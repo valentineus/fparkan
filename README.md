@@ -1,1 +1,1 @@
-# Utilities and tools for the game "Parkan: Iron Strategy"
+# Utilities for the game "Parkan: Iron Strategy"
