@@ -3,9 +3,15 @@ extern crate thiserror;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum ReaderError {
+pub enum ConverterError {
     #[error("error converting an value")]
     ConvertValue(#[from] std::num::TryFromIntError),
+}
+
+#[derive(Error, Debug)]
+pub enum ReaderError {
+    #[error(transparent)]
+    ConvertValue(#[from] ConverterError),
 
     #[error("incorrect header format")]
     IncorrectHeader,

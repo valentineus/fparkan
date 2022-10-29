@@ -2,6 +2,7 @@ use std::io::{Read, Seek};
 
 use byteorder::ByteOrder;
 
+use crate::converter;
 use crate::error::ReaderError;
 
 /// String value "NRes" in decimal notation
@@ -98,7 +99,7 @@ fn get_list_of_files(
         _ => {}
     }
 
-    let buffer_size = usize_to_i32(buffer.len())?;
+    let buffer_size = converter::usize_to_i32(buffer.len())?;
 
     if buffer_size % ELEMENT_SIZE != 0 {
         return Err(ReaderError::IncorrectSizeList {
@@ -119,14 +120,14 @@ fn get_list_of_files(
 }
 
 fn get_position_element(index: i32) -> Result<(usize, usize), ReaderError> {
-    let from = i32_to_usize(index * ELEMENT_SIZE)?;
-    let to = i32_to_usize((index * ELEMENT_SIZE) + ELEMENT_SIZE)?;
+    let from = converter::i32_to_usize(index * ELEMENT_SIZE)?;
+    let to = converter::i32_to_usize((index * ELEMENT_SIZE) + ELEMENT_SIZE)?;
     Ok((from, to))
 }
 
 fn get_position_list_of_files(header: &FileHeader) -> Result<(u64, usize), ReaderError> {
-    let position = i32_to_u64(header.size - (header.total * ELEMENT_SIZE))?;
-    let size = i32_to_usize(header.total * ELEMENT_SIZE)?;
+    let position = converter::i32_to_u64(header.size - (header.total * ELEMENT_SIZE))?;
+    let size = converter::i32_to_usize(header.total * ELEMENT_SIZE)?;
     Ok((position, size))
 }
 
@@ -183,34 +184,6 @@ fn get_file_size(file: &std::fs::File) -> Result<i64, ReaderError> {
         Ok(value) => value,
     };
 
-    let result = u64_to_i64(metadata.len())?;
+    let result = converter::u64_to_i64(metadata.len())?;
     Ok(result)
-}
-
-fn usize_to_i32(value: usize) -> Result<i32, ReaderError> {
-    match i32::try_from(value) {
-        Err(error) => return Err(ReaderError::ConvertValue(error)),
-        Ok(result) => Ok(result),
-    }
-}
-
-fn u64_to_i64(value: u64) -> Result<i64, ReaderError> {
-    match i64::try_from(value) {
-        Err(error) => return Err(ReaderError::ConvertValue(error)),
-        Ok(result) => Ok(result),
-    }
-}
-
-fn i32_to_u64(value: i32) -> Result<u64, ReaderError> {
-    match u64::try_from(value) {
-        Err(error) => return Err(ReaderError::ConvertValue(error)),
-        Ok(result) => Ok(result),
-    }
-}
-
-fn i32_to_usize(value: i32) -> Result<usize, ReaderError> {
-    match usize::try_from(value) {
-        Err(error) => return Err(ReaderError::ConvertValue(error)),
-        Ok(result) => Ok(result),
-    }
 }
