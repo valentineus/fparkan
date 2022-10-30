@@ -4,8 +4,6 @@ extern crate thiserror;
 use miette::Diagnostic;
 use thiserror::Error;
 
-use crate::reader::FileHeader;
-
 #[derive(Error, Diagnostic, Debug)]
 pub enum ConverterError {
     #[error("error converting an value")]
@@ -19,9 +17,9 @@ pub enum ReaderError {
     #[diagnostic(code(libnres::convert_error))]
     ConvertValue(#[from] ConverterError),
 
-    #[error("incorrect header format (received {received:?})")]
+    #[error("incorrect header format")]
     #[diagnostic(code(libnres::list_type_error))]
-    IncorrectHeader { received: FileHeader },
+    IncorrectHeader,
 
     #[error("incorrect file size (expected {expected:?} bytes, received {received:?} bytes)")]
     #[diagnostic(code(libnres::file_size_error))]

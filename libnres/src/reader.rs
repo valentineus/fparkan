@@ -37,49 +37,77 @@ pub struct FileHeader {
     type2: i32,
 }
 
+/// Get a packed file data
 pub fn get_file(file: &std::fs::File, element: &ListElement) -> Result<Vec<u8>, ReaderError> {
-    todo!()
+    let size = get_file_size(&file)?;
+    check_file_size(size)?;
+
+    let header = get_file_header(&file)?;
+    check_file_header(&header, size)?;
+
+    let data = get_element_data(&file, &element)?;
+    Ok(data)
 }
 
 /// Get a list of packed files
 pub fn get_list(file: &std::fs::File) -> Result<Vec<ListElement>, ReaderError> {
     let mut list: Vec<ListElement> = Vec::new();
 
-    //region Getting the file size
-    let file_size = get_file_size(&file)?;
+    let size = get_file_size(&file)?;
+    check_file_size(size)?;
 
-    if file_size < MINIMUM_FILE_SIZE {
-        return Err(ReaderError::SmallFile {
-            expected: MINIMUM_FILE_SIZE,
-            received: file_size,
-        });
-    }
-    //endregion
-
-    //region Getting the file header
     let header = get_file_header(&file)?;
+    check_file_header(&header, size)?;
 
+    get_file_list(&file, &header, &mut list)?;
+
+    Ok(list)
+}
+
+fn check_file_header(header: &FileHeader, size: i32) -> Result<(), ReaderError> {
     if header.type1 != FILE_TYPE_1 || header.type2 != FILE_TYPE_2 {
-        return Err(ReaderError::IncorrectHeader { received: header });
+        return Err(ReaderError::IncorrectHeader);
     }
 
-    if header.size != file_size {
+    if header.size != size {
         return Err(ReaderError::IncorrectSizeFile {
-            expected: file_size,
+            expected: size,
             received: header.size,
         });
     }
 
-    if header.total <= 0 {
-        return Ok(list);
+    Ok(())
+}
+
+fn check_file_size(size: i32) -> Result<(), ReaderError> {
+    if size < MINIMUM_FILE_SIZE {
+        return Err(ReaderError::SmallFile {
+            expected: MINIMUM_FILE_SIZE,
+            received: size,
+        });
     }
-    //endregion
 
-    //region Extracting the list of elements
-    get_file_list(&file, &header, &mut list)?;
-    //endregion
+    Ok(())
+}
 
-    Ok(list)
+fn get_element_data(file: &std::fs::File, element: &ListElement) -> Result<Vec<u8>, ReaderError> {
+    let position = converter::i32_to_u64(element.position)?;
+    let size = converter::i32_to_usize(element.size)?;
+
+    let mut reader = std::io::BufReader::new(file);
+    let mut buffer = vec![0u8; size];
+
+    match reader.seek(std::io::SeekFrom::Start(position)) {
+        Err(error) => return Err(ReaderError::ReadFile(error)),
+        _ => {}
+    };
+
+    match reader.read_exact(&mut buffer) {
+        Err(error) => return Err(ReaderError::ReadFile(error)),
+        _ => {}
+    };
+
+    Ok(buffer)
 }
 
 fn get_element_position(index: i32) -> Result<(usize, usize), ReaderError> {
