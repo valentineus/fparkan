@@ -1,6 +1,6 @@
 [package]
 name = "nres-cli"
-version = "0.0.1"
+version = "0.1.0"
 description = "Console tool for NRes files"
 authors = [
   "Valentin Popov <valentin@popov.link>"

@@ -1,5 +1,7 @@
 extern crate libnres;
 
+use std::io::Write;
+
 use clap::{Parser, Subcommand};
 use console::Term;
 use miette::{IntoDiagnostic, Result};
@@ -56,8 +58,20 @@ pub fn main() -> Result<()> {
             name,
             out,
         } => {
-            if debug {
-                dbg!(file, force, name, out);
+            let file = std::fs::File::open(file).into_diagnostic()?;
+            let list = reader::get_list(&file).into_diagnostic()?;
+
+            for element in list {
+                let path = out.to_string()
+                    + "/"
+                    + &element.name.to_string()
+                    + "."
+                    + &element.extension.to_string();
+
+                let mut output = std::fs::File::create(path).into_diagnostic()?;
+                let mut buffer = reader::get_file(&file, &element).into_diagnostic()?;
+                output.write_all(&mut buffer).into_diagnostic()?;
+                buffer.clear();
             }
         } //endregion
 
