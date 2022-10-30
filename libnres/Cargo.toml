@@ -1,6 +1,6 @@
 [package]
 name = "libnres"
-version = "0.0.1"
+version = "0.1.0"
 description = "Library for NRes files"
 authors = [
   "Valentin Popov <valentin@popov.link>"
@@ -17,4 +17,5 @@ keywords = [
 
 [dependencies]
 byteorder = "1.4"
+miette = "5.4"
 thiserror = "1.0"
