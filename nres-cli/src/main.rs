@@ -1,4 +1,10 @@
+extern crate libnres;
+
 use clap::{Parser, Subcommand};
+use console::Term;
+use miette::{IntoDiagnostic, Result};
+
+use libnres::reader;
 
 #[derive(Parser, Debug)]
 #[command(name = "NRes CLI")]
@@ -35,6 +41,36 @@ enum Commands {
     },
 }
 
-fn main() {
-    let _cli = Cli::parse();
+pub fn main() -> Result<()> {
+    let _stderr = Term::stderr();
+    let stdout = Term::stdout();
+
+    let cli = Cli::parse();
+    let debug = cli.debug;
+
+    match cli.command {
+        //region Command "EXTRACT"
+        Commands::Extract {
+            file,
+            force,
+            name,
+            out,
+        } => {
+            if debug {
+                dbg!(file, force, name, out);
+            }
+        } //endregion
+
+        //region Command "LS"
+        Commands::Ls { file } => {
+            let file = std::fs::File::open(file).into_diagnostic()?;
+            let list = reader::get_list(&file).into_diagnostic()?;
+
+            for element in list {
+                stdout.write_line(&element.name).into_diagnostic()?;
+            }
+        } //endregion
+    }
+
+    Ok(())
 }
