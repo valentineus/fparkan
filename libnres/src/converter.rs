@@ -16,9 +16,9 @@ pub fn i32_to_usize(value: i32) -> Result<usize, ConverterError> {
     }
 }
 
-/// Method for converting u64 to i64.
-pub fn u64_to_i64(value: u64) -> Result<i64, ConverterError> {
-    match i64::try_from(value) {
+/// Method for converting u64 to i32.
+pub fn u64_to_i32(value: u64) -> Result<i32, ConverterError> {
+    match i32::try_from(value) {
         Err(error) => return Err(ConverterError::ConvertValue(error)),
         Ok(result) => Ok(result),
     }

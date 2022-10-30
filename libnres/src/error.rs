@@ -2,6 +2,8 @@ extern crate thiserror;
 
 use thiserror::Error;
 
+use crate::reader::FileHeader;
+
 #[derive(Error, Debug)]
 pub enum ConverterError {
     #[error("error converting an value")]
@@ -13,8 +15,8 @@ pub enum ReaderError {
     #[error(transparent)]
     ConvertValue(#[from] ConverterError),
 
-    #[error("incorrect header format")]
-    IncorrectHeader,
+    #[error("incorrect header format (received {received:?})")]
+    IncorrectHeader { received: FileHeader },
 
     #[error("incorrect file size (expected {expected:?} bytes, received {received:?} bytes)")]
     IncorrectSizeFile { expected: i32, received: i32 },

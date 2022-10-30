@@ -1,9 +1,19 @@
 [package]
 name = "libnres"
 version = "0.0.1"
+description = "Library for NRes files"
+authors = [
+  "Valentin Popov <valentin@popov.link>"
+]
+homepage = "https://github.com/valentineus/fparkan"
+repository = "https://github.com/valentineus/fparkan.git"
+license = "GPL-2.0"
 edition = "2021"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+keywords = [
+  "gamedev",
+  "library",
+  "nres"
+]
 
 [dependencies]
 byteorder = "1.4"
