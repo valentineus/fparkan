@@ -120,6 +120,11 @@ fn get_file_header(file: &std::fs::File) -> Result<FileHeader, ReaderError> {
     let mut reader = std::io::BufReader::new(file);
     let mut buffer = vec![0u8; MINIMUM_FILE_SIZE as usize];
 
+    match reader.seek(std::io::SeekFrom::Start(0)) {
+        Err(error) => return Err(ReaderError::ReadFile(error)),
+        _ => {}
+    };
+
     match reader.read_exact(&mut buffer) {
         Err(error) => return Err(ReaderError::ReadFile(error)),
         _ => {}
