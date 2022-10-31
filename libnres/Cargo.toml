@@ -17,5 +17,6 @@ keywords = [
 
 [dependencies]
 byteorder = "1.4"
+log = "0.4"
 miette = "5.4"
 thiserror = "1.0"

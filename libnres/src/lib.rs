@@ -7,6 +7,18 @@ pub const LIST_ELEMENT_SIZE: i32 = 64;
 /// Minimum allowed file size (in bytes)
 pub const MINIMUM_FILE_SIZE: i32 = 16;
 
+static DEBUG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 mod converter;
 mod error;
 pub mod reader;
+
+/// Get debug status value
+pub fn get_debug() -> bool {
+    DEBUG.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Change debug status value
+pub fn set_debug(value: bool) {
+    DEBUG.store(value, std::sync::atomic::Ordering::Relaxed)
+}
