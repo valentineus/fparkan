@@ -48,35 +48,40 @@ pub fn main() -> Result<()> {
     let debug = cli.debug;
 
     match cli.command {
-        //region Command "EXTRACT"
-        Commands::Extract { file, force, out } => {
-            let file = std::fs::File::open(file).into_diagnostic()?;
-            let list = reader::get_list(&file).into_diagnostic()?;
-            let bar = indicatif::ProgressBar::new(list.len() as u64);
+        Commands::Extract { file, force, out } => command_extract(file, out, force)?,
+        Commands::Ls { file } => command_ls(stdout, file)?,
+    }
 
-            for element in list {
-                let path = format!("{}/{}", out, element.get_filename());
+    Ok(())
+}
 
-                let mut output = std::fs::File::create(path).into_diagnostic()?;
-                let mut buffer = reader::get_file(&file, &element).into_diagnostic()?;
+fn command_extract(file: String, out: String, _force: Option<bool>) -> Result<()> {
+    let file = std::fs::File::open(file).into_diagnostic()?;
+    let list = reader::get_list(&file).into_diagnostic()?;
+    let bar = indicatif::ProgressBar::new(list.len() as u64);
 
-                output.write_all(&mut buffer).into_diagnostic()?;
-                buffer.clear();
-                bar.inc(1);
-            }
+    for element in list {
+        let path = format!("{}/{}", out, element.get_filename());
 
-            bar.finish();
-        } //endregion
+        let mut output = std::fs::File::create(path).into_diagnostic()?;
+        let mut buffer = reader::get_file(&file, &element).into_diagnostic()?;
 
-        //region Command "LS"
-        Commands::Ls { file } => {
-            let file = std::fs::File::open(file).into_diagnostic()?;
-            let list = reader::get_list(&file).into_diagnostic()?;
+        output.write_all(&mut buffer).into_diagnostic()?;
+        buffer.clear();
+        bar.inc(1);
+    }
 
-            for element in list {
-                stdout.write_line(&element.name).into_diagnostic()?;
-            }
-        } //endregion
+    bar.finish();
+
+    Ok(())
+}
+
+fn command_ls(stdout: Term, file: String) -> Result<()> {
+    let file = std::fs::File::open(file).into_diagnostic()?;
+    let list = reader::get_list(&file).into_diagnostic()?;
+
+    for element in list {
+        stdout.write_line(&element.name).into_diagnostic()?;
     }
 
     Ok(())
