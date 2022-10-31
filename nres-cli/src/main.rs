@@ -41,14 +41,14 @@ pub fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Extract { file, force, out } => command_extract(file, out, force)?,
+        Commands::Extract { file, force, out } => command_extract(stdout, file, out, force)?,
         Commands::Ls { file } => command_ls(stdout, file)?,
     }
 
     Ok(())
 }
 
-fn command_extract(file: String, out: String, force: bool) -> Result<()> {
+fn command_extract(_stdout: console::Term, file: String, out: String, force: bool) -> Result<()> {
     let file = std::fs::File::open(file).into_diagnostic()?;
     let list = reader::get_list(&file).into_diagnostic()?;
     let bar = indicatif::ProgressBar::new(list.len() as u64);
