@@ -54,14 +54,11 @@ pub fn main() -> Result<()> {
             let list = reader::get_list(&file).into_diagnostic()?;
 
             for element in list {
-                let path = out.to_string()
-                    + "/"
-                    + &element.name.to_string()
-                    + "."
-                    + &element.extension.to_string();
+                let path = format!("{}/{}", out, element.get_filename());
 
                 let mut output = std::fs::File::create(path).into_diagnostic()?;
                 let mut buffer = reader::get_file(&file, &element).into_diagnostic()?;
+
                 output.write_all(&mut buffer).into_diagnostic()?;
                 buffer.clear();
             }
