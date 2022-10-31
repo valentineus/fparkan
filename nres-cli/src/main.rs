@@ -29,9 +29,6 @@ enum Commands {
         /// Overwrite files
         #[arg(short, long, value_name = "TRUE|FALSE")]
         force: Option<bool>,
-        /// Name of the packed file to extract
-        #[arg(short, long)]
-        name: Option<String>,
         /// Outbound directory
         #[arg(short, long, value_name = "DIR")]
         out: String,
@@ -52,12 +49,7 @@ pub fn main() -> Result<()> {
 
     match cli.command {
         //region Command "EXTRACT"
-        Commands::Extract {
-            file,
-            force,
-            name,
-            out,
-        } => {
+        Commands::Extract { file, force, out } => {
             let file = std::fs::File::open(file).into_diagnostic()?;
             let list = reader::get_list(&file).into_diagnostic()?;
 
