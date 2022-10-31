@@ -13,9 +13,6 @@ use libnres::reader;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
-    /// Print debugging information
-    #[arg(short, long, default_value_t = false)]
-    debug: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -40,11 +37,8 @@ enum Commands {
 }
 
 pub fn main() -> Result<()> {
-    let _stderr = console::Term::stderr();
     let stdout = console::Term::stdout();
-
     let cli = Cli::parse();
-    let debug = cli.debug;
 
     match cli.command {
         Commands::Extract { file, force, out } => command_extract(file, out, force)?,
