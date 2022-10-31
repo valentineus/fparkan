@@ -25,6 +25,13 @@ pub struct ListElement {
     pub size: i32,
 }
 
+impl ListElement {
+    /// Get full name of the file
+    pub fn get_filename(&self) -> String {
+        return format!("{}.{}", self.name, self.extension);
+    }
+}
+
 #[derive(Debug)]
 pub struct FileHeader {
     /// File size
