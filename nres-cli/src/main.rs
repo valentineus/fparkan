@@ -5,8 +5,6 @@ use std::io::Write;
 use clap::{Parser, Subcommand};
 use miette::{IntoDiagnostic, Result};
 
-use libnres::reader;
-
 #[derive(Parser, Debug)]
 #[command(name = "NRes CLI")]
 #[command(about, author, version, long_about = None)]
@@ -17,6 +15,12 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Print debugging information on the "NRes" file
+    #[command(arg_required_else_help = true)]
+    Debug {
+        /// "NRes" file
+        file: String,
+    },
     /// Extract files or a file from the "NRes" file
     #[command(arg_required_else_help = true)]
     Extract {
@@ -30,6 +34,7 @@ enum Commands {
         out: String,
     },
     /// Print a list of files in the "NRes" file
+    #[command(arg_required_else_help = true)]
     Ls {
         /// "NRes" file
         file: String,
@@ -41,6 +46,7 @@ pub fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Debug { file } => command_debug(stdout, file)?,
         Commands::Extract { file, force, out } => command_extract(stdout, file, out, force)?,
         Commands::Ls { file } => command_ls(stdout, file)?,
     }
@@ -48,9 +54,28 @@ pub fn main() -> Result<()> {
     Ok(())
 }
 
+fn command_debug(stdout: console::Term, file: String) -> Result<()> {
+    let file = std::fs::File::open(file).into_diagnostic()?;
+    let list = libnres::reader::get_list(&file).into_diagnostic()?;
+
+    for (index, item) in list.iter().enumerate() {
+        let mut gap = 0;
+
+        if index > 1 {
+            let previous_item = &list[index - 1];
+            gap = item.position - (previous_item.position + previous_item.size);
+        }
+
+        let text = format!("Index: {};\nGap: {};\nItem: {:#?};\n", index, gap, item);
+        stdout.write_line(&text).into_diagnostic()?;
+    }
+
+    Ok(())
+}
+
 fn command_extract(_stdout: console::Term, file: String, out: String, force: bool) -> Result<()> {
     let file = std::fs::File::open(file).into_diagnostic()?;
-    let list = reader::get_list(&file).into_diagnostic()?;
+    let list = libnres::reader::get_list(&file).into_diagnostic()?;
     let bar = indicatif::ProgressBar::new(list.len() as u64);
 
     for element in list {
@@ -69,7 +94,7 @@ fn command_extract(_stdout: console::Term, file: String, out: String, force: boo
         }
 
         let mut output = std::fs::File::create(path).into_diagnostic()?;
-        let mut buffer = reader::get_file(&file, &element).into_diagnostic()?;
+        let mut buffer = libnres::reader::get_file(&file, &element).into_diagnostic()?;
 
         output.write_all(&mut buffer).into_diagnostic()?;
         buffer.clear();
@@ -83,7 +108,7 @@ fn command_extract(_stdout: console::Term, file: String, out: String, force: boo
 
 fn command_ls(stdout: console::Term, file: String) -> Result<()> {
     let file = std::fs::File::open(file).into_diagnostic()?;
-    let list = reader::get_list(&file).into_diagnostic()?;
+    let list = libnres::reader::get_list(&file).into_diagnostic()?;
 
     for element in list {
         stdout.write_line(&element.name).into_diagnostic()?;
