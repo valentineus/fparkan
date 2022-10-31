@@ -3,7 +3,6 @@ extern crate libnres;
 use std::io::Write;
 
 use clap::{Parser, Subcommand};
-use console::Term;
 use miette::{IntoDiagnostic, Result};
 
 use libnres::reader;
@@ -27,8 +26,8 @@ enum Commands {
         /// "NRes" file
         file: String,
         /// Overwrite files
-        #[arg(short, long, value_name = "TRUE|FALSE")]
-        force: Option<bool>,
+        #[arg(short, long, default_value_t = false, value_name = "TRUE|FALSE")]
+        force: bool,
         /// Outbound directory
         #[arg(short, long, value_name = "DIR")]
         out: String,
@@ -41,8 +40,8 @@ enum Commands {
 }
 
 pub fn main() -> Result<()> {
-    let _stderr = Term::stderr();
-    let stdout = Term::stdout();
+    let _stderr = console::Term::stderr();
+    let stdout = console::Term::stdout();
 
     let cli = Cli::parse();
     let debug = cli.debug;
@@ -55,13 +54,25 @@ pub fn main() -> Result<()> {
     Ok(())
 }
 
-fn command_extract(file: String, out: String, _force: Option<bool>) -> Result<()> {
+fn command_extract(file: String, out: String, force: bool) -> Result<()> {
     let file = std::fs::File::open(file).into_diagnostic()?;
     let list = reader::get_list(&file).into_diagnostic()?;
     let bar = indicatif::ProgressBar::new(list.len() as u64);
 
     for element in list {
         let path = format!("{}/{}", out, element.get_filename());
+
+        if force != true && is_exist_file(&path) {
+            let message = format!("File \"{}\" exists. Overwrite it?", path);
+
+            if !dialoguer::Confirm::new()
+                .with_prompt(message)
+                .interact()
+                .into_diagnostic()?
+            {
+                continue;
+            }
+        }
 
         let mut output = std::fs::File::create(path).into_diagnostic()?;
         let mut buffer = reader::get_file(&file, &element).into_diagnostic()?;
@@ -76,7 +87,7 @@ fn command_extract(file: String, out: String, _force: Option<bool>) -> Result<()
     Ok(())
 }
 
-fn command_ls(stdout: Term, file: String) -> Result<()> {
+fn command_ls(stdout: console::Term, file: String) -> Result<()> {
     let file = std::fs::File::open(file).into_diagnostic()?;
     let list = reader::get_list(&file).into_diagnostic()?;
 
@@ -85,4 +96,9 @@ fn command_ls(stdout: Term, file: String) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn is_exist_file(path: &String) -> bool {
+    let metadata = std::path::Path::new(path);
+    metadata.exists()
 }
