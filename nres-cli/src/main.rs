@@ -61,6 +61,7 @@ pub fn main() -> Result<()> {
 fn command_debug(stdout: console::Term, file: String, name: Option<String>) -> Result<()> {
     let file = std::fs::File::open(file).into_diagnostic()?;
     let mut list = libnres::reader::get_list(&file).into_diagnostic()?;
+
     let mut total_files_size: i32 = 0;
     let mut total_files_gap: i32 = 0;
     let mut total_files: i32 = 0;
