@@ -52,6 +52,7 @@ pub fn main() -> Result<()> {
         Commands::Extract { file, force, out } => {
             let file = std::fs::File::open(file).into_diagnostic()?;
             let list = reader::get_list(&file).into_diagnostic()?;
+            let bar = indicatif::ProgressBar::new(list.len() as u64);
 
             for element in list {
                 let path = format!("{}/{}", out, element.get_filename());
@@ -61,7 +62,10 @@ pub fn main() -> Result<()> {
 
                 output.write_all(&mut buffer).into_diagnostic()?;
                 buffer.clear();
+                bar.inc(1);
             }
+
+            bar.finish();
         } //endregion
 
         //region Command "LS"
