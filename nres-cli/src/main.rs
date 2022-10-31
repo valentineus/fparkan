@@ -66,7 +66,13 @@ fn command_debug(stdout: console::Term, file: String, name: Option<String>) -> R
         list.retain(|item| item.name.contains(&name));
     };
 
+    let mut total_files_size: i32 = 0;
+    let mut total_files_gap: i32 = 0;
+    let mut total_files: i32 = 0;
+
     for (index, item) in list.iter().enumerate() {
+        total_files_size += item.size;
+        total_files += 1;
         let mut gap = 0;
 
         if index > 1 {
@@ -74,9 +80,18 @@ fn command_debug(stdout: console::Term, file: String, name: Option<String>) -> R
             gap = item.position - (previous_item.position + previous_item.size);
         }
 
+        total_files_gap += gap;
+
         let text = format!("Index: {};\nGap: {};\nItem: {:#?};\n", index, gap, item);
         stdout.write_line(&text).into_diagnostic()?;
     }
+
+    let text = format!(
+        "Total files: {};\nTotal files gap: {};\nTotal files size: {}",
+        total_files, total_files_gap, total_files_size
+    );
+
+    stdout.write_line(&text).into_diagnostic()?;
 
     Ok(())
 }
