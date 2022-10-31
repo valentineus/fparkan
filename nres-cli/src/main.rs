@@ -61,11 +61,6 @@ pub fn main() -> Result<()> {
 fn command_debug(stdout: console::Term, file: String, name: Option<String>) -> Result<()> {
     let file = std::fs::File::open(file).into_diagnostic()?;
     let mut list = libnres::reader::get_list(&file).into_diagnostic()?;
-
-    if let Some(name) = name {
-        list.retain(|item| item.name.contains(&name));
-    };
-
     let mut total_files_size: i32 = 0;
     let mut total_files_gap: i32 = 0;
     let mut total_files: i32 = 0;
@@ -81,13 +76,26 @@ fn command_debug(stdout: console::Term, file: String, name: Option<String>) -> R
         }
 
         total_files_gap += gap;
+    }
+
+    if let Some(name) = name {
+        list.retain(|item| item.name.contains(&name));
+    };
+
+    for (index, item) in list.iter().enumerate() {
+        let mut gap = 0;
+
+        if index > 1 {
+            let previous_item = &list[index - 1];
+            gap = item.position - (previous_item.position + previous_item.size);
+        }
 
         let text = format!("Index: {};\nGap: {};\nItem: {:#?};\n", index, gap, item);
         stdout.write_line(&text).into_diagnostic()?;
     }
 
     let text = format!(
-        "Total files: {};\nTotal files gap: {};\nTotal files size: {}",
+        "Total files: {};\nTotal files gap: {} (bytes);\nTotal files size: {} (bytes);",
         total_files, total_files_gap, total_files_size
     );
 
