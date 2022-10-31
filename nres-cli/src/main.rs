@@ -1,3 +1,4 @@
+extern crate core;
 extern crate libnres;
 
 use std::io::Write;
@@ -20,6 +21,9 @@ enum Commands {
     Debug {
         /// "NRes" file
         file: String,
+        /// Filter results by file name
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Extract files or a file from the "NRes" file
     #[command(arg_required_else_help = true)]
@@ -46,7 +50,7 @@ pub fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Debug { file } => command_debug(stdout, file)?,
+        Commands::Debug { file, name } => command_debug(stdout, file, name)?,
         Commands::Extract { file, force, out } => command_extract(stdout, file, out, force)?,
         Commands::Ls { file } => command_ls(stdout, file)?,
     }
@@ -54,9 +58,13 @@ pub fn main() -> Result<()> {
     Ok(())
 }
 
-fn command_debug(stdout: console::Term, file: String) -> Result<()> {
+fn command_debug(stdout: console::Term, file: String, name: Option<String>) -> Result<()> {
     let file = std::fs::File::open(file).into_diagnostic()?;
-    let list = libnres::reader::get_list(&file).into_diagnostic()?;
+    let mut list = libnres::reader::get_list(&file).into_diagnostic()?;
+
+    if let Some(name) = name {
+        list.retain(|item| item.name.contains(&name));
+    };
 
     for (index, item) in list.iter().enumerate() {
         let mut gap = 0;
