@@ -70,7 +70,11 @@ fn command_check(_stdout: console::Term, file: String) -> Result<()> {
     let tmp = tempdir::TempDir::new("nres").into_diagnostic()?;
     let bar = indicatif::ProgressBar::new(list.len() as u64);
 
+    bar.set_style(get_bar_style()?);
+
     for element in list {
+        bar.set_message(element.get_filename());
+
         let path = tmp.path().join(element.get_filename());
         let mut output = std::fs::File::create(path).into_diagnostic()?;
         let mut buffer = libnres::reader::get_file(&file, &element).into_diagnostic()?;
@@ -137,7 +141,11 @@ fn command_extract(_stdout: console::Term, file: String, out: String, force: boo
     let list = libnres::reader::get_list(&file).into_diagnostic()?;
     let bar = indicatif::ProgressBar::new(list.len() as u64);
 
+    bar.set_style(get_bar_style()?);
+
     for element in list {
+        bar.set_message(element.get_filename());
+
         let path = format!("{}/{}", out, element.get_filename());
 
         if force != true && is_exist_file(&path) {
@@ -174,6 +182,14 @@ fn command_ls(stdout: console::Term, file: String) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn get_bar_style() -> Result<indicatif::ProgressStyle> {
+    Ok(
+        indicatif::ProgressStyle::with_template("[{bar:32}] {pos:>7}/{len:7} {msg}")
+            .into_diagnostic()?
+            .progress_chars("=>-"),
+    )
 }
 
 fn is_exist_file(path: &String) -> bool {
