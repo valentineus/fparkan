@@ -16,6 +16,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Check if the "NRes" file can be extract
+    Check {
+        /// "NRes" file
+        file: String,
+    },
     /// Print debugging information on the "NRes" file
     #[command(arg_required_else_help = true)]
     Debug {
@@ -50,10 +55,32 @@ pub fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Check { file } => command_check(stdout, file)?,
         Commands::Debug { file, name } => command_debug(stdout, file, name)?,
         Commands::Extract { file, force, out } => command_extract(stdout, file, out, force)?,
         Commands::Ls { file } => command_ls(stdout, file)?,
     }
+
+    Ok(())
+}
+
+fn command_check(_stdout: console::Term, file: String) -> Result<()> {
+    let file = std::fs::File::open(file).into_diagnostic()?;
+    let list = libnres::reader::get_list(&file).into_diagnostic()?;
+    let tmp = tempdir::TempDir::new("nres").into_diagnostic()?;
+    let bar = indicatif::ProgressBar::new(list.len() as u64);
+
+    for element in list {
+        let path = tmp.path().join(element.get_filename());
+        let mut output = std::fs::File::create(path).into_diagnostic()?;
+        let mut buffer = libnres::reader::get_file(&file, &element).into_diagnostic()?;
+
+        output.write_all(&mut buffer).into_diagnostic()?;
+        buffer.clear();
+        bar.inc(1);
+    }
+
+    bar.finish();
 
     Ok(())
 }

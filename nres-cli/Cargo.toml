@@ -16,9 +16,11 @@ keywords = [
 ]
 
 [dependencies]
+byteorder = "1.4"
 clap = { version = "4.0", features = ["derive"] }
 console = "0.15"
 dialoguer = { version = "0.10", features = ["completion"] }
 indicatif = "0.17"
 libnres = { version = "0.1", path = "../libnres" }
 miette = { version = "5.4", features = ["fancy"] }
+tempdir = "0.3"
