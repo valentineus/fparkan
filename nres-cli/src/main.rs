@@ -62,9 +62,9 @@ fn command_debug(stdout: console::Term, file: String, name: Option<String>) -> R
     let file = std::fs::File::open(file).into_diagnostic()?;
     let mut list = libnres::reader::get_list(&file).into_diagnostic()?;
 
-    let mut total_files_size: i32 = 0;
-    let mut total_files_gap: i32 = 0;
-    let mut total_files: i32 = 0;
+    let mut total_files_size: u32 = 0;
+    let mut total_files_gap: u32 = 0;
+    let mut total_files: u32 = 0;
 
     for (index, item) in list.iter().enumerate() {
         total_files_size += item.size;
