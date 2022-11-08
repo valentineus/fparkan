@@ -1,11 +1,11 @@
 /// First constant value of the NRes file ("NRes" characters in numeric)
-pub const FILE_TYPE_1: i32 = 1936020046;
+pub const FILE_TYPE_1: u32 = 1936020046;
 /// Second constant value of the NRes file
-pub const FILE_TYPE_2: i32 = 256;
+pub const FILE_TYPE_2: u32 = 256;
 /// Size of the element item (in bytes)
-pub const LIST_ELEMENT_SIZE: i32 = 64;
+pub const LIST_ELEMENT_SIZE: u32 = 64;
 /// Minimum allowed file size (in bytes)
-pub const MINIMUM_FILE_SIZE: i32 = 16;
+pub const MINIMUM_FILE_SIZE: u32 = 16;
 
 static DEBUG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 

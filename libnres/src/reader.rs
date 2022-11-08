@@ -16,13 +16,13 @@ pub struct ListElement {
     /// File extension
     pub extension: String,
     /// Identifier or sequence number
-    pub index: i32,
+    pub index: u32,
     /// File name
     pub name: String,
     /// Position in the file
-    pub position: i32,
+    pub position: u32,
     /// File size (in bytes)
-    pub size: i32,
+    pub size: u32,
 }
 
 impl ListElement {
@@ -35,13 +35,13 @@ impl ListElement {
 #[derive(Debug)]
 pub struct FileHeader {
     /// File size
-    size: i32,
+    size: u32,
     /// Number of files
-    total: i32,
+    total: u32,
     /// First constant value
-    type1: i32,
+    type1: u32,
     /// Second constant value
-    type2: i32,
+    type2: u32,
 }
 
 /// Get a packed file data
@@ -71,7 +71,7 @@ pub fn get_list(file: &std::fs::File) -> Result<Vec<ListElement>, ReaderError> {
     Ok(list)
 }
 
-fn check_file_header(header: &FileHeader, size: i32) -> Result<(), ReaderError> {
+fn check_file_header(header: &FileHeader, size: u32) -> Result<(), ReaderError> {
     if header.type1 != FILE_TYPE_1 || header.type2 != FILE_TYPE_2 {
         return Err(ReaderError::IncorrectHeader);
     }
@@ -86,7 +86,7 @@ fn check_file_header(header: &FileHeader, size: i32) -> Result<(), ReaderError> 
     Ok(())
 }
 
-fn check_file_size(size: i32) -> Result<(), ReaderError> {
+fn check_file_size(size: u32) -> Result<(), ReaderError> {
     if size < MINIMUM_FILE_SIZE {
         return Err(ReaderError::SmallFile {
             expected: MINIMUM_FILE_SIZE,
@@ -98,8 +98,8 @@ fn check_file_size(size: i32) -> Result<(), ReaderError> {
 }
 
 fn get_element_data(file: &std::fs::File, element: &ListElement) -> Result<Vec<u8>, ReaderError> {
-    let position = converter::i32_to_u64(element.position)?;
-    let size = converter::i32_to_usize(element.size)?;
+    let position = converter::u32_to_u64(element.position)?;
+    let size = converter::u32_to_usize(element.size)?;
 
     let mut reader = std::io::BufReader::new(file);
     let mut buffer = vec![0u8; size];
@@ -117,9 +117,9 @@ fn get_element_data(file: &std::fs::File, element: &ListElement) -> Result<Vec<u
     Ok(buffer)
 }
 
-fn get_element_position(index: i32) -> Result<(usize, usize), ReaderError> {
-    let from = converter::i32_to_usize(index * LIST_ELEMENT_SIZE)?;
-    let to = converter::i32_to_usize((index * LIST_ELEMENT_SIZE) + LIST_ELEMENT_SIZE)?;
+fn get_element_position(index: u32) -> Result<(usize, usize), ReaderError> {
+    let from = converter::u32_to_usize(index * LIST_ELEMENT_SIZE)?;
+    let to = converter::u32_to_usize((index * LIST_ELEMENT_SIZE) + LIST_ELEMENT_SIZE)?;
     Ok((from, to))
 }
 
@@ -138,10 +138,10 @@ fn get_file_header(file: &std::fs::File) -> Result<FileHeader, ReaderError> {
     };
 
     let header = FileHeader {
-        size: byteorder::LittleEndian::read_i32(&buffer[12..16]),
-        total: byteorder::LittleEndian::read_i32(&buffer[8..12]),
-        type1: byteorder::LittleEndian::read_i32(&buffer[0..4]),
-        type2: byteorder::LittleEndian::read_i32(&buffer[4..8]),
+        size: byteorder::LittleEndian::read_u32(&buffer[12..16]),
+        total: byteorder::LittleEndian::read_u32(&buffer[8..12]),
+        type1: byteorder::LittleEndian::read_u32(&buffer[0..4]),
+        type2: byteorder::LittleEndian::read_u32(&buffer[4..8]),
     };
 
     buffer.clear();
@@ -167,7 +167,7 @@ fn get_file_list(
         _ => {}
     }
 
-    let buffer_size = converter::usize_to_i32(buffer.len())?;
+    let buffer_size = converter::usize_to_u32(buffer.len())?;
 
     if buffer_size % LIST_ELEMENT_SIZE != 0 {
         return Err(ReaderError::IncorrectSizeList {
@@ -188,20 +188,20 @@ fn get_file_list(
     Ok(())
 }
 
-fn get_file_size(file: &std::fs::File) -> Result<i32, ReaderError> {
+fn get_file_size(file: &std::fs::File) -> Result<u32, ReaderError> {
     let metadata = match file.metadata() {
         Err(error) => return Err(ReaderError::ReadFile(error)),
         Ok(value) => value,
     };
 
-    let result = converter::u64_to_i32(metadata.len())?;
+    let result = converter::u64_to_u32(metadata.len())?;
     Ok(result)
 }
 
 fn get_list_element(buffer: &[u8]) -> Result<ListElement, ReaderError> {
-    let index = byteorder::LittleEndian::read_i32(&buffer[60..64]);
-    let position = byteorder::LittleEndian::read_i32(&buffer[56..60]);
-    let size = byteorder::LittleEndian::read_i32(&buffer[12..16]);
+    let index = byteorder::LittleEndian::read_u32(&buffer[60..64]);
+    let position = byteorder::LittleEndian::read_u32(&buffer[56..60]);
+    let size = byteorder::LittleEndian::read_u32(&buffer[12..16]);
     let unknown0 = byteorder::LittleEndian::read_i32(&buffer[4..8]);
     let unknown1 = byteorder::LittleEndian::read_i32(&buffer[8..12]);
     let unknown2 = byteorder::LittleEndian::read_i32(&buffer[16..20]);
@@ -227,7 +227,7 @@ fn get_list_element(buffer: &[u8]) -> Result<ListElement, ReaderError> {
 }
 
 fn get_list_position(header: &FileHeader) -> Result<(u64, usize), ReaderError> {
-    let position = converter::i32_to_u64(header.size - (header.total * LIST_ELEMENT_SIZE))?;
-    let size = converter::i32_to_usize(header.total * LIST_ELEMENT_SIZE)?;
+    let position = converter::u32_to_u64(header.size - (header.total * LIST_ELEMENT_SIZE))?;
+    let size = converter::u32_to_usize(header.total * LIST_ELEMENT_SIZE)?;
     Ok((position, size))
 }
