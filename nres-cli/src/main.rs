@@ -79,7 +79,7 @@ fn command_check(_stdout: console::Term, file: String) -> Result<()> {
         let mut output = std::fs::File::create(path).into_diagnostic()?;
         let mut buffer = libnres::reader::get_file(&file, &element).into_diagnostic()?;
 
-        output.write_all(&mut buffer).into_diagnostic()?;
+        output.write_all(&buffer).into_diagnostic()?;
         buffer.clear();
         bar.inc(1);
     }
@@ -148,7 +148,7 @@ fn command_extract(_stdout: console::Term, file: String, out: String, force: boo
 
         let path = format!("{}/{}", out, element.get_filename());
 
-        if force != true && is_exist_file(&path) {
+        if !force && is_exist_file(&path) {
             let message = format!("File \"{}\" exists. Overwrite it?", path);
 
             if !dialoguer::Confirm::new()
@@ -163,7 +163,7 @@ fn command_extract(_stdout: console::Term, file: String, out: String, force: boo
         let mut output = std::fs::File::create(path).into_diagnostic()?;
         let mut buffer = libnres::reader::get_file(&file, &element).into_diagnostic()?;
 
-        output.write_all(&mut buffer).into_diagnostic()?;
+        output.write_all(&buffer).into_diagnostic()?;
         buffer.clear();
         bar.inc(1);
     }
