@@ -28,7 +28,7 @@ pub struct ListElement {
 impl ListElement {
     /// Get full name of the file
     pub fn get_filename(&self) -> String {
-        return format!("{}.{}", self.name, self.extension);
+        format!("{}.{}", self.name, self.extension)
     }
 }
 
@@ -46,13 +46,13 @@ pub struct FileHeader {
 
 /// Get a packed file data
 pub fn get_file(file: &std::fs::File, element: &ListElement) -> Result<Vec<u8>, ReaderError> {
-    let size = get_file_size(&file)?;
+    let size = get_file_size(file)?;
     check_file_size(size)?;
 
-    let header = get_file_header(&file)?;
+    let header = get_file_header(file)?;
     check_file_header(&header, size)?;
 
-    let data = get_element_data(&file, &element)?;
+    let data = get_element_data(file, element)?;
     Ok(data)
 }
 
@@ -60,13 +60,13 @@ pub fn get_file(file: &std::fs::File, element: &ListElement) -> Result<Vec<u8>, 
 pub fn get_list(file: &std::fs::File) -> Result<Vec<ListElement>, ReaderError> {
     let mut list: Vec<ListElement> = Vec::new();
 
-    let size = get_file_size(&file)?;
+    let size = get_file_size(file)?;
     check_file_size(size)?;
 
-    let header = get_file_header(&file)?;
+    let header = get_file_header(file)?;
     check_file_header(&header, size)?;
 
-    get_file_list(&file, &header, &mut list)?;
+    get_file_list(file, &header, &mut list)?;
 
     Ok(list)
 }
@@ -104,14 +104,12 @@ fn get_element_data(file: &std::fs::File, element: &ListElement) -> Result<Vec<u
     let mut reader = std::io::BufReader::new(file);
     let mut buffer = vec![0u8; size];
 
-    match reader.seek(std::io::SeekFrom::Start(position)) {
-        Err(error) => return Err(ReaderError::ReadFile(error)),
-        _ => {}
+    if let Err(error) = reader.seek(std::io::SeekFrom::Start(position)) {
+        return Err(ReaderError::ReadFile(error));
     };
 
-    match reader.read_exact(&mut buffer) {
-        Err(error) => return Err(ReaderError::ReadFile(error)),
-        _ => {}
+    if let Err(error) = reader.read_exact(&mut buffer) {
+        return Err(ReaderError::ReadFile(error));
     };
 
     Ok(buffer)
@@ -127,14 +125,12 @@ fn get_file_header(file: &std::fs::File) -> Result<FileHeader, ReaderError> {
     let mut reader = std::io::BufReader::new(file);
     let mut buffer = vec![0u8; MINIMUM_FILE_SIZE as usize];
 
-    match reader.seek(std::io::SeekFrom::Start(0)) {
-        Err(error) => return Err(ReaderError::ReadFile(error)),
-        _ => {}
+    if let Err(error) = reader.seek(std::io::SeekFrom::Start(0)) {
+        return Err(ReaderError::ReadFile(error));
     };
 
-    match reader.read_exact(&mut buffer) {
-        Err(error) => return Err(ReaderError::ReadFile(error)),
-        _ => {}
+    if let Err(error) = reader.read_exact(&mut buffer) {
+        return Err(ReaderError::ReadFile(error));
     };
 
     let header = FileHeader {
@@ -157,14 +153,12 @@ fn get_file_list(
     let mut reader = std::io::BufReader::new(file);
     let mut buffer = vec![0u8; list_size];
 
-    match reader.seek(std::io::SeekFrom::Start(start_position)) {
-        Err(error) => return Err(ReaderError::ReadFile(error)),
-        _ => {}
+    if let Err(error) = reader.seek(std::io::SeekFrom::Start(start_position)) {
+        return Err(ReaderError::ReadFile(error));
     };
 
-    match reader.read_exact(&mut buffer) {
-        Err(error) => return Err(ReaderError::ReadFile(error)),
-        _ => {}
+    if let Err(error) = reader.read_exact(&mut buffer) {
+        return Err(ReaderError::ReadFile(error));
     }
 
     let buffer_size = converter::usize_to_u32(buffer.len())?;
