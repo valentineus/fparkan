@@ -1,6 +1,6 @@
 [package]
 name = "libnres"
-version = "0.1.2"
+version = "0.1.3"
 description = "Library for NRes files"
 authors = [
   "Valentin Popov <valentin@popov.link>"
