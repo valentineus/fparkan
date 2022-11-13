@@ -3,3 +3,8 @@ members = [
   "libnres",
   "nres-cli"
 ]
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
