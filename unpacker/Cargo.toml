@@ -1,0 +1,9 @@
+[package]
+name = "unpacker"
+version = "0.1.1"
+edition = "2021"
+
+[dependencies]
+byteorder = "1.4.3"
+serde = { version = "1.0.160", features = ["derive"] }
+serde_json = "1.0.96"
