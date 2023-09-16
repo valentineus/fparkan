@@ -1,0 +1,16 @@
+[package]
+name = "libnres"
+version = "0.1.4"
+description = "Library for NRes files"
+authors = ["Valentin Popov <valentin@popov.link>"]
+homepage = "https://git.popov.link/valentineus/fparkan"
+repository = "https://git.popov.link/valentineus/fparkan.git"
+license = "GPL-2.0"
+edition = "2021"
+keywords = ["gamedev", "library", "nres"]
+
+[dependencies]
+byteorder = "1.4"
+log = "0.4"
+miette = "5.6"
+thiserror = "1.0"
