@@ -1,5 +1,5 @@
 [workspace]
-members = ["libnres", "nres-cli", "packer", "unpacker"]
+members = ["libnres", "nres-cli", "packer", "texture-decoder", "unpacker"]
 
 [profile.release]
 codegen-units = 1
