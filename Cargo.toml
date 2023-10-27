@@ -1,4 +1,5 @@
 [workspace]
+resolver = "2"
 members = ["libnres", "nres-cli", "packer", "texture-decoder", "unpacker"]
 
 [profile.release]
