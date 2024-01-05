@@ -53,7 +53,7 @@ fn pack(input: String, output: String) {
 
     for (index, item) in list.iter().enumerate() {
         // Открываем дескриптор файла
-        let path = format!("{}/{}", input, item.name);
+        let path = format!("{}/{}.{}", input, item.name, item.index);
         let file = File::open(path).unwrap();
         let metadata = file.metadata().unwrap();
 
@@ -136,6 +136,11 @@ fn pack(input: String, output: String) {
 
         // Добавляем итоговый буфер в буфер элементов списка
         list_buffer.extend(element_buffer);
+    }
+
+    // Выравнивание буфера
+    while content_buffer.len() % 8 != 0 {
+        content_buffer.push(0);
     }
 
     let mut header_buffer: Vec<u8> = Vec::new();

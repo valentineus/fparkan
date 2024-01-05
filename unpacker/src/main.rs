@@ -102,7 +102,7 @@ fn unpack(input: String, output: String) {
 
     // Распаковываем файлы в директорию
     for element in &list {
-        let path = format!("{}/{}", output, element.name);
+        let path = format!("{}/{}.{}", output, element.name, element.index);
         let mut file = File::create(path).unwrap();
 
         let mut file_buffer = vec![0u8; element.size as usize];
