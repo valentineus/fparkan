@@ -35,7 +35,7 @@ fn main() {
     let input = &args[1];
     let output = &args[2];
 
-    if let Err(err) = decode_texture(&input, &output) {
+    if let Err(err) = decode_texture(input, output) {
         eprintln!("Error: {}", err)
     }
 }
