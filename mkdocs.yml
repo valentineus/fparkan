@@ -1,0 +1,26 @@
+# Project information
+site_name: FParkan
+site_url: https://fparkan.popov.link/
+site_author: Valentin Popov
+site_description: >-
+  Utilities and tools for the game “Parkan: Iron Strategy”.
+
+# Repository
+repo_name: valentineus/fparkan
+repo_url: https://github.com/valentineus/fparkan
+
+# Copyright
+copyright: Copyright &copy; 2023 &mdash; 2024 Valentin Popov
+
+# Configuration
+theme:
+  name: material
+  language: en
+  palette:
+    scheme: slate
+
+# Additional configuration
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/valentineus/fparkan
