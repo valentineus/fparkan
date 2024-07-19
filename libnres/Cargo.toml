@@ -12,5 +12,5 @@ keywords = ["gamedev", "library", "nres"]
 [dependencies]
 byteorder = "1.4"
 log = "0.4"
-miette = "5.6"
+miette = "7.0"
 thiserror = "1.0"
