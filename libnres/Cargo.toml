@@ -13,4 +13,4 @@ keywords = ["gamedev", "library", "nres"]
 byteorder = "1.4"
 log = "0.4"
 miette = "7.0"
-thiserror = "1.0"
+thiserror = "2.0"
