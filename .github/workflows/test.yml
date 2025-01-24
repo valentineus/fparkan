@@ -1,4 +1,4 @@
-name: test suite
+name: Test
 on: [push, pull_request]
 
 jobs:

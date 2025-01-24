@@ -1,23 +1,21 @@
 {
-  "assignees": [
-    "valentineus"
-  ],
   "extends": [
     "config:recommended",
     ":disableDependencyDashboard"
   ],
+  "automerge": true,
   "packageRules": [
     {
       "groupName": "all digest updates",
       "groupSlug": "all-digest",
-      "matchPackagePatterns": [
-        "*"
-      ],
       "matchUpdateTypes": [
         "minor",
         "patch",
         "pin",
         "digest"
+      ],
+      "matchPackageNames": [
+        "*"
       ]
     }
   ]
