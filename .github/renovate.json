@@ -4,6 +4,13 @@
     "config:recommended",
     ":disableDependencyDashboard"
   ],
+  "assignees": [
+    "valentineus"
+  ],
+  "labels": [
+    "dependencies",
+    "automated"
+  ],
   "packageRules": [
     {
       "groupName": "all digest updates",
