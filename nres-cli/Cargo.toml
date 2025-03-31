@@ -11,7 +11,7 @@ keywords = ["cli", "gamedev", "nres"]
 
 [dependencies]
 byteorder = "1.4"
-clap = { version = "4.2", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"] }
 console = "0.15"
 dialoguer = { version = "0.11", features = ["completion"] }
 indicatif = "0.17"
