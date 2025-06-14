@@ -1,12 +1,6 @@
 [workspace]
 resolver = "2"
-members = [
-    "libnres",
-    "nres-cli",
-    "packer",
-    "texture-decoder",
-    "unpacker",
-]
+members = ["libs/*", "tools/*"]
 
 [profile.release]
 codegen-units = 1

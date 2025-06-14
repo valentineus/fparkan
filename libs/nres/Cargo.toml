@@ -1,0 +1,10 @@
+[package]
+name = "libnres"
+version = "0.1.4"
+edition = "2021"
+
+[dependencies]
+byteorder = "1.4"
+log = "0.4"
+miette = "7.0"
+thiserror = "2.0"
