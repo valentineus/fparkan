@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 byteorder = "1.4"
 clap = { version = "4.2", features = ["derive"] }
-console = "0.15"
+console = "0.16"
 dialoguer = { version = "0.11", features = ["completion"] }
 indicatif = "0.17"
 libnres = { version = "0.1", path = "../../libs/nres" }
