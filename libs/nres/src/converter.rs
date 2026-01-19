@@ -2,10 +2,7 @@ use crate::error::ConverterError;
 
 /// Method for converting u32 to u64.
 pub fn u32_to_u64(value: u32) -> Result<u64, ConverterError> {
-    match u64::try_from(value) {
-        Err(error) => Err(ConverterError::Infallible(error)),
-        Ok(result) => Ok(result),
-    }
+    Ok(u64::from(value))
 }
 
 /// Method for converting u32 to usize.

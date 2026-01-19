@@ -73,7 +73,7 @@ fn unpack(input: String, output: String) {
         .unwrap();
     reader.read_exact(&mut list_buffer).unwrap();
 
-    if list_buffer.len() % 64 != 0 {
+    if !list_buffer.len().is_multiple_of(64) {
         panic!("invalid files list")
     }
 
