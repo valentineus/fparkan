@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["libs/*", "tools/*"]
+members = ["libs/*", "tools/*", "packer"]
 
 [profile.release]
 codegen-units = 1

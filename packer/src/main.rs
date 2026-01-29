@@ -64,7 +64,7 @@ fn pack(input: String, output: String) {
 
         // Выравнивание буфера
         if index != 0 {
-            while content_buffer.len() % 8 != 0 {
+            while !content_buffer.len().is_multiple_of(8) {
                 content_buffer.push(0);
             }
         }
@@ -139,7 +139,7 @@ fn pack(input: String, output: String) {
     }
 
     // Выравнивание буфера
-    while content_buffer.len() % 8 != 0 {
+    while !content_buffer.len().is_multiple_of(8) {
         content_buffer.push(0);
     }
 
