@@ -20,6 +20,8 @@ jobs:
         run: |
           renovate
         env:
+          LOG_LEVEL: ${{ vars.RENOVATE_LOG_LEVEL }}
+          RENOVATE_LOG_LEVEL: ${{ vars.RENOVATE_LOG_LEVEL }}
           RENOVATE_CONFIG_FILE: renovate.config.cjs
           RENOVATE_REPOSITORIES: ${{ gitea.repository }}
           RENOVATE_TOKEN: ${{ secrets.RENOVATE_TOKEN }}
