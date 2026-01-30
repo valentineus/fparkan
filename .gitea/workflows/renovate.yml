@@ -20,8 +20,9 @@ jobs:
         run: |
           renovate
         env:
+          GITHUB_COM_TOKEN: ${{ secrets.RENOVATE_GITHUB_TOKEN }}
           LOG_LEVEL: ${{ vars.RENOVATE_LOG_LEVEL }}
-          RENOVATE_LOG_LEVEL: ${{ vars.RENOVATE_LOG_LEVEL }}
           RENOVATE_CONFIG_FILE: renovate.config.cjs
+          RENOVATE_LOG_LEVEL: ${{ vars.RENOVATE_LOG_LEVEL }}
           RENOVATE_REPOSITORIES: ${{ gitea.repository }}
           RENOVATE_TOKEN: ${{ secrets.RENOVATE_TOKEN }}
