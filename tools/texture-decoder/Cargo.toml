@@ -1,8 +1,0 @@
-[package]
-name = "texture-decoder"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-byteorder = "1.4.3"
-image = "0.25.0"

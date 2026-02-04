@@ -1,8 +1,0 @@
-[workspace]
-resolver = "2"
-members = ["libs/*", "tools/*", "packer"]
-
-[profile.release]
-codegen-units = 1
-lto = true
-strip = true
