@@ -51,37 +51,34 @@ dword_1003E0A4          // Длина повтора для LZ77
 Цикл декомпрессии:
     Пока есть входные данные и выходной буфер не заполнен:
 
-        1. Прочитать бит флага:
-           if (flagBits высокий бит == 0):
+        1. Прочитать бит флага (LSB-first):
+           if (flagBits == 0):
                flags = *input++
-               flagBits = 127 (0x7F)
+               flagBits = 8
 
            flag_bit = flags & 1
            flags >>= 1
+           flagBits -= 1
 
-        2. Прочитать второй бит:
-           if (flagBits низкий бит == 0):
-               загрузить новый байт флагов
+        2. Выбор действия по биту:
 
-           second_bit = flags & 1
-           flags >>= 1
-
-        3. Выбор действия по битам:
-
-           a) Если оба бита == 0:
+           a) Если bit == 1:
               // Литерал - копировать один байт
               byte = *input++
               window[position] = byte
               *output++ = byte
               position = (position + 1) & 0xFFF
 
-           b) Если второй бит == 0 (первый == 1):
-              // LZ77 копирование
+           b) Если bit == 0:
+              // LZ77 копирование (2 байта)
               word = *(uint16*)input
               input += 2
 
-              offset = (word >> 4) & 0xFFF       // 12 бит offset
-              length = (word & 0xF) + 3          // 4 бита длины + 3
+              b0 = word & 0xFF
+              b1 = (word >> 8) & 0xFF
+
+              offset = b0 | ((b1 & 0xF0) << 4)   // 12 бит offset
+              length = (b1 & 0x0F) + 3           // 4 бита длины + 3
 
               src_pos = offset
               Повторить length раз:
@@ -97,19 +94,20 @@ dword_1003E0A4          // Длина повтора для LZ77
 ```
 Битовый поток:
 
-[FLAG_BIT] [SECOND_BIT] [DATA]
+Битовый поток:
+
+[FLAG_BIT] [DATA]
 
 Где:
-    FLAG_BIT = 0, SECOND_BIT = 0:  → Литерал (1 байт следует)
-    FLAG_BIT = 1, SECOND_BIT = 0:  → LZ77 копирование (2 байта следуют)
-    FLAG_BIT = любой, SECOND_BIT = 1: → Литерал (1 байт следует)
+    FLAG_BIT = 1: → Литерал (1 байт следует)
+    FLAG_BIT = 0: → LZ77 копирование (2 байта следуют)
 
 Формат LZ77 копирования (2 байта, little-endian):
     Байт 0: offset_low (биты 0-7)
     Байт 1: [length:4][offset_high:4]
 
-    offset = (byte1 >> 4) | (byte0 << 4)  // 12 бит
-    length = (byte1 & 0x0F) + 3           // 4 бита + 3 = 3-18 байт
+    offset = byte0 | ((byte1 & 0xF0) << 4)  // 12 бит
+    length = (byte1 & 0x0F) + 3             // 4 бита + 3 = 3-18 байт
 ```
 
 ## Режим 2: Adaptive Huffman режим (a1 < 0)
@@ -122,7 +120,8 @@ dword_1003E0A4          // Длина повтора для LZ77
 Инициализация таблиц:
     1. Создание таблицы быстрого декодирования (dword_1003B94C[256])
     2. Инициализация длин кодов (byte_1003BD4C[256])
-    3. Построение начального дерева (627 узлов)
+    3. Построение начального дерева (627 узлов, T = 2*N_CHAR - 1)
+       где N_CHAR = 314 (256 литералов + 58 кодов длины)
 ```
 
 ### Алгоритм декодирования
@@ -161,14 +160,11 @@ dword_1003E0A4          // Длина повтора для LZ77
                position = (position + 1) & 0xFFF
 
            else:
-               // LZ77 копирование
-               length = symbol - 253
+               // LZSS копирование (LZHUF)
+               length = symbol - 253          // 3..60
+               match_pos = decode_position()  // префикс + 6 бит
 
-               // Прочитать offset (закодирован отдельно)
-               offset_bits = прочитать_биты(таблица длин)
-               offset = декодировать(offset_bits)
-
-               src_pos = (position - 1 - offset) & 0xFFF
+               src_pos = (position - 1 - match_pos) & 0xFFF
 
                Повторить length раз:
                    byte = window[src_pos]
@@ -207,69 +203,23 @@ def fres_decompress_simple(input_data, output_size):
 
     input_pos = 0
     flags = 0
-    flag_bits_high = 0
-    flag_bits_low = 0
+    flag_bits = 0
 
     while len(output) < output_size and input_pos < len(input_data):
-        # Читаем флаг высокого бита
-        if (flag_bits_high & 1) == 0:
+        # Читаем флаг (LSB-first)
+        if flag_bits == 0:
             if input_pos >= len(input_data):
                 break
             flags = input_data[input_pos]
             input_pos += 1
-            flag_bits_high = 127  # 0x7F
+            flag_bits = 8
 
-        flag_high = flag_bits_high & 1
-        flag_bits_high >>= 1
-
-        # Читаем флаг низкого бита
-        if input_pos >= len(input_data):
-            break
-
-        if (flag_bits_low & 1) == 0:
-            flags = input_data[input_pos]
-            input_pos += 1
-            flag_bits_low = 127
-
-        flag_low = flags & 1
+        flag = flags & 1
         flags >>= 1
+        flag_bits -= 1
 
-        # Обработка по флагам
-        if not flag_low:  # Второй бит == 0
-            if not flag_high:  # Оба бита == 0
-                # Литерал
-                if input_pos >= len(input_data):
-                    break
-                byte = input_data[input_pos]
-                input_pos += 1
-
-                window[position] = byte
-                output.append(byte)
-                position = (position + 1) & 0xFFF
-
-            else:  # Первый == 1, второй == 0
-                # LZ77 копирование
-                if input_pos + 1 >= len(input_data):
-                    break
-
-                word = input_data[input_pos] | (input_data[input_pos + 1] << 8)
-                input_pos += 2
-
-                offset = (word >> 4) & 0xFFF
-                length = (word & 0xF) + 3
-
-                for _ in range(length):
-                    if len(output) >= output_size:
-                        break
-
-                    byte = window[offset]
-                    window[position] = byte
-                    output.append(byte)
-
-                    offset = (offset + 1) & 0xFFF
-                    position = (position + 1) & 0xFFF
-
-        else:  # Второй бит == 1
+        # Обработка по флагу
+        if flag:  # 1 = literal
             # Литерал
             if input_pos >= len(input_data):
                 break
@@ -279,6 +229,27 @@ def fres_decompress_simple(input_data, output_size):
             window[position] = byte
             output.append(byte)
             position = (position + 1) & 0xFFF
+        else:  # 0 = backref (2 байта)
+            if input_pos + 1 >= len(input_data):
+                break
+
+            b0 = input_data[input_pos]
+            b1 = input_data[input_pos + 1]
+            input_pos += 2
+
+            offset = b0 | ((b1 & 0xF0) << 4)
+            length = (b1 & 0x0F) + 3
+
+            for _ in range(length):
+                if len(output) >= output_size:
+                    break
+
+                byte = window[offset]
+                window[position] = byte
+                output.append(byte)
+
+                offset = (offset + 1) & 0xFFF
+                position = (position + 1) & 0xFFF
 
     return bytes(output[:output_size])
 ```
@@ -347,7 +318,10 @@ def initialize_window():
 
 ### 4. Битовые флаги
 
-Используется двойная система флагов для определения типа следующих данных
+Используется один флаговый бит (LSB-first) для определения типа данных:
+
+- `1` → literal (1 байт)
+- `0` → backref (2 байта)
 
 ## Проблемы реализации
 
@@ -363,6 +337,8 @@ def initialize_window():
 
 Необходимо тщательно проверять границы буферов
 
+- В простом режиме перед backref нужно гарантировать наличие **2 байт** входных данных
+
 ## Примеры данных
 
 ### Пример 1: Литералы (простой режим)
@@ -372,7 +348,7 @@ def initialize_window():
 Выход: Последовательность литералов
 
 Пример:
-    Flags: 0x00 (00000000)
+    Flags: 0xFF (11111111)
     Data:  0x41 ('A'), 0x42 ('B'), 0x43 ('C'), ...
     Выход: "ABC..."
 ```
@@ -384,12 +360,12 @@ def initialize_window():
 Выход: Копирование из окна
 
 Пример:
-    Flags: 0x01 (00000001) - первый бит = 1
-    Word:  0x1234
+    Flags: 0x00 (00000000) - первый бит = 0
+    Bytes: b0=0x34, b1=0x12
 
     Разбор:
-        offset = (0x34 << 4) | (0x12 >> 4) = 0x341
-        length = (0x12 & 0xF) + 3 = 5
+        offset = 0x34 | ((0x12 & 0xF0) << 4) = 0x234
+        length = (0x12 & 0x0F) + 3 = 5
 
     Действие: Скопировать 5 байт с позиции offset
 ```
@@ -406,7 +382,7 @@ def debug_fres_decompress(input_data, output_size):
 
     # ... реализация с print на каждом шаге
 
-    print(f"Flag: {flag_high}{flag_low}")
+    print(f"Flag: {flag}")
     if is_literal:
         print(f"  Literal: 0x{byte:02X}")
     else:

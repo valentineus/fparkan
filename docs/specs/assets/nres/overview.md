@@ -10,7 +10,7 @@ NRes — это формат контейнера ресурсов, исполь
 
 ```c
 struct NResHeader {
-    uint32_t signature;      // +0x00: Сигнатура "NRes" (0x7365526E в little-endian)
+    uint32_t signature;      // +0x00: Сигнатура "NRes" (0x7365524E в little-endian)
     uint32_t version;        // +0x04: Версия формата (0x00000100 = версия 1.0)
     uint32_t fileCount;      // +0x08: Количество файлов в архиве
     uint32_t fileSize;       // +0x0C: Общий размер файла в байтах
@@ -19,7 +19,7 @@ struct NResHeader {
 
 **Детали:**
 
-- `signature`: Константа `0x7365526E` (1936020046 в десятичном виде). Это ASCII строка "nRes" в обратном порядке байт
+- `signature`: Константа `0x7365524E` (1936020046 в десятичном виде). Это ASCII строка "NRes" в обратном порядке байт
 - `version`: Всегда должна быть `0x00000100` (256 в десятичном виде) для версии 1.0
 - `fileCount`: Общее количество файлов в архиве (используется для валидации)
 - `fileSize`: Полный размер NRes файла, включая заголовок
@@ -65,7 +65,7 @@ DirectoryOffset = FileSize - (FileCount * 64)
 struct NResFileEntry {
     char     name[16];           // +0x00: Имя файла (NULL-terminated, uppercase)
     uint32_t crc32;              // +0x10: CRC32 хеш упакованных данных
-    uint32_t packMethod;         // +0x14: Флаги метода упаковки и опции
+    uint32_t packMethod;         // +0x14: Флаги метода упаковки (также используется как XOR seed)
     uint32_t unpackedSize;       // +0x18: Размер файла после распаковки
     uint32_t packedSize;         // +0x1C: Размер упакованных данных
     uint32_t dataOffset;         // +0x20: Смещение данных от начала файла
@@ -98,20 +98,17 @@ struct NResFileEntry {
 
 ```c
 // Маски для извлечения метода упаковки
-#define PACK_METHOD_MASK    0x1E0  // Биты 5-8 (основной метод)
-#define PACK_METHOD_MASK2   0x1C0  // Биты 6-7 (альтернативная маска)
+#define PACK_METHOD_MASK    0x1E0  // Биты 5-8 (метод + XOR)
+#define PACK_METHOD_MASK2   0x1C0  // Биты 6-7 (без XOR-бита)
 
-// Методы упаковки (биты 5-8)
-#define PACK_NONE           0x000  // Нет упаковки (копирование)
-#define PACK_XOR            0x020  // XOR-шифрование
-#define PACK_FRES           0x040  // FRES компрессия (устаревшая)
-#define PACK_FRES_XOR       0x060  // FRES + XOR (два прохода)
-#define PACK_ZLIB           0x080  // Zlib сжатие (устаревшее)
-#define PACK_ZLIB_XOR       0x0A0  // Zlib + XOR (два прохода)
-#define PACK_HUFFMAN        0x0E0  // Huffman кодирование (основной метод)
-
-// Дополнительные флаги
-#define FLAG_ENCRYPTED      0x040  // Файл зашифрован/требует декодирования
+// Методы упаковки (packMethod & 0x1E0)
+#define PACK_NONE           0x000  // Нет упаковки (raw)
+#define PACK_XOR            0x020  // XOR (только шифрование)
+#define PACK_FRES           0x040  // FRES (LZSS простой режим)
+#define PACK_FRES_XOR       0x060  // XOR + FRES
+#define PACK_LZHUF          0x080  // LZHUF (LZSS + adaptive Huffman)
+#define PACK_LZHUF_XOR      0x0A0  // XOR + LZHUF
+#define PACK_DEFLATE_RAW    0x100  // RAW-DEFLATE (без zlib-обёртки)
 ```
 
 **Алгоритм определения метода:**
@@ -120,9 +117,13 @@ struct NResFileEntry {
 2. Проверить конкретные значения:
     - `0x000`: Данные не сжаты, простое копирование
     - `0x020`: XOR-шифрование с двухбайтовым ключом
-    - `0x040` или `0x060`: FRES компрессия (может быть + XOR)
-    - `0x080` или `0x0A0`: Zlib компрессия (может быть + XOR)
-    - `0x0E0`: Huffman кодирование (наиболее распространенный)
+    - `0x040` или `0x060`: FRES (может быть + XOR)
+    - `0x080` или `0x0A0`: LZHUF (может быть + XOR)
+    - `0x100`: RAW-DEFLATE (inflate без zlib-обёртки)
+
+**Важно:** `rsGetPackMethod()` возвращает `packMethod & 0x1C0`, то есть маску **без XOR-бита `0x20`**. Это нужно учитывать при сравнении.
+
+**Примечание про XOR seed:** значение для XOR берётся из поля `packMethod` (смещение `+0x14`). Это же поле может быть перезаписано при формировании каталога (см. раздел о `rsOpenLib`), если в библиотеке нет готовой таблицы сортировки.
 
 ### Поле: unpackedSize (смещение +0x18, 4 байта)
 
@@ -163,9 +164,9 @@ struct NResFileEntry {
 
 - **Назначение**: Индекс для быстрого поиска по отсортированному каталогу
 - **Использование**:
-    - Каталог сортируется по алфавиту (имени файлов)
-    - `sortIndex` хранит оригинальный порядковый номер файла
-    - Позволяет использовать бинарный поиск для функции `rsFind()`
+    - В `rsOpenLib` при отсутствии маркера `0xABBA` формируется таблица индексов сортировки имён
+    - Индексы записываются в это поле с шагом 0x40 (по записи)
+    - Используется `rsFind()` через таблицу индексов, а не прямую сортировку записей
 
 ### Поле: reserved (смещение +0x30, 16 байт)
 
@@ -185,8 +186,8 @@ struct NResFileEntry {
 ### 2. XOR-шифрование (PACK_XOR = 0x020)
 
 ```c
-// Ключ берется из поля crc32
-uint16_t key = (uint16_t)(crc32 & 0xFFFF);
+// Ключ/seed берется из поля packMethod (смещение +0x14)
+uint16_t key = (uint16_t)(packMethod & 0xFFFF);
 
 for (int i = 0; i < packedSize; i++) {
     uint8_t byte = source[i];
@@ -200,7 +201,7 @@ for (int i = 0; i < packedSize; i++) {
 
 **Ключевые особенности:**
 
-- Используется 16-битный ключ из младших байт CRC32
+- Используется 16-битный ключ из младших байт поля `packMethod`
 - Ключ изменяется после каждого байта по специальному алгоритму
 - Операции: XOR с старшим байтом ключа и со сдвинутым значением
 
@@ -215,30 +216,19 @@ sub_1001B22E() - функция декомпрессии FRES
     - Использует скользящее окно для ссылок
 ```
 
-### 4. [Huffman кодирование](huffman_decompression.md) (PACK_HUFFMAN = 0x0E0)
+### 4. [LZHUF (adaptive Huffman)](fres_decompression.md) (PACK_LZHUF = 0x080, 0x0A0)
 
 Наиболее сложный и эффективный метод:
 
-```c
-// Структура декодера
-struct HuffmanDecoder {
-    uint32_t  bitBuffer[0x4000];   // Буфер для битов
-    uint32_t  compressedSize;      // Размер сжатых данных
-    uint32_t  outputPosition;      // Текущая позиция в выходном буфере
-    uint32_t  inputPosition;       // Позиция в входных данных
-    uint8_t*  sourceData;          // Указатель на сжатые данные
-    uint8_t*  destData;            // Указатель на выходной буфер
-    uint32_t  bitPosition;         // Позиция бита в буфере
-    // ... дополнительные поля
-};
-```
-
 **Процесс декодирования:**
 
-1. Инициализация структуры декодера
-2. Чтение битов и построение дерева Huffman
-3. Декодирование символов по дереву
-4. Запись в выходной буфер
+1. Распаковка LZSS + adaptive Huffman (Okumura LZHUF)
+2. Дерево обновляется после каждого символа
+3. Match-символы преобразуются в длину и позицию
+
+### 5. [RAW-DEFLATE](huffman_decompression.md) (PACK_DEFLATE_RAW = 0x100)
+
+Это inflate без zlib-обёртки (без 2-байтового заголовка и Adler32).
 
 ## Высокоуровневая инструкция по реализации
 
@@ -252,7 +242,7 @@ def open_nres_file(filepath):
         signature, version, file_count, file_size = struct.unpack('<4I', header_data)
 
         # 2. Проверяем сигнатуру
-        if signature != 0x7365526E:  # "nRes"
+        if signature != 0x7365524E:  # "NRes"
             raise ValueError("Неверная сигнатура файла")
 
         # 3. Проверяем версию
@@ -315,7 +305,7 @@ def read_directory(nres_file):
 ```python
 def find_file(entries, filename):
     # Имена в архиве хранятся в UPPERCASE
-    search_name = filename.upper()
+    search_name = filename.upper()[:15]
 
     # Используем бинарный поиск, так как каталог отсортирован
     # Сортировка по sort_index восстанавливает алфавитный порядок
@@ -357,20 +347,27 @@ def extract_file(nres_file, entry):
 
     elif pack_method == 0x020:
         # XOR-шифрование
-        return unpack_xor(packed_data, entry['crc32'], entry['unpacked_size'])
+        return unpack_xor(packed_data, entry['pack_method'], entry['unpacked_size'])
 
     elif pack_method == 0x040 or pack_method == 0x060:
         # FRES компрессия (может быть с XOR)
         if pack_method == 0x060:
             # Сначала XOR
-            temp_data = unpack_xor(packed_data, entry['crc32'], entry['xor_size'])
+            temp_data = unpack_xor(packed_data, entry['pack_method'], entry['xor_size'])
             return unpack_fres(temp_data, entry['unpacked_size'])
         else:
             return unpack_fres(packed_data, entry['unpacked_size'])
 
-    elif pack_method == 0x0E0:
-        # Huffman кодирование
-        return unpack_huffman(packed_data, entry['unpacked_size'])
+    elif pack_method == 0x080 or pack_method == 0x0A0:
+        # LZHUF (может быть с XOR)
+        if pack_method == 0x0A0:
+            temp_data = unpack_xor(packed_data, entry['pack_method'], entry['xor_size'])
+            return unpack_lzhuf(temp_data, entry['unpacked_size'])
+        return unpack_lzhuf(packed_data, entry['unpacked_size'])
+
+    elif pack_method == 0x100:
+        # RAW-DEFLATE
+        return unpack_deflate_raw(packed_data, entry['unpacked_size'])
 
     else:
         raise ValueError(f"Неподдерживаемый метод упаковки: 0x{pack_method:X}")
@@ -383,10 +380,10 @@ def unpack_none(data):
     """Без упаковки - просто возвращаем данные"""
     return data
 
-def unpack_xor(data, crc32, size):
+def unpack_xor(data, pack_method, size):
     """XOR-дешифрование с изменяющимся ключом"""
     result = bytearray(size)
-    key = crc32 & 0xFFFF  # Берем младшие 16 бит
+    key = pack_method & 0xFFFF  # Берем младшие 16 бит из поля packMethod
 
     for i in range(min(size, len(data))):
         byte = data[i]
@@ -412,13 +409,22 @@ def unpack_fres(data, unpacked_size):
     decoder = FRESDecoder()
     return decoder.decompress(data, unpacked_size)
 
-def unpack_huffman(data, unpacked_size):
+def unpack_lzhuf(data, unpacked_size):
     """
-    Huffman декодирование (DEFLATE-подобный)
-    Полная реализация в nres_decompression.py (класс HuffmanDecoder)
+    LZHUF (LZSS + adaptive Huffman)
+    Полная реализация в nres_decompression.py (класс LZHUDecoder)
     """
-    from nres_decompression import HuffmanDecoder
-    decoder = HuffmanDecoder()
+    from nres_decompression import LZHUDecoder
+    decoder = LZHUDecoder()
+    return decoder.decompress(data, unpacked_size)
+
+def unpack_deflate_raw(data, unpacked_size):
+    """
+    RAW-DEFLATE (inflate без zlib-обертки)
+    Полная реализация в nres_decompression.py (класс RawDeflateDecoder)
+    """
+    from nres_decompression import RawDeflateDecoder
+    decoder = RawDeflateDecoder()
     return decoder.decompress(data, unpacked_size)
 ```
 
@@ -455,6 +461,30 @@ def extract_all(nres_filepath, output_dir):
         except Exception as e:
             print(f"  ✗ Ошибка: {e}")
 ```
+
+## Поддерживаемые контейнеры
+
+### 1. NRes (MAGIC "NRes")
+
+- Открывается через `niOpenResFile/niOpenResInMem`
+- Каталог находится в конце файла (см. структуру выше)
+
+### 2. rsLib / NL (MAGIC "NL")
+
+Отдельный формат контейнера, обрабатывается `rsOpenLib`:
+
+- В начале файла проверяется `*(_WORD*)buf == 0x4C4E` (ASCII "NL" в little-endian)
+- `buf[3] == 1` — версия/маркер
+- `buf[2]` — количество записей
+- Каталог расположен с offset `0x20`, размер `0x20 * count`
+- Каталог перед разбором дешифруется (байтовый XOR-поток)
+
+## Поиск по имени (rsFind)
+
+- Имя обрезается до 16 байт, `name[15] = 0`
+- Приводится к верхнему регистру (`_strupr`)
+- Поиск идёт по таблице индексов сортировки (значение хранится в поле `sortIndex`)
+- Если в rsLib нет маркера `0xABBA`, таблица строится пузырьковой сортировкой и индексы записываются в поле записи
 
 ## Особенности и важные замечания
 
@@ -539,7 +569,7 @@ def is_nres_file(filepath):
     try:
         with open(filepath, 'rb') as f:
             signature = struct.unpack('<I', f.read(4))[0]
-            return signature == 0x7365526E
+            return signature == 0x7365524E
     except:
         return False
 ```
@@ -553,9 +583,9 @@ def get_file_info(entry):
         0x020: "XOR",
         0x040: "FRES",
         0x060: "FRES+XOR",
-        0x080: "Zlib",
-        0x0A0: "Zlib+XOR",
-        0x0E0: "Huffman"
+        0x080: "LZHUF",
+        0x0A0: "LZHUF+XOR",
+        0x100: "RAW-DEFLATE"
     }
 
     pack_method = entry['pack_method'] & 0x1E0

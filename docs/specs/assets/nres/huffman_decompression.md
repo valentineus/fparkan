@@ -2,7 +2,7 @@
 
 ## Обзор
 
-Это реализация **DEFLATE-подобного** алгоритма декомпрессии, используемого в [NRes](overview.md). Алгоритм поддерживает три режима блоков и использует два Huffman дерева для кодирования литералов/длин и расстояний.
+Это реализация **RAW-DEFLATE (inflate)**, используемого в [NRes](overview.md). Поток подаётся без zlib-обёртки (нет 2-байтового заголовка и Adler32). Алгоритм поддерживает три режима блоков и использует два Huffman дерева для кодирования литералов/длин и расстояний.
 
 ```c
 int __thiscall sub_1001AF10(
@@ -15,30 +15,31 @@ int __thiscall sub_1001AF10(
 
 ```c
 struct HuffmanContext {
-    uint32_t  bitBuffer[0x4000];    // 0x00000-0x0FFFF: Битовый буфер (32KB)
-    uint32_t  compressedSize;       // 0x10000: Размер сжатых данных
-    uint32_t  unknown1;             // 0x10004: Не используется
-    uint32_t  outputPosition;       // 0x10008: Позиция в выходном буфере
-    uint32_t  currentByte;          // 0x1000C: Текущий байт
-    uint8_t*  sourceData;           // 0x10010: Указатель на сжатые данные
-    uint8_t*  destData;             // 0x10014: Указатель на выходной буфер
-    uint32_t  bitPosition;          // 0x10018: Позиция бита
-    uint32_t  inputPosition;        // 0x1001C: Позиция чтения (this[16389])
-    uint32_t  decodedBytes;         // 0x10020: Декодированные байты (this[16386])
-    uint32_t  bitBufferValue;       // 0x10024: Значение бит буфера (this[16391])
-    uint32_t  bitsAvailable;        // 0x10028: Доступные биты (this[16392])
+    uint8_t   window[0x10000];      // 0x00000-0x0FFFF: Внутренний буфер/окно
+    uint32_t  compressedSize;       // 0x10000: packedSize
+    uint32_t  outputPosition;       // 0x10004: Сколько уже выведено
+    uint32_t  windowPos;            // 0x10008: Позиция в 0x8000 окне
+    uint32_t  sourcePtr;            // 0x1000C: Указатель на сжатые данные
+    uint32_t  destPtr;              // 0x10010: Указатель на выходной буфер
+    uint32_t  sourcePos;            // 0x10014: Текущая позиция чтения
+    uint32_t  unpackedSize;         // 0x10018: Ожидаемый размер распаковки
+    uint32_t  bitBufferValue;       // 0x1001C: Битовый буфер
+    uint32_t  bitsAvailable;        // 0x10020: Количество доступных бит
+    uint32_t  maxWindowPosSeen;     // 0x10024: Максимум окна (статистика)
     // ...
 };
 
-// Смещения в структуре:
-#define CTX_OUTPUT_POS     16385    // this[16385]
-#define CTX_DECODED_BYTES  16386    // this[16386]
-#define CTX_SOURCE_PTR     16387    // this[16387]
-#define CTX_DEST_PTR       16388    // this[16388]
-#define CTX_INPUT_POS      16389    // this[16389]
-#define CTX_BIT_BUFFER     16391    // this[16391]
-#define CTX_BITS_COUNT     16392    // this[16392]
-#define CTX_MAX_SYMBOL     16393    // this[16393]
+// Смещения в структуре (индексация this[]):
+#define CTX_COMPRESSED_SIZE 0x4000  // this[0x4000] == 0x10000
+#define CTX_OUTPUT_POS      16385   // this[16385] == 0x10004
+#define CTX_WINDOW_POS      16386   // this[16386] == 0x10008
+#define CTX_SOURCE_PTR      16387   // this[16387] == 0x1000C
+#define CTX_DEST_PTR        16388   // this[16388] == 0x10010
+#define CTX_SOURCE_POS      16389   // this[16389] == 0x10014
+#define CTX_UNPACKED_SIZE   16390   // this[16390] == 0x10018
+#define CTX_BIT_BUFFER      16391   // this[16391] == 0x1001C
+#define CTX_BITS_COUNT      16392   // this[16392] == 0x10020
+#define CTX_MAX_WINDOW_POS  16393   // this[16393] == 0x10024
 ```
 
 ## Три режима блоков
@@ -55,6 +56,12 @@ TYPE:
     10 = Сжатый с динамическими Huffman кодами
     11 = Зарезервировано (ошибка)
 ```
+
+Соответствие функциям:
+
+- type 0 → `sub_1001A750` (stored)
+- type 1 → `sub_1001A8C0` (fixed Huffman)
+- type 2 → `sub_1001AA30` (dynamic Huffman)
 
 ### Основной цикл декодирования
 
@@ -417,33 +424,33 @@ def decode_huffman_symbol(ctx, tree):
 ```python
 def write_output_byte(ctx, byte):
     """Записать байт в выходной буфер"""
-    # Записываем в bitBuffer (используется как циклический буфер)
-    ctx.bitBuffer[ctx.decodedBytes] = byte
-    ctx.decodedBytes += 1
+    # Записываем в окно 0x8000
+    ctx.window[ctx.windowPos] = byte
+    ctx.windowPos += 1
 
-    # Если буфер заполнен (32KB)
-    if ctx.decodedBytes >= 0x8000:
+    # Если окно заполнено (32KB)
+    if ctx.windowPos >= 0x8000:
         flush_output_buffer(ctx)
 
 
 def flush_output_buffer(ctx):
     """Сбросить выходной буфер в финальный выход"""
-    # Копируем данные в финальный выходной буфер
-    dest_offset = ctx.outputPosition + ctx.destData
-    memcpy(dest_offset, ctx.bitBuffer, ctx.decodedBytes)
+    # Копируем окно в финальный выходной буфер
+    dest_offset = ctx.outputPosition + ctx.destPtr
+    memcpy(dest_offset, ctx.window, ctx.windowPos)
 
     # Обновляем счетчики
-    ctx.outputPosition += ctx.decodedBytes
-    ctx.decodedBytes = 0
+    ctx.outputPosition += ctx.windowPos
+    ctx.windowPos = 0
 
 
 def copy_from_history(ctx, distance, length):
     """Скопировать данные из истории (LZ77)"""
     # Позиция источника в циклическом буфере
-    src_pos = (ctx.decodedBytes - distance) & 0x7FFF
+    src_pos = (ctx.windowPos - distance) & 0x7FFF
 
     for i in range(length):
-        byte = ctx.bitBuffer[src_pos]
+        byte = ctx.window[src_pos]
         write_output_byte(ctx, byte)
         src_pos = (src_pos + 1) & 0x7FFF
 ```
@@ -452,7 +459,7 @@ def copy_from_history(ctx, distance, length):
 
 ```python
 class HuffmanDecoder:
-    """Полный DEFLATE-подобный декодер"""
+    """Полный RAW-DEFLATE декодер"""
 
     def __init__(self, input_data, output_size):
         self.input_data = input_data
@@ -582,7 +589,7 @@ def debug_huffman_decode(data):
 
 ## Заключение
 
-Этот Huffman декодер реализует **DEFLATE**-совместимый алгоритм с тремя режимами блоков:
+Этот декодер реализует **RAW-DEFLATE** с тремя режимами блоков:
 
 1. **Несжатый** - для несжимаемых данных
 2. **Фиксированный Huffman** - быстрое декодирование с предопределенными таблицами
