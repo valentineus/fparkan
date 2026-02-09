@@ -23,11 +23,7 @@ theme:
 nav:
   - Home: index.md
   - Specs:
-      - Assets:
-          - NRes:
-              - Документация по формату: specs/assets/nres/overview.md
-              - FRES Декомпрессия: specs/assets/nres/fres_decompression.md
-              - Huffman Декомпрессия: specs/assets/nres/huffman_decompression.md
+    - NRes / RsLi: specs/nres.md
 
 # Additional configuration
 extra:
