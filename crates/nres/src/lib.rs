@@ -20,18 +20,14 @@ pub struct OpenOptions {
     pub prefetch_pages: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub enum OpenMode {
+    #[default]
     ReadOnly,
     ReadWrite,
 }
 
-impl Default for OpenMode {
-    fn default() -> Self {
-        Self::ReadOnly
-    }
-}
-
+#[derive(Debug)]
 pub struct Archive {
     bytes: Arc<[u8]>,
     entries: Vec<EntryRecord>,
@@ -286,8 +282,7 @@ impl Editor {
 
     pub fn commit(mut self) -> Result<()> {
         let count_u32 = u32::try_from(self.entries.len()).map_err(|_| Error::IntegerOverflow)?;
-        let mut out = Vec::new();
-        out.resize(16, 0);
+        let mut out = vec![0; 16];
 
         for entry in &mut self.entries {
             entry.meta.data_offset =
@@ -626,238 +621,4 @@ fn unix_time_nanos() -> u128 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::any::Any;
-    use std::fs;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
-
-    fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = fs::read_dir(root) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                collect_files_recursive(&path, out);
-            } else if path.is_file() {
-                out.push(path);
-            }
-        }
-    }
-
-    fn nres_test_files() -> Vec<PathBuf> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("testdata")
-            .join("nres");
-        let mut files = Vec::new();
-        collect_files_recursive(&root, &mut files);
-        files.sort();
-        files
-            .into_iter()
-            .filter(|path| {
-                fs::read(path)
-                    .map(|data| data.get(0..4) == Some(b"NRes"))
-                    .unwrap_or(false)
-            })
-            .collect()
-    }
-
-    fn make_temp_copy(original: &Path, bytes: &[u8]) -> PathBuf {
-        let mut path = std::env::temp_dir();
-        let file_name = original
-            .file_name()
-            .and_then(|v| v.to_str())
-            .unwrap_or("archive");
-        path.push(format!(
-            "nres-test-{}-{}-{}",
-            std::process::id(),
-            unix_time_nanos(),
-            file_name
-        ));
-        fs::write(&path, bytes).expect("failed to create temp file");
-        path
-    }
-
-    fn panic_message(payload: Box<dyn Any + Send>) -> String {
-        let any = payload.as_ref();
-        if let Some(message) = any.downcast_ref::<String>() {
-            return message.clone();
-        }
-        if let Some(message) = any.downcast_ref::<&str>() {
-            return (*message).to_string();
-        }
-        String::from("panic without message")
-    }
-
-    #[test]
-    fn nres_read_and_roundtrip_all_files() {
-        let files = nres_test_files();
-        assert!(!files.is_empty(), "testdata/nres contains no NRes archives");
-
-        let checked = files.len();
-        let mut success = 0usize;
-        let mut failures = Vec::new();
-
-        for path in files {
-            let display_path = path.display().to_string();
-            let result = catch_unwind(AssertUnwindSafe(|| {
-                let original = fs::read(&path).expect("failed to read archive");
-                let archive = Archive::open_path(&path)
-                    .unwrap_or_else(|err| panic!("failed to open {}: {err}", path.display()));
-
-                let count = archive.entry_count();
-                assert_eq!(
-                    count,
-                    archive.entries().count(),
-                    "entry count mismatch: {}",
-                    path.display()
-                );
-
-                for idx in 0..count {
-                    let id = EntryId(idx as u32);
-                    let entry = archive
-                        .get(id)
-                        .unwrap_or_else(|| panic!("missing entry #{idx} in {}", path.display()));
-
-                    let payload = archive.read(id).unwrap_or_else(|err| {
-                        panic!("read failed for {} entry #{idx}: {err}", path.display())
-                    });
-
-                    let mut out = Vec::new();
-                    let written = archive.read_into(id, &mut out).unwrap_or_else(|err| {
-                        panic!(
-                            "read_into failed for {} entry #{idx}: {err}",
-                            path.display()
-                        )
-                    });
-                    assert_eq!(
-                        written,
-                        payload.as_slice().len(),
-                        "size mismatch in {} entry #{idx}",
-                        path.display()
-                    );
-                    assert_eq!(
-                        out.as_slice(),
-                        payload.as_slice(),
-                        "payload mismatch in {} entry #{idx}",
-                        path.display()
-                    );
-
-                    let raw = archive
-                        .raw_slice(id)
-                        .unwrap_or_else(|err| {
-                            panic!(
-                                "raw_slice failed for {} entry #{idx}: {err}",
-                                path.display()
-                            )
-                        })
-                        .expect("raw_slice must return Some for file-backed archive");
-                    assert_eq!(
-                        raw,
-                        payload.as_slice(),
-                        "raw slice mismatch in {} entry #{idx}",
-                        path.display()
-                    );
-
-                    let found = archive.find(&entry.meta.name).unwrap_or_else(|| {
-                        panic!(
-                            "find failed for name '{}' in {}",
-                            entry.meta.name,
-                            path.display()
-                        )
-                    });
-                    let found_meta = archive.get(found).expect("find returned invalid id");
-                    assert!(
-                        found_meta.meta.name.eq_ignore_ascii_case(&entry.meta.name),
-                        "find returned unrelated entry in {}",
-                        path.display()
-                    );
-                }
-
-                let temp_copy = make_temp_copy(&path, &original);
-                let mut editor = Archive::edit_path(&temp_copy)
-                    .unwrap_or_else(|err| panic!("edit_path failed for {}: {err}", path.display()));
-
-                for idx in 0..count {
-                    let data = archive
-                        .read(EntryId(idx as u32))
-                        .unwrap_or_else(|err| {
-                            panic!(
-                                "read before replace failed for {} entry #{idx}: {err}",
-                                path.display()
-                            )
-                        })
-                        .into_owned();
-                    editor
-                        .replace_data(EntryId(idx as u32), &data)
-                        .unwrap_or_else(|err| {
-                            panic!(
-                                "replace_data failed for {} entry #{idx}: {err}",
-                                path.display()
-                            )
-                        });
-                }
-
-                editor
-                    .commit()
-                    .unwrap_or_else(|err| panic!("commit failed for {}: {err}", path.display()));
-                let rebuilt = fs::read(&temp_copy).expect("failed to read rebuilt archive");
-                let _ = fs::remove_file(&temp_copy);
-
-                assert_eq!(
-                    original,
-                    rebuilt,
-                    "byte-to-byte roundtrip mismatch for {}",
-                    path.display()
-                );
-            }));
-
-            match result {
-                Ok(()) => success += 1,
-                Err(payload) => {
-                    failures.push(format!("{}: {}", display_path, panic_message(payload)));
-                }
-            }
-        }
-
-        let failed = failures.len();
-        eprintln!(
-            "NRes summary: checked={}, success={}, failed={}",
-            checked, success, failed
-        );
-        if !failures.is_empty() {
-            panic!(
-                "NRes validation failed.\nsummary: checked={}, success={}, failed={}\n{}",
-                checked,
-                success,
-                failed,
-                failures.join("\n")
-            );
-        }
-    }
-
-    #[test]
-    fn nres_raw_mode_exposes_whole_file() {
-        let files = nres_test_files();
-        let first = files.first().expect("testdata/nres has no archives");
-        let original = fs::read(first).expect("failed to read archive");
-        let arc: Arc<[u8]> = Arc::from(original.clone().into_boxed_slice());
-
-        let archive = Archive::open_bytes(
-            arc,
-            OpenOptions {
-                raw_mode: true,
-                sequential_hint: false,
-                prefetch_pages: false,
-            },
-        )
-        .expect("raw mode open failed");
-
-        assert_eq!(archive.entry_count(), 1);
-        let data = archive.read(EntryId(0)).expect("raw read failed");
-        assert_eq!(data.as_slice(), original.as_slice());
-    }
-}
+mod tests;
