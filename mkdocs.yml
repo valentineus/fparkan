@@ -15,7 +15,7 @@ copyright: Copyright &copy; 2023 &mdash; 2024 Valentin Popov
 # Configuration
 theme:
   name: material
-  language: en
+  language: ru
   palette:
     scheme: slate
 
