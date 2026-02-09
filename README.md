@@ -45,8 +45,8 @@ Open source проект с реализацией компонентов игр
 
 Проект активно поддерживается и открыт для contribution. Issues и pull requests можно создавать в обоих репозиториях:
 
-- **Primary development**: [valentineus/fparkan](https://code.popov.link/valentineus/fparkan/issues)
-- **GitHub mirror**: [valentineus/fparkan](https://github.com/valentineus/fparkan/issues)
+- **Primary development**: [valentineus/fparkan](https://code.popov.link/valentineus/fparkan)
+- **GitHub mirror**: [valentineus/fparkan](https://github.com/valentineus/fparkan)
 
 Основная разработка ведётся в self-hosted репозитории.
 
