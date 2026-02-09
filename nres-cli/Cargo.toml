@@ -16,5 +16,5 @@ console = "0.15"
 dialoguer = { version = "0.11", features = ["completion"] }
 indicatif = "0.17"
 libnres = { version = "0.1", path = "../libnres" }
-miette = { version = "7.0", features = ["fancy"] }
+miette = { version = "7.6", features = ["fancy"] }
 tempdir = "0.3"
