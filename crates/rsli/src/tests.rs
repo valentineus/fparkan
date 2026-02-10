@@ -668,6 +668,44 @@ fn rsli_synthetic_all_methods_roundtrip() {
 }
 
 #[test]
+fn rsli_xorlzss_huffman_on_the_fly_roundtrip() {
+    let plain: Vec<u8> = (0..512u16).map(|i| b'A' + (i % 26) as u8).collect();
+    let entries = vec![SyntheticRsliEntry {
+        name: "XLZH_ONFLY".to_string(),
+        method_raw: 0x0A0,
+        plain: plain.clone(),
+        declared_packed_size: None,
+    }];
+
+    let bytes = build_rsli_bytes(
+        &entries,
+        &RsliBuildOptions {
+            seed: 0x0BAD_C0DE,
+            presorted: true,
+            overlay: 0,
+            add_ao_trailer: false,
+        },
+    );
+    let path = write_temp_file("rsli-xorlzh-onfly", &bytes);
+
+    let library = Library::open_path(&path).expect("open synthetic XLZH archive failed");
+    let id = library
+        .find("XLZH_ONFLY")
+        .expect("find XLZH_ONFLY entry failed");
+
+    let loaded = library.load(id).expect("load XLZH_ONFLY failed");
+    assert_eq!(loaded, plain);
+
+    let packed = library
+        .load_packed(id)
+        .expect("load_packed XLZH_ONFLY failed");
+    let unpacked = library.unpack(&packed).expect("unpack XLZH_ONFLY failed");
+    assert_eq!(unpacked, loaded);
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
 fn rsli_synthetic_overlay_and_ao_trailer() {
     let entries = vec![SyntheticRsliEntry {
         name: "OVERLAY".to_string(),

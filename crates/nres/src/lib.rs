@@ -111,7 +111,9 @@ impl Archive {
             let mut high = self.entries.len();
             while low < high {
                 let mid = low + (high - low) / 2;
-                let target_idx = self.entries[mid].meta.sort_index as usize;
+                let Ok(target_idx) = usize::try_from(self.entries[mid].meta.sort_index) else {
+                    break;
+                };
                 if target_idx >= self.entries.len() {
                     break;
                 }
@@ -396,7 +398,10 @@ fn parse_archive(bytes: &[u8], raw_mode: bool) -> Result<(Vec<EntryRecord>, u64)
                 name
             },
         };
-        return Ok((vec![entry], bytes.len() as u64));
+        return Ok((
+            vec![entry],
+            u64::try_from(bytes.len()).map_err(|_| Error::IntegerOverflow)?,
+        ));
     }
 
     if bytes.len() < 16 {

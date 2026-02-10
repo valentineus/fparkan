@@ -1,4 +1,4 @@
-use super::xor::xor_stream;
+use super::xor::XorState;
 use crate::error::Error;
 use crate::Result;
 
@@ -10,22 +10,14 @@ pub(crate) const LZH_T: usize = LZH_N_CHAR * 2 - 1;
 pub(crate) const LZH_R: usize = LZH_T - 1;
 pub(crate) const LZH_MAX_FREQ: u16 = 0x8000;
 
-/// LZSS-Huffman decompression with optional XOR pre-decryption
+/// LZSS-Huffman decompression with optional on-the-fly XOR decryption.
 pub fn lzss_huffman_decompress(
     data: &[u8],
     expected_size: usize,
     xor_key: Option<u16>,
 ) -> Result<Vec<u8>> {
-    // TODO: Full optimization for Huffman variant (rare in practice)
-    // For now, fallback to separate XOR step for Huffman
-    if let Some(key) = xor_key {
-        let decrypted = xor_stream(data, key);
-        let mut decoder = LzhDecoder::new(&decrypted);
-        decoder.decode(expected_size)
-    } else {
-        let mut decoder = LzhDecoder::new(data);
-        decoder.decode(expected_size)
-    }
+    let mut decoder = LzhDecoder::new(data, xor_key);
+    decoder.decode(expected_size)
 }
 
 struct LzhDecoder<'a> {
@@ -40,9 +32,9 @@ struct LzhDecoder<'a> {
 }
 
 impl<'a> LzhDecoder<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    fn new(data: &'a [u8], xor_key: Option<u16>) -> Self {
         let mut decoder = Self {
-            bit_reader: BitReader::new(data),
+            bit_reader: BitReader::new(data, xor_key),
             text: [0x20u8; LZH_N],
             freq: [0u16; LZH_T + 1],
             parent: [0usize; LZH_T + LZH_N_CHAR],
@@ -257,23 +249,37 @@ struct BitReader<'a> {
     data: &'a [u8],
     byte_pos: usize,
     bit_mask: u8,
+    current_byte: u8,
+    xor_state: Option<XorState>,
 }
 
 impl<'a> BitReader<'a> {
-    fn new(data: &'a [u8]) -> Self {
+    fn new(data: &'a [u8], xor_key: Option<u16>) -> Self {
         Self {
             data,
             byte_pos: 0,
             bit_mask: 0x80,
+            current_byte: 0,
+            xor_state: xor_key.map(XorState::new),
         }
     }
 
     fn read_bit_or_zero(&mut self) -> u8 {
-        let Some(byte) = self.data.get(self.byte_pos).copied() else {
-            return 0;
-        };
+        if self.bit_mask == 0x80 {
+            let Some(mut byte) = self.data.get(self.byte_pos).copied() else {
+                return 0;
+            };
+            if let Some(state) = &mut self.xor_state {
+                byte = state.decrypt_byte(byte);
+            }
+            self.current_byte = byte;
+        }
 
-        let bit = if (byte & self.bit_mask) != 0 { 1 } else { 0 };
+        let bit = if (self.current_byte & self.bit_mask) != 0 {
+            1
+        } else {
+            0
+        };
         self.bit_mask >>= 1;
         if self.bit_mask == 0 {
             self.bit_mask = 0x80;

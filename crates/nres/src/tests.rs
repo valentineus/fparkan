@@ -610,6 +610,52 @@ fn nres_synthetic_read_find_and_edit() {
 }
 
 #[test]
+fn nres_find_falls_back_when_sort_index_is_out_of_range() {
+    let mut bytes = build_nres_bytes(&[
+        SyntheticEntry {
+            kind: 1,
+            attr1: 0,
+            attr2: 0,
+            attr3: 0,
+            name: "Alpha",
+            data: b"a",
+        },
+        SyntheticEntry {
+            kind: 2,
+            attr1: 0,
+            attr2: 0,
+            attr3: 0,
+            name: "Beta",
+            data: b"b",
+        },
+        SyntheticEntry {
+            kind: 3,
+            attr1: 0,
+            attr2: 0,
+            attr3: 0,
+            name: "Gamma",
+            data: b"c",
+        },
+    ]);
+
+    let entry_count = 3usize;
+    let directory_offset = bytes
+        .len()
+        .checked_sub(entry_count * 64)
+        .expect("directory offset underflow");
+    let mid_entry_sort_index = directory_offset + 64 + 60;
+    bytes[mid_entry_sort_index..mid_entry_sort_index + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+
+    let archive = Archive::open_bytes(Arc::from(bytes.into_boxed_slice()), OpenOptions::default())
+        .expect("open archive with corrupted sort index failed");
+
+    assert_eq!(archive.find("alpha"), Some(EntryId(0)));
+    assert_eq!(archive.find("BETA"), Some(EntryId(1)));
+    assert_eq!(archive.find("gamma"), Some(EntryId(2)));
+    assert_eq!(archive.find("missing"), None);
+}
+
+#[test]
 fn nres_validation_error_cases() {
     let valid = build_nres_bytes(&[SyntheticEntry {
         kind: 1,
