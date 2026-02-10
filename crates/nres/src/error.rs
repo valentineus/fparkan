@@ -19,6 +19,9 @@ pub enum Error {
     InvalidEntryCount {
         got: i32,
     },
+    TooManyEntries {
+        got: usize,
+    },
     DirectoryOutOfBounds {
         directory_offset: u64,
         directory_len: u64,
@@ -65,6 +68,7 @@ impl fmt::Display for Error {
                 write!(f, "NRes total_size mismatch: header={header}, actual={actual}")
             }
             Error::InvalidEntryCount { got } => write!(f, "invalid entry_count: {got}"),
+            Error::TooManyEntries { got } => write!(f, "too many entries: {got} exceeds u32::MAX"),
             Error::DirectoryOutOfBounds {
                 directory_offset,
                 directory_len,

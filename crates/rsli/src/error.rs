@@ -14,6 +14,9 @@ pub enum Error {
     InvalidEntryCount {
         got: i16,
     },
+    TooManyEntries {
+        got: usize,
+    },
 
     EntryTableOutOfBounds {
         table_offset: u64,
@@ -75,6 +78,7 @@ impl fmt::Display for Error {
             Error::InvalidMagic { got } => write!(f, "invalid RsLi magic: {got:02X?}"),
             Error::UnsupportedVersion { got } => write!(f, "unsupported RsLi version: {got:#x}"),
             Error::InvalidEntryCount { got } => write!(f, "invalid entry_count: {got}"),
+            Error::TooManyEntries { got } => write!(f, "too many entries: {got} exceeds u32::MAX"),
             Error::EntryTableOutOfBounds {
                 table_offset,
                 table_len,

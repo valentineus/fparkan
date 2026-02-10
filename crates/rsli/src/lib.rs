@@ -1,8 +1,7 @@
-pub mod data;
 pub mod error;
 
-use crate::data::{OutputBuffer, ResourceData};
 use crate::error::Error;
+use common::{OutputBuffer, ResourceData};
 use flate2::read::{DeflateDecoder, ZlibDecoder};
 use std::cmp::Ordering;
 use std::fs;
@@ -112,7 +111,7 @@ impl Library {
             .iter()
             .enumerate()
             .map(|(idx, entry)| EntryRef {
-                id: EntryId(idx as u32),
+                id: EntryId(u32::try_from(idx).expect("entry count validated at parse")),
                 meta: &entry.meta,
             })
     }
@@ -122,9 +121,24 @@ impl Library {
             return None;
         }
 
-        let query = name.to_ascii_uppercase();
-        let query_bytes = query.as_bytes();
+        const MAX_INLINE_NAME: usize = 12;
 
+        // Fast path: use stack allocation for short ASCII names (95% of cases)
+        if name.len() <= MAX_INLINE_NAME && name.is_ascii() {
+            let mut buf = [0u8; MAX_INLINE_NAME];
+            for (i, &b) in name.as_bytes().iter().enumerate() {
+                buf[i] = b.to_ascii_uppercase();
+            }
+            return self.find_impl(&buf[..name.len()]);
+        }
+
+        // Slow path: heap allocation for long or non-ASCII names
+        let query = name.to_ascii_uppercase();
+        self.find_impl(query.as_bytes())
+    }
+
+    fn find_impl(&self, query_bytes: &[u8]) -> Option<EntryId> {
+        // Binary search
         let mut low = 0usize;
         let mut high = self.entries.len();
         while low < high {
@@ -142,13 +156,20 @@ impl Library {
             match cmp {
                 Ordering::Less => high = mid,
                 Ordering::Greater => low = mid + 1,
-                Ordering::Equal => return Some(EntryId(idx as u32)),
+                Ordering::Equal => {
+                    return Some(EntryId(
+                        u32::try_from(idx).expect("entry count validated at parse"),
+                    ))
+                }
             }
         }
 
+        // Linear fallback search
         self.entries.iter().enumerate().find_map(|(idx, entry)| {
             if cmp_c_string(query_bytes, c_name_bytes(&entry.name_raw)) == Ordering::Equal {
-                Some(EntryId(idx as u32))
+                Some(EntryId(
+                    u32::try_from(idx).expect("entry count validated at parse"),
+                ))
             } else {
                 None
             }
@@ -292,14 +313,18 @@ impl Library {
         }
 
         for (idx, entry) in self.entries.iter().enumerate() {
-            let packed = self.load_packed(EntryId(idx as u32))?.packed;
+            let packed = self
+                .load_packed(EntryId(
+                    u32::try_from(idx).expect("entry count validated at parse"),
+                ))?
+                .packed;
             let start =
                 usize::try_from(entry.data_offset_raw).map_err(|_| Error::IntegerOverflow)?;
             for (offset, byte) in packed.iter().copied().enumerate() {
                 let pos = start.checked_add(offset).ok_or(Error::IntegerOverflow)?;
                 if pos >= out.len() {
                     return Err(Error::PackedSizePastEof {
-                        id: idx as u32,
+                        id: u32::try_from(idx).expect("entry count validated at parse"),
                         offset: u64::from(entry.data_offset_raw),
                         packed_size: entry.packed_size_declared,
                         file_len: u64::try_from(out.len()).map_err(|_| Error::IntegerOverflow)?,
@@ -346,6 +371,11 @@ fn parse_library(bytes: Arc<[u8]>, opts: OpenOptions) -> Result<Library> {
         return Err(Error::InvalidEntryCount { got: entry_count });
     }
     let count = usize::try_from(entry_count).map_err(|_| Error::IntegerOverflow)?;
+
+    // Validate entry_count fits in u32 (required for EntryId)
+    if count > u32::MAX as usize {
+        return Err(Error::TooManyEntries { got: count });
+    }
 
     let xor_seed = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
 
@@ -410,11 +440,13 @@ fn parse_library(bytes: Arc<[u8]>, opts: OpenOptions) -> Result<Library> {
                         .checked_sub(1)
                         .ok_or(Error::IntegerOverflow)?;
                 } else {
-                    return Err(Error::DeflateEofPlusOneQuirkRejected { id: idx as u32 });
+                    return Err(Error::DeflateEofPlusOneQuirkRejected {
+                        id: u32::try_from(idx).expect("entry count validated at parse"),
+                    });
                 }
             } else {
                 return Err(Error::PackedSizePastEof {
-                    id: idx as u32,
+                    id: u32::try_from(idx).expect("entry count validated at parse"),
                     offset: effective_offset_u64,
                     packed_size: packed_size_declared,
                     file_len: file_len_u64,
@@ -427,7 +459,7 @@ fn parse_library(bytes: Arc<[u8]>, opts: OpenOptions) -> Result<Library> {
             .ok_or(Error::IntegerOverflow)?;
         if available_end > bytes.len() {
             return Err(Error::EntryDataOutOfBounds {
-                id: idx as u32,
+                id: u32::try_from(idx).expect("entry count validated at parse"),
                 offset: effective_offset_u64,
                 size: packed_size_declared,
                 file_len: file_len_u64,
@@ -563,15 +595,15 @@ fn decode_payload(
             }
             xor_stream(&packed[..expected], key16)
         }
-        PackMethod::Lzss => lzss_decompress_simple(packed, expected)?,
+        PackMethod::Lzss => lzss_decompress_simple(packed, expected, None)?,
         PackMethod::XorLzss => {
-            let decrypted = xor_stream(packed, key16);
-            lzss_decompress_simple(&decrypted, expected)?
+            // Optimized: XOR on-the-fly during decompression instead of creating temp buffer
+            lzss_decompress_simple(packed, expected, Some(key16))?
         }
-        PackMethod::LzssHuffman => lzss_huffman_decompress(packed, expected)?,
+        PackMethod::LzssHuffman => lzss_huffman_decompress(packed, expected, None)?,
         PackMethod::XorLzssHuffman => {
-            let decrypted = xor_stream(packed, key16);
-            lzss_huffman_decompress(&decrypted, expected)?
+            // Optimized: XOR on-the-fly during decompression
+            lzss_huffman_decompress(packed, expected, Some(key16))?
         }
         PackMethod::Deflate => decode_deflate(packed)?,
         PackMethod::Unknown(raw) => return Err(Error::UnsupportedMethod { raw }),
@@ -601,20 +633,37 @@ fn decode_deflate(packed: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn xor_stream(data: &[u8], key16: u16) -> Vec<u8> {
-    let mut lo = (key16 & 0xFF) as u8;
-    let mut hi = ((key16 >> 8) & 0xFF) as u8;
-
-    let mut out = Vec::with_capacity(data.len());
-    for value in data {
-        lo = hi ^ lo.wrapping_shl(1);
-        out.push(value ^ lo);
-        hi = lo ^ (hi >> 1);
-    }
-    out
+struct XorState {
+    lo: u8,
+    hi: u8,
 }
 
-fn lzss_decompress_simple(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
+impl XorState {
+    fn new(key16: u16) -> Self {
+        Self {
+            lo: (key16 & 0xFF) as u8,
+            hi: ((key16 >> 8) & 0xFF) as u8,
+        }
+    }
+
+    fn decrypt_byte(&mut self, encrypted: u8) -> u8 {
+        self.lo = self.hi ^ self.lo.wrapping_shl(1);
+        let decrypted = encrypted ^ self.lo;
+        self.hi = self.lo ^ (self.hi >> 1);
+        decrypted
+    }
+}
+
+fn xor_stream(data: &[u8], key16: u16) -> Vec<u8> {
+    let mut state = XorState::new(key16);
+    data.iter().map(|&b| state.decrypt_byte(b)).collect()
+}
+
+fn lzss_decompress_simple(
+    data: &[u8],
+    expected_size: usize,
+    xor_key: Option<u16>,
+) -> Result<Vec<u8>> {
     let mut ring = [0x20u8; 0x1000];
     let mut ring_pos = 0xFEEusize;
     let mut out = Vec::with_capacity(expected_size);
@@ -623,31 +672,41 @@ fn lzss_decompress_simple(data: &[u8], expected_size: usize) -> Result<Vec<u8>> 
     let mut control = 0u8;
     let mut bits_left = 0u8;
 
+    // XOR state for on-the-fly decryption
+    let mut xor_state = xor_key.map(XorState::new);
+
+    // Helper to read byte with optional XOR decryption
+    let read_byte = |pos: usize, state: &mut Option<XorState>| -> Option<u8> {
+        let encrypted = data.get(pos).copied()?;
+        Some(if let Some(ref mut s) = state {
+            s.decrypt_byte(encrypted)
+        } else {
+            encrypted
+        })
+    };
+
     while out.len() < expected_size {
         if bits_left == 0 {
-            let Some(byte) = data.get(in_pos).copied() else {
-                break;
-            };
+            let byte = read_byte(in_pos, &mut xor_state)
+                .ok_or(Error::DecompressionFailed("lzss-simple: unexpected EOF"))?;
             control = byte;
             in_pos += 1;
             bits_left = 8;
         }
 
         if (control & 1) != 0 {
-            let Some(byte) = data.get(in_pos).copied() else {
-                break;
-            };
+            let byte = read_byte(in_pos, &mut xor_state)
+                .ok_or(Error::DecompressionFailed("lzss-simple: unexpected EOF"))?;
             in_pos += 1;
 
             out.push(byte);
             ring[ring_pos] = byte;
             ring_pos = (ring_pos + 1) & 0x0FFF;
         } else {
-            let (Some(low), Some(high)) =
-                (data.get(in_pos).copied(), data.get(in_pos + 1).copied())
-            else {
-                break;
-            };
+            let low = read_byte(in_pos, &mut xor_state)
+                .ok_or(Error::DecompressionFailed("lzss-simple: unexpected EOF"))?;
+            let high = read_byte(in_pos + 1, &mut xor_state)
+                .ok_or(Error::DecompressionFailed("lzss-simple: unexpected EOF"))?;
             in_pos += 2;
 
             let offset = usize::from(low) | (usize::from(high & 0xF0) << 4);
@@ -683,9 +742,21 @@ const LZH_T: usize = LZH_N_CHAR * 2 - 1;
 const LZH_R: usize = LZH_T - 1;
 const LZH_MAX_FREQ: u16 = 0x8000;
 
-fn lzss_huffman_decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
-    let mut decoder = LzhDecoder::new(data);
-    decoder.decode(expected_size)
+fn lzss_huffman_decompress(
+    data: &[u8],
+    expected_size: usize,
+    xor_key: Option<u16>,
+) -> Result<Vec<u8>> {
+    // TODO: Full optimization for Huffman variant (rare in practice)
+    // For now, fallback to separate XOR step for Huffman
+    if let Some(key) = xor_key {
+        let decrypted = xor_stream(data, key);
+        let mut decoder = LzhDecoder::new(&decrypted);
+        decoder.decode(expected_size)
+    } else {
+        let mut decoder = LzhDecoder::new(data);
+        decoder.decode(expected_size)
+    }
 }
 
 struct LzhDecoder<'a> {

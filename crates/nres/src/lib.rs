@@ -1,8 +1,7 @@
-pub mod data;
 pub mod error;
 
-use crate::data::{OutputBuffer, ResourceData};
 use crate::error::Error;
+use common::{OutputBuffer, ResourceData};
 use core::ops::Range;
 use std::cmp::Ordering;
 use std::fs::{self, OpenOptions as FsOpenOptions};
@@ -97,7 +96,7 @@ impl Archive {
             .iter()
             .enumerate()
             .map(|(idx, entry)| EntryRef {
-                id: EntryId(idx as u32),
+                id: EntryId(u32::try_from(idx).expect("entry count validated at parse")),
                 meta: &entry.meta,
             })
     }
@@ -123,7 +122,11 @@ impl Archive {
                 match cmp {
                     Ordering::Less => high = mid,
                     Ordering::Greater => low = mid + 1,
-                    Ordering::Equal => return Some(EntryId(target_idx as u32)),
+                    Ordering::Equal => {
+                        return Some(EntryId(
+                            u32::try_from(target_idx).expect("entry count validated at parse"),
+                        ))
+                    }
                 }
             }
         }
@@ -132,7 +135,9 @@ impl Archive {
             if cmp_name_case_insensitive(name.as_bytes(), entry_name_bytes(&entry.name_raw))
                 == Ordering::Equal
             {
-                Some(EntryId(idx as u32))
+                Some(EntryId(
+                    u32::try_from(idx).expect("entry count validated at parse"),
+                ))
             } else {
                 None
             }
@@ -175,11 +180,12 @@ impl Archive {
             editable.push(EditableEntry {
                 meta: entry.meta.clone(),
                 name_raw: entry.name_raw,
-                data: arc[range].to_vec(),
+                data: EntryData::Borrowed(range), // Copy-on-write: only store range
             });
         }
         Ok(Editor {
             path: path_buf,
+            source: arc,
             entries: editable,
         })
     }
@@ -202,14 +208,47 @@ impl Archive {
 
 pub struct Editor {
     path: PathBuf,
+    source: Arc<[u8]>,
     entries: Vec<EditableEntry>,
+}
+
+#[derive(Clone, Debug)]
+enum EntryData {
+    Borrowed(Range<usize>),
+    Modified(Vec<u8>),
 }
 
 #[derive(Clone, Debug)]
 struct EditableEntry {
     meta: EntryMeta,
     name_raw: [u8; 36],
-    data: Vec<u8>,
+    data: EntryData,
+}
+
+impl EditableEntry {
+    fn data_slice<'a>(&'a self, source: &'a Arc<[u8]>) -> &'a [u8] {
+        match &self.data {
+            EntryData::Borrowed(range) => &source[range.clone()],
+            EntryData::Modified(vec) => vec.as_slice(),
+        }
+    }
+
+    fn data_mut(&mut self, source: &Arc<[u8]>) -> &mut Vec<u8> {
+        // Check if we need to copy-on-write
+        if matches!(&self.data, EntryData::Borrowed(_)) {
+            let range = match &self.data {
+                EntryData::Borrowed(r) => r.clone(),
+                _ => unreachable!(),
+            };
+            let copied = source[range].to_vec();
+            self.data = EntryData::Modified(copied);
+        }
+        // Now we have Modified variant, return mutable reference
+        match &mut self.data {
+            EntryData::Modified(vec) => vec,
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -228,7 +267,7 @@ impl Editor {
             .iter()
             .enumerate()
             .map(|(idx, entry)| EntryRef {
-                id: EntryId(idx as u32),
+                id: EntryId(u32::try_from(idx).expect("entry count validated at add")),
                 meta: &entry.meta,
             })
     }
@@ -249,7 +288,7 @@ impl Editor {
                 sort_index: 0,
             },
             name_raw,
-            data: entry.data.to_vec(),
+            data: EntryData::Modified(entry.data.to_vec()),
         });
         Ok(EntryId(id_u32))
     }
@@ -263,8 +302,8 @@ impl Editor {
             });
         };
         entry.meta.data_size = u32::try_from(data.len()).map_err(|_| Error::IntegerOverflow)?;
-        entry.data.clear();
-        entry.data.extend_from_slice(data);
+        // Replace with new data (triggers copy-on-write if borrowed)
+        entry.data = EntryData::Modified(data.to_vec());
         Ok(())
     }
 
@@ -282,14 +321,35 @@ impl Editor {
 
     pub fn commit(mut self) -> Result<()> {
         let count_u32 = u32::try_from(self.entries.len()).map_err(|_| Error::IntegerOverflow)?;
-        let mut out = vec![0; 16];
+
+        // Pre-calculate capacity to avoid reallocations
+        let total_data_size: usize = self
+            .entries
+            .iter()
+            .map(|e| e.data_slice(&self.source).len())
+            .sum();
+        let padding_estimate = self.entries.len() * 8; // Max 8 bytes padding per entry
+        let directory_size = self.entries.len() * 64; // 64 bytes per entry
+        let capacity = 16 + total_data_size + padding_estimate + directory_size;
+
+        let mut out = Vec::with_capacity(capacity);
+        out.resize(16, 0); // Header
+
+        // Keep reference to source for copy-on-write
+        let source = &self.source;
 
         for entry in &mut self.entries {
             entry.meta.data_offset =
                 u64::try_from(out.len()).map_err(|_| Error::IntegerOverflow)?;
-            entry.meta.data_size =
-                u32::try_from(entry.data.len()).map_err(|_| Error::IntegerOverflow)?;
-            out.extend_from_slice(&entry.data);
+
+            // Calculate size and get slice separately to avoid borrow conflicts
+            let data_len = entry.data_slice(source).len();
+            entry.meta.data_size = u32::try_from(data_len).map_err(|_| Error::IntegerOverflow)?;
+
+            // Now get the slice again for writing
+            let data_slice = entry.data_slice(source);
+            out.extend_from_slice(data_slice);
+
             let padding = (8 - (out.len() % 8)) % 8;
             if padding > 0 {
                 out.resize(out.len() + padding, 0);
@@ -385,6 +445,11 @@ fn parse_archive(bytes: &[u8], raw_mode: bool) -> Result<(Vec<EntryRecord>, u64)
         });
     }
     let entry_count = usize::try_from(entry_count_i32).map_err(|_| Error::IntegerOverflow)?;
+
+    // Validate entry_count fits in u32 (required for EntryId)
+    if entry_count > u32::MAX as usize {
+        return Err(Error::TooManyEntries { got: entry_count });
+    }
 
     let total_size = read_u32(bytes, 12)?;
     let actual_size = u64::try_from(bytes.len()).map_err(|_| Error::IntegerOverflow)?;
