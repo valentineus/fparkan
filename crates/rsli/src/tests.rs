@@ -1,4 +1,6 @@
 use super::*;
+use crate::compress::lzh::{LZH_MAX_FREQ, LZH_N_CHAR, LZH_R, LZH_T};
+use crate::compress::xor::xor_stream;
 use flate2::write::DeflateEncoder;
 use flate2::Compression;
 use std::any::Any;

@@ -232,23 +232,6 @@ impl EditableEntry {
             EntryData::Modified(vec) => vec.as_slice(),
         }
     }
-
-    fn data_mut(&mut self, source: &Arc<[u8]>) -> &mut Vec<u8> {
-        // Check if we need to copy-on-write
-        if matches!(&self.data, EntryData::Borrowed(_)) {
-            let range = match &self.data {
-                EntryData::Borrowed(r) => r.clone(),
-                _ => unreachable!(),
-            };
-            let copied = source[range].to_vec();
-            self.data = EntryData::Modified(copied);
-        }
-        // Now we have Modified variant, return mutable reference
-        match &mut self.data {
-            EntryData::Modified(vec) => vec,
-            _ => unreachable!(),
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
