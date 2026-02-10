@@ -105,3 +105,97 @@ python3 tools/init_testdata.py --input tmp/gamedata --output testdata --force
 - если `--output` указывает на существующий файл, скрипт завершится с ошибкой;
 - если `--output` расположен внутри `--input`, каталог вывода исключается из сканирования;
 - если `stdin` неинтерактивный и требуется перезапись, нужно явно указать `--force`.
+
+## `msh_doc_validator.py`
+
+Скрипт валидирует ключевые инварианты из документации `/Users/valentineus/Developer/personal/fparkan/docs/specs/msh.md` на реальных данных.
+
+Проверяемые группы:
+
+- модели `*.msh` (вложенные `NRes` в архивах `NRes`);
+- текстуры `Texm` (`type_id = 0x6D786554`);
+- эффекты `FXID` (`type_id = 0x44495846`).
+
+Что проверяет для моделей:
+
+- обязательные ресурсы (`Res1/2/3/6/13`) и известные опциональные (`Res4/5/7/8/10/15/16/18/19`);
+- `size/attr1/attr3` и шаги структур по таблицам;
+- диапазоны индексов, батчей и ссылок между таблицами;
+- разбор `Res10` как `len + bytes + NUL` для каждого узла;
+- матрицу слотов в `Res1` (LOD/group) и границы по `Res2/Res7/Res13/Res19`.
+
+Быстрый запуск:
+
+```bash
+python3 tools/msh_doc_validator.py scan --input testdata/nres
+python3 tools/msh_doc_validator.py validate --input testdata/nres --print-limit 20
+```
+
+С отчётом в JSON:
+
+```bash
+python3 tools/msh_doc_validator.py validate \
+  --input testdata/nres \
+  --report tmp/msh_validation_report.json \
+  --fail-on-warnings
+```
+
+## `msh_preview_renderer.py`
+
+Примитивный программный рендерер моделей `*.msh` без внешних зависимостей.
+
+- вход: архив `NRes` (например `animals.rlb`) или прямой payload модели;
+- выход: изображение `PPM` (`P6`);
+- использует `Res3` (позиции), `Res6` (индексы), `Res13` (батчи), `Res1/Res2` (выбор слотов по `lod/group`).
+
+Показать доступные модели в архиве:
+
+```bash
+python3 tools/msh_preview_renderer.py list-models --archive testdata/nres/animals.rlb
+```
+
+Сгенерировать тестовый рендер:
+
+```bash
+python3 tools/msh_preview_renderer.py render \
+  --archive testdata/nres/animals.rlb \
+  --model A_L_01.msh \
+  --output tmp/renders/A_L_01.ppm \
+  --width 800 \
+  --height 600 \
+  --lod 0 \
+  --group 0 \
+  --wireframe
+```
+
+Ограничения:
+
+- инструмент предназначен для smoke-теста геометрии, а не для пиксельно-точного рендера движка;
+- текстуры/материалы/эффектные проходы не эмулируются.
+
+## `msh_export_obj.py`
+
+Экспортирует геометрию `*.msh` в `Wavefront OBJ`, чтобы открыть модель в Blender/MeshLab.
+
+- вход: `NRes` архив (например `animals.rlb`) или прямой payload модели;
+- выбор геометрии: через `Res1` slot matrix (`lod/group`) как в рендерере;
+- опция `--all-batches` экспортирует все батчи, игнорируя slot matrix.
+
+Показать модели в архиве:
+
+```bash
+python3 tools/msh_export_obj.py list-models --archive testdata/nres/animals.rlb
+```
+
+Экспорт в OBJ:
+
+```bash
+python3 tools/msh_export_obj.py export \
+  --archive testdata/nres/animals.rlb \
+  --model A_L_01.msh \
+  --output tmp/renders/A_L_01.obj \
+  --lod 0 \
+  --group 0
+```
+
+Файл `OBJ` можно открыть напрямую в Blender (`File -> Import -> Wavefront (.obj)`).

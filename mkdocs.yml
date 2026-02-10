@@ -23,10 +23,8 @@ theme:
 nav:
   - Home: index.md
   - Specs:
-    - NRes / RsLi: specs/nres.md
-    - 3D модели: specs/msh.md
-    - Текстуры и материалы: specs/textures.md
-    - Эффекты и частицы: specs/effects.md
+      - NRes / RsLi: specs/nres.md
+      - Форматы 3D‑ресурсов: specs/msh.md
 
 # Additional configuration
 extra:
