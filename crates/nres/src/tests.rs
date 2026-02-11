@@ -771,6 +771,41 @@ fn nres_synthetic_read_find_and_edit() {
 }
 
 #[test]
+fn nres_max_name_length_roundtrip() {
+    let max_name = "12345678901234567890123456789012345";
+    assert_eq!(max_name.len(), 35);
+
+    let src = build_nres_bytes(&[SyntheticEntry {
+        kind: 9,
+        attr1: 1,
+        attr2: 2,
+        attr3: 3,
+        name: max_name,
+        data: b"payload",
+    }]);
+
+    let archive = Archive::open_bytes(Arc::from(src.into_boxed_slice()), OpenOptions::default())
+        .expect("open synthetic nres failed");
+
+    assert_eq!(archive.entry_count(), 1);
+    assert_eq!(archive.find(max_name), Some(EntryId(0)));
+    assert_eq!(
+        archive.find(&max_name.to_ascii_lowercase()),
+        Some(EntryId(0))
+    );
+
+    let entry = archive.get(EntryId(0)).expect("missing entry 0");
+    assert_eq!(entry.meta.name, max_name);
+    assert_eq!(
+        archive
+            .read(EntryId(0))
+            .expect("read payload failed")
+            .as_slice(),
+        b"payload"
+    );
+}
+
+#[test]
 fn nres_find_falls_back_when_sort_index_is_out_of_range() {
     let mut bytes = build_nres_bytes(&[
         SyntheticEntry {

@@ -803,6 +803,102 @@ fn rsli_synthetic_all_methods_roundtrip() {
 }
 
 #[test]
+fn rsli_empty_archive_roundtrip() {
+    let bytes = build_rsli_bytes(&[], &RsliBuildOptions::default());
+    let path = write_temp_file("rsli-empty", &bytes);
+
+    let library = Library::open_path(&path).expect("open empty rsli failed");
+    assert_eq!(library.entry_count(), 0);
+    assert_eq!(library.find("ANYTHING"), None);
+
+    let rebuilt = library
+        .rebuild_from_parsed_metadata()
+        .expect("rebuild empty rsli failed");
+    assert_eq!(rebuilt, bytes, "empty rsli roundtrip mismatch");
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn rsli_max_name_length_without_nul_roundtrip() {
+    let max_name = "NAME12345678";
+    assert_eq!(max_name.len(), 12);
+
+    let bytes = build_rsli_bytes(
+        &[SyntheticRsliEntry {
+            name: max_name.to_string(),
+            method_raw: 0x000,
+            plain: b"payload".to_vec(),
+            declared_packed_size: None,
+        }],
+        &RsliBuildOptions::default(),
+    );
+    let path = write_temp_file("rsli-max-name", &bytes);
+
+    let library = Library::open_path(&path).expect("open max-name rsli failed");
+    assert_eq!(library.entry_count(), 1);
+    assert_eq!(library.find(max_name), Some(EntryId(0)));
+    assert_eq!(
+        library.find(&max_name.to_ascii_lowercase()),
+        Some(EntryId(0))
+    );
+    assert_eq!(
+        library.entries[0]
+            .name_raw
+            .iter()
+            .position(|byte| *byte == 0),
+        None,
+        "name_raw must occupy full 12 bytes without NUL"
+    );
+
+    let entry = library.get(EntryId(0)).expect("missing entry");
+    assert_eq!(entry.meta.name, max_name);
+    assert_eq!(
+        library.load(EntryId(0)).expect("load failed"),
+        b"payload",
+        "payload mismatch"
+    );
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn rsli_lzss_large_payload_over_4k_roundtrip() {
+    let plain: Vec<u8> = (0..10_000u32).map(|v| (v % 251) as u8).collect();
+    let entries = vec![
+        SyntheticRsliEntry {
+            name: "LZSS4K".to_string(),
+            method_raw: 0x040,
+            plain: plain.clone(),
+            declared_packed_size: None,
+        },
+        SyntheticRsliEntry {
+            name: "XLZS4K".to_string(),
+            method_raw: 0x060,
+            plain: plain.clone(),
+            declared_packed_size: None,
+        },
+    ];
+    let bytes = build_rsli_bytes(&entries, &RsliBuildOptions::default());
+    let path = write_temp_file("rsli-lzss-4k", &bytes);
+
+    let library = Library::open_path(&path).expect("open large-lzss rsli failed");
+    assert_eq!(library.entry_count(), entries.len());
+
+    for entry in &entries {
+        let id = library
+            .find(&entry.name)
+            .unwrap_or_else(|| panic!("find failed for {}", entry.name));
+        let loaded = library
+            .load(id)
+            .unwrap_or_else(|err| panic!("load failed for {}: {err}", entry.name));
+        assert_eq!(loaded, plain, "payload mismatch for {}", entry.name);
+    }
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
 fn rsli_find_falls_back_when_sort_table_corrupted_in_memory() {
     let entries = vec![
         SyntheticRsliEntry {

@@ -651,18 +651,43 @@ fn write_atomic(path: &Path, content: &[u8]) -> Result<()> {
     file.flush()?;
     drop(file);
 
-    match fs::rename(&tmp_path, path) {
-        Ok(()) => Ok(()),
-        Err(rename_err) => {
-            if path.exists() {
-                fs::remove_file(path)?;
-                fs::rename(&tmp_path, path)?;
-                Ok(())
-            } else {
-                let _ = fs::remove_file(&tmp_path);
-                Err(Error::Io(rename_err))
-            }
-        }
+    if let Err(err) = replace_file_atomically(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(Error::Io(err));
+    }
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomically(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::rename(src, dst)
+}
+
+#[cfg(windows)]
+fn replace_file_atomically(src: &Path, dst: &Path) -> std::io::Result<()> {
+    use std::iter;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let src_wide: Vec<u16> = src.as_os_str().encode_wide().chain(iter::once(0)).collect();
+    let dst_wide: Vec<u16> = dst.as_os_str().encode_wide().chain(iter::once(0)).collect();
+
+    // Replace destination in one OS call, avoiding remove+rename gaps on Windows.
+    let ok = unsafe {
+        MoveFileExW(
+            src_wide.as_ptr(),
+            dst_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
