@@ -114,10 +114,14 @@ struct TextureSlot {
 };
 ```
 
+`lastZeroRefTime` реально используется: texture-слоты с `refCount==0` освобождаются отложенно периодическим GC.
+
 ### 4.2 Кэш lightmaps (`dword_10029C98`...)
 
 - Тот же layout `5 DWORD`
 - Ёмкость: `100`
+
+Для lightmap-слотов аналогичного периодического GC по `lastZeroRefTime` в `World3D` не наблюдается.
 
 ### 4.3 Пул материалов (`dword_100669F0`...)
 
@@ -317,6 +321,7 @@ struct AnimBlockRuntime {
 Ключи в runtime занимают 8 байт/ключ (с расширением `k0` до `uint32`).
 
 `k2` в `sub_100031F0/sub_10003680` не используется.
+Поле нужно сохранять lossless, т.к. оно присутствует в бинарном формате.
 
 ### 6.6 Поиск и fallback
 
@@ -362,11 +367,21 @@ struct AnimBlockRuntime {
 - `2`: one-shot clamp
 - `3`: random (`rand() % cycleLength`)
 
+Важные детали 1:1:
+
+- деление/остаток по циклу реализованы через unsigned `div` (`edx=0` перед делением);
+- в `mode=3` вычисленное `rand() % cycleLength` записывается прямо в `startTime` записи (не в локальную переменную).
+- при `gameTime < startTime` применяется unsigned-wrap семантика (важно для точного воспроизведения edge-case).
+
 После выбора сегмента интерполяции `sub_10003030` строит scratch-материал (`unk_1013B300`), который возвращается через out-параметр.
 
 ### 7.3 Выбор по нормализованному `t` (`sub_10003680`)
 
 Аналогично `sub_100031F0`, но time берётся как `t * cycleLength`.
+
+Перед вычислением времени применяется runtime-нормализация:
+
+- если `t < 0.0` или `t > 1.0`, используется `t = 0.5`.
 
 ### 7.4 Сброс времени записи
 
@@ -384,6 +399,7 @@ struct AnimBlockRuntime {
 <wearCount:int>\n
 <legacyId:int> <materialName>\n   // повторить wearCount раз
 
+[\n]                               // для buffer-парсера с LIGHTMAPS фактически обязательна пустая строка
 [LIGHTMAPS\n
 <lightmapCount:int>\n
 <legacyId:int> <lightmapName>\n  // повторить lightmapCount раз]
@@ -397,6 +413,11 @@ struct AnimBlockRuntime {
 1. `sub_10003B10`: файл/ресурсный режим.
 2. `sub_10003F80`: парсер из строкового буфера.
 
+Различие важно для совместимости:
+
+- `sub_10003B10` после `LIGHTMAPS` сразу читает `lightmapCount` через `fscanf`.
+- `sub_10003F80` после детекта `LIGHTMAPS` делает два последовательных skip до `\n`; поэтому при наличии блока `LIGHTMAPS` нужен пустой разделитель перед строкой `LIGHTMAPS`, иначе парсинг может съехать.
+
 ### 8.3 Поведение и ошибки
 
 - `wearCount <= 0` (в текстовом файловом режиме) -> `"Illegal wear length."`
@@ -404,6 +425,7 @@ struct AnimBlockRuntime {
 - если найден блок `LIGHTMAPS` и `lightmapCount <= 0` -> `"Illegal lightmaps length."`
 - отсутствующий материал -> `"Material %s not found."` + fallback `DEFAULT`
 - отсутствующая lightmap -> `"LightMap %s not found."` и slot `-1`
+- в buffer-режиме неверная структура вокруг `LIGHTMAPS` может дать некорректный `lightmapCount` и каскадные ошибки чтения.
 
 ### 8.4 Ограничения runtime
 
@@ -439,14 +461,18 @@ struct AnimBlockRuntime {
 - `idx = (L - 'A') * 11 + (D ? (D - '0' + 1) : 0)`
 
 Если `idx < 0`, палитра не подставляется (`0`).
+Верхняя граница `idx` в runtime не проверяется.
 
 Практически в стоковых ассетах имена часто вида `NAME.0`; это даёт `idx < 0`, т.е. без палитровой привязки.
+Для невалидных суффиксов это потенциально даёт OOB-чтение палитрового массива.
 
 ### 9.3 Кэширование
 
 - Дедупликация по `resIndex`.
 - При повторном запросе увеличивается `refCount`, `lastZeroRefTime` сбрасывается в `0`.
 - При освобождении материала `refCount` texture/lightmap уменьшается.
+- texture: при `refCount -> 0` запоминается `lastZeroRefTime`; периодический sweep (примерно раз в 20 секунд) удаляет слот, если прошло больше `~60` секунд.
+- lightmap: явного аналогичного sweep-пути нет; освобождение в основном происходит при teardown таблиц (`MatManager` dtor).
 
 ---
 
@@ -521,14 +547,48 @@ Runtime конвертирует `Rect16` в:
 - пиксельные прямоугольники;
 - UV-границы с учётом возможного `mipSkip`.
 
+Формулы (`s = mipSkip`):
+
+- `x0 = x << s`, `x1 = (x + w) << s`
+- `y0 = y << s`, `y1 = (y + h) << s`
+- `u0 = x / (width << s)`, `du = w / (width << s)`
+- `v0 = y / (height << s)`, `dv = h / (height << s)`
+
+Также всегда добавляется базовый rect `[0]` на всю текстуру: пиксели `(0,0,width,height)`, UV `(0,0,1,1)`.
+
 ### 10.5 Loader-поведение (`sub_1000FB30`)
 
-- Читает header в внутренние поля (`+56..+84`).
+- Читает header в внутренние поля (`+56..+84`) напрямую:
+  - `+56 magic`, `+60 width`, `+64 height`, `+68 mipCount`,
+  - `+72 flags4`, `+76 flags5`, `+80 unk6`, `+84 format`.
 - Для `format==0` считывает palette и переставляет каналы в runtime-таблицу.
 - Считает `sizeCore`, находит tail.
 - `Page` разбирается только если включён флаг загрузки `0x400000` и tail содержит `Page`.
 - Может уменьшать стартовый mip (`sub_1000F580`) в зависимости от размеров/формата/флагов.
 - При `DisableMipmap == 0` и допустимых условиях может строить mips в runtime.
+
+### 10.6 Политика `mipSkip` (`sub_1000F580`)
+
+`mipSkip` зависит от `flags5 & 0x72000000`, `width`, `height`, `mipCount`:
+
+- если `mipCount <= 1` -> `0`
+- если `flags5Mask == 0x02000000` -> `2` при `mipCount > 2`, иначе `1`
+- если `flags5Mask == 0x10000000` -> `1`
+- если `flags5Mask == 0x20000000`:
+  - `1`, если `width >= 256` или `height >= 256`
+  - иначе `0`
+- если `flags5Mask == 0x40000000`:
+  - если `width > 128` и `height > 128`: `2` при `mipCount > 2`, иначе `1`
+  - если `width == 128` или `height == 128`: `1`
+  - иначе `0`
+- иначе `0`
+
+Применение в loader:
+
+- `mipCount -= mipSkip`
+- `width >>= mipSkip`, `height >>= mipSkip`
+- `pixelDataOffset += bytesPerPixel * origWidth * origHeight` для `mipSkip==1`
+- `pixelDataOffset += bytesPerPixel * origWidth * origHeight * 1.25` для `mipSkip==2` (первые два уровня)
 
 ---
 
@@ -563,6 +623,7 @@ Runtime конвертирует `Rect16` в:
 - хранить строки wear/lightmaps как текст;
 - сохранять порядок строк;
 - допускать отсутствие блока `LIGHTMAPS`.
+- если нужен полный runtime-parity с buffer-парсером (`sub_10003F80`) и есть `LIGHTMAPS`, сохранять пустую строку-разделитель перед строкой `LIGHTMAPS`.
 
 3. `Texm`:
 - хранить header поля как есть (`flags4/flags5/unk6` не нормализовать);
@@ -580,6 +641,7 @@ Runtime конвертирует `Rect16` в:
   - `magic == 'Texm'`.
   - `mipCount > 0`, `width>0`, `height>0`.
   - tail либо отсутствует, либо ровно один корректный `Page` chunk без лишних байт.
+  - при эмуляции runtime-загрузчика учитывать, что `Page` обрабатывается только при load-flag `0x400000`.
 
 ### 12.3 Рекомендованные валидации редактора
 
@@ -587,12 +649,14 @@ Runtime конвертирует `Rect16` в:
   - `wearCount > 0`.
   - число строк wear соответствует `wearCount`.
   - если есть `LIGHTMAPS`, то `lightmapCount > 0` и число строк совпадает.
+  - для buffer-совместимого текста с `LIGHTMAPS` проверять наличие пустой строки перед `LIGHTMAPS`.
 - `MAT0`:
   - не выходить за payload при распаковке.
   - все ссылки фаз/keys проверять на диапазоны.
 - `Texm`:
   - `sizeCore <= payload_size`.
   - проверка `Page` как `8 + rectCount*8`.
+  - предупреждать/блокировать невалидные palette suffix, которые могут дать `idx >= 286` в runtime.
 
 ---
 
@@ -626,20 +690,21 @@ Runtime конвертирует `Rect16` в:
 - `439` entries `type=WEAR`
 - `attr1=0, attr2=0, attr3=1`
 - `21` entry содержит блок `LIGHTMAPS` (в текущем наборе везде `lightmapCount=1`)
+- для всех `21` entry с `LIGHTMAPS` присутствует пустая строка перед `LIGHTMAPS`.
 
 ---
 
-## 14. Не до конца определённые семантики
+## 14. Opaque-поля и границы знания
 
-Эти поля нужно сохранять прозрачно:
+Для 1:1 runtime/toolchain достаточно фиксировать следующие поля как `opaque-but-required`:
 
 - `MAT0`:
-  - `k2` в `AnimBlockRaw::KeyRaw`
-  - точная доменная семантика `metaA/metaB/metaC/metaD`
-  - точная семантика части float-полей в `MaterialPhase76`
+  - `k2` в `AnimBlockRaw::KeyRaw` (хранить/писать без изменений);
+  - `metaA/metaB/metaC/metaD` (в `World3D` заполняются и возвращаются наружу; внутренних consumers этих мета-полей не найдено).
 - `Texm`:
-  - смысл `flags4/flags5/unk6` вне уже наблюдённых веток
-  - формат `88` в файловом контенте (поддержка есть, но в сток-данных не найден)
+  - `flags4/flags5/unk6` (часть веток разобрана, но полная доменная семантика не требуется для 1:1).
+
+Это не блокирует реализацию движка/конвертеров 1:1.
 
 ---
 
@@ -715,3 +780,95 @@ def parse_texm(payload: bytes):
     return (w, h, mips, fmt, f4, f5, unk6, page)
 ```
 
+### 15.3 `mip_skip_policy(flags5, width, height, mip_count)`
+
+```python
+def mip_skip_policy(flags5: int, width: int, height: int, mip_count: int) -> int:
+    if mip_count <= 1:
+        return 0
+
+    m = flags5 & 0x72000000
+    if m == 0x02000000:
+        return 2 if mip_count > 2 else 1
+    if m == 0x10000000:
+        return 1
+    if m == 0x20000000:
+        return 1 if (width >= 256 or height >= 256) else 0
+    if m == 0x40000000:
+        if width > 128 and height > 128:
+            return 2 if mip_count > 2 else 1
+        if width == 128 or height == 128:
+            return 1
+    return 0
+```
+
+### 15.4 `parse_wear_buffer_compatible(text)`
+
+```python
+def parse_wear_buffer_compatible(text: str):
+    lines = text.splitlines()
+    i = 0
+
+    wear_count = int(lines[i].strip()); i += 1
+    if wear_count <= 0:
+        raise ValueError("Illegal wear length.")
+
+    wear = []
+    for _ in range(wear_count):
+        legacy, name = lines[i].split(maxsplit=1)
+        wear.append((int(legacy), name.strip()))
+        i += 1
+
+    lightmaps = []
+    tail = lines[i:] if i < len(lines) else []
+    if tail and tail[0].strip() == "":
+        # sub_10003F80-совместимый разделитель перед LIGHTMAPS
+        i += 1
+        tail = lines[i:]
+
+    if tail and tail[0].strip().upper() == "LIGHTMAPS":
+        i += 1
+        if i >= len(lines):
+            raise ValueError("Illegal lightmaps length.")
+        light_count = int(lines[i].strip()); i += 1
+        if light_count <= 0:
+            raise ValueError("Illegal lightmaps length.")
+        for _ in range(light_count):
+            legacy, name = lines[i].split(maxsplit=1)
+            lightmaps.append((int(legacy), name.strip()))
+            i += 1
+
+    return wear, lightmaps
+```
+
+### 15.5 `select_phase_time_1to1(...)`
+
+```python
+def select_phase_time_1to1(game_time: int, start_time: int, keys, mode: int):
+    # keys: list[(phase_index, t_start, t_end)], t_end последнего = cycle_len
+    cycle_len = keys[-1][2]
+    if cycle_len <= 0:
+        return 0, 0.0
+
+    # unsigned div/mod как в runtime
+    delta = (game_time - start_time) & 0xFFFFFFFF
+    q = delta // cycle_len
+    r = delta % cycle_len
+
+    if mode == 1:  # ping-pong
+        if q & 1:
+            r = cycle_len - r
+    elif mode == 2:  # one-shot
+        if q > 0:
+            k = len(keys) - 1
+            return k, 0.0
+    elif mode == 3:  # random
+        r = rand32() % cycle_len
+        start_time = r  # side effect как в sub_100031F0
+
+    k = find_segment(keys, r)          # t_start <= r < t_end
+    kn = 0 if (k + 1 == len(keys)) else (k + 1)
+    t0, t1 = keys[k][1], keys[k][2]
+    alpha = 0.0 if t1 == t0 else (r - t0) / float(t1 - t0)
+    return (k, kn), alpha
+```
