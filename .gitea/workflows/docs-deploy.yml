@@ -1,0 +1,43 @@
+name: Docs Deploy
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  deploy-docs:
+    name: Build and Deploy MkDocs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install docs dependencies
+        run: pip install -r requirements.txt
+
+      - name: Build MkDocs site
+        run: mkdocs build
+
+      - name: Prepare SSH key
+        env:
+          SSH_KEY_B64: ${{ secrets.ROOT_CI_KEY_B64 }}
+        run: |
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s' "$SSH_KEY_B64" | base64 -d > ~/.ssh/id_root_ci
+          chmod 600 ~/.ssh/id_root_ci
+
+      - name: Deploy via rsync
+        env:
+          DEPLOY_HOST: ${{ secrets.FPARKAN_DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.FPARKAN_DEPLOY_PORT }}
+        run: |
+          rsync -az --delete \
+            -e "ssh -p ${DEPLOY_PORT} -i ~/.ssh/id_root_ci -o StrictHostKeyChecking=accept-new" \
+            site/ "gitea-runner@${DEPLOY_HOST}:/var/www/fparkan/"
