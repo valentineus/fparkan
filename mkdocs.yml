@@ -23,8 +23,23 @@ theme:
 nav:
   - Home: index.md
   - Specs:
+      - 3D implementation notes: specs/msh-notes.md
+      - AI system: specs/ai.md
+      - ArealMap: specs/arealmap.md
+      - Behavior system: specs/behavior.md
+      - Control system: specs/control.md
+      - FXID: specs/fxid.md
+      - Materials + Texm: specs/materials-texm.md
+      - Missions: specs/missions.md
+      - MSH animation: specs/msh-animation.md
+      - MSH core: specs/msh-core.md
+      - Network system: specs/network.md
       - NRes / RsLi: specs/nres.md
-      - Форматы 3D‑ресурсов: specs/msh.md
+      - Runtime pipeline: specs/runtime-pipeline.md
+      - Sound system: specs/sound.md
+      - Terrain + map loading: specs/terrain-map-loading.md
+      - UI system: specs/ui.md
+      - Форматы 3D‑ресурсов (обзор): specs/msh.md
 
 # Additional configuration
 extra:
