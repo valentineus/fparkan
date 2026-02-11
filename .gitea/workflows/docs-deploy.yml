@@ -45,4 +45,4 @@ jobs:
         run: |
           rsync -az --delete \
             -e "ssh -p ${DEPLOY_PORT} -i ~/.ssh/id_root_ci -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" \
-            site/ "gitea-runner@${DEPLOY_HOST}:/var/www/fparkan/"
+            site/ "gitea-runner@${DEPLOY_HOST}:./"
