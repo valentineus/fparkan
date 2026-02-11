@@ -24,6 +24,11 @@ jobs:
       - name: Build MkDocs site
         run: mkdocs build
 
+      - name: Install rsync
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rsync openssh-client
+
       - name: Prepare SSH key
         env:
           SSH_KEY_B64: ${{ secrets.ROOT_CI_KEY_B64 }}
