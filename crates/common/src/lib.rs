@@ -31,6 +31,7 @@ impl AsRef<[u8]> for ResourceData<'_> {
 
 /// Output sink used by `read_into`/`load_into` APIs.
 pub trait OutputBuffer {
+    /// Writes the full payload to the sink, replacing any previous content.
     fn write_exact(&mut self, data: &[u8]) -> io::Result<()>;
 }
 

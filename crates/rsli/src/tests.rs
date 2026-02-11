@@ -2,6 +2,7 @@ use super::*;
 use crate::compress::lzh::{LZH_MAX_FREQ, LZH_N_CHAR, LZH_R, LZH_T};
 use crate::compress::xor::xor_stream;
 use flate2::write::DeflateEncoder;
+use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use std::any::Any;
 use std::fs;
@@ -101,6 +102,12 @@ fn deflate_raw(data: &[u8]) -> Vec<u8> {
         .write_all(data)
         .expect("deflate encoder write failed");
     encoder.finish().expect("deflate encoder finish failed")
+}
+
+fn deflate_zlib(data: &[u8]) -> Vec<u8> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data).expect("zlib encoder write failed");
+    encoder.finish().expect("zlib encoder finish failed")
 }
 
 fn lzss_pack_literals(data: &[u8]) -> Vec<u8> {
@@ -796,6 +803,131 @@ fn rsli_synthetic_all_methods_roundtrip() {
 }
 
 #[test]
+fn rsli_find_falls_back_when_sort_table_corrupted_in_memory() {
+    let entries = vec![
+        SyntheticRsliEntry {
+            name: "AAA".to_string(),
+            method_raw: 0x000,
+            plain: b"a".to_vec(),
+            declared_packed_size: None,
+        },
+        SyntheticRsliEntry {
+            name: "BBB".to_string(),
+            method_raw: 0x000,
+            plain: b"b".to_vec(),
+            declared_packed_size: None,
+        },
+        SyntheticRsliEntry {
+            name: "CCC".to_string(),
+            method_raw: 0x000,
+            plain: b"c".to_vec(),
+            declared_packed_size: None,
+        },
+    ];
+    let bytes = build_rsli_bytes(
+        &entries,
+        &RsliBuildOptions {
+            presorted: true,
+            ..RsliBuildOptions::default()
+        },
+    );
+    let path = write_temp_file("rsli-find-fallback", &bytes);
+
+    let mut library = Library::open_path(&path).expect("open synthetic rsli failed");
+    library.entries[1].sort_to_original = -1;
+
+    assert_eq!(library.find("AAA"), Some(EntryId(0)));
+    assert_eq!(library.find("bbb"), Some(EntryId(1)));
+    assert_eq!(library.find("CcC"), Some(EntryId(2)));
+    assert_eq!(library.find("missing"), None);
+
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn rsli_deflate_method_rejects_zlib_wrapped_stream() {
+    let plain = b"payload".to_vec();
+    let zlib_payload = deflate_zlib(&plain);
+    let entries = vec![SyntheticRsliEntry {
+        name: "ZLIB".to_string(),
+        method_raw: 0x100,
+        plain,
+        declared_packed_size: Some(
+            u32::try_from(zlib_payload.len()).expect("zlib payload size overflow"),
+        ),
+    }];
+    let mut bytes = build_rsli_bytes(
+        &entries,
+        &RsliBuildOptions {
+            presorted: true,
+            ..RsliBuildOptions::default()
+        },
+    );
+
+    let table_end = 32 + entries.len() * 32;
+    let data_offset = table_end;
+    let data_end = data_offset + zlib_payload.len();
+    if bytes.len() < data_end {
+        bytes.resize(data_end, 0);
+    }
+    bytes[data_offset..data_end].copy_from_slice(&zlib_payload);
+
+    let path = write_temp_file("rsli-zlib-reject", &bytes);
+    let library = Library::open_path(&path).expect("open zlib-wrapped rsli failed");
+    match library.load(EntryId(0)) {
+        Err(Error::DecompressionFailed(reason)) => {
+            assert_eq!(reason, "deflate");
+        }
+        other => panic!("expected deflate decompression error, got {other:?}"),
+    }
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn rsli_lzss_huffman_reports_unexpected_eof() {
+    let entries = vec![SyntheticRsliEntry {
+        name: "TRUNC".to_string(),
+        method_raw: 0x080,
+        plain: b"this payload is long enough".to_vec(),
+        declared_packed_size: None,
+    }];
+    let mut bytes = build_rsli_bytes(
+        &entries,
+        &RsliBuildOptions {
+            presorted: true,
+            ..RsliBuildOptions::default()
+        },
+    );
+
+    let seed = read_u32_le(&bytes, 20);
+    let mut table_plain = xor_stream(&bytes[32..64], (seed & 0xFFFF) as u16);
+    let original_packed_size = u32::from_le_bytes([
+        table_plain[28],
+        table_plain[29],
+        table_plain[30],
+        table_plain[31],
+    ]);
+    assert!(
+        original_packed_size > 4,
+        "packed payload too small for truncation"
+    );
+    let truncated_size = original_packed_size - 3;
+    table_plain[28..32].copy_from_slice(&truncated_size.to_le_bytes());
+    let encrypted_table = xor_stream(&table_plain, (seed & 0xFFFF) as u16);
+    bytes[32..64].copy_from_slice(&encrypted_table);
+
+    let path = write_temp_file("rsli-lzh-truncated", &bytes);
+    let library = Library::open_path(&path).expect("open truncated lzh rsli failed");
+    match library.load(EntryId(0)) {
+        Err(Error::DecompressionFailed(reason)) => {
+            assert_eq!(reason, "lzss-huffman: unexpected EOF");
+        }
+        other => panic!("expected lzss-huffman EOF error, got {other:?}"),
+    }
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
 fn rsli_presorted_flag_requires_permutation() {
     let entries = vec![
         SyntheticRsliEntry {
@@ -839,6 +971,48 @@ fn rsli_presorted_flag_requires_permutation() {
         }
         other => panic!("expected CorruptEntryTable for invalid permutation, got {other:?}"),
     }
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn rsli_load_reports_correct_entry_id_on_range_failure() {
+    let entries = vec![
+        SyntheticRsliEntry {
+            name: "ONE".to_string(),
+            method_raw: 0x000,
+            plain: b"one".to_vec(),
+            declared_packed_size: None,
+        },
+        SyntheticRsliEntry {
+            name: "TWO".to_string(),
+            method_raw: 0x000,
+            plain: b"two".to_vec(),
+            declared_packed_size: None,
+        },
+    ];
+    let bytes = build_rsli_bytes(
+        &entries,
+        &RsliBuildOptions {
+            presorted: true,
+            ..RsliBuildOptions::default()
+        },
+    );
+    let path = write_temp_file("rsli-entry-id-error", &bytes);
+
+    let mut library = Library::open_path(&path).expect("open synthetic rsli failed");
+    library.entries[1].packed_size_available = usize::MAX;
+
+    match library.load(EntryId(1)) {
+        Err(Error::IntegerOverflow) => {}
+        other => panic!("expected IntegerOverflow, got {other:?}"),
+    }
+
+    library.entries[1].packed_size_available = library.bytes.len();
+    match library.load(EntryId(1)) {
+        Err(Error::EntryDataOutOfBounds { id, .. }) => assert_eq!(id, 1),
+        other => panic!("expected EntryDataOutOfBounds with id=1, got {other:?}"),
+    }
+
     let _ = fs::remove_file(&path);
 }
 

@@ -52,14 +52,14 @@ impl<'a> LzhDecoder<'a> {
         let mut out = Vec::with_capacity(expected_size);
 
         while out.len() < expected_size {
-            let c = self.decode_char();
+            let c = self.decode_char()?;
             if c < 256 {
                 let byte = c as u8;
                 out.push(byte);
                 self.text[self.ring_pos] = byte;
                 self.ring_pos = (self.ring_pos + 1) & (LZH_N - 1);
             } else {
-                let mut offset = self.decode_position();
+                let mut offset = self.decode_position()?;
                 offset = (self.ring_pos.wrapping_sub(offset).wrapping_sub(1)) & (LZH_N - 1);
                 let mut length = c.saturating_sub(253);
 
@@ -131,29 +131,29 @@ impl<'a> LzhDecoder<'a> {
         self.parent[LZH_R] = 0;
     }
 
-    fn decode_char(&mut self) -> usize {
+    fn decode_char(&mut self) -> Result<usize> {
         let mut node = self.son[LZH_R];
         while node < LZH_T {
-            let bit = usize::from(self.bit_reader.read_bit_or_zero());
+            let bit = usize::from(self.bit_reader.read_bit()?);
             node = self.son[node + bit];
         }
 
         let c = node - LZH_T;
         self.update(c);
-        c
+        Ok(c)
     }
 
-    fn decode_position(&mut self) -> usize {
-        let i = self.bit_reader.read_bits_or_zero(8) as usize;
+    fn decode_position(&mut self) -> Result<usize> {
+        let i = self.bit_reader.read_bits(8)? as usize;
         let mut c = usize::from(self.d_code[i]) << 6;
         let mut j = usize::from(self.d_len[i]).saturating_sub(2);
 
         while j > 0 {
             j -= 1;
-            c |= usize::from(self.bit_reader.read_bit_or_zero()) << j;
+            c |= usize::from(self.bit_reader.read_bit()?) << j;
         }
 
-        c | (i & 0x3F)
+        Ok(c | (i & 0x3F))
     }
 
     fn update(&mut self, c: usize) {
@@ -264,10 +264,10 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    fn read_bit_or_zero(&mut self) -> u8 {
+    fn read_bit(&mut self) -> Result<u8> {
         if self.bit_mask == 0x80 {
             let Some(mut byte) = self.data.get(self.byte_pos).copied() else {
-                return 0;
+                return Err(Error::DecompressionFailed("lzss-huffman: unexpected EOF"));
             };
             if let Some(state) = &mut self.xor_state {
                 byte = state.decrypt_byte(byte);
@@ -285,14 +285,14 @@ impl<'a> BitReader<'a> {
             self.bit_mask = 0x80;
             self.byte_pos = self.byte_pos.saturating_add(1);
         }
-        bit
+        Ok(bit)
     }
 
-    fn read_bits_or_zero(&mut self, bits: usize) -> u32 {
+    fn read_bits(&mut self, bits: usize) -> Result<u32> {
         let mut value = 0u32;
         for _ in 0..bits {
-            value = (value << 1) | u32::from(self.read_bit_or_zero());
+            value = (value << 1) | u32::from(self.read_bit()?);
         }
-        value
+        Ok(value)
     }
 }

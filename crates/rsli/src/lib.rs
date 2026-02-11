@@ -191,7 +191,7 @@ impl Library {
 
     pub fn load(&self, id: EntryId) -> Result<Vec<u8>> {
         let entry = self.entry_by_id(id)?;
-        let packed = self.packed_slice(entry)?;
+        let packed = self.packed_slice(id, entry)?;
         decode_payload(
             packed,
             entry.meta.method,
@@ -208,7 +208,7 @@ impl Library {
 
     pub fn load_packed(&self, id: EntryId) -> Result<PackedResource> {
         let entry = self.entry_by_id(id)?;
-        let packed = self.packed_slice(entry)?.to_vec();
+        let packed = self.packed_slice(id, entry)?.to_vec();
         Ok(PackedResource {
             meta: entry.meta.clone(),
             packed,
@@ -231,7 +231,7 @@ impl Library {
     pub fn load_fast(&self, id: EntryId) -> Result<ResourceData<'_>> {
         let entry = self.entry_by_id(id)?;
         if entry.meta.method == PackMethod::None {
-            let packed = self.packed_slice(entry)?;
+            let packed = self.packed_slice(id, entry)?;
             let size =
                 usize::try_from(entry.meta.unpacked_size).map_err(|_| Error::IntegerOverflow)?;
             if packed.len() < size {
@@ -255,7 +255,7 @@ impl Library {
             })
     }
 
-    fn packed_slice<'a>(&'a self, entry: &EntryRecord) -> Result<&'a [u8]> {
+    fn packed_slice<'a>(&'a self, id: EntryId, entry: &EntryRecord) -> Result<&'a [u8]> {
         let start = entry.effective_offset;
         let end = start
             .checked_add(entry.packed_size_available)
@@ -263,7 +263,7 @@ impl Library {
         self.bytes
             .get(start..end)
             .ok_or(Error::EntryDataOutOfBounds {
-                id: 0,
+                id: id.0,
                 offset: u64::try_from(start).unwrap_or(u64::MAX),
                 size: entry.packed_size_declared,
                 file_len: u64::try_from(self.bytes.len()).unwrap_or(u64::MAX),
