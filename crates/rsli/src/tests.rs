@@ -444,6 +444,14 @@ fn build_rsli_bytes(entries: &[SyntheticRsliEntry], opts: &RsliBuildOptions) -> 
     output
 }
 
+fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
+    let slice = bytes
+        .get(offset..offset + 4)
+        .expect("u32 read out of bounds in test");
+    let arr: [u8; 4] = slice.try_into().expect("u32 conversion failed in test");
+    u32::from_le_bytes(arr)
+}
+
 #[test]
 fn rsli_read_unpack_and_repack_all_files() {
     let files = rsli_test_files();
@@ -582,6 +590,126 @@ fn rsli_read_unpack_and_repack_all_files() {
 }
 
 #[test]
+fn rsli_docs_structural_invariants_all_files() {
+    let files = rsli_test_files();
+    if files.is_empty() {
+        eprintln!(
+            "skipping rsli_docs_structural_invariants_all_files: no RsLi archives in testdata/rsli"
+        );
+        return;
+    }
+
+    let mut deflate_eof_plus_one_quirks = Vec::new();
+
+    for path in files {
+        let bytes = fs::read(&path).unwrap_or_else(|err| {
+            panic!("failed to read {}: {err}", path.display());
+        });
+
+        assert!(
+            bytes.len() >= 32,
+            "RsLi header too short in {}",
+            path.display()
+        );
+        assert_eq!(&bytes[0..2], b"NL", "bad magic in {}", path.display());
+        assert_eq!(
+            bytes[2],
+            0,
+            "reserved header byte must be zero in {}",
+            path.display()
+        );
+        assert_eq!(bytes[3], 1, "bad version in {}", path.display());
+
+        let entry_count = i16::from_le_bytes([bytes[4], bytes[5]]);
+        assert!(
+            entry_count >= 0,
+            "negative entry_count={} in {}",
+            entry_count,
+            path.display()
+        );
+        let count = usize::try_from(entry_count).expect("entry_count overflow");
+        let table_size = count.checked_mul(32).expect("table_size overflow");
+        let table_end = 32usize.checked_add(table_size).expect("table_end overflow");
+        assert!(
+            table_end <= bytes.len(),
+            "table out of bounds in {}",
+            path.display()
+        );
+
+        let seed = read_u32_le(&bytes, 20);
+        let table_plain = xor_stream(&bytes[32..table_end], (seed & 0xFFFF) as u16);
+        assert_eq!(
+            table_plain.len(),
+            table_size,
+            "decrypted table size mismatch in {}",
+            path.display()
+        );
+
+        let mut overlay = 0u32;
+        if bytes.len() >= 6 && &bytes[bytes.len() - 6..bytes.len() - 4] == b"AO" {
+            overlay = read_u32_le(&bytes, bytes.len() - 4);
+            assert!(
+                usize::try_from(overlay).expect("overlay overflow") <= bytes.len(),
+                "overlay beyond EOF in {}",
+                path.display()
+            );
+        }
+
+        let presorted_flag = u16::from_le_bytes([bytes[14], bytes[15]]);
+        let mut sort_values = Vec::with_capacity(count);
+
+        for index in 0..count {
+            let base = index * 32;
+            let row = &table_plain[base..base + 32];
+            let flags_signed = i16::from_le_bytes([row[16], row[17]]);
+            let sort_to_original = i16::from_le_bytes([row[18], row[19]]);
+            let data_offset = u64::from(read_u32_le(row, 24));
+            let packed_size = u64::from(read_u32_le(row, 28));
+
+            let method = (flags_signed as u16 as u32) & 0x1E0;
+            let effective_offset = data_offset + u64::from(overlay);
+            let end = effective_offset + packed_size;
+            let file_len = u64::try_from(bytes.len()).expect("file size overflow");
+
+            if end > file_len {
+                assert!(
+                    method == 0x100 && end == file_len + 1,
+                    "packed range out of bounds in {} entry #{index}: method=0x{method:03X}, range=[{effective_offset}, {end}), file={file_len}",
+                    path.display()
+                );
+                deflate_eof_plus_one_quirks.push((path.display().to_string(), index));
+            }
+
+            sort_values.push(sort_to_original);
+        }
+
+        if presorted_flag == 0xABBA {
+            let mut sorted = sort_values;
+            sorted.sort_unstable();
+            let expected: Vec<i16> = (0..count)
+                .map(|idx| i16::try_from(idx).expect("too many entries for i16"))
+                .collect();
+            assert_eq!(
+                sorted,
+                expected,
+                "sort_to_original is not a permutation in {}",
+                path.display()
+            );
+        }
+    }
+
+    if !deflate_eof_plus_one_quirks.is_empty() {
+        assert!(
+            deflate_eof_plus_one_quirks
+                .iter()
+                .all(|(file, idx)| file.ends_with("sprites.lib") && *idx == 23),
+            "unexpected deflate EOF+1 quirks: {:?}",
+            deflate_eof_plus_one_quirks
+        );
+    }
+}
+
+#[test]
 fn rsli_synthetic_all_methods_roundtrip() {
     let entries = vec![
         SyntheticRsliEntry {
@@ -664,6 +792,53 @@ fn rsli_synthetic_all_methods_roundtrip() {
         assert_eq!(unpacked, entry.plain, "unpack mismatch for {}", entry.name);
     }
 
+    let _ = fs::remove_file(&path);
+}
+
+#[test]
+fn rsli_presorted_flag_requires_permutation() {
+    let entries = vec![
+        SyntheticRsliEntry {
+            name: "AAA".to_string(),
+            method_raw: 0x000,
+            plain: b"a".to_vec(),
+            declared_packed_size: None,
+        },
+        SyntheticRsliEntry {
+            name: "BBB".to_string(),
+            method_raw: 0x000,
+            plain: b"b".to_vec(),
+            declared_packed_size: None,
+        },
+    ];
+    let mut bytes = build_rsli_bytes(
+        &entries,
+        &RsliBuildOptions {
+            presorted: true,
+            ..RsliBuildOptions::default()
+        },
+    );
+
+    let seed = read_u32_le(&bytes, 20);
+    let mut table_plain = xor_stream(&bytes[32..32 + entries.len() * 32], (seed & 0xFFFF) as u16);
+
+    // Corrupt sort_to_original: duplicate index 0, so the table is not a permutation.
+    table_plain[18..20].copy_from_slice(&0i16.to_le_bytes());
+    table_plain[50..52].copy_from_slice(&0i16.to_le_bytes());
+
+    let table_encrypted = xor_stream(&table_plain, (seed & 0xFFFF) as u16);
+    bytes[32..32 + table_encrypted.len()].copy_from_slice(&table_encrypted);
+
+    let path = write_temp_file("rsli-bad-presorted-perm", &bytes);
+    match Library::open_path(&path) {
+        Err(Error::CorruptEntryTable(message)) => {
+            assert!(
+                message.contains("permutation"),
+                "unexpected error message: {message}"
+            );
+        }
+        other => panic!("expected CorruptEntryTable for invalid permutation, got {other:?}"),
+    }
     let _ = fs::remove_file(&path);
 }
 

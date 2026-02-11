@@ -149,13 +149,31 @@ pub fn parse_library(bytes: Arc<[u8]>, opts: OpenOptions) -> Result<Library> {
 
     let presorted_flag = u16::from_le_bytes([bytes[14], bytes[15]]);
     if presorted_flag == 0xABBA {
+        let mut seen = vec![false; count];
         for entry in &entries {
             let idx = i32::from(entry.sort_to_original);
-            if idx < 0 || usize::try_from(idx).map_err(|_| Error::IntegerOverflow)? >= count {
+            if idx < 0 {
                 return Err(Error::CorruptEntryTable(
                     "sort_to_original is not a valid permutation index",
                 ));
             }
+            let idx = usize::try_from(idx).map_err(|_| Error::IntegerOverflow)?;
+            if idx >= count {
+                return Err(Error::CorruptEntryTable(
+                    "sort_to_original is not a valid permutation index",
+                ));
+            }
+            if seen[idx] {
+                return Err(Error::CorruptEntryTable(
+                    "sort_to_original is not a permutation",
+                ));
+            }
+            seen[idx] = true;
+        }
+        if seen.iter().any(|value| !*value) {
+            return Err(Error::CorruptEntryTable(
+                "sort_to_original is not a permutation",
+            ));
         }
     } else {
         let mut sorted: Vec<usize> = (0..count).collect();

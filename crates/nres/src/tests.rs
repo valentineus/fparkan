@@ -81,6 +81,19 @@ fn read_u32_le(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(arr)
 }
 
+fn read_i32_le(bytes: &[u8], offset: usize) -> i32 {
+    let slice = bytes
+        .get(offset..offset + 4)
+        .expect("i32 read out of bounds in test");
+    let arr: [u8; 4] = slice.try_into().expect("i32 conversion failed in test");
+    i32::from_le_bytes(arr)
+}
+
+fn name_field_bytes(raw: &[u8; 36]) -> Option<&[u8]> {
+    let nul = raw.iter().position(|value| *value == 0)?;
+    Some(&raw[..nul])
+}
+
 fn build_nres_bytes(entries: &[SyntheticEntry<'_>]) -> Vec<u8> {
     let mut out = vec![0u8; 16];
     let mut offsets = Vec::with_capacity(entries.len());
@@ -131,6 +144,154 @@ fn build_nres_bytes(entries: &[SyntheticEntry<'_>]) -> Vec<u8> {
     let total_size = u32::try_from(out.len()).expect("size overflow");
     out[12..16].copy_from_slice(&total_size.to_le_bytes());
     out
+}
+
+#[test]
+fn nres_docs_structural_invariants_all_files() {
+    let files = nres_test_files();
+    if files.is_empty() {
+        eprintln!(
+            "skipping nres_docs_structural_invariants_all_files: no NRes archives in testdata/nres"
+        );
+        return;
+    }
+
+    for path in files {
+        let bytes = fs::read(&path).unwrap_or_else(|err| {
+            panic!("failed to read {}: {err}", path.display());
+        });
+
+        assert!(
+            bytes.len() >= 16,
+            "NRes header too short in {}",
+            path.display()
+        );
+        assert_eq!(&bytes[0..4], b"NRes", "bad magic in {}", path.display());
+        assert_eq!(
+            read_u32_le(&bytes, 4),
+            0x100,
+            "bad version in {}",
+            path.display()
+        );
+        assert_eq!(
+            usize::try_from(read_u32_le(&bytes, 12)).expect("size overflow"),
+            bytes.len(),
+            "header.total_size mismatch in {}",
+            path.display()
+        );
+
+        let entry_count_i32 = read_i32_le(&bytes, 8);
+        assert!(
+            entry_count_i32 >= 0,
+            "negative entry_count={} in {}",
+            entry_count_i32,
+            path.display()
+        );
+        let entry_count = usize::try_from(entry_count_i32).expect("entry_count overflow");
+        let directory_len = entry_count.checked_mul(64).expect("directory_len overflow");
+        let directory_offset = bytes
+            .len()
+            .checked_sub(directory_len)
+            .unwrap_or_else(|| panic!("directory underflow in {}", path.display()));
+        assert!(
+            directory_offset >= 16,
+            "directory offset before data area in {}",
+            path.display()
+        );
+        assert_eq!(
+            directory_offset + directory_len,
+            bytes.len(),
+            "directory not at file end in {}",
+            path.display()
+        );
+
+        let mut sort_indices = Vec::with_capacity(entry_count);
+        let mut entries = Vec::with_capacity(entry_count);
+        for index in 0..entry_count {
+            let base = directory_offset + index * 64;
+            let size = usize::try_from(read_u32_le(&bytes, base + 12)).expect("size overflow");
+            let data_offset =
+                usize::try_from(read_u32_le(&bytes, base + 56)).expect("offset overflow");
+            let sort_index =
+                usize::try_from(read_u32_le(&bytes, base + 60)).expect("sort_index overflow");
+
+            let mut name_raw = [0u8; 36];
+            name_raw.copy_from_slice(
+                bytes
+                    .get(base + 20..base + 56)
+                    .expect("name field out of bounds in test"),
+            );
+            let name_bytes = name_field_bytes(&name_raw).unwrap_or_else(|| {
+                panic!(
+                    "name field without NUL terminator in {} entry #{index}",
+                    path.display()
+                )
+            });
+            assert!(
+                name_bytes.len() <= 35,
+                "name longer than 35 bytes in {} entry #{index}",
+                path.display()
+            );
+
+            sort_indices.push(sort_index);
+            entries.push((name_bytes.to_vec(), data_offset, size));
+        }
+
+        let mut expected_sort: Vec<usize> = (0..entry_count).collect();
+        expected_sort.sort_by(|a, b| cmp_name_case_insensitive(&entries[*a].0, &entries[*b].0));
+        assert_eq!(
+            sort_indices,
+            expected_sort,
+            "sort_index table mismatch in {}",
+            path.display()
+        );
+
+        let mut data_regions: Vec<(usize, usize)> =
+            entries.iter().map(|(_, off, size)| (*off, *size)).collect();
+        data_regions.sort_by_key(|(off, _)| *off);
+
+        for (idx, (data_offset, size)) in data_regions.iter().enumerate() {
+            assert_eq!(
+                data_offset % 8,
+                0,
+                "data offset is not 8-byte aligned in {} (region #{idx})",
+                path.display()
+            );
+            assert!(
+                *data_offset >= 16,
+                "data offset before header end in {} (region #{idx})",
+                path.display()
+            );
+            assert!(
+                data_offset.checked_add(*size).unwrap_or(usize::MAX) <= directory_offset,
+                "data region overlaps directory in {} (region #{idx})",
+                path.display()
+            );
+        }
+
+        for pair in data_regions.windows(2) {
+            let (start, size) = pair[0];
+            let (next_start, _) = pair[1];
+            let end = start
+                .checked_add(size)
+                .unwrap_or_else(|| panic!("size overflow in {}", path.display()));
+            assert!(
+                end <= next_start,
+                "overlapping data regions in {}: [{start}, {end}) and next at {next_start}",
+                path.display()
+            );
+
+            for (offset, value) in bytes[end..next_start].iter().enumerate() {
+                assert_eq!(
+                    *value,
+                    0,
+                    "non-zero alignment padding in {} at offset {}",
+                    path.display(),
+                    end + offset
+                );
+            }
+        }
+    }
 }
 
 #[test]
