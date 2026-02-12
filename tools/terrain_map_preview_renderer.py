@@ -181,6 +181,47 @@ def _write_ppm(path: Path, width: int, height: int, rgb: bytearray) -> None:
         handle.write(rgb)
 
 
+def _write_obj(
+    path: Path,
+    terrain_positions: list[tuple[float, float, float]],
+    terrain_faces: list[tuple[int, int, int]],
+    areals: list[dict[str, Any]],
+    *,
+    include_areals: bool,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="\n") as out:
+        out.write("# Exported by terrain_map_preview_renderer.py\n")
+        out.write("o terrain\n")
+        for x, y, z in terrain_positions:
+            out.write(f"v {x:.9g} {y:.9g} {z:.9g}\n")
+        for i0, i1, i2 in terrain_faces:
+            # OBJ indices are 1-based.
+            out.write(f"f {i0 + 1} {i1 + 1} {i2 + 1}\n")
+
+        if include_areals and areals:
+            base = len(terrain_positions)
+            area_vertex_counts: list[int] = []
+            out.write("o areal_edges\n")
+            for area in areals:
+                verts = area["vertices"]
+                area_vertex_counts.append(len(verts))
+                for x, y, z in verts:
+                    out.write(f"v {x:.9g} {y:.9g} {z:.9g}\n")
+
+            ptr = base
+            for area_idx, area in enumerate(areals):
+                cnt = area_vertex_counts[area_idx]
+                if cnt < 2:
+                    ptr += cnt
+                    continue
+                # closed polyline.
+                line = [str(ptr + i + 1) for i in range(cnt)]
+                line.append(str(ptr + 1))
+                out.write("l " + " ".join(line) + "\n")
+                ptr += cnt
+
+
 def _render_scene(
     terrain_positions: list[tuple[float, float, float]],
     terrain_faces: list[tuple[int, int, int]],
@@ -430,6 +471,90 @@ def cmd_render(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export_obj(args: argparse.Namespace) -> int:
+    msh_path = Path(args.land_msh).resolve()
+    map_path = Path(args.land_map).resolve() if args.land_map else None
+    output_path = Path(args.output).resolve()
+
+    positions, faces, terrain_meta = load_terrain_msh(msh_path, max_faces=int(args.max_faces))
+    areals: list[dict[str, Any]] = []
+    if map_path and bool(args.include_areals):
+        areals, _ = load_areal_map(map_path)
+
+    _write_obj(
+        output_path,
+        positions,
+        faces,
+        areals,
+        include_areals=bool(args.include_areals),
+    )
+
+    areal_vertices = sum(len(a["vertices"]) for a in areals)
+    print(f"Terrain source   : {msh_path}")
+    if map_path:
+        print(f"Areal source     : {map_path}")
+    print(f"OBJ output       : {output_path}")
+    print(
+        "Terrain geometry : "
+        f"vertices={terrain_meta['vertex_count']}, "
+        f"faces={terrain_meta['face_count_rendered']}/{terrain_meta['face_count_valid']}"
+    )
+    if bool(args.include_areals):
+        print(f"Areal edges      : areals={len(areals)}, extra_vertices={areal_vertices}")
+    return 0
+
+
+def cmd_render_turntable(args: argparse.Namespace) -> int:
+    msh_path = Path(args.land_msh).resolve()
+    map_path = Path(args.land_map).resolve() if args.land_map else None
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    frames = int(args.frames)
+    if frames <= 0:
+        raise RuntimeError("--frames must be > 0")
+
+    positions, faces, terrain_meta = load_terrain_msh(msh_path, max_faces=int(args.max_faces))
+    areals: list[dict[str, Any]] = []
+    if map_path:
+        areals, _ = load_areal_map(map_path)
+
+    yaw_start = float(args.yaw_start)
+    yaw_end = float(args.yaw_end)
+    if frames == 1:
+        yaws = [yaw_start]
+    else:
+        step = (yaw_end - yaw_start) / (frames - 1)
+        yaws = [yaw_start + i * step for i in range(frames)]
+
+    prefix = str(args.prefix)
+    for i, yaw in enumerate(yaws):
+        rgb = _render_scene(
+            positions,
+            faces,
+            areals,
+            width=int(args.width),
+            height=int(args.height),
+            yaw_deg=yaw,
+            pitch_deg=float(args.pitch),
+            wireframe=bool(args.wireframe),
+            areal_overlay=bool(args.overlay_areals),
+        )
+        out = output_dir / f"{prefix}_{i:03d}.ppm"
+        _write_ppm(out, int(args.width), int(args.height), rgb)
+
+    print(f"Turntable source : {msh_path}")
+    if map_path:
+        print(f"Areal source     : {map_path}")
+    print(f"Output dir       : {output_dir}")
+    print(f"Frames           : {frames} ({yaws[0]:.3f} -> {yaws[-1]:.3f} yaw)")
+    print(
+        "Terrain geometry : "
+        f"vertices={terrain_meta['vertex_count']}, faces={terrain_meta['face_count_rendered']}"
+    )
+    return 0
+
+
 def cmd_render_batch(args: argparse.Namespace) -> int:
     maps_root = Path(args.maps_root).resolve()
     output_dir = Path(args.output_dir).resolve()
@@ -489,6 +614,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     render.set_defaults(func=cmd_render)
 
+    export_obj = sub.add_parser("export-obj", help="Export terrain (and optional areal edges) to OBJ.")
+    export_obj.add_argument("--land-msh", required=True, help="Path to Land.msh")
+    export_obj.add_argument("--land-map", help="Path to Land.map (optional)")
+    export_obj.add_argument("--output", required=True, help="Output .obj path")
+    export_obj.add_argument("--max-faces", type=int, default=0, help="Face limit (0 = all)")
+    export_obj.add_argument(
+        "--include-areals",
+        action="store_true",
+        help="Export areal polygons as OBJ polyline object",
+    )
+    export_obj.set_defaults(func=cmd_export_obj)
+
+    turn = sub.add_parser("render-turntable", help="Render turntable frame sequence to PPM.")
+    turn.add_argument("--land-msh", required=True, help="Path to Land.msh")
+    turn.add_argument("--land-map", help="Path to Land.map (optional)")
+    turn.add_argument("--output-dir", required=True, help="Output directory for frames")
+    turn.add_argument("--prefix", default="frame", help="Frame filename prefix (default: frame)")
+    turn.add_argument("--frames", type=int, default=36, help="Frame count (default: 36)")
+    turn.add_argument("--yaw-start", type=float, default=0.0, help="Start yaw in degrees (default: 0)")
+    turn.add_argument("--yaw-end", type=float, default=360.0, help="End yaw in degrees (default: 360)")
+    turn.add_argument("--pitch", type=float, default=26.0, help="Pitch angle in degrees (default: 26)")
+    turn.add_argument("--max-faces", type=int, default=160000, help="Face limit (default: 160000)")
+    turn.add_argument("--width", type=int, default=960, help="Image width (default: 960)")
+    turn.add_argument("--height", type=int, default=540, help="Image height (default: 540)")
+    turn.add_argument("--wireframe", action="store_true", help="Draw terrain wireframe overlay")
+    turn.add_argument(
+        "--overlay-areals",
+        action="store_true",
+        help="Draw ArealMap polygon overlay",
+    )
+    turn.set_defaults(func=cmd_render_turntable)
+
     batch = sub.add_parser("render-batch", help="Render all MAPS/**/Land.msh under root.")
     batch.add_argument(
         "--maps-root",
@@ -520,4 +677,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
