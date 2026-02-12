@@ -13,6 +13,8 @@
 Спецификация основана на:
 - `tmp/disassembler1/AniMesh.dll.c` (псевдо-C): `sub_10015FD0`, `sub_10012880`, `sub_10012560`.
 - `tmp/disassembler2/AniMesh.dll.asm` (ASM): подтверждение x87-пути (`FISTP`) и ветвлений.
+- `tmp/disassembler1/Ngi32.dll.c` (псевдо-C): `sub_10002F90`, `sub_10014540`, `sub_10014630`, `sub_10015D80`, `sub_10017E60`, `sub_10017F50`, `sub_10006D00`, `niGetProcAddress`.
+- `tmp/disassembler2/Ngi32.dll.asm` (ASM): подтверждение таблицы `g_FastProc` и FPU control-word setup.
 - валидации corpus (`testdata`): 435 моделей `*.msh`.
 
 Ниже разделено на:
@@ -99,7 +101,11 @@ Runtime читает эти поля напрямую в `sub_10012880`.
 
 Важно:
 - это не «просто floor»;
-- поведение зависит от x87 rounding mode (в игре используется стандартный control word).
+- поведение зависит от x87 control word.
+
+В оригинальном runtime control word приводится к каноничному виду в `Ngi32::sub_10006D00`:
+- `cw = (cw & 0xF0FF) | 0x003F`;
+- это даёт `round-to-nearest` (RC=00), precision control `PC=00` и маскирование x87-исключений.
 
 Если нужен byte/behavior 1:1, надо повторить именно x87-ветку или её точный эквивалент.
 
@@ -138,6 +144,16 @@ if ((uint32_t)frame >= animFrameCount
      - `quat = fastproc_interp(k0.quat, k1.quat, alpha)` (`g_FastProc[17]`).
 
 Сравнение `t == key.time` строгое (битовая float-эквивалентность по FPU compare), без epsilon.
+
+### 3.4. Порядок quaternion-компонент в runtime (нормативно)
+
+В `Res8` компоненты лежат как `qx,qy,qz,qw`, но в runtime-буферы они попадают в порядке:
+- `outQuat[0] = qw`;
+- `outQuat[1] = qx`;
+- `outQuat[2] = qy`;
+- `outQuat[3] = qz`.
+
+То есть все `g_FastProc`-пути в анимации работают с quaternion в порядке `float4 = [w, x, y, z]`.
 
 ---
 
@@ -183,6 +199,72 @@ outMatrix[11] = pos.z;
 ```
 
 (`sub_1000B8E0` подтверждает, что используются именно эти ячейки).
+
+### 4.4. Точные `g_FastProc[14/17/22]` (нормативно)
+
+`niGetProcAddress(i)` в `Ngi32` возвращает `g_FastProc[i]` (таблица function pointers).
+В `AniMesh` используются:
+- `call [g_FastProc + 0x38]` -> index 14 -> `quat_to_matrix`.
+- `call [g_FastProc + 0x44]` -> index 17 -> `quat_interp`.
+- `call [g_FastProc + 0x58]` -> index 22 -> `quat_blend`.
+
+Связь с символами `Ngi32` (по адресам таблицы):
+- `g_FastProc` base = `0x1003A058`;
+- index 14 -> `0x1003A090`;
+- index 17 -> `0x1003A09C`;
+- index 22 -> `0x1003A0B0`.
+
+Назначения по CPU-веткам (`sub_10002F90`) и семантика:
+- scalar path: `14=sub_10017E60` (или `sub_10014540`), `17=22=sub_10017F50` (или `sub_10014630`);
+- SIMD path (`dword_1003A168`): `14=sub_1001D830`, `17=22=sub_10015D80`;
+- все варианты эквивалентны по математике.
+
+Точная формула `quat_to_matrix` для `q=[w,x,y,z]`:
+
+```c
+m[0]  = 1 - 2*(y*y + z*z);
+m[1]  = 2*(x*y + w*z);
+m[2]  = 2*(x*z - w*y);
+m[3]  = 0;
+
+m[4]  = 2*(x*y - w*z);
+m[5]  = 1 - 2*(x*x + z*z);
+m[6]  = 2*(y*z + w*x);
+m[7]  = 0;
+
+m[8]  = 2*(x*z + w*y);
+m[9]  = 2*(y*z - w*x);
+m[10] = 1 - 2*(x*x + y*y);
+m[11] = 0;
+
+m[12] = 0;
+m[13] = 0;
+m[14] = 0;
+m[15] = 1;
+```
+
+Точная формула `quat_interp`/`quat_blend` (`index 17` и `22`, один и тот же алгоритм):
+
+```c
+float dot = dot4(q0, q1);
+float sign = 1.0f;
+if (dot < 0.0f) { dot = -dot; sign = -1.0f; }
+
+float w0, w1;
+if (1.0f - dot <= 9.9999997e-6f) {
+    w0 = 1.0f - a;
+    w1 = a;
+} else {
+    float theta = acos(dot);
+    float inv_sin_theta = 1.0f / sin(theta);
+    w1 = sin(a * theta) * inv_sin_theta;
+    w0 = cos(a * theta) - w1 * dot;
+}
+w1 *= sign;
+out = w0 * q0 + w1 * q1;
+```
+
+Примечание: явной нормализации `out` в конце нет; используется закрытая форма SLERP-весов.
 
 Reference pseudocode:
 
@@ -367,8 +449,12 @@ struct AnimModel {
 
 ### 10.3. `Res1.attr3 == 24` (legacy outlier)
 
-В corpus встречается единично (`MTCHECK.MSH`).
-Алгоритм из `sub_10012880` адресует node как stride 38, поэтому этот вариант нужно трактовать как отдельный legacy-формат и не применять к нему правила `hdr2/hdr3` из данного документа без дополнительного реверса.
+В corpus встречается единично (`MTCHECK.MSH`, `testdata/nres/system.rlb`):
+- `Res1.attr3 = 24`;
+- `Res8` содержит 1 ключ;
+- `Res19.size == 0`.
+
+Алгоритм `sub_10012880` адресует node как stride 38, поэтому этот случай нельзя интерпретировать правилами текущего 38-byte формата. Практически это отдельный legacy-формат/legacy-path вне описанного runtime-контракта.
 
 ### 10.4. Квантование quaternion при экспорте
 
@@ -418,3 +504,14 @@ void sample_node_pose(Model *m, int node_idx, float t, float out_quat[4], float 
     fastproc_quat_interp(decode_quat(k0), decode_quat(k1), a, out_quat); // g_FastProc[17]
 }
 ```
+
+## 12. Границы полноты
+
+Для основного формата (`Res1` stride 38 + `Res8` + `Res19`) эта страница покрывает runtime и toolchain-поведение на уровне, достаточном для 1:1 реализации (reader/writer/converter/editor).
+
+Единственный подтверждённый неполный сегмент:
+- legacy `Res1.attr3 == 24` (`MTCHECK.MSH`), для которого в `AniMesh` не найден отдельный открытый decode-path в рамках текущего реверса.
+
+Для абсолютных 100% по всем историческим вариантам формата дополнительно нужно:
+- найти и дореверсить runtime-код, который реально обрабатывает `Res1.attr3==24` (если он есть в других модулях/ветках);
+- получить больше образцов `*.msh` с `attr3==24` для проверки writer/validator-инвариантов.

@@ -1,492 +1,678 @@
 # MSH core
 
-Документ описывает core-часть формата MSH: геометрию, узлы, батчи, LOD и slot-матрицу.
+Документ фиксирует core-часть формата MSH на уровне, достаточном для:
 
-Связанный формат контейнера: [NRes / RsLi](nres.md).
+- реализации runtime-совместимого движка (поведение 1:1);
+- реализации reader/writer/editor/converter с lossless round-trip;
+- валидации ассетов и диагностики повреждений.
 
----
+Связанные документы:
 
-## 1.1. Общая архитектура
-
-Модель состоит из набора именованных ресурсов внутри одного NRes‑архива. Каждый ресурс идентифицируется **целочисленным типом** (`resource_type`), который передаётся API функции `niReadData` (vtable‑метод `+0x18`) через связку `niFind` (vtable‑метод `+0x0C`, `+0x20`).
-
-Рендер‑модель использует **rigid‑скининг по узлам** (нет per‑vertex bone weights). Каждый batch геометрии привязан к одному узлу и рисуется с матрицей этого узла.
-
-## 1.2. Общая структура файла модели
-
-```
-┌────────────────────────────────────┐
-│  NRes‑заголовок (16 байт)          │
-├────────────────────────────────────┤
-│  Ресурсы (произвольный порядок):   │
-│    Res1  — Node table              │
-│    Res2  — Model header + Slots    │
-│    Res3  — Vertex positions        │
-│    Res4  — Packed normals          │
-│    Res5  — Packed UV0              │
-│    Res6  — Index buffer            │
-│    Res7  — Triangle descriptors    │
-│    Res8  — Keyframe data           │
-│    Res10 — String table            │
-│    Res13 — Batch table             │
-│    Res19 — Animation mapping       │
-│    [Res15] — UV1 / доп. поток      │
-│    [Res16] — Tangent/Bitangent     │
-│    [Res18] — Vertex color          │
-│    [Res20] — Доп. таблица          │
-├────────────────────────────────────┤
-│  NRes‑каталог                      │
-└────────────────────────────────────┘
-```
-
-Ресурсы в квадратных скобках — **опциональные**. Загрузчик проверяет их наличие перед чтением (`niFindRes` возвращает `−1` при отсутствии).
-
-## 1.3. Порядок загрузки ресурсов (из `sub_10015FD0` в AniMesh.dll)
-
-Функция `sub_10015FD0` выполняет инициализацию внутренней структуры модели размером **0xA4** (164 байта). Ниже приведён точный порядок загрузки и маппинг ресурсов на поля структуры:
-
-| Шаг | Тип ресурса | Поле структуры | Описание                                |
-|-----|-------------|----------------|-----------------------------------------|
-| 1   | 1           | `+0x00`        | Node table (Res1)                       |
-| 2   | 2           | `+0x04`        | Model header (Res2)                     |
-| 3   | 3           | `+0x0C`        | Vertex positions (Res3)                 |
-| 4   | 4           | `+0x10`        | Packed normals (Res4)                   |
-| 5   | 5           | `+0x14`        | Packed UV0 (Res5)                       |
-| 6   | 10 (0x0A)   | `+0x20`        | String table (Res10)                    |
-| 7   | 8           | `+0x18`        | Keyframe / animation track data (Res8)  |
-| 8   | 19 (0x13)   | `+0x1C`        | Animation mapping (Res19)               |
-| 9   | 7           | `+0x24`        | Triangle descriptors (Res7)             |
-| 10  | 13 (0x0D)   | `+0x28`        | Batch table (Res13)                     |
-| 11  | 6           | `+0x2C`        | Index buffer (Res6)                     |
-| 12  | 15 (0x0F)   | `+0x34`        | Доп. vertex stream (Res15), опционально |
-| 13  | 16 (0x10)   | `+0x38`        | Доп. vertex stream (Res16), опционально |
-| 14  | 18 (0x12)   | `+0x64`        | Vertex color (Res18), опционально       |
-| 15  | 20 (0x14)   | `+0x30`        | Доп. таблица (Res20), опционально       |
-
-### Производные поля (вычисляются после загрузки)
-
-| Поле    | Формула                 | Описание                                                                                       |
-|---------|-------------------------|------------------------------------------------------------------------------------------------|
-| `+0x08` | `Res2_ptr + 0x8C`       | Указатель на slot table (140 байт от начала Res2)                                              |
-| `+0x3C` | `= Res3_ptr`            | Копия указателя positions (stream ptr)                                                         |
-| `+0x40` | `= 0x0C` (12)           | Stride позиций: `sizeof(float3)`                                                               |
-| `+0x44` | `= Res4_ptr`            | Копия указателя normals (stream ptr)                                                           |
-| `+0x48` | `= 4`                   | Stride нормалей: 4 байта                                                                       |
-| `+0x4C` | `Res16_ptr` или `0`     | Stream A Res16 (tangent)                                                                       |
-| `+0x50` | `= 8` если `+0x4C != 0` | Stride stream A (используется только при наличии Res16)                                        |
-| `+0x54` | `Res16_ptr + 4` или `0` | Stream B Res16 (bitangent)                                                                     |
-| `+0x58` | `= 8` если `+0x54 != 0` | Stride stream B (используется только при наличии Res16)                                        |
-| `+0x5C` | `= Res5_ptr`            | Копия указателя UV0 (stream ptr)                                                               |
-| `+0x60` | `= 4`                   | Stride UV0: 4 байта                                                                            |
-| `+0x68` | `= 4` или `0`           | Stride Res18 (если найден)                                                                     |
-| `+0x8C` | `= Res15_ptr`           | Копия указателя Res15                                                                          |
-| `+0x90` | `= 8`                   | Stride Res15: 8 байт                                                                           |
-| `+0x94` | `= 0`                   | Зарезервировано/unk94: инициализируется нулём при загрузке; не является флагом Res18           |
-| `+0x9C` | NRes entry Res19 `+8`   | Метаданные из каталожной записи Res19                                                          |
-| `+0xA0` | NRes entry Res20 `+4`   | Метаданные из каталожной записи Res20 (заполняется только если Res20 найден и открыт, иначе 0) |
-
-**Примечание к метаданным:** поле `+0x9C` читается из каталожной записи NRes для ресурса 19 (смещение `+8` в записи каталога, т.е. `attribute_2`). Поле `+0xA0` — из каталожной записи для ресурса 20 (смещение `+4`, т.е. `attribute_1`) **только если Res20 найден и `niOpenRes` вернул ненулевой указатель**; иначе `+0xA0 = 0`. Индекс записи определяется как `entry_index * 64`, после чего считывается поле.
+- [NRes / RsLi](nres.md) — контейнер, каталог, атрибуты, выравнивание.
+- [MSH animation](msh-animation.md) — детальная спецификация `Res8`/`Res19`.
+- [Materials + Texm](materials-texm.md) — материальная часть и текстуры.
+- [Terrain + map loading](terrain-map-loading.md) — отдельная ветка terrain-ресурсов.
 
 ---
 
-### 1.3.1. Ссылки на функции и паттерны вызовов (для проверки реверса)
+## 1. Область и источники
 
-- `AniMesh.dll!sub_10015FD0` — загрузка ресурсов модели через vtable интерфейса NRes:
-  - `niFindRes(type, ...)` вызывается через `call [vtable+0x20]`
-  - `niOpenRes(...)` / чтение указателя — через `call [vtable+0x18]`
-- `AniMesh.dll!sub_10015FD0` выставляет производные поля (`Res2_ptr+0x8C`, stride'ы), обнуляет `model+0x94`, и при отсутствии Res16 обнуляет только указатели потоков (`+0x4C`, `+0x54`).
-- `AniMesh.dll!sub_10004840` / `sub_10004870` / `sub_100048A0` — использование runtime mapping‑таблицы (`+0x18`, индекс `boneId*4`) и таблицы указателей треков (`+0x08`) после построения анимационного объекта.
+### 1.1. Что покрывает этот документ
 
+Этот документ покрывает именно **core-геометрию и её runtime-связи**:
 
-## 1.4. Ресурс Res2 — Model Header (140 байт) + Slot Table
+- `Res1` (node table),
+- `Res2` (header + slots),
+- `Res3/4/5` (позиции/нормали/UV0),
+- `Res6` (индексы),
+- `Res7` (triangle descriptors),
+- `Res10` (node string table),
+- `Res13` (batch table),
+- optional `Res15/16/18/20`,
+- точки стыка с анимацией (`Res8/Res19`).
 
-Ресурс Res2 содержит:
+### 1.2. Что не покрывает
 
-```
-┌───────────────────────────────────┐  Смещение 0
-│  Model Header (140 байт = 0x8C)   │
-├───────────────────────────────────┤  Смещение 140 (0x8C)
-│  Slot Table                        │
-│  (slot_count × 68 байт)           │
-└───────────────────────────────────┘
-```
+- детальную семантику материалов/текстурных фаз (см. `materials-texm.md`),
+- terrain-ветку (`type 11/14/21` и связанные структуры, см. `terrain-map-loading.md`),
+- полную математику анимационного сэмплирования (см. `msh-animation.md`).
 
-### 1.4.1. Model Header (первые 140 байт)
+### 1.3. Источники реверса
 
-Поле `Res2[0x00..0x8B]` используется как **35 float** (без внутренних таблиц/индексов). Это подтверждено прямыми копированиями в `AniMesh.dll!sub_1000A460`:
+Основные подтверждения:
 
-- `qmemcpy(this+0x54, Res2+0x00, 0x60)` — первые 24 float;
-- копирование `Res2+0x60` размером `0x10` — ещё 4 float;
-- `qmemcpy(this+0x134, Res2+0x70, 0x1C)` — ещё 7 float.
+- `tmp/disassembler1/AniMesh.dll.c`:
+  - `sub_10015FD0` (загрузка ресурсов core-модели),
+  - `sub_100124D0` (поиск slot по node/lod/group),
+  - `sub_10012530` (доступ к строке узла в `Res10`),
+  - `sub_1000B2C0`/`sub_10013680` (tri/batch path),
+  - `sub_1000A460` (инициализация runtime-инстансов, копирование глобальных bounds).
+- `tmp/disassembler2/AniMesh.dll.asm` — подтверждение смещений/stride/ветвлений.
+- валидация corpus: `testdata/nres` (435 MSH моделей, нулевые ошибки в `tools/msh_doc_validator.py`).
 
-Итоговая раскладка:
+---
 
-| Диапазон     | Размер | Тип         | Семантика                                                            |
-|--------------|--------|-------------|----------------------------------------------------------------------|
-| `0x00..0x5F` | `0x60` | `float[24]` | 8 вершин глобального bounding‑hull (`vec3[8]`)                       |
-| `0x60..0x6F` | `0x10` | `float[4]`  | Глобальная bounding‑sphere: `center.xyz + radius`                    |
-| `0x70..0x8B` | `0x1C` | `float[7]`  | Глобальный «капсульный»/сегментный bound: `A.xyz`, `B.xyz`, `radius` |
+## 2. Модель данных MSH (high-level)
 
-Для рендера и broadphase движок использует как слот‑bounds (`Res2 slot`), так и этот глобальный набор bounds (в зависимости от контекста вызова/LOD и наличия слота).
+MSH-модель — это NRes-контейнер, где ресурсы связаны **не по порядку, а по type-id**.
 
-### 1.4.2. Slot Table (массив записей по 68 байт)
+Базовая связь таблиц:
 
-Slot — ключевая структура, связывающая узел иерархии с конкретной геометрией для конкретного LOD и группы. Каждая запись — **68 байт** (0x44).
+1. `Res1` для `(node, lod, group)` выбирает `slotIndex`.
+2. `Res2.slot[slotIndex]` даёт диапазоны triangle/batch (`triStart/triCount`, `batchStart/batchCount`).
+3. `Res13.batch` даёт `indexStart/indexCount/baseVertex`.
+4. `Res6` даёт сырые `uint16` индексы.
+5. `Res3/4/5` дают vertex-атрибуты по `baseVertex + index`.
 
-**Важно:** смещения в таблице ниже указаны в **десятичном формате** (байты). В скобках приведён hex‑эквивалент (например, 48 (0x30)).
+Ключевая особенность runtime:
 
+- скиннинг по узлам жёсткий (rigid attachment), без per-vertex bone weights в core-ресурсах.
 
-| Смещение  | Размер | Тип      | Описание                                            |
-|-----------|--------|----------|-----------------------------------------------------|
-| 0         | 2      | uint16   | `triStart` — индекс первого треугольника в Res7     |
-| 2         | 2      | uint16   | `triCount` — длина диапазона треугольников (`Res7`) |
-| 4         | 2      | uint16   | `batchStart` — индекс первого batch'а в Res13       |
-| 6         | 2      | uint16   | `batchCount` — количество batch'ей                  |
-| 8         | 4      | float    | `aabbMin.x`                                         |
-| 12        | 4      | float    | `aabbMin.y`                                         |
-| 16        | 4      | float    | `aabbMin.z`                                         |
-| 20        | 4      | float    | `aabbMax.x`                                         |
-| 24        | 4      | float    | `aabbMax.y`                                         |
-| 28        | 4      | float    | `aabbMax.z`                                         |
-| 32        | 4      | float    | `sphereCenter.x`                                    |
-| 36        | 4      | float    | `sphereCenter.y`                                    |
-| 40        | 4      | float    | `sphereCenter.z`                                    |
-| 44 (0x2C) | 4      | float    | `sphereRadius`                                      |
-| 48 (0x30) | 20     | 5×uint32 | Хвостовые поля: `unk30..unk40` (см. §1.4.2.1)       |
+---
 
-**AABB** — axis‑aligned bounding box в локальных координатах узла.
-**Bounding Sphere** — описанная сфера в локальных координатах узла.
+## 3. Карта ресурсов и границы core
 
-#### 1.4.2.1. Точная семантика `triStart/triCount`
+### 3.1. Ресурсы, которые читает core-loader (`sub_10015FD0`)
 
-В `AniMesh.dll!sub_1000B2C0` слот считается «владельцем» треугольника `triId`, если:
+| Type | Ресурс | Статус в core-loader | Формат/stride |
+|---:|---|---|---|
+| 1 | Node table | required | 38 байт/узел (основной случай) |
+| 2 | Model header + slots | required | `0x8C + slotCount*0x44` |
+| 3 | Positions | required | 12 |
+| 4 | Packed normals | обычно required | 4 |
+| 5 | Packed UV0 | обычно required | 4 |
+| 6 | Index buffer | required | 2 |
+| 7 | Triangle descriptors | обычно required | 16 |
+| 8 | Anim key pool | optional для статических | 24 |
+| 10 | String table | обычно required | variable |
+| 13 | Batch table | required | 20 |
+| 15 | Доп. stream | optional | 8 |
+| 16 | Tangent/bitangent stream | optional | 8 |
+| 18 | Vertex color stream | optional | 4 |
+| 19 | Anim mapping | optional для статических | 2 |
+| 20 | Доп. таблица | optional | variable |
+
+### 3.2. Ресурсы, которые встречаются в MSH, но вне этого документа
+
+В corpus из 435 моделей стабильно встречаются также `type 9` и `type 17`.
+Они **не загружаются** `sub_10015FD0` и относятся к некоревым подсистемам (материалы/эффекты/прочие runtime-ветки).
+
+### 3.3. Прямая MSH и вложенная MSH
+
+Tooling должен поддерживать два режима входа:
+
+- файл уже является модельным NRes (`magic NRes` и содержит `type 1/2/3/6/13`),
+- файл-архив содержит `.msh` entry, внутри которой вложенный NRes модели.
+
+---
+
+## 4. Runtime-контракт загрузки (`sub_10015FD0`)
+
+`sub_10015FD0` заполняет структуру модели размером `0xA4` байт и строит derived pointers/stride.
+
+### 4.1. Порядок `find/open`
+
+Фактический порядок загрузки:
+
+1. `type 1 -> this+0x00`
+2. `type 2 -> this+0x04`
+3. `type 3 -> this+0x0C`
+4. `type 4 -> this+0x10`
+5. `type 5 -> this+0x14`
+6. `type 10 -> this+0x20`
+7. `type 8 -> this+0x18`
+8. `type 19 -> this+0x1C`
+9. `type 7 -> this+0x24`
+10. `type 13 -> this+0x28`
+11. `type 6 -> this+0x2C`
+12. `type 15 -> this+0x34`
+13. `type 16 -> this+0x38`
+14. `type 18 -> this+0x64` (через отдельный `find`, optional)
+15. `type 20 -> this+0x30` (optional)
+
+### 4.2. Derived-поля (стримы)
+
+После загрузки ставятся derived-поля:
+
+- `this+0x08 = Res2 + 0x8C` (начало slot table),
+- `this+0x3C = Res3`, `this+0x40 = 12`,
+- `this+0x44 = Res4`, `this+0x48 = 4`,
+- `this+0x5C = Res5`, `this+0x60 = 4`,
+- `this+0x8C = Res15`, `this+0x90 = 8`,
+- `this+0x94 = 0` (инициализация нулём).
+
+Для `Res16`:
+
+- если есть: `this+0x4C = Res16`, `this+0x50 = 8`, `this+0x54 = Res16+4`, `this+0x58 = 8`;
+- если нет: `this+0x4C = 0`, `this+0x54 = 0` (stride остаются несущественными, т.к. указатели нулевые).
+
+Для `Res18`:
+
+- если найден: `this+0x64 = ptr`, `this+0x68 = 4`;
+- иначе: `this+0x64 = 0`, `this+0x68 = 0`.
+
+### 4.3. Метаданные из каталога NRes
+
+- `this+0x9C` получает `entry(type19).attr2` (читается из поля `+8` каталожной записи, индекс `entry * 64`).
+- `this+0xA0` получает `entry(type20).attr1` (поле `+4`) только если `type20` существует и успешно открыт; иначе `0`.
+
+---
+
+## 5. Бинарные структуры core-ресурсов
+
+Все структуры little-endian.
+
+### 5.1. `Res1` — Node table
+
+Базовый stride: `38` байт (`19 * uint16`).
 
 ```c
-triId >= slot.triStart && triId < slot.triStart + slot.triCount
-```
-
-Это прямое доказательство, что `slot +0x02` — именно **count диапазона**, а не флаги.
-
-#### 1.4.2.2. Хвост слота (20 байт = 5×uint32)
-
-Последние 20 байт записи слота трактуем как 5 последовательных 32‑битных значений (little‑endian). Их назначение пока не подтверждено; для инструментов рекомендуется сохранять и восстанавливать их «как есть».
-
-- `+48 (0x30)`: `unk30` (uint32)
-- `+52 (0x34)`: `unk34` (uint32)
-- `+56 (0x38)`: `unk38` (uint32)
-- `+60 (0x3C)`: `unk3C` (uint32)
-- `+64 (0x40)`: `unk40` (uint32)
-
-Для culling при рендере: AABB/sphere трансформируются матрицей узла и инстанса. При неравномерном scale радиус сферы масштабируется по `max(scaleX, scaleY, scaleZ)` (подтверждено по коду).
-
----
-
-### 1.4.3. Восстановление счётчиков элементов по размерам ресурсов (практика для инструментов)
-
-Для toolchain надёжнее считать count'ы по размерам ресурсов (а не по дублирующим полям других таблиц). Это полностью совпадает с тем, как рантайм использует fixed stride'ы в `sub_10015FD0`.
-
-Берите **unpacked_size** (или фактический размер распакованного блока) соответствующего ресурса и вычисляйте:
-
-- `node_count` = `size(Res1) / 38`
-- `vertex_count` = `size(Res3) / 12`
-- `normals_count` = `size(Res4) / 4`
-- `uv0_count` = `size(Res5) / 4`
-- `index_count` = `size(Res6) / 2`
-- `tri_count` = `index_count / 3` (если примитивы — список треугольников)
-- `tri_desc_count` = `size(Res7) / 16`
-- `batch_count` = `size(Res13) / 20`
-- `slot_count` = `(size(Res2) - 0x8C) / 0x44`
-- `anim_key_count` = `size(Res8) / 24`
-- `anim_map_count` = `size(Res19) / 2`
-- `uv1_count` = `size(Res15) / 8` (если Res15 присутствует)
-- `tbn_count` = `size(Res16) / 8` (если Res16 присутствует; tangent/bitangent по 4 байта, stride 8)
-- `color_count` = `size(Res18) / 4` (если Res18 присутствует)
-
-**Валидация:**
-
-- Любое деление должно быть **без остатка**; иначе ресурс повреждён или stride неверно угадан.
-- Если присутствуют Res4/Res5/Res15/Res16/Res18, их count'ы по смыслу должны совпадать с `vertex_count` (или быть ≥ него, если формат допускает хвостовые данные — пока не наблюдалось).
-- Для `slot_count` дополнительно проверьте, что `size(Res2) >= 0x8C`.
-
-**Проверка на реальных данных (435 MSH):**
-
-- `Res2.attr1 == (size-140)/68`, `Res2.attr2 == 0`, `Res2.attr3 == 68`;
-- `Res7.attr1 == size/16`, `Res7.attr3 == 16`;
-- `Res8.attr1 == size/24`, `Res8.attr3 == 4`;
-- `Res19.attr1 == size/2`, `Res19.attr3 == 2`;
-- для `Res1` почти всегда `attr3 == 38` (один служебный outlier: `MTCHECK.MSH` с `attr3 == 24`).
-
-Эти формулы достаточны, чтобы реализовать распаковщик/просмотрщик геометрии и батчей даже без полного понимания полей заголовка Res2.
-
-## 1.5. Ресурс Res1 — Node Table (38 байт на узел)
-
-Node table — компактная карта слотов по уровням LOD и группам. Каждый узел занимает **38 байт** (19 × `uint16`).
-
-### Адресация слота
-
-Движок вычисляет индекс слова в таблице:
-
-```
-word_index = nodeIndex × 19 + lod × 5 + group + 4
-slot_index = node_table[word_index]   // uint16, 0xFFFF = нет слота
-```
-
-Параметры:
-
-- `lod`: 0..2 (три уровня детализации). Значение `−1` → подставляется `current_lod` из инстанса.
-- `group`: 0..4 (пять групп). На практике чаще всего используется `group = 0`.
-
-### Раскладка записи узла (38 байт)
-
-```
-┌───────────────────────────────────────────────────────┐
-│  Header: 4 × uint16 (8 байт)                          │
-│    hdr0, hdr1, hdr2, hdr3                             │
-├───────────────────────────────────────────────────────┤
-│  SlotIndex matrix: 3 LOD × 5 groups = 15 × uint16     │
-│    LOD 0: group[0..4]                                 │
-│    LOD 1: group[0..4]                                 │
-│    LOD 2: group[0..4]                                 │
-└───────────────────────────────────────────────────────┘
-```
-
-| Смещение | Размер | Тип        | Описание                                |
-|----------|--------|------------|-----------------------------------------|
-| 0        | 8      | uint16[4]  | Заголовок узла (`hdr0..hdr3`, см. ниже) |
-| 8        | 30     | uint16[15] | Матрица слотов: `slotIndex[lod][group]` |
-
-`slotIndex = 0xFFFF` означает «слот отсутствует» — узел при данном LOD и группе не рисуется.
-
-Подтверждённые семантики полей `hdr*`:
-
-- `hdr1` (`+0x02`) — parent/index-link при построении инстанса (в `sub_1000A460` читается как индекс связанного узла, `0xFFFF` = нет связи).
-- `hdr2` (`+0x04`) — `mapStart` для Res19 (`0xFFFF` = нет карты; fallback по `hdr3`).
-- `hdr3` (`+0x06`) — `fallbackKeyIndex`/верхняя граница для map‑значений (используется в `sub_10012880`).
-
-`hdr0` (`+0x00`) по коду участвует в битовых проверках (`&0x40`, `byte+1 & 8`) и несёт флаги узла.
-
-**Группы (group 0..4):** в рантайме это ортогональный индекс к LOD (матрица 5×3 на узел). Имена групп в оригинальных ресурсах не подписаны; для 1:1 нужно сохранять группы как «сырой» индекс 0..4 без переинтерпретации.
-
----
-
-## 1.6. Ресурс Res3 — Vertex Positions
-
-**Формат:** массив `float3` (IEEE 754 single‑precision).
-**Stride:** 12 байт.
-
-```c
-struct Position {
-    float x;    // +0
-    float y;    // +4
-    float z;    // +8
+struct Node38 {
+    uint16_t hdr0;            // +0
+    uint16_t hdr1;            // +2
+    uint16_t hdr2;            // +4
+    uint16_t hdr3;            // +6
+    uint16_t slotIndex[15];   // +8: [lod0 g0..g4][lod1 g0..g4][lod2 g0..g4]
 };
 ```
 
-Чтение: `pos = *(float3*)(res3_data + 12 * vertexIndex)`.
+#### Подтверждённые поля
+
+- `hdr1`: parent/index-link (используется при построении инстанса), `0xFFFF` = нет.
+- `hdr2`: `mapStart` для `Res19` (см. `msh-animation.md`), `0xFFFF` = нет map.
+- `hdr3`: fallback key index в `Res8`.
+- `hdr0`: node flags (есть битовые проверки, но полная доменная семантика не закрыта).
+
+#### Адресация slot (runtime-функция `sub_100124D0`)
+
+```c
+uint16_t get_slot_index(const Node38* node_table, uint32_t nodeIndex, int lod, int group, int current_lod) {
+    int use_lod = (lod == -1) ? current_lod : lod;
+    int word_index = 4 + (int)nodeIndex * 19 + use_lod * 5 + group;
+    return *(uint16_t*)((const uint8_t*)node_table + word_index * 2);
+}
+```
+
+`0xFFFF` означает "слот отсутствует".
+
+#### Вариант stride=24
+
+В corpus есть единичный служебный outlier с `Res1.attr3 = 24`.
+Для 1:1 editing существующих ассетов требуется copy-through этого варианта.
+Новая генерация должна ориентироваться на stride `38`, если нет чёткой цели поддержать legacy-вариант.
 
 ---
 
-## 1.7. Ресурс Res4 — Packed Normals
+### 5.2. `Res2` — Model header + Slot table
 
-**Формат:** 4 байта на вершину.
-**Stride:** 4 байта.
+```
+Res2:
+  [0x00 .. 0x8B]   model header (140 bytes)
+  [0x8C .. end]    slot records (68 bytes each)
+```
+
+#### 5.2.1. Header (0x8C)
+
+Runtime копирует блоки как float-массивы:
+
+- `0x00..0x5F` (`24 float`) — глобальный hull (`vec3[8]`),
+- `0x60..0x6F` (`4 float`) — глобальная sphere (`center.xyz + radius`),
+- `0x70..0x8B` (`7 float`) — сегмент/капсула (`A.xyz`, `B.xyz`, `radius`).
+
+#### 5.2.2. Slot record (68 bytes)
 
 ```c
-struct PackedNormal {
-    int8_t nx;  // +0
-    int8_t ny;  // +1
-    int8_t nz;  // +2
-    int8_t nw;  // +3 (назначение не подтверждено: паддинг / знак / индекс)
+struct Slot68 {
+    uint16_t triStart;      // +0
+    uint16_t triCount;      // +2
+    uint16_t batchStart;    // +4
+    uint16_t batchCount;    // +6
+
+    float aabbMin[3];       // +8
+    float aabbMax[3];       // +20
+    float sphereCenter[3];  // +32
+    float sphereRadius;     // +44
+
+    uint32_t unk30;         // +48
+    uint32_t unk34;         // +52
+    uint32_t unk38;         // +56
+    uint32_t unk3C;         // +60
+    uint32_t unk40;         // +64
 };
 ```
 
-### Алгоритм декодирования (подтверждено по AniMesh.dll)
+`triCount` подтверждён как длина диапазона:
 
-> В движке используется делитель **127.0**, а не 128.0 (см. константу `127.0` рядом с `1024.0`/`32767.0`).
-
-```
-normal.x = clamp((float)nx / 127.0, -1.0, 1.0)
-normal.y = clamp((float)ny / 127.0, -1.0, 1.0)
-normal.z = clamp((float)nz / 127.0, -1.0, 1.0)
+```c
+triId >= triStart && triId < triStart + triCount
 ```
 
-**Множитель:** `1.0 / 127.0 ≈ 0.0078740157`.
-**Диапазон входных значений:** −128..+127 → выход ≈ −1.007874..+1.0 → **после клампа** −1.0..+1.0.
-**Почему нужен кламп:** значение `-128` при делении на `127.0` даёт модуль чуть больше 1.
-**4‑й байт (nw):** используется ли он как часть нормали, как индекс или просто как выравнивание — не подтверждено. Рекомендация: игнорировать при первичном импорте.
+Хвост `unk30..unk40` должен сохраняться без изменений в editor/writer.
+
+#### 5.2.3. Bounds semantics
+
+- Slot bounds локальны относительно узла.
+- При world-трансформации sphere radius масштабируется по `max(scaleX, scaleY, scaleZ)` при неравномерном scale.
 
 ---
 
-## 1.8. Ресурс Res5 — Packed UV0
-
-**Формат:** 4 байта на вершину (два `int16`).
-**Stride:** 4 байта.
+### 5.3. `Res3` — Positions
 
 ```c
-struct PackedUV {
-    int16_t u;  // +0
-    int16_t v;  // +2
+struct Position12 {
+    float x;
+    float y;
+    float z;
 };
 ```
 
-### Алгоритм декодирования
-
-```
-uv.u = (float)u / 1024.0
-uv.v = (float)v / 1024.0
-```
-
-**Множитель:** `1.0 / 1024.0 = 0.0009765625`.
-**Диапазон входных значений:** −32768..+32767 → выход ≈ −32.0..+31.999.
-Значения >1.0 или <0.0 означают wrapping/repeat текстурных координат.
-
-### Алгоритм кодирования (для экспортёра)
-
-```
-packed_u = (int16_t)round(uv.u * 1024.0)
-packed_v = (int16_t)round(uv.v * 1024.0)
-```
-
-Результат обрезается (clamp) до диапазона `int16` (−32768..+32767).
+Stride `12`.
 
 ---
 
-## 1.9. Ресурс Res6 — Index Buffer
-
-**Формат:** массив `uint16` (беззнаковые 16‑битные индексы).
-**Stride:** 2 байта.
-
-Максимальное число вершин в одном batch: 65535.
-Индексы используются совместно с `baseVertex` из batch table:
-
-```
-actual_vertex_index = index_buffer[indexStart + i] + baseVertex
-```
-
----
-
-## 1.10. Ресурс Res7 — Triangle Descriptors
-
-**Формат:** массив записей по 16 байт. Одна запись на треугольник.
-
-| Смещение | Размер | Тип      | Описание                                    |
-|----------|--------|----------|---------------------------------------------|
-| `+0x00`  | 2      | `uint16` | `triFlags` — фильтрация/материал tri‑уровня |
-| `+0x02`  | 2      | `uint16` | `linkTri0` — tri‑ref для связанного обхода  |
-| `+0x04`  | 2      | `uint16` | `linkTri1` — tri‑ref для связанного обхода  |
-| `+0x06`  | 2      | `uint16` | `linkTri2` — tri‑ref для связанного обхода  |
-| `+0x08`  | 2      | `int16`  | `nX` (packed, scale `1/32767`)              |
-| `+0x0A`  | 2      | `int16`  | `nY` (packed, scale `1/32767`)              |
-| `+0x0C`  | 2      | `int16`  | `nZ` (packed, scale `1/32767`)              |
-| `+0x0E`  | 2      | `uint16` | `selPacked` — 3 селектора по 2 бита         |
-
-Расшифровка `selPacked` (`AniMesh.dll!sub_10013680`):
+### 5.4. `Res4` — Packed normals
 
 ```c
-sel0 =  selPacked        & 0x3;  if (sel0 == 3) sel0 = 0xFFFF;
-sel1 = (selPacked >> 2)  & 0x3;  if (sel1 == 3) sel1 = 0xFFFF;
-sel2 = (selPacked >> 4)  & 0x3;  if (sel2 == 3) sel2 = 0xFFFF;
+struct PackedNormal4 {
+    int8_t nx;
+    int8_t ny;
+    int8_t nz;
+    int8_t nw; // семантика 4-го байта не зафиксирована
+};
 ```
 
-`linkTri*` передаются в `sub_1000B2C0` и используются для построения соседнего набора треугольников при коллизии/пикинге.
+Декодирование:
 
-**Важно:** дескрипторы не хранят индексы вершин треугольника. Индексы берутся из Res6 (index buffer) через `indexStart`/`indexCount` соответствующего batch'а.
+```c
+normal = clamp((float)n / 127.0f, -1.0f, 1.0f)
+```
 
-Дескрипторы используются при обходе треугольников для коллизии и пикинга. `triStart` из slot table указывает, с какого дескриптора начинать обход для данного слота.
+- делитель строго `127.0`;
+- clamp обязателен из-за `-128 / 127.0`.
+
+Кодирование (writer):
+
+```c
+int8_t q = (int8_t)clamp(round(v * 127.0f), -128, 127);
+```
 
 ---
 
-## 1.11. Ресурс Res13 — Batch Table
+### 5.5. `Res5` — Packed UV0
 
-**Формат:** массив записей по 20 байт. Batch — минимальная единица отрисовки.
-
-| Смещение | Размер | Тип    | Описание                                                |
-|----------|--------|--------|---------------------------------------------------------|
-| 0        | 2      | uint16 | `batchFlags` — битовая маска для фильтрации             |
-| 2        | 2      | uint16 | `materialIndex` — индекс материала                      |
-| 4        | 2      | uint16 | `unk4` — неподтверждённое поле                          |
-| 6        | 2      | uint16 | `unk6` — вероятный `nodeIndex` (привязка batch к кости) |
-| 8        | 2      | uint16 | `indexCount` — число индексов (кратно 3)                |
-| 10       | 4      | uint32 | `indexStart` — стартовый индекс в Res6 (в элементах)    |
-| 14       | 2      | uint16 | `unk14` — неподтверждённое поле                         |
-| 16       | 4      | uint32 | `baseVertex` — смещение вершинного индекса              |
-
-### Использование при рендере
-
-```
-for i in 0 .. indexCount-1:
-    raw_index = index_buffer[indexStart + i]
-    vertex_index = raw_index + baseVertex
-    position = res3[vertex_index]
-    normal   = decode_normal(res4[vertex_index])
-    uv       = decode_uv(res5[vertex_index])
+```c
+struct PackedUV4 {
+    int16_t u;
+    int16_t v;
+};
 ```
 
-**Примечание:** движок читает `indexStart` как `uint32` и умножает на 2 для получения байтового смещения в массиве `uint16`.
+Декодирование:
+
+```c
+uv = packed / 1024.0f
+```
+
+Кодирование:
+
+```c
+int16_t q = (int16_t)clamp(round(uv * 1024.0f), -32768, 32767);
+```
 
 ---
 
-## 1.12. Ресурс Res10 — String Table
+### 5.6. `Res6` — Index buffer
 
-Res10 — это **последовательность записей, индексируемых по `nodeIndex`** (см. `AniMesh.dll!sub_10012530`).
+Массив `uint16`, stride `2`.
 
-Формат одной записи:
+Runtime-путь:
+
+```c
+vertexIndex = Res6[indexStart + i] + batch.baseVertex;
+```
+
+`indexStart` хранится в элементах, не в байтах.
+
+---
+
+### 5.7. `Res7` — Triangle descriptors (16 bytes)
+
+```c
+struct TriDesc16 {
+    uint16_t triFlags;    // +0
+    uint16_t linkTri0;    // +2
+    uint16_t linkTri1;    // +4
+    uint16_t linkTri2;    // +6
+    int16_t  nX;          // +8
+    int16_t  nY;          // +10
+    int16_t  nZ;          // +12
+    uint16_t selPacked;   // +14
+};
+```
+
+- `nX/nY/nZ` декодируются через `1/32767`.
+- `linkTri*` используются в tri-neighbour/collision path.
+
+Раскладка `selPacked` (3 селектора по 2 бита):
+
+```c
+sel0 = (selPacked >> 0) & 0x3; if (sel0 == 3) sel0 = 0xFFFF;
+sel1 = (selPacked >> 2) & 0x3; if (sel1 == 3) sel1 = 0xFFFF;
+sel2 = (selPacked >> 4) & 0x3; if (sel2 == 3) sel2 = 0xFFFF;
+```
+
+---
+
+### 5.8. `Res13` — Batch table (20 bytes)
+
+```c
+struct Batch20 {
+    uint16_t batchFlags;     // +0
+    uint16_t materialIndex;  // +2
+    uint16_t unk4;           // +4
+    uint16_t unk6;           // +6
+    uint16_t indexCount;     // +8
+    uint32_t indexStart;     // +10
+    uint16_t unk14;          // +14
+    uint32_t baseVertex;     // +16
+};
+```
+
+`unk4/unk6/unk14` семантически не закрыты; writer/editor должны сохранять.
+
+---
+
+### 5.9. `Res10` — Node string table
+
+Последовательность записей variable-length:
 
 ```c
 struct Res10Record {
-    uint32_t len;      // число символов без терминирующего '\0'
-    char     text[];   // если len > 0: хранится len+1 байт (включая '\0')
-                       // если len == 0: payload отсутствует
+    uint32_t len;   // длина строки без '\0'
+    char text[];    // если len>0: len+1 байт (с '\0'), иначе payload нет
 };
 ```
 
-Переход к следующей записи:
+Переход:
 
 ```c
-next = cur + 4 + (len ? (len + 1) : 0);
+next = cur + 4 + (len ? len + 1 : 0);
 ```
 
 `sub_10012530` возвращает:
 
-- `NULL`, если `len == 0`;
-- `record + 4`, если `len > 0` (указатель на C‑строку).
+- `NULL`, если `len == 0`,
+- `record + 4`, если `len > 0`.
 
-Это значение используется в `sub_1000A460` для проверки имени текущего узла (например, поиск подстроки `"central"` при обработке node‑флагов).
-
----
-
+Индекс записи в `Res10` соответствует `nodeIndex`.
 
 ---
 
-## 1.14. Опциональные vertex streams
+### 5.10. Optional streams
 
-### Res15 — Дополнительный vertex stream (stride 8)
+#### `Res15` (stride 8)
 
-- **Stride:** 8 байт на вершину.
-- **Кандидаты:** `float2 uv1` (lightmap / second UV layer), 4 × `int16` (2 UV‑пары), либо иной формат.
-- Загружается условно — если ресурс 15 отсутствует, указатель равен `NULL`.
+Дополнительный поток на вершину (семантика не полностью подтверждена).
 
-### Res16 — Tangent / Bitangent (stride 8, split 2×4)
+#### `Res16` (stride 8, split 2x4)
 
-- **Stride:** 8 байт на вершину (2 подпотока по 4 байта).
-- При загрузке движок создаёт **два перемежающихся (interleaved) подпотока**:
-  - Stream A: `base + 0`, stride 8 — 4 байта (кандидат: packed tangent, `int8 × 4`)
-  - Stream B: `base + 4`, stride 8 — 4 байта (кандидат: packed bitangent, `int8 × 4`)
-- Если ресурс 16 отсутствует, оба указателя обнуляются.
-- **Важно:** в оригинальном `sub_10015FD0` при отсутствии Res16 страйды `+0x50/+0x58` явным образом не обнуляются; это безопасно, потому что оба указателя равны `NULL` и код не должен обращаться к потокам без проверки указателя.
-- Декодирование предположительно аналогично нормалям: `component / 127.0` (как Res4), но требует подтверждения; при импорте — кламп в [-1..1].
+Runtime делит поток на два interleaved подпотока:
 
-### Res18 — Vertex Color (stride 4)
+- stream A: `base+0`, stride 8,
+- stream B: `base+4`, stride 8.
 
-- **Stride:** 4 байта на вершину.
-- **Кандидаты:** `D3DCOLOR` (BGRA), packed параметры освещения, vertex AO.
-- Загружается условно (через проверку `niFindRes` на возврат `−1`).
+В corpus из `testdata/nres` этот ресурс не встретился, но loader поддерживает.
 
-### Res20 — Дополнительная таблица
+#### `Res18` (stride 4)
 
-- Присутствует не всегда.
-- Из каталожной записи NRes считывается поле `attribute_1` (смещение `+4`) и сохраняется как метаданные.
-- **Кандидаты:** vertex remap, дополнительные данные для эффектов/деформаций.
+Vertex color / доп. packed-канал. В corpus встречается на части моделей.
+
+#### `Res20`
+
+Доп. таблица неизвестной доменной семантики. Loader хранит pointer и метаданные каталога (`attr1`).
 
 ---
+
+### 5.11. Точки стыка с анимацией (`Res8`/`Res19`)
+
+Core-loader загружает:
+
+- `Res8` в `this+0x18`,
+- `Res19` в `this+0x1C`,
+- `Res19.attr2` в `this+0x9C`.
+
+Полный runtime-алгоритм сэмплирования/смешивания описан в [MSH animation](msh-animation.md).
+
+---
+
+## 6. Runtime-алгоритмы core
+
+### 6.1. Slot lookup (`sub_100124D0`)
+
+Вход: runtime-node-instance, `group`, `lod`.
+
+1. Если нет model pointer -> `NULL`.
+2. `lod == -1` -> подставить `current_lod` инстанса.
+3. Вычислить `slotIndex` через формулу `4 + node*19 + lod*5 + group`.
+4. Если `slotIndex == 0xFFFF` -> `NULL`.
+5. Иначе вернуть `Res2.slotBase + slotIndex * 68`.
+
+### 6.2. Node string lookup (`sub_10012530`)
+
+1. Идти по `Res10`-записям `nodeIndex` раз.
+2. Возвращать `NULL` или `char*` по правилу `len==0`.
+
+### 6.3. Геометрический обход для рендера
+
+Reference-путь, эквивалентный runtime-логике:
+
+```c
+for each node:
+    slot = resolve_slot(node, lod, group)
+    if (!slot) continue
+
+    for b in [slot.batchStart .. slot.batchStart + slot.batchCount):
+        batch = Res13[b]
+        for i in [0 .. batch.indexCount):
+            idx = Res6[batch.indexStart + i]
+            vtx = batch.baseVertex + idx
+
+            pos = Res3[vtx]
+            nrm = decode_res4(Res4[vtx])
+            uv0 = decode_res5(Res5[vtx])
+```
+
+### 6.4. Tri/collision path (обобщённо)
+
+- `sub_1000B2C0` и `sub_10013680` используют tri-диапазоны слота + `Res7` link/select-поля.
+- Для collision/picking-контекста должны быть валидны:
+  - `slot.triStart + slot.triCount <= triDescCount`,
+  - `linkTri*` либо `0xFFFF`, либо `< triDescCount`.
+
+---
+
+## 7. Инварианты и валидация (reader)
+
+### 7.1. Базовые проверки целостности
+
+- каждый fixed-stride ресурс делится на stride без остатка;
+- `Res2.size >= 0x8C`;
+- `(Res2.size - 0x8C) % 68 == 0`;
+- `Res2.attr1 == slotCount`, `Res2.attr3 == 68`;
+- `Res3.attr3 == 12`, `Res4.attr3 == 4`, `Res5.attr3 == 4`, `Res6.attr3 == 2`, `Res7.attr3 == 16`, `Res13.attr3 == 20`;
+- `Res8.attr3 == 4` (не stride), `Res19.attr3 == 2`, `Res10.attr3 == 0` (в observed assets).
+
+### 7.2. Cross-table проверки
+
+- `slot.batchStart + slot.batchCount <= batchCount`;
+- `slot.triStart + slot.triCount <= triDescCount`;
+- `batch.indexStart + batch.indexCount <= indexCount`;
+- `batch.baseVertex + max(indexSlice) < vertexCount`;
+- все `Res1.slotIndex[*]` либо `0xFFFF`, либо `< slotCount`;
+- для `Res10`: парсинг ровно `nodeCount` записей без хвостовых байт;
+- для `Res7.linkTri*`: либо `0xFFFF`, либо `< triDescCount`.
+
+### 7.3. Strict vs tolerant режим
+
+Рекомендуется 2 режима reader:
+
+- `strict`: любое нарушение инвариантов -> ошибка;
+- `tolerant`: безопасно отбрасывать/игнорировать только локально повреждённые диапазоны (без OOB).
+
+---
+
+## 8. Правила writer/editor
+
+### 8.1. Обязательная политика для 1:1 editing
+
+- сохранять неизвестные поля (`Slot68.unk*`, `Batch20.unk*`, `Node.hdr0` и т.д.) без модификации, если нет осознанного пересчёта;
+- сохранять неизвестные resource types и их payload/атрибуты;
+- не полагаться на порядок ресурсов в контейнере: lookup в runtime идёт по type-id.
+
+### 8.2. Пересчёт атрибутов каталога
+
+При записи изменённых ресурсов:
+
+- `attr1` = count (или форматно-специфичное значение),
+- `attr2` — по формату/семантике ресурса,
+- `attr3` — stride/константа формата.
+
+Практические правила для core:
+
+- `Res1`: `attr1=nodeCount`, `attr3=38` (или исходный вариант, если copy-through legacy), `attr2` лучше сохранять из исходника;
+- `Res2`: `attr1=slotCount`, `attr2=0`, `attr3=68`;
+- `Res3/4/5/6/7/13/15/16/18`: `attr1=size/stride`, `attr2=0`, `attr3=stride`;
+- `Res8`: `attr1=size/24`, `attr3=4`;
+- `Res10`: `attr1=nodeCount`, `attr2=0`, `attr3=0`;
+- `Res19`: `attr1=size/2`, `attr2=frameCount`, `attr3=2`.
+
+### 8.3. Матрица зависимостей при редактировании
+
+| Операция | Какие ресурсы обновлять |
+|---|---|
+| Смещение/деформация вершин | `Res3`, при необходимости `Res4`, bounds в `Res2` |
+| Изменение UV | `Res5` (и опционально `Res15`) |
+| Изменение topology (индексы/треугольники) | `Res6`, `Res13`, `Res7`, диапазоны `Res2.slot` |
+| Изменение LOD/group назначения | `Res1.slotIndex`, возможно `Res2.slot` |
+| Изменение имени узла | `Res10` |
+| Изменение иерархии/анимации узлов | `Res1.hdr1/hdr2/hdr3`, `Res8`, `Res19` |
+| Добавление/удаление slot | `Res2`, ссылки из `Res1`, диапазоны batch/tri |
+
+### 8.4. Детерминированная сериализация
+
+- little-endian для всех чисел;
+- без внутреннего padding в таблицах ресурсов;
+- выравнивание блоков ресурсов в NRes по 8 байт (через контейнер).
+
+---
+
+## 9. Рекомендованный canonical IR для toolchain
+
+Минимальный IR для безопасного round-trip:
+
+```c
+struct ModelCoreIR {
+    // raw payloads for unknown/passthrough types
+    map<uint32_t, RawResource> raw_passthrough;
+
+    vector<Node> nodes;          // Res1 decoded (hdr + matrix)
+    Header140 header;            // Res2[0x00..0x8B]
+    vector<Slot> slots;          // Res2 slot table (включая unk tail)
+
+    vector<float3> positions;    // Res3
+    vector<PackedNormal4> normals_raw; // Res4 raw + optional decoded cache
+    vector<PackedUV4> uv0_raw;   // Res5 raw + optional decoded cache
+
+    vector<uint16_t> indices;    // Res6
+    vector<TriDesc16> tri;       // Res7
+    vector<Batch20> batches;     // Res13
+    vector<optional<string>> node_names; // Res10
+
+    optional<vector<uint8_t>> res15_raw;
+    optional<vector<uint8_t>> res16_raw;
+    optional<vector<uint32_t>> colors_raw; // Res18
+    optional<RawResource> res20_raw;
+
+    // animation bridge
+    optional<vector<AnimKey24>> anim_keys;    // Res8
+    optional<vector<uint16_t>> anim_map_words; // Res19
+    uint32_t anim_frame_count;
+};
+```
+
+Принцип: где семантика неполная, хранить raw и переизлучать байт-в-байт.
+
+---
+
+## 10. Практика конвертации
+
+### 10.1. MSH -> OBJ/GLTF
+
+- `Res3` напрямую в позиции;
+- `Res6 + Res13` в faces;
+- нормали/UV декодировать через коэффициенты `1/127`, `1/1024`;
+- при экспорте по LOD/group использовать `Res1` матрицу слотов, а не "все batch подряд" (если нужен runtime-эквивалент);
+- пометить ограничения: core не содержит классический weight-скиннинг.
+
+### 10.2. Обратный импорт (OBJ/GLTF -> MSH)
+
+Для 1:1 ожидаемого поведения импортёр должен:
+
+- строить корректные `Res13` диапазоны,
+- строить/обновлять `Res2.slot` ranges и bounds,
+- поддерживать quantization при упаковке (`Res4/Res5`),
+- сохранять unknown-поля таблиц, если вход был редактированием существующей модели.
+
+---
+
+## 11. Наблюдения по corpus (testdata/nres)
+
+Сводка по 435 MSH-моделям:
+
+- валидны все 435/435 по `tools/msh_doc_validator.py`;
+- основной порядок типов:
+  - `414`: `(1,2,3,4,5,15,13,6,7,8,19,9,10,17)`
+  - `21`: `(1,2,3,4,5,18,15,13,6,7,8,19,9,10,17,20)`
+- `Res1.attr3`: `38` в 434 моделях, `24` в 1 модели;
+- `Res18` и `Res20` встречаются в 21 модели;
+- `Res16` в данном corpus не встретился;
+- `Res8/Res19` присутствуют во всех моделях, но `Res19.attr2=1` часто соответствует статике.
+
+---
+
+## 12. Открытые вопросы (не блокируют 1:1)
+
+- точная доменная семантика `Node.hdr0` битов;
+- полные имена/назначения `Batch20.unk4/unk6/unk14`;
+- назначение `Slot68.unk30..unk40`;
+- полная семантика `Res15/Res16/Res18/Res20` payload beyond stride-level;
+- точная семантика 4-го байта в `PackedNormal4`.
+
+Для runtime/reader/writer это не критично при условии byte-preserving policy.
+
+---
+
+## 13. Чеклист реализации 1:1
+
+### 13.1. Engine runtime
+
+- реализован loader-порядок как в `sub_10015FD0`;
+- slot lookup по формуле `4 + node*19 + lod*5 + group`;
+- декодирование `Res4` через `/127.0` с clamp;
+- декодирование `Res5` через `/1024.0`;
+- tri селекторы `selPacked` трактуются как 2-битные с `3 -> 0xFFFF`;
+- корректная обработка `0xFFFF` sentinel во всех таблицах.
+
+### 13.2. Reader/validator
+
+- строгая проверка stride/размеров/диапазонов;
+- OOB-защита всех индексных доступов;
+- поддержка both direct-model и nested `.msh` payload.
+
+### 13.3. Writer/editor
+
+- стабильный пересчёт `attr1/attr2/attr3`;
+- сохранение unknown fields и unknown resource types;
+- детерминированная сериализация NRes (8-byte align);
+- regression-проверка round-trip: `decode -> encode -> decode` без расхождений структуры/диапазонов.
 
