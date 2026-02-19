@@ -34,6 +34,7 @@ nav:
       - Texture (Texm): specs/texture.md
       - Materials index: specs/materials-texm.md
       - Missions: specs/missions.md
+      - Object registry (objects.rlb): specs/object-registry.md
       - MSH animation: specs/msh-animation.md
       - MSH core: specs/msh-core.md
       - Network system: specs/network.md

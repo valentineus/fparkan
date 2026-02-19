@@ -1,0 +1,10 @@
+﻿[package]
+name = "terrain-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nres = { path = "../nres" }
+
+[dev-dependencies]
+common = { path = "../common" }

@@ -1,0 +1,33 @@
+﻿[package]
+name = "render-mission-demo"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+demo = ["dep:sdl2", "dep:glow"]
+
+[dependencies]
+encoding_rs = "0.8"
+glow = { version = "0.16", optional = true }
+nres = { path = "../nres" }
+render-core = { path = "../render-core" }
+render-demo = { path = "../render-demo" }
+tma = { path = "../tma" }
+terrain-core = { path = "../terrain-core" }
+texm = { path = "../texm" }
+unitdat = { path = "../unitdat" }
+
+[dev-dependencies]
+common = { path = "../common" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+sdl2 = { version = "0.37", optional = true, default-features = false, features = ["use-pkgconfig"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+sdl2 = { version = "0.37", optional = true, default-features = false, features = ["bundled", "static-link"] }
+
+[[bin]]
+name = "parkan-render-mission-demo"
+path = "src/main.rs"
+required-features = ["demo"]
