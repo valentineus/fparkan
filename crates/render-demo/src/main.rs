@@ -26,6 +26,12 @@ struct GpuTexture {
     handle: glow::NativeTexture,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum GlBackend {
+    Gles2,
+    Core33,
+}
+
 fn parse_args() -> Result<Args, String> {
     let mut archive = None;
     let mut model = None;
@@ -265,35 +271,7 @@ fn run(args: Args) -> Result<(), String> {
         .video()
         .map_err(|err| format!("failed to init SDL2 video: {err}"))?;
 
-    {
-        let gl_attr = video.gl_attr();
-        gl_attr.set_context_profile(sdl2::video::GLProfile::GLES);
-        gl_attr.set_context_version(2, 0);
-        gl_attr.set_depth_size(24);
-        gl_attr.set_double_buffer(true);
-    }
-
-    let mut window_builder = video.window(
-        "Parkan Render Demo (SDL2 + OpenGL ES 2.0)",
-        args.width,
-        args.height,
-    );
-    window_builder.opengl();
-    if args.capture.is_some() {
-        window_builder.hidden();
-    } else {
-        window_builder.resizable();
-    }
-    let window = window_builder
-        .build()
-        .map_err(|err| format!("failed to create window: {err}"))?;
-
-    let gl_ctx = window
-        .gl_create_context()
-        .map_err(|err| format!("failed to create OpenGL context: {err}"))?;
-    window
-        .gl_make_current(&gl_ctx)
-        .map_err(|err| format!("failed to make GL context current: {err}"))?;
+    let (window, _gl_ctx, gl_backend) = create_window_and_context(&video, &args)?;
     let _ = if args.capture.is_some() {
         video.gl_set_swap_interval(0)
     } else {
@@ -315,7 +293,7 @@ fn run(args: Args) -> Result<(), String> {
         glow::Context::from_loader_function(|name| video.gl_get_proc_address(name) as *const _)
     };
 
-    let program = unsafe { create_program(&gl)? };
+    let program = unsafe { create_program(&gl, gl_backend)? };
     let u_mvp = unsafe { gl.get_uniform_location(program, "u_mvp") };
     let u_use_tex = unsafe { gl.get_uniform_location(program, "u_use_tex") };
     let u_tex = unsafe { gl.get_uniform_location(program, "u_tex") };
@@ -334,6 +312,7 @@ fn run(args: Args) -> Result<(), String> {
         gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, None);
         gl.bind_buffer(glow::ARRAY_BUFFER, None);
     }
+    let vao = unsafe { create_vertex_layout_if_needed(&gl, gl_backend, vbo, ebo, a_pos, a_uv)? };
 
     let gpu_texture = if let Some(texture) = resolved_texture.as_ref() {
         Some(unsafe { create_texture(&gl, texture)? })
@@ -352,6 +331,7 @@ fn run(args: Args) -> Result<(), String> {
             a_uv,
             vbo,
             ebo,
+            vao,
             gpu_texture.as_ref(),
             mesh.indices.len(),
             &args,
@@ -372,6 +352,7 @@ fn run(args: Args) -> Result<(), String> {
             a_uv,
             vbo,
             ebo,
+            vao,
             gpu_texture.as_ref(),
             mesh.indices.len(),
             &args,
@@ -384,12 +365,106 @@ fn run(args: Args) -> Result<(), String> {
         if let Some(texture) = gpu_texture {
             gl.delete_texture(texture.handle);
         }
+        if let Some(vao) = vao {
+            gl.delete_vertex_array(vao);
+        }
         gl.delete_buffer(ebo);
         gl.delete_buffer(vbo);
         gl.delete_program(program);
     }
 
     result
+}
+
+fn create_window_and_context(
+    video: &sdl2::VideoSubsystem,
+    args: &Args,
+) -> Result<(sdl2::video::Window, sdl2::video::GLContext, GlBackend), String> {
+    let candidates = [
+        (GlBackend::Gles2, sdl2::video::GLProfile::GLES, 2, 0),
+        (GlBackend::Core33, sdl2::video::GLProfile::Core, 3, 3),
+    ];
+    let mut errors = Vec::new();
+
+    for (backend, profile, major, minor) in candidates {
+        {
+            let gl_attr = video.gl_attr();
+            gl_attr.set_context_profile(profile);
+            gl_attr.set_context_version(major, minor);
+            gl_attr.set_depth_size(24);
+            gl_attr.set_double_buffer(true);
+        }
+
+        let mut window_builder = video.window(
+            "Parkan Render Demo (SDL2 + OpenGL)",
+            args.width,
+            args.height,
+        );
+        window_builder.opengl();
+        if args.capture.is_some() {
+            window_builder.hidden();
+        } else {
+            window_builder.resizable();
+        }
+
+        let window = match window_builder.build() {
+            Ok(window) => window,
+            Err(err) => {
+                errors.push(format!(
+                    "{profile:?} {major}.{minor}: window build failed ({err})"
+                ));
+                continue;
+            }
+        };
+
+        let gl_ctx = match window.gl_create_context() {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                errors.push(format!(
+                    "{profile:?} {major}.{minor}: context create failed ({err})"
+                ));
+                continue;
+            }
+        };
+
+        if let Err(err) = window.gl_make_current(&gl_ctx) {
+            errors.push(format!(
+                "{profile:?} {major}.{minor}: make current failed ({err})"
+            ));
+            continue;
+        }
+
+        return Ok((window, gl_ctx, backend));
+    }
+
+    Err(format!(
+        "failed to create OpenGL context. Attempts: {}",
+        errors.join(" | ")
+    ))
+}
+
+unsafe fn create_vertex_layout_if_needed(
+    gl: &glow::Context,
+    backend: GlBackend,
+    vbo: glow::NativeBuffer,
+    ebo: glow::NativeBuffer,
+    a_pos: u32,
+    a_uv: u32,
+) -> Result<Option<glow::NativeVertexArray>, String> {
+    if backend != GlBackend::Core33 {
+        return Ok(None);
+    }
+
+    let vao = gl.create_vertex_array().map_err(|e| e.to_string())?;
+    gl.bind_vertex_array(Some(vao));
+    gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+    gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ebo));
+    gl.enable_vertex_attrib_array(a_pos);
+    gl.vertex_attrib_pointer_f32(a_pos, 3, glow::FLOAT, false, 20, 0);
+    gl.enable_vertex_attrib_array(a_uv);
+    gl.vertex_attrib_pointer_f32(a_uv, 2, glow::FLOAT, false, 20, 12);
+    gl.bind_vertex_array(None);
+    Ok(Some(vao))
 }
 
 fn resolve_texture(args: &Args, model_name: &str) -> Result<Option<LoadedTexture>, String> {
@@ -466,6 +541,7 @@ fn run_capture(
     a_uv: u32,
     vbo: glow::NativeBuffer,
     ebo: glow::NativeBuffer,
+    vao: Option<glow::NativeVertexArray>,
     texture: Option<&GpuTexture>,
     index_count: usize,
     args: &Args,
@@ -493,6 +569,7 @@ fn run_capture(
             a_uv,
             vbo,
             ebo,
+            vao,
             texture,
             index_count,
             args.width,
@@ -520,6 +597,7 @@ fn run_interactive(
     a_uv: u32,
     vbo: glow::NativeBuffer,
     ebo: glow::NativeBuffer,
+    vao: Option<glow::NativeVertexArray>,
     texture: Option<&GpuTexture>,
     index_count: usize,
     args: &Args,
@@ -560,6 +638,7 @@ fn run_interactive(
                 a_uv,
                 vbo,
                 ebo,
+                vao,
                 texture,
                 index_count,
                 w,
@@ -602,6 +681,7 @@ unsafe fn draw_frame(
     a_uv: u32,
     vbo: glow::NativeBuffer,
     ebo: glow::NativeBuffer,
+    vao: Option<glow::NativeVertexArray>,
     texture: Option<&GpuTexture>,
     index_count: usize,
     width: u32,
@@ -631,22 +711,33 @@ unsafe fn draw_frame(
         gl.bind_texture(glow::TEXTURE_2D, None);
     }
 
-    gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-    gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ebo));
-    gl.enable_vertex_attrib_array(a_pos);
-    gl.vertex_attrib_pointer_f32(a_pos, 3, glow::FLOAT, false, 20, 0);
-    gl.enable_vertex_attrib_array(a_uv);
-    gl.vertex_attrib_pointer_f32(a_uv, 2, glow::FLOAT, false, 20, 12);
-    gl.draw_elements(
-        glow::TRIANGLES,
-        index_count.min(i32::MAX as usize) as i32,
-        glow::UNSIGNED_SHORT,
-        0,
-    );
-    gl.disable_vertex_attrib_array(a_uv);
-    gl.disable_vertex_attrib_array(a_pos);
-    gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, None);
-    gl.bind_buffer(glow::ARRAY_BUFFER, None);
+    if let Some(vao) = vao {
+        gl.bind_vertex_array(Some(vao));
+        gl.draw_elements(
+            glow::TRIANGLES,
+            index_count.min(i32::MAX as usize) as i32,
+            glow::UNSIGNED_SHORT,
+            0,
+        );
+        gl.bind_vertex_array(None);
+    } else {
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ebo));
+        gl.enable_vertex_attrib_array(a_pos);
+        gl.vertex_attrib_pointer_f32(a_pos, 3, glow::FLOAT, false, 20, 0);
+        gl.enable_vertex_attrib_array(a_uv);
+        gl.vertex_attrib_pointer_f32(a_uv, 2, glow::FLOAT, false, 20, 12);
+        gl.draw_elements(
+            glow::TRIANGLES,
+            index_count.min(i32::MAX as usize) as i32,
+            glow::UNSIGNED_SHORT,
+            0,
+        );
+        gl.disable_vertex_attrib_array(a_uv);
+        gl.disable_vertex_attrib_array(a_pos);
+        gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, None);
+        gl.bind_buffer(glow::ARRAY_BUFFER, None);
+    }
     gl.bind_texture(glow::TEXTURE_2D, None);
     gl.use_program(None);
 }
@@ -701,8 +792,13 @@ fn save_png(path: &Path, width: u32, height: u32, rgba: Vec<u8>) -> Result<(), S
         .map_err(|err| format!("failed to save PNG {}: {err}", path.display()))
 }
 
-unsafe fn create_program(gl: &glow::Context) -> Result<glow::NativeProgram, String> {
-    let vs_src = r#"
+unsafe fn create_program(
+    gl: &glow::Context,
+    backend: GlBackend,
+) -> Result<glow::NativeProgram, String> {
+    let (vs_src, fs_src) = match backend {
+        GlBackend::Gles2 => (
+            r#"
 attribute vec3 a_pos;
 attribute vec2 a_uv;
 uniform mat4 u_mvp;
@@ -711,9 +807,8 @@ void main() {
     v_uv = a_uv;
     gl_Position = u_mvp * vec4(a_pos, 1.0);
 }
-"#;
-
-    let fs_src = r#"
+"#,
+            r#"
 precision mediump float;
 uniform sampler2D u_tex;
 uniform float u_use_tex;
@@ -723,7 +818,32 @@ void main() {
     vec4 texColor = texture2D(u_tex, v_uv);
     gl_FragColor = mix(base, texColor, u_use_tex);
 }
-"#;
+"#,
+        ),
+        GlBackend::Core33 => (
+            r#"#version 330 core
+in vec3 a_pos;
+in vec2 a_uv;
+uniform mat4 u_mvp;
+out vec2 v_uv;
+void main() {
+    v_uv = a_uv;
+    gl_Position = u_mvp * vec4(a_pos, 1.0);
+}
+"#,
+            r#"#version 330 core
+uniform sampler2D u_tex;
+uniform float u_use_tex;
+in vec2 v_uv;
+out vec4 fragColor;
+void main() {
+    vec4 base = vec4(0.85, 0.90, 1.00, 1.0);
+    vec4 texColor = texture(u_tex, v_uv);
+    fragColor = mix(base, texColor, u_use_tex);
+}
+"#,
+        ),
+    };
 
     let program = gl.create_program().map_err(|e| e.to_string())?;
     let vs = gl

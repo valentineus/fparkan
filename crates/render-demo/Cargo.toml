@@ -13,12 +13,17 @@ msh-core = { path = "../msh-core" }
 nres = { path = "../nres" }
 render-core = { path = "../render-core" }
 texm = { path = "../texm" }
-sdl2 = { version = "0.37", optional = true, default-features = false, features = ["bundled", "static-link"] }
 glow = { version = "0.16", optional = true }
 image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 
 [dev-dependencies]
 common = { path = "../common" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+sdl2 = { version = "0.37", optional = true, default-features = false, features = ["use-pkgconfig"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+sdl2 = { version = "0.37", optional = true, default-features = false, features = ["bundled", "static-link"] }
 
 [[bin]]
 name = "parkan-render-demo"

@@ -1,6 +1,6 @@
 # render-demo
 
-Тестовый рендерер Parkan-моделей на Rust (`SDL2 + OpenGL ES 2.0`).
+Тестовый рендерер Parkan-моделей на Rust (`SDL2 + OpenGL`: GLES2 с fallback на Core 3.3).
 
 ## Назначение
 
@@ -17,6 +17,16 @@ cargo run -p render-demo --features demo -- \
   --lod 0 \
   --group 0
 ```
+
+### macOS prerequisites
+
+Для macOS `render-demo` ожидает системный SDL2 через `pkg-config`:
+
+```bash
+brew install sdl2 pkg-config
+```
+
+После этого запускайте той же командой `cargo run ... --features demo`.
 
 Параметры:
 
@@ -70,4 +80,4 @@ cargo run -p render-demo --features demo -- \
 ## Ограничения
 
 - Используется только базовая texture-фаза (без полной material/fx анимации).
-- Вывод через `glDrawArrays(GL_TRIANGLES)` из расширенного triangle-list (позиции+UV).
+- Вывод через `glDrawElements(GL_TRIANGLES)` с index-buffer (позиции+UV).
