@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
+members = ["crates/*", "apps/resource-viewer"]
 
 [profile.release]
 codegen-units = 1

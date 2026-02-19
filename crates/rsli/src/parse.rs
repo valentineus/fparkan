@@ -1,6 +1,8 @@
 use crate::compress::xor::xor_stream;
 use crate::error::Error;
-use crate::{EntryMeta, EntryRecord, Library, OpenOptions, PackMethod, Result};
+use crate::{
+    AoTrailer, EntryMeta, EntryRecord, Library, LibraryHeader, OpenOptions, PackMethod, Result,
+};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
@@ -16,13 +18,17 @@ pub fn parse_library(bytes: Arc<[u8]>, opts: OpenOptions) -> Result<Library> {
     let mut header_raw = [0u8; 32];
     header_raw.copy_from_slice(&bytes[0..32]);
 
-    if &bytes[0..2] != b"NL" {
+    let mut magic = [0u8; 2];
+    magic.copy_from_slice(&bytes[0..2]);
+    if &magic != b"NL" {
         let mut got = [0u8; 2];
         got.copy_from_slice(&bytes[0..2]);
         return Err(Error::InvalidMagic { got });
     }
-    if bytes[3] != 0x01 {
-        return Err(Error::UnsupportedVersion { got: bytes[3] });
+    let reserved = bytes[2];
+    let version = bytes[3];
+    if version != 0x01 {
+        return Err(Error::UnsupportedVersion { got: version });
     }
 
     let entry_count = i16::from_le_bytes([bytes[4], bytes[5]]);
@@ -36,7 +42,17 @@ pub fn parse_library(bytes: Arc<[u8]>, opts: OpenOptions) -> Result<Library> {
         return Err(Error::TooManyEntries { got: count });
     }
 
+    let presorted_flag = u16::from_le_bytes([bytes[14], bytes[15]]);
     let xor_seed = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    let header = LibraryHeader {
+        raw: header_raw,
+        magic,
+        reserved,
+        version,
+        entry_count,
+        presorted_flag,
+        xor_seed,
+    };
 
     let table_len = count.checked_mul(32).ok_or(Error::IntegerOverflow)?;
     let table_offset = 32usize;
@@ -58,8 +74,6 @@ pub fn parse_library(bytes: Arc<[u8]>, opts: OpenOptions) -> Result<Library> {
     }
 
     let (overlay, trailer_raw) = parse_ao_trailer(&bytes, opts.allow_ao_trailer)?;
-    #[cfg(not(test))]
-    let _ = trailer_raw;
 
     let mut entries = Vec::with_capacity(count);
     for idx in 0..count {
@@ -67,6 +81,8 @@ pub fn parse_library(bytes: Arc<[u8]>, opts: OpenOptions) -> Result<Library> {
 
         let mut name_raw = [0u8; 12];
         name_raw.copy_from_slice(&row[0..12]);
+        let mut service_tail = [0u8; 4];
+        service_tail.copy_from_slice(&row[12..16]);
 
         let flags_signed = i16::from_le_bytes([row[16], row[17]]);
         let sort_to_original = i16::from_le_bytes([row[18], row[19]]);
@@ -137,9 +153,9 @@ pub fn parse_library(bytes: Arc<[u8]>, opts: OpenOptions) -> Result<Library> {
                 unpacked_size,
             },
             name_raw,
+            service_tail,
             sort_to_original,
             key16: sort_to_original as u16,
-            #[cfg(test)]
             data_offset_raw,
             packed_size_declared,
             packed_size_available,
@@ -147,7 +163,6 @@ pub fn parse_library(bytes: Arc<[u8]>, opts: OpenOptions) -> Result<Library> {
         });
     }
 
-    let presorted_flag = u16::from_le_bytes([bytes[14], bytes[15]]);
     if presorted_flag == 0xABBA {
         let mut seen = vec![false; count];
         for entry in &entries {
@@ -196,16 +211,12 @@ pub fn parse_library(bytes: Arc<[u8]>, opts: OpenOptions) -> Result<Library> {
     Ok(Library {
         bytes,
         entries,
-        #[cfg(test)]
-        header_raw,
+        header,
+        ao_trailer: trailer_raw.map(|raw| AoTrailer { raw, overlay }),
         #[cfg(test)]
         table_plain_original,
         #[cfg(test)]
-        xor_seed,
-        #[cfg(test)]
         source_size,
-        #[cfg(test)]
-        trailer_raw,
     })
 }
 

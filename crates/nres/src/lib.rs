@@ -26,10 +26,28 @@ pub enum OpenMode {
     ReadWrite,
 }
 
+#[derive(Clone, Debug)]
+pub struct ArchiveHeader {
+    pub magic: [u8; 4],
+    pub version: u32,
+    pub entry_count: u32,
+    pub total_size: u32,
+    pub directory_offset: u64,
+    pub directory_size: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ArchiveInfo {
+    pub raw_mode: bool,
+    pub file_size: u64,
+    pub header: Option<ArchiveHeader>,
+}
+
 #[derive(Debug)]
 pub struct Archive {
     bytes: Arc<[u8]>,
     entries: Vec<EntryRecord>,
+    info: ArchiveInfo,
     raw_mode: bool,
 }
 
@@ -54,6 +72,13 @@ pub struct EntryRef<'a> {
     pub meta: &'a EntryMeta,
 }
 
+#[derive(Copy, Clone, Debug)]
+pub struct EntryInspect<'a> {
+    pub id: EntryId,
+    pub meta: &'a EntryMeta,
+    pub name_raw: &'a [u8; 36],
+}
+
 #[derive(Clone, Debug)]
 struct EntryRecord {
     meta: EntryMeta,
@@ -76,15 +101,25 @@ impl Archive {
     }
 
     pub fn open_bytes(bytes: Arc<[u8]>, opts: OpenOptions) -> Result<Self> {
-        let (entries, _) = parse_archive(&bytes, opts.raw_mode)?;
+        let file_size = u64::try_from(bytes.len()).map_err(|_| Error::IntegerOverflow)?;
+        let (entries, header) = parse_archive(&bytes, opts.raw_mode)?;
         if opts.prefetch_pages {
             prefetch_pages(&bytes);
         }
         Ok(Self {
             bytes,
             entries,
+            info: ArchiveInfo {
+                raw_mode: opts.raw_mode,
+                file_size,
+                header,
+            },
             raw_mode: opts.raw_mode,
         })
+    }
+
+    pub fn info(&self) -> &ArchiveInfo {
+        &self.info
     }
 
     pub fn entry_count(&self) -> usize {
@@ -97,6 +132,17 @@ impl Archive {
             Some(EntryRef {
                 id: EntryId(id),
                 meta: &entry.meta,
+            })
+        })
+    }
+
+    pub fn entries_inspect(&self) -> impl Iterator<Item = EntryInspect<'_>> {
+        self.entries.iter().enumerate().filter_map(|(idx, entry)| {
+            let id = u32::try_from(idx).ok()?;
+            Some(EntryInspect {
+                id: EntryId(id),
+                meta: &entry.meta,
+                name_raw: &entry.name_raw,
             })
         })
     }
@@ -150,6 +196,16 @@ impl Archive {
         Some(EntryRef {
             id,
             meta: &entry.meta,
+        })
+    }
+
+    pub fn inspect(&self, id: EntryId) -> Option<EntryInspect<'_>> {
+        let idx = usize::try_from(id.0).ok()?;
+        let entry = self.entries.get(idx)?;
+        Some(EntryInspect {
+            id,
+            meta: &entry.meta,
+            name_raw: &entry.name_raw,
         })
     }
 
@@ -377,7 +433,10 @@ impl Editor {
     }
 }
 
-fn parse_archive(bytes: &[u8], raw_mode: bool) -> Result<(Vec<EntryRecord>, u64)> {
+fn parse_archive(
+    bytes: &[u8],
+    raw_mode: bool,
+) -> Result<(Vec<EntryRecord>, Option<ArchiveHeader>)> {
     if raw_mode {
         let data_size = u32::try_from(bytes.len()).map_err(|_| Error::IntegerOverflow)?;
         let entry = EntryRecord {
@@ -398,10 +457,7 @@ fn parse_archive(bytes: &[u8], raw_mode: bool) -> Result<(Vec<EntryRecord>, u64)
                 name
             },
         };
-        return Ok((
-            vec![entry],
-            u64::try_from(bytes.len()).map_err(|_| Error::IntegerOverflow)?,
-        ));
+        return Ok((vec![entry], None));
     }
 
     if bytes.len() < 16 {
@@ -526,7 +582,17 @@ fn parse_archive(bytes: &[u8], raw_mode: bool) -> Result<(Vec<EntryRecord>, u64)
         });
     }
 
-    Ok((entries, directory_offset))
+    Ok((
+        entries,
+        Some(ArchiveHeader {
+            magic: *b"NRes",
+            version,
+            entry_count: u32::try_from(entry_count).map_err(|_| Error::IntegerOverflow)?,
+            total_size,
+            directory_offset,
+            directory_size: directory_len,
+        }),
+    ))
 }
 
 fn checked_range(offset: u64, size: u32, bytes_len: usize) -> Result<Range<usize>> {

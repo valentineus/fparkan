@@ -30,20 +30,33 @@ impl Default for OpenOptions {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct LibraryHeader {
+    pub raw: [u8; 32],
+    pub magic: [u8; 2],
+    pub reserved: u8,
+    pub version: u8,
+    pub entry_count: i16,
+    pub presorted_flag: u16,
+    pub xor_seed: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct AoTrailer {
+    pub raw: [u8; 6],
+    pub overlay: u32,
+}
+
 #[derive(Debug)]
 pub struct Library {
     bytes: Arc<[u8]>,
     entries: Vec<EntryRecord>,
-    #[cfg(test)]
-    pub(crate) header_raw: [u8; 32],
+    header: LibraryHeader,
+    ao_trailer: Option<AoTrailer>,
     #[cfg(test)]
     pub(crate) table_plain_original: Vec<u8>,
     #[cfg(test)]
-    pub(crate) xor_seed: u32,
-    #[cfg(test)]
     pub(crate) source_size: usize,
-    #[cfg(test)]
-    pub(crate) trailer_raw: Option<[u8; 6]>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -77,6 +90,16 @@ pub struct EntryRef<'a> {
     pub meta: &'a EntryMeta,
 }
 
+#[derive(Copy, Clone, Debug)]
+pub struct EntryInspect<'a> {
+    pub id: EntryId,
+    pub meta: &'a EntryMeta,
+    pub name_raw: &'a [u8; 12],
+    pub service_tail: &'a [u8; 4],
+    pub sort_to_original: i16,
+    pub data_offset_raw: u32,
+}
+
 pub struct PackedResource {
     pub meta: EntryMeta,
     pub packed: Vec<u8>,
@@ -86,9 +109,9 @@ pub struct PackedResource {
 pub(crate) struct EntryRecord {
     pub(crate) meta: EntryMeta,
     pub(crate) name_raw: [u8; 12],
+    pub(crate) service_tail: [u8; 4],
     pub(crate) sort_to_original: i16,
     pub(crate) key16: u16,
-    #[cfg(test)]
     pub(crate) data_offset_raw: u32,
     pub(crate) packed_size_declared: u32,
     pub(crate) packed_size_available: usize,
@@ -106,6 +129,14 @@ impl Library {
         parse_library(arc, opts)
     }
 
+    pub fn header(&self) -> &LibraryHeader {
+        &self.header
+    }
+
+    pub fn ao_trailer(&self) -> Option<&AoTrailer> {
+        self.ao_trailer.as_ref()
+    }
+
     pub fn entry_count(&self) -> usize {
         self.entries.len()
     }
@@ -116,6 +147,20 @@ impl Library {
             Some(EntryRef {
                 id: EntryId(id),
                 meta: &entry.meta,
+            })
+        })
+    }
+
+    pub fn entries_inspect(&self) -> impl Iterator<Item = EntryInspect<'_>> {
+        self.entries.iter().enumerate().filter_map(|(idx, entry)| {
+            let id = u32::try_from(idx).ok()?;
+            Some(EntryInspect {
+                id: EntryId(id),
+                meta: &entry.meta,
+                name_raw: &entry.name_raw,
+                service_tail: &entry.service_tail,
+                sort_to_original: entry.sort_to_original,
+                data_offset_raw: entry.data_offset_raw,
             })
         })
     }
@@ -184,6 +229,19 @@ impl Library {
         Some(EntryRef {
             id,
             meta: &entry.meta,
+        })
+    }
+
+    pub fn inspect(&self, id: EntryId) -> Option<EntryInspect<'_>> {
+        let idx = usize::try_from(id.0).ok()?;
+        let entry = self.entries.get(idx)?;
+        Some(EntryInspect {
+            id,
+            meta: &entry.meta,
+            name_raw: &entry.name_raw,
+            service_tail: &entry.service_tail,
+            sort_to_original: entry.sort_to_original,
+            data_offset_raw: entry.data_offset_raw,
         })
     }
 
@@ -284,7 +342,7 @@ impl Library {
 
     #[cfg(test)]
     pub(crate) fn rebuild_from_parsed_metadata(&self) -> Result<Vec<u8>> {
-        let trailer_len = usize::from(self.trailer_raw.is_some()) * 6;
+        let trailer_len = usize::from(self.ao_trailer.is_some()) * 6;
         let pre_trailer_size = self
             .source_size
             .checked_sub(trailer_len)
@@ -304,9 +362,11 @@ impl Library {
         }
 
         let mut out = vec![0u8; pre_trailer_size];
-        out[0..32].copy_from_slice(&self.header_raw);
-        let encrypted_table =
-            xor_stream(&self.table_plain_original, (self.xor_seed & 0xFFFF) as u16);
+        out[0..32].copy_from_slice(&self.header.raw);
+        let encrypted_table = xor_stream(
+            &self.table_plain_original,
+            (self.header.xor_seed & 0xFFFF) as u16,
+        );
         out[32..table_end].copy_from_slice(&encrypted_table);
 
         let mut occupied = vec![false; pre_trailer_size];
@@ -337,8 +397,8 @@ impl Library {
             }
         }
 
-        if let Some(trailer) = self.trailer_raw {
-            out.extend_from_slice(&trailer);
+        if let Some(trailer) = &self.ao_trailer {
+            out.extend_from_slice(&trailer.raw);
         }
         Ok(out)
     }
