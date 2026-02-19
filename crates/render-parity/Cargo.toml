@@ -1,0 +1,9 @@
+[package]
+name = "render-parity"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

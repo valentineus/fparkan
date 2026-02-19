@@ -1,0 +1,27 @@
+[meta]
+# Global defaults for all cases.
+width = 1280
+height = 720
+lod = 0
+group = 0
+angle = 0.0
+
+# Per-pixel change threshold for the "changed pixel ratio" metric.
+diff_threshold = 8
+
+# Allowed thresholds (case fails if any limit is exceeded).
+max_mean_abs = 2.0
+max_changed_ratio = 0.010
+
+# Add one block per model.
+#
+# [[case]]
+# id = "animals_a_l_01"
+# archive = "../testdata/Parkan - Iron Strategy/animals.rlb"
+# model = "A_L_01.msh"
+# reference = "reference/animals_a_l_01.png"
+# lod = 0
+# group = 0
+# angle = 0.0
+# max_mean_abs = 2.0
+# max_changed_ratio = 0.010

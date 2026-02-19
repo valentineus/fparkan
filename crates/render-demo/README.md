@@ -23,6 +23,25 @@ cargo run -p render-demo --features demo -- \
 - `--model` (опционально): имя модели; если не задано, берётся первая `.msh`.
 - `--lod` (опционально, default `0`).
 - `--group` (опционально, default `0`).
+- `--width`, `--height` (опционально, default `1280x720`).
+- `--angle` (опционально): фиксированный угол поворота вокруг Y (в радианах).
+- `--spin-rate` (опционально, default `0.35`): скорость вращения в интерактивном режиме.
+
+## Детерминированный снимок кадра
+
+Для parity-проверок используется headless-сценарий с фиксированными параметрами:
+
+```bash
+cargo run -p render-demo --features demo -- \
+  --archive "testdata/Parkan - Iron Strategy/animals.rlb" \
+  --model "A_L_01.msh" \
+  --lod 0 \
+  --group 0 \
+  --width 1280 \
+  --height 720 \
+  --angle 0.0 \
+  --capture "target/render-parity/current/animals_a_l_01.png"
+```
 
 ## Ограничения
 

@@ -39,6 +39,7 @@ nav:
       - Network system: specs/network.md
       - NRes / RsLi: specs/nres.md
       - Render pipeline: specs/render.md
+      - Render parity: specs/render-parity.md
       - Runtime pointer: specs/runtime-pipeline.md
       - Sound system: specs/sound.md
       - Terrain + map loading: specs/terrain-map-loading.md
