@@ -5,7 +5,7 @@ CPU-подготовка draw-данных для моделей `MSH`.
 Покрывает:
 
 - обход `node -> slot -> batch`;
-- раскрытие индексов в triangle-list (`Vec<[f32;3]>`);
+- раскрытие индексов в triangle-list (`position + uv0`);
 - расчёт bounds по вершинам.
 
 Тесты:

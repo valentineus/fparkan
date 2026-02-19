@@ -74,8 +74,16 @@ fn build_render_mesh_for_real_models() {
             if !mesh.vertices.is_empty() {
                 meshes_non_empty += 1;
             }
-            if compute_bounds(&mesh.vertices).is_some() {
+            if compute_bounds_for_mesh(&mesh.vertices).is_some() {
                 bounds_non_empty += 1;
+            }
+            for vertex in &mesh.vertices {
+                assert!(
+                    vertex.uv0[0].is_finite() && vertex.uv0[1].is_finite(),
+                    "UV must be finite for '{}' in {}",
+                    entry.meta.name,
+                    archive_path.display()
+                );
             }
         }
     }
@@ -96,6 +104,28 @@ fn compute_bounds_handles_empty_and_non_empty() {
     assert!(compute_bounds(&[]).is_none());
     let bounds = compute_bounds(&[[1.0, 2.0, 3.0], [-2.0, 5.0, 0.5], [0.0, -1.0, 9.0]])
         .expect("bounds expected");
+    assert_eq!(bounds.0, [-2.0, -1.0, 0.5]);
+    assert_eq!(bounds.1, [1.0, 5.0, 9.0]);
+}
+
+#[test]
+fn compute_bounds_for_mesh_handles_empty_and_non_empty() {
+    assert!(compute_bounds_for_mesh(&[]).is_none());
+    let bounds = compute_bounds_for_mesh(&[
+        RenderVertex {
+            position: [1.0, 2.0, 3.0],
+            uv0: [0.0, 0.0],
+        },
+        RenderVertex {
+            position: [-2.0, 5.0, 0.5],
+            uv0: [0.2, 0.3],
+        },
+        RenderVertex {
+            position: [0.0, -1.0, 9.0],
+            uv0: [1.0, 1.0],
+        },
+    ])
+    .expect("bounds expected");
     assert_eq!(bounds.0, [-2.0, -1.0, 0.5]);
     assert_eq!(bounds.1, [1.0, 5.0, 9.0]);
 }

@@ -90,6 +90,13 @@ impl Texture {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct DecodedMip {
+    pub width: u32,
+    pub height: u32,
+    pub rgba8: Vec<u8>,
+}
+
 pub fn parse_texm(payload: &[u8]) -> Result<Texture> {
     if payload.len() < 32 {
         return Err(Error::HeaderTooSmall {
@@ -195,6 +202,81 @@ pub fn parse_texm(payload: &[u8]) -> Result<Texture> {
     })
 }
 
+pub fn decode_mip_rgba8(texture: &Texture, payload: &[u8], mip_index: usize) -> Result<DecodedMip> {
+    let Some(level) = texture.mip_levels.get(mip_index).copied() else {
+        return Err(Error::MipIndexOutOfRange {
+            requested: mip_index,
+            mip_count: texture.mip_levels.len(),
+        });
+    };
+
+    let end = level
+        .offset
+        .checked_add(level.size)
+        .ok_or(Error::IntegerOverflow)?;
+    let Some(level_data) = payload.get(level.offset..end) else {
+        return Err(Error::MipDataOutOfBounds {
+            offset: level.offset,
+            size: level.size,
+            payload_size: payload.len(),
+        });
+    };
+
+    let pixel_count = usize::try_from(level.width)
+        .ok()
+        .and_then(|w| {
+            usize::try_from(level.height)
+                .ok()
+                .map(|h| w.saturating_mul(h))
+        })
+        .ok_or(Error::IntegerOverflow)?;
+    let mut rgba = vec![0u8; pixel_count.saturating_mul(4)];
+
+    match texture.header.format {
+        PixelFormat::Indexed8 => {
+            let palette = texture.palette.as_ref().ok_or(Error::IntegerOverflow)?;
+            for (i, &index) in level_data.iter().enumerate() {
+                if i >= pixel_count {
+                    break;
+                }
+                let poff = usize::from(index).saturating_mul(4);
+                if poff + 3 >= palette.len() {
+                    continue;
+                }
+                let out = i.saturating_mul(4);
+                rgba[out] = palette[poff];
+                rgba[out + 1] = palette[poff + 1];
+                rgba[out + 2] = palette[poff + 2];
+                rgba[out + 3] = palette[poff + 3];
+            }
+        }
+        PixelFormat::Rgb565 => {
+            decode_words(level_data, pixel_count, &mut rgba, decode_rgb565);
+        }
+        PixelFormat::Rgb556 => {
+            decode_words(level_data, pixel_count, &mut rgba, decode_rgb556);
+        }
+        PixelFormat::Argb4444 => {
+            decode_words(level_data, pixel_count, &mut rgba, decode_argb4444);
+        }
+        PixelFormat::LuminanceAlpha88 => {
+            decode_words(level_data, pixel_count, &mut rgba, decode_luminance_alpha88);
+        }
+        PixelFormat::Rgb888 => {
+            decode_dwords(level_data, pixel_count, &mut rgba, decode_rgb888x);
+        }
+        PixelFormat::Argb8888 => {
+            decode_dwords(level_data, pixel_count, &mut rgba, decode_argb8888);
+        }
+    }
+
+    Ok(DecodedMip {
+        width: level.width,
+        height: level.height,
+        rgba8: rgba,
+    })
+}
+
 fn parse_page_tail(payload: &[u8], core_end: usize) -> Result<Vec<PageRect>> {
     if core_end == payload.len() {
         return Ok(Vec::new());
@@ -252,6 +334,87 @@ fn read_i16(data: &[u8], offset: usize) -> Result<i16> {
     let bytes = data.get(offset..offset + 2).ok_or(Error::IntegerOverflow)?;
     let arr: [u8; 2] = bytes.try_into().map_err(|_| Error::IntegerOverflow)?;
     Ok(i16::from_le_bytes(arr))
+}
+
+fn decode_words(data: &[u8], pixel_count: usize, rgba: &mut [u8], decode: fn(u16) -> [u8; 4]) {
+    for i in 0..pixel_count {
+        let off = i.saturating_mul(2);
+        let Some(bytes) = data.get(off..off + 2) else {
+            break;
+        };
+        let word = u16::from_le_bytes([bytes[0], bytes[1]]);
+        let px = decode(word);
+        let out = i.saturating_mul(4);
+        rgba[out..out + 4].copy_from_slice(&px);
+    }
+}
+
+fn decode_dwords(data: &[u8], pixel_count: usize, rgba: &mut [u8], decode: fn(u32) -> [u8; 4]) {
+    for i in 0..pixel_count {
+        let off = i.saturating_mul(4);
+        let Some(bytes) = data.get(off..off + 4) else {
+            break;
+        };
+        let dword = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let px = decode(dword);
+        let out = i.saturating_mul(4);
+        rgba[out..out + 4].copy_from_slice(&px);
+    }
+}
+
+fn expand5(v: u16) -> u8 {
+    ((u32::from(v) * 255 + 15) / 31) as u8
+}
+
+fn expand6(v: u16) -> u8 {
+    ((u32::from(v) * 255 + 31) / 63) as u8
+}
+
+fn expand4(v: u16) -> u8 {
+    (u32::from(v) * 17) as u8
+}
+
+fn decode_rgb565(word: u16) -> [u8; 4] {
+    let r = expand5((word >> 11) & 0x1F);
+    let g = expand6((word >> 5) & 0x3F);
+    let b = expand5(word & 0x1F);
+    [r, g, b, 255]
+}
+
+fn decode_rgb556(word: u16) -> [u8; 4] {
+    let r = expand5((word >> 11) & 0x1F);
+    let g = expand5((word >> 6) & 0x1F);
+    let b = expand6(word & 0x3F);
+    [r, g, b, 255]
+}
+
+fn decode_argb4444(word: u16) -> [u8; 4] {
+    let a = expand4((word >> 12) & 0x0F);
+    let r = expand4((word >> 8) & 0x0F);
+    let g = expand4((word >> 4) & 0x0F);
+    let b = expand4(word & 0x0F);
+    [r, g, b, a]
+}
+
+fn decode_luminance_alpha88(word: u16) -> [u8; 4] {
+    let l = ((word >> 8) & 0xFF) as u8;
+    let a = (word & 0xFF) as u8;
+    [l, l, l, a]
+}
+
+fn decode_rgb888x(dword: u32) -> [u8; 4] {
+    let r = (dword & 0xFF) as u8;
+    let g = ((dword >> 8) & 0xFF) as u8;
+    let b = ((dword >> 16) & 0xFF) as u8;
+    [r, g, b, 255]
+}
+
+fn decode_argb8888(dword: u32) -> [u8; 4] {
+    let a = (dword & 0xFF) as u8;
+    let r = ((dword >> 8) & 0xFF) as u8;
+    let g = ((dword >> 16) & 0xFF) as u8;
+    let b = ((dword >> 24) & 0xFF) as u8;
+    [r, g, b, a]
 }
 
 #[cfg(test)]

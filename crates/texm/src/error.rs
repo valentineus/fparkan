@@ -23,6 +23,15 @@ pub enum Error {
         expected_end: usize,
         actual_size: usize,
     },
+    MipIndexOutOfRange {
+        requested: usize,
+        mip_count: usize,
+    },
+    MipDataOutOfBounds {
+        offset: usize,
+        size: usize,
+        payload_size: usize,
+    },
     InvalidPageMagic,
     InvalidPageSize {
         expected: usize,
@@ -49,6 +58,21 @@ impl fmt::Display for Error {
             } => write!(
                 f,
                 "Texm core data out of bounds: expected_end={expected_end}, actual_size={actual_size}"
+            ),
+            Self::MipIndexOutOfRange {
+                requested,
+                mip_count,
+            } => write!(
+                f,
+                "Texm mip index out of range: requested={requested}, mip_count={mip_count}"
+            ),
+            Self::MipDataOutOfBounds {
+                offset,
+                size,
+                payload_size,
+            } => write!(
+                f,
+                "Texm mip data out of bounds: offset={offset}, size={size}, payload_size={payload_size}"
             ),
             Self::InvalidPageMagic => write!(f, "Texm tail exists but Page magic is missing"),
             Self::InvalidPageSize { expected, actual } => {

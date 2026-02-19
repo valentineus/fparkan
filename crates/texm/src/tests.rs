@@ -116,6 +116,26 @@ fn texm_parse_minimal_argb8888_no_page() {
 }
 
 #[test]
+fn texm_decode_minimal_argb8888_no_page() {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&TEXM_MAGIC.to_le_bytes());
+    payload.extend_from_slice(&1u32.to_le_bytes()); // width
+    payload.extend_from_slice(&1u32.to_le_bytes()); // height
+    payload.extend_from_slice(&1u32.to_le_bytes()); // mip_count
+    payload.extend_from_slice(&0u32.to_le_bytes()); // flags4
+    payload.extend_from_slice(&0u32.to_le_bytes()); // flags5
+    payload.extend_from_slice(&0u32.to_le_bytes()); // unk6
+    payload.extend_from_slice(&8888u32.to_le_bytes()); // format
+    payload.extend_from_slice(&[0x40, 0x11, 0x22, 0x33]); // A,R,G,B in little-endian order
+
+    let parsed = parse_texm(&payload).expect("failed to parse minimal texm");
+    let decoded = decode_mip_rgba8(&parsed, &payload, 0).expect("failed to decode mip");
+    assert_eq!(decoded.width, 1);
+    assert_eq!(decoded.height, 1);
+    assert_eq!(decoded.rgba8, vec![0x11, 0x22, 0x33, 0x40]);
+}
+
+#[test]
 fn texm_parse_indexed_with_page_chunk() {
     let mut payload = Vec::new();
     payload.extend_from_slice(&TEXM_MAGIC.to_le_bytes());
@@ -147,4 +167,29 @@ fn texm_parse_indexed_with_page_chunk() {
             h: 2
         }
     );
+}
+
+#[test]
+fn texm_decode_indexed_with_palette() {
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&TEXM_MAGIC.to_le_bytes());
+    payload.extend_from_slice(&2u32.to_le_bytes()); // width
+    payload.extend_from_slice(&1u32.to_le_bytes()); // height
+    payload.extend_from_slice(&1u32.to_le_bytes()); // mip_count
+    payload.extend_from_slice(&0u32.to_le_bytes()); // flags4
+    payload.extend_from_slice(&0u32.to_le_bytes()); // flags5
+    payload.extend_from_slice(&0u32.to_le_bytes()); // unk6
+    payload.extend_from_slice(&0u32.to_le_bytes()); // format indexed8
+
+    let mut palette = [0u8; 1024];
+    palette[4..8].copy_from_slice(&[10, 20, 30, 255]); // index 1
+    palette[8..12].copy_from_slice(&[40, 50, 60, 200]); // index 2
+    payload.extend_from_slice(&palette);
+    payload.extend_from_slice(&[1u8, 2u8]); // two pixels
+
+    let parsed = parse_texm(&payload).expect("failed to parse indexed texm");
+    let decoded = decode_mip_rgba8(&parsed, &payload, 0).expect("failed to decode indexed texm");
+    assert_eq!(decoded.width, 2);
+    assert_eq!(decoded.height, 1);
+    assert_eq!(decoded.rgba8, vec![10, 20, 30, 255, 40, 50, 60, 200]);
 }

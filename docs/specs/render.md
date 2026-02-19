@@ -87,6 +87,14 @@ Material pipeline на кадре:
 4. Резолвятся ссылки на texture/lightmap.
 5. Невалидные ссылки обрабатываются fallback-стратегией.
 
+Практическая цепочка привязки для большинства `*.msh` ассетов из `*.rlb`:
+
+1. Для модели выбирается одноимённый `WEAR` (`<model_stem>.wea`).
+2. Из `WEAR` берётся material-слот (по имени, `legacyId` не участвует в выборе).
+3. В `Material.lib` ищется `MAT0` по имени (`DEFAULT`, затем индекс `0` как fallback).
+4. Из выбранной material-фазы берётся `textureName`.
+5. `Texm` ищется в `Textures.lib` (и/или lightmap-архиве для lightmap-ветки).
+
 ## 6. Texture path
 
 При резолве текстуры:

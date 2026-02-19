@@ -1,8 +1,14 @@
 use msh_core::Model;
 
 #[derive(Clone, Debug)]
+pub struct RenderVertex {
+    pub position: [f32; 3],
+    pub uv0: [f32; 2],
+}
+
+#[derive(Clone, Debug)]
 pub struct RenderMesh {
-    pub vertices: Vec<[f32; 3]>,
+    pub vertices: Vec<RenderVertex>,
     pub batch_count: usize,
 }
 
@@ -18,6 +24,7 @@ impl RenderMesh {
 pub fn build_render_mesh(model: &Model, lod: usize, group: usize) -> RenderMesh {
     let mut vertices = Vec::new();
     let mut batch_count = 0usize;
+    let uv0 = model.uv0.as_ref();
 
     for node_index in 0..model.node_count {
         let Some(slot_idx) = model.slot_index(node_index, lod, group) else {
@@ -48,7 +55,15 @@ pub fn build_render_mesh(model: &Model, lod: usize, group: usize) -> RenderMesh 
                 let Some(pos) = model.positions.get(final_idx) else {
                     continue;
                 };
-                vertices.push(*pos);
+                let uv = uv0
+                    .and_then(|uvs| uvs.get(final_idx))
+                    .copied()
+                    .map(|packed| [packed[0] as f32 / 1024.0, packed[1] as f32 / 1024.0])
+                    .unwrap_or([0.0, 0.0]);
+                vertices.push(RenderVertex {
+                    position: *pos,
+                    uv0: uv,
+                });
             }
             batch_count += 1;
         }
@@ -73,6 +88,26 @@ pub fn compute_bounds(vertices: &[[f32; 3]]) -> Option<([f32; 3], [f32; 3])> {
             }
             if v[i] > max_v[i] {
                 max_v[i] = v[i];
+            }
+        }
+    }
+
+    Some((min_v, max_v))
+}
+
+pub fn compute_bounds_for_mesh(vertices: &[RenderVertex]) -> Option<([f32; 3], [f32; 3])> {
+    let mut iter = vertices.iter();
+    let first = iter.next()?;
+    let mut min_v = first.position;
+    let mut max_v = first.position;
+
+    for v in iter {
+        for i in 0..3 {
+            if v.position[i] < min_v[i] {
+                min_v[i] = v.position[i];
+            }
+            if v.position[i] > max_v[i] {
+                max_v[i] = v.position[i];
             }
         }
     }

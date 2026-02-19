@@ -5,6 +5,7 @@
 ## Назначение
 
 - Проверить, что `nres + msh-core + render-core` дают рабочий draw-path на реальных ассетах.
+- Проверить текстурный path `WEAR -> MAT0 -> Texm` на реальных ассетах.
 - Служить минимальным reference-приложением.
 
 ## Запуск
@@ -26,6 +27,20 @@ cargo run -p render-demo --features demo -- \
 - `--width`, `--height` (опционально, default `1280x720`).
 - `--angle` (опционально): фиксированный угол поворота вокруг Y (в радианах).
 - `--spin-rate` (опционально, default `0.35`): скорость вращения в интерактивном режиме.
+- `--texture <name>`: явное имя `Texm` (override авто-резолва).
+- `--texture-archive <path>`: путь к архиву текстур (по умолчанию `textures.lib` рядом с `--archive`).
+- `--material-archive <path>`: путь к `material.lib` (по умолчанию соседний `material.lib`).
+- `--wear <name.wea>`: имя wear-entry внутри модельного архива (по умолчанию `<model_stem>.wea`).
+- `--no-texture`: отключить текстуры и рендерить однотонным цветом.
+
+## Авто-резолв текстуры
+
+Если не передан `--texture`, демо пытается взять текстуру из игровых данных:
+
+1. `model.msh -> model.wea` (первый wear-материал),
+2. `material.lib` (`MAT0`) по имени материала с fallback `DEFAULT`,
+3. первая непустая `textureName` фаза материала,
+4. загрузка `Texm` из `textures.lib` (или `lightmap.lib` как fallback).
 
 ## Детерминированный снимок кадра
 
@@ -43,7 +58,16 @@ cargo run -p render-demo --features demo -- \
   --capture "target/render-parity/current/animals_a_l_01.png"
 ```
 
+Явный выбор текстуры:
+
+```bash
+cargo run -p render-demo --features demo -- \
+  --archive "testdata/Parkan - Iron Strategy/animals.rlb" \
+  --model "A_L_01.msh" \
+  --texture "PG09.0"
+```
+
 ## Ограничения
 
-- Рендер только геометрии (без материалов/текстур/FX).
-- Вывод через `glDrawArrays(GL_TRIANGLES)` из расширенного triangle-list.
+- Используется только базовая texture-фаза (без полной material/fx анимации).
+- Вывод через `glDrawArrays(GL_TRIANGLES)` из расширенного triangle-list (позиции+UV).

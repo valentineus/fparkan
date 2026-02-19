@@ -1,6 +1,6 @@
 use glow::HasContext as _;
-use render_core::{build_render_mesh, compute_bounds};
-use render_demo::load_model_from_archive;
+use render_core::{build_render_mesh, compute_bounds_for_mesh};
+use render_demo::{load_model_with_name_from_archive, resolve_texture_for_model, LoadedTexture};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -14,6 +14,15 @@ struct Args {
     capture: Option<PathBuf>,
     angle: Option<f32>,
     spin_rate: f32,
+    texture: Option<String>,
+    texture_archive: Option<PathBuf>,
+    material_archive: Option<PathBuf>,
+    wear: Option<String>,
+    no_texture: bool,
+}
+
+struct GpuTexture {
+    handle: glow::NativeTexture,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -26,6 +35,11 @@ fn parse_args() -> Result<Args, String> {
     let mut capture = None;
     let mut angle = None;
     let mut spin_rate = 0.35f32;
+    let mut texture = None;
+    let mut texture_archive = None;
+    let mut material_archive = None;
+    let mut wear = None;
+    let mut no_texture = false;
 
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -104,6 +118,33 @@ fn parse_args() -> Result<Args, String> {
                     .parse::<f32>()
                     .map_err(|_| String::from("invalid --spin-rate value"))?;
             }
+            "--texture" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| String::from("missing value for --texture"))?;
+                texture = Some(value);
+            }
+            "--texture-archive" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| String::from("missing value for --texture-archive"))?;
+                texture_archive = Some(PathBuf::from(value));
+            }
+            "--material-archive" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| String::from("missing value for --material-archive"))?;
+                material_archive = Some(PathBuf::from(value));
+            }
+            "--wear" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| String::from("missing value for --wear"))?;
+                wear = Some(value);
+            }
+            "--no-texture" => {
+                no_texture = true;
+            }
             "--help" | "-h" => {
                 print_help();
                 std::process::exit(0);
@@ -125,6 +166,11 @@ fn parse_args() -> Result<Args, String> {
         capture,
         angle,
         spin_rate,
+        texture,
+        texture_archive,
+        material_archive,
+        wear,
+        no_texture,
     })
 }
 
@@ -133,6 +179,7 @@ fn print_help() {
         "parkan-render-demo --archive <path> [--model <name.msh>] [--lod N] [--group N] [--width W] [--height H]"
     );
     eprintln!("                  [--capture <out.png>] [--angle RAD] [--spin-rate RAD_PER_SEC]");
+    eprintln!("                  [--texture <name>] [--texture-archive <path>] [--material-archive <path>] [--wear <name.wea>] [--no-texture]");
 }
 
 fn main() {
@@ -152,23 +199,33 @@ fn main() {
 }
 
 fn run(args: Args) -> Result<(), String> {
-    let model = load_model_from_archive(&args.archive, args.model.as_deref()).map_err(|err| {
-        format!(
-            "failed to load model from archive {}: {err:?}",
-            args.archive.display()
-        )
-    })?;
-
-    let mesh = build_render_mesh(&model, args.lod, args.group);
+    let loaded_model = load_model_with_name_from_archive(&args.archive, args.model.as_deref())
+        .map_err(|err| {
+            format!(
+                "failed to load model from archive {}: {err:?}",
+                args.archive.display()
+            )
+        })?;
+    let mesh = build_render_mesh(&loaded_model.model, args.lod, args.group);
     if mesh.vertices.is_empty() {
         return Err(format!(
             "model has no renderable triangles for lod={} group={}",
             args.lod, args.group
         ));
     }
-    let Some((bounds_min, bounds_max)) = compute_bounds(&mesh.vertices) else {
+    let Some((bounds_min, bounds_max)) = compute_bounds_for_mesh(&mesh.vertices) else {
         return Err(String::from("failed to compute mesh bounds"));
     };
+
+    let resolved_texture = resolve_texture(&args, &loaded_model.name)?;
+    if let Some(tex) = resolved_texture.as_ref() {
+        println!(
+            "resolved texture '{}' ({}x{})",
+            tex.name, tex.width, tex.height
+        );
+    } else {
+        println!("texture path disabled or unresolved; rendering with fallback color");
+    }
 
     let center = [
         0.5 * (bounds_min[0] + bounds_max[0]),
@@ -224,9 +281,13 @@ fn run(args: Args) -> Result<(), String> {
         video.gl_set_swap_interval(1)
     };
 
-    let mut vertices_flat = Vec::with_capacity(mesh.vertices.len() * 3);
-    for pos in &mesh.vertices {
-        vertices_flat.extend_from_slice(pos);
+    let mut vertex_data = Vec::with_capacity(mesh.vertices.len() * 5);
+    for vertex in &mesh.vertices {
+        vertex_data.push(vertex.position[0]);
+        vertex_data.push(vertex.position[1]);
+        vertex_data.push(vertex.position[2]);
+        vertex_data.push(vertex.uv0[0]);
+        vertex_data.push(vertex.uv0[1]);
     }
 
     let gl = unsafe {
@@ -235,27 +296,41 @@ fn run(args: Args) -> Result<(), String> {
 
     let program = unsafe { create_program(&gl)? };
     let u_mvp = unsafe { gl.get_uniform_location(program, "u_mvp") };
+    let u_use_tex = unsafe { gl.get_uniform_location(program, "u_use_tex") };
+    let u_tex = unsafe { gl.get_uniform_location(program, "u_tex") };
     let a_pos = unsafe { gl.get_attrib_location(program, "a_pos") }
         .ok_or_else(|| String::from("shader attribute a_pos is missing"))?;
+    let a_uv = unsafe { gl.get_attrib_location(program, "a_uv") }
+        .ok_or_else(|| String::from("shader attribute a_uv is missing"))?;
 
     let vbo = unsafe { gl.create_buffer().map_err(|e| e.to_string())? };
     unsafe {
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
         gl.buffer_data_u8_slice(
             glow::ARRAY_BUFFER,
-            cast_slice_u8(&vertices_flat),
+            cast_slice_u8(&vertex_data),
             glow::STATIC_DRAW,
         );
         gl.bind_buffer(glow::ARRAY_BUFFER, None);
     }
+
+    let gpu_texture = if let Some(texture) = resolved_texture.as_ref() {
+        Some(unsafe { create_texture(&gl, texture)? })
+    } else {
+        None
+    };
 
     let result = if let Some(capture_path) = args.capture.as_ref() {
         run_capture(
             &gl,
             program,
             u_mvp.as_ref(),
+            u_use_tex.as_ref(),
+            u_tex.as_ref(),
             a_pos,
+            a_uv,
             vbo,
+            gpu_texture.as_ref(),
             mesh.vertices.len(),
             &args,
             center,
@@ -269,8 +344,12 @@ fn run(args: Args) -> Result<(), String> {
             &gl,
             program,
             u_mvp.as_ref(),
+            u_use_tex.as_ref(),
+            u_tex.as_ref(),
             a_pos,
+            a_uv,
             vbo,
+            gpu_texture.as_ref(),
             mesh.vertices.len(),
             &args,
             center,
@@ -279,6 +358,9 @@ fn run(args: Args) -> Result<(), String> {
     };
 
     unsafe {
+        if let Some(texture) = gpu_texture {
+            gl.delete_texture(texture.handle);
+        }
         gl.delete_buffer(vbo);
         gl.delete_program(program);
     }
@@ -286,13 +368,82 @@ fn run(args: Args) -> Result<(), String> {
     result
 }
 
+fn resolve_texture(args: &Args, model_name: &str) -> Result<Option<LoadedTexture>, String> {
+    if args.no_texture {
+        return Ok(None);
+    }
+
+    match resolve_texture_for_model(
+        &args.archive,
+        model_name,
+        args.texture.as_deref(),
+        args.texture_archive.as_deref(),
+        args.material_archive.as_deref(),
+        args.wear.as_deref(),
+    ) {
+        Ok(texture) => Ok(texture),
+        Err(err) => {
+            if args.texture.is_some()
+                || args.texture_archive.is_some()
+                || args.material_archive.is_some()
+                || args.wear.is_some()
+            {
+                Err(format!("failed to resolve texture: {err:?}"))
+            } else {
+                eprintln!(
+                    "warning: auto texture resolve failed ({err:?}), fallback to solid color"
+                );
+                Ok(None)
+            }
+        }
+    }
+}
+
+unsafe fn create_texture(
+    gl: &glow::Context,
+    texture: &LoadedTexture,
+) -> Result<GpuTexture, String> {
+    let handle = gl.create_texture().map_err(|e| e.to_string())?;
+    gl.bind_texture(glow::TEXTURE_2D, Some(handle));
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_MIN_FILTER,
+        glow::LINEAR as i32,
+    );
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_MAG_FILTER,
+        glow::LINEAR as i32,
+    );
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::REPEAT as i32);
+    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::REPEAT as i32);
+    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+    gl.tex_image_2d(
+        glow::TEXTURE_2D,
+        0,
+        glow::RGBA as i32,
+        texture.width.min(i32::MAX as u32) as i32,
+        texture.height.min(i32::MAX as u32) as i32,
+        0,
+        glow::RGBA,
+        glow::UNSIGNED_BYTE,
+        glow::PixelUnpackData::Slice(Some(texture.rgba8.as_slice())),
+    );
+    gl.bind_texture(glow::TEXTURE_2D, None);
+    Ok(GpuTexture { handle })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_capture(
     gl: &glow::Context,
     program: glow::NativeProgram,
     u_mvp: Option<&glow::NativeUniformLocation>,
+    u_use_tex: Option<&glow::NativeUniformLocation>,
+    u_tex: Option<&glow::NativeUniformLocation>,
     a_pos: u32,
+    a_uv: u32,
     vbo: glow::NativeBuffer,
+    texture: Option<&GpuTexture>,
     vertex_count: usize,
     args: &Args,
     center: [f32; 3],
@@ -306,8 +457,12 @@ fn run_capture(
             gl,
             program,
             u_mvp,
+            u_use_tex,
+            u_tex,
             a_pos,
+            a_uv,
             vbo,
+            texture,
             vertex_count,
             args.width,
             args.height,
@@ -328,8 +483,12 @@ fn run_interactive(
     gl: &glow::Context,
     program: glow::NativeProgram,
     u_mvp: Option<&glow::NativeUniformLocation>,
+    u_use_tex: Option<&glow::NativeUniformLocation>,
+    u_tex: Option<&glow::NativeUniformLocation>,
     a_pos: u32,
+    a_uv: u32,
     vbo: glow::NativeBuffer,
+    texture: Option<&GpuTexture>,
     vertex_count: usize,
     args: &Args,
     center: [f32; 3],
@@ -359,7 +518,21 @@ fn run_interactive(
         let mvp = compute_mvp(w, h, center, camera_distance, angle);
 
         unsafe {
-            draw_frame(gl, program, u_mvp, a_pos, vbo, vertex_count, w, h, &mvp);
+            draw_frame(
+                gl,
+                program,
+                u_mvp,
+                u_use_tex,
+                u_tex,
+                a_pos,
+                a_uv,
+                vbo,
+                texture,
+                vertex_count,
+                w,
+                h,
+                &mvp,
+            );
         }
         window.gl_swap_window();
     }
@@ -389,8 +562,12 @@ unsafe fn draw_frame(
     gl: &glow::Context,
     program: glow::NativeProgram,
     u_mvp: Option<&glow::NativeUniformLocation>,
+    u_use_tex: Option<&glow::NativeUniformLocation>,
+    u_tex: Option<&glow::NativeUniformLocation>,
     a_pos: u32,
+    a_uv: u32,
     vbo: glow::NativeBuffer,
+    texture: Option<&GpuTexture>,
     vertex_count: usize,
     width: u32,
     height: u32,
@@ -409,16 +586,30 @@ unsafe fn draw_frame(
     gl.use_program(Some(program));
     gl.uniform_matrix_4_f32_slice(u_mvp, false, mvp);
 
+    let texture_enabled = texture.is_some();
+    gl.uniform_1_f32(u_use_tex, if texture_enabled { 1.0 } else { 0.0 });
+    if let Some(tex) = texture {
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex.handle));
+        gl.uniform_1_i32(u_tex, 0);
+    } else {
+        gl.bind_texture(glow::TEXTURE_2D, None);
+    }
+
     gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
     gl.enable_vertex_attrib_array(a_pos);
-    gl.vertex_attrib_pointer_f32(a_pos, 3, glow::FLOAT, false, 12, 0);
+    gl.vertex_attrib_pointer_f32(a_pos, 3, glow::FLOAT, false, 20, 0);
+    gl.enable_vertex_attrib_array(a_uv);
+    gl.vertex_attrib_pointer_f32(a_uv, 2, glow::FLOAT, false, 20, 12);
     gl.draw_arrays(
         glow::TRIANGLES,
         0,
         vertex_count.min(i32::MAX as usize) as i32,
     );
+    gl.disable_vertex_attrib_array(a_uv);
     gl.disable_vertex_attrib_array(a_pos);
     gl.bind_buffer(glow::ARRAY_BUFFER, None);
+    gl.bind_texture(glow::TEXTURE_2D, None);
     gl.use_program(None);
 }
 
@@ -475,16 +666,24 @@ fn save_png(path: &Path, width: u32, height: u32, rgba: Vec<u8>) -> Result<(), S
 unsafe fn create_program(gl: &glow::Context) -> Result<glow::NativeProgram, String> {
     let vs_src = r#"
 attribute vec3 a_pos;
+attribute vec2 a_uv;
 uniform mat4 u_mvp;
+varying vec2 v_uv;
 void main() {
+    v_uv = a_uv;
     gl_Position = u_mvp * vec4(a_pos, 1.0);
 }
 "#;
 
     let fs_src = r#"
 precision mediump float;
+uniform sampler2D u_tex;
+uniform float u_use_tex;
+varying vec2 v_uv;
 void main() {
-    gl_FragColor = vec4(0.85, 0.90, 1.00, 1.0);
+    vec4 base = vec4(0.85, 0.90, 1.00, 1.0);
+    vec4 texColor = texture2D(u_tex, v_uv);
+    gl_FragColor = mix(base, texColor, u_use_tex);
 }
 "#;
 

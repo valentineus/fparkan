@@ -59,6 +59,20 @@ pixelCount = sum(max(1, width>>i) * max(1, height>>i), i=0..mipCount-1);
 sizeCore = 32 + (format==0 ? 1024 : 0) + bytesPerPixel * pixelCount;
 ```
 
+## 4.1. Декодирование в RGBA8 (runtime/инструменты)
+
+Для CPU-пути (preview, валидация, оффлайн-конвертация) используется декодирование:
+
+- `0` (`Indexed8`): `index -> palette[index]` (`RGBA` из палитры 256×4).
+- `565`: `R5 G6 B5`, `A=255`.
+- `556`: `R5 G5 B6`, `A=255`.
+- `4444`: `A4 R4 G4 B4` (с расширением 4-битных каналов в 8-битные).
+- `88`: `L8 A8` (`R=G=B=L`).
+- `888`: `R8 G8 B8` + padding/служебный байт, `A=255`.
+- `8888`: `A8 R8 G8 B8`.
+
+Это декодирование соответствует текущему test/demo pipeline проекта.
+
 ## 5. `Page` chunk
 
 ```c
