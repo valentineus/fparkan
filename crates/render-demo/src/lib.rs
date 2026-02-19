@@ -1,5 +1,7 @@
+use encoding_rs::WINDOWS_1251;
 use msh_core::{parse_model_payload, Model};
 use nres::{Archive, EntryRef};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use texm::{decode_mip_rgba8, parse_texm};
 
@@ -20,6 +22,37 @@ pub enum Error {
     WearNotFound(String),
     InvalidWear(String),
     InvalidMaterial(String),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Nres(err) => write!(f, "{err}"),
+            Self::Msh(err) => write!(f, "{err}"),
+            Self::Texm(err) => write!(f, "{err}"),
+            Self::Io(err) => write!(f, "{err}"),
+            Self::NoMshEntries => write!(f, "archive does not contain .msh entries"),
+            Self::ModelNotFound(name) => write!(f, "model not found: {name}"),
+            Self::NoTexmEntries => write!(f, "archive does not contain Texm entries"),
+            Self::TextureNotFound(name) => write!(f, "texture not found: {name}"),
+            Self::MaterialNotFound(name) => write!(f, "material not found: {name}"),
+            Self::WearNotFound(name) => write!(f, "wear entry not found: {name}"),
+            Self::InvalidWear(reason) => write!(f, "invalid WEAR payload: {reason}"),
+            Self::InvalidMaterial(reason) => write!(f, "invalid MAT0 payload: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Nres(err) => Some(err),
+            Self::Msh(err) => Some(err),
+            Self::Texm(err) => Some(err),
+            Self::Io(err) => Some(err),
+            _ => None,
+        }
+    }
 }
 
 impl From<nres::error::Error> for Error {
@@ -280,7 +313,7 @@ fn find_material_entry_with_fallback<'a>(
 }
 
 fn parse_wear_material_names(payload: &[u8]) -> Result<Vec<String>> {
-    let text = String::from_utf8_lossy(payload).replace('\r', "");
+    let text = decode_cp1251(payload).replace('\r', "");
     let mut lines = text.lines();
     let Some(first) = lines.next() else {
         return Err(Error::InvalidWear(String::from("WEAR payload is empty")));
@@ -360,15 +393,18 @@ fn parse_primary_texture_name_from_mat0(payload: &[u8], attr2: u32) -> Result<Op
             .iter()
             .position(|&b| b == 0)
             .unwrap_or(name_raw.len());
-        let name = String::from_utf8_lossy(&name_raw[..name_end])
-            .trim()
-            .to_string();
+        let name = decode_cp1251(&name_raw[..name_end]).trim().to_string();
         if !name.is_empty() {
             return Ok(Some(name));
         }
     }
 
     Ok(None)
+}
+
+fn decode_cp1251(bytes: &[u8]) -> String {
+    let (decoded, _, _) = WINDOWS_1251.decode(bytes);
+    decoded.into_owned()
 }
 
 fn load_texture_from_archive_by_name(archive: &Archive, name: &str) -> Result<LoadedTexture> {
@@ -523,5 +559,46 @@ mod tests {
         });
         assert!(texture.width > 0 && texture.height > 0);
         assert!(!texture.rgba8.is_empty());
+    }
+
+    #[test]
+    fn parse_wear_material_names_parses_counted_lines() {
+        let payload = b"2\r\n0 MAT_A\r\n1 MAT_B\r\n";
+        let materials =
+            parse_wear_material_names(payload).expect("failed to parse valid WEAR payload");
+        assert_eq!(materials, vec!["MAT_A".to_string(), "MAT_B".to_string()]);
+    }
+
+    #[test]
+    fn parse_wear_material_names_rejects_invalid_payload() {
+        let payload = b"2\n0 ONLY_ONE\n";
+        assert!(matches!(
+            parse_wear_material_names(payload),
+            Err(Error::InvalidWear(_))
+        ));
+    }
+
+    #[test]
+    fn parse_primary_texture_name_from_mat0_respects_attr2_layout() {
+        let mut payload = vec![0u8; 4 + 10 + 34];
+        payload[0..2].copy_from_slice(&1u16.to_le_bytes()); // phase_count
+                                                            // attr2=4 adds 10 bytes before phase table
+        let name = b"TEX_MAIN";
+        payload[4 + 10 + 18..4 + 10 + 18 + name.len()].copy_from_slice(name);
+
+        let parsed = parse_primary_texture_name_from_mat0(&payload, 4)
+            .expect("failed to parse MAT0 payload with attr2=4");
+        assert_eq!(parsed, Some("TEX_MAIN".to_string()));
+    }
+
+    #[test]
+    fn parse_primary_texture_name_from_mat0_decodes_cp1251_bytes() {
+        let mut payload = vec![0u8; 4 + 34];
+        payload[0..2].copy_from_slice(&1u16.to_le_bytes()); // phase_count
+        payload[4 + 18] = 0xC0; // 'А' in CP1251
+
+        let parsed =
+            parse_primary_texture_name_from_mat0(&payload, 0).expect("failed to parse MAT0");
+        assert_eq!(parsed, Some("А".to_string()));
     }
 }

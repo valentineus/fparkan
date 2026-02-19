@@ -111,13 +111,13 @@ impl Library {
     }
 
     pub fn entries(&self) -> impl Iterator<Item = EntryRef<'_>> {
-        self.entries
-            .iter()
-            .enumerate()
-            .map(|(idx, entry)| EntryRef {
-                id: EntryId(u32::try_from(idx).expect("entry count validated at parse")),
+        self.entries.iter().enumerate().filter_map(|(idx, entry)| {
+            let id = u32::try_from(idx).ok()?;
+            Some(EntryRef {
+                id: EntryId(id),
                 meta: &entry.meta,
             })
+        })
     }
 
     pub fn find(&self, name: &str) -> Option<EntryId> {
@@ -161,9 +161,8 @@ impl Library {
                 Ordering::Less => high = mid,
                 Ordering::Greater => low = mid + 1,
                 Ordering::Equal => {
-                    return Some(EntryId(
-                        u32::try_from(idx).expect("entry count validated at parse"),
-                    ))
+                    let id = u32::try_from(idx).ok()?;
+                    return Some(EntryId(id));
                 }
             }
         }
@@ -171,9 +170,8 @@ impl Library {
         // Linear fallback search
         self.entries.iter().enumerate().find_map(|(idx, entry)| {
             if cmp_c_string(query_bytes, c_name_bytes(&entry.name_raw)) == Ordering::Equal {
-                Some(EntryId(
-                    u32::try_from(idx).expect("entry count validated at parse"),
-                ))
+                let id = u32::try_from(idx).ok()?;
+                Some(EntryId(id))
             } else {
                 None
             }
@@ -251,7 +249,7 @@ impl Library {
             .get(idx)
             .ok_or_else(|| Error::EntryIdOutOfRange {
                 id: id.0,
-                entry_count: self.entries.len().try_into().unwrap_or(u32::MAX),
+                entry_count: saturating_u32_len(self.entries.len()),
             })
     }
 
@@ -317,18 +315,15 @@ impl Library {
         }
 
         for (idx, entry) in self.entries.iter().enumerate() {
-            let packed = self
-                .load_packed(EntryId(
-                    u32::try_from(idx).expect("entry count validated at parse"),
-                ))?
-                .packed;
+            let id = u32::try_from(idx).map_err(|_| Error::IntegerOverflow)?;
+            let packed = self.load_packed(EntryId(id))?.packed;
             let start =
                 usize::try_from(entry.data_offset_raw).map_err(|_| Error::IntegerOverflow)?;
             for (offset, byte) in packed.iter().copied().enumerate() {
                 let pos = start.checked_add(offset).ok_or(Error::IntegerOverflow)?;
                 if pos >= out.len() {
                     return Err(Error::PackedSizePastEof {
-                        id: u32::try_from(idx).expect("entry count validated at parse"),
+                        id,
                         offset: u64::from(entry.data_offset_raw),
                         packed_size: entry.packed_size_declared,
                         file_len: u64::try_from(out.len()).map_err(|_| Error::IntegerOverflow)?,
@@ -405,6 +400,10 @@ fn needs_xor_key(method: PackMethod) -> bool {
         method,
         PackMethod::XorOnly | PackMethod::XorLzss | PackMethod::XorLzssHuffman
     )
+}
+
+fn saturating_u32_len(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
 }
 
 #[cfg(test)]

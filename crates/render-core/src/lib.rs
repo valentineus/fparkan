@@ -1,5 +1,7 @@
 use msh_core::Model;
 
+pub const DEFAULT_UV_SCALE: f32 = 1024.0;
+
 #[derive(Clone, Debug)]
 pub struct RenderVertex {
     pub position: [f32; 3],
@@ -58,7 +60,12 @@ pub fn build_render_mesh(model: &Model, lod: usize, group: usize) -> RenderMesh 
                 let uv = uv0
                     .and_then(|uvs| uvs.get(final_idx))
                     .copied()
-                    .map(|packed| [packed[0] as f32 / 1024.0, packed[1] as f32 / 1024.0])
+                    .map(|packed| {
+                        [
+                            packed[0] as f32 / DEFAULT_UV_SCALE,
+                            packed[1] as f32 / DEFAULT_UV_SCALE,
+                        ]
+                    })
                     .unwrap_or([0.0, 0.0]);
                 vertices.push(RenderVertex {
                     position: *pos,
@@ -76,38 +83,28 @@ pub fn build_render_mesh(model: &Model, lod: usize, group: usize) -> RenderMesh 
 }
 
 pub fn compute_bounds(vertices: &[[f32; 3]]) -> Option<([f32; 3], [f32; 3])> {
-    let mut iter = vertices.iter();
-    let first = iter.next()?;
-    let mut min_v = *first;
-    let mut max_v = *first;
-
-    for v in iter {
-        for i in 0..3 {
-            if v[i] < min_v[i] {
-                min_v[i] = v[i];
-            }
-            if v[i] > max_v[i] {
-                max_v[i] = v[i];
-            }
-        }
-    }
-
-    Some((min_v, max_v))
+    compute_bounds_impl(vertices.iter().copied())
 }
 
 pub fn compute_bounds_for_mesh(vertices: &[RenderVertex]) -> Option<([f32; 3], [f32; 3])> {
-    let mut iter = vertices.iter();
-    let first = iter.next()?;
-    let mut min_v = first.position;
-    let mut max_v = first.position;
+    compute_bounds_impl(vertices.iter().map(|v| v.position))
+}
 
-    for v in iter {
+fn compute_bounds_impl<I>(mut positions: I) -> Option<([f32; 3], [f32; 3])>
+where
+    I: Iterator<Item = [f32; 3]>,
+{
+    let first = positions.next()?;
+    let mut min_v = first;
+    let mut max_v = first;
+
+    for pos in positions {
         for i in 0..3 {
-            if v.position[i] < min_v[i] {
-                min_v[i] = v.position[i];
+            if pos[i] < min_v[i] {
+                min_v[i] = pos[i];
             }
-            if v.position[i] > max_v[i] {
-                max_v[i] = v.position[i];
+            if pos[i] > max_v[i] {
+                max_v[i] = pos[i];
             }
         }
     }

@@ -92,13 +92,13 @@ impl Archive {
     }
 
     pub fn entries(&self) -> impl Iterator<Item = EntryRef<'_>> {
-        self.entries
-            .iter()
-            .enumerate()
-            .map(|(idx, entry)| EntryRef {
-                id: EntryId(u32::try_from(idx).expect("entry count validated at parse")),
+        self.entries.iter().enumerate().filter_map(|(idx, entry)| {
+            let id = u32::try_from(idx).ok()?;
+            Some(EntryRef {
+                id: EntryId(id),
                 meta: &entry.meta,
             })
+        })
     }
 
     pub fn find(&self, name: &str) -> Option<EntryId> {
@@ -125,9 +125,8 @@ impl Archive {
                     Ordering::Less => high = mid,
                     Ordering::Greater => low = mid + 1,
                     Ordering::Equal => {
-                        return Some(EntryId(
-                            u32::try_from(target_idx).expect("entry count validated at parse"),
-                        ))
+                        let id = u32::try_from(target_idx).ok()?;
+                        return Some(EntryId(id));
                     }
                 }
             }
@@ -137,9 +136,8 @@ impl Archive {
             if cmp_name_case_insensitive(name.as_bytes(), entry_name_bytes(&entry.name_raw))
                 == Ordering::Equal
             {
-                Some(EntryId(
-                    u32::try_from(idx).expect("entry count validated at parse"),
-                ))
+                let id = u32::try_from(idx).ok()?;
+                Some(EntryId(id))
             } else {
                 None
             }
@@ -197,7 +195,7 @@ impl Archive {
         let Some(entry) = self.entries.get(idx) else {
             return Err(Error::EntryIdOutOfRange {
                 id: id.0,
-                entry_count: self.entries.len().try_into().unwrap_or(u32::MAX),
+                entry_count: saturating_u32_len(self.entries.len()),
             });
         };
         checked_range(
@@ -248,13 +246,13 @@ pub struct NewEntry<'a> {
 
 impl Editor {
     pub fn entries(&self) -> impl Iterator<Item = EntryRef<'_>> {
-        self.entries
-            .iter()
-            .enumerate()
-            .map(|(idx, entry)| EntryRef {
-                id: EntryId(u32::try_from(idx).expect("entry count validated at add")),
+        self.entries.iter().enumerate().filter_map(|(idx, entry)| {
+            let id = u32::try_from(idx).ok()?;
+            Some(EntryRef {
+                id: EntryId(id),
                 meta: &entry.meta,
             })
+        })
     }
 
     pub fn add(&mut self, entry: NewEntry<'_>) -> Result<EntryId> {
@@ -283,7 +281,7 @@ impl Editor {
         let Some(entry) = self.entries.get_mut(idx) else {
             return Err(Error::EntryIdOutOfRange {
                 id: id.0,
-                entry_count: self.entries.len().try_into().unwrap_or(u32::MAX),
+                entry_count: saturating_u32_len(self.entries.len()),
             });
         };
         entry.meta.data_size = u32::try_from(data.len()).map_err(|_| Error::IntegerOverflow)?;
@@ -297,7 +295,7 @@ impl Editor {
         if idx >= self.entries.len() {
             return Err(Error::EntryIdOutOfRange {
                 id: id.0,
-                entry_count: self.entries.len().try_into().unwrap_or(u32::MAX),
+                entry_count: saturating_u32_len(self.entries.len()),
             });
         }
         self.entries.remove(idx);
@@ -350,6 +348,8 @@ impl Editor {
         });
 
         for (idx, entry) in self.entries.iter_mut().enumerate() {
+            // sort_index stores the original-entry index at sorted position `idx`.
+            // This mirrors the format emitted by the retail assets and test fixtures.
             entry.meta.sort_index =
                 u32::try_from(sort_order[idx]).map_err(|_| Error::IntegerOverflow)?;
         }
@@ -599,8 +599,12 @@ fn ascii_lower(value: u8) -> u8 {
     }
 }
 
+fn saturating_u32_len(len: usize) -> u32 {
+    u32::try_from(len).unwrap_or(u32::MAX)
+}
+
 fn prefetch_pages(bytes: &[u8]) {
-    use std::sync::atomic::{compiler_fence, Ordering};
+    use std::hint::black_box;
 
     let mut cursor = 0usize;
     let mut sink = 0u8;
@@ -608,8 +612,7 @@ fn prefetch_pages(bytes: &[u8]) {
         sink ^= bytes[cursor];
         cursor = cursor.saturating_add(4096);
     }
-    compiler_fence(Ordering::SeqCst);
-    let _ = sink;
+    black_box(sink);
 }
 
 fn write_atomic(path: &Path, content: &[u8]) -> Result<()> {
@@ -675,7 +678,8 @@ fn replace_file_atomically(src: &Path, dst: &Path) -> std::io::Result<()> {
     let src_wide: Vec<u16> = src.as_os_str().encode_wide().chain(iter::once(0)).collect();
     let dst_wide: Vec<u16> = dst.as_os_str().encode_wide().chain(iter::once(0)).collect();
 
-    // Replace destination in one OS call, avoiding remove+rename gaps on Windows.
+    // SAFETY: pointers reference NUL-terminated UTF-16 buffers that stay alive
+    // for the duration of the call; flags and argument contract match WinAPI.
     let ok = unsafe {
         MoveFileExW(
             src_wide.as_ptr(),

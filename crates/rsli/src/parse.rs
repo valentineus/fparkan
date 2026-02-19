@@ -100,12 +100,12 @@ pub fn parse_library(bytes: Arc<[u8]>, opts: OpenOptions) -> Result<Library> {
                         .ok_or(Error::IntegerOverflow)?;
                 } else {
                     return Err(Error::DeflateEofPlusOneQuirkRejected {
-                        id: u32::try_from(idx).expect("entry count validated at parse"),
+                        id: u32::try_from(idx).map_err(|_| Error::IntegerOverflow)?,
                     });
                 }
             } else {
                 return Err(Error::PackedSizePastEof {
-                    id: u32::try_from(idx).expect("entry count validated at parse"),
+                    id: u32::try_from(idx).map_err(|_| Error::IntegerOverflow)?,
                     offset: effective_offset_u64,
                     packed_size: packed_size_declared,
                     file_len: file_len_u64,
@@ -118,7 +118,7 @@ pub fn parse_library(bytes: Arc<[u8]>, opts: OpenOptions) -> Result<Library> {
             .ok_or(Error::IntegerOverflow)?;
         if available_end > bytes.len() {
             return Err(Error::EntryDataOutOfBounds {
-                id: u32::try_from(idx).expect("entry count validated at parse"),
+                id: u32::try_from(idx).map_err(|_| Error::IntegerOverflow)?,
                 offset: effective_offset_u64,
                 size: packed_size_declared,
                 file_len: file_len_u64,

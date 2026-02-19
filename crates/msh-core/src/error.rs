@@ -1,6 +1,7 @@
 use core::fmt;
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     Nres(nres::error::Error),
     MissingResource {

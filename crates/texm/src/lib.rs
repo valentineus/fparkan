@@ -36,6 +36,7 @@ impl PixelFormat {
         match self {
             Self::Indexed8 => 1,
             Self::Rgb565 | Self::Rgb556 | Self::Argb4444 | Self::LuminanceAlpha88 => 2,
+            // Parkan stores format 888 as 32-bit RGBX in texture payloads.
             Self::Rgb888 | Self::Argb8888 => 4,
         }
     }
@@ -173,14 +174,8 @@ pub fn parse_texm(payload: &[u8]) -> Result<Texture> {
             offset: level_offset,
             size: level_size,
         });
-        w = w.max(1) >> 1;
-        h = h.max(1) >> 1;
-        if w == 0 {
-            w = 1;
-        }
-        if h == 0 {
-            h = 1;
-        }
+        w = (w >> 1).max(1);
+        h = (h >> 1).max(1);
     }
 
     let page_rects = parse_page_tail(payload, offset)?;
@@ -240,7 +235,8 @@ pub fn decode_mip_rgba8(texture: &Texture, payload: &[u8], mip_index: usize) -> 
                     break;
                 }
                 let poff = usize::from(index).saturating_mul(4);
-                if poff + 3 >= palette.len() {
+                // Keep this form to accept the last palette item (index 255).
+                if poff + 4 > palette.len() {
                     continue;
                 }
                 let out = i.saturating_mul(4);

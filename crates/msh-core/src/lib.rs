@@ -164,6 +164,8 @@ pub fn parse_model_payload(payload: &[u8]) -> Result<Model> {
     let positions = parse_positions(&res3.bytes)?;
     let indices = parse_u16_array(&res6.bytes, "Res6")?;
     let batches = parse_batches(&res13.bytes)?;
+    validate_slot_batch_ranges(&slots, batches.len())?;
+    validate_batch_index_ranges(&batches, indices.len())?;
 
     let normals = match res4 {
         Some(raw) => Some(parse_i8x4_array(&raw.bytes, "Res4")?),
@@ -190,6 +192,40 @@ pub fn parse_model_payload(payload: &[u8]) -> Result<Model> {
         batches,
         node_names,
     })
+}
+
+fn validate_slot_batch_ranges(slots: &[Slot], batch_count: usize) -> Result<()> {
+    for slot in slots {
+        let start = usize::from(slot.batch_start);
+        let end = start
+            .checked_add(usize::from(slot.batch_count))
+            .ok_or(Error::IntegerOverflow)?;
+        if end > batch_count {
+            return Err(Error::IndexOutOfBounds {
+                label: "Res2.batch_range",
+                index: end,
+                limit: batch_count,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_batch_index_ranges(batches: &[Batch], index_count: usize) -> Result<()> {
+    for batch in batches {
+        let start = usize::try_from(batch.index_start).map_err(|_| Error::IntegerOverflow)?;
+        let end = start
+            .checked_add(usize::from(batch.index_count))
+            .ok_or(Error::IntegerOverflow)?;
+        if end > index_count {
+            return Err(Error::IndexOutOfBounds {
+                label: "Res13.index_range",
+                index: end,
+                limit: index_count,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn parse_positions(data: &[u8]) -> Result<Vec<[f32; 3]>> {

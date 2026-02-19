@@ -11,6 +11,7 @@ struct Args {
     group: usize,
     width: u32,
     height: u32,
+    fov_deg: f32,
     capture: Option<PathBuf>,
     angle: Option<f32>,
     spin_rate: f32,
@@ -32,6 +33,7 @@ fn parse_args() -> Result<Args, String> {
     let mut group = 0usize;
     let mut width = 1280u32;
     let mut height = 720u32;
+    let mut fov_deg = 60.0f32;
     let mut capture = None;
     let mut angle = None;
     let mut spin_rate = 0.35f32;
@@ -92,6 +94,17 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| String::from("invalid --height value"))?;
                 if height == 0 {
                     return Err(String::from("--height must be > 0"));
+                }
+            }
+            "--fov" => {
+                let value = it
+                    .next()
+                    .ok_or_else(|| String::from("missing value for --fov"))?;
+                fov_deg = value
+                    .parse::<f32>()
+                    .map_err(|_| String::from("invalid --fov value"))?;
+                if !(1.0..=179.0).contains(&fov_deg) {
+                    return Err(String::from("--fov must be in range [1, 179]"));
                 }
             }
             "--capture" => {
@@ -163,6 +176,7 @@ fn parse_args() -> Result<Args, String> {
         group,
         width,
         height,
+        fov_deg,
         capture,
         angle,
         spin_rate,
@@ -176,7 +190,7 @@ fn parse_args() -> Result<Args, String> {
 
 fn print_help() {
     eprintln!(
-        "parkan-render-demo --archive <path> [--model <name.msh>] [--lod N] [--group N] [--width W] [--height H]"
+        "parkan-render-demo --archive <path> [--model <name.msh>] [--lod N] [--group N] [--width W] [--height H] [--fov DEG]"
     );
     eprintln!("                  [--capture <out.png>] [--angle RAD] [--spin-rate RAD_PER_SEC]");
     eprintln!("                  [--texture <name>] [--texture-archive <path>] [--material-archive <path>] [--wear <name.wea>] [--no-texture]");
@@ -202,7 +216,7 @@ fn run(args: Args) -> Result<(), String> {
     let loaded_model = load_model_with_name_from_archive(&args.archive, args.model.as_deref())
         .map_err(|err| {
             format!(
-                "failed to load model from archive {}: {err:?}",
+                "failed to load model from archive {}: {err}",
                 args.archive.display()
             )
         })?;
@@ -289,6 +303,7 @@ fn run(args: Args) -> Result<(), String> {
         vertex_data.push(vertex.uv0[0]);
         vertex_data.push(vertex.uv0[1]);
     }
+    let vertex_bytes = f32_slice_to_ne_bytes(&vertex_data);
 
     let gl = unsafe {
         glow::Context::from_loader_function(|name| video.gl_get_proc_address(name) as *const _)
@@ -306,11 +321,7 @@ fn run(args: Args) -> Result<(), String> {
     let vbo = unsafe { gl.create_buffer().map_err(|e| e.to_string())? };
     unsafe {
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-        gl.buffer_data_u8_slice(
-            glow::ARRAY_BUFFER,
-            cast_slice_u8(&vertex_data),
-            glow::STATIC_DRAW,
-        );
+        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, &vertex_bytes, glow::STATIC_DRAW);
         gl.bind_buffer(glow::ARRAY_BUFFER, None);
     }
 
@@ -388,11 +399,9 @@ fn resolve_texture(args: &Args, model_name: &str) -> Result<Option<LoadedTexture
                 || args.material_archive.is_some()
                 || args.wear.is_some()
             {
-                Err(format!("failed to resolve texture: {err:?}"))
+                Err(format!("failed to resolve texture: {err}"))
             } else {
-                eprintln!(
-                    "warning: auto texture resolve failed ({err:?}), fallback to solid color"
-                );
+                eprintln!("warning: auto texture resolve failed ({err}), fallback to solid color");
                 Ok(None)
             }
         }
@@ -451,7 +460,14 @@ fn run_capture(
     capture_path: &Path,
 ) -> Result<(), String> {
     let angle = args.angle.unwrap_or(0.0);
-    let mvp = compute_mvp(args.width, args.height, center, camera_distance, angle);
+    let mvp = compute_mvp(
+        args.width,
+        args.height,
+        args.fov_deg,
+        center,
+        camera_distance,
+        angle,
+    );
     unsafe {
         draw_frame(
             gl,
@@ -515,7 +531,7 @@ fn run_interactive(
         let angle = args
             .angle
             .unwrap_or(start.elapsed().as_secs_f32() * args.spin_rate);
-        let mvp = compute_mvp(w, h, center, camera_distance, angle);
+        let mvp = compute_mvp(w, h, args.fov_deg, center, camera_distance, angle);
 
         unsafe {
             draw_frame(
@@ -543,12 +559,13 @@ fn run_interactive(
 fn compute_mvp(
     width: u32,
     height: u32,
+    fov_deg: f32,
     center: [f32; 3],
     camera_distance: f32,
     angle_rad: f32,
 ) -> [f32; 16] {
     let aspect = (width as f32 / (height.max(1) as f32)).max(0.01);
-    let proj = mat4_perspective(60.0_f32.to_radians(), aspect, 0.01, camera_distance * 10.0);
+    let proj = mat4_perspective(fov_deg.to_radians(), aspect, 0.01, camera_distance * 10.0);
     let view = mat4_translation(0.0, 0.0, -camera_distance);
     let center_shift = mat4_translation(-center[0], -center[1], -center[2]);
     let rot = mat4_rotation_y(angle_rad);
@@ -733,8 +750,12 @@ void main() {
     Ok(program)
 }
 
-fn cast_slice_u8<T>(slice: &[T]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, std::mem::size_of_val(slice)) }
+fn f32_slice_to_ne_bytes(slice: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(slice.len().saturating_mul(std::mem::size_of::<f32>()));
+    for &value in slice {
+        out.extend_from_slice(&value.to_ne_bytes());
+    }
+    out
 }
 
 fn mat4_identity() -> [f32; 16] {

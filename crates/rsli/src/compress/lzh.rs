@@ -135,7 +135,12 @@ impl<'a> LzhDecoder<'a> {
         let mut node = self.son[LZH_R];
         while node < LZH_T {
             let bit = usize::from(self.bit_reader.read_bit()?);
-            node = self.son[node + bit];
+            let branch = node
+                .checked_add(bit)
+                .ok_or(Error::DecompressionFailed("lzss-huffman tree overflow"))?;
+            node = *self.son.get(branch).ok_or(Error::DecompressionFailed(
+                "lzss-huffman tree out of bounds",
+            ))?;
         }
 
         let c = node - LZH_T;

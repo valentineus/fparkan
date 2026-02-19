@@ -129,3 +129,105 @@ fn compute_bounds_for_mesh_handles_empty_and_non_empty() {
     assert_eq!(bounds.0, [-2.0, -1.0, 0.5]);
     assert_eq!(bounds.1, [1.0, 5.0, 9.0]);
 }
+
+fn nodes_with_slot_refs(slot_ids: &[Option<u16>]) -> Vec<u8> {
+    let mut out = vec![0u8; slot_ids.len().saturating_mul(38)];
+    for (node_index, slot_id) in slot_ids.iter().copied().enumerate() {
+        let node_off = node_index * 38;
+        for i in 0..15 {
+            let off = node_off + 8 + i * 2;
+            out[off..off + 2].copy_from_slice(&u16::MAX.to_le_bytes());
+        }
+        if let Some(slot_id) = slot_id {
+            out[node_off + 8..node_off + 10].copy_from_slice(&slot_id.to_le_bytes());
+        }
+    }
+    out
+}
+
+fn slot(batch_start: u16, batch_count: u16) -> msh_core::Slot {
+    msh_core::Slot {
+        tri_start: 0,
+        tri_count: 0,
+        batch_start,
+        batch_count,
+        aabb_min: [0.0; 3],
+        aabb_max: [0.0; 3],
+        sphere_center: [0.0; 3],
+        sphere_radius: 0.0,
+        opaque: [0; 5],
+    }
+}
+
+fn batch(index_start: u32, index_count: u16, base_vertex: u32) -> msh_core::Batch {
+    msh_core::Batch {
+        batch_flags: 0,
+        material_index: 0,
+        opaque4: 0,
+        opaque6: 0,
+        index_count,
+        index_start,
+        opaque14: 0,
+        base_vertex,
+    }
+}
+
+#[test]
+fn build_render_mesh_handles_empty_slot_model() {
+    let model = msh_core::Model {
+        node_stride: 38,
+        node_count: 1,
+        nodes_raw: nodes_with_slot_refs(&[None]),
+        slots: Vec::new(),
+        positions: vec![[0.0, 0.0, 0.0]],
+        normals: None,
+        uv0: None,
+        indices: Vec::new(),
+        batches: Vec::new(),
+        node_names: None,
+    };
+
+    let mesh = build_render_mesh(&model, 0, 0);
+    assert!(mesh.vertices.is_empty());
+    assert_eq!(mesh.batch_count, 0);
+    assert_eq!(mesh.triangle_count(), 0);
+}
+
+#[test]
+fn build_render_mesh_supports_multi_node_and_uv_scaling() {
+    let model = msh_core::Model {
+        node_stride: 38,
+        node_count: 2,
+        nodes_raw: nodes_with_slot_refs(&[Some(0), Some(1)]),
+        slots: vec![slot(0, 1), slot(1, 1)],
+        positions: vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [3.0, 0.0, 0.0],
+            [2.0, 1.0, 0.0],
+        ],
+        normals: None,
+        uv0: Some(vec![
+            [1024, -1024],
+            [512, 256],
+            [0, 0],
+            [1024, 1024],
+            [2048, 1024],
+            [1024, 0],
+        ]),
+        indices: vec![0, 1, 2, 0, 1, 2],
+        batches: vec![batch(0, 3, 0), batch(3, 3, 3)],
+        node_names: None,
+    };
+
+    let mesh = build_render_mesh(&model, 0, 0);
+    assert_eq!(mesh.batch_count, 2);
+    assert_eq!(mesh.vertices.len(), 6);
+    assert_eq!(mesh.triangle_count(), 2);
+    assert_eq!(mesh.vertices[0].uv0, [1.0, -1.0]);
+    assert_eq!(mesh.vertices[1].uv0, [0.5, 0.25]);
+    assert_eq!(mesh.vertices[2].uv0, [0.0, 0.0]);
+    assert_eq!(mesh.vertices[3].uv0, [1.0, 1.0]);
+}

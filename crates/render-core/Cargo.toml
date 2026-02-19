@@ -5,4 +5,6 @@ edition = "2021"
 
 [dependencies]
 msh-core = { path = "../msh-core" }
+
+[dev-dependencies]
 nres = { path = "../nres" }
