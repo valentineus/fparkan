@@ -1,0 +1,20 @@
+[package]
+name = "render-demo"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+demo = ["dep:sdl2", "dep:glow"]
+
+[dependencies]
+msh-core = { path = "../msh-core" }
+nres = { path = "../nres" }
+render-core = { path = "../render-core" }
+sdl2 = { version = "0.37", optional = true, default-features = false, features = ["bundled", "static-link"] }
+glow = { version = "0.16", optional = true }
+
+[[bin]]
+name = "parkan-render-demo"
+path = "src/main.rs"
+required-features = ["demo"]

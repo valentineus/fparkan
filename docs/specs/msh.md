@@ -6,11 +6,13 @@
 
 1. [MSH core](msh-core.md) — геометрия, узлы, батчи, LOD, slot-матрица.
 2. [MSH animation](msh-animation.md) — `Res8`, `Res19`, выбор ключей и интерполяция.
-3. [Materials + Texm](materials-texm.md) — материалы, текстуры, палитры, `WEAR`, `LIGHTMAPS`, `Texm`.
-4. [FXID](fxid.md) — контейнер эффекта и команды runtime-потока.
-5. [Terrain + map loading](terrain-map-loading.md) — ландшафт, шейдинг и привязка к миру.
-6. [Runtime pipeline](runtime-pipeline.md) — межмодульное поведение движка в кадре.
-7. [3D implementation notes](msh-notes.md) — контрольные заметки, декодирование и открытые вопросы.
+3. [Material (`MAT0`)](material.md) — формат материала и фазовая анимация.
+4. [Wear (`WEAR`)](wear.md) — текстовая таблица привязки материалов/lightmap.
+5. [Texture (`Texm`)](texture.md) — форматы текстур, mip-chain и `Page`.
+6. [FXID](fxid.md) — контейнер эффекта и поток команд.
+7. [Render pipeline](render.md) — полный процесс рендера кадра.
+8. [Terrain + map loading](terrain-map-loading.md) — ландшафт, шейдинг и привязка к миру.
+9. [3D implementation notes](msh-notes.md) — контрольные заметки и открытые вопросы.
 
 ## Связанные спецификации
 

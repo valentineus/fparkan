@@ -1,0 +1,8 @@
+[package]
+name = "render-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+msh-core = { path = "../msh-core" }
+nres = { path = "../nres" }
