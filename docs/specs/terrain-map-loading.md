@@ -1,170 +1,111 @@
-# Terrain + map loading
+# Terrain + ArealMap
 
-Документ описывает полный runtime-пайплайн загрузки ландшафта и карты (`Terrain.dll` + `ArealMap.dll`) и требования к toolchain для 1:1 совместимости (чтение, конвертация, редактирование, обратная сборка).
+Документ описывает подсистему ландшафта и ареалов мира в движке Parkan: Iron Strategy:
 
-Источник реверса:
+- `Land.msh` (terrain-геометрия и вспомогательные таблицы);
+- `Land.map` (ареалы и навигационные связи);
+- `BuildDat.lst` (категории объектных зон).
 
-- `tmp/disassembler1/Terrain.dll.c`
-- `tmp/disassembler1/ArealMap.dll.c`
-- `tmp/disassembler2/Terrain.dll.asm`
-- `tmp/disassembler2/ArealMap.dll.asm`
+Описание дано в высокоуровневом переносимом виде, без ссылок на внутренние адреса и имена из дизассемблера.
 
-Связанные спецификации:
+Связанные страницы:
 
-- [NRes / RsLi](nres.md)
+- [NRes](nres.md)
+- [RsLi](rsli.md)
 - [MSH core](msh-core.md)
-- [ArealMap](arealmap.md)
+- [Render pipeline](render.md)
 
----
+## 1. End-to-End загрузка уровня
 
-## 1. Назначение подсистем
+Для каждой карты движок загружает пару файлов:
 
-### 1.1. `Terrain.dll`
+- `.../Land.msh`
+- `.../Land.map`
 
-Отвечает за:
+Высокоуровневый порядок:
 
-- загрузку и хранение terrain-геометрии из `*.msh` (NRes);
-- фильтрацию и выборку треугольников для коллизий/трассировки/рендера;
-- рендер terrain-примитивов и связанного shading;
-- использование микро-текстурного канала (chunk type 18).
+1. Открыть `Land.msh` как `NRes`.
+2. Прочитать обязательные terrain-chunk'и.
+3. Построить runtime-структуры terrain (slots, faces, spatial grid).
+4. Открыть `Land.map` как `NRes`.
+5. Найти единственный chunk `type=12`.
+6. Прочитать ареалы, их связи и cell-grid.
+7. Применить инициализацию объектных категорий из `BuildDat.lst`.
 
-Характерные runtime-строки:
+## 2. Формат `Land.msh`
 
-- `CLandscape::CLandscape()`
-- `Unable to find microtexture mapping chunk`
-- `Rendering empty primitive!`
-- `Rendering empty primitive2!`
+`Land.msh` — обычный `NRes` архив с фиксированным набором terrain-ресурсов.
 
-### 1.2. `ArealMap.dll`
+## 2.1. Состав chunk'ов
 
-Отвечает за:
+Обязательные типы:
 
-- загрузку геометрии ареалов из `*.map` (NRes, chunk type 12);
-- построение связей "ареал <-> соседи/подграфы";
-- grid-ускорение по ячейкам карты;
-- runtime-доступ к `ISystemArealMap` (интерфейс id `770`) и ареалам (id `771`).
+- `1`, `2`, `3`, `4`, `5`, `11`, `18`, `21`
 
-Характерные runtime-строки:
+Опциональные типы:
 
-- `SystemArealMap panic: Cannot load ArealMapGeometry`
-- `SystemArealMap panic: Cannot find chunk in resource`
-- `SystemArealMap panic: ArealMap Cells are empty`
-- `SystemArealMap panic: Incorrect ArealMap`
+- `14`
 
----
+Наблюдаемый retail-порядок chunk'ов:
 
-## 2. End-to-End загрузка уровня
-
-### 2.1. Имена файлов уровня
-
-В `CLandscape::CLandscape()` базовое имя уровня `levelBase` разворачивается в:
-
-- `levelBase + ".msh"`: terrain-геометрия;
-- `levelBase + ".map"`: геометрия ареалов/навигация;
-- `levelBase + "1.wea"` и `levelBase + "2.wea"`: weather/материалы.
-
-### 2.2. Порядок инициализации (высокоуровнево)
-
-1. Получение `3DRender` и `3DSound`.
-2. Загрузка `MatManager` (`*.wea`), `LightManager`, `CollManager`, `FxManager`.
-3. Создание `SystemArealMap` через `CreateSystemArealMap(..., "<level>.map", ...)`.
-4. Открытие terrain-библиотеки `niOpenResFile("<level>.msh")`.
-5. Загрузка terrain-chunk-ов (см. §3).
-6. Построение runtime-границ, grid-ускорителей и рабочих массивов.
-
-Критичные ошибки на любом шаге приводят к `ngiProcessError`/panic.
-
----
-
-## 3. Формат terrain `*.msh` (NRes)
-
-### 3.1. Используемые chunk type в `Terrain.dll`
-
-Порядок загрузки в `CLandscape::CLandscape()`:
-
-| Порядок | Type | Обяз. | Использование (подтверждено кодом) |
-|---|---:|---|---|
-| 1 | 3 | да | поток позиций (`stride = 12`) |
-| 2 | 4 | да | поток packed normal (`stride = 4`) |
-| 3 | 5 | да | UV-поток (`stride = 4`) |
-| 4 | 18 | да | microtexture mapping (`stride = 4`) |
-| 5 | 14 | нет | опциональный доп. поток (`stride = 4`, отсутствует на части карт) |
-| 6 | 21 | да | таблица terrain-face (по 28 байт) |
-| 7 | 2 | да | header + slot-таблицы (используются диапазоны face) |
-| 8 | 1 | да | node/grid-таблица (stride 38) |
-| 9 | 11 | да | доп. индекс/ускоритель для запросов (cell->list) |
-
-Ключевые проверки:
-
-- отсутствие type `18` вызывает `Unable to find microtexture mapping chunk`;
-- отсутствие остальных обязательных чанков вызывает `Unable to open file`.
-
-### 3.2. Node/slot структура для terrain
-
-Terrain-код использует те же stride и адресацию, что и core-описание:
-
-- node-запись: `38` байт;
-- slot-запись: `68` байт;
-- доступ к первому slot-index: `node + 8`;
-- tri-диапазон в slot: `slot + 140` (offset 0 внутри slot), `slot + 142` (offset 2).
-
-Это согласуется с [MSH core](msh-core.md) для `Res1/Res2`:
-
-- `Res1`: `uint16[19]` на node;
-- `Res2`: header + slot table (`0x8C + N * 0x44`).
-
-### 3.3. Terrain face record (type 21, 28 bytes)
-
-Подтвержденные поля из runtime-декодирования face:
-
-```c
-struct TerrainFace28 {
-    uint32_t flags;        // +0
-    uint8_t  materialId;   // +4 (читается как byte)
-    uint8_t  auxByte;      // +5
-    uint16_t unk06;        // +6
-    uint16_t i0;           // +8  (индекс вершины)
-    uint16_t i1;           // +10
-    uint16_t i2;           // +12
-    uint16_t n0;           // +14 (сосед, 0xFFFF -> нет)
-    uint16_t n1;           // +16
-    uint16_t n2;           // +18
-    int16_t  nx;           // +20 packed normal component
-    int16_t  ny;           // +22
-    int16_t  nz;           // +24
-    uint8_t  edgeClass;    // +26 (три 2-бит значения)
-    uint8_t  unk27;        // +27
-};
+```text
+[1, 2, 3, 4, 5, 18, 14, 11, 21]
 ```
 
-`edgeClass` декодируется как:
+## 2.2. Stride и атрибуты
 
-- `edge0 = byte26 & 0x3`
-- `edge1 = (byte26 >> 2) & 0x3`
-- `edge2 = (byte26 >> 4) & 0x3`
+| Type | Назначение | Stride |
+|---:|---|---:|
+| 1 | node/slot матрица | 38 |
+| 3 | позиции вершин | 12 |
+| 4 | нормали (packed) | 4 |
+| 5 | UV (packed) | 4 |
+| 11 | cell-ускоритель | 4 |
+| 14 | доп. поток | 4 |
+| 18 | доп. поток | 4 |
+| 21 | terrain face | 28 |
 
-### 3.4. Маски флагов face
+Общее правило для этих chunk'ов:
 
-Во многих запросах применяется фильтр:
+- `attr1 == size / stride`
+- `attr3 == stride`
 
-```c
-(faceFlags & requiredMask) == requiredMask &&
-(faceFlags | ~forbiddenMask) == ~forbiddenMask
-```
+## 2.3. Type `2`: slot table
 
-Эквивалентно: "все required-биты выставлены, forbidden-биты отсутствуют".
+`type=2` содержит:
 
-Подтверждено активное использование битов:
+- заголовок `0x8C` байт;
+- затем таблицу slots по `68` байт.
 
-- `0x8` (особая обработка в трассировке)
-- `0x2000`
-- `0x20000`
-- `0x100000`
-- `0x200000`
+Инварианты:
 
-Кроме "полной" 32-бит маски, runtime использует компактные маски в API-запросах.
+- `size >= 0x8C`
+- `(size - 0x8C) % 68 == 0`
+- `attr1 == (size - 0x8C) / 68`
+- `attr3 == 68`
 
-Подтверждённый remap `full -> compactMain16` (функции `sub_10013FC0`, `sub_1004BA00`, `sub_1004BB40`):
+## 2.4. Type `21`: terrain face (28 байт)
+
+Высокоуровневая структура face:
+
+- флаги face;
+- индексы треугольника (`i0, i1, i2`);
+- индексы соседей (`n0, n1, n2`, значение `0xFFFF` = нет соседа);
+- служебные поля (материал/класс/edge-поля и др.).
+
+Критичные проверки:
+
+- `i0/i1/i2 < vertex_count` (`type=3`);
+- `nX == 0xFFFF` или `nX < face_count`.
+
+## 2.5. Маски face и compact-представления
+
+В рантайме используются:
+
+- полная 32-битная маска (`full`);
+- компактные представления (`compactMain16`, `compactMaterial6`).
+
+Подтвержденный remap `full -> compactMain16`:
 
 | Full bit | Compact bit |
 |---:|---:|
@@ -184,7 +125,7 @@ struct TerrainFace28 {
 | `0x00000040` | `0x2000` |
 | `0x00200000` | `0x8000` |
 
-Подтверждённый remap `full -> compactMaterial6` (функции `sub_10014090`, `sub_10015540`, `sub_1004BB40`):
+Подтвержденный remap `full -> compactMaterial6`:
 
 | Full bit | Compact bit |
 |---:|---:|
@@ -195,180 +136,99 @@ struct TerrainFace28 {
 | `0x00080000` | `0x10` |
 | `0x00000080` | `0x20` |
 
-Подтверждённый remap `compact -> full` (функция `sub_10015680`):
+Для 1:1 реализации нужно поддерживать оба представления и обратное восстановление `compact -> full`.
 
-- `a2[4]`/`a2[5]` (compactMain16 required/forbidden) + `a2[6]`/`a2[7]` (compactMaterial6 required/forbidden)
-- разворачиваются в `fullRequired/fullForbidden` в `this[4]/this[5]`.
+## 2.6. Type `11` и cell-ускоритель terrain
 
-Для toolchain это означает:
+`type=11` служит источником cell-ускорителя для terrain-запросов.
 
-- если редактируется только бинарник `type 21`, достаточно сохранять `flags` как есть;
-- если реализуется API-совместимый runtime-слой, нужно поддерживать оба представления (`full` и `compact`) и точный remap выше.
+Практические требования для editor/toolchain:
 
-### 3.5. Grid-ускоритель terrain-запросов
+- не переупорядочивать содержимое без полного пересчета зависимых таблиц;
+- сохранять служебные/неизвестные поля побайтно;
+- выполнять валидацию диапазонов face/slot после любых правок.
 
-Runtime строит grid descriptor с параметрами:
+## 3. Формат `Land.map` (chunk `type=12`)
 
-- origin (`baseX/baseY`);
-- масштабные коэффициенты (`invSizeX/invSizeY`);
-- размеры сетки (`cellsX`, `cellsY`).
+`Land.map` — `NRes`, содержащий ровно один ресурс `type=12`.
 
-Дальше запросы:
+Контракт верхнего уровня:
 
-1. переводят world AABB в диапазон grid-ячеек (`floor(...)`);
-2. берут диапазон face через `Res1/Res2` (slot `triStart/triCount`);
-3. дополняют кандидаты из cell-списков (chunk type 11);
-4. применяют маски флагов;
-5. выполняют геометрию (plane/intersection/point-in-triangle).
+- `entry.attr1` = `areal_count`;
+- payload включает:
+  - `areal_count` переменных записей ареалов;
+  - затем grid-секцию cell-попаданий.
 
-### 3.6. Cell-списки по ячейкам (`type 11` и runtime-массивы)
+## 3.1. Запись ареала
 
-В `CLandscape` после инициализации используются три параллельных массива по ячейкам (`cellsX * cellsY`):
-
-- `this+31588` (`sub_100164B0` ctor): массив записей по `12` байт, каждая запись содержит динамический буфер `8`-байтовых элементов;
-- `this+31592` (`sub_100164E0` ctor): массив записей по `12` байт, каждая запись содержит динамический буфер `4`-байтовых элементов;
-- `this+31596` (`sub_1001F880` ctor): массив записей по `12` байт для runtime-объектов/агентов (буфер `4`-байтовых идентификаторов/указателей).
-
-Общий header записи списка:
+Старт записи:
 
 ```c
-struct CellListHdr {
-    void* ptr;      // +0
-    int   count;    // +4
-    int   capacity; // +8
-};
+float    anchor_x;      // +0
+float    anchor_y;      // +4
+float    anchor_z;      // +8
+float    reserved_12;   // +12
+float    area_metric;   // +16
+float    normal_x;      // +20
+float    normal_y;      // +24
+float    normal_z;      // +28
+uint32_t logic_flag;    // +32
+uint32_t reserved_36;   // +36
+uint32_t class_id;      // +40
+uint32_t reserved_44;   // +44
+uint32_t vertex_count;  // +48
+uint32_t poly_count;    // +52
 ```
 
-Подтвержденные element-layout:
+Далее:
 
-- `this+31588`: элемент `8` байт (`uint32_t id`, `uint32_t aux`), добавление через `sub_10012E20` пишет `aux = 0`;
-- `this+31592`: элемент `4` байта (`uint32_t id`);
-- `this+31596`: элемент `4` байта (runtime object handle/pointer id).
+1. `float3 vertices[vertex_count]`
+2. `EdgeLink8 links[vertex_count + 3 * poly_count]`, где
+   `EdgeLink8 = { int32 area_ref; int32 edge_ref; }`
+3. для каждого полигона block:
+   - `uint32 n`
+   - `4 * (3*n + 1)` байт данных полигона
 
-Практический вывод для редактора:
+## 3.2. Семантика edge-link
 
-- `type 11` должен считаться источником cell-ускорителя;
-- неизвестные/дополнительные поля внутри списков должны сохраняться как есть;
-- нельзя "нормализовать" или переупорядочивать списки без полного пересчёта всех зависимых runtime-структур.
+Для `links[0 .. vertex_count-1]`:
 
----
+- `(-1, -1)` означает «соседа нет»;
+- иначе `area_ref` указывает на индекс соседнего ареала, `edge_ref` — на ребро в соседнем ареале.
 
-## 4. Формат `*.map` (ArealMapGeometry, chunk type 12)
+## 3.3. Grid-секция после ареалов
 
-### 4.1. Точка входа
-
-`CreateSystemArealMap(..., "<level>.map", ...)` вызывает `sub_1001E0D0`:
-
-1. `niOpenResFile("<level>.map")`;
-2. поиск chunk type `12`;
-3. чтение chunk-данных;
-4. разбор `ArealMapGeometry`.
-
-При ошибках выдаются panic-строки `SystemArealMap panic: ...`.
-
-### 4.2. Верхний уровень chunk 12
-
-Используются:
-
-- `entry.attr1` (из каталога NRes) как `areal_count`;
-- `entry[+0x0C]` как размер payload chunk для контроля полного разбора.
-
-Данные chunk:
-
-1. `areal_count` переменных записей ареалов;
-2. секция grid-ячеек (`cellsX/cellsY` + списки попаданий).
-
-### 4.3. Переменная запись ареала
-
-Полностью подтверждённые элементы layout:
+Формат:
 
 ```c
-// record = начало записи ареала
-float    anchor_x      = *(float*)(record + 0);
-float    anchor_y      = *(float*)(record + 4);
-float    anchor_z      = *(float*)(record + 8);
-float    reserved_12   = *(float*)(record + 12);        // в retail-данных всегда 0
-float    area_metric   = *(float*)(record + 16);        // предрасчитанная площадь ареала
-float    normal_x      = *(float*)(record + 20);
-float    normal_y      = *(float*)(record + 24);
-float    normal_z      = *(float*)(record + 28);        // unit vector (|n| ~= 1)
-uint32_t logic_flag    = *(uint32_t*)(record + 32);     // активно используется в runtime
-uint32_t reserved_36   = *(uint32_t*)(record + 36);     // в retail-данных всегда 0
-uint32_t class_id      = *(uint32_t*)(record + 40);     // runtime-class/type id ареала
-uint32_t reserved_44   = *(uint32_t*)(record + 44);     // в retail-данных всегда 0
-uint32_t vertex_count = *(uint32_t*)(record + 48);
-uint32_t poly_count   = *(uint32_t*)(record + 52);
-float*   vertices     = (float*)(record + 56);          // float3[vertex_count]
-
-// сразу после vertices:
-// EdgeLink8[vertex_count + 3*poly_count]
-// где EdgeLink8 = { int32_t area_ref; int32_t edge_ref; }
-// первые vertex_count записей используются как per-edge соседство границы ареала.
-EdgeLink8* links = (EdgeLink8*)(record + 56 + 12 * vertex_count);
-
-uint8_t* p = (uint8_t*)(links + (vertex_count + 3 * poly_count));
-for (i=0; i<poly_count; i++) {
-    uint32_t n = *(uint32_t*)p;
-    p += 4 * (3*n + 1);
-}
-// p -> начало следующей записи ареала
-```
-
-То есть для toolchain:
-
-- поля `+0/+4/+8`, `+16`, `+20..+28`, `+32`, `+40`, `+48`, `+52` являются runtime-значимыми;
-- для `links[0..vertex_count-1]` подтверждена интерпретация как `(area_ref, edge_ref)`:
-  - `area_ref == -1 && edge_ref == -1` = нет соседа;
-  - иначе `area_ref` указывает на индекс ареала, `edge_ref` — на индекс ребра в целевом ареале;
-- при редактировании безопасно работать через parser+writer этой формулы;
-- неизвестные байты внутри записи должны сохраняться без изменений.
-
-Дополнительно по runtime-поведению:
-
-- `anchor_x/anchor_y` валидируются на попадание внутрь полигона; при промахе движок делает случайный re-seed позиции (см. §4.5);
-- `logic_flag` по смещению `+32` используется как gating-условие в логике `SystemArealMap`.
-
-### 4.4. Секция grid-ячеек в chunk 12
-
-После массива ареалов идёт:
-
-```c
-uint32_t cellsX;
-uint32_t cellsY;
-for (x in 0..cellsX-1) {
-    for (y in 0..cellsY-1) {
-        uint16_t hitCount;
-        uint16_t areaIds[hitCount];
+uint32 cellsX;
+uint32 cellsY;
+for (x=0; x<cellsX; x++) {
+    for (y=0; y<cellsY; y++) {
+        uint16 hitCount;
+        uint16 areaIds[hitCount];
     }
 }
 ```
 
-Runtime упаковывает метаданные ячейки в `uint32`:
+В runtime существует упакованное cell-meta представление:
 
-- high 10 bits: `hitCount` (`value >> 22`);
-- low 22 bits: `startIndex` (1-based индекс в общем `uint16`-пуле areaIds).
+- high 10 бит: `hitCount`;
+- low 22 бита: `startIndex` (в общем `areaIds` пуле).
 
-Контроль целостности:
+## 3.4. Валидация целостности chunk 12
 
-- после разбора `ptr_end - chunk_begin` должен строго совпасть с `entry[+0x0C]`;
-- иначе `SystemArealMap panic: Incorrect ArealMap`.
+Обязательные проверки:
 
-### 4.5. Нормализация геометрии при загрузке
+- `areal_count > 0`;
+- `cellsX > 0 && cellsY > 0`;
+- каждый `area_id` из cell-списков `< areal_count`;
+- все `area_ref/edge_ref` валидны относительно целевых ареалов;
+- полный объем прочитанных байт должен точно совпасть с размером payload.
 
-Если опорная точка ареала не попадает внутрь его полигона:
+## 4. `BuildDat.lst`
 
-- до 100 попыток случайного сдвига в радиусе ~30;
-- затем до 200 попыток в радиусе ~100.
-
-Это runtime-correction; для 1:1-офлайн инструментов лучше генерировать валидные данные, чтобы не зависеть от недетерминизма `rand()`.
-
----
-
-## 5. `BuildDat.lst` и объектные категории ареалов
-
-`ArealMap.dll` инициализирует 12 категорий и читает `BuildDat.lst`.
-
-Хардкод-категории (имя -> mask):
+Используются 12 объектных категорий ареалов:
 
 | Имя | Маска |
 |---|---:|
@@ -385,127 +245,49 @@ Runtime упаковывает метаданные ячейки в `uint32`:
 | `Tower_Medium` | `0x80100000` |
 | `Tower_Large` | `0x80200000` |
 
-Файл `BuildDat.lst` парсится секционно; при сбое формата используется panic `BuildDat.lst is corrupted`.
+Файл должен парситься строго секционно; поврежденный формат считается ошибкой.
 
----
+## 5. Требования к reader/writer/editor
 
-## 6. Требования к toolchain (конвертер/ридер/редактор)
+1. Сохранять порядок и бинарную форму chunk'ов, если не выполняется осознанная нормализация.
+2. Все неизвестные поля хранить и писать побайтно (`preserve-as-is`).
+3. После правок пересчитывать только вычислимые поля, не «чистить» opaque-данные.
+4. Проверять диапазоны индексов между связанными таблицами (`nodes/slots/faces/vertices/areas/cells`).
+5. Для неизмененных ресурсов обеспечивать byte-identical roundtrip.
 
-### 6.1. Общие принципы 1:1
+## 6. Эмпирическая верификация (retail)
 
-1. Никаких "переупорядочиваний по вкусу": сохранять порядок chunk-ов, если не требуется явная нормализация.
-2. Все неизвестные поля сохранять побайтно.
-3. При roundtrip обеспечивать byte-identical для неизмененных сущностей.
-4. Валидации должны повторять runtime-ожидания (размеры, count-формулы, обязательность chunk-ов).
+Валидация на `testdata/Parkan - Iron Strategy`:
 
-### 6.2. Для terrain `*.msh`
+- карт: `33`
+- `Land.msh`: `33/33` валидны
+- `Land.map`: `33/33` валидны
+- `issues_total = 0`, `errors_total = 0`, `warnings_total = 0`
 
-Обязательные проверки:
+Подтвержденные наблюдения:
 
-- наличие chunk types `1,2,3,4,5,11,18,21`;
-- type `14` опционален;
-- для `type 2`: `size >= 0x8C`, `(size - 0x8C) % 68 == 0`, `attr1 == (size - 0x8C) / 68`;
-- `type21_size % 28 == 0`;
-- индексы `i0/i1/i2` в `TerrainFace28` не выходят за `vertex_count` (type 3);
-- `slot.triStart + slot.triCount` не выходит за `face_count`.
+- `Land.msh` порядок chunk'ов стабилен: `[1,2,3,4,5,18,14,11,21]`;
+- `Land.map` всегда содержит один chunk `type=12`;
+- `cellsX == cellsY == 128` во всех retail-картах;
+- `poly_count == 0` во всем проверенном retail-корпусе;
+- `normal` имеет длину ~1.0;
+- `reserved_12`, `reserved_36`, `reserved_44` в retail наблюдаются как `0`.
 
-Сериализация:
-
-- `flags`, соседи, `edgeClass`, material байты в `TerrainFace28` сохранять как есть;
-- содержимое `type 11`-derived cell-списков (`id`, `aux`) сохранять без "починки";
-- для packed normal не делать "улучшений" нормализации, если цель 1:1.
-
-### 6.3. Для `*.map` (chunk 12)
-
-Обязательные проверки:
-
-- chunk type `12` существует;
-- `areal_count > 0`;
-- `cellsX > 0 && cellsY > 0`;
-- `|normal_x,normal_y,normal_z| ~= 1` для каждого ареала;
-- `links[0..vertex_count-1]` валидны (`-1/-1` или корректные `(area_ref, edge_ref)`);
-- полный consumed-bytes строго равен `entry[+0x0C]`.
-
-При редактировании:
-
-- перестраивать только то, что действительно изменено;
-- пересчитывать cell-списки и packed `cellMeta` синхронно;
-- сохранять неизвестные части записи ареала без изменений.
-
-### 6.4. Рекомендуемая архитектура редактора
-
-1. `Parser`:
-   - NRes-слой;
-   - `TerrainMsh`-слой;
-   - `ArealMapChunk12`-слой.
-2. `Model`:
-   - явные известные поля;
-   - `raw_unknown` для непросаженных блоков.
-3. `Writer`:
-   - стабильная сериализация;
-   - проверка контрольных инвариантов перед записью.
-4. `Verifier`:
-   - roundtrip hash/byte-compare;
-   - runtime-совместимые asserts.
-
----
-
-## 7. Практический чеклист "движок 1:1"
-
-Для runtime-совместимого движка нужно реализовать:
-
-1. NRes API-уровень (`niOpenResFile`, `niOpenResInMem`, поиск chunk по type, получение data/attrs).
-2. `CLandscape` пайплайн загрузки `*.msh` + менеджеров + `CreateSystemArealMap`.
-3. Terrain face decode (28-byte запись), mask-фильтр, spatial grid queries.
-4. Загрузчик `ArealMapGeometry` (chunk 12) с той же валидацией и packed-cell логикой.
-5. Пост-обработку ареалов (пересвязка, корректировки опорных точек).
-6. Поддержку `BuildDat.lst` для объектных категорий/схем.
-
----
-
-## 8. Нерасшифрованные зоны (важно для редакторов)
-
-Ниже поля, которые пока нельзя безопасно "пересобирать по смыслу":
-
-- семантика `class_id` (`record + 40`) на уровне геймдизайна/скриптов (числовое поле подтверждено, но человекочитаемая таблица соответствий не восстановлена полностью);
-- ветки формата для `poly_count > 0` (в retail `tmp/gamedata` это всегда `0`, поэтому поведение этих веток подтверждено только по коду, без живых образцов);
-- человекочитаемая семантика части битов `TerrainFace28.flags` (при этом remap и бинарные значения подтверждены);
-- семантика поля `aux` во `8`-байтовом элементе cell-списка (`this+31588`, второй `uint32_t`), которое в известных runtime-путях инициализируется нулем.
-
-Правило до полного реверса: `preserve-as-is`.
-
----
-
-## 9. Эмпирическая верификация (retail `tmp/gamedata`)
-
-Для массовой проверки спецификации добавлен валидатор:
+Инструмент:
 
 - `tools/terrain_map_doc_validator.py`
 
-Запуск:
+## 7. Статус покрытия и что осталось до 100%
 
-```bash
-python3 tools/terrain_map_doc_validator.py \
-  --maps-root tmp/gamedata/DATA/MAPS \
-  --report-json tmp/terrain_map_doc_validator.report.json
-```
+Закрыто:
 
-Проверенные инварианты (на 33 картах, 2026-02-12):
+- бинарный контракт `Land.msh` и `Land.map`;
+- диапазонные и структурные инварианты;
+- remap масок `full/compact`;
+- валидация на полном retail-корпусе карт.
 
-- `Land.msh`:
-  - порядок chunk-ов всегда `[1,2,3,4,5,18,14,11,21]`;
-  - `type11` первые dword всегда `[5767168, 4718593]`;
-  - `type21` индексы вершин/соседей валидны;
-  - `type2` slot-таблица валидна по формуле `0x8C + 68*N`.
-- `Land.map`:
-  - всегда один chunk `type 12`;
-  - `cellsX == cellsY == 128` на всех картах;
-  - `poly_count == 0` для всех `34662` записей ареалов в retail-наборе;
-  - `record+12`, `record+36`, `record+44` всегда `0`;
-  - `area_metric` (`record+16`) стабильно коррелирует с площадью XY-полигона (макс. абсолютное отклонение `51.39`, макс. относительное `14.73%`, `18` кейсов > `5%`);
-  - `normal` в `record+20..28` всегда unit (диапазон длины `0.9999998758..1.0000001194`);
-  - link-таблицы `EdgeLink8` проходят строгую валидацию ссылочной целостности.
+Осталось до полного 100% архитектурного покрытия движка:
 
-Сводный результат текущего набора данных:
-
-- `issues_total = 0`, `errors_total = 0`, `warnings_total = 0`.
+1. Полная доменная семантика `class_id` и `logic_flag` (игровые значения/поведенческие правила).
+2. Полная спецификация ветки `poly_count > 0` на живых данных (в retail не встречена).
+3. Полная field-level семантика части битов `TerrainFace28.flags` (бинарный контракт и remap закрыты, но не все биты имеют документированные геймплейные имена).

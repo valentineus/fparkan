@@ -9,7 +9,8 @@
 - [Material](material.md)
 - [Texture (Texm)](texture.md)
 - [Render pipeline](render.md)
-- [NRes / RsLi](nres.md)
+- [NRes](nres.md)
+- [RsLi](rsli.md)
 
 ## 1. Общая модель
 
@@ -174,5 +175,19 @@ for each node:
 ## 8. Статус валидации
 
 - Инварианты формата реализованы в `tools/msh_doc_validator.py`.
-- В текущем окружении нет загруженного полного корпуса игровых MSH в `testdata`, поэтому массовый прогон по ассетам здесь не выполнялся.
+- На полном retail-корпусе `testdata/Parkan - Iron Strategy` проверено `435/435` MSH-моделей без структурных ошибок.
+
+## 9. Статус покрытия и что осталось до 100%
+
+Закрыто:
+
+1. Базовые таблицы geometry path (`Res1/2/3/4/5/6/7/13`).
+2. Критичные range-инварианты slot/batch/index.
+3. Правила совместимого writer/editor для lossless работы с существующими ассетами.
+
+Осталось:
+
+1. Полная семантика части opaque-полей (`Slot68` tail, `Batch20` opaque-поля) для authoring без copy-through.
+2. Полная формализация редких веток (`Res1.attr3 != 38`) на расширенном корпусе.
+3. End-to-end writer для генерации новых игровых MSH с подтвержденным runtime-паритетом.
 

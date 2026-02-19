@@ -151,5 +151,19 @@ void RenderFrame(Scene* scene, Camera* cam, float dt) {
 
 ## 10. Статус валидации
 
-- Порядок кадра и подключение `Material.lib / Textures.lib / LightMap.lib` подтверждены текущим runtime-кодом приложения и импортами движковых DLL.
+- Порядок кадра и подключение `Material.lib / Textures.lib / LightMap.lib` подтверждены текущей runtime-валидацией проекта.
 - Детальные инварианты форматов зафиксированы в `tools/msh_doc_validator.py` и `tools/fxid_abs100_audit.py`.
+
+## 11. Статус покрытия и что осталось до 100%
+
+Закрыто:
+
+1. Высокоуровневый кадр: simulation -> animation -> culling -> material/texture resolve -> mesh draw -> fx -> ui -> present.
+2. Связка MSH/MAT0/WEAR/Texm/FXID в едином runtime-процессе.
+3. Форматная валидация входных данных на полном retail-корпусе.
+
+Осталось:
+
+1. Полный pixel-parity контур с эталонными кадрами оригинального рендера по набору моделей/сцен.
+2. Формализация всех render-state деталей (точные blend/depth/cull/state transitions) для гарантии 1:1 в каждом draw-pass.
+3. Полный coverage-пакет по динамическим веткам (FX-heavy кадры, сложные material-режимы, lightmap-комбинации).
