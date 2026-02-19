@@ -1,6 +1,7 @@
 pub mod error;
 
 use crate::error::Error;
+use encoding_rs::WINDOWS_1251;
 use std::sync::Arc;
 
 pub type Result<T> = core::result::Result<T, Error>;
@@ -347,11 +348,16 @@ fn parse_res10_names(data: &[u8], node_count: usize) -> Result<Vec<Option<String
         } else {
             slice
         };
-        let decoded = String::from_utf8_lossy(text).to_string();
+        let decoded = decode_cp1251(text);
         out.push(Some(decoded));
         off = end;
     }
     Ok(out)
+}
+
+fn decode_cp1251(bytes: &[u8]) -> String {
+    let (decoded, _, _) = WINDOWS_1251.decode(bytes);
+    decoded.into_owned()
 }
 
 struct RawResource {

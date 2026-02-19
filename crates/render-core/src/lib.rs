@@ -1,4 +1,5 @@
 use msh_core::Model;
+use std::collections::HashMap;
 
 pub const DEFAULT_UV_SCALE: f32 = 1024.0;
 
@@ -11,21 +12,24 @@ pub struct RenderVertex {
 #[derive(Clone, Debug)]
 pub struct RenderMesh {
     pub vertices: Vec<RenderVertex>,
+    pub indices: Vec<u16>,
     pub batch_count: usize,
+    pub index_overflow: bool,
 }
 
 impl RenderMesh {
     pub fn triangle_count(&self) -> usize {
-        self.vertices.len() / 3
+        self.indices.len() / 3
     }
 }
 
-/// Builds an expanded triangle list for a specific LOD/group pair.
-///
-/// The output is suitable for simple `glDrawArrays(GL_TRIANGLES, ...)` paths.
+/// Builds an indexed triangle mesh for a specific LOD/group pair.
 pub fn build_render_mesh(model: &Model, lod: usize, group: usize) -> RenderMesh {
     let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let mut index_remap: HashMap<usize, u16> = HashMap::new();
     let mut batch_count = 0usize;
+    let mut index_overflow = false;
     let uv0 = model.uv0.as_ref();
 
     for node_index in 0..model.node_count {
@@ -49,36 +53,62 @@ pub fn build_render_mesh(model: &Model, lod: usize, group: usize) -> RenderMesh 
                 continue;
             }
 
+            let batch_out_start = indices.len();
+            let mut batch_valid = true;
             for &idx in &model.indices[index_start..index_end] {
                 let final_idx_u64 = u64::from(batch.base_vertex).saturating_add(u64::from(idx));
                 let Ok(final_idx) = usize::try_from(final_idx_u64) else {
-                    continue;
+                    batch_valid = false;
+                    break;
                 };
                 let Some(pos) = model.positions.get(final_idx) else {
-                    continue;
+                    batch_valid = false;
+                    break;
                 };
-                let uv = uv0
-                    .and_then(|uvs| uvs.get(final_idx))
-                    .copied()
-                    .map(|packed| {
-                        [
-                            packed[0] as f32 / DEFAULT_UV_SCALE,
-                            packed[1] as f32 / DEFAULT_UV_SCALE,
-                        ]
-                    })
-                    .unwrap_or([0.0, 0.0]);
-                vertices.push(RenderVertex {
-                    position: *pos,
-                    uv0: uv,
-                });
+
+                let local_index = if let Some(&mapped) = index_remap.get(&final_idx) {
+                    mapped
+                } else {
+                    let Ok(mapped) = u16::try_from(vertices.len()) else {
+                        index_overflow = true;
+                        batch_valid = false;
+                        break;
+                    };
+                    let uv = uv0
+                        .and_then(|uvs| uvs.get(final_idx))
+                        .copied()
+                        .map(|packed| {
+                            [
+                                packed[0] as f32 / DEFAULT_UV_SCALE,
+                                packed[1] as f32 / DEFAULT_UV_SCALE,
+                            ]
+                        })
+                        .unwrap_or([0.0, 0.0]);
+                    vertices.push(RenderVertex {
+                        position: *pos,
+                        uv0: uv,
+                    });
+                    index_remap.insert(final_idx, mapped);
+                    mapped
+                };
+
+                indices.push(local_index);
             }
+
+            if !batch_valid {
+                indices.truncate(batch_out_start);
+                continue;
+            }
+
             batch_count += 1;
         }
     }
 
     RenderMesh {
         vertices,
+        indices,
         batch_count,
+        index_overflow,
     }
 }
 

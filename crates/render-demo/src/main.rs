@@ -221,11 +221,16 @@ fn run(args: Args) -> Result<(), String> {
             )
         })?;
     let mesh = build_render_mesh(&loaded_model.model, args.lod, args.group);
-    if mesh.vertices.is_empty() {
+    if mesh.indices.is_empty() {
         return Err(format!(
             "model has no renderable triangles for lod={} group={}",
             args.lod, args.group
         ));
+    }
+    if mesh.index_overflow {
+        eprintln!(
+            "warning: mesh exceeds u16 index space and may be partially rendered on GLES2 targets"
+        );
     }
     let Some((bounds_min, bounds_max)) = compute_bounds_for_mesh(&mesh.vertices) else {
         return Err(String::from("failed to compute mesh bounds"));
@@ -304,6 +309,7 @@ fn run(args: Args) -> Result<(), String> {
         vertex_data.push(vertex.uv0[1]);
     }
     let vertex_bytes = f32_slice_to_ne_bytes(&vertex_data);
+    let index_bytes = u16_slice_to_ne_bytes(&mesh.indices);
 
     let gl = unsafe {
         glow::Context::from_loader_function(|name| video.gl_get_proc_address(name) as *const _)
@@ -319,9 +325,13 @@ fn run(args: Args) -> Result<(), String> {
         .ok_or_else(|| String::from("shader attribute a_uv is missing"))?;
 
     let vbo = unsafe { gl.create_buffer().map_err(|e| e.to_string())? };
+    let ebo = unsafe { gl.create_buffer().map_err(|e| e.to_string())? };
     unsafe {
         gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
         gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, &vertex_bytes, glow::STATIC_DRAW);
+        gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ebo));
+        gl.buffer_data_u8_slice(glow::ELEMENT_ARRAY_BUFFER, &index_bytes, glow::STATIC_DRAW);
+        gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, None);
         gl.bind_buffer(glow::ARRAY_BUFFER, None);
     }
 
@@ -341,8 +351,9 @@ fn run(args: Args) -> Result<(), String> {
             a_pos,
             a_uv,
             vbo,
+            ebo,
             gpu_texture.as_ref(),
-            mesh.vertices.len(),
+            mesh.indices.len(),
             &args,
             center,
             camera_distance,
@@ -360,8 +371,9 @@ fn run(args: Args) -> Result<(), String> {
             a_pos,
             a_uv,
             vbo,
+            ebo,
             gpu_texture.as_ref(),
-            mesh.vertices.len(),
+            mesh.indices.len(),
             &args,
             center,
             camera_distance,
@@ -372,6 +384,7 @@ fn run(args: Args) -> Result<(), String> {
         if let Some(texture) = gpu_texture {
             gl.delete_texture(texture.handle);
         }
+        gl.delete_buffer(ebo);
         gl.delete_buffer(vbo);
         gl.delete_program(program);
     }
@@ -452,8 +465,9 @@ fn run_capture(
     a_pos: u32,
     a_uv: u32,
     vbo: glow::NativeBuffer,
+    ebo: glow::NativeBuffer,
     texture: Option<&GpuTexture>,
-    vertex_count: usize,
+    index_count: usize,
     args: &Args,
     center: [f32; 3],
     camera_distance: f32,
@@ -478,8 +492,9 @@ fn run_capture(
             a_pos,
             a_uv,
             vbo,
+            ebo,
             texture,
-            vertex_count,
+            index_count,
             args.width,
             args.height,
             &mvp,
@@ -504,8 +519,9 @@ fn run_interactive(
     a_pos: u32,
     a_uv: u32,
     vbo: glow::NativeBuffer,
+    ebo: glow::NativeBuffer,
     texture: Option<&GpuTexture>,
-    vertex_count: usize,
+    index_count: usize,
     args: &Args,
     center: [f32; 3],
     camera_distance: f32,
@@ -543,8 +559,9 @@ fn run_interactive(
                 a_pos,
                 a_uv,
                 vbo,
+                ebo,
                 texture,
-                vertex_count,
+                index_count,
                 w,
                 h,
                 &mvp,
@@ -584,8 +601,9 @@ unsafe fn draw_frame(
     a_pos: u32,
     a_uv: u32,
     vbo: glow::NativeBuffer,
+    ebo: glow::NativeBuffer,
     texture: Option<&GpuTexture>,
-    vertex_count: usize,
+    index_count: usize,
     width: u32,
     height: u32,
     mvp: &[f32; 16],
@@ -614,17 +632,20 @@ unsafe fn draw_frame(
     }
 
     gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+    gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, Some(ebo));
     gl.enable_vertex_attrib_array(a_pos);
     gl.vertex_attrib_pointer_f32(a_pos, 3, glow::FLOAT, false, 20, 0);
     gl.enable_vertex_attrib_array(a_uv);
     gl.vertex_attrib_pointer_f32(a_uv, 2, glow::FLOAT, false, 20, 12);
-    gl.draw_arrays(
+    gl.draw_elements(
         glow::TRIANGLES,
+        index_count.min(i32::MAX as usize) as i32,
+        glow::UNSIGNED_SHORT,
         0,
-        vertex_count.min(i32::MAX as usize) as i32,
     );
     gl.disable_vertex_attrib_array(a_uv);
     gl.disable_vertex_attrib_array(a_pos);
+    gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, None);
     gl.bind_buffer(glow::ARRAY_BUFFER, None);
     gl.bind_texture(glow::TEXTURE_2D, None);
     gl.use_program(None);
@@ -752,6 +773,14 @@ void main() {
 
 fn f32_slice_to_ne_bytes(slice: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(slice.len().saturating_mul(std::mem::size_of::<f32>()));
+    for &value in slice {
+        out.extend_from_slice(&value.to_ne_bytes());
+    }
+    out
+}
+
+fn u16_slice_to_ne_bytes(slice: &[u16]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(slice.len().saturating_mul(std::mem::size_of::<u16>()));
     for &value in slice {
         out.extend_from_slice(&value.to_ne_bytes());
     }

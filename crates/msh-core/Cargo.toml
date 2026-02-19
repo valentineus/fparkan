@@ -4,4 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+encoding_rs = "0.8"
 nres = { path = "../nres" }
+
+[dev-dependencies]
+common = { path = "../common" }
+proptest = "1"

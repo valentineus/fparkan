@@ -1,21 +1,9 @@
 use super::*;
+use common::collect_files_recursive;
 use nres::Archive;
+use proptest::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_files_recursive(&path, out);
-        } else if path.is_file() {
-            out.push(path);
-        }
-    }
-}
 
 fn nres_test_files() -> Vec<PathBuf> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -326,4 +314,17 @@ fn texm_errors_for_page_chunk_and_mip_bounds() {
         decode_mip_rgba8(&parsed, truncated, 0),
         Err(Error::MipDataOutOfBounds { .. })
     ));
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn parse_texm_is_panic_free_on_random_bytes(payload in proptest::collection::vec(any::<u8>(), 0..4096)) {
+        if let Ok(texture) = parse_texm(&payload) {
+            for mip_index in 0..texture.mip_levels.len() {
+                let _ = decode_mip_rgba8(&texture, &payload, mip_index);
+            }
+        }
+    }
 }

@@ -1,4 +1,6 @@
+use std::fs;
 use std::io;
+use std::path::{Path, PathBuf};
 
 /// Resource payload that can be either borrowed from mapped bytes or owned.
 #[derive(Clone, Debug)]
@@ -40,5 +42,20 @@ impl OutputBuffer for Vec<u8> {
         self.clear();
         self.extend_from_slice(data);
         Ok(())
+    }
+}
+
+/// Recursively collects all files under `root`.
+pub fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_recursive(&path, out);
+        } else if path.is_file() {
+            out.push(path);
+        }
     }
 }

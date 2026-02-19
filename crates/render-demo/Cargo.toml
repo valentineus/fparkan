@@ -17,6 +17,9 @@ sdl2 = { version = "0.37", optional = true, default-features = false, features =
 glow = { version = "0.16", optional = true }
 image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 
+[dev-dependencies]
+common = { path = "../common" }
+
 [[bin]]
 name = "parkan-render-demo"
 path = "src/main.rs"

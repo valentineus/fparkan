@@ -1,21 +1,9 @@
 use super::*;
+use common::collect_files_recursive;
 use nres::Archive;
+use proptest::prelude::*;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_files_recursive(&path, out);
-        } else if path.is_file() {
-            out.push(path);
-        }
-    }
-}
 
 fn nres_test_files() -> Vec<PathBuf> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -169,24 +157,28 @@ fn res13_single_batch(index_start: u32, index_count: u16) -> Vec<u8> {
     batch
 }
 
-fn res10_names(names: &[Option<&str>]) -> Vec<u8> {
+fn res10_names_raw(names: &[Option<&[u8]>]) -> Vec<u8> {
     let mut out = Vec::new();
     for name in names {
         match name {
             Some(name) => {
-                let bytes = name.as_bytes();
                 out.extend_from_slice(
-                    &u32::try_from(bytes.len())
+                    &u32::try_from(name.len())
                         .expect("name size overflow in test")
                         .to_le_bytes(),
                 );
-                out.extend_from_slice(bytes);
+                out.extend_from_slice(name);
                 out.push(0);
             }
             None => out.extend_from_slice(&0u32.to_le_bytes()),
         }
     }
     out
+}
+
+fn res10_names(names: &[Option<&str>]) -> Vec<u8> {
+    let raw: Vec<Option<&[u8]>> = names.iter().map(|name| name.map(str::as_bytes)).collect();
+    res10_names_raw(&raw)
 }
 
 fn base_synthetic_entries() -> Vec<SyntheticEntry> {
@@ -340,6 +332,22 @@ fn parse_synthetic_model_with_optional_res4_res5_res10() {
 }
 
 #[test]
+fn parse_res10_names_decodes_cp1251() {
+    let mut entries = base_synthetic_entries();
+    entries[0] = synthetic_entry(RES1_NODE_TABLE, "Res1", 38, res1_stride38_nodes(1, Some(0)));
+    entries.push(synthetic_entry(
+        RES10_NAMES,
+        "Res10",
+        1,
+        res10_names_raw(&[Some(&[0xC0])]),
+    ));
+    let payload = build_nested_nres(&entries);
+
+    let model = parse_model_payload(&payload).expect("failed to parse model with cp1251 name");
+    assert_eq!(model.node_names, Some(vec![Some("А".to_string())]));
+}
+
+#[test]
 fn parse_fails_when_required_resource_missing() {
     let mut entries = base_synthetic_entries();
     entries.retain(|entry| entry.kind != RES13_BATCHES);
@@ -418,4 +426,13 @@ fn parse_fails_for_batch_index_range_out_of_bounds() {
             ..
         })
     ));
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn parse_model_payload_never_panics_on_random_bytes(data in proptest::collection::vec(any::<u8>(), 0..8192)) {
+        let _ = parse_model_payload(&data);
+    }
 }

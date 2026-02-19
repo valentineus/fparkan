@@ -1,4 +1,5 @@
 use super::*;
+use common::collect_files_recursive;
 use std::any::Any;
 use std::fs;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -11,20 +12,6 @@ struct SyntheticEntry<'a> {
     attr3: u32,
     name: &'a str,
     data: &'a [u8],
-}
-
-fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_files_recursive(&path, out);
-        } else if path.is_file() {
-            out.push(path);
-        }
-    }
 }
 
 fn nres_test_files() -> Vec<PathBuf> {

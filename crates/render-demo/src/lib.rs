@@ -435,22 +435,9 @@ fn decode_texture_entry(archive: &Archive, entry: EntryRef<'_>) -> Result<Loaded
 #[cfg(test)]
 mod tests {
     use super::*;
+    use common::collect_files_recursive;
     use std::fs;
     use std::path::{Path, PathBuf};
-
-    fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = fs::read_dir(root) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                collect_files_recursive(&path, out);
-            } else if path.is_file() {
-                out.push(path);
-            }
-        }
-    }
 
     fn archive_with_msh() -> Option<PathBuf> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -1,14 +1,17 @@
 use super::*;
 use crate::compress::lzh::{LZH_MAX_FREQ, LZH_N_CHAR, LZH_R, LZH_T};
 use crate::compress::xor::xor_stream;
+use common::collect_files_recursive;
 use flate2::write::DeflateEncoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
+use proptest::prelude::*;
 use std::any::Any;
 use std::fs;
 use std::io::Write as _;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 struct SyntheticRsliEntry {
@@ -33,20 +36,6 @@ impl Default for RsliBuildOptions {
             presorted: true,
             overlay: 0,
             add_ao_trailer: false,
-        }
-    }
-}
-
-fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_files_recursive(&path, out);
-        } else if path.is_file() {
-            out.push(path);
         }
     }
 }
@@ -1334,4 +1323,16 @@ fn rsli_validation_error_cases() {
         other => panic!("expected MediaOverlayOutOfBounds, got {other:?}"),
     }
     let _ = fs::remove_file(&path);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn parse_library_is_panic_free_on_random_bytes(data in proptest::collection::vec(any::<u8>(), 0..4096)) {
+        let _ = crate::parse::parse_library(
+            Arc::from(data.into_boxed_slice()),
+            OpenOptions::default(),
+        );
+    }
 }

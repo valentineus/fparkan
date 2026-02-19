@@ -1,22 +1,9 @@
 use super::*;
+use common::collect_files_recursive;
 use msh_core::parse_model_payload;
 use nres::Archive;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-fn collect_files_recursive(root: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_files_recursive(&path, out);
-        } else if path.is_file() {
-            out.push(path);
-        }
-    }
-}
 
 fn nres_test_files() -> Vec<PathBuf> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -71,11 +58,19 @@ fn build_render_mesh_for_real_models() {
                 )
             });
             let mesh = build_render_mesh(&model, 0, 0);
-            if !mesh.vertices.is_empty() {
+            if !mesh.indices.is_empty() {
                 meshes_non_empty += 1;
             }
             if compute_bounds_for_mesh(&mesh.vertices).is_some() {
                 bounds_non_empty += 1;
+            }
+            for &index in &mesh.indices {
+                assert!(
+                    usize::from(index) < mesh.vertices.len(),
+                    "index out of bounds for '{}' in {}",
+                    entry.meta.name,
+                    archive_path.display()
+                );
             }
             for vertex in &mesh.vertices {
                 assert!(
@@ -189,6 +184,7 @@ fn build_render_mesh_handles_empty_slot_model() {
 
     let mesh = build_render_mesh(&model, 0, 0);
     assert!(mesh.vertices.is_empty());
+    assert!(mesh.indices.is_empty());
     assert_eq!(mesh.batch_count, 0);
     assert_eq!(mesh.triangle_count(), 0);
 }
@@ -225,9 +221,36 @@ fn build_render_mesh_supports_multi_node_and_uv_scaling() {
     let mesh = build_render_mesh(&model, 0, 0);
     assert_eq!(mesh.batch_count, 2);
     assert_eq!(mesh.vertices.len(), 6);
+    assert_eq!(mesh.indices, vec![0, 1, 2, 3, 4, 5]);
     assert_eq!(mesh.triangle_count(), 2);
     assert_eq!(mesh.vertices[0].uv0, [1.0, -1.0]);
     assert_eq!(mesh.vertices[1].uv0, [0.5, 0.25]);
     assert_eq!(mesh.vertices[2].uv0, [0.0, 0.0]);
     assert_eq!(mesh.vertices[3].uv0, [1.0, 1.0]);
+}
+
+#[test]
+fn build_render_mesh_deduplicates_shared_vertices() {
+    let model = msh_core::Model {
+        node_stride: 38,
+        node_count: 1,
+        nodes_raw: nodes_with_slot_refs(&[Some(0)]),
+        slots: vec![slot(0, 1)],
+        positions: vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ],
+        normals: None,
+        uv0: None,
+        indices: vec![0, 1, 2, 2, 1, 3],
+        batches: vec![batch(0, 6, 0)],
+        node_names: None,
+    };
+
+    let mesh = build_render_mesh(&model, 0, 0);
+    assert_eq!(mesh.vertices.len(), 4);
+    assert_eq!(mesh.indices, vec![0, 1, 2, 2, 1, 3]);
+    assert_eq!(mesh.triangle_count(), 2);
 }
