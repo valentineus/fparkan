@@ -1,8 +1,9 @@
 use glow::HasContext as _;
 use render_core::{build_render_mesh, compute_bounds_for_mesh};
 use render_demo::{load_model_with_name_from_archive, resolve_texture_for_model, LoadedTexture};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 struct Args {
     archive: PathBuf,
@@ -271,7 +272,7 @@ fn run(args: Args) -> Result<(), String> {
         .video()
         .map_err(|err| format!("failed to init SDL2 video: {err}"))?;
 
-    let (window, _gl_ctx, gl_backend) = create_window_and_context(&video, &args)?;
+    let (mut window, _gl_ctx, gl_backend) = create_window_and_context(&video, &args)?;
     let _ = if args.capture.is_some() {
         video.gl_set_swap_interval(0)
     } else {
@@ -342,7 +343,7 @@ fn run(args: Args) -> Result<(), String> {
     } else {
         run_interactive(
             &sdl,
-            &window,
+            &mut window,
             &gl,
             program,
             u_mvp.as_ref(),
@@ -587,7 +588,7 @@ fn run_capture(
 #[allow(clippy::too_many_arguments)]
 fn run_interactive(
     sdl: &sdl2::Sdl,
-    window: &sdl2::video::Window,
+    window: &mut sdl2::video::Window,
     gl: &glow::Context,
     program: glow::NativeProgram,
     u_mvp: Option<&glow::NativeUniformLocation>,
@@ -608,6 +609,10 @@ fn run_interactive(
         .event_pump()
         .map_err(|err| format!("failed to get SDL event pump: {err}"))?;
     let start = Instant::now();
+    let mut fps_window_start = Instant::now();
+    let mut fps_frames: u32 = 0;
+    let mut fps_printed = false;
+    let base_title = "Parkan Render Demo (SDL2 + OpenGL)";
 
     'main_loop: loop {
         for event in events.poll_iter() {
@@ -647,6 +652,25 @@ fn run_interactive(
             );
         }
         window.gl_swap_window();
+
+        fps_frames = fps_frames.saturating_add(1);
+        let elapsed = fps_window_start.elapsed();
+        if elapsed >= Duration::from_millis(500) {
+            let fps = fps_frames as f32 / elapsed.as_secs_f32().max(0.000_1);
+            let frame_time_ms = 1000.0 / fps.max(0.000_1);
+            let _ = window.set_title(&format!(
+                "{base_title} | FPS: {fps:.1} ({frame_time_ms:.2} ms)"
+            ));
+            print!("\rFPS: {fps:.1} ({frame_time_ms:.2} ms)");
+            let _ = std::io::stdout().flush();
+            fps_printed = true;
+            fps_frames = 0;
+            fps_window_start = Instant::now();
+        }
+    }
+
+    if fps_printed {
+        println!();
     }
 
     Ok(())

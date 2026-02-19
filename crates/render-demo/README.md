@@ -37,6 +37,7 @@ brew install sdl2 pkg-config
 - `--width`, `--height` (опционально, default `1280x720`).
 - `--angle` (опционально): фиксированный угол поворота вокруг Y (в радианах).
 - `--spin-rate` (опционально, default `0.35`): скорость вращения в интерактивном режиме.
+- В интерактивном режиме FPS выводится в заголовок окна и в stdout (обновление примерно каждые 0.5 сек).
 - `--texture <name>`: явное имя `Texm` (override авто-резолва).
 - `--texture-archive <path>`: путь к архиву текстур (по умолчанию `textures.lib` рядом с `--archive`).
 - `--material-archive <path>`: путь к `material.lib` (по умолчанию соседний `material.lib`).
