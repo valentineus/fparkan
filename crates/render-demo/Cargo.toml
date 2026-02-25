@@ -20,10 +20,10 @@ image = { version = "0.25", optional = true, default-features = false, features 
 common = { path = "../common" }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-sdl2 = { version = "0.37", optional = true, default-features = false, features = ["use-pkgconfig"] }
+sdl2 = { version = "0.38", optional = true, default-features = false, features = ["use-pkgconfig"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-sdl2 = { version = "0.37", optional = true, default-features = false, features = ["bundled", "static-link"] }
+sdl2 = { version = "0.38", optional = true, default-features = false, features = ["bundled", "static-link"] }
 
 [[bin]]
 name = "parkan-render-demo"
