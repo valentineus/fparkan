@@ -13,7 +13,7 @@ msh-core = { path = "../msh-core" }
 nres = { path = "../nres" }
 render-core = { path = "../render-core" }
 texm = { path = "../texm" }
-glow = { version = "0.16", optional = true }
+glow = { version = "0.17", optional = true }
 image = { version = "0.25", optional = true, default-features = false, features = ["png"] }
 
 [dev-dependencies]
