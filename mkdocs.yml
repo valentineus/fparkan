@@ -3,7 +3,7 @@ site_name: FParkan
 site_url: https://fparkan.popov.link/
 site_author: Valentin Popov
 site_description: >-
-  Utilities and tools for the game “Parkan: Iron Strategy”.
+  Техническая книга о восстановлении игрового движка Iron3D из Parkan: Iron Strategy.
 
 # Repository
 repo_name: valentineus/fparkan
@@ -16,36 +16,66 @@ copyright: Copyright &copy; 2023 &mdash; 2026 Valentin Popov
 theme:
   name: material
   language: ru
+  features:
+    - navigation.instant
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - toc.follow
+    - search.highlight
+    - search.suggest
   palette:
-    scheme: slate
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: deep orange
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: deep orange
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - md_in_html
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+plugins:
+  - search:
+      lang:
+        - ru
+        - en
 
 # Navigation
 nav:
-  - Home: index.md
-  - Specs:
-      - 3D implementation notes: specs/msh-notes.md
-      - AI system: specs/ai.md
-      - ArealMap: specs/arealmap.md
-      - Behavior system: specs/behavior.md
-      - Control system: specs/control.md
-      - FXID: specs/fxid.md
-      - Material (MAT0): specs/material.md
-      - Wear (WEAR): specs/wear.md
-      - Texture (Texm): specs/texture.md
-      - Materials index: specs/materials-texm.md
-      - Missions: specs/missions.md
-      - Object registry (objects.rlb): specs/object-registry.md
-      - MSH animation: specs/msh-animation.md
-      - MSH core: specs/msh-core.md
-      - Network system: specs/network.md
-      - NRes / RsLi: specs/nres.md
-      - Render pipeline: specs/render.md
-      - Render parity: specs/render-parity.md
-      - Runtime pointer: specs/runtime-pipeline.md
-      - Sound system: specs/sound.md
-      - Terrain + map loading: specs/terrain-map-loading.md
-      - UI system: specs/ui.md
-      - Форматы 3D‑ресурсов (обзор): specs/msh.md
+  - Начало: index.md
+  - Книга:
+      - I. Путеводитель и методика: tomes/01-guide.md
+      - II. Запуск, архитектура и игровой цикл: tomes/02-architecture.md
+      - III. Ресурсная система и форматы: tomes/03-resources.md
+      - IV. Мир, миссии и игровой runtime: tomes/04-world.md
+      - V. Геометрия, материалы и рендер: tomes/05-render.md
+      - VI. Поведение, управление, звук и сеть: tomes/06-behavior.md
+      - VII. Руководство по полной реализации: tomes/07-implementation.md
+      - VIII. Справочник и доказательная база: tomes/08-evidence.md
+  - Справочник:
+      - NRes: reference/nres.md
+      - RsLi: reference/rsli.md
+      - TMA: reference/tma.md
+      - MSH: reference/msh.md
+      - WEAR и MAT0: reference/materials.md
+      - Texm: reference/texm.md
+      - Render frame: reference/render-frame.md
+  - Приложения:
+      - Глоссарий: appendices/glossary.md
+      - Границы знания: appendices/knowledge-boundaries.md
 
 # Additional configuration
 extra:
