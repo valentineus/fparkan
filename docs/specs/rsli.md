@@ -207,10 +207,7 @@ XOR-дешифрование первых `unpacked_size` байт.
 - roundtrip `unpack -> repack -> byte-compare`: `2/2` совпали побайтно;
 - подтвержден ровно один `deflate EOF+1` случай (`sprites.lib`, entry `23`).
 
-Инструменты:
-
-- `tools/archive_roundtrip_validator.py`
-- `crates/rsli` tests
+Проверено legacy-валидатором архивов и тестами `crates/rsli`.
 
 ## 11. Статус покрытия и что осталось до 100%
 

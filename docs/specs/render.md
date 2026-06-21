@@ -152,7 +152,7 @@ void RenderFrame(Scene* scene, Camera* cam, float dt) {
 ## 10. Статус валидации
 
 - Порядок кадра и подключение `Material.lib / Textures.lib / LightMap.lib` подтверждены текущей runtime-валидацией проекта.
-- Детальные инварианты форматов зафиксированы в `tools/msh_doc_validator.py` и `tools/fxid_abs100_audit.py`.
+- Детальные инварианты форматов зафиксированы в спецификациях проекта и проверены legacy-валидаторами.
 
 ## 11. Статус покрытия и что осталось до 100%
 

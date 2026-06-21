@@ -273,9 +273,7 @@ for (x=0; x<cellsX; x++) {
 - `normal` имеет длину ~1.0;
 - `reserved_12`, `reserved_36`, `reserved_44` в retail наблюдаются как `0`.
 
-Инструмент:
-
-- `tools/terrain_map_doc_validator.py`
+Проверено legacy-валидатором terrain/map форматов.
 
 ## 7. Статус покрытия и что осталось до 100%
 

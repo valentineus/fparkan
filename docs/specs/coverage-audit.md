@@ -11,9 +11,7 @@
 - `RsLi`: `2` архива, roundtrip `2/2` (byte-identical)
 - подтвержден один совместимый quirk: `sprites.lib`, entry `23`, `deflate EOF+1`
 
-Инструмент:
-
-- `tools/archive_roundtrip_validator.py`
+Проверено legacy-валидатором архивов.
 
 ## 2. Проверка рендерных форматов
 
@@ -24,11 +22,7 @@
 - `FXID`: `923/923` валидны
 - `Terrain/Map` (`Land.msh` + `Land.map`): `33/33` без ошибок/предупреждений
 
-Инструменты:
-
-- `tools/msh_doc_validator.py`
-- `tools/fxid_abs100_audit.py`
-- `tools/terrain_map_doc_validator.py`
+Проверено legacy-валидаторами рендерных форматов.
 
 ## 3. Глобальный статус по подсистемам
 

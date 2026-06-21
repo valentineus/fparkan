@@ -184,7 +184,7 @@ struct ResourceRef64 {
 
 ## 11. Статус валидации
 
-- Формальные инварианты FXID зафиксированы в `tools/msh_doc_validator.py` и `tools/fxid_abs100_audit.py`.
+- Формальные инварианты FXID зафиксированы в спецификациях проекта и проверены legacy-валидаторами.
 - На полном retail-корпусе `testdata/Parkan - Iron Strategy` проверено `923/923` FXID payload без ошибок.
 
 ## 12. Статус покрытия и что осталось до 100%
