@@ -8,6 +8,7 @@ use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Corpus kind.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,6 +73,34 @@ pub struct CorpusReport {
     pub casefold_collisions: usize,
     /// Manifest fingerprint.
     pub fingerprint: Sha256Digest,
+    /// Per-file status records.
+    pub records: Vec<CorpusFileRecord>,
+    /// Number of files with report errors.
+    pub failures: usize,
+}
+
+/// Per-file report status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CorpusFileStatus {
+    /// File was inspected successfully.
+    Ok,
+    /// File was inspected but produced a non-fatal warning.
+    Warning,
+    /// File could not be inspected.
+    Error,
+}
+
+/// Per-file report record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CorpusFileRecord {
+    /// Normalized relative path.
+    pub path: String,
+    /// Inspection status.
+    pub status: CorpusFileStatus,
+    /// Detected file variant.
+    pub variant: String,
+    /// Optional status message.
+    pub message: Option<String>,
 }
 
 /// Corpus error.
@@ -88,6 +117,13 @@ pub enum CorpusError {
     InvalidRoot(PathBuf),
     /// Invalid path.
     InvalidPath(String),
+    /// Aggregate report failure.
+    Report {
+        /// Path where reporting failed.
+        path: String,
+        /// Failure message.
+        message: String,
+    },
 }
 
 impl fmt::Display for CorpusError {
@@ -96,6 +132,7 @@ impl fmt::Display for CorpusError {
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
             Self::InvalidRoot(path) => write!(f, "invalid corpus root: {}", path.display()),
             Self::InvalidPath(path) => write!(f, "invalid corpus path: {path}"),
+            Self::Report { path, message } => write!(f, "{path}: {message}"),
         }
     }
 }
@@ -104,7 +141,7 @@ impl std::error::Error for CorpusError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::InvalidRoot(_) | Self::InvalidPath(_) => None,
+            Self::InvalidRoot(_) | Self::InvalidPath(_) | Self::Report { .. } => None,
         }
     }
 }
@@ -230,8 +267,39 @@ fn detect_casefold_collisions(files: &[ManifestEntry]) -> Vec<Vec<String>> {
 }
 
 /// Builds aggregate report.
-#[must_use]
-pub fn report(root: &Path, manifest: &CorpusManifest) -> CorpusReport {
+///
+/// # Errors
+///
+/// Returns [`CorpusError`] when the aggregate report cannot be constructed.
+/// Per-file inspection failures are represented in [`CorpusReport::records`]
+/// and counted in [`CorpusReport::failures`].
+pub fn report(root: &Path, manifest: &CorpusManifest) -> Result<CorpusReport, CorpusError> {
+    let mut metrics = empty_report_metrics();
+    let mut records = Vec::with_capacity(manifest.files.len());
+    let mut failures = 0usize;
+
+    for entry in &manifest.files {
+        let record = inspect_report_file(root, entry, &mut metrics);
+        if record.status == CorpusFileStatus::Error {
+            failures = failures.saturating_add(1);
+        }
+        records.push(record);
+    }
+
+    Ok(CorpusReport {
+        schema: 1,
+        kind: manifest.kind,
+        files: manifest.files.len(),
+        bytes: manifest.files.iter().map(|f| f.size).sum(),
+        metrics,
+        casefold_collisions: manifest.casefold_collisions.len(),
+        fingerprint: fingerprint(manifest),
+        records,
+        failures,
+    })
+}
+
+fn empty_report_metrics() -> BTreeMap<String, u64> {
     let mut metrics = BTreeMap::new();
     metrics.insert("nres_files".to_string(), 0);
     metrics.insert("nres_entries".to_string(), 0);
@@ -245,67 +313,97 @@ pub fn report(root: &Path, manifest: &CorpusManifest) -> CorpusReport {
     metrics.insert("texm_entries".to_string(), 0);
     metrics.insert("fxid_entries".to_string(), 0);
     metrics.insert("wear_entries".to_string(), 0);
+    metrics
+}
 
-    for entry in &manifest.files {
-        let lower = entry.path.to_ascii_lowercase();
-        if lower.ends_with("data.tma") {
-            bump(&mut metrics, "tma_files", 1);
+fn inspect_report_file(
+    root: &Path,
+    entry: &ManifestEntry,
+    metrics: &mut BTreeMap<String, u64>,
+) -> CorpusFileRecord {
+    let lower = entry.path.to_ascii_lowercase();
+    let mut variant = inspect_path_metrics(&lower, metrics);
+    let path = root.join(&entry.path);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(source) => {
+            return CorpusFileRecord {
+                path: entry.path.clone(),
+                status: CorpusFileStatus::Error,
+                variant,
+                message: Some(source.to_string()),
+            };
         }
-        if lower.ends_with("land.msh") {
-            bump(&mut metrics, "land_msh_files", 1);
+    };
+    if bytes.starts_with(b"NRes") {
+        variant = "nres".to_string();
+        bump(metrics, "nres_files", 1);
+        if let Err(message) = inspect_nres_metrics(bytes, metrics) {
+            return CorpusFileRecord {
+                path: entry.path.clone(),
+                status: CorpusFileStatus::Error,
+                variant,
+                message: Some(message),
+            };
         }
-        if lower.ends_with("land.map") {
-            bump(&mut metrics, "land_map_files", 1);
-        }
-        if has_extension(&lower, "dat")
-            && (lower.starts_with("units/") || lower.contains("/units/"))
-        {
-            bump(&mut metrics, "unit_dat_files", 1);
-        }
+    } else if bytes.starts_with(b"NL") {
+        variant = "rsli".to_string();
+        bump(metrics, "rsli_files", 1);
+    }
+    CorpusFileRecord {
+        path: entry.path.clone(),
+        status: CorpusFileStatus::Ok,
+        variant,
+        message: None,
+    }
+}
 
-        let path = root.join(&entry.path);
-        if let Ok(bytes) = fs::read(path) {
-            if bytes.starts_with(b"NRes") {
-                bump(&mut metrics, "nres_files", 1);
-                if let Some(entries) = inspect_nres_entries(&bytes) {
-                    bump(&mut metrics, "nres_entries", entries.len() as u64);
-                    for entry in entries {
-                        let name = entry.name.to_ascii_lowercase();
-                        if has_extension(&name, "msh") {
-                            bump(&mut metrics, "msh_entries", 1);
-                        }
-                        match entry.kind {
-                            0x3054_414D => {
-                                bump(&mut metrics, "mat0_entries", 1);
-                            }
-                            0x6D78_6554 => {
-                                bump(&mut metrics, "texm_entries", 1);
-                            }
-                            0x4449_5846 => {
-                                bump(&mut metrics, "fxid_entries", 1);
-                            }
-                            0x5241_4557 => {
-                                bump(&mut metrics, "wear_entries", 1);
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            } else if bytes.starts_with(b"NL") {
-                bump(&mut metrics, "rsli_files", 1);
+fn inspect_path_metrics(lower: &str, metrics: &mut BTreeMap<String, u64>) -> String {
+    let mut variant = "file";
+    if lower.ends_with("data.tma") {
+        bump(metrics, "tma_files", 1);
+        variant = "tma";
+    }
+    if lower.ends_with("land.msh") {
+        bump(metrics, "land_msh_files", 1);
+        variant = "land_msh";
+    }
+    if lower.ends_with("land.map") {
+        bump(metrics, "land_map_files", 1);
+        variant = "land_map";
+    }
+    if has_extension(lower, "dat") && (lower.starts_with("units/") || lower.contains("/units/")) {
+        bump(metrics, "unit_dat_files", 1);
+        variant = "unit_dat";
+    }
+    variant.to_string()
+}
+
+fn inspect_nres_metrics(bytes: Vec<u8>, metrics: &mut BTreeMap<String, u64>) -> Result<(), String> {
+    let entries = inspect_nres_entries(bytes)?;
+    bump(metrics, "nres_entries", entries.len() as u64);
+    for entry in entries {
+        let name = String::from_utf8_lossy(entry.name_bytes()).to_ascii_lowercase();
+        if has_extension(&name, "msh") {
+            bump(metrics, "msh_entries", 1);
+        }
+        match entry.meta().type_id {
+            0x3054_414D => {
+                bump(metrics, "mat0_entries", 1);
             }
+            0x6D78_6554 => {
+                bump(metrics, "texm_entries", 1);
+            }
+            0x4449_5846 => {
+                bump(metrics, "fxid_entries", 1);
+            }
+            0x5241_4557 => {
+                bump(metrics, "wear_entries", 1);
+            }
+            _ => {}
         }
     }
-
-    CorpusReport {
-        schema: 1,
-        kind: manifest.kind,
-        files: manifest.files.len(),
-        bytes: manifest.files.iter().map(|f| f.size).sum(),
-        metrics,
-        casefold_collisions: manifest.casefold_collisions.len(),
-        fingerprint: fingerprint(manifest),
-    }
+    Ok(())
 }
 
 fn bump(metrics: &mut BTreeMap<String, u64>, key: &str, delta: u64) {
@@ -320,35 +418,13 @@ fn has_extension(path: &str, expected: &str) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
 }
 
-#[derive(Clone, Debug)]
-struct NresEntryBrief {
-    kind: u32,
-    name: String,
-}
-
-fn inspect_nres_entries(bytes: &[u8]) -> Option<Vec<NresEntryBrief>> {
-    if bytes.len() < 16 || !bytes.starts_with(b"NRes") {
-        return None;
-    }
-    let count = i32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?);
-    if count < 0 {
-        return None;
-    }
-    let count = usize::try_from(count).ok()?;
-    let directory_len = count.checked_mul(64)?;
-    let directory_offset = bytes.len().checked_sub(directory_len)?;
-    let mut names = Vec::with_capacity(count);
-    for index in 0..count {
-        let base = directory_offset.checked_add(index.checked_mul(64)?)?;
-        let kind = u32::from_le_bytes(bytes.get(base..base + 4)?.try_into().ok()?);
-        let raw = bytes.get(base + 20..base + 56)?;
-        let len = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
-        names.push(NresEntryBrief {
-            kind,
-            name: String::from_utf8_lossy(&raw[..len]).to_string(),
-        });
-    }
-    Some(names)
+fn inspect_nres_entries(bytes: Vec<u8>) -> Result<Vec<fparkan_nres::NresEntry>, String> {
+    let document = fparkan_nres::decode(
+        Arc::from(bytes.into_boxed_slice()),
+        fparkan_nres::ReadProfile::Compatible,
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(document.entries().to_vec())
 }
 
 /// Computes stable manifest fingerprint.
@@ -402,13 +478,15 @@ pub fn write_report_atomic(path: &Path, report: &CorpusReport) -> Result<(), Cor
 #[must_use]
 pub fn render_report_json(report: &CorpusReport) -> String {
     let mut out = format!(
-        "{{\"schema_version\":\"fparkan-corpus-report-v1\",\"schema\":{},\"kind\":\"{:?}\",\"files\":{},\"bytes\":{},\"casefold_collisions\":{},\"fingerprint\":\"{}\",\"metrics\":{{",
+        "{{\"schema_version\":\"fparkan-corpus-report-v1\",\"schema\":{},\"kind\":\"{:?}\",\"files\":{},\"bytes\":{},\"casefold_collisions\":{},\"fingerprint\":\"{}\",\"failures\":{},\"record_count\":{},\"metrics\":{{",
         report.schema,
         report.kind,
         report.files,
         report.bytes,
         report.casefold_collisions,
-        sha256_hex(&report.fingerprint)
+        sha256_hex(&report.fingerprint),
+        report.failures,
+        report.records.len()
     );
     for (idx, (key, value)) in report.metrics.iter().enumerate() {
         if idx > 0 {
@@ -441,7 +519,7 @@ mod tests {
             return;
         }
         let manifest = discover(&root, DiscoverOptions::default()).expect("manifest");
-        let report = report(&root, &manifest);
+        let report = report(&root, &manifest).expect("report");
         assert!(report.files > 0);
         assert!(report.metrics["nres_files"] > 0);
     }
@@ -451,7 +529,7 @@ mod tests {
     fn licensed_part1_manifest_profile_and_counts_match_baseline() {
         let root = testdata_root("IS");
         let manifest = discover(&root, DiscoverOptions::default()).expect("part 1 manifest");
-        let report = report(&root, &manifest);
+        let report = report(&root, &manifest).expect("report");
 
         assert_eq!(manifest.kind, CorpusKind::Part1);
         assert_eq!(report.files, 1_017);
@@ -468,7 +546,7 @@ mod tests {
     fn licensed_part2_manifest_profile_and_counts_match_baseline() {
         let root = testdata_root("IS2");
         let manifest = discover(&root, DiscoverOptions::default()).expect("part 2 manifest");
-        let report = report(&root, &manifest);
+        let report = report(&root, &manifest).expect("report");
 
         assert_eq!(manifest.kind, CorpusKind::Part2);
         assert_eq!(report.files, 1_302);
@@ -521,14 +599,109 @@ mod tests {
             }],
             casefold_collisions: Vec::new(),
         };
-        let report = report(Path::new("."), &manifest);
+        let report = report(Path::new("."), &manifest).expect("report");
         let json = render_report_json(&report);
 
         assert!(json.contains("\"schema_version\":\"fparkan-corpus-report-v1\""));
         assert!(json.contains("\"fingerprint\":"));
+        assert!(json.contains("\"failures\":1"));
+        assert!(json.contains("\"record_count\":1"));
         assert!(json.contains("\"metrics\":"));
         assert!(!json.contains("secret/payload.bin"));
         assert!(!json.contains("DATA"));
+    }
+
+    #[test]
+    fn report_records_missing_manifest_files_as_failures() {
+        let root = temp_dir("report-missing");
+        let manifest = CorpusManifest {
+            kind: CorpusKind::Unknown,
+            files: vec![ManifestEntry {
+                path: "missing.lib".to_string(),
+                size: 1,
+                hash: sha256(b"missing"),
+            }],
+            casefold_collisions: Vec::new(),
+        };
+
+        let report = report(&root, &manifest).expect("report");
+
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.records.len(), 1);
+        assert_eq!(report.records[0].path, "missing.lib");
+        assert_eq!(report.records[0].status, CorpusFileStatus::Error);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn report_records_malformed_nres_as_failure() {
+        let root = temp_dir("report-bad-nres");
+        fs::write(root.join("bad.lib"), b"NRes").expect("bad nres");
+        let manifest = CorpusManifest {
+            kind: CorpusKind::Unknown,
+            files: vec![ManifestEntry {
+                path: "bad.lib".to_string(),
+                size: 4,
+                hash: sha256(b"NRes"),
+            }],
+            casefold_collisions: Vec::new(),
+        };
+
+        let report = report(&root, &manifest).expect("report");
+
+        assert_eq!(report.failures, 1);
+        assert_eq!(report.records[0].status, CorpusFileStatus::Error);
+        assert_eq!(report.records[0].variant, "nres");
+        assert!(report.records[0]
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("NRes")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn report_uses_production_nres_parser_for_entry_metrics() {
+        let root = temp_dir("report-nres");
+        let archive = build_nres(&[
+            TestNresEntry {
+                name: "mesh.msh",
+                type_id: 0,
+                payload: b"mesh",
+            },
+            TestNresEntry {
+                name: "mat.bin",
+                type_id: 0x3054_414D,
+                payload: b"mat0",
+            },
+            TestNresEntry {
+                name: "texture.bin",
+                type_id: 0x6D78_6554,
+                payload: b"texm",
+            },
+        ]);
+        fs::write(root.join("archive.lib"), &archive).expect("archive");
+        let manifest = CorpusManifest {
+            kind: CorpusKind::Unknown,
+            files: vec![ManifestEntry {
+                path: "archive.lib".to_string(),
+                size: u64::try_from(archive.len()).expect("archive size"),
+                hash: sha256(&archive),
+            }],
+            casefold_collisions: Vec::new(),
+        };
+
+        let report = report(&root, &manifest).expect("report");
+
+        assert_eq!(report.failures, 0);
+        assert_eq!(report.records.len(), 1);
+        assert_eq!(report.records[0].status, CorpusFileStatus::Ok);
+        assert_eq!(report.records[0].variant, "nres");
+        assert_eq!(report.metrics["nres_files"], 1);
+        assert_eq!(report.metrics["nres_entries"], 3);
+        assert_eq!(report.metrics["msh_entries"], 1);
+        assert_eq!(report.metrics["mat0_entries"], 1);
+        assert_eq!(report.metrics["texm_entries"], 1);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -648,10 +821,62 @@ mod tests {
             metrics: BTreeMap::new(),
             casefold_collisions: 0,
             fingerprint: sha256(b"empty-report"),
+            records: Vec::new(),
+            failures: 0,
         };
         write_report_atomic(&tmp, &report).expect("write");
         assert!(tmp.is_file());
         let _ = fs::remove_file(tmp);
+    }
+
+    struct TestNresEntry<'a> {
+        name: &'a str,
+        type_id: u32,
+        payload: &'a [u8],
+    }
+
+    fn build_nres(entries: &[TestNresEntry<'_>]) -> Vec<u8> {
+        let mut out = vec![0; 16];
+        let mut offsets = Vec::with_capacity(entries.len());
+        for entry in entries {
+            offsets.push(u32::try_from(out.len()).expect("offset"));
+            out.extend_from_slice(entry.payload);
+            let padding = (8 - (out.len() % 8)) % 8;
+            out.resize(out.len() + padding, 0);
+        }
+        let mut order: Vec<usize> = (0..entries.len()).collect();
+        order.sort_by(|left, right| {
+            entries[*left]
+                .name
+                .as_bytes()
+                .cmp(entries[*right].name.as_bytes())
+        });
+        for (index, entry) in entries.iter().enumerate() {
+            push_u32(&mut out, entry.type_id);
+            push_u32(&mut out, 0);
+            push_u32(&mut out, 0);
+            push_u32(
+                &mut out,
+                u32::try_from(entry.payload.len()).expect("payload size"),
+            );
+            push_u32(&mut out, 0);
+            let mut name = [0; 36];
+            let name_bytes = entry.name.as_bytes();
+            name[..name_bytes.len()].copy_from_slice(name_bytes);
+            out.extend_from_slice(&name);
+            push_u32(&mut out, offsets[index]);
+            push_u32(&mut out, u32::try_from(order[index]).expect("sort index"));
+        }
+        out[0..4].copy_from_slice(b"NRes");
+        out[4..8].copy_from_slice(&0x100_u32.to_le_bytes());
+        out[8..12].copy_from_slice(&u32::try_from(entries.len()).expect("count").to_le_bytes());
+        let total_size = u32::try_from(out.len()).expect("total size");
+        out[12..16].copy_from_slice(&total_size.to_le_bytes());
+        out
+    }
+
+    fn push_u32(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_le_bytes());
     }
 
     fn temp_dir(name: &str) -> PathBuf {

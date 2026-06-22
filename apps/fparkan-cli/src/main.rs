@@ -32,7 +32,7 @@ fn run(args: &[String]) -> Result<(), String> {
             let root = parse_root(&rest)?;
             let manifest =
                 discover(&root, DiscoverOptions::default()).map_err(|e| e.to_string())?;
-            let report = report(&root, &manifest);
+            let report = report(&root, &manifest).map_err(|e| e.to_string())?;
             println!("{}", render_report_json(&report));
             Ok(())
         }
@@ -41,9 +41,12 @@ fn run(args: &[String]) -> Result<(), String> {
             let root = parse_root(&rest)?;
             let manifest =
                 discover(&root, DiscoverOptions::default()).map_err(|e| e.to_string())?;
-            let report = report(&root, &manifest);
+            let report = report(&root, &manifest).map_err(|e| e.to_string())?;
             if report.casefold_collisions > 0 {
                 return Err("casefold collisions found".to_string());
+            }
+            if report.failures > 0 {
+                return Err(format!("corpus report found {} failures", report.failures));
             }
             println!("{}", render_report_json(&report));
             Ok(())

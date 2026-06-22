@@ -82,6 +82,7 @@ name = "fparkan-corpus"
 version = "0.1.0"
 dependencies = [
  "fparkan-binary",
+ "fparkan-nres",
  "fparkan-path",
 ]
 
