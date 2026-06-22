@@ -180,6 +180,24 @@ pub struct CachedResourceRepository {
     state: Mutex<RepositoryState>,
 }
 
+/// Decoded payload cache limits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PayloadCacheLimits {
+    /// Maximum cached decoded payload entries.
+    pub max_entries: usize,
+    /// Maximum cached decoded payload bytes.
+    pub max_bytes: usize,
+}
+
+impl Default for PayloadCacheLimits {
+    fn default() -> Self {
+        Self {
+            max_entries: 64,
+            max_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
 #[derive(Default)]
 struct RepositoryState {
     paths: BTreeMap<String, ArchiveId>,
@@ -203,6 +221,8 @@ enum ArchiveDocument {
 #[derive(Debug, Default)]
 struct DecodedPayloadCache {
     max_entries: usize,
+    max_bytes: usize,
+    current_bytes: usize,
     generation: u64,
     entries: BTreeMap<EntryHandle, PayloadCacheEntry>,
 }
@@ -217,16 +237,28 @@ impl CachedResourceRepository {
     /// Creates a cached repository.
     #[must_use]
     pub fn new(vfs: Arc<dyn Vfs>) -> Self {
-        Self::with_payload_cache_budget(vfs, 64)
+        Self::with_payload_cache_limits(vfs, PayloadCacheLimits::default())
     }
 
     /// Creates a cached repository with a decoded payload entry budget.
     #[must_use]
     pub fn with_payload_cache_budget(vfs: Arc<dyn Vfs>, max_payload_entries: usize) -> Self {
+        Self::with_payload_cache_limits(
+            vfs,
+            PayloadCacheLimits {
+                max_entries: max_payload_entries,
+                ..PayloadCacheLimits::default()
+            },
+        )
+    }
+
+    /// Creates a cached repository with decoded payload entry and byte budgets.
+    #[must_use]
+    pub fn with_payload_cache_limits(vfs: Arc<dyn Vfs>, limits: PayloadCacheLimits) -> Self {
         Self {
             vfs,
             state: Mutex::new(RepositoryState {
-                payload_cache: DecodedPayloadCache::new(max_payload_entries),
+                payload_cache: DecodedPayloadCache::new(limits),
                 ..RepositoryState::default()
             }),
         }
@@ -394,9 +426,11 @@ impl CachedResourceRepository {
 }
 
 impl DecodedPayloadCache {
-    fn new(max_entries: usize) -> Self {
+    fn new(limits: PayloadCacheLimits) -> Self {
         Self {
-            max_entries,
+            max_entries: limits.max_entries,
+            max_bytes: limits.max_bytes,
+            current_bytes: 0,
             generation: 0,
             entries: BTreeMap::new(),
         }
@@ -410,18 +444,39 @@ impl DecodedPayloadCache {
     }
 
     fn insert(&mut self, handle: EntryHandle, bytes: Arc<[u8]>) {
-        if self.max_entries == 0 {
+        let len = bytes.len();
+        if self.max_entries == 0 || len > self.max_bytes {
             return;
         }
         self.generation = self.generation.saturating_add(1);
-        self.entries.insert(
+        if let Some(previous) = self.entries.insert(
             handle,
             PayloadCacheEntry {
                 bytes,
                 last_access: self.generation,
             },
-        );
-        while self.entries.len() > self.max_entries {
+        ) {
+            self.current_bytes = self.current_bytes.saturating_sub(previous.bytes.len());
+        }
+        self.current_bytes = self.current_bytes.saturating_add(len);
+        self.evict_until_within_budget();
+    }
+
+    fn remove_archive(&mut self, archive: ArchiveId) {
+        let mut removed_bytes = 0usize;
+        self.entries.retain(|handle, entry| {
+            if handle.archive == archive {
+                removed_bytes = removed_bytes.saturating_add(entry.bytes.len());
+                false
+            } else {
+                true
+            }
+        });
+        self.current_bytes = self.current_bytes.saturating_sub(removed_bytes);
+    }
+
+    fn evict_until_within_budget(&mut self) {
+        while self.entries.len() > self.max_entries || self.current_bytes > self.max_bytes {
             let Some(victim) = self
                 .entries
                 .iter()
@@ -430,12 +485,10 @@ impl DecodedPayloadCache {
             else {
                 break;
             };
-            self.entries.remove(&victim);
+            if let Some(removed) = self.entries.remove(&victim) {
+                self.current_bytes = self.current_bytes.saturating_sub(removed.bytes.len());
+            }
         }
-    }
-
-    fn remove_archive(&mut self, archive: ArchiveId) {
-        self.entries.retain(|handle, _| handle.archive != archive);
     }
 }
 
@@ -672,6 +725,77 @@ mod tests {
             repo.read(first).expect("reread evicted payload").as_slice(),
             b"a"
         );
+    }
+
+    #[test]
+    fn decoded_payload_cache_evicts_by_byte_budget() {
+        let path = archive_path(b"cache/bytes.lib").expect("path");
+        let bytes = build_nres(&[
+            ("a.bin", b"1234".as_slice()),
+            ("b.bin", b"5678".as_slice()),
+            ("c.bin", b"90".as_slice()),
+        ]);
+        let mut vfs = MemoryVfs::default();
+        vfs.insert(path.clone(), Arc::from(bytes.into_boxed_slice()));
+        let repo = CachedResourceRepository::with_payload_cache_limits(
+            Arc::new(vfs),
+            PayloadCacheLimits {
+                max_entries: 64,
+                max_bytes: 6,
+            },
+        );
+
+        let archive = repo.open_archive(&path).expect("open archive");
+        let first = repo
+            .find(archive, &resource_name(b"a.bin"))
+            .expect("find a")
+            .expect("a");
+        let second = repo
+            .find(archive, &resource_name(b"b.bin"))
+            .expect("find b")
+            .expect("b");
+        let third = repo
+            .find(archive, &resource_name(b"c.bin"))
+            .expect("find c")
+            .expect("c");
+
+        assert_eq!(repo.read(first).expect("read a").as_slice(), b"1234");
+        assert_eq!(repo.read(second).expect("read b").as_slice(), b"5678");
+        assert_eq!(repo.read(third).expect("read c").as_slice(), b"90");
+
+        let state = repo.state.lock().expect("state");
+        assert_eq!(state.payload_cache.current_bytes, 6);
+        assert_eq!(state.payload_cache.entries.len(), 2);
+        assert!(!state.payload_cache.entries.contains_key(&first));
+        assert!(state.payload_cache.entries.contains_key(&second));
+        assert!(state.payload_cache.entries.contains_key(&third));
+    }
+
+    #[test]
+    fn decoded_payload_cache_does_not_store_payload_larger_than_budget() {
+        let path = archive_path(b"cache/oversized.lib").expect("path");
+        let bytes = build_nres(&[("big.bin", b"1234567".as_slice())]);
+        let mut vfs = MemoryVfs::default();
+        vfs.insert(path.clone(), Arc::from(bytes.into_boxed_slice()));
+        let repo = CachedResourceRepository::with_payload_cache_limits(
+            Arc::new(vfs),
+            PayloadCacheLimits {
+                max_entries: 64,
+                max_bytes: 6,
+            },
+        );
+
+        let archive = repo.open_archive(&path).expect("open archive");
+        let handle = repo
+            .find(archive, &resource_name(b"big.bin"))
+            .expect("find big")
+            .expect("big");
+
+        assert_eq!(repo.read(handle).expect("read big").as_slice(), b"1234567");
+
+        let state = repo.state.lock().expect("state");
+        assert_eq!(state.payload_cache.current_bytes, 0);
+        assert!(state.payload_cache.entries.is_empty());
     }
 
     #[test]
