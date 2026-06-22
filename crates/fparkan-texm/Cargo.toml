@@ -1,0 +1,14 @@
+[package]
+name = "fparkan-texm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+fparkan-nres = { path = "../fparkan-nres" }
+
+[lints]
+workspace = true

@@ -1,0 +1,12 @@
+[package]
+name = "fparkan-test-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fparkan-render = { path = "../fparkan-render" }
+
+[lints]
+workspace = true

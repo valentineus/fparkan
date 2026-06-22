@@ -1,0 +1,10 @@
+{
+	"schema": 1,
+	"required": ["schema", "kind", "files", "metrics"],
+	"properties": {
+		"schema": { "const": 1 },
+		"kind": { "type": "string" },
+		"files": { "type": "integer" },
+		"metrics": { "type": "object" }
+	}
+}

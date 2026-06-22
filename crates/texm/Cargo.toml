@@ -1,9 +1,0 @@
-[package]
-name = "texm"
-version = "0.1.0"
-edition = "2021"
-
-[dev-dependencies]
-common = { path = "../common" }
-nres = { path = "../nres" }
-proptest = "1"

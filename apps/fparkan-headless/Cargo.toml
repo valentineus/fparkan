@@ -1,0 +1,14 @@
+[package]
+name = "fparkan-headless"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fparkan-runtime = { path = "../../crates/fparkan-runtime" }
+fparkan-vfs = { path = "../../crates/fparkan-vfs" }
+fparkan-world = { path = "../../crates/fparkan-world" }
+
+[lints]
+workspace = true

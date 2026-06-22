@@ -1,0 +1,22 @@
+[package]
+name = "fparkan-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fparkan-mission-format = { path = "../fparkan-mission-format" }
+fparkan-nres = { path = "../fparkan-nres" }
+fparkan-path = { path = "../fparkan-path" }
+fparkan-platform = { path = "../fparkan-platform" }
+fparkan-prototype = { path = "../fparkan-prototype" }
+fparkan-render = { path = "../fparkan-render" }
+fparkan-resource = { path = "../fparkan-resource" }
+fparkan-terrain = { path = "../fparkan-terrain" }
+fparkan-terrain-format = { path = "../fparkan-terrain-format" }
+fparkan-vfs = { path = "../fparkan-vfs" }
+fparkan-world = { path = "../fparkan-world" }
+
+[lints]
+workspace = true

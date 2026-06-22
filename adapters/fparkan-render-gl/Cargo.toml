@@ -1,0 +1,12 @@
+[package]
+name = "fparkan-render-gl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fparkan-render = { path = "../../crates/fparkan-render" }
+
+[lints]
+workspace = true

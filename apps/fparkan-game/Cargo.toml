@@ -1,0 +1,15 @@
+[package]
+name = "fparkan-game"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fparkan-render = { path = "../../crates/fparkan-render" }
+fparkan-runtime = { path = "../../crates/fparkan-runtime" }
+fparkan-vfs = { path = "../../crates/fparkan-vfs" }
+fparkan-world = { path = "../../crates/fparkan-world" }
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "required": ["schema", "corpus"],
+  "properties": {
+    "schema": { "const": 1 },
+    "corpus": {
+      "type": "array",
+      "items": {
+        "required": ["id", "kind", "root", "expected_profile"],
+        "properties": {
+          "id": { "type": "string" },
+          "kind": { "enum": ["demo", "part1", "part2"] },
+          "root": { "type": "string" },
+          "expected_profile": { "type": "string" }
+        }
+      }
+    }
+  }
+}

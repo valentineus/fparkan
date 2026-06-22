@@ -111,6 +111,39 @@ launcher, который восстанавливает snapshot, запуска
 key, configuration, device profile, initial state, input/time script и версии
 инструментов.
 
+## Local evidence requests
+
+На текущем рабочем месте закрыты статические, corpus и headless runtime gates.
+Для macOS Desktop GL подтверждены безопасный command/state trace и offscreen
+pixel capture:
+
+- `cargo test -p fparkan-render-gl --offline desktop_gl33_triangle_command_capture`;
+- `fixtures/acceptance/macos-gl33-triangle-capture.json`.
+
+`S3-GL-001` считается закрытым для текущей macOS-focused цели: временный
+`rustc` probe создал CGL/OpenGL offscreen FBO, выполнил shader-based triangle
+draw, прочитал RGBA pixels и сохранил hash capture. Probe не добавляет
+project-owned `unsafe` в workspace; постоянный adapter API остаётся safe.
+
+Для повышения `S3-GL-002` до `covered` всё ещё нужен воспроизводимый GLES2
+backend profile: GLES2 должен создать кадр, сохранить pixel capture и тот же
+command/state trace. Локальный Docker probe существующего Rust image не нашёл
+`libGL`, `libEGL`, `libGLES` или `libOSMesa`, поэтому закрытие этого gate требует
+отдельно предоставленного Docker image с Rust + Mesa/EGL/OSMesa либо разрешения
+на установку соответствующего проверочного окружения.
+
+Для текущей macOS-focused цели `S3-GL-002`, `L3-DEVICE-001` и `L5-RG40-001`
+помечены как `omitted`: они остаются требованиями portable target scope, но не
+блокируют локальный macOS acceptance-аудит. При возврате RG40XX/GLES2 в область
+цели эти gates снова должны требовать внешнего evidence.
+
+`L3-DEVICE-001` и `L5-RG40-001` не закрываются локально без RG40XX H или
+эквивалентного удалённого runner-а. Требуемое доказательство: запуск выбранной
+миссии при 640x480 на целевом профиле, сохранённые stdout/stderr, build
+fingerprint, manifest игрового каталога, frame/tick budget, memory budget и
+итоговый pass/fail report. Desktop/headless результаты не считаются заменой
+on-device smoke.
+
 ## Closure criteria
 
 Вопрос считается закрытым только при наличии build fingerprint, raw trace,

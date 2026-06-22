@@ -1,0 +1,17 @@
+{
+  "schema_version": "fparkan-macos-gl33-triangle-capture-v1",
+  "acceptance_id": "S3-GL-001",
+  "platform_scope": "macos",
+  "profile": "DesktopCore33",
+  "probe": "temporary rustc CGL/OpenGL offscreen FBO triangle capture",
+  "workspace_source_unsafe_free": true,
+  "requested_cgl_profile": "3.2-core-or-newer",
+  "version": "4.1 APPLE-23.1.1",
+  "renderer": "Apple Software Renderer",
+  "width": 64,
+  "height": 64,
+  "magenta_pixels": 1352,
+  "black_pixels": 2744,
+  "center_rgba": [255, 0, 255, 255],
+  "fnv1a64": "060aba78d7123f25"
+}

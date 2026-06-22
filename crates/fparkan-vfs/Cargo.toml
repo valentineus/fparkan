@@ -1,0 +1,12 @@
+[package]
+name = "fparkan-vfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fparkan-path = { path = "../fparkan-path" }
+
+[lints]
+workspace = true

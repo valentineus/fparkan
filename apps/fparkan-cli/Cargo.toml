@@ -1,0 +1,18 @@
+[package]
+name = "fparkan-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fparkan-corpus = { path = "../../crates/fparkan-corpus" }
+fparkan-nres = { path = "../../crates/fparkan-nres" }
+fparkan-prototype = { path = "../../crates/fparkan-prototype" }
+fparkan-resource = { path = "../../crates/fparkan-resource" }
+fparkan-rsli = { path = "../../crates/fparkan-rsli" }
+fparkan-runtime = { path = "../../crates/fparkan-runtime" }
+fparkan-vfs = { path = "../../crates/fparkan-vfs" }
+
+[lints]
+workspace = true

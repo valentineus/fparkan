@@ -1,0 +1,15 @@
+[package]
+name = "fparkan-fx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fparkan-binary = { path = "../fparkan-binary" }
+
+[dev-dependencies]
+fparkan-nres = { path = "../fparkan-nres" }
+
+[lints]
+workspace = true

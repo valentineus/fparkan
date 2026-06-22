@@ -1,0 +1,18 @@
+[package]
+name = "fparkan-material"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+encoding_rs = "0.8"
+fparkan-path = { path = "../fparkan-path" }
+fparkan-resource = { path = "../fparkan-resource" }
+
+[dev-dependencies]
+fparkan-nres = { path = "../fparkan-nres" }
+fparkan-vfs = { path = "../fparkan-vfs" }
+
+[lints]
+workspace = true
