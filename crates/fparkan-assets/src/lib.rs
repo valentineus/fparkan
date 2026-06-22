@@ -426,6 +426,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn prepares_real_unit_asset_plan() {
         let root = fixture_root("IS");
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(&root));
@@ -448,6 +449,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn repository_plan_deduplicates_duplicate_visuals_but_graph_preserves_requests() {
         let root = fixture_root("IS");
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(&root));

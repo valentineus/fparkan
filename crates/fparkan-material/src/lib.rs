@@ -1092,6 +1092,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_corpus_mat0_and_wear_parse() {
         for (corpus, expected_mat0, expected_archive_wear, expected_standalone_wear) in [
             ("IS", 905_usize, 439_usize, 95_usize),

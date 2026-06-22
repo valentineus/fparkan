@@ -262,6 +262,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn selected_is_and_is2_missions_produce_approved_render_captures() {
         for case in [
             RenderCase {

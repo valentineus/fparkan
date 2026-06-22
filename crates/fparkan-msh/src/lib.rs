@@ -1236,6 +1236,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_corpus_msh_assets_validate() {
         for (corpus, expected) in [("IS", 435_usize), ("IS2", 511_usize)] {
             let Some(root) = corpus_root(corpus) else {
@@ -1279,6 +1280,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_corpus_animation_streams_sample_approved_pose_captures() {
         for (
             corpus,

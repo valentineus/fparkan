@@ -1071,6 +1071,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_corpus_texm_assets_validate_and_decode_mip0() {
         for (corpus, expected) in [("IS", 518_usize), ("IS2", 631_usize)] {
             let Some(root) = corpus_root(corpus) else {

@@ -696,6 +696,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_corpora_repository_reads_nres_and_rsli() {
         licensed_repository_gate("IS").expect("part 1 repository gate");
         licensed_repository_gate("IS2").expect("part 2 repository gate");

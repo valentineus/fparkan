@@ -1826,6 +1826,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_corpora_unit_dat_parse_counts() {
         let cases = [("IS", 425, 5_219), ("IS2", 676, 8_145)];
         for (corpus, expected_files, expected_records) in cases {
@@ -1859,6 +1860,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_corpora_registry_payloads_are_record_aligned() {
         for corpus in ["IS", "IS2"] {
             let root = corpus_root(corpus).expect("corpus root");

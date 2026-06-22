@@ -695,6 +695,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn load_trace_records_preparation_before_registration_and_raw_transforms() {
         let root = workspace_root().join("testdata").join("IS");
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(&root));
@@ -736,6 +737,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn missing_map_and_missing_reachable_resource_fail_before_registration() {
         let root = workspace_root().join("testdata").join("IS");
         for (denied, mission) in [
@@ -779,6 +781,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn registration_phase_failure_uses_normal_teardown_and_keeps_engine_world() {
         let root = workspace_root().join("testdata").join("IS");
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(root));
@@ -816,6 +819,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn selected_is_and_is2_missions_execute_10000_deterministic_ticks() {
         for case in [
             HeadlessCase {
@@ -849,6 +853,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_corpora_load_all_mission_foundations() {
         let root = workspace_root();
         let part1 = load_all(&root.join("testdata").join("IS"));

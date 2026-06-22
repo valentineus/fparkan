@@ -27,8 +27,8 @@ fn run(args: &[String]) -> Result<(), String> {
         [cmd] if cmd == "ci" => {
             run_rustfmt_check(Path::new("."))?;
             run_policy(Path::new("."))?;
-            cargo(&["test", "--workspace", "--offline"])?;
-            clippy_rustup(&["--workspace", "--offline"])?;
+            cargo(&["test", "--workspace", "--locked", "--offline"])?;
+            clippy_rustup(&["--workspace", "--locked", "--offline"])?;
             Ok(())
         }
         [cmd] if cmd == "policy" => run_policy(Path::new(".")),
@@ -46,12 +46,12 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         [cmd, suite, rest @ ..] if cmd == "test" && suite == "synthetic" => {
             let options = parse_test_options(rest, PathBuf::from("testdata"))?;
-            run_stage_tests(options.stage)
+            run_stage_tests(options.stage, TestSuite::Synthetic)
         }
         [cmd, suite, rest @ ..] if cmd == "test" && suite == "licensed" => {
             let options = parse_test_options(rest, PathBuf::from("testdata"))?;
             validate_licensed_root(&options.root)?;
-            run_stage_tests(options.stage)
+            run_stage_tests(options.stage, TestSuite::Licensed)
         }
         [cmd, subcmd, rest @ ..] if cmd == "corpus" && subcmd == "baseline" => {
             let root = parse_root(rest)?;
@@ -248,6 +248,7 @@ fn run_package(options: &PackageOptions) -> Result<(), String> {
         "-p".to_string(),
         options.app.package().to_string(),
         "--release".to_string(),
+        "--locked".to_string(),
         "--offline".to_string(),
         "--target".to_string(),
         options.target.clone(),
@@ -258,6 +259,8 @@ fn run_policy(root: &Path) -> Result<(), String> {
     let mut failures = Vec::new();
     scan_policy_dir(root, &mut failures)?;
     validate_cargo_metadata(root, &mut failures)?;
+    validate_lockfile(root, &mut failures);
+    validate_workspace_license(root, &mut failures)?;
     validate_dependency_boundaries(root, &mut failures)?;
     if failures.is_empty() {
         Ok(())
@@ -278,6 +281,7 @@ fn validate_cargo_metadata(root: &Path, failures: &mut Vec<String>) -> Result<()
             "--format-version",
             "1",
             "--offline",
+            "--locked",
             "--no-deps",
             "--manifest-path",
         ])
@@ -291,6 +295,62 @@ fn validate_cargo_metadata(root: &Path, failures: &mut Vec<String>) -> Result<()
             manifest.display(),
             stderr.trim()
         ));
+    }
+    Ok(())
+}
+
+fn validate_lockfile(root: &Path, failures: &mut Vec<String>) {
+    let lockfile = root.join("Cargo.lock");
+    if !lockfile.is_file() {
+        failures.push(format!(
+            "{}: workspace lockfile is required for locked/offline builds",
+            lockfile.display()
+        ));
+    }
+}
+
+fn validate_workspace_license(root: &Path, failures: &mut Vec<String>) -> Result<(), String> {
+    let manifest = root.join("Cargo.toml");
+    let license = fs::read_to_string(root.join("LICENSE.txt"))
+        .map_err(|err| format!("{}: {err}", root.join("LICENSE.txt").display()))?;
+    let expected = if license.contains("GNU GENERAL PUBLIC LICENSE")
+        && license.contains("Version 2, June 1991")
+    {
+        "GPL-2.0-only"
+    } else {
+        failures.push(format!(
+            "{}: unsupported repository license text",
+            root.join("LICENSE.txt").display()
+        ));
+        return Ok(());
+    };
+
+    let mut manifests = Vec::new();
+    collect_cargo_manifests(root, &mut manifests)?;
+    manifests.push(manifest);
+    manifests.sort();
+    manifests.dedup();
+
+    for manifest in manifests {
+        let text = fs::read_to_string(&manifest)
+            .map_err(|err| format!("{}: {err}", manifest.display()))?;
+        let explicit_license = parse_manifest_license(&text);
+        let is_root = manifest == root.join("Cargo.toml");
+        if is_root {
+            if explicit_license.as_deref() != Some(expected) {
+                failures.push(format!(
+                    "{}: workspace.package license must be {expected}",
+                    manifest.display()
+                ));
+            }
+        } else if let Some(license) = explicit_license {
+            if license != expected {
+                failures.push(format!(
+                    "{}: package license {license} does not match repository license {expected}",
+                    manifest.display()
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -355,6 +415,23 @@ fn collect_cargo_manifests(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Str
         }
     }
     Ok(())
+}
+
+fn parse_manifest_license(manifest: &str) -> Option<String> {
+    let mut in_package = false;
+    let mut in_workspace_package = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_package = trimmed == "[package]";
+            in_workspace_package = trimmed == "[workspace.package]";
+            continue;
+        }
+        if (in_package || in_workspace_package) && trimmed.starts_with("license") {
+            return parse_toml_string_value(trimmed);
+        }
+    }
+    None
 }
 
 fn parse_package_name(manifest: &str) -> Option<String> {
@@ -1082,7 +1159,7 @@ fn run_acceptance_report(options: &AcceptanceOptions) -> Result<(), String> {
     if options.suite == TestSuite::Licensed {
         validate_licensed_root(&options.root)?;
     }
-    run_stage_tests(options.stage)?;
+    run_stage_tests(options.stage, options.suite)?;
 
     if let Some(parent) = options.out.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
@@ -1131,12 +1208,22 @@ fn stage_report_packages(stage: Stage) -> Vec<&'static str> {
     }
 }
 
-fn run_stage_tests(stage: Stage) -> Result<(), String> {
+fn run_stage_tests(stage: Stage, suite: TestSuite) -> Result<(), String> {
+    let mut suffix = Vec::new();
+    if suite == TestSuite::Licensed {
+        suffix.extend(["--", "--ignored"]);
+    }
     match stage {
-        Stage::All => cargo(&["test", "--workspace", "--offline"]),
+        Stage::All => {
+            let mut args = vec!["test", "--workspace", "--locked", "--offline"];
+            args.extend(suffix);
+            cargo(&args)
+        }
         Stage::Number(number) => {
             for package in stage_packages(number)? {
-                cargo(&["test", "-p", package, "--offline"])?;
+                let mut args = vec!["test", "-p", package, "--locked", "--offline"];
+                args.extend(suffix.iter().copied());
+                cargo(&args)?;
             }
             Ok(())
         }

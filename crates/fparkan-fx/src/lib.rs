@@ -838,6 +838,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_corpus_fxid_exact_eof_and_distribution() {
         for (corpus, expected_count) in [("IS", 923_usize), ("IS2", 1065_usize)] {
             let Some(root) = corpus_root(corpus) else {
@@ -886,6 +887,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_corpus_fxid_emission_captures_are_approved() {
         for (corpus, expected_count, expected_emitting, expected_hash) in [
             ("IS", 923_usize, 467_usize, 10_553_431_922_547_057_702_u64),

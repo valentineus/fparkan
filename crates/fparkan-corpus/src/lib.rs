@@ -442,6 +442,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn report_for_testdata_roots() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -457,6 +458,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_part1_manifest_profile_and_counts_match_baseline() {
         let root = testdata_root("IS");
         let manifest = discover(&root, DiscoverOptions::default()).expect("part 1 manifest");
@@ -473,6 +475,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_part2_manifest_profile_and_counts_match_baseline() {
         let root = testdata_root("IS2");
         let manifest = discover(&root, DiscoverOptions::default()).expect("part 2 manifest");
@@ -489,6 +492,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_part1_has_no_casefold_relative_path_collisions() {
         let root = testdata_root("IS");
         let manifest = discover(&root, DiscoverOptions::default()).expect("part 1 manifest");
@@ -497,6 +501,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_part2_has_no_casefold_relative_path_collisions() {
         let root = testdata_root("IS2");
         let manifest = discover(&root, DiscoverOptions::default()).expect("part 2 manifest");
@@ -505,11 +510,13 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_part1_paths_stay_under_root() {
         assert_discovered_paths_stay_under_root("IS");
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_part2_paths_stay_under_root() {
         assert_discovered_paths_stay_under_root("IS2");
     }

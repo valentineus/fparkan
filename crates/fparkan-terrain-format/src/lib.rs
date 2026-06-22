@@ -1488,6 +1488,7 @@ Generator 1
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_corpus_land_msh_validate() {
         for (corpus, expected_files, expected_vertices, expected_faces) in [
             ("IS", 33_usize, 299_450_usize, 275_882_usize),
@@ -1536,6 +1537,7 @@ Generator 1
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_corpus_build_dat_validate() {
         for (corpus, expected_ai_prefix) in [("IS", false), ("IS2", true)] {
             let Some(root) = corpus_root(corpus) else {
@@ -1583,6 +1585,7 @@ Generator 1
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_corpus_land_map_validate() {
         for (corpus, expected_files, expected_areals, expected_vertices, expected_max_hits) in [
             ("IS", 33_usize, 34_662_usize, 197_698_usize, 20_usize),

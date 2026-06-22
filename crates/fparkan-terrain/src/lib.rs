@@ -794,6 +794,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_corpus_land_maps_build_navigation_worlds() {
         for (corpus, expected_files, expected_areals) in [
             ("IS", 33_usize, 34_662_usize),
@@ -849,6 +850,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_corpus_land_meshes_build_surface_worlds() {
         for (corpus, expected_files, expected_faces) in [
             ("IS", 33_usize, 275_882_usize),

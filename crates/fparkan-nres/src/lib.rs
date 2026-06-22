@@ -1779,6 +1779,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_corpora_nres_roundtrip_gates() {
         let part1 = corpus_gate("IS", 120, 6_804).expect("part 1 NRes gate");
         let part2 = corpus_gate("IS2", 134, 8_171).expect("part 2 NRes gate");

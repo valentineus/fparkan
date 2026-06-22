@@ -1742,6 +1742,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_corpora_rsli_roundtrip_gates() {
         let part1 = corpus_gate("IS", 2).expect("part 1 RsLi gate");
         let part2 = corpus_gate("IS2", 2).expect("part 2 RsLi gate");
@@ -1751,6 +1752,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_part1_rsli_method_distribution_baseline() {
         let stats = corpus_gate("IS", 2).expect("part 1 RsLi gate");
 
@@ -1770,6 +1772,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_part2_rsli_method_distribution_baseline() {
         let stats = corpus_gate("IS2", 2).expect("part 2 RsLi gate");
 
@@ -1789,6 +1792,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_corpora_rsli_quirk_is_only_approved_interf8_tex() {
         let part1 = corpus_gate("IS", 2).expect("part 1 RsLi gate");
         let part2 = corpus_gate("IS2", 2).expect("part 2 RsLi gate");
