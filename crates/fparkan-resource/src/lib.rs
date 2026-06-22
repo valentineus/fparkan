@@ -128,7 +128,30 @@ pub enum ResourceError {
 
 impl std::fmt::Display for ResourceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::MissingArchive => write!(f, "archive was not found"),
+            Self::MissingEntry => write!(f, "resource entry was not found in the archive"),
+            Self::InvalidHandle => write!(
+                f,
+                "resource handle does not reference an open archive entry"
+            ),
+            Self::StaleHandle => {
+                write!(f, "resource handle belongs to an older archive generation")
+            }
+            Self::Format(message) => write!(f, "resource archive format error: {message}"),
+            Self::EntryRead { key, source } => {
+                write!(
+                    f,
+                    "failed to read resource {}:{} from {}: {}",
+                    key.type_id
+                        .map_or_else(|| "-".to_string(), |type_id| type_id.to_string()),
+                    String::from_utf8_lossy(&key.name.0),
+                    key.archive.as_str(),
+                    source
+                )
+            }
+            Self::Poisoned => write!(f, "resource repository state lock was poisoned"),
+        }
     }
 }
 
@@ -882,6 +905,28 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+
+    #[test]
+    fn resource_error_display_is_actionable() {
+        let path = archive_path(b"bad/rsli.lib").expect("path");
+        let err = ResourceError::EntryRead {
+            key: ResourceKey {
+                archive: path,
+                name: resource_name(b"BROKEN.TEX"),
+                type_id: None,
+            },
+            source: "unsupported packing method 0x1e0".to_string(),
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "failed to read resource -:BROKEN.TEX from bad/rsli.lib: unsupported packing method 0x1e0"
+        );
+        assert_eq!(
+            ResourceError::StaleHandle.to_string(),
+            "resource handle belongs to an older archive generation"
+        );
     }
 
     #[test]

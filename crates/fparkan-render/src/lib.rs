@@ -172,7 +172,28 @@ pub enum RenderError {
 
 impl std::fmt::Display for RenderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::InvalidRange => write!(f, "render command contains an empty index range"),
+            Self::InvalidDrawRange {
+                draw_id,
+                stable_order,
+                start,
+                count,
+            } => write!(
+                f,
+                "draw {} has invalid index range start={} count={} at stable order {}",
+                draw_id.0, start, count, stable_order
+            ),
+            Self::MaterialIndexOutOfBounds {
+                draw_id,
+                material_index,
+                material_count,
+            } => write!(
+                f,
+                "draw {} references material index {} but only {} material slots are available",
+                draw_id.0, material_index, material_count
+            ),
+        }
     }
 }
 
@@ -532,6 +553,29 @@ mod tests {
                 count: 0
             })
         ));
+    }
+
+    #[test]
+    fn render_error_display_is_actionable() {
+        assert_eq!(
+            RenderError::InvalidDrawRange {
+                draw_id: DrawId(9),
+                stable_order: 10,
+                start: 4,
+                count: 0
+            }
+            .to_string(),
+            "draw 9 has invalid index range start=4 count=0 at stable order 10"
+        );
+        assert_eq!(
+            RenderError::MaterialIndexOutOfBounds {
+                draw_id: DrawId(7),
+                material_index: 3,
+                material_count: 2
+            }
+            .to_string(),
+            "draw 7 references material index 3 but only 2 material slots are available"
+        );
     }
 
     #[test]

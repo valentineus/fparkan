@@ -97,7 +97,14 @@ pub enum PathError {
 
 impl fmt::Display for PathError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::Empty => write!(f, "path is empty"),
+            Self::EmbeddedNul => write!(f, "path contains an embedded NUL byte"),
+            Self::Absolute => write!(f, "path must be relative and cannot be absolute"),
+            Self::ParentTraversal => write!(f, "path attempts to traverse outside its root"),
+            Self::EscapesRoot => write!(f, "normalized path escapes the configured root"),
+            Self::InvalidUtf8 => write!(f, "path is not valid UTF-8 after normalization"),
+        }
     }
 }
 
@@ -226,6 +233,18 @@ mod tests {
         assert_eq!(
             normalize_relative(b"DATA\0MAPS", PathPolicy::StrictLegacy),
             Err(PathError::EmbeddedNul)
+        );
+    }
+
+    #[test]
+    fn path_error_display_is_actionable() {
+        assert_eq!(
+            PathError::ParentTraversal.to_string(),
+            "path attempts to traverse outside its root"
+        );
+        assert_eq!(
+            PathError::EmbeddedNul.to_string(),
+            "path contains an embedded NUL byte"
         );
     }
 

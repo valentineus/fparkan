@@ -169,7 +169,15 @@ pub enum WorldError {
 
 impl std::fmt::Display for WorldError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::InvalidHandle => write!(f, "object handle does not reference a known slot"),
+            Self::StaleHandle => write!(f, "object handle belongs to an older slot generation"),
+            Self::Deleted => write!(f, "object has already been deleted"),
+            Self::DuplicateOriginalObjectId(id) => {
+                write!(f, "original object id {} is already registered", id.0)
+            }
+            Self::InvalidFixedStep => write!(f, "fixed-step configuration must be non-zero"),
+        }
     }
 }
 
@@ -629,6 +637,18 @@ mod tests {
         assert_eq!(
             register_object(&mut world, duplicate),
             Err(WorldError::DuplicateOriginalObjectId(OriginalObjectId(8)))
+        );
+    }
+
+    #[test]
+    fn world_error_display_is_actionable() {
+        assert_eq!(
+            WorldError::StaleHandle.to_string(),
+            "object handle belongs to an older slot generation"
+        );
+        assert_eq!(
+            WorldError::DuplicateOriginalObjectId(OriginalObjectId(8)).to_string(),
+            "original object id 8 is already registered"
         );
     }
 
