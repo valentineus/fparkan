@@ -232,8 +232,8 @@ S4-ANIM-005	covered	cargo test -p fparkan-animation --offline exact_key_time_ret
 S4-ANIM-006	covered	cargo test -p fparkan-animation --offline pose_track_blends_translation_and_rotation
 S4-ANIM-007	covered	cargo test -p fparkan-animation --offline quaternion_shortest_path_sign_flip_is_stable
 S4-ANIM-008	covered	cargo test -p fparkan-animation --offline zero_or_degenerate_key_interval_is_rejected
-S4-ANIM-009	covered	cargo test -p fparkan-animation --offline x87_boundary_golden_vectors_and_profile_difference_report
-S4-ANIM-010	covered	cargo test -p fparkan-animation --offline x87_boundary_golden_vectors_and_profile_difference_report
+S4-ANIM-009	omitted	current sampler is a portable reference path; runtime-captured x87 parity vectors are not implemented in the macOS-focused scope
+S4-ANIM-010	omitted	current sampler accepts the profile marker but does not implement an independent x87 compatibility path
 S4-ANIM-011	covered	cargo test -p fparkan-animation --offline blend_optional_pose_uses_valid_side
 S4-ANIM-012	covered	cargo test -p fparkan-animation --offline hierarchy_evaluates_parent_before_child_and_rejects_cycles
 S4-ANIM-013	covered	cargo test -p fparkan-animation --offline hierarchy_evaluates_parent_before_child_and_rejects_cycles
@@ -254,13 +254,13 @@ S4-FX-014	covered	cargo test -p fparkan-fx --offline rejects_command_count_that_
 S4-FX-015	covered	cargo test -p fparkan-fx --offline rejects_trailing_bytes_after_command_stream
 S4-FX-016	covered	cargo test -p fparkan-fx --offline fixed_resource_refs_preserve_tails
 S4-FX-017	covered	cargo test -p fparkan-fx --offline missing_dependency_error_contains_effect_command_archive_and_name
-S4-FX-018	covered	cargo test -p fparkan-fx --offline create_records_seed_transform_and_start_time
-S4-FX-019	covered	cargo test -p fparkan-fx --offline update_and_emit_are_separate
-S4-FX-020	covered	cargo test -p fparkan-fx --offline update_and_emit_are_separate
-S4-FX-021	covered	cargo test -p fparkan-fx --offline stable_command_order_and_emission_capture_are_seed_stable
-S4-FX-022	covered	cargo test -p fparkan-fx --offline stop_restart_end_lifecycle_controls_emission
-S4-FX-023	covered	cargo test -p fparkan-fx --offline stable_command_order_and_emission_capture_are_seed_stable
-S4-FX-024	covered	cargo test -p fparkan-fx --offline unrelated_rng_stream_use_does_not_perturb_fx_capture
+S4-FX-018	omitted	FX create/update/emit is documented as a deterministic reference stub until runtime-captured lifecycle semantics are implemented
+S4-FX-019	omitted	FX update side-effect contract is stub-level only and not accepted as original runtime parity evidence
+S4-FX-020	omitted	FX emit side-effect contract is stub-level only and not accepted as original runtime parity evidence
+S4-FX-021	omitted	FX command order is deterministic for the stub but original runtime ordering evidence is not implemented
+S4-FX-022	omitted	FX lifecycle controls are deterministic for the stub but original stop/restart/end semantics are not implemented
+S4-FX-023	omitted	FX emission capture is deterministic for the stub but lacks runtime-captured parity evidence
+S4-FX-024	omitted	FX RNG accounting is not implemented beyond the reference stub and must not count as compatibility coverage
 S4-FX-FUZZ-001	covered	cargo test -p fparkan-fx --offline arbitrary_command_streams_are_bounded_and_panic_free
 L4-P1-ANIM-001	covered	cargo test -p fparkan-msh --offline licensed_corpus_animation_streams_sample_approved_pose_captures
 L4-P2-ANIM-001	covered	cargo test -p fparkan-msh --offline licensed_corpus_animation_streams_sample_approved_pose_captures
@@ -271,8 +271,8 @@ L4-P2-FX-001	covered	cargo test -p fparkan-fx --offline licensed_corpus_fxid_exa
 L4-P1-FX-002	covered	cargo test -p fparkan-fx --offline licensed_corpus_fxid_exact_eof_and_distribution
 L4-P2-FX-002	covered	cargo test -p fparkan-fx --offline licensed_corpus_fxid_exact_eof_and_distribution
 L4-FX-OP6-001	covered	cargo test -p fparkan-fx --offline licensed_corpus_fxid_exact_eof_and_distribution
-L4-P1-EFFECT-001	covered	cargo test -p fparkan-fx --offline licensed_corpus_fxid_emission_captures_are_approved
-L4-P2-EFFECT-001	covered	cargo test -p fparkan-fx --offline licensed_corpus_fxid_emission_captures_are_approved
+L4-P1-EFFECT-001	omitted	licensed FX emission capture currently covers deterministic reference-stub output, not original runtime-captured effect parity
+L4-P2-EFFECT-001	omitted	licensed FX emission capture currently covers deterministic reference-stub output, not original runtime-captured effect parity
 S5-LMESH-001	covered	cargo test -p fparkan-terrain-format --offline land_msh_required_streams_are_order_independent_and_stride_checked
 S5-LMESH-002	covered	cargo test -p fparkan-terrain-format --offline land_msh_required_streams_are_order_independent_and_stride_checked
 S5-LMESH-003	covered	cargo test -p fparkan-terrain-format --offline decodes_minimal_land_msh

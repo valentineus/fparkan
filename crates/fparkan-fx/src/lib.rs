@@ -1,5 +1,10 @@
 #![forbid(unsafe_code)]
 //! FXID effect contracts.
+//!
+//! FXID decoding and command framing are implemented as compatibility
+//! contracts. The create/update/emit lifecycle below is a deterministic
+//! reference stub until opcode timing, gates, RNG, and command-body semantics
+//! are backed by runtime-captured evidence.
 
 use fparkan_binary::{Cursor, DecodeError};
 use std::sync::Arc;
@@ -121,7 +126,7 @@ impl Default for Transform {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct GameTime(pub u64);
 
-/// FX runtime state.
+/// FX reference-stub runtime state.
 #[derive(Clone, Debug)]
 pub struct FxState {
     /// Instance id.
@@ -322,12 +327,12 @@ pub fn decode_fxid(bytes: Arc<[u8]>) -> Result<FxDocument, FxError> {
     })
 }
 
-/// Creates an FX instance.
+/// Creates a deterministic FX reference-stub instance.
 ///
 /// # Errors
 ///
 /// Currently returns [`FxError`] only for future resource/lifecycle validation
-/// hooks; creation is deterministic for a decoded document.
+/// hooks. This function does not claim original runtime parity.
 pub fn create_instance(
     document: Arc<FxDocument>,
     seed: FxSeed,
@@ -344,21 +349,21 @@ pub fn create_instance(
     })
 }
 
-/// Updates FX simulation time without emitting side effects.
+/// Updates reference-stub FX simulation time without emitting side effects.
 ///
 /// # Errors
 ///
-/// Reserved for future runtime validation.
+/// Reserved for future runtime-captured compatibility validation.
 pub fn update(state: &mut FxState, time: GameTime) -> Result<(), FxError> {
     state.time = time;
     Ok(())
 }
 
-/// Emits active commands without advancing state.
+/// Emits reference-stub active commands without advancing state.
 ///
 /// # Errors
 ///
-/// Reserved for future resource/runtime validation.
+/// Reserved for future resource/runtime-captured compatibility validation.
 pub fn emit(state: &FxState, out: &mut Vec<FxEmission>) -> Result<(), FxError> {
     if state.lifecycle != FxLifecycle::Running {
         return Ok(());

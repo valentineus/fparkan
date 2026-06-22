@@ -1,15 +1,18 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::cast_precision_loss)]
 //! Deterministic animation sampling contracts.
+//!
+//! The current sampler is a portable reference path. Compatibility profiles
+//! that require runtime-captured x87 parity remain explicit evidence gaps.
 
 use std::fmt;
 
 /// Numeric profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NumericProfile {
-    /// Portable reference.
+    /// Portable reference sampler implemented by this crate.
     PortableReference,
-    /// X87-compatible compatibility profile for captured parity vectors.
+    /// Reserved profile for future runtime-captured x87 parity vectors.
     X87Compatibility,
 }
 
@@ -424,8 +427,11 @@ impl PoseTrack {
         &self.keys
     }
 
-    /// Samples the pose track with linear translation and normalized quaternion
-    /// interpolation.
+    /// Samples the pose track with the portable reference path.
+    ///
+    /// `NumericProfile::X87Compatibility` is accepted so callers can keep the
+    /// compatibility contract explicit, but it does not yet select an
+    /// independently captured x87 runtime path.
     ///
     /// # Errors
     ///
