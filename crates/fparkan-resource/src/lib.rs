@@ -210,12 +210,17 @@ struct ArchiveSlot {
     fingerprint: Sha256Digest,
     generation: u64,
     kind: ArchiveKind,
-    document: ArchiveDocument,
+    document: Arc<ArchiveDocument>,
 }
 
 enum ArchiveDocument {
     Nres(fparkan_nres::NresDocument),
     Rsli(fparkan_rsli::RsliDocument),
+}
+
+struct PayloadDecodeTask {
+    document: Arc<ArchiveDocument>,
+    key: ResourceKey,
 }
 
 #[derive(Debug, Default)]
@@ -320,7 +325,7 @@ impl ResourceRepository for CachedResourceRepository {
     ) -> Result<Option<EntryHandle>, ResourceError> {
         let state = self.state.lock().map_err(|_| ResourceError::Poisoned)?;
         let slot = state.archive(archive)?;
-        let local = match &slot.document {
+        let local = match slot.document.as_ref() {
             ArchiveDocument::Nres(document) => document.find_bytes(&name.0).map(|id| id.0),
             ArchiveDocument::Rsli(document) => document.find_bytes(&name.0).map(|id| id.0),
         };
@@ -334,7 +339,7 @@ impl ResourceRepository for CachedResourceRepository {
     fn first_entry(&self, archive: ArchiveId) -> Result<Option<EntryHandle>, ResourceError> {
         let state = self.state.lock().map_err(|_| ResourceError::Poisoned)?;
         let slot = state.archive(archive)?;
-        let local = match &slot.document {
+        let local = match slot.document.as_ref() {
             ArchiveDocument::Nres(document) => document.entries().first().map(|entry| entry.id().0),
             ArchiveDocument::Rsli(document) => document.entry(fparkan_rsli::EntryId(0)).map(|_| 0),
         };
@@ -346,21 +351,27 @@ impl ResourceRepository for CachedResourceRepository {
     }
 
     fn read(&self, entry: EntryHandle) -> Result<ResourceBytes, ResourceError> {
+        let task = {
+            let mut state = self.state.lock().map_err(|_| ResourceError::Poisoned)?;
+            if let Some(bytes) = state.payload_cache.get(entry) {
+                return Ok(ResourceBytes::Shared(bytes));
+            }
+            state.payload_decode_task(entry)?
+        };
+        let payload =
+            task.document
+                .read_payload(entry.local)
+                .map_err(|source| ResourceError::EntryRead {
+                    key: task.key,
+                    source,
+                })?;
+        let shared = Arc::from(payload.into_boxed_slice());
+
         let mut state = self.state.lock().map_err(|_| ResourceError::Poisoned)?;
         if let Some(bytes) = state.payload_cache.get(entry) {
             return Ok(ResourceBytes::Shared(bytes));
         }
-
-        let payload = {
-            let slot = state.entry_archive(entry)?;
-            let key = slot.entry_key(entry.local)?;
-            slot.read_payload(entry.local)
-                .map_err(|source| ResourceError::EntryRead {
-                    key: key.clone(),
-                    source,
-                })?
-        };
-        let shared = Arc::from(payload.into_boxed_slice());
+        state.entry_archive(entry)?;
         state.payload_cache.insert(entry, Arc::clone(&shared));
         Ok(ResourceBytes::Shared(shared))
     }
@@ -368,7 +379,7 @@ impl ResourceRepository for CachedResourceRepository {
     fn entry_info(&self, entry: EntryHandle) -> Result<ResourceEntryInfo, ResourceError> {
         let state = self.state.lock().map_err(|_| ResourceError::Poisoned)?;
         let slot = state.entry_archive(entry)?;
-        match &slot.document {
+        match slot.document.as_ref() {
             ArchiveDocument::Nres(document) => {
                 let local =
                     usize::try_from(entry.local).map_err(|_| ResourceError::InvalidHandle)?;
@@ -512,11 +523,19 @@ impl RepositoryState {
         }
         Ok(slot)
     }
+
+    fn payload_decode_task(&self, entry: EntryHandle) -> Result<PayloadDecodeTask, ResourceError> {
+        let slot = self.entry_archive(entry)?;
+        Ok(PayloadDecodeTask {
+            document: Arc::clone(&slot.document),
+            key: slot.entry_key(entry.local)?,
+        })
+    }
 }
 
 impl ArchiveSlot {
     fn entry_key(&self, local: u32) -> Result<ResourceKey, ResourceError> {
-        match &self.document {
+        match self.document.as_ref() {
             ArchiveDocument::Nres(document) => {
                 let local = usize::try_from(local).map_err(|_| ResourceError::InvalidHandle)?;
                 let entry = document
@@ -541,9 +560,11 @@ impl ArchiveSlot {
             }
         }
     }
+}
 
+impl ArchiveDocument {
     fn read_payload(&self, local: u32) -> Result<Vec<u8>, String> {
-        match &self.document {
+        match self {
             ArchiveDocument::Nres(document) => document
                 .payload(fparkan_nres::EntryId(local))
                 .map(<[u8]>::to_vec)
@@ -568,7 +589,7 @@ fn decode_archive(
             fingerprint,
             generation: 0,
             kind: ArchiveKind::Nres,
-            document: ArchiveDocument::Nres(document),
+            document: Arc::new(ArchiveDocument::Nres(document)),
         });
     }
     if bytes.get(0..4) == Some(b"NL\0\x01") {
@@ -579,7 +600,7 @@ fn decode_archive(
             fingerprint,
             generation: 0,
             kind: ArchiveKind::Rsli,
-            document: ArchiveDocument::Rsli(document),
+            document: Arc::new(ArchiveDocument::Rsli(document)),
         });
     }
     Err(ResourceError::Format(
