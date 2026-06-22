@@ -196,6 +196,15 @@ pub struct LoadedMission {
 pub struct FrameResult {
     /// Snapshot.
     pub snapshot: WorldSnapshot,
+    /// Scheduler phases executed for this frame.
+    pub trace: FrameTrace,
+}
+
+/// Scheduler trace for a completed frame.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FrameTrace {
+    /// Frame phases in execution order.
+    pub phases: Vec<SchedulerPhase>,
 }
 
 /// Engine.
@@ -267,6 +276,13 @@ pub enum EngineError {
     },
     /// World error.
     World(fparkan_world::WorldError),
+    /// Scheduler phase order was violated.
+    SchedulerPhaseOrder {
+        /// Previous phase.
+        previous: SchedulerPhase,
+        /// Current phase.
+        current: SchedulerPhase,
+    },
     /// Staged mission world was torn down after a registration-phase failure.
     RegistrationTeardown {
         /// Registered objects before the forced failure.
@@ -304,6 +320,10 @@ impl std::fmt::Display for EngineError {
                 write!(f, "mission prototype graph has {} failures", failures.len())
             }
             Self::World(source) => write!(f, "{source}"),
+            Self::SchedulerPhaseOrder { previous, current } => write!(
+                f,
+                "scheduler phase order regressed from {previous:?} to {current:?}"
+            ),
             Self::RegistrationTeardown {
                 registered_objects,
                 released_objects,
@@ -326,9 +346,10 @@ impl std::error::Error for EngineError {
             Self::TerrainFormat { source, .. } => Some(source),
             Self::Terrain(source) => Some(source),
             Self::World(source) => Some(source),
-            Self::MissingVfs | Self::PrototypeGraph { .. } | Self::RegistrationTeardown { .. } => {
-                None
-            }
+            Self::MissingVfs
+            | Self::PrototypeGraph { .. }
+            | Self::SchedulerPhaseOrder { .. }
+            | Self::RegistrationTeardown { .. } => None,
         }
     }
 }
@@ -533,8 +554,7 @@ pub fn step_headless(
     engine: &mut Engine,
     input: InputSnapshot,
 ) -> Result<FrameResult, EngineError> {
-    let snapshot = step(&mut engine.world, &input)?;
-    Ok(FrameResult { snapshot })
+    run_frame(engine, input, SchedulerPresentation::Headless)
 }
 
 /// Steps rendered mode.
@@ -544,7 +564,8 @@ pub fn step_headless(
 /// Returns [`EngineError`] when the world step fails.
 pub fn frame(engine: &mut Engine) -> Result<FrameResult, EngineError> {
     match engine.config.mode {
-        EngineMode::Headless | EngineMode::Rendered => step_headless(engine, InputSnapshot),
+        EngineMode::Headless => step_headless(engine, InputSnapshot),
+        EngineMode::Rendered => run_frame(engine, InputSnapshot, SchedulerPresentation::Rendered),
     }
 }
 
@@ -604,6 +625,78 @@ pub fn loaded_resolved_prototypes(engine: &Engine) -> Option<&[EffectivePrototyp
         .loaded
         .as_ref()
         .map(|state| state.resolved_prototypes.as_slice())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SchedulerPresentation {
+    Headless,
+    Rendered,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Scheduler {
+    phase: Option<SchedulerPhase>,
+    trace: FrameTrace,
+}
+
+impl Scheduler {
+    fn enter(&mut self, phase: SchedulerPhase) -> Result<(), EngineError> {
+        if let Some(previous) = self.phase {
+            if scheduler_phase_index(phase) <= scheduler_phase_index(previous) {
+                return Err(EngineError::SchedulerPhaseOrder {
+                    previous,
+                    current: phase,
+                });
+            }
+        }
+        self.phase = Some(phase);
+        self.trace.phases.push(phase);
+        Ok(())
+    }
+
+    fn finish(self) -> FrameTrace {
+        self.trace
+    }
+}
+
+fn run_frame(
+    engine: &mut Engine,
+    input: InputSnapshot,
+    presentation: SchedulerPresentation,
+) -> Result<FrameResult, EngineError> {
+    let mut scheduler = Scheduler::default();
+    scheduler.enter(SchedulerPhase::CollectPlatformEvents)?;
+    scheduler.enter(SchedulerPhase::BuildInputSnapshot)?;
+    scheduler.enter(SchedulerPhase::AdvanceGameClock)?;
+    scheduler.enter(SchedulerPhase::CalculateWorldQueue)?;
+    let snapshot = step(&mut engine.world, &input)?;
+    scheduler.enter(SchedulerPhase::ApplyDeferredOperations)?;
+    scheduler.enter(SchedulerPhase::UpdateAnimationAndEffects)?;
+    if presentation == SchedulerPresentation::Rendered {
+        scheduler.enter(SchedulerPhase::PublishRenderSnapshot)?;
+        scheduler.enter(SchedulerPhase::RenderWorld)?;
+    }
+    scheduler.enter(SchedulerPhase::EndFrameCallbacks)?;
+    scheduler.enter(SchedulerPhase::Maintenance)?;
+    Ok(FrameResult {
+        snapshot,
+        trace: scheduler.finish(),
+    })
+}
+
+fn scheduler_phase_index(phase: SchedulerPhase) -> u8 {
+    match phase {
+        SchedulerPhase::CollectPlatformEvents => 0,
+        SchedulerPhase::BuildInputSnapshot => 1,
+        SchedulerPhase::AdvanceGameClock => 2,
+        SchedulerPhase::CalculateWorldQueue => 3,
+        SchedulerPhase::ApplyDeferredOperations => 4,
+        SchedulerPhase::UpdateAnimationAndEffects => 5,
+        SchedulerPhase::PublishRenderSnapshot => 6,
+        SchedulerPhase::RenderWorld => 7,
+        SchedulerPhase::EndFrameCallbacks => 8,
+        SchedulerPhase::Maintenance => 9,
+    }
 }
 
 fn normalize_engine_path(role: &'static str, value: &str) -> Result<NormalizedPath, EngineError> {
@@ -692,6 +785,79 @@ mod tests {
         assert!(matches!(err, EngineError::MissingVfs));
         let after = step_headless(&mut engine, InputSnapshot).expect("step");
         assert_eq!(before.snapshot.objects, after.snapshot.objects);
+    }
+
+    #[test]
+    fn headless_scheduler_trace_skips_presentation_phases() {
+        let mut engine = create(
+            EngineConfig {
+                mode: EngineMode::Headless,
+            },
+            EngineServices::default(),
+        )
+        .expect("engine");
+
+        let result = frame(&mut engine).expect("frame");
+
+        assert_eq!(result.snapshot.tick.0, 1);
+        assert_eq!(
+            result.trace.phases,
+            vec![
+                SchedulerPhase::CollectPlatformEvents,
+                SchedulerPhase::BuildInputSnapshot,
+                SchedulerPhase::AdvanceGameClock,
+                SchedulerPhase::CalculateWorldQueue,
+                SchedulerPhase::ApplyDeferredOperations,
+                SchedulerPhase::UpdateAnimationAndEffects,
+                SchedulerPhase::EndFrameCallbacks,
+                SchedulerPhase::Maintenance,
+            ]
+        );
+    }
+
+    #[test]
+    fn rendered_scheduler_trace_includes_presentation_after_simulation() {
+        let mut engine = create(
+            EngineConfig {
+                mode: EngineMode::Rendered,
+            },
+            EngineServices::default(),
+        )
+        .expect("engine");
+
+        let result = frame(&mut engine).expect("frame");
+
+        assert_eq!(
+            result.trace.phases,
+            vec![
+                SchedulerPhase::CollectPlatformEvents,
+                SchedulerPhase::BuildInputSnapshot,
+                SchedulerPhase::AdvanceGameClock,
+                SchedulerPhase::CalculateWorldQueue,
+                SchedulerPhase::ApplyDeferredOperations,
+                SchedulerPhase::UpdateAnimationAndEffects,
+                SchedulerPhase::PublishRenderSnapshot,
+                SchedulerPhase::RenderWorld,
+                SchedulerPhase::EndFrameCallbacks,
+                SchedulerPhase::Maintenance,
+            ]
+        );
+    }
+
+    #[test]
+    fn scheduler_rejects_phase_regressions() {
+        let mut scheduler = Scheduler::default();
+        scheduler
+            .enter(SchedulerPhase::BuildInputSnapshot)
+            .expect("enter build input");
+
+        assert!(matches!(
+            scheduler.enter(SchedulerPhase::CollectPlatformEvents),
+            Err(EngineError::SchedulerPhaseOrder {
+                previous: SchedulerPhase::BuildInputSnapshot,
+                current: SchedulerPhase::CollectPlatformEvents,
+            })
+        ));
     }
 
     #[test]
