@@ -26,7 +26,7 @@ pub enum ReadProfile {
 /// Write profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WriteProfile {
-    /// Return the original byte image when no edit model is active.
+    /// Preserve the original byte image or unindexed data-region bytes.
     Lossless,
     /// Repack active payloads and rebuild the lookup table.
     CanonicalCompact,
@@ -102,6 +102,7 @@ pub struct NresDocument {
 #[derive(Clone, Debug)]
 pub struct NresEditor {
     entries: Vec<EditableEntry>,
+    layout: Vec<EditableSegment>,
 }
 
 #[derive(Clone, Debug)]
@@ -112,6 +113,12 @@ struct EditableEntry {
     attr3: u32,
     name_raw: [u8; NAME_LEN],
     payload: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+enum EditableSegment {
+    Entry(usize),
+    Preserved(Vec<u8>),
 }
 
 /// `NRes` parse or write error.
@@ -506,7 +513,8 @@ impl NresEditor {
                 payload: document.payload(entry.id())?.to_vec(),
             });
         }
-        Ok(Self { entries })
+        let layout = build_edit_layout(document)?;
+        Ok(Self { entries, layout })
     }
 
     /// Replaces an entry payload.
@@ -537,13 +545,57 @@ impl NresEditor {
         Ok(())
     }
 
-    /// Encodes the edited document in canonical compact form.
+    /// Encodes the edited document while preserving unindexed bytes.
     ///
     /// # Errors
     ///
     /// Returns [`NresError`] when offsets or sizes exceed the on-disk `u32`
     /// representation.
     pub fn encode(&self) -> Result<Vec<u8>, NresError> {
+        self.encode_with_profile(WriteProfile::Lossless)
+    }
+
+    /// Encodes the edited document with an explicit write profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NresError`] when offsets or sizes exceed the on-disk `u32`
+    /// representation.
+    pub fn encode_with_profile(&self, profile: WriteProfile) -> Result<Vec<u8>, NresError> {
+        match profile {
+            WriteProfile::Lossless => self.encode_preserving_layout(),
+            WriteProfile::CanonicalCompact => self.encode_canonical_compact(),
+        }
+    }
+
+    fn encode_preserving_layout(&self) -> Result<Vec<u8>, NresError> {
+        let mut out = vec![0; HEADER_LEN];
+        let mut offsets = vec![0; self.entries.len()];
+        let mut sizes = vec![0; self.entries.len()];
+        for segment in &self.layout {
+            match segment {
+                EditableSegment::Entry(index) => {
+                    let entry = self
+                        .entries
+                        .get(*index)
+                        .ok_or(DecodeError::IntegerOverflow)?;
+                    offsets[*index] = checked_u32_len(out.len())?;
+                    sizes[*index] = checked_u32_len(entry.payload.len())?;
+                    out.extend_from_slice(&entry.payload);
+                }
+                EditableSegment::Preserved(bytes) => {
+                    out.len()
+                        .checked_add(bytes.len())
+                        .ok_or(DecodeError::IntegerOverflow)?;
+                    out.extend_from_slice(bytes);
+                }
+            }
+        }
+        write_edit_archive_header_and_directory(&mut out, &self.entries, &offsets, &sizes)?;
+        Ok(out)
+    }
+
+    fn encode_canonical_compact(&self) -> Result<Vec<u8>, NresError> {
         let mut out = vec![0; HEADER_LEN];
         let mut offsets = Vec::with_capacity(self.entries.len());
         let mut sizes = Vec::with_capacity(self.entries.len());
@@ -560,23 +612,7 @@ impl NresEditor {
             );
         }
 
-        let sort_order = build_edit_sort_order(&self.entries);
-        for (index, entry) in self.entries.iter().enumerate() {
-            push_u32(&mut out, entry.type_id);
-            push_u32(&mut out, entry.attr1);
-            push_u32(&mut out, entry.attr2);
-            push_u32(&mut out, sizes[index]);
-            push_u32(&mut out, entry.attr3);
-            out.extend_from_slice(&entry.name_raw);
-            push_u32(&mut out, offsets[index]);
-            push_u32(&mut out, checked_u32_len(sort_order[index])?);
-        }
-
-        let total_size = checked_u32_len(out.len())?;
-        out[0..4].copy_from_slice(b"NRes");
-        out[4..8].copy_from_slice(&VERSION_0100.to_le_bytes());
-        out[8..12].copy_from_slice(&checked_u32_len(self.entries.len())?.to_le_bytes());
-        out[12..16].copy_from_slice(&total_size.to_le_bytes());
+        write_edit_archive_header_and_directory(&mut out, &self.entries, &offsets, &sizes)?;
         Ok(out)
     }
 
@@ -897,6 +933,76 @@ fn build_edit_sort_order(entries: &[EditableEntry]) -> Vec<usize> {
         )
     });
     order
+}
+
+fn build_edit_layout(document: &NresDocument) -> Result<Vec<EditableSegment>, NresError> {
+    let mut ranges: Vec<(Range<usize>, usize)> = document
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| (entry.data_range.clone(), index))
+        .collect();
+    ranges.sort_by(|(left, _), (right, _)| {
+        left.start
+            .cmp(&right.start)
+            .then_with(|| left.end.cmp(&right.end))
+    });
+
+    let mut cursor = HEADER_LEN;
+    let directory_offset = usize::try_from(document.header.directory_offset)
+        .map_err(|_| DecodeError::IntegerOverflow)?;
+    let mut layout = Vec::new();
+    for (range, index) in ranges {
+        if cursor < range.start {
+            layout.push(EditableSegment::Preserved(
+                document.bytes[cursor..range.start].to_vec(),
+            ));
+        }
+        layout.push(EditableSegment::Entry(index));
+        cursor = cursor.max(range.end);
+    }
+    if cursor < directory_offset {
+        layout.push(EditableSegment::Preserved(
+            document.bytes[cursor..directory_offset].to_vec(),
+        ));
+    }
+    Ok(layout)
+}
+
+fn write_edit_archive_header_and_directory(
+    out: &mut Vec<u8>,
+    entries: &[EditableEntry],
+    offsets: &[u32],
+    sizes: &[u32],
+) -> Result<(), NresError> {
+    if offsets.len() != entries.len() || sizes.len() != entries.len() {
+        return Err(DecodeError::IntegerOverflow.into());
+    }
+    let directory_len = ENTRY_LEN
+        .checked_mul(entries.len())
+        .ok_or(DecodeError::IntegerOverflow)?;
+    out.len()
+        .checked_add(directory_len)
+        .ok_or(DecodeError::IntegerOverflow)?;
+
+    let sort_order = build_edit_sort_order(entries);
+    for (index, entry) in entries.iter().enumerate() {
+        push_u32(out, entry.type_id);
+        push_u32(out, entry.attr1);
+        push_u32(out, entry.attr2);
+        push_u32(out, sizes[index]);
+        push_u32(out, entry.attr3);
+        out.extend_from_slice(&entry.name_raw);
+        push_u32(out, offsets[index]);
+        push_u32(out, checked_u32_len(sort_order[index])?);
+    }
+
+    let total_size = checked_u32_len(out.len())?;
+    out[0..4].copy_from_slice(b"NRes");
+    out[4..8].copy_from_slice(&VERSION_0100.to_le_bytes());
+    out[8..12].copy_from_slice(&checked_u32_len(entries.len())?.to_le_bytes());
+    out[12..16].copy_from_slice(&total_size.to_le_bytes());
+    Ok(())
 }
 
 fn editable_name_bytes(raw: &[u8; NAME_LEN]) -> &[u8] {
@@ -1414,7 +1520,7 @@ mod tests {
 
     #[test]
     fn preserves_nonzero_unindexed_region() {
-        let mut bytes = build_archive(&[SyntheticEntry {
+        let bytes = build_archive_with_nonzero_prefix_gap(&[SyntheticEntry {
             type_id: 1,
             attr1: 0,
             attr2: 0,
@@ -1422,18 +1528,6 @@ mod tests {
             name: "payload",
             payload: b"data",
         }]);
-        let directory_offset = bytes.len() - ENTRY_LEN;
-        bytes.splice(HEADER_LEN..HEADER_LEN, [0xAA, 0xBB, 0xCC, 0xDD]);
-        let total = u32::try_from(bytes.len()).expect("total size");
-        bytes[12..16].copy_from_slice(&total.to_le_bytes());
-        let offset = u32::from_le_bytes(
-            bytes[directory_offset + 4 + 56..directory_offset + 4 + 60]
-                .try_into()
-                .expect("shifted offset"),
-        );
-        let shifted_directory_offset = directory_offset + 4;
-        bytes[shifted_directory_offset + 56..shifted_directory_offset + 60]
-            .copy_from_slice(&(offset + 4).to_le_bytes());
 
         let doc = decode(arc(bytes.clone()), ReadProfile::Strict).expect("nres");
         assert!(doc.has_nonzero_preserved_region());
@@ -1443,7 +1537,7 @@ mod tests {
 
     #[test]
     fn canonical_compact_roundtrip_preserves_entry_semantics() {
-        let mut bytes = build_archive(&[
+        let bytes = build_archive_with_nonzero_prefix_gap(&[
             SyntheticEntry {
                 type_id: 7,
                 attr1: 10,
@@ -1461,16 +1555,6 @@ mod tests {
                 payload: b"aaaa",
             },
         ]);
-        let directory_offset = bytes.len() - ENTRY_LEN * 2;
-        bytes.splice(HEADER_LEN..HEADER_LEN, [0xAA, 0xBB, 0xCC, 0xDD]);
-        let total = u32::try_from(bytes.len()).expect("total size");
-        bytes[12..16].copy_from_slice(&total.to_le_bytes());
-        for entry_index in 0..2 {
-            let field = directory_offset + 4 + entry_index * ENTRY_LEN + 56;
-            let offset =
-                u32::from_le_bytes(bytes[field..field + 4].try_into().expect("shifted offset"));
-            bytes[field..field + 4].copy_from_slice(&(offset + 4).to_le_bytes());
-        }
 
         let original = decode(arc(bytes), ReadProfile::Strict).expect("original");
         let compact = decode(
@@ -1529,8 +1613,13 @@ mod tests {
         editor
             .set_payload(EntryId(0), b"replacement".to_vec())
             .expect("set payload");
-        let edited =
-            decode(arc(editor.encode().expect("encode")), ReadProfile::Strict).expect("edited");
+        let edited = decode(
+            arc(editor
+                .encode_with_profile(WriteProfile::CanonicalCompact)
+                .expect("encode")),
+            ReadProfile::Strict,
+        )
+        .expect("edited");
         let first = edited.entry(EntryId(0)).expect("first");
         let second = edited.entry(EntryId(1)).expect("second");
 
@@ -1543,6 +1632,64 @@ mod tests {
         assert_eq!(first.meta().data_offset, HEADER_LEN_U32);
         assert_eq!(second.meta().data_offset % 8, 0);
         assert!(second.meta().data_offset > first.meta().data_offset + first.meta().data_size);
+    }
+
+    #[test]
+    fn editor_payload_update_preserves_nonzero_unindexed_region_by_default() {
+        let bytes = build_archive_with_nonzero_prefix_gap(&[
+            SyntheticEntry {
+                type_id: 1,
+                attr1: 0,
+                attr2: 0,
+                attr3: 0,
+                name: "first",
+                payload: b"one",
+            },
+            SyntheticEntry {
+                type_id: 2,
+                attr1: 0,
+                attr2: 0,
+                attr3: 0,
+                name: "second",
+                payload: b"two",
+            },
+        ]);
+        let original = decode(arc(bytes), ReadProfile::Strict).expect("original");
+        let marker = original
+            .preserved_regions()
+            .iter()
+            .find(|region| !region.all_zero)
+            .expect("nonzero preserved region")
+            .range
+            .clone();
+        let marker = original.bytes[usize::try_from(marker.start).expect("start")
+            ..usize::try_from(marker.end).expect("end")]
+            .to_vec();
+        let mut editor = original.editor().expect("editor");
+
+        editor
+            .set_payload(EntryId(0), b"replacement".to_vec())
+            .expect("set payload");
+        let edited_bytes = editor.encode().expect("encode");
+        let edited = decode(arc(edited_bytes.clone()), ReadProfile::Strict).expect("edited");
+
+        assert_eq!(
+            edited.payload(EntryId(0)).expect("first payload"),
+            b"replacement"
+        );
+        assert!(edited.has_nonzero_preserved_region());
+        assert!(edited_bytes
+            .windows(marker.len())
+            .any(|window| window == marker));
+
+        let compact = decode(
+            arc(editor
+                .encode_with_profile(WriteProfile::CanonicalCompact)
+                .expect("compact")),
+            ReadProfile::Strict,
+        )
+        .expect("compact");
+        assert!(!compact.has_nonzero_preserved_region());
     }
 
     #[test]
@@ -1928,6 +2075,21 @@ mod tests {
         let total_size = u32::try_from(out.len()).expect("total size");
         out[12..16].copy_from_slice(&total_size.to_le_bytes());
         out
+    }
+
+    fn build_archive_with_nonzero_prefix_gap(entries: &[SyntheticEntry<'_>]) -> Vec<u8> {
+        let mut bytes = build_archive(entries);
+        let directory_offset = bytes.len() - ENTRY_LEN * entries.len();
+        bytes.splice(HEADER_LEN..HEADER_LEN, [0xAA, 0xBB, 0xCC, 0xDD]);
+        let total = u32::try_from(bytes.len()).expect("total size");
+        bytes[12..16].copy_from_slice(&total.to_le_bytes());
+        for entry_index in 0..entries.len() {
+            let field = directory_offset + 4 + entry_index * ENTRY_LEN + 56;
+            let offset =
+                u32::from_le_bytes(bytes[field..field + 4].try_into().expect("shifted offset"));
+            bytes[field..field + 4].copy_from_slice(&(offset + 4).to_le_bytes());
+        }
+        bytes
     }
 
     fn arc(bytes: Vec<u8>) -> Arc<[u8]> {
