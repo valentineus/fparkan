@@ -139,6 +139,15 @@ pub struct RenderCommandList {
     pub commands: Vec<RenderCommand>,
 }
 
+/// Optional render command validation limits.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RenderValidationLimits {
+    /// Exclusive upper bound for GPU mesh ids.
+    pub mesh_count: Option<u64>,
+    /// Exclusive upper bound for index ranges.
+    pub index_count: Option<u32>,
+}
+
 /// Frame output.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct FrameOutput;
@@ -148,6 +157,13 @@ pub struct FrameOutput;
 pub enum RenderError {
     /// Invalid range.
     InvalidRange,
+    /// Invalid command stream framing or ordering.
+    InvalidCommandStream {
+        /// Command index.
+        index: usize,
+        /// Contextual error message.
+        message: &'static str,
+    },
     /// Invalid draw range with command-generation context.
     InvalidDrawRange {
         /// Draw id.
@@ -158,6 +174,49 @@ pub enum RenderError {
         start: u32,
         /// Range count.
         count: u32,
+    },
+    /// Index range arithmetic overflow.
+    IndexRangeOverflow {
+        /// Draw id.
+        draw_id: DrawId,
+        /// Range start.
+        start: u32,
+        /// Range count.
+        count: u32,
+    },
+    /// Index range exceeds validation limits.
+    IndexRangeOutOfBounds {
+        /// Draw id.
+        draw_id: DrawId,
+        /// Exclusive index limit.
+        index_count: u32,
+        /// Range end.
+        end: u32,
+    },
+    /// Mesh id exceeds validation limits.
+    MeshOutOfBounds {
+        /// Draw id.
+        draw_id: DrawId,
+        /// Mesh id.
+        mesh: GpuMeshId,
+        /// Exclusive mesh limit.
+        mesh_count: u64,
+    },
+    /// Draw transform contains a non-finite value.
+    NonFiniteTransform {
+        /// Draw id.
+        draw_id: DrawId,
+        /// Matrix element index.
+        element: usize,
+    },
+    /// Draw commands are not ordered by phase, stable order and draw id.
+    PhaseOrderViolation {
+        /// Draw id.
+        draw_id: DrawId,
+        /// Previous phase.
+        previous: RenderPhase,
+        /// Current phase.
+        current: RenderPhase,
     },
     /// A batch material index did not resolve through the material table.
     MaterialIndexOutOfBounds {
@@ -174,6 +233,12 @@ impl std::fmt::Display for RenderError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidRange => write!(f, "render command contains an empty index range"),
+            Self::InvalidCommandStream { index, message } => {
+                write!(
+                    f,
+                    "render command stream is invalid at command {index}: {message}"
+                )
+            }
             Self::InvalidDrawRange {
                 draw_id,
                 stable_order,
@@ -183,6 +248,47 @@ impl std::fmt::Display for RenderError {
                 f,
                 "draw {} has invalid index range start={} count={} at stable order {}",
                 draw_id.0, start, count, stable_order
+            ),
+            Self::IndexRangeOverflow {
+                draw_id,
+                start,
+                count,
+            } => write!(
+                f,
+                "draw {} index range overflows start={} count={}",
+                draw_id.0, start, count
+            ),
+            Self::IndexRangeOutOfBounds {
+                draw_id,
+                index_count,
+                end,
+            } => write!(
+                f,
+                "draw {} index range ends at {} but mesh has {} indices",
+                draw_id.0, end, index_count
+            ),
+            Self::MeshOutOfBounds {
+                draw_id,
+                mesh,
+                mesh_count,
+            } => write!(
+                f,
+                "draw {} references mesh {} but only {} meshes are available",
+                draw_id.0, mesh.0, mesh_count
+            ),
+            Self::NonFiniteTransform { draw_id, element } => write!(
+                f,
+                "draw {} has non-finite transform element {}",
+                draw_id.0, element
+            ),
+            Self::PhaseOrderViolation {
+                draw_id,
+                previous,
+                current,
+            } => write!(
+                f,
+                "draw {} phase order regressed from {:?} to {:?}",
+                draw_id.0, previous, current
             ),
             Self::MaterialIndexOutOfBounds {
                 draw_id,
@@ -227,6 +333,8 @@ pub fn build_commands(
                 count: draw.range.count,
             });
         }
+        validate_index_range(draw.id, draw.range)?;
+        validate_transform(draw.id, &draw.transform)?;
         let material = draw
             .material_slots
             .get(usize::from(draw.material_index))
@@ -268,7 +376,7 @@ pub struct NullBackend;
 
 impl RenderBackend for NullBackend {
     fn execute(&mut self, commands: &RenderCommandList) -> Result<FrameOutput, RenderError> {
-        validate_commands(commands)?;
+        validate_command_list(commands)?;
         Ok(FrameOutput)
     }
 }
@@ -312,7 +420,7 @@ impl RenderBackend for RecordingBackend {
 ///
 /// Returns [`RenderError`] when a draw command contains an invalid index range.
 pub fn canonical_capture(commands: &RenderCommandList) -> Result<Vec<u8>, RenderError> {
-    validate_commands(commands)?;
+    validate_command_list(commands)?;
     let mut out = Vec::new();
     for command in &commands.commands {
         match command {
@@ -332,12 +440,132 @@ pub fn canonical_capture(commands: &RenderCommandList) -> Result<Vec<u8>, Render
     Ok(out)
 }
 
-fn validate_commands(commands: &RenderCommandList) -> Result<(), RenderError> {
-    for command in &commands.commands {
-        if let RenderCommand::Draw(draw) = command {
-            if draw.range.count == 0 {
-                return Err(RenderError::InvalidRange);
+/// Validates a render command list without backend-specific resource limits.
+///
+/// # Errors
+///
+/// Returns [`RenderError`] when framing, ordering or draw data is invalid.
+pub fn validate_command_list(commands: &RenderCommandList) -> Result<(), RenderError> {
+    validate_command_list_with_limits(commands, RenderValidationLimits::default())
+}
+
+/// Validates a render command list with optional backend resource limits.
+///
+/// # Errors
+///
+/// Returns [`RenderError`] when framing, ordering, draw data or resource bounds
+/// are invalid.
+pub fn validate_command_list_with_limits(
+    commands: &RenderCommandList,
+    limits: RenderValidationLimits,
+) -> Result<(), RenderError> {
+    let Some(first) = commands.commands.first() else {
+        return Err(RenderError::InvalidCommandStream {
+            index: 0,
+            message: "empty command list",
+        });
+    };
+    if !matches!(first, RenderCommand::BeginFrame) {
+        return Err(RenderError::InvalidCommandStream {
+            index: 0,
+            message: "first command must be BeginFrame",
+        });
+    }
+    if commands.commands.len() < 2 {
+        return Err(RenderError::InvalidCommandStream {
+            index: 0,
+            message: "frame must end with EndFrame",
+        });
+    }
+    let end_index = commands.commands.len() - 1;
+    if !matches!(commands.commands[end_index], RenderCommand::EndFrame) {
+        return Err(RenderError::InvalidCommandStream {
+            index: end_index,
+            message: "last command must be EndFrame",
+        });
+    }
+
+    let mut previous_key: Option<(RenderPhase, u64, DrawId)> = None;
+    for (index, command) in commands.commands.iter().enumerate() {
+        match command {
+            RenderCommand::BeginFrame if index == 0 => {}
+            RenderCommand::BeginFrame => {
+                return Err(RenderError::InvalidCommandStream {
+                    index,
+                    message: "nested BeginFrame is not allowed",
+                });
             }
+            RenderCommand::EndFrame if index == end_index => {}
+            RenderCommand::EndFrame => {
+                return Err(RenderError::InvalidCommandStream {
+                    index,
+                    message: "EndFrame before final command is not allowed",
+                });
+            }
+            RenderCommand::Draw(draw) => {
+                validate_draw_command(draw, limits)?;
+                let key = (draw.phase, draw.stable_order, draw.id);
+                if let Some(previous) = previous_key {
+                    if key < previous {
+                        return Err(RenderError::PhaseOrderViolation {
+                            draw_id: draw.id,
+                            previous: previous.0,
+                            current: draw.phase,
+                        });
+                    }
+                }
+                previous_key = Some(key);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_draw_command(
+    draw: &DrawCommand,
+    limits: RenderValidationLimits,
+) -> Result<(), RenderError> {
+    if draw.range.count == 0 {
+        return Err(RenderError::InvalidRange);
+    }
+    let end = validate_index_range(draw.id, draw.range)?;
+    validate_transform(draw.id, &draw.transform)?;
+    if let Some(mesh_count) = limits.mesh_count {
+        if draw.mesh.0 >= mesh_count {
+            return Err(RenderError::MeshOutOfBounds {
+                draw_id: draw.id,
+                mesh: draw.mesh,
+                mesh_count,
+            });
+        }
+    }
+    if let Some(index_count) = limits.index_count {
+        if end > index_count {
+            return Err(RenderError::IndexRangeOutOfBounds {
+                draw_id: draw.id,
+                index_count,
+                end,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_index_range(draw_id: DrawId, range: IndexRange) -> Result<u32, RenderError> {
+    range
+        .start
+        .checked_add(range.count)
+        .ok_or(RenderError::IndexRangeOverflow {
+            draw_id,
+            start: range.start,
+            count: range.count,
+        })
+}
+
+fn validate_transform(draw_id: DrawId, transform: &[f32; 16]) -> Result<(), RenderError> {
+    for (element, value) in transform.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(RenderError::NonFiniteTransform { draw_id, element });
         }
     }
     Ok(())
@@ -400,16 +628,20 @@ mod tests {
     fn null_backend_validates_without_capture() {
         let mut backend = NullBackend;
         let invalid = RenderCommandList {
-            commands: vec![RenderCommand::Draw(DrawCommand {
-                id: DrawId(1),
-                phase: RenderPhase::Opaque,
-                object_id: None,
-                mesh: GpuMeshId(2),
-                material: GpuMaterialId(3),
-                transform: [0.0; 16],
-                range: IndexRange { start: 0, count: 0 },
-                stable_order: 4,
-            })],
+            commands: vec![
+                RenderCommand::BeginFrame,
+                RenderCommand::Draw(DrawCommand {
+                    id: DrawId(1),
+                    phase: RenderPhase::Opaque,
+                    object_id: None,
+                    mesh: GpuMeshId(2),
+                    material: GpuMaterialId(3),
+                    transform: [0.0; 16],
+                    range: IndexRange { start: 0, count: 0 },
+                    stable_order: 4,
+                }),
+                RenderCommand::EndFrame,
+            ],
         };
 
         assert!(matches!(
@@ -551,6 +783,178 @@ mod tests {
                 stable_order: 10,
                 start: 4,
                 count: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn command_validation_rejects_bad_frame_framing() {
+        let missing_begin = RenderCommandList {
+            commands: vec![RenderCommand::EndFrame],
+        };
+        assert!(matches!(
+            validate_command_list(&missing_begin),
+            Err(RenderError::InvalidCommandStream {
+                index: 0,
+                message: "first command must be BeginFrame"
+            })
+        ));
+
+        let nested = RenderCommandList {
+            commands: vec![
+                RenderCommand::BeginFrame,
+                RenderCommand::BeginFrame,
+                RenderCommand::EndFrame,
+            ],
+        };
+        assert!(matches!(
+            validate_command_list(&nested),
+            Err(RenderError::InvalidCommandStream {
+                index: 1,
+                message: "nested BeginFrame is not allowed"
+            })
+        ));
+    }
+
+    #[test]
+    fn command_validation_rejects_nonfinite_transform_and_range_overflow() {
+        let mut draw = snapshot_draw(10, RenderPhase::Opaque, 0, 10);
+        draw.transform[5] = f32::NAN;
+        let nonfinite = build_commands(
+            &RenderSnapshot {
+                camera: CameraSnapshot::default(),
+                draws: vec![draw],
+            },
+            RenderProfile::default(),
+        );
+        assert!(matches!(
+            nonfinite,
+            Err(RenderError::NonFiniteTransform {
+                draw_id: DrawId(10),
+                element: 5
+            })
+        ));
+
+        let list = RenderCommandList {
+            commands: vec![
+                RenderCommand::BeginFrame,
+                RenderCommand::Draw(DrawCommand {
+                    id: DrawId(11),
+                    phase: RenderPhase::Opaque,
+                    object_id: None,
+                    mesh: GpuMeshId(2),
+                    material: GpuMaterialId(3),
+                    transform: identity_transform(),
+                    range: IndexRange {
+                        start: u32::MAX,
+                        count: 1,
+                    },
+                    stable_order: 4,
+                }),
+                RenderCommand::EndFrame,
+            ],
+        };
+        assert!(matches!(
+            validate_command_list(&list),
+            Err(RenderError::IndexRangeOverflow {
+                draw_id: DrawId(11),
+                start: u32::MAX,
+                count: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn command_validation_checks_order_and_resource_bounds() {
+        let ordered = build_commands(
+            &RenderSnapshot {
+                camera: CameraSnapshot::default(),
+                draws: vec![snapshot_draw(1, RenderPhase::Opaque, 0, 10)],
+            },
+            RenderProfile::default(),
+        )
+        .expect("commands");
+        assert!(matches!(
+            validate_command_list_with_limits(
+                &ordered,
+                RenderValidationLimits {
+                    mesh_count: Some(5),
+                    index_count: Some(16)
+                }
+            ),
+            Err(RenderError::MeshOutOfBounds {
+                draw_id: DrawId(1),
+                mesh: GpuMeshId(11),
+                mesh_count: 5
+            })
+        ));
+
+        let out_of_bounds = RenderCommandList {
+            commands: vec![
+                RenderCommand::BeginFrame,
+                RenderCommand::Draw(DrawCommand {
+                    id: DrawId(12),
+                    phase: RenderPhase::Opaque,
+                    object_id: None,
+                    mesh: GpuMeshId(2),
+                    material: GpuMaterialId(3),
+                    transform: identity_transform(),
+                    range: IndexRange {
+                        start: 14,
+                        count: 3,
+                    },
+                    stable_order: 4,
+                }),
+                RenderCommand::EndFrame,
+            ],
+        };
+        assert!(matches!(
+            validate_command_list_with_limits(
+                &out_of_bounds,
+                RenderValidationLimits {
+                    mesh_count: Some(5),
+                    index_count: Some(16)
+                }
+            ),
+            Err(RenderError::IndexRangeOutOfBounds {
+                draw_id: DrawId(12),
+                index_count: 16,
+                end: 17
+            })
+        ));
+
+        let unordered = RenderCommandList {
+            commands: vec![
+                RenderCommand::BeginFrame,
+                RenderCommand::Draw(DrawCommand {
+                    id: DrawId(1),
+                    phase: RenderPhase::Transparent,
+                    object_id: None,
+                    mesh: GpuMeshId(1),
+                    material: GpuMaterialId(1),
+                    transform: identity_transform(),
+                    range: IndexRange { start: 0, count: 3 },
+                    stable_order: 0,
+                }),
+                RenderCommand::Draw(DrawCommand {
+                    id: DrawId(2),
+                    phase: RenderPhase::Opaque,
+                    object_id: None,
+                    mesh: GpuMeshId(1),
+                    material: GpuMaterialId(1),
+                    transform: identity_transform(),
+                    range: IndexRange { start: 0, count: 3 },
+                    stable_order: 0,
+                }),
+                RenderCommand::EndFrame,
+            ],
+        };
+        assert!(matches!(
+            validate_command_list(&unordered),
+            Err(RenderError::PhaseOrderViolation {
+                draw_id: DrawId(2),
+                previous: RenderPhase::Transparent,
+                current: RenderPhase::Opaque
             })
         ));
     }
