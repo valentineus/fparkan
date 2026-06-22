@@ -1,7 +1,10 @@
 #![forbid(unsafe_code)]
 //! Deterministic world identity, queue, lifecycle, and snapshots.
 
+use fparkan_binary::sha256;
 use std::collections::VecDeque;
+
+const WORLD_STATE_HASH_SCHEMA: &[u8] = b"fparkan-world-state-v2\0";
 
 /// Object handle with generation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -418,24 +421,36 @@ where
 /// Computes canonical state hash.
 #[must_use]
 pub fn canonical_state_hash(world: &World) -> StateHash {
-    let mut state = 0xcbf2_9ce4_8422_2325_u64;
-    hash_u64(&mut state, world.tick.0);
+    StateHash(sha256(&canonical_state_bytes(world)))
+}
+
+fn canonical_state_bytes(world: &World) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(WORLD_STATE_HASH_SCHEMA);
+    push_u64(&mut out, world.tick.0);
+    push_u64(&mut out, world.next_sequence);
+    push_u64(&mut out, world.next_registration_sequence);
+    push_len(&mut out, world.slots.len());
     for (idx, slot) in world.slots.iter().enumerate() {
-        hash_u64(&mut state, idx as u64);
-        hash_u64(&mut state, u64::from(slot.generation));
-        hash_u64(&mut state, u64::from(u8::from(slot.live)));
-        hash_u64(&mut state, u64::from(u8::from(slot.registered)));
-        hash_u64(&mut state, slot.original_id.map_or(0, |id| u64::from(id.0)));
-        hash_u64(&mut state, slot.mirror_id.map_or(0, |id| u64::from(id.0)));
-        hash_u64(&mut state, slot.owner_id.map_or(0, |id| u64::from(id.0)));
-        hash_u64(&mut state, slot.registration_sequence.unwrap_or(u64::MAX));
+        push_len(&mut out, idx);
+        push_u32(&mut out, slot.generation);
+        push_bool(&mut out, slot.live);
+        push_bool(&mut out, slot.registered);
+        push_optional_u32(&mut out, slot.original_id.map(|id| id.0));
+        push_optional_u32(&mut out, slot.mirror_id.map(|id| id.0));
+        push_optional_u16(&mut out, slot.owner_id.map(|id| id.0));
+        push_optional_u64(&mut out, slot.registration_sequence);
     }
-    let mut out = [0; 32];
-    out[..8].copy_from_slice(&state.to_le_bytes());
-    out[8..16].copy_from_slice(&state.rotate_left(13).to_le_bytes());
-    out[16..24].copy_from_slice(&state.rotate_left(29).to_le_bytes());
-    out[24..32].copy_from_slice(&state.rotate_left(47).to_le_bytes());
-    StateHash(out)
+    push_len(&mut out, world.queue.len());
+    for command in &world.queue {
+        push_u64(&mut out, command.sequence);
+        push_optional_handle(&mut out, command.target);
+    }
+    push_len(&mut out, world.deferred_delete.len());
+    for handle in &world.deferred_delete {
+        push_handle(&mut out, *handle);
+    }
+    out
 }
 
 /// Creates a fixed-step clock.
@@ -552,11 +567,57 @@ pub fn shutdown(mut world: World) -> ShutdownReport {
     }
 }
 
-fn hash_u64(state: &mut u64, value: u64) {
-    for byte in value.to_le_bytes() {
-        *state ^= u64::from(byte);
-        *state = state.wrapping_mul(0x0000_0100_0000_01b3);
+fn push_len(out: &mut Vec<u8>, value: usize) {
+    push_u64(out, u64::try_from(value).unwrap_or(u64::MAX));
+}
+
+fn push_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u16(out: &mut Vec<u8>, value: u16) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_bool(out: &mut Vec<u8>, value: bool) {
+    out.push(u8::from(value));
+}
+
+fn push_optional_u64(out: &mut Vec<u8>, value: Option<u64>) {
+    push_bool(out, value.is_some());
+    if let Some(value) = value {
+        push_u64(out, value);
     }
+}
+
+fn push_optional_u32(out: &mut Vec<u8>, value: Option<u32>) {
+    push_bool(out, value.is_some());
+    if let Some(value) = value {
+        push_u32(out, value);
+    }
+}
+
+fn push_optional_u16(out: &mut Vec<u8>, value: Option<u16>) {
+    push_bool(out, value.is_some());
+    if let Some(value) = value {
+        push_u16(out, value);
+    }
+}
+
+fn push_optional_handle(out: &mut Vec<u8>, handle: Option<ObjectHandle>) {
+    push_bool(out, handle.is_some());
+    if let Some(handle) = handle {
+        push_handle(out, handle);
+    }
+}
+
+fn push_handle(out: &mut Vec<u8>, handle: ObjectHandle) {
+    push_u32(out, handle.generation);
+    push_u32(out, handle.slot);
 }
 
 fn checked_slot(world: &World, handle: ObjectHandle) -> Result<&Slot, WorldError> {
@@ -837,6 +898,34 @@ mod tests {
     }
 
     #[test]
+    fn state_hash_uses_canonical_sha256_instead_of_legacy_rotated_fnv() {
+        let mut world = new(WorldConfig);
+        let handle = construct_object(
+            &mut world,
+            ObjectDraft {
+                original_id: Some(OriginalObjectId(42)),
+            },
+        )
+        .expect("object");
+        set_mirror_original(&mut world, handle, Some(OriginalObjectId(420))).expect("mirror");
+        set_owner(&mut world, handle, Some(OwnerId(9))).expect("owner");
+        register_object(&mut world, handle).expect("register");
+        enqueue(
+            &mut world,
+            WorldCommand {
+                sequence: 999,
+                target: Some(handle),
+            },
+        )
+        .expect("enqueue");
+
+        let snapshot = step(&mut world, &InputSnapshot).expect("step");
+
+        assert_ne!(snapshot.hash, legacy_rotated_fnv_hash(&world));
+        assert_ne!(snapshot.hash, canonical_state_hash(&new(WorldConfig)));
+    }
+
+    #[test]
     fn fixed_step_pause_and_long_determinism_are_stable() {
         let config = FixedStepConfig {
             step_millis: 20,
@@ -964,6 +1053,37 @@ mod tests {
                     .expect("sequence")
                     .is_some());
             }
+        }
+    }
+
+    fn legacy_rotated_fnv_hash(world: &World) -> StateHash {
+        let mut state = 0xcbf2_9ce4_8422_2325_u64;
+        legacy_hash_u64(&mut state, world.tick.0);
+        for (idx, slot) in world.slots.iter().enumerate() {
+            legacy_hash_u64(
+                &mut state,
+                u64::try_from(idx).expect("slot index should fit"),
+            );
+            legacy_hash_u64(&mut state, u64::from(slot.generation));
+            legacy_hash_u64(&mut state, u64::from(u8::from(slot.live)));
+            legacy_hash_u64(&mut state, u64::from(u8::from(slot.registered)));
+            legacy_hash_u64(&mut state, slot.original_id.map_or(0, |id| u64::from(id.0)));
+            legacy_hash_u64(&mut state, slot.mirror_id.map_or(0, |id| u64::from(id.0)));
+            legacy_hash_u64(&mut state, slot.owner_id.map_or(0, |id| u64::from(id.0)));
+            legacy_hash_u64(&mut state, slot.registration_sequence.unwrap_or(u64::MAX));
+        }
+        let mut out = [0; 32];
+        out[..8].copy_from_slice(&state.to_le_bytes());
+        out[8..16].copy_from_slice(&state.rotate_left(13).to_le_bytes());
+        out[16..24].copy_from_slice(&state.rotate_left(29).to_le_bytes());
+        out[24..32].copy_from_slice(&state.rotate_left(47).to_le_bytes());
+        StateHash(out)
+    }
+
+    fn legacy_hash_u64(state: &mut u64, value: u64) {
+        for byte in value.to_le_bytes() {
+            *state ^= u64::from(byte);
+            *state = state.wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
 }

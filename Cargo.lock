@@ -287,6 +287,9 @@ dependencies = [
 [[package]]
 name = "fparkan-world"
 version = "0.1.0"
+dependencies = [
+ "fparkan-binary",
+]
 
 [[package]]
 name = "miniz_oxide"
