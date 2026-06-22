@@ -105,6 +105,8 @@ pub struct FixedStepClock {
     tick: Tick,
     paused: bool,
     platform_event_collections: u64,
+    dropped_presentation_millis: u64,
+    dropped_presentation_frames: u64,
 }
 
 /// Fixed-step configuration.
@@ -112,11 +114,16 @@ pub struct FixedStepClock {
 pub struct FixedStepConfig {
     /// Milliseconds per simulation tick.
     pub step_millis: u32,
+    /// Maximum simulation ticks executed for a single presentation frame.
+    pub max_steps_per_frame: u32,
 }
 
 impl Default for FixedStepConfig {
     fn default() -> Self {
-        Self { step_millis: 16 }
+        Self {
+            step_millis: 16,
+            max_steps_per_frame: 8,
+        }
     }
 }
 
@@ -176,7 +183,9 @@ impl std::fmt::Display for WorldError {
             Self::DuplicateOriginalObjectId(id) => {
                 write!(f, "original object id {} is already registered", id.0)
             }
-            Self::InvalidFixedStep => write!(f, "fixed-step configuration must be non-zero"),
+            Self::InvalidFixedStep => {
+                write!(f, "fixed-step configuration values must be non-zero")
+            }
         }
     }
 }
@@ -433,9 +442,10 @@ pub fn canonical_state_hash(world: &World) -> StateHash {
 ///
 /// # Errors
 ///
-/// Returns [`WorldError::InvalidFixedStep`] when the configured step is zero.
+/// Returns [`WorldError::InvalidFixedStep`] when the configured step or
+/// per-frame catch-up limit is zero.
 pub fn fixed_step_clock(config: FixedStepConfig) -> Result<FixedStepClock, WorldError> {
-    if config.step_millis == 0 {
+    if config.step_millis == 0 || config.max_steps_per_frame == 0 {
         return Err(WorldError::InvalidFixedStep);
     }
     Ok(FixedStepClock {
@@ -443,6 +453,8 @@ pub fn fixed_step_clock(config: FixedStepConfig) -> Result<FixedStepClock, World
         tick: Tick(0),
         paused: false,
         platform_event_collections: 0,
+        dropped_presentation_millis: 0,
+        dropped_presentation_frames: 0,
     })
 }
 
@@ -462,13 +474,14 @@ pub fn set_paused(clock: &mut FixedStepClock, paused: bool) {
 ///
 /// # Errors
 ///
-/// Returns [`WorldError::InvalidFixedStep`] when the configured step is zero.
+/// Returns [`WorldError::InvalidFixedStep`] when the configured step or
+/// per-frame catch-up limit is zero.
 pub fn advance_fixed_step(
     clock: &mut FixedStepClock,
     config: FixedStepConfig,
     elapsed_millis: u64,
 ) -> Result<u32, WorldError> {
-    if config.step_millis == 0 {
+    if config.step_millis == 0 || config.max_steps_per_frame == 0 {
         return Err(WorldError::InvalidFixedStep);
     }
     if clock.paused {
@@ -476,12 +489,20 @@ pub fn advance_fixed_step(
     }
     clock.accumulated_millis = clock.accumulated_millis.saturating_add(elapsed_millis);
     let step = u64::from(config.step_millis);
-    let mut ticks = 0_u32;
-    while clock.accumulated_millis >= step {
-        clock.accumulated_millis -= step;
-        clock.tick.0 = clock.tick.0.saturating_add(1);
-        ticks = ticks.saturating_add(1);
+    let available_steps = clock.accumulated_millis / step;
+    let ticks_u64 = available_steps.min(u64::from(config.max_steps_per_frame));
+    let consumed = ticks_u64.saturating_mul(step);
+    if available_steps > u64::from(config.max_steps_per_frame) {
+        let dropped = clock.accumulated_millis.saturating_sub(consumed);
+        clock.dropped_presentation_millis =
+            clock.dropped_presentation_millis.saturating_add(dropped);
+        clock.dropped_presentation_frames = clock.dropped_presentation_frames.saturating_add(1);
+        clock.accumulated_millis = 0;
+    } else {
+        clock.accumulated_millis = clock.accumulated_millis.saturating_sub(consumed);
     }
+    let ticks = u32::try_from(ticks_u64).unwrap_or(u32::MAX);
+    clock.tick.0 = clock.tick.0.saturating_add(ticks_u64);
     Ok(ticks)
 }
 
@@ -495,6 +516,18 @@ pub fn fixed_step_tick(clock: &FixedStepClock) -> Tick {
 #[must_use]
 pub fn platform_event_collections(clock: &FixedStepClock) -> u64 {
     clock.platform_event_collections
+}
+
+/// Returns total presentation time dropped by fixed-step catch-up limits.
+#[must_use]
+pub fn dropped_presentation_millis(clock: &FixedStepClock) -> u64 {
+    clock.dropped_presentation_millis
+}
+
+/// Returns how many presentation frames exceeded fixed-step catch-up limits.
+#[must_use]
+pub fn dropped_presentation_frames(clock: &FixedStepClock) -> u64 {
+    clock.dropped_presentation_frames
 }
 
 /// Runs end-frame callbacks in stable sequence order.
@@ -805,7 +838,10 @@ mod tests {
 
     #[test]
     fn fixed_step_pause_and_long_determinism_are_stable() {
-        let config = FixedStepConfig { step_millis: 20 };
+        let config = FixedStepConfig {
+            step_millis: 20,
+            max_steps_per_frame: 8,
+        };
         let mut clock = fixed_step_clock(config).expect("clock");
         collect_platform_events(&mut clock);
         set_paused(&mut clock, true);
@@ -827,6 +863,32 @@ mod tests {
             second_hashes.push(step(&mut second, &InputSnapshot).expect("second").hash);
         }
         assert_eq!(first_hashes, second_hashes);
+    }
+
+    #[test]
+    fn fixed_step_catch_up_is_capped_and_reports_dropped_time() {
+        let config = FixedStepConfig {
+            step_millis: 20,
+            max_steps_per_frame: 3,
+        };
+        let mut clock = fixed_step_clock(config).expect("clock");
+
+        assert_eq!(advance_fixed_step(&mut clock, config, 95), Ok(3));
+        assert_eq!(fixed_step_tick(&clock), Tick(3));
+        assert_eq!(dropped_presentation_millis(&clock), 35);
+        assert_eq!(dropped_presentation_frames(&clock), 1);
+
+        assert_eq!(advance_fixed_step(&mut clock, config, 10), Ok(0));
+        assert_eq!(advance_fixed_step(&mut clock, config, 10), Ok(1));
+        assert_eq!(fixed_step_tick(&clock), Tick(4));
+        assert_eq!(dropped_presentation_millis(&clock), 35);
+        assert_eq!(dropped_presentation_frames(&clock), 1);
+
+        assert_eq!(
+            advance_fixed_step(&mut clock, config, u64::MAX),
+            Ok(config.max_steps_per_frame)
+        );
+        assert_eq!(dropped_presentation_frames(&clock), 2);
     }
 
     #[test]
