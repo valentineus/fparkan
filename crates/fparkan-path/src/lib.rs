@@ -110,7 +110,7 @@ impl std::error::Error for PathError {}
 /// Returns [`PathError`] when the input is empty, absolute, contains an
 /// embedded NUL, attempts parent traversal, or is not valid UTF-8 after
 /// legacy separator normalization.
-pub fn normalize_relative(raw: &[u8], _policy: PathPolicy) -> Result<NormalizedPath, PathError> {
+pub fn normalize_relative(raw: &[u8], policy: PathPolicy) -> Result<NormalizedPath, PathError> {
     if raw.is_empty() {
         return Err(PathError::Empty);
     }
@@ -124,10 +124,16 @@ pub fn normalize_relative(raw: &[u8], _policy: PathPolicy) -> Result<NormalizedP
     let mut parts = Vec::new();
     for part in text.split(['/', '\\']) {
         if part.is_empty() || part == "." {
+            if policy == PathPolicy::StrictLegacy {
+                return Err(PathError::ParentTraversal);
+            }
             continue;
         }
         if part == ".." {
             return Err(PathError::ParentTraversal);
+        }
+        if policy == PathPolicy::StrictLegacy && part.contains(':') {
+            return Err(PathError::Absolute);
         }
         parts.push(part);
     }
@@ -221,6 +227,25 @@ mod tests {
             normalize_relative(b"DATA\0MAPS", PathPolicy::StrictLegacy),
             Err(PathError::EmbeddedNul)
         );
+    }
+
+    #[test]
+    fn strict_legacy_rejects_host_only_segments() {
+        assert_eq!(
+            normalize_relative(b"./DATA/MAPS", PathPolicy::StrictLegacy),
+            Err(PathError::ParentTraversal)
+        );
+        assert_eq!(
+            normalize_relative(b"DATA//MAPS", PathPolicy::StrictLegacy),
+            Err(PathError::ParentTraversal)
+        );
+        assert_eq!(
+            normalize_relative(b"DATA/stream:name", PathPolicy::StrictLegacy),
+            Err(PathError::Absolute)
+        );
+
+        let host = normalize_relative(b"./DATA//MAPS", PathPolicy::HostCompatible).expect("host");
+        assert_eq!(host.as_str(), "DATA/MAPS");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! Virtual filesystem ports for resource loading.
 
-use fparkan_path::{join_under, NormalizedPath};
+use fparkan_path::{ascii_lookup_key, join_under, NormalizedPath};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -92,22 +92,27 @@ impl DirectoryVfs {
     }
 
     fn host_path(&self, path: &NormalizedPath) -> Result<PathBuf, VfsError> {
-        let exact = join_under(&self.root, path).map_err(|_| VfsError::Path)?;
-        if exact.exists() {
-            return Ok(exact);
-        }
+        join_under(&self.root, path).map_err(|_| VfsError::Path)?;
         resolve_casefolded(&self.root, path.as_str())
     }
 }
 
 impl Vfs for DirectoryVfs {
     fn metadata(&self, path: &NormalizedPath) -> Result<VfsMetadata, VfsError> {
-        let meta = fs::metadata(self.host_path(path)?).map_err(VfsError::Io)?;
+        let meta = fs::symlink_metadata(self.host_path(path)?).map_err(VfsError::Io)?;
         Ok(metadata_from_fs(&meta))
     }
 
     fn read(&self, path: &NormalizedPath) -> Result<Arc<[u8]>, VfsError> {
-        let bytes = fs::read(self.host_path(path)?).map_err(VfsError::Io)?;
+        let host = self.host_path(path)?;
+        if fs::symlink_metadata(&host)
+            .map_err(VfsError::Io)?
+            .file_type()
+            .is_symlink()
+        {
+            return Err(VfsError::Path);
+        }
+        let bytes = fs::read(host).map_err(VfsError::Io)?;
         Ok(Arc::from(bytes.into_boxed_slice()))
     }
 
@@ -115,7 +120,7 @@ impl Vfs for DirectoryVfs {
         let base = self.host_path(prefix)?;
         let mut entries = Vec::new();
         if base.is_file() {
-            let metadata = fs::metadata(&base).map_err(VfsError::Io)?;
+            let metadata = fs::symlink_metadata(&base).map_err(VfsError::Io)?;
             entries.push(VfsEntry {
                 path: prefix.clone(),
                 metadata: metadata_from_fs(&metadata),
@@ -140,6 +145,9 @@ fn resolve_casefolded(root: &Path, normalized: &str) -> Result<PathBuf, VfsError
                 continue;
             };
             if name.eq_ignore_ascii_case(segment) {
+                if entry.file_type().map_err(VfsError::Io)?.is_symlink() {
+                    return Err(VfsError::Path);
+                }
                 matches.push(entry.path());
             }
         }
@@ -175,7 +183,10 @@ fn list_recursive(root: &Path, dir: &Path, out: &mut Vec<VfsEntry>) -> Result<()
     }
     children.sort();
     for child in children {
-        let metadata = fs::metadata(&child).map_err(VfsError::Io)?;
+        let metadata = fs::symlink_metadata(&child).map_err(VfsError::Io)?;
+        if metadata.file_type().is_symlink() {
+            return Err(VfsError::Path);
+        }
         if metadata.is_dir() {
             list_recursive(root, &child, out)?;
             continue;
@@ -217,21 +228,51 @@ fn metadata_from_fs(metadata: &fs::Metadata) -> VfsMetadata {
 #[derive(Clone, Debug, Default)]
 pub struct MemoryVfs {
     files: BTreeMap<String, Arc<[u8]>>,
+    lookup: BTreeMap<Vec<u8>, Vec<String>>,
 }
 
 impl MemoryVfs {
     /// Inserts a file.
     #[allow(clippy::needless_pass_by_value)]
     pub fn insert(&mut self, path: NormalizedPath, bytes: Arc<[u8]>) {
-        self.files.insert(path.as_str().to_string(), bytes);
+        let path = path.as_str().to_string();
+        self.files.insert(path, bytes);
+        self.rebuild_lookup();
+    }
+
+    fn rebuild_lookup(&mut self) {
+        self.lookup.clear();
+        for path in self.files.keys() {
+            self.lookup
+                .entry(ascii_lookup_key(path.as_bytes()).0)
+                .or_default()
+                .push(path.clone());
+        }
+        for paths in self.lookup.values_mut() {
+            paths.sort();
+        }
+    }
+
+    fn resolve_path(&self, path: &NormalizedPath) -> Result<&str, VfsError> {
+        let key = ascii_lookup_key(path.as_str().as_bytes()).0;
+        let matches = self
+            .lookup
+            .get(&key)
+            .ok_or_else(|| VfsError::NotFound(path.as_str().to_string()))?;
+        match matches.as_slice() {
+            [single] => Ok(single.as_str()),
+            [] => Err(VfsError::NotFound(path.as_str().to_string())),
+            _ => Err(VfsError::Ambiguous(path.as_str().to_string())),
+        }
     }
 }
 
 impl Vfs for MemoryVfs {
     fn metadata(&self, path: &NormalizedPath) -> Result<VfsMetadata, VfsError> {
+        let resolved = self.resolve_path(path)?;
         let bytes = self
             .files
-            .get(path.as_str())
+            .get(resolved)
             .ok_or_else(|| VfsError::NotFound(path.as_str().to_string()))?;
         Ok(VfsMetadata {
             len: bytes.len() as u64,
@@ -240,8 +281,9 @@ impl Vfs for MemoryVfs {
     }
 
     fn read(&self, path: &NormalizedPath) -> Result<Arc<[u8]>, VfsError> {
+        let resolved = self.resolve_path(path)?;
         self.files
-            .get(path.as_str())
+            .get(resolved)
             .cloned()
             .ok_or_else(|| VfsError::NotFound(path.as_str().to_string()))
     }
@@ -385,6 +427,36 @@ mod tests {
     }
 
     #[test]
+    fn directory_vfs_reports_casefold_ambiguity_even_for_exact_host_path() {
+        let root = unique_test_dir("casefold-ambiguous");
+        std::fs::create_dir_all(root.join("Data")).expect("mkdir first");
+        std::fs::create_dir_all(root.join("data")).expect("mkdir second");
+        std::fs::write(root.join("Data").join("File.bin"), b"first").expect("write first");
+        std::fs::write(root.join("data").join("File.bin"), b"second").expect("write second");
+        let collision_count = std::fs::read_dir(&root)
+            .expect("read root")
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("data"))
+            })
+            .count();
+        if collision_count < 2 {
+            std::fs::remove_dir_all(root).expect("cleanup");
+            return;
+        }
+
+        let vfs = DirectoryVfs::new(&root);
+        let path = normalize_relative(b"Data/File.bin", PathPolicy::StrictLegacy).expect("path");
+
+        assert!(matches!(vfs.read(&path), Err(VfsError::Ambiguous(_))));
+
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
     fn directory_vfs_lists_files_below_prefix() {
         let root = unique_test_dir("list");
         std::fs::create_dir_all(root.join("DATA").join("MAPS")).expect("mkdir");
@@ -403,6 +475,27 @@ mod tests {
         std::fs::remove_dir_all(root).expect("cleanup");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn directory_vfs_rejects_symlink_escape() {
+        let root = unique_test_dir("symlink-escape");
+        let outside = unique_test_dir("symlink-outside");
+        std::fs::create_dir_all(&root).expect("mkdir root");
+        std::fs::create_dir_all(&outside).expect("mkdir outside");
+        std::fs::write(outside.join("secret.bin"), b"secret").expect("write outside");
+        std::os::unix::fs::symlink(&outside, root.join("DATA")).expect("symlink");
+
+        let vfs = DirectoryVfs::new(&root);
+        let path = normalize_relative(b"DATA/secret.bin", PathPolicy::StrictLegacy).expect("path");
+        let prefix = normalize_relative(b"DATA", PathPolicy::StrictLegacy).expect("prefix");
+
+        assert!(matches!(vfs.read(&path), Err(VfsError::Path)));
+        assert!(matches!(vfs.list(&prefix), Err(VfsError::Path)));
+
+        std::fs::remove_dir_all(root).expect("cleanup root");
+        std::fs::remove_dir_all(outside).expect("cleanup outside");
+    }
+
     #[test]
     fn casefold_selector_reports_ambiguous_segments() {
         let err = select_casefolded_match(
@@ -417,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_vfs_uses_exact_lookup() {
+    fn memory_vfs_uses_ascii_casefold_lookup() {
         let path = normalize_relative(b"Data/File.bin", PathPolicy::StrictLegacy).expect("path");
         let mut vfs = MemoryVfs::default();
         vfs.insert(path.clone(), Arc::from(b"payload".as_slice()));
@@ -427,7 +520,23 @@ mod tests {
 
         let other_case =
             normalize_relative(b"data/file.bin", PathPolicy::StrictLegacy).expect("path");
-        assert!(matches!(vfs.read(&other_case), Err(VfsError::NotFound(_))));
+        assert_eq!(
+            vfs.read(&other_case).expect("casefold read").as_ref(),
+            b"payload"
+        );
+    }
+
+    #[test]
+    fn memory_vfs_reports_casefold_ambiguity() {
+        let first = normalize_relative(b"Data/File.bin", PathPolicy::StrictLegacy).expect("first");
+        let second =
+            normalize_relative(b"DATA/file.BIN", PathPolicy::StrictLegacy).expect("second");
+        let query = normalize_relative(b"data/file.bin", PathPolicy::StrictLegacy).expect("query");
+        let mut vfs = MemoryVfs::default();
+        vfs.insert(first, Arc::from(b"first".as_slice()));
+        vfs.insert(second, Arc::from(b"second".as_slice()));
+
+        assert!(matches!(vfs.read(&query), Err(VfsError::Ambiguous(_))));
     }
 
     #[test]

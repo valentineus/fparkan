@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! SDL platform adapter proof behind safe `FParkan` ports.
+//! SDL platform adapter boundary stubs behind safe `FParkan` ports.
 
 use fparkan_platform::{
     EventSource, GraphicsContextRequest, GraphicsProfile, PhysicalSize, PlatformError,
@@ -33,20 +33,20 @@ impl Default for SdlAdapterCapabilities {
     }
 }
 
-/// Returns adapter readiness status for the safe project-owned layer.
+/// Returns whether the project-owned adapter boundary avoids `unsafe`.
 #[must_use]
-pub fn safe_adapter_ready() -> bool {
+pub fn project_owned_layer_unsafe_free() -> bool {
     SdlAdapterCapabilities::default().project_owned_unsafe_free
 }
 
-/// In-memory event source used by adapter smoke tests and composition roots
-/// before a concrete SDL runtime is injected.
+/// In-memory event source used by adapter smoke tests before a concrete SDL
+/// runtime is selected.
 #[derive(Clone, Debug, Default)]
-pub struct SdlEventSourceProof {
+pub struct SdlEventSourceStub {
     pending: Vec<PlatformEvent>,
 }
 
-impl SdlEventSourceProof {
+impl SdlEventSourceStub {
     /// Creates an event source with deterministic pending events.
     #[must_use]
     pub fn new(pending: Vec<PlatformEvent>) -> Self {
@@ -54,22 +54,22 @@ impl SdlEventSourceProof {
     }
 }
 
-impl EventSource for SdlEventSourceProof {
+impl EventSource for SdlEventSourceStub {
     fn poll(&mut self, out: &mut Vec<PlatformEvent>) -> Result<(), PlatformError> {
         out.append(&mut self.pending);
         Ok(())
     }
 }
 
-/// Safe window-port proof with SDL-compatible drawable-size semantics.
+/// Safe window-port stub with SDL-compatible drawable-size semantics.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SdlWindowProof {
+pub struct SdlWindowStub {
     size: PhysicalSize,
     presents: u64,
 }
 
-impl SdlWindowProof {
-    /// Creates a proof window with a fixed drawable size.
+impl SdlWindowStub {
+    /// Creates a stub window with a fixed drawable size.
     #[must_use]
     pub fn new(size: PhysicalSize) -> Self {
         Self { size, presents: 0 }
@@ -82,7 +82,7 @@ impl SdlWindowProof {
     }
 }
 
-impl WindowPort for SdlWindowProof {
+impl WindowPort for SdlWindowStub {
     fn drawable_size(&self) -> PhysicalSize {
         self.size
     }
@@ -98,20 +98,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn adapter_reports_safe_project_layer_ready() {
-        assert!(safe_adapter_ready());
+    fn adapter_boundary_is_project_owned_unsafe_free() {
+        assert!(project_owned_layer_unsafe_free());
         assert_eq!(SdlAdapterCapabilities::default().graphics.len(), 2);
     }
 
     #[test]
     fn event_source_and_window_ports_are_deterministic() -> Result<(), PlatformError> {
-        let mut source = SdlEventSourceProof::new(vec![PlatformEvent::Quit]);
+        let mut source = SdlEventSourceStub::new(vec![PlatformEvent::Quit]);
         let mut events = Vec::new();
         source.poll(&mut events)?;
         source.poll(&mut events)?;
         assert_eq!(events, vec![PlatformEvent::Quit]);
 
-        let mut window = SdlWindowProof::new(PhysicalSize {
+        let mut window = SdlWindowStub::new(PhysicalSize {
             width: 320,
             height: 240,
         });

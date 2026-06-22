@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! OpenGL render adapter proof behind safe `FParkan` render ports.
+//! OpenGL render adapter boundary stubs behind safe `FParkan` render ports.
 
 use fparkan_render::{
     canonical_capture, FrameOutput, RenderBackend, RenderCommandList, RenderError,
@@ -64,9 +64,9 @@ impl Default for GlAdapterCapabilities {
     }
 }
 
-/// Returns adapter readiness status for the safe project-owned layer.
+/// Returns whether the project-owned adapter boundary avoids `unsafe`.
 #[must_use]
-pub fn safe_adapter_ready() -> bool {
+pub fn project_owned_layer_unsafe_free() -> bool {
     GlAdapterCapabilities::default().project_owned_unsafe_free
 }
 
@@ -98,7 +98,7 @@ pub fn compile_shader_source(
     Ok(())
 }
 
-/// Safe render backend facade used for adapter-level command validation.
+/// Safe render backend stub used for adapter-level command validation.
 ///
 /// A concrete OpenGL implementation can be injected behind the same
 /// [`RenderBackend`] port once an audited safe GL facade is selected. This type
@@ -147,8 +147,8 @@ mod tests {
     };
 
     #[test]
-    fn adapter_reports_safe_project_layer_ready() {
-        assert!(safe_adapter_ready());
+    fn adapter_boundary_is_project_owned_unsafe_free() {
+        assert!(project_owned_layer_unsafe_free());
         assert_eq!(GlAdapterCapabilities::default().profiles.len(), 2);
     }
 

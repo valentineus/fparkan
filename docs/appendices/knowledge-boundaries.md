@@ -114,16 +114,23 @@ key, configuration, device profile, initial state, input/time script и верс
 ## Local evidence requests
 
 На текущем рабочем месте закрыты статические, corpus и headless runtime gates.
-Для macOS Desktop GL подтверждены безопасный command/state trace и offscreen
-pixel capture:
+Для macOS Desktop GL есть только безопасный command/state trace и исторический
+одноразовый offscreen pixel probe:
 
 - `cargo test -p fparkan-render-gl --offline desktop_gl33_triangle_command_capture`;
 - `fixtures/acceptance/macos-gl33-triangle-capture.json`.
 
-`S3-GL-001` считается закрытым для текущей macOS-focused цели: временный
-`rustc` probe создал CGL/OpenGL offscreen FBO, выполнил shader-based triangle
-draw, прочитал RGBA pixels и сохранил hash capture. Probe не добавляет
-project-owned `unsafe` в workspace; постоянный adapter API остаётся safe.
+`S3-GL-001` не считается закрытым: временный `rustc` probe создал CGL/OpenGL
+offscreen FBO, выполнил shader-based triangle draw, прочитал RGBA pixels и
+сохранил hash capture, но постоянный workspace adapter по-прежнему не создаёт
+SDL window, GL context, GPU resources, shader programs, draw calls или present.
+Probe не добавляет project-owned `unsafe` в workspace и остаётся только external
+evidence request artifact.
+
+Для повышения `S3-GL-001` до `covered` нужен постоянный macOS backend через
+выбранную safe facade stack: SDL event/window/context lifecycle, Desktop GL 3.3
+shader/buffer/texture/draw/present path, hidden-window/offscreen smoke test и
+licensed local model/terrain frame capture.
 
 Для повышения `S3-GL-002` до `covered` всё ещё нужен воспроизводимый GLES2
 backend profile: GLES2 должен создать кадр, сохранить pixel capture и тот же

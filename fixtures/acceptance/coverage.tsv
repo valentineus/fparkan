@@ -21,7 +21,7 @@ S0-CORPUS-005	covered	cargo test -p fparkan-corpus --offline fingerprint_changes
 S0-CORPUS-006	covered	cargo test -p fparkan-corpus --offline atomic_report_write
 S0-CLI-001	covered	cargo test -p fparkan-cli --offline stable_exit_codes_are_mapped
 S0-CLI-002	covered	cargo test -p fparkan-cli --offline accepts_json_format_option archive_json_has_schema_version
-S0-GL-001	covered	cargo test -p fparkan-platform-sdl -p fparkan-render-gl --offline adapter_reports_safe_project_layer_ready
+S0-GL-001	covered	cargo test -p fparkan-platform-sdl -p fparkan-render-gl --offline adapter_boundary_is_project_owned_unsafe_free
 S0-LIMIT-001	covered	cargo test -p fparkan-binary --offline rejects_count_stride_overflow
 S0-LIMIT-002	covered	cargo test -p fparkan-binary --offline rejects_oversized_declared_allocation_before_read
 L1-P1-NRES-001	covered	cargo test -p fparkan-nres --offline licensed_corpora_nres_roundtrip_gates
@@ -220,7 +220,7 @@ S3-RENDER-006	covered	cargo test -p fparkan-render --offline invalid_range_retur
 S3-RENDER-007	covered	cargo test -p fparkan-render --offline capture_is_stable
 S3-RENDER-008	covered	cargo test -p fparkan-render --offline recording_backend_stores_captures
 S3-RENDER-009	covered	cargo xtask policy
-S3-GL-001	covered	cargo test -p fparkan-render-gl --offline desktop_gl33_triangle_command_capture plus fixtures/acceptance/macos-gl33-triangle-capture.json records macOS CGL/OpenGL offscreen FBO pixel capture
+S3-GL-001	omitted	permanent macOS Desktop GL 3.3 adapter is not implemented; historical CGL probe is retained as external evidence only
 S3-GL-002	omitted	outside the current macOS-focused goal scope; GLES2 remains documented for portable/non-macOS targets
 S3-GL-003	covered	cargo test -p fparkan-render-gl --offline shader_compile_failure_diagnostic_contains_profile_and_log
 S3-VIEWER-001	covered	cargo test -p fparkan-viewer --offline model_fixture_uses_viewer_service_and_render_commands
