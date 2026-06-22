@@ -417,15 +417,8 @@ pub fn resolve_material(
     {
         return Ok(resolved);
     }
-    if let Some(first) = table.entries.first() {
-        if let Some(resolved) = load_material_entry(
-            repository,
-            archive,
-            &first.material,
-            MaterialFallback::FirstEntry,
-        )? {
-            return Ok(resolved);
-        }
+    if let Some(resolved) = load_first_material_entry(repository, archive)? {
+        return Ok(resolved);
     }
     Err(MaterialError::MissingMaterial(
         String::from_utf8_lossy(&entry.material.0).into_owned(),
@@ -606,6 +599,26 @@ fn load_material_entry(
     Ok(Some(ResolvedMaterial {
         name: info.key.name,
         fallback,
+        document,
+    }))
+}
+
+fn load_first_material_entry(
+    repository: &dyn ResourceRepository,
+    archive: fparkan_resource::ArchiveId,
+) -> Result<Option<ResolvedMaterial>, MaterialError> {
+    let Some(handle) = repository.first_entry(archive)? else {
+        return Ok(None);
+    };
+    let info = repository.entry_info(handle)?;
+    if info.key.type_id != Some(MAT0_KIND) {
+        return Ok(None);
+    }
+    let bytes = repository.read(handle)?.into_owned();
+    let document = decode_mat0(&bytes, info.attr2)?;
+    Ok(Some(ResolvedMaterial {
+        name: info.key.name,
+        fallback: MaterialFallback::FirstEntry,
         document,
     }))
 }
@@ -924,6 +937,24 @@ mod tests {
 
         assert_eq!(resolved.name.0, b"MAT_FIRST");
         assert_eq!(resolved.fallback, MaterialFallback::FirstEntry);
+    }
+
+    #[test]
+    fn resolve_material_first_entry_uses_material_archive_not_wear_row_zero() {
+        let repo = material_repo(&[
+            material_entry(b"MAT_ARCHIVE_FIRST", &mat0_with_texture(b"TEX_ARCHIVE")),
+            material_entry(b"MAT_WEAR_FIRST", &mat0_with_texture(b"TEX_WEAR")),
+        ]);
+        let table = decode_wear(b"2\n0 MAT_WEAR_FIRST\n1 MISSING\n").expect("wear");
+
+        let resolved = resolve_material(&repo, &table, 1).expect("resolved");
+
+        assert_eq!(resolved.name.0, b"MAT_ARCHIVE_FIRST");
+        assert_eq!(resolved.fallback, MaterialFallback::FirstEntry);
+        assert_eq!(
+            resolved.document.primary_texture().expect("texture").0,
+            b"TEX_ARCHIVE"
+        );
     }
 
     #[test]

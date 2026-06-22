@@ -357,36 +357,45 @@ pub fn step_with_handler<F>(
 where
     F: FnMut(&mut World, &WorldCommand) -> Result<(), WorldError>,
 {
+    let before = world.clone();
     world.phase = WorldPhase::Calculating;
     let mut events = Vec::new();
-    while let Some(command) = world.queue.pop_front() {
-        if let Some(handle) = command.target {
-            if world.deferred_delete.contains(&handle) {
-                continue;
+    let result = (|| {
+        while let Some(command) = world.queue.pop_front() {
+            if let Some(handle) = command.target {
+                if world.deferred_delete.contains(&handle) {
+                    continue;
+                }
+                checked_slot(world, handle)?;
             }
-            checked_slot(world, handle)?;
+            handler(world, &command)?;
+            events.push(WorldEvent {
+                sequence: command.sequence,
+                target: command.target,
+            });
         }
-        handler(world, &command)?;
-        events.push(WorldEvent {
-            sequence: command.sequence,
-            target: command.target,
-        });
+        world.phase = WorldPhase::ApplyingDeferred;
+        let deletes = std::mem::take(&mut world.deferred_delete);
+        for handle in deletes {
+            delete_now(world, handle)?;
+        }
+        world.tick.0 = world.tick.0.saturating_add(1);
+        world.phase = WorldPhase::PublishingSnapshot;
+        let snapshot = WorldSnapshot {
+            tick: world.tick,
+            objects: live_registered(world),
+            events,
+            hash: canonical_state_hash(world),
+        };
+        world.phase = WorldPhase::Idle;
+        Ok(snapshot)
+    })();
+    if let Err(err) = result {
+        *world = before;
+        world.phase = WorldPhase::Idle;
+        return Err(err);
     }
-    world.phase = WorldPhase::ApplyingDeferred;
-    let deletes = std::mem::take(&mut world.deferred_delete);
-    for handle in deletes {
-        let _ = delete_now(world, handle);
-    }
-    world.tick.0 = world.tick.0.saturating_add(1);
-    world.phase = WorldPhase::PublishingSnapshot;
-    let snapshot = WorldSnapshot {
-        tick: world.tick,
-        objects: live_registered(world),
-        events,
-        hash: canonical_state_hash(world),
-    };
-    world.phase = WorldPhase::Idle;
-    Ok(snapshot)
+    result
 }
 
 /// Computes canonical state hash.
@@ -708,6 +717,44 @@ mod tests {
             step(&mut world, &InputSnapshot).expect("step").objects,
             vec![second]
         );
+    }
+
+    #[test]
+    fn callback_error_rolls_back_phase_queue_and_deferred_deletes() {
+        let mut world = new(WorldConfig);
+        let first = construct_object(&mut world, ObjectDraft { original_id: None }).expect("first");
+        register_object(&mut world, first).expect("register");
+        enqueue(
+            &mut world,
+            WorldCommand {
+                sequence: 7,
+                target: Some(first),
+            },
+        )
+        .expect("enqueue");
+
+        let err = step_with_handler(&mut world, &InputSnapshot, |world, _| {
+            request_delete(world, first)?;
+            Err(WorldError::InvalidFixedStep)
+        })
+        .expect_err("handler error");
+
+        assert_eq!(err, WorldError::InvalidFixedStep);
+        assert_eq!(world.phase, WorldPhase::Idle);
+        assert_eq!(world.tick, Tick(0));
+        assert!(world.deferred_delete.is_empty());
+        assert_eq!(world.queue.len(), 1);
+
+        let snapshot = step(&mut world, &InputSnapshot).expect("retry step");
+        assert_eq!(snapshot.tick, Tick(1));
+        assert_eq!(
+            snapshot.events,
+            vec![WorldEvent {
+                sequence: 0,
+                target: Some(first)
+            }]
+        );
+        assert_eq!(snapshot.objects, vec![first]);
     }
 
     #[test]

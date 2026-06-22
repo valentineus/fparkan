@@ -6,7 +6,7 @@ use fparkan_msh::{decode_msh, validate_msh};
 use fparkan_nres::{decode as decode_nres, ReadProfile};
 use fparkan_path::{normalize_relative, NormalizedPath, PathPolicy, ResourceName};
 use fparkan_prototype::{EffectivePrototype, PrototypeGeometry, PrototypeGraph};
-use fparkan_resource::{ResourceKey, ResourceRepository};
+use fparkan_resource::{ResourceError, ResourceKey, ResourceRepository};
 use fparkan_texm::decode_texm;
 use std::collections::BTreeSet;
 use std::fmt;
@@ -279,17 +279,13 @@ pub fn prepare_visual_with_repository<R: ResourceRepository>(
         material_count += 1;
 
         for texture in material.document.texture_requests() {
-            resolve_texm(repository, &texture, &[TEXTURES_ARCHIVE, LIGHTMAP_ARCHIVE])?;
+            resolve_texture(repository, &texture)?;
             texture_count += 1;
         }
     }
 
     for lightmap in &wear.lightmaps {
-        resolve_texm(
-            repository,
-            &lightmap.lightmap,
-            &[LIGHTMAP_ARCHIVE, TEXTURES_ARCHIVE],
-        )?;
+        resolve_lightmap(repository, &lightmap.lightmap)?;
         lightmap_count += 1;
     }
 
@@ -325,28 +321,59 @@ fn read_key<R: ResourceRepository>(
     Ok(Arc::from(bytes.into_owned()))
 }
 
+fn resolve_texture<R: ResourceRepository>(
+    repository: &R,
+    name: &ResourceName,
+) -> Result<(), AssetError> {
+    resolve_texm(repository, name, TEXTURES_ARCHIVE, "texture")
+}
+
+fn resolve_lightmap<R: ResourceRepository>(
+    repository: &R,
+    name: &ResourceName,
+) -> Result<(), AssetError> {
+    resolve_texm(repository, name, LIGHTMAP_ARCHIVE, "lightmap")
+}
+
 fn resolve_texm<R: ResourceRepository>(
     repository: &R,
     name: &ResourceName,
-    archives: &[&str],
+    archive: &str,
+    label: &'static str,
 ) -> Result<(), AssetError> {
-    for archive in archives {
-        let key = ResourceKey {
-            archive: parse_path(archive)?,
-            name: name.clone(),
-            type_id: None,
-        };
-        match read_key(repository, &key, Some("texm")) {
-            Ok(bytes) => {
-                decode_texm(bytes).map_err(|err| AssetError::Texture(err.to_string()))?;
-                return Ok(());
-            }
-            Err(AssetError::MissingDependency(_) | AssetError::Resource(_)) => {}
-            Err(err) => return Err(err),
-        }
-    }
+    let key = ResourceKey {
+        archive: parse_path(archive)?,
+        name: name.clone(),
+        type_id: None,
+    };
+    let Some(bytes) = read_optional_key(repository, &key, Some(label))? else {
+        return Err(AssetError::MissingDependency(format!("{label} {name:?}")));
+    };
+    decode_texm(bytes)
+        .map(|_| ())
+        .map_err(|err| AssetError::Texture(err.to_string()))
+}
 
-    Err(AssetError::MissingDependency(format!("{name:?}")))
+fn read_optional_key<R: ResourceRepository>(
+    repository: &R,
+    key: &ResourceKey,
+    label: Option<&str>,
+) -> Result<Option<Arc<[u8]>>, AssetError> {
+    let archive = match repository.open_archive(&key.archive) {
+        Ok(archive) => archive,
+        Err(ResourceError::MissingArchive | ResourceError::MissingEntry) => return Ok(None),
+        Err(err) => return Err(AssetError::Resource(format!("{label:?} {key:?}: {err}"))),
+    };
+    let Some(handle) = repository
+        .find(archive, &key.name)
+        .map_err(|err| AssetError::Resource(format!("{label:?} {key:?}: {err}")))?
+    else {
+        return Ok(None);
+    };
+    let bytes = repository
+        .read(handle)
+        .map_err(|err| AssetError::Resource(format!("{label:?} {key:?}: {err}")))?;
+    Ok(Some(Arc::from(bytes.into_owned())))
 }
 
 fn sibling_name(key: &ResourceKey, extension: &str) -> Result<ResourceName, AssetError> {
@@ -412,7 +439,7 @@ mod tests {
     use super::*;
     use fparkan_prototype::build_prototype_graph;
     use fparkan_resource::{resource_name, CachedResourceRepository};
-    use fparkan_vfs::{DirectoryVfs, Vfs};
+    use fparkan_vfs::{DirectoryVfs, MemoryVfs, Vfs};
     use std::path::PathBuf;
 
     #[test]
@@ -423,6 +450,47 @@ mod tests {
 
         assert_eq!(plan.visual_count, 0);
         assert_eq!(plan.model_count, 0);
+    }
+
+    #[test]
+    fn texture_resolver_does_not_fallback_to_lightmap_archive() {
+        let texm = texm_payload();
+        let repo = repository_with_archives(&[(
+            LIGHTMAP_ARCHIVE,
+            &[(b"TEX_ONLY".as_slice(), texm.as_slice())],
+        )]);
+
+        let err = resolve_texture(&repo, &resource_name(b"TEX_ONLY")).expect_err("missing texture");
+
+        assert!(matches!(err, AssetError::MissingDependency(_)));
+    }
+
+    #[test]
+    fn lightmap_resolver_does_not_fallback_to_texture_archive() {
+        let texm = texm_payload();
+        let repo = repository_with_archives(&[(
+            TEXTURES_ARCHIVE,
+            &[(b"LM_ONLY".as_slice(), texm.as_slice())],
+        )]);
+
+        let err =
+            resolve_lightmap(&repo, &resource_name(b"LM_ONLY")).expect_err("missing lightmap");
+
+        assert!(matches!(err, AssetError::MissingDependency(_)));
+    }
+
+    #[test]
+    fn texture_resolver_does_not_continue_after_malformed_texture() {
+        let malformed = b"not texm".as_slice();
+        let texm = texm_payload();
+        let repo = repository_with_archives(&[
+            (TEXTURES_ARCHIVE, &[(b"BAD".as_slice(), malformed)]),
+            (LIGHTMAP_ARCHIVE, &[(b"BAD".as_slice(), texm.as_slice())]),
+        ]);
+
+        let err = resolve_texture(&repo, &resource_name(b"BAD")).expect_err("malformed texture");
+
+        assert!(matches!(err, AssetError::Texture(_)));
     }
 
     #[test]
@@ -479,5 +547,66 @@ mod tests {
             .join("../..")
             .join("testdata")
             .join(part)
+    }
+
+    fn repository_with_archives(
+        archives: &[(&str, &[(&[u8], &[u8])])],
+    ) -> CachedResourceRepository {
+        let mut vfs = MemoryVfs::default();
+        for (archive, entries) in archives {
+            let path = parse_path(archive).expect("archive path");
+            vfs.insert(path, Arc::from(build_nres(entries).into_boxed_slice()));
+        }
+        CachedResourceRepository::new(Arc::new(vfs))
+    }
+
+    fn texm_payload() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0x6d78_6554_u32.to_le_bytes());
+        out.extend_from_slice(&1_u32.to_le_bytes());
+        out.extend_from_slice(&1_u32.to_le_bytes());
+        out.extend_from_slice(&1_u32.to_le_bytes());
+        out.extend_from_slice(&0_u32.to_le_bytes());
+        out.extend_from_slice(&0_u32.to_le_bytes());
+        out.extend_from_slice(&0_u32.to_le_bytes());
+        out.extend_from_slice(&565_u32.to_le_bytes());
+        out.extend_from_slice(&0xffff_u16.to_le_bytes());
+        out
+    }
+
+    fn build_nres(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut out = vec![0; 16];
+        let mut offsets = Vec::with_capacity(entries.len());
+        for (_, payload) in entries {
+            offsets.push(u32::try_from(out.len()).expect("offset"));
+            out.extend_from_slice(payload);
+            let padding = (8 - (out.len() % 8)) % 8;
+            out.resize(out.len() + padding, 0);
+        }
+        let mut order: Vec<usize> = (0..entries.len()).collect();
+        order.sort_by(|left, right| entries[*left].0.cmp(entries[*right].0));
+        for (idx, (name, payload)) in entries.iter().enumerate() {
+            push_u32(&mut out, 0);
+            push_u32(&mut out, 0);
+            push_u32(&mut out, 0);
+            push_u32(&mut out, u32::try_from(payload.len()).expect("payload"));
+            push_u32(&mut out, 0);
+            let mut name_raw = [0; 36];
+            let len = name_raw.len().saturating_sub(1).min(name.len());
+            name_raw[..len].copy_from_slice(&name[..len]);
+            out.extend_from_slice(&name_raw);
+            push_u32(&mut out, offsets[idx]);
+            push_u32(&mut out, u32::try_from(order[idx]).expect("sort index"));
+        }
+        out[0..4].copy_from_slice(b"NRes");
+        out[4..8].copy_from_slice(&0x100_u32.to_le_bytes());
+        out[8..12].copy_from_slice(&u32::try_from(entries.len()).expect("count").to_le_bytes());
+        let total_size = u32::try_from(out.len()).expect("total size");
+        out[12..16].copy_from_slice(&total_size.to_le_bytes());
+        out
+    }
+
+    fn push_u32(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_le_bytes());
     }
 }

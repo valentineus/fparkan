@@ -40,6 +40,8 @@ pub struct ArchiveId(pub u64);
 pub struct EntryHandle {
     /// Archive.
     pub archive: ArchiveId,
+    /// Archive generation at the time the entry was resolved.
+    pub generation: u64,
     /// Local entry index.
     pub local: u32,
 }
@@ -108,6 +110,8 @@ pub enum ResourceError {
     MissingEntry,
     /// Stale or invalid handle.
     InvalidHandle,
+    /// Handle belongs to an older archive generation.
+    StaleHandle,
     /// Format error.
     Format(String),
     /// Entry-specific read error.
@@ -148,6 +152,12 @@ pub trait ResourceRepository {
         archive: ArchiveId,
         name: &ResourceName,
     ) -> Result<Option<EntryHandle>, ResourceError>;
+    /// Returns the first entry in archive directory order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResourceError`] when `archive` is not a valid opened archive.
+    fn first_entry(&self, archive: ArchiveId) -> Result<Option<EntryHandle>, ResourceError>;
     /// Reads bytes.
     ///
     /// # Errors
@@ -179,6 +189,7 @@ struct RepositoryState {
 struct ArchiveSlot {
     path: NormalizedPath,
     fingerprint: u64,
+    generation: u64,
     kind: ArchiveKind,
     document: ArchiveDocument,
 }
@@ -250,12 +261,13 @@ impl ResourceRepository for CachedResourceRepository {
         }
 
         let bytes = self.vfs.read(path).map_err(resource_error_from_vfs)?;
-        let slot = decode_archive(path.clone(), bytes, fingerprint)?;
+        let mut slot = decode_archive(path.clone(), bytes, fingerprint)?;
         let mut state = self.state.lock().map_err(|_| ResourceError::Poisoned)?;
         if let Some(id) = state.paths.get(path.as_str()).copied() {
             if state.archive(id)?.fingerprint == fingerprint {
                 return Ok(id);
             }
+            slot.generation = state.archive(id)?.generation.saturating_add(1);
             *state.archive_mut(id)? = slot;
             state.payload_cache.remove_archive(id);
             return Ok(id);
@@ -279,7 +291,25 @@ impl ResourceRepository for CachedResourceRepository {
             ArchiveDocument::Nres(document) => document.find_bytes(&name.0).map(|id| id.0),
             ArchiveDocument::Rsli(document) => document.find_bytes(&name.0).map(|id| id.0),
         };
-        Ok(local.map(|local| EntryHandle { archive, local }))
+        Ok(local.map(|local| EntryHandle {
+            archive,
+            generation: slot.generation,
+            local,
+        }))
+    }
+
+    fn first_entry(&self, archive: ArchiveId) -> Result<Option<EntryHandle>, ResourceError> {
+        let state = self.state.lock().map_err(|_| ResourceError::Poisoned)?;
+        let slot = state.archive(archive)?;
+        let local = match &slot.document {
+            ArchiveDocument::Nres(document) => document.entries().first().map(|entry| entry.id().0),
+            ArchiveDocument::Rsli(document) => document.entry(fparkan_rsli::EntryId(0)).map(|_| 0),
+        };
+        Ok(local.map(|local| EntryHandle {
+            archive,
+            generation: slot.generation,
+            local,
+        }))
     }
 
     fn read(&self, entry: EntryHandle) -> Result<ResourceBytes, ResourceError> {
@@ -289,7 +319,7 @@ impl ResourceRepository for CachedResourceRepository {
         }
 
         let payload = {
-            let slot = state.archive(entry.archive)?;
+            let slot = state.entry_archive(entry)?;
             let key = slot.entry_key(entry.local)?;
             slot.read_payload(entry.local)
                 .map_err(|source| ResourceError::EntryRead {
@@ -304,7 +334,7 @@ impl ResourceRepository for CachedResourceRepository {
 
     fn entry_info(&self, entry: EntryHandle) -> Result<ResourceEntryInfo, ResourceError> {
         let state = self.state.lock().map_err(|_| ResourceError::Poisoned)?;
-        let slot = state.archive(entry.archive)?;
+        let slot = state.entry_archive(entry)?;
         match &slot.document {
             ArchiveDocument::Nres(document) => {
                 let local =
@@ -420,6 +450,14 @@ impl RepositoryState {
             .get_mut(index)
             .ok_or(ResourceError::InvalidHandle)
     }
+
+    fn entry_archive(&self, entry: EntryHandle) -> Result<&ArchiveSlot, ResourceError> {
+        let slot = self.archive(entry.archive)?;
+        if slot.generation != entry.generation {
+            return Err(ResourceError::StaleHandle);
+        }
+        Ok(slot)
+    }
 }
 
 impl ArchiveSlot {
@@ -474,6 +512,7 @@ fn decode_archive(
         return Ok(ArchiveSlot {
             path,
             fingerprint,
+            generation: 0,
             kind: ArchiveKind::Nres,
             document: ArchiveDocument::Nres(document),
         });
@@ -484,6 +523,7 @@ fn decode_archive(
         return Ok(ArchiveSlot {
             path,
             fingerprint,
+            generation: 0,
             kind: ArchiveKind::Rsli,
             document: ArchiveDocument::Rsli(document),
         });
@@ -554,6 +594,7 @@ mod tests {
         assert!(matches!(
             repo.read(EntryHandle {
                 archive: ArchiveId(99),
+                generation: 0,
                 local: 0
             }),
             Err(ResourceError::InvalidHandle)
@@ -661,6 +702,8 @@ mod tests {
             .expect("updated handle");
 
         assert_eq!(reopened, archive);
+        assert_ne!(first, second);
+        assert!(matches!(repo.read(first), Err(ResourceError::StaleHandle)));
         assert_eq!(
             repo.read(second).expect("read updated").as_slice(),
             b"after"
