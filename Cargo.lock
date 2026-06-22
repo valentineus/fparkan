@@ -81,6 +81,7 @@ dependencies = [
 name = "fparkan-corpus"
 version = "0.1.0"
 dependencies = [
+ "fparkan-binary",
  "fparkan-path",
 ]
 
@@ -199,6 +200,7 @@ dependencies = [
 name = "fparkan-resource"
 version = "0.1.0"
 dependencies = [
+ "fparkan-binary",
  "fparkan-nres",
  "fparkan-path",
  "fparkan-rsli",
@@ -263,6 +265,7 @@ dependencies = [
 name = "fparkan-vfs"
 version = "0.1.0"
 dependencies = [
+ "fparkan-binary",
  "fparkan-path",
 ]
 

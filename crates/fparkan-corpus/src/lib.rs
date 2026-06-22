@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Licensed corpus discovery and aggregate reports.
 
+use fparkan_binary::{sha256, sha256_hex, Sha256Digest};
 use fparkan_path::{ascii_lookup_key, normalize_relative, PathPolicy};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -39,8 +40,8 @@ pub struct ManifestEntry {
     pub path: String,
     /// File size in bytes.
     pub size: u64,
-    /// Stable content fingerprint.
-    pub hash: u64,
+    /// SHA-256 content fingerprint.
+    pub hash: Sha256Digest,
 }
 
 /// Corpus manifest.
@@ -70,7 +71,7 @@ pub struct CorpusReport {
     /// Casefold collision count.
     pub casefold_collisions: usize,
     /// Manifest fingerprint.
-    pub fingerprint: u64,
+    pub fingerprint: Sha256Digest,
 }
 
 /// Corpus error.
@@ -187,7 +188,7 @@ fn walk(
         out.push(ManifestEntry {
             path: normalized.as_str().to_string(),
             size: metadata.len(),
-            hash: stable_hash(&bytes),
+            hash: sha256(&bytes),
         });
     }
     Ok(())
@@ -352,27 +353,15 @@ fn inspect_nres_entries(bytes: &[u8]) -> Option<Vec<NresEntryBrief>> {
 
 /// Computes stable manifest fingerprint.
 #[must_use]
-pub fn fingerprint(manifest: &CorpusManifest) -> u64 {
-    let mut state = 0xcbf2_9ce4_8422_2325;
+pub fn fingerprint(manifest: &CorpusManifest) -> Sha256Digest {
+    let mut bytes = Vec::new();
     for file in &manifest.files {
-        hash_into(&mut state, file.path.as_bytes());
-        hash_into(&mut state, &file.size.to_le_bytes());
-        hash_into(&mut state, &file.hash.to_le_bytes());
+        bytes.extend_from_slice(file.path.as_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&file.size.to_le_bytes());
+        bytes.extend_from_slice(&file.hash);
     }
-    state
-}
-
-fn stable_hash(bytes: &[u8]) -> u64 {
-    let mut state = 0xcbf2_9ce4_8422_2325;
-    hash_into(&mut state, bytes);
-    state
-}
-
-fn hash_into(state: &mut u64, bytes: &[u8]) {
-    for byte in bytes {
-        *state ^= u64::from(*byte);
-        *state = state.wrapping_mul(0x0000_0100_0000_01b3);
-    }
+    sha256(&bytes)
 }
 
 /// Writes report atomically.
@@ -413,13 +402,13 @@ pub fn write_report_atomic(path: &Path, report: &CorpusReport) -> Result<(), Cor
 #[must_use]
 pub fn render_report_json(report: &CorpusReport) -> String {
     let mut out = format!(
-        "{{\"schema_version\":\"fparkan-corpus-report-v1\",\"schema\":{},\"kind\":\"{:?}\",\"files\":{},\"bytes\":{},\"casefold_collisions\":{},\"fingerprint\":\"{:016x}\",\"metrics\":{{",
+        "{{\"schema_version\":\"fparkan-corpus-report-v1\",\"schema\":{},\"kind\":\"{:?}\",\"files\":{},\"bytes\":{},\"casefold_collisions\":{},\"fingerprint\":\"{}\",\"metrics\":{{",
         report.schema,
         report.kind,
         report.files,
         report.bytes,
         report.casefold_collisions,
-        report.fingerprint
+        sha256_hex(&report.fingerprint)
     );
     for (idx, (key, value)) in report.metrics.iter().enumerate() {
         if idx > 0 {
@@ -528,7 +517,7 @@ mod tests {
             files: vec![ManifestEntry {
                 path: "secret/payload.bin".to_string(),
                 size: 4,
-                hash: stable_hash(b"DATA"),
+                hash: sha256(b"DATA"),
             }],
             casefold_collisions: Vec::new(),
         };
@@ -604,12 +593,12 @@ mod tests {
                 ManifestEntry {
                     path: "Textures/Foo.TEX".to_string(),
                     size: 1,
-                    hash: 1,
+                    hash: sha256(b"first"),
                 },
                 ManifestEntry {
                     path: "textures/foo.tex".to_string(),
                     size: 1,
-                    hash: 2,
+                    hash: sha256(b"second"),
                 },
             ],
             casefold_collisions: Vec::new(),
@@ -633,12 +622,12 @@ mod tests {
             files: vec![ManifestEntry {
                 path: "a".to_string(),
                 size: 1,
-                hash: 1,
+                hash: sha256(b"before"),
             }],
             casefold_collisions: Vec::new(),
         };
         let a = fingerprint(&manifest);
-        manifest.files[0].hash = 2;
+        manifest.files[0].hash = sha256(b"after");
         assert_ne!(a, fingerprint(&manifest));
     }
 
@@ -658,7 +647,7 @@ mod tests {
             bytes: 0,
             metrics: BTreeMap::new(),
             casefold_collisions: 0,
-            fingerprint: 0,
+            fingerprint: sha256(b"empty-report"),
         };
         write_report_atomic(&tmp, &report).expect("write");
         assert!(tmp.is_file());

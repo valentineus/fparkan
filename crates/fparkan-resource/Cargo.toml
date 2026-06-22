@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+fparkan-binary = { path = "../fparkan-binary" }
 fparkan-nres = { path = "../fparkan-nres" }
 fparkan-path = { path = "../fparkan-path" }
 fparkan-rsli = { path = "../fparkan-rsli" }

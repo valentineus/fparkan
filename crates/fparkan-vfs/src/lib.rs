@@ -1,19 +1,21 @@
 #![forbid(unsafe_code)]
 //! Virtual filesystem ports for resource loading.
 
+use fparkan_binary::{sha256, Sha256Digest};
 use fparkan_path::{ascii_lookup_key, join_under, NormalizedPath};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 /// VFS metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VfsMetadata {
     /// Byte length.
     pub len: u64,
-    /// Stable-enough source fingerprint for cache invalidation.
-    pub fingerprint: u64,
+    /// SHA-256 content fingerprint for cache invalidation.
+    pub fingerprint: Sha256Digest,
 }
 
 /// VFS entry.
@@ -80,6 +82,7 @@ pub trait Vfs: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct DirectoryVfs {
     root: PathBuf,
+    fingerprint_cache: Arc<Mutex<BTreeMap<PathBuf, CachedHostFingerprint>>>,
 }
 
 impl DirectoryVfs {
@@ -88,6 +91,7 @@ impl DirectoryVfs {
     pub fn new(root: impl AsRef<Path>) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
+            fingerprint_cache: Arc::default(),
         }
     }
 
@@ -95,12 +99,23 @@ impl DirectoryVfs {
         join_under(&self.root, path).map_err(|_| VfsError::Path)?;
         resolve_casefolded(&self.root, path.as_str())
     }
+
+    fn metadata_from_host_file(&self, path: &Path) -> Result<VfsMetadata, VfsError> {
+        let metadata = fs::symlink_metadata(path).map_err(VfsError::Io)?;
+        metadata_from_host_file_with_cache(path, &metadata, &self.fingerprint_cache)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CachedHostFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+    fingerprint: Sha256Digest,
 }
 
 impl Vfs for DirectoryVfs {
     fn metadata(&self, path: &NormalizedPath) -> Result<VfsMetadata, VfsError> {
-        let meta = fs::symlink_metadata(self.host_path(path)?).map_err(VfsError::Io)?;
-        Ok(metadata_from_fs(&meta))
+        self.metadata_from_host_file(&self.host_path(path)?)
     }
 
     fn read(&self, path: &NormalizedPath) -> Result<Arc<[u8]>, VfsError> {
@@ -123,11 +138,15 @@ impl Vfs for DirectoryVfs {
             let metadata = fs::symlink_metadata(&base).map_err(VfsError::Io)?;
             entries.push(VfsEntry {
                 path: prefix.clone(),
-                metadata: metadata_from_fs(&metadata),
+                metadata: metadata_from_host_file_with_cache(
+                    &base,
+                    &metadata,
+                    &self.fingerprint_cache,
+                )?,
             });
             return Ok(entries);
         }
-        list_recursive(&self.root, &base, &mut entries)?;
+        list_recursive(&self.root, &base, &self.fingerprint_cache, &mut entries)?;
         entries.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
         Ok(entries)
     }
@@ -174,7 +193,12 @@ fn select_casefolded_match(
     }
 }
 
-fn list_recursive(root: &Path, dir: &Path, out: &mut Vec<VfsEntry>) -> Result<(), VfsError> {
+fn list_recursive(
+    root: &Path,
+    dir: &Path,
+    fingerprint_cache: &Mutex<BTreeMap<PathBuf, CachedHostFingerprint>>,
+    out: &mut Vec<VfsEntry>,
+) -> Result<(), VfsError> {
     let read_dir = fs::read_dir(dir).map_err(VfsError::Io)?;
     let mut children = Vec::new();
     for entry in read_dir {
@@ -188,7 +212,7 @@ fn list_recursive(root: &Path, dir: &Path, out: &mut Vec<VfsEntry>) -> Result<()
             return Err(VfsError::Path);
         }
         if metadata.is_dir() {
-            list_recursive(root, &child, out)?;
+            list_recursive(root, &child, fingerprint_cache, out)?;
             continue;
         }
         if !metadata.is_file() {
@@ -203,25 +227,49 @@ fn list_recursive(root: &Path, dir: &Path, out: &mut Vec<VfsEntry>) -> Result<()
         .map_err(|_| VfsError::Path)?;
         out.push(VfsEntry {
             path,
-            metadata: metadata_from_fs(&metadata),
+            metadata: metadata_from_host_file_with_cache(&child, &metadata, fingerprint_cache)?,
         });
     }
     Ok(())
 }
 
-fn metadata_from_fs(metadata: &fs::Metadata) -> VfsMetadata {
-    let mut fingerprint = 0xcbf2_9ce4_8422_2325;
-    hash_u64(&mut fingerprint, metadata.len());
-    if let Ok(modified) = metadata.modified() {
-        if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
-            hash_u64(&mut fingerprint, duration.as_secs());
-            hash_u64(&mut fingerprint, u64::from(duration.subsec_nanos()));
-        }
+fn metadata_from_host_file_with_cache(
+    path: &Path,
+    metadata: &fs::Metadata,
+    fingerprint_cache: &Mutex<BTreeMap<PathBuf, CachedHostFingerprint>>,
+) -> Result<VfsMetadata, VfsError> {
+    if !metadata.is_file() {
+        return Err(VfsError::Path);
     }
-    VfsMetadata {
-        len: metadata.len(),
-        fingerprint,
+    let len = metadata.len();
+    let modified = metadata.modified().ok();
+    if let Some(cached) = fingerprint_cache
+        .lock()
+        .map_err(|_| VfsError::Path)?
+        .get(path)
+        .cloned()
+        .filter(|cached| cached.len == len && cached.modified == modified)
+    {
+        return Ok(VfsMetadata {
+            len,
+            fingerprint: cached.fingerprint,
+        });
     }
+
+    let bytes = fs::read(path).map_err(VfsError::Io)?;
+    let fingerprint = sha256(&bytes);
+    fingerprint_cache
+        .lock()
+        .map_err(|_| VfsError::Path)?
+        .insert(
+            path.to_path_buf(),
+            CachedHostFingerprint {
+                len,
+                modified,
+                fingerprint,
+            },
+        );
+    Ok(VfsMetadata { len, fingerprint })
 }
 
 /// In-memory VFS.
@@ -276,7 +324,7 @@ impl Vfs for MemoryVfs {
             .ok_or_else(|| VfsError::NotFound(path.as_str().to_string()))?;
         Ok(VfsMetadata {
             len: bytes.len() as u64,
-            fingerprint: stable_hash(bytes),
+            fingerprint: sha256(bytes),
         })
     }
 
@@ -305,28 +353,12 @@ impl Vfs for MemoryVfs {
                     path: normalized,
                     metadata: VfsMetadata {
                         len: bytes.len() as u64,
-                        fingerprint: stable_hash(bytes),
+                        fingerprint: sha256(bytes),
                     },
                 });
             }
         }
         Ok(out)
-    }
-}
-
-fn stable_hash(bytes: &[u8]) -> u64 {
-    let mut state = 0xcbf2_9ce4_8422_2325;
-    for byte in bytes {
-        state ^= u64::from(*byte);
-        state = state.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    state
-}
-
-fn hash_u64(state: &mut u64, value: u64) {
-    for byte in value.to_le_bytes() {
-        *state ^= u64::from(byte);
-        *state = state.wrapping_mul(0x0000_0100_0000_01b3);
     }
 }
 
@@ -471,6 +503,24 @@ mod tests {
             .path
             .as_str()
             .eq_ignore_ascii_case("DATA/MAPS/Land.map"));
+
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn directory_vfs_fingerprint_changes_for_same_length_content() {
+        let root = unique_test_dir("content-fingerprint");
+        std::fs::create_dir_all(root.join("DATA")).expect("mkdir");
+        std::fs::write(root.join("DATA").join("File.bin"), b"before").expect("write before");
+
+        let vfs = DirectoryVfs::new(&root);
+        let path = normalize_relative(b"DATA/File.bin", PathPolicy::StrictLegacy).expect("path");
+        let before = vfs.metadata(&path).expect("before metadata");
+        std::fs::write(root.join("DATA").join("File.bin"), b"after!").expect("write after");
+        let after = vfs.metadata(&path).expect("after metadata");
+
+        assert_eq!(before.len, after.len);
+        assert_ne!(before.fingerprint, after.fingerprint);
 
         std::fs::remove_dir_all(root).expect("cleanup");
     }

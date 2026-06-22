@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Resource identity and repository ports.
 
+use fparkan_binary::Sha256Digest;
 use fparkan_path::{normalize_relative, NormalizedPath, PathPolicy, ResourceName};
 use fparkan_vfs::{Vfs, VfsError};
 use std::collections::BTreeMap;
@@ -188,7 +189,7 @@ struct RepositoryState {
 
 struct ArchiveSlot {
     path: NormalizedPath,
-    fingerprint: u64,
+    fingerprint: Sha256Digest,
     generation: u64,
     kind: ArchiveKind,
     document: ArchiveDocument,
@@ -378,7 +379,7 @@ impl CachedResourceRepository {
     fn cached_id(
         &self,
         path: &NormalizedPath,
-        fingerprint: u64,
+        fingerprint: Sha256Digest,
     ) -> Result<Option<ArchiveId>, ResourceError> {
         let state = self.state.lock().map_err(|_| ResourceError::Poisoned)?;
         let Some(id) = state.paths.get(path.as_str()).copied() else {
@@ -504,7 +505,7 @@ impl ArchiveSlot {
 fn decode_archive(
     path: NormalizedPath,
     bytes: Arc<[u8]>,
-    fingerprint: u64,
+    fingerprint: Sha256Digest,
 ) -> Result<ArchiveSlot, ResourceError> {
     if bytes.starts_with(b"NRes") {
         let document = fparkan_nres::decode(bytes, fparkan_nres::ReadProfile::Compatible)
@@ -693,7 +694,7 @@ mod tests {
             b"before"
         );
 
-        std::fs::write(&host_path, build_nres(&[("a.bin", b"after".as_slice())]))
+        std::fs::write(&host_path, build_nres(&[("a.bin", b"after!".as_slice())]))
             .expect("updated archive");
         let reopened = repo.open_archive(&path).expect("open updated archive");
         let second = repo
@@ -706,7 +707,7 @@ mod tests {
         assert!(matches!(repo.read(first), Err(ResourceError::StaleHandle)));
         assert_eq!(
             repo.read(second).expect("read updated").as_slice(),
-            b"after"
+            b"after!"
         );
         let _ = std::fs::remove_dir_all(root);
     }
