@@ -992,9 +992,7 @@ mod tests {
             ("IS", 29_usize, 34_usize, 101_usize, 864_usize, 28_usize),
             ("IS2", 31_usize, 61_usize, 91_usize, 885_usize, 41_usize),
         ] {
-            let Some(root) = corpus_root(corpus) else {
-                continue;
-            };
+            let root = corpus_root(corpus);
             let mut files = 0usize;
             let mut paths = 0usize;
             let mut clans = 0usize;
@@ -1143,12 +1141,21 @@ mod tests {
         }
     }
 
-    fn corpus_root(name: &str) -> Option<PathBuf> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("testdata")
-            .join(name);
-        root.is_dir().then_some(root)
+    fn corpus_root(name: &str) -> PathBuf {
+        let variable = match name {
+            "IS" => "FPARKAN_CORPUS_PART1_ROOT",
+            "IS2" => "FPARKAN_CORPUS_PART2_ROOT",
+            _ => panic!("unknown licensed corpus part: {name}"),
+        };
+        let root = std::env::var_os(variable)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("{variable} is required for licensed corpus tests"));
+        assert!(
+            root.is_dir(),
+            "licensed corpus root is missing: {}",
+            root.display()
+        );
+        root
     }
 
     fn files_under(root: &Path) -> Vec<PathBuf> {

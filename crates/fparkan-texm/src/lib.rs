@@ -1074,9 +1074,7 @@ mod tests {
     #[ignore = "requires licensed corpus"]
     fn licensed_corpus_texm_assets_validate_and_decode_mip0() {
         for (corpus, expected) in [("IS", 518_usize), ("IS2", 631_usize)] {
-            let Some(root) = corpus_root(corpus) else {
-                continue;
-            };
+            let root = corpus_root(corpus);
             let mut count = 0usize;
             for path in files_under(&root) {
                 let Ok(bytes) = std::fs::read(&path) else {
@@ -1158,12 +1156,21 @@ mod tests {
         }
     }
 
-    fn corpus_root(name: &str) -> Option<PathBuf> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("testdata")
-            .join(name);
-        root.is_dir().then_some(root)
+    fn corpus_root(name: &str) -> PathBuf {
+        let variable = match name {
+            "IS" => "FPARKAN_CORPUS_PART1_ROOT",
+            "IS2" => "FPARKAN_CORPUS_PART2_ROOT",
+            _ => panic!("unknown licensed corpus part: {name}"),
+        };
+        let root = std::env::var_os(variable)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("{variable} is required for licensed corpus tests"));
+        assert!(
+            root.is_dir(),
+            "licensed corpus root is missing: {}",
+            root.display()
+        );
+        root
     }
 
     fn files_under(root: &Path) -> Vec<PathBuf> {

@@ -10,6 +10,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const CORPORA_MANIFEST_ENV: &str = "FPARKAN_CORPORA_MANIFEST";
+const PART1_ROOT_ENV: &str = "FPARKAN_CORPUS_PART1_ROOT";
+const PART2_ROOT_ENV: &str = "FPARKAN_CORPUS_PART2_ROOT";
+
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let code = match run(&args) {
@@ -46,12 +50,12 @@ fn run(args: &[String]) -> Result<(), String> {
         }
         [cmd, suite, rest @ ..] if cmd == "test" && suite == "synthetic" => {
             let options = parse_test_options(rest, PathBuf::from("testdata"))?;
-            run_stage_tests(options.stage, TestSuite::Synthetic)
+            run_stage_tests(options.stage, TestSuite::Synthetic, None)
         }
         [cmd, suite, rest @ ..] if cmd == "test" && suite == "licensed" => {
             let options = parse_test_options(rest, PathBuf::from("testdata"))?;
-            validate_licensed_root(&options.root)?;
-            run_stage_tests(options.stage, TestSuite::Licensed)
+            let roots = load_licensed_roots(options.manifest.as_deref())?;
+            run_stage_tests(options.stage, TestSuite::Licensed, Some(&roots))
         }
         [cmd, subcmd, rest @ ..] if cmd == "corpus" && subcmd == "baseline" => {
             let root = parse_root(rest)?;
@@ -62,7 +66,7 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         _ => Err(
-            "usage: cargo xtask ci | policy | acceptance report --suite synthetic|licensed [--stage 0..5|all] [--root testdata] [--out <path>] | acceptance audit [--roadmap <path>] [--coverage <path>] [--out <path>] [--strict] | package --target <triple> --app viewer|game|headless|cli | test synthetic|licensed [--stage 0..5|all] [--root testdata] | corpus baseline --root <path>"
+            "usage: cargo xtask ci | policy | acceptance report --suite synthetic|licensed [--stage 0..5|all] [--manifest corpora.toml] [--out <path>] | acceptance audit [--roadmap <path>] [--coverage <path>] [--out <path>] [--strict] | package --target <triple> --app viewer|game|headless|cli | test synthetic|licensed [--stage 0..5|all] [--manifest corpora.toml] | corpus baseline --root <path>"
                 .to_string(),
         ),
     }
@@ -85,6 +89,23 @@ fn cargo_owned(args: &[String]) -> Result<(), String> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let status = Command::new(cargo)
         .args(args)
+        .status()
+        .map_err(|err| format!("failed to run cargo: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("cargo exited with {status}"))
+    }
+}
+
+fn cargo_with_env(args: &[&str], envs: &[(&str, &Path)]) -> Result<(), String> {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let mut command = Command::new(cargo);
+    command.args(args);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let status = command
         .status()
         .map_err(|err| format!("failed to run cargo: {err}"))?;
     if status.success() {
@@ -153,17 +174,122 @@ fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> 
     Ok(())
 }
 
-fn validate_licensed_root(root: &Path) -> Result<(), String> {
-    for part in ["IS", "IS2"] {
-        let part_root = root.join(part);
-        if !part_root.is_dir() {
-            return Err(format!(
-                "licensed corpus part is missing: {}",
-                part_root.display()
-            ));
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LicensedCorpusRoots {
+    part1: PathBuf,
+    part2: PathBuf,
+}
+
+impl LicensedCorpusRoots {
+    fn envs(&self) -> [(&str, &Path); 2] {
+        [
+            (PART1_ROOT_ENV, self.part1.as_path()),
+            (PART2_ROOT_ENV, self.part2.as_path()),
+        ]
+    }
+}
+
+fn load_licensed_roots(manifest: Option<&Path>) -> Result<LicensedCorpusRoots, String> {
+    let manifest = manifest
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os(CORPORA_MANIFEST_ENV).map(PathBuf::from))
+        .ok_or_else(|| {
+            format!(
+                "licensed tests require --manifest or {CORPORA_MANIFEST_ENV}=<absolute corpora.toml>"
+            )
+        })?;
+    parse_licensed_manifest(&manifest)
+}
+
+fn parse_licensed_manifest(path: &Path) -> Result<LicensedCorpusRoots, String> {
+    let text = fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    let mut part1 = None;
+    let mut part2 = None;
+    let mut current_kind: Option<String> = None;
+    let mut current_root: Option<PathBuf> = None;
+
+    for raw_line in text.lines() {
+        let line = raw_line.split('#').next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "[[corpus]]" {
+            flush_manifest_entry(&mut part1, &mut part2, &mut current_kind, &mut current_root)?;
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        match key {
+            "kind" => current_kind = Some(parse_manifest_string(value.trim())?),
+            "root" => current_root = Some(PathBuf::from(parse_manifest_string(value.trim())?)),
+            _ => {}
         }
     }
+    flush_manifest_entry(&mut part1, &mut part2, &mut current_kind, &mut current_root)?;
+
+    let roots = LicensedCorpusRoots {
+        part1: part1.ok_or_else(|| "licensed manifest is missing kind = \"part1\"".to_string())?,
+        part2: part2.ok_or_else(|| "licensed manifest is missing kind = \"part2\"".to_string())?,
+    };
+    validate_licensed_part("part1", &roots.part1)?;
+    validate_licensed_part("part2", &roots.part2)?;
+    Ok(roots)
+}
+
+fn flush_manifest_entry(
+    part1: &mut Option<PathBuf>,
+    part2: &mut Option<PathBuf>,
+    current_kind: &mut Option<String>,
+    current_root: &mut Option<PathBuf>,
+) -> Result<(), String> {
+    let Some(kind) = current_kind.take() else {
+        *current_root = None;
+        return Ok(());
+    };
+    let root = current_root
+        .take()
+        .ok_or_else(|| format!("licensed manifest entry {kind} is missing root"))?;
+    match kind.as_str() {
+        "part1" => assign_manifest_root(part1, root, "part1"),
+        "part2" => assign_manifest_root(part2, root, "part2"),
+        _ => Ok(()),
+    }
+}
+
+fn assign_manifest_root(
+    target: &mut Option<PathBuf>,
+    root: PathBuf,
+    kind: &str,
+) -> Result<(), String> {
+    if target.replace(root).is_some() {
+        return Err(format!("licensed manifest contains duplicate {kind} root"));
+    }
     Ok(())
+}
+
+fn parse_manifest_string(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if let Some(quoted) = trimmed
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
+        Ok(quoted.to_string())
+    } else {
+        Err(format!("manifest value must be a quoted string: {trimmed}"))
+    }
+}
+
+fn validate_licensed_part(kind: &str, root: &Path) -> Result<(), String> {
+    if root.is_dir() {
+        Ok(())
+    } else {
+        Err(format!(
+            "licensed corpus {kind} root is missing: {}",
+            root.display()
+        ))
+    }
 }
 
 fn parse_root(args: &[String]) -> Result<PathBuf, String> {
@@ -717,6 +843,7 @@ impl fmt::Display for Stage {
 struct TestOptions {
     stage: Stage,
     root: PathBuf,
+    manifest: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -747,6 +874,7 @@ struct AcceptanceOptions {
     suite: TestSuite,
     stage: Stage,
     root: PathBuf,
+    manifest: Option<PathBuf>,
     out: PathBuf,
 }
 
@@ -762,6 +890,7 @@ fn parse_test_options(args: &[String], default_root: PathBuf) -> Result<TestOpti
     let mut options = TestOptions {
         stage: Stage::All,
         root: default_root,
+        manifest: None,
     };
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -778,6 +907,12 @@ fn parse_test_options(args: &[String], default_root: PathBuf) -> Result<TestOpti
                     .ok_or_else(|| "--root requires a path".to_string())?;
                 options.root = PathBuf::from(value);
             }
+            "--manifest" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--manifest requires a path".to_string())?;
+                options.manifest = Some(PathBuf::from(value));
+            }
             _ => return Err(format!("unknown test option: {arg}")),
         }
     }
@@ -788,6 +923,7 @@ fn parse_acceptance_options(args: &[String]) -> Result<AcceptanceOptions, String
     let mut suite = None;
     let mut stage = Stage::All;
     let mut root = PathBuf::from("testdata");
+    let mut manifest = None;
     let mut out = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -809,6 +945,12 @@ fn parse_acceptance_options(args: &[String]) -> Result<AcceptanceOptions, String
                     .next()
                     .ok_or_else(|| "--root requires a path".to_string())?;
                 root = PathBuf::from(value);
+            }
+            "--manifest" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--manifest requires a path".to_string())?;
+                manifest = Some(PathBuf::from(value));
             }
             "--out" => {
                 let value = iter
@@ -832,6 +974,7 @@ fn parse_acceptance_options(args: &[String]) -> Result<AcceptanceOptions, String
         suite,
         stage,
         root,
+        manifest,
         out,
     })
 }
@@ -1156,10 +1299,12 @@ fn json_escape(value: &str) -> String {
 }
 
 fn run_acceptance_report(options: &AcceptanceOptions) -> Result<(), String> {
-    if options.suite == TestSuite::Licensed {
-        validate_licensed_root(&options.root)?;
-    }
-    run_stage_tests(options.stage, options.suite)?;
+    let roots = if options.suite == TestSuite::Licensed {
+        Some(load_licensed_roots(options.manifest.as_deref())?)
+    } else {
+        None
+    };
+    run_stage_tests(options.stage, options.suite, roots.as_ref())?;
 
     if let Some(parent) = options.out.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
@@ -1208,22 +1353,35 @@ fn stage_report_packages(stage: Stage) -> Vec<&'static str> {
     }
 }
 
-fn run_stage_tests(stage: Stage, suite: TestSuite) -> Result<(), String> {
+fn run_stage_tests(
+    stage: Stage,
+    suite: TestSuite,
+    roots: Option<&LicensedCorpusRoots>,
+) -> Result<(), String> {
     let mut suffix = Vec::new();
     if suite == TestSuite::Licensed {
         suffix.extend(["--", "--ignored"]);
     }
+    let envs = roots.map(LicensedCorpusRoots::envs);
     match stage {
         Stage::All => {
             let mut args = vec!["test", "--workspace", "--locked", "--offline"];
             args.extend(suffix);
-            cargo(&args)
+            if let Some(envs) = envs {
+                cargo_with_env(&args, &envs)
+            } else {
+                cargo(&args)
+            }
         }
         Stage::Number(number) => {
             for package in stage_packages(number)? {
                 let mut args = vec!["test", "-p", package, "--locked", "--offline"];
                 args.extend(suffix.iter().copied());
-                cargo(&args)?;
+                if let Some(envs) = envs {
+                    cargo_with_env(&args, &envs)?;
+                } else {
+                    cargo(&args)?;
+                }
             }
             Ok(())
         }
@@ -1276,6 +1434,13 @@ mod tests {
         values.iter().map(|value| (*value).to_string()).collect()
     }
 
+    fn temp_dir(name: &str) -> PathBuf {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        std::env::temp_dir().join(format!("fparkan-xtask-{name}-{suffix}"))
+    }
+
     #[test]
     fn parses_stage_and_root_options() {
         let args = strings(&["--stage", "3", "--root", "fixtures"]);
@@ -1286,6 +1451,7 @@ mod tests {
             Ok(TestOptions {
                 stage: Stage::Number(3),
                 root: PathBuf::from("fixtures"),
+                manifest: None,
             })
         );
     }
@@ -1297,8 +1463,8 @@ mod tests {
             "licensed",
             "--stage",
             "5",
-            "--root",
-            "testdata",
+            "--manifest",
+            "corpora.toml",
             "--out",
             "target/report.json",
         ]));
@@ -1309,6 +1475,7 @@ mod tests {
                 suite: TestSuite::Licensed,
                 stage: Stage::Number(5),
                 root: PathBuf::from("testdata"),
+                manifest: Some(PathBuf::from("corpora.toml")),
                 out: PathBuf::from("target/report.json"),
             })
         );
@@ -1320,6 +1487,7 @@ mod tests {
             suite: TestSuite::Licensed,
             stage: Stage::Number(0),
             root: PathBuf::from("/private/game"),
+            manifest: Some(PathBuf::from("/private/corpora.toml")),
             out: PathBuf::from("target/report.json"),
         };
         let report = render_acceptance_report(&options);
@@ -1421,8 +1589,52 @@ mod tests {
             Ok(TestOptions {
                 stage: Stage::All,
                 root: PathBuf::from("testdata"),
+                manifest: None,
             })
         );
+    }
+
+    #[test]
+    fn parses_licensed_corpora_manifest() -> Result<(), String> {
+        let root = temp_dir("manifest");
+        let part1 = root.join("IS");
+        let part2 = root.join("IS2");
+        fs::create_dir_all(&part1).map_err(|err| err.to_string())?;
+        fs::create_dir_all(&part2).map_err(|err| err.to_string())?;
+        let manifest = root.join("corpora.toml");
+        fs::write(
+            &manifest,
+            format!(
+                "schema = 1\n\n[[corpus]]\nid = \"part1-local\"\nkind = \"part1\"\nroot = \"{}\"\nexpected_profile = \"parkan-is-part1\"\n\n[[corpus]]\nid = \"part2-local\"\nkind = \"part2\"\nroot = \"{}\"\nexpected_profile = \"parkan-is-part2\"\n",
+                part1.display(),
+                part2.display()
+            ),
+        )
+        .map_err(|err| err.to_string())?;
+
+        assert_eq!(
+            parse_licensed_manifest(&manifest)?,
+            LicensedCorpusRoots { part1, part2 }
+        );
+        fs::remove_dir_all(root).map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn licensed_roots_require_manifest_configuration() {
+        let previous = std::env::var_os(CORPORA_MANIFEST_ENV);
+        std::env::remove_var(CORPORA_MANIFEST_ENV);
+
+        assert_eq!(
+            load_licensed_roots(None),
+            Err(format!(
+                "licensed tests require --manifest or {CORPORA_MANIFEST_ENV}=<absolute corpora.toml>"
+            ))
+        );
+
+        if let Some(value) = previous {
+            std::env::set_var(CORPORA_MANIFEST_ENV, value);
+        }
     }
 
     #[test]

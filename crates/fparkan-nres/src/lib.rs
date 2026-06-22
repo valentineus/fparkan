@@ -1948,10 +1948,14 @@ mod tests {
         expected_files: usize,
         expected_entries: usize,
     ) -> Result<CorpusGateResult, String> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("testdata")
-            .join(name);
+        let variable = match name {
+            "IS" => "FPARKAN_CORPUS_PART1_ROOT",
+            "IS2" => "FPARKAN_CORPUS_PART2_ROOT",
+            _ => return Err(format!("unknown licensed corpus part: {name}")),
+        };
+        let root = std::env::var_os(variable)
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("{variable} is required for licensed corpus tests"))?;
         if !root.is_dir() {
             return Err(format!(
                 "licensed corpus root is missing: {}",

@@ -268,16 +268,16 @@ mod tests {
             RenderCase {
                 root: "IS",
                 mission: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.01/data.tma",
-                expected: "{\"mission\":\"MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.01/data.tma\",\"objects\":33,\"frames\":1,\"tick\":1,\"draws\":33,\"captures\":1,\"last_capture_bytes\":810,\"hash\":\"8584c4307bc911fc82bf909018662f392f3982bf909018666298bde408fe4242\"}",
+                expected: "{\"mission\":\"MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.01/data.tma\",\"objects\":33,\"frames\":1,\"tick\":1,\"draws\":33,\"captures\":1,\"last_capture_bytes\":810,\"hash\":\"ca17cc76e55c45e83c1c9c1c088e84bf1a698be91a7730943210fe27596af841\"}",
             },
             RenderCase {
                 root: "IS2",
                 mission: "MISSIONS/Campaign/CAMPAIGN.00/Mission.02/data.tma",
-                expected: "{\"mission\":\"MISSIONS/Campaign/CAMPAIGN.00/Mission.02/data.tma\",\"objects\":10,\"frames\":1,\"tick\":1,\"draws\":10,\"captures\":1,\"last_capture_bytes\":235,\"hash\":\"c52267cb14f699cb73b958e46c99c23ec23e73b958e46c99b3650afbcce56291\"}",
+                expected: "{\"mission\":\"MISSIONS/Campaign/CAMPAIGN.00/Mission.02/data.tma\",\"objects\":10,\"frames\":1,\"tick\":1,\"draws\":10,\"captures\":1,\"last_capture_bytes\":235,\"hash\":\"5d720b3ab690076a398a79a404850bbeaee2e33811b5bb570ec8a96d4a7a2fc4\"}",
             },
         ] {
             assert_eq!(
-                run(&render_args(&workspace_root().join("testdata").join(case.root), case.mission)),
+                run(&render_args(&licensed_root(case.root), case.mission)),
                 Ok(case.expected.to_string())
             );
         }
@@ -313,11 +313,20 @@ mod tests {
         ]
     }
 
-    fn workspace_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("workspace root")
-            .to_path_buf()
+    fn licensed_root(name: &str) -> PathBuf {
+        let variable = match name {
+            "IS" => "FPARKAN_CORPUS_PART1_ROOT",
+            "IS2" => "FPARKAN_CORPUS_PART2_ROOT",
+            _ => panic!("unknown licensed corpus part: {name}"),
+        };
+        let root = std::env::var_os(variable)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("{variable} is required for licensed corpus tests"));
+        assert!(
+            root.is_dir(),
+            "licensed corpus root is missing: {}",
+            root.display()
+        );
+        root
     }
 }

@@ -846,9 +846,7 @@ mod tests {
     #[ignore = "requires licensed corpus"]
     fn licensed_corpus_fxid_exact_eof_and_distribution() {
         for (corpus, expected_count) in [("IS", 923_usize), ("IS2", 1065_usize)] {
-            let Some(root) = corpus_root(corpus) else {
-                continue;
-            };
+            let root = corpus_root(corpus);
             let mut count = 0usize;
             let mut opcodes = BTreeMap::<FxOpcode, usize>::new();
             let mut time_modes = BTreeMap::<u32, usize>::new();
@@ -898,9 +896,7 @@ mod tests {
             ("IS", 923_usize, 467_usize, 10_553_431_922_547_057_702_u64),
             ("IS2", 1065_usize, 532_usize, 9_217_284_592_334_143_531_u64),
         ] {
-            let Some(root) = corpus_root(corpus) else {
-                continue;
-            };
+            let root = corpus_root(corpus);
             let mut count = 0usize;
             let mut emitting = 0usize;
             let mut hash = FNV_OFFSET;
@@ -992,12 +988,21 @@ mod tests {
         dst[..len].copy_from_slice(&src[..len]);
     }
 
-    fn corpus_root(name: &str) -> Option<PathBuf> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("testdata")
-            .join(name);
-        root.is_dir().then_some(root)
+    fn corpus_root(name: &str) -> PathBuf {
+        let variable = match name {
+            "IS" => "FPARKAN_CORPUS_PART1_ROOT",
+            "IS2" => "FPARKAN_CORPUS_PART2_ROOT",
+            _ => panic!("unknown licensed corpus part: {name}"),
+        };
+        let root = std::env::var_os(variable)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("{variable} is required for licensed corpus tests"));
+        assert!(
+            root.is_dir(),
+            "licensed corpus root is missing: {}",
+            root.display()
+        );
+        root
     }
 
     fn files_under(root: &Path) -> Vec<PathBuf> {

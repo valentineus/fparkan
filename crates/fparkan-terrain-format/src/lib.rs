@@ -1494,9 +1494,7 @@ Generator 1
             ("IS", 33_usize, 299_450_usize, 275_882_usize),
             ("IS2", 32_usize, 188_024_usize, 184_454_usize),
         ] {
-            let Some(root) = corpus_root(corpus) else {
-                continue;
-            };
+            let root = corpus_root(corpus);
             let mut files = 0usize;
             let mut vertices = 0usize;
             let mut faces = 0usize;
@@ -1540,9 +1538,7 @@ Generator 1
     #[ignore = "requires licensed corpus"]
     fn licensed_corpus_build_dat_validate() {
         for (corpus, expected_ai_prefix) in [("IS", false), ("IS2", true)] {
-            let Some(root) = corpus_root(corpus) else {
-                continue;
-            };
+            let root = corpus_root(corpus);
             let path = root.join("BuildDat.lst");
             let bytes = std::fs::read(&path).expect("read BuildDat.lst");
             let categories =
@@ -1591,9 +1587,7 @@ Generator 1
             ("IS", 33_usize, 34_662_usize, 197_698_usize, 20_usize),
             ("IS2", 32_usize, 18_984_usize, 114_968_usize, 14_usize),
         ] {
-            let Some(root) = corpus_root(corpus) else {
-                continue;
-            };
+            let root = corpus_root(corpus);
             let mut files = 0usize;
             let mut areals = 0usize;
             let mut vertices = 0usize;
@@ -1883,12 +1877,21 @@ Generator 1
         out.extend_from_slice(&value.to_le_bytes());
     }
 
-    fn corpus_root(name: &str) -> Option<PathBuf> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("testdata")
-            .join(name);
-        root.is_dir().then_some(root)
+    fn corpus_root(name: &str) -> PathBuf {
+        let variable = match name {
+            "IS" => "FPARKAN_CORPUS_PART1_ROOT",
+            "IS2" => "FPARKAN_CORPUS_PART2_ROOT",
+            _ => panic!("unknown licensed corpus part: {name}"),
+        };
+        let root = std::env::var_os(variable)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("{variable} is required for licensed corpus tests"));
+        assert!(
+            root.is_dir(),
+            "licensed corpus root is missing: {}",
+            root.display()
+        );
+        root
     }
 
     fn files_under(root: &Path) -> Vec<PathBuf> {

@@ -697,7 +697,7 @@ mod tests {
     #[test]
     #[ignore = "requires licensed corpus"]
     fn load_trace_records_preparation_before_registration_and_raw_transforms() {
-        let root = workspace_root().join("testdata").join("IS");
+        let root = licensed_root("IS");
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(&root));
         let mut engine = create(
             EngineConfig {
@@ -739,7 +739,7 @@ mod tests {
     #[test]
     #[ignore = "requires licensed corpus"]
     fn missing_map_and_missing_reachable_resource_fail_before_registration() {
-        let root = workspace_root().join("testdata").join("IS");
+        let root = licensed_root("IS");
         for (denied, mission) in [
             (
                 DenyRule::Suffix("Land.map"),
@@ -783,7 +783,7 @@ mod tests {
     #[test]
     #[ignore = "requires licensed corpus"]
     fn registration_phase_failure_uses_normal_teardown_and_keeps_engine_world() {
-        let root = workspace_root().join("testdata").join("IS");
+        let root = licensed_root("IS");
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(root));
         let mut engine = create(
             EngineConfig {
@@ -827,9 +827,9 @@ mod tests {
                 mission: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.01/data.tma",
                 object_count: 33,
                 expected_hash: [
-                    0x19, 0xdc, 0xd3, 0x9b, 0x35, 0xad, 0x90, 0x6c, 0x92, 0x2d, 0x83, 0x7b, 0x7a,
-                    0xb3, 0xa6, 0x15, 0xa6, 0x15, 0x92, 0x2d, 0x83, 0x7b, 0x7a, 0xb3, 0xe9, 0xcd,
-                    0x9a, 0x56, 0x48, 0xb6, 0x0c, 0xee,
+                    0xc7, 0xb0, 0x6e, 0x0a, 0x31, 0x1f, 0x5d, 0x8c, 0xde, 0x64, 0xa5, 0x33, 0x1f,
+                    0x2c, 0xd0, 0x2c, 0x21, 0x44, 0x2f, 0x34, 0x5d, 0x16, 0xe8, 0x94, 0xaf, 0xa2,
+                    0x2b, 0xa9, 0xd4, 0x24, 0xd2, 0xf9,
                 ],
             },
             HeadlessCase {
@@ -837,9 +837,9 @@ mod tests {
                 mission: "MISSIONS/Campaign/CAMPAIGN.00/Mission.02/data.tma",
                 object_count: 10,
                 expected_hash: [
-                    0x59, 0x6e, 0x88, 0xcc, 0xd0, 0x3a, 0xd9, 0x68, 0x1b, 0x2d, 0xcb, 0x0d, 0x91,
-                    0x19, 0x5a, 0x27, 0x5a, 0x27, 0x1b, 0x2d, 0xcb, 0x0d, 0x91, 0x19, 0x44, 0x66,
-                    0x68, 0x9d, 0x6c, 0xb4, 0x2c, 0x37,
+                    0x3c, 0xe5, 0xa6, 0x39, 0x47, 0x86, 0x76, 0xe1, 0xb2, 0x1a, 0x8e, 0x96, 0x3d,
+                    0x60, 0x6e, 0xc6, 0x8c, 0xe2, 0x28, 0x4f, 0x57, 0xd9, 0xe1, 0xe4, 0xb5, 0x95,
+                    0xdf, 0x88, 0xd3, 0x2f, 0x4a, 0x4d,
                 ],
             },
         ] {
@@ -855,8 +855,7 @@ mod tests {
     #[test]
     #[ignore = "requires licensed corpus"]
     fn licensed_corpora_load_all_mission_foundations() {
-        let root = workspace_root();
-        let part1 = load_all(&root.join("testdata").join("IS"));
+        let part1 = load_all(&licensed_root("IS"));
         assert_eq!(part1.missions, 29);
         assert_eq!(part1.paths, 34);
         assert_eq!(part1.clans, 101);
@@ -876,7 +875,7 @@ mod tests {
         assert_eq!(part1.texture_requests, part1.texture_resolved);
         assert_eq!(part1.lightmap_requests, part1.lightmap_resolved);
 
-        let part2 = load_all(&root.join("testdata").join("IS2"));
+        let part2 = load_all(&licensed_root("IS2"));
         assert_eq!(part2.missions, 31);
         assert_eq!(part2.paths, 61);
         assert_eq!(part2.clans, 91);
@@ -928,7 +927,7 @@ mod tests {
     }
 
     fn run_headless_case(case: HeadlessCase) -> WorldSnapshot {
-        let root = workspace_root().join("testdata").join(case.root);
+        let root = licensed_root(case.root);
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(root));
         let mut engine = create(
             EngineConfig {
@@ -1048,12 +1047,21 @@ mod tests {
         }
     }
 
-    fn workspace_root() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("workspace root")
-            .to_path_buf()
+    fn licensed_root(name: &str) -> PathBuf {
+        let variable = match name {
+            "IS" => "FPARKAN_CORPUS_PART1_ROOT",
+            "IS2" => "FPARKAN_CORPUS_PART2_ROOT",
+            _ => panic!("unknown licensed corpus part: {name}"),
+        };
+        let root = std::env::var_os(variable)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("{variable} is required for licensed corpus tests"));
+        assert!(
+            root.is_dir(),
+            "licensed corpus root is missing: {}",
+            root.display()
+        );
+        root
     }
 
     #[derive(Clone, Copy)]

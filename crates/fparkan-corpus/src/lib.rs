@@ -511,13 +511,7 @@ mod tests {
     #[test]
     #[ignore = "requires licensed corpus"]
     fn report_for_testdata_roots() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("testdata")
-            .join("IS");
-        if !root.is_dir() {
-            return;
-        }
+        let root = licensed_root("IS");
         let manifest = discover(&root, DiscoverOptions::default()).expect("manifest");
         let report = report(&root, &manifest).expect("report");
         assert!(report.files > 0);
@@ -892,10 +886,24 @@ mod tests {
     }
 
     fn testdata_root(part: &str) -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("testdata")
-            .join(part)
+        licensed_root(part)
+    }
+
+    fn licensed_root(part: &str) -> PathBuf {
+        let variable = match part {
+            "IS" => "FPARKAN_CORPUS_PART1_ROOT",
+            "IS2" => "FPARKAN_CORPUS_PART2_ROOT",
+            _ => panic!("unknown licensed corpus part: {part}"),
+        };
+        let root = std::env::var_os(variable)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| panic!("{variable} is required for licensed corpus tests"));
+        assert!(
+            root.is_dir(),
+            "licensed corpus root is missing: {}",
+            root.display()
+        );
+        root
     }
 
     fn assert_discovered_paths_stay_under_root(part: &str) {

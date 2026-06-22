@@ -666,7 +666,7 @@ fn c_name_bytes(raw: &[u8; 12]) -> &[u8] {
 mod tests {
     use super::*;
     use fparkan_vfs::{DirectoryVfs, MemoryVfs};
-    use std::path::Path;
+    use std::path::PathBuf;
 
     #[test]
     fn cached_repository_reads_synthetic_nres() {
@@ -937,10 +937,14 @@ mod tests {
     }
 
     fn licensed_repository_gate(corpus: &str) -> Result<(), String> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("testdata")
-            .join(corpus);
+        let variable = match corpus {
+            "IS" => "FPARKAN_CORPUS_PART1_ROOT",
+            "IS2" => "FPARKAN_CORPUS_PART2_ROOT",
+            _ => return Err(format!("unknown licensed corpus part: {corpus}")),
+        };
+        let root = std::env::var_os(variable)
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("{variable} is required for licensed corpus tests"))?;
         if !root.is_dir() {
             return Err(format!(
                 "licensed corpus root is missing: {}",

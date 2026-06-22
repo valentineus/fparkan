@@ -40,10 +40,27 @@ cargo xtask ci
 - разместите игровые каталоги в [`testdata/`](testdata);
 - игровые ресурсы в репозиторий не включаются, так как защищены авторским правом.
 
-Локальный licensed gate:
+Локальный licensed gate использует некоммитимый manifest:
 
 ```bash
-cargo xtask acceptance report --suite licensed --stage 5 --root testdata
+cat > /private/tmp/fparkan-corpora.toml <<'EOF'
+schema = 1
+
+[[corpus]]
+id = "part1-local"
+kind = "part1"
+root = "/absolute/path/to/IS"
+expected_profile = "parkan-is-part1"
+
+[[corpus]]
+id = "part2-local"
+kind = "part2"
+root = "/absolute/path/to/IS2"
+expected_profile = "parkan-is-part2"
+EOF
+
+FPARKAN_CORPORA_MANIFEST=/private/tmp/fparkan-corpora.toml \
+  cargo xtask acceptance report --suite licensed --stage 5
 ```
 
 ## Contributing & Support

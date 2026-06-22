@@ -1768,8 +1768,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn resolves_known_part1_registry_cases() {
-        let root = corpus_root("IS").expect("part 1 root");
+        let root = corpus_root("IS");
         let vfs = Arc::new(DirectoryVfs::new(&root));
         let repo = CachedResourceRepository::new(vfs.clone());
         let cases = [
@@ -1799,9 +1800,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires licensed corpus"]
     fn resolves_some_registry_entries_in_both_corpora() {
         for corpus in ["IS", "IS2"] {
-            let root = corpus_root(corpus).expect("corpus root");
+            let root = corpus_root(corpus);
             let objects = std::fs::read(root.join("objects.rlb")).expect("objects.rlb");
             let document = fparkan_nres::decode(
                 Arc::from(objects.into_boxed_slice()),
@@ -1830,7 +1832,7 @@ mod tests {
     fn licensed_corpora_unit_dat_parse_counts() {
         let cases = [("IS", 425, 5_219), ("IS2", 676, 8_145)];
         for (corpus, expected_files, expected_records) in cases {
-            let root = corpus_root(corpus).expect("corpus root");
+            let root = corpus_root(corpus);
             let mut dat_paths = Vec::new();
             collect_unit_dat_files(&root, &mut dat_paths);
             dat_paths.sort();
@@ -1863,7 +1865,7 @@ mod tests {
     #[ignore = "requires licensed corpus"]
     fn licensed_corpora_registry_payloads_are_record_aligned() {
         for corpus in ["IS", "IS2"] {
-            let root = corpus_root(corpus).expect("corpus root");
+            let root = corpus_root(corpus);
             let objects = std::fs::read(root.join("objects.rlb")).expect("objects.rlb");
             let document = fparkan_nres::decode(
                 Arc::from(objects.into_boxed_slice()),
@@ -1909,12 +1911,21 @@ mod tests {
         }
     }
 
-    fn corpus_root(name: &str) -> Option<std::path::PathBuf> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("testdata")
-            .join(name);
-        root.is_dir().then_some(root)
+    fn corpus_root(name: &str) -> std::path::PathBuf {
+        let variable = match name {
+            "IS" => "FPARKAN_CORPUS_PART1_ROOT",
+            "IS2" => "FPARKAN_CORPUS_PART2_ROOT",
+            _ => panic!("unknown licensed corpus part: {name}"),
+        };
+        let root = std::env::var_os(variable)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| panic!("{variable} is required for licensed corpus tests"));
+        assert!(
+            root.is_dir(),
+            "licensed corpus root is missing: {}",
+            root.display()
+        );
+        root
     }
 
     fn generated_acyclic_graph(
