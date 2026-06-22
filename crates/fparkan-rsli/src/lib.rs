@@ -14,6 +14,44 @@ pub enum ReadProfile {
     Compatible,
 }
 
+/// Detailed read profile.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RsliReadProfile {
+    /// Reject compatibility quirks.
+    Strict,
+    /// Accept selected retail compatibility quirks.
+    Compatible(RsliCompatibilityProfile),
+}
+
+impl From<ReadProfile> for RsliReadProfile {
+    fn from(value: ReadProfile) -> Self {
+        match value {
+            ReadProfile::Strict => Self::Strict,
+            ReadProfile::Compatible => Self::Compatible(RsliCompatibilityProfile::default()),
+        }
+    }
+}
+
+impl RsliReadProfile {
+    /// Strict profile with every compatibility quirk disabled.
+    #[must_use]
+    pub const fn strict() -> Self {
+        Self::Strict
+    }
+
+    /// Retail-compatible profile with the default approved quirk set.
+    #[must_use]
+    pub const fn compatible() -> Self {
+        Self::Compatible(RsliCompatibilityProfile::retail())
+    }
+
+    /// Retail-compatible profile with a caller-provided quirk set.
+    #[must_use]
+    pub const fn compatible_with(profile: RsliCompatibilityProfile) -> Self {
+        Self::Compatible(profile)
+    }
+}
+
 /// Write profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WriteProfile {
@@ -34,10 +72,28 @@ pub struct RsliCompatibilityProfile {
 
 impl Default for RsliCompatibilityProfile {
     fn default() -> Self {
+        Self::retail()
+    }
+}
+
+impl RsliCompatibilityProfile {
+    /// Retail-compatible profile with every approved quirk enabled.
+    #[must_use]
+    pub const fn retail() -> Self {
         Self {
             allow_ao_trailer: true,
             allow_deflate_eof_plus_one: true,
             allow_invalid_presorted_fallback: true,
+        }
+    }
+
+    /// Profile with every compatibility quirk disabled.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            allow_ao_trailer: false,
+            allow_deflate_eof_plus_one: false,
+            allow_invalid_presorted_fallback: false,
         }
     }
 }
@@ -197,6 +253,11 @@ pub enum RsliError {
         /// Archive byte length.
         file_len: u64,
     },
+    /// Registered `AO` overlay is rejected by the selected profile.
+    AoTrailerQuirkRejected {
+        /// Overlay byte offset.
+        overlay: u32,
+    },
     /// Unsupported packing method.
     UnsupportedMethod {
         /// Raw method bits.
@@ -266,6 +327,9 @@ impl fmt::Display for RsliError {
                     "media overlay out of bounds: overlay={overlay}, file={file_len}"
                 )
             }
+            Self::AoTrailerQuirkRejected { overlay } => {
+                write!(f, "AO trailer quirk rejected: overlay={overlay}")
+            }
             Self::UnsupportedMethod { raw } => write!(f, "unsupported packing method: {raw:#x}"),
             Self::PackedSizePastEof {
                 id,
@@ -298,20 +362,31 @@ impl std::error::Error for RsliError {}
 /// compatibility quirks, or packed payloads are invalid for the selected
 /// profile.
 pub fn decode(bytes: Arc<[u8]>, profile: ReadProfile) -> Result<RsliDocument, RsliError> {
+    decode_with_profile(bytes, profile.into())
+}
+
+/// Decodes an `RsLi` document with explicit compatibility switches.
+///
+/// # Errors
+///
+/// Returns [`RsliError`] when the header, table, payload ranges, registered
+/// compatibility quirks, or packed payloads are invalid for the selected
+/// profile.
+pub fn decode_with_profile(
+    bytes: Arc<[u8]>,
+    profile: RsliReadProfile,
+) -> Result<RsliDocument, RsliError> {
     let options = match profile {
-        ReadProfile::Strict => ParseOptions {
+        RsliReadProfile::Strict => ParseOptions {
             allow_ao_trailer: false,
             allow_deflate_eof_plus_one: false,
             allow_invalid_presorted_fallback: false,
         },
-        ReadProfile::Compatible => {
-            let profile = RsliCompatibilityProfile::default();
-            ParseOptions {
-                allow_ao_trailer: profile.allow_ao_trailer,
-                allow_deflate_eof_plus_one: profile.allow_deflate_eof_plus_one,
-                allow_invalid_presorted_fallback: profile.allow_invalid_presorted_fallback,
-            }
-        }
+        RsliReadProfile::Compatible(profile) => ParseOptions {
+            allow_ao_trailer: profile.allow_ao_trailer,
+            allow_deflate_eof_plus_one: profile.allow_deflate_eof_plus_one,
+            allow_invalid_presorted_fallback: profile.allow_invalid_presorted_fallback,
+        },
     };
     let ParsedRsli {
         header,
@@ -691,7 +766,7 @@ fn rebuild_sorted_mapping(records: &mut [EntryRecord]) -> Result<(), RsliError> 
 }
 
 fn parse_ao_trailer(bytes: &[u8], allow: bool) -> Result<(u32, Option<[u8; 6]>), RsliError> {
-    if !allow || bytes.len() < 6 || &bytes[bytes.len() - 6..bytes.len() - 4] != b"AO" {
+    if bytes.len() < 6 || &bytes[bytes.len() - 6..bytes.len() - 4] != b"AO" {
         return Ok((0, None));
     }
     let mut raw = [0u8; 6];
@@ -702,6 +777,9 @@ fn parse_ao_trailer(bytes: &[u8], allow: bool) -> Result<(u32, Option<[u8; 6]>),
             overlay,
             file_len: u64::try_from(bytes.len()).map_err(|_| RsliError::IntegerOverflow)?,
         });
+    }
+    if !allow {
+        return Err(RsliError::AoTrailerQuirkRejected { overlay });
     }
     Ok((overlay, Some(raw)))
 }
@@ -1331,6 +1409,39 @@ mod tests {
     }
 
     #[test]
+    fn explicit_profile_controls_invalid_presorted_fallback() {
+        let bytes = synthetic_rsli(
+            &[
+                SyntheticEntry::stored(b"B", 0, b"bee"),
+                SyntheticEntry::stored(b"A", 0, b"aye"),
+            ],
+            true,
+            0x0102,
+            None,
+        );
+        let profile = RsliCompatibilityProfile {
+            allow_invalid_presorted_fallback: false,
+            ..RsliCompatibilityProfile::retail()
+        };
+
+        assert!(matches!(
+            decode_with_profile(
+                arc(bytes.clone()),
+                RsliReadProfile::compatible_with(profile)
+            ),
+            Err(RsliError::CorruptEntryTable(_))
+        ));
+
+        let profile = RsliCompatibilityProfile {
+            allow_invalid_presorted_fallback: true,
+            ..RsliCompatibilityProfile::none()
+        };
+        let doc = decode_with_profile(arc(bytes), RsliReadProfile::compatible_with(profile))
+            .expect("presorted fallback only");
+        assert_eq!(doc.find("A"), Some(EntryId(1)));
+    }
+
+    #[test]
     fn stored_method_uses_exact_size() {
         let bytes = synthetic_rsli(
             &[SyntheticEntry::stored(b"A", 0, b"abc")],
@@ -1510,6 +1621,16 @@ mod tests {
             decode(arc(approved.clone()), ReadProfile::Strict),
             Err(RsliError::DeflateEofPlusOneQuirkRejected { id: 0 })
         ));
+        assert!(matches!(
+            decode_with_profile(
+                arc(approved.clone()),
+                RsliReadProfile::compatible_with(RsliCompatibilityProfile {
+                    allow_deflate_eof_plus_one: false,
+                    ..RsliCompatibilityProfile::retail()
+                })
+            ),
+            Err(RsliError::DeflateEofPlusOneQuirkRejected { id: 0 })
+        ));
         let doc = decode(arc(approved), ReadProfile::Compatible).expect("approved EOF+1 quirk");
         assert_eq!(doc.load(EntryId(0)).expect("approved payload"), b"raw");
 
@@ -1606,11 +1727,22 @@ mod tests {
             Some(4),
         );
 
-        let doc = decode(arc(bytes), ReadProfile::Compatible).expect("AO overlay");
+        let doc = decode(arc(bytes.clone()), ReadProfile::Compatible).expect("AO overlay");
         let meta = doc.entry(EntryId(0)).expect("AO meta");
         assert_eq!(meta.data_offset, 64);
         assert_eq!(meta.data_offset_raw, 60);
         assert_eq!(doc.load(EntryId(0)).expect("AO payload"), b"media");
+
+        assert!(matches!(
+            decode_with_profile(
+                arc(bytes),
+                RsliReadProfile::compatible_with(RsliCompatibilityProfile {
+                    allow_ao_trailer: false,
+                    ..RsliCompatibilityProfile::retail()
+                })
+            ),
+            Err(RsliError::AoTrailerQuirkRejected { overlay: 4 })
+        ));
     }
 
     #[test]
@@ -1621,6 +1753,28 @@ mod tests {
 
         assert!(matches!(
             decode(arc(bytes), ReadProfile::Compatible),
+            Err(RsliError::MediaOverlayOutOfBounds { overlay: 1000, .. })
+        ));
+    }
+
+    #[test]
+    fn strict_profile_distinguishes_valid_ao_quirk_from_malformed_ao() {
+        let valid = synthetic_rsli(
+            &[SyntheticEntry::stored(b"A", 0, b"media")],
+            true,
+            0x3333,
+            Some(4),
+        );
+        assert!(matches!(
+            decode_with_profile(arc(valid), RsliReadProfile::strict()),
+            Err(RsliError::AoTrailerQuirkRejected { overlay: 4 })
+        ));
+
+        let mut malformed = synthetic_rsli(&[], false, 0, None);
+        malformed.extend_from_slice(b"AO");
+        malformed.extend_from_slice(&1000u32.to_le_bytes());
+        assert!(matches!(
+            decode_with_profile(arc(malformed), RsliReadProfile::strict()),
             Err(RsliError::MediaOverlayOutOfBounds { overlay: 1000, .. })
         ));
     }
