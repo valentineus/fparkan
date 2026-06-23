@@ -642,12 +642,16 @@ version = "0.1.0"
 [[package]]
 name = "fparkan-platform"
 version = "0.1.0"
+dependencies = [
+ "raw-window-handle",
+]
 
 [[package]]
 name = "fparkan-platform-winit"
 version = "0.1.0"
 dependencies = [
  "fparkan-platform",
+ "raw-window-handle",
  "winit",
 ]
 

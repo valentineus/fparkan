@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 fparkan-platform = { path = "../../crates/fparkan-platform" }
+raw-window-handle = "0.6"
 winit = "0.30"
 
 [lints]

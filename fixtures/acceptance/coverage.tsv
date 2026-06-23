@@ -21,6 +21,8 @@ S0-CORPUS-005	covered	cargo test -p fparkan-corpus --offline fingerprint_changes
 S0-CORPUS-006	covered	cargo test -p fparkan-corpus --offline atomic_report_write
 S0-CLI-001	covered	cargo test -p fparkan-cli --offline stable_exit_codes_are_mapped
 S0-CLI-002	covered	cargo test -p fparkan-cli --offline accepts_json_format_option archive_json_has_schema_version
+S0-PLAT-001	covered	cargo test -p fparkan-platform-winit --offline window_port_reports_default_request_profile
+S0-PLAT-002	covered	cargo clippy -p fparkan-platform -p fparkan-platform-winit --all-targets --all-features --locked -- -D warnings
 S0-VK-001	covered	cargo test -p fparkan-render-vulkan --offline backend_tracks_render_request_and_presents
 S0-VK-002	covered	cargo test -p fparkan-render-vulkan --offline device_scoring_is_deterministic_and_prefers_discrete_unified_queue
 S0-VK-003	covered	cargo test -p fparkan-render-vulkan --offline portability_subset_is_reported_and_enabled_when_exposed

@@ -21,9 +21,10 @@
 //! Minimal `winit`-backed platform adapter shim.
 
 use fparkan_platform::{
-    EventSource, MonotonicClock, MonotonicInstant, PhysicalSize, PlatformError, PlatformEvent,
-    RenderRequest, WindowHandle, WindowPort,
+    EventSource, MonotonicClock, MonotonicInstant, NativeWindowHandles, PhysicalSize,
+    PlatformError, PlatformEvent, RenderRequest, WindowHandle, WindowPort,
 };
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -153,6 +154,7 @@ pub struct WinitWindow {
     focused: bool,
     minimized: bool,
     occluded: bool,
+    native_handles: Option<NativeWindowHandles>,
 }
 
 impl WinitWindow {
@@ -171,6 +173,7 @@ impl WinitWindow {
             focused: true,
             minimized: false,
             occluded: false,
+            native_handles: native_handles(window),
         }
     }
 
@@ -187,6 +190,7 @@ impl WinitWindow {
             focused: true,
             minimized: false,
             occluded: false,
+            native_handles: None,
         }
     }
 
@@ -224,6 +228,16 @@ impl WindowPort for WinitWindow {
     fn handle(&self) -> WindowHandle {
         self.handle
     }
+
+    fn native_handles(&self) -> Option<NativeWindowHandles> {
+        self.native_handles
+    }
+}
+
+fn native_handles(window: &Window) -> Option<NativeWindowHandles> {
+    let display = window.display_handle().ok()?.as_raw();
+    let window = window.window_handle().ok()?.as_raw();
+    Some(NativeWindowHandles { display, window })
 }
 
 #[cfg(test)]
@@ -259,6 +273,7 @@ mod tests {
                 height: 360
             }
         );
+        assert!(window.native_handles().is_none());
     }
 
     #[test]

@@ -20,6 +20,8 @@
 )]
 //! Platform ports for clocks, event sources and window descriptors.
 
+use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
+
 /// Monotonic instant measured in milliseconds since process start.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct MonotonicInstant(pub u64);
@@ -143,6 +145,15 @@ pub struct WindowHandle {
     pub id: u64,
 }
 
+/// Native raw window/display handles for render surface creation.
+#[derive(Clone, Copy, Debug)]
+pub struct NativeWindowHandles {
+    /// Raw display handle.
+    pub display: RawDisplayHandle,
+    /// Raw window handle.
+    pub window: RawWindowHandle,
+}
+
 /// Window presentation and lifecycle port.
 ///
 /// Presentation is not owned by the window abstraction. Render adapters
@@ -160,6 +171,10 @@ pub trait WindowPort {
     fn is_occluded(&self) -> bool;
     /// Opaque window identity.
     fn handle(&self) -> WindowHandle;
+    /// Raw native handles for render surface creation, when backed by a native window.
+    fn native_handles(&self) -> Option<NativeWindowHandles> {
+        None
+    }
 }
 
 /// Render backend request contract.
