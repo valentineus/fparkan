@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![allow(unsafe_code)]
 #![cfg_attr(
     test,
     allow(
@@ -32,12 +32,94 @@ use fparkan_platform::RenderRequest;
 use fparkan_render::{
     canonical_capture, FrameOutput, RenderBackend, RenderCommandList, RenderError,
 };
+use std::ffi::CStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Minimum Vulkan API version accepted by the Stage 0 backend.
 pub const MIN_VULKAN_API_VERSION: u32 = vk::API_VERSION_1_1;
 const KHR_SWAPCHAIN_EXTENSION: &str = "VK_KHR_swapchain";
 const KHR_PORTABILITY_SUBSET_EXTENSION: &str = "VK_KHR_portability_subset";
+
+/// Deterministic Vulkan loader probe report.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VulkanLoaderProbeReport {
+    /// Report schema version.
+    pub schema: u32,
+    /// Whether the Vulkan loader was opened successfully.
+    pub loader_available: bool,
+    /// Reported loader instance API version.
+    pub instance_api_version: u32,
+}
+
+/// Vulkan loader bootstrap error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VulkanLoaderError {
+    /// The Vulkan loader library could not be opened.
+    Unavailable {
+        /// Loader error text.
+        message: String,
+    },
+}
+
+impl std::fmt::Display for VulkanLoaderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable { message } => {
+                write!(f, "Vulkan loader is unavailable: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VulkanLoaderError {}
+
+/// Opens the Vulkan loader and reports the supported instance API version.
+///
+/// # Errors
+///
+/// Returns [`VulkanLoaderError`] when no Vulkan loader library can be opened on
+/// the host.
+pub fn probe_vulkan_loader() -> Result<VulkanLoaderProbeReport, VulkanLoaderError> {
+    // SAFETY: Loading the entry only resolves loader symbols; no raw Vulkan handles escape.
+    let entry = unsafe { ash::Entry::load() }.map_err(|error| VulkanLoaderError::Unavailable {
+        message: error.to_string(),
+    })?;
+    // SAFETY: The resolved entry only queries the loader-supported instance API version.
+    let version = unsafe { entry.try_enumerate_instance_version() }
+        .map_err(|error| VulkanLoaderError::Unavailable {
+            message: error.to_string(),
+        })?
+        .unwrap_or(vk::API_VERSION_1_0);
+    Ok(VulkanLoaderProbeReport {
+        schema: 1,
+        loader_available: true,
+        instance_api_version: version,
+    })
+}
+
+/// Returns the static Vulkan entry name used by loader probes.
+#[must_use]
+pub fn vulkan_entry_symbol_name() -> &'static CStr {
+    c"vkGetInstanceProcAddr"
+}
+
+/// Renders a deterministic JSON Vulkan loader report.
+#[must_use]
+pub fn render_loader_probe_report_json(report: &VulkanLoaderProbeReport) -> String {
+    let mut out = String::new();
+    out.push_str("{\"schema\":");
+    out.push_str(&report.schema.to_string());
+    out.push_str(",\"loader_available\":");
+    out.push_str(if report.loader_available {
+        "true"
+    } else {
+        "false"
+    });
+    out.push_str(",\"instance_api\":\"");
+    out.push_str(&format_api_version(report.instance_api_version));
+    out.push_str("\"}");
+    out
+}
 
 /// Vulkan backend migration readiness.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -638,6 +720,33 @@ mod tests {
         assert_eq!(
             render_capability_report_json(&report),
             "{\"schema\":1,\"vulkan_api\":\"1.1.0\",\"device_name\":\"GPU \\\"A\\\"\",\"score\":1101,\"graphics_queue_family\":3,\"present_queue_family\":3,\"portability_subset\":false,\"enabled_extensions\":[\"VK_KHR_swapchain\"]}"
+        );
+    }
+
+    #[test]
+    fn loader_probe_report_json_is_stable() {
+        assert_eq!(
+            vulkan_entry_symbol_name().to_bytes(),
+            b"vkGetInstanceProcAddr"
+        );
+        assert_eq!(
+            render_loader_probe_report_json(&VulkanLoaderProbeReport {
+                schema: 1,
+                loader_available: true,
+                instance_api_version: vk::API_VERSION_1_2,
+            }),
+            "{\"schema\":1,\"loader_available\":true,\"instance_api\":\"1.2.0\"}"
+        );
+    }
+
+    #[test]
+    fn loader_error_display_is_actionable() {
+        assert_eq!(
+            VulkanLoaderError::Unavailable {
+                message: "dlopen failed".to_string(),
+            }
+            .to_string(),
+            "Vulkan loader is unavailable: dlopen failed"
         );
     }
 
