@@ -57,6 +57,7 @@ struct SmokeOptions {
     status: SmokeStatus,
     frames: u32,
     resize_count: u32,
+    swapchain_recreate_count: u32,
     validation_error_count: Option<u32>,
     probes: ProbeOptions,
     reason: Option<String>,
@@ -69,6 +70,7 @@ impl SmokeOptions {
         let mut status = SmokeStatus::Blocked;
         let mut frames = 0;
         let mut resize_count = 0;
+        let mut swapchain_recreate_count = 0;
         let mut validation_error_count = None;
         let mut probes = ProbeOptions::default();
         let mut reason = None;
@@ -105,6 +107,12 @@ impl SmokeOptions {
                         .ok_or_else(|| "--resize-count requires a value".to_string())?;
                     resize_count = parse_u32("--resize-count", value)?;
                 }
+                "--swapchain-recreate-count" => {
+                    let value = iter
+                        .next()
+                        .ok_or_else(|| "--swapchain-recreate-count requires a value".to_string())?;
+                    swapchain_recreate_count = parse_u32("--swapchain-recreate-count", value)?;
+                }
                 "--validation-error-count" => {
                     let value = iter
                         .next()
@@ -139,6 +147,7 @@ impl SmokeOptions {
             status,
             frames,
             resize_count,
+            swapchain_recreate_count,
             validation_error_count,
             probes,
             reason,
@@ -433,6 +442,12 @@ fn validate_smoke_options(
             if options.resize_count == 0 {
                 return Err("passed native smoke report requires --resize-count >= 1".to_string());
             }
+            if options.swapchain_recreate_count == 0 {
+                return Err(
+                    "passed native smoke report requires --swapchain-recreate-count >= 1"
+                        .to_string(),
+                );
+            }
             if options.validation_error_count != Some(0) {
                 return Err(
                     "passed native smoke report requires --validation-error-count 0".to_string(),
@@ -512,6 +527,7 @@ fn render_smoke_report_json(
             "  \"status\": \"{}\",\n",
             "  \"frames\": {},\n",
             "  \"resize_count\": {},\n",
+            "  \"swapchain_recreate_count\": {},\n",
             "  \"validation_error_count\": {},\n",
             "  \"shader_manifest_hash\": \"{}\",\n",
             "  \"vulkan_loader_status\": \"{}\",\n",
@@ -536,6 +552,7 @@ fn render_smoke_report_json(
         options.status.as_str(),
         options.frames,
         options.resize_count,
+        options.swapchain_recreate_count,
         validation_error_count,
         json_escape(&shader_manifest.manifest_hash),
         bootstrap.loader_status.as_str(),
@@ -658,6 +675,8 @@ mod tests {
             "299",
             "--resize-count",
             "1",
+            "--swapchain-recreate-count",
+            "1",
             "--validation-error-count",
             "0",
         ]))
@@ -698,6 +717,8 @@ mod tests {
             "300",
             "--resize-count",
             "1",
+            "--swapchain-recreate-count",
+            "1",
             "--validation-error-count",
             "0",
         ]))
@@ -726,6 +747,47 @@ mod tests {
     }
 
     #[test]
+    fn rejects_passed_without_swapchain_recreation() {
+        let options = SmokeOptions::parse(&strings(&[
+            "--platform",
+            "linux",
+            "--out",
+            "target/native.json",
+            "--status",
+            "passed",
+            "--frames",
+            "300",
+            "--resize-count",
+            "1",
+            "--validation-error-count",
+            "0",
+            "--probe-surface",
+        ]))
+        .expect("options");
+
+        assert_eq!(
+            validate_smoke_options(
+                &options,
+                &VulkanBootstrapProbe {
+                    loader_status: VulkanLoaderStatus::Available,
+                    instance_api: Some("1.3.0".to_string()),
+                    loader_error: None,
+                    instance_status: VulkanInstanceStatus::Created,
+                    instance_error: None,
+                    portability_enumeration: false,
+                    window_status: WinitWindowStatus::Planned,
+                    window_width: Some(1280),
+                    window_height: Some(720),
+                    window_error: None,
+                    surface_status: VulkanSurfaceStatus::Planned,
+                    surface_error: None,
+                },
+            ),
+            Err("passed native smoke report requires --swapchain-recreate-count >= 1".to_string())
+        );
+    }
+
+    #[test]
     fn rejects_passed_without_instance_probe() {
         let options = SmokeOptions::parse(&strings(&[
             "--platform",
@@ -737,6 +799,8 @@ mod tests {
             "--frames",
             "300",
             "--resize-count",
+            "1",
+            "--swapchain-recreate-count",
             "1",
             "--validation-error-count",
             "0",
@@ -779,6 +843,8 @@ mod tests {
             "300",
             "--resize-count",
             "1",
+            "--swapchain-recreate-count",
+            "1",
             "--validation-error-count",
             "0",
             "--probe-instance",
@@ -819,6 +885,8 @@ mod tests {
             "--frames",
             "300",
             "--resize-count",
+            "1",
+            "--swapchain-recreate-count",
             "1",
             "--validation-error-count",
             "0",
@@ -886,6 +954,7 @@ mod tests {
         assert!(json.contains("\"schema_version\": \"fparkan-native-smoke-v1\""));
         assert!(json.contains("\"platform\": \"macos\""));
         assert!(json.contains("\"status\": \"blocked\""));
+        assert!(json.contains("\"swapchain_recreate_count\": 0"));
         assert!(json.contains("\"shader_manifest_hash\": \""));
         assert!(json.contains("\"vulkan_loader_status\": \"unavailable\""));
         assert!(json.contains("\"vulkan_instance_api\": null"));
