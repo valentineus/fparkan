@@ -52,6 +52,7 @@ S0-VK-021	covered	cargo test -p fparkan-render-vulkan --offline frame_submission
 S0-VK-022	covered	cargo test -p fparkan-render-vulkan --offline backend_tracks_render_request_and_presents
 S0-VK-023	covered	cargo test -p fparkan-vulkan-smoke --offline rejects_false_pass_without_full_evidence blocked_report_includes_shader_manifest_and_bootstrap_status
 S0-VK-024	covered	cargo test -p fparkan-vulkan-smoke --offline rejects_passed_without_loader_probe formats_vulkan_api_version
+S0-VK-025	covered	cargo test -p fparkan-vulkan-smoke --offline rejects_passed_without_instance_probe parses_instance_probe_as_loader_probe
 S0-LIMIT-001	covered	cargo test -p fparkan-binary --offline rejects_count_stride_overflow
 S0-LIMIT-002	covered	cargo test -p fparkan-binary --offline rejects_oversized_declared_allocation_before_read
 L1-P1-NRES-001	covered	cargo test -p fparkan-nres --offline licensed_corpora_nres_roundtrip_gates

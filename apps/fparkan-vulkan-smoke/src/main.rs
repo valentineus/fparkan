@@ -12,7 +12,8 @@
 //! Native Vulkan smoke runner entrypoint.
 
 use fparkan_render_vulkan::{
-    probe_vulkan_loader, triangle_shader_manifest, validate_shader_manifest,
+    create_vulkan_instance_probe, probe_vulkan_loader, triangle_shader_manifest,
+    validate_shader_manifest, VulkanInstanceConfig,
 };
 use std::path::PathBuf;
 use std::process::Command;
@@ -57,6 +58,7 @@ struct SmokeOptions {
     resize_count: u32,
     validation_error_count: Option<u32>,
     probe_loader: bool,
+    probe_instance: bool,
     reason: Option<String>,
 }
 
@@ -69,6 +71,7 @@ impl SmokeOptions {
         let mut resize_count = 0;
         let mut validation_error_count = None;
         let mut probe_loader = false;
+        let mut probe_instance = false;
         let mut reason = None;
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
@@ -112,6 +115,10 @@ impl SmokeOptions {
                 "--probe-loader" => {
                     probe_loader = true;
                 }
+                "--probe-instance" => {
+                    probe_loader = true;
+                    probe_instance = true;
+                }
                 "--reason" => {
                     let value = iter
                         .next()
@@ -129,6 +136,7 @@ impl SmokeOptions {
             resize_count,
             validation_error_count,
             probe_loader,
+            probe_instance,
             reason,
         })
     }
@@ -144,7 +152,10 @@ fn parse_u32(name: &str, value: &str) -> Result<u32, String> {
 struct VulkanBootstrapProbe {
     loader_status: VulkanLoaderStatus,
     instance_api: Option<String>,
-    error: Option<String>,
+    loader_error: Option<String>,
+    instance_status: VulkanInstanceStatus,
+    instance_error: Option<String>,
+    portability_enumeration: bool,
 }
 
 impl VulkanBootstrapProbe {
@@ -153,22 +164,47 @@ impl VulkanBootstrapProbe {
             return Self {
                 loader_status: VulkanLoaderStatus::Skipped,
                 instance_api: None,
-                error: None,
+                loader_error: None,
+                instance_status: VulkanInstanceStatus::Skipped,
+                instance_error: None,
+                portability_enumeration: false,
             };
         }
 
-        match probe_vulkan_loader() {
+        let mut probe = match probe_vulkan_loader() {
             Ok(report) => Self {
                 loader_status: VulkanLoaderStatus::Available,
                 instance_api: Some(format_api_version(report.instance_api_version)),
-                error: None,
+                loader_error: None,
+                instance_status: VulkanInstanceStatus::Skipped,
+                instance_error: None,
+                portability_enumeration: false,
             },
             Err(err) => Self {
                 loader_status: VulkanLoaderStatus::Unavailable,
                 instance_api: None,
-                error: Some(err.to_string()),
+                loader_error: Some(err.to_string()),
+                instance_status: VulkanInstanceStatus::Skipped,
+                instance_error: None,
+                portability_enumeration: false,
             },
+        };
+
+        if options.probe_instance && probe.loader_status == VulkanLoaderStatus::Available {
+            let config = VulkanInstanceConfig::smoke("fparkan-vulkan-smoke");
+            probe.portability_enumeration = config.enable_portability_enumeration;
+            match create_vulkan_instance_probe(&config) {
+                Ok(instance) => {
+                    probe.instance_status = VulkanInstanceStatus::Created;
+                    probe.portability_enumeration = instance.report.create_flags != 0;
+                }
+                Err(err) => {
+                    probe.instance_status = VulkanInstanceStatus::Failed;
+                    probe.instance_error = Some(err.to_string());
+                }
+            }
         }
+        probe
     }
 }
 
@@ -185,6 +221,23 @@ impl VulkanLoaderStatus {
             Self::Skipped => "skipped",
             Self::Available => "available",
             Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VulkanInstanceStatus {
+    Skipped,
+    Created,
+    Failed,
+}
+
+impl VulkanInstanceStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Skipped => "skipped",
+            Self::Created => "created",
+            Self::Failed => "failed",
         }
     }
 }
@@ -271,6 +324,11 @@ fn validate_smoke_options(
                     "passed native smoke report requires successful --probe-loader".to_string(),
                 );
             }
+            if bootstrap.instance_status != VulkanInstanceStatus::Created {
+                return Err(
+                    "passed native smoke report requires successful --probe-instance".to_string(),
+                );
+            }
         }
     }
     Ok(())
@@ -293,8 +351,12 @@ fn render_smoke_report_json(
         .instance_api
         .as_ref()
         .map_or_else(|| "null".to_string(), |value| json_string(value));
-    let bootstrap_error = bootstrap
-        .error
+    let loader_error = bootstrap
+        .loader_error
+        .as_ref()
+        .map_or_else(|| "null".to_string(), |value| json_string(value));
+    let instance_error = bootstrap
+        .instance_error
         .as_ref()
         .map_or_else(|| "null".to_string(), |value| json_string(value));
     Ok(format!(
@@ -311,7 +373,10 @@ fn render_smoke_report_json(
             "  \"shader_manifest_hash\": \"{}\",\n",
             "  \"vulkan_loader_status\": \"{}\",\n",
             "  \"vulkan_instance_api\": {},\n",
-            "  \"vulkan_bootstrap_error\": {},\n",
+            "  \"vulkan_loader_error\": {},\n",
+            "  \"vulkan_instance_status\": \"{}\",\n",
+            "  \"vulkan_instance_error\": {},\n",
+            "  \"vulkan_portability_enumeration\": {},\n",
             "  \"reason\": {}\n",
             "}}\n"
         ),
@@ -326,7 +391,14 @@ fn render_smoke_report_json(
         json_escape(&shader_manifest.manifest_hash),
         bootstrap.loader_status.as_str(),
         instance_api,
-        bootstrap_error,
+        loader_error,
+        bootstrap.instance_status.as_str(),
+        instance_error,
+        if bootstrap.portability_enumeration {
+            "true"
+        } else {
+            "false"
+        },
         reason
     ))
 }
@@ -404,7 +476,10 @@ mod tests {
             &VulkanBootstrapProbe {
                 loader_status: VulkanLoaderStatus::Unavailable,
                 instance_api: None,
-                error: Some("Vulkan loader is unavailable".to_string()),
+                loader_error: Some("Vulkan loader is unavailable".to_string()),
+                instance_status: VulkanInstanceStatus::Skipped,
+                instance_error: None,
+                portability_enumeration: false,
             },
         )
     }
@@ -433,7 +508,10 @@ mod tests {
                 &VulkanBootstrapProbe {
                     loader_status: VulkanLoaderStatus::Available,
                     instance_api: Some("1.3.0".to_string()),
-                    error: None,
+                    loader_error: None,
+                    instance_status: VulkanInstanceStatus::Created,
+                    instance_error: None,
+                    portability_enumeration: false,
                 },
             ),
             Err("passed native smoke report requires --frames >= 300".to_string())
@@ -464,10 +542,48 @@ mod tests {
                 &VulkanBootstrapProbe {
                     loader_status: VulkanLoaderStatus::Skipped,
                     instance_api: None,
-                    error: None,
+                    loader_error: None,
+                    instance_status: VulkanInstanceStatus::Skipped,
+                    instance_error: None,
+                    portability_enumeration: false,
                 },
             ),
             Err("passed native smoke report requires successful --probe-loader".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_passed_without_instance_probe() {
+        let options = SmokeOptions::parse(&strings(&[
+            "--platform",
+            "linux",
+            "--out",
+            "target/native.json",
+            "--status",
+            "passed",
+            "--frames",
+            "300",
+            "--resize-count",
+            "1",
+            "--validation-error-count",
+            "0",
+            "--probe-loader",
+        ]))
+        .expect("options");
+
+        assert_eq!(
+            validate_smoke_options(
+                &options,
+                &VulkanBootstrapProbe {
+                    loader_status: VulkanLoaderStatus::Available,
+                    instance_api: Some("1.3.0".to_string()),
+                    loader_error: None,
+                    instance_status: VulkanInstanceStatus::Skipped,
+                    instance_error: None,
+                    portability_enumeration: false,
+                },
+            ),
+            Err("passed native smoke report requires successful --probe-instance".to_string())
         );
     }
 
@@ -489,7 +605,10 @@ mod tests {
             &VulkanBootstrapProbe {
                 loader_status: VulkanLoaderStatus::Unavailable,
                 instance_api: None,
-                error: Some("Vulkan loader is unavailable: dlopen failed".to_string()),
+                loader_error: Some("Vulkan loader is unavailable: dlopen failed".to_string()),
+                instance_status: VulkanInstanceStatus::Skipped,
+                instance_error: None,
+                portability_enumeration: true,
             },
         )?;
 
@@ -499,10 +618,29 @@ mod tests {
         assert!(json.contains("\"shader_manifest_hash\": \""));
         assert!(json.contains("\"vulkan_loader_status\": \"unavailable\""));
         assert!(json.contains("\"vulkan_instance_api\": null"));
-        assert!(json.contains(
-            "\"vulkan_bootstrap_error\": \"Vulkan loader is unavailable: dlopen failed\""
-        ));
+        assert!(json
+            .contains("\"vulkan_loader_error\": \"Vulkan loader is unavailable: dlopen failed\""));
+        assert!(json.contains("\"vulkan_instance_status\": \"skipped\""));
+        assert!(json.contains("\"vulkan_instance_error\": null"));
+        assert!(json.contains("\"vulkan_portability_enumeration\": true"));
         assert!(json.contains("\"reason\": \"runner unavailable\""));
+        Ok(())
+    }
+
+    #[test]
+    fn parses_instance_probe_as_loader_probe() -> Result<(), String> {
+        let options = SmokeOptions::parse(&strings(&[
+            "--platform",
+            "linux",
+            "--out",
+            "target/native.json",
+            "--probe-instance",
+            "--reason",
+            "runner unavailable",
+        ]))?;
+
+        assert!(options.probe_loader);
+        assert!(options.probe_instance);
         Ok(())
     }
 
