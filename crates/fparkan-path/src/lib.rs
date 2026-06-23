@@ -24,13 +24,28 @@ impl OriginalPathBytes {
 
 /// Normalized relative path.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct NormalizedPath(String);
+pub struct NormalizedPath {
+    raw: Vec<u8>,
+    display: String,
+}
 
 impl NormalizedPath {
     /// Returns string view.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.display
+    }
+
+    /// Returns normalized byte view.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.raw
+    }
+
+    /// Returns an OS path owned path buffer.
+    #[must_use]
+    pub fn as_path(&self) -> PathBuf {
+        as_os_path_from_bytes(&self.raw)
     }
 }
 
@@ -91,8 +106,6 @@ pub enum PathError {
     ParentTraversal,
     /// Host path escape.
     EscapesRoot,
-    /// Invalid UTF-8 after normalization.
-    InvalidUtf8,
 }
 
 impl fmt::Display for PathError {
@@ -103,7 +116,6 @@ impl fmt::Display for PathError {
             Self::Absolute => write!(f, "path must be relative and cannot be absolute"),
             Self::ParentTraversal => write!(f, "path attempts to traverse outside its root"),
             Self::EscapesRoot => write!(f, "normalized path escapes the configured root"),
-            Self::InvalidUtf8 => write!(f, "path is not valid UTF-8 after normalization"),
         }
     }
 }
@@ -115,8 +127,7 @@ impl std::error::Error for PathError {}
 /// # Errors
 ///
 /// Returns [`PathError`] when the input is empty, absolute, contains an
-/// embedded NUL, attempts parent traversal, or is not valid UTF-8 after
-/// legacy separator normalization.
+/// embedded NUL, attempts parent traversal, or has an invalid drive prefix.
 pub fn normalize_relative(raw: &[u8], policy: PathPolicy) -> Result<NormalizedPath, PathError> {
     if raw.is_empty() {
         return Err(PathError::Empty);
@@ -124,22 +135,21 @@ pub fn normalize_relative(raw: &[u8], policy: PathPolicy) -> Result<NormalizedPa
     if raw.contains(&0) {
         return Err(PathError::EmbeddedNul);
     }
-    let text = std::str::from_utf8(raw).map_err(|_| PathError::InvalidUtf8)?;
-    if text.starts_with('/') || text.starts_with('\\') || has_drive_prefix(text) {
+    if raw.starts_with(b"/") || raw.starts_with(b"\\") || has_drive_prefix(raw) {
         return Err(PathError::Absolute);
     }
     let mut parts = Vec::new();
-    for part in text.split(['/', '\\']) {
-        if part.is_empty() || part == "." {
+    for part in raw.split(|byte| *byte == b'/' || *byte == b'\\') {
+        if part.is_empty() || part == b"." {
             if policy == PathPolicy::StrictLegacy {
                 return Err(PathError::ParentTraversal);
             }
             continue;
         }
-        if part == ".." {
+        if part == b".." {
             return Err(PathError::ParentTraversal);
         }
-        if policy == PathPolicy::StrictLegacy && part.contains(':') {
+        if policy == PathPolicy::StrictLegacy && part.contains(&b':') {
             return Err(PathError::Absolute);
         }
         parts.push(part);
@@ -147,7 +157,17 @@ pub fn normalize_relative(raw: &[u8], policy: PathPolicy) -> Result<NormalizedPa
     if parts.is_empty() {
         return Err(PathError::Empty);
     }
-    Ok(NormalizedPath(parts.join("/")))
+    let mut normalized = Vec::new();
+    for (index, part) in parts.iter().enumerate() {
+        if index > 0 {
+            normalized.push(b'/');
+        }
+        normalized.extend_from_slice(part);
+    }
+    Ok(NormalizedPath {
+        raw: normalized,
+        display: String::from_utf8_lossy(&normalized).into_owned(),
+    })
 }
 
 /// Normalizes a relative path while preserving its original bytes.
@@ -166,8 +186,7 @@ pub fn normalize_relative_with_original(
     })
 }
 
-fn has_drive_prefix(text: &str) -> bool {
-    let bytes = text.as_bytes();
+fn has_drive_prefix(bytes: &[u8]) -> bool {
     bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
 }
 
@@ -184,7 +203,11 @@ pub fn ascii_lookup_key(raw: &[u8]) -> LookupKey {
 /// Returns [`PathError::ParentTraversal`] when a normalized segment attempts
 /// to address a parent directory.
 pub fn reject_escape(rel: &NormalizedPath) -> Result<(), PathError> {
-    if rel.0.split('/').any(|part| part == "..") {
+    if rel
+        .as_bytes()
+        .split(|byte| *byte == b'/')
+        .any(|part| part == b"..")
+    {
         Err(PathError::ParentTraversal)
     } else {
         Ok(())
@@ -198,7 +221,20 @@ pub fn reject_escape(rel: &NormalizedPath) -> Result<(), PathError> {
 /// Returns [`PathError`] if the normalized path fails the escape check.
 pub fn join_under(root: &Path, rel: &NormalizedPath) -> Result<PathBuf, PathError> {
     reject_escape(rel)?;
-    Ok(root.join(rel.as_str()))
+    Ok(root.join(rel.as_path()))
+}
+
+#[cfg(unix)]
+fn as_os_path_from_bytes(raw: &[u8]) -> PathBuf {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    PathBuf::from(OsString::from_vec(raw.to_vec()))
+}
+
+#[cfg(not(unix))]
+fn as_os_path_from_bytes(raw: &[u8]) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(raw).into_owned())
 }
 
 #[cfg(test)]
@@ -290,6 +326,14 @@ mod tests {
         assert_eq!(path.normalized().as_str().as_bytes(), raw);
         assert_eq!(path.original().as_bytes(), raw);
         assert_eq!(&ascii_lookup_key(raw).0[5..13], &raw[5..13]);
+    }
+
+    #[test]
+    fn accepts_non_utf8_legacy_bytes() {
+        let path = normalize_relative(b"DATA/\xFF.bin", PathPolicy::HostCompatible)
+            .expect("raw legacy bytes");
+
+        assert_eq!(path.as_str(), "DATA/\u{FFFD}.bin");
     }
 
     #[test]

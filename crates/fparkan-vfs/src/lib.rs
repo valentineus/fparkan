@@ -8,6 +8,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 
 /// VFS metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -110,6 +114,7 @@ impl DirectoryVfs {
 struct CachedHostFingerprint {
     len: u64,
     modified: Option<SystemTime>,
+    identity: Option<u64>,
     fingerprint: Sha256Digest,
 }
 
@@ -120,14 +125,23 @@ impl Vfs for DirectoryVfs {
 
     fn read(&self, path: &NormalizedPath) -> Result<Arc<[u8]>, VfsError> {
         let host = self.host_path(path)?;
-        if fs::symlink_metadata(&host)
-            .map_err(VfsError::Io)?
-            .file_type()
-            .is_symlink()
+        let pre_metadata = fs::symlink_metadata(&host).map_err(VfsError::Io)?;
+        if pre_metadata.file_type().is_symlink() || !pre_metadata.is_file() {
+            return Err(VfsError::Path);
+        }
+        let pre_identity = file_identity(&pre_metadata);
+        let pre_len = pre_metadata.len();
+        let pre_modified = pre_metadata.modified().ok();
+        let bytes = fs::read(&host).map_err(VfsError::Io)?;
+        let post_metadata = fs::symlink_metadata(&host).map_err(VfsError::Io)?;
+        if post_metadata.file_type().is_symlink()
+            || !post_metadata.is_file()
+            || post_metadata.len() != pre_len
+            || post_metadata.modified().ok() != pre_modified
+            || file_identity(&post_metadata) != pre_identity
         {
             return Err(VfsError::Path);
         }
-        let bytes = fs::read(host).map_err(VfsError::Io)?;
         Ok(Arc::from(bytes.into_boxed_slice()))
     }
 
@@ -248,7 +262,11 @@ fn metadata_from_host_file_with_cache(
         .map_err(|_| VfsError::Path)?
         .get(path)
         .cloned()
-        .filter(|cached| cached.len == len && cached.modified == modified)
+        .filter(|cached| {
+            cached.len == len
+                && cached.modified == modified
+                && cached.identity == file_identity(metadata)
+        })
     {
         return Ok(VfsMetadata {
             len,
@@ -266,6 +284,7 @@ fn metadata_from_host_file_with_cache(
             CachedHostFingerprint {
                 len,
                 modified,
+                identity: file_identity(metadata),
                 fingerprint,
             },
         );
@@ -275,15 +294,15 @@ fn metadata_from_host_file_with_cache(
 /// In-memory VFS.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryVfs {
-    files: BTreeMap<String, Arc<[u8]>>,
-    lookup: BTreeMap<Vec<u8>, Vec<String>>,
+    files: BTreeMap<Vec<u8>, Arc<[u8]>>,
+    lookup: BTreeMap<Vec<u8>, Vec<Vec<u8>>>,
 }
 
 impl MemoryVfs {
     /// Inserts a file.
     #[allow(clippy::needless_pass_by_value)]
     pub fn insert(&mut self, path: NormalizedPath, bytes: Arc<[u8]>) {
-        let path = path.as_str().to_string();
+        let path = path.as_bytes().to_vec();
         self.files.insert(path, bytes);
         self.rebuild_lookup();
     }
@@ -292,7 +311,7 @@ impl MemoryVfs {
         self.lookup.clear();
         for path in self.files.keys() {
             self.lookup
-                .entry(ascii_lookup_key(path.as_bytes()).0)
+                .entry(ascii_lookup_key(path).0)
                 .or_default()
                 .push(path.clone());
         }
@@ -301,18 +320,37 @@ impl MemoryVfs {
         }
     }
 
-    fn resolve_path(&self, path: &NormalizedPath) -> Result<&str, VfsError> {
-        let key = ascii_lookup_key(path.as_str().as_bytes()).0;
+    fn resolve_path(&self, path: &NormalizedPath) -> Result<&[u8], VfsError> {
+        let key = ascii_lookup_key(path.as_bytes()).0;
         let matches = self
             .lookup
             .get(&key)
             .ok_or_else(|| VfsError::NotFound(path.as_str().to_string()))?;
         match matches.as_slice() {
-            [single] => Ok(single.as_str()),
+            [single] => Ok(single.as_slice()),
             [] => Err(VfsError::NotFound(path.as_str().to_string())),
             _ => Err(VfsError::Ambiguous(path.as_str().to_string())),
         }
     }
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &fs::Metadata) -> Option<u64> {
+    Some((metadata.dev() as u64).rotate_left(32) ^ metadata.ino())
+}
+
+#[cfg(windows)]
+fn file_identity(metadata: &fs::Metadata) -> Option<u64> {
+    Some(
+        (metadata.volume_serial_number() as u64).rotate_left(40)
+            ^ ((metadata.file_index_high() as u64) << 32)
+            ^ metadata.file_index_low() as u64,
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(_metadata: &fs::Metadata) -> Option<u64> {
+    None
 }
 
 impl Vfs for MemoryVfs {
@@ -339,13 +377,9 @@ impl Vfs for MemoryVfs {
     fn list(&self, prefix: &NormalizedPath) -> Result<Vec<VfsEntry>, VfsError> {
         let mut out = Vec::new();
         for (path, bytes) in &self.files {
-            if path
-                .as_bytes()
-                .get(..prefix.as_str().len())
-                .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_str().as_bytes()))
-            {
+            if has_segment_boundary_prefix_bytes(path, prefix.as_bytes()) {
                 let normalized = fparkan_path::normalize_relative(
-                    path.as_bytes(),
+                    path,
                     fparkan_path::PathPolicy::StrictLegacy,
                 )
                 .map_err(|_| VfsError::Path)?;
@@ -360,6 +394,25 @@ impl Vfs for MemoryVfs {
         }
         Ok(out)
     }
+}
+
+fn has_segment_boundary_prefix_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    if haystack.len() == needle.len() {
+        return haystack
+            .iter()
+            .zip(needle.iter())
+            .all(|(left, right)| left.eq_ignore_ascii_case(right));
+    }
+    if haystack[needle.len()] != b'/' {
+        return false;
+    }
+    haystack[..needle.len()]
+        .iter()
+        .zip(needle.iter())
+        .all(|(left, right)| left.eq_ignore_ascii_case(right))
 }
 
 /// Layered VFS with deterministic first-layer precedence.
@@ -508,6 +561,21 @@ mod tests {
     }
 
     #[test]
+    fn memory_vfs_list_prefix_is_boundary_safe() {
+        let mut vfs = MemoryVfs::default();
+        let exact = normalize_relative(b"DATA/Land.map", PathPolicy::StrictLegacy).expect("path");
+        let sibling = normalize_relative(b"DATA2/Land.map", PathPolicy::StrictLegacy).expect("path");
+        vfs.insert(exact.clone(), Arc::from(b"exact".as_slice()));
+        vfs.insert(sibling, Arc::from(b"sibling".as_slice()));
+
+        let prefix = normalize_relative(b"DATA", PathPolicy::StrictLegacy).expect("prefix");
+        let entries = vfs.list(&prefix).expect("list");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path.as_str(), exact.as_str());
+    }
+
+    #[test]
     fn directory_vfs_fingerprint_changes_for_same_length_content() {
         let root = unique_test_dir("content-fingerprint");
         std::fs::create_dir_all(root.join("DATA")).expect("mkdir");
@@ -587,6 +655,23 @@ mod tests {
         vfs.insert(second, Arc::from(b"second".as_slice()));
 
         assert!(matches!(vfs.read(&query), Err(VfsError::Ambiguous(_))));
+    }
+
+    #[test]
+    fn memory_vfs_distinguishes_non_utf8_path_bytes() {
+        let mut vfs = MemoryVfs::default();
+        let ascii = normalize_relative(b"DATA/normal.bin", PathPolicy::HostCompatible)
+            .expect("ascii path");
+        let binary = normalize_relative(b"DATA/\xFF.bin", PathPolicy::HostCompatible)
+            .expect("binary path");
+        vfs.insert(ascii.clone(), Arc::from(b"ascii".as_slice()));
+        vfs.insert(binary.clone(), Arc::from(b"binary".as_slice()));
+
+        let binary_query = normalize_relative(b"DATA/\xFF.bin", PathPolicy::HostCompatible)
+            .expect("binary query");
+
+        assert_eq!(vfs.read(&binary_query).expect("read binary").as_ref(), b"binary");
+        assert_eq!(vfs.read(&ascii).expect("read ascii").as_ref(), b"ascii");
     }
 
     #[test]

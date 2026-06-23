@@ -1,8 +1,11 @@
 #![forbid(unsafe_code)]
 //! Structured diagnostics shared by `FParkan` crates.
 
+use serde::Serialize;
+
 /// Diagnostic severity.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Severity {
     /// Informational note.
     Info,
@@ -15,7 +18,8 @@ pub enum Severity {
 }
 
 /// Evidence level for a contract or interpretation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum EvidenceStatus {
     /// Described by project documentation.
     Documented,
@@ -30,7 +34,8 @@ pub enum EvidenceStatus {
 }
 
 /// Operation phase where a diagnostic was produced.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Phase {
     /// Discovery.
     Discover,
@@ -55,7 +60,7 @@ pub enum Phase {
 }
 
 /// Byte span in an input source.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct SourceSpan {
     /// Start offset.
     pub offset: u64,
@@ -64,11 +69,11 @@ pub struct SourceSpan {
 }
 
 /// Stable diagnostic code.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct DiagnosticCode(pub &'static str);
 
 /// Context attached to a diagnostic.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct DiagnosticContext {
     /// Phase.
     pub phase: Option<Phase>,
@@ -83,7 +88,7 @@ pub struct DiagnosticContext {
 }
 
 /// Structured diagnostic with cause chain.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Diagnostic {
     /// Stable code.
     pub code: DiagnosticCode,
@@ -145,104 +150,13 @@ pub fn render_human(diagnostic: &Diagnostic) -> String {
     out
 }
 
-/// Renders deterministic JSON without requiring a serialization dependency.
+/// Renders deterministic JSON using the typed diagnostic schema.
 #[must_use]
 pub fn render_json(diagnostic: &Diagnostic) -> String {
-    fn esc(value: &str) -> String {
-        let mut out = String::with_capacity(value.len() + 2);
-        for ch in value.chars() {
-            match ch {
-                '\\' => out.push_str("\\\\"),
-                '"' => out.push_str("\\\""),
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                _ => out.push(ch),
-            }
-        }
-        out
+    match serde_json::to_string(diagnostic) {
+        Ok(json) => json,
+        Err(err) => format!("{{\"error\":\"diagnostic serialization failed: {err}\"}}"),
     }
-
-    let mut out = String::new();
-    out.push('{');
-    out.push_str("\"code\":\"");
-    out.push_str(&esc(diagnostic.code.0));
-    out.push_str("\",\"severity\":\"");
-    out.push_str(match diagnostic.severity {
-        Severity::Info => "info",
-        Severity::Warning => "warning",
-        Severity::Error => "error",
-        Severity::Fatal => "fatal",
-    });
-    out.push_str("\",\"message\":\"");
-    out.push_str(&esc(&diagnostic.message));
-    out.push_str("\",\"context\":{");
-    if let Some(phase) = diagnostic.context.phase {
-        out.push_str("\"phase\":\"");
-        out.push_str(match phase {
-            Phase::Discover => "discover",
-            Phase::Read => "read",
-            Phase::Parse => "parse",
-            Phase::Validate => "validate",
-            Phase::Resolve => "resolve",
-            Phase::Prepare => "prepare",
-            Phase::Construct => "construct",
-            Phase::Register => "register",
-            Phase::Simulate => "simulate",
-            Phase::Render => "render",
-        });
-        out.push('"');
-    }
-    if let Some(path) = &diagnostic.context.path {
-        if diagnostic.context.phase.is_some() {
-            out.push(',');
-        }
-        out.push_str("\"path\":\"");
-        out.push_str(&esc(path));
-        out.push('"');
-    }
-    if let Some(entry) = &diagnostic.context.archive_entry {
-        if diagnostic.context.phase.is_some() || diagnostic.context.path.is_some() {
-            out.push(',');
-        }
-        out.push_str("\"archive_entry\":\"");
-        out.push_str(&esc(entry));
-        out.push('"');
-    }
-    if let Some(key) = &diagnostic.context.object_key {
-        if diagnostic.context.phase.is_some()
-            || diagnostic.context.path.is_some()
-            || diagnostic.context.archive_entry.is_some()
-        {
-            out.push(',');
-        }
-        out.push_str("\"object_key\":\"");
-        out.push_str(&esc(key));
-        out.push('"');
-    }
-    if let Some(span) = diagnostic.context.span {
-        if diagnostic.context.phase.is_some()
-            || diagnostic.context.path.is_some()
-            || diagnostic.context.archive_entry.is_some()
-            || diagnostic.context.object_key.is_some()
-        {
-            out.push(',');
-        }
-        out.push_str("\"span\":{\"offset\":");
-        out.push_str(&span.offset.to_string());
-        out.push_str(",\"length\":");
-        out.push_str(&span.length.to_string());
-        out.push('}');
-    }
-    out.push_str("},\"causes\":[");
-    for (idx, cause) in diagnostic.causes.iter().enumerate() {
-        if idx > 0 {
-            out.push(',');
-        }
-        out.push_str(&render_json(cause));
-    }
-    out.push_str("]}");
-    out
 }
 
 #[cfg(test)]
@@ -297,5 +211,15 @@ mod tests {
         assert!(json.contains("\"span\":{\"offset\":12,\"length\":4}"));
         assert!(json.contains("\"code\":\"CAUSE\""));
         assert!(json.contains("\"span\":{\"offset\":16,\"length\":8}"));
+    }
+
+    #[test]
+    fn json_escapes_all_control_characters() {
+        let value = diagnostic(DiagnosticCode("S1-H01"), "quote\"\u{0000}tab\tline\r\n");
+        let json = render_json(&value);
+        assert!(json.contains("\\u0000"));
+        assert!(json.contains("\\u0009"));
+        assert!(!json.contains('\t'));
+        assert!(!json.contains('\r'));
     }
 }

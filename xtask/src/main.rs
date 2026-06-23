@@ -2,7 +2,9 @@
 #![allow(clippy::print_stderr, clippy::print_stdout)]
 //! Repository automation for `FParkan`.
 
+use cargo_metadata::MetadataCommand;
 use fparkan_corpus::{discover, render_report_json, report, DiscoverOptions};
+use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Write as _;
@@ -13,6 +15,9 @@ use std::process::Command;
 const CORPORA_MANIFEST_ENV: &str = "FPARKAN_CORPORA_MANIFEST";
 const PART1_ROOT_ENV: &str = "FPARKAN_CORPUS_PART1_ROOT";
 const PART2_ROOT_ENV: &str = "FPARKAN_CORPUS_PART2_ROOT";
+const CI_ACCEPTANCE_ROADMAP: &str = "fixtures/acceptance/stage_0_2_roadmap.md";
+const CI_ACCEPTANCE_COVERAGE: &str = "fixtures/acceptance/coverage.tsv";
+const CI_ACCEPTANCE_REPORT: &str = "target/fparkan/acceptance/stage-0-2-audit.json";
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -29,10 +34,27 @@ fn main() {
 fn run(args: &[String]) -> Result<(), String> {
     match args {
         [cmd] if cmd == "ci" => {
-            run_rustfmt_check(Path::new("."))?;
+            run_cargo_fmt_check()?;
             run_policy(Path::new("."))?;
-            cargo(&["test", "--workspace", "--locked", "--offline"])?;
-            clippy_rustup(&["--workspace", "--locked", "--offline"])?;
+            cargo(&["test", "--workspace", "--all-targets", "--all-features", "--locked"])?;
+            cargo(&[
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--all-features",
+                "--locked",
+                "--",
+                "-D",
+                "warnings",
+            ])?;
+            run_cargo_doc()?;
+            run_cargo_deny()?;
+            run_acceptance_audit(&AuditOptions {
+                roadmap: PathBuf::from(CI_ACCEPTANCE_ROADMAP),
+                coverage: PathBuf::from(CI_ACCEPTANCE_COVERAGE),
+                out: PathBuf::from(CI_ACCEPTANCE_REPORT),
+                strict: true,
+            })?;
             Ok(())
         }
         [cmd] if cmd == "policy" => run_policy(Path::new(".")),
@@ -115,63 +137,53 @@ fn cargo_with_env(args: &[&str], envs: &[(&str, &Path)]) -> Result<(), String> {
     }
 }
 
-fn clippy_rustup(args: &[&str]) -> Result<(), String> {
-    let rustup = std::env::var_os("RUSTUP").unwrap_or_else(|| "rustup".into());
-    let status = Command::new(rustup)
-        .args(["run", "stable", "cargo-clippy"])
-        .args(args)
-        .status()
-        .map_err(|err| format!("failed to run cargo-clippy through rustup: {err}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("cargo-clippy exited with {status}"))
-    }
-}
-
-fn run_rustfmt_check(root: &Path) -> Result<(), String> {
-    let mut files = Vec::new();
-    collect_rust_files(root, &mut files)?;
-    if files.is_empty() {
-        return Ok(());
-    }
-
-    let rustup = std::env::var_os("RUSTUP").unwrap_or_else(|| "rustup".into());
-    let status = Command::new(rustup)
-        .args(["run", "stable", "rustfmt", "--check"])
-        .args(files)
+fn run_cargo_fmt_check() -> Result<(), String> {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = Command::new(cargo)
+        .args(["fmt", "--all", "--", "--check"])
         .status()
         .map_err(|err| format!("failed to run rustfmt: {err}"))?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!("rustfmt exited with {status}"))
+        Err(format!("cargo fmt exited with {status}"))
     }
 }
 
-fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
-    let entries = fs::read_dir(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
-    for entry in entries {
-        let entry = entry.map_err(|err| format!("{}: {err}", dir.display()))?;
-        let path = entry.path();
-        if should_skip_policy_path(&path) {
-            continue;
-        }
-        let file_type = entry
-            .file_type()
-            .map_err(|err| format!("{}: {err}", path.display()))?;
-        if file_type.is_dir() {
-            collect_rust_files(&path, out)?;
-        } else if file_type.is_file()
-            && path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| ext == "rs")
-        {
-            out.push(path);
-        }
+fn run_cargo_deny() -> Result<(), String> {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = Command::new(cargo)
+        .args([
+            "deny",
+            "check",
+            "--workspace",
+            "--all-features",
+            "advisories",
+            "bans",
+            "licenses",
+            "sources",
+        ])
+        .status()
+        .map_err(|err| format!("failed to run cargo-deny: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("cargo-deny exited with {status}"))
     }
-    Ok(())
+}
+
+fn run_cargo_doc() -> Result<(), String> {
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let status = Command::new(cargo)
+        .args(["doc", "--workspace", "--all-features", "--locked", "--no-deps"])
+        .env("RUSTDOCFLAGS", "-D warnings -D rustdoc::broken_intra_doc_links")
+        .status()
+        .map_err(|err| format!("failed to run cargo doc: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("cargo doc exited with {status}"))
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -197,65 +209,75 @@ fn load_licensed_roots(manifest: Option<&Path>) -> Result<LicensedCorpusRoots, S
             format!(
                 "licensed tests require --manifest or {CORPORA_MANIFEST_ENV}=<absolute corpora.toml>"
             )
-        })?;
+    })?;
     parse_licensed_manifest(&manifest)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LicensedManifest {
+    schema: Option<u8>,
+    #[serde(rename = "corpus")]
+    corpora: Vec<CorpusEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CorpusEntry {
+    id: String,
+    kind: CorpusKind,
+    root: String,
+    expected_profile: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CorpusKind {
+    Part1,
+    Part2,
 }
 
 fn parse_licensed_manifest(path: &Path) -> Result<LicensedCorpusRoots, String> {
     let text = fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    let manifest: LicensedManifest = toml::from_str(&text)
+        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    if manifest.schema.is_some_and(|version| version != 1) {
+        return Err(format!(
+            "unsupported corpora manifest schema {} (expected 1)",
+            manifest.schema.unwrap_or(1)
+        ));
+    }
+
     let mut part1 = None;
     let mut part2 = None;
-    let mut current_kind: Option<String> = None;
-    let mut current_root: Option<PathBuf> = None;
 
-    for raw_line in text.lines() {
-        let line = raw_line.split('#').next().unwrap_or_default().trim();
-        if line.is_empty() {
-            continue;
+    for entry in manifest.corpora {
+        match entry.kind {
+            CorpusKind::Part1 => {
+                let root = PathBuf::from(entry.root);
+                assign_manifest_root(&mut part1, root, "part1")?;
+            }
+            CorpusKind::Part2 => {
+                let root = PathBuf::from(entry.root);
+                assign_manifest_root(&mut part2, root, "part2")?;
+            }
         }
-        if line == "[[corpus]]" {
-            flush_manifest_entry(&mut part1, &mut part2, &mut current_kind, &mut current_root)?;
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let key = key.trim();
-        match key {
-            "kind" => current_kind = Some(parse_manifest_string(value.trim())?),
-            "root" => current_root = Some(PathBuf::from(parse_manifest_string(value.trim())?)),
-            _ => {}
+        if entry.expected_profile.is_none() {
+            return Err(format!(
+                "{}: corpus entry '{}' must define expected_profile",
+                path.display(),
+                entry.id
+            ));
         }
     }
-    flush_manifest_entry(&mut part1, &mut part2, &mut current_kind, &mut current_root)?;
 
     let roots = LicensedCorpusRoots {
-        part1: part1.ok_or_else(|| "licensed manifest is missing kind = \"part1\"".to_string())?,
-        part2: part2.ok_or_else(|| "licensed manifest is missing kind = \"part2\"".to_string())?,
+        part1: part1.ok_or_else(|| "licensed manifest is missing part1 corpus entry".to_string())?,
+        part2: part2.ok_or_else(|| "licensed manifest is missing part2 corpus entry".to_string())?,
     };
     validate_licensed_part("part1", &roots.part1)?;
     validate_licensed_part("part2", &roots.part2)?;
     Ok(roots)
-}
-
-fn flush_manifest_entry(
-    part1: &mut Option<PathBuf>,
-    part2: &mut Option<PathBuf>,
-    current_kind: &mut Option<String>,
-    current_root: &mut Option<PathBuf>,
-) -> Result<(), String> {
-    let Some(kind) = current_kind.take() else {
-        *current_root = None;
-        return Ok(());
-    };
-    let root = current_root
-        .take()
-        .ok_or_else(|| format!("licensed manifest entry {kind} is missing root"))?;
-    match kind.as_str() {
-        "part1" => assign_manifest_root(part1, root, "part1"),
-        "part2" => assign_manifest_root(part2, root, "part2"),
-        _ => Ok(()),
-    }
 }
 
 fn assign_manifest_root(
@@ -267,18 +289,6 @@ fn assign_manifest_root(
         return Err(format!("licensed manifest contains duplicate {kind} root"));
     }
     Ok(())
-}
-
-fn parse_manifest_string(value: &str) -> Result<String, String> {
-    let trimmed = value.trim();
-    if let Some(quoted) = trimmed
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-    {
-        Ok(quoted.to_string())
-    } else {
-        Err(format!("manifest value must be a quoted string: {trimmed}"))
-    }
 }
 
 fn validate_licensed_part(kind: &str, root: &Path) -> Result<(), String> {
@@ -400,27 +410,24 @@ fn validate_cargo_metadata(root: &Path, failures: &mut Vec<String>) -> Result<()
     if !manifest.exists() {
         return Ok(());
     }
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let output = Command::new(cargo)
-        .args([
-            "metadata",
-            "--format-version",
-            "1",
-            "--offline",
-            "--locked",
-            "--no-deps",
-            "--manifest-path",
-        ])
-        .arg(&manifest)
-        .output()
-        .map_err(|err| format!("failed to run cargo metadata: {err}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let metadata = MetadataCommand::new()
+        .manifest_path(&manifest)
+        .no_deps(true)
+        .other_options(["--offline".to_string(), "--locked".to_string()])
+        .exec()
+        .map_err(|error| {
+            format!(
+                "{}: cargo metadata failed: {}",
+                manifest.display(),
+                error
+            )
+        })?;
+    if metadata.workspace_members.is_empty() {
         failures.push(format!(
-            "{}: cargo metadata failed: {}",
-            manifest.display(),
-            stderr.trim()
+            "{}: cargo metadata produced no workspace members",
+            manifest.display()
         ));
+        return Ok(());
     }
     Ok(())
 }
@@ -490,32 +497,171 @@ fn validate_dependency_boundaries(root: &Path, failures: &mut Vec<String>) -> Re
         let Some(package) = parse_package_name(&text) else {
             continue;
         };
+        if is_removed_legacy_adapter_manifest(root, &manifest) {
+            failures.push(format!(
+                "{}: legacy SDL/OpenGL adapter crate must be removed: {package}",
+                manifest.display()
+            ));
+            continue;
+        }
         let dependencies = parse_manifest_dependencies(&text);
-        if is_domain_manifest(root, &manifest) {
+        if !is_adapter_like_package(&package) {
             for dependency in &dependencies {
-                if is_forbidden_domain_dependency(dependency) {
+                if is_forbidden_gui_dependency(dependency) {
                     failures.push(format!(
-                        "{}: domain package {package} depends on forbidden GUI/adapter package {dependency}",
+                        "{}: package {package} depends on forbidden GUI/adapter package {dependency}",
                         manifest.display()
                     ));
                 }
             }
         }
-        if package == "fparkan-headless" {
+        if is_app_package(&package) {
+            if let Some(forbidden) = first_forbidden_parser_dependency(&dependencies) {
+                failures.push(format!(
+                    "{}: app package {package} depends on parser crate {forbidden}",
+                    manifest.display()
+                ));
+            }
             for dependency in &dependencies {
-                if matches!(
-                    dependency.as_str(),
-                    "fparkan-platform-sdl" | "fparkan-render-gl"
-                ) {
+                if is_forbidden_runtime_bridge_dependency(dependency) {
                     failures.push(format!(
-                        "{}: fparkan-headless depends on forbidden platform/render adapter {dependency}",
+                        "{}: app package {package} depends on forbidden bridge dependency {dependency}",
                         manifest.display()
                     ));
                 }
+            }
+        }
+
+        if package == "fparkan-runtime" {
+            if let Some(forbidden) = first_forbidden_parser_dependency(&dependencies) {
+                failures.push(format!(
+                    "{}: runtime package {package} depends on parser crate {forbidden}",
+                    manifest.display()
+                ));
+            }
+            if let Some(forbidden) = first_forbidden_platform_bridge_dependency(&dependencies) {
+                failures.push(format!(
+                    "{}: runtime package {package} depends on forbidden platform/driver crate {forbidden}",
+                    manifest.display()
+                ));
+            }
+        }
+
+        if package == "fparkan-prototype" {
+            if let Some(forbidden) = first_forbidden_visual_dependency(&dependencies) {
+                failures.push(format!(
+                    "{}: prototype package {package} depends on forbidden visual parser {forbidden}",
+                    manifest.display()
+                ));
             }
         }
     }
     Ok(())
+}
+
+fn is_app_package(package: &str) -> bool {
+    matches!(
+        package,
+        "fparkan-cli" | "fparkan-game" | "fparkan-headless" | "fparkan-viewer"
+    )
+}
+
+fn is_adapter_like_package(package: &str) -> bool {
+    matches!(
+        package,
+        "fparkan-platform-winit" | "fparkan-render-vulkan"
+    )
+}
+
+fn first_forbidden_parser_dependency(dependencies: &BTreeSet<String>) -> Option<&str> {
+    [
+        "fparkan-msh",
+        "fparkan-nres",
+        "fparkan-rsli",
+        "fparkan-terrain-format",
+        "fparkan-texm",
+        "fparkan-mission-format",
+        "fparkan-material",
+        "fparkan-fx",
+    ]
+    .iter()
+    .find_map(|forbidden| {
+        if dependencies.contains(*forbidden) {
+            Some(*forbidden)
+        } else {
+            None
+        }
+    })
+}
+
+fn first_forbidden_visual_dependency(dependencies: &BTreeSet<String>) -> Option<&str> {
+    [
+        "fparkan-msh",
+        "fparkan-material",
+        "fparkan-texm",
+        "fparkan-fx",
+        "fparkan-terrain-format",
+    ]
+    .iter()
+    .find_map(|forbidden| {
+        if dependencies.contains(*forbidden) {
+            Some(*forbidden)
+        } else {
+            None
+        }
+    })
+}
+
+fn first_forbidden_platform_bridge_dependency(dependencies: &BTreeSet<String>) -> Option<&str> {
+    [
+        "fparkan-platform-winit",
+        "fparkan-render-vulkan",
+        "winit",
+        "ash",
+        "ash-window",
+    ]
+    .iter()
+    .find_map(|forbidden| {
+        if dependencies.contains(*forbidden) {
+            Some(*forbidden)
+        } else {
+            None
+        }
+    })
+}
+
+fn is_forbidden_runtime_bridge_dependency(dependency: &str) -> bool {
+    matches!(
+        dependency,
+        "fparkan-platform-winit" | "fparkan-render-vulkan" | "winit" | "ash" | "ash-window"
+    )
+}
+
+fn is_forbidden_domain_dependency(dependency: &str) -> bool {
+    matches!(
+        dependency, "fparkan-cli"
+            | "fparkan-game"
+            | "fparkan-headless"
+            | "fparkan-viewer"
+            | "fparkan-platform-sdl"
+            | "fparkan-render-gl"
+            | "sdl2"
+            | "gl"
+            | "glow"
+            | "glium"
+            | "glutin"
+    )
+}
+
+fn is_forbidden_gui_dependency(dependency: &str) -> bool {
+    is_forbidden_domain_dependency(dependency) || is_forbidden_platform_dependency(dependency)
+}
+
+fn is_forbidden_platform_dependency(dependency: &str) -> bool {
+    matches!(
+        dependency,
+        "fparkan-platform-winit" | "fparkan-render-vulkan" | "winit" | "ash" | "ash-window"
+    )
 }
 
 fn collect_cargo_manifests(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
@@ -610,30 +756,10 @@ fn parse_toml_string_value(line: &str) -> Option<String> {
     Some(value.trim_matches('"').to_string())
 }
 
-fn is_domain_manifest(root: &Path, manifest: &Path) -> bool {
-    let relative = manifest.strip_prefix(root).unwrap_or(manifest);
-    relative
-        .components()
-        .next()
-        .is_some_and(|component| component.as_os_str() == "crates")
-}
-
-fn is_forbidden_domain_dependency(dependency: &str) -> bool {
-    matches!(
-        dependency,
-        "fparkan-platform-sdl"
-            | "fparkan-render-gl"
-            | "fparkan-cli"
-            | "fparkan-game"
-            | "fparkan-headless"
-            | "fparkan-viewer"
-            | "sdl2"
-            | "gl"
-            | "glow"
-            | "glium"
-            | "glutin"
-            | "winit"
-    )
+fn is_removed_legacy_adapter_manifest(root: &Path, manifest: &Path) -> bool {
+    let normalized = manifest.strip_prefix(root).unwrap_or(manifest);
+    normalized.starts_with("adapters/fparkan-platform-sdl")
+        || normalized.starts_with("adapters/fparkan-render-gl")
 }
 
 fn scan_policy_dir(dir: &Path, failures: &mut Vec<String>) -> Result<(), String> {
@@ -752,18 +878,27 @@ fn scan_policy_file(path: &Path, failures: &mut Vec<String>) -> Result<(), Strin
             path.display()
         ));
     }
+    let mut previous_line_has_safety_comment = false;
     for (index, line) in text.lines().enumerate() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("//") || trimmed.starts_with("//!") || trimmed.starts_with("///") {
+        if is_comment_line(trimmed) {
+            previous_line_has_safety_comment = has_safety_comment(trimmed);
+            continue;
+        }
+        if trimmed.is_empty() {
+            previous_line_has_safety_comment = false;
             continue;
         }
         if contains_unsafe_construct(trimmed) {
-            failures.push(format!(
-                "{}:{}: unsafe construct in workspace source",
-                path.display(),
-                index + 1
-            ));
+            if !is_authorized_unsafe_construct(path, trimmed, previous_line_has_safety_comment) {
+                failures.push(format!(
+                    "{}:{}: unsafe construct in workspace source",
+                    path.display(),
+                    index + 1
+                ));
+            }
         }
+        previous_line_has_safety_comment = false;
     }
     Ok(())
 }
@@ -773,6 +908,34 @@ fn contains_unsafe_construct(line: &str) -> bool {
         || line.contains(concat!("un", "safe fn"))
         || line.contains(concat!("un", "safe impl"))
         || line.contains(concat!("extern ", "\"C\""))
+}
+
+fn is_comment_line(line: &str) -> bool {
+    line.starts_with("//")
+        || line.starts_with("//!")
+        || line.starts_with("///")
+}
+
+fn has_safety_comment(line: &str) -> bool {
+    line.contains("SAFETY:")
+}
+
+const AUDITED_UNSAFE_SOURCE_FILES: &[&str] = &["adapters/fparkan-render-vulkan/src/lib.rs"];
+
+fn is_audited_unsafe_source(path: &Path) -> bool {
+    let as_path = path.as_os_str().to_string_lossy();
+    AUDITED_UNSAFE_SOURCE_FILES.iter().any(|candidate| as_path.ends_with(candidate))
+}
+
+fn is_authorized_unsafe_construct(
+    path: &Path,
+    line: &str,
+    previous_line_has_safety_comment: bool,
+) -> bool {
+    if !is_audited_unsafe_source(path) {
+        return false;
+    }
+    previous_line_has_safety_comment || has_safety_comment(line)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -805,8 +968,8 @@ const ALL_WORKSPACE_PACKAGES: &[&str] = &[
     "fparkan-texm",
     "fparkan-vfs",
     "fparkan-world",
-    "fparkan-platform-sdl",
-    "fparkan-render-gl",
+    "fparkan-platform-winit",
+    "fparkan-render-vulkan",
     "fparkan-cli",
     "fparkan-game",
     "fparkan-headless",
@@ -1033,11 +1196,11 @@ fn run_acceptance_audit(options: &AuditOptions) -> Result<(), String> {
     fs::write(&options.out, render_audit_json(&audit))
         .map_err(|err| format!("{}: {err}", options.out.display()))?;
     println!("{}", options.out.display());
-    let unverified = audit.unverified();
-    if options.strict && (!unverified.is_empty() || !audit.unknown_coverage.is_empty()) {
+    let strict_failures = audit.strict_failures();
+    if options.strict && (!strict_failures.is_empty() || !audit.unknown_coverage.is_empty()) {
         Err(format!(
-            "acceptance coverage incomplete: {} unverified, {} unknown",
-            unverified.len(),
+            "acceptance coverage incomplete: {} strict failures, {} unknown",
+            strict_failures.len(),
             audit.unknown_coverage.len()
         ))
     } else {
@@ -1089,6 +1252,14 @@ impl AcceptanceAudit {
         self.partial
             .iter()
             .chain(&self.blocked)
+            .chain(&self.missing)
+            .cloned()
+            .collect()
+    }
+
+    fn strict_failures(&self) -> Vec<String> {
+        self.partial
+            .iter()
             .chain(&self.missing)
             .cloned()
             .collect()
@@ -1666,7 +1837,7 @@ fparkan-render = { path = "../fparkan-render" }
 "quoted-dep" = "1"
 
 [dev-dependencies]
-fparkan-render-gl = { path = "../../adapters/fparkan-render-gl" }
+fparkan-render-vulkan = { path = "../../adapters/fparkan-render-vulkan" }
 "#;
 
         assert_eq!(
@@ -1676,13 +1847,14 @@ fparkan-render-gl = { path = "../../adapters/fparkan-render-gl" }
         let deps = parse_manifest_dependencies(manifest);
         assert!(deps.contains("fparkan-render"));
         assert!(deps.contains("quoted-dep"));
-        assert!(deps.contains("fparkan-render-gl"));
+        assert!(deps.contains("fparkan-render-vulkan"));
     }
 
     #[test]
     fn detects_forbidden_domain_dependencies() {
-        assert!(is_forbidden_domain_dependency("fparkan-render-gl"));
+        assert!(!is_forbidden_domain_dependency("fparkan-render-vulkan"));
         assert!(is_forbidden_domain_dependency("sdl2"));
+        assert!(is_forbidden_domain_dependency("fparkan-platform-sdl"));
         assert!(!is_forbidden_domain_dependency("fparkan-render"));
         assert!(!is_forbidden_domain_dependency("fparkan-platform"));
     }

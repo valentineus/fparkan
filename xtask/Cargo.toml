@@ -7,6 +7,9 @@ repository.workspace = true
 
 [dependencies]
 fparkan-corpus = { path = "../crates/fparkan-corpus" }
+cargo_metadata = "0.21"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
 
 [lints]
 workspace = true

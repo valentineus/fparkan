@@ -59,6 +59,71 @@ pub enum WriteProfile {
     Lossless,
 }
 
+/// Error returned when mutable editing is attempted.
+#[derive(Debug)]
+pub enum RsliMutationError {
+    /// Entry id is not present in this editable document.
+    EntryNotFound {
+        /// Requested entry id.
+        id: EntryId,
+    },
+    /// Entry name does not fit into a 12-byte fixed field.
+    AuthoringNameTooLong {
+        /// Observed length in bytes.
+        len: usize,
+        /// Maximum accepted length for an authoring field.
+        max: usize,
+    },
+    /// Entry name contains an explicit NUL byte.
+    AuthoringNameContainsNul {
+        /// Byte offset within the provided name.
+        offset: usize,
+    },
+    /// Packed payload size overflows the format `u32` field.
+    PackedPayloadTooLarge {
+        /// Requested packed payload size.
+        size: usize,
+        /// Format maximum (`u32::MAX`).
+        max: usize,
+    },
+}
+
+impl std::fmt::Display for RsliMutationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EntryNotFound { id } => write!(f, "entry id {id:?} is not present"),
+            Self::AuthoringNameTooLong { len, max } => {
+                write!(f, "authoring name is too long: {len} > {max}")
+            }
+            Self::AuthoringNameContainsNul { offset } => {
+                write!(f, "authoring name contains embedded NUL at {offset}")
+            }
+            Self::PackedPayloadTooLarge { size, max } => {
+                write!(f, "packed payload is too large: {size} > {max}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RsliMutationError {}
+
+/// Mutable editor for `RsliDocument` that can rebuild lookup tables.
+#[derive(Clone, Debug)]
+pub struct RsliEditor {
+    original_image: Arc<[u8]>,
+    header: RsliHeader,
+    overlay: u32,
+    ao_trailer: Option<[u8; 6]>,
+    entries: Vec<EditableEntry>,
+    dirty: bool,
+}
+
+#[derive(Clone, Debug)]
+struct EditableEntry {
+    meta: EntryMeta,
+    packed: Vec<u8>,
+}
+
 /// `RsLi` compatibility switches.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RsliCompatibilityProfile {
@@ -493,6 +558,180 @@ impl RsliDocument {
             WriteProfile::Lossless => self.bytes.to_vec(),
         }
     }
+
+    /// Creates a mutable editor from the parsed document.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsliError`] when source payloads cannot be copied from the
+    /// underlying archive image.
+    pub fn editor(&self) -> Result<RsliEditor, RsliError> {
+        let mut entries = Vec::with_capacity(self.records.len());
+        for (id, record) in self.records.iter().enumerate() {
+            let packed = self
+                .packed_slice(EntryId(u32::try_from(id).map_err(|_| RsliError::IntegerOverflow)?)?,
+                record,
+            )?
+            .to_vec();
+            entries.push(EditableEntry {
+                meta: record.meta.clone(),
+                packed,
+            });
+        }
+
+        Ok(RsliEditor {
+            original_image: self.bytes.clone(),
+            header: self.header.clone(),
+            overlay: self.ao_trailer.as_ref().map_or(0, |overlay| overlay.overlay),
+            ao_trailer: self.ao_trailer.as_ref().map(|overlay| overlay.raw),
+            entries,
+            dirty: false,
+        })
+    }
+}
+
+impl RsliEditor {
+    /// Returns editable entries by original directory id.
+    #[must_use]
+    pub fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Replaces packed payload bytes for an entry.
+    ///
+    /// `unpacked_size` is stored explicitly for compatibility checks and does
+    /// not imply a packing transform.
+    pub fn set_packed_payload(
+        &mut self,
+        id: EntryId,
+        packed: impl Into<Vec<u8>>,
+        unpacked_size: u32,
+    ) -> Result<(), RsliMutationError> {
+        let entry = self.entry_mut(id)?;
+        let packed = packed.into();
+        entry.meta.packed_size = u32::try_from(packed.len()).map_err(|_| {
+            RsliMutationError::PackedPayloadTooLarge {
+                size: packed.len(),
+                max: usize::try_from(u32::MAX).expect("u32 max always fits usize"),
+            }
+        })?;
+        entry.packed = packed;
+        entry.meta.unpacked_size = unpacked_size;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Replaces entry packing method in-place.
+    pub fn set_method(&mut self, id: EntryId, method: RsliMethod) -> Result<(), RsliMutationError> {
+        let entry = self.entry_mut(id)?;
+        entry.meta.method = method;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Replaces entry name in the fixed 12-byte table field.
+    pub fn set_name(&mut self, id: EntryId, name: &[u8]) -> Result<(), RsliMutationError> {
+        let entry = self.entry_mut(id)?;
+        entry.meta.name_raw = authoring_name_raw(name)?;
+        entry.meta.name = decode_name(c_name_bytes(&entry.meta.name_raw));
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Encodes the document according to editor state.
+    ///
+    /// For untouched documents returns the original image verbatim. On any
+    /// mutation this method rebuilds the lookup table and rewrites packed entry
+    /// bytes deterministically.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsliError`] when offsets, sizes or ids exceed in-memory limits.
+    pub fn encode(&self) -> Result<Vec<u8>, RsliError> {
+        if !self.dirty {
+            return Ok(self.original_image.to_vec());
+        }
+        self.encode_rebuild()
+    }
+
+    fn encode_rebuild(&self) -> Result<Vec<u8>, RsliError> {
+        let mut output = Vec::with_capacity(self.original_image.len());
+
+        let entry_count = u16::try_from(self.entries.len()).map_err(|_| RsliError::IntegerOverflow)?;
+        let table_len = self
+            .entries
+            .len()
+            .checked_mul(32)
+            .ok_or(RsliError::IntegerOverflow)?;
+
+        let mut header = self.header.raw;
+        header[4..6].copy_from_slice(&entry_count.to_le_bytes());
+        output.extend_from_slice(&header);
+
+        let mut sorted = (0..self.entries.len()).collect::<Vec<_>>();
+        sorted.sort_by(|left, right| {
+            cmp_c_string(
+                c_name_bytes(&self.entries[*left].meta.name_raw),
+                c_name_bytes(&self.entries[*right].meta.name_raw),
+            )
+        });
+
+        let mut lookup_map = vec![0i16; self.entries.len()];
+        for (position, original) in sorted.iter().enumerate() {
+            lookup_map[*original] = i16::try_from(position).map_err(|_| RsliError::IntegerOverflow)?;
+        }
+
+        let mut cursor = 32usize
+            .checked_add(table_len)
+            .ok_or(RsliError::IntegerOverflow)?;
+        let mut table_plain = Vec::with_capacity(table_len);
+        for (index, entry) in self.entries.iter().enumerate() {
+            let mut row = [0u8; 32];
+            let name_len = entry.meta.name_raw.len().min(12);
+            row[0..name_len].copy_from_slice(&entry.meta.name_raw[..name_len]);
+
+            row[16..18].copy_from_slice(&i16::try_from(entry.meta.flags)
+                .map_err(|_| RsliError::IntegerOverflow)?
+                .to_le_bytes());
+            row[18..20].copy_from_slice(&lookup_map[index].to_le_bytes());
+            row[20..24].copy_from_slice(&entry.meta.unpacked_size.to_le_bytes());
+
+            let packed_len = u32::try_from(entry.packed.len()).map_err(|_| RsliError::IntegerOverflow)?;
+            let cursor_u32 = u32::try_from(cursor).map_err(|_| RsliError::IntegerOverflow)?;
+            let offset_raw = if self.overlay == 0 {
+                cursor_u32
+            } else {
+                cursor_u32
+                    .checked_sub(self.overlay)
+                    .ok_or(RsliError::IntegerOverflow)?
+            };
+
+            row[24..28].copy_from_slice(&offset_raw.to_le_bytes());
+            row[28..32].copy_from_slice(&packed_len.to_le_bytes());
+            table_plain.extend_from_slice(&row);
+
+            output.extend_from_slice(&entry.packed);
+            cursor = cursor
+                .checked_add(entry.packed.len())
+                .ok_or(RsliError::IntegerOverflow)?;
+        }
+
+        let seed = self.header.xor_seed & 0xFFFF;
+        let encrypted = xor_stream(&table_plain, seed);
+        output.splice(32..32, encrypted.into_iter());
+
+        if let Some(overlay) = &self.ao_trailer {
+            output.extend_from_slice(overlay);
+        }
+
+        Ok(output)
+    }
+
+    fn entry_mut(&mut self, id: EntryId) -> Result<&mut EditableEntry, RsliMutationError> {
+        self.entries
+            .get_mut(usize::try_from(id.0).map_err(|_| RsliMutationError::EntryNotFound { id })?)
+            .ok_or_else(|| RsliMutationError::EntryNotFound { id })
+    }
 }
 
 impl RsliDocument {
@@ -831,6 +1070,23 @@ fn is_registered_deflate_eof_plus_one_quirk(name_raw: &[u8; 12]) -> bool {
 
 fn decode_name(name: &[u8]) -> String {
     name.iter().map(|byte| char::from(*byte)).collect()
+}
+
+fn authoring_name_raw(name: &[u8]) -> Result<[u8; 12], RsliMutationError> {
+    if name.len() > 12 {
+        return Err(RsliMutationError::AuthoringNameTooLong {
+            len: name.len(),
+            max: 12,
+        });
+    }
+    let mut output = [0u8; 12];
+    for (offset, byte) in name.iter().copied().enumerate() {
+        if byte == 0 {
+            return Err(RsliMutationError::AuthoringNameContainsNul { offset });
+        }
+        output[offset] = byte;
+    }
+    Ok(output)
 }
 
 fn c_name_bytes(raw: &[u8; 12]) -> &[u8] {
@@ -1812,6 +2068,85 @@ mod tests {
         let doc = decode(arc(bytes.clone()), ReadProfile::Strict).expect("roundtrip archive");
 
         assert_eq!(doc.encode(WriteProfile::Lossless), bytes);
+    }
+
+    #[test]
+    fn editor_roundtrip_without_mutations_is_identity() {
+        let bytes = synthetic_rsli(
+            &[
+                SyntheticEntry::stored(b"A", 0, b"alpha"),
+                SyntheticEntry::stored(b"B", 1, b"beta"),
+            ],
+            true,
+            0x7777,
+            None,
+        );
+
+        let doc = decode(arc(bytes.clone()), ReadProfile::Strict).expect("editable archive");
+        let editor = doc.editor().expect("editor");
+
+        assert_eq!(editor.encode().expect("editor encode"), bytes);
+    }
+
+    #[test]
+    fn editor_can_mutate_names_and_payloads() {
+        let bytes = synthetic_rsli(
+            &[
+                SyntheticEntry::stored(b"A", 0, b"alpha"),
+                SyntheticEntry::stored(b"B", 1, b"beta"),
+            ],
+            true,
+            0x7778,
+            None,
+        );
+
+        let doc = decode(arc(bytes), ReadProfile::Strict).expect("editable archive");
+        let mut editor = doc.editor().expect("editor");
+        editor
+            .set_name(EntryId(1), b"ZETA")
+            .expect("edit name");
+        editor
+            .set_packed_payload(EntryId(0), b"repacked-alpha", 13)
+            .expect("edit packed payload");
+        editor
+            .set_method(EntryId(0), RsliMethod::RawDeflate)
+            .expect("edit method");
+
+        let rebuilt = editor.encode().expect("editor encode");
+        let doc = decode(arc(rebuilt), ReadProfile::Strict).expect("repacked archive");
+
+        let renamed = doc.find("ZETA").expect("renamed entry");
+        assert_eq!(
+            doc.load(renamed).expect("renamed payload"),
+            b"beta"
+        );
+        let original = doc
+            .find("A")
+            .or_else(|| doc.find("a"))
+            .expect("original renamed entry fallback");
+        assert_eq!(doc.load(original).expect("updated payload"), b"repacked-alpha");
+        assert_eq!(doc.entries()[original.0 as usize].method, RsliMethod::RawDeflate);
+    }
+
+    #[test]
+    fn editor_rejects_unknown_entry_id_and_invalid_name() {
+        let bytes = synthetic_rsli(
+            &[SyntheticEntry::stored(b"A", 0, b"alpha")],
+            true,
+            0x7779,
+            None,
+        );
+        let doc = decode(arc(bytes), ReadProfile::Strict).expect("editable archive");
+        let mut editor = doc.editor().expect("editor");
+
+        assert!(matches!(
+            editor.set_name(EntryId(10), b"BAD"),
+            Err(RsliMutationError::EntryNotFound { id: EntryId(10) })
+        ));
+        assert!(matches!(
+            editor.set_name(EntryId(0), b"TOO_LONG_ENTRY_NAME"),
+            Err(RsliMutationError::AuthoringNameTooLong { .. })
+        ));
     }
 
     #[test]

@@ -1,11 +1,12 @@
 [package]
-name = "fparkan-render-gl"
+name = "fparkan-render-vulkan"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
+fparkan-platform = { path = "../../crates/fparkan-platform" }
 fparkan-render = { path = "../../crates/fparkan-render" }
 
 [lints]

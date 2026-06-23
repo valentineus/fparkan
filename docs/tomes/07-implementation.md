@@ -34,7 +34,7 @@ behavior         unit state machines, target and path requests
 physics          control systems, collision proxies and contacts
 animation        pose sampling, hierarchy and blending
 audio            sample cache, sources, listener and buses
-render           legacy-state compatibility and modern backend
+render           immutable frame contracts and modern backend
 network          game message schema plus transport adapters
 tools            validators, extractors, viewers, captures and editors
 ```
@@ -103,8 +103,8 @@ CPU assets и GPU resources имеют отдельные бюджеты и от
 
 ### Backend adapters
 
-Render, audio, input и network получают отдельные adapters. Legacy compatibility
-state живёт выше Vulkan, D3D11 или Metal backend; DirectPlay compatibility живёт
+Render, audio, input и network получают отдельные adapters. Compatibility state
+живёт вне Vulkan, D3D11 или Metal backend; DirectPlay compatibility живёт
 отдельно от modern transport. Так можно заменить платформу, не меняя форматы,
 игровую семантику и regression corpus.
 

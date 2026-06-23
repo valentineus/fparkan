@@ -7,8 +7,16 @@ repository.workspace = true
 
 [dependencies]
 fparkan-binary = { path = "../fparkan-binary" }
+fparkan-fx = { path = "../fparkan-fx" }
+fparkan-material = { path = "../fparkan-material" }
+fparkan-msh = { path = "../fparkan-msh" }
+fparkan-mission-format = { path = "../fparkan-mission-format" }
 fparkan-nres = { path = "../fparkan-nres" }
+fparkan-prototype = { path = "../fparkan-prototype" }
 fparkan-path = { path = "../fparkan-path" }
+fparkan-rsli = { path = "../fparkan-rsli" }
+fparkan-texm = { path = "../fparkan-texm" }
+fparkan-terrain-format = { path = "../fparkan-terrain-format" }
 
 [lints]
 workspace = true

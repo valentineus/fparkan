@@ -3,11 +3,13 @@
 Baseline command:
 
 ```text
-env RUSTC=/Users/valentineus/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc /opt/homebrew/bin/rustup run stable cargo test --workspace --offline
+cargo xtask ci
 ```
 
-Result on 2026-06-22:
+Result on 2026-06-23:
 
-- library and binary unit tests compile and pass after aligning SDL2 versions and pinning `toml` to cached `0.8`;
-- doctests fail in this shell because `rustdoc` is not in PATH unless `RUSTDOC` is also set to the real toolchain binary;
-- full online dependency resolution is unavailable in the sandbox.
+- canonical pipeline now uses a fixed MSRV/toolchain, policy checks,
+  full-format workspace test command, `clippy`/`doc`/`cargo deny` gates and
+  typed manifest parsing in `xtask`;
+- `rpath`/offline mode is still useful for synthetic local checks;
+- full online dependency resolution remains unavailable in the sandbox.

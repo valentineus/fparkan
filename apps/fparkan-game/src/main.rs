@@ -3,11 +3,14 @@
 //! `FParkan` rendered game composition root.
 
 use fparkan_render::{
-    DrawCommand, DrawId, GpuMaterialId, GpuMeshId, IndexRange, RecordingBackend, RenderBackend,
+    DrawCommand, DrawId, GpuMaterialId, GpuMeshId, IndexRange, RenderBackend,
     RenderCommand, RenderCommandList, RenderPhase,
 };
+use fparkan_platform_winit::WinitWindow;
+use fparkan_render_vulkan::VulkanBackend;
 use fparkan_runtime::{
     create, frame, load_mission, EngineConfig, EngineMode, EngineServices, MissionRequest,
+    MissionAssets, loaded_mission_assets,
 };
 use fparkan_vfs::DirectoryVfs;
 use fparkan_world::WorldSnapshot;
@@ -47,7 +50,11 @@ fn run(args: &[String]) -> Result<String, String> {
     )
     .map_err(|err| err.to_string())?;
 
-    let mut backend = RecordingBackend::default();
+    let mut backend = VulkanBackend::new();
+    let _request = WinitWindow::default_render_request();
+    let window = WinitWindow::synthetic(1280, 720);
+    let _ = window.drawable_size();
+    let _ = window.handle();
     let mut last_draw_count = 0usize;
     let mut last_tick = 0u64;
     let mut last_hash = [0u8; 32];
@@ -55,7 +62,8 @@ fn run(args: &[String]) -> Result<String, String> {
         let result = frame(&mut engine).map_err(|err| err.to_string())?;
         last_tick = result.snapshot.tick.0;
         last_hash = result.snapshot.hash.0;
-        let commands = render_snapshot_commands(&result.snapshot);
+        let mission_assets = loaded_mission_assets(&engine);
+        let commands = render_snapshot_commands_with_assets(&result.snapshot, mission_assets);
         last_draw_count = commands
             .commands
             .iter()
@@ -66,6 +74,8 @@ fn run(args: &[String]) -> Result<String, String> {
             .map_err(|err| format!("render backend: {err}"))?;
     }
 
+    let capture_report = backend.report();
+
     Ok(format!(
         "{{\"mission\":{},\"objects\":{},\"frames\":{},\"tick\":{},\"draws\":{},\"captures\":{},\"last_capture_bytes\":{},\"hash\":{}}}",
         json_string(&args.mission),
@@ -73,17 +83,40 @@ fn run(args: &[String]) -> Result<String, String> {
         args.frames,
         last_tick,
         last_draw_count,
-        backend.captures().len(),
-        backend.last_capture().map_or(0, <[u8]>::len),
+        capture_report.submissions,
+        capture_report.last_capture_size,
         json_hash(&last_hash)
     ))
 }
 
 fn render_snapshot_commands(snapshot: &WorldSnapshot) -> RenderCommandList {
+    render_snapshot_commands_with_assets(snapshot, None)
+}
+
+fn render_snapshot_commands_with_assets(
+    snapshot: &WorldSnapshot,
+    mission_assets: Option<&MissionAssets>,
+) -> RenderCommandList {
     let mut commands = Vec::with_capacity(snapshot.objects.len() + 2);
     commands.push(RenderCommand::BeginFrame);
     for (index, handle) in snapshot.objects.iter().enumerate() {
         let stable_order = u64::from(handle.slot);
+        let prepared = mission_assets.and_then(|assets| {
+            assets
+                .visual_for_object(index)
+                .and_then(|visual_id| assets.visual_by_id(visual_id))
+        });
+        let mesh = if let Some(visual) = prepared {
+            visual.mesh.as_ref().map_or_else(
+                || GpuMeshId(u64::from(handle.slot) + 1),
+                |_| GpuMeshId(visual.id.raw()),
+            )
+        } else {
+            GpuMeshId(u64::from(handle.slot) + 1)
+        };
+        let material = prepared
+            .and_then(|visual| visual.primary_material_id())
+            .map_or(GpuMaterialId(1), |material_id| GpuMaterialId(material_id.raw()));
         let draw_id = snapshot
             .tick
             .0
@@ -93,8 +126,8 @@ fn render_snapshot_commands(snapshot: &WorldSnapshot) -> RenderCommandList {
             id: DrawId(draw_id),
             phase: RenderPhase::Opaque,
             object_id: None,
-            mesh: GpuMeshId(u64::from(handle.slot) + 1),
-            material: GpuMaterialId(1),
+            mesh,
+            material,
             transform: identity_transform(index_to_f32(index)),
             range: IndexRange { start: 0, count: 3 },
             stable_order,
@@ -178,7 +211,7 @@ fn json_string(value: &str) -> String {
             '\t' => out.push_str("\\t"),
             c if c.is_control() => {
                 use std::fmt::Write as _;
-                let _ = write!(out, "\\u{:04x}", u32::from(c));
+                let _ = write!(out, "\\u{:04x}", c as u32);
             }
             c => out.push(c),
         }

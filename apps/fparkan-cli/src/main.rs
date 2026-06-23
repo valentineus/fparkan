@@ -3,9 +3,10 @@
 //! `FParkan` command-line tools.
 
 use fparkan_corpus::{discover, render_report_json, report, DiscoverOptions};
-use fparkan_prototype::{
-    build_prototype_graph_report, extend_graph_report_with_visual_dependencies,
-};
+use fparkan_inspection::inspect_archive_file;
+use fparkan_inspection::ArchiveInspection;
+use fparkan_assets::extend_graph_report_with_visual_dependencies;
+use fparkan_prototype::build_prototype_graph_report;
 use fparkan_resource::{resource_name, CachedResourceRepository};
 use fparkan_runtime::{
     create, load_mission, EngineConfig, EngineMode, EngineServices, MissionRequest,
@@ -134,7 +135,12 @@ fn inspect_prototype(args: &[String]) -> Result<(), String> {
     let roots = [resource_name(key.as_bytes())];
     let (graph, resolved, mut report) =
         build_prototype_graph_report(&repository, vfs.as_ref(), &roots);
-    extend_graph_report_with_visual_dependencies(&repository, &mut report, &resolved);
+    extend_graph_report_with_visual_dependencies(
+        &repository,
+        &mut report,
+        &graph,
+        &resolved,
+    );
     println!("{}", prototype_inspect_json(&key, &graph, &report));
     Ok(())
 }
@@ -202,42 +208,34 @@ fn graph_mission(args: &[String]) -> Result<(), String> {
 
 fn inspect_archive(args: &[String]) -> Result<(), String> {
     let path = parse_archive_path(args)?;
-    let bytes = std::fs::read(&path).map_err(|err| format!("{}: {err}", path.display()))?;
-    if bytes.starts_with(b"NRes") {
-        let document = fparkan_nres::decode(
-            Arc::from(bytes.into_boxed_slice()),
-            fparkan_nres::ReadProfile::Compatible,
-        )
-        .map_err(|err| err.to_string())?;
-        println!(
-            "{}",
-            archive_inspect_json(
-                &path.display().to_string(),
-                "NRes",
-                document.entries().len(),
-                Some(document.lookup_order_valid()),
-            )
-        );
-        return Ok(());
+    let inspection = inspect_archive_file(&path, 0).map_err(|err| err.to_string())?;
+
+    match inspection {
+        ArchiveInspection::Nres {
+            entries,
+            lookup_order_valid,
+            ..
+        } => {
+            println!(
+                "{}",
+                archive_inspect_json(
+                    &path.display().to_string(),
+                    "NRes",
+                    entries,
+                    Some(lookup_order_valid),
+                )
+            );
+            Ok(())
+        }
+        ArchiveInspection::Rsli { entries } => {
+            println!(
+                "{}",
+                archive_inspect_json(&path.display().to_string(), "RsLi", entries, None)
+            );
+            Ok(())
+        }
+        ArchiveInspection::Unsupported => Err(format!("{}: unsupported archive magic", path.display())),
     }
-    if bytes.get(0..4) == Some(b"NL\0\x01") {
-        let document = fparkan_rsli::decode(
-            Arc::from(bytes.into_boxed_slice()),
-            fparkan_rsli::ReadProfile::Compatible,
-        )
-        .map_err(|err| err.to_string())?;
-        println!(
-            "{}",
-            archive_inspect_json(
-                &path.display().to_string(),
-                "RsLi",
-                document.entries().len(),
-                None
-            )
-        );
-        return Ok(());
-    }
-    Err(format!("{}: unsupported archive magic", path.display()))
 }
 
 fn archive_inspect_json(
@@ -278,7 +276,7 @@ fn json_string(value: &str) -> String {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             c if c.is_control() => {
-                let _ = write!(out, "\\u{:04x}", u32::from(c));
+                let _ = write!(out, "\\u{:04x}", c as u32);
             }
             c => out.push(c),
         }

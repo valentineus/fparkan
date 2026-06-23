@@ -7,6 +7,7 @@ members = [
     "crates/fparkan-corpus",
     "crates/fparkan-diagnostics",
     "crates/fparkan-fx",
+    "crates/fparkan-inspection",
     "crates/fparkan-material",
     "crates/fparkan-mission-format",
     "crates/fparkan-msh",
@@ -24,8 +25,8 @@ members = [
     "crates/fparkan-texm",
     "crates/fparkan-vfs",
     "crates/fparkan-world",
-    "adapters/fparkan-platform-sdl",
-    "adapters/fparkan-render-gl",
+    "adapters/fparkan-platform-winit",
+    "adapters/fparkan-render-vulkan",
     "apps/fparkan-cli",
     "apps/fparkan-game",
     "apps/fparkan-headless",
@@ -36,6 +37,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.87"
 license = "GPL-2.0-only"
 repository = "https://github.com/valentineus/fparkan"
 

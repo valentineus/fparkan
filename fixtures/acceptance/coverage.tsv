@@ -21,7 +21,7 @@ S0-CORPUS-005	covered	cargo test -p fparkan-corpus --offline fingerprint_changes
 S0-CORPUS-006	covered	cargo test -p fparkan-corpus --offline atomic_report_write
 S0-CLI-001	covered	cargo test -p fparkan-cli --offline stable_exit_codes_are_mapped
 S0-CLI-002	covered	cargo test -p fparkan-cli --offline accepts_json_format_option archive_json_has_schema_version
-S0-GL-001	covered	cargo test -p fparkan-platform-sdl -p fparkan-render-gl --offline adapter_boundary_is_project_owned_unsafe_free
+S0-GL-001	covered	cargo test -p fparkan-render-vulkan --offline backend_tracks_render_request_and_presents
 S0-LIMIT-001	covered	cargo test -p fparkan-binary --offline rejects_count_stride_overflow
 S0-LIMIT-002	covered	cargo test -p fparkan-binary --offline rejects_oversized_declared_allocation_before_read
 L1-P1-NRES-001	covered	cargo test -p fparkan-nres --offline licensed_corpora_nres_roundtrip_gates
@@ -71,6 +71,8 @@ S1-PATH-005	covered	cargo test -p fparkan-path --offline rejects_escape
 S1-PATH-006	covered	cargo test -p fparkan-path --offline rejects_absolute_drive_and_nul_paths
 S1-PATH-007	covered	cargo test -p fparkan-path --offline join_under_keeps_normalized_path_below_root
 S1-PATH-008	covered	cargo test -p fparkan-path --offline original_separators_and_raw_bytes_are_preserved
+S1-H02	covered	cargo test -p fparkan-path --offline accepts_non_utf8_legacy_bytes
+S1-M01	covered	cargo test -p fparkan-vfs --offline memory_vfs_list_prefix_is_boundary_safe
 S1-RSLI-001	covered	cargo test -p fparkan-rsli --offline parses_minimal_empty_library
 S1-RSLI-002	covered	cargo test -p fparkan-rsli --offline rejects_invalid_header_fields
 S1-RSLI-003	covered	cargo test -p fparkan-rsli --offline rejects_entry_table_bounds
@@ -222,7 +224,7 @@ S3-RENDER-008	covered	cargo test -p fparkan-render --offline recording_backend_s
 S3-RENDER-009	covered	cargo xtask policy
 S3-GL-001	omitted	permanent macOS Desktop GL 3.3 adapter is not implemented; historical CGL probe is retained as external evidence only
 S3-GL-002	omitted	outside the current macOS-focused goal scope; GLES2 remains documented for portable/non-macOS targets
-S3-GL-003	covered	cargo test -p fparkan-render-gl --offline shader_compile_failure_diagnostic_contains_profile_and_log
+S3-GL-003	blocked	legacy fparkan-render-gl adapter removed while Vulkan renderer path is being brought in as the stage-3 backend
 S3-VIEWER-001	covered	cargo test -p fparkan-viewer --offline model_fixture_uses_viewer_service_and_render_commands
 S4-ANIM-001	covered	cargo test -p fparkan-animation --offline anim_key24_decodes_signed_quaternion
 S4-ANIM-002	covered	cargo test -p fparkan-animation --offline frame_map_decodes_u16_and_uses_attr_frame_count

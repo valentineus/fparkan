@@ -1,23 +1,17 @@
 [package]
-name = "fparkan-assets"
+name = "fparkan-inspection"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
-fparkan-material = { path = "../fparkan-material" }
 fparkan-msh = { path = "../fparkan-msh" }
 fparkan-nres = { path = "../fparkan-nres" }
-fparkan-path = { path = "../fparkan-path" }
-fparkan-mission-format = { path = "../fparkan-mission-format" }
-fparkan-prototype = { path = "../fparkan-prototype" }
+fparkan-rsli = { path = "../fparkan-rsli" }
 fparkan-resource = { path = "../fparkan-resource" }
-fparkan-texm = { path = "../fparkan-texm" }
-fparkan-terrain = { path = "../fparkan-terrain" }
 fparkan-terrain-format = { path = "../fparkan-terrain-format" }
-
-[dev-dependencies]
+fparkan-texm = { path = "../fparkan-texm" }
 fparkan-vfs = { path = "../fparkan-vfs" }
 
 [lints]

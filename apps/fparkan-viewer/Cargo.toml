@@ -6,14 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-fparkan-msh = { path = "../../crates/fparkan-msh" }
-fparkan-nres = { path = "../../crates/fparkan-nres" }
-fparkan-resource = { path = "../../crates/fparkan-resource" }
+fparkan-inspection = { path = "../../crates/fparkan-inspection" }
 fparkan-render = { path = "../../crates/fparkan-render" }
-fparkan-rsli = { path = "../../crates/fparkan-rsli" }
-fparkan-terrain-format = { path = "../../crates/fparkan-terrain-format" }
-fparkan-texm = { path = "../../crates/fparkan-texm" }
-fparkan-vfs = { path = "../../crates/fparkan-vfs" }
 
 [lints]
 workspace = true

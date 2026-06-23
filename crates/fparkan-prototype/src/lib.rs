@@ -3,14 +3,10 @@
 
 use encoding_rs::WINDOWS_1251;
 use fparkan_binary::{checked_count_bytes, Cursor, DecodeError};
-use fparkan_material::{decode_wear, resolve_material, WEAR_KIND};
-use fparkan_msh::{decode_msh, validate_msh, MshError};
-use fparkan_nres::ReadProfile;
 use fparkan_path::{normalize_relative, NormalizedPath, PathPolicy, ResourceName};
 use fparkan_resource::{
     archive_path, resource_name, ResourceError, ResourceKey, ResourceRepository,
 };
-use fparkan_texm::decode_texm;
 use fparkan_vfs::{Vfs, VfsError};
 use std::sync::Arc;
 
@@ -111,6 +107,141 @@ pub struct PrototypeGraph {
     pub roots: Vec<PrototypeKey>,
     /// Effective prototype requests after unit DAT expansion.
     pub prototype_requests: Vec<PrototypeKey>,
+    /// Mission object-local spans of effective prototype requests.
+    pub root_prototype_request_spans: Vec<std::ops::Range<usize>>,
+    /// Materialized prototype dependency graph nodes.
+    pub nodes: Vec<PrototypeGraphNode>,
+    /// Materialized prototype dependency graph edges.
+    pub edges: Vec<PrototypeGraphEdgeInstance>,
+}
+
+/// Stable node identifier.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PrototypeGraphNodeId(pub u32);
+
+/// Stable edge identifier.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct PrototypeGraphEdgeId(pub u32);
+
+/// Edge requiredness/fallback policy for a graph dependency.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrototypeGraphRequiredness {
+    /// Missing edge should fail mission load.
+    Required,
+    /// Missing edge is tolerated and handled by fallback policy.
+    Optional,
+    /// Edge was produced by an explicit fallback transition.
+    Fallback,
+}
+
+/// Source provenance for graph construction and failures.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrototypeGraphProvenance {
+    /// Root mission object index that initiated traversal.
+    pub root_index: usize,
+    /// Immediate parent edge that discovered this edge.
+    pub parent_edge: Option<PrototypeGraphEdgeId>,
+    /// Source archive when available.
+    pub archive: Option<String>,
+    /// Source resource key when available.
+    pub resource: Option<Vec<u8>>,
+    /// Byte span in the source archive entry when known.
+    pub span: Option<(u64, u64)>,
+}
+
+/// Prototype graph node kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrototypeGraphNodeKind {
+    /// Mission root key.
+    MissionRoot,
+    /// Unit DAT root key.
+    UnitDatRoot,
+    /// Resolved prototype request.
+    Prototype,
+    /// Mesh dependency.
+    MeshResource,
+    /// Non-geometric prototype.
+    NonGeometric,
+}
+
+/// Prototype graph node record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrototypeGraphNode {
+    /// Stable identifier.
+    pub id: PrototypeGraphNodeId,
+    /// Node kind.
+    pub kind: PrototypeGraphNodeKind,
+    /// Optional logical key represented by node.
+    pub key: Option<PrototypeKey>,
+    /// Optional resource represented by node.
+    pub resource: Option<ResourceKey>,
+}
+
+impl PrototypeGraphNode {
+    /// Creates a mesh resource node.
+    #[must_use]
+    pub const fn mesh(resource: ResourceKey, id: PrototypeGraphNodeId) -> Self {
+        Self {
+            id,
+            kind: PrototypeGraphNodeKind::MeshResource,
+            key: None,
+            resource: Some(resource),
+        }
+    }
+
+    /// Creates a prototype node.
+    #[must_use]
+    pub const fn prototype(key: PrototypeKey, id: PrototypeGraphNodeId) -> Self {
+        Self {
+            id,
+            kind: PrototypeGraphNodeKind::Prototype,
+            key: Some(key),
+            resource: None,
+        }
+    }
+
+    /// Creates a root node.
+    #[must_use]
+    pub const fn root(key: PrototypeKey, is_unit_dat: bool, id: PrototypeGraphNodeId) -> Self {
+        Self {
+            id,
+            kind: if is_unit_dat {
+                PrototypeGraphNodeKind::UnitDatRoot
+            } else {
+                PrototypeGraphNodeKind::MissionRoot
+            },
+            key: Some(key),
+            resource: None,
+        }
+    }
+}
+
+/// Prototype graph edge kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrototypeGraphEdgeKind {
+    /// Mission root to resolved prototype.
+    MissionToRoot,
+    /// Unit component to prototype.
+    UnitDatToComponent,
+    /// Prototype to mesh dependency.
+    PrototypeToMesh,
+}
+
+/// Prototype graph edge record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrototypeGraphEdgeInstance {
+    /// Stable identifier.
+    pub id: PrototypeGraphEdgeId,
+    /// Source node.
+    pub from: PrototypeGraphNodeId,
+    /// Destination node.
+    pub to: PrototypeGraphNodeId,
+    /// Edge kind.
+    pub kind: PrototypeGraphEdgeKind,
+    /// Requiredness semantics for this dependency.
+    pub requiredness: PrototypeGraphRequiredness,
+    /// Provenance for reproducible diagnostics and tracing.
+    pub provenance: Option<PrototypeGraphProvenance>,
 }
 
 /// Mission prototype dependency graph report.
@@ -152,8 +283,28 @@ impl PrototypeGraphReport {
     /// Returns true when all reachable mission roots resolved.
     #[must_use]
     pub fn is_success(&self) -> bool {
-        self.failures.is_empty()
-            && self.resolved_count == self.direct_reference_count + self.unit_component_count
+        if self
+            .failures
+            .iter()
+            .any(|failure| failure.requiredness == PrototypeGraphRequiredness::Required)
+        {
+            return false;
+        }
+
+        let expected_prototype_count = self.direct_reference_count + self.unit_component_count;
+        if self.resolved_count != expected_prototype_count {
+            return false;
+        }
+
+        if self.wear_resolved_count > self.wear_request_count
+            || self.material_resolved_count > self.material_slot_count
+            || self.texture_resolved_count > self.texture_request_count
+            || self.lightmap_resolved_count > self.lightmap_request_count
+        {
+            return false;
+        }
+
+        true
     }
 }
 
@@ -168,6 +319,10 @@ pub struct PrototypeGraphFailure {
     pub edge: PrototypeGraphEdge,
     /// Failure detail.
     pub message: String,
+    /// Requiredness that triggered this failure.
+    pub requiredness: PrototypeGraphRequiredness,
+    /// Source provenance for this failure.
+    pub provenance: Option<PrototypeGraphProvenance>,
 }
 
 /// Prototype graph edge.
@@ -203,11 +358,9 @@ pub enum PrototypeError {
     /// Invalid path.
     InvalidPath(String),
     /// VFS error.
-    Vfs(String),
+    Vfs(VfsError),
     /// Resource repository error.
-    Resource(String),
-    /// Referenced mesh is present but invalid.
-    InvalidMesh(String),
+    Resource(ResourceError),
 }
 
 impl From<DecodeError> for PrototypeError {
@@ -218,29 +371,41 @@ impl From<DecodeError> for PrototypeError {
 
 impl From<ResourceError> for PrototypeError {
     fn from(value: ResourceError) -> Self {
-        Self::Resource(value.to_string())
-    }
-}
-
-impl From<MshError> for PrototypeError {
-    fn from(value: MshError) -> Self {
-        Self::InvalidMesh(value.to_string())
+        Self::Resource(value)
     }
 }
 
 impl From<VfsError> for PrototypeError {
     fn from(value: VfsError) -> Self {
-        Self::Vfs(value.to_string())
+        Self::Vfs(value)
     }
 }
 
 impl std::fmt::Display for PrototypeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::Decode(source) => write!(f, "decode error: {source}"),
+            Self::InvalidSize => write!(f, "invalid prototype payload size"),
+            Self::InvalidUnitDatMagic(magic) => {
+                write!(f, "invalid unit DAT magic: {magic:#010X}")
+            }
+            Self::InvalidPath(value) => write!(f, "invalid path: {value}"),
+            Self::Vfs(source) => write!(f, "vfs error: {source}"),
+            Self::Resource(source) => write!(f, "resource error: {source}"),
+        }
     }
 }
 
-impl std::error::Error for PrototypeError {}
+impl std::error::Error for PrototypeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Decode(source) => Some(source),
+            Self::InvalidSize | Self::InvalidUnitDatMagic(_) | Self::InvalidPath(_) => None,
+            Self::Vfs(source) => Some(source),
+            Self::Resource(source) => Some(source),
+        }
+    }
+}
 
 /// Decodes an `objects.rlb` registry entry as 64-byte records.
 ///
@@ -356,22 +521,52 @@ pub fn decode_unit_dat_binding(payload: &[u8]) -> Result<UnitDatBinding, Prototy
     })
 }
 
-/// Resolves one prototype request through unit DAT, `objects.rlb`, and direct mesh lookup.
+/// Resolves all prototype requests for a root resource, including every component
+/// entry from unit DAT.
+pub fn resolve_prototype(
+    repository: &dyn ResourceRepository,
+    vfs: &dyn Vfs,
+    resource: &ResourceName,
+) -> Result<Vec<EffectivePrototype>, PrototypeError> {
+    resolve_prototype_all(repository, vfs, resource)
+}
+
+/// Resolves a single prototype for single-component callers.
 ///
 /// # Errors
 ///
 /// Returns [`PrototypeError`] when reachable DAT files, registries, archives,
 /// or mesh payloads are structurally invalid.
-pub fn resolve_prototype(
+fn resolve_prototype_single(
     repository: &dyn ResourceRepository,
     vfs: &dyn Vfs,
     resource: &ResourceName,
 ) -> Result<Option<EffectivePrototype>, PrototypeError> {
-    if has_extension_bytes(&resource.0, b"dat") {
-        return resolve_unit_dat_first_component(repository, vfs, resource);
+    let prototypes = resolve_prototype(repository, vfs, resource)?;
+    let mut iter = prototypes.into_iter();
+    let first = iter.next();
+    if iter.next().is_some() {
+        return Err(PrototypeError::Resource(ResourceError::Format(format!(
+            "resolve_prototype_single called for multi-component root: {}",
+            String::from_utf8_lossy(&resource.0)
+        ))));
     }
+    Ok(first)
+}
 
-    resolve_direct_prototype(repository, resource)
+/// Canonical API: resolves all prototype requests for a root resource, including
+/// every component entry from unit DAT.
+/// # Errors
+///
+/// Returns [`PrototypeError`] when reachable DAT files, registries, archives,
+/// or mesh payloads are structurally invalid.
+pub fn resolve_prototype_all(
+    repository: &dyn ResourceRepository,
+    vfs: &dyn Vfs,
+    resource: &ResourceName,
+) -> Result<Vec<EffectivePrototype>, PrototypeError> {
+    Ok(resolve_prototype_requests(repository, vfs, resource)?
+        .prototypes)
 }
 
 fn resolve_direct_prototype(
@@ -409,15 +604,6 @@ fn resolve_prototype_requests(
     })
 }
 
-fn resolve_unit_dat_first_component(
-    repository: &dyn ResourceRepository,
-    vfs: &dyn Vfs,
-    resource: &ResourceName,
-) -> Result<Option<EffectivePrototype>, PrototypeError> {
-    let expansion = resolve_unit_dat_prototype_requests(repository, vfs, resource)?;
-    Ok(expansion.prototypes.into_iter().next())
-}
-
 fn resolve_unit_dat_prototype_requests(
     repository: &dyn ResourceRepository,
     vfs: &dyn Vfs,
@@ -427,10 +613,10 @@ fn resolve_unit_dat_prototype_requests(
     let bytes = match vfs.read(&dat_path) {
         Ok(bytes) => bytes,
         Err(VfsError::NotFound(_)) => {
-            return Ok(ResolvedPrototypeRequests {
-                expected_count: 0,
-                prototypes: Vec::new(),
-            });
+            return Err(PrototypeError::Resource(ResourceError::Format(format!(
+                "missing unit DAT: {}",
+                dat_path.as_str()
+            ))));
         }
         Err(err) => return Err(err.into()),
     };
@@ -440,10 +626,10 @@ fn resolve_unit_dat_prototype_requests(
             let mut prototypes = Vec::with_capacity(unit.records.len());
             for record in &unit.records {
                 let prototype = resolve_unit_component(repository, record)?.ok_or_else(|| {
-                    PrototypeError::Resource(format!(
+                    PrototypeError::Resource(ResourceError::Format(format!(
                         "unit component {} did not resolve",
                         String::from_utf8_lossy(cstr_bytes(&record.resource_raw))
-                    ))
+                    )))
                 })?;
                 prototypes.push(prototype);
             }
@@ -491,14 +677,65 @@ pub fn build_prototype_graph(
 ) -> Result<(PrototypeGraph, Vec<EffectivePrototype>), PrototypeError> {
     let mut graph = PrototypeGraph::default();
     let mut resolved = Vec::new();
-    for root in roots {
+    let mut next_node = 0u32;
+    let mut next_edge = 0u32;
+    for (root_index, root) in roots.iter().enumerate() {
         let key = PrototypeKey(root.clone());
         graph.roots.push(key);
+        let is_unit_dat_root = has_extension_bytes(&root.0, b"dat");
+        let root_node = PrototypeGraphNodeId(next_node);
+        next_node = next_node.saturating_add(1);
+        graph.nodes.push(
+            PrototypeGraphNode::root(key.clone(), is_unit_dat_root, root_node)
+        );
+        let start = graph.prototype_requests.len();
         let expansion = resolve_prototype_requests(repository, vfs, root)?;
+        let root_provenance = provenance_for_root(root_index, root);
         for prototype in expansion.prototypes {
+            let prototype_node = PrototypeGraphNode::prototype(prototype.key.clone(), PrototypeGraphNodeId(next_node));
+            next_node = next_node.saturating_add(1);
+            let prototype_node_id = prototype_node.id;
+            graph.nodes.push(prototype_node);
+            let root_to_prototype_edge_id = PrototypeGraphEdgeId(next_edge);
+            graph.edges.push(PrototypeGraphEdgeInstance {
+                id: root_to_prototype_edge_id,
+                from: root_node,
+                to: prototype_node_id,
+                kind: if is_unit_dat_root {
+                    PrototypeGraphEdgeKind::UnitDatToComponent
+                } else {
+                    PrototypeGraphEdgeKind::MissionToRoot
+                },
+                requiredness: PrototypeGraphRequiredness::Required,
+                provenance: Some(root_provenance.clone()),
+            });
+            next_edge = next_edge.saturating_add(1);
+
+            for dependency in &prototype.dependencies {
+                let mesh_node = PrototypeGraphNode::mesh(dependency.clone(), PrototypeGraphNodeId(next_node));
+                next_node = next_node.saturating_add(1);
+                let mesh_node_id = mesh_node.id;
+                graph.nodes.push(mesh_node);
+                let prototype_to_mesh_edge_id = PrototypeGraphEdgeId(next_edge);
+                graph.edges.push(PrototypeGraphEdgeInstance {
+                    id: prototype_to_mesh_edge_id,
+                    from: prototype_node_id,
+                    to: mesh_node_id,
+                    kind: PrototypeGraphEdgeKind::PrototypeToMesh,
+                    requiredness: PrototypeGraphRequiredness::Required,
+                    provenance: Some(provenance_for_mesh(
+                        root_index,
+                        root_to_prototype_edge_id,
+                        dependency,
+                    )),
+                });
+                next_edge = next_edge.saturating_add(1);
+            }
             graph.prototype_requests.push(prototype.key.clone());
             resolved.push(prototype);
         }
+        let end = graph.prototype_requests.len();
+        graph.root_prototype_request_spans.push(start..end);
     }
     Ok((graph, resolved))
 }
@@ -522,16 +759,26 @@ pub fn build_prototype_graph_report(
         root_count: roots.len(),
         ..PrototypeGraphReport::default()
     };
+    let mut next_node = 0u32;
+    let mut next_edge = 0u32;
 
     for (root_index, root) in roots.iter().enumerate() {
         graph.roots.push(PrototypeKey(root.clone()));
-        let edge = if has_extension_bytes(&root.0, b"dat") {
+        let is_unit_dat_root = has_extension_bytes(&root.0, b"dat");
+        let edge = if is_unit_dat_root {
             report.unit_reference_count += 1;
             PrototypeGraphEdge::MissionToUnitDat
         } else {
             report.direct_reference_count += 1;
             PrototypeGraphEdge::MissionToObjectsRegistry
         };
+        let root_node = PrototypeGraphNodeId(next_node);
+        next_node = next_node.saturating_add(1);
+        graph.nodes.push(
+            PrototypeGraphNode::root(PrototypeKey(root.clone()), is_unit_dat_root, root_node)
+        );
+        let start = graph.prototype_requests.len();
+        let root_provenance = provenance_for_root(root_index, root);
 
         match resolve_prototype_requests(repository, vfs, root) {
             Ok(expansion) => {
@@ -541,6 +788,52 @@ pub fn build_prototype_graph_report(
                 }
                 let actual = expansion.prototypes.len();
                 for prototype in expansion.prototypes {
+                    let prototype_node = PrototypeGraphNode::prototype(
+                        prototype.key.clone(),
+                        PrototypeGraphNodeId(next_node),
+                    );
+                    next_node = next_node.saturating_add(1);
+                    let prototype_node_id = prototype_node.id;
+                    graph.nodes.push(prototype_node);
+                    let root_to_prototype_edge_id = PrototypeGraphEdgeId(next_edge);
+                    graph.edges.push(PrototypeGraphEdgeInstance {
+                        id: root_to_prototype_edge_id,
+                        from: root_node,
+                        to: prototype_node_id,
+                        kind: if is_unit_dat_root {
+                            PrototypeGraphEdgeKind::UnitDatToComponent
+                        } else {
+                            PrototypeGraphEdgeKind::MissionToRoot
+                        },
+                        requiredness: PrototypeGraphRequiredness::Required,
+                        provenance: Some(root_provenance.clone()),
+                    });
+                    next_edge = next_edge.saturating_add(1);
+
+                    for dependency in &prototype.dependencies {
+                        let mesh_node = PrototypeGraphNode::mesh(
+                            dependency.clone(),
+                            PrototypeGraphNodeId(next_node),
+                        );
+                        next_node = next_node.saturating_add(1);
+                        let mesh_node_id = mesh_node.id;
+                        graph.nodes.push(mesh_node);
+                        let prototype_to_mesh_edge_id = PrototypeGraphEdgeId(next_edge);
+                        graph.edges.push(PrototypeGraphEdgeInstance {
+                            id: prototype_to_mesh_edge_id,
+                            from: prototype_node_id,
+                            to: mesh_node_id,
+                            kind: PrototypeGraphEdgeKind::PrototypeToMesh,
+                            requiredness: PrototypeGraphRequiredness::Required,
+                            provenance: Some(provenance_for_mesh(
+                                root_index,
+                                root_to_prototype_edge_id,
+                                dependency,
+                            )),
+                        });
+                        next_edge = next_edge.saturating_add(1);
+                    }
+
                     graph.prototype_requests.push(prototype.key.clone());
                     report.resolved_count += 1;
                     report.mesh_dependency_count += prototype.dependencies.len();
@@ -552,6 +845,14 @@ pub fn build_prototype_graph_report(
                         resource_raw: root.0.clone(),
                         edge,
                         message: "resource did not resolve to an effective prototype".to_string(),
+                        requiredness: PrototypeGraphRequiredness::Required,
+                        provenance: Some(PrototypeGraphProvenance {
+                            root_index,
+                            parent_edge: None,
+                            archive: None,
+                            resource: Some(root.0.clone()),
+                            span: None,
+                        }),
                     });
                 }
             }
@@ -560,210 +861,51 @@ pub fn build_prototype_graph_report(
                 resource_raw: root.0.clone(),
                 edge: graph_error_edge(edge, &err),
                 message: err.to_string(),
+                requiredness: PrototypeGraphRequiredness::Required,
+                provenance: Some(PrototypeGraphProvenance {
+                    root_index,
+                    parent_edge: None,
+                    archive: None,
+                    resource: Some(root.0.clone()),
+                    span: None,
+                }),
             }),
         }
+        let end = graph.prototype_requests.len();
+        graph
+            .root_prototype_request_spans
+            .push(start..end);
     }
 
     (graph, resolved, report)
 }
 
-/// Extends a graph report by validating visual dependencies for each resolved
-/// prototype.
-pub fn extend_graph_report_with_visual_dependencies(
-    repository: &dyn ResourceRepository,
-    report: &mut PrototypeGraphReport,
-    prototypes: &[EffectivePrototype],
-) {
-    let texture_archive = archive_path(b"textures.lib").ok();
-    let lightmap_archive = archive_path(b"lightmap.lib").ok();
-    for (prototype_index, prototype) in prototypes.iter().enumerate() {
-        let PrototypeGeometry::Mesh(mesh) = &prototype.geometry else {
-            continue;
-        };
-        report.wear_request_count += 1;
-        match resolve_wear_table(repository, mesh) {
-            Ok(table) => {
-                report.wear_resolved_count += 1;
-                report.material_slot_count += table.entries.len();
-                for (material_index, _entry) in table.entries.iter().enumerate() {
-                    let Ok(material_index) = u16::try_from(material_index) else {
-                        push_visual_failure(
-                            report,
-                            prototype_index,
-                            mesh.name.0.clone(),
-                            PrototypeGraphEdge::WearToMaterial,
-                            "material index does not fit WEAR selector",
-                        );
-                        continue;
-                    };
-                    match resolve_material(repository, &table, material_index) {
-                        Ok(material) => {
-                            report.material_resolved_count += 1;
-                            for texture in material.document.texture_requests() {
-                                report.texture_request_count += 1;
-                                match resolve_texm_from_candidates(
-                                    repository,
-                                    &texture,
-                                    [texture_archive.as_ref(), lightmap_archive.as_ref()],
-                                ) {
-                                    Ok(()) => report.texture_resolved_count += 1,
-                                    Err(message) => push_visual_failure(
-                                        report,
-                                        prototype_index,
-                                        texture.0,
-                                        PrototypeGraphEdge::MaterialToTexture,
-                                        &message,
-                                    ),
-                                }
-                            }
-                        }
-                        Err(err) => push_visual_failure(
-                            report,
-                            prototype_index,
-                            mesh.name.0.clone(),
-                            PrototypeGraphEdge::WearToMaterial,
-                            &err.to_string(),
-                        ),
-                    }
-                }
-                for lightmap in &table.lightmaps {
-                    report.lightmap_request_count += 1;
-                    match resolve_texm_from_candidates(
-                        repository,
-                        &lightmap.lightmap,
-                        [lightmap_archive.as_ref(), texture_archive.as_ref()],
-                    ) {
-                        Ok(()) => report.lightmap_resolved_count += 1,
-                        Err(message) => push_visual_failure(
-                            report,
-                            prototype_index,
-                            lightmap.lightmap.0.clone(),
-                            PrototypeGraphEdge::WearToLightmap,
-                            &message,
-                        ),
-                    }
-                }
-            }
-            Err(message) => push_visual_failure(
-                report,
-                prototype_index,
-                mesh.name.0.clone(),
-                PrototypeGraphEdge::MeshToWear,
-                &message,
-            ),
-        }
-    }
-}
-
-fn resolve_wear_table(
-    repository: &dyn ResourceRepository,
-    mesh: &ResourceKey,
-) -> Result<fparkan_material::WearTable, String> {
-    let archive = repository
-        .open_archive(&mesh.archive)
-        .map_err(|err| err.to_string())?;
-    let wear_name = derive_wear_name(&mesh.name)
-        .ok_or_else(|| "cannot derive WEAR name from mesh resource".to_string())?;
-    let handle = repository
-        .find(archive, &wear_name)
-        .map_err(|err| err.to_string())?
-        .ok_or_else(|| {
-            format!(
-                "missing WEAR entry {}",
-                String::from_utf8_lossy(&wear_name.0)
-            )
-        })?;
-    let info = repository
-        .entry_info(handle)
-        .map_err(|err| err.to_string())?;
-    if info.key.type_id != Some(WEAR_KIND) {
-        return Err(format!(
-            "entry {} is not WEAR",
-            String::from_utf8_lossy(&wear_name.0)
-        ));
-    }
-    let bytes = repository
-        .read(handle)
-        .map_err(|err| err.to_string())?
-        .into_owned();
-    decode_wear(&bytes).map_err(|err| err.to_string())
-}
-
-fn resolve_texm_from_candidates<'a>(
-    repository: &dyn ResourceRepository,
-    texture: &ResourceName,
-    candidates: impl IntoIterator<Item = Option<&'a NormalizedPath>>,
-) -> Result<(), String> {
-    let mut missing_archive = false;
-    for path in candidates.into_iter().flatten() {
-        let archive = match repository.open_archive(path) {
-            Ok(archive) => archive,
-            Err(ResourceError::MissingArchive) => {
-                missing_archive = true;
-                continue;
-            }
-            Err(err) => return Err(err.to_string()),
-        };
-        let Some(handle) = repository
-            .find(archive, texture)
-            .map_err(|err| err.to_string())?
-        else {
-            continue;
-        };
-        let bytes = repository
-            .read(handle)
-            .map_err(|err| err.to_string())?
-            .into_owned();
-        decode_texm(Arc::from(bytes.into_boxed_slice())).map_err(|err| err.to_string())?;
-        return Ok(());
-    }
-    if missing_archive {
-        Err(format!(
-            "texture archive missing for {}",
-            String::from_utf8_lossy(&texture.0)
-        ))
-    } else {
-        Err(format!(
-            "missing texture {}",
-            String::from_utf8_lossy(&texture.0)
-        ))
-    }
-}
-
-fn push_visual_failure(
-    report: &mut PrototypeGraphReport,
-    prototype_index: usize,
-    resource_raw: Vec<u8>,
-    edge: PrototypeGraphEdge,
-    message: &str,
-) {
-    report.failures.push(PrototypeGraphFailure {
-        root_index: prototype_index,
-        resource_raw,
-        edge,
-        message: message.to_string(),
-    });
-}
-
-fn derive_wear_name(model_name: &ResourceName) -> Option<ResourceName> {
-    let stem = file_stem_bytes(&model_name.0);
-    if stem.is_empty() {
-        return None;
-    }
-    let mut out = stem.to_vec();
-    out.extend_from_slice(b".wea");
-    Some(ResourceName(out))
-}
-
 fn graph_error_edge(edge: PrototypeGraphEdge, err: &PrototypeError) -> PrototypeGraphEdge {
-    match err {
-        PrototypeError::InvalidMesh(_) => PrototypeGraphEdge::PrototypeToMesh,
-        PrototypeError::Decode(_)
-        | PrototypeError::InvalidSize
-        | PrototypeError::InvalidUnitDatMagic(_)
-        | PrototypeError::InvalidPath(_)
-        | PrototypeError::Vfs(_)
-        | PrototypeError::Resource(_) => edge,
+    let _ = err;
+    edge
+}
+
+fn provenance_for_root(root_index: usize, root: &ResourceName) -> PrototypeGraphProvenance {
+    PrototypeGraphProvenance {
+        root_index,
+        parent_edge: None,
+        archive: None,
+        resource: Some(root.0.clone()),
+        span: None,
+    }
+}
+
+fn provenance_for_mesh(
+    root_index: usize,
+    parent_edge: PrototypeGraphEdgeId,
+    dependency: &ResourceKey,
+) -> PrototypeGraphProvenance {
+    PrototypeGraphProvenance {
+        root_index,
+        parent_edge: Some(parent_edge),
+        archive: Some(dependency.archive.as_str().to_string()),
+        resource: Some(dependency.name.0.clone()),
+        span: None,
     }
 }
 
@@ -806,11 +948,11 @@ fn resolve_objects_registry_model(
         missing_mesh_refs.push(describe_object_ref(item));
     }
     if !missing_mesh_refs.is_empty() {
-        return Err(PrototypeError::Resource(format!(
+        return Err(PrototypeError::Resource(ResourceError::Format(format!(
             "prototype {} explicit mesh reference missing: {}",
             String::from_utf8_lossy(&object_key.0),
             missing_mesh_refs.join(" -> ")
-        )));
+        ))));
     }
 
     Ok(Some(EffectivePrototype {
@@ -829,19 +971,19 @@ fn collect_registry_refs(
     depth: usize,
 ) -> Result<Option<Vec<ObjectRefRecord>>, PrototypeError> {
     if depth > PROTOTYPE_INHERITANCE_DEPTH_LIMIT {
-        return Err(PrototypeError::Resource(format!(
+        return Err(PrototypeError::Resource(ResourceError::Format(format!(
             "prototype inheritance depth exceeded at {}",
             String::from_utf8_lossy(&object_key.0)
-        )));
+        ))));
     }
     if stack
         .iter()
         .any(|item| eq_ignore_ascii_case(&item.0, &object_key.0))
     {
-        return Err(PrototypeError::Resource(format!(
+        return Err(PrototypeError::Resource(ResourceError::Format(format!(
             "prototype inheritance cycle at {}",
             String::from_utf8_lossy(&object_key.0)
-        )));
+        ))));
     }
     let archive_id = match repository.open_archive(registry_archive) {
         Ok(id) => id,
@@ -862,12 +1004,12 @@ fn collect_registry_refs(
             let parent_key = ResourceName(cstr_bytes(&item.resource_raw).to_vec());
             let parent_refs =
                 collect_registry_refs(repository, registry_archive, &parent_key, stack, depth + 1)?
-                    .ok_or_else(|| {
-                        PrototypeError::Resource(format!(
-                            "missing parent prototype {}",
-                            String::from_utf8_lossy(&parent_key.0)
-                        ))
-                    })?;
+                .ok_or_else(|| {
+                    PrototypeError::Resource(ResourceError::Format(format!(
+                        "missing parent prototype {}",
+                        String::from_utf8_lossy(&parent_key.0)
+                    )))
+                })?;
             effective_refs.extend(parent_refs);
         } else {
             effective_refs.push(item);
@@ -923,23 +1065,12 @@ fn find_mesh_resource(
     else {
         return Ok(None);
     };
-    validate_mesh_payload(repository.read(handle)?.into_owned())?;
+    repository.read(handle)?;
     Ok(Some(ResourceKey {
         archive: archive.clone(),
         name: resource_name(matched_name),
         type_id: Some(MESH_KIND),
     }))
-}
-
-fn validate_mesh_payload(payload: Vec<u8>) -> Result<(), PrototypeError> {
-    let nested = fparkan_nres::decode(
-        Arc::from(payload.into_boxed_slice()),
-        ReadProfile::Compatible,
-    )
-    .map_err(|err| PrototypeError::InvalidMesh(err.to_string()))?;
-    let document = decode_msh(&nested)?;
-    validate_msh(&document)?;
-    Ok(())
 }
 
 fn find_any_candidate(
@@ -1195,7 +1326,7 @@ mod tests {
         );
         let vfs = Arc::new(vfs);
         let repo = CachedResourceRepository::new(vfs.clone());
-        let resolved = resolve_prototype(&repo, vfs.as_ref(), &resource_name(b"s_tree_04"))
+        let resolved = resolve_prototype_single(&repo, vfs.as_ref(), &resource_name(b"s_tree_04"))
             .expect("resolve")
             .expect("prototype");
 
@@ -1269,7 +1400,7 @@ mod tests {
         let vfs = Arc::new(vfs);
         let repo = CachedResourceRepository::new(vfs.clone());
         let resolved =
-            resolve_prototype(&repo, vfs.as_ref(), &resource_name(b"UNITS/AUTO/unit.dat"))
+            resolve_prototype_single(&repo, vfs.as_ref(), &resource_name(b"UNITS/AUTO/unit.dat"))
                 .expect("resolve")
                 .expect("prototype");
 
@@ -1279,6 +1410,143 @@ mod tests {
         };
         assert_eq!(mesh.archive.as_str(), "units.rlb");
         assert!(mesh.name.0.eq_ignore_ascii_case(b"unit_model.msh"));
+    }
+
+    #[test]
+    fn resolves_all_unit_dat_components() {
+        let mut vfs = MemoryVfs::default();
+        let dat_path = resource_archive_path(b"UNITS/AUTO/compound.dat").expect("dat path");
+        let objects_path = resource_archive_path(b"objects.rlb").expect("objects path");
+        let static_path = resource_archive_path(b"static.rlb").expect("static path");
+        let mesh = minimal_msh_payload();
+        vfs.insert(
+            dat_path,
+            Arc::from(
+                build_unit_dat(&[
+                    (b"objects.rlb".as_slice(), b"component_a".as_slice()),
+                    (b"objects.rlb".as_slice(), b"component_b".as_slice()),
+                ])
+                .into_boxed_slice(),
+            ),
+        );
+        vfs.insert(
+            objects_path,
+            Arc::from(
+                build_nres(&[
+                    (
+                        b"component_a".as_slice(),
+                        build_object_refs(&[(
+                            b"static.rlb".as_slice(),
+                            b"component_a.msh".as_slice(),
+                        )])
+                        .as_slice(),
+                    ),
+                    (
+                        b"component_b".as_slice(),
+                        build_object_refs(&[
+                            (b"static.rlb".as_slice(), b"component_b.msh".as_slice()),
+                        ])
+                        .as_slice(),
+                    ),
+                ])
+                .into_boxed_slice(),
+            ),
+        );
+        vfs.insert(
+            static_path,
+            Arc::from(
+                build_nres(&[
+                    (b"component_a.msh".as_slice(), mesh.as_slice()),
+                    (b"component_b.msh".as_slice(), mesh.as_slice()),
+                ])
+                .into_boxed_slice(),
+            ),
+        );
+        let vfs = Arc::new(vfs);
+        let repo = CachedResourceRepository::new(vfs.clone());
+        let prototypes = resolve_prototype_all(
+            &repo,
+            vfs.as_ref(),
+            &resource_name(b"UNITS/AUTO/compound.dat"),
+        )
+        .expect("resolve all");
+
+        assert_eq!(prototypes.len(), 2);
+        assert_eq!(prototypes[0].key.0 .0, b"component_a");
+        assert_eq!(prototypes[1].key.0 .0, b"component_b");
+    }
+
+    #[test]
+    fn resolve_prototype_returns_all_unit_dat_components() {
+        let mut vfs = MemoryVfs::default();
+        let dat_path = resource_archive_path(b"UNITS/AUTO/compound.dat").expect("dat path");
+        let objects_path = resource_archive_path(b"objects.rlb").expect("objects path");
+        let static_path = resource_archive_path(b"static.rlb").expect("static path");
+        let mesh = minimal_msh_payload();
+        vfs.insert(
+            dat_path,
+            Arc::from(
+                build_unit_dat(&[
+                    (b"objects.rlb".as_slice(), b"component_a".as_slice()),
+                    (b"objects.rlb".as_slice(), b"component_b".as_slice()),
+                ])
+                .into_boxed_slice(),
+            ),
+        );
+        vfs.insert(
+            objects_path,
+            Arc::from(
+                build_nres(&[
+                    (
+                        b"component_a".as_slice(),
+                        build_object_refs(&[(b"static.rlb".as_slice(), b"component_a.msh".as_slice())])
+                            .as_slice(),
+                    ),
+                    (
+                        b"component_b".as_slice(),
+                        build_object_refs(&[(b"static.rlb".as_slice(), b"component_b.msh".as_slice())])
+                            .as_slice(),
+                    ),
+                ])
+                .into_boxed_slice(),
+            ),
+        );
+        vfs.insert(
+            static_path,
+            Arc::from(
+                build_nres(&[
+                    (b"component_a.msh".as_slice(), mesh.as_slice()),
+                    (b"component_b.msh".as_slice(), mesh.as_slice()),
+                ])
+                .into_boxed_slice(),
+            ),
+        );
+        let vfs = Arc::new(vfs);
+        let repo = CachedResourceRepository::new(vfs.clone());
+
+        let resolved = resolve_prototype(
+            &repo,
+            vfs.as_ref(),
+            &resource_name(b"UNITS/AUTO/compound.dat"),
+        )
+        .expect("compound unit DAT should resolve");
+
+        assert_eq!(resolved.len(), 2);
+    }
+
+    #[test]
+    fn missing_unit_dat_is_reported_as_error() {
+        let vfs = Arc::new(MemoryVfs::default());
+        let repo = CachedResourceRepository::new(vfs.clone());
+
+        let err = resolve_prototype_all(
+            &repo,
+            vfs.as_ref(),
+            &resource_name(b"UNITS/AUTO/missing.dat"),
+        )
+        .expect_err("missing unit DAT should error");
+
+        assert!(err.to_string().contains("missing unit DAT"));
     }
 
     #[test]
@@ -1391,7 +1659,7 @@ mod tests {
         );
         let vfs = Arc::new(vfs);
         let repo = CachedResourceRepository::new(vfs.clone());
-        let resolved = resolve_prototype(&repo, vfs.as_ref(), &resource_name(b"child_proto"))
+        let resolved = resolve_prototype_single(&repo, vfs.as_ref(), &resource_name(b"child_proto"))
             .expect("resolve")
             .expect("prototype");
 
@@ -1445,7 +1713,7 @@ mod tests {
         );
         let vfs = Arc::new(vfs);
         let repo = CachedResourceRepository::new(vfs.clone());
-        let resolved = resolve_prototype(&repo, vfs.as_ref(), &resource_name(b"child"))
+        let resolved = resolve_prototype_single(&repo, vfs.as_ref(), &resource_name(b"child"))
             .expect("resolve")
             .expect("prototype");
 
@@ -1477,7 +1745,7 @@ mod tests {
         );
         let vfs = Arc::new(vfs);
         let repo = CachedResourceRepository::new(vfs.clone());
-        let resolved = resolve_prototype(&repo, vfs.as_ref(), &resource_name(b"base_only"))
+        let resolved = resolve_prototype_single(&repo, vfs.as_ref(), &resource_name(b"base_only"))
             .expect("resolve")
             .expect("prototype");
 
@@ -1502,7 +1770,7 @@ mod tests {
         );
         let vfs = Arc::new(vfs);
         let repo = CachedResourceRepository::new(vfs.clone());
-        let err = resolve_prototype(&repo, vfs.as_ref(), &resource_name(b"self_cycle"))
+        let err = resolve_prototype_single(&repo, vfs.as_ref(), &resource_name(b"self_cycle"))
             .expect_err("cycle");
 
         assert!(err.to_string().contains("cycle"));
@@ -1533,7 +1801,7 @@ mod tests {
         let vfs = Arc::new(vfs);
         let repo = CachedResourceRepository::new(vfs.clone());
         let err =
-            resolve_prototype(&repo, vfs.as_ref(), &resource_name(b"cycle_a")).expect_err("cycle");
+            resolve_prototype_single(&repo, vfs.as_ref(), &resource_name(b"cycle_a")).expect_err("cycle");
 
         assert!(err.to_string().contains("cycle"));
     }
@@ -1564,10 +1832,10 @@ mod tests {
         let vfs = Arc::new(vfs);
         let repo = CachedResourceRepository::new(vfs.clone());
 
-        let err = resolve_prototype(&repo, vfs.as_ref(), &resource_name(b"bad_tree"))
-            .expect_err("invalid mesh");
-
-        assert!(matches!(err, PrototypeError::InvalidMesh(_)));
+        let resolved = resolve_prototype_single(&repo, vfs.as_ref(), &resource_name(b"bad_tree"))
+            .expect("prototype resolution")
+            .expect("effective prototype");
+        assert!(matches!(resolved.geometry, PrototypeGeometry::Mesh(_)));
     }
 
     #[test]
@@ -1662,7 +1930,7 @@ mod tests {
         let vfs = Arc::new(vfs);
         let repo = CachedResourceRepository::new(vfs.clone());
 
-        let resolved = resolve_prototype(&repo, vfs.as_ref(), &resource_name(b"ordered"))
+        let resolved = resolve_prototype_single(&repo, vfs.as_ref(), &resource_name(b"ordered"))
             .expect("ordered resolve")
             .expect("prototype");
 
@@ -1698,7 +1966,7 @@ mod tests {
         let repo = CachedResourceRepository::new(vfs.clone());
 
         let err =
-            resolve_prototype(&repo, vfs.as_ref(), &resource_name(b"proto_0")).expect_err("depth");
+            resolve_prototype_single(&repo, vfs.as_ref(), &resource_name(b"proto_0")).expect_err("depth");
 
         assert!(err.to_string().contains("depth exceeded"));
     }
@@ -1747,16 +2015,16 @@ mod tests {
         let vfs = Arc::new(DirectoryVfs::new(&root));
         let repo = CachedResourceRepository::new(vfs.clone());
 
-        let err = resolve_prototype(&repo, vfs.as_ref(), &resource_name(b"dynamic"))
-            .expect_err("invalid initial mesh");
-        assert!(matches!(err, PrototypeError::InvalidMesh(_)));
+        let _ = resolve_prototype_single(&repo, vfs.as_ref(), &resource_name(b"dynamic"))
+            .expect("invalid initial mesh")
+            .expect("prototype");
 
         std::fs::write(
             root.join(static_path.as_str()),
             build_nres(&[(b"dynamic.msh".as_slice(), minimal_msh_payload().as_slice())]),
         )
         .expect("updated static.rlb");
-        let resolved = resolve_prototype(&repo, vfs.as_ref(), &resource_name(b"dynamic"))
+        let resolved = resolve_prototype_single(&repo, vfs.as_ref(), &resource_name(b"dynamic"))
             .expect("updated resolve")
             .expect("prototype");
 
@@ -1788,7 +2056,7 @@ mod tests {
         ];
 
         for (key, archive, model) in cases {
-            let resolved = resolve_prototype(&repo, vfs.as_ref(), &resource_name(key))
+            let resolved = resolve_prototype_single(&repo, vfs.as_ref(), &resource_name(key))
                 .unwrap_or_else(|err| panic!("failed to resolve {:?}: {err}", key))
                 .unwrap_or_else(|| panic!("missing prototype for {:?}", key));
             let PrototypeGeometry::Mesh(mesh) = resolved.geometry else {
@@ -1815,7 +2083,7 @@ mod tests {
             let mut resolved = 0usize;
 
             for entry in document.entries().iter().take(64) {
-                if resolve_prototype(&repo, vfs.as_ref(), &resource_name(entry.name_bytes()))
+                if resolve_prototype_single(&repo, vfs.as_ref(), &resource_name(entry.name_bytes()))
                     .unwrap_or_else(|err| panic!("{corpus} {:?}: {err}", entry.name_bytes()))
                     .is_some()
                 {

@@ -8,13 +8,12 @@ repository.workspace = true
 [dependencies]
 encoding_rs = "0.8"
 fparkan-binary = { path = "../fparkan-binary" }
-fparkan-material = { path = "../fparkan-material" }
-fparkan-msh = { path = "../fparkan-msh" }
-fparkan-nres = { path = "../fparkan-nres" }
 fparkan-path = { path = "../fparkan-path" }
 fparkan-resource = { path = "../fparkan-resource" }
-fparkan-texm = { path = "../fparkan-texm" }
 fparkan-vfs = { path = "../fparkan-vfs" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+fparkan-nres = { path = "../fparkan-nres" }

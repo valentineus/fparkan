@@ -1,25 +1,28 @@
 #![forbid(unsafe_code)]
 //! Runtime orchestration for headless and rendered modes.
 
-use fparkan_mission_format::{
-    decode_tma, decode_tma_land_path, LpString, MissionDocument, MissionError, TmaProfile,
+use fparkan_assets::{
+    AssetError as AssetPreparationError, AssetManager, MissionAssetPlan,
+    decode_mission_land_path, decode_nres_payload, decode_mission_payload, prepare_terrain_world,
+    derive_mission_land_paths, BuildCategory, MissionDocument, MissionError, MissionTerrainPaths,
+    TerrainFormatError, TerrainPreparationError, TmaProfile, TerrainWorld,
+    NresError,
+    extend_graph_report_with_visual_dependencies,
 };
 use fparkan_path::{normalize_relative, NormalizedPath, PathError, PathPolicy};
 use fparkan_prototype::{
-    build_prototype_graph_report, extend_graph_report_with_visual_dependencies, EffectivePrototype,
+    build_prototype_graph_report,
     PrototypeGraph, PrototypeGraphFailure, PrototypeGraphReport,
 };
 use fparkan_resource::{resource_name, CachedResourceRepository};
-use fparkan_terrain::TerrainWorld;
-use fparkan_terrain_format::{
-    decode_build_dat, decode_land_map, decode_land_msh, BuildCategory, TerrainFormatError,
-};
 use fparkan_vfs::{Vfs, VfsError};
 use fparkan_world::{
     construct_object, new as new_world, register_object, step, InputSnapshot, ObjectDraft,
     OriginalObjectId, World, WorldConfig, WorldSnapshot,
 };
 use std::sync::Arc;
+
+pub use fparkan_assets::MissionAssets;
 
 /// Engine mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -167,6 +170,8 @@ pub struct LoadedMission {
     pub graph_unit_component_count: usize,
     /// Mission prototype graph root count.
     pub graph_root_count: usize,
+    /// Mission asset plan visual count after dependency preparation.
+    pub asset_visual_count: usize,
     /// Expanded prototype requests resolved to effective prototypes.
     pub graph_resolved_count: usize,
     /// Reached mesh dependency count.
@@ -189,6 +194,14 @@ pub struct LoadedMission {
     pub graph_lightmap_request_count: usize,
     /// Lightmap Texm entries decoded.
     pub graph_lightmap_resolved_count: usize,
+    /// Mission asset plan mesh-backed count after dependency preparation.
+    pub asset_model_count: usize,
+    /// Mission asset plan material count after dependency preparation.
+    pub asset_material_count: usize,
+    /// Mission asset plan texture count after dependency preparation.
+    pub asset_texture_count: usize,
+    /// Mission asset plan lightmap count after dependency preparation.
+    pub asset_lightmap_count: usize,
 }
 
 /// Frame result.
@@ -222,7 +235,8 @@ struct LoadedMissionState {
     build_categories: Vec<BuildCategory>,
     prototype_graph: PrototypeGraph,
     prototype_report: PrototypeGraphReport,
-    resolved_prototypes: Vec<EffectivePrototype>,
+    mission_assets: MissionAssets,
+    asset_plan: MissionAssetPlan,
 }
 
 /// Engine error.
@@ -251,7 +265,7 @@ pub enum EngineError {
         /// Resource path.
         path: String,
         /// Source error.
-        source: fparkan_nres::NresError,
+        source: NresError,
     },
     /// Mission decode error.
     Mission {
@@ -268,11 +282,18 @@ pub enum EngineError {
         source: TerrainFormatError,
     },
     /// Terrain runtime build error.
-    Terrain(fparkan_terrain::TerrainError),
+    Terrain(fparkan_assets::TerrainError),
     /// Prototype graph errors.
     PrototypeGraph {
         /// Root failures.
         failures: Vec<PrototypeGraphFailure>,
+    },
+    /// Asset preparation errors.
+    AssetPreparation {
+        /// Mission key.
+        mission: String,
+        /// Source error.
+        source: AssetPreparationError,
     },
     /// World error.
     World(fparkan_world::WorldError),
@@ -319,6 +340,9 @@ impl std::fmt::Display for EngineError {
             Self::PrototypeGraph { failures } => {
                 write!(f, "mission prototype graph has {} failures", failures.len())
             }
+            Self::AssetPreparation { mission, source } => {
+                write!(f, "{mission}: asset preparation failed: {source}")
+            }
             Self::World(source) => write!(f, "{source}"),
             Self::SchedulerPhaseOrder { previous, current } => write!(
                 f,
@@ -346,6 +370,7 @@ impl std::error::Error for EngineError {
             Self::TerrainFormat { source, .. } => Some(source),
             Self::Terrain(source) => Some(source),
             Self::World(source) => Some(source),
+            Self::AssetPreparation { source, .. } => Some(source),
             Self::MissingVfs
             | Self::PrototypeGraph { .. }
             | Self::SchedulerPhaseOrder { .. }
@@ -410,44 +435,44 @@ fn load_mission_with_options(
     let mission_bytes = read_vfs(&vfs, &mission_path)?;
 
     trace.phases.push(MissionLoadPhase::Map);
-    let land_path = decode_tma_land_path(&mission_bytes, TmaProfile::Strict).map_err(|source| {
+    let land_path = decode_mission_land_path(&mission_bytes, TmaProfile::Strict).map_err(|source| {
         EngineError::Mission {
             path: mission_path.as_str().to_string(),
             source,
         }
     })?;
-    let (land_msh_path, land_map_path) = terrain_paths_from_land_path(&land_path)?;
-    let land_msh_nres = decode_nres(&vfs, &land_msh_path)?;
-    let land_map_nres = decode_nres(&vfs, &land_map_path)?;
-    let land_msh =
-        decode_land_msh(&land_msh_nres).map_err(|source| EngineError::TerrainFormat {
+    let MissionTerrainPaths { land_msh: land_msh_path, land_map: land_map_path } =
+        derive_mission_land_paths(&land_path).map_err(|source| EngineError::Path {
+            role: "mission land",
+            value: mission_path.as_str().to_string(),
+            source,
+        })?;
+    let land_msh_nres = decode_nres_payload(read_vfs(&vfs, &land_msh_path)?)
+        .map_err(|source| EngineError::Nres {
             path: land_msh_path.as_str().to_string(),
             source,
         })?;
-    let land_map =
-        decode_land_map(&land_map_nres).map_err(|source| EngineError::TerrainFormat {
+    let land_map_nres = decode_nres_payload(read_vfs(&vfs, &land_map_path)?)
+        .map_err(|source| EngineError::Nres {
             path: land_map_path.as_str().to_string(),
             source,
         })?;
-    let terrain =
-        TerrainWorld::from_land_assets(&land_msh, &land_map).map_err(EngineError::Terrain)?;
-
     let build_dat_path = normalize_engine_path("BuildDat", "BuildDat.lst")?;
     let build_dat = read_vfs(&vfs, &build_dat_path)?;
-    let build_categories =
-        decode_build_dat(&build_dat).map_err(|source| EngineError::TerrainFormat {
-            path: build_dat_path.as_str().to_string(),
-            source,
+    let (terrain, build_categories) = prepare_terrain_world(&land_msh_nres, &land_map_nres, &build_dat)
+        .map_err(|source| match source {
+            TerrainPreparationError::Decode(source) => EngineError::TerrainFormat {
+                path: build_dat_path.as_str().to_string(),
+                source,
+            },
+            TerrainPreparationError::Runtime(source) => EngineError::Terrain(source),
         })?;
     trace.phases.push(MissionLoadPhase::Tma);
     let mission =
-        decode_tma(mission_bytes, TmaProfile::Strict).map_err(|source| EngineError::Mission {
+        decode_mission_payload(mission_bytes, TmaProfile::Strict).map_err(|source| EngineError::Mission {
             path: mission_path.as_str().to_string(),
             source,
         })?;
-    let verified_terrain_paths = terrain_paths(&mission)?;
-    debug_assert_eq!(verified_terrain_paths.0.as_str(), land_msh_path.as_str());
-    debug_assert_eq!(verified_terrain_paths.1.as_str(), land_map_path.as_str());
     trace.transforms = mission
         .objects
         .iter()
@@ -471,6 +496,7 @@ fn load_mission_with_options(
     extend_graph_report_with_visual_dependencies(
         &repository,
         &mut prototype_report,
+        &prototype_graph,
         &resolved_prototypes,
     );
     if !prototype_report.is_success() {
@@ -478,6 +504,16 @@ fn load_mission_with_options(
             failures: prototype_report.failures.clone(),
         });
     }
+    let mission_assets = AssetManager::new(repository)
+        .prepare_mission_assets(
+            &prototype_graph.root_prototype_request_spans,
+            &resolved_prototypes,
+        )
+        .map_err(|source| EngineError::AssetPreparation {
+            mission: request.key.clone(),
+            source,
+        })?;
+    let mission_asset_plan = mission_assets.to_plan();
     trace.phases.push(MissionLoadPhase::Assets);
 
     let mut new_runtime_world = new_world(WorldConfig);
@@ -519,6 +555,7 @@ fn load_mission_with_options(
         graph_direct_reference_count: prototype_report.direct_reference_count,
         graph_unit_component_count: prototype_report.unit_component_count,
         graph_root_count: prototype_report.root_count,
+        asset_visual_count: mission_asset_plan.visual_count,
         graph_resolved_count: prototype_report.resolved_count,
         graph_mesh_dependency_count: prototype_report.mesh_dependency_count,
         graph_failure_count: prototype_report.failures.len(),
@@ -530,6 +567,10 @@ fn load_mission_with_options(
         graph_texture_resolved_count: prototype_report.texture_resolved_count,
         graph_lightmap_request_count: prototype_report.lightmap_request_count,
         graph_lightmap_resolved_count: prototype_report.lightmap_resolved_count,
+        asset_model_count: mission_asset_plan.model_count,
+        asset_material_count: mission_asset_plan.material_count,
+        asset_texture_count: mission_asset_plan.texture_count,
+        asset_lightmap_count: mission_asset_plan.lightmap_count,
     };
 
     engine.world = new_runtime_world;
@@ -540,7 +581,8 @@ fn load_mission_with_options(
         build_categories,
         prototype_graph,
         prototype_report,
-        resolved_prototypes,
+        mission_assets,
+        asset_plan: mission_asset_plan,
     });
     Ok((summary, trace))
 }
@@ -618,13 +660,16 @@ pub fn loaded_prototype_graph_report(engine: &Engine) -> Option<&PrototypeGraphR
     engine.loaded.as_ref().map(|state| &state.prototype_report)
 }
 
-/// Returns resolved effective prototypes for the loaded mission.
+/// Returns the prepared mission asset plan for the loaded mission.
 #[must_use]
-pub fn loaded_resolved_prototypes(engine: &Engine) -> Option<&[EffectivePrototype]> {
-    engine
-        .loaded
-        .as_ref()
-        .map(|state| state.resolved_prototypes.as_slice())
+pub fn loaded_mission_asset_plan(engine: &Engine) -> Option<&MissionAssetPlan> {
+    engine.loaded.as_ref().map(|state| &state.asset_plan)
+}
+
+/// Returns prepared mission assets for the loaded mission.
+#[must_use]
+pub fn loaded_mission_assets(engine: &Engine) -> Option<&MissionAssets> {
+    engine.loaded.as_ref().map(|state| &state.mission_assets)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -714,49 +759,6 @@ fn read_vfs(vfs: &Arc<dyn Vfs>, path: &NormalizedPath) -> Result<Arc<[u8]>, Engi
         path: path.as_str().to_string(),
         source,
     })
-}
-
-fn decode_nres(
-    vfs: &Arc<dyn Vfs>,
-    path: &NormalizedPath,
-) -> Result<fparkan_nres::NresDocument, EngineError> {
-    let bytes = read_vfs(vfs, path)?;
-    fparkan_nres::decode(bytes, fparkan_nres::ReadProfile::Compatible).map_err(|source| {
-        EngineError::Nres {
-            path: path.as_str().to_string(),
-            source,
-        }
-    })
-}
-
-fn terrain_paths(
-    mission: &MissionDocument,
-) -> Result<(NormalizedPath, NormalizedPath), EngineError> {
-    terrain_paths_from_land_path(&mission.land_path)
-}
-
-fn terrain_paths_from_land_path(
-    land_path: &LpString,
-) -> Result<(NormalizedPath, NormalizedPath), EngineError> {
-    let land_path_raw = String::from_utf8_lossy(&land_path.raw).to_string();
-    let normalized =
-        normalize_relative(&land_path.raw, PathPolicy::StrictLegacy).map_err(|source| {
-            EngineError::Path {
-                role: "mission land",
-                value: land_path_raw.clone(),
-                source,
-            }
-        })?;
-    let Some((parent, _stem)) = normalized.as_str().rsplit_once('/') else {
-        return Err(EngineError::Path {
-            role: "mission land",
-            value: normalized.as_str().to_string(),
-            source: PathError::Empty,
-        });
-    };
-    let mesh = normalize_engine_path("Land.msh", &format!("{parent}/Land.msh"))?;
-    let map = normalize_engine_path("Land.map", &format!("{parent}/Land.map"))?;
-    Ok((mesh, map))
 }
 
 #[cfg(test)]

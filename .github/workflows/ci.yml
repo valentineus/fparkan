@@ -1,0 +1,37 @@
+name: fparkan-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  stage0-matrix:
+    name: Stage 0-2 CI (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain-file: rust-toolchain.toml
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: Run canonical CI gate
+        run: cargo xtask ci
+      - name: Upload acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage-0-2-acceptance-${{ matrix.os }}
+          path: target/fparkan/acceptance/stage-0-2-audit.json
+          if-no-files-found: ignore

@@ -2,19 +2,16 @@
 #![allow(clippy::print_stderr, clippy::print_stdout)]
 //! `FParkan` asset viewer composition root.
 
-use fparkan_msh::{decode_msh, validate_msh};
-use fparkan_nres::{decode as decode_nres, ReadProfile as NresReadProfile};
+use fparkan_inspection::{
+    inspect_land_file, inspect_model_from_root, inspect_texture_from_root, ArchiveInspection, LandFileKind,
+    MapInspection, NresEntrySummary,
+};
 use fparkan_render::{
     build_commands, CameraSnapshot, DrawId, GpuMaterialId, GpuMeshId, IndexRange, RenderPhase,
     RenderProfile, RenderSnapshot, RenderSnapshotDraw,
 };
-use fparkan_resource::{archive_path, resource_name, CachedResourceRepository, ResourceRepository};
-use fparkan_terrain_format::{decode_land_map, decode_land_msh};
-use fparkan_texm::decode_texm;
-use fparkan_vfs::DirectoryVfs;
 use std::fmt::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -44,35 +41,27 @@ fn run(args: &[String]) -> Result<String, String> {
 fn inspect_archive(args: &[String]) -> Result<String, String> {
     let file = parse_file(args)?;
     let limit = parse_limit(args)?;
-    let bytes = std::fs::read(&file).map_err(|err| format!("{}: {err}", file.display()))?;
-    if bytes.starts_with(b"NRes") {
-        let document = decode_nres(
-            Arc::from(bytes.into_boxed_slice()),
-            NresReadProfile::Compatible,
-        )
-        .map_err(|err| err.to_string())?;
-        let sample = render_nres_entries(&document, limit);
-        return Ok(format!(
+    let inspection = fparkan_inspection::inspect_archive_file(&file, limit)?;
+
+    match inspection {
+        ArchiveInspection::Nres {
+            entries,
+            lookup_order_valid,
+            sample,
+        } => Ok(format!(
             "{{\"kind\":\"NRes\",\"path\":{},\"entries\":{},\"lookup_order_valid\":{},\"sample\":[{}]}}",
             json_string(&file.display().to_string()),
-            document.entries().len(),
-            document.lookup_order_valid(),
-            sample
-        ));
-    }
-    if bytes.get(0..4) == Some(b"NL\0\x01") {
-        let document = fparkan_rsli::decode(
-            Arc::from(bytes.into_boxed_slice()),
-            fparkan_rsli::ReadProfile::Compatible,
-        )
-        .map_err(|err| err.to_string())?;
-        return Ok(format!(
+            entries,
+            lookup_order_valid,
+            render_nres_entries(&sample)
+        )),
+        ArchiveInspection::Rsli { entries } => Ok(format!(
             "{{\"kind\":\"RsLi\",\"path\":{},\"entries\":{}}}",
             json_string(&file.display().to_string()),
-            document.entries().len()
-        ));
+            entries
+        )),
+        ArchiveInspection::Unsupported => Err(format!("{}: unsupported archive magic", file.display())),
     }
-    Err(format!("{}: unsupported archive magic", file.display()))
 }
 
 fn inspect_model(args: &[String]) -> Result<String, String> {
@@ -81,21 +70,18 @@ fn inspect_model(args: &[String]) -> Result<String, String> {
     }
 
     let query = parse_resource_query(args)?;
-    let bytes = read_resource(&query)?;
-    let nested = decode_nres(bytes, NresReadProfile::Compatible).map_err(|err| err.to_string())?;
-    let document = decode_msh(&nested).map_err(|err| err.to_string())?;
-    let model = validate_msh(&document).map_err(|err| err.to_string())?;
+    let inspection = inspect_model_from_root(&query.root, &query.archive, &query.name)?;
 
     Ok(format!(
         "{{\"kind\":\"model\",\"archive\":{},\"name\":{},\"streams\":{},\"nodes\":{},\"slots\":{},\"positions\":{},\"indices\":{},\"batches\":{}}}",
         json_string(&query.archive),
         json_string(&query.name),
-        document.streams().len(),
-        model.node_count,
-        model.slots.len(),
-        model.positions.len(),
-        model.indices.len(),
-        model.batches.len()
+        inspection.streams,
+        inspection.nodes,
+        inspection.slots,
+        inspection.positions,
+        inspection.indices,
+        inspection.batches
     ))
 }
 
@@ -139,54 +125,54 @@ impl ViewerModelService {
 
 fn inspect_texture(args: &[String]) -> Result<String, String> {
     let query = parse_resource_query(args)?;
-    let document = decode_texm(read_resource(&query)?).map_err(|err| err.to_string())?;
+    let inspection = inspect_texture_from_root(&query.root, &query.archive, &query.name)?;
 
     Ok(format!(
         "{{\"kind\":\"texture\",\"archive\":{},\"name\":{},\"width\":{},\"height\":{},\"format\":{},\"mips\":{},\"pages\":{}}}",
         json_string(&query.archive),
         json_string(&query.name),
-        document.width(),
-        document.height(),
-        json_string(&format!("{:?}", document.format())),
-        document.mip_count(),
-        document.page_rects().len()
+        inspection.width,
+        inspection.height,
+        json_string(&inspection.format),
+        inspection.mips,
+        inspection.pages
     ))
 }
 
 fn inspect_map(args: &[String]) -> Result<String, String> {
     let file = parse_file(args)?;
     let kind = parse_option(args, &["--kind"]).ok_or_else(|| "missing --kind".to_string())?;
-    let bytes = std::fs::read(&file).map_err(|err| format!("{}: {err}", file.display()))?;
-    let nres = decode_nres(
-        Arc::from(bytes.into_boxed_slice()),
-        NresReadProfile::Compatible,
-    )
-    .map_err(|err| err.to_string())?;
+    let inspection = inspect_land_file(
+        &file,
+        match kind.as_str() {
+            "land-msh" => LandFileKind::LandMsh,
+            "land-map" => LandFileKind::LandMap,
+            _ => return Err(format!("unknown map kind: {kind}")),
+        },
+    )?;
 
-    match kind.as_str() {
-        "land-msh" => {
-            let land = decode_land_msh(&nres).map_err(|err| err.to_string())?;
-            Ok(format!(
-                "{{\"kind\":\"land-msh\",\"path\":{},\"streams\":{},\"positions\":{},\"faces\":{},\"slots\":{}}}",
-                json_string(&file.display().to_string()),
-                land.streams.len(),
-                land.positions.len(),
-                land.faces.len(),
-                land.slots.slots_raw.len()
-            ))
-        }
-        "land-map" => {
-            let land = decode_land_map(&nres).map_err(|err| err.to_string())?;
-            Ok(format!(
-                "{{\"kind\":\"land-map\",\"path\":{},\"areals\":{},\"declared_areals\":{},\"grid_width\":{},\"grid_height\":{}}}",
-                json_string(&file.display().to_string()),
-                land.areals.len(),
-                land.areal_count,
-                land.grid.cells_x,
-                land.grid.cells_y
-            ))
-        }
-        _ => Err(format!("unknown map kind: {kind}")),
+    Ok(render_map_inspection_json(&file.display().to_string(), &kind, &inspection))
+}
+
+fn render_map_inspection_json(path: &str, kind: &str, inspection: &MapInspection) -> String {
+    match kind {
+        "land-msh" => format!(
+            "{{\"kind\":\"land-msh\",\"path\":{},\"streams\":{},\"positions\":{},\"faces\":{},\"slots\":{}}}",
+            json_string(path),
+            inspection.streams,
+            inspection.positions,
+            inspection.faces,
+            inspection.slots
+        ),
+        "land-map" => format!(
+            "{{\"kind\":\"land-map\",\"path\":{},\"areals\":{},\"declared_areals\":{},\"grid_width\":{},\"grid_height\":{}}}",
+            json_string(path),
+            inspection.areals,
+            inspection.declared_areals,
+            inspection.grid_width,
+            inspection.grid_height
+        ),
+        _ => unreachable!("invalid land kind: {kind}"),
     }
 }
 
@@ -205,19 +191,6 @@ fn parse_resource_query(args: &[String]) -> Result<ResourceQuery, String> {
     })
 }
 
-fn read_resource(query: &ResourceQuery) -> Result<Arc<[u8]>, String> {
-    let repository = CachedResourceRepository::new(Arc::new(DirectoryVfs::new(&query.root)));
-    let archive = repository
-        .open_archive(&archive_path(query.archive.as_bytes()).map_err(|err| err.to_string())?)
-        .map_err(|err| err.to_string())?;
-    let entry = repository
-        .find(archive, &resource_name(query.name.as_bytes()))
-        .map_err(|err| err.to_string())?
-        .ok_or_else(|| format!("resource not found: {}/{}", query.archive, query.name))?;
-    let bytes = repository.read(entry).map_err(|err| err.to_string())?;
-    Ok(Arc::from(bytes.into_owned()))
-}
-
 fn parse_file(args: &[String]) -> Result<PathBuf, String> {
     parse_path_option(args, &["--file"], "--file")
 }
@@ -233,19 +206,19 @@ fn parse_limit(args: &[String]) -> Result<usize, String> {
         .map(|value| value.unwrap_or(0))
 }
 
-fn render_nres_entries(document: &fparkan_nres::NresDocument, limit: usize) -> String {
+fn render_nres_entries(entries: &[NresEntrySummary]) -> String {
     let mut out = String::new();
-    for (index, entry) in document.entries().iter().take(limit).enumerate() {
+    for (index, entry) in entries.iter().enumerate() {
         if index > 0 {
             out.push(',');
         }
-        let name = String::from_utf8_lossy(entry.name_bytes());
+        let name = &entry.name;
         let _ = write!(
             out,
             "{{\"name\":{},\"type\":{},\"size\":{}}}",
-            json_string(&name),
-            entry.meta().type_id,
-            entry.meta().data_size
+            json_string(name),
+            entry.type_id,
+            entry.data_size
         );
     }
     out
@@ -278,7 +251,7 @@ fn json_string(value: &str) -> String {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             c if c.is_control() => {
-                let _ = write!(out, "\\u{:04x}", u32::from(c));
+                let _ = write!(out, "\\u{:04x}", c as u32);
             }
             c => out.push(c),
         }
