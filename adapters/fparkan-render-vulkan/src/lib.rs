@@ -539,6 +539,98 @@ pub struct VulkanSurfaceFormat {
     pub color_space: i32,
 }
 
+/// Surface capabilities needed by the Stage 0 swapchain policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VulkanSwapchainSurfaceCapabilities {
+    /// Current surface extent, when dictated by the platform.
+    pub current_extent: Option<(u32, u32)>,
+    /// Minimum supported swapchain extent.
+    pub min_extent: (u32, u32),
+    /// Maximum supported swapchain extent.
+    pub max_extent: (u32, u32),
+    /// Minimum supported image count.
+    pub min_image_count: u32,
+    /// Maximum supported image count, or 0 when unbounded.
+    pub max_image_count: u32,
+}
+
+/// Deterministic swapchain planning input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VulkanSwapchainRequest {
+    /// Requested drawable extent.
+    pub drawable_extent: (u32, u32),
+    /// Available surface formats.
+    pub formats: Vec<VulkanSurfaceFormat>,
+    /// Available present modes as raw Vulkan values.
+    pub present_modes: Vec<i32>,
+    /// Surface capabilities.
+    pub capabilities: VulkanSwapchainSurfaceCapabilities,
+    /// Preferred present mode.
+    pub preferred_present_mode: i32,
+}
+
+/// Deterministic swapchain plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VulkanSwapchainPlan {
+    /// Report schema version.
+    pub schema: u32,
+    /// Selected swapchain extent.
+    pub extent: (u32, u32),
+    /// Selected surface format.
+    pub format: VulkanSurfaceFormat,
+    /// Selected present mode raw Vulkan value.
+    pub present_mode: i32,
+    /// Selected image count.
+    pub image_count: u32,
+}
+
+/// Swapchain planning error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VulkanSwapchainError {
+    /// No surface format was available.
+    MissingSurfaceFormat,
+    /// No present mode was available.
+    MissingPresentMode,
+    /// Requested or current extent is empty.
+    EmptyExtent,
+}
+
+impl std::fmt::Display for VulkanSwapchainError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingSurfaceFormat => write!(f, "Vulkan swapchain has no surface format"),
+            Self::MissingPresentMode => write!(f, "Vulkan swapchain has no present mode"),
+            Self::EmptyExtent => write!(f, "Vulkan swapchain extent must be non-zero"),
+        }
+    }
+}
+
+impl std::error::Error for VulkanSwapchainError {}
+
+/// Swapchain recreation reason.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VulkanSwapchainRecreationReason {
+    /// Drawable extent changed.
+    Resize,
+    /// Vulkan reported `VK_ERROR_OUT_OF_DATE_KHR`.
+    OutOfDate,
+    /// Vulkan reported `VK_SUBOPTIMAL_KHR`.
+    Suboptimal,
+}
+
+/// Deterministic swapchain recreation report.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VulkanSwapchainRecreationReport {
+    /// Report schema version.
+    pub schema: u32,
+    /// Recreation reason.
+    pub reason: VulkanSwapchainRecreationReason,
+    /// Previous extent.
+    pub previous_extent: (u32, u32),
+    /// Next extent.
+    pub next_extent: (u32, u32),
+}
+
 /// Synthetic physical-device capabilities used by negative tests and reports.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VulkanPhysicalDeviceRecord {
@@ -674,6 +766,102 @@ pub fn select_physical_device(
     best.ok_or(VulkanCapabilityError::NoPhysicalDevice)
 }
 
+/// Builds a deterministic swapchain plan from surface capabilities.
+///
+/// # Errors
+///
+/// Returns [`VulkanSwapchainError`] when formats, present modes or extent are
+/// unusable.
+pub fn plan_vulkan_swapchain(
+    request: &VulkanSwapchainRequest,
+) -> Result<VulkanSwapchainPlan, VulkanSwapchainError> {
+    let format = select_surface_format(&request.formats)?;
+    let present_mode = select_present_mode(&request.present_modes, request.preferred_present_mode)?;
+    let extent = select_swapchain_extent(request)?;
+    if extent.0 == 0 || extent.1 == 0 {
+        return Err(VulkanSwapchainError::EmptyExtent);
+    }
+    Ok(VulkanSwapchainPlan {
+        schema: 1,
+        extent,
+        format,
+        present_mode,
+        image_count: select_image_count(request.capabilities),
+    })
+}
+
+fn select_surface_format(
+    formats: &[VulkanSurfaceFormat],
+) -> Result<VulkanSurfaceFormat, VulkanSwapchainError> {
+    formats
+        .iter()
+        .copied()
+        .find(|format| {
+            format.format == vk::Format::B8G8R8A8_SRGB.as_raw()
+                && format.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR.as_raw()
+        })
+        .or_else(|| formats.first().copied())
+        .ok_or(VulkanSwapchainError::MissingSurfaceFormat)
+}
+
+fn select_present_mode(present_modes: &[i32], preferred: i32) -> Result<i32, VulkanSwapchainError> {
+    if present_modes.contains(&preferred) {
+        Ok(preferred)
+    } else if present_modes.contains(&vk::PresentModeKHR::FIFO.as_raw()) {
+        Ok(vk::PresentModeKHR::FIFO.as_raw())
+    } else {
+        present_modes
+            .first()
+            .copied()
+            .ok_or(VulkanSwapchainError::MissingPresentMode)
+    }
+}
+
+fn select_swapchain_extent(
+    request: &VulkanSwapchainRequest,
+) -> Result<(u32, u32), VulkanSwapchainError> {
+    if let Some(extent) = request.capabilities.current_extent {
+        return if extent.0 == 0 || extent.1 == 0 {
+            Err(VulkanSwapchainError::EmptyExtent)
+        } else {
+            Ok(extent)
+        };
+    }
+    let width = request.drawable_extent.0.clamp(
+        request.capabilities.min_extent.0,
+        request.capabilities.max_extent.0,
+    );
+    let height = request.drawable_extent.1.clamp(
+        request.capabilities.min_extent.1,
+        request.capabilities.max_extent.1,
+    );
+    Ok((width, height))
+}
+
+fn select_image_count(capabilities: VulkanSwapchainSurfaceCapabilities) -> u32 {
+    let requested = capabilities.min_image_count.saturating_add(1).max(2);
+    if capabilities.max_image_count == 0 {
+        requested
+    } else {
+        requested.min(capabilities.max_image_count)
+    }
+}
+
+/// Builds a deterministic swapchain recreation report.
+#[must_use]
+pub const fn swapchain_recreation_report(
+    reason: VulkanSwapchainRecreationReason,
+    previous_extent: (u32, u32),
+    next_extent: (u32, u32),
+) -> VulkanSwapchainRecreationReport {
+    VulkanSwapchainRecreationReport {
+        schema: 1,
+        reason,
+        previous_extent,
+        next_extent,
+    }
+}
+
 fn validate_device(
     device: &VulkanPhysicalDeviceRecord,
 ) -> Result<VulkanCapabilityReport, VulkanCapabilityError> {
@@ -787,6 +975,52 @@ pub fn render_capability_report_json(report: &VulkanCapabilityReport) -> String 
         }
         push_json_string(&mut out, extension);
     }
+    out.push_str("]}");
+    out
+}
+
+/// Renders a deterministic JSON swapchain plan.
+#[must_use]
+pub fn render_swapchain_plan_json(plan: &VulkanSwapchainPlan) -> String {
+    let mut out = String::new();
+    out.push_str("{\"schema\":");
+    out.push_str(&plan.schema.to_string());
+    out.push_str(",\"extent\":[");
+    out.push_str(&plan.extent.0.to_string());
+    out.push(',');
+    out.push_str(&plan.extent.1.to_string());
+    out.push_str("],\"format\":");
+    out.push_str(&plan.format.format.to_string());
+    out.push_str(",\"color_space\":");
+    out.push_str(&plan.format.color_space.to_string());
+    out.push_str(",\"present_mode\":");
+    out.push_str(&plan.present_mode.to_string());
+    out.push_str(",\"image_count\":");
+    out.push_str(&plan.image_count.to_string());
+    out.push('}');
+    out
+}
+
+/// Renders a deterministic JSON swapchain recreation report.
+#[must_use]
+pub fn render_swapchain_recreation_report_json(report: &VulkanSwapchainRecreationReport) -> String {
+    let mut out = String::new();
+    out.push_str("{\"schema\":");
+    out.push_str(&report.schema.to_string());
+    out.push_str(",\"reason\":\"");
+    out.push_str(match report.reason {
+        VulkanSwapchainRecreationReason::Resize => "resize",
+        VulkanSwapchainRecreationReason::OutOfDate => "out_of_date",
+        VulkanSwapchainRecreationReason::Suboptimal => "suboptimal",
+    });
+    out.push_str("\",\"previous_extent\":[");
+    out.push_str(&report.previous_extent.0.to_string());
+    out.push(',');
+    out.push_str(&report.previous_extent.1.to_string());
+    out.push_str("],\"next_extent\":[");
+    out.push_str(&report.next_extent.0.to_string());
+    out.push(',');
+    out.push_str(&report.next_extent.1.to_string());
     out.push_str("]}");
     out
 }
@@ -1188,6 +1422,78 @@ mod tests {
         assert_eq!(name, "VK_KHR_surface");
     }
 
+    #[test]
+    fn swapchain_plan_prefers_srgb_mailbox_and_clamps_extent() {
+        let plan = plan_vulkan_swapchain(&swapchain_request()).expect("swapchain plan");
+
+        assert_eq!(
+            plan.format,
+            VulkanSurfaceFormat {
+                format: vk::Format::B8G8R8A8_SRGB.as_raw(),
+                color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR.as_raw(),
+            }
+        );
+        assert_eq!(plan.present_mode, vk::PresentModeKHR::MAILBOX.as_raw());
+        assert_eq!(plan.extent, (1024, 720));
+        assert_eq!(plan.image_count, 3);
+    }
+
+    #[test]
+    fn swapchain_plan_uses_fifo_and_current_extent_fallbacks() {
+        let mut request = swapchain_request();
+        request.preferred_present_mode = vk::PresentModeKHR::IMMEDIATE.as_raw();
+        request.present_modes = vec![vk::PresentModeKHR::FIFO.as_raw()];
+        request.capabilities.current_extent = Some((800, 600));
+
+        let plan = plan_vulkan_swapchain(&request).expect("swapchain plan");
+
+        assert_eq!(plan.present_mode, vk::PresentModeKHR::FIFO.as_raw());
+        assert_eq!(plan.extent, (800, 600));
+    }
+
+    #[test]
+    fn swapchain_plan_rejects_missing_surface_data_and_empty_extent() {
+        let mut request = swapchain_request();
+        request.formats.clear();
+        assert_eq!(
+            plan_vulkan_swapchain(&request),
+            Err(VulkanSwapchainError::MissingSurfaceFormat)
+        );
+
+        let mut request = swapchain_request();
+        request.present_modes.clear();
+        assert_eq!(
+            plan_vulkan_swapchain(&request),
+            Err(VulkanSwapchainError::MissingPresentMode)
+        );
+
+        let mut request = swapchain_request();
+        request.capabilities.current_extent = Some((0, 600));
+        assert_eq!(
+            plan_vulkan_swapchain(&request),
+            Err(VulkanSwapchainError::EmptyExtent)
+        );
+    }
+
+    #[test]
+    fn swapchain_plan_json_and_recreation_reports_are_stable() {
+        let plan = plan_vulkan_swapchain(&swapchain_request()).expect("swapchain plan");
+        assert_eq!(
+            render_swapchain_plan_json(&plan),
+            "{\"schema\":1,\"extent\":[1024,720],\"format\":50,\"color_space\":0,\"present_mode\":1,\"image_count\":3}"
+        );
+
+        let report = swapchain_recreation_report(
+            VulkanSwapchainRecreationReason::OutOfDate,
+            (1024, 720),
+            (1280, 720),
+        );
+        assert_eq!(
+            render_swapchain_recreation_report_json(&report),
+            "{\"schema\":1,\"reason\":\"out_of_date\",\"previous_extent\":[1024,720],\"next_extent\":[1280,720]}"
+        );
+    }
+
     fn device(
         name: &str,
         device_type: VulkanDeviceType,
@@ -1216,6 +1522,34 @@ mod tests {
                 format: vk::Format::B8G8R8A8_SRGB.as_raw(),
                 color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR.as_raw(),
             }],
+        }
+    }
+
+    fn swapchain_request() -> VulkanSwapchainRequest {
+        VulkanSwapchainRequest {
+            drawable_extent: (1280, 720),
+            formats: vec![
+                VulkanSurfaceFormat {
+                    format: vk::Format::R8G8B8A8_UNORM.as_raw(),
+                    color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR.as_raw(),
+                },
+                VulkanSurfaceFormat {
+                    format: vk::Format::B8G8R8A8_SRGB.as_raw(),
+                    color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR.as_raw(),
+                },
+            ],
+            present_modes: vec![
+                vk::PresentModeKHR::FIFO.as_raw(),
+                vk::PresentModeKHR::MAILBOX.as_raw(),
+            ],
+            capabilities: VulkanSwapchainSurfaceCapabilities {
+                current_extent: None,
+                min_extent: (320, 240),
+                max_extent: (1024, 768),
+                min_image_count: 2,
+                max_image_count: 3,
+            },
+            preferred_present_mode: vk::PresentModeKHR::MAILBOX.as_raw(),
         }
     }
 }

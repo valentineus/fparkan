@@ -36,6 +36,10 @@ S0-VK-010	covered	cargo test -p fparkan-render-vulkan --offline invalid_instance
 S0-VK-011	covered	cargo test -p fparkan-render-vulkan --offline surface_plan_requires_native_handles
 S0-VK-012	covered	cargo test -p fparkan-render-vulkan --offline surface_plan_json_is_stable
 S0-VK-013	covered	cargo test -p fparkan-render-vulkan --offline static_surface_extension_name_is_decoded
+S0-VK-014	covered	cargo test -p fparkan-render-vulkan --offline swapchain_plan_prefers_srgb_mailbox_and_clamps_extent
+S0-VK-015	covered	cargo test -p fparkan-render-vulkan --offline swapchain_plan_uses_fifo_and_current_extent_fallbacks
+S0-VK-016	covered	cargo test -p fparkan-render-vulkan --offline swapchain_plan_rejects_missing_surface_data_and_empty_extent
+S0-VK-017	covered	cargo test -p fparkan-render-vulkan --offline swapchain_plan_json_and_recreation_reports_are_stable
 S0-LIMIT-001	covered	cargo test -p fparkan-binary --offline rejects_count_stride_overflow
 S0-LIMIT-002	covered	cargo test -p fparkan-binary --offline rejects_oversized_declared_allocation_before_read
 L1-P1-NRES-001	covered	cargo test -p fparkan-nres --offline licensed_corpora_nres_roundtrip_gates
