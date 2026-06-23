@@ -28,6 +28,9 @@ S0-VK-004	covered	cargo test -p fparkan-render-vulkan --offline rejects_missing_
 S0-VK-005	covered	cargo test -p fparkan-render-vulkan --offline capability_report_json_is_stable
 S0-VK-006	covered	cargo test -p fparkan-render-vulkan --offline loader_probe_report_json_is_stable
 S0-VK-007	covered	cargo xtask policy
+S0-VK-008	covered	cargo test -p fparkan-render-vulkan --offline instance_plan_is_sorted_deduplicated_and_portability_aware
+S0-VK-009	covered	cargo test -p fparkan-render-vulkan --offline instance_plan_adds_portability_extension_when_requested
+S0-VK-010	covered	cargo test -p fparkan-render-vulkan --offline invalid_instance_extension_name_is_reported_before_loader_use
 S0-LIMIT-001	covered	cargo test -p fparkan-binary --offline rejects_count_stride_overflow
 S0-LIMIT-002	covered	cargo test -p fparkan-binary --offline rejects_oversized_declared_allocation_before_read
 L1-P1-NRES-001	covered	cargo test -p fparkan-nres --offline licensed_corpora_nres_roundtrip_gates

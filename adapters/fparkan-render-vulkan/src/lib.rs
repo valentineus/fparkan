@@ -32,13 +32,219 @@ use fparkan_platform::RenderRequest;
 use fparkan_render::{
     canonical_capture, FrameOutput, RenderBackend, RenderCommandList, RenderError,
 };
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
+use std::os::raw::c_char;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Minimum Vulkan API version accepted by the Stage 0 backend.
 pub const MIN_VULKAN_API_VERSION: u32 = vk::API_VERSION_1_1;
 const KHR_SWAPCHAIN_EXTENSION: &str = "VK_KHR_swapchain";
 const KHR_PORTABILITY_SUBSET_EXTENSION: &str = "VK_KHR_portability_subset";
+const KHR_PORTABILITY_ENUMERATION_EXTENSION: &str = "VK_KHR_portability_enumeration";
+
+/// Vulkan instance bootstrap configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VulkanInstanceConfig {
+    /// Application name reported to the loader.
+    pub application_name: String,
+    /// Required instance extensions, usually including surface extensions.
+    pub required_extensions: Vec<String>,
+    /// Whether `VK_KHR_portability_enumeration` and its create flag are enabled.
+    pub enable_portability_enumeration: bool,
+    /// Whether validation layers are requested.
+    pub enable_validation: bool,
+}
+
+impl VulkanInstanceConfig {
+    /// Returns a conservative instance configuration for smoke probes.
+    #[must_use]
+    pub fn smoke(application_name: impl Into<String>) -> Self {
+        Self {
+            application_name: application_name.into(),
+            required_extensions: Vec::new(),
+            enable_portability_enumeration: cfg!(target_os = "macos"),
+            enable_validation: false,
+        }
+    }
+}
+
+/// Deterministic Vulkan instance creation plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VulkanInstancePlan {
+    /// Report schema version.
+    pub schema: u32,
+    /// Instance extensions requested at creation time.
+    pub enabled_extensions: Vec<String>,
+    /// Raw Vulkan instance creation flags.
+    pub create_flags: u32,
+    /// Whether validation was requested.
+    pub validation_requested: bool,
+}
+
+/// Created Vulkan instance probe.
+pub struct VulkanInstanceProbe {
+    _entry: ash::Entry,
+    instance: ash::Instance,
+    /// Deterministic instance creation report.
+    pub report: VulkanInstancePlan,
+}
+
+impl Drop for VulkanInstanceProbe {
+    fn drop(&mut self) {
+        // SAFETY: The `Instance` was created by this probe and is destroyed once during drop.
+        unsafe { self.instance.destroy_instance(None) };
+    }
+}
+
+/// Vulkan instance bootstrap error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VulkanInstanceError {
+    /// The Vulkan loader could not be opened.
+    Loader(VulkanLoaderError),
+    /// Application name contained an interior NUL byte.
+    InvalidApplicationName,
+    /// An extension name contained an interior NUL byte.
+    InvalidExtensionName {
+        /// Invalid extension name.
+        extension: String,
+    },
+    /// Instance creation failed.
+    CreateFailed {
+        /// Vulkan result.
+        result: String,
+    },
+}
+
+impl std::fmt::Display for VulkanInstanceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Loader(error) => write!(f, "{error}"),
+            Self::InvalidApplicationName => {
+                write!(f, "Vulkan application name contains an interior NUL byte")
+            }
+            Self::InvalidExtensionName { extension } => {
+                write!(
+                    f,
+                    "Vulkan instance extension name contains an interior NUL byte: {extension:?}"
+                )
+            }
+            Self::CreateFailed { result } => write!(f, "Vulkan instance creation failed: {result}"),
+        }
+    }
+}
+
+impl std::error::Error for VulkanInstanceError {}
+
+/// Builds the deterministic instance creation plan without touching the loader.
+#[must_use]
+pub fn plan_vulkan_instance(config: &VulkanInstanceConfig) -> VulkanInstancePlan {
+    let mut enabled_extensions = config.required_extensions.clone();
+    if config.enable_portability_enumeration
+        && !enabled_extensions
+            .iter()
+            .any(|extension| extension == KHR_PORTABILITY_ENUMERATION_EXTENSION)
+    {
+        enabled_extensions.push(KHR_PORTABILITY_ENUMERATION_EXTENSION.to_string());
+    }
+    enabled_extensions.sort();
+    enabled_extensions.dedup();
+    VulkanInstancePlan {
+        schema: 1,
+        enabled_extensions,
+        create_flags: if config.enable_portability_enumeration {
+            vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR.as_raw()
+        } else {
+            0
+        },
+        validation_requested: config.enable_validation,
+    }
+}
+
+/// Creates a Vulkan instance probe from the supplied configuration.
+///
+/// # Errors
+///
+/// Returns [`VulkanInstanceError`] when the loader is unavailable, names are not
+/// valid C strings, or `vkCreateInstance` fails.
+pub fn create_vulkan_instance_probe(
+    config: &VulkanInstanceConfig,
+) -> Result<VulkanInstanceProbe, VulkanInstanceError> {
+    // SAFETY: Loading the entry only resolves loader symbols; no raw Vulkan handles escape.
+    let entry = unsafe { ash::Entry::load() }.map_err(|error| {
+        VulkanInstanceError::Loader(VulkanLoaderError::Unavailable {
+            message: error.to_string(),
+        })
+    })?;
+    let app_name = CString::new(config.application_name.clone())
+        .map_err(|_| VulkanInstanceError::InvalidApplicationName)?;
+    let engine_name = c"fparkan";
+    let plan = plan_vulkan_instance(config);
+    let extension_names = cstring_vec(&plan.enabled_extensions)?;
+    let extension_ptrs = cstring_ptrs(&extension_names);
+    let app_info = vk::ApplicationInfo::default()
+        .application_name(&app_name)
+        .application_version(0)
+        .engine_name(engine_name)
+        .engine_version(0)
+        .api_version(MIN_VULKAN_API_VERSION);
+    let create_info = vk::InstanceCreateInfo::default()
+        .application_info(&app_info)
+        .enabled_extension_names(&extension_ptrs)
+        .flags(vk::InstanceCreateFlags::from_raw(plan.create_flags));
+    // SAFETY: `create_info` points to stack-owned Vulkan create data that lives for the call.
+    let instance = unsafe { entry.create_instance(&create_info, None) }.map_err(|error| {
+        VulkanInstanceError::CreateFailed {
+            result: format!("{error:?}"),
+        }
+    })?;
+    Ok(VulkanInstanceProbe {
+        _entry: entry,
+        instance,
+        report: plan,
+    })
+}
+
+/// Renders a deterministic JSON Vulkan instance plan.
+#[must_use]
+pub fn render_instance_plan_json(plan: &VulkanInstancePlan) -> String {
+    let mut out = String::new();
+    out.push_str("{\"schema\":");
+    out.push_str(&plan.schema.to_string());
+    out.push_str(",\"create_flags\":");
+    out.push_str(&plan.create_flags.to_string());
+    out.push_str(",\"validation_requested\":");
+    out.push_str(if plan.validation_requested {
+        "true"
+    } else {
+        "false"
+    });
+    out.push_str(",\"enabled_extensions\":[");
+    for (index, extension) in plan.enabled_extensions.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        push_json_string(&mut out, extension);
+    }
+    out.push_str("]}");
+    out
+}
+
+fn cstring_vec(values: &[String]) -> Result<Vec<CString>, VulkanInstanceError> {
+    values
+        .iter()
+        .map(|extension| {
+            CString::new(extension.as_str()).map_err(|_| {
+                VulkanInstanceError::InvalidExtensionName {
+                    extension: extension.clone(),
+                }
+            })
+        })
+        .collect()
+}
+
+fn cstring_ptrs(values: &[CString]) -> Vec<*const c_char> {
+    values.iter().map(|value| value.as_ptr()).collect()
+}
 
 /// Deterministic Vulkan loader probe report.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -747,6 +953,54 @@ mod tests {
             }
             .to_string(),
             "Vulkan loader is unavailable: dlopen failed"
+        );
+    }
+
+    #[test]
+    fn instance_plan_is_sorted_deduplicated_and_portability_aware() {
+        let plan = plan_vulkan_instance(&VulkanInstanceConfig {
+            application_name: "FParkan".to_string(),
+            required_extensions: vec![
+                "VK_KHR_surface".to_string(),
+                KHR_PORTABILITY_ENUMERATION_EXTENSION.to_string(),
+                "VK_KHR_surface".to_string(),
+            ],
+            enable_portability_enumeration: true,
+            enable_validation: true,
+        });
+
+        assert_eq!(
+            render_instance_plan_json(&plan),
+            "{\"schema\":1,\"create_flags\":1,\"validation_requested\":true,\"enabled_extensions\":[\"VK_KHR_portability_enumeration\",\"VK_KHR_surface\"]}"
+        );
+    }
+
+    #[test]
+    fn instance_plan_adds_portability_extension_when_requested() {
+        let plan = plan_vulkan_instance(&VulkanInstanceConfig {
+            application_name: "FParkan".to_string(),
+            required_extensions: vec!["VK_KHR_surface".to_string()],
+            enable_portability_enumeration: true,
+            enable_validation: false,
+        });
+
+        assert_eq!(
+            plan.enabled_extensions,
+            vec![
+                KHR_PORTABILITY_ENUMERATION_EXTENSION.to_string(),
+                "VK_KHR_surface".to_string()
+            ]
+        );
+        assert_eq!(plan.create_flags, 1);
+    }
+
+    #[test]
+    fn invalid_instance_extension_name_is_reported_before_loader_use() {
+        assert_eq!(
+            cstring_vec(&["bad\0extension".to_string()]),
+            Err(VulkanInstanceError::InvalidExtensionName {
+                extension: "bad\0extension".to_string()
+            })
         );
     }
 
