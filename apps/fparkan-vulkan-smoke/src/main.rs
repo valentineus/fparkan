@@ -12,8 +12,8 @@
 //! Native Vulkan smoke runner entrypoint.
 
 use fparkan_render_vulkan::{
-    create_vulkan_instance_probe, probe_vulkan_loader, triangle_shader_manifest,
-    validate_shader_manifest, VulkanInstanceConfig,
+    create_vulkan_instance_probe, plan_vulkan_surface, probe_vulkan_loader,
+    triangle_shader_manifest, validate_shader_manifest, VulkanInstanceConfig,
 };
 use std::path::PathBuf;
 use std::process::Command;
@@ -59,6 +59,7 @@ struct SmokeOptions {
     validation_error_count: Option<u32>,
     probe_loader: bool,
     probe_instance: bool,
+    probe_surface: bool,
     reason: Option<String>,
 }
 
@@ -72,6 +73,7 @@ impl SmokeOptions {
         let mut validation_error_count = None;
         let mut probe_loader = false;
         let mut probe_instance = false;
+        let mut probe_surface = false;
         let mut reason = None;
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
@@ -119,6 +121,11 @@ impl SmokeOptions {
                     probe_loader = true;
                     probe_instance = true;
                 }
+                "--probe-surface" => {
+                    probe_loader = true;
+                    probe_instance = true;
+                    probe_surface = true;
+                }
                 "--reason" => {
                     let value = iter
                         .next()
@@ -137,6 +144,7 @@ impl SmokeOptions {
             validation_error_count,
             probe_loader,
             probe_instance,
+            probe_surface,
             reason,
         })
     }
@@ -156,6 +164,8 @@ struct VulkanBootstrapProbe {
     instance_status: VulkanInstanceStatus,
     instance_error: Option<String>,
     portability_enumeration: bool,
+    surface_status: VulkanSurfaceStatus,
+    surface_error: Option<String>,
 }
 
 impl VulkanBootstrapProbe {
@@ -168,6 +178,8 @@ impl VulkanBootstrapProbe {
                 instance_status: VulkanInstanceStatus::Skipped,
                 instance_error: None,
                 portability_enumeration: false,
+                surface_status: VulkanSurfaceStatus::Skipped,
+                surface_error: None,
             };
         }
 
@@ -179,6 +191,8 @@ impl VulkanBootstrapProbe {
                 instance_status: VulkanInstanceStatus::Skipped,
                 instance_error: None,
                 portability_enumeration: false,
+                surface_status: VulkanSurfaceStatus::Skipped,
+                surface_error: None,
             },
             Err(err) => Self {
                 loader_status: VulkanLoaderStatus::Unavailable,
@@ -187,6 +201,8 @@ impl VulkanBootstrapProbe {
                 instance_status: VulkanInstanceStatus::Skipped,
                 instance_error: None,
                 portability_enumeration: false,
+                surface_status: VulkanSurfaceStatus::Skipped,
+                surface_error: None,
             },
         };
 
@@ -201,6 +217,17 @@ impl VulkanBootstrapProbe {
                 Err(err) => {
                     probe.instance_status = VulkanInstanceStatus::Failed;
                     probe.instance_error = Some(err.to_string());
+                }
+            }
+        }
+        if options.probe_surface && probe.instance_status == VulkanInstanceStatus::Created {
+            match plan_vulkan_surface(None) {
+                Ok(_) => {
+                    probe.surface_status = VulkanSurfaceStatus::Planned;
+                }
+                Err(err) => {
+                    probe.surface_status = VulkanSurfaceStatus::MissingWindowHandles;
+                    probe.surface_error = Some(err.to_string());
                 }
             }
         }
@@ -238,6 +265,23 @@ impl VulkanInstanceStatus {
             Self::Skipped => "skipped",
             Self::Created => "created",
             Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VulkanSurfaceStatus {
+    Skipped,
+    Planned,
+    MissingWindowHandles,
+}
+
+impl VulkanSurfaceStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Skipped => "skipped",
+            Self::Planned => "planned",
+            Self::MissingWindowHandles => "missing_window_handles",
         }
     }
 }
@@ -329,6 +373,11 @@ fn validate_smoke_options(
                     "passed native smoke report requires successful --probe-instance".to_string(),
                 );
             }
+            if bootstrap.surface_status != VulkanSurfaceStatus::Planned {
+                return Err(
+                    "passed native smoke report requires successful --probe-surface".to_string(),
+                );
+            }
         }
     }
     Ok(())
@@ -359,6 +408,10 @@ fn render_smoke_report_json(
         .instance_error
         .as_ref()
         .map_or_else(|| "null".to_string(), |value| json_string(value));
+    let surface_error = bootstrap
+        .surface_error
+        .as_ref()
+        .map_or_else(|| "null".to_string(), |value| json_string(value));
     Ok(format!(
         concat!(
             "{{\n",
@@ -377,6 +430,8 @@ fn render_smoke_report_json(
             "  \"vulkan_instance_status\": \"{}\",\n",
             "  \"vulkan_instance_error\": {},\n",
             "  \"vulkan_portability_enumeration\": {},\n",
+            "  \"vulkan_surface_status\": \"{}\",\n",
+            "  \"vulkan_surface_error\": {},\n",
             "  \"reason\": {}\n",
             "}}\n"
         ),
@@ -399,6 +454,8 @@ fn render_smoke_report_json(
         } else {
             "false"
         },
+        bootstrap.surface_status.as_str(),
+        surface_error,
         reason
     ))
 }
@@ -480,6 +537,8 @@ mod tests {
                 instance_status: VulkanInstanceStatus::Skipped,
                 instance_error: None,
                 portability_enumeration: false,
+                surface_status: VulkanSurfaceStatus::Skipped,
+                surface_error: None,
             },
         )
     }
@@ -512,6 +571,8 @@ mod tests {
                     instance_status: VulkanInstanceStatus::Created,
                     instance_error: None,
                     portability_enumeration: false,
+                    surface_status: VulkanSurfaceStatus::Planned,
+                    surface_error: None,
                 },
             ),
             Err("passed native smoke report requires --frames >= 300".to_string())
@@ -546,6 +607,8 @@ mod tests {
                     instance_status: VulkanInstanceStatus::Skipped,
                     instance_error: None,
                     portability_enumeration: false,
+                    surface_status: VulkanSurfaceStatus::Skipped,
+                    surface_error: None,
                 },
             ),
             Err("passed native smoke report requires successful --probe-loader".to_string())
@@ -581,9 +644,48 @@ mod tests {
                     instance_status: VulkanInstanceStatus::Skipped,
                     instance_error: None,
                     portability_enumeration: false,
+                    surface_status: VulkanSurfaceStatus::Skipped,
+                    surface_error: None,
                 },
             ),
             Err("passed native smoke report requires successful --probe-instance".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_passed_without_surface_probe() {
+        let options = SmokeOptions::parse(&strings(&[
+            "--platform",
+            "linux",
+            "--out",
+            "target/native.json",
+            "--status",
+            "passed",
+            "--frames",
+            "300",
+            "--resize-count",
+            "1",
+            "--validation-error-count",
+            "0",
+            "--probe-instance",
+        ]))
+        .expect("options");
+
+        assert_eq!(
+            validate_smoke_options(
+                &options,
+                &VulkanBootstrapProbe {
+                    loader_status: VulkanLoaderStatus::Available,
+                    instance_api: Some("1.3.0".to_string()),
+                    loader_error: None,
+                    instance_status: VulkanInstanceStatus::Created,
+                    instance_error: None,
+                    portability_enumeration: false,
+                    surface_status: VulkanSurfaceStatus::Skipped,
+                    surface_error: None,
+                },
+            ),
+            Err("passed native smoke report requires successful --probe-surface".to_string())
         );
     }
 
@@ -609,6 +711,11 @@ mod tests {
                 instance_status: VulkanInstanceStatus::Skipped,
                 instance_error: None,
                 portability_enumeration: true,
+                surface_status: VulkanSurfaceStatus::MissingWindowHandles,
+                surface_error: Some(
+                    "native window/display handles are required for Vulkan surface creation"
+                        .to_string(),
+                ),
             },
         )?;
 
@@ -623,6 +730,10 @@ mod tests {
         assert!(json.contains("\"vulkan_instance_status\": \"skipped\""));
         assert!(json.contains("\"vulkan_instance_error\": null"));
         assert!(json.contains("\"vulkan_portability_enumeration\": true"));
+        assert!(json.contains("\"vulkan_surface_status\": \"missing_window_handles\""));
+        assert!(json.contains(
+            "\"vulkan_surface_error\": \"native window/display handles are required for Vulkan surface creation\""
+        ));
         assert!(json.contains("\"reason\": \"runner unavailable\""));
         Ok(())
     }
@@ -641,6 +752,25 @@ mod tests {
 
         assert!(options.probe_loader);
         assert!(options.probe_instance);
+        assert!(!options.probe_surface);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_surface_probe_as_instance_probe() -> Result<(), String> {
+        let options = SmokeOptions::parse(&strings(&[
+            "--platform",
+            "linux",
+            "--out",
+            "target/native.json",
+            "--probe-surface",
+            "--reason",
+            "runner unavailable",
+        ]))?;
+
+        assert!(options.probe_loader);
+        assert!(options.probe_instance);
+        assert!(options.probe_surface);
         Ok(())
     }
 
