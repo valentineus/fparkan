@@ -1468,6 +1468,9 @@ impl CoverageStatus {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AcceptanceAudit {
+    commit_sha: String,
+    rust_toolchain: String,
+    msrv: String,
     required_total: usize,
     covered: Vec<String>,
     partial: Vec<String>,
@@ -1597,6 +1600,9 @@ fn build_acceptance_audit(
         .collect();
 
     AcceptanceAudit {
+        commit_sha: current_git_commit_sha(),
+        rust_toolchain: PINNED_RUST_TOOLCHAIN.to_string(),
+        msrv: WORKSPACE_MSRV.to_string(),
         required_total: required.len(),
         covered,
         partial,
@@ -1615,6 +1621,9 @@ fn render_audit_json(audit: &AcceptanceAudit) -> String {
         concat!(
             "{{\n",
             "  \"schema_version\": \"fparkan-acceptance-coverage-v1\",\n",
+            "  \"commit_sha\": \"{}\",\n",
+            "  \"rust_toolchain\": \"{}\",\n",
+            "  \"msrv\": \"{}\",\n",
             "  \"required_total\": {},\n",
             "  \"covered_total\": {},\n",
             "  \"partial_total\": {},\n",
@@ -1633,6 +1642,9 @@ fn render_audit_json(audit: &AcceptanceAudit) -> String {
             "  \"coverage_evidence\": {}\n",
             "}}\n"
         ),
+        json_escape(&audit.commit_sha),
+        json_escape(&audit.rust_toolchain),
+        json_escape(&audit.msrv),
         audit.required_total,
         audit.covered.len(),
         audit.partial.len(),
@@ -1650,6 +1662,18 @@ fn render_audit_json(audit: &AcceptanceAudit) -> String {
         render_string_array(&audit.unknown_coverage),
         render_string_string_map(&audit.coverage_evidence)
     )
+}
+
+fn current_git_commit_sha() -> String {
+    Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| value.len() == 40 && value.chars().all(|ch| ch.is_ascii_hexdigit()))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn render_string_usize_map(values: &BTreeMap<String, usize>) -> String {
@@ -1959,6 +1983,9 @@ mod tests {
     #[test]
     fn audit_json_escapes_evidence() {
         let mut audit = AcceptanceAudit {
+            commit_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            rust_toolchain: PINNED_RUST_TOOLCHAIN.to_string(),
+            msrv: WORKSPACE_MSRV.to_string(),
             required_total: 1,
             covered: vec!["S0-ARCH-001".to_string()],
             partial: Vec::new(),
@@ -1976,6 +2003,9 @@ mod tests {
         let json = render_audit_json(&audit);
 
         assert!(json.contains("quoted \\\"value\\\""));
+        assert!(json.contains("\"commit_sha\": \"0123456789abcdef0123456789abcdef01234567\""));
+        assert!(json.contains("\"rust_toolchain\": \"1.87.0\""));
+        assert!(json.contains("\"msrv\": \"1.87\""));
     }
 
     #[test]
