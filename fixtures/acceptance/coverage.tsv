@@ -44,6 +44,8 @@ S0-VK-017	covered	cargo test -p fparkan-render-vulkan --offline swapchain_plan_j
 S0-VK-018	covered	cargo test -p fparkan-render-vulkan --offline triangle_shader_manifest_hashes_are_stable
 S0-VK-019	covered	cargo test -p fparkan-render-vulkan --offline shader_manifest_report_json_is_stable
 S0-VK-020	covered	cargo test -p fparkan-render-vulkan --offline shader_manifest_rejects_invalid_spirv_containers
+S0-VK-021	covered	cargo test -p fparkan-render-vulkan --offline frame_submission_plan_json_is_stable
+S0-VK-022	covered	cargo test -p fparkan-render-vulkan --offline backend_tracks_render_request_and_presents
 S0-LIMIT-001	covered	cargo test -p fparkan-binary --offline rejects_count_stride_overflow
 S0-LIMIT-002	covered	cargo test -p fparkan-binary --offline rejects_oversized_declared_allocation_before_read
 L1-P1-NRES-001	covered	cargo test -p fparkan-nres --offline licensed_corpora_nres_roundtrip_gates

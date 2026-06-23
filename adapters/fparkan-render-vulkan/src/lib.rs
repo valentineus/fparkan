@@ -31,7 +31,8 @@ use ash::{khr::surface, vk};
 use fparkan_binary::{sha256, sha256_hex};
 use fparkan_platform::{NativeWindowHandles, RenderRequest};
 use fparkan_render::{
-    canonical_capture, FrameOutput, RenderBackend, RenderCommandList, RenderError,
+    canonical_capture, validate_command_list, FrameOutput, RenderBackend, RenderCommand,
+    RenderCommandList, RenderError,
 };
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -906,6 +907,25 @@ pub struct VulkanSwapchainRecreationReport {
     pub next_extent: (u32, u32),
 }
 
+/// Deterministic frame submission plan for command buffers and sync objects.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VulkanFrameSubmissionPlan {
+    /// Report schema version.
+    pub schema: u32,
+    /// Frames allowed in flight.
+    pub frames_in_flight: u32,
+    /// Swapchain-backed primary command buffers.
+    pub command_buffers: u32,
+    /// Binary semaphores allocated per frame.
+    pub semaphores_per_frame: u32,
+    /// Fences allocated per frame.
+    pub fences_per_frame: u32,
+    /// Draw commands encoded into the frame.
+    pub draw_count: u32,
+    /// Total indexed vertices submitted by draw commands.
+    pub indexed_vertex_count: u32,
+}
+
 /// Synthetic physical-device capabilities used by negative tests and reports.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VulkanPhysicalDeviceRecord {
@@ -1137,6 +1157,39 @@ pub const fn swapchain_recreation_report(
     }
 }
 
+/// Builds a deterministic frame submission plan for a validated command list.
+///
+/// Stage 0 keeps this as a pure planning boundary so command-pool, command-buffer
+/// and synchronization policy can be tested without requiring a native surface.
+///
+/// # Errors
+///
+/// Returns [`RenderError`] when the command list has invalid frame framing,
+/// ordering, draw ranges, mesh bounds, or non-finite transforms.
+pub fn plan_vulkan_frame_submission(
+    swapchain: &VulkanSwapchainPlan,
+    commands: &RenderCommandList,
+) -> Result<VulkanFrameSubmissionPlan, RenderError> {
+    validate_command_list(commands)?;
+    let mut draw_count = 0_u32;
+    let mut indexed_vertex_count = 0_u32;
+    for command in &commands.commands {
+        if let RenderCommand::Draw(draw) = command {
+            draw_count = draw_count.saturating_add(1);
+            indexed_vertex_count = indexed_vertex_count.saturating_add(draw.range.count);
+        }
+    }
+    Ok(VulkanFrameSubmissionPlan {
+        schema: 1,
+        frames_in_flight: swapchain.image_count.clamp(1, 2),
+        command_buffers: swapchain.image_count,
+        semaphores_per_frame: 2,
+        fences_per_frame: 1,
+        draw_count,
+        indexed_vertex_count,
+    })
+}
+
 fn validate_device(
     device: &VulkanPhysicalDeviceRecord,
 ) -> Result<VulkanCapabilityReport, VulkanCapabilityError> {
@@ -1300,6 +1353,28 @@ pub fn render_swapchain_recreation_report_json(report: &VulkanSwapchainRecreatio
     out
 }
 
+/// Renders a deterministic JSON frame submission plan.
+#[must_use]
+pub fn render_frame_submission_plan_json(plan: &VulkanFrameSubmissionPlan) -> String {
+    let mut out = String::new();
+    out.push_str("{\"schema\":");
+    out.push_str(&plan.schema.to_string());
+    out.push_str(",\"frames_in_flight\":");
+    out.push_str(&plan.frames_in_flight.to_string());
+    out.push_str(",\"command_buffers\":");
+    out.push_str(&plan.command_buffers.to_string());
+    out.push_str(",\"semaphores_per_frame\":");
+    out.push_str(&plan.semaphores_per_frame.to_string());
+    out.push_str(",\"fences_per_frame\":");
+    out.push_str(&plan.fences_per_frame.to_string());
+    out.push_str(",\"draw_count\":");
+    out.push_str(&plan.draw_count.to_string());
+    out.push_str(",\"indexed_vertex_count\":");
+    out.push_str(&plan.indexed_vertex_count.to_string());
+    out.push('}');
+    out
+}
+
 fn format_api_version(version: u32) -> String {
     format!(
         "{}.{}.{}",
@@ -1345,6 +1420,8 @@ pub struct VulkanBackendReport {
     pub resize_rebuilds: u64,
     /// Last render request observed.
     pub request: RenderRequest,
+    /// Last deterministic frame submission plan.
+    pub last_frame_submission: Option<VulkanFrameSubmissionPlan>,
 }
 
 impl Default for VulkanBackendReport {
@@ -1359,6 +1436,7 @@ impl Default for VulkanBackendReport {
             presents: 0,
             resize_rebuilds: 0,
             request: RenderRequest::conservative(),
+            last_frame_submission: None,
         }
     }
 }
@@ -1368,6 +1446,7 @@ impl Default for VulkanBackendReport {
 pub struct VulkanBackend {
     state: VulkanBackendState,
     report: VulkanBackendReport,
+    swapchain_plan: VulkanSwapchainPlan,
 }
 
 impl Default for VulkanBackend {
@@ -1383,6 +1462,7 @@ impl VulkanBackend {
         Self {
             state: VulkanBackendState::Ready,
             report: VulkanBackendReport::default(),
+            swapchain_plan: default_stage0_swapchain_plan(),
         }
     }
 
@@ -1396,6 +1476,17 @@ impl VulkanBackend {
     #[must_use]
     pub const fn render_request(&self) -> RenderRequest {
         self.report.request
+    }
+
+    /// Replaces active swapchain plan used for frame submission planning.
+    pub fn set_swapchain_plan(&mut self, plan: VulkanSwapchainPlan) {
+        self.swapchain_plan = plan;
+    }
+
+    /// Returns active swapchain plan.
+    #[must_use]
+    pub const fn swapchain_plan(&self) -> &VulkanSwapchainPlan {
+        &self.swapchain_plan
     }
 
     /// Returns adapter state.
@@ -1424,11 +1515,26 @@ impl RenderBackend for VulkanBackend {
             return Err(RenderError::InvalidRange);
         }
         let capture = canonical_capture(commands)?;
+        let frame_plan = plan_vulkan_frame_submission(&self.swapchain_plan, commands)?;
         self.report.frames_executed = self.report.frames_executed.saturating_add(1);
         self.report.submissions = self.report.submissions.saturating_add(1);
         self.report.last_capture_size = capture.len();
+        self.report.last_frame_submission = Some(frame_plan);
         self.simulate_present();
         Ok(FrameOutput)
+    }
+}
+
+fn default_stage0_swapchain_plan() -> VulkanSwapchainPlan {
+    VulkanSwapchainPlan {
+        schema: 1,
+        extent: (1, 1),
+        format: VulkanSurfaceFormat {
+            format: vk::Format::B8G8R8A8_SRGB.as_raw(),
+            color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR.as_raw(),
+        },
+        present_mode: vk::PresentModeKHR::FIFO.as_raw(),
+        image_count: 2,
     }
 }
 
@@ -1470,6 +1576,54 @@ mod tests {
         assert_eq!(backend.report().submissions, 1);
         assert_eq!(backend.report().presents, 1);
         assert!(backend.report().last_capture_size > 0);
+        assert_eq!(
+            backend.report().last_frame_submission,
+            Some(VulkanFrameSubmissionPlan {
+                schema: 1,
+                frames_in_flight: 2,
+                command_buffers: 2,
+                semaphores_per_frame: 2,
+                fences_per_frame: 1,
+                draw_count: 1,
+                indexed_vertex_count: 3,
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn frame_submission_plan_json_is_stable() -> Result<(), RenderError> {
+        let commands = fparkan_render::RenderCommandList {
+            commands: vec![
+                RenderCommand::BeginFrame,
+                RenderCommand::Draw(DrawCommand {
+                    id: DrawId(11),
+                    phase: RenderPhase::Opaque,
+                    object_id: None,
+                    mesh: GpuMeshId(1),
+                    material: GpuMaterialId(2),
+                    transform: [1.0; 16],
+                    range: IndexRange { start: 0, count: 3 },
+                    stable_order: 7,
+                }),
+                RenderCommand::EndFrame,
+            ],
+        };
+        let swapchain = VulkanSwapchainPlan {
+            image_count: 3,
+            ..default_stage0_swapchain_plan()
+        };
+
+        let plan = plan_vulkan_frame_submission(&swapchain, &commands)?;
+
+        assert_eq!(plan.frames_in_flight, 2);
+        assert_eq!(plan.command_buffers, 3);
+        assert_eq!(plan.draw_count, 1);
+        assert_eq!(plan.indexed_vertex_count, 3);
+        assert_eq!(
+            render_frame_submission_plan_json(&plan),
+            "{\"schema\":1,\"frames_in_flight\":2,\"command_buffers\":3,\"semaphores_per_frame\":2,\"fences_per_frame\":1,\"draw_count\":1,\"indexed_vertex_count\":3}"
+        );
         Ok(())
     }
 
