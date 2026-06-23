@@ -1532,7 +1532,7 @@ fn validate_native_smoke_report(
         platform,
         report,
         "vulkan_surface_status",
-        "planned",
+        "created",
         failures,
     );
     expect_u64_at_least(platform, report, "frames", 300, failures);
@@ -2233,7 +2233,7 @@ mod tests {
                         "vulkan_loader_status": "available",
                         "vulkan_instance_status": "created",
                         "window_status": "created",
-                        "vulkan_surface_status": "planned"
+                        "vulkan_surface_status": "created"
                     }),
                 )
             })
