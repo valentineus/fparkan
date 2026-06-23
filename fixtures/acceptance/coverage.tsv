@@ -15,7 +15,7 @@ S0-ARCH-007	covered	cargo xtask ci runs fmt, policy, workspace test, clippy, rus
 S0-ARCH-008	covered	cargo xtask policy rejects moving Rust toolchains and workspace rust-version drift
 S0-ARCH-009	covered	.github/workflows/ci.yml runs a pinned MSRV backend-neutral crate job
 S0-ARCH-010	covered	cargo xtask acceptance audit emits commit_sha, rust_toolchain, and msrv metadata into the JSON artifact
-S0-ARCH-011	blocked	cargo xtask native-smoke report emits explicit per-platform blocked artifacts until real Vulkan 300-frame validation=0 runner is available
+S0-ARCH-011	blocked	cargo run -p fparkan-vulkan-smoke emits explicit per-platform blocked artifacts until real Vulkan 300-frame validation=0 runner is available
 S0-DIAG-001	covered	cargo test -p fparkan-diagnostics --offline diagnostic_chain_preserves_context
 S0-DIAG-002	covered	cargo test -p fparkan-diagnostics --offline json_is_stable
 S0-CORPUS-001	covered	cargo test -p fparkan-corpus --offline deterministic_traversal_is_creation_order_independent
@@ -50,6 +50,7 @@ S0-VK-019	covered	cargo test -p fparkan-render-vulkan --offline shader_manifest_
 S0-VK-020	covered	cargo test -p fparkan-render-vulkan --offline shader_manifest_rejects_invalid_spirv_containers
 S0-VK-021	covered	cargo test -p fparkan-render-vulkan --offline frame_submission_plan_json_is_stable
 S0-VK-022	covered	cargo test -p fparkan-render-vulkan --offline backend_tracks_render_request_and_presents
+S0-VK-023	covered	cargo test -p fparkan-vulkan-smoke --offline rejects_false_pass_without_full_evidence blocked_report_includes_shader_manifest_hash
 S0-LIMIT-001	covered	cargo test -p fparkan-binary --offline rejects_count_stride_overflow
 S0-LIMIT-002	covered	cargo test -p fparkan-binary --offline rejects_oversized_declared_allocation_before_read
 L1-P1-NRES-001	covered	cargo test -p fparkan-nres --offline licensed_corpora_nres_roundtrip_gates

@@ -73,7 +73,7 @@ jobs:
         if: always()
         shell: bash
         run: >
-          cargo xtask native-smoke report
+          cargo run -p fparkan-vulkan-smoke --locked --
           --platform "${{ matrix.smoke_platform }}"
           --out "target/fparkan/native-smoke/${{ runner.os }}.json"
           --status blocked

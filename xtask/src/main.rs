@@ -807,7 +807,11 @@ fn validate_dependency_boundaries(root: &Path, failures: &mut Vec<String>) -> Re
 fn is_app_package(package: &str) -> bool {
     matches!(
         package,
-        "fparkan-cli" | "fparkan-game" | "fparkan-headless" | "fparkan-viewer"
+        "fparkan-cli"
+            | "fparkan-game"
+            | "fparkan-headless"
+            | "fparkan-vulkan-smoke"
+            | "fparkan-viewer"
     )
 }
 
@@ -1209,6 +1213,7 @@ const ALL_WORKSPACE_PACKAGES: &[&str] = &[
     "fparkan-cli",
     "fparkan-game",
     "fparkan-headless",
+    "fparkan-vulkan-smoke",
     "fparkan-viewer",
     "xtask",
 ];
@@ -2087,6 +2092,7 @@ fn stage_packages(stage: u8) -> Result<&'static [&'static str], String> {
             "fparkan-runtime",
             "fparkan-headless",
             "fparkan-game",
+            "fparkan-vulkan-smoke",
         ]),
         _ => Err(format!("stage out of range: {stage}")),
     }

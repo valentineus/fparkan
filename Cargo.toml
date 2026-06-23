@@ -30,6 +30,7 @@ members = [
     "apps/fparkan-cli",
     "apps/fparkan-game",
     "apps/fparkan-headless",
+    "apps/fparkan-vulkan-smoke",
     "apps/fparkan-viewer",
     "xtask",
 ]

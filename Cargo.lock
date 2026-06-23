@@ -764,6 +764,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "fparkan-vulkan-smoke"
+version = "0.1.0"
+dependencies = [
+ "fparkan-render-vulkan",
+]
+
+[[package]]
 name = "fparkan-world"
 version = "0.1.0"
 dependencies = [
