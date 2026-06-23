@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+fparkan-platform-winit = { path = "../../adapters/fparkan-platform-winit" }
 fparkan-render-vulkan = { path = "../../adapters/fparkan-render-vulkan" }
 
 [lints]

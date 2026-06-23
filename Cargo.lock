@@ -767,6 +767,7 @@ dependencies = [
 name = "fparkan-vulkan-smoke"
 version = "0.1.0"
 dependencies = [
+ "fparkan-platform-winit",
  "fparkan-render-vulkan",
 ]
 

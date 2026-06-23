@@ -33,6 +33,8 @@ use winit::platform::scancode::PhysicalKeyExtScancode;
 use winit::window::Window;
 
 static NEXT_WINDOW_HANDLE_ID: AtomicU64 = AtomicU64::new(1);
+const DEFAULT_SMOKE_WIDTH: u32 = 1280;
+const DEFAULT_SMOKE_HEIGHT: u32 = 720;
 
 fn next_window_id() -> u64 {
     NEXT_WINDOW_HANDLE_ID.fetch_add(1, Ordering::Relaxed)
@@ -141,6 +143,44 @@ impl EventSource for WinitEventSource {
             out.push(event);
         }
         Ok(())
+    }
+}
+
+/// Window creation plan for native smoke entrypoints.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WinitWindowPlan {
+    /// Requested drawable width in physical pixels.
+    pub width: u32,
+    /// Requested drawable height in physical pixels.
+    pub height: u32,
+    /// Whether native window/display handles are required by the caller.
+    pub requires_native_handles: bool,
+}
+
+impl WinitWindowPlan {
+    /// Returns the Stage 0 native smoke window plan.
+    #[must_use]
+    pub const fn smoke() -> Self {
+        Self {
+            width: DEFAULT_SMOKE_WIDTH,
+            height: DEFAULT_SMOKE_HEIGHT,
+            requires_native_handles: true,
+        }
+    }
+
+    /// Validates the window plan before a native event loop is entered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PlatformError`] when the drawable extent is zero.
+    pub fn validate(self) -> Result<Self, PlatformError> {
+        if self.width == 0 || self.height == 0 {
+            return Err(PlatformError::Backend {
+                context: "winit window plan",
+                message: "drawable extent must be non-zero".to_string(),
+            });
+        }
+        Ok(self)
     }
 }
 
@@ -274,6 +314,33 @@ mod tests {
             }
         );
         assert!(window.native_handles().is_none());
+    }
+
+    #[test]
+    fn smoke_window_plan_requires_native_handles_and_nonzero_extent() -> Result<(), PlatformError> {
+        let plan = WinitWindowPlan::smoke().validate()?;
+
+        assert_eq!(plan.width, DEFAULT_SMOKE_WIDTH);
+        assert_eq!(plan.height, DEFAULT_SMOKE_HEIGHT);
+        assert!(plan.requires_native_handles);
+        Ok(())
+    }
+
+    #[test]
+    fn smoke_window_plan_rejects_zero_extent() {
+        let plan = WinitWindowPlan {
+            width: 0,
+            height: DEFAULT_SMOKE_HEIGHT,
+            requires_native_handles: true,
+        };
+
+        assert!(matches!(
+            plan.validate(),
+            Err(PlatformError::Backend {
+                context: "winit window plan",
+                ..
+            })
+        ));
     }
 
     #[test]
