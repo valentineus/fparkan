@@ -89,6 +89,10 @@ fn run(args: &[String]) -> Result<(), String> {
             let options = parse_audit_options(rest)?;
             run_acceptance_audit(&options)
         }
+        [cmd, subcmd, rest @ ..] if cmd == "native-smoke" && subcmd == "report" => {
+            let options = parse_native_smoke_options(rest)?;
+            run_native_smoke_report(&options)
+        }
         [cmd, rest @ ..] if cmd == "package" => {
             let options = parse_package_options(rest)?;
             run_package(&options)
@@ -111,7 +115,7 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         _ => Err(
-            "usage: cargo xtask ci | policy | acceptance report --suite synthetic|licensed [--stage 0..5|all] [--manifest corpora.toml] [--out <path>] | acceptance audit [--roadmap <path>] [--coverage <path>] [--out <path>] [--strict] | package --target <triple> --app viewer|game|headless|cli | test synthetic|licensed [--stage 0..5|all] [--manifest corpora.toml] | corpus baseline --root <path>"
+            "usage: cargo xtask ci | policy | acceptance report --suite synthetic|licensed [--stage 0..5|all] [--manifest corpora.toml] [--out <path>] | acceptance audit [--roadmap <path>] [--coverage <path>] [--out <path>] [--strict] | native-smoke report --platform <windows|linux|macos> --out <path> [--status blocked|passed] [--frames <n>] [--resize-count <n>] [--validation-error-count <n>] [--shader-manifest-hash <hex>] [--reason <text>] | package --target <triple> --app viewer|game|headless|cli | test synthetic|licensed [--stage 0..5|all] [--manifest corpora.toml] | corpus baseline --root <path>"
                 .to_string(),
         ),
     }
@@ -1281,6 +1285,67 @@ struct AuditOptions {
     strict: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeSmokeOptions {
+    platform: NativeSmokePlatform,
+    out: PathBuf,
+    status: NativeSmokeStatus,
+    frames: u32,
+    resize_count: u32,
+    validation_error_count: Option<u32>,
+    shader_manifest_hash: Option<String>,
+    reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeSmokePlatform {
+    Windows,
+    Linux,
+    Macos,
+}
+
+impl NativeSmokePlatform {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "windows" => Ok(Self::Windows),
+            "linux" => Ok(Self::Linux),
+            "macos" => Ok(Self::Macos),
+            _ => Err(format!("unknown native smoke platform: {value}")),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Windows => "windows",
+            Self::Linux => "linux",
+            Self::Macos => "macos",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeSmokeStatus {
+    Blocked,
+    Passed,
+}
+
+impl NativeSmokeStatus {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "blocked" => Ok(Self::Blocked),
+            "passed" => Ok(Self::Passed),
+            _ => Err(format!("unknown native smoke status: {value}")),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Blocked => "blocked",
+            Self::Passed => "passed",
+        }
+    }
+}
+
 fn parse_test_options(args: &[String], default_root: PathBuf) -> Result<TestOptions, String> {
     let mut options = TestOptions {
         stage: Stage::All,
@@ -1414,6 +1479,184 @@ fn parse_audit_options(args: &[String]) -> Result<AuditOptions, String> {
         out,
         strict,
     })
+}
+
+fn parse_native_smoke_options(args: &[String]) -> Result<NativeSmokeOptions, String> {
+    let mut platform = None;
+    let mut out = None;
+    let mut status = NativeSmokeStatus::Blocked;
+    let mut frames = 0;
+    let mut resize_count = 0;
+    let mut validation_error_count = None;
+    let mut shader_manifest_hash = None;
+    let mut reason = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--platform" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--platform requires a value".to_string())?;
+                platform = Some(NativeSmokePlatform::parse(value)?);
+            }
+            "--out" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--out requires a path".to_string())?;
+                out = Some(PathBuf::from(value));
+            }
+            "--status" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--status requires a value".to_string())?;
+                status = NativeSmokeStatus::parse(value)?;
+            }
+            "--frames" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--frames requires a value".to_string())?;
+                frames = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid --frames value: {value}"))?;
+            }
+            "--resize-count" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--resize-count requires a value".to_string())?;
+                resize_count = value
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid --resize-count value: {value}"))?;
+            }
+            "--validation-error-count" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--validation-error-count requires a value".to_string())?;
+                validation_error_count = Some(
+                    value
+                        .parse::<u32>()
+                        .map_err(|_| format!("invalid --validation-error-count value: {value}"))?,
+                );
+            }
+            "--shader-manifest-hash" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--shader-manifest-hash requires a value".to_string())?;
+                shader_manifest_hash = Some(value.to_string());
+            }
+            "--reason" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--reason requires a value".to_string())?;
+                reason = Some(value.to_string());
+            }
+            _ => return Err(format!("unknown native smoke option: {arg}")),
+        }
+    }
+
+    Ok(NativeSmokeOptions {
+        platform: platform.ok_or_else(|| "missing --platform".to_string())?,
+        out: out.ok_or_else(|| "missing --out".to_string())?,
+        status,
+        frames,
+        resize_count,
+        validation_error_count,
+        shader_manifest_hash,
+        reason,
+    })
+}
+
+fn run_native_smoke_report(options: &NativeSmokeOptions) -> Result<(), String> {
+    validate_native_smoke_options(options)?;
+    if let Some(parent) = options.out.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
+    }
+    fs::write(&options.out, render_native_smoke_report_json(options))
+        .map_err(|err| format!("{}: {err}", options.out.display()))?;
+    println!("{}", options.out.display());
+    Ok(())
+}
+
+fn validate_native_smoke_options(options: &NativeSmokeOptions) -> Result<(), String> {
+    match options.status {
+        NativeSmokeStatus::Blocked => {
+            if options
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+            {
+                return Err("blocked native smoke report requires --reason".to_string());
+            }
+        }
+        NativeSmokeStatus::Passed => {
+            if options.frames < 300 {
+                return Err("passed native smoke report requires --frames >= 300".to_string());
+            }
+            if options.resize_count == 0 {
+                return Err("passed native smoke report requires --resize-count >= 1".to_string());
+            }
+            if options.validation_error_count != Some(0) {
+                return Err(
+                    "passed native smoke report requires --validation-error-count 0".to_string(),
+                );
+            }
+            let hash = options.shader_manifest_hash.as_deref().unwrap_or_default();
+            if !is_hex_hash(hash) {
+                return Err(
+                    "passed native smoke report requires a hex --shader-manifest-hash".to_string(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_hex_hash(value: &str) -> bool {
+    value.len() == 64 && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn render_native_smoke_report_json(options: &NativeSmokeOptions) -> String {
+    let validation_error_count = options
+        .validation_error_count
+        .map_or_else(|| "null".to_string(), |value| value.to_string());
+    let shader_manifest_hash = options
+        .shader_manifest_hash
+        .as_ref()
+        .map_or_else(|| "null".to_string(), |value| json_string(value));
+    let reason = options
+        .reason
+        .as_ref()
+        .map_or_else(|| "null".to_string(), |value| json_string(value));
+    format!(
+        concat!(
+            "{{\n",
+            "  \"schema_version\": \"fparkan-native-smoke-v1\",\n",
+            "  \"commit_sha\": \"{}\",\n",
+            "  \"rust_toolchain\": \"{}\",\n",
+            "  \"platform\": \"{}\",\n",
+            "  \"status\": \"{}\",\n",
+            "  \"frames\": {},\n",
+            "  \"resize_count\": {},\n",
+            "  \"validation_error_count\": {},\n",
+            "  \"shader_manifest_hash\": {},\n",
+            "  \"reason\": {}\n",
+            "}}\n"
+        ),
+        json_escape(&current_git_commit_sha()),
+        json_escape(PINNED_RUST_TOOLCHAIN),
+        options.platform.as_str(),
+        options.status.as_str(),
+        options.frames,
+        options.resize_count,
+        validation_error_count,
+        shader_manifest_hash,
+        reason
+    )
+}
+
+fn json_string(value: &str) -> String {
+    format!("\"{}\"", json_escape(value))
 }
 
 fn run_acceptance_audit(options: &AuditOptions) -> Result<(), String> {
@@ -2006,6 +2249,75 @@ mod tests {
         assert!(json.contains("\"commit_sha\": \"0123456789abcdef0123456789abcdef01234567\""));
         assert!(json.contains("\"rust_toolchain\": \"1.87.0\""));
         assert!(json.contains("\"msrv\": \"1.87\""));
+    }
+
+    #[test]
+    fn native_smoke_blocked_report_requires_reason() {
+        let options = NativeSmokeOptions {
+            platform: NativeSmokePlatform::Linux,
+            out: PathBuf::from("target/native.json"),
+            status: NativeSmokeStatus::Blocked,
+            frames: 0,
+            resize_count: 0,
+            validation_error_count: None,
+            shader_manifest_hash: None,
+            reason: None,
+        };
+
+        assert_eq!(
+            validate_native_smoke_options(&options),
+            Err("blocked native smoke report requires --reason".to_string())
+        );
+    }
+
+    #[test]
+    fn native_smoke_passed_report_requires_full_evidence() {
+        let mut options = NativeSmokeOptions {
+            platform: NativeSmokePlatform::Linux,
+            out: PathBuf::from("target/native.json"),
+            status: NativeSmokeStatus::Passed,
+            frames: 299,
+            resize_count: 1,
+            validation_error_count: Some(0),
+            shader_manifest_hash: Some("a".repeat(64)),
+            reason: None,
+        };
+
+        assert_eq!(
+            validate_native_smoke_options(&options),
+            Err("passed native smoke report requires --frames >= 300".to_string())
+        );
+
+        options.frames = 300;
+        options.validation_error_count = Some(1);
+        assert_eq!(
+            validate_native_smoke_options(&options),
+            Err("passed native smoke report requires --validation-error-count 0".to_string())
+        );
+    }
+
+    #[test]
+    fn native_smoke_report_json_is_stable() -> Result<(), String> {
+        let options = parse_native_smoke_options(&strings(&[
+            "--platform",
+            "macos",
+            "--out",
+            "target/native.json",
+            "--status",
+            "blocked",
+            "--reason",
+            "runner unavailable",
+        ]))?;
+
+        validate_native_smoke_options(&options)?;
+        let json = render_native_smoke_report_json(&options);
+
+        assert!(json.contains("\"schema_version\": \"fparkan-native-smoke-v1\""));
+        assert!(json.contains("\"platform\": \"macos\""));
+        assert!(json.contains("\"status\": \"blocked\""));
+        assert!(json.contains("\"validation_error_count\": null"));
+        assert!(json.contains("\"reason\": \"runner unavailable\""));
+        Ok(())
     }
 
     #[test]

@@ -51,10 +51,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - windows-latest
-          - macos-latest
+        include:
+          - os: ubuntu-latest
+            smoke_platform: linux
+          - os: windows-latest
+            smoke_platform: windows
+          - os: macos-latest
+            smoke_platform: macos
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -66,10 +69,21 @@ jobs:
         run: cargo install cargo-deny --locked
       - name: Run canonical CI gate
         run: cargo xtask ci
+      - name: Record native Vulkan smoke status
+        if: always()
+        shell: bash
+        run: >
+          cargo xtask native-smoke report
+          --platform "${{ matrix.smoke_platform }}"
+          --out "target/fparkan/native-smoke/${{ runner.os }}.json"
+          --status blocked
+          --reason "native Vulkan smoke runner is not enabled on this CI lane yet"
       - name: Upload acceptance evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: stage-0-2-acceptance-${{ matrix.os }}
-          path: target/fparkan/acceptance/stage-0-2-audit.json
+          path: |
+            target/fparkan/acceptance/stage-0-2-audit.json
+            target/fparkan/native-smoke/*.json
           if-no-files-found: ignore

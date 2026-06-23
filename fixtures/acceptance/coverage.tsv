@@ -15,6 +15,7 @@ S0-ARCH-007	covered	cargo xtask ci runs fmt, policy, workspace test, clippy, rus
 S0-ARCH-008	covered	cargo xtask policy rejects moving Rust toolchains and workspace rust-version drift
 S0-ARCH-009	covered	.github/workflows/ci.yml runs a pinned MSRV backend-neutral crate job
 S0-ARCH-010	covered	cargo xtask acceptance audit emits commit_sha, rust_toolchain, and msrv metadata into the JSON artifact
+S0-ARCH-011	blocked	cargo xtask native-smoke report emits explicit per-platform blocked artifacts until real Vulkan 300-frame validation=0 runner is available
 S0-DIAG-001	covered	cargo test -p fparkan-diagnostics --offline diagnostic_chain_preserves_context
 S0-DIAG-002	covered	cargo test -p fparkan-diagnostics --offline json_is_stable
 S0-CORPUS-001	covered	cargo test -p fparkan-corpus --offline deterministic_traversal_is_creation_order_independent
