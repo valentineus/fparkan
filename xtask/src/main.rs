@@ -1527,7 +1527,7 @@ fn validate_native_smoke_report(
         "created",
         failures,
     );
-    expect_string_field(platform, report, "window_status", "planned", failures);
+    expect_string_field(platform, report, "window_status", "created", failures);
     expect_string_field(
         platform,
         report,
@@ -2232,7 +2232,7 @@ mod tests {
                         "shader_manifest_hash": "dd293e4ff08ffca1c037900d08b0ffd415db39f238b4fcdde46468fa049b679c",
                         "vulkan_loader_status": "available",
                         "vulkan_instance_status": "created",
-                        "window_status": "planned",
+                        "window_status": "created",
                         "vulkan_surface_status": "planned"
                     }),
                 )

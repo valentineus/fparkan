@@ -28,9 +28,12 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use winit::application::ApplicationHandler;
+use winit::dpi::PhysicalSize as WinitPhysicalSize;
 use winit::event::{Event, MouseButton, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::platform::scancode::PhysicalKeyExtScancode;
-use winit::window::Window;
+use winit::window::{Window, WindowId};
 
 static NEXT_WINDOW_HANDLE_ID: AtomicU64 = AtomicU64::new(1);
 const DEFAULT_SMOKE_WIDTH: u32 = 1280;
@@ -184,8 +187,115 @@ impl WinitWindowPlan {
     }
 }
 
+/// Native smoke window creation result.
+#[derive(Clone, Copy, Debug)]
+pub struct WinitSmokeWindowProbe {
+    /// Validated creation plan.
+    pub plan: WinitWindowPlan,
+    /// Captured window descriptor.
+    pub window: WinitWindow,
+}
+
+impl WinitSmokeWindowProbe {
+    /// Returns raw native handles captured from the native window.
+    #[must_use]
+    pub fn native_handles(&self) -> Option<NativeWindowHandles> {
+        self.window.native_handles()
+    }
+}
+
+/// Creates a native smoke window, captures raw handles, then exits the event loop.
+///
+/// # Errors
+///
+/// Returns [`PlatformError`] when the plan is invalid, the event loop/window
+/// cannot be created, or raw native handles are unavailable.
+pub fn probe_smoke_window() -> Result<WinitSmokeWindowProbe, PlatformError> {
+    let plan = WinitWindowPlan::smoke().validate()?;
+    let event_loop = EventLoop::new().map_err(|err| PlatformError::Backend {
+        context: "winit event loop",
+        message: err.to_string(),
+    })?;
+    let mut app = SmokeWindowApp::new(plan);
+    event_loop
+        .run_app(&mut app)
+        .map_err(|err| PlatformError::Backend {
+            context: "winit event loop",
+            message: err.to_string(),
+        })?;
+    app.into_probe()
+}
+
+struct SmokeWindowApp {
+    plan: WinitWindowPlan,
+    window: Option<WinitWindow>,
+    error: Option<String>,
+}
+
+impl SmokeWindowApp {
+    const fn new(plan: WinitWindowPlan) -> Self {
+        Self {
+            plan,
+            window: None,
+            error: None,
+        }
+    }
+
+    fn into_probe(self) -> Result<WinitSmokeWindowProbe, PlatformError> {
+        if let Some(message) = self.error {
+            return Err(PlatformError::Backend {
+                context: "winit smoke window",
+                message,
+            });
+        }
+        let window = self.window.ok_or_else(|| PlatformError::Backend {
+            context: "winit smoke window",
+            message: "event loop exited before creating a window".to_string(),
+        })?;
+        if self.plan.requires_native_handles && window.native_handles().is_none() {
+            return Err(PlatformError::Backend {
+                context: "winit smoke window",
+                message: "native window/display handles are unavailable".to_string(),
+            });
+        }
+        Ok(WinitSmokeWindowProbe {
+            plan: self.plan,
+            window,
+        })
+    }
+}
+
+impl ApplicationHandler for SmokeWindowApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() || self.error.is_some() {
+            event_loop.exit();
+            return;
+        }
+        let attributes = Window::default_attributes()
+            .with_title("FParkan Vulkan smoke")
+            .with_inner_size(WinitPhysicalSize::new(self.plan.width, self.plan.height));
+        match event_loop.create_window(attributes) {
+            Ok(window) => {
+                self.window = Some(WinitWindow::from_window(&window));
+            }
+            Err(err) => {
+                self.error = Some(err.to_string());
+            }
+        }
+        event_loop.exit();
+    }
+
+    fn window_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        _event: WindowEvent,
+    ) {
+    }
+}
+
 /// Minimal window view over a `winit` window.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct WinitWindow {
     handle: WindowHandle,
     width: u32,
@@ -338,6 +448,36 @@ mod tests {
             plan.validate(),
             Err(PlatformError::Backend {
                 context: "winit window plan",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn smoke_window_app_requires_created_native_window() {
+        let app = SmokeWindowApp::new(WinitWindowPlan::smoke());
+
+        assert!(matches!(
+            app.into_probe(),
+            Err(PlatformError::Backend {
+                context: "winit smoke window",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn smoke_window_app_rejects_synthetic_window_without_native_handles() {
+        let mut app = SmokeWindowApp::new(WinitWindowPlan::smoke());
+        app.window = Some(WinitWindow::synthetic(
+            DEFAULT_SMOKE_WIDTH,
+            DEFAULT_SMOKE_HEIGHT,
+        ));
+
+        assert!(matches!(
+            app.into_probe(),
+            Err(PlatformError::Backend {
+                context: "winit smoke window",
                 ..
             })
         ));
