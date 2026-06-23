@@ -39,6 +39,8 @@ const CI_ACCEPTANCE_COVERAGE: &str = "fixtures/acceptance/coverage.tsv";
 const CI_ACCEPTANCE_REPORT: &str = "target/fparkan/acceptance/stage-0-2-audit.json";
 const APPROVED_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const SUPPLY_CHAIN_BANNED_PACKAGES: &[&str] = &["native-tls", "openssl", "openssl-sys"];
+const PINNED_RUST_TOOLCHAIN: &str = "1.87.0";
+const WORKSPACE_MSRV: &str = "1.87";
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -447,6 +449,7 @@ fn run_package(options: &PackageOptions) -> Result<(), String> {
 
 fn run_policy(root: &Path) -> Result<(), String> {
     let mut failures = Vec::new();
+    validate_toolchain_policy(root, &mut failures)?;
     scan_policy_dir(root, &mut failures)?;
     validate_cargo_metadata(root, &mut failures)?;
     validate_cargo_metadata_dependency_closures(root, &mut failures)?;
@@ -542,6 +545,86 @@ fn dependency_closure_names(
         }
     }
     names
+}
+
+fn validate_toolchain_policy(root: &Path, failures: &mut Vec<String>) -> Result<(), String> {
+    let toolchain_path = root.join("rust-toolchain.toml");
+    let toolchain_text = fs::read_to_string(&toolchain_path)
+        .map_err(|err| format!("{}: {err}", toolchain_path.display()))?;
+    let toolchain = toml::from_str::<RustToolchainToml>(&toolchain_text)
+        .map_err(|err| format!("{}: invalid TOML: {err}", toolchain_path.display()))?;
+    if toolchain.toolchain.channel != PINNED_RUST_TOOLCHAIN {
+        failures.push(format!(
+            "{}: toolchain channel must be exact {PINNED_RUST_TOOLCHAIN}",
+            toolchain_path.display()
+        ));
+    }
+    if !is_exact_rust_patch_version(&toolchain.toolchain.channel) {
+        failures.push(format!(
+            "{}: toolchain channel must include major.minor.patch, not a moving channel",
+            toolchain_path.display()
+        ));
+    }
+
+    let manifest_path = root.join("Cargo.toml");
+    let manifest_text = fs::read_to_string(&manifest_path)
+        .map_err(|err| format!("{}: {err}", manifest_path.display()))?;
+    let manifest = toml::from_str::<WorkspaceManifestToml>(&manifest_text)
+        .map_err(|err| format!("{}: invalid TOML: {err}", manifest_path.display()))?;
+    if manifest.workspace.package.rust_version != WORKSPACE_MSRV {
+        failures.push(format!(
+            "{}: workspace.package.rust-version must be {WORKSPACE_MSRV}",
+            manifest_path.display()
+        ));
+    }
+    if !PINNED_RUST_TOOLCHAIN.starts_with(&format!("{}.", manifest.workspace.package.rust_version))
+    {
+        failures.push(format!(
+            "{}: workspace.package.rust-version must match pinned toolchain major.minor",
+            manifest_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn is_exact_rust_patch_version(value: &str) -> bool {
+    let parts = value.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RustToolchainToml {
+    toolchain: RustToolchainTable,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RustToolchainTable {
+    channel: String,
+    #[allow(dead_code)]
+    components: Option<Vec<String>>,
+    #[allow(dead_code)]
+    targets: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceManifestToml {
+    workspace: WorkspaceTable,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspaceTable {
+    package: WorkspacePackageTable,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkspacePackageTable {
+    #[serde(rename = "rust-version")]
+    rust_version: String,
 }
 
 fn validate_lockfile(root: &Path, failures: &mut Vec<String>) {
@@ -2018,6 +2101,56 @@ fparkan-render-vulkan = { path = "../../adapters/fparkan-render-vulkan" }
             first_forbidden_platform_bridge_dependency(&closure),
             Some("fparkan-render-vulkan")
         );
+    }
+
+    #[test]
+    fn toolchain_policy_rejects_moving_toolchain() -> Result<(), String> {
+        let root = temp_dir("toolchain-moving");
+        fs::create_dir_all(&root).map_err(|err| err.to_string())?;
+        fs::write(
+            root.join("rust-toolchain.toml"),
+            "[toolchain]\nchannel = \"stable\"\n",
+        )
+        .map_err(|err| err.to_string())?;
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\n[workspace.package]\nrust-version = \"1.87\"\n",
+        )
+        .map_err(|err| err.to_string())?;
+
+        let mut failures = Vec::new();
+        validate_toolchain_policy(&root, &mut failures)?;
+
+        assert_eq!(failures.len(), 2);
+        assert!(failures[0].contains("must be exact"));
+        assert!(failures[1].contains("major.minor.patch"));
+        fs::remove_dir_all(root).map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn toolchain_policy_rejects_msrv_mismatch() -> Result<(), String> {
+        let root = temp_dir("toolchain-msrv");
+        fs::create_dir_all(&root).map_err(|err| err.to_string())?;
+        fs::write(
+            root.join("rust-toolchain.toml"),
+            format!("[toolchain]\nchannel = \"{PINNED_RUST_TOOLCHAIN}\"\n"),
+        )
+        .map_err(|err| err.to_string())?;
+        fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\n[workspace.package]\nrust-version = \"1.86\"\n",
+        )
+        .map_err(|err| err.to_string())?;
+
+        let mut failures = Vec::new();
+        validate_toolchain_policy(&root, &mut failures)?;
+
+        assert_eq!(failures.len(), 2);
+        assert!(failures[0].contains("rust-version must be"));
+        assert!(failures[1].contains("must match pinned toolchain"));
+        fs::remove_dir_all(root).map_err(|err| err.to_string())?;
+        Ok(())
     }
 
     #[test]

@@ -7,6 +7,44 @@ on:
     branches: [main]
 
 jobs:
+  msrv-backend-neutral:
+    name: MSRV backend-neutral crates
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.87.0
+      - name: Test backend-neutral crates
+        run: >
+          cargo test
+          -p fparkan-animation
+          -p fparkan-binary
+          -p fparkan-corpus
+          -p fparkan-diagnostics
+          -p fparkan-fx
+          -p fparkan-inspection
+          -p fparkan-material
+          -p fparkan-mission-format
+          -p fparkan-msh
+          -p fparkan-nres
+          -p fparkan-path
+          -p fparkan-platform
+          -p fparkan-prototype
+          -p fparkan-render
+          -p fparkan-resource
+          -p fparkan-rsli
+          -p fparkan-runtime
+          -p fparkan-terrain
+          -p fparkan-terrain-format
+          -p fparkan-texm
+          -p fparkan-vfs
+          -p fparkan-world
+          --all-targets
+          --locked
+
   stage0-matrix:
     name: Stage 0-2 CI (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
