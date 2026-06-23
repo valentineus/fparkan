@@ -61,8 +61,9 @@ S0-VK-028	covered	cargo test -p fparkan-vulkan-smoke --offline reports_rustc_hos
 S0-VK-029	covered	cargo test -p xtask --offline native_smoke_audit_accepts_complete_three_platform_pass native_smoke_audit_rejects_blocked_or_incomplete_reports
 S0-VK-030	covered	cargo test -p fparkan-vulkan-smoke --offline rejects_passed_with_failed_surface
 S0-VK-031	covered	cargo test -p fparkan-vulkan-smoke --offline rejects_passed_without_selected_device
-S0-VK-032	covered	cargo test -p fparkan-vulkan-smoke --offline rejects_passed_without_planned_swapchain
+S0-VK-032	covered	cargo test -p fparkan-vulkan-smoke --offline rejects_passed_without_created_swapchain
 S0-VK-033	covered	cargo test -p fparkan-vulkan-smoke --offline rejects_passed_without_created_logical_device
+S0-VK-034	covered	cargo test -p xtask --offline native_smoke_audit_accepts_complete_three_platform_pass native_smoke_audit_rejects_blocked_or_incomplete_reports
 S0-LIMIT-001	covered	cargo test -p fparkan-binary --offline rejects_count_stride_overflow
 S0-LIMIT-002	covered	cargo test -p fparkan-binary --offline rejects_oversized_declared_allocation_before_read
 L1-P1-NRES-001	covered	cargo test -p fparkan-nres --offline licensed_corpora_nres_roundtrip_gates

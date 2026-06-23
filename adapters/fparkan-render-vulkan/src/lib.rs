@@ -27,7 +27,10 @@
 //!
 //! This crate is the declared low-level Vulkan boundary.
 
-use ash::{khr::surface, vk};
+use ash::{
+    khr::{surface, swapchain},
+    vk,
+};
 use fparkan_binary::{sha256, sha256_hex};
 use fparkan_platform::{NativeWindowHandles, RenderRequest};
 use fparkan_render::{
@@ -323,6 +326,7 @@ pub struct VulkanRuntimeCapabilityProbe {
 /// Created Vulkan logical device probe.
 pub struct VulkanLogicalDeviceProbe {
     device: ash::Device,
+    physical_device: vk::PhysicalDevice,
     /// Runtime capability report used for device selection.
     pub runtime: VulkanRuntimeCapabilityProbe,
     /// Deterministic logical device creation report.
@@ -349,6 +353,32 @@ pub struct VulkanLogicalDeviceReport {
     pub present_queue_family: u32,
     /// Enabled device extensions.
     pub enabled_extensions: Vec<String>,
+}
+
+/// Created Vulkan swapchain probe.
+pub struct VulkanSwapchainProbe {
+    loader: swapchain::Device,
+    swapchain: vk::SwapchainKHR,
+    /// Deterministic swapchain creation report.
+    pub report: VulkanSwapchainReport,
+}
+
+impl Drop for VulkanSwapchainProbe {
+    fn drop(&mut self) {
+        // SAFETY: The swapchain was created by this probe and is destroyed once during drop.
+        unsafe { self.loader.destroy_swapchain(self.swapchain, None) };
+    }
+}
+
+/// Runtime swapchain creation report.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VulkanSwapchainReport {
+    /// Report schema version.
+    pub schema: u32,
+    /// Deterministic swapchain policy used for creation.
+    pub plan: VulkanSwapchainPlan,
+    /// Number of images returned by `vkGetSwapchainImagesKHR`.
+    pub image_count: u32,
 }
 
 /// Live Vulkan device/surface capability probe error.
@@ -479,6 +509,44 @@ impl std::fmt::Display for VulkanLogicalDeviceError {
 
 impl std::error::Error for VulkanLogicalDeviceError {}
 
+/// Vulkan swapchain creation error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VulkanSwapchainProbeError {
+    /// Surface capability query failed.
+    SurfaceCapabilitiesFailed {
+        /// Vulkan result.
+        result: String,
+    },
+    /// Swapchain creation failed.
+    CreateFailed {
+        /// Vulkan result.
+        result: String,
+    },
+    /// Swapchain image query failed.
+    ImagesFailed {
+        /// Vulkan result.
+        result: String,
+    },
+}
+
+impl std::fmt::Display for VulkanSwapchainProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SurfaceCapabilitiesFailed { result } => {
+                write!(f, "Vulkan surface capabilities query failed: {result}")
+            }
+            Self::CreateFailed { result } => {
+                write!(f, "Vulkan swapchain creation failed: {result}")
+            }
+            Self::ImagesFailed { result } => {
+                write!(f, "Vulkan swapchain image query failed: {result}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VulkanSwapchainProbeError {}
+
 /// Builds a deterministic Vulkan surface plan from native window handles.
 ///
 /// # Errors
@@ -606,6 +674,7 @@ pub fn create_vulkan_logical_device_probe(
     let _present_queue = unsafe { device.get_device_queue(capability.present_queue_family, 0) };
     Ok(VulkanLogicalDeviceProbe {
         device,
+        physical_device: selected.physical_device,
         report: VulkanLogicalDeviceReport {
             schema: 1,
             device_name: capability.device_name.clone(),
@@ -614,6 +683,83 @@ pub fn create_vulkan_logical_device_probe(
             enabled_extensions: capability.enabled_extensions.clone(),
         },
         runtime: selected.runtime,
+    })
+}
+
+/// Creates a Vulkan swapchain for the live logical device and surface.
+///
+/// # Errors
+///
+/// Returns [`VulkanSwapchainProbeError`] when live surface capability queries,
+/// swapchain creation, or swapchain image enumeration fails.
+pub fn create_vulkan_swapchain_probe(
+    instance: &VulkanInstanceProbe,
+    surface: &VulkanSurfaceProbe,
+    device: &VulkanLogicalDeviceProbe,
+) -> Result<VulkanSwapchainProbe, VulkanSwapchainProbeError> {
+    let raw_capabilities = {
+        // SAFETY: The physical device and surface are live query inputs and no handles are retained.
+        unsafe {
+            surface
+                .loader
+                .get_physical_device_surface_capabilities(device.physical_device, surface.surface)
+        }
+    }
+    .map_err(
+        |error| VulkanSwapchainProbeError::SurfaceCapabilitiesFailed {
+            result: format!("{error:?}"),
+        },
+    )?;
+    let plan = &device.runtime.swapchain;
+    let queue_family_indices = unique_queue_families(
+        device.runtime.capability.graphics_queue_family,
+        device.runtime.capability.present_queue_family,
+    );
+    let sharing_mode = if queue_family_indices.len() > 1 {
+        vk::SharingMode::CONCURRENT
+    } else {
+        vk::SharingMode::EXCLUSIVE
+    };
+    let create_info = vk::SwapchainCreateInfoKHR::default()
+        .surface(surface.surface)
+        .min_image_count(plan.image_count)
+        .image_format(vk::Format::from_raw(plan.format.format))
+        .image_color_space(vk::ColorSpaceKHR::from_raw(plan.format.color_space))
+        .image_extent(vk::Extent2D {
+            width: plan.extent.0,
+            height: plan.extent.1,
+        })
+        .image_array_layers(1)
+        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+        .image_sharing_mode(sharing_mode)
+        .queue_family_indices(&queue_family_indices)
+        .pre_transform(raw_capabilities.current_transform)
+        .composite_alpha(select_composite_alpha(
+            raw_capabilities.supported_composite_alpha,
+        ))
+        .present_mode(vk::PresentModeKHR::from_raw(plan.present_mode))
+        .clipped(true);
+    let loader = swapchain::Device::new(&instance.instance, &device.device);
+    // SAFETY: The create info references live instance/device/surface handles for this call.
+    let swapchain = unsafe { loader.create_swapchain(&create_info, None) }.map_err(|error| {
+        VulkanSwapchainProbeError::CreateFailed {
+            result: format!("{error:?}"),
+        }
+    })?;
+    // SAFETY: The swapchain was created above and the returned image handles are owned by it.
+    let images = unsafe { loader.get_swapchain_images(swapchain) }.map_err(|error| {
+        VulkanSwapchainProbeError::ImagesFailed {
+            result: format!("{error:?}"),
+        }
+    })?;
+    Ok(VulkanSwapchainProbe {
+        loader,
+        swapchain,
+        report: VulkanSwapchainReport {
+            schema: 1,
+            plan: plan.clone(),
+            image_count: images.len().try_into().unwrap_or(u32::MAX),
+        },
     })
 }
 
@@ -1662,6 +1808,18 @@ fn select_image_count(capabilities: VulkanSwapchainSurfaceCapabilities) -> u32 {
         requested
     } else {
         requested.min(capabilities.max_image_count)
+    }
+}
+
+fn select_composite_alpha(supported: vk::CompositeAlphaFlagsKHR) -> vk::CompositeAlphaFlagsKHR {
+    if supported.contains(vk::CompositeAlphaFlagsKHR::OPAQUE) {
+        vk::CompositeAlphaFlagsKHR::OPAQUE
+    } else if supported.contains(vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED) {
+        vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED
+    } else if supported.contains(vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED) {
+        vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED
+    } else {
+        vk::CompositeAlphaFlagsKHR::INHERIT
     }
 }
 

@@ -1553,7 +1553,7 @@ fn validate_native_smoke_report(
         platform,
         report,
         "vulkan_swapchain_status",
-        "planned",
+        "created",
         failures,
     );
     expect_u64_at_least(platform, report, "frames", 300, failures);
@@ -2292,7 +2292,7 @@ mod tests {
                         "vulkan_logical_device_graphics_queue_family": 0,
                         "vulkan_logical_device_present_queue_family": 0,
                         "vulkan_logical_device_enabled_extension_count": 1,
-                        "vulkan_swapchain_status": "planned",
+                        "vulkan_swapchain_status": "created",
                         "vulkan_swapchain_width": 1280,
                         "vulkan_swapchain_height": 720,
                         "vulkan_swapchain_image_count": 3

@@ -15,8 +15,9 @@ use fparkan_platform::{NativeWindowHandles, WindowPort};
 use fparkan_platform_winit::{probe_smoke_window, WinitWindowPlan};
 use fparkan_render_vulkan::{
     create_vulkan_instance_probe, create_vulkan_logical_device_probe, create_vulkan_surface_probe,
-    probe_vulkan_loader, triangle_shader_manifest, validate_shader_manifest, VulkanInstanceConfig,
-    VulkanInstanceProbe, VulkanLogicalDeviceProbe,
+    create_vulkan_swapchain_probe, probe_vulkan_loader, triangle_shader_manifest,
+    validate_shader_manifest, VulkanInstanceConfig, VulkanInstanceProbe, VulkanLogicalDeviceProbe,
+    VulkanSwapchainProbe,
 };
 use std::path::PathBuf;
 use std::process::Command;
@@ -424,7 +425,14 @@ impl VulkanBootstrapProbe {
                 self.window_height.unwrap_or(1).max(1),
             ),
         ) {
-            Ok(device) => self.record_logical_device_probe(&device),
+            Ok(device) => match create_vulkan_swapchain_probe(instance, surface, &device) {
+                Ok(swapchain) => self.record_swapchain_probe(&device, &swapchain),
+                Err(err) => {
+                    self.record_logical_device_probe(&device);
+                    self.swapchain_status = VulkanSwapchainStatus::Failed;
+                    self.swapchain_error = Some(err.to_string());
+                }
+            },
             Err(err) => {
                 self.device_status = VulkanDeviceStatus::Failed;
                 self.device_error = Some(err.to_string());
@@ -450,10 +458,21 @@ impl VulkanBootstrapProbe {
                 .try_into()
                 .unwrap_or(u32::MAX),
         );
-        self.swapchain_status = VulkanSwapchainStatus::Planned;
         self.swapchain_width = Some(device.runtime.swapchain.extent.0);
         self.swapchain_height = Some(device.runtime.swapchain.extent.1);
         self.swapchain_image_count = Some(device.runtime.swapchain.image_count);
+    }
+
+    fn record_swapchain_probe(
+        &mut self,
+        device: &VulkanLogicalDeviceProbe,
+        swapchain: &VulkanSwapchainProbe,
+    ) {
+        self.record_logical_device_probe(device);
+        self.swapchain_status = VulkanSwapchainStatus::Created;
+        self.swapchain_width = Some(swapchain.report.plan.extent.0);
+        self.swapchain_height = Some(swapchain.report.plan.extent.1);
+        self.swapchain_image_count = Some(swapchain.report.image_count);
     }
 }
 
@@ -564,7 +583,7 @@ impl VulkanLogicalDeviceStatus {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum VulkanSwapchainStatus {
     Skipped,
-    Planned,
+    Created,
     Failed,
 }
 
@@ -572,7 +591,7 @@ impl VulkanSwapchainStatus {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Skipped => "skipped",
-            Self::Planned => "planned",
+            Self::Created => "created",
             Self::Failed => "failed",
         }
     }
@@ -691,9 +710,9 @@ fn validate_smoke_options(
                     "passed native smoke report requires created Vulkan logical device".to_string(),
                 );
             }
-            if bootstrap.swapchain_status != VulkanSwapchainStatus::Planned {
+            if bootstrap.swapchain_status != VulkanSwapchainStatus::Created {
                 return Err(
-                    "passed native smoke report requires planned Vulkan swapchain".to_string(),
+                    "passed native smoke report requires created Vulkan swapchain".to_string(),
                 );
             }
         }
@@ -953,7 +972,7 @@ mod tests {
             logical_device_present_queue_family: Some(0),
             logical_device_enabled_extension_count: Some(1),
             logical_device_error: None,
-            swapchain_status: VulkanSwapchainStatus::Planned,
+            swapchain_status: VulkanSwapchainStatus::Created,
             swapchain_width: Some(1280),
             swapchain_height: Some(720),
             swapchain_image_count: Some(3),
@@ -1340,7 +1359,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_passed_without_planned_swapchain() {
+    fn rejects_passed_without_created_swapchain() {
         let options = SmokeOptions::parse(&strings(&[
             "--platform",
             "linux",
@@ -1365,11 +1384,11 @@ mod tests {
                 &options,
                 &VulkanBootstrapProbe {
                     swapchain_status: VulkanSwapchainStatus::Failed,
-                    swapchain_error: Some("Vulkan swapchain has no surface format".to_string()),
+                    swapchain_error: Some("Vulkan swapchain creation failed".to_string()),
                     ..probe_fixture()
                 },
             ),
-            Err("passed native smoke report requires planned Vulkan swapchain".to_string())
+            Err("passed native smoke report requires created Vulkan swapchain".to_string())
         );
     }
 
