@@ -37,6 +37,7 @@ const PART2_ROOT_ENV: &str = "FPARKAN_CORPUS_PART2_ROOT";
 const CI_ACCEPTANCE_ROADMAP: &str = "fixtures/acceptance/stage_0_2_roadmap.md";
 const CI_ACCEPTANCE_COVERAGE: &str = "fixtures/acceptance/coverage.tsv";
 const CI_ACCEPTANCE_REPORT: &str = "target/fparkan/acceptance/stage-0-2-audit.json";
+const REQUIRED_NATIVE_SMOKE_PLATFORMS: &[&str] = &["linux", "macos", "windows"];
 const APPROVED_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const SUPPLY_CHAIN_BANNED_PACKAGES: &[&str] = &["native-tls", "openssl", "openssl-sys"];
 const PINNED_RUST_TOOLCHAIN: &str = "1.87.0";
@@ -89,6 +90,10 @@ fn run(args: &[String]) -> Result<(), String> {
             let options = parse_audit_options(rest)?;
             run_acceptance_audit(&options)
         }
+        [cmd, subcmd, rest @ ..] if cmd == "native-smoke" && subcmd == "audit" => {
+            let options = parse_native_smoke_audit_options(rest)?;
+            run_native_smoke_audit(&options)
+        }
         [cmd, rest @ ..] if cmd == "package" => {
             let options = parse_package_options(rest)?;
             run_package(&options)
@@ -111,7 +116,7 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         _ => Err(
-            "usage: cargo xtask ci | policy | acceptance report --suite synthetic|licensed [--stage 0..5|all] [--manifest corpora.toml] [--out <path>] | acceptance audit [--roadmap <path>] [--coverage <path>] [--out <path>] [--strict] | package --target <triple> --app viewer|game|headless|cli | test synthetic|licensed [--stage 0..5|all] [--manifest corpora.toml] | corpus baseline --root <path>"
+            "usage: cargo xtask ci | policy | acceptance report --suite synthetic|licensed [--stage 0..5|all] [--manifest corpora.toml] [--out <path>] | acceptance audit [--roadmap <path>] [--coverage <path>] [--out <path>] [--strict] | native-smoke audit --dir <path> | package --target <triple> --app viewer|game|headless|cli | test synthetic|licensed [--stage 0..5|all] [--manifest corpora.toml] | corpus baseline --root <path>"
                 .to_string(),
         ),
     }
@@ -1286,6 +1291,11 @@ struct AuditOptions {
     strict: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeSmokeAuditOptions {
+    dir: PathBuf,
+}
+
 fn parse_test_options(args: &[String], default_root: PathBuf) -> Result<TestOptions, String> {
     let mut options = TestOptions {
         stage: Stage::All,
@@ -1419,6 +1429,193 @@ fn parse_audit_options(args: &[String]) -> Result<AuditOptions, String> {
         out,
         strict,
     })
+}
+
+fn parse_native_smoke_audit_options(args: &[String]) -> Result<NativeSmokeAuditOptions, String> {
+    let mut dir = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--dir" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--dir requires a path".to_string())?;
+                dir = Some(PathBuf::from(value));
+            }
+            _ => return Err(format!("unknown native-smoke audit option: {arg}")),
+        }
+    }
+    Ok(NativeSmokeAuditOptions {
+        dir: dir.ok_or_else(|| "native-smoke audit requires --dir".to_string())?,
+    })
+}
+
+fn run_native_smoke_audit(options: &NativeSmokeAuditOptions) -> Result<(), String> {
+    let reports = read_native_smoke_reports(&options.dir)?;
+    let failures = audit_native_smoke_reports(&reports);
+    if failures.is_empty() {
+        println!("native smoke artifacts passed: {}", options.dir.display());
+        Ok(())
+    } else {
+        Err(format!(
+            "native smoke artifacts incomplete:\n{}",
+            failures.join("\n")
+        ))
+    }
+}
+
+fn read_native_smoke_reports(dir: &Path) -> Result<BTreeMap<String, serde_json::Value>, String> {
+    let mut reports = BTreeMap::new();
+    let entries = fs::read_dir(dir).map_err(|err| format!("{}: {err}", dir.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("{}: {err}", dir.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let text = fs::read_to_string(&path).map_err(|err| format!("{}: {err}", path.display()))?;
+        let json = serde_json::from_str::<serde_json::Value>(&text)
+            .map_err(|err| format!("{}: {err}", path.display()))?;
+        let platform = json_string_field(&json, "platform")
+            .map_err(|err| format!("{}: {err}", path.display()))?;
+        reports.insert(platform.to_string(), json);
+    }
+    Ok(reports)
+}
+
+fn audit_native_smoke_reports(reports: &BTreeMap<String, serde_json::Value>) -> Vec<String> {
+    let mut failures = Vec::new();
+    for platform in REQUIRED_NATIVE_SMOKE_PLATFORMS {
+        let Some(report) = reports.get(*platform) else {
+            failures.push(format!("{platform}: missing native smoke report"));
+            continue;
+        };
+        validate_native_smoke_report(platform, report, &mut failures);
+    }
+    for platform in reports.keys() {
+        if !REQUIRED_NATIVE_SMOKE_PLATFORMS.contains(&platform.as_str()) {
+            failures.push(format!("{platform}: unexpected native smoke platform"));
+        }
+    }
+    failures
+}
+
+fn validate_native_smoke_report(
+    platform: &str,
+    report: &serde_json::Value,
+    failures: &mut Vec<String>,
+) {
+    expect_string_field(
+        platform,
+        report,
+        "schema_version",
+        "fparkan-native-smoke-v1",
+        failures,
+    );
+    expect_string_field(platform, report, "status", "passed", failures);
+    expect_string_field(
+        platform,
+        report,
+        "vulkan_loader_status",
+        "available",
+        failures,
+    );
+    expect_string_field(
+        platform,
+        report,
+        "vulkan_instance_status",
+        "created",
+        failures,
+    );
+    expect_string_field(platform, report, "window_status", "planned", failures);
+    expect_string_field(
+        platform,
+        report,
+        "vulkan_surface_status",
+        "planned",
+        failures,
+    );
+    expect_u64_at_least(platform, report, "frames", 300, failures);
+    expect_u64_at_least(platform, report, "resize_count", 1, failures);
+    expect_u64_at_least(platform, report, "swapchain_recreate_count", 1, failures);
+    expect_u64_field(platform, report, "validation_error_count", 0, failures);
+    expect_nonempty_string(platform, report, "commit_sha", failures);
+    expect_nonempty_string(platform, report, "rust_toolchain", failures);
+    expect_nonempty_string(platform, report, "target_triple", failures);
+    expect_nonempty_string(platform, report, "shader_manifest_hash", failures);
+}
+
+fn expect_string_field(
+    platform: &str,
+    report: &serde_json::Value,
+    field: &str,
+    expected: &str,
+    failures: &mut Vec<String>,
+) {
+    match json_string_field(report, field) {
+        Ok(actual) if actual == expected => {}
+        Ok(actual) => failures.push(format!(
+            "{platform}: {field} expected {expected:?}, found {actual:?}"
+        )),
+        Err(err) => failures.push(format!("{platform}: {err}")),
+    }
+}
+
+fn expect_nonempty_string(
+    platform: &str,
+    report: &serde_json::Value,
+    field: &str,
+    failures: &mut Vec<String>,
+) {
+    match json_string_field(report, field) {
+        Ok(value) if !value.trim().is_empty() => {}
+        Ok(_) => failures.push(format!("{platform}: {field} must be non-empty")),
+        Err(err) => failures.push(format!("{platform}: {err}")),
+    }
+}
+
+fn expect_u64_at_least(
+    platform: &str,
+    report: &serde_json::Value,
+    field: &str,
+    minimum: u64,
+    failures: &mut Vec<String>,
+) {
+    match json_u64_field(report, field) {
+        Ok(value) if value >= minimum => {}
+        Ok(value) => failures.push(format!(
+            "{platform}: {field} expected >= {minimum}, found {value}"
+        )),
+        Err(err) => failures.push(format!("{platform}: {err}")),
+    }
+}
+
+fn expect_u64_field(
+    platform: &str,
+    report: &serde_json::Value,
+    field: &str,
+    expected: u64,
+    failures: &mut Vec<String>,
+) {
+    match json_u64_field(report, field) {
+        Ok(value) if value == expected => {}
+        Ok(value) => failures.push(format!(
+            "{platform}: {field} expected {expected}, found {value}"
+        )),
+        Err(err) => failures.push(format!("{platform}: {err}")),
+    }
+}
+
+fn json_string_field<'a>(json: &'a serde_json::Value, field: &str) -> Result<&'a str, String> {
+    json.get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("{field} must be a string"))
+}
+
+fn json_u64_field(json: &serde_json::Value, field: &str) -> Result<u64, String> {
+    json.get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| format!("{field} must be an unsigned integer"))
 }
 
 fn run_acceptance_audit(options: &AuditOptions) -> Result<(), String> {
@@ -2012,6 +2209,74 @@ mod tests {
         assert!(json.contains("\"commit_sha\": \"0123456789abcdef0123456789abcdef01234567\""));
         assert!(json.contains("\"rust_toolchain\": \"1.87.0\""));
         assert!(json.contains("\"msrv\": \"1.87\""));
+    }
+
+    #[test]
+    fn native_smoke_audit_accepts_complete_three_platform_pass() {
+        let reports = ["linux", "macos", "windows"]
+            .into_iter()
+            .map(|platform| {
+                (
+                    platform.to_string(),
+                    serde_json::json!({
+                        "schema_version": "fparkan-native-smoke-v1",
+                        "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                        "rust_toolchain": "1.87.0",
+                        "target_triple": format!("{platform}-test-target"),
+                        "platform": platform,
+                        "status": "passed",
+                        "frames": 300,
+                        "resize_count": 1,
+                        "swapchain_recreate_count": 1,
+                        "validation_error_count": 0,
+                        "shader_manifest_hash": "dd293e4ff08ffca1c037900d08b0ffd415db39f238b4fcdde46468fa049b679c",
+                        "vulkan_loader_status": "available",
+                        "vulkan_instance_status": "created",
+                        "window_status": "planned",
+                        "vulkan_surface_status": "planned"
+                    }),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(audit_native_smoke_reports(&reports), Vec::<String>::new());
+    }
+
+    #[test]
+    fn native_smoke_audit_rejects_blocked_or_incomplete_reports() {
+        let reports = [(
+            "macos".to_string(),
+            serde_json::json!({
+                "schema_version": "fparkan-native-smoke-v1",
+                "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                "rust_toolchain": "1.87.0",
+                "target_triple": "aarch64-apple-darwin",
+                "platform": "macos",
+                "status": "blocked",
+                "frames": 0,
+                "resize_count": 0,
+                "swapchain_recreate_count": 0,
+                "validation_error_count": null,
+                "shader_manifest_hash": "dd293e4ff08ffca1c037900d08b0ffd415db39f238b4fcdde46468fa049b679c",
+                "vulkan_loader_status": "unavailable",
+                "vulkan_instance_status": "skipped",
+                "window_status": "planned",
+                "vulkan_surface_status": "skipped"
+            }),
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+
+        let failures = audit_native_smoke_reports(&reports);
+
+        assert!(failures.contains(&"linux: missing native smoke report".to_string()));
+        assert!(failures.contains(&"windows: missing native smoke report".to_string()));
+        assert!(
+            failures.contains(&"macos: status expected \"passed\", found \"blocked\"".to_string())
+        );
+        assert!(failures.contains(&"macos: frames expected >= 300, found 0".to_string()));
+        assert!(failures
+            .contains(&"macos: validation_error_count must be an unsigned integer".to_string()));
     }
 
     #[test]

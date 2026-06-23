@@ -2504,6 +2504,7 @@ dependencies = [
  "cargo_metadata",
  "fparkan-corpus",
  "serde",
+ "serde_json",
  "toml",
 ]
 

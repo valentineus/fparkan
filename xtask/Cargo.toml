@@ -9,6 +9,7 @@ repository.workspace = true
 fparkan-corpus = { path = "../crates/fparkan-corpus" }
 cargo_metadata = "0.21"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 toml = "0.8"
 
 [lints]
