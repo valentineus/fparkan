@@ -1535,6 +1535,20 @@ fn validate_native_smoke_report(
         "created",
         failures,
     );
+    expect_string_field(
+        platform,
+        report,
+        "vulkan_device_status",
+        "selected",
+        failures,
+    );
+    expect_string_field(
+        platform,
+        report,
+        "vulkan_swapchain_status",
+        "planned",
+        failures,
+    );
     expect_u64_at_least(platform, report, "frames", 300, failures);
     expect_u64_at_least(platform, report, "resize_count", 1, failures);
     expect_u64_at_least(platform, report, "swapchain_recreate_count", 1, failures);
@@ -1543,6 +1557,16 @@ fn validate_native_smoke_report(
     expect_nonempty_string(platform, report, "rust_toolchain", failures);
     expect_nonempty_string(platform, report, "target_triple", failures);
     expect_nonempty_string(platform, report, "shader_manifest_hash", failures);
+    expect_nonempty_string(platform, report, "vulkan_device_name", failures);
+    expect_u64_at_least(platform, report, "vulkan_swapchain_width", 1, failures);
+    expect_u64_at_least(platform, report, "vulkan_swapchain_height", 1, failures);
+    expect_u64_at_least(
+        platform,
+        report,
+        "vulkan_swapchain_image_count",
+        2,
+        failures,
+    );
 }
 
 fn expect_string_field(
@@ -2233,7 +2257,13 @@ mod tests {
                         "vulkan_loader_status": "available",
                         "vulkan_instance_status": "created",
                         "window_status": "created",
-                        "vulkan_surface_status": "created"
+                        "vulkan_surface_status": "created",
+                        "vulkan_device_status": "selected",
+                        "vulkan_device_name": format!("{platform} GPU"),
+                        "vulkan_swapchain_status": "planned",
+                        "vulkan_swapchain_width": 1280,
+                        "vulkan_swapchain_height": 720,
+                        "vulkan_swapchain_image_count": 3
                     }),
                 )
             })
@@ -2261,7 +2291,9 @@ mod tests {
                 "vulkan_loader_status": "unavailable",
                 "vulkan_instance_status": "skipped",
                 "window_status": "planned",
-                "vulkan_surface_status": "skipped"
+                "vulkan_surface_status": "skipped",
+                "vulkan_device_status": "skipped",
+                "vulkan_swapchain_status": "skipped"
             }),
         )]
         .into_iter()

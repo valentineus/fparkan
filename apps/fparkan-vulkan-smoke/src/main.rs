@@ -15,7 +15,8 @@ use fparkan_platform::{NativeWindowHandles, WindowPort};
 use fparkan_platform_winit::{probe_smoke_window, WinitWindowPlan};
 use fparkan_render_vulkan::{
     create_vulkan_instance_probe, create_vulkan_surface_probe, probe_vulkan_loader,
-    triangle_shader_manifest, validate_shader_manifest, VulkanInstanceConfig, VulkanInstanceProbe,
+    probe_vulkan_runtime_capabilities, triangle_shader_manifest, validate_shader_manifest,
+    VulkanInstanceConfig, VulkanInstanceProbe, VulkanRuntimeCapabilityProbe,
 };
 use std::path::PathBuf;
 use std::process::Command;
@@ -205,6 +206,14 @@ struct VulkanBootstrapProbe {
     window_error: Option<String>,
     surface_status: VulkanSurfaceStatus,
     surface_error: Option<String>,
+    device_status: VulkanDeviceStatus,
+    device_name: Option<String>,
+    device_error: Option<String>,
+    swapchain_status: VulkanSwapchainStatus,
+    swapchain_width: Option<u32>,
+    swapchain_height: Option<u32>,
+    swapchain_image_count: Option<u32>,
+    swapchain_error: Option<String>,
 }
 
 impl VulkanBootstrapProbe {
@@ -234,6 +243,14 @@ impl VulkanBootstrapProbe {
             window_error: None,
             surface_status: VulkanSurfaceStatus::Skipped,
             surface_error: None,
+            device_status: VulkanDeviceStatus::Skipped,
+            device_name: None,
+            device_error: None,
+            swapchain_status: VulkanSwapchainStatus::Skipped,
+            swapchain_width: None,
+            swapchain_height: None,
+            swapchain_image_count: None,
+            swapchain_error: None,
         }
     }
 
@@ -252,6 +269,14 @@ impl VulkanBootstrapProbe {
                 window_error: None,
                 surface_status: VulkanSurfaceStatus::Skipped,
                 surface_error: None,
+                device_status: VulkanDeviceStatus::Skipped,
+                device_name: None,
+                device_error: None,
+                swapchain_status: VulkanSwapchainStatus::Skipped,
+                swapchain_width: None,
+                swapchain_height: None,
+                swapchain_image_count: None,
+                swapchain_error: None,
             },
             Err(err) => Self {
                 loader_status: VulkanLoaderStatus::Unavailable,
@@ -266,6 +291,14 @@ impl VulkanBootstrapProbe {
                 window_error: None,
                 surface_status: VulkanSurfaceStatus::Skipped,
                 surface_error: None,
+                device_status: VulkanDeviceStatus::Skipped,
+                device_name: None,
+                device_error: None,
+                swapchain_status: VulkanSwapchainStatus::Skipped,
+                swapchain_width: None,
+                swapchain_height: None,
+                swapchain_image_count: None,
+                swapchain_error: None,
             },
         }
     }
@@ -339,8 +372,9 @@ impl VulkanBootstrapProbe {
                     create_vulkan_surface_probe(instance, window_handles)
                         .map_err(|err| err.to_string())
                 }) {
-                Ok(_) => {
+                Ok(surface) => {
                     self.surface_status = VulkanSurfaceStatus::Created;
+                    self.probe_runtime_capabilities(instance, &surface);
                 }
                 Err(err) => {
                     self.surface_status = VulkanSurfaceStatus::Failed;
@@ -348,6 +382,44 @@ impl VulkanBootstrapProbe {
                 }
             }
         }
+    }
+
+    fn probe_runtime_capabilities(
+        &mut self,
+        instance: Option<&VulkanInstanceProbe>,
+        surface: &fparkan_render_vulkan::VulkanSurfaceProbe,
+    ) {
+        let Some(instance) = instance else {
+            self.device_status = VulkanDeviceStatus::Failed;
+            self.device_error = Some("Vulkan instance probe was not retained".to_string());
+            self.swapchain_status = VulkanSwapchainStatus::Skipped;
+            return;
+        };
+        match probe_vulkan_runtime_capabilities(
+            instance,
+            surface,
+            (
+                self.window_width.unwrap_or(1).max(1),
+                self.window_height.unwrap_or(1).max(1),
+            ),
+        ) {
+            Ok(runtime) => self.record_runtime_capabilities(runtime),
+            Err(err) => {
+                self.device_status = VulkanDeviceStatus::Failed;
+                self.device_error = Some(err.to_string());
+                self.swapchain_status = VulkanSwapchainStatus::Failed;
+                self.swapchain_error = Some(err.to_string());
+            }
+        }
+    }
+
+    fn record_runtime_capabilities(&mut self, runtime: VulkanRuntimeCapabilityProbe) {
+        self.device_status = VulkanDeviceStatus::Selected;
+        self.device_name = Some(runtime.capability.device_name);
+        self.swapchain_status = VulkanSwapchainStatus::Planned;
+        self.swapchain_width = Some(runtime.swapchain.extent.0);
+        self.swapchain_height = Some(runtime.swapchain.extent.1);
+        self.swapchain_image_count = Some(runtime.swapchain.image_count);
     }
 }
 
@@ -416,6 +488,40 @@ impl VulkanSurfaceStatus {
         match self {
             Self::Skipped => "skipped",
             Self::Created => "created",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VulkanDeviceStatus {
+    Skipped,
+    Selected,
+    Failed,
+}
+
+impl VulkanDeviceStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Skipped => "skipped",
+            Self::Selected => "selected",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VulkanSwapchainStatus {
+    Skipped,
+    Planned,
+    Failed,
+}
+
+impl VulkanSwapchainStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Skipped => "skipped",
+            Self::Planned => "planned",
             Self::Failed => "failed",
         }
     }
@@ -524,6 +630,16 @@ fn validate_smoke_options(
                     "passed native smoke report requires successful --probe-surface".to_string(),
                 );
             }
+            if bootstrap.device_status != VulkanDeviceStatus::Selected {
+                return Err(
+                    "passed native smoke report requires selected Vulkan device".to_string()
+                );
+            }
+            if bootstrap.swapchain_status != VulkanSwapchainStatus::Planned {
+                return Err(
+                    "passed native smoke report requires planned Vulkan swapchain".to_string(),
+                );
+            }
         }
     }
     Ok(())
@@ -535,97 +651,131 @@ fn render_smoke_report_json(
 ) -> Result<String, String> {
     let shader_manifest = validate_shader_manifest(&triangle_shader_manifest())
         .map_err(|err| format!("shader manifest: {err}"))?;
-    let validation_error_count = options
-        .validation_error_count
-        .map_or_else(|| "null".to_string(), |value| value.to_string());
-    let reason = options
-        .reason
-        .as_ref()
-        .map_or_else(|| "null".to_string(), |value| json_string(value));
-    let instance_api = bootstrap
-        .instance_api
-        .as_ref()
-        .map_or_else(|| "null".to_string(), |value| json_string(value));
-    let loader_error = bootstrap
-        .loader_error
-        .as_ref()
-        .map_or_else(|| "null".to_string(), |value| json_string(value));
-    let instance_error = bootstrap
-        .instance_error
-        .as_ref()
-        .map_or_else(|| "null".to_string(), |value| json_string(value));
-    let window_width = bootstrap
-        .window_width
-        .map_or_else(|| "null".to_string(), |value| value.to_string());
-    let window_height = bootstrap
-        .window_height
-        .map_or_else(|| "null".to_string(), |value| value.to_string());
-    let window_error = bootstrap
-        .window_error
-        .as_ref()
-        .map_or_else(|| "null".to_string(), |value| json_string(value));
-    let surface_error = bootstrap
-        .surface_error
-        .as_ref()
-        .map_or_else(|| "null".to_string(), |value| json_string(value));
-    Ok(format!(
-        concat!(
-            "{{\n",
-            "  \"schema_version\": \"{}\",\n",
-            "  \"commit_sha\": \"{}\",\n",
-            "  \"rust_toolchain\": \"{}\",\n",
-            "  \"target_triple\": \"{}\",\n",
-            "  \"platform\": \"{}\",\n",
-            "  \"status\": \"{}\",\n",
-            "  \"frames\": {},\n",
-            "  \"resize_count\": {},\n",
-            "  \"swapchain_recreate_count\": {},\n",
-            "  \"validation_error_count\": {},\n",
-            "  \"shader_manifest_hash\": \"{}\",\n",
-            "  \"vulkan_loader_status\": \"{}\",\n",
-            "  \"vulkan_instance_api\": {},\n",
-            "  \"vulkan_loader_error\": {},\n",
-            "  \"vulkan_instance_status\": \"{}\",\n",
-            "  \"vulkan_instance_error\": {},\n",
-            "  \"vulkan_portability_enumeration\": {},\n",
-            "  \"window_status\": \"{}\",\n",
-            "  \"window_width\": {},\n",
-            "  \"window_height\": {},\n",
-            "  \"window_error\": {},\n",
-            "  \"vulkan_surface_status\": \"{}\",\n",
-            "  \"vulkan_surface_error\": {},\n",
-            "  \"reason\": {}\n",
-            "}}\n"
+    Ok(render_json_object(&[
+        ("schema_version", json_string(SCHEMA_VERSION)),
+        ("commit_sha", json_string(&current_git_commit_sha())),
+        ("rust_toolchain", json_string(RUST_TOOLCHAIN)),
+        ("target_triple", json_string(&current_rustc_host_triple())),
+        ("platform", json_string(options.platform.as_str())),
+        ("status", json_string(options.status.as_str())),
+        ("frames", options.frames.to_string()),
+        ("resize_count", options.resize_count.to_string()),
+        (
+            "swapchain_recreate_count",
+            options.swapchain_recreate_count.to_string(),
         ),
-        SCHEMA_VERSION,
-        json_escape(&current_git_commit_sha()),
-        RUST_TOOLCHAIN,
-        json_escape(&current_rustc_host_triple()),
-        options.platform.as_str(),
-        options.status.as_str(),
-        options.frames,
-        options.resize_count,
-        options.swapchain_recreate_count,
-        validation_error_count,
-        json_escape(&shader_manifest.manifest_hash),
-        bootstrap.loader_status.as_str(),
-        instance_api,
-        loader_error,
-        bootstrap.instance_status.as_str(),
-        instance_error,
-        if bootstrap.portability_enumeration {
-            "true"
-        } else {
-            "false"
-        },
-        bootstrap.window_status.as_str(),
-        window_width,
-        window_height,
-        window_error,
-        bootstrap.surface_status.as_str(),
-        surface_error,
-        reason
-    ))
+        (
+            "validation_error_count",
+            optional_u32(options.validation_error_count),
+        ),
+        (
+            "shader_manifest_hash",
+            json_string(&shader_manifest.manifest_hash),
+        ),
+        (
+            "vulkan_loader_status",
+            json_string(bootstrap.loader_status.as_str()),
+        ),
+        (
+            "vulkan_instance_api",
+            optional_string(bootstrap.instance_api.as_deref()),
+        ),
+        (
+            "vulkan_loader_error",
+            optional_string(bootstrap.loader_error.as_deref()),
+        ),
+        (
+            "vulkan_instance_status",
+            json_string(bootstrap.instance_status.as_str()),
+        ),
+        (
+            "vulkan_instance_error",
+            optional_string(bootstrap.instance_error.as_deref()),
+        ),
+        (
+            "vulkan_portability_enumeration",
+            bool_json(bootstrap.portability_enumeration),
+        ),
+        (
+            "window_status",
+            json_string(bootstrap.window_status.as_str()),
+        ),
+        ("window_width", optional_u32(bootstrap.window_width)),
+        ("window_height", optional_u32(bootstrap.window_height)),
+        (
+            "window_error",
+            optional_string(bootstrap.window_error.as_deref()),
+        ),
+        (
+            "vulkan_surface_status",
+            json_string(bootstrap.surface_status.as_str()),
+        ),
+        (
+            "vulkan_surface_error",
+            optional_string(bootstrap.surface_error.as_deref()),
+        ),
+        (
+            "vulkan_device_status",
+            json_string(bootstrap.device_status.as_str()),
+        ),
+        (
+            "vulkan_device_name",
+            optional_string(bootstrap.device_name.as_deref()),
+        ),
+        (
+            "vulkan_device_error",
+            optional_string(bootstrap.device_error.as_deref()),
+        ),
+        (
+            "vulkan_swapchain_status",
+            json_string(bootstrap.swapchain_status.as_str()),
+        ),
+        (
+            "vulkan_swapchain_width",
+            optional_u32(bootstrap.swapchain_width),
+        ),
+        (
+            "vulkan_swapchain_height",
+            optional_u32(bootstrap.swapchain_height),
+        ),
+        (
+            "vulkan_swapchain_image_count",
+            optional_u32(bootstrap.swapchain_image_count),
+        ),
+        (
+            "vulkan_swapchain_error",
+            optional_string(bootstrap.swapchain_error.as_deref()),
+        ),
+        ("reason", optional_string(options.reason.as_deref())),
+    ]))
+}
+
+fn render_json_object(fields: &[(&str, String)]) -> String {
+    let mut out = String::from("{\n");
+    for (index, (name, value)) in fields.iter().enumerate() {
+        out.push_str("  ");
+        out.push_str(&json_string(name));
+        out.push_str(": ");
+        out.push_str(value);
+        if index + 1 < fields.len() {
+            out.push(',');
+        }
+        out.push('\n');
+    }
+    out.push_str("}\n");
+    out
+}
+
+fn optional_string(value: Option<&str>) -> String {
+    value.map_or_else(|| "null".to_string(), json_string)
+}
+
+fn optional_u32(value: Option<u32>) -> String {
+    value.map_or_else(|| "null".to_string(), |value| value.to_string())
+}
+
+fn bool_json(value: bool) -> String {
+    if value { "true" } else { "false" }.to_string()
 }
 
 fn format_api_version(version: u32) -> String {
@@ -694,6 +844,31 @@ mod tests {
         values.iter().map(|value| (*value).to_string()).collect()
     }
 
+    fn probe_fixture() -> VulkanBootstrapProbe {
+        VulkanBootstrapProbe {
+            loader_status: VulkanLoaderStatus::Available,
+            instance_api: Some("1.3.0".to_string()),
+            loader_error: None,
+            instance_status: VulkanInstanceStatus::Created,
+            instance_error: None,
+            portability_enumeration: false,
+            window_status: WinitWindowStatus::Created,
+            window_width: Some(1280),
+            window_height: Some(720),
+            window_error: None,
+            surface_status: VulkanSurfaceStatus::Created,
+            surface_error: None,
+            device_status: VulkanDeviceStatus::Selected,
+            device_name: Some("Stage 0 GPU".to_string()),
+            device_error: None,
+            swapchain_status: VulkanSwapchainStatus::Planned,
+            swapchain_width: Some(1280),
+            swapchain_height: Some(720),
+            swapchain_image_count: Some(3),
+            swapchain_error: None,
+        }
+    }
+
     #[test]
     fn parses_blocked_smoke_args() -> Result<(), String> {
         let options = SmokeOptions::parse(&strings(&[
@@ -727,6 +902,7 @@ mod tests {
                 window_error: None,
                 surface_status: VulkanSurfaceStatus::Skipped,
                 surface_error: None,
+                ..probe_fixture()
             },
         )
     }
@@ -767,6 +943,7 @@ mod tests {
                     window_error: None,
                     surface_status: VulkanSurfaceStatus::Created,
                     surface_error: None,
+                    ..probe_fixture()
                 },
             ),
             Err("passed native smoke report requires --frames >= 300".to_string())
@@ -809,6 +986,7 @@ mod tests {
                     window_error: None,
                     surface_status: VulkanSurfaceStatus::Skipped,
                     surface_error: None,
+                    ..probe_fixture()
                 },
             ),
             Err("passed native smoke report requires successful --probe-loader".to_string())
@@ -850,6 +1028,7 @@ mod tests {
                     window_error: None,
                     surface_status: VulkanSurfaceStatus::Created,
                     surface_error: None,
+                    ..probe_fixture()
                 },
             ),
             Err("passed native smoke report requires --swapchain-recreate-count >= 1".to_string())
@@ -893,6 +1072,7 @@ mod tests {
                     window_error: None,
                     surface_status: VulkanSurfaceStatus::Skipped,
                     surface_error: None,
+                    ..probe_fixture()
                 },
             ),
             Err("passed native smoke report requires successful --probe-instance".to_string())
@@ -936,6 +1116,7 @@ mod tests {
                     window_error: None,
                     surface_status: VulkanSurfaceStatus::Created,
                     surface_error: None,
+                    ..probe_fixture()
                 },
             ),
             Err("passed native smoke report requires successful --probe-window".to_string())
@@ -980,6 +1161,7 @@ mod tests {
                     window_error: None,
                     surface_status: VulkanSurfaceStatus::Skipped,
                     surface_error: None,
+                    ..probe_fixture()
                 },
             ),
             Err("passed native smoke report requires successful --probe-surface".to_string())
@@ -1023,9 +1205,79 @@ mod tests {
                     window_error: None,
                     surface_status: VulkanSurfaceStatus::Failed,
                     surface_error: Some("Vulkan surface creation failed".to_string()),
+                    ..probe_fixture()
                 },
             ),
             Err("passed native smoke report requires successful --probe-surface".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_passed_without_selected_device() {
+        let options = SmokeOptions::parse(&strings(&[
+            "--platform",
+            "linux",
+            "--out",
+            "target/native.json",
+            "--status",
+            "passed",
+            "--frames",
+            "300",
+            "--resize-count",
+            "1",
+            "--swapchain-recreate-count",
+            "1",
+            "--validation-error-count",
+            "0",
+            "--probe-surface",
+        ]))
+        .expect("options");
+
+        assert_eq!(
+            validate_smoke_options(
+                &options,
+                &VulkanBootstrapProbe {
+                    device_status: VulkanDeviceStatus::Failed,
+                    device_name: None,
+                    device_error: Some("no Vulkan physical device available".to_string()),
+                    ..probe_fixture()
+                },
+            ),
+            Err("passed native smoke report requires selected Vulkan device".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_passed_without_planned_swapchain() {
+        let options = SmokeOptions::parse(&strings(&[
+            "--platform",
+            "linux",
+            "--out",
+            "target/native.json",
+            "--status",
+            "passed",
+            "--frames",
+            "300",
+            "--resize-count",
+            "1",
+            "--swapchain-recreate-count",
+            "1",
+            "--validation-error-count",
+            "0",
+            "--probe-surface",
+        ]))
+        .expect("options");
+
+        assert_eq!(
+            validate_smoke_options(
+                &options,
+                &VulkanBootstrapProbe {
+                    swapchain_status: VulkanSwapchainStatus::Failed,
+                    swapchain_error: Some("Vulkan swapchain has no surface format".to_string()),
+                    ..probe_fixture()
+                },
+            ),
+            Err("passed native smoke report requires planned Vulkan swapchain".to_string())
         );
     }
 
@@ -1060,6 +1312,14 @@ mod tests {
                     "native window/display handles are required for Vulkan surface creation"
                         .to_string(),
                 ),
+                device_status: VulkanDeviceStatus::Skipped,
+                device_name: None,
+                device_error: None,
+                swapchain_status: VulkanSwapchainStatus::Skipped,
+                swapchain_width: None,
+                swapchain_height: None,
+                swapchain_image_count: None,
+                swapchain_error: None,
             },
         )?;
 
@@ -1084,6 +1344,10 @@ mod tests {
         assert!(json.contains(
             "\"vulkan_surface_error\": \"native window/display handles are required for Vulkan surface creation\""
         ));
+        assert!(json.contains("\"vulkan_device_status\": \"skipped\""));
+        assert!(json.contains("\"vulkan_device_name\": null"));
+        assert!(json.contains("\"vulkan_swapchain_status\": \"skipped\""));
+        assert!(json.contains("\"vulkan_swapchain_width\": null"));
         assert!(json.contains("\"reason\": \"runner unavailable\""));
         Ok(())
     }

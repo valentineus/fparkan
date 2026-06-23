@@ -311,6 +311,104 @@ impl Drop for VulkanSurfaceProbe {
     }
 }
 
+/// Live Vulkan device/surface capability probe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VulkanRuntimeCapabilityProbe {
+    /// Selected device/queue capability report.
+    pub capability: VulkanCapabilityReport,
+    /// Swapchain plan built from the selected device and live surface capabilities.
+    pub swapchain: VulkanSwapchainPlan,
+}
+
+/// Live Vulkan device/surface capability probe error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VulkanRuntimeCapabilityError {
+    /// Physical device enumeration failed.
+    EnumerateDevicesFailed {
+        /// Vulkan result.
+        result: String,
+    },
+    /// Device extension enumeration failed.
+    EnumerateDeviceExtensionsFailed {
+        /// Device name or index context.
+        device: String,
+        /// Vulkan result.
+        result: String,
+    },
+    /// Queue-family present support query failed.
+    PresentSupportFailed {
+        /// Device name.
+        device: String,
+        /// Queue-family index.
+        queue_family: u32,
+        /// Vulkan result.
+        result: String,
+    },
+    /// Surface format query failed.
+    SurfaceFormatsFailed {
+        /// Device name.
+        device: String,
+        /// Vulkan result.
+        result: String,
+    },
+    /// Surface capability query failed.
+    SurfaceCapabilitiesFailed {
+        /// Device name.
+        device: String,
+        /// Vulkan result.
+        result: String,
+    },
+    /// Present mode query failed.
+    PresentModesFailed {
+        /// Device name.
+        device: String,
+        /// Vulkan result.
+        result: String,
+    },
+    /// No device satisfied Stage 0 capability policy.
+    Capability(VulkanCapabilityError),
+    /// Live surface capabilities could not produce a swapchain plan.
+    Swapchain(VulkanSwapchainError),
+}
+
+impl std::fmt::Display for VulkanRuntimeCapabilityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EnumerateDevicesFailed { result } => {
+                write!(f, "Vulkan physical device enumeration failed: {result}")
+            }
+            Self::EnumerateDeviceExtensionsFailed { device, result } => write!(
+                f,
+                "Vulkan device {device} extension enumeration failed: {result}"
+            ),
+            Self::PresentSupportFailed {
+                device,
+                queue_family,
+                result,
+            } => write!(
+                f,
+                "Vulkan device {device} queue family {queue_family} present support query failed: {result}"
+            ),
+            Self::SurfaceFormatsFailed { device, result } => write!(
+                f,
+                "Vulkan device {device} surface format query failed: {result}"
+            ),
+            Self::SurfaceCapabilitiesFailed { device, result } => write!(
+                f,
+                "Vulkan device {device} surface capabilities query failed: {result}"
+            ),
+            Self::PresentModesFailed { device, result } => write!(
+                f,
+                "Vulkan device {device} present mode query failed: {result}"
+            ),
+            Self::Capability(error) => write!(f, "{error}"),
+            Self::Swapchain(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for VulkanRuntimeCapabilityError {}
+
 /// Builds a deterministic Vulkan surface plan from native window handles.
 ///
 /// # Errors
@@ -368,6 +466,264 @@ pub fn create_vulkan_surface_probe(
         loader: surface::Instance::new(&instance.entry, &instance.instance),
         surface,
         report,
+    })
+}
+
+/// Probes live Vulkan device, queue, surface and swapchain capabilities.
+///
+/// # Errors
+///
+/// Returns [`VulkanRuntimeCapabilityError`] when device enumeration, surface
+/// capability queries, Stage 0 device selection, or swapchain planning fails.
+pub fn probe_vulkan_runtime_capabilities(
+    instance: &VulkanInstanceProbe,
+    surface: &VulkanSurfaceProbe,
+    drawable_extent: (u32, u32),
+) -> Result<VulkanRuntimeCapabilityProbe, VulkanRuntimeCapabilityError> {
+    let devices = {
+        // SAFETY: The Vulkan instance is live for this query and no handles are retained.
+        unsafe { instance.instance.enumerate_physical_devices() }.map_err(|error| {
+            VulkanRuntimeCapabilityError::EnumerateDevicesFailed {
+                result: format!("{error:?}"),
+            }
+        })?
+    };
+    let mut best: Option<LiveDeviceCandidate> = None;
+    for (index, device) in devices.iter().copied().enumerate() {
+        let candidate = live_device_candidate(instance, surface, device, index)?;
+        match &best {
+            Some(existing)
+                if compare_reports(&candidate.capability, &existing.capability)
+                    != std::cmp::Ordering::Greater => {}
+            _ => best = Some(candidate),
+        }
+    }
+    let best = best.ok_or(VulkanRuntimeCapabilityError::Capability(
+        VulkanCapabilityError::NoPhysicalDevice,
+    ))?;
+    let swapchain = plan_vulkan_swapchain(&VulkanSwapchainRequest {
+        drawable_extent,
+        formats: best.surface_formats,
+        present_modes: best.present_modes,
+        capabilities: best.surface_capabilities,
+        preferred_present_mode: vk::PresentModeKHR::MAILBOX.as_raw(),
+    })
+    .map_err(VulkanRuntimeCapabilityError::Swapchain)?;
+    Ok(VulkanRuntimeCapabilityProbe {
+        capability: best.capability,
+        swapchain,
+    })
+}
+
+struct LiveDeviceCandidate {
+    capability: VulkanCapabilityReport,
+    surface_formats: Vec<VulkanSurfaceFormat>,
+    present_modes: Vec<i32>,
+    surface_capabilities: VulkanSwapchainSurfaceCapabilities,
+}
+
+fn live_device_candidate(
+    instance: &VulkanInstanceProbe,
+    surface: &VulkanSurfaceProbe,
+    device: vk::PhysicalDevice,
+    index: usize,
+) -> Result<LiveDeviceCandidate, VulkanRuntimeCapabilityError> {
+    let properties = {
+        // SAFETY: `device` was returned by this live instance and the result is copied by value.
+        unsafe { instance.instance.get_physical_device_properties(device) }
+    };
+    let name = physical_device_name(&properties, index);
+    let queue_properties = {
+        // SAFETY: `device` was returned by this live instance and the result is owned by Rust.
+        unsafe {
+            instance
+                .instance
+                .get_physical_device_queue_family_properties(device)
+        }
+    };
+    let extensions = live_device_extensions(instance, device, &name)?;
+    let surface_formats = live_surface_formats(surface, device, &name)?;
+    let present_modes = live_present_modes(surface, device, &name)?;
+    let surface_capabilities = live_surface_capabilities(surface, device, &name)?;
+    let queue_families = queue_properties
+        .iter()
+        .enumerate()
+        .map(|(queue_index, properties)| {
+            let index = u32::try_from(queue_index).unwrap_or(u32::MAX);
+            let present = {
+                // SAFETY: The physical device, surface and queue-family index are live query inputs.
+                unsafe {
+                    surface.loader.get_physical_device_surface_support(
+                        device,
+                        index,
+                        surface.surface,
+                    )
+                }
+            }
+            .map_err(|error| VulkanRuntimeCapabilityError::PresentSupportFailed {
+                device: name.clone(),
+                queue_family: index,
+                result: format!("{error:?}"),
+            })?;
+            Ok(VulkanQueueFamily {
+                index,
+                graphics: properties.queue_flags.contains(vk::QueueFlags::GRAPHICS),
+                present,
+            })
+        })
+        .collect::<Result<Vec<_>, VulkanRuntimeCapabilityError>>()?;
+    let record = VulkanPhysicalDeviceRecord {
+        name,
+        api_version: properties.api_version,
+        device_type: match properties.device_type {
+            vk::PhysicalDeviceType::DISCRETE_GPU => VulkanDeviceType::DiscreteGpu,
+            vk::PhysicalDeviceType::INTEGRATED_GPU => VulkanDeviceType::IntegratedGpu,
+            vk::PhysicalDeviceType::CPU => VulkanDeviceType::Cpu,
+            _ => VulkanDeviceType::Other,
+        },
+        extensions,
+        queue_families,
+        surface_formats: surface_formats.clone(),
+    };
+    let capability = validate_device(&record).map_err(VulkanRuntimeCapabilityError::Capability)?;
+    Ok(LiveDeviceCandidate {
+        capability,
+        surface_formats,
+        present_modes,
+        surface_capabilities,
+    })
+}
+
+fn physical_device_name(properties: &vk::PhysicalDeviceProperties, index: usize) -> String {
+    // SAFETY: Vulkan device names are fixed-size NUL-terminated C strings per the spec.
+    let name = unsafe { CStr::from_ptr(properties.device_name.as_ptr()) }
+        .to_string_lossy()
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        format!("physical-device-{index}")
+    } else {
+        name
+    }
+}
+
+fn live_device_extensions(
+    instance: &VulkanInstanceProbe,
+    device: vk::PhysicalDevice,
+    name: &str,
+) -> Result<Vec<String>, VulkanRuntimeCapabilityError> {
+    let properties = {
+        // SAFETY: `device` was returned by this live instance and no borrowed data escapes.
+        unsafe {
+            instance
+                .instance
+                .enumerate_device_extension_properties(device)
+        }
+    }
+    .map_err(
+        |error| VulkanRuntimeCapabilityError::EnumerateDeviceExtensionsFailed {
+            device: name.to_string(),
+            result: format!("{error:?}"),
+        },
+    )?;
+    let mut extensions = properties
+        .iter()
+        .map(|property| {
+            // SAFETY: Vulkan extension names are fixed-size NUL-terminated C strings per the spec.
+            unsafe { CStr::from_ptr(property.extension_name.as_ptr()) }
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    extensions.sort();
+    extensions.dedup();
+    Ok(extensions)
+}
+
+fn live_surface_formats(
+    surface: &VulkanSurfaceProbe,
+    device: vk::PhysicalDevice,
+    name: &str,
+) -> Result<Vec<VulkanSurfaceFormat>, VulkanRuntimeCapabilityError> {
+    let formats = {
+        // SAFETY: The physical device and surface are live query inputs and no handles are retained.
+        unsafe {
+            surface
+                .loader
+                .get_physical_device_surface_formats(device, surface.surface)
+        }
+    }
+    .map_err(|error| VulkanRuntimeCapabilityError::SurfaceFormatsFailed {
+        device: name.to_string(),
+        result: format!("{error:?}"),
+    })?;
+    Ok(formats
+        .into_iter()
+        .map(|format| VulkanSurfaceFormat {
+            format: format.format.as_raw(),
+            color_space: format.color_space.as_raw(),
+        })
+        .collect())
+}
+
+fn live_present_modes(
+    surface: &VulkanSurfaceProbe,
+    device: vk::PhysicalDevice,
+    name: &str,
+) -> Result<Vec<i32>, VulkanRuntimeCapabilityError> {
+    let modes = {
+        // SAFETY: The physical device and surface are live query inputs and no handles are retained.
+        unsafe {
+            surface
+                .loader
+                .get_physical_device_surface_present_modes(device, surface.surface)
+        }
+    }
+    .map_err(|error| VulkanRuntimeCapabilityError::PresentModesFailed {
+        device: name.to_string(),
+        result: format!("{error:?}"),
+    })?;
+    Ok(modes.into_iter().map(vk::PresentModeKHR::as_raw).collect())
+}
+
+fn live_surface_capabilities(
+    surface: &VulkanSurfaceProbe,
+    device: vk::PhysicalDevice,
+    name: &str,
+) -> Result<VulkanSwapchainSurfaceCapabilities, VulkanRuntimeCapabilityError> {
+    let capabilities = {
+        // SAFETY: The physical device and surface are live query inputs and no handles are retained.
+        unsafe {
+            surface
+                .loader
+                .get_physical_device_surface_capabilities(device, surface.surface)
+        }
+    }
+    .map_err(
+        |error| VulkanRuntimeCapabilityError::SurfaceCapabilitiesFailed {
+            device: name.to_string(),
+            result: format!("{error:?}"),
+        },
+    )?;
+    Ok(VulkanSwapchainSurfaceCapabilities {
+        current_extent: if capabilities.current_extent.width == u32::MAX {
+            None
+        } else {
+            Some((
+                capabilities.current_extent.width,
+                capabilities.current_extent.height,
+            ))
+        },
+        min_extent: (
+            capabilities.min_image_extent.width,
+            capabilities.min_image_extent.height,
+        ),
+        max_extent: (
+            capabilities.max_image_extent.width,
+            capabilities.max_image_extent.height,
+        ),
+        min_image_count: capabilities.min_image_count,
+        max_image_count: capabilities.max_image_count,
     })
 }
 
