@@ -11,6 +11,7 @@ S0-ARCH-003	covered	cargo xtask policy rejects platform/render adapter dependenc
 S0-ARCH-004	covered	cargo xtask policy scans workspace-owned Rust/TOML for unsafe constructs and workspace lints forbid unsafe_code
 S0-ARCH-005	covered	cargo xtask policy rejects Python source files, Python shebangs, and Python CI workflow steps while allowing docs requirements.txt
 S0-ARCH-006	covered	cargo xtask policy rejects non-fparkan package directories under crates/
+S0-ARCH-007	covered	cargo xtask ci runs fmt, policy, workspace test, clippy, rustdoc warnings, cargo-deny or built-in supply-chain fallback, and strict acceptance audit
 S0-DIAG-001	covered	cargo test -p fparkan-diagnostics --offline diagnostic_chain_preserves_context
 S0-DIAG-002	covered	cargo test -p fparkan-diagnostics --offline json_is_stable
 S0-CORPUS-001	covered	cargo test -p fparkan-corpus --offline deterministic_traversal_is_creation_order_independent

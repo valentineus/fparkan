@@ -37,6 +37,8 @@ const PART2_ROOT_ENV: &str = "FPARKAN_CORPUS_PART2_ROOT";
 const CI_ACCEPTANCE_ROADMAP: &str = "fixtures/acceptance/stage_0_2_roadmap.md";
 const CI_ACCEPTANCE_COVERAGE: &str = "fixtures/acceptance/coverage.tsv";
 const CI_ACCEPTANCE_REPORT: &str = "target/fparkan/acceptance/stage-0-2-audit.json";
+const APPROVED_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+const SUPPLY_CHAIN_BANNED_PACKAGES: &[&str] = &["native-tls", "openssl", "openssl-sys"];
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -170,10 +172,18 @@ fn run_cargo_fmt_check() -> Result<(), String> {
 }
 
 fn run_cargo_deny() -> Result<(), String> {
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let status = Command::new(cargo)
+    let cargo_deny = std::env::var_os("CARGO_DENY").unwrap_or_else(|| "cargo-deny".into());
+    let available = Command::new(&cargo_deny).arg("--version").status();
+    match available {
+        Ok(status) if status.success() => {}
+        Ok(_) | Err(_) => {
+            eprintln!("cargo-deny is unavailable; running built-in supply-chain policy fallback");
+            return run_builtin_supply_chain_policy(Path::new("."));
+        }
+    }
+
+    let status = Command::new(cargo_deny)
         .args([
-            "deny",
             "check",
             "--workspace",
             "--all-features",
@@ -188,6 +198,20 @@ fn run_cargo_deny() -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("cargo-deny exited with {status}"))
+    }
+}
+
+fn run_builtin_supply_chain_policy(root: &Path) -> Result<(), String> {
+    let mut failures = Vec::new();
+    validate_workspace_license(root, &mut failures)?;
+    validate_lockfile_supply_chain(root, &mut failures)?;
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "built-in supply-chain policy failed:\n{}",
+            failures.join("\n")
+        ))
     }
 }
 
@@ -528,6 +552,52 @@ fn validate_lockfile(root: &Path, failures: &mut Vec<String>) {
             lockfile.display()
         ));
     }
+}
+
+fn validate_lockfile_supply_chain(root: &Path, failures: &mut Vec<String>) -> Result<(), String> {
+    let lockfile = root.join("Cargo.lock");
+    let packages = read_lockfile_packages(&lockfile)?;
+    for package in packages {
+        if let Some(source) = package.source.as_deref() {
+            if source != APPROVED_REGISTRY_SOURCE {
+                failures.push(format!(
+                    "{}: package {} {} uses unapproved source {source}",
+                    lockfile.display(),
+                    package.name,
+                    package.version
+                ));
+            }
+        }
+        if SUPPLY_CHAIN_BANNED_PACKAGES.contains(&package.name.as_str()) {
+            failures.push(format!(
+                "{}: package {} {} is banned by built-in supply-chain policy",
+                lockfile.display(),
+                package.name,
+                package.version
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn read_lockfile_packages(lockfile: &Path) -> Result<Vec<CargoLockPackage>, String> {
+    let text =
+        fs::read_to_string(lockfile).map_err(|err| format!("{}: {err}", lockfile.display()))?;
+    let parsed = toml::from_str::<CargoLock>(&text)
+        .map_err(|err| format!("{}: invalid Cargo.lock TOML: {err}", lockfile.display()))?;
+    Ok(parsed.package)
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoLock {
+    package: Vec<CargoLockPackage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CargoLockPackage {
+    name: String,
+    version: String,
+    source: Option<String>,
 }
 
 fn validate_workspace_license(root: &Path, failures: &mut Vec<String>) -> Result<(), String> {
@@ -1948,6 +2018,51 @@ fparkan-render-vulkan = { path = "../../adapters/fparkan-render-vulkan" }
             first_forbidden_platform_bridge_dependency(&closure),
             Some("fparkan-render-vulkan")
         );
+    }
+
+    #[test]
+    fn lockfile_supply_chain_rejects_unapproved_sources() -> Result<(), String> {
+        let root = temp_dir("lockfile-source");
+        fs::create_dir_all(&root).map_err(|err| err.to_string())?;
+        fs::write(
+            root.join("Cargo.lock"),
+            r#"
+[[package]]
+name = "external"
+version = "1.0.0"
+source = "git+https://example.invalid/repo"
+"#,
+        )
+        .map_err(|err| err.to_string())?;
+
+        let mut failures = Vec::new();
+        validate_lockfile_supply_chain(&root, &mut failures)?;
+
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("uses unapproved source"));
+        fs::remove_dir_all(root).map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn lockfile_supply_chain_rejects_banned_packages() -> Result<(), String> {
+        let root = temp_dir("lockfile-ban");
+        fs::create_dir_all(&root).map_err(|err| err.to_string())?;
+        fs::write(
+            root.join("Cargo.lock"),
+            format!(
+                "[[package]]\nname = \"openssl\"\nversion = \"0.10.0\"\nsource = \"{APPROVED_REGISTRY_SOURCE}\"\n"
+            ),
+        )
+        .map_err(|err| err.to_string())?;
+
+        let mut failures = Vec::new();
+        validate_lockfile_supply_chain(&root, &mut failures)?;
+
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("is banned"));
+        fs::remove_dir_all(root).map_err(|err| err.to_string())?;
+        Ok(())
     }
 
     #[test]
