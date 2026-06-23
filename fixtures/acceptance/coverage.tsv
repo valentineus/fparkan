@@ -7,7 +7,7 @@ L0-P2-001	covered	cargo test -p fparkan-corpus --offline licensed_part2_manifest
 L0-P2-002	covered	cargo test -p fparkan-corpus --offline licensed_part2_has_no_casefold_relative_path_collisions
 S0-ARCH-001	covered	cargo xtask policy runs cargo metadata --offline --no-deps successfully
 S0-ARCH-002	covered	cargo xtask policy rejects forbidden GUI/adapter dependencies from domain crates
-S0-ARCH-003	covered	cargo xtask policy rejects platform/render adapter dependencies from fparkan-headless
+S0-ARCH-003	covered	cargo xtask policy rejects platform/render adapter dependencies from the transitive fparkan-headless workspace manifest closure
 S0-ARCH-004	covered	cargo xtask policy scans workspace-owned Rust/TOML for unsafe constructs and workspace lints forbid unsafe_code
 S0-ARCH-005	covered	cargo xtask policy rejects Python source files, Python shebangs, and Python CI workflow steps while allowing docs requirements.txt
 S0-ARCH-006	covered	cargo xtask policy rejects non-fparkan package directories under crates/

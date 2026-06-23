@@ -425,6 +425,7 @@ fn run_policy(root: &Path) -> Result<(), String> {
     let mut failures = Vec::new();
     scan_policy_dir(root, &mut failures)?;
     validate_cargo_metadata(root, &mut failures)?;
+    validate_cargo_metadata_dependency_closures(root, &mut failures)?;
     validate_lockfile(root, &mut failures);
     validate_workspace_license(root, &mut failures)?;
     validate_dependency_boundaries(root, &mut failures)?;
@@ -454,6 +455,69 @@ fn validate_cargo_metadata(root: &Path, failures: &mut Vec<String>) -> Result<()
         return Ok(());
     }
     Ok(())
+}
+
+fn validate_cargo_metadata_dependency_closures(
+    root: &Path,
+    failures: &mut Vec<String>,
+) -> Result<(), String> {
+    let mut manifests = Vec::new();
+    collect_cargo_manifests(root, &mut manifests)?;
+    let mut deps_by_package = BTreeMap::new();
+    for manifest in manifests {
+        let text = fs::read_to_string(&manifest)
+            .map_err(|err| format!("{}: {err}", manifest.display()))?;
+        let Some(package) = parse_package_name(&text) else {
+            continue;
+        };
+        deps_by_package.insert(package, parse_manifest_dependencies(&text));
+    }
+
+    validate_package_closure_excludes("fparkan-headless", &deps_by_package, failures);
+    Ok(())
+}
+
+fn validate_package_closure_excludes(
+    package: &str,
+    deps_by_package: &BTreeMap<String, BTreeSet<String>>,
+    failures: &mut Vec<String>,
+) {
+    if !deps_by_package.contains_key(package) {
+        failures.push(format!(
+            "workspace manifest graph missing package {package}"
+        ));
+        return;
+    }
+    let closure = dependency_closure_names(package, deps_by_package);
+    if let Some(forbidden) = first_forbidden_platform_bridge_dependency(&closure) {
+        failures.push(format!(
+            "workspace manifest closure: package {package} depends on forbidden platform/render dependency {forbidden}"
+        ));
+    }
+}
+
+fn dependency_closure_names(
+    root: &str,
+    deps_by_package: &BTreeMap<String, BTreeSet<String>>,
+) -> BTreeSet<String> {
+    let mut seen = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    let mut stack = deps_by_package
+        .get(root)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<Vec<_>>();
+    while let Some(name) = stack.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        names.insert(name.clone());
+        if let Some(deps) = deps_by_package.get(&name) {
+            stack.extend(deps.iter().cloned());
+        }
+    }
+    names
 }
 
 fn validate_lockfile(root: &Path, failures: &mut Vec<String>) {
@@ -1859,6 +1923,31 @@ fparkan-render-vulkan = { path = "../../adapters/fparkan-render-vulkan" }
         assert!(deps.contains("fparkan-render"));
         assert!(deps.contains("quoted-dep"));
         assert!(deps.contains("fparkan-render-vulkan"));
+    }
+
+    #[test]
+    fn workspace_manifest_closure_detects_transitive_platform_bridge() {
+        let deps_by_package = [
+            (
+                "fparkan-headless".to_string(),
+                ["fparkan-runtime".to_string()].into_iter().collect(),
+            ),
+            (
+                "fparkan-runtime".to_string(),
+                ["fparkan-render-vulkan".to_string()].into_iter().collect(),
+            ),
+            ("fparkan-render-vulkan".to_string(), BTreeSet::new()),
+        ]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+
+        let closure = dependency_closure_names("fparkan-headless", &deps_by_package);
+
+        assert!(closure.contains("fparkan-runtime"));
+        assert_eq!(
+            first_forbidden_platform_bridge_dependency(&closure),
+            Some("fparkan-render-vulkan")
+        );
     }
 
     #[test]
