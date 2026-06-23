@@ -523,6 +523,7 @@ fn render_smoke_report_json(
             "  \"schema_version\": \"{}\",\n",
             "  \"commit_sha\": \"{}\",\n",
             "  \"rust_toolchain\": \"{}\",\n",
+            "  \"target_triple\": \"{}\",\n",
             "  \"platform\": \"{}\",\n",
             "  \"status\": \"{}\",\n",
             "  \"frames\": {},\n",
@@ -548,6 +549,7 @@ fn render_smoke_report_json(
         SCHEMA_VERSION,
         json_escape(&current_git_commit_sha()),
         RUST_TOOLCHAIN,
+        json_escape(&current_rustc_host_triple()),
         options.platform.as_str(),
         options.status.as_str(),
         options.frames,
@@ -591,6 +593,22 @@ fn current_git_commit_sha() -> String {
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .map(|value| value.trim().to_string())
         .filter(|value| value.len() == 40 && value.chars().all(|ch| ch.is_ascii_hexdigit()))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn current_rustc_host_triple() -> String {
+    Command::new("rustc")
+        .arg("-vV")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|output| {
+            output
+                .lines()
+                .find_map(|line| line.strip_prefix("host: ").map(ToString::to_string))
+        })
+        .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "unknown".to_string())
 }
 
@@ -952,6 +970,7 @@ mod tests {
         )?;
 
         assert!(json.contains("\"schema_version\": \"fparkan-native-smoke-v1\""));
+        assert!(json.contains("\"target_triple\": \""));
         assert!(json.contains("\"platform\": \"macos\""));
         assert!(json.contains("\"status\": \"blocked\""));
         assert!(json.contains("\"swapchain_recreate_count\": 0"));
@@ -1029,5 +1048,10 @@ mod tests {
     #[test]
     fn formats_vulkan_api_version() {
         assert_eq!(format_api_version((1 << 22) | (3 << 12) | 280), "1.3.280");
+    }
+
+    #[test]
+    fn reports_rustc_host_triple() {
+        assert!(!current_rustc_host_triple().trim().is_empty());
     }
 }
