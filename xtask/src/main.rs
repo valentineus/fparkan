@@ -1,4 +1,23 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_precision_loss,
+        clippy::expect_used,
+        clippy::float_cmp,
+        clippy::identity_op,
+        clippy::too_many_lines,
+        clippy::uninlined_format_args,
+        clippy::map_unwrap_or,
+        clippy::needless_raw_string_hashes,
+        clippy::semicolon_if_nothing_returned,
+        clippy::type_complexity,
+        clippy::panic,
+        clippy::unwrap_used
+    )
+)]
 #![allow(clippy::print_stderr, clippy::print_stdout)]
 //! Repository automation for `FParkan`.
 
@@ -175,8 +194,17 @@ fn run_cargo_deny() -> Result<(), String> {
 fn run_cargo_doc() -> Result<(), String> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let status = Command::new(cargo)
-        .args(["doc", "--workspace", "--all-features", "--locked", "--no-deps"])
-        .env("RUSTDOCFLAGS", "-D warnings -D rustdoc::broken_intra_doc_links")
+        .args([
+            "doc",
+            "--workspace",
+            "--all-features",
+            "--locked",
+            "--no-deps",
+        ])
+        .env(
+            "RUSTDOCFLAGS",
+            "-D warnings -D rustdoc::broken_intra_doc_links",
+        )
         .status()
         .map_err(|err| format!("failed to run cargo doc: {err}"))?;
     if status.success() {
@@ -272,8 +300,10 @@ fn parse_licensed_manifest(path: &Path) -> Result<LicensedCorpusRoots, String> {
     }
 
     let roots = LicensedCorpusRoots {
-        part1: part1.ok_or_else(|| "licensed manifest is missing part1 corpus entry".to_string())?,
-        part2: part2.ok_or_else(|| "licensed manifest is missing part2 corpus entry".to_string())?,
+        part1: part1
+            .ok_or_else(|| "licensed manifest is missing part1 corpus entry".to_string())?,
+        part2: part2
+            .ok_or_else(|| "licensed manifest is missing part2 corpus entry".to_string())?,
     };
     validate_licensed_part("part1", &roots.part1)?;
     validate_licensed_part("part2", &roots.part2)?;
@@ -412,16 +442,10 @@ fn validate_cargo_metadata(root: &Path, failures: &mut Vec<String>) -> Result<()
     }
     let metadata = MetadataCommand::new()
         .manifest_path(&manifest)
-        .no_deps(true)
+        .no_deps()
         .other_options(["--offline".to_string(), "--locked".to_string()])
         .exec()
-        .map_err(|error| {
-            format!(
-                "{}: cargo metadata failed: {}",
-                manifest.display(),
-                error
-            )
-        })?;
+        .map_err(|error| format!("{}: cargo metadata failed: {}", manifest.display(), error))?;
     if metadata.workspace_members.is_empty() {
         failures.push(format!(
             "{}: cargo metadata produced no workspace members",
@@ -505,7 +529,7 @@ fn validate_dependency_boundaries(root: &Path, failures: &mut Vec<String>) -> Re
             continue;
         }
         let dependencies = parse_manifest_dependencies(&text);
-        if !is_adapter_like_package(&package) {
+        if !is_adapter_like_package(&package) && !is_app_package(&package) {
             for dependency in &dependencies {
                 if is_forbidden_gui_dependency(dependency) {
                     failures.push(format!(
@@ -522,13 +546,13 @@ fn validate_dependency_boundaries(root: &Path, failures: &mut Vec<String>) -> Re
                     manifest.display()
                 ));
             }
-            for dependency in &dependencies {
-                if is_forbidden_runtime_bridge_dependency(dependency) {
-                    failures.push(format!(
-                        "{}: app package {package} depends on forbidden bridge dependency {dependency}",
-                        manifest.display()
-                    ));
-                }
+        }
+        if package == "fparkan-headless" {
+            if let Some(forbidden) = first_forbidden_platform_bridge_dependency(&dependencies) {
+                failures.push(format!(
+                    "{}: headless package {package} depends on platform/render bridge dependency {forbidden}",
+                    manifest.display()
+                ));
             }
         }
 
@@ -567,10 +591,7 @@ fn is_app_package(package: &str) -> bool {
 }
 
 fn is_adapter_like_package(package: &str) -> bool {
-    matches!(
-        package,
-        "fparkan-platform-winit" | "fparkan-render-vulkan"
-    )
+    matches!(package, "fparkan-platform-winit" | "fparkan-render-vulkan")
 }
 
 fn first_forbidden_parser_dependency(dependencies: &BTreeSet<String>) -> Option<&str> {
@@ -630,16 +651,10 @@ fn first_forbidden_platform_bridge_dependency(dependencies: &BTreeSet<String>) -
     })
 }
 
-fn is_forbidden_runtime_bridge_dependency(dependency: &str) -> bool {
-    matches!(
-        dependency,
-        "fparkan-platform-winit" | "fparkan-render-vulkan" | "winit" | "ash" | "ash-window"
-    )
-}
-
 fn is_forbidden_domain_dependency(dependency: &str) -> bool {
     matches!(
-        dependency, "fparkan-cli"
+        dependency,
+        "fparkan-cli"
             | "fparkan-game"
             | "fparkan-headless"
             | "fparkan-viewer"
@@ -889,14 +904,14 @@ fn scan_policy_file(path: &Path, failures: &mut Vec<String>) -> Result<(), Strin
             previous_line_has_safety_comment = false;
             continue;
         }
-        if contains_unsafe_construct(trimmed) {
-            if !is_authorized_unsafe_construct(path, trimmed, previous_line_has_safety_comment) {
-                failures.push(format!(
-                    "{}:{}: unsafe construct in workspace source",
-                    path.display(),
-                    index + 1
-                ));
-            }
+        if contains_unsafe_construct(trimmed)
+            && !is_authorized_unsafe_construct(path, trimmed, previous_line_has_safety_comment)
+        {
+            failures.push(format!(
+                "{}:{}: unsafe construct in workspace source",
+                path.display(),
+                index + 1
+            ));
         }
         previous_line_has_safety_comment = false;
     }
@@ -911,9 +926,7 @@ fn contains_unsafe_construct(line: &str) -> bool {
 }
 
 fn is_comment_line(line: &str) -> bool {
-    line.starts_with("//")
-        || line.starts_with("//!")
-        || line.starts_with("///")
+    line.starts_with("//") || line.starts_with("//!") || line.starts_with("///")
 }
 
 fn has_safety_comment(line: &str) -> bool {
@@ -924,7 +937,9 @@ const AUDITED_UNSAFE_SOURCE_FILES: &[&str] = &["adapters/fparkan-render-vulkan/s
 
 fn is_audited_unsafe_source(path: &Path) -> bool {
     let as_path = path.as_os_str().to_string_lossy();
-    AUDITED_UNSAFE_SOURCE_FILES.iter().any(|candidate| as_path.ends_with(candidate))
+    AUDITED_UNSAFE_SOURCE_FILES
+        .iter()
+        .any(|candidate| as_path.ends_with(candidate))
 }
 
 fn is_authorized_unsafe_construct(
@@ -1258,11 +1273,7 @@ impl AcceptanceAudit {
     }
 
     fn strict_failures(&self) -> Vec<String> {
-        self.partial
-            .iter()
-            .chain(&self.missing)
-            .cloned()
-            .collect()
+        self.partial.iter().chain(&self.missing).cloned().collect()
     }
 }
 

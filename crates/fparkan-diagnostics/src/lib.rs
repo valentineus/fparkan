@@ -1,4 +1,23 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_precision_loss,
+        clippy::expect_used,
+        clippy::float_cmp,
+        clippy::identity_op,
+        clippy::too_many_lines,
+        clippy::uninlined_format_args,
+        clippy::map_unwrap_or,
+        clippy::needless_raw_string_hashes,
+        clippy::semicolon_if_nothing_returned,
+        clippy::type_complexity,
+        clippy::panic,
+        clippy::unwrap_used
+    )
+)]
 //! Structured diagnostics shared by `FParkan` crates.
 
 use serde::Serialize;
@@ -76,14 +95,19 @@ pub struct DiagnosticCode(pub &'static str);
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct DiagnosticContext {
     /// Phase.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub phase: Option<Phase>,
     /// Redacted or logical path.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     /// Archive entry name.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub archive_entry: Option<String>,
     /// Object/prototype key.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub object_key: Option<String>,
     /// Input span.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub span: Option<SourceSpan>,
 }
 
@@ -218,7 +242,7 @@ mod tests {
         let value = diagnostic(DiagnosticCode("S1-H01"), "quote\"\u{0000}tab\tline\r\n");
         let json = render_json(&value);
         assert!(json.contains("\\u0000"));
-        assert!(json.contains("\\u0009"));
+        assert!(json.contains("\\t"));
         assert!(!json.contains('\t'));
         assert!(!json.contains('\r'));
     }

@@ -1,4 +1,23 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_precision_loss,
+        clippy::expect_used,
+        clippy::float_cmp,
+        clippy::identity_op,
+        clippy::too_many_lines,
+        clippy::uninlined_format_args,
+        clippy::map_unwrap_or,
+        clippy::needless_raw_string_hashes,
+        clippy::semicolon_if_nothing_returned,
+        clippy::type_complexity,
+        clippy::panic,
+        clippy::unwrap_used
+    )
+)]
 //! Prototype registry and unit DAT primitives.
 
 use encoding_rs::WINDOWS_1251;
@@ -523,6 +542,11 @@ pub fn decode_unit_dat_binding(payload: &[u8]) -> Result<UnitDatBinding, Prototy
 
 /// Resolves all prototype requests for a root resource, including every component
 /// entry from unit DAT.
+///
+/// # Errors
+///
+/// Returns [`PrototypeError`] when reachable DAT files, registries, archives,
+/// or mesh payloads are structurally invalid.
 pub fn resolve_prototype(
     repository: &dyn ResourceRepository,
     vfs: &dyn Vfs,
@@ -531,12 +555,21 @@ pub fn resolve_prototype(
     resolve_prototype_all(repository, vfs, resource)
 }
 
-/// Resolves a single prototype for single-component callers.
-///
+/// Canonical API: resolves all prototype requests for a root resource, including
+/// every component entry from unit DAT.
 /// # Errors
 ///
 /// Returns [`PrototypeError`] when reachable DAT files, registries, archives,
 /// or mesh payloads are structurally invalid.
+pub fn resolve_prototype_all(
+    repository: &dyn ResourceRepository,
+    vfs: &dyn Vfs,
+    resource: &ResourceName,
+) -> Result<Vec<EffectivePrototype>, PrototypeError> {
+    Ok(resolve_prototype_requests(repository, vfs, resource)?.prototypes)
+}
+
+#[cfg(test)]
 fn resolve_prototype_single(
     repository: &dyn ResourceRepository,
     vfs: &dyn Vfs,
@@ -552,21 +585,6 @@ fn resolve_prototype_single(
         ))));
     }
     Ok(first)
-}
-
-/// Canonical API: resolves all prototype requests for a root resource, including
-/// every component entry from unit DAT.
-/// # Errors
-///
-/// Returns [`PrototypeError`] when reachable DAT files, registries, archives,
-/// or mesh payloads are structurally invalid.
-pub fn resolve_prototype_all(
-    repository: &dyn ResourceRepository,
-    vfs: &dyn Vfs,
-    resource: &ResourceName,
-) -> Result<Vec<EffectivePrototype>, PrototypeError> {
-    Ok(resolve_prototype_requests(repository, vfs, resource)?
-        .prototypes)
 }
 
 fn resolve_direct_prototype(
@@ -681,18 +699,23 @@ pub fn build_prototype_graph(
     let mut next_edge = 0u32;
     for (root_index, root) in roots.iter().enumerate() {
         let key = PrototypeKey(root.clone());
-        graph.roots.push(key);
         let is_unit_dat_root = has_extension_bytes(&root.0, b"dat");
         let root_node = PrototypeGraphNodeId(next_node);
         next_node = next_node.saturating_add(1);
-        graph.nodes.push(
-            PrototypeGraphNode::root(key.clone(), is_unit_dat_root, root_node)
-        );
+        graph.nodes.push(PrototypeGraphNode::root(
+            key.clone(),
+            is_unit_dat_root,
+            root_node,
+        ));
+        graph.roots.push(key);
         let start = graph.prototype_requests.len();
         let expansion = resolve_prototype_requests(repository, vfs, root)?;
         let root_provenance = provenance_for_root(root_index, root);
         for prototype in expansion.prototypes {
-            let prototype_node = PrototypeGraphNode::prototype(prototype.key.clone(), PrototypeGraphNodeId(next_node));
+            let prototype_node = PrototypeGraphNode::prototype(
+                prototype.key.clone(),
+                PrototypeGraphNodeId(next_node),
+            );
             next_node = next_node.saturating_add(1);
             let prototype_node_id = prototype_node.id;
             graph.nodes.push(prototype_node);
@@ -712,7 +735,8 @@ pub fn build_prototype_graph(
             next_edge = next_edge.saturating_add(1);
 
             for dependency in &prototype.dependencies {
-                let mesh_node = PrototypeGraphNode::mesh(dependency.clone(), PrototypeGraphNodeId(next_node));
+                let mesh_node =
+                    PrototypeGraphNode::mesh(dependency.clone(), PrototypeGraphNodeId(next_node));
                 next_node = next_node.saturating_add(1);
                 let mesh_node_id = mesh_node.id;
                 graph.nodes.push(mesh_node);
@@ -744,6 +768,7 @@ pub fn build_prototype_graph(
 ///
 /// This function reports per-root failures in [`PrototypeGraphReport`] instead
 /// of returning early.
+#[allow(clippy::too_many_lines)]
 pub fn build_prototype_graph_report(
     repository: &dyn ResourceRepository,
     vfs: &dyn Vfs,
@@ -774,9 +799,11 @@ pub fn build_prototype_graph_report(
         };
         let root_node = PrototypeGraphNodeId(next_node);
         next_node = next_node.saturating_add(1);
-        graph.nodes.push(
-            PrototypeGraphNode::root(PrototypeKey(root.clone()), is_unit_dat_root, root_node)
-        );
+        graph.nodes.push(PrototypeGraphNode::root(
+            PrototypeKey(root.clone()),
+            is_unit_dat_root,
+            root_node,
+        ));
         let start = graph.prototype_requests.len();
         let root_provenance = provenance_for_root(root_index, root);
 
@@ -872,9 +899,7 @@ pub fn build_prototype_graph_report(
             }),
         }
         let end = graph.prototype_requests.len();
-        graph
-            .root_prototype_request_spans
-            .push(start..end);
+        graph.root_prototype_request_spans.push(start..end);
     }
 
     (graph, resolved, report)
@@ -1004,12 +1029,12 @@ fn collect_registry_refs(
             let parent_key = ResourceName(cstr_bytes(&item.resource_raw).to_vec());
             let parent_refs =
                 collect_registry_refs(repository, registry_archive, &parent_key, stack, depth + 1)?
-                .ok_or_else(|| {
-                    PrototypeError::Resource(ResourceError::Format(format!(
-                        "missing parent prototype {}",
-                        String::from_utf8_lossy(&parent_key.0)
-                    )))
-                })?;
+                    .ok_or_else(|| {
+                        PrototypeError::Resource(ResourceError::Format(format!(
+                            "missing parent prototype {}",
+                            String::from_utf8_lossy(&parent_key.0)
+                        )))
+                    })?;
             effective_refs.extend(parent_refs);
         } else {
             effective_refs.push(item);
@@ -1443,9 +1468,10 @@ mod tests {
                     ),
                     (
                         b"component_b".as_slice(),
-                        build_object_refs(&[
-                            (b"static.rlb".as_slice(), b"component_b.msh".as_slice()),
-                        ])
+                        build_object_refs(&[(
+                            b"static.rlb".as_slice(),
+                            b"component_b.msh".as_slice(),
+                        )])
                         .as_slice(),
                     ),
                 ])
@@ -1499,13 +1525,19 @@ mod tests {
                 build_nres(&[
                     (
                         b"component_a".as_slice(),
-                        build_object_refs(&[(b"static.rlb".as_slice(), b"component_a.msh".as_slice())])
-                            .as_slice(),
+                        build_object_refs(&[(
+                            b"static.rlb".as_slice(),
+                            b"component_a.msh".as_slice(),
+                        )])
+                        .as_slice(),
                     ),
                     (
                         b"component_b".as_slice(),
-                        build_object_refs(&[(b"static.rlb".as_slice(), b"component_b.msh".as_slice())])
-                            .as_slice(),
+                        build_object_refs(&[(
+                            b"static.rlb".as_slice(),
+                            b"component_b.msh".as_slice(),
+                        )])
+                        .as_slice(),
                     ),
                 ])
                 .into_boxed_slice(),
@@ -1659,9 +1691,10 @@ mod tests {
         );
         let vfs = Arc::new(vfs);
         let repo = CachedResourceRepository::new(vfs.clone());
-        let resolved = resolve_prototype_single(&repo, vfs.as_ref(), &resource_name(b"child_proto"))
-            .expect("resolve")
-            .expect("prototype");
+        let resolved =
+            resolve_prototype_single(&repo, vfs.as_ref(), &resource_name(b"child_proto"))
+                .expect("resolve")
+                .expect("prototype");
 
         let PrototypeGeometry::Mesh(mesh) = resolved.geometry else {
             panic!("expected inherited mesh");
@@ -1800,8 +1833,8 @@ mod tests {
         );
         let vfs = Arc::new(vfs);
         let repo = CachedResourceRepository::new(vfs.clone());
-        let err =
-            resolve_prototype_single(&repo, vfs.as_ref(), &resource_name(b"cycle_a")).expect_err("cycle");
+        let err = resolve_prototype_single(&repo, vfs.as_ref(), &resource_name(b"cycle_a"))
+            .expect_err("cycle");
 
         assert!(err.to_string().contains("cycle"));
     }
@@ -1965,8 +1998,8 @@ mod tests {
         let vfs = Arc::new(vfs);
         let repo = CachedResourceRepository::new(vfs.clone());
 
-        let err =
-            resolve_prototype_single(&repo, vfs.as_ref(), &resource_name(b"proto_0")).expect_err("depth");
+        let err = resolve_prototype_single(&repo, vfs.as_ref(), &resource_name(b"proto_0"))
+            .expect_err("depth");
 
         assert!(err.to_string().contains("depth exceeded"));
     }

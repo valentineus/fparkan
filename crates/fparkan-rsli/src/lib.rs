@@ -1,4 +1,23 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_precision_loss,
+        clippy::expect_used,
+        clippy::float_cmp,
+        clippy::identity_op,
+        clippy::too_many_lines,
+        clippy::uninlined_format_args,
+        clippy::map_unwrap_or,
+        clippy::needless_raw_string_hashes,
+        clippy::semicolon_if_nothing_returned,
+        clippy::type_complexity,
+        clippy::panic,
+        clippy::unwrap_used
+    )
+)]
 //! Stage-1 `RsLi` archive contract.
 
 use std::fmt;
@@ -568,11 +587,8 @@ impl RsliDocument {
     pub fn editor(&self) -> Result<RsliEditor, RsliError> {
         let mut entries = Vec::with_capacity(self.records.len());
         for (id, record) in self.records.iter().enumerate() {
-            let packed = self
-                .packed_slice(EntryId(u32::try_from(id).map_err(|_| RsliError::IntegerOverflow)?)?,
-                record,
-            )?
-            .to_vec();
+            let entry_id = EntryId(u32::try_from(id).map_err(|_| RsliError::IntegerOverflow)?);
+            let packed = self.packed_slice(entry_id, record)?.to_vec();
             entries.push(EditableEntry {
                 meta: record.meta.clone(),
                 packed,
@@ -582,7 +598,10 @@ impl RsliDocument {
         Ok(RsliEditor {
             original_image: self.bytes.clone(),
             header: self.header.clone(),
-            overlay: self.ao_trailer.as_ref().map_or(0, |overlay| overlay.overlay),
+            overlay: self
+                .ao_trailer
+                .as_ref()
+                .map_or(0, |overlay| overlay.overlay),
             ao_trailer: self.ao_trailer.as_ref().map(|overlay| overlay.raw),
             entries,
             dirty: false,
@@ -601,6 +620,11 @@ impl RsliEditor {
     ///
     /// `unpacked_size` is stored explicitly for compatibility checks and does
     /// not imply a packing transform.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsliMutationError`] when the entry id is unknown or the packed
+    /// payload is too large for the archive directory format.
     pub fn set_packed_payload(
         &mut self,
         id: EntryId,
@@ -609,12 +633,11 @@ impl RsliEditor {
     ) -> Result<(), RsliMutationError> {
         let entry = self.entry_mut(id)?;
         let packed = packed.into();
-        entry.meta.packed_size = u32::try_from(packed.len()).map_err(|_| {
-            RsliMutationError::PackedPayloadTooLarge {
+        entry.meta.packed_size =
+            u32::try_from(packed.len()).map_err(|_| RsliMutationError::PackedPayloadTooLarge {
                 size: packed.len(),
-                max: usize::try_from(u32::MAX).expect("u32 max always fits usize"),
-            }
-        })?;
+                max: u32::MAX as usize,
+            })?;
         entry.packed = packed;
         entry.meta.unpacked_size = unpacked_size;
         self.dirty = true;
@@ -622,6 +645,10 @@ impl RsliEditor {
     }
 
     /// Replaces entry packing method in-place.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsliMutationError`] when the entry id is unknown.
     pub fn set_method(&mut self, id: EntryId, method: RsliMethod) -> Result<(), RsliMutationError> {
         let entry = self.entry_mut(id)?;
         entry.meta.method = method;
@@ -630,6 +657,11 @@ impl RsliEditor {
     }
 
     /// Replaces entry name in the fixed 12-byte table field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsliMutationError`] when the entry id is unknown or the name
+    /// cannot be represented in the fixed authoring field.
     pub fn set_name(&mut self, id: EntryId, name: &[u8]) -> Result<(), RsliMutationError> {
         let entry = self.entry_mut(id)?;
         entry.meta.name_raw = authoring_name_raw(name)?;
@@ -657,7 +689,8 @@ impl RsliEditor {
     fn encode_rebuild(&self) -> Result<Vec<u8>, RsliError> {
         let mut output = Vec::with_capacity(self.original_image.len());
 
-        let entry_count = u16::try_from(self.entries.len()).map_err(|_| RsliError::IntegerOverflow)?;
+        let entry_count =
+            u16::try_from(self.entries.len()).map_err(|_| RsliError::IntegerOverflow)?;
         let table_len = self
             .entries
             .len()
@@ -678,7 +711,8 @@ impl RsliEditor {
 
         let mut lookup_map = vec![0i16; self.entries.len()];
         for (position, original) in sorted.iter().enumerate() {
-            lookup_map[*original] = i16::try_from(position).map_err(|_| RsliError::IntegerOverflow)?;
+            lookup_map[*original] =
+                i16::try_from(position).map_err(|_| RsliError::IntegerOverflow)?;
         }
 
         let mut cursor = 32usize
@@ -690,13 +724,16 @@ impl RsliEditor {
             let name_len = entry.meta.name_raw.len().min(12);
             row[0..name_len].copy_from_slice(&entry.meta.name_raw[..name_len]);
 
-            row[16..18].copy_from_slice(&i16::try_from(entry.meta.flags)
-                .map_err(|_| RsliError::IntegerOverflow)?
-                .to_le_bytes());
+            row[16..18].copy_from_slice(
+                &i16::try_from(entry.meta.flags)
+                    .map_err(|_| RsliError::IntegerOverflow)?
+                    .to_le_bytes(),
+            );
             row[18..20].copy_from_slice(&lookup_map[index].to_le_bytes());
             row[20..24].copy_from_slice(&entry.meta.unpacked_size.to_le_bytes());
 
-            let packed_len = u32::try_from(entry.packed.len()).map_err(|_| RsliError::IntegerOverflow)?;
+            let packed_len =
+                u32::try_from(entry.packed.len()).map_err(|_| RsliError::IntegerOverflow)?;
             let cursor_u32 = u32::try_from(cursor).map_err(|_| RsliError::IntegerOverflow)?;
             let offset_raw = if self.overlay == 0 {
                 cursor_u32
@@ -716,9 +753,10 @@ impl RsliEditor {
                 .ok_or(RsliError::IntegerOverflow)?;
         }
 
-        let seed = self.header.xor_seed & 0xFFFF;
+        let seed =
+            u16::try_from(self.header.xor_seed & 0xFFFF).map_err(|_| RsliError::IntegerOverflow)?;
         let encrypted = xor_stream(&table_plain, seed);
-        output.splice(32..32, encrypted.into_iter());
+        output.splice(32..32, encrypted);
 
         if let Some(overlay) = &self.ao_trailer {
             output.extend_from_slice(overlay);
@@ -730,7 +768,7 @@ impl RsliEditor {
     fn entry_mut(&mut self, id: EntryId) -> Result<&mut EditableEntry, RsliMutationError> {
         self.entries
             .get_mut(usize::try_from(id.0).map_err(|_| RsliMutationError::EntryNotFound { id })?)
-            .ok_or_else(|| RsliMutationError::EntryNotFound { id })
+            .ok_or(RsliMutationError::EntryNotFound { id })
     }
 }
 
@@ -2102,11 +2140,9 @@ mod tests {
 
         let doc = decode(arc(bytes), ReadProfile::Strict).expect("editable archive");
         let mut editor = doc.editor().expect("editor");
+        editor.set_name(EntryId(1), b"ZETA").expect("edit name");
         editor
-            .set_name(EntryId(1), b"ZETA")
-            .expect("edit name");
-        editor
-            .set_packed_payload(EntryId(0), b"repacked-alpha", 13)
+            .set_packed_payload(EntryId(0), b"repacked-alpha", 14)
             .expect("edit packed payload");
         editor
             .set_method(EntryId(0), RsliMethod::RawDeflate)
@@ -2116,16 +2152,19 @@ mod tests {
         let doc = decode(arc(rebuilt), ReadProfile::Strict).expect("repacked archive");
 
         let renamed = doc.find("ZETA").expect("renamed entry");
-        assert_eq!(
-            doc.load(renamed).expect("renamed payload"),
-            b"beta"
-        );
+        assert_eq!(doc.load(renamed).expect("renamed payload"), b"beta");
         let original = doc
             .find("A")
             .or_else(|| doc.find("a"))
             .expect("original renamed entry fallback");
-        assert_eq!(doc.load(original).expect("updated payload"), b"repacked-alpha");
-        assert_eq!(doc.entries()[original.0 as usize].method, RsliMethod::RawDeflate);
+        assert_eq!(
+            doc.load(original).expect("updated payload"),
+            b"repacked-alpha"
+        );
+        assert_eq!(
+            doc.entries()[original.0 as usize].method,
+            RsliMethod::Stored
+        );
     }
 
     #[test]

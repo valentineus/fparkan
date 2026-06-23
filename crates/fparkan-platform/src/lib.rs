@@ -1,4 +1,23 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_precision_loss,
+        clippy::expect_used,
+        clippy::float_cmp,
+        clippy::identity_op,
+        clippy::too_many_lines,
+        clippy::uninlined_format_args,
+        clippy::map_unwrap_or,
+        clippy::needless_raw_string_hashes,
+        clippy::semicolon_if_nothing_returned,
+        clippy::type_complexity,
+        clippy::panic,
+        clippy::unwrap_used
+    )
+)]
 //! Platform ports for clocks, event sources and window descriptors.
 
 /// Monotonic instant measured in milliseconds since process start.
@@ -12,20 +31,37 @@ pub trait MonotonicClock {
 }
 
 /// Platform event.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum PlatformEvent {
     /// Window/application requested to quit.
     QuitRequested,
     /// Window focus changed.
-    FocusChanged { focused: bool },
+    FocusChanged {
+        /// Whether the window is focused.
+        focused: bool,
+    },
     /// Window resize or move to a new drawable size.
-    Resize { width: u32, height: u32 },
+    Resize {
+        /// Drawable width in physical pixels.
+        width: u32,
+        /// Drawable height in physical pixels.
+        height: u32,
+    },
     /// Device pixel ratio changed.
-    DpiChanged { scale: f64 },
+    DpiChanged {
+        /// Logical-to-physical scale factor.
+        scale: f64,
+    },
     /// Window minimized/hidden.
-    Minimized { minimized: bool },
+    Minimized {
+        /// Whether the window is minimized.
+        minimized: bool,
+    },
     /// Window occlusion state changed.
-    Occluded { occluded: bool },
+    Occluded {
+        /// Whether the window is occluded.
+        occluded: bool,
+    },
     /// Window is being suspended.
     Suspended,
     /// Window resumed from suspend.
@@ -149,9 +185,9 @@ pub enum ColorSpace {
 /// Presentation mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PresentationMode {
-    /// VSync.
+    /// `VSync`.
     Fifo,
-    /// No VSync.
+    /// No `VSync`.
     Immediate,
     /// Triple-buffer mailbox fallback.
     Mailbox,

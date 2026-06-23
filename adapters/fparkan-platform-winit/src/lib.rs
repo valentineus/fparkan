@@ -1,15 +1,34 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_precision_loss,
+        clippy::expect_used,
+        clippy::float_cmp,
+        clippy::identity_op,
+        clippy::too_many_lines,
+        clippy::uninlined_format_args,
+        clippy::map_unwrap_or,
+        clippy::needless_raw_string_hashes,
+        clippy::semicolon_if_nothing_returned,
+        clippy::type_complexity,
+        clippy::panic,
+        clippy::unwrap_used
+    )
+)]
 //! Minimal `winit`-backed platform adapter shim.
 
 use fparkan_platform::{
-    EventSource, MonotonicClock, MonotonicInstant, PlatformEvent, PlatformError, PhysicalSize,
+    EventSource, MonotonicClock, MonotonicInstant, PhysicalSize, PlatformError, PlatformEvent,
     RenderRequest, WindowHandle, WindowPort,
 };
-use winit::event::{MouseButton, WindowEvent};
-use winit::event_loop::Event;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use winit::event::{Event, MouseButton, WindowEvent};
+use winit::platform::scancode::PhysicalKeyExtScancode;
 use winit::window::Window;
 
 static NEXT_WINDOW_HANDLE_ID: AtomicU64 = AtomicU64::new(1);
@@ -52,7 +71,7 @@ impl WinitEventSource {
     }
 
     /// Pushes a mapped native window event.
-    pub fn push_window_event(&mut self, event: &WindowEvent<'_>) {
+    pub fn push_window_event(&mut self, event: &WindowEvent) {
         match event {
             WindowEvent::KeyboardInput { event, .. } => {
                 self.queue.push_back(PlatformEvent::KeyboardInput {
@@ -81,14 +100,13 @@ impl WinitEventSource {
                 });
             }
             WindowEvent::Focused(focused) => {
-                self.queue.push_back(PlatformEvent::FocusChanged { focused: *focused });
-            }
-            WindowEvent::ScaleFactorChanged {
-                scale_factor,
-                ..
-            } => {
                 self.queue
-                    .push_back(PlatformEvent::DpiChanged { scale: *scale_factor });
+                    .push_back(PlatformEvent::FocusChanged { focused: *focused });
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.queue.push_back(PlatformEvent::DpiChanged {
+                    scale: *scale_factor,
+                });
             }
             WindowEvent::CloseRequested => {
                 self.queue.push_back(PlatformEvent::QuitRequested);
@@ -98,7 +116,7 @@ impl WinitEventSource {
     }
 
     /// Pushes events from an event loop event.
-    pub fn push_event<T>(&mut self, event: &Event<'_, T>) {
+    pub fn push_event<T>(&mut self, event: &Event<T>) {
         if let Event::WindowEvent { event, .. } = event {
             self.push_window_event(event);
         }
@@ -112,7 +130,7 @@ fn mouse_button_code(button: MouseButton) -> u16 {
         MouseButton::Middle => 2,
         MouseButton::Back => 3,
         MouseButton::Forward => 4,
-        MouseButton::Other(index) => 100 + u16::try_from(index).unwrap_or(0),
+        MouseButton::Other(index) => 100 + index,
     }
 }
 
@@ -219,7 +237,10 @@ mod tests {
         source.push(PlatformEvent::QuitRequested);
         let mut events = Vec::new();
         source.poll(&mut events)?;
-        assert_eq!(events, vec![PlatformEvent::Resumed, PlatformEvent::QuitRequested]);
+        assert_eq!(
+            events,
+            vec![PlatformEvent::Resumed, PlatformEvent::QuitRequested]
+        );
         Ok(())
     }
 
@@ -227,8 +248,17 @@ mod tests {
     fn window_port_reports_default_request_profile() {
         let window = WinitWindow::synthetic(640, 360);
         let request = WinitWindow::default_render_request();
-        assert_eq!(request.presentation, fparkan_platform::PresentationMode::Fifo);
-        assert_eq!(window.drawable_size(), PhysicalSize { width: 640, height: 360 });
+        assert_eq!(
+            request.presentation,
+            fparkan_platform::PresentationMode::Fifo
+        );
+        assert_eq!(
+            window.drawable_size(),
+            PhysicalSize {
+                width: 640,
+                height: 360
+            }
+        );
     }
 
     #[test]

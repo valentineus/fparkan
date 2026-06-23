@@ -1,4 +1,23 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_precision_loss,
+        clippy::expect_used,
+        clippy::float_cmp,
+        clippy::identity_op,
+        clippy::too_many_lines,
+        clippy::uninlined_format_args,
+        clippy::map_unwrap_or,
+        clippy::needless_raw_string_hashes,
+        clippy::semicolon_if_nothing_returned,
+        clippy::type_complexity,
+        clippy::panic,
+        clippy::unwrap_used
+    )
+)]
 #![deny(unsafe_op_in_unsafe_fn)]
 //! Vulkan adapter facade and migration-ready backend surface contract.
 //!
@@ -8,10 +27,10 @@
 //!
 //! This crate is the declared low-level Vulkan boundary.
 
+use fparkan_platform::RenderRequest;
 use fparkan_render::{
     canonical_capture, FrameOutput, RenderBackend, RenderCommandList, RenderError,
 };
-use fparkan_platform::RenderRequest;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Vulkan backend migration readiness.
@@ -120,7 +139,10 @@ impl VulkanBackend {
 
 impl RenderBackend for VulkanBackend {
     fn execute(&mut self, commands: &RenderCommandList) -> Result<FrameOutput, RenderError> {
-        if !matches!(self.state, VulkanBackendState::Ready | VulkanBackendState::Degraded) {
+        if !matches!(
+            self.state,
+            VulkanBackendState::Ready | VulkanBackendState::Degraded
+        ) {
             return Err(RenderError::InvalidRange);
         }
         let capture = canonical_capture(commands)?;

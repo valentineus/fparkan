@@ -71,8 +71,8 @@ S1-PATH-005	covered	cargo test -p fparkan-path --offline rejects_escape
 S1-PATH-006	covered	cargo test -p fparkan-path --offline rejects_absolute_drive_and_nul_paths
 S1-PATH-007	covered	cargo test -p fparkan-path --offline join_under_keeps_normalized_path_below_root
 S1-PATH-008	covered	cargo test -p fparkan-path --offline original_separators_and_raw_bytes_are_preserved
-S1-H02	covered	cargo test -p fparkan-path --offline accepts_non_utf8_legacy_bytes
-S1-M01	covered	cargo test -p fparkan-vfs --offline memory_vfs_list_prefix_is_boundary_safe
+S1-PATH-009	covered	cargo test -p fparkan-path --offline accepts_non_utf8_legacy_bytes
+S1-VFS-005	covered	cargo test -p fparkan-vfs --offline memory_vfs_list_prefix_is_boundary_safe
 S1-RSLI-001	covered	cargo test -p fparkan-rsli --offline parses_minimal_empty_library
 S1-RSLI-002	covered	cargo test -p fparkan-rsli --offline rejects_invalid_header_fields
 S1-RSLI-003	covered	cargo test -p fparkan-rsli --offline rejects_entry_table_bounds

@@ -1,11 +1,30 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_precision_loss,
+        clippy::expect_used,
+        clippy::float_cmp,
+        clippy::identity_op,
+        clippy::too_many_lines,
+        clippy::uninlined_format_args,
+        clippy::map_unwrap_or,
+        clippy::needless_raw_string_hashes,
+        clippy::semicolon_if_nothing_returned,
+        clippy::type_complexity,
+        clippy::panic,
+        clippy::unwrap_used
+    )
+)]
 #![allow(clippy::print_stderr, clippy::print_stdout)]
 //! `FParkan` command-line tools.
 
+use fparkan_assets::extend_graph_report_with_visual_dependencies;
 use fparkan_corpus::{discover, render_report_json, report, DiscoverOptions};
 use fparkan_inspection::inspect_archive_file;
 use fparkan_inspection::ArchiveInspection;
-use fparkan_assets::extend_graph_report_with_visual_dependencies;
 use fparkan_prototype::build_prototype_graph_report;
 use fparkan_resource::{resource_name, CachedResourceRepository};
 use fparkan_runtime::{
@@ -135,12 +154,7 @@ fn inspect_prototype(args: &[String]) -> Result<(), String> {
     let roots = [resource_name(key.as_bytes())];
     let (graph, resolved, mut report) =
         build_prototype_graph_report(&repository, vfs.as_ref(), &roots);
-    extend_graph_report_with_visual_dependencies(
-        &repository,
-        &mut report,
-        &graph,
-        &resolved,
-    );
+    extend_graph_report_with_visual_dependencies(&repository, &mut report, &graph, &resolved);
     println!("{}", prototype_inspect_json(&key, &graph, &report));
     Ok(())
 }
@@ -234,7 +248,9 @@ fn inspect_archive(args: &[String]) -> Result<(), String> {
             );
             Ok(())
         }
-        ArchiveInspection::Unsupported => Err(format!("{}: unsupported archive magic", path.display())),
+        ArchiveInspection::Unsupported => {
+            Err(format!("{}: unsupported archive magic", path.display()))
+        }
     }
 }
 

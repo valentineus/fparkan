@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+fparkan-assets = { path = "../../crates/fparkan-assets" }
+fparkan-platform = { path = "../../crates/fparkan-platform" }
 fparkan-render = { path = "../../crates/fparkan-render" }
 fparkan-platform-winit = { path = "../../adapters/fparkan-platform-winit" }
 fparkan-render-vulkan = { path = "../../adapters/fparkan-render-vulkan" }

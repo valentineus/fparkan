@@ -1,10 +1,29 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_precision_loss,
+        clippy::expect_used,
+        clippy::float_cmp,
+        clippy::identity_op,
+        clippy::too_many_lines,
+        clippy::uninlined_format_args,
+        clippy::map_unwrap_or,
+        clippy::needless_raw_string_hashes,
+        clippy::semicolon_if_nothing_returned,
+        clippy::type_complexity,
+        clippy::panic,
+        clippy::unwrap_used
+    )
+)]
 #![allow(clippy::print_stderr, clippy::print_stdout)]
 //! `FParkan` asset viewer composition root.
 
 use fparkan_inspection::{
-    inspect_land_file, inspect_model_from_root, inspect_texture_from_root, ArchiveInspection, LandFileKind,
-    MapInspection, NresEntrySummary,
+    inspect_land_file, inspect_model_from_root, inspect_texture_from_root, ArchiveInspection,
+    LandFileKind, MapInspection, NresEntrySummary,
 };
 use fparkan_render::{
     build_commands, CameraSnapshot, DrawId, GpuMaterialId, GpuMeshId, IndexRange, RenderPhase,
@@ -151,7 +170,11 @@ fn inspect_map(args: &[String]) -> Result<String, String> {
         },
     )?;
 
-    Ok(render_map_inspection_json(&file.display().to_string(), &kind, &inspection))
+    Ok(render_map_inspection_json(
+        &file.display().to_string(),
+        &kind,
+        &inspection,
+    ))
 }
 
 fn render_map_inspection_json(path: &str, kind: &str, inspection: &MapInspection) -> String {

@@ -1,16 +1,37 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_precision_loss,
+        clippy::expect_used,
+        clippy::float_cmp,
+        clippy::identity_op,
+        clippy::too_many_lines,
+        clippy::uninlined_format_args,
+        clippy::map_unwrap_or,
+        clippy::needless_raw_string_hashes,
+        clippy::semicolon_if_nothing_returned,
+        clippy::type_complexity,
+        clippy::panic,
+        clippy::unwrap_used
+    )
+)]
 #![allow(clippy::print_stderr, clippy::print_stdout)]
 //! `FParkan` rendered game composition root.
 
-use fparkan_render::{
-    DrawCommand, DrawId, GpuMaterialId, GpuMeshId, IndexRange, RenderBackend,
-    RenderCommand, RenderCommandList, RenderPhase,
-};
+use fparkan_assets::PreparedVisual;
+use fparkan_platform::WindowPort;
 use fparkan_platform_winit::WinitWindow;
+use fparkan_render::{
+    DrawCommand, DrawId, GpuMaterialId, GpuMeshId, IndexRange, RenderBackend, RenderCommand,
+    RenderCommandList, RenderPhase,
+};
 use fparkan_render_vulkan::VulkanBackend;
 use fparkan_runtime::{
-    create, frame, load_mission, EngineConfig, EngineMode, EngineServices, MissionRequest,
-    MissionAssets, loaded_mission_assets,
+    create, frame, load_mission, loaded_mission_assets, EngineConfig, EngineMode, EngineServices,
+    MissionAssets, MissionRequest,
 };
 use fparkan_vfs::DirectoryVfs;
 use fparkan_world::WorldSnapshot;
@@ -89,6 +110,7 @@ fn run(args: &[String]) -> Result<String, String> {
     ))
 }
 
+#[cfg(test)]
 fn render_snapshot_commands(snapshot: &WorldSnapshot) -> RenderCommandList {
     render_snapshot_commands_with_assets(snapshot, None)
 }
@@ -115,8 +137,10 @@ fn render_snapshot_commands_with_assets(
             GpuMeshId(u64::from(handle.slot) + 1)
         };
         let material = prepared
-            .and_then(|visual| visual.primary_material_id())
-            .map_or(GpuMaterialId(1), |material_id| GpuMaterialId(material_id.raw()));
+            .and_then(PreparedVisual::primary_material_id)
+            .map_or(GpuMaterialId(1), |material_id| {
+                GpuMaterialId(material_id.raw())
+            });
         let draw_id = snapshot
             .tick
             .0

@@ -1,4 +1,23 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_precision_loss,
+        clippy::expect_used,
+        clippy::float_cmp,
+        clippy::identity_op,
+        clippy::too_many_lines,
+        clippy::uninlined_format_args,
+        clippy::map_unwrap_or,
+        clippy::needless_raw_string_hashes,
+        clippy::semicolon_if_nothing_returned,
+        clippy::type_complexity,
+        clippy::panic,
+        clippy::unwrap_used
+    )
+)]
 //! Validated terrain runtime queries.
 
 use fparkan_terrain_format::{FullSurfaceMask, LandMapDocument, LandMeshDocument};
@@ -524,26 +543,29 @@ struct RuntimeGrid {
 
 impl RuntimeGrid {
     fn from_land_map(map: &LandMapDocument) -> Result<Self, TerrainError> {
-        let mut min = [f32::INFINITY, f32::INFINITY];
-        let mut max = [f32::NEG_INFINITY, f32::NEG_INFINITY];
+        let mut bounds_min = [f32::INFINITY, f32::INFINITY];
+        let mut bounds_max = [f32::NEG_INFINITY, f32::NEG_INFINITY];
         for areal in &map.areals {
             for vertex in &areal.vertices {
-                min[0] = min[0].min(vertex[0]);
-                min[1] = min[1].min(vertex[2]);
-                max[0] = max[0].max(vertex[0]);
-                max[1] = max[1].max(vertex[2]);
+                bounds_min[0] = bounds_min[0].min(vertex[0]);
+                bounds_min[1] = bounds_min[1].min(vertex[2]);
+                bounds_max[0] = bounds_max[0].max(vertex[0]);
+                bounds_max[1] = bounds_max[1].max(vertex[2]);
             }
         }
-        if !min[0].is_finite() || !min[1].is_finite() || !max[0].is_finite() || !max[1].is_finite()
+        if !bounds_min[0].is_finite()
+            || !bounds_min[1].is_finite()
+            || !bounds_max[0].is_finite()
+            || !bounds_max[1].is_finite()
         {
-            min = [0.0, 0.0];
-            max = [1.0, 1.0];
+            bounds_min = [0.0, 0.0];
+            bounds_max = [1.0, 1.0];
         }
-        if (min[0] - max[0]).abs() <= f32::EPSILON {
-            max[0] += 1.0;
+        if (bounds_min[0] - bounds_max[0]).abs() <= f32::EPSILON {
+            bounds_max[0] += 1.0;
         }
-        if (min[1] - max[1]).abs() <= f32::EPSILON {
-            max[1] += 1.0;
+        if (bounds_min[1] - bounds_max[1]).abs() <= f32::EPSILON {
+            bounds_max[1] += 1.0;
         }
 
         let mut cells = Vec::with_capacity(map.grid.cells.len());
@@ -568,8 +590,8 @@ impl RuntimeGrid {
         Ok(Self {
             cells_x: map.grid.cells_x,
             cells_y: map.grid.cells_y,
-            min,
-            max,
+            min: bounds_min,
+            max: bounds_max,
             cells,
         })
     }

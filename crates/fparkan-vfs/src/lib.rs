@@ -1,17 +1,36 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_precision_loss,
+        clippy::expect_used,
+        clippy::float_cmp,
+        clippy::identity_op,
+        clippy::too_many_lines,
+        clippy::uninlined_format_args,
+        clippy::map_unwrap_or,
+        clippy::needless_raw_string_hashes,
+        clippy::semicolon_if_nothing_returned,
+        clippy::type_complexity,
+        clippy::panic,
+        clippy::unwrap_used
+    )
+)]
 //! Virtual filesystem ports for resource loading.
 
 use fparkan_binary::{sha256, Sha256Digest};
 use fparkan_path::{ascii_lookup_key, join_under, NormalizedPath};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 /// VFS metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -335,11 +354,13 @@ impl MemoryVfs {
 }
 
 #[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)]
 fn file_identity(metadata: &fs::Metadata) -> Option<u64> {
-    Some((metadata.dev() as u64).rotate_left(32) ^ metadata.ino())
+    Some(metadata.dev().rotate_left(32) ^ metadata.ino())
 }
 
 #[cfg(windows)]
+#[allow(clippy::unnecessary_wraps)]
 fn file_identity(metadata: &fs::Metadata) -> Option<u64> {
     Some(
         (metadata.volume_serial_number() as u64).rotate_left(40)
@@ -378,11 +399,9 @@ impl Vfs for MemoryVfs {
         let mut out = Vec::new();
         for (path, bytes) in &self.files {
             if has_segment_boundary_prefix_bytes(path, prefix.as_bytes()) {
-                let normalized = fparkan_path::normalize_relative(
-                    path,
-                    fparkan_path::PathPolicy::StrictLegacy,
-                )
-                .map_err(|_| VfsError::Path)?;
+                let normalized =
+                    fparkan_path::normalize_relative(path, fparkan_path::PathPolicy::StrictLegacy)
+                        .map_err(|_| VfsError::Path)?;
                 out.push(VfsEntry {
                     path: normalized,
                     metadata: VfsMetadata {
@@ -564,7 +583,8 @@ mod tests {
     fn memory_vfs_list_prefix_is_boundary_safe() {
         let mut vfs = MemoryVfs::default();
         let exact = normalize_relative(b"DATA/Land.map", PathPolicy::StrictLegacy).expect("path");
-        let sibling = normalize_relative(b"DATA2/Land.map", PathPolicy::StrictLegacy).expect("path");
+        let sibling =
+            normalize_relative(b"DATA2/Land.map", PathPolicy::StrictLegacy).expect("path");
         vfs.insert(exact.clone(), Arc::from(b"exact".as_slice()));
         vfs.insert(sibling, Arc::from(b"sibling".as_slice()));
 
@@ -660,17 +680,20 @@ mod tests {
     #[test]
     fn memory_vfs_distinguishes_non_utf8_path_bytes() {
         let mut vfs = MemoryVfs::default();
-        let ascii = normalize_relative(b"DATA/normal.bin", PathPolicy::HostCompatible)
-            .expect("ascii path");
-        let binary = normalize_relative(b"DATA/\xFF.bin", PathPolicy::HostCompatible)
-            .expect("binary path");
+        let ascii =
+            normalize_relative(b"DATA/normal.bin", PathPolicy::HostCompatible).expect("ascii path");
+        let binary =
+            normalize_relative(b"DATA/\xFF.bin", PathPolicy::HostCompatible).expect("binary path");
         vfs.insert(ascii.clone(), Arc::from(b"ascii".as_slice()));
         vfs.insert(binary.clone(), Arc::from(b"binary".as_slice()));
 
-        let binary_query = normalize_relative(b"DATA/\xFF.bin", PathPolicy::HostCompatible)
-            .expect("binary query");
+        let binary_query =
+            normalize_relative(b"DATA/\xFF.bin", PathPolicy::HostCompatible).expect("binary query");
 
-        assert_eq!(vfs.read(&binary_query).expect("read binary").as_ref(), b"binary");
+        assert_eq!(
+            vfs.read(&binary_query).expect("read binary").as_ref(),
+            b"binary"
+        );
         assert_eq!(vfs.read(&ascii).expect("read ascii").as_ref(), b"ascii");
     }
 

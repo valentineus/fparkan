@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+fparkan-assets = { path = "../../crates/fparkan-assets" }
 fparkan-corpus = { path = "../../crates/fparkan-corpus" }
 fparkan-prototype = { path = "../../crates/fparkan-prototype" }
 fparkan-inspection = { path = "../../crates/fparkan-inspection" }

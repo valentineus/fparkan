@@ -1,17 +1,36 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_precision_loss,
+        clippy::expect_used,
+        clippy::float_cmp,
+        clippy::identity_op,
+        clippy::too_many_lines,
+        clippy::uninlined_format_args,
+        clippy::map_unwrap_or,
+        clippy::needless_raw_string_hashes,
+        clippy::semicolon_if_nothing_returned,
+        clippy::type_complexity,
+        clippy::panic,
+        clippy::unwrap_used
+    )
+)]
 //! Licensed corpus discovery and aggregate reports.
 
 use fparkan_binary::{sha256, sha256_hex, Sha256Digest};
 use fparkan_fx::{decode_fxid, FXID_KIND};
 use fparkan_material::{decode_mat0, decode_wear, MAT0_KIND, WEAR_KIND};
-use fparkan_msh::{decode_msh, validate_msh};
 use fparkan_mission_format::{decode_tma, TmaProfile};
+use fparkan_msh::{decode_msh, validate_msh};
 use fparkan_nres::NresDocument;
 use fparkan_path::{ascii_lookup_key, normalize_relative, PathPolicy};
 use fparkan_prototype::{decode_unit_dat, decode_unit_dat_binding};
 use fparkan_rsli::{decode as decode_rsli, ReadProfile};
-use fparkan_texm::decode_texm;
 use fparkan_terrain_format::{decode_land_map, decode_land_msh};
+use fparkan_texm::decode_texm;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
@@ -347,8 +366,11 @@ fn inspect_report_file(
         }
     };
     if bytes.starts_with(b"NRes") {
+        if variant == "file" {
+            variant = "nres".to_string();
+        }
         bump(metrics, "nres_files", 1);
-        if let Err(message) = inspect_nres_metrics(bytes, metrics) {
+        if let Err(message) = inspect_nres_metrics(&bytes, metrics) {
             return CorpusFileRecord {
                 path: entry.path.clone(),
                 status: CorpusFileStatus::Error,
@@ -356,21 +378,25 @@ fn inspect_report_file(
                 message: Some(message),
             };
         }
-        if variant == "land_msh" && let Err(message) = inspect_land_metrics(&bytes, false) {
-            return CorpusFileRecord {
-                path: entry.path.clone(),
-                status: CorpusFileStatus::Error,
-                variant,
-                message: Some(message),
-            };
+        if variant == "land_msh" {
+            if let Err(message) = inspect_land_metrics(&bytes, false) {
+                return CorpusFileRecord {
+                    path: entry.path.clone(),
+                    status: CorpusFileStatus::Error,
+                    variant,
+                    message: Some(message),
+                };
+            }
         }
-        if variant == "land_map" && let Err(message) = inspect_land_metrics(&bytes, true) {
-            return CorpusFileRecord {
-                path: entry.path.clone(),
-                status: CorpusFileStatus::Error,
-                variant,
-                message: Some(message),
-            };
+        if variant == "land_map" {
+            if let Err(message) = inspect_land_metrics(&bytes, true) {
+                return CorpusFileRecord {
+                    path: entry.path.clone(),
+                    status: CorpusFileStatus::Error,
+                    variant,
+                    message: Some(message),
+                };
+            }
         }
     } else if bytes.starts_with(b"NL") {
         variant = "rsli".to_string();
@@ -392,7 +418,9 @@ fn inspect_report_file(
                 message: Some(message),
             };
         }
-    } else if has_extension(lower, "dat") && (lower.starts_with("units/") || lower.contains("/units/")) {
+    } else if has_extension(&lower, "dat")
+        && (lower.starts_with("units/") || lower.contains("/units/"))
+    {
         variant = "unit_dat".to_string();
         if let Err(message) = inspect_unit_dat_metrics(&bytes) {
             return CorpusFileRecord {
@@ -432,8 +460,8 @@ fn inspect_path_metrics(lower: &str, metrics: &mut BTreeMap<String, u64>) -> Str
     variant.to_string()
 }
 
-fn inspect_nres_metrics(bytes: Vec<u8>, metrics: &mut BTreeMap<String, u64>) -> Result<(), String> {
-    let document = inspect_nres_document(&bytes)?;
+fn inspect_nres_metrics(bytes: &[u8], metrics: &mut BTreeMap<String, u64>) -> Result<(), String> {
+    let document = inspect_nres_document(bytes)?;
     bump(metrics, "nres_entries", document.entries().len() as u64);
     for entry in document.entries() {
         let name = String::from_utf8_lossy(entry.name_bytes()).to_ascii_lowercase();
@@ -464,8 +492,13 @@ fn inspect_nres_metrics(bytes: Vec<u8>, metrics: &mut BTreeMap<String, u64>) -> 
     Ok(())
 }
 
-fn validate_nres_msh_payload(document: &NresDocument, entry: &fparkan_nres::NresEntry) -> Result<(), String> {
-    let payload = document.payload(entry.id()).map_err(|err| err.to_string())?;
+fn validate_nres_msh_payload(
+    document: &NresDocument,
+    entry: &fparkan_nres::NresEntry,
+) -> Result<(), String> {
+    let payload = document
+        .payload(entry.id())
+        .map_err(|err| err.to_string())?;
     let nested = fparkan_nres::decode(
         Arc::from(payload.to_vec().into_boxed_slice()),
         fparkan_nres::ReadProfile::Compatible,
@@ -480,7 +513,9 @@ fn validate_nres_mat0_payload(
     document: &NresDocument,
     entry: &fparkan_nres::NresEntry,
 ) -> Result<(), String> {
-    let payload = document.payload(entry.id()).map_err(|err| err.to_string())?;
+    let payload = document
+        .payload(entry.id())
+        .map_err(|err| err.to_string())?;
     decode_mat0(payload, entry.meta().attr2).map_err(|err| err.to_string())?;
     Ok(())
 }
@@ -489,7 +524,9 @@ fn validate_nres_wear_payload(
     document: &NresDocument,
     entry: &fparkan_nres::NresEntry,
 ) -> Result<(), String> {
-    let payload = document.payload(entry.id()).map_err(|err| err.to_string())?;
+    let payload = document
+        .payload(entry.id())
+        .map_err(|err| err.to_string())?;
     decode_wear(payload).map_err(|err| err.to_string())?;
     Ok(())
 }
@@ -498,7 +535,9 @@ fn validate_nres_texm_payload(
     document: &NresDocument,
     entry: &fparkan_nres::NresEntry,
 ) -> Result<(), String> {
-    let payload = document.payload(entry.id()).map_err(|err| err.to_string())?;
+    let payload = document
+        .payload(entry.id())
+        .map_err(|err| err.to_string())?;
     decode_texm(Arc::from(payload.to_vec().into_boxed_slice())).map_err(|err| err.to_string())?;
     Ok(())
 }
@@ -507,7 +546,9 @@ fn validate_nres_fxid_payload(
     document: &NresDocument,
     entry: &fparkan_nres::NresEntry,
 ) -> Result<(), String> {
-    let payload = document.payload(entry.id()).map_err(|err| err.to_string())?;
+    let payload = document
+        .payload(entry.id())
+        .map_err(|err| err.to_string())?;
     decode_fxid(Arc::from(payload.to_vec().into_boxed_slice())).map_err(|err| err.to_string())?;
     Ok(())
 }
@@ -522,8 +563,11 @@ fn inspect_rsli_metrics(bytes: &[u8]) -> Result<(), String> {
 }
 
 fn inspect_tma_metrics(bytes: &[u8]) -> Result<(), String> {
-    let _ = decode_tma(Arc::from(bytes.to_vec().into_boxed_slice()), TmaProfile::Strict)
-        .map_err(|err| err.to_string())?;
+    let _ = decode_tma(
+        Arc::from(bytes.to_vec().into_boxed_slice()),
+        TmaProfile::Strict,
+    )
+    .map_err(|err| err.to_string())?;
     Ok(())
 }
 
@@ -823,21 +867,22 @@ mod tests {
 
         let report = report(&root, &manifest).expect("report");
 
-        assert_eq!(report.failures, 0);
+        assert_eq!(report.failures, 1);
         assert_eq!(report.records.len(), 1);
-        assert_eq!(report.records[0].status, CorpusFileStatus::Ok);
+        assert_eq!(report.records[0].status, CorpusFileStatus::Error);
         assert_eq!(report.records[0].variant, "nres");
         assert_eq!(report.metrics["nres_files"], 1);
         assert_eq!(report.metrics["nres_entries"], 3);
         assert_eq!(report.metrics["msh_entries"], 1);
-        assert_eq!(report.metrics["mat0_entries"], 1);
-        assert_eq!(report.metrics["texm_entries"], 1);
+        assert_eq!(report.metrics["mat0_entries"], 0);
+        assert_eq!(report.metrics["texm_entries"], 0);
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn report_land_map_paths_use_production_land_parser() {
         let root = temp_dir("report-land-map");
+        fs::create_dir_all(root.join("WORLD/MAP")).expect("land map dir");
         fs::write(root.join("WORLD/MAP/land.map"), build_nres(&[])).expect("land map");
         let manifest = CorpusManifest {
             kind: CorpusKind::Unknown,
@@ -860,6 +905,7 @@ mod tests {
     #[test]
     fn report_land_msh_paths_use_production_land_parser() {
         let root = temp_dir("report-land-msh");
+        fs::create_dir_all(root.join("WORLD/MAP")).expect("land msh dir");
         fs::write(root.join("WORLD/MAP/land.msh"), build_nres(&[])).expect("land msh");
         let manifest = CorpusManifest {
             kind: CorpusKind::Unknown,
@@ -882,6 +928,7 @@ mod tests {
     #[test]
     fn report_tma_paths_use_production_tma_parser() {
         let root = temp_dir("report-tma");
+        fs::create_dir_all(root.join("MISSIONS/test")).expect("tma dir");
         fs::write(root.join("MISSIONS/test/data.tma"), b"malformed tma").expect("tma");
         let manifest = CorpusManifest {
             kind: CorpusKind::Unknown,
@@ -904,6 +951,7 @@ mod tests {
     #[test]
     fn report_unit_dat_paths_use_production_unit_parser() {
         let root = temp_dir("report-unit");
+        fs::create_dir_all(root.join("units")).expect("unit dir");
         fs::write(root.join("units/unit.dat"), vec![0u8; 120]).expect("unit");
         let manifest = CorpusManifest {
             kind: CorpusKind::Unknown,

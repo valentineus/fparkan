@@ -1,15 +1,31 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_precision_loss,
+        clippy::expect_used,
+        clippy::float_cmp,
+        clippy::identity_op,
+        clippy::too_many_lines,
+        clippy::uninlined_format_args,
+        clippy::map_unwrap_or,
+        clippy::needless_raw_string_hashes,
+        clippy::semicolon_if_nothing_returned,
+        clippy::type_complexity,
+        clippy::panic,
+        clippy::unwrap_used
+    )
+)]
 //! Asset manager ports and transactional preparation models.
 
 use fparkan_material::{decode_wear, resolve_material, MaterialError, WEAR_KIND};
-use fparkan_msh::{decode_msh, validate_msh, MshError};
-pub use fparkan_nres::{NresDocument, NresError};
-use fparkan_nres::{decode as decode_nres, ReadProfile};
-pub use fparkan_mission_format::{LpString, MissionDocument, MissionError, TmaProfile};
-pub use fparkan_terrain::{TerrainError, TerrainWorld};
-pub use fparkan_terrain_format::{BuildCategory, TerrainFormatError};
 use fparkan_mission_format::{decode_tma, decode_tma_land_path};
-use fparkan_terrain_format::{decode_build_dat, decode_land_map, decode_land_msh};
+pub use fparkan_mission_format::{LpString, MissionDocument, MissionError, TmaProfile};
+use fparkan_msh::{decode_msh, validate_msh, MshError};
+use fparkan_nres::{decode as decode_nres, ReadProfile};
+pub use fparkan_nres::{NresDocument, NresError};
 use fparkan_path::{normalize_relative, NormalizedPath, PathError, PathPolicy, ResourceName};
 use fparkan_prototype::{
     EffectivePrototype, PrototypeGeometry, PrototypeGraph, PrototypeGraphEdge,
@@ -17,6 +33,9 @@ use fparkan_prototype::{
     PrototypeGraphRequiredness,
 };
 use fparkan_resource::{ResourceError, ResourceKey, ResourceRepository};
+pub use fparkan_terrain::{TerrainError, TerrainWorld};
+use fparkan_terrain_format::{decode_build_dat, decode_land_map, decode_land_msh};
+pub use fparkan_terrain_format::{BuildCategory, TerrainFormatError};
 use fparkan_texm::{decode_texm, TexmError};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -27,7 +46,8 @@ use std::sync::Arc;
 const TEXTURES_ARCHIVE: &str = "textures.lib";
 const LIGHTMAP_ARCHIVE: &str = "lightmap.lib";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Canonical terrain archive paths derived from a mission land reference.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MissionTerrainPaths {
     /// Landscape mesh archive path.
     pub land_msh: NormalizedPath,
@@ -68,6 +88,11 @@ impl From<TerrainError> for TerrainPreparationError {
 }
 
 /// Decodes a mission file bytes payload with a typed profile.
+///
+/// # Errors
+///
+/// Returns [`MissionError`] when the mission payload is malformed for the
+/// selected profile.
 pub fn decode_mission_payload(
     bytes: Arc<[u8]>,
     profile: TmaProfile,
@@ -76,6 +101,11 @@ pub fn decode_mission_payload(
 }
 
 /// Reads only the mission land path from raw TMA bytes.
+///
+/// # Errors
+///
+/// Returns [`MissionError`] when the mission header or land path record cannot
+/// be decoded.
 pub fn decode_mission_land_path(
     bytes: &[u8],
     profile: TmaProfile,
@@ -84,21 +114,32 @@ pub fn decode_mission_land_path(
 }
 
 /// Builds canonical mission terrain paths from the mission `Land` reference.
-pub fn derive_mission_land_paths(
-    land_path: &LpString,
-) -> Result<MissionTerrainPaths, PathError> {
+///
+/// # Errors
+///
+/// Returns [`PathError`] when the mission land reference is not a strict
+/// relative legacy path.
+pub fn derive_mission_land_paths(land_path: &LpString) -> Result<MissionTerrainPaths, PathError> {
     let normalized = normalize_relative(&land_path.raw, PathPolicy::StrictLegacy)?;
     let Some((parent, _stem)) = normalized.as_str().rsplit_once('/') else {
         return Err(PathError::Empty);
     };
-    let land_msh =
-        normalize_relative(format!("{parent}/Land.msh").as_bytes(), PathPolicy::StrictLegacy)?;
-    let land_map =
-        normalize_relative(format!("{parent}/Land.map").as_bytes(), PathPolicy::StrictLegacy)?;
+    let land_msh = normalize_relative(
+        format!("{parent}/Land.msh").as_bytes(),
+        PathPolicy::StrictLegacy,
+    )?;
+    let land_map = normalize_relative(
+        format!("{parent}/Land.map").as_bytes(),
+        PathPolicy::StrictLegacy,
+    )?;
     Ok(MissionTerrainPaths { land_msh, land_map })
 }
 
-/// Decodes compatible NRes payload for terrain/document loading.
+/// Decodes compatible `NRes` payload for terrain/document loading.
+///
+/// # Errors
+///
+/// Returns [`NresError`] when the payload is not a compatible `NRes` archive.
 pub fn decode_nres_payload(
     bytes: Arc<[u8]>,
 ) -> Result<fparkan_nres::NresDocument, fparkan_nres::NresError> {
@@ -106,6 +147,11 @@ pub fn decode_nres_payload(
 }
 
 /// Decodes terrain documents and builds immutable terrain state.
+///
+/// # Errors
+///
+/// Returns [`TerrainPreparationError`] when terrain documents are malformed or
+/// cannot be converted into runtime terrain state.
 pub fn prepare_terrain_world(
     land_msh_nres: &fparkan_nres::NresDocument,
     land_map_nres: &fparkan_nres::NresDocument,
@@ -119,10 +165,32 @@ pub fn prepare_terrain_world(
 }
 
 /// Stable typed identifier for a prepared asset.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[derive(Debug)]
 pub struct AssetId<T> {
     raw: u64,
     marker: PhantomData<T>,
+}
+
+impl<T> Clone for AssetId<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for AssetId<T> {}
+
+impl<T> PartialEq for AssetId<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+}
+
+impl<T> Eq for AssetId<T> {}
+
+impl<T> Hash for AssetId<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.raw.hash(state);
+    }
 }
 
 impl<T> AssetId<T> {
@@ -183,7 +251,7 @@ impl PreparedVisual {
 }
 
 /// Immutable prepared mission assets for rendering and game setup.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MissionAssets {
     /// Visuals prepared for all reachable prototype requests.
     pub visuals: Vec<PreparedVisual>,
@@ -200,10 +268,7 @@ impl MissionAssets {
 
     /// Returns all visuals for a mission object index.
     #[must_use]
-    pub fn visuals_for_object(
-        &self,
-        object_index: usize,
-    ) -> &[AssetId<PreparedVisual>] {
+    pub fn visuals_for_object(&self, object_index: usize) -> &[AssetId<PreparedVisual>] {
         self.object_visuals
             .get(object_index)
             .map_or(&[], |values| values.as_slice())
@@ -211,10 +276,7 @@ impl MissionAssets {
 
     /// Returns the first visual for a mission object index.
     #[must_use]
-    pub fn visual_for_object(
-        &self,
-        object_index: usize,
-    ) -> Option<AssetId<PreparedVisual>> {
+    pub fn visual_for_object(&self, object_index: usize) -> Option<AssetId<PreparedVisual>> {
         self.visuals_for_object(object_index).first().copied()
     }
 
@@ -238,11 +300,7 @@ impl MissionAssets {
             .iter()
             .map(|visual| visual.material_count)
             .sum();
-        let texture_count = self
-            .visuals
-            .iter()
-            .map(|visual| visual.texture_count)
-            .sum();
+        let texture_count = self.visuals.iter().map(|visual| visual.texture_count).sum();
         let lightmap_count = self
             .visuals
             .iter()
@@ -254,15 +312,6 @@ impl MissionAssets {
             material_count,
             texture_count,
             lightmap_count,
-        }
-    }
-}
-
-impl Default for MissionAssets {
-    fn default() -> Self {
-        Self {
-            visuals: Vec::new(),
-            object_visuals: Vec::new(),
         }
     }
 }
@@ -301,7 +350,7 @@ pub enum AssetError {
         /// Human context for the operation.
         context: String,
         /// Concrete repository source error.
-        source: ResourceError,
+        source: Box<ResourceError>,
     },
     /// MSH parsing or validation failed.
     Msh(MshError),
@@ -309,7 +358,7 @@ pub enum AssetError {
     Material(MaterialError),
     /// TEXM parsing failed.
     Texture(TexmError),
-    /// NRes decoding failed.
+    /// `NRes` decoding failed.
     Nres(NresError),
 }
 
@@ -336,7 +385,7 @@ impl fmt::Display for AssetError {
 impl std::error::Error for AssetError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Resource { source, .. } => Some(source),
+            Self::Resource { source, .. } => Some(source.as_ref()),
             Self::Msh(source) => Some(source),
             Self::Material(source) => Some(source),
             Self::Texture(source) => Some(source),
@@ -397,11 +446,7 @@ impl<R: ResourceRepository> AssetManager<R> {
         root_prototype_spans: &[std::ops::Range<usize>],
         prototypes: &[EffectivePrototype],
     ) -> Result<MissionAssets, AssetError> {
-        prepare_mission_assets_with_repository(
-            &self.repository,
-            root_prototype_spans,
-            prototypes,
-        )
+        prepare_mission_assets_with_repository(&self.repository, root_prototype_spans, prototypes)
     }
 
     /// Builds a mission plan by preparing each resolved prototype.
@@ -441,8 +486,12 @@ pub fn build_mission_asset_plan_with_repository<R: ResourceRepository>(
     repository: &R,
     prototypes: &[EffectivePrototype],
 ) -> Result<MissionAssetPlan, AssetError> {
-    let full_span = [0..prototypes.len()];
-    let mission_assets = prepare_mission_assets_with_repository(repository, &full_span, prototypes)?;
+    let full_span = 0..prototypes.len();
+    let mission_assets = prepare_mission_assets_with_repository(
+        repository,
+        std::slice::from_ref(&full_span),
+        prototypes,
+    )?;
     Ok(mission_assets.to_plan())
 }
 
@@ -461,13 +510,12 @@ pub fn prepare_mission_assets_with_repository<R: ResourceRepository>(
     }
     let mut visual_index_by_id: HashMap<AssetId<PreparedVisual>, PreparedVisualSignature> =
         HashMap::new();
-    let mut material_signature_by_id: HashMap<AssetId<PreparedMaterial>, Vec<u8>> =
-        HashMap::new();
+    let mut material_signature_by_id: HashMap<AssetId<PreparedMaterial>, Vec<u8>> = HashMap::new();
     let mut visuals = Vec::new();
     let mut prototype_visual_ids = Vec::with_capacity(prototypes.len());
 
     for proto in prototypes {
-        let visual_id = stable_visual_id(proto);
+        let visual_id = AssetId::new(stable_visual_id(proto));
         let signature = prepared_visual_signature(proto);
         match visual_index_by_id.get(&visual_id) {
             Some(existing) if existing != &signature => {
@@ -571,7 +619,7 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
                 report.wear_resolved_count += 1;
                 report.material_slot_count += table.entries.len();
                 for (material_index, _entry) in table.entries.iter().enumerate() {
-                let Ok(material_index) = u16::try_from(material_index) else {
+                    let Ok(material_index) = u16::try_from(material_index) else {
                         push_visual_failure(
                             report,
                             graph,
@@ -594,15 +642,18 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
                                     [texture_archive.as_ref(), lightmap_archive.as_ref()],
                                 ) {
                                     Ok(()) => report.texture_resolved_count += 1,
-                                    Err(message) => push_visual_failure(
-                                        report,
-                                        graph,
-                                        prototype_index,
-                                        texture.0,
-                                        PrototypeGraphEdge::MaterialToTexture,
-                                        PrototypeGraphRequiredness::Required,
-                                        &message,
-                                    ),
+                                    Err(message) => {
+                                        let message = message.to_string();
+                                        push_visual_failure(
+                                            report,
+                                            graph,
+                                            prototype_index,
+                                            texture.0,
+                                            PrototypeGraphEdge::MaterialToTexture,
+                                            PrototypeGraphRequiredness::Required,
+                                            &message,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -615,7 +666,7 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
                             PrototypeGraphRequiredness::Required,
                             &message.to_string(),
                         ),
-                        }
+                    }
                 }
                 for lightmap in &table.lightmaps {
                     report.lightmap_request_count += 1;
@@ -625,15 +676,18 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
                         [lightmap_archive.as_ref(), texture_archive.as_ref()],
                     ) {
                         Ok(()) => report.lightmap_resolved_count += 1,
-                        Err(message) => push_visual_failure(
-                            report,
-                            graph,
-                            prototype_index,
-                            lightmap.lightmap.0.clone(),
-                            PrototypeGraphEdge::WearToLightmap,
-                            PrototypeGraphRequiredness::Required,
-                            &message,
-                        ),
+                        Err(message) => {
+                            let message = message.to_string();
+                            push_visual_failure(
+                                report,
+                                graph,
+                                prototype_index,
+                                lightmap.lightmap.0.clone(),
+                                PrototypeGraphEdge::WearToLightmap,
+                                PrototypeGraphRequiredness::Required,
+                                &message,
+                            );
+                        }
                     }
                 }
             }
@@ -693,7 +747,7 @@ pub fn prepare_visual_with_repository<R: ResourceRepository>(
 fn prepare_visual_with_repository_internal<R: ResourceRepository>(
     repository: &R,
     proto: &EffectivePrototype,
-    material_signature_by_id: Option<&mut HashMap<AssetId<PreparedMaterial>, Vec<u8>>>,
+    mut material_signature_by_id: Option<&mut HashMap<AssetId<PreparedMaterial>, Vec<u8>>>,
 ) -> Result<PreparedVisual, AssetError> {
     let PrototypeGeometry::Mesh(mesh_key) = &proto.geometry else {
         return prepare_visual(proto);
@@ -713,7 +767,8 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
         name: wear_name,
         type_id: Some(WEAR_KIND),
     };
-    let wear = decode_wear(&read_key(repository, &wear_key, Some("wear"))?).map_err(AssetError::Material)?;
+    let wear = decode_wear(&read_key(repository, &wear_key, Some("wear"))?)
+        .map_err(AssetError::Material)?;
 
     let mut material_count = 0;
     let mut material_ids = Vec::with_capacity(wear.entries.len());
@@ -723,18 +778,12 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
         let material_index = u16::try_from(material_index).map_err(|_| {
             AssetError::InvalidPrototype("material index does not fit archive format".to_string())
         })?;
-        let material = resolve_material(repository, &wear, material_index)
-            .map_err(AssetError::Material)?;
+        let material =
+            resolve_material(repository, &wear, material_index).map_err(AssetError::Material)?;
         material_count += 1;
-        material_ids.push(AssetId::new(stable_material_id(
-            proto,
-            material_index,
-            &material.name,
-        )));
-        let material_id = *material_ids
-            .last()
-            .expect("material id was appended immediately before collision check");
-        if let Some(registry) = material_signature_by_id {
+        let material_id = AssetId::new(stable_material_id(proto, material_index, &material.name));
+        material_ids.push(material_id);
+        if let Some(registry) = material_signature_by_id.as_deref_mut() {
             match registry.get(&material_id) {
                 Some(existing_name) => {
                     if existing_name != &material.name.0 {
@@ -750,7 +799,7 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
         }
 
         for texture in material.document.texture_requests() {
-        resolve_texture(repository, &texture)?;
+            resolve_texture(repository, &texture)?;
             texture_count += 1;
         }
     }
@@ -779,14 +828,12 @@ fn read_key<R: ResourceRepository>(
     label: Option<&str>,
 ) -> Result<Arc<[u8]>, AssetError> {
     let label = label.unwrap_or("asset");
-    let handle = repository
+    let archive = repository
         .open_archive(&key.archive)
+        .map_err(|err| map_resource_error(label, key, err))?;
+    let handle = repository
+        .find(archive, &key.name)
         .map_err(|err| map_resource_error(label, key, err))?
-        .and_then(|archive| {
-            repository
-                .find(archive, &key.name)
-                .map_err(|err| map_resource_error(label, key, err))
-        })?
         .ok_or_else(|| AssetError::MissingDependency(format!("{label}: {key:?}")))?;
     let bytes = repository
         .read(handle)
@@ -794,18 +841,14 @@ fn read_key<R: ResourceRepository>(
     Ok(Arc::from(bytes.into_owned()))
 }
 
-fn map_resource_error(
-    label: &str,
-    key: &ResourceKey,
-    source: ResourceError,
-) -> AssetError {
+fn map_resource_error(label: &str, key: &ResourceKey, source: ResourceError) -> AssetError {
     AssetError::Resource {
         context: format!(
             "{label}: archive={} entry={}",
             key.archive.as_str(),
             String::from_utf8_lossy(&key.name.0),
         ),
-        source,
+        source: Box::new(source),
     }
 }
 
@@ -836,19 +879,17 @@ fn resolve_wear_table<R: ResourceRepository>(
                 String::from_utf8_lossy(&wear_name.0)
             ))
         })?;
-    let info = repository
-        .entry_info(handle)
-        .map_err(|err| {
-            map_resource_error(
-                "wear",
-                &ResourceKey {
-                    archive: mesh.archive.clone(),
-                    name: wear_name.clone(),
-                    type_id: Some(WEAR_KIND),
-                },
-                err,
-            )
-        })?;
+    let info = repository.entry_info(handle).map_err(|err| {
+        map_resource_error(
+            "wear",
+            &ResourceKey {
+                archive: mesh.archive.clone(),
+                name: wear_name.clone(),
+                type_id: Some(WEAR_KIND),
+            },
+            err,
+        )
+    })?;
     if info.key.type_id != Some(WEAR_KIND) {
         return Err(AssetError::InvalidPrototype(format!(
             "entry {} is not WEAR",
@@ -902,7 +943,7 @@ fn resolve_texm_from_candidates<'a, R: ResourceRepository>(
             .read(handle)
             .map_err(|err| map_resource_error("texm", &key, err))?
             .into_owned();
-        decode_texm(bytes).map_err(AssetError::Texture)?;
+        decode_texm(Arc::from(bytes)).map_err(AssetError::Texture)?;
         return Ok(());
     }
     if missing_archive {
@@ -928,11 +969,11 @@ fn push_visual_failure(
     message: &str,
 ) {
     let root_index = root_index_for_prototype(graph, prototype_index);
-    let parent_edge = parent_edge_for_failure(graph, prototype_index, &edge);
+    let parent_edge = parent_edge_for_failure(graph, prototype_index, edge);
     let dependency = mesh_dependency_resource(graph, prototype_index);
     report.failures.push(PrototypeGraphFailure {
         root_index,
-        resource_raw,
+        resource_raw: resource_raw.clone(),
         edge,
         message: message.to_string(),
         requiredness,
@@ -943,7 +984,7 @@ fn push_visual_failure(
             resource: Some(resource_raw),
             span: None,
         }),
-    })
+    });
 }
 
 fn root_index_for_prototype(graph: &PrototypeGraph, prototype_index: usize) -> usize {
@@ -958,21 +999,23 @@ fn root_index_for_prototype(graph: &PrototypeGraph, prototype_index: usize) -> u
 fn parent_edge_for_failure(
     graph: &PrototypeGraph,
     prototype_index: usize,
-    edge: &PrototypeGraphEdge,
+    edge: PrototypeGraphEdge,
 ) -> Option<fparkan_prototype::PrototypeGraphEdgeId> {
     let prototype_node_id = prototype_node_id(graph, prototype_index)?;
     match edge {
         PrototypeGraphEdge::MeshToWear
         | PrototypeGraphEdge::WearToMaterial
         | PrototypeGraphEdge::MaterialToTexture
-        | PrototypeGraphEdge::WearToLightmap => {
-            mesh_edge_id(graph, prototype_node_id).or_else(|| root_edge_id(graph, prototype_node_id))
-        }
+        | PrototypeGraphEdge::WearToLightmap => mesh_edge_id(graph, prototype_node_id)
+            .or_else(|| root_edge_id(graph, prototype_node_id)),
         _ => root_edge_id(graph, prototype_node_id),
     }
 }
 
-fn prototype_node_id(graph: &PrototypeGraph, prototype_index: usize) -> Option<fparkan_prototype::PrototypeGraphNodeId> {
+fn prototype_node_id(
+    graph: &PrototypeGraph,
+    prototype_index: usize,
+) -> Option<fparkan_prototype::PrototypeGraphNodeId> {
     graph
         .nodes
         .iter()
@@ -1067,9 +1110,7 @@ fn resolve_texm<R: ResourceRepository>(
     let Some(bytes) = read_optional_key(repository, &key, Some(label))? else {
         return Err(AssetError::MissingDependency(format!("{label} {name:?}")));
     };
-    decode_texm(bytes)
-        .map(|_| ())
-        .map_err(AssetError::Texture)
+    decode_texm(bytes).map(|_| ()).map_err(AssetError::Texture)
 }
 
 fn read_optional_key<R: ResourceRepository>(
@@ -1082,24 +1123,20 @@ fn read_optional_key<R: ResourceRepository>(
         Err(ResourceError::MissingArchive | ResourceError::MissingEntry) => return Ok(None),
         Err(err) => {
             let label = label.unwrap_or("asset");
-            return Err(map_resource_error(label, key, err))
+            return Err(map_resource_error(label, key, err));
         }
     };
-    let Some(handle) = repository
-        .find(archive, &key.name)
-        .map_err(|err| {
-            let label = label.unwrap_or("asset");
-            map_resource_error(label, key, err)
-        })?
+    let Some(handle) = repository.find(archive, &key.name).map_err(|err| {
+        let label = label.unwrap_or("asset");
+        map_resource_error(label, key, err)
+    })?
     else {
         return Ok(None);
     };
-    let bytes = repository
-        .read(handle)
-        .map_err(|err| {
-            let label = label.unwrap_or("asset");
-            map_resource_error(label, key, err)
-        })?;
+    let bytes = repository.read(handle).map_err(|err| {
+        let label = label.unwrap_or("asset");
+        map_resource_error(label, key, err)
+    })?;
     Ok(Some(Arc::from(bytes.into_owned())))
 }
 

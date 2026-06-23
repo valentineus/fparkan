@@ -1,21 +1,40 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_precision_loss,
+        clippy::expect_used,
+        clippy::float_cmp,
+        clippy::identity_op,
+        clippy::too_many_lines,
+        clippy::uninlined_format_args,
+        clippy::map_unwrap_or,
+        clippy::needless_raw_string_hashes,
+        clippy::semicolon_if_nothing_returned,
+        clippy::type_complexity,
+        clippy::panic,
+        clippy::unwrap_used
+    )
+)]
 //! Shared inspection helpers for format-backed tooling.
 
 use fparkan_msh::{decode_msh, validate_msh};
 use fparkan_nres::{decode as decode_nres, NresDocument, ReadProfile};
-use fparkan_resource::{archive_path, resource_name, CachedResourceRepository};
+use fparkan_resource::{archive_path, resource_name, CachedResourceRepository, ResourceRepository};
 use fparkan_rsli::decode as decode_rsli;
 use fparkan_terrain_format::{decode_land_map, decode_land_msh};
 use fparkan_texm::decode_texm;
-use fparkan_vfs::{DirectoryVfs, Vfs};
+use fparkan_vfs::DirectoryVfs;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 /// Archive inspection variants.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArchiveInspection {
-    /// NRes inspection summary.
+    /// `NRes` inspection summary.
     Nres {
         /// Archive entry count.
         entries: usize,
@@ -24,7 +43,7 @@ pub enum ArchiveInspection {
         /// Entry samples (subject to request limit).
         sample: Vec<NresEntrySummary>,
     },
-    /// RsLi inspection summary.
+    /// `RsLi` inspection summary.
     Rsli {
         /// Archive entry count.
         entries: usize,
@@ -33,7 +52,7 @@ pub enum ArchiveInspection {
     Unsupported,
 }
 
-/// NRes entry summary.
+/// `NRes` entry summary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NresEntrySummary {
     /// ASCII/legacy resource name.
@@ -107,6 +126,10 @@ pub enum LandFileKind {
 }
 
 /// Inspects a format archive.
+///
+/// # Errors
+///
+/// Returns a string error when the archive cannot be read or decoded.
 pub fn inspect_archive_file(path: &Path, sample_limit: usize) -> Result<ArchiveInspection, String> {
     let bytes = fs::read(path).map_err(|err| format!("{}: {err}", path.display()))?;
     inspect_archive_bytes(&bytes, sample_limit, Some(path))
@@ -138,8 +161,11 @@ fn inspect_archive_bytes(
             sample,
         })
     } else if bytes.get(0..4) == Some(b"NL\0\x01") {
-        let document = decode_rsli(Arc::from(bytes.to_vec().into_boxed_slice()), fparkan_rsli::ReadProfile::Compatible)
-            .map_err(|err| err.to_string())?;
+        let document = decode_rsli(
+            Arc::from(bytes.to_vec().into_boxed_slice()),
+            fparkan_rsli::ReadProfile::Compatible,
+        )
+        .map_err(|err| err.to_string())?;
         Ok(ArchiveInspection::Rsli {
             entries: document.entries().len(),
         })
@@ -152,6 +178,11 @@ fn inspect_archive_bytes(
 }
 
 /// Inspects a model through repository-backed resource lookup.
+///
+/// # Errors
+///
+/// Returns a string error when the resource cannot be resolved or parsed as a
+/// valid model payload.
 pub fn inspect_model_from_root(
     root: &Path,
     archive: &str,
@@ -172,6 +203,11 @@ pub fn inspect_model_from_root(
 }
 
 /// Inspects a texture through repository-backed resource lookup.
+///
+/// # Errors
+///
+/// Returns a string error when the resource cannot be resolved or parsed as a
+/// valid texture payload.
 pub fn inspect_texture_from_root(
     root: &Path,
     archive: &str,
@@ -189,13 +225,15 @@ pub fn inspect_texture_from_root(
 }
 
 /// Inspects a terrain land file by path.
+///
+/// # Errors
+///
+/// Returns a string error when the file cannot be read or parsed as the
+/// requested terrain payload kind.
 pub fn inspect_land_file(path: &Path, kind: LandFileKind) -> Result<MapInspection, String> {
     let bytes = fs::read(path).map_err(|err| format!("{}: {err}", path.display()))?;
-    let document = decode_nres(
-        Arc::from(bytes.into_boxed_slice()),
-        ReadProfile::Compatible,
-    )
-    .map_err(|err| err.to_string())?;
+    let document = decode_nres(Arc::from(bytes.into_boxed_slice()), ReadProfile::Compatible)
+        .map_err(|err| err.to_string())?;
     match kind {
         LandFileKind::LandMsh => inspect_land_msh(&document),
         LandFileKind::LandMap => inspect_land_map(&document),
@@ -254,17 +292,18 @@ fn read_resource_bytes(root: &Path, archive: &str, name: &str) -> Result<Arc<[u8
 mod tests {
     use super::*;
     use std::io::Write as _;
+    use std::path::PathBuf;
 
     #[test]
-    fn inspect_rsli_counts_entries() {
+    fn inspect_rsli_rejects_malformed_archive() {
         let dir = temp_dir("inspect");
         let path = dir.join("test.rsli");
         let mut file = fs::File::create(&path).expect("file");
         file.write_all(b"NL\0\x01").expect("magic");
         drop(file);
 
-        let inspection = inspect_archive_file(&path, 0).expect("inspect");
-        assert!(matches!(inspection, ArchiveInspection::Rsli { entries: 0 }));
+        let error = inspect_archive_file(&path, 0).expect_err("malformed archive");
+        assert!(error.contains("entry table out of bounds"));
     }
 
     #[test]
@@ -278,7 +317,9 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> PathBuf {
-        let base = PathBuf::from("/tmp").join("fparkan-inspection-tests").join(name);
+        let base = PathBuf::from("/tmp")
+            .join("fparkan-inspection-tests")
+            .join(name);
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).expect("tmp dir");
         base

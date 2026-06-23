@@ -1,18 +1,35 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        clippy::cast_precision_loss,
+        clippy::expect_used,
+        clippy::float_cmp,
+        clippy::identity_op,
+        clippy::too_many_lines,
+        clippy::uninlined_format_args,
+        clippy::map_unwrap_or,
+        clippy::needless_raw_string_hashes,
+        clippy::semicolon_if_nothing_returned,
+        clippy::type_complexity,
+        clippy::panic,
+        clippy::unwrap_used
+    )
+)]
 //! Runtime orchestration for headless and rendered modes.
 
 use fparkan_assets::{
-    AssetError as AssetPreparationError, AssetManager, MissionAssetPlan,
-    decode_mission_land_path, decode_nres_payload, decode_mission_payload, prepare_terrain_world,
-    derive_mission_land_paths, BuildCategory, MissionDocument, MissionError, MissionTerrainPaths,
-    TerrainFormatError, TerrainPreparationError, TmaProfile, TerrainWorld,
-    NresError,
-    extend_graph_report_with_visual_dependencies,
+    decode_mission_land_path, decode_mission_payload, decode_nres_payload,
+    derive_mission_land_paths, extend_graph_report_with_visual_dependencies, prepare_terrain_world,
+    AssetError as AssetPreparationError, AssetManager, BuildCategory, MissionAssetPlan,
+    MissionDocument, MissionError, MissionTerrainPaths, NresError, TerrainFormatError,
+    TerrainPreparationError, TerrainWorld, TmaProfile,
 };
 use fparkan_path::{normalize_relative, NormalizedPath, PathError, PathPolicy};
 use fparkan_prototype::{
-    build_prototype_graph_report,
-    PrototypeGraph, PrototypeGraphFailure, PrototypeGraphReport,
+    build_prototype_graph_report, PrototypeGraph, PrototypeGraphFailure, PrototypeGraphReport,
 };
 use fparkan_resource::{resource_name, CachedResourceRepository};
 use fparkan_vfs::{Vfs, VfsError};
@@ -435,44 +452,52 @@ fn load_mission_with_options(
     let mission_bytes = read_vfs(&vfs, &mission_path)?;
 
     trace.phases.push(MissionLoadPhase::Map);
-    let land_path = decode_mission_land_path(&mission_bytes, TmaProfile::Strict).map_err(|source| {
+    let land_path =
+        decode_mission_land_path(&mission_bytes, TmaProfile::Strict).map_err(|source| {
+            EngineError::Mission {
+                path: mission_path.as_str().to_string(),
+                source,
+            }
+        })?;
+    let MissionTerrainPaths {
+        land_msh: land_msh_path,
+        land_map: land_map_path,
+    } = derive_mission_land_paths(&land_path).map_err(|source| EngineError::Path {
+        role: "mission land",
+        value: mission_path.as_str().to_string(),
+        source,
+    })?;
+    let land_msh_nres = decode_nres_payload(read_vfs(&vfs, &land_msh_path)?).map_err(|source| {
+        EngineError::Nres {
+            path: land_msh_path.as_str().to_string(),
+            source,
+        }
+    })?;
+    let land_map_nres = decode_nres_payload(read_vfs(&vfs, &land_map_path)?).map_err(|source| {
+        EngineError::Nres {
+            path: land_map_path.as_str().to_string(),
+            source,
+        }
+    })?;
+    let build_dat_path = normalize_engine_path("BuildDat", "BuildDat.lst")?;
+    let build_dat = read_vfs(&vfs, &build_dat_path)?;
+    let (terrain, build_categories) =
+        prepare_terrain_world(&land_msh_nres, &land_map_nres, &build_dat).map_err(|source| {
+            match source {
+                TerrainPreparationError::Decode(source) => EngineError::TerrainFormat {
+                    path: build_dat_path.as_str().to_string(),
+                    source,
+                },
+                TerrainPreparationError::Runtime(source) => EngineError::Terrain(source),
+            }
+        })?;
+    trace.phases.push(MissionLoadPhase::Tma);
+    let mission = decode_mission_payload(mission_bytes, TmaProfile::Strict).map_err(|source| {
         EngineError::Mission {
             path: mission_path.as_str().to_string(),
             source,
         }
     })?;
-    let MissionTerrainPaths { land_msh: land_msh_path, land_map: land_map_path } =
-        derive_mission_land_paths(&land_path).map_err(|source| EngineError::Path {
-            role: "mission land",
-            value: mission_path.as_str().to_string(),
-            source,
-        })?;
-    let land_msh_nres = decode_nres_payload(read_vfs(&vfs, &land_msh_path)?)
-        .map_err(|source| EngineError::Nres {
-            path: land_msh_path.as_str().to_string(),
-            source,
-        })?;
-    let land_map_nres = decode_nres_payload(read_vfs(&vfs, &land_map_path)?)
-        .map_err(|source| EngineError::Nres {
-            path: land_map_path.as_str().to_string(),
-            source,
-        })?;
-    let build_dat_path = normalize_engine_path("BuildDat", "BuildDat.lst")?;
-    let build_dat = read_vfs(&vfs, &build_dat_path)?;
-    let (terrain, build_categories) = prepare_terrain_world(&land_msh_nres, &land_map_nres, &build_dat)
-        .map_err(|source| match source {
-            TerrainPreparationError::Decode(source) => EngineError::TerrainFormat {
-                path: build_dat_path.as_str().to_string(),
-                source,
-            },
-            TerrainPreparationError::Runtime(source) => EngineError::Terrain(source),
-        })?;
-    trace.phases.push(MissionLoadPhase::Tma);
-    let mission =
-        decode_mission_payload(mission_bytes, TmaProfile::Strict).map_err(|source| EngineError::Mission {
-            path: mission_path.as_str().to_string(),
-            source,
-        })?;
     trace.transforms = mission
         .objects
         .iter()
