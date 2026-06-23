@@ -1024,6 +1024,13 @@ mod tests {
         fs::create_dir_all(&child).expect("locked dir");
         fs::set_permissions(&child, fs::Permissions::from_mode(0o000)).expect("lock dir");
 
+        if fs::read_dir(&child).is_ok() {
+            eprintln!("skipping unreadable directory assertion: process can read 0o000 directory");
+            fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).expect("unlock dir");
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+
         let result = discover(&root, DiscoverOptions::default());
 
         fs::set_permissions(&child, fs::Permissions::from_mode(0o700)).expect("unlock dir");
