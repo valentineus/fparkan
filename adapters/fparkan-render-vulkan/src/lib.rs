@@ -27,8 +27,8 @@
 //!
 //! This crate is the declared low-level Vulkan boundary.
 
-use ash::vk;
-use fparkan_platform::RenderRequest;
+use ash::{khr::surface, vk};
+use fparkan_platform::{NativeWindowHandles, RenderRequest};
 use fparkan_render::{
     canonical_capture, FrameOutput, RenderBackend, RenderCommandList, RenderError,
 };
@@ -83,7 +83,7 @@ pub struct VulkanInstancePlan {
 
 /// Created Vulkan instance probe.
 pub struct VulkanInstanceProbe {
-    _entry: ash::Entry,
+    entry: ash::Entry,
     instance: ash::Instance,
     /// Deterministic instance creation report.
     pub report: VulkanInstancePlan,
@@ -94,6 +94,157 @@ impl Drop for VulkanInstanceProbe {
         // SAFETY: The `Instance` was created by this probe and is destroyed once during drop.
         unsafe { self.instance.destroy_instance(None) };
     }
+}
+
+/// Deterministic Vulkan surface creation plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VulkanSurfacePlan {
+    /// Report schema version.
+    pub schema: u32,
+    /// Instance extensions required by the native display backend.
+    pub required_instance_extensions: Vec<String>,
+}
+
+/// Vulkan surface bootstrap error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VulkanSurfaceError {
+    /// No native raw window/display handles were available.
+    MissingNativeHandles,
+    /// Required platform surface extensions could not be enumerated.
+    RequiredExtensionsFailed {
+        /// Vulkan result.
+        result: String,
+    },
+    /// A required extension pointer was not valid UTF-8.
+    InvalidExtensionName,
+    /// Surface creation failed.
+    CreateFailed {
+        /// Vulkan result.
+        result: String,
+    },
+}
+
+impl std::fmt::Display for VulkanSurfaceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingNativeHandles => {
+                write!(
+                    f,
+                    "native window/display handles are required for Vulkan surface creation"
+                )
+            }
+            Self::RequiredExtensionsFailed { result } => write!(
+                f,
+                "failed to enumerate required Vulkan surface extensions: {result}"
+            ),
+            Self::InvalidExtensionName => {
+                write!(f, "Vulkan surface extension name is not valid UTF-8")
+            }
+            Self::CreateFailed { result } => write!(f, "Vulkan surface creation failed: {result}"),
+        }
+    }
+}
+
+impl std::error::Error for VulkanSurfaceError {}
+
+/// Created Vulkan surface probe.
+pub struct VulkanSurfaceProbe {
+    loader: surface::Instance,
+    surface: vk::SurfaceKHR,
+    /// Deterministic surface creation report.
+    pub report: VulkanSurfacePlan,
+}
+
+impl Drop for VulkanSurfaceProbe {
+    fn drop(&mut self) {
+        // SAFETY: The `SurfaceKHR` was created by this probe and is destroyed once during drop.
+        unsafe { self.loader.destroy_surface(self.surface, None) };
+    }
+}
+
+/// Builds a deterministic Vulkan surface plan from native window handles.
+///
+/// # Errors
+///
+/// Returns [`VulkanSurfaceError`] when no native handles exist or the platform
+/// display backend has no Vulkan surface extension mapping.
+pub fn plan_vulkan_surface(
+    handles: Option<NativeWindowHandles>,
+) -> Result<VulkanSurfacePlan, VulkanSurfaceError> {
+    let handles = handles.ok_or(VulkanSurfaceError::MissingNativeHandles)?;
+    let required = ash_window::enumerate_required_extensions(handles.display).map_err(|error| {
+        VulkanSurfaceError::RequiredExtensionsFailed {
+            result: format!("{error:?}"),
+        }
+    })?;
+    let mut required_instance_extensions = Vec::with_capacity(required.len());
+    for extension in required {
+        let name = extension_name(*extension)?;
+        required_instance_extensions.push(name);
+    }
+    required_instance_extensions.sort();
+    required_instance_extensions.dedup();
+    Ok(VulkanSurfacePlan {
+        schema: 1,
+        required_instance_extensions,
+    })
+}
+
+/// Creates a Vulkan surface probe from native window handles.
+///
+/// # Errors
+///
+/// Returns [`VulkanSurfaceError`] when handles are missing, required extensions
+/// cannot be planned, or `vkCreate*SurfaceKHR` fails.
+pub fn create_vulkan_surface_probe(
+    instance: &VulkanInstanceProbe,
+    handles: Option<NativeWindowHandles>,
+) -> Result<VulkanSurfaceProbe, VulkanSurfaceError> {
+    let handles = handles.ok_or(VulkanSurfaceError::MissingNativeHandles)?;
+    let report = plan_vulkan_surface(Some(handles))?;
+    // SAFETY: The platform handles are only used to create a child surface owned by this probe.
+    let surface = unsafe {
+        ash_window::create_surface(
+            &instance.entry,
+            &instance.instance,
+            handles.display,
+            handles.window,
+            None,
+        )
+    }
+    .map_err(|error| VulkanSurfaceError::CreateFailed {
+        result: format!("{error:?}"),
+    })?;
+    Ok(VulkanSurfaceProbe {
+        loader: surface::Instance::new(&instance.entry, &instance.instance),
+        surface,
+        report,
+    })
+}
+
+/// Renders a deterministic JSON Vulkan surface plan.
+#[must_use]
+pub fn render_surface_plan_json(plan: &VulkanSurfacePlan) -> String {
+    let mut out = String::new();
+    out.push_str("{\"schema\":");
+    out.push_str(&plan.schema.to_string());
+    out.push_str(",\"required_instance_extensions\":[");
+    for (index, extension) in plan.required_instance_extensions.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        push_json_string(&mut out, extension);
+    }
+    out.push_str("]}");
+    out
+}
+
+fn extension_name(extension: *const c_char) -> Result<String, VulkanSurfaceError> {
+    // SAFETY: `ash-window` returns extension pointers to static NUL-terminated Vulkan names.
+    let name = unsafe { CStr::from_ptr(extension) };
+    name.to_str()
+        .map(str::to_string)
+        .map_err(|_| VulkanSurfaceError::InvalidExtensionName)
 }
 
 /// Vulkan instance bootstrap error.
@@ -198,7 +349,7 @@ pub fn create_vulkan_instance_probe(
         }
     })?;
     Ok(VulkanInstanceProbe {
-        _entry: entry,
+        entry,
         instance,
         report: plan,
     })
@@ -1002,6 +1153,39 @@ mod tests {
                 extension: "bad\0extension".to_string()
             })
         );
+    }
+
+    #[test]
+    fn surface_plan_requires_native_handles() {
+        assert_eq!(
+            plan_vulkan_surface(None),
+            Err(VulkanSurfaceError::MissingNativeHandles)
+        );
+        assert_eq!(
+            VulkanSurfaceError::MissingNativeHandles.to_string(),
+            "native window/display handles are required for Vulkan surface creation"
+        );
+    }
+
+    #[test]
+    fn surface_plan_json_is_stable() {
+        assert_eq!(
+            render_surface_plan_json(&VulkanSurfacePlan {
+                schema: 1,
+                required_instance_extensions: vec![
+                    "VK_KHR_surface".to_string(),
+                    "VK_EXT_metal_surface".to_string(),
+                ],
+            }),
+            "{\"schema\":1,\"required_instance_extensions\":[\"VK_KHR_surface\",\"VK_EXT_metal_surface\"]}"
+        );
+    }
+
+    #[test]
+    fn static_surface_extension_name_is_decoded() {
+        let name = extension_name(ash::khr::surface::NAME.as_ptr()).expect("extension name");
+
+        assert_eq!(name, "VK_KHR_surface");
     }
 
     fn device(
