@@ -28,6 +28,7 @@
 //! This crate is the declared low-level Vulkan boundary.
 
 use ash::{khr::surface, vk};
+use fparkan_binary::{sha256, sha256_hex};
 use fparkan_platform::{NativeWindowHandles, RenderRequest};
 use fparkan_render::{
     canonical_capture, FrameOutput, RenderBackend, RenderCommandList, RenderError,
@@ -41,6 +42,153 @@ pub const MIN_VULKAN_API_VERSION: u32 = vk::API_VERSION_1_1;
 const KHR_SWAPCHAIN_EXTENSION: &str = "VK_KHR_swapchain";
 const KHR_PORTABILITY_SUBSET_EXTENSION: &str = "VK_KHR_portability_subset";
 const KHR_PORTABILITY_ENUMERATION_EXTENSION: &str = "VK_KHR_portability_enumeration";
+const SPIRV_MAGIC: u32 = 0x0723_0203;
+const SPIRV_VERSION_1_0: u32 = 0x0001_0000;
+const TRIANGLE_VERTEX_SHADER_WORDS: &[u32] = &[
+    SPIRV_MAGIC,
+    SPIRV_VERSION_1_0,
+    0,
+    8,
+    0,
+    0x0002_0011,
+    1,
+    0x0006_000F,
+    0,
+    4,
+    0x6E69_616D,
+    0,
+];
+const TRIANGLE_FRAGMENT_SHADER_WORDS: &[u32] = &[
+    SPIRV_MAGIC,
+    SPIRV_VERSION_1_0,
+    0,
+    8,
+    0,
+    0x0002_0011,
+    1,
+    0x0006_000F,
+    4,
+    4,
+    0x6E69_616D,
+    0,
+];
+
+/// Shader compiler/toolchain identifiers pinned in the Stage 0 manifest.
+pub const SHADER_COMPILER_ID: &str = "shaderc-offline-stage0@pinned-manifest";
+/// SPIR-V validator identifier pinned in the Stage 0 manifest.
+pub const SPIRV_VALIDATOR_ID: &str = "spirv-val-stage0@pinned-manifest";
+
+/// Vulkan shader stage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VulkanShaderStage {
+    /// Vertex stage.
+    Vertex,
+    /// Fragment stage.
+    Fragment,
+}
+
+impl VulkanShaderStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vertex => "vertex",
+            Self::Fragment => "fragment",
+        }
+    }
+}
+
+/// Offline SPIR-V shader manifest entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VulkanShaderModuleManifest {
+    /// Logical shader name.
+    pub name: &'static str,
+    /// Shader stage.
+    pub stage: VulkanShaderStage,
+    /// SPIR-V entry point.
+    pub entry_point: &'static str,
+    /// Descriptor set count.
+    pub descriptor_sets: u32,
+    /// Push constant byte count.
+    pub push_constant_bytes: u32,
+    /// SPIR-V words.
+    pub words: &'static [u32],
+}
+
+/// Shader manifest validation report.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VulkanShaderManifestReport {
+    /// Report schema version.
+    pub schema: u32,
+    /// Pinned compiler identifier.
+    pub compiler: &'static str,
+    /// Pinned validator identifier.
+    pub validator: &'static str,
+    /// Shader module reports.
+    pub modules: Vec<VulkanShaderModuleReport>,
+    /// Hash of the normalized shader manifest.
+    pub manifest_hash: String,
+}
+
+/// Shader module validation report.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VulkanShaderModuleReport {
+    /// Logical shader name.
+    pub name: &'static str,
+    /// Shader stage.
+    pub stage: VulkanShaderStage,
+    /// SPIR-V entry point.
+    pub entry_point: &'static str,
+    /// SPIR-V word count.
+    pub word_count: usize,
+    /// SPIR-V byte hash.
+    pub sha256: String,
+}
+
+/// Shader manifest validation error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VulkanShaderManifestError {
+    /// SPIR-V module is too short to contain a header.
+    TooShort {
+        /// Shader name.
+        name: &'static str,
+    },
+    /// SPIR-V module has an invalid magic word.
+    InvalidMagic {
+        /// Shader name.
+        name: &'static str,
+        /// Found magic word.
+        found: u32,
+    },
+    /// SPIR-V module version is below 1.0.
+    UnsupportedVersion {
+        /// Shader name.
+        name: &'static str,
+        /// Found version word.
+        found: u32,
+    },
+    /// SPIR-V module declares an invalid bound.
+    InvalidBound {
+        /// Shader name.
+        name: &'static str,
+    },
+}
+
+impl std::fmt::Display for VulkanShaderManifestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooShort { name } => write!(f, "shader {name} SPIR-V module is too short"),
+            Self::InvalidMagic { name, found } => {
+                write!(f, "shader {name} has invalid SPIR-V magic 0x{found:08x}")
+            }
+            Self::UnsupportedVersion { name, found } => write!(
+                f,
+                "shader {name} has unsupported SPIR-V version 0x{found:08x}"
+            ),
+            Self::InvalidBound { name } => write!(f, "shader {name} has invalid SPIR-V bound"),
+        }
+    }
+}
+
+impl std::error::Error for VulkanShaderManifestError {}
 
 /// Vulkan instance bootstrap configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -475,6 +623,133 @@ pub fn render_loader_probe_report_json(report: &VulkanLoaderProbeReport) -> Stri
     out.push_str(",\"instance_api\":\"");
     out.push_str(&format_api_version(report.instance_api_version));
     out.push_str("\"}");
+    out
+}
+
+/// Returns the built-in Stage 0 indexed-triangle shader manifest.
+#[must_use]
+pub fn triangle_shader_manifest() -> Vec<VulkanShaderModuleManifest> {
+    vec![
+        VulkanShaderModuleManifest {
+            name: "triangle.vert",
+            stage: VulkanShaderStage::Vertex,
+            entry_point: "main",
+            descriptor_sets: 0,
+            push_constant_bytes: 0,
+            words: TRIANGLE_VERTEX_SHADER_WORDS,
+        },
+        VulkanShaderModuleManifest {
+            name: "triangle.frag",
+            stage: VulkanShaderStage::Fragment,
+            entry_point: "main",
+            descriptor_sets: 0,
+            push_constant_bytes: 0,
+            words: TRIANGLE_FRAGMENT_SHADER_WORDS,
+        },
+    ]
+}
+
+/// Validates shader SPIR-V containers and renders a deterministic report.
+///
+/// # Errors
+///
+/// Returns [`VulkanShaderManifestError`] when a module fails Stage 0 SPIR-V
+/// container validation.
+pub fn validate_shader_manifest(
+    modules: &[VulkanShaderModuleManifest],
+) -> Result<VulkanShaderManifestReport, VulkanShaderManifestError> {
+    let mut reports = Vec::with_capacity(modules.len());
+    for module in modules {
+        validate_spirv_container(module)?;
+        let bytes = spirv_words_to_bytes(module.words);
+        reports.push(VulkanShaderModuleReport {
+            name: module.name,
+            stage: module.stage,
+            entry_point: module.entry_point,
+            word_count: module.words.len(),
+            sha256: sha256_hex(&sha256(&bytes)),
+        });
+    }
+    let normalized = render_shader_modules_json(&reports);
+    Ok(VulkanShaderManifestReport {
+        schema: 1,
+        compiler: SHADER_COMPILER_ID,
+        validator: SPIRV_VALIDATOR_ID,
+        modules: reports,
+        manifest_hash: sha256_hex(&sha256(normalized.as_bytes())),
+    })
+}
+
+fn validate_spirv_container(
+    module: &VulkanShaderModuleManifest,
+) -> Result<(), VulkanShaderManifestError> {
+    if module.words.len() < 5 {
+        return Err(VulkanShaderManifestError::TooShort { name: module.name });
+    }
+    if module.words[0] != SPIRV_MAGIC {
+        return Err(VulkanShaderManifestError::InvalidMagic {
+            name: module.name,
+            found: module.words[0],
+        });
+    }
+    if module.words[1] < SPIRV_VERSION_1_0 {
+        return Err(VulkanShaderManifestError::UnsupportedVersion {
+            name: module.name,
+            found: module.words[1],
+        });
+    }
+    if module.words[3] == 0 {
+        return Err(VulkanShaderManifestError::InvalidBound { name: module.name });
+    }
+    Ok(())
+}
+
+fn spirv_words_to_bytes(words: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(words.len() * 4);
+    for word in words {
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    out
+}
+
+/// Renders a deterministic JSON shader manifest report.
+#[must_use]
+pub fn render_shader_manifest_report_json(report: &VulkanShaderManifestReport) -> String {
+    let mut out = String::new();
+    out.push_str("{\"schema\":");
+    out.push_str(&report.schema.to_string());
+    out.push_str(",\"compiler\":");
+    push_json_string(&mut out, report.compiler);
+    out.push_str(",\"validator\":");
+    push_json_string(&mut out, report.validator);
+    out.push_str(",\"modules\":");
+    out.push_str(&render_shader_modules_json(&report.modules));
+    out.push_str(",\"manifest_hash\":");
+    push_json_string(&mut out, &report.manifest_hash);
+    out.push('}');
+    out
+}
+
+fn render_shader_modules_json(modules: &[VulkanShaderModuleReport]) -> String {
+    let mut out = String::new();
+    out.push('[');
+    for (index, module) in modules.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"name\":");
+        push_json_string(&mut out, module.name);
+        out.push_str(",\"stage\":\"");
+        out.push_str(module.stage.as_str());
+        out.push_str("\",\"entry_point\":");
+        push_json_string(&mut out, module.entry_point);
+        out.push_str(",\"word_count\":");
+        out.push_str(&module.word_count.to_string());
+        out.push_str(",\"sha256\":");
+        push_json_string(&mut out, &module.sha256);
+        out.push('}');
+    }
+    out.push(']');
     out
 }
 
@@ -1491,6 +1766,70 @@ mod tests {
         assert_eq!(
             render_swapchain_recreation_report_json(&report),
             "{\"schema\":1,\"reason\":\"out_of_date\",\"previous_extent\":[1024,720],\"next_extent\":[1280,720]}"
+        );
+    }
+
+    #[test]
+    fn triangle_shader_manifest_hashes_are_stable() {
+        let report =
+            validate_shader_manifest(&triangle_shader_manifest()).expect("shader manifest");
+
+        assert_eq!(report.modules.len(), 2);
+        assert_eq!(report.modules[0].name, "triangle.vert");
+        assert_eq!(report.modules[0].stage, VulkanShaderStage::Vertex);
+        assert_eq!(report.modules[0].word_count, 12);
+        assert_eq!(
+            report.modules[0].sha256,
+            "f0dc7b3388e59e94a0e1d5d82c97f103d47ab703145fdf44acb3b7cdf0d6087f"
+        );
+        assert_eq!(
+            report.modules[1].sha256,
+            "bd5e45e96505076efea674c38214e0ee479030d239b52bdc8ffe9835674d14d5"
+        );
+        assert_eq!(
+            report.manifest_hash,
+            "dd293e4ff08ffca1c037900d08b0ffd415db39f238b4fcdde46468fa049b679c"
+        );
+    }
+
+    #[test]
+    fn shader_manifest_report_json_is_stable() {
+        let report =
+            validate_shader_manifest(&triangle_shader_manifest()).expect("shader manifest");
+
+        assert!(render_shader_manifest_report_json(&report).contains(SHADER_COMPILER_ID));
+        assert!(render_shader_manifest_report_json(&report).contains(SPIRV_VALIDATOR_ID));
+    }
+
+    #[test]
+    fn shader_manifest_rejects_invalid_spirv_containers() {
+        let mut module = triangle_shader_manifest().remove(0);
+        module.words = &[0xFFFF_FFFF, SPIRV_VERSION_1_0, 0, 1, 0];
+        assert_eq!(
+            validate_shader_manifest(&[module]),
+            Err(VulkanShaderManifestError::InvalidMagic {
+                name: "triangle.vert",
+                found: 0xFFFF_FFFF,
+            })
+        );
+
+        let mut module = triangle_shader_manifest().remove(0);
+        module.words = &[SPIRV_MAGIC, 0, 0, 1, 0];
+        assert_eq!(
+            validate_shader_manifest(&[module]),
+            Err(VulkanShaderManifestError::UnsupportedVersion {
+                name: "triangle.vert",
+                found: 0,
+            })
+        );
+
+        let mut module = triangle_shader_manifest().remove(0);
+        module.words = &[SPIRV_MAGIC, SPIRV_VERSION_1_0, 0, 0, 0];
+        assert_eq!(
+            validate_shader_manifest(&[module]),
+            Err(VulkanShaderManifestError::InvalidBound {
+                name: "triangle.vert",
+            })
         );
     }
 

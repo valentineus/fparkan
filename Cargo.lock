@@ -680,6 +680,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "ash-window",
+ "fparkan-binary",
  "fparkan-platform",
  "fparkan-render",
 ]
