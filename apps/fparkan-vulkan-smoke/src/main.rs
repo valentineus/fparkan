@@ -11,7 +11,9 @@
 #![allow(clippy::print_stderr, clippy::print_stdout)]
 //! Native Vulkan smoke runner entrypoint.
 
-use fparkan_render_vulkan::{triangle_shader_manifest, validate_shader_manifest};
+use fparkan_render_vulkan::{
+    probe_vulkan_loader, triangle_shader_manifest, validate_shader_manifest,
+};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -35,8 +37,9 @@ fn main() {
 
 fn run(args: &[String]) -> Result<String, String> {
     let options = SmokeOptions::parse(args)?;
-    validate_smoke_options(&options)?;
-    let report = render_smoke_report_json(&options)?;
+    let bootstrap = VulkanBootstrapProbe::run(&options);
+    validate_smoke_options(&options, &bootstrap)?;
+    let report = render_smoke_report_json(&options, &bootstrap)?;
     if let Some(parent) = options.out.parent() {
         std::fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
     }
@@ -53,6 +56,7 @@ struct SmokeOptions {
     frames: u32,
     resize_count: u32,
     validation_error_count: Option<u32>,
+    probe_loader: bool,
     reason: Option<String>,
 }
 
@@ -64,6 +68,7 @@ impl SmokeOptions {
         let mut frames = 0;
         let mut resize_count = 0;
         let mut validation_error_count = None;
+        let mut probe_loader = false;
         let mut reason = None;
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
@@ -104,6 +109,9 @@ impl SmokeOptions {
                         .ok_or_else(|| "--validation-error-count requires a value".to_string())?;
                     validation_error_count = Some(parse_u32("--validation-error-count", value)?);
                 }
+                "--probe-loader" => {
+                    probe_loader = true;
+                }
                 "--reason" => {
                     let value = iter
                         .next()
@@ -120,6 +128,7 @@ impl SmokeOptions {
             frames,
             resize_count,
             validation_error_count,
+            probe_loader,
             reason,
         })
     }
@@ -129,6 +138,55 @@ fn parse_u32(name: &str, value: &str) -> Result<u32, String> {
     value
         .parse::<u32>()
         .map_err(|_| format!("invalid {name} value: {value}"))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VulkanBootstrapProbe {
+    loader_status: VulkanLoaderStatus,
+    instance_api: Option<String>,
+    error: Option<String>,
+}
+
+impl VulkanBootstrapProbe {
+    fn run(options: &SmokeOptions) -> Self {
+        if !options.probe_loader {
+            return Self {
+                loader_status: VulkanLoaderStatus::Skipped,
+                instance_api: None,
+                error: None,
+            };
+        }
+
+        match probe_vulkan_loader() {
+            Ok(report) => Self {
+                loader_status: VulkanLoaderStatus::Available,
+                instance_api: Some(format_api_version(report.instance_api_version)),
+                error: None,
+            },
+            Err(err) => Self {
+                loader_status: VulkanLoaderStatus::Unavailable,
+                instance_api: None,
+                error: Some(err.to_string()),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VulkanLoaderStatus {
+    Skipped,
+    Available,
+    Unavailable,
+}
+
+impl VulkanLoaderStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Skipped => "skipped",
+            Self::Available => "available",
+            Self::Unavailable => "unavailable",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -180,7 +238,10 @@ impl SmokeStatus {
     }
 }
 
-fn validate_smoke_options(options: &SmokeOptions) -> Result<(), String> {
+fn validate_smoke_options(
+    options: &SmokeOptions,
+    bootstrap: &VulkanBootstrapProbe,
+) -> Result<(), String> {
     match options.status {
         SmokeStatus::Blocked => {
             if options
@@ -205,12 +266,20 @@ fn validate_smoke_options(options: &SmokeOptions) -> Result<(), String> {
                     "passed native smoke report requires --validation-error-count 0".to_string(),
                 );
             }
+            if bootstrap.loader_status != VulkanLoaderStatus::Available {
+                return Err(
+                    "passed native smoke report requires successful --probe-loader".to_string(),
+                );
+            }
         }
     }
     Ok(())
 }
 
-fn render_smoke_report_json(options: &SmokeOptions) -> Result<String, String> {
+fn render_smoke_report_json(
+    options: &SmokeOptions,
+    bootstrap: &VulkanBootstrapProbe,
+) -> Result<String, String> {
     let shader_manifest = validate_shader_manifest(&triangle_shader_manifest())
         .map_err(|err| format!("shader manifest: {err}"))?;
     let validation_error_count = options
@@ -218,6 +287,14 @@ fn render_smoke_report_json(options: &SmokeOptions) -> Result<String, String> {
         .map_or_else(|| "null".to_string(), |value| value.to_string());
     let reason = options
         .reason
+        .as_ref()
+        .map_or_else(|| "null".to_string(), |value| json_string(value));
+    let instance_api = bootstrap
+        .instance_api
+        .as_ref()
+        .map_or_else(|| "null".to_string(), |value| json_string(value));
+    let bootstrap_error = bootstrap
+        .error
         .as_ref()
         .map_or_else(|| "null".to_string(), |value| json_string(value));
     Ok(format!(
@@ -232,6 +309,9 @@ fn render_smoke_report_json(options: &SmokeOptions) -> Result<String, String> {
             "  \"resize_count\": {},\n",
             "  \"validation_error_count\": {},\n",
             "  \"shader_manifest_hash\": \"{}\",\n",
+            "  \"vulkan_loader_status\": \"{}\",\n",
+            "  \"vulkan_instance_api\": {},\n",
+            "  \"vulkan_bootstrap_error\": {},\n",
             "  \"reason\": {}\n",
             "}}\n"
         ),
@@ -244,8 +324,18 @@ fn render_smoke_report_json(options: &SmokeOptions) -> Result<String, String> {
         options.resize_count,
         validation_error_count,
         json_escape(&shader_manifest.manifest_hash),
+        bootstrap.loader_status.as_str(),
+        instance_api,
+        bootstrap_error,
         reason
     ))
+}
+
+fn format_api_version(version: u32) -> String {
+    let major = version >> 22;
+    let minor = (version >> 12) & 0x03ff;
+    let patch = version & 0x0fff;
+    format!("{major}.{minor}.{patch}")
 }
 
 fn current_git_commit_sha() -> String {
@@ -300,14 +390,23 @@ mod tests {
             "target/native.json",
             "--status",
             "blocked",
+            "--probe-loader",
             "--reason",
             "runner unavailable",
         ]))?;
 
         assert_eq!(options.platform, SmokePlatform::Linux);
         assert_eq!(options.status, SmokeStatus::Blocked);
+        assert!(options.probe_loader);
         assert_eq!(options.reason.as_deref(), Some("runner unavailable"));
-        validate_smoke_options(&options)
+        validate_smoke_options(
+            &options,
+            &VulkanBootstrapProbe {
+                loader_status: VulkanLoaderStatus::Unavailable,
+                instance_api: None,
+                error: Some("Vulkan loader is unavailable".to_string()),
+            },
+        )
     }
 
     #[test]
@@ -329,13 +428,51 @@ mod tests {
         .expect("options");
 
         assert_eq!(
-            validate_smoke_options(&options),
+            validate_smoke_options(
+                &options,
+                &VulkanBootstrapProbe {
+                    loader_status: VulkanLoaderStatus::Available,
+                    instance_api: Some("1.3.0".to_string()),
+                    error: None,
+                },
+            ),
             Err("passed native smoke report requires --frames >= 300".to_string())
         );
     }
 
     #[test]
-    fn blocked_report_includes_shader_manifest_hash() -> Result<(), String> {
+    fn rejects_passed_without_loader_probe() {
+        let options = SmokeOptions::parse(&strings(&[
+            "--platform",
+            "linux",
+            "--out",
+            "target/native.json",
+            "--status",
+            "passed",
+            "--frames",
+            "300",
+            "--resize-count",
+            "1",
+            "--validation-error-count",
+            "0",
+        ]))
+        .expect("options");
+
+        assert_eq!(
+            validate_smoke_options(
+                &options,
+                &VulkanBootstrapProbe {
+                    loader_status: VulkanLoaderStatus::Skipped,
+                    instance_api: None,
+                    error: None,
+                },
+            ),
+            Err("passed native smoke report requires successful --probe-loader".to_string())
+        );
+    }
+
+    #[test]
+    fn blocked_report_includes_shader_manifest_and_bootstrap_status() -> Result<(), String> {
         let options = SmokeOptions::parse(&strings(&[
             "--platform",
             "macos",
@@ -347,13 +484,30 @@ mod tests {
             "runner unavailable",
         ]))?;
 
-        let json = render_smoke_report_json(&options)?;
+        let json = render_smoke_report_json(
+            &options,
+            &VulkanBootstrapProbe {
+                loader_status: VulkanLoaderStatus::Unavailable,
+                instance_api: None,
+                error: Some("Vulkan loader is unavailable: dlopen failed".to_string()),
+            },
+        )?;
 
         assert!(json.contains("\"schema_version\": \"fparkan-native-smoke-v1\""));
         assert!(json.contains("\"platform\": \"macos\""));
         assert!(json.contains("\"status\": \"blocked\""));
         assert!(json.contains("\"shader_manifest_hash\": \""));
+        assert!(json.contains("\"vulkan_loader_status\": \"unavailable\""));
+        assert!(json.contains("\"vulkan_instance_api\": null"));
+        assert!(json.contains(
+            "\"vulkan_bootstrap_error\": \"Vulkan loader is unavailable: dlopen failed\""
+        ));
         assert!(json.contains("\"reason\": \"runner unavailable\""));
         Ok(())
+    }
+
+    #[test]
+    fn formats_vulkan_api_version() {
+        assert_eq!(format_api_version((1 << 22) | (3 << 12) | 280), "1.3.280");
     }
 }
