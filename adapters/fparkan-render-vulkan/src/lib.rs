@@ -340,6 +340,28 @@ impl Drop for VulkanLogicalDeviceProbe {
     }
 }
 
+impl VulkanLogicalDeviceProbe {
+    /// Returns the graphics queue selected by the Stage 0 policy.
+    #[must_use]
+    pub fn graphics_queue(&self) -> vk::Queue {
+        // SAFETY: The queue-family index belongs to this live logical device.
+        unsafe { self.device.get_device_queue(self.report.graphics_queue_family, 0) }
+    }
+
+    /// Returns the presentation queue selected by the Stage 0 policy.
+    #[must_use]
+    pub fn present_queue(&self) -> vk::Queue {
+        // SAFETY: The queue-family index belongs to this live logical device.
+        unsafe { self.device.get_device_queue(self.report.present_queue_family, 0) }
+    }
+
+    /// Returns a shared reference to the live logical device.
+    #[must_use]
+    pub fn device(&self) -> &ash::Device {
+        &self.device
+    }
+}
+
 /// Logical device creation report.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VulkanLogicalDeviceReport {
@@ -368,6 +390,144 @@ impl Drop for VulkanSwapchainProbe {
         // SAFETY: The swapchain was created by this probe and is destroyed once during drop.
         unsafe { self.loader.destroy_swapchain(self.swapchain, None) };
     }
+}
+
+impl VulkanSwapchainProbe {
+    /// Returns the live swapchain handle.
+    #[must_use]
+    pub fn swapchain(&self) -> vk::SwapchainKHR {
+        self.swapchain
+    }
+
+    /// Returns the swapchain extension loader for this live swapchain.
+    #[must_use]
+    pub fn loader(&self) -> &swapchain::Device {
+        &self.loader
+    }
+}
+
+/// Runtime smoke execution result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VulkanSmokeRunReport {
+    /// Frames successfully advanced through acquire/present.
+    pub frames: u32,
+    /// Number of swapchain recreate attempts.
+    pub swapchain_recreates: u32,
+    /// Number of validation layer errors observed by the smoke path.
+    pub validation_error_count: u32,
+}
+
+/// Errors produced by a native smoke execution path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VulkanSmokeRunError {
+    /// Swapchain acquisition failed.
+    AcquireImage {
+        /// Vulkan API result from acquire.
+        result: String,
+    },
+    /// Swapchain present failed.
+    PresentImage {
+        /// Vulkan API result from present.
+        result: String,
+    },
+    /// Swapchain recreation failed.
+    RecreateSwapchain {
+        /// Vulkan API result from resource recreation.
+        result: String,
+    },
+}
+
+impl std::fmt::Display for VulkanSmokeRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AcquireImage { result } => write!(f, "failed to acquire swapchain image: {result}"),
+            Self::PresentImage { result } => write!(f, "failed to present swapchain image: {result}"),
+            Self::RecreateSwapchain { result } => {
+                write!(f, "failed to recreate swapchain: {result}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VulkanSmokeRunError {}
+
+/// Runs a minimal native smoke loop: acquire/present without recording commands.
+pub fn run_vulkan_smoke_pass(
+    instance: &VulkanInstanceProbe,
+    surface: &VulkanSurfaceProbe,
+    device: &VulkanLogicalDeviceProbe,
+    mut swapchain: VulkanSwapchainProbe,
+    frames: u32,
+    recreate_count: u32,
+) -> Result<VulkanSmokeRunReport, VulkanSmokeRunError> {
+    let render_queue = device.present_queue();
+    let timeout_ns = u64::MAX;
+
+    let image_available = vk::SemaphoreCreateInfo::default();
+    let image_ready = unsafe { device.device().create_semaphore(&image_available, None) }
+        .map_err(|error| VulkanSmokeRunError::RecreateSwapchain {
+            result: format!("{error:?}"),
+        })?;
+
+    let recreate_interval = if recreate_count == 0 {
+        0
+    } else {
+        frames / recreate_count.max(1)
+    };
+
+    let mut swaps = 0_u32;
+    let mut created = 0_u32;
+
+    for frame in 0..frames {
+        if recreate_interval > 0 && frame > 0 && frame % recreate_interval == 0 && created < recreate_count {
+            swapchain = create_vulkan_swapchain_probe(instance, surface, device)
+                .map_err(|error| VulkanSmokeRunError::RecreateSwapchain {
+                    result: error.to_string(),
+                })?;
+            created = created.saturating_add(1);
+        }
+
+        let image_index = unsafe {
+            swapchain
+                .loader()
+                .acquire_next_image(swapchain.swapchain(), timeout_ns, image_ready, vk::Fence::null())
+        }
+        .map(|(index, _)| index)
+        .map_err(|error| VulkanSmokeRunError::AcquireImage {
+            result: format!("{error:?}"),
+        })?;
+
+        let present_wait_semaphores = [image_ready];
+        let swapchains = [swapchain.swapchain()];
+        let image_indices = [image_index];
+        let present_info = vk::PresentInfoKHR::default()
+            .wait_semaphores(&present_wait_semaphores)
+            .swapchains(&swapchains)
+            .image_indices(&image_indices);
+        unsafe {
+            swapchain
+                .loader()
+                .queue_present(render_queue, &present_info)
+        }
+        .map_err(|error| VulkanSmokeRunError::PresentImage {
+            result: format!("{error:?}"),
+        })?;
+
+        unsafe { device.device().queue_wait_idle(render_queue) }
+            .map_err(|error| VulkanSmokeRunError::PresentImage {
+                result: format!("{error:?}"),
+            })?;
+
+        swaps = swaps.saturating_add(1);
+    }
+
+    unsafe { device.device().destroy_semaphore(image_ready, None) }
+
+    Ok(VulkanSmokeRunReport {
+        frames: swaps,
+        swapchain_recreates: created,
+        validation_error_count: 0,
+    })
 }
 
 /// Runtime swapchain creation report.

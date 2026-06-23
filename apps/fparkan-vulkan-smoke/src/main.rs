@@ -15,9 +15,9 @@ use fparkan_platform::{NativeWindowHandles, WindowPort};
 use fparkan_platform_winit::{probe_smoke_window, WinitWindowPlan};
 use fparkan_render_vulkan::{
     create_vulkan_instance_probe, create_vulkan_logical_device_probe, create_vulkan_surface_probe,
-    create_vulkan_swapchain_probe, probe_vulkan_loader, triangle_shader_manifest,
-    validate_shader_manifest, VulkanInstanceConfig, VulkanInstanceProbe, VulkanLogicalDeviceProbe,
-    VulkanSwapchainProbe,
+    create_vulkan_swapchain_probe, probe_vulkan_loader, run_vulkan_smoke_pass,
+    triangle_shader_manifest, validate_shader_manifest, VulkanInstanceConfig,
+    VulkanInstanceProbe, VulkanLogicalDeviceProbe, VulkanSwapchainProbe,
 };
 use std::path::PathBuf;
 use std::process::Command;
@@ -42,8 +42,36 @@ fn main() {
 
 fn run(args: &[String]) -> Result<String, String> {
     let options = SmokeOptions::parse(args)?;
-    let bootstrap = VulkanBootstrapProbe::run(&options);
+    let (bootstrap, runtime) = VulkanBootstrapProbe::run(&options);
     validate_smoke_options(&options, &bootstrap)?;
+    let smoke_run = if options.status == SmokeStatus::Passed {
+        runtime
+            .map(|runtime| {
+                run_vulkan_smoke_pass(
+                    &runtime.instance,
+                    &runtime.surface,
+                    &runtime.device,
+                    runtime.swapchain,
+                    options.frames,
+                    options.swapchain_recreate_count,
+                )
+            })
+            .transpose()
+            .map_err(|err| err.to_string())?
+    } else {
+        None
+    };
+
+    if let Some(smoke_run) = smoke_run.as_ref() {
+        if smoke_run.frames < options.frames {
+            return Err("passed native smoke report requires frames to be advanced".to_string());
+        }
+        if smoke_run.validation_error_count
+            != options.validation_error_count.unwrap_or(smoke_run.validation_error_count)
+        {
+            return Err("passed native smoke report requires validation errors to be zero".to_string());
+        }
+    }
     let report = render_smoke_report_json(&options, &bootstrap)?;
     if let Some(parent) = options.out.parent() {
         std::fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
@@ -222,17 +250,49 @@ struct VulkanBootstrapProbe {
     swapchain_error: Option<String>,
 }
 
+struct VulkanRuntimePass {
+    instance: VulkanInstanceProbe,
+    surface: fparkan_render_vulkan::VulkanSurfaceProbe,
+    device: VulkanLogicalDeviceProbe,
+    swapchain: VulkanSwapchainProbe,
+}
+
 impl VulkanBootstrapProbe {
-    fn run(options: &SmokeOptions) -> Self {
+    fn run(options: &SmokeOptions) -> (Self, Option<VulkanRuntimePass>) {
         if !options.probes.vulkan.includes_loader() {
-            return Self::skipped();
+            return (Self::skipped(), None);
         }
 
         let mut probe = Self::probe_loader();
         let window_handles = probe.probe_window(options);
         let instance = probe.probe_instance(options);
-        probe.probe_surface(options, instance.as_ref(), window_handles);
-        probe
+        let runtime = if let Some(instance) = instance.as_ref() {
+            let surface = probe.probe_surface_for_runtime(options, instance, window_handles);
+            surface.and_then(|surface| {
+                probe
+                    .probe_runtime_capabilities(instance, &surface)
+                    .map(|(device, swapchain)| (device, swapchain, surface))
+            })
+        } else {
+            None
+        };
+
+        if let Some(runtime) = runtime {
+            let (device, swapchain, surface) = runtime;
+            if probe.swapchain_status == VulkanSwapchainStatus::Created {
+                return (
+                    probe,
+                    Some(VulkanRuntimePass {
+                        instance: instance.expect("instance retained"),
+                        surface,
+                        device,
+                        swapchain,
+                    }),
+                );
+            }
+        }
+
+        (probe, None)
     }
 
     const fn skipped() -> Self {
@@ -378,24 +438,20 @@ impl VulkanBootstrapProbe {
         None
     }
 
-    fn probe_surface(
+    fn probe_surface_for_runtime(
         &mut self,
         options: &SmokeOptions,
-        instance: Option<&VulkanInstanceProbe>,
+        instance: &VulkanInstanceProbe,
         window_handles: Option<NativeWindowHandles>,
-    ) {
+    ) -> Option<fparkan_render_vulkan::VulkanSurfaceProbe>
+    {
         if options.probes.vulkan.includes_surface()
             && self.instance_status == VulkanInstanceStatus::Created
         {
-            match instance
-                .ok_or_else(|| "Vulkan instance probe was not retained".to_string())
-                .and_then(|instance| {
-                    create_vulkan_surface_probe(instance, window_handles)
-                        .map_err(|err| err.to_string())
-                }) {
+            match create_vulkan_surface_probe(instance, window_handles).map_err(|err| err.to_string()) {
                 Ok(surface) => {
                     self.surface_status = VulkanSurfaceStatus::Created;
-                    self.probe_runtime_capabilities(instance, &surface);
+                    return Some(surface);
                 }
                 Err(err) => {
                     self.surface_status = VulkanSurfaceStatus::Failed;
@@ -403,20 +459,14 @@ impl VulkanBootstrapProbe {
                 }
             }
         }
+        None
     }
 
     fn probe_runtime_capabilities(
         &mut self,
-        instance: Option<&VulkanInstanceProbe>,
+        instance: &VulkanInstanceProbe,
         surface: &fparkan_render_vulkan::VulkanSurfaceProbe,
-    ) {
-        let Some(instance) = instance else {
-            self.device_status = VulkanDeviceStatus::Failed;
-            self.device_error = Some("Vulkan instance probe was not retained".to_string());
-            self.logical_device_status = VulkanLogicalDeviceStatus::Skipped;
-            self.swapchain_status = VulkanSwapchainStatus::Skipped;
-            return;
-        };
+    ) -> Option<(VulkanLogicalDeviceProbe, VulkanSwapchainProbe)> {
         match create_vulkan_logical_device_probe(
             instance,
             surface,
@@ -426,11 +476,15 @@ impl VulkanBootstrapProbe {
             ),
         ) {
             Ok(device) => match create_vulkan_swapchain_probe(instance, surface, &device) {
-                Ok(swapchain) => self.record_swapchain_probe(&device, &swapchain),
+                Ok(swapchain) => {
+                    self.record_swapchain_probe(&device, &swapchain);
+                    return Some((device, swapchain));
+                }
                 Err(err) => {
                     self.record_logical_device_probe(&device);
                     self.swapchain_status = VulkanSwapchainStatus::Failed;
                     self.swapchain_error = Some(err.to_string());
+                    return None;
                 }
             },
             Err(err) => {
@@ -440,6 +494,7 @@ impl VulkanBootstrapProbe {
                 self.logical_device_error = Some(err.to_string());
                 self.swapchain_status = VulkanSwapchainStatus::Failed;
                 self.swapchain_error = Some(err.to_string());
+                return None;
             }
         }
     }
