@@ -1545,6 +1545,13 @@ fn validate_native_smoke_report(
     expect_string_field(
         platform,
         report,
+        "vulkan_logical_device_status",
+        "created",
+        failures,
+    );
+    expect_string_field(
+        platform,
+        report,
         "vulkan_swapchain_status",
         "planned",
         failures,
@@ -1558,6 +1565,27 @@ fn validate_native_smoke_report(
     expect_nonempty_string(platform, report, "target_triple", failures);
     expect_nonempty_string(platform, report, "shader_manifest_hash", failures);
     expect_nonempty_string(platform, report, "vulkan_device_name", failures);
+    expect_u64_at_least(
+        platform,
+        report,
+        "vulkan_logical_device_enabled_extension_count",
+        1,
+        failures,
+    );
+    expect_u64_at_least(
+        platform,
+        report,
+        "vulkan_logical_device_graphics_queue_family",
+        0,
+        failures,
+    );
+    expect_u64_at_least(
+        platform,
+        report,
+        "vulkan_logical_device_present_queue_family",
+        0,
+        failures,
+    );
     expect_u64_at_least(platform, report, "vulkan_swapchain_width", 1, failures);
     expect_u64_at_least(platform, report, "vulkan_swapchain_height", 1, failures);
     expect_u64_at_least(
@@ -2260,6 +2288,10 @@ mod tests {
                         "vulkan_surface_status": "created",
                         "vulkan_device_status": "selected",
                         "vulkan_device_name": format!("{platform} GPU"),
+                        "vulkan_logical_device_status": "created",
+                        "vulkan_logical_device_graphics_queue_family": 0,
+                        "vulkan_logical_device_present_queue_family": 0,
+                        "vulkan_logical_device_enabled_extension_count": 1,
                         "vulkan_swapchain_status": "planned",
                         "vulkan_swapchain_width": 1280,
                         "vulkan_swapchain_height": 720,

@@ -320,6 +320,37 @@ pub struct VulkanRuntimeCapabilityProbe {
     pub swapchain: VulkanSwapchainPlan,
 }
 
+/// Created Vulkan logical device probe.
+pub struct VulkanLogicalDeviceProbe {
+    device: ash::Device,
+    /// Runtime capability report used for device selection.
+    pub runtime: VulkanRuntimeCapabilityProbe,
+    /// Deterministic logical device creation report.
+    pub report: VulkanLogicalDeviceReport,
+}
+
+impl Drop for VulkanLogicalDeviceProbe {
+    fn drop(&mut self) {
+        // SAFETY: The logical device was created by this probe and is destroyed once during drop.
+        unsafe { self.device.destroy_device(None) };
+    }
+}
+
+/// Logical device creation report.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VulkanLogicalDeviceReport {
+    /// Report schema version.
+    pub schema: u32,
+    /// Selected physical device name.
+    pub device_name: String,
+    /// Graphics queue-family index used by the logical device.
+    pub graphics_queue_family: u32,
+    /// Present queue-family index used by the logical device.
+    pub present_queue_family: u32,
+    /// Enabled device extensions.
+    pub enabled_extensions: Vec<String>,
+}
+
 /// Live Vulkan device/surface capability probe error.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VulkanRuntimeCapabilityError {
@@ -409,6 +440,45 @@ impl std::fmt::Display for VulkanRuntimeCapabilityError {
 
 impl std::error::Error for VulkanRuntimeCapabilityError {}
 
+/// Vulkan logical device creation error.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VulkanLogicalDeviceError {
+    /// Runtime capability probing failed.
+    Runtime(VulkanRuntimeCapabilityError),
+    /// Device extension name contained an interior NUL byte.
+    InvalidExtensionName {
+        /// Invalid extension name.
+        extension: String,
+    },
+    /// Logical device creation failed.
+    CreateFailed {
+        /// Selected device name.
+        device: String,
+        /// Vulkan result.
+        result: String,
+    },
+}
+
+impl std::fmt::Display for VulkanLogicalDeviceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Runtime(error) => write!(f, "{error}"),
+            Self::InvalidExtensionName { extension } => write!(
+                f,
+                "Vulkan device extension name contains an interior NUL byte: {extension:?}"
+            ),
+            Self::CreateFailed { device, result } => {
+                write!(
+                    f,
+                    "Vulkan logical device creation failed for {device}: {result}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for VulkanLogicalDeviceError {}
+
 /// Builds a deterministic Vulkan surface plan from native window handles.
 ///
 /// # Errors
@@ -480,6 +550,78 @@ pub fn probe_vulkan_runtime_capabilities(
     surface: &VulkanSurfaceProbe,
     drawable_extent: (u32, u32),
 ) -> Result<VulkanRuntimeCapabilityProbe, VulkanRuntimeCapabilityError> {
+    let selected = select_live_device_candidate(instance, surface, drawable_extent)?;
+    Ok(selected.runtime)
+}
+
+/// Creates a Vulkan logical device for the selected live surface-capable device.
+///
+/// # Errors
+///
+/// Returns [`VulkanLogicalDeviceError`] when runtime capability probing fails,
+/// device extension names are invalid, or `vkCreateDevice` fails.
+pub fn create_vulkan_logical_device_probe(
+    instance: &VulkanInstanceProbe,
+    surface: &VulkanSurfaceProbe,
+    drawable_extent: (u32, u32),
+) -> Result<VulkanLogicalDeviceProbe, VulkanLogicalDeviceError> {
+    let selected = select_live_device_candidate(instance, surface, drawable_extent)
+        .map_err(VulkanLogicalDeviceError::Runtime)?;
+    let capability = &selected.runtime.capability;
+    let queue_priorities = [1.0_f32];
+    let queue_families = unique_queue_families(
+        capability.graphics_queue_family,
+        capability.present_queue_family,
+    );
+    let queue_infos = queue_families
+        .iter()
+        .map(|queue_family| {
+            vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(*queue_family)
+                .queue_priorities(&queue_priorities)
+        })
+        .collect::<Vec<_>>();
+    let extension_names = device_extension_cstrings(&capability.enabled_extensions)
+        .map_err(|extension| VulkanLogicalDeviceError::InvalidExtensionName { extension })?;
+    let extension_ptrs = extension_names
+        .iter()
+        .map(|extension| extension.as_ptr())
+        .collect::<Vec<_>>();
+    let create_info = vk::DeviceCreateInfo::default()
+        .queue_create_infos(&queue_infos)
+        .enabled_extension_names(&extension_ptrs);
+    // SAFETY: `selected.physical_device` belongs to `instance`; create data lives for the call.
+    let device = unsafe {
+        instance
+            .instance
+            .create_device(selected.physical_device, &create_info, None)
+    }
+    .map_err(|error| VulkanLogicalDeviceError::CreateFailed {
+        device: capability.device_name.clone(),
+        result: format!("{error:?}"),
+    })?;
+    // SAFETY: Queue family indices came from validated live queue families requested above.
+    let _graphics_queue = unsafe { device.get_device_queue(capability.graphics_queue_family, 0) };
+    // SAFETY: Queue family indices came from validated live queue families requested above.
+    let _present_queue = unsafe { device.get_device_queue(capability.present_queue_family, 0) };
+    Ok(VulkanLogicalDeviceProbe {
+        device,
+        report: VulkanLogicalDeviceReport {
+            schema: 1,
+            device_name: capability.device_name.clone(),
+            graphics_queue_family: capability.graphics_queue_family,
+            present_queue_family: capability.present_queue_family,
+            enabled_extensions: capability.enabled_extensions.clone(),
+        },
+        runtime: selected.runtime,
+    })
+}
+
+fn select_live_device_candidate(
+    instance: &VulkanInstanceProbe,
+    surface: &VulkanSurfaceProbe,
+    drawable_extent: (u32, u32),
+) -> Result<SelectedLiveDevice, VulkanRuntimeCapabilityError> {
     let devices = {
         // SAFETY: The Vulkan instance is live for this query and no handles are retained.
         unsafe { instance.instance.enumerate_physical_devices() }.map_err(|error| {
@@ -509,13 +651,22 @@ pub fn probe_vulkan_runtime_capabilities(
         preferred_present_mode: vk::PresentModeKHR::MAILBOX.as_raw(),
     })
     .map_err(VulkanRuntimeCapabilityError::Swapchain)?;
-    Ok(VulkanRuntimeCapabilityProbe {
-        capability: best.capability,
-        swapchain,
+    Ok(SelectedLiveDevice {
+        physical_device: best.physical_device,
+        runtime: VulkanRuntimeCapabilityProbe {
+            capability: best.capability,
+            swapchain,
+        },
     })
 }
 
+struct SelectedLiveDevice {
+    physical_device: vk::PhysicalDevice,
+    runtime: VulkanRuntimeCapabilityProbe,
+}
+
 struct LiveDeviceCandidate {
+    physical_device: vk::PhysicalDevice,
     capability: VulkanCapabilityReport,
     surface_formats: Vec<VulkanSurfaceFormat>,
     present_modes: Vec<i32>,
@@ -587,11 +738,27 @@ fn live_device_candidate(
     };
     let capability = validate_device(&record).map_err(VulkanRuntimeCapabilityError::Capability)?;
     Ok(LiveDeviceCandidate {
+        physical_device: device,
         capability,
         surface_formats,
         present_modes,
         surface_capabilities,
     })
+}
+
+fn unique_queue_families(graphics: u32, present: u32) -> Vec<u32> {
+    if graphics == present {
+        vec![graphics]
+    } else {
+        vec![graphics, present]
+    }
+}
+
+fn device_extension_cstrings(values: &[String]) -> Result<Vec<CString>, String> {
+    values
+        .iter()
+        .map(|extension| CString::new(extension.as_str()).map_err(|_| extension.clone()))
+        .collect()
 }
 
 fn physical_device_name(properties: &vk::PhysicalDeviceProperties, index: usize) -> String {

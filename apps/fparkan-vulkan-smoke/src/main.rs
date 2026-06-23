@@ -14,9 +14,9 @@
 use fparkan_platform::{NativeWindowHandles, WindowPort};
 use fparkan_platform_winit::{probe_smoke_window, WinitWindowPlan};
 use fparkan_render_vulkan::{
-    create_vulkan_instance_probe, create_vulkan_surface_probe, probe_vulkan_loader,
-    probe_vulkan_runtime_capabilities, triangle_shader_manifest, validate_shader_manifest,
-    VulkanInstanceConfig, VulkanInstanceProbe, VulkanRuntimeCapabilityProbe,
+    create_vulkan_instance_probe, create_vulkan_logical_device_probe, create_vulkan_surface_probe,
+    probe_vulkan_loader, triangle_shader_manifest, validate_shader_manifest, VulkanInstanceConfig,
+    VulkanInstanceProbe, VulkanLogicalDeviceProbe,
 };
 use std::path::PathBuf;
 use std::process::Command;
@@ -209,6 +209,11 @@ struct VulkanBootstrapProbe {
     device_status: VulkanDeviceStatus,
     device_name: Option<String>,
     device_error: Option<String>,
+    logical_device_status: VulkanLogicalDeviceStatus,
+    logical_device_graphics_queue_family: Option<u32>,
+    logical_device_present_queue_family: Option<u32>,
+    logical_device_enabled_extension_count: Option<u32>,
+    logical_device_error: Option<String>,
     swapchain_status: VulkanSwapchainStatus,
     swapchain_width: Option<u32>,
     swapchain_height: Option<u32>,
@@ -246,6 +251,11 @@ impl VulkanBootstrapProbe {
             device_status: VulkanDeviceStatus::Skipped,
             device_name: None,
             device_error: None,
+            logical_device_status: VulkanLogicalDeviceStatus::Skipped,
+            logical_device_graphics_queue_family: None,
+            logical_device_present_queue_family: None,
+            logical_device_enabled_extension_count: None,
+            logical_device_error: None,
             swapchain_status: VulkanSwapchainStatus::Skipped,
             swapchain_width: None,
             swapchain_height: None,
@@ -272,6 +282,11 @@ impl VulkanBootstrapProbe {
                 device_status: VulkanDeviceStatus::Skipped,
                 device_name: None,
                 device_error: None,
+                logical_device_status: VulkanLogicalDeviceStatus::Skipped,
+                logical_device_graphics_queue_family: None,
+                logical_device_present_queue_family: None,
+                logical_device_enabled_extension_count: None,
+                logical_device_error: None,
                 swapchain_status: VulkanSwapchainStatus::Skipped,
                 swapchain_width: None,
                 swapchain_height: None,
@@ -294,6 +309,11 @@ impl VulkanBootstrapProbe {
                 device_status: VulkanDeviceStatus::Skipped,
                 device_name: None,
                 device_error: None,
+                logical_device_status: VulkanLogicalDeviceStatus::Skipped,
+                logical_device_graphics_queue_family: None,
+                logical_device_present_queue_family: None,
+                logical_device_enabled_extension_count: None,
+                logical_device_error: None,
                 swapchain_status: VulkanSwapchainStatus::Skipped,
                 swapchain_width: None,
                 swapchain_height: None,
@@ -392,10 +412,11 @@ impl VulkanBootstrapProbe {
         let Some(instance) = instance else {
             self.device_status = VulkanDeviceStatus::Failed;
             self.device_error = Some("Vulkan instance probe was not retained".to_string());
+            self.logical_device_status = VulkanLogicalDeviceStatus::Skipped;
             self.swapchain_status = VulkanSwapchainStatus::Skipped;
             return;
         };
-        match probe_vulkan_runtime_capabilities(
+        match create_vulkan_logical_device_probe(
             instance,
             surface,
             (
@@ -403,23 +424,36 @@ impl VulkanBootstrapProbe {
                 self.window_height.unwrap_or(1).max(1),
             ),
         ) {
-            Ok(runtime) => self.record_runtime_capabilities(runtime),
+            Ok(device) => self.record_logical_device_probe(&device),
             Err(err) => {
                 self.device_status = VulkanDeviceStatus::Failed;
                 self.device_error = Some(err.to_string());
+                self.logical_device_status = VulkanLogicalDeviceStatus::Failed;
+                self.logical_device_error = Some(err.to_string());
                 self.swapchain_status = VulkanSwapchainStatus::Failed;
                 self.swapchain_error = Some(err.to_string());
             }
         }
     }
 
-    fn record_runtime_capabilities(&mut self, runtime: VulkanRuntimeCapabilityProbe) {
+    fn record_logical_device_probe(&mut self, device: &VulkanLogicalDeviceProbe) {
         self.device_status = VulkanDeviceStatus::Selected;
-        self.device_name = Some(runtime.capability.device_name);
+        self.device_name = Some(device.runtime.capability.device_name.clone());
+        self.logical_device_status = VulkanLogicalDeviceStatus::Created;
+        self.logical_device_graphics_queue_family = Some(device.report.graphics_queue_family);
+        self.logical_device_present_queue_family = Some(device.report.present_queue_family);
+        self.logical_device_enabled_extension_count = Some(
+            device
+                .report
+                .enabled_extensions
+                .len()
+                .try_into()
+                .unwrap_or(u32::MAX),
+        );
         self.swapchain_status = VulkanSwapchainStatus::Planned;
-        self.swapchain_width = Some(runtime.swapchain.extent.0);
-        self.swapchain_height = Some(runtime.swapchain.extent.1);
-        self.swapchain_image_count = Some(runtime.swapchain.image_count);
+        self.swapchain_width = Some(device.runtime.swapchain.extent.0);
+        self.swapchain_height = Some(device.runtime.swapchain.extent.1);
+        self.swapchain_image_count = Some(device.runtime.swapchain.image_count);
     }
 }
 
@@ -505,6 +539,23 @@ impl VulkanDeviceStatus {
         match self {
             Self::Skipped => "skipped",
             Self::Selected => "selected",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VulkanLogicalDeviceStatus {
+    Skipped,
+    Created,
+    Failed,
+}
+
+impl VulkanLogicalDeviceStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Skipped => "skipped",
+            Self::Created => "created",
             Self::Failed => "failed",
         }
     }
@@ -635,6 +686,11 @@ fn validate_smoke_options(
                     "passed native smoke report requires selected Vulkan device".to_string()
                 );
             }
+            if bootstrap.logical_device_status != VulkanLogicalDeviceStatus::Created {
+                return Err(
+                    "passed native smoke report requires created Vulkan logical device".to_string(),
+                );
+            }
             if bootstrap.swapchain_status != VulkanSwapchainStatus::Planned {
                 return Err(
                     "passed native smoke report requires planned Vulkan swapchain".to_string(),
@@ -651,7 +707,17 @@ fn render_smoke_report_json(
 ) -> Result<String, String> {
     let shader_manifest = validate_shader_manifest(&triangle_shader_manifest())
         .map_err(|err| format!("shader manifest: {err}"))?;
-    Ok(render_json_object(&[
+    let mut fields = base_smoke_report_fields(options, &shader_manifest.manifest_hash);
+    fields.extend(vulkan_bootstrap_fields(bootstrap));
+    fields.push(("reason", optional_string(options.reason.as_deref())));
+    Ok(render_json_object(&fields))
+}
+
+fn base_smoke_report_fields(
+    options: &SmokeOptions,
+    shader_manifest_hash: &str,
+) -> Vec<(&'static str, String)> {
+    vec![
         ("schema_version", json_string(SCHEMA_VERSION)),
         ("commit_sha", json_string(&current_git_commit_sha())),
         ("rust_toolchain", json_string(RUST_TOOLCHAIN)),
@@ -668,10 +734,12 @@ fn render_smoke_report_json(
             "validation_error_count",
             optional_u32(options.validation_error_count),
         ),
-        (
-            "shader_manifest_hash",
-            json_string(&shader_manifest.manifest_hash),
-        ),
+        ("shader_manifest_hash", json_string(shader_manifest_hash)),
+    ]
+}
+
+fn vulkan_bootstrap_fields(bootstrap: &VulkanBootstrapProbe) -> Vec<(&'static str, String)> {
+    vec![
         (
             "vulkan_loader_status",
             json_string(bootstrap.loader_status.as_str()),
@@ -727,6 +795,26 @@ fn render_smoke_report_json(
             optional_string(bootstrap.device_error.as_deref()),
         ),
         (
+            "vulkan_logical_device_status",
+            json_string(bootstrap.logical_device_status.as_str()),
+        ),
+        (
+            "vulkan_logical_device_graphics_queue_family",
+            optional_u32(bootstrap.logical_device_graphics_queue_family),
+        ),
+        (
+            "vulkan_logical_device_present_queue_family",
+            optional_u32(bootstrap.logical_device_present_queue_family),
+        ),
+        (
+            "vulkan_logical_device_enabled_extension_count",
+            optional_u32(bootstrap.logical_device_enabled_extension_count),
+        ),
+        (
+            "vulkan_logical_device_error",
+            optional_string(bootstrap.logical_device_error.as_deref()),
+        ),
+        (
             "vulkan_swapchain_status",
             json_string(bootstrap.swapchain_status.as_str()),
         ),
@@ -746,8 +834,7 @@ fn render_smoke_report_json(
             "vulkan_swapchain_error",
             optional_string(bootstrap.swapchain_error.as_deref()),
         ),
-        ("reason", optional_string(options.reason.as_deref())),
-    ]))
+    ]
 }
 
 fn render_json_object(fields: &[(&str, String)]) -> String {
@@ -861,6 +948,11 @@ mod tests {
             device_status: VulkanDeviceStatus::Selected,
             device_name: Some("Stage 0 GPU".to_string()),
             device_error: None,
+            logical_device_status: VulkanLogicalDeviceStatus::Created,
+            logical_device_graphics_queue_family: Some(0),
+            logical_device_present_queue_family: Some(0),
+            logical_device_enabled_extension_count: Some(1),
+            logical_device_error: None,
             swapchain_status: VulkanSwapchainStatus::Planned,
             swapchain_width: Some(1280),
             swapchain_height: Some(720),
@@ -1282,6 +1374,40 @@ mod tests {
     }
 
     #[test]
+    fn rejects_passed_without_created_logical_device() {
+        let options = SmokeOptions::parse(&strings(&[
+            "--platform",
+            "linux",
+            "--out",
+            "target/native.json",
+            "--status",
+            "passed",
+            "--frames",
+            "300",
+            "--resize-count",
+            "1",
+            "--swapchain-recreate-count",
+            "1",
+            "--validation-error-count",
+            "0",
+            "--probe-surface",
+        ]))
+        .expect("options");
+
+        assert_eq!(
+            validate_smoke_options(
+                &options,
+                &VulkanBootstrapProbe {
+                    logical_device_status: VulkanLogicalDeviceStatus::Failed,
+                    logical_device_error: Some("Vulkan logical device creation failed".to_string()),
+                    ..probe_fixture()
+                },
+            ),
+            Err("passed native smoke report requires created Vulkan logical device".to_string())
+        );
+    }
+
+    #[test]
     fn blocked_report_includes_shader_manifest_and_bootstrap_status() -> Result<(), String> {
         let options = SmokeOptions::parse(&strings(&[
             "--platform",
@@ -1315,6 +1441,11 @@ mod tests {
                 device_status: VulkanDeviceStatus::Skipped,
                 device_name: None,
                 device_error: None,
+                logical_device_status: VulkanLogicalDeviceStatus::Skipped,
+                logical_device_graphics_queue_family: None,
+                logical_device_present_queue_family: None,
+                logical_device_enabled_extension_count: None,
+                logical_device_error: None,
                 swapchain_status: VulkanSwapchainStatus::Skipped,
                 swapchain_width: None,
                 swapchain_height: None,
@@ -1346,6 +1477,8 @@ mod tests {
         ));
         assert!(json.contains("\"vulkan_device_status\": \"skipped\""));
         assert!(json.contains("\"vulkan_device_name\": null"));
+        assert!(json.contains("\"vulkan_logical_device_status\": \"skipped\""));
+        assert!(json.contains("\"vulkan_logical_device_graphics_queue_family\": null"));
         assert!(json.contains("\"vulkan_swapchain_status\": \"skipped\""));
         assert!(json.contains("\"vulkan_swapchain_width\": null"));
         assert!(json.contains("\"reason\": \"runner unavailable\""));
