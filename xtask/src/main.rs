@@ -37,11 +37,24 @@ const PART2_ROOT_ENV: &str = "FPARKAN_CORPUS_PART2_ROOT";
 const CI_ACCEPTANCE_ROADMAP: &str = "fixtures/acceptance/stage_0_2_roadmap.md";
 const CI_ACCEPTANCE_COVERAGE: &str = "fixtures/acceptance/coverage.tsv";
 const CI_ACCEPTANCE_REPORT: &str = "target/fparkan/acceptance/stage-0-2-audit.json";
+const STAGE_PACKAGE_MANIFEST: &str = "fixtures/acceptance/stage_packages.toml";
 const REQUIRED_NATIVE_SMOKE_PLATFORMS: &[&str] = &["linux", "macos", "windows"];
 const APPROVED_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const SUPPLY_CHAIN_BANNED_PACKAGES: &[&str] = &["native-tls", "openssl", "openssl-sys"];
 const PINNED_RUST_TOOLCHAIN: &str = "1.87.0";
 const WORKSPACE_MSRV: &str = "1.87";
+const ALLOW_SUPPLY_CHAIN_FALLBACK_ENV: &str = "FPARKAN_ALLOW_SUPPLY_CHAIN_FALLBACK";
+
+fn workspace_root_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")))
+        .to_path_buf()
+}
+
+fn workspace_relative_path(path: &str) -> PathBuf {
+    workspace_root_path().join(path)
+}
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -180,13 +193,27 @@ fn run_cargo_fmt_check() -> Result<(), String> {
 
 fn run_cargo_deny() -> Result<(), String> {
     let cargo_deny = std::env::var_os("CARGO_DENY").unwrap_or_else(|| "cargo-deny".into());
-    let available = Command::new(&cargo_deny).arg("--version").status();
-    match available {
-        Ok(status) if status.success() => {}
-        Ok(_) | Err(_) => {
-            eprintln!("cargo-deny is unavailable; running built-in supply-chain policy fallback");
-            return run_builtin_supply_chain_policy(Path::new("."));
-        }
+    let version_output = Command::new(&cargo_deny)
+        .arg("--version")
+        .output()
+        .map_err(|err| {
+            format!(
+                "cargo-deny is required; install cargo-deny {PINNED_CARGO_DENY_VERSION} or set {ALLOW_SUPPLY_CHAIN_FALLBACK_ENV}=1 for the built-in fallback: {err}"
+            )
+        })?;
+    if !version_output.status.success() {
+        return handle_cargo_deny_fallback(format!(
+            "cargo-deny --version exited with {}",
+            version_output.status
+        ));
+    }
+    let version_text = String::from_utf8(version_output.stdout)
+        .map_err(|err| format!("cargo-deny --version produced invalid UTF-8: {err}"))?;
+    if !version_text.contains(PINNED_CARGO_DENY_VERSION) {
+        return handle_cargo_deny_fallback(format!(
+            "cargo-deny version mismatch: expected {PINNED_CARGO_DENY_VERSION}, found {}",
+            version_text.trim()
+        ));
     }
 
     let status = Command::new(cargo_deny)
@@ -205,6 +232,21 @@ fn run_cargo_deny() -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("cargo-deny exited with {status}"))
+    }
+}
+
+const PINNED_CARGO_DENY_VERSION: &str = "0.19.9";
+
+fn handle_cargo_deny_fallback(reason: String) -> Result<(), String> {
+    if std::env::var_os(ALLOW_SUPPLY_CHAIN_FALLBACK_ENV).is_some() {
+        eprintln!(
+            "{reason}; running built-in supply-chain policy fallback because {ALLOW_SUPPLY_CHAIN_FALLBACK_ENV} is set"
+        );
+        run_builtin_supply_chain_policy(Path::new("."))
+    } else {
+        Err(format!(
+            "{reason}; install cargo-deny {PINNED_CARGO_DENY_VERSION} or explicitly opt into the fallback with {ALLOW_SUPPLY_CHAIN_FALLBACK_ENV}=1"
+        ))
     }
 }
 
@@ -473,18 +515,25 @@ fn validate_cargo_metadata(root: &Path, failures: &mut Vec<String>) -> Result<()
     if !manifest.exists() {
         return Ok(());
     }
-    let metadata = MetadataCommand::new()
-        .manifest_path(&manifest)
-        .no_deps()
-        .other_options(["--offline".to_string(), "--locked".to_string()])
-        .exec()
-        .map_err(|error| format!("{}: cargo metadata failed: {}", manifest.display(), error))?;
+    let metadata = workspace_metadata(root)?;
     if metadata.workspace_members.is_empty() {
         failures.push(format!(
             "{}: cargo metadata produced no workspace members",
             manifest.display()
         ));
         return Ok(());
+    }
+    let stage_manifest_path = root.join(STAGE_PACKAGE_MANIFEST);
+    let stage_manifest = load_stage_package_manifest(&stage_manifest_path)?;
+    let workspace_packages = metadata
+        .workspace_packages()
+        .iter()
+        .map(|package| package.name.to_string())
+        .collect::<BTreeSet<_>>();
+    if let Err(err) =
+        validate_stage_package_entries(&stage_manifest, &workspace_packages, &stage_manifest_path)
+    {
+        failures.push(err);
     }
     Ok(())
 }
@@ -1185,40 +1234,6 @@ enum Stage {
     Number(u8),
 }
 
-const ALL_WORKSPACE_PACKAGES: &[&str] = &[
-    "fparkan-animation",
-    "fparkan-assets",
-    "fparkan-binary",
-    "fparkan-corpus",
-    "fparkan-diagnostics",
-    "fparkan-fx",
-    "fparkan-material",
-    "fparkan-mission-format",
-    "fparkan-msh",
-    "fparkan-nres",
-    "fparkan-path",
-    "fparkan-platform",
-    "fparkan-prototype",
-    "fparkan-render",
-    "fparkan-resource",
-    "fparkan-rsli",
-    "fparkan-runtime",
-    "fparkan-terrain",
-    "fparkan-terrain-format",
-    "fparkan-test-support",
-    "fparkan-texm",
-    "fparkan-vfs",
-    "fparkan-world",
-    "fparkan-platform-winit",
-    "fparkan-render-vulkan",
-    "fparkan-cli",
-    "fparkan-game",
-    "fparkan-headless",
-    "fparkan-vulkan-smoke",
-    "fparkan-viewer",
-    "xtask",
-];
-
 impl Stage {
     fn parse(value: &str) -> Result<Self, String> {
         if value == "all" {
@@ -1390,9 +1405,10 @@ fn parse_acceptance_options(args: &[String]) -> Result<AcceptanceOptions, String
 }
 
 fn parse_audit_options(args: &[String]) -> Result<AuditOptions, String> {
-    let mut roadmap = PathBuf::from("FPARKAN_ARCHITECTURE_ROADMAP_STAGES_0_5.md");
-    let mut coverage = PathBuf::from("fixtures/acceptance/coverage.tsv");
-    let mut out = PathBuf::from("target")
+    let mut roadmap = workspace_relative_path(CI_ACCEPTANCE_ROADMAP);
+    let mut coverage = workspace_relative_path(CI_ACCEPTANCE_COVERAGE);
+    let mut out = workspace_root_path()
+        .join("target")
         .join("fparkan")
         .join("reports")
         .join("acceptance")
@@ -1478,24 +1494,54 @@ fn read_native_smoke_reports(dir: &Path) -> Result<BTreeMap<String, serde_json::
             .map_err(|err| format!("{}: {err}", path.display()))?;
         let platform = json_string_field(&json, "platform")
             .map_err(|err| format!("{}: {err}", path.display()))?;
-        reports.insert(platform.to_string(), json);
+        let platform = platform.to_string();
+        if reports.insert(platform.clone(), json).is_some() {
+            return Err(format!(
+                "{}: duplicate native smoke report for platform {platform}",
+                path.display()
+            ));
+        }
     }
     Ok(reports)
 }
 
 fn audit_native_smoke_reports(reports: &BTreeMap<String, serde_json::Value>) -> Vec<String> {
     let mut failures = Vec::new();
+    let mut commit_shas = BTreeSet::new();
+    let mut rust_toolchains = BTreeSet::new();
     for platform in REQUIRED_NATIVE_SMOKE_PLATFORMS {
         let Some(report) = reports.get(*platform) else {
             failures.push(format!("{platform}: missing native smoke report"));
             continue;
         };
         validate_native_smoke_report(platform, report, &mut failures);
+        if let Ok(commit_sha) = json_string_field(report, "commit_sha") {
+            if commit_sha == "unknown" {
+                failures.push(format!("{platform}: commit_sha must not be \"unknown\""));
+            } else {
+                commit_shas.insert(commit_sha.to_string());
+            }
+        }
+        if let Ok(toolchain) = json_string_field(report, "rust_toolchain") {
+            rust_toolchains.insert(toolchain.to_string());
+        }
     }
     for platform in reports.keys() {
         if !REQUIRED_NATIVE_SMOKE_PLATFORMS.contains(&platform.as_str()) {
             failures.push(format!("{platform}: unexpected native smoke platform"));
         }
+    }
+    if commit_shas.len() > 1 {
+        failures.push(format!(
+            "native smoke reports disagree on commit_sha: {}",
+            commit_shas.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if rust_toolchains.len() > 1 {
+        failures.push(format!(
+            "native smoke reports disagree on rust_toolchain: {}",
+            rust_toolchains.into_iter().collect::<Vec<_>>().join(", ")
+        ));
     }
     failures
 }
@@ -1561,7 +1607,14 @@ fn validate_native_smoke_report(
     expect_u64_at_least(platform, report, "swapchain_recreate_count", 1, failures);
     expect_u64_field(platform, report, "validation_error_count", 0, failures);
     expect_nonempty_string(platform, report, "commit_sha", failures);
-    expect_nonempty_string(platform, report, "rust_toolchain", failures);
+    expect_string_field(
+        platform,
+        report,
+        "rust_toolchain",
+        &measured_rust_toolchain_version(),
+        failures,
+    );
+    expect_string_field(platform, report, "platform", platform, failures);
     expect_nonempty_string(platform, report, "target_triple", failures);
     expect_nonempty_string(platform, report, "shader_manifest_hash", failures);
     expect_nonempty_string(platform, report, "vulkan_device_name", failures);
@@ -1741,13 +1794,20 @@ impl AcceptanceAudit {
         self.partial
             .iter()
             .chain(&self.blocked)
+            .chain(&self.omitted)
             .chain(&self.missing)
             .cloned()
             .collect()
     }
 
     fn strict_failures(&self) -> Vec<String> {
-        self.partial.iter().chain(&self.missing).cloned().collect()
+        self.partial
+            .iter()
+            .chain(&self.blocked)
+            .chain(&self.omitted)
+            .chain(&self.missing)
+            .cloned()
+            .collect()
     }
 }
 
@@ -1855,7 +1915,7 @@ fn build_acceptance_audit(
 
     AcceptanceAudit {
         commit_sha: current_git_commit_sha(),
-        rust_toolchain: PINNED_RUST_TOOLCHAIN.to_string(),
+        rust_toolchain: measured_rust_toolchain_version(),
         msrv: WORKSPACE_MSRV.to_string(),
         required_total: required.len(),
         covered,
@@ -1930,6 +1990,23 @@ fn current_git_commit_sha() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+fn measured_rust_toolchain_version() -> String {
+    Command::new("rustc")
+        .args(["-Vv"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|stdout| {
+            stdout.lines().find_map(|line| {
+                line.strip_prefix("release:")
+                    .map(str::trim)
+                    .map(ToString::to_string)
+            })
+        })
+        .unwrap_or_else(|| PINNED_RUST_TOOLCHAIN.to_string())
+}
+
 fn render_string_usize_map(values: &BTreeMap<String, usize>) -> String {
     let pairs = values
         .iter()
@@ -1994,6 +2071,7 @@ fn run_acceptance_report(options: &AcceptanceOptions) -> Result<(), String> {
 
 fn render_acceptance_report(options: &AcceptanceOptions) -> String {
     let packages = stage_report_packages(options.stage)
+        .unwrap_or_default()
         .into_iter()
         .map(|package| format!("    \"{package}\""))
         .collect::<Vec<_>>()
@@ -2023,10 +2101,12 @@ fn render_acceptance_report(options: &AcceptanceOptions) -> String {
     )
 }
 
-fn stage_report_packages(stage: Stage) -> Vec<&'static str> {
+fn stage_report_packages(stage: Stage) -> Result<Vec<String>, String> {
+    let workspace_root = workspace_root_path();
     match stage {
-        Stage::All => ALL_WORKSPACE_PACKAGES.to_vec(),
-        Stage::Number(number) => stage_packages(number).unwrap_or(&[]).to_vec(),
+        Stage::All => workspace_package_names(&workspace_root)
+            .map(|packages| packages.into_iter().collect::<Vec<_>>()),
+        Stage::Number(number) => stage_packages(number),
     }
 }
 
@@ -2052,12 +2132,19 @@ fn run_stage_tests(
         }
         Stage::Number(number) => {
             for package in stage_packages(number)? {
-                let mut args = vec!["test", "-p", package, "--locked", "--offline"];
-                args.extend(suffix.iter().copied());
+                let mut args = vec![
+                    "test".to_string(),
+                    "-p".to_string(),
+                    package,
+                    "--locked".to_string(),
+                    "--offline".to_string(),
+                ];
+                args.extend(suffix.iter().map(|value| (*value).to_string()));
                 if let Some(envs) = envs {
-                    cargo_with_env(&args, &envs)?;
+                    let borrowed = args.iter().map(String::as_str).collect::<Vec<_>>();
+                    cargo_with_env(&borrowed, &envs)?;
                 } else {
-                    cargo(&args)?;
+                    cargo_owned(&args)?;
                 }
             }
             Ok(())
@@ -2065,43 +2152,108 @@ fn run_stage_tests(
     }
 }
 
-fn stage_packages(stage: u8) -> Result<&'static [&'static str], String> {
-    match stage {
-        0 => Ok(&[
-            "fparkan-corpus",
-            "fparkan-diagnostics",
-            "fparkan-test-support",
-        ]),
-        1 => Ok(&[
-            "fparkan-binary",
-            "fparkan-path",
-            "fparkan-nres",
-            "fparkan-rsli",
-            "fparkan-resource",
-            "fparkan-vfs",
-        ]),
-        2 => Ok(&["fparkan-prototype"]),
-        3 => Ok(&[
-            "fparkan-msh",
-            "fparkan-material",
-            "fparkan-texm",
-            "fparkan-assets",
-            "fparkan-render",
-            "fparkan-viewer",
-        ]),
-        4 => Ok(&["fparkan-animation", "fparkan-fx"]),
-        5 => Ok(&[
-            "fparkan-terrain-format",
-            "fparkan-terrain",
-            "fparkan-mission-format",
-            "fparkan-world",
-            "fparkan-runtime",
-            "fparkan-headless",
-            "fparkan-game",
-            "fparkan-vulkan-smoke",
-        ]),
-        _ => Err(format!("stage out of range: {stage}")),
+fn stage_packages(stage: u8) -> Result<Vec<String>, String> {
+    let manifest_path = workspace_relative_path(STAGE_PACKAGE_MANIFEST);
+    let manifest = load_stage_package_manifest(&manifest_path)?;
+    let packages = manifest
+        .stages
+        .get(&stage.to_string())
+        .cloned()
+        .ok_or_else(|| format!("stage out of range: {stage}"))?;
+    validate_stage_package_entries(
+        &manifest,
+        &workspace_package_names(&workspace_root_path())?,
+        &manifest_path,
+    )?;
+    Ok(packages)
+}
+
+fn workspace_package_names(root: &Path) -> Result<BTreeSet<String>, String> {
+    let metadata = workspace_metadata(root)?;
+    Ok(metadata
+        .workspace_packages()
+        .iter()
+        .map(|package| package.name.to_string())
+        .collect())
+}
+
+fn workspace_metadata(root: &Path) -> Result<cargo_metadata::Metadata, String> {
+    let manifest = root.join("Cargo.toml");
+    MetadataCommand::new()
+        .manifest_path(&manifest)
+        .no_deps()
+        .other_options(["--offline".to_string(), "--locked".to_string()])
+        .exec()
+        .map_err(|error| format!("{}: cargo metadata failed: {}", manifest.display(), error))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagePackageManifest {
+    schema: Option<u8>,
+    stages: BTreeMap<String, Vec<String>>,
+}
+
+fn load_stage_package_manifest(path: &Path) -> Result<StagePackageManifest, String> {
+    let text = fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    let manifest = toml::from_str::<StagePackageManifest>(&text)
+        .map_err(|err| format!("failed to parse {}: {err}", path.display()))?;
+    if manifest.schema != Some(1) {
+        return Err(format!(
+            "{}: unsupported stage package manifest schema {:?} (expected 1)",
+            path.display(),
+            manifest.schema
+        ));
     }
+    Ok(manifest)
+}
+
+fn validate_stage_package_entries(
+    manifest: &StagePackageManifest,
+    workspace_packages: &BTreeSet<String>,
+    path: &Path,
+) -> Result<(), String> {
+    let required_stages = (0_u8..=5_u8)
+        .map(|stage| stage.to_string())
+        .collect::<BTreeSet<_>>();
+    let declared_stages = manifest.stages.keys().cloned().collect::<BTreeSet<_>>();
+    if declared_stages != required_stages {
+        return Err(format!(
+            "{}: stage package manifest must declare stages 0 through 5 exactly once",
+            path.display()
+        ));
+    }
+
+    let mut assigned = BTreeSet::new();
+    for (stage, packages) in &manifest.stages {
+        for package in packages {
+            if !workspace_packages.contains(package) {
+                return Err(format!(
+                    "{}: stage {stage} references unknown package {package}",
+                    path.display()
+                ));
+            }
+            if !assigned.insert(package.clone()) {
+                return Err(format!(
+                    "{}: package {package} is assigned to multiple stages",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    let missing = workspace_packages
+        .difference(&assigned)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "{}: stage package manifest is missing workspace packages: {}",
+            path.display(),
+            missing.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2233,6 +2385,10 @@ mod tests {
         assert_eq!(audit.missing, ["S0-ARCH-002"]);
         assert_eq!(audit.unknown_coverage, ["S9-UNKNOWN-001"]);
         assert_eq!(audit.by_stage.get("S0"), Some(&2));
+        assert_eq!(
+            audit.strict_failures(),
+            strings(&["L5-RG40-001", "L3-DEVICE-001", "S0-ARCH-002"])
+        );
     }
 
     #[test]
@@ -2273,7 +2429,7 @@ mod tests {
                     serde_json::json!({
                         "schema_version": "fparkan-native-smoke-v1",
                         "commit_sha": "0123456789abcdef0123456789abcdef01234567",
-                        "rust_toolchain": "1.87.0",
+                        "rust_toolchain": measured_rust_toolchain_version(),
                         "target_triple": format!("{platform}-test-target"),
                         "platform": platform,
                         "status": "passed",
@@ -2311,7 +2467,7 @@ mod tests {
             serde_json::json!({
                 "schema_version": "fparkan-native-smoke-v1",
                 "commit_sha": "0123456789abcdef0123456789abcdef01234567",
-                "rust_toolchain": "1.87.0",
+                "rust_toolchain": measured_rust_toolchain_version(),
                 "target_triple": "aarch64-apple-darwin",
                 "platform": "macos",
                 "status": "blocked",
@@ -2412,11 +2568,29 @@ mod tests {
 
     #[test]
     fn maps_stage_packages() {
-        assert!(stage_packages(3).is_ok_and(|packages| packages.contains(&"fparkan-assets")));
-        assert!(stage_packages(3).is_ok_and(|packages| packages.contains(&"fparkan-viewer")));
-        assert!(stage_packages(5).is_ok_and(|packages| packages.contains(&"fparkan-runtime")));
-        assert!(stage_packages(5).is_ok_and(|packages| packages.contains(&"fparkan-game")));
+        assert!(stage_packages(0)
+            .is_ok_and(|packages| packages.contains(&"fparkan-platform".to_string())));
+        assert!(stage_packages(0)
+            .is_ok_and(|packages| packages.contains(&"fparkan-vulkan-smoke".to_string())));
+        assert!(stage_packages(1)
+            .is_ok_and(|packages| packages.contains(&"fparkan-inspection".to_string())));
+        assert!(stage_packages(5)
+            .is_ok_and(|packages| packages.contains(&"fparkan-runtime".to_string())));
+        assert!(
+            stage_packages(5).is_ok_and(|packages| packages.contains(&"fparkan-game".to_string()))
+        );
         assert_eq!(stage_packages(9), Err("stage out of range: 9".to_string()));
+    }
+
+    #[test]
+    fn stage_package_manifest_covers_workspace_once() -> Result<(), String> {
+        let manifest_path = workspace_relative_path(STAGE_PACKAGE_MANIFEST);
+        let manifest = load_stage_package_manifest(&manifest_path)?;
+        let workspace_packages = workspace_package_names(&workspace_root_path())?;
+
+        validate_stage_package_entries(&manifest, &workspace_packages, &manifest_path)?;
+
+        Ok(())
     }
 
     #[test]

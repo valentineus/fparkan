@@ -345,14 +345,20 @@ impl VulkanLogicalDeviceProbe {
     #[must_use]
     pub fn graphics_queue(&self) -> vk::Queue {
         // SAFETY: The queue-family index belongs to this live logical device.
-        unsafe { self.device.get_device_queue(self.report.graphics_queue_family, 0) }
+        unsafe {
+            self.device
+                .get_device_queue(self.report.graphics_queue_family, 0)
+        }
     }
 
     /// Returns the presentation queue selected by the Stage 0 policy.
     #[must_use]
     pub fn present_queue(&self) -> vk::Queue {
         // SAFETY: The queue-family index belongs to this live logical device.
-        unsafe { self.device.get_device_queue(self.report.present_queue_family, 0) }
+        unsafe {
+            self.device
+                .get_device_queue(self.report.present_queue_family, 0)
+        }
     }
 
     /// Returns a shared reference to the live logical device.
@@ -440,8 +446,12 @@ pub enum VulkanSmokeRunError {
 impl std::fmt::Display for VulkanSmokeRunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::AcquireImage { result } => write!(f, "failed to acquire swapchain image: {result}"),
-            Self::PresentImage { result } => write!(f, "failed to present swapchain image: {result}"),
+            Self::AcquireImage { result } => {
+                write!(f, "failed to acquire swapchain image: {result}")
+            }
+            Self::PresentImage { result } => {
+                write!(f, "failed to present swapchain image: {result}")
+            }
             Self::RecreateSwapchain { result } => {
                 write!(f, "failed to recreate swapchain: {result}")
             }
@@ -464,9 +474,11 @@ pub fn run_vulkan_smoke_pass(
     let timeout_ns = u64::MAX;
 
     let image_available = vk::SemaphoreCreateInfo::default();
-    let image_ready = unsafe { device.device().create_semaphore(&image_available, None) }
-        .map_err(|error| VulkanSmokeRunError::RecreateSwapchain {
-            result: format!("{error:?}"),
+    let image_ready =
+        unsafe { device.device().create_semaphore(&image_available, None) }.map_err(|error| {
+            VulkanSmokeRunError::RecreateSwapchain {
+                result: format!("{error:?}"),
+            }
         })?;
 
     let recreate_interval = if recreate_count == 0 {
@@ -479,18 +491,27 @@ pub fn run_vulkan_smoke_pass(
     let mut created = 0_u32;
 
     for frame in 0..frames {
-        if recreate_interval > 0 && frame > 0 && frame % recreate_interval == 0 && created < recreate_count {
-            swapchain = create_vulkan_swapchain_probe(instance, surface, device)
-                .map_err(|error| VulkanSmokeRunError::RecreateSwapchain {
-                    result: error.to_string(),
+        if recreate_interval > 0
+            && frame > 0
+            && frame % recreate_interval == 0
+            && created < recreate_count
+        {
+            swapchain =
+                create_vulkan_swapchain_probe(instance, surface, device).map_err(|error| {
+                    VulkanSmokeRunError::RecreateSwapchain {
+                        result: error.to_string(),
+                    }
                 })?;
             created = created.saturating_add(1);
         }
 
         let image_index = unsafe {
-            swapchain
-                .loader()
-                .acquire_next_image(swapchain.swapchain(), timeout_ns, image_ready, vk::Fence::null())
+            swapchain.loader().acquire_next_image(
+                swapchain.swapchain(),
+                timeout_ns,
+                image_ready,
+                vk::Fence::null(),
+            )
         }
         .map(|(index, _)| index)
         .map_err(|error| VulkanSmokeRunError::AcquireImage {
@@ -513,10 +534,11 @@ pub fn run_vulkan_smoke_pass(
             result: format!("{error:?}"),
         })?;
 
-        unsafe { device.device().queue_wait_idle(render_queue) }
-            .map_err(|error| VulkanSmokeRunError::PresentImage {
+        unsafe { device.device().queue_wait_idle(render_queue) }.map_err(|error| {
+            VulkanSmokeRunError::PresentImage {
                 result: format!("{error:?}"),
-            })?;
+            }
+        })?;
 
         swaps = swaps.saturating_add(1);
     }

@@ -16,8 +16,8 @@ use fparkan_platform_winit::{probe_smoke_window, WinitWindowPlan};
 use fparkan_render_vulkan::{
     create_vulkan_instance_probe, create_vulkan_logical_device_probe, create_vulkan_surface_probe,
     create_vulkan_swapchain_probe, probe_vulkan_loader, run_vulkan_smoke_pass,
-    triangle_shader_manifest, validate_shader_manifest, VulkanInstanceConfig,
-    VulkanInstanceProbe, VulkanLogicalDeviceProbe, VulkanSwapchainProbe,
+    triangle_shader_manifest, validate_shader_manifest, VulkanInstanceConfig, VulkanInstanceProbe,
+    VulkanLogicalDeviceProbe, VulkanSwapchainProbe,
 };
 use std::path::PathBuf;
 use std::process::Command;
@@ -67,9 +67,13 @@ fn run(args: &[String]) -> Result<String, String> {
             return Err("passed native smoke report requires frames to be advanced".to_string());
         }
         if smoke_run.validation_error_count
-            != options.validation_error_count.unwrap_or(smoke_run.validation_error_count)
+            != options
+                .validation_error_count
+                .unwrap_or(smoke_run.validation_error_count)
         {
-            return Err("passed native smoke report requires validation errors to be zero".to_string());
+            return Err(
+                "passed native smoke report requires validation errors to be zero".to_string(),
+            );
         }
     }
     let report = render_smoke_report_json(&options, &bootstrap)?;
@@ -443,12 +447,13 @@ impl VulkanBootstrapProbe {
         options: &SmokeOptions,
         instance: &VulkanInstanceProbe,
         window_handles: Option<NativeWindowHandles>,
-    ) -> Option<fparkan_render_vulkan::VulkanSurfaceProbe>
-    {
+    ) -> Option<fparkan_render_vulkan::VulkanSurfaceProbe> {
         if options.probes.vulkan.includes_surface()
             && self.instance_status == VulkanInstanceStatus::Created
         {
-            match create_vulkan_surface_probe(instance, window_handles).map_err(|err| err.to_string()) {
+            match create_vulkan_surface_probe(instance, window_handles)
+                .map_err(|err| err.to_string())
+            {
                 Ok(surface) => {
                     self.surface_status = VulkanSurfaceStatus::Created;
                     return Some(surface);

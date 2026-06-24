@@ -1,0 +1,47 @@
+schema = 1
+
+[stages]
+"0" = [
+  "fparkan-binary",
+  "fparkan-corpus",
+  "fparkan-diagnostics",
+  "fparkan-platform",
+  "fparkan-platform-winit",
+  "fparkan-render",
+  "fparkan-render-vulkan",
+  "fparkan-test-support",
+  "fparkan-vulkan-smoke",
+  "xtask",
+]
+"1" = [
+  "fparkan-cli",
+  "fparkan-inspection",
+  "fparkan-nres",
+  "fparkan-path",
+  "fparkan-resource",
+  "fparkan-rsli",
+  "fparkan-vfs",
+]
+"2" = [
+  "fparkan-prototype",
+]
+"3" = [
+  "fparkan-assets",
+  "fparkan-material",
+  "fparkan-msh",
+  "fparkan-texm",
+  "fparkan-viewer",
+]
+"4" = [
+  "fparkan-animation",
+  "fparkan-fx",
+]
+"5" = [
+  "fparkan-game",
+  "fparkan-headless",
+  "fparkan-mission-format",
+  "fparkan-runtime",
+  "fparkan-terrain",
+  "fparkan-terrain-format",
+  "fparkan-world",
+]

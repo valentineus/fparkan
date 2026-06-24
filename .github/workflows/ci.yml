@@ -2,19 +2,21 @@ name: fparkan-ci
 
 on:
   push:
-    branches: [main]
+    branches: [devel, main]
   pull_request:
-    branches: [main]
+    branches: [devel, main]
+  workflow_dispatch:
 
 jobs:
   msrv-backend-neutral:
     name: MSRV backend-neutral crates
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
         with:
           toolchain: 1.87.0
       - name: Test backend-neutral crates
@@ -48,6 +50,7 @@ jobs:
   stage0-matrix:
     name: Stage 0-2 CI (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -61,12 +64,13 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
         with:
-          toolchain-file: rust-toolchain.toml
+          toolchain: 1.87.0
+          components: clippy,rustfmt
       - name: Install cargo-deny
-        run: cargo install cargo-deny --locked
+        run: cargo install cargo-deny --version 0.19.9 --locked
       - name: Run canonical CI gate
         run: cargo xtask ci
       - name: Record native Vulkan smoke status
@@ -81,10 +85,10 @@ jobs:
           --reason "native Vulkan smoke runner is not enabled on this CI lane yet"
       - name: Upload acceptance evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: stage-0-2-acceptance-${{ matrix.os }}
           path: |
             target/fparkan/acceptance/stage-0-2-audit.json
             target/fparkan/native-smoke/*.json
-          if-no-files-found: ignore
+          if-no-files-found: error
