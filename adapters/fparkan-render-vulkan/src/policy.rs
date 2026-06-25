@@ -213,6 +213,19 @@ pub struct VulkanCapabilityReport {
     pub portability_subset: bool,
     /// Enabled device extensions.
     pub enabled_extensions: Vec<String>,
+    /// Devices rejected by deterministic Stage 0 capability validation.
+    pub rejected_devices: Vec<VulkanRejectedDeviceReport>,
+}
+
+/// Deterministic rejection reason for an unsuitable physical device.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct VulkanRejectedDeviceReport {
+    /// Human-readable device name.
+    pub device_name: String,
+    /// Stable machine-readable rejection code.
+    pub reason_code: &'static str,
+    /// Actionable rejection summary.
+    pub reason: String,
 }
 
 /// Vulkan capability selection error.
@@ -308,11 +321,13 @@ pub fn select_physical_device(
     }
 
     let mut best = None;
+    let mut rejected_devices = Vec::new();
     let mut last_error = None;
     for device in devices {
         let report = match validate_device(device) {
             Ok(report) => report,
             Err(err) => {
+                rejected_devices.push(rejected_device_report(device, &err));
                 last_error = Some(err);
                 continue;
             }
@@ -323,7 +338,10 @@ pub fn select_physical_device(
             _ => best = Some(report),
         }
     }
-    best.ok_or_else(|| last_error.unwrap_or(VulkanCapabilityError::NoPhysicalDevice))
+    let mut best =
+        best.ok_or_else(|| last_error.unwrap_or(VulkanCapabilityError::NoPhysicalDevice))?;
+    best.rejected_devices = rejected_devices;
+    Ok(best)
 }
 
 /// Builds a deterministic swapchain plan from surface capabilities.
@@ -411,6 +429,7 @@ pub fn render_capability_report_json(report: &VulkanCapabilityReport) -> String 
         present_queue_family: u32,
         portability_subset: bool,
         enabled_extensions: &'a [String],
+        rejected_devices: &'a [VulkanRejectedDeviceReport],
     }
 
     serialize_json_or_fallback(
@@ -423,8 +442,9 @@ pub fn render_capability_report_json(report: &VulkanCapabilityReport) -> String 
             present_queue_family: report.present_queue_family,
             portability_subset: report.portability_subset,
             enabled_extensions: &report.enabled_extensions,
+            rejected_devices: &report.rejected_devices,
         },
-        "{\"schema\":0,\"vulkan_api\":\"0.0.0\",\"device_name\":\"unknown\",\"score\":0,\"graphics_queue_family\":0,\"present_queue_family\":0,\"portability_subset\":false,\"enabled_extensions\":[]}",
+        "{\"schema\":0,\"vulkan_api\":\"0.0.0\",\"device_name\":\"unknown\",\"score\":0,\"graphics_queue_family\":0,\"present_queue_family\":0,\"portability_subset\":false,\"enabled_extensions\":[],\"rejected_devices\":[]}",
     )
 }
 
@@ -637,7 +657,34 @@ pub(crate) fn validate_device(
         present_queue_family,
         portability_subset,
         enabled_extensions,
+        rejected_devices: Vec::new(),
     })
+}
+
+fn rejected_device_report(
+    device: &VulkanPhysicalDeviceRecord,
+    error: &VulkanCapabilityError,
+) -> VulkanRejectedDeviceReport {
+    VulkanRejectedDeviceReport {
+        device_name: device.name.clone(),
+        reason_code: capability_error_code(error),
+        reason: error.to_string(),
+    }
+}
+
+const fn capability_error_code(error: &VulkanCapabilityError) -> &'static str {
+    match error {
+        VulkanCapabilityError::NoPhysicalDevice => "no_physical_device",
+        VulkanCapabilityError::ApiVersionTooLow { .. } => "api_version_too_low",
+        VulkanCapabilityError::NoGraphicsQueue { .. } => "no_graphics_queue",
+        VulkanCapabilityError::NoPresentQueue { .. } => "no_present_queue",
+        VulkanCapabilityError::MissingSwapchainExtension { .. } => "missing_swapchain_extension",
+        VulkanCapabilityError::MissingSurfaceFormat { .. } => "missing_surface_format",
+        VulkanCapabilityError::MissingPresentMode { .. } => "missing_present_mode",
+        VulkanCapabilityError::MissingColorAttachmentUsage { .. } => {
+            "missing_color_attachment_usage"
+        }
+    }
 }
 
 fn select_queue_families(

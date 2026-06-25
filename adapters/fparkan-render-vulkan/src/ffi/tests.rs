@@ -140,6 +140,14 @@ fn device_selection_skips_rejected_candidates_before_accepting_valid_gpu() {
     assert_eq!(report.device_name, "Accepted");
     assert_eq!(report.graphics_queue_family, 2);
     assert_eq!(report.present_queue_family, 2);
+    assert_eq!(
+        report.rejected_devices,
+        vec![VulkanRejectedDeviceReport {
+            device_name: "Rejected".to_string(),
+            reason_code: "no_present_queue",
+            reason: "Vulkan device Rejected has no present queue".to_string(),
+        }]
+    );
 }
 
 #[test]
@@ -281,18 +289,17 @@ fn rejects_missing_graphics_present_swapchain_and_format() {
 
 #[test]
 fn capability_report_json_is_stable() {
-    let report = select_physical_device(&[device(
-        "GPU \"A\"",
-        VulkanDeviceType::DiscreteGpu,
-        3,
-        true,
-        false,
-    )])
+    let mut rejected = device("Rejected", VulkanDeviceType::IntegratedGpu, 0, true, false);
+    rejected.present_modes.clear();
+    let report = select_physical_device(&[
+        rejected,
+        device("GPU \"A\"", VulkanDeviceType::DiscreteGpu, 3, true, false),
+    ])
     .expect("selected device");
 
     assert_eq!(
         render_capability_report_json(&report),
-        "{\"schema\":1,\"vulkan_api\":\"1.1.0\",\"device_name\":\"GPU \\\"A\\\"\",\"score\":1101,\"graphics_queue_family\":3,\"present_queue_family\":3,\"portability_subset\":false,\"enabled_extensions\":[\"VK_KHR_swapchain\"]}"
+        "{\"schema\":1,\"vulkan_api\":\"1.1.0\",\"device_name\":\"GPU \\\"A\\\"\",\"score\":1101,\"graphics_queue_family\":3,\"present_queue_family\":3,\"portability_subset\":false,\"enabled_extensions\":[\"VK_KHR_swapchain\"],\"rejected_devices\":[{\"device_name\":\"Rejected\",\"reason_code\":\"missing_present_mode\",\"reason\":\"Vulkan device Rejected has no supported present mode\"}]}"
     );
 }
 
