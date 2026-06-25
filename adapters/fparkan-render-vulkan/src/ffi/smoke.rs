@@ -3,7 +3,7 @@
 use ash::vk;
 
 use super::{
-    color_subresource_range, create_command_pool, create_frame_sync, create_swapchain_resources,
+    create_command_pool, create_frame_sync, create_swapchain_resources,
     create_triangle_index_buffer, create_triangle_vertex_buffer, create_validation_messenger,
     create_vulkan_instance_probe, create_vulkan_logical_device_probe, create_vulkan_surface_probe,
     create_vulkan_swapchain_probe_for_extent, destroy_allocated_buffer,
@@ -438,38 +438,6 @@ impl VulkanSmokeRenderer {
             result: error,
         })?;
 
-        let pre_barrier = vk::ImageMemoryBarrier::default()
-            .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .subresource_range(color_subresource_range())
-            .src_access_mask(vk::AccessFlags::empty())
-            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
-        // SAFETY: The swapchain is live and queried only to resolve the current image handles.
-        let swapchain_images = unsafe {
-            swapchain
-                .loader()
-                .get_swapchain_images(swapchain.swapchain())
-        }
-        .map_err(|error| VulkanSmokeRendererError::VulkanOperation {
-            context: "vkGetSwapchainImagesKHR",
-            result: error,
-        })?;
-        let pre_barrier = pre_barrier.image(swapchain_images[image_index]);
-        // SAFETY: The barriers operate on the acquired swapchain image owned by this command buffer submission.
-        unsafe {
-            device.device().cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[pre_barrier],
-            );
-        }
-
         let clear_values = [vk::ClearValue {
             color: vk::ClearColorValue {
                 float32: [0.05, 0.08, 0.11, 1.0],
@@ -516,31 +484,12 @@ impl VulkanSmokeRenderer {
             device.device().cmd_end_render_pass(command_buffer);
         }
 
-        let post_barrier = vk::ImageMemoryBarrier::default()
-            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(swapchain_images[image_index])
-            .subresource_range(color_subresource_range())
-            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-            .dst_access_mask(vk::AccessFlags::empty());
-        // SAFETY: The post-render barrier transitions the same live swapchain image into present layout.
-        unsafe {
-            device.device().cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[post_barrier],
-            );
-            device.device().end_command_buffer(command_buffer)
-        }
-        .map_err(|error| VulkanSmokeRendererError::VulkanOperation {
-            context: "vkEndCommandBuffer",
-            result: error,
+        // SAFETY: The render pass owns the attachment layout transitions for this clear-and-present path.
+        unsafe { device.device().end_command_buffer(command_buffer) }.map_err(|error| {
+            VulkanSmokeRendererError::VulkanOperation {
+                context: "vkEndCommandBuffer",
+                result: error,
+            }
         })?;
         Ok(())
     }

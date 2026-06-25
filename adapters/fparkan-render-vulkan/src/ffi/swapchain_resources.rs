@@ -214,8 +214,8 @@ fn create_render_pass(
         .samples(vk::SampleCountFlags::TYPE_1)
         .load_op(vk::AttachmentLoadOp::CLEAR)
         .store_op(vk::AttachmentStoreOp::STORE)
-        .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-        .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
     let color_attachment_ref = vk::AttachmentReference::default()
         .attachment(0)
         .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
@@ -228,6 +228,7 @@ fn create_render_pass(
         .dst_subpass(0)
         .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
         .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .src_access_mask(vk::AccessFlags::empty())
         .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
     let attachments = [color_attachment];
     let subpasses = [subpass];
