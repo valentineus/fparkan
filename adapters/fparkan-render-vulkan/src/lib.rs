@@ -42,8 +42,6 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 /// Minimum Vulkan API version accepted by the Stage 0 backend.
 pub const MIN_VULKAN_API_VERSION: u32 = vk::API_VERSION_1_1;
 const KHR_SWAPCHAIN_EXTENSION: &str = "VK_KHR_swapchain";
@@ -3599,7 +3597,7 @@ fn render_shader_tool_json(tool: &VulkanShaderToolManifest) -> String {
 
 /// Vulkan backend migration readiness.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum VulkanBackendState {
+pub enum VulkanPlanningBackendState {
     /// Adapter prepared and able to accept commands.
     Ready,
     /// Adapter is tracking a recoverable runtime surface/depth pipeline fault.
@@ -3608,7 +3606,7 @@ pub enum VulkanBackendState {
     Error,
 }
 
-impl Default for VulkanBackendState {
+impl Default for VulkanPlanningBackendState {
     fn default() -> Self {
         Self::Degraded
     }
@@ -4283,16 +4281,14 @@ fn push_json_string(out: &mut String, value: &str) {
 /// Diagnostics for Vulkan planning backend setup and frame progression.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VulkanPlanningBackendReport {
-    /// Unix time at initialization.
-    pub initialized_at: u64,
     /// Total frames executed.
     pub frames_executed: u64,
     /// Total command submissions.
     pub submissions: u64,
     /// Last command-capture byte size.
     pub last_capture_size: usize,
-    /// Number of simulated present calls.
-    pub presents: u64,
+    /// Number of simulated present calls issued by the planning facade.
+    pub simulated_presents: u64,
     /// Number of resize-driven surface plan refreshes.
     pub resize_rebuilds: u64,
     /// Last render request observed.
@@ -4304,13 +4300,10 @@ pub struct VulkanPlanningBackendReport {
 impl Default for VulkanPlanningBackendReport {
     fn default() -> Self {
         Self {
-            initialized_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |duration| duration.as_secs()),
             frames_executed: 0,
             submissions: 0,
             last_capture_size: 0,
-            presents: 0,
+            simulated_presents: 0,
             resize_rebuilds: 0,
             request: RenderRequest::conservative(),
             last_frame_submission: None,
@@ -4321,7 +4314,7 @@ impl Default for VulkanPlanningBackendReport {
 /// Vulkan planning backend façade used by the game entrypoint.
 #[derive(Debug)]
 pub struct VulkanPlanningBackend {
-    state: VulkanBackendState,
+    state: VulkanPlanningBackendState,
     report: VulkanPlanningBackendReport,
     swapchain_plan: VulkanSwapchainPlan,
 }
@@ -4337,7 +4330,7 @@ impl VulkanPlanningBackend {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            state: VulkanBackendState::Ready,
+            state: VulkanPlanningBackendState::Ready,
             report: VulkanPlanningBackendReport::default(),
             swapchain_plan: default_stage0_swapchain_plan(),
         }
@@ -4368,7 +4361,7 @@ impl VulkanPlanningBackend {
 
     /// Returns adapter state.
     #[must_use]
-    pub const fn state(&self) -> VulkanBackendState {
+    pub const fn state(&self) -> VulkanPlanningBackendState {
         self.state
     }
 
@@ -4379,7 +4372,7 @@ impl VulkanPlanningBackend {
     }
 
     fn simulate_present(&mut self) {
-        self.report.presents = self.report.presents.saturating_add(1);
+        self.report.simulated_presents = self.report.simulated_presents.saturating_add(1);
     }
 }
 
@@ -4387,7 +4380,7 @@ impl RenderBackend for VulkanPlanningBackend {
     fn execute(&mut self, commands: &RenderCommandList) -> Result<FrameOutput, RenderError> {
         if !matches!(
             self.state,
-            VulkanBackendState::Ready | VulkanBackendState::Degraded
+            VulkanPlanningBackendState::Ready | VulkanPlanningBackendState::Degraded
         ) {
             return Err(RenderError::InvalidRange);
         }
@@ -4423,7 +4416,7 @@ mod tests {
     };
 
     #[test]
-    fn backend_tracks_render_request_and_presents() -> Result<(), RenderError> {
+    fn planning_backend_tracks_render_request_and_simulated_present() -> Result<(), RenderError> {
         let mut backend = VulkanPlanningBackend::new();
         let request = RenderRequest::conservative();
         backend.set_render_request(request);
@@ -4448,10 +4441,10 @@ mod tests {
         };
 
         backend.execute(&commands)?;
-        assert_eq!(backend.state(), VulkanBackendState::Ready);
+        assert_eq!(backend.state(), VulkanPlanningBackendState::Ready);
         assert_eq!(backend.report().frames_executed, 1);
         assert_eq!(backend.report().submissions, 1);
-        assert_eq!(backend.report().presents, 1);
+        assert_eq!(backend.report().simulated_presents, 1);
         assert!(backend.report().last_capture_size > 0);
         assert_eq!(
             backend.report().last_frame_submission,
