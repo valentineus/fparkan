@@ -198,10 +198,10 @@ impl SmokeApp {
         let smoke_report = SmokeReport {
             schema_version: SCHEMA_VERSION,
             commit_sha: compiled_commit_sha(),
-            git_dirty: current_git_dirty(),
+            git_dirty: compiled_git_dirty(),
             runner_identity: measured_runner_identity(),
             runner_architecture: actual_architecture(),
-            rust_toolchain: current_rustc_release(),
+            rust_toolchain: compiled_rust_toolchain(),
             target_triple: compiled_target_triple(),
             platform: actual_platform(),
             status,
@@ -559,7 +559,13 @@ fn runtime_git_commit_sha() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn current_git_dirty() -> bool {
+fn compiled_git_dirty() -> bool {
+    option_env!("FPARKAN_BUILD_GIT_DIRTY")
+        .and_then(parse_bool_env)
+        .unwrap_or_else(runtime_git_dirty)
+}
+
+fn runtime_git_dirty() -> bool {
     Command::new("git")
         .args(["status", "--short"])
         .output()
@@ -567,6 +573,12 @@ fn current_git_dirty() -> bool {
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .is_some_and(|output| !output.trim().is_empty())
+}
+
+fn compiled_rust_toolchain() -> String {
+    option_env!("FPARKAN_BUILD_RUST_TOOLCHAIN")
+        .filter(|value| !value.trim().is_empty())
+        .map_or_else(current_rustc_release, ToString::to_string)
 }
 
 fn current_rustc_release() -> String {
@@ -622,6 +634,14 @@ fn current_rustc_host_triple() -> String {
 
 fn is_commit_sha(value: &str) -> bool {
     value.len() == 40 && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn parse_bool_env(value: &str) -> Option<bool> {
+    match value {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -722,6 +742,13 @@ mod tests {
     fn commit_sha_validation_rejects_non_hex_or_wrong_length() {
         assert!(!is_commit_sha("0123456789abcdef0123456789abcdef0123456"));
         assert!(!is_commit_sha("zz23456789abcdef0123456789abcdef01234567"));
+    }
+
+    #[test]
+    fn parses_bool_env_values() {
+        assert_eq!(parse_bool_env("true"), Some(true));
+        assert_eq!(parse_bool_env("false"), Some(false));
+        assert_eq!(parse_bool_env("1"), None);
     }
 
     #[test]

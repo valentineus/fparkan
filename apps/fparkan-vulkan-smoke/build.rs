@@ -6,12 +6,17 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=TARGET");
+    println!("cargo:rerun-if-env-changed=RUSTC");
+    println!("cargo:rerun-if-env-changed=RUSTUP_TOOLCHAIN");
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
     println!("cargo:rerun-if-env-changed=SOURCE_VERSION");
     println!("cargo:rerun-if-env-changed=BUILD_VCS_NUMBER");
 
     if let Ok(target) = env::var("TARGET") {
         println!("cargo:rustc-env=FPARKAN_BUILD_TARGET_TRIPLE={target}");
+    }
+    if let Some(toolchain) = rustc_release() {
+        println!("cargo:rustc-env=FPARKAN_BUILD_RUST_TOOLCHAIN={toolchain}");
     }
 
     let workspace_root =
@@ -22,6 +27,9 @@ fn main() {
 
     if let Some(commit_sha) = env_commit_sha().or_else(|| git_head_commit_sha(&workspace_root)) {
         println!("cargo:rustc-env=FPARKAN_BUILD_COMMIT_SHA={commit_sha}");
+    }
+    if let Some(git_dirty) = git_dirty(&workspace_root) {
+        println!("cargo:rustc-env=FPARKAN_BUILD_GIT_DIRTY={git_dirty}");
     }
 }
 
@@ -47,6 +55,19 @@ fn git_head_commit_sha(workspace_root: &Path) -> Option<String> {
     is_commit_sha(&value).then_some(value)
 }
 
+fn git_dirty(workspace_root: &Path) -> Option<bool> {
+    let output = Command::new("git")
+        .args(["-C"])
+        .arg(workspace_root)
+        .args(["status", "--short"])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| !String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
 fn git_dir(workspace_root: &Path) -> Option<PathBuf> {
     let output = Command::new("git")
         .args(["-C"])
@@ -69,6 +90,7 @@ fn emit_git_rerun_hints(git_dir: &Path) {
         "cargo:rerun-if-changed={}",
         git_dir.join("packed-refs").display()
     );
+    println!("cargo:rerun-if-changed={}", git_dir.join("index").display());
     let Some(reference) = std::fs::read_to_string(&head).ok().and_then(|value| {
         value
             .strip_prefix("ref: ")
@@ -85,4 +107,21 @@ fn emit_git_rerun_hints(git_dir: &Path) {
 
 fn is_commit_sha(value: &str) -> bool {
     value.len() == 40 && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
+fn rustc_release() -> Option<String> {
+    let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let output = Command::new(rustc).arg("-Vv").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("release: ")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
 }
