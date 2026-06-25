@@ -568,7 +568,8 @@ pub(super) fn create_frame_sync(
                 context: "vkCreateSemaphore(image_available)",
                 result: error,
             })?;
-        let render_finished =
+        let render_finished = {
+            // SAFETY: The sync objects belong to this live logical device and are destroyed at teardown.
             match unsafe { device.device().create_semaphore(&semaphore_info, None) } {
                 Ok(render_finished) => render_finished,
                 Err(error) => {
@@ -580,7 +581,9 @@ pub(super) fn create_frame_sync(
                         result: error,
                     });
                 }
-            };
+            }
+        };
+        // SAFETY: The fence belongs to this live logical device and is destroyed at teardown.
         let fence = match unsafe { device.device().create_fence(&fence_info, None) } {
             Ok(fence) => fence,
             Err(error) => {
