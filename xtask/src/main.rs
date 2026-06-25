@@ -1243,6 +1243,7 @@ const AUDITED_UNSAFE_SOURCE_FILES: &[&str] = &[
     "adapters/fparkan-render-vulkan/src/ffi.rs",
     "adapters/fparkan-render-vulkan/src/ffi/instance.rs",
     "adapters/fparkan-render-vulkan/src/ffi/surface.rs",
+    "adapters/fparkan-render-vulkan/src/ffi/validation.rs",
 ];
 
 fn is_audited_unsafe_source(path: &Path) -> bool {
