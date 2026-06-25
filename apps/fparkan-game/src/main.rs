@@ -104,8 +104,8 @@ fn run(args: &[String]) -> Result<String, String> {
         args.frames,
         last_tick,
         last_draw_count,
-        capture_report.submissions,
-        capture_report.last_capture_size,
+        capture_report.execution.submission_plans,
+        capture_report.execution.last_capture_size,
         json_hash(&last_hash)
     ))
 }

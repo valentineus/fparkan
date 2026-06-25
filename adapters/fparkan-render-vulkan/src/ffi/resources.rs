@@ -216,77 +216,45 @@ pub(super) fn create_swapchain_resources(
         result: error,
     })?;
     let mut partial = PartialSwapchainResources {
-        image_views: Vec::with_capacity(images.len()),
+        image_views: create_swapchain_image_views(
+            device,
+            &images,
+            swapchain.report.plan.format.format,
+        )?,
         render_pass: None,
         pipeline_layout: None,
         pipeline: None,
-        framebuffers: Vec::with_capacity(images.len()),
+        framebuffers: Vec::new(),
         command_buffers: Vec::new(),
     };
-    for image in images.iter().copied() {
-        match create_image_view(device, image, swapchain.report.plan.format.format) {
-            Ok(image_view) => partial.image_views.push(image_view),
-            Err(error) => {
-                destroy_partial_swapchain_resources(device, command_pool, partial);
-                return Err(error);
-            }
-        }
-    }
-    let render_pass = match create_render_pass(device, swapchain.report.plan.format.format) {
-        Ok(render_pass) => render_pass,
+    let (render_pass, pipeline_layout, pipeline) = match create_swapchain_pipeline_bundle(
+        device,
+        swapchain.report.plan.format.format,
+        swapchain.report.plan.extent,
+    ) {
+        Ok(bundle) => bundle,
         Err(error) => {
             destroy_partial_swapchain_resources(device, command_pool, partial);
             return Err(error);
         }
     };
     partial.render_pass = Some(render_pass);
-    let pipeline_layout = match create_pipeline_layout(device) {
-        Ok(pipeline_layout) => pipeline_layout,
-        Err(error) => {
-            destroy_partial_swapchain_resources(device, command_pool, partial);
-            return Err(error);
-        }
-    };
     partial.pipeline_layout = Some(pipeline_layout);
-    let pipeline = match create_graphics_pipeline(
+    partial.pipeline = Some(pipeline);
+    let framebuffers = match create_swapchain_framebuffers(
         device,
         render_pass,
-        pipeline_layout,
+        &partial.image_views,
         swapchain.report.plan.extent,
     ) {
-        Ok(pipeline) => pipeline,
+        Ok(framebuffers) => framebuffers,
         Err(error) => {
             destroy_partial_swapchain_resources(device, command_pool, partial);
             return Err(error);
         }
     };
-    partial.pipeline = Some(pipeline);
-    for image_view in partial.image_views.iter().copied() {
-        match create_framebuffer(
-            device,
-            render_pass,
-            image_view,
-            swapchain.report.plan.extent,
-        ) {
-            Ok(framebuffer) => partial.framebuffers.push(framebuffer),
-            Err(error) => {
-                destroy_partial_swapchain_resources(device, command_pool, partial);
-                return Err(error);
-            }
-        }
-    }
-    if reuse_command_pool {
-        // SAFETY: All command buffers allocated from the live pool are freed before reallocating them.
-        unsafe {
-            device
-                .device()
-                .reset_command_pool(command_pool, vk::CommandPoolResetFlags::empty())
-        }
-        .map_err(|error| VulkanSmokeRendererError::VulkanOperation {
-            context: "vkResetCommandPool",
-            result: error,
-        })?;
-    }
+    partial.framebuffers = framebuffers;
+    reset_reusable_command_pool(device, command_pool, reuse_command_pool)?;
     let command_buffers = match allocate_command_buffers(
         device,
         command_pool,
@@ -307,6 +275,85 @@ pub(super) fn create_swapchain_resources(
         pipeline,
         framebuffers: partial.framebuffers,
         command_buffers: partial.command_buffers,
+    })
+}
+
+fn create_swapchain_image_views(
+    device: &VulkanLogicalDeviceProbe,
+    images: &[vk::Image],
+    format: i32,
+) -> Result<Vec<vk::ImageView>, VulkanSmokeRendererError> {
+    let mut image_views = Vec::with_capacity(images.len());
+    for image in images.iter().copied() {
+        image_views.push(create_image_view(device, image, format)?);
+    }
+    Ok(image_views)
+}
+
+fn create_swapchain_pipeline_bundle(
+    device: &VulkanLogicalDeviceProbe,
+    format: i32,
+    extent: (u32, u32),
+) -> Result<(vk::RenderPass, vk::PipelineLayout, vk::Pipeline), VulkanSmokeRendererError> {
+    let render_pass = create_render_pass(device, format)?;
+    let pipeline_layout = create_pipeline_layout(device).inspect_err(|_| {
+        // SAFETY: The render pass was created above on this live logical device and is destroyed on setup failure.
+        unsafe { device.device().destroy_render_pass(render_pass, None) };
+    })?;
+    let pipeline = create_graphics_pipeline(device, render_pass, pipeline_layout, extent)
+        .inspect_err(|_| {
+            // SAFETY: These objects were created above on this live logical device and are destroyed on setup failure.
+            unsafe {
+                device
+                    .device()
+                    .destroy_pipeline_layout(pipeline_layout, None);
+                device.device().destroy_render_pass(render_pass, None);
+            }
+        })?;
+    Ok((render_pass, pipeline_layout, pipeline))
+}
+
+fn create_swapchain_framebuffers(
+    device: &VulkanLogicalDeviceProbe,
+    render_pass: vk::RenderPass,
+    image_views: &[vk::ImageView],
+    extent: (u32, u32),
+) -> Result<Vec<vk::Framebuffer>, VulkanSmokeRendererError> {
+    let mut framebuffers = Vec::with_capacity(image_views.len());
+    for image_view in image_views.iter().copied() {
+        match create_framebuffer(device, render_pass, image_view, extent) {
+            Ok(framebuffer) => framebuffers.push(framebuffer),
+            Err(error) => {
+                // SAFETY: These framebuffers were created above on this live logical device and are destroyed on setup failure.
+                unsafe {
+                    for framebuffer in framebuffers.iter().copied() {
+                        device.device().destroy_framebuffer(framebuffer, None);
+                    }
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok(framebuffers)
+}
+
+fn reset_reusable_command_pool(
+    device: &VulkanLogicalDeviceProbe,
+    command_pool: vk::CommandPool,
+    reuse_command_pool: bool,
+) -> Result<(), VulkanSmokeRendererError> {
+    if !reuse_command_pool {
+        return Ok(());
+    }
+    // SAFETY: All command buffers allocated from the live pool are freed before reallocating them.
+    unsafe {
+        device
+            .device()
+            .reset_command_pool(command_pool, vk::CommandPoolResetFlags::empty())
+    }
+    .map_err(|error| VulkanSmokeRendererError::VulkanOperation {
+        context: "vkResetCommandPool",
+        result: error,
     })
 }
 

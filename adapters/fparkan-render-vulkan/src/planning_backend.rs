@@ -45,7 +45,7 @@ impl Default for VulkanPlanningRequestReport {
 }
 
 /// Diagnostics for planning-facade execution telemetry.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct VulkanPlanningExecutionReport {
     /// Total frames planned by the facade.
     pub planned_frames: u64,
@@ -57,19 +57,8 @@ pub struct VulkanPlanningExecutionReport {
     pub simulated_presents: u64,
 }
 
-impl Default for VulkanPlanningExecutionReport {
-    fn default() -> Self {
-        Self {
-            planned_frames: 0,
-            submission_plans: 0,
-            last_capture_size: 0,
-            simulated_presents: 0,
-        }
-    }
-}
-
 /// Diagnostics for Vulkan planning backend setup and frame progression.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct VulkanPlanningBackendReport {
     /// Request-tracking telemetry.
     pub request: VulkanPlanningRequestReport,
@@ -77,16 +66,6 @@ pub struct VulkanPlanningBackendReport {
     pub execution: VulkanPlanningExecutionReport,
     /// Last deterministic frame submission plan.
     pub last_frame_submission: Option<VulkanFrameSubmissionPlan>,
-}
-
-impl Default for VulkanPlanningBackendReport {
-    fn default() -> Self {
-        Self {
-            request: VulkanPlanningRequestReport::default(),
-            execution: VulkanPlanningExecutionReport::default(),
-            last_frame_submission: None,
-        }
-    }
 }
 
 /// Vulkan planning backend facade used by the game entrypoint.
