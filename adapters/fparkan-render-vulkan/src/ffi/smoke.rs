@@ -29,6 +29,44 @@ fn take_runtime_owners_in_dependency_order<Instance, Validation, Surface, Device
     instance.take();
 }
 
+struct RollbackOnDrop<T, F>
+where
+    F: FnOnce(T),
+{
+    value: Option<T>,
+    rollback: Option<F>,
+}
+
+impl<T, F> RollbackOnDrop<T, F>
+where
+    F: FnOnce(T),
+{
+    fn new(value: T, rollback: F) -> Self {
+        Self {
+            value: Some(value),
+            rollback: Some(rollback),
+        }
+    }
+
+    fn commit(mut self) -> T {
+        self.rollback.take();
+        self.value
+            .take()
+            .expect("rollback guard must hold a value until commit")
+    }
+}
+
+impl<T, F> Drop for RollbackOnDrop<T, F>
+where
+    F: FnOnce(T),
+{
+    fn drop(&mut self) {
+        if let (Some(value), Some(rollback)) = (self.value.take(), self.rollback.take()) {
+            rollback(value);
+        }
+    }
+}
+
 impl VulkanSmokeRenderer {
     /// Creates a live Vulkan smoke renderer bound to a live native window.
     ///
@@ -395,9 +433,9 @@ impl VulkanSmokeRenderer {
         &mut self,
         reuse_command_pool: bool,
     ) -> Result<(), VulkanSmokeRendererError> {
-        let resources = {
-            let device = self.device_ref()?;
-            let swapchain = self.swapchain_ref()?;
+        let device = self.device_ref()?;
+        let swapchain = self.swapchain_ref()?;
+        let resources = RollbackOnDrop::new(
             create_swapchain_resources(
                 device,
                 swapchain,
@@ -405,14 +443,13 @@ impl VulkanSmokeRenderer {
                 self.vertex_buffer_ref()?,
                 self.index_buffer_ref()?,
                 reuse_command_pool,
-            )?
-        };
-        let frame_sync = {
-            let device = self.device_ref()?;
-            create_frame_sync(device)?
-        };
+            )?,
+            |resources| destroy_swapchain_resources(device, self.command_pool, resources),
+        );
+        let frame_sync = create_frame_sync(device)?;
         let swapchain_extent = self.swapchain_ref()?.report.plan.extent;
         let swapchain_image_count = self.swapchain_ref()?.report.image_count;
+        let resources = resources.commit();
         self.images_in_flight = vec![vk::Fence::null(); resources.image_views.len()];
         self.frame_sync = frame_sync;
         self.report.swapchain_extent = swapchain_extent;
@@ -578,7 +615,7 @@ impl Drop for VulkanSmokeRenderer {
 
 #[cfg(test)]
 mod tests {
-    use super::take_runtime_owners_in_dependency_order;
+    use super::{take_runtime_owners_in_dependency_order, RollbackOnDrop};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -712,5 +749,31 @@ mod tests {
         for (present_steps, expected) in cases {
             assert_eq!(record_teardown_steps(&present_steps), expected);
         }
+    }
+
+    #[test]
+    fn rollback_guard_runs_cleanup_when_later_step_fails() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        {
+            let _guard = RollbackOnDrop::new(tracker(TeardownStep::Swapchain, &log), |tracker| {
+                drop(tracker)
+            });
+        }
+
+        assert_eq!(log.borrow().as_slice(), &[TeardownStep::Swapchain]);
+    }
+
+    #[test]
+    fn rollback_guard_skips_cleanup_after_commit() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let tracker = RollbackOnDrop::new(tracker(TeardownStep::Swapchain, &log), |tracker| {
+            drop(tracker)
+        })
+        .commit();
+        assert!(log.borrow().is_empty());
+
+        drop(tracker);
+
+        assert_eq!(log.borrow().as_slice(), &[TeardownStep::Swapchain]);
     }
 }
