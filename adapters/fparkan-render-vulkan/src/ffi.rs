@@ -2895,6 +2895,8 @@ fn live_device_candidate(
         extensions,
         queue_families,
         surface_formats: surface_formats.clone(),
+        present_modes: present_modes.clone(),
+        surface_capabilities,
     };
     let capability = validate_device(&record).map_err(VulkanRuntimeCapabilityError::Capability)?;
     Ok(LiveDeviceCandidate {
@@ -3051,6 +3053,7 @@ fn live_surface_capabilities(
         ),
         min_image_count: capabilities.min_image_count,
         max_image_count: capabilities.max_image_count,
+        supported_usage_flags: capabilities.supported_usage_flags.as_raw(),
     })
 }
 
@@ -3624,6 +3627,8 @@ pub struct VulkanSwapchainSurfaceCapabilities {
     pub min_image_count: u32,
     /// Maximum supported image count, or 0 when unbounded.
     pub max_image_count: u32,
+    /// Supported swapchain image-usage flags as raw Vulkan bits.
+    pub supported_usage_flags: u32,
 }
 
 /// Deterministic swapchain planning input.
@@ -3737,6 +3742,10 @@ pub struct VulkanPhysicalDeviceRecord {
     pub queue_families: Vec<VulkanQueueFamily>,
     /// Surface formats accepted by the target surface.
     pub surface_formats: Vec<VulkanSurfaceFormat>,
+    /// Present modes accepted by the target surface.
+    pub present_modes: Vec<i32>,
+    /// Surface capabilities accepted by the target surface.
+    pub surface_capabilities: VulkanSwapchainSurfaceCapabilities,
 }
 
 impl VulkanPhysicalDeviceRecord {
@@ -3802,6 +3811,16 @@ pub enum VulkanCapabilityError {
         /// Device name that failed validation.
         device: String,
     },
+    /// No present mode is available for the target surface.
+    MissingPresentMode {
+        /// Device name that failed validation.
+        device: String,
+    },
+    /// Swapchain images cannot be used as color attachments.
+    MissingColorAttachmentUsage {
+        /// Device name that failed validation.
+        device: String,
+    },
 }
 
 impl std::fmt::Display for VulkanCapabilityError {
@@ -3826,6 +3845,13 @@ impl std::fmt::Display for VulkanCapabilityError {
             Self::MissingSurfaceFormat { device } => {
                 write!(f, "Vulkan device {device} has no compatible surface format")
             }
+            Self::MissingPresentMode { device } => {
+                write!(f, "Vulkan device {device} has no supported present mode")
+            }
+            Self::MissingColorAttachmentUsage { device } => write!(
+                f,
+                "Vulkan device {device} surface does not support COLOR_ATTACHMENT usage"
+            ),
         }
     }
 }
@@ -3891,6 +3917,9 @@ pub fn plan_vulkan_swapchain(
 fn select_surface_format(
     formats: &[VulkanSurfaceFormat],
 ) -> Result<VulkanSurfaceFormat, VulkanSwapchainError> {
+    if let Some(format) = undefined_surface_format_override(formats) {
+        return Ok(format);
+    }
     formats
         .iter()
         .copied()
@@ -3900,6 +3929,18 @@ fn select_surface_format(
         })
         .or_else(|| formats.first().copied())
         .ok_or(VulkanSwapchainError::MissingSurfaceFormat)
+}
+
+fn undefined_surface_format_override(
+    formats: &[VulkanSurfaceFormat],
+) -> Option<VulkanSurfaceFormat> {
+    match formats {
+        [format] if format.format == vk::Format::UNDEFINED.as_raw() => Some(VulkanSurfaceFormat {
+            format: vk::Format::B8G8R8A8_SRGB.as_raw(),
+            color_space: format.color_space,
+        }),
+        _ => None,
+    }
 }
 
 fn select_present_mode(present_modes: &[i32], preferred: i32) -> Result<i32, VulkanSwapchainError> {
@@ -4019,8 +4060,18 @@ fn validate_device(
             device: device.name.clone(),
         });
     }
-    if device.surface_formats.is_empty() {
+    if !supports_surface_formats(device) {
         return Err(VulkanCapabilityError::MissingSurfaceFormat {
+            device: device.name.clone(),
+        });
+    }
+    if device.present_modes.is_empty() {
+        return Err(VulkanCapabilityError::MissingPresentMode {
+            device: device.name.clone(),
+        });
+    }
+    if !supports_color_attachment_usage(device.surface_capabilities) {
+        return Err(VulkanCapabilityError::MissingColorAttachmentUsage {
             device: device.name.clone(),
         });
     }
@@ -4050,7 +4101,8 @@ fn select_queue_families(
     if let Some(unified) = device
         .queue_families
         .iter()
-        .find(|family| family.graphics && family.present)
+        .filter(|family| family.graphics && family.present)
+        .min_by_key(|family| family.index)
     {
         return Ok((unified.index, unified.index));
     }
@@ -4058,7 +4110,8 @@ fn select_queue_families(
     let graphics_queue_family = device
         .queue_families
         .iter()
-        .find(|family| family.graphics)
+        .filter(|family| family.graphics)
+        .min_by_key(|family| family.index)
         .ok_or_else(|| VulkanCapabilityError::NoGraphicsQueue {
             device: device.name.clone(),
         })?
@@ -4066,12 +4119,21 @@ fn select_queue_families(
     let present_queue_family = device
         .queue_families
         .iter()
-        .find(|family| family.present)
+        .filter(|family| family.present)
+        .min_by_key(|family| family.index)
         .ok_or_else(|| VulkanCapabilityError::NoPresentQueue {
             device: device.name.clone(),
         })?
         .index;
     Ok((graphics_queue_family, present_queue_family))
+}
+
+fn supports_surface_formats(device: &VulkanPhysicalDeviceRecord) -> bool {
+    !device.surface_formats.is_empty()
+}
+
+fn supports_color_attachment_usage(capabilities: VulkanSwapchainSurfaceCapabilities) -> bool {
+    capabilities.supported_usage_flags & vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw() != 0
 }
 
 fn score_device(
@@ -4454,6 +4516,53 @@ mod tests {
     }
 
     #[test]
+    fn device_selection_skips_rejected_candidates_before_accepting_valid_gpu() {
+        let mut rejected = device("Rejected", VulkanDeviceType::DiscreteGpu, 0, true, false);
+        rejected.queue_families[0].present = false;
+        let accepted = device("Accepted", VulkanDeviceType::IntegratedGpu, 2, true, false);
+
+        let report =
+            select_physical_device(&[rejected, accepted]).expect("selected fallback device");
+
+        assert_eq!(report.device_name, "Accepted");
+        assert_eq!(report.graphics_queue_family, 2);
+        assert_eq!(report.present_queue_family, 2);
+    }
+
+    #[test]
+    fn queue_family_selection_prefers_lowest_index_unified_family() {
+        let mut candidate = device(
+            "Unified later in list",
+            VulkanDeviceType::DiscreteGpu,
+            7,
+            true,
+            false,
+        );
+        candidate.queue_families = vec![
+            VulkanQueueFamily {
+                index: 9,
+                graphics: true,
+                present: true,
+            },
+            VulkanQueueFamily {
+                index: 3,
+                graphics: true,
+                present: true,
+            },
+            VulkanQueueFamily {
+                index: 1,
+                graphics: true,
+                present: false,
+            },
+        ];
+
+        let report = select_physical_device(&[candidate]).expect("selected unified queue");
+
+        assert_eq!(report.graphics_queue_family, 3);
+        assert_eq!(report.present_queue_family, 3);
+    }
+
+    #[test]
     fn portability_subset_is_reported_and_enabled_when_exposed() {
         let report = select_physical_device(&[device(
             "MoltenVK",
@@ -4526,6 +4635,34 @@ mod tests {
         assert!(matches!(
             select_physical_device(&[no_format]),
             Err(VulkanCapabilityError::MissingSurfaceFormat { .. })
+        ));
+
+        let mut no_present_mode = device(
+            "No present mode",
+            VulkanDeviceType::DiscreteGpu,
+            0,
+            true,
+            false,
+        );
+        no_present_mode.present_modes.clear();
+        assert!(matches!(
+            select_physical_device(&[no_present_mode]),
+            Err(VulkanCapabilityError::MissingPresentMode { .. })
+        ));
+
+        let mut no_color_attachment = device(
+            "No color attachment",
+            VulkanDeviceType::DiscreteGpu,
+            0,
+            true,
+            false,
+        );
+        no_color_attachment
+            .surface_capabilities
+            .supported_usage_flags = vk::ImageUsageFlags::TRANSFER_DST.as_raw();
+        assert!(matches!(
+            select_physical_device(&[no_color_attachment]),
+            Err(VulkanCapabilityError::MissingColorAttachmentUsage { .. })
         ));
     }
 
@@ -4681,6 +4818,25 @@ mod tests {
 
         assert_eq!(plan.present_mode, vk::PresentModeKHR::FIFO.as_raw());
         assert_eq!(plan.extent, (800, 600));
+    }
+
+    #[test]
+    fn swapchain_plan_accepts_undefined_surface_format_by_picking_stage0_default() {
+        let mut request = swapchain_request();
+        request.formats = vec![VulkanSurfaceFormat {
+            format: vk::Format::UNDEFINED.as_raw(),
+            color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR.as_raw(),
+        }];
+
+        let plan = plan_vulkan_swapchain(&request).expect("swapchain plan");
+
+        assert_eq!(
+            plan.format,
+            VulkanSurfaceFormat {
+                format: vk::Format::B8G8R8A8_SRGB.as_raw(),
+                color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR.as_raw(),
+            }
+        );
     }
 
     #[test]
@@ -4866,6 +5022,11 @@ mod tests {
                 format: vk::Format::B8G8R8A8_SRGB.as_raw(),
                 color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR.as_raw(),
             }],
+            present_modes: vec![
+                vk::PresentModeKHR::FIFO.as_raw(),
+                vk::PresentModeKHR::MAILBOX.as_raw(),
+            ],
+            surface_capabilities: default_surface_capabilities(),
         }
     }
 
@@ -4886,14 +5047,19 @@ mod tests {
                 vk::PresentModeKHR::FIFO.as_raw(),
                 vk::PresentModeKHR::MAILBOX.as_raw(),
             ],
-            capabilities: VulkanSwapchainSurfaceCapabilities {
-                current_extent: None,
-                min_extent: (320, 240),
-                max_extent: (1024, 768),
-                min_image_count: 2,
-                max_image_count: 3,
-            },
+            capabilities: default_surface_capabilities(),
             preferred_present_mode: vk::PresentModeKHR::MAILBOX.as_raw(),
+        }
+    }
+
+    fn default_surface_capabilities() -> VulkanSwapchainSurfaceCapabilities {
+        VulkanSwapchainSurfaceCapabilities {
+            current_extent: None,
+            min_extent: (320, 240),
+            max_extent: (1024, 768),
+            min_image_count: 2,
+            max_image_count: 3,
+            supported_usage_flags: vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw(),
         }
     }
 }
