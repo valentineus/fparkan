@@ -57,6 +57,9 @@ impl MonotonicClock for WinitClock {
 #[derive(Clone, Debug, Default)]
 pub struct WinitEventSource {
     queue: VecDeque<PlatformEvent>,
+    cursor_position: Option<(f64, f64)>,
+    minimized: Option<bool>,
+    occluded: Option<bool>,
 }
 
 impl WinitEventSource {
@@ -65,6 +68,9 @@ impl WinitEventSource {
     pub const fn new() -> Self {
         Self {
             queue: VecDeque::new(),
+            cursor_position: None,
+            minimized: None,
+            occluded: None,
         }
     }
 
@@ -77,20 +83,24 @@ impl WinitEventSource {
     pub fn push_window_event(&mut self, event: &WindowEvent) {
         match event {
             WindowEvent::KeyboardInput { event, .. } => {
-                self.queue.push_back(PlatformEvent::KeyboardInput {
-                    scancode: event.physical_key.to_scancode().unwrap_or(0),
-                    pressed: event.state.is_pressed(),
-                });
+                if let Some(scancode) = event.physical_key.to_scancode() {
+                    self.queue.push_back(PlatformEvent::KeyboardInput {
+                        scancode,
+                        pressed: event.state.is_pressed(),
+                    });
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                let (x, y) = self.cursor_position.unwrap_or((0.0, 0.0));
                 self.queue.push_back(PlatformEvent::MouseInput {
                     button: mouse_button_code(*button),
                     pressed: state.is_pressed(),
-                    x: 0.0,
-                    y: 0.0,
+                    x,
+                    y,
                 });
             }
             WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_position = Some((position.x, position.y));
                 self.queue.push_back(PlatformEvent::CursorMoved {
                     x: position.x,
                     y: position.y,
@@ -101,10 +111,23 @@ impl WinitEventSource {
                     width: size.width,
                     height: size.height,
                 });
+                let minimized = size.width == 0 || size.height == 0;
+                if self.minimized != Some(minimized) {
+                    self.minimized = Some(minimized);
+                    self.queue.push_back(PlatformEvent::Minimized { minimized });
+                }
             }
             WindowEvent::Focused(focused) => {
                 self.queue
                     .push_back(PlatformEvent::FocusChanged { focused: *focused });
+            }
+            WindowEvent::Occluded(occluded) => {
+                if self.occluded != Some(*occluded) {
+                    self.occluded = Some(*occluded);
+                    self.queue.push_back(PlatformEvent::Occluded {
+                        occluded: *occluded,
+                    });
+                }
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 self.queue.push_back(PlatformEvent::DpiChanged {
@@ -120,8 +143,11 @@ impl WinitEventSource {
 
     /// Pushes events from an event loop event.
     pub fn push_event<T>(&mut self, event: &Event<T>) {
-        if let Event::WindowEvent { event, .. } = event {
-            self.push_window_event(event);
+        match event {
+            Event::Resumed => self.queue.push_back(PlatformEvent::Resumed),
+            Event::Suspended => self.queue.push_back(PlatformEvent::Suspended),
+            Event::WindowEvent { event, .. } => self.push_window_event(event),
+            _ => {}
         }
     }
 }
@@ -133,7 +159,7 @@ fn mouse_button_code(button: MouseButton) -> u16 {
         MouseButton::Middle => 2,
         MouseButton::Back => 3,
         MouseButton::Forward => 4,
-        MouseButton::Other(index) => 100 + index,
+        MouseButton::Other(index) => 100_u16.saturating_add(index),
     }
 }
 
@@ -285,6 +311,7 @@ pub fn window_native_handles(window: &Window) -> Option<NativeWindowHandles> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use winit::event::{DeviceId, ElementState};
 
     #[test]
     fn event_source_buffers_synthetic_events() -> Result<(), PlatformError> {
@@ -374,6 +401,68 @@ mod tests {
         }));
         assert!(events.contains(&PlatformEvent::FocusChanged { focused: false }));
         assert!(events.contains(&PlatformEvent::QuitRequested));
+    }
+
+    #[test]
+    fn push_event_maps_lifecycle_resumed_and_suspended() -> Result<(), PlatformError> {
+        let mut source = WinitEventSource::new();
+        source.push_event(&Event::<()>::Resumed);
+        source.push_event(&Event::<()>::Suspended);
+
+        let mut events = Vec::new();
+        source.poll(&mut events)?;
+
+        assert_eq!(
+            events,
+            vec![PlatformEvent::Resumed, PlatformEvent::Suspended]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cursor_position_and_occlusion_are_preserved_for_mouse_input() -> Result<(), PlatformError> {
+        let mut source = WinitEventSource::new();
+        source.push_window_event(&WindowEvent::CursorMoved {
+            device_id: DeviceId::dummy(),
+            position: (320.0, 240.0).into(),
+        });
+        source.push_window_event(&WindowEvent::MouseInput {
+            device_id: DeviceId::dummy(),
+            state: ElementState::Pressed,
+            button: MouseButton::Other(u16::MAX),
+        });
+        source.push_window_event(&WindowEvent::Occluded(true));
+
+        let mut events = Vec::new();
+        source.poll(&mut events)?;
+
+        assert!(events.contains(&PlatformEvent::CursorMoved { x: 320.0, y: 240.0 }));
+        assert!(events.contains(&PlatformEvent::MouseInput {
+            button: u16::MAX,
+            pressed: true,
+            x: 320.0,
+            y: 240.0,
+        }));
+        assert!(events.contains(&PlatformEvent::Occluded { occluded: true }));
+        Ok(())
+    }
+
+    #[test]
+    fn zero_extent_resize_updates_minimized_state() -> Result<(), PlatformError> {
+        let mut source = WinitEventSource::new();
+        source.push_window_event(&WindowEvent::Resized(winit::dpi::PhysicalSize::new(
+            0u32, 720u32,
+        )));
+        source.push_window_event(&WindowEvent::Resized(winit::dpi::PhysicalSize::new(
+            1280u32, 720u32,
+        )));
+
+        let mut events = Vec::new();
+        source.poll(&mut events)?;
+
+        assert!(events.contains(&PlatformEvent::Minimized { minimized: true }));
+        assert!(events.contains(&PlatformEvent::Minimized { minimized: false }));
+        Ok(())
     }
 }
 
