@@ -1199,6 +1199,7 @@ fn scan_policy_file(path: &Path, failures: &mut Vec<String>) -> Result<(), Strin
             path.display()
         ));
     }
+    validate_unsafe_module_attribute_policy(path, &text, failures);
     let mut previous_line_has_safety_comment = false;
     for (index, line) in text.lines().enumerate() {
         let trimmed = line.trim_start();
@@ -1224,6 +1225,27 @@ fn scan_policy_file(path: &Path, failures: &mut Vec<String>) -> Result<(), Strin
     Ok(())
 }
 
+fn validate_unsafe_module_attribute_policy(path: &Path, text: &str, failures: &mut Vec<String>) {
+    let declares_unsafe_module_boundary = text
+        .lines()
+        .map(str::trim_start)
+        .any(|line| line.starts_with("#![allow(unsafe_code)]"));
+    match (
+        is_audited_unsafe_source(path),
+        declares_unsafe_module_boundary,
+    ) {
+        (true, false) => failures.push(format!(
+            "{}: audited Vulkan FFI module must declare #![allow(unsafe_code)]",
+            path.display()
+        )),
+        (false, true) => failures.push(format!(
+            "{}: #![allow(unsafe_code)] is only permitted in audited Vulkan FFI modules",
+            path.display()
+        )),
+        (true, true) | (false, false) => {}
+    }
+}
+
 fn contains_unsafe_construct(line: &str) -> bool {
     line.contains(concat!("un", "safe {"))
         || line.contains(concat!("un", "safe fn"))
@@ -1240,7 +1262,6 @@ fn has_safety_comment(line: &str) -> bool {
 }
 
 const AUDITED_UNSAFE_SOURCE_FILES: &[&str] = &[
-    "adapters/fparkan-render-vulkan/src/ffi.rs",
     "adapters/fparkan-render-vulkan/src/ffi/instance.rs",
     "adapters/fparkan-render-vulkan/src/ffi/capabilities.rs",
     "adapters/fparkan-render-vulkan/src/ffi/resources.rs",
@@ -3035,5 +3056,35 @@ source = "git+https://example.invalid/repo"
             "safe { call() };"
         )));
         assert!(!contains_unsafe_construct("#![forbid(unsafe_code)]"));
+    }
+
+    #[test]
+    fn unsafe_module_attributes_must_match_audited_ffi_allowlist() {
+        let audited = Path::new("adapters/fparkan-render-vulkan/src/ffi/runtime.rs");
+        let non_audited = Path::new("adapters/fparkan-render-vulkan/src/ffi.rs");
+
+        let mut failures = Vec::new();
+        validate_unsafe_module_attribute_policy(audited, "mod x;\n", &mut failures);
+        assert_eq!(
+            failures,
+            vec![format!(
+                "{}: audited Vulkan FFI module must declare #![allow(unsafe_code)]",
+                audited.display()
+            )]
+        );
+
+        failures.clear();
+        validate_unsafe_module_attribute_policy(
+            non_audited,
+            "#![allow(unsafe_code)]\nmod runtime;\n",
+            &mut failures,
+        );
+        assert_eq!(
+            failures,
+            vec![format!(
+                "{}: #![allow(unsafe_code)] is only permitted in audited Vulkan FFI modules",
+                non_audited.display()
+            )]
+        );
     }
 }
