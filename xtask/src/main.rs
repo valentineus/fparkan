@@ -1665,6 +1665,8 @@ fn validate_native_smoke_provenance_fields(
     expect_bool_field(platform, report, "git_dirty", failures);
     expect_bool_field_value(platform, report, "git_dirty", false, failures);
     expect_nonempty_string(platform, report, "runner_identity", failures);
+    expect_nonempty_string(platform, report, "runner_architecture", failures);
+    expect_runner_architecture_matches_platform(platform, report, failures);
     expect_string_field(
         platform,
         report,
@@ -1719,6 +1721,22 @@ fn validate_native_smoke_runtime_fields(
         2,
         failures,
     );
+    if platform == "macos" {
+        expect_bool_field_value(
+            platform,
+            report,
+            "vulkan_portability_enumeration",
+            true,
+            failures,
+        );
+        expect_bool_field_value(
+            platform,
+            report,
+            "vulkan_portability_subset_enabled",
+            true,
+            failures,
+        );
+    }
 }
 
 fn expect_string_field(
@@ -1811,6 +1829,25 @@ fn expect_target_triple_matches_platform(
     if !matches_platform {
         failures.push(format!(
             "{platform}: target_triple {target_triple:?} does not match platform"
+        ));
+    }
+}
+
+fn expect_runner_architecture_matches_platform(
+    platform: &str,
+    report: &serde_json::Value,
+    failures: &mut Vec<String>,
+) {
+    let Ok(runner_architecture) = json_string_field(report, "runner_architecture") else {
+        return;
+    };
+    let matches_platform = match platform {
+        "macos" => runner_architecture == "aarch64",
+        _ => !runner_architecture.trim().is_empty(),
+    };
+    if !matches_platform {
+        failures.push(format!(
+            "{platform}: runner_architecture {runner_architecture:?} does not match platform policy"
         ));
     }
 }
@@ -2585,6 +2622,7 @@ mod tests {
                         "commit_sha": "0123456789abcdef0123456789abcdef01234567",
                         "git_dirty": false,
                         "runner_identity": "github-actions/12345/stage0-macos",
+                        "runner_architecture": "aarch64",
                         "rust_toolchain": measured_rust_toolchain_version(),
                         "target_triple": target_triple,
                         "platform": platform,
@@ -2608,7 +2646,9 @@ mod tests {
                         "vulkan_swapchain_status": "created",
                         "vulkan_swapchain_width": 1280,
                         "vulkan_swapchain_height": 720,
-                        "vulkan_swapchain_image_count": 3
+                        "vulkan_swapchain_image_count": 3,
+                        "vulkan_portability_enumeration": true,
+                        "vulkan_portability_subset_enabled": true
                     }),
                 )
             })
@@ -2626,6 +2666,7 @@ mod tests {
                 "commit_sha": "unknown",
                 "git_dirty": true,
                 "runner_identity": "",
+                "runner_architecture": "x86_64",
                 "rust_toolchain": measured_rust_toolchain_version(),
                 "target_triple": "x86_64-unknown-linux-gnu",
                 "platform": "macos",
@@ -2661,6 +2702,9 @@ mod tests {
         assert!(failures.contains(
             &"macos: target_triple \"x86_64-unknown-linux-gnu\" does not match platform"
                 .to_string()
+        ));
+        assert!(failures.contains(
+            &"macos: runner_architecture \"x86_64\" does not match platform policy".to_string()
         ));
         assert!(failures.contains(&"macos: frames expected >= 300, found 0".to_string()));
         assert!(failures

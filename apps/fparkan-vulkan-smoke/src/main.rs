@@ -200,6 +200,7 @@ impl SmokeApp {
             commit_sha: current_git_commit_sha(),
             git_dirty: current_git_dirty(),
             runner_identity: measured_runner_identity(),
+            runner_architecture: actual_architecture(),
             rust_toolchain: current_rustc_release(),
             target_triple: current_rustc_host_triple(),
             platform: actual_platform(),
@@ -264,6 +265,8 @@ impl SmokeApp {
                 .map_or(0, |value| value.report().swapchain_image_count),
             vulkan_portability_enumeration: renderer
                 .is_some_and(|value| value.report().portability_enumeration),
+            vulkan_portability_subset_enabled: renderer
+                .is_some_and(|value| value.report().portability_subset_enabled),
         };
         serde_json::to_string_pretty(&smoke_report)
             .map(|json| format!("{json}\n"))
@@ -488,6 +491,7 @@ struct SmokeReport<'a> {
     commit_sha: String,
     git_dirty: bool,
     runner_identity: String,
+    runner_architecture: &'static str,
     rust_toolchain: String,
     target_triple: String,
     platform: &'static str,
@@ -518,6 +522,7 @@ struct SmokeReport<'a> {
     vulkan_swapchain_height: u32,
     vulkan_swapchain_image_count: u32,
     vulkan_portability_enumeration: bool,
+    vulkan_portability_subset_enabled: bool,
 }
 
 fn actual_platform() -> &'static str {
@@ -525,6 +530,13 @@ fn actual_platform() -> &'static str {
         "macos" => "macos",
         "linux" => "linux",
         "windows" => "windows",
+        other => other,
+    }
+}
+
+fn actual_architecture() -> &'static str {
+    match std::env::consts::ARCH {
+        "arm64" => "aarch64",
         other => other,
     }
 }
@@ -692,6 +704,7 @@ mod tests {
             commit_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
             git_dirty: false,
             runner_identity: "github-actions/12345/stage0-macos".to_string(),
+            runner_architecture: "aarch64",
             rust_toolchain: "1.87.0".to_string(),
             target_triple: "aarch64-apple-darwin".to_string(),
             platform: "macos",
@@ -721,12 +734,14 @@ mod tests {
             vulkan_swapchain_height: 540,
             vulkan_swapchain_image_count: 3,
             vulkan_portability_enumeration: true,
+            vulkan_portability_subset_enabled: true,
         })
         .expect("smoke report should serialize");
 
         assert!(json.contains("\"schema_version\": \"fparkan-native-smoke-v1\""));
         assert!(json.contains("\"validation_vuids\": ["));
         assert!(json.contains("\"vulkan_device_name\": \"Apple GPU\""));
+        assert!(json.contains("\"runner_architecture\": \"aarch64\""));
     }
 
     #[test]

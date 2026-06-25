@@ -29,6 +29,8 @@ pub struct VulkanSmokeRendererReport {
     pub shader_manifest_hash: String,
     /// Whether portability enumeration was enabled at instance creation.
     pub portability_enumeration: bool,
+    /// Whether the logical device enabled `VK_KHR_portability_subset`.
+    pub portability_subset_enabled: bool,
     /// Selected device name.
     pub device_name: String,
     /// Graphics queue-family index.

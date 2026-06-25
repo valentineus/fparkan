@@ -13,6 +13,7 @@ use super::{
     VulkanSurfaceProbe, VulkanSwapchainProbe, VulkanSwapchainResources, VulkanValidationMessenger,
     VulkanValidationReport,
 };
+use crate::policy::KHR_PORTABILITY_SUBSET_EXTENSION;
 use crate::shader_manifest::{triangle_shader_manifest, validate_shader_manifest};
 
 fn take_runtime_owners_in_dependency_order<Instance, Validation, Surface, Device, Swapchain>(
@@ -142,6 +143,7 @@ impl VulkanSmokeRenderer {
             report: VulkanSmokeRendererReport {
                 shader_manifest_hash: shader_manifest.manifest_hash.clone(),
                 portability_enumeration: instance_config.enable_portability_enumeration,
+                portability_subset_enabled: false,
                 device_name: String::new(),
                 graphics_queue_family: 0,
                 present_queue_family: 0,
@@ -159,6 +161,11 @@ impl VulkanSmokeRenderer {
                 .instance
                 .as_ref()
                 .is_some_and(|instance| instance.report.create_flags != 0),
+            portability_subset_enabled: device_ref
+                .report
+                .enabled_extensions
+                .iter()
+                .any(|extension| extension == KHR_PORTABILITY_SUBSET_EXTENSION),
             device_name: device_ref.report.device_name.clone(),
             graphics_queue_family: device_ref.report.graphics_queue_family,
             present_queue_family: device_ref.report.present_queue_family,
