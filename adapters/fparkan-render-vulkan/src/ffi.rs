@@ -33,6 +33,7 @@ mod runtime;
 mod smoke;
 mod smoke_types;
 mod surface;
+mod swapchain_resources;
 mod validation;
 
 pub use self::instance::{
@@ -44,9 +45,9 @@ pub use self::instance::{
 #[cfg(test)]
 use self::instance::{cstring_vec, ensure_instance_extensions_available};
 use self::resources::{
-    color_subresource_range, create_command_pool, create_frame_sync, create_swapchain_resources,
-    create_triangle_index_buffer, create_triangle_vertex_buffer, destroy_allocated_buffer,
-    destroy_swapchain_resources, VulkanAllocatedBuffer, VulkanFrameSync, VulkanSwapchainResources,
+    color_subresource_range, create_command_pool, create_frame_sync, create_triangle_index_buffer,
+    create_triangle_vertex_buffer, destroy_allocated_buffer, VulkanAllocatedBuffer,
+    VulkanFrameSync,
 };
 pub use self::runtime::{
     create_vulkan_logical_device_probe, create_vulkan_swapchain_probe,
@@ -64,6 +65,9 @@ use self::surface::extension_name;
 pub use self::surface::{
     create_vulkan_surface_probe, plan_vulkan_surface, render_surface_plan_json, VulkanSurfaceError,
     VulkanSurfacePlan, VulkanSurfaceProbe,
+};
+use self::swapchain_resources::{
+    create_swapchain_resources, destroy_swapchain_resources, VulkanSwapchainResources,
 };
 use self::validation::{create_validation_messenger, VulkanValidationMessenger};
 use ash::vk;
