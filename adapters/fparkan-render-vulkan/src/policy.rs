@@ -185,6 +185,10 @@ pub struct VulkanPhysicalDeviceRecord {
     pub surface_capabilities: VulkanSwapchainSurfaceCapabilities,
     /// Depth/stencil attachment formats supported by the device.
     pub supported_depth_stencil_formats: Vec<i32>,
+    /// Formats that can be used as sampled images.
+    pub sampled_image_formats: Vec<i32>,
+    /// Informational device limits relevant to the future Stage 0 baseline.
+    pub limits: VulkanDeviceLimits,
 }
 
 impl VulkanPhysicalDeviceRecord {
@@ -195,6 +199,30 @@ impl VulkanPhysicalDeviceRecord {
             .iter()
             .any(|candidate| candidate == extension)
     }
+}
+
+/// Informational device limits relevant to future Stage 0 capability growth.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct VulkanDeviceLimits {
+    /// Maximum 2D image dimension supported by the device.
+    pub max_image_dimension_2d: u32,
+    /// Maximum number of live samplers supported by the device.
+    pub max_sampler_allocation_count: u32,
+    /// Maximum number of sampler descriptors per stage.
+    pub max_per_stage_descriptor_samplers: u32,
+    /// Maximum number of bound descriptor sets.
+    pub max_bound_descriptor_sets: u32,
+}
+
+/// Informational capabilities preserved in deterministic Stage 0 reports.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct VulkanInformationalCapabilities {
+    /// Color formats that support sampled-image usage.
+    pub sampled_color_formats: Vec<i32>,
+    /// Depth/stencil formats that support sampled-image usage.
+    pub sampled_depth_formats: Vec<i32>,
+    /// Future-baseline device limits.
+    pub limits: VulkanDeviceLimits,
 }
 
 /// Selected device and queue capability report.
@@ -216,6 +244,8 @@ pub struct VulkanCapabilityReport {
     pub portability_subset: bool,
     /// Enabled device extensions.
     pub enabled_extensions: Vec<String>,
+    /// Informational capabilities retained for future baseline planning.
+    pub informational_capabilities: VulkanInformationalCapabilities,
     /// Devices rejected by deterministic Stage 0 capability validation.
     pub rejected_devices: Vec<VulkanRejectedDeviceReport>,
 }
@@ -459,6 +489,7 @@ pub fn render_capability_report_json(report: &VulkanCapabilityReport) -> String 
         present_queue_family: u32,
         portability_subset: bool,
         enabled_extensions: &'a [String],
+        informational_capabilities: &'a VulkanInformationalCapabilities,
         rejected_devices: &'a [VulkanRejectedDeviceReport],
     }
 
@@ -472,9 +503,10 @@ pub fn render_capability_report_json(report: &VulkanCapabilityReport) -> String 
             present_queue_family: report.present_queue_family,
             portability_subset: report.portability_subset,
             enabled_extensions: &report.enabled_extensions,
+            informational_capabilities: &report.informational_capabilities,
             rejected_devices: &report.rejected_devices,
         },
-        "{\"schema\":0,\"vulkan_api\":\"0.0.0\",\"device_name\":\"unknown\",\"score\":0,\"graphics_queue_family\":0,\"present_queue_family\":0,\"portability_subset\":false,\"enabled_extensions\":[],\"rejected_devices\":[]}",
+        "{\"schema\":0,\"vulkan_api\":\"0.0.0\",\"device_name\":\"unknown\",\"score\":0,\"graphics_queue_family\":0,\"present_queue_family\":0,\"portability_subset\":false,\"enabled_extensions\":[],\"informational_capabilities\":{\"sampled_color_formats\":[],\"sampled_depth_formats\":[],\"limits\":{\"max_image_dimension_2d\":0,\"max_sampler_allocation_count\":0,\"max_per_stage_descriptor_samplers\":0,\"max_bound_descriptor_sets\":0}},\"rejected_devices\":[]}",
     )
 }
 
@@ -694,6 +726,7 @@ pub(crate) fn validate_device_for_request(
         present_queue_family,
         portability_subset,
         enabled_extensions,
+        informational_capabilities: informational_capabilities(device),
         rejected_devices: Vec::new(),
     })
 }
@@ -780,6 +813,21 @@ fn supports_depth_stencil_request(
     })
 }
 
+fn informational_capabilities(
+    device: &VulkanPhysicalDeviceRecord,
+) -> VulkanInformationalCapabilities {
+    let (sampled_depth_formats, sampled_color_formats): (Vec<_>, Vec<_>) = device
+        .sampled_image_formats
+        .iter()
+        .copied()
+        .partition(|format| is_depth_stencil_format(*format));
+    VulkanInformationalCapabilities {
+        sampled_color_formats,
+        sampled_depth_formats,
+        limits: device.limits,
+    }
+}
+
 fn required_depth_stencil_formats(depth: DepthStencilSupport) -> &'static [vk::Format] {
     match (depth.depth_bits, depth.stencil_bits) {
         (0, 0) => &[],
@@ -794,6 +842,19 @@ fn required_depth_stencil_formats(depth: DepthStencilSupport) -> &'static [vk::F
         (32, 8) => &[vk::Format::D32_SFLOAT_S8_UINT],
         _ => &[],
     }
+}
+
+fn is_depth_stencil_format(format: i32) -> bool {
+    matches!(
+        vk::Format::from_raw(format),
+        vk::Format::D16_UNORM
+            | vk::Format::X8_D24_UNORM_PACK32
+            | vk::Format::D32_SFLOAT
+            | vk::Format::S8_UINT
+            | vk::Format::D16_UNORM_S8_UINT
+            | vk::Format::D24_UNORM_S8_UINT
+            | vk::Format::D32_SFLOAT_S8_UINT
+    )
 }
 
 fn score_device(

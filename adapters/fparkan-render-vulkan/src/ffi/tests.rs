@@ -318,6 +318,36 @@ fn capability_gate_respects_request_specific_depth_profiles() {
 }
 
 #[test]
+fn capability_report_preserves_informational_sampled_formats_and_limits() {
+    let report = select_physical_device(&[device(
+        "Telemetry GPU",
+        VulkanDeviceType::DiscreteGpu,
+        0,
+        true,
+        false,
+    )])
+    .expect("selected device");
+
+    assert_eq!(
+        report.informational_capabilities.sampled_color_formats,
+        vec![vk::Format::B8G8R8A8_SRGB.as_raw()]
+    );
+    assert_eq!(
+        report.informational_capabilities.sampled_depth_formats,
+        vec![vk::Format::D32_SFLOAT.as_raw()]
+    );
+    assert_eq!(
+        report.informational_capabilities.limits,
+        VulkanDeviceLimits {
+            max_image_dimension_2d: 4096,
+            max_sampler_allocation_count: 4096,
+            max_per_stage_descriptor_samplers: 16,
+            max_bound_descriptor_sets: 4,
+        }
+    );
+}
+
+#[test]
 fn capability_report_json_is_stable() {
     let mut rejected = device("Rejected", VulkanDeviceType::IntegratedGpu, 0, true, false);
     rejected.present_modes.clear();
@@ -329,7 +359,7 @@ fn capability_report_json_is_stable() {
 
     assert_eq!(
         render_capability_report_json(&report),
-        "{\"schema\":1,\"vulkan_api\":\"1.1.0\",\"device_name\":\"GPU \\\"A\\\"\",\"score\":1101,\"graphics_queue_family\":3,\"present_queue_family\":3,\"portability_subset\":false,\"enabled_extensions\":[\"VK_KHR_swapchain\"],\"rejected_devices\":[{\"device_name\":\"Rejected\",\"reason_code\":\"missing_present_mode\",\"reason\":\"Vulkan device Rejected has no supported present mode\"}]}"
+        "{\"schema\":1,\"vulkan_api\":\"1.1.0\",\"device_name\":\"GPU \\\"A\\\"\",\"score\":1101,\"graphics_queue_family\":3,\"present_queue_family\":3,\"portability_subset\":false,\"enabled_extensions\":[\"VK_KHR_swapchain\"],\"informational_capabilities\":{\"sampled_color_formats\":[50],\"sampled_depth_formats\":[126],\"limits\":{\"max_image_dimension_2d\":4096,\"max_sampler_allocation_count\":4096,\"max_per_stage_descriptor_samplers\":16,\"max_bound_descriptor_sets\":4}},\"rejected_devices\":[{\"device_name\":\"Rejected\",\"reason_code\":\"missing_present_mode\",\"reason\":\"Vulkan device Rejected has no supported present mode\"}]}"
     );
 }
 
@@ -695,6 +725,16 @@ fn device(
             vk::Format::D32_SFLOAT_S8_UINT.as_raw(),
             vk::Format::D32_SFLOAT.as_raw(),
         ],
+        sampled_image_formats: vec![
+            vk::Format::B8G8R8A8_SRGB.as_raw(),
+            vk::Format::D32_SFLOAT.as_raw(),
+        ],
+        limits: VulkanDeviceLimits {
+            max_image_dimension_2d: 4096,
+            max_sampler_allocation_count: 4096,
+            max_per_stage_descriptor_samplers: 16,
+            max_bound_descriptor_sets: 4,
+        },
     }
 }
 

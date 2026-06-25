@@ -7,9 +7,9 @@ use std::ffi::CStr;
 use super::{VulkanInstanceProbe, VulkanSurfaceProbe};
 use crate::policy::{
     compare_reports, plan_vulkan_swapchain, validate_device_for_request, VulkanCapabilityError,
-    VulkanCapabilityReport, VulkanDeviceType, VulkanPhysicalDeviceRecord, VulkanQueueFamily,
-    VulkanSurfaceFormat, VulkanSwapchainError, VulkanSwapchainPlan, VulkanSwapchainRequest,
-    VulkanSwapchainSurfaceCapabilities,
+    VulkanCapabilityReport, VulkanDeviceLimits, VulkanDeviceType, VulkanPhysicalDeviceRecord,
+    VulkanQueueFamily, VulkanSurfaceFormat, VulkanSwapchainError, VulkanSwapchainPlan,
+    VulkanSwapchainRequest, VulkanSwapchainSurfaceCapabilities,
 };
 
 /// Live Vulkan device/surface capability probe.
@@ -242,6 +242,7 @@ fn live_device_candidate(
     let present_modes = live_present_modes(surface, device, &name)?;
     let surface_capabilities = live_surface_capabilities(surface, device, &name)?;
     let supported_depth_stencil_formats = live_depth_stencil_formats(instance, device);
+    let sampled_image_formats = live_sampled_image_formats(instance, device);
     let queue_families = queue_properties
         .iter()
         .enumerate()
@@ -284,6 +285,13 @@ fn live_device_candidate(
         present_modes: present_modes.clone(),
         surface_capabilities,
         supported_depth_stencil_formats,
+        sampled_image_formats,
+        limits: VulkanDeviceLimits {
+            max_image_dimension_2d: properties.limits.max_image_dimension2_d,
+            max_sampler_allocation_count: properties.limits.max_sampler_allocation_count,
+            max_per_stage_descriptor_samplers: properties.limits.max_per_stage_descriptor_samplers,
+            max_bound_descriptor_sets: properties.limits.max_bound_descriptor_sets,
+        },
     };
     let capability = validate_device_for_request(&record, render_request)
         .map_err(VulkanRuntimeCapabilityError::Capability)?;
@@ -464,6 +472,36 @@ fn live_depth_stencil_formats(
         properties
             .optimal_tiling_features
             .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+    })
+    .map(vk::Format::as_raw)
+    .collect()
+}
+
+fn live_sampled_image_formats(
+    instance: &VulkanInstanceProbe,
+    device: vk::PhysicalDevice,
+) -> Vec<i32> {
+    [
+        vk::Format::R8G8B8A8_SRGB,
+        vk::Format::B8G8R8A8_SRGB,
+        vk::Format::D16_UNORM,
+        vk::Format::D32_SFLOAT,
+        vk::Format::D24_UNORM_S8_UINT,
+        vk::Format::D32_SFLOAT_S8_UINT,
+    ]
+    .into_iter()
+    .filter(|format| {
+        let properties = {
+            // SAFETY: `device` belongs to `instance`; format-property queries copy data by value.
+            unsafe {
+                instance
+                    .instance
+                    .get_physical_device_format_properties(device, *format)
+            }
+        };
+        properties
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)
     })
     .map(vk::Format::as_raw)
     .collect()
