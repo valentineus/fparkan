@@ -7,7 +7,7 @@ pub(crate) use crate::ffi::{
 use crate::policy::serialize_json_or_fallback;
 
 pub(crate) const SHADER_MANIFEST_SCHEMA: u32 = 2;
-pub(crate) const SHADER_TARGET_ENV: &str = "vulkan1.0";
+pub(crate) const SHADER_TARGET_ENV: &str = "vulkan1.1";
 pub(crate) const SHADER_COMPILER_NAME: &str = "glslangValidator";
 pub(crate) const SHADER_COMPILER_VERSION: &str = "11:16.3.0";
 pub(crate) const SHADER_COMPILER_BINARY_SHA256: &str =
@@ -24,18 +24,18 @@ pub(crate) const TRIANGLE_VERTEX_SOURCE_SHA256: &str =
 pub(crate) const TRIANGLE_VERTEX_SPIRV_PATH: &str =
     "adapters/fparkan-render-vulkan/shaders/triangle.vert.spv";
 pub(crate) const TRIANGLE_VERTEX_COMPILE_COMMAND: &str =
-    "glslangValidator -V -S vert -e main adapters/fparkan-render-vulkan/shaders/triangle.vert -o adapters/fparkan-render-vulkan/shaders/triangle.vert.spv";
+    "glslangValidator -V --target-env vulkan1.1 -S vert -e main adapters/fparkan-render-vulkan/shaders/triangle.vert -o adapters/fparkan-render-vulkan/shaders/triangle.vert.spv";
 pub(crate) const TRIANGLE_VERTEX_VALIDATE_COMMAND: &str =
-    "spirv-val --target-env vulkan1.0 adapters/fparkan-render-vulkan/shaders/triangle.vert.spv";
+    "spirv-val --target-env vulkan1.1 adapters/fparkan-render-vulkan/shaders/triangle.vert.spv";
 const TRIANGLE_FRAGMENT_SOURCE_PATH: &str = "adapters/fparkan-render-vulkan/shaders/triangle.frag";
 const TRIANGLE_FRAGMENT_SOURCE_SHA256: &str =
     "f19e74d001d07fb537d4b0f9e621f9b8bc40eeb68816130220853abea6bd4445";
 const TRIANGLE_FRAGMENT_SPIRV_PATH: &str =
     "adapters/fparkan-render-vulkan/shaders/triangle.frag.spv";
 const TRIANGLE_FRAGMENT_COMPILE_COMMAND: &str =
-    "glslangValidator -V -S frag -e main adapters/fparkan-render-vulkan/shaders/triangle.frag -o adapters/fparkan-render-vulkan/shaders/triangle.frag.spv";
+    "glslangValidator -V --target-env vulkan1.1 -S frag -e main adapters/fparkan-render-vulkan/shaders/triangle.frag -o adapters/fparkan-render-vulkan/shaders/triangle.frag.spv";
 const TRIANGLE_FRAGMENT_VALIDATE_COMMAND: &str =
-    "spirv-val --target-env vulkan1.0 adapters/fparkan-render-vulkan/shaders/triangle.frag.spv";
+    "spirv-val --target-env vulkan1.1 adapters/fparkan-render-vulkan/shaders/triangle.frag.spv";
 
 fn shader_compiler_name() -> &'static str {
     option_env!("FPARKAN_BUILD_SHADER_COMPILER_NAME").unwrap_or(SHADER_COMPILER_NAME)

@@ -564,7 +564,7 @@ fn triangle_shader_manifest_hashes_are_stable() {
     );
     assert_eq!(
         report.manifest_hash,
-        "725529e9449fa53017e7df75f3f14c76d53479a5a7617d55ec78280b3059bc44"
+        "20fb84fb6edbd6897e2ea3c2ec3a6db3826a84b46c4efb69027c1cfc0119ccf2"
     );
 }
 
