@@ -1583,6 +1583,16 @@ fn validate_native_smoke_report(
     report: &serde_json::Value,
     failures: &mut Vec<String>,
 ) {
+    validate_native_smoke_status_fields(platform, report, failures);
+    validate_native_smoke_provenance_fields(platform, report, failures);
+    validate_native_smoke_runtime_fields(platform, report, failures);
+}
+
+fn validate_native_smoke_status_fields(
+    platform: &str,
+    report: &serde_json::Value,
+    failures: &mut Vec<String>,
+) {
     expect_string_field(
         platform,
         report,
@@ -1634,13 +1644,16 @@ fn validate_native_smoke_report(
         "created",
         failures,
     );
-    expect_u64_at_least(platform, report, "frames", 300, failures);
-    expect_u64_at_least(platform, report, "resize_count", 1, failures);
-    expect_u64_at_least(platform, report, "swapchain_recreate_count", 1, failures);
-    expect_u64_field(platform, report, "validation_warning_count", 0, failures);
-    expect_u64_field(platform, report, "validation_error_count", 0, failures);
-    expect_nonempty_string(platform, report, "commit_sha", failures);
+}
+
+fn validate_native_smoke_provenance_fields(
+    platform: &str,
+    report: &serde_json::Value,
+    failures: &mut Vec<String>,
+) {
+    expect_commit_sha(platform, report, failures);
     expect_bool_field(platform, report, "git_dirty", failures);
+    expect_bool_field_value(platform, report, "git_dirty", false, failures);
     expect_nonempty_string(platform, report, "runner_identity", failures);
     expect_string_field(
         platform,
@@ -1651,6 +1664,19 @@ fn validate_native_smoke_report(
     );
     expect_string_field(platform, report, "platform", platform, failures);
     expect_nonempty_string(platform, report, "target_triple", failures);
+    expect_target_triple_matches_platform(platform, report, failures);
+}
+
+fn validate_native_smoke_runtime_fields(
+    platform: &str,
+    report: &serde_json::Value,
+    failures: &mut Vec<String>,
+) {
+    expect_u64_at_least(platform, report, "frames", 300, failures);
+    expect_u64_at_least(platform, report, "resize_count", 1, failures);
+    expect_u64_at_least(platform, report, "swapchain_recreate_count", 1, failures);
+    expect_u64_field(platform, report, "validation_warning_count", 0, failures);
+    expect_u64_field(platform, report, "validation_error_count", 0, failures);
     expect_nonempty_string(platform, report, "shader_manifest_hash", failures);
     expect_nonempty_string(platform, report, "vulkan_device_name", failures);
     expect_u64_at_least(
@@ -1724,6 +1750,58 @@ fn expect_bool_field(
         Some(serde_json::Value::Bool(_)) => {}
         Some(_) => failures.push(format!("{platform}: {field} must be a boolean")),
         None => failures.push(format!("{platform}: missing {field}")),
+    }
+}
+
+fn expect_bool_field_value(
+    platform: &str,
+    report: &serde_json::Value,
+    field: &str,
+    expected: bool,
+    failures: &mut Vec<String>,
+) {
+    match report.get(field) {
+        Some(serde_json::Value::Bool(actual)) if *actual == expected => {}
+        Some(serde_json::Value::Bool(actual)) => {
+            failures.push(format!(
+                "{platform}: {field} expected {expected}, found {actual}"
+            ));
+        }
+        Some(_) => failures.push(format!("{platform}: {field} must be a boolean")),
+        None => failures.push(format!("{platform}: missing {field}")),
+    }
+}
+
+fn expect_commit_sha(platform: &str, report: &serde_json::Value, failures: &mut Vec<String>) {
+    match report.get("commit_sha") {
+        Some(serde_json::Value::String(commit_sha))
+            if commit_sha.len() == 40 && commit_sha.chars().all(|ch| ch.is_ascii_hexdigit()) => {}
+        Some(serde_json::Value::String(_)) => failures.push(format!(
+            "{platform}: commit_sha must be a 40-character lowercase or uppercase hex string"
+        )),
+        Some(_) => failures.push(format!("{platform}: commit_sha must be a string")),
+        None => failures.push(format!("{platform}: missing commit_sha")),
+    }
+}
+
+fn expect_target_triple_matches_platform(
+    platform: &str,
+    report: &serde_json::Value,
+    failures: &mut Vec<String>,
+) {
+    let Ok(target_triple) = json_string_field(report, "target_triple") else {
+        return;
+    };
+    let matches_platform = match platform {
+        "macos" => target_triple.contains("apple-darwin"),
+        "linux" => target_triple.contains("linux"),
+        "windows" => target_triple.contains("windows"),
+        _ => true,
+    };
+    if !matches_platform {
+        failures.push(format!(
+            "{platform}: target_triple {target_triple:?} does not match platform"
+        ));
     }
 }
 
@@ -2518,6 +2596,12 @@ mod tests {
         let reports = ["macos"]
             .into_iter()
             .map(|platform| {
+                let target_triple = match platform {
+                    "macos" => "aarch64-apple-darwin",
+                    "linux" => "x86_64-unknown-linux-gnu",
+                    "windows" => "x86_64-pc-windows-msvc",
+                    _ => "unknown-target",
+                };
                 (
                     platform.to_string(),
                     serde_json::json!({
@@ -2526,7 +2610,7 @@ mod tests {
                         "git_dirty": false,
                         "runner_identity": "github-actions/12345/stage0-macos",
                         "rust_toolchain": measured_rust_toolchain_version(),
-                        "target_triple": format!("{platform}-test-target"),
+                        "target_triple": target_triple,
                         "platform": platform,
                         "status": "passed",
                         "frames": 300,
@@ -2563,11 +2647,11 @@ mod tests {
             "macos".to_string(),
             serde_json::json!({
                 "schema_version": "fparkan-native-smoke-v1",
-                "commit_sha": "0123456789abcdef0123456789abcdef01234567",
-                "git_dirty": "dirty",
+                "commit_sha": "unknown",
+                "git_dirty": true,
                 "runner_identity": "",
                 "rust_toolchain": measured_rust_toolchain_version(),
-                "target_triple": "aarch64-apple-darwin",
+                "target_triple": "x86_64-unknown-linux-gnu",
                 "platform": "macos",
                 "status": "blocked",
                 "frames": 0,
@@ -2592,8 +2676,16 @@ mod tests {
         assert!(
             failures.contains(&"macos: status expected \"passed\", found \"blocked\"".to_string())
         );
-        assert!(failures.contains(&"macos: git_dirty must be a boolean".to_string()));
+        assert!(failures.contains(
+            &"macos: commit_sha must be a 40-character lowercase or uppercase hex string"
+                .to_string()
+        ));
+        assert!(failures.contains(&"macos: git_dirty expected false, found true".to_string()));
         assert!(failures.contains(&"macos: runner_identity must be non-empty".to_string()));
+        assert!(failures.contains(
+            &"macos: target_triple \"x86_64-unknown-linux-gnu\" does not match platform"
+                .to_string()
+        ));
         assert!(failures.contains(&"macos: frames expected >= 300, found 0".to_string()));
         assert!(failures
             .contains(&"macos: validation_error_count must be an unsigned integer".to_string()));

@@ -576,6 +576,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_deprecated_self_assertion_flags() {
+        for flag in [
+            "--status",
+            "--platform",
+            "--validation-error-count",
+            "--resize-count",
+            "--swapchain-recreate-count",
+        ] {
+            let parsed = SmokeOptions::parse(&[
+                "--out".to_string(),
+                "target/report.json".to_string(),
+                flag.to_string(),
+                "value".to_string(),
+            ]);
+
+            assert_eq!(parsed, Err(format!("unknown native smoke option: {flag}")));
+        }
+    }
+
+    #[test]
     fn renders_string_array_json() {
         assert_eq!(
             render_string_array(&["VUID-A".to_string(), "VUID-B".to_string()]),
