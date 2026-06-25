@@ -29,6 +29,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const CORPORA_MANIFEST_ENV: &str = "FPARKAN_CORPORA_MANIFEST";
 const PART1_ROOT_ENV: &str = "FPARKAN_CORPUS_PART1_ROOT";
@@ -36,6 +37,7 @@ const PART2_ROOT_ENV: &str = "FPARKAN_CORPUS_PART2_ROOT";
 const CI_ACCEPTANCE_ROADMAP: &str = "fixtures/acceptance/stage_0_roadmap.md";
 const CI_ACCEPTANCE_COVERAGE: &str = "fixtures/acceptance/coverage.tsv";
 const CI_ACCEPTANCE_REPORT: &str = "target/fparkan/acceptance/stage-0-audit.json";
+const SHADER_MANIFEST_REPORT: &str = "adapters/fparkan-render-vulkan/shaders/manifest.json";
 const STAGE_PACKAGE_MANIFEST: &str = "fixtures/acceptance/stage_packages.toml";
 const SUPPLY_CHAIN_POLICY_CONFIG: &str = "deny.toml";
 const REQUIRED_NATIVE_SMOKE_PLATFORMS: &[&str] = &["macos"];
@@ -73,6 +75,7 @@ fn run(args: &[String]) -> Result<(), String> {
         [cmd] if cmd == "ci" => {
             run_cargo_fmt_check()?;
             run_policy(Path::new("."))?;
+            run_shader_provenance_verification()?;
             cargo(&["test", "--workspace", "--all-targets", "--all-features", "--locked"])?;
             cargo(&[
                 "clippy",
@@ -95,6 +98,7 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         [cmd] if cmd == "policy" => run_policy(Path::new(".")),
+        [cmd] if cmd == "shader-provenance" => run_shader_provenance_verification(),
         [cmd, subcmd, rest @ ..] if cmd == "acceptance" && subcmd == "report" => {
             let options = parse_acceptance_options(rest)?;
             run_acceptance_report(&options)
@@ -129,7 +133,7 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         _ => Err(
-            "usage: cargo xtask ci | policy | acceptance report --suite synthetic|licensed [--stage 0..5|all] [--manifest corpora.toml] [--out <path>] | acceptance audit [--roadmap <path>] [--coverage <path>] [--out <path>] [--strict] | native-smoke audit --dir <path> | package --target <triple> --app viewer|game|headless|cli | test synthetic|licensed [--stage 0..5|all] [--manifest corpora.toml] | corpus baseline --root <path>"
+            "usage: cargo xtask ci | policy | shader-provenance | acceptance report --suite synthetic|licensed [--stage 0..5|all] [--manifest corpora.toml] [--out <path>] | acceptance audit [--roadmap <path>] [--coverage <path>] [--out <path>] [--strict] | native-smoke audit --dir <path> | package --target <triple> --app viewer|game|headless|cli | test synthetic|licensed [--stage 0..5|all] [--manifest corpora.toml] | corpus baseline --root <path>"
                 .to_string(),
         ),
     }
@@ -189,6 +193,285 @@ fn run_cargo_fmt_check() -> Result<(), String> {
     } else {
         Err(format!("cargo fmt exited with {status}"))
     }
+}
+
+fn run_shader_provenance_verification() -> Result<(), String> {
+    let manifest_path = workspace_relative_path(SHADER_MANIFEST_REPORT);
+    let manifest = load_shader_manifest(&manifest_path)?;
+    let compiler_path = resolve_required_tool("FPARKAN_GLSLANG_VALIDATOR", &manifest.compiler)?;
+    let validator_path = resolve_required_tool("FPARKAN_SPIRV_VAL", &manifest.validator)?;
+
+    verify_tool_metadata(&compiler_path, &manifest.compiler)?;
+    verify_tool_metadata(&validator_path, &manifest.validator)?;
+
+    let out_dir = shader_provenance_output_dir();
+    if out_dir.exists() {
+        fs::remove_dir_all(&out_dir).map_err(|err| format!("{}: {err}", out_dir.display()))?;
+    }
+    fs::create_dir_all(&out_dir).map_err(|err| format!("{}: {err}", out_dir.display()))?;
+
+    for module in &manifest.modules {
+        verify_shader_module(&manifest, module, &compiler_path, &validator_path, &out_dir)?;
+    }
+    Ok(())
+}
+
+fn load_shader_manifest(path: &Path) -> Result<ShaderManifestJson, String> {
+    let text = fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    let manifest = serde_json::from_str::<ShaderManifestJson>(&text)
+        .map_err(|err| format!("{}: invalid shader manifest JSON: {err}", path.display()))?;
+    if manifest.modules.is_empty() {
+        return Err(format!(
+            "{}: shader manifest must describe at least one module",
+            path.display()
+        ));
+    }
+    Ok(manifest)
+}
+
+fn resolve_required_tool(
+    env_var: &str,
+    manifest: &ShaderToolManifestJson,
+) -> Result<PathBuf, String> {
+    let requested = std::env::var(env_var).unwrap_or_else(|_| manifest.name.clone());
+    resolve_tool_path(&requested).ok_or_else(|| {
+        format!(
+            "required shader tool {} is unavailable (set {env_var} to override path)",
+            manifest.name
+        )
+    })
+}
+
+fn resolve_tool_path(tool: &str) -> Option<PathBuf> {
+    let candidate = Path::new(tool);
+    if candidate.components().count() > 1 {
+        return candidate.is_file().then(|| candidate.to_path_buf());
+    }
+    let output = Command::new("which").arg(tool).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let resolved = String::from_utf8(output.stdout).ok()?;
+    let resolved = resolved.trim();
+    (!resolved.is_empty()).then(|| PathBuf::from(resolved))
+}
+
+fn verify_tool_metadata(path: &Path, manifest: &ShaderToolManifestJson) -> Result<(), String> {
+    let actual_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("{}: invalid tool filename", path.display()))?;
+    if actual_name != manifest.name {
+        return Err(format!(
+            "{}: tool name mismatch, expected {}, found {}",
+            path.display(),
+            manifest.name,
+            actual_name
+        ));
+    }
+    let actual_version = tool_version(path)?;
+    if actual_version != manifest.version {
+        return Err(format!(
+            "{}: tool version mismatch, expected {:?}, found {:?}",
+            path.display(),
+            manifest.version,
+            actual_version
+        ));
+    }
+    let actual_sha256 = sha256_file(path)?;
+    if actual_sha256 != manifest.binary_sha256 {
+        return Err(format!(
+            "{}: tool SHA-256 mismatch, expected {}, found {}",
+            path.display(),
+            manifest.binary_sha256,
+            actual_sha256
+        ));
+    }
+    Ok(())
+}
+
+fn tool_version(path: &Path) -> Result<String, String> {
+    let output = Command::new(path)
+        .arg("--version")
+        .output()
+        .map_err(|err| format!("{} --version: {err}", path.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} --version exited with {}",
+            path.display(),
+            output.status
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|err| format!("{} --version: invalid UTF-8: {err}", path.display()))?;
+    stdout
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .map(|line| {
+            line.strip_prefix("Glslang Version: ")
+                .unwrap_or(line)
+                .to_string()
+        })
+        .ok_or_else(|| format!("{} --version returned no version line", path.display()))
+}
+
+fn verify_shader_module(
+    manifest: &ShaderManifestJson,
+    module: &ShaderModuleManifestJson,
+    compiler_path: &Path,
+    validator_path: &Path,
+    out_dir: &Path,
+) -> Result<(), String> {
+    let source_path = workspace_relative_path(&module.source_path);
+    let checked_in_spirv_path = workspace_relative_path(&module.spirv_path);
+    let generated_spirv_path = out_dir.join(format!("{}.spv", module.name));
+
+    let source_sha256 = sha256_file(&source_path)?;
+    if source_sha256 != module.source_sha256 {
+        return Err(format!(
+            "{}: source SHA-256 mismatch, expected {}, found {}",
+            source_path.display(),
+            module.source_sha256,
+            source_sha256
+        ));
+    }
+
+    let checked_in_spirv_sha256 = sha256_file(&checked_in_spirv_path)?;
+    if checked_in_spirv_sha256 != module.sha256 {
+        return Err(format!(
+            "{}: checked-in SPIR-V SHA-256 mismatch, expected {}, found {}",
+            checked_in_spirv_path.display(),
+            module.sha256,
+            checked_in_spirv_sha256
+        ));
+    }
+
+    compile_shader_module(
+        compiler_path,
+        &manifest.target_env,
+        module,
+        &source_path,
+        &generated_spirv_path,
+    )?;
+    validate_shader_module(validator_path, &manifest.target_env, &generated_spirv_path)?;
+
+    let generated_spirv_sha256 = sha256_file(&generated_spirv_path)?;
+    if generated_spirv_sha256 != module.sha256 {
+        return Err(format!(
+            "{}: generated SPIR-V SHA-256 mismatch, expected {}, found {}",
+            generated_spirv_path.display(),
+            module.sha256,
+            generated_spirv_sha256
+        ));
+    }
+    Ok(())
+}
+
+fn compile_shader_module(
+    compiler_path: &Path,
+    target_env: &str,
+    module: &ShaderModuleManifestJson,
+    source_path: &Path,
+    output_path: &Path,
+) -> Result<(), String> {
+    let stage = glslang_stage(&module.stage).ok_or_else(|| {
+        format!(
+            "{}: unsupported shader stage {:?}",
+            source_path.display(),
+            module.stage
+        )
+    })?;
+    let output = Command::new(compiler_path)
+        .args(["-V", "--target-env", target_env, "-S", stage, "-e"])
+        .arg(&module.entry_point)
+        .arg(source_path)
+        .arg("-o")
+        .arg(output_path)
+        .output()
+        .map_err(|err| {
+            format!(
+                "{}: shader compile failed to start: {err}",
+                source_path.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "{}: shader compile failed:\n{}{}",
+            source_path.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+fn validate_shader_module(
+    validator_path: &Path,
+    target_env: &str,
+    module_path: &Path,
+) -> Result<(), String> {
+    let output = Command::new(validator_path)
+        .args(["--target-env", target_env])
+        .arg(module_path)
+        .output()
+        .map_err(|err| {
+            format!(
+                "{}: shader validation failed to start: {err}",
+                module_path.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "{}: shader validation failed:\n{}{}",
+            module_path.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+fn glslang_stage(stage: &str) -> Option<&'static str> {
+    match stage {
+        "vertex" => Some("vert"),
+        "fragment" => Some("frag"),
+        _ => None,
+    }
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    for command in [&["shasum", "-a", "256"][..], &["sha256sum"][..]] {
+        let mut process = Command::new(command[0]);
+        process.args(&command[1..]).arg(path);
+        let Ok(output) = process.output() else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let stdout = String::from_utf8(output.stdout)
+            .map_err(|err| format!("{}: invalid checksum output: {err}", path.display()))?;
+        if let Some(sum) = stdout.split_whitespace().next() {
+            return Ok(sum.to_string());
+        }
+    }
+    Err(format!(
+        "{}: could not compute SHA-256 (tried shasum and sha256sum)",
+        path.display()
+    ))
+}
+
+fn shader_provenance_output_dir() -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    workspace_root_path()
+        .join("target")
+        .join("fparkan")
+        .join("shader-provenance")
+        .join(format!("{}-{}", std::process::id(), nonce))
 }
 
 fn run_cargo_deny() -> Result<(), String> {
@@ -1372,6 +1655,32 @@ struct AuditOptions {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NativeSmokeAuditOptions {
     dir: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShaderManifestJson {
+    target_env: String,
+    compiler: ShaderToolManifestJson,
+    validator: ShaderToolManifestJson,
+    modules: Vec<ShaderModuleManifestJson>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShaderToolManifestJson {
+    name: String,
+    version: String,
+    binary_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShaderModuleManifestJson {
+    name: String,
+    stage: String,
+    entry_point: String,
+    source_path: String,
+    source_sha256: String,
+    spirv_path: String,
+    sha256: String,
 }
 
 fn parse_test_options(args: &[String], default_root: PathBuf) -> Result<TestOptions, String> {

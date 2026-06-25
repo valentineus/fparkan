@@ -86,8 +86,8 @@ const VALIDATION_LAYER_NAME: &str = "VK_LAYER_KHRONOS_validation";
 pub(crate) const SPIRV_MAGIC: u32 = 0x0723_0203;
 pub(crate) const SPIRV_VERSION_1_0: u32 = 0x0001_0000;
 pub(crate) const TRIANGLE_VERTEX_SHADER_WORDS: &[u32] = &[
-    SPIRV_MAGIC,
-    SPIRV_VERSION_1_0,
+    0x0723_0203,
+    0x0001_0300,
     0x0008_000b,
     0x0000_0021,
     0x0000_0000,
@@ -341,8 +341,8 @@ pub(crate) const TRIANGLE_VERTEX_SHADER_WORDS: &[u32] = &[
     0x0001_0038,
 ];
 pub(crate) const TRIANGLE_FRAGMENT_SHADER_WORDS: &[u32] = &[
-    SPIRV_MAGIC,
-    SPIRV_VERSION_1_0,
+    0x0723_0203,
+    0x0001_0300,
     0x0008_000b,
     0x0000_0013,
     0x0000_0000,

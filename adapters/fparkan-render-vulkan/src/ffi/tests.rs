@@ -612,7 +612,7 @@ fn triangle_shader_manifest_hashes_are_stable() {
     assert_eq!(report.modules[0].word_count, 253);
     assert_eq!(
         report.modules[0].sha256,
-        "9023b1cc856c98ecd21755596c4e9d1e62cc63e1787f8c43ada2101544e8d0d1"
+        "4d3ceca7b42ebc971d831b0a0d816457397bd9aeda47fb8d44c4b1aeaa5e7ba0"
     );
     assert_eq!(report.modules[0].descriptor_sets, 0);
     assert_eq!(report.modules[0].push_constant_bytes, 0);
@@ -627,11 +627,11 @@ fn triangle_shader_manifest_hashes_are_stable() {
     assert!(!report.modules[0].interface_hash.is_empty());
     assert_eq!(
         report.modules[1].sha256,
-        "6efe2c9716ae845c471ecbaac2c83e56a17a37dc017dd63f0a05f0d9161f44ba"
+        "5a7441be03cd3c25d557268b2e58d5aa50504c87bffcb4c3fd7cbcf007db0b96"
     );
     assert_eq!(
         report.manifest_hash,
-        "20fb84fb6edbd6897e2ea3c2ec3a6db3826a84b46c4efb69027c1cfc0119ccf2"
+        "11e3feb65200ebd2ac87b7e776e9c6433a5da9d71a651bfadea89a51be17ff05"
     );
 }
 
