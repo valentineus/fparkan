@@ -15,6 +15,20 @@ use super::{
 };
 use crate::shader_manifest::{triangle_shader_manifest, validate_shader_manifest};
 
+fn take_runtime_owners_in_dependency_order<Instance, Validation, Surface, Device, Swapchain>(
+    instance: &mut Option<Instance>,
+    validation: &mut Option<Validation>,
+    surface: &mut Option<Surface>,
+    device: &mut Option<Device>,
+    swapchain: &mut Option<Swapchain>,
+) {
+    swapchain.take();
+    device.take();
+    surface.take();
+    validation.take();
+    instance.take();
+}
+
 impl VulkanSmokeRenderer {
     /// Creates a live Vulkan smoke renderer bound to a live native window.
     ///
@@ -546,16 +560,157 @@ impl VulkanSmokeRenderer {
             };
         }
         // Drop child Vulkan owners explicitly before their parents instead of relying on field order.
-        self.swapchain.take();
-        self.device.take();
-        self.surface.take();
-        self.validation.take();
-        self.instance.take();
+        take_runtime_owners_in_dependency_order(
+            &mut self.instance,
+            &mut self.validation,
+            &mut self.surface,
+            &mut self.device,
+            &mut self.swapchain,
+        );
     }
 }
 
 impl Drop for VulkanSmokeRenderer {
     fn drop(&mut self) {
         self.teardown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::take_runtime_owners_in_dependency_order;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TeardownStep {
+        Instance,
+        Validation,
+        Surface,
+        Device,
+        Swapchain,
+    }
+
+    struct DropTracker {
+        step: TeardownStep,
+        log: Rc<RefCell<Vec<TeardownStep>>>,
+    }
+
+    impl Drop for DropTracker {
+        fn drop(&mut self) {
+            self.log.borrow_mut().push(self.step);
+        }
+    }
+
+    fn tracker(step: TeardownStep, log: &Rc<RefCell<Vec<TeardownStep>>>) -> DropTracker {
+        DropTracker {
+            step,
+            log: Rc::clone(log),
+        }
+    }
+
+    fn record_teardown_steps(present_steps: &[TeardownStep]) -> Vec<TeardownStep> {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut instance = present_steps
+            .contains(&TeardownStep::Instance)
+            .then(|| tracker(TeardownStep::Instance, &log));
+        let mut validation = present_steps
+            .contains(&TeardownStep::Validation)
+            .then(|| tracker(TeardownStep::Validation, &log));
+        let mut surface = present_steps
+            .contains(&TeardownStep::Surface)
+            .then(|| tracker(TeardownStep::Surface, &log));
+        let mut device = present_steps
+            .contains(&TeardownStep::Device)
+            .then(|| tracker(TeardownStep::Device, &log));
+        let mut swapchain = present_steps
+            .contains(&TeardownStep::Swapchain)
+            .then(|| tracker(TeardownStep::Swapchain, &log));
+
+        take_runtime_owners_in_dependency_order(
+            &mut instance,
+            &mut validation,
+            &mut surface,
+            &mut device,
+            &mut swapchain,
+        );
+        Rc::into_inner(log)
+            .expect("all drop trackers released")
+            .into_inner()
+    }
+
+    #[test]
+    fn runtime_owners_drop_in_explicit_dependency_order() {
+        assert_eq!(
+            record_teardown_steps(&[
+                TeardownStep::Instance,
+                TeardownStep::Validation,
+                TeardownStep::Surface,
+                TeardownStep::Device,
+                TeardownStep::Swapchain,
+            ]),
+            vec![
+                TeardownStep::Swapchain,
+                TeardownStep::Device,
+                TeardownStep::Surface,
+                TeardownStep::Validation,
+                TeardownStep::Instance,
+            ]
+        );
+    }
+
+    #[test]
+    fn runtime_owners_drop_remaining_children_after_partial_init_failures() {
+        let cases = [
+            (vec![TeardownStep::Instance], vec![TeardownStep::Instance]),
+            (
+                vec![TeardownStep::Instance, TeardownStep::Validation],
+                vec![TeardownStep::Validation, TeardownStep::Instance],
+            ),
+            (
+                vec![
+                    TeardownStep::Instance,
+                    TeardownStep::Validation,
+                    TeardownStep::Surface,
+                ],
+                vec![
+                    TeardownStep::Surface,
+                    TeardownStep::Validation,
+                    TeardownStep::Instance,
+                ],
+            ),
+            (
+                vec![
+                    TeardownStep::Instance,
+                    TeardownStep::Validation,
+                    TeardownStep::Surface,
+                    TeardownStep::Device,
+                ],
+                vec![
+                    TeardownStep::Device,
+                    TeardownStep::Surface,
+                    TeardownStep::Validation,
+                    TeardownStep::Instance,
+                ],
+            ),
+            (
+                vec![
+                    TeardownStep::Instance,
+                    TeardownStep::Surface,
+                    TeardownStep::Device,
+                    TeardownStep::Swapchain,
+                ],
+                vec![
+                    TeardownStep::Swapchain,
+                    TeardownStep::Device,
+                    TeardownStep::Surface,
+                    TeardownStep::Instance,
+                ],
+            ),
+        ];
+
+        for (present_steps, expected) in cases {
+            assert_eq!(record_teardown_steps(&present_steps), expected);
+        }
     }
 }
