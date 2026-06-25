@@ -185,6 +185,14 @@ struct SmokeApp {
     started_at: Instant,
 }
 
+fn drop_renderer_before_window<Renderer, WindowLike>(
+    renderer: &mut Option<Renderer>,
+    window: &mut Option<WindowLike>,
+) {
+    drop(renderer.take());
+    drop(window.take());
+}
+
 impl SmokeApp {
     fn new(
         options: SmokeOptions,
@@ -405,6 +413,14 @@ impl SmokeApp {
         self.resize_requested = true;
         let requested = PhysicalSize::new(DEFAULT_RESIZE_WIDTH, DEFAULT_RESIZE_HEIGHT);
         let _ = window.request_inner_size(requested);
+    }
+}
+
+impl Drop for SmokeApp {
+    fn drop(&mut self) {
+        // Keep the native window alive until the Vulkan renderer finishes
+        // destroying swapchain and surface state that still references it.
+        drop_renderer_before_window(&mut self.renderer, &mut self.window);
     }
 }
 
@@ -859,6 +875,32 @@ fn parse_bool_env(value: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum DropStep {
+        Renderer,
+        Window,
+    }
+
+    struct DropTracker {
+        step: DropStep,
+        log: Rc<RefCell<Vec<DropStep>>>,
+    }
+
+    impl Drop for DropTracker {
+        fn drop(&mut self) {
+            self.log.borrow_mut().push(self.step);
+        }
+    }
+
+    fn tracker(step: DropStep, log: &Rc<RefCell<Vec<DropStep>>>) -> DropTracker {
+        DropTracker {
+            step,
+            log: Rc::clone(log),
+        }
+    }
 
     #[test]
     fn parses_required_args() {
@@ -1057,5 +1099,21 @@ mod tests {
 
         std::fs::remove_file(out).expect("cleanup report");
         std::fs::remove_dir(root).expect("cleanup dir");
+    }
+
+    #[test]
+    fn renderer_is_dropped_before_window() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut renderer = Some(tracker(DropStep::Renderer, &log));
+        let mut window = Some(tracker(DropStep::Window, &log));
+
+        drop_renderer_before_window(&mut renderer, &mut window);
+
+        assert!(renderer.is_none());
+        assert!(window.is_none());
+        assert_eq!(
+            Rc::into_inner(log).expect("trackers released").into_inner(),
+            vec![DropStep::Renderer, DropStep::Window]
+        );
     }
 }
