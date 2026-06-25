@@ -3095,6 +3095,11 @@ pub enum VulkanInstanceError {
         /// Invalid extension name.
         extension: String,
     },
+    /// A required instance extension is unavailable from the loader.
+    MissingInstanceExtension {
+        /// Required extension name.
+        extension: String,
+    },
     /// Validation layers were requested but unavailable.
     MissingValidationLayer,
     /// Instance creation failed.
@@ -3116,6 +3121,9 @@ impl std::fmt::Display for VulkanInstanceError {
                     f,
                     "Vulkan instance extension name contains an interior NUL byte: {extension:?}"
                 )
+            }
+            Self::MissingInstanceExtension { extension } => {
+                write!(f, "Vulkan instance extension {extension} is unavailable")
             }
             Self::MissingValidationLayer => {
                 write!(
@@ -3183,6 +3191,8 @@ pub fn create_vulkan_instance_probe(
         .map_err(|_| VulkanInstanceError::InvalidApplicationName)?;
     let engine_name = c"fparkan";
     let plan = plan_vulkan_instance(config);
+    let available_extensions = available_instance_extensions(&entry)?;
+    ensure_instance_extensions_available(&plan.enabled_extensions, &available_extensions)?;
     let extension_names = cstring_vec(&plan.enabled_extensions)?;
     let extension_ptrs = cstring_ptrs(&extension_names);
     let layer_names = validation_layer_cstrings(&entry, config.enable_validation)?;
@@ -3206,6 +3216,43 @@ pub fn create_vulkan_instance_probe(
         instance,
         report: plan,
     })
+}
+
+fn available_instance_extensions(entry: &ash::Entry) -> Result<Vec<String>, VulkanInstanceError> {
+    let available_extensions =
+        // SAFETY: Enumerating instance extensions reads loader-owned immutable metadata.
+        unsafe { entry.enumerate_instance_extension_properties(None) }.map_err(|error| {
+            VulkanInstanceError::CreateFailed {
+                result: error,
+            }
+        })?;
+    available_extensions
+        .into_iter()
+        .map(|extension| {
+            // SAFETY: Vulkan extension names are fixed-size NUL-terminated strings from the loader.
+            Ok(unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) }
+                .to_string_lossy()
+                .into_owned())
+        })
+        .collect()
+}
+
+fn ensure_instance_extensions_available(
+    required_extensions: &[String],
+    available_extensions: &[String],
+) -> Result<(), VulkanInstanceError> {
+    let available = available_extensions
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    for extension in required_extensions {
+        if !available.contains(extension.as_str()) {
+            return Err(VulkanInstanceError::MissingInstanceExtension {
+                extension: extension.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn validation_layer_cstrings(
@@ -4754,6 +4801,22 @@ mod tests {
             cstring_vec(&["bad\0extension".to_string()]),
             Err(VulkanInstanceError::InvalidExtensionName {
                 extension: "bad\0extension".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn missing_instance_extension_is_reported_before_create_instance() {
+        assert_eq!(
+            ensure_instance_extensions_available(
+                &[
+                    "VK_EXT_debug_utils".to_string(),
+                    "VK_KHR_surface".to_string(),
+                ],
+                &["VK_KHR_surface".to_string()],
+            ),
+            Err(VulkanInstanceError::MissingInstanceExtension {
+                extension: "VK_EXT_debug_utils".to_string(),
             })
         );
     }
