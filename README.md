@@ -81,7 +81,17 @@ cargo run -p fparkan-vulkan-smoke --locked -- \
 
 Перед запуском убедитесь, что на машине доступен Vulkan loader и рабочий ICD:
 
-- macOS: установлены Vulkan SDK и MoltenVK; если используется нестандартная установка, проверьте `VK_ICD_FILENAMES`, `VK_LAYER_PATH` и наличие `VK_LAYER_KHRONOS_validation`.
+- macOS: используйте ту же схему, что и GitHub CI (`macos-15` arm64):
+
+  ```bash
+  brew install molten-vk vulkan-loader vulkan-tools vulkan-validationlayers
+  export VK_ICD_FILENAMES="$(brew --prefix)/opt/molten-vk/etc/vulkan/icd.d/MoltenVK_icd.json"
+  export VK_LAYER_PATH="$(brew --prefix)/opt/vulkan-validationlayers/share/vulkan/explicit_layer.d"
+  export DYLD_FALLBACK_LIBRARY_PATH="$(brew --prefix)/opt/vulkan-loader/lib:$(brew --prefix)/opt/molten-vk/lib"
+  vulkaninfo --summary
+  ```
+
+  Workflow fail-closed проверяет exact formula versions и ожидает наличие `VK_LAYER_KHRONOS_validation`.
 - Linux: установлен `libvulkan` и драйвер/ICD (`mesa-vulkan-drivers`, Lavapipe или vendor GPU stack); smoke нужно запускать из активной графической сессии X11/Wayland.
 - Windows: установлен Vulkan runtime от GPU vendor или LunarG Vulkan SDK; validation layer должен быть доступен из активного runtime.
 
