@@ -18,11 +18,14 @@ use fparkan_render_vulkan::{
 use serde::Serialize;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
+use winit::event::StartCause;
 use winit::event::WindowEvent;
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
 const SCHEMA_VERSION: &str = "fparkan-native-smoke-v1";
@@ -50,11 +53,35 @@ fn main() {
 fn run(args: &[String]) -> Result<String, String> {
     let options = SmokeOptions::parse(args)?;
     let event_loop = EventLoop::new().map_err(|err| format!("winit event loop: {err}"))?;
-    let mut app = SmokeApp::new(options);
+    event_loop.set_control_flow(ControlFlow::Poll);
+    let completed = Arc::new(AtomicBool::new(false));
+    spawn_timeout_watchdog(options.clone(), Arc::clone(&completed));
+    let mut app = SmokeApp::new(options, completed);
     if let Err(err) = event_loop.run_app(&mut app) {
         app.error = Some(format!("winit event loop: {err}"));
     }
     app.finish()
+}
+
+fn spawn_timeout_watchdog(options: SmokeOptions, completed: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(options.timeout_seconds));
+        if completed.load(Ordering::SeqCst) || options.out.exists() {
+            return;
+        }
+        let failure_reason = format!(
+            "native smoke timed out after {} seconds",
+            options.timeout_seconds
+        );
+        if let Ok(report) = render_timeout_failure_report(&options, &failure_reason) {
+            if let Some(parent) = options.out.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&options.out, report);
+        }
+        eprintln!("{failure_reason}");
+        std::process::exit(2);
+    });
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -125,6 +152,7 @@ impl SmokeOptions {
 
 struct SmokeApp {
     options: SmokeOptions,
+    completed: Arc<AtomicBool>,
     window_id: Option<WindowId>,
     window: Option<Window>,
     renderer: Option<VulkanSmokeRenderer>,
@@ -138,9 +166,10 @@ struct SmokeApp {
 }
 
 impl SmokeApp {
-    fn new(options: SmokeOptions) -> Self {
+    fn new(options: SmokeOptions, completed: Arc<AtomicBool>) -> Self {
         Self {
             options,
+            completed,
             window_id: None,
             window: None,
             renderer: None,
@@ -158,6 +187,7 @@ impl SmokeApp {
         if let Some(output) = self.output.take() {
             return Ok(output);
         }
+        self.completed.store(true, Ordering::SeqCst);
         let error = self
             .error
             .clone()
@@ -330,6 +360,7 @@ impl SmokeApp {
                 return;
             }
         };
+        self.completed.store(true, Ordering::SeqCst);
         if let Err(err) = self.write_report(&report) {
             self.error = Some(err);
             event_loop.exit();
@@ -352,7 +383,57 @@ impl SmokeApp {
     }
 }
 
+fn render_timeout_failure_report(
+    options: &SmokeOptions,
+    failure_reason: &str,
+) -> Result<String, String> {
+    let smoke_report = SmokeReport {
+        schema_version: SCHEMA_VERSION,
+        commit_sha: compiled_commit_sha(),
+        git_dirty: compiled_git_dirty(),
+        runner_identity: measured_runner_identity(),
+        runner_architecture: actual_architecture(),
+        rust_toolchain: compiled_rust_toolchain(),
+        target_triple: compiled_target_triple(),
+        platform: actual_platform(),
+        status: "failed",
+        failure_reason: Some(failure_reason),
+        frames: 0,
+        resize_count: 0,
+        swapchain_recreate_count: 0,
+        validation_warning_count: 0,
+        validation_error_count: 0,
+        validation_vuids: &[],
+        requested_frames: options.frames,
+        timeout_seconds: options.timeout_seconds,
+        shader_manifest_hash: "",
+        vulkan_loader_status: "failed",
+        vulkan_instance_status: "failed",
+        window_status: "failed",
+        vulkan_surface_status: "failed",
+        vulkan_device_status: "failed",
+        vulkan_device_name: "",
+        vulkan_logical_device_status: "failed",
+        vulkan_logical_device_graphics_queue_family: 0,
+        vulkan_logical_device_present_queue_family: 0,
+        vulkan_logical_device_enabled_extension_count: 0,
+        vulkan_swapchain_status: "failed",
+        vulkan_swapchain_width: 0,
+        vulkan_swapchain_height: 0,
+        vulkan_swapchain_image_count: 0,
+        vulkan_portability_enumeration: false,
+        vulkan_portability_subset_enabled: false,
+    };
+    serde_json::to_string_pretty(&smoke_report)
+        .map(|json| format!("{json}\n"))
+        .map_err(|err| format!("native smoke report serialization failed: {err}"))
+}
+
 impl ApplicationHandler for SmokeApp {
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, _cause: StartCause) {
+        let _ = self.abort_if_timed_out(event_loop);
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.abort_if_timed_out(event_loop) {
             return;
@@ -818,6 +899,7 @@ mod tests {
                 resize_frame: DEFAULT_RESIZE_FRAME,
                 timeout_seconds: 7,
             },
+            completed: Arc::new(AtomicBool::new(false)),
             window_id: None,
             window: None,
             renderer: None,

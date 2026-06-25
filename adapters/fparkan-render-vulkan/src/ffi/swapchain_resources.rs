@@ -259,10 +259,12 @@ fn create_pipeline_layout(
     })
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn extent_component_to_f32(value: u32) -> f32 {
     value as f32
 }
 
+#[allow(clippy::too_many_lines)]
 fn create_graphics_pipeline(
     device: &VulkanLogicalDeviceProbe,
     render_pass: vk::RenderPass,

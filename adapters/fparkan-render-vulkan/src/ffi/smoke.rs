@@ -51,9 +51,10 @@ where
 
     fn commit(mut self) -> T {
         self.rollback.take();
-        self.value
-            .take()
-            .expect("rollback guard must hold a value until commit")
+        match self.value.take() {
+            Some(value) => value,
+            None => unreachable!("rollback guard must hold a value until commit"),
+        }
     }
 }
 

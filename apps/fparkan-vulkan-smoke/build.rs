@@ -19,18 +19,25 @@ fn main() {
         println!("cargo:rustc-env=FPARKAN_BUILD_RUST_TOOLCHAIN={toolchain}");
     }
 
-    let workspace_root =
-        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest dir")).join("../..");
-    if let Some(git_dir) = git_dir(&workspace_root) {
-        emit_git_rerun_hints(&git_dir);
-    }
+    if let Some(workspace_root) = workspace_root() {
+        if let Some(git_dir) = git_dir(&workspace_root) {
+            emit_git_rerun_hints(&git_dir);
+        }
 
-    if let Some(commit_sha) = env_commit_sha().or_else(|| git_head_commit_sha(&workspace_root)) {
-        println!("cargo:rustc-env=FPARKAN_BUILD_COMMIT_SHA={commit_sha}");
+        if let Some(commit_sha) = env_commit_sha().or_else(|| git_head_commit_sha(&workspace_root))
+        {
+            println!("cargo:rustc-env=FPARKAN_BUILD_COMMIT_SHA={commit_sha}");
+        }
+        if let Some(git_dirty) = git_dirty(&workspace_root) {
+            println!("cargo:rustc-env=FPARKAN_BUILD_GIT_DIRTY={git_dirty}");
+        }
     }
-    if let Some(git_dirty) = git_dirty(&workspace_root) {
-        println!("cargo:rustc-env=FPARKAN_BUILD_GIT_DIRTY={git_dirty}");
-    }
+}
+
+fn workspace_root() -> Option<PathBuf> {
+    env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .map(|manifest_dir| manifest_dir.join("../.."))
 }
 
 fn env_commit_sha() -> Option<String> {
