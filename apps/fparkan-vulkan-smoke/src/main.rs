@@ -443,11 +443,7 @@ fn render_timeout_failure_report(
         } else {
             "failed"
         },
-        window_status: if progress.window_created.load(Ordering::SeqCst) {
-            "created"
-        } else {
-            "failed"
-        },
+        window_status: progress.window_phase.status(),
         vulkan_surface_status: if bootstrap.surface_created {
             "created"
         } else {
@@ -492,6 +488,7 @@ impl ApplicationHandler for SmokeApp {
         if self.abort_if_timed_out(event_loop) {
             return;
         }
+        self.progress.window_phase.store(WindowPhase::Resumed);
         if self.window.is_some() {
             return;
         }
@@ -503,6 +500,9 @@ impl ApplicationHandler for SmokeApp {
                 return;
             }
         };
+        self.progress
+            .window_phase
+            .store(WindowPhase::CreatingWindow);
         let attributes = Window::default_attributes()
             .with_title("FParkan Vulkan smoke")
             .with_inner_size(PhysicalSize::new(plan.width, plan.height));
@@ -536,7 +536,7 @@ impl ApplicationHandler for SmokeApp {
         };
         self.last_size = Some((size.width, size.height));
         self.window_id = Some(window.id());
-        self.progress.window_created.store(true, Ordering::SeqCst);
+        self.progress.window_phase.store(WindowPhase::Created);
         self.renderer = Some(renderer);
         self.window = Some(window);
         self.schedule_next_redraw();
@@ -674,10 +674,61 @@ struct SmokeReport<'a> {
 #[derive(Debug, Default)]
 struct SharedSmokeProgress {
     bootstrap: Arc<VulkanSmokeBootstrapProgress>,
-    window_created: AtomicBool,
+    window_phase: AtomicWindowPhase,
     frames_presented: AtomicU32,
     resize_count: AtomicU32,
     swapchain_recreate_count: AtomicU32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum WindowPhase {
+    #[default]
+    NotStarted,
+    Resumed,
+    CreatingWindow,
+    Created,
+}
+
+impl WindowPhase {
+    const fn as_u8(self) -> u8 {
+        match self {
+            Self::NotStarted => 0,
+            Self::Resumed => 1,
+            Self::CreatingWindow => 2,
+            Self::Created => 3,
+        }
+    }
+
+    const fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Self::Resumed,
+            2 => Self::CreatingWindow,
+            3 => Self::Created,
+            _ => Self::NotStarted,
+        }
+    }
+
+    const fn status(self) -> &'static str {
+        match self {
+            Self::NotStarted => "failed",
+            Self::Resumed => "resumed",
+            Self::CreatingWindow => "creating",
+            Self::Created => "created",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct AtomicWindowPhase(AtomicU32);
+
+impl AtomicWindowPhase {
+    fn store(&self, phase: WindowPhase) {
+        self.0.store(u32::from(phase.as_u8()), Ordering::SeqCst);
+    }
+
+    fn status(&self) -> &'static str {
+        WindowPhase::from_u8(self.0.load(Ordering::SeqCst) as u8).status()
+    }
 }
 
 fn actual_platform() -> &'static str {
