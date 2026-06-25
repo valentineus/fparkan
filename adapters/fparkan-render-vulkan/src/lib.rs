@@ -1621,41 +1621,50 @@ impl VulkanSmokeRenderer {
         if let Some(resources) = self.swapchain_resources.take() {
             destroy_swapchain_resources(device, self.command_pool, resources);
         }
+        self.images_in_flight.clear();
+        self.current_frame = 0;
     }
-}
 
-impl Drop for VulkanSmokeRenderer {
-    fn drop(&mut self) {
+    fn teardown(&mut self) {
+        if let Some(device) = self.device.as_ref() {
+            // SAFETY: The logical device remains live until teardown finishes and idling prevents in-flight work from touching swapchain, buffers, sync objects or the command pool after destruction starts.
+            let _ = unsafe { device.device().device_wait_idle() };
+        }
         self.destroy_swapchain_resources();
         if let Some(device) = self.device.as_ref() {
             if let Some(buffer) = self.index_buffer.take() {
-                // SAFETY: Buffer and memory belong to this device and are destroyed once.
+                // SAFETY: Buffer and memory belong to this device and are destroyed once after the device has been idled and frame work has been torn down.
                 unsafe {
                     device.device().destroy_buffer(buffer.buffer, None);
                     device.device().free_memory(buffer.memory, None);
                 }
             }
             if let Some(buffer) = self.vertex_buffer.take() {
-                // SAFETY: Buffer and memory belong to this device and are destroyed once.
+                // SAFETY: Buffer and memory belong to this device and are destroyed once after the device has been idled and frame work has been torn down.
                 unsafe {
                     device.device().destroy_buffer(buffer.buffer, None);
                     device.device().free_memory(buffer.memory, None);
                 }
             }
-            // SAFETY: The command pool belongs to this device and is destroyed once after buffers are freed.
+            // SAFETY: The command pool belongs to this device and is destroyed once after the device is idle and all command buffers allocated from it were freed above.
             unsafe {
                 device
                     .device()
                     .destroy_command_pool(self.command_pool, None);
             };
-            // SAFETY: The logical device remains live until the renderer completes teardown.
-            let _ = unsafe { device.device().device_wait_idle() };
         }
+        // Drop child Vulkan owners explicitly before their parents instead of relying on field order.
         self.swapchain.take();
         self.device.take();
         self.surface.take();
         self.validation.take();
         self.instance.take();
+    }
+}
+
+impl Drop for VulkanSmokeRenderer {
+    fn drop(&mut self) {
+        self.teardown();
     }
 }
 
