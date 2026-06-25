@@ -133,7 +133,7 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         _ => Err(
-            "usage: cargo xtask ci | policy | shader-provenance | acceptance report --suite synthetic|licensed [--stage 0..5|all] [--manifest corpora.toml] [--out <path>] | acceptance audit [--roadmap <path>] [--coverage <path>] [--out <path>] [--strict] | native-smoke audit --dir <path> | package --target <triple> --app viewer|game|headless|cli | test synthetic|licensed [--stage 0..5|all] [--manifest corpora.toml] | corpus baseline --root <path>"
+            "usage: cargo xtask ci | policy | shader-provenance | acceptance report --suite synthetic|licensed [--stage 0..5|all] [--manifest corpora.toml] [--out <path>] | acceptance audit [--roadmap <path>] [--coverage <path>] [--out <path>] [--strict] | native-smoke audit --dir <path> [--expected-commit <sha>] [--expected-shader-manifest-hash <sha256>] | package --target <triple> --app viewer|game|headless|cli | test synthetic|licensed [--stage 0..5|all] [--manifest corpora.toml] | corpus baseline --root <path>"
                 .to_string(),
         ),
     }
@@ -223,6 +223,12 @@ fn load_shader_manifest(path: &Path) -> Result<ShaderManifestJson, String> {
     if manifest.modules.is_empty() {
         return Err(format!(
             "{}: shader manifest must describe at least one module",
+            path.display()
+        ));
+    }
+    if manifest.manifest_hash.trim().is_empty() {
+        return Err(format!(
+            "{}: shader manifest must include a non-empty manifest_hash",
             path.display()
         ));
     }
@@ -1655,6 +1661,8 @@ struct AuditOptions {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct NativeSmokeAuditOptions {
     dir: PathBuf,
+    expected_commit: String,
+    expected_shader_manifest_hash: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1663,6 +1671,7 @@ struct ShaderManifestJson {
     compiler: ShaderToolManifestJson,
     validator: ShaderToolManifestJson,
     modules: Vec<ShaderModuleManifestJson>,
+    manifest_hash: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1821,6 +1830,8 @@ fn parse_audit_options(args: &[String]) -> Result<AuditOptions, String> {
 
 fn parse_native_smoke_audit_options(args: &[String]) -> Result<NativeSmokeAuditOptions, String> {
     let mut dir = None;
+    let mut expected_commit = expected_native_smoke_commit()?;
+    let mut expected_shader_manifest_hash = current_shader_manifest_hash()?;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -1830,17 +1841,43 @@ fn parse_native_smoke_audit_options(args: &[String]) -> Result<NativeSmokeAuditO
                     .ok_or_else(|| "--dir requires a path".to_string())?;
                 dir = Some(PathBuf::from(value));
             }
+            "--expected-commit" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| "--expected-commit requires a value".to_string())?;
+                if !is_commit_sha(value) {
+                    return Err(format!(
+                        "--expected-commit must be a 40-character lowercase or uppercase hex string, found {value:?}"
+                    ));
+                }
+                expected_commit = value.to_string();
+            }
+            "--expected-shader-manifest-hash" => {
+                let value = iter.next().ok_or_else(|| {
+                    "--expected-shader-manifest-hash requires a value".to_string()
+                })?;
+                if value.trim().is_empty() {
+                    return Err("--expected-shader-manifest-hash must be non-empty".to_string());
+                }
+                expected_shader_manifest_hash = value.to_string();
+            }
             _ => return Err(format!("unknown native-smoke audit option: {arg}")),
         }
     }
     Ok(NativeSmokeAuditOptions {
         dir: dir.ok_or_else(|| "native-smoke audit requires --dir".to_string())?,
+        expected_commit,
+        expected_shader_manifest_hash,
     })
 }
 
 fn run_native_smoke_audit(options: &NativeSmokeAuditOptions) -> Result<(), String> {
     let reports = read_native_smoke_reports(&options.dir)?;
-    let failures = audit_native_smoke_reports(&reports);
+    let failures = audit_native_smoke_reports(
+        &reports,
+        &options.expected_commit,
+        &options.expected_shader_manifest_hash,
+    );
     if failures.is_empty() {
         println!("native smoke artifacts passed: {}", options.dir.display());
         Ok(())
@@ -1877,7 +1914,11 @@ fn read_native_smoke_reports(dir: &Path) -> Result<BTreeMap<String, serde_json::
     Ok(reports)
 }
 
-fn audit_native_smoke_reports(reports: &BTreeMap<String, serde_json::Value>) -> Vec<String> {
+fn audit_native_smoke_reports(
+    reports: &BTreeMap<String, serde_json::Value>,
+    expected_commit: &str,
+    expected_shader_manifest_hash: &str,
+) -> Vec<String> {
     let mut failures = Vec::new();
     let mut commit_shas = BTreeSet::new();
     let mut rust_toolchains = BTreeSet::new();
@@ -1887,6 +1928,20 @@ fn audit_native_smoke_reports(reports: &BTreeMap<String, serde_json::Value>) -> 
             continue;
         };
         validate_native_smoke_report(platform, report, &mut failures);
+        expect_string_field(
+            platform,
+            report,
+            "commit_sha",
+            expected_commit,
+            &mut failures,
+        );
+        expect_string_field(
+            platform,
+            report,
+            "shader_manifest_hash",
+            expected_shader_manifest_hash,
+            &mut failures,
+        );
         if let Ok(commit_sha) = json_string_field(report, "commit_sha") {
             if commit_sha == "unknown" {
                 failures.push(format!("{platform}: commit_sha must not be \"unknown\""));
@@ -1916,6 +1971,32 @@ fn audit_native_smoke_reports(reports: &BTreeMap<String, serde_json::Value>) -> 
         ));
     }
     failures
+}
+
+fn expected_native_smoke_commit() -> Result<String, String> {
+    if let Ok(commit_sha) = std::env::var("GITHUB_SHA") {
+        if is_commit_sha(&commit_sha) {
+            return Ok(commit_sha);
+        }
+        return Err(format!(
+            "GITHUB_SHA must be a 40-character lowercase or uppercase hex string when set, found {commit_sha:?}"
+        ));
+    }
+    let commit_sha = current_git_commit_sha();
+    if is_commit_sha(&commit_sha) {
+        Ok(commit_sha)
+    } else {
+        Err(
+            "native-smoke audit could not resolve expected commit from GITHUB_SHA or git rev-parse HEAD"
+                .to_string(),
+        )
+    }
+}
+
+fn current_shader_manifest_hash() -> Result<String, String> {
+    let manifest_path = workspace_relative_path(SHADER_MANIFEST_REPORT);
+    let manifest = load_shader_manifest(&manifest_path)?;
+    Ok(manifest.manifest_hash)
 }
 
 fn validate_native_smoke_report(
@@ -2514,6 +2595,10 @@ fn current_git_commit_sha() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+fn is_commit_sha(value: &str) -> bool {
+    value.len() == 40 && value.chars().all(|ch| ch.is_ascii_hexdigit())
+}
+
 fn current_git_dirty() -> bool {
     Command::new("git")
         .args(["status", "--short"])
@@ -2936,6 +3021,9 @@ mod tests {
 
     #[test]
     fn native_smoke_audit_accepts_complete_required_platform_pass() {
+        let expected_commit = "0123456789abcdef0123456789abcdef01234567";
+        let expected_shader_manifest_hash =
+            "dd293e4ff08ffca1c037900d08b0ffd415db39f238b4fcdde46468fa049b679c";
         let reports = ["macos"]
             .into_iter()
             .map(|platform| {
@@ -2962,7 +3050,7 @@ mod tests {
                         "swapchain_recreate_count": 1,
                         "validation_warning_count": 0,
                         "validation_error_count": 0,
-                        "shader_manifest_hash": "dd293e4ff08ffca1c037900d08b0ffd415db39f238b4fcdde46468fa049b679c",
+                        "shader_manifest_hash": expected_shader_manifest_hash,
                         "vulkan_loader_status": "available",
                         "vulkan_instance_status": "created",
                         "window_status": "created",
@@ -2984,11 +3072,17 @@ mod tests {
             })
             .collect::<BTreeMap<_, _>>();
 
-        assert_eq!(audit_native_smoke_reports(&reports), Vec::<String>::new());
+        assert_eq!(
+            audit_native_smoke_reports(&reports, expected_commit, expected_shader_manifest_hash,),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
     fn native_smoke_audit_rejects_blocked_or_incomplete_reports() {
+        let expected_commit = "0123456789abcdef0123456789abcdef01234567";
+        let expected_shader_manifest_hash =
+            "dd293e4ff08ffca1c037900d08b0ffd415db39f238b4fcdde46468fa049b679c";
         let reports = [(
             "macos".to_string(),
             serde_json::json!({
@@ -3018,7 +3112,8 @@ mod tests {
         .into_iter()
         .collect::<BTreeMap<_, _>>();
 
-        let failures = audit_native_smoke_reports(&reports);
+        let failures =
+            audit_native_smoke_reports(&reports, expected_commit, expected_shader_manifest_hash);
 
         assert!(
             failures.contains(&"macos: status expected \"passed\", found \"blocked\"".to_string())
@@ -3039,6 +3134,113 @@ mod tests {
         assert!(failures.contains(&"macos: frames expected >= 300, found 0".to_string()));
         assert!(failures
             .contains(&"macos: validation_error_count must be an unsigned integer".to_string()));
+    }
+
+    #[test]
+    fn native_smoke_audit_rejects_stale_commit_sha() {
+        let expected_shader_manifest_hash =
+            "dd293e4ff08ffca1c037900d08b0ffd415db39f238b4fcdde46468fa049b679c";
+        let reports = [(
+            "macos".to_string(),
+            serde_json::json!({
+                "schema_version": "fparkan-native-smoke-v1",
+                "commit_sha": "fedcba98765432100123456789abcdef01234567",
+                "git_dirty": false,
+                "runner_identity": "github-actions/12345/stage0-macos",
+                "runner_architecture": "aarch64",
+                "rust_toolchain": measured_rust_toolchain_version(),
+                "target_triple": "aarch64-apple-darwin",
+                "platform": "macos",
+                "status": "passed",
+                "frames": 300,
+                "resize_count": 1,
+                "swapchain_recreate_count": 1,
+                "validation_warning_count": 0,
+                "validation_error_count": 0,
+                "shader_manifest_hash": expected_shader_manifest_hash,
+                "vulkan_loader_status": "available",
+                "vulkan_instance_status": "created",
+                "window_status": "created",
+                "vulkan_surface_status": "created",
+                "vulkan_device_status": "selected",
+                "vulkan_device_name": "Apple GPU",
+                "vulkan_logical_device_status": "created",
+                "vulkan_logical_device_graphics_queue_family": 0,
+                "vulkan_logical_device_present_queue_family": 0,
+                "vulkan_logical_device_enabled_extension_count": 1,
+                "vulkan_swapchain_status": "created",
+                "vulkan_swapchain_width": 1280,
+                "vulkan_swapchain_height": 720,
+                "vulkan_swapchain_image_count": 3,
+                "vulkan_portability_enumeration": true,
+                "vulkan_portability_subset_enabled": true
+            }),
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+
+        let failures = audit_native_smoke_reports(
+            &reports,
+            "0123456789abcdef0123456789abcdef01234567",
+            expected_shader_manifest_hash,
+        );
+
+        assert!(failures.contains(
+            &"macos: commit_sha expected \"0123456789abcdef0123456789abcdef01234567\", found \"fedcba98765432100123456789abcdef01234567\"".to_string()
+        ));
+    }
+
+    #[test]
+    fn native_smoke_audit_rejects_stale_shader_manifest_hash() {
+        let expected_commit = "0123456789abcdef0123456789abcdef01234567";
+        let reports = [(
+            "macos".to_string(),
+            serde_json::json!({
+                "schema_version": "fparkan-native-smoke-v1",
+                "commit_sha": expected_commit,
+                "git_dirty": false,
+                "runner_identity": "github-actions/12345/stage0-macos",
+                "runner_architecture": "aarch64",
+                "rust_toolchain": measured_rust_toolchain_version(),
+                "target_triple": "aarch64-apple-darwin",
+                "platform": "macos",
+                "status": "passed",
+                "frames": 300,
+                "resize_count": 1,
+                "swapchain_recreate_count": 1,
+                "validation_warning_count": 0,
+                "validation_error_count": 0,
+                "shader_manifest_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "vulkan_loader_status": "available",
+                "vulkan_instance_status": "created",
+                "window_status": "created",
+                "vulkan_surface_status": "created",
+                "vulkan_device_status": "selected",
+                "vulkan_device_name": "Apple GPU",
+                "vulkan_logical_device_status": "created",
+                "vulkan_logical_device_graphics_queue_family": 0,
+                "vulkan_logical_device_present_queue_family": 0,
+                "vulkan_logical_device_enabled_extension_count": 1,
+                "vulkan_swapchain_status": "created",
+                "vulkan_swapchain_width": 1280,
+                "vulkan_swapchain_height": 720,
+                "vulkan_swapchain_image_count": 3,
+                "vulkan_portability_enumeration": true,
+                "vulkan_portability_subset_enabled": true
+            }),
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+
+        let failures = audit_native_smoke_reports(
+            &reports,
+            expected_commit,
+            "dd293e4ff08ffca1c037900d08b0ffd415db39f238b4fcdde46468fa049b679c",
+        );
+
+        assert!(failures.contains(
+            &"macos: shader_manifest_hash expected \"dd293e4ff08ffca1c037900d08b0ffd415db39f238b4fcdde46468fa049b679c\", found \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"".to_string()
+        ));
     }
 
     #[test]
