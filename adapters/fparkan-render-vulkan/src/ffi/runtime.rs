@@ -1,10 +1,11 @@
 #![allow(unsafe_code)]
 
 use ash::vk;
+use fparkan_platform::RenderRequest;
 use std::ffi::CString;
 
 use super::capabilities::{
-    select_live_device_candidate, unique_queue_families, VulkanRuntimeCapabilityError,
+    select_live_device_candidate_for_request, unique_queue_families, VulkanRuntimeCapabilityError,
     VulkanRuntimeCapabilityProbe,
 };
 use super::{VulkanInstanceProbe, VulkanSurfaceProbe};
@@ -125,8 +126,33 @@ pub fn create_vulkan_logical_device_probe(
     surface: &VulkanSurfaceProbe,
     drawable_extent: (u32, u32),
 ) -> Result<VulkanLogicalDeviceProbe, VulkanLogicalDeviceError> {
-    let selected = select_live_device_candidate(instance, surface, drawable_extent)
-        .map_err(VulkanLogicalDeviceError::Runtime)?;
+    create_vulkan_logical_device_probe_for_request(
+        instance,
+        surface,
+        drawable_extent,
+        &RenderRequest::conservative(),
+    )
+}
+
+/// Creates a Vulkan logical device for a specific Stage 0 render request.
+///
+/// # Errors
+///
+/// Returns [`VulkanLogicalDeviceError`] when runtime capability probing fails,
+/// device extension names are invalid, or `vkCreateDevice` fails.
+pub fn create_vulkan_logical_device_probe_for_request(
+    instance: &VulkanInstanceProbe,
+    surface: &VulkanSurfaceProbe,
+    drawable_extent: (u32, u32),
+    render_request: &RenderRequest,
+) -> Result<VulkanLogicalDeviceProbe, VulkanLogicalDeviceError> {
+    let selected = select_live_device_candidate_for_request(
+        instance,
+        surface,
+        drawable_extent,
+        render_request,
+    )
+    .map_err(VulkanLogicalDeviceError::Runtime)?;
     let capability = &selected.runtime.capability;
     let queue_priorities = [1.0_f32];
     let queue_families = unique_queue_families(

@@ -1,5 +1,5 @@
 use ash::vk;
-use fparkan_platform::NativeWindowHandles;
+use fparkan_platform::{NativeWindowHandles, RenderRequest};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -20,6 +20,8 @@ pub struct VulkanSmokeRendererCreateInfo {
     pub native_handles: NativeWindowHandles,
     /// Initial drawable extent.
     pub drawable_extent: (u32, u32),
+    /// Stage 0 render request used for capability gating.
+    pub render_request: RenderRequest,
     /// Whether validation layers must be enabled.
     pub enable_validation: bool,
     /// Optional shared bootstrap progress tracker for failure evidence.

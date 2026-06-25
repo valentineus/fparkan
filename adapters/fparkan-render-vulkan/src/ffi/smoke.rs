@@ -5,13 +5,13 @@ use ash::vk;
 use super::{
     create_command_pool, create_frame_sync, create_swapchain_resources,
     create_triangle_index_buffer, create_triangle_vertex_buffer, create_validation_messenger,
-    create_vulkan_instance_probe, create_vulkan_logical_device_probe, create_vulkan_surface_probe,
-    create_vulkan_swapchain_probe_for_extent, destroy_allocated_buffer,
-    destroy_swapchain_resources, plan_vulkan_surface, VulkanAllocatedBuffer, VulkanInstanceConfig,
-    VulkanInstanceProbe, VulkanLogicalDeviceProbe, VulkanSmokeFrameOutcome, VulkanSmokeRenderer,
-    VulkanSmokeRendererCreateInfo, VulkanSmokeRendererError, VulkanSmokeRendererReport,
-    VulkanSurfaceProbe, VulkanSwapchainProbe, VulkanSwapchainResources, VulkanValidationMessenger,
-    VulkanValidationReport,
+    create_vulkan_instance_probe, create_vulkan_logical_device_probe_for_request,
+    create_vulkan_surface_probe, create_vulkan_swapchain_probe_for_extent,
+    destroy_allocated_buffer, destroy_swapchain_resources, plan_vulkan_surface,
+    VulkanAllocatedBuffer, VulkanInstanceConfig, VulkanInstanceProbe, VulkanLogicalDeviceProbe,
+    VulkanSmokeFrameOutcome, VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo,
+    VulkanSmokeRendererError, VulkanSmokeRendererReport, VulkanSurfaceProbe, VulkanSwapchainProbe,
+    VulkanSwapchainResources, VulkanValidationMessenger, VulkanValidationReport,
 };
 use crate::policy::KHR_PORTABILITY_SUBSET_EXTENSION;
 use crate::shader_manifest::{triangle_shader_manifest, validate_shader_manifest};
@@ -106,9 +106,13 @@ impl VulkanSmokeRenderer {
         if let Some(progress) = bootstrap_progress {
             progress.mark_surface_created();
         }
-        let device =
-            create_vulkan_logical_device_probe(&instance, &surface, create_info.drawable_extent)
-                .map_err(VulkanSmokeRendererError::LogicalDevice)?;
+        let device = create_vulkan_logical_device_probe_for_request(
+            &instance,
+            &surface,
+            create_info.drawable_extent,
+            &create_info.render_request,
+        )
+        .map_err(VulkanSmokeRendererError::LogicalDevice)?;
         if let Some(progress) = bootstrap_progress {
             progress.mark_logical_device_created();
         }

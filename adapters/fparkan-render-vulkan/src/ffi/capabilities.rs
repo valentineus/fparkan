@@ -1,11 +1,12 @@
 #![allow(unsafe_code)]
 
 use ash::vk;
+use fparkan_platform::RenderRequest;
 use std::ffi::CStr;
 
 use super::{VulkanInstanceProbe, VulkanSurfaceProbe};
 use crate::policy::{
-    compare_reports, plan_vulkan_swapchain, validate_device, VulkanCapabilityError,
+    compare_reports, plan_vulkan_swapchain, validate_device_for_request, VulkanCapabilityError,
     VulkanCapabilityReport, VulkanDeviceType, VulkanPhysicalDeviceRecord, VulkanQueueFamily,
     VulkanSurfaceFormat, VulkanSwapchainError, VulkanSwapchainPlan, VulkanSwapchainRequest,
     VulkanSwapchainSurfaceCapabilities,
@@ -133,14 +134,42 @@ pub fn probe_vulkan_runtime_capabilities(
     surface: &VulkanSurfaceProbe,
     drawable_extent: (u32, u32),
 ) -> Result<VulkanRuntimeCapabilityProbe, VulkanRuntimeCapabilityError> {
-    let selected = select_live_device_candidate(instance, surface, drawable_extent)?;
+    let selected = select_live_device_candidate_for_request(
+        instance,
+        surface,
+        drawable_extent,
+        &RenderRequest::conservative(),
+    )?;
     Ok(selected.runtime)
 }
 
-pub(super) fn select_live_device_candidate(
+/// Probes live Vulkan device, queue, surface and swapchain capabilities for a
+/// specific Stage 0 render request.
+///
+/// # Errors
+///
+/// Returns [`VulkanRuntimeCapabilityError`] when device enumeration, surface
+/// capability queries, Stage 0 device selection, or swapchain planning fails.
+pub fn probe_vulkan_runtime_capabilities_for_request(
     instance: &VulkanInstanceProbe,
     surface: &VulkanSurfaceProbe,
     drawable_extent: (u32, u32),
+    render_request: &RenderRequest,
+) -> Result<VulkanRuntimeCapabilityProbe, VulkanRuntimeCapabilityError> {
+    let selected = select_live_device_candidate_for_request(
+        instance,
+        surface,
+        drawable_extent,
+        render_request,
+    )?;
+    Ok(selected.runtime)
+}
+
+pub(super) fn select_live_device_candidate_for_request(
+    instance: &VulkanInstanceProbe,
+    surface: &VulkanSurfaceProbe,
+    drawable_extent: (u32, u32),
+    render_request: &RenderRequest,
 ) -> Result<SelectedLiveDevice, VulkanRuntimeCapabilityError> {
     let devices = {
         // SAFETY: The Vulkan instance is live for this query and no handles are retained.
@@ -151,13 +180,14 @@ pub(super) fn select_live_device_candidate(
     let mut best: Option<LiveDeviceCandidate> = None;
     let mut last_error = None;
     for (index, device) in devices.iter().copied().enumerate() {
-        let candidate = match live_device_candidate(instance, surface, device, index) {
-            Ok(candidate) => candidate,
-            Err(err) => {
-                last_error = Some(err);
-                continue;
-            }
-        };
+        let candidate =
+            match live_device_candidate(instance, surface, device, index, render_request) {
+                Ok(candidate) => candidate,
+                Err(err) => {
+                    last_error = Some(err);
+                    continue;
+                }
+            };
         match &best {
             Some(existing)
                 if compare_reports(&candidate.capability, &existing.capability)
@@ -192,6 +222,7 @@ fn live_device_candidate(
     surface: &VulkanSurfaceProbe,
     device: vk::PhysicalDevice,
     index: usize,
+    render_request: &RenderRequest,
 ) -> Result<LiveDeviceCandidate, VulkanRuntimeCapabilityError> {
     let properties = {
         // SAFETY: `device` was returned by this live instance and the result is copied by value.
@@ -210,6 +241,7 @@ fn live_device_candidate(
     let surface_formats = live_surface_formats(surface, device, &name)?;
     let present_modes = live_present_modes(surface, device, &name)?;
     let surface_capabilities = live_surface_capabilities(surface, device, &name)?;
+    let supported_depth_stencil_formats = live_depth_stencil_formats(instance, device);
     let queue_families = queue_properties
         .iter()
         .enumerate()
@@ -251,8 +283,10 @@ fn live_device_candidate(
         surface_formats: surface_formats.clone(),
         present_modes: present_modes.clone(),
         surface_capabilities,
+        supported_depth_stencil_formats,
     };
-    let capability = validate_device(&record).map_err(VulkanRuntimeCapabilityError::Capability)?;
+    let capability = validate_device_for_request(&record, render_request)
+        .map_err(VulkanRuntimeCapabilityError::Capability)?;
     Ok(LiveDeviceCandidate {
         physical_device: device,
         capability,
@@ -402,4 +436,35 @@ pub(super) fn live_surface_capabilities(
         max_image_count: capabilities.max_image_count,
         supported_usage_flags: capabilities.supported_usage_flags.as_raw(),
     })
+}
+
+fn live_depth_stencil_formats(
+    instance: &VulkanInstanceProbe,
+    device: vk::PhysicalDevice,
+) -> Vec<i32> {
+    [
+        vk::Format::D16_UNORM,
+        vk::Format::X8_D24_UNORM_PACK32,
+        vk::Format::D32_SFLOAT,
+        vk::Format::S8_UINT,
+        vk::Format::D16_UNORM_S8_UINT,
+        vk::Format::D24_UNORM_S8_UINT,
+        vk::Format::D32_SFLOAT_S8_UINT,
+    ]
+    .into_iter()
+    .filter(|format| {
+        let properties = {
+            // SAFETY: `device` belongs to `instance`; format-property queries copy data by value.
+            unsafe {
+                instance
+                    .instance
+                    .get_physical_device_format_properties(device, *format)
+            }
+        };
+        properties
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+    })
+    .map(vk::Format::as_raw)
+    .collect()
 }

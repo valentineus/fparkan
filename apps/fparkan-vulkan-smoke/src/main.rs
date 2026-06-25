@@ -11,6 +11,7 @@
 #![allow(clippy::print_stderr, clippy::print_stdout)]
 //! Native Vulkan smoke runner entrypoint.
 
+use fparkan_platform::RenderRequest;
 use fparkan_platform_winit::{window_native_handles, WinitWindowPlan};
 use fparkan_render_vulkan::{
     VulkanSmokeBootstrapProgress, VulkanSmokeFrameOutcome, VulkanSmokeRenderer,
@@ -524,6 +525,7 @@ impl ApplicationHandler for SmokeApp {
             application_name: "fparkan-vulkan-smoke".to_string(),
             native_handles,
             drawable_extent: (size.width.max(1), size.height.max(1)),
+            render_request: RenderRequest::conservative(),
             enable_validation: true,
             bootstrap_progress: Some(Arc::clone(&self.progress.bootstrap)),
         }) {

@@ -8,7 +8,7 @@ use crate::shader_manifest::{
     TRIANGLE_VERTEX_SPIRV_PATH, TRIANGLE_VERTEX_VALIDATE_COMMAND,
 };
 use crate::*;
-use fparkan_platform::RenderRequest;
+use fparkan_platform::{DepthStencilSupport, RenderRequest};
 use fparkan_render::{
     DrawCommand, DrawId, GpuMaterialId, GpuMeshId, IndexRange, RenderCommand, RenderPhase,
 };
@@ -285,6 +285,36 @@ fn rejects_missing_graphics_present_swapchain_and_format() {
         select_physical_device(&[no_color_attachment]),
         Err(VulkanCapabilityError::MissingColorAttachmentUsage { .. })
     ));
+}
+
+#[test]
+fn capability_gate_rejects_devices_without_requested_depth_stencil_support() {
+    let mut no_depth = device("No depth", VulkanDeviceType::DiscreteGpu, 0, true, false);
+    no_depth.supported_depth_stencil_formats = vec![vk::Format::D32_SFLOAT.as_raw()];
+
+    assert!(matches!(
+        select_physical_device(&[no_depth]),
+        Err(VulkanCapabilityError::MissingDepthStencilFormat { .. })
+    ));
+}
+
+#[test]
+fn capability_gate_respects_request_specific_depth_profiles() {
+    let mut no_stencil = device("No stencil", VulkanDeviceType::DiscreteGpu, 0, true, false);
+    no_stencil.supported_depth_stencil_formats = vec![vk::Format::D32_SFLOAT.as_raw()];
+    let relaxed_request = RenderRequest {
+        depth: DepthStencilSupport {
+            depth_bits: 32,
+            stencil_bits: 0,
+        },
+        ..RenderRequest::conservative()
+    };
+
+    let report = select_physical_device_for_request(&[no_stencil], &relaxed_request)
+        .expect("selected device for depth-only request");
+
+    assert_eq!(report.device_name, "No stencil");
+    assert!(report.rejected_devices.is_empty());
 }
 
 #[test]
@@ -660,6 +690,11 @@ fn device(
             vk::PresentModeKHR::MAILBOX.as_raw(),
         ],
         surface_capabilities: default_surface_capabilities(),
+        supported_depth_stencil_formats: vec![
+            vk::Format::D24_UNORM_S8_UINT.as_raw(),
+            vk::Format::D32_SFLOAT_S8_UINT.as_raw(),
+            vk::Format::D32_SFLOAT.as_raw(),
+        ],
     }
 }
 

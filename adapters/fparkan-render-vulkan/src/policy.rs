@@ -1,4 +1,5 @@
 use ash::vk;
+use fparkan_platform::{DepthStencilSupport, RenderRequest};
 use fparkan_render::{validate_command_list, RenderCommand, RenderCommandList, RenderError};
 use serde::Serialize;
 
@@ -182,6 +183,8 @@ pub struct VulkanPhysicalDeviceRecord {
     pub present_modes: Vec<i32>,
     /// Surface capabilities accepted by the target surface.
     pub surface_capabilities: VulkanSwapchainSurfaceCapabilities,
+    /// Depth/stencil attachment formats supported by the device.
+    pub supported_depth_stencil_formats: Vec<i32>,
 }
 
 impl VulkanPhysicalDeviceRecord {
@@ -270,6 +273,13 @@ pub enum VulkanCapabilityError {
         /// Device name that failed validation.
         device: String,
     },
+    /// No compatible depth/stencil attachment format exists for the render request.
+    MissingDepthStencilFormat {
+        /// Device name that failed validation.
+        device: String,
+        /// Requested depth/stencil profile.
+        requested: DepthStencilSupport,
+    },
 }
 
 impl std::fmt::Display for VulkanCapabilityError {
@@ -301,6 +311,12 @@ impl std::fmt::Display for VulkanCapabilityError {
                 f,
                 "Vulkan device {device} surface does not support COLOR_ATTACHMENT usage"
             ),
+            Self::MissingDepthStencilFormat { device, requested } => write!(
+                f,
+                "Vulkan device {device} lacks a depth/stencil attachment format for {}-bit depth and {}-bit stencil",
+                requested.depth_bits,
+                requested.stencil_bits
+            ),
         }
     }
 }
@@ -316,6 +332,20 @@ impl std::error::Error for VulkanCapabilityError {}
 pub fn select_physical_device(
     devices: &[VulkanPhysicalDeviceRecord],
 ) -> Result<VulkanCapabilityReport, VulkanCapabilityError> {
+    select_physical_device_for_request(devices, &RenderRequest::conservative())
+}
+
+/// Selects a Vulkan physical device for a specific Stage 0 render request.
+///
+/// # Errors
+///
+/// Returns [`VulkanCapabilityError`] when no candidate satisfies the minimum
+/// API version, queue, swapchain-extension, surface-format or depth/stencil
+/// requirements for the requested profile.
+pub fn select_physical_device_for_request(
+    devices: &[VulkanPhysicalDeviceRecord],
+    render_request: &RenderRequest,
+) -> Result<VulkanCapabilityReport, VulkanCapabilityError> {
     if devices.is_empty() {
         return Err(VulkanCapabilityError::NoPhysicalDevice);
     }
@@ -324,7 +354,7 @@ pub fn select_physical_device(
     let mut rejected_devices = Vec::new();
     let mut last_error = None;
     for device in devices {
-        let report = match validate_device(device) {
+        let report = match validate_device_for_request(device, render_request) {
             Ok(report) => report,
             Err(err) => {
                 rejected_devices.push(rejected_device_report(device, &err));
@@ -611,8 +641,9 @@ fn select_image_count(capabilities: VulkanSwapchainSurfaceCapabilities) -> u32 {
     }
 }
 
-pub(crate) fn validate_device(
+pub(crate) fn validate_device_for_request(
     device: &VulkanPhysicalDeviceRecord,
+    render_request: &RenderRequest,
 ) -> Result<VulkanCapabilityReport, VulkanCapabilityError> {
     if device.api_version < MIN_VULKAN_API_VERSION {
         return Err(VulkanCapabilityError::ApiVersionTooLow {
@@ -638,6 +669,12 @@ pub(crate) fn validate_device(
     if !supports_color_attachment_usage(device.surface_capabilities) {
         return Err(VulkanCapabilityError::MissingColorAttachmentUsage {
             device: device.name.clone(),
+        });
+    }
+    if !supports_depth_stencil_request(device, render_request.depth) {
+        return Err(VulkanCapabilityError::MissingDepthStencilFormat {
+            device: device.name.clone(),
+            requested: render_request.depth,
         });
     }
     let (graphics_queue_family, present_queue_family) = select_queue_families(device)?;
@@ -684,6 +721,7 @@ const fn capability_error_code(error: &VulkanCapabilityError) -> &'static str {
         VulkanCapabilityError::MissingColorAttachmentUsage { .. } => {
             "missing_color_attachment_usage"
         }
+        VulkanCapabilityError::MissingDepthStencilFormat { .. } => "missing_depth_stencil_format",
     }
 }
 
@@ -726,6 +764,36 @@ fn supports_surface_formats(device: &VulkanPhysicalDeviceRecord) -> bool {
 
 fn supports_color_attachment_usage(capabilities: VulkanSwapchainSurfaceCapabilities) -> bool {
     capabilities.supported_usage_flags & vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw() != 0
+}
+
+fn supports_depth_stencil_request(
+    device: &VulkanPhysicalDeviceRecord,
+    depth: DepthStencilSupport,
+) -> bool {
+    if depth.depth_bits == 0 && depth.stencil_bits == 0 {
+        return true;
+    }
+    required_depth_stencil_formats(depth).iter().any(|format| {
+        device
+            .supported_depth_stencil_formats
+            .contains(&format.as_raw())
+    })
+}
+
+fn required_depth_stencil_formats(depth: DepthStencilSupport) -> &'static [vk::Format] {
+    match (depth.depth_bits, depth.stencil_bits) {
+        (0, 0) => &[],
+        (16, 0) => &[vk::Format::D16_UNORM, vk::Format::D32_SFLOAT],
+        (24, 0) => &[vk::Format::X8_D24_UNORM_PACK32, vk::Format::D32_SFLOAT],
+        (32, 0) => &[vk::Format::D32_SFLOAT],
+        (16, 8) => &[vk::Format::D16_UNORM_S8_UINT, vk::Format::D24_UNORM_S8_UINT],
+        (24, 8) => &[
+            vk::Format::D24_UNORM_S8_UINT,
+            vk::Format::D32_SFLOAT_S8_UINT,
+        ],
+        (32, 8) => &[vk::Format::D32_SFLOAT_S8_UINT],
+        _ => &[],
+    }
 }
 
 fn score_device(

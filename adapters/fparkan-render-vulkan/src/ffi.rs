@@ -38,7 +38,8 @@ mod swapchain_resources;
 mod validation;
 
 pub use self::capabilities::{
-    probe_vulkan_runtime_capabilities, VulkanRuntimeCapabilityError, VulkanRuntimeCapabilityProbe,
+    probe_vulkan_runtime_capabilities, probe_vulkan_runtime_capabilities_for_request,
+    VulkanRuntimeCapabilityError, VulkanRuntimeCapabilityProbe,
 };
 pub use self::instance::{
     create_vulkan_instance_probe, plan_vulkan_instance, probe_vulkan_loader,
@@ -54,8 +55,8 @@ use self::resources::{
     VulkanFrameSync,
 };
 pub use self::runtime::{
-    create_vulkan_logical_device_probe, VulkanLogicalDeviceError, VulkanLogicalDeviceProbe,
-    VulkanLogicalDeviceReport,
+    create_vulkan_logical_device_probe, create_vulkan_logical_device_probe_for_request,
+    VulkanLogicalDeviceError, VulkanLogicalDeviceProbe, VulkanLogicalDeviceReport,
 };
 pub use self::smoke_types::{
     VulkanSmokeBootstrapProgress, VulkanSmokeBootstrapSnapshot, VulkanSmokeFrameOutcome,
