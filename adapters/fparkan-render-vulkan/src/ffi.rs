@@ -27,6 +27,7 @@
 //!
 //! This crate is the declared low-level Vulkan boundary.
 
+mod capabilities;
 mod instance;
 mod resources;
 mod runtime;
@@ -37,6 +38,9 @@ mod swapchain;
 mod swapchain_resources;
 mod validation;
 
+pub use self::capabilities::{
+    probe_vulkan_runtime_capabilities, VulkanRuntimeCapabilityError, VulkanRuntimeCapabilityProbe,
+};
 pub use self::instance::{
     create_vulkan_instance_probe, plan_vulkan_instance, probe_vulkan_loader,
     render_instance_plan_json, render_loader_probe_report_json, vulkan_entry_symbol_name,
@@ -51,9 +55,8 @@ use self::resources::{
     VulkanFrameSync,
 };
 pub use self::runtime::{
-    create_vulkan_logical_device_probe, probe_vulkan_runtime_capabilities,
-    VulkanLogicalDeviceError, VulkanLogicalDeviceProbe, VulkanLogicalDeviceReport,
-    VulkanRuntimeCapabilityError, VulkanRuntimeCapabilityProbe,
+    create_vulkan_logical_device_probe, VulkanLogicalDeviceError, VulkanLogicalDeviceProbe,
+    VulkanLogicalDeviceReport,
 };
 pub use self::smoke_types::{
     VulkanSmokeFrameOutcome, VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo,

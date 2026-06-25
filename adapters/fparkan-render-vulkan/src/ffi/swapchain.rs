@@ -3,7 +3,7 @@
 use ash::{khr::swapchain, vk};
 
 use super::{
-    runtime::{
+    capabilities::{
         live_present_modes, live_surface_capabilities, live_surface_formats, unique_queue_families,
     },
     VulkanInstanceProbe, VulkanLogicalDeviceProbe, VulkanRuntimeCapabilityError,

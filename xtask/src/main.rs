@@ -1242,6 +1242,7 @@ fn has_safety_comment(line: &str) -> bool {
 const AUDITED_UNSAFE_SOURCE_FILES: &[&str] = &[
     "adapters/fparkan-render-vulkan/src/ffi.rs",
     "adapters/fparkan-render-vulkan/src/ffi/instance.rs",
+    "adapters/fparkan-render-vulkan/src/ffi/capabilities.rs",
     "adapters/fparkan-render-vulkan/src/ffi/resources.rs",
     "adapters/fparkan-render-vulkan/src/ffi/runtime.rs",
     "adapters/fparkan-render-vulkan/src/ffi/smoke.rs",
