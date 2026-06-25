@@ -12,8 +12,8 @@ use crate::{
 /// Vulkan backend migration readiness.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VulkanPlanningBackendState {
-    /// Adapter prepared and able to accept commands.
-    Ready,
+    /// Planning facade is configured and able to accept command lists.
+    Configured,
     /// Adapter is tracking a recoverable runtime surface/depth pipeline fault.
     Degraded,
     /// Adapter has encountered a non-recoverable error.
@@ -22,25 +22,59 @@ pub enum VulkanPlanningBackendState {
 
 impl Default for VulkanPlanningBackendState {
     fn default() -> Self {
-        Self::Degraded
+        Self::Configured
+    }
+}
+
+/// Diagnostics for planning-facade request tracking.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VulkanPlanningRequestReport {
+    /// Last render request observed by the planning facade.
+    pub current_request: RenderRequest,
+    /// Number of meaningful request updates applied to the facade.
+    pub request_updates: u64,
+}
+
+impl Default for VulkanPlanningRequestReport {
+    fn default() -> Self {
+        Self {
+            current_request: RenderRequest::conservative(),
+            request_updates: 0,
+        }
+    }
+}
+
+/// Diagnostics for planning-facade execution telemetry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VulkanPlanningExecutionReport {
+    /// Total frames planned by the facade.
+    pub planned_frames: u64,
+    /// Total frame-submission plans emitted by the facade.
+    pub submission_plans: u64,
+    /// Last command-capture byte size.
+    pub last_capture_size: usize,
+    /// Number of simulated present calls issued by the planning facade.
+    pub simulated_presents: u64,
+}
+
+impl Default for VulkanPlanningExecutionReport {
+    fn default() -> Self {
+        Self {
+            planned_frames: 0,
+            submission_plans: 0,
+            last_capture_size: 0,
+            simulated_presents: 0,
+        }
     }
 }
 
 /// Diagnostics for Vulkan planning backend setup and frame progression.
 #[derive(Clone, Debug, PartialEq)]
 pub struct VulkanPlanningBackendReport {
-    /// Total frames executed.
-    pub frames_executed: u64,
-    /// Total command submissions.
-    pub submissions: u64,
-    /// Last command-capture byte size.
-    pub last_capture_size: usize,
-    /// Number of simulated present calls issued by the planning facade.
-    pub simulated_presents: u64,
-    /// Number of resize-driven surface plan refreshes.
-    pub resize_rebuilds: u64,
-    /// Last render request observed.
-    pub request: RenderRequest,
+    /// Request-tracking telemetry.
+    pub request: VulkanPlanningRequestReport,
+    /// Execution-planning telemetry.
+    pub execution: VulkanPlanningExecutionReport,
     /// Last deterministic frame submission plan.
     pub last_frame_submission: Option<VulkanFrameSubmissionPlan>,
 }
@@ -48,12 +82,8 @@ pub struct VulkanPlanningBackendReport {
 impl Default for VulkanPlanningBackendReport {
     fn default() -> Self {
         Self {
-            frames_executed: 0,
-            submissions: 0,
-            last_capture_size: 0,
-            simulated_presents: 0,
-            resize_rebuilds: 0,
-            request: RenderRequest::conservative(),
+            request: VulkanPlanningRequestReport::default(),
+            execution: VulkanPlanningExecutionReport::default(),
             last_frame_submission: None,
         }
     }
@@ -78,7 +108,7 @@ impl VulkanPlanningBackend {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            state: VulkanPlanningBackendState::Ready,
+            state: VulkanPlanningBackendState::Configured,
             report: VulkanPlanningBackendReport::default(),
             swapchain_plan: default_stage0_swapchain_plan(),
         }
@@ -86,14 +116,17 @@ impl VulkanPlanningBackend {
 
     /// Replaces active surface/profile request.
     pub fn set_render_request(&mut self, request: RenderRequest) {
-        self.report.request = request;
-        self.report.resize_rebuilds = self.report.resize_rebuilds.saturating_add(1);
+        if self.report.request.current_request != request {
+            self.report.request.current_request = request;
+            self.report.request.request_updates =
+                self.report.request.request_updates.saturating_add(1);
+        }
     }
 
     /// Returns active render request policy.
     #[must_use]
     pub const fn render_request(&self) -> RenderRequest {
-        self.report.request
+        self.report.request.current_request
     }
 
     /// Replaces active swapchain plan used for frame submission planning.
@@ -120,7 +153,8 @@ impl VulkanPlanningBackend {
     }
 
     fn simulate_present(&mut self) {
-        self.report.simulated_presents = self.report.simulated_presents.saturating_add(1);
+        self.report.execution.simulated_presents =
+            self.report.execution.simulated_presents.saturating_add(1);
     }
 }
 
@@ -128,15 +162,17 @@ impl RenderBackend for VulkanPlanningBackend {
     fn execute(&mut self, commands: &RenderCommandList) -> Result<FrameOutput, RenderError> {
         if !matches!(
             self.state,
-            VulkanPlanningBackendState::Ready | VulkanPlanningBackendState::Degraded
+            VulkanPlanningBackendState::Configured | VulkanPlanningBackendState::Degraded
         ) {
             return Err(RenderError::InvalidRange);
         }
         let capture = canonical_capture(commands)?;
         let frame_plan = plan_vulkan_frame_submission(&self.swapchain_plan, commands)?;
-        self.report.frames_executed = self.report.frames_executed.saturating_add(1);
-        self.report.submissions = self.report.submissions.saturating_add(1);
-        self.report.last_capture_size = capture.len();
+        self.report.execution.planned_frames =
+            self.report.execution.planned_frames.saturating_add(1);
+        self.report.execution.submission_plans =
+            self.report.execution.submission_plans.saturating_add(1);
+        self.report.execution.last_capture_size = capture.len();
         self.report.last_frame_submission = Some(frame_plan);
         self.simulate_present();
         Ok(FrameOutput)

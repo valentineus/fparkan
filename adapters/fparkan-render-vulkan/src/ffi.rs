@@ -606,10 +606,14 @@ mod tests {
     #[test]
     fn planning_backend_tracks_render_request_and_simulated_present() -> Result<(), RenderError> {
         let mut backend = VulkanPlanningBackend::new();
-        let request = RenderRequest::conservative();
+        let request = RenderRequest {
+            presentation: fparkan_platform::PresentationMode::Immediate,
+            ..RenderRequest::conservative()
+        };
         backend.set_render_request(request);
         assert_eq!(backend.render_request(), request);
-        assert_eq!(backend.report().resize_rebuilds, 1);
+        assert_eq!(backend.report().request.current_request, request);
+        assert_eq!(backend.report().request.request_updates, 1);
 
         let commands = fparkan_render::RenderCommandList {
             commands: vec![
@@ -629,11 +633,11 @@ mod tests {
         };
 
         backend.execute(&commands)?;
-        assert_eq!(backend.state(), VulkanPlanningBackendState::Ready);
-        assert_eq!(backend.report().frames_executed, 1);
-        assert_eq!(backend.report().submissions, 1);
-        assert_eq!(backend.report().simulated_presents, 1);
-        assert!(backend.report().last_capture_size > 0);
+        assert_eq!(backend.state(), VulkanPlanningBackendState::Configured);
+        assert_eq!(backend.report().execution.planned_frames, 1);
+        assert_eq!(backend.report().execution.submission_plans, 1);
+        assert_eq!(backend.report().execution.simulated_presents, 1);
+        assert!(backend.report().execution.last_capture_size > 0);
         assert_eq!(
             backend.report().last_frame_submission,
             Some(VulkanFrameSubmissionPlan {
