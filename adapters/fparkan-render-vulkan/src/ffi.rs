@@ -37,6 +37,7 @@ use fparkan_render::{
     canonical_capture, validate_command_list, FrameOutput, RenderBackend, RenderCommand,
     RenderCommandList, RenderError,
 };
+use serde::Serialize;
 use std::collections::BTreeSet;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -461,7 +462,7 @@ const TRIANGLE_FRAGMENT_VALIDATE_COMMAND: &str =
     "spirv-val --target-env vulkan1.0 adapters/fparkan-render-vulkan/shaders/triangle.frag.spv";
 
 /// Shader tool metadata pinned in the Stage 0 manifest.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct VulkanShaderToolManifest {
     /// Tool executable name.
     pub name: &'static str,
@@ -472,21 +473,13 @@ pub struct VulkanShaderToolManifest {
 }
 
 /// Vulkan shader stage.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum VulkanShaderStage {
     /// Vertex stage.
     Vertex,
     /// Fragment stage.
     Fragment,
-}
-
-impl VulkanShaderStage {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Vertex => "vertex",
-            Self::Fragment => "fragment",
-        }
-    }
 }
 
 /// Offline SPIR-V shader manifest entry.
@@ -534,7 +527,7 @@ pub struct VulkanShaderManifestReport {
 }
 
 /// Shader module validation report.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct VulkanShaderModuleReport {
     /// Logical shader name.
     pub name: &'static str,
@@ -3064,18 +3057,19 @@ fn live_surface_capabilities(
 /// Renders a deterministic JSON Vulkan surface plan.
 #[must_use]
 pub fn render_surface_plan_json(plan: &VulkanSurfacePlan) -> String {
-    let mut out = String::new();
-    out.push_str("{\"schema\":");
-    out.push_str(&plan.schema.to_string());
-    out.push_str(",\"required_instance_extensions\":[");
-    for (index, extension) in plan.required_instance_extensions.iter().enumerate() {
-        if index > 0 {
-            out.push(',');
-        }
-        push_json_string(&mut out, extension);
+    #[derive(Serialize)]
+    struct SurfacePlanJson<'a> {
+        schema: u32,
+        required_instance_extensions: &'a [String],
     }
-    out.push_str("]}");
-    out
+
+    serialize_json_or_fallback(
+        &SurfacePlanJson {
+            schema: plan.schema,
+            required_instance_extensions: &plan.required_instance_extensions,
+        },
+        "{\"schema\":0,\"required_instance_extensions\":[]}",
+    )
 }
 
 fn extension_name(extension: *const c_char) -> Result<String, VulkanSurfaceError> {
@@ -3243,26 +3237,23 @@ fn validation_layer_cstrings(
 /// Renders a deterministic JSON Vulkan instance plan.
 #[must_use]
 pub fn render_instance_plan_json(plan: &VulkanInstancePlan) -> String {
-    let mut out = String::new();
-    out.push_str("{\"schema\":");
-    out.push_str(&plan.schema.to_string());
-    out.push_str(",\"create_flags\":");
-    out.push_str(&plan.create_flags.to_string());
-    out.push_str(",\"validation_requested\":");
-    out.push_str(if plan.validation_requested {
-        "true"
-    } else {
-        "false"
-    });
-    out.push_str(",\"enabled_extensions\":[");
-    for (index, extension) in plan.enabled_extensions.iter().enumerate() {
-        if index > 0 {
-            out.push(',');
-        }
-        push_json_string(&mut out, extension);
+    #[derive(Serialize)]
+    struct InstancePlanJson<'a> {
+        schema: u32,
+        create_flags: u32,
+        validation_requested: bool,
+        enabled_extensions: &'a [String],
     }
-    out.push_str("]}");
-    out
+
+    serialize_json_or_fallback(
+        &InstancePlanJson {
+            schema: plan.schema,
+            create_flags: plan.create_flags,
+            validation_requested: plan.validation_requested,
+            enabled_extensions: &plan.enabled_extensions,
+        },
+        "{\"schema\":0,\"create_flags\":0,\"validation_requested\":false,\"enabled_extensions\":[]}",
+    )
 }
 
 fn cstring_vec(values: &[String]) -> Result<Vec<CString>, VulkanInstanceError> {
@@ -3348,19 +3339,21 @@ pub fn vulkan_entry_symbol_name() -> &'static CStr {
 /// Renders a deterministic JSON Vulkan loader report.
 #[must_use]
 pub fn render_loader_probe_report_json(report: &VulkanLoaderProbeReport) -> String {
-    let mut out = String::new();
-    out.push_str("{\"schema\":");
-    out.push_str(&report.schema.to_string());
-    out.push_str(",\"loader_available\":");
-    out.push_str(if report.loader_available {
-        "true"
-    } else {
-        "false"
-    });
-    out.push_str(",\"instance_api\":\"");
-    out.push_str(&format_api_version(report.instance_api_version));
-    out.push_str("\"}");
-    out
+    #[derive(Serialize)]
+    struct LoaderProbeReportJson {
+        schema: u32,
+        loader_available: bool,
+        instance_api: String,
+    }
+
+    serialize_json_or_fallback(
+        &LoaderProbeReportJson {
+            schema: report.schema,
+            loader_available: report.loader_available,
+            instance_api: format_api_version(report.instance_api_version),
+        },
+        "{\"schema\":0,\"loader_available\":false,\"instance_api\":\"0.0.0\"}",
+    )
 }
 
 /// Returns the built-in Stage 0 indexed-triangle shader manifest.
@@ -3445,16 +3438,23 @@ pub fn validate_shader_manifest(
 }
 
 fn shader_interface_hash(module: &VulkanShaderModuleManifest) -> String {
-    let mut normalized = String::new();
-    normalized.push_str("{\"stage\":\"");
-    normalized.push_str(module.stage.as_str());
-    normalized.push_str("\",\"entry_point\":");
-    push_json_string(&mut normalized, module.entry_point);
-    normalized.push_str(",\"descriptor_sets\":");
-    normalized.push_str(&module.descriptor_sets.to_string());
-    normalized.push_str(",\"push_constant_bytes\":");
-    normalized.push_str(&module.push_constant_bytes.to_string());
-    normalized.push('}');
+    #[derive(Serialize)]
+    struct ShaderInterfaceHashJson<'a> {
+        stage: VulkanShaderStage,
+        entry_point: &'a str,
+        descriptor_sets: u32,
+        push_constant_bytes: u32,
+    }
+
+    let normalized = serialize_json_or_fallback(
+        &ShaderInterfaceHashJson {
+            stage: module.stage,
+            entry_point: module.entry_point,
+            descriptor_sets: module.descriptor_sets,
+            push_constant_bytes: module.push_constant_bytes,
+        },
+        "{\"stage\":\"vertex\",\"entry_point\":\"main\",\"descriptor_sets\":0,\"push_constant_bytes\":0}",
+    );
     sha256_hex(&sha256(normalized.as_bytes()))
 }
 
@@ -3493,85 +3493,61 @@ fn spirv_words_to_bytes(words: &[u32]) -> Vec<u8> {
 /// Renders a deterministic JSON shader manifest report.
 #[must_use]
 pub fn render_shader_manifest_report_json(report: &VulkanShaderManifestReport) -> String {
-    let mut out = render_shader_manifest_without_hash_json(&report.modules);
-    out.push_str(",\"manifest_hash\":");
-    push_json_string(&mut out, &report.manifest_hash);
-    out.push('}');
-    out
+    #[derive(Serialize)]
+    struct ShaderManifestReportJson<'a> {
+        schema: u32,
+        target_env: &'a str,
+        compiler: &'a VulkanShaderToolManifest,
+        validator: &'a VulkanShaderToolManifest,
+        modules: &'a [VulkanShaderModuleReport],
+        manifest_hash: &'a str,
+    }
+
+    serialize_json_or_fallback(
+        &ShaderManifestReportJson {
+            schema: report.schema,
+            target_env: report.target_env,
+            compiler: &report.compiler,
+            validator: &report.validator,
+            modules: &report.modules,
+            manifest_hash: &report.manifest_hash,
+        },
+        "{\"schema\":0,\"target_env\":\"unknown\",\"compiler\":{\"name\":\"unknown\",\"version\":\"unknown\",\"binary_sha256\":\"unknown\"},\"validator\":{\"name\":\"unknown\",\"version\":\"unknown\",\"binary_sha256\":\"unknown\"},\"modules\":[],\"manifest_hash\":\"unknown\"}",
+    )
 }
 
 fn render_shader_manifest_without_hash_json(modules: &[VulkanShaderModuleReport]) -> String {
-    let mut out = String::new();
-    out.push_str("{\"schema\":");
-    out.push_str(&SHADER_MANIFEST_SCHEMA.to_string());
-    out.push_str(",\"target_env\":");
-    push_json_string(&mut out, SHADER_TARGET_ENV);
-    out.push_str(",\"compiler\":");
-    out.push_str(&render_shader_tool_json(&VulkanShaderToolManifest {
-        name: SHADER_COMPILER_NAME,
-        version: SHADER_COMPILER_VERSION,
-        binary_sha256: SHADER_COMPILER_BINARY_SHA256,
-    }));
-    out.push_str(",\"validator\":");
-    out.push_str(&render_shader_tool_json(&VulkanShaderToolManifest {
-        name: SPIRV_VALIDATOR_NAME,
-        version: SPIRV_VALIDATOR_VERSION,
-        binary_sha256: SPIRV_VALIDATOR_BINARY_SHA256,
-    }));
-    out.push_str(",\"modules\":");
-    out.push_str(&render_shader_modules_json(modules));
-    out
-}
-
-fn render_shader_modules_json(modules: &[VulkanShaderModuleReport]) -> String {
-    let mut out = String::new();
-    out.push('[');
-    for (index, module) in modules.iter().enumerate() {
-        if index > 0 {
-            out.push(',');
-        }
-        out.push_str("{\"name\":");
-        push_json_string(&mut out, module.name);
-        out.push_str(",\"stage\":\"");
-        out.push_str(module.stage.as_str());
-        out.push_str("\",\"entry_point\":");
-        push_json_string(&mut out, module.entry_point);
-        out.push_str(",\"source_path\":");
-        push_json_string(&mut out, module.source_path);
-        out.push_str(",\"source_sha256\":");
-        push_json_string(&mut out, module.source_sha256);
-        out.push_str(",\"spirv_path\":");
-        push_json_string(&mut out, module.spirv_path);
-        out.push_str(",\"word_count\":");
-        out.push_str(&module.word_count.to_string());
-        out.push_str(",\"sha256\":");
-        push_json_string(&mut out, &module.sha256);
-        out.push_str(",\"descriptor_sets\":");
-        out.push_str(&module.descriptor_sets.to_string());
-        out.push_str(",\"push_constant_bytes\":");
-        out.push_str(&module.push_constant_bytes.to_string());
-        out.push_str(",\"compile_command\":");
-        push_json_string(&mut out, module.compile_command);
-        out.push_str(",\"validate_command\":");
-        push_json_string(&mut out, module.validate_command);
-        out.push_str(",\"interface_hash\":");
-        push_json_string(&mut out, &module.interface_hash);
-        out.push('}');
+    #[derive(Serialize)]
+    struct ShaderManifestWithoutHashJson<'a> {
+        schema: u32,
+        target_env: &'a str,
+        compiler: VulkanShaderToolManifest,
+        validator: VulkanShaderToolManifest,
+        modules: &'a [VulkanShaderModuleReport],
     }
-    out.push(']');
-    out
-}
 
-fn render_shader_tool_json(tool: &VulkanShaderToolManifest) -> String {
-    let mut out = String::new();
-    out.push_str("{\"name\":");
-    push_json_string(&mut out, tool.name);
-    out.push_str(",\"version\":");
-    push_json_string(&mut out, tool.version);
-    out.push_str(",\"binary_sha256\":");
-    push_json_string(&mut out, tool.binary_sha256);
-    out.push('}');
-    out
+    let json = serialize_json_or_fallback(
+        &ShaderManifestWithoutHashJson {
+            schema: SHADER_MANIFEST_SCHEMA,
+            target_env: SHADER_TARGET_ENV,
+            compiler: VulkanShaderToolManifest {
+                name: SHADER_COMPILER_NAME,
+                version: SHADER_COMPILER_VERSION,
+                binary_sha256: SHADER_COMPILER_BINARY_SHA256,
+            },
+            validator: VulkanShaderToolManifest {
+                name: SPIRV_VALIDATOR_NAME,
+                version: SPIRV_VALIDATOR_VERSION,
+                binary_sha256: SPIRV_VALIDATOR_BINARY_SHA256,
+            },
+            modules,
+        },
+        "{\"schema\":0,\"target_env\":\"unknown\",\"compiler\":{\"name\":\"unknown\",\"version\":\"unknown\",\"binary_sha256\":\"unknown\"},\"validator\":{\"name\":\"unknown\",\"version\":\"unknown\",\"binary_sha256\":\"unknown\"},\"modules\":[]}",
+    );
+    match json.strip_suffix('}') {
+        Some(stripped) => stripped.to_string(),
+        None => json,
+    }
 }
 
 /// Vulkan backend migration readiness.
@@ -3728,7 +3704,7 @@ pub struct VulkanSwapchainRecreationReport {
 }
 
 /// Deterministic frame submission plan for command buffers and sync objects.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct VulkanFrameSubmissionPlan {
     /// Report schema version.
     pub schema: u32,
@@ -4131,102 +4107,99 @@ fn compare_reports(
 /// Renders a deterministic JSON capability report.
 #[must_use]
 pub fn render_capability_report_json(report: &VulkanCapabilityReport) -> String {
-    let mut out = String::new();
-    out.push_str("{\"schema\":");
-    out.push_str(&report.schema.to_string());
-    out.push_str(",\"vulkan_api\":\"");
-    out.push_str(&format_api_version(report.vulkan_api_version));
-    out.push_str("\",\"device_name\":");
-    push_json_string(&mut out, &report.device_name);
-    out.push_str(",\"score\":");
-    out.push_str(&report.score.to_string());
-    out.push_str(",\"graphics_queue_family\":");
-    out.push_str(&report.graphics_queue_family.to_string());
-    out.push_str(",\"present_queue_family\":");
-    out.push_str(&report.present_queue_family.to_string());
-    out.push_str(",\"portability_subset\":");
-    out.push_str(if report.portability_subset {
-        "true"
-    } else {
-        "false"
-    });
-    out.push_str(",\"enabled_extensions\":[");
-    for (index, extension) in report.enabled_extensions.iter().enumerate() {
-        if index > 0 {
-            out.push(',');
-        }
-        push_json_string(&mut out, extension);
+    #[derive(Serialize)]
+    struct CapabilityReportJson<'a> {
+        schema: u32,
+        vulkan_api: String,
+        device_name: &'a str,
+        score: i32,
+        graphics_queue_family: u32,
+        present_queue_family: u32,
+        portability_subset: bool,
+        enabled_extensions: &'a [String],
     }
-    out.push_str("]}");
-    out
+
+    serialize_json_or_fallback(
+        &CapabilityReportJson {
+            schema: report.schema,
+            vulkan_api: format_api_version(report.vulkan_api_version),
+            device_name: &report.device_name,
+            score: report.score,
+            graphics_queue_family: report.graphics_queue_family,
+            present_queue_family: report.present_queue_family,
+            portability_subset: report.portability_subset,
+            enabled_extensions: &report.enabled_extensions,
+        },
+        "{\"schema\":0,\"vulkan_api\":\"0.0.0\",\"device_name\":\"unknown\",\"score\":0,\"graphics_queue_family\":0,\"present_queue_family\":0,\"portability_subset\":false,\"enabled_extensions\":[]}",
+    )
 }
 
 /// Renders a deterministic JSON swapchain plan.
 #[must_use]
 pub fn render_swapchain_plan_json(plan: &VulkanSwapchainPlan) -> String {
-    let mut out = String::new();
-    out.push_str("{\"schema\":");
-    out.push_str(&plan.schema.to_string());
-    out.push_str(",\"extent\":[");
-    out.push_str(&plan.extent.0.to_string());
-    out.push(',');
-    out.push_str(&plan.extent.1.to_string());
-    out.push_str("],\"format\":");
-    out.push_str(&plan.format.format.to_string());
-    out.push_str(",\"color_space\":");
-    out.push_str(&plan.format.color_space.to_string());
-    out.push_str(",\"present_mode\":");
-    out.push_str(&plan.present_mode.to_string());
-    out.push_str(",\"image_count\":");
-    out.push_str(&plan.image_count.to_string());
-    out.push('}');
-    out
+    #[derive(Serialize)]
+    struct SwapchainPlanJson {
+        schema: u32,
+        extent: [u32; 2],
+        format: i32,
+        color_space: i32,
+        present_mode: i32,
+        image_count: u32,
+    }
+
+    serialize_json_or_fallback(
+        &SwapchainPlanJson {
+            schema: plan.schema,
+            extent: [plan.extent.0, plan.extent.1],
+            format: plan.format.format,
+            color_space: plan.format.color_space,
+            present_mode: plan.present_mode,
+            image_count: plan.image_count,
+        },
+        "{\"schema\":0,\"extent\":[0,0],\"format\":0,\"color_space\":0,\"present_mode\":0,\"image_count\":0}",
+    )
 }
 
 /// Renders a deterministic JSON swapchain recreation report.
 #[must_use]
 pub fn render_swapchain_recreation_report_json(report: &VulkanSwapchainRecreationReport) -> String {
-    let mut out = String::new();
-    out.push_str("{\"schema\":");
-    out.push_str(&report.schema.to_string());
-    out.push_str(",\"reason\":\"");
-    out.push_str(match report.reason {
-        VulkanSwapchainRecreationReason::Resize => "resize",
-        VulkanSwapchainRecreationReason::OutOfDate => "out_of_date",
-        VulkanSwapchainRecreationReason::Suboptimal => "suboptimal",
-    });
-    out.push_str("\",\"previous_extent\":[");
-    out.push_str(&report.previous_extent.0.to_string());
-    out.push(',');
-    out.push_str(&report.previous_extent.1.to_string());
-    out.push_str("],\"next_extent\":[");
-    out.push_str(&report.next_extent.0.to_string());
-    out.push(',');
-    out.push_str(&report.next_extent.1.to_string());
-    out.push_str("]}");
-    out
+    #[derive(Serialize)]
+    struct SwapchainRecreationReportJson<'a> {
+        schema: u32,
+        reason: &'a str,
+        previous_extent: [u32; 2],
+        next_extent: [u32; 2],
+    }
+
+    serialize_json_or_fallback(
+        &SwapchainRecreationReportJson {
+            schema: report.schema,
+            reason: match report.reason {
+                VulkanSwapchainRecreationReason::Resize => "resize",
+                VulkanSwapchainRecreationReason::OutOfDate => "out_of_date",
+                VulkanSwapchainRecreationReason::Suboptimal => "suboptimal",
+            },
+            previous_extent: [report.previous_extent.0, report.previous_extent.1],
+            next_extent: [report.next_extent.0, report.next_extent.1],
+        },
+        "{\"schema\":0,\"reason\":\"unknown\",\"previous_extent\":[0,0],\"next_extent\":[0,0]}",
+    )
 }
 
 /// Renders a deterministic JSON frame submission plan.
 #[must_use]
 pub fn render_frame_submission_plan_json(plan: &VulkanFrameSubmissionPlan) -> String {
-    let mut out = String::new();
-    out.push_str("{\"schema\":");
-    out.push_str(&plan.schema.to_string());
-    out.push_str(",\"frames_in_flight\":");
-    out.push_str(&plan.frames_in_flight.to_string());
-    out.push_str(",\"command_buffers\":");
-    out.push_str(&plan.command_buffers.to_string());
-    out.push_str(",\"semaphores_per_frame\":");
-    out.push_str(&plan.semaphores_per_frame.to_string());
-    out.push_str(",\"fences_per_frame\":");
-    out.push_str(&plan.fences_per_frame.to_string());
-    out.push_str(",\"draw_count\":");
-    out.push_str(&plan.draw_count.to_string());
-    out.push_str(",\"indexed_vertex_count\":");
-    out.push_str(&plan.indexed_vertex_count.to_string());
-    out.push('}');
-    out
+    serialize_json_or_fallback(
+        plan,
+        "{\"schema\":0,\"frames_in_flight\":0,\"command_buffers\":0,\"semaphores_per_frame\":0,\"fences_per_frame\":0,\"draw_count\":0,\"indexed_vertex_count\":0}",
+    )
+}
+
+fn serialize_json_or_fallback<T: Serialize>(value: &T, fallback: &str) -> String {
+    match serde_json::to_string(value) {
+        Ok(json) => json,
+        Err(_) => fallback.to_string(),
+    }
 }
 
 fn format_api_version(version: u32) -> String {
@@ -4236,25 +4209,6 @@ fn format_api_version(version: u32) -> String {
         vk::api_version_minor(version),
         vk::api_version_patch(version)
     )
-}
-
-fn push_json_string(out: &mut String, value: &str) {
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => {
-                use std::fmt::Write as _;
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
 }
 
 /// Diagnostics for Vulkan planning backend setup and frame progression.

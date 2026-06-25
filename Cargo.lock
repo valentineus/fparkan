@@ -630,6 +630,8 @@ dependencies = [
  "fparkan-binary",
  "fparkan-platform",
  "fparkan-render",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
