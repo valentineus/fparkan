@@ -310,7 +310,7 @@ fn capability_gate_respects_request_specific_depth_profiles() {
         ..RenderRequest::conservative()
     };
 
-    let report = select_physical_device_for_request(&[no_stencil], &relaxed_request)
+    let report = select_physical_device_for_request(&[no_stencil], relaxed_request)
         .expect("selected device for depth-only request");
 
     assert_eq!(report.device_name, "No stencil");

@@ -130,7 +130,7 @@ pub fn create_vulkan_logical_device_probe(
         instance,
         surface,
         drawable_extent,
-        &RenderRequest::conservative(),
+        RenderRequest::conservative(),
     )
 }
 
@@ -144,7 +144,7 @@ pub fn create_vulkan_logical_device_probe_for_request(
     instance: &VulkanInstanceProbe,
     surface: &VulkanSurfaceProbe,
     drawable_extent: (u32, u32),
-    render_request: &RenderRequest,
+    render_request: RenderRequest,
 ) -> Result<VulkanLogicalDeviceProbe, VulkanLogicalDeviceError> {
     let selected = select_live_device_candidate_for_request(
         instance,

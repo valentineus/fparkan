@@ -729,7 +729,11 @@ impl AtomicWindowPhase {
     }
 
     fn status(&self) -> &'static str {
-        WindowPhase::from_u8(self.0.load(Ordering::SeqCst) as u8).status()
+        match u8::try_from(self.0.load(Ordering::SeqCst)) {
+            Ok(value) => WindowPhase::from_u8(value),
+            Err(_) => WindowPhase::NotStarted,
+        }
+        .status()
     }
 }
 

@@ -110,7 +110,7 @@ impl VulkanSmokeRenderer {
             &instance,
             &surface,
             create_info.drawable_extent,
-            &create_info.render_request,
+            create_info.render_request,
         )
         .map_err(VulkanSmokeRendererError::LogicalDevice)?;
         if let Some(progress) = bootstrap_progress {

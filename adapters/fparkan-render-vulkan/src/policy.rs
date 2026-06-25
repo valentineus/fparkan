@@ -362,7 +362,7 @@ impl std::error::Error for VulkanCapabilityError {}
 pub fn select_physical_device(
     devices: &[VulkanPhysicalDeviceRecord],
 ) -> Result<VulkanCapabilityReport, VulkanCapabilityError> {
-    select_physical_device_for_request(devices, &RenderRequest::conservative())
+    select_physical_device_for_request(devices, RenderRequest::conservative())
 }
 
 /// Selects a Vulkan physical device for a specific Stage 0 render request.
@@ -374,7 +374,7 @@ pub fn select_physical_device(
 /// requirements for the requested profile.
 pub fn select_physical_device_for_request(
     devices: &[VulkanPhysicalDeviceRecord],
-    render_request: &RenderRequest,
+    render_request: RenderRequest,
 ) -> Result<VulkanCapabilityReport, VulkanCapabilityError> {
     if devices.is_empty() {
         return Err(VulkanCapabilityError::NoPhysicalDevice);
@@ -675,7 +675,7 @@ fn select_image_count(capabilities: VulkanSwapchainSurfaceCapabilities) -> u32 {
 
 pub(crate) fn validate_device_for_request(
     device: &VulkanPhysicalDeviceRecord,
-    render_request: &RenderRequest,
+    render_request: RenderRequest,
 ) -> Result<VulkanCapabilityReport, VulkanCapabilityError> {
     if device.api_version < MIN_VULKAN_API_VERSION {
         return Err(VulkanCapabilityError::ApiVersionTooLow {
@@ -830,7 +830,6 @@ fn informational_capabilities(
 
 fn required_depth_stencil_formats(depth: DepthStencilSupport) -> &'static [vk::Format] {
     match (depth.depth_bits, depth.stencil_bits) {
-        (0, 0) => &[],
         (16, 0) => &[vk::Format::D16_UNORM, vk::Format::D32_SFLOAT],
         (24, 0) => &[vk::Format::X8_D24_UNORM_PACK32, vk::Format::D32_SFLOAT],
         (32, 0) => &[vk::Format::D32_SFLOAT],

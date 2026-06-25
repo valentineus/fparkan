@@ -138,7 +138,7 @@ pub fn probe_vulkan_runtime_capabilities(
         instance,
         surface,
         drawable_extent,
-        &RenderRequest::conservative(),
+        RenderRequest::conservative(),
     )?;
     Ok(selected.runtime)
 }
@@ -154,7 +154,7 @@ pub fn probe_vulkan_runtime_capabilities_for_request(
     instance: &VulkanInstanceProbe,
     surface: &VulkanSurfaceProbe,
     drawable_extent: (u32, u32),
-    render_request: &RenderRequest,
+    render_request: RenderRequest,
 ) -> Result<VulkanRuntimeCapabilityProbe, VulkanRuntimeCapabilityError> {
     let selected = select_live_device_candidate_for_request(
         instance,
@@ -169,7 +169,7 @@ pub(super) fn select_live_device_candidate_for_request(
     instance: &VulkanInstanceProbe,
     surface: &VulkanSurfaceProbe,
     drawable_extent: (u32, u32),
-    render_request: &RenderRequest,
+    render_request: RenderRequest,
 ) -> Result<SelectedLiveDevice, VulkanRuntimeCapabilityError> {
     let devices = {
         // SAFETY: The Vulkan instance is live for this query and no handles are retained.
@@ -222,7 +222,7 @@ fn live_device_candidate(
     surface: &VulkanSurfaceProbe,
     device: vk::PhysicalDevice,
     index: usize,
-    render_request: &RenderRequest,
+    render_request: RenderRequest,
 ) -> Result<LiveDeviceCandidate, VulkanRuntimeCapabilityError> {
     let properties = {
         // SAFETY: `device` was returned by this live instance and the result is copied by value.
