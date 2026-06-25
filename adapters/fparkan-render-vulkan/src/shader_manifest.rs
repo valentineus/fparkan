@@ -37,6 +37,30 @@ const TRIANGLE_FRAGMENT_COMPILE_COMMAND: &str =
 const TRIANGLE_FRAGMENT_VALIDATE_COMMAND: &str =
     "spirv-val --target-env vulkan1.0 adapters/fparkan-render-vulkan/shaders/triangle.frag.spv";
 
+fn shader_compiler_name() -> &'static str {
+    option_env!("FPARKAN_BUILD_SHADER_COMPILER_NAME").unwrap_or(SHADER_COMPILER_NAME)
+}
+
+fn shader_compiler_version() -> &'static str {
+    option_env!("FPARKAN_BUILD_SHADER_COMPILER_VERSION").unwrap_or(SHADER_COMPILER_VERSION)
+}
+
+fn shader_compiler_binary_sha256() -> &'static str {
+    option_env!("FPARKAN_BUILD_SHADER_COMPILER_SHA256").unwrap_or(SHADER_COMPILER_BINARY_SHA256)
+}
+
+fn spirv_validator_name() -> &'static str {
+    option_env!("FPARKAN_BUILD_SPIRV_VALIDATOR_NAME").unwrap_or(SPIRV_VALIDATOR_NAME)
+}
+
+fn spirv_validator_version() -> &'static str {
+    option_env!("FPARKAN_BUILD_SPIRV_VALIDATOR_VERSION").unwrap_or(SPIRV_VALIDATOR_VERSION)
+}
+
+fn spirv_validator_binary_sha256() -> &'static str {
+    option_env!("FPARKAN_BUILD_SPIRV_VALIDATOR_SHA256").unwrap_or(SPIRV_VALIDATOR_BINARY_SHA256)
+}
+
 /// Shader tool metadata pinned in the Stage 0 manifest.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct VulkanShaderToolManifest {
@@ -247,14 +271,14 @@ pub fn validate_shader_manifest(
         schema: SHADER_MANIFEST_SCHEMA,
         target_env: SHADER_TARGET_ENV,
         compiler: VulkanShaderToolManifest {
-            name: SHADER_COMPILER_NAME,
-            version: SHADER_COMPILER_VERSION,
-            binary_sha256: SHADER_COMPILER_BINARY_SHA256,
+            name: shader_compiler_name(),
+            version: shader_compiler_version(),
+            binary_sha256: shader_compiler_binary_sha256(),
         },
         validator: VulkanShaderToolManifest {
-            name: SPIRV_VALIDATOR_NAME,
-            version: SPIRV_VALIDATOR_VERSION,
-            binary_sha256: SPIRV_VALIDATOR_BINARY_SHA256,
+            name: spirv_validator_name(),
+            version: spirv_validator_version(),
+            binary_sha256: spirv_validator_binary_sha256(),
         },
         modules: reports,
         manifest_hash: sha256_hex(&sha256(normalized.as_bytes())),
