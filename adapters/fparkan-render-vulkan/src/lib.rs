@@ -3,6 +3,8 @@
 
 mod ffi;
 mod planning_backend;
+mod policy;
 
 pub use ffi::*;
 pub use planning_backend::*;
+pub use policy::*;
