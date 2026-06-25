@@ -33,6 +33,7 @@ mod runtime;
 mod smoke;
 mod smoke_types;
 mod surface;
+mod swapchain;
 mod swapchain_resources;
 mod validation;
 
@@ -50,11 +51,9 @@ use self::resources::{
     VulkanFrameSync,
 };
 pub use self::runtime::{
-    create_vulkan_logical_device_probe, create_vulkan_swapchain_probe,
-    create_vulkan_swapchain_probe_for_extent, probe_vulkan_runtime_capabilities,
+    create_vulkan_logical_device_probe, probe_vulkan_runtime_capabilities,
     VulkanLogicalDeviceError, VulkanLogicalDeviceProbe, VulkanLogicalDeviceReport,
-    VulkanRuntimeCapabilityError, VulkanRuntimeCapabilityProbe, VulkanSwapchainProbe,
-    VulkanSwapchainProbeError, VulkanSwapchainReport,
+    VulkanRuntimeCapabilityError, VulkanRuntimeCapabilityProbe,
 };
 pub use self::smoke_types::{
     VulkanSmokeFrameOutcome, VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo,
@@ -65,6 +64,10 @@ use self::surface::extension_name;
 pub use self::surface::{
     create_vulkan_surface_probe, plan_vulkan_surface, render_surface_plan_json, VulkanSurfaceError,
     VulkanSurfacePlan, VulkanSurfaceProbe,
+};
+pub use self::swapchain::{
+    create_vulkan_swapchain_probe, create_vulkan_swapchain_probe_for_extent, VulkanSwapchainProbe,
+    VulkanSwapchainProbeError, VulkanSwapchainReport,
 };
 use self::swapchain_resources::{
     create_swapchain_resources, destroy_swapchain_resources, VulkanSwapchainResources,

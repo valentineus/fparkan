@@ -1245,6 +1245,7 @@ const AUDITED_UNSAFE_SOURCE_FILES: &[&str] = &[
     "adapters/fparkan-render-vulkan/src/ffi/resources.rs",
     "adapters/fparkan-render-vulkan/src/ffi/runtime.rs",
     "adapters/fparkan-render-vulkan/src/ffi/smoke.rs",
+    "adapters/fparkan-render-vulkan/src/ffi/swapchain.rs",
     "adapters/fparkan-render-vulkan/src/ffi/swapchain_resources.rs",
     "adapters/fparkan-render-vulkan/src/ffi/surface.rs",
     "adapters/fparkan-render-vulkan/src/ffi/validation.rs",
