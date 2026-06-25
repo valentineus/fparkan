@@ -11,7 +11,7 @@ S0-ARCH-003	covered	cargo xtask policy rejects platform/render adapter dependenc
 S0-ARCH-004	covered	cargo xtask policy scans workspace-owned Rust/TOML for unsafe constructs and workspace lints forbid unsafe_code
 S0-ARCH-005	covered	cargo xtask policy rejects Python source files, Python shebangs, and Python CI workflow steps while allowing docs requirements.txt
 S0-ARCH-006	covered	cargo xtask policy rejects non-fparkan package directories under crates/
-S0-ARCH-007	covered	cargo xtask ci runs fmt, policy, workspace test, clippy, rustdoc warnings, cargo-deny or built-in supply-chain fallback, and strict acceptance audit
+S0-ARCH-007	covered	cargo xtask ci runs fmt, policy, workspace test, clippy, rustdoc warnings, cargo-deny with reviewed deny.toml, and strict acceptance audit; built-in supply-chain fallback is opt-in local-only and forbidden when CI is set
 S0-ARCH-008	covered	cargo xtask policy rejects moving Rust toolchains and workspace rust-version drift
 S0-ARCH-009	covered	.github/workflows/ci.yml runs a pinned MSRV backend-neutral crate job
 S0-ARCH-010	covered	cargo xtask acceptance audit emits commit_sha, rust_toolchain, and msrv metadata into the JSON artifact

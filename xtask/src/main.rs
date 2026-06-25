@@ -38,6 +38,7 @@ const CI_ACCEPTANCE_ROADMAP: &str = "fixtures/acceptance/stage_0_roadmap.md";
 const CI_ACCEPTANCE_COVERAGE: &str = "fixtures/acceptance/coverage.tsv";
 const CI_ACCEPTANCE_REPORT: &str = "target/fparkan/acceptance/stage-0-audit.json";
 const STAGE_PACKAGE_MANIFEST: &str = "fixtures/acceptance/stage_packages.toml";
+const SUPPLY_CHAIN_POLICY_CONFIG: &str = "deny.toml";
 const REQUIRED_NATIVE_SMOKE_PLATFORMS: &[&str] = &["macos"];
 const APPROVED_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const SUPPLY_CHAIN_BANNED_PACKAGES: &[&str] = &["native-tls", "openssl", "openssl-sys"];
@@ -192,6 +193,7 @@ fn run_cargo_fmt_check() -> Result<(), String> {
 }
 
 fn run_cargo_deny() -> Result<(), String> {
+    validate_supply_chain_policy_config(&workspace_relative_path(SUPPLY_CHAIN_POLICY_CONFIG))?;
     let cargo_deny = std::env::var_os("CARGO_DENY").unwrap_or_else(|| "cargo-deny".into());
     let version_output = match Command::new(&cargo_deny).arg("--version").output() {
         Ok(output) => output,
@@ -238,16 +240,46 @@ fn run_cargo_deny() -> Result<(), String> {
 const PINNED_CARGO_DENY_VERSION: &str = "0.19.9";
 
 fn handle_cargo_deny_fallback(reason: &str) -> Result<(), String> {
-    if std::env::var_os(ALLOW_SUPPLY_CHAIN_FALLBACK_ENV).is_some() {
+    if allow_supply_chain_fallback() {
         eprintln!(
             "{reason}; running built-in supply-chain policy fallback because {ALLOW_SUPPLY_CHAIN_FALLBACK_ENV} is set"
         );
         run_builtin_supply_chain_policy(Path::new("."))
+    } else if std::env::var_os(ALLOW_SUPPLY_CHAIN_FALLBACK_ENV).is_some() && ci_env_active() {
+        Err(format!(
+            "{reason}; {ALLOW_SUPPLY_CHAIN_FALLBACK_ENV} is for local developer convenience only and is forbidden when CI is set"
+        ))
     } else {
         Err(format!(
             "{reason}; install cargo-deny {PINNED_CARGO_DENY_VERSION} or explicitly opt into the fallback with {ALLOW_SUPPLY_CHAIN_FALLBACK_ENV}=1"
         ))
     }
+}
+
+fn validate_supply_chain_policy_config(path: &Path) -> Result<(), String> {
+    if path.is_file() {
+        Ok(())
+    } else {
+        Err(format!(
+            "reviewed supply-chain policy config is missing: {}",
+            path.display()
+        ))
+    }
+}
+
+fn allow_supply_chain_fallback() -> bool {
+    std::env::var_os(ALLOW_SUPPLY_CHAIN_FALLBACK_ENV).is_some() && !ci_env_active()
+}
+
+fn ci_env_active() -> bool {
+    ci_env_value_is_active(std::env::var("CI").ok().as_deref())
+}
+
+fn ci_env_value_is_active(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        let trimmed = value.trim();
+        !trimmed.is_empty() && trimmed != "0" && !trimmed.eq_ignore_ascii_case("false")
+    })
 }
 
 fn run_builtin_supply_chain_policy(root: &Path) -> Result<(), String> {
@@ -2745,6 +2777,33 @@ source = "git+https://example.invalid/repo"
         assert!(failures[0].contains("is banned"));
         fs::remove_dir_all(root).map_err(|err| err.to_string())?;
         Ok(())
+    }
+
+    #[test]
+    fn supply_chain_policy_config_must_exist() -> Result<(), String> {
+        let root = temp_dir("supply-chain-config");
+        fs::create_dir_all(&root).map_err(|err| err.to_string())?;
+
+        let missing = root.join("deny.toml");
+        assert!(validate_supply_chain_policy_config(&missing).is_err());
+
+        fs::write(&missing, "[graph]\nall-features = true\n").map_err(|err| err.to_string())?;
+        assert_eq!(validate_supply_chain_policy_config(&missing), Ok(()));
+
+        fs::remove_dir_all(root).map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn ci_env_truthy_values_are_detected() {
+        assert!(ci_env_value_is_active(Some("true")));
+        assert!(ci_env_value_is_active(Some("1")));
+        assert!(ci_env_value_is_active(Some("yes")));
+        assert!(!ci_env_value_is_active(None));
+        assert!(!ci_env_value_is_active(Some("")));
+        assert!(!ci_env_value_is_active(Some("0")));
+        assert!(!ci_env_value_is_active(Some("false")));
+        assert!(!ci_env_value_is_active(Some(" FALSE ")));
     }
 
     #[test]
