@@ -13,12 +13,13 @@
 
 use fparkan_platform_winit::{window_native_handles, WinitWindowPlan};
 use fparkan_render_vulkan::{
-    VulkanSmokeFrameOutcome, VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo,
+    VulkanSmokeBootstrapProgress, VulkanSmokeFrameOutcome, VulkanSmokeRenderer,
+    VulkanSmokeRendererCreateInfo,
 };
 use serde::Serialize;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -52,28 +53,38 @@ fn main() {
 
 fn run(args: &[String]) -> Result<String, String> {
     let options = SmokeOptions::parse(args)?;
+    remove_stale_output(&options)?;
     let event_loop = EventLoop::new().map_err(|err| format!("winit event loop: {err}"))?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let completed = Arc::new(AtomicBool::new(false));
-    spawn_timeout_watchdog(options.clone(), Arc::clone(&completed));
-    let mut app = SmokeApp::new(options, completed);
+    let progress = Arc::new(SharedSmokeProgress::default());
+    spawn_timeout_watchdog(
+        options.clone(),
+        Arc::clone(&completed),
+        Arc::clone(&progress),
+    );
+    let mut app = SmokeApp::new(options, completed, progress);
     if let Err(err) = event_loop.run_app(&mut app) {
         app.error = Some(format!("winit event loop: {err}"));
     }
     app.finish()
 }
 
-fn spawn_timeout_watchdog(options: SmokeOptions, completed: Arc<AtomicBool>) {
+fn spawn_timeout_watchdog(
+    options: SmokeOptions,
+    completed: Arc<AtomicBool>,
+    progress: Arc<SharedSmokeProgress>,
+) {
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(options.timeout_seconds));
-        if completed.load(Ordering::SeqCst) || options.out.exists() {
+        if completed.load(Ordering::SeqCst) {
             return;
         }
         let failure_reason = format!(
             "native smoke timed out after {} seconds",
             options.timeout_seconds
         );
-        if let Ok(report) = render_timeout_failure_report(&options, &failure_reason) {
+        if let Ok(report) = render_timeout_failure_report(&options, &failure_reason, &progress) {
             if let Some(parent) = options.out.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -82,6 +93,13 @@ fn spawn_timeout_watchdog(options: SmokeOptions, completed: Arc<AtomicBool>) {
         eprintln!("{failure_reason}");
         std::process::exit(2);
     });
+}
+
+fn remove_stale_output(options: &SmokeOptions) -> Result<(), String> {
+    if !options.out.exists() {
+        return Ok(());
+    }
+    std::fs::remove_file(&options.out).map_err(|err| format!("{}: {err}", options.out.display()))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -153,6 +171,7 @@ impl SmokeOptions {
 struct SmokeApp {
     options: SmokeOptions,
     completed: Arc<AtomicBool>,
+    progress: Arc<SharedSmokeProgress>,
     window_id: Option<WindowId>,
     window: Option<Window>,
     renderer: Option<VulkanSmokeRenderer>,
@@ -166,10 +185,15 @@ struct SmokeApp {
 }
 
 impl SmokeApp {
-    fn new(options: SmokeOptions, completed: Arc<AtomicBool>) -> Self {
+    fn new(
+        options: SmokeOptions,
+        completed: Arc<AtomicBool>,
+        progress: Arc<SharedSmokeProgress>,
+    ) -> Self {
         Self {
             options,
             completed,
+            progress,
             window_id: None,
             window: None,
             renderer: None,
@@ -386,7 +410,9 @@ impl SmokeApp {
 fn render_timeout_failure_report(
     options: &SmokeOptions,
     failure_reason: &str,
+    progress: &SharedSmokeProgress,
 ) -> Result<String, String> {
+    let bootstrap = progress.bootstrap.snapshot();
     let smoke_report = SmokeReport {
         schema_version: SCHEMA_VERSION,
         commit_sha: compiled_commit_sha(),
@@ -398,26 +424,54 @@ fn render_timeout_failure_report(
         platform: actual_platform(),
         status: "failed",
         failure_reason: Some(failure_reason),
-        frames: 0,
-        resize_count: 0,
-        swapchain_recreate_count: 0,
+        frames: progress.frames_presented.load(Ordering::SeqCst),
+        resize_count: progress.resize_count.load(Ordering::SeqCst),
+        swapchain_recreate_count: progress.swapchain_recreate_count.load(Ordering::SeqCst),
         validation_warning_count: 0,
         validation_error_count: 0,
         validation_vuids: &[],
         requested_frames: options.frames,
         timeout_seconds: options.timeout_seconds,
         shader_manifest_hash: "",
-        vulkan_loader_status: "failed",
-        vulkan_instance_status: "failed",
-        window_status: "failed",
-        vulkan_surface_status: "failed",
-        vulkan_device_status: "failed",
+        vulkan_loader_status: if bootstrap.loader_available {
+            "available"
+        } else {
+            "failed"
+        },
+        vulkan_instance_status: if bootstrap.instance_created {
+            "created"
+        } else {
+            "failed"
+        },
+        window_status: if progress.window_created.load(Ordering::SeqCst) {
+            "created"
+        } else {
+            "failed"
+        },
+        vulkan_surface_status: if bootstrap.surface_created {
+            "created"
+        } else {
+            "failed"
+        },
+        vulkan_device_status: if bootstrap.device_selected {
+            "selected"
+        } else {
+            "failed"
+        },
         vulkan_device_name: "",
-        vulkan_logical_device_status: "failed",
+        vulkan_logical_device_status: if bootstrap.logical_device_created {
+            "created"
+        } else {
+            "failed"
+        },
         vulkan_logical_device_graphics_queue_family: 0,
         vulkan_logical_device_present_queue_family: 0,
         vulkan_logical_device_enabled_extension_count: 0,
-        vulkan_swapchain_status: "failed",
+        vulkan_swapchain_status: if bootstrap.swapchain_created {
+            "created"
+        } else {
+            "failed"
+        },
         vulkan_swapchain_width: 0,
         vulkan_swapchain_height: 0,
         vulkan_swapchain_image_count: 0,
@@ -471,6 +525,7 @@ impl ApplicationHandler for SmokeApp {
             native_handles,
             drawable_extent: (size.width.max(1), size.height.max(1)),
             enable_validation: true,
+            bootstrap_progress: Some(Arc::clone(&self.progress.bootstrap)),
         }) {
             Ok(renderer) => renderer,
             Err(err) => {
@@ -481,6 +536,7 @@ impl ApplicationHandler for SmokeApp {
         };
         self.last_size = Some((size.width, size.height));
         self.window_id = Some(window.id());
+        self.progress.window_created.store(true, Ordering::SeqCst);
         self.renderer = Some(renderer);
         self.window = Some(window);
         self.schedule_next_redraw();
@@ -511,6 +567,9 @@ impl ApplicationHandler for SmokeApp {
                     .is_some_and(|last| last != (size.width, size.height))
                 {
                     self.resize_count = self.resize_count.saturating_add(1);
+                    self.progress
+                        .resize_count
+                        .store(self.resize_count, Ordering::SeqCst);
                 }
                 self.last_size = Some((size.width, size.height));
                 if let Some(renderer) = self.renderer.as_mut() {
@@ -526,6 +585,9 @@ impl ApplicationHandler for SmokeApp {
                 match renderer.draw_frame() {
                     Ok(VulkanSmokeFrameOutcome::Presented) => {
                         self.frames_presented = self.frames_presented.saturating_add(1);
+                        self.progress
+                            .frames_presented
+                            .store(self.frames_presented, Ordering::SeqCst);
                     }
                     Ok(
                         VulkanSmokeFrameOutcome::Recreated | VulkanSmokeFrameOutcome::ZeroExtent,
@@ -537,6 +599,9 @@ impl ApplicationHandler for SmokeApp {
                     }
                 }
                 let recreate_count = renderer.swapchain_recreate_count();
+                self.progress
+                    .swapchain_recreate_count
+                    .store(recreate_count, Ordering::SeqCst);
                 let should_request_resize =
                     !self.resize_requested && self.frames_presented >= self.options.resize_frame;
                 let should_complete = self.frames_presented >= self.options.frames
@@ -604,6 +669,15 @@ struct SmokeReport<'a> {
     vulkan_swapchain_image_count: u32,
     vulkan_portability_enumeration: bool,
     vulkan_portability_subset_enabled: bool,
+}
+
+#[derive(Debug, Default)]
+struct SharedSmokeProgress {
+    bootstrap: Arc<VulkanSmokeBootstrapProgress>,
+    window_created: AtomicBool,
+    frames_presented: AtomicU32,
+    resize_count: AtomicU32,
+    swapchain_recreate_count: AtomicU32,
 }
 
 fn actual_platform() -> &'static str {
@@ -900,6 +974,7 @@ mod tests {
                 timeout_seconds: 7,
             },
             completed: Arc::new(AtomicBool::new(false)),
+            progress: Arc::new(SharedSmokeProgress::default()),
             window_id: None,
             window: None,
             renderer: None,

@@ -76,9 +76,11 @@ impl VulkanSmokeRenderer {
     ///
     /// Returns [`VulkanSmokeRendererError`] when Vulkan bootstrap, pipeline creation,
     /// memory allocation, or synchronization resource creation fails.
+    #[allow(clippy::too_many_lines)]
     pub fn new(
         create_info: &VulkanSmokeRendererCreateInfo,
     ) -> Result<Self, VulkanSmokeRendererError> {
+        let bootstrap_progress = create_info.bootstrap_progress.as_ref();
         let shader_manifest = validate_shader_manifest(&triangle_shader_manifest())
             .map_err(VulkanSmokeRendererError::ShaderManifest)?;
         let surface_plan = plan_vulkan_surface(Some(create_info.native_handles))
@@ -90,6 +92,10 @@ impl VulkanSmokeRenderer {
         instance_config.enable_validation = create_info.enable_validation;
         let instance = create_vulkan_instance_probe(&instance_config)
             .map_err(VulkanSmokeRendererError::Instance)?;
+        if let Some(progress) = bootstrap_progress {
+            progress.mark_loader_available();
+            progress.mark_instance_created();
+        }
         let validation = if create_info.enable_validation {
             Some(create_validation_messenger(&instance)?)
         } else {
@@ -97,9 +103,15 @@ impl VulkanSmokeRenderer {
         };
         let surface = create_vulkan_surface_probe(&instance, Some(create_info.native_handles))
             .map_err(VulkanSmokeRendererError::Surface)?;
+        if let Some(progress) = bootstrap_progress {
+            progress.mark_surface_created();
+        }
         let device =
             create_vulkan_logical_device_probe(&instance, &surface, create_info.drawable_extent)
                 .map_err(VulkanSmokeRendererError::LogicalDevice)?;
+        if let Some(progress) = bootstrap_progress {
+            progress.mark_logical_device_created();
+        }
         let swapchain = create_vulkan_swapchain_probe_for_extent(
             &instance,
             &surface,
@@ -108,6 +120,9 @@ impl VulkanSmokeRenderer {
             vk::SwapchainKHR::null(),
         )
         .map_err(VulkanSmokeRendererError::Swapchain)?;
+        if let Some(progress) = bootstrap_progress {
+            progress.mark_swapchain_created();
+        }
         let command_pool = create_command_pool(&device)?;
         let vertex_buffer = match create_triangle_vertex_buffer(&instance, &device) {
             Ok(buffer) => buffer,

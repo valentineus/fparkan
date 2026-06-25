@@ -58,8 +58,9 @@ pub use self::runtime::{
     VulkanLogicalDeviceReport,
 };
 pub use self::smoke_types::{
-    VulkanSmokeFrameOutcome, VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo,
-    VulkanSmokeRendererError, VulkanSmokeRendererReport, VulkanValidationReport,
+    VulkanSmokeBootstrapProgress, VulkanSmokeBootstrapSnapshot, VulkanSmokeFrameOutcome,
+    VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo, VulkanSmokeRendererError,
+    VulkanSmokeRendererReport, VulkanValidationReport,
 };
 #[cfg(test)]
 use self::surface::extension_name;
