@@ -682,14 +682,14 @@ pub enum VulkanSurfaceError {
     /// Required platform surface extensions could not be enumerated.
     RequiredExtensionsFailed {
         /// Vulkan result.
-        result: String,
+        result: vk::Result,
     },
     /// A required extension pointer was not valid UTF-8.
     InvalidExtensionName,
     /// Surface creation failed.
     CreateFailed {
         /// Vulkan result.
-        result: String,
+        result: vk::Result,
     },
 }
 
@@ -704,12 +704,14 @@ impl std::fmt::Display for VulkanSurfaceError {
             }
             Self::RequiredExtensionsFailed { result } => write!(
                 f,
-                "failed to enumerate required Vulkan surface extensions: {result}"
+                "failed to enumerate required Vulkan surface extensions: {result:?}"
             ),
             Self::InvalidExtensionName => {
                 write!(f, "Vulkan surface extension name is not valid UTF-8")
             }
-            Self::CreateFailed { result } => write!(f, "Vulkan surface creation failed: {result}"),
+            Self::CreateFailed { result } => {
+                write!(f, "Vulkan surface creation failed: {result:?}")
+            }
         }
     }
 }
@@ -902,8 +904,8 @@ pub enum VulkanSmokeRendererError {
     VulkanOperation {
         /// Operation context.
         context: &'static str,
-        /// Raw Vulkan result text.
-        result: String,
+        /// Raw Vulkan result code.
+        result: vk::Result,
     },
     /// No suitable memory type exists for the required properties.
     MissingMemoryType {
@@ -926,7 +928,7 @@ impl std::fmt::Display for VulkanSmokeRendererError {
             Self::Swapchain(error) => write!(f, "{error}"),
             Self::ShaderManifest(error) => write!(f, "{error}"),
             Self::VulkanOperation { context, result } => {
-                write!(f, "{context}: {result}")
+                write!(f, "{context}: {result:?}")
             }
             Self::MissingMemoryType { context } => {
                 write!(f, "{context}: no compatible Vulkan memory type")
@@ -1290,7 +1292,7 @@ impl VulkanSmokeRenderer {
         }
         .map_err(|error| VulkanSmokeRendererError::VulkanOperation {
             context: "vkWaitForFences",
-            result: format!("{error:?}"),
+            result: error,
         })?;
         // SAFETY: The swapchain, semaphore and fence inputs are live for the duration of the acquire call.
         let acquire = unsafe {
@@ -1310,7 +1312,7 @@ impl VulkanSmokeRenderer {
             Err(error) => {
                 return Err(VulkanSmokeRendererError::VulkanOperation {
                     context: "vkAcquireNextImageKHR",
-                    result: format!("{error:?}"),
+                    result: error,
                 });
             }
         };
@@ -1325,7 +1327,7 @@ impl VulkanSmokeRenderer {
             }
             .map_err(|error| VulkanSmokeRendererError::VulkanOperation {
                 context: "vkWaitForFences(image)",
-                result: format!("{error:?}"),
+                result: error,
             })?;
         }
         self.images_in_flight[image_index_usize] = in_flight_fence;
@@ -1333,7 +1335,7 @@ impl VulkanSmokeRenderer {
         unsafe { self.device_ref()?.device().reset_fences(&[in_flight_fence]) }.map_err(
             |error| VulkanSmokeRendererError::VulkanOperation {
                 context: "vkResetFences",
-                result: format!("{error:?}"),
+                result: error,
             },
         )?;
 
@@ -1357,7 +1359,7 @@ impl VulkanSmokeRenderer {
         }
         .map_err(|error| VulkanSmokeRendererError::VulkanOperation {
             context: "vkQueueSubmit",
-            result: format!("{error:?}"),
+            result: error,
         })?;
 
         let present_wait = [render_finished];
@@ -1381,7 +1383,7 @@ impl VulkanSmokeRenderer {
             Err(error) => {
                 return Err(VulkanSmokeRendererError::VulkanOperation {
                     context: "vkQueuePresentKHR",
-                    result: format!("{error:?}"),
+                    result: error,
                 });
             }
         };
@@ -1401,7 +1403,7 @@ impl VulkanSmokeRenderer {
         unsafe { device.device().device_wait_idle() }.map_err(|error| {
             VulkanSmokeRendererError::VulkanOperation {
                 context: "vkDeviceWaitIdle",
-                result: format!("{error:?}"),
+                result: error,
             }
         })?;
         self.pending_extent = None;
@@ -1479,7 +1481,7 @@ impl VulkanSmokeRenderer {
         }
         .map_err(|error| VulkanSmokeRendererError::VulkanOperation {
             context: "vkResetCommandBuffer",
-            result: format!("{error:?}"),
+            result: error,
         })?;
         let begin_info = vk::CommandBufferBeginInfo::default();
         // SAFETY: The command buffer is in the initial state after reset and recorded on one thread.
@@ -1490,7 +1492,7 @@ impl VulkanSmokeRenderer {
         }
         .map_err(|error| VulkanSmokeRendererError::VulkanOperation {
             context: "vkBeginCommandBuffer",
-            result: format!("{error:?}"),
+            result: error,
         })?;
 
         let pre_barrier = vk::ImageMemoryBarrier::default()
@@ -1509,7 +1511,7 @@ impl VulkanSmokeRenderer {
         }
         .map_err(|error| VulkanSmokeRendererError::VulkanOperation {
             context: "vkGetSwapchainImagesKHR",
-            result: format!("{error:?}"),
+            result: error,
         })?;
         let pre_barrier = pre_barrier.image(swapchain_images[image_index]);
         // SAFETY: The barriers operate on the acquired swapchain image owned by this command buffer submission.
@@ -1595,7 +1597,7 @@ impl VulkanSmokeRenderer {
         }
         .map_err(|error| VulkanSmokeRendererError::VulkanOperation {
             context: "vkEndCommandBuffer",
-            result: format!("{error:?}"),
+            result: error,
         })?;
         Ok(())
     }
@@ -1688,7 +1690,7 @@ fn create_validation_messenger(
         unsafe { loader.create_debug_utils_messenger(&create_info, None) }.map_err(|error| {
             VulkanSmokeRendererError::VulkanOperation {
                 context: "vkCreateDebugUtilsMessengerEXT",
-                result: format!("{error:?}"),
+                result: error,
             }
         })?;
     Ok(VulkanValidationMessenger {
@@ -1708,7 +1710,7 @@ fn create_command_pool(
     unsafe { device.device().create_command_pool(&create_info, None) }.map_err(|error| {
         VulkanSmokeRendererError::VulkanOperation {
             context: "vkCreateCommandPool",
-            result: format!("{error:?}"),
+            result: error,
         }
     })
 }
@@ -1770,7 +1772,7 @@ fn create_host_visible_buffer(
     let buffer = unsafe { device.device().create_buffer(&create_info, None) }.map_err(|error| {
         VulkanSmokeRendererError::VulkanOperation {
             context,
-            result: format!("{error:?}"),
+            result: error,
         }
     })?;
     // SAFETY: The buffer belongs to this device and is queried immediately after creation.
@@ -1795,7 +1797,7 @@ fn create_host_visible_buffer(
             unsafe { device.device().destroy_buffer(buffer, None) };
             VulkanSmokeRendererError::VulkanOperation {
                 context,
-                result: format!("{error:?}"),
+                result: error,
             }
         })?;
     // SAFETY: The buffer and allocation belong to the same live logical device.
@@ -1807,7 +1809,7 @@ fn create_host_visible_buffer(
         }
         VulkanSmokeRendererError::VulkanOperation {
             context,
-            result: format!("{error:?}"),
+            result: error,
         }
     })?;
     // SAFETY: The allocation is HOST_VISIBLE, mapped for the full buffer size and unmapped before return.
@@ -1824,7 +1826,7 @@ fn create_host_visible_buffer(
         }
         VulkanSmokeRendererError::VulkanOperation {
             context,
-            result: format!("{error:?}"),
+            result: error,
         }
     })?;
     // SAFETY: The mapped pointer is valid for `bytes.len()` bytes and non-overlapping with the source slice.
@@ -1875,7 +1877,7 @@ fn create_swapchain_resources(
     }
     .map_err(|error| VulkanSmokeRendererError::VulkanOperation {
         context: "vkGetSwapchainImagesKHR",
-        result: format!("{error:?}"),
+        result: error,
     })?;
     let mut partial = PartialSwapchainResources {
         image_views: Vec::with_capacity(images.len()),
@@ -1972,7 +1974,7 @@ fn create_image_view(
     unsafe { device.device().create_image_view(&create_info, None) }.map_err(|error| {
         VulkanSmokeRendererError::VulkanOperation {
             context: "vkCreateImageView",
-            result: format!("{error:?}"),
+            result: error,
         }
     })
 }
@@ -2012,7 +2014,7 @@ fn create_render_pass(
     unsafe { device.device().create_render_pass(&create_info, None) }.map_err(|error| {
         VulkanSmokeRendererError::VulkanOperation {
             context: "vkCreateRenderPass",
-            result: format!("{error:?}"),
+            result: error,
         }
     })
 }
@@ -2025,7 +2027,7 @@ fn create_pipeline_layout(
     unsafe { device.device().create_pipeline_layout(&create_info, None) }.map_err(|error| {
         VulkanSmokeRendererError::VulkanOperation {
             context: "vkCreatePipelineLayout",
-            result: format!("{error:?}"),
+            result: error,
         }
     })
 }
@@ -2144,7 +2146,7 @@ fn create_graphics_pipeline(
     let pipeline =
         pipeline_result.map_err(|(_, error)| VulkanSmokeRendererError::VulkanOperation {
             context: "vkCreateGraphicsPipelines",
-            result: format!("{error:?}"),
+            result: error,
         })?[0];
     Ok(pipeline)
 }
@@ -2158,7 +2160,7 @@ fn create_shader_module(
     unsafe { device.device().create_shader_module(&create_info, None) }.map_err(|error| {
         VulkanSmokeRendererError::VulkanOperation {
             context: "vkCreateShaderModule",
-            result: format!("{error:?}"),
+            result: error,
         }
     })
 }
@@ -2180,7 +2182,7 @@ fn create_framebuffer(
     unsafe { device.device().create_framebuffer(&create_info, None) }.map_err(|error| {
         VulkanSmokeRendererError::VulkanOperation {
             context: "vkCreateFramebuffer",
-            result: format!("{error:?}"),
+            result: error,
         }
     })
 }
@@ -2198,7 +2200,7 @@ fn allocate_command_buffers(
     unsafe { device.device().allocate_command_buffers(&allocate_info) }.map_err(|error| {
         VulkanSmokeRendererError::VulkanOperation {
             context: "vkAllocateCommandBuffers",
-            result: format!("{error:?}"),
+            result: error,
         }
     })
 }
@@ -2214,7 +2216,7 @@ fn create_frame_sync(
         let image_available = unsafe { device.device().create_semaphore(&semaphore_info, None) }
             .map_err(|error| VulkanSmokeRendererError::VulkanOperation {
                 context: "vkCreateSemaphore(image_available)",
-                result: format!("{error:?}"),
+                result: error,
             })?;
         let render_finished =
             // SAFETY: The sync objects belong to this live logical device and are destroyed at teardown.
@@ -2226,7 +2228,7 @@ fn create_frame_sync(
                     unsafe { device.device().destroy_semaphore(image_available, None) };
                     return Err(VulkanSmokeRendererError::VulkanOperation {
                         context: "vkCreateSemaphore(render_finished)",
-                        result: format!("{error:?}"),
+                        result: error,
                     });
                 }
             };
@@ -2243,7 +2245,7 @@ fn create_frame_sync(
                     }
                     return Err(VulkanSmokeRendererError::VulkanOperation {
                     context: "vkCreateFence",
-                    result: format!("{error:?}"),
+                    result: error,
                     });
                 }
             };
@@ -2363,14 +2365,14 @@ pub enum VulkanRuntimeCapabilityError {
     /// Physical device enumeration failed.
     EnumerateDevicesFailed {
         /// Vulkan result.
-        result: String,
+        result: vk::Result,
     },
     /// Device extension enumeration failed.
     EnumerateDeviceExtensionsFailed {
         /// Device name or index context.
         device: String,
         /// Vulkan result.
-        result: String,
+        result: vk::Result,
     },
     /// Queue-family present support query failed.
     PresentSupportFailed {
@@ -2379,28 +2381,28 @@ pub enum VulkanRuntimeCapabilityError {
         /// Queue-family index.
         queue_family: u32,
         /// Vulkan result.
-        result: String,
+        result: vk::Result,
     },
     /// Surface format query failed.
     SurfaceFormatsFailed {
         /// Device name.
         device: String,
         /// Vulkan result.
-        result: String,
+        result: vk::Result,
     },
     /// Surface capability query failed.
     SurfaceCapabilitiesFailed {
         /// Device name.
         device: String,
         /// Vulkan result.
-        result: String,
+        result: vk::Result,
     },
     /// Present mode query failed.
     PresentModesFailed {
         /// Device name.
         device: String,
         /// Vulkan result.
-        result: String,
+        result: vk::Result,
     },
     /// No device satisfied Stage 0 capability policy.
     Capability(VulkanCapabilityError),
@@ -2412,11 +2414,11 @@ impl std::fmt::Display for VulkanRuntimeCapabilityError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::EnumerateDevicesFailed { result } => {
-                write!(f, "Vulkan physical device enumeration failed: {result}")
+                write!(f, "Vulkan physical device enumeration failed: {result:?}")
             }
             Self::EnumerateDeviceExtensionsFailed { device, result } => write!(
                 f,
-                "Vulkan device {device} extension enumeration failed: {result}"
+                "Vulkan device {device} extension enumeration failed: {result:?}"
             ),
             Self::PresentSupportFailed {
                 device,
@@ -2424,19 +2426,19 @@ impl std::fmt::Display for VulkanRuntimeCapabilityError {
                 result,
             } => write!(
                 f,
-                "Vulkan device {device} queue family {queue_family} present support query failed: {result}"
+                "Vulkan device {device} queue family {queue_family} present support query failed: {result:?}"
             ),
             Self::SurfaceFormatsFailed { device, result } => write!(
                 f,
-                "Vulkan device {device} surface format query failed: {result}"
+                "Vulkan device {device} surface format query failed: {result:?}"
             ),
             Self::SurfaceCapabilitiesFailed { device, result } => write!(
                 f,
-                "Vulkan device {device} surface capabilities query failed: {result}"
+                "Vulkan device {device} surface capabilities query failed: {result:?}"
             ),
             Self::PresentModesFailed { device, result } => write!(
                 f,
-                "Vulkan device {device} present mode query failed: {result}"
+                "Vulkan device {device} present mode query failed: {result:?}"
             ),
             Self::Capability(error) => write!(f, "{error}"),
             Self::Swapchain(error) => write!(f, "{error}"),
@@ -2461,7 +2463,7 @@ pub enum VulkanLogicalDeviceError {
         /// Selected device name.
         device: String,
         /// Vulkan result.
-        result: String,
+        result: vk::Result,
     },
 }
 
@@ -2476,7 +2478,7 @@ impl std::fmt::Display for VulkanLogicalDeviceError {
             Self::CreateFailed { device, result } => {
                 write!(
                     f,
-                    "Vulkan logical device creation failed for {device}: {result}"
+                    "Vulkan logical device creation failed for {device}: {result:?}"
                 )
             }
         }
@@ -2488,34 +2490,40 @@ impl std::error::Error for VulkanLogicalDeviceError {}
 /// Vulkan swapchain creation error.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VulkanSwapchainProbeError {
+    /// Live runtime capability probing failed before swapchain creation.
+    Runtime(VulkanRuntimeCapabilityError),
+    /// Deterministic swapchain planning failed before create.
+    Plan(VulkanSwapchainError),
     /// Surface capability query failed.
     SurfaceCapabilitiesFailed {
         /// Vulkan result.
-        result: String,
+        result: vk::Result,
     },
     /// Swapchain creation failed.
     CreateFailed {
         /// Vulkan result.
-        result: String,
+        result: vk::Result,
     },
     /// Swapchain image query failed.
     ImagesFailed {
         /// Vulkan result.
-        result: String,
+        result: vk::Result,
     },
 }
 
 impl std::fmt::Display for VulkanSwapchainProbeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Runtime(error) => write!(f, "{error}"),
+            Self::Plan(error) => write!(f, "{error}"),
             Self::SurfaceCapabilitiesFailed { result } => {
-                write!(f, "Vulkan surface capabilities query failed: {result}")
+                write!(f, "Vulkan surface capabilities query failed: {result:?}")
             }
             Self::CreateFailed { result } => {
-                write!(f, "Vulkan swapchain creation failed: {result}")
+                write!(f, "Vulkan swapchain creation failed: {result:?}")
             }
             Self::ImagesFailed { result } => {
-                write!(f, "Vulkan swapchain image query failed: {result}")
+                write!(f, "Vulkan swapchain image query failed: {result:?}")
             }
         }
     }
@@ -2533,11 +2541,8 @@ pub fn plan_vulkan_surface(
     handles: Option<NativeWindowHandles>,
 ) -> Result<VulkanSurfacePlan, VulkanSurfaceError> {
     let handles = handles.ok_or(VulkanSurfaceError::MissingNativeHandles)?;
-    let required = ash_window::enumerate_required_extensions(handles.display).map_err(|error| {
-        VulkanSurfaceError::RequiredExtensionsFailed {
-            result: format!("{error:?}"),
-        }
-    })?;
+    let required = ash_window::enumerate_required_extensions(handles.display)
+        .map_err(|error| VulkanSurfaceError::RequiredExtensionsFailed { result: error })?;
     let mut required_instance_extensions = Vec::with_capacity(required.len());
     for extension in required {
         let name = extension_name(*extension)?;
@@ -2573,9 +2578,7 @@ pub fn create_vulkan_surface_probe(
             None,
         )
     }
-    .map_err(|error| VulkanSurfaceError::CreateFailed {
-        result: format!("{error:?}"),
-    })?;
+    .map_err(|error| VulkanSurfaceError::CreateFailed { result: error })?;
     Ok(VulkanSurfaceProbe {
         loader: surface::Instance::new(&instance.entry, &instance.instance),
         surface,
@@ -2642,7 +2645,7 @@ pub fn create_vulkan_logical_device_probe(
     }
     .map_err(|error| VulkanLogicalDeviceError::CreateFailed {
         device: capability.device_name.clone(),
-        result: format!("{error:?}"),
+        result: error,
     })?;
     // SAFETY: Queue family indices came from validated live queue families requested above.
     let _graphics_queue = unsafe { device.get_device_queue(capability.graphics_queue_family, 0) };
@@ -2703,30 +2706,16 @@ pub fn create_vulkan_swapchain_probe_for_extent(
                 .get_physical_device_surface_capabilities(device.physical_device, surface.surface)
         }
     }
-    .map_err(
-        |error| VulkanSwapchainProbeError::SurfaceCapabilitiesFailed {
-            result: format!("{error:?}"),
-        },
-    )?;
+    .map_err(|error| VulkanSwapchainProbeError::SurfaceCapabilitiesFailed { result: error })?;
     let surface_formats =
-        live_surface_formats(surface, device.physical_device, &device.report.device_name).map_err(
-            |error| VulkanSwapchainProbeError::CreateFailed {
-                result: error.to_string(),
-            },
-        )?;
+        live_surface_formats(surface, device.physical_device, &device.report.device_name)
+            .map_err(VulkanSwapchainProbeError::Runtime)?;
     let present_modes =
-        live_present_modes(surface, device.physical_device, &device.report.device_name).map_err(
-            |error| VulkanSwapchainProbeError::CreateFailed {
-                result: error.to_string(),
-            },
-        )?;
+        live_present_modes(surface, device.physical_device, &device.report.device_name)
+            .map_err(VulkanSwapchainProbeError::Runtime)?;
     let capabilities =
         live_surface_capabilities(surface, device.physical_device, &device.report.device_name)
-            .map_err(
-                |error| VulkanSwapchainProbeError::SurfaceCapabilitiesFailed {
-                    result: error.to_string(),
-                },
-            )?;
+            .map_err(VulkanSwapchainProbeError::Runtime)?;
     let plan = plan_vulkan_swapchain(&VulkanSwapchainRequest {
         drawable_extent,
         formats: surface_formats,
@@ -2734,9 +2723,7 @@ pub fn create_vulkan_swapchain_probe_for_extent(
         capabilities,
         preferred_present_mode: vk::PresentModeKHR::MAILBOX.as_raw(),
     })
-    .map_err(|error| VulkanSwapchainProbeError::CreateFailed {
-        result: error.to_string(),
-    })?;
+    .map_err(VulkanSwapchainProbeError::Plan)?;
     let queue_family_indices = unique_queue_families(
         device.runtime.capability.graphics_queue_family,
         device.runtime.capability.present_queue_family,
@@ -2768,20 +2755,15 @@ pub fn create_vulkan_swapchain_probe_for_extent(
         .clipped(true);
     let loader = swapchain::Device::new(&instance.instance, &device.device);
     // SAFETY: The create info references live instance/device/surface handles for this call.
-    let swapchain = unsafe { loader.create_swapchain(&create_info, None) }.map_err(|error| {
-        VulkanSwapchainProbeError::CreateFailed {
-            result: format!("{error:?}"),
-        }
-    })?;
+    let swapchain = unsafe { loader.create_swapchain(&create_info, None) }
+        .map_err(|error| VulkanSwapchainProbeError::CreateFailed { result: error })?;
     // SAFETY: The swapchain was created above and the returned image handles are owned by it.
     let images = match unsafe { loader.get_swapchain_images(swapchain) } {
         Ok(images) => images,
         Err(error) => {
             // SAFETY: The swapchain was created above on this loader/device pair and is destroyed on setup failure.
             unsafe { loader.destroy_swapchain(swapchain, None) };
-            return Err(VulkanSwapchainProbeError::ImagesFailed {
-                result: format!("{error:?}"),
-            });
+            return Err(VulkanSwapchainProbeError::ImagesFailed { result: error });
         }
     };
     Ok(VulkanSwapchainProbe {
@@ -2803,9 +2785,7 @@ fn select_live_device_candidate(
     let devices = {
         // SAFETY: The Vulkan instance is live for this query and no handles are retained.
         unsafe { instance.instance.enumerate_physical_devices() }.map_err(|error| {
-            VulkanRuntimeCapabilityError::EnumerateDevicesFailed {
-                result: format!("{error:?}"),
-            }
+            VulkanRuntimeCapabilityError::EnumerateDevicesFailed { result: error }
         })?
     };
     let mut best: Option<LiveDeviceCandidate> = None;
@@ -2901,7 +2881,7 @@ fn live_device_candidate(
             .map_err(|error| VulkanRuntimeCapabilityError::PresentSupportFailed {
                 device: name.clone(),
                 queue_family: index,
-                result: format!("{error:?}"),
+                result: error,
             })?;
             Ok(VulkanQueueFamily {
                 index,
@@ -2977,7 +2957,7 @@ fn live_device_extensions(
     .map_err(
         |error| VulkanRuntimeCapabilityError::EnumerateDeviceExtensionsFailed {
             device: name.to_string(),
-            result: format!("{error:?}"),
+            result: error,
         },
     )?;
     let mut extensions = properties
@@ -3009,7 +2989,7 @@ fn live_surface_formats(
     }
     .map_err(|error| VulkanRuntimeCapabilityError::SurfaceFormatsFailed {
         device: name.to_string(),
-        result: format!("{error:?}"),
+        result: error,
     })?;
     Ok(formats
         .into_iter()
@@ -3035,7 +3015,7 @@ fn live_present_modes(
     }
     .map_err(|error| VulkanRuntimeCapabilityError::PresentModesFailed {
         device: name.to_string(),
-        result: format!("{error:?}"),
+        result: error,
     })?;
     Ok(modes.into_iter().map(vk::PresentModeKHR::as_raw).collect())
 }
@@ -3056,7 +3036,7 @@ fn live_surface_capabilities(
     .map_err(
         |error| VulkanRuntimeCapabilityError::SurfaceCapabilitiesFailed {
             device: name.to_string(),
-            result: format!("{error:?}"),
+            result: error,
         },
     )?;
     Ok(VulkanSwapchainSurfaceCapabilities {
@@ -3123,7 +3103,7 @@ pub enum VulkanInstanceError {
     /// Instance creation failed.
     CreateFailed {
         /// Vulkan result.
-        result: String,
+        result: vk::Result,
     },
 }
 
@@ -3146,7 +3126,9 @@ impl std::fmt::Display for VulkanInstanceError {
                     "Vulkan validation layer VK_LAYER_KHRONOS_validation is unavailable"
                 )
             }
-            Self::CreateFailed { result } => write!(f, "Vulkan instance creation failed: {result}"),
+            Self::CreateFailed { result } => {
+                write!(f, "Vulkan instance creation failed: {result:?}")
+            }
         }
     }
 }
@@ -3220,11 +3202,8 @@ pub fn create_vulkan_instance_probe(
         .enabled_layer_names(&layer_ptrs)
         .flags(vk::InstanceCreateFlags::from_raw(plan.create_flags));
     // SAFETY: `create_info` points to stack-owned Vulkan create data that lives for the call.
-    let instance = unsafe { entry.create_instance(&create_info, None) }.map_err(|error| {
-        VulkanInstanceError::CreateFailed {
-            result: format!("{error:?}"),
-        }
-    })?;
+    let instance = unsafe { entry.create_instance(&create_info, None) }
+        .map_err(|error| VulkanInstanceError::CreateFailed { result: error })?;
     Ok(VulkanInstanceProbe {
         entry,
         instance,
@@ -3243,7 +3222,7 @@ fn validation_layer_cstrings(
         // SAFETY: Enumerating instance layers reads loader-owned immutable metadata.
         unsafe { entry.enumerate_instance_layer_properties() }.map_err(|error| {
             VulkanInstanceError::CreateFailed {
-                result: format!("{error:?}"),
+                result: error,
             }
         })?;
     let validation_available = available_layers.iter().any(|layer| {
