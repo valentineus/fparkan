@@ -118,6 +118,7 @@ jobs:
         run: >
           cargo run -p fparkan-vulkan-smoke --locked --
           --out "target/fparkan/native-smoke/${{ matrix.smoke_platform }}.json"
+          --timeout-seconds 120
       - name: Upload acceptance audit
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

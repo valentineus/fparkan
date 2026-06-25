@@ -18,6 +18,7 @@ use fparkan_render_vulkan::{
 use serde::Serialize;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
@@ -29,6 +30,7 @@ const DEFAULT_TARGET_FRAMES: u32 = 300;
 const DEFAULT_RESIZE_FRAME: u32 = 120;
 const DEFAULT_RESIZE_WIDTH: u32 = 960;
 const DEFAULT_RESIZE_HEIGHT: u32 = 540;
+const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 
 fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -49,9 +51,9 @@ fn run(args: &[String]) -> Result<String, String> {
     let options = SmokeOptions::parse(args)?;
     let event_loop = EventLoop::new().map_err(|err| format!("winit event loop: {err}"))?;
     let mut app = SmokeApp::new(options);
-    event_loop
-        .run_app(&mut app)
-        .map_err(|err| format!("winit event loop: {err}"))?;
+    if let Err(err) = event_loop.run_app(&mut app) {
+        app.error = Some(format!("winit event loop: {err}"));
+    }
     app.finish()
 }
 
@@ -60,6 +62,7 @@ struct SmokeOptions {
     out: PathBuf,
     frames: u32,
     resize_frame: u32,
+    timeout_seconds: u64,
 }
 
 impl SmokeOptions {
@@ -67,6 +70,7 @@ impl SmokeOptions {
         let mut out = None;
         let mut frames = DEFAULT_TARGET_FRAMES;
         let mut resize_frame = DEFAULT_RESIZE_FRAME;
+        let mut timeout_seconds = DEFAULT_TIMEOUT_SECONDS;
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -91,6 +95,13 @@ impl SmokeOptions {
                         .parse()
                         .map_err(|_| "--resize-frame must be an integer".to_string())?;
                 }
+                "--timeout-seconds" => {
+                    timeout_seconds = iter
+                        .next()
+                        .ok_or_else(|| "--timeout-seconds requires a value".to_string())?
+                        .parse()
+                        .map_err(|_| "--timeout-seconds must be an integer".to_string())?;
+                }
                 _ => return Err(format!("unknown native smoke option: {arg}")),
             }
         }
@@ -100,10 +111,14 @@ impl SmokeOptions {
                 "native smoke requires --frames >= {DEFAULT_TARGET_FRAMES}"
             ));
         }
+        if timeout_seconds == 0 {
+            return Err("native smoke requires --timeout-seconds >= 1".to_string());
+        }
         Ok(Self {
             out,
             frames,
             resize_frame,
+            timeout_seconds,
         })
     }
 }
@@ -119,10 +134,11 @@ struct SmokeApp {
     resize_count: u32,
     resize_requested: bool,
     last_size: Option<(u32, u32)>,
+    started_at: Instant,
 }
 
 impl SmokeApp {
-    const fn new(options: SmokeOptions) -> Self {
+    fn new(options: SmokeOptions) -> Self {
         Self {
             options,
             window_id: None,
@@ -134,21 +150,144 @@ impl SmokeApp {
             resize_count: 0,
             resize_requested: false,
             last_size: None,
+            started_at: Instant::now(),
         }
     }
 
-    fn finish(self) -> Result<String, String> {
-        if let Some(error) = self.error {
-            return Err(error);
+    fn finish(mut self) -> Result<String, String> {
+        if let Some(output) = self.output.take() {
+            return Ok(output);
         }
-        self.output
-            .ok_or_else(|| "native smoke exited before producing a report".to_string())
+        let error = self
+            .error
+            .clone()
+            .unwrap_or_else(|| "native smoke exited before producing a report".to_string());
+        self.write_failure_report(&error)?;
+        Err(error)
     }
 
     fn schedule_next_redraw(&self) {
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
         }
+    }
+
+    fn write_report(&self, report: &str) -> Result<(), String> {
+        if let Some(parent) = self.options.out.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("{}: {err}", parent.display()))?;
+        }
+        std::fs::write(&self.options.out, report)
+            .map_err(|err| format!("{}: {err}", self.options.out.display()))
+    }
+
+    fn render_report(
+        &self,
+        status: &'static str,
+        failure_reason: Option<&str>,
+    ) -> Result<String, String> {
+        let renderer = self.renderer.as_ref();
+        let validation = renderer.map_or(
+            fparkan_render_vulkan::VulkanValidationReport {
+                warning_count: 0,
+                error_count: 0,
+                vuids: Vec::new(),
+            },
+            VulkanSmokeRenderer::validation_report,
+        );
+        let smoke_report = SmokeReport {
+            schema_version: SCHEMA_VERSION,
+            commit_sha: current_git_commit_sha(),
+            git_dirty: current_git_dirty(),
+            runner_identity: measured_runner_identity(),
+            rust_toolchain: current_rustc_release(),
+            target_triple: current_rustc_host_triple(),
+            platform: actual_platform(),
+            status,
+            failure_reason,
+            frames: self.frames_presented,
+            resize_count: self.resize_count,
+            swapchain_recreate_count: renderer
+                .map_or(0, VulkanSmokeRenderer::swapchain_recreate_count),
+            validation_warning_count: validation.warning_count,
+            validation_error_count: validation.error_count,
+            validation_vuids: &validation.vuids,
+            requested_frames: self.options.frames,
+            timeout_seconds: self.options.timeout_seconds,
+            shader_manifest_hash: renderer
+                .map_or("", |value| value.report().shader_manifest_hash.as_str()),
+            vulkan_loader_status: if renderer.is_some() {
+                "available"
+            } else {
+                "failed"
+            },
+            vulkan_instance_status: if renderer.is_some() {
+                "created"
+            } else {
+                "failed"
+            },
+            window_status: if self.window.is_some() {
+                "created"
+            } else {
+                "failed"
+            },
+            vulkan_surface_status: if renderer.is_some() {
+                "created"
+            } else {
+                "failed"
+            },
+            vulkan_device_status: if renderer.is_some() {
+                "selected"
+            } else {
+                "failed"
+            },
+            vulkan_device_name: renderer.map_or("", |value| value.report().device_name.as_str()),
+            vulkan_logical_device_status: if renderer.is_some() {
+                "created"
+            } else {
+                "failed"
+            },
+            vulkan_logical_device_graphics_queue_family: renderer
+                .map_or(0, |value| value.report().graphics_queue_family),
+            vulkan_logical_device_present_queue_family: renderer
+                .map_or(0, |value| value.report().present_queue_family),
+            vulkan_logical_device_enabled_extension_count: renderer
+                .map_or(0, |value| value.report().enabled_extension_count),
+            vulkan_swapchain_status: if renderer.is_some() {
+                "created"
+            } else {
+                "failed"
+            },
+            vulkan_swapchain_width: renderer.map_or(0, |value| value.report().swapchain_extent.0),
+            vulkan_swapchain_height: renderer.map_or(0, |value| value.report().swapchain_extent.1),
+            vulkan_swapchain_image_count: renderer
+                .map_or(0, |value| value.report().swapchain_image_count),
+            vulkan_portability_enumeration: renderer
+                .is_some_and(|value| value.report().portability_enumeration),
+        };
+        serde_json::to_string_pretty(&smoke_report)
+            .map(|json| format!("{json}\n"))
+            .map_err(|err| format!("native smoke report serialization failed: {err}"))
+    }
+
+    fn write_failure_report(&self, failure_reason: &str) -> Result<(), String> {
+        let report = self.render_report("failed", Some(failure_reason))?;
+        self.write_report(&report)
+    }
+
+    fn abort_if_timed_out(&mut self, event_loop: &ActiveEventLoop) -> bool {
+        if self.output.is_some() || self.error.is_some() {
+            return false;
+        }
+        if self.started_at.elapsed() <= Duration::from_secs(self.options.timeout_seconds) {
+            return false;
+        }
+        self.error = Some(format!(
+            "native smoke timed out after {} seconds",
+            self.options.timeout_seconds
+        ));
+        event_loop.exit();
+        true
     }
 
     fn complete(&mut self, event_loop: &ActiveEventLoop) {
@@ -179,15 +318,8 @@ impl SmokeApp {
             event_loop.exit();
             return;
         }
-        let report = match render_smoke_report_json(
-            &self.options,
-            renderer,
-            self.frames_presented,
-            self.resize_count,
-            validation.warning_count,
-            validation.error_count,
-            &validation.vuids,
-        ) {
+        let _ = renderer;
+        let report = match self.render_report("passed", None) {
             Ok(report) => report,
             Err(err) => {
                 self.error = Some(err);
@@ -195,15 +327,8 @@ impl SmokeApp {
                 return;
             }
         };
-        if let Some(parent) = self.options.out.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                self.error = Some(format!("{}: {err}", parent.display()));
-                event_loop.exit();
-                return;
-            }
-        }
-        if let Err(err) = std::fs::write(&self.options.out, &report) {
-            self.error = Some(format!("{}: {err}", self.options.out.display()));
+        if let Err(err) = self.write_report(&report) {
+            self.error = Some(err);
             event_loop.exit();
             return;
         }
@@ -226,6 +351,9 @@ impl SmokeApp {
 
 impl ApplicationHandler for SmokeApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.abort_if_timed_out(event_loop) {
+            return;
+        }
         if self.window.is_some() {
             return;
         }
@@ -280,6 +408,9 @@ impl ApplicationHandler for SmokeApp {
         window_id: WindowId,
         event: WindowEvent,
     ) {
+        if self.abort_if_timed_out(event_loop) {
+            return;
+        }
         if Some(window_id) != self.window_id {
             return;
         }
@@ -341,7 +472,10 @@ impl ApplicationHandler for SmokeApp {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.abort_if_timed_out(event_loop) {
+            return;
+        }
         if self.output.is_none() && self.error.is_none() {
             self.schedule_next_redraw();
         }
@@ -357,7 +491,9 @@ struct SmokeReport<'a> {
     rust_toolchain: String,
     target_triple: String,
     platform: &'static str,
-    status: &'static str,
+    status: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_reason: Option<&'a str>,
     frames: u32,
     resize_count: u32,
     swapchain_recreate_count: u32,
@@ -365,70 +501,23 @@ struct SmokeReport<'a> {
     validation_error_count: u32,
     validation_vuids: &'a [String],
     requested_frames: u32,
+    timeout_seconds: u64,
     shader_manifest_hash: &'a str,
-    vulkan_loader_status: &'static str,
-    vulkan_instance_status: &'static str,
-    window_status: &'static str,
-    vulkan_surface_status: &'static str,
-    vulkan_device_status: &'static str,
+    vulkan_loader_status: &'a str,
+    vulkan_instance_status: &'a str,
+    window_status: &'a str,
+    vulkan_surface_status: &'a str,
+    vulkan_device_status: &'a str,
     vulkan_device_name: &'a str,
-    vulkan_logical_device_status: &'static str,
+    vulkan_logical_device_status: &'a str,
     vulkan_logical_device_graphics_queue_family: u32,
     vulkan_logical_device_present_queue_family: u32,
     vulkan_logical_device_enabled_extension_count: u32,
-    vulkan_swapchain_status: &'static str,
+    vulkan_swapchain_status: &'a str,
     vulkan_swapchain_width: u32,
     vulkan_swapchain_height: u32,
     vulkan_swapchain_image_count: u32,
     vulkan_portability_enumeration: bool,
-}
-
-fn render_smoke_report_json(
-    options: &SmokeOptions,
-    renderer: &VulkanSmokeRenderer,
-    frames_presented: u32,
-    resize_count: u32,
-    validation_warning_count: u32,
-    validation_error_count: u32,
-    validation_vuids: &[String],
-) -> Result<String, String> {
-    let report = renderer.report();
-    let smoke_report = SmokeReport {
-        schema_version: SCHEMA_VERSION,
-        commit_sha: current_git_commit_sha(),
-        git_dirty: current_git_dirty(),
-        runner_identity: measured_runner_identity(),
-        rust_toolchain: current_rustc_release(),
-        target_triple: current_rustc_host_triple(),
-        platform: actual_platform(),
-        status: "passed",
-        frames: frames_presented,
-        resize_count,
-        swapchain_recreate_count: renderer.swapchain_recreate_count(),
-        validation_warning_count,
-        validation_error_count,
-        validation_vuids,
-        requested_frames: options.frames,
-        shader_manifest_hash: &report.shader_manifest_hash,
-        vulkan_loader_status: "available",
-        vulkan_instance_status: "created",
-        window_status: "created",
-        vulkan_surface_status: "created",
-        vulkan_device_status: "selected",
-        vulkan_device_name: &report.device_name,
-        vulkan_logical_device_status: "created",
-        vulkan_logical_device_graphics_queue_family: report.graphics_queue_family,
-        vulkan_logical_device_present_queue_family: report.present_queue_family,
-        vulkan_logical_device_enabled_extension_count: report.enabled_extension_count,
-        vulkan_swapchain_status: "created",
-        vulkan_swapchain_width: report.swapchain_extent.0,
-        vulkan_swapchain_height: report.swapchain_extent.1,
-        vulkan_swapchain_image_count: report.swapchain_image_count,
-        vulkan_portability_enumeration: report.portability_enumeration,
-    };
-    serde_json::to_string_pretty(&smoke_report)
-        .map(|json| format!("{json}\n"))
-        .map_err(|err| format!("native smoke report serialization failed: {err}"))
 }
 
 fn actual_platform() -> &'static str {
@@ -521,6 +610,7 @@ mod tests {
                 out: PathBuf::from("target/report.json"),
                 frames: DEFAULT_TARGET_FRAMES,
                 resize_frame: DEFAULT_RESIZE_FRAME,
+                timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
             })
         );
     }
@@ -537,6 +627,41 @@ mod tests {
         assert_eq!(
             parsed,
             Err("native smoke requires --frames >= 300".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_timeout_seconds() {
+        let parsed = SmokeOptions::parse(&[
+            "--out".to_string(),
+            "target/report.json".to_string(),
+            "--timeout-seconds".to_string(),
+            "45".to_string(),
+        ]);
+
+        assert_eq!(
+            parsed,
+            Ok(SmokeOptions {
+                out: PathBuf::from("target/report.json"),
+                frames: DEFAULT_TARGET_FRAMES,
+                resize_frame: DEFAULT_RESIZE_FRAME,
+                timeout_seconds: 45,
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_zero_timeout_seconds() {
+        let parsed = SmokeOptions::parse(&[
+            "--out".to_string(),
+            "target/report.json".to_string(),
+            "--timeout-seconds".to_string(),
+            "0".to_string(),
+        ]);
+
+        assert_eq!(
+            parsed,
+            Err("native smoke requires --timeout-seconds >= 1".to_string())
         );
     }
 
@@ -571,6 +696,7 @@ mod tests {
             target_triple: "aarch64-apple-darwin".to_string(),
             platform: "macos",
             status: "passed",
+            failure_reason: None,
             frames: 300,
             resize_count: 1,
             swapchain_recreate_count: 1,
@@ -578,6 +704,7 @@ mod tests {
             validation_error_count: 0,
             validation_vuids: &["VUID-A".to_string(), "VUID-B".to_string()],
             requested_frames: 300,
+            timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
             shader_manifest_hash: "deadbeef",
             vulkan_loader_status: "available",
             vulkan_instance_status: "created",
@@ -600,5 +727,52 @@ mod tests {
         assert!(json.contains("\"schema_version\": \"fparkan-native-smoke-v1\""));
         assert!(json.contains("\"validation_vuids\": ["));
         assert!(json.contains("\"vulkan_device_name\": \"Apple GPU\""));
+    }
+
+    #[test]
+    fn finish_writes_failure_artifact() {
+        let root = std::env::temp_dir().join(format!(
+            "fparkan-native-smoke-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("temp dir");
+        let out = root.join("report.json");
+
+        let result = SmokeApp {
+            options: SmokeOptions {
+                out: out.clone(),
+                frames: DEFAULT_TARGET_FRAMES,
+                resize_frame: DEFAULT_RESIZE_FRAME,
+                timeout_seconds: 7,
+            },
+            window_id: None,
+            window: None,
+            renderer: None,
+            error: Some("native smoke timed out after 7 seconds".to_string()),
+            output: None,
+            frames_presented: 42,
+            resize_count: 0,
+            resize_requested: false,
+            last_size: None,
+            started_at: Instant::now(),
+        }
+        .finish();
+
+        assert_eq!(
+            result,
+            Err("native smoke timed out after 7 seconds".to_string())
+        );
+
+        let json = std::fs::read_to_string(&out).expect("failure report");
+        assert!(json.contains("\"status\": \"failed\""));
+        assert!(json.contains("\"failure_reason\": \"native smoke timed out after 7 seconds\""));
+        assert!(json.contains("\"timeout_seconds\": 7"));
+
+        std::fs::remove_file(out).expect("cleanup report");
+        std::fs::remove_dir(root).expect("cleanup dir");
     }
 }

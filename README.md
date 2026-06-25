@@ -76,7 +76,8 @@ FPARKAN_CORPORA_MANIFEST=/private/tmp/fparkan-corpora.toml \
 
 ```bash
 cargo run -p fparkan-vulkan-smoke --locked -- \
-  --out target/fparkan/native-smoke/local.json
+  --out target/fparkan/native-smoke/local.json \
+  --timeout-seconds 120
 ```
 
 Перед запуском убедитесь, что на машине доступен Vulkan loader и рабочий ICD:
