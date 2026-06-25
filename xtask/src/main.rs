@@ -23,10 +23,9 @@
 
 use cargo_metadata::MetadataCommand;
 use fparkan_corpus::{discover, render_report_json, report, DiscoverOptions};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -1858,8 +1857,8 @@ fn run_acceptance_audit(options: &AuditOptions) -> Result<(), String> {
     if let Some(parent) = options.out.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
     }
-    fs::write(&options.out, render_audit_json(&audit))
-        .map_err(|err| format!("{}: {err}", options.out.display()))?;
+    let rendered = render_audit_json(&audit)?;
+    fs::write(&options.out, rendered).map_err(|err| format!("{}: {err}", options.out.display()))?;
     println!("{}", options.out.display());
     let strict_failures = audit.strict_failures();
     if options.strict && (!strict_failures.is_empty() || !audit.unknown_coverage.is_empty()) {
@@ -2068,57 +2067,61 @@ fn build_acceptance_audit(
     }
 }
 
-fn render_audit_json(audit: &AcceptanceAudit) -> String {
+#[derive(Serialize)]
+struct AcceptanceAuditJson<'a> {
+    schema_version: &'static str,
+    commit_sha: &'a str,
+    git_dirty: bool,
+    runner_identity: &'a str,
+    rust_toolchain: &'a str,
+    msrv: &'a str,
+    required_total: usize,
+    covered_total: usize,
+    partial_total: usize,
+    blocked_total: usize,
+    omitted_total: usize,
+    missing_total: usize,
+    unverified_total: usize,
+    unknown_coverage_total: usize,
+    by_stage: &'a BTreeMap<String, usize>,
+    covered: &'a [String],
+    partial: &'a [String],
+    blocked: &'a [String],
+    omitted: &'a [String],
+    missing: &'a [String],
+    unknown_coverage: &'a [String],
+    coverage_evidence: &'a BTreeMap<String, String>,
+}
+
+fn render_audit_json(audit: &AcceptanceAudit) -> Result<String, String> {
     let unverified = audit.unverified();
-    format!(
-        concat!(
-            "{{\n",
-            "  \"schema_version\": \"fparkan-acceptance-coverage-v1\",\n",
-            "  \"commit_sha\": \"{}\",\n",
-            "  \"git_dirty\": {},\n",
-            "  \"runner_identity\": \"{}\",\n",
-            "  \"rust_toolchain\": \"{}\",\n",
-            "  \"msrv\": \"{}\",\n",
-            "  \"required_total\": {},\n",
-            "  \"covered_total\": {},\n",
-            "  \"partial_total\": {},\n",
-            "  \"blocked_total\": {},\n",
-            "  \"omitted_total\": {},\n",
-            "  \"missing_total\": {},\n",
-            "  \"unverified_total\": {},\n",
-            "  \"unknown_coverage_total\": {},\n",
-            "  \"by_stage\": {},\n",
-            "  \"covered\": {},\n",
-            "  \"partial\": {},\n",
-            "  \"blocked\": {},\n",
-            "  \"omitted\": {},\n",
-            "  \"missing\": {},\n",
-            "  \"unknown_coverage\": {},\n",
-            "  \"coverage_evidence\": {}\n",
-            "}}\n"
-        ),
-        json_escape(&audit.commit_sha),
-        if audit.git_dirty { "true" } else { "false" },
-        json_escape(&audit.runner_identity),
-        json_escape(&audit.rust_toolchain),
-        json_escape(&audit.msrv),
-        audit.required_total,
-        audit.covered.len(),
-        audit.partial.len(),
-        audit.blocked.len(),
-        audit.omitted.len(),
-        audit.missing.len(),
-        unverified.len(),
-        audit.unknown_coverage.len(),
-        render_string_usize_map(&audit.by_stage),
-        render_string_array(&audit.covered),
-        render_string_array(&audit.partial),
-        render_string_array(&audit.blocked),
-        render_string_array(&audit.omitted),
-        render_string_array(&audit.missing),
-        render_string_array(&audit.unknown_coverage),
-        render_string_string_map(&audit.coverage_evidence)
-    )
+    let report = AcceptanceAuditJson {
+        schema_version: "fparkan-acceptance-coverage-v1",
+        commit_sha: &audit.commit_sha,
+        git_dirty: audit.git_dirty,
+        runner_identity: &audit.runner_identity,
+        rust_toolchain: &audit.rust_toolchain,
+        msrv: &audit.msrv,
+        required_total: audit.required_total,
+        covered_total: audit.covered.len(),
+        partial_total: audit.partial.len(),
+        blocked_total: audit.blocked.len(),
+        omitted_total: audit.omitted.len(),
+        missing_total: audit.missing.len(),
+        unverified_total: unverified.len(),
+        unknown_coverage_total: audit.unknown_coverage.len(),
+        by_stage: &audit.by_stage,
+        covered: &audit.covered,
+        partial: &audit.partial,
+        blocked: &audit.blocked,
+        omitted: &audit.omitted,
+        missing: &audit.missing,
+        unknown_coverage: &audit.unknown_coverage,
+        coverage_evidence: &audit.coverage_evidence,
+    };
+    serde_json::to_string_pretty(&report)
+        .map(|json| format!("{json}\n"))
+        .map_err(|err| format!("acceptance audit serialization failed: {err}"))
 }
 
 fn current_git_commit_sha() -> String {
@@ -2175,51 +2178,6 @@ fn measured_runner_identity() -> String {
     }
 }
 
-fn render_string_usize_map(values: &BTreeMap<String, usize>) -> String {
-    let pairs = values
-        .iter()
-        .map(|(key, value)| format!("\"{}\": {}", json_escape(key), value))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("{{{pairs}}}")
-}
-
-fn render_string_string_map(values: &BTreeMap<String, String>) -> String {
-    let pairs = values
-        .iter()
-        .map(|(key, value)| format!("\"{}\": \"{}\"", json_escape(key), json_escape(value)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("{{{pairs}}}")
-}
-
-fn render_string_array(values: &[String]) -> String {
-    let items = values
-        .iter()
-        .map(|value| format!("\"{}\"", json_escape(value)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("[{items}]")
-}
-
-fn json_escape(value: &str) -> String {
-    let mut out = String::new();
-    for ch in value.chars() {
-        match ch {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            ch if ch.is_control() => {
-                let _ = write!(out, "\\u{:04x}", ch as u32);
-            }
-            ch => out.push(ch),
-        }
-    }
-    out
-}
-
 fn run_acceptance_report(options: &AcceptanceOptions) -> Result<(), String> {
     let roots = if options.suite == TestSuite::Licensed {
         Some(load_licensed_roots(options.manifest.as_deref())?)
@@ -2231,42 +2189,48 @@ fn run_acceptance_report(options: &AcceptanceOptions) -> Result<(), String> {
     if let Some(parent) = options.out.parent() {
         fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
     }
-    let report = render_acceptance_report(options);
+    let report = render_acceptance_report(options)?;
     fs::write(&options.out, report).map_err(|err| format!("{}: {err}", options.out.display()))?;
     println!("{}", options.out.display());
     Ok(())
 }
 
-fn render_acceptance_report(options: &AcceptanceOptions) -> String {
-    let packages = stage_report_packages(options.stage)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|package| format!("    \"{package}\""))
-        .collect::<Vec<_>>()
-        .join(",\n");
-    let corpus = if options.suite == TestSuite::Licensed {
-        "\n  \"licensed_corpus\": {\n    \"root\": \"redacted\",\n    \"parts\": [\"IS\", \"IS2\"]\n  },"
-    } else {
-        ""
+#[derive(Serialize)]
+struct AcceptanceLicensedCorpusReport<'a> {
+    root: &'a str,
+    parts: [&'a str; 2],
+}
+
+#[derive(Serialize)]
+struct AcceptanceReportJson {
+    schema_version: &'static str,
+    suite: String,
+    stage: String,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    licensed_corpus: Option<AcceptanceLicensedCorpusReport<'static>>,
+    packages: Vec<String>,
+}
+
+fn render_acceptance_report(options: &AcceptanceOptions) -> Result<String, String> {
+    let report = AcceptanceReportJson {
+        schema_version: "fparkan-acceptance-report-v1",
+        suite: options.suite.as_str().to_string(),
+        stage: options.stage.to_string(),
+        status: "passed",
+        licensed_corpus: if options.suite == TestSuite::Licensed {
+            Some(AcceptanceLicensedCorpusReport {
+                root: "redacted",
+                parts: ["IS", "IS2"],
+            })
+        } else {
+            None
+        },
+        packages: stage_report_packages(options.stage).unwrap_or_default(),
     };
-    format!(
-        concat!(
-            "{{\n",
-            "  \"schema_version\": \"fparkan-acceptance-report-v1\",\n",
-            "  \"suite\": \"{}\",\n",
-            "  \"stage\": \"{}\",\n",
-            "  \"status\": \"passed\",",
-            "{}\n",
-            "  \"packages\": [\n",
-            "{}\n",
-            "  ]\n",
-            "}}\n"
-        ),
-        options.suite.as_str(),
-        options.stage,
-        corpus,
-        packages
-    )
+    serde_json::to_string_pretty(&report)
+        .map(|json| format!("{json}\n"))
+        .map_err(|err| format!("acceptance report serialization failed: {err}"))
 }
 
 fn stage_report_packages(stage: Stage) -> Result<Vec<String>, String> {
@@ -2488,7 +2452,8 @@ mod tests {
             manifest: Some(PathBuf::from("/private/corpora.toml")),
             out: PathBuf::from("target/report.json"),
         };
-        let report = render_acceptance_report(&options);
+        let report =
+            render_acceptance_report(&options).expect("acceptance report should serialize");
 
         assert!(report.contains("\"root\": \"redacted\""));
         assert!(!report.contains("/private/game"));
@@ -2581,7 +2546,7 @@ mod tests {
             .coverage_evidence
             .insert("S0-ARCH-001".to_string(), "quoted \"value\"".to_string());
 
-        let json = render_audit_json(&audit);
+        let json = render_audit_json(&audit).expect("acceptance audit should serialize");
 
         assert!(json.contains("quoted \\\"value\\\""));
         assert!(json.contains("\"commit_sha\": \"0123456789abcdef0123456789abcdef01234567\""));

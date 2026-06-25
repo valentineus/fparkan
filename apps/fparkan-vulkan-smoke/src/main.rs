@@ -15,6 +15,7 @@ use fparkan_platform_winit::{window_native_handles, WinitWindowPlan};
 use fparkan_render_vulkan::{
     VulkanSmokeFrameOutcome, VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo,
 };
+use serde::Serialize;
 use std::path::PathBuf;
 use std::process::Command;
 use winit::application::ApplicationHandler;
@@ -178,7 +179,7 @@ impl SmokeApp {
             event_loop.exit();
             return;
         }
-        let report = render_smoke_report_json(
+        let report = match render_smoke_report_json(
             &self.options,
             renderer,
             self.frames_presented,
@@ -186,7 +187,14 @@ impl SmokeApp {
             validation.warning_count,
             validation.error_count,
             &validation.vuids,
-        );
+        ) {
+            Ok(report) => report,
+            Err(err) => {
+                self.error = Some(err);
+                event_loop.exit();
+                return;
+            }
+        };
         if let Some(parent) = self.options.out.parent() {
             if let Err(err) = std::fs::create_dir_all(parent) {
                 self.error = Some(format!("{}: {err}", parent.display()));
@@ -340,6 +348,41 @@ impl ApplicationHandler for SmokeApp {
     }
 }
 
+#[derive(Serialize)]
+struct SmokeReport<'a> {
+    schema_version: &'static str,
+    commit_sha: String,
+    git_dirty: bool,
+    runner_identity: String,
+    rust_toolchain: String,
+    target_triple: String,
+    platform: &'static str,
+    status: &'static str,
+    frames: u32,
+    resize_count: u32,
+    swapchain_recreate_count: u32,
+    validation_warning_count: u32,
+    validation_error_count: u32,
+    validation_vuids: &'a [String],
+    requested_frames: u32,
+    shader_manifest_hash: &'a str,
+    vulkan_loader_status: &'static str,
+    vulkan_instance_status: &'static str,
+    window_status: &'static str,
+    vulkan_surface_status: &'static str,
+    vulkan_device_status: &'static str,
+    vulkan_device_name: &'a str,
+    vulkan_logical_device_status: &'static str,
+    vulkan_logical_device_graphics_queue_family: u32,
+    vulkan_logical_device_present_queue_family: u32,
+    vulkan_logical_device_enabled_extension_count: u32,
+    vulkan_swapchain_status: &'static str,
+    vulkan_swapchain_width: u32,
+    vulkan_swapchain_height: u32,
+    vulkan_swapchain_image_count: u32,
+    vulkan_portability_enumeration: bool,
+}
+
 fn render_smoke_report_json(
     options: &SmokeOptions,
     renderer: &VulkanSmokeRenderer,
@@ -348,97 +391,44 @@ fn render_smoke_report_json(
     validation_warning_count: u32,
     validation_error_count: u32,
     validation_vuids: &[String],
-) -> String {
+) -> Result<String, String> {
     let report = renderer.report();
-    let fields = vec![
-        ("schema_version", json_string(SCHEMA_VERSION)),
-        ("commit_sha", json_string(&current_git_commit_sha())),
-        ("git_dirty", bool_json(current_git_dirty())),
-        ("runner_identity", json_string(&measured_runner_identity())),
-        ("rust_toolchain", json_string(&current_rustc_release())),
-        ("target_triple", json_string(&current_rustc_host_triple())),
-        ("platform", json_string(actual_platform())),
-        ("status", json_string("passed")),
-        ("frames", frames_presented.to_string()),
-        ("resize_count", resize_count.to_string()),
-        (
-            "swapchain_recreate_count",
-            renderer.swapchain_recreate_count().to_string(),
-        ),
-        (
-            "validation_warning_count",
-            validation_warning_count.to_string(),
-        ),
-        ("validation_error_count", validation_error_count.to_string()),
-        ("validation_vuids", render_string_array(validation_vuids)),
-        ("requested_frames", options.frames.to_string()),
-        (
-            "shader_manifest_hash",
-            json_string(&report.shader_manifest_hash),
-        ),
-        ("vulkan_loader_status", json_string("available")),
-        ("vulkan_instance_status", json_string("created")),
-        ("window_status", json_string("created")),
-        ("vulkan_surface_status", json_string("created")),
-        ("vulkan_device_status", json_string("selected")),
-        ("vulkan_device_name", json_string(&report.device_name)),
-        ("vulkan_logical_device_status", json_string("created")),
-        (
-            "vulkan_logical_device_graphics_queue_family",
-            report.graphics_queue_family.to_string(),
-        ),
-        (
-            "vulkan_logical_device_present_queue_family",
-            report.present_queue_family.to_string(),
-        ),
-        (
-            "vulkan_logical_device_enabled_extension_count",
-            report.enabled_extension_count.to_string(),
-        ),
-        ("vulkan_swapchain_status", json_string("created")),
-        (
-            "vulkan_swapchain_width",
-            report.swapchain_extent.0.to_string(),
-        ),
-        (
-            "vulkan_swapchain_height",
-            report.swapchain_extent.1.to_string(),
-        ),
-        (
-            "vulkan_swapchain_image_count",
-            report.swapchain_image_count.to_string(),
-        ),
-        (
-            "vulkan_portability_enumeration",
-            bool_json(report.portability_enumeration),
-        ),
-    ];
-    render_json_object(&fields)
-}
-
-fn render_json_object(fields: &[(&str, String)]) -> String {
-    let mut out = String::from("{\n");
-    for (index, (name, value)) in fields.iter().enumerate() {
-        out.push_str("  ");
-        out.push_str(&json_string(name));
-        out.push_str(": ");
-        out.push_str(value);
-        if index + 1 < fields.len() {
-            out.push(',');
-        }
-        out.push('\n');
-    }
-    out.push_str("}\n");
-    out
-}
-
-fn render_string_array(values: &[String]) -> String {
-    let items = values
-        .iter()
-        .map(|value| json_string(value))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("[{items}]")
+    let smoke_report = SmokeReport {
+        schema_version: SCHEMA_VERSION,
+        commit_sha: current_git_commit_sha(),
+        git_dirty: current_git_dirty(),
+        runner_identity: measured_runner_identity(),
+        rust_toolchain: current_rustc_release(),
+        target_triple: current_rustc_host_triple(),
+        platform: actual_platform(),
+        status: "passed",
+        frames: frames_presented,
+        resize_count,
+        swapchain_recreate_count: renderer.swapchain_recreate_count(),
+        validation_warning_count,
+        validation_error_count,
+        validation_vuids,
+        requested_frames: options.frames,
+        shader_manifest_hash: &report.shader_manifest_hash,
+        vulkan_loader_status: "available",
+        vulkan_instance_status: "created",
+        window_status: "created",
+        vulkan_surface_status: "created",
+        vulkan_device_status: "selected",
+        vulkan_device_name: &report.device_name,
+        vulkan_logical_device_status: "created",
+        vulkan_logical_device_graphics_queue_family: report.graphics_queue_family,
+        vulkan_logical_device_present_queue_family: report.present_queue_family,
+        vulkan_logical_device_enabled_extension_count: report.enabled_extension_count,
+        vulkan_swapchain_status: "created",
+        vulkan_swapchain_width: report.swapchain_extent.0,
+        vulkan_swapchain_height: report.swapchain_extent.1,
+        vulkan_swapchain_image_count: report.swapchain_image_count,
+        vulkan_portability_enumeration: report.portability_enumeration,
+    };
+    serde_json::to_string_pretty(&smoke_report)
+        .map(|json| format!("{json}\n"))
+        .map_err(|err| format!("native smoke report serialization failed: {err}"))
 }
 
 fn actual_platform() -> &'static str {
@@ -517,31 +507,6 @@ fn current_rustc_host_triple() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn json_string(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => {
-                use std::fmt::Write as _;
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-fn bool_json(value: bool) -> String {
-    if value { "true" } else { "false" }.to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -596,10 +561,44 @@ mod tests {
     }
 
     #[test]
-    fn renders_string_array_json() {
-        assert_eq!(
-            render_string_array(&["VUID-A".to_string(), "VUID-B".to_string()]),
-            "[\"VUID-A\", \"VUID-B\"]"
-        );
+    fn smoke_report_json_contains_expected_fields() {
+        let json = serde_json::to_string_pretty(&SmokeReport {
+            schema_version: SCHEMA_VERSION,
+            commit_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            git_dirty: false,
+            runner_identity: "github-actions/12345/stage0-macos".to_string(),
+            rust_toolchain: "1.87.0".to_string(),
+            target_triple: "aarch64-apple-darwin".to_string(),
+            platform: "macos",
+            status: "passed",
+            frames: 300,
+            resize_count: 1,
+            swapchain_recreate_count: 1,
+            validation_warning_count: 0,
+            validation_error_count: 0,
+            validation_vuids: &["VUID-A".to_string(), "VUID-B".to_string()],
+            requested_frames: 300,
+            shader_manifest_hash: "deadbeef",
+            vulkan_loader_status: "available",
+            vulkan_instance_status: "created",
+            window_status: "created",
+            vulkan_surface_status: "created",
+            vulkan_device_status: "selected",
+            vulkan_device_name: "Apple GPU",
+            vulkan_logical_device_status: "created",
+            vulkan_logical_device_graphics_queue_family: 0,
+            vulkan_logical_device_present_queue_family: 0,
+            vulkan_logical_device_enabled_extension_count: 2,
+            vulkan_swapchain_status: "created",
+            vulkan_swapchain_width: 960,
+            vulkan_swapchain_height: 540,
+            vulkan_swapchain_image_count: 3,
+            vulkan_portability_enumeration: true,
+        })
+        .expect("smoke report should serialize");
+
+        assert!(json.contains("\"schema_version\": \"fparkan-native-smoke-v1\""));
+        assert!(json.contains("\"validation_vuids\": ["));
+        assert!(json.contains("\"vulkan_device_name\": \"Apple GPU\""));
     }
 }

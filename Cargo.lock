@@ -717,6 +717,8 @@ dependencies = [
  "fparkan-platform",
  "fparkan-platform-winit",
  "fparkan-render-vulkan",
+ "serde",
+ "serde_json",
  "winit",
 ]
 
