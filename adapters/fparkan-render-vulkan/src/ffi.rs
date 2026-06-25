@@ -61,7 +61,7 @@ pub use self::runtime::{
 pub use self::smoke_types::{
     VulkanSmokeBootstrapProgress, VulkanSmokeBootstrapSnapshot, VulkanSmokeFrameOutcome,
     VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo, VulkanSmokeRendererError,
-    VulkanSmokeRendererReport, VulkanValidationReport,
+    VulkanSmokeRendererReport, VulkanSmokeShutdownReport, VulkanValidationReport,
 };
 #[cfg(test)]
 use self::surface::extension_name;

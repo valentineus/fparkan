@@ -15,7 +15,8 @@ use fparkan_platform::RenderRequest;
 use fparkan_platform_winit::{window_native_handles, WinitWindowPlan};
 use fparkan_render_vulkan::{
     VulkanSmokeBootstrapProgress, VulkanSmokeFrameOutcome, VulkanSmokeRenderer,
-    VulkanSmokeRendererCreateInfo,
+    VulkanSmokeRendererCreateInfo, VulkanSmokeRendererReport, VulkanSmokeShutdownReport,
+    VulkanValidationReport,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -176,6 +177,7 @@ struct SmokeApp {
     window_id: Option<WindowId>,
     window: Option<Window>,
     renderer: Option<VulkanSmokeRenderer>,
+    final_renderer: Option<RendererSnapshot>,
     error: Option<String>,
     output: Option<String>,
     frames_presented: u32,
@@ -193,6 +195,23 @@ fn drop_renderer_before_window<Renderer, WindowLike>(
     drop(window.take());
 }
 
+#[derive(Clone, Debug)]
+struct RendererSnapshot {
+    report: VulkanSmokeRendererReport,
+    swapchain_recreate_count: u32,
+    validation: VulkanValidationReport,
+}
+
+impl From<VulkanSmokeShutdownReport> for RendererSnapshot {
+    fn from(report: VulkanSmokeShutdownReport) -> Self {
+        Self {
+            report: report.renderer_report,
+            swapchain_recreate_count: report.swapchain_recreate_count,
+            validation: report.validation,
+        }
+    }
+}
+
 impl SmokeApp {
     fn new(
         options: SmokeOptions,
@@ -206,6 +225,7 @@ impl SmokeApp {
             window_id: None,
             window: None,
             renderer: None,
+            final_renderer: None,
             error: None,
             output: None,
             frames_presented: 0,
@@ -244,20 +264,31 @@ impl SmokeApp {
             .map_err(|err| format!("{}: {err}", self.options.out.display()))
     }
 
+    fn live_renderer_snapshot(&self) -> Option<RendererSnapshot> {
+        self.renderer.as_ref().map(|renderer| RendererSnapshot {
+            report: renderer.report().clone(),
+            swapchain_recreate_count: renderer.swapchain_recreate_count(),
+            validation: renderer.validation_report(),
+        })
+    }
+
+    fn renderer_snapshot(&self) -> Option<RendererSnapshot> {
+        self.final_renderer
+            .clone()
+            .or_else(|| self.live_renderer_snapshot())
+    }
+
     fn render_report(
         &self,
         status: &'static str,
         failure_reason: Option<&str>,
     ) -> Result<String, String> {
-        let renderer = self.renderer.as_ref();
-        let validation = renderer.map_or(
-            fparkan_render_vulkan::VulkanValidationReport {
-                warning_count: 0,
-                error_count: 0,
-                vuids: Vec::new(),
-            },
-            VulkanSmokeRenderer::validation_report,
-        );
+        let renderer = self.renderer_snapshot();
+        let validation = renderer
+            .as_ref()
+            .map_or_else(VulkanValidationReport::default, |snapshot| {
+                snapshot.validation.clone()
+            });
         let smoke_report = SmokeReport {
             schema_version: SCHEMA_VERSION,
             commit_sha: compiled_commit_sha(),
@@ -272,14 +303,16 @@ impl SmokeApp {
             frames: self.frames_presented,
             resize_count: self.resize_count,
             swapchain_recreate_count: renderer
-                .map_or(0, VulkanSmokeRenderer::swapchain_recreate_count),
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.swapchain_recreate_count),
             validation_warning_count: validation.warning_count,
             validation_error_count: validation.error_count,
             validation_vuids: &validation.vuids,
             requested_frames: self.options.frames,
             timeout_seconds: self.options.timeout_seconds,
             shader_manifest_hash: renderer
-                .map_or("", |value| value.report().shader_manifest_hash.as_str()),
+                .as_ref()
+                .map_or("", |snapshot| snapshot.report.shader_manifest_hash.as_str()),
             vulkan_loader_status: if renderer.is_some() {
                 "available"
             } else {
@@ -305,31 +338,43 @@ impl SmokeApp {
             } else {
                 "failed"
             },
-            vulkan_device_name: renderer.map_or("", |value| value.report().device_name.as_str()),
+            vulkan_device_name: renderer
+                .as_ref()
+                .map_or("", |snapshot| snapshot.report.device_name.as_str()),
             vulkan_logical_device_status: if renderer.is_some() {
                 "created"
             } else {
                 "failed"
             },
             vulkan_logical_device_graphics_queue_family: renderer
-                .map_or(0, |value| value.report().graphics_queue_family),
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.report.graphics_queue_family),
             vulkan_logical_device_present_queue_family: renderer
-                .map_or(0, |value| value.report().present_queue_family),
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.report.present_queue_family),
             vulkan_logical_device_enabled_extension_count: renderer
-                .map_or(0, |value| value.report().enabled_extension_count),
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.report.enabled_extension_count),
             vulkan_swapchain_status: if renderer.is_some() {
                 "created"
             } else {
                 "failed"
             },
-            vulkan_swapchain_width: renderer.map_or(0, |value| value.report().swapchain_extent.0),
-            vulkan_swapchain_height: renderer.map_or(0, |value| value.report().swapchain_extent.1),
+            vulkan_swapchain_width: renderer
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.report.swapchain_extent.0),
+            vulkan_swapchain_height: renderer
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.report.swapchain_extent.1),
             vulkan_swapchain_image_count: renderer
-                .map_or(0, |value| value.report().swapchain_image_count),
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.report.swapchain_image_count),
             vulkan_portability_enumeration: renderer
-                .is_some_and(|value| value.report().portability_enumeration),
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.report.portability_enumeration),
             vulkan_portability_subset_enabled: renderer
-                .is_some_and(|value| value.report().portability_subset_enabled),
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.report.portability_subset_enabled),
         };
         serde_json::to_string_pretty(&smoke_report)
             .map(|json| format!("{json}\n"))
@@ -362,7 +407,6 @@ impl SmokeApp {
             event_loop.exit();
             return;
         };
-        let validation = renderer.validation_report();
         if self.frames_presented < self.options.frames {
             self.error = Some("native smoke did not reach the required frame count".to_string());
             event_loop.exit();
@@ -376,15 +420,34 @@ impl SmokeApp {
             event_loop.exit();
             return;
         }
-        if validation.warning_count != 0 || validation.error_count != 0 {
+        let renderer = match self.renderer.take() {
+            Some(renderer) => renderer,
+            None => {
+                self.error = Some("native smoke renderer was not initialized".to_string());
+                event_loop.exit();
+                return;
+            }
+        };
+        let final_renderer = match renderer.shutdown() {
+            Ok(report) => RendererSnapshot::from(report),
+            Err(err) => {
+                self.error = Some(err.to_string());
+                event_loop.exit();
+                return;
+            }
+        };
+        if final_renderer.validation.warning_count != 0
+            || final_renderer.validation.error_count != 0
+        {
+            self.final_renderer = Some(final_renderer.clone());
             self.error = Some(format!(
                 "native smoke validation must stay clean (warnings={}, errors={})",
-                validation.warning_count, validation.error_count
+                final_renderer.validation.warning_count, final_renderer.validation.error_count
             ));
             event_loop.exit();
             return;
         }
-        let _ = renderer;
+        self.final_renderer = Some(final_renderer);
         let report = match self.render_report("passed", None) {
             Ok(report) => report,
             Err(err) => {
@@ -1077,6 +1140,7 @@ mod tests {
             window_id: None,
             window: None,
             renderer: None,
+            final_renderer: None,
             error: Some("native smoke timed out after 7 seconds".to_string()),
             output: None,
             frames_presented: 42,

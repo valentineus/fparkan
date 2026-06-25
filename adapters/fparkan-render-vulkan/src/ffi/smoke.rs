@@ -10,8 +10,9 @@ use super::{
     destroy_allocated_buffer, destroy_swapchain_resources, plan_vulkan_surface,
     VulkanAllocatedBuffer, VulkanInstanceConfig, VulkanInstanceProbe, VulkanLogicalDeviceProbe,
     VulkanSmokeFrameOutcome, VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo,
-    VulkanSmokeRendererError, VulkanSmokeRendererReport, VulkanSurfaceProbe, VulkanSwapchainProbe,
-    VulkanSwapchainResources, VulkanValidationMessenger, VulkanValidationReport,
+    VulkanSmokeRendererError, VulkanSmokeRendererReport, VulkanSmokeShutdownReport,
+    VulkanSurfaceProbe, VulkanSwapchainProbe, VulkanSwapchainResources, VulkanValidationMessenger,
+    VulkanValidationReport,
 };
 use crate::policy::KHR_PORTABILITY_SUBSET_EXTENSION;
 use crate::shader_manifest::{triangle_shader_manifest, validate_shader_manifest};
@@ -28,6 +29,30 @@ fn take_runtime_owners_in_dependency_order<Instance, Validation, Surface, Device
     surface.take();
     validation.take();
     instance.take();
+}
+
+fn take_runtime_owners_with_validation_snapshot<
+    Instance,
+    Validation,
+    Surface,
+    Device,
+    Swapchain,
+    Snapshot,
+    Capture,
+>(
+    instance: &mut Option<Instance>,
+    validation: &mut Option<Validation>,
+    surface: &mut Option<Surface>,
+    device: &mut Option<Device>,
+    swapchain: &mut Option<Swapchain>,
+    capture: Capture,
+) -> Option<Snapshot>
+where
+    Capture: FnOnce(&Validation) -> Snapshot,
+{
+    let snapshot = validation.as_ref().map(capture);
+    take_runtime_owners_in_dependency_order(instance, validation, surface, device, swapchain);
+    snapshot
 }
 
 struct RollbackOnDrop<T, F>
@@ -224,6 +249,16 @@ impl VulkanSmokeRenderer {
     #[must_use]
     pub const fn swapchain_recreate_count(&self) -> u32 {
         self.swapchain_recreate_count
+    }
+
+    /// Explicitly idles and tears down the renderer while the native window is still alive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VulkanSmokeRendererError`] when the renderer cannot reach a
+    /// stable idle point before teardown begins.
+    pub fn shutdown(mut self) -> Result<VulkanSmokeShutdownReport, VulkanSmokeRendererError> {
+        self.shutdown_inner()
     }
 
     /// Requests swapchain recreation for a new drawable extent.
@@ -595,11 +630,7 @@ impl VulkanSmokeRenderer {
         self.current_frame = 0;
     }
 
-    fn teardown(&mut self) {
-        if let Some(device) = self.device.as_ref() {
-            // SAFETY: The logical device remains live until teardown finishes and idling prevents in-flight work from touching swapchain, buffers, sync objects or the command pool after destruction starts.
-            let _ = unsafe { device.device().device_wait_idle() };
-        }
+    fn destroy_device_owned_resources(&mut self) {
         self.destroy_swapchain_resources();
         if let Some(device) = self.device.as_ref() {
             if let Some(buffer) = self.index_buffer.take() {
@@ -623,13 +654,49 @@ impl VulkanSmokeRenderer {
                     .destroy_command_pool(self.command_pool, None);
             };
         }
-        // Drop child Vulkan owners explicitly before their parents instead of relying on field order.
-        take_runtime_owners_in_dependency_order(
+        self.pending_extent = None;
+    }
+
+    fn shutdown_inner(&mut self) -> Result<VulkanSmokeShutdownReport, VulkanSmokeRendererError> {
+        if let Some(device) = self.device.as_ref() {
+            // SAFETY: The logical device remains live until teardown finishes and idling prevents in-flight work from touching swapchain, buffers, sync objects or the command pool after destruction starts.
+            unsafe { device.device().device_wait_idle() }.map_err(|error| {
+                VulkanSmokeRendererError::VulkanOperation {
+                    context: "vkDeviceWaitIdle",
+                    result: error,
+                }
+            })?;
+        }
+        self.destroy_device_owned_resources();
+        let validation = take_runtime_owners_with_validation_snapshot(
             &mut self.instance,
             &mut self.validation,
             &mut self.surface,
             &mut self.device,
             &mut self.swapchain,
+            VulkanValidationMessenger::report,
+        )
+        .unwrap_or_default();
+        Ok(VulkanSmokeShutdownReport {
+            renderer_report: self.report.clone(),
+            swapchain_recreate_count: self.swapchain_recreate_count,
+            validation,
+        })
+    }
+
+    fn teardown(&mut self) {
+        if let Some(device) = self.device.as_ref() {
+            // SAFETY: The logical device remains live until teardown finishes and idling prevents in-flight work from touching swapchain, buffers, sync objects or the command pool after destruction starts.
+            let _ = unsafe { device.device().device_wait_idle() };
+        }
+        self.destroy_device_owned_resources();
+        let _ = take_runtime_owners_with_validation_snapshot(
+            &mut self.instance,
+            &mut self.validation,
+            &mut self.surface,
+            &mut self.device,
+            &mut self.swapchain,
+            VulkanValidationMessenger::report,
         );
     }
 }
@@ -642,12 +709,16 @@ impl Drop for VulkanSmokeRenderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{take_runtime_owners_in_dependency_order, RollbackOnDrop};
+    use super::{
+        take_runtime_owners_in_dependency_order, take_runtime_owners_with_validation_snapshot,
+        RollbackOnDrop,
+    };
     use std::cell::RefCell;
     use std::rc::Rc;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum TeardownStep {
+        Snapshot,
         Instance,
         Validation,
         Surface,
@@ -776,6 +847,43 @@ mod tests {
         for (present_steps, expected) in cases {
             assert_eq!(record_teardown_steps(&present_steps), expected);
         }
+    }
+
+    #[test]
+    fn final_validation_snapshot_is_captured_before_validation_drop() {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let mut instance = Some(tracker(TeardownStep::Instance, &log));
+        let mut validation = Some(tracker(TeardownStep::Validation, &log));
+        let mut surface = Some(tracker(TeardownStep::Surface, &log));
+        let mut device = Some(tracker(TeardownStep::Device, &log));
+        let mut swapchain = Some(tracker(TeardownStep::Swapchain, &log));
+
+        let snapshot = take_runtime_owners_with_validation_snapshot(
+            &mut instance,
+            &mut validation,
+            &mut surface,
+            &mut device,
+            &mut swapchain,
+            |_| {
+                log.borrow_mut().push(TeardownStep::Snapshot);
+                TeardownStep::Validation
+            },
+        );
+
+        assert_eq!(snapshot, Some(TeardownStep::Validation));
+        assert_eq!(
+            Rc::into_inner(log)
+                .expect("all drop trackers released")
+                .into_inner(),
+            vec![
+                TeardownStep::Snapshot,
+                TeardownStep::Swapchain,
+                TeardownStep::Device,
+                TeardownStep::Surface,
+                TeardownStep::Validation,
+                TeardownStep::Instance,
+            ]
+        );
     }
 
     #[test]

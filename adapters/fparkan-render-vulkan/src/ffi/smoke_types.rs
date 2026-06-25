@@ -128,7 +128,7 @@ pub struct VulkanSmokeRendererReport {
 }
 
 /// Measured validation counters from the live smoke loop.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct VulkanValidationReport {
     /// Validation warnings observed by the debug messenger.
     pub warning_count: u32,
@@ -136,6 +136,17 @@ pub struct VulkanValidationReport {
     pub error_count: u32,
     /// Stable sorted VUID list.
     pub vuids: Vec<String>,
+}
+
+/// Final smoke renderer shutdown evidence captured after explicit teardown.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VulkanSmokeShutdownReport {
+    /// Stable renderer bootstrap and swapchain report.
+    pub renderer_report: VulkanSmokeRendererReport,
+    /// Measured swapchain recreation count for the completed smoke loop.
+    pub swapchain_recreate_count: u32,
+    /// Final validation snapshot captured before the debug messenger is destroyed.
+    pub validation: VulkanValidationReport,
 }
 
 /// Result of one rendered smoke frame.
