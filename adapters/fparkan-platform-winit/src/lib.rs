@@ -265,6 +265,41 @@ impl WinitWindow {
     pub const fn default_render_request() -> RenderRequest {
         RenderRequest::conservative()
     }
+
+    /// Applies one platform event to the cached window descriptor state.
+    pub fn apply_event(&mut self, event: &PlatformEvent) {
+        match event {
+            PlatformEvent::Resize { width, height } => {
+                self.width = *width;
+                self.height = *height;
+            }
+            PlatformEvent::DpiChanged { scale } => {
+                self.scale = *scale;
+            }
+            PlatformEvent::FocusChanged { focused } => {
+                self.focused = *focused;
+            }
+            PlatformEvent::Minimized { minimized } => {
+                self.minimized = *minimized;
+            }
+            PlatformEvent::Occluded { occluded } => {
+                self.occluded = *occluded;
+            }
+            PlatformEvent::Suspended
+            | PlatformEvent::Resumed
+            | PlatformEvent::QuitRequested
+            | PlatformEvent::KeyboardInput { .. }
+            | PlatformEvent::MouseInput { .. }
+            | PlatformEvent::CursorMoved { .. } => {}
+        }
+    }
+
+    /// Applies a sequence of platform events to the cached window descriptor state.
+    pub fn apply_events<'a>(&mut self, events: impl IntoIterator<Item = &'a PlatformEvent>) {
+        for event in events {
+            self.apply_event(event);
+        }
+    }
 }
 
 impl WindowPort for WinitWindow {
@@ -463,6 +498,35 @@ mod tests {
         assert!(events.contains(&PlatformEvent::Minimized { minimized: true }));
         assert!(events.contains(&PlatformEvent::Minimized { minimized: false }));
         Ok(())
+    }
+
+    #[test]
+    fn window_descriptor_applies_lifecycle_and_resize_events() {
+        let mut window = WinitWindow::synthetic(640, 360);
+        let events = [
+            PlatformEvent::Resize {
+                width: 1280,
+                height: 720,
+            },
+            PlatformEvent::DpiChanged { scale: 2.0 },
+            PlatformEvent::FocusChanged { focused: false },
+            PlatformEvent::Minimized { minimized: true },
+            PlatformEvent::Occluded { occluded: true },
+        ];
+
+        window.apply_events(events.iter());
+
+        assert_eq!(
+            window.drawable_size(),
+            PhysicalSize {
+                width: 1280,
+                height: 720,
+            }
+        );
+        assert_eq!(window.dpi_scale(), 2.0);
+        assert!(!window.has_focus());
+        assert!(window.is_minimized());
+        assert!(window.is_occluded());
     }
 }
 
