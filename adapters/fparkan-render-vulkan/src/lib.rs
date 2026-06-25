@@ -436,10 +436,42 @@ const TRIANGLE_FRAGMENT_SHADER_WORDS: &[u32] = &[
     0x0001_0038,
 ];
 
-/// Shader compiler/toolchain identifiers pinned in the Stage 0 manifest.
-pub const SHADER_COMPILER_ID: &str = "shaderc-offline-stage0@pinned-manifest";
-/// SPIR-V validator identifier pinned in the Stage 0 manifest.
-pub const SPIRV_VALIDATOR_ID: &str = "spirv-val-stage0@pinned-manifest";
+const SHADER_MANIFEST_SCHEMA: u32 = 2;
+const SHADER_TARGET_ENV: &str = "vulkan1.0";
+const SHADER_COMPILER_NAME: &str = "glslangValidator";
+const SHADER_COMPILER_VERSION: &str = "11:16.3.0";
+const SHADER_COMPILER_BINARY_SHA256: &str =
+    "9bcd69d830b350aaa6e2254915ff74e46070e217b67f38daad27c1fc1f22910f";
+const SPIRV_VALIDATOR_NAME: &str = "spirv-val";
+const SPIRV_VALIDATOR_VERSION: &str = "SPIRV-Tools v2026.2 unknown hash, 2026-04-29T17:02:58+00:00";
+const SPIRV_VALIDATOR_BINARY_SHA256: &str =
+    "f6d5b96ff19f073f3af0c0bcfa0c18702d288d3ec598efc242d01cd104d8354f";
+const TRIANGLE_VERTEX_SOURCE_PATH: &str = "adapters/fparkan-render-vulkan/shaders/triangle.vert";
+const TRIANGLE_VERTEX_SOURCE_SHA256: &str =
+    "1e57f14d193fc61457c0749081c452ad25669998913107df12f3ccc3c33e0341";
+const TRIANGLE_VERTEX_SPIRV_PATH: &str = "adapters/fparkan-render-vulkan/shaders/triangle.vert.spv";
+const TRIANGLE_VERTEX_COMPILE_COMMAND: &str = "glslangValidator -V -S vert -e main adapters/fparkan-render-vulkan/shaders/triangle.vert -o adapters/fparkan-render-vulkan/shaders/triangle.vert.spv";
+const TRIANGLE_VERTEX_VALIDATE_COMMAND: &str =
+    "spirv-val --target-env vulkan1.0 adapters/fparkan-render-vulkan/shaders/triangle.vert.spv";
+const TRIANGLE_FRAGMENT_SOURCE_PATH: &str = "adapters/fparkan-render-vulkan/shaders/triangle.frag";
+const TRIANGLE_FRAGMENT_SOURCE_SHA256: &str =
+    "f19e74d001d07fb537d4b0f9e621f9b8bc40eeb68816130220853abea6bd4445";
+const TRIANGLE_FRAGMENT_SPIRV_PATH: &str =
+    "adapters/fparkan-render-vulkan/shaders/triangle.frag.spv";
+const TRIANGLE_FRAGMENT_COMPILE_COMMAND: &str = "glslangValidator -V -S frag -e main adapters/fparkan-render-vulkan/shaders/triangle.frag -o adapters/fparkan-render-vulkan/shaders/triangle.frag.spv";
+const TRIANGLE_FRAGMENT_VALIDATE_COMMAND: &str =
+    "spirv-val --target-env vulkan1.0 adapters/fparkan-render-vulkan/shaders/triangle.frag.spv";
+
+/// Shader tool metadata pinned in the Stage 0 manifest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VulkanShaderToolManifest {
+    /// Tool executable name.
+    pub name: &'static str,
+    /// Tool version string.
+    pub version: &'static str,
+    /// Tool binary SHA-256.
+    pub binary_sha256: &'static str,
+}
 
 /// Vulkan shader stage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -472,6 +504,16 @@ pub struct VulkanShaderModuleManifest {
     pub descriptor_sets: u32,
     /// Push constant byte count.
     pub push_constant_bytes: u32,
+    /// Checked-in GLSL source path.
+    pub source_path: &'static str,
+    /// Checked-in GLSL source SHA-256.
+    pub source_sha256: &'static str,
+    /// Checked-in SPIR-V module path.
+    pub spirv_path: &'static str,
+    /// Exact offline compile command used for the checked-in SPIR-V artifact.
+    pub compile_command: &'static str,
+    /// Exact offline validation command used for the checked-in SPIR-V artifact.
+    pub validate_command: &'static str,
     /// SPIR-V words.
     pub words: &'static [u32],
 }
@@ -481,10 +523,12 @@ pub struct VulkanShaderModuleManifest {
 pub struct VulkanShaderManifestReport {
     /// Report schema version.
     pub schema: u32,
-    /// Pinned compiler identifier.
-    pub compiler: &'static str,
-    /// Pinned validator identifier.
-    pub validator: &'static str,
+    /// Explicit Vulkan target environment for the checked-in SPIR-V.
+    pub target_env: &'static str,
+    /// Pinned compiler metadata.
+    pub compiler: VulkanShaderToolManifest,
+    /// Pinned validator metadata.
+    pub validator: VulkanShaderToolManifest,
     /// Shader module reports.
     pub modules: Vec<VulkanShaderModuleReport>,
     /// Hash of the normalized shader manifest.
@@ -500,10 +544,26 @@ pub struct VulkanShaderModuleReport {
     pub stage: VulkanShaderStage,
     /// SPIR-V entry point.
     pub entry_point: &'static str,
+    /// Checked-in GLSL source path.
+    pub source_path: &'static str,
+    /// Checked-in GLSL source SHA-256.
+    pub source_sha256: &'static str,
+    /// Checked-in SPIR-V module path.
+    pub spirv_path: &'static str,
     /// SPIR-V word count.
     pub word_count: usize,
     /// SPIR-V byte hash.
     pub sha256: String,
+    /// Descriptor set count.
+    pub descriptor_sets: u32,
+    /// Push constant byte count.
+    pub push_constant_bytes: u32,
+    /// Exact offline compile command used for the checked-in SPIR-V artifact.
+    pub compile_command: &'static str,
+    /// Exact offline validation command used for the checked-in SPIR-V artifact.
+    pub validate_command: &'static str,
+    /// Stable hash of the reflected interface contract for this module.
+    pub interface_hash: String,
 }
 
 /// Shader manifest validation error.
@@ -787,6 +847,8 @@ pub struct VulkanSmokeRendererCreateInfo {
 /// Stable smoke renderer bootstrap report.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VulkanSmokeRendererReport {
+    /// Checked-in shader manifest hash used by the renderer.
+    pub shader_manifest_hash: String,
     /// Whether portability enumeration was enabled at instance creation.
     pub portability_enumeration: bool,
     /// Selected device name.
@@ -1020,7 +1082,7 @@ impl VulkanSmokeRenderer {
     pub fn new(
         create_info: &VulkanSmokeRendererCreateInfo,
     ) -> Result<Self, VulkanSmokeRendererError> {
-        validate_shader_manifest(&triangle_shader_manifest())
+        let shader_manifest = validate_shader_manifest(&triangle_shader_manifest())
             .map_err(VulkanSmokeRendererError::ShaderManifest)?;
         let surface_plan = plan_vulkan_surface(Some(create_info.native_handles))
             .map_err(VulkanSmokeRendererError::Surface)?;
@@ -1083,6 +1145,7 @@ impl VulkanSmokeRenderer {
             pending_extent: None,
             swapchain_recreate_count: 0,
             report: VulkanSmokeRendererReport {
+                shader_manifest_hash: shader_manifest.manifest_hash.clone(),
                 portability_enumeration: instance_config.enable_portability_enumeration,
                 device_name: String::new(),
                 graphics_queue_family: 0,
@@ -1096,6 +1159,7 @@ impl VulkanSmokeRenderer {
         let device_ref = renderer.device_ref()?;
         let swapchain_ref = renderer.swapchain_ref()?;
         renderer.report = VulkanSmokeRendererReport {
+            shader_manifest_hash: shader_manifest.manifest_hash,
             portability_enumeration: renderer
                 .instance
                 .as_ref()
@@ -3323,6 +3387,11 @@ pub fn triangle_shader_manifest() -> Vec<VulkanShaderModuleManifest> {
             entry_point: "main",
             descriptor_sets: 0,
             push_constant_bytes: 0,
+            source_path: TRIANGLE_VERTEX_SOURCE_PATH,
+            source_sha256: TRIANGLE_VERTEX_SOURCE_SHA256,
+            spirv_path: TRIANGLE_VERTEX_SPIRV_PATH,
+            compile_command: TRIANGLE_VERTEX_COMPILE_COMMAND,
+            validate_command: TRIANGLE_VERTEX_VALIDATE_COMMAND,
             words: TRIANGLE_VERTEX_SHADER_WORDS,
         },
         VulkanShaderModuleManifest {
@@ -3331,6 +3400,11 @@ pub fn triangle_shader_manifest() -> Vec<VulkanShaderModuleManifest> {
             entry_point: "main",
             descriptor_sets: 0,
             push_constant_bytes: 0,
+            source_path: TRIANGLE_FRAGMENT_SOURCE_PATH,
+            source_sha256: TRIANGLE_FRAGMENT_SOURCE_SHA256,
+            spirv_path: TRIANGLE_FRAGMENT_SPIRV_PATH,
+            compile_command: TRIANGLE_FRAGMENT_COMPILE_COMMAND,
+            validate_command: TRIANGLE_FRAGMENT_VALIDATE_COMMAND,
             words: TRIANGLE_FRAGMENT_SHADER_WORDS,
         },
     ]
@@ -3353,18 +3427,49 @@ pub fn validate_shader_manifest(
             name: module.name,
             stage: module.stage,
             entry_point: module.entry_point,
+            source_path: module.source_path,
+            source_sha256: module.source_sha256,
+            spirv_path: module.spirv_path,
             word_count: module.words.len(),
             sha256: sha256_hex(&sha256(&bytes)),
+            descriptor_sets: module.descriptor_sets,
+            push_constant_bytes: module.push_constant_bytes,
+            compile_command: module.compile_command,
+            validate_command: module.validate_command,
+            interface_hash: shader_interface_hash(module),
         });
     }
-    let normalized = render_shader_modules_json(&reports);
+    let normalized = render_shader_manifest_without_hash_json(&reports);
     Ok(VulkanShaderManifestReport {
-        schema: 1,
-        compiler: SHADER_COMPILER_ID,
-        validator: SPIRV_VALIDATOR_ID,
+        schema: SHADER_MANIFEST_SCHEMA,
+        target_env: SHADER_TARGET_ENV,
+        compiler: VulkanShaderToolManifest {
+            name: SHADER_COMPILER_NAME,
+            version: SHADER_COMPILER_VERSION,
+            binary_sha256: SHADER_COMPILER_BINARY_SHA256,
+        },
+        validator: VulkanShaderToolManifest {
+            name: SPIRV_VALIDATOR_NAME,
+            version: SPIRV_VALIDATOR_VERSION,
+            binary_sha256: SPIRV_VALIDATOR_BINARY_SHA256,
+        },
         modules: reports,
         manifest_hash: sha256_hex(&sha256(normalized.as_bytes())),
     })
+}
+
+fn shader_interface_hash(module: &VulkanShaderModuleManifest) -> String {
+    let mut normalized = String::new();
+    normalized.push_str("{\"stage\":\"");
+    normalized.push_str(module.stage.as_str());
+    normalized.push_str("\",\"entry_point\":");
+    push_json_string(&mut normalized, module.entry_point);
+    normalized.push_str(",\"descriptor_sets\":");
+    normalized.push_str(&module.descriptor_sets.to_string());
+    normalized.push_str(",\"push_constant_bytes\":");
+    normalized.push_str(&module.push_constant_bytes.to_string());
+    normalized.push('}');
+    sha256_hex(&sha256(normalized.as_bytes()))
 }
 
 fn validate_spirv_container(
@@ -3402,18 +3507,33 @@ fn spirv_words_to_bytes(words: &[u32]) -> Vec<u8> {
 /// Renders a deterministic JSON shader manifest report.
 #[must_use]
 pub fn render_shader_manifest_report_json(report: &VulkanShaderManifestReport) -> String {
-    let mut out = String::new();
-    out.push_str("{\"schema\":");
-    out.push_str(&report.schema.to_string());
-    out.push_str(",\"compiler\":");
-    push_json_string(&mut out, report.compiler);
-    out.push_str(",\"validator\":");
-    push_json_string(&mut out, report.validator);
-    out.push_str(",\"modules\":");
-    out.push_str(&render_shader_modules_json(&report.modules));
+    let mut out = render_shader_manifest_without_hash_json(&report.modules);
     out.push_str(",\"manifest_hash\":");
     push_json_string(&mut out, &report.manifest_hash);
     out.push('}');
+    out
+}
+
+fn render_shader_manifest_without_hash_json(modules: &[VulkanShaderModuleReport]) -> String {
+    let mut out = String::new();
+    out.push_str("{\"schema\":");
+    out.push_str(&SHADER_MANIFEST_SCHEMA.to_string());
+    out.push_str(",\"target_env\":");
+    push_json_string(&mut out, SHADER_TARGET_ENV);
+    out.push_str(",\"compiler\":");
+    out.push_str(&render_shader_tool_json(&VulkanShaderToolManifest {
+        name: SHADER_COMPILER_NAME,
+        version: SHADER_COMPILER_VERSION,
+        binary_sha256: SHADER_COMPILER_BINARY_SHA256,
+    }));
+    out.push_str(",\"validator\":");
+    out.push_str(&render_shader_tool_json(&VulkanShaderToolManifest {
+        name: SPIRV_VALIDATOR_NAME,
+        version: SPIRV_VALIDATOR_VERSION,
+        binary_sha256: SPIRV_VALIDATOR_BINARY_SHA256,
+    }));
+    out.push_str(",\"modules\":");
+    out.push_str(&render_shader_modules_json(modules));
     out
 }
 
@@ -3430,13 +3550,41 @@ fn render_shader_modules_json(modules: &[VulkanShaderModuleReport]) -> String {
         out.push_str(module.stage.as_str());
         out.push_str("\",\"entry_point\":");
         push_json_string(&mut out, module.entry_point);
+        out.push_str(",\"source_path\":");
+        push_json_string(&mut out, module.source_path);
+        out.push_str(",\"source_sha256\":");
+        push_json_string(&mut out, module.source_sha256);
+        out.push_str(",\"spirv_path\":");
+        push_json_string(&mut out, module.spirv_path);
         out.push_str(",\"word_count\":");
         out.push_str(&module.word_count.to_string());
         out.push_str(",\"sha256\":");
         push_json_string(&mut out, &module.sha256);
+        out.push_str(",\"descriptor_sets\":");
+        out.push_str(&module.descriptor_sets.to_string());
+        out.push_str(",\"push_constant_bytes\":");
+        out.push_str(&module.push_constant_bytes.to_string());
+        out.push_str(",\"compile_command\":");
+        push_json_string(&mut out, module.compile_command);
+        out.push_str(",\"validate_command\":");
+        push_json_string(&mut out, module.validate_command);
+        out.push_str(",\"interface_hash\":");
+        push_json_string(&mut out, &module.interface_hash);
         out.push('}');
     }
     out.push(']');
+    out
+}
+
+fn render_shader_tool_json(tool: &VulkanShaderToolManifest) -> String {
+    let mut out = String::new();
+    out.push_str("{\"name\":");
+    push_json_string(&mut out, tool.name);
+    out.push_str(",\"version\":");
+    push_json_string(&mut out, tool.version);
+    out.push_str(",\"binary_sha256\":");
+    push_json_string(&mut out, tool.binary_sha256);
+    out.push('}');
     out
 }
 
@@ -4648,21 +4796,56 @@ mod tests {
         let report =
             validate_shader_manifest(&triangle_shader_manifest()).expect("shader manifest");
 
+        assert_eq!(report.schema, SHADER_MANIFEST_SCHEMA);
+        assert_eq!(report.target_env, SHADER_TARGET_ENV);
+        assert_eq!(
+            report.compiler,
+            VulkanShaderToolManifest {
+                name: SHADER_COMPILER_NAME,
+                version: SHADER_COMPILER_VERSION,
+                binary_sha256: SHADER_COMPILER_BINARY_SHA256,
+            }
+        );
+        assert_eq!(
+            report.validator,
+            VulkanShaderToolManifest {
+                name: SPIRV_VALIDATOR_NAME,
+                version: SPIRV_VALIDATOR_VERSION,
+                binary_sha256: SPIRV_VALIDATOR_BINARY_SHA256,
+            }
+        );
         assert_eq!(report.modules.len(), 2);
         assert_eq!(report.modules[0].name, "triangle.vert");
         assert_eq!(report.modules[0].stage, VulkanShaderStage::Vertex);
+        assert_eq!(report.modules[0].source_path, TRIANGLE_VERTEX_SOURCE_PATH);
+        assert_eq!(
+            report.modules[0].source_sha256,
+            TRIANGLE_VERTEX_SOURCE_SHA256
+        );
+        assert_eq!(report.modules[0].spirv_path, TRIANGLE_VERTEX_SPIRV_PATH);
         assert_eq!(report.modules[0].word_count, 253);
         assert_eq!(
             report.modules[0].sha256,
             "9023b1cc856c98ecd21755596c4e9d1e62cc63e1787f8c43ada2101544e8d0d1"
         );
+        assert_eq!(report.modules[0].descriptor_sets, 0);
+        assert_eq!(report.modules[0].push_constant_bytes, 0);
+        assert_eq!(
+            report.modules[0].compile_command,
+            TRIANGLE_VERTEX_COMPILE_COMMAND
+        );
+        assert_eq!(
+            report.modules[0].validate_command,
+            TRIANGLE_VERTEX_VALIDATE_COMMAND
+        );
+        assert!(!report.modules[0].interface_hash.is_empty());
         assert_eq!(
             report.modules[1].sha256,
             "6efe2c9716ae845c471ecbaac2c83e56a17a37dc017dd63f0a05f0d9161f44ba"
         );
         assert_eq!(
             report.manifest_hash,
-            "849ffae9681f5ff2fc145d7b98f19f69b478d9ea73207efdf5f1748e8d51045c"
+            "725529e9449fa53017e7df75f3f14c76d53479a5a7617d55ec78280b3059bc44"
         );
     }
 
@@ -4670,9 +4853,22 @@ mod tests {
     fn shader_manifest_report_json_is_stable() {
         let report =
             validate_shader_manifest(&triangle_shader_manifest()).expect("shader manifest");
+        let json = render_shader_manifest_report_json(&report);
 
-        assert!(render_shader_manifest_report_json(&report).contains(SHADER_COMPILER_ID));
-        assert!(render_shader_manifest_report_json(&report).contains(SPIRV_VALIDATOR_ID));
+        assert!(json.contains(SHADER_COMPILER_NAME));
+        assert!(json.contains(SPIRV_VALIDATOR_NAME));
+        assert!(json.contains(TRIANGLE_VERTEX_SOURCE_PATH));
+        assert!(json.contains(TRIANGLE_VERTEX_COMPILE_COMMAND));
+    }
+
+    #[test]
+    fn checked_in_shader_manifest_matches_generated_report() {
+        let report =
+            validate_shader_manifest(&triangle_shader_manifest()).expect("shader manifest");
+        assert_eq!(
+            render_shader_manifest_report_json(&report),
+            include_str!("../shaders/manifest.json").trim()
+        );
     }
 
     #[test]

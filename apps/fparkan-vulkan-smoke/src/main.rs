@@ -372,7 +372,7 @@ fn render_smoke_report_json(
         ("requested_frames", options.frames.to_string()),
         (
             "shader_manifest_hash",
-            json_string("849ffae9681f5ff2fc145d7b98f19f69b478d9ea73207efdf5f1748e8d51045c"),
+            json_string(&report.shader_manifest_hash),
         ),
         ("vulkan_loader_status", json_string("available")),
         ("vulkan_instance_status", json_string("created")),
