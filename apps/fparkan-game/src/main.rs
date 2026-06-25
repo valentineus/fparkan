@@ -28,7 +28,7 @@ use fparkan_render::{
     DrawCommand, DrawId, GpuMaterialId, GpuMeshId, IndexRange, RenderBackend, RenderCommand,
     RenderCommandList, RenderPhase,
 };
-use fparkan_render_vulkan::VulkanBackend;
+use fparkan_render_vulkan::VulkanPlanningBackend;
 use fparkan_runtime::{
     create, frame, load_mission, loaded_mission_assets, EngineConfig, EngineMode, EngineServices,
     MissionAssets, MissionRequest,
@@ -71,7 +71,7 @@ fn run(args: &[String]) -> Result<String, String> {
     )
     .map_err(|err| err.to_string())?;
 
-    let mut backend = VulkanBackend::new();
+    let mut backend = VulkanPlanningBackend::new();
     let _request = WinitWindow::default_render_request();
     let window = WinitWindow::synthetic(1280, 720);
     let _ = window.drawable_size();

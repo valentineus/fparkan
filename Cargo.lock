@@ -717,6 +717,7 @@ dependencies = [
  "fparkan-platform",
  "fparkan-platform-winit",
  "fparkan-render-vulkan",
+ "winit",
 ]
 
 [[package]]

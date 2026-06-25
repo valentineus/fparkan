@@ -34,9 +34,9 @@ use std::process::Command;
 const CORPORA_MANIFEST_ENV: &str = "FPARKAN_CORPORA_MANIFEST";
 const PART1_ROOT_ENV: &str = "FPARKAN_CORPUS_PART1_ROOT";
 const PART2_ROOT_ENV: &str = "FPARKAN_CORPUS_PART2_ROOT";
-const CI_ACCEPTANCE_ROADMAP: &str = "fixtures/acceptance/stage_0_2_roadmap.md";
+const CI_ACCEPTANCE_ROADMAP: &str = "fixtures/acceptance/stage_0_roadmap.md";
 const CI_ACCEPTANCE_COVERAGE: &str = "fixtures/acceptance/coverage.tsv";
-const CI_ACCEPTANCE_REPORT: &str = "target/fparkan/acceptance/stage-0-2-audit.json";
+const CI_ACCEPTANCE_REPORT: &str = "target/fparkan/acceptance/stage-0-audit.json";
 const STAGE_PACKAGE_MANIFEST: &str = "fixtures/acceptance/stage_packages.toml";
 const REQUIRED_NATIVE_SMOKE_PLATFORMS: &[&str] = &["linux", "macos", "windows"];
 const APPROVED_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
@@ -193,16 +193,16 @@ fn run_cargo_fmt_check() -> Result<(), String> {
 
 fn run_cargo_deny() -> Result<(), String> {
     let cargo_deny = std::env::var_os("CARGO_DENY").unwrap_or_else(|| "cargo-deny".into());
-    let version_output = Command::new(&cargo_deny)
-        .arg("--version")
-        .output()
-        .map_err(|err| {
-            format!(
-                "cargo-deny is required; install cargo-deny {PINNED_CARGO_DENY_VERSION} or set {ALLOW_SUPPLY_CHAIN_FALLBACK_ENV}=1 for the built-in fallback: {err}"
-            )
-        })?;
+    let version_output = match Command::new(&cargo_deny).arg("--version").output() {
+        Ok(output) => output,
+        Err(err) => {
+            return handle_cargo_deny_fallback(&format!(
+                "failed to run cargo-deny --version: {err}"
+            ));
+        }
+    };
     if !version_output.status.success() {
-        return handle_cargo_deny_fallback(format!(
+        return handle_cargo_deny_fallback(&format!(
             "cargo-deny --version exited with {}",
             version_output.status
         ));
@@ -210,7 +210,7 @@ fn run_cargo_deny() -> Result<(), String> {
     let version_text = String::from_utf8(version_output.stdout)
         .map_err(|err| format!("cargo-deny --version produced invalid UTF-8: {err}"))?;
     if !version_text.contains(PINNED_CARGO_DENY_VERSION) {
-        return handle_cargo_deny_fallback(format!(
+        return handle_cargo_deny_fallback(&format!(
             "cargo-deny version mismatch: expected {PINNED_CARGO_DENY_VERSION}, found {}",
             version_text.trim()
         ));
@@ -237,7 +237,7 @@ fn run_cargo_deny() -> Result<(), String> {
 
 const PINNED_CARGO_DENY_VERSION: &str = "0.19.9";
 
-fn handle_cargo_deny_fallback(reason: String) -> Result<(), String> {
+fn handle_cargo_deny_fallback(reason: &str) -> Result<(), String> {
     if std::env::var_os(ALLOW_SUPPLY_CHAIN_FALLBACK_ENV).is_some() {
         eprintln!(
             "{reason}; running built-in supply-chain policy fallback because {ALLOW_SUPPLY_CHAIN_FALLBACK_ENV} is set"
@@ -1605,6 +1605,7 @@ fn validate_native_smoke_report(
     expect_u64_at_least(platform, report, "frames", 300, failures);
     expect_u64_at_least(platform, report, "resize_count", 1, failures);
     expect_u64_at_least(platform, report, "swapchain_recreate_count", 1, failures);
+    expect_u64_field(platform, report, "validation_warning_count", 0, failures);
     expect_u64_field(platform, report, "validation_error_count", 0, failures);
     expect_nonempty_string(platform, report, "commit_sha", failures);
     expect_string_field(
@@ -1889,6 +1890,10 @@ fn build_acceptance_audit(
     let mut missing = Vec::new();
     let mut by_stage = BTreeMap::new();
     let mut coverage_evidence = BTreeMap::new();
+    let required_scopes = required
+        .iter()
+        .filter_map(|id| id.get(0..2).map(ToString::to_string))
+        .collect::<BTreeSet<_>>();
 
     for id in required {
         let stage = id
@@ -1909,7 +1914,12 @@ fn build_acceptance_audit(
 
     let unknown_coverage = coverage
         .keys()
-        .filter(|id| !required.contains(*id))
+        .filter(|id| {
+            !required.contains(*id)
+                && id
+                    .get(0..2)
+                    .is_some_and(|scope| required_scopes.contains(scope))
+        })
         .cloned()
         .collect();
 
@@ -2367,7 +2377,7 @@ mod tests {
                 },
             ),
             (
-                "S9-UNKNOWN-001".to_string(),
+                "S0-ARCH-099".to_string(),
                 CoverageEntry {
                     status: CoverageStatus::Partial,
                     evidence: "bad id".to_string(),
@@ -2383,7 +2393,7 @@ mod tests {
         assert_eq!(audit.blocked, ["L5-RG40-001"]);
         assert_eq!(audit.omitted, ["L3-DEVICE-001"]);
         assert_eq!(audit.missing, ["S0-ARCH-002"]);
-        assert_eq!(audit.unknown_coverage, ["S9-UNKNOWN-001"]);
+        assert_eq!(audit.unknown_coverage, ["S0-ARCH-099"]);
         assert_eq!(audit.by_stage.get("S0"), Some(&2));
         assert_eq!(
             audit.strict_failures(),
@@ -2436,6 +2446,7 @@ mod tests {
                         "frames": 300,
                         "resize_count": 1,
                         "swapchain_recreate_count": 1,
+                        "validation_warning_count": 0,
                         "validation_error_count": 0,
                         "shader_manifest_hash": "dd293e4ff08ffca1c037900d08b0ffd415db39f238b4fcdde46468fa049b679c",
                         "vulkan_loader_status": "available",
@@ -2474,6 +2485,7 @@ mod tests {
                 "frames": 0,
                 "resize_count": 0,
                 "swapchain_recreate_count": 0,
+                "validation_warning_count": null,
                 "validation_error_count": null,
                 "shader_manifest_hash": "dd293e4ff08ffca1c037900d08b0ffd415db39f238b4fcdde46468fa049b679c",
                 "vulkan_loader_status": "unavailable",

@@ -9,6 +9,7 @@ repository.workspace = true
 fparkan-platform = { path = "../../crates/fparkan-platform" }
 fparkan-platform-winit = { path = "../../adapters/fparkan-platform-winit" }
 fparkan-render-vulkan = { path = "../../adapters/fparkan-render-vulkan" }
+winit = "0.30"
 
 [lints]
 workspace = true

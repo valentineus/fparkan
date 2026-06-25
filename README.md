@@ -63,6 +63,40 @@ FPARKAN_CORPORA_MANIFEST=/private/tmp/fparkan-corpora.toml \
   cargo xtask acceptance report --suite licensed --stage 5
 ```
 
+## Stage 0 Vulkan smoke
+
+Локальный Stage 0 smoke запускает реальный `winit` lifecycle и Vulkan triangle path с включёнными validation layers. Успешный прогон обязан:
+
+- отрисовать 300 кадров;
+- выполнить как минимум один реальный resize;
+- пересоздать swapchain после resize;
+- завершиться без validation warnings/errors.
+
+Команда запуска:
+
+```bash
+cargo run -p fparkan-vulkan-smoke --locked -- \
+  --out target/fparkan/native-smoke/local.json
+```
+
+Перед запуском убедитесь, что на машине доступен Vulkan loader и рабочий ICD:
+
+- macOS: установлены Vulkan SDK и MoltenVK; если используется нестандартная установка, проверьте `VK_ICD_FILENAMES`, `VK_LAYER_PATH` и наличие `VK_LAYER_KHRONOS_validation`.
+- Linux: установлен `libvulkan` и драйвер/ICD (`mesa-vulkan-drivers`, Lavapipe или vendor GPU stack); smoke нужно запускать из активной графической сессии X11/Wayland.
+- Windows: установлен Vulkan runtime от GPU vendor или LunarG Vulkan SDK; validation layer должен быть доступен из активного runtime.
+
+Для полного локального closure gate используйте:
+
+```bash
+cargo xtask ci
+```
+
+GitHub workflow дополнительно собирает три platform reports и проверяет их aggregate gate:
+
+```bash
+cargo xtask native-smoke audit --dir target/fparkan/native-smoke-artifacts
+```
+
 ## Contributing & Support
 
 Проект активно поддерживается и открыт для contribution. Issues и pull requests можно создавать в обоих репозиториях:

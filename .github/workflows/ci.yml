@@ -48,7 +48,7 @@ jobs:
           --locked
 
   stage0-matrix:
-    name: Stage 0-2 CI (${{ matrix.os }})
+    name: Stage 0 CI (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -73,22 +73,43 @@ jobs:
         run: cargo install cargo-deny --version 0.19.9 --locked
       - name: Run canonical CI gate
         run: cargo xtask ci
-      - name: Record native Vulkan smoke status
-        if: always()
-        shell: bash
+      - name: Run native Vulkan smoke
         run: >
           cargo run -p fparkan-vulkan-smoke --locked --
-          --platform "${{ matrix.smoke_platform }}"
-          --out "target/fparkan/native-smoke/${{ runner.os }}.json"
-          --status blocked
-          --probe-surface
-          --reason "native Vulkan smoke runner is not enabled on this CI lane yet"
-      - name: Upload acceptance evidence
+          --out "target/fparkan/native-smoke/${{ matrix.smoke_platform }}.json"
+      - name: Upload acceptance audit
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: stage-0-2-acceptance-${{ matrix.os }}
-          path: |
-            target/fparkan/acceptance/stage-0-2-audit.json
-            target/fparkan/native-smoke/*.json
+          name: stage-0-acceptance-${{ matrix.os }}
+          path: target/fparkan/acceptance/stage-0-audit.json
           if-no-files-found: error
+      - name: Upload native smoke report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-smoke-${{ matrix.smoke_platform }}
+          path: target/fparkan/native-smoke/*.json
+          if-no-files-found: error
+
+  native-smoke-audit:
+    name: Native smoke audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: stage0-matrix
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537
+        with:
+          toolchain: 1.87.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: native-smoke-*
+          path: target/fparkan/native-smoke-artifacts
+          merge-multiple: true
+      - name: Aggregate native smoke reports
+        run: >
+          cargo xtask native-smoke audit
+          --dir target/fparkan/native-smoke-artifacts
