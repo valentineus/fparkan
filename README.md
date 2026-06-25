@@ -91,7 +91,7 @@ cargo run -p fparkan-vulkan-smoke --locked -- \
 cargo xtask ci
 ```
 
-GitHub workflow дополнительно собирает три platform reports и проверяет их aggregate gate:
+В текущем macOS-only цикле GitHub workflow собирает только macOS report и проверяет его через `native-smoke audit`. Windows и Linux smoke stages сознательно не входят в этот closure:
 
 ```bash
 cargo xtask native-smoke audit --dir target/fparkan/native-smoke-artifacts

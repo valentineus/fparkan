@@ -38,7 +38,7 @@ const CI_ACCEPTANCE_ROADMAP: &str = "fixtures/acceptance/stage_0_roadmap.md";
 const CI_ACCEPTANCE_COVERAGE: &str = "fixtures/acceptance/coverage.tsv";
 const CI_ACCEPTANCE_REPORT: &str = "target/fparkan/acceptance/stage-0-audit.json";
 const STAGE_PACKAGE_MANIFEST: &str = "fixtures/acceptance/stage_packages.toml";
-const REQUIRED_NATIVE_SMOKE_PLATFORMS: &[&str] = &["linux", "macos", "windows"];
+const REQUIRED_NATIVE_SMOKE_PLATFORMS: &[&str] = &["macos"];
 const APPROVED_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const SUPPLY_CHAIN_BANNED_PACKAGES: &[&str] = &["native-tls", "openssl", "openssl-sys"];
 const PINNED_RUST_TOOLCHAIN: &str = "1.87.0";
@@ -2430,8 +2430,8 @@ mod tests {
     }
 
     #[test]
-    fn native_smoke_audit_accepts_complete_three_platform_pass() {
-        let reports = ["linux", "macos", "windows"]
+    fn native_smoke_audit_accepts_complete_required_platform_pass() {
+        let reports = ["macos"]
             .into_iter()
             .map(|platform| {
                 (
@@ -2501,8 +2501,6 @@ mod tests {
 
         let failures = audit_native_smoke_reports(&reports);
 
-        assert!(failures.contains(&"linux: missing native smoke report".to_string()));
-        assert!(failures.contains(&"windows: missing native smoke report".to_string()));
         assert!(
             failures.contains(&"macos: status expected \"passed\", found \"blocked\"".to_string())
         );

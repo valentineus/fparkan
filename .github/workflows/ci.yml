@@ -55,10 +55,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            smoke_platform: linux
-          - os: windows-latest
-            smoke_platform: windows
           - os: macos-latest
             smoke_platform: macos
     env:
