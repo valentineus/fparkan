@@ -1240,7 +1240,7 @@ fn has_safety_comment(line: &str) -> bool {
     line.contains("SAFETY:")
 }
 
-const AUDITED_UNSAFE_SOURCE_FILES: &[&str] = &["adapters/fparkan-render-vulkan/src/lib.rs"];
+const AUDITED_UNSAFE_SOURCE_FILES: &[&str] = &["adapters/fparkan-render-vulkan/src/ffi.rs"];
 
 fn is_audited_unsafe_source(path: &Path) -> bool {
     let as_path = path.as_os_str().to_string_lossy();
