@@ -197,12 +197,12 @@ impl SmokeApp {
         );
         let smoke_report = SmokeReport {
             schema_version: SCHEMA_VERSION,
-            commit_sha: current_git_commit_sha(),
+            commit_sha: compiled_commit_sha(),
             git_dirty: current_git_dirty(),
             runner_identity: measured_runner_identity(),
             runner_architecture: actual_architecture(),
             rust_toolchain: current_rustc_release(),
-            target_triple: current_rustc_host_triple(),
+            target_triple: compiled_target_triple(),
             platform: actual_platform(),
             status,
             failure_reason,
@@ -541,7 +541,13 @@ fn actual_architecture() -> &'static str {
     }
 }
 
-fn current_git_commit_sha() -> String {
+fn compiled_commit_sha() -> String {
+    option_env!("FPARKAN_BUILD_COMMIT_SHA")
+        .filter(|value| is_commit_sha(value))
+        .map_or_else(runtime_git_commit_sha, ToString::to_string)
+}
+
+fn runtime_git_commit_sha() -> String {
     Command::new("git")
         .args(["rev-parse", "HEAD"])
         .output()
@@ -549,7 +555,7 @@ fn current_git_commit_sha() -> String {
         .filter(|output| output.status.success())
         .and_then(|output| String::from_utf8(output.stdout).ok())
         .map(|value| value.trim().to_string())
-        .filter(|value| value.len() == 40 && value.chars().all(|ch| ch.is_ascii_hexdigit()))
+        .filter(|value| is_commit_sha(value))
         .unwrap_or_else(|| "unknown".to_string())
 }
 
@@ -576,6 +582,12 @@ fn current_rustc_release() -> String {
                 .find_map(|line| line.strip_prefix("release: ").map(ToString::to_string))
         })
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn compiled_target_triple() -> String {
+    option_env!("FPARKAN_BUILD_TARGET_TRIPLE")
+        .filter(|value| !value.trim().is_empty())
+        .map_or_else(current_rustc_host_triple, ToString::to_string)
 }
 
 fn measured_runner_identity() -> String {
@@ -606,6 +618,10 @@ fn current_rustc_host_triple() -> String {
                 .find_map(|line| line.strip_prefix("host: ").map(ToString::to_string))
         })
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn is_commit_sha(value: &str) -> bool {
+    value.len() == 40 && value.chars().all(|ch| ch.is_ascii_hexdigit())
 }
 
 #[cfg(test)]
@@ -695,6 +711,17 @@ mod tests {
 
             assert_eq!(parsed, Err(format!("unknown native smoke option: {flag}")));
         }
+    }
+
+    #[test]
+    fn commit_sha_validation_accepts_hex_head() {
+        assert!(is_commit_sha("0123456789abcdef0123456789abcdef01234567"));
+    }
+
+    #[test]
+    fn commit_sha_validation_rejects_non_hex_or_wrong_length() {
+        assert!(!is_commit_sha("0123456789abcdef0123456789abcdef0123456"));
+        assert!(!is_commit_sha("zz23456789abcdef0123456789abcdef01234567"));
     }
 
     #[test]
