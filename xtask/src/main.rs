@@ -1640,6 +1640,8 @@ fn validate_native_smoke_report(
     expect_u64_field(platform, report, "validation_warning_count", 0, failures);
     expect_u64_field(platform, report, "validation_error_count", 0, failures);
     expect_nonempty_string(platform, report, "commit_sha", failures);
+    expect_bool_field(platform, report, "git_dirty", failures);
+    expect_nonempty_string(platform, report, "runner_identity", failures);
     expect_string_field(
         platform,
         report,
@@ -1709,6 +1711,19 @@ fn expect_nonempty_string(
         Ok(value) if !value.trim().is_empty() => {}
         Ok(_) => failures.push(format!("{platform}: {field} must be non-empty")),
         Err(err) => failures.push(format!("{platform}: {err}")),
+    }
+}
+
+fn expect_bool_field(
+    platform: &str,
+    report: &serde_json::Value,
+    field: &str,
+    failures: &mut Vec<String>,
+) {
+    match report.get(field) {
+        Some(serde_json::Value::Bool(_)) => {}
+        Some(_) => failures.push(format!("{platform}: {field} must be a boolean")),
+        None => failures.push(format!("{platform}: missing {field}")),
     }
 }
 
@@ -1809,6 +1824,8 @@ impl CoverageStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AcceptanceAudit {
     commit_sha: String,
+    git_dirty: bool,
+    runner_identity: String,
     rust_toolchain: String,
     msrv: String,
     required_total: usize,
@@ -1957,6 +1974,8 @@ fn build_acceptance_audit(
 
     AcceptanceAudit {
         commit_sha: current_git_commit_sha(),
+        git_dirty: current_git_dirty(),
+        runner_identity: measured_runner_identity(),
         rust_toolchain: measured_rust_toolchain_version(),
         msrv: WORKSPACE_MSRV.to_string(),
         required_total: required.len(),
@@ -1978,6 +1997,8 @@ fn render_audit_json(audit: &AcceptanceAudit) -> String {
             "{{\n",
             "  \"schema_version\": \"fparkan-acceptance-coverage-v1\",\n",
             "  \"commit_sha\": \"{}\",\n",
+            "  \"git_dirty\": {},\n",
+            "  \"runner_identity\": \"{}\",\n",
             "  \"rust_toolchain\": \"{}\",\n",
             "  \"msrv\": \"{}\",\n",
             "  \"required_total\": {},\n",
@@ -1999,6 +2020,8 @@ fn render_audit_json(audit: &AcceptanceAudit) -> String {
             "}}\n"
         ),
         json_escape(&audit.commit_sha),
+        if audit.git_dirty { "true" } else { "false" },
+        json_escape(&audit.runner_identity),
         json_escape(&audit.rust_toolchain),
         json_escape(&audit.msrv),
         audit.required_total,
@@ -2032,6 +2055,16 @@ fn current_git_commit_sha() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+fn current_git_dirty() -> bool {
+    Command::new("git")
+        .args(["status", "--short"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .is_some_and(|output| !output.trim().is_empty())
+}
+
 fn measured_rust_toolchain_version() -> String {
     Command::new("rustc")
         .args(["-Vv"])
@@ -2047,6 +2080,21 @@ fn measured_rust_toolchain_version() -> String {
             })
         })
         .unwrap_or_else(|| PINNED_RUST_TOOLCHAIN.to_string())
+}
+
+fn measured_runner_identity() -> String {
+    if std::env::var_os("GITHUB_ACTIONS").is_some() {
+        let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_else(|_| "unknown-run".to_string());
+        let job = std::env::var("GITHUB_JOB").unwrap_or_else(|_| "unknown-job".to_string());
+        format!("github-actions/{run_id}/{job}")
+    } else if std::env::var_os("CI").is_some() {
+        let job = std::env::var("CI_JOB_NAME")
+            .or_else(|_| std::env::var("BUILD_ID"))
+            .unwrap_or_else(|_| "generic-ci".to_string());
+        format!("ci/{job}")
+    } else {
+        format!("local/{}", std::env::consts::OS)
+    }
 }
 
 fn render_string_usize_map(values: &BTreeMap<String, usize>) -> String {
@@ -2437,6 +2485,8 @@ mod tests {
     fn audit_json_escapes_evidence() {
         let mut audit = AcceptanceAudit {
             commit_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            git_dirty: false,
+            runner_identity: "github-actions/12345/stage0-macos".to_string(),
             rust_toolchain: PINNED_RUST_TOOLCHAIN.to_string(),
             msrv: WORKSPACE_MSRV.to_string(),
             required_total: 1,
@@ -2457,6 +2507,8 @@ mod tests {
 
         assert!(json.contains("quoted \\\"value\\\""));
         assert!(json.contains("\"commit_sha\": \"0123456789abcdef0123456789abcdef01234567\""));
+        assert!(json.contains("\"git_dirty\": false"));
+        assert!(json.contains("\"runner_identity\": \"github-actions/12345/stage0-macos\""));
         assert!(json.contains("\"rust_toolchain\": \"1.87.0\""));
         assert!(json.contains("\"msrv\": \"1.87\""));
     }
@@ -2471,6 +2523,8 @@ mod tests {
                     serde_json::json!({
                         "schema_version": "fparkan-native-smoke-v1",
                         "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                        "git_dirty": false,
+                        "runner_identity": "github-actions/12345/stage0-macos",
                         "rust_toolchain": measured_rust_toolchain_version(),
                         "target_triple": format!("{platform}-test-target"),
                         "platform": platform,
@@ -2510,6 +2564,8 @@ mod tests {
             serde_json::json!({
                 "schema_version": "fparkan-native-smoke-v1",
                 "commit_sha": "0123456789abcdef0123456789abcdef01234567",
+                "git_dirty": "dirty",
+                "runner_identity": "",
                 "rust_toolchain": measured_rust_toolchain_version(),
                 "target_triple": "aarch64-apple-darwin",
                 "platform": "macos",
@@ -2536,6 +2592,8 @@ mod tests {
         assert!(
             failures.contains(&"macos: status expected \"passed\", found \"blocked\"".to_string())
         );
+        assert!(failures.contains(&"macos: git_dirty must be a boolean".to_string()));
+        assert!(failures.contains(&"macos: runner_identity must be non-empty".to_string()));
         assert!(failures.contains(&"macos: frames expected >= 300, found 0".to_string()));
         assert!(failures
             .contains(&"macos: validation_error_count must be an unsigned integer".to_string()));

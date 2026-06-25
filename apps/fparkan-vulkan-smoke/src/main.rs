@@ -353,6 +353,8 @@ fn render_smoke_report_json(
     let fields = vec![
         ("schema_version", json_string(SCHEMA_VERSION)),
         ("commit_sha", json_string(&current_git_commit_sha())),
+        ("git_dirty", bool_json(current_git_dirty())),
+        ("runner_identity", json_string(&measured_runner_identity())),
         ("rust_toolchain", json_string(&current_rustc_release())),
         ("target_triple", json_string(&current_rustc_host_triple())),
         ("platform", json_string(actual_platform())),
@@ -460,6 +462,16 @@ fn current_git_commit_sha() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+fn current_git_dirty() -> bool {
+    Command::new("git")
+        .args(["status", "--short"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .is_some_and(|output| !output.trim().is_empty())
+}
+
 fn current_rustc_release() -> String {
     Command::new("rustc")
         .arg("-Vv")
@@ -473,6 +485,21 @@ fn current_rustc_release() -> String {
                 .find_map(|line| line.strip_prefix("release: ").map(ToString::to_string))
         })
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn measured_runner_identity() -> String {
+    if std::env::var_os("GITHUB_ACTIONS").is_some() {
+        let run_id = std::env::var("GITHUB_RUN_ID").unwrap_or_else(|_| "unknown-run".to_string());
+        let job = std::env::var("GITHUB_JOB").unwrap_or_else(|_| "unknown-job".to_string());
+        format!("github-actions/{run_id}/{job}")
+    } else if std::env::var_os("CI").is_some() {
+        let job = std::env::var("CI_JOB_NAME")
+            .or_else(|_| std::env::var("BUILD_ID"))
+            .unwrap_or_else(|_| "generic-ci".to_string());
+        format!("ci/{job}")
+    } else {
+        format!("local/{}", std::env::consts::OS)
+    }
 }
 
 fn current_rustc_host_triple() -> String {
