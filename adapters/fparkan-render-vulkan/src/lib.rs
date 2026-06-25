@@ -976,6 +976,15 @@ struct VulkanSwapchainResources {
     command_buffers: Vec<vk::CommandBuffer>,
 }
 
+struct PartialSwapchainResources {
+    image_views: Vec<vk::ImageView>,
+    render_pass: Option<vk::RenderPass>,
+    pipeline_layout: Option<vk::PipelineLayout>,
+    pipeline: Option<vk::Pipeline>,
+    framebuffers: Vec<vk::Framebuffer>,
+    command_buffers: Vec<vk::CommandBuffer>,
+}
+
 struct VulkanFrameSync {
     image_available: vk::Semaphore,
     render_finished: vk::Semaphore,
@@ -1041,8 +1050,23 @@ impl VulkanSmokeRenderer {
         )
         .map_err(VulkanSmokeRendererError::Swapchain)?;
         let command_pool = create_command_pool(&device)?;
-        let vertex_buffer = Some(create_triangle_vertex_buffer(&instance, &device)?);
-        let index_buffer = Some(create_triangle_index_buffer(&instance, &device)?);
+        let vertex_buffer = match create_triangle_vertex_buffer(&instance, &device) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                // SAFETY: The command pool belongs to this live logical device and is destroyed on setup failure.
+                unsafe { device.device().destroy_command_pool(command_pool, None) };
+                return Err(error);
+            }
+        };
+        let index_buffer = match create_triangle_index_buffer(&instance, &device) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                // SAFETY: The command pool belongs to this live logical device and is destroyed on setup failure.
+                unsafe { device.device().destroy_command_pool(command_pool, None) };
+                destroy_allocated_buffer(&device, &vertex_buffer);
+                return Err(error);
+            }
+        };
         let mut renderer = Self {
             instance: Some(instance),
             validation,
@@ -1051,8 +1075,8 @@ impl VulkanSmokeRenderer {
             swapchain: Some(swapchain),
             command_pool,
             swapchain_resources: None,
-            vertex_buffer,
-            index_buffer,
+            vertex_buffer: Some(vertex_buffer),
+            index_buffer: Some(index_buffer),
             frame_sync: Vec::new(),
             images_in_flight: Vec::new(),
             current_frame: 0,
@@ -1680,19 +1704,24 @@ fn create_host_visible_buffer(
     })?;
     // SAFETY: The buffer belongs to this device and is queried immediately after creation.
     let requirements = unsafe { device.device().get_buffer_memory_requirements(buffer) };
-    let memory_type_index = find_memory_type(
+    let Some(memory_type_index) = find_memory_type(
         instance,
         device.physical_device,
         requirements.memory_type_bits,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    )
-    .ok_or(VulkanSmokeRendererError::MissingMemoryType { context })?;
+    ) else {
+        // SAFETY: The buffer was created above on this logical device and is destroyed on setup failure.
+        unsafe { device.device().destroy_buffer(buffer, None) };
+        return Err(VulkanSmokeRendererError::MissingMemoryType { context });
+    };
     let allocate_info = vk::MemoryAllocateInfo::default()
         .allocation_size(requirements.size)
         .memory_type_index(memory_type_index);
     let memory =
         // SAFETY: Allocation uses a memory type index selected from the physical-device requirements above.
         unsafe { device.device().allocate_memory(&allocate_info, None) }.map_err(|error| {
+            // SAFETY: The buffer was created above on this logical device and is destroyed on setup failure.
+            unsafe { device.device().destroy_buffer(buffer, None) };
             VulkanSmokeRendererError::VulkanOperation {
                 context,
                 result: format!("{error:?}"),
@@ -1700,6 +1729,11 @@ fn create_host_visible_buffer(
         })?;
     // SAFETY: The buffer and allocation belong to the same live logical device.
     unsafe { device.device().bind_buffer_memory(buffer, memory, 0) }.map_err(|error| {
+        // SAFETY: The buffer and allocation belong to this logical device and are destroyed on setup failure.
+        unsafe {
+            device.device().destroy_buffer(buffer, None);
+            device.device().free_memory(memory, None);
+        }
         VulkanSmokeRendererError::VulkanOperation {
             context,
             result: format!("{error:?}"),
@@ -1711,9 +1745,16 @@ fn create_host_visible_buffer(
             .device()
             .map_memory(memory, 0, requirements.size, vk::MemoryMapFlags::empty())
     }
-    .map_err(|error| VulkanSmokeRendererError::VulkanOperation {
-        context,
-        result: format!("{error:?}"),
+    .map_err(|error| {
+        // SAFETY: The buffer and allocation belong to this logical device and are destroyed on setup failure.
+        unsafe {
+            device.device().destroy_buffer(buffer, None);
+            device.device().free_memory(memory, None);
+        }
+        VulkanSmokeRendererError::VulkanOperation {
+            context,
+            result: format!("{error:?}"),
+        }
     })?;
     // SAFETY: The mapped pointer is valid for `bytes.len()` bytes and non-overlapping with the source slice.
     unsafe {
@@ -1746,6 +1787,7 @@ fn find_memory_type(
         })
 }
 
+#[allow(clippy::too_many_lines)]
 fn create_swapchain_resources(
     device: &VulkanLogicalDeviceProbe,
     swapchain: &VulkanSwapchainProbe,
@@ -1764,41 +1806,84 @@ fn create_swapchain_resources(
         context: "vkGetSwapchainImagesKHR",
         result: format!("{error:?}"),
     })?;
-    let image_views = images
-        .iter()
-        .map(|image| create_image_view(device, *image, swapchain.report.plan.format.format))
-        .collect::<Result<Vec<_>, _>>()?;
-    let render_pass = create_render_pass(device, swapchain.report.plan.format.format)?;
-    let pipeline_layout = create_pipeline_layout(device)?;
-    let pipeline = create_graphics_pipeline(
+    let mut partial = PartialSwapchainResources {
+        image_views: Vec::with_capacity(images.len()),
+        render_pass: None,
+        pipeline_layout: None,
+        pipeline: None,
+        framebuffers: Vec::with_capacity(images.len()),
+        command_buffers: Vec::new(),
+    };
+    for image in &images {
+        match create_image_view(device, *image, swapchain.report.plan.format.format) {
+            Ok(image_view) => partial.image_views.push(image_view),
+            Err(error) => {
+                destroy_partial_swapchain_resources(device, command_pool, partial);
+                return Err(error);
+            }
+        }
+    }
+    let render_pass = match create_render_pass(device, swapchain.report.plan.format.format) {
+        Ok(render_pass) => render_pass,
+        Err(error) => {
+            destroy_partial_swapchain_resources(device, command_pool, partial);
+            return Err(error);
+        }
+    };
+    partial.render_pass = Some(render_pass);
+    let pipeline_layout = match create_pipeline_layout(device) {
+        Ok(pipeline_layout) => pipeline_layout,
+        Err(error) => {
+            destroy_partial_swapchain_resources(device, command_pool, partial);
+            return Err(error);
+        }
+    };
+    partial.pipeline_layout = Some(pipeline_layout);
+    let pipeline = match create_graphics_pipeline(
         device,
         render_pass,
         pipeline_layout,
         swapchain.report.plan.extent,
-    )?;
-    let framebuffers = image_views
-        .iter()
-        .map(|image_view| {
-            create_framebuffer(
-                device,
-                render_pass,
-                *image_view,
-                swapchain.report.plan.extent,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let command_buffers = allocate_command_buffers(
+    ) {
+        Ok(pipeline) => pipeline,
+        Err(error) => {
+            destroy_partial_swapchain_resources(device, command_pool, partial);
+            return Err(error);
+        }
+    };
+    partial.pipeline = Some(pipeline);
+    for image_view in &partial.image_views {
+        match create_framebuffer(
+            device,
+            render_pass,
+            *image_view,
+            swapchain.report.plan.extent,
+        ) {
+            Ok(framebuffer) => partial.framebuffers.push(framebuffer),
+            Err(error) => {
+                destroy_partial_swapchain_resources(device, command_pool, partial);
+                return Err(error);
+            }
+        }
+    }
+    partial.command_buffers = match allocate_command_buffers(
         device,
         command_pool,
-        image_views.len().try_into().unwrap_or(u32::MAX),
-    )?;
+        partial.image_views.len().try_into().unwrap_or(u32::MAX),
+    ) {
+        Ok(command_buffers) => command_buffers,
+        Err(error) => {
+            destroy_partial_swapchain_resources(device, command_pool, partial);
+            return Err(error);
+        }
+    };
     Ok(VulkanSwapchainResources {
-        image_views,
+        image_views: partial.image_views,
         render_pass,
         pipeline_layout,
         pipeline,
-        framebuffers,
-        command_buffers,
+        framebuffers: partial.framebuffers,
+        command_buffers: partial.command_buffers,
     })
 }
 
@@ -1878,6 +1963,7 @@ fn extent_component_to_f32(value: u32) -> f32 {
     u16::try_from(value).map_or(f32::from(u16::MAX), f32::from)
 }
 
+#[allow(clippy::too_many_lines)]
 fn create_graphics_pipeline(
     device: &VulkanLogicalDeviceProbe,
     render_pass: vk::RenderPass,
@@ -1886,7 +1972,14 @@ fn create_graphics_pipeline(
 ) -> Result<vk::Pipeline, VulkanSmokeRendererError> {
     let entry_point = c"main";
     let vertex_module = create_shader_module(device, TRIANGLE_VERTEX_SHADER_WORDS)?;
-    let fragment_module = create_shader_module(device, TRIANGLE_FRAGMENT_SHADER_WORDS)?;
+    let fragment_module = match create_shader_module(device, TRIANGLE_FRAGMENT_SHADER_WORDS) {
+        Ok(fragment_module) => fragment_module,
+        Err(error) => {
+            // SAFETY: The vertex shader module was created above on this logical device and is destroyed on setup failure.
+            unsafe { device.device().destroy_shader_module(vertex_module, None) };
+            return Err(error);
+        }
+    };
     let stage_create_infos = [
         vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::VERTEX)
@@ -1967,20 +2060,21 @@ fn create_graphics_pipeline(
         .render_pass(render_pass)
         .subpass(0)];
     // SAFETY: The pipeline creation references live shader modules and stack-owned fixed-function descriptors.
-    let pipeline = unsafe {
+    let pipeline_result = unsafe {
         device
             .device()
             .create_graphics_pipelines(vk::PipelineCache::null(), &create_info, None)
-    }
-    .map_err(|(_, error)| VulkanSmokeRendererError::VulkanOperation {
-        context: "vkCreateGraphicsPipelines",
-        result: format!("{error:?}"),
-    })?[0];
+    };
     // SAFETY: Shader modules are no longer needed after pipeline creation completes.
     unsafe {
         device.device().destroy_shader_module(vertex_module, None);
         device.device().destroy_shader_module(fragment_module, None);
     }
+    let pipeline =
+        pipeline_result.map_err(|(_, error)| VulkanSmokeRendererError::VulkanOperation {
+            context: "vkCreateGraphicsPipelines",
+            result: format!("{error:?}"),
+        })?[0];
     Ok(pipeline)
 }
 
@@ -2051,20 +2145,37 @@ fn create_frame_sync(
                 context: "vkCreateSemaphore(image_available)",
                 result: format!("{error:?}"),
             })?;
-        // SAFETY: The sync objects belong to this live logical device and are destroyed at teardown.
-        let render_finished = unsafe { device.device().create_semaphore(&semaphore_info, None) }
-            .map_err(|error| VulkanSmokeRendererError::VulkanOperation {
-                context: "vkCreateSemaphore(render_finished)",
-                result: format!("{error:?}"),
-            })?;
+        let render_finished =
+            // SAFETY: The sync objects belong to this live logical device and are destroyed at teardown.
+            match unsafe { device.device().create_semaphore(&semaphore_info, None) } {
+                Ok(render_finished) => render_finished,
+                Err(error) => {
+                    destroy_frame_sync_objects(device, &sync);
+                    // SAFETY: The semaphore was created above on this logical device and is destroyed on setup failure.
+                    unsafe { device.device().destroy_semaphore(image_available, None) };
+                    return Err(VulkanSmokeRendererError::VulkanOperation {
+                        context: "vkCreateSemaphore(render_finished)",
+                        result: format!("{error:?}"),
+                    });
+                }
+            };
         let fence =
             // SAFETY: The fence belongs to this live logical device and is destroyed at teardown.
-            unsafe { device.device().create_fence(&fence_info, None) }.map_err(|error| {
-                VulkanSmokeRendererError::VulkanOperation {
+            match unsafe { device.device().create_fence(&fence_info, None) } {
+                Ok(fence) => fence,
+                Err(error) => {
+                    destroy_frame_sync_objects(device, &sync);
+                    // SAFETY: These semaphores were created above on this logical device and are destroyed on setup failure.
+                    unsafe {
+                        device.device().destroy_semaphore(image_available, None);
+                        device.device().destroy_semaphore(render_finished, None);
+                    }
+                    return Err(VulkanSmokeRendererError::VulkanOperation {
                     context: "vkCreateFence",
                     result: format!("{error:?}"),
+                    });
                 }
-            })?;
+            };
         sync.push(VulkanFrameSync {
             image_available,
             render_finished,
@@ -2097,6 +2208,61 @@ fn destroy_swapchain_resources(
         for image_view in resources.image_views {
             device.device().destroy_image_view(image_view, None);
         }
+    }
+}
+
+fn destroy_partial_swapchain_resources(
+    device: &VulkanLogicalDeviceProbe,
+    command_pool: vk::CommandPool,
+    resources: PartialSwapchainResources,
+) {
+    // SAFETY: All handles in this partial resource set were created on this live logical device and are destroyed once.
+    unsafe {
+        if !resources.command_buffers.is_empty() {
+            device
+                .device()
+                .free_command_buffers(command_pool, &resources.command_buffers);
+        }
+        for framebuffer in resources.framebuffers {
+            device.device().destroy_framebuffer(framebuffer, None);
+        }
+        if let Some(pipeline) = resources.pipeline {
+            device.device().destroy_pipeline(pipeline, None);
+        }
+        if let Some(pipeline_layout) = resources.pipeline_layout {
+            device
+                .device()
+                .destroy_pipeline_layout(pipeline_layout, None);
+        }
+        if let Some(render_pass) = resources.render_pass {
+            device.device().destroy_render_pass(render_pass, None);
+        }
+        for image_view in resources.image_views {
+            device.device().destroy_image_view(image_view, None);
+        }
+    }
+}
+
+fn destroy_frame_sync_objects(device: &VulkanLogicalDeviceProbe, sync: &[VulkanFrameSync]) {
+    for frame_sync in sync {
+        // SAFETY: These sync objects belong to this live logical device and are destroyed once during teardown.
+        unsafe {
+            device
+                .device()
+                .destroy_semaphore(frame_sync.image_available, None);
+            device
+                .device()
+                .destroy_semaphore(frame_sync.render_finished, None);
+            device.device().destroy_fence(frame_sync.fence, None);
+        }
+    }
+}
+
+fn destroy_allocated_buffer(device: &VulkanLogicalDeviceProbe, buffer: &VulkanAllocatedBuffer) {
+    // SAFETY: The buffer and allocation belong to this live logical device and are destroyed once during teardown.
+    unsafe {
+        device.device().destroy_buffer(buffer.buffer, None);
+        device.device().free_memory(buffer.memory, None);
     }
 }
 
@@ -2537,11 +2703,16 @@ pub fn create_vulkan_swapchain_probe_for_extent(
         }
     })?;
     // SAFETY: The swapchain was created above and the returned image handles are owned by it.
-    let images = unsafe { loader.get_swapchain_images(swapchain) }.map_err(|error| {
-        VulkanSwapchainProbeError::ImagesFailed {
-            result: format!("{error:?}"),
+    let images = match unsafe { loader.get_swapchain_images(swapchain) } {
+        Ok(images) => images,
+        Err(error) => {
+            // SAFETY: The swapchain was created above on this loader/device pair and is destroyed on setup failure.
+            unsafe { loader.destroy_swapchain(swapchain, None) };
+            return Err(VulkanSwapchainProbeError::ImagesFailed {
+                result: format!("{error:?}"),
+            });
         }
-    })?;
+    };
     Ok(VulkanSwapchainProbe {
         loader,
         swapchain,
