@@ -300,6 +300,27 @@ impl WinitWindow {
             self.apply_event(event);
         }
     }
+
+    /// Applies one native `winit` window event to the cached window descriptor state.
+    pub fn apply_window_event(&mut self, event: &WindowEvent) {
+        match event {
+            WindowEvent::Resized(size) => {
+                self.width = size.width;
+                self.height = size.height;
+                self.minimized = size.width == 0 || size.height == 0;
+            }
+            WindowEvent::Focused(focused) => {
+                self.focused = *focused;
+            }
+            WindowEvent::Occluded(occluded) => {
+                self.occluded = *occluded;
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.scale = *scale_factor;
+            }
+            _ => {}
+        }
+    }
 }
 
 impl WindowPort for WinitWindow {
@@ -524,6 +545,28 @@ mod tests {
             }
         );
         assert_eq!(window.dpi_scale(), 2.0);
+        assert!(!window.has_focus());
+        assert!(window.is_minimized());
+        assert!(window.is_occluded());
+    }
+
+    #[test]
+    fn window_descriptor_applies_native_window_events() {
+        let mut window = WinitWindow::synthetic(640, 360);
+
+        window.apply_window_event(&WindowEvent::Resized(winit::dpi::PhysicalSize::new(
+            0u32, 720u32,
+        )));
+        window.apply_window_event(&WindowEvent::Focused(false));
+        window.apply_window_event(&WindowEvent::Occluded(true));
+
+        assert_eq!(
+            window.drawable_size(),
+            PhysicalSize {
+                width: 0,
+                height: 720,
+            }
+        );
         assert!(!window.has_focus());
         assert!(window.is_minimized());
         assert!(window.is_occluded());
