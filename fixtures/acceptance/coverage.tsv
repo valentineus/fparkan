@@ -102,6 +102,8 @@ S1-NRES-022	covered	cargo test -p fparkan-nres --offline canonical_compact_round
 S1-NRES-023	covered	cargo test -p fparkan-nres --offline editor_payload_update_rewrites_offsets_and_size
 S1-NRES-024	covered	cargo test -p fparkan-nres --offline editor_rename_rebuilds_search_mapping
 S1-NRES-025	covered	cargo test -p fparkan-nres --offline editor_rejects_invalid_authoring_names
+S1-NRES-026	covered	cargo test -p fparkan-nres --offline strict_rejects_unsorted_lookup_table
+S1-LIMIT-001	partial	cargo test -p fparkan-nres --offline rejects_directory_size_before_allocation decode_rejects_entry_count_above_limit decode_rejects_preserved_bytes_above_limit; explicit max_input_bytes boundary test is still missing
 S1-NRES-PROP-001	covered	cargo test -p fparkan-nres --offline generated_archives_preserve_lossless_and_canonical_semantics
 S1-NRES-PROP-002	covered	cargo test -p fparkan-nres --offline generated_editor_updates_roundtrip
 S1-NRES-FUZZ-001	covered	cargo test -p fparkan-nres --offline arbitrary_small_inputs_do_not_panic_or_overallocate
@@ -114,6 +116,8 @@ S1-PATH-006	covered	cargo test -p fparkan-path --offline rejects_absolute_drive_
 S1-PATH-007	covered	cargo test -p fparkan-path --offline join_under_keeps_normalized_path_below_root
 S1-PATH-008	covered	cargo test -p fparkan-path --offline original_separators_and_raw_bytes_are_preserved
 S1-PATH-009	covered	cargo test -p fparkan-path --offline accepts_non_utf8_legacy_bytes
+S1-PATH-010	covered	cargo test -p fparkan-vfs --offline directory_vfs_resolves_non_utf8_host_entries_by_raw_bytes
+S1-PATH-011	covered	cargo test -p fparkan-path -p fparkan-vfs -p fparkan-resource --offline lossy_display_does_not_affect_identity_or_ordering overlay_vfs_keeps_lossy_equivalent_entries_distinct lossy_equivalent_archive_paths_remain_distinct
 S1-VFS-005	covered	cargo test -p fparkan-vfs --offline memory_vfs_list_prefix_is_boundary_safe
 S1-RSLI-001	covered	cargo test -p fparkan-rsli --offline parses_minimal_empty_library
 S1-RSLI-002	covered	cargo test -p fparkan-rsli --offline rejects_invalid_header_fields
@@ -138,16 +142,25 @@ S1-RSLI-020	covered	cargo test -p fparkan-rsli --offline rejects_registered_quir
 S1-RSLI-021	covered	cargo test -p fparkan-rsli --offline named_deflate_eof_plus_one_quirk_accepts_only_approved_entry
 S1-RSLI-022	covered	cargo test -p fparkan-rsli --offline unknown_header_bytes_are_lossless
 S1-RSLI-023	covered	cargo test -p fparkan-rsli --offline no_op_lossless_roundtrip_preserves_bytes
+S1-RSLI-024	covered	cargo test -p fparkan-rsli --offline strict_rejects_unsorted_presorted_mapping
+S1-RSLI-025	covered	cargo test -p fparkan-rsli --offline editor_can_mutate_names_and_payloads set_method_rejects_unknown_authoring_method
+S1-LIMIT-002	covered	cargo test -p fparkan-rsli --offline decode_rejects_entry_count_above_limit load_rejects_unpacked_size_above_limit_before_allocation
 S1-RSLI-PROP-001	covered	cargo test -p fparkan-rsli --offline generated_supported_methods_decode_expected_bytes
 S1-RSLI-FUZZ-001	covered	cargo test -p fparkan-rsli --offline arbitrary_small_inputs_do_not_panic
 S1-RES-001	covered	cargo test -p fparkan-resource --offline cached_repository_reads_synthetic_nres
 S1-RES-002	covered	cargo test -p fparkan-resource --offline entry_handles_are_archive_qualified
 S1-RES-003	covered	cargo test -p fparkan-resource --offline archive_cache_and_decoded_payload_cache_evict_independently
 S1-RES-004	covered	cargo test -p fparkan-resource --offline entry_read_error_carries_archive_path_and_entry_name
+S1-RES-005	partial	cargo test -p fparkan-resource --offline archive_cache_and_decoded_payload_cache_evict_independently; explicit max_archive_bytes eviction test is still missing
+S1-RES-006	covered	cargo test -p fparkan-resource --offline archive_cache_eviction_makes_old_handles_stale
+S1-RES-007	covered	cargo test -p fparkan-resource --offline lossy_equivalent_archive_paths_remain_distinct
+S1-DIAG-001	partial	cargo test -p fparkan-inspection --offline archive_diagnostic_preserves_source_path; entry/span coverage is still missing
 S1-VFS-001	covered	cargo test -p fparkan-vfs --offline memory_vfs_uses_exact_lookup
 S1-VFS-002	covered	cargo test -p fparkan-vfs --offline overlay_vfs_uses_first_matching_layer
 S1-VFS-003	covered	cargo test -p fparkan-vfs --offline directory_vfs_resolves_ascii_casefolded_segments
 S1-VFS-004	covered	cargo test -p fparkan-vfs --offline casefold_selector_reports_ambiguous_segments
+S1-LICENSED-001	blocked	cargo test -p fparkan-resource --offline licensed_corpora_repository_reads_nres_and_rsli (ignored, requires licensed corpus; gate covers Part 1 and Part 2)
+S1-LICENSED-002	blocked	cargo test -p fparkan-resource --offline licensed_corpora_repository_reads_nres_and_rsli (ignored, requires licensed corpus; gate covers Part 1 and Part 2)
 L2-P1-UNIT-001	covered	cargo test -p fparkan-prototype --offline licensed_corpora_unit_dat_parse_counts
 L2-P2-UNIT-001	covered	cargo test -p fparkan-prototype --offline licensed_corpora_unit_dat_parse_counts
 L2-P1-REG-001	covered	cargo test -p fparkan-prototype --offline licensed_corpora_registry_payloads_are_record_aligned
