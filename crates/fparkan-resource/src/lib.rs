@@ -20,7 +20,7 @@
 )]
 //! Resource identity and repository ports.
 
-use fparkan_binary::Sha256Digest;
+use fparkan_binary::{sha256, Sha256Digest};
 use fparkan_path::{normalize_relative, NormalizedPath, PathPolicy, ResourceName};
 use fparkan_vfs::{Vfs, VfsError};
 use std::collections::BTreeMap;
@@ -222,6 +222,30 @@ pub struct CachedResourceRepository {
     state: Mutex<RepositoryState>,
 }
 
+/// Repository-wide archive and payload cache limits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RepositoryLimits {
+    /// Maximum number of decoded archives retained in memory.
+    pub max_open_archives: usize,
+    /// Maximum total retained source archive bytes.
+    pub max_archive_bytes: usize,
+    /// Maximum cached decoded payload entries.
+    pub max_decoded_payload_entries: usize,
+    /// Maximum cached decoded payload bytes.
+    pub max_decoded_payload_bytes: usize,
+}
+
+impl Default for RepositoryLimits {
+    fn default() -> Self {
+        Self {
+            max_open_archives: 32,
+            max_archive_bytes: 256 * 1024 * 1024,
+            max_decoded_payload_entries: 64,
+            max_decoded_payload_bytes: 64 * 1024 * 1024,
+        }
+    }
+}
+
 /// Decoded payload cache limits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PayloadCacheLimits {
@@ -233,17 +257,23 @@ pub struct PayloadCacheLimits {
 
 impl Default for PayloadCacheLimits {
     fn default() -> Self {
+        let limits = RepositoryLimits::default();
         Self {
-            max_entries: 64,
-            max_bytes: 64 * 1024 * 1024,
+            max_entries: limits.max_decoded_payload_entries,
+            max_bytes: limits.max_decoded_payload_bytes,
         }
     }
 }
 
 #[derive(Default)]
 struct RepositoryState {
-    paths: BTreeMap<String, ArchiveId>,
+    paths: BTreeMap<Vec<u8>, ArchiveId>,
     archives: Vec<ArchiveSlot>,
+    max_open_archives: usize,
+    max_archive_bytes: usize,
+    current_open_archives: usize,
+    current_archive_bytes: usize,
+    archive_access_generation: u64,
     payload_cache: DecodedPayloadCache,
 }
 
@@ -252,7 +282,9 @@ struct ArchiveSlot {
     fingerprint: Sha256Digest,
     generation: u64,
     kind: ArchiveKind,
-    document: Arc<ArchiveDocument>,
+    document: Option<Arc<ArchiveDocument>>,
+    archive_bytes: usize,
+    last_access: u64,
 }
 
 enum ArchiveDocument {
@@ -284,31 +316,41 @@ impl CachedResourceRepository {
     /// Creates a cached repository.
     #[must_use]
     pub fn new(vfs: Arc<dyn Vfs>) -> Self {
-        Self::with_payload_cache_limits(vfs, PayloadCacheLimits::default())
+        Self::with_limits(vfs, RepositoryLimits::default())
+    }
+
+    /// Creates a cached repository with explicit archive and payload budgets.
+    #[must_use]
+    pub fn with_limits(vfs: Arc<dyn Vfs>, limits: RepositoryLimits) -> Self {
+        Self {
+            vfs,
+            state: Mutex::new(RepositoryState {
+                max_open_archives: limits.max_open_archives,
+                max_archive_bytes: limits.max_archive_bytes,
+                payload_cache: DecodedPayloadCache::new(PayloadCacheLimits {
+                    max_entries: limits.max_decoded_payload_entries,
+                    max_bytes: limits.max_decoded_payload_bytes,
+                }),
+                ..RepositoryState::default()
+            }),
+        }
     }
 
     /// Creates a cached repository with a decoded payload entry budget.
     #[must_use]
     pub fn with_payload_cache_budget(vfs: Arc<dyn Vfs>, max_payload_entries: usize) -> Self {
-        Self::with_payload_cache_limits(
-            vfs,
-            PayloadCacheLimits {
-                max_entries: max_payload_entries,
-                ..PayloadCacheLimits::default()
-            },
-        )
+        let mut limits = RepositoryLimits::default();
+        limits.max_decoded_payload_entries = max_payload_entries;
+        Self::with_limits(vfs, limits)
     }
 
     /// Creates a cached repository with decoded payload entry and byte budgets.
     #[must_use]
     pub fn with_payload_cache_limits(vfs: Arc<dyn Vfs>, limits: PayloadCacheLimits) -> Self {
-        Self {
-            vfs,
-            state: Mutex::new(RepositoryState {
-                payload_cache: DecodedPayloadCache::new(limits),
-                ..RepositoryState::default()
-            }),
-        }
+        let mut repository_limits = RepositoryLimits::default();
+        repository_limits.max_decoded_payload_entries = limits.max_entries;
+        repository_limits.max_decoded_payload_bytes = limits.max_bytes;
+        Self::with_limits(vfs, repository_limits)
     }
 
     /// Returns the archive kind for an opened archive.
@@ -334,29 +376,38 @@ impl CachedResourceRepository {
 
 impl ResourceRepository for CachedResourceRepository {
     fn open_archive(&self, path: &NormalizedPath) -> Result<ArchiveId, ResourceError> {
-        let metadata = self.vfs.metadata(path).map_err(resource_error_from_vfs)?;
-        let fingerprint = metadata.fingerprint;
-        if let Some(id) = self.cached_id(path, fingerprint)? {
-            return Ok(id);
-        }
-
         let bytes = self.vfs.read(path).map_err(resource_error_from_vfs)?;
+        let fingerprint = sha256(&bytes);
         let mut slot = decode_archive(path.clone(), bytes, fingerprint)?;
         let mut state = self.state.lock().map_err(|_| ResourceError::Poisoned)?;
-        if let Some(id) = state.paths.get(path.as_str()).copied() {
-            if state.archive(id)?.fingerprint == fingerprint {
+        let key = path.identity_bytes().to_vec();
+        if let Some(id) = state.paths.get(&key).copied() {
+            let current = state.archive(id)?;
+            if current.fingerprint == fingerprint && current.document.is_some() {
+                state.touch_archive(id)?;
                 return Ok(id);
             }
-            slot.generation = state.archive(id)?.generation.saturating_add(1);
+            let current_generation = current.generation;
+            let current_fingerprint = current.fingerprint;
+            if current_fingerprint != fingerprint {
+                slot.generation = current_generation.saturating_add(1);
+                state.payload_cache.remove_archive(id);
+            } else {
+                slot.generation = current_generation;
+            }
+            state.unload_archive(id)?;
             *state.archive_mut(id)? = slot;
-            state.payload_cache.remove_archive(id);
+            state.load_archive(id)?;
+            state.evict_archives(id)?;
             return Ok(id);
         }
         let id = ArchiveId(u64::try_from(state.archives.len()).map_err(|_| {
             ResourceError::Format("too many open archives for handle space".to_string())
         })?);
-        state.paths.insert(path.as_str().to_string(), id);
+        state.paths.insert(key, id);
         state.archives.push(slot);
+        state.load_archive(id)?;
+        state.evict_archives(id)?;
         Ok(id)
     }
 
@@ -367,7 +418,8 @@ impl ResourceRepository for CachedResourceRepository {
     ) -> Result<Option<EntryHandle>, ResourceError> {
         let state = self.state.lock().map_err(|_| ResourceError::Poisoned)?;
         let slot = state.archive(archive)?;
-        let local = match slot.document.as_ref() {
+        let document = slot.document.as_ref().ok_or(ResourceError::InvalidHandle)?;
+        let local = match document.as_ref() {
             ArchiveDocument::Nres(document) => document.find_bytes(&name.0).map(|id| id.0),
             ArchiveDocument::Rsli(document) => document.find_bytes(&name.0).map(|id| id.0),
         };
@@ -381,7 +433,8 @@ impl ResourceRepository for CachedResourceRepository {
     fn first_entry(&self, archive: ArchiveId) -> Result<Option<EntryHandle>, ResourceError> {
         let state = self.state.lock().map_err(|_| ResourceError::Poisoned)?;
         let slot = state.archive(archive)?;
-        let local = match slot.document.as_ref() {
+        let document = slot.document.as_ref().ok_or(ResourceError::InvalidHandle)?;
+        let local = match document.as_ref() {
             ArchiveDocument::Nres(document) => document.entries().first().map(|entry| entry.id().0),
             ArchiveDocument::Rsli(document) => document.entry(fparkan_rsli::EntryId(0)).map(|_| 0),
         };
@@ -421,7 +474,8 @@ impl ResourceRepository for CachedResourceRepository {
     fn entry_info(&self, entry: EntryHandle) -> Result<ResourceEntryInfo, ResourceError> {
         let state = self.state.lock().map_err(|_| ResourceError::Poisoned)?;
         let slot = state.entry_archive(entry)?;
-        match slot.document.as_ref() {
+        let document = slot.document.as_ref().ok_or(ResourceError::InvalidHandle)?;
+        match document.as_ref() {
             ArchiveDocument::Nres(document) => {
                 let local =
                     usize::try_from(entry.local).map_err(|_| ResourceError::InvalidHandle)?;
@@ -448,7 +502,7 @@ impl ResourceRepository for CachedResourceRepository {
                 Ok(ResourceEntryInfo {
                     key: ResourceKey {
                         archive: slot.path.clone(),
-                        name: ResourceName(meta.name_raw.to_vec()),
+                        name: ResourceName(c_name_bytes(&meta.name_raw).to_vec()),
                         type_id: None,
                     },
                     attr1: u32::try_from(meta.flags).unwrap_or_default(),
@@ -456,24 +510,6 @@ impl ResourceRepository for CachedResourceRepository {
                     attr3: 0,
                 })
             }
-        }
-    }
-}
-
-impl CachedResourceRepository {
-    fn cached_id(
-        &self,
-        path: &NormalizedPath,
-        fingerprint: Sha256Digest,
-    ) -> Result<Option<ArchiveId>, ResourceError> {
-        let state = self.state.lock().map_err(|_| ResourceError::Poisoned)?;
-        let Some(id) = state.paths.get(path.as_str()).copied() else {
-            return Ok(None);
-        };
-        if state.archive(id)?.fingerprint == fingerprint {
-            Ok(Some(id))
-        } else {
-            Ok(None)
         }
     }
 }
@@ -568,16 +604,77 @@ impl RepositoryState {
 
     fn payload_decode_task(&self, entry: EntryHandle) -> Result<PayloadDecodeTask, ResourceError> {
         let slot = self.entry_archive(entry)?;
+        let document = slot.document.as_ref().ok_or(ResourceError::InvalidHandle)?;
         Ok(PayloadDecodeTask {
-            document: Arc::clone(&slot.document),
+            document: Arc::clone(document),
             key: slot.entry_key(entry.local)?,
         })
+    }
+
+    fn touch_archive(&mut self, id: ArchiveId) -> Result<(), ResourceError> {
+        self.archive_access_generation = self.archive_access_generation.saturating_add(1);
+        let access = self.archive_access_generation;
+        self.archive_mut(id)?.last_access = access;
+        Ok(())
+    }
+
+    fn load_archive(&mut self, id: ArchiveId) -> Result<(), ResourceError> {
+        let archive_bytes = self.archive(id)?.archive_bytes;
+        if self.archive(id)?.document.is_none() {
+            return Err(ResourceError::InvalidHandle);
+        }
+        self.current_open_archives = self.current_open_archives.saturating_add(1);
+        self.current_archive_bytes = self.current_archive_bytes.saturating_add(archive_bytes);
+        self.touch_archive(id)
+    }
+
+    fn unload_archive(&mut self, id: ArchiveId) -> Result<(), ResourceError> {
+        let (was_loaded, archive_bytes) = {
+            let slot = self.archive(id)?;
+            (slot.document.is_some(), slot.archive_bytes)
+        };
+        if was_loaded {
+            self.current_open_archives = self.current_open_archives.saturating_sub(1);
+            self.current_archive_bytes = self.current_archive_bytes.saturating_sub(archive_bytes);
+            self.payload_cache.remove_archive(id);
+            let slot = self.archive_mut(id)?;
+            slot.document = None;
+            slot.archive_bytes = 0;
+            slot.generation = slot.generation.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    fn evict_archives(&mut self, protected: ArchiveId) -> Result<(), ResourceError> {
+        while self.current_open_archives > self.max_open_archives
+            || self.current_archive_bytes > self.max_archive_bytes
+        {
+            let Some(victim) = self
+                .archives
+                .iter()
+                .enumerate()
+                .filter_map(|(index, slot)| {
+                    let id = ArchiveId(u64::try_from(index).ok()?);
+                    if id == protected || slot.document.is_none() {
+                        return None;
+                    }
+                    Some((id, slot.last_access))
+                })
+                .min_by_key(|(_, access)| *access)
+                .map(|(id, _)| id)
+            else {
+                break;
+            };
+            self.unload_archive(victim)?;
+        }
+        Ok(())
     }
 }
 
 impl ArchiveSlot {
     fn entry_key(&self, local: u32) -> Result<ResourceKey, ResourceError> {
-        match self.document.as_ref() {
+        let document = self.document.as_ref().ok_or(ResourceError::InvalidHandle)?;
+        match document.as_ref() {
             ArchiveDocument::Nres(document) => {
                 let local = usize::try_from(local).map_err(|_| ResourceError::InvalidHandle)?;
                 let entry = document
@@ -623,6 +720,7 @@ fn decode_archive(
     bytes: Arc<[u8]>,
     fingerprint: Sha256Digest,
 ) -> Result<ArchiveSlot, ResourceError> {
+    let archive_bytes = bytes.len();
     if bytes.starts_with(b"NRes") {
         let document = fparkan_nres::decode(bytes, fparkan_nres::ReadProfile::Compatible)
             .map_err(|err| ResourceError::Format(err.to_string()))?;
@@ -631,7 +729,9 @@ fn decode_archive(
             fingerprint,
             generation: 0,
             kind: ArchiveKind::Nres,
-            document: Arc::new(ArchiveDocument::Nres(document)),
+            archive_bytes,
+            last_access: 0,
+            document: Some(Arc::new(ArchiveDocument::Nres(document))),
         });
     }
     if bytes.get(0..4) == Some(b"NL\0\x01") {
@@ -642,7 +742,9 @@ fn decode_archive(
             fingerprint,
             generation: 0,
             kind: ArchiveKind::Rsli,
-            document: Arc::new(ArchiveDocument::Rsli(document)),
+            archive_bytes,
+            last_access: 0,
+            document: Some(Arc::new(ArchiveDocument::Rsli(document))),
         });
     }
     Err(ResourceError::Format(
@@ -780,7 +882,7 @@ mod tests {
         let state = repo.state.lock().expect("state");
         assert_eq!(state.archives.len(), 1);
         assert_eq!(state.payload_cache.entries.len(), 1);
-        assert_eq!(state.paths.get(path.as_str()).copied(), Some(archive));
+        assert_eq!(state.paths.get(path.identity_bytes()).copied(), Some(archive));
         drop(state);
 
         assert_eq!(repo.open_archive(&path).expect("cached archive"), archive);
@@ -865,7 +967,7 @@ mod tests {
     fn archive_cache_invalidates_when_vfs_bytes_change() {
         let root = temp_dir("archive-invalidate");
         let path = archive_path(b"cache/test.lib").expect("path");
-        let host_path = root.join(path.as_str());
+        let host_path = root.join(path.as_path());
         std::fs::create_dir_all(host_path.parent().expect("parent")).expect("cache dir");
         std::fs::write(&host_path, build_nres(&[("a.bin", b"before".as_slice())]))
             .expect("initial archive");
@@ -927,6 +1029,90 @@ mod tests {
     }
 
     #[test]
+    fn lossy_equivalent_archive_paths_remain_distinct() {
+        let first_path = archive_path(b"DATA/\xFF.lib").expect("first path");
+        let second_path = archive_path(b"DATA/\xFE.lib").expect("second path");
+        let mut vfs = MemoryVfs::default();
+        vfs.insert(
+            first_path.clone(),
+            Arc::from(build_nres(&[("same.bin", b"first".as_slice())]).into_boxed_slice()),
+        );
+        vfs.insert(
+            second_path.clone(),
+            Arc::from(build_nres(&[("same.bin", b"second".as_slice())]).into_boxed_slice()),
+        );
+        let repo = CachedResourceRepository::new(Arc::new(vfs));
+
+        let first_archive = repo.open_archive(&first_path).expect("first archive");
+        let second_archive = repo.open_archive(&second_path).expect("second archive");
+
+        assert_ne!(first_archive, second_archive);
+        assert_eq!(
+            repo.read(
+                repo.find(first_archive, &resource_name(b"same.bin"))
+                    .expect("find first")
+                    .expect("first handle")
+            )
+            .expect("read first")
+            .as_slice(),
+            b"first"
+        );
+        assert_eq!(
+            repo.read(
+                repo.find(second_archive, &resource_name(b"same.bin"))
+                    .expect("find second")
+                    .expect("second handle")
+            )
+            .expect("read second")
+            .as_slice(),
+            b"second"
+        );
+    }
+
+    #[test]
+    fn archive_cache_eviction_makes_old_handles_stale() {
+        let first_path = archive_path(b"cache/first.lib").expect("first path");
+        let second_path = archive_path(b"cache/second.lib").expect("second path");
+        let mut vfs = MemoryVfs::default();
+        vfs.insert(
+            first_path.clone(),
+            Arc::from(build_nres(&[("a.bin", b"first".as_slice())]).into_boxed_slice()),
+        );
+        vfs.insert(
+            second_path.clone(),
+            Arc::from(build_nres(&[("b.bin", b"second".as_slice())]).into_boxed_slice()),
+        );
+        let repo = CachedResourceRepository::with_limits(
+            Arc::new(vfs),
+            RepositoryLimits {
+                max_open_archives: 1,
+                max_archive_bytes: usize::MAX,
+                max_decoded_payload_entries: 64,
+                max_decoded_payload_bytes: 64 * 1024 * 1024,
+            },
+        );
+
+        let first_archive = repo.open_archive(&first_path).expect("open first");
+        let first_handle = repo
+            .find(first_archive, &resource_name(b"a.bin"))
+            .expect("find first")
+            .expect("first handle");
+        assert_eq!(repo.read(first_handle).expect("read first").as_slice(), b"first");
+
+        let _second_archive = repo.open_archive(&second_path).expect("open second");
+        assert!(matches!(repo.read(first_handle), Err(ResourceError::StaleHandle)));
+
+        let reopened = repo.open_archive(&first_path).expect("reopen first");
+        let refreshed = repo
+            .find(reopened, &resource_name(b"a.bin"))
+            .expect("find refreshed")
+            .expect("refreshed handle");
+        assert_eq!(reopened, first_archive);
+        assert_ne!(refreshed, first_handle);
+        assert_eq!(repo.read(refreshed).expect("read refreshed").as_slice(), b"first");
+    }
+
+    #[test]
     fn resource_error_display_is_actionable() {
         let path = archive_path(b"bad/rsli.lib").expect("path");
         let err = ResourceError::EntryRead {
@@ -974,7 +1160,7 @@ mod tests {
 
         let material_path = archive_path(b"Material.lib").map_err(|err| err.to_string())?;
         let material_bytes =
-            std::fs::read(root.join(material_path.as_str())).map_err(|err| err.to_string())?;
+            std::fs::read(root.join(material_path.as_path())).map_err(|err| err.to_string())?;
         let material_doc = fparkan_nres::decode(
             Arc::from(material_bytes.clone().into_boxed_slice()),
             fparkan_nres::ReadProfile::Compatible,
@@ -1008,7 +1194,7 @@ mod tests {
 
         let font_path = archive_path(b"gamefont.rlb").map_err(|err| err.to_string())?;
         let font_bytes =
-            std::fs::read(root.join(font_path.as_str())).map_err(|err| err.to_string())?;
+            std::fs::read(root.join(font_path.as_path())).map_err(|err| err.to_string())?;
         let font_doc = fparkan_rsli::decode(
             Arc::from(font_bytes.into_boxed_slice()),
             fparkan_rsli::ReadProfile::Compatible,

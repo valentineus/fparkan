@@ -25,12 +25,13 @@ use fparkan_path::{ascii_lookup_key, join_under, NormalizedPath};
 use std::collections::BTreeMap;
 use std::fs;
 #[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::sync::Arc;
 
 /// VFS metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -105,7 +106,6 @@ pub trait Vfs: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct DirectoryVfs {
     root: PathBuf,
-    fingerprint_cache: Arc<Mutex<BTreeMap<PathBuf, CachedHostFingerprint>>>,
 }
 
 impl DirectoryVfs {
@@ -114,27 +114,18 @@ impl DirectoryVfs {
     pub fn new(root: impl AsRef<Path>) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
-            fingerprint_cache: Arc::default(),
         }
     }
 
     fn host_path(&self, path: &NormalizedPath) -> Result<PathBuf, VfsError> {
         join_under(&self.root, path).map_err(|_| VfsError::Path)?;
-        resolve_casefolded(&self.root, path.as_str())
+        resolve_casefolded(&self.root, path)
     }
 
     fn metadata_from_host_file(&self, path: &Path) -> Result<VfsMetadata, VfsError> {
         let metadata = fs::symlink_metadata(path).map_err(VfsError::Io)?;
-        metadata_from_host_file_with_cache(path, &metadata, &self.fingerprint_cache)
+        metadata_from_host_file(path, &metadata)
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CachedHostFingerprint {
-    len: u64,
-    modified: Option<SystemTime>,
-    identity: Option<u64>,
-    fingerprint: Sha256Digest,
 }
 
 impl Vfs for DirectoryVfs {
@@ -171,21 +162,60 @@ impl Vfs for DirectoryVfs {
             let metadata = fs::symlink_metadata(&base).map_err(VfsError::Io)?;
             entries.push(VfsEntry {
                 path: prefix.clone(),
-                metadata: metadata_from_host_file_with_cache(
-                    &base,
-                    &metadata,
-                    &self.fingerprint_cache,
-                )?,
+                metadata: metadata_from_host_file(&base, &metadata)?,
             });
             return Ok(entries);
         }
-        list_recursive(&self.root, &base, &self.fingerprint_cache, &mut entries)?;
-        entries.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
+        list_recursive(&self.root, &base, &mut entries)?;
+        entries.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
         Ok(entries)
     }
 }
 
-fn resolve_casefolded(root: &Path, normalized: &str) -> Result<PathBuf, VfsError> {
+fn resolve_casefolded(root: &Path, normalized: &NormalizedPath) -> Result<PathBuf, VfsError> {
+    #[cfg(unix)]
+    {
+        return resolve_casefolded_unix(root, normalized);
+    }
+
+    #[cfg(not(unix))]
+    {
+        resolve_casefolded_text(root, normalized.display_lossy())
+    }
+}
+
+#[cfg(unix)]
+fn resolve_casefolded_unix(root: &Path, normalized: &NormalizedPath) -> Result<PathBuf, VfsError> {
+    let mut current = root.to_path_buf();
+    for segment in normalized.as_bytes().split(|byte| *byte == b'/') {
+        current = resolve_casefolded_segment(&current, segment, normalized)?;
+    }
+    Ok(current)
+}
+
+#[cfg(unix)]
+fn resolve_casefolded_segment(
+    dir: &Path,
+    segment: &[u8],
+    normalized: &NormalizedPath,
+) -> Result<PathBuf, VfsError> {
+    let read_dir = fs::read_dir(dir).map_err(VfsError::Io)?;
+    let mut matches = Vec::new();
+    for entry in read_dir {
+        let entry = entry.map_err(VfsError::Io)?;
+        let name = entry.file_name();
+        if name.as_bytes().eq_ignore_ascii_case(segment) {
+            if entry.file_type().map_err(VfsError::Io)?.is_symlink() {
+                return Err(VfsError::Path);
+            }
+            matches.push(entry.path());
+        }
+    }
+    select_casefolded_match(normalized.display_lossy(), dir, segment, matches)
+}
+
+#[cfg(not(unix))]
+fn resolve_casefolded_text(root: &Path, normalized: &str) -> Result<PathBuf, VfsError> {
     let mut current = root.to_path_buf();
     for segment in normalized.split('/') {
         let read_dir = fs::read_dir(&current).map_err(VfsError::Io)?;
@@ -211,10 +241,11 @@ fn resolve_casefolded(root: &Path, normalized: &str) -> Result<PathBuf, VfsError
 fn select_casefolded_match(
     normalized: &str,
     current: &Path,
-    segment: &str,
+    segment: impl AsRef<[u8]>,
     mut matches: Vec<PathBuf>,
 ) -> Result<PathBuf, VfsError> {
     matches.sort();
+    let segment = String::from_utf8_lossy(segment.as_ref());
     match matches.len() {
         0 => Err(VfsError::NotFound(normalized.to_string())),
         1 => Ok(matches.remove(0)),
@@ -229,7 +260,6 @@ fn select_casefolded_match(
 fn list_recursive(
     root: &Path,
     dir: &Path,
-    fingerprint_cache: &Mutex<BTreeMap<PathBuf, CachedHostFingerprint>>,
     out: &mut Vec<VfsEntry>,
 ) -> Result<(), VfsError> {
     let read_dir = fs::read_dir(dir).map_err(VfsError::Io)?;
@@ -245,68 +275,40 @@ fn list_recursive(
             return Err(VfsError::Path);
         }
         if metadata.is_dir() {
-            list_recursive(root, &child, fingerprint_cache, out)?;
+            list_recursive(root, &child, out)?;
             continue;
         }
         if !metadata.is_file() {
             continue;
         }
         let rel = child.strip_prefix(root).map_err(|_| VfsError::Path)?;
-        let rel_text = rel.to_str().ok_or(VfsError::Path)?;
+        #[cfg(unix)]
+        let rel_bytes = rel.as_os_str().as_bytes();
+        #[cfg(not(unix))]
+        let rel_bytes = rel.to_str().ok_or(VfsError::Path)?.as_bytes();
         let path = fparkan_path::normalize_relative(
-            rel_text.as_bytes(),
+            rel_bytes,
             fparkan_path::PathPolicy::HostCompatible,
         )
         .map_err(|_| VfsError::Path)?;
         out.push(VfsEntry {
             path,
-            metadata: metadata_from_host_file_with_cache(&child, &metadata, fingerprint_cache)?,
+            metadata: metadata_from_host_file(&child, &metadata)?,
         });
     }
     Ok(())
 }
 
-fn metadata_from_host_file_with_cache(
+fn metadata_from_host_file(
     path: &Path,
     metadata: &fs::Metadata,
-    fingerprint_cache: &Mutex<BTreeMap<PathBuf, CachedHostFingerprint>>,
 ) -> Result<VfsMetadata, VfsError> {
     if !metadata.is_file() {
         return Err(VfsError::Path);
     }
     let len = metadata.len();
-    let modified = metadata.modified().ok();
-    if let Some(cached) = fingerprint_cache
-        .lock()
-        .map_err(|_| VfsError::Path)?
-        .get(path)
-        .cloned()
-        .filter(|cached| {
-            cached.len == len
-                && cached.modified == modified
-                && cached.identity == file_identity(metadata)
-        })
-    {
-        return Ok(VfsMetadata {
-            len,
-            fingerprint: cached.fingerprint,
-        });
-    }
-
     let bytes = fs::read(path).map_err(VfsError::Io)?;
     let fingerprint = sha256(&bytes);
-    fingerprint_cache
-        .lock()
-        .map_err(|_| VfsError::Path)?
-        .insert(
-            path.to_path_buf(),
-            CachedHostFingerprint {
-                len,
-                modified,
-                identity: file_identity(metadata),
-                fingerprint,
-            },
-        );
     Ok(VfsMetadata { len, fingerprint })
 }
 
@@ -344,11 +346,11 @@ impl MemoryVfs {
         let matches = self
             .lookup
             .get(&key)
-            .ok_or_else(|| VfsError::NotFound(path.as_str().to_string()))?;
+            .ok_or_else(|| VfsError::NotFound(path.display_lossy().to_string()))?;
         match matches.as_slice() {
             [single] => Ok(single.as_slice()),
-            [] => Err(VfsError::NotFound(path.as_str().to_string())),
-            _ => Err(VfsError::Ambiguous(path.as_str().to_string())),
+            [] => Err(VfsError::NotFound(path.display_lossy().to_string())),
+            _ => Err(VfsError::Ambiguous(path.display_lossy().to_string())),
         }
     }
 }
@@ -380,7 +382,7 @@ impl Vfs for MemoryVfs {
         let bytes = self
             .files
             .get(resolved)
-            .ok_or_else(|| VfsError::NotFound(path.as_str().to_string()))?;
+            .ok_or_else(|| VfsError::NotFound(path.display_lossy().to_string()))?;
         Ok(VfsMetadata {
             len: bytes.len() as u64,
             fingerprint: sha256(bytes),
@@ -392,7 +394,7 @@ impl Vfs for MemoryVfs {
         self.files
             .get(resolved)
             .cloned()
-            .ok_or_else(|| VfsError::NotFound(path.as_str().to_string()))
+            .ok_or_else(|| VfsError::NotFound(path.display_lossy().to_string()))
     }
 
     fn list(&self, prefix: &NormalizedPath) -> Result<Vec<VfsEntry>, VfsError> {
@@ -476,7 +478,7 @@ impl Vfs for OverlayVfs {
                 Err(err) => return Err(err),
             }
         }
-        Err(VfsError::NotFound(path.as_str().to_string()))
+        Err(VfsError::NotFound(path.display_lossy().to_string()))
     }
 
     fn read(&self, path: &NormalizedPath) -> Result<Arc<[u8]>, VfsError> {
@@ -487,7 +489,7 @@ impl Vfs for OverlayVfs {
                 Err(err) => return Err(err),
             }
         }
-        Err(VfsError::NotFound(path.as_str().to_string()))
+        Err(VfsError::NotFound(path.display_lossy().to_string()))
     }
 
     fn list(&self, prefix: &NormalizedPath) -> Result<Vec<VfsEntry>, VfsError> {
@@ -496,7 +498,7 @@ impl Vfs for OverlayVfs {
             match layer.list(prefix) {
                 Ok(entries) => {
                     for entry in entries {
-                        let key = entry.path.as_str().to_ascii_uppercase();
+                        let key = ascii_lookup_key(entry.path.as_bytes()).0;
                         by_key.entry(key).or_insert(entry);
                     }
                 }
@@ -505,7 +507,7 @@ impl Vfs for OverlayVfs {
             }
         }
         let mut entries: Vec<_> = by_key.into_values().collect();
-        entries.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
+        entries.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
         Ok(entries)
     }
 }
@@ -514,6 +516,10 @@ impl Vfs for OverlayVfs {
 mod tests {
     use super::*;
     use fparkan_path::{normalize_relative, PathPolicy};
+    #[cfg(unix)]
+    use std::ffi::OsString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
 
     #[test]
     fn directory_vfs_resolves_ascii_casefolded_segments() {
@@ -634,6 +640,34 @@ mod tests {
         std::fs::remove_dir_all(outside).expect("cleanup outside");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn directory_vfs_resolves_non_utf8_host_entries_by_raw_bytes() {
+        let root = unique_test_dir("non-utf8");
+        let data_dir = root.join("DATA");
+        std::fs::create_dir_all(&data_dir).expect("mkdir");
+        let file_name = OsString::from_vec(vec![0xFF, b'.', b'b', b'i', b'n']);
+        let raw_path = data_dir.join(&file_name);
+        if let Err(err) = std::fs::write(&raw_path, b"raw") {
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+            std::fs::remove_dir_all(root).expect("cleanup");
+            return;
+        }
+
+        let vfs = DirectoryVfs::new(&root);
+        let path =
+            normalize_relative(b"data/\xFF.bin", PathPolicy::HostCompatible).expect("path");
+
+        assert_eq!(vfs.read(&path).expect("read raw path").as_ref(), b"raw");
+        let entries = vfs
+            .list(&normalize_relative(b"DATA", PathPolicy::StrictLegacy).expect("prefix"))
+            .expect("list");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path.identity_bytes(), b"DATA/\xFF.bin");
+
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
     #[test]
     fn casefold_selector_reports_ambiguous_segments() {
         let err = select_casefolded_match(
@@ -712,6 +746,28 @@ mod tests {
         let entries = overlay.list(&prefix).expect("list");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].metadata.len, 4);
+    }
+
+    #[test]
+    fn overlay_vfs_keeps_lossy_equivalent_entries_distinct() {
+        let prefix = normalize_relative(b"DATA", PathPolicy::StrictLegacy).expect("prefix");
+        let mut high = MemoryVfs::default();
+        let mut low = MemoryVfs::default();
+        high.insert(
+            normalize_relative(b"DATA/\xFF.bin", PathPolicy::HostCompatible).expect("high path"),
+            Arc::from(b"high".as_slice()),
+        );
+        low.insert(
+            normalize_relative(b"DATA/\xFE.bin", PathPolicy::HostCompatible).expect("low path"),
+            Arc::from(b"low".as_slice()),
+        );
+
+        let overlay = OverlayVfs::from_layers(vec![Arc::new(high), Arc::new(low)]);
+        let entries = overlay.list(&prefix).expect("list");
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path.display_lossy(), entries[1].path.display_lossy());
+        assert_ne!(entries[0].path.identity_bytes(), entries[1].path.identity_bytes());
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {

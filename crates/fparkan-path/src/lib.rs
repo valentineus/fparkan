@@ -20,7 +20,9 @@
 )]
 //! Legacy path normalization and ASCII lookup semantics.
 
+use std::cmp::Ordering;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 /// Original bytes.
@@ -42,29 +44,73 @@ impl OriginalPathBytes {
 }
 
 /// Normalized relative path.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug)]
 pub struct NormalizedPath {
     raw: Vec<u8>,
     display: String,
 }
 
 impl NormalizedPath {
-    /// Returns string view.
+    /// Returns normalized byte view used for identity, ordering, and hashing.
     #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.display
+    pub fn identity_bytes(&self) -> &[u8] {
+        &self.raw
+    }
+
+    /// Returns an ASCII-only lookup key for case-insensitive archive matching.
+    #[must_use]
+    pub fn lookup_key(&self) -> LookupKey {
+        ascii_lookup_key(&self.raw)
     }
 
     /// Returns normalized byte view.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        &self.raw
+        self.identity_bytes()
+    }
+
+    /// Returns a lossy display representation.
+    #[must_use]
+    pub fn display_lossy(&self) -> &str {
+        &self.display
+    }
+
+    /// Returns a lossy string view for UI and diagnostics only.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.display_lossy()
     }
 
     /// Returns an OS path owned path buffer.
     #[must_use]
     pub fn as_path(&self) -> PathBuf {
         as_os_path_from_bytes(&self.raw)
+    }
+}
+
+impl PartialEq for NormalizedPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+}
+
+impl Eq for NormalizedPath {}
+
+impl PartialOrd for NormalizedPath {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NormalizedPath {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.raw.cmp(&other.raw)
+    }
+}
+
+impl Hash for NormalizedPath {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.raw.hash(state);
     }
 }
 
@@ -353,7 +399,8 @@ mod tests {
         let path = normalize_relative(b"DATA/\xFF.bin", PathPolicy::HostCompatible)
             .expect("raw legacy bytes");
 
-        assert_eq!(path.as_str(), "DATA/\u{FFFD}.bin");
+        assert_eq!(path.display_lossy(), "DATA/\u{FFFD}.bin");
+        assert_eq!(path.identity_bytes(), b"DATA/\xFF.bin");
     }
 
     #[test]
@@ -363,5 +410,19 @@ mod tests {
 
         assert_eq!(path.normalized().as_str(), "DATA/Maps/Intro/Land.msh");
         assert_eq!(path.original().as_bytes(), raw);
+    }
+
+    #[test]
+    fn lossy_display_does_not_affect_identity_or_ordering() {
+        let first = normalize_relative(b"DATA/\xFF.bin", PathPolicy::HostCompatible)
+            .expect("first raw path");
+        let second = normalize_relative(b"DATA/\xFE.bin", PathPolicy::HostCompatible)
+            .expect("second raw path");
+
+        assert_eq!(first.display_lossy(), second.display_lossy());
+        assert_ne!(first, second);
+        assert_ne!(first.identity_bytes(), second.identity_bytes());
+        assert_ne!(first.cmp(&second), Ordering::Equal);
+        assert_ne!(first.lookup_key(), second.lookup_key());
     }
 }
