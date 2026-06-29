@@ -1477,6 +1477,58 @@ mod tests {
     }
 
     #[test]
+    fn archive_cache_evicts_by_byte_budget() {
+        let first_path = archive_path(b"cache/first-bytes.lib").expect("first path");
+        let second_path = archive_path(b"cache/second-bytes.lib").expect("second path");
+        let first_bytes = build_nres(&[("a.bin", b"first".as_slice())]);
+        let second_bytes = build_nres(&[("b.bin", b"second".as_slice())]);
+        let second_budget = second_bytes.len();
+        let mut vfs = MemoryVfs::default();
+        vfs.insert(
+            first_path.clone(),
+            Arc::from(first_bytes.into_boxed_slice()),
+        );
+        vfs.insert(
+            second_path.clone(),
+            Arc::from(second_bytes.into_boxed_slice()),
+        );
+        let repo = CachedResourceRepository::with_limits(
+            Arc::new(vfs),
+            RepositoryLimits {
+                max_open_archives: 2,
+                max_archive_bytes: second_budget,
+                max_decoded_payload_entries: 64,
+                max_decoded_payload_bytes: 64 * 1024 * 1024,
+            },
+        );
+
+        let first_archive = repo.open_archive(&first_path).expect("open first");
+        let first_handle = repo
+            .find(first_archive, &resource_name(b"a.bin"))
+            .expect("find first")
+            .expect("first handle");
+        assert_eq!(
+            repo.read(first_handle).expect("read first").as_slice(),
+            b"first"
+        );
+
+        let second_archive = repo.open_archive(&second_path).expect("open second");
+        let second_handle = repo
+            .find(second_archive, &resource_name(b"b.bin"))
+            .expect("find second")
+            .expect("second handle");
+        assert_eq!(
+            repo.read(second_handle).expect("read second").as_slice(),
+            b"second"
+        );
+
+        assert!(matches!(
+            repo.read(first_handle),
+            Err(ResourceError::StaleHandle)
+        ));
+    }
+
+    #[test]
     fn resource_error_display_is_actionable() {
         let path = archive_path(b"bad/rsli.lib").expect("path");
         let err = ResourceError::EntryRead {
