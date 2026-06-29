@@ -20,6 +20,7 @@
 )]
 //! Stage-1 `RsLi` archive contract.
 
+use fparkan_binary::DecodeError;
 use std::fmt;
 use std::io::Read;
 use std::sync::Arc;
@@ -78,6 +79,33 @@ pub enum WriteProfile {
     Lossless,
 }
 
+/// Decode and payload loading limits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DecodeLimits {
+    /// Maximum accepted source archive bytes.
+    pub max_input_bytes: u64,
+    /// Maximum accepted entry count.
+    pub max_entries: u32,
+    /// Maximum accepted packed entry bytes.
+    pub max_packed_entry_bytes: u64,
+    /// Maximum accepted decoded entry bytes.
+    pub max_decoded_entry_bytes: u64,
+    /// Maximum accepted cumulative decoded bytes for a single load operation.
+    pub max_total_decoded_bytes: u64,
+}
+
+impl Default for DecodeLimits {
+    fn default() -> Self {
+        Self {
+            max_input_bytes: 256 * 1024 * 1024,
+            max_entries: 1_000_000,
+            max_packed_entry_bytes: 64 * 1024 * 1024,
+            max_decoded_entry_bytes: 128 * 1024 * 1024,
+            max_total_decoded_bytes: 128 * 1024 * 1024,
+        }
+    }
+}
+
 /// Error returned when mutable editing is attempted.
 #[derive(Debug)]
 pub enum RsliMutationError {
@@ -105,6 +133,11 @@ pub enum RsliMutationError {
         /// Format maximum (`u32::MAX`).
         max: usize,
     },
+    /// Method cannot be represented by the on-disk flags field.
+    UnsupportedMethod {
+        /// Requested method.
+        method: RsliMethod,
+    },
 }
 
 impl std::fmt::Display for RsliMutationError {
@@ -119,6 +152,9 @@ impl std::fmt::Display for RsliMutationError {
             }
             Self::PackedPayloadTooLarge { size, max } => {
                 write!(f, "packed payload is too large: {size} > {max}")
+            }
+            Self::UnsupportedMethod { method } => {
+                write!(f, "unsupported authoring method: {method:?}")
             }
         }
     }
@@ -374,6 +410,8 @@ pub enum RsliError {
     },
     /// Integer conversion or arithmetic overflow.
     IntegerOverflow,
+    /// Shared bounded decode failure.
+    Binary(DecodeError),
 }
 
 impl fmt::Display for RsliError {
@@ -432,11 +470,25 @@ impl fmt::Display for RsliError {
                 write!(f, "output size mismatch: expected={expected}, got={got}")
             }
             Self::IntegerOverflow => write!(f, "integer overflow"),
+            Self::Binary(source) => write!(f, "{source}"),
         }
     }
 }
 
-impl std::error::Error for RsliError {}
+impl std::error::Error for RsliError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Binary(source) => Some(source),
+            _ => None,
+        }
+    }
+}
+
+impl From<DecodeError> for RsliError {
+    fn from(value: DecodeError) -> Self {
+        Self::Binary(value)
+    }
+}
 
 /// Decodes an `RsLi` document.
 ///
@@ -446,7 +498,21 @@ impl std::error::Error for RsliError {}
 /// compatibility quirks, or packed payloads are invalid for the selected
 /// profile.
 pub fn decode(bytes: Arc<[u8]>, profile: ReadProfile) -> Result<RsliDocument, RsliError> {
-    decode_with_profile(bytes, profile.into())
+    decode_with_limits(bytes, profile, DecodeLimits::default())
+}
+
+/// Decodes an `RsLi` document with explicit archive limits.
+///
+/// # Errors
+///
+/// Returns [`RsliError`] when the input exceeds configured limits or the
+/// archive is malformed for the selected profile.
+pub fn decode_with_limits(
+    bytes: Arc<[u8]>,
+    profile: ReadProfile,
+    limits: DecodeLimits,
+) -> Result<RsliDocument, RsliError> {
+    decode_with_profile_and_limits(bytes, profile.into(), limits)
 }
 
 /// Decodes an `RsLi` document with explicit compatibility switches.
@@ -460,16 +526,32 @@ pub fn decode_with_profile(
     bytes: Arc<[u8]>,
     profile: RsliReadProfile,
 ) -> Result<RsliDocument, RsliError> {
+    decode_with_profile_and_limits(bytes, profile, DecodeLimits::default())
+}
+
+/// Decodes an `RsLi` document with explicit profile and archive limits.
+///
+/// # Errors
+///
+/// Returns [`RsliError`] when the input exceeds configured limits or the
+/// archive is malformed for the selected profile.
+pub fn decode_with_profile_and_limits(
+    bytes: Arc<[u8]>,
+    profile: RsliReadProfile,
+    limits: DecodeLimits,
+) -> Result<RsliDocument, RsliError> {
     let options = match profile {
         RsliReadProfile::Strict => ParseOptions {
             allow_ao_trailer: false,
             allow_deflate_eof_plus_one: false,
             allow_invalid_presorted_fallback: false,
+            limits,
         },
         RsliReadProfile::Compatible(profile) => ParseOptions {
             allow_ao_trailer: profile.allow_ao_trailer,
             allow_deflate_eof_plus_one: profile.allow_deflate_eof_plus_one,
             allow_invalid_presorted_fallback: profile.allow_invalid_presorted_fallback,
+            limits,
         },
     };
     let ParsedRsli {
@@ -545,6 +627,16 @@ impl RsliDocument {
     /// Returns [`RsliError`] when `id` is invalid or the packed payload cannot
     /// be decoded to the declared size.
     pub fn load(&self, id: EntryId) -> Result<Vec<u8>, RsliError> {
+        self.load_with_limits(id, DecodeLimits::default())
+    }
+
+    /// Loads and unpacks an entry with explicit decode limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RsliError`] when the packed payload exceeds configured
+    /// limits, `id` is invalid, or the payload cannot be decoded.
+    pub fn load_with_limits(&self, id: EntryId, limits: DecodeLimits) -> Result<Vec<u8>, RsliError> {
         let record = self.record_by_id(id)?;
         let packed = self.packed_slice(id, record)?;
         decode_payload(
@@ -552,6 +644,7 @@ impl RsliDocument {
             record.meta.method,
             record.key16,
             record.meta.unpacked_size,
+            limits,
         )
     }
 
@@ -651,6 +744,7 @@ impl RsliEditor {
     /// Returns [`RsliMutationError`] when the entry id is unknown.
     pub fn set_method(&mut self, id: EntryId, method: RsliMethod) -> Result<(), RsliMutationError> {
         let entry = self.entry_mut(id)?;
+        entry.meta.flags = flags_with_method(entry.meta.flags, method)?;
         entry.meta.method = method;
         self.dirty = true;
         Ok(())
@@ -837,6 +931,7 @@ struct ParseOptions {
     allow_ao_trailer: bool,
     allow_deflate_eof_plus_one: bool,
     allow_invalid_presorted_fallback: bool,
+    limits: DecodeLimits,
 }
 
 #[derive(Clone, Debug)]
@@ -857,6 +952,10 @@ struct EntryRecord {
 
 #[allow(clippy::too_many_lines)]
 fn parse_rsli(bytes: &[u8], options: ParseOptions) -> Result<ParsedRsli, RsliError> {
+    enforce_limit(
+        u64::try_from(bytes.len()).map_err(|_| RsliError::IntegerOverflow)?,
+        options.limits.max_input_bytes,
+    )?;
     if bytes.len() < 32 {
         return Err(RsliError::EntryTableOutOfBounds {
             table_offset: 32,
@@ -892,6 +991,10 @@ fn parse_rsli(bytes: &[u8], options: ParseOptions) -> Result<ParsedRsli, RsliErr
     if count > usize::try_from(u32::MAX).map_err(|_| RsliError::IntegerOverflow)? {
         return Err(RsliError::TooManyEntries { got: count });
     }
+    enforce_limit(
+        u64::try_from(count).map_err(|_| RsliError::IntegerOverflow)?,
+        u64::from(options.limits.max_entries),
+    )?;
 
     let presorted_flag = u16::from_le_bytes([bytes[14], bytes[15]]);
     let xor_seed = u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
@@ -935,6 +1038,14 @@ fn parse_rsli(bytes: &[u8], options: ParseOptions) -> Result<ParsedRsli, RsliErr
         let unpacked_size = u32::from_le_bytes([row[20], row[21], row[22], row[23]]);
         let data_offset_raw = u32::from_le_bytes([row[24], row[25], row[26], row[27]]);
         let packed_size_declared = u32::from_le_bytes([row[28], row[29], row[30], row[31]]);
+        enforce_limit(
+            u64::from(packed_size_declared),
+            options.limits.max_packed_entry_bytes,
+        )?;
+        enforce_limit(
+            u64::from(unpacked_size),
+            options.limits.max_decoded_entry_bytes,
+        )?;
         let method_raw = u32::from(flags_signed.cast_unsigned()) & 0x1E0;
         let method = parse_method(method_raw);
 
@@ -1009,9 +1120,12 @@ fn parse_rsli(bytes: &[u8], options: ParseOptions) -> Result<ParsedRsli, RsliErr
     }
 
     if presorted_flag == 0xABBA {
-        if validate_permutation(&records).is_err() {
+        let permutation = validate_permutation(&records);
+        let order = validate_lookup_order(&records);
+        if permutation.is_err() || order.is_err() {
             if !options.allow_invalid_presorted_fallback {
-                validate_permutation(&records)?;
+                permutation?;
+                order?;
             }
             rebuild_sorted_mapping(&mut records)?;
         }
@@ -1086,6 +1200,29 @@ fn validate_permutation(records: &[EntryRecord]) -> Result<(), RsliError> {
     Ok(())
 }
 
+fn validate_lookup_order(records: &[EntryRecord]) -> Result<(), RsliError> {
+    for pair in records.windows(2) {
+        let left_original = usize::try_from(i32::from(pair[0].meta.sort_to_original))
+            .map_err(|_| RsliError::IntegerOverflow)?;
+        let right_original = usize::try_from(i32::from(pair[1].meta.sort_to_original))
+            .map_err(|_| RsliError::IntegerOverflow)?;
+        let left = records
+            .get(left_original)
+            .ok_or(RsliError::CorruptEntryTable("sort_to_original is not a permutation"))?;
+        let right = records
+            .get(right_original)
+            .ok_or(RsliError::CorruptEntryTable("sort_to_original is not a permutation"))?;
+        if cmp_c_string(c_name_bytes(&left.meta.name_raw), c_name_bytes(&right.meta.name_raw))
+            == std::cmp::Ordering::Greater
+        {
+            return Err(RsliError::CorruptEntryTable(
+                "presorted lookup names are not sorted",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn parse_method(raw: u32) -> RsliMethod {
     match raw {
         0x000 => RsliMethod::Stored,
@@ -1147,32 +1284,39 @@ fn decode_payload(
     method: RsliMethod,
     key16: u16,
     unpacked_size: u32,
+    limits: DecodeLimits,
 ) -> Result<Vec<u8>, RsliError> {
+    enforce_limit(
+        u64::try_from(packed.len()).map_err(|_| RsliError::IntegerOverflow)?,
+        limits.max_packed_entry_bytes,
+    )?;
+    enforce_limit(u64::from(unpacked_size), limits.max_decoded_entry_bytes)?;
+    enforce_limit(u64::from(unpacked_size), limits.max_total_decoded_bytes)?;
     let expected = usize::try_from(unpacked_size).map_err(|_| RsliError::IntegerOverflow)?;
     let out = match method {
         RsliMethod::Stored => {
-            if packed.len() < expected {
+            if packed.len() != expected {
                 return Err(RsliError::OutputSizeMismatch {
                     expected: unpacked_size,
                     got: u32::try_from(packed.len()).unwrap_or(u32::MAX),
                 });
             }
-            packed[..expected].to_vec()
+            packed.to_vec()
         }
         RsliMethod::XorOnly => {
-            if packed.len() < expected {
+            if packed.len() != expected {
                 return Err(RsliError::OutputSizeMismatch {
                     expected: unpacked_size,
                     got: u32::try_from(packed.len()).unwrap_or(u32::MAX),
                 });
             }
-            xor_stream(&packed[..expected], key16)
+            xor_stream(packed, key16)
         }
         RsliMethod::Lzss => lzss_decompress_simple(packed, expected, None)?,
         RsliMethod::XorLzss => lzss_decompress_simple(packed, expected, Some(key16))?,
         RsliMethod::AdaptiveLzss => lzss_huffman_decompress(packed, expected, None)?,
         RsliMethod::XorAdaptiveLzss => lzss_huffman_decompress(packed, expected, Some(key16))?,
-        RsliMethod::RawDeflate => decode_deflate(packed)?,
+        RsliMethod::RawDeflate => decode_deflate(packed, expected)?,
         RsliMethod::Unknown(raw) => return Err(RsliError::UnsupportedMethod { raw }),
     };
     if out.len() != expected {
@@ -1276,13 +1420,59 @@ fn read_packed_byte(data: &[u8], pos: usize, state: &mut Option<XorState>) -> Op
     })
 }
 
-fn decode_deflate(packed: &[u8]) -> Result<Vec<u8>, RsliError> {
-    let mut out = Vec::new();
+fn decode_deflate(packed: &[u8], expected_size: usize) -> Result<Vec<u8>, RsliError> {
+    let mut out = Vec::with_capacity(expected_size);
+    let mut chunk = [0u8; 4096];
     let mut decoder = flate2::read::DeflateDecoder::new(packed);
-    decoder
-        .read_to_end(&mut out)
-        .map_err(|_| RsliError::DecompressionFailed("deflate"))?;
+    loop {
+        let read = decoder
+            .read(&mut chunk)
+            .map_err(|_| RsliError::DecompressionFailed("deflate"))?;
+        if read == 0 {
+            break;
+        }
+        let next_len = out
+            .len()
+            .checked_add(read)
+            .ok_or(RsliError::IntegerOverflow)?;
+        if next_len > expected_size {
+            return Err(RsliError::OutputSizeMismatch {
+                expected: u32::try_from(expected_size).unwrap_or(u32::MAX),
+                got: u32::try_from(next_len).unwrap_or(u32::MAX),
+            });
+        }
+        out.extend_from_slice(&chunk[..read]);
+    }
     Ok(out)
+}
+
+fn method_bits(method: RsliMethod) -> Result<u16, RsliMutationError> {
+    match method {
+        RsliMethod::Stored => Ok(0x000),
+        RsliMethod::XorOnly => Ok(0x020),
+        RsliMethod::Lzss => Ok(0x040),
+        RsliMethod::XorLzss => Ok(0x060),
+        RsliMethod::AdaptiveLzss => Ok(0x080),
+        RsliMethod::XorAdaptiveLzss => Ok(0x0A0),
+        RsliMethod::RawDeflate => Ok(0x100),
+        RsliMethod::Unknown(_) => Err(RsliMutationError::UnsupportedMethod { method }),
+    }
+}
+
+fn flags_with_method(flags: i32, method: RsliMethod) -> Result<i32, RsliMutationError> {
+    let method = i32::from(method_bits(method)?);
+    Ok((flags & !0x1E0) | method)
+}
+
+fn enforce_limit(value: u64, limit: u64) -> Result<(), RsliError> {
+    if value > limit {
+        return Err(DecodeError::LimitExceeded {
+            count: value,
+            limit,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 const LZH_N: usize = 4096;
@@ -1703,6 +1893,28 @@ mod tests {
     }
 
     #[test]
+    fn strict_rejects_unsorted_presorted_mapping() {
+        let bytes = synthetic_rsli(
+            &[
+                SyntheticEntry::stored(b"B", 0, b"bee"),
+                SyntheticEntry::stored(b"A", 1, b"aye"),
+            ],
+            true,
+            0x0103,
+            None,
+        );
+
+        assert!(matches!(
+            decode(arc(bytes.clone()), ReadProfile::Strict),
+            Err(RsliError::CorruptEntryTable("presorted lookup names are not sorted"))
+        ));
+
+        let doc = decode(arc(bytes), ReadProfile::Compatible).expect("compatible fallback");
+        assert_eq!(doc.find("A"), Some(EntryId(1)));
+        assert_eq!(doc.find("B"), Some(EntryId(0)));
+    }
+
+    #[test]
     fn explicit_profile_controls_invalid_presorted_fallback() {
         let bytes = synthetic_rsli(
             &[
@@ -1756,8 +1968,8 @@ mod tests {
         let packed = xor_stream(&plain, 1);
         let bytes = synthetic_rsli(
             &[
-                SyntheticEntry::with_payload(b"A", 0x020, 1, &plain, packed),
-                SyntheticEntry::stored(b"B", 0, b"plain"),
+                SyntheticEntry::with_payload(b"B", 0x020, 1, &plain, packed),
+                SyntheticEntry::stored(b"A", 0, b"plain"),
             ],
             true,
             0x2222,
@@ -2141,8 +2353,9 @@ mod tests {
         let doc = decode(arc(bytes), ReadProfile::Strict).expect("editable archive");
         let mut editor = doc.editor().expect("editor");
         editor.set_name(EntryId(1), b"ZETA").expect("edit name");
+        let repacked = deflate_bytes(b"repacked-alpha");
         editor
-            .set_packed_payload(EntryId(0), b"repacked-alpha", 14)
+            .set_packed_payload(EntryId(0), repacked, 14)
             .expect("edit packed payload");
         editor
             .set_method(EntryId(0), RsliMethod::RawDeflate)
@@ -2163,8 +2376,89 @@ mod tests {
         );
         assert_eq!(
             doc.entries()[original.0 as usize].method,
-            RsliMethod::Stored
+            RsliMethod::RawDeflate
         );
+    }
+
+    #[test]
+    fn set_method_rejects_unknown_authoring_method() {
+        let bytes = synthetic_rsli(
+            &[SyntheticEntry::stored(b"A", 0, b"alpha")],
+            true,
+            0x7780,
+            None,
+        );
+        let doc = decode(arc(bytes), ReadProfile::Strict).expect("editable archive");
+        let mut editor = doc.editor().expect("editor");
+
+        assert!(matches!(
+            editor.set_method(EntryId(0), RsliMethod::Unknown(0x1E0)),
+            Err(RsliMutationError::UnsupportedMethod { .. })
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_entry_count_above_limit() {
+        let bytes = synthetic_rsli(
+            &[
+                SyntheticEntry::stored(b"A", 0, b"alpha"),
+                SyntheticEntry::stored(b"B", 1, b"beta"),
+            ],
+            true,
+            0x7781,
+            None,
+        );
+
+        assert!(matches!(
+            decode_with_limits(
+                arc(bytes),
+                ReadProfile::Strict,
+                DecodeLimits {
+                    max_entries: 1,
+                    ..DecodeLimits::default()
+                }
+            ),
+            Err(RsliError::Binary(DecodeError::LimitExceeded { count: 2, limit: 1 }))
+        ));
+    }
+
+    #[test]
+    fn stored_entries_require_exact_packed_size() {
+        let bytes = synthetic_rsli(
+            &[SyntheticEntry::with_payload(b"A", 0x000, 0, b"ok", b"ok!".to_vec())],
+            true,
+            0x7782,
+            None,
+        );
+        let doc = decode(arc(bytes), ReadProfile::Strict).expect("stored archive");
+
+        assert!(matches!(
+            doc.load(EntryId(0)),
+            Err(RsliError::OutputSizeMismatch { expected: 2, got: 3 })
+        ));
+    }
+
+    #[test]
+    fn load_rejects_unpacked_size_above_limit_before_allocation() {
+        let bytes = synthetic_rsli(
+            &[SyntheticEntry::stored(b"A", 0, b"alpha")],
+            true,
+            0x7783,
+            None,
+        );
+        let doc = decode(arc(bytes), ReadProfile::Strict).expect("stored archive");
+
+        assert!(matches!(
+            doc.load_with_limits(
+                EntryId(0),
+                DecodeLimits {
+                    max_decoded_entry_bytes: 4,
+                    max_total_decoded_bytes: 4,
+                    ..DecodeLimits::default()
+                }
+            ),
+            Err(RsliError::Binary(DecodeError::LimitExceeded { count: 5, limit: 4 }))
+        ));
     }
 
     #[test]
@@ -2635,6 +2929,15 @@ mod tests {
             bytes.extend_from_slice(&overlay.to_le_bytes());
         }
         bytes
+    }
+
+    fn deflate_bytes(plain: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut encoder =
+            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+        encoder.write_all(plain).expect("deflate write");
+        encoder.finish().expect("deflate finish")
     }
 
     fn two_plain_rows_for_transform_test() -> Vec<[u8; 32]> {

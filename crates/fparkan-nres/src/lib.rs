@@ -20,7 +20,7 @@
 )]
 //! Strict and lossless `NRes` archive support.
 
-use fparkan_binary::{Cursor, DecodeError};
+use fparkan_binary::{checked_allocation_len, Cursor, DecodeError};
 use fparkan_path::{ascii_lookup_key, LookupKey};
 use std::cmp::Ordering;
 use std::fmt;
@@ -49,6 +49,33 @@ pub enum WriteProfile {
     Lossless,
     /// Repack active payloads and rebuild the lookup table.
     CanonicalCompact,
+}
+
+/// Decode-time archive limits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DecodeLimits {
+    /// Maximum accepted source archive bytes.
+    pub max_input_bytes: u64,
+    /// Maximum accepted entry count.
+    pub max_entries: u32,
+    /// Maximum accepted single payload byte length.
+    pub max_decoded_entry_bytes: u64,
+    /// Maximum accepted cumulative payload bytes.
+    pub max_total_decoded_bytes: u64,
+    /// Maximum accepted preserved-region bytes.
+    pub max_preserved_bytes: u64,
+}
+
+impl Default for DecodeLimits {
+    fn default() -> Self {
+        Self {
+            max_input_bytes: 256 * 1024 * 1024,
+            max_entries: 1_000_000,
+            max_decoded_entry_bytes: 64 * 1024 * 1024,
+            max_total_decoded_bytes: 512 * 1024 * 1024,
+            max_preserved_bytes: 64 * 1024 * 1024,
+        }
+    }
 }
 
 /// `NRes` archive header.
@@ -343,16 +370,31 @@ impl From<DecodeError> for NresError {
 /// Returns [`NresError`] when the header, directory, payload ranges, or strict
 /// lookup permutation are malformed for the selected [`ReadProfile`].
 pub fn decode(bytes: Arc<[u8]>, profile: ReadProfile) -> Result<NresDocument, NresError> {
-    let header = parse_header(&bytes)?;
-    let entries = parse_entries(&bytes, &header)?;
+    decode_with_limits(bytes, profile, DecodeLimits::default())
+}
+
+/// Decodes `NRes` bytes with explicit archive limits.
+///
+/// # Errors
+///
+/// Returns [`NresError`] when the input exceeds configured limits, the header,
+/// directory, payload ranges, or strict lookup permutation are malformed.
+pub fn decode_with_limits(
+    bytes: Arc<[u8]>,
+    profile: ReadProfile,
+    limits: DecodeLimits,
+) -> Result<NresDocument, NresError> {
+    let header = parse_header(&bytes, limits)?;
+    let entries = parse_entries(&bytes, &header, limits)?;
     validate_names(&entries)?;
-    validate_payload_ranges(&entries)?;
+    validate_payload_ranges(&entries, limits)?;
     let lookup_order_valid = match validate_lookup_order(&entries) {
-        Ok(valid) => valid,
+        Ok(()) => true,
         Err(err) if profile == ReadProfile::Strict => return Err(err),
         Err(_) => false,
     };
-    let preserved_regions = find_preserved_regions(&bytes, &entries, header.directory_offset)?;
+    let preserved_regions =
+        find_preserved_regions(&bytes, &entries, header.directory_offset, limits)?;
     Ok(NresDocument {
         bytes,
         header,
@@ -684,7 +726,11 @@ impl NresEntry {
     }
 }
 
-fn parse_header(bytes: &[u8]) -> Result<NresHeader, NresError> {
+fn parse_header(bytes: &[u8], limits: DecodeLimits) -> Result<NresHeader, NresError> {
+    enforce_limit(
+        u64::try_from(bytes.len()).map_err(|_| DecodeError::IntegerOverflow)?,
+        limits.max_input_bytes,
+    )?;
     if bytes.len() < HEADER_LEN {
         let mut got = [0; 4];
         let copy_len = bytes.len().min(4);
@@ -711,6 +757,7 @@ fn parse_header(bytes: &[u8]) -> Result<NresHeader, NresError> {
     }
     let entry_count =
         u32::try_from(entry_count_signed).map_err(|_| DecodeError::IntegerOverflow)?;
+    enforce_limit(u64::from(entry_count), u64::from(limits.max_entries))?;
     let total_size = cursor.read_u32_le()?;
     let actual = u64::try_from(bytes.len()).map_err(|_| DecodeError::IntegerOverflow)?;
     if u64::from(total_size) != actual {
@@ -750,8 +797,16 @@ fn parse_header(bytes: &[u8]) -> Result<NresHeader, NresError> {
     })
 }
 
-fn parse_entries(bytes: &[u8], header: &NresHeader) -> Result<Vec<NresEntry>, NresError> {
-    let mut entries = Vec::with_capacity(header.entry_count as usize);
+fn parse_entries(
+    bytes: &[u8],
+    header: &NresHeader,
+    limits: DecodeLimits,
+) -> Result<Vec<NresEntry>, NresError> {
+    let capacity = checked_allocation_len(
+        u64::from(header.entry_count),
+        u64::from(limits.max_entries),
+    )?;
+    let mut entries = Vec::with_capacity(capacity);
     let directory_offset =
         usize::try_from(header.directory_offset).map_err(|_| DecodeError::IntegerOverflow)?;
     for index in 0..header.entry_count {
@@ -832,7 +887,7 @@ fn parse_entry(
     })
 }
 
-fn validate_payload_ranges(entries: &[NresEntry]) -> Result<(), NresError> {
+fn validate_payload_ranges(entries: &[NresEntry], limits: DecodeLimits) -> Result<(), NresError> {
     let mut ranges: Vec<(u32, Range<usize>)> = entries
         .iter()
         .map(|entry| (entry.id.0, entry.data_range.clone()))
@@ -843,6 +898,15 @@ fn validate_payload_ranges(entries: &[NresEntry]) -> Result<(), NresError> {
             .cmp(&right.1.start)
             .then_with(|| left.1.end.cmp(&right.1.end))
     });
+    let mut total_payload_bytes = 0_u64;
+    for entry in entries {
+        let payload_len = u64::from(entry.meta.data_size);
+        enforce_limit(payload_len, limits.max_decoded_entry_bytes)?;
+        total_payload_bytes = total_payload_bytes
+            .checked_add(payload_len)
+            .ok_or(DecodeError::IntegerOverflow)?;
+        enforce_limit(total_payload_bytes, limits.max_total_decoded_bytes)?;
+    }
     for pair in ranges.windows(2) {
         if pair[0].1.end > pair[1].1.start {
             return Err(NresError::EntryDataOverlap {
@@ -863,7 +927,7 @@ fn validate_names(entries: &[NresEntry]) -> Result<(), NresError> {
     Ok(())
 }
 
-fn validate_lookup_order(entries: &[NresEntry]) -> Result<bool, NresError> {
+fn validate_lookup_order(entries: &[NresEntry]) -> Result<(), NresError> {
     let entry_count = saturating_u32_len(entries.len());
     let mut seen = vec![false; entries.len()];
     for (position, entry) in entries.iter().enumerate() {
@@ -881,7 +945,7 @@ fn validate_lookup_order(entries: &[NresEntry]) -> Result<bool, NresError> {
         }
         seen[index_usize] = true;
     }
-    for pair in entries.windows(2) {
+    for (position, pair) in entries.windows(2).enumerate() {
         let left_index =
             usize::try_from(pair[0].meta.sort_index).map_err(|_| DecodeError::IntegerOverflow)?;
         let right_index =
@@ -889,16 +953,19 @@ fn validate_lookup_order(entries: &[NresEntry]) -> Result<bool, NresError> {
         let left = entries[left_index].name_bytes();
         let right = entries[right_index].name_bytes();
         if cmp_ascii_casefold(left, right) == Ordering::Greater {
-            return Ok(false);
+            return Err(NresError::SortOrderMismatch {
+                position: saturating_u32_len(position.saturating_add(1)),
+            });
         }
     }
-    Ok(true)
+    Ok(())
 }
 
 fn find_preserved_regions(
     bytes: &[u8],
     entries: &[NresEntry],
     directory_offset: u32,
+    limits: DecodeLimits,
 ) -> Result<Vec<PreservedRegion>, NresError> {
     let mut ranges: Vec<Range<usize>> = entries
         .iter()
@@ -914,16 +981,42 @@ fn find_preserved_regions(
     let directory_offset =
         usize::try_from(directory_offset).map_err(|_| DecodeError::IntegerOverflow)?;
     let mut preserved = Vec::new();
+    let mut preserved_bytes = 0_u64;
     for range in ranges {
         if cursor < range.start {
+            preserved_bytes = preserved_bytes
+                .checked_add(
+                    u64::try_from(range.start - cursor)
+                        .map_err(|_| DecodeError::IntegerOverflow)?,
+                )
+                .ok_or(DecodeError::IntegerOverflow)?;
+            enforce_limit(preserved_bytes, limits.max_preserved_bytes)?;
             preserved.push(make_preserved_region(bytes, cursor..range.start)?);
         }
         cursor = cursor.max(range.end);
     }
     if cursor < directory_offset {
+        preserved_bytes = preserved_bytes
+            .checked_add(
+                u64::try_from(directory_offset - cursor)
+                    .map_err(|_| DecodeError::IntegerOverflow)?,
+            )
+            .ok_or(DecodeError::IntegerOverflow)?;
+        enforce_limit(preserved_bytes, limits.max_preserved_bytes)?;
         preserved.push(make_preserved_region(bytes, cursor..directory_offset)?);
     }
     Ok(preserved)
+}
+
+fn enforce_limit(value: u64, limit: u64) -> Result<(), NresError> {
+    if value > limit {
+        return Err(DecodeError::LimitExceeded {
+            count: value,
+            limit,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 fn make_preserved_region(bytes: &[u8], range: Range<usize>) -> Result<PreservedRegion, NresError> {
@@ -1176,7 +1269,10 @@ mod tests {
 
         assert!(matches!(
             decode(arc(bytes), ReadProfile::Strict),
-            Err(NresError::DirectoryOutOfBounds { .. })
+            Err(NresError::Binary(DecodeError::LimitExceeded {
+                count,
+                limit
+            })) if count == i32::MAX as u64 && limit == DecodeLimits::default().max_entries as u64
         ));
     }
 
@@ -1469,7 +1565,7 @@ mod tests {
     }
 
     #[test]
-    fn unsorted_lookup_table_falls_back_to_linear_lookup() {
+    fn strict_rejects_unsorted_lookup_table() {
         let mut bytes = build_archive(&[
             SyntheticEntry {
                 type_id: 1,
@@ -1497,9 +1593,68 @@ mod tests {
         bytes[directory_offset + ENTRY_LEN + 60..directory_offset + ENTRY_LEN + 64]
             .copy_from_slice(&1_u32.to_le_bytes());
 
-        let doc = decode(arc(bytes), ReadProfile::Strict).expect("strict nres");
-        assert!(!doc.lookup_order_valid());
-        assert_eq!(doc.find("A"), Some(EntryId(1)));
+        assert!(matches!(
+            decode(arc(bytes), ReadProfile::Strict),
+            Err(NresError::SortOrderMismatch { position: 1 })
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_entry_count_above_limit() {
+        let bytes = build_archive(&[
+            SyntheticEntry {
+                type_id: 1,
+                attr1: 0,
+                attr2: 0,
+                attr3: 0,
+                name: "a",
+                payload: b"a",
+            },
+            SyntheticEntry {
+                type_id: 2,
+                attr1: 0,
+                attr2: 0,
+                attr3: 0,
+                name: "b",
+                payload: b"b",
+            },
+        ]);
+
+        assert!(matches!(
+            decode_with_limits(
+                arc(bytes),
+                ReadProfile::Strict,
+                DecodeLimits {
+                    max_entries: 1,
+                    ..DecodeLimits::default()
+                }
+            ),
+            Err(NresError::Binary(DecodeError::LimitExceeded { count: 2, limit: 1 }))
+        ));
+    }
+
+    #[test]
+    fn decode_rejects_preserved_bytes_above_limit() {
+        let bytes = build_archive_with_nonzero_prefix_gap(&[SyntheticEntry {
+            type_id: 1,
+            attr1: 0,
+            attr2: 0,
+            attr3: 0,
+            name: "payload",
+            payload: b"data",
+        }]);
+
+        assert!(matches!(
+            decode_with_limits(
+                arc(bytes),
+                ReadProfile::Strict,
+                DecodeLimits {
+                    max_preserved_bytes: 4,
+                    ..DecodeLimits::default()
+                }
+            ),
+            Err(NresError::Binary(DecodeError::LimitExceeded { .. }))
+        ));
     }
 
     #[test]
