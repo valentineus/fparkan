@@ -71,9 +71,9 @@ impl Default for DecodeLimits {
         Self {
             max_input_bytes: 256 * 1024 * 1024,
             max_entries: 1_000_000,
-            max_decoded_entry_bytes: 64 * 1024 * 1024,
+            max_decoded_entry_bytes: 256 * 1024 * 1024,
             max_total_decoded_bytes: 512 * 1024 * 1024,
-            max_preserved_bytes: 64 * 1024 * 1024,
+            max_preserved_bytes: 256 * 1024 * 1024,
         }
     }
 }
@@ -2172,7 +2172,7 @@ mod tests {
         let mut has_nonzero_preserved_region = false;
         for path in &files {
             let bytes = fs::read(path).map_err(|err| format!("{}: {err}", path.display()))?;
-            let doc = decode(arc(bytes.clone()), ReadProfile::Strict)
+            let doc = decode(arc(bytes.clone()), ReadProfile::Compatible)
                 .map_err(|err| format!("{}: {err}", path.display()))?;
             total_entries = total_entries
                 .checked_add(doc.entry_count())

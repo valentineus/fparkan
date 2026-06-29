@@ -159,8 +159,8 @@ S1-VFS-001	covered	cargo test -p fparkan-vfs --offline memory_vfs_uses_exact_loo
 S1-VFS-002	covered	cargo test -p fparkan-vfs --offline overlay_vfs_uses_first_matching_layer
 S1-VFS-003	covered	cargo test -p fparkan-vfs --offline directory_vfs_resolves_ascii_casefolded_segments
 S1-VFS-004	covered	cargo test -p fparkan-vfs --offline casefold_selector_reports_ambiguous_segments
-S1-LICENSED-001	blocked	cargo test -p fparkan-resource --offline licensed_corpora_repository_reads_nres_and_rsli (ignored, requires licensed corpus; gate covers Part 1 and Part 2)
-S1-LICENSED-002	blocked	cargo test -p fparkan-resource --offline licensed_corpora_repository_reads_nres_and_rsli (ignored, requires licensed corpus; gate covers Part 1 and Part 2)
+S1-LICENSED-001	covered	local testdata corpora via FPARKAN_CORPUS_PART1_ROOT and FPARKAN_CORPUS_PART2_ROOT; cargo test -p fparkan-nres -p fparkan-resource -p fparkan-rsli --offline -- --ignored
+S1-LICENSED-002	covered	local testdata corpora via FPARKAN_CORPUS_PART1_ROOT and FPARKAN_CORPUS_PART2_ROOT; cargo test -p fparkan-nres -p fparkan-resource -p fparkan-rsli --offline -- --ignored
 L2-P1-UNIT-001	covered	cargo test -p fparkan-prototype --offline licensed_corpora_unit_dat_parse_counts
 L2-P2-UNIT-001	covered	cargo test -p fparkan-prototype --offline licensed_corpora_unit_dat_parse_counts
 L2-P1-REG-001	covered	cargo test -p fparkan-prototype --offline licensed_corpora_registry_payloads_are_record_aligned
