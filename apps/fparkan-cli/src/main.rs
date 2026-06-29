@@ -31,9 +31,60 @@ use fparkan_runtime::{
     create, load_mission, EngineConfig, EngineMode, EngineServices, MissionRequest,
 };
 use fparkan_vfs::DirectoryVfs;
-use std::fmt::Write;
+use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+const ARCHIVE_INSPECT_SCHEMA: &str = "fparkan-archive-inspect-v1";
+const MISSION_GRAPH_SCHEMA: &str = "fparkan-mission-graph-v1";
+const PROTOTYPE_INSPECT_SCHEMA: &str = "fparkan-prototype-inspect-v1";
+
+#[derive(Serialize)]
+struct PrototypeInspectOutput<'a> {
+    schema_version: &'static str,
+    key: &'a str,
+    roots: usize,
+    prototype_requests: usize,
+    resolved: usize,
+    unit_references: usize,
+    unit_components: usize,
+    direct_references: usize,
+    wear: usize,
+    materials: usize,
+    textures: usize,
+    lightmaps: usize,
+    failures: usize,
+}
+
+#[derive(Serialize)]
+struct MissionGraphOutput<'a> {
+    schema_version: &'static str,
+    mission: &'a str,
+    objects: usize,
+    paths: usize,
+    clans: usize,
+    extras: usize,
+    roots: usize,
+    direct_references: usize,
+    unit_references: usize,
+    unit_components: usize,
+    prototype_requests: usize,
+    wear: usize,
+    materials: usize,
+    textures: usize,
+    lightmaps: usize,
+    failures: usize,
+}
+
+#[derive(Serialize)]
+struct ArchiveInspectOutput<'a> {
+    schema_version: &'static str,
+    path: &'a str,
+    kind: &'a str,
+    entries: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lookup_order_valid: Option<bool>,
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -155,7 +206,7 @@ fn inspect_prototype(args: &[String]) -> Result<(), String> {
     let (graph, resolved, mut report) =
         build_prototype_graph_report(&repository, vfs.as_ref(), &roots);
     extend_graph_report_with_visual_dependencies(&repository, &mut report, &graph, &resolved);
-    println!("{}", prototype_inspect_json(&key, &graph, &report));
+    println!("{}", prototype_inspect_json(&key, &graph, &report)?);
     Ok(())
 }
 
@@ -163,22 +214,22 @@ fn prototype_inspect_json(
     key: &str,
     graph: &fparkan_prototype::PrototypeGraph,
     report: &fparkan_prototype::PrototypeGraphReport,
-) -> String {
-    format!(
-        "{{\"schema_version\":\"fparkan-prototype-inspect-v1\",\"key\":{},\"roots\":{},\"prototype_requests\":{},\"resolved\":{},\"unit_references\":{},\"unit_components\":{},\"direct_references\":{},\"wear\":{},\"materials\":{},\"textures\":{},\"lightmaps\":{},\"failures\":{}}}",
-        json_string(key),
-        report.root_count,
-        graph.prototype_requests.len(),
-        report.resolved_count,
-        report.unit_reference_count,
-        report.unit_component_count,
-        report.direct_reference_count,
-        report.wear_resolved_count,
-        report.material_resolved_count,
-        report.texture_resolved_count,
-        report.lightmap_resolved_count,
-        report.failures.len()
-    )
+) -> Result<String, String> {
+    serialize_json(&PrototypeInspectOutput {
+        schema_version: PROTOTYPE_INSPECT_SCHEMA,
+        key,
+        roots: report.root_count,
+        prototype_requests: graph.prototype_requests.len(),
+        resolved: report.resolved_count,
+        unit_references: report.unit_reference_count,
+        unit_components: report.unit_component_count,
+        direct_references: report.direct_reference_count,
+        wear: report.wear_resolved_count,
+        materials: report.material_resolved_count,
+        textures: report.texture_resolved_count,
+        lightmaps: report.lightmap_resolved_count,
+        failures: report.failures.len(),
+    })
 }
 
 fn graph_mission(args: &[String]) -> Result<(), String> {
@@ -199,25 +250,32 @@ fn graph_mission(args: &[String]) -> Result<(), String> {
         },
     )
     .map_err(|err| err.to_string())?;
-    println!(
-        "{{\"schema_version\":\"fparkan-mission-graph-v1\",\"mission\":{},\"objects\":{},\"paths\":{},\"clans\":{},\"extras\":{},\"roots\":{},\"direct_references\":{},\"unit_references\":{},\"unit_components\":{},\"prototype_requests\":{},\"wear\":{},\"materials\":{},\"textures\":{},\"lightmaps\":{},\"failures\":{}}}",
-        json_string(&mission),
-        loaded.object_count,
-        loaded.path_count,
-        loaded.clan_count,
-        loaded.extra_count,
-        loaded.graph_root_count,
-        loaded.graph_direct_reference_count,
-        loaded.graph_unit_reference_count,
-        loaded.graph_unit_component_count,
-        loaded.graph_resolved_count,
-        loaded.graph_wear_resolved_count,
-        loaded.graph_material_resolved_count,
-        loaded.graph_texture_resolved_count,
-        loaded.graph_lightmap_resolved_count,
-        loaded.graph_failure_count
-    );
+    println!("{}", mission_graph_json(&mission, &loaded)?);
     Ok(())
+}
+
+fn mission_graph_json(
+    mission: &str,
+    loaded: &fparkan_runtime::LoadedMission,
+) -> Result<String, String> {
+    serialize_json(&MissionGraphOutput {
+        schema_version: MISSION_GRAPH_SCHEMA,
+        mission,
+        objects: loaded.object_count,
+        paths: loaded.path_count,
+        clans: loaded.clan_count,
+        extras: loaded.extra_count,
+        roots: loaded.graph_root_count,
+        direct_references: loaded.graph_direct_reference_count,
+        unit_references: loaded.graph_unit_reference_count,
+        unit_components: loaded.graph_unit_component_count,
+        prototype_requests: loaded.graph_resolved_count,
+        wear: loaded.graph_wear_resolved_count,
+        materials: loaded.graph_material_resolved_count,
+        textures: loaded.graph_texture_resolved_count,
+        lightmaps: loaded.graph_lightmap_resolved_count,
+        failures: loaded.graph_failure_count,
+    })
 }
 
 fn inspect_archive(args: &[String]) -> Result<(), String> {
@@ -237,14 +295,14 @@ fn inspect_archive(args: &[String]) -> Result<(), String> {
                     "NRes",
                     entries,
                     Some(lookup_order_valid),
-                )
+                )?
             );
             Ok(())
         }
         ArchiveInspection::Rsli { entries } => {
             println!(
                 "{}",
-                archive_inspect_json(&path.display().to_string(), "RsLi", entries, None)
+                archive_inspect_json(&path.display().to_string(), "RsLi", entries, None)?
             );
             Ok(())
         }
@@ -259,18 +317,14 @@ fn archive_inspect_json(
     kind: &str,
     entries: usize,
     lookup_order_valid: Option<bool>,
-) -> String {
-    let mut out = format!(
-        "{{\"schema_version\":\"fparkan-archive-inspect-v1\",\"path\":{},\"kind\":{},\"entries\":{}",
-        json_string(path),
-        json_string(kind),
-        entries
-    );
-    if let Some(valid) = lookup_order_valid {
-        let _ = write!(out, ",\"lookup_order_valid\":{valid}");
-    }
-    out.push('}');
-    out
+) -> Result<String, String> {
+    serialize_json(&ArchiveInspectOutput {
+        schema_version: ARCHIVE_INSPECT_SCHEMA,
+        path,
+        kind,
+        entries,
+        lookup_order_valid,
+    })
 }
 
 fn parse_archive_path(args: &[String]) -> Result<PathBuf, String> {
@@ -281,24 +335,8 @@ fn parse_archive_path(args: &[String]) -> Result<PathBuf, String> {
     }
 }
 
-fn json_string(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
+fn serialize_json<T: Serialize>(value: &T) -> Result<String, String> {
+    serde_json::to_string(value).map_err(|err| err.to_string())
 }
 
 fn usage() -> String {
@@ -333,7 +371,8 @@ mod tests {
 
     #[test]
     fn archive_json_has_schema_version() {
-        let json = archive_inspect_json("archive.lib", "NRes", 3, Some(true));
+        let json = archive_inspect_json("archive.lib", "NRes", 3, Some(true))
+            .expect("serialize archive inspection");
 
         assert!(json.contains("\"schema_version\":\"fparkan-archive-inspect-v1\""));
         assert!(json.contains("\"kind\":\"NRes\""));
@@ -353,11 +392,56 @@ mod tests {
             ..fparkan_prototype::PrototypeGraphReport::default()
         };
 
-        let json = prototype_inspect_json("root", &graph, &report);
+        let json =
+            prototype_inspect_json("root", &graph, &report).expect("serialize prototype graph");
 
         assert_eq!(
             json,
             "{\"schema_version\":\"fparkan-prototype-inspect-v1\",\"key\":\"root\",\"roots\":1,\"prototype_requests\":1,\"resolved\":1,\"unit_references\":0,\"unit_components\":0,\"direct_references\":1,\"wear\":0,\"materials\":0,\"textures\":0,\"lightmaps\":0,\"failures\":0}"
+        );
+    }
+
+    #[test]
+    fn mission_graph_json_has_canonical_field_order() {
+        let loaded = fparkan_runtime::LoadedMission {
+            key: "mission".to_string(),
+            path_count: 3,
+            clan_count: 4,
+            object_count: 2,
+            extra_count: 5,
+            land_msh_path: "land.msh".to_string(),
+            land_map_path: "land.map".to_string(),
+            build_category_count: 0,
+            areal_count: 0,
+            surface_count: 0,
+            registered_objects: 0,
+            graph_unit_reference_count: 7,
+            graph_direct_reference_count: 6,
+            graph_unit_component_count: 8,
+            graph_root_count: 9,
+            asset_visual_count: 0,
+            graph_resolved_count: 10,
+            graph_mesh_dependency_count: 0,
+            graph_failure_count: 15,
+            graph_wear_request_count: 0,
+            graph_wear_resolved_count: 11,
+            graph_material_slot_count: 0,
+            graph_material_resolved_count: 12,
+            graph_texture_request_count: 0,
+            graph_texture_resolved_count: 13,
+            graph_lightmap_request_count: 0,
+            graph_lightmap_resolved_count: 14,
+            asset_model_count: 0,
+            asset_material_count: 0,
+            asset_texture_count: 0,
+            asset_lightmap_count: 0,
+        };
+
+        let json = mission_graph_json("mission", &loaded).expect("serialize mission graph");
+
+        assert_eq!(
+            json,
+            "{\"schema_version\":\"fparkan-mission-graph-v1\",\"mission\":\"mission\",\"objects\":2,\"paths\":3,\"clans\":4,\"extras\":5,\"roots\":9,\"direct_references\":6,\"unit_references\":7,\"unit_components\":8,\"prototype_requests\":10,\"wear\":11,\"materials\":12,\"textures\":13,\"lightmaps\":14,\"failures\":15}"
         );
     }
 }
