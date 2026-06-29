@@ -103,7 +103,7 @@ S1-NRES-023	covered	cargo test -p fparkan-nres --offline editor_payload_update_r
 S1-NRES-024	covered	cargo test -p fparkan-nres --offline editor_rename_rebuilds_search_mapping
 S1-NRES-025	covered	cargo test -p fparkan-nres --offline editor_rejects_invalid_authoring_names
 S1-NRES-026	covered	cargo test -p fparkan-nres --offline strict_rejects_unsorted_lookup_table
-S1-LIMIT-001	partial	cargo test -p fparkan-nres --offline rejects_directory_size_before_allocation decode_rejects_entry_count_above_limit decode_rejects_preserved_bytes_above_limit; explicit max_input_bytes boundary test is still missing
+S1-LIMIT-001	covered	cargo test -p fparkan-nres --offline rejects_directory_size_before_allocation decode_rejects_entry_count_above_limit decode_rejects_input_bytes_above_limit decode_rejects_preserved_bytes_above_limit
 S1-NRES-PROP-001	covered	cargo test -p fparkan-nres --offline generated_archives_preserve_lossless_and_canonical_semantics
 S1-NRES-PROP-002	covered	cargo test -p fparkan-nres --offline generated_editor_updates_roundtrip
 S1-NRES-FUZZ-001	covered	cargo test -p fparkan-nres --offline arbitrary_small_inputs_do_not_panic_or_overallocate

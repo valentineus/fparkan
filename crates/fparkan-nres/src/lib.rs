@@ -1634,6 +1634,34 @@ mod tests {
     }
 
     #[test]
+    fn decode_rejects_input_bytes_above_limit() {
+        let bytes = build_archive(&[SyntheticEntry {
+            type_id: 1,
+            attr1: 0,
+            attr2: 0,
+            attr3: 0,
+            name: "payload",
+            payload: b"data",
+        }]);
+        let exact_size = u64::try_from(bytes.len()).expect("archive size");
+
+        assert!(matches!(
+            decode_with_limits(
+                arc(bytes),
+                ReadProfile::Strict,
+                DecodeLimits {
+                    max_input_bytes: exact_size - 1,
+                    ..DecodeLimits::default()
+                }
+            ),
+            Err(NresError::Binary(DecodeError::LimitExceeded {
+                count,
+                limit
+            })) if count == exact_size && limit == exact_size - 1
+        ));
+    }
+
+    #[test]
     fn decode_rejects_preserved_bytes_above_limit() {
         let bytes = build_archive_with_nonzero_prefix_gap(&[SyntheticEntry {
             type_id: 1,
