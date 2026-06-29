@@ -21,7 +21,7 @@
 //! Shared inspection helpers for format-backed tooling.
 
 use fparkan_diagnostics::{
-    diagnostic, render_human, Diagnostic, DiagnosticCode, DiagnosticContext, Phase,
+    diagnostic, render_human, Diagnostic, DiagnosticCode, DiagnosticContext, Phase, SourceSpan,
 };
 use fparkan_msh::{decode_msh, validate_msh, ModelAsset};
 use fparkan_nres::{decode as decode_nres, NresDocument, ReadProfile};
@@ -215,7 +215,7 @@ fn inspect_archive_bytes(
             Arc::from(bytes.to_vec().into_boxed_slice()),
             ReadProfile::Compatible,
         )
-        .map_err(|err| archive_parse_diagnostic("S1.NRES.DECODE", source, err.to_string()))?;
+        .map_err(|err| archive_parse_diagnostic("S1.NRES.DECODE", source, bytes, err.to_string()))?;
         let mut sample = Vec::new();
         for entry in document.entries().iter().take(sample_limit) {
             sample.push(NresEntrySummary {
@@ -234,7 +234,7 @@ fn inspect_archive_bytes(
             Arc::from(bytes.to_vec().into_boxed_slice()),
             fparkan_rsli::ReadProfile::Compatible,
         )
-        .map_err(|err| archive_parse_diagnostic("S1.RSLI.DECODE", source, err.to_string()))?;
+        .map_err(|err| archive_parse_diagnostic("S1.RSLI.DECODE", source, bytes, err.to_string()))?;
         Ok(ArchiveInspection::Rsli {
             entries: document.entries().len(),
         })
@@ -242,6 +242,7 @@ fn inspect_archive_bytes(
         Err(archive_parse_diagnostic(
             "S1.RESOURCE.UNSUPPORTED_ARCHIVE",
             source,
+            bytes,
             "unsupported archive magic".to_string(),
         ))
     }
@@ -386,11 +387,16 @@ fn load_model_document_from_root(
 fn archive_parse_diagnostic(
     code: &'static str,
     source: Option<&Path>,
+    bytes: &[u8],
     message: String,
 ) -> Diagnostic {
     diagnostic(DiagnosticCode(code), message).with_context(DiagnosticContext {
         phase: Some(Phase::Parse),
         path: source.map(|path| path.display().to_string()),
+        span: Some(SourceSpan {
+            offset: 0,
+            length: u64::try_from(bytes.len().min(4)).unwrap_or(4),
+        }),
         ..DiagnosticContext::default()
     })
 }
@@ -414,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn archive_diagnostic_preserves_source_path() {
+    fn archive_diagnostic_preserves_source_path_phase_and_span() {
         let dir = temp_dir("inspect-diagnostic");
         let path = dir.join("broken.nres");
         fs::write(&path, b"NRes").expect("broken nres");
@@ -427,6 +433,14 @@ mod tests {
         assert_eq!(
             diagnostic.context.path.as_deref(),
             Some(expected_path.as_str())
+        );
+        assert_eq!(diagnostic.context.phase, Some(Phase::Parse));
+        assert_eq!(
+            diagnostic.context.span,
+            Some(SourceSpan {
+                offset: 0,
+                length: 4
+            })
         );
     }
 
