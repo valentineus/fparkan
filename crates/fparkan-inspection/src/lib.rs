@@ -20,14 +20,20 @@
 )]
 //! Shared inspection helpers for format-backed tooling.
 
-use fparkan_msh::{decode_msh, validate_msh};
+use fparkan_diagnostics::{
+    diagnostic, render_human, Diagnostic, DiagnosticCode, DiagnosticContext, Phase,
+};
+use fparkan_msh::{decode_msh, validate_msh, ModelAsset};
 use fparkan_nres::{decode as decode_nres, NresDocument, ReadProfile};
+use fparkan_path::{normalize_relative, PathPolicy};
 use fparkan_resource::{archive_path, resource_name, CachedResourceRepository, ResourceRepository};
 use fparkan_rsli::decode as decode_rsli;
 use fparkan_terrain_format::{decode_land_map, decode_land_msh};
 use fparkan_texm::decode_texm;
-use fparkan_vfs::DirectoryVfs;
+use fparkan_vfs::{DirectoryVfs, Vfs};
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -131,7 +137,70 @@ pub enum LandFileKind {
 ///
 /// Returns a string error when the archive cannot be read or decoded.
 pub fn inspect_archive_file(path: &Path, sample_limit: usize) -> Result<ArchiveInspection, String> {
-    let bytes = fs::read(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    inspect_archive_file_diagnostic(path, sample_limit).map_err(|diagnostic| render_human(&diagnostic))
+}
+
+/// Inspects a format archive and returns a structured diagnostic on failure.
+///
+/// # Errors
+///
+/// Returns a [`Diagnostic`] when the archive cannot be read or decoded.
+pub fn inspect_archive_file_diagnostic(
+    path: &Path,
+    sample_limit: usize,
+) -> Result<ArchiveInspection, Diagnostic> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().ok_or_else(|| {
+        diagnostic(
+            DiagnosticCode("S1.VFS.PATH"),
+            format!("{}: archive path has no file name", path.display()),
+        )
+        .with_context(DiagnosticContext {
+            phase: Some(Phase::Read),
+            path: Some(path.display().to_string()),
+            ..DiagnosticContext::default()
+        })
+    })?;
+    #[cfg(unix)]
+    let raw_name = file_name.as_bytes();
+    #[cfg(not(unix))]
+    let raw_name = file_name
+        .to_str()
+        .ok_or_else(|| {
+            diagnostic(
+                DiagnosticCode("S1.VFS.PATH"),
+                format!("{}: archive file name is not valid text", path.display()),
+            )
+            .with_context(DiagnosticContext {
+                phase: Some(Phase::Read),
+                path: Some(path.display().to_string()),
+                ..DiagnosticContext::default()
+            })
+        })?
+        .as_bytes();
+    let normalized = normalize_relative(raw_name, PathPolicy::HostCompatible).map_err(|err| {
+        diagnostic(
+            DiagnosticCode("S1.VFS.PATH"),
+            format!("{}: {err}", path.display()),
+        )
+        .with_context(DiagnosticContext {
+            phase: Some(Phase::Read),
+            path: Some(path.display().to_string()),
+            ..DiagnosticContext::default()
+        })
+    })?;
+    let vfs = DirectoryVfs::new(parent);
+    let bytes = vfs.read(&normalized).map_err(|err| {
+        diagnostic(
+            DiagnosticCode("S1.VFS.READ"),
+            format!("{}: {err}", path.display()),
+        )
+        .with_context(DiagnosticContext {
+            phase: Some(Phase::Read),
+            path: Some(path.display().to_string()),
+            ..DiagnosticContext::default()
+        })
+    })?;
     inspect_archive_bytes(&bytes, sample_limit, Some(path))
 }
 
@@ -140,13 +209,13 @@ fn inspect_archive_bytes(
     bytes: &[u8],
     sample_limit: usize,
     source: Option<&Path>,
-) -> Result<ArchiveInspection, String> {
+) -> Result<ArchiveInspection, Diagnostic> {
     if bytes.starts_with(b"NRes") {
         let document = decode_nres(
             Arc::from(bytes.to_vec().into_boxed_slice()),
             ReadProfile::Compatible,
         )
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| archive_parse_diagnostic("S1.NRES.DECODE", source, err.to_string()))?;
         let mut sample = Vec::new();
         for entry in document.entries().iter().take(sample_limit) {
             sample.push(NresEntrySummary {
@@ -165,15 +234,16 @@ fn inspect_archive_bytes(
             Arc::from(bytes.to_vec().into_boxed_slice()),
             fparkan_rsli::ReadProfile::Compatible,
         )
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| archive_parse_diagnostic("S1.RSLI.DECODE", source, err.to_string()))?;
         Ok(ArchiveInspection::Rsli {
             entries: document.entries().len(),
         })
     } else {
-        match source {
-            Some(path) => Err(format!("{}: unsupported archive magic", path.display())),
-            None => Err("unsupported archive magic".to_string()),
-        }
+        Err(archive_parse_diagnostic(
+            "S1.RESOURCE.UNSUPPORTED_ARCHIVE",
+            source,
+            "unsupported archive magic".to_string(),
+        ))
     }
 }
 
@@ -200,6 +270,22 @@ pub fn inspect_model_from_root(
         indices: validated.indices.len(),
         batches: validated.batches.len(),
     })
+}
+
+/// Loads and validates a model resource through repository-backed lookup.
+///
+/// # Errors
+///
+/// Returns a string error when the resource cannot be resolved or parsed as a
+/// valid model payload.
+pub fn load_model_from_root(
+    root: &Path,
+    archive: &str,
+    resource: &str,
+) -> Result<ModelAsset, String> {
+    let document = load_model_document_from_root(root, archive, resource)?;
+    let msh = decode_msh(&document).map_err(|err| err.to_string())?;
+    validate_msh(&msh).map_err(|err| err.to_string())
 }
 
 /// Inspects a texture through repository-backed resource lookup.
@@ -288,6 +374,27 @@ fn read_resource_bytes(root: &Path, archive: &str, name: &str) -> Result<Arc<[u8
     Ok(Arc::from(bytes.into_owned()))
 }
 
+fn load_model_document_from_root(
+    root: &Path,
+    archive: &str,
+    resource: &str,
+) -> Result<NresDocument, String> {
+    let bytes = read_resource_bytes(root, archive, resource)?;
+    decode_nres(bytes, ReadProfile::Compatible).map_err(|err| err.to_string())
+}
+
+fn archive_parse_diagnostic(
+    code: &'static str,
+    source: Option<&Path>,
+    message: String,
+) -> Diagnostic {
+    diagnostic(DiagnosticCode(code), message).with_context(DiagnosticContext {
+        phase: Some(Phase::Parse),
+        path: source.map(|path| path.display().to_string()),
+        ..DiagnosticContext::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +411,23 @@ mod tests {
 
         let error = inspect_archive_file(&path, 0).expect_err("malformed archive");
         assert!(error.contains("entry table out of bounds"));
+    }
+
+    #[test]
+    fn archive_diagnostic_preserves_source_path() {
+        let dir = temp_dir("inspect-diagnostic");
+        let path = dir.join("broken.nres");
+        fs::write(&path, b"NRes").expect("broken nres");
+
+        let diagnostic =
+            inspect_archive_file_diagnostic(&path, 0).expect_err("diagnostic failure");
+
+        assert_eq!(diagnostic.code.0, "S1.NRES.DECODE");
+        let expected_path = path.display().to_string();
+        assert_eq!(
+            diagnostic.context.path.as_deref(),
+            Some(expected_path.as_str())
+        );
     }
 
     #[test]

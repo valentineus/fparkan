@@ -35,6 +35,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -69,6 +71,8 @@ pub struct DiscoverOptions {
 pub struct ManifestEntry {
     /// Normalized relative path.
     pub path: String,
+    /// Byte-exact relative host path used for reopening corpus files.
+    pub host_rel_path: PathBuf,
     /// File size in bytes.
     pub size: u64,
     /// SHA-256 content fingerprint.
@@ -188,7 +192,7 @@ pub fn discover(root: &Path, options: DiscoverOptions) -> Result<CorpusManifest,
     }
     let mut files = Vec::new();
     walk(root, root, options, &mut files)?;
-    files.sort_by(|a, b| a.path.cmp(&b.path));
+    files.sort_by(|a, b| a.host_rel_path.cmp(&b.host_rel_path));
 
     let kind = classify(root, &files);
     let casefold_collisions = detect_casefold_collisions(&files);
@@ -243,17 +247,22 @@ fn walk(
         let rel = path
             .strip_prefix(root)
             .map_err(|_| CorpusError::InvalidPath(path.display().to_string()))?;
-        let rel_text = rel
+        #[cfg(unix)]
+        let rel_bytes = rel.as_os_str().as_bytes();
+        #[cfg(not(unix))]
+        let rel_bytes = rel
             .to_str()
-            .ok_or_else(|| CorpusError::InvalidPath(path.display().to_string()))?;
-        let normalized = normalize_relative(rel_text.as_bytes(), PathPolicy::HostCompatible)
-            .map_err(|_| CorpusError::InvalidPath(rel_text.to_string()))?;
+            .ok_or_else(|| CorpusError::InvalidPath(path.display().to_string()))?
+            .as_bytes();
+        let normalized = normalize_relative(rel_bytes, PathPolicy::HostCompatible)
+            .map_err(|_| CorpusError::InvalidPath(path.display().to_string()))?;
         let bytes = fs::read(&path).map_err(|source| CorpusError::Io {
             path: path.clone(),
             source,
         })?;
         out.push(ManifestEntry {
-            path: normalized.as_str().to_string(),
+            path: normalized.display_lossy().to_string(),
+            host_rel_path: rel.to_path_buf(),
             size: metadata.len(),
             hash: sha256(&bytes),
         });
@@ -285,7 +294,7 @@ fn detect_casefold_collisions(files: &[ManifestEntry]) -> Vec<Vec<String>> {
     let mut grouped: BTreeMap<Vec<u8>, BTreeSet<String>> = BTreeMap::new();
     for file in files {
         grouped
-            .entry(ascii_lookup_key(file.path.as_bytes()).0)
+            .entry(ascii_lookup_key(path_identity_bytes(&file.host_rel_path)).0)
             .or_default()
             .insert(file.path.clone());
     }
@@ -353,7 +362,7 @@ fn inspect_report_file(
 ) -> CorpusFileRecord {
     let lower = entry.path.to_ascii_lowercase();
     let mut variant = inspect_path_metrics(&lower, metrics);
-    let path = root.join(&entry.path);
+    let path = root.join(&entry.host_rel_path);
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(source) => {
@@ -436,6 +445,17 @@ fn inspect_report_file(
         status: CorpusFileStatus::Ok,
         variant,
         message: None,
+    }
+}
+
+fn path_identity_bytes(path: &Path) -> &[u8] {
+    #[cfg(unix)]
+    {
+        path.as_os_str().as_bytes()
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_str().unwrap_or_default().as_bytes()
     }
 }
 
@@ -767,11 +787,7 @@ mod tests {
     fn report_json_contains_metrics_and_hashes_not_paths_or_payloads() {
         let manifest = CorpusManifest {
             kind: CorpusKind::Part1,
-            files: vec![ManifestEntry {
-                path: "secret/payload.bin".to_string(),
-                size: 4,
-                hash: sha256(b"DATA"),
-            }],
+            files: vec![manifest_entry("secret/payload.bin", 4, sha256(b"DATA"))],
             casefold_collisions: Vec::new(),
         };
         let report = report(Path::new("."), &manifest).expect("report");
@@ -791,11 +807,7 @@ mod tests {
         let root = temp_dir("report-missing");
         let manifest = CorpusManifest {
             kind: CorpusKind::Unknown,
-            files: vec![ManifestEntry {
-                path: "missing.lib".to_string(),
-                size: 1,
-                hash: sha256(b"missing"),
-            }],
+            files: vec![manifest_entry("missing.lib", 1, sha256(b"missing"))],
             casefold_collisions: Vec::new(),
         };
 
@@ -814,11 +826,7 @@ mod tests {
         fs::write(root.join("bad.lib"), b"NRes").expect("bad nres");
         let manifest = CorpusManifest {
             kind: CorpusKind::Unknown,
-            files: vec![ManifestEntry {
-                path: "bad.lib".to_string(),
-                size: 4,
-                hash: sha256(b"NRes"),
-            }],
+            files: vec![manifest_entry("bad.lib", 4, sha256(b"NRes"))],
             casefold_collisions: Vec::new(),
         };
 
@@ -857,11 +865,11 @@ mod tests {
         fs::write(root.join("archive.lib"), &archive).expect("archive");
         let manifest = CorpusManifest {
             kind: CorpusKind::Unknown,
-            files: vec![ManifestEntry {
-                path: "archive.lib".to_string(),
-                size: u64::try_from(archive.len()).expect("archive size"),
-                hash: sha256(&archive),
-            }],
+            files: vec![manifest_entry(
+                "archive.lib",
+                u64::try_from(archive.len()).expect("archive size"),
+                sha256(&archive),
+            )],
             casefold_collisions: Vec::new(),
         };
 
@@ -886,11 +894,7 @@ mod tests {
         fs::write(root.join("WORLD/MAP/land.map"), build_nres(&[])).expect("land map");
         let manifest = CorpusManifest {
             kind: CorpusKind::Unknown,
-            files: vec![ManifestEntry {
-                path: "WORLD/MAP/land.map".to_string(),
-                size: 16,
-                hash: sha256(b"land.map"),
-            }],
+            files: vec![manifest_entry("WORLD/MAP/land.map", 16, sha256(b"land.map"))],
             casefold_collisions: Vec::new(),
         };
 
@@ -909,11 +913,7 @@ mod tests {
         fs::write(root.join("WORLD/MAP/land.msh"), build_nres(&[])).expect("land msh");
         let manifest = CorpusManifest {
             kind: CorpusKind::Unknown,
-            files: vec![ManifestEntry {
-                path: "WORLD/MAP/land.msh".to_string(),
-                size: 16,
-                hash: sha256(b"land.msh"),
-            }],
+            files: vec![manifest_entry("WORLD/MAP/land.msh", 16, sha256(b"land.msh"))],
             casefold_collisions: Vec::new(),
         };
 
@@ -932,11 +932,11 @@ mod tests {
         fs::write(root.join("MISSIONS/test/data.tma"), b"malformed tma").expect("tma");
         let manifest = CorpusManifest {
             kind: CorpusKind::Unknown,
-            files: vec![ManifestEntry {
-                path: "MISSIONS/test/data.tma".to_string(),
-                size: 12,
-                hash: sha256(b"malformed tma"),
-            }],
+            files: vec![manifest_entry(
+                "MISSIONS/test/data.tma",
+                12,
+                sha256(b"malformed tma"),
+            )],
             casefold_collisions: Vec::new(),
         };
 
@@ -955,11 +955,7 @@ mod tests {
         fs::write(root.join("units/unit.dat"), vec![0u8; 120]).expect("unit");
         let manifest = CorpusManifest {
             kind: CorpusKind::Unknown,
-            files: vec![ManifestEntry {
-                path: "units/unit.dat".to_string(),
-                size: 120,
-                hash: sha256(&[0u8; 120]),
-            }],
+            files: vec![manifest_entry("units/unit.dat", 120, sha256(&[0u8; 120]))],
             casefold_collisions: Vec::new(),
         };
 
@@ -977,11 +973,7 @@ mod tests {
         fs::write(root.join("patch.nl"), b"NL malformed").expect("rsli");
         let manifest = CorpusManifest {
             kind: CorpusKind::Unknown,
-            files: vec![ManifestEntry {
-                path: "patch.nl".to_string(),
-                size: 12,
-                hash: sha256(b"NL malformed"),
-            }],
+            files: vec![manifest_entry("patch.nl", 12, sha256(b"NL malformed"))],
             casefold_collisions: Vec::new(),
         };
 
@@ -1052,16 +1044,8 @@ mod tests {
         let manifest = CorpusManifest {
             kind: CorpusKind::Unknown,
             files: vec![
-                ManifestEntry {
-                    path: "Textures/Foo.TEX".to_string(),
-                    size: 1,
-                    hash: sha256(b"first"),
-                },
-                ManifestEntry {
-                    path: "textures/foo.tex".to_string(),
-                    size: 1,
-                    hash: sha256(b"second"),
-                },
+                manifest_entry("Textures/Foo.TEX", 1, sha256(b"first")),
+                manifest_entry("textures/foo.tex", 1, sha256(b"second")),
             ],
             casefold_collisions: Vec::new(),
         };
@@ -1081,11 +1065,7 @@ mod tests {
     fn fingerprint_changes() {
         let mut manifest = CorpusManifest {
             kind: CorpusKind::Unknown,
-            files: vec![ManifestEntry {
-                path: "a".to_string(),
-                size: 1,
-                hash: sha256(b"before"),
-            }],
+            files: vec![manifest_entry("a", 1, sha256(b"before"))],
             casefold_collisions: Vec::new(),
         };
         let a = fingerprint(&manifest);
@@ -1116,6 +1096,29 @@ mod tests {
         write_report_atomic(&tmp, &report).expect("write");
         assert!(tmp.is_file());
         let _ = fs::remove_file(tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_supports_non_utf8_host_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = temp_dir("non-utf8");
+        let file_name = OsString::from_vec(vec![0xFF, b'.', b'b', b'i', b'n']);
+        let file_path = root.join(&file_name);
+        if let Err(err) = fs::write(&file_path, b"raw") {
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+
+        let manifest = discover(&root, DiscoverOptions::default()).expect("manifest");
+
+        assert_eq!(manifest.files.len(), 1);
+        assert_eq!(manifest.files[0].path, "\u{FFFD}.bin");
+        assert_eq!(manifest.files[0].host_rel_path, PathBuf::from(&file_name));
+        let _ = fs::remove_dir_all(root);
     }
 
     struct TestNresEntry<'a> {
@@ -1162,6 +1165,15 @@ mod tests {
         let total_size = u32::try_from(out.len()).expect("total size");
         out[12..16].copy_from_slice(&total_size.to_le_bytes());
         out
+    }
+
+    fn manifest_entry(path: &str, size: u64, hash: Sha256Digest) -> ManifestEntry {
+        ManifestEntry {
+            path: path.to_string(),
+            host_rel_path: PathBuf::from(path),
+            size,
+            hash,
+        }
     }
 
     fn push_u32(out: &mut Vec<u8>, value: u32) {

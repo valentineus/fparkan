@@ -6,8 +6,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+fparkan-diagnostics = { path = "../fparkan-diagnostics" }
 fparkan-msh = { path = "../fparkan-msh" }
 fparkan-nres = { path = "../fparkan-nres" }
+fparkan-path = { path = "../fparkan-path" }
 fparkan-rsli = { path = "../fparkan-rsli" }
 fparkan-resource = { path = "../fparkan-resource" }
 fparkan-terrain-format = { path = "../fparkan-terrain-format" }
