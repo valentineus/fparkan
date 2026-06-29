@@ -125,13 +125,47 @@ impl ResourceBytes {
 #[derive(Debug)]
 pub enum ResourceError {
     /// Missing archive.
-    MissingArchive,
+    MissingArchive {
+        /// Logical archive path.
+        path: NormalizedPath,
+    },
     /// Missing entry.
     MissingEntry,
     /// Stale or invalid handle.
     InvalidHandle,
     /// Handle belongs to an older archive generation.
     StaleHandle,
+    /// Resource archive path is invalid.
+    InvalidPath {
+        /// Display form of the rejected path.
+        path: String,
+        /// Validation or VFS rejection text.
+        source: String,
+    },
+    /// Host lookup matched multiple candidates.
+    PathAmbiguous {
+        /// Ambiguous host path description.
+        path: String,
+    },
+    /// Backing storage failed while reading an archive.
+    Storage {
+        /// Logical archive path.
+        path: NormalizedPath,
+        /// Underlying storage error.
+        source: std::io::Error,
+    },
+    /// Archive magic is unsupported.
+    UnsupportedArchive {
+        /// Logical archive path.
+        path: NormalizedPath,
+    },
+    /// Archive bytes were found but could not be decoded.
+    ArchiveDecode {
+        /// Logical archive path.
+        path: NormalizedPath,
+        /// Decoder failure text.
+        source: String,
+    },
     /// Format error.
     Format(String),
     /// Entry-specific read error.
@@ -141,6 +175,8 @@ pub enum ResourceError {
         /// Source error text.
         source: String,
     },
+    /// Repository exhausted stable archive handle space.
+    HandleSpaceExhausted,
     /// Repository state lock was poisoned.
     Poisoned,
 }
@@ -148,7 +184,9 @@ pub enum ResourceError {
 impl std::fmt::Display for ResourceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MissingArchive => write!(f, "archive was not found"),
+            Self::MissingArchive { path } => {
+                write!(f, "archive was not found: {}", path.display_lossy())
+            }
             Self::MissingEntry => write!(f, "resource entry was not found in the archive"),
             Self::InvalidHandle => write!(
                 f,
@@ -156,6 +194,31 @@ impl std::fmt::Display for ResourceError {
             ),
             Self::StaleHandle => {
                 write!(f, "resource handle belongs to an older archive generation")
+            }
+            Self::InvalidPath { path, source } => {
+                write!(f, "invalid resource archive path {path}: {source}")
+            }
+            Self::PathAmbiguous { path } => {
+                write!(f, "resource archive path is ambiguous: {path}")
+            }
+            Self::Storage { path, source } => {
+                write!(
+                    f,
+                    "failed to read archive {}: {source}",
+                    path.display_lossy()
+                )
+            }
+            Self::UnsupportedArchive { path } => write!(
+                f,
+                "unsupported archive magic for resource repository: {}",
+                path.display_lossy()
+            ),
+            Self::ArchiveDecode { path, source } => {
+                write!(
+                    f,
+                    "failed to decode archive {}: {source}",
+                    path.display_lossy()
+                )
             }
             Self::Format(message) => write!(f, "resource archive format error: {message}"),
             Self::EntryRead { key, source } => {
@@ -169,12 +232,22 @@ impl std::fmt::Display for ResourceError {
                     source
                 )
             }
+            Self::HandleSpaceExhausted => {
+                write!(f, "too many open archives for handle space")
+            }
             Self::Poisoned => write!(f, "resource repository state lock was poisoned"),
         }
     }
 }
 
-impl std::error::Error for ResourceError {}
+impl std::error::Error for ResourceError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Storage { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 /// Repository port.
 pub trait ResourceRepository {
@@ -376,7 +449,10 @@ impl CachedResourceRepository {
 
 impl ResourceRepository for CachedResourceRepository {
     fn open_archive(&self, path: &NormalizedPath) -> Result<ArchiveId, ResourceError> {
-        let bytes = self.vfs.read(path).map_err(resource_error_from_vfs)?;
+        let bytes = self
+            .vfs
+            .read(path)
+            .map_err(|err| resource_error_from_vfs(path, err))?;
         let fingerprint = sha256(&bytes);
         let mut slot = decode_archive(path.clone(), bytes, fingerprint)?;
         let mut state = self.state.lock().map_err(|_| ResourceError::Poisoned)?;
@@ -401,9 +477,9 @@ impl ResourceRepository for CachedResourceRepository {
             state.evict_archives(id)?;
             return Ok(id);
         }
-        let id = ArchiveId(u64::try_from(state.archives.len()).map_err(|_| {
-            ResourceError::Format("too many open archives for handle space".to_string())
-        })?);
+        let id = ArchiveId(
+            u64::try_from(state.archives.len()).map_err(|_| ResourceError::HandleSpaceExhausted)?,
+        );
         state.paths.insert(key, id);
         state.archives.push(slot);
         state.load_archive(id)?;
@@ -722,8 +798,13 @@ fn decode_archive(
 ) -> Result<ArchiveSlot, ResourceError> {
     let archive_bytes = bytes.len();
     if bytes.starts_with(b"NRes") {
-        let document = fparkan_nres::decode(bytes, fparkan_nres::ReadProfile::Compatible)
-            .map_err(|err| ResourceError::Format(err.to_string()))?;
+        let document =
+            fparkan_nres::decode(bytes, fparkan_nres::ReadProfile::Compatible).map_err(|err| {
+                ResourceError::ArchiveDecode {
+                    path: path.clone(),
+                    source: err.to_string(),
+                }
+            })?;
         return Ok(ArchiveSlot {
             path,
             fingerprint,
@@ -735,8 +816,13 @@ fn decode_archive(
         });
     }
     if bytes.get(0..4) == Some(b"NL\0\x01") {
-        let document = fparkan_rsli::decode(bytes, fparkan_rsli::ReadProfile::Compatible)
-            .map_err(|err| ResourceError::Format(err.to_string()))?;
+        let document =
+            fparkan_rsli::decode(bytes, fparkan_rsli::ReadProfile::Compatible).map_err(|err| {
+                ResourceError::ArchiveDecode {
+                    path: path.clone(),
+                    source: err.to_string(),
+                }
+            })?;
         return Ok(ArchiveSlot {
             path,
             fingerprint,
@@ -747,17 +833,21 @@ fn decode_archive(
             document: Some(Arc::new(ArchiveDocument::Rsli(document))),
         });
     }
-    Err(ResourceError::Format(
-        "unsupported archive magic for resource repository".to_string(),
-    ))
+    Err(ResourceError::UnsupportedArchive { path })
 }
 
-fn resource_error_from_vfs(err: VfsError) -> ResourceError {
+fn resource_error_from_vfs(path: &NormalizedPath, err: VfsError) -> ResourceError {
     match err {
-        VfsError::NotFound(_) => ResourceError::MissingArchive,
-        VfsError::Ambiguous(path) => ResourceError::Format(format!("ambiguous VFS path: {path}")),
-        VfsError::Io(source) => ResourceError::Format(source.to_string()),
-        VfsError::Path => ResourceError::Format("invalid VFS path".to_string()),
+        VfsError::NotFound(_) => ResourceError::MissingArchive { path: path.clone() },
+        VfsError::Ambiguous(path) => ResourceError::PathAmbiguous { path },
+        VfsError::Io(source) => ResourceError::Storage {
+            path: path.clone(),
+            source,
+        },
+        VfsError::Path => ResourceError::InvalidPath {
+            path: path.display_lossy().to_string(),
+            source: "invalid VFS path".to_string(),
+        },
     }
 }
 
@@ -771,11 +861,14 @@ pub fn resource_name(raw: impl AsRef<[u8]>) -> ResourceName {
 ///
 /// # Errors
 ///
-/// Returns [`ResourceError::Format`] when the path is not a valid relative
+/// Returns [`ResourceError::InvalidPath`] when the path is not a valid relative
 /// resource path.
 pub fn archive_path(raw: impl AsRef<[u8]>) -> Result<NormalizedPath, ResourceError> {
-    normalize_relative(raw.as_ref(), PathPolicy::StrictLegacy)
-        .map_err(|err| ResourceError::Format(err.to_string()))
+    let raw = raw.as_ref();
+    normalize_relative(raw, PathPolicy::StrictLegacy).map_err(|err| ResourceError::InvalidPath {
+        path: String::from_utf8_lossy(raw).to_string(),
+        source: err.to_string(),
+    })
 }
 
 fn c_name_bytes(raw: &[u8; 12]) -> &[u8] {
@@ -786,8 +879,36 @@ fn c_name_bytes(raw: &[u8; 12]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fparkan_vfs::{DirectoryVfs, MemoryVfs};
+    use fparkan_vfs::{DirectoryVfs, MemoryVfs, Vfs, VfsEntry, VfsError, VfsMetadata};
     use std::path::PathBuf;
+
+    enum FailingReadMode {
+        Ambiguous(&'static str),
+        Io,
+        Path,
+    }
+
+    struct FailingReadVfs {
+        mode: FailingReadMode,
+    }
+
+    impl Vfs for FailingReadVfs {
+        fn metadata(&self, _path: &NormalizedPath) -> Result<VfsMetadata, VfsError> {
+            unreachable!("metadata is not used in these tests");
+        }
+
+        fn read(&self, _path: &NormalizedPath) -> Result<Arc<[u8]>, VfsError> {
+            match self.mode {
+                FailingReadMode::Ambiguous(path) => Err(VfsError::Ambiguous(path.to_string())),
+                FailingReadMode::Io => Err(VfsError::Io(std::io::Error::other("disk offline"))),
+                FailingReadMode::Path => Err(VfsError::Path),
+            }
+        }
+
+        fn list(&self, _prefix: &NormalizedPath) -> Result<Vec<VfsEntry>, VfsError> {
+            unreachable!("list is not used in these tests");
+        }
+    }
 
     #[test]
     fn cached_repository_reads_synthetic_nres() {
@@ -882,7 +1003,10 @@ mod tests {
         let state = repo.state.lock().expect("state");
         assert_eq!(state.archives.len(), 1);
         assert_eq!(state.payload_cache.entries.len(), 1);
-        assert_eq!(state.paths.get(path.identity_bytes()).copied(), Some(archive));
+        assert_eq!(
+            state.paths.get(path.identity_bytes()).copied(),
+            Some(archive)
+        );
         drop(state);
 
         assert_eq!(repo.open_archive(&path).expect("cached archive"), archive);
@@ -1029,6 +1153,95 @@ mod tests {
     }
 
     #[test]
+    fn missing_archive_error_carries_logical_path() {
+        let path = archive_path(b"missing/archive.lib").expect("path");
+        let repo = CachedResourceRepository::new(Arc::new(MemoryVfs::default()));
+
+        let err = repo.open_archive(&path).expect_err("missing archive");
+
+        match err {
+            ResourceError::MissingArchive { path: missing } => assert_eq!(missing, path),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_archive_maps_vfs_errors_to_typed_variants() {
+        let path = archive_path(b"broken/archive.lib").expect("path");
+
+        let ambiguous = CachedResourceRepository::new(Arc::new(FailingReadVfs {
+            mode: FailingReadMode::Ambiguous("/tmp/root/archive.lib"),
+        }));
+        match ambiguous
+            .open_archive(&path)
+            .expect_err("ambiguous archive")
+        {
+            ResourceError::PathAmbiguous { path } => assert_eq!(path, "/tmp/root/archive.lib"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let io = CachedResourceRepository::new(Arc::new(FailingReadVfs {
+            mode: FailingReadMode::Io,
+        }));
+        match io.open_archive(&path).expect_err("storage failure") {
+            ResourceError::Storage {
+                path: archive,
+                source,
+            } => {
+                assert_eq!(archive, path);
+                assert_eq!(source.to_string(), "disk offline");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        let invalid = CachedResourceRepository::new(Arc::new(FailingReadVfs {
+            mode: FailingReadMode::Path,
+        }));
+        match invalid.open_archive(&path).expect_err("invalid path") {
+            ResourceError::InvalidPath { path: raw, source } => {
+                assert_eq!(raw, "broken/archive.lib");
+                assert_eq!(source, "invalid VFS path");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_archive_reports_decode_and_magic_errors() {
+        let malformed_path = archive_path(b"broken/malformed.lib").expect("malformed path");
+        let unsupported_path = archive_path(b"broken/unsupported.lib").expect("unsupported path");
+        let mut vfs = MemoryVfs::default();
+        vfs.insert(
+            malformed_path.clone(),
+            Arc::from(b"NRes".to_vec().into_boxed_slice()),
+        );
+        vfs.insert(
+            unsupported_path.clone(),
+            Arc::from(b"ABCD".to_vec().into_boxed_slice()),
+        );
+        let repo = CachedResourceRepository::new(Arc::new(vfs));
+
+        match repo
+            .open_archive(&malformed_path)
+            .expect_err("malformed archive should fail")
+        {
+            ResourceError::ArchiveDecode { path, source } => {
+                assert_eq!(path, malformed_path);
+                assert!(!source.is_empty());
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        match repo
+            .open_archive(&unsupported_path)
+            .expect_err("unsupported archive should fail")
+        {
+            ResourceError::UnsupportedArchive { path } => assert_eq!(path, unsupported_path),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn lossy_equivalent_archive_paths_remain_distinct() {
         let first_path = archive_path(b"DATA/\xFF.lib").expect("first path");
         let second_path = archive_path(b"DATA/\xFE.lib").expect("second path");
@@ -1097,10 +1310,16 @@ mod tests {
             .find(first_archive, &resource_name(b"a.bin"))
             .expect("find first")
             .expect("first handle");
-        assert_eq!(repo.read(first_handle).expect("read first").as_slice(), b"first");
+        assert_eq!(
+            repo.read(first_handle).expect("read first").as_slice(),
+            b"first"
+        );
 
         let _second_archive = repo.open_archive(&second_path).expect("open second");
-        assert!(matches!(repo.read(first_handle), Err(ResourceError::StaleHandle)));
+        assert!(matches!(
+            repo.read(first_handle),
+            Err(ResourceError::StaleHandle)
+        ));
 
         let reopened = repo.open_archive(&first_path).expect("reopen first");
         let refreshed = repo
@@ -1109,7 +1328,10 @@ mod tests {
             .expect("refreshed handle");
         assert_eq!(reopened, first_archive);
         assert_ne!(refreshed, first_handle);
-        assert_eq!(repo.read(refreshed).expect("read refreshed").as_slice(), b"first");
+        assert_eq!(
+            repo.read(refreshed).expect("read refreshed").as_slice(),
+            b"first"
+        );
     }
 
     #[test]
@@ -1131,6 +1353,20 @@ mod tests {
         assert_eq!(
             ResourceError::StaleHandle.to_string(),
             "resource handle belongs to an older archive generation"
+        );
+        assert_eq!(
+            ResourceError::MissingArchive {
+                path: archive_path(b"missing.lib").expect("missing path")
+            }
+            .to_string(),
+            "archive was not found: missing.lib"
+        );
+        assert_eq!(
+            ResourceError::PathAmbiguous {
+                path: "/tmp/root/MATERIAL.LIB".to_string()
+            }
+            .to_string(),
+            "resource archive path is ambiguous: /tmp/root/MATERIAL.LIB"
         );
     }
 

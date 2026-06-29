@@ -927,7 +927,7 @@ fn resolve_texm_from_candidates<'a, R: ResourceRepository>(
         };
         let archive = match repository.open_archive(path) {
             Ok(archive) => archive,
-            Err(ResourceError::MissingArchive) => {
+            Err(ResourceError::MissingArchive { .. }) => {
                 missing_archive = true;
                 continue;
             }
@@ -1120,7 +1120,7 @@ fn read_optional_key<R: ResourceRepository>(
 ) -> Result<Option<Arc<[u8]>>, AssetError> {
     let archive = match repository.open_archive(&key.archive) {
         Ok(archive) => archive,
-        Err(ResourceError::MissingArchive | ResourceError::MissingEntry) => return Ok(None),
+        Err(ResourceError::MissingArchive { .. } | ResourceError::MissingEntry) => return Ok(None),
         Err(err) => {
             let label = label.unwrap_or("asset");
             return Err(map_resource_error(label, key, err));

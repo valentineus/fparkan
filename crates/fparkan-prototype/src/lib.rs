@@ -1012,7 +1012,7 @@ fn collect_registry_refs(
     }
     let archive_id = match repository.open_archive(registry_archive) {
         Ok(id) => id,
-        Err(ResourceError::MissingArchive) => return Ok(None),
+        Err(ResourceError::MissingArchive { .. }) => return Ok(None),
         Err(err) => return Err(err.into()),
     };
     let Some((registry_entry, _matched_name)) =
@@ -1082,7 +1082,7 @@ fn find_mesh_resource(
 ) -> Result<Option<ResourceKey>, PrototypeError> {
     let archive_id = match repository.open_archive(archive) {
         Ok(id) => id,
-        Err(ResourceError::MissingArchive) => return Ok(None),
+        Err(ResourceError::MissingArchive { .. }) => return Ok(None),
         Err(err) => return Err(err.into()),
     };
     let candidates = mesh_name_candidates(&model_key.0);
