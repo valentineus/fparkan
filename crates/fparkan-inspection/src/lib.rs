@@ -259,8 +259,17 @@ pub fn inspect_model_from_root(
     archive: &str,
     resource: &str,
 ) -> Result<ModelInspection, String> {
-    let bytes = read_resource_bytes(root, archive, resource)?;
-    let document = decode_nres(bytes, ReadProfile::Compatible).map_err(|err| err.to_string())?;
+    let bytes =
+        read_resource_bytes_diagnostic(root, archive, resource).map_err(|err| render_human(&err))?;
+    let document = decode_nres(bytes.clone(), ReadProfile::Compatible).map_err(|err| {
+        render_human(&resource_parse_diagnostic(
+            "S1.NRES.DECODE",
+            archive,
+            resource,
+            &bytes,
+            err.to_string(),
+        ))
+    })?;
     let msh = decode_msh(&document).map_err(|err| err.to_string())?;
     let validated = validate_msh(&msh).map_err(|err| err.to_string())?;
     Ok(ModelInspection {
@@ -284,7 +293,10 @@ pub fn load_model_from_root(
     archive: &str,
     resource: &str,
 ) -> Result<ModelAsset, String> {
-    let document = load_model_document_from_root(root, archive, resource)?;
+    let document =
+        load_model_document_from_root_diagnostic(root, archive, resource).map_err(|err| {
+            render_human(&err)
+        })?;
     let msh = decode_msh(&document).map_err(|err| err.to_string())?;
     validate_msh(&msh).map_err(|err| err.to_string())
 }
@@ -300,7 +312,8 @@ pub fn inspect_texture_from_root(
     archive: &str,
     resource: &str,
 ) -> Result<TextureInspection, String> {
-    let bytes = read_resource_bytes(root, archive, resource)?;
+    let bytes =
+        read_resource_bytes_diagnostic(root, archive, resource).map_err(|err| render_human(&err))?;
     let document = decode_texm(bytes).map_err(|err| err.to_string())?;
     Ok(TextureInspection {
         width: document.width(),
@@ -355,33 +368,86 @@ fn inspect_land_map(document: &NresDocument) -> Result<MapInspection, String> {
     })
 }
 
-fn read_resource_bytes(root: &Path, archive: &str, name: &str) -> Result<Arc<[u8]>, String> {
+fn read_resource_bytes_diagnostic(
+    root: &Path,
+    archive: &str,
+    name: &str,
+) -> Result<Arc<[u8]>, Diagnostic> {
     let repository = CachedResourceRepository::new(Arc::new(DirectoryVfs::new(root)));
-    let archive_path = archive_path(archive.as_bytes()).map_err(|err| err.to_string())?;
+    let archive_path = archive_path(archive.as_bytes()).map_err(|err| {
+        diagnostic(DiagnosticCode("S1.PATH.ARCHIVE"), err.to_string()).with_context(
+            DiagnosticContext {
+                phase: Some(Phase::Resolve),
+                path: Some(archive.to_string()),
+                archive_entry: Some(name.to_string()),
+                ..DiagnosticContext::default()
+            },
+        )
+    })?;
     let resource_name = resource_name(name.as_bytes());
     let archive_handle = repository
         .open_archive(&archive_path)
-        .map_err(|err| format!("{err}"))?;
+        .map_err(|err| {
+            diagnostic(DiagnosticCode("S1.RESOURCE.OPEN_ARCHIVE"), err.to_string()).with_context(
+                DiagnosticContext {
+                    phase: Some(Phase::Read),
+                    path: Some(archive.to_string()),
+                    archive_entry: Some(name.to_string()),
+                    ..DiagnosticContext::default()
+                },
+            )
+        })?;
     let Some(handle) = repository
         .find(archive_handle, &resource_name)
-        .map_err(|err| format!("{err}"))?
+        .map_err(|err| {
+            diagnostic(DiagnosticCode("S1.RESOURCE.FIND"), err.to_string()).with_context(
+                DiagnosticContext {
+                    phase: Some(Phase::Resolve),
+                    path: Some(archive.to_string()),
+                    archive_entry: Some(name.to_string()),
+                    ..DiagnosticContext::default()
+                },
+            )
+        })?
     else {
-        return Err(format!(
-            "resource not found: {archive}/{}",
-            String::from_utf8_lossy(name.as_bytes())
-        ));
+        return Err(
+            diagnostic(
+                DiagnosticCode("S1.RESOURCE.MISSING_ENTRY"),
+                format!(
+                    "resource not found: {archive}/{}",
+                    String::from_utf8_lossy(name.as_bytes())
+                ),
+            )
+            .with_context(DiagnosticContext {
+                phase: Some(Phase::Resolve),
+                path: Some(archive.to_string()),
+                archive_entry: Some(name.to_string()),
+                ..DiagnosticContext::default()
+            }),
+        );
     };
-    let bytes = repository.read(handle).map_err(|err| format!("{err}"))?;
+    let bytes = repository.read(handle).map_err(|err| {
+        diagnostic(DiagnosticCode("S1.RESOURCE.READ"), err.to_string()).with_context(
+            DiagnosticContext {
+                phase: Some(Phase::Read),
+                path: Some(archive.to_string()),
+                archive_entry: Some(name.to_string()),
+                ..DiagnosticContext::default()
+            },
+        )
+    })?;
     Ok(Arc::from(bytes.into_owned()))
 }
 
-fn load_model_document_from_root(
+fn load_model_document_from_root_diagnostic(
     root: &Path,
     archive: &str,
     resource: &str,
-) -> Result<NresDocument, String> {
-    let bytes = read_resource_bytes(root, archive, resource)?;
-    decode_nres(bytes, ReadProfile::Compatible).map_err(|err| err.to_string())
+) -> Result<NresDocument, Diagnostic> {
+    let bytes = read_resource_bytes_diagnostic(root, archive, resource)?;
+    decode_nres(bytes.clone(), ReadProfile::Compatible).map_err(|err| {
+        resource_parse_diagnostic("S1.NRES.DECODE", archive, resource, &bytes, err.to_string())
+    })
 }
 
 fn archive_parse_diagnostic(
@@ -401,11 +467,34 @@ fn archive_parse_diagnostic(
     })
 }
 
+fn resource_parse_diagnostic(
+    code: &'static str,
+    archive: &str,
+    resource: &str,
+    bytes: &[u8],
+    message: String,
+) -> Diagnostic {
+    diagnostic(DiagnosticCode(code), message).with_context(DiagnosticContext {
+        phase: Some(Phase::Parse),
+        path: Some(archive.to_string()),
+        archive_entry: Some(resource.to_string()),
+        span: Some(SourceSpan {
+            offset: 0,
+            length: u64::try_from(bytes.len().min(4)).unwrap_or(4),
+        }),
+        ..DiagnosticContext::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write as _;
     use std::path::PathBuf;
+
+    const TEST_NRES_HEADER_LEN: usize = 16;
+    const TEST_NRES_NAME_LEN: usize = 36;
+    const TEST_NRES_VERSION_0100: u32 = 0x100;
 
     #[test]
     fn inspect_rsli_rejects_malformed_archive() {
@@ -454,6 +543,28 @@ mod tests {
         let _ = inspect_archive_file(&archive, 2);
     }
 
+    #[test]
+    fn model_archive_diagnostic_preserves_archive_entry_context() {
+        let dir = temp_dir("inspect-model-diagnostic");
+        let archive = dir.join("models.rlb");
+        fs::write(&archive, build_single_entry_nres(b"BROKEN.MSH", b"NRes")).expect("archive");
+
+        let diagnostic = load_model_document_from_root_diagnostic(&dir, "models.rlb", "BROKEN.MSH")
+            .expect_err("nested diagnostic failure");
+
+        assert_eq!(diagnostic.code.0, "S1.NRES.DECODE");
+        assert_eq!(diagnostic.context.phase, Some(Phase::Parse));
+        assert_eq!(diagnostic.context.path.as_deref(), Some("models.rlb"));
+        assert_eq!(diagnostic.context.archive_entry.as_deref(), Some("BROKEN.MSH"));
+        assert_eq!(
+            diagnostic.context.span,
+            Some(SourceSpan {
+                offset: 0,
+                length: 4
+            })
+        );
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let base = PathBuf::from("/tmp")
             .join("fparkan-inspection-tests")
@@ -461,5 +572,35 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).expect("tmp dir");
         base
+    }
+
+    fn build_single_entry_nres(name: &[u8], payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![0; TEST_NRES_HEADER_LEN];
+        let payload_offset = u32::try_from(out.len()).expect("payload offset");
+        out.extend_from_slice(payload);
+        let padding = (8 - (out.len() % 8)) % 8;
+        out.resize(out.len() + padding, 0);
+
+        push_u32(&mut out, 1);
+        push_u32(&mut out, 0);
+        push_u32(&mut out, 0);
+        push_u32(&mut out, u32::try_from(payload.len()).expect("payload len"));
+        push_u32(&mut out, 0);
+        let mut raw_name = [0; TEST_NRES_NAME_LEN];
+        raw_name[..name.len()].copy_from_slice(name);
+        out.extend_from_slice(&raw_name);
+        push_u32(&mut out, payload_offset);
+        push_u32(&mut out, 0);
+
+        out[0..4].copy_from_slice(b"NRes");
+        out[4..8].copy_from_slice(&TEST_NRES_VERSION_0100.to_le_bytes());
+        out[8..12].copy_from_slice(&1_u32.to_le_bytes());
+        let total_size = u32::try_from(out.len()).expect("total size");
+        out[12..16].copy_from_slice(&total_size.to_le_bytes());
+        out
+    }
+
+    fn push_u32(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_le_bytes());
     }
 }

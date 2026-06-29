@@ -154,7 +154,7 @@ S1-RES-004	covered	cargo test -p fparkan-resource --offline entry_read_error_car
 S1-RES-005	covered	cargo test -p fparkan-resource --offline archive_cache_evicts_by_byte_budget
 S1-RES-006	covered	cargo test -p fparkan-resource --offline archive_cache_eviction_makes_old_handles_stale
 S1-RES-007	covered	cargo test -p fparkan-resource --offline lossy_equivalent_archive_paths_remain_distinct
-S1-DIAG-001	partial	cargo test -p fparkan-inspection --offline archive_diagnostic_preserves_source_path_phase_and_span; archive_entry coverage is still missing
+S1-DIAG-001	covered	cargo test -p fparkan-inspection --offline archive_diagnostic_preserves_source_path_phase_and_span model_archive_diagnostic_preserves_archive_entry_context
 S1-VFS-001	covered	cargo test -p fparkan-vfs --offline memory_vfs_uses_exact_lookup
 S1-VFS-002	covered	cargo test -p fparkan-vfs --offline overlay_vfs_uses_first_matching_layer
 S1-VFS-003	covered	cargo test -p fparkan-vfs --offline directory_vfs_resolves_ascii_casefolded_segments
