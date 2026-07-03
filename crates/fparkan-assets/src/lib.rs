@@ -39,7 +39,7 @@ pub use fparkan_terrain::{TerrainError, TerrainWorld};
 use fparkan_terrain_format::{decode_build_dat, decode_land_map, decode_land_msh};
 pub use fparkan_terrain_format::{BuildCategory, TerrainFormatError};
 use fparkan_texm::{decode_texm, TexmDocument, TexmError};
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
@@ -586,15 +586,33 @@ pub fn prepare_mission_assets_with_repository<R: ResourceRepository>(
     root_prototype_spans: &[std::ops::Range<usize>],
     prototypes: &[EffectivePrototype],
 ) -> Result<MissionAssets, AssetError> {
+    prepare_mission_assets_with_repository_internal(
+        repository,
+        root_prototype_spans,
+        prototypes,
+        AssetIdentityPolicy::default(),
+    )
+}
+
+fn prepare_mission_assets_with_repository_internal<R: ResourceRepository>(
+    repository: &R,
+    root_prototype_spans: &[std::ops::Range<usize>],
+    prototypes: &[EffectivePrototype],
+    identity_policy: AssetIdentityPolicy,
+) -> Result<MissionAssets, AssetError> {
     if prototypes.is_empty() {
         return Ok(MissionAssets::default());
     }
     let mut visual_index_by_id: HashMap<AssetId<PreparedVisual>, PreparedVisualSignature> =
         HashMap::new();
-    let mut model_ids = HashSet::new();
-    let mut wear_ids = HashSet::new();
-    let mut material_ids = HashSet::new();
-    let mut texture_ids = HashSet::new();
+    let mut model_index_by_id: HashMap<AssetId<PreparedModel>, PreparedModelSignature> =
+        HashMap::new();
+    let mut wear_index_by_id: HashMap<AssetId<PreparedWear>, PreparedWearSignature> =
+        HashMap::new();
+    let mut material_index_by_id: HashMap<AssetId<PreparedMaterial>, PreparedMaterialSignature> =
+        HashMap::new();
+    let mut texture_index_by_id: HashMap<AssetId<PreparedTexture>, PreparedTextureSignature> =
+        HashMap::new();
     let mut models = Vec::new();
     let mut wears = Vec::new();
     let mut materials = Vec::new();
@@ -603,7 +621,7 @@ pub fn prepare_mission_assets_with_repository<R: ResourceRepository>(
     let mut prototype_visual_ids = Vec::with_capacity(prototypes.len());
 
     for proto in prototypes {
-        let visual_id = AssetId::new(stable_visual_id(proto));
+        let visual_id = AssetId::new((identity_policy.visual_id)(proto));
         let signature = prepared_visual_signature(proto);
         match visual_index_by_id.get(&visual_id) {
             Some(existing) if existing != &signature => {
@@ -614,7 +632,8 @@ pub fn prepare_mission_assets_with_repository<R: ResourceRepository>(
             Some(_) => {}
             None => {
                 visual_index_by_id.insert(visual_id, signature);
-                let bundle = prepare_visual_with_repository_internal(repository, proto)?;
+                let bundle =
+                    prepare_visual_with_repository_internal(repository, proto, identity_policy)?;
                 if bundle.visual.id != visual_id {
                     // Defensive check. stable IDs are deterministic for the same inputs.
                     return Err(AssetError::InvalidPrototype(
@@ -622,22 +641,42 @@ pub fn prepare_mission_assets_with_repository<R: ResourceRepository>(
                     ));
                 }
                 if let Some(model) = bundle.model {
-                    if model_ids.insert(model.id) {
+                    if insert_asset_signature(
+                        &mut model_index_by_id,
+                        model.id,
+                        prepared_model_signature(&model),
+                        "model",
+                    )? {
                         models.push(model);
                     }
                 }
                 if let Some(wear) = bundle.wear {
-                    if wear_ids.insert(wear.id) {
+                    if insert_asset_signature(
+                        &mut wear_index_by_id,
+                        wear.id,
+                        prepared_wear_signature(&wear),
+                        "wear",
+                    )? {
                         wears.push(wear);
                     }
                 }
                 for material in bundle.materials {
-                    if material_ids.insert(material.id) {
+                    if insert_asset_signature(
+                        &mut material_index_by_id,
+                        material.id,
+                        prepared_material_signature(&material),
+                        "material",
+                    )? {
                         materials.push(material);
                     }
                 }
                 for texture in bundle.textures {
-                    if texture_ids.insert(texture.id) {
+                    if insert_asset_signature(
+                        &mut texture_index_by_id,
+                        texture.id,
+                        prepared_texture_signature(&texture),
+                        "texture",
+                    )? {
                         textures.push(texture);
                     }
                 }
@@ -688,6 +727,65 @@ enum PreparedVisualSignature {
     },
 }
 
+#[derive(Clone, Copy)]
+struct AssetIdentityPolicy {
+    visual_id: fn(&EffectivePrototype) -> u64,
+    model_id: fn(&EffectivePrototype) -> u64,
+    wear_id: fn(&EffectivePrototype) -> u64,
+    material_id: fn(&EffectivePrototype, u16, &ResourceName) -> u64,
+    texture_id: fn(&ResourceKey, PreparedTextureUsage) -> u64,
+}
+
+impl Default for AssetIdentityPolicy {
+    fn default() -> Self {
+        Self {
+            visual_id: stable_visual_id,
+            model_id: stable_model_id,
+            wear_id: stable_wear_id,
+            material_id: stable_material_id,
+            texture_id: stable_texture_id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResourceSignature {
+    archive: Vec<u8>,
+    name: Vec<u8>,
+    type_id: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedModelSignature {
+    source: ResourceSignature,
+    node_count: usize,
+    slot_count: usize,
+    batch_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedWearSignature {
+    source: ResourceSignature,
+    material_slots: usize,
+    lightmap_slots: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedMaterialSignature {
+    source: ResourceSignature,
+    texture_requests: Vec<Vec<u8>>,
+    lightmap_requests: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PreparedTextureSignature {
+    source: ResourceSignature,
+    usage: PreparedTextureUsage,
+    width: u32,
+    height: u32,
+    mip_count: usize,
+}
+
 fn prepared_visual_signature(proto: &EffectivePrototype) -> PreparedVisualSignature {
     match &proto.geometry {
         PrototypeGeometry::Mesh(key) => PreparedVisualSignature::Mesh {
@@ -699,6 +797,82 @@ fn prepared_visual_signature(proto: &EffectivePrototype) -> PreparedVisualSignat
         PrototypeGeometry::NonGeometric => PreparedVisualSignature::NonGeometric {
             dependency_count: proto.dependencies.len(),
         },
+    }
+}
+
+fn resource_signature(key: &ResourceKey) -> ResourceSignature {
+    ResourceSignature {
+        archive: key.archive.identity_bytes().to_vec(),
+        name: key.name.0.clone(),
+        type_id: key.type_id,
+    }
+}
+
+fn prepared_model_signature(model: &PreparedModel) -> PreparedModelSignature {
+    PreparedModelSignature {
+        source: resource_signature(&model.source),
+        node_count: model.validated.node_count,
+        slot_count: model.validated.slots.len(),
+        batch_count: model.validated.batches.len(),
+    }
+}
+
+fn prepared_wear_signature(wear: &PreparedWear) -> PreparedWearSignature {
+    PreparedWearSignature {
+        source: resource_signature(&wear.source),
+        material_slots: wear.table.entries.len(),
+        lightmap_slots: wear.table.lightmaps.len(),
+    }
+}
+
+fn prepared_material_signature(material: &PreparedMaterial) -> PreparedMaterialSignature {
+    PreparedMaterialSignature {
+        source: resource_signature(&material.source),
+        texture_requests: material
+            .texture_requests
+            .iter()
+            .map(|name| name.0.clone())
+            .collect(),
+        lightmap_requests: material
+            .lightmap_requests
+            .iter()
+            .map(|name| name.0.clone())
+            .collect(),
+    }
+}
+
+fn prepared_texture_signature(texture: &PreparedTexture) -> PreparedTextureSignature {
+    PreparedTextureSignature {
+        source: resource_signature(&texture.source),
+        usage: texture.usage,
+        width: texture.texm.width(),
+        height: texture.texm.height(),
+        mip_count: texture.texm.mip_count(),
+    }
+}
+
+fn insert_asset_signature<T, S>(
+    signatures: &mut HashMap<AssetId<T>, S>,
+    id: AssetId<T>,
+    signature: S,
+    label: &str,
+) -> Result<bool, AssetError>
+where
+    S: Eq,
+{
+    match signatures.entry(id) {
+        Entry::Occupied(existing) => {
+            if existing.get() != &signature {
+                return Err(AssetError::InvalidPrototype(format!(
+                    "stable {label} id collision between unrelated assets"
+                )));
+            }
+            Ok(false)
+        }
+        Entry::Vacant(entry) => {
+            entry.insert(signature);
+            Ok(true)
+        }
     }
 }
 
@@ -1059,7 +1233,10 @@ pub fn prepare_visual_with_repository<R: ResourceRepository>(
     repository: &R,
     proto: &EffectivePrototype,
 ) -> Result<PreparedVisual, AssetError> {
-    Ok(prepare_visual_with_repository_internal(repository, proto)?.visual)
+    Ok(
+        prepare_visual_with_repository_internal(repository, proto, AssetIdentityPolicy::default())?
+            .visual,
+    )
 }
 
 struct PreparedVisualBundle {
@@ -1073,6 +1250,7 @@ struct PreparedVisualBundle {
 fn prepare_visual_with_repository_internal<R: ResourceRepository>(
     repository: &R,
     proto: &EffectivePrototype,
+    identity_policy: AssetIdentityPolicy,
 ) -> Result<PreparedVisualBundle, AssetError> {
     let PrototypeGeometry::Mesh(mesh_key) = &proto.geometry else {
         return Ok(PreparedVisualBundle {
@@ -1091,7 +1269,7 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
     .map_err(AssetError::Nres)?;
     let msh_document = decode_msh(&nres).map_err(AssetError::Msh)?;
     let model = validate_msh(&msh_document).map_err(AssetError::Msh)?;
-    let model_id = AssetId::new(stable_model_id(proto));
+    let model_id = AssetId::new((identity_policy.model_id)(proto));
     let prepared_model = PreparedModel {
         id: model_id,
         source: mesh_key.clone(),
@@ -1107,7 +1285,7 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
     };
     let wear = decode_wear(&read_key(repository, &wear_key, Some("wear"))?)
         .map_err(AssetError::Material)?;
-    let wear_id = AssetId::new(stable_wear_id(proto));
+    let wear_id = AssetId::new((identity_policy.wear_id)(proto));
     let prepared_wear = PreparedWear {
         id: wear_id,
         source: wear_key.clone(),
@@ -1134,7 +1312,11 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
         let material =
             resolve_material(repository, &wear, material_index).map_err(AssetError::Material)?;
         material_count += 1;
-        let material_id = AssetId::new(stable_material_id(proto, material_index, &material.name));
+        let material_id = AssetId::new((identity_policy.material_id)(
+            proto,
+            material_index,
+            &material.name,
+        ));
         material_ids.push(material_id);
         let material_key = ResourceKey {
             archive: parse_path("material.lib")?,
@@ -1152,8 +1334,12 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
         });
 
         for texture in texture_requests {
-            let prepared_texture =
-                prepare_texture(repository, &texture, PreparedTextureUsage::Diffuse)?;
+            let prepared_texture = prepare_texture(
+                repository,
+                &texture,
+                PreparedTextureUsage::Diffuse,
+                identity_policy,
+            )?;
             texture_ids.push(prepared_texture.id);
             prepared_textures.push(prepared_texture);
             texture_count += 1;
@@ -1165,6 +1351,7 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
             repository,
             &lightmap.lightmap,
             PreparedTextureUsage::Lightmap,
+            identity_policy,
         )?;
         lightmap_ids.push(prepared_lightmap.id);
         prepared_textures.push(prepared_lightmap);
@@ -1173,7 +1360,7 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
 
     Ok(PreparedVisualBundle {
         visual: PreparedVisual {
-            id: AssetId::new(stable_visual_id(proto)),
+            id: AssetId::new((identity_policy.visual_id)(proto)),
             mesh: Some(mesh_key.clone()),
             model_id: Some(model_id),
             wear_id: Some(wear_id),
@@ -1426,6 +1613,7 @@ fn prepare_texture<R: ResourceRepository>(
     repository: &R,
     name: &ResourceName,
     usage: PreparedTextureUsage,
+    identity_policy: AssetIdentityPolicy,
 ) -> Result<PreparedTexture, AssetError> {
     let (archive, label) = match usage {
         PreparedTextureUsage::Diffuse => (TEXTURES_ARCHIVE, "texture"),
@@ -1441,7 +1629,7 @@ fn prepare_texture<R: ResourceRepository>(
     };
     let texm = decode_texm(bytes).map_err(AssetError::Texture)?;
     Ok(PreparedTexture {
-        id: AssetId::new(stable_texture_id(&key, usage)),
+        id: AssetId::new((identity_policy.texture_id)(&key, usage)),
         source: key,
         texm,
         usage,
@@ -2005,6 +2193,50 @@ mod tests {
     }
 
     #[test]
+    fn forced_model_id_collision_is_rejected() {
+        assert_forced_collision(
+            AssetIdentityPolicy {
+                model_id: |_| 7,
+                ..AssetIdentityPolicy::default()
+            },
+            "stable model id collision",
+        );
+    }
+
+    #[test]
+    fn forced_wear_id_collision_is_rejected() {
+        assert_forced_collision(
+            AssetIdentityPolicy {
+                wear_id: |_| 11,
+                ..AssetIdentityPolicy::default()
+            },
+            "stable wear id collision",
+        );
+    }
+
+    #[test]
+    fn forced_material_id_collision_is_rejected() {
+        assert_forced_collision(
+            AssetIdentityPolicy {
+                material_id: |_, _, _| 13,
+                ..AssetIdentityPolicy::default()
+            },
+            "stable material id collision",
+        );
+    }
+
+    #[test]
+    fn forced_texture_id_collision_is_rejected() {
+        assert_forced_collision(
+            AssetIdentityPolicy {
+                texture_id: |_, _| 17,
+                ..AssetIdentityPolicy::default()
+            },
+            "stable texture id collision",
+        );
+    }
+
+    #[test]
     fn graph_report_uses_strict_texture_archive_policy() {
         let mesh_key = ResourceKey {
             archive: parse_path("static.rlb").expect("archive"),
@@ -2122,6 +2354,20 @@ mod tests {
         assert_eq!(plan.texture_count, 77);
     }
 
+    fn assert_forced_collision(policy: AssetIdentityPolicy, expected: &str) {
+        let (repo, prototypes) = collision_fixture();
+
+        let err = prepare_mission_assets_with_repository_internal(
+            &repo,
+            &[0..1, 1..2],
+            &prototypes,
+            policy,
+        )
+        .expect_err("collision should fail");
+
+        assert!(err.to_string().contains(expected), "{err}");
+    }
+
     fn fixture_root(part: &str) -> PathBuf {
         let variable = match part {
             "IS" => "FPARKAN_CORPUS_PART1_ROOT",
@@ -2137,6 +2383,121 @@ mod tests {
             root.display()
         );
         root
+    }
+
+    fn collision_fixture() -> (CachedResourceRepository, Vec<EffectivePrototype>) {
+        let msh = minimal_model_archive();
+        let mat0_a = mat0_with_texture(b"TEX_A");
+        let mat0_b = mat0_with_texture(b"TEX_B");
+        let texm_a = texm_payload();
+        let texm_b = texm_payload();
+        let lightmap_a = texm_payload();
+        let lightmap_b = texm_payload();
+        let repo = repository_with_archives_meta(&[
+            (
+                "static.rlb",
+                &[
+                    TestNresEntry {
+                        name: b"tree_a.msh",
+                        payload: &msh,
+                        type_id: 0x4853_454D,
+                        attr2: 0,
+                    },
+                    TestNresEntry {
+                        name: b"tree_a.wea",
+                        payload: b"1\n0 MAT_A\n\nLIGHTMAPS\n1\n0 LM_A\n",
+                        type_id: WEAR_KIND,
+                        attr2: 0,
+                    },
+                    TestNresEntry {
+                        name: b"tree_b.msh",
+                        payload: &msh,
+                        type_id: 0x4853_454D,
+                        attr2: 0,
+                    },
+                    TestNresEntry {
+                        name: b"tree_b.wea",
+                        payload: b"1\n0 MAT_B\n\nLIGHTMAPS\n1\n0 LM_B\n",
+                        type_id: WEAR_KIND,
+                        attr2: 0,
+                    },
+                ],
+            ),
+            (
+                "material.lib",
+                &[
+                    TestNresEntry {
+                        name: b"MAT_A",
+                        payload: &mat0_a,
+                        type_id: MAT0_KIND,
+                        attr2: 0,
+                    },
+                    TestNresEntry {
+                        name: b"MAT_B",
+                        payload: &mat0_b,
+                        type_id: MAT0_KIND,
+                        attr2: 0,
+                    },
+                ],
+            ),
+            (
+                TEXTURES_ARCHIVE,
+                &[
+                    TestNresEntry {
+                        name: b"TEX_A",
+                        payload: &texm_a,
+                        type_id: 0,
+                        attr2: 0,
+                    },
+                    TestNresEntry {
+                        name: b"TEX_B",
+                        payload: &texm_b,
+                        type_id: 0,
+                        attr2: 0,
+                    },
+                ],
+            ),
+            (
+                LIGHTMAP_ARCHIVE,
+                &[
+                    TestNresEntry {
+                        name: b"LM_A",
+                        payload: &lightmap_a,
+                        type_id: 0,
+                        attr2: 0,
+                    },
+                    TestNresEntry {
+                        name: b"LM_B",
+                        payload: &lightmap_b,
+                        type_id: 0,
+                        attr2: 0,
+                    },
+                ],
+            ),
+        ]);
+        let prototypes = vec![
+            EffectivePrototype {
+                key: fparkan_prototype::PrototypeKey(resource_name(b"tree_a")),
+                geometry: PrototypeGeometry::Mesh(ResourceKey {
+                    archive: parse_path("static.rlb").expect("archive"),
+                    name: resource_name(b"tree_a.msh"),
+                    type_id: Some(0x4853_454D),
+                }),
+                source: fparkan_prototype::PrototypeSource::DirectArchive,
+                dependencies: Vec::new(),
+            },
+            EffectivePrototype {
+                key: fparkan_prototype::PrototypeKey(resource_name(b"tree_b")),
+                geometry: PrototypeGeometry::Mesh(ResourceKey {
+                    archive: parse_path("static.rlb").expect("archive"),
+                    name: resource_name(b"tree_b.msh"),
+                    type_id: Some(0x4853_454D),
+                }),
+                source: fparkan_prototype::PrototypeSource::DirectArchive,
+                dependencies: Vec::new(),
+            },
+        ];
+        (repo, prototypes)
     }
 
     fn repository_with_archives(

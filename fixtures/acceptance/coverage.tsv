@@ -214,6 +214,7 @@ S2-ASSET-MODEL-001	covered	cargo test -p fparkan-assets --offline prepare_single
 S2-ASSET-WEAR-001	covered	cargo test -p fparkan-assets --offline prepare_single_visual_mission_assets_materialize_model_wear_material_and_texture_payloads
 S2-ASSET-MATERIAL-001	covered	cargo test -p fparkan-assets --offline prepare_single_visual_mission_assets_materialize_model_wear_material_and_texture_payloads
 S2-ASSET-TEXM-001	covered	cargo test -p fparkan-assets --offline prepare_single_visual_mission_assets_materialize_model_wear_material_and_texture_payloads
+S2-ASSET-ID-001	covered	cargo test -p fparkan-assets --offline forced_model_id_collision_is_rejected forced_wear_id_collision_is_rejected forced_material_id_collision_is_rejected forced_texture_id_collision_is_rejected
 S2-RUNTIME-DRAFT-001	covered	local testdata/IS and testdata/IS2; cargo test -p fparkan-runtime --offline -- --ignored selected_is_and_is2_missions_preserve_runtime_object_drafts
 S2-CLI-JSON-001	covered	cargo test -p fparkan-cli --offline prototype_graph_json_has_canonical_field_order mission_graph_json_has_canonical_field_order
 S2-LICENSED-MISSION-P1-001	covered	local testdata/IS; cargo test -p fparkan-runtime --offline -- --ignored selected_is_and_is2_missions_preserve_runtime_object_drafts
