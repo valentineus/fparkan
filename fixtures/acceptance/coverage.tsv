@@ -209,12 +209,14 @@ S2-GRAPH-005	covered	cargo test -p fparkan-cli --offline prototype_graph_json_ha
 S2-GRAPH-006	covered	cargo test -p fparkan-prototype --offline graph_report_records_resolved_roots_and_failures
 S2-GRAPH-EDGE-001	covered	cargo test -p fparkan-assets --offline graph_materializes_visual_dependency_nodes_and_edges
 S2-GRAPH-PROV-001	covered	cargo test -p fparkan-assets --offline graph_visual_dependency_edges_preserve_root_and_parent_provenance
+S2-GRAPH-IDEMP-001	covered	cargo test -p fparkan-assets --offline graph_visual_dependency_expansion_is_idempotent
 S2-UNIT-EMPTY-001	covered	cargo test -p fparkan-prototype --offline empty_unit_dat_resolves_as_zero_component_root
 S2-ASSET-MODEL-001	covered	cargo test -p fparkan-assets --offline prepare_single_visual_mission_assets_materialize_model_wear_material_and_texture_payloads
 S2-ASSET-WEAR-001	covered	cargo test -p fparkan-assets --offline prepare_single_visual_mission_assets_materialize_model_wear_material_and_texture_payloads
 S2-ASSET-MATERIAL-001	covered	cargo test -p fparkan-assets --offline prepare_single_visual_mission_assets_materialize_model_wear_material_and_texture_payloads
 S2-ASSET-TEXM-001	covered	cargo test -p fparkan-assets --offline prepare_single_visual_mission_assets_materialize_model_wear_material_and_texture_payloads
 S2-ASSET-ID-001	covered	cargo test -p fparkan-assets --offline forced_model_id_collision_is_rejected forced_wear_id_collision_is_rejected forced_material_id_collision_is_rejected forced_texture_id_collision_is_rejected
+S2-ASSET-LIMIT-001	covered	cargo test -p fparkan-assets --offline profiled_asset_preparation_reports_unique_asset_counts asset_preparation_limits_reject_texture_pixel_budget
 S2-RUNTIME-DRAFT-001	covered	local testdata/IS and testdata/IS2; cargo test -p fparkan-runtime --offline -- --ignored selected_is_and_is2_missions_preserve_runtime_object_drafts
 S2-CLI-JSON-001	covered	cargo test -p fparkan-cli --offline prototype_graph_json_has_canonical_field_order mission_graph_json_has_canonical_field_order
 S2-LICENSED-MISSION-P1-001	covered	local testdata/IS; cargo test -p fparkan-runtime --offline -- --ignored selected_is_and_is2_missions_preserve_runtime_object_drafts

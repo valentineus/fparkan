@@ -128,6 +128,8 @@ pub struct PrototypeGraph {
     pub prototype_requests: Vec<PrototypeKey>,
     /// Mission object-local spans of effective prototype requests.
     pub root_prototype_request_spans: Vec<std::ops::Range<usize>>,
+    /// Whether visual dependency expansion has already been applied.
+    pub visual_dependencies_expanded: bool,
     /// Materialized prototype dependency graph nodes.
     pub nodes: Vec<PrototypeGraphNode>,
     /// Materialized prototype dependency graph edges.
@@ -187,8 +189,6 @@ pub enum PrototypeGraphNodeKind {
     TextureResource,
     /// TEXM lightmap dependency.
     LightmapResource,
-    /// Effect dependency placeholder for later stages.
-    EffectResource,
     /// Non-geometric prototype.
     NonGeometric,
 }
@@ -273,8 +273,6 @@ pub enum PrototypeGraphEdgeKind {
     MaterialToTexture,
     /// WEAR table to TEXM lightmap.
     WearToLightmap,
-    /// MAT0 material to effect dependency.
-    MaterialToEffect,
 }
 
 /// Prototype graph edge record.

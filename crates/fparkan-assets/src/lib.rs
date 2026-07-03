@@ -412,11 +412,34 @@ pub struct MissionAssetPlan {
     pub lightmap_count: usize,
 }
 
-/// Coarse CPU-side asset budgets.
+/// Bounded CPU-side asset preparation limits enforced before renderer upload.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct AssetBudgets {
-    /// Bytes parsed from source resource payloads.
-    pub parsed_bytes: u64,
+pub struct AssetPreparationLimits {
+    /// Maximum number of unique prepared models.
+    pub max_models: Option<usize>,
+    /// Maximum number of unique prepared WEAR tables.
+    pub max_wears: Option<usize>,
+    /// Maximum number of unique prepared materials.
+    pub max_materials: Option<usize>,
+    /// Maximum number of unique prepared textures, including lightmaps.
+    pub max_textures: Option<usize>,
+    /// Maximum sum of unique texture base-level pixels.
+    pub max_texture_pixels: Option<u64>,
+}
+
+/// Summary emitted by bounded asset preparation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AssetPreparationReport {
+    /// Number of unique prepared models.
+    pub model_count: usize,
+    /// Number of unique prepared WEAR tables.
+    pub wear_count: usize,
+    /// Number of unique prepared materials.
+    pub material_count: usize,
+    /// Number of unique prepared textures, including lightmaps.
+    pub texture_count: usize,
+    /// Sum of unique texture base-level pixels.
+    pub texture_pixels: u64,
 }
 
 /// Errors raised while preparing CPU-side assets.
@@ -426,6 +449,8 @@ pub enum AssetError {
     MissingDependency(String),
     /// A prototype did not describe a usable visual.
     InvalidPrototype(String),
+    /// Asset preparation exceeded explicit limits.
+    BudgetExceeded(String),
     /// A repository operation failed.
     Resource {
         /// Human context for the operation.
@@ -448,6 +473,7 @@ impl fmt::Display for AssetError {
         match self {
             Self::MissingDependency(value) => write!(f, "missing dependency: {value}"),
             Self::InvalidPrototype(value) => write!(f, "invalid prototype: {value}"),
+            Self::BudgetExceeded(value) => write!(f, "asset budget exceeded: {value}"),
             Self::Resource { context, source } => {
                 if context.is_empty() {
                     write!(f, "resource error: {source}")
@@ -471,7 +497,9 @@ impl std::error::Error for AssetError {
             Self::Material(source) => Some(source),
             Self::Texture(source) => Some(source),
             Self::Nres(source) => Some(source),
-            Self::MissingDependency(_) | Self::InvalidPrototype(_) => None,
+            Self::MissingDependency(_) | Self::InvalidPrototype(_) | Self::BudgetExceeded(_) => {
+                None
+            }
         }
     }
 }
@@ -530,6 +558,26 @@ impl<R: ResourceRepository> AssetManager<R> {
         prepare_mission_assets_with_repository(&self.repository, root_prototype_spans, prototypes)
     }
 
+    /// Builds mission assets together with a bounded preparation report.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssetError`] if any visual dependency is missing or malformed,
+    /// or when explicit limits are exceeded.
+    pub fn prepare_mission_assets_profiled(
+        &self,
+        root_prototype_spans: &[std::ops::Range<usize>],
+        prototypes: &[EffectivePrototype],
+        limits: AssetPreparationLimits,
+    ) -> Result<(MissionAssets, AssetPreparationReport), AssetError> {
+        prepare_mission_assets_profiled_with_repository(
+            &self.repository,
+            root_prototype_spans,
+            prototypes,
+            limits,
+        )
+    }
+
     /// Builds a mission plan by preparing each resolved prototype.
     ///
     /// # Errors
@@ -586,11 +634,35 @@ pub fn prepare_mission_assets_with_repository<R: ResourceRepository>(
     root_prototype_spans: &[std::ops::Range<usize>],
     prototypes: &[EffectivePrototype],
 ) -> Result<MissionAssets, AssetError> {
+    Ok(
+        prepare_mission_assets_profiled_with_repository(
+            repository,
+            root_prototype_spans,
+            prototypes,
+            AssetPreparationLimits::default(),
+        )?
+        .0,
+    )
+}
+
+/// Builds mission assets while enforcing explicit preparation limits.
+///
+/// # Errors
+///
+/// Returns [`AssetError`] if any visual dependency is missing or malformed, or
+/// when explicit limits are exceeded.
+pub fn prepare_mission_assets_profiled_with_repository<R: ResourceRepository>(
+    repository: &R,
+    root_prototype_spans: &[std::ops::Range<usize>],
+    prototypes: &[EffectivePrototype],
+    limits: AssetPreparationLimits,
+) -> Result<(MissionAssets, AssetPreparationReport), AssetError> {
     prepare_mission_assets_with_repository_internal(
         repository,
         root_prototype_spans,
         prototypes,
         AssetIdentityPolicy::default(),
+        limits,
     )
 }
 
@@ -599,9 +671,10 @@ fn prepare_mission_assets_with_repository_internal<R: ResourceRepository>(
     root_prototype_spans: &[std::ops::Range<usize>],
     prototypes: &[EffectivePrototype],
     identity_policy: AssetIdentityPolicy,
-) -> Result<MissionAssets, AssetError> {
+    limits: AssetPreparationLimits,
+) -> Result<(MissionAssets, AssetPreparationReport), AssetError> {
     if prototypes.is_empty() {
-        return Ok(MissionAssets::default());
+        return Ok((MissionAssets::default(), AssetPreparationReport::default()));
     }
     let mut visual_index_by_id: HashMap<AssetId<PreparedVisual>, PreparedVisualSignature> =
         HashMap::new();
@@ -704,14 +777,27 @@ fn prepare_mission_assets_with_repository_internal<R: ResourceRepository>(
         object_visuals.push(ids);
     }
 
-    Ok(MissionAssets {
+    let assets = MissionAssets {
         models,
         wears,
         materials,
         textures,
         visuals,
         object_visuals,
-    })
+    };
+    let report = AssetPreparationReport {
+        model_count: assets.models.len(),
+        wear_count: assets.wears.len(),
+        material_count: assets.materials.len(),
+        texture_count: assets.textures.len(),
+        texture_pixels: assets
+            .textures
+            .iter()
+            .map(|texture| u64::from(texture.texm.width()) * u64::from(texture.texm.height()))
+            .sum(),
+    };
+    enforce_asset_preparation_limits(&report, limits)?;
+    Ok((assets, report))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -876,6 +962,53 @@ where
     }
 }
 
+fn enforce_asset_preparation_limits(
+    report: &AssetPreparationReport,
+    limits: AssetPreparationLimits,
+) -> Result<(), AssetError> {
+    if let Some(limit) = limits.max_models {
+        if report.model_count > limit {
+            return Err(AssetError::BudgetExceeded(format!(
+                "models={} exceeds limit={limit}",
+                report.model_count
+            )));
+        }
+    }
+    if let Some(limit) = limits.max_wears {
+        if report.wear_count > limit {
+            return Err(AssetError::BudgetExceeded(format!(
+                "wears={} exceeds limit={limit}",
+                report.wear_count
+            )));
+        }
+    }
+    if let Some(limit) = limits.max_materials {
+        if report.material_count > limit {
+            return Err(AssetError::BudgetExceeded(format!(
+                "materials={} exceeds limit={limit}",
+                report.material_count
+            )));
+        }
+    }
+    if let Some(limit) = limits.max_textures {
+        if report.texture_count > limit {
+            return Err(AssetError::BudgetExceeded(format!(
+                "textures={} exceeds limit={limit}",
+                report.texture_count
+            )));
+        }
+    }
+    if let Some(limit) = limits.max_texture_pixels {
+        if report.texture_pixels > limit {
+            return Err(AssetError::BudgetExceeded(format!(
+                "texture_pixels={} exceeds limit={limit}",
+                report.texture_pixels
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Extends a prototype dependency report with visual dependency failures.
 ///
 /// This function validates WEAR/material/TEXM/LIGHTMAP resolution for each resolved
@@ -886,6 +1019,9 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
     graph: &mut PrototypeGraph,
     prototypes: &[EffectivePrototype],
 ) {
+    if graph.visual_dependencies_expanded {
+        return;
+    }
     let material_archive = parse_path("material.lib")
         .expect("static material archive path must satisfy host-compatible normalization");
     let mut next_node = graph
@@ -1103,6 +1239,7 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
             ),
         }
     }
+    graph.visual_dependencies_expanded = true;
 }
 
 fn push_graph_resource_node(
@@ -2107,6 +2244,90 @@ mod tests {
     }
 
     #[test]
+    fn graph_visual_dependency_expansion_is_idempotent() {
+        let mesh_key = ResourceKey {
+            archive: parse_path("static.rlb").expect("archive"),
+            name: resource_name(b"tree.msh"),
+            type_id: Some(0x4853_454D),
+        };
+        let mat0 = mat0_with_texture(b"TEX_A");
+        let texm = texm_payload();
+        let lightmap_texm = texm_payload();
+        let repo = repository_with_archives_meta(&[
+            (
+                "static.rlb",
+                &[TestNresEntry {
+                    name: b"tree.wea",
+                    payload: b"1\n0 MAT_A\n\nLIGHTMAPS\n1\n0 LM_A\n",
+                    type_id: WEAR_KIND,
+                    attr2: 0,
+                }],
+            ),
+            (
+                "material.lib",
+                &[TestNresEntry {
+                    name: b"MAT_A",
+                    payload: &mat0,
+                    type_id: MAT0_KIND,
+                    attr2: 0,
+                }],
+            ),
+            (
+                TEXTURES_ARCHIVE,
+                &[TestNresEntry {
+                    name: b"TEX_A",
+                    payload: &texm,
+                    type_id: 0,
+                    attr2: 0,
+                }],
+            ),
+            (
+                LIGHTMAP_ARCHIVE,
+                &[TestNresEntry {
+                    name: b"LM_A",
+                    payload: &lightmap_texm,
+                    type_id: 0,
+                    attr2: 0,
+                }],
+            ),
+        ]);
+        let prototype = EffectivePrototype {
+            key: fparkan_prototype::PrototypeKey(resource_name(b"tree")),
+            geometry: PrototypeGeometry::Mesh(mesh_key),
+            source: fparkan_prototype::PrototypeSource::DirectArchive,
+            dependencies: Vec::new(),
+        };
+        let mut graph = prototype_graph_for_mesh(&prototype);
+        let mut report = PrototypeGraphReport {
+            root_count: 1,
+            direct_reference_count: 1,
+            resolved_count: 1,
+            mesh_dependency_count: 1,
+            ..PrototypeGraphReport::default()
+        };
+
+        extend_graph_report_with_visual_dependencies(
+            &repo,
+            &mut report,
+            &mut graph,
+            std::slice::from_ref(&prototype),
+        );
+        let first = (graph.nodes.clone(), graph.edges.clone(), report.clone());
+
+        extend_graph_report_with_visual_dependencies(
+            &repo,
+            &mut report,
+            &mut graph,
+            std::slice::from_ref(&prototype),
+        );
+
+        assert!(graph.visual_dependencies_expanded);
+        assert_eq!(graph.nodes, first.0);
+        assert_eq!(graph.edges, first.1);
+        assert_eq!(report, first.2);
+    }
+
+    #[test]
     fn prepare_single_visual_mission_assets_materialize_model_wear_material_and_texture_payloads() {
         let mesh_key = ResourceKey {
             archive: parse_path("static.rlb").expect("archive"),
@@ -2237,6 +2458,44 @@ mod tests {
     }
 
     #[test]
+    fn profiled_asset_preparation_reports_unique_asset_counts() {
+        let (repo, prototypes) = collision_fixture();
+
+        let (assets, report) = prepare_mission_assets_profiled_with_repository(
+            &repo,
+            &[0..1, 1..2],
+            &prototypes,
+            AssetPreparationLimits::default(),
+        )
+        .expect("profiled assets");
+
+        assert_eq!(report.model_count, assets.models.len());
+        assert_eq!(report.wear_count, assets.wears.len());
+        assert_eq!(report.material_count, assets.materials.len());
+        assert_eq!(report.texture_count, assets.textures.len());
+        assert!(report.texture_pixels > 0);
+    }
+
+    #[test]
+    fn asset_preparation_limits_reject_texture_pixel_budget() {
+        let (repo, prototypes) = collision_fixture();
+
+        let err = prepare_mission_assets_profiled_with_repository(
+            &repo,
+            &[0..1, 1..2],
+            &prototypes,
+            AssetPreparationLimits {
+                max_texture_pixels: Some(1),
+                ..AssetPreparationLimits::default()
+            },
+        )
+        .expect_err("budget should fail");
+
+        assert!(matches!(err, AssetError::BudgetExceeded(_)));
+        assert!(err.to_string().contains("texture_pixels"));
+    }
+
+    #[test]
     fn graph_report_uses_strict_texture_archive_policy() {
         let mesh_key = ResourceKey {
             archive: parse_path("static.rlb").expect("archive"),
@@ -2362,6 +2621,7 @@ mod tests {
             &[0..1, 1..2],
             &prototypes,
             policy,
+            AssetPreparationLimits::default(),
         )
         .expect_err("collision should fail");
 
@@ -2652,6 +2912,7 @@ mod tests {
             roots: vec![prototype.key.clone()],
             prototype_requests: vec![prototype.key.clone()],
             root_prototype_request_spans: std::iter::once(0..1).collect(),
+            visual_dependencies_expanded: false,
             nodes: vec![root_node, prototype_node, mesh_node],
             edges: vec![
                 fparkan_prototype::PrototypeGraphEdgeInstance {
