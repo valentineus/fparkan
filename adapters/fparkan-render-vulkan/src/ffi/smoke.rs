@@ -31,28 +31,20 @@ fn take_runtime_owners_in_dependency_order<Instance, Validation, Surface, Device
     instance.take();
 }
 
-fn take_runtime_owners_with_validation_snapshot<
-    Instance,
-    Validation,
-    Surface,
-    Device,
-    Swapchain,
-    Snapshot,
-    Capture,
->(
-    instance: &mut Option<Instance>,
-    validation: &mut Option<Validation>,
+fn take_runtime_children_with_validation_snapshot<Surface, Device, Swapchain, Validation, Snapshot, Capture>(
     surface: &mut Option<Surface>,
     device: &mut Option<Device>,
     swapchain: &mut Option<Swapchain>,
+    validation: &Option<Validation>,
     capture: Capture,
 ) -> Option<Snapshot>
 where
     Capture: FnOnce(&Validation) -> Snapshot,
 {
-    let snapshot = validation.as_ref().map(capture);
-    take_runtime_owners_in_dependency_order(instance, validation, surface, device, swapchain);
-    snapshot
+    swapchain.take();
+    device.take();
+    surface.take();
+    validation.as_ref().map(capture)
 }
 
 struct RollbackOnDrop<T, F>
@@ -668,15 +660,16 @@ impl VulkanSmokeRenderer {
             })?;
         }
         self.destroy_device_owned_resources();
-        let validation = take_runtime_owners_with_validation_snapshot(
-            &mut self.instance,
-            &mut self.validation,
+        let validation = take_runtime_children_with_validation_snapshot(
             &mut self.surface,
             &mut self.device,
             &mut self.swapchain,
+            &self.validation,
             VulkanValidationMessenger::report,
         )
         .unwrap_or_default();
+        self.validation.take();
+        self.instance.take();
         Ok(VulkanSmokeShutdownReport {
             renderer_report: self.report.clone(),
             swapchain_recreate_count: self.swapchain_recreate_count,
@@ -690,14 +683,15 @@ impl VulkanSmokeRenderer {
             let _ = unsafe { device.device().device_wait_idle() };
         }
         self.destroy_device_owned_resources();
-        let _ = take_runtime_owners_with_validation_snapshot(
-            &mut self.instance,
-            &mut self.validation,
+        let _ = take_runtime_children_with_validation_snapshot(
             &mut self.surface,
             &mut self.device,
             &mut self.swapchain,
+            &self.validation,
             VulkanValidationMessenger::report,
         );
+        self.validation.take();
+        self.instance.take();
     }
 }
 
@@ -710,7 +704,7 @@ impl Drop for VulkanSmokeRenderer {
 #[cfg(test)]
 mod tests {
     use super::{
-        take_runtime_owners_in_dependency_order, take_runtime_owners_with_validation_snapshot,
+        take_runtime_children_with_validation_snapshot, take_runtime_owners_in_dependency_order,
         RollbackOnDrop,
     };
     use std::cell::RefCell;
@@ -850,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn final_validation_snapshot_is_captured_before_validation_drop() {
+    fn final_validation_snapshot_is_captured_after_surface_device_swapchain_drop() {
         let log = Rc::new(RefCell::new(Vec::new()));
         let mut instance = Some(tracker(TeardownStep::Instance, &log));
         let mut validation = Some(tracker(TeardownStep::Validation, &log));
@@ -858,17 +852,18 @@ mod tests {
         let mut device = Some(tracker(TeardownStep::Device, &log));
         let mut swapchain = Some(tracker(TeardownStep::Swapchain, &log));
 
-        let snapshot = take_runtime_owners_with_validation_snapshot(
-            &mut instance,
-            &mut validation,
+        let snapshot = take_runtime_children_with_validation_snapshot(
             &mut surface,
             &mut device,
             &mut swapchain,
+            &validation,
             |_| {
                 log.borrow_mut().push(TeardownStep::Snapshot);
                 TeardownStep::Validation
             },
         );
+        validation.take();
+        instance.take();
 
         assert_eq!(snapshot, Some(TeardownStep::Validation));
         assert_eq!(
@@ -876,10 +871,10 @@ mod tests {
                 .expect("all drop trackers released")
                 .into_inner(),
             vec![
-                TeardownStep::Snapshot,
                 TeardownStep::Swapchain,
                 TeardownStep::Device,
                 TeardownStep::Surface,
+                TeardownStep::Snapshot,
                 TeardownStep::Validation,
                 TeardownStep::Instance,
             ]
