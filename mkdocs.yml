@@ -73,6 +73,9 @@ nav:
       - WEAR и MAT0: reference/materials.md
       - Texm: reference/texm.md
       - Render frame: reference/render-frame.md
+      - Renderer Truth Table: rendering/renderer_truth_table.md
+      - Original Engine Hashes: evidence/original_engine_hashes.md
+      - Stage 4 Capture Schema: evidence/stage4_capture_schema.md
   - Приложения:
       - Глоссарий: appendices/glossary.md
       - Границы знания: appendices/knowledge-boundaries.md

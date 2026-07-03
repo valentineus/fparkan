@@ -24,7 +24,17 @@ Open source проект с реализацией компонентов игр
 - [crates/fparkan-rsli](crates/fparkan-rsli) — чтение, lookup и lossless roundtrip архивов RsLi.
 - [crates/fparkan-msh](crates/fparkan-msh) — validated static MSH geometry.
 - [crates/fparkan-runtime](crates/fparkan-runtime) — transactional mission loading и headless runtime foundation.
-- [apps/fparkan-cli](apps/fparkan-cli), [apps/fparkan-viewer](apps/fparkan-viewer), [apps/fparkan-headless](apps/fparkan-headless), [apps/fparkan-game](apps/fparkan-game) — composition roots.
+- [apps/fparkan-cli](apps/fparkan-cli) — CLI для архивов, графов и acceptance-отчетов.
+- [apps/fparkan-viewer](apps/fparkan-viewer) — inspection-only CLI для archive/model/texture/map без live Vulkan draw path.
+- [apps/fparkan-headless](apps/fparkan-headless) — headless runtime composition root.
+- [apps/fparkan-game](apps/fparkan-game) — render-planning composition root; сейчас выдает planning report, а не живой отрисованный кадр.
+
+## Текущий статус рендера
+
+- `fparkan-vulkan-smoke` доказывает живой Stage 0 Vulkan triangle path с native window, swapchain и validation telemetry.
+- `VulkanPlanningBackend` и `fparkan-game` подтверждают только deterministic command planning/capture, а не draw пикселей.
+- `fparkan-viewer` пока является инспектором ассетов. Stage 3 GPU vertical slice для оригинального `MSH`/`Texm`/`WEAR`/`MAT0`/terrain еще не закрыт.
+- Truth table и evidence-артефакты вынесены в [`docs/rendering/renderer_truth_table.md`](docs/rendering/renderer_truth_table.md) и [`docs/evidence/`](docs/evidence).
 
 ## Тестирование
 

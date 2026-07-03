@@ -219,6 +219,13 @@ graph.
 текстурированную статическую модель из исходного архива. Красивый viewer всё ещё
 означает только asset compatibility, а не готовую игру.
 
+Текущее состояние репозитория нужно формулировать строже. `apps/fparkan-viewer`
+сейчас является inspection CLI и synthetic command producer, а не live Vulkan
+asset viewer. Реальный Vulkan в репозитории сегодня доказан только через
+Stage 0 smoke triangle path; Stage 3 GPU vertical slice для оригинального
+`MSH` + `Texm` + `WEAR/MAT0` + terrain остаётся блокером. Для различения
+smoke, planning и live GPU путей используйте [таблицу правды renderer paths](../rendering/renderer_truth_table.md).
+
 ### Этап 4. Анимация и эффекты
 
 - реализовать MSH type 8/type 19 sampling и hierarchy;
@@ -231,6 +238,13 @@ graph.
 Готовность: frame-by-frame poses совпадают с golden reference своей части; все
 923/1 065 FXID создаются без parser errors; перезапуск одинакового effect seed
 даёт идентичный список emitted primitives.
+
+Текущее состояние репозитория опять же уже, чем целевой этап. В коде есть
+portable reference sampler и детерминированный FX reference stub, но нет
+runtime-captured parity для lifecycle/opcode semantics и нет Stage 4 rendered
+acceptance поверх live Vulkan asset renderer. Поэтому rendered Stage 4 следует
+считать заблокированным входным gate Stage 3, а parallel Stage 4 work вести
+через captures, schemas и backend-neutral snapshots.
 
 ### Этап 5. Карта и мир
 
