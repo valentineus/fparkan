@@ -771,7 +771,11 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
                     wear_node_id,
                     fparkan_prototype::PrototypeGraphEdgeKind::MeshToWear,
                     PrototypeGraphRequiredness::Required,
-                    Some(provenance_for_resource(root_index, mesh_parent_edge, &wear_key)),
+                    Some(provenance_for_resource(
+                        root_index,
+                        mesh_parent_edge,
+                        &wear_key,
+                    )),
                     &mut next_edge,
                 );
                 report.material_slot_count += table.entries.len();
@@ -937,7 +941,9 @@ fn push_graph_resource_node(
     *next_node = (*next_node).saturating_add(1);
     graph
         .nodes
-        .push(fparkan_prototype::PrototypeGraphNode::resource(kind, resource, id));
+        .push(fparkan_prototype::PrototypeGraphNode::resource(
+            kind, resource, id,
+        ));
     id
 }
 
@@ -952,14 +958,16 @@ fn push_graph_edge(
 ) -> fparkan_prototype::PrototypeGraphEdgeId {
     let id = fparkan_prototype::PrototypeGraphEdgeId(*next_edge);
     *next_edge = (*next_edge).saturating_add(1);
-    graph.edges.push(fparkan_prototype::PrototypeGraphEdgeInstance {
-        id,
-        from,
-        to,
-        kind,
-        requiredness,
-        provenance,
-    });
+    graph
+        .edges
+        .push(fparkan_prototype::PrototypeGraphEdgeInstance {
+            id,
+            from,
+            to,
+            kind,
+            requiredness,
+            provenance,
+        });
     id
 }
 
@@ -1144,11 +1152,8 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
         });
 
         for texture in texture_requests {
-            let prepared_texture = prepare_texture(
-                repository,
-                &texture,
-                PreparedTextureUsage::Diffuse,
-            )?;
+            let prepared_texture =
+                prepare_texture(repository, &texture, PreparedTextureUsage::Diffuse)?;
             texture_ids.push(prepared_texture.id);
             prepared_textures.push(prepared_texture);
             texture_count += 1;
@@ -1664,7 +1669,10 @@ mod tests {
         };
 
         assert_ne!(stable_visual_id(&first), stable_visual_id(&second));
-        assert_ne!(prepared_visual_signature(&first), prepared_visual_signature(&second));
+        assert_ne!(
+            prepared_visual_signature(&first),
+            prepared_visual_signature(&second)
+        );
     }
 
     #[test]
@@ -1781,6 +1789,222 @@ mod tests {
     }
 
     #[test]
+    fn graph_visual_dependency_edges_preserve_root_and_parent_provenance() {
+        let mesh_key = ResourceKey {
+            archive: parse_path("static.rlb").expect("archive"),
+            name: resource_name(b"tree.msh"),
+            type_id: Some(0x4853_454D),
+        };
+        let mat0 = mat0_with_texture(b"TEX_A");
+        let texm = texm_payload();
+        let lightmap_texm = texm_payload();
+        let repo = repository_with_archives_meta(&[
+            (
+                "static.rlb",
+                &[TestNresEntry {
+                    name: b"tree.wea",
+                    payload: b"1\n0 MAT_A\n\nLIGHTMAPS\n1\n0 LM_A\n",
+                    type_id: WEAR_KIND,
+                    attr2: 0,
+                }],
+            ),
+            (
+                "material.lib",
+                &[TestNresEntry {
+                    name: b"MAT_A",
+                    payload: &mat0,
+                    type_id: MAT0_KIND,
+                    attr2: 0,
+                }],
+            ),
+            (
+                TEXTURES_ARCHIVE,
+                &[TestNresEntry {
+                    name: b"TEX_A",
+                    payload: &texm,
+                    type_id: 0,
+                    attr2: 0,
+                }],
+            ),
+            (
+                LIGHTMAP_ARCHIVE,
+                &[TestNresEntry {
+                    name: b"LM_A",
+                    payload: &lightmap_texm,
+                    type_id: 0,
+                    attr2: 0,
+                }],
+            ),
+        ]);
+        let prototype = EffectivePrototype {
+            key: fparkan_prototype::PrototypeKey(resource_name(b"tree")),
+            geometry: PrototypeGeometry::Mesh(mesh_key),
+            source: fparkan_prototype::PrototypeSource::DirectArchive,
+            dependencies: Vec::new(),
+        };
+        let mut graph = prototype_graph_for_mesh(&prototype);
+        let mut report = PrototypeGraphReport {
+            root_count: 1,
+            direct_reference_count: 1,
+            resolved_count: 1,
+            mesh_dependency_count: 1,
+            ..PrototypeGraphReport::default()
+        };
+
+        extend_graph_report_with_visual_dependencies(
+            &repo,
+            &mut report,
+            &mut graph,
+            std::slice::from_ref(&prototype),
+        );
+
+        let wear_edge = graph
+            .edges
+            .iter()
+            .find(|edge| edge.kind == fparkan_prototype::PrototypeGraphEdgeKind::MeshToWear)
+            .expect("wear edge");
+        let material_edge = graph
+            .edges
+            .iter()
+            .find(|edge| edge.kind == fparkan_prototype::PrototypeGraphEdgeKind::WearToMaterial)
+            .expect("material edge");
+        let texture_edge = graph
+            .edges
+            .iter()
+            .find(|edge| edge.kind == fparkan_prototype::PrototypeGraphEdgeKind::MaterialToTexture)
+            .expect("texture edge");
+        let lightmap_edge = graph
+            .edges
+            .iter()
+            .find(|edge| edge.kind == fparkan_prototype::PrototypeGraphEdgeKind::WearToLightmap)
+            .expect("lightmap edge");
+
+        assert_eq!(
+            wear_edge
+                .provenance
+                .as_ref()
+                .expect("wear provenance")
+                .parent_edge,
+            Some(fparkan_prototype::PrototypeGraphEdgeId(1))
+        );
+        assert_eq!(
+            material_edge
+                .provenance
+                .as_ref()
+                .expect("material provenance")
+                .parent_edge,
+            Some(wear_edge.id)
+        );
+        assert_eq!(
+            texture_edge
+                .provenance
+                .as_ref()
+                .expect("texture provenance")
+                .parent_edge,
+            Some(material_edge.id)
+        );
+        assert_eq!(
+            lightmap_edge
+                .provenance
+                .as_ref()
+                .expect("lightmap provenance")
+                .parent_edge,
+            Some(wear_edge.id)
+        );
+        assert!(graph
+            .edges
+            .iter()
+            .filter_map(|edge| edge.provenance.as_ref())
+            .all(|provenance| provenance.root_index == 0));
+    }
+
+    #[test]
+    fn prepare_single_visual_mission_assets_materialize_model_wear_material_and_texture_payloads() {
+        let mesh_key = ResourceKey {
+            archive: parse_path("static.rlb").expect("archive"),
+            name: resource_name(b"tree.msh"),
+            type_id: Some(0x4853_454D),
+        };
+        let msh = minimal_model_archive();
+        let mat0 = mat0_with_texture(b"TEX_A");
+        let texm = texm_payload();
+        let lightmap_texm = texm_payload();
+        let repo = repository_with_archives_meta(&[
+            (
+                "static.rlb",
+                &[
+                    TestNresEntry {
+                        name: b"tree.msh",
+                        payload: &msh,
+                        type_id: 0x4853_454D,
+                        attr2: 0,
+                    },
+                    TestNresEntry {
+                        name: b"tree.wea",
+                        payload: b"1\n0 MAT_A\n\nLIGHTMAPS\n1\n0 LM_A\n",
+                        type_id: WEAR_KIND,
+                        attr2: 0,
+                    },
+                ],
+            ),
+            (
+                "material.lib",
+                &[TestNresEntry {
+                    name: b"MAT_A",
+                    payload: &mat0,
+                    type_id: MAT0_KIND,
+                    attr2: 0,
+                }],
+            ),
+            (
+                TEXTURES_ARCHIVE,
+                &[TestNresEntry {
+                    name: b"TEX_A",
+                    payload: &texm,
+                    type_id: 0,
+                    attr2: 0,
+                }],
+            ),
+            (
+                LIGHTMAP_ARCHIVE,
+                &[TestNresEntry {
+                    name: b"LM_A",
+                    payload: &lightmap_texm,
+                    type_id: 0,
+                    attr2: 0,
+                }],
+            ),
+        ]);
+        let prototype = EffectivePrototype {
+            key: fparkan_prototype::PrototypeKey(resource_name(b"tree")),
+            geometry: PrototypeGeometry::Mesh(mesh_key),
+            source: fparkan_prototype::PrototypeSource::DirectArchive,
+            dependencies: Vec::new(),
+        };
+
+        let assets = prepare_mission_assets_with_repository(
+            &repo,
+            std::slice::from_ref(&(0..1)),
+            std::slice::from_ref(&prototype),
+        )
+        .expect("prepared mission assets");
+
+        assert_eq!(assets.models.len(), 1);
+        assert_eq!(assets.wears.len(), 1);
+        assert_eq!(assets.materials.len(), 1);
+        assert_eq!(assets.textures.len(), 2);
+        assert_eq!(assets.visuals.len(), 1);
+        assert_eq!(assets.object_visuals, vec![vec![assets.visuals[0].id]]);
+
+        let visual = &assets.visuals[0];
+        assert_eq!(visual.model_id, Some(assets.models[0].id));
+        assert_eq!(visual.wear_id, Some(assets.wears[0].id));
+        assert_eq!(visual.material_ids, vec![assets.materials[0].id]);
+        assert_eq!(visual.texture_ids.len(), 1);
+        assert_eq!(visual.lightmap_ids.len(), 1);
+    }
+
+    #[test]
     fn graph_report_uses_strict_texture_archive_policy() {
         let mesh_key = ResourceKey {
             archive: parse_path("static.rlb").expect("archive"),
@@ -1843,7 +2067,10 @@ mod tests {
         assert_eq!(report.texture_request_count, 1);
         assert_eq!(report.texture_resolved_count, 0);
         assert_eq!(report.failures.len(), 1);
-        assert_eq!(report.failures[0].edge, PrototypeGraphEdge::MaterialToTexture);
+        assert_eq!(
+            report.failures[0].edge,
+            PrototypeGraphEdge::MaterialToTexture
+        );
     }
 
     #[test]
@@ -1937,7 +2164,10 @@ mod tests {
         let mut vfs = MemoryVfs::default();
         for (archive, entries) in archives {
             let path = parse_path(archive).expect("archive path");
-            vfs.insert(path, Arc::from(build_nres_with_meta(entries).into_boxed_slice()));
+            vfs.insert(
+                path,
+                Arc::from(build_nres_with_meta(entries).into_boxed_slice()),
+            );
         }
         CachedResourceRepository::new(Arc::new(vfs))
     }
@@ -1962,6 +2192,81 @@ mod tests {
         let len = texture.len().min(16);
         bytes[22..22 + len].copy_from_slice(&texture[..len]);
         bytes
+    }
+
+    fn minimal_model_archive() -> Vec<u8> {
+        struct MshEntry<'a> {
+            type_id: u32,
+            attr3: u32,
+            name: &'a [u8],
+            payload: &'a [u8],
+        }
+
+        let entries = [
+            MshEntry {
+                type_id: 1,
+                attr3: 38,
+                name: b"Res1",
+                payload: &[],
+            },
+            MshEntry {
+                type_id: 2,
+                attr3: 0,
+                name: b"Res2",
+                payload: &[0; 0x8c],
+            },
+            MshEntry {
+                type_id: 3,
+                attr3: 0,
+                name: b"Res3",
+                payload: &[],
+            },
+            MshEntry {
+                type_id: 6,
+                attr3: 0,
+                name: b"Res6",
+                payload: &[],
+            },
+            MshEntry {
+                type_id: 13,
+                attr3: 0,
+                name: b"Res13",
+                payload: &[],
+            },
+        ];
+
+        let mut out = vec![0; 16];
+        let mut offsets = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            offsets.push(u32::try_from(out.len()).expect("offset"));
+            out.extend_from_slice(entry.payload);
+            let padding = (8 - (out.len() % 8)) % 8;
+            out.resize(out.len() + padding, 0);
+        }
+        let mut order: Vec<usize> = (0..entries.len()).collect();
+        order.sort_by(|left, right| entries[*left].name.cmp(entries[*right].name));
+        for (idx, entry) in entries.iter().enumerate() {
+            push_u32(&mut out, entry.type_id);
+            push_u32(&mut out, 0);
+            push_u32(&mut out, 0);
+            push_u32(
+                &mut out,
+                u32::try_from(entry.payload.len()).expect("payload"),
+            );
+            push_u32(&mut out, entry.attr3);
+            let mut name_raw = [0; 36];
+            let len = name_raw.len().saturating_sub(1).min(entry.name.len());
+            name_raw[..len].copy_from_slice(&entry.name[..len]);
+            out.extend_from_slice(&name_raw);
+            push_u32(&mut out, offsets[idx]);
+            push_u32(&mut out, u32::try_from(order[idx]).expect("sort index"));
+        }
+        out[0..4].copy_from_slice(b"NRes");
+        out[4..8].copy_from_slice(&0x100_u32.to_le_bytes());
+        out[8..12].copy_from_slice(&u32::try_from(entries.len()).expect("count").to_le_bytes());
+        let total_size = u32::try_from(out.len()).expect("total size");
+        out[12..16].copy_from_slice(&total_size.to_le_bytes());
+        out
     }
 
     fn prototype_graph_for_mesh(prototype: &EffectivePrototype) -> PrototypeGraph {
@@ -2055,7 +2360,10 @@ mod tests {
             push_u32(&mut out, entry.type_id);
             push_u32(&mut out, 0);
             push_u32(&mut out, entry.attr2);
-            push_u32(&mut out, u32::try_from(entry.payload.len()).expect("payload"));
+            push_u32(
+                &mut out,
+                u32::try_from(entry.payload.len()).expect("payload"),
+            );
             push_u32(&mut out, 0);
             let mut name_raw = [0; 36];
             let len = name_raw.len().saturating_sub(1).min(entry.name.len());

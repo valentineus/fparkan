@@ -1115,6 +1115,50 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires local testdata corpus"]
+    fn selected_is_and_is2_missions_preserve_runtime_object_drafts() {
+        for case in [
+            ("IS", "MISSIONS/Autodemo.00/data.tma"),
+            ("IS2", "MISSIONS/Autodemo.00/data.tma"),
+        ] {
+            let root = local_testdata_root(case.0);
+            let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(root));
+            let mut engine = create(
+                EngineConfig {
+                    mode: EngineMode::Headless,
+                },
+                EngineServices::new(vfs),
+            )
+            .expect("engine");
+            let loaded = load_mission(
+                &mut engine,
+                MissionRequest {
+                    key: case.1.to_string(),
+                },
+            )
+            .expect("load mission");
+            let drafts = loaded_mission_object_drafts(&engine).expect("object drafts");
+            let assets = loaded_mission_assets(&engine).expect("mission assets");
+
+            assert_eq!(drafts.len(), loaded.object_count);
+            assert!(drafts.iter().any(|draft| !draft.visual_ids.is_empty()));
+            for (index, draft) in drafts.iter().enumerate() {
+                assert_eq!(
+                    draft.original_id,
+                    u32::try_from(index).ok().map(OriginalObjectId)
+                );
+                assert_eq!(draft.visual_ids, assets.visuals_for_object(index));
+                assert!(draft.position.iter().all(|component| component.is_finite()));
+                assert!(draft
+                    .orientation_raw
+                    .iter()
+                    .all(|component| component.is_finite()));
+                assert!(draft.scale.iter().all(|component| component.is_finite()));
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "requires licensed corpus"]
     fn licensed_corpora_load_all_mission_foundations() {
         let part1 = load_all(&licensed_root("IS"));
@@ -1321,6 +1365,18 @@ mod tests {
         assert!(
             root.is_dir(),
             "licensed corpus root is missing: {}",
+            root.display()
+        );
+        root
+    }
+
+    fn local_testdata_root(name: &str) -> PathBuf {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../testdata")
+            .join(name);
+        assert!(
+            root.is_dir(),
+            "local testdata root is missing: {}",
             root.display()
         );
         root

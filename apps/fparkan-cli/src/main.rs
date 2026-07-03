@@ -255,7 +255,12 @@ fn prototype_inspect_json(
         textures: report.texture_resolved_count,
         lightmaps: report.lightmap_resolved_count,
         is_success: report.is_success(),
-        failures: report.failures.iter().take(16).map(graph_failure_output).collect(),
+        failures: report
+            .failures
+            .iter()
+            .take(16)
+            .map(graph_failure_output)
+            .collect(),
     })
 }
 
@@ -366,9 +371,7 @@ fn serialize_json<T: Serialize>(value: &T) -> Result<String, String> {
     serde_json::to_string(value).map_err(|err| err.to_string())
 }
 
-fn graph_failure_output(
-    failure: &fparkan_prototype::PrototypeGraphFailure,
-) -> GraphFailureOutput {
+fn graph_failure_output(failure: &fparkan_prototype::PrototypeGraphFailure) -> GraphFailureOutput {
     GraphFailureOutput {
         root_index: failure.root_index,
         edge: prototype_graph_edge_label(failure.edge),
@@ -470,6 +473,38 @@ mod tests {
         assert_eq!(
             json,
             "{\"schema_version\":\"fparkan-prototype-inspect-v1\",\"key\":\"root\",\"roots\":1,\"node_count\":0,\"edge_count\":0,\"prototype_requests\":1,\"resolved\":1,\"unit_references\":0,\"unit_components\":0,\"direct_references\":1,\"wear_requests\":0,\"wear\":0,\"materials\":0,\"textures\":0,\"lightmaps\":0,\"is_success\":true,\"failures\":[]}"
+        );
+    }
+
+    #[test]
+    fn mission_graph_json_has_canonical_field_order() {
+        let json = serialize_json(&MissionGraphOutput {
+            schema_version: MISSION_GRAPH_SCHEMA,
+            mission: "MISSIONS/Autodemo.00/data.tma".to_string(),
+            objects: 2,
+            paths: 3,
+            clans: 4,
+            extras: 5,
+            roots: 6,
+            node_count: 7,
+            edge_count: 8,
+            direct_references: 9,
+            unit_references: 10,
+            unit_components: 11,
+            prototype_requests: 12,
+            wear_requests: 13,
+            wear: 14,
+            materials: 15,
+            textures: 16,
+            lightmaps: 17,
+            is_success: true,
+            failures: 0,
+        })
+        .expect("serialize");
+
+        assert_eq!(
+            json,
+            "{\"schema_version\":\"fparkan-mission-graph-v1\",\"mission\":\"MISSIONS/Autodemo.00/data.tma\",\"objects\":2,\"paths\":3,\"clans\":4,\"extras\":5,\"roots\":6,\"node_count\":7,\"edge_count\":8,\"direct_references\":9,\"unit_references\":10,\"unit_components\":11,\"prototype_requests\":12,\"wear_requests\":13,\"wear\":14,\"materials\":15,\"textures\":16,\"lightmaps\":17,\"is_success\":true,\"failures\":0}"
         );
     }
 }

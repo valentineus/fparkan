@@ -207,6 +207,17 @@ S2-GRAPH-003	covered	cargo test -p fparkan-assets --offline repository_plan_dedu
 S2-GRAPH-004	covered	cargo test -p fparkan-prototype --offline graph_report_records_resolved_roots_and_failures
 S2-GRAPH-005	covered	cargo test -p fparkan-cli --offline prototype_graph_json_has_canonical_field_order
 S2-GRAPH-006	covered	cargo test -p fparkan-prototype --offline graph_report_records_resolved_roots_and_failures
+S2-GRAPH-EDGE-001	covered	cargo test -p fparkan-assets --offline graph_materializes_visual_dependency_nodes_and_edges
+S2-GRAPH-PROV-001	covered	cargo test -p fparkan-assets --offline graph_visual_dependency_edges_preserve_root_and_parent_provenance
+S2-UNIT-EMPTY-001	covered	cargo test -p fparkan-prototype --offline empty_unit_dat_resolves_as_zero_component_root
+S2-ASSET-MODEL-001	covered	cargo test -p fparkan-assets --offline prepare_single_visual_mission_assets_materialize_model_wear_material_and_texture_payloads
+S2-ASSET-WEAR-001	covered	cargo test -p fparkan-assets --offline prepare_single_visual_mission_assets_materialize_model_wear_material_and_texture_payloads
+S2-ASSET-MATERIAL-001	covered	cargo test -p fparkan-assets --offline prepare_single_visual_mission_assets_materialize_model_wear_material_and_texture_payloads
+S2-ASSET-TEXM-001	covered	cargo test -p fparkan-assets --offline prepare_single_visual_mission_assets_materialize_model_wear_material_and_texture_payloads
+S2-RUNTIME-DRAFT-001	covered	local testdata/IS and testdata/IS2; cargo test -p fparkan-runtime --offline -- --ignored selected_is_and_is2_missions_preserve_runtime_object_drafts
+S2-CLI-JSON-001	covered	cargo test -p fparkan-cli --offline prototype_graph_json_has_canonical_field_order mission_graph_json_has_canonical_field_order
+S2-LICENSED-MISSION-P1-001	covered	local testdata/IS; cargo test -p fparkan-runtime --offline -- --ignored selected_is_and_is2_missions_preserve_runtime_object_drafts
+S2-LICENSED-MISSION-P2-001	covered	local testdata/IS2; cargo test -p fparkan-runtime --offline -- --ignored selected_is_and_is2_missions_preserve_runtime_object_drafts
 S2-PROP-001	covered	cargo test -p fparkan-prototype --offline generated_acyclic_prototype_graph_resolves_deterministically
 S2-FUZZ-001	covered	cargo test -p fparkan-prototype --offline arbitrary_unit_and_registry_bytes_are_bounded_and_panic_free
 L3-P1-MSH-001	covered	cargo test -p fparkan-msh --offline licensed_corpus_msh_assets_validate
@@ -219,8 +230,8 @@ L3-P1-WEAR-001	covered	cargo test -p fparkan-material --offline licensed_corpus_
 L3-P2-WEAR-001	covered	cargo test -p fparkan-material --offline licensed_corpus_mat0_and_wear_parse
 L3-P1-ASSET-001	covered	cargo test -p fparkan-runtime --offline licensed_corpora_load_all_mission_foundations
 L3-P2-ASSET-001	covered	cargo test -p fparkan-runtime --offline licensed_corpora_load_all_mission_foundations
-L3-P1-CAPTURE-001	covered	cargo test -p fparkan-game --offline selected_is_and_is2_missions_produce_approved_render_captures
-L3-P2-CAPTURE-001	covered	cargo test -p fparkan-game --offline selected_is_and_is2_missions_produce_approved_render_captures
+S2-PLANNING-CAPTURE-P1-001	covered	cargo test -p fparkan-game --offline selected_is_and_is2_missions_produce_approved_render_captures
+S2-PLANNING-CAPTURE-P2-001	covered	cargo test -p fparkan-game --offline selected_is_and_is2_missions_produce_approved_render_captures
 S3-WEAR-001	covered	cargo test -p fparkan-material --offline wear_preserves_legacy_id_but_selects_by_index
 S3-WEAR-002	covered	cargo test -p fparkan-material --offline wear_requires_declared_rows
 S3-WEAR-003	covered	cargo test -p fparkan-material --offline wear_preserves_legacy_id_but_selects_by_index
@@ -271,15 +282,23 @@ S3-MAT-RESOLVE-002	covered	cargo test -p fparkan-material --offline resolve_mate
 S3-MAT-RESOLVE-003	covered	cargo test -p fparkan-material --offline resolve_material_uses_first_entry_only_after_missing_default
 S3-MAT-RESOLVE-004	covered	cargo test -p fparkan-material --offline resolve_material_empty_texture_means_untextured
 S3-MAT-RESOLVE-005	covered	cargo test -p fparkan-material --offline resolve_material_without_lightmap_keeps_lightmap_absent
-S3-RENDER-001	covered	cargo test -p fparkan-render --offline one_snapshot_draw_produces_one_draw_command
-S3-RENDER-002	covered	cargo test -p fparkan-render --offline material_index_maps_through_resolved_material_slots
-S3-RENDER-003	covered	cargo test -p fparkan-render --offline node_transform_is_retained
-S3-RENDER-004	covered	cargo test -p fparkan-render --offline command_order_uses_phase_then_stable_key
-S3-RENDER-005	covered	cargo test -p fparkan-render --offline command_capture_independent_of_snapshot_construction_order
-S3-RENDER-006	covered	cargo test -p fparkan-render --offline invalid_range_returns_contextual_error
-S3-RENDER-007	covered	cargo test -p fparkan-render --offline capture_is_stable
-S3-RENDER-008	covered	cargo test -p fparkan-render --offline recording_backend_stores_captures
-S3-RENDER-009	covered	cargo xtask policy
+S2-PLANNING-RENDER-001	covered	cargo test -p fparkan-render --offline one_snapshot_draw_produces_one_draw_command
+S2-PLANNING-RENDER-002	covered	cargo test -p fparkan-render --offline material_index_maps_through_resolved_material_slots
+S2-PLANNING-RENDER-003	covered	cargo test -p fparkan-render --offline node_transform_is_retained
+S2-PLANNING-RENDER-004	covered	cargo test -p fparkan-render --offline command_order_uses_phase_then_stable_key
+S2-PLANNING-RENDER-005	covered	cargo test -p fparkan-render --offline command_capture_independent_of_snapshot_construction_order
+S2-PLANNING-RENDER-006	covered	cargo test -p fparkan-render --offline invalid_range_returns_contextual_error
+S2-PLANNING-RENDER-007	covered	cargo test -p fparkan-render --offline capture_is_stable
+S2-PLANNING-RENDER-008	covered	cargo test -p fparkan-render --offline recording_backend_stores_captures
+S2-PLANNING-RENDER-009	covered	cargo xtask policy
+S3-VK-MESH-UPLOAD-001	blocked	awaits Stage 3 Vulkan asset renderer and GPU upload path
+S3-VK-TEXM-UPLOAD-001	blocked	awaits Stage 3 Vulkan texture upload path
+S3-VK-DESCRIPTOR-001	blocked	awaits Stage 3 descriptor set contract implementation
+S3-VK-PIPELINE-001	blocked	awaits Stage 3 graphics pipeline key and cache implementation
+S3-VK-DRAW-MODEL-001	blocked	awaits Stage 3 real Vulkan indexed model draw path
+S3-VK-DRAW-TERRAIN-001	blocked	awaits Stage 3 terrain Vulkan draw path
+S3-VK-PIXEL-CAPTURE-001	blocked	awaits Stage 3 fixed-camera pixel capture approval flow
+S3-VK-VALIDATION-001	blocked	awaits Stage 3 validation-clean GPU frame execution
 S3-GL-001	omitted	permanent macOS Desktop GL 3.3 adapter is not implemented; historical CGL probe is retained as external evidence only
 S3-GL-002	omitted	outside the current macOS-focused goal scope; GLES2 remains documented for portable/non-macOS targets
 S3-GL-003	blocked	legacy fparkan-render-gl adapter removed while Vulkan renderer path is being brought in as the stage-3 backend
