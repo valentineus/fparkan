@@ -2340,6 +2340,9 @@ struct CoverageEntry {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CoverageStatus {
     Covered,
+    CoveredPlanning,
+    CoveredStub,
+    CoveredGpu,
     Partial,
     Blocked,
     Omitted,
@@ -2349,10 +2352,25 @@ impl CoverageStatus {
     fn parse(value: &str) -> Result<Self, String> {
         match value {
             "covered" => Ok(Self::Covered),
+            "covered-planning" => Ok(Self::CoveredPlanning),
+            "covered-stub" => Ok(Self::CoveredStub),
+            "covered-gpu" => Ok(Self::CoveredGpu),
             "partial" => Ok(Self::Partial),
             "blocked" => Ok(Self::Blocked),
             "omitted" => Ok(Self::Omitted),
             _ => Err(format!("unknown coverage status: {value}")),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Covered => "covered",
+            Self::CoveredPlanning => "covered-planning",
+            Self::CoveredStub => "covered-stub",
+            Self::CoveredGpu => "covered-gpu",
+            Self::Partial => "partial",
+            Self::Blocked => "blocked",
+            Self::Omitted => "omitted",
         }
     }
 }
@@ -2366,22 +2384,34 @@ struct AcceptanceAudit {
     msrv: String,
     required_total: usize,
     covered: Vec<String>,
+    covered_planning: Vec<String>,
+    covered_stub: Vec<String>,
+    covered_gpu: Vec<String>,
     partial: Vec<String>,
     blocked: Vec<String>,
     omitted: Vec<String>,
     missing: Vec<String>,
+    invalid_coverage: Vec<String>,
     unknown_coverage: Vec<String>,
     coverage_evidence: BTreeMap<String, String>,
     by_stage: BTreeMap<String, usize>,
 }
 
 impl AcceptanceAudit {
+    fn covered_total(&self) -> usize {
+        self.covered.len()
+            + self.covered_planning.len()
+            + self.covered_stub.len()
+            + self.covered_gpu.len()
+    }
+
     fn unverified(&self) -> Vec<String> {
         self.partial
             .iter()
             .chain(&self.blocked)
             .chain(&self.omitted)
             .chain(&self.missing)
+            .chain(&self.invalid_coverage)
             .cloned()
             .collect()
     }
@@ -2392,6 +2422,7 @@ impl AcceptanceAudit {
             .chain(&self.blocked)
             .chain(&self.omitted)
             .chain(&self.missing)
+            .chain(&self.invalid_coverage)
             .cloned()
             .collect()
     }
@@ -2469,6 +2500,9 @@ fn build_acceptance_audit(
     coverage: &BTreeMap<String, CoverageEntry>,
 ) -> AcceptanceAudit {
     let mut covered = Vec::new();
+    let mut covered_planning = Vec::new();
+    let mut covered_stub = Vec::new();
+    let mut covered_gpu = Vec::new();
     let mut partial = Vec::new();
     let mut blocked = Vec::new();
     let mut omitted = Vec::new();
@@ -2487,6 +2521,9 @@ fn build_acceptance_audit(
         *by_stage.entry(stage).or_insert(0) += 1;
         match coverage.get(id).map(|entry| entry.status) {
             Some(CoverageStatus::Covered) => covered.push(id.clone()),
+            Some(CoverageStatus::CoveredPlanning) => covered_planning.push(id.clone()),
+            Some(CoverageStatus::CoveredStub) => covered_stub.push(id.clone()),
+            Some(CoverageStatus::CoveredGpu) => covered_gpu.push(id.clone()),
             Some(CoverageStatus::Partial) => partial.push(id.clone()),
             Some(CoverageStatus::Blocked) => blocked.push(id.clone()),
             Some(CoverageStatus::Omitted) => omitted.push(id.clone()),
@@ -2496,6 +2533,11 @@ fn build_acceptance_audit(
             coverage_evidence.insert(id.clone(), entry.evidence.clone());
         }
     }
+
+    let invalid_coverage = coverage
+        .iter()
+        .filter_map(|(id, entry)| coverage_semantic_failure(id, entry.status))
+        .collect();
 
     let unknown_coverage = coverage
         .keys()
@@ -2516,14 +2558,61 @@ fn build_acceptance_audit(
         msrv: WORKSPACE_MSRV.to_string(),
         required_total: required.len(),
         covered,
+        covered_planning,
+        covered_stub,
+        covered_gpu,
         partial,
         blocked,
         omitted,
         missing,
+        invalid_coverage,
         unknown_coverage,
         coverage_evidence,
         by_stage,
     }
+}
+
+fn coverage_semantic_failure(id: &str, status: CoverageStatus) -> Option<String> {
+    if is_stage3_or_later(id)
+        && matches!(
+            status,
+            CoverageStatus::CoveredPlanning | CoverageStatus::CoveredStub
+        )
+        && has_gpu_delivery_token(id)
+    {
+        return Some(format!(
+            "{id}: {} cannot satisfy Stage 3+ GPU/pixel acceptance; use covered-gpu or leave the row non-green",
+            status.as_str()
+        ));
+    }
+
+    if matches!(status, CoverageStatus::CoveredStub)
+        && is_fx_lifecycle_compatibility_id(id)
+        && !id.contains("STUB")
+    {
+        return Some(format!(
+            "{id}: covered-stub is reserved for explicit STUB-only FX lifecycle acceptance rows"
+        ));
+    }
+
+    None
+}
+
+fn is_stage3_or_later(id: &str) -> bool {
+    id.as_bytes().get(1).is_some_and(|stage| *stage >= b'3')
+}
+
+fn has_gpu_delivery_token(id: &str) -> bool {
+    id.split('-').any(|token| {
+        matches!(
+            token,
+            "VK" | "GPU" | "DRAW" | "PIXEL" | "VALIDATION" | "RENDERED"
+        )
+    })
+}
+
+fn is_fx_lifecycle_compatibility_id(id: &str) -> bool {
+    id.starts_with("S4-FX-") || id.starts_with("L4-P1-EFFECT-") || id.starts_with("L4-P2-EFFECT-")
 }
 
 #[derive(Serialize)]
@@ -2536,18 +2625,26 @@ struct AcceptanceAuditJson<'a> {
     msrv: &'a str,
     required_total: usize,
     covered_total: usize,
+    covered_planning_total: usize,
+    covered_stub_total: usize,
+    covered_gpu_total: usize,
     partial_total: usize,
     blocked_total: usize,
     omitted_total: usize,
     missing_total: usize,
     unverified_total: usize,
+    invalid_coverage_total: usize,
     unknown_coverage_total: usize,
     by_stage: &'a BTreeMap<String, usize>,
     covered: &'a [String],
+    covered_planning: &'a [String],
+    covered_stub: &'a [String],
+    covered_gpu: &'a [String],
     partial: &'a [String],
     blocked: &'a [String],
     omitted: &'a [String],
     missing: &'a [String],
+    invalid_coverage: &'a [String],
     unknown_coverage: &'a [String],
     coverage_evidence: &'a BTreeMap<String, String>,
 }
@@ -2562,19 +2659,27 @@ fn render_audit_json(audit: &AcceptanceAudit) -> Result<String, String> {
         rust_toolchain: &audit.rust_toolchain,
         msrv: &audit.msrv,
         required_total: audit.required_total,
-        covered_total: audit.covered.len(),
+        covered_total: audit.covered_total(),
+        covered_planning_total: audit.covered_planning.len(),
+        covered_stub_total: audit.covered_stub.len(),
+        covered_gpu_total: audit.covered_gpu.len(),
         partial_total: audit.partial.len(),
         blocked_total: audit.blocked.len(),
         omitted_total: audit.omitted.len(),
         missing_total: audit.missing.len(),
         unverified_total: unverified.len(),
+        invalid_coverage_total: audit.invalid_coverage.len(),
         unknown_coverage_total: audit.unknown_coverage.len(),
         by_stage: &audit.by_stage,
         covered: &audit.covered,
+        covered_planning: &audit.covered_planning,
+        covered_stub: &audit.covered_stub,
+        covered_gpu: &audit.covered_gpu,
         partial: &audit.partial,
         blocked: &audit.blocked,
         omitted: &audit.omitted,
         missing: &audit.missing,
+        invalid_coverage: &audit.invalid_coverage,
         unknown_coverage: &audit.unknown_coverage,
         coverage_evidence: &audit.coverage_evidence,
     };
@@ -2936,7 +3041,7 @@ mod tests {
 
     #[test]
     fn builds_acceptance_audit_counts() {
-        let required = ["S0-ARCH-001", "S0-ARCH-002", "L3-DEVICE-001", "L5-RG40-001"]
+        let required = ["S0-ARCH-001", "S0-ARCH-002", "L3-GPU-001", "L5-RG40-001"]
             .into_iter()
             .map(str::to_string)
             .collect::<BTreeSet<_>>();
@@ -2949,10 +3054,10 @@ mod tests {
                 },
             ),
             (
-                "L3-DEVICE-001".to_string(),
+                "L3-GPU-001".to_string(),
                 CoverageEntry {
-                    status: CoverageStatus::Omitted,
-                    evidence: "outside macos scope".to_string(),
+                    status: CoverageStatus::CoveredPlanning,
+                    evidence: "planning-only evidence".to_string(),
                 },
             ),
             (
@@ -2976,14 +3081,46 @@ mod tests {
         let audit = build_acceptance_audit(&required, &coverage);
 
         assert_eq!(audit.covered, ["S0-ARCH-001"]);
+        assert_eq!(audit.covered_planning, ["L3-GPU-001"]);
         assert_eq!(audit.blocked, ["L5-RG40-001"]);
-        assert_eq!(audit.omitted, ["L3-DEVICE-001"]);
         assert_eq!(audit.missing, ["S0-ARCH-002"]);
         assert_eq!(audit.unknown_coverage, ["S0-ARCH-099"]);
         assert_eq!(audit.by_stage.get("S0"), Some(&2));
         assert_eq!(
             audit.strict_failures(),
-            strings(&["L5-RG40-001", "L3-DEVICE-001", "S0-ARCH-002"])
+            vec![
+                "L5-RG40-001".to_string(),
+                "S0-ARCH-002".to_string(),
+                "L3-GPU-001: covered-planning cannot satisfy Stage 3+ GPU/pixel acceptance; use covered-gpu or leave the row non-green".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn covered_stub_requires_explicit_stub_fx_acceptance_row() {
+        let required = ["S4-FX-018"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        let coverage = [(
+            "S4-FX-018".to_string(),
+            CoverageEntry {
+                status: CoverageStatus::CoveredStub,
+                evidence: "reference stub output".to_string(),
+            },
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+
+        let audit = build_acceptance_audit(&required, &coverage);
+
+        assert_eq!(audit.covered_stub, ["S4-FX-018"]);
+        assert_eq!(
+            audit.invalid_coverage,
+            vec![
+                "S4-FX-018: covered-stub is reserved for explicit STUB-only FX lifecycle acceptance rows"
+                    .to_string()
+            ]
         );
     }
 
@@ -2997,10 +3134,14 @@ mod tests {
             msrv: WORKSPACE_MSRV.to_string(),
             required_total: 1,
             covered: vec!["S0-ARCH-001".to_string()],
+            covered_planning: Vec::new(),
+            covered_stub: Vec::new(),
+            covered_gpu: Vec::new(),
             partial: Vec::new(),
             blocked: Vec::new(),
             omitted: Vec::new(),
             missing: Vec::new(),
+            invalid_coverage: Vec::new(),
             unknown_coverage: Vec::new(),
             coverage_evidence: BTreeMap::new(),
             by_stage: BTreeMap::new(),

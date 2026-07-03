@@ -389,6 +389,11 @@ pub trait RenderBackend {
     fn execute(&mut self, commands: &RenderCommandList) -> Result<FrameOutput, RenderError>;
 }
 
+/// Marker trait for backends that execute draws against a live GPU.
+///
+/// Planning and capture-only backends must not implement this trait.
+pub trait GpuRenderBackend: RenderBackend {}
+
 /// Backend that validates commands and intentionally produces no pixels.
 #[derive(Clone, Debug, Default)]
 pub struct NullBackend;

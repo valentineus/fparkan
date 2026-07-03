@@ -19,7 +19,7 @@
     )
 )]
 #![allow(clippy::print_stderr, clippy::print_stdout)]
-//! `FParkan` asset viewer composition root.
+//! `FParkan` asset inspection composition root.
 
 use fparkan_inspection::{
     inspect_land_file, inspect_model_from_root, inspect_texture_from_root, ArchiveInspection,
@@ -68,14 +68,14 @@ fn inspect_archive(args: &[String]) -> Result<String, String> {
             lookup_order_valid,
             sample,
         } => Ok(format!(
-            "{{\"kind\":\"NRes\",\"path\":{},\"entries\":{},\"lookup_order_valid\":{},\"sample\":[{}]}}",
+            "{{\"report_kind\":\"archive-inspection\",\"kind\":\"NRes\",\"path\":{},\"entries\":{},\"lookup_order_valid\":{},\"sample\":[{}]}}",
             json_string(&file.display().to_string()),
             entries,
             lookup_order_valid,
             render_nres_entries(&sample)
         )),
         ArchiveInspection::Rsli { entries } => Ok(format!(
-            "{{\"kind\":\"RsLi\",\"path\":{},\"entries\":{}}}",
+            "{{\"report_kind\":\"archive-inspection\",\"kind\":\"RsLi\",\"path\":{},\"entries\":{}}}",
             json_string(&file.display().to_string()),
             entries
         )),
@@ -92,7 +92,7 @@ fn inspect_model(args: &[String]) -> Result<String, String> {
     let inspection = inspect_model_from_root(&query.root, &query.archive, &query.name)?;
 
     Ok(format!(
-        "{{\"kind\":\"model\",\"archive\":{},\"name\":{},\"streams\":{},\"nodes\":{},\"slots\":{},\"positions\":{},\"indices\":{},\"batches\":{}}}",
+        "{{\"report_kind\":\"model-inspection\",\"kind\":\"model\",\"archive\":{},\"name\":{},\"streams\":{},\"nodes\":{},\"slots\":{},\"positions\":{},\"indices\":{},\"batches\":{}}}",
         json_string(&query.archive),
         json_string(&query.name),
         inspection.streams,
@@ -136,7 +136,7 @@ impl ViewerModelService {
             .count();
 
         Ok(format!(
-            "{{\"kind\":\"model\",\"fixture\":{},\"service\":\"synthetic-model\",\"draw_commands\":{draw_commands}}}",
+            "{{\"report_kind\":\"model-inspection\",\"kind\":\"model\",\"fixture\":{},\"service\":\"synthetic-model-inspection\",\"draw_commands\":{draw_commands}}}",
             json_string(fixture)
         ))
     }
@@ -147,7 +147,7 @@ fn inspect_texture(args: &[String]) -> Result<String, String> {
     let inspection = inspect_texture_from_root(&query.root, &query.archive, &query.name)?;
 
     Ok(format!(
-        "{{\"kind\":\"texture\",\"archive\":{},\"name\":{},\"width\":{},\"height\":{},\"format\":{},\"mips\":{},\"pages\":{}}}",
+        "{{\"report_kind\":\"texture-inspection\",\"kind\":\"texture\",\"archive\":{},\"name\":{},\"width\":{},\"height\":{},\"format\":{},\"mips\":{},\"pages\":{}}}",
         json_string(&query.archive),
         json_string(&query.name),
         inspection.width,
@@ -180,7 +180,7 @@ fn inspect_map(args: &[String]) -> Result<String, String> {
 fn render_map_inspection_json(path: &str, kind: &str, inspection: &MapInspection) -> String {
     match kind {
         "land-msh" => format!(
-            "{{\"kind\":\"land-msh\",\"path\":{},\"streams\":{},\"positions\":{},\"faces\":{},\"slots\":{}}}",
+            "{{\"report_kind\":\"map-inspection\",\"kind\":\"land-msh\",\"path\":{},\"streams\":{},\"positions\":{},\"faces\":{},\"slots\":{}}}",
             json_string(path),
             inspection.streams,
             inspection.positions,
@@ -188,7 +188,7 @@ fn render_map_inspection_json(path: &str, kind: &str, inspection: &MapInspection
             inspection.slots
         ),
         "land-map" => format!(
-            "{{\"kind\":\"land-map\",\"path\":{},\"areals\":{},\"declared_areals\":{},\"grid_width\":{},\"grid_height\":{}}}",
+            "{{\"report_kind\":\"map-inspection\",\"kind\":\"land-map\",\"path\":{},\"areals\":{},\"declared_areals\":{},\"grid_width\":{},\"grid_height\":{}}}",
             json_string(path),
             inspection.areals,
             inspection.declared_areals,
@@ -342,7 +342,7 @@ mod tests {
     fn model_fixture_uses_viewer_service_and_render_commands() -> Result<(), String> {
         assert_eq!(
             run(&strings(&["model", "--fixture", "synthetic/model-basic"]))?,
-            "{\"kind\":\"model\",\"fixture\":\"synthetic/model-basic\",\"service\":\"synthetic-model\",\"draw_commands\":1}"
+            "{\"report_kind\":\"model-inspection\",\"kind\":\"model\",\"fixture\":\"synthetic/model-basic\",\"service\":\"synthetic-model-inspection\",\"draw_commands\":1}"
         );
         Ok(())
     }

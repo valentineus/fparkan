@@ -1,5 +1,5 @@
 # Acceptance coverage manifest.
-# Format: <acceptance-id>\t<covered|partial|blocked|omitted>\t<evidence>
+# Format: <acceptance-id>\t<covered|covered-planning|covered-stub|covered-gpu|partial|blocked|omitted>\t<evidence>
 # Scope note: Stage 0 is closed for the macOS/codebase review scope.
 # Scope note: cross-platform native runtime and hosted CI evidence remain deferred.
 L0-COPYRIGHT-001	covered	cargo test -p fparkan-corpus --offline report_json_contains_metrics_and_hashes_not_paths_or_payloads
@@ -32,7 +32,7 @@ S0-PLAT-001	covered	cargo test -p fparkan-platform-winit --offline window_port_r
 S0-PLAT-002	covered	cargo clippy -p fparkan-platform -p fparkan-platform-winit --all-targets --all-features --locked -- -D warnings
 S0-PLAT-003	covered	cargo test -p fparkan-platform-winit --offline smoke_window_plan_requires_native_handles_and_nonzero_extent smoke_window_plan_rejects_zero_extent
 S0-PLAT-004	covered	cargo test -p fparkan-platform-winit --offline smoke_window_app_requires_created_native_window smoke_window_app_rejects_synthetic_window_without_native_handles
-S0-VK-001	covered	cargo test -p fparkan-render-vulkan --offline planning_backend_tracks_render_request_and_simulated_present
+S0-VK-001	covered-planning	cargo test -p fparkan-render-vulkan --offline planning_backend_tracks_render_request_and_simulated_present
 S0-VK-002	covered	cargo test -p fparkan-render-vulkan --offline device_scoring_is_deterministic_and_prefers_discrete_unified_queue
 S0-VK-003	covered	cargo test -p fparkan-render-vulkan --offline portability_subset_is_reported_and_enabled_when_exposed
 S0-VK-004	covered	cargo test -p fparkan-render-vulkan --offline rejects_missing_graphics_present_swapchain_and_format
@@ -52,8 +52,8 @@ S0-VK-017	covered	cargo test -p fparkan-render-vulkan --offline swapchain_plan_j
 S0-VK-018	covered	cargo test -p fparkan-render-vulkan --offline triangle_shader_manifest_hashes_are_stable checked_in_shader_manifest_matches_generated_report
 S0-VK-019	covered	cargo test -p fparkan-render-vulkan --offline shader_manifest_report_json_is_stable
 S0-VK-020	covered	cargo test -p fparkan-render-vulkan --offline shader_manifest_rejects_invalid_spirv_containers
-S0-VK-021	covered	cargo test -p fparkan-render-vulkan --offline frame_submission_plan_json_is_stable
-S0-VK-022	covered	cargo test -p fparkan-render-vulkan --offline planning_backend_tracks_render_request_and_simulated_present
+S0-VK-021	covered-planning	cargo test -p fparkan-render-vulkan --offline frame_submission_plan_json_is_stable
+S0-VK-022	covered-planning	cargo test -p fparkan-render-vulkan --offline planning_backend_tracks_render_request_and_simulated_present
 S0-VK-023	covered	cargo test -p fparkan-vulkan-smoke --offline rejects_false_pass_without_full_evidence blocked_report_includes_shader_manifest_and_bootstrap_status
 S0-VK-024	covered	cargo test -p fparkan-vulkan-smoke --offline rejects_passed_without_loader_probe formats_vulkan_api_version
 S0-VK-025	covered	cargo test -p fparkan-vulkan-smoke --offline rejects_passed_without_instance_probe parses_instance_probe_as_loader_probe
@@ -233,8 +233,8 @@ L3-P1-WEAR-001	covered	cargo test -p fparkan-material --offline licensed_corpus_
 L3-P2-WEAR-001	covered	cargo test -p fparkan-material --offline licensed_corpus_mat0_and_wear_parse
 L3-P1-ASSET-001	covered	cargo test -p fparkan-runtime --offline licensed_corpora_load_all_mission_foundations
 L3-P2-ASSET-001	covered	cargo test -p fparkan-runtime --offline licensed_corpora_load_all_mission_foundations
-S2-PLANNING-CAPTURE-P1-001	covered	cargo test -p fparkan-game --offline selected_is_and_is2_missions_produce_approved_render_captures
-S2-PLANNING-CAPTURE-P2-001	covered	cargo test -p fparkan-game --offline selected_is_and_is2_missions_produce_approved_render_captures
+S2-PLANNING-CAPTURE-P1-001	covered-planning	cargo test -p fparkan-game --offline selected_is_and_is2_missions_produce_approved_render_captures
+S2-PLANNING-CAPTURE-P2-001	covered-planning	cargo test -p fparkan-game --offline selected_is_and_is2_missions_produce_approved_render_captures
 S3-WEAR-001	covered	cargo test -p fparkan-material --offline wear_preserves_legacy_id_but_selects_by_index
 S3-WEAR-002	covered	cargo test -p fparkan-material --offline wear_requires_declared_rows
 S3-WEAR-003	covered	cargo test -p fparkan-material --offline wear_preserves_legacy_id_but_selects_by_index
@@ -292,7 +292,7 @@ S2-PLANNING-RENDER-004	covered	cargo test -p fparkan-render --offline command_or
 S2-PLANNING-RENDER-005	covered	cargo test -p fparkan-render --offline command_capture_independent_of_snapshot_construction_order
 S2-PLANNING-RENDER-006	covered	cargo test -p fparkan-render --offline invalid_range_returns_contextual_error
 S2-PLANNING-RENDER-007	covered	cargo test -p fparkan-render --offline capture_is_stable
-S2-PLANNING-RENDER-008	covered	cargo test -p fparkan-render --offline recording_backend_stores_captures
+S2-PLANNING-RENDER-008	covered-planning	cargo test -p fparkan-render --offline recording_backend_stores_captures
 S2-PLANNING-RENDER-009	covered	cargo xtask policy
 S3-VK-MESH-UPLOAD-001	blocked	awaits Stage 3 Vulkan asset renderer and GPU upload path
 S3-VK-TEXM-UPLOAD-001	blocked	awaits Stage 3 Vulkan texture upload path
@@ -441,7 +441,7 @@ L5-P1-MISSION-002	covered	cargo test -p fparkan-runtime --offline licensed_corpo
 L5-P2-MISSION-002	covered	cargo test -p fparkan-runtime --offline licensed_corpora_load_all_mission_foundations
 L5-P1-HEADLESS-001	covered	cargo test -p fparkan-runtime --offline selected_is_and_is2_missions_execute_10000_deterministic_ticks
 L5-P2-HEADLESS-001	covered	cargo test -p fparkan-runtime --offline selected_is_and_is2_missions_execute_10000_deterministic_ticks
-L5-P1-RENDER-001	covered	cargo test -p fparkan-game --offline selected_is_and_is2_missions_produce_approved_render_captures
-L5-P2-RENDER-001	covered	cargo test -p fparkan-game --offline selected_is_and_is2_missions_produce_approved_render_captures
+L5-P1-RENDER-001	covered-planning	cargo test -p fparkan-game --offline selected_is_and_is2_missions_produce_approved_render_captures
+L5-P2-RENDER-001	covered-planning	cargo test -p fparkan-game --offline selected_is_and_is2_missions_produce_approved_render_captures
 L3-DEVICE-001	omitted	outside the current macOS-focused goal scope; RG40XX-capable device/profile evidence remains documented for the portable target scope
 L5-RG40-001	omitted	outside the current macOS-focused goal scope; RG40XX 640x480 on-device mission smoke/performance/memory evidence remains documented for the portable target scope
