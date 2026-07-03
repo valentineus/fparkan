@@ -570,7 +570,7 @@ pub fn prepare_mission_assets_with_repository<R: ResourceRepository>(
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum PreparedVisualSignature {
     Mesh {
-        archive: String,
+        archive: Vec<u8>,
         name: Vec<u8>,
         type_id: Option<u32>,
         dependency_count: usize,
@@ -583,7 +583,7 @@ enum PreparedVisualSignature {
 fn prepared_visual_signature(proto: &EffectivePrototype) -> PreparedVisualSignature {
     match &proto.geometry {
         PrototypeGeometry::Mesh(key) => PreparedVisualSignature::Mesh {
-            archive: key.archive.as_str().to_string(),
+            archive: key.archive.identity_bytes().to_vec(),
             name: key.name.0.clone(),
             type_id: key.type_id,
             dependency_count: proto.dependencies.len(),
@@ -1160,7 +1160,7 @@ fn stable_visual_id(proto: &EffectivePrototype) -> u64 {
     match &proto.geometry {
         PrototypeGeometry::Mesh(key) => {
             1_u8.hash(&mut hasher);
-            key.archive.as_str().hash(&mut hasher);
+            key.archive.identity_bytes().hash(&mut hasher);
             key.name.0.hash(&mut hasher);
             key.type_id.hash(&mut hasher);
         }
@@ -1267,6 +1267,35 @@ mod tests {
         let err = resolve_texture(&repo, &resource_name(b"BAD")).expect_err("malformed texture");
 
         assert!(matches!(err, AssetError::Texture(_)));
+    }
+
+    #[test]
+    fn stable_visual_id_uses_archive_identity_bytes() {
+        let first = EffectivePrototype {
+            key: fparkan_prototype::PrototypeKey(resource_name(b"mesh")),
+            geometry: PrototypeGeometry::Mesh(ResourceKey {
+                archive: normalize_relative(b"DATA/\xFF.lib", PathPolicy::HostCompatible)
+                    .expect("archive"),
+                name: resource_name(b"mesh.msh"),
+                type_id: Some(0x4853_454D),
+            }),
+            source: fparkan_prototype::PrototypeSource::DirectArchive,
+            dependencies: Vec::new(),
+        };
+        let second = EffectivePrototype {
+            key: fparkan_prototype::PrototypeKey(resource_name(b"mesh")),
+            geometry: PrototypeGeometry::Mesh(ResourceKey {
+                archive: normalize_relative(b"DATA/\xFE.lib", PathPolicy::HostCompatible)
+                    .expect("archive"),
+                name: resource_name(b"mesh.msh"),
+                type_id: Some(0x4853_454D),
+            }),
+            source: fparkan_prototype::PrototypeSource::DirectArchive,
+            dependencies: Vec::new(),
+        };
+
+        assert_ne!(stable_visual_id(&first), stable_visual_id(&second));
+        assert_ne!(prepared_visual_signature(&first), prepared_visual_signature(&second));
     }
 
     #[test]

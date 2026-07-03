@@ -640,22 +640,20 @@ fn resolve_unit_dat_prototype_requests(
     };
 
     if let Ok(unit) = decode_unit_dat(&bytes) {
-        if !unit.records.is_empty() {
-            let mut prototypes = Vec::with_capacity(unit.records.len());
-            for record in &unit.records {
-                let prototype = resolve_unit_component(repository, record)?.ok_or_else(|| {
-                    PrototypeError::Resource(ResourceError::Format(format!(
-                        "unit component {} did not resolve",
-                        String::from_utf8_lossy(cstr_bytes(&record.resource_raw))
-                    )))
-                })?;
-                prototypes.push(prototype);
-            }
-            return Ok(ResolvedPrototypeRequests {
-                expected_count: unit.records.len(),
-                prototypes,
-            });
+        let mut prototypes = Vec::with_capacity(unit.records.len());
+        for record in &unit.records {
+            let prototype = resolve_unit_component(repository, record)?.ok_or_else(|| {
+                PrototypeError::Resource(ResourceError::Format(format!(
+                    "unit component {} did not resolve",
+                    String::from_utf8_lossy(cstr_bytes(&record.resource_raw))
+                )))
+            })?;
+            prototypes.push(prototype);
         }
+        return Ok(ResolvedPrototypeRequests {
+            expected_count: unit.records.len(),
+            prototypes,
+        });
     }
 
     let binding = decode_unit_dat_binding(&bytes)?;
@@ -906,8 +904,31 @@ pub fn build_prototype_graph_report(
 }
 
 fn graph_error_edge(edge: PrototypeGraphEdge, err: &PrototypeError) -> PrototypeGraphEdge {
-    let _ = err;
-    edge
+    match err {
+        PrototypeError::Decode(_)
+        | PrototypeError::InvalidSize
+        | PrototypeError::InvalidUnitDatMagic(_)
+            if edge == PrototypeGraphEdge::MissionToUnitDat =>
+        {
+            PrototypeGraphEdge::MissionToUnitDat
+        }
+        PrototypeError::Resource(ResourceError::Format(message))
+            if message.starts_with("missing unit DAT:") =>
+        {
+            PrototypeGraphEdge::MissionToUnitDat
+        }
+        PrototypeError::Resource(ResourceError::Format(message))
+            if message.starts_with("unit component ") =>
+        {
+            PrototypeGraphEdge::UnitDatToComponent
+        }
+        PrototypeError::Resource(ResourceError::Format(message))
+            if message.contains("explicit mesh reference missing:") =>
+        {
+            PrototypeGraphEdge::PrototypeToMesh
+        }
+        _ => edge,
+    }
 }
 
 fn provenance_for_root(root_index: usize, root: &ResourceName) -> PrototypeGraphProvenance {
@@ -1582,6 +1603,69 @@ mod tests {
     }
 
     #[test]
+    fn empty_unit_dat_resolves_as_zero_component_root() {
+        let mut vfs = MemoryVfs::default();
+        let dat_path = resource_archive_path(b"UNITS/AUTO/empty.dat").expect("dat path");
+        vfs.insert(dat_path, Arc::from(vec![0_u8; 8].into_boxed_slice()));
+        let vfs = Arc::new(vfs);
+        let repo = CachedResourceRepository::new(vfs.clone());
+        let roots = [resource_name(b"UNITS/AUTO/empty.dat")];
+
+        let (graph, resolved, report) = build_prototype_graph_report(&repo, vfs.as_ref(), &roots);
+
+        assert_eq!(graph.roots.len(), 1);
+        assert!(graph.prototype_requests.is_empty());
+        assert!(resolved.is_empty());
+        assert_eq!(report.unit_reference_count, 1);
+        assert_eq!(report.unit_component_count, 0);
+        assert_eq!(report.resolved_count, 0);
+        assert!(report.failures.is_empty());
+        assert!(report.is_success());
+    }
+
+    #[test]
+    fn malformed_unit_dat_failure_is_classified_on_unit_edge() {
+        let mut vfs = MemoryVfs::default();
+        let dat_path = resource_archive_path(b"UNITS/AUTO/bad.dat").expect("dat path");
+        vfs.insert(dat_path, Arc::from([1_u8, 2, 3].to_vec().into_boxed_slice()));
+        let vfs = Arc::new(vfs);
+        let repo = CachedResourceRepository::new(vfs.clone());
+
+        let (_graph, _resolved, report) =
+            build_prototype_graph_report(&repo, vfs.as_ref(), &[resource_name(b"UNITS/AUTO/bad.dat")]);
+
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].edge, PrototypeGraphEdge::MissionToUnitDat);
+    }
+
+    #[test]
+    fn missing_unit_component_failure_is_classified_on_component_edge() {
+        let mut vfs = MemoryVfs::default();
+        let dat_path = resource_archive_path(b"UNITS/AUTO/compound.dat").expect("dat path");
+        let objects_path = resource_archive_path(b"objects.rlb").expect("objects path");
+        vfs.insert(
+            dat_path,
+            Arc::from(
+                build_unit_dat(&[(b"objects.rlb".as_slice(), b"missing_component".as_slice())])
+                    .into_boxed_slice(),
+            ),
+        );
+        vfs.insert(objects_path, Arc::from(build_nres(&[]).into_boxed_slice()));
+        let vfs = Arc::new(vfs);
+        let repo = CachedResourceRepository::new(vfs.clone());
+
+        let (_graph, _resolved, report) = build_prototype_graph_report(
+            &repo,
+            vfs.as_ref(),
+            &[resource_name(b"UNITS/AUTO/compound.dat")],
+        );
+
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].edge, PrototypeGraphEdge::UnitDatToComponent);
+        assert!(report.failures[0].message.contains("missing_component"));
+    }
+
+    #[test]
     fn unit_dat_expands_components_in_order() {
         let mut vfs = MemoryVfs::default();
         let dat_path = resource_archive_path(b"UNITS/AUTO/compound.dat").expect("dat path");
@@ -1896,7 +1980,7 @@ mod tests {
         assert_eq!(report.failures[0].resource_raw, b"broken");
         assert_eq!(
             report.failures[0].edge,
-            PrototypeGraphEdge::MissionToObjectsRegistry
+            PrototypeGraphEdge::PrototypeToMesh
         );
         assert!(report.failures[0].message.contains("broken"));
         assert!(report.failures[0]
@@ -1929,6 +2013,7 @@ mod tests {
 
         assert_eq!(report.failures.len(), 1);
         assert_eq!(report.failures[0].resource_raw, b"broken");
+        assert_eq!(report.failures[0].edge, PrototypeGraphEdge::PrototypeToMesh);
         assert!(report.failures[0]
             .message
             .contains("static.rlb:missing.msh"));
