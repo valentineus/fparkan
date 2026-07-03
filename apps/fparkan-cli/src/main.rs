@@ -165,9 +165,9 @@ fn inspect_prototype(args: &[String]) -> Result<(), String> {
     let vfs = Arc::new(DirectoryVfs::new(root));
     let repository = CachedResourceRepository::new(vfs.clone());
     let roots = [resource_name(key.as_bytes())];
-    let (graph, resolved, mut report) =
+    let (mut graph, resolved, mut report) =
         build_prototype_graph_report(&repository, vfs.as_ref(), &roots);
-    extend_graph_report_with_visual_dependencies(&repository, &mut report, &graph, &resolved);
+    extend_graph_report_with_visual_dependencies(&repository, &mut report, &mut graph, &resolved);
     println!("{}", prototype_inspect_json(&key, &graph, &report));
     Ok(())
 }

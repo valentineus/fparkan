@@ -516,12 +516,12 @@ fn load_mission_with_options(
         .iter()
         .map(|object| resource_name(&object.resource_name.raw))
         .collect();
-    let (prototype_graph, resolved_prototypes, mut prototype_report) =
+    let (mut prototype_graph, resolved_prototypes, mut prototype_report) =
         build_prototype_graph_report(&repository, vfs.as_ref(), &graph_roots);
     extend_graph_report_with_visual_dependencies(
         &repository,
         &mut prototype_report,
-        &prototype_graph,
+        &mut prototype_graph,
         &resolved_prototypes,
     );
     if !prototype_report.is_success() {

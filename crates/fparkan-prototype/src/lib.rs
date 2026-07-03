@@ -179,6 +179,16 @@ pub enum PrototypeGraphNodeKind {
     Prototype,
     /// Mesh dependency.
     MeshResource,
+    /// WEAR dependency.
+    WearResource,
+    /// MAT0 dependency.
+    MaterialResource,
+    /// TEXM texture dependency.
+    TextureResource,
+    /// TEXM lightmap dependency.
+    LightmapResource,
+    /// Effect dependency placeholder for later stages.
+    EffectResource,
     /// Non-geometric prototype.
     NonGeometric,
 }
@@ -197,6 +207,17 @@ pub struct PrototypeGraphNode {
 }
 
 impl PrototypeGraphNode {
+    /// Creates a typed resource node.
+    #[must_use]
+    pub fn resource(kind: PrototypeGraphNodeKind, resource: ResourceKey, id: PrototypeGraphNodeId) -> Self {
+        Self {
+            id,
+            kind,
+            key: None,
+            resource: Some(resource),
+        }
+    }
+
     /// Creates a mesh resource node.
     #[must_use]
     pub const fn mesh(resource: ResourceKey, id: PrototypeGraphNodeId) -> Self {
@@ -244,6 +265,16 @@ pub enum PrototypeGraphEdgeKind {
     UnitDatToComponent,
     /// Prototype to mesh dependency.
     PrototypeToMesh,
+    /// Mesh resource to WEAR table.
+    MeshToWear,
+    /// WEAR table to MAT0 material.
+    WearToMaterial,
+    /// MAT0 material to TEXM texture.
+    MaterialToTexture,
+    /// WEAR table to TEXM lightmap.
+    WearToLightmap,
+    /// MAT0 material to effect dependency.
+    MaterialToEffect,
 }
 
 /// Prototype graph edge record.

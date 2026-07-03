@@ -20,7 +20,7 @@
 )]
 //! Asset manager ports and transactional preparation models.
 
-use fparkan_material::{decode_wear, resolve_material, MaterialError, WEAR_KIND};
+use fparkan_material::{decode_wear, resolve_material, MaterialError, MAT0_KIND, WEAR_KIND};
 use fparkan_mission_format::{decode_tma, decode_tma_land_path};
 pub use fparkan_mission_format::{LpString, MissionDocument, MissionError, TmaProfile};
 use fparkan_msh::{decode_msh, validate_msh, MshError};
@@ -601,22 +601,71 @@ fn prepared_visual_signature(proto: &EffectivePrototype) -> PreparedVisualSignat
 pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
     repository: &R,
     report: &mut PrototypeGraphReport,
-    graph: &PrototypeGraph,
+    graph: &mut PrototypeGraph,
     prototypes: &[EffectivePrototype],
 ) {
-    let texture_archive = parse_path(TEXTURES_ARCHIVE).ok();
-    let lightmap_archive = parse_path(LIGHTMAP_ARCHIVE).ok();
+    let material_archive = parse_path("material.lib")
+        .expect("static material archive path must satisfy host-compatible normalization");
+    let mut next_node = graph
+        .nodes
+        .iter()
+        .map(|node| node.id.0)
+        .max()
+        .map_or(0, |value| value.saturating_add(1));
+    let mut next_edge = graph
+        .edges
+        .iter()
+        .map(|edge| edge.id.0)
+        .max()
+        .map_or(0, |value| value.saturating_add(1));
 
     for (prototype_index, prototype) in prototypes.iter().enumerate() {
         let PrototypeGeometry::Mesh(mesh) = &prototype.geometry else {
             continue;
         };
-        report.mesh_dependency_count += prototype.dependencies.len();
         report.wear_request_count += 1;
+        let Some(prototype_node_id) = prototype_node_id(graph, prototype_index) else {
+            continue;
+        };
+        let Some(mesh_node_id) = prototype_mesh_node_id(graph, prototype_node_id) else {
+            continue;
+        };
+        let mesh_parent_edge = mesh_edge_id(graph, prototype_node_id);
+        let root_index = root_index_for_prototype(graph, prototype_index);
 
         match resolve_wear_table(repository, mesh) {
             Ok(table) => {
                 report.wear_resolved_count += 1;
+                let wear_key = match wear_resource_key(mesh) {
+                    Ok(key) => key,
+                    Err(message) => {
+                        push_visual_failure(
+                            report,
+                            graph,
+                            prototype_index,
+                            mesh.name.0.clone(),
+                            PrototypeGraphEdge::MeshToWear,
+                            PrototypeGraphRequiredness::Required,
+                            &message.to_string(),
+                        );
+                        continue;
+                    }
+                };
+                let wear_node_id = push_graph_resource_node(
+                    graph,
+                    PrototypeGraphNodeKind::WearResource,
+                    wear_key.clone(),
+                    &mut next_node,
+                );
+                let wear_edge_id = push_graph_edge(
+                    graph,
+                    mesh_node_id,
+                    wear_node_id,
+                    fparkan_prototype::PrototypeGraphEdgeKind::MeshToWear,
+                    PrototypeGraphRequiredness::Required,
+                    Some(provenance_for_resource(root_index, mesh_parent_edge, &wear_key)),
+                    &mut next_edge,
+                );
                 report.material_slot_count += table.entries.len();
                 for (material_index, _entry) in table.entries.iter().enumerate() {
                     let Ok(material_index) = u16::try_from(material_index) else {
@@ -634,14 +683,59 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
                     match resolve_material(repository, &table, material_index) {
                         Ok(material) => {
                             report.material_resolved_count += 1;
+                            let material_key = ResourceKey {
+                                archive: material_archive.clone(),
+                                name: material.name.clone(),
+                                type_id: Some(MAT0_KIND),
+                            };
+                            let material_node_id = push_graph_resource_node(
+                                graph,
+                                PrototypeGraphNodeKind::MaterialResource,
+                                material_key.clone(),
+                                &mut next_node,
+                            );
+                            let material_edge_id = push_graph_edge(
+                                graph,
+                                wear_node_id,
+                                material_node_id,
+                                fparkan_prototype::PrototypeGraphEdgeKind::WearToMaterial,
+                                PrototypeGraphRequiredness::Required,
+                                Some(provenance_for_resource(
+                                    root_index,
+                                    Some(wear_edge_id),
+                                    &material_key,
+                                )),
+                                &mut next_edge,
+                            );
                             for texture in material.document.texture_requests() {
                                 report.texture_request_count += 1;
-                                match resolve_texm_from_candidates(
-                                    repository,
-                                    &texture,
-                                    [texture_archive.as_ref(), lightmap_archive.as_ref()],
-                                ) {
-                                    Ok(()) => report.texture_resolved_count += 1,
+                                match resolve_texture(repository, &texture) {
+                                    Ok(()) => {
+                                        report.texture_resolved_count += 1;
+                                        if let Ok(texture_key) =
+                                            texm_resource_key(TEXTURES_ARCHIVE, &texture)
+                                        {
+                                            let texture_node_id = push_graph_resource_node(
+                                                graph,
+                                                PrototypeGraphNodeKind::TextureResource,
+                                                texture_key.clone(),
+                                                &mut next_node,
+                                            );
+                                            push_graph_edge(
+                                                graph,
+                                                material_node_id,
+                                                texture_node_id,
+                                                fparkan_prototype::PrototypeGraphEdgeKind::MaterialToTexture,
+                                                PrototypeGraphRequiredness::Required,
+                                                Some(provenance_for_resource(
+                                                    root_index,
+                                                    Some(material_edge_id),
+                                                    &texture_key,
+                                                )),
+                                                &mut next_edge,
+                                            );
+                                        }
+                                    }
                                     Err(message) => {
                                         let message = message.to_string();
                                         push_visual_failure(
@@ -670,12 +764,33 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
                 }
                 for lightmap in &table.lightmaps {
                     report.lightmap_request_count += 1;
-                    match resolve_texm_from_candidates(
-                        repository,
-                        &lightmap.lightmap,
-                        [lightmap_archive.as_ref(), texture_archive.as_ref()],
-                    ) {
-                        Ok(()) => report.lightmap_resolved_count += 1,
+                    match resolve_lightmap(repository, &lightmap.lightmap) {
+                        Ok(()) => {
+                            report.lightmap_resolved_count += 1;
+                            if let Ok(lightmap_key) =
+                                texm_resource_key(LIGHTMAP_ARCHIVE, &lightmap.lightmap)
+                            {
+                                let lightmap_node_id = push_graph_resource_node(
+                                    graph,
+                                    PrototypeGraphNodeKind::LightmapResource,
+                                    lightmap_key.clone(),
+                                    &mut next_node,
+                                );
+                                push_graph_edge(
+                                    graph,
+                                    wear_node_id,
+                                    lightmap_node_id,
+                                    fparkan_prototype::PrototypeGraphEdgeKind::WearToLightmap,
+                                    PrototypeGraphRequiredness::Required,
+                                    Some(provenance_for_resource(
+                                        root_index,
+                                        Some(wear_edge_id),
+                                        &lightmap_key,
+                                    )),
+                                    &mut next_edge,
+                                );
+                            }
+                        }
                         Err(message) => {
                             let message = message.to_string();
                             push_visual_failure(
@@ -702,6 +817,89 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
             ),
         }
     }
+}
+
+fn push_graph_resource_node(
+    graph: &mut PrototypeGraph,
+    kind: PrototypeGraphNodeKind,
+    resource: ResourceKey,
+    next_node: &mut u32,
+) -> fparkan_prototype::PrototypeGraphNodeId {
+    let id = fparkan_prototype::PrototypeGraphNodeId(*next_node);
+    *next_node = (*next_node).saturating_add(1);
+    graph
+        .nodes
+        .push(fparkan_prototype::PrototypeGraphNode::resource(kind, resource, id));
+    id
+}
+
+fn push_graph_edge(
+    graph: &mut PrototypeGraph,
+    from: fparkan_prototype::PrototypeGraphNodeId,
+    to: fparkan_prototype::PrototypeGraphNodeId,
+    kind: fparkan_prototype::PrototypeGraphEdgeKind,
+    requiredness: PrototypeGraphRequiredness,
+    provenance: Option<PrototypeGraphProvenance>,
+    next_edge: &mut u32,
+) -> fparkan_prototype::PrototypeGraphEdgeId {
+    let id = fparkan_prototype::PrototypeGraphEdgeId(*next_edge);
+    *next_edge = (*next_edge).saturating_add(1);
+    graph.edges.push(fparkan_prototype::PrototypeGraphEdgeInstance {
+        id,
+        from,
+        to,
+        kind,
+        requiredness,
+        provenance,
+    });
+    id
+}
+
+fn prototype_mesh_node_id(
+    graph: &PrototypeGraph,
+    prototype_node: fparkan_prototype::PrototypeGraphNodeId,
+) -> Option<fparkan_prototype::PrototypeGraphNodeId> {
+    graph
+        .edges
+        .iter()
+        .find(|edge| {
+            edge.from == prototype_node
+                && matches!(
+                    edge.kind,
+                    fparkan_prototype::PrototypeGraphEdgeKind::PrototypeToMesh
+                )
+        })
+        .map(|edge| edge.to)
+}
+
+fn provenance_for_resource(
+    root_index: usize,
+    parent_edge: Option<fparkan_prototype::PrototypeGraphEdgeId>,
+    resource: &ResourceKey,
+) -> PrototypeGraphProvenance {
+    PrototypeGraphProvenance {
+        root_index,
+        parent_edge,
+        archive: Some(resource.archive.display_lossy().to_string()),
+        resource: Some(resource.name.0.clone()),
+        span: None,
+    }
+}
+
+fn wear_resource_key(mesh: &ResourceKey) -> Result<ResourceKey, AssetError> {
+    Ok(ResourceKey {
+        archive: mesh.archive.clone(),
+        name: sibling_name(mesh, "wea")?,
+        type_id: Some(WEAR_KIND),
+    })
+}
+
+fn texm_resource_key(archive: &str, name: &ResourceName) -> Result<ResourceKey, AssetError> {
+    Ok(ResourceKey {
+        archive: parse_path(archive)?,
+        name: name.clone(),
+        type_id: None,
+    })
 }
 
 /// Validates a prototype visual without resolving cross-resource dependencies.
@@ -911,52 +1109,6 @@ fn resolve_wear_table<R: ResourceRepository>(
         })?
         .into_owned();
     decode_wear(&bytes).map_err(AssetError::Material)
-}
-
-fn resolve_texm_from_candidates<'a, R: ResourceRepository>(
-    repository: &R,
-    texture: &ResourceName,
-    candidates: impl IntoIterator<Item = Option<&'a NormalizedPath>>,
-) -> Result<(), AssetError> {
-    let mut missing_archive = false;
-    for path in candidates.into_iter().flatten() {
-        let key = ResourceKey {
-            archive: path.to_owned(),
-            name: texture.clone(),
-            type_id: None,
-        };
-        let archive = match repository.open_archive(path) {
-            Ok(archive) => archive,
-            Err(ResourceError::MissingArchive { .. }) => {
-                missing_archive = true;
-                continue;
-            }
-            Err(err) => return Err(map_resource_error("texm", &key, err)),
-        };
-        let Some(handle) = repository
-            .find(archive, texture)
-            .map_err(|err| map_resource_error("texm", &key, err))?
-        else {
-            continue;
-        };
-        let bytes = repository
-            .read(handle)
-            .map_err(|err| map_resource_error("texm", &key, err))?
-            .into_owned();
-        decode_texm(Arc::from(bytes)).map_err(AssetError::Texture)?;
-        return Ok(());
-    }
-    if missing_archive {
-        Err(AssetError::MissingDependency(format!(
-            "texm archive missing for {}",
-            String::from_utf8_lossy(&texture.0)
-        )))
-    } else {
-        Err(AssetError::MissingDependency(format!(
-            "missing texm {}",
-            String::from_utf8_lossy(&texture.0)
-        )))
-    }
 }
 
 fn push_visual_failure(
@@ -1299,6 +1451,185 @@ mod tests {
     }
 
     #[test]
+    fn graph_materializes_visual_dependency_nodes_and_edges() {
+        let mesh_key = ResourceKey {
+            archive: parse_path("static.rlb").expect("archive"),
+            name: resource_name(b"tree.msh"),
+            type_id: Some(0x4853_454D),
+        };
+        let mat0 = mat0_with_texture(b"TEX_A");
+        let texm = texm_payload();
+        let lightmap_texm = texm_payload();
+        let repo = repository_with_archives_meta(&[
+            (
+                "static.rlb",
+                &[TestNresEntry {
+                    name: b"tree.wea",
+                    payload: b"1\n0 MAT_A\n\nLIGHTMAPS\n1\n0 LM_A\n",
+                    type_id: WEAR_KIND,
+                    attr2: 0,
+                }],
+            ),
+            (
+                "material.lib",
+                &[TestNresEntry {
+                    name: b"MAT_A",
+                    payload: &mat0,
+                    type_id: MAT0_KIND,
+                    attr2: 0,
+                }],
+            ),
+            (
+                TEXTURES_ARCHIVE,
+                &[TestNresEntry {
+                    name: b"TEX_A",
+                    payload: &texm,
+                    type_id: 0,
+                    attr2: 0,
+                }],
+            ),
+            (
+                LIGHTMAP_ARCHIVE,
+                &[TestNresEntry {
+                    name: b"LM_A",
+                    payload: &lightmap_texm,
+                    type_id: 0,
+                    attr2: 0,
+                }],
+            ),
+        ]);
+        let prototype = EffectivePrototype {
+            key: fparkan_prototype::PrototypeKey(resource_name(b"tree")),
+            geometry: PrototypeGeometry::Mesh(mesh_key.clone()),
+            source: fparkan_prototype::PrototypeSource::DirectArchive,
+            dependencies: vec![mesh_key.clone()],
+        };
+        let mut graph = prototype_graph_for_mesh(&prototype);
+        let mut report = PrototypeGraphReport {
+            root_count: 1,
+            direct_reference_count: 1,
+            resolved_count: 1,
+            mesh_dependency_count: 1,
+            ..PrototypeGraphReport::default()
+        };
+
+        extend_graph_report_with_visual_dependencies(
+            &repo,
+            &mut report,
+            &mut graph,
+            std::slice::from_ref(&prototype),
+        );
+
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| node.kind == PrototypeGraphNodeKind::WearResource));
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| node.kind == PrototypeGraphNodeKind::MaterialResource));
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| node.kind == PrototypeGraphNodeKind::TextureResource));
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| node.kind == PrototypeGraphNodeKind::LightmapResource));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge.kind == fparkan_prototype::PrototypeGraphEdgeKind::MeshToWear));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge.kind == fparkan_prototype::PrototypeGraphEdgeKind::WearToMaterial));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge.kind == fparkan_prototype::PrototypeGraphEdgeKind::MaterialToTexture));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge.kind == fparkan_prototype::PrototypeGraphEdgeKind::WearToLightmap));
+        assert_eq!(report.wear_request_count, 1);
+        assert_eq!(report.wear_resolved_count, 1);
+        assert_eq!(report.material_slot_count, 1);
+        assert_eq!(report.material_resolved_count, 1);
+        assert_eq!(report.texture_request_count, 1);
+        assert_eq!(report.texture_resolved_count, 1);
+        assert_eq!(report.lightmap_request_count, 1);
+        assert_eq!(report.lightmap_resolved_count, 1);
+        assert!(report.failures.is_empty());
+    }
+
+    #[test]
+    fn graph_report_uses_strict_texture_archive_policy() {
+        let mesh_key = ResourceKey {
+            archive: parse_path("static.rlb").expect("archive"),
+            name: resource_name(b"tree.msh"),
+            type_id: Some(0x4853_454D),
+        };
+        let mat0 = mat0_with_texture(b"TEX_A");
+        let texm = texm_payload();
+        let repo = repository_with_archives_meta(&[
+            (
+                "static.rlb",
+                &[TestNresEntry {
+                    name: b"tree.wea",
+                    payload: b"1\n0 MAT_A\n",
+                    type_id: WEAR_KIND,
+                    attr2: 0,
+                }],
+            ),
+            (
+                "material.lib",
+                &[TestNresEntry {
+                    name: b"MAT_A",
+                    payload: &mat0,
+                    type_id: MAT0_KIND,
+                    attr2: 0,
+                }],
+            ),
+            (
+                LIGHTMAP_ARCHIVE,
+                &[TestNresEntry {
+                    name: b"TEX_A",
+                    payload: &texm,
+                    type_id: 0,
+                    attr2: 0,
+                }],
+            ),
+        ]);
+        let prototype = EffectivePrototype {
+            key: fparkan_prototype::PrototypeKey(resource_name(b"tree")),
+            geometry: PrototypeGeometry::Mesh(mesh_key.clone()),
+            source: fparkan_prototype::PrototypeSource::DirectArchive,
+            dependencies: vec![mesh_key.clone()],
+        };
+        let mut graph = prototype_graph_for_mesh(&prototype);
+        let mut report = PrototypeGraphReport {
+            root_count: 1,
+            direct_reference_count: 1,
+            resolved_count: 1,
+            mesh_dependency_count: 1,
+            ..PrototypeGraphReport::default()
+        };
+
+        extend_graph_report_with_visual_dependencies(
+            &repo,
+            &mut report,
+            &mut graph,
+            std::slice::from_ref(&prototype),
+        );
+
+        assert_eq!(report.texture_request_count, 1);
+        assert_eq!(report.texture_resolved_count, 0);
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].edge, PrototypeGraphEdge::MaterialToTexture);
+    }
+
+    #[test]
     #[ignore = "requires licensed corpus"]
     fn prepares_real_unit_asset_plan() {
         let root = fixture_root("IS");
@@ -1375,6 +1706,25 @@ mod tests {
         CachedResourceRepository::new(Arc::new(vfs))
     }
 
+    #[derive(Clone, Copy)]
+    struct TestNresEntry<'a> {
+        name: &'a [u8],
+        payload: &'a [u8],
+        type_id: u32,
+        attr2: u32,
+    }
+
+    fn repository_with_archives_meta(
+        archives: &[(&str, &[TestNresEntry<'_>])],
+    ) -> CachedResourceRepository {
+        let mut vfs = MemoryVfs::default();
+        for (archive, entries) in archives {
+            let path = parse_path(archive).expect("archive path");
+            vfs.insert(path, Arc::from(build_nres_with_meta(entries).into_boxed_slice()));
+        }
+        CachedResourceRepository::new(Arc::new(vfs))
+    }
+
     fn texm_payload() -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&0x6d78_6554_u32.to_le_bytes());
@@ -1387,6 +1737,58 @@ mod tests {
         out.extend_from_slice(&565_u32.to_le_bytes());
         out.extend_from_slice(&0xffff_u16.to_le_bytes());
         out
+    }
+
+    fn mat0_with_texture(texture: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0; 4 + 34];
+        bytes[0..2].copy_from_slice(&1_u16.to_le_bytes());
+        let len = texture.len().min(16);
+        bytes[22..22 + len].copy_from_slice(&texture[..len]);
+        bytes
+    }
+
+    fn prototype_graph_for_mesh(prototype: &EffectivePrototype) -> PrototypeGraph {
+        let root_node = fparkan_prototype::PrototypeGraphNode::root(
+            fparkan_prototype::PrototypeKey(prototype.key.0.clone()),
+            false,
+            fparkan_prototype::PrototypeGraphNodeId(0),
+        );
+        let prototype_node = fparkan_prototype::PrototypeGraphNode::prototype(
+            prototype.key.clone(),
+            fparkan_prototype::PrototypeGraphNodeId(1),
+        );
+        let mesh_key = match &prototype.geometry {
+            PrototypeGeometry::Mesh(mesh) => mesh.clone(),
+            PrototypeGeometry::NonGeometric => panic!("mesh prototype expected"),
+        };
+        let mesh_node = fparkan_prototype::PrototypeGraphNode::mesh(
+            mesh_key,
+            fparkan_prototype::PrototypeGraphNodeId(2),
+        );
+        PrototypeGraph {
+            roots: vec![prototype.key.clone()],
+            prototype_requests: vec![prototype.key.clone()],
+            root_prototype_request_spans: std::iter::once(0..1).collect(),
+            nodes: vec![root_node, prototype_node, mesh_node],
+            edges: vec![
+                fparkan_prototype::PrototypeGraphEdgeInstance {
+                    id: fparkan_prototype::PrototypeGraphEdgeId(0),
+                    from: fparkan_prototype::PrototypeGraphNodeId(0),
+                    to: fparkan_prototype::PrototypeGraphNodeId(1),
+                    kind: fparkan_prototype::PrototypeGraphEdgeKind::MissionToRoot,
+                    requiredness: PrototypeGraphRequiredness::Required,
+                    provenance: None,
+                },
+                fparkan_prototype::PrototypeGraphEdgeInstance {
+                    id: fparkan_prototype::PrototypeGraphEdgeId(1),
+                    from: fparkan_prototype::PrototypeGraphNodeId(1),
+                    to: fparkan_prototype::PrototypeGraphNodeId(2),
+                    kind: fparkan_prototype::PrototypeGraphEdgeKind::PrototypeToMesh,
+                    requiredness: PrototypeGraphRequiredness::Required,
+                    provenance: None,
+                },
+            ],
+        }
     }
 
     fn build_nres(entries: &[(&[u8], &[u8])]) -> Vec<u8> {
@@ -1409,6 +1811,38 @@ mod tests {
             let mut name_raw = [0; 36];
             let len = name_raw.len().saturating_sub(1).min(name.len());
             name_raw[..len].copy_from_slice(&name[..len]);
+            out.extend_from_slice(&name_raw);
+            push_u32(&mut out, offsets[idx]);
+            push_u32(&mut out, u32::try_from(order[idx]).expect("sort index"));
+        }
+        out[0..4].copy_from_slice(b"NRes");
+        out[4..8].copy_from_slice(&0x100_u32.to_le_bytes());
+        out[8..12].copy_from_slice(&u32::try_from(entries.len()).expect("count").to_le_bytes());
+        let total_size = u32::try_from(out.len()).expect("total size");
+        out[12..16].copy_from_slice(&total_size.to_le_bytes());
+        out
+    }
+
+    fn build_nres_with_meta(entries: &[TestNresEntry<'_>]) -> Vec<u8> {
+        let mut out = vec![0; 16];
+        let mut offsets = Vec::with_capacity(entries.len());
+        for entry in entries {
+            offsets.push(u32::try_from(out.len()).expect("offset"));
+            out.extend_from_slice(entry.payload);
+            let padding = (8 - (out.len() % 8)) % 8;
+            out.resize(out.len() + padding, 0);
+        }
+        let mut order: Vec<usize> = (0..entries.len()).collect();
+        order.sort_by(|left, right| entries[*left].name.cmp(entries[*right].name));
+        for (idx, entry) in entries.iter().enumerate() {
+            push_u32(&mut out, entry.type_id);
+            push_u32(&mut out, 0);
+            push_u32(&mut out, entry.attr2);
+            push_u32(&mut out, u32::try_from(entry.payload.len()).expect("payload"));
+            push_u32(&mut out, 0);
+            let mut name_raw = [0; 36];
+            let len = name_raw.len().saturating_sub(1).min(entry.name.len());
+            name_raw[..len].copy_from_slice(&entry.name[..len]);
             out.extend_from_slice(&name_raw);
             push_u32(&mut out, offsets[idx]);
             push_u32(&mut out, u32::try_from(order[idx]).expect("sort index"));
