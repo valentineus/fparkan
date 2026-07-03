@@ -13,3 +13,8 @@ Result on 2026-06-23:
   typed manifest parsing in `xtask`;
 - `rpath`/offline mode is still useful for synthetic local checks;
 - full online dependency resolution remains unavailable in the sandbox.
+
+Scope labels:
+
+- Stage 0 macOS/codebase: closed.
+- Stage 0 cross-platform native runtime and hosted CI: deferred.
