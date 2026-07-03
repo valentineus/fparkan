@@ -17,6 +17,7 @@ use super::{
 use crate::policy::KHR_PORTABILITY_SUBSET_EXTENSION;
 use crate::shader_manifest::{triangle_shader_manifest, validate_shader_manifest};
 
+#[cfg(test)]
 fn take_runtime_owners_in_dependency_order<Instance, Validation, Surface, Device, Swapchain>(
     instance: &mut Option<Instance>,
     validation: &mut Option<Validation>,

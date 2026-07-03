@@ -32,11 +32,12 @@ use fparkan_runtime::{
 };
 use fparkan_vfs::DirectoryVfs;
 use serde::Serialize;
-use std::fmt::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 const ARCHIVE_INSPECT_SCHEMA: &str = "fparkan-archive-inspect-v1";
+const PROTOTYPE_INSPECT_SCHEMA: &str = "fparkan-prototype-inspect-v1";
+const MISSION_GRAPH_SCHEMA: &str = "fparkan-mission-graph-v1";
 
 #[derive(Serialize)]
 struct ArchiveInspectOutput<'a> {
@@ -46,6 +47,63 @@ struct ArchiveInspectOutput<'a> {
     entries: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     lookup_order_valid: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct PrototypeInspectOutput {
+    schema_version: &'static str,
+    key: String,
+    roots: usize,
+    node_count: usize,
+    edge_count: usize,
+    prototype_requests: usize,
+    resolved: usize,
+    unit_references: usize,
+    unit_components: usize,
+    direct_references: usize,
+    wear_requests: usize,
+    wear: usize,
+    materials: usize,
+    textures: usize,
+    lightmaps: usize,
+    is_success: bool,
+    failures: Vec<GraphFailureOutput>,
+}
+
+#[derive(Serialize)]
+struct MissionGraphOutput {
+    schema_version: &'static str,
+    mission: String,
+    objects: usize,
+    paths: usize,
+    clans: usize,
+    extras: usize,
+    roots: usize,
+    node_count: usize,
+    edge_count: usize,
+    direct_references: usize,
+    unit_references: usize,
+    unit_components: usize,
+    prototype_requests: usize,
+    wear_requests: usize,
+    wear: usize,
+    materials: usize,
+    textures: usize,
+    lightmaps: usize,
+    is_success: bool,
+    failures: usize,
+}
+
+#[derive(Serialize)]
+struct GraphFailureOutput {
+    root_index: usize,
+    edge: &'static str,
+    requiredness: &'static str,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archive: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource: Option<String>,
 }
 
 fn main() {
@@ -168,7 +226,10 @@ fn inspect_prototype(args: &[String]) -> Result<(), String> {
     let (mut graph, resolved, mut report) =
         build_prototype_graph_report(&repository, vfs.as_ref(), &roots);
     extend_graph_report_with_visual_dependencies(&repository, &mut report, &mut graph, &resolved);
-    println!("{}", prototype_inspect_json(&key, &graph, &report));
+    println!(
+        "{}",
+        prototype_inspect_json(&key, &graph, &report).map_err(|err| err.to_string())?
+    );
     Ok(())
 }
 
@@ -176,22 +237,26 @@ fn prototype_inspect_json(
     key: &str,
     graph: &fparkan_prototype::PrototypeGraph,
     report: &fparkan_prototype::PrototypeGraphReport,
-) -> String {
-    format!(
-        "{{\"schema_version\":\"fparkan-prototype-inspect-v1\",\"key\":{},\"roots\":{},\"prototype_requests\":{},\"resolved\":{},\"unit_references\":{},\"unit_components\":{},\"direct_references\":{},\"wear\":{},\"materials\":{},\"textures\":{},\"lightmaps\":{},\"failures\":{}}}",
-        json_string(key),
-        report.root_count,
-        graph.prototype_requests.len(),
-        report.resolved_count,
-        report.unit_reference_count,
-        report.unit_component_count,
-        report.direct_reference_count,
-        report.wear_resolved_count,
-        report.material_resolved_count,
-        report.texture_resolved_count,
-        report.lightmap_resolved_count,
-        report.failures.len()
-    )
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&PrototypeInspectOutput {
+        schema_version: PROTOTYPE_INSPECT_SCHEMA,
+        key: key.to_string(),
+        roots: report.root_count,
+        node_count: graph.nodes.len(),
+        edge_count: graph.edges.len(),
+        prototype_requests: graph.prototype_requests.len(),
+        resolved: report.resolved_count,
+        unit_references: report.unit_reference_count,
+        unit_components: report.unit_component_count,
+        direct_references: report.direct_reference_count,
+        wear_requests: report.wear_request_count,
+        wear: report.wear_resolved_count,
+        materials: report.material_resolved_count,
+        textures: report.texture_resolved_count,
+        lightmaps: report.lightmap_resolved_count,
+        is_success: report.is_success(),
+        failures: report.failures.iter().take(16).map(graph_failure_output).collect(),
+    })
 }
 
 fn graph_mission(args: &[String]) -> Result<(), String> {
@@ -213,22 +278,29 @@ fn graph_mission(args: &[String]) -> Result<(), String> {
     )
     .map_err(|err| err.to_string())?;
     println!(
-        "{{\"schema_version\":\"fparkan-mission-graph-v1\",\"mission\":{},\"objects\":{},\"paths\":{},\"clans\":{},\"extras\":{},\"roots\":{},\"direct_references\":{},\"unit_references\":{},\"unit_components\":{},\"prototype_requests\":{},\"wear\":{},\"materials\":{},\"textures\":{},\"lightmaps\":{},\"failures\":{}}}",
-        json_string(&mission),
-        loaded.object_count,
-        loaded.path_count,
-        loaded.clan_count,
-        loaded.extra_count,
-        loaded.graph_root_count,
-        loaded.graph_direct_reference_count,
-        loaded.graph_unit_reference_count,
-        loaded.graph_unit_component_count,
-        loaded.graph_resolved_count,
-        loaded.graph_wear_resolved_count,
-        loaded.graph_material_resolved_count,
-        loaded.graph_texture_resolved_count,
-        loaded.graph_lightmap_resolved_count,
-        loaded.graph_failure_count
+        "{}",
+        serialize_json(&MissionGraphOutput {
+            schema_version: MISSION_GRAPH_SCHEMA,
+            mission: mission.clone(),
+            objects: loaded.object_count,
+            paths: loaded.path_count,
+            clans: loaded.clan_count,
+            extras: loaded.extra_count,
+            roots: loaded.graph_root_count,
+            node_count: loaded.graph_node_count,
+            edge_count: loaded.graph_edge_count,
+            direct_references: loaded.graph_direct_reference_count,
+            unit_references: loaded.graph_unit_reference_count,
+            unit_components: loaded.graph_unit_component_count,
+            prototype_requests: loaded.graph_resolved_count,
+            wear_requests: loaded.graph_wear_request_count,
+            wear: loaded.graph_wear_resolved_count,
+            materials: loaded.graph_material_resolved_count,
+            textures: loaded.graph_texture_resolved_count,
+            lightmaps: loaded.graph_lightmap_resolved_count,
+            is_success: loaded.graph_failure_count == 0,
+            failures: loaded.graph_failure_count,
+        })?
     );
     Ok(())
 }
@@ -290,28 +362,54 @@ fn parse_archive_path(args: &[String]) -> Result<PathBuf, String> {
     }
 }
 
-fn json_string(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
 fn serialize_json<T: Serialize>(value: &T) -> Result<String, String> {
     serde_json::to_string(value).map_err(|err| err.to_string())
+}
+
+fn graph_failure_output(
+    failure: &fparkan_prototype::PrototypeGraphFailure,
+) -> GraphFailureOutput {
+    GraphFailureOutput {
+        root_index: failure.root_index,
+        edge: prototype_graph_edge_label(failure.edge),
+        requiredness: prototype_graph_requiredness_label(failure.requiredness),
+        message: failure.message.clone(),
+        archive: failure
+            .provenance
+            .as_ref()
+            .and_then(|provenance| provenance.archive.clone()),
+        resource: failure.provenance.as_ref().and_then(|provenance| {
+            provenance
+                .resource
+                .as_ref()
+                .map(|raw| String::from_utf8_lossy(raw).into_owned())
+        }),
+    }
+}
+
+fn prototype_graph_edge_label(edge: fparkan_prototype::PrototypeGraphEdge) -> &'static str {
+    match edge {
+        fparkan_prototype::PrototypeGraphEdge::MissionToUnitDat => "mission_to_unit_dat",
+        fparkan_prototype::PrototypeGraphEdge::MissionToObjectsRegistry => {
+            "mission_to_objects_registry"
+        }
+        fparkan_prototype::PrototypeGraphEdge::UnitDatToComponent => "unit_dat_to_component",
+        fparkan_prototype::PrototypeGraphEdge::PrototypeToMesh => "prototype_to_mesh",
+        fparkan_prototype::PrototypeGraphEdge::MeshToWear => "mesh_to_wear",
+        fparkan_prototype::PrototypeGraphEdge::WearToMaterial => "wear_to_material",
+        fparkan_prototype::PrototypeGraphEdge::MaterialToTexture => "material_to_texture",
+        fparkan_prototype::PrototypeGraphEdge::WearToLightmap => "wear_to_lightmap",
+    }
+}
+
+fn prototype_graph_requiredness_label(
+    requiredness: fparkan_prototype::PrototypeGraphRequiredness,
+) -> &'static str {
+    match requiredness {
+        fparkan_prototype::PrototypeGraphRequiredness::Required => "required",
+        fparkan_prototype::PrototypeGraphRequiredness::Optional => "optional",
+        fparkan_prototype::PrototypeGraphRequiredness::Fallback => "fallback",
+    }
 }
 
 fn usage() -> String {
@@ -367,11 +465,11 @@ mod tests {
             ..fparkan_prototype::PrototypeGraphReport::default()
         };
 
-        let json = prototype_inspect_json("root", &graph, &report);
+        let json = prototype_inspect_json("root", &graph, &report).expect("serialize");
 
         assert_eq!(
             json,
-            "{\"schema_version\":\"fparkan-prototype-inspect-v1\",\"key\":\"root\",\"roots\":1,\"prototype_requests\":1,\"resolved\":1,\"unit_references\":0,\"unit_components\":0,\"direct_references\":1,\"wear\":0,\"materials\":0,\"textures\":0,\"lightmaps\":0,\"failures\":0}"
+            "{\"schema_version\":\"fparkan-prototype-inspect-v1\",\"key\":\"root\",\"roots\":1,\"node_count\":0,\"edge_count\":0,\"prototype_requests\":1,\"resolved\":1,\"unit_references\":0,\"unit_components\":0,\"direct_references\":1,\"wear_requests\":0,\"wear\":0,\"materials\":0,\"textures\":0,\"lightmaps\":0,\"is_success\":true,\"failures\":[]}"
         );
     }
 }

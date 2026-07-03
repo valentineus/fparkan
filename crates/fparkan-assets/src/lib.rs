@@ -20,10 +20,12 @@
 )]
 //! Asset manager ports and transactional preparation models.
 
-use fparkan_material::{decode_wear, resolve_material, MaterialError, MAT0_KIND, WEAR_KIND};
+use fparkan_material::{
+    decode_wear, resolve_material, Mat0Document, MaterialError, WearTable, MAT0_KIND, WEAR_KIND,
+};
 use fparkan_mission_format::{decode_tma, decode_tma_land_path};
 pub use fparkan_mission_format::{LpString, MissionDocument, MissionError, TmaProfile};
-use fparkan_msh::{decode_msh, validate_msh, MshError};
+use fparkan_msh::{decode_msh, validate_msh, ModelAsset, MshError};
 use fparkan_nres::{decode as decode_nres, ReadProfile};
 pub use fparkan_nres::{NresDocument, NresError};
 use fparkan_path::{normalize_relative, NormalizedPath, PathError, PathPolicy, ResourceName};
@@ -36,7 +38,7 @@ use fparkan_resource::{ResourceError, ResourceKey, ResourceRepository};
 pub use fparkan_terrain::{TerrainError, TerrainWorld};
 use fparkan_terrain_format::{decode_build_dat, decode_land_map, decode_land_msh};
 pub use fparkan_terrain_format::{BuildCategory, TerrainFormatError};
-use fparkan_texm::{decode_texm, TexmError};
+use fparkan_texm::{decode_texm, TexmDocument, TexmError};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -217,6 +219,10 @@ pub struct PreparedVisual {
     pub id: AssetId<PreparedVisual>,
     /// Optional mesh resource backing the visual.
     pub mesh: Option<ResourceKey>,
+    /// Prepared model backing the visual, when geometry is present.
+    pub model_id: Option<AssetId<PreparedModel>>,
+    /// Prepared WEAR table backing the visual, when geometry is present.
+    pub wear_id: Option<AssetId<PreparedWear>>,
     /// Number of validated model nodes.
     pub model_nodes: usize,
     /// Number of validated material slots on the model.
@@ -227,10 +233,38 @@ pub struct PreparedVisual {
     pub material_count: usize,
     /// Typed material IDs available from the resolved visual.
     pub material_ids: Vec<AssetId<PreparedMaterial>>,
+    /// Typed texture IDs available from the resolved visual.
+    pub texture_ids: Vec<AssetId<PreparedTexture>>,
+    /// Typed lightmap IDs available from the resolved visual.
+    pub lightmap_ids: Vec<AssetId<PreparedTexture>>,
     /// Number of texture phase requests decoded as TEXM.
     pub texture_count: usize,
     /// Number of lightmap requests decoded as TEXM.
     pub lightmap_count: usize,
+}
+
+/// CPU-side validated model ready for a renderer upload path.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedModel {
+    /// Stable id derived from the visual source.
+    pub id: AssetId<PreparedModel>,
+    /// Source mesh resource.
+    pub source: ResourceKey,
+    /// Fully validated model payload.
+    pub validated: ModelAsset,
+    /// Mesh dependencies that led to this prepared model.
+    pub mesh_dependencies: Vec<ResourceKey>,
+}
+
+/// CPU-side WEAR table resolved for a visual.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedWear {
+    /// Stable id derived from the visual source.
+    pub id: AssetId<PreparedWear>,
+    /// Source WEAR resource.
+    pub source: ResourceKey,
+    /// Decoded WEAR table.
+    pub table: WearTable,
 }
 
 /// CPU-side data needed before a material can be handed to a renderer.
@@ -238,8 +272,38 @@ pub struct PreparedVisual {
 pub struct PreparedMaterial {
     /// Stable id derived from the visual and material selector.
     pub id: AssetId<PreparedMaterial>,
-    /// Parsed material key.
+    /// Source MAT0 resource.
+    pub source: ResourceKey,
+    /// Parsed material key retained for compatibility with older callers.
     pub name: ResourceName,
+    /// Decoded MAT0 payload.
+    pub mat0: Mat0Document,
+    /// Texture requests declared by MAT0 phases.
+    pub texture_requests: Vec<ResourceName>,
+    /// Lightmap requests associated with the owning WEAR table.
+    pub lightmap_requests: Vec<ResourceName>,
+}
+
+/// Texture usage role inside a prepared visual.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreparedTextureUsage {
+    /// Standard diffuse/albedo texture.
+    Diffuse,
+    /// Lightmap texture.
+    Lightmap,
+}
+
+/// CPU-side TEXM texture ready for a renderer upload path.
+#[derive(Clone, Debug)]
+pub struct PreparedTexture {
+    /// Stable id derived from the texture source and usage.
+    pub id: AssetId<PreparedTexture>,
+    /// Source TEXM resource.
+    pub source: ResourceKey,
+    /// Decoded TEXM payload.
+    pub texm: TexmDocument,
+    /// Usage role in the prepared visual.
+    pub usage: PreparedTextureUsage,
 }
 
 impl PreparedVisual {
@@ -251,8 +315,16 @@ impl PreparedVisual {
 }
 
 /// Immutable prepared mission assets for rendering and game setup.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default)]
 pub struct MissionAssets {
+    /// Mesh-backed models prepared for reachable visuals.
+    pub models: Vec<PreparedModel>,
+    /// WEAR tables prepared for reachable visuals.
+    pub wears: Vec<PreparedWear>,
+    /// MAT0 materials prepared for reachable visuals.
+    pub materials: Vec<PreparedMaterial>,
+    /// TEXM textures prepared for reachable visuals.
+    pub textures: Vec<PreparedTexture>,
     /// Visuals prepared for all reachable prototype requests.
     pub visuals: Vec<PreparedVisual>,
     /// Visual ids available for each mission object index.
@@ -286,32 +358,41 @@ impl MissionAssets {
         self.visuals.iter().find(|visual| visual.id == id)
     }
 
+    /// Finds a prepared model by id.
+    #[must_use]
+    pub fn model_by_id(&self, id: AssetId<PreparedModel>) -> Option<&PreparedModel> {
+        self.models.iter().find(|model| model.id == id)
+    }
+
+    /// Finds a prepared material by id.
+    #[must_use]
+    pub fn material_by_id(&self, id: AssetId<PreparedMaterial>) -> Option<&PreparedMaterial> {
+        self.materials.iter().find(|material| material.id == id)
+    }
+
+    /// Finds a prepared texture by id.
+    #[must_use]
+    pub fn texture_by_id(&self, id: AssetId<PreparedTexture>) -> Option<&PreparedTexture> {
+        self.textures.iter().find(|texture| texture.id == id)
+    }
+
     /// Converts mission assets into a coarse mission plan.
     #[must_use]
     pub fn to_plan(&self) -> MissionAssetPlan {
-        let visual_count = self.visuals.len();
-        let model_count = self
-            .visuals
-            .iter()
-            .filter(|visual| visual.mesh.is_some())
-            .count();
-        let material_count = self
-            .visuals
-            .iter()
-            .map(|visual| visual.material_count)
-            .sum();
-        let texture_count = self.visuals.iter().map(|visual| visual.texture_count).sum();
-        let lightmap_count = self
-            .visuals
-            .iter()
-            .map(|visual| visual.lightmap_count)
-            .sum();
         MissionAssetPlan {
-            visual_count,
-            model_count,
-            material_count,
-            texture_count,
-            lightmap_count,
+            visual_count: self.visuals.len(),
+            model_count: self.models.len(),
+            material_count: self.materials.len(),
+            texture_count: self
+                .textures
+                .iter()
+                .filter(|texture| texture.usage == PreparedTextureUsage::Diffuse)
+                .count(),
+            lightmap_count: self
+                .textures
+                .iter()
+                .filter(|texture| texture.usage == PreparedTextureUsage::Lightmap)
+                .count(),
         }
     }
 }
@@ -510,7 +591,14 @@ pub fn prepare_mission_assets_with_repository<R: ResourceRepository>(
     }
     let mut visual_index_by_id: HashMap<AssetId<PreparedVisual>, PreparedVisualSignature> =
         HashMap::new();
-    let mut material_signature_by_id: HashMap<AssetId<PreparedMaterial>, Vec<u8>> = HashMap::new();
+    let mut model_ids = HashSet::new();
+    let mut wear_ids = HashSet::new();
+    let mut material_ids = HashSet::new();
+    let mut texture_ids = HashSet::new();
+    let mut models = Vec::new();
+    let mut wears = Vec::new();
+    let mut materials = Vec::new();
+    let mut textures = Vec::new();
     let mut visuals = Vec::new();
     let mut prototype_visual_ids = Vec::with_capacity(prototypes.len());
 
@@ -526,18 +614,34 @@ pub fn prepare_mission_assets_with_repository<R: ResourceRepository>(
             Some(_) => {}
             None => {
                 visual_index_by_id.insert(visual_id, signature);
-                let visual = prepare_visual_with_repository_internal(
-                    repository,
-                    proto,
-                    Some(&mut material_signature_by_id),
-                )?;
-                if visual.id != visual_id {
+                let bundle = prepare_visual_with_repository_internal(repository, proto)?;
+                if bundle.visual.id != visual_id {
                     // Defensive check. stable IDs are deterministic for the same inputs.
                     return Err(AssetError::InvalidPrototype(
                         "prepared visual id changed during preparation".to_string(),
                     ));
                 }
-                visuals.push(visual);
+                if let Some(model) = bundle.model {
+                    if model_ids.insert(model.id) {
+                        models.push(model);
+                    }
+                }
+                if let Some(wear) = bundle.wear {
+                    if wear_ids.insert(wear.id) {
+                        wears.push(wear);
+                    }
+                }
+                for material in bundle.materials {
+                    if material_ids.insert(material.id) {
+                        materials.push(material);
+                    }
+                }
+                for texture in bundle.textures {
+                    if texture_ids.insert(texture.id) {
+                        textures.push(texture);
+                    }
+                }
+                visuals.push(bundle.visual);
             }
         }
         prototype_visual_ids.push(visual_id);
@@ -562,6 +666,10 @@ pub fn prepare_mission_assets_with_repository<R: ResourceRepository>(
     }
 
     Ok(MissionAssets {
+        models,
+        wears,
+        materials,
+        textures,
         visuals,
         object_visuals,
     })
@@ -919,11 +1027,15 @@ pub fn prepare_visual(proto: &EffectivePrototype) -> Result<PreparedVisual, Asse
     Ok(PreparedVisual {
         id: AssetId::new(id),
         mesh,
+        model_id: None,
+        wear_id: None,
         model_nodes: 0,
         model_slots: 0,
         model_batches: 0,
         material_count: 0,
         material_ids: Vec::new(),
+        texture_ids: Vec::new(),
+        lightmap_ids: Vec::new(),
         texture_count: 0,
         lightmap_count: 0,
     })
@@ -939,16 +1051,29 @@ pub fn prepare_visual_with_repository<R: ResourceRepository>(
     repository: &R,
     proto: &EffectivePrototype,
 ) -> Result<PreparedVisual, AssetError> {
-    prepare_visual_with_repository_internal(repository, proto, None)
+    Ok(prepare_visual_with_repository_internal(repository, proto)?.visual)
+}
+
+struct PreparedVisualBundle {
+    visual: PreparedVisual,
+    model: Option<PreparedModel>,
+    wear: Option<PreparedWear>,
+    materials: Vec<PreparedMaterial>,
+    textures: Vec<PreparedTexture>,
 }
 
 fn prepare_visual_with_repository_internal<R: ResourceRepository>(
     repository: &R,
     proto: &EffectivePrototype,
-    mut material_signature_by_id: Option<&mut HashMap<AssetId<PreparedMaterial>, Vec<u8>>>,
-) -> Result<PreparedVisual, AssetError> {
+) -> Result<PreparedVisualBundle, AssetError> {
     let PrototypeGeometry::Mesh(mesh_key) = &proto.geometry else {
-        return prepare_visual(proto);
+        return Ok(PreparedVisualBundle {
+            visual: prepare_visual(proto)?,
+            model: None,
+            wear: None,
+            materials: Vec::new(),
+            textures: Vec::new(),
+        });
     };
 
     let nres = decode_nres(
@@ -958,6 +1083,13 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
     .map_err(AssetError::Nres)?;
     let msh_document = decode_msh(&nres).map_err(AssetError::Msh)?;
     let model = validate_msh(&msh_document).map_err(AssetError::Msh)?;
+    let model_id = AssetId::new(stable_model_id(proto));
+    let prepared_model = PreparedModel {
+        id: model_id,
+        source: mesh_key.clone(),
+        validated: model.clone(),
+        mesh_dependencies: proto.dependencies.clone(),
+    };
 
     let wear_name = sibling_name(mesh_key, "wea")?;
     let wear_key = ResourceKey {
@@ -967,11 +1099,26 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
     };
     let wear = decode_wear(&read_key(repository, &wear_key, Some("wear"))?)
         .map_err(AssetError::Material)?;
+    let wear_id = AssetId::new(stable_wear_id(proto));
+    let prepared_wear = PreparedWear {
+        id: wear_id,
+        source: wear_key.clone(),
+        table: wear.clone(),
+    };
 
     let mut material_count = 0;
     let mut material_ids = Vec::with_capacity(wear.entries.len());
+    let mut prepared_materials = Vec::with_capacity(wear.entries.len());
+    let mut prepared_textures = Vec::new();
+    let mut texture_ids = Vec::new();
+    let mut lightmap_ids = Vec::new();
     let mut texture_count = 0;
     let mut lightmap_count = 0;
+    let lightmap_requests: Vec<_> = wear
+        .lightmaps
+        .iter()
+        .map(|lightmap| lightmap.lightmap.clone())
+        .collect();
     for material_index in 0..wear.entries.len() {
         let material_index = u16::try_from(material_index).map_err(|_| {
             AssetError::InvalidPrototype("material index does not fit archive format".to_string())
@@ -981,42 +1128,64 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
         material_count += 1;
         let material_id = AssetId::new(stable_material_id(proto, material_index, &material.name));
         material_ids.push(material_id);
-        if let Some(registry) = material_signature_by_id.as_deref_mut() {
-            match registry.get(&material_id) {
-                Some(existing_name) => {
-                    if existing_name != &material.name.0 {
-                        return Err(AssetError::InvalidPrototype(
-                            "stable material id collision between unrelated materials".to_string(),
-                        ));
-                    }
-                }
-                None => {
-                    registry.insert(material_id, material.name.0.clone());
-                }
-            }
-        }
+        let material_key = ResourceKey {
+            archive: parse_path("material.lib")?,
+            name: material.name.clone(),
+            type_id: Some(MAT0_KIND),
+        };
+        let texture_requests = material.document.texture_requests();
+        prepared_materials.push(PreparedMaterial {
+            id: material_id,
+            source: material_key,
+            name: material.name.clone(),
+            mat0: material.document.clone(),
+            texture_requests: texture_requests.clone(),
+            lightmap_requests: lightmap_requests.clone(),
+        });
 
-        for texture in material.document.texture_requests() {
-            resolve_texture(repository, &texture)?;
+        for texture in texture_requests {
+            let prepared_texture = prepare_texture(
+                repository,
+                &texture,
+                PreparedTextureUsage::Diffuse,
+            )?;
+            texture_ids.push(prepared_texture.id);
+            prepared_textures.push(prepared_texture);
             texture_count += 1;
         }
     }
 
     for lightmap in &wear.lightmaps {
-        resolve_lightmap(repository, &lightmap.lightmap)?;
+        let prepared_lightmap = prepare_texture(
+            repository,
+            &lightmap.lightmap,
+            PreparedTextureUsage::Lightmap,
+        )?;
+        lightmap_ids.push(prepared_lightmap.id);
+        prepared_textures.push(prepared_lightmap);
         lightmap_count += 1;
     }
 
-    Ok(PreparedVisual {
-        id: AssetId::new(stable_visual_id(proto)),
-        mesh: Some(mesh_key.clone()),
-        model_nodes: model.node_count,
-        model_slots: model.slots.len(),
-        model_batches: model.batches.len(),
-        material_count,
-        material_ids,
-        texture_count,
-        lightmap_count,
+    Ok(PreparedVisualBundle {
+        visual: PreparedVisual {
+            id: AssetId::new(stable_visual_id(proto)),
+            mesh: Some(mesh_key.clone()),
+            model_id: Some(model_id),
+            wear_id: Some(wear_id),
+            model_nodes: model.node_count,
+            model_slots: model.slots.len(),
+            model_batches: model.batches.len(),
+            material_count,
+            material_ids,
+            texture_ids,
+            lightmap_ids,
+            texture_count,
+            lightmap_count,
+        },
+        model: Some(prepared_model),
+        wear: Some(prepared_wear),
+        materials: prepared_materials,
+        textures: prepared_textures,
     })
 }
 
@@ -1248,6 +1417,32 @@ fn resolve_lightmap<R: ResourceRepository>(
     resolve_texm(repository, name, LIGHTMAP_ARCHIVE, "lightmap")
 }
 
+fn prepare_texture<R: ResourceRepository>(
+    repository: &R,
+    name: &ResourceName,
+    usage: PreparedTextureUsage,
+) -> Result<PreparedTexture, AssetError> {
+    let (archive, label) = match usage {
+        PreparedTextureUsage::Diffuse => (TEXTURES_ARCHIVE, "texture"),
+        PreparedTextureUsage::Lightmap => (LIGHTMAP_ARCHIVE, "lightmap"),
+    };
+    let key = ResourceKey {
+        archive: parse_path(archive)?,
+        name: name.clone(),
+        type_id: None,
+    };
+    let Some(bytes) = read_optional_key(repository, &key, Some(label))? else {
+        return Err(AssetError::MissingDependency(format!("{label} {name:?}")));
+    };
+    let texm = decode_texm(bytes).map_err(AssetError::Texture)?;
+    Ok(PreparedTexture {
+        id: AssetId::new(stable_texture_id(&key, usage)),
+        source: key,
+        texm,
+        usage,
+    })
+}
+
 fn resolve_texm<R: ResourceRepository>(
     repository: &R,
     name: &ResourceName,
@@ -1323,6 +1518,17 @@ fn stable_visual_id(proto: &EffectivePrototype) -> u64 {
     hasher.finish()
 }
 
+fn stable_model_id(proto: &EffectivePrototype) -> u64 {
+    stable_visual_id(proto)
+}
+
+fn stable_wear_id(proto: &EffectivePrototype) -> u64 {
+    let mut hasher = StableHasher::default();
+    stable_visual_id(proto).hash(&mut hasher);
+    b"wear".hash(&mut hasher);
+    hasher.finish()
+}
+
 fn stable_material_id(
     proto: &EffectivePrototype,
     material_index: u16,
@@ -1332,6 +1538,17 @@ fn stable_material_id(
     stable_visual_id(proto).hash(&mut hasher);
     material_index.hash(&mut hasher);
     material_name.0.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn stable_texture_id(key: &ResourceKey, usage: PreparedTextureUsage) -> u64 {
+    let mut hasher = StableHasher::default();
+    key.archive.identity_bytes().hash(&mut hasher);
+    key.name.0.hash(&mut hasher);
+    match usage {
+        PreparedTextureUsage::Diffuse => 0_u8.hash(&mut hasher),
+        PreparedTextureUsage::Lightmap => 1_u8.hash(&mut hasher),
+    }
     hasher.finish()
 }
 

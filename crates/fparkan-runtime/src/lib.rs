@@ -23,9 +23,9 @@
 use fparkan_assets::{
     decode_mission_land_path, decode_mission_payload, decode_nres_payload,
     derive_mission_land_paths, extend_graph_report_with_visual_dependencies, prepare_terrain_world,
-    AssetError as AssetPreparationError, AssetManager, BuildCategory, MissionAssetPlan,
-    MissionDocument, MissionError, MissionTerrainPaths, NresError, TerrainFormatError,
-    TerrainPreparationError, TerrainWorld, TmaProfile,
+    AssetError as AssetPreparationError, AssetId, AssetManager, BuildCategory, MissionAssetPlan,
+    MissionDocument, MissionError, MissionTerrainPaths, NresError, PreparedVisual,
+    TerrainFormatError, TerrainPreparationError, TerrainWorld, TmaProfile,
 };
 use fparkan_path::{normalize_relative, NormalizedPath, PathError, PathPolicy};
 use fparkan_prototype::{
@@ -149,6 +149,36 @@ pub struct MissionLoadTrace {
     pub transforms: Vec<PlacedTransformProfile>,
 }
 
+/// Ordered mission property preserved for later runtime stages.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissionObjectProperty {
+    /// Raw property value words.
+    pub raw_value: [u32; 4],
+    /// Raw property name bytes.
+    pub name_raw: Vec<u8>,
+}
+
+/// Mission-derived object draft preserved for Stage 3 viewer/player work.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MissionObjectDraft {
+    /// Original mission object id.
+    pub original_id: Option<OriginalObjectId>,
+    /// Raw mission resource reference.
+    pub resource_name_raw: Vec<u8>,
+    /// Raw identity/clan word from the mission.
+    pub identity_or_clan_raw: u32,
+    /// Raw position vector.
+    pub position: [f32; 3],
+    /// Raw orientation vector.
+    pub orientation_raw: [f32; 3],
+    /// Raw scale vector.
+    pub scale: [f32; 3],
+    /// Prepared visuals reachable from this mission object.
+    pub visual_ids: Vec<AssetId<PreparedVisual>>,
+    /// Ordered mission properties.
+    pub properties: Vec<MissionObjectProperty>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct MissionLoadOptions {
     fail_after_registered_objects: Option<usize>,
@@ -187,6 +217,10 @@ pub struct LoadedMission {
     pub graph_unit_component_count: usize,
     /// Mission prototype graph root count.
     pub graph_root_count: usize,
+    /// Total materialized graph node count after visual dependency expansion.
+    pub graph_node_count: usize,
+    /// Total materialized graph edge count after visual dependency expansion.
+    pub graph_edge_count: usize,
     /// Mission asset plan visual count after dependency preparation.
     pub asset_visual_count: usize,
     /// Expanded prototype requests resolved to effective prototypes.
@@ -254,6 +288,7 @@ struct LoadedMissionState {
     prototype_report: PrototypeGraphReport,
     mission_assets: MissionAssets,
     asset_plan: MissionAssetPlan,
+    object_drafts: Vec<MissionObjectDraft>,
 }
 
 /// Engine error.
@@ -539,6 +574,28 @@ fn load_mission_with_options(
             source,
         })?;
     let mission_asset_plan = mission_assets.to_plan();
+    let object_drafts: Vec<_> = mission
+        .objects
+        .iter()
+        .enumerate()
+        .map(|(index, object)| MissionObjectDraft {
+            original_id: u32::try_from(index).ok().map(OriginalObjectId),
+            resource_name_raw: object.resource_raw.clone(),
+            identity_or_clan_raw: object.identity_or_clan_raw,
+            position: object.position,
+            orientation_raw: object.orientation,
+            scale: object.scale,
+            visual_ids: mission_assets.visuals_for_object(index).to_vec(),
+            properties: object
+                .properties
+                .iter()
+                .map(|property| MissionObjectProperty {
+                    raw_value: property.raw_value,
+                    name_raw: property.name_raw.clone(),
+                })
+                .collect(),
+        })
+        .collect();
     trace.phases.push(MissionLoadPhase::Assets);
 
     let mut new_runtime_world = new_world(WorldConfig);
@@ -580,6 +637,8 @@ fn load_mission_with_options(
         graph_direct_reference_count: prototype_report.direct_reference_count,
         graph_unit_component_count: prototype_report.unit_component_count,
         graph_root_count: prototype_report.root_count,
+        graph_node_count: prototype_graph.nodes.len(),
+        graph_edge_count: prototype_graph.edges.len(),
         asset_visual_count: mission_asset_plan.visual_count,
         graph_resolved_count: prototype_report.resolved_count,
         graph_mesh_dependency_count: prototype_report.mesh_dependency_count,
@@ -608,6 +667,7 @@ fn load_mission_with_options(
         prototype_report,
         mission_assets,
         asset_plan: mission_asset_plan,
+        object_drafts,
     });
     Ok((summary, trace))
 }
@@ -695,6 +755,15 @@ pub fn loaded_mission_asset_plan(engine: &Engine) -> Option<&MissionAssetPlan> {
 #[must_use]
 pub fn loaded_mission_assets(engine: &Engine) -> Option<&MissionAssets> {
     engine.loaded.as_ref().map(|state| &state.mission_assets)
+}
+
+/// Returns mission-derived object drafts preserved for later runtime stages.
+#[must_use]
+pub fn loaded_mission_object_drafts(engine: &Engine) -> Option<&[MissionObjectDraft]> {
+    engine
+        .loaded
+        .as_ref()
+        .map(|state| state.object_drafts.as_slice())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
