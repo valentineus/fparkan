@@ -228,6 +228,7 @@ impl VulkanSmokeRenderer {
             frame_sync: Vec::new(),
             images_in_flight: Vec::new(),
             current_frame: 0,
+            depth_request: create_info.render_request.depth,
             pending_extent: None,
             swapchain_recreate_count: 0,
             report: VulkanSmokeRendererReport {
@@ -554,6 +555,7 @@ impl VulkanSmokeRenderer {
         let swapchain = self.swapchain_ref()?;
         let resources = RollbackOnDrop::new(
             create_swapchain_resources(
+                self.instance_ref()?,
                 device,
                 swapchain,
                 self.command_pool,
@@ -561,6 +563,7 @@ impl VulkanSmokeRenderer {
                 self.index_buffer_ref()?,
                 self.textures_ref()?,
                 &self.draw_ranges,
+                self.depth_request,
                 reuse_command_pool,
             )?,
             |resources| destroy_swapchain_resources(device, self.command_pool, resources),
@@ -608,11 +611,19 @@ impl VulkanSmokeRenderer {
             result: error,
         })?;
 
-        let clear_values = [vk::ClearValue {
-            color: vk::ClearColorValue {
-                float32: [0.05, 0.08, 0.11, 1.0],
+        let clear_values = [
+            vk::ClearValue {
+                color: vk::ClearColorValue {
+                    float32: [0.05, 0.08, 0.11, 1.0],
+                },
             },
-        }];
+            vk::ClearValue {
+                depth_stencil: vk::ClearDepthStencilValue {
+                    depth: 1.0,
+                    stencil: 0,
+                },
+            },
+        ];
         let render_area = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: vk::Extent2D {

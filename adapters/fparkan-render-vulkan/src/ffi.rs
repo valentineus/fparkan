@@ -53,10 +53,10 @@ pub use self::instance::{
 #[cfg(test)]
 use self::instance::{cstring_vec, ensure_instance_extensions_available};
 use self::resources::{
-    color_subresource_range, create_command_pool, create_frame_sync,
+    color_subresource_range, create_command_pool, create_depth_attachment, create_frame_sync,
     create_static_mesh_index_buffer, create_static_mesh_vertex_buffer, create_static_texture_image,
-    destroy_allocated_buffer, destroy_allocated_image, VulkanAllocatedBuffer, VulkanAllocatedImage,
-    VulkanFrameSync,
+    destroy_allocated_buffer, destroy_allocated_image, destroy_depth_attachment,
+    VulkanAllocatedBuffer, VulkanAllocatedImage, VulkanDepthAttachment, VulkanFrameSync,
 };
 pub use self::runtime::{
     create_vulkan_logical_device_probe, create_vulkan_logical_device_probe_for_request,

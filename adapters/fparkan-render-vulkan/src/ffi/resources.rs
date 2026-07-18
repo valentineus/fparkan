@@ -1,11 +1,13 @@
 #![allow(unsafe_code)]
 
 use ash::vk;
+use fparkan_platform::DepthStencilSupport;
 
 use super::{
     VulkanInstanceProbe, VulkanLogicalDeviceProbe, VulkanSmokeRendererError, VulkanStaticMesh,
     VulkanStaticTexture,
 };
+use crate::select_depth_stencil_attachment_format;
 
 pub(super) struct VulkanAllocatedBuffer {
     pub(super) buffer: vk::Buffer,
@@ -16,6 +18,171 @@ pub(super) struct VulkanAllocatedImage {
     pub(super) image: vk::Image,
     pub(super) memory: vk::DeviceMemory,
     pub(super) view: vk::ImageView,
+}
+
+/// Depth/stencil image and the exact format selected for its render pass.
+pub(super) struct VulkanDepthAttachment {
+    pub(super) image: VulkanAllocatedImage,
+    pub(super) format: vk::Format,
+}
+
+#[allow(clippy::too_many_lines)]
+pub(super) fn create_depth_attachment(
+    instance: &VulkanInstanceProbe,
+    device: &VulkanLogicalDeviceProbe,
+    extent: (u32, u32),
+    request: DepthStencilSupport,
+) -> Result<VulkanDepthAttachment, VulkanSmokeRendererError> {
+    let supported_formats = depth_attachment_formats(instance, device);
+    let format = select_depth_stencil_attachment_format(&supported_formats, request)
+        .map(vk::Format::from_raw)
+        .ok_or(VulkanSmokeRendererError::InvalidStaticMesh {
+            context: "logical device has no selected depth attachment format",
+        })?;
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D {
+            width: extent.0,
+            height: extent.1,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    // SAFETY: The creation info is stack-owned and uses the live non-zero swapchain extent.
+    let image = unsafe { device.device().create_image(&image_info, None) }.map_err(|result| {
+        VulkanSmokeRendererError::VulkanOperation {
+            context: "vkCreateImage(depth attachment)",
+            result,
+        }
+    })?;
+    // SAFETY: The newly created image belongs to this device.
+    let requirements = unsafe { device.device().get_image_memory_requirements(image) };
+    let Some(memory_type_index) = find_memory_type(
+        instance,
+        device.physical_device(),
+        requirements.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    ) else {
+        // SAFETY: The unbound image is rolled back on its owning device.
+        unsafe { device.device().destroy_image(image, None) };
+        return Err(VulkanSmokeRendererError::MissingMemoryType {
+            context: "depth attachment",
+        });
+    };
+    let allocation = vk::MemoryAllocateInfo::default()
+        .allocation_size(requirements.size)
+        .memory_type_index(memory_type_index);
+    // SAFETY: Allocation parameters are derived from this image's requirements.
+    let allocation_result = unsafe { device.device().allocate_memory(&allocation, None) };
+    let memory = match allocation_result {
+        Ok(memory) => memory,
+        Err(result) => {
+            // SAFETY: The unbound image is rolled back on allocation failure.
+            unsafe { device.device().destroy_image(image, None) };
+            return Err(VulkanSmokeRendererError::VulkanOperation {
+                context: "vkAllocateMemory(depth attachment)",
+                result,
+            });
+        }
+    };
+    // SAFETY: The allocation satisfies this image's queried requirements.
+    if let Err(result) = unsafe { device.device().bind_image_memory(image, memory, 0) } {
+        // SAFETY: Both newly created resources are rolled back together.
+        unsafe {
+            device.device().destroy_image(image, None);
+            device.device().free_memory(memory, None);
+        }
+        return Err(VulkanSmokeRendererError::VulkanOperation {
+            context: "vkBindImageMemory(depth attachment)",
+            result,
+        });
+    }
+    let range = vk::ImageSubresourceRange::default()
+        .aspect_mask(depth_aspect(format))
+        .base_mip_level(0)
+        .level_count(1)
+        .base_array_layer(0)
+        .layer_count(1);
+    let view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .subresource_range(range);
+    // SAFETY: The image is bound and the depth/stencil aspect matches its selected format.
+    let view_result = unsafe { device.device().create_image_view(&view_info, None) };
+    let view = match view_result {
+        Ok(view) => view,
+        Err(result) => {
+            // SAFETY: Both newly created resources are rolled back together.
+            unsafe {
+                device.device().destroy_image(image, None);
+                device.device().free_memory(memory, None);
+            }
+            return Err(VulkanSmokeRendererError::VulkanOperation {
+                context: "vkCreateImageView(depth attachment)",
+                result,
+            });
+        }
+    };
+    Ok(VulkanDepthAttachment {
+        image: VulkanAllocatedImage {
+            image,
+            memory,
+            view,
+        },
+        format,
+    })
+}
+
+pub(super) fn destroy_depth_attachment(
+    device: &VulkanLogicalDeviceProbe,
+    attachment: &VulkanDepthAttachment,
+) {
+    destroy_allocated_image(device, &attachment.image);
+}
+
+fn depth_attachment_formats(
+    instance: &VulkanInstanceProbe,
+    device: &VulkanLogicalDeviceProbe,
+) -> Vec<i32> {
+    [
+        vk::Format::D16_UNORM,
+        vk::Format::X8_D24_UNORM_PACK32,
+        vk::Format::D32_SFLOAT,
+        vk::Format::D16_UNORM_S8_UINT,
+        vk::Format::D24_UNORM_S8_UINT,
+        vk::Format::D32_SFLOAT_S8_UINT,
+    ]
+    .into_iter()
+    .filter(|format| {
+        // SAFETY: The physical device belongs to this instance and the query returns a value copy.
+        unsafe {
+            instance
+                .instance
+                .get_physical_device_format_properties(device.physical_device(), *format)
+        }
+        .optimal_tiling_features
+        .contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+    })
+    .map(vk::Format::as_raw)
+    .collect()
+}
+
+fn depth_aspect(format: vk::Format) -> vk::ImageAspectFlags {
+    match format {
+        vk::Format::D16_UNORM_S8_UINT
+        | vk::Format::D24_UNORM_S8_UINT
+        | vk::Format::D32_SFLOAT_S8_UINT => {
+            vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
+        }
+        _ => vk::ImageAspectFlags::DEPTH,
+    }
 }
 
 pub(super) struct VulkanFrameSync {

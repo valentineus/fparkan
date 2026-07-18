@@ -543,6 +543,7 @@ pub struct VulkanSmokeRenderer {
     pub(super) frame_sync: Vec<VulkanFrameSync>,
     pub(super) images_in_flight: Vec<vk::Fence>,
     pub(super) current_frame: usize,
+    pub(super) depth_request: fparkan_platform::DepthStencilSupport,
     pub(super) pending_extent: Option<(u32, u32)>,
     pub(super) swapchain_recreate_count: u32,
     pub(super) report: VulkanSmokeRendererReport,

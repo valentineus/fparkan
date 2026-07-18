@@ -1,19 +1,22 @@
 #![allow(unsafe_code)]
 
 use ash::vk;
+use fparkan_platform::DepthStencilSupport;
 use fparkan_render::{
     LegacyBlendMode, LegacyCullMode, LegacyDepthMode, LegacyPipelineState, PipelineKey,
 };
 use std::collections::BTreeMap;
 
 use super::{
-    color_subresource_range, VulkanAllocatedBuffer, VulkanAllocatedImage, VulkanLogicalDeviceProbe,
-    VulkanSmokeRendererError, VulkanSwapchainProbe, TRIANGLE_FRAGMENT_SHADER_WORDS,
-    TRIANGLE_VERTEX_SHADER_WORDS,
+    color_subresource_range, create_depth_attachment, destroy_depth_attachment,
+    VulkanAllocatedBuffer, VulkanAllocatedImage, VulkanDepthAttachment, VulkanInstanceProbe,
+    VulkanLogicalDeviceProbe, VulkanSmokeRendererError, VulkanSwapchainProbe,
+    TRIANGLE_FRAGMENT_SHADER_WORDS, TRIANGLE_VERTEX_SHADER_WORDS,
 };
 
 pub(super) struct VulkanSwapchainResources {
     pub(super) image_views: Vec<vk::ImageView>,
+    pub(super) depth_attachment: VulkanDepthAttachment,
     pub(super) render_pass: vk::RenderPass,
     pub(super) pipeline_layout: vk::PipelineLayout,
     pub(super) descriptor_set_layout: vk::DescriptorSetLayout,
@@ -28,6 +31,7 @@ pub(super) struct VulkanSwapchainResources {
 
 struct PartialSwapchainResources {
     image_views: Vec<vk::ImageView>,
+    depth_attachment: Option<VulkanDepthAttachment>,
     render_pass: Option<vk::RenderPass>,
     pipeline_layout: Option<vk::PipelineLayout>,
     descriptor_set_layout: Option<vk::DescriptorSetLayout>,
@@ -38,8 +42,9 @@ struct PartialSwapchainResources {
     command_buffers: Vec<vk::CommandBuffer>,
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn create_swapchain_resources(
+    instance: &VulkanInstanceProbe,
     device: &VulkanLogicalDeviceProbe,
     swapchain: &VulkanSwapchainProbe,
     command_pool: vk::CommandPool,
@@ -47,6 +52,7 @@ pub(super) fn create_swapchain_resources(
     index_buffer: &VulkanAllocatedBuffer,
     textures: &[VulkanAllocatedImage],
     draw_ranges: &[super::VulkanStaticDrawRange],
+    depth_request: DepthStencilSupport,
     reuse_command_pool: bool,
 ) -> Result<VulkanSwapchainResources, VulkanSmokeRendererError> {
     // SAFETY: The swapchain is live and owned by this renderer for the duration of the query.
@@ -65,6 +71,7 @@ pub(super) fn create_swapchain_resources(
             &images,
             swapchain.report.plan.format.format,
         )?,
+        depth_attachment: None,
         render_pass: None,
         pipeline_layout: None,
         descriptor_set_layout: None,
@@ -75,6 +82,7 @@ pub(super) fn create_swapchain_resources(
         command_buffers: Vec::new(),
     };
     let (
+        depth_attachment,
         render_pass,
         pipeline_layout,
         pipelines,
@@ -83,11 +91,13 @@ pub(super) fn create_swapchain_resources(
         descriptor_sets,
         sampler,
     ) = match create_swapchain_pipeline_bundle(
+        instance,
         device,
         swapchain.report.plan.format.format,
         swapchain.report.plan.extent,
         textures,
         draw_ranges,
+        depth_request,
     ) {
         Ok(bundle) => bundle,
         Err(error) => {
@@ -95,6 +105,8 @@ pub(super) fn create_swapchain_resources(
             return Err(error);
         }
     };
+    let depth_view = depth_attachment.image.view;
+    partial.depth_attachment = Some(depth_attachment);
     partial.render_pass = Some(render_pass);
     partial.pipeline_layout = Some(pipeline_layout);
     partial.descriptor_set_layout = Some(descriptor_set_layout);
@@ -105,6 +117,7 @@ pub(super) fn create_swapchain_resources(
         device,
         render_pass,
         &partial.image_views,
+        depth_view,
         swapchain.report.plan.extent,
     ) {
         Ok(framebuffers) => framebuffers,
@@ -128,8 +141,16 @@ pub(super) fn create_swapchain_resources(
     };
     partial.command_buffers = command_buffers;
     let _ = (vertex_buffer, index_buffer);
+    let depth_attachment =
+        partial
+            .depth_attachment
+            .take()
+            .ok_or(VulkanSmokeRendererError::InvariantViolation {
+                context: "depth attachment ownership after swapchain setup",
+            })?;
     Ok(VulkanSwapchainResources {
         image_views: partial.image_views,
+        depth_attachment,
         render_pass,
         pipeline_layout,
         descriptor_set_layout,
@@ -156,13 +177,16 @@ fn create_swapchain_image_views(
 
 #[allow(clippy::type_complexity)]
 fn create_swapchain_pipeline_bundle(
+    instance: &VulkanInstanceProbe,
     device: &VulkanLogicalDeviceProbe,
     format: i32,
     extent: (u32, u32),
     textures: &[VulkanAllocatedImage],
     draw_ranges: &[super::VulkanStaticDrawRange],
+    depth_request: DepthStencilSupport,
 ) -> Result<
     (
+        VulkanDepthAttachment,
         vk::RenderPass,
         vk::PipelineLayout,
         BTreeMap<PipelineKey, vk::Pipeline>,
@@ -173,11 +197,19 @@ fn create_swapchain_pipeline_bundle(
     ),
     VulkanSmokeRendererError,
 > {
-    let render_pass = create_render_pass(device, format)?;
+    let depth_attachment = create_depth_attachment(instance, device, extent, depth_request)?;
+    let render_pass = match create_render_pass(device, format, depth_attachment.format) {
+        Ok(render_pass) => render_pass,
+        Err(error) => {
+            destroy_depth_attachment(device, &depth_attachment);
+            return Err(error);
+        }
+    };
     let (descriptor_set_layout, descriptor_pool, descriptor_sets, sampler) =
         create_texture_descriptor_bundle(device, textures).inspect_err(|_| {
             // SAFETY: The render pass was created above on this live logical device and is destroyed on setup failure.
             unsafe { device.device().destroy_render_pass(render_pass, None) };
+            destroy_depth_attachment(device, &depth_attachment);
         })?;
     let pipeline_layout =
         create_pipeline_layout(device, descriptor_set_layout).inspect_err(|_| {
@@ -192,6 +224,7 @@ fn create_swapchain_pipeline_bundle(
                     .destroy_descriptor_set_layout(descriptor_set_layout, None);
                 device.device().destroy_render_pass(render_pass, None);
             }
+            destroy_depth_attachment(device, &depth_attachment);
         })?;
     let pipelines =
         create_graphics_pipeline_cache(device, render_pass, pipeline_layout, extent, draw_ranges)
@@ -210,8 +243,10 @@ fn create_swapchain_pipeline_bundle(
                     .destroy_descriptor_set_layout(descriptor_set_layout, None);
                 device.device().destroy_render_pass(render_pass, None);
             }
+            destroy_depth_attachment(device, &depth_attachment);
         })?;
     Ok((
+        depth_attachment,
         render_pass,
         pipeline_layout,
         pipelines,
@@ -226,11 +261,12 @@ fn create_swapchain_framebuffers(
     device: &VulkanLogicalDeviceProbe,
     render_pass: vk::RenderPass,
     image_views: &[vk::ImageView],
+    depth_view: vk::ImageView,
     extent: (u32, u32),
 ) -> Result<Vec<vk::Framebuffer>, VulkanSmokeRendererError> {
     let mut framebuffers = Vec::with_capacity(image_views.len());
     for image_view in image_views.iter().copied() {
-        match create_framebuffer(device, render_pass, image_view, extent) {
+        match create_framebuffer(device, render_pass, image_view, depth_view, extent) {
             Ok(framebuffer) => framebuffers.push(framebuffer),
             Err(error) => {
                 // SAFETY: These framebuffers were created above on this live logical device and are destroyed on setup failure.
@@ -288,6 +324,7 @@ fn create_image_view(
 fn create_render_pass(
     device: &VulkanLogicalDeviceProbe,
     format: i32,
+    depth_format: vk::Format,
 ) -> Result<vk::RenderPass, VulkanSmokeRendererError> {
     let color_attachment = vk::AttachmentDescription::default()
         .format(vk::Format::from_raw(format))
@@ -299,10 +336,23 @@ fn create_render_pass(
     let color_attachment_ref = vk::AttachmentReference::default()
         .attachment(0)
         .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+    let depth_attachment = vk::AttachmentDescription::default()
+        .format(depth_format)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::CLEAR)
+        .store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .final_layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    let depth_attachment_ref = vk::AttachmentReference::default()
+        .attachment(1)
+        .layout(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
     let color_attachments = [color_attachment_ref];
     let subpass = vk::SubpassDescription::default()
         .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
-        .color_attachments(&color_attachments);
+        .color_attachments(&color_attachments)
+        .depth_stencil_attachment(&depth_attachment_ref);
     let dependency = vk::SubpassDependency::default()
         .src_subpass(vk::SUBPASS_EXTERNAL)
         .dst_subpass(0)
@@ -310,7 +360,7 @@ fn create_render_pass(
         .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
         .src_access_mask(vk::AccessFlags::empty())
         .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
-    let attachments = [color_attachment];
+    let attachments = [color_attachment, depth_attachment];
     let subpasses = [subpass];
     let dependencies = [dependency];
     let create_info = vk::RenderPassCreateInfo::default()
@@ -512,11 +562,6 @@ fn create_graphics_pipeline(
     extent: (u32, u32),
     state: LegacyPipelineState,
 ) -> Result<vk::Pipeline, VulkanSmokeRendererError> {
-    if state.depth != LegacyDepthMode::Disabled {
-        return Err(VulkanSmokeRendererError::InvalidStaticMesh {
-            context: "static renderer has no depth attachment for requested pipeline state",
-        });
-    }
     if state.alpha_test {
         return Err(VulkanSmokeRendererError::InvalidStaticMesh {
             context:
@@ -604,6 +649,12 @@ fn create_graphics_pipeline(
     let multisample_state = vk::PipelineMultisampleStateCreateInfo::default()
         .sample_shading_enable(false)
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+    let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo::default()
+        .depth_test_enable(state.depth != LegacyDepthMode::Disabled)
+        .depth_write_enable(state.depth == LegacyDepthMode::TestWrite)
+        .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
+        .depth_bounds_test_enable(false)
+        .stencil_test_enable(false);
     let color_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
         .color_write_mask(
             vk::ColorComponentFlags::R
@@ -629,6 +680,7 @@ fn create_graphics_pipeline(
         .viewport_state(&viewport_state)
         .rasterization_state(&rasterization_state)
         .multisample_state(&multisample_state)
+        .depth_stencil_state(&depth_stencil_state)
         .color_blend_state(&color_blend_state)
         .layout(pipeline_layout)
         .render_pass(render_pass)
@@ -671,9 +723,10 @@ fn create_framebuffer(
     device: &VulkanLogicalDeviceProbe,
     render_pass: vk::RenderPass,
     image_view: vk::ImageView,
+    depth_view: vk::ImageView,
     extent: (u32, u32),
 ) -> Result<vk::Framebuffer, VulkanSmokeRendererError> {
-    let attachments = [image_view];
+    let attachments = [image_view, depth_view];
     let create_info = vk::FramebufferCreateInfo::default()
         .render_pass(render_pass)
         .attachments(&attachments)
@@ -738,6 +791,7 @@ pub(super) fn destroy_swapchain_resources(
         device
             .device()
             .destroy_render_pass(resources.render_pass, None);
+        destroy_depth_attachment(device, &resources.depth_attachment);
         for image_view in resources.image_views {
             device.device().destroy_image_view(image_view, None);
         }
@@ -782,6 +836,9 @@ fn destroy_partial_swapchain_resources(
         }
         if let Some(render_pass) = partial.render_pass {
             device.device().destroy_render_pass(render_pass, None);
+        }
+        if let Some(depth_attachment) = partial.depth_attachment {
+            destroy_depth_attachment(device, &depth_attachment);
         }
         for image_view in partial.image_views {
             device.device().destroy_image_view(image_view, None);
