@@ -1573,6 +1573,15 @@ draw or compose the two terrain tables. The later consumer of that record and
 the type-18 microtexture mapping remains the required evidence before adding
 an overlay, blend, or microtexture shader.
 
+The terrain render traversal is now located at `Terrain.dll` RVA `0x11340`.
+After visibility/cell work, it derives a 68-byte source-material record and
+dispatches renderer-context slot `+16` with four arguments: zero, the record's
+16-bit word at `+2`, a pointer selected from a four-byte table by its word at
+`+0`, and zero. A preceding renderer-context slot `+60` receives the current
+visibility mode. This is the concrete terrain-to-renderer handoff; it does not
+call `GetMaterialPhase` directly and does not yet identify either word, the
+four-byte payload, or the final blend operation.
+
 The static Vulkan bridge now carries each contiguous face run as a separate
 draw range keyed by the original packed `material_tag`; it neither reorders
 triangles nor collapses the high byte. For the first usable visual layer, the
