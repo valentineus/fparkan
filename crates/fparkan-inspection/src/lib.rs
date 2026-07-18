@@ -29,7 +29,7 @@ use fparkan_nres::{decode as decode_nres, NresDocument, ReadProfile};
 use fparkan_path::{normalize_relative, PathPolicy};
 use fparkan_resource::{archive_path, resource_name, CachedResourceRepository, ResourceRepository};
 use fparkan_rsli::decode as decode_rsli;
-use fparkan_terrain_format::{decode_land_map, decode_land_msh};
+use fparkan_terrain_format::{decode_land_map, decode_land_msh, LandMeshDocument};
 use fparkan_texm::decode_texm;
 use fparkan_vfs::{DirectoryVfs, Vfs};
 use std::fs;
@@ -435,6 +435,19 @@ pub fn inspect_land_file(path: &Path, kind: LandFileKind) -> Result<MapInspectio
         LandFileKind::LandMsh => inspect_land_msh(&document),
         LandFileKind::LandMap => inspect_land_map(&document),
     }
+}
+
+/// Loads and validates a standalone `Land.msh` file.
+///
+/// # Errors
+///
+/// Returns a human-readable error if the file cannot be read, decoded as `NRes`,
+/// or decoded as the specialized terrain mesh format.
+pub fn load_land_msh_from_path(path: &Path) -> Result<LandMeshDocument, String> {
+    let bytes = fs::read(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    let document = decode_nres(Arc::from(bytes.into_boxed_slice()), ReadProfile::Compatible)
+        .map_err(|err| err.to_string())?;
+    decode_land_msh(&document).map_err(|err| err.to_string())
 }
 
 fn inspect_land_msh(document: &NresDocument) -> Result<MapInspection, String> {

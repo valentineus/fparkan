@@ -565,6 +565,7 @@ dependencies = [
  "fparkan-msh",
  "fparkan-platform",
  "fparkan-render",
+ "fparkan-terrain-format",
  "serde",
  "serde_json",
 ]

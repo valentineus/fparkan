@@ -33,7 +33,7 @@ Open source проект с реализацией компонентов игр
 
 - `fparkan-vulkan-smoke` доказывает живой Stage 0 Vulkan triangle path с native window, swapchain и validation telemetry.
 - `VulkanPlanningBackend` и `fparkan-game` подтверждают только deterministic command planning/capture, а не draw пикселей.
-- `fparkan-viewer` пока является инспектором ассетов. Stage 3 GPU vertical slice для оригинального `MSH`/`Texm`/`WEAR`/`MAT0`/terrain еще не закрыт.
+- `fparkan-viewer` пока является инспектором ассетов. `fparkan-vulkan-smoke` имеет live Stage 3 bridge для original `MSH`/`Texm`/`WEAR`/`MAT0` и geometry-only `Land.msh`; полноценный viewer, исходные terrain-material states, camera и pixel parity ещё не закрыты.
 - Truth table и evidence-артефакты вынесены в [`docs/rendering/renderer_truth_table.md`](docs/rendering/renderer_truth_table.md) и [`docs/evidence/`](docs/evidence).
 
 ## Тестирование

@@ -14,10 +14,10 @@
 use fparkan_platform::RenderRequest;
 use fparkan_platform_winit::{window_native_handles, WinitWindowPlan};
 use fparkan_render_vulkan::{
-    project_msh_to_static_mesh, VulkanSmokeBootstrapProgress, VulkanSmokeFrameOutcome,
-    VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo, VulkanSmokeRendererReport,
-    VulkanSmokeShutdownReport, VulkanStaticMaterial, VulkanStaticMesh, VulkanStaticTexture,
-    VulkanValidationReport,
+    project_land_msh_to_static_mesh, project_msh_to_static_mesh, VulkanSmokeBootstrapProgress,
+    VulkanSmokeFrameOutcome, VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo,
+    VulkanSmokeRendererReport, VulkanSmokeShutdownReport, VulkanStaticMaterial, VulkanStaticMesh,
+    VulkanStaticTexture, VulkanValidationReport,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -179,6 +179,9 @@ enum MeshInput {
         archive: String,
         name: String,
     },
+    LandMsh {
+        path: PathBuf,
+    },
 }
 
 impl MeshInput {
@@ -186,13 +189,14 @@ impl MeshInput {
         match self {
             Self::SmokeTriangle => "synthetic-smoke-triangle",
             Self::Msh { .. } => "original-msh",
+            Self::LandMsh { .. } => "original-land-msh",
         }
     }
 
     fn archive(&self) -> &str {
         match self {
-            Self::SmokeTriangle => "",
             Self::Msh { archive, .. } => archive,
+            Self::SmokeTriangle | Self::LandMsh { .. } => "",
         }
     }
 
@@ -200,6 +204,7 @@ impl MeshInput {
         match self {
             Self::SmokeTriangle => "",
             Self::Msh { name, .. } => name,
+            Self::LandMsh { .. } => "Land.msh",
         }
     }
 }
@@ -214,6 +219,7 @@ impl SmokeOptions {
         let mut model_root = None;
         let mut model_archive = None;
         let mut model_name = None;
+        let mut terrain_path = None;
         let mut texture_root = None;
         let mut texture_archive = None;
         let mut texture_name = None;
@@ -271,6 +277,13 @@ impl SmokeOptions {
                         iter.next()
                             .cloned()
                             .ok_or_else(|| "--model-name requires a value".to_string())?,
+                    );
+                }
+                "--terrain-path" => {
+                    terrain_path = Some(
+                        iter.next()
+                            .map(PathBuf::from)
+                            .ok_or_else(|| "--terrain-path requires a path".to_string())?,
                     );
                 }
                 "--texture-root" => {
@@ -335,19 +348,21 @@ impl SmokeOptions {
         if timeout_seconds == 0 {
             return Err("native smoke requires --timeout-seconds >= 1".to_string());
         }
-        let mesh_input = match (model_root, model_archive, model_name) {
-            (None, None, None) => MeshInput::SmokeTriangle,
-            (Some(root), Some(archive), Some(name)) => MeshInput::Msh {
+        let mesh_input = match (terrain_path, model_root, model_archive, model_name) {
+            (Some(path), None, None, None) => MeshInput::LandMsh { path },
+            (None, None, None, None) => MeshInput::SmokeTriangle,
+            (None, Some(root), Some(archive), Some(name)) => MeshInput::Msh {
                 root,
                 archive,
                 name,
             },
-            _ => {
+            (None, _, _, _) => {
                 return Err(
                     "--model-root, --model-archive and --model-name must be supplied together"
                         .to_string(),
                 );
             }
+            _ => return Err("--terrain-path cannot be combined with --model-*".to_string()),
         };
         let texture_input = match (texture_root, texture_archive, texture_name) {
             (None, None, None) => None,
@@ -413,6 +428,10 @@ impl SmokeOptions {
             } => {
                 let model = fparkan_inspection::load_model_from_root(root, archive, name)?;
                 project_msh_to_static_mesh(&model).map_err(|err| err.to_string())
+            }
+            MeshInput::LandMsh { path } => {
+                let terrain = fparkan_inspection::load_land_msh_from_path(path)?;
+                project_land_msh_to_static_mesh(&terrain).map_err(|err| err.to_string())
             }
         }
     }
@@ -1484,6 +1503,24 @@ mod tests {
                 mesh_input: MeshInput::Msh { archive, name, .. },
                 ..
             }) if archive == "system.rlb" && name == "MTCHECK.MSH"
+        ));
+    }
+
+    #[test]
+    fn parses_original_land_msh_as_direct_terrain_input() {
+        let parsed = SmokeOptions::parse(&[
+            "--out".to_string(),
+            "target/report.json".to_string(),
+            "--terrain-path".to_string(),
+            "C:/GOG/DATA/MAPS/11/Land.msh".to_string(),
+        ]);
+
+        assert!(matches!(
+            parsed,
+            Ok(SmokeOptions {
+                mesh_input: MeshInput::LandMsh { path },
+                ..
+            }) if path == std::path::Path::new("C:/GOG/DATA/MAPS/11/Land.msh")
         ));
     }
 

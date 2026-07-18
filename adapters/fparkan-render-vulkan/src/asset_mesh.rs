@@ -3,6 +3,7 @@
 use crate::{VulkanStaticDrawRange, VulkanStaticMesh, VulkanStaticVertex};
 use fparkan_msh::ModelAsset;
 use fparkan_render::LegacyPipelineState;
+use fparkan_terrain_format::LandMeshDocument;
 
 /// Error returned when a validated MSH cannot enter the current static GPU path.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,10 +133,108 @@ pub fn project_msh_to_static_mesh(
     })
 }
 
+/// Projects validated `Land.msh` terrain geometry into the static Vulkan path.
+///
+/// This bridge preserves the source triangle order from `TerrainFace28` and
+/// consumes its validated position and UV0 streams. It is deliberately a
+/// geometry-only terrain slice: source slot/material selection, camera
+/// transforms, fog and surface-mask shading need their own evidence before
+/// they can be modeled as renderer state.
+///
+/// # Errors
+///
+/// Returns [`VulkanAssetMeshError`] if the terrain has no triangles, contains
+/// non-finite positions, has no usable XZ extent, or references data outside
+/// the current static Vulkan input contract.
+pub fn project_land_msh_to_static_mesh(
+    terrain: &LandMeshDocument,
+) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
+    let mut indices = Vec::with_capacity(
+        terrain
+            .faces
+            .len()
+            .checked_mul(3)
+            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?,
+    );
+    for face in &terrain.faces {
+        indices.extend(face.vertices);
+    }
+    if indices.is_empty() {
+        return Err(VulkanAssetMeshError::EmptyGeometry);
+    }
+
+    let (min_x, max_x, min_z, max_z) = static_mesh_xz_bounds(&terrain.positions, &indices)?;
+    let extent = (max_x - min_x).max(max_z - min_z);
+    if !extent.is_finite() || extent <= f32::EPSILON {
+        return Err(VulkanAssetMeshError::DegenerateViewExtent);
+    }
+    let center_x = (min_x + max_x) * 0.5;
+    let center_z = (min_z + max_z) * 0.5;
+    let scale = 1.6 / extent;
+    let vertices = terrain
+        .positions
+        .iter()
+        .enumerate()
+        .map(|(index, position)| VulkanStaticVertex {
+            position: [
+                (position[0] - center_x) * scale,
+                (position[2] - center_z) * scale,
+            ],
+            color: [0.31, 0.58, 0.27],
+            uv: terrain.uv0.get(index).map_or(
+                [
+                    (position[0] - center_x) / extent + 0.5,
+                    (position[2] - center_z) / extent + 0.5,
+                ],
+                |uv| [f32::from(uv[0]) / 1024.0, f32::from(uv[1]) / 1024.0],
+            ),
+        })
+        .collect();
+
+    Ok(VulkanStaticMesh {
+        vertices,
+        indices,
+        draw_ranges: vec![VulkanStaticDrawRange {
+            first_index: 0,
+            index_count: u32::try_from(terrain.faces.len())
+                .map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?
+                .checked_mul(3)
+                .ok_or(VulkanAssetMeshError::IndexOutOfRange)?,
+            material_index: 0,
+            pipeline_state: LegacyPipelineState::default(),
+            alpha_test_reference: 0,
+        }],
+    })
+}
+
+fn static_mesh_xz_bounds(
+    positions: &[[f32; 3]],
+    indices: &[u16],
+) -> Result<(f32, f32, f32, f32), VulkanAssetMeshError> {
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_z = f32::INFINITY;
+    let mut max_z = f32::NEG_INFINITY;
+    for &index in indices {
+        let position = positions
+            .get(usize::from(index))
+            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?;
+        if !position.iter().all(|value| value.is_finite()) {
+            return Err(VulkanAssetMeshError::NonFinitePosition);
+        }
+        min_x = min_x.min(position[0]);
+        max_x = max_x.max(position[0]);
+        min_z = min_z.min(position[2]);
+        max_z = max_z.max(position[2]);
+    }
+    Ok((min_x, max_x, min_z, max_z))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use fparkan_msh::{Batch, ModelAsset};
+    use fparkan_terrain_format::{FullSurfaceMask, TerrainFace28, TerrainSlotTable};
 
     fn model(positions: Vec<[f32; 3]>, indices: Vec<u16>, batches: Vec<Batch>) -> ModelAsset {
         ModelAsset {
@@ -246,5 +345,51 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn projects_land_faces_in_source_order_with_packed_uv0() {
+        let terrain = LandMeshDocument {
+            streams: Vec::new(),
+            nodes_raw: Vec::new(),
+            slots: TerrainSlotTable {
+                header_raw: Vec::new(),
+                slots_raw: Vec::new(),
+            },
+            positions: vec![
+                [-2.0, 5.0, -1.0],
+                [2.0, 3.0, -1.0],
+                [-2.0, 9.0, 3.0],
+                [2.0, 1.0, 3.0],
+            ],
+            normals: Vec::new(),
+            uv0: vec![[1024, -512], [0, 2048], [-1024, 512], [512, 0]],
+            accelerator: Vec::new(),
+            aux14: Vec::new(),
+            aux18: Vec::new(),
+            faces: vec![terrain_face([0, 1, 2]), terrain_face([1, 3, 2])],
+        };
+
+        let mesh = project_land_msh_to_static_mesh(&terrain).expect("representable terrain");
+
+        assert_eq!(mesh.indices, vec![0, 1, 2, 1, 3, 2]);
+        assert_eq!(mesh.draw_ranges.len(), 1);
+        assert_eq!(mesh.draw_ranges[0].index_count, 6);
+        assert_eq!(mesh.vertices[0].position, [-0.8, -0.8]);
+        assert_eq!(mesh.vertices[3].position, [0.8, 0.8]);
+        assert_eq!(mesh.vertices[0].uv, [1.0, -0.5]);
+        assert_eq!(mesh.vertices[2].uv, [-1.0, 0.5]);
+    }
+
+    fn terrain_face(vertices: [u16; 3]) -> TerrainFace28 {
+        TerrainFace28 {
+            flags: FullSurfaceMask(0),
+            material_tag: 0,
+            aux_tag: 0,
+            vertices,
+            neighbors: [None; 3],
+            tail_raw: [0; 8],
+            raw: [0; 28],
+        }
     }
 }
