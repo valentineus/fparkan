@@ -925,6 +925,15 @@ matrix convention are not yet proven. This preserves authored values without
 inventing transform math; the app still uses planning backend and triangle
 ranges, so it is not a full renderer claim.
 
+### Mission original-ID render provenance
+
+Each backend-neutral draw now retains the `OriginalObjectId` preserved by the
+TMA loader for its source mission object. This gives capture and diagnostics a
+stable link from a draw back to its original object record, including every
+visual component emitted for that object. The bridge deliberately leaves the
+value absent when no mission draft exists; it does not infer an original ID
+from a runtime slot or draw order.
+
 `Land.msh` использует отдельный geometry-only bridge: validated `TerrainFace28`
 сохраняет source triangle order, а его positions и packed UV0 попадают в тот же
 static vertex/index upload path. Для текущего диагностического viewer XZ bounds

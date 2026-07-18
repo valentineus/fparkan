@@ -35,6 +35,8 @@ use fparkan_runtime::{
     MissionAssets, MissionObjectDraft, MissionRequest,
 };
 use fparkan_vfs::DirectoryVfs;
+#[cfg(test)]
+use fparkan_world::OriginalObjectId;
 use fparkan_world::WorldSnapshot;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -167,7 +169,9 @@ fn render_snapshot_with_assets(
             draws.push(RenderSnapshotDraw {
                 id: DrawId(draw_id),
                 phase: RenderPhase::Opaque,
-                object_id: None,
+                object_id: mission_drafts
+                    .and_then(|drafts| drafts.get(index))
+                    .and_then(|draft| draft.original_id),
                 mesh,
                 material_slots: vec![material],
                 material_index: 0,
@@ -426,6 +430,36 @@ mod tests {
             mission_position_scale_transform(&draft),
             [2.0, 0.0, 0.0, 10.0, 0.0, 3.0, 0.0, 20.0, 0.0, 0.0, 4.0, 30.0, 0.0, 0.0, 0.0, 1.0,]
         );
+    }
+
+    #[test]
+    fn render_snapshot_preserves_mission_original_object_id() -> Result<(), String> {
+        let snapshot = WorldSnapshot {
+            tick: Tick(1),
+            objects: vec![ObjectHandle {
+                generation: 1,
+                slot: 0,
+            }],
+            events: Vec::new(),
+            hash: StateHash([0; 32]),
+        };
+        let drafts = vec![MissionObjectDraft {
+            original_id: Some(OriginalObjectId(42)),
+            resource_name_raw: Vec::new(),
+            identity_or_clan_raw: 0,
+            position: [0.0; 3],
+            orientation_raw: [0.0; 3],
+            scale: [1.0; 3],
+            visual_ids: Vec::new(),
+            properties: Vec::new(),
+        }];
+
+        let commands = render_snapshot_commands_with_assets(&snapshot, None, Some(&drafts))?;
+        let RenderCommand::Draw(draw) = &commands.commands[1] else {
+            return Err("expected draw".to_string());
+        };
+        assert_eq!(draw.object_id, Some(OriginalObjectId(42)));
+        Ok(())
     }
 
     fn prepared_visual(id: u64, material: u64) -> PreparedVisual {
