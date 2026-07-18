@@ -1087,6 +1087,13 @@ the same 14 root MSH components, terrain component, 15 descriptors, native
 `6451493914305554398`. This confirms the current first-root diagnostic bridge
 across GOG and Part 1 data; it does not claim full mission or Part 2 parity.
 
+The corresponding Part 2 run (`C:\\Program Files (x86)\\Nikita\\IS2`) did
+not reach asset preparation or a Vulkan frame within a controlled 180-second
+window: its final persisted checkpoint was `GraphVisuals`, and the exact child
+process was terminated. This gives no Part 2 GPU acceptance or pixel result and
+does not attribute the delay to Vulkan; its visual-dependency corpus remains a
+separate profiling and compatibility target.
+
 `Assets` now has four ordered diagnostic sub-checkpoints: `AssetModelMeshes`
 (MSH), `AssetWearTables` (WEAR), `AssetMaterials` (MAT0) and `AssetTextures`
 (diffuse TEXM and lightmaps). The callback is observational: it neither changes
