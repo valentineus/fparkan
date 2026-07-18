@@ -1304,6 +1304,20 @@ not prove first- versus third-person identity. It does prove that the static
 direct-xref initializer is not the sole runtime writer of the global; indirect
 or unanalyzed write paths remain to be recovered.
 
+The shared outer vtable now recovers the exact transform adjustment for the
+world-like samples. Its slot `+0x54` asks the subobject at `outer + 4` for
+selector `0` through that subobject's slot `+0x20`, then copies three dwords
+from returned offsets `+0x0C`, `+0x1C`, and `+0x2C`. In the live world-like
+object, the selector field at `outer + 0x10` was `0xFFFFFFFF`; the recovered
+selector implementation therefore returns `outer + 0x20`. The copied triple is
+exactly `outer + 0x2C/+0x3C/+0x4C`, proving its association with the active
+affine transform rather than merely a sampled correlation. The paired block
+starts at `outer + 0x60` under selector `2`. Another outer slot at `+0x70`
+obtains that selector-2 transform and applies `atan2` to its axis values, so it
+is a proven orientation-angle path. Field names, angle order and matrix
+handedness remain unassigned, but a backend-neutral camera pose may now retain
+the raw affine transform and the exact translation triple without guessing them.
+
 A fresh no-input launch of the canonical `iron_3d.exe` did create a responsive
 window titled `Parkan. Железная Стратегия`. A read-only probe then requested
 `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ` and attempted to read the known

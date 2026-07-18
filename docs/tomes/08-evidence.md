@@ -296,6 +296,18 @@ normalized-looking `(0.098, 0.018, 0.856)` и не совпадал с paired bl
 оно запрещает называть `0x4D4D0` единственным runtime writer и требует recovery
 indirect/unanalyzed write path.
 
+Outer vtable `off_100665B4` теперь даёт exact transform adjustment для
+world-like sample. Slot `+0x54` вызывает у subobject `outer + 4` slot `+0x20`
+с selector `0`, затем копирует returned `+0x0C/+0x1C/+0x2C`. В live объекте
+selector field `outer + 0x10` был `0xFFFFFFFF`; реализация selector `0` при
+этом возвращает `outer + 0x20`. Значит observed triple
+`outer + 0x2C/+0x3C/+0x4C` — доказанная translation часть active affine
+transform, а не корреляция. Selector `2` возвращает paired block `outer + 0x60`;
+outer slot `+0x70` применяет `atan2` к его axis values, что доказывает
+orientation-angle path. Названия полей, angle order и handedness пока не
+установлены, но raw affine transform и translation можно сохранять как
+backend-neutral camera pose без догадок.
+
 ### Vtable и interface negotiation
 
 Вызовы вида `object->vfunc(offset)` доказывают порядок slots, даже когда имя
