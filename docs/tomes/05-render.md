@@ -979,6 +979,24 @@ probe timed out at `Graph`; this reduction is what allowed the successful GOG
 native run. If that first root has no usable MSH, static preview fails explicitly
 rather than expanding later roots or pretending to render the entire mission.
 
+### Camera ownership boundary from the GOG renderer
+
+The GOG `World3D.dll` export `LoadCamera` at RVA `0x1FB06` is only an import
+thunk: it jumps through IAT `0x10020148` to `Terrain.dll!LoadCamera`. The
+Terrain export is at RVA `0x4EBE0` and is a `__stdcall` entry with `ret 0x10`,
+so it receives four machine-word arguments. It allocates a `0x1A4`-byte object,
+forwards those four words to its constructor, and returns a pointer at object
+offset `+0x134`; the meaning and concrete types of those arguments are not yet
+established. `Terrain.dll!stdGetCurrentCamera2` returns a global camera pointer,
+and `stdSetCurrentCamera2` updates it through the object's interface methods.
+
+This establishes that original camera creation/selection is Terrain-owned and
+not a field that can safely be inferred from a TMA transform. It does **not**
+yet establish world-to-view matrix layout, FOV, near/far values, projection
+handedness, or initial mission camera selection. The Vulkan path must therefore
+continue to label its XZ projection as diagnostic until a dynamic capture or
+further Terrain disassembly proves these contracts.
+
 `Land.msh` использует отдельный geometry-only bridge: validated `TerrainFace28`
 сохраняет source triangle order, а его positions и packed UV0 попадают в тот же
 static vertex/index upload path. Для текущего диагностического viewer XZ bounds
