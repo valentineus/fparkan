@@ -163,5 +163,6 @@ fn default_stage0_swapchain_plan() -> VulkanSwapchainPlan {
         },
         present_mode: vk::PresentModeKHR::FIFO.as_raw(),
         image_count: 2,
+        image_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw(),
     }
 }

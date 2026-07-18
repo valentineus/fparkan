@@ -185,7 +185,7 @@ pub fn create_vulkan_swapchain_probe_for_extent(
             height: plan.extent.1,
         })
         .image_array_layers(1)
-        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+        .image_usage(vk::ImageUsageFlags::from_raw(plan.image_usage))
         .image_sharing_mode(sharing_mode)
         .queue_family_indices(&queue_family_indices)
         .pre_transform(raw_capabilities.current_transform)

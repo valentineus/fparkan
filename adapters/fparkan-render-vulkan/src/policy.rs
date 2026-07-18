@@ -96,6 +96,8 @@ pub struct VulkanSwapchainPlan {
     pub present_mode: i32,
     /// Selected image count.
     pub image_count: u32,
+    /// Selected image-usage flags as raw Vulkan bits.
+    pub image_usage: u32,
 }
 
 /// Swapchain planning error.
@@ -425,6 +427,7 @@ pub fn plan_vulkan_swapchain(
         format,
         present_mode,
         image_count: select_image_count(request.capabilities),
+        image_usage: select_swapchain_image_usage(request.capabilities),
     })
 }
 
@@ -521,6 +524,7 @@ pub fn render_swapchain_plan_json(plan: &VulkanSwapchainPlan) -> String {
         color_space: i32,
         present_mode: i32,
         image_count: u32,
+        image_usage: u32,
     }
 
     serialize_json_or_fallback(
@@ -531,8 +535,9 @@ pub fn render_swapchain_plan_json(plan: &VulkanSwapchainPlan) -> String {
             color_space: plan.format.color_space,
             present_mode: plan.present_mode,
             image_count: plan.image_count,
+            image_usage: plan.image_usage,
         },
-        "{\"schema\":0,\"extent\":[0,0],\"format\":0,\"color_space\":0,\"present_mode\":0,\"image_count\":0}",
+        "{\"schema\":0,\"extent\":[0,0],\"format\":0,\"color_space\":0,\"present_mode\":0,\"image_count\":0,\"image_usage\":0}",
     )
 }
 
@@ -807,6 +812,15 @@ fn supports_depth_stencil_request(
         return true;
     }
     select_depth_stencil_attachment_format(&device.supported_depth_stencil_formats, depth).is_some()
+}
+
+fn select_swapchain_image_usage(capabilities: VulkanSwapchainSurfaceCapabilities) -> u32 {
+    let mut usage = vk::ImageUsageFlags::COLOR_ATTACHMENT;
+    let supported = vk::ImageUsageFlags::from_raw(capabilities.supported_usage_flags);
+    if supported.contains(vk::ImageUsageFlags::TRANSFER_SRC) {
+        usage |= vk::ImageUsageFlags::TRANSFER_SRC;
+    }
+    usage.as_raw()
 }
 
 /// Selects the first canonical depth/stencil attachment format supported by a device.

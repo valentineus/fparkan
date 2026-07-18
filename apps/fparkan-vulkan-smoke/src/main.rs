@@ -778,6 +778,9 @@ impl SmokeApp {
             vulkan_swapchain_image_count: renderer
                 .as_ref()
                 .map_or(0, |snapshot| snapshot.report.swapchain_image_count),
+            vulkan_swapchain_image_usage: renderer
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.report.swapchain_image_usage),
             vulkan_portability_enumeration: renderer
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.report.portability_enumeration),
@@ -980,6 +983,7 @@ fn render_timeout_failure_report(
         vulkan_swapchain_width: 0,
         vulkan_swapchain_height: 0,
         vulkan_swapchain_image_count: 0,
+        vulkan_swapchain_image_usage: 0,
         vulkan_portability_enumeration: false,
         vulkan_portability_subset_enabled: false,
     };
@@ -1200,6 +1204,7 @@ struct SmokeReport<'a> {
     vulkan_swapchain_width: u32,
     vulkan_swapchain_height: u32,
     vulkan_swapchain_image_count: u32,
+    vulkan_swapchain_image_usage: u32,
     vulkan_portability_enumeration: bool,
     vulkan_portability_subset_enabled: bool,
 }
@@ -1703,6 +1708,7 @@ mod tests {
             vulkan_swapchain_width: 960,
             vulkan_swapchain_height: 540,
             vulkan_swapchain_image_count: 3,
+            vulkan_swapchain_image_usage: 17,
             vulkan_portability_enumeration: false,
             vulkan_portability_subset_enabled: false,
         })

@@ -94,6 +94,7 @@ fn frame_submission_plan_json_is_stable() -> Result<(), RenderError> {
         },
         present_mode: vk::PresentModeKHR::FIFO.as_raw(),
         image_count: 3,
+        image_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw(),
     };
 
     let plan = plan_vulkan_frame_submission(&swapchain, &commands)?;
@@ -543,6 +544,23 @@ fn swapchain_plan_prefers_srgb_mailbox_and_clamps_extent() {
     assert_eq!(plan.present_mode, vk::PresentModeKHR::MAILBOX.as_raw());
     assert_eq!(plan.extent, (1024, 720));
     assert_eq!(plan.image_count, 3);
+    assert_eq!(
+        plan.image_usage,
+        vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw()
+    );
+}
+
+#[test]
+fn swapchain_plan_enables_transfer_source_when_surface_supports_it() {
+    let mut request = swapchain_request();
+    request.capabilities.supported_usage_flags |= vk::ImageUsageFlags::TRANSFER_SRC.as_raw();
+
+    let plan = plan_vulkan_swapchain(&request).expect("swapchain plan");
+
+    assert_eq!(
+        plan.image_usage,
+        (vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC).as_raw()
+    );
 }
 
 #[test]
@@ -606,7 +624,7 @@ fn swapchain_plan_json_and_recreation_reports_are_stable() {
     let plan = plan_vulkan_swapchain(&swapchain_request()).expect("swapchain plan");
     assert_eq!(
         render_swapchain_plan_json(&plan),
-        "{\"schema\":1,\"extent\":[1024,720],\"format\":50,\"color_space\":0,\"present_mode\":1,\"image_count\":3}"
+        "{\"schema\":1,\"extent\":[1024,720],\"format\":50,\"color_space\":0,\"present_mode\":1,\"image_count\":3,\"image_usage\":16}"
     );
 
     let report = swapchain_recreation_report(

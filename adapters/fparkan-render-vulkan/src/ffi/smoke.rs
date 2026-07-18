@@ -241,6 +241,7 @@ impl VulkanSmokeRenderer {
                 enabled_extension_count: 0,
                 swapchain_extent: (0, 0),
                 swapchain_image_count: 0,
+                swapchain_image_usage: 0,
             },
         };
         renderer.rebuild_swapchain_resources(false)?;
@@ -268,6 +269,7 @@ impl VulkanSmokeRenderer {
                 .unwrap_or(u32::MAX),
             swapchain_extent: swapchain_ref.report.plan.extent,
             swapchain_image_count: swapchain_ref.report.image_count,
+            swapchain_image_usage: swapchain_ref.report.plan.image_usage,
         };
         Ok(renderer)
     }
@@ -571,11 +573,13 @@ impl VulkanSmokeRenderer {
         let frame_sync = create_frame_sync(device)?;
         let swapchain_extent = self.swapchain_ref()?.report.plan.extent;
         let swapchain_image_count = self.swapchain_ref()?.report.image_count;
+        let swapchain_image_usage = self.swapchain_ref()?.report.plan.image_usage;
         let resources = resources.commit();
         self.images_in_flight = vec![vk::Fence::null(); resources.image_views.len()];
         self.frame_sync = frame_sync;
         self.report.swapchain_extent = swapchain_extent;
         self.report.swapchain_image_count = swapchain_image_count;
+        self.report.swapchain_image_usage = swapchain_image_usage;
         self.swapchain_resources = Some(resources);
         Ok(())
     }
