@@ -52,12 +52,18 @@ $snapshot = [FparkanAiInitCapture]::CreateToolhelp32Snapshot(
     [FparkanAiInitCapture]::TH32CS_SNAPMODULE -bor [FparkanAiInitCapture]::TH32CS_SNAPMODULE32,
     [uint32]$ProcessId)
 $aiBase = $null
+$modules = @()
 try {
     $entry = [FparkanAiInitCapture+MODULEENTRY32]::new()
     $entry.dwSize = [Runtime.InteropServices.Marshal]::SizeOf([type][FparkanAiInitCapture+MODULEENTRY32])
     if ([FparkanAiInitCapture]::Module32First($snapshot, [ref]$entry)) {
         do {
-            if ($entry.szModule -ieq 'ai.dll') { $aiBase = $entry.modBaseAddr.ToInt64(); break }
+            $modules += [ordered]@{
+                name = $entry.szModule
+                base = $entry.modBaseAddr.ToInt64()
+                size = [int64]$entry.modBaseSize
+            }
+            if ($entry.szModule -ieq 'ai.dll') { $aiBase = $entry.modBaseAddr.ToInt64() }
             $entry = [FparkanAiInitCapture+MODULEENTRY32]::new()
             $entry.dwSize = [Runtime.InteropServices.Marshal]::SizeOf([type][FparkanAiInitCapture+MODULEENTRY32])
         } while ([FparkanAiInitCapture]::Module32Next($snapshot, [ref]$entry))
@@ -70,6 +76,12 @@ $process = [FparkanAiInitCapture]::OpenProcess(
     $false, [uint32]$ProcessId)
 if ($process -eq [IntPtr]::Zero) { throw "OpenProcess read-only failed" }
 try {
+    # CreateSuperAI stores its tenth host-callback argument at DAT_100555e4.
+    $callbackBytes = Read-Bytes $process ($aiBase + 0x555e4) 4
+    $callback = [BitConverter]::ToUInt32($callbackBytes, 0)
+    $callbackModule = $modules | Where-Object {
+        $callback -ge $_.base -and [int64]$callback -lt ($_.base + $_.size)
+    } | Select-Object -First 1
     # GetSuperAI(i) returns (&DAT_10055398)[i], with ai.dll preferred base 0x10000000.
     $entries = Read-Bytes $process ($aiBase + 0x55398) (64 * 4)
     $samples = for ($index = 0; $index -lt 64; $index++) {
@@ -86,6 +98,14 @@ try {
             }
         } catch { }
     }
-    [ordered]@{ schema = 'fparkan-ai-init-v1'; process_id = $ProcessId; ai_module_base = ('0x{0:X8}' -f $aiBase); entries = @($samples) } |
+    [ordered]@{
+        schema = 'fparkan-ai-init-v1'
+        process_id = $ProcessId
+        ai_module_base = ('0x{0:X8}' -f $aiBase)
+        handler30_callback = ('0x{0:X8}' -f $callback)
+        handler30_callback_module = if ($null -eq $callbackModule) { $null } else { $callbackModule.name }
+        handler30_callback_rva = if ($null -eq $callbackModule) { $null } else { ('0x{0:X}' -f ([int64]$callback - $callbackModule.base)) }
+        entries = @($samples)
+    } |
         ConvertTo-Json -Depth 4 -Compress
 } finally { [void][FparkanAiInitCapture]::CloseHandle($process) }

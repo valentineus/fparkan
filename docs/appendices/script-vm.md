@@ -240,6 +240,18 @@ defaults. Runtime exposes `resolve_loaded_handler30` for the exact opaque
 command without invoking a guessed game-side consumer: the tenth
 `CreateSuperAI` callback argument still needs its own recovery.
 
+The live GOG AutoDemo closes that consumer boundary: the read-only callback
+pointer at `ai.dll + 0x555e4` is `0x100611d0`, or `iron3d.dll + 0x611d0` at
+the observed load base. Its recovered `__cdecl` ABI is `(mode, command,
+payload)`, matching `Handler(30)` as `(0, first, second)`. In `mode == 0`,
+`command == 0` and `payload == 0` selects `VOICE_MISSION_FAIL`, records the
+failed status, and clears an IGame byte; `payload == 1` selects
+`VOICE_MISSION_COMPLETE`, records completion, and sets that byte. Commands
+1, 3, 4, and 5 have additional game-side paths; mode 2 is a separate IGame
+call. Those branches are not yet assigned Rust gameplay meanings. Reproduce
+the current evidence with `capture-ai-init.ps1` and
+`ExportIron3dAiCallback.java`.
+
 ### Handler(8): problem-record state write
 
 `Handler(8)` is the ninth VM-table entry at GOG `ai.dll` VA `0x10009b0d`.
