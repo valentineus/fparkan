@@ -894,7 +894,11 @@ mod tests {
         fs::write(root.join("WORLD/MAP/land.map"), build_nres(&[])).expect("land map");
         let manifest = CorpusManifest {
             kind: CorpusKind::Unknown,
-            files: vec![manifest_entry("WORLD/MAP/land.map", 16, sha256(b"land.map"))],
+            files: vec![manifest_entry(
+                "WORLD/MAP/land.map",
+                16,
+                sha256(b"land.map"),
+            )],
             casefold_collisions: Vec::new(),
         };
 
@@ -913,7 +917,11 @@ mod tests {
         fs::write(root.join("WORLD/MAP/land.msh"), build_nres(&[])).expect("land msh");
         let manifest = CorpusManifest {
             kind: CorpusKind::Unknown,
-            files: vec![manifest_entry("WORLD/MAP/land.msh", 16, sha256(b"land.msh"))],
+            files: vec![manifest_entry(
+                "WORLD/MAP/land.msh",
+                16,
+                sha256(b"land.msh"),
+            )],
             casefold_collisions: Vec::new(),
         };
 

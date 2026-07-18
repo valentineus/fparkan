@@ -636,7 +636,11 @@ impl RsliDocument {
     ///
     /// Returns [`RsliError`] when the packed payload exceeds configured
     /// limits, `id` is invalid, or the payload cannot be decoded.
-    pub fn load_with_limits(&self, id: EntryId, limits: DecodeLimits) -> Result<Vec<u8>, RsliError> {
+    pub fn load_with_limits(
+        &self,
+        id: EntryId,
+        limits: DecodeLimits,
+    ) -> Result<Vec<u8>, RsliError> {
         let record = self.record_by_id(id)?;
         let packed = self.packed_slice(id, record)?;
         decode_payload(
@@ -1208,12 +1212,18 @@ fn validate_lookup_order(records: &[EntryRecord]) -> Result<(), RsliError> {
             .map_err(|_| RsliError::IntegerOverflow)?;
         let left = records
             .get(left_original)
-            .ok_or(RsliError::CorruptEntryTable("sort_to_original is not a permutation"))?;
+            .ok_or(RsliError::CorruptEntryTable(
+                "sort_to_original is not a permutation",
+            ))?;
         let right = records
             .get(right_original)
-            .ok_or(RsliError::CorruptEntryTable("sort_to_original is not a permutation"))?;
-        if cmp_c_string(c_name_bytes(&left.meta.name_raw), c_name_bytes(&right.meta.name_raw))
-            == std::cmp::Ordering::Greater
+            .ok_or(RsliError::CorruptEntryTable(
+                "sort_to_original is not a permutation",
+            ))?;
+        if cmp_c_string(
+            c_name_bytes(&left.meta.name_raw),
+            c_name_bytes(&right.meta.name_raw),
+        ) == std::cmp::Ordering::Greater
         {
             return Err(RsliError::CorruptEntryTable(
                 "presorted lookup names are not sorted",
@@ -1906,7 +1916,9 @@ mod tests {
 
         assert!(matches!(
             decode(arc(bytes.clone()), ReadProfile::Strict),
-            Err(RsliError::CorruptEntryTable("presorted lookup names are not sorted"))
+            Err(RsliError::CorruptEntryTable(
+                "presorted lookup names are not sorted"
+            ))
         ));
 
         let doc = decode(arc(bytes), ReadProfile::Compatible).expect("compatible fallback");
@@ -2418,14 +2430,23 @@ mod tests {
                     ..DecodeLimits::default()
                 }
             ),
-            Err(RsliError::Binary(DecodeError::LimitExceeded { count: 2, limit: 1 }))
+            Err(RsliError::Binary(DecodeError::LimitExceeded {
+                count: 2,
+                limit: 1
+            }))
         ));
     }
 
     #[test]
     fn stored_entries_require_exact_packed_size() {
         let bytes = synthetic_rsli(
-            &[SyntheticEntry::with_payload(b"A", 0x000, 0, b"ok", b"ok!".to_vec())],
+            &[SyntheticEntry::with_payload(
+                b"A",
+                0x000,
+                0,
+                b"ok",
+                b"ok!".to_vec(),
+            )],
             true,
             0x7782,
             None,
@@ -2434,7 +2455,10 @@ mod tests {
 
         assert!(matches!(
             doc.load(EntryId(0)),
-            Err(RsliError::OutputSizeMismatch { expected: 2, got: 3 })
+            Err(RsliError::OutputSizeMismatch {
+                expected: 2,
+                got: 3
+            })
         ));
     }
 
@@ -2457,7 +2481,10 @@ mod tests {
                     ..DecodeLimits::default()
                 }
             ),
-            Err(RsliError::Binary(DecodeError::LimitExceeded { count: 5, limit: 4 }))
+            Err(RsliError::Binary(DecodeError::LimitExceeded {
+                count: 5,
+                limit: 4
+            }))
         ));
     }
 

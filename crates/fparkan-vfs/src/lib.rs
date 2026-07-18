@@ -257,11 +257,7 @@ fn select_casefolded_match(
     }
 }
 
-fn list_recursive(
-    root: &Path,
-    dir: &Path,
-    out: &mut Vec<VfsEntry>,
-) -> Result<(), VfsError> {
+fn list_recursive(root: &Path, dir: &Path, out: &mut Vec<VfsEntry>) -> Result<(), VfsError> {
     let read_dir = fs::read_dir(dir).map_err(VfsError::Io)?;
     let mut children = Vec::new();
     for entry in read_dir {
@@ -286,11 +282,9 @@ fn list_recursive(
         let rel_bytes = rel.as_os_str().as_bytes();
         #[cfg(not(unix))]
         let rel_bytes = rel.to_str().ok_or(VfsError::Path)?.as_bytes();
-        let path = fparkan_path::normalize_relative(
-            rel_bytes,
-            fparkan_path::PathPolicy::HostCompatible,
-        )
-        .map_err(|_| VfsError::Path)?;
+        let path =
+            fparkan_path::normalize_relative(rel_bytes, fparkan_path::PathPolicy::HostCompatible)
+                .map_err(|_| VfsError::Path)?;
         out.push(VfsEntry {
             path,
             metadata: metadata_from_host_file(&child, &metadata)?,
@@ -299,10 +293,7 @@ fn list_recursive(
     Ok(())
 }
 
-fn metadata_from_host_file(
-    path: &Path,
-    metadata: &fs::Metadata,
-) -> Result<VfsMetadata, VfsError> {
+fn metadata_from_host_file(path: &Path, metadata: &fs::Metadata) -> Result<VfsMetadata, VfsError> {
     if !metadata.is_file() {
         return Err(VfsError::Path);
     }
@@ -659,8 +650,7 @@ mod tests {
         }
 
         let vfs = DirectoryVfs::new(&root);
-        let path =
-            normalize_relative(b"data/\xFF.bin", PathPolicy::HostCompatible).expect("path");
+        let path = normalize_relative(b"data/\xFF.bin", PathPolicy::HostCompatible).expect("path");
 
         assert_eq!(vfs.read(&path).expect("read raw path").as_ref(), b"raw");
         let entries = vfs
@@ -770,8 +760,14 @@ mod tests {
         let entries = overlay.list(&prefix).expect("list");
 
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].path.display_lossy(), entries[1].path.display_lossy());
-        assert_ne!(entries[0].path.identity_bytes(), entries[1].path.identity_bytes());
+        assert_eq!(
+            entries[0].path.display_lossy(),
+            entries[1].path.display_lossy()
+        );
+        assert_ne!(
+            entries[0].path.identity_bytes(),
+            entries[1].path.identity_bytes()
+        );
     }
 
     fn unique_test_dir(name: &str) -> PathBuf {

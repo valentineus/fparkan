@@ -209,7 +209,11 @@ pub struct PrototypeGraphNode {
 impl PrototypeGraphNode {
     /// Creates a typed resource node.
     #[must_use]
-    pub fn resource(kind: PrototypeGraphNodeKind, resource: ResourceKey, id: PrototypeGraphNodeId) -> Self {
+    pub fn resource(
+        kind: PrototypeGraphNodeKind,
+        resource: ResourceKey,
+        id: PrototypeGraphNodeId,
+    ) -> Self {
         Self {
             id,
             kind,
@@ -1656,15 +1660,24 @@ mod tests {
     fn malformed_unit_dat_failure_is_classified_on_unit_edge() {
         let mut vfs = MemoryVfs::default();
         let dat_path = resource_archive_path(b"UNITS/AUTO/bad.dat").expect("dat path");
-        vfs.insert(dat_path, Arc::from([1_u8, 2, 3].to_vec().into_boxed_slice()));
+        vfs.insert(
+            dat_path,
+            Arc::from([1_u8, 2, 3].to_vec().into_boxed_slice()),
+        );
         let vfs = Arc::new(vfs);
         let repo = CachedResourceRepository::new(vfs.clone());
 
-        let (_graph, _resolved, report) =
-            build_prototype_graph_report(&repo, vfs.as_ref(), &[resource_name(b"UNITS/AUTO/bad.dat")]);
+        let (_graph, _resolved, report) = build_prototype_graph_report(
+            &repo,
+            vfs.as_ref(),
+            &[resource_name(b"UNITS/AUTO/bad.dat")],
+        );
 
         assert_eq!(report.failures.len(), 1);
-        assert_eq!(report.failures[0].edge, PrototypeGraphEdge::MissionToUnitDat);
+        assert_eq!(
+            report.failures[0].edge,
+            PrototypeGraphEdge::MissionToUnitDat
+        );
     }
 
     #[test]
@@ -1690,7 +1703,10 @@ mod tests {
         );
 
         assert_eq!(report.failures.len(), 1);
-        assert_eq!(report.failures[0].edge, PrototypeGraphEdge::UnitDatToComponent);
+        assert_eq!(
+            report.failures[0].edge,
+            PrototypeGraphEdge::UnitDatToComponent
+        );
         assert!(report.failures[0].message.contains("missing_component"));
     }
 
@@ -2007,10 +2023,7 @@ mod tests {
 
         assert_eq!(report.failures.len(), 1);
         assert_eq!(report.failures[0].resource_raw, b"broken");
-        assert_eq!(
-            report.failures[0].edge,
-            PrototypeGraphEdge::PrototypeToMesh
-        );
+        assert_eq!(report.failures[0].edge, PrototypeGraphEdge::PrototypeToMesh);
         assert!(report.failures[0].message.contains("broken"));
         assert!(report.failures[0]
             .message

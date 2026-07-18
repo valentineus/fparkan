@@ -32,7 +32,14 @@ fn take_runtime_owners_in_dependency_order<Instance, Validation, Surface, Device
     instance.take();
 }
 
-fn take_runtime_children_with_validation_snapshot<Surface, Device, Swapchain, Validation, Snapshot, Capture>(
+fn take_runtime_children_with_validation_snapshot<
+    Surface,
+    Device,
+    Swapchain,
+    Validation,
+    Snapshot,
+    Capture,
+>(
     surface: &mut Option<Surface>,
     device: &mut Option<Device>,
     swapchain: &mut Option<Swapchain>,

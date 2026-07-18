@@ -634,15 +634,13 @@ pub fn prepare_mission_assets_with_repository<R: ResourceRepository>(
     root_prototype_spans: &[std::ops::Range<usize>],
     prototypes: &[EffectivePrototype],
 ) -> Result<MissionAssets, AssetError> {
-    Ok(
-        prepare_mission_assets_profiled_with_repository(
-            repository,
-            root_prototype_spans,
-            prototypes,
-            AssetPreparationLimits::default(),
-        )?
-        .0,
-    )
+    Ok(prepare_mission_assets_profiled_with_repository(
+        repository,
+        root_prototype_spans,
+        prototypes,
+        AssetPreparationLimits::default(),
+    )?
+    .0)
 }
 
 /// Builds mission assets while enforcing explicit preparation limits.

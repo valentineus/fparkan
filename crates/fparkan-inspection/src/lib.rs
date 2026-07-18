@@ -137,7 +137,8 @@ pub enum LandFileKind {
 ///
 /// Returns a string error when the archive cannot be read or decoded.
 pub fn inspect_archive_file(path: &Path, sample_limit: usize) -> Result<ArchiveInspection, String> {
-    inspect_archive_file_diagnostic(path, sample_limit).map_err(|diagnostic| render_human(&diagnostic))
+    inspect_archive_file_diagnostic(path, sample_limit)
+        .map_err(|diagnostic| render_human(&diagnostic))
 }
 
 /// Inspects a format archive and returns a structured diagnostic on failure.
@@ -215,7 +216,9 @@ fn inspect_archive_bytes(
             Arc::from(bytes.to_vec().into_boxed_slice()),
             ReadProfile::Compatible,
         )
-        .map_err(|err| archive_parse_diagnostic("S1.NRES.DECODE", source, bytes, err.to_string()))?;
+        .map_err(|err| {
+            archive_parse_diagnostic("S1.NRES.DECODE", source, bytes, err.to_string())
+        })?;
         let mut sample = Vec::new();
         for entry in document.entries().iter().take(sample_limit) {
             sample.push(NresEntrySummary {
@@ -234,7 +237,9 @@ fn inspect_archive_bytes(
             Arc::from(bytes.to_vec().into_boxed_slice()),
             fparkan_rsli::ReadProfile::Compatible,
         )
-        .map_err(|err| archive_parse_diagnostic("S1.RSLI.DECODE", source, bytes, err.to_string()))?;
+        .map_err(|err| {
+            archive_parse_diagnostic("S1.RSLI.DECODE", source, bytes, err.to_string())
+        })?;
         Ok(ArchiveInspection::Rsli {
             entries: document.entries().len(),
         })
@@ -259,8 +264,8 @@ pub fn inspect_model_from_root(
     archive: &str,
     resource: &str,
 ) -> Result<ModelInspection, String> {
-    let bytes =
-        read_resource_bytes_diagnostic(root, archive, resource).map_err(|err| render_human(&err))?;
+    let bytes = read_resource_bytes_diagnostic(root, archive, resource)
+        .map_err(|err| render_human(&err))?;
     let document = decode_nres(bytes.clone(), ReadProfile::Compatible).map_err(|err| {
         render_human(&resource_parse_diagnostic(
             "S1.NRES.DECODE",
@@ -293,10 +298,8 @@ pub fn load_model_from_root(
     archive: &str,
     resource: &str,
 ) -> Result<ModelAsset, String> {
-    let document =
-        load_model_document_from_root_diagnostic(root, archive, resource).map_err(|err| {
-            render_human(&err)
-        })?;
+    let document = load_model_document_from_root_diagnostic(root, archive, resource)
+        .map_err(|err| render_human(&err))?;
     let msh = decode_msh(&document).map_err(|err| err.to_string())?;
     validate_msh(&msh).map_err(|err| err.to_string())
 }
@@ -312,8 +315,8 @@ pub fn inspect_texture_from_root(
     archive: &str,
     resource: &str,
 ) -> Result<TextureInspection, String> {
-    let bytes =
-        read_resource_bytes_diagnostic(root, archive, resource).map_err(|err| render_human(&err))?;
+    let bytes = read_resource_bytes_diagnostic(root, archive, resource)
+        .map_err(|err| render_human(&err))?;
     let document = decode_texm(bytes).map_err(|err| err.to_string())?;
     Ok(TextureInspection {
         width: document.width(),
@@ -385,18 +388,16 @@ fn read_resource_bytes_diagnostic(
         )
     })?;
     let resource_name = resource_name(name.as_bytes());
-    let archive_handle = repository
-        .open_archive(&archive_path)
-        .map_err(|err| {
-            diagnostic(DiagnosticCode("S1.RESOURCE.OPEN_ARCHIVE"), err.to_string()).with_context(
-                DiagnosticContext {
-                    phase: Some(Phase::Read),
-                    path: Some(archive.to_string()),
-                    archive_entry: Some(name.to_string()),
-                    ..DiagnosticContext::default()
-                },
-            )
-        })?;
+    let archive_handle = repository.open_archive(&archive_path).map_err(|err| {
+        diagnostic(DiagnosticCode("S1.RESOURCE.OPEN_ARCHIVE"), err.to_string()).with_context(
+            DiagnosticContext {
+                phase: Some(Phase::Read),
+                path: Some(archive.to_string()),
+                archive_entry: Some(name.to_string()),
+                ..DiagnosticContext::default()
+            },
+        )
+    })?;
     let Some(handle) = repository
         .find(archive_handle, &resource_name)
         .map_err(|err| {
@@ -410,21 +411,19 @@ fn read_resource_bytes_diagnostic(
             )
         })?
     else {
-        return Err(
-            diagnostic(
-                DiagnosticCode("S1.RESOURCE.MISSING_ENTRY"),
-                format!(
-                    "resource not found: {archive}/{}",
-                    String::from_utf8_lossy(name.as_bytes())
-                ),
-            )
-            .with_context(DiagnosticContext {
-                phase: Some(Phase::Resolve),
-                path: Some(archive.to_string()),
-                archive_entry: Some(name.to_string()),
-                ..DiagnosticContext::default()
-            }),
-        );
+        return Err(diagnostic(
+            DiagnosticCode("S1.RESOURCE.MISSING_ENTRY"),
+            format!(
+                "resource not found: {archive}/{}",
+                String::from_utf8_lossy(name.as_bytes())
+            ),
+        )
+        .with_context(DiagnosticContext {
+            phase: Some(Phase::Resolve),
+            path: Some(archive.to_string()),
+            archive_entry: Some(name.to_string()),
+            ..DiagnosticContext::default()
+        }));
     };
     let bytes = repository.read(handle).map_err(|err| {
         diagnostic(DiagnosticCode("S1.RESOURCE.READ"), err.to_string()).with_context(
@@ -514,8 +513,7 @@ mod tests {
         let path = dir.join("broken.nres");
         fs::write(&path, b"NRes").expect("broken nres");
 
-        let diagnostic =
-            inspect_archive_file_diagnostic(&path, 0).expect_err("diagnostic failure");
+        let diagnostic = inspect_archive_file_diagnostic(&path, 0).expect_err("diagnostic failure");
 
         assert_eq!(diagnostic.code.0, "S1.NRES.DECODE");
         let expected_path = path.display().to_string();
@@ -555,7 +553,10 @@ mod tests {
         assert_eq!(diagnostic.code.0, "S1.NRES.DECODE");
         assert_eq!(diagnostic.context.phase, Some(Phase::Parse));
         assert_eq!(diagnostic.context.path.as_deref(), Some("models.rlb"));
-        assert_eq!(diagnostic.context.archive_entry.as_deref(), Some("BROKEN.MSH"));
+        assert_eq!(
+            diagnostic.context.archive_entry.as_deref(),
+            Some("BROKEN.MSH")
+        );
         assert_eq!(
             diagnostic.context.span,
             Some(SourceSpan {

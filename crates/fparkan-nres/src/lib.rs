@@ -802,10 +802,8 @@ fn parse_entries(
     header: &NresHeader,
     limits: DecodeLimits,
 ) -> Result<Vec<NresEntry>, NresError> {
-    let capacity = checked_allocation_len(
-        u64::from(header.entry_count),
-        u64::from(limits.max_entries),
-    )?;
+    let capacity =
+        checked_allocation_len(u64::from(header.entry_count), u64::from(limits.max_entries))?;
     let mut entries = Vec::with_capacity(capacity);
     let directory_offset =
         usize::try_from(header.directory_offset).map_err(|_| DecodeError::IntegerOverflow)?;
@@ -1629,7 +1627,10 @@ mod tests {
                     ..DecodeLimits::default()
                 }
             ),
-            Err(NresError::Binary(DecodeError::LimitExceeded { count: 2, limit: 1 }))
+            Err(NresError::Binary(DecodeError::LimitExceeded {
+                count: 2,
+                limit: 1
+            }))
         ));
     }
 
