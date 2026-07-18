@@ -1427,6 +1427,16 @@ identity camera deliberately preserves the old XY diagnostic preview; feeding
 live terrain camera/projection values into mission rendering remains later
 runtime wiring, not a claim of scene parity.
 
+The geometry side of that handoff is also explicit. The static mesh adapter now
+has source-world projections for `Land.msh` and MSH: terrain positions retain
+all three decoded coordinates; model positions retain Z and apply only the
+already decoded mission translation and scale. These APIs preserve triangle
+order, batch ranges and packed UV decoding, but do not interpret the still
+unproven raw object orientation. The current game preview deliberately stays
+on its XY diagnostic projection until a runtime supplies a real legacy camera;
+selecting source-world coordinates with identity camera would be a misleading
+empty/off-screen viewer rather than a compatibility result.
+
 A fresh no-input launch of the canonical `iron_3d.exe` did create a responsive
 window titled `Parkan. Железная Стратегия`. A read-only probe then requested
 `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ` and attempted to read the known

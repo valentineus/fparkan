@@ -169,6 +169,64 @@ pub fn project_msh_to_static_mesh_in_xy_frame(
     })
 }
 
+/// Projects MSH geometry into source world coordinates with known translation and scale.
+///
+/// Unlike [`project_msh_to_static_mesh_in_xy_frame`], this does not normalize
+/// or discard Z. It retains the decoded translation/scale for the recovered
+/// legacy camera path while intentionally leaving raw object orientation
+/// uninterpreted until its original convention is established.
+///
+/// # Errors
+///
+/// Returns [`VulkanAssetMeshError`] when geometry, transform values or the
+/// static Vulkan input contract cannot represent the source model.
+pub fn project_msh_to_static_mesh_in_world_space(
+    model: &ModelAsset,
+    translation: [f32; 3],
+    scale: [f32; 3],
+) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
+    if !translation
+        .iter()
+        .chain(scale.iter())
+        .all(|value| value.is_finite())
+    {
+        return Err(VulkanAssetMeshError::NonFinitePosition);
+    }
+    let (indices, draw_ranges) = static_model_indices_and_ranges(model)?;
+    let vertices = model
+        .positions
+        .iter()
+        .enumerate()
+        .map(|(index, position)| {
+            if !position.iter().all(|value| value.is_finite()) {
+                return Err(VulkanAssetMeshError::NonFinitePosition);
+            }
+            let position = [
+                position[0] * scale[0] + translation[0],
+                position[1] * scale[1] + translation[1],
+                position[2] * scale[2] + translation[2],
+            ];
+            Ok(VulkanStaticVertex {
+                position,
+                color: [0.82, 0.72, 0.31],
+                uv: model
+                    .uv0
+                    .as_ref()
+                    .and_then(|uv0| uv0.get(index))
+                    .map_or([0.0, 0.0], |uv| {
+                        [f32::from(uv[0]) / 1024.0, f32::from(uv[1]) / 1024.0]
+                    }),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(VulkanStaticMesh {
+        vertices,
+        indices,
+        draw_ranges,
+    })
+}
+
 /// Projects validated `Land.msh` terrain geometry into the static Vulkan path.
 ///
 /// This bridge preserves the source triangle order from `TerrainFace28` and
@@ -255,17 +313,80 @@ pub fn project_land_msh_to_static_mesh_in_xy_frame(
     Ok(VulkanStaticMesh {
         vertices,
         indices,
-        draw_ranges: vec![VulkanStaticDrawRange {
-            first_index: 0,
-            index_count: u32::try_from(terrain.faces.len())
-                .map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?
-                .checked_mul(3)
-                .ok_or(VulkanAssetMeshError::IndexOutOfRange)?,
-            material_index: 0,
-            pipeline_state: LegacyPipelineState::default(),
-            alpha_test_reference: 0,
-        }],
+        draw_ranges: static_terrain_draw_ranges(terrain)?,
     })
+}
+
+/// Projects `Land.msh` terrain with its decoded source coordinates intact.
+///
+/// This is the terrain counterpart of
+/// [`project_msh_to_static_mesh_in_world_space`]. It has no viewer transform:
+/// camera framing and any coordinate conversion are owned by the recovered
+/// legacy camera adapter.
+///
+/// # Errors
+///
+/// Returns [`VulkanAssetMeshError`] when terrain geometry or the static Vulkan
+/// input contract cannot represent the source mesh.
+pub fn project_land_msh_to_static_mesh_in_world_space(
+    terrain: &LandMeshDocument,
+) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
+    let indices = static_terrain_indices(terrain)?;
+    let vertices = terrain
+        .positions
+        .iter()
+        .enumerate()
+        .map(|(index, position)| {
+            if !position.iter().all(|value| value.is_finite()) {
+                return Err(VulkanAssetMeshError::NonFinitePosition);
+            }
+            Ok(VulkanStaticVertex {
+                position: *position,
+                color: [0.31, 0.58, 0.27],
+                uv: terrain.uv0.get(index).map_or([0.0, 0.0], |uv| {
+                    [f32::from(uv[0]) / 1024.0, f32::from(uv[1]) / 1024.0]
+                }),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(VulkanStaticMesh {
+        vertices,
+        indices,
+        draw_ranges: static_terrain_draw_ranges(terrain)?,
+    })
+}
+
+fn static_terrain_indices(terrain: &LandMeshDocument) -> Result<Vec<u16>, VulkanAssetMeshError> {
+    let mut indices = Vec::with_capacity(
+        terrain
+            .faces
+            .len()
+            .checked_mul(3)
+            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?,
+    );
+    for face in &terrain.faces {
+        indices.extend(face.vertices);
+    }
+    if indices.is_empty() {
+        return Err(VulkanAssetMeshError::EmptyGeometry);
+    }
+    Ok(indices)
+}
+
+fn static_terrain_draw_ranges(
+    terrain: &LandMeshDocument,
+) -> Result<Vec<VulkanStaticDrawRange>, VulkanAssetMeshError> {
+    Ok(vec![VulkanStaticDrawRange {
+        first_index: 0,
+        index_count: u32::try_from(terrain.faces.len())
+            .map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?
+            .checked_mul(3)
+            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?,
+        material_index: 0,
+        pipeline_state: LegacyPipelineState::default(),
+        alpha_test_reference: 0,
+    }])
 }
 
 fn static_model_indices_and_ranges(
@@ -410,6 +531,28 @@ mod tests {
     }
 
     #[test]
+    fn world_space_msh_preserves_z_and_applies_only_decoded_translation_scale() {
+        let mut source = model(
+            vec![[2.0, -3.0, 4.0], [0.0, 1.0, 2.0], [-1.0, 2.0, 3.0]],
+            vec![0, 1, 2],
+            vec![batch(0, 3, 0)],
+        );
+        source.uv0 = Some(vec![[1024, -512], [0, 2048], [-1024, 512]]);
+
+        let mesh = project_msh_to_static_mesh_in_world_space(
+            &source,
+            [100.0, 200.0, 300.0],
+            [2.0, -1.0, 0.5],
+        )
+        .expect("representable source-space MSH");
+
+        assert_eq!(mesh.indices, vec![0, 1, 2]);
+        assert_eq!(mesh.vertices[0].position, [104.0, 203.0, 302.0]);
+        assert_eq!(mesh.vertices[1].position, [100.0, 199.0, 301.0]);
+        assert_eq!(mesh.vertices[0].uv, [1.0, -0.5]);
+    }
+
+    #[test]
     fn retains_each_source_batch_material_selector() {
         let mut second = batch(3, 3, 0);
         second.material_index = 7;
@@ -478,6 +621,33 @@ mod tests {
         assert_eq!(mesh.vertices[3].position, [0.8, 0.8, 0.0]);
         assert_eq!(mesh.vertices[0].uv, [1.0, -0.5]);
         assert_eq!(mesh.vertices[2].uv, [-1.0, 0.5]);
+    }
+
+    #[test]
+    fn world_space_terrain_preserves_source_coordinates_and_faces() {
+        let terrain = LandMeshDocument {
+            streams: Vec::new(),
+            nodes_raw: Vec::new(),
+            slots: TerrainSlotTable {
+                header_raw: Vec::new(),
+                slots_raw: Vec::new(),
+            },
+            positions: vec![[10.0, 20.0, 30.0], [40.0, 50.0, 60.0], [70.0, 80.0, 90.0]],
+            normals: Vec::new(),
+            uv0: vec![[1024, -512], [0, 2048], [-1024, 512]],
+            accelerator: Vec::new(),
+            aux14: Vec::new(),
+            aux18: Vec::new(),
+            faces: vec![terrain_face([2, 0, 1])],
+        };
+
+        let mesh = project_land_msh_to_static_mesh_in_world_space(&terrain)
+            .expect("representable source-space terrain");
+
+        assert_eq!(mesh.indices, vec![2, 0, 1]);
+        assert_eq!(mesh.vertices[0].position, [10.0, 20.0, 30.0]);
+        assert_eq!(mesh.vertices[2].position, [70.0, 80.0, 90.0]);
+        assert_eq!(mesh.vertices[0].uv, [1.0, -0.5]);
     }
 
     fn terrain_face(vertices: [u16; 3]) -> TerrainFace28 {
