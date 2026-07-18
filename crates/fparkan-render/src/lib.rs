@@ -142,6 +142,37 @@ pub struct RawCameraPose {
     pub selector2: RawCameraTransform,
 }
 
+/// Raw projection state observed through the original `CBufferingCamera` ABI.
+///
+/// The five-float context block is intentionally represented as original words:
+/// its indices are observed, but their semantic labels have not yet all been
+/// recovered. The field-of-view value is the type-0 input to `tan(fov / 2)`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RawCameraProjection {
+    /// Viewport rectangle as `(left, top, right, bottom)`.
+    pub viewport: [i32; 4],
+    /// Original projection selector.
+    pub projection_type: u32,
+    /// Original IEEE-754 FOV value in radians.
+    pub field_of_view_radians_bits: u32,
+    /// Exact five-float context block returned by the primary renderer.
+    pub context_words: [u32; 5],
+}
+
+impl RawCameraProjection {
+    /// Returns the type-0 FOV input in radians.
+    #[must_use]
+    pub fn field_of_view_radians(self) -> f32 {
+        f32::from_bits(self.field_of_view_radians_bits)
+    }
+
+    /// Returns the five context values without assigning semantic labels.
+    #[must_use]
+    pub fn context_values(self) -> [f32; 5] {
+        self.context_words.map(f32::from_bits)
+    }
+}
+
 /// Immutable camera data visible to command generation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CameraSnapshot {
@@ -155,6 +186,11 @@ pub struct CameraSnapshot {
     /// conventions have been recovered; it preserves the ABI boundary for the
     /// runtime adapter and deterministic captures.
     pub raw_pose: Option<RawCameraPose>,
+    /// Optional unconverted source-projection state.
+    ///
+    /// This is retained independently of `projection`, because its legacy
+    /// context words have not yet been mapped to a Vulkan clip convention.
+    pub raw_projection: Option<RawCameraProjection>,
 }
 
 impl Default for CameraSnapshot {
@@ -163,6 +199,7 @@ impl Default for CameraSnapshot {
             view: identity_transform(),
             projection: identity_transform(),
             raw_pose: None,
+            raw_projection: None,
         }
     }
 }
@@ -872,6 +909,26 @@ mod tests {
             [491.562_5, 761.550_8, 7.361_0]
         );
         assert_eq!(CameraSnapshot::default().raw_pose, None);
+    }
+
+    #[test]
+    fn raw_camera_projection_preserves_live_context_words_without_labeling_them() {
+        let projection = RawCameraProjection {
+            viewport: [0, 0, 1024, 768],
+            projection_type: 0,
+            field_of_view_radians_bits: 1.04_f32.to_bits(),
+            context_words: [
+                0.0_f32.to_bits(),
+                0.5_f32.to_bits(),
+                700.0_f32.to_bits(),
+                0.1_f32.to_bits(),
+                0.99_f32.to_bits(),
+            ],
+        };
+
+        assert_eq!(projection.field_of_view_radians(), 1.04);
+        assert_eq!(projection.context_values(), [0.0, 0.5, 700.0, 0.1, 0.99]);
+        assert_eq!(CameraSnapshot::default().raw_projection, None);
     }
 
     #[test]

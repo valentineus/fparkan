@@ -1364,6 +1364,13 @@ is only a table lookup keyed by two still-unnamed inputs. No virtual call was
 made by the probe. Therefore the block's values cannot yet be assigned as
 near/far or reused by the Vulkan adapter.
 
+The runtime render model now retains this evidence as `RawCameraProjection` on
+`CameraSnapshot`: the viewport rectangle, projection selector, exact FOV bits,
+and all five context words travel through the backend-neutral boundary without
+changing the current Vulkan projection. Its float accessors deliberately leave
+the context fields unnamed; preserving a raw ABI value is safer than encoding a
+near/far or clip-space convention before it is demonstrated.
+
 A fresh no-input launch of the canonical `iron_3d.exe` did create a responsive
 window titled `Parkan. Железная Стратегия`. A read-only probe then requested
 `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ` and attempted to read the known
