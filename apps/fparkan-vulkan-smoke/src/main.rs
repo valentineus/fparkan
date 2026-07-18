@@ -592,6 +592,7 @@ impl SmokeApp {
             mesh_name: self.options.mesh_input.name(),
             mesh_vertex_count: self.mesh.vertices.len(),
             mesh_index_count: self.mesh.indices.len(),
+            mesh_draw_count: self.mesh.draw_ranges.len(),
             texture_source: self
                 .options
                 .texture_input
@@ -823,6 +824,7 @@ fn render_timeout_failure_report(
         mesh_name: options.mesh_input.name(),
         mesh_vertex_count: 0,
         mesh_index_count: 0,
+        mesh_draw_count: 0,
         texture_source: options
             .texture_input
             .as_ref()
@@ -1065,6 +1067,7 @@ struct SmokeReport<'a> {
     mesh_name: &'a str,
     mesh_vertex_count: usize,
     mesh_index_count: usize,
+    mesh_draw_count: usize,
     texture_source: &'a str,
     texture_archive: &'a str,
     texture_name: &'a str,
@@ -1524,6 +1527,7 @@ mod tests {
             mesh_name: "MTCHECK.MSH",
             mesh_vertex_count: 128,
             mesh_index_count: 252,
+            mesh_draw_count: 1,
             texture_source: "original-texm",
             texture_archive: "Textures.lib",
             texture_name: "DEFAULT.0",
@@ -1554,6 +1558,7 @@ mod tests {
         assert!(json.contains("\"vulkan_device_name\": \"Windows test GPU\""));
         assert!(json.contains("\"runner_architecture\": \"x86_64\""));
         assert!(json.contains("\"mesh_source\": \"original-msh\""));
+        assert!(json.contains("\"mesh_draw_count\": 1"));
         assert!(json.contains("\"texture_source\": \"original-texm\""));
     }
 

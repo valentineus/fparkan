@@ -1,6 +1,6 @@
 //! Format-to-GPU geometry bridge for the initial static asset renderer.
 
-use crate::{VulkanStaticMesh, VulkanStaticVertex};
+use crate::{VulkanStaticDrawRange, VulkanStaticMesh, VulkanStaticVertex};
 use fparkan_msh::ModelAsset;
 
 /// Error returned when a validated MSH cannot enter the current static GPU path.
@@ -45,7 +45,10 @@ pub fn project_msh_to_static_mesh(
     model: &ModelAsset,
 ) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
     let mut indices = Vec::new();
+    let mut draw_ranges = Vec::with_capacity(model.batches.len());
     for batch in &model.batches {
+        let first_index =
+            u32::try_from(indices.len()).map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?;
         let start = usize::try_from(batch.index_start)
             .map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?;
         let end = start
@@ -62,6 +65,10 @@ pub fn project_msh_to_static_mesh(
                 .ok_or(VulkanAssetMeshError::IndexOutOfRange)?;
             indices.push(u16::try_from(index).map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?);
         }
+        draw_ranges.push(VulkanStaticDrawRange {
+            first_index,
+            index_count: u32::from(batch.index_count),
+        });
     }
     if indices.is_empty() {
         return Err(VulkanAssetMeshError::EmptyGeometry);
@@ -114,7 +121,11 @@ pub fn project_msh_to_static_mesh(
         })
         .collect();
 
-    Ok(VulkanStaticMesh { vertices, indices })
+    Ok(VulkanStaticMesh {
+        vertices,
+        indices,
+        draw_ranges,
+    })
 }
 
 #[cfg(test)]
@@ -165,6 +176,13 @@ mod tests {
         .expect("representable MSH");
 
         assert_eq!(mesh.indices, vec![1, 2, 3]);
+        assert_eq!(
+            mesh.draw_ranges,
+            vec![VulkanStaticDrawRange {
+                first_index: 0,
+                index_count: 3,
+            }]
+        );
         assert_eq!(mesh.vertices[1].position, [-0.8, -0.8]);
         assert_eq!(mesh.vertices[2].position, [0.8, -0.8]);
         assert_eq!(mesh.vertices[3].position, [-0.8, 0.8]);

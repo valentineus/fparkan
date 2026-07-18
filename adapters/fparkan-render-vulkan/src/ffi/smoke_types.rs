@@ -53,6 +53,17 @@ pub struct VulkanStaticMesh {
     pub vertices: Vec<VulkanStaticVertex>,
     /// Triangle-list indices into [`Self::vertices`].
     pub indices: Vec<u16>,
+    /// Source-preserving triangle draw ranges in [`Self::indices`].
+    pub draw_ranges: Vec<VulkanStaticDrawRange>,
+}
+
+/// One indexed triangle-list draw retained from an original mesh batch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VulkanStaticDrawRange {
+    /// First index in the shared index buffer.
+    pub first_index: u32,
+    /// Number of indices in this draw.
+    pub index_count: u32,
 }
 
 /// Decoded RGBA8 image accepted by the initial Vulkan texture upload path.
@@ -110,6 +121,10 @@ impl VulkanStaticMesh {
                 },
             ],
             indices: vec![0, 1, 2],
+            draw_ranges: vec![VulkanStaticDrawRange {
+                first_index: 0,
+                index_count: 3,
+            }],
         }
     }
 
@@ -119,6 +134,24 @@ impl VulkanStaticMesh {
         }
         if self.indices.is_empty() || !self.indices.len().is_multiple_of(3) {
             return Err("static mesh indices must contain complete triangles");
+        }
+        if self.draw_ranges.is_empty() {
+            return Err("static mesh has no draw ranges");
+        }
+        let mut expected_first = 0_u32;
+        for range in &self.draw_ranges {
+            if range.first_index != expected_first
+                || range.index_count == 0
+                || !range.index_count.is_multiple_of(3)
+            {
+                return Err("static mesh draw ranges must be contiguous complete triangles");
+            }
+            expected_first = expected_first
+                .checked_add(range.index_count)
+                .ok_or("static mesh draw range exceeds index count")?;
+        }
+        if usize::try_from(expected_first).ok() != Some(self.indices.len()) {
+            return Err("static mesh draw ranges must cover all indices");
         }
         if self
             .indices
@@ -148,14 +181,20 @@ mod static_mesh_tests {
         let no_vertices = VulkanStaticMesh {
             vertices: Vec::new(),
             indices: vec![0, 1, 2],
+            draw_ranges: VulkanStaticMesh::smoke_triangle().draw_ranges,
         };
         let incomplete_triangle = VulkanStaticMesh {
             vertices: VulkanStaticMesh::smoke_triangle().vertices,
             indices: vec![0, 1],
+            draw_ranges: vec![VulkanStaticDrawRange {
+                first_index: 0,
+                index_count: 2,
+            }],
         };
         let out_of_range_index = VulkanStaticMesh {
             vertices: VulkanStaticMesh::smoke_triangle().vertices,
             indices: vec![0, 1, 3],
+            draw_ranges: VulkanStaticMesh::smoke_triangle().draw_ranges,
         };
 
         assert_eq!(no_vertices.validate(), Err("static mesh has no vertices"));
@@ -383,7 +422,7 @@ pub struct VulkanSmokeRenderer {
     pub(super) vertex_buffer: Option<VulkanAllocatedBuffer>,
     pub(super) index_buffer: Option<VulkanAllocatedBuffer>,
     pub(super) texture: Option<VulkanAllocatedImage>,
-    pub(super) index_count: u32,
+    pub(super) draw_ranges: Vec<VulkanStaticDrawRange>,
     pub(super) frame_sync: Vec<VulkanFrameSync>,
     pub(super) images_in_flight: Vec<vk::Fence>,
     pub(super) current_frame: usize,

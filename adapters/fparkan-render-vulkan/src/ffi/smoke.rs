@@ -211,7 +211,7 @@ impl VulkanSmokeRenderer {
             vertex_buffer: Some(vertex_buffer),
             index_buffer: Some(index_buffer),
             texture,
-            index_count: u32::try_from(create_info.mesh.indices.len()).unwrap_or(u32::MAX),
+            draw_ranges: create_info.mesh.draw_ranges.clone(),
             frame_sync: Vec::new(),
             images_in_flight: Vec::new(),
             current_frame: 0,
@@ -640,9 +640,16 @@ impl VulkanSmokeRenderer {
                 0,
                 vk::IndexType::UINT16,
             );
-            device
-                .device()
-                .cmd_draw_indexed(command_buffer, self.index_count, 1, 0, 0, 0);
+            for range in &self.draw_ranges {
+                device.device().cmd_draw_indexed(
+                    command_buffer,
+                    range.index_count,
+                    1,
+                    range.first_index,
+                    0,
+                    0,
+                );
+            }
             device.device().cmd_end_render_pass(command_buffer);
         }
 
