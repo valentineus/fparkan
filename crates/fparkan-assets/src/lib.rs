@@ -3528,6 +3528,7 @@ mod tests {
             roots: vec![prototype.key.clone()],
             prototype_requests: vec![prototype.key.clone()],
             root_prototype_request_spans: std::iter::once(0..1).collect(),
+            root_unit_components: vec![Vec::new()],
             visual_dependencies_expanded: false,
             nodes: vec![root_node, prototype_node, mesh_node],
             edges: vec![

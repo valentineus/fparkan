@@ -276,6 +276,12 @@ component как ordered raw-string/resource provenance, но не для при
 этим строкам смысловых имён до трассировки private update methods. Extractor:
 `tools/ghidra/ExportAniMeshControlCaller.java`.
 
+Runtime сохраняет ordered raw Unit DAT records рядом с каждым mission object
+draft. Это создаёт проверяемую границу передачи данных от loader-а к будущему
+Control consumer-у: никакой компонент пока не получает имя `Control` только
+по `kind`, `parent_or_link` или description; semantic binding появится лишь
+после trace private update/load methods.
+
 ### Control system и physical model
 
 `LoadControlSystem` загружает настройки controller-а: ограничения скорости,

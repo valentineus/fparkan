@@ -128,6 +128,13 @@ pub struct PrototypeGraph {
     pub prototype_requests: Vec<PrototypeKey>,
     /// Mission object-local spans of effective prototype requests.
     pub root_prototype_request_spans: Vec<std::ops::Range<usize>>,
+    /// Ordered raw unit DAT component records for each mission root.
+    ///
+    /// This vector is aligned with [`Self::roots`]. Direct roots and legacy
+    /// unit bindings have an empty record list. Records are preserved without
+    /// assigning runtime semantics to their `kind`, links, descriptions, or
+    /// opaque tails.
+    pub root_unit_components: Vec<Vec<UnitComponentRecord>>,
     /// Whether visual dependency expansion has already been applied.
     pub visual_dependencies_expanded: bool,
     /// Materialized prototype dependency graph nodes.
@@ -637,6 +644,7 @@ fn resolve_direct_prototype(
 struct ResolvedPrototypeRequests {
     expected_count: usize,
     prototypes: Vec<EffectivePrototype>,
+    unit_components: Vec<UnitComponentRecord>,
 }
 
 fn resolve_prototype_requests(
@@ -652,6 +660,7 @@ fn resolve_prototype_requests(
     Ok(ResolvedPrototypeRequests {
         expected_count: 1,
         prototypes: prototype.into_iter().collect(),
+        unit_components: Vec::new(),
     })
 }
 
@@ -686,6 +695,7 @@ fn resolve_unit_dat_prototype_requests(
         return Ok(ResolvedPrototypeRequests {
             expected_count: unit.records.len(),
             prototypes,
+            unit_components: unit.records,
         });
     }
 
@@ -697,6 +707,7 @@ fn resolve_unit_dat_prototype_requests(
     Ok(ResolvedPrototypeRequests {
         expected_count: 1,
         prototypes: prototype.into_iter().collect(),
+        unit_components: Vec::new(),
     })
 }
 
@@ -741,6 +752,9 @@ pub fn build_prototype_graph(
         graph.roots.push(key);
         let start = graph.prototype_requests.len();
         let expansion = resolve_prototype_requests(repository, vfs, root)?;
+        graph
+            .root_unit_components
+            .push(expansion.unit_components.clone());
         let root_provenance = provenance_for_root(root_index, root);
         for prototype in expansion.prototypes {
             let prototype_node = PrototypeGraphNode::prototype(
@@ -841,6 +855,9 @@ pub fn build_prototype_graph_report(
         match resolve_prototype_requests(repository, vfs, root) {
             Ok(expansion) => {
                 let expected = expansion.expected_count;
+                graph
+                    .root_unit_components
+                    .push(expansion.unit_components.clone());
                 if edge == PrototypeGraphEdge::MissionToUnitDat {
                     report.unit_component_count += expected;
                 }
@@ -928,6 +945,9 @@ pub fn build_prototype_graph_report(
                     span: None,
                 }),
             }),
+        }
+        if graph.root_unit_components.len() <= root_index {
+            graph.root_unit_components.push(Vec::new());
         }
         let end = graph.prototype_requests.len();
         graph.root_prototype_request_spans.push(start..end);
@@ -1770,6 +1790,16 @@ mod tests {
         assert_eq!(graph.prototype_requests.len(), 2);
         assert_eq!(graph.prototype_requests[0].0 .0, b"component_a");
         assert_eq!(graph.prototype_requests[1].0 .0, b"component_b");
+        assert_eq!(graph.root_unit_components.len(), 1);
+        assert_eq!(graph.root_unit_components[0].len(), 2);
+        assert_eq!(
+            cstr_bytes(&graph.root_unit_components[0][0].resource_raw),
+            b"component_a"
+        );
+        assert_eq!(
+            cstr_bytes(&graph.root_unit_components[0][1].resource_raw),
+            b"component_b"
+        );
         assert_eq!(resolved.len(), 2);
         assert_eq!(report.unit_reference_count, 1);
         assert_eq!(report.unit_component_count, 2);

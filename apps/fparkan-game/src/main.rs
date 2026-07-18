@@ -1810,6 +1810,7 @@ mod tests {
             scale: [2.0, 3.0, 4.0],
             visual_ids: Vec::new(),
             properties: Vec::new(),
+            unit_components: Vec::new(),
         };
         assert_eq!(
             mission_position_scale_transform(&draft),
@@ -1850,6 +1851,7 @@ mod tests {
             scale: [1.0; 3],
             visual_ids: Vec::new(),
             properties: Vec::new(),
+            unit_components: Vec::new(),
         }];
 
         let commands = render_snapshot_commands_with_assets(&snapshot, None, Some(&drafts))?;
@@ -1887,6 +1889,7 @@ mod tests {
             scale: [1.0; 3],
             visual_ids: Vec::new(),
             properties: Vec::new(),
+            unit_components: Vec::new(),
         }];
 
         let commands = render_snapshot_commands_with_assets(&snapshot, None, Some(&drafts))?;

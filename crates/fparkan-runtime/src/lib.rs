@@ -31,6 +31,7 @@ use fparkan_assets::{
 use fparkan_path::{normalize_relative, NormalizedPath, PathError, PathPolicy};
 use fparkan_prototype::{
     build_prototype_graph_report, PrototypeGraph, PrototypeGraphFailure, PrototypeGraphReport,
+    UnitComponentRecord,
 };
 use fparkan_resource::{resource_name, CachedResourceRepository, ResourceRepository};
 use fparkan_terrain::SurfaceQuery;
@@ -229,6 +230,11 @@ pub struct MissionObjectDraft {
     pub visual_ids: Vec<AssetId<PreparedVisual>>,
     /// Ordered mission properties.
     pub properties: Vec<MissionObjectProperty>,
+    /// Ordered raw Unit DAT components that selected this mission root.
+    ///
+    /// The records preserve source provenance for future controller loading;
+    /// their fields intentionally have no inferred Control/physics semantics.
+    pub unit_components: Vec<UnitComponentRecord>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -912,6 +918,11 @@ fn load_mission_with_options_and_progress(
                     name_raw: property.name_raw.clone(),
                 })
                 .collect(),
+            unit_components: prototype_graph
+                .root_unit_components
+                .get(index)
+                .cloned()
+                .unwrap_or_default(),
         })
         .collect();
     let mut new_runtime_world = new_world(WorldConfig);
@@ -1608,6 +1619,7 @@ mod tests {
             .expect("load mission");
             let drafts = loaded_mission_object_drafts(&engine).expect("object drafts");
             let assets = loaded_mission_assets(&engine).expect("mission assets");
+            let graph = loaded_prototype_graph(&engine).expect("prototype graph");
 
             assert_eq!(drafts.len(), loaded.object_count);
             assert!(drafts.iter().any(|draft| !draft.visual_ids.is_empty()));
@@ -1617,6 +1629,7 @@ mod tests {
                     u32::try_from(index).ok().map(OriginalObjectId)
                 );
                 assert_eq!(draft.visual_ids, assets.visuals_for_object(index));
+                assert_eq!(draft.unit_components, graph.root_unit_components[index]);
                 assert!(draft.position.iter().all(|component| component.is_finite()));
                 assert!(draft
                     .orientation_raw
