@@ -453,6 +453,7 @@ dependencies = [
  "fparkan-runtime",
  "fparkan-vfs",
  "fparkan-world",
+ "winit",
 ]
 
 [[package]]

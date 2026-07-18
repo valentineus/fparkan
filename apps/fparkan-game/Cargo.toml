@@ -14,6 +14,7 @@ fparkan-render-vulkan = { path = "../../adapters/fparkan-render-vulkan", version
 fparkan-runtime = { path = "../../crates/fparkan-runtime", version = "0.1.0" }
 fparkan-vfs = { path = "../../crates/fparkan-vfs", version = "0.1.0" }
 fparkan-world = { path = "../../crates/fparkan-world", version = "0.1.0" }
+winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
 
 [lints]
 workspace = true

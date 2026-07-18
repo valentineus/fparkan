@@ -27,12 +27,12 @@ Open source проект с реализацией компонентов игр
 - [apps/fparkan-cli](apps/fparkan-cli) — CLI для архивов, графов и acceptance-отчетов.
 - [apps/fparkan-viewer](apps/fparkan-viewer) — inspection-only CLI для archive/model/texture/map без live Vulkan draw path.
 - [apps/fparkan-headless](apps/fparkan-headless) — headless runtime composition root.
-- [apps/fparkan-game](apps/fparkan-game) — render-planning composition root; сейчас выдает planning report, а не живой отрисованный кадр.
+- [apps/fparkan-game](apps/fparkan-game) — mission composition root: по умолчанию выдаёт planning report; opt-in `--backend static-vulkan` открывает native Vulkan окно для первой подготовленной MSH-модели миссии.
 
 ## Текущий статус рендера
 
 - `fparkan-vulkan-smoke` доказывает живой Stage 0 Vulkan triangle path с native window, swapchain и validation telemetry.
-- `VulkanPlanningBackend` и `fparkan-game` подтверждают только deterministic command planning/capture, а не draw пикселей.
+- `VulkanPlanningBackend` и default-режим `fparkan-game` подтверждают только deterministic command planning/capture, а не draw пикселей. Новый `fparkan-game --backend static-vulkan` — узкий mission-to-native-Vulkan bridge без подтверждённого полного corpus run, текстур, transforms или pixel parity.
 - `fparkan-viewer` пока является инспектором ассетов. `fparkan-vulkan-smoke` имеет live Stage 3 bridge для original `MSH`/`Texm`/`WEAR`/`MAT0` и geometry-only `Land.msh`; полноценный viewer, исходные terrain-material states, camera и pixel parity ещё не закрыты.
 - Truth table и evidence-артефакты вынесены в [`docs/rendering/renderer_truth_table.md`](docs/rendering/renderer_truth_table.md) и [`docs/evidence/`](docs/evidence).
 

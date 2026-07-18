@@ -934,6 +934,23 @@ visual component emitted for that object. The bridge deliberately leaves the
 value absent when no mission draft exists; it does not infer an original ID
 from a runtime slot or draw order.
 
+### Opt-in mission static-Vulkan bridge
+
+`fparkan-game --backend static-vulkan` is an explicit native-window experiment,
+not the default planning path. After mission loading it selects the first
+prepared MSH model, sends it through the existing static XZ clip-space
+projection and renders a requested number of frames through
+`VulkanSmokeRenderer`; teardown rejects validation warnings/errors and reports
+swapchain/readback telemetry. It deliberately supplies no material textures,
+so the renderer's documented white fallback is used.
+
+This is a narrow bootstrap from mission assets to a live Vulkan renderer. It
+does not render every placed object, apply TMA transforms or orientation, bind
+WEAR/MAT0/TEXM material data, or establish a game camera. A GOG
+`MISSIONS/Autodemo.00/data.tma` attempt exceeded the local 120-second runner
+limit before the window/report, so this mode has implementation and unit/lint
+evidence only, not a corpus GPU acceptance claim.
+
 `Land.msh` использует отдельный geometry-only bridge: validated `TerrainFace28`
 сохраняет source triangle order, а его positions и packed UV0 попадают в тот же
 static vertex/index upload path. Для текущего диагностического viewer XZ bounds

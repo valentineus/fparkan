@@ -23,13 +23,16 @@
 
 use fparkan_assets::PreparedVisual;
 use fparkan_platform::WindowPort;
-use fparkan_platform_winit::WinitWindow;
+use fparkan_platform_winit::{window_native_handles, WinitWindow, WinitWindowPlan};
 use fparkan_render::{
     build_commands, CameraSnapshot, DrawId, GpuMaterialId, GpuMeshId, IndexRange, RenderBackend,
     RenderCommand, RenderCommandList, RenderPhase, RenderProfile, RenderSnapshot,
     RenderSnapshotDraw,
 };
-use fparkan_render_vulkan::VulkanPlanningBackend;
+use fparkan_render_vulkan::{
+    project_msh_to_static_mesh, VulkanPlanningBackend, VulkanSmokeFrameOutcome,
+    VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo, VulkanStaticMesh,
+};
 use fparkan_runtime::{
     create, frame, load_mission, loaded_mission_assets, EngineConfig, EngineMode, EngineServices,
     MissionAssets, MissionObjectDraft, MissionRequest,
@@ -40,6 +43,11 @@ use fparkan_world::OriginalObjectId;
 use fparkan_world::WorldSnapshot;
 use std::path::PathBuf;
 use std::sync::Arc;
+use winit::application::ApplicationHandler;
+use winit::dpi::PhysicalSize as WinitPhysicalSize;
+use winit::event::WindowEvent;
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::window::{Window, WindowId};
 
 fn main() {
     let raw_args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -73,6 +81,17 @@ fn run(args: &[String]) -> Result<String, String> {
         },
     )
     .map_err(|err| err.to_string())?;
+
+    if args.backend == RenderBackendMode::StaticVulkan {
+        let mission_assets = loaded_mission_assets(&engine)
+            .ok_or_else(|| "mission assets are unavailable after loading".to_string())?;
+        let model = mission_assets.models.first().ok_or_else(|| {
+            "mission has no mesh-backed model for the static Vulkan bridge".to_string()
+        })?;
+        let mesh = project_msh_to_static_mesh(&model.validated)
+            .map_err(|err| format!("project mission MSH for Vulkan: {err}"))?;
+        return run_static_vulkan_mode(mesh, args.frames, &args.mission, loaded.object_count);
+    }
 
     let mut backend = VulkanPlanningBackend::new();
     let _request = WinitWindow::default_render_request();
@@ -114,6 +133,212 @@ fn run(args: &[String]) -> Result<String, String> {
         capture_report.execution.last_capture_size,
         json_hash(&last_hash)
     ))
+}
+
+fn run_static_vulkan_mode(
+    mesh: VulkanStaticMesh,
+    target_frames: u64,
+    mission: &str,
+    object_count: usize,
+) -> Result<String, String> {
+    let event_loop = EventLoop::new().map_err(|err| format!("winit event loop: {err}"))?;
+    event_loop.set_control_flow(ControlFlow::Poll);
+    let mut app = StaticVulkanApp::new(mesh, target_frames, mission, object_count);
+    if let Err(err) = event_loop.run_app(&mut app) {
+        app.error = Some(format!("winit event loop: {err}"));
+    }
+    app.finish()
+}
+
+struct StaticVulkanApp {
+    mesh: VulkanStaticMesh,
+    target_frames: u64,
+    mission: String,
+    object_count: usize,
+    window_id: Option<WindowId>,
+    window: Option<Window>,
+    renderer: Option<VulkanSmokeRenderer>,
+    frames_presented: u64,
+    output: Option<String>,
+    error: Option<String>,
+}
+
+impl StaticVulkanApp {
+    fn new(mesh: VulkanStaticMesh, target_frames: u64, mission: &str, object_count: usize) -> Self {
+        Self {
+            mesh,
+            target_frames,
+            mission: mission.to_string(),
+            object_count,
+            window_id: None,
+            window: None,
+            renderer: None,
+            frames_presented: 0,
+            output: None,
+            error: None,
+        }
+    }
+
+    fn schedule_next_redraw(&self) {
+        if let Some(window) = self.window.as_ref() {
+            window.request_redraw();
+        }
+    }
+
+    fn complete(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(renderer) = self.renderer.take() else {
+            self.error = Some("native Vulkan renderer was not initialized".to_string());
+            event_loop.exit();
+            return;
+        };
+        let report = match renderer.shutdown() {
+            Ok(report) => report,
+            Err(err) => {
+                self.error = Some(err.to_string());
+                event_loop.exit();
+                return;
+            }
+        };
+        self.window.take();
+        if report.validation.warning_count != 0 || report.validation.error_count != 0 {
+            self.error = Some(format!(
+                "native Vulkan validation must stay clean (warnings={}, errors={})",
+                report.validation.warning_count, report.validation.error_count
+            ));
+            event_loop.exit();
+            return;
+        }
+        self.output = Some(format!(
+            "{{\"report_kind\":\"rendered-static-mission\",\"backend\":\"vulkan-static\",\"window\":\"native\",\"mission\":{},\"objects\":{},\"frames\":{},\"swapchain\":[{},{}],\"swapchain_images\":{},\"validation_warnings\":{},\"validation_errors\":{},\"readback_bytes\":{},\"readback_hash\":{}}}",
+            json_string(&self.mission),
+            self.object_count,
+            self.frames_presented,
+            report.renderer_report.swapchain_extent.0,
+            report.renderer_report.swapchain_extent.1,
+            report.renderer_report.swapchain_image_count,
+            report.validation.warning_count,
+            report.validation.error_count,
+            report.renderer_report.readback_byte_count,
+            report.renderer_report.readback_fnv1a64,
+        ));
+        event_loop.exit();
+    }
+
+    fn finish(self) -> Result<String, String> {
+        self.output.ok_or_else(|| {
+            self.error.unwrap_or_else(|| {
+                "native Vulkan mode exited before producing a report".to_string()
+            })
+        })
+    }
+}
+
+impl ApplicationHandler for StaticVulkanApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+        let plan = match WinitWindowPlan::smoke().validate() {
+            Ok(plan) => plan,
+            Err(err) => {
+                self.error = Some(err.to_string());
+                event_loop.exit();
+                return;
+            }
+        };
+        let attributes = Window::default_attributes()
+            .with_title("FParkan static mission Vulkan")
+            .with_inner_size(WinitPhysicalSize::new(plan.width, plan.height));
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => window,
+            Err(err) => {
+                self.error = Some(format!("winit window: {err}"));
+                event_loop.exit();
+                return;
+            }
+        };
+        let Some(native_handles) = window_native_handles(&window) else {
+            self.error = Some("winit window does not expose native handles".to_string());
+            event_loop.exit();
+            return;
+        };
+        let size = window.inner_size();
+        let renderer = match VulkanSmokeRenderer::new(&VulkanSmokeRendererCreateInfo {
+            application_name: "fparkan-game".to_string(),
+            native_handles,
+            drawable_extent: (size.width.max(1), size.height.max(1)),
+            render_request: WinitWindow::default_render_request(),
+            enable_validation: true,
+            mesh: self.mesh.clone(),
+            materials: Vec::new(),
+            bootstrap_progress: None,
+        }) {
+            Ok(renderer) => renderer,
+            Err(err) => {
+                self.error = Some(err.to_string());
+                event_loop.exit();
+                return;
+            }
+        };
+        self.window_id = Some(window.id());
+        self.renderer = Some(renderer);
+        self.window = Some(window);
+        self.schedule_next_redraw();
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        if Some(window_id) != self.window_id {
+            return;
+        }
+        match event {
+            WindowEvent::CloseRequested => {
+                self.error = Some("native Vulkan window closed before completion".to_string());
+                event_loop.exit();
+            }
+            WindowEvent::Resized(size) => {
+                if let Some(renderer) = self.renderer.as_mut() {
+                    renderer.request_resize((size.width, size.height));
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                let Some(renderer) = self.renderer.as_mut() else {
+                    self.error = Some("native Vulkan renderer was not initialized".to_string());
+                    event_loop.exit();
+                    return;
+                };
+                match renderer.draw_frame() {
+                    Ok(VulkanSmokeFrameOutcome::Presented) => {
+                        self.frames_presented = self.frames_presented.saturating_add(1);
+                    }
+                    Ok(
+                        VulkanSmokeFrameOutcome::Recreated | VulkanSmokeFrameOutcome::ZeroExtent,
+                    ) => {}
+                    Err(err) => {
+                        self.error = Some(err.to_string());
+                        event_loop.exit();
+                        return;
+                    }
+                }
+                if self.frames_presented >= self.target_frames {
+                    self.complete(event_loop);
+                } else {
+                    self.schedule_next_redraw();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if self.output.is_none() && self.error.is_none() {
+            self.schedule_next_redraw();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -229,6 +454,13 @@ struct Args {
     root: PathBuf,
     mission: String,
     frames: u64,
+    backend: RenderBackendMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenderBackendMode {
+    Planning,
+    StaticVulkan,
 }
 
 impl Args {
@@ -236,6 +468,7 @@ impl Args {
         let mut root = None;
         let mut mission = None;
         let mut frames = 1;
+        let mut backend = RenderBackendMode::Planning;
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -260,6 +493,17 @@ impl Args {
                         .parse()
                         .map_err(|_| "--frames must be an integer".to_string())?;
                 }
+                "--backend" => {
+                    backend = match iter
+                        .next()
+                        .ok_or_else(|| "--backend requires a value".to_string())?
+                        .as_str()
+                    {
+                        "planning" => RenderBackendMode::Planning,
+                        "static-vulkan" => RenderBackendMode::StaticVulkan,
+                        _ => return Err("--backend must be planning or static-vulkan".to_string()),
+                    };
+                }
                 _ => return Err(usage()),
             }
         }
@@ -272,6 +516,7 @@ impl Args {
             root,
             mission,
             frames,
+            backend,
         })
     }
 }
@@ -308,7 +553,7 @@ fn json_hash(hash: &[u8; 32]) -> String {
 }
 
 fn usage() -> String {
-    "usage: fparkan-game --root <path> --mission <path> [--frames <n>]".to_string()
+    "usage: fparkan-game --root <path> --mission <path> [--frames <n>] [--backend <planning|static-vulkan>]".to_string()
 }
 
 #[cfg(test)]
@@ -337,6 +582,27 @@ mod tests {
                 root: PathBuf::from("testdata/IS"),
                 mission: "MISSIONS/Autodemo.00/data.tma".to_string(),
                 frames: 3,
+                backend: RenderBackendMode::Planning,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_static_vulkan_backend() {
+        assert_eq!(
+            Args::parse(&strings(&[
+                "--root",
+                "testdata/IS",
+                "--mission",
+                "MISSIONS/Autodemo.00/data.tma",
+                "--backend",
+                "static-vulkan",
+            ])),
+            Ok(Args {
+                root: PathBuf::from("testdata/IS"),
+                mission: "MISSIONS/Autodemo.00/data.tma".to_string(),
+                frames: 1,
+                backend: RenderBackendMode::StaticVulkan,
             })
         );
     }
