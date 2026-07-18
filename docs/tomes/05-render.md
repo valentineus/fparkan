@@ -972,11 +972,12 @@ of the first-root static-preview bridge, not a claim that the two games' full
 mission renderers are compatible.
 
 The preview now has an explicit root-prefix contract. `--preview-roots N`
-prepares the first non-zero `N` TMA roots for the opt-in static Vulkan path;
-the default remains one root. Normal mission loading remains full and
-transactional, so this is not a hidden relaxation of gameplay validation. The
-previous all-root probe timed out at `Graph`; the prefix makes broader scene
-work measurable without pretending that a bounded preview is the full game.
+prepares the first non-zero `N` TMA roots for the opt-in static Vulkan path.
+Without that diagnostic limiter, the static Vulkan path now requests every TMA
+root (the runtime clamps the request to the decoded mission length), so a
+normal native preview no longer silently displays just root zero. Normal mission
+loading remains full and transactional; the prefix is retained for bounded
+investigation rather than as a hidden relaxation of gameplay validation.
 
 ### Shared terrain/root diagnostic frame
 

@@ -1012,7 +1012,11 @@ impl Args {
         let mut frames = 1;
         let mut backend = RenderBackendMode::Planning;
         let mut load_progress = None;
-        let mut preview_roots = NonZeroUsize::MIN;
+        // A native static-Vulkan invocation is the usable mission preview, so
+        // its default scope covers every root. `PreviewRoots` is clamped by the
+        // runtime to the decoded mission length; an explicit --preview-roots N
+        // remains available for bounded diagnostic work.
+        let mut preview_roots = NonZeroUsize::MAX;
         let mut legacy_camera_capture = None;
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
@@ -1224,7 +1228,7 @@ mod tests {
                 frames: 3,
                 backend: RenderBackendMode::Planning,
                 load_progress: None,
-                preview_roots: NonZeroUsize::MIN,
+                preview_roots: NonZeroUsize::MAX,
                 legacy_camera_capture: None,
             })
         );
@@ -1247,7 +1251,7 @@ mod tests {
                 frames: 1,
                 backend: RenderBackendMode::StaticVulkan,
                 load_progress: None,
-                preview_roots: NonZeroUsize::MIN,
+                preview_roots: NonZeroUsize::MAX,
                 legacy_camera_capture: None,
             })
         );
@@ -1305,7 +1309,7 @@ mod tests {
                 frames: 1,
                 backend: RenderBackendMode::Planning,
                 load_progress: Some(PathBuf::from("target/probe.txt")),
-                preview_roots: NonZeroUsize::MIN,
+                preview_roots: NonZeroUsize::MAX,
                 legacy_camera_capture: None,
             })
         );
