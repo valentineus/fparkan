@@ -265,6 +265,17 @@ AniMesh/unit components, а не с одной глобальной настро
 private objects и per-tick update slots пока не восстановлены; порядок
 создания не доказывает скорость, collision algorithm или AI semantics.
 
+Headless Ghidra call-site decompile уточняет configuration provenance:
+AniMesh передаёт в `LoadControlSystem` шесть 32-byte strings из одного
+configuration block по offsets `+0x80`, `+0xa0`, `+0xc0`, `+0xe0`, `+0x100` и
+`+0x120`, затем resource context и mode из owner `+0x6d8`. Returned Control
+interface сразу получает пять virtual calls, связывающих его с owner slots
+`+0x158`, `+0x160`, `+0x164`, `+0x168` и `+0x18c`; collision object затем
+связывается с `+0x170`. Это достаточное основание хранить будущий Control
+component как ordered raw-string/resource provenance, но не для присвоения
+этим строкам смысловых имён до трассировки private update methods. Extractor:
+`tools/ghidra/ExportAniMeshControlCaller.java`.
+
 ### Control system и physical model
 
 `LoadControlSystem` загружает настройки controller-а: ограничения скорости,
