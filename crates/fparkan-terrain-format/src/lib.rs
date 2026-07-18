@@ -62,6 +62,18 @@ pub struct CompactSurfaceMask(pub u16);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaterialClassMask(pub u8);
 
+/// The two positional material-table selectors packed into a terrain face tag.
+///
+/// The high byte selects from map-local `Land1.wea`; `0xff` is the observed
+/// no-selection sentinel. The low byte selects from `Land2.wea`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerrainMaterialLayers {
+    /// Optional high-byte selector for `Land1.wea`.
+    pub land1_selector: Option<u8>,
+    /// Low-byte selector for `Land2.wea`.
+    pub land2_selector: u8,
+}
+
 /// Terrain face with 28-byte source layout.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TerrainFace28 {
@@ -79,6 +91,18 @@ pub struct TerrainFace28 {
     pub tail_raw: [u8; 8],
     /// Preserved raw bytes.
     pub raw: [u8; 28],
+}
+
+impl TerrainFace28 {
+    /// Decodes the proven two-table selector layout of [`Self::material_tag`].
+    #[must_use]
+    pub const fn material_layers(&self) -> TerrainMaterialLayers {
+        let [land2_selector, land1] = self.material_tag.to_le_bytes();
+        TerrainMaterialLayers {
+            land1_selector: if land1 == u8::MAX { None } else { Some(land1) },
+            land2_selector,
+        }
+    }
 }
 
 /// Terrain stream descriptor.
@@ -131,7 +155,10 @@ pub struct LandMeshDocument {
     pub accelerator: Vec<[u8; 4]>,
     /// Type 14 auxiliary words.
     pub aux14: Vec<[u8; 4]>,
-    /// Type 18 auxiliary words.
+    /// Type 18 microtexture mapping words.
+    ///
+    /// `Terrain.dll!CLandscape` requires this stream and retains it as a
+    /// four-byte-per-entry mapping chunk.
     pub aux18: Vec<[u8; 4]>,
     /// Faces.
     pub faces: Vec<TerrainFace28>,
@@ -1383,6 +1410,33 @@ mod tests {
         assert_eq!(
             full_to_material_class(FullSurfaceMask(0x0000_8000 | 0x0000_0080)),
             MaterialClassMask(0x22)
+        );
+    }
+
+    #[test]
+    fn terrain_material_tag_decodes_two_sidecar_selectors() {
+        let mut raw_face = face([0, 1, 2], [None, None, None]);
+        raw_face[4..6].copy_from_slice(&0x0102_u16.to_le_bytes());
+        let nres = decode_nres(&minimal_land_msh(&raw_face)).expect("nres");
+        let document = decode_land_msh(&nres).expect("land mesh");
+
+        assert_eq!(
+            document.faces[0].material_layers(),
+            TerrainMaterialLayers {
+                land1_selector: Some(1),
+                land2_selector: 2,
+            }
+        );
+
+        raw_face[4..6].copy_from_slice(&0xff03_u16.to_le_bytes());
+        let nres = decode_nres(&minimal_land_msh(&raw_face)).expect("nres");
+        let document = decode_land_msh(&nres).expect("land mesh");
+        assert_eq!(
+            document.faces[0].material_layers(),
+            TerrainMaterialLayers {
+                land1_selector: None,
+                land2_selector: 3,
+            }
         );
     }
 

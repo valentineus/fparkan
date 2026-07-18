@@ -1550,6 +1550,17 @@ This is evidence for a two-layer terrain-material contract, but not yet for
 its blend equation, so the Vulkan bridge intentionally remains texture-agnostic
 until the base/overlay composition is recovered.
 
+Static recovery of `Terrain.dll!CLandscape` now fixes the loader contract behind
+that observation. The constructor opens `Land.msh`, creates one material manager
+from `Land1.wea`, then invokes that manager's second-table load with `Land2.wea`.
+It requires NRes type 18 with the original diagnostic “microtexture mapping
+chunk” and retains it as four-byte entries; type 14 is optional. Therefore the
+two WEAR selectors must not be collapsed into an invented one-layer material,
+and the type-18 `aux18` stream is now documented as microtexture mapping data.
+`TerrainFace28::material_layers` exposes the evidenced high-byte `Land1`
+selector (with `0xff` absent sentinel) and low-byte `Land2` selector. The
+manager's actual blend/pass operation remains unrecovered.
+
 The static Vulkan bridge now carries each contiguous face run as a separate
 draw range keyed by the original packed `material_tag`; it neither reorders
 triangles nor collapses the high byte. For the first usable visual layer, the
