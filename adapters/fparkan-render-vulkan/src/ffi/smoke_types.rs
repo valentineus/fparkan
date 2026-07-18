@@ -1,5 +1,6 @@
 use ash::vk;
 use fparkan_platform::{NativeWindowHandles, RenderRequest};
+use fparkan_render::{LegacyPipelineState, PipelineKey};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -70,6 +71,16 @@ pub struct VulkanStaticDrawRange {
     pub index_count: u32,
     /// Original positional `Batch20.material_index` selector.
     pub material_index: u16,
+    /// Backend-neutral fixed-function state for this source range.
+    pub pipeline_state: LegacyPipelineState,
+}
+
+impl VulkanStaticDrawRange {
+    /// Returns the canonical key used for Vulkan pipeline selection.
+    #[must_use]
+    pub fn pipeline_key(self) -> PipelineKey {
+        self.pipeline_state.into()
+    }
 }
 
 /// One diffuse material texture keyed by an original MSH batch selector.
@@ -173,6 +184,7 @@ impl VulkanStaticMesh {
                 first_index: 0,
                 index_count: 3,
                 material_index: 0,
+                pipeline_state: LegacyPipelineState::default(),
             }],
         }
     }
@@ -239,6 +251,7 @@ mod static_mesh_tests {
                 first_index: 0,
                 index_count: 2,
                 material_index: 0,
+                pipeline_state: LegacyPipelineState::default(),
             }],
         };
         let out_of_range_index = VulkanStaticMesh {
@@ -265,11 +278,13 @@ mod static_mesh_tests {
                 first_index: 0,
                 index_count: 3,
                 material_index: 7,
+                pipeline_state: LegacyPipelineState::default(),
             },
             VulkanStaticDrawRange {
                 first_index: 3,
                 index_count: 3,
                 material_index: 2,
+                pipeline_state: LegacyPipelineState::default(),
             },
         ];
         let texture = || VulkanStaticTexture {
@@ -292,6 +307,21 @@ mod static_mesh_tests {
             resolve_draw_texture_indices(&ranges, &materials),
             Ok(vec![1, 0])
         );
+    }
+
+    #[test]
+    fn draw_range_pipeline_key_follows_backend_neutral_state() {
+        let base = VulkanStaticMesh::smoke_triangle().draw_ranges[0];
+        let blended = VulkanStaticDrawRange {
+            pipeline_state: LegacyPipelineState {
+                blend: fparkan_render::LegacyBlendMode::SourceAlpha,
+                ..LegacyPipelineState::default()
+            },
+            ..base
+        };
+
+        assert_eq!(base.pipeline_key().packed(), 0);
+        assert_ne!(base.pipeline_key(), blended.pipeline_key());
     }
 }
 

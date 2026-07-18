@@ -838,14 +838,20 @@ draw_indexed(item.batch.base_vertex,
 от версии Rust или процесса. Alpha reference намеренно не входит в key: это
 dynamic material constant, а не структурный вариант graphics pipeline.
 
-Пока текущий статический Vulkan viewer создаёт только базовое состояние
-`opaque + depth disabled + cull disabled + alpha-test disabled`; ключ уже
-передаётся через render command и canonical capture, но Vulkan pipeline cache
-ещё не выбирает variants по нему. Также не установлен источник значений для
-Batch20/MAT0: их поля нельзя объявлять blend/depth/cull mapping без dynamic
-capture или дополнительного дизассемблирования. Поэтому этот контракт —
-подготовленная граница совместимости, а не заявление о готовой parity
-fixed-function state.
+Текущий static Vulkan viewer дедуплицирует состояния ranges при каждой сборке
+swapchain resources, создаёт один `vk::Pipeline` на уникальный `PipelineKey` и
+выбирает его непосредственно перед соответствующим `vkCmdDrawIndexed`.
+Кэш корректно уничтожается при recreate/teardown; setup failure откатывает уже
+созданные variants. Baseline оригинального MSH подтверждён с состоянием
+`opaque + depth disabled + cull disabled + alpha-test disabled`.
+
+`SourceAlpha` и front/back culling имеют Vulkan mapping в этом кэше. Запрос
+depth или alpha-test сейчас завершается явной ошибкой: renderer ещё не имеет
+depth attachment либо alpha-test shader variant, поэтому он не должен молча
+подменять state. Также не установлен источник значений для Batch20/MAT0: их
+поля нельзя объявлять blend/depth/cull mapping без dynamic capture или
+дополнительного дизассемблирования. Это частично реализованная compatibility
+boundary, а не заявление о готовой parity fixed-function state.
 
 После последнего world pass renderer закрывает сцену и выводит back buffer.
 World3D снимает `in_render`, восстанавливает временный viewport state и вызывает

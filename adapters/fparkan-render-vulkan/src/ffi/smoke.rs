@@ -560,6 +560,7 @@ impl VulkanSmokeRenderer {
                 self.vertex_buffer_ref()?,
                 self.index_buffer_ref()?,
                 self.textures_ref()?,
+                &self.draw_ranges,
                 reuse_command_pool,
             )?,
             |resources| destroy_swapchain_resources(device, self.command_pool, resources),
@@ -631,11 +632,6 @@ impl VulkanSmokeRenderer {
                 &render_pass_info,
                 vk::SubpassContents::INLINE,
             );
-            device.device().cmd_bind_pipeline(
-                command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                resources.pipeline,
-            );
             let vertex_buffers = [self.vertex_buffer_ref()?.buffer];
             let offsets = [0_u64];
             device
@@ -648,6 +644,16 @@ impl VulkanSmokeRenderer {
                 vk::IndexType::UINT16,
             );
             for (range, &texture_index) in self.draw_ranges.iter().zip(&self.draw_texture_indices) {
+                let pipeline = resources.pipelines.get(&range.pipeline_key()).ok_or(
+                    VulkanSmokeRendererError::InvariantViolation {
+                        context: "static draw pipeline variant",
+                    },
+                )?;
+                device.device().cmd_bind_pipeline(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    *pipeline,
+                );
                 let descriptor_set = resources.descriptor_sets.get(texture_index).ok_or(
                     VulkanSmokeRendererError::InvariantViolation {
                         context: "static material descriptor set",

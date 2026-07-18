@@ -2,6 +2,7 @@
 
 use crate::{VulkanStaticDrawRange, VulkanStaticMesh, VulkanStaticVertex};
 use fparkan_msh::ModelAsset;
+use fparkan_render::LegacyPipelineState;
 
 /// Error returned when a validated MSH cannot enter the current static GPU path.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,6 +70,7 @@ pub fn project_msh_to_static_mesh(
             first_index,
             index_count: u32::from(batch.index_count),
             material_index: batch.material_index,
+            pipeline_state: LegacyPipelineState::default(),
         });
     }
     if indices.is_empty() {
@@ -183,6 +185,7 @@ mod tests {
                 first_index: 0,
                 index_count: 3,
                 material_index: 0,
+                pipeline_state: LegacyPipelineState::default(),
             }]
         );
         assert_eq!(mesh.vertices[1].position, [-0.8, -0.8]);
@@ -229,11 +232,13 @@ mod tests {
                     first_index: 0,
                     index_count: 3,
                     material_index: 0,
+                    pipeline_state: LegacyPipelineState::default(),
                 },
                 VulkanStaticDrawRange {
                     first_index: 3,
                     index_count: 3,
                     material_index: 7,
+                    pipeline_state: LegacyPipelineState::default(),
                 },
             ]
         );

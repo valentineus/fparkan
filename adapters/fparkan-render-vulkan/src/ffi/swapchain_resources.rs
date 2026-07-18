@@ -1,6 +1,10 @@
 #![allow(unsafe_code)]
 
 use ash::vk;
+use fparkan_render::{
+    LegacyBlendMode, LegacyCullMode, LegacyDepthMode, LegacyPipelineState, PipelineKey,
+};
+use std::collections::BTreeMap;
 
 use super::{
     color_subresource_range, VulkanAllocatedBuffer, VulkanAllocatedImage, VulkanLogicalDeviceProbe,
@@ -16,7 +20,8 @@ pub(super) struct VulkanSwapchainResources {
     pub(super) descriptor_pool: vk::DescriptorPool,
     pub(super) descriptor_sets: Vec<vk::DescriptorSet>,
     pub(super) sampler: vk::Sampler,
-    pub(super) pipeline: vk::Pipeline,
+    /// Live graphics pipelines indexed by canonical backend-neutral state.
+    pub(super) pipelines: BTreeMap<PipelineKey, vk::Pipeline>,
     pub(super) framebuffers: Vec<vk::Framebuffer>,
     pub(super) command_buffers: Vec<vk::CommandBuffer>,
 }
@@ -28,11 +33,12 @@ struct PartialSwapchainResources {
     descriptor_set_layout: Option<vk::DescriptorSetLayout>,
     descriptor_pool: Option<vk::DescriptorPool>,
     sampler: Option<vk::Sampler>,
-    pipeline: Option<vk::Pipeline>,
+    pipelines: BTreeMap<PipelineKey, vk::Pipeline>,
     framebuffers: Vec<vk::Framebuffer>,
     command_buffers: Vec<vk::CommandBuffer>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn create_swapchain_resources(
     device: &VulkanLogicalDeviceProbe,
     swapchain: &VulkanSwapchainProbe,
@@ -40,6 +46,7 @@ pub(super) fn create_swapchain_resources(
     vertex_buffer: &VulkanAllocatedBuffer,
     index_buffer: &VulkanAllocatedBuffer,
     textures: &[VulkanAllocatedImage],
+    draw_ranges: &[super::VulkanStaticDrawRange],
     reuse_command_pool: bool,
 ) -> Result<VulkanSwapchainResources, VulkanSmokeRendererError> {
     // SAFETY: The swapchain is live and owned by this renderer for the duration of the query.
@@ -63,14 +70,14 @@ pub(super) fn create_swapchain_resources(
         descriptor_set_layout: None,
         descriptor_pool: None,
         sampler: None,
-        pipeline: None,
+        pipelines: BTreeMap::new(),
         framebuffers: Vec::new(),
         command_buffers: Vec::new(),
     };
     let (
         render_pass,
         pipeline_layout,
-        pipeline,
+        pipelines,
         descriptor_set_layout,
         descriptor_pool,
         descriptor_sets,
@@ -80,6 +87,7 @@ pub(super) fn create_swapchain_resources(
         swapchain.report.plan.format.format,
         swapchain.report.plan.extent,
         textures,
+        draw_ranges,
     ) {
         Ok(bundle) => bundle,
         Err(error) => {
@@ -92,7 +100,7 @@ pub(super) fn create_swapchain_resources(
     partial.descriptor_set_layout = Some(descriptor_set_layout);
     partial.descriptor_pool = Some(descriptor_pool);
     partial.sampler = Some(sampler);
-    partial.pipeline = Some(pipeline);
+    partial.pipelines = pipelines;
     let framebuffers = match create_swapchain_framebuffers(
         device,
         render_pass,
@@ -128,7 +136,7 @@ pub(super) fn create_swapchain_resources(
         descriptor_pool,
         descriptor_sets,
         sampler,
-        pipeline,
+        pipelines: partial.pipelines,
         framebuffers: partial.framebuffers,
         command_buffers: partial.command_buffers,
     })
@@ -152,11 +160,12 @@ fn create_swapchain_pipeline_bundle(
     format: i32,
     extent: (u32, u32),
     textures: &[VulkanAllocatedImage],
+    draw_ranges: &[super::VulkanStaticDrawRange],
 ) -> Result<
     (
         vk::RenderPass,
         vk::PipelineLayout,
-        vk::Pipeline,
+        BTreeMap<PipelineKey, vk::Pipeline>,
         vk::DescriptorSetLayout,
         vk::DescriptorPool,
         Vec<vk::DescriptorSet>,
@@ -184,8 +193,9 @@ fn create_swapchain_pipeline_bundle(
                 device.device().destroy_render_pass(render_pass, None);
             }
         })?;
-    let pipeline = create_graphics_pipeline(device, render_pass, pipeline_layout, extent)
-        .inspect_err(|_| {
+    let pipelines =
+        create_graphics_pipeline_cache(device, render_pass, pipeline_layout, extent, draw_ranges)
+            .inspect_err(|_| {
             // SAFETY: These objects were created above on this live logical device and are destroyed on setup failure.
             unsafe {
                 device
@@ -204,7 +214,7 @@ fn create_swapchain_pipeline_bundle(
     Ok((
         render_pass,
         pipeline_layout,
-        pipeline,
+        pipelines,
         descriptor_set_layout,
         descriptor_pool,
         descriptor_sets,
@@ -458,12 +468,61 @@ fn extent_component_to_f32(value: u32) -> f32 {
 }
 
 #[allow(clippy::too_many_lines)]
+fn create_graphics_pipeline_cache(
+    device: &VulkanLogicalDeviceProbe,
+    render_pass: vk::RenderPass,
+    pipeline_layout: vk::PipelineLayout,
+    extent: (u32, u32),
+    draw_ranges: &[super::VulkanStaticDrawRange],
+) -> Result<BTreeMap<PipelineKey, vk::Pipeline>, VulkanSmokeRendererError> {
+    let mut pipelines = BTreeMap::new();
+    for range in draw_ranges {
+        let key = range.pipeline_key();
+        if pipelines.contains_key(&key) {
+            continue;
+        }
+        let pipeline = match create_graphics_pipeline(
+            device,
+            render_pass,
+            pipeline_layout,
+            extent,
+            range.pipeline_state,
+        ) {
+            Ok(pipeline) => pipeline,
+            Err(error) => {
+                // SAFETY: All previously created pipelines belong to this live device and are rolled back with their bundle.
+                unsafe {
+                    for pipeline in pipelines.into_values() {
+                        device.device().destroy_pipeline(pipeline, None);
+                    }
+                }
+                return Err(error);
+            }
+        };
+        pipelines.insert(key, pipeline);
+    }
+    Ok(pipelines)
+}
+
+#[allow(clippy::too_many_lines)]
 fn create_graphics_pipeline(
     device: &VulkanLogicalDeviceProbe,
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
     extent: (u32, u32),
+    state: LegacyPipelineState,
 ) -> Result<vk::Pipeline, VulkanSmokeRendererError> {
+    if state.depth != LegacyDepthMode::Disabled {
+        return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+            context: "static renderer has no depth attachment for requested pipeline state",
+        });
+    }
+    if state.alpha_test {
+        return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+            context:
+                "static renderer has no alpha-test shader variant for requested pipeline state",
+        });
+    }
     let vertex_shader = create_shader_module(device, TRIANGLE_VERTEX_SHADER_WORDS)?;
     let fragment_shader = match create_shader_module(device, TRIANGLE_FRAGMENT_SHADER_WORDS) {
         Ok(module) => module,
@@ -535,9 +594,11 @@ fn create_graphics_pipeline(
         .rasterizer_discard_enable(false)
         .polygon_mode(vk::PolygonMode::FILL)
         .line_width(1.0)
-        // Static MSH viewer mode has no original material/cull state yet; draw
-        // both windings so every source batch is visible during the bridge.
-        .cull_mode(vk::CullModeFlags::NONE)
+        .cull_mode(match state.cull {
+            LegacyCullMode::Disabled => vk::CullModeFlags::NONE,
+            LegacyCullMode::BackFace => vk::CullModeFlags::BACK,
+            LegacyCullMode::FrontFace => vk::CullModeFlags::FRONT,
+        })
         .front_face(vk::FrontFace::CLOCKWISE)
         .depth_bias_enable(false);
     let multisample_state = vk::PipelineMultisampleStateCreateInfo::default()
@@ -550,7 +611,13 @@ fn create_graphics_pipeline(
                 | vk::ColorComponentFlags::B
                 | vk::ColorComponentFlags::A,
         )
-        .blend_enable(false);
+        .blend_enable(state.blend == LegacyBlendMode::SourceAlpha)
+        .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .color_blend_op(vk::BlendOp::ADD)
+        .src_alpha_blend_factor(vk::BlendFactor::ONE)
+        .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .alpha_blend_op(vk::BlendOp::ADD);
     let color_blend_attachments = [color_blend_attachment];
     let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
         .logic_op_enable(false)
@@ -655,7 +722,9 @@ pub(super) fn destroy_swapchain_resources(
         for framebuffer in resources.framebuffers {
             device.device().destroy_framebuffer(framebuffer, None);
         }
-        device.device().destroy_pipeline(resources.pipeline, None);
+        for pipeline in resources.pipelines.into_values() {
+            device.device().destroy_pipeline(pipeline, None);
+        }
         device
             .device()
             .destroy_pipeline_layout(resources.pipeline_layout, None);
@@ -690,7 +759,7 @@ fn destroy_partial_swapchain_resources(
         for framebuffer in partial.framebuffers {
             device.device().destroy_framebuffer(framebuffer, None);
         }
-        if let Some(pipeline) = partial.pipeline {
+        for pipeline in partial.pipelines.into_values() {
             device.device().destroy_pipeline(pipeline, None);
         }
         if let Some(pipeline_layout) = partial.pipeline_layout {
