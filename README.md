@@ -90,21 +90,10 @@ cargo run -p fparkan-vulkan-smoke --locked -- \
   --timeout-seconds 120
 ```
 
-Перед запуском убедитесь, что на машине доступен Vulkan loader и рабочий ICD:
-
-- macOS: используйте ту же схему, что и GitHub CI (`macos-15` arm64):
-
-  ```bash
-  brew install molten-vk vulkan-loader vulkan-tools vulkan-validationlayers
-  export VK_ICD_FILENAMES="$(brew --prefix)/opt/molten-vk/etc/vulkan/icd.d/MoltenVK_icd.json"
-  export VK_LAYER_PATH="$(brew --prefix)/opt/vulkan-validationlayers/share/vulkan/explicit_layer.d"
-  export DYLD_FALLBACK_LIBRARY_PATH="$(brew --prefix)/opt/vulkan-loader/lib:$(brew --prefix)/opt/molten-vk/lib"
-  vulkaninfo --summary
-  ```
-
-  Workflow fail-closed проверяет exact formula versions и ожидает наличие `VK_LAYER_KHRONOS_validation`.
-- Linux: установлен `libvulkan` и драйвер/ICD (`mesa-vulkan-drivers`, Lavapipe или vendor GPU stack); smoke нужно запускать из активной графической сессии X11/Wayland.
-- Windows: установлен Vulkan runtime от GPU vendor или LunarG Vulkan SDK; validation layer должен быть доступен из активного runtime.
+Поддерживается только Windows. Перед запуском убедитесь, что установлен Vulkan runtime
+от GPU vendor или LunarG Vulkan SDK и активный runtime предоставляет
+`VK_LAYER_KHRONOS_validation`. Linux, macOS/MoltenVK и их smoke-пути не входят в
+проектный scope.
 
 Для полного локального closure gate используйте:
 
@@ -112,11 +101,8 @@ cargo run -p fparkan-vulkan-smoke --locked -- \
 cargo xtask ci
 ```
 
-В текущем macOS-only цикле GitHub workflow собирает только macOS report и проверяет его через `native-smoke audit`. Windows и Linux smoke stages сознательно не входят в этот closure:
-
-```bash
-cargo xtask native-smoke audit --dir target/fparkan/native-smoke-artifacts
-```
+Windows native smoke — единственный platform acceptance path. Вопросы hosted CI
+и других операционных систем намеренно находятся вне scope разработки.
 
 ## Contributing & Support
 
