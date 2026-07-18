@@ -997,6 +997,20 @@ handedness, or initial mission camera selection. The Vulkan path must therefore
 continue to label its XZ projection as diagnostic until a dynamic capture or
 further Terrain disassembly proves these contracts.
 
+The public `World3D.dll!stdSetCurrentCamera` is a one-pointer `__stdcall`
+wrapper: it delegates to the Terrain `stdSetCurrentCamera2` IAT thunk and then
+writes the same pointer to a World3D mirror global. An `iron3d.dll` call site
+at RVA `0x4FB95` loads the argument from an active game-state chain
+`[esi + 0xBC90] + 0x94` before calling that wrapper. This proves that the
+selected camera is an object reference supplied by game state, not a scalar
+mission-coordinate field. The caller's enclosing type and the meaning of
+offsets remain unnamed until a class layout is recovered.
+
+Terrain strings also identify `CBufferingCamera`, `ICamera::SetTransformMatrix`
+and `ICamera::GetTransformMatrix`, plus frustum/clip methods. These names prove
+that a transform-matrix interface exists, but give neither method slots nor a
+matrix convention; they must not be treated as a usable renderer ABI yet.
+
 `Land.msh` использует отдельный geometry-only bridge: validated `TerrainFace28`
 сохраняет source triangle order, а его positions и packed UV0 попадают в тот же
 static vertex/index upload path. Для текущего диагностического viewer XZ bounds
