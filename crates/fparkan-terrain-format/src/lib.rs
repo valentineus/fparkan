@@ -183,6 +183,33 @@ pub struct TerrainSlotTable {
     pub slots_raw: Vec<[u8; SLOT_STRIDE]>,
 }
 
+/// The proven front fields of one 68-byte terrain slot record.
+///
+/// `Terrain.dll!CLandscape` supplies these fields to `GetShade`'s terrain
+/// batch dispatcher: `pair_table_index` selects the pointer-table entry and
+/// `pair_count` is the number of adjacent `u16` pairs to process. The pair
+/// payload and the later material/blend interpretation remain external to the
+/// disk record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerrainSlotRenderDispatch {
+    /// Index into the runtime pair-pointer table.
+    pub pair_table_index: u16,
+    /// Number of adjacent `u16` pairs in that selected payload.
+    pub pair_count: u16,
+}
+
+impl TerrainSlotTable {
+    /// Returns the render-dispatch header for one decoded slot record.
+    #[must_use]
+    pub fn render_dispatch(&self, slot_index: usize) -> Option<TerrainSlotRenderDispatch> {
+        let raw = self.slots_raw.get(slot_index)?;
+        Some(TerrainSlotRenderDispatch {
+            pair_table_index: u16::from_le_bytes([raw[0], raw[1]]),
+            pair_count: u16::from_le_bytes([raw[2], raw[3]]),
+        })
+    }
+}
+
 /// Land mesh document.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LandMeshDocument {
@@ -1458,6 +1485,26 @@ mod tests {
             full_to_material_class(FullSurfaceMask(0x0000_8000 | 0x0000_0080)),
             MaterialClassMask(0x22)
         );
+    }
+
+    #[test]
+    fn slot_render_dispatch_retains_pair_table_index_and_count() {
+        let mut raw = [0_u8; SLOT_STRIDE];
+        raw[..2].copy_from_slice(&7_u16.to_le_bytes());
+        raw[2..4].copy_from_slice(&3_u16.to_le_bytes());
+        let slots = TerrainSlotTable {
+            header_raw: SLOT_HEADER_ZERO.to_vec(),
+            slots_raw: vec![raw],
+        };
+
+        assert_eq!(
+            slots.render_dispatch(0),
+            Some(TerrainSlotRenderDispatch {
+                pair_table_index: 7,
+                pair_count: 3,
+            })
+        );
+        assert_eq!(slots.render_dispatch(1), None);
     }
 
     #[test]

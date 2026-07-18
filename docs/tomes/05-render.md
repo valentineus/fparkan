@@ -1575,12 +1575,15 @@ an overlay, blend, or microtexture shader.
 
 The terrain render traversal is now located at `Terrain.dll` RVA `0x11340`.
 After visibility/cell work, it derives a 68-byte source-material record and
-dispatches renderer-context slot `+16` with four arguments: zero, the record's
-16-bit word at `+2`, a pointer selected from a four-byte table by its word at
-`+0`, and zero. A preceding renderer-context slot `+60` receives the current
-visibility mode. This is the concrete terrain-to-renderer handoff; it does not
-call `GetMaterialPhase` directly and does not yet identify either word, the
-four-byte payload, or the final blend operation.
+dispatches `Terrain!GetShade()` slot `+16` with four arguments: zero, the
+record's word at `+2`, a pointer selected from a four-byte table by its word at
+`+0`, and zero. `GetShade` is a Terrain singleton, not `niGet3DRender`; the
+preceding slot `+60` call sets its visibility mode. Slot `+16` consumes the
+second word as the count of adjacent `u16` pairs and the first as the pair-table
+index, then groups the pairs by material lookup before constructing draw work.
+`TerrainSlotTable::render_dispatch` exposes exactly those two proven disk
+fields. The pair payload, its material key, and the final blend operation remain
+unassigned.
 
 The static Vulkan bridge now carries each contiguous face run as a separate
 draw range keyed by the original packed `material_tag`; it neither reorders
