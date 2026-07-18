@@ -166,7 +166,7 @@ impl RawCameraTransform {
             m20,
             0.0,
             m23.mul_add(m21, m13.mul_add(m11, m03 * m01)),
-            -(m23.mul_add(m12, m13.mul_add(m02, m03 * m10))),
+            -(m23.mul_add(m22, m13.mul_add(m12, m03 * m02))),
             -(m00.mul_add(m03, m23.mul_add(m20, m13 * m10))),
             1.0,
         ])
@@ -193,10 +193,11 @@ pub struct LegacyD3d7Projection {
 impl LegacyD3d7Projection {
     /// Reconstructs the exact row-major matrix passed to D3D7 projection state.
     ///
-    /// Ngi32 uses the viewport's `height / width`, writes `cos(fov / 2)` to
-    /// the diagonal and `sin(fov / 2)` to the homogeneous-W term. The ratio
-    /// after D3D's perspective divide is therefore the expected cotangent
-    /// scale. This remains legacy D3D7 data rather than a Vulkan projection.
+    /// Ngi32 uses the viewport's `width / height`, writes `cos(fov / 2)` to
+    /// the diagonal and `sin(fov / 2)` to both the depth scale and
+    /// homogeneous-W term. The ratio after D3D's perspective divide is
+    /// therefore the expected cotangent scale. This remains legacy D3D7 data
+    /// rather than a Vulkan projection.
     #[must_use]
     pub fn try_direct3d7_projection_row_major(self) -> Option<[f32; 16]> {
         let width = self.viewport[2].checked_sub(self.viewport[0])?;
@@ -217,11 +218,11 @@ impl LegacyD3d7Projection {
         // Ngi32 converts these signed viewport dimensions into single-precision
         // arithmetic before building the legacy matrix.
         #[allow(clippy::cast_precision_loss)]
-        let aspect = (height as f32) / (width as f32);
+        let aspect = (width as f32) / (height as f32);
         let half_fov = self.field_of_view_radians * 0.5;
         let cosine = half_fov.cos();
         let sine = half_fov.sin();
-        let depth_scale = 1.0 / (1.0 - self.near_plane / self.far_plane);
+        let depth_scale = sine / (1.0 - self.near_plane / self.far_plane);
         [aspect, cosine, sine, depth_scale]
             .iter()
             .all(|value| value.is_finite())
@@ -1185,7 +1186,7 @@ mod tests {
         assert_eq!(
             transform.try_direct3d7_view_row_major(),
             Some([
-                1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, -10.0, -10.0, -20.0,
+                1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, -10.0, -30.0, -20.0,
                 1.0,
             ])
         );
@@ -1207,10 +1208,10 @@ mod tests {
             .try_direct3d7_projection_row_major()
             .expect("live Ngi32 projection parameters are valid");
         let half_fov = 0.65_f32;
-        let depth_scale = 700.0_f32 / 699.5;
+        let depth_scale = half_fov.sin() * 700.0_f32 / 699.5;
 
         assert_eq!(matrix[0], half_fov.cos());
-        assert_eq!(matrix[5], 0.75 * half_fov.cos());
+        assert_eq!(matrix[5], (4.0 / 3.0) * half_fov.cos());
         assert_eq!(matrix[10], depth_scale);
         assert_eq!(matrix[11], half_fov.sin());
         assert_eq!(matrix[14], -(depth_scale * 0.5));

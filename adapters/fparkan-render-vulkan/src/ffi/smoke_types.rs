@@ -353,7 +353,7 @@ mod static_mesh_tests {
 
         assert!(camera.is_finite());
         assert_eq!(camera.clip_from_world[0], 0.65_f32.cos());
-        assert_eq!(camera.clip_from_world[6], 700.0_f32 / 699.5);
+        assert_eq!(camera.clip_from_world[6], 0.65_f32.sin() * 700.0 / 699.5);
         assert_eq!(camera.clip_from_world[7], 0.65_f32.sin());
     }
 
