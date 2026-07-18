@@ -34,8 +34,10 @@ use fparkan_render_vulkan::{
     VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo, VulkanStaticMesh,
 };
 use fparkan_runtime::{
-    create, frame, load_mission, load_mission_static_preview, loaded_mission_assets, EngineConfig,
-    EngineMode, EngineServices, MissionAssets, MissionObjectDraft, MissionRequest,
+    create, frame, load_mission, load_mission_static_preview,
+    load_mission_static_preview_with_progress, load_mission_with_progress, loaded_mission_assets,
+    EngineConfig, EngineMode, EngineServices, MissionAssets, MissionLoadPhase, MissionObjectDraft,
+    MissionRequest,
 };
 use fparkan_vfs::DirectoryVfs;
 #[cfg(test)]
@@ -74,15 +76,7 @@ fn run(args: &[String]) -> Result<String, String> {
         services,
     )
     .map_err(|err| err.to_string())?;
-    let request = MissionRequest {
-        key: args.mission.clone(),
-    };
-    let loaded = if args.backend == RenderBackendMode::StaticVulkan {
-        load_mission_static_preview(&mut engine, request)
-    } else {
-        load_mission(&mut engine, request)
-    }
-    .map_err(|err| err.to_string())?;
+    let loaded = load_requested_mission(&mut engine, &args)?;
 
     if args.backend == RenderBackendMode::StaticVulkan {
         let mission_assets = loaded_mission_assets(&engine)
@@ -135,6 +129,60 @@ fn run(args: &[String]) -> Result<String, String> {
         capture_report.execution.last_capture_size,
         json_hash(&last_hash)
     ))
+}
+
+fn load_requested_mission(
+    engine: &mut fparkan_runtime::Engine,
+    args: &Args,
+) -> Result<fparkan_runtime::LoadedMission, String> {
+    let request = MissionRequest {
+        key: args.mission.clone(),
+    };
+    if let Some(progress_path) = args.load_progress.as_ref() {
+        prepare_load_progress_path(progress_path)?;
+        let mut write_error = None;
+        let loaded = if args.backend == RenderBackendMode::StaticVulkan {
+            load_mission_static_preview_with_progress(engine, request, |phase| {
+                if write_error.is_none() {
+                    if let Err(err) = write_load_progress(progress_path, phase) {
+                        write_error = Some(err);
+                    }
+                }
+            })
+        } else {
+            load_mission_with_progress(engine, request, |phase| {
+                if write_error.is_none() {
+                    if let Err(err) = write_load_progress(progress_path, phase) {
+                        write_error = Some(err);
+                    }
+                }
+            })
+        }
+        .map_err(|err| err.to_string())?;
+        if let Some(err) = write_error {
+            return Err(err);
+        }
+        std::fs::write(progress_path, "Complete\n")
+            .map_err(|err| format!("{}: {err}", progress_path.display()))?;
+        return Ok(loaded);
+    }
+    if args.backend == RenderBackendMode::StaticVulkan {
+        load_mission_static_preview(engine, request)
+    } else {
+        load_mission(engine, request)
+    }
+    .map_err(|err| err.to_string())
+}
+
+fn prepare_load_progress_path(path: &std::path::Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
+    }
+    std::fs::write(path, "Starting\n").map_err(|err| format!("{}: {err}", path.display()))
+}
+
+fn write_load_progress(path: &std::path::Path, phase: MissionLoadPhase) -> Result<(), String> {
+    std::fs::write(path, format!("{phase:?}\n")).map_err(|err| format!("{}: {err}", path.display()))
 }
 
 fn run_static_vulkan_mode(
@@ -457,6 +505,7 @@ struct Args {
     mission: String,
     frames: u64,
     backend: RenderBackendMode,
+    load_progress: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -471,6 +520,7 @@ impl Args {
         let mut mission = None;
         let mut frames = 1;
         let mut backend = RenderBackendMode::Planning;
+        let mut load_progress = None;
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -506,6 +556,13 @@ impl Args {
                         _ => return Err("--backend must be planning or static-vulkan".to_string()),
                     };
                 }
+                "--load-progress" => {
+                    load_progress = Some(
+                        iter.next()
+                            .map(PathBuf::from)
+                            .ok_or_else(|| "--load-progress requires a path".to_string())?,
+                    );
+                }
                 _ => return Err(usage()),
             }
         }
@@ -519,6 +576,7 @@ impl Args {
             mission,
             frames,
             backend,
+            load_progress,
         })
     }
 }
@@ -555,7 +613,7 @@ fn json_hash(hash: &[u8; 32]) -> String {
 }
 
 fn usage() -> String {
-    "usage: fparkan-game --root <path> --mission <path> [--frames <n>] [--backend <planning|static-vulkan>]".to_string()
+    "usage: fparkan-game --root <path> --mission <path> [--frames <n>] [--backend <planning|static-vulkan>] [--load-progress <path>]".to_string()
 }
 
 #[cfg(test)]
@@ -585,6 +643,7 @@ mod tests {
                 mission: "MISSIONS/Autodemo.00/data.tma".to_string(),
                 frames: 3,
                 backend: RenderBackendMode::Planning,
+                load_progress: None,
             })
         );
     }
@@ -605,6 +664,28 @@ mod tests {
                 mission: "MISSIONS/Autodemo.00/data.tma".to_string(),
                 frames: 1,
                 backend: RenderBackendMode::StaticVulkan,
+                load_progress: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_load_progress_path() {
+        assert_eq!(
+            Args::parse(&strings(&[
+                "--root",
+                "testdata/IS",
+                "--mission",
+                "MISSIONS/Autodemo.00/data.tma",
+                "--load-progress",
+                "target/probe.txt",
+            ])),
+            Ok(Args {
+                root: PathBuf::from("testdata/IS"),
+                mission: "MISSIONS/Autodemo.00/data.tma".to_string(),
+                frames: 1,
+                backend: RenderBackendMode::Planning,
+                load_progress: Some(PathBuf::from("target/probe.txt")),
             })
         );
     }

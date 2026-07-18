@@ -956,8 +956,11 @@ loading remains full and transactional; the preview scope walks root spans in
 TMA order and stops asset preparation after the first mesh-backed model. It is
 therefore not a hidden relaxation of gameplay validation. A second GOG
 `Autodemo.00` attempt with this narrower asset scope still exceeded 120 seconds
-before opening a window, which locates the remaining startup cost before the
-Vulkan draw loop but does not identify it as terrain versus graph work.
+before opening a window. The diagnostic `--load-progress <file>` checkpoint
+reported `Graph`, which proves the remaining startup cost is in prototype graph
+construction/visual-dependency expansion rather than terrain decode, asset
+preparation, window creation or the Vulkan draw loop. The timeout probe does
+not distinguish individual graph suboperations; no renderer acceptance follows.
 
 `Land.msh` использует отдельный geometry-only bridge: validated `TerrainFace28`
 сохраняет source triangle order, а его positions и packed UV0 попадают в тот же

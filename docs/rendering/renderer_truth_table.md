@@ -38,9 +38,11 @@
   `VulkanSmokeRenderer` с пустым списком materials (явный white-fallback). Режим использует
   отдельный bounded preview loader: normal `load_mission` по-прежнему готовит все reachable
   assets, тогда как preview останавливает asset preparation после первого root с mesh-backed
-  model. Это не является rendered acceptance: fresh GOG `MISSIONS/Autodemo.00/data.tma` test
-  с этим scope всё равно не дошёл до окна за локальный 120-second runner limit, поэтому нет
-  live report, pixel artifact или validation evidence именно для game path.
+  model. `--load-progress <file>` writes the last entered loader phase synchronously for timeout
+  diagnosis. This is not rendered acceptance: fresh GOG `MISSIONS/Autodemo.00/data.tma` test
+  with this scope still did not reach a window in the local 120-second runner; its checkpoint
+  was `Graph`, therefore no live report, pixel artifact or validation evidence exists for the
+  game path.
 - `apps/fparkan-viewer` сейчас inspection-only CLI и не открывает live Vulkan
   asset viewer.
 - Следующий реальный milestone для rendered acceptance: `VulkanAssetRenderer`

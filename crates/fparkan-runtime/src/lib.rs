@@ -489,13 +489,30 @@ pub fn load_mission_static_preview(
     engine: &mut Engine,
     request: MissionRequest,
 ) -> Result<LoadedMission, EngineError> {
-    load_mission_with_options(
+    load_mission_static_preview_with_progress(engine, request, |_| {})
+}
+
+/// Loads a static preview while synchronously reporting entered loading phases.
+///
+/// This has the same bounded asset scope as [`load_mission_static_preview`].
+///
+/// # Errors
+///
+/// Returns [`EngineError`] under the same conditions as
+/// [`load_mission_static_preview`].
+pub fn load_mission_static_preview_with_progress(
+    engine: &mut Engine,
+    request: MissionRequest,
+    mut on_phase: impl FnMut(MissionLoadPhase),
+) -> Result<LoadedMission, EngineError> {
+    load_mission_with_options_and_progress(
         engine,
         request,
         MissionLoadOptions {
             asset_scope: MissionAssetScope::FirstMeshPreview,
             ..MissionLoadOptions::default()
         },
+        Some(&mut on_phase),
     )
     .map(|(loaded, _trace)| loaded)
 }
@@ -509,22 +526,46 @@ pub fn load_mission_with_trace(
     engine: &mut Engine,
     request: MissionRequest,
 ) -> Result<(LoadedMission, MissionLoadTrace), EngineError> {
-    load_mission_with_options(engine, request, MissionLoadOptions::default())
+    load_mission_with_options_and_progress(engine, request, MissionLoadOptions::default(), None)
+}
+
+/// Loads a mission while synchronously reporting each entered loading phase.
+///
+/// The observer runs immediately after the phase is recorded in the returned
+/// trace. It is intended for diagnostic progress reporting; it does not alter
+/// loader ordering, validation, or transaction behavior.
+///
+/// # Errors
+///
+/// Returns [`EngineError`] under the same conditions as [`load_mission`].
+pub fn load_mission_with_progress(
+    engine: &mut Engine,
+    request: MissionRequest,
+    mut on_phase: impl FnMut(MissionLoadPhase),
+) -> Result<LoadedMission, EngineError> {
+    load_mission_with_options_and_progress(
+        engine,
+        request,
+        MissionLoadOptions::default(),
+        Some(&mut on_phase),
+    )
+    .map(|(loaded, _trace)| loaded)
 }
 
 #[allow(clippy::too_many_lines)]
-fn load_mission_with_options(
+fn load_mission_with_options_and_progress(
     engine: &mut Engine,
     request: MissionRequest,
     options: MissionLoadOptions,
+    mut on_phase: Option<&mut dyn FnMut(MissionLoadPhase)>,
 ) -> Result<(LoadedMission, MissionLoadTrace), EngineError> {
     let mut trace = MissionLoadTrace::default();
-    trace.phases.push(MissionLoadPhase::Context);
+    record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::Context);
     let vfs = engine.services.vfs.clone().ok_or(EngineError::MissingVfs)?;
     let mission_path = normalize_engine_path("mission", &request.key)?;
     let mission_bytes = read_vfs(&vfs, &mission_path)?;
 
-    trace.phases.push(MissionLoadPhase::Map);
+    record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::Map);
     let land_path =
         decode_mission_land_path(&mission_bytes, TmaProfile::Strict).map_err(|source| {
             EngineError::Mission {
@@ -564,7 +605,7 @@ fn load_mission_with_options(
                 TerrainPreparationError::Runtime(source) => EngineError::Terrain(source),
             }
         })?;
-    trace.phases.push(MissionLoadPhase::Tma);
+    record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::Tma);
     let mission = decode_mission_payload(mission_bytes, TmaProfile::Strict).map_err(|source| {
         EngineError::Mission {
             path: mission_path.as_str().to_string(),
@@ -582,7 +623,7 @@ fn load_mission_with_options(
             scale: object.scale,
         })
         .collect();
-    trace.phases.push(MissionLoadPhase::Graph);
+    record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::Graph);
     let repository = CachedResourceRepository::new(vfs.clone());
     let graph_roots: Vec<_> = mission
         .objects
@@ -641,18 +682,18 @@ fn load_mission_with_options(
                 .collect(),
         })
         .collect();
-    trace.phases.push(MissionLoadPhase::Assets);
+    record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::Assets);
 
     let mut new_runtime_world = new_world(WorldConfig);
     let mut handles = Vec::with_capacity(mission.objects.len());
-    trace.phases.push(MissionLoadPhase::Construct);
+    record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::Construct);
     for (index, _object) in mission.objects.iter().enumerate() {
         let original_id = u32::try_from(index).ok().map(OriginalObjectId);
         let handle = construct_object(&mut new_runtime_world, ObjectDraft { original_id })?;
         handles.push(handle);
     }
     trace.drafts_before_registration = handles.len();
-    trace.phases.push(MissionLoadPhase::Register);
+    record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::Register);
     for handle in &handles {
         if options.fail_after_registered_objects == Some(trace.registered_objects) {
             let report = fparkan_world::shutdown(new_runtime_world);
@@ -715,6 +756,17 @@ fn load_mission_with_options(
         object_drafts,
     });
     Ok((summary, trace))
+}
+
+fn record_load_phase(
+    trace: &mut MissionLoadTrace,
+    on_phase: &mut Option<&mut dyn FnMut(MissionLoadPhase)>,
+    phase: MissionLoadPhase,
+) {
+    trace.phases.push(phase);
+    if let Some(observer) = on_phase.as_deref_mut() {
+        observer(phase);
+    }
 }
 
 fn prepare_first_mesh_preview_assets<R: ResourceRepository>(
@@ -944,6 +996,30 @@ mod tests {
     }
 
     #[test]
+    fn load_progress_reports_context_before_missing_vfs_error() {
+        let mut engine = create(
+            EngineConfig {
+                mode: EngineMode::Headless,
+            },
+            EngineServices::default(),
+        )
+        .expect("engine");
+        let mut phases = Vec::new();
+
+        let err = load_mission_with_progress(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Autodemo.00/data.tma".to_string(),
+            },
+            |phase| phases.push(phase),
+        )
+        .expect_err("missing VFS");
+
+        assert!(matches!(err, EngineError::MissingVfs));
+        assert_eq!(phases, vec![MissionLoadPhase::Context]);
+    }
+
+    #[test]
     fn headless_scheduler_trace_skips_presentation_phases() {
         let mut engine = create(
             EngineConfig {
@@ -1116,7 +1192,7 @@ mod tests {
         .expect("engine");
         let before = step_headless(&mut engine, InputSnapshot).expect("before");
 
-        let err = load_mission_with_options(
+        let err = load_mission_with_options_and_progress(
             &mut engine,
             MissionRequest {
                 key: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.01/data.tma".to_string(),
@@ -1125,6 +1201,7 @@ mod tests {
                 fail_after_registered_objects: Some(1),
                 ..MissionLoadOptions::default()
             },
+            None,
         )
         .expect_err("forced registration failure");
 
