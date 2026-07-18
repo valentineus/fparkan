@@ -30,16 +30,18 @@ use fparkan_render::{
     RenderSnapshotDraw,
 };
 use fparkan_render_vulkan::{
-    project_msh_to_static_mesh, VulkanPlanningBackend, VulkanSmokeFrameOutcome,
-    VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo, VulkanStaticMaterial, VulkanStaticMesh,
-    VulkanStaticTexture,
+    project_land_msh_to_static_mesh_in_xz_frame, project_msh_to_static_mesh_in_xz_frame,
+    VulkanPlanningBackend, VulkanSmokeFrameOutcome, VulkanSmokeRenderer,
+    VulkanSmokeRendererCreateInfo, VulkanStaticMaterial, VulkanStaticMesh, VulkanStaticTexture,
+    VulkanStaticXzFrame,
 };
 use fparkan_runtime::{
     create, frame, load_mission, load_mission_static_preview,
     load_mission_static_preview_with_progress, load_mission_with_progress, loaded_mission_assets,
-    EngineConfig, EngineMode, EngineServices, MissionAssets, MissionLoadPhase, MissionObjectDraft,
-    MissionRequest,
+    loaded_mission_object_drafts, loaded_terrain, EngineConfig, EngineMode, EngineServices,
+    MissionAssets, MissionLoadPhase, MissionObjectDraft, MissionRequest,
 };
+use fparkan_terrain::TerrainWorld;
 use fparkan_vfs::DirectoryVfs;
 #[cfg(test)]
 use fparkan_world::OriginalObjectId;
@@ -82,11 +84,17 @@ fn run(args: &[String]) -> Result<String, String> {
     if args.backend == RenderBackendMode::StaticVulkan {
         let mission_assets = loaded_mission_assets(&engine)
             .ok_or_else(|| "mission assets are unavailable after loading".to_string())?;
-        let preview = static_preview_mesh_and_materials(mission_assets)?;
+        let terrain = loaded_terrain(&engine)
+            .ok_or_else(|| "mission terrain is unavailable after loading".to_string())?;
+        let root = loaded_mission_object_drafts(&engine)
+            .and_then(|drafts| drafts.first())
+            .ok_or_else(|| "first mission object draft is unavailable after loading".to_string())?;
+        let preview = static_preview_mesh_and_materials(mission_assets, terrain, root)?;
         return run_static_vulkan_mode(
             preview.mesh,
             preview.materials,
             preview.mesh_components,
+            preview.terrain_components,
             args.frames,
             &args.mission,
             loaded.object_count,
@@ -183,25 +191,45 @@ struct StaticPreviewScene {
     mesh: VulkanStaticMesh,
     materials: Vec<VulkanStaticMaterial>,
     mesh_components: usize,
+    terrain_components: usize,
 }
 
-/// Projects every MSH component of the explicitly bounded static-preview root
-/// into one mesh and selector-keyed diffuse material descriptors.
+/// Projects the mission terrain plus every MSH component of the explicitly
+/// bounded static-preview root into one diagnostic XZ frame.
 ///
 /// This intentionally takes only the first MAT0 texture request for each MSH
-/// batch selector. Later material phases, animation, lightmaps, transforms,
-/// and gameplay visibility remain outside this preview bridge.
-fn static_preview_mesh_and_materials(assets: &MissionAssets) -> Result<StaticPreviewScene, String> {
+/// batch selector. The terrain uses an explicit white diagnostic texture;
+/// terrain slot/material selection, orientation, camera, later material phases,
+/// animation, lightmaps and gameplay visibility remain outside this bridge.
+fn static_preview_mesh_and_materials(
+    assets: &MissionAssets,
+    terrain: &TerrainWorld,
+    root: &MissionObjectDraft,
+) -> Result<StaticPreviewScene, String> {
     let visual_ids = assets.visuals_for_object(0);
     if visual_ids.is_empty() {
         return Err("first static preview root has no prepared visuals".to_string());
     }
+    let terrain_mesh = terrain
+        .source_mesh()
+        .ok_or_else(|| "runtime terrain does not retain its validated source mesh".to_string())?;
+    let frame = static_preview_xz_frame(assets, visual_ids, terrain, root)?;
     let mut mesh = VulkanStaticMesh {
         vertices: Vec::new(),
         indices: Vec::new(),
         draw_ranges: Vec::new(),
     };
-    let mut materials = Vec::new();
+    let mut materials = vec![VulkanStaticMaterial {
+        material_index: 0,
+        texture: VulkanStaticTexture {
+            width: 1,
+            height: 1,
+            rgba8: vec![255, 255, 255, 255],
+        },
+    }];
+    let terrain_component = project_land_msh_to_static_mesh_in_xz_frame(terrain_mesh, frame)
+        .map_err(|err| format!("project mission terrain for Vulkan: {err}"))?;
+    append_static_preview_component(&mut mesh, terrain_component, &[(0, 0)])?;
     let mut mesh_components = 0;
     for visual_id in visual_ids {
         let visual = assets.visual_by_id(*visual_id).ok_or_else(|| {
@@ -213,8 +241,13 @@ fn static_preview_mesh_and_materials(assets: &MissionAssets) -> Result<StaticPre
         let model = assets.model_by_id(model_id).ok_or_else(|| {
             format!("static preview visual {visual_id:?} references unknown model {model_id:?}")
         })?;
-        let component = project_msh_to_static_mesh(&model.validated)
-            .map_err(|err| format!("project mission MSH for Vulkan: {err}"))?;
+        let component = project_msh_to_static_mesh_in_xz_frame(
+            &model.validated,
+            frame,
+            root.position,
+            root.scale,
+        )
+        .map_err(|err| format!("project mission MSH for Vulkan: {err}"))?;
         let selector_remap =
             static_preview_component_materials(assets, visual, &component, &mut materials)?;
         append_static_preview_component(&mut mesh, component, &selector_remap)?;
@@ -227,7 +260,77 @@ fn static_preview_mesh_and_materials(assets: &MissionAssets) -> Result<StaticPre
         mesh,
         materials,
         mesh_components,
+        terrain_components: 1,
     })
+}
+
+fn static_preview_xz_frame(
+    assets: &MissionAssets,
+    visual_ids: &[fparkan_assets::AssetId<PreparedVisual>],
+    terrain: &TerrainWorld,
+    root: &MissionObjectDraft,
+) -> Result<VulkanStaticXzFrame, String> {
+    if !root
+        .position
+        .iter()
+        .chain(root.scale.iter())
+        .all(|value| value.is_finite())
+    {
+        return Err("first static preview root has a non-finite position or scale".to_string());
+    }
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_z = f32::INFINITY;
+    let mut max_z = f32::NEG_INFINITY;
+    let terrain_positions = terrain
+        .source_positions()
+        .ok_or_else(|| "runtime terrain does not retain source positions".to_string())?;
+    for position in terrain_positions {
+        extend_static_preview_xz_bounds(*position, &mut min_x, &mut max_x, &mut min_z, &mut max_z)?;
+    }
+    for visual_id in visual_ids {
+        let visual = assets.visual_by_id(*visual_id).ok_or_else(|| {
+            format!("first static preview root references unknown visual {visual_id:?}")
+        })?;
+        let Some(model_id) = visual.model_id else {
+            continue;
+        };
+        let model = assets.model_by_id(model_id).ok_or_else(|| {
+            format!("static preview visual {visual_id:?} references unknown model {model_id:?}")
+        })?;
+        for position in &model.validated.positions {
+            extend_static_preview_xz_bounds(
+                [
+                    position[0] * root.scale[0] + root.position[0],
+                    position[1] * root.scale[1] + root.position[1],
+                    position[2] * root.scale[2] + root.position[2],
+                ],
+                &mut min_x,
+                &mut max_x,
+                &mut min_z,
+                &mut max_z,
+            )?;
+        }
+    }
+    VulkanStaticXzFrame::from_bounds(min_x, max_x, min_z, max_z)
+        .map_err(|err| format!("build static preview XZ frame: {err}"))
+}
+
+fn extend_static_preview_xz_bounds(
+    position: [f32; 3],
+    min_x: &mut f32,
+    max_x: &mut f32,
+    min_z: &mut f32,
+    max_z: &mut f32,
+) -> Result<(), String> {
+    if !position.iter().all(|value| value.is_finite()) {
+        return Err("static preview contains a non-finite XZ position".to_string());
+    }
+    *min_x = min_x.min(position[0]);
+    *max_x = max_x.max(position[0]);
+    *min_z = min_z.min(position[2]);
+    *max_z = max_z.max(position[2]);
+    Ok(())
 }
 
 fn static_preview_component_materials(
@@ -361,6 +464,7 @@ fn run_static_vulkan_mode(
     mesh: VulkanStaticMesh,
     materials: Vec<VulkanStaticMaterial>,
     mesh_components: usize,
+    terrain_components: usize,
     target_frames: u64,
     mission: &str,
     object_count: usize,
@@ -371,6 +475,7 @@ fn run_static_vulkan_mode(
         mesh,
         materials,
         mesh_components,
+        terrain_components,
         target_frames,
         mission,
         object_count,
@@ -385,6 +490,7 @@ struct StaticVulkanApp {
     mesh: VulkanStaticMesh,
     materials: Vec<VulkanStaticMaterial>,
     mesh_components: usize,
+    terrain_components: usize,
     target_frames: u64,
     mission: String,
     object_count: usize,
@@ -401,6 +507,7 @@ impl StaticVulkanApp {
         mesh: VulkanStaticMesh,
         materials: Vec<VulkanStaticMaterial>,
         mesh_components: usize,
+        terrain_components: usize,
         target_frames: u64,
         mission: &str,
         object_count: usize,
@@ -409,6 +516,7 @@ impl StaticVulkanApp {
             mesh,
             materials,
             mesh_components,
+            terrain_components,
             target_frames,
             mission: mission.to_string(),
             object_count,
@@ -451,11 +559,12 @@ impl StaticVulkanApp {
             return;
         }
         self.output = Some(format!(
-            "{{\"report_kind\":\"rendered-static-mission\",\"backend\":\"vulkan-static\",\"window\":\"native\",\"mission\":{},\"objects\":{},\"frames\":{},\"mesh_components\":{},\"material_descriptors\":{},\"swapchain\":[{},{}],\"swapchain_images\":{},\"validation_warnings\":{},\"validation_errors\":{},\"readback_bytes\":{},\"readback_hash\":{}}}",
+            "{{\"report_kind\":\"rendered-static-mission\",\"backend\":\"vulkan-static\",\"window\":\"native\",\"mission\":{},\"objects\":{},\"frames\":{},\"mesh_components\":{},\"terrain_components\":{},\"material_descriptors\":{},\"swapchain\":[{},{}],\"swapchain_images\":{},\"validation_warnings\":{},\"validation_errors\":{},\"readback_bytes\":{},\"readback_hash\":{}}}",
             json_string(&self.mission),
             self.object_count,
             self.frames_presented,
             self.mesh_components,
+            self.terrain_components,
             self.materials.len(),
             report.renderer_report.swapchain_extent.0,
             report.renderer_report.swapchain_extent.1,

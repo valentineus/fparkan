@@ -18,6 +18,58 @@ pub enum VulkanAssetMeshError {
     IndexOutOfRange,
 }
 
+/// Shared XZ frame for a deliberately top-down diagnostic static scene.
+///
+/// It is a CPU-side viewer transform, not evidence of the original camera or
+/// object transform convention. Keeping it explicit prevents separately
+/// normalized terrain and model components from being incorrectly overlaid.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VulkanStaticXzFrame {
+    center_x: f32,
+    center_z: f32,
+    extent: f32,
+}
+
+impl VulkanStaticXzFrame {
+    /// Builds a frame that maps the supplied XZ bounds into the static viewer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VulkanAssetMeshError::DegenerateViewExtent`] for non-finite
+    /// or zero-sized bounds.
+    pub fn from_bounds(
+        min_x: f32,
+        max_x: f32,
+        min_z: f32,
+        max_z: f32,
+    ) -> Result<Self, VulkanAssetMeshError> {
+        let extent = (max_x - min_x).max(max_z - min_z);
+        if !extent.is_finite() || extent <= f32::EPSILON {
+            return Err(VulkanAssetMeshError::DegenerateViewExtent);
+        }
+        Ok(Self {
+            center_x: (min_x + max_x) * 0.5,
+            center_z: (min_z + max_z) * 0.5,
+            extent,
+        })
+    }
+
+    fn project(self, position: [f32; 3]) -> [f32; 2] {
+        let scale = 1.6 / self.extent;
+        [
+            (position[0] - self.center_x) * scale,
+            (position[2] - self.center_z) * scale,
+        ]
+    }
+
+    fn planar_uv(self, position: [f32; 3]) -> [f32; 2] {
+        [
+            (position[0] - self.center_x) / self.extent + 0.5,
+            (position[2] - self.center_z) / self.extent + 0.5,
+        ]
+    }
+}
+
 impl std::fmt::Display for VulkanAssetMeshError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -46,85 +98,65 @@ impl std::error::Error for VulkanAssetMeshError {}
 pub fn project_msh_to_static_mesh(
     model: &ModelAsset,
 ) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
-    let mut indices = Vec::new();
-    let mut draw_ranges = Vec::with_capacity(model.batches.len());
-    for batch in &model.batches {
-        let first_index =
-            u32::try_from(indices.len()).map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?;
-        let start = usize::try_from(batch.index_start)
-            .map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?;
-        let end = start
-            .checked_add(usize::from(batch.index_count))
-            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?;
-        for &raw_index in model
-            .indices
-            .get(start..end)
-            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?
-        {
-            let index = batch
-                .base_vertex
-                .checked_add(u32::from(raw_index))
-                .ok_or(VulkanAssetMeshError::IndexOutOfRange)?;
-            indices.push(u16::try_from(index).map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?);
-        }
-        draw_ranges.push(VulkanStaticDrawRange {
-            first_index,
-            index_count: u32::from(batch.index_count),
-            material_index: batch.material_index,
-            pipeline_state: LegacyPipelineState::default(),
-            alpha_test_reference: 0,
-        });
-    }
-    if indices.is_empty() {
-        return Err(VulkanAssetMeshError::EmptyGeometry);
-    }
+    let (indices, _) = static_model_indices_and_ranges(model)?;
+    let (min_x, max_x, min_z, max_z) = static_mesh_xz_bounds(&model.positions, &indices)?;
+    let frame = VulkanStaticXzFrame::from_bounds(min_x, max_x, min_z, max_z)?;
+    project_msh_to_static_mesh_in_xz_frame(model, frame, [0.0; 3], [1.0; 3])
+}
 
-    let mut min_x = f32::INFINITY;
-    let mut max_x = f32::NEG_INFINITY;
-    let mut min_z = f32::INFINITY;
-    let mut max_z = f32::NEG_INFINITY;
-    for &index in &indices {
-        let position = model
-            .positions
-            .get(usize::from(index))
-            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?;
-        if !position.iter().all(|value| value.is_finite()) {
-            return Err(VulkanAssetMeshError::NonFinitePosition);
-        }
-        min_x = min_x.min(position[0]);
-        max_x = max_x.max(position[0]);
-        min_z = min_z.min(position[2]);
-        max_z = max_z.max(position[2]);
+/// Projects MSH geometry with a known translation/scale into a shared XZ frame.
+///
+/// The caller supplies only transforms already decoded from mission data. Raw
+/// orientation is intentionally not interpreted until its original convention
+/// is established.
+///
+/// # Errors
+///
+/// Returns [`VulkanAssetMeshError`] when geometry, transform values or the
+/// static Vulkan input contract cannot represent the source model.
+pub fn project_msh_to_static_mesh_in_xz_frame(
+    model: &ModelAsset,
+    frame: VulkanStaticXzFrame,
+    translation: [f32; 3],
+    scale: [f32; 3],
+) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
+    if !translation
+        .iter()
+        .chain(scale.iter())
+        .all(|value| value.is_finite())
+    {
+        return Err(VulkanAssetMeshError::NonFinitePosition);
     }
-    let extent = (max_x - min_x).max(max_z - min_z);
-    if !extent.is_finite() || extent <= f32::EPSILON {
-        return Err(VulkanAssetMeshError::DegenerateViewExtent);
-    }
-    let center_x = (min_x + max_x) * 0.5;
-    let center_z = (min_z + max_z) * 0.5;
-    let scale = 1.6 / extent;
+    let (indices, draw_ranges) = static_model_indices_and_ranges(model)?;
     let vertices = model
         .positions
         .iter()
         .enumerate()
-        .map(|(index, position)| VulkanStaticVertex {
-            position: [
-                (position[0] - center_x) * scale,
-                (position[2] - center_z) * scale,
-            ],
-            color: [0.82, 0.72, 0.31],
-            // Iron3D stores Res5 UV0 as signed fixed point with 1/1024 units.
-            // Models that omit this optional stream retain the static viewer's
-            // XZ planar fallback instead of receiving fabricated raw UV values.
-            uv: model.uv0.as_ref().and_then(|uv0| uv0.get(index)).map_or(
-                [
-                    (position[0] - center_x) / extent + 0.5,
-                    (position[2] - center_z) / extent + 0.5,
-                ],
-                |uv| [f32::from(uv[0]) / 1024.0, f32::from(uv[1]) / 1024.0],
-            ),
+        .map(|(index, position)| {
+            if !position.iter().all(|value| value.is_finite()) {
+                return Err(VulkanAssetMeshError::NonFinitePosition);
+            }
+            let transformed = [
+                position[0] * scale[0] + translation[0],
+                position[1] * scale[1] + translation[1],
+                position[2] * scale[2] + translation[2],
+            ];
+            Ok(VulkanStaticVertex {
+                position: frame.project(transformed),
+                color: [0.82, 0.72, 0.31],
+                // Iron3D stores Res5 UV0 as signed fixed point with 1/1024 units.
+                // Models that omit this optional stream retain the static viewer's
+                // XZ planar fallback instead of receiving fabricated raw UV values.
+                uv: model
+                    .uv0
+                    .as_ref()
+                    .and_then(|uv0| uv0.get(index))
+                    .map_or(frame.planar_uv(transformed), |uv| {
+                        [f32::from(uv[0]) / 1024.0, f32::from(uv[1]) / 1024.0]
+                    }),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(VulkanStaticMesh {
         vertices,
@@ -164,32 +196,53 @@ pub fn project_land_msh_to_static_mesh(
     }
 
     let (min_x, max_x, min_z, max_z) = static_mesh_xz_bounds(&terrain.positions, &indices)?;
-    let extent = (max_x - min_x).max(max_z - min_z);
-    if !extent.is_finite() || extent <= f32::EPSILON {
-        return Err(VulkanAssetMeshError::DegenerateViewExtent);
+    let frame = VulkanStaticXzFrame::from_bounds(min_x, max_x, min_z, max_z)?;
+    project_land_msh_to_static_mesh_in_xz_frame(terrain, frame)
+}
+
+/// Projects `Land.msh` terrain geometry into a shared diagnostic XZ frame.
+///
+/// # Errors
+///
+/// Returns [`VulkanAssetMeshError`] when terrain geometry or the static Vulkan
+/// input contract cannot represent the source mesh.
+pub fn project_land_msh_to_static_mesh_in_xz_frame(
+    terrain: &LandMeshDocument,
+    frame: VulkanStaticXzFrame,
+) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
+    let mut indices = Vec::with_capacity(
+        terrain
+            .faces
+            .len()
+            .checked_mul(3)
+            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?,
+    );
+    for face in &terrain.faces {
+        indices.extend(face.vertices);
     }
-    let center_x = (min_x + max_x) * 0.5;
-    let center_z = (min_z + max_z) * 0.5;
-    let scale = 1.6 / extent;
+    if indices.is_empty() {
+        return Err(VulkanAssetMeshError::EmptyGeometry);
+    }
     let vertices = terrain
         .positions
         .iter()
         .enumerate()
-        .map(|(index, position)| VulkanStaticVertex {
-            position: [
-                (position[0] - center_x) * scale,
-                (position[2] - center_z) * scale,
-            ],
-            color: [0.31, 0.58, 0.27],
-            uv: terrain.uv0.get(index).map_or(
-                [
-                    (position[0] - center_x) / extent + 0.5,
-                    (position[2] - center_z) / extent + 0.5,
-                ],
-                |uv| [f32::from(uv[0]) / 1024.0, f32::from(uv[1]) / 1024.0],
-            ),
+        .map(|(index, position)| {
+            if !position.iter().all(|value| value.is_finite()) {
+                return Err(VulkanAssetMeshError::NonFinitePosition);
+            }
+            Ok(VulkanStaticVertex {
+                position: frame.project(*position),
+                color: [0.31, 0.58, 0.27],
+                uv: terrain
+                    .uv0
+                    .get(index)
+                    .map_or(frame.planar_uv(*position), |uv| {
+                        [f32::from(uv[0]) / 1024.0, f32::from(uv[1]) / 1024.0]
+                    }),
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(VulkanStaticMesh {
         vertices,
@@ -205,6 +258,44 @@ pub fn project_land_msh_to_static_mesh(
             alpha_test_reference: 0,
         }],
     })
+}
+
+fn static_model_indices_and_ranges(
+    model: &ModelAsset,
+) -> Result<(Vec<u16>, Vec<VulkanStaticDrawRange>), VulkanAssetMeshError> {
+    let mut indices = Vec::new();
+    let mut draw_ranges = Vec::with_capacity(model.batches.len());
+    for batch in &model.batches {
+        let first_index =
+            u32::try_from(indices.len()).map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?;
+        let start = usize::try_from(batch.index_start)
+            .map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?;
+        let end = start
+            .checked_add(usize::from(batch.index_count))
+            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?;
+        for &raw_index in model
+            .indices
+            .get(start..end)
+            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?
+        {
+            let index = batch
+                .base_vertex
+                .checked_add(u32::from(raw_index))
+                .ok_or(VulkanAssetMeshError::IndexOutOfRange)?;
+            indices.push(u16::try_from(index).map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?);
+        }
+        draw_ranges.push(VulkanStaticDrawRange {
+            first_index,
+            index_count: u32::from(batch.index_count),
+            material_index: batch.material_index,
+            pipeline_state: LegacyPipelineState::default(),
+            alpha_test_reference: 0,
+        });
+    }
+    if indices.is_empty() {
+        return Err(VulkanAssetMeshError::EmptyGeometry);
+    }
+    Ok((indices, draw_ranges))
 }
 
 fn static_mesh_xz_bounds(

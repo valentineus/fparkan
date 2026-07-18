@@ -451,6 +451,7 @@ dependencies = [
  "fparkan-render",
  "fparkan-render-vulkan",
  "fparkan-runtime",
+ "fparkan-terrain",
  "fparkan-vfs",
  "fparkan-world",
  "winit",

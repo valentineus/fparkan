@@ -979,6 +979,29 @@ probe timed out at `Graph`; this reduction is what allowed the successful GOG
 native run. If that first root has no usable MSH, static preview fails explicitly
 rather than expanding later roots or pretending to render the entire mission.
 
+### Shared terrain/root diagnostic frame
+
+The bounded native preview now retains the already validated `Land.msh` inside
+`TerrainWorld`; this lets the application consume source geometry through the
+runtime boundary instead of decoding archive formats a second time. It merges
+one terrain component with the first TMA root's 14 reachable MSH components in
+one explicit top-down XZ frame. The frame is computed from terrain positions
+and the root models after applying only the decoded TMA `position` and `scale`.
+Raw TMA orientation is deliberately excluded: its convention is not proven.
+
+Terrain is assigned an explicit 1x1 white diagnostic texture, rather than a
+guessed terrain material. `Land.msh` slot selection, `material_tag`, masks,
+auxiliary streams, original terrain phases and camera remain unresolved. Thus
+this is an integrated geometry/provenance checkpoint, not a claim of original
+terrain shading or scene camera reconstruction.
+
+Fresh canonical GOG `MISSIONS/Autodemo.00/data.tma` evidence: one native
+1280x720 Vulkan frame completed in 40.6 seconds with 14 root MSH components,
+one terrain component, 15 descriptors, a 7,372,800-byte readback (FNV-1a
+`10739087367165646439`) and validation warnings/errors `0/0`. The distinct hash
+from the earlier first-root-only preview is expected because the submitted
+geometry and descriptor set changed; it is not an original-frame comparison.
+
 ### Camera ownership boundary from the GOG renderer
 
 The GOG `World3D.dll` export `LoadCamera` at RVA `0x1FB06` is only an import

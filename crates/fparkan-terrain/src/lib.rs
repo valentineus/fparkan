@@ -30,6 +30,7 @@ pub struct TerrainWorld {
     grid: RuntimeGrid,
     adjacency: Vec<Vec<ArealId>>,
     surfaces: Vec<RuntimeTriangle>,
+    source_mesh: Option<LandMeshDocument>,
 }
 
 /// Surface hit.
@@ -232,6 +233,7 @@ impl TerrainWorld {
             grid,
             adjacency,
             surfaces: Vec::new(),
+            source_mesh: None,
         })
     }
 
@@ -244,6 +246,7 @@ impl TerrainWorld {
     pub fn from_land_msh(mesh: &LandMeshDocument) -> Result<Self, TerrainError> {
         Ok(Self {
             surfaces: build_surfaces(mesh)?,
+            source_mesh: Some(mesh.clone()),
             ..Self::default()
         })
     }
@@ -260,6 +263,7 @@ impl TerrainWorld {
     ) -> Result<Self, TerrainError> {
         let mut world = Self::from_land_map(map)?;
         world.surfaces = build_surfaces(mesh)?;
+        world.source_mesh = Some(mesh.clone());
         Ok(world)
     }
 
@@ -273,6 +277,24 @@ impl TerrainWorld {
     #[must_use]
     pub fn surface_count(&self) -> usize {
         self.surfaces.len()
+    }
+
+    /// Returns the validated source mesh retained for renderer integration.
+    ///
+    /// Runtime collision queries use their own compact triangle representation;
+    /// keeping this document preserves the original geometry and UV streams for
+    /// rendering without asking the application layer to decode an archive again.
+    #[must_use]
+    pub fn source_mesh(&self) -> Option<&LandMeshDocument> {
+        self.source_mesh.as_ref()
+    }
+
+    /// Returns source terrain positions without exposing parser ownership to apps.
+    #[must_use]
+    pub fn source_positions(&self) -> Option<&[[f32; 3]]> {
+        self.source_mesh
+            .as_ref()
+            .map(|mesh| mesh.positions.as_slice())
     }
 
     fn locate_by_candidates(
