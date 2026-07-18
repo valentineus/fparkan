@@ -1606,6 +1606,13 @@ visibility tests, primitive construction and texture/secondary passes, but the
 cache builder and bit meanings are still not recovered; the Vulkan path must
 not map any of them to invented pipeline state.
 
+A read-only elevated AutoDemo probe confirms that this is a lifecycle boundary,
+not a permanently allocated table: the live `GetShade` singleton is initialized
+and its `Shade.wea` manager pointer is non-null, while its byte-offset `3244`
+cache pointer was null at the sampled instant. Therefore a future runtime
+implementation must treat cache availability as contextual and cannot dereference
+or prebuild the cache solely from constructor state.
+
 The static Vulkan bridge now carries each contiguous face run as a separate
 draw range keyed by the original packed `material_tag`; it neither reorders
 triangles nor collapses the high byte. For the first usable visual layer, the
