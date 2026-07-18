@@ -1430,6 +1430,8 @@ struct PreparedVisualBundle {
 
 #[derive(Default)]
 struct PreparationCache {
+    models: Vec<(ResourceKey, ModelAsset)>,
+    wears: Vec<(ResourceKey, WearTable)>,
     diffuse: HashMap<Vec<u8>, PreparedTexture>,
     lightmaps: HashMap<Vec<u8>, PreparedTexture>,
     materials: HashMap<Vec<u8>, ResolvedMaterial>,
@@ -1453,13 +1455,7 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
         });
     };
 
-    let nres = decode_nres(
-        read_key(repository, mesh_key, Some("mesh"))?,
-        ReadProfile::Compatible,
-    )
-    .map_err(AssetError::Nres)?;
-    let msh_document = decode_msh(&nres).map_err(AssetError::Msh)?;
-    let model = validate_msh(&msh_document).map_err(AssetError::Msh)?;
+    let model = prepare_model_cached(repository, mesh_key, preparation_cache)?;
     let model_id = AssetId::new((identity_policy.model)(proto));
     let prepared_model = PreparedModel {
         id: model_id,
@@ -1474,8 +1470,7 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
         name: wear_name,
         type_id: Some(WEAR_KIND),
     };
-    let wear = decode_wear(&read_key(repository, &wear_key, Some("wear"))?)
-        .map_err(AssetError::Material)?;
+    let wear = prepare_wear_cached(repository, &wear_key, preparation_cache)?;
     let wear_id = AssetId::new((identity_policy.wear)(proto));
     let prepared_wear = PreparedWear {
         id: wear_id,
@@ -1591,6 +1586,43 @@ fn read_key<R: ResourceRepository>(
         .read(handle)
         .map_err(|err| map_resource_error(label, key, err))?;
     Ok(Arc::from(bytes.into_owned()))
+}
+
+fn prepare_model_cached<R: ResourceRepository>(
+    repository: &R,
+    key: &ResourceKey,
+    cache: &mut PreparationCache,
+) -> Result<ModelAsset, AssetError> {
+    if let Some((_, model)) = cache
+        .models
+        .iter()
+        .find(|(cached_key, _)| cached_key == key)
+    {
+        return Ok(model.clone());
+    }
+    let nres = decode_nres(
+        read_key(repository, key, Some("mesh"))?,
+        ReadProfile::Compatible,
+    )
+    .map_err(AssetError::Nres)?;
+    let document = decode_msh(&nres).map_err(AssetError::Msh)?;
+    let model = validate_msh(&document).map_err(AssetError::Msh)?;
+    cache.models.push((key.clone(), model.clone()));
+    Ok(model)
+}
+
+fn prepare_wear_cached<R: ResourceRepository>(
+    repository: &R,
+    key: &ResourceKey,
+    cache: &mut PreparationCache,
+) -> Result<WearTable, AssetError> {
+    if let Some((_, wear)) = cache.wears.iter().find(|(cached_key, _)| cached_key == key) {
+        return Ok(wear.clone());
+    }
+    let wear =
+        decode_wear(&read_key(repository, key, Some("wear"))?).map_err(AssetError::Material)?;
+    cache.wears.push((key.clone(), wear.clone()));
+    Ok(wear)
 }
 
 fn map_resource_error(label: &str, key: &ResourceKey, source: ResourceError) -> AssetError {

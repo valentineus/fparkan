@@ -1056,6 +1056,13 @@ last checkpoint advanced to `Assets`. The process was deliberately terminated
 before a frame, so this proves reduced visual-graph work rather than a Vulkan
 acceptance result.
 
+Asset preparation additionally caches validated MSH models and decoded WEAR
+tables by their complete resource key. This preserves separate prepared visual
+provenance while avoiding repeat format work for repeated components. The same
+60-second first-root GOG probe remained at `Assets`, so that corpus does not
+demonstrate an additional checkpoint advance from this cache; it must not be
+reported as a measured startup improvement.
+
 The same source-axis proof now applies to `TerrainWorld`: its `Land.msh` surface
 height query and `Land.map` areal/grid lookup use XY ground coordinates, return
 source Z height, and leave raycasts as full 3D intersections. The Part 1 and
