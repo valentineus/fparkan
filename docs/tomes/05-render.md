@@ -1352,9 +1352,17 @@ relocated vtable `0x02576344`. Its rectangle at `+0x10` was exactly
 `(left=0, top=0, right=1024, bottom=768)`, its projection-type field at
 `+0x230` was `0`, and its FOV field at `+0x234` was `1.04` radians.
 `CBufferingCamera` passes that FOV to `tan(fov / 2)` on its type-0 projection
-path. This proves the live vertical-angle input and viewport for this sample;
+path. This proves the live angle input and viewport for this sample;
 it does not yet assign the two remaining projection values, near/far planes,
 depth range, clip-space Y direction, or a Vulkan projection matrix.
+
+The unresolved values are now located rather than guessed. `CBufferingCamera`
+uses its primary-render interface at component offset `+0x220` to select a
+render context, then asks that context for a five-float projection block. The
+sample's primary vtable was relocated `0x02574DF0`; its selector at `+0x0C`
+is only a table lookup keyed by two still-unnamed inputs. No virtual call was
+made by the probe. Therefore the block's values cannot yet be assigned as
+near/far or reused by the Vulkan adapter.
 
 A fresh no-input launch of the canonical `iron_3d.exe` did create a responsive
 window titled `Parkan. Железная Стратегия`. A read-only probe then requested
