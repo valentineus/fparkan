@@ -1205,19 +1205,29 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
     let mut wear_requests = 0usize;
     let mut material_requests = 0usize;
     let mut texture_requests = 0usize;
+    // Capture all base-graph anchors before this traversal appends visual
+    // resources and edges. Looking them up again from the growing graph would
+    // make each later prototype scan an ever larger collection.
+    let prototype_mesh_anchors: Vec<_> = (0..prototypes.len())
+        .map(|prototype_index| {
+            let prototype_node_id = prototype_node_id(graph, prototype_index)?;
+            let mesh_node_id = prototype_mesh_node_id(graph, prototype_node_id)?;
+            Some((mesh_node_id, mesh_edge_id(graph, prototype_node_id)))
+        })
+        .collect();
 
     for (prototype_index, prototype) in prototypes.iter().enumerate() {
         let PrototypeGeometry::Mesh(mesh) = &prototype.geometry else {
             continue;
         };
         report.wear_request_count += 1;
-        let Some(prototype_node_id) = prototype_node_id(graph, prototype_index) else {
+        let Some((mesh_node_id, mesh_parent_edge)) = prototype_mesh_anchors
+            .get(prototype_index)
+            .copied()
+            .flatten()
+        else {
             continue;
         };
-        let Some(mesh_node_id) = prototype_mesh_node_id(graph, prototype_node_id) else {
-            continue;
-        };
-        let mesh_parent_edge = mesh_edge_id(graph, prototype_node_id);
         let root_index = root_index_for_prototype(graph, prototype_index);
 
         wear_requests = wear_requests.saturating_add(1);

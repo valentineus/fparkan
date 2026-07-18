@@ -1110,6 +1110,14 @@ before the first TEXM progress marker. The differing checkpoints rule out the
 previous overly narrow claim that TEXM is the sole remaining target. Profiling
 must compare WEAR, MAT0, TEXM, graph allocation and archive I/O quantitatively.
 
+Visual expansion now snapshots each prototype's base-graph `Prototype→MSH`
+anchor before it appends any WEAR/MAT0/TEXM nodes and edges. The subsequent
+traversal reads this immutable vector rather than repeatedly linearly searching
+the growing graph; graph content, node/edge IDs and provenance remain
+unchanged. The same controlled 180-second Part 2 probe still ended at
+`GraphVisualMaterials`, so this is a complexity/correctness improvement rather
+than measured evidence of a startup checkpoint advance.
+
 Mission loading now raises the decoded-payload cache entry budget from 64 to
 256 while retaining its 64 MiB byte budget. This avoids premature entry-count
 eviction during resource-rich loads without making memory unbounded. The same
