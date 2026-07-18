@@ -1421,14 +1421,15 @@ proves ownership and the D3D7 boundary, while keeping the earlier
 `CBufferingCamera` FOV=`1.04` as a distinct upstream interface value.
 
 The live GOG layout is now independently repeatable without invoking any game
-method: `Terrain.dll + 0x7355c` contains the current camera interface pointer,
-whose vtable relocates to `Terrain.dll` RVA `0x665b4`. Its selector-0 block
-starts with one 32-bit internal tag at interface `+28`; the actual sixteen
-row-major matrix words begin at `+32`. Captures for `RawCameraTransform` must
-therefore contain those sixteen payload words, not the tag. A passive AutoDemo
-sample produced a finite affine camera matrix and passed through the offline
-Vulkan adapter as source-world geometry, rather than relying on a guessed
-identity view.
+method: `Terrain.dll + 0x7355c` contains the current outer camera-object
+pointer, whose vtable relocates to `Terrain.dll` RVA `0x665b4`. Selector 0
+returns the affine block beginning at outer `+0x20`; its sixteen row-major
+words have translations at indices 3, 7 and 11. The public `LoadCamera`
+interface at outer `+0x134` is a different view and must not be substituted
+for that block. Captures for `RawCameraTransform` therefore contain the sixteen
+selector-0 words from outer `+0x20`. A passive AutoDemo sample produced a
+finite affine camera matrix and passed through the offline Vulkan adapter as
+source-world geometry, rather than relying on a guessed identity view.
 
 The Vulkan static path now accepts this recovered camera as
 `VulkanStaticCamera`. It composes the row-major D3D7 result as
@@ -1501,8 +1502,13 @@ comparison.
 `tools/capture-original-camera.ps1` makes that handoff repeatable for a live
 GOG process. It finds the actual `Terrain.dll` base with Toolhelp module
 enumeration, opens the chosen PID with only
-`PROCESS_QUERY_INFORMATION | PROCESS_VM_READ`, reads the camera global at its
-RVA and then exactly 64 matrix bytes at interface `+32`. It emits the
+`PROCESS_QUERY_INFORMATION | PROCESS_VM_READ`, verifies the expected outer
+vtable, and reads exactly 64 selector-0 bytes at outer `+0x20`. AutoDemo can
+briefly select a normalized/reflection-like camera object whose finite
+translation is near the origin. The tool therefore re-reads the global on
+each attempt and accepts a sample only when the proven translation length
+exceeds its explicit `-MinimumWorldTranslation` threshold (default `100`);
+the JSON retains the accepted outer pointer and translation for audit. It emits the
 `fparkan-legacy-camera-v1` JSON accepted by `fparkan-game`; it does not write
 to the process, send window messages, inject code, suspend threads, or invoke
 an original method. PowerShell execution policy may require the explicit
@@ -1518,16 +1524,16 @@ cargo run -q -p fparkan-game -- --root 'C:\GOG Games\Parkan - Iron Strategy' `
   --readback-out target\fparkan\autodemo-live-camera.raw
 ```
 
-On the unattended live AutoDemo the tool produced a new finite matrix and the
-same all-root static bridge completed with 46 clip-visible vertices, 71
-descriptors, a 7,372,800-byte format-50 readback, FNV-1a
-`11081931966175262997`, and zero Vulkan validation warnings/errors. A passive
-desktop-surface capture of that original window also proved that the selected
-instant contains the textured terrain, atmospheric sky, HUD and weapon FX;
-`PrintWindow` itself returns a black Direct3D buffer, so it must not be treated
-as an original-frame oracle. Neither screenshot establishes pixel parity: HUD,
-FX, lighting, terrain layer composition and the remaining scene objects are
-not yet represented by the static bridge.
+On the unattended live AutoDemo the accepted world-space capture completed the
+same all-root static bridge with 10,152 clip-visible vertices, 71 descriptors,
+a 7,372,800-byte format-50 readback, and zero Vulkan validation
+warnings/errors. A passive desktop-surface capture of that original window also
+proved that the selected instant contains the textured terrain, atmospheric
+sky, HUD and weapon FX; `PrintWindow` itself returns a black Direct3D buffer,
+so it must not be treated as an original-frame oracle. The paired images expose
+the next real renderer gap: sharing the raw pose and Ngi32 projection inputs is
+not yet pixel parity, because the static bridge still lacks the full runtime
+camera-selection timing, terrain composition, culling, lighting, UI and FX.
 
 For visual regression work, `fparkan-game --backend static-vulkan` also accepts
 `--readback-out <path>`. It writes the final synchronized Vulkan readback bytes

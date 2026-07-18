@@ -11,7 +11,13 @@ param(
     [ValidateRange(0.01, 100000.0)]
     [double]$FarPlane = 700.0,
     [ValidateRange(0.01, 3.13)]
-    [double]$FieldOfViewRadians = 1.3
+    [double]$FieldOfViewRadians = 1.3,
+    [ValidateRange(1, 600)]
+    [int]$CaptureAttempts = 60,
+    [ValidateRange(0, 1000000.0)]
+    [double]$MinimumWorldTranslation = 100.0,
+    [ValidateRange(0, 1000)]
+    [int]$RetryIntervalMilliseconds = 100
 )
 
 Set-StrictMode -Version Latest
@@ -131,15 +137,60 @@ if ($process -eq [IntPtr]::Zero) {
 }
 
 try {
-    # Terrain.dll image RVA 0x7355c -> active camera interface pointer.
-    # Selector 0's matrix is prefixed by a four-byte internal tag, so the
-    # 16 IEEE-754 row-major words begin at interface + 32, not + 28.
-    $cameraPointerBytes = Read-OriginalBytes $process ($terrainBase + 0x7355c) 4
-    $cameraInterface = [BitConverter]::ToUInt32($cameraPointerBytes, 0)
-    if ($cameraInterface -lt 0x10000) {
-        throw "Terrain camera pointer is unavailable or invalid: 0x$('{0:X8}' -f $cameraInterface)"
+    # Terrain.dll image RVA 0x7355c -> active 0x1a4-byte outer camera object.
+    # Its selector-0 affine block begins at outer + 0x20. Words 3/7/11 are
+    # the proven world-space translation components. AutoDemo also briefly
+    # selects normalized/reflection-like camera objects; a finite matrix alone
+    # is not sufficient evidence that it can project the mission world.
+    $expectedOuterVtable = [uint32]($terrainBase + 0x665b4)
+    $matrixBytes = $null
+    $translation = $null
+    $cameraOuter = $null
+    $lastObservation = 'camera pointer unavailable'
+    for ($attempt = 1; $attempt -le $CaptureAttempts; $attempt++) {
+        $candidateOuter = [BitConverter]::ToUInt32(
+            (Read-OriginalBytes $process ($terrainBase + 0x7355c) 4),
+            0
+        )
+        if ($candidateOuter -lt 0x10000) {
+            $lastObservation = "camera pointer 0x$('{0:X8}' -f $candidateOuter)"
+            continue
+        }
+        $outerVtable = [BitConverter]::ToUInt32(
+            (Read-OriginalBytes $process ([int64]$candidateOuter) 4),
+            0
+        )
+        if ($outerVtable -ne $expectedOuterVtable) {
+            $lastObservation = "outer vtable 0x$('{0:X8}' -f $outerVtable)"
+            continue
+        }
+        $matrixBytes = Read-OriginalBytes $process ([int64]$candidateOuter + 0x20) 64
+        $candidateTranslation = @(
+            [BitConverter]::ToSingle($matrixBytes, 12),
+            [BitConverter]::ToSingle($matrixBytes, 28),
+            [BitConverter]::ToSingle($matrixBytes, 44)
+        )
+        $nonFinite = @($candidateTranslation | Where-Object {
+            [Single]::IsNaN($_) -or [Single]::IsInfinity($_)
+        })
+        $length = [Math]::Sqrt(
+            [double]$candidateTranslation[0] * $candidateTranslation[0] +
+            [double]$candidateTranslation[1] * $candidateTranslation[1] +
+            [double]$candidateTranslation[2] * $candidateTranslation[2]
+        )
+        if ($nonFinite.Count -eq 0 -and $length -ge $MinimumWorldTranslation) {
+            $cameraOuter = $candidateOuter
+            $translation = $candidateTranslation
+            break
+        }
+        $lastObservation = "translation length $length at 0x$('{0:X8}' -f $candidateOuter)"
+        if ($attempt -lt $CaptureAttempts -and $RetryIntervalMilliseconds -gt 0) {
+            Start-Sleep -Milliseconds $RetryIntervalMilliseconds
+        }
     }
-    $matrixBytes = Read-OriginalBytes $process ([int64]$cameraInterface + 32) 64
+    if ($null -eq $translation) {
+        throw "No world-space selector-0 transform after $CaptureAttempts samples (minimum translation length $MinimumWorldTranslation; last observation: $lastObservation)"
+    }
     $words = for ($index = 0; $index -lt 16; $index++) {
         [BitConverter]::ToUInt32($matrixBytes, $index * 4)
     }
@@ -148,7 +199,9 @@ try {
         process_id = $ProcessId
         terrain_module_base = ('0x{0:X8}' -f $terrainBase)
         terrain_camera_global_rva = '0x7355c'
+        terrain_camera_outer = ('0x{0:X8}' -f $cameraOuter)
         selector0_words = @($words)
+        selector0_translation = @($translation)
         # LegacyD3d7Projection carries a D3D7 RECT: left, top, right, bottom.
         viewport = @(0, 0, $ViewportWidth, $ViewportHeight)
         near_plane = $NearPlane
