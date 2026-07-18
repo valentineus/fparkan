@@ -1258,6 +1258,27 @@ and `ICamera::GetTransformMatrix`, plus frustum/clip methods. These names prove
 that a transform-matrix interface exists, but give neither method slots nor a
 matrix convention; they must not be treated as a usable renderer ABI yet.
 
+### Buffering-camera projection path from static Terrain analysis
+
+A further headless-IDA review of the same GOG `Terrain.dll` identifies a
+concrete `CBufferingCamera` implementation path without requiring a live game
+process. Its method at RVA `0x4D740` copies exactly 64 bytes (16 dwords) into
+the component at offset `+0x10`. Its frame-preparation method at RVA `0x4D9C0`
+queries a viewport rectangle through a virtual method at `+0x3C`, derives its
+width, height, centre and an aspect ratio from that rectangle, and obtains
+projection data through the camera interface. Projection type `0` uses a
+component float at offset `+0x234` as an angle passed to `tan(angle / 2)`;
+projection type `2` obtains a five-float block through a virtual method at
+`+0x70`. Any other non-zero type raises `Not supported projection type`.
+
+This is sufficient to prove that original viewport and projection state are
+live camera inputs, rather than a fixed diagnostic projection. It does **not**
+yet prove matrix row/column convention, angle units, near/far field mapping,
+handedness, or the initial mission camera object. In particular, the exported
+string-labelled `ICamera::SetTransformMatrix` (RVA `0x4F830`) and
+`ICamera::GetTransformMatrix` (RVA `0x4F850`) are both obsolete-call stubs, so
+they are not a usable method ABI.
+
 `Land.msh` использует отдельный geometry-only bridge: validated `TerrainFace28`
 сохраняет source triangle order, а его positions и packed UV0 попадают в тот же
 static vertex/index upload path. Для текущего диагностического viewer XY bounds

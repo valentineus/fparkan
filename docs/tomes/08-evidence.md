@@ -254,6 +254,20 @@ Terrain object. Следовательно, selector `18`, slot `+12` и global 
 должны оставаться именованными evidence boundary до dynamic capture; считать
 `stdGetCurrentCamera2` getter-ом переданной camera было бы ошибкой.
 
+Повторный headless-IDA review той же GOG базы уточняет рабочий static contract
+`CBufferingCamera`. Метод Terrain RVA `0x4D740` копирует ровно 64 байта
+(16 dword) в component offset `+0x10`. Frame-preparation метод RVA `0x4D9C0`
+получает viewport rectangle через virtual slot `+0x3C`, выводит width, height,
+centre и aspect, а projection читает через camera interface. Для projection type
+`0` он использует float по component offset `+0x234` в `tan(angle / 2)`; для
+type `2` получает five-float block через slot `+0x70`; иной non-zero type
+завершается `Not supported projection type`. Это доказывает зависимость
+projection от live camera/viewport, но не row/column convention, единицы угла,
+near/far mapping, handedness или initial camera selection. Важно, что строки
+`ICamera::SetTransformMatrix` (RVA `0x4F830`) и
+`ICamera::GetTransformMatrix` (RVA `0x4F850`) ведут только в obsolete-call
+stubs и не дают usable ABI.
+
 Локальная IDA-база уточняет адреса этой связи: `stdGetCurrentCamera2` — это
 шестибайтный getter по RVA `0x4FD80`, который возвращает `dword` по RVA
 `0x7355C`. Единственный найденный initializer этого global — функция Terrain
