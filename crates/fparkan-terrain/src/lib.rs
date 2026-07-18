@@ -18,7 +18,7 @@
         clippy::unwrap_used
     )
 )]
-//! Validated terrain runtime queries.
+//! Validated terrain runtime queries using XY ground coordinates and Z height.
 
 use fparkan_terrain_format::{FullSurfaceMask, LandMapDocument, LandMeshDocument};
 use std::collections::VecDeque;
@@ -36,7 +36,7 @@ pub struct TerrainWorld {
 /// Surface hit.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SurfaceHit {
-    /// Height.
+    /// Source Z height.
     pub height: f32,
     /// Hit position.
     pub position: [f32; 3],
@@ -135,7 +135,7 @@ impl std::error::Error for TerrainError {}
 
 /// Surface query.
 pub trait SurfaceQuery {
-    /// Height at position.
+    /// Source Z height at an XY ground position.
     ///
     /// # Errors
     ///
@@ -157,7 +157,7 @@ pub trait SurfaceQuery {
 
 /// Navigation query.
 pub trait NavigationQuery {
-    /// Locate areal.
+    /// Locates an areal from the XY components of a world position.
     ///
     /// # Errors
     ///
@@ -195,7 +195,7 @@ impl TerrainWorld {
                 polygon: areal
                     .vertices
                     .iter()
-                    .map(|vertex| [vertex[0], vertex[2]])
+                    .map(|vertex| [vertex[0], vertex[1]])
                     .collect(),
             });
         }
@@ -302,7 +302,7 @@ impl TerrainWorld {
         position: [f32; 3],
         candidates: &[ArealId],
     ) -> Result<Option<ArealId>, TerrainError> {
-        let point = [position[0], position[2]];
+        let point = [position[0], position[1]];
         for candidate in candidates {
             let Some(areal) = usize::try_from(candidate.0)
                 .ok()
@@ -427,7 +427,7 @@ impl SurfaceQuery for TerrainWorld {
                 origin[2] + direction[2] * distance,
             ];
             best = Some(SurfaceHit {
-                height: position[1],
+                height: position[2],
                 position,
                 distance,
                 face: triangle.face,
@@ -468,18 +468,18 @@ struct RuntimeTriangle {
 
 impl RuntimeTriangle {
     fn height_at(&self, position: [f32; 2]) -> Option<f32> {
-        let a = [self.vertices[0][0], self.vertices[0][2]];
-        let b = [self.vertices[1][0], self.vertices[1][2]];
-        let c = [self.vertices[2][0], self.vertices[2][2]];
+        let a = [self.vertices[0][0], self.vertices[0][1]];
+        let b = [self.vertices[1][0], self.vertices[1][1]];
+        let c = [self.vertices[2][0], self.vertices[2][1]];
         let weights = barycentric_2d(position, a, b, c)?;
         if weights
             .iter()
             .all(|weight| *weight >= -1.0e-4 && *weight <= 1.0001)
         {
             Some(
-                weights[0] * self.vertices[0][1]
-                    + weights[1] * self.vertices[1][1]
-                    + weights[2] * self.vertices[2][1],
+                weights[0] * self.vertices[0][2]
+                    + weights[1] * self.vertices[1][2]
+                    + weights[2] * self.vertices[2][2],
             )
         } else {
             None
@@ -570,9 +570,9 @@ impl RuntimeGrid {
         for areal in &map.areals {
             for vertex in &areal.vertices {
                 bounds_min[0] = bounds_min[0].min(vertex[0]);
-                bounds_min[1] = bounds_min[1].min(vertex[2]);
+                bounds_min[1] = bounds_min[1].min(vertex[1]);
                 bounds_max[0] = bounds_max[0].max(vertex[0]);
-                bounds_max[1] = bounds_max[1].max(vertex[2]);
+                bounds_max[1] = bounds_max[1].max(vertex[1]);
             }
         }
         if !bounds_min[0].is_finite()
@@ -622,7 +622,7 @@ impl RuntimeGrid {
         if self.cells_x == 0 || self.cells_y == 0 || self.cells.is_empty() {
             return None;
         }
-        let point = [position[0], position[2]];
+        let point = [position[0], position[1]];
         if point[0] < self.min[0]
             || point[0] > self.max[0]
             || point[1] < self.min[1]
@@ -770,18 +770,18 @@ mod tests {
 
         assert_eq!(world.areal_count(), 2);
         assert_eq!(
-            world.locate_areal([0.25, 0.0, 0.25]).expect("locate"),
+            world.locate_areal([0.25, 0.25, 41.0]).expect("locate"),
             Some(ArealId(0))
         );
         assert_eq!(
-            world.locate_areal([1.75, 0.0, 0.25]).expect("locate"),
+            world.locate_areal([1.75, 0.25, -12.0]).expect("locate"),
             Some(ArealId(1))
         );
         assert_eq!(
             world
                 .route(RouteRequest {
-                    start: [0.25, 0.0, 0.25],
-                    goal: [1.75, 0.0, 0.25],
+                    start: [0.25, 0.25, 0.0],
+                    goal: [1.75, 0.25, 0.0],
                 })
                 .expect("route"),
             Some(ArealRoute {
@@ -797,8 +797,8 @@ mod tests {
         assert_eq!(
             world
                 .route(RouteRequest {
-                    start: [10.0, 0.0, 10.0],
-                    goal: [1.75, 0.0, 0.25],
+                    start: [10.0, 10.0, 0.0],
+                    goal: [1.75, 0.25, 0.0],
                 })
                 .expect("route"),
             None
@@ -815,8 +815,8 @@ mod tests {
 
         let hit = world
             .raycast(
-                [0.25, 2.0, 0.25],
-                [0.0, -1.0, 0.0],
+                [0.25, 0.25, 2.0],
+                [0.0, 0.0, -1.0],
                 FullSurfaceMask(0x0000_0001),
             )
             .expect("raycast")
@@ -828,8 +828,8 @@ mod tests {
         assert_eq!(
             world
                 .raycast(
-                    [0.25, 2.0, 0.25],
-                    [0.0, -1.0, 0.0],
+                    [0.25, 0.25, 2.0],
+                    [0.0, 0.0, -1.0],
                     FullSurfaceMask(0x8000_0000)
                 )
                 .expect("raycast"),
@@ -942,9 +942,9 @@ mod tests {
             },
             positions: vec![
                 [0.0, 0.0, 0.0],
-                [1.0, 1.0, 0.0],
+                [1.0, 0.0, 1.0],
                 [0.0, 1.0, 1.0],
-                [1.0, 2.0, 1.0],
+                [1.0, 1.0, 2.0],
             ],
             normals: Vec::new(),
             uv0: Vec::new(),
@@ -987,10 +987,10 @@ mod tests {
             areals: vec![
                 Areal {
                     prefix_raw: [0; 56],
-                    anchor: [0.5, 0.0, 0.5],
+                    anchor: [0.5, 0.5, 0.0],
                     reserved_12: 0.0,
                     area_metric: 1.0,
-                    normal: [0.0, 1.0, 0.0],
+                    normal: [0.0, 0.0, 1.0],
                     logic_flag: 0,
                     reserved_36: 0,
                     class_id: 0,
@@ -998,8 +998,8 @@ mod tests {
                     vertices: vec![
                         [0.0, 0.0, 0.0],
                         [1.0, 0.0, 0.0],
-                        [1.0, 0.0, 1.0],
-                        [0.0, 0.0, 1.0],
+                        [1.0, 1.0, 0.0],
+                        [0.0, 1.0, 0.0],
                     ],
                     links: vec![
                         EdgeLink {
@@ -1031,10 +1031,10 @@ mod tests {
                 },
                 Areal {
                     prefix_raw: [0; 56],
-                    anchor: [1.5, 0.0, 0.5],
+                    anchor: [1.5, 0.5, 0.0],
                     reserved_12: 0.0,
                     area_metric: 1.0,
-                    normal: [0.0, 1.0, 0.0],
+                    normal: [0.0, 0.0, 1.0],
                     logic_flag: 0,
                     reserved_36: 0,
                     class_id: 0,
@@ -1042,8 +1042,8 @@ mod tests {
                     vertices: vec![
                         [1.0, 0.0, 0.0],
                         [2.0, 0.0, 0.0],
-                        [2.0, 0.0, 1.0],
-                        [1.0, 0.0, 1.0],
+                        [2.0, 1.0, 0.0],
+                        [1.0, 1.0, 0.0],
                     ],
                     links: vec![
                         EdgeLink {

@@ -1038,6 +1038,14 @@ to 120 seconds but remained at the existing `Graph` loading checkpoint and were
 terminated without a native frame/report; therefore no new readback hash or GPU
 acceptance result is claimed for the corrected projection yet.
 
+The same source-axis proof now applies to `TerrainWorld`: its `Land.msh` surface
+height query and `Land.map` areal/grid lookup use XY ground coordinates, return
+source Z height, and leave raycasts as full 3D intersections. The Part 1 and
+Part 2 licensed `Land.map` gate successfully locates sampled polygon vertices
+under that contract. This closes the former XZ mismatch in terrain queries; it
+does not establish object orientation, physics/gravity, original culling or the
+camera matrix.
+
 ### Camera ownership boundary from the GOG renderer
 
 The GOG `World3D.dll` export `LoadCamera` at RVA `0x1FB06` is only an import
