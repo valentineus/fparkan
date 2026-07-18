@@ -1611,8 +1611,17 @@ to zero. The profile-bank region starts at subobject `+332`: every one of the
 100 banks has a 116-byte header followed by a 96-byte initialized stream, hence
 the recovered 212-byte stride. The byte selected from each table entry is
 therefore a bank index into a constructor-owned, fixed 100-bank region. This
-proves the cache's allocation layout; it does **not** yet identify the code that
-populates individual entry records from map resources.
+proves the cache's allocation layout. Its population path is also now located.
+`Terrain.dll` RVA `0x10280` resets the count, recreates the base entries from
+the 28-byte stream at parent `+756`, and assigns bank zero. RVA `0x12e20`
+copies one `0xd4`-byte profile header into bank `profile_count`, increments that
+count, and remaps supplied keys to 28-byte records through the entry table. A
+mapped record is stored as `profile_record_base + 28 * record_index` with the
+new bank byte; a mapping whose second index is `-1` stores only the profile
+ordinal, below `0x1000`, and is deliberately rejected by the lookup routine.
+This explains the runtime sentinel without interpreting it as a missing WEAR
+row. The input map is not yet tied to a named on-disk stream, so this proves the
+cache builder's mechanics but not its complete asset-to-profile mapping.
 
 On success the method returns the shared result view at cache offset `+24`, not
 the stored-record pointer and not a WEAR row. Thus the dispatcher's observed
