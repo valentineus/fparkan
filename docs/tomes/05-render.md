@@ -1538,6 +1538,23 @@ temporary vertex buffers или заменять render representation. UI/shell
 диагностики полезно уметь сохранять world-only command list и финальный
 framebuffer отдельно.
 
+Terrain material discovery is now reproducible instead of inferred from the
+mesh shape. The original AutoDemo map places two textual sidecar WEAR tables,
+`Land1.wea` and `Land2.wea`, beside `Land.msh`; `Terrain.dll` contains the
+corresponding `1.wea` and `2.wea` loading suffixes. The new terrain inspector
+reports all packed face tags. For `DATA/MAPS/AutoMAP/Land.msh`, its 3,174 faces
+use `0x0102` (592), `0x0203` (386), `0xff01` (918), `0xff02` (970), and
+`0xff03` (308). The low byte is always a valid positional selector 1..3 in
+`Land2.wea`; the high byte is a `Land1.wea` selector or sentinel `0xff`.
+This is evidence for a two-layer terrain-material contract, but not yet for
+its blend equation, so the Vulkan bridge intentionally remains texture-agnostic
+until the base/overlay composition is recovered.
+
+```powershell
+cargo run -q -p fparkan-cli -- terrain inspect `
+  'C:\GOG Games\Parkan - Iron Strategy\DATA\MAPS\AutoMAP\Land.msh' --format json
+```
+
 ## Проверки паритета
 
 Главные риски совпадения кадра:

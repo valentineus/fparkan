@@ -26,8 +26,8 @@ use fparkan_assets::{
 };
 use fparkan_corpus::{discover, render_report_json, report, DiscoverOptions};
 use fparkan_inspection::{
-    inspect_archive_file, inspect_land_msh_bounds_file, inspect_model_from_root, ArchiveInspection,
-    ModelInspection,
+    inspect_archive_file, inspect_land_msh_bounds_file, inspect_model_from_root,
+    load_land_msh_from_path, ArchiveInspection, ModelInspection,
 };
 use fparkan_path::{normalize_relative, PathPolicy};
 use fparkan_prototype::build_prototype_graph_report;
@@ -125,6 +125,15 @@ struct TerrainInspectOutput {
     positions: usize,
     min: [f32; 3],
     max: [f32; 3],
+    faces: usize,
+    slots: usize,
+    material_tags: Vec<TerrainMaterialTagCount>,
+}
+
+#[derive(Serialize)]
+struct TerrainMaterialTagCount {
+    tag: u16,
+    faces: usize,
 }
 
 #[derive(Serialize)]
@@ -452,6 +461,18 @@ fn inspect_archive(args: &[String]) -> Result<(), String> {
 fn inspect_terrain(args: &[String]) -> Result<(), String> {
     let path = parse_file_path(args, "terrain inspect")?;
     let bounds = inspect_land_msh_bounds_file(&path)?;
+    let terrain = load_land_msh_from_path(&path)?;
+    let mut material_tags = terrain
+        .faces
+        .iter()
+        .fold(std::collections::BTreeMap::new(), |mut counts, face| {
+            *counts.entry(face.material_tag).or_insert(0usize) += 1;
+            counts
+        })
+        .into_iter()
+        .map(|(tag, faces)| TerrainMaterialTagCount { tag, faces })
+        .collect::<Vec<_>>();
+    material_tags.sort_unstable_by_key(|entry| entry.tag);
     println!(
         "{}",
         serialize_json(&TerrainInspectOutput {
@@ -460,6 +481,9 @@ fn inspect_terrain(args: &[String]) -> Result<(), String> {
             positions: bounds.positions,
             min: bounds.min,
             max: bounds.max,
+            faces: terrain.faces.len(),
+            slots: terrain.slots.slots_raw.len(),
+            material_tags,
         })?
     );
     Ok(())
@@ -703,12 +727,18 @@ mod tests {
             positions: 3,
             min: [-1.0, -2.0, -3.0],
             max: [4.0, 5.0, 6.0],
+            faces: 2,
+            slots: 4,
+            material_tags: vec![
+                TerrainMaterialTagCount { tag: 0, faces: 1 },
+                TerrainMaterialTagCount { tag: 3, faces: 1 },
+            ],
         })
         .expect("serialize terrain inspection");
 
         assert_eq!(
             json,
-            "{\"schema_version\":\"fparkan-terrain-inspect-v1\",\"path\":\"DATA/MAPS/AutoMAP/Land.msh\",\"positions\":3,\"min\":[-1.0,-2.0,-3.0],\"max\":[4.0,5.0,6.0]}"
+            "{\"schema_version\":\"fparkan-terrain-inspect-v1\",\"path\":\"DATA/MAPS/AutoMAP/Land.msh\",\"positions\":3,\"min\":[-1.0,-2.0,-3.0],\"max\":[4.0,5.0,6.0],\"faces\":2,\"slots\":4,\"material_tags\":[{\"tag\":0,\"faces\":1},{\"tag\":3,\"faces\":1}]}"
         );
     }
 }
