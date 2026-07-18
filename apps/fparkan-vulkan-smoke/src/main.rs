@@ -14,10 +14,10 @@
 use fparkan_platform::RenderRequest;
 use fparkan_platform_winit::{window_native_handles, WinitWindowPlan};
 use fparkan_render_vulkan::{
-    project_land_msh_to_static_mesh, project_msh_to_static_mesh, VulkanSmokeBootstrapProgress,
-    VulkanSmokeFrameOutcome, VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo,
-    VulkanSmokeRendererReport, VulkanSmokeShutdownReport, VulkanStaticMaterial, VulkanStaticMesh,
-    VulkanStaticTexture, VulkanValidationReport,
+    project_land_msh_to_static_mesh, project_msh_to_static_mesh, VulkanReadbackArtifact,
+    VulkanSmokeBootstrapProgress, VulkanSmokeFrameOutcome, VulkanSmokeRenderer,
+    VulkanSmokeRendererCreateInfo, VulkanSmokeRendererReport, VulkanSmokeShutdownReport,
+    VulkanStaticMaterial, VulkanStaticMesh, VulkanStaticTexture, VulkanValidationReport,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -557,6 +557,7 @@ fn drop_renderer_before_window<Renderer, WindowLike>(
 #[derive(Clone, Debug)]
 struct RendererSnapshot {
     report: VulkanSmokeRendererReport,
+    readback_artifact: Option<VulkanReadbackArtifact>,
     swapchain_recreate_count: u32,
     validation: VulkanValidationReport,
 }
@@ -565,6 +566,7 @@ impl From<VulkanSmokeShutdownReport> for RendererSnapshot {
     fn from(report: VulkanSmokeShutdownReport) -> Self {
         Self {
             report: report.renderer_report,
+            readback_artifact: report.readback_artifact,
             swapchain_recreate_count: report.swapchain_recreate_count,
             validation: report.validation,
         }
@@ -627,9 +629,24 @@ impl SmokeApp {
             .map_err(|err| format!("{}: {err}", self.options.out.display()))
     }
 
+    fn write_readback_artifact(&self, artifact: &VulkanReadbackArtifact) -> Result<(), String> {
+        let stem = self
+            .options
+            .out
+            .file_stem()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("smoke");
+        let path = self
+            .options
+            .out
+            .with_file_name(format!("{stem}.readback-b8g8r8a8.raw"));
+        std::fs::write(&path, &artifact.bytes).map_err(|err| format!("{}: {err}", path.display()))
+    }
+
     fn live_renderer_snapshot(&self) -> Option<RendererSnapshot> {
         self.renderer.as_ref().map(|renderer| RendererSnapshot {
             report: renderer.report().clone(),
+            readback_artifact: None,
             swapchain_recreate_count: renderer.swapchain_recreate_count(),
             validation: renderer.validation_report(),
         })
@@ -866,6 +883,17 @@ impl SmokeApp {
             return;
         }
         self.final_renderer = Some(final_renderer);
+        if let Some(artifact) = self
+            .final_renderer
+            .as_ref()
+            .and_then(|snapshot| snapshot.readback_artifact.as_ref())
+        {
+            if let Err(err) = self.write_readback_artifact(artifact) {
+                self.error = Some(err);
+                event_loop.exit();
+                return;
+            }
+        }
         let report = match self.render_report("passed", None) {
             Ok(report) => report,
             Err(err) => {

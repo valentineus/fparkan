@@ -10,10 +10,11 @@ use super::{
     create_vulkan_logical_device_probe_for_request, create_vulkan_surface_probe,
     create_vulkan_swapchain_probe_for_extent, destroy_allocated_buffer, destroy_allocated_image,
     destroy_swapchain_resources, plan_vulkan_surface, readback_buffer_bytes, VulkanAllocatedBuffer,
-    VulkanInstanceConfig, VulkanInstanceProbe, VulkanLogicalDeviceProbe, VulkanSmokeFrameOutcome,
-    VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo, VulkanSmokeRendererError,
-    VulkanSmokeRendererReport, VulkanSmokeShutdownReport, VulkanSurfaceProbe, VulkanSwapchainProbe,
-    VulkanSwapchainResources, VulkanValidationMessenger, VulkanValidationReport,
+    VulkanInstanceConfig, VulkanInstanceProbe, VulkanLogicalDeviceProbe, VulkanReadbackArtifact,
+    VulkanSmokeFrameOutcome, VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo,
+    VulkanSmokeRendererError, VulkanSmokeRendererReport, VulkanSmokeShutdownReport,
+    VulkanSurfaceProbe, VulkanSwapchainProbe, VulkanSwapchainResources, VulkanValidationMessenger,
+    VulkanValidationReport,
 };
 use crate::policy::KHR_PORTABILITY_SUBSET_EXTENSION;
 use crate::shader_manifest::{triangle_shader_manifest, validate_shader_manifest};
@@ -845,10 +846,18 @@ impl VulkanSmokeRenderer {
         } else {
             None
         };
-        if let Some((byte_count, hash)) = completed_readback {
-            self.report.readback_byte_count = byte_count;
-            self.report.readback_fnv1a64 = hash;
-        }
+        let readback_artifact = completed_readback.map(|bytes| {
+            self.report.readback_byte_count = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            self.report.readback_fnv1a64 = fnv1a64(&bytes);
+            VulkanReadbackArtifact {
+                format: self
+                    .swapchain_ref()
+                    .map_or(0, |swapchain| swapchain.report.plan.format.format),
+                width: self.report.swapchain_extent.0,
+                height: self.report.swapchain_extent.1,
+                bytes,
+            }
+        });
         self.destroy_device_owned_resources();
         let validation = take_runtime_children_with_validation_snapshot(
             &mut self.surface,
@@ -862,6 +871,7 @@ impl VulkanSmokeRenderer {
         self.instance.take();
         Ok(VulkanSmokeShutdownReport {
             renderer_report: self.report.clone(),
+            readback_artifact,
             swapchain_recreate_count: self.swapchain_recreate_count,
             validation,
         })
@@ -870,7 +880,7 @@ impl VulkanSmokeRenderer {
     fn completed_readback(
         &self,
         device: &VulkanLogicalDeviceProbe,
-    ) -> Result<Option<(u64, u64)>, VulkanSmokeRendererError> {
+    ) -> Result<Option<Vec<u8>>, VulkanSmokeRendererError> {
         let Some(resources) = self.swapchain_resources.as_ref() else {
             return Ok(None);
         };
@@ -888,17 +898,13 @@ impl VulkanSmokeRenderer {
         if resources.readback_buffers.is_empty() {
             return Ok(None);
         }
-        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-        let mut byte_count = 0_u64;
+        let mut artifact =
+            Vec::with_capacity(byte_len.saturating_mul(resources.readback_buffers.len()));
         for buffer in &resources.readback_buffers {
             let bytes = readback_buffer_bytes(device, buffer, byte_len)?;
-            for byte in bytes {
-                hash ^= u64::from(byte);
-                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-            byte_count = byte_count.saturating_add(u64::try_from(byte_len).unwrap_or(u64::MAX));
+            artifact.extend_from_slice(&bytes);
         }
-        Ok(Some((byte_count, hash)))
+        Ok(Some(artifact))
     }
 
     fn teardown(&mut self) {
@@ -917,6 +923,12 @@ impl VulkanSmokeRenderer {
         self.validation.take();
         self.instance.take();
     }
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 impl Drop for VulkanSmokeRenderer {

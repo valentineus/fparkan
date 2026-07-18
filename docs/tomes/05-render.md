@@ -895,6 +895,12 @@ static viewer. Он ещё не захватывает original DirectDraw frame
 fixed original camera и не сравнивает два изображения, поэтому pixel-parity
 acceptance остаётся blocked.
 
+Smoke также сохраняет raw artifact рядом с JSON: `<report-stem>.readback-b8g8r8a8.raw`.
+Это concatenated current-swapchain images in Vulkan order, каждый с dimensions
+из JSON и четырьмя bytes per pixel; format намеренно указан в имени файла,
+потому что bytes не перекодируются. GOG proof produced a 4,147,200-byte file
+for two 960x540 images. Артефакт остаётся локальным output и не попадает в Git.
+
 `Land.msh` использует отдельный geometry-only bridge: validated `TerrainFace28`
 сохраняет source triangle order, а его positions и packed UV0 попадают в тот же
 static vertex/index upload path. Для текущего диагностического viewer XZ bounds

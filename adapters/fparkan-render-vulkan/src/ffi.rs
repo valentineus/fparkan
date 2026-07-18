@@ -66,11 +66,11 @@ pub use self::runtime::{
     VulkanLogicalDeviceError, VulkanLogicalDeviceProbe, VulkanLogicalDeviceReport,
 };
 pub use self::smoke_types::{
-    VulkanSmokeBootstrapProgress, VulkanSmokeBootstrapSnapshot, VulkanSmokeFrameOutcome,
-    VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo, VulkanSmokeRendererError,
-    VulkanSmokeRendererReport, VulkanSmokeShutdownReport, VulkanStaticDrawRange,
-    VulkanStaticMaterial, VulkanStaticMesh, VulkanStaticTexture, VulkanStaticVertex,
-    VulkanValidationReport,
+    VulkanReadbackArtifact, VulkanSmokeBootstrapProgress, VulkanSmokeBootstrapSnapshot,
+    VulkanSmokeFrameOutcome, VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo,
+    VulkanSmokeRendererError, VulkanSmokeRendererReport, VulkanSmokeShutdownReport,
+    VulkanStaticDrawRange, VulkanStaticMaterial, VulkanStaticMesh, VulkanStaticTexture,
+    VulkanStaticVertex, VulkanValidationReport,
 };
 #[cfg(test)]
 use self::surface::extension_name;

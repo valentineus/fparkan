@@ -478,11 +478,26 @@ pub struct VulkanValidationReport {
     pub vuids: Vec<String>,
 }
 
+/// CPU-owned copy of the final completed swapchain readback buffers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VulkanReadbackArtifact {
+    /// Vulkan swapchain format as a raw enum value.
+    pub format: i32,
+    /// Width of each image in pixels.
+    pub width: u32,
+    /// Height of each image in pixels.
+    pub height: u32,
+    /// Concatenated raw four-byte-per-pixel images in swapchain order.
+    pub bytes: Vec<u8>,
+}
+
 /// Final smoke renderer shutdown evidence captured after explicit teardown.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VulkanSmokeShutdownReport {
     /// Stable renderer bootstrap and swapchain report.
     pub renderer_report: VulkanSmokeRendererReport,
+    /// Optional raw GPU readback retained after synchronization and before teardown.
+    pub readback_artifact: Option<VulkanReadbackArtifact>,
     /// Measured swapchain recreation count for the completed smoke loop.
     pub swapchain_recreate_count: u32,
     /// Final validation snapshot captured before the debug messenger is destroyed.
