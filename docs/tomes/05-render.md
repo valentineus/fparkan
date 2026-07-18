@@ -1457,11 +1457,23 @@ is the base of the `0x1A4` camera object (vtables at `+0` and `+4`), while
 with its own vtable. This capture format deliberately preserves the former
 base-object interpretation and does not invent camera ownership.
 
-A bounded first launch of the capture-driven static preview against the
-canonical GOG `MISSIONS/Autodemo.00/data.tma` did not reach a native frame
-within 60 seconds. It is therefore load-path evidence only, not a rendering or
-pixel-parity result; the existing full dependency preparation remains the next
-performance/runtime obstacle before this exact capture can be visually compared.
+The first bounded launch showed that repeated fingerprinting, rather than
+Vulkan initialization, was the load-path bottleneck: each new MAT0/TEXM request
+re-opened an already decoded archive and re-hashed its entire source file.
+`ResourceRepository::open_archive_unchanged` now makes the *explicit* bounded
+loading-transaction contract available. The normal `open_archive` remains the
+strict public path and still invalidates stale entry handles after an external
+archive replacement; only mission asset preparation uses the transactional
+variant because it consumes an immutable snapshot of the selected game root.
+
+With that scoped cache, canonical GOG
+`MISSIONS/Autodemo.00/data.tma --backend static-vulkan --preview-roots 1`
+completed preparation in 6.308 seconds (the visual graph completed in 6.012
+seconds) and produced a 1280×720 native Vulkan frame with the captured D3D7
+camera, 15 material descriptors, and zero validation warnings or errors. This
+is a real original-asset rendering milestone, but not pixel parity or gameplay
+camera parity: it intentionally renders the bounded first preview root and
+uses a one-time offline camera capture.
 
 A fresh no-input launch of the canonical `iron_3d.exe` did create a responsive
 window titled `Parkan. Железная Стратегия`. A read-only probe then requested

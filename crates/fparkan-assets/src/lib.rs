@@ -1863,7 +1863,7 @@ fn read_key<R: ResourceRepository>(
 ) -> Result<Arc<[u8]>, AssetError> {
     let label = label.unwrap_or("asset");
     let archive = repository
-        .open_archive(&key.archive)
+        .open_archive_unchanged(&key.archive)
         .map_err(|err| map_resource_error(label, key, err))?;
     let handle = repository
         .find(archive, &key.name)
@@ -1928,7 +1928,7 @@ fn resolve_wear_table<R: ResourceRepository>(
     mesh: &ResourceKey,
 ) -> Result<fparkan_material::WearTable, AssetError> {
     let archive = repository
-        .open_archive(&mesh.archive)
+        .open_archive_unchanged(&mesh.archive)
         .map_err(|err| map_resource_error("wear", mesh, err))?;
     let wear_name = sibling_name(mesh, "wea")?;
     let handle = repository
@@ -2271,7 +2271,7 @@ fn read_optional_key<R: ResourceRepository>(
     key: &ResourceKey,
     label: Option<&str>,
 ) -> Result<Option<Arc<[u8]>>, AssetError> {
-    let archive = match repository.open_archive(&key.archive) {
+    let archive = match repository.open_archive_unchanged(&key.archive) {
         Ok(archive) => archive,
         Err(ResourceError::MissingArchive { .. } | ResourceError::MissingEntry) => return Ok(None),
         Err(err) => {

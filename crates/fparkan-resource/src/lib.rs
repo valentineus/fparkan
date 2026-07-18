@@ -258,6 +258,21 @@ pub trait ResourceRepository {
     /// Returns [`ResourceError`] when the archive is missing, unsupported, or
     /// malformed.
     fn open_archive(&self, path: &NormalizedPath) -> Result<ArchiveId, ResourceError>;
+    /// Opens an archive known to remain unchanged for the caller's bounded
+    /// loading transaction.
+    ///
+    /// Implementations may reuse an already decoded archive without a second
+    /// content-fingerprint pass. Callers must use this only while their asset
+    /// source is immutable; the default preserves [`Self::open_archive`]'s
+    /// strict invalidation behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResourceError`] when the archive is missing, unsupported, or
+    /// malformed.
+    fn open_archive_unchanged(&self, path: &NormalizedPath) -> Result<ArchiveId, ResourceError> {
+        self.open_archive(path)
+    }
     /// Finds entry.
     ///
     /// # Errors
@@ -522,6 +537,19 @@ impl ResourceRepository for CachedResourceRepository {
             state.evict_archives(id)?;
             return Ok(id);
         }
+    }
+
+    fn open_archive_unchanged(&self, path: &NormalizedPath) -> Result<ArchiveId, ResourceError> {
+        let key = path.identity_bytes().to_vec();
+        let mut state = self.state.lock().map_err(|_| ResourceError::Poisoned)?;
+        if let Some(id) = state.paths.get(&key).copied() {
+            if state.archive(id)?.document.is_some() {
+                state.touch_archive(id)?;
+                return Ok(id);
+            }
+        }
+        drop(state);
+        self.open_archive(path)
     }
 
     fn find(
@@ -1098,6 +1126,23 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(vfs.reads.load(Ordering::Relaxed), 2);
+        assert_eq!(vfs.metadata_reads.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn unchanged_transaction_reuses_decoded_archive_without_rereading() {
+        let path = archive_path(b"archives/test.lib").expect("path");
+        let bytes = Arc::from(build_nres(&[("one", b"payload")]).into_boxed_slice());
+        let vfs = Arc::new(CountingVfs::new(bytes));
+        let repo = CachedResourceRepository::new(Arc::clone(&vfs) as Arc<dyn Vfs>);
+
+        let first = repo.open_archive_unchanged(&path).expect("first open");
+        let second = repo
+            .open_archive_unchanged(&path)
+            .expect("transactional cached open");
+
+        assert_eq!(first, second);
+        assert_eq!(vfs.reads.load(Ordering::Relaxed), 1);
         assert_eq!(vfs.metadata_reads.load(Ordering::Relaxed), 1);
     }
 
