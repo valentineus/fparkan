@@ -1498,6 +1498,15 @@ errors. This validates the offline handoff for one captured instant; it does
 not claim live camera tracking, material parity, or an original-frame pixel
 comparison.
 
+For visual regression work, `fparkan-game --backend static-vulkan` also accepts
+`--readback-out <path>`. It writes the final synchronized Vulkan readback bytes
+only after the renderer has completed its normal teardown evidence; the JSON
+report records the raw Vulkan format, byte count, hash, and requested path. A
+three-frame diagnostic AutoDemo run wrote 7,372,800 bytes at format `50`
+(`VK_FORMAT_B8G8R8A8_UNORM`) with the same frame hash reported by the renderer.
+The artifact is a Vulkan-side comparison input, not an asserted original-frame
+image.
+
 The first bounded launch showed that repeated fingerprinting, rather than
 Vulkan initialization, was the load-path bottleneck: each new MAT0/TEXM request
 re-opened an already decoded archive and re-hashed its entire source file.

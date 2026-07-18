@@ -119,6 +119,7 @@ fn run(args: &[String]) -> Result<String, String> {
             args.frames,
             &args.mission,
             loaded.object_count,
+            args.readback_out.as_deref(),
         );
     }
 
@@ -651,11 +652,18 @@ fn run_static_vulkan_mode(
     target_frames: u64,
     mission: &str,
     object_count: usize,
+    readback_out: Option<&std::path::Path>,
 ) -> Result<String, String> {
     let event_loop = EventLoop::new().map_err(|err| format!("winit event loop: {err}"))?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app =
-        StaticVulkanApp::new(preview, preview_roots, target_frames, mission, object_count);
+    let mut app = StaticVulkanApp::new(
+        preview,
+        preview_roots,
+        target_frames,
+        mission,
+        object_count,
+        readback_out.map(std::path::Path::to_path_buf),
+    );
     if let Err(err) = event_loop.run_app(&mut app) {
         app.error = Some(format!("winit event loop: {err}"));
     }
@@ -674,6 +682,7 @@ struct StaticVulkanApp {
     target_frames: u64,
     mission: String,
     object_count: usize,
+    readback_out: Option<PathBuf>,
     window_id: Option<WindowId>,
     window: Option<Window>,
     renderer: Option<VulkanSmokeRenderer>,
@@ -689,6 +698,7 @@ impl StaticVulkanApp {
         target_frames: u64,
         mission: &str,
         object_count: usize,
+        readback_out: Option<PathBuf>,
     ) -> Self {
         Self {
             mesh: preview.mesh,
@@ -702,6 +712,7 @@ impl StaticVulkanApp {
             target_frames,
             mission: mission.to_string(),
             object_count,
+            readback_out,
             window_id: None,
             window: None,
             renderer: None,
@@ -740,8 +751,32 @@ impl StaticVulkanApp {
             event_loop.exit();
             return;
         }
+        let readback_path = match (&self.readback_out, &report.readback_artifact) {
+            (Some(path), Some(artifact)) => {
+                if let Some(parent) = path.parent() {
+                    if let Err(err) = std::fs::create_dir_all(parent) {
+                        self.error = Some(format!("{}: {err}", parent.display()));
+                        event_loop.exit();
+                        return;
+                    }
+                }
+                if let Err(err) = std::fs::write(path, &artifact.bytes) {
+                    self.error = Some(format!("{}: {err}", path.display()));
+                    event_loop.exit();
+                    return;
+                }
+                Some(path.display().to_string())
+            }
+            (Some(_), None) => {
+                self.error =
+                    Some("native Vulkan renderer produced no synchronized readback".to_string());
+                event_loop.exit();
+                return;
+            }
+            (None, _) => None,
+        };
         self.output = Some(format!(
-            "{{\"report_kind\":\"rendered-static-mission\",\"backend\":\"vulkan-static\",\"camera_mode\":{},\"window\":\"native\",\"mission\":{},\"objects\":{},\"frames\":{},\"preview_roots\":{},\"mesh_components\":{},\"terrain_components\":{},\"clip_visible_vertices\":{},\"material_descriptors\":{},\"swapchain\":[{},{}],\"swapchain_images\":{},\"validation_warnings\":{},\"validation_errors\":{},\"readback_bytes\":{},\"readback_hash\":{}}}",
+            "{{\"report_kind\":\"rendered-static-mission\",\"backend\":\"vulkan-static\",\"camera_mode\":{},\"window\":\"native\",\"mission\":{},\"objects\":{},\"frames\":{},\"preview_roots\":{},\"mesh_components\":{},\"terrain_components\":{},\"clip_visible_vertices\":{},\"material_descriptors\":{},\"swapchain\":[{},{}],\"swapchain_images\":{},\"validation_warnings\":{},\"validation_errors\":{},\"readback_format\":{},\"readback_bytes\":{},\"readback_hash\":{},\"readback_path\":{}}}",
             json_string(self.camera_mode),
             json_string(&self.mission),
             self.object_count,
@@ -756,8 +791,10 @@ impl StaticVulkanApp {
             report.renderer_report.swapchain_image_count,
             report.validation.warning_count,
             report.validation.error_count,
+            report.readback_artifact.as_ref().map_or(0, |artifact| artifact.format),
             report.renderer_report.readback_byte_count,
             report.renderer_report.readback_fnv1a64,
+            readback_path.as_deref().map_or_else(|| "null".to_string(), json_string),
         ));
         event_loop.exit();
     }
@@ -995,6 +1032,7 @@ struct Args {
     frames: u64,
     backend: RenderBackendMode,
     load_progress: Option<PathBuf>,
+    readback_out: Option<PathBuf>,
     preview_roots: NonZeroUsize,
     legacy_camera_capture: Option<PathBuf>,
 }
@@ -1012,6 +1050,7 @@ impl Args {
         let mut frames = 1;
         let mut backend = RenderBackendMode::Planning;
         let mut load_progress = None;
+        let mut readback_out = None;
         // A native static-Vulkan invocation is the usable mission preview, so
         // its default scope covers every root. `PreviewRoots` is clamped by the
         // runtime to the decoded mission length; an explicit --preview-roots N
@@ -1060,6 +1099,13 @@ impl Args {
                             .ok_or_else(|| "--load-progress requires a path".to_string())?,
                     );
                 }
+                "--readback-out" => {
+                    readback_out = Some(
+                        iter.next()
+                            .map(PathBuf::from)
+                            .ok_or_else(|| "--readback-out requires a path".to_string())?,
+                    );
+                }
                 "--preview-roots" => {
                     preview_roots = iter
                         .next()
@@ -1084,12 +1130,16 @@ impl Args {
         if legacy_camera_capture.is_some() && backend != RenderBackendMode::StaticVulkan {
             return Err("--legacy-camera-capture requires --backend static-vulkan".to_string());
         }
+        if readback_out.is_some() && backend != RenderBackendMode::StaticVulkan {
+            return Err("--readback-out requires --backend static-vulkan".to_string());
+        }
         Ok(Self {
             root,
             mission,
             frames,
             backend,
             load_progress,
+            readback_out,
             preview_roots,
             legacy_camera_capture,
         })
@@ -1163,7 +1213,7 @@ fn json_hash(hash: &[u8; 32]) -> String {
 }
 
 fn usage() -> String {
-    "usage: fparkan-game --root <path> --mission <path> [--frames <n>] [--backend <planning|static-vulkan>] [--preview-roots <non-zero n>] [--legacy-camera-capture <path>] [--load-progress <path>]".to_string()
+    "usage: fparkan-game --root <path> --mission <path> [--frames <n>] [--backend <planning|static-vulkan>] [--preview-roots <non-zero n>] [--legacy-camera-capture <path>] [--readback-out <path>] [--load-progress <path>]".to_string()
 }
 
 #[cfg(test)]
@@ -1228,6 +1278,7 @@ mod tests {
                 frames: 3,
                 backend: RenderBackendMode::Planning,
                 load_progress: None,
+                readback_out: None,
                 preview_roots: NonZeroUsize::MAX,
                 legacy_camera_capture: None,
             })
@@ -1251,6 +1302,7 @@ mod tests {
                 frames: 1,
                 backend: RenderBackendMode::StaticVulkan,
                 load_progress: None,
+                readback_out: None,
                 preview_roots: NonZeroUsize::MAX,
                 legacy_camera_capture: None,
             })
@@ -1274,6 +1326,34 @@ mod tests {
             parsed.preview_roots,
             NonZeroUsize::new(2).expect("non-zero literal")
         );
+    }
+
+    #[test]
+    fn readback_output_requires_static_vulkan_and_is_retained() {
+        let common = [
+            "--root",
+            "testdata/IS",
+            "--mission",
+            "MISSIONS/Autodemo.00/data.tma",
+            "--readback-out",
+            "target/frame.raw",
+        ];
+        assert_eq!(
+            Args::parse(&strings(&common)),
+            Err("--readback-out requires --backend static-vulkan".to_string())
+        );
+        let parsed = Args::parse(&strings(&[
+            "--root",
+            "testdata/IS",
+            "--mission",
+            "MISSIONS/Autodemo.00/data.tma",
+            "--backend",
+            "static-vulkan",
+            "--readback-out",
+            "target/frame.raw",
+        ]))
+        .expect("valid readback output arguments");
+        assert_eq!(parsed.readback_out, Some(PathBuf::from("target/frame.raw")));
     }
 
     #[test]
@@ -1309,6 +1389,7 @@ mod tests {
                 frames: 1,
                 backend: RenderBackendMode::Planning,
                 load_progress: Some(PathBuf::from("target/probe.txt")),
+                readback_out: None,
                 preview_roots: NonZeroUsize::MAX,
                 legacy_camera_capture: None,
             })
