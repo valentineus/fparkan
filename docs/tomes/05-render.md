@@ -1383,6 +1383,40 @@ next recovery target is therefore the Direct3D transform consumer in
 `700`, `0.1`, and `0.99` values remain unlabelled until that consumer proves
 their roles.
 
+### Ngi32 Direct3D7 camera matrices recovered
+
+The downstream renderer is now concrete. `iron3d.dll` obtains an opaque
+render interface through `Ngi32!niGet3DRender`; Ngi32 RVA `0x5640` returns the
+global renderer object at RVA `0x3A460`. Its constructor at RVA `0x5E10` gives
+the `0x8CC`-byte object vtable `0x100315E0`. During device setup, Ngi32 RVA
+`0x8E70` calls the Direct3D7 device vtable at `+0x2C` (`SetTransform`) with
+state `3` for the matrix made by RVA `0x7030` and state `2` for the matrix made
+by RVA `0x9450`: projection then view.
+
+RVA `0x7030` exactly builds the row-major D3D7 projection from renderer FOV
+`f`, near `n`, far `z` and viewport width/height `w`/`h`:
+
+```text
+[ cos(f/2),         0,                 0,          0 ]
+[        0, h/w * cos(f/2),            0,          0 ]
+[        0,         0, z/(z-n), sin(f/2) ]
+[        0,         0, -n*z/(z-n),     0 ]
+```
+
+The sine in the homogeneous-W term is intentional: after the D3D perspective
+divide the diagonal has the expected cotangent scale. RVA `0x9450` applies a
+specific axis permutation/sign change and translated dot products to selector
+0 before the view `SetTransform`; it is not merely the generic affine inverse.
+
+An elevated read-only AutoDemo probe sampled a 1024×768 renderer with
+near=`0.5`, far=`700`, FOV=`1.3` radians and showed its view-source pointer
+byte-identical to the active Terrain outer camera's selector-0 block. This
+proves ownership and the D3D7 boundary, while keeping the earlier
+`CBufferingCamera` FOV=`1.04` as a distinct upstream interface value. The
+backend-neutral render crate now exposes the two recovered D3D7 matrices, but
+does not yet use them as Vulkan matrices: vector and clip-space conversion is
+still an explicit next task.
+
 A fresh no-input launch of the canonical `iron_3d.exe` did create a responsive
 window titled `Parkan. Железная Стратегия`. A read-only probe then requested
 `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ` and attempted to read the known

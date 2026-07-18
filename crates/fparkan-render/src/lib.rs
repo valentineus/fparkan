@@ -127,6 +127,123 @@ impl RawCameraTransform {
             1.0,
         ])
     }
+
+    /// Reproduces Ngi32's `Direct3D7` view-matrix conversion for this transform.
+    ///
+    /// The legacy renderer copies selector-0 into its camera state, then maps
+    /// its axes and translation in this exact order before calling
+    /// `IDirect3DDevice7::SetTransform(D3DTRANSFORMSTATE_VIEW, ...)`. This is
+    /// deliberately distinct from [`Self::try_inverse_affine_row_major`]: it
+    /// includes the original renderer's coordinate-system conversion.
+    ///
+    /// The returned matrix is row-major D3D7 data, not yet a Vulkan view
+    /// matrix. A later adapter must explicitly account for clip-space and
+    /// shader-vector conventions.
+    #[must_use]
+    pub fn try_direct3d7_view_row_major(self) -> Option<[f32; 16]> {
+        let matrix = self.words.map(f32::from_bits);
+        if !matrix.iter().all(|value| value.is_finite())
+            || matrix[12].abs() > f32::EPSILON
+            || matrix[13].abs() > f32::EPSILON
+            || matrix[14].abs() > f32::EPSILON
+            || (matrix[15] - 1.0).abs() > f32::EPSILON
+        {
+            return None;
+        }
+
+        let [m00, m01, m02, m03, m10, m11, m12, m13, m20, m21, m22, m23, _, _, _, _] = matrix;
+        Some([
+            -m01,
+            m02,
+            m00,
+            0.0,
+            -m11,
+            m12,
+            m10,
+            0.0,
+            -m21,
+            m22,
+            m20,
+            0.0,
+            m23.mul_add(m21, m13.mul_add(m11, m03 * m01)),
+            -(m23.mul_add(m12, m13.mul_add(m02, m03 * m10))),
+            -(m00.mul_add(m03, m23.mul_add(m20, m13 * m10))),
+            1.0,
+        ])
+    }
+}
+
+/// Parameters consumed by Ngi32's `Direct3D7` projection-matrix builder.
+///
+/// These are a separate legacy-renderer boundary from
+/// [`RawCameraProjection`]. The latter preserves Terrain's source ABI, while
+/// this type records the already-resolved Ngi32 values submitted to `Direct3D7`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LegacyD3d7Projection {
+    /// Viewport rectangle as `(left, top, right, bottom)`.
+    pub viewport: [i32; 4],
+    /// Positive camera near-plane distance.
+    pub near_plane: f32,
+    /// Camera far-plane distance, greater than [`Self::near_plane`].
+    pub far_plane: f32,
+    /// Full field-of-view angle in radians.
+    pub field_of_view_radians: f32,
+}
+
+impl LegacyD3d7Projection {
+    /// Reconstructs the exact row-major matrix passed to D3D7 projection state.
+    ///
+    /// Ngi32 uses the viewport's `height / width`, writes `cos(fov / 2)` to
+    /// the diagonal and `sin(fov / 2)` to the homogeneous-W term. The ratio
+    /// after D3D's perspective divide is therefore the expected cotangent
+    /// scale. This remains legacy D3D7 data rather than a Vulkan projection.
+    #[must_use]
+    pub fn try_direct3d7_projection_row_major(self) -> Option<[f32; 16]> {
+        let width = self.viewport[2].checked_sub(self.viewport[0])?;
+        let height = self.viewport[3].checked_sub(self.viewport[1])?;
+        if width <= 0
+            || height <= 0
+            || !self.near_plane.is_finite()
+            || !self.far_plane.is_finite()
+            || !self.field_of_view_radians.is_finite()
+            || self.near_plane <= 0.0
+            || self.far_plane <= self.near_plane
+            || self.field_of_view_radians <= 0.0
+            || self.field_of_view_radians >= std::f32::consts::PI
+        {
+            return None;
+        }
+
+        // Ngi32 converts these signed viewport dimensions into single-precision
+        // arithmetic before building the legacy matrix.
+        #[allow(clippy::cast_precision_loss)]
+        let aspect = (height as f32) / (width as f32);
+        let half_fov = self.field_of_view_radians * 0.5;
+        let cosine = half_fov.cos();
+        let sine = half_fov.sin();
+        let depth_scale = 1.0 / (1.0 - self.near_plane / self.far_plane);
+        [aspect, cosine, sine, depth_scale]
+            .iter()
+            .all(|value| value.is_finite())
+            .then_some([
+                cosine,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                aspect * cosine,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                depth_scale,
+                sine,
+                0.0,
+                0.0,
+                -(depth_scale * self.near_plane),
+                0.0,
+            ])
+    }
 }
 
 /// Raw camera state observed through the original Terrain camera interface.
@@ -949,6 +1066,71 @@ mod tests {
 
         let singular = RawCameraTransform { words: [0_u32; 16] };
         assert_eq!(singular.try_inverse_affine_row_major(), None);
+    }
+
+    #[test]
+    fn raw_camera_transform_reproduces_direct3d7_view_axis_conversion() {
+        let transform = RawCameraTransform {
+            words: [
+                0.0_f32.to_bits(),
+                (-1.0_f32).to_bits(),
+                0.0_f32.to_bits(),
+                10.0_f32.to_bits(),
+                1.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                20.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                1.0_f32.to_bits(),
+                30.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                1.0_f32.to_bits(),
+            ],
+        };
+
+        assert_eq!(
+            transform.try_direct3d7_view_row_major(),
+            Some([
+                1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, -10.0, -10.0, -20.0,
+                1.0,
+            ])
+        );
+        assert_eq!(
+            RawCameraTransform { words: [0_u32; 16] }.try_direct3d7_view_row_major(),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_d3d7_projection_matches_recovered_camera_formula() {
+        let projection = LegacyD3d7Projection {
+            viewport: [0, 0, 1024, 768],
+            near_plane: 0.5,
+            far_plane: 700.0,
+            field_of_view_radians: 1.3,
+        };
+        let matrix = projection
+            .try_direct3d7_projection_row_major()
+            .expect("live Ngi32 projection parameters are valid");
+        let half_fov = 0.65_f32;
+        let depth_scale = 700.0_f32 / 699.5;
+
+        assert_eq!(matrix[0], half_fov.cos());
+        assert_eq!(matrix[5], 0.75 * half_fov.cos());
+        assert_eq!(matrix[10], depth_scale);
+        assert_eq!(matrix[11], half_fov.sin());
+        assert_eq!(matrix[14], -(depth_scale * 0.5));
+        assert_eq!(
+            LegacyD3d7Projection {
+                viewport: [0, 0, 0, 768],
+                ..projection
+            }
+            .try_direct3d7_projection_row_major(),
+            None
+        );
     }
 
     fn snapshot_draw(
