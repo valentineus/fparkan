@@ -154,6 +154,7 @@ fn load_requested_mission(
     };
     if let Some(progress_path) = args.load_progress.as_ref() {
         prepare_load_progress_path(progress_path)?;
+        let progress_started = std::time::Instant::now();
         let mut write_error = None;
         let loaded = if args.backend == RenderBackendMode::StaticVulkan {
             load_mission_static_preview_roots_with_progress(
@@ -162,7 +163,9 @@ fn load_requested_mission(
                 args.preview_roots,
                 |phase| {
                     if write_error.is_none() {
-                        if let Err(err) = write_load_progress(progress_path, phase) {
+                        if let Err(err) =
+                            write_load_progress(progress_path, progress_started.elapsed(), phase)
+                        {
                             write_error = Some(err);
                         }
                     }
@@ -171,7 +174,9 @@ fn load_requested_mission(
         } else {
             load_mission_with_progress(engine, request, |phase| {
                 if write_error.is_none() {
-                    if let Err(err) = write_load_progress(progress_path, phase) {
+                    if let Err(err) =
+                        write_load_progress(progress_path, progress_started.elapsed(), phase)
+                    {
                         write_error = Some(err);
                     }
                 }
@@ -181,7 +186,17 @@ fn load_requested_mission(
         if let Some(err) = write_error {
             return Err(err);
         }
-        std::fs::write(progress_path, "Complete\n")
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(progress_path)
+            .and_then(|mut file| {
+                use std::io::Write;
+                writeln!(
+                    file,
+                    "Complete\telapsed_ms={}",
+                    progress_started.elapsed().as_millis()
+                )
+            })
             .map_err(|err| format!("{}: {err}", progress_path.display()))?;
         return Ok(loaded);
     }
@@ -469,17 +484,23 @@ fn prepare_load_progress_path(path: &std::path::Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
     }
-    std::fs::write(path, "Starting\n").map_err(|err| format!("{}: {err}", path.display()))
+    std::fs::write(path, "Starting\telapsed_ms=0\n")
+        .map_err(|err| format!("{}: {err}", path.display()))
 }
 
-fn write_load_progress(path: &std::path::Path, phase: MissionLoadPhase) -> Result<(), String> {
+fn write_load_progress(
+    path: &std::path::Path,
+    elapsed: std::time::Duration,
+    phase: MissionLoadPhase,
+) -> Result<(), String> {
     use std::io::Write;
 
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .open(path)
         .map_err(|err| format!("{}: {err}", path.display()))?;
-    writeln!(file, "{phase:?}").map_err(|err| format!("{}: {err}", path.display()))
+    writeln!(file, "{phase:?}\telapsed_ms={}", elapsed.as_millis())
+        .map_err(|err| format!("{}: {err}", path.display()))
 }
 
 fn run_static_vulkan_mode(
@@ -1060,14 +1081,22 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("fparkan-game-progress-{}.txt", std::process::id()));
         prepare_load_progress_path(&path)?;
-        write_load_progress(&path, MissionLoadPhase::GraphVisualMaterials)?;
-        write_load_progress(&path, MissionLoadPhase::GraphVisualMaterialRequests(64))?;
+        write_load_progress(
+            &path,
+            std::time::Duration::from_millis(12),
+            MissionLoadPhase::GraphVisualMaterials,
+        )?;
+        write_load_progress(
+            &path,
+            std::time::Duration::from_millis(34),
+            MissionLoadPhase::GraphVisualMaterialRequests(64),
+        )?;
         let progress = std::fs::read_to_string(&path).map_err(|err| err.to_string())?;
         std::fs::remove_file(&path).map_err(|err| err.to_string())?;
 
         assert_eq!(
             progress,
-            "Starting\nGraphVisualMaterials\nGraphVisualMaterialRequests(64)\n"
+            "Starting\telapsed_ms=0\nGraphVisualMaterials\telapsed_ms=12\nGraphVisualMaterialRequests(64)\telapsed_ms=34\n"
         );
         Ok(())
     }

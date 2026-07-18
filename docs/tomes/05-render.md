@@ -1132,6 +1132,16 @@ bounded probe can therefore retain both MAT0 and TEXM request milestones even
 when a later event is last. The behavior is diagnostic persistence only: it
 does not alter graph traversal, resource validation, or rendering.
 
+Each trace row now keeps the phase name first and appends a monotonic
+`elapsed_ms=<N>` field from one process-local `Instant`; successful completion
+is appended rather than overwriting the trace. A short rebuilt Part 2 probe
+confirmed real timestamps from `Map` at 5 ms through `GraphVisualTextures` at
+2,389 ms, then later MAT0 request milestones at 28,841 and 35,486 ms. The
+probe was deliberately terminated and provides no frame/GPU result. These
+timestamps measure whole elapsed intervals, including archive I/O, allocation,
+validation, cache effects and progress-file writes; they are not per-parser
+benchmarks.
+
 A rebuilt executable then ran a controlled 180-second Part 2 `Autodemo.00`
 probe with the append-only trace. Before exact-child termination it recorded
 `GraphVisualTextureRequests(64)`, `GraphVisualMaterialRequests(100)`, and every
