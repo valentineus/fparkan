@@ -128,6 +128,12 @@ directory_offset = total_size - directory_size
 Reader проверяет, что `directory_offset >= 16`, умножение не переполнено, а
 каталог заканчивается точно на `total_size`.
 
+В repository NRes payload возвращается как slice с `Arc`-владельцем полного
+неизменяемого архива: валидация формата не создаёт промежуточную копию каждого
+payload. Такой view учитывается в том же bounded decoded-payload cache по
+длине диапазона и сохраняет deterministic eviction. Это применимо только к
+raw NRes; сжатый RsLi по-прежнему материализуется после декодирования.
+
 ### Запись каталога NRes
 
 ```c

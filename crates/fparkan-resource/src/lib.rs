@@ -381,7 +381,7 @@ struct DecodedPayloadCache {
 
 #[derive(Clone, Debug)]
 struct PayloadCacheEntry {
-    bytes: Arc<[u8]>,
+    bytes: ResourceBytes,
     last_access: u64,
 }
 
@@ -562,7 +562,7 @@ impl ResourceRepository for CachedResourceRepository {
         let task = {
             let mut state = self.state.lock().map_err(|_| ResourceError::Poisoned)?;
             if let Some(bytes) = state.payload_cache.get(entry) {
-                return Ok(ResourceBytes::Shared(bytes));
+                return Ok(bytes);
             }
             state.payload_decode_task(entry)?
         };
@@ -573,15 +573,14 @@ impl ResourceRepository for CachedResourceRepository {
                     key: task.key,
                     source,
                 })?;
-        let shared = Arc::from(payload.into_boxed_slice());
 
         let mut state = self.state.lock().map_err(|_| ResourceError::Poisoned)?;
         if let Some(bytes) = state.payload_cache.get(entry) {
-            return Ok(ResourceBytes::Shared(bytes));
+            return Ok(bytes);
         }
         state.entry_archive(entry)?;
-        state.payload_cache.insert(entry, Arc::clone(&shared));
-        Ok(ResourceBytes::Shared(shared))
+        state.payload_cache.insert(entry, payload.clone());
+        Ok(payload)
     }
 
     fn entry_info(&self, entry: EntryHandle) -> Result<ResourceEntryInfo, ResourceError> {
@@ -638,14 +637,14 @@ impl DecodedPayloadCache {
         }
     }
 
-    fn get(&mut self, handle: EntryHandle) -> Option<Arc<[u8]>> {
+    fn get(&mut self, handle: EntryHandle) -> Option<ResourceBytes> {
         let entry = self.entries.get_mut(&handle)?;
         self.generation = self.generation.saturating_add(1);
         entry.last_access = self.generation;
-        Some(Arc::clone(&entry.bytes))
+        Some(entry.bytes.clone())
     }
 
-    fn insert(&mut self, handle: EntryHandle, bytes: Arc<[u8]>) {
+    fn insert(&mut self, handle: EntryHandle, bytes: ResourceBytes) {
         let len = bytes.len();
         if self.max_entries == 0 || len > self.max_bytes {
             return;
@@ -815,14 +814,15 @@ impl ArchiveSlot {
 }
 
 impl ArchiveDocument {
-    fn read_payload(&self, local: u32) -> Result<Vec<u8>, String> {
+    fn read_payload(&self, local: u32) -> Result<ResourceBytes, String> {
         match self {
             ArchiveDocument::Nres(document) => document
-                .payload(fparkan_nres::EntryId(local))
-                .map(<[u8]>::to_vec)
+                .payload_view(fparkan_nres::EntryId(local))
+                .map(|(owner, range)| ResourceBytes::Slice { owner, range })
                 .map_err(|err| err.to_string()),
             ArchiveDocument::Rsli(document) => document
                 .load(fparkan_rsli::EntryId(local))
+                .map(|payload| ResourceBytes::Shared(Arc::from(payload.into_boxed_slice())))
                 .map_err(|err| err.to_string()),
         }
     }
@@ -1070,7 +1070,9 @@ mod tests {
             .find(first, &resource_name(b"alpha.txt"))
             .expect("find")
             .expect("entry");
-        assert_eq!(repo.read(handle).expect("read").as_slice(), b"alpha");
+        let payload = repo.read(handle).expect("read");
+        assert_eq!(payload.as_slice(), b"alpha");
+        assert!(matches!(payload, ResourceBytes::Slice { .. }));
         let info = repo.entry_info(handle).expect("entry info");
         assert_eq!(info.key.archive, path);
         assert!(info.key.name.0.eq_ignore_ascii_case(b"Alpha.TXT"));

@@ -479,6 +479,23 @@ impl NresDocument {
         Ok(&self.bytes[entry.data_range.clone()])
     }
 
+    /// Returns an owned view of an entry payload without copying its bytes.
+    ///
+    /// The returned owner is the immutable archive buffer. Consumers may retain
+    /// the view after dropping this document.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NresError::EntryIdOutOfRange`] when `id` is not present in
+    /// this document.
+    pub fn payload_view(&self, id: EntryId) -> Result<(Arc<[u8]>, Range<usize>), NresError> {
+        let entry = self.entry(id).ok_or_else(|| NresError::EntryIdOutOfRange {
+            id: id.0,
+            entry_count: saturating_u32_len(self.entries.len()),
+        })?;
+        Ok((Arc::clone(&self.bytes), entry.data_range.clone()))
+    }
+
     /// Encodes the document according to the selected write profile.
     #[must_use]
     pub fn encode(&self, profile: WriteProfile) -> Vec<u8> {
@@ -1213,6 +1230,8 @@ mod tests {
         assert_eq!(entry.data_range().end, HEADER_LEN + 1);
         assert_eq!(doc.header().directory_offset % 8, 0);
         assert_eq!(doc.payload(EntryId(0)).expect("payload"), b"x");
+        let (owner, range) = doc.payload_view(EntryId(0)).expect("payload view");
+        assert_eq!(&owner[range], b"x");
     }
 
     #[test]
