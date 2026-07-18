@@ -118,6 +118,21 @@ unsupported result, а не «примерный» game command.
 находится в отдельном позднем update path. Воспроизводимый read-only extractor:
 `tools/ghidra/ExportAiVmHandler2Dispatch.java`.
 
+Corpus priority теперь измерен, а не предполагается: во всех 58 GOG `.scr`
+имеются 6 087 instruction records, из них 3 992 sentinel; самый частый
+non-sentinel selector — `Handler(30)`, 246 records. Его VA `0x1000c266`
+читает первые два reference words активной instruction, разрешает каждый
+через varset (`0x10002d30` и `0x10013570`) и вызывает внешний callback с
+тремя `u32`: `(0, first, second)`. Callback не принадлежит `ai.dll`: его
+кладёт десятый argument экспортного `CreateSuperAI`. Тот же callback встречен
+у `Handler(57)` с первым word `2` и у отдельного lifecycle path с первым word
+`1`; предметная семантика этих modes ещё не доказана. В частности, это пока
+не основание назвать Handler(30) сообщением, приказом или UI opcode. Точный
+text-to-varset resolver ещё расположен за wrapper `0x10011ea0` в
+`0x100174a0`, поэтому Rust не dispatch-ит Handler(30) до восстановления
+индексации. Воспроизводимые exports: `ExportAiVmHandler30.java`,
+`FindAiVmHandler30Callback.java`, `ExportAiVarSetLoader.java`.
+
 Следующий static pass закрывает equality/update policy. Identity ровно равна
 `(slot0 word, slot4 IEEE-754 bits, slot5 IEEE-754 bits)`, поэтому `-0.0` и
 `+0.0` различаются. Новый 100-byte record получает slot1 в поле `+0x14`,
