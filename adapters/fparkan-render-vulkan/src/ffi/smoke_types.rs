@@ -24,8 +24,111 @@ pub struct VulkanSmokeRendererCreateInfo {
     pub render_request: RenderRequest,
     /// Whether validation layers must be enabled.
     pub enable_validation: bool,
+    /// Static indexed geometry uploaded before the first live frame.
+    ///
+    /// This initial bridge keeps positions in clip-space. MSH transforms,
+    /// materials, and textures are deliberately higher-level Stage 3 work.
+    pub mesh: VulkanStaticMesh,
     /// Optional shared bootstrap progress tracker for failure evidence.
     pub bootstrap_progress: Option<Arc<VulkanSmokeBootstrapProgress>>,
+}
+
+/// One vertex accepted by the initial static Vulkan geometry path.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VulkanStaticVertex {
+    /// Position in Vulkan clip-space XY coordinates.
+    pub position: [f32; 2],
+    /// Linear RGB vertex color.
+    pub color: [f32; 3],
+}
+
+/// Static indexed geometry uploaded to live Vulkan buffers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VulkanStaticMesh {
+    /// Vertex data in pipeline order.
+    pub vertices: Vec<VulkanStaticVertex>,
+    /// Triangle-list indices into [`Self::vertices`].
+    pub indices: Vec<u16>,
+}
+
+impl VulkanStaticMesh {
+    /// Returns the compatibility triangle used by the native Stage 0 smoke app.
+    #[must_use]
+    pub fn smoke_triangle() -> Self {
+        Self {
+            vertices: vec![
+                VulkanStaticVertex {
+                    position: [0.0, -0.55],
+                    color: [1.0, 0.2, 0.2],
+                },
+                VulkanStaticVertex {
+                    position: [0.55, 0.55],
+                    color: [0.2, 1.0, 0.2],
+                },
+                VulkanStaticVertex {
+                    position: [-0.55, 0.55],
+                    color: [0.2, 0.4, 1.0],
+                },
+            ],
+            indices: vec![0, 1, 2],
+        }
+    }
+
+    pub(super) fn validate(&self) -> Result<(), &'static str> {
+        if self.vertices.is_empty() {
+            return Err("static mesh has no vertices");
+        }
+        if self.indices.is_empty() || !self.indices.len().is_multiple_of(3) {
+            return Err("static mesh indices must contain complete triangles");
+        }
+        if self
+            .indices
+            .iter()
+            .any(|&index| usize::from(index) >= self.vertices.len())
+        {
+            return Err("static mesh index exceeds vertex count");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod static_mesh_tests {
+    use super::*;
+
+    #[test]
+    fn smoke_triangle_is_valid_complete_geometry() {
+        let mesh = VulkanStaticMesh::smoke_triangle();
+
+        assert_eq!(mesh.indices, vec![0, 1, 2]);
+        assert_eq!(mesh.validate(), Ok(()));
+    }
+
+    #[test]
+    fn static_mesh_rejects_bad_triangle_topology_and_indices() {
+        let no_vertices = VulkanStaticMesh {
+            vertices: Vec::new(),
+            indices: vec![0, 1, 2],
+        };
+        let incomplete_triangle = VulkanStaticMesh {
+            vertices: VulkanStaticMesh::smoke_triangle().vertices,
+            indices: vec![0, 1],
+        };
+        let out_of_range_index = VulkanStaticMesh {
+            vertices: VulkanStaticMesh::smoke_triangle().vertices,
+            indices: vec![0, 1, 3],
+        };
+
+        assert_eq!(no_vertices.validate(), Err("static mesh has no vertices"));
+        assert_eq!(
+            incomplete_triangle.validate(),
+            Err("static mesh indices must contain complete triangles")
+        );
+        assert_eq!(
+            out_of_range_index.validate(),
+            Err("static mesh index exceeds vertex count")
+        );
+    }
 }
 
 /// Shared bootstrap progress used to report partial renderer startup evidence.
@@ -185,6 +288,11 @@ pub enum VulkanSmokeRendererError {
         /// Operation context.
         context: &'static str,
     },
+    /// The submitted static geometry cannot be represented by this path.
+    InvalidStaticMesh {
+        /// Validation failure detail.
+        context: &'static str,
+    },
     /// Internal smoke renderer state was unexpectedly absent.
     InvariantViolation {
         /// Missing state context.
@@ -206,6 +314,7 @@ impl std::fmt::Display for VulkanSmokeRendererError {
             Self::MissingMemoryType { context } => {
                 write!(f, "{context}: no compatible Vulkan memory type")
             }
+            Self::InvalidStaticMesh { context } => write!(f, "invalid static mesh: {context}"),
             Self::InvariantViolation { context } => {
                 write!(f, "renderer invariant violated: {context}")
             }
@@ -226,6 +335,7 @@ pub struct VulkanSmokeRenderer {
     pub(super) swapchain_resources: Option<VulkanSwapchainResources>,
     pub(super) vertex_buffer: Option<VulkanAllocatedBuffer>,
     pub(super) index_buffer: Option<VulkanAllocatedBuffer>,
+    pub(super) index_count: u32,
     pub(super) frame_sync: Vec<VulkanFrameSync>,
     pub(super) images_in_flight: Vec<vk::Fence>,
     pub(super) current_frame: usize,

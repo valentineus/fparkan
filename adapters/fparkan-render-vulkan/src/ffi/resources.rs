@@ -2,7 +2,9 @@
 
 use ash::vk;
 
-use super::{VulkanInstanceProbe, VulkanLogicalDeviceProbe, VulkanSmokeRendererError};
+use super::{
+    VulkanInstanceProbe, VulkanLogicalDeviceProbe, VulkanSmokeRendererError, VulkanStaticMesh,
+};
 
 pub(super) struct VulkanAllocatedBuffer {
     pub(super) buffer: vk::Buffer,
@@ -30,18 +32,14 @@ pub(super) fn create_command_pool(
     })
 }
 
-pub(super) fn create_triangle_vertex_buffer(
+pub(super) fn create_static_mesh_vertex_buffer(
     instance: &VulkanInstanceProbe,
     device: &VulkanLogicalDeviceProbe,
+    mesh: &VulkanStaticMesh,
 ) -> Result<VulkanAllocatedBuffer, VulkanSmokeRendererError> {
-    let vertices: [[f32; 5]; 3] = [
-        [0.0, -0.55, 1.0, 0.2, 0.2],
-        [0.55, 0.55, 0.2, 1.0, 0.2],
-        [-0.55, 0.55, 0.2, 0.4, 1.0],
-    ];
-    let mut bytes = Vec::with_capacity(vertices.len() * 5 * std::mem::size_of::<f32>());
-    for vertex in vertices {
-        for value in vertex {
+    let mut bytes = Vec::with_capacity(mesh.vertices.len() * 5 * std::mem::size_of::<f32>());
+    for vertex in &mesh.vertices {
+        for value in vertex.position.into_iter().chain(vertex.color) {
             bytes.extend_from_slice(&value.to_ne_bytes());
         }
     }
@@ -50,17 +48,17 @@ pub(super) fn create_triangle_vertex_buffer(
         device,
         &bytes,
         vk::BufferUsageFlags::VERTEX_BUFFER,
-        "triangle vertex buffer",
+        "static mesh vertex buffer",
     )
 }
 
-pub(super) fn create_triangle_index_buffer(
+pub(super) fn create_static_mesh_index_buffer(
     instance: &VulkanInstanceProbe,
     device: &VulkanLogicalDeviceProbe,
+    mesh: &VulkanStaticMesh,
 ) -> Result<VulkanAllocatedBuffer, VulkanSmokeRendererError> {
-    let indices = [0_u16, 1_u16, 2_u16];
-    let mut bytes = Vec::with_capacity(indices.len() * std::mem::size_of::<u16>());
-    for index in indices {
+    let mut bytes = Vec::with_capacity(mesh.indices.len() * std::mem::size_of::<u16>());
+    for &index in &mesh.indices {
         bytes.extend_from_slice(&index.to_ne_bytes());
     }
     create_host_visible_buffer(
@@ -68,7 +66,7 @@ pub(super) fn create_triangle_index_buffer(
         device,
         &bytes,
         vk::BufferUsageFlags::INDEX_BUFFER,
-        "triangle index buffer",
+        "static mesh index buffer",
     )
 }
 

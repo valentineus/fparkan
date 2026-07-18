@@ -3,8 +3,8 @@
 use ash::vk;
 
 use super::{
-    create_command_pool, create_frame_sync, create_swapchain_resources,
-    create_triangle_index_buffer, create_triangle_vertex_buffer, create_validation_messenger,
+    create_command_pool, create_frame_sync, create_static_mesh_index_buffer,
+    create_static_mesh_vertex_buffer, create_swapchain_resources, create_validation_messenger,
     create_vulkan_instance_probe, create_vulkan_logical_device_probe_for_request,
     create_vulkan_surface_probe, create_vulkan_swapchain_probe_for_extent,
     destroy_allocated_buffer, destroy_swapchain_resources, plan_vulkan_surface,
@@ -105,6 +105,10 @@ impl VulkanSmokeRenderer {
     pub fn new(
         create_info: &VulkanSmokeRendererCreateInfo,
     ) -> Result<Self, VulkanSmokeRendererError> {
+        create_info
+            .mesh
+            .validate()
+            .map_err(|context| VulkanSmokeRendererError::InvalidStaticMesh { context })?;
         let bootstrap_progress = create_info.bootstrap_progress.as_ref();
         let shader_manifest = validate_shader_manifest(&triangle_shader_manifest())
             .map_err(VulkanSmokeRendererError::ShaderManifest)?;
@@ -153,23 +157,25 @@ impl VulkanSmokeRenderer {
             progress.mark_swapchain_created();
         }
         let command_pool = create_command_pool(&device)?;
-        let vertex_buffer = match create_triangle_vertex_buffer(&instance, &device) {
-            Ok(buffer) => buffer,
-            Err(error) => {
-                // SAFETY: The command pool belongs to this live logical device and is destroyed on setup failure.
-                unsafe { device.device().destroy_command_pool(command_pool, None) };
-                return Err(error);
-            }
-        };
-        let index_buffer = match create_triangle_index_buffer(&instance, &device) {
-            Ok(buffer) => buffer,
-            Err(error) => {
-                // SAFETY: The command pool belongs to this live logical device and is destroyed on setup failure.
-                unsafe { device.device().destroy_command_pool(command_pool, None) };
-                destroy_allocated_buffer(&device, &vertex_buffer);
-                return Err(error);
-            }
-        };
+        let vertex_buffer =
+            match create_static_mesh_vertex_buffer(&instance, &device, &create_info.mesh) {
+                Ok(buffer) => buffer,
+                Err(error) => {
+                    // SAFETY: The command pool belongs to this live logical device and is destroyed on setup failure.
+                    unsafe { device.device().destroy_command_pool(command_pool, None) };
+                    return Err(error);
+                }
+            };
+        let index_buffer =
+            match create_static_mesh_index_buffer(&instance, &device, &create_info.mesh) {
+                Ok(buffer) => buffer,
+                Err(error) => {
+                    // SAFETY: The command pool belongs to this live logical device and is destroyed on setup failure.
+                    unsafe { device.device().destroy_command_pool(command_pool, None) };
+                    destroy_allocated_buffer(&device, &vertex_buffer);
+                    return Err(error);
+                }
+            };
         let mut renderer = Self {
             instance: Some(instance),
             validation,
@@ -180,6 +186,7 @@ impl VulkanSmokeRenderer {
             swapchain_resources: None,
             vertex_buffer: Some(vertex_buffer),
             index_buffer: Some(index_buffer),
+            index_count: u32::try_from(create_info.mesh.indices.len()).unwrap_or(u32::MAX),
             frame_sync: Vec::new(),
             images_in_flight: Vec::new(),
             current_frame: 0,
@@ -593,7 +600,7 @@ impl VulkanSmokeRenderer {
             );
             device
                 .device()
-                .cmd_draw_indexed(command_buffer, 3, 1, 0, 0, 0);
+                .cmd_draw_indexed(command_buffer, self.index_count, 1, 0, 0, 0);
             device.device().cmd_end_render_pass(command_buffer);
         }
 

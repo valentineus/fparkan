@@ -16,7 +16,7 @@ use fparkan_platform_winit::{window_native_handles, WinitWindowPlan};
 use fparkan_render_vulkan::{
     VulkanSmokeBootstrapProgress, VulkanSmokeFrameOutcome, VulkanSmokeRenderer,
     VulkanSmokeRendererCreateInfo, VulkanSmokeRendererReport, VulkanSmokeShutdownReport,
-    VulkanValidationReport,
+    VulkanStaticMesh, VulkanValidationReport,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -603,6 +603,7 @@ impl ApplicationHandler for SmokeApp {
             drawable_extent: (size.width.max(1), size.height.max(1)),
             render_request: RenderRequest::conservative(),
             enable_validation: true,
+            mesh: VulkanStaticMesh::smoke_triangle(),
             bootstrap_progress: Some(Arc::clone(&self.progress.bootstrap)),
         }) {
             Ok(renderer) => renderer,
