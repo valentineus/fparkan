@@ -1279,6 +1279,14 @@ string-labelled `ICamera::SetTransformMatrix` (RVA `0x4F830`) and
 `ICamera::GetTransformMatrix` (RVA `0x4F850`) are both obsolete-call stubs, so
 they are not a usable method ABI.
 
+A fresh no-input launch of the canonical `iron_3d.exe` did create a responsive
+window titled `Parkan. Железная Стратегия`. A read-only probe then requested
+`PROCESS_QUERY_INFORMATION | PROCESS_VM_READ` and attempted to read the known
+Terrain global at image address `0x1007355C`; `OpenProcess` returned
+`ERROR_ACCESS_DENIED` (5), so no process memory or camera value was read. The
+window was left running. A same- or higher-integrity 32-bit debugger is still
+required for live camera evidence.
+
 `Land.msh` использует отдельный geometry-only bridge: validated `TerrainFace28`
 сохраняет source triangle order, а его positions и packed UV0 попадают в тот же
 static vertex/index upload path. Для текущего диагностического viewer XY bounds
