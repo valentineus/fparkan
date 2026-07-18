@@ -1071,6 +1071,15 @@ from `GraphVisuals` to `AssetModelMeshes`, `AssetWearTables`, then
 `AssetTextures` before termination. This is a bounded timing observation, not a
 claim that a frame completed or that every run has identical timing.
 
+After these visual-graph caches, the corrected XY static-Vulkan preview again
+completed on canonical GOG `MISSIONS/Autodemo.00/data.tma` within a controlled
+120-second run. It reported `Complete`, a native 1280x720 two-image swapchain,
+one frame, 14 root MSH components, one terrain component, 15 material
+descriptors, validation warnings/errors `0/0`, and a 7,372,800-byte readback
+FNV-1a `6451493914305554398`. This is the first GPU acceptance evidence for
+the corrected XY diagnostic projection; the hash is not compared with the
+original renderer and does not establish original camera, shading or parity.
+
 `Assets` now has four ordered diagnostic sub-checkpoints: `AssetModelMeshes`
 (MSH), `AssetWearTables` (WEAR), `AssetMaterials` (MAT0) and `AssetTextures`
 (diffuse TEXM and lightmaps). The callback is observational: it neither changes
