@@ -1437,6 +1437,17 @@ on its XY diagnostic projection until a runtime supplies a real legacy camera;
 selecting source-world coordinates with identity camera would be a misleading
 empty/off-screen viewer rather than a compatibility result.
 
+Static analysis of GOG `iron3d.dll` now recovers an exact adjacent placement
+primitive: RVA `0x36610` evaluates a row-major affine
+`Rz(z) * Ry(y) * Rx(x)` and writes translation in the final column. The
+backend-neutral `LegacyIron3dEulerTransform` preserves that finite portable
+formula with a golden yaw-vector test. This is deliberately not wired to TMA:
+AutoDemo records strongly suggest the candidate `(0, 0, z)` radians (all eight
+objects have zero first two values and `z` in approximately `[-pi, pi]`), but
+the current static trace has not proved that those raw record fields reach this
+builder unchanged for every mission object category. The remaining link needs
+a direct loader-to-builder dataflow or a dynamic placement capture.
+
 `VulkanSmokeRenderer::set_camera` now accepts a new finite camera between frame
 submissions and uses it for the next command buffer without rebuilding the
 swapchain, buffers, descriptors or pipelines. `VulkanStaticCamera` also accepts

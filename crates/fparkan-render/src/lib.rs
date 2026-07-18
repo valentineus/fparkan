@@ -246,6 +246,66 @@ impl LegacyD3d7Projection {
     }
 }
 
+/// Affine placement inputs consumed by `Iron3D`'s recovered Euler-matrix builder.
+///
+/// This records the exact matrix construction at `iron3d.dll` RVA `0x36610`.
+/// It is intentionally distinct from a mission placement contract: the static
+/// trace has not yet proved that TMA's three raw orientation floats reach this
+/// builder unchanged for every object category.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LegacyIron3dEulerTransform {
+    /// World-space translation passed to the builder.
+    pub translation: [f32; 3],
+    /// Three angles in the builder's `(x, y, z)` input order, in radians.
+    pub orientation_radians: [f32; 3],
+}
+
+impl LegacyIron3dEulerTransform {
+    /// Reconstructs the builder's finite row-major affine matrix.
+    ///
+    /// The recovered x87 code evaluates `Rz(z) * Ry(y) * Rx(x)` and writes
+    /// translation into the last column. This uses portable `f32` trigonometry;
+    /// any future x87-compatibility path must be separately capture-validated.
+    #[must_use]
+    pub fn try_row_major(self) -> Option<[f32; 16]> {
+        if !self
+            .translation
+            .iter()
+            .chain(self.orientation_radians.iter())
+            .all(|value| value.is_finite())
+        {
+            return None;
+        }
+        let [x, y, z] = self.orientation_radians;
+        let (sin_x, cos_x) = x.sin_cos();
+        let (sin_y, cos_y) = y.sin_cos();
+        let (sin_z, cos_z) = z.sin_cos();
+        let [translation_x, translation_y, translation_z] = self.translation;
+        let matrix = [
+            cos_z * cos_y,
+            cos_z * sin_y * sin_x - sin_z * cos_x,
+            cos_z * sin_y * cos_x + sin_z * sin_x,
+            translation_x,
+            sin_z * cos_y,
+            sin_z * sin_y * sin_x + cos_z * cos_x,
+            sin_z * sin_y * cos_x - cos_z * sin_x,
+            translation_y,
+            -sin_y,
+            cos_y * sin_x,
+            cos_y * cos_x,
+            translation_z,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ];
+        matrix
+            .iter()
+            .all(|value| value.is_finite())
+            .then_some(matrix)
+    }
+}
+
 /// Raw camera state observed through the original Terrain camera interface.
 ///
 /// Selector 0 supplies the currently active transform and selector 2 supplies
@@ -1129,6 +1189,33 @@ mod tests {
                 ..projection
             }
             .try_direct3d7_projection_row_major(),
+            None
+        );
+    }
+
+    #[test]
+    fn iron3d_euler_builder_uses_rz_ry_rx_and_last_column_translation() {
+        let matrix = LegacyIron3dEulerTransform {
+            translation: [418.103_18, 717.433, 3.040_938_9],
+            orientation_radians: [0.0, 0.0, std::f32::consts::FRAC_PI_2],
+        }
+        .try_row_major()
+        .expect("finite recovered builder inputs");
+
+        assert!((matrix[0]).abs() < 0.000_001);
+        assert!((matrix[1] + 1.0).abs() < 0.000_001);
+        assert!((matrix[4] - 1.0).abs() < 0.000_001);
+        assert!((matrix[5]).abs() < 0.000_001);
+        assert_eq!(matrix[3], 418.103_18);
+        assert_eq!(matrix[7], 717.433);
+        assert_eq!(matrix[11], 3.040_938_9);
+        assert_eq!(matrix[15], 1.0);
+        assert_eq!(
+            LegacyIron3dEulerTransform {
+                translation: [0.0, 0.0, 0.0],
+                orientation_radians: [f32::NAN, 0.0, 0.0],
+            }
+            .try_row_major(),
             None
         );
     }
