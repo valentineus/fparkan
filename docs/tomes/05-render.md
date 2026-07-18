@@ -1063,14 +1063,15 @@ provenance while avoiding repeat format work for repeated components. The same
 demonstrate an additional checkpoint advance from this cache; it must not be
 reported as a measured startup improvement.
 
-`Assets` now has three ordered diagnostic sub-checkpoints: `AssetModels`
-(MSH and WEAR), `AssetMaterials` (MAT0) and `AssetTextures` (diffuse TEXM and
-lightmaps). The callback is observational: it neither changes the preparation
-order nor deduplicates requests. A fresh controlled 60-second canonical GOG
-`Autodemo.00` first-root probe reached `AssetModels` and did not reach
+`Assets` now has four ordered diagnostic sub-checkpoints: `AssetModelMeshes`
+(MSH), `AssetWearTables` (WEAR), `AssetMaterials` (MAT0) and `AssetTextures`
+(diffuse TEXM and lightmaps). The callback is observational: it neither changes
+the preparation order nor deduplicates requests. A fresh controlled 60-second
+canonical GOG `Autodemo.00` first-root probe reached `AssetWearTables` but not
 `AssetMaterials`; its created process was terminated and no native frame was
-reported. This narrows the next investigation to model/WEAR preparation, but
-does not by itself attribute the delay to either decoder or I/O.
+reported. At least one MSH therefore finished before the timeout, but this does
+not attribute the remaining interval to WEAR decoding rather than later
+MSH/WEAR iteration or archive I/O.
 
 The same source-axis proof now applies to `TerrainWorld`: its `Land.msh` surface
 height query and `Land.map` areal/grid lookup use XY ground coordinates, return

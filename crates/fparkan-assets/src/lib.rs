@@ -458,8 +458,10 @@ pub struct AssetPreparationReport {
 /// Asset preparation checkpoint emitted while resolving visual dependencies.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AssetPreparationPhase {
-    /// Decode a model and its corresponding WEAR table.
-    ModelAndWear,
+    /// Decode and validate an MSH model.
+    ModelMesh,
+    /// Decode the corresponding WEAR table.
+    WearTable,
     /// Resolve MAT0 material documents referenced by a WEAR table.
     Materials,
     /// Decode diffuse textures and baked lightmaps.
@@ -1513,7 +1515,7 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
         });
     };
 
-    on_phase(AssetPreparationPhase::ModelAndWear);
+    on_phase(AssetPreparationPhase::ModelMesh);
     let model = prepare_model_cached(repository, mesh_key, preparation_cache)?;
     let model_id = AssetId::new((identity_policy.model)(proto));
     let prepared_model = PreparedModel {
@@ -1529,6 +1531,7 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
         name: wear_name,
         type_id: Some(WEAR_KIND),
     };
+    on_phase(AssetPreparationPhase::WearTable);
     let wear = prepare_wear_cached(repository, &wear_key, preparation_cache)?;
     let wear_id = AssetId::new((identity_policy.wear)(proto));
     let prepared_wear = PreparedWear {

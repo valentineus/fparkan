@@ -120,8 +120,10 @@ pub enum MissionLoadPhase {
     GraphVisuals,
     /// Prepare all reachable visual/resource dependencies.
     Assets,
-    /// Decode model meshes and their WEAR tables.
-    AssetModels,
+    /// Decode and validate MSH model meshes.
+    AssetModelMeshes,
+    /// Decode WEAR material tables.
+    AssetWearTables,
     /// Resolve MAT0 material documents.
     AssetMaterials,
     /// Decode diffuse textures and baked lightmaps.
@@ -707,7 +709,8 @@ fn load_mission_with_options_and_progress(
     let mut last_asset_phase = None;
     let mut observe_asset_phase = |phase| {
         let runtime_phase = match phase {
-            AssetPreparationPhase::ModelAndWear => MissionLoadPhase::AssetModels,
+            AssetPreparationPhase::ModelMesh => MissionLoadPhase::AssetModelMeshes,
+            AssetPreparationPhase::WearTable => MissionLoadPhase::AssetWearTables,
             AssetPreparationPhase::Materials => MissionLoadPhase::AssetMaterials,
             AssetPreparationPhase::Textures => MissionLoadPhase::AssetTextures,
         };
