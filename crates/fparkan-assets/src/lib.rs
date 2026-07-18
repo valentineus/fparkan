@@ -39,7 +39,7 @@ use fparkan_resource::{ResourceError, ResourceKey, ResourceRepository};
 pub use fparkan_terrain::{TerrainError, TerrainWorld};
 use fparkan_terrain_format::{decode_build_dat, decode_land_map, decode_land_msh};
 pub use fparkan_terrain_format::{BuildCategory, TerrainFormatError};
-use fparkan_texm::{decode_texm, TexmDocument, TexmError};
+use fparkan_texm::{decode_mip_rgba8, decode_texm, RgbaImage, TexmDocument, TexmError};
 use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -305,6 +305,18 @@ pub struct PreparedTexture {
     pub texm: TexmDocument,
     /// Usage role in the prepared visual.
     pub usage: PreparedTextureUsage,
+}
+
+impl PreparedTexture {
+    /// Decodes one prepared texture mip into the renderer upload representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the original TEXM decode error when the requested mip is invalid
+    /// or malformed.
+    pub fn decode_mip_rgba8(&self, level: u32) -> Result<RgbaImage, TexmError> {
+        decode_mip_rgba8(&self.texm, level)
+    }
 }
 
 impl PreparedVisual {

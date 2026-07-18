@@ -21,7 +21,7 @@
 #![allow(clippy::print_stderr, clippy::print_stdout)]
 //! `FParkan` render-planning composition root.
 
-use fparkan_assets::PreparedVisual;
+use fparkan_assets::{PreparedTextureUsage, PreparedVisual};
 use fparkan_platform::WindowPort;
 use fparkan_platform_winit::{window_native_handles, WinitWindow, WinitWindowPlan};
 use fparkan_render::{
@@ -31,7 +31,8 @@ use fparkan_render::{
 };
 use fparkan_render_vulkan::{
     project_msh_to_static_mesh, VulkanPlanningBackend, VulkanSmokeFrameOutcome,
-    VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo, VulkanStaticMesh,
+    VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo, VulkanStaticMaterial, VulkanStaticMesh,
+    VulkanStaticTexture,
 };
 use fparkan_runtime::{
     create, frame, load_mission, load_mission_static_preview,
@@ -81,12 +82,14 @@ fn run(args: &[String]) -> Result<String, String> {
     if args.backend == RenderBackendMode::StaticVulkan {
         let mission_assets = loaded_mission_assets(&engine)
             .ok_or_else(|| "mission assets are unavailable after loading".to_string())?;
-        let model = mission_assets.models.first().ok_or_else(|| {
-            "mission has no mesh-backed model for the static Vulkan bridge".to_string()
-        })?;
-        let mesh = project_msh_to_static_mesh(&model.validated)
-            .map_err(|err| format!("project mission MSH for Vulkan: {err}"))?;
-        return run_static_vulkan_mode(mesh, args.frames, &args.mission, loaded.object_count);
+        let (mesh, materials) = static_preview_mesh_and_materials(mission_assets)?;
+        return run_static_vulkan_mode(
+            mesh,
+            materials,
+            args.frames,
+            &args.mission,
+            loaded.object_count,
+        );
     }
 
     let mut backend = VulkanPlanningBackend::new();
@@ -174,6 +177,79 @@ fn load_requested_mission(
     .map_err(|err| err.to_string())
 }
 
+/// Projects the explicitly bounded static-preview root into geometry and its
+/// selector-keyed diffuse material descriptors.
+///
+/// This intentionally takes only the first MAT0 texture request for each MSH
+/// batch selector. Later material phases, animation, lightmaps, transforms,
+/// and gameplay visibility remain outside this preview bridge.
+fn static_preview_mesh_and_materials(
+    assets: &MissionAssets,
+) -> Result<(VulkanStaticMesh, Vec<VulkanStaticMaterial>), String> {
+    let model = assets.models.first().ok_or_else(|| {
+        "mission has no mesh-backed model for the static Vulkan bridge".to_string()
+    })?;
+    let mesh = project_msh_to_static_mesh(&model.validated)
+        .map_err(|err| format!("project mission MSH for Vulkan: {err}"))?;
+    let visual = assets
+        .visuals
+        .iter()
+        .find(|visual| visual.model_id == Some(model.id))
+        .ok_or_else(|| "static preview model has no prepared visual".to_string())?;
+    let mut selectors = mesh
+        .draw_ranges
+        .iter()
+        .map(|range| range.material_index)
+        .collect::<Vec<_>>();
+    selectors.sort_unstable();
+    selectors.dedup();
+
+    let materials = selectors
+        .into_iter()
+        .map(|material_index| {
+            let material_id = visual.material_ids.get(usize::from(material_index)).ok_or_else(|| {
+                format!(
+                    "static preview MSH batch selector {material_index} has no prepared WEAR material"
+                )
+            })?;
+            let material = assets.material_by_id(*material_id).ok_or_else(|| {
+                format!(
+                    "static preview prepared material {material_index} is unavailable"
+                )
+            })?;
+            let texture_name = material.texture_requests.first().ok_or_else(|| {
+                format!("static preview material {material_index} has no MAT0 diffuse texture")
+            })?;
+            let texture = assets
+                .textures
+                .iter()
+                .find(|texture| {
+                    texture.usage == PreparedTextureUsage::Diffuse
+                        && texture.source.name == *texture_name
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "static preview diffuse texture {texture_name:?} for material {material_index} is unavailable"
+                    )
+                })?;
+            let image = texture.decode_mip_rgba8(0).map_err(|err| {
+                format!(
+                    "decode static preview diffuse texture {texture_name:?} for material {material_index}: {err}"
+                )
+            })?;
+            Ok(VulkanStaticMaterial {
+                material_index,
+                texture: VulkanStaticTexture {
+                    width: image.width,
+                    height: image.height,
+                    rgba8: image.rgba8,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok((mesh, materials))
+}
+
 fn prepare_load_progress_path(path: &std::path::Path) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
@@ -187,13 +263,14 @@ fn write_load_progress(path: &std::path::Path, phase: MissionLoadPhase) -> Resul
 
 fn run_static_vulkan_mode(
     mesh: VulkanStaticMesh,
+    materials: Vec<VulkanStaticMaterial>,
     target_frames: u64,
     mission: &str,
     object_count: usize,
 ) -> Result<String, String> {
     let event_loop = EventLoop::new().map_err(|err| format!("winit event loop: {err}"))?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = StaticVulkanApp::new(mesh, target_frames, mission, object_count);
+    let mut app = StaticVulkanApp::new(mesh, materials, target_frames, mission, object_count);
     if let Err(err) = event_loop.run_app(&mut app) {
         app.error = Some(format!("winit event loop: {err}"));
     }
@@ -202,6 +279,7 @@ fn run_static_vulkan_mode(
 
 struct StaticVulkanApp {
     mesh: VulkanStaticMesh,
+    materials: Vec<VulkanStaticMaterial>,
     target_frames: u64,
     mission: String,
     object_count: usize,
@@ -214,9 +292,16 @@ struct StaticVulkanApp {
 }
 
 impl StaticVulkanApp {
-    fn new(mesh: VulkanStaticMesh, target_frames: u64, mission: &str, object_count: usize) -> Self {
+    fn new(
+        mesh: VulkanStaticMesh,
+        materials: Vec<VulkanStaticMaterial>,
+        target_frames: u64,
+        mission: &str,
+        object_count: usize,
+    ) -> Self {
         Self {
             mesh,
+            materials,
             target_frames,
             mission: mission.to_string(),
             object_count,
@@ -259,10 +344,11 @@ impl StaticVulkanApp {
             return;
         }
         self.output = Some(format!(
-            "{{\"report_kind\":\"rendered-static-mission\",\"backend\":\"vulkan-static\",\"window\":\"native\",\"mission\":{},\"objects\":{},\"frames\":{},\"swapchain\":[{},{}],\"swapchain_images\":{},\"validation_warnings\":{},\"validation_errors\":{},\"readback_bytes\":{},\"readback_hash\":{}}}",
+            "{{\"report_kind\":\"rendered-static-mission\",\"backend\":\"vulkan-static\",\"window\":\"native\",\"mission\":{},\"objects\":{},\"frames\":{},\"material_descriptors\":{},\"swapchain\":[{},{}],\"swapchain_images\":{},\"validation_warnings\":{},\"validation_errors\":{},\"readback_bytes\":{},\"readback_hash\":{}}}",
             json_string(&self.mission),
             self.object_count,
             self.frames_presented,
+            self.materials.len(),
             report.renderer_report.swapchain_extent.0,
             report.renderer_report.swapchain_extent.1,
             report.renderer_report.swapchain_image_count,
@@ -320,7 +406,7 @@ impl ApplicationHandler for StaticVulkanApp {
             render_request: WinitWindow::default_render_request(),
             enable_validation: true,
             mesh: self.mesh.clone(),
-            materials: Vec::new(),
+            materials: self.materials.clone(),
             bootstrap_progress: None,
         }) {
             Ok(renderer) => renderer,

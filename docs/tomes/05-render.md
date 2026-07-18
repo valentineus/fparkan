@@ -941,16 +941,18 @@ not the default planning path. It visits only the first mission root, selects
 its prepared MSH model, sends it through the existing static XZ clip-space
 projection and renders a requested number of frames through
 `VulkanSmokeRenderer`; teardown rejects validation warnings/errors and reports
-swapchain/readback telemetry. It deliberately supplies no material textures,
-so the renderer's documented white fallback is used.
+swapchain/readback telemetry. For each used `Batch20.material_index`, it resolves
+the positional prepared WEAR material and uploads mip 0 of that material's first
+MAT0 diffuse texture request as a selector-keyed descriptor.
 
 This is a narrow bootstrap from mission assets to a live Vulkan renderer. It
-does not render every placed object, apply TMA transforms or orientation, bind
-WEAR/MAT0/TEXM material data, or establish a game camera. Fresh GOG
+does not render every placed object, apply TMA transforms or orientation, select
+later MAT0 phases or animation, bind lightmaps, or establish a game camera. Fresh GOG
 `MISSIONS/Autodemo.00/data.tma` evidence now proves the narrow GPU bridge: one
 presented frame completed in 38.7 seconds with a native 1280×720 two-image
-swapchain, 7,372,800-byte synchronized readback (FNV-1a
-`10681850560830502773`) and validation warnings/errors `0/0`. This is not a
+swapchain, one selector-keyed original diffuse descriptor, 7,372,800-byte
+synchronized readback (FNV-1a `12332214764918703197`) and validation
+warnings/errors `0/0`. This is not a
 full-scene or original-renderer pixel-parity claim.
 
 The preview now asks `load_mission_static_preview` for both graph and assets.
