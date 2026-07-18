@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 fparkan-diagnostics = { path = "../fparkan-diagnostics", version = "0.1.0" }
 fparkan-msh = { path = "../fparkan-msh", version = "0.1.0" }
+fparkan-material = { path = "../fparkan-material", version = "0.1.0" }
 fparkan-nres = { path = "../fparkan-nres", version = "0.1.0" }
 fparkan-path = { path = "../fparkan-path", version = "0.1.0" }
 fparkan-rsli = { path = "../fparkan-rsli", version = "0.1.0" }

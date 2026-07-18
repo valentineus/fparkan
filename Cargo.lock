@@ -469,6 +469,7 @@ name = "fparkan-inspection"
 version = "0.1.0"
 dependencies = [
  "fparkan-diagnostics",
+ "fparkan-material",
  "fparkan-msh",
  "fparkan-nres",
  "fparkan-path",

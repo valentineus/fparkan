@@ -23,6 +23,7 @@
 use fparkan_diagnostics::{
     diagnostic, render_human, Diagnostic, DiagnosticCode, DiagnosticContext, Phase, SourceSpan,
 };
+use fparkan_material::{decode_wear, resolve_material, MaterialFallback};
 use fparkan_msh::{decode_msh, validate_msh, ModelAsset};
 use fparkan_nres::{decode as decode_nres, NresDocument, ReadProfile};
 use fparkan_path::{normalize_relative, PathPolicy};
@@ -99,6 +100,25 @@ pub struct TextureInspection {
     pub mips: usize,
     /// Total page rectangles.
     pub pages: usize,
+}
+
+/// Diffuse TEXM selected through an original WEAR and MAT0 material chain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WearMaterialTexture {
+    /// Source WEAR archive.
+    pub wear_archive: String,
+    /// Source WEAR resource.
+    pub wear_resource: String,
+    /// Positional WEAR selector used by an MSH batch.
+    pub material_index: u16,
+    /// Resolved MAT0 resource name after the original fallback chain.
+    pub material_name: String,
+    /// Fallback route used while resolving the MAT0 resource.
+    pub material_fallback: MaterialFallback,
+    /// Texture name selected from phase zero of the resolved MAT0 document.
+    pub texture_name: String,
+    /// Decoded RGBA8 mip zero suitable for the Vulkan upload boundary.
+    pub image: fparkan_texm::RgbaImage,
 }
 
 /// Land map/msh inspection payload.
@@ -362,6 +382,45 @@ pub fn load_texture_mip0_rgba8_from_root(
     fparkan_texm::decode_mip_rgba8(&document, 0).map_err(|err| err.to_string())
 }
 
+/// Resolves phase-zero diffuse TEXM through `WEAR → MAT0 → Textures.lib`.
+///
+/// The selector is the positional `Batch20.material_index`, not WEAR's legacy
+/// text id. MAT0 fallback remains owned by `fparkan-material`: exact requested
+/// entry, then `DEFAULT`, then the first material entry.
+///
+/// # Errors
+///
+/// Returns a string error if WEAR/MAT0 resolution, phase selection, or TEXM
+/// decoding fails. An empty phase-zero texture name is an intentional
+/// untextured material and is reported rather than substituted with a texture.
+pub fn load_wear_material_texture_mip0_rgba8_from_root(
+    root: &Path,
+    wear_archive: &str,
+    wear_resource: &str,
+    material_index: u16,
+) -> Result<WearMaterialTexture, String> {
+    let wear_bytes = read_resource_bytes_diagnostic(root, wear_archive, wear_resource)
+        .map_err(|err| render_human(&err))?;
+    let wear = decode_wear(&wear_bytes).map_err(|err| err.to_string())?;
+    let repository = CachedResourceRepository::new(Arc::new(DirectoryVfs::new(root)));
+    let material =
+        resolve_material(&repository, &wear, material_index).map_err(|err| err.to_string())?;
+    let texture = material.document.primary_texture().ok_or_else(|| {
+        "MAT0 phase zero declares an intentionally untextured material".to_string()
+    })?;
+    let texture_name = String::from_utf8_lossy(&texture.0).into_owned();
+    let image = load_texture_mip0_rgba8_from_root(root, "Textures.lib", &texture_name)?;
+    Ok(WearMaterialTexture {
+        wear_archive: wear_archive.to_string(),
+        wear_resource: wear_resource.to_string(),
+        material_index,
+        material_name: String::from_utf8_lossy(&material.name.0).into_owned(),
+        material_fallback: material.fallback,
+        texture_name,
+        image,
+    })
+}
+
 /// Inspects a terrain land file by path.
 ///
 /// # Errors
@@ -605,6 +664,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wear_material_texture_loader_preserves_original_selection_provenance() {
+        let dir = temp_dir("wear-material-texture");
+        fs::write(
+            dir.join("wear.rlb"),
+            build_single_entry_nres(b"MODEL.WEA", b"1\n0 MAT\n"),
+        )
+        .expect("wear archive");
+        let mut mat0 = vec![0; 4 + 34];
+        mat0[0..2].copy_from_slice(&1_u16.to_le_bytes());
+        mat0[22..25].copy_from_slice(b"TEX");
+        fs::write(
+            dir.join("material.lib"),
+            build_single_entry_nres_with_meta(b"MAT", fparkan_material::MAT0_KIND, 0, &mat0),
+        )
+        .expect("material archive");
+        fs::write(
+            dir.join("Textures.lib"),
+            build_single_entry_nres(b"TEX", &texm_argb8888_pixel([0x40, 0x11, 0x22, 0x33])),
+        )
+        .expect("texture archive");
+
+        let selected =
+            load_wear_material_texture_mip0_rgba8_from_root(&dir, "wear.rlb", "MODEL.WEA", 0)
+                .expect("resolved material texture");
+
+        assert_eq!(selected.material_name, "MAT");
+        assert_eq!(selected.material_fallback, MaterialFallback::Exact);
+        assert_eq!(selected.texture_name, "TEX");
+        assert_eq!(selected.image.rgba8, vec![0x11, 0x22, 0x33, 0x40]);
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let base = PathBuf::from("/tmp")
             .join("fparkan-inspection-tests")
@@ -615,15 +706,24 @@ mod tests {
     }
 
     fn build_single_entry_nres(name: &[u8], payload: &[u8]) -> Vec<u8> {
+        build_single_entry_nres_with_meta(name, 1, 0, payload)
+    }
+
+    fn build_single_entry_nres_with_meta(
+        name: &[u8],
+        type_id: u32,
+        attr2: u32,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let mut out = vec![0; TEST_NRES_HEADER_LEN];
         let payload_offset = u32::try_from(out.len()).expect("payload offset");
         out.extend_from_slice(payload);
         let padding = (8 - (out.len() % 8)) % 8;
         out.resize(out.len() + padding, 0);
 
-        push_u32(&mut out, 1);
+        push_u32(&mut out, type_id);
         push_u32(&mut out, 0);
-        push_u32(&mut out, 0);
+        push_u32(&mut out, attr2);
         push_u32(&mut out, u32::try_from(payload.len()).expect("payload len"));
         push_u32(&mut out, 0);
         let mut raw_name = [0; TEST_NRES_NAME_LEN];
@@ -642,5 +742,19 @@ mod tests {
 
     fn push_u32(out: &mut Vec<u8>, value: u32) {
         out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn texm_argb8888_pixel(pixel: [u8; 4]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&0x6D78_6554_u32.to_le_bytes());
+        out.extend_from_slice(&1_u32.to_le_bytes());
+        out.extend_from_slice(&1_u32.to_le_bytes());
+        out.extend_from_slice(&1_u32.to_le_bytes());
+        out.extend_from_slice(&0_u32.to_le_bytes());
+        out.extend_from_slice(&0_u32.to_le_bytes());
+        out.extend_from_slice(&0_u32.to_le_bytes());
+        out.extend_from_slice(&8888_u32.to_le_bytes());
+        out.extend_from_slice(&pixel);
+        out
     }
 }
