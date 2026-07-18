@@ -11,6 +11,7 @@ fparkan-path = { path = "../fparkan-path", version = "0.1.0" }
 fparkan-platform = { path = "../fparkan-platform", version = "0.1.0" }
 fparkan-prototype = { path = "../fparkan-prototype", version = "0.1.0" }
 fparkan-render = { path = "../fparkan-render", version = "0.1.0" }
+fparkan-terrain = { path = "../fparkan-terrain", version = "0.1.0" }
 fparkan-resource = { path = "../fparkan-resource", version = "0.1.0" }
 fparkan-vfs = { path = "../fparkan-vfs", version = "0.1.0" }
 fparkan-world = { path = "../fparkan-world", version = "0.1.0" }

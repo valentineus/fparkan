@@ -376,6 +376,20 @@ pub fn transform_state(world: &World, handle: ObjectHandle) -> Result<TransformS
     Ok(checked_slot(world, handle)?.transform)
 }
 
+/// Returns the live registered handle carrying an original mission id.
+#[must_use]
+pub fn handle_by_original_id(world: &World, original_id: OriginalObjectId) -> Option<ObjectHandle> {
+    world.slots.iter().enumerate().find_map(|(index, slot)| {
+        let index = u32::try_from(index).ok()?;
+        (slot.live && slot.registered && slot.original_id == Some(original_id)).then_some(
+            ObjectHandle {
+                generation: slot.generation,
+                slot: index,
+            },
+        )
+    })
+}
+
 /// Requests deletion.
 ///
 /// # Errors
@@ -814,10 +828,16 @@ mod tests {
         .expect("second");
         register_object(&mut world, first).expect("register first");
         register_object(&mut world, second).expect("register second");
+        assert_eq!(
+            handle_by_original_id(&world, OriginalObjectId(7)),
+            Some(first)
+        );
+        assert_eq!(handle_by_original_id(&world, OriginalObjectId(9)), None);
         assert_eq!(registration_sequence(&world, first), Ok(Some(0)));
         assert_eq!(registration_sequence(&world, second), Ok(Some(1)));
 
         request_delete(&mut world, first).expect("delete");
+        assert_eq!(handle_by_original_id(&world, OriginalObjectId(7)), None);
         assert_eq!(
             register_object(&mut world, first),
             Err(WorldError::StaleHandle)

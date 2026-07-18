@@ -33,10 +33,12 @@ use fparkan_prototype::{
     build_prototype_graph_report, PrototypeGraph, PrototypeGraphFailure, PrototypeGraphReport,
 };
 use fparkan_resource::{resource_name, CachedResourceRepository, ResourceRepository};
+use fparkan_terrain::SurfaceQuery;
 use fparkan_vfs::{Vfs, VfsError};
 use fparkan_world::{
-    construct_object, new as new_world, register_object, set_transform, step, InputSnapshot,
-    ObjectDraft, OriginalObjectId, TransformState, World, WorldConfig, WorldSnapshot,
+    construct_object, handle_by_original_id, new as new_world, register_object, set_transform,
+    step, transform_state, InputSnapshot, ObjectDraft, OriginalObjectId, TransformState, World,
+    WorldConfig, WorldSnapshot,
 };
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -412,6 +414,8 @@ pub enum EngineError {
     },
     /// World error.
     World(fparkan_world::WorldError),
+    /// Reference movement input or terrain query failed.
+    Movement(String),
     /// Scheduler phase order was violated.
     SchedulerPhaseOrder {
         /// Previous phase.
@@ -428,6 +432,65 @@ pub enum EngineError {
         /// Managers were released after objects.
         managers_released: bool,
     },
+}
+
+/// Advances one object toward an explicit XY target and snaps it to terrain.
+///
+/// This is a deterministic reference controller, not recovered original AI.
+///
+/// # Errors
+///
+/// Returns an error when the input is invalid, the mission/object is absent,
+/// the source transform is non-finite, or the requested point has no terrain
+/// surface.
+pub fn advance_reference_movement(
+    engine: &mut Engine,
+    original_id: OriginalObjectId,
+    target_xy: [f32; 2],
+    max_step: f32,
+) -> Result<bool, EngineError> {
+    if !target_xy
+        .iter()
+        .chain(std::iter::once(&max_step))
+        .all(|v| v.is_finite())
+        || max_step <= 0.0
+    {
+        return Err(EngineError::Movement(
+            "target and max_step must be finite; max_step must be positive".to_string(),
+        ));
+    }
+    let terrain = engine
+        .loaded
+        .as_ref()
+        .ok_or_else(|| EngineError::Movement("mission terrain is unavailable".to_string()))?
+        .terrain
+        .clone();
+    let handle = handle_by_original_id(&engine.world, original_id).ok_or_else(|| {
+        EngineError::Movement(format!("original object {} is unavailable", original_id.0))
+    })?;
+    let mut transform = transform_state(&engine.world, handle)?;
+    let position = transform.position.map(f32::from_bits);
+    if !position.iter().all(|v| v.is_finite()) {
+        return Err(EngineError::Movement(
+            "object transform is non-finite".to_string(),
+        ));
+    }
+    let dx = target_xy[0] - position[0];
+    let dy = target_xy[1] - position[1];
+    let distance = dx.hypot(dy);
+    let reached = distance <= max_step;
+    let ratio = if reached { 1.0 } else { max_step / distance };
+    let x = position[0] + dx * ratio;
+    let y = position[1] + dy * ratio;
+    let z = terrain
+        .height_at([x, y])
+        .map_err(|err| EngineError::Movement(err.to_string()))?
+        .ok_or_else(|| {
+            EngineError::Movement("movement target lies outside terrain surface".to_string())
+        })?;
+    transform.position = [x.to_bits(), y.to_bits(), z.to_bits()];
+    set_transform(&mut engine.world, handle, transform)?;
+    Ok(reached)
 }
 
 impl From<fparkan_world::WorldError> for EngineError {
@@ -459,6 +522,7 @@ impl std::fmt::Display for EngineError {
                 write!(f, "{mission}: asset preparation failed: {source}")
             }
             Self::World(source) => write!(f, "{source}"),
+            Self::Movement(message) => write!(f, "reference movement: {message}"),
             Self::SchedulerPhaseOrder { previous, current } => write!(
                 f,
                 "scheduler phase order regressed from {previous:?} to {current:?}"
@@ -487,6 +551,7 @@ impl std::error::Error for EngineError {
             Self::World(source) => Some(source),
             Self::AssetPreparation { source, .. } => Some(source),
             Self::MissingVfs
+            | Self::Movement(_)
             | Self::PrototypeGraph { .. }
             | Self::SchedulerPhaseOrder { .. }
             | Self::RegistrationTeardown { .. } => None,
@@ -1271,6 +1336,30 @@ mod tests {
     }
 
     #[test]
+    fn reference_movement_rejects_non_finite_or_non_positive_input() {
+        let mut engine = create(
+            EngineConfig {
+                mode: EngineMode::Headless,
+            },
+            EngineServices::default(),
+        )
+        .expect("engine");
+
+        let err =
+            advance_reference_movement(&mut engine, OriginalObjectId(0), [f32::NAN, 0.0], 1.0)
+                .expect_err("non-finite target must fail");
+        assert_eq!(
+            err.to_string(),
+            "reference movement: target and max_step must be finite; max_step must be positive"
+        );
+
+        assert!(matches!(
+            advance_reference_movement(&mut engine, OriginalObjectId(0), [0.0, 0.0], 0.0),
+            Err(EngineError::Movement(_))
+        ));
+    }
+
+    #[test]
     #[ignore = "requires licensed corpus"]
     fn load_trace_records_preparation_before_registration_and_raw_transforms() {
         let root = licensed_root("IS");
@@ -1311,6 +1400,69 @@ mod tests {
             .orientation_raw
             .iter()
             .all(|component| component.is_finite())));
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn reference_movement_snaps_a_live_mission_object_to_terrain() {
+        let root = licensed_root("IS");
+        let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(&root));
+        let mut engine = create(
+            EngineConfig {
+                mode: EngineMode::Headless,
+            },
+            EngineServices::new(vfs),
+        )
+        .expect("engine");
+        load_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Autodemo.00/data.tma".to_string(),
+            },
+        )
+        .expect("load mission");
+
+        let (original_id, start_xy, target_xy, expected_xy, expected_height) = {
+            let loaded = engine.loaded.as_ref().expect("loaded mission");
+            loaded
+                .object_drafts
+                .iter()
+                .find_map(|draft| {
+                    let original_id = draft.original_id?;
+                    let start_xy = [draft.position[0], draft.position[1]];
+                    [[1.0, 0.0], [-1.0, 0.0], [0.0, 1.0], [0.0, -1.0]]
+                        .into_iter()
+                        .find_map(|offset| {
+                            let target_xy = [start_xy[0] + offset[0], start_xy[1] + offset[1]];
+                            let expected_xy =
+                                [start_xy[0] + offset[0] * 0.5, start_xy[1] + offset[1] * 0.5];
+                            let height = loaded.terrain.height_at(expected_xy).ok()??;
+                            loaded
+                                .terrain
+                                .height_at(target_xy)
+                                .ok()??
+                                .is_finite()
+                                .then_some((original_id, start_xy, target_xy, expected_xy, height))
+                        })
+                })
+                .expect("mission object with a movable terrain-neighbour target")
+        };
+
+        assert!(
+            !advance_reference_movement(&mut engine, original_id, target_xy, 0.5)
+                .expect("bounded reference movement")
+        );
+        let handle = handle_by_original_id(&engine.world, original_id).expect("world object");
+        let transform = transform_state(&engine.world, handle).expect("world transform");
+        assert_eq!(
+            transform.position,
+            [
+                expected_xy[0].to_bits(),
+                expected_xy[1].to_bits(),
+                expected_height.to_bits()
+            ]
+        );
+        assert_ne!(start_xy, expected_xy);
     }
 
     #[test]
