@@ -173,6 +173,38 @@ layout prerequisites/modifiers/unlocks. Formula evaluator требует strict
 grammar/version, typed operands, deterministic numeric policy, bounded stack и
 явных errors; x87-compatible rounding нужен там, где оно выбирает ветку.
 
+### Handler(19): AutoDemo Init varset initialization
+
+`Handler(19)` is the twentieth VM-table entry at GOG `ai.dll` VA `0x1000aa38`.
+It is the only instruction in the `Init` event of the two `default.scr` bundles
+referenced by `MISSIONS\\Autodemo.00\\data.tma`; together those bundles account for
+the observed 18 named script events. Each instruction references varset records
+`224`, `225`, and `226`: `ClanBaseX`, `ClanBaseY`, and `ClanID` respectively.
+
+The original writes three raw DWORD values in order. It converts the VM fields
+at `+0x80` and `+0x84` through the x87 `__ftol` helper and stores the resulting
+words into references 0 and 1. It copies the raw word from `+0x7c` into reference
+2, then clears VM field `+0x50`. The default targets are `DWORD` records; the
+shared setter preserves the incoming word for that type. Therefore this is not
+a license to replace the first two conversions with Rust float casts: their
+rounding behavior remains an x87 compatibility boundary until it has captured
+test vectors.
+
+`GetSuperAI` returns element `n` of the 64-pointer global table at preferred
+`ai.dll + 0x55398` for `n <= 63`. The read-only
+`tools/capture-ai-init.ps1` probe observed the running GOG AutoDemo values
+`(500, 752, 0)` for entry 0 and `(728, 449, 1)` for entry 1 at fields
+`(+0x80, +0x84, +0x7c)`. These values are integral samples, not a rounding
+profile.
+
+The Rust reader exposes `VarSet::resolve_handler19`. It accepts the already
+converted first two words and the third raw word, produces three typed writes,
+and rejects missing, out-of-range, or non-`DWORD` targets. It deliberately does
+not guess how the mission creates the three source fields or execute a script
+event yet. The associated Ghidra scripts are
+`ExportAiVmHandler19.java`, `ExportAiVmHandler19Setter.java`,
+`ExportAiVmHandler19SetterCallee.java`, and `ExportAiGetSuperAi.java`.
+
 ### Handler(8): problem-record state write
 
 `Handler(8)` is the ninth VM-table entry at GOG `ai.dll` VA `0x10009b0d`.

@@ -143,6 +143,77 @@ pub struct Handler8StateChange {
     pub reset: Handler8Reset,
 }
 
+/// One raw DWORD write made by the corpus-proven `Handler(19)` Init path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Handler19DwordWrite {
+    /// Compiled varset record index selected by the instruction reference.
+    pub index: u32,
+    /// Exact 32-bit payload passed to the original common varset setter.
+    pub value: u32,
+}
+
+/// Inputs already expressed at the original `Handler(19)` setter ABI boundary.
+///
+/// The first two words are results of original x87 `__ftol` calls. Keeping
+/// them as words prevents this package from silently substituting Rust's float
+/// conversion policy before captured x87 vectors are available.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Handler19InitInput {
+    /// x87-converted value from VM field `+0x80`.
+    pub first_x87_word: u32,
+    /// x87-converted value from VM field `+0x84`.
+    pub second_x87_word: u32,
+    /// Raw word from VM field `+0x7c`.
+    pub third_word: u32,
+}
+
+/// Error resolving the three-target `Handler(19)` Init contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Handler19ResolveError {
+    /// One of the three required references was absent.
+    MissingReference {
+        /// Zero-based required target position.
+        position: usize,
+    },
+    /// A compiled reference indexed outside the loaded varset.
+    VarSetIndexOutOfBounds {
+        /// Referenced compiled-varset index.
+        index: u32,
+        /// Available declaration count.
+        declarations: usize,
+    },
+    /// The `AutoDemo` Init target was not a `DWORD` declaration.
+    UnexpectedType {
+        /// Zero-based target position.
+        position: usize,
+        /// Observed declaration type.
+        found: VarSetType,
+    },
+}
+
+impl std::fmt::Display for Handler19ResolveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingReference { position } => {
+                write!(formatter, "Handler(19) is missing reference {position}")
+            }
+            Self::VarSetIndexOutOfBounds {
+                index,
+                declarations,
+            } => write!(
+                formatter,
+                "Handler(19) reference {index} is outside {declarations} varset declarations"
+            ),
+            Self::UnexpectedType { position, found } => write!(
+                formatter,
+                "Handler(19) reference {position} has {found:?}, expected Dword"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Handler19ResolveError {}
+
 /// Error resolving the one-operand `Handler(8)` contract.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Handler8ResolveError {
@@ -389,6 +460,68 @@ impl VarSet {
             next_state,
             reset,
         })
+    }
+
+    /// Resolves the three DWORD targets written by GOG `Handler(19)`.
+    ///
+    /// The caller supplies values at the original setter ABI boundary: the
+    /// first two are already x87-converted `__ftol` results and the third is
+    /// the raw VM word. This preserves the exact default-script Init path
+    /// without claiming an unrecovered portable x87 policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed failure for missing/out-of-range targets or a target
+    /// type that differs from the observed `AutoDemo` `DWORD` contract.
+    pub fn resolve_handler19(
+        &self,
+        instruction: &ScriptInstruction,
+        input: Handler19InitInput,
+    ) -> Result<[Handler19DwordWrite; 3], Handler19ResolveError> {
+        let targets = [
+            self.resolve_handler19_target(instruction, 0)?,
+            self.resolve_handler19_target(instruction, 1)?,
+            self.resolve_handler19_target(instruction, 2)?,
+        ];
+        Ok([
+            Handler19DwordWrite {
+                index: targets[0],
+                value: input.first_x87_word,
+            },
+            Handler19DwordWrite {
+                index: targets[1],
+                value: input.second_x87_word,
+            },
+            Handler19DwordWrite {
+                index: targets[2],
+                value: input.third_word,
+            },
+        ])
+    }
+
+    fn resolve_handler19_target(
+        &self,
+        instruction: &ScriptInstruction,
+        position: usize,
+    ) -> Result<u32, Handler19ResolveError> {
+        let index = *instruction
+            .references
+            .get(position)
+            .ok_or(Handler19ResolveError::MissingReference { position })?;
+        match self.declarations.get(index as usize) {
+            Some(VarSetDeclaration {
+                type_name: VarSetType::Dword,
+                ..
+            }) => Ok(index),
+            Some(declaration) => Err(Handler19ResolveError::UnexpectedType {
+                position,
+                found: declaration.type_name,
+            }),
+            None => Err(Handler19ResolveError::VarSetIndexOutOfBounds {
+                index,
+                declarations: self.declarations.len(),
+            }),
+        }
     }
 
     /// Resolves the fixed-width, corpus-proven operands of GOG `Handler(15)`.
@@ -1033,9 +1166,10 @@ fn read_instruction(
 mod tests {
     use super::{
         decode, decode_with_limits, parse_varset, Handler15ResolveError, Handler15TargetPayload,
-        Handler2RecordInput, Handler2RecordScheduler, Handler30ResolveError, Handler8Reset,
-        Handler8ResolveError, ScriptDispatchSelector, ScriptInstruction, VarSetDefault,
-        VarSetError, VarSetType, VmHostCallbackCommand, GOG_HANDLER_COUNT, INSTRUCTION_WORDS,
+        Handler19DwordWrite, Handler19InitInput, Handler19ResolveError, Handler2RecordInput,
+        Handler2RecordScheduler, Handler30ResolveError, Handler8Reset, Handler8ResolveError,
+        ScriptDispatchSelector, ScriptInstruction, VarSetDefault, VarSetError, VarSetType,
+        VmHostCallbackCommand, GOG_HANDLER_COUNT, INSTRUCTION_WORDS,
     };
     use fparkan_binary::{DecodeError, Limits};
 
@@ -1286,6 +1420,79 @@ STRING( 8, ignored, ignored, ignored)\r\n";
                 index: 1,
                 declarations: 1,
             })
+        );
+    }
+
+    #[test]
+    fn handler_nineteen_writes_exact_default_init_dwords_without_float_coercion() {
+        let varset = parse_varset(
+            b"VAR( DWORD, ClanBaseX, 950)\nVAR( DWORD, ClanBaseY, 1000)\nVAR( DWORD, ClanID, 0)\n",
+        )
+        .expect("default Init targets");
+        let writes = varset
+            .resolve_handler19(
+                &ScriptInstruction {
+                    header_words: [19, 0, 0, 0, 0, 3, 0],
+                    references: vec![0, 1, 2],
+                },
+                Handler19InitInput {
+                    first_x87_word: 500,
+                    second_x87_word: 752,
+                    third_word: 0,
+                },
+            )
+            .expect("resolved Init writes");
+        assert_eq!(
+            writes,
+            [
+                Handler19DwordWrite {
+                    index: 0,
+                    value: 500
+                },
+                Handler19DwordWrite {
+                    index: 1,
+                    value: 752
+                },
+                Handler19DwordWrite { index: 2, value: 0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn handler_nineteen_keeps_target_errors_explicit() {
+        let float = parse_varset(b"VAR( float, f0, 1.0)\n").expect("float target");
+        let instruction = ScriptInstruction {
+            header_words: [19, 0, 0, 0, 0, 1, 0],
+            references: vec![0],
+        };
+        assert_eq!(
+            float.resolve_handler19(
+                &instruction,
+                Handler19InitInput {
+                    first_x87_word: 0,
+                    second_x87_word: 0,
+                    third_word: 0,
+                },
+            ),
+            Err(Handler19ResolveError::UnexpectedType {
+                position: 0,
+                found: VarSetType::Float,
+            })
+        );
+        let empty = parse_varset(b"").expect("empty varset");
+        assert_eq!(
+            empty.resolve_handler19(
+                &ScriptInstruction {
+                    header_words: [19, 0, 0, 0, 0, 0, 0],
+                    references: Vec::new(),
+                },
+                Handler19InitInput {
+                    first_x87_word: 0,
+                    second_x87_word: 0,
+                    third_word: 0,
+                },
+            ),
+            Err(Handler19ResolveError::MissingReference { position: 0 })
         );
     }
 
