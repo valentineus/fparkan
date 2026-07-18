@@ -1132,6 +1132,16 @@ bounded probe can therefore retain both MAT0 and TEXM request milestones even
 when a later event is last. The behavior is diagnostic persistence only: it
 does not alter graph traversal, resource validation, or rendering.
 
+A rebuilt executable then ran a controlled 180-second Part 2 `Autodemo.00`
+probe with the append-only trace. Before exact-child termination it recorded
+`GraphVisualTextureRequests(64)`, `GraphVisualMaterialRequests(100)`, and every
+asset-preparation checkpoint through `AssetTextures`. It produced no native
+window, frame, readback, or Vulkan acceptance report because it was terminated
+while preparation was still active. This is one warm-state timing sample, not
+evidence that the trace change improved loading or that either MAT0/TEXM alone
+caused the earlier timeout; it does show the prior last-event-only trace hid
+concurrent request classes and later preparation progress.
+
 Mission loading now raises the decoded-payload cache entry budget from 64 to
 256 while retaining its 64 MiB byte budget. This avoids premature entry-count
 eviction during resource-rich loads without making memory unbounded. The same
