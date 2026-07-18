@@ -1126,6 +1126,12 @@ termination. It does not preserve the simultaneous TEXM count, so it neither
 identifies a slow individual material nor attributes time to MAT0 parsing; the
 next profiler revision needs one cumulative snapshot of all classes.
 
+`fparkan-game --load-progress` now initializes its file with `Starting` and
+appends each later mission-load event instead of replacing the prior line. A
+bounded probe can therefore retain both MAT0 and TEXM request milestones even
+when a later event is last. The behavior is diagnostic persistence only: it
+does not alter graph traversal, resource validation, or rendering.
+
 Mission loading now raises the decoded-payload cache entry budget from 64 to
 256 while retaining its 64 MiB byte budget. This avoids premature entry-count
 eviction during resource-rich loads without making memory unbounded. The same

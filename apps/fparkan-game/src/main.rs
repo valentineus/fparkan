@@ -473,7 +473,13 @@ fn prepare_load_progress_path(path: &std::path::Path) -> Result<(), String> {
 }
 
 fn write_load_progress(path: &std::path::Path, phase: MissionLoadPhase) -> Result<(), String> {
-    std::fs::write(path, format!("{phase:?}\n")).map_err(|err| format!("{}: {err}", path.display()))
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|err| format!("{}: {err}", path.display()))?;
+    writeln!(file, "{phase:?}").map_err(|err| format!("{}: {err}", path.display()))
 }
 
 fn run_static_vulkan_mode(
@@ -1047,6 +1053,23 @@ mod tests {
                 preview_roots: NonZeroUsize::MIN,
             })
         );
+    }
+
+    #[test]
+    fn load_progress_retains_prior_milestones() -> Result<(), String> {
+        let path =
+            std::env::temp_dir().join(format!("fparkan-game-progress-{}.txt", std::process::id()));
+        prepare_load_progress_path(&path)?;
+        write_load_progress(&path, MissionLoadPhase::GraphVisualMaterials)?;
+        write_load_progress(&path, MissionLoadPhase::GraphVisualMaterialRequests(64))?;
+        let progress = std::fs::read_to_string(&path).map_err(|err| err.to_string())?;
+        std::fs::remove_file(&path).map_err(|err| err.to_string())?;
+
+        assert_eq!(
+            progress,
+            "Starting\nGraphVisualMaterials\nGraphVisualMaterialRequests(64)\n"
+        );
+        Ok(())
     }
 
     #[test]
