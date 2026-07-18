@@ -35,10 +35,12 @@
 - `apps/fparkan-game` по умолчанию выдает `render-planning` JSON report поверх
   synthetic window descriptor и `VulkanPlanningBackend`. Opt-in `--backend static-vulkan`
   уже создаёт native `winit` window и передаёт первую подготовленную MSH модели миссии в
-  `VulkanSmokeRenderer` с пустым списком materials (явный white-fallback). Это не является
-  rendered acceptance: fresh GOG `MISSIONS/Autodemo.00/data.tma` test не дошёл до окна за
-  локальный 120-second runner limit, поэтому нет live report, pixel artifact или validation
-  evidence именно для game path.
+  `VulkanSmokeRenderer` с пустым списком materials (явный white-fallback). Режим использует
+  отдельный bounded preview loader: normal `load_mission` по-прежнему готовит все reachable
+  assets, тогда как preview останавливает asset preparation после первого root с mesh-backed
+  model. Это не является rendered acceptance: fresh GOG `MISSIONS/Autodemo.00/data.tma` test
+  с этим scope всё равно не дошёл до окна за локальный 120-second runner limit, поэтому нет
+  live report, pixel artifact или validation evidence именно для game path.
 - `apps/fparkan-viewer` сейчас inspection-only CLI и не открывает live Vulkan
   asset viewer.
 - Следующий реальный milestone для rendered acceptance: `VulkanAssetRenderer`

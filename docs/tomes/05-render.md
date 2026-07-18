@@ -951,6 +951,14 @@ WEAR/MAT0/TEXM material data, or establish a game camera. A GOG
 limit before the window/report, so this mode has implementation and unit/lint
 evidence only, not a corpus GPU acceptance claim.
 
+The preview now asks `load_mission_static_preview` for assets. Normal mission
+loading remains full and transactional; the preview scope walks root spans in
+TMA order and stops asset preparation after the first mesh-backed model. It is
+therefore not a hidden relaxation of gameplay validation. A second GOG
+`Autodemo.00` attempt with this narrower asset scope still exceeded 120 seconds
+before opening a window, which locates the remaining startup cost before the
+Vulkan draw loop but does not identify it as terrain versus graph work.
+
 `Land.msh` использует отдельный geometry-only bridge: validated `TerrainFace28`
 сохраняет source triangle order, а его positions и packed UV0 попадают в тот же
 static vertex/index upload path. Для текущего диагностического viewer XZ bounds

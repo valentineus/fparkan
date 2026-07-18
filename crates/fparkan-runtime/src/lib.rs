@@ -31,7 +31,7 @@ use fparkan_path::{normalize_relative, NormalizedPath, PathError, PathPolicy};
 use fparkan_prototype::{
     build_prototype_graph_report, PrototypeGraph, PrototypeGraphFailure, PrototypeGraphReport,
 };
-use fparkan_resource::{resource_name, CachedResourceRepository};
+use fparkan_resource::{resource_name, CachedResourceRepository, ResourceRepository};
 use fparkan_vfs::{Vfs, VfsError};
 use fparkan_world::{
     construct_object, new as new_world, register_object, step, InputSnapshot, ObjectDraft,
@@ -182,6 +182,17 @@ pub struct MissionObjectDraft {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct MissionLoadOptions {
     fail_after_registered_objects: Option<usize>,
+    asset_scope: MissionAssetScope,
+}
+
+/// Selects how much of the resolved mission asset graph to prepare.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum MissionAssetScope {
+    /// Prepare every reachable asset; required by normal runtime loading.
+    #[default]
+    Full,
+    /// Prepare one root at a time until a mesh-backed preview model is found.
+    FirstMeshPreview,
 }
 
 /// Loaded mission.
@@ -462,6 +473,33 @@ pub fn load_mission(
     load_mission_with_trace(engine, request).map(|(loaded, _trace)| loaded)
 }
 
+/// Loads a mission using the bounded static-preview asset scope.
+///
+/// This mode preserves map, TMA, graph, construction and registration work,
+/// but prepares only the first root that supplies a mesh-backed model. It is
+/// intended solely for the opt-in static Vulkan preview and must not be used
+/// for normal gameplay, where all reachable assets remain required.
+///
+/// # Errors
+///
+/// Returns [`EngineError`] under the same decoding, graph, terrain and world
+/// conditions as [`load_mission`], plus asset errors for the roots examined by
+/// the preview scope.
+pub fn load_mission_static_preview(
+    engine: &mut Engine,
+    request: MissionRequest,
+) -> Result<LoadedMission, EngineError> {
+    load_mission_with_options(
+        engine,
+        request,
+        MissionLoadOptions {
+            asset_scope: MissionAssetScope::FirstMeshPreview,
+            ..MissionLoadOptions::default()
+        },
+    )
+    .map(|(loaded, _trace)| loaded)
+}
+
 /// Loads mission transactionally and returns a diagnostic trace.
 ///
 /// # Errors
@@ -564,15 +602,22 @@ fn load_mission_with_options(
             failures: prototype_report.failures.clone(),
         });
     }
-    let mission_assets = AssetManager::new(repository)
-        .prepare_mission_assets(
+    let asset_manager = AssetManager::new(repository);
+    let mission_assets = match options.asset_scope {
+        MissionAssetScope::Full => asset_manager.prepare_mission_assets(
             &prototype_graph.root_prototype_request_spans,
             &resolved_prototypes,
-        )
-        .map_err(|source| EngineError::AssetPreparation {
-            mission: request.key.clone(),
-            source,
-        })?;
+        ),
+        MissionAssetScope::FirstMeshPreview => prepare_first_mesh_preview_assets(
+            &asset_manager,
+            &prototype_graph.root_prototype_request_spans,
+            &resolved_prototypes,
+        ),
+    }
+    .map_err(|source| EngineError::AssetPreparation {
+        mission: request.key.clone(),
+        source,
+    })?;
     let mission_asset_plan = mission_assets.to_plan();
     let object_drafts: Vec<_> = mission
         .objects
@@ -670,6 +715,21 @@ fn load_mission_with_options(
         object_drafts,
     });
     Ok((summary, trace))
+}
+
+fn prepare_first_mesh_preview_assets<R: ResourceRepository>(
+    asset_manager: &AssetManager<R>,
+    root_spans: &[std::ops::Range<usize>],
+    prototypes: &[fparkan_prototype::EffectivePrototype],
+) -> Result<MissionAssets, AssetPreparationError> {
+    for span in root_spans {
+        let assets =
+            asset_manager.prepare_mission_assets(std::slice::from_ref(span), prototypes)?;
+        if !assets.models.is_empty() {
+            return Ok(assets);
+        }
+    }
+    Ok(MissionAssets::default())
 }
 
 /// Steps headless mode.
@@ -1063,6 +1123,7 @@ mod tests {
             },
             MissionLoadOptions {
                 fail_after_registered_objects: Some(1),
+                ..MissionLoadOptions::default()
             },
         )
         .expect_err("forced registration failure");

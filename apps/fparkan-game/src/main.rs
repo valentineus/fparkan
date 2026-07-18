@@ -34,8 +34,8 @@ use fparkan_render_vulkan::{
     VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo, VulkanStaticMesh,
 };
 use fparkan_runtime::{
-    create, frame, load_mission, loaded_mission_assets, EngineConfig, EngineMode, EngineServices,
-    MissionAssets, MissionObjectDraft, MissionRequest,
+    create, frame, load_mission, load_mission_static_preview, loaded_mission_assets, EngineConfig,
+    EngineMode, EngineServices, MissionAssets, MissionObjectDraft, MissionRequest,
 };
 use fparkan_vfs::DirectoryVfs;
 #[cfg(test)]
@@ -74,12 +74,14 @@ fn run(args: &[String]) -> Result<String, String> {
         services,
     )
     .map_err(|err| err.to_string())?;
-    let loaded = load_mission(
-        &mut engine,
-        MissionRequest {
-            key: args.mission.clone(),
-        },
-    )
+    let request = MissionRequest {
+        key: args.mission.clone(),
+    };
+    let loaded = if args.backend == RenderBackendMode::StaticVulkan {
+        load_mission_static_preview(&mut engine, request)
+    } else {
+        load_mission(&mut engine, request)
+    }
     .map_err(|err| err.to_string())?;
 
     if args.backend == RenderBackendMode::StaticVulkan {

@@ -27,7 +27,7 @@ Open source проект с реализацией компонентов игр
 - [apps/fparkan-cli](apps/fparkan-cli) — CLI для архивов, графов и acceptance-отчетов.
 - [apps/fparkan-viewer](apps/fparkan-viewer) — inspection-only CLI для archive/model/texture/map без live Vulkan draw path.
 - [apps/fparkan-headless](apps/fparkan-headless) — headless runtime composition root.
-- [apps/fparkan-game](apps/fparkan-game) — mission composition root: по умолчанию выдаёт planning report; opt-in `--backend static-vulkan` открывает native Vulkan окно для первой подготовленной MSH-модели миссии.
+- [apps/fparkan-game](apps/fparkan-game) — mission composition root: по умолчанию выдаёт planning report; opt-in `--backend static-vulkan` использует bounded preview loader и открывает native Vulkan окно для первой mesh-backed MSH-модели.
 
 ## Текущий статус рендера
 
