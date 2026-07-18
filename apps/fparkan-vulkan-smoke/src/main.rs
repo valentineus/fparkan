@@ -107,12 +107,41 @@ fn remove_stale_output(options: &SmokeOptions) -> Result<(), String> {
     std::fs::remove_file(&options.out).map_err(|err| format!("{}: {err}", options.out.display()))
 }
 
+fn compare_readback_files(
+    expected: &std::path::Path,
+    actual: &std::path::Path,
+) -> Result<(), String> {
+    let expected_bytes =
+        std::fs::read(expected).map_err(|err| format!("{}: {err}", expected.display()))?;
+    let actual_bytes =
+        std::fs::read(actual).map_err(|err| format!("{}: {err}", actual.display()))?;
+    if expected_bytes.len() != actual_bytes.len() {
+        return Err(format!(
+            "pixel readback length mismatch: expected={} actual={}",
+            expected_bytes.len(),
+            actual_bytes.len()
+        ));
+    }
+    if let Some((offset, (expected_byte, actual_byte))) = expected_bytes
+        .iter()
+        .zip(&actual_bytes)
+        .enumerate()
+        .find(|(_, (expected_byte, actual_byte))| expected_byte != actual_byte)
+    {
+        return Err(format!(
+            "pixel readback mismatch at byte {offset}: expected={expected_byte} actual={actual_byte}"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SmokeOptions {
     out: PathBuf,
     frames: u32,
     resize_frame: u32,
     timeout_seconds: u64,
+    expected_readback: Option<PathBuf>,
     mesh_input: MeshInput,
     texture_input: Option<TextureInput>,
 }
@@ -216,6 +245,7 @@ impl SmokeOptions {
         let mut frames = DEFAULT_TARGET_FRAMES;
         let mut resize_frame = DEFAULT_RESIZE_FRAME;
         let mut timeout_seconds = DEFAULT_TIMEOUT_SECONDS;
+        let mut expected_readback = None;
         let mut model_root = None;
         let mut model_archive = None;
         let mut model_name = None;
@@ -257,6 +287,13 @@ impl SmokeOptions {
                         .ok_or_else(|| "--timeout-seconds requires a value".to_string())?
                         .parse()
                         .map_err(|_| "--timeout-seconds must be an integer".to_string())?;
+                }
+                "--expected-readback" => {
+                    expected_readback = Some(
+                        iter.next()
+                            .map(PathBuf::from)
+                            .ok_or_else(|| "--expected-readback requires a path".to_string())?,
+                    );
                 }
                 "--model-root" => {
                     model_root = Some(
@@ -413,6 +450,7 @@ impl SmokeOptions {
             frames,
             resize_frame,
             timeout_seconds,
+            expected_readback,
             mesh_input,
             texture_input: texture_input.or(wear_material_input),
         })
@@ -629,18 +667,26 @@ impl SmokeApp {
             .map_err(|err| format!("{}: {err}", self.options.out.display()))
     }
 
-    fn write_readback_artifact(&self, artifact: &VulkanReadbackArtifact) -> Result<(), String> {
+    fn readback_artifact_path(&self, artifact: &VulkanReadbackArtifact) -> PathBuf {
         let stem = self
             .options
             .out
             .file_stem()
             .and_then(std::ffi::OsStr::to_str)
             .unwrap_or("smoke");
-        let path = self
-            .options
+        self.options
             .out
-            .with_file_name(format!("{stem}.readback-vkformat-{}.raw", artifact.format));
-        std::fs::write(&path, &artifact.bytes).map_err(|err| format!("{}: {err}", path.display()))
+            .with_file_name(format!("{stem}.readback-vkformat-{}.raw", artifact.format))
+    }
+
+    fn write_readback_artifact(
+        &self,
+        artifact: &VulkanReadbackArtifact,
+    ) -> Result<PathBuf, String> {
+        let path = self.readback_artifact_path(artifact);
+        std::fs::write(&path, &artifact.bytes)
+            .map_err(|err| format!("{}: {err}", path.display()))
+            .map(|()| path)
     }
 
     fn live_renderer_snapshot(&self) -> Option<RendererSnapshot> {
@@ -891,10 +937,20 @@ impl SmokeApp {
             .as_ref()
             .and_then(|snapshot| snapshot.readback_artifact.as_ref())
         {
-            if let Err(err) = self.write_readback_artifact(artifact) {
-                self.error = Some(err);
-                event_loop.exit();
-                return;
+            let path = match self.write_readback_artifact(artifact) {
+                Ok(path) => path,
+                Err(err) => {
+                    self.error = Some(err);
+                    event_loop.exit();
+                    return;
+                }
+            };
+            if let Some(expected) = self.options.expected_readback.as_ref() {
+                if let Err(err) = compare_readback_files(expected, &path) {
+                    self.error = Some(err);
+                    event_loop.exit();
+                    return;
+                }
             }
         }
         let report = match self.render_report("passed", None) {
@@ -1479,6 +1535,7 @@ mod tests {
                 frames: DEFAULT_TARGET_FRAMES,
                 resize_frame: DEFAULT_RESIZE_FRAME,
                 timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+                expected_readback: None,
                 mesh_input: MeshInput::SmokeTriangle,
                 texture_input: None,
             })
@@ -1516,6 +1573,7 @@ mod tests {
                 frames: DEFAULT_TARGET_FRAMES,
                 resize_frame: DEFAULT_RESIZE_FRAME,
                 timeout_seconds: 45,
+                expected_readback: None,
                 mesh_input: MeshInput::SmokeTriangle,
                 texture_input: None,
             })
@@ -1796,6 +1854,7 @@ mod tests {
                 frames: DEFAULT_TARGET_FRAMES,
                 resize_frame: DEFAULT_RESIZE_FRAME,
                 timeout_seconds: 7,
+                expected_readback: None,
                 mesh_input: MeshInput::SmokeTriangle,
                 texture_input: None,
             },
@@ -1829,6 +1888,23 @@ mod tests {
 
         std::fs::remove_file(out).expect("cleanup report");
         std::fs::remove_dir(root).expect("cleanup dir");
+    }
+
+    #[test]
+    fn readback_comparator_accepts_exact_bytes_and_reports_first_difference() {
+        let root = std::env::temp_dir().join(format!("fparkan-readback-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("temp dir");
+        let expected = root.join("expected.raw");
+        let actual = root.join("actual.raw");
+        std::fs::write(&expected, [1_u8, 2, 3]).expect("expected");
+        std::fs::write(&actual, [1_u8, 2, 3]).expect("actual");
+        assert_eq!(compare_readback_files(&expected, &actual), Ok(()));
+        std::fs::write(&actual, [1_u8, 9, 3]).expect("different actual");
+        assert_eq!(
+            compare_readback_files(&expected, &actual),
+            Err("pixel readback mismatch at byte 1: expected=2 actual=9".to_string())
+        );
+        std::fs::remove_dir_all(root).expect("cleanup");
     }
 
     #[test]

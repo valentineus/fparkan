@@ -901,6 +901,11 @@ Smoke также сохраняет raw artifact рядом с JSON: `<report-st
 потому что bytes не перекодируются; JSON содержит actual raw enum. GOG selected `50` and produced a 4,147,200-byte file
 for two 960x540 images. Артефакт остаётся локальным output и не попадает в Git.
 
+Smoke option `--expected-readback <path>` выполняет exact byte comparison после
+readback и завершает run с первым differing byte или length mismatch. Fresh GOG
+run с предыдущим format-50 artifact прошёл этот gate. Это regression contract
+нашего static Vulkan viewer, не comparison с оригинальным renderer.
+
 `Land.msh` использует отдельный geometry-only bridge: validated `TerrainFace28`
 сохраняет source triangle order, а его positions и packed UV0 попадают в тот же
 static vertex/index upload path. Для текущего диагностического viewer XZ bounds
