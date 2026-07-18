@@ -31,7 +31,8 @@ use fparkan_render::{
     RenderSnapshotDraw,
 };
 use fparkan_render_vulkan::{
-    project_land_msh_to_static_mesh_in_world_space, project_land_msh_to_static_mesh_in_xy_frame,
+    project_land_msh_to_static_mesh_in_legacy_world_space,
+    project_land_msh_to_static_mesh_in_xy_frame,
     project_msh_to_static_mesh_in_world_space_with_transform,
     project_msh_to_static_mesh_in_xy_frame, VulkanPlanningBackend, VulkanSmokeFrameOutcome,
     VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo, VulkanStaticCamera, VulkanStaticMaterial,
@@ -226,6 +227,7 @@ struct StaticPreviewScene {
     materials: Vec<VulkanStaticMaterial>,
     camera: VulkanStaticCamera,
     camera_mode: &'static str,
+    clip_visible_vertices: usize,
     mesh_components: usize,
     terrain_components: usize,
 }
@@ -264,7 +266,7 @@ fn static_preview_mesh_and_materials(
         },
     }];
     let terrain_component = if legacy_camera.is_some() {
-        project_land_msh_to_static_mesh_in_world_space(terrain_mesh)
+        project_land_msh_to_static_mesh_in_legacy_world_space(terrain_mesh)
     } else {
         let frame = xy_frame.ok_or_else(|| "missing diagnostic XY frame".to_string())?;
         project_land_msh_to_static_mesh_in_xy_frame(terrain_mesh, frame)
@@ -313,10 +315,12 @@ fn static_preview_mesh_and_materials(
     if mesh_components == 0 {
         return Err("selected static preview roots have no mesh-backed visual".to_string());
     }
+    let camera = legacy_camera.unwrap_or_default();
     Ok(StaticPreviewScene {
+        clip_visible_vertices: static_preview_clip_visible_vertices(&mesh, camera),
         mesh,
         materials,
-        camera: legacy_camera.unwrap_or_default(),
+        camera,
         camera_mode: if legacy_camera.is_some() {
             "legacy-d3d7-capture"
         } else {
@@ -325,6 +329,46 @@ fn static_preview_mesh_and_materials(
         mesh_components,
         terrain_components: 1,
     })
+}
+
+/// Counts source vertices inside the Vulkan clip volume for a static preview.
+///
+/// The static vertex shader receives row-major D3D7 matrix data as a GLSL
+/// column-major `mat4`; its multiplication is consequently equivalent to this
+/// row-vector calculation. This remains CPU-only diagnostic evidence and does
+/// not change the renderer's clipping rules.
+fn static_preview_clip_visible_vertices(
+    mesh: &VulkanStaticMesh,
+    camera: VulkanStaticCamera,
+) -> usize {
+    mesh.vertices
+        .iter()
+        .filter(|vertex| {
+            let [x, y, z] = vertex.position;
+            let matrix = camera.clip_from_world;
+            let clip_x = x.mul_add(
+                matrix[0],
+                y.mul_add(matrix[4], z.mul_add(matrix[8], matrix[12])),
+            );
+            let clip_y = x.mul_add(
+                matrix[1],
+                y.mul_add(matrix[5], z.mul_add(matrix[9], matrix[13])),
+            );
+            let clip_z = x.mul_add(
+                matrix[2],
+                y.mul_add(matrix[6], z.mul_add(matrix[10], matrix[14])),
+            );
+            let clip_w = x.mul_add(
+                matrix[3],
+                y.mul_add(matrix[7], z.mul_add(matrix[11], matrix[15])),
+            );
+            clip_w.is_finite()
+                && clip_w > 0.0
+                && (-clip_w..=clip_w).contains(&clip_x)
+                && (-clip_w..=clip_w).contains(&clip_y)
+                && (0.0..=clip_w).contains(&clip_z)
+        })
+        .count()
 }
 
 fn static_preview_xy_frame(
@@ -558,6 +602,7 @@ struct StaticVulkanApp {
     materials: Vec<VulkanStaticMaterial>,
     camera: VulkanStaticCamera,
     camera_mode: &'static str,
+    clip_visible_vertices: usize,
     mesh_components: usize,
     terrain_components: usize,
     preview_roots: usize,
@@ -585,6 +630,7 @@ impl StaticVulkanApp {
             materials: preview.materials,
             camera: preview.camera,
             camera_mode: preview.camera_mode,
+            clip_visible_vertices: preview.clip_visible_vertices,
             mesh_components: preview.mesh_components,
             terrain_components: preview.terrain_components,
             preview_roots,
@@ -630,7 +676,7 @@ impl StaticVulkanApp {
             return;
         }
         self.output = Some(format!(
-            "{{\"report_kind\":\"rendered-static-mission\",\"backend\":\"vulkan-static\",\"camera_mode\":{},\"window\":\"native\",\"mission\":{},\"objects\":{},\"frames\":{},\"preview_roots\":{},\"mesh_components\":{},\"terrain_components\":{},\"material_descriptors\":{},\"swapchain\":[{},{}],\"swapchain_images\":{},\"validation_warnings\":{},\"validation_errors\":{},\"readback_bytes\":{},\"readback_hash\":{}}}",
+            "{{\"report_kind\":\"rendered-static-mission\",\"backend\":\"vulkan-static\",\"camera_mode\":{},\"window\":\"native\",\"mission\":{},\"objects\":{},\"frames\":{},\"preview_roots\":{},\"mesh_components\":{},\"terrain_components\":{},\"clip_visible_vertices\":{},\"material_descriptors\":{},\"swapchain\":[{},{}],\"swapchain_images\":{},\"validation_warnings\":{},\"validation_errors\":{},\"readback_bytes\":{},\"readback_hash\":{}}}",
             json_string(self.camera_mode),
             json_string(&self.mission),
             self.object_count,
@@ -638,6 +684,7 @@ impl StaticVulkanApp {
             self.preview_roots,
             self.mesh_components,
             self.terrain_components,
+            self.clip_visible_vertices,
             self.materials.len(),
             report.renderer_report.swapchain_extent.0,
             report.renderer_report.swapchain_extent.1,
@@ -1059,6 +1106,40 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn static_preview_clip_diagnostic_matches_vulkan_clip_bounds() {
+        let mesh = VulkanStaticMesh {
+            vertices: vec![
+                fparkan_render_vulkan::VulkanStaticVertex {
+                    position: [0.0, 0.0, 0.0],
+                    color: [0.0; 3],
+                    uv: [0.0; 2],
+                },
+                fparkan_render_vulkan::VulkanStaticVertex {
+                    position: [1.0, -1.0, 1.0],
+                    color: [0.0; 3],
+                    uv: [0.0; 2],
+                },
+                fparkan_render_vulkan::VulkanStaticVertex {
+                    position: [1.01, 0.0, 0.0],
+                    color: [0.0; 3],
+                    uv: [0.0; 2],
+                },
+                fparkan_render_vulkan::VulkanStaticVertex {
+                    position: [0.0, 0.0, -0.01],
+                    color: [0.0; 3],
+                    uv: [0.0; 2],
+                },
+            ],
+            indices: Vec::new(),
+            draw_ranges: Vec::new(),
+        };
+        assert_eq!(
+            static_preview_clip_visible_vertices(&mesh, VulkanStaticCamera::default()),
+            2
+        );
     }
 
     #[test]
