@@ -1242,6 +1242,11 @@ impl ApplicationHandler for SmokeApp {
                     event_loop.exit();
                     return;
                 };
+                if let Err(error) = renderer.set_camera(VulkanStaticCamera::default()) {
+                    self.error = Some(error.to_string());
+                    event_loop.exit();
+                    return;
+                }
                 match renderer.draw_frame() {
                     Ok(VulkanSmokeFrameOutcome::Presented) => {
                         self.frames_presented = self.frames_presented.saturating_add(1);

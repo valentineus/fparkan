@@ -314,6 +314,32 @@ impl VulkanSmokeRenderer {
         self.swapchain_recreate_count
     }
 
+    /// Returns the camera that will be uploaded for the next recorded frame.
+    #[must_use]
+    pub const fn camera(&self) -> super::VulkanStaticCamera {
+        self.camera
+    }
+
+    /// Replaces the camera for subsequent frames without recreating GPU resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VulkanSmokeRendererError::InvalidStaticCamera`] when a matrix
+    /// element is non-finite. The caller must update only between
+    /// [`Self::draw_frame`] calls on the renderer-owning thread.
+    pub fn set_camera(
+        &mut self,
+        camera: super::VulkanStaticCamera,
+    ) -> Result<(), VulkanSmokeRendererError> {
+        if !camera.is_finite() {
+            return Err(VulkanSmokeRendererError::InvalidStaticCamera {
+                context: "non-finite clip_from_world matrix",
+            });
+        }
+        self.camera = camera;
+        Ok(())
+    }
+
     /// Explicitly idles and tears down the renderer while the native window is still alive.
     ///
     /// # Errors

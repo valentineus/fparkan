@@ -72,9 +72,23 @@ impl VulkanStaticCamera {
     ) -> Option<Self> {
         let view = transform.try_direct3d7_view_row_major()?;
         let projection = projection.try_direct3d7_projection_row_major()?;
-        Some(Self {
-            clip_from_world: multiply_row_major(view, projection),
-        })
+        Self::from_row_major_view_projection(view, projection)
+    }
+
+    /// Builds a camera from finite row-major view and projection matrices.
+    ///
+    /// This is the runtime-facing form of the contract. It is intentionally
+    /// independent of the D3D7 recovery path so a future native camera
+    /// controller can submit its per-frame matrices without recreating Vulkan
+    /// resources.
+    #[must_use]
+    pub fn from_row_major_view_projection(view: [f32; 16], projection: [f32; 16]) -> Option<Self> {
+        view.iter()
+            .chain(projection.iter())
+            .all(|value| value.is_finite())
+            .then_some(Self {
+                clip_from_world: multiply_row_major(view, projection),
+            })
     }
 
     /// Returns whether every matrix element is finite.
@@ -341,6 +355,22 @@ mod static_mesh_tests {
         assert_eq!(camera.clip_from_world[0], 0.65_f32.cos());
         assert_eq!(camera.clip_from_world[6], 700.0_f32 / 699.5);
         assert_eq!(camera.clip_from_world[7], 0.65_f32.sin());
+    }
+
+    #[test]
+    fn static_camera_accepts_finite_runtime_matrices_and_rejects_nan() {
+        let identity = VulkanStaticCamera::default().clip_from_world;
+
+        assert_eq!(
+            VulkanStaticCamera::from_row_major_view_projection(identity, identity),
+            Some(VulkanStaticCamera::default())
+        );
+        let mut invalid = identity;
+        invalid[5] = f32::NAN;
+        assert_eq!(
+            VulkanStaticCamera::from_row_major_view_projection(invalid, identity),
+            None
+        );
     }
 
     #[test]

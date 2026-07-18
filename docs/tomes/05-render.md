@@ -1437,6 +1437,15 @@ on its XY diagnostic projection until a runtime supplies a real legacy camera;
 selecting source-world coordinates with identity camera would be a misleading
 empty/off-screen viewer rather than a compatibility result.
 
+`VulkanSmokeRenderer::set_camera` now accepts a new finite camera between frame
+submissions and uses it for the next command buffer without rebuilding the
+swapchain, buffers, descriptors or pipelines. `VulkanStaticCamera` also accepts
+generic finite row-major view/projection pairs, so the final game camera
+controller need not be coupled to the D3D7 recovery type. The native Windows
+smoke executes that update before each of 300 validation-clean frames. This is
+the renderer-side cadence contract only; it does not yet supply a gameplay
+camera controller or claim camera movement parity.
+
 A fresh no-input launch of the canonical `iron_3d.exe` did create a responsive
 window titled `Parkan. Железная Стратегия`. A read-only probe then requested
 `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ` and attempted to read the known
