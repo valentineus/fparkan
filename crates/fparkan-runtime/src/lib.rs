@@ -37,6 +37,7 @@ use fparkan_world::{
     construct_object, new as new_world, register_object, step, InputSnapshot, ObjectDraft,
     OriginalObjectId, World, WorldConfig, WorldSnapshot,
 };
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 pub use fparkan_assets::MissionAssets;
@@ -193,6 +194,8 @@ enum MissionAssetScope {
     Full,
     /// Prepare only the first mission root for a static preview.
     FirstMeshPreview,
+    /// Prepare a non-zero prefix of mission roots for a static preview.
+    PreviewRoots(NonZeroUsize),
 }
 
 /// Loaded mission.
@@ -492,6 +495,46 @@ pub fn load_mission_static_preview(
     load_mission_static_preview_with_progress(engine, request, |_| {})
 }
 
+/// Loads a static preview for the first requested non-zero count of mission roots.
+///
+/// Normal gameplay still uses [`load_mission`] and always resolves every root.
+///
+/// # Errors
+///
+/// Returns [`EngineError`] under the same conditions as
+/// [`load_mission_static_preview`].
+pub fn load_mission_static_preview_roots(
+    engine: &mut Engine,
+    request: MissionRequest,
+    root_count: NonZeroUsize,
+) -> Result<LoadedMission, EngineError> {
+    load_mission_static_preview_roots_with_progress(engine, request, root_count, |_| {})
+}
+
+/// Loads selected static-preview roots while synchronously reporting phases.
+///
+/// # Errors
+///
+/// Returns [`EngineError`] under the same conditions as
+/// [`load_mission_static_preview_roots`].
+pub fn load_mission_static_preview_roots_with_progress(
+    engine: &mut Engine,
+    request: MissionRequest,
+    root_count: NonZeroUsize,
+    mut on_phase: impl FnMut(MissionLoadPhase),
+) -> Result<LoadedMission, EngineError> {
+    load_mission_with_options_and_progress(
+        engine,
+        request,
+        MissionLoadOptions {
+            asset_scope: MissionAssetScope::PreviewRoots(root_count),
+            ..MissionLoadOptions::default()
+        },
+        Some(&mut on_phase),
+    )
+    .map(|(loaded, _trace)| loaded)
+}
+
 /// Loads a static preview while synchronously reporting entered loading phases.
 ///
 /// This has the same bounded asset scope as [`load_mission_static_preview`].
@@ -633,6 +676,9 @@ fn load_mission_with_options_and_progress(
     let scoped_graph_roots = match options.asset_scope {
         MissionAssetScope::Full => graph_roots.as_slice(),
         MissionAssetScope::FirstMeshPreview => graph_roots.get(..1).unwrap_or_default(),
+        MissionAssetScope::PreviewRoots(root_count) => graph_roots
+            .get(..root_count.get().min(graph_roots.len()))
+            .unwrap_or_default(),
     };
     let (mut prototype_graph, resolved_prototypes, mut prototype_report) =
         build_prototype_graph_report(&repository, vfs.as_ref(), scoped_graph_roots);
@@ -656,6 +702,12 @@ fn load_mission_with_options_and_progress(
         MissionAssetScope::FirstMeshPreview => prepare_first_preview_assets(
             &asset_manager,
             &prototype_graph.root_prototype_request_spans,
+            &resolved_prototypes,
+        ),
+        MissionAssetScope::PreviewRoots(root_count) => asset_manager.prepare_mission_assets(
+            &prototype_graph.root_prototype_request_spans[..root_count
+                .get()
+                .min(prototype_graph.root_prototype_request_spans.len())],
             &resolved_prototypes,
         ),
     }

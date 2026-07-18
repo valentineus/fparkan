@@ -971,13 +971,12 @@ startup is not attributed to Vulkan. This is only a cross-corpus confirmation
 of the first-root static-preview bridge, not a claim that the two games' full
 mission renderers are compatible.
 
-The preview now asks `load_mission_static_preview` for both graph and assets.
-Normal mission loading remains full and transactional; preview graph traversal
-and asset preparation are restricted to the first TMA root. It is therefore not
-a hidden relaxation of gameplay validation. The preceding all-root preview
-probe timed out at `Graph`; this reduction is what allowed the successful GOG
-native run. If that first root has no usable MSH, static preview fails explicitly
-rather than expanding later roots or pretending to render the entire mission.
+The preview now has an explicit root-prefix contract. `--preview-roots N`
+prepares the first non-zero `N` TMA roots for the opt-in static Vulkan path;
+the default remains one root. Normal mission loading remains full and
+transactional, so this is not a hidden relaxation of gameplay validation. The
+previous all-root probe timed out at `Graph`; the prefix makes broader scene
+work measurable without pretending that a bounded preview is the full game.
 
 ### Shared terrain/root diagnostic frame
 
@@ -1001,6 +1000,22 @@ one terrain component, 15 descriptors, a 7,372,800-byte readback (FNV-1a
 `10739087367165646439`) and validation warnings/errors `0/0`. The distinct hash
 from the earlier first-root-only preview is expected because the submitted
 geometry and descriptor set changed; it is not an original-frame comparison.
+
+### Multiple static-preview roots
+
+The native bridge now combines every mesh-backed visual of each selected root,
+using that root's preserved TMA `position` and `scale` in the shared diagnostic
+XZ frame. It reports the actual selected root count as `preview_roots`, rather
+than implying that all mission objects are rendered. Raw orientation, original
+camera/frustum and visibility remain unresolved.
+
+Fresh canonical GOG `Autodemo.00` evidence with `--preview-roots 2` completed
+in 59.7 seconds: 25 submitted MSH components, one terrain component and 26
+descriptors on the native 1280x720 two-image swapchain, with validation
+warnings/errors `0/0`. The readback FNV-1a remained
+`10739087367165646439`, equal to the one-root terrain/root run. That equality
+does **not** prove the second root is visible or equivalent: it is recorded as
+a camera/frustum/overlap investigation target, not hidden as a parity result.
 
 ### Camera ownership boundary from the GOG renderer
 

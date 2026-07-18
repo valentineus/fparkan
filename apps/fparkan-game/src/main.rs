@@ -36,16 +36,17 @@ use fparkan_render_vulkan::{
     VulkanStaticXzFrame,
 };
 use fparkan_runtime::{
-    create, frame, load_mission, load_mission_static_preview,
-    load_mission_static_preview_with_progress, load_mission_with_progress, loaded_mission_assets,
-    loaded_mission_object_drafts, loaded_terrain, EngineConfig, EngineMode, EngineServices,
-    MissionAssets, MissionLoadPhase, MissionObjectDraft, MissionRequest,
+    create, frame, load_mission, load_mission_static_preview, load_mission_static_preview_roots,
+    load_mission_static_preview_roots_with_progress, load_mission_with_progress,
+    loaded_mission_assets, loaded_mission_object_drafts, loaded_terrain, EngineConfig, EngineMode,
+    EngineServices, MissionAssets, MissionLoadPhase, MissionObjectDraft, MissionRequest,
 };
 use fparkan_terrain::TerrainWorld;
 use fparkan_vfs::DirectoryVfs;
 #[cfg(test)]
 use fparkan_world::OriginalObjectId;
 use fparkan_world::WorldSnapshot;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
@@ -86,15 +87,16 @@ fn run(args: &[String]) -> Result<String, String> {
             .ok_or_else(|| "mission assets are unavailable after loading".to_string())?;
         let terrain = loaded_terrain(&engine)
             .ok_or_else(|| "mission terrain is unavailable after loading".to_string())?;
-        let root = loaded_mission_object_drafts(&engine)
-            .and_then(|drafts| drafts.first())
-            .ok_or_else(|| "first mission object draft is unavailable after loading".to_string())?;
-        let preview = static_preview_mesh_and_materials(mission_assets, terrain, root)?;
+        let roots = loaded_mission_object_drafts(&engine)
+            .map(|drafts| &drafts[..args.preview_roots.get().min(drafts.len())])
+            .filter(|roots| !roots.is_empty())
+            .ok_or_else(|| {
+                "selected mission object drafts are unavailable after loading".to_string()
+            })?;
+        let preview = static_preview_mesh_and_materials(mission_assets, terrain, roots)?;
         return run_static_vulkan_mode(
-            preview.mesh,
-            preview.materials,
-            preview.mesh_components,
-            preview.terrain_components,
+            preview,
+            roots.len(),
             args.frames,
             &args.mission,
             loaded.object_count,
@@ -154,13 +156,18 @@ fn load_requested_mission(
         prepare_load_progress_path(progress_path)?;
         let mut write_error = None;
         let loaded = if args.backend == RenderBackendMode::StaticVulkan {
-            load_mission_static_preview_with_progress(engine, request, |phase| {
-                if write_error.is_none() {
-                    if let Err(err) = write_load_progress(progress_path, phase) {
-                        write_error = Some(err);
+            load_mission_static_preview_roots_with_progress(
+                engine,
+                request,
+                args.preview_roots,
+                |phase| {
+                    if write_error.is_none() {
+                        if let Err(err) = write_load_progress(progress_path, phase) {
+                            write_error = Some(err);
+                        }
                     }
-                }
-            })
+                },
+            )
         } else {
             load_mission_with_progress(engine, request, |phase| {
                 if write_error.is_none() {
@@ -179,7 +186,11 @@ fn load_requested_mission(
         return Ok(loaded);
     }
     if args.backend == RenderBackendMode::StaticVulkan {
-        load_mission_static_preview(engine, request)
+        if args.preview_roots.get() == 1 {
+            load_mission_static_preview(engine, request)
+        } else {
+            load_mission_static_preview_roots(engine, request, args.preview_roots)
+        }
     } else {
         load_mission(engine, request)
     }
@@ -204,16 +215,12 @@ struct StaticPreviewScene {
 fn static_preview_mesh_and_materials(
     assets: &MissionAssets,
     terrain: &TerrainWorld,
-    root: &MissionObjectDraft,
+    roots: &[MissionObjectDraft],
 ) -> Result<StaticPreviewScene, String> {
-    let visual_ids = assets.visuals_for_object(0);
-    if visual_ids.is_empty() {
-        return Err("first static preview root has no prepared visuals".to_string());
-    }
     let terrain_mesh = terrain
         .source_mesh()
         .ok_or_else(|| "runtime terrain does not retain its validated source mesh".to_string())?;
-    let frame = static_preview_xz_frame(assets, visual_ids, terrain, root)?;
+    let frame = static_preview_xz_frame(assets, terrain, roots)?;
     let mut mesh = VulkanStaticMesh {
         vertices: Vec::new(),
         indices: Vec::new(),
@@ -231,30 +238,34 @@ fn static_preview_mesh_and_materials(
         .map_err(|err| format!("project mission terrain for Vulkan: {err}"))?;
     append_static_preview_component(&mut mesh, terrain_component, &[(0, 0)])?;
     let mut mesh_components = 0;
-    for visual_id in visual_ids {
-        let visual = assets.visual_by_id(*visual_id).ok_or_else(|| {
-            format!("first static preview root references unknown visual {visual_id:?}")
-        })?;
-        let Some(model_id) = visual.model_id else {
-            continue;
-        };
-        let model = assets.model_by_id(model_id).ok_or_else(|| {
-            format!("static preview visual {visual_id:?} references unknown model {model_id:?}")
-        })?;
-        let component = project_msh_to_static_mesh_in_xz_frame(
-            &model.validated,
-            frame,
-            root.position,
-            root.scale,
-        )
-        .map_err(|err| format!("project mission MSH for Vulkan: {err}"))?;
-        let selector_remap =
-            static_preview_component_materials(assets, visual, &component, &mut materials)?;
-        append_static_preview_component(&mut mesh, component, &selector_remap)?;
-        mesh_components += 1;
+    for (object_index, root) in roots.iter().enumerate() {
+        for visual_id in assets.visuals_for_object(object_index) {
+            let visual = assets.visual_by_id(*visual_id).ok_or_else(|| {
+                format!(
+                    "static preview root {object_index} references unknown visual {visual_id:?}"
+                )
+            })?;
+            let Some(model_id) = visual.model_id else {
+                continue;
+            };
+            let model = assets.model_by_id(model_id).ok_or_else(|| {
+                format!("static preview visual {visual_id:?} references unknown model {model_id:?}")
+            })?;
+            let component = project_msh_to_static_mesh_in_xz_frame(
+                &model.validated,
+                frame,
+                root.position,
+                root.scale,
+            )
+            .map_err(|err| format!("project mission MSH for Vulkan: {err}"))?;
+            let selector_remap =
+                static_preview_component_materials(assets, visual, &component, &mut materials)?;
+            append_static_preview_component(&mut mesh, component, &selector_remap)?;
+            mesh_components += 1;
+        }
     }
     if mesh_components == 0 {
-        return Err("first static preview root has no mesh-backed visual".to_string());
+        return Err("selected static preview roots have no mesh-backed visual".to_string());
     }
     Ok(StaticPreviewScene {
         mesh,
@@ -266,18 +277,9 @@ fn static_preview_mesh_and_materials(
 
 fn static_preview_xz_frame(
     assets: &MissionAssets,
-    visual_ids: &[fparkan_assets::AssetId<PreparedVisual>],
     terrain: &TerrainWorld,
-    root: &MissionObjectDraft,
+    roots: &[MissionObjectDraft],
 ) -> Result<VulkanStaticXzFrame, String> {
-    if !root
-        .position
-        .iter()
-        .chain(root.scale.iter())
-        .all(|value| value.is_finite())
-    {
-        return Err("first static preview root has a non-finite position or scale".to_string());
-    }
     let mut min_x = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;
     let mut min_z = f32::INFINITY;
@@ -288,28 +290,42 @@ fn static_preview_xz_frame(
     for position in terrain_positions {
         extend_static_preview_xz_bounds(*position, &mut min_x, &mut max_x, &mut min_z, &mut max_z)?;
     }
-    for visual_id in visual_ids {
-        let visual = assets.visual_by_id(*visual_id).ok_or_else(|| {
-            format!("first static preview root references unknown visual {visual_id:?}")
-        })?;
-        let Some(model_id) = visual.model_id else {
-            continue;
-        };
-        let model = assets.model_by_id(model_id).ok_or_else(|| {
-            format!("static preview visual {visual_id:?} references unknown model {model_id:?}")
-        })?;
-        for position in &model.validated.positions {
-            extend_static_preview_xz_bounds(
-                [
-                    position[0] * root.scale[0] + root.position[0],
-                    position[1] * root.scale[1] + root.position[1],
-                    position[2] * root.scale[2] + root.position[2],
-                ],
-                &mut min_x,
-                &mut max_x,
-                &mut min_z,
-                &mut max_z,
-            )?;
+    for (object_index, root) in roots.iter().enumerate() {
+        if !root
+            .position
+            .iter()
+            .chain(root.scale.iter())
+            .all(|value| value.is_finite())
+        {
+            return Err(format!(
+                "static preview root {object_index} has a non-finite position or scale"
+            ));
+        }
+        for visual_id in assets.visuals_for_object(object_index) {
+            let visual = assets.visual_by_id(*visual_id).ok_or_else(|| {
+                format!(
+                    "static preview root {object_index} references unknown visual {visual_id:?}"
+                )
+            })?;
+            let Some(model_id) = visual.model_id else {
+                continue;
+            };
+            let model = assets.model_by_id(model_id).ok_or_else(|| {
+                format!("static preview visual {visual_id:?} references unknown model {model_id:?}")
+            })?;
+            for position in &model.validated.positions {
+                extend_static_preview_xz_bounds(
+                    [
+                        position[0] * root.scale[0] + root.position[0],
+                        position[1] * root.scale[1] + root.position[1],
+                        position[2] * root.scale[2] + root.position[2],
+                    ],
+                    &mut min_x,
+                    &mut max_x,
+                    &mut min_z,
+                    &mut max_z,
+                )?;
+            }
         }
     }
     VulkanStaticXzFrame::from_bounds(min_x, max_x, min_z, max_z)
@@ -461,25 +477,16 @@ fn write_load_progress(path: &std::path::Path, phase: MissionLoadPhase) -> Resul
 }
 
 fn run_static_vulkan_mode(
-    mesh: VulkanStaticMesh,
-    materials: Vec<VulkanStaticMaterial>,
-    mesh_components: usize,
-    terrain_components: usize,
+    preview: StaticPreviewScene,
+    preview_roots: usize,
     target_frames: u64,
     mission: &str,
     object_count: usize,
 ) -> Result<String, String> {
     let event_loop = EventLoop::new().map_err(|err| format!("winit event loop: {err}"))?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = StaticVulkanApp::new(
-        mesh,
-        materials,
-        mesh_components,
-        terrain_components,
-        target_frames,
-        mission,
-        object_count,
-    );
+    let mut app =
+        StaticVulkanApp::new(preview, preview_roots, target_frames, mission, object_count);
     if let Err(err) = event_loop.run_app(&mut app) {
         app.error = Some(format!("winit event loop: {err}"));
     }
@@ -491,6 +498,7 @@ struct StaticVulkanApp {
     materials: Vec<VulkanStaticMaterial>,
     mesh_components: usize,
     terrain_components: usize,
+    preview_roots: usize,
     target_frames: u64,
     mission: String,
     object_count: usize,
@@ -504,19 +512,18 @@ struct StaticVulkanApp {
 
 impl StaticVulkanApp {
     fn new(
-        mesh: VulkanStaticMesh,
-        materials: Vec<VulkanStaticMaterial>,
-        mesh_components: usize,
-        terrain_components: usize,
+        preview: StaticPreviewScene,
+        preview_roots: usize,
         target_frames: u64,
         mission: &str,
         object_count: usize,
     ) -> Self {
         Self {
-            mesh,
-            materials,
-            mesh_components,
-            terrain_components,
+            mesh: preview.mesh,
+            materials: preview.materials,
+            mesh_components: preview.mesh_components,
+            terrain_components: preview.terrain_components,
+            preview_roots,
             target_frames,
             mission: mission.to_string(),
             object_count,
@@ -559,10 +566,11 @@ impl StaticVulkanApp {
             return;
         }
         self.output = Some(format!(
-            "{{\"report_kind\":\"rendered-static-mission\",\"backend\":\"vulkan-static\",\"window\":\"native\",\"mission\":{},\"objects\":{},\"frames\":{},\"mesh_components\":{},\"terrain_components\":{},\"material_descriptors\":{},\"swapchain\":[{},{}],\"swapchain_images\":{},\"validation_warnings\":{},\"validation_errors\":{},\"readback_bytes\":{},\"readback_hash\":{}}}",
+            "{{\"report_kind\":\"rendered-static-mission\",\"backend\":\"vulkan-static\",\"window\":\"native\",\"mission\":{},\"objects\":{},\"frames\":{},\"preview_roots\":{},\"mesh_components\":{},\"terrain_components\":{},\"material_descriptors\":{},\"swapchain\":[{},{}],\"swapchain_images\":{},\"validation_warnings\":{},\"validation_errors\":{},\"readback_bytes\":{},\"readback_hash\":{}}}",
             json_string(&self.mission),
             self.object_count,
             self.frames_presented,
+            self.preview_roots,
             self.mesh_components,
             self.terrain_components,
             self.materials.len(),
@@ -809,6 +817,7 @@ struct Args {
     frames: u64,
     backend: RenderBackendMode,
     load_progress: Option<PathBuf>,
+    preview_roots: NonZeroUsize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -824,6 +833,7 @@ impl Args {
         let mut frames = 1;
         let mut backend = RenderBackendMode::Planning;
         let mut load_progress = None;
+        let mut preview_roots = NonZeroUsize::MIN;
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -866,6 +876,13 @@ impl Args {
                             .ok_or_else(|| "--load-progress requires a path".to_string())?,
                     );
                 }
+                "--preview-roots" => {
+                    preview_roots = iter
+                        .next()
+                        .ok_or_else(|| "--preview-roots requires a value".to_string())?
+                        .parse()
+                        .map_err(|_| "--preview-roots must be a non-zero integer".to_string())?;
+                }
                 _ => return Err(usage()),
             }
         }
@@ -880,6 +897,7 @@ impl Args {
             frames,
             backend,
             load_progress,
+            preview_roots,
         })
     }
 }
@@ -916,7 +934,7 @@ fn json_hash(hash: &[u8; 32]) -> String {
 }
 
 fn usage() -> String {
-    "usage: fparkan-game --root <path> --mission <path> [--frames <n>] [--backend <planning|static-vulkan>] [--load-progress <path>]".to_string()
+    "usage: fparkan-game --root <path> --mission <path> [--frames <n>] [--backend <planning|static-vulkan>] [--preview-roots <non-zero n>] [--load-progress <path>]".to_string()
 }
 
 #[cfg(test)]
@@ -947,6 +965,7 @@ mod tests {
                 frames: 3,
                 backend: RenderBackendMode::Planning,
                 load_progress: None,
+                preview_roots: NonZeroUsize::MIN,
             })
         );
     }
@@ -968,7 +987,43 @@ mod tests {
                 frames: 1,
                 backend: RenderBackendMode::StaticVulkan,
                 load_progress: None,
+                preview_roots: NonZeroUsize::MIN,
             })
+        );
+    }
+
+    #[test]
+    fn parses_nonzero_static_preview_root_count() {
+        let parsed = Args::parse(&strings(&[
+            "--root",
+            "testdata/IS",
+            "--mission",
+            "MISSIONS/Autodemo.00/data.tma",
+            "--backend",
+            "static-vulkan",
+            "--preview-roots",
+            "2",
+        ]))
+        .expect("valid static preview arguments");
+        assert_eq!(
+            parsed.preview_roots,
+            NonZeroUsize::new(2).expect("non-zero literal")
+        );
+    }
+
+    #[test]
+    fn rejects_zero_static_preview_root_count() {
+        let error = Args::parse(&strings(&[
+            "--root",
+            "testdata/IS",
+            "--mission",
+            "MISSIONS/Autodemo.00/data.tma",
+            "--preview-roots",
+            "0",
+        ]));
+        assert_eq!(
+            error,
+            Err("--preview-roots must be a non-zero integer".to_string())
         );
     }
 
@@ -989,6 +1044,7 @@ mod tests {
                 frames: 1,
                 backend: RenderBackendMode::Planning,
                 load_progress: Some(PathBuf::from("target/probe.txt")),
+                preview_roots: NonZeroUsize::MIN,
             })
         );
     }
