@@ -1498,6 +1498,37 @@ errors. This validates the offline handoff for one captured instant; it does
 not claim live camera tracking, material parity, or an original-frame pixel
 comparison.
 
+`tools/capture-original-camera.ps1` makes that handoff repeatable for a live
+GOG process. It finds the actual `Terrain.dll` base with Toolhelp module
+enumeration, opens the chosen PID with only
+`PROCESS_QUERY_INFORMATION | PROCESS_VM_READ`, reads the camera global at its
+RVA and then exactly 64 matrix bytes at interface `+32`. It emits the
+`fparkan-legacy-camera-v1` JSON accepted by `fparkan-game`; it does not write
+to the process, send window messages, inject code, suspend threads, or invoke
+an original method. PowerShell execution policy may require the explicit
+one-shot bypass below; that changes neither the script nor the game.
+
+```powershell
+$capture = powershell -NoProfile -ExecutionPolicy Bypass -File `
+  .\tools\capture-original-camera.ps1 -ProcessId 5632
+$capture | Set-Content -NoNewline target\fparkan\live-camera.json
+cargo run -q -p fparkan-game -- --root 'C:\GOG Games\Parkan - Iron Strategy' `
+  --mission 'MISSIONS\Autodemo.00\data.tma' --backend static-vulkan --frames 3 `
+  --legacy-camera-capture target\fparkan\live-camera.json `
+  --readback-out target\fparkan\autodemo-live-camera.raw
+```
+
+On the unattended live AutoDemo the tool produced a new finite matrix and the
+same all-root static bridge completed with 46 clip-visible vertices, 71
+descriptors, a 7,372,800-byte format-50 readback, FNV-1a
+`11081931966175262997`, and zero Vulkan validation warnings/errors. A passive
+desktop-surface capture of that original window also proved that the selected
+instant contains the textured terrain, atmospheric sky, HUD and weapon FX;
+`PrintWindow` itself returns a black Direct3D buffer, so it must not be treated
+as an original-frame oracle. Neither screenshot establishes pixel parity: HUD,
+FX, lighting, terrain layer composition and the remaining scene objects are
+not yet represented by the static bridge.
+
 For visual regression work, `fparkan-game --backend static-vulkan` also accepts
 `--readback-out <path>`. It writes the final synchronized Vulkan readback bytes
 only after the renderer has completed its normal teardown evidence; the JSON
