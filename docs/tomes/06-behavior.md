@@ -151,6 +151,13 @@ handler contracts и runtime traces.
 handler лишь инициирует execution context (`+0x50 = 1`); его gameplay meaning
 пока не назван.
 
+Первый часто встречающийся table entry с side effect — `Handler(2)` (176
+records в corpus). Он берёт active instruction, разрешает семь slots через
+varset, приводит три значения к float по observed kinds `5`/`3`, вызывает
+внутренний AI object и сбрасывает active flag. Смысл вызова и slot names ещё
+не установлены динамически, поэтому Rust не исполняет этот handler как
+гипотетическую команду движения/атаки/строительства.
+
 Безопасная runtime-модель:
 
 ```text

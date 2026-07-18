@@ -62,6 +62,17 @@ sentinel records. Поэтому `ScriptInstruction::dispatch_selector()` воз
 (`Handler(0)`, VA `0x10008034`) только устанавливает current context и flag
 `+0x50 = 1`; это не даёт ему игрового имени и не заменяет runtime trace.
 
+`Handler(2)` (третья entry table, VA `0x10009610`) уже имеет статический
+contract, но ещё не Rust execution: он выбирает active event/instruction через
+runtime offsets `+0x48/+0x4c`, разрешает семь 32-bit slots через varset object
+`+0x18`, допускает integer-kind `5` и float-kind `3` для трёх numeric slots
+(`+0x10/+0x14/+0x18`, иначе использует `0.0`), затем вызывает opaque AI object
+по `this + 0x7c` и очищает flag `+0x50`. Три первых slots передаются без
+доказанной semantic type/name. Следующий закрывающий capture должен записать
+raw seven slots, resolved variable values и вход/выход вызова `0x100059f0` в
+controlled mission. До него compatibility VM возвращает явный unsupported
+result, а не «примерный» game command.
+
 TMA properties остаются four raw `u32` words плюс имя, пока consumer/schema не
 задаст тип (integer/float bits/ObjectId/enum/fixed-point/index). В том числе
 сохраняются `NOT USED`; corpus подтверждает `Invulnerability`, life state,
