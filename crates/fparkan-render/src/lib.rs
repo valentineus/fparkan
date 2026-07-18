@@ -22,6 +22,42 @@
 
 use fparkan_world::OriginalObjectId;
 
+/// A 64-byte transform block returned by the original Terrain camera ABI.
+///
+/// The original uses two selector-dependent transform pointers.  Their exact
+/// matrix convention is still under recovery, so words are deliberately kept
+/// losslessly rather than treated as a renderer-ready matrix.  The three
+/// translation words have been confirmed at indices 3, 7, and 11.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RawCameraTransform {
+    /// The exact 16 little-endian dwords returned by the legacy camera.
+    pub words: [u32; 16],
+}
+
+impl RawCameraTransform {
+    /// Indices of the confirmed X, Y, and Z translation floats.
+    pub const TRANSLATION_WORD_INDICES: [usize; 3] = [3, 7, 11];
+
+    /// Returns the confirmed legacy world position (X, Y, Z).
+    #[must_use]
+    pub fn translation(self) -> [f32; 3] {
+        Self::TRANSLATION_WORD_INDICES.map(|index| f32::from_bits(self.words[index]))
+    }
+}
+
+/// Raw camera state observed through the original Terrain camera interface.
+///
+/// Selector 0 supplies the currently active transform and selector 2 supplies
+/// its paired transform.  Keeping both lets a later compatibility layer derive
+/// a view/projection convention without re-reading the legacy process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RawCameraPose {
+    /// Transform returned by selector 0.
+    pub selector0: RawCameraTransform,
+    /// Transform returned by selector 2.
+    pub selector2: RawCameraTransform,
+}
+
 /// Immutable camera data visible to command generation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CameraSnapshot {
@@ -29,6 +65,12 @@ pub struct CameraSnapshot {
     pub view: [f32; 16],
     /// Projection matrix, row-major.
     pub projection: [f32; 16],
+    /// Optional unconverted source-camera state.
+    ///
+    /// This does not alter rendering until the original matrix and projection
+    /// conventions have been recovered; it preserves the ABI boundary for the
+    /// runtime adapter and deterministic captures.
+    pub raw_pose: Option<RawCameraPose>,
 }
 
 impl Default for CameraSnapshot {
@@ -36,6 +78,7 @@ impl Default for CameraSnapshot {
         Self {
             view: identity_transform(),
             projection: identity_transform(),
+            raw_pose: None,
         }
     }
 }
@@ -701,6 +744,29 @@ fn identity_transform() -> [f32; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_camera_pose_preserves_words_and_extracts_confirmed_translation() {
+        let mut active = [0_u32; 16];
+        active[0] = 0x7FC0_0001;
+        active[3] = 491.562_5_f32.to_bits();
+        active[7] = 761.550_8_f32.to_bits();
+        active[11] = 7.361_0_f32.to_bits();
+        let paired = [0xA5A5_5A5A; 16];
+
+        let pose = RawCameraPose {
+            selector0: RawCameraTransform { words: active },
+            selector2: RawCameraTransform { words: paired },
+        };
+
+        assert_eq!(pose.selector0.words, active);
+        assert_eq!(pose.selector2.words, paired);
+        assert_eq!(
+            pose.selector0.translation(),
+            [491.562_5, 761.550_8, 7.361_0]
+        );
+        assert_eq!(CameraSnapshot::default().raw_pose, None);
+    }
 
     fn snapshot_draw(
         id: u64,

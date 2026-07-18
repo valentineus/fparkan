@@ -1318,6 +1318,16 @@ is a proven orientation-angle path. Field names, angle order and matrix
 handedness remain unassigned, but a backend-neutral camera pose may now retain
 the raw affine transform and the exact translation triple without guessing them.
 
+The render contract now represents that boundary directly. `RawCameraTransform`
+preserves each selector result as sixteen original `u32` words, so diagnostic
+data is not rounded or silently assigned a row/column convention. Its only
+typed accessor reinterprets the proven X/Y/Z words `3/7/11` as IEEE-754
+floats. `RawCameraPose` retains selector `0` and selector `2` together, and
+`CameraSnapshot::raw_pose` is optional. The present Vulkan renderer continues
+to use its existing view/projection matrices: raw pose capture is intentionally
+not converted into a view matrix until the original transform/projection
+convention has evidence.
+
 A fresh no-input launch of the canonical `iron_3d.exe` did create a responsive
 window titled `Parkan. Железная Стратегия`. A read-only probe then requested
 `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ` and attempted to read the known
