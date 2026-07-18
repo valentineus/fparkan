@@ -25,7 +25,10 @@ use fparkan_assets::{
     decode_mission_payload, extend_graph_report_with_visual_dependencies, TmaProfile,
 };
 use fparkan_corpus::{discover, render_report_json, report, DiscoverOptions};
-use fparkan_inspection::{inspect_archive_file, inspect_land_msh_bounds_file, ArchiveInspection};
+use fparkan_inspection::{
+    inspect_archive_file, inspect_land_msh_bounds_file, inspect_model_from_root, ArchiveInspection,
+    ModelInspection,
+};
 use fparkan_path::{normalize_relative, PathPolicy};
 use fparkan_prototype::build_prototype_graph_report;
 use fparkan_resource::{resource_name, CachedResourceRepository};
@@ -42,6 +45,7 @@ const PROTOTYPE_INSPECT_SCHEMA: &str = "fparkan-prototype-inspect-v1";
 const MISSION_GRAPH_SCHEMA: &str = "fparkan-mission-graph-v1";
 const MISSION_INSPECT_SCHEMA: &str = "fparkan-mission-inspect-v1";
 const TERRAIN_INSPECT_SCHEMA: &str = "fparkan-terrain-inspect-v1";
+const MODEL_INSPECT_SCHEMA: &str = "fparkan-model-inspect-v1";
 
 #[derive(Serialize)]
 struct ArchiveInspectOutput<'a> {
@@ -124,6 +128,34 @@ struct TerrainInspectOutput {
 }
 
 #[derive(Serialize)]
+struct ModelInspectOutput<'a> {
+    schema_version: &'static str,
+    archive: &'a str,
+    resource: &'a str,
+    streams: usize,
+    nodes: usize,
+    node_stride: usize,
+    slots: usize,
+    positions: usize,
+    indices: usize,
+    batches: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    animation_keys: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    animation_frame_count: Option<u32>,
+    node38: Vec<ModelNodeInspectOutput>,
+}
+
+#[derive(Serialize)]
+struct ModelNodeInspectOutput {
+    index: usize,
+    parent_or_link_raw: u16,
+    anim_map_start: u16,
+    fallback_key: u16,
+    has_lod0_group0: bool,
+}
+
+#[derive(Serialize)]
 struct GraphFailureOutput {
     root_index: usize,
     edge: &'static str,
@@ -190,6 +222,10 @@ fn run(args: &[String]) -> Result<(), String> {
         [domain, command, rest @ ..] if domain == "terrain" && command == "inspect" => {
             let rest = strip_format_json(rest)?;
             inspect_terrain(&rest)
+        }
+        [domain, command, rest @ ..] if domain == "model" && command == "inspect" => {
+            let rest = strip_format_json(rest)?;
+            inspect_model(&rest)
         }
         _ => Err(usage()),
     }
@@ -429,6 +465,47 @@ fn inspect_terrain(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn inspect_model(args: &[String]) -> Result<(), String> {
+    let root = parse_root_alias(args)?;
+    let archive = parse_required(args, &["--archive"], "--archive")?;
+    let resource = parse_required(args, &["--resource"], "--resource")?;
+    let inspection = inspect_model_from_root(&root, &archive, &resource)?;
+    println!("{}", model_inspect_json(&archive, &resource, &inspection)?);
+    Ok(())
+}
+
+fn model_inspect_json(
+    archive: &str,
+    resource: &str,
+    inspection: &ModelInspection,
+) -> Result<String, String> {
+    serialize_json(&ModelInspectOutput {
+        schema_version: MODEL_INSPECT_SCHEMA,
+        archive,
+        resource,
+        streams: inspection.streams,
+        nodes: inspection.nodes,
+        node_stride: inspection.node_stride,
+        slots: inspection.slots,
+        positions: inspection.positions,
+        indices: inspection.indices,
+        batches: inspection.batches,
+        animation_keys: inspection.animation_keys,
+        animation_frame_count: inspection.animation_frame_count,
+        node38: inspection
+            .node38
+            .iter()
+            .map(|node| ModelNodeInspectOutput {
+                index: node.index,
+                parent_or_link_raw: node.parent_or_link_raw,
+                anim_map_start: node.anim_map_start,
+                fallback_key: node.fallback_key,
+                has_lod0_group0: node.has_lod0_group0,
+            })
+            .collect(),
+    })
+}
+
 fn archive_inspect_json(
     path: &str,
     kind: &str,
@@ -505,7 +582,7 @@ fn prototype_graph_requiredness_label(
 }
 
 fn usage() -> String {
-    "usage: fparkan corpus discover|validate --root <path> [--format json] | archive inspect <file> [--format json] | terrain inspect <Land.msh> [--format json] | prototype inspect --root <path> --key <key> [--format json] | mission graph|inspect --root <path> --mission <path> [--format json]".to_string()
+    "usage: fparkan corpus discover|validate --root <path> [--format json] | archive inspect <file> [--format json] | terrain inspect <Land.msh> [--format json] | model inspect --root <path> --archive <archive> --resource <model.msh> [--format json] | prototype inspect --root <path> --key <key> [--format json] | mission graph|inspect --root <path> --mission <path> [--format json]".to_string()
 }
 
 #[cfg(test)]

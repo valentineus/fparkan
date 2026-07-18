@@ -21,7 +21,7 @@
 //! Stage-3 MSH asset contract.
 
 use encoding_rs::WINDOWS_1251;
-use fparkan_animation::{AnimKey24, Pose};
+use fparkan_animation::{evaluate_hierarchy, AnimKey24, NodePoseBuffer, ParentIndex, Pose};
 use fparkan_nres::{EntryMeta, NresDocument, NresError};
 
 /// Node table stream.
@@ -448,6 +448,34 @@ pub fn node38_fallback_pose(model: &ModelAsset, node: NodeId) -> Option<Pose> {
         .keys
         .get(usize::from(metadata.fallback_key))
         .map(AnimKey24::sampling_pose)
+}
+
+/// Evaluates the static fallback pose hierarchy of a standard `Node38` model.
+///
+/// `0xFFFF` denotes a root. Every non-root source link must name an earlier
+/// node, which preserves the producer's parent-before-child ordering. Models
+/// that do not meet this established `Node38` contract return `None` so callers
+/// can retain an explicitly unhierarchical diagnostic path.
+#[must_use]
+pub fn node38_fallback_hierarchy(model: &ModelAsset) -> Option<NodePoseBuffer> {
+    if model.node_stride != 38 || model.node_count == 0 {
+        return None;
+    }
+    let mut parents = Vec::with_capacity(model.node_count);
+    let mut poses = Vec::with_capacity(model.node_count);
+    for index in 0..model.node_count {
+        let node = NodeId(u32::try_from(index).ok()?);
+        let metadata = node38_metadata(model, node)?;
+        let parent = if metadata.parent_or_link_raw == u16::MAX {
+            ParentIndex(None)
+        } else {
+            let parent = usize::from(metadata.parent_or_link_raw);
+            (parent < index).then_some(ParentIndex(Some(metadata.parent_or_link_raw)))?
+        };
+        parents.push(parent);
+        poses.push(node38_fallback_pose(model, node)?);
+    }
+    evaluate_hierarchy(&parents, &poses).ok()
 }
 
 /// Returns draw batches for a validated slot.
@@ -1205,6 +1233,47 @@ mod tests {
     }
 
     #[test]
+    fn standard_nodes_evaluate_fallback_parent_hierarchy() {
+        let mut root = node38([u16::MAX; 15]);
+        root[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
+        root[6..8].copy_from_slice(&0_u16.to_le_bytes());
+        let mut child = node38([u16::MAX; 15]);
+        child[2..4].copy_from_slice(&0_u16.to_le_bytes());
+        child[6..8].copy_from_slice(&1_u16.to_le_bytes());
+        let mut nodes = root;
+        nodes.extend(child);
+        let mut keys = Vec::new();
+        for (x, y, z, qz, qw) in [
+            (1.0, 0.0, 0.0, 23_170_i16, 23_170_i16),
+            (2.0, 0.0, 0.0, 0_i16, 32_767_i16),
+        ] {
+            push_f32(&mut keys, x);
+            push_f32(&mut keys, y);
+            push_f32(&mut keys, z);
+            push_f32(&mut keys, 0.0);
+            push_u16(&mut keys, 0);
+            push_u16(&mut keys, 0);
+            push_u16(&mut keys, qz.cast_unsigned());
+            push_u16(&mut keys, qw.cast_unsigned());
+        }
+        let document = decode_nested(&build_nres(&[
+            stream(STREAM_NODE_TABLE, 38, b"Res1", &nodes),
+            stream(STREAM_SLOTS, 0, b"Res2", &slots_payload(&[])),
+            stream(STREAM_POSITIONS, 0, b"Res3", &[]),
+            stream(STREAM_INDICES, 0, b"Res6", &[]),
+            stream(STREAM_ANIMATION_KEYS, 0, b"Res8", &keys),
+            stream(STREAM_BATCHES, 0, b"Res13", &[]),
+            stream(STREAM_ANIMATION_FRAME_MAP, 0, b"Res19", &[]),
+        ]))
+        .expect("nested NRes");
+        let model =
+            validate_msh(&decode_msh(&document).expect("msh document")).expect("model asset");
+        let hierarchy = node38_fallback_hierarchy(&model).expect("valid node hierarchy");
+        assert!((hierarchy.poses[1].translation[0] - 1.0).abs() < 0.001);
+        assert!((hierarchy.poses[1].translation[1] - 2.0).abs() < 0.001);
+    }
+
+    #[test]
     fn type2_header_and_slot_tail_framing_are_exact() {
         let too_small = decode_nested(&build_nres(&[
             stream(STREAM_NODE_TABLE, 38, b"Res1", &[]),
@@ -1496,6 +1565,13 @@ mod tests {
                     let model = validate_msh(&msh).unwrap_or_else(|err| {
                         panic!("{corpus} {path:?} {:?}: {err}", entry.name_bytes())
                     });
+                    if model.node_stride == 38 {
+                        assert!(
+                            node38_fallback_hierarchy(&model).is_some(),
+                            "{corpus} {path:?} {:?}: Node38 hierarchy is not parent-before-child",
+                            entry.name_bytes()
+                        );
+                    }
                     let preserved = msh.preserved_streams().unwrap_or_else(|err| {
                         panic!("{corpus} {path:?} {:?}: {err}", entry.name_bytes())
                     });

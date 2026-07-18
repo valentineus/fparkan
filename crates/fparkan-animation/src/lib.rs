@@ -781,14 +781,27 @@ fn write_f32_bits(out: &mut Vec<u8>, value: f32) {
 }
 
 fn compose_pose(parent: Pose, child: Pose) -> Result<Pose, AnimationError> {
+    let translated = rotate_point(parent.rotation, child.translation);
     Ok(Pose {
         translation: [
-            parent.translation[0] + child.translation[0],
-            parent.translation[1] + child.translation[1],
-            parent.translation[2] + child.translation[2],
+            parent.translation[0] + translated[0],
+            parent.translation[1] + translated[1],
+            parent.translation[2] + translated[2],
         ],
         rotation: normalize_quat(mul_quat(parent.rotation, child.rotation))?,
     })
+}
+
+fn rotate_point(rotation: [f32; 4], point: [f32; 3]) -> [f32; 3] {
+    let [x, y, z, w] = rotation;
+    let tx = 2.0 * (y * point[2] - z * point[1]);
+    let ty = 2.0 * (z * point[0] - x * point[2]);
+    let tz = 2.0 * (x * point[1] - y * point[0]);
+    [
+        point[0] + w * tx + (y * tz - z * ty),
+        point[1] + w * ty + (z * tx - x * tz),
+        point[2] + w * tz + (x * ty - y * tx),
+    ]
 }
 
 fn mul_quat(left: [f32; 4], right: [f32; 4]) -> [f32; 4] {
@@ -1172,6 +1185,26 @@ mod tests {
                 parent: 1,
             }
         );
+    }
+
+    #[test]
+    fn hierarchy_rotates_child_translation_by_parent_orientation() {
+        let half = std::f32::consts::FRAC_1_SQRT_2;
+        let local = [
+            Pose {
+                translation: [1.0, 0.0, 0.0],
+                rotation: [0.0, 0.0, half, half],
+            },
+            Pose {
+                translation: [2.0, 0.0, 0.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            },
+        ];
+        let buffer = evaluate_hierarchy(&[ParentIndex(None), ParentIndex(Some(0))], &local)
+            .expect("hierarchy");
+        assert!((buffer.poses[1].translation[0] - 1.0).abs() < 0.0001);
+        assert!((buffer.poses[1].translation[1] - 2.0).abs() < 0.0001);
+        assert!(buffer.poses[1].translation[2].abs() < 0.0001);
     }
 
     #[test]

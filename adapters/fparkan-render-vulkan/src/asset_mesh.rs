@@ -2,7 +2,7 @@
 
 use crate::{VulkanStaticDrawRange, VulkanStaticMesh, VulkanStaticVertex};
 use fparkan_msh::{
-    draw_batches, node38_fallback_pose, selected_slot, Group, Lod, ModelAsset, NodeId,
+    draw_batches, node38_fallback_hierarchy, selected_slot, Group, Lod, ModelAsset, NodeId,
 };
 use fparkan_render::{LegacyIron3dEulerTransform, LegacyPipelineState};
 use fparkan_terrain_format::LandMeshDocument;
@@ -261,11 +261,10 @@ pub fn project_msh_to_static_mesh_in_world_space_with_transform(
 /// Projects a standard `Node38` model using each selected node's decoded
 /// fallback pose before its recovered `Iron3D` placement transform.
 ///
-/// This is deliberately not a skeleton evaluator: the source field at
-/// `Node38 + 2` is still an unassigned link, so no parent transform is
-/// inferred here.  Each node's source fallback pose is nevertheless enough to
-/// keep independently stored static components at their authored local pose.
-/// Models without complete standard-node pose data retain the established
+/// The source link at `Node38 + 2` is a parent index: `0xFFFF` marks a root
+/// and non-root indices are parent-before-child. The bridge composes the
+/// fallback poses through that hierarchy before applying the outer transform.
+/// Models without complete standard-node hierarchy data retain the established
 /// unposed static bridge.
 ///
 /// # Errors
@@ -289,6 +288,9 @@ pub fn project_msh_to_static_mesh_in_world_space_with_node_fallback_poses(
     if model.node_stride != 38 || model.node_count == 0 || model.animation.is_none() {
         return project_msh_to_static_mesh_in_world_space_with_transform(model, transform, scale);
     }
+    let Some(hierarchy) = node38_fallback_hierarchy(model) else {
+        return project_msh_to_static_mesh_in_world_space_with_transform(model, transform, scale);
+    };
 
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
@@ -299,11 +301,7 @@ pub fn project_msh_to_static_mesh_in_world_space_with_node_fallback_poses(
         let Some(slot) = selected_slot(model, node, Lod(0), Group(0)) else {
             continue;
         };
-        let Some(pose) = node38_fallback_pose(model, node) else {
-            return project_msh_to_static_mesh_in_world_space_with_transform(
-                model, transform, scale,
-            );
-        };
+        let pose = hierarchy.poses[node_index];
         if !pose
             .translation
             .iter()
@@ -893,7 +891,9 @@ mod tests {
     #[test]
     fn world_space_msh_applies_each_node_fallback_pose_before_root_transform() {
         let mut nodes = vec![0_u8; 76];
+        nodes[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
         nodes[8..10].copy_from_slice(&0_u16.to_le_bytes());
+        nodes[38 + 2..38 + 4].copy_from_slice(&0_u16.to_le_bytes());
         nodes[38 + 6..38 + 8].copy_from_slice(&1_u16.to_le_bytes());
         nodes[38 + 8..38 + 10].copy_from_slice(&1_u16.to_le_bytes());
         let source = ModelAsset {

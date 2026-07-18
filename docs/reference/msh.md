@@ -45,18 +45,22 @@ struct Node38 {
 
 Validated `ModelAsset` также сохраняет decoded type 8 keys и type 19 map как
 `ModelAnimation`. `node38_fallback_pose` возвращает pose по `fallback_key`,
-то есть доказанный static input. Значение `parent_or_link` сохраняется как raw
-field, пока runtime evidence не подтверждает, является ли оно parent index или
-другой link semantic.
+то есть доказанный static input. `parent_or_link == 0xFFFF` означает root;
+иначе это parent index, обязательно меньший индекса child. Этот контракт
+подтверждён на licensed animation gates обеих частей и защищён fallback-ом:
+модель с нарушенным порядком не получает придуманную hierarchy.
 
 В legacy-camera static preview стандартный узел уже получает свой fallback pose
-до внешнего TMA/Iron3D transform: quaternion поворачивает local vertex, затем
-добавляется node translation, после чего применяется `Rz * Ry * Rx`, scale и
-mission translation. Геометрия намеренно дублируется на draw-range узла, потому
-что один source vertex может быть нарисован разными node poses. Это local-pose
-assembly, а не skeleton: `parent_or_link` по-прежнему не используется, поэтому
-вложенные parent transforms и dynamic frame-map sampling остаются отдельной
-задачей runtime recovery.
+до внешнего TMA/Iron3D transform. Parent pose поворачивает child translation,
+затем translation суммируется, а rotations умножаются; после полученной global
+pose применяется `Rz * Ry * Rx`, scale и mission translation. Геометрия
+намеренно дублируется на draw-range узла, потому что один source vertex может
+быть нарисован разными node poses. Это static fallback hierarchy, а не полная
+animation parity: dynamic type-19 frame-map sampling остаётся отдельной задачей.
+
+Для воспроизводимого исследования `fparkan-cli model inspect --root <game>
+--archive <archive> --resource <model.msh>` выводит Node38 metadata, включая
+parent index, fallback key и наличие LOD0/group0 geometry.
 
 ## Slot and batch
 

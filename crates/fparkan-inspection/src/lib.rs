@@ -24,7 +24,9 @@ use fparkan_diagnostics::{
     diagnostic, render_human, Diagnostic, DiagnosticCode, DiagnosticContext, Phase, SourceSpan,
 };
 use fparkan_material::{decode_wear, resolve_material, MaterialFallback};
-use fparkan_msh::{decode_msh, validate_msh, ModelAsset};
+use fparkan_msh::{
+    decode_msh, node38_metadata, selected_slot, validate_msh, Group, Lod, ModelAsset, NodeId,
+};
 use fparkan_nres::{decode as decode_nres, NresDocument, ReadProfile};
 use fparkan_path::{normalize_relative, PathPolicy};
 use fparkan_resource::{archive_path, resource_name, CachedResourceRepository, ResourceRepository};
@@ -85,6 +87,29 @@ pub struct ModelInspection {
     pub indices: usize,
     /// Batch count.
     pub batches: usize,
+    /// Original node record stride.
+    pub node_stride: usize,
+    /// Standard-node metadata in source order, when the model uses `Node38`.
+    pub node38: Vec<Node38Inspection>,
+    /// Number of decoded type-8 animation keys, when available.
+    pub animation_keys: Option<usize>,
+    /// Declared type-19 animation frame count, when available.
+    pub animation_frame_count: Option<u32>,
+}
+
+/// Inspection view of a standard 38-byte model node.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Node38Inspection {
+    /// Source node index.
+    pub index: usize,
+    /// Opaque source field at byte offset two.
+    pub parent_or_link_raw: u16,
+    /// Type-19 frame-map offset, or `0xFFFF`.
+    pub anim_map_start: u16,
+    /// Type-8 fallback key index.
+    pub fallback_key: u16,
+    /// Whether LOD zero/group zero selects a geometry slot.
+    pub has_lod0_group0: bool,
 }
 
 /// Texture inspection payload.
@@ -312,6 +337,23 @@ pub fn inspect_model_from_root(
     })?;
     let msh = decode_msh(&document).map_err(|err| err.to_string())?;
     let validated = validate_msh(&msh).map_err(|err| err.to_string())?;
+    let node38 = if validated.node_stride == 38 {
+        (0..validated.node_count)
+            .filter_map(|index| {
+                let node = NodeId(u32::try_from(index).ok()?);
+                let metadata = node38_metadata(&validated, node)?;
+                Some(Node38Inspection {
+                    index,
+                    parent_or_link_raw: metadata.parent_or_link_raw,
+                    anim_map_start: metadata.anim_map_start,
+                    fallback_key: metadata.fallback_key,
+                    has_lod0_group0: selected_slot(&validated, node, Lod(0), Group(0)).is_some(),
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(ModelInspection {
         streams: msh.streams().len(),
         nodes: validated.node_count,
@@ -319,6 +361,16 @@ pub fn inspect_model_from_root(
         positions: validated.positions.len(),
         indices: validated.indices.len(),
         batches: validated.batches.len(),
+        node_stride: validated.node_stride,
+        node38,
+        animation_keys: validated
+            .animation
+            .as_ref()
+            .map(|animation| animation.keys.len()),
+        animation_frame_count: validated
+            .animation
+            .as_ref()
+            .map(|animation| animation.frame_count),
     })
 }
 
