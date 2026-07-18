@@ -43,6 +43,8 @@ use std::sync::Arc;
 
 pub use fparkan_assets::MissionAssets;
 
+const MISSION_DECODED_PAYLOAD_CACHE_ENTRIES: usize = 256;
+
 /// Engine mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EngineMode {
@@ -684,7 +686,10 @@ fn load_mission_with_options_and_progress(
         })
         .collect();
     record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::Graph);
-    let repository = CachedResourceRepository::new(vfs.clone());
+    let repository = CachedResourceRepository::with_payload_cache_budget(
+        vfs.clone(),
+        MISSION_DECODED_PAYLOAD_CACHE_ENTRIES,
+    );
     let graph_roots: Vec<_> = mission
         .objects
         .iter()

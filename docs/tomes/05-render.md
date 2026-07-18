@@ -1101,6 +1101,13 @@ graph traversal, edge order and validation semantics. Repeating the controlled
 WEAR and MAT0 expansion before timeout; its remaining bottleneck is TEXM
 validation/archive work, not Vulkan submission or the base prototype graph.
 
+Mission loading now raises the decoded-payload cache entry budget from 64 to
+256 while retaining its 64 MiB byte budget. This avoids premature entry-count
+eviction during resource-rich loads without making memory unbounded. The same
+180-second Part 2 probe nevertheless remained at `GraphVisualTextures`; this
+change is a safe cache-capacity improvement, not measured evidence of a Part 2
+startup advance.
+
 `Assets` now has four ordered diagnostic sub-checkpoints: `AssetModelMeshes`
 (MSH), `AssetWearTables` (WEAR), `AssetMaterials` (MAT0) and `AssetTextures`
 (diffuse TEXM and lightmaps). The callback is observational: it neither changes
