@@ -1895,3 +1895,19 @@ the licensed GOG `MISSIONS/Autodemo.00/data.tma` run with all eight roots,
 `--static-animation-frame 1`, two frames and format `50` completed with 66
 mesh components, 75,543 clip-visible vertices, a 1280×720 / 3,686,400-byte
 readback hash `4638497144561211935`, and validation warnings/errors `0/0`.
+
+### Explicit MAT0 phase preview
+
+`fparkan-game --backend static-vulkan --static-material-phase <u16>` now
+selects the exact decoded MAT0 texture for that phase of each MSH material.
+The override is deliberately per material: when the requested phase is absent
+or intentionally untextured, that material retains its existing first prepared
+diffuse request, rather than fabricating a texture or aborting the whole
+mission. Terrain remains on its separately proven Land2 base path. The JSON
+report records `material_phase` so the artifact's selector is explicit. This
+is an asset-viewer control, not a claim about the original material clock,
+phase mode, interpolation, random offset, lighting or Land1 composition.
+
+On 2026-07-18 the licensed GOG AutoDemo run with all eight roots, phase `1`,
+two frames and format `50` completed validation-clean with 71 descriptors and
+a 1280×720 / 3,686,400-byte readback hash `3152437928708207395`.

@@ -448,6 +448,7 @@ version = "0.1.0"
 dependencies = [
  "fparkan-assets",
  "fparkan-inspection",
+ "fparkan-path",
  "fparkan-platform",
  "fparkan-platform-winit",
  "fparkan-render",

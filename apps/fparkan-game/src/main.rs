@@ -23,6 +23,7 @@
 
 use fparkan_assets::{PreparedTextureUsage, PreparedVisual};
 use fparkan_inspection::load_standalone_wear_material_texture_mip0_rgba8_from_root;
+use fparkan_path::ResourceName;
 use fparkan_platform::WindowPort;
 use fparkan_platform_winit::{window_native_handles, WinitWindow, WinitWindowPlan};
 use fparkan_render::{
@@ -113,6 +114,7 @@ fn run(args: &[String]) -> Result<String, String> {
             roots,
             camera,
             args.static_animation_frame,
+            args.static_material_phase,
             &args.root,
             &loaded.land_msh_path,
         )?;
@@ -245,6 +247,7 @@ struct StaticPreviewScene {
     mesh_components: usize,
     terrain_components: usize,
     animation_frame: Option<u16>,
+    material_phase: Option<u16>,
 }
 
 /// Projects the mission terrain plus every MSH component of the explicitly
@@ -256,13 +259,14 @@ struct StaticPreviewScene {
 /// retained on draw ranges but awaits a recovered blend equation; orientation,
 /// later material phases, animation, lightmaps and gameplay visibility remain
 /// outside this bridge.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn static_preview_mesh_and_materials(
     assets: &MissionAssets,
     terrain: &TerrainWorld,
     roots: &[MissionObjectDraft],
     legacy_camera: Option<VulkanStaticCamera>,
     static_animation_frame: Option<u16>,
+    static_material_phase: Option<u16>,
     root: &std::path::Path,
     land_msh_path: &str,
 ) -> Result<StaticPreviewScene, String> {
@@ -346,8 +350,13 @@ fn static_preview_mesh_and_materials(
                 }
             }
             .map_err(|err| format!("project mission MSH for Vulkan: {err}"))?;
-            let selector_remap =
-                static_preview_component_materials(assets, visual, &component, &mut materials)?;
+            let selector_remap = static_preview_component_materials(
+                assets,
+                visual,
+                &component,
+                static_material_phase,
+                &mut materials,
+            )?;
             append_static_preview_component(&mut mesh, component, &selector_remap)?;
             mesh_components += 1;
         }
@@ -369,6 +378,7 @@ fn static_preview_mesh_and_materials(
         mesh_components,
         terrain_components: 1,
         animation_frame: static_animation_frame,
+        material_phase: static_material_phase,
     })
 }
 
@@ -539,6 +549,7 @@ fn static_preview_component_materials(
     assets: &MissionAssets,
     visual: &PreparedVisual,
     mesh: &VulkanStaticMesh,
+    static_material_phase: Option<u16>,
     materials: &mut Vec<VulkanStaticMaterial>,
 ) -> Result<Vec<(u16, u16)>, String> {
     let mut source_selectors = mesh
@@ -562,15 +573,21 @@ fn static_preview_component_materials(
             let material = assets.material_by_id(*material_id).ok_or_else(|| {
                 format!("static preview prepared material {source_selector} is unavailable")
             })?;
-            let texture_name = material.texture_requests.first().ok_or_else(|| {
-                format!("static preview material {source_selector} has no MAT0 diffuse texture")
-            })?;
+            let texture_name = static_material_phase
+                .and_then(|phase_index| {
+                    let phase = material.mat0.phases.get(usize::from(phase_index))?;
+                    let length = phase.texture_raw.iter().position(|byte| *byte == 0).unwrap_or(phase.texture_raw.len());
+                    (length != 0).then(|| ResourceName(phase.texture_raw[..length].to_vec()))
+                })
+                .or_else(|| material.texture_requests.first().cloned())
+                .ok_or_else(|| {
+                    format!("static preview material {source_selector} has no MAT0 diffuse texture")
+                })?;
             let texture = assets
                 .textures
                 .iter()
                 .find(|texture| {
-                    texture.usage == PreparedTextureUsage::Diffuse
-                        && texture.source.name == *texture_name
+                    texture.usage == PreparedTextureUsage::Diffuse && texture.source.name == texture_name
                 })
                 .ok_or_else(|| {
                     format!(
@@ -703,6 +720,7 @@ struct StaticVulkanApp {
     mesh_components: usize,
     terrain_components: usize,
     animation_frame: Option<u16>,
+    material_phase: Option<u16>,
     preview_roots: usize,
     target_frames: u64,
     mission: String,
@@ -734,6 +752,7 @@ impl StaticVulkanApp {
             mesh_components: preview.mesh_components,
             terrain_components: preview.terrain_components,
             animation_frame: preview.animation_frame,
+            material_phase: preview.material_phase,
             preview_roots,
             target_frames,
             mission: mission.to_string(),
@@ -802,13 +821,14 @@ impl StaticVulkanApp {
             (None, _) => None,
         };
         self.output = Some(format!(
-            "{{\"report_kind\":\"rendered-static-mission\",\"backend\":\"vulkan-static\",\"camera_mode\":{},\"window\":\"native\",\"mission\":{},\"objects\":{},\"frames\":{},\"preview_roots\":{},\"animation_frame\":{},\"mesh_components\":{},\"terrain_components\":{},\"clip_visible_vertices\":{},\"material_descriptors\":{},\"swapchain\":[{},{}],\"swapchain_images\":{},\"validation_warnings\":{},\"validation_errors\":{},\"readback_format\":{},\"readback_bytes\":{},\"readback_hash\":{},\"readback_path\":{}}}",
+            "{{\"report_kind\":\"rendered-static-mission\",\"backend\":\"vulkan-static\",\"camera_mode\":{},\"window\":\"native\",\"mission\":{},\"objects\":{},\"frames\":{},\"preview_roots\":{},\"animation_frame\":{},\"material_phase\":{},\"mesh_components\":{},\"terrain_components\":{},\"clip_visible_vertices\":{},\"material_descriptors\":{},\"swapchain\":[{},{}],\"swapchain_images\":{},\"validation_warnings\":{},\"validation_errors\":{},\"readback_format\":{},\"readback_bytes\":{},\"readback_hash\":{},\"readback_path\":{}}}",
             json_string(self.camera_mode),
             json_string(&self.mission),
             self.object_count,
             self.frames_presented,
             self.preview_roots,
             self.animation_frame.map_or_else(|| "null".to_string(), |frame| frame.to_string()),
+            self.material_phase.map_or_else(|| "null".to_string(), |phase| phase.to_string()),
             self.mesh_components,
             self.terrain_components,
             self.clip_visible_vertices,
@@ -1063,6 +1083,7 @@ struct Args {
     preview_roots: NonZeroUsize,
     legacy_camera_capture: Option<PathBuf>,
     static_animation_frame: Option<u16>,
+    static_material_phase: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1087,6 +1108,7 @@ impl Args {
         let mut preview_roots = NonZeroUsize::MAX;
         let mut legacy_camera_capture = None;
         let mut static_animation_frame = None;
+        let mut static_material_phase = None;
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -1159,6 +1181,16 @@ impl Args {
                             })?,
                     );
                 }
+                "--static-material-phase" => {
+                    static_material_phase = Some(
+                        iter.next()
+                            .ok_or_else(|| "--static-material-phase requires a value".to_string())?
+                            .parse()
+                            .map_err(|_| {
+                                "--static-material-phase must be a u16 integer".to_string()
+                            })?,
+                    );
+                }
                 _ => return Err(usage()),
             }
         }
@@ -1176,6 +1208,9 @@ impl Args {
         if static_animation_frame.is_some() && backend != RenderBackendMode::StaticVulkan {
             return Err("--static-animation-frame requires --backend static-vulkan".to_string());
         }
+        if static_material_phase.is_some() && backend != RenderBackendMode::StaticVulkan {
+            return Err("--static-material-phase requires --backend static-vulkan".to_string());
+        }
         Ok(Self {
             root,
             mission,
@@ -1186,6 +1221,7 @@ impl Args {
             preview_roots,
             legacy_camera_capture,
             static_animation_frame,
+            static_material_phase,
         })
     }
 }
@@ -1257,7 +1293,7 @@ fn json_hash(hash: &[u8; 32]) -> String {
 }
 
 fn usage() -> String {
-    "usage: fparkan-game --root <path> --mission <path> [--frames <n>] [--backend <planning|static-vulkan>] [--preview-roots <non-zero n>] [--legacy-camera-capture <path>] [--static-animation-frame <u16>] [--readback-out <path>] [--load-progress <path>]".to_string()
+    "usage: fparkan-game --root <path> --mission <path> [--frames <n>] [--backend <planning|static-vulkan>] [--preview-roots <non-zero n>] [--legacy-camera-capture <path>] [--static-animation-frame <u16>] [--static-material-phase <u16>] [--readback-out <path>] [--load-progress <path>]".to_string()
 }
 
 #[cfg(test)]
@@ -1326,6 +1362,7 @@ mod tests {
                 preview_roots: NonZeroUsize::MAX,
                 legacy_camera_capture: None,
                 static_animation_frame: None,
+                static_material_phase: None,
             })
         );
     }
@@ -1351,6 +1388,7 @@ mod tests {
                 preview_roots: NonZeroUsize::MAX,
                 legacy_camera_capture: None,
                 static_animation_frame: None,
+                static_material_phase: None,
             })
         );
     }
@@ -1431,6 +1469,34 @@ mod tests {
     }
 
     #[test]
+    fn static_material_phase_requires_static_vulkan_and_is_retained() {
+        let common = [
+            "--root",
+            "testdata/IS",
+            "--mission",
+            "MISSIONS/Autodemo.00/data.tma",
+            "--static-material-phase",
+            "2",
+        ];
+        assert_eq!(
+            Args::parse(&strings(&common)),
+            Err("--static-material-phase requires --backend static-vulkan".to_string())
+        );
+        let parsed = Args::parse(&strings(&[
+            "--root",
+            "testdata/IS",
+            "--mission",
+            "MISSIONS/Autodemo.00/data.tma",
+            "--backend",
+            "static-vulkan",
+            "--static-material-phase",
+            "2",
+        ]))
+        .expect("valid static material phase");
+        assert_eq!(parsed.static_material_phase, Some(2));
+    }
+
+    #[test]
     fn rejects_zero_static_preview_root_count() {
         let error = Args::parse(&strings(&[
             "--root",
@@ -1467,6 +1533,7 @@ mod tests {
                 preview_roots: NonZeroUsize::MAX,
                 legacy_camera_capture: None,
                 static_animation_frame: None,
+                static_material_phase: None,
             })
         );
     }
