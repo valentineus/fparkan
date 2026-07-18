@@ -1594,6 +1594,18 @@ without conflating it with `Land1.wea`/`Land2.wea`. The AutoDemo inspector now
 reports 128 slots and 392 `0x0010` batch boundaries. The meanings of remaining
 flags, this cache mapping, and the final blend operation remain unassigned.
 
+The cache boundary is now mechanically separated from the WEAR loader. In the
+`GetShade` object, the `Shade.wea` manager is stored at byte offset `3092`, but
+the dispatcher calls a distinct object at byte offset `3244`. Its virtual slot
+`+16` receives every type-11 key repeatedly with mode values `512`, `16`,
+`20497`, and `20752`, and returns a runtime record rather than a WEAR row. The
+dispatcher reads that record's flags at `+60`, a secondary selector at `+24`,
+an optional byte at `+88`, a referenced state block at `+104`, three signed
+shorts at `+108`, and another selector at `+112`. Those fields are inputs to
+visibility tests, primitive construction and texture/secondary passes, but the
+cache builder and bit meanings are still not recovered; the Vulkan path must
+not map any of them to invented pipeline state.
+
 The static Vulkan bridge now carries each contiguous face run as a separate
 draw range keyed by the original packed `material_tag`; it neither reorders
 triangles nor collapses the high byte. For the first usable visual layer, the
