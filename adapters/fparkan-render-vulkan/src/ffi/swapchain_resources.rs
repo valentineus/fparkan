@@ -14,7 +14,7 @@ pub(super) struct VulkanSwapchainResources {
     pub(super) pipeline_layout: vk::PipelineLayout,
     pub(super) descriptor_set_layout: vk::DescriptorSetLayout,
     pub(super) descriptor_pool: vk::DescriptorPool,
-    pub(super) descriptor_set: vk::DescriptorSet,
+    pub(super) descriptor_sets: Vec<vk::DescriptorSet>,
     pub(super) sampler: vk::Sampler,
     pub(super) pipeline: vk::Pipeline,
     pub(super) framebuffers: Vec<vk::Framebuffer>,
@@ -39,7 +39,7 @@ pub(super) fn create_swapchain_resources(
     command_pool: vk::CommandPool,
     vertex_buffer: &VulkanAllocatedBuffer,
     index_buffer: &VulkanAllocatedBuffer,
-    texture: &VulkanAllocatedImage,
+    textures: &[VulkanAllocatedImage],
     reuse_command_pool: bool,
 ) -> Result<VulkanSwapchainResources, VulkanSmokeRendererError> {
     // SAFETY: The swapchain is live and owned by this renderer for the duration of the query.
@@ -73,13 +73,13 @@ pub(super) fn create_swapchain_resources(
         pipeline,
         descriptor_set_layout,
         descriptor_pool,
-        descriptor_set,
+        descriptor_sets,
         sampler,
     ) = match create_swapchain_pipeline_bundle(
         device,
         swapchain.report.plan.format.format,
         swapchain.report.plan.extent,
-        texture,
+        textures,
     ) {
         Ok(bundle) => bundle,
         Err(error) => {
@@ -126,7 +126,7 @@ pub(super) fn create_swapchain_resources(
         pipeline_layout,
         descriptor_set_layout,
         descriptor_pool,
-        descriptor_set,
+        descriptor_sets,
         sampler,
         pipeline,
         framebuffers: partial.framebuffers,
@@ -151,7 +151,7 @@ fn create_swapchain_pipeline_bundle(
     device: &VulkanLogicalDeviceProbe,
     format: i32,
     extent: (u32, u32),
-    texture: &VulkanAllocatedImage,
+    textures: &[VulkanAllocatedImage],
 ) -> Result<
     (
         vk::RenderPass,
@@ -159,14 +159,14 @@ fn create_swapchain_pipeline_bundle(
         vk::Pipeline,
         vk::DescriptorSetLayout,
         vk::DescriptorPool,
-        vk::DescriptorSet,
+        Vec<vk::DescriptorSet>,
         vk::Sampler,
     ),
     VulkanSmokeRendererError,
 > {
     let render_pass = create_render_pass(device, format)?;
-    let (descriptor_set_layout, descriptor_pool, descriptor_set, sampler) =
-        create_texture_descriptor_bundle(device, texture).inspect_err(|_| {
+    let (descriptor_set_layout, descriptor_pool, descriptor_sets, sampler) =
+        create_texture_descriptor_bundle(device, textures).inspect_err(|_| {
             // SAFETY: The render pass was created above on this live logical device and is destroyed on setup failure.
             unsafe { device.device().destroy_render_pass(render_pass, None) };
         })?;
@@ -207,7 +207,7 @@ fn create_swapchain_pipeline_bundle(
         pipeline,
         descriptor_set_layout,
         descriptor_pool,
-        descriptor_set,
+        descriptor_sets,
         sampler,
     ))
 }
@@ -334,12 +334,12 @@ fn create_pipeline_layout(
 #[allow(clippy::too_many_lines)]
 fn create_texture_descriptor_bundle(
     device: &VulkanLogicalDeviceProbe,
-    texture: &VulkanAllocatedImage,
+    textures: &[VulkanAllocatedImage],
 ) -> Result<
     (
         vk::DescriptorSetLayout,
         vk::DescriptorPool,
-        vk::DescriptorSet,
+        Vec<vk::DescriptorSet>,
         vk::Sampler,
     ),
     VulkanSmokeRendererError,
@@ -361,13 +361,23 @@ fn create_texture_descriptor_bundle(
         context: "vkCreateDescriptorSetLayout",
         result,
     })?;
+    let texture_count = u32::try_from(textures.len()).map_err(|_| {
+        VulkanSmokeRendererError::InvariantViolation {
+            context: "static material texture count exceeds Vulkan descriptor limit",
+        }
+    })?;
+    if texture_count == 0 {
+        return Err(VulkanSmokeRendererError::InvariantViolation {
+            context: "static material texture list is empty",
+        });
+    }
     let pool_size = vk::DescriptorPoolSize::default()
         .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-        .descriptor_count(1);
+        .descriptor_count(texture_count);
     let pool_sizes = [pool_size];
     let pool_info = vk::DescriptorPoolCreateInfo::default()
         .pool_sizes(&pool_sizes)
-        .max_sets(1);
+        .max_sets(texture_count);
     let pool =
         // SAFETY: The pool description is stack-owned and reserves exactly one descriptor.
         unsafe { device.device().create_descriptor_pool(&pool_info, None) }.map_err(|result| {
@@ -378,12 +388,12 @@ fn create_texture_descriptor_bundle(
                 result,
             }
         })?;
-    let layouts = [layout];
+    let layouts = vec![layout; textures.len()];
     let allocate_info = vk::DescriptorSetAllocateInfo::default()
         .descriptor_pool(pool)
         .set_layouts(&layouts);
     // SAFETY: The pool and layout are live on this logical device.
-    let descriptor_set = unsafe { device.device().allocate_descriptor_sets(&allocate_info) }
+    let descriptor_sets = unsafe { device.device().allocate_descriptor_sets(&allocate_info) }
         .map_err(|result| {
             // SAFETY: Resources were created above on this device and are rolled back once.
             unsafe {
@@ -394,7 +404,7 @@ fn create_texture_descriptor_bundle(
                 context: "vkAllocateDescriptorSets",
                 result,
             }
-        })?[0];
+        })?;
     let sampler_info = vk::SamplerCreateInfo::default()
         .mag_filter(vk::Filter::LINEAR)
         .min_filter(vk::Filter::LINEAR)
@@ -416,19 +426,30 @@ fn create_texture_descriptor_bundle(
                 result,
             }
         })?;
-    let image_info = vk::DescriptorImageInfo::default()
-        .sampler(sampler)
-        .image_view(texture.view)
-        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-    let image_infos = [image_info];
-    let write = vk::WriteDescriptorSet::default()
-        .dst_set(descriptor_set)
-        .dst_binding(0)
-        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-        .image_info(&image_infos);
-    // SAFETY: The descriptor set, sampler and image view are live and the texture upload completed its shader-read transition.
-    unsafe { device.device().update_descriptor_sets(&[write], &[]) };
-    Ok((layout, pool, descriptor_set, sampler))
+    let image_infos = textures
+        .iter()
+        .map(|texture| {
+            vk::DescriptorImageInfo::default()
+                .sampler(sampler)
+                .image_view(texture.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        })
+        .collect::<Vec<_>>();
+    let writes = descriptor_sets
+        .iter()
+        .copied()
+        .zip(image_infos.iter())
+        .map(|(descriptor_set, image_info)| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(std::slice::from_ref(image_info))
+        })
+        .collect::<Vec<_>>();
+    // SAFETY: Descriptor sets, sampler and image views are live; every texture upload completed its shader-read transition.
+    unsafe { device.device().update_descriptor_sets(&writes, &[]) };
+    Ok((layout, pool, descriptor_sets, sampler))
 }
 
 #[allow(clippy::cast_precision_loss)]

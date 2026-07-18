@@ -2,6 +2,7 @@
 
 use ash::vk;
 
+use super::smoke_types::resolve_draw_texture_indices;
 use super::{
     create_command_pool, create_frame_sync, create_static_mesh_index_buffer,
     create_static_mesh_vertex_buffer, create_static_texture_image, create_swapchain_resources,
@@ -109,11 +110,9 @@ impl VulkanSmokeRenderer {
             .mesh
             .validate()
             .map_err(|context| VulkanSmokeRendererError::InvalidStaticMesh { context })?;
-        if let Some(texture) = &create_info.texture {
-            texture
-                .validate()
-                .map_err(|context| VulkanSmokeRendererError::InvalidStaticTexture { context })?;
-        }
+        let draw_texture_indices =
+            resolve_draw_texture_indices(&create_info.mesh.draw_ranges, &create_info.materials)
+                .map_err(|context| VulkanSmokeRendererError::InvalidStaticMesh { context })?;
         let bootstrap_progress = create_info.bootstrap_progress.as_ref();
         let shader_manifest = validate_shader_manifest(&triangle_shader_manifest())
             .map_err(VulkanSmokeRendererError::ShaderManifest)?;
@@ -188,18 +187,31 @@ impl VulkanSmokeRenderer {
             height: 1,
             rgba8: vec![255, 255, 255, 255],
         };
-        let texture_source = create_info.texture.as_ref().unwrap_or(&fallback_texture);
-        let texture =
+        let texture_sources = if create_info.materials.is_empty() {
+            vec![&fallback_texture]
+        } else {
+            create_info
+                .materials
+                .iter()
+                .map(|material| &material.texture)
+                .collect()
+        };
+        let mut textures = Vec::with_capacity(texture_sources.len());
+        for texture_source in texture_sources {
             match create_static_texture_image(&instance, &device, command_pool, texture_source) {
-                Ok(image) => Some(image),
+                Ok(image) => textures.push(image),
                 Err(error) => {
+                    for texture in &textures {
+                        destroy_allocated_image(&device, texture);
+                    }
                     // SAFETY: These resources belong to this live device and are rolled back before it drops.
                     unsafe { device.device().destroy_command_pool(command_pool, None) };
                     destroy_allocated_buffer(&device, &index_buffer);
                     destroy_allocated_buffer(&device, &vertex_buffer);
                     return Err(error);
                 }
-            };
+            }
+        }
         let mut renderer = Self {
             instance: Some(instance),
             validation,
@@ -210,8 +222,9 @@ impl VulkanSmokeRenderer {
             swapchain_resources: None,
             vertex_buffer: Some(vertex_buffer),
             index_buffer: Some(index_buffer),
-            texture,
+            textures,
             draw_ranges: create_info.mesh.draw_ranges.clone(),
+            draw_texture_indices,
             frame_sync: Vec::new(),
             images_in_flight: Vec::new(),
             current_frame: 0,
@@ -322,12 +335,14 @@ impl VulkanSmokeRenderer {
             })
     }
 
-    fn texture_ref(&self) -> Result<&super::VulkanAllocatedImage, VulkanSmokeRendererError> {
-        self.texture
-            .as_ref()
-            .ok_or(VulkanSmokeRendererError::InvariantViolation {
-                context: "static material texture",
+    fn textures_ref(&self) -> Result<&[super::VulkanAllocatedImage], VulkanSmokeRendererError> {
+        if self.textures.is_empty() {
+            Err(VulkanSmokeRendererError::InvariantViolation {
+                context: "static material textures",
             })
+        } else {
+            Ok(&self.textures)
+        }
     }
 
     fn surface_ref(&self) -> Result<&VulkanSurfaceProbe, VulkanSmokeRendererError> {
@@ -544,7 +559,7 @@ impl VulkanSmokeRenderer {
                 self.command_pool,
                 self.vertex_buffer_ref()?,
                 self.index_buffer_ref()?,
-                self.texture_ref()?,
+                self.textures_ref()?,
                 reuse_command_pool,
             )?,
             |resources| destroy_swapchain_resources(device, self.command_pool, resources),
@@ -621,14 +636,6 @@ impl VulkanSmokeRenderer {
                 vk::PipelineBindPoint::GRAPHICS,
                 resources.pipeline,
             );
-            device.device().cmd_bind_descriptor_sets(
-                command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                resources.pipeline_layout,
-                0,
-                &[resources.descriptor_set],
-                &[],
-            );
             let vertex_buffers = [self.vertex_buffer_ref()?.buffer];
             let offsets = [0_u64];
             device
@@ -640,7 +647,20 @@ impl VulkanSmokeRenderer {
                 0,
                 vk::IndexType::UINT16,
             );
-            for range in &self.draw_ranges {
+            for (range, &texture_index) in self.draw_ranges.iter().zip(&self.draw_texture_indices) {
+                let descriptor_set = resources.descriptor_sets.get(texture_index).ok_or(
+                    VulkanSmokeRendererError::InvariantViolation {
+                        context: "static material descriptor set",
+                    },
+                )?;
+                device.device().cmd_bind_descriptor_sets(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    resources.pipeline_layout,
+                    0,
+                    std::slice::from_ref(descriptor_set),
+                    &[],
+                );
                 device.device().cmd_draw_indexed(
                     command_buffer,
                     range.index_count,
@@ -689,7 +709,7 @@ impl VulkanSmokeRenderer {
     fn destroy_device_owned_resources(&mut self) {
         self.destroy_swapchain_resources();
         if let Some(device) = self.device.as_ref() {
-            if let Some(texture) = self.texture.take() {
+            for texture in self.textures.drain(..) {
                 destroy_allocated_image(device, &texture);
             }
             if let Some(buffer) = self.index_buffer.take() {

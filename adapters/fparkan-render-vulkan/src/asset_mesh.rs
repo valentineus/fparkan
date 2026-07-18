@@ -68,6 +68,7 @@ pub fn project_msh_to_static_mesh(
         draw_ranges.push(VulkanStaticDrawRange {
             first_index,
             index_count: u32::from(batch.index_count),
+            material_index: batch.material_index,
         });
     }
     if indices.is_empty() {
@@ -181,6 +182,7 @@ mod tests {
             vec![VulkanStaticDrawRange {
                 first_index: 0,
                 index_count: 3,
+                material_index: 0,
             }]
         );
         assert_eq!(mesh.vertices[1].position, [-0.8, -0.8]);
@@ -202,5 +204,38 @@ mod tests {
         assert_eq!(mesh.vertices[0].uv, [1.0, -0.5]);
         assert_eq!(mesh.vertices[1].uv, [0.0, 2.0]);
         assert_eq!(mesh.vertices[2].uv, [-1.0, 0.5]);
+    }
+
+    #[test]
+    fn retains_each_source_batch_material_selector() {
+        let mut second = batch(3, 3, 0);
+        second.material_index = 7;
+        let mesh = project_msh_to_static_mesh(&model(
+            vec![
+                [-2.0, 0.0, -1.0],
+                [2.0, 0.0, -1.0],
+                [-2.0, 0.0, 3.0],
+                [2.0, 0.0, 3.0],
+            ],
+            vec![0, 1, 2, 1, 3, 2],
+            vec![batch(0, 3, 0), second],
+        ))
+        .expect("representable MSH");
+
+        assert_eq!(
+            mesh.draw_ranges,
+            vec![
+                VulkanStaticDrawRange {
+                    first_index: 0,
+                    index_count: 3,
+                    material_index: 0,
+                },
+                VulkanStaticDrawRange {
+                    first_index: 3,
+                    index_count: 3,
+                    material_index: 7,
+                },
+            ]
+        );
     }
 }

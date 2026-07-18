@@ -29,8 +29,12 @@ pub struct VulkanSmokeRendererCreateInfo {
     /// This initial bridge keeps positions in clip-space. MSH transforms,
     /// materials, and textures are deliberately higher-level Stage 3 work.
     pub mesh: VulkanStaticMesh,
-    /// Optional RGBA8 texture uploaded before the first live frame.
-    pub texture: Option<VulkanStaticTexture>,
+    /// Material textures uploaded before the first live frame.
+    ///
+    /// An empty list retains the compatibility white fallback. A singleton list
+    /// is a deliberately explicit one-material compatibility mode; otherwise
+    /// every source batch selector must resolve to one entry in this list.
+    pub materials: Vec<VulkanStaticMaterial>,
     /// Optional shared bootstrap progress tracker for failure evidence.
     pub bootstrap_progress: Option<Arc<VulkanSmokeBootstrapProgress>>,
 }
@@ -64,6 +68,17 @@ pub struct VulkanStaticDrawRange {
     pub first_index: u32,
     /// Number of indices in this draw.
     pub index_count: u32,
+    /// Original positional `Batch20.material_index` selector.
+    pub material_index: u16,
+}
+
+/// One diffuse material texture keyed by an original MSH batch selector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VulkanStaticMaterial {
+    /// Positional material selector used by one or more source batches.
+    pub material_index: u16,
+    /// Decoded RGBA8 diffuse texture for this selector.
+    pub texture: VulkanStaticTexture,
 }
 
 /// Decoded RGBA8 image accepted by the initial Vulkan texture upload path.
@@ -98,6 +113,39 @@ impl VulkanStaticTexture {
     }
 }
 
+/// Resolves each source range to its descriptor-set material index.
+///
+/// Empty material input selects the renderer's white fallback. A singleton is
+/// the explicit direct-TEXM compatibility mode. Multiple materials must map
+/// each `Batch20.material_index` exactly and never duplicate a selector.
+pub(super) fn resolve_draw_texture_indices(
+    draw_ranges: &[VulkanStaticDrawRange],
+    materials: &[VulkanStaticMaterial],
+) -> Result<Vec<usize>, &'static str> {
+    for (index, material) in materials.iter().enumerate() {
+        material.texture.validate()?;
+        if materials[..index]
+            .iter()
+            .any(|previous| previous.material_index == material.material_index)
+        {
+            return Err("static material selectors must be unique");
+        }
+    }
+    draw_ranges
+        .iter()
+        .map(|range| {
+            if materials.len() <= 1 {
+                Ok(0)
+            } else {
+                materials
+                    .iter()
+                    .position(|material| material.material_index == range.material_index)
+                    .ok_or("static mesh draw range has no material texture")
+            }
+        })
+        .collect()
+}
+
 impl VulkanStaticMesh {
     /// Returns the compatibility triangle used by the native Stage 0 smoke app.
     #[must_use]
@@ -124,6 +172,7 @@ impl VulkanStaticMesh {
             draw_ranges: vec![VulkanStaticDrawRange {
                 first_index: 0,
                 index_count: 3,
+                material_index: 0,
             }],
         }
     }
@@ -189,6 +238,7 @@ mod static_mesh_tests {
             draw_ranges: vec![VulkanStaticDrawRange {
                 first_index: 0,
                 index_count: 2,
+                material_index: 0,
             }],
         };
         let out_of_range_index = VulkanStaticMesh {
@@ -205,6 +255,42 @@ mod static_mesh_tests {
         assert_eq!(
             out_of_range_index.validate(),
             Err("static mesh index exceeds vertex count")
+        );
+    }
+
+    #[test]
+    fn material_descriptors_follow_source_batch_selectors() {
+        let ranges = [
+            VulkanStaticDrawRange {
+                first_index: 0,
+                index_count: 3,
+                material_index: 7,
+            },
+            VulkanStaticDrawRange {
+                first_index: 3,
+                index_count: 3,
+                material_index: 2,
+            },
+        ];
+        let texture = || VulkanStaticTexture {
+            width: 1,
+            height: 1,
+            rgba8: vec![255; 4],
+        };
+        let materials = [
+            VulkanStaticMaterial {
+                material_index: 2,
+                texture: texture(),
+            },
+            VulkanStaticMaterial {
+                material_index: 7,
+                texture: texture(),
+            },
+        ];
+
+        assert_eq!(
+            resolve_draw_texture_indices(&ranges, &materials),
+            Ok(vec![1, 0])
         );
     }
 }
@@ -421,8 +507,9 @@ pub struct VulkanSmokeRenderer {
     pub(super) swapchain_resources: Option<VulkanSwapchainResources>,
     pub(super) vertex_buffer: Option<VulkanAllocatedBuffer>,
     pub(super) index_buffer: Option<VulkanAllocatedBuffer>,
-    pub(super) texture: Option<VulkanAllocatedImage>,
+    pub(super) textures: Vec<VulkanAllocatedImage>,
     pub(super) draw_ranges: Vec<VulkanStaticDrawRange>,
+    pub(super) draw_texture_indices: Vec<usize>,
     pub(super) frame_sync: Vec<VulkanFrameSync>,
     pub(super) images_in_flight: Vec<vk::Fence>,
     pub(super) current_frame: usize,

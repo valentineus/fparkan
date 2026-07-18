@@ -16,7 +16,8 @@ use fparkan_platform_winit::{window_native_handles, WinitWindowPlan};
 use fparkan_render_vulkan::{
     project_msh_to_static_mesh, VulkanSmokeBootstrapProgress, VulkanSmokeFrameOutcome,
     VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo, VulkanSmokeRendererReport,
-    VulkanSmokeShutdownReport, VulkanStaticMesh, VulkanStaticTexture, VulkanValidationReport,
+    VulkanSmokeShutdownReport, VulkanStaticMaterial, VulkanStaticMesh, VulkanStaticTexture,
+    VulkanValidationReport,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -56,7 +57,7 @@ fn main() {
 fn run(args: &[String]) -> Result<String, String> {
     let options = SmokeOptions::parse(args)?;
     let mesh = options.load_mesh()?;
-    let texture = options.load_texture()?;
+    let materials = options.load_materials(&mesh)?;
     remove_stale_output(&options)?;
     let event_loop = EventLoop::new().map_err(|err| format!("winit event loop: {err}"))?;
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -67,7 +68,7 @@ fn run(args: &[String]) -> Result<String, String> {
         Arc::clone(&completed),
         Arc::clone(&progress),
     );
-    let mut app = SmokeApp::new(options, mesh, texture, completed, progress);
+    let mut app = SmokeApp::new(options, mesh, materials, completed, progress);
     if let Err(err) = event_loop.run_app(&mut app) {
         app.error = Some(format!("winit event loop: {err}"));
     }
@@ -132,9 +133,17 @@ struct WearMaterialInput {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct WearInput {
+    root: PathBuf,
+    archive: String,
+    name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum TextureInput {
     Direct(ResourceInput),
     WearMaterial(WearMaterialInput),
+    WearBatchMaterials(WearInput),
 }
 
 impl TextureInput {
@@ -142,13 +151,14 @@ impl TextureInput {
         match self {
             Self::Direct(_) => "original-texm",
             Self::WearMaterial(_) => "original-wear-mat0-texm",
+            Self::WearBatchMaterials(_) => "original-wear-mat0-texm-batch",
         }
     }
 
     fn archive(&self) -> &str {
         match self {
             Self::Direct(input) => &input.archive,
-            Self::WearMaterial(_) => "Textures.lib",
+            Self::WearMaterial(_) | Self::WearBatchMaterials(_) => "Textures.lib",
         }
     }
 
@@ -156,7 +166,7 @@ impl TextureInput {
         match self {
             Self::Direct(input) => &input.name,
             // The selected name comes from MAT0 at load time and is not a CLI request.
-            Self::WearMaterial(_) => "",
+            Self::WearMaterial(_) | Self::WearBatchMaterials(_) => "",
         }
     }
 }
@@ -363,9 +373,16 @@ impl SmokeOptions {
                     material_index,
                 }))
             }
+            (Some(root), Some(archive), Some(name), None) => {
+                Some(TextureInput::WearBatchMaterials(WearInput {
+                    root,
+                    archive,
+                    name,
+                }))
+            }
             _ => {
                 return Err(
-                    "--wear-root, --wear-archive, --wear-name and --material-index must be supplied together"
+                    "--wear-root, --wear-archive and --wear-name must be supplied together; --material-index is optional"
                         .to_string(),
                 );
             }
@@ -400,42 +417,93 @@ impl SmokeOptions {
         }
     }
 
-    fn load_texture(&self) -> Result<Option<LoadedTexture>, String> {
-        self.texture_input.as_ref().map_or(Ok(None), |input| {
-            let (image, selected_name) = match input {
-                TextureInput::Direct(input) => (
-                    fparkan_inspection::load_texture_mip0_rgba8_from_root(
+    fn load_materials(&self, mesh: &VulkanStaticMesh) -> Result<Vec<LoadedTexture>, String> {
+        let Some(input) = self.texture_input.as_ref() else {
+            return Ok(Vec::new());
+        };
+        match input {
+            TextureInput::Direct(input) => Ok(vec![Self::load_material(
+                0,
+                {
+                    let image = fparkan_inspection::load_texture_mip0_rgba8_from_root(
                         &input.root,
                         &input.archive,
                         &input.name,
-                    )?,
-                    input.name.clone(),
-                ),
-                TextureInput::WearMaterial(input) => {
-                    let selected =
-                        fparkan_inspection::load_wear_material_texture_mip0_rgba8_from_root(
-                            &input.root,
-                            &input.archive,
-                            &input.name,
-                            input.material_index,
-                        )?;
-                    (selected.image, selected.texture_name)
-                }
-            };
-            Ok(Some(LoadedTexture {
-                texture: VulkanStaticTexture {
-                    width: image.width,
-                    height: image.height,
-                    rgba8: image.rgba8,
+                    )?;
+                    (image.width, image.height, image.rgba8)
                 },
-                selected_name,
-            }))
-        })
+                input.name.clone(),
+            )]),
+            TextureInput::WearMaterial(input) => {
+                let selected = fparkan_inspection::load_wear_material_texture_mip0_rgba8_from_root(
+                    &input.root,
+                    &input.archive,
+                    &input.name,
+                    input.material_index,
+                )?;
+                Ok(vec![Self::load_material(
+                    input.material_index,
+                    (
+                        selected.image.width,
+                        selected.image.height,
+                        selected.image.rgba8,
+                    ),
+                    selected.texture_name,
+                )])
+            }
+            TextureInput::WearBatchMaterials(input) => {
+                let mut selectors = mesh
+                    .draw_ranges
+                    .iter()
+                    .map(|range| range.material_index)
+                    .collect::<Vec<_>>();
+                selectors.sort_unstable();
+                selectors.dedup();
+                selectors
+                    .into_iter()
+                    .map(|material_index| {
+                        let selected =
+                            fparkan_inspection::load_wear_material_texture_mip0_rgba8_from_root(
+                                &input.root,
+                                &input.archive,
+                                &input.name,
+                                material_index,
+                            )?;
+                        Ok(Self::load_material(
+                            material_index,
+                            (
+                                selected.image.width,
+                                selected.image.height,
+                                selected.image.rgba8,
+                            ),
+                            selected.texture_name,
+                        ))
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    fn load_material(
+        material_index: u16,
+        image: (u32, u32, Vec<u8>),
+        selected_name: String,
+    ) -> LoadedTexture {
+        LoadedTexture {
+            material_index,
+            texture: VulkanStaticTexture {
+                width: image.0,
+                height: image.1,
+                rgba8: image.2,
+            },
+            selected_name,
+        }
     }
 }
 
 #[derive(Clone, Debug)]
 struct LoadedTexture {
+    material_index: u16,
     texture: VulkanStaticTexture,
     selected_name: String,
 }
@@ -443,7 +511,7 @@ struct LoadedTexture {
 struct SmokeApp {
     options: SmokeOptions,
     mesh: VulkanStaticMesh,
-    texture: Option<LoadedTexture>,
+    materials: Vec<LoadedTexture>,
     completed: Arc<AtomicBool>,
     progress: Arc<SharedSmokeProgress>,
     window_id: Option<WindowId>,
@@ -488,14 +556,14 @@ impl SmokeApp {
     fn new(
         options: SmokeOptions,
         mesh: VulkanStaticMesh,
-        texture: Option<LoadedTexture>,
+        materials: Vec<LoadedTexture>,
         completed: Arc<AtomicBool>,
         progress: Arc<SharedSmokeProgress>,
     ) -> Self {
         Self {
             options,
             mesh,
-            texture,
+            materials,
             completed,
             progress,
             window_id: None,
@@ -603,23 +671,35 @@ impl SmokeApp {
                 .texture_input
                 .as_ref()
                 .map_or("", TextureInput::archive),
-            texture_name: self.texture.as_ref().map_or_else(
-                || {
-                    self.options
-                        .texture_input
-                        .as_ref()
-                        .map_or("", TextureInput::requested_name)
-                },
-                |texture| texture.selected_name.as_str(),
-            ),
+            texture_name: match self.materials.as_slice() {
+                [] => self
+                    .options
+                    .texture_input
+                    .as_ref()
+                    .map_or("", TextureInput::requested_name),
+                [material] => material.selected_name.as_str(),
+                _ => "multiple",
+            },
             texture_width: self
-                .texture
-                .as_ref()
-                .map_or(0, |texture| texture.texture.width),
+                .materials
+                .first()
+                .map_or(0, |material| material.texture.width),
             texture_height: self
-                .texture
-                .as_ref()
-                .map_or(0, |texture| texture.texture.height),
+                .materials
+                .first()
+                .map_or(0, |material| material.texture.height),
+            material_binding_count: self.materials.len(),
+            mesh_material_indices: self
+                .mesh
+                .draw_ranges
+                .iter()
+                .map(|range| range.material_index)
+                .collect(),
+            material_texture_names: self
+                .materials
+                .iter()
+                .map(|material| material.selected_name.clone())
+                .collect(),
             shader_manifest_hash: renderer
                 .as_ref()
                 .map_or("", |snapshot| snapshot.report.shader_manifest_hash.as_str()),
@@ -839,6 +919,9 @@ fn render_timeout_failure_report(
             .map_or("", TextureInput::requested_name),
         texture_width: 0,
         texture_height: 0,
+        material_binding_count: 0,
+        mesh_material_indices: Vec::new(),
+        material_texture_names: Vec::new(),
         shader_manifest_hash: "",
         vulkan_loader_status: if bootstrap.loader_available {
             "available"
@@ -934,7 +1017,14 @@ impl ApplicationHandler for SmokeApp {
             render_request: RenderRequest::conservative(),
             enable_validation: true,
             mesh: self.mesh.clone(),
-            texture: self.texture.as_ref().map(|texture| texture.texture.clone()),
+            materials: self
+                .materials
+                .iter()
+                .map(|material| VulkanStaticMaterial {
+                    material_index: material.material_index,
+                    texture: material.texture.clone(),
+                })
+                .collect(),
             bootstrap_progress: Some(Arc::clone(&self.progress.bootstrap)),
         }) {
             Ok(renderer) => renderer,
@@ -1073,6 +1163,9 @@ struct SmokeReport<'a> {
     texture_name: &'a str,
     texture_width: u32,
     texture_height: u32,
+    material_binding_count: usize,
+    mesh_material_indices: Vec<u16>,
+    material_texture_names: Vec<String>,
     shader_manifest_hash: &'a str,
     vulkan_loader_status: &'a str,
     vulkan_instance_status: &'a str,
@@ -1464,6 +1557,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_original_wear_batch_material_input_without_override() {
+        let parsed = SmokeOptions::parse(&[
+            "--out".to_string(),
+            "target/report.json".to_string(),
+            "--wear-root".to_string(),
+            "C:/GOG".to_string(),
+            "--wear-archive".to_string(),
+            "system.rlb".to_string(),
+            "--wear-name".to_string(),
+            "MODEL.WEA".to_string(),
+        ]);
+
+        assert!(matches!(
+            parsed,
+            Ok(SmokeOptions {
+                texture_input: Some(TextureInput::WearBatchMaterials(WearInput { archive, name, .. })),
+                ..
+            }) if archive == "system.rlb" && name == "MODEL.WEA"
+        ));
+    }
+
+    #[test]
     fn rejects_deprecated_self_assertion_flags() {
         for flag in [
             "--status",
@@ -1533,6 +1648,9 @@ mod tests {
             texture_name: "DEFAULT.0",
             texture_width: 16,
             texture_height: 16,
+            material_binding_count: 1,
+            mesh_material_indices: vec![0],
+            material_texture_names: vec!["DEFAULT.0".to_string()],
             shader_manifest_hash: "deadbeef",
             vulkan_loader_status: "available",
             vulkan_instance_status: "created",
@@ -1585,7 +1703,7 @@ mod tests {
                 texture_input: None,
             },
             mesh: VulkanStaticMesh::smoke_triangle(),
-            texture: None,
+            materials: Vec::new(),
             completed: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(SharedSmokeProgress::default()),
             window_id: None,
