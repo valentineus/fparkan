@@ -484,6 +484,21 @@ Visual dependency expansion наследует этот индекс на edges 
 diffuse texture и lightmap. Поэтому ошибка или asset в любой из этих фаз
 сохраняет путь до конкретной записи unit DAT, а не только до миссионного object.
 
+Для воспроизводимой проверки используется `fparkan-cli prototype inspect`.
+Схема JSON `fparkan-prototype-inspect-v2` содержит lossless hex каждого
+32-byte поля unit record и materialized graph edges с `unit_component_index`.
+Например, для GOG AutoDemo:
+
+```powershell
+cargo run -p fparkan-cli -- prototype inspect `
+  --root 'C:\GOG Games\Parkan - Iron Strategy' `
+  --key 'UNITS\UNITS\AutoDEMO\w_m_wlk2.dat' --format json
+```
+
+Вывод фиксирует 18 component records, их MSH/WEAR/MAT0/Texm dependencies и
+точные parent edges. JSON предназначен для анализа и regression evidence, а
+не для интерпретации `kind`, links или opaque tails как готовой game logic.
+
 ## Вспомогательные форматы
 
 MSH, материал и текстура отвечают за видимую форму. Полноценный прототип

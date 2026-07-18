@@ -37,11 +37,12 @@ use fparkan_runtime::{
 };
 use fparkan_vfs::{DirectoryVfs, Vfs};
 use serde::Serialize;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 const ARCHIVE_INSPECT_SCHEMA: &str = "fparkan-archive-inspect-v1";
-const PROTOTYPE_INSPECT_SCHEMA: &str = "fparkan-prototype-inspect-v1";
+const PROTOTYPE_INSPECT_SCHEMA: &str = "fparkan-prototype-inspect-v2";
 const MISSION_GRAPH_SCHEMA: &str = "fparkan-mission-graph-v1";
 const MISSION_INSPECT_SCHEMA: &str = "fparkan-mission-inspect-v1";
 const TERRAIN_INSPECT_SCHEMA: &str = "fparkan-terrain-inspect-v1";
@@ -65,6 +66,8 @@ struct PrototypeInspectOutput {
     roots: usize,
     node_count: usize,
     edge_count: usize,
+    unit_component_records: Vec<UnitComponentInspectOutput>,
+    edges: Vec<PrototypeGraphEdgeInspectOutput>,
     prototype_requests: usize,
     resolved: usize,
     unit_references: usize,
@@ -194,6 +197,33 @@ struct GraphFailureOutput {
     archive: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     resource: Option<String>,
+}
+
+#[derive(Serialize)]
+struct UnitComponentInspectOutput {
+    root_index: usize,
+    component_index: usize,
+    archive_raw_hex: String,
+    resource_raw_hex: String,
+    kind: u32,
+    parent_or_link: i32,
+    description_raw_hex: String,
+    tail0: u32,
+    tail1: u32,
+}
+
+#[derive(Serialize)]
+struct PrototypeGraphEdgeInspectOutput {
+    id: u32,
+    from: u32,
+    to: u32,
+    kind: &'static str,
+    requiredness: &'static str,
+    root_index: Option<usize>,
+    parent_edge: Option<u32>,
+    unit_component_index: Option<usize>,
+    archive: Option<String>,
+    resource_raw_hex: Option<String>,
 }
 
 fn main() {
@@ -350,6 +380,58 @@ fn prototype_inspect_json(
         roots: report.root_count,
         node_count: graph.nodes.len(),
         edge_count: graph.edges.len(),
+        unit_component_records: graph
+            .root_unit_components
+            .iter()
+            .enumerate()
+            .flat_map(|(root_index, records)| {
+                records
+                    .iter()
+                    .enumerate()
+                    .map(
+                        move |(component_index, record)| UnitComponentInspectOutput {
+                            root_index,
+                            component_index,
+                            archive_raw_hex: hex_bytes(&record.archive_raw),
+                            resource_raw_hex: hex_bytes(&record.resource_raw),
+                            kind: record.kind,
+                            parent_or_link: record.parent_or_link,
+                            description_raw_hex: hex_bytes(&record.description_raw),
+                            tail0: record.tail0,
+                            tail1: record.tail1,
+                        },
+                    )
+            })
+            .collect(),
+        edges: graph
+            .edges
+            .iter()
+            .map(|edge| PrototypeGraphEdgeInspectOutput {
+                id: edge.id.0,
+                from: edge.from.0,
+                to: edge.to.0,
+                kind: prototype_graph_edge_kind_label(edge.kind),
+                requiredness: prototype_graph_requiredness_label(edge.requiredness),
+                root_index: edge.provenance.as_ref().map(|value| value.root_index),
+                parent_edge: edge
+                    .provenance
+                    .as_ref()
+                    .and_then(|value| value.parent_edge.map(|parent| parent.0)),
+                unit_component_index: edge
+                    .provenance
+                    .as_ref()
+                    .and_then(|value| value.unit_component_index),
+                archive: edge
+                    .provenance
+                    .as_ref()
+                    .and_then(|value| value.archive.clone()),
+                resource_raw_hex: edge
+                    .provenance
+                    .as_ref()
+                    .and_then(|value| value.resource.as_ref())
+                    .map(|raw| hex_bytes(raw)),
+            })
+            .collect(),
         prototype_requests: graph.prototype_requests.len(),
         resolved: report.resolved_count,
         unit_references: report.unit_reference_count,
@@ -638,6 +720,29 @@ fn graph_failure_output(failure: &fparkan_prototype::PrototypeGraphFailure) -> G
     }
 }
 
+fn hex_bytes(raw: &[u8]) -> String {
+    let mut output = String::with_capacity(raw.len().saturating_mul(2));
+    for byte in raw {
+        #[allow(clippy::expect_used)]
+        write!(&mut output, "{byte:02x}").expect("writing into String cannot fail");
+    }
+    output
+}
+
+fn prototype_graph_edge_kind_label(
+    edge: fparkan_prototype::PrototypeGraphEdgeKind,
+) -> &'static str {
+    match edge {
+        fparkan_prototype::PrototypeGraphEdgeKind::MissionToRoot => "mission_to_root",
+        fparkan_prototype::PrototypeGraphEdgeKind::UnitDatToComponent => "unit_dat_to_component",
+        fparkan_prototype::PrototypeGraphEdgeKind::PrototypeToMesh => "prototype_to_mesh",
+        fparkan_prototype::PrototypeGraphEdgeKind::MeshToWear => "mesh_to_wear",
+        fparkan_prototype::PrototypeGraphEdgeKind::WearToMaterial => "wear_to_material",
+        fparkan_prototype::PrototypeGraphEdgeKind::MaterialToTexture => "material_to_texture",
+        fparkan_prototype::PrototypeGraphEdgeKind::WearToLightmap => "wear_to_lightmap",
+    }
+}
+
 fn prototype_graph_edge_label(edge: fparkan_prototype::PrototypeGraphEdge) -> &'static str {
     match edge {
         fparkan_prototype::PrototypeGraphEdge::MissionToUnitDat => "mission_to_unit_dat",
@@ -720,7 +825,7 @@ mod tests {
 
         assert_eq!(
             json,
-            "{\"schema_version\":\"fparkan-prototype-inspect-v1\",\"key\":\"root\",\"roots\":1,\"node_count\":0,\"edge_count\":0,\"prototype_requests\":1,\"resolved\":1,\"unit_references\":0,\"unit_components\":0,\"direct_references\":1,\"wear_requests\":0,\"wear\":0,\"materials\":0,\"textures\":0,\"lightmaps\":0,\"is_success\":true,\"failures\":[]}"
+            "{\"schema_version\":\"fparkan-prototype-inspect-v2\",\"key\":\"root\",\"roots\":1,\"node_count\":0,\"edge_count\":0,\"unit_component_records\":[],\"edges\":[],\"prototype_requests\":1,\"resolved\":1,\"unit_references\":0,\"unit_components\":0,\"direct_references\":1,\"wear_requests\":0,\"wear\":0,\"materials\":0,\"textures\":0,\"lightmaps\":0,\"is_success\":true,\"failures\":[]}"
         );
     }
 
