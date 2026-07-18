@@ -455,6 +455,8 @@ dependencies = [
  "fparkan-terrain",
  "fparkan-vfs",
  "fparkan-world",
+ "serde",
+ "serde_json",
  "winit",
 ]
 

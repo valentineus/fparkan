@@ -25,12 +25,13 @@ use fparkan_assets::{PreparedTextureUsage, PreparedVisual};
 use fparkan_platform::WindowPort;
 use fparkan_platform_winit::{window_native_handles, WinitWindow, WinitWindowPlan};
 use fparkan_render::{
-    build_commands, CameraSnapshot, DrawId, GpuMaterialId, GpuMeshId, IndexRange, RenderBackend,
-    RenderCommand, RenderCommandList, RenderPhase, RenderProfile, RenderSnapshot,
-    RenderSnapshotDraw,
+    build_commands, CameraSnapshot, DrawId, GpuMaterialId, GpuMeshId, IndexRange,
+    LegacyD3d7Projection, RawCameraTransform, RenderBackend, RenderCommand, RenderCommandList,
+    RenderPhase, RenderProfile, RenderSnapshot, RenderSnapshotDraw,
 };
 use fparkan_render_vulkan::{
-    project_land_msh_to_static_mesh_in_xy_frame, project_msh_to_static_mesh_in_xy_frame,
+    project_land_msh_to_static_mesh_in_world_space, project_land_msh_to_static_mesh_in_xy_frame,
+    project_msh_to_static_mesh_in_world_space, project_msh_to_static_mesh_in_xy_frame,
     VulkanPlanningBackend, VulkanSmokeFrameOutcome, VulkanSmokeRenderer,
     VulkanSmokeRendererCreateInfo, VulkanStaticCamera, VulkanStaticMaterial, VulkanStaticMesh,
     VulkanStaticTexture, VulkanStaticXyFrame,
@@ -46,6 +47,7 @@ use fparkan_vfs::DirectoryVfs;
 #[cfg(test)]
 use fparkan_world::OriginalObjectId;
 use fparkan_world::WorldSnapshot;
+use serde::Deserialize;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -93,7 +95,12 @@ fn run(args: &[String]) -> Result<String, String> {
             .ok_or_else(|| {
                 "selected mission object drafts are unavailable after loading".to_string()
             })?;
-        let preview = static_preview_mesh_and_materials(mission_assets, terrain, roots)?;
+        let camera = args
+            .legacy_camera_capture
+            .as_deref()
+            .map(load_legacy_camera_capture)
+            .transpose()?;
+        let preview = static_preview_mesh_and_materials(mission_assets, terrain, roots, camera)?;
         return run_static_vulkan_mode(
             preview,
             roots.len(),
@@ -216,6 +223,8 @@ fn load_requested_mission(
 struct StaticPreviewScene {
     mesh: VulkanStaticMesh,
     materials: Vec<VulkanStaticMaterial>,
+    camera: VulkanStaticCamera,
+    camera_mode: &'static str,
     mesh_components: usize,
     terrain_components: usize,
 }
@@ -231,11 +240,15 @@ fn static_preview_mesh_and_materials(
     assets: &MissionAssets,
     terrain: &TerrainWorld,
     roots: &[MissionObjectDraft],
+    legacy_camera: Option<VulkanStaticCamera>,
 ) -> Result<StaticPreviewScene, String> {
     let terrain_mesh = terrain
         .source_mesh()
         .ok_or_else(|| "runtime terrain does not retain its validated source mesh".to_string())?;
-    let frame = static_preview_xy_frame(assets, terrain, roots)?;
+    let xy_frame = legacy_camera
+        .is_none()
+        .then(|| static_preview_xy_frame(assets, terrain, roots))
+        .transpose()?;
     let mut mesh = VulkanStaticMesh {
         vertices: Vec::new(),
         indices: Vec::new(),
@@ -249,8 +262,13 @@ fn static_preview_mesh_and_materials(
             rgba8: vec![255, 255, 255, 255],
         },
     }];
-    let terrain_component = project_land_msh_to_static_mesh_in_xy_frame(terrain_mesh, frame)
-        .map_err(|err| format!("project mission terrain for Vulkan: {err}"))?;
+    let terrain_component = if legacy_camera.is_some() {
+        project_land_msh_to_static_mesh_in_world_space(terrain_mesh)
+    } else {
+        let frame = xy_frame.ok_or_else(|| "missing diagnostic XY frame".to_string())?;
+        project_land_msh_to_static_mesh_in_xy_frame(terrain_mesh, frame)
+    }
+    .map_err(|err| format!("project mission terrain for Vulkan: {err}"))?;
     append_static_preview_component(&mut mesh, terrain_component, &[(0, 0)])?;
     let mut mesh_components = 0;
     for (object_index, root) in roots.iter().enumerate() {
@@ -266,12 +284,21 @@ fn static_preview_mesh_and_materials(
             let model = assets.model_by_id(model_id).ok_or_else(|| {
                 format!("static preview visual {visual_id:?} references unknown model {model_id:?}")
             })?;
-            let component = project_msh_to_static_mesh_in_xy_frame(
-                &model.validated,
-                frame,
-                root.position,
-                root.scale,
-            )
+            let component = if legacy_camera.is_some() {
+                project_msh_to_static_mesh_in_world_space(
+                    &model.validated,
+                    root.position,
+                    root.scale,
+                )
+            } else {
+                let frame = xy_frame.ok_or_else(|| "missing diagnostic XY frame".to_string())?;
+                project_msh_to_static_mesh_in_xy_frame(
+                    &model.validated,
+                    frame,
+                    root.position,
+                    root.scale,
+                )
+            }
             .map_err(|err| format!("project mission MSH for Vulkan: {err}"))?;
             let selector_remap =
                 static_preview_component_materials(assets, visual, &component, &mut materials)?;
@@ -285,6 +312,12 @@ fn static_preview_mesh_and_materials(
     Ok(StaticPreviewScene {
         mesh,
         materials,
+        camera: legacy_camera.unwrap_or_default(),
+        camera_mode: if legacy_camera.is_some() {
+            "legacy-d3d7-capture"
+        } else {
+            "diagnostic-xy"
+        },
         mesh_components,
         terrain_components: 1,
     })
@@ -523,6 +556,8 @@ fn run_static_vulkan_mode(
 struct StaticVulkanApp {
     mesh: VulkanStaticMesh,
     materials: Vec<VulkanStaticMaterial>,
+    camera: VulkanStaticCamera,
+    camera_mode: &'static str,
     mesh_components: usize,
     terrain_components: usize,
     preview_roots: usize,
@@ -548,6 +583,8 @@ impl StaticVulkanApp {
         Self {
             mesh: preview.mesh,
             materials: preview.materials,
+            camera: preview.camera,
+            camera_mode: preview.camera_mode,
             mesh_components: preview.mesh_components,
             terrain_components: preview.terrain_components,
             preview_roots,
@@ -593,7 +630,8 @@ impl StaticVulkanApp {
             return;
         }
         self.output = Some(format!(
-            "{{\"report_kind\":\"rendered-static-mission\",\"backend\":\"vulkan-static\",\"window\":\"native\",\"mission\":{},\"objects\":{},\"frames\":{},\"preview_roots\":{},\"mesh_components\":{},\"terrain_components\":{},\"material_descriptors\":{},\"swapchain\":[{},{}],\"swapchain_images\":{},\"validation_warnings\":{},\"validation_errors\":{},\"readback_bytes\":{},\"readback_hash\":{}}}",
+            "{{\"report_kind\":\"rendered-static-mission\",\"backend\":\"vulkan-static\",\"camera_mode\":{},\"window\":\"native\",\"mission\":{},\"objects\":{},\"frames\":{},\"preview_roots\":{},\"mesh_components\":{},\"terrain_components\":{},\"material_descriptors\":{},\"swapchain\":[{},{}],\"swapchain_images\":{},\"validation_warnings\":{},\"validation_errors\":{},\"readback_bytes\":{},\"readback_hash\":{}}}",
+            json_string(self.camera_mode),
             json_string(&self.mission),
             self.object_count,
             self.frames_presented,
@@ -658,7 +696,7 @@ impl ApplicationHandler for StaticVulkanApp {
             render_request: WinitWindow::default_render_request(),
             enable_validation: true,
             mesh: self.mesh.clone(),
-            camera: VulkanStaticCamera::default(),
+            camera: self.camera,
             materials: self.materials.clone(),
             bootstrap_progress: None,
         }) {
@@ -846,6 +884,7 @@ struct Args {
     backend: RenderBackendMode,
     load_progress: Option<PathBuf>,
     preview_roots: NonZeroUsize,
+    legacy_camera_capture: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -862,6 +901,7 @@ impl Args {
         let mut backend = RenderBackendMode::Planning;
         let mut load_progress = None;
         let mut preview_roots = NonZeroUsize::MIN;
+        let mut legacy_camera_capture = None;
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -911,6 +951,12 @@ impl Args {
                         .parse()
                         .map_err(|_| "--preview-roots must be a non-zero integer".to_string())?;
                 }
+                "--legacy-camera-capture" => {
+                    legacy_camera_capture =
+                        Some(iter.next().map(PathBuf::from).ok_or_else(|| {
+                            "--legacy-camera-capture requires a path".to_string()
+                        })?);
+                }
                 _ => return Err(usage()),
             }
         }
@@ -919,6 +965,9 @@ impl Args {
         if frames == 0 {
             return Err("--frames must be greater than zero".to_string());
         }
+        if legacy_camera_capture.is_some() && backend != RenderBackendMode::StaticVulkan {
+            return Err("--legacy-camera-capture requires --backend static-vulkan".to_string());
+        }
         Ok(Self {
             root,
             mission,
@@ -926,8 +975,44 @@ impl Args {
             backend,
             load_progress,
             preview_roots,
+            legacy_camera_capture,
         })
     }
+}
+
+#[derive(Deserialize)]
+struct LegacyCameraCapture {
+    schema: String,
+    selector0_words: [u32; 16],
+    viewport: [i32; 4],
+    near_plane: f32,
+    far_plane: f32,
+    field_of_view_radians: f32,
+}
+
+fn load_legacy_camera_capture(path: &std::path::Path) -> Result<VulkanStaticCamera, String> {
+    let bytes = std::fs::read(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    parse_legacy_camera_capture(&bytes).map_err(|err| format!("{}: {err}", path.display()))
+}
+
+fn parse_legacy_camera_capture(bytes: &[u8]) -> Result<VulkanStaticCamera, String> {
+    let capture: LegacyCameraCapture = serde_json::from_slice(bytes)
+        .map_err(|err| format!("invalid legacy camera JSON: {err}"))?;
+    if capture.schema != "fparkan-legacy-camera-v1" {
+        return Err("unsupported legacy camera capture schema".to_string());
+    }
+    VulkanStaticCamera::from_legacy_d3d7(
+        RawCameraTransform {
+            words: capture.selector0_words,
+        },
+        LegacyD3d7Projection {
+            viewport: capture.viewport,
+            near_plane: capture.near_plane,
+            far_plane: capture.far_plane,
+            field_of_view_radians: capture.field_of_view_radians,
+        },
+    )
+    .ok_or_else(|| "legacy camera capture contains an invalid D3D7 camera".to_string())
 }
 
 fn json_string(value: &str) -> String {
@@ -962,7 +1047,7 @@ fn json_hash(hash: &[u8; 32]) -> String {
 }
 
 fn usage() -> String {
-    "usage: fparkan-game --root <path> --mission <path> [--frames <n>] [--backend <planning|static-vulkan>] [--preview-roots <non-zero n>] [--load-progress <path>]".to_string()
+    "usage: fparkan-game --root <path> --mission <path> [--frames <n>] [--backend <planning|static-vulkan>] [--preview-roots <non-zero n>] [--legacy-camera-capture <path>] [--load-progress <path>]".to_string()
 }
 
 #[cfg(test)]
@@ -994,6 +1079,7 @@ mod tests {
                 backend: RenderBackendMode::Planning,
                 load_progress: None,
                 preview_roots: NonZeroUsize::MIN,
+                legacy_camera_capture: None,
             })
         );
     }
@@ -1016,6 +1102,7 @@ mod tests {
                 backend: RenderBackendMode::StaticVulkan,
                 load_progress: None,
                 preview_roots: NonZeroUsize::MIN,
+                legacy_camera_capture: None,
             })
         );
     }
@@ -1073,7 +1160,74 @@ mod tests {
                 backend: RenderBackendMode::Planning,
                 load_progress: Some(PathBuf::from("target/probe.txt")),
                 preview_roots: NonZeroUsize::MIN,
+                legacy_camera_capture: None,
             })
+        );
+    }
+
+    #[test]
+    fn legacy_camera_capture_requires_static_vulkan_and_is_retained() {
+        let common = [
+            "--root",
+            "testdata/IS",
+            "--mission",
+            "MISSIONS/Autodemo.00/data.tma",
+            "--legacy-camera-capture",
+            "target/camera.json",
+        ];
+        assert_eq!(
+            Args::parse(&strings(&common)),
+            Err("--legacy-camera-capture requires --backend static-vulkan".to_string())
+        );
+        let valid = Args::parse(&strings(&[
+            "--root",
+            "testdata/IS",
+            "--mission",
+            "MISSIONS/Autodemo.00/data.tma",
+            "--backend",
+            "static-vulkan",
+            "--legacy-camera-capture",
+            "target/camera.json",
+        ]))
+        .expect("valid legacy camera arguments");
+        assert_eq!(
+            valid.legacy_camera_capture,
+            Some(PathBuf::from("target/camera.json"))
+        );
+    }
+
+    #[test]
+    fn legacy_camera_capture_parses_exact_d3d7_inputs() {
+        let words = [
+            0.0_f32.to_bits(),
+            (-1.0_f32).to_bits(),
+            0.0_f32.to_bits(),
+            10.0_f32.to_bits(),
+            1.0_f32.to_bits(),
+            0.0_f32.to_bits(),
+            0.0_f32.to_bits(),
+            20.0_f32.to_bits(),
+            0.0_f32.to_bits(),
+            0.0_f32.to_bits(),
+            1.0_f32.to_bits(),
+            30.0_f32.to_bits(),
+            0.0_f32.to_bits(),
+            0.0_f32.to_bits(),
+            0.0_f32.to_bits(),
+            1.0_f32.to_bits(),
+        ];
+        let json = format!(
+            "{{\"schema\":\"fparkan-legacy-camera-v1\",\"selector0_words\":{:?},\"viewport\":[0,0,1024,768],\"near_plane\":0.5,\"far_plane\":700.0,\"field_of_view_radians\":1.3}}",
+            words
+        );
+
+        let camera = parse_legacy_camera_capture(json.as_bytes()).expect("valid legacy camera");
+
+        assert!(camera.is_finite());
+        assert_eq!(camera.clip_from_world[0], 0.65_f32.cos());
+        assert_eq!(
+            parse_legacy_camera_capture(br#"{"schema":"unknown","selector0_words":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"viewport":[0,0,1,1],"near_plane":0.1,"far_plane":1.0,"field_of_view_radians":1.0}"#),
+            Err("unsupported legacy camera capture schema".to_string())
         );
     }
 

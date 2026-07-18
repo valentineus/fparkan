@@ -1446,6 +1446,23 @@ smoke executes that update before each of 300 validation-clean frames. This is
 the renderer-side cadence contract only; it does not yet supply a gameplay
 camera controller or claim camera movement parity.
 
+For controlled differential work, `fparkan-game --backend static-vulkan` now
+accepts `--legacy-camera-capture <path>`. The JSON capture stores only the
+selector-0 words and the already recovered Ngi32 viewport/near/far/FOV inputs;
+the application reconstructs the D3D7 camera offline, selects source-world
+geometry, and never attaches to or controls the original process. A live
+read-only AutoDemo confirmation corrected an ABI ambiguity: the Terrain global
+is the base of the `0x1A4` camera object (vtables at `+0` and `+4`), while
+`LoadCamera`'s public return is the separate interface view at `base + 0x134`
+with its own vtable. This capture format deliberately preserves the former
+base-object interpretation and does not invent camera ownership.
+
+A bounded first launch of the capture-driven static preview against the
+canonical GOG `MISSIONS/Autodemo.00/data.tma` did not reach a native frame
+within 60 seconds. It is therefore load-path evidence only, not a rendering or
+pixel-parity result; the existing full dependency preparation remains the next
+performance/runtime obstacle before this exact capture can be visually compared.
+
 A fresh no-input launch of the canonical `iron_3d.exe` did create a responsive
 window titled `Parkan. Железная Стратегия`. A read-only probe then requested
 `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ` and attempted to read the known
