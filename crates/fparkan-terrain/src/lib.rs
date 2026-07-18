@@ -27,7 +27,9 @@ use std::collections::VecDeque;
 ///
 /// Applications access this semantic terrain API through this terrain crate
 /// rather than taking a direct dependency on the binary-format parser.
-pub use fparkan_terrain_format::{TerrainMaterialLayers, TerrainMaterialSelection};
+pub use fparkan_terrain_format::{
+    TerrainMaterialLayers, TerrainMaterialPair, TerrainMaterialSelection,
+};
 
 /// Terrain world.
 #[derive(Clone, Debug, Default)]

@@ -128,6 +128,12 @@ struct TerrainInspectOutput {
     faces: usize,
     slots: usize,
     material_tags: Vec<TerrainMaterialTagCount>,
+    shade_material_pairs: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shade_material_lookup_min: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shade_material_lookup_max: Option<u16>,
+    shade_batch_boundaries: usize,
 }
 
 #[derive(Serialize)]
@@ -473,6 +479,22 @@ fn inspect_terrain(args: &[String]) -> Result<(), String> {
         .map(|(tag, faces)| TerrainMaterialTagCount { tag, faces })
         .collect::<Vec<_>>();
     material_tags.sort_unstable_by_key(|entry| entry.tag);
+    let shade_material_pairs = (0..terrain.slots.slots_raw.len())
+        .filter_map(|slot_index| terrain.slot_material_pairs(slot_index))
+        .flatten()
+        .collect::<Vec<_>>();
+    let shade_material_lookup_min = shade_material_pairs
+        .iter()
+        .map(|pair| pair.shade_selection().material_index)
+        .min();
+    let shade_material_lookup_max = shade_material_pairs
+        .iter()
+        .map(|pair| pair.shade_selection().material_index)
+        .max();
+    let shade_batch_boundaries = shade_material_pairs
+        .iter()
+        .filter(|pair| pair.flags & 0x0010 != 0)
+        .count();
     println!(
         "{}",
         serialize_json(&TerrainInspectOutput {
@@ -484,6 +506,10 @@ fn inspect_terrain(args: &[String]) -> Result<(), String> {
             faces: terrain.faces.len(),
             slots: terrain.slots.slots_raw.len(),
             material_tags,
+            shade_material_pairs: shade_material_pairs.len(),
+            shade_material_lookup_min,
+            shade_material_lookup_max,
+            shade_batch_boundaries,
         })?
     );
     Ok(())
@@ -733,12 +759,16 @@ mod tests {
                 TerrainMaterialTagCount { tag: 0, faces: 1 },
                 TerrainMaterialTagCount { tag: 3, faces: 1 },
             ],
+            shade_material_pairs: 2,
+            shade_material_lookup_min: Some(1),
+            shade_material_lookup_max: Some(2),
+            shade_batch_boundaries: 1,
         })
         .expect("serialize terrain inspection");
 
         assert_eq!(
             json,
-            "{\"schema_version\":\"fparkan-terrain-inspect-v1\",\"path\":\"DATA/MAPS/AutoMAP/Land.msh\",\"positions\":3,\"min\":[-1.0,-2.0,-3.0],\"max\":[4.0,5.0,6.0],\"faces\":2,\"slots\":4,\"material_tags\":[{\"tag\":0,\"faces\":1},{\"tag\":3,\"faces\":1}]}"
+            "{\"schema_version\":\"fparkan-terrain-inspect-v1\",\"path\":\"DATA/MAPS/AutoMAP/Land.msh\",\"positions\":3,\"min\":[-1.0,-2.0,-3.0],\"max\":[4.0,5.0,6.0],\"faces\":2,\"slots\":4,\"material_tags\":[{\"tag\":0,\"faces\":1},{\"tag\":3,\"faces\":1}],\"shade_material_pairs\":2,\"shade_material_lookup_min\":1,\"shade_material_lookup_max\":2,\"shade_batch_boundaries\":1}"
         );
     }
 }

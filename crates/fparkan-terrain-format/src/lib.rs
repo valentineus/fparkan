@@ -211,6 +211,22 @@ pub struct TerrainMaterialPair {
     pub flags: u16,
 }
 
+impl TerrainMaterialPair {
+    /// Returns the material-manager selection used by `GetShade`.
+    ///
+    /// `GetShade` owns a manager loaded only with `Shade.wea`, so its
+    /// 16-bit lookup occupies row bits of that manager's table zero. It is
+    /// deliberately separate from the `Land1.wea`/`Land2.wea` selections
+    /// carried by [`TerrainMaterialLayers`].
+    #[must_use]
+    pub const fn shade_selection(self) -> TerrainMaterialSelection {
+        TerrainMaterialSelection {
+            table_index: 0,
+            material_index: self.material_lookup,
+        }
+    }
+}
+
 impl TerrainSlotTable {
     /// Returns the render-dispatch header for one decoded slot record.
     #[must_use]
@@ -1568,6 +1584,13 @@ mod tests {
                     flags: 0x0010,
                 },
             ])
+        );
+        assert_eq!(
+            document.slot_material_pairs(0).expect("material pairs")[0].shade_selection(),
+            TerrainMaterialSelection {
+                table_index: 0,
+                material_index: 0x0102,
+            }
         );
         assert_eq!(document.slot_material_pairs(1), None);
 

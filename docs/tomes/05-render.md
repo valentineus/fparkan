@@ -1584,9 +1584,14 @@ index, then groups the pairs by material lookup before constructing draw work.
 `TerrainSlotTable::render_dispatch` exposes exactly those two proven disk
 fields, while `LandMeshDocument::slot_material_pairs` decodes the selected
 type-11 entries as `{ material_lookup: u16, flags: u16 }`. Flag `0x0010` is a
-proven batch boundary in `GetShade`; the lookup's mapping to the two WEAR
-tables, the meanings of its remaining flags, and the final blend operation
-remain unassigned.
+proven batch boundary in `GetShade`. Crucially, this lookup does **not** select
+either map-local Land table: the `GetShade` constructor loads its own one-table
+manager from `system.rlb` resource `Shade.wea`, so the 16-bit value is that
+manager's table-zero row. `TerrainMaterialPair::shade_selection` records this
+separate selector instead of conflating it with `Land1.wea`/`Land2.wea`. The
+AutoDemo inspector now reports 128 slots, 3,174 addressed shade pairs, selector
+range `0..3173`, and 392 `0x0010` batch boundaries. The meanings of remaining
+flags and the final blend operation remain unassigned.
 
 The static Vulkan bridge now carries each contiguous face run as a separate
 draw range keyed by the original packed `material_tag`; it neither reorders
