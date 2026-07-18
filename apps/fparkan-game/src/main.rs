@@ -131,42 +131,48 @@ fn render_snapshot_with_assets(
 ) -> RenderSnapshot {
     let mut draws = Vec::with_capacity(snapshot.objects.len());
     for (index, handle) in snapshot.objects.iter().enumerate() {
-        let stable_order = u64::from(handle.slot);
-        let prepared = mission_assets.and_then(|assets| {
-            assets
-                .visual_for_object(index)
-                .and_then(|visual_id| assets.visual_by_id(visual_id))
-        });
-        let mesh = if let Some(visual) = prepared {
-            visual.mesh.as_ref().map_or_else(
-                || GpuMeshId(u64::from(handle.slot) + 1),
-                |_| GpuMeshId(visual.id.raw()),
-            )
-        } else {
-            GpuMeshId(u64::from(handle.slot) + 1)
-        };
-        let material = prepared
-            .and_then(PreparedVisual::primary_material_id)
-            .map_or(GpuMaterialId(1), |material_id| {
-                GpuMaterialId(material_id.raw())
+        let visuals = mission_assets.map_or(&[][..], |assets| assets.visuals_for_object(index));
+        let visual_count = visuals.len().max(1);
+        for visual_index in 0..visual_count {
+            let prepared = mission_assets.and_then(|assets| {
+                visuals
+                    .get(visual_index)
+                    .and_then(|visual_id| assets.visual_by_id(*visual_id))
             });
-        let draw_id = snapshot
-            .tick
-            .0
-            .wrapping_mul(1_000_003)
-            .wrapping_add(stable_order);
-        draws.push(RenderSnapshotDraw {
-            id: DrawId(draw_id),
-            phase: RenderPhase::Opaque,
-            object_id: None,
-            mesh,
-            material_slots: vec![material],
-            material_index: 0,
-            pipeline_state: fparkan_render::LegacyPipelineState::default(),
-            transform: identity_transform(index_to_f32(index)),
-            range: IndexRange { start: 0, count: 3 },
-            stable_order,
-        });
+            let mesh = prepared.map_or_else(
+                || GpuMeshId(u64::from(handle.slot) + 1),
+                |visual| GpuMeshId(visual.id.raw()),
+            );
+            let material = prepared
+                .and_then(PreparedVisual::primary_material_id)
+                .map_or(GpuMaterialId(1), |material_id| {
+                    GpuMaterialId(material_id.raw())
+                });
+            let stable_order = if visual_count == 1 {
+                u64::from(handle.slot)
+            } else {
+                u64::from(handle.slot)
+                    .wrapping_mul(1_000_003)
+                    .wrapping_add(u64::try_from(visual_index).unwrap_or(u64::MAX))
+            };
+            let draw_id = snapshot
+                .tick
+                .0
+                .wrapping_mul(1_000_003)
+                .wrapping_add(stable_order);
+            draws.push(RenderSnapshotDraw {
+                id: DrawId(draw_id),
+                phase: RenderPhase::Opaque,
+                object_id: None,
+                mesh,
+                material_slots: vec![material],
+                material_index: 0,
+                pipeline_state: fparkan_render::LegacyPipelineState::default(),
+                transform: identity_transform(index_to_f32(index)),
+                range: IndexRange { start: 0, count: 3 },
+                stable_order,
+            });
+        }
     }
     RenderSnapshot {
         camera: CameraSnapshot::default(),
@@ -274,6 +280,7 @@ fn usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fparkan_assets::AssetId;
     use fparkan_world::{ObjectHandle, StateHash, Tick};
     use std::path::Path;
 
@@ -335,6 +342,60 @@ mod tests {
         assert_eq!(first.mesh, GpuMeshId(3));
         assert_eq!(first.stable_order, 2);
         Ok(())
+    }
+
+    #[test]
+    fn render_snapshot_retains_every_prepared_visual_for_an_object() -> Result<(), String> {
+        let snapshot = WorldSnapshot {
+            tick: Tick(3),
+            objects: vec![ObjectHandle {
+                generation: 1,
+                slot: 7,
+            }],
+            events: Vec::new(),
+            hash: StateHash([0; 32]),
+        };
+        let first = prepared_visual(101, 201);
+        let second = prepared_visual(102, 202);
+        let assets = MissionAssets {
+            visuals: vec![first, second],
+            object_visuals: vec![vec![AssetId::new(101), AssetId::new(102)]],
+            ..MissionAssets::default()
+        };
+        let commands = render_snapshot_commands_with_assets(&snapshot, Some(&assets))?;
+        let draws: Vec<_> = commands
+            .commands
+            .iter()
+            .filter_map(|command| match command {
+                RenderCommand::Draw(draw) => Some(draw),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(draws.len(), 2);
+        assert_eq!(draws[0].mesh, GpuMeshId(101));
+        assert_eq!(draws[1].mesh, GpuMeshId(102));
+        assert_eq!(draws[0].material, GpuMaterialId(201));
+        assert_eq!(draws[1].material, GpuMaterialId(202));
+        assert_ne!(draws[0].stable_order, draws[1].stable_order);
+        Ok(())
+    }
+
+    fn prepared_visual(id: u64, material: u64) -> PreparedVisual {
+        PreparedVisual {
+            id: AssetId::new(id),
+            mesh: None,
+            model_id: None,
+            wear_id: None,
+            model_nodes: 0,
+            model_slots: 0,
+            model_batches: 0,
+            material_count: 1,
+            material_ids: vec![AssetId::new(material)],
+            texture_ids: Vec::new(),
+            lightmap_ids: Vec::new(),
+            texture_count: 0,
+            lightmap_count: 0,
+        }
     }
 
     #[test]
