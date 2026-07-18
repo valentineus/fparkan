@@ -64,6 +64,119 @@ pub struct VmHostCallbackCommand {
     pub second: u32,
 }
 
+/// The optional target-lookup payload selected by the recovered `Handler(15)`
+/// mode word. Names follow the shipped `varset.var` constants; they do not
+/// assign a gameplay operation to the later opaque virtual call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Handler15TargetPayload {
+    /// `NONE` (`0`): no additional reference is consumed.
+    None,
+    /// `TARGET_BY_LOGIC_ID` (`0x0201`): one DWORD payload.
+    ByLogicId(u32),
+    /// `TARGET_BY_PLACE` (`0x0202`): two DWORD payloads.
+    ByPlace {
+        /// First DWORD payload in source order.
+        first: u32,
+        /// Second DWORD payload in source order.
+        second: u32,
+    },
+    /// `TARGET_BY_TYPE` (`0x0203`): one DWORD payload.
+    ByType(u32),
+    /// `TARGET_NOT_DEFINED` (`0x0204`): one DWORD payload.
+    NotDefined(u32),
+    /// `TARGET_BY_NAME` (`0x0205`): one DWORD payload.
+    ByName(u32),
+}
+
+/// Resolved fixed-width operands delivered by `Handler(15)` to its target
+/// interface.
+///
+/// Slot names preserve disk/reference order. The original first looks up an
+/// opaque target through `word_0`, then calls a target vtable slot with this
+/// packed data and `word_2`; neither operation is named here.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Handler15Invocation {
+    /// Resolved DWORD reference 0, used for the preceding target lookup.
+    pub word_0: u32,
+    /// Resolved DWORD reference 1.
+    pub word_1: u32,
+    /// Resolved DWORD reference 2, passed separately to the target call.
+    pub word_2: u32,
+    /// Resolved DWORD reference 3.
+    pub word_3: u32,
+    /// Resolved scalar reference 4.
+    pub scalar_4: f32,
+    /// Resolved scalar reference 5.
+    pub scalar_5: f32,
+    /// Resolved scalar reference 6.
+    pub scalar_6: f32,
+    /// Resolved scalar reference 7.
+    pub scalar_7: f32,
+    /// Target mode and its exactly consumed trailing DWORD references.
+    pub target: Handler15TargetPayload,
+}
+
+/// Error resolving the corpus-proven `Handler(15)` input layout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Handler15ResolveError {
+    /// One of the mode-specific required references was absent.
+    MissingReference {
+        /// Zero-based required reference position.
+        position: usize,
+    },
+    /// A compiled reference indexed outside the loaded varset.
+    VarSetIndexOutOfBounds {
+        /// Referenced compiled-varset index.
+        index: u32,
+        /// Available declaration count.
+        declarations: usize,
+    },
+    /// A reference's declaration type differed from the observed contract.
+    UnexpectedType {
+        /// Zero-based reference position.
+        position: usize,
+        /// Type required by the recovered handler contract.
+        expected: VarSetType,
+        /// Type actually declared in the loaded varset.
+        found: VarSetType,
+    },
+    /// The target-mode value was not among the modes observed in the GOG corpus.
+    UnsupportedTargetMode(u32),
+}
+
+impl std::fmt::Display for Handler15ResolveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingReference { position } => {
+                write!(formatter, "Handler(15) is missing reference {position}")
+            }
+            Self::VarSetIndexOutOfBounds {
+                index,
+                declarations,
+            } => write!(
+                formatter,
+                "Handler(15) reference {index} is outside {declarations} varset declarations"
+            ),
+            Self::UnexpectedType {
+                position,
+                expected,
+                found,
+            } => write!(
+                formatter,
+                "Handler(15) reference {position} has {found:?}, expected {expected:?}"
+            ),
+            Self::UnsupportedTargetMode(mode) => {
+                write!(
+                    formatter,
+                    "Handler(15) has unsupported target mode 0x{mode:08x}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for Handler15ResolveError {}
+
 /// Error resolving the proven `Handler(30)` callback contract.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Handler30ResolveError {
@@ -157,6 +270,114 @@ impl VarSet {
                 declarations: self.declarations.len(),
             }),
         }
+    }
+
+    /// Resolves the fixed-width, corpus-proven operands of GOG `Handler(15)`.
+    ///
+    /// Static analysis of `ai.dll` at `0x10008054` shows four DWORD slots,
+    /// four scalar slots, then a DWORD mode. The mode selects zero, one, or
+    /// two additional DWORD references. This method deliberately stops before
+    /// the original target lookup and virtual call because their object and
+    /// gameplay semantics are not yet recovered.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed failures for missing/out-of-range operands, type changes,
+    /// or an unobserved target mode rather than silently inventing a command.
+    pub fn resolve_handler15(
+        &self,
+        instruction: &ScriptInstruction,
+    ) -> Result<Handler15Invocation, Handler15ResolveError> {
+        let word_0 = self.resolve_handler15_dword(instruction, 0)?;
+        let word_1 = self.resolve_handler15_dword(instruction, 1)?;
+        let word_2 = self.resolve_handler15_dword(instruction, 2)?;
+        let word_3 = self.resolve_handler15_dword(instruction, 3)?;
+        let scalar_4 = self.resolve_handler15_float(instruction, 4)?;
+        let scalar_5 = self.resolve_handler15_float(instruction, 5)?;
+        let scalar_6 = self.resolve_handler15_float(instruction, 6)?;
+        let scalar_7 = self.resolve_handler15_float(instruction, 7)?;
+        let target = match self.resolve_handler15_dword(instruction, 8)? {
+            0 => Handler15TargetPayload::None,
+            0x0201 => {
+                Handler15TargetPayload::ByLogicId(self.resolve_handler15_dword(instruction, 9)?)
+            }
+            0x0202 => Handler15TargetPayload::ByPlace {
+                first: self.resolve_handler15_dword(instruction, 9)?,
+                second: self.resolve_handler15_dword(instruction, 10)?,
+            },
+            0x0203 => Handler15TargetPayload::ByType(self.resolve_handler15_dword(instruction, 9)?),
+            0x0204 => {
+                Handler15TargetPayload::NotDefined(self.resolve_handler15_dword(instruction, 9)?)
+            }
+            0x0205 => Handler15TargetPayload::ByName(self.resolve_handler15_dword(instruction, 9)?),
+            mode => return Err(Handler15ResolveError::UnsupportedTargetMode(mode)),
+        };
+        Ok(Handler15Invocation {
+            word_0,
+            word_1,
+            word_2,
+            word_3,
+            scalar_4,
+            scalar_5,
+            scalar_6,
+            scalar_7,
+            target,
+        })
+    }
+
+    fn resolve_handler15_dword(
+        &self,
+        instruction: &ScriptInstruction,
+        position: usize,
+    ) -> Result<u32, Handler15ResolveError> {
+        match self.resolve_handler15_declaration(instruction, position)? {
+            VarSetDeclaration {
+                type_name: VarSetType::Dword,
+                default_value: VarSetDefault::Dword(value),
+                ..
+            } => Ok(*value),
+            declaration => Err(Handler15ResolveError::UnexpectedType {
+                position,
+                expected: VarSetType::Dword,
+                found: declaration.type_name,
+            }),
+        }
+    }
+
+    fn resolve_handler15_float(
+        &self,
+        instruction: &ScriptInstruction,
+        position: usize,
+    ) -> Result<f32, Handler15ResolveError> {
+        match self.resolve_handler15_declaration(instruction, position)? {
+            VarSetDeclaration {
+                type_name: VarSetType::Float,
+                default_value: VarSetDefault::FloatBits(bits),
+                ..
+            } => Ok(f32::from_bits(*bits)),
+            declaration => Err(Handler15ResolveError::UnexpectedType {
+                position,
+                expected: VarSetType::Float,
+                found: declaration.type_name,
+            }),
+        }
+    }
+
+    fn resolve_handler15_declaration(
+        &self,
+        instruction: &ScriptInstruction,
+        position: usize,
+    ) -> Result<&VarSetDeclaration, Handler15ResolveError> {
+        let index = *instruction
+            .references
+            .get(position)
+            .ok_or(Handler15ResolveError::MissingReference { position })?;
+        self.declarations
+            .get(index as usize)
+            .ok_or(Handler15ResolveError::VarSetIndexOutOfBounds {
+                index,
+                declarations: self.declarations.len(),
+            })
     }
 }
 
@@ -692,9 +913,10 @@ fn read_instruction(
 #[cfg(test)]
 mod tests {
     use super::{
-        decode, decode_with_limits, parse_varset, Handler2RecordInput, Handler2RecordScheduler,
-        Handler30ResolveError, ScriptDispatchSelector, ScriptInstruction, VarSetDefault,
-        VarSetError, VarSetType, VmHostCallbackCommand, GOG_HANDLER_COUNT, INSTRUCTION_WORDS,
+        decode, decode_with_limits, parse_varset, Handler15ResolveError, Handler15TargetPayload,
+        Handler2RecordInput, Handler2RecordScheduler, Handler30ResolveError,
+        ScriptDispatchSelector, ScriptInstruction, VarSetDefault, VarSetError, VarSetType,
+        VmHostCallbackCommand, GOG_HANDLER_COUNT, INSTRUCTION_WORDS,
     };
     use fparkan_binary::{DecodeError, Limits};
 
@@ -878,6 +1100,80 @@ STRING( 8, ignored, ignored, ignored)\r\n";
                 index: 1,
                 declarations: 1,
             })
+        );
+    }
+
+    #[test]
+    fn handler_fifteen_resolves_exact_typed_target_by_place_operands() {
+        let varset = parse_varset(
+            b"VAR( DWORD, d0, 1)\nVAR( DWORD, d1, 2)\nVAR( DWORD, d2, 3)\nVAR( DWORD, d3, 4)\nVAR( float, f4, 1.5)\nVAR( float, f5, 2.5)\nVAR( float, f6, 3.5)\nVAR( float, f7, 4.5)\nVAR( DWORD, mode, 0x0202)\nVAR( DWORD, place0, 12)\nVAR( DWORD, place1, 13)\n",
+        )
+        .expect("valid Handler(15) varset");
+        let instruction = ScriptInstruction {
+            header_words: [15, 0, 0, 0, 0, 11, 0],
+            references: (0..11).collect(),
+        };
+
+        let resolved = varset
+            .resolve_handler15(&instruction)
+            .expect("exact Handler(15) layout");
+        assert_eq!(
+            [
+                resolved.word_0,
+                resolved.word_1,
+                resolved.word_2,
+                resolved.word_3
+            ],
+            [1, 2, 3, 4]
+        );
+        assert_eq!(
+            [
+                resolved.scalar_4.to_bits(),
+                resolved.scalar_5.to_bits(),
+                resolved.scalar_6.to_bits(),
+                resolved.scalar_7.to_bits()
+            ],
+            [
+                1.5_f32.to_bits(),
+                2.5_f32.to_bits(),
+                3.5_f32.to_bits(),
+                4.5_f32.to_bits()
+            ]
+        );
+        assert_eq!(
+            resolved.target,
+            Handler15TargetPayload::ByPlace {
+                first: 12,
+                second: 13
+            }
+        );
+    }
+
+    #[test]
+    fn handler_fifteen_rejects_missing_and_wrongly_typed_operands() {
+        let wrong_scalar = parse_varset(
+            b"VAR( DWORD, d0, 1)\nVAR( DWORD, d1, 2)\nVAR( DWORD, d2, 3)\nVAR( DWORD, d3, 4)\nVAR( DWORD, wrong, 5)\n",
+        )
+        .expect("valid varset");
+        let instruction = ScriptInstruction {
+            header_words: [15, 0, 0, 0, 0, 5, 0],
+            references: (0..5).collect(),
+        };
+        assert_eq!(
+            wrong_scalar.resolve_handler15(&instruction),
+            Err(Handler15ResolveError::UnexpectedType {
+                position: 4,
+                expected: VarSetType::Float,
+                found: VarSetType::Dword,
+            })
+        );
+        let empty = parse_varset(b"").expect("empty varset");
+        assert_eq!(
+            empty.resolve_handler15(&ScriptInstruction {
+                header_words: [15, 0, 0, 0, 0, 0, 0],
+                references: Vec::new(),
+            }),
+            Err(Handler15ResolveError::MissingReference { position: 0 })
         );
     }
 

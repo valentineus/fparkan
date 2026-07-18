@@ -173,6 +173,35 @@ layout prerequisites/modifiers/unlocks. Formula evaluator требует strict
 grammar/version, typed operands, deterministic numeric policy, bounded stack и
 явных errors; x87-compatible rounding нужен там, где оно выбирает ветку.
 
+### Handler(15): typed target-call boundary
+
+`Handler(15)` is the sixteenth VM-table entry at GOG `ai.dll` VA `0x10008054`
+and the second most frequent non-sentinel selector: 236 records in 28 of 58
+GOG packages. It is not a one-word opcode. Across the complete corpus,
+references `0..3` are `DWORD`, `4..7` are `float`, and `8` is the DWORD mode.
+The original resolves the first four through `0x10013570`, the next four
+through x87 scalar helper `0x10013190`, then reads the mode through
+`0x10013570`.
+
+The shipped `varset.var` names the only observed mode values: `NONE=0` uses
+9 total references; `TARGET_BY_LOGIC_ID=0x0201`, `TARGET_BY_TYPE=0x0203`,
+`TARGET_NOT_DEFINED=0x0204`, and `TARGET_BY_NAME=0x0205` use 10; and
+`TARGET_BY_PLACE=0x0202` uses 11. The corpus contains 34/122/80 records in
+these three arities. The trailing references at positions 9 and, only for
+`TARGET_BY_PLACE`, 10 are all in-range DWORD declarations.
+
+After resolving those inputs, the handler looks up an opaque target through
+virtual slot `+0x1c` on `this+0x3d8` using the first word. A missing target
+sets VM flag `+0x50=5`; otherwise the handler builds a temporary call record,
+applies the mode-specific tail, and invokes the target's `+0x0c` virtual slot
+with that record and the third word. Its zero/non-zero result becomes
+`+0x50=0/1`. The target type, the virtual method's semantic action, and its
+return value remain unproven. Accordingly `VarSet::resolve_handler15` only
+materializes a type-checked `Handler15Invocation` and `Handler15TargetPayload`;
+it never executes the opaque target call. Missing, out-of-range, wrong-type,
+and unobserved-mode inputs are explicit errors. Reproduce the static evidence
+with `tools/ghidra/ExportAiVmHandler15.java`.
+
 ## Готовность
 
 Все demo packages должны проходить package/version checks, offsets оставаться
