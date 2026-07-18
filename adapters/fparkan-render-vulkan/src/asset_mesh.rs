@@ -18,20 +18,20 @@ pub enum VulkanAssetMeshError {
     IndexOutOfRange,
 }
 
-/// Shared XZ frame for a deliberately top-down diagnostic static scene.
+/// Shared XY frame for a deliberately top-down diagnostic static scene.
 ///
 /// It is a CPU-side viewer transform, not evidence of the original camera or
 /// object transform convention. Keeping it explicit prevents separately
 /// normalized terrain and model components from being incorrectly overlaid.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct VulkanStaticXzFrame {
+pub struct VulkanStaticXyFrame {
     center_x: f32,
-    center_z: f32,
+    center_y: f32,
     extent: f32,
 }
 
-impl VulkanStaticXzFrame {
-    /// Builds a frame that maps the supplied XZ bounds into the static viewer.
+impl VulkanStaticXyFrame {
+    /// Builds a frame that maps the supplied XY bounds into the static viewer.
     ///
     /// # Errors
     ///
@@ -40,16 +40,16 @@ impl VulkanStaticXzFrame {
     pub fn from_bounds(
         min_x: f32,
         max_x: f32,
-        min_z: f32,
-        max_z: f32,
+        min_y: f32,
+        max_y: f32,
     ) -> Result<Self, VulkanAssetMeshError> {
-        let extent = (max_x - min_x).max(max_z - min_z);
+        let extent = (max_x - min_x).max(max_y - min_y);
         if !extent.is_finite() || extent <= f32::EPSILON {
             return Err(VulkanAssetMeshError::DegenerateViewExtent);
         }
         Ok(Self {
             center_x: (min_x + max_x) * 0.5,
-            center_z: (min_z + max_z) * 0.5,
+            center_y: (min_y + max_y) * 0.5,
             extent,
         })
     }
@@ -58,14 +58,14 @@ impl VulkanStaticXzFrame {
         let scale = 1.6 / self.extent;
         [
             (position[0] - self.center_x) * scale,
-            (position[2] - self.center_z) * scale,
+            (position[1] - self.center_y) * scale,
         ]
     }
 
     fn planar_uv(self, position: [f32; 3]) -> [f32; 2] {
         [
             (position[0] - self.center_x) / self.extent + 0.5,
-            (position[2] - self.center_z) / self.extent + 0.5,
+            (position[1] - self.center_y) / self.extent + 0.5,
         ]
     }
 }
@@ -75,7 +75,7 @@ impl std::fmt::Display for VulkanAssetMeshError {
         match self {
             Self::EmptyGeometry => write!(f, "MSH contains no triangle geometry"),
             Self::NonFinitePosition => write!(f, "MSH contains a non-finite position"),
-            Self::DegenerateViewExtent => write!(f, "MSH has a degenerate XZ view extent"),
+            Self::DegenerateViewExtent => write!(f, "MSH has a degenerate XY view extent"),
             Self::IndexOutOfRange => write!(f, "MSH index exceeds the static Vulkan u16 contract"),
         }
     }
@@ -88,7 +88,7 @@ impl std::error::Error for VulkanAssetMeshError {}
 /// The original engine's node transforms, camera and material pipeline are not
 /// substituted here. This bridge is intentionally a static asset-viewer step:
 /// it preserves every batch's `index_start`, `index_count` and `base_vertex`,
-/// projects the conventional `Iron3D` XZ ground plane into the current XY shader
+/// projects the conventional `Iron3D` XY ground plane into the current XY shader
 /// input, and scales the used bounds uniformly into the visible clip rectangle.
 ///
 /// # Errors
@@ -99,12 +99,12 @@ pub fn project_msh_to_static_mesh(
     model: &ModelAsset,
 ) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
     let (indices, _) = static_model_indices_and_ranges(model)?;
-    let (min_x, max_x, min_z, max_z) = static_mesh_xz_bounds(&model.positions, &indices)?;
-    let frame = VulkanStaticXzFrame::from_bounds(min_x, max_x, min_z, max_z)?;
-    project_msh_to_static_mesh_in_xz_frame(model, frame, [0.0; 3], [1.0; 3])
+    let (min_x, max_x, min_y, max_y) = static_mesh_xy_bounds(&model.positions, &indices)?;
+    let frame = VulkanStaticXyFrame::from_bounds(min_x, max_x, min_y, max_y)?;
+    project_msh_to_static_mesh_in_xy_frame(model, frame, [0.0; 3], [1.0; 3])
 }
 
-/// Projects MSH geometry with a known translation/scale into a shared XZ frame.
+/// Projects MSH geometry with a known translation/scale into a shared XY frame.
 ///
 /// The caller supplies only transforms already decoded from mission data. Raw
 /// orientation is intentionally not interpreted until its original convention
@@ -114,9 +114,9 @@ pub fn project_msh_to_static_mesh(
 ///
 /// Returns [`VulkanAssetMeshError`] when geometry, transform values or the
 /// static Vulkan input contract cannot represent the source model.
-pub fn project_msh_to_static_mesh_in_xz_frame(
+pub fn project_msh_to_static_mesh_in_xy_frame(
     model: &ModelAsset,
-    frame: VulkanStaticXzFrame,
+    frame: VulkanStaticXyFrame,
     translation: [f32; 3],
     scale: [f32; 3],
 ) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
@@ -146,7 +146,7 @@ pub fn project_msh_to_static_mesh_in_xz_frame(
                 color: [0.82, 0.72, 0.31],
                 // Iron3D stores Res5 UV0 as signed fixed point with 1/1024 units.
                 // Models that omit this optional stream retain the static viewer's
-                // XZ planar fallback instead of receiving fabricated raw UV values.
+                // XY planar fallback instead of receiving fabricated raw UV values.
                 uv: model
                     .uv0
                     .as_ref()
@@ -176,7 +176,7 @@ pub fn project_msh_to_static_mesh_in_xz_frame(
 /// # Errors
 ///
 /// Returns [`VulkanAssetMeshError`] if the terrain has no triangles, contains
-/// non-finite positions, has no usable XZ extent, or references data outside
+/// non-finite positions, has no usable XY extent, or references data outside
 /// the current static Vulkan input contract.
 pub fn project_land_msh_to_static_mesh(
     terrain: &LandMeshDocument,
@@ -195,20 +195,20 @@ pub fn project_land_msh_to_static_mesh(
         return Err(VulkanAssetMeshError::EmptyGeometry);
     }
 
-    let (min_x, max_x, min_z, max_z) = static_mesh_xz_bounds(&terrain.positions, &indices)?;
-    let frame = VulkanStaticXzFrame::from_bounds(min_x, max_x, min_z, max_z)?;
-    project_land_msh_to_static_mesh_in_xz_frame(terrain, frame)
+    let (min_x, max_x, min_y, max_y) = static_mesh_xy_bounds(&terrain.positions, &indices)?;
+    let frame = VulkanStaticXyFrame::from_bounds(min_x, max_x, min_y, max_y)?;
+    project_land_msh_to_static_mesh_in_xy_frame(terrain, frame)
 }
 
-/// Projects `Land.msh` terrain geometry into a shared diagnostic XZ frame.
+/// Projects `Land.msh` terrain geometry into a shared diagnostic XY frame.
 ///
 /// # Errors
 ///
 /// Returns [`VulkanAssetMeshError`] when terrain geometry or the static Vulkan
 /// input contract cannot represent the source mesh.
-pub fn project_land_msh_to_static_mesh_in_xz_frame(
+pub fn project_land_msh_to_static_mesh_in_xy_frame(
     terrain: &LandMeshDocument,
-    frame: VulkanStaticXzFrame,
+    frame: VulkanStaticXyFrame,
 ) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
     let mut indices = Vec::with_capacity(
         terrain
@@ -298,14 +298,14 @@ fn static_model_indices_and_ranges(
     Ok((indices, draw_ranges))
 }
 
-fn static_mesh_xz_bounds(
+fn static_mesh_xy_bounds(
     positions: &[[f32; 3]],
     indices: &[u16],
 ) -> Result<(f32, f32, f32, f32), VulkanAssetMeshError> {
     let mut min_x = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;
-    let mut min_z = f32::INFINITY;
-    let mut max_z = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
     for &index in indices {
         let position = positions
             .get(usize::from(index))
@@ -315,10 +315,10 @@ fn static_mesh_xz_bounds(
         }
         min_x = min_x.min(position[0]);
         max_x = max_x.max(position[0]);
-        min_z = min_z.min(position[2]);
-        max_z = max_z.max(position[2]);
+        min_y = min_y.min(position[1]);
+        max_y = max_y.max(position[1]);
     }
-    Ok((min_x, max_x, min_z, max_z))
+    Ok((min_x, max_x, min_y, max_y))
 }
 
 #[cfg(test)]
@@ -356,13 +356,13 @@ mod tests {
     }
 
     #[test]
-    fn projects_xz_geometry_and_applies_base_vertex() {
+    fn projects_xy_geometry_and_applies_base_vertex() {
         let mesh = project_msh_to_static_mesh(&model(
             vec![
-                [99.0, 0.0, 99.0],
-                [-2.0, 4.0, -1.0],
-                [2.0, 8.0, -1.0],
-                [-2.0, 1.0, 3.0],
+                [99.0, 99.0, 0.0],
+                [-2.0, -1.0, 4.0],
+                [2.0, -1.0, 8.0],
+                [-2.0, 3.0, 1.0],
             ],
             vec![0, 1, 2],
             vec![batch(0, 3, 1)],
@@ -448,10 +448,10 @@ mod tests {
                 slots_raw: Vec::new(),
             },
             positions: vec![
-                [-2.0, 5.0, -1.0],
-                [2.0, 3.0, -1.0],
-                [-2.0, 9.0, 3.0],
-                [2.0, 1.0, 3.0],
+                [-2.0, -1.0, 5.0],
+                [2.0, -1.0, 3.0],
+                [-2.0, 3.0, 9.0],
+                [2.0, 3.0, 1.0],
             ],
             normals: Vec::new(),
             uv0: vec![[1024, -512], [0, 2048], [-1024, 512], [512, 0]],

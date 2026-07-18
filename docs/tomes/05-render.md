@@ -938,7 +938,7 @@ from a runtime slot or draw order.
 
 `fparkan-game --backend static-vulkan` is an explicit native-window experiment,
 not the default planning path. It visits only the first mission root, selects
-every prepared MSH component of that root, merges their static XZ clip-space
+every prepared MSH component of that root, merges their static XY clip-space
 geometry, and renders a requested number of frames through
 `VulkanSmokeRenderer`; teardown rejects validation warnings/errors and reports
 swapchain/readback telemetry. For each used `Batch20.material_index`, it resolves
@@ -984,7 +984,7 @@ The bounded native preview now retains the already validated `Land.msh` inside
 `TerrainWorld`; this lets the application consume source geometry through the
 runtime boundary instead of decoding archive formats a second time. It merges
 one terrain component with the first TMA root's 14 reachable MSH components in
-one explicit top-down XZ frame. The frame is computed from terrain positions
+one explicit top-down XY frame. The frame is computed from terrain positions
 and the root models after applying only the decoded TMA `position` and `scale`.
 Raw TMA orientation is deliberately excluded: its convention is not proven.
 
@@ -1005,7 +1005,7 @@ geometry and descriptor set changed; it is not an original-frame comparison.
 
 The native bridge now combines every mesh-backed visual of each selected root,
 using that root's preserved TMA `position` and `scale` in the shared diagnostic
-XZ frame. It reports the actual selected root count as `preview_roots`, rather
+XY frame. It reports the actual selected root count as `preview_roots`, rather
 than implying that all mission objects are rendered. Raw orientation, original
 camera/frustum and visibility remain unresolved.
 
@@ -1014,8 +1014,8 @@ in 59.7 seconds: 25 submitted MSH components, one terrain component and 26
 descriptors on the native 1280x720 two-image swapchain, with validation
 warnings/errors `0/0`. The readback FNV-1a remained
 `10739087367165646439`, equal to the one-root terrain/root run. That equality
-does **not** prove the second root is visible or equivalent: it is recorded as
-a camera/frustum/overlap investigation target, not hidden as a parity result.
+does **not** prove the second root is visible or equivalent: it was recorded as
+an investigation target, not hidden as a parity result.
 
 The reproducible `fparkan-cli mission inspect` probe closes two tempting but
 incorrect explanations for that equality. GOG `Autodemo.00` root 0 is
@@ -1023,11 +1023,20 @@ incorrect explanations for that equality. GOG `Autodemo.00` root 0 is
 `w_s_wlk1.dat` at `(479.12396, 795.95337, 1.6228507)`; therefore the TMA data
 is neither duplicate nor co-located. Separately, the Vulkan static submit loop
 calls `cmd_draw_indexed` for every prepared draw range and its depth comparison
-is `LESS_OR_EQUAL`. The unresolved equality is consequently evidence about the
-diagnostic camera/projection or visibility framing, not grounds to patch a
-missing draw or a `LESS` depth bug. The inspector intentionally reports raw
-orientation as well as position and scale so later camera/transform work can
-be checked against the original mission bytes.
+is `LESS_OR_EQUAL`. A later direct `Land.msh` bounds probe identified the actual
+static-viewer defect: GOG `AutoMAP/Land.msh` spans X/Y
+`0..1190.6976` but Z only `0..94.50981`; the same TMA objects use X/Y for their
+world placement and a small Z height. The old XZ CPU frame discarded the second
+horizontal TMA component and treated height as the screen axis. The renderer now
+uses a shared XY CPU frame and retains Z as geometry height. This proves only
+the source-axis convention needed by the diagnostic bridge; it does not recover
+the original camera, orientation order, culling or projection matrix.
+
+The new `fparkan-cli terrain inspect <Land.msh>` exposes these three-axis source
+bounds without a renderer. The first XY GPU rechecks were intentionally bounded
+to 120 seconds but remained at the existing `Graph` loading checkpoint and were
+terminated without a native frame/report; therefore no new readback hash or GPU
+acceptance result is claimed for the corrected projection yet.
 
 ### Camera ownership boundary from the GOG renderer
 
@@ -1051,7 +1060,7 @@ This establishes that original camera creation/selection is Terrain-owned and
 not a field that can safely be inferred from a TMA transform. It does **not**
 yet establish world-to-view matrix layout, FOV, near/far values, projection
 handedness, or initial mission camera selection. The Vulkan path must therefore
-continue to label its XZ projection as diagnostic until a dynamic capture or
+continue to label its XY projection as diagnostic until a dynamic capture or
 further Terrain disassembly proves these contracts.
 
 The public `World3D.dll!stdSetCurrentCamera` is a one-pointer `__stdcall`
@@ -1070,7 +1079,7 @@ matrix convention; they must not be treated as a usable renderer ABI yet.
 
 `Land.msh` использует отдельный geometry-only bridge: validated `TerrainFace28`
 сохраняет source triangle order, а его positions и packed UV0 попадают в тот же
-static vertex/index upload path. Для текущего диагностического viewer XZ bounds
+static vertex/index upload path. Для текущего диагностического viewer XY bounds
 нормализуются в clip-space, packed UV0 декодируется как signed `int16 / 1024`.
 Один static draw range намеренно не трактует `material_tag`, surface mask, slots
 или auxiliary streams как material/pipeline state: их связь с original terrain

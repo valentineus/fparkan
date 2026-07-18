@@ -25,8 +25,7 @@ use fparkan_assets::{
     decode_mission_payload, extend_graph_report_with_visual_dependencies, TmaProfile,
 };
 use fparkan_corpus::{discover, render_report_json, report, DiscoverOptions};
-use fparkan_inspection::inspect_archive_file;
-use fparkan_inspection::ArchiveInspection;
+use fparkan_inspection::{inspect_archive_file, inspect_land_msh_bounds_file, ArchiveInspection};
 use fparkan_path::{normalize_relative, PathPolicy};
 use fparkan_prototype::build_prototype_graph_report;
 use fparkan_resource::{resource_name, CachedResourceRepository};
@@ -42,6 +41,7 @@ const ARCHIVE_INSPECT_SCHEMA: &str = "fparkan-archive-inspect-v1";
 const PROTOTYPE_INSPECT_SCHEMA: &str = "fparkan-prototype-inspect-v1";
 const MISSION_GRAPH_SCHEMA: &str = "fparkan-mission-graph-v1";
 const MISSION_INSPECT_SCHEMA: &str = "fparkan-mission-inspect-v1";
+const TERRAIN_INSPECT_SCHEMA: &str = "fparkan-terrain-inspect-v1";
 
 #[derive(Serialize)]
 struct ArchiveInspectOutput<'a> {
@@ -115,6 +115,15 @@ struct MissionObjectInspectOutput {
 }
 
 #[derive(Serialize)]
+struct TerrainInspectOutput {
+    schema_version: &'static str,
+    path: String,
+    positions: usize,
+    min: [f32; 3],
+    max: [f32; 3],
+}
+
+#[derive(Serialize)]
 struct GraphFailureOutput {
     root_index: usize,
     edge: &'static str,
@@ -177,6 +186,10 @@ fn run(args: &[String]) -> Result<(), String> {
         [domain, command, rest @ ..] if domain == "mission" && command == "inspect" => {
             let rest = strip_format_json(rest)?;
             inspect_mission(&rest)
+        }
+        [domain, command, rest @ ..] if domain == "terrain" && command == "inspect" => {
+            let rest = strip_format_json(rest)?;
+            inspect_terrain(&rest)
         }
         _ => Err(usage()),
     }
@@ -400,6 +413,22 @@ fn inspect_archive(args: &[String]) -> Result<(), String> {
     }
 }
 
+fn inspect_terrain(args: &[String]) -> Result<(), String> {
+    let path = parse_file_path(args, "terrain inspect")?;
+    let bounds = inspect_land_msh_bounds_file(&path)?;
+    println!(
+        "{}",
+        serialize_json(&TerrainInspectOutput {
+            schema_version: TERRAIN_INSPECT_SCHEMA,
+            path: path.display().to_string(),
+            positions: bounds.positions,
+            min: bounds.min,
+            max: bounds.max,
+        })?
+    );
+    Ok(())
+}
+
 fn archive_inspect_json(
     path: &str,
     kind: &str,
@@ -416,10 +445,14 @@ fn archive_inspect_json(
 }
 
 fn parse_archive_path(args: &[String]) -> Result<PathBuf, String> {
+    parse_file_path(args, "archive inspect")
+}
+
+fn parse_file_path(args: &[String], command: &str) -> Result<PathBuf, String> {
     match args {
         [path] => Ok(PathBuf::from(path)),
         [flag, path] if flag == "--file" => Ok(PathBuf::from(path)),
-        _ => Err("archive inspect requires <file> or --file <file>".to_string()),
+        _ => Err(format!("{command} requires <file> or --file <file>")),
     }
 }
 
@@ -472,7 +505,7 @@ fn prototype_graph_requiredness_label(
 }
 
 fn usage() -> String {
-    "usage: fparkan corpus discover|validate --root <path> [--format json] | archive inspect <file> [--format json] | prototype inspect --root <path> --key <key> [--format json] | mission graph|inspect --root <path> --mission <path> [--format json]".to_string()
+    "usage: fparkan corpus discover|validate --root <path> [--format json] | archive inspect <file> [--format json] | terrain inspect <Land.msh> [--format json] | prototype inspect --root <path> --key <key> [--format json] | mission graph|inspect --root <path> --mission <path> [--format json]".to_string()
 }
 
 #[cfg(test)]
@@ -582,6 +615,23 @@ mod tests {
         assert_eq!(
             json,
             "{\"schema_version\":\"fparkan-mission-inspect-v1\",\"mission\":\"MISSIONS/test/data.tma\",\"objects\":[{\"index\":1,\"resource\":\"unit.dat\",\"position\":[1.0,2.0,3.0],\"orientation_raw\":[4.0,5.0,6.0],\"scale\":[7.0,8.0,9.0]}]}"
+        );
+    }
+
+    #[test]
+    fn terrain_inspect_output_retains_axis_bounds() {
+        let json = serialize_json(&TerrainInspectOutput {
+            schema_version: TERRAIN_INSPECT_SCHEMA,
+            path: "DATA/MAPS/AutoMAP/Land.msh".to_string(),
+            positions: 3,
+            min: [-1.0, -2.0, -3.0],
+            max: [4.0, 5.0, 6.0],
+        })
+        .expect("serialize terrain inspection");
+
+        assert_eq!(
+            json,
+            "{\"schema_version\":\"fparkan-terrain-inspect-v1\",\"path\":\"DATA/MAPS/AutoMAP/Land.msh\",\"positions\":3,\"min\":[-1.0,-2.0,-3.0],\"max\":[4.0,5.0,6.0]}"
         );
     }
 }

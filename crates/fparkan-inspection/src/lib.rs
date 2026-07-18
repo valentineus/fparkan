@@ -142,6 +142,17 @@ pub struct MapInspection {
     pub grid_height: u32,
 }
 
+/// Axis-aligned position bounds of a decoded `Land.msh`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LandMeshBoundsInspection {
+    /// Number of source positions covered by the bounds.
+    pub positions: usize,
+    /// Per-axis inclusive minimum position.
+    pub min: [f32; 3],
+    /// Per-axis inclusive maximum position.
+    pub max: [f32; 3],
+}
+
 /// Supported land file kinds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LandFileKind {
@@ -450,6 +461,46 @@ pub fn load_land_msh_from_path(path: &Path) -> Result<LandMeshDocument, String> 
     decode_land_msh(&document).map_err(|err| err.to_string())
 }
 
+/// Inspects the source-coordinate bounds of a standalone `Land.msh` file.
+///
+/// # Errors
+///
+/// Returns a string error when the file cannot be read, decoded, or contains
+/// no finite source positions.
+pub fn inspect_land_msh_bounds_file(path: &Path) -> Result<LandMeshBoundsInspection, String> {
+    let mesh = load_land_msh_from_path(path)?;
+    inspect_land_msh_bounds(&mesh)
+}
+
+/// Computes source-coordinate bounds for an already validated `Land.msh`.
+///
+/// # Errors
+///
+/// Returns a string error when the mesh has no finite source positions.
+pub fn inspect_land_msh_bounds(
+    mesh: &LandMeshDocument,
+) -> Result<LandMeshBoundsInspection, String> {
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for position in &mesh.positions {
+        if !position.iter().all(|value| value.is_finite()) {
+            return Err("Land.msh contains a non-finite source position".to_string());
+        }
+        for axis in 0..3 {
+            min[axis] = min[axis].min(position[axis]);
+            max[axis] = max[axis].max(position[axis]);
+        }
+    }
+    if mesh.positions.is_empty() {
+        return Err("Land.msh contains no source positions".to_string());
+    }
+    Ok(LandMeshBoundsInspection {
+        positions: mesh.positions.len(),
+        min,
+        max,
+    })
+}
+
 fn inspect_land_msh(document: &NresDocument) -> Result<MapInspection, String> {
     let land_msh = decode_land_msh(document).map_err(|err| err.to_string())?;
     Ok(MapInspection {
@@ -599,6 +650,7 @@ fn resource_parse_diagnostic(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fparkan_terrain_format::TerrainSlotTable;
     use std::io::Write as _;
     use std::path::PathBuf;
 
@@ -707,6 +759,31 @@ mod tests {
         assert_eq!(selected.material_fallback, MaterialFallback::Exact);
         assert_eq!(selected.texture_name, "TEX");
         assert_eq!(selected.image.rgba8, vec![0x11, 0x22, 0x33, 0x40]);
+    }
+
+    #[test]
+    fn land_mesh_bounds_preserve_each_source_axis() {
+        let mesh = LandMeshDocument {
+            streams: Vec::new(),
+            nodes_raw: Vec::new(),
+            slots: TerrainSlotTable {
+                header_raw: Vec::new(),
+                slots_raw: Vec::new(),
+            },
+            positions: vec![[4.0, -2.0, 8.0], [-3.0, 6.0, 1.0]],
+            normals: Vec::new(),
+            uv0: Vec::new(),
+            accelerator: Vec::new(),
+            aux14: Vec::new(),
+            aux18: Vec::new(),
+            faces: Vec::new(),
+        };
+
+        let bounds = inspect_land_msh_bounds(&mesh).expect("bounds");
+
+        assert_eq!(bounds.positions, 2);
+        assert_eq!(bounds.min, [-3.0, -2.0, 1.0]);
+        assert_eq!(bounds.max, [4.0, 6.0, 8.0]);
     }
 
     fn temp_dir(name: &str) -> PathBuf {

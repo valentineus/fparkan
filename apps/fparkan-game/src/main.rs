@@ -30,10 +30,10 @@ use fparkan_render::{
     RenderSnapshotDraw,
 };
 use fparkan_render_vulkan::{
-    project_land_msh_to_static_mesh_in_xz_frame, project_msh_to_static_mesh_in_xz_frame,
+    project_land_msh_to_static_mesh_in_xy_frame, project_msh_to_static_mesh_in_xy_frame,
     VulkanPlanningBackend, VulkanSmokeFrameOutcome, VulkanSmokeRenderer,
     VulkanSmokeRendererCreateInfo, VulkanStaticMaterial, VulkanStaticMesh, VulkanStaticTexture,
-    VulkanStaticXzFrame,
+    VulkanStaticXyFrame,
 };
 use fparkan_runtime::{
     create, frame, load_mission, load_mission_static_preview, load_mission_static_preview_roots,
@@ -206,7 +206,7 @@ struct StaticPreviewScene {
 }
 
 /// Projects the mission terrain plus every MSH component of the explicitly
-/// bounded static-preview root into one diagnostic XZ frame.
+/// bounded static-preview root into one diagnostic XY frame.
 ///
 /// This intentionally takes only the first MAT0 texture request for each MSH
 /// batch selector. The terrain uses an explicit white diagnostic texture;
@@ -220,7 +220,7 @@ fn static_preview_mesh_and_materials(
     let terrain_mesh = terrain
         .source_mesh()
         .ok_or_else(|| "runtime terrain does not retain its validated source mesh".to_string())?;
-    let frame = static_preview_xz_frame(assets, terrain, roots)?;
+    let frame = static_preview_xy_frame(assets, terrain, roots)?;
     let mut mesh = VulkanStaticMesh {
         vertices: Vec::new(),
         indices: Vec::new(),
@@ -234,7 +234,7 @@ fn static_preview_mesh_and_materials(
             rgba8: vec![255, 255, 255, 255],
         },
     }];
-    let terrain_component = project_land_msh_to_static_mesh_in_xz_frame(terrain_mesh, frame)
+    let terrain_component = project_land_msh_to_static_mesh_in_xy_frame(terrain_mesh, frame)
         .map_err(|err| format!("project mission terrain for Vulkan: {err}"))?;
     append_static_preview_component(&mut mesh, terrain_component, &[(0, 0)])?;
     let mut mesh_components = 0;
@@ -251,7 +251,7 @@ fn static_preview_mesh_and_materials(
             let model = assets.model_by_id(model_id).ok_or_else(|| {
                 format!("static preview visual {visual_id:?} references unknown model {model_id:?}")
             })?;
-            let component = project_msh_to_static_mesh_in_xz_frame(
+            let component = project_msh_to_static_mesh_in_xy_frame(
                 &model.validated,
                 frame,
                 root.position,
@@ -275,20 +275,20 @@ fn static_preview_mesh_and_materials(
     })
 }
 
-fn static_preview_xz_frame(
+fn static_preview_xy_frame(
     assets: &MissionAssets,
     terrain: &TerrainWorld,
     roots: &[MissionObjectDraft],
-) -> Result<VulkanStaticXzFrame, String> {
+) -> Result<VulkanStaticXyFrame, String> {
     let mut min_x = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;
-    let mut min_z = f32::INFINITY;
-    let mut max_z = f32::NEG_INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
     let terrain_positions = terrain
         .source_positions()
         .ok_or_else(|| "runtime terrain does not retain source positions".to_string())?;
     for position in terrain_positions {
-        extend_static_preview_xz_bounds(*position, &mut min_x, &mut max_x, &mut min_z, &mut max_z)?;
+        extend_static_preview_xy_bounds(*position, &mut min_x, &mut max_x, &mut min_y, &mut max_y)?;
     }
     for (object_index, root) in roots.iter().enumerate() {
         if !root
@@ -314,7 +314,7 @@ fn static_preview_xz_frame(
                 format!("static preview visual {visual_id:?} references unknown model {model_id:?}")
             })?;
             for position in &model.validated.positions {
-                extend_static_preview_xz_bounds(
+                extend_static_preview_xy_bounds(
                     [
                         position[0] * root.scale[0] + root.position[0],
                         position[1] * root.scale[1] + root.position[1],
@@ -322,30 +322,30 @@ fn static_preview_xz_frame(
                     ],
                     &mut min_x,
                     &mut max_x,
-                    &mut min_z,
-                    &mut max_z,
+                    &mut min_y,
+                    &mut max_y,
                 )?;
             }
         }
     }
-    VulkanStaticXzFrame::from_bounds(min_x, max_x, min_z, max_z)
-        .map_err(|err| format!("build static preview XZ frame: {err}"))
+    VulkanStaticXyFrame::from_bounds(min_x, max_x, min_y, max_y)
+        .map_err(|err| format!("build static preview XY frame: {err}"))
 }
 
-fn extend_static_preview_xz_bounds(
+fn extend_static_preview_xy_bounds(
     position: [f32; 3],
     min_x: &mut f32,
     max_x: &mut f32,
-    min_z: &mut f32,
-    max_z: &mut f32,
+    min_y: &mut f32,
+    max_y: &mut f32,
 ) -> Result<(), String> {
     if !position.iter().all(|value| value.is_finite()) {
-        return Err("static preview contains a non-finite XZ position".to_string());
+        return Err("static preview contains a non-finite XY position".to_string());
     }
     *min_x = min_x.min(position[0]);
     *max_x = max_x.max(position[0]);
-    *min_z = min_z.min(position[2]);
-    *max_z = max_z.max(position[2]);
+    *min_y = min_y.min(position[1]);
+    *max_y = max_y.max(position[1]);
     Ok(())
 }
 
