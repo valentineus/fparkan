@@ -1371,6 +1371,18 @@ changing the current Vulkan projection. Its float accessors deliberately leave
 the context fields unnamed; preserving a raw ABI value is safer than encoding a
 near/far or clip-space convention before it is demonstrated.
 
+The next downstream boundary is now also identified. In the canonical static
+`CBufferingCamera` vtable (`0x10066344`), slot `+0x4C` is Terrain RVA
+`0x4D9C0`; it packages the camera transform, rectangle-derived viewport data,
+FOV-derived tangent, and primary-render context values for another renderer
+component. It does not itself assemble the final projection matrix. The GOG
+`Ngi32.dll` export named `vrtSetCameraParam` resolves to a no-op compatibility
+stub, while the live process loads the Direct3D7 runtime (`D3DIM700.DLL`). The
+next recovery target is therefore the Direct3D transform consumer in
+`iron3d.dll`, not a guessed Vulkan perspective formula. The observed `0.5`,
+`700`, `0.1`, and `0.99` values remain unlabelled until that consumer proves
+their roles.
+
 A fresh no-input launch of the canonical `iron_3d.exe` did create a responsive
 window titled `Parkan. Железная Стратегия`. A read-only probe then requested
 `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ` and attempted to read the known
