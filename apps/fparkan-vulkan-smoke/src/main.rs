@@ -16,7 +16,7 @@ use fparkan_platform_winit::{window_native_handles, WinitWindowPlan};
 use fparkan_render_vulkan::{
     project_msh_to_static_mesh, VulkanSmokeBootstrapProgress, VulkanSmokeFrameOutcome,
     VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo, VulkanSmokeRendererReport,
-    VulkanSmokeShutdownReport, VulkanStaticMesh, VulkanValidationReport,
+    VulkanSmokeShutdownReport, VulkanStaticMesh, VulkanStaticTexture, VulkanValidationReport,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -56,6 +56,7 @@ fn main() {
 fn run(args: &[String]) -> Result<String, String> {
     let options = SmokeOptions::parse(args)?;
     let mesh = options.load_mesh()?;
+    let texture = options.load_texture()?;
     remove_stale_output(&options)?;
     let event_loop = EventLoop::new().map_err(|err| format!("winit event loop: {err}"))?;
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -66,7 +67,7 @@ fn run(args: &[String]) -> Result<String, String> {
         Arc::clone(&completed),
         Arc::clone(&progress),
     );
-    let mut app = SmokeApp::new(options, mesh, completed, progress);
+    let mut app = SmokeApp::new(options, mesh, texture, completed, progress);
     if let Err(err) = event_loop.run_app(&mut app) {
         app.error = Some(format!("winit event loop: {err}"));
     }
@@ -112,6 +113,14 @@ struct SmokeOptions {
     resize_frame: u32,
     timeout_seconds: u64,
     mesh_input: MeshInput,
+    texture_input: Option<ResourceInput>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResourceInput {
+    root: PathBuf,
+    archive: String,
+    name: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -148,6 +157,7 @@ impl MeshInput {
 }
 
 impl SmokeOptions {
+    #[allow(clippy::too_many_lines)]
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut out = None;
         let mut frames = DEFAULT_TARGET_FRAMES;
@@ -156,6 +166,9 @@ impl SmokeOptions {
         let mut model_root = None;
         let mut model_archive = None;
         let mut model_name = None;
+        let mut texture_root = None;
+        let mut texture_archive = None;
+        let mut texture_name = None;
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -208,6 +221,27 @@ impl SmokeOptions {
                             .ok_or_else(|| "--model-name requires a value".to_string())?,
                     );
                 }
+                "--texture-root" => {
+                    texture_root = Some(
+                        iter.next()
+                            .map(PathBuf::from)
+                            .ok_or_else(|| "--texture-root requires a path".to_string())?,
+                    );
+                }
+                "--texture-archive" => {
+                    texture_archive = Some(
+                        iter.next()
+                            .cloned()
+                            .ok_or_else(|| "--texture-archive requires a value".to_string())?,
+                    );
+                }
+                "--texture-name" => {
+                    texture_name = Some(
+                        iter.next()
+                            .cloned()
+                            .ok_or_else(|| "--texture-name requires a value".to_string())?,
+                    );
+                }
                 _ => return Err(format!("unknown native smoke option: {arg}")),
             }
         }
@@ -234,12 +268,27 @@ impl SmokeOptions {
                 );
             }
         };
+        let texture_input = match (texture_root, texture_archive, texture_name) {
+            (None, None, None) => None,
+            (Some(root), Some(archive), Some(name)) => Some(ResourceInput {
+                root,
+                archive,
+                name,
+            }),
+            _ => {
+                return Err(
+                    "--texture-root, --texture-archive and --texture-name must be supplied together"
+                        .to_string(),
+                );
+            }
+        };
         Ok(Self {
             out,
             frames,
             resize_frame,
             timeout_seconds,
             mesh_input,
+            texture_input,
         })
     }
 
@@ -256,11 +305,27 @@ impl SmokeOptions {
             }
         }
     }
+
+    fn load_texture(&self) -> Result<Option<VulkanStaticTexture>, String> {
+        self.texture_input.as_ref().map_or(Ok(None), |input| {
+            let image = fparkan_inspection::load_texture_mip0_rgba8_from_root(
+                &input.root,
+                &input.archive,
+                &input.name,
+            )?;
+            Ok(Some(VulkanStaticTexture {
+                width: image.width,
+                height: image.height,
+                rgba8: image.rgba8,
+            }))
+        })
+    }
 }
 
 struct SmokeApp {
     options: SmokeOptions,
     mesh: VulkanStaticMesh,
+    texture: Option<VulkanStaticTexture>,
     completed: Arc<AtomicBool>,
     progress: Arc<SharedSmokeProgress>,
     window_id: Option<WindowId>,
@@ -305,12 +370,14 @@ impl SmokeApp {
     fn new(
         options: SmokeOptions,
         mesh: VulkanStaticMesh,
+        texture: Option<VulkanStaticTexture>,
         completed: Arc<AtomicBool>,
         progress: Arc<SharedSmokeProgress>,
     ) -> Self {
         Self {
             options,
             mesh,
+            texture,
             completed,
             progress,
             window_id: None,
@@ -407,6 +474,23 @@ impl SmokeApp {
             mesh_name: self.options.mesh_input.name(),
             mesh_vertex_count: self.mesh.vertices.len(),
             mesh_index_count: self.mesh.indices.len(),
+            texture_source: self
+                .options
+                .texture_input
+                .as_ref()
+                .map_or("none", |_| "original-texm"),
+            texture_archive: self
+                .options
+                .texture_input
+                .as_ref()
+                .map_or("", |input| input.archive.as_str()),
+            texture_name: self
+                .options
+                .texture_input
+                .as_ref()
+                .map_or("", |input| input.name.as_str()),
+            texture_width: self.texture.as_ref().map_or(0, |texture| texture.width),
+            texture_height: self.texture.as_ref().map_or(0, |texture| texture.height),
             shader_manifest_hash: renderer
                 .as_ref()
                 .map_or("", |snapshot| snapshot.report.shader_manifest_hash.as_str()),
@@ -611,6 +695,20 @@ fn render_timeout_failure_report(
         mesh_name: options.mesh_input.name(),
         mesh_vertex_count: 0,
         mesh_index_count: 0,
+        texture_source: options
+            .texture_input
+            .as_ref()
+            .map_or("none", |_| "original-texm"),
+        texture_archive: options
+            .texture_input
+            .as_ref()
+            .map_or("", |input| input.archive.as_str()),
+        texture_name: options
+            .texture_input
+            .as_ref()
+            .map_or("", |input| input.name.as_str()),
+        texture_width: 0,
+        texture_height: 0,
         shader_manifest_hash: "",
         vulkan_loader_status: if bootstrap.loader_available {
             "available"
@@ -706,6 +804,7 @@ impl ApplicationHandler for SmokeApp {
             render_request: RenderRequest::conservative(),
             enable_validation: true,
             mesh: self.mesh.clone(),
+            texture: self.texture.clone(),
             bootstrap_progress: Some(Arc::clone(&self.progress.bootstrap)),
         }) {
             Ok(renderer) => renderer,
@@ -838,6 +937,11 @@ struct SmokeReport<'a> {
     mesh_name: &'a str,
     mesh_vertex_count: usize,
     mesh_index_count: usize,
+    texture_source: &'a str,
+    texture_archive: &'a str,
+    texture_name: &'a str,
+    texture_width: u32,
+    texture_height: u32,
     shader_manifest_hash: &'a str,
     vulkan_loader_status: &'a str,
     vulkan_instance_status: &'a str,
@@ -1080,6 +1184,7 @@ mod tests {
                 resize_frame: DEFAULT_RESIZE_FRAME,
                 timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
                 mesh_input: MeshInput::SmokeTriangle,
+                texture_input: None,
             })
         );
     }
@@ -1116,6 +1221,7 @@ mod tests {
                 resize_frame: DEFAULT_RESIZE_FRAME,
                 timeout_seconds: 45,
                 mesh_input: MeshInput::SmokeTriangle,
+                texture_input: None,
             })
         );
     }
@@ -1173,6 +1279,28 @@ mod tests {
                     .to_string()
             )
         );
+    }
+
+    #[test]
+    fn parses_original_texm_input_as_one_atomic_request() {
+        let parsed = SmokeOptions::parse(&[
+            "--out".to_string(),
+            "target/report.json".to_string(),
+            "--texture-root".to_string(),
+            "C:/GOG".to_string(),
+            "--texture-archive".to_string(),
+            "Textures.lib".to_string(),
+            "--texture-name".to_string(),
+            "DEFAULT.0".to_string(),
+        ]);
+
+        assert!(matches!(
+            parsed,
+            Ok(SmokeOptions {
+                texture_input: Some(ResourceInput { archive, name, .. }),
+                ..
+            }) if archive == "Textures.lib" && name == "DEFAULT.0"
+        ));
     }
 
     #[test]
@@ -1239,6 +1367,11 @@ mod tests {
             mesh_name: "MTCHECK.MSH",
             mesh_vertex_count: 128,
             mesh_index_count: 252,
+            texture_source: "original-texm",
+            texture_archive: "Textures.lib",
+            texture_name: "DEFAULT.0",
+            texture_width: 16,
+            texture_height: 16,
             shader_manifest_hash: "deadbeef",
             vulkan_loader_status: "available",
             vulkan_instance_status: "created",
@@ -1264,6 +1397,7 @@ mod tests {
         assert!(json.contains("\"vulkan_device_name\": \"Windows test GPU\""));
         assert!(json.contains("\"runner_architecture\": \"x86_64\""));
         assert!(json.contains("\"mesh_source\": \"original-msh\""));
+        assert!(json.contains("\"texture_source\": \"original-texm\""));
     }
 
     #[test]
@@ -1286,8 +1420,10 @@ mod tests {
                 resize_frame: DEFAULT_RESIZE_FRAME,
                 timeout_seconds: 7,
                 mesh_input: MeshInput::SmokeTriangle,
+                texture_input: None,
             },
             mesh: VulkanStaticMesh::smoke_triangle(),
+            texture: None,
             completed: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(SharedSmokeProgress::default()),
             window_id: None,

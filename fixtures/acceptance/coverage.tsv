@@ -295,7 +295,7 @@ S2-PLANNING-RENDER-007	covered	cargo test -p fparkan-render --offline capture_is
 S2-PLANNING-RENDER-008	covered-planning	cargo test -p fparkan-render --offline recording_backend_stores_captures
 S2-PLANNING-RENDER-009	covered	cargo xtask policy
 S3-VK-MESH-UPLOAD-001	covered-gpu	cargo run -p fparkan-vulkan-smoke --release --locked -- --out target/fparkan/stage3-mtcheck-msh.json --frames 300 --resize-frame 120 --timeout-seconds 90 --model-root <GOG_ROOT> --model-archive system.rlb --model-name MTCHECK.MSH; original MSH reports 128 vertices and 252 indices
-S3-VK-TEXM-UPLOAD-001	blocked	awaits Stage 3 Vulkan texture upload path
+S3-VK-TEXM-UPLOAD-001	covered-gpu	cargo run -p fparkan-vulkan-smoke --release --locked -- --out target/fparkan/stage3-mtcheck-texm-upload.json --frames 300 --resize-frame 120 --timeout-seconds 90 --model-root <GOG_ROOT> --model-archive system.rlb --model-name MTCHECK.MSH --texture-root <GOG_ROOT> --texture-archive Textures.lib --texture-name DEFAULT.0; original TEXM 16x16 decoded RGBA8, staged into device-local image and transitioned to SHADER_READ_ONLY_OPTIMAL
 S3-VK-DESCRIPTOR-001	blocked	awaits Stage 3 descriptor set contract implementation
 S3-VK-PIPELINE-001	blocked	awaits Stage 3 graphics pipeline key and cache implementation
 S3-VK-DRAW-MODEL-001	covered-gpu	cargo run -p fparkan-vulkan-smoke --release --locked -- --out target/fparkan/stage3-mtcheck-msh.json --frames 300 --resize-frame 120 --timeout-seconds 90 --model-root <GOG_ROOT> --model-archive system.rlb --model-name MTCHECK.MSH; live Win32 Vulkan indexed MSH draw/present

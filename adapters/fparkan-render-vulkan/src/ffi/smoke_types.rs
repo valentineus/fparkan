@@ -4,9 +4,9 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use super::{
-    VulkanAllocatedBuffer, VulkanFrameSync, VulkanInstanceError, VulkanInstanceProbe,
-    VulkanLogicalDeviceError, VulkanLogicalDeviceProbe, VulkanSurfaceError, VulkanSurfaceProbe,
-    VulkanSwapchainProbe, VulkanSwapchainProbeError, VulkanSwapchainResources,
+    VulkanAllocatedBuffer, VulkanAllocatedImage, VulkanFrameSync, VulkanInstanceError,
+    VulkanInstanceProbe, VulkanLogicalDeviceError, VulkanLogicalDeviceProbe, VulkanSurfaceError,
+    VulkanSurfaceProbe, VulkanSwapchainProbe, VulkanSwapchainProbeError, VulkanSwapchainResources,
     VulkanValidationMessenger,
 };
 use crate::shader_manifest::VulkanShaderManifestError;
@@ -29,6 +29,8 @@ pub struct VulkanSmokeRendererCreateInfo {
     /// This initial bridge keeps positions in clip-space. MSH transforms,
     /// materials, and textures are deliberately higher-level Stage 3 work.
     pub mesh: VulkanStaticMesh,
+    /// Optional RGBA8 texture uploaded before the first live frame.
+    pub texture: Option<VulkanStaticTexture>,
     /// Optional shared bootstrap progress tracker for failure evidence.
     pub bootstrap_progress: Option<Arc<VulkanSmokeBootstrapProgress>>,
 }
@@ -49,6 +51,38 @@ pub struct VulkanStaticMesh {
     pub vertices: Vec<VulkanStaticVertex>,
     /// Triangle-list indices into [`Self::vertices`].
     pub indices: Vec<u16>,
+}
+
+/// Decoded RGBA8 image accepted by the initial Vulkan texture upload path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VulkanStaticTexture {
+    /// Image width in texels.
+    pub width: u32,
+    /// Image height in texels.
+    pub height: u32,
+    /// Row-major RGBA8 pixels.
+    pub rgba8: Vec<u8>,
+}
+
+impl VulkanStaticTexture {
+    pub(super) fn validate(&self) -> Result<(), &'static str> {
+        let pixels = usize::try_from(self.width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(self.height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(4));
+        match pixels {
+            None => Err("static texture dimensions overflow address space"),
+            Some(0) => Err("static texture has zero extent"),
+            Some(expected) if expected != self.rgba8.len() => {
+                Err("static texture rgba8 byte count does not match extent")
+            }
+            Some(_) => Ok(()),
+        }
+    }
 }
 
 impl VulkanStaticMesh {
@@ -293,6 +327,11 @@ pub enum VulkanSmokeRendererError {
         /// Validation failure detail.
         context: &'static str,
     },
+    /// The submitted static texture cannot be represented by this path.
+    InvalidStaticTexture {
+        /// Validation failure detail.
+        context: &'static str,
+    },
     /// Internal smoke renderer state was unexpectedly absent.
     InvariantViolation {
         /// Missing state context.
@@ -315,6 +354,9 @@ impl std::fmt::Display for VulkanSmokeRendererError {
                 write!(f, "{context}: no compatible Vulkan memory type")
             }
             Self::InvalidStaticMesh { context } => write!(f, "invalid static mesh: {context}"),
+            Self::InvalidStaticTexture { context } => {
+                write!(f, "invalid static texture: {context}")
+            }
             Self::InvariantViolation { context } => {
                 write!(f, "renderer invariant violated: {context}")
             }
@@ -335,6 +377,7 @@ pub struct VulkanSmokeRenderer {
     pub(super) swapchain_resources: Option<VulkanSwapchainResources>,
     pub(super) vertex_buffer: Option<VulkanAllocatedBuffer>,
     pub(super) index_buffer: Option<VulkanAllocatedBuffer>,
+    pub(super) texture: Option<VulkanAllocatedImage>,
     pub(super) index_count: u32,
     pub(super) frame_sync: Vec<VulkanFrameSync>,
     pub(super) images_in_flight: Vec<vk::Fence>,

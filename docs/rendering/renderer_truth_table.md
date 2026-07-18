@@ -8,7 +8,7 @@
 
 | Path | Native window / swapchain | Draws pixels | Uses original assets | Acceptance class | Что доказывает | Чего не доказывает |
 | --- | --- | --- | --- | --- | --- | --- |
-| `fparkan-vulkan-smoke` / `VulkanSmokeRenderer` | Yes | Yes | Static MSH only | `covered-gpu` for Stage 0 smoke and explicit MSH bridge IDs | Loader, instance, surface, swapchain, submit/present, validation-clean triangle path; original MSH vertex/index upload and indexed draw | Texture sampling, descriptors, terrain, gameplay rendering |
+| `fparkan-vulkan-smoke` / `VulkanSmokeRenderer` | Yes | Yes | Static MSH plus TEXM upload | `covered-gpu` for Stage 0 smoke and explicit MSH/TEXM bridge IDs | Loader, instance, surface, swapchain, submit/present, validation-clean triangle path; original MSH indexed draw; TEXM RGBA8 staging upload and `SHADER_READ_ONLY_OPTIMAL` transition | Texture sampling, descriptors, terrain, gameplay rendering |
 | `VulkanPlanningBackend` | No | No | Optional CPU-side IDs only | `covered-planning` | Deterministic command validation, canonical capture, frame submission planning | Любой live GPU draw, pixel parity, validation-clean asset frame |
 | `RecordingBackend` | No | No | Optional CPU-side IDs only | `covered-planning` | Stable command capture for backend-neutral tests | Native window, Vulkan, GPU resource lifetime, pixels |
 | `NullBackend` | No | No | Optional CPU-side IDs only | Usually `covered` for validation-only rows | Command stream framing and bounds validation | Capture stability, GPU execution, pixels |
@@ -29,7 +29,7 @@
 
 ## Current repository status
 
-- Реальный Vulkan в репозитории имеет smoke triangle path и узкий static-MSH bridge: `fparkan-vulkan-smoke --model-root <GOG_ROOT> --model-archive system.rlb --model-name MTCHECK.MSH` загружает validated original MSH, разворачивает batch `base_vertex`, нормализует XZ viewer plane и выполняет real indexed draw. Это не является texture/material/terrain renderer.
+- Реальный Vulkan в репозитории имеет smoke triangle path и узкий static asset bridge: `fparkan-vulkan-smoke --model-root <GOG_ROOT> --model-archive system.rlb --model-name MTCHECK.MSH --texture-root <GOG_ROOT> --texture-archive Textures.lib --texture-name DEFAULT.0` загружает validated original MSH, разворачивает batch `base_vertex`, нормализует XZ viewer plane, выполняет real indexed draw и загружает decoded TEXM mip-0 в device-local image. Image переходится в sampling layout, но ещё не связан descriptor set-ом или fragment shader; это не texture/material/terrain renderer.
 - `apps/fparkan-game` сейчас выдает `render-planning` JSON report поверх
   synthetic window descriptor и `VulkanPlanningBackend`.
 - `apps/fparkan-viewer` сейчас inspection-only CLI и не открывает live Vulkan

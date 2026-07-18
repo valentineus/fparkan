@@ -331,6 +331,37 @@ pub fn inspect_texture_from_root(
     })
 }
 
+/// Loads a decoded TEXM document through repository-backed lookup.
+///
+/// # Errors
+///
+/// Returns a string error when the resource cannot be resolved or parsed as a
+/// valid TEXM payload.
+pub fn load_texture_from_root(
+    root: &Path,
+    archive: &str,
+    resource: &str,
+) -> Result<fparkan_texm::TexmDocument, String> {
+    let bytes = read_resource_bytes_diagnostic(root, archive, resource)
+        .map_err(|err| render_human(&err))?;
+    decode_texm(bytes).map_err(|err| err.to_string())
+}
+
+/// Loads and decodes TEXM mip 0 as RGBA8 through repository-backed lookup.
+///
+/// # Errors
+///
+/// Returns a string error when the resource cannot be resolved, decoded, or
+/// converted to the shared RGBA8 upload representation.
+pub fn load_texture_mip0_rgba8_from_root(
+    root: &Path,
+    archive: &str,
+    resource: &str,
+) -> Result<fparkan_texm::RgbaImage, String> {
+    let document = load_texture_from_root(root, archive, resource)?;
+    fparkan_texm::decode_mip_rgba8(&document, 0).map_err(|err| err.to_string())
+}
+
 /// Inspects a terrain land file by path.
 ///
 /// # Errors

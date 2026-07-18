@@ -4,15 +4,15 @@ use ash::vk;
 
 use super::{
     create_command_pool, create_frame_sync, create_static_mesh_index_buffer,
-    create_static_mesh_vertex_buffer, create_swapchain_resources, create_validation_messenger,
-    create_vulkan_instance_probe, create_vulkan_logical_device_probe_for_request,
-    create_vulkan_surface_probe, create_vulkan_swapchain_probe_for_extent,
-    destroy_allocated_buffer, destroy_swapchain_resources, plan_vulkan_surface,
-    VulkanAllocatedBuffer, VulkanInstanceConfig, VulkanInstanceProbe, VulkanLogicalDeviceProbe,
-    VulkanSmokeFrameOutcome, VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo,
-    VulkanSmokeRendererError, VulkanSmokeRendererReport, VulkanSmokeShutdownReport,
-    VulkanSurfaceProbe, VulkanSwapchainProbe, VulkanSwapchainResources, VulkanValidationMessenger,
-    VulkanValidationReport,
+    create_static_mesh_vertex_buffer, create_static_texture_image, create_swapchain_resources,
+    create_validation_messenger, create_vulkan_instance_probe,
+    create_vulkan_logical_device_probe_for_request, create_vulkan_surface_probe,
+    create_vulkan_swapchain_probe_for_extent, destroy_allocated_buffer, destroy_allocated_image,
+    destroy_swapchain_resources, plan_vulkan_surface, VulkanAllocatedBuffer, VulkanInstanceConfig,
+    VulkanInstanceProbe, VulkanLogicalDeviceProbe, VulkanSmokeFrameOutcome, VulkanSmokeRenderer,
+    VulkanSmokeRendererCreateInfo, VulkanSmokeRendererError, VulkanSmokeRendererReport,
+    VulkanSmokeShutdownReport, VulkanSurfaceProbe, VulkanSwapchainProbe, VulkanSwapchainResources,
+    VulkanValidationMessenger, VulkanValidationReport,
 };
 use crate::policy::KHR_PORTABILITY_SUBSET_EXTENSION;
 use crate::shader_manifest::{triangle_shader_manifest, validate_shader_manifest};
@@ -109,6 +109,11 @@ impl VulkanSmokeRenderer {
             .mesh
             .validate()
             .map_err(|context| VulkanSmokeRendererError::InvalidStaticMesh { context })?;
+        if let Some(texture) = &create_info.texture {
+            texture
+                .validate()
+                .map_err(|context| VulkanSmokeRendererError::InvalidStaticTexture { context })?;
+        }
         let bootstrap_progress = create_info.bootstrap_progress.as_ref();
         let shader_manifest = validate_shader_manifest(&triangle_shader_manifest())
             .map_err(VulkanSmokeRendererError::ShaderManifest)?;
@@ -176,6 +181,21 @@ impl VulkanSmokeRenderer {
                     return Err(error);
                 }
             };
+        let texture = match create_info.texture.as_ref() {
+            None => None,
+            Some(texture) => {
+                match create_static_texture_image(&instance, &device, command_pool, texture) {
+                    Ok(image) => Some(image),
+                    Err(error) => {
+                        // SAFETY: These resources belong to this live device and are rolled back before it drops.
+                        unsafe { device.device().destroy_command_pool(command_pool, None) };
+                        destroy_allocated_buffer(&device, &index_buffer);
+                        destroy_allocated_buffer(&device, &vertex_buffer);
+                        return Err(error);
+                    }
+                }
+            }
+        };
         let mut renderer = Self {
             instance: Some(instance),
             validation,
@@ -186,6 +206,7 @@ impl VulkanSmokeRenderer {
             swapchain_resources: None,
             vertex_buffer: Some(vertex_buffer),
             index_buffer: Some(index_buffer),
+            texture,
             index_count: u32::try_from(create_info.mesh.indices.len()).unwrap_or(u32::MAX),
             frame_sync: Vec::new(),
             images_in_flight: Vec::new(),
@@ -640,6 +661,9 @@ impl VulkanSmokeRenderer {
     fn destroy_device_owned_resources(&mut self) {
         self.destroy_swapchain_resources();
         if let Some(device) = self.device.as_ref() {
+            if let Some(texture) = self.texture.take() {
+                destroy_allocated_image(device, &texture);
+            }
             if let Some(buffer) = self.index_buffer.take() {
                 // SAFETY: Buffer and memory belong to this device and are destroyed once after the device has been idled and frame work has been torn down.
                 unsafe {

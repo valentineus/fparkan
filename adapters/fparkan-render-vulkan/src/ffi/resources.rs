@@ -4,11 +4,18 @@ use ash::vk;
 
 use super::{
     VulkanInstanceProbe, VulkanLogicalDeviceProbe, VulkanSmokeRendererError, VulkanStaticMesh,
+    VulkanStaticTexture,
 };
 
 pub(super) struct VulkanAllocatedBuffer {
     pub(super) buffer: vk::Buffer,
     pub(super) memory: vk::DeviceMemory,
+}
+
+pub(super) struct VulkanAllocatedImage {
+    pub(super) image: vk::Image,
+    pub(super) memory: vk::DeviceMemory,
+    pub(super) view: vk::ImageView,
 }
 
 pub(super) struct VulkanFrameSync {
@@ -68,6 +75,272 @@ pub(super) fn create_static_mesh_index_buffer(
         vk::BufferUsageFlags::INDEX_BUFFER,
         "static mesh index buffer",
     )
+}
+
+#[allow(clippy::too_many_lines)]
+pub(super) fn create_static_texture_image(
+    instance: &VulkanInstanceProbe,
+    device: &VulkanLogicalDeviceProbe,
+    command_pool: vk::CommandPool,
+    texture: &VulkanStaticTexture,
+) -> Result<VulkanAllocatedImage, VulkanSmokeRendererError> {
+    let staging = create_host_visible_buffer(
+        instance,
+        device,
+        &texture.rgba8,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+        "static texture staging buffer",
+    )?;
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(vk::Format::R8G8B8A8_UNORM)
+        .extent(vk::Extent3D {
+            width: texture.width,
+            height: texture.height,
+            depth: 1,
+        })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    // SAFETY: The create info only contains stack-owned values and a validated non-zero extent.
+    let image = unsafe { device.device().create_image(&image_info, None) }.map_err(|result| {
+        destroy_allocated_buffer(device, &staging);
+        VulkanSmokeRendererError::VulkanOperation {
+            context: "vkCreateImage(static texture)",
+            result,
+        }
+    })?;
+    // SAFETY: The image belongs to this device and is queried immediately after creation.
+    let requirements = unsafe { device.device().get_image_memory_requirements(image) };
+    let Some(memory_type_index) = find_memory_type(
+        instance,
+        device.physical_device(),
+        requirements.memory_type_bits,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    ) else {
+        // SAFETY: Both resources were created on this device and are being rolled back once.
+        unsafe { device.device().destroy_image(image, None) };
+        destroy_allocated_buffer(device, &staging);
+        return Err(VulkanSmokeRendererError::MissingMemoryType {
+            context: "static texture image",
+        });
+    };
+    let allocate_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(requirements.size)
+        .memory_type_index(memory_type_index);
+    // SAFETY: The allocation matches the image memory requirements queried above.
+    let memory = {
+        // SAFETY: The allocation matches the image memory requirements queried above.
+        unsafe { device.device().allocate_memory(&allocate_info, None) }
+    }
+    .map_err(|result| {
+        // SAFETY: Both resources were created on this device and are being rolled back once.
+        unsafe { device.device().destroy_image(image, None) };
+        destroy_allocated_buffer(device, &staging);
+        VulkanSmokeRendererError::VulkanOperation {
+            context: "vkAllocateMemory(static texture)",
+            result,
+        }
+    })?;
+    // SAFETY: The allocation matches this image's queried requirements.
+    if let Err(result) = unsafe { device.device().bind_image_memory(image, memory, 0) } {
+        // SAFETY: Both resources were created on this device and are being rolled back once.
+        unsafe {
+            device.device().destroy_image(image, None);
+            device.device().free_memory(memory, None);
+        };
+        destroy_allocated_buffer(device, &staging);
+        return Err(VulkanSmokeRendererError::VulkanOperation {
+            context: "vkBindImageMemory(static texture)",
+            result,
+        });
+    }
+    if let Err(error) = upload_static_texture(
+        device,
+        command_pool,
+        staging.buffer,
+        image,
+        texture.width,
+        texture.height,
+    ) {
+        // SAFETY: Both resources were created on this device and are being rolled back once.
+        unsafe {
+            device.device().destroy_image(image, None);
+            device.device().free_memory(memory, None);
+        };
+        destroy_allocated_buffer(device, &staging);
+        return Err(error);
+    }
+    destroy_allocated_buffer(device, &staging);
+    let view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(vk::Format::R8G8B8A8_UNORM)
+        .subresource_range(color_subresource_range());
+    // SAFETY: The image is live, initialized and has the stated color subresource.
+    let view = {
+        // SAFETY: The image is live, initialized and has the stated color subresource.
+        unsafe { device.device().create_image_view(&view_info, None) }
+    }
+    .map_err(|result| {
+        // SAFETY: Both resources were created on this device and are being rolled back once.
+        unsafe {
+            device.device().destroy_image(image, None);
+            device.device().free_memory(memory, None);
+        };
+        VulkanSmokeRendererError::VulkanOperation {
+            context: "vkCreateImageView(static texture)",
+            result,
+        }
+    })?;
+    Ok(VulkanAllocatedImage {
+        image,
+        memory,
+        view,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn upload_static_texture(
+    device: &VulkanLogicalDeviceProbe,
+    command_pool: vk::CommandPool,
+    staging_buffer: vk::Buffer,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+) -> Result<(), VulkanSmokeRendererError> {
+    let allocate_info = vk::CommandBufferAllocateInfo::default()
+        .command_pool(command_pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(1);
+    // SAFETY: The command pool is live and owned by the current logical device.
+    let command_buffer = unsafe { device.device().allocate_command_buffers(&allocate_info) }
+        .map_err(|result| VulkanSmokeRendererError::VulkanOperation {
+            context: "vkAllocateCommandBuffers(texture upload)",
+            result,
+        })?[0];
+    let begin =
+        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    // SAFETY: The command buffer is freshly allocated from the current pool.
+    if let Err(result) = unsafe { device.device().begin_command_buffer(command_buffer, &begin) } {
+        // SAFETY: The command buffer belongs to this pool and is released on failure.
+        unsafe {
+            device
+                .device()
+                .free_command_buffers(command_pool, &[command_buffer]);
+        };
+        return Err(VulkanSmokeRendererError::VulkanOperation {
+            context: "vkBeginCommandBuffer(texture upload)",
+            result,
+        });
+    }
+    let range = color_subresource_range();
+    let to_transfer = vk::ImageMemoryBarrier::default()
+        .old_layout(vk::ImageLayout::UNDEFINED)
+        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .src_access_mask(vk::AccessFlags::empty())
+        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .image(image)
+        .subresource_range(range);
+    let region = vk::BufferImageCopy::default()
+        .image_subresource(
+            vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .mip_level(0)
+                .base_array_layer(0)
+                .layer_count(1),
+        )
+        .image_extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        });
+    let to_sampled = vk::ImageMemoryBarrier::default()
+        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+        .image(image)
+        .subresource_range(range);
+    // SAFETY: The commands operate on live, exclusively owned resources and the stated color subresource.
+    unsafe {
+        device.device().cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_transfer],
+        );
+        device.device().cmd_copy_buffer_to_image(
+            command_buffer,
+            staging_buffer,
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[region],
+        );
+        device.device().cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_sampled],
+        );
+    }
+    // SAFETY: Command recording is complete on the current command buffer.
+    if let Err(result) = unsafe { device.device().end_command_buffer(command_buffer) } {
+        // SAFETY: The command buffer belongs to this pool and is released on failure.
+        unsafe {
+            device
+                .device()
+                .free_command_buffers(command_pool, &[command_buffer]);
+        };
+        return Err(VulkanSmokeRendererError::VulkanOperation {
+            context: "vkEndCommandBuffer(texture upload)",
+            result,
+        });
+    }
+    let command_buffers = [command_buffer];
+    let submit = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+    // SAFETY: The graphics queue and submitted command buffer are live for the duration of the wait.
+    let submit_result = unsafe {
+        device
+            .device()
+            .queue_submit(device.graphics_queue(), &submit, vk::Fence::null())
+    };
+    let result = submit_result.and_then(|()| {
+        // SAFETY: The graphics queue remains live until the synchronous idle wait completes.
+        unsafe { device.device().queue_wait_idle(device.graphics_queue()) }
+    });
+    // SAFETY: Submission completed or failed synchronously and the command buffer is no longer needed.
+    unsafe {
+        device
+            .device()
+            .free_command_buffers(command_pool, &[command_buffer]);
+    };
+    result.map_err(|result| VulkanSmokeRendererError::VulkanOperation {
+        context: "vkQueueSubmit/WaitIdle(texture upload)",
+        result,
+    })
+}
+
+pub(super) fn destroy_allocated_image(
+    device: &VulkanLogicalDeviceProbe,
+    image: &VulkanAllocatedImage,
+) {
+    // SAFETY: The image, view and allocation belong to this device and are destroyed once after idle.
+    unsafe {
+        device.device().destroy_image_view(image.view, None);
+        device.device().destroy_image(image.image, None);
+        device.device().free_memory(image.memory, None);
+    };
 }
 
 fn create_host_visible_buffer(
