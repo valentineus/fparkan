@@ -9,11 +9,11 @@ use super::{
     create_validation_messenger, create_vulkan_instance_probe,
     create_vulkan_logical_device_probe_for_request, create_vulkan_surface_probe,
     create_vulkan_swapchain_probe_for_extent, destroy_allocated_buffer, destroy_allocated_image,
-    destroy_swapchain_resources, plan_vulkan_surface, VulkanAllocatedBuffer, VulkanInstanceConfig,
-    VulkanInstanceProbe, VulkanLogicalDeviceProbe, VulkanSmokeFrameOutcome, VulkanSmokeRenderer,
-    VulkanSmokeRendererCreateInfo, VulkanSmokeRendererError, VulkanSmokeRendererReport,
-    VulkanSmokeShutdownReport, VulkanSurfaceProbe, VulkanSwapchainProbe, VulkanSwapchainResources,
-    VulkanValidationMessenger, VulkanValidationReport,
+    destroy_swapchain_resources, plan_vulkan_surface, readback_buffer_bytes, VulkanAllocatedBuffer,
+    VulkanInstanceConfig, VulkanInstanceProbe, VulkanLogicalDeviceProbe, VulkanSmokeFrameOutcome,
+    VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo, VulkanSmokeRendererError,
+    VulkanSmokeRendererReport, VulkanSmokeShutdownReport, VulkanSurfaceProbe, VulkanSwapchainProbe,
+    VulkanSwapchainResources, VulkanValidationMessenger, VulkanValidationReport,
 };
 use crate::policy::KHR_PORTABILITY_SUBSET_EXTENSION;
 use crate::shader_manifest::{triangle_shader_manifest, validate_shader_manifest};
@@ -242,6 +242,9 @@ impl VulkanSmokeRenderer {
                 swapchain_extent: (0, 0),
                 swapchain_image_count: 0,
                 swapchain_image_usage: 0,
+                readback_copy_count: 0,
+                readback_byte_count: 0,
+                readback_fnv1a64: 0,
             },
         };
         renderer.rebuild_swapchain_resources(false)?;
@@ -270,6 +273,9 @@ impl VulkanSmokeRenderer {
             swapchain_extent: swapchain_ref.report.plan.extent,
             swapchain_image_count: swapchain_ref.report.image_count,
             swapchain_image_usage: swapchain_ref.report.plan.image_usage,
+            readback_copy_count: 0,
+            readback_byte_count: 0,
+            readback_fnv1a64: 0,
         };
         Ok(renderer)
     }
@@ -476,6 +482,9 @@ impl VulkanSmokeRenderer {
             context: "vkQueueSubmit",
             result: error,
         })?;
+        if !self.resources_ref()?.readback_buffers.is_empty() {
+            self.report.readback_copy_count = self.report.readback_copy_count.saturating_add(1);
+        }
 
         let present_wait = [render_finished];
         let swapchains = [self.swapchain_ref()?.swapchain()];
@@ -700,6 +709,64 @@ impl VulkanSmokeRenderer {
                 );
             }
             device.device().cmd_end_render_pass(command_buffer);
+            if let (Some(image), Some(readback)) = (
+                resources.images.get(image_index),
+                resources.readback_buffers.get(image_index),
+            ) {
+                let range = super::color_subresource_range();
+                let to_transfer = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .image(*image)
+                    .subresource_range(range);
+                let back_to_present = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .dst_access_mask(vk::AccessFlags::empty())
+                    .image(*image)
+                    .subresource_range(range);
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(0)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D {
+                        width: swapchain.report.plan.extent.0,
+                        height: swapchain.report.plan.extent.1,
+                        depth: 1,
+                    });
+                device.device().cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_transfer],
+                );
+                device.device().cmd_copy_image_to_buffer(
+                    command_buffer,
+                    *image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    readback.buffer,
+                    &[region],
+                );
+                device.device().cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[back_to_present],
+                );
+            }
         }
 
         // SAFETY: The render pass owns the attachment layout transitions for this clear-and-present path.
@@ -766,7 +833,7 @@ impl VulkanSmokeRenderer {
     }
 
     fn shutdown_inner(&mut self) -> Result<VulkanSmokeShutdownReport, VulkanSmokeRendererError> {
-        if let Some(device) = self.device.as_ref() {
+        let completed_readback = if let Some(device) = self.device.as_ref() {
             // SAFETY: The logical device remains live until teardown finishes and idling prevents in-flight work from touching swapchain, buffers, sync objects or the command pool after destruction starts.
             unsafe { device.device().device_wait_idle() }.map_err(|error| {
                 VulkanSmokeRendererError::VulkanOperation {
@@ -774,6 +841,13 @@ impl VulkanSmokeRenderer {
                     result: error,
                 }
             })?;
+            self.completed_readback(device)?
+        } else {
+            None
+        };
+        if let Some((byte_count, hash)) = completed_readback {
+            self.report.readback_byte_count = byte_count;
+            self.report.readback_fnv1a64 = hash;
         }
         self.destroy_device_owned_resources();
         let validation = take_runtime_children_with_validation_snapshot(
@@ -791,6 +865,40 @@ impl VulkanSmokeRenderer {
             swapchain_recreate_count: self.swapchain_recreate_count,
             validation,
         })
+    }
+
+    fn completed_readback(
+        &self,
+        device: &VulkanLogicalDeviceProbe,
+    ) -> Result<Option<(u64, u64)>, VulkanSmokeRendererError> {
+        let Some(resources) = self.swapchain_resources.as_ref() else {
+            return Ok(None);
+        };
+        let byte_len = usize::try_from(self.report.swapchain_extent.0)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(self.report.swapchain_extent.1)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "completed readback byte length",
+            })?;
+        if resources.readback_buffers.is_empty() {
+            return Ok(None);
+        }
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        let mut byte_count = 0_u64;
+        for buffer in &resources.readback_buffers {
+            let bytes = readback_buffer_bytes(device, buffer, byte_len)?;
+            for byte in bytes {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            byte_count = byte_count.saturating_add(u64::try_from(byte_len).unwrap_or(u64::MAX));
+        }
+        Ok(Some((byte_count, hash)))
     }
 
     fn teardown(&mut self) {

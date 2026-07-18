@@ -16,6 +16,8 @@ use super::{
 
 pub(super) struct VulkanSwapchainResources {
     pub(super) image_views: Vec<vk::ImageView>,
+    pub(super) images: Vec<vk::Image>,
+    pub(super) readback_buffers: Vec<VulkanAllocatedBuffer>,
     pub(super) depth_attachment: VulkanDepthAttachment,
     pub(super) render_pass: vk::RenderPass,
     pub(super) pipeline_layout: vk::PipelineLayout,
@@ -31,6 +33,7 @@ pub(super) struct VulkanSwapchainResources {
 
 struct PartialSwapchainResources {
     image_views: Vec<vk::ImageView>,
+    readback_buffers: Vec<VulkanAllocatedBuffer>,
     depth_attachment: Option<VulkanDepthAttachment>,
     render_pass: Option<vk::RenderPass>,
     pipeline_layout: Option<vk::PipelineLayout>,
@@ -71,6 +74,7 @@ pub(super) fn create_swapchain_resources(
             &images,
             swapchain.report.plan.format.format,
         )?,
+        readback_buffers: Vec::new(),
         depth_attachment: None,
         render_pass: None,
         pipeline_layout: None,
@@ -127,6 +131,30 @@ pub(super) fn create_swapchain_resources(
         }
     };
     partial.framebuffers = framebuffers;
+    if vk::ImageUsageFlags::from_raw(swapchain.report.plan.image_usage)
+        .contains(vk::ImageUsageFlags::TRANSFER_SRC)
+    {
+        let byte_len = usize::try_from(swapchain.report.plan.extent.0)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(swapchain.report.plan.extent.1)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "swapchain readback byte length",
+            })?;
+        for _ in &images {
+            match super::create_readback_buffer(instance, device, byte_len) {
+                Ok(buffer) => partial.readback_buffers.push(buffer),
+                Err(error) => {
+                    destroy_partial_swapchain_resources(device, command_pool, partial);
+                    return Err(error);
+                }
+            }
+        }
+    }
     reset_reusable_command_pool(device, command_pool, reuse_command_pool)?;
     let command_buffers = match allocate_command_buffers(
         device,
@@ -150,6 +178,8 @@ pub(super) fn create_swapchain_resources(
             })?;
     Ok(VulkanSwapchainResources {
         image_views: partial.image_views,
+        images,
+        readback_buffers: partial.readback_buffers,
         depth_attachment,
         render_pass,
         pipeline_layout,
@@ -795,6 +825,10 @@ pub(super) fn destroy_swapchain_resources(
         for image_view in resources.image_views {
             device.device().destroy_image_view(image_view, None);
         }
+        for buffer in resources.readback_buffers {
+            device.device().destroy_buffer(buffer.buffer, None);
+            device.device().free_memory(buffer.memory, None);
+        }
     }
 }
 
@@ -842,6 +876,10 @@ fn destroy_partial_swapchain_resources(
         }
         for image_view in partial.image_views {
             device.device().destroy_image_view(image_view, None);
+        }
+        for buffer in partial.readback_buffers {
+            device.device().destroy_buffer(buffer.buffer, None);
+            device.device().free_memory(buffer.memory, None);
         }
     }
 }

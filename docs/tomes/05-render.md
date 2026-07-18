@@ -875,6 +875,26 @@ events, 2 swapchain recreations, Vulkan validation warnings/errors `0/0`.
 Следующий шаг должен выполнить явный image-to-buffer copy и сравнить полученные
 bytes с зафиксированным reference capture.
 
+### First synchronized Vulkan pixel-readback artifact
+
+Stage 3 static viewer теперь выполняет фактический readback для surface с
+`TRANSFER_SRC`: на каждый swapchain image создаётся host-visible coherent
+`TRANSFER_DST` buffer. После render pass command buffer переводит image из
+`PRESENT_SRC_KHR` в `TRANSFER_SRC_OPTIMAL`, выполняет `vkCmdCopyImageToBuffer`
+и возвращает image в `PRESENT_SRC_KHR`. CPU отображает memory только после
+`vkDeviceWaitIdle` during shutdown; это исключает чтение GPU work in flight.
+Smoke JSON фиксирует число записанных copy-команд, final byte count и FNV-1a-64
+hash всех current-swapchain readback buffers, не сохраняя игровые pixels в
+репозитории.
+
+На GOG `MTCHECK.MSH`/`DEFAULT.0` AMD Radeon Pro WX 3200 Series выполнил 300
+copy-команд, final artifact 4,147,200 bytes и hash `2184179010340020629` при
+validation warnings/errors `0/0`. Повторный идентичный запуск дал тот же
+размер и hash. Это доказывает Vulkan copy/readback path только для нашего
+static viewer. Он ещё не захватывает original DirectDraw frame, не задаёт
+fixed original camera и не сравнивает два изображения, поэтому pixel-parity
+acceptance остаётся blocked.
+
 `Land.msh` использует отдельный geometry-only bridge: validated `TerrainFace28`
 сохраняет source triangle order, а его positions и packed UV0 попадают в тот же
 static vertex/index upload path. Для текущего диагностического viewer XZ bounds

@@ -459,6 +459,12 @@ pub struct VulkanSmokeRendererReport {
     pub swapchain_image_count: u32,
     /// Current swapchain image-usage flags as raw Vulkan bits.
     pub swapchain_image_usage: u32,
+    /// Number of submitted swapchain image-to-buffer copy commands.
+    pub readback_copy_count: u64,
+    /// Byte length of the final completed readback artifact.
+    pub readback_byte_count: u64,
+    /// Stable FNV-1a hash of the final completed readback artifact.
+    pub readback_fnv1a64: u64,
 }
 
 /// Measured validation counters from the live smoke loop.

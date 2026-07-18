@@ -781,6 +781,15 @@ impl SmokeApp {
             vulkan_swapchain_image_usage: renderer
                 .as_ref()
                 .map_or(0, |snapshot| snapshot.report.swapchain_image_usage),
+            vulkan_readback_copy_count: renderer
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.report.readback_copy_count),
+            vulkan_readback_byte_count: renderer
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.report.readback_byte_count),
+            vulkan_readback_fnv1a64: renderer
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.report.readback_fnv1a64),
             vulkan_portability_enumeration: renderer
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.report.portability_enumeration),
@@ -984,6 +993,9 @@ fn render_timeout_failure_report(
         vulkan_swapchain_height: 0,
         vulkan_swapchain_image_count: 0,
         vulkan_swapchain_image_usage: 0,
+        vulkan_readback_copy_count: 0,
+        vulkan_readback_byte_count: 0,
+        vulkan_readback_fnv1a64: 0,
         vulkan_portability_enumeration: false,
         vulkan_portability_subset_enabled: false,
     };
@@ -1205,6 +1217,9 @@ struct SmokeReport<'a> {
     vulkan_swapchain_height: u32,
     vulkan_swapchain_image_count: u32,
     vulkan_swapchain_image_usage: u32,
+    vulkan_readback_copy_count: u64,
+    vulkan_readback_byte_count: u64,
+    vulkan_readback_fnv1a64: u64,
     vulkan_portability_enumeration: bool,
     vulkan_portability_subset_enabled: bool,
 }
@@ -1709,6 +1724,9 @@ mod tests {
             vulkan_swapchain_height: 540,
             vulkan_swapchain_image_count: 3,
             vulkan_swapchain_image_usage: 17,
+            vulkan_readback_copy_count: 300,
+            vulkan_readback_byte_count: 4_147_200,
+            vulkan_readback_fnv1a64: 0x1234_5678_90ab_cdef,
             vulkan_portability_enumeration: false,
             vulkan_portability_subset_enabled: false,
         })
@@ -1721,6 +1739,8 @@ mod tests {
         assert!(json.contains("\"mesh_source\": \"original-msh\""));
         assert!(json.contains("\"mesh_draw_count\": 1"));
         assert!(json.contains("\"texture_source\": \"original-texm\""));
+        assert!(json.contains("\"vulkan_readback_copy_count\": 300"));
+        assert!(json.contains("\"vulkan_readback_byte_count\": 4147200"));
     }
 
     #[test]

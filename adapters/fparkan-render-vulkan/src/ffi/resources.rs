@@ -698,6 +698,49 @@ pub(super) fn destroy_allocated_buffer(
     }
 }
 
+/// Allocates a host-coherent transfer destination for a swapchain image copy.
+pub(super) fn create_readback_buffer(
+    instance: &VulkanInstanceProbe,
+    device: &VulkanLogicalDeviceProbe,
+    byte_len: usize,
+) -> Result<VulkanAllocatedBuffer, VulkanSmokeRendererError> {
+    create_host_visible_buffer(
+        instance,
+        device,
+        &vec![0; byte_len],
+        vk::BufferUsageFlags::TRANSFER_DST,
+        "vkCreateBuffer(readback)",
+    )
+}
+
+/// Copies a completed host-coherent readback allocation into CPU-owned bytes.
+pub(super) fn readback_buffer_bytes(
+    device: &VulkanLogicalDeviceProbe,
+    buffer: &VulkanAllocatedBuffer,
+    byte_len: usize,
+) -> Result<Vec<u8>, VulkanSmokeRendererError> {
+    // SAFETY: The caller waits for device idle before mapping this host-visible allocation.
+    let mapped = unsafe {
+        device.device().map_memory(
+            buffer.memory,
+            0,
+            u64::try_from(byte_len).unwrap_or(u64::MAX),
+            vk::MemoryMapFlags::empty(),
+        )
+    }
+    .map_err(|result| VulkanSmokeRendererError::VulkanOperation {
+        context: "vkMapMemory(readback)",
+        result,
+    })?;
+    let mut bytes = vec![0; byte_len];
+    // SAFETY: Both ranges contain exactly byte_len initialized bytes and do not overlap.
+    unsafe {
+        std::ptr::copy_nonoverlapping(mapped.cast::<u8>(), bytes.as_mut_ptr(), byte_len);
+        device.device().unmap_memory(buffer.memory);
+    }
+    Ok(bytes)
+}
+
 pub(super) fn color_subresource_range() -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
