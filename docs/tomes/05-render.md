@@ -1586,12 +1586,13 @@ fields, while `LandMeshDocument::slot_material_pairs` decodes the selected
 type-11 entries as `{ material_lookup: u16, flags: u16 }`. Flag `0x0010` is a
 proven batch boundary in `GetShade`. Crucially, this lookup does **not** select
 either map-local Land table: the `GetShade` constructor loads its own one-table
-manager from `system.rlb` resource `Shade.wea`, so the 16-bit value is that
-manager's table-zero row. `TerrainMaterialPair::shade_selection` records this
-separate selector instead of conflating it with `Land1.wea`/`Land2.wea`. The
-AutoDemo inspector now reports 128 slots, 3,174 addressed shade pairs, selector
-range `0..3173`, and 392 `0x0010` batch boundaries. The meanings of remaining
-flags and the final blend operation remain unassigned.
+manager from `system.rlb` resource `Shade.wea`. That WEAR table has one row,
+`LIGHT1`, whereas AutoDemo's 3,174 pairs use keys `0..3173`; therefore the
+16-bit value is an opaque manager lookup/cache key, **not** a table-row
+selector. `TerrainMaterialPair::shade_lookup_key` records this separate key
+without conflating it with `Land1.wea`/`Land2.wea`. The AutoDemo inspector now
+reports 128 slots and 392 `0x0010` batch boundaries. The meanings of remaining
+flags, this cache mapping, and the final blend operation remain unassigned.
 
 The static Vulkan bridge now carries each contiguous face run as a separate
 draw range keyed by the original packed `material_tag`; it neither reorders

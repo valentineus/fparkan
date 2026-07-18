@@ -146,6 +146,19 @@ pub struct WearMaterialTexture {
     pub image: fparkan_texm::RgbaImage,
 }
 
+/// Compact inspection summary of a WEAR resource stored in an archive.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WearInspection {
+    /// Number of material rows.
+    pub materials: usize,
+    /// Number of lightmap rows.
+    pub lightmaps: usize,
+    /// First material resource name, when present.
+    pub first_material: Option<String>,
+    /// Last material resource name, when present.
+    pub last_material: Option<String>,
+}
+
 /// Land map/msh inspection payload.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MapInspection {
@@ -371,6 +384,34 @@ pub fn inspect_model_from_root(
             .animation
             .as_ref()
             .map(|animation| animation.frame_count),
+    })
+}
+
+/// Inspects a WEAR resource through repository-backed lookup.
+///
+/// # Errors
+///
+/// Returns a string error when the resource cannot be resolved or parsed as a
+/// valid WEAR payload.
+pub fn inspect_wear_from_root(
+    root: &Path,
+    archive: &str,
+    resource: &str,
+) -> Result<WearInspection, String> {
+    let bytes = read_resource_bytes_diagnostic(root, archive, resource)
+        .map_err(|err| render_human(&err))?;
+    let wear = decode_wear(&bytes).map_err(|err| err.to_string())?;
+    Ok(WearInspection {
+        materials: wear.entries.len(),
+        lightmaps: wear.lightmaps.len(),
+        first_material: wear
+            .entries
+            .first()
+            .map(|entry| String::from_utf8_lossy(&entry.material.0).into_owned()),
+        last_material: wear
+            .entries
+            .last()
+            .map(|entry| String::from_utf8_lossy(&entry.material.0).into_owned()),
     })
 }
 
