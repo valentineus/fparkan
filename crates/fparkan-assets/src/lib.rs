@@ -1124,6 +1124,7 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
         .map_or(0, |value| value.saturating_add(1));
     let mut diffuse_texture_validation = HashMap::new();
     let mut lightmap_texture_validation = HashMap::new();
+    let mut material_validation = HashMap::new();
 
     for (prototype_index, prototype) in prototypes.iter().enumerate() {
         let PrototypeGeometry::Mesh(mesh) = &prototype.geometry else {
@@ -1190,7 +1191,12 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
                         );
                         continue;
                     };
-                    match resolve_material(repository, &table, material_index) {
+                    match resolve_material_validation_cached(
+                        repository,
+                        &table,
+                        material_index,
+                        &mut material_validation,
+                    ) {
                         Ok(material) => {
                             report.material_resolved_count += 1;
                             let material_key = ResourceKey {
@@ -1897,6 +1903,31 @@ fn resolve_texm_validation_cached<R: ResourceRepository>(
     }
     let result = resolve_texm(repository, name, archive, label).map_err(|error| error.to_string());
     cache.insert(name.0.clone(), result.clone());
+    result
+}
+
+fn resolve_material_validation_cached<R: ResourceRepository>(
+    repository: &R,
+    table: &WearTable,
+    index: u16,
+    cache: &mut HashMap<Vec<u8>, Result<ResolvedMaterial, String>>,
+) -> Result<ResolvedMaterial, String> {
+    let request = table
+        .entries
+        .get(usize::from(index))
+        .ok_or(MaterialError::WearIndexOutOfBounds {
+            index,
+            count: table.entries.len(),
+        })
+        .map_err(|error| error.to_string())?
+        .material
+        .0
+        .clone();
+    if let Some(result) = cache.get(&request) {
+        return result.clone();
+    }
+    let result = resolve_material(repository, table, index).map_err(|error| error.to_string());
+    cache.insert(request, result.clone());
     result
 }
 

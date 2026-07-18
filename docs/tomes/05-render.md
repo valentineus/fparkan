@@ -1063,6 +1063,14 @@ provenance while avoiding repeat format work for repeated components. The same
 demonstrate an additional checkpoint advance from this cache; it must not be
 reported as a measured startup improvement.
 
+Visual-graph material resolution now also caches the complete success or failure
+of each WEAR material request. Every material edge and failure remains in the
+graph; the cache only avoids reopening and decoding an already resolved MAT0.
+Under the controlled 60-second GOG first-root probe, the phase sequence advanced
+from `GraphVisuals` to `AssetModelMeshes`, `AssetWearTables`, then
+`AssetTextures` before termination. This is a bounded timing observation, not a
+claim that a frame completed or that every run has identical timing.
+
 `Assets` now has four ordered diagnostic sub-checkpoints: `AssetModelMeshes`
 (MSH), `AssetWearTables` (WEAR), `AssetMaterials` (MAT0) and `AssetTextures`
 (diffuse TEXM and lightmaps). The callback is observational: it neither changes
