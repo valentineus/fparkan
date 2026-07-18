@@ -1103,8 +1103,9 @@ is only the last phase reached in one run: it is not proof of a single global
 bottleneck or of Vulkan involvement.
 
 Visual expansion now reports each dependency-class entrance, its first request
-and every 64th later request; this is diagnostic-only and does not alter
-traversal, edges or validation. A
+and every 64th later request; runtime progress persists MAT0/TEXM counts at
+those boundaries. This is diagnostic-only and does not alter traversal, edges
+or validation. A
 later controlled 180-second Part 2 probe ended at `GraphVisualMaterials`,
 before the first TEXM progress marker. The differing checkpoints rule out the
 previous overly narrow claim that TEXM is the sole remaining target. Profiling
@@ -1117,6 +1118,13 @@ the growing graph; graph content, node/edge IDs and provenance remain
 unchanged. The same controlled 180-second Part 2 probe still ended at
 `GraphVisualMaterials`, so this is a complexity/correctness improvement rather
 than measured evidence of a startup checkpoint advance.
+
+The MAT0 counter now records `GraphVisualMaterialRequests(N)` with the same
+64-request throttle. A fresh controlled Part 2 probe ended at
+`GraphVisualMaterialRequests(71)`: at least 71 MAT0 requests had begun before
+termination. It does not preserve the simultaneous TEXM count, so it neither
+identifies a slow individual material nor attributes time to MAT0 parsing; the
+next profiler revision needs one cumulative snapshot of all classes.
 
 Mission loading now raises the decoded-payload cache entry budget from 64 to
 256 while retaining its 64 MiB byte budget. This avoids premature entry-count

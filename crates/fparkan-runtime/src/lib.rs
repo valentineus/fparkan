@@ -125,6 +125,8 @@ pub enum MissionLoadPhase {
     GraphVisualWears,
     /// Resolve MAT0 documents while expanding visual dependencies.
     GraphVisualMaterials,
+    /// Progress marker emitted after each 64 MAT0 validation requests.
+    GraphVisualMaterialRequests(usize),
     /// Validate TEXM documents while expanding visual dependencies.
     GraphVisualTextures,
     /// Progress marker emitted after each 64 TEXM validation requests.
@@ -723,12 +725,19 @@ fn load_mission_with_options_and_progress(
                 record_load_phase(&mut trace, &mut on_phase, runtime_phase);
                 last_graph_visual_phase = Some(runtime_phase);
             }
-            if progress.phase == VisualDependencyPhase::Texture && progress.request_count > 1 {
-                record_load_phase(
-                    &mut trace,
-                    &mut on_phase,
-                    MissionLoadPhase::GraphVisualTextureRequests(progress.request_count),
-                );
+            if progress.request_count > 1 {
+                let request_phase = match progress.phase {
+                    VisualDependencyPhase::Wear => None,
+                    VisualDependencyPhase::Material => Some(
+                        MissionLoadPhase::GraphVisualMaterialRequests(progress.request_count),
+                    ),
+                    VisualDependencyPhase::Texture => Some(
+                        MissionLoadPhase::GraphVisualTextureRequests(progress.request_count),
+                    ),
+                };
+                if let Some(request_phase) = request_phase {
+                    record_load_phase(&mut trace, &mut on_phase, request_phase);
+                }
             }
         },
     );
