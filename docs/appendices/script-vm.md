@@ -24,10 +24,13 @@ defaults и bindings она dispatches Init/start, на каждом tick обн
 budget. Опасное удаление идёт через World3D queue и общий deferred lifecycle.
 
 До восстановления opcode table package mode читает header/strings/symbols/
-event offsets/raw bytecode losslessly. Disassembly mode использует подтверждённую
-`ai.dll` jump table. Unknown opcode нельзя пропустить как один byte: это ломает
-синхронизацию. Для каждого доказанного opcode фиксируются number, size,
-operands, control flow, effects, errors и минимальный test.
+event offsets/raw bytecode losslessly. Статический анализ уже выделил отдельный
+five-way evaluator condition records (`ai.dll` VA `0x10005180`): tags `1..5`,
+type guards, object lookup и completion flag. Это не следует выдавать за
+instruction dispatcher или jump table `.scr`: bytecode opcode table всё ещё
+требует отдельного доказательства. Unknown opcode нельзя пропустить как один
+byte: это ломает синхронизацию. Для каждого доказанного opcode фиксируются
+number, size, operands, control flow, effects, errors и минимальный test.
 
 TMA properties остаются four raw `u32` words плюс имя, пока consumer/schema не
 задаст тип (integer/float bits/ObjectId/enum/fixed-point/index). В том числе

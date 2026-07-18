@@ -154,6 +154,36 @@ IDs и отправляет команды через игровые interfaces,
 открытым направлением. До появления decompiler-а `.scr` binary body сохраняется
 lossless, а доказанные symbol/event tables документируются отдельно.
 
+### Подтверждённый evaluator выражений
+
+Ghidra 12.1.2 decompile GOG `ai.dll` фиксирует отдельный evaluator по VA
+`0x10005180` (не dispatcher инструкций `.scr`). Он получает индекс записи,
+ищет её в контейнере `this + 0x34`, переключается по `u32 tag` в offset `+0`
+и при успешном результате пишет completion byte в `+0x0c`. Из кода доказаны
+ровно пять ветвей `tag = 1..5`; `tag = 1..3` требуют `u32` subtype в
+`+0x04 == 0`, а `tag = 4..5` — `+0x04 == 1`. Поле payload находится по
+`+0x08`.
+
+Ветки 1--3 делают lookup через object/interface, достижимый от
+`this + 0x60 + 0x35c`, и используют его virtual slot `+0x1c`. Ветка 2
+дополнительно читает virtual slots `+0x10`/`+0x18` возвращённого объекта и
+разрешает result tags `1`, `0x12`, `0x13`. Ветка 3 сравнивает virtual slot
+`+0x44` с текущим object value. Ветки 4--5 используют `payload` как index в
+контейнере `this + 0x4c`, обходят его child indices и делают тот же lookup;
+их разные success-guards пока не именуются семантически. Это доказывает
+typed condition/evaluation layer, но **не** формат `.scr`, размеры инструкций
+или связь чисел tag с языковыми операторами.
+
+Выгрузка воспроизводится без изменения PE:
+
+```powershell
+& 'C:\Tools\ghidra_12.1.2_PUBLIC\support\analyzeHeadless.bat' `
+  C:\temp\fparkan-ghidra ai -import 'C:\GOG Games\Parkan - Iron Strategy\ai.dll' `
+  -processor x86:LE:32:default `
+  -scriptPath C:\Develop\fparkan\tools\ghidra `
+  -postScript ExportAiExpressionDispatcher.java -deleteProject
+```
+
 ### TRF и preload-данные
 
 TRF-файлы проходят структурный разбор. `auto.trf`, `data.trf` и tutorial
