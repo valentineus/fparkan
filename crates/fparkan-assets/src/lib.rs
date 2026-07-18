@@ -1803,6 +1803,22 @@ fn resolve_texm_validation_cached<R: ResourceRepository>(
     result
 }
 
+#[cfg(test)]
+fn resolve_texture<R: ResourceRepository>(
+    repository: &R,
+    name: &ResourceName,
+) -> Result<(), AssetError> {
+    resolve_texm(repository, name, TEXTURES_ARCHIVE, "texture")
+}
+
+#[cfg(test)]
+fn resolve_lightmap<R: ResourceRepository>(
+    repository: &R,
+    name: &ResourceName,
+) -> Result<(), AssetError> {
+    resolve_texm(repository, name, LIGHTMAP_ARCHIVE, "lightmap")
+}
+
 fn prepare_texture<R: ResourceRepository>(
     repository: &R,
     name: &ResourceName,
