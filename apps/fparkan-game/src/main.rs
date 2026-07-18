@@ -343,12 +343,12 @@ mod tests {
             RenderCase {
                 root: "IS",
                 mission: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.01/data.tma",
-                expected: "{\"report_kind\":\"render-planning\",\"backend\":\"vulkan-planning\",\"window\":\"synthetic\",\"mission\":\"MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.01/data.tma\",\"objects\":33,\"frames\":1,\"tick\":1,\"draws\":33,\"submission_plans\":1,\"last_command_capture_bytes\":810,\"hash\":\"ca17cc76e55c45e83c1c9c1c088e84bf1a698be91a7730943210fe27596af841\"}",
+                expected: "{\"report_kind\":\"render-planning\",\"backend\":\"vulkan-planning\",\"window\":\"synthetic\",\"mission\":\"MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.01/data.tma\",\"objects\":33,\"frames\":1,\"tick\":1,\"draws\":33,\"submission_plans\":1,\"last_command_capture_bytes\":2008,\"hash\":\"ca17cc76e55c45e83c1c9c1c088e84bf1a698be91a7730943210fe27596af841\"}",
             },
             RenderCase {
                 root: "IS2",
                 mission: "MISSIONS/Campaign/CAMPAIGN.00/Mission.02/data.tma",
-                expected: "{\"report_kind\":\"render-planning\",\"backend\":\"vulkan-planning\",\"window\":\"synthetic\",\"mission\":\"MISSIONS/Campaign/CAMPAIGN.00/Mission.02/data.tma\",\"objects\":10,\"frames\":1,\"tick\":1,\"draws\":10,\"submission_plans\":1,\"last_command_capture_bytes\":235,\"hash\":\"5d720b3ab690076a398a79a404850bbeaee2e33811b5bb570ec8a96d4a7a2fc4\"}",
+                expected: "{\"report_kind\":\"render-planning\",\"backend\":\"vulkan-planning\",\"window\":\"synthetic\",\"mission\":\"MISSIONS/Campaign/CAMPAIGN.00/Mission.02/data.tma\",\"objects\":10,\"frames\":1,\"tick\":1,\"draws\":10,\"submission_plans\":1,\"last_command_capture_bytes\":605,\"hash\":\"5d720b3ab690076a398a79a404850bbeaee2e33811b5bb570ec8a96d4a7a2fc4\"}",
             },
         ] {
             assert_eq!(
