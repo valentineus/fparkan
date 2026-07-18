@@ -52,6 +52,7 @@ const VISUAL_DEPENDENCY_PROGRESS_INTERVAL: usize = 64;
 
 type WearValidationCache =
     HashMap<(NormalizedPath, Vec<u8>), Result<fparkan_material::WearTable, String>>;
+type TextureValidationCache = HashMap<Vec<u8>, Result<(), String>>;
 
 /// Canonical terrain archive paths derived from a mission land reference.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -483,6 +484,17 @@ pub enum VisualDependencyPhase {
     Texture,
 }
 
+/// Validation-cache entries retained while expanding visual dependencies.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VisualDependencyCacheCounts {
+    /// Distinct WEAR archive/name keys resolved so far.
+    pub wear_entries: usize,
+    /// Distinct MAT0 raw names resolved so far.
+    pub material_entries: usize,
+    /// Distinct TEXM archive/name keys resolved so far.
+    pub texture_entries: usize,
+}
+
 /// Throttled visual-dependency expansion progress.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VisualDependencyProgress {
@@ -494,6 +506,8 @@ pub struct VisualDependencyProgress {
     pub graph_node_count: usize,
     /// Resource graph edges materialized before this request is resolved.
     pub graph_edge_count: usize,
+    /// Validation-cache entries retained before this request is resolved.
+    pub cache_entries: VisualDependencyCacheCounts,
 }
 
 /// Errors raised while preparing CPU-side assets.
@@ -1241,10 +1255,18 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
         wear_requests = wear_requests.saturating_add(1);
         report_visual_dependency_progress(
             &mut on_progress,
-            VisualDependencyPhase::Wear,
-            wear_requests,
-            graph.nodes.len(),
-            graph.edges.len(),
+            VisualDependencyProgress {
+                phase: VisualDependencyPhase::Wear,
+                request_count: wear_requests,
+                graph_node_count: graph.nodes.len(),
+                graph_edge_count: graph.edges.len(),
+                cache_entries: visual_dependency_cache_counts(
+                    &wear_validation,
+                    &material_validation,
+                    &diffuse_texture_validation,
+                    &lightmap_texture_validation,
+                ),
+            },
         );
         match resolve_wear_table_cached(repository, mesh, &mut wear_validation) {
             Ok(table) => {
@@ -1289,15 +1311,29 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
                     request_count: material_requests,
                     graph_node_count: graph.nodes.len(),
                     graph_edge_count: graph.edges.len(),
+                    cache_entries: visual_dependency_cache_counts(
+                        &wear_validation,
+                        &material_validation,
+                        &diffuse_texture_validation,
+                        &lightmap_texture_validation,
+                    ),
                 });
                 for (material_index, _entry) in table.entries.iter().enumerate() {
                     material_requests = material_requests.saturating_add(1);
                     report_visual_dependency_progress(
                         &mut on_progress,
-                        VisualDependencyPhase::Material,
-                        material_requests,
-                        graph.nodes.len(),
-                        graph.edges.len(),
+                        VisualDependencyProgress {
+                            phase: VisualDependencyPhase::Material,
+                            request_count: material_requests,
+                            graph_node_count: graph.nodes.len(),
+                            graph_edge_count: graph.edges.len(),
+                            cache_entries: visual_dependency_cache_counts(
+                                &wear_validation,
+                                &material_validation,
+                                &diffuse_texture_validation,
+                                &lightmap_texture_validation,
+                            ),
+                        },
                     );
                     let Ok(material_index) = u16::try_from(material_index) else {
                         push_visual_failure(
@@ -1347,10 +1383,18 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
                                 texture_requests = texture_requests.saturating_add(1);
                                 report_visual_dependency_progress(
                                     &mut on_progress,
-                                    VisualDependencyPhase::Texture,
-                                    texture_requests,
-                                    graph.nodes.len(),
-                                    graph.edges.len(),
+                                    VisualDependencyProgress {
+                                        phase: VisualDependencyPhase::Texture,
+                                        request_count: texture_requests,
+                                        graph_node_count: graph.nodes.len(),
+                                        graph_edge_count: graph.edges.len(),
+                                        cache_entries: visual_dependency_cache_counts(
+                                            &wear_validation,
+                                            &material_validation,
+                                            &diffuse_texture_validation,
+                                            &lightmap_texture_validation,
+                                        ),
+                                    },
                                 );
                                 report.texture_request_count += 1;
                                 match resolve_texm_validation_cached(
@@ -1415,10 +1459,18 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
                     texture_requests = texture_requests.saturating_add(1);
                     report_visual_dependency_progress(
                         &mut on_progress,
-                        VisualDependencyPhase::Texture,
-                        texture_requests,
-                        graph.nodes.len(),
-                        graph.edges.len(),
+                        VisualDependencyProgress {
+                            phase: VisualDependencyPhase::Texture,
+                            request_count: texture_requests,
+                            graph_node_count: graph.nodes.len(),
+                            graph_edge_count: graph.edges.len(),
+                            cache_entries: visual_dependency_cache_counts(
+                                &wear_validation,
+                                &material_validation,
+                                &diffuse_texture_validation,
+                                &lightmap_texture_validation,
+                            ),
+                        },
                     );
                     report.lightmap_request_count += 1;
                     match resolve_texm_validation_cached(
@@ -1484,18 +1536,29 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
 
 fn report_visual_dependency_progress(
     on_progress: &mut impl FnMut(VisualDependencyProgress),
-    phase: VisualDependencyPhase,
-    request_count: usize,
-    graph_node_count: usize,
-    graph_edge_count: usize,
+    progress: VisualDependencyProgress,
 ) {
-    if request_count == 1 || request_count.is_multiple_of(VISUAL_DEPENDENCY_PROGRESS_INTERVAL) {
-        on_progress(VisualDependencyProgress {
-            phase,
-            request_count,
-            graph_node_count,
-            graph_edge_count,
-        });
+    if progress.request_count == 1
+        || progress
+            .request_count
+            .is_multiple_of(VISUAL_DEPENDENCY_PROGRESS_INTERVAL)
+    {
+        on_progress(progress);
+    }
+}
+
+fn visual_dependency_cache_counts(
+    wear_validation: &WearValidationCache,
+    material_validation: &HashMap<Vec<u8>, Result<ResolvedMaterial, String>>,
+    diffuse_texture_validation: &TextureValidationCache,
+    lightmap_texture_validation: &TextureValidationCache,
+) -> VisualDependencyCacheCounts {
+    VisualDependencyCacheCounts {
+        wear_entries: wear_validation.len(),
+        material_entries: material_validation.len(),
+        texture_entries: diffuse_texture_validation
+            .len()
+            .saturating_add(lightmap_texture_validation.len()),
     }
 }
 
@@ -2336,10 +2399,17 @@ mod tests {
         for request_count in 1..=129 {
             report_visual_dependency_progress(
                 &mut |event| progress.push(event),
-                VisualDependencyPhase::Texture,
-                request_count,
-                37,
-                41,
+                VisualDependencyProgress {
+                    phase: VisualDependencyPhase::Texture,
+                    request_count,
+                    graph_node_count: 37,
+                    graph_edge_count: 41,
+                    cache_entries: VisualDependencyCacheCounts {
+                        wear_entries: 3,
+                        material_entries: 5,
+                        texture_entries: 7,
+                    },
+                },
             );
         }
 
@@ -2351,18 +2421,33 @@ mod tests {
                     request_count: 1,
                     graph_node_count: 37,
                     graph_edge_count: 41,
+                    cache_entries: VisualDependencyCacheCounts {
+                        wear_entries: 3,
+                        material_entries: 5,
+                        texture_entries: 7,
+                    },
                 },
                 VisualDependencyProgress {
                     phase: VisualDependencyPhase::Texture,
                     request_count: 64,
                     graph_node_count: 37,
                     graph_edge_count: 41,
+                    cache_entries: VisualDependencyCacheCounts {
+                        wear_entries: 3,
+                        material_entries: 5,
+                        texture_entries: 7,
+                    },
                 },
                 VisualDependencyProgress {
                     phase: VisualDependencyPhase::Texture,
                     request_count: 128,
                     graph_node_count: 37,
                     graph_edge_count: 41,
+                    cache_entries: VisualDependencyCacheCounts {
+                        wear_entries: 3,
+                        material_entries: 5,
+                        texture_entries: 7,
+                    },
                 },
             ]
         );

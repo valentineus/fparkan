@@ -133,6 +133,12 @@ pub enum MissionLoadPhase {
         graph_node_count: usize,
         /// Graph edges materialized before the request.
         graph_edge_count: usize,
+        /// Distinct WEAR validation keys retained before the request.
+        wear_cache_entries: usize,
+        /// Distinct MAT0 validation keys retained before the request.
+        material_cache_entries: usize,
+        /// Distinct TEXM validation keys retained before the request.
+        texture_cache_entries: usize,
     },
     /// Validate TEXM documents while expanding visual dependencies.
     GraphVisualTextures,
@@ -144,6 +150,12 @@ pub enum MissionLoadPhase {
         graph_node_count: usize,
         /// Graph edges materialized before the request.
         graph_edge_count: usize,
+        /// Distinct WEAR validation keys retained before the request.
+        wear_cache_entries: usize,
+        /// Distinct MAT0 validation keys retained before the request.
+        material_cache_entries: usize,
+        /// Distinct TEXM validation keys retained before the request.
+        texture_cache_entries: usize,
     },
     /// Prepare all reachable visual/resource dependencies.
     Assets,
@@ -747,6 +759,9 @@ fn load_mission_with_options_and_progress(
                             request_count: progress.request_count,
                             graph_node_count: progress.graph_node_count,
                             graph_edge_count: progress.graph_edge_count,
+                            wear_cache_entries: progress.cache_entries.wear_entries,
+                            material_cache_entries: progress.cache_entries.material_entries,
+                            texture_cache_entries: progress.cache_entries.texture_entries,
                         })
                     }
                     VisualDependencyPhase::Texture => {
@@ -754,6 +769,9 @@ fn load_mission_with_options_and_progress(
                             request_count: progress.request_count,
                             graph_node_count: progress.graph_node_count,
                             graph_edge_count: progress.graph_edge_count,
+                            wear_cache_entries: progress.cache_entries.wear_entries,
+                            material_cache_entries: progress.cache_entries.material_entries,
+                            texture_cache_entries: progress.cache_entries.texture_entries,
                         })
                     }
                 };

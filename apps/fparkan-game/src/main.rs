@@ -1093,6 +1093,9 @@ mod tests {
                 request_count: 64,
                 graph_node_count: 128,
                 graph_edge_count: 192,
+                wear_cache_entries: 8,
+                material_cache_entries: 16,
+                texture_cache_entries: 32,
             },
         )?;
         let progress = std::fs::read_to_string(&path).map_err(|err| err.to_string())?;
@@ -1100,7 +1103,7 @@ mod tests {
 
         assert_eq!(
             progress,
-            "Starting\telapsed_ms=0\nGraphVisualMaterials\telapsed_ms=12\nGraphVisualMaterialRequests { request_count: 64, graph_node_count: 128, graph_edge_count: 192 }\telapsed_ms=34\n"
+            "Starting\telapsed_ms=0\nGraphVisualMaterials\telapsed_ms=12\nGraphVisualMaterialRequests { request_count: 64, graph_node_count: 128, graph_edge_count: 192, wear_cache_entries: 8, material_cache_entries: 16, texture_cache_entries: 32 }\telapsed_ms=34\n"
         );
         Ok(())
     }

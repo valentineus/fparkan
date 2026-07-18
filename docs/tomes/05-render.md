@@ -1133,6 +1133,14 @@ probe recorded MAT0 request 3 at 52 nodes / 51 edges and request 4 at 55 nodes
 they do not change traversal order, node or edge identities, provenance,
 validation, cache semantics, or rendering.
 
+The same throttled snapshots now retain the number of distinct validation-cache
+keys for WEAR, MAT0, and TEXM before the request. In a fresh 50-second Part 2
+probe, MAT0 request 3 recorded cache counts 2 / 3 / 3 and request 4 recorded
+3 / 4 / 4, while the graph moved from 52 / 51 to 55 / 54 nodes / edges. The
+counts distinguish cache growth from graph growth without adding per-request
+file writes or asserting which parser, archive I/O operation, or allocation
+caused the elapsed interval.
+
 `fparkan-game --load-progress` now initializes its file with `Starting` and
 appends each later mission-load event instead of replacing the prior line. A
 bounded probe can therefore retain both MAT0 and TEXM request milestones even
