@@ -1620,8 +1620,18 @@ mapped record is stored as `profile_record_base + 28 * record_index` with the
 new bank byte; a mapping whose second index is `-1` stores only the profile
 ordinal, below `0x1000`, and is deliberately rejected by the lookup routine.
 This explains the runtime sentinel without interpreting it as a missing WEAR
-row. The input map is not yet tied to a named on-disk stream, so this proves the
-cache builder's mechanics but not its complete asset-to-profile mapping.
+row. The input map is not a direct `Shade.wea` decode: the sole call site is
+the terrain loader at `Terrain.dll` RVA `0x0a3f0`, after it has generated and
+stitched 28-byte terrain records. That loader first appends pairs copied from
+an intermediate primitive-key list with second value `-1`, then appends one
+`(-1, generated_record_index)` pair for every generated record. Before calling
+the cache builder it runs a three-edge matching pass over those records, using
+their quantized positions and adjacency selectors. The cache profile therefore
+describes loader-produced geometry and its generated correspondence map, not a
+named on-disk `Shade.wea` section. The source of the intermediate primitive-key
+list and the exact semantics of the 28-byte record's non-position fields remain
+unassigned; this is sufficient to rule out an invented static WEAR parser, but
+not to reproduce the profile generator yet.
 
 On success the method returns the shared result view at cache offset `+24`, not
 the stored-record pointer and not a WEAR row. Thus the dispatcher's observed
