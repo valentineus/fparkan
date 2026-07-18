@@ -71,6 +71,93 @@ pub enum RenderPhase {
     Ui,
 }
 
+/// Fixed-function blend behaviour represented without a graphics API type.
+///
+/// This is a compatibility contract, not yet a decoded MAT0 mapping.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LegacyBlendMode {
+    /// Do not blend the fragment with the existing colour.
+    #[default]
+    Opaque,
+    /// Blend using source alpha.
+    SourceAlpha,
+}
+
+/// Depth-buffer behaviour represented without a graphics API type.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LegacyDepthMode {
+    /// No depth attachment is used.
+    #[default]
+    Disabled,
+    /// Test depth and write passing fragments.
+    TestWrite,
+    /// Test depth without modifying it.
+    TestReadOnly,
+}
+
+/// Triangle culling behaviour represented without a graphics API type.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LegacyCullMode {
+    /// Keep both front- and back-facing triangles.
+    #[default]
+    Disabled,
+    /// Cull back-facing triangles.
+    BackFace,
+    /// Cull front-facing triangles.
+    FrontFace,
+}
+
+/// Legacy fixed-function state that changes graphics-pipeline structure.
+///
+/// Alpha reference is deliberately not present: it is dynamic material data,
+/// whereas this state records only whether an alpha-test shader variant is used.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LegacyPipelineState {
+    /// Colour blend mode.
+    pub blend: LegacyBlendMode,
+    /// Depth test/write mode.
+    pub depth: LegacyDepthMode,
+    /// Face culling mode.
+    pub cull: LegacyCullMode,
+    /// Whether alpha-test shader logic is enabled.
+    pub alpha_test: bool,
+}
+
+/// Canonical, backend-neutral key for a graphics-pipeline variant.
+///
+/// The value is explicitly packed rather than hashed, so captures and caches
+/// remain stable across processes and Rust toolchain updates.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PipelineKey(u8);
+
+impl PipelineKey {
+    /// Returns the canonical packed representation.
+    #[must_use]
+    pub const fn packed(self) -> u8 {
+        self.0
+    }
+}
+
+impl From<LegacyPipelineState> for PipelineKey {
+    fn from(state: LegacyPipelineState) -> Self {
+        let blend = match state.blend {
+            LegacyBlendMode::Opaque => 0,
+            LegacyBlendMode::SourceAlpha => 1,
+        };
+        let depth = match state.depth {
+            LegacyDepthMode::Disabled => 0,
+            LegacyDepthMode::TestWrite => 1,
+            LegacyDepthMode::TestReadOnly => 2,
+        };
+        let cull = match state.cull {
+            LegacyCullMode::Disabled => 0,
+            LegacyCullMode::BackFace => 1,
+            LegacyCullMode::FrontFace => 2,
+        };
+        Self(blend | (depth << 1) | (cull << 3) | (u8::from(state.alpha_test) << 5))
+    }
+}
+
 /// Index range.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IndexRange {
@@ -95,6 +182,8 @@ pub struct RenderSnapshotDraw {
     pub material_slots: Vec<GpuMaterialId>,
     /// Batch material index into [`Self::material_slots`].
     pub material_index: u16,
+    /// Fixed-function state resolved for this draw.
+    pub pipeline_state: LegacyPipelineState,
     /// Node transform matrix, row-major.
     pub transform: [f32; 16],
     /// Index range.
@@ -132,6 +221,8 @@ pub struct DrawCommand {
     pub mesh: GpuMeshId,
     /// Material.
     pub material: GpuMaterialId,
+    /// Canonical graphics-pipeline variant.
+    pub pipeline_key: PipelineKey,
     /// Transform matrix, row-major.
     pub transform: [f32; 16],
     /// Index range.
@@ -369,6 +460,7 @@ pub fn build_commands(
             object_id: draw.object_id,
             mesh: draw.mesh,
             material,
+            pipeline_key: draw.pipeline_state.into(),
             transform: draw.transform,
             range: draw.range,
             stable_order: draw.stable_order,
@@ -453,8 +545,13 @@ pub fn canonical_capture(commands: &RenderCommandList) -> Result<Vec<u8>, Render
             RenderCommand::Draw(draw) => {
                 out.extend_from_slice(
                     format!(
-                        "D,{:?},{},{},{},{}\n",
-                        draw.phase, draw.id.0, draw.mesh.0, draw.material.0, draw.stable_order
+                        "D,{:?},{},{},{},{},{}\n",
+                        draw.phase,
+                        draw.id.0,
+                        draw.mesh.0,
+                        draw.material.0,
+                        draw.pipeline_key.packed(),
+                        draw.stable_order
                     )
                     .as_bytes(),
                 );
@@ -618,6 +715,7 @@ mod tests {
             mesh: GpuMeshId(10 + id),
             material_slots: vec![GpuMaterialId(31), GpuMaterialId(37)],
             material_index,
+            pipeline_state: LegacyPipelineState::default(),
             transform: identity_transform(),
             range: IndexRange { start: 0, count: 3 },
             stable_order,
@@ -635,6 +733,7 @@ mod tests {
                     object_id: None,
                     mesh: GpuMeshId(2),
                     material: GpuMaterialId(3),
+                    pipeline_key: LegacyPipelineState::default().into(),
                     transform: [0.0; 16],
                     range: IndexRange { start: 0, count: 3 },
                     stable_order: 4,
@@ -644,8 +743,33 @@ mod tests {
         };
         assert_eq!(
             canonical_capture(&list).expect("capture"),
-            b"B\nD,Opaque,1,2,3,4\nE\n"
+            b"B\nD,Opaque,1,2,3,0,4\nE\n"
         );
+    }
+
+    #[test]
+    fn pipeline_key_is_explicit_stable_and_sensitive_to_pipeline_structure() {
+        let base = LegacyPipelineState::default();
+        assert_eq!(PipelineKey::from(base).packed(), 0);
+
+        let variant = LegacyPipelineState {
+            blend: LegacyBlendMode::SourceAlpha,
+            depth: LegacyDepthMode::TestReadOnly,
+            cull: LegacyCullMode::BackFace,
+            alpha_test: true,
+        };
+        assert_eq!(PipelineKey::from(variant).packed(), 0b00_101_101);
+        assert_ne!(PipelineKey::from(base), PipelineKey::from(variant));
+    }
+
+    #[test]
+    fn alpha_test_flag_changes_key_without_encoding_material_threshold() {
+        let opaque = LegacyPipelineState::default();
+        let alpha_test = LegacyPipelineState {
+            alpha_test: true,
+            ..opaque
+        };
+        assert_eq!(PipelineKey::from(alpha_test).packed(), 0b10_0000);
     }
 
     #[test]
@@ -660,6 +784,7 @@ mod tests {
                     object_id: None,
                     mesh: GpuMeshId(2),
                     material: GpuMaterialId(3),
+                    pipeline_key: LegacyPipelineState::default().into(),
                     transform: [0.0; 16],
                     range: IndexRange { start: 0, count: 0 },
                     stable_order: 4,
@@ -762,7 +887,7 @@ mod tests {
 
         assert_eq!(
             capture,
-            b"B\nD,Opaque,1,11,31,10\nD,Opaque,2,12,31,20\nD,Transparent,3,13,31,0\nE\n"
+            b"B\nD,Opaque,1,11,31,0,10\nD,Opaque,2,12,31,0,20\nD,Transparent,3,13,31,0,0\nE\n"
         );
         Ok(())
     }
@@ -868,6 +993,7 @@ mod tests {
                     object_id: None,
                     mesh: GpuMeshId(2),
                     material: GpuMaterialId(3),
+                    pipeline_key: LegacyPipelineState::default().into(),
                     transform: identity_transform(),
                     range: IndexRange {
                         start: u32::MAX,
@@ -922,6 +1048,7 @@ mod tests {
                     object_id: None,
                     mesh: GpuMeshId(2),
                     material: GpuMaterialId(3),
+                    pipeline_key: LegacyPipelineState::default().into(),
                     transform: identity_transform(),
                     range: IndexRange {
                         start: 14,
@@ -956,6 +1083,7 @@ mod tests {
                     object_id: None,
                     mesh: GpuMeshId(1),
                     material: GpuMaterialId(1),
+                    pipeline_key: LegacyPipelineState::default().into(),
                     transform: identity_transform(),
                     range: IndexRange { start: 0, count: 3 },
                     stable_order: 0,
@@ -966,6 +1094,7 @@ mod tests {
                     object_id: None,
                     mesh: GpuMeshId(1),
                     material: GpuMaterialId(1),
+                    pipeline_key: LegacyPipelineState::default().into(),
                     transform: identity_transform(),
                     range: IndexRange { start: 0, count: 3 },
                     stable_order: 0,

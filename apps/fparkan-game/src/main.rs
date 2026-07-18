@@ -162,6 +162,7 @@ fn render_snapshot_with_assets(
             mesh,
             material_slots: vec![material],
             material_index: 0,
+            pipeline_state: fparkan_render::LegacyPipelineState::default(),
             transform: identity_transform(index_to_f32(index)),
             range: IndexRange { start: 0, count: 3 },
             stable_order,

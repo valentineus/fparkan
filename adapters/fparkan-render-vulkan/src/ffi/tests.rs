@@ -10,7 +10,8 @@ use crate::shader_manifest::{
 use crate::*;
 use fparkan_platform::{DepthStencilSupport, RenderRequest};
 use fparkan_render::{
-    DrawCommand, DrawId, GpuMaterialId, GpuMeshId, IndexRange, RenderCommand, RenderPhase,
+    DrawCommand, DrawId, GpuMaterialId, GpuMeshId, IndexRange, LegacyPipelineState, RenderCommand,
+    RenderPhase,
 };
 use fparkan_render::{RenderBackend, RenderError};
 
@@ -35,6 +36,7 @@ fn planning_backend_tracks_render_request_and_simulated_present() -> Result<(), 
                 object_id: None,
                 mesh: GpuMeshId(1),
                 material: GpuMaterialId(2),
+                pipeline_key: LegacyPipelineState::default().into(),
                 transform: [1.0; 16],
                 range: IndexRange { start: 0, count: 3 },
                 stable_order: 7,
@@ -75,6 +77,7 @@ fn frame_submission_plan_json_is_stable() -> Result<(), RenderError> {
                 object_id: None,
                 mesh: GpuMeshId(1),
                 material: GpuMaterialId(2),
+                pipeline_key: LegacyPipelineState::default().into(),
                 transform: [1.0; 16],
                 range: IndexRange { start: 0, count: 3 },
                 stable_order: 7,

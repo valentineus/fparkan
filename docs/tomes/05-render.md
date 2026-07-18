@@ -829,6 +829,24 @@ draw_indexed(item.batch.base_vertex,
              item.batch.index_count);
 ```
 
+## Текущий контракт pipeline key
+
+`fparkan-render` теперь переносит вместе с каждым backend-neutral draw
+`LegacyPipelineState` и детерминированный `PipelineKey`. Ключ не хешируется:
+он явно упаковывает blend mode, depth mode, cull mode и флаг alpha-test, поэтому
+одинаковые snapshots дают одинаковый capture и будущий Vulkan cache не зависит
+от версии Rust или процесса. Alpha reference намеренно не входит в key: это
+dynamic material constant, а не структурный вариант graphics pipeline.
+
+Пока текущий статический Vulkan viewer создаёт только базовое состояние
+`opaque + depth disabled + cull disabled + alpha-test disabled`; ключ уже
+передаётся через render command и canonical capture, но Vulkan pipeline cache
+ещё не выбирает variants по нему. Также не установлен источник значений для
+Batch20/MAT0: их поля нельзя объявлять blend/depth/cull mapping без dynamic
+capture или дополнительного дизассемблирования. Поэтому этот контракт —
+подготовленная граница совместимости, а не заявление о готовой parity
+fixed-function state.
+
 После последнего world pass renderer закрывает сцену и выводит back buffer.
 World3D снимает `in_render`, восстанавливает временный viewport state и вызывает
 `on_end_render` у active objects. Только после этого допустимо освобождать

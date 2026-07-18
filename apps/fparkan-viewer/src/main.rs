@@ -122,6 +122,7 @@ impl ViewerModelService {
                 mesh: GpuMeshId(1),
                 material_slots: vec![GpuMaterialId(7)],
                 material_index: 0,
+                pipeline_state: fparkan_render::LegacyPipelineState::default(),
                 transform: identity_transform(),
                 range: IndexRange { start: 0, count: 3 },
                 stable_order: 0,
