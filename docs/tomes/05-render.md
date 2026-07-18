@@ -1151,6 +1151,17 @@ the measured unfinished interval for this run. It still does not allocate that
 time among MAT0 decode, graph allocation, archive I/O, OS cache state, or the
 interleaved TEXM requests.
 
+Visual expansion now also caches WEAR validation by the complete derived WEAR
+archive/name key and replays both successes and failures. It still creates each
+per-prototype WEAR edge, increments the same request counters, and reports the
+same failure provenance. A unit test verifies an archive-qualified cached
+failure is replayed without consulting the repository. In a matched bounded
+Part 2 probe the first TEXM-64 marker occurred at 135,520 ms, versus 134,793
+ms in the preceding sample, and neither run reached `Assets`; therefore this
+corpus does not evidence a startup advance from WEAR caching. The path is kept
+as a correctness-preserving duplicate-resolve optimization, not a causal
+performance claim.
+
 A rebuilt executable then ran a controlled 180-second Part 2 `Autodemo.00`
 probe with the append-only trace. Before exact-child termination it recorded
 `GraphVisualTextureRequests(64)`, `GraphVisualMaterialRequests(100)`, and every

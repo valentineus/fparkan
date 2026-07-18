@@ -50,6 +50,9 @@ const TEXTURES_ARCHIVE: &str = "textures.lib";
 const LIGHTMAP_ARCHIVE: &str = "lightmap.lib";
 const VISUAL_DEPENDENCY_PROGRESS_INTERVAL: usize = 64;
 
+type WearValidationCache =
+    HashMap<(NormalizedPath, Vec<u8>), Result<fparkan_material::WearTable, String>>;
+
 /// Canonical terrain archive paths derived from a mission land reference.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MissionTerrainPaths {
@@ -1202,6 +1205,7 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
     let mut diffuse_texture_validation = HashMap::new();
     let mut lightmap_texture_validation = HashMap::new();
     let mut material_validation = HashMap::new();
+    let mut wear_validation = HashMap::new();
     let mut wear_requests = 0usize;
     let mut material_requests = 0usize;
     let mut texture_requests = 0usize;
@@ -1236,7 +1240,7 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
             VisualDependencyPhase::Wear,
             wear_requests,
         );
-        match resolve_wear_table(repository, mesh) {
+        match resolve_wear_table_cached(repository, mesh, &mut wear_validation) {
             Ok(table) => {
                 report.wear_resolved_count += 1;
                 let wear_key = match wear_resource_key(mesh) {
@@ -1457,7 +1461,7 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
                 mesh.name.0.clone(),
                 PrototypeGraphEdge::MeshToWear,
                 PrototypeGraphRequiredness::Required,
-                &message.to_string(),
+                &message,
             ),
         }
     }
@@ -1899,6 +1903,21 @@ fn resolve_wear_table<R: ResourceRepository>(
     decode_wear(&bytes).map_err(AssetError::Material)
 }
 
+fn resolve_wear_table_cached<R: ResourceRepository>(
+    repository: &R,
+    mesh: &ResourceKey,
+    cache: &mut WearValidationCache,
+) -> Result<fparkan_material::WearTable, String> {
+    let wear_key = wear_resource_key(mesh).map_err(|error| error.to_string())?;
+    let cache_key = (wear_key.archive.clone(), wear_key.name.0.clone());
+    if let Some(result) = cache.get(&cache_key) {
+        return result.clone();
+    }
+    let result = resolve_wear_table(repository, mesh).map_err(|error| error.to_string());
+    cache.insert(cache_key, result.clone());
+    result
+}
+
 fn push_visual_failure(
     report: &mut PrototypeGraphReport,
     graph: &PrototypeGraph,
@@ -2320,6 +2339,26 @@ mod tests {
                     request_count: 128,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn wear_validation_cache_replays_archive_qualified_failure() {
+        let repository = repository_with_archives(&[]);
+        let mesh = ResourceKey {
+            archive: parse_path("static.rlb").expect("archive"),
+            name: resource_name(b"tree.msh"),
+            type_id: Some(0x4853_454D),
+        };
+        let mut cache = WearValidationCache::new();
+        cache.insert(
+            (mesh.archive.clone(), b"tree.wea".to_vec()),
+            Err("cached WEAR failure".to_string()),
+        );
+
+        assert_eq!(
+            resolve_wear_table_cached(&repository, &mesh, &mut cache),
+            Err("cached WEAR failure".to_string())
         );
     }
 
