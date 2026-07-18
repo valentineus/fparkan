@@ -1565,6 +1565,14 @@ as table 1, while its material-phase lookup receives the exact 32-bit selector
 `(table_index << 16) | material_index`. `TerrainMaterialSelection` preserves
 that key for the renderer without assuming how the two phases are blended.
 
+The same `World3D!GetMaterialPhase` recovery establishes the next boundary. It
+validates the table/row selector, chooses a MAT0 phase (or interpolates two
+phases for an animated material), returns the selected material record, and
+hands its caller a 76-byte expanded phase-state block. It does not submit a
+draw or compose the two terrain tables. The later consumer of that record and
+the type-18 microtexture mapping remains the required evidence before adding
+an overlay, blend, or microtexture shader.
+
 The static Vulkan bridge now carries each contiguous face run as a separate
 draw range keyed by the original packed `material_tag`; it neither reorders
 triangles nor collapses the high byte. For the first usable visual layer, the
