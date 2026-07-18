@@ -21,7 +21,8 @@
 //! Asset manager ports and transactional preparation models.
 
 use fparkan_material::{
-    decode_wear, resolve_material, Mat0Document, MaterialError, WearTable, MAT0_KIND, WEAR_KIND,
+    decode_wear, resolve_material, Mat0Document, MaterialError, ResolvedMaterial, WearTable,
+    MAT0_KIND, WEAR_KIND,
 };
 use fparkan_mission_format::{decode_tma, decode_tma_land_path};
 pub use fparkan_mission_format::{LpString, MissionDocument, MissionError, TmaProfile};
@@ -693,7 +694,7 @@ fn prepare_mission_assets_with_repository_internal<R: ResourceRepository>(
     let mut textures = Vec::new();
     let mut visuals = Vec::new();
     let mut prototype_visual_ids = Vec::with_capacity(prototypes.len());
-    let mut texture_cache = TexturePreparationCache::default();
+    let mut preparation_cache = PreparationCache::default();
 
     for proto in prototypes {
         let visual_id = AssetId::new((identity_policy.visual)(proto));
@@ -711,7 +712,7 @@ fn prepare_mission_assets_with_repository_internal<R: ResourceRepository>(
                     repository,
                     proto,
                     identity_policy,
-                    &mut texture_cache,
+                    &mut preparation_cache,
                 )?;
                 if bundle.visual.id != visual_id {
                     // Defensive check. stable IDs are deterministic for the same inputs.
@@ -1385,12 +1386,12 @@ pub fn prepare_visual_with_repository<R: ResourceRepository>(
     repository: &R,
     proto: &EffectivePrototype,
 ) -> Result<PreparedVisual, AssetError> {
-    let mut texture_cache = TexturePreparationCache::default();
+    let mut preparation_cache = PreparationCache::default();
     Ok(prepare_visual_with_repository_internal(
         repository,
         proto,
         AssetIdentityPolicy::default(),
-        &mut texture_cache,
+        &mut preparation_cache,
     )?
     .visual)
 }
@@ -1404,9 +1405,10 @@ struct PreparedVisualBundle {
 }
 
 #[derive(Default)]
-struct TexturePreparationCache {
+struct PreparationCache {
     diffuse: HashMap<Vec<u8>, PreparedTexture>,
     lightmaps: HashMap<Vec<u8>, PreparedTexture>,
+    materials: HashMap<Vec<u8>, ResolvedMaterial>,
 }
 
 // Keeps the complete model -> WEAR -> material -> texture transaction in one fallible boundary.
@@ -1415,7 +1417,7 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
     repository: &R,
     proto: &EffectivePrototype,
     identity_policy: AssetIdentityPolicy,
-    texture_cache: &mut TexturePreparationCache,
+    preparation_cache: &mut PreparationCache,
 ) -> Result<PreparedVisualBundle, AssetError> {
     let PrototypeGeometry::Mesh(mesh_key) = &proto.geometry else {
         return Ok(PreparedVisualBundle {
@@ -1475,7 +1477,7 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
             AssetError::InvalidPrototype("material index does not fit archive format".to_string())
         })?;
         let material =
-            resolve_material(repository, &wear, material_index).map_err(AssetError::Material)?;
+            resolve_material_cached(repository, &wear, material_index, preparation_cache)?;
         material_count += 1;
         let material_id = AssetId::new((identity_policy.material)(
             proto,
@@ -1504,7 +1506,7 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
                 &texture,
                 PreparedTextureUsage::Diffuse,
                 identity_policy,
-                texture_cache,
+                preparation_cache,
             )?;
             texture_ids.push(prepared_texture.id);
             prepared_textures.push(prepared_texture);
@@ -1518,7 +1520,7 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
             &lightmap.lightmap,
             PreparedTextureUsage::Lightmap,
             identity_policy,
-            texture_cache,
+            preparation_cache,
         )?;
         lightmap_ids.push(prepared_lightmap.id);
         prepared_textures.push(prepared_lightmap);
@@ -1808,7 +1810,7 @@ fn prepare_texture_cached<R: ResourceRepository>(
     name: &ResourceName,
     usage: PreparedTextureUsage,
     identity_policy: AssetIdentityPolicy,
-    cache: &mut TexturePreparationCache,
+    cache: &mut PreparationCache,
 ) -> Result<PreparedTexture, AssetError> {
     let entries = match usage {
         PreparedTextureUsage::Diffuse => &mut cache.diffuse,
@@ -1820,6 +1822,31 @@ fn prepare_texture_cached<R: ResourceRepository>(
     let texture = prepare_texture(repository, name, usage, identity_policy)?;
     entries.insert(name.0.clone(), texture.clone());
     Ok(texture)
+}
+
+fn resolve_material_cached<R: ResourceRepository>(
+    repository: &R,
+    table: &WearTable,
+    index: u16,
+    cache: &mut PreparationCache,
+) -> Result<ResolvedMaterial, AssetError> {
+    let request = table
+        .entries
+        .get(usize::from(index))
+        .ok_or(MaterialError::WearIndexOutOfBounds {
+            index,
+            count: table.entries.len(),
+        })
+        .map_err(AssetError::Material)?
+        .material
+        .0
+        .clone();
+    if let Some(material) = cache.materials.get(&request) {
+        return Ok(material.clone());
+    }
+    let material = resolve_material(repository, table, index).map_err(AssetError::Material)?;
+    cache.materials.insert(request, material.clone());
+    Ok(material)
 }
 
 fn resolve_texm<R: ResourceRepository>(
@@ -2475,7 +2502,7 @@ mod tests {
             }],
         )]);
         let name = resource_name(b"TEX_A");
-        let mut cache = TexturePreparationCache::default();
+        let mut cache = PreparationCache::default();
 
         let first = prepare_texture_cached(
             &repo,
@@ -2497,6 +2524,28 @@ mod tests {
         assert_eq!(first.id, second.id);
         assert_eq!(cache.diffuse.len(), 1);
         assert!(cache.lightmaps.is_empty());
+    }
+
+    #[test]
+    fn material_preparation_cache_preserves_exact_wear_request() {
+        let mat0 = mat0_with_texture(b"TEX_A");
+        let repo = repository_with_archives_meta(&[(
+            "material.lib",
+            &[TestNresEntry {
+                name: b"MAT_A",
+                payload: &mat0,
+                type_id: MAT0_KIND,
+                attr2: 0,
+            }],
+        )]);
+        let wear = decode_wear(b"1\n0 MAT_A\n").expect("wear");
+        let mut cache = PreparationCache::default();
+
+        let first = resolve_material_cached(&repo, &wear, 0, &mut cache).expect("first material");
+        let second = resolve_material_cached(&repo, &wear, 0, &mut cache).expect("cached material");
+
+        assert_eq!(first, second);
+        assert_eq!(cache.materials.len(), 1);
     }
 
     #[test]
