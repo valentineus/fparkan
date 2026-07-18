@@ -412,17 +412,21 @@ impl CachedResourceRepository {
     /// Creates a cached repository with a decoded payload entry budget.
     #[must_use]
     pub fn with_payload_cache_budget(vfs: Arc<dyn Vfs>, max_payload_entries: usize) -> Self {
-        let mut limits = RepositoryLimits::default();
-        limits.max_decoded_payload_entries = max_payload_entries;
+        let limits = RepositoryLimits {
+            max_decoded_payload_entries: max_payload_entries,
+            ..RepositoryLimits::default()
+        };
         Self::with_limits(vfs, limits)
     }
 
     /// Creates a cached repository with decoded payload entry and byte budgets.
     #[must_use]
     pub fn with_payload_cache_limits(vfs: Arc<dyn Vfs>, limits: PayloadCacheLimits) -> Self {
-        let mut repository_limits = RepositoryLimits::default();
-        repository_limits.max_decoded_payload_entries = limits.max_entries;
-        repository_limits.max_decoded_payload_bytes = limits.max_bytes;
+        let repository_limits = RepositoryLimits {
+            max_decoded_payload_entries: limits.max_entries,
+            max_decoded_payload_bytes: limits.max_bytes,
+            ..RepositoryLimits::default()
+        };
         Self::with_limits(vfs, repository_limits)
     }
 
@@ -482,11 +486,11 @@ impl ResourceRepository for CachedResourceRepository {
                 }
                 let current_generation = current.generation;
                 let current_fingerprint = current.fingerprint;
-                if current_fingerprint != observed_fingerprint {
+                if current_fingerprint == observed_fingerprint {
+                    slot.generation = current_generation;
+                } else {
                     slot.generation = current_generation.saturating_add(1);
                     state.payload_cache.remove_archive(id);
-                } else {
-                    slot.generation = current_generation;
                 }
                 state.unload_archive(id)?;
                 *state.archive_mut(id)? = slot;

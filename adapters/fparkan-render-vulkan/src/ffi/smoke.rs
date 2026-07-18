@@ -43,7 +43,7 @@ fn take_runtime_children_with_validation_snapshot<
     surface: &mut Option<Surface>,
     device: &mut Option<Device>,
     swapchain: &mut Option<Swapchain>,
-    validation: &Option<Validation>,
+    validation: Option<&Validation>,
     capture: Capture,
 ) -> Option<Snapshot>
 where
@@ -52,7 +52,7 @@ where
     swapchain.take();
     device.take();
     surface.take();
-    validation.as_ref().map(capture)
+    validation.map(capture)
 }
 
 struct RollbackOnDrop<T, F>
@@ -672,7 +672,7 @@ impl VulkanSmokeRenderer {
             &mut self.surface,
             &mut self.device,
             &mut self.swapchain,
-            &self.validation,
+            self.validation.as_ref(),
             VulkanValidationMessenger::report,
         )
         .unwrap_or_default();
@@ -695,7 +695,7 @@ impl VulkanSmokeRenderer {
             &mut self.surface,
             &mut self.device,
             &mut self.swapchain,
-            &self.validation,
+            self.validation.as_ref(),
             VulkanValidationMessenger::report,
         );
         self.validation.take();
@@ -864,7 +864,7 @@ mod tests {
             &mut surface,
             &mut device,
             &mut swapchain,
-            &validation,
+            validation.as_ref(),
             |_| {
                 log.borrow_mut().push(TeardownStep::Snapshot);
                 TeardownStep::Validation

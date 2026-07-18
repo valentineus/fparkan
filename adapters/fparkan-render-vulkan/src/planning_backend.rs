@@ -10,20 +10,15 @@ use crate::{
 };
 
 /// Vulkan backend migration readiness.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum VulkanPlanningBackendState {
     /// Planning facade is configured and able to accept command lists.
+    #[default]
     Configured,
     /// Adapter is tracking a recoverable runtime surface/depth pipeline fault.
     Degraded,
     /// Adapter has encountered a non-recoverable error.
     Error,
-}
-
-impl Default for VulkanPlanningBackendState {
-    fn default() -> Self {
-        Self::Configured
-    }
 }
 
 /// Diagnostics for planning-facade request tracking.

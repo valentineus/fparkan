@@ -1270,7 +1270,7 @@ mod tests {
             Err(NresError::Binary(DecodeError::LimitExceeded {
                 count,
                 limit
-            })) if count == i32::MAX as u64 && limit == DecodeLimits::default().max_entries as u64
+            })) if count == i32::MAX as u64 && limit == u64::from(DecodeLimits::default().max_entries)
         ));
     }
 

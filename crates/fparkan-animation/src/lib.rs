@@ -4,7 +4,6 @@
     allow(
         clippy::cast_possible_truncation,
         clippy::cast_possible_wrap,
-        clippy::cast_precision_loss,
         clippy::expect_used,
         clippy::float_cmp,
         clippy::identity_op,

@@ -1053,7 +1053,7 @@ mod tests {
                 handles.push(handle);
             }
             for (index, handle) in handles.iter().copied().enumerate() {
-                if (seed as usize + index) % 3 == 0 {
+                if (seed as usize + index).is_multiple_of(3) {
                     request_delete(&mut world, handle).expect("delete");
                 } else {
                     enqueue(

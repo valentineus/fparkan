@@ -122,7 +122,7 @@ impl DirectoryVfs {
         resolve_casefolded(&self.root, path)
     }
 
-    fn metadata_from_host_file(&self, path: &Path) -> Result<VfsMetadata, VfsError> {
+    fn metadata_from_host_file(path: &Path) -> Result<VfsMetadata, VfsError> {
         let metadata = fs::symlink_metadata(path).map_err(VfsError::Io)?;
         metadata_from_host_file(path, &metadata)
     }
@@ -130,7 +130,7 @@ impl DirectoryVfs {
 
 impl Vfs for DirectoryVfs {
     fn metadata(&self, path: &NormalizedPath) -> Result<VfsMetadata, VfsError> {
-        self.metadata_from_host_file(&self.host_path(path)?)
+        Self::metadata_from_host_file(&self.host_path(path)?)
     }
 
     fn read(&self, path: &NormalizedPath) -> Result<Arc<[u8]>, VfsError> {

@@ -146,6 +146,8 @@ pub fn inspect_archive_file(path: &Path, sample_limit: usize) -> Result<ArchiveI
 /// # Errors
 ///
 /// Returns a [`Diagnostic`] when the archive cannot be read or decoded.
+// Diagnostic is deliberately returned by value as the public structured-error contract.
+#[allow(clippy::result_large_err)]
 pub fn inspect_archive_file_diagnostic(
     path: &Path,
     sample_limit: usize,
@@ -206,6 +208,8 @@ pub fn inspect_archive_file_diagnostic(
 }
 
 /// Inspects archive bytes and returns a typed summary.
+// Keeps the internal diagnostic flow aligned with the public structured-error contract.
+#[allow(clippy::result_large_err)]
 fn inspect_archive_bytes(
     bytes: &[u8],
     sample_limit: usize,
@@ -371,6 +375,8 @@ fn inspect_land_map(document: &NresDocument) -> Result<MapInspection, String> {
     })
 }
 
+// Preserves the shared structured-error type without changing callers to boxed errors.
+#[allow(clippy::result_large_err)]
 fn read_resource_bytes_diagnostic(
     root: &Path,
     archive: &str,
@@ -438,6 +444,8 @@ fn read_resource_bytes_diagnostic(
     Ok(Arc::from(bytes.into_owned()))
 }
 
+// Preserves the shared structured-error type without changing callers to boxed errors.
+#[allow(clippy::result_large_err)]
 fn load_model_document_from_root_diagnostic(
     root: &Path,
     archive: &str,
