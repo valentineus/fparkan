@@ -101,6 +101,13 @@ internal record. В этой ветке не видно прямого World3D/B
 открытыми; до dynamic capture Rust возвращает явный
 unsupported result, а не «примерный» game command.
 
+У этой границы также нет скрытого immediate dispatch: после добавления новой
+записи `0x100059f0` вызывает `0x1000f920`, а Ghidra 12.1.2 декомпилирует эту
+функцию как пустой `return`. Следовательно, найденные `<base>_Start` и
+`<base>_Continue` только кэшируются в scheduler state; их фактический consumer
+находится в отдельном позднем update path. Воспроизводимый read-only extractor:
+`tools/ghidra/ExportAiVmHandler2Dispatch.java`.
+
 Следующий static pass закрывает equality/update policy. Identity ровно равна
 `(slot0 word, slot4 IEEE-754 bits, slot5 IEEE-754 bits)`, поэтому `-0.0` и
 `+0.0` различаются. Новый 100-byte record получает slot1 в поле `+0x14`,
