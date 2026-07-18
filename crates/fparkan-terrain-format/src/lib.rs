@@ -198,6 +198,19 @@ pub struct TerrainSlotRenderDispatch {
     pub pair_count: u16,
 }
 
+/// One pair consumed by the original terrain material-batch dispatcher.
+///
+/// These four bytes live in the type-11 stream. `material_lookup` is handed to
+/// `GetShade`'s material lookup, while bit `0x10` of `flags` creates a batch
+/// boundary. Other flag bits remain raw.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerrainMaterialPair {
+    /// Lookup id supplied to the shade material manager.
+    pub material_lookup: u16,
+    /// Opaque pair flags; bit `0x10` is a proven batch boundary.
+    pub flags: u16,
+}
+
 impl TerrainSlotTable {
     /// Returns the render-dispatch header for one decoded slot record.
     #[must_use]
@@ -236,6 +249,29 @@ pub struct LandMeshDocument {
     pub aux18: Vec<[u8; 4]>,
     /// Faces.
     pub faces: Vec<TerrainFace28>,
+}
+
+impl LandMeshDocument {
+    /// Resolves the type-11 material pairs addressed by one 68-byte slot.
+    ///
+    /// Returns `None` when the slot is absent or its pair range does not fit
+    /// the retained type-11 stream.
+    #[must_use]
+    pub fn slot_material_pairs(&self, slot_index: usize) -> Option<Vec<TerrainMaterialPair>> {
+        let dispatch = self.slots.render_dispatch(slot_index)?;
+        let start = usize::from(dispatch.pair_table_index);
+        let end = start.checked_add(usize::from(dispatch.pair_count))?;
+        let pairs = self.accelerator.get(start..end)?;
+        Some(
+            pairs
+                .iter()
+                .map(|raw| TerrainMaterialPair {
+                    material_lookup: u16::from_le_bytes([raw[0], raw[1]]),
+                    flags: u16::from_le_bytes([raw[2], raw[3]]),
+                })
+                .collect(),
+        )
+    }
 }
 
 /// Decoded `Land.map` document.
@@ -1505,6 +1541,38 @@ mod tests {
             })
         );
         assert_eq!(slots.render_dispatch(1), None);
+    }
+
+    #[test]
+    fn slot_material_pairs_use_type11_pair_table_and_preserve_flags() {
+        let nres =
+            decode_nres(&minimal_land_msh(&face([0, 1, 2], [None, None, None]))).expect("nres");
+        let mut document = decode_land_msh(&nres).expect("land mesh");
+        document.slots = TerrainSlotTable {
+            header_raw: SLOT_HEADER_ZERO.to_vec(),
+            slots_raw: vec![[0_u8; SLOT_STRIDE]],
+        };
+        document.slots.slots_raw[0][..2].copy_from_slice(&1_u16.to_le_bytes());
+        document.slots.slots_raw[0][2..4].copy_from_slice(&2_u16.to_le_bytes());
+        document.accelerator = vec![[0, 0, 0, 0], [2, 1, 0, 0], [3, 2, 0x10, 0]];
+
+        assert_eq!(
+            document.slot_material_pairs(0),
+            Some(vec![
+                TerrainMaterialPair {
+                    material_lookup: 0x0102,
+                    flags: 0,
+                },
+                TerrainMaterialPair {
+                    material_lookup: 0x0203,
+                    flags: 0x0010,
+                },
+            ])
+        );
+        assert_eq!(document.slot_material_pairs(1), None);
+
+        document.slots.slots_raw[0][2..4].copy_from_slice(&3_u16.to_le_bytes());
+        assert_eq!(document.slot_material_pairs(0), None);
     }
 
     #[test]

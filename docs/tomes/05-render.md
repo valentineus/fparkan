@@ -1582,8 +1582,11 @@ preceding slot `+60` call sets its visibility mode. Slot `+16` consumes the
 second word as the count of adjacent `u16` pairs and the first as the pair-table
 index, then groups the pairs by material lookup before constructing draw work.
 `TerrainSlotTable::render_dispatch` exposes exactly those two proven disk
-fields. The pair payload, its material key, and the final blend operation remain
-unassigned.
+fields, while `LandMeshDocument::slot_material_pairs` decodes the selected
+type-11 entries as `{ material_lookup: u16, flags: u16 }`. Flag `0x0010` is a
+proven batch boundary in `GetShade`; the lookup's mapping to the two WEAR
+tables, the meanings of its remaining flags, and the final blend operation
+remain unassigned.
 
 The static Vulkan bridge now carries each contiguous face run as a separate
 draw range keyed by the original packed `material_tag`; it neither reorders
