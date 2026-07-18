@@ -113,7 +113,7 @@ struct SmokeOptions {
     resize_frame: u32,
     timeout_seconds: u64,
     mesh_input: MeshInput,
-    texture_input: Option<ResourceInput>,
+    texture_input: Option<TextureInput>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -121,6 +121,44 @@ struct ResourceInput {
     root: PathBuf,
     archive: String,
     name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WearMaterialInput {
+    root: PathBuf,
+    archive: String,
+    name: String,
+    material_index: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TextureInput {
+    Direct(ResourceInput),
+    WearMaterial(WearMaterialInput),
+}
+
+impl TextureInput {
+    fn source(&self) -> &'static str {
+        match self {
+            Self::Direct(_) => "original-texm",
+            Self::WearMaterial(_) => "original-wear-mat0-texm",
+        }
+    }
+
+    fn archive(&self) -> &str {
+        match self {
+            Self::Direct(input) => &input.archive,
+            Self::WearMaterial(_) => "Textures.lib",
+        }
+    }
+
+    fn requested_name(&self) -> &str {
+        match self {
+            Self::Direct(input) => &input.name,
+            // The selected name comes from MAT0 at load time and is not a CLI request.
+            Self::WearMaterial(_) => "",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -169,6 +207,10 @@ impl SmokeOptions {
         let mut texture_root = None;
         let mut texture_archive = None;
         let mut texture_name = None;
+        let mut wear_root = None;
+        let mut wear_archive = None;
+        let mut wear_name = None;
+        let mut material_index = None;
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -242,6 +284,35 @@ impl SmokeOptions {
                             .ok_or_else(|| "--texture-name requires a value".to_string())?,
                     );
                 }
+                "--wear-root" => {
+                    wear_root = Some(
+                        iter.next()
+                            .map(PathBuf::from)
+                            .ok_or_else(|| "--wear-root requires a path".to_string())?,
+                    );
+                }
+                "--wear-archive" => {
+                    wear_archive = Some(
+                        iter.next()
+                            .cloned()
+                            .ok_or_else(|| "--wear-archive requires a value".to_string())?,
+                    );
+                }
+                "--wear-name" => {
+                    wear_name = Some(
+                        iter.next()
+                            .cloned()
+                            .ok_or_else(|| "--wear-name requires a value".to_string())?,
+                    );
+                }
+                "--material-index" => {
+                    material_index = Some(
+                        iter.next()
+                            .ok_or_else(|| "--material-index requires a value".to_string())?
+                            .parse()
+                            .map_err(|_| "--material-index must be a u16".to_string())?,
+                    );
+                }
                 _ => return Err(format!("unknown native smoke option: {arg}")),
             }
         }
@@ -270,11 +341,11 @@ impl SmokeOptions {
         };
         let texture_input = match (texture_root, texture_archive, texture_name) {
             (None, None, None) => None,
-            (Some(root), Some(archive), Some(name)) => Some(ResourceInput {
+            (Some(root), Some(archive), Some(name)) => Some(TextureInput::Direct(ResourceInput {
                 root,
                 archive,
                 name,
-            }),
+            })),
             _ => {
                 return Err(
                     "--texture-root, --texture-archive and --texture-name must be supplied together"
@@ -282,13 +353,36 @@ impl SmokeOptions {
                 );
             }
         };
+        let wear_material_input = match (wear_root, wear_archive, wear_name, material_index) {
+            (None, None, None, None) => None,
+            (Some(root), Some(archive), Some(name), Some(material_index)) => {
+                Some(TextureInput::WearMaterial(WearMaterialInput {
+                    root,
+                    archive,
+                    name,
+                    material_index,
+                }))
+            }
+            _ => {
+                return Err(
+                    "--wear-root, --wear-archive, --wear-name and --material-index must be supplied together"
+                        .to_string(),
+                );
+            }
+        };
+        if texture_input.is_some() && wear_material_input.is_some() {
+            return Err(
+                "manual --texture-* input cannot be combined with --wear-* material input"
+                    .to_string(),
+            );
+        }
         Ok(Self {
             out,
             frames,
             resize_frame,
             timeout_seconds,
             mesh_input,
-            texture_input,
+            texture_input: texture_input.or(wear_material_input),
         })
     }
 
@@ -306,26 +400,50 @@ impl SmokeOptions {
         }
     }
 
-    fn load_texture(&self) -> Result<Option<VulkanStaticTexture>, String> {
+    fn load_texture(&self) -> Result<Option<LoadedTexture>, String> {
         self.texture_input.as_ref().map_or(Ok(None), |input| {
-            let image = fparkan_inspection::load_texture_mip0_rgba8_from_root(
-                &input.root,
-                &input.archive,
-                &input.name,
-            )?;
-            Ok(Some(VulkanStaticTexture {
-                width: image.width,
-                height: image.height,
-                rgba8: image.rgba8,
+            let (image, selected_name) = match input {
+                TextureInput::Direct(input) => (
+                    fparkan_inspection::load_texture_mip0_rgba8_from_root(
+                        &input.root,
+                        &input.archive,
+                        &input.name,
+                    )?,
+                    input.name.clone(),
+                ),
+                TextureInput::WearMaterial(input) => {
+                    let selected =
+                        fparkan_inspection::load_wear_material_texture_mip0_rgba8_from_root(
+                            &input.root,
+                            &input.archive,
+                            &input.name,
+                            input.material_index,
+                        )?;
+                    (selected.image, selected.texture_name)
+                }
+            };
+            Ok(Some(LoadedTexture {
+                texture: VulkanStaticTexture {
+                    width: image.width,
+                    height: image.height,
+                    rgba8: image.rgba8,
+                },
+                selected_name,
             }))
         })
     }
 }
 
+#[derive(Clone, Debug)]
+struct LoadedTexture {
+    texture: VulkanStaticTexture,
+    selected_name: String,
+}
+
 struct SmokeApp {
     options: SmokeOptions,
     mesh: VulkanStaticMesh,
-    texture: Option<VulkanStaticTexture>,
+    texture: Option<LoadedTexture>,
     completed: Arc<AtomicBool>,
     progress: Arc<SharedSmokeProgress>,
     window_id: Option<WindowId>,
@@ -370,7 +488,7 @@ impl SmokeApp {
     fn new(
         options: SmokeOptions,
         mesh: VulkanStaticMesh,
-        texture: Option<VulkanStaticTexture>,
+        texture: Option<LoadedTexture>,
         completed: Arc<AtomicBool>,
         progress: Arc<SharedSmokeProgress>,
     ) -> Self {
@@ -478,19 +596,29 @@ impl SmokeApp {
                 .options
                 .texture_input
                 .as_ref()
-                .map_or("none", |_| "original-texm"),
+                .map_or("none", TextureInput::source),
             texture_archive: self
                 .options
                 .texture_input
                 .as_ref()
-                .map_or("", |input| input.archive.as_str()),
-            texture_name: self
-                .options
-                .texture_input
+                .map_or("", TextureInput::archive),
+            texture_name: self.texture.as_ref().map_or_else(
+                || {
+                    self.options
+                        .texture_input
+                        .as_ref()
+                        .map_or("", TextureInput::requested_name)
+                },
+                |texture| texture.selected_name.as_str(),
+            ),
+            texture_width: self
+                .texture
                 .as_ref()
-                .map_or("", |input| input.name.as_str()),
-            texture_width: self.texture.as_ref().map_or(0, |texture| texture.width),
-            texture_height: self.texture.as_ref().map_or(0, |texture| texture.height),
+                .map_or(0, |texture| texture.texture.width),
+            texture_height: self
+                .texture
+                .as_ref()
+                .map_or(0, |texture| texture.texture.height),
             shader_manifest_hash: renderer
                 .as_ref()
                 .map_or("", |snapshot| snapshot.report.shader_manifest_hash.as_str()),
@@ -698,15 +826,15 @@ fn render_timeout_failure_report(
         texture_source: options
             .texture_input
             .as_ref()
-            .map_or("none", |_| "original-texm"),
+            .map_or("none", TextureInput::source),
         texture_archive: options
             .texture_input
             .as_ref()
-            .map_or("", |input| input.archive.as_str()),
+            .map_or("", TextureInput::archive),
         texture_name: options
             .texture_input
             .as_ref()
-            .map_or("", |input| input.name.as_str()),
+            .map_or("", TextureInput::requested_name),
         texture_width: 0,
         texture_height: 0,
         shader_manifest_hash: "",
@@ -804,7 +932,7 @@ impl ApplicationHandler for SmokeApp {
             render_request: RenderRequest::conservative(),
             enable_validation: true,
             mesh: self.mesh.clone(),
-            texture: self.texture.clone(),
+            texture: self.texture.as_ref().map(|texture| texture.texture.clone()),
             bootstrap_progress: Some(Arc::clone(&self.progress.bootstrap)),
         }) {
             Ok(renderer) => renderer,
@@ -1297,9 +1425,38 @@ mod tests {
         assert!(matches!(
             parsed,
             Ok(SmokeOptions {
-                texture_input: Some(ResourceInput { archive, name, .. }),
+                texture_input: Some(TextureInput::Direct(ResourceInput { archive, name, .. })),
                 ..
             }) if archive == "Textures.lib" && name == "DEFAULT.0"
+        ));
+    }
+
+    #[test]
+    fn parses_original_wear_material_input_as_one_atomic_request() {
+        let parsed = SmokeOptions::parse(&[
+            "--out".to_string(),
+            "target/report.json".to_string(),
+            "--wear-root".to_string(),
+            "C:/GOG".to_string(),
+            "--wear-archive".to_string(),
+            "system.rlb".to_string(),
+            "--wear-name".to_string(),
+            "MODEL.WEA".to_string(),
+            "--material-index".to_string(),
+            "7".to_string(),
+        ]);
+
+        assert!(matches!(
+            parsed,
+            Ok(SmokeOptions {
+                texture_input: Some(TextureInput::WearMaterial(WearMaterialInput {
+                    archive,
+                    name,
+                    material_index,
+                    ..
+                })),
+                ..
+            }) if archive == "system.rlb" && name == "MODEL.WEA" && material_index == 7
         ));
     }
 
