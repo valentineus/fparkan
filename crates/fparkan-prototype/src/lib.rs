@@ -169,6 +169,12 @@ pub struct PrototypeGraphProvenance {
     pub root_index: usize,
     /// Immediate parent edge that discovered this edge.
     pub parent_edge: Option<PrototypeGraphEdgeId>,
+    /// Ordered Unit DAT record selected for this path, when the root is a
+    /// decoded multi-component unit.
+    ///
+    /// The index identifies source provenance only; it does not classify the
+    /// component as physics, Control, animation, or any other subsystem.
+    pub unit_component_index: Option<usize>,
     /// Source archive when available.
     pub archive: Option<String>,
     /// Source resource key when available.
@@ -755,8 +761,12 @@ pub fn build_prototype_graph(
         graph
             .root_unit_components
             .push(expansion.unit_components.clone());
-        let root_provenance = provenance_for_root(root_index, root);
-        for prototype in expansion.prototypes {
+        let unit_component_count = expansion.unit_components.len();
+        for (prototype_index, prototype) in expansion.prototypes.into_iter().enumerate() {
+            let unit_component_index = is_unit_dat_root
+                .then_some(prototype_index)
+                .filter(|index| *index < unit_component_count);
+            let root_provenance = provenance_for_root(root_index, root, unit_component_index);
             let prototype_node = PrototypeGraphNode::prototype(
                 prototype.key.clone(),
                 PrototypeGraphNodeId(next_node),
@@ -795,6 +805,7 @@ pub fn build_prototype_graph(
                     provenance: Some(provenance_for_mesh(
                         root_index,
                         root_to_prototype_edge_id,
+                        unit_component_index,
                         dependency,
                     )),
                 });
@@ -850,8 +861,6 @@ pub fn build_prototype_graph_report(
             root_node,
         ));
         let start = graph.prototype_requests.len();
-        let root_provenance = provenance_for_root(root_index, root);
-
         match resolve_prototype_requests(repository, vfs, root) {
             Ok(expansion) => {
                 let expected = expansion.expected_count;
@@ -862,7 +871,13 @@ pub fn build_prototype_graph_report(
                     report.unit_component_count += expected;
                 }
                 let actual = expansion.prototypes.len();
-                for prototype in expansion.prototypes {
+                let unit_component_count = expansion.unit_components.len();
+                for (prototype_index, prototype) in expansion.prototypes.into_iter().enumerate() {
+                    let unit_component_index = is_unit_dat_root
+                        .then_some(prototype_index)
+                        .filter(|index| *index < unit_component_count);
+                    let root_provenance =
+                        provenance_for_root(root_index, root, unit_component_index);
                     let prototype_node = PrototypeGraphNode::prototype(
                         prototype.key.clone(),
                         PrototypeGraphNodeId(next_node),
@@ -903,6 +918,7 @@ pub fn build_prototype_graph_report(
                             provenance: Some(provenance_for_mesh(
                                 root_index,
                                 root_to_prototype_edge_id,
+                                unit_component_index,
                                 dependency,
                             )),
                         });
@@ -924,6 +940,7 @@ pub fn build_prototype_graph_report(
                         provenance: Some(PrototypeGraphProvenance {
                             root_index,
                             parent_edge: None,
+                            unit_component_index: None,
                             archive: None,
                             resource: Some(root.0.clone()),
                             span: None,
@@ -940,6 +957,7 @@ pub fn build_prototype_graph_report(
                 provenance: Some(PrototypeGraphProvenance {
                     root_index,
                     parent_edge: None,
+                    unit_component_index: None,
                     archive: None,
                     resource: Some(root.0.clone()),
                     span: None,
@@ -984,10 +1002,15 @@ fn graph_error_edge(edge: PrototypeGraphEdge, err: &PrototypeError) -> Prototype
     }
 }
 
-fn provenance_for_root(root_index: usize, root: &ResourceName) -> PrototypeGraphProvenance {
+fn provenance_for_root(
+    root_index: usize,
+    root: &ResourceName,
+    unit_component_index: Option<usize>,
+) -> PrototypeGraphProvenance {
     PrototypeGraphProvenance {
         root_index,
         parent_edge: None,
+        unit_component_index,
         archive: None,
         resource: Some(root.0.clone()),
         span: None,
@@ -997,11 +1020,13 @@ fn provenance_for_root(root_index: usize, root: &ResourceName) -> PrototypeGraph
 fn provenance_for_mesh(
     root_index: usize,
     parent_edge: PrototypeGraphEdgeId,
+    unit_component_index: Option<usize>,
     dependency: &ResourceKey,
 ) -> PrototypeGraphProvenance {
     PrototypeGraphProvenance {
         root_index,
         parent_edge: Some(parent_edge),
+        unit_component_index,
         archive: Some(dependency.archive.as_str().to_string()),
         resource: Some(dependency.name.0.clone()),
         span: None,
@@ -1800,6 +1825,35 @@ mod tests {
             cstr_bytes(&graph.root_unit_components[0][1].resource_raw),
             b"component_b"
         );
+        let component_edges: Vec<_> = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == PrototypeGraphEdgeKind::UnitDatToComponent)
+            .collect();
+        assert_eq!(component_edges.len(), 2);
+        assert_eq!(
+            component_edges[0]
+                .provenance
+                .as_ref()
+                .and_then(|provenance| provenance.unit_component_index),
+            Some(0)
+        );
+        assert_eq!(
+            component_edges[1]
+                .provenance
+                .as_ref()
+                .and_then(|provenance| provenance.unit_component_index),
+            Some(1)
+        );
+        assert!(graph
+            .edges
+            .iter()
+            .filter(|edge| edge.kind == PrototypeGraphEdgeKind::PrototypeToMesh)
+            .all(|edge| edge
+                .provenance
+                .as_ref()
+                .and_then(|value| value.unit_component_index)
+                .is_some()));
         assert_eq!(resolved.len(), 2);
         assert_eq!(report.unit_reference_count, 1);
         assert_eq!(report.unit_component_count, 2);

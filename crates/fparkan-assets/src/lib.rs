@@ -1627,6 +1627,7 @@ fn provenance_for_resource(
     PrototypeGraphProvenance {
         root_index,
         parent_edge,
+        unit_component_index: None,
         archive: Some(resource.archive.display_lossy().to_string()),
         resource: Some(resource.name.0.clone()),
         span: None,
@@ -2020,6 +2021,7 @@ fn push_visual_failure(
         provenance: Some(PrototypeGraphProvenance {
             root_index,
             parent_edge,
+            unit_component_index: None,
             archive: dependency.map(|resource| resource.archive.as_str().to_string()),
             resource: Some(resource_raw),
             span: None,
