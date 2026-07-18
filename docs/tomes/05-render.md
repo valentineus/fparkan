@@ -1261,13 +1261,13 @@ matrix convention; they must not be treated as a usable renderer ABI yet.
 ### Buffering-camera projection path from static Terrain analysis
 
 A further headless-IDA review of the same GOG `Terrain.dll` identifies a
-concrete `CBufferingCamera` implementation path without requiring a live game
-process. Its method at RVA `0x4D740` copies exactly 64 bytes (16 dwords) into
-the component at offset `+0x10`. Its frame-preparation method at RVA `0x4D9C0`
-queries a viewport rectangle through a virtual method at `+0x3C`, derives its
+`CBufferingCamera`-related implementation path without requiring a live game
+process. The procedure at RVA `0x4D740` copies exactly 64 bytes (16 dwords)
+into its receiver at offset `+0x10`. The frame-preparation procedure at RVA
+`0x4D9C0` queries a viewport rectangle through a virtual method at `+0x3C`, derives its
 width, height, centre and an aspect ratio from that rectangle, and obtains
 projection data through the camera interface. Projection type `0` uses a
-component float at offset `+0x234` as an angle passed to `tan(angle / 2)`;
+receiver float at offset `+0x234` as an angle passed to `tan(angle / 2)`;
 projection type `2` obtains a five-float block through a virtual method at
 `+0x70`. Any other non-zero type raises `Not supported projection type`.
 
@@ -1278,6 +1278,18 @@ handedness, or the initial mission camera object. In particular, the exported
 string-labelled `ICamera::SetTransformMatrix` (RVA `0x4F830`) and
 `ICamera::GetTransformMatrix` (RVA `0x4F850`) are both obsolete-call stubs, so
 they are not a usable method ABI.
+
+Live read-only evidence now confirms the relocation-aware global contract. In
+one elevated GOG run, `Terrain.dll` loaded at `0x02510000`; its global at
+`base + 0x7355C` held non-null `0x0B37DF08`, whose first dword was
+`0x025765B4` — exactly the relocated `off_100665B4` vtable from the
+`LoadCamera` construction path. This proves the global is a live camera object
+with that outer vtable. It also corrects an overreach: raw reads at global
+offsets `+0x10` and `+0x234` did not yield a finite 4×4 matrix and a projection
+angle in this sample. The static procedures' receiver and the exported global
+pointer are therefore not yet proven to have the same adjustment/layout; those
+offsets must remain unassigned until the selector/interface relationship is
+recovered.
 
 A fresh no-input launch of the canonical `iron_3d.exe` did create a responsive
 window titled `Parkan. Железная Стратегия`. A read-only probe then requested

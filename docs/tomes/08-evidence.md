@@ -268,6 +268,16 @@ near/far mapping, handedness или initial camera selection. Важно, что
 `ICamera::GetTransformMatrix` (RVA `0x4F850`) ведут только в obsolete-call
 stubs и не дают usable ABI.
 
+Live elevated read-only probe впервые подтвердил relocation-aware runtime связь:
+`Terrain.dll` был загружен по `0x02510000`, global `base + 0x7355C` содержал
+non-null `0x0B37DF08`, а первый dword этого объекта был `0x025765B4` — ровно
+relocated `off_100665B4` из `LoadCamera` construction path. Это доказывает
+live camera object с outer vtable, но одновременно исправляет прежнее слишком
+сильное сопоставление offsets: raw read `global + 0x10` не дал finite 4x4 matrix,
+а `+0x234` был zero в данном sample. Receiver static procedures `0x4D740`/
+`0x4D9C0` и exported global ещё не доказаны как один layout без interface
+adjustment; их offsets остаются unassigned до recovery selector relationship.
+
 Локальная IDA-база уточняет адреса этой связи: `stdGetCurrentCamera2` — это
 шестибайтный getter по RVA `0x4FD80`, который возвращает `dword` по RVA
 `0x7355C`. Единственный найденный initializer этого global — функция Terrain
