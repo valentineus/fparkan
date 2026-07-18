@@ -244,6 +244,16 @@ end-of-render callbacks вынесен также в отдельный `sendEnd
 Это доказывает порядок передачи camera и границы frame lifecycle, но не layout
 camera object, не матрицы projection/view и не значения viewport selectors.
 
+Отдельная проверка GOG `Terrain.dll` (`AF87D1B2E728A0BE73C52BE3B44CC196AB46DA7799F25A15D40F8C9B0B425EAD`,
+499 712 bytes) уточняет receiver side. `stdSetCurrentCamera2` находится по
+RVA `0x4FD40`: при инициализированном Terrain он требует у переданного объекта
+interface selector `18` и вызывает slot `+12` результата. Он **не** записывает
+переданный pointer в `stdGetCurrentCamera2`. Последний возвращает Terrain global,
+который внутренний initialization path устанавливает результатом selector `8` на
+Terrain object. Следовательно, selector `18`, slot `+12` и global selector `8`
+должны оставаться именованными evidence boundary до dynamic capture; считать
+`stdGetCurrentCamera2` getter-ом переданной camera было бы ошибкой.
+
 ### Vtable и interface negotiation
 
 Вызовы вида `object->vfunc(offset)` доказывают порядок slots, даже когда имя

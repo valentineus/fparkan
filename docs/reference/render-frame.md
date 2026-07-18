@@ -50,6 +50,13 @@ the frame, and clears it before return. `sendEndOfRender` is a separate export
 at RVA `0x13D90`. This is frame-order evidence only: the camera ABI, matrices
 and viewport values still require dynamic capture or further decompilation.
 
+Receiver-side GOG Terrain evidence refines this contract. `stdSetCurrentCamera2`
+(RVA `0x4FD40` in Terrain SHA-256
+`af87d1b2e728a0be73c52be3b44cc196ab46da7799f25a15d40f8c9b0b425ead`) queries
+selector `18` on the supplied object and invokes slot `+12` on that result. It
+does not store the supplied pointer in `stdGetCurrentCamera2`; that getter
+returns a Terrain global populated by selector `8` during Terrain initialization.
+
 ## Parity risks
 
 - x87 precision and rounding;

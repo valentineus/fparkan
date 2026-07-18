@@ -19,6 +19,15 @@
 | `Terrain.dll` | `6d3e68f0e15b297f6c184af3113baf1f31e19c3326c18f0150dec659242ed667` | 708608 | Shared terrain/shade/world baseline |
 | `iron_3d.exe` / `iron_3d_p2.exe` | `f476af85c034a4b4f34f49d0806e4dff397b5da0ee26d382a7674231144979f7` | 36864 | Shared launcher binary |
 
+## GOG research baseline
+
+The canonical disassembly source is the windowed GOG installation, not the
+Part 1/Part 2 test installations. Its `Terrain.dll` is a distinct revision:
+
+| Binary | SHA-256 | Size | Notes |
+| --- | --- | ---: | --- |
+| `Terrain.dll` | `af87d1b2e728a0be73c52be3b44cc196ab46da7799f25a15d40f8c9b0b425ead` | 499712 | GOG camera receiver evidence; do not reuse Part 1/2 RVAs without a matching hash |
+
 ## Divergent binaries across Part 1 / Part 2
 
 Эти модули нельзя автоматически считать behavior-compatible между частями:
