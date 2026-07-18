@@ -1345,6 +1345,17 @@ non-affine block and, crucially, does **not** identify that inverse as a view
 matrix. Whether a selector result is camera-to-world or already a renderer
 transform remains an evidence boundary.
 
+The active camera now also has a proven live projection-interface boundary.
+`LoadCamera` stores its selector-18 camera interface at outer offset `+0x19C`;
+in the elevated GOG AutoDemo sample it was a `CBufferingCamera` object with
+relocated vtable `0x02576344`. Its rectangle at `+0x10` was exactly
+`(left=0, top=0, right=1024, bottom=768)`, its projection-type field at
+`+0x230` was `0`, and its FOV field at `+0x234` was `1.04` radians.
+`CBufferingCamera` passes that FOV to `tan(fov / 2)` on its type-0 projection
+path. This proves the live vertical-angle input and viewport for this sample;
+it does not yet assign the two remaining projection values, near/far planes,
+depth range, clip-space Y direction, or a Vulkan projection matrix.
+
 A fresh no-input launch of the canonical `iron_3d.exe` did create a responsive
 window titled `Parkan. Железная Стратегия`. A read-only probe then requested
 `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ` and attempted to read the known
