@@ -1291,6 +1291,19 @@ pointer are therefore not yet proven to have the same adjustment/layout; those
 offsets must remain unassigned until the selector/interface relationship is
 recovered.
 
+The unattended demo also proves that this global is dynamic. Across 25 seconds
+of read-only sampling it held three distinct heap pointers; all began with the
+same relocated outer vtables `0x025765B4` and `0x02576558`. Two selected
+objects exposed synchronized translation triples in the paired raw blocks at
+offsets `+0x2C/+0x3C/+0x4C` and `+0x6C/+0x7C/+0x8C`, with world-like values
+such as `(491.562, 761.551, 7.361)`. A third object used the same vtable but
+reported normalized-looking values near `(0.098, 0.018, 0.856)` and did not
+match the paired block. The observed pointer transitions are consistent with
+the unattended camera changes, but the sample carries no mode label and does
+not prove first- versus third-person identity. It does prove that the static
+direct-xref initializer is not the sole runtime writer of the global; indirect
+or unanalyzed write paths remain to be recovered.
+
 A fresh no-input launch of the canonical `iron_3d.exe` did create a responsive
 window titled `Parkan. Железная Стратегия`. A read-only probe then requested
 `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ` and attempted to read the known

@@ -280,11 +280,21 @@ adjustment; их offsets остаются unassigned до recovery selector rela
 
 Локальная IDA-база уточняет адреса этой связи: `stdGetCurrentCamera2` — это
 шестибайтный getter по RVA `0x4FD80`, который возвращает `dword` по RVA
-`0x7355C`. Единственный найденный initializer этого global — функция Terrain
+`0x7355C`. Единственный найденный **direct static** initializer этого global — функция Terrain
 по RVA `0x4D4D0`: она запрашивает selector `8` у своего `this` и сохраняет
 полученный interface pointer. Это доказывает адрес хранения и путь заполнения,
 но не разрешает трактовать pointer как конкретный layout камеры либо читать его
 как runtime evidence без доступа к процессу на том же уровне привилегий.
+
+Elevated live sampling теперь доказывает, что direct static xref не исчерпывает
+runtime writers: за 25 секунд autoplay global переключился между тремя heap
+pointer, все с relocated outer vtables `0x025765B4`/`0x02576558`. У двух объектов
+paired blocks `+0x2C/+0x3C/+0x4C` и `+0x6C/+0x7C/+0x8C` синхронно несли
+world-like translation, например `(491.562, 761.551, 7.361)`; третий давал
+normalized-looking `(0.098, 0.018, 0.856)` и не совпадал с paired block.
+Наблюдение согласуется с автоматическими camera switches, но не маркирует mode;
+оно запрещает называть `0x4D4D0` единственным runtime writer и требует recovery
+indirect/unanalyzed write path.
 
 ### Vtable и interface negotiation
 
