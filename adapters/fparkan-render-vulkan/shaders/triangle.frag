@@ -7,6 +7,7 @@ layout(location = 0) out vec4 out_color;
 layout(set = 0, binding = 0) uniform sampler2D base_color;
 
 layout(push_constant) uniform AlphaTestConstants {
+    layout(offset = 64)
     float alpha_cutoff;
 } alpha_test;
 

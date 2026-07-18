@@ -111,6 +111,11 @@ impl VulkanSmokeRenderer {
             .mesh
             .validate()
             .map_err(|context| VulkanSmokeRendererError::InvalidStaticMesh { context })?;
+        if !create_info.camera.is_finite() {
+            return Err(VulkanSmokeRendererError::InvalidStaticCamera {
+                context: "non-finite clip_from_world matrix",
+            });
+        }
         let draw_texture_indices =
             resolve_draw_texture_indices(&create_info.mesh.draw_ranges, &create_info.materials)
                 .map_err(|context| VulkanSmokeRendererError::InvalidStaticMesh { context })?;
@@ -226,6 +231,7 @@ impl VulkanSmokeRenderer {
             textures,
             draw_ranges: create_info.mesh.draw_ranges.clone(),
             draw_texture_indices,
+            camera: create_info.camera,
             frame_sync: Vec::new(),
             images_in_flight: Vec::new(),
             current_frame: 0,
@@ -671,6 +677,14 @@ impl VulkanSmokeRenderer {
                 0,
                 vk::IndexType::UINT16,
             );
+            let clip_from_world = matrix_bytes(self.camera.clip_from_world);
+            device.device().cmd_push_constants(
+                command_buffer,
+                resources.pipeline_layout,
+                vk::ShaderStageFlags::VERTEX,
+                0,
+                &clip_from_world,
+            );
             for (range, &texture_index) in self.draw_ranges.iter().zip(&self.draw_texture_indices) {
                 let pipeline = resources.pipelines.get(&range.pipeline_key()).ok_or(
                     VulkanSmokeRendererError::InvariantViolation {
@@ -700,7 +714,7 @@ impl VulkanSmokeRenderer {
                     command_buffer,
                     resources.pipeline_layout,
                     vk::ShaderStageFlags::FRAGMENT,
-                    0,
+                    64,
                     &alpha_cutoff,
                 );
                 device.device().cmd_draw_indexed(
@@ -926,6 +940,14 @@ impl VulkanSmokeRenderer {
         self.validation.take();
         self.instance.take();
     }
+}
+
+fn matrix_bytes(matrix: [f32; 16]) -> [u8; 64] {
+    let mut bytes = [0; 64];
+    for (index, value) in matrix.into_iter().enumerate() {
+        bytes[index * 4..(index + 1) * 4].copy_from_slice(&value.to_ne_bytes());
+    }
+    bytes
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {

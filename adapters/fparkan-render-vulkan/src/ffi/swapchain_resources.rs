@@ -411,10 +411,16 @@ fn create_pipeline_layout(
     descriptor_set_layout: vk::DescriptorSetLayout,
 ) -> Result<vk::PipelineLayout, VulkanSmokeRendererError> {
     let set_layouts = [descriptor_set_layout];
-    let push_constant_ranges = [vk::PushConstantRange::default()
-        .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-        .offset(0)
-        .size(u32::try_from(std::mem::size_of::<f32>()).unwrap_or(u32::MAX))];
+    let push_constant_ranges = [
+        vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .offset(0)
+            .size(64),
+        vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            .offset(64)
+            .size(u32::try_from(std::mem::size_of::<f32>()).unwrap_or(u32::MAX)),
+    ];
     let create_info = vk::PipelineLayoutCreateInfo::default()
         .set_layouts(&set_layouts)
         .push_constant_ranges(&push_constant_ranges);
@@ -620,24 +626,24 @@ fn create_graphics_pipeline(
     ];
     let vertex_binding = vk::VertexInputBindingDescription::default()
         .binding(0)
-        .stride(u32::try_from(7 * std::mem::size_of::<f32>()).unwrap_or(u32::MAX))
+        .stride(u32::try_from(8 * std::mem::size_of::<f32>()).unwrap_or(u32::MAX))
         .input_rate(vk::VertexInputRate::VERTEX);
     let vertex_attributes = [
         vk::VertexInputAttributeDescription::default()
             .binding(0)
             .location(0)
-            .format(vk::Format::R32G32_SFLOAT)
+            .format(vk::Format::R32G32B32_SFLOAT)
             .offset(0),
         vk::VertexInputAttributeDescription::default()
             .binding(0)
             .location(1)
             .format(vk::Format::R32G32B32_SFLOAT)
-            .offset(u32::try_from(2 * std::mem::size_of::<f32>()).unwrap_or(u32::MAX)),
+            .offset(u32::try_from(3 * std::mem::size_of::<f32>()).unwrap_or(u32::MAX)),
         vk::VertexInputAttributeDescription::default()
             .binding(0)
             .location(2)
             .format(vk::Format::R32G32_SFLOAT)
-            .offset(u32::try_from(5 * std::mem::size_of::<f32>()).unwrap_or(u32::MAX)),
+            .offset(u32::try_from(6 * std::mem::size_of::<f32>()).unwrap_or(u32::MAX)),
     ];
     let vertex_bindings = [vertex_binding];
     let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default()

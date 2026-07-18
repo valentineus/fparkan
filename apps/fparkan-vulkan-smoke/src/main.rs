@@ -17,7 +17,8 @@ use fparkan_render_vulkan::{
     project_land_msh_to_static_mesh, project_msh_to_static_mesh, VulkanReadbackArtifact,
     VulkanSmokeBootstrapProgress, VulkanSmokeFrameOutcome, VulkanSmokeRenderer,
     VulkanSmokeRendererCreateInfo, VulkanSmokeRendererReport, VulkanSmokeShutdownReport,
-    VulkanStaticMaterial, VulkanStaticMesh, VulkanStaticTexture, VulkanValidationReport,
+    VulkanStaticCamera, VulkanStaticMaterial, VulkanStaticMesh, VulkanStaticTexture,
+    VulkanValidationReport,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -1175,6 +1176,7 @@ impl ApplicationHandler for SmokeApp {
             render_request: RenderRequest::conservative(),
             enable_validation: true,
             mesh: self.mesh.clone(),
+            camera: VulkanStaticCamera::default(),
             materials: self
                 .materials
                 .iter()

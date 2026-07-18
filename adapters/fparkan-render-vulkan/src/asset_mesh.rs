@@ -142,7 +142,11 @@ pub fn project_msh_to_static_mesh_in_xy_frame(
                 position[2] * scale[2] + translation[2],
             ];
             Ok(VulkanStaticVertex {
-                position: frame.project(transformed),
+                position: [
+                    frame.project(transformed)[0],
+                    frame.project(transformed)[1],
+                    0.0,
+                ],
                 color: [0.82, 0.72, 0.31],
                 // Iron3D stores Res5 UV0 as signed fixed point with 1/1024 units.
                 // Models that omit this optional stream retain the static viewer's
@@ -232,7 +236,11 @@ pub fn project_land_msh_to_static_mesh_in_xy_frame(
                 return Err(VulkanAssetMeshError::NonFinitePosition);
             }
             Ok(VulkanStaticVertex {
-                position: frame.project(*position),
+                position: [
+                    frame.project(*position)[0],
+                    frame.project(*position)[1],
+                    0.0,
+                ],
                 color: [0.31, 0.58, 0.27],
                 uv: terrain
                     .uv0
@@ -380,9 +388,9 @@ mod tests {
                 alpha_test_reference: 0,
             }]
         );
-        assert_eq!(mesh.vertices[1].position, [-0.8, -0.8]);
-        assert_eq!(mesh.vertices[2].position, [0.8, -0.8]);
-        assert_eq!(mesh.vertices[3].position, [-0.8, 0.8]);
+        assert_eq!(mesh.vertices[1].position, [-0.8, -0.8, 0.0]);
+        assert_eq!(mesh.vertices[2].position, [0.8, -0.8, 0.0]);
+        assert_eq!(mesh.vertices[3].position, [-0.8, 0.8, 0.0]);
     }
 
     #[test]
@@ -466,8 +474,8 @@ mod tests {
         assert_eq!(mesh.indices, vec![0, 1, 2, 1, 3, 2]);
         assert_eq!(mesh.draw_ranges.len(), 1);
         assert_eq!(mesh.draw_ranges[0].index_count, 6);
-        assert_eq!(mesh.vertices[0].position, [-0.8, -0.8]);
-        assert_eq!(mesh.vertices[3].position, [0.8, 0.8]);
+        assert_eq!(mesh.vertices[0].position, [-0.8, -0.8, 0.0]);
+        assert_eq!(mesh.vertices[3].position, [0.8, 0.8, 0.0]);
         assert_eq!(mesh.vertices[0].uv, [1.0, -0.5]);
         assert_eq!(mesh.vertices[2].uv, [-1.0, 0.5]);
     }

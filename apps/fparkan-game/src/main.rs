@@ -32,8 +32,8 @@ use fparkan_render::{
 use fparkan_render_vulkan::{
     project_land_msh_to_static_mesh_in_xy_frame, project_msh_to_static_mesh_in_xy_frame,
     VulkanPlanningBackend, VulkanSmokeFrameOutcome, VulkanSmokeRenderer,
-    VulkanSmokeRendererCreateInfo, VulkanStaticMaterial, VulkanStaticMesh, VulkanStaticTexture,
-    VulkanStaticXyFrame,
+    VulkanSmokeRendererCreateInfo, VulkanStaticCamera, VulkanStaticMaterial, VulkanStaticMesh,
+    VulkanStaticTexture, VulkanStaticXyFrame,
 };
 use fparkan_runtime::{
     create, frame, load_mission, load_mission_static_preview, load_mission_static_preview_roots,
@@ -658,6 +658,7 @@ impl ApplicationHandler for StaticVulkanApp {
             render_request: WinitWindow::default_render_request(),
             enable_validation: true,
             mesh: self.mesh.clone(),
+            camera: VulkanStaticCamera::default(),
             materials: self.materials.clone(),
             bootstrap_progress: None,
         }) {

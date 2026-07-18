@@ -1,6 +1,6 @@
 use ash::vk;
 use fparkan_platform::{NativeWindowHandles, RenderRequest};
-use fparkan_render::{LegacyPipelineState, PipelineKey};
+use fparkan_render::{LegacyD3d7Projection, LegacyPipelineState, PipelineKey, RawCameraTransform};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -26,10 +26,11 @@ pub struct VulkanSmokeRendererCreateInfo {
     /// Whether validation layers must be enabled.
     pub enable_validation: bool,
     /// Static indexed geometry uploaded before the first live frame.
-    ///
-    /// This initial bridge keeps positions in clip-space. MSH transforms,
-    /// materials, and textures are deliberately higher-level Stage 3 work.
     pub mesh: VulkanStaticMesh,
+    /// Camera contract for static geometry.
+    ///
+    /// The default identity matrix retains the initial XY diagnostic viewer.
+    pub camera: VulkanStaticCamera,
     /// Material textures uploaded before the first live frame.
     ///
     /// An empty list retains the compatibility white fallback. A singleton list
@@ -43,12 +44,66 @@ pub struct VulkanSmokeRendererCreateInfo {
 /// One vertex accepted by the initial static Vulkan geometry path.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VulkanStaticVertex {
-    /// Position in Vulkan clip-space XY coordinates.
-    pub position: [f32; 2],
+    /// World or clip position transformed by [`VulkanStaticCamera`].
+    pub position: [f32; 3],
     /// Linear RGB vertex color.
     pub color: [f32; 3],
     /// Texture coordinate consumed by the static material bridge.
     pub uv: [f32; 2],
+}
+
+/// A static geometry camera represented in the shader's matrix memory order.
+///
+/// `clip_from_world` contains row-major D3D7 data. GLSL's default column-major
+/// `mat4` interpretation deliberately transposes that storage, making
+/// `matrix * vec4(position, 1)` equivalent to D3D7's row-vector multiplication.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VulkanStaticCamera {
+    /// Row-major clip-from-world transform consumed by the vertex shader.
+    pub clip_from_world: [f32; 16],
+}
+
+impl VulkanStaticCamera {
+    /// Builds a static camera from the recovered Ngi32 D3D7 camera contract.
+    #[must_use]
+    pub fn from_legacy_d3d7(
+        transform: RawCameraTransform,
+        projection: LegacyD3d7Projection,
+    ) -> Option<Self> {
+        let view = transform.try_direct3d7_view_row_major()?;
+        let projection = projection.try_direct3d7_projection_row_major()?;
+        Some(Self {
+            clip_from_world: multiply_row_major(view, projection),
+        })
+    }
+
+    /// Returns whether every matrix element is finite.
+    #[must_use]
+    pub fn is_finite(self) -> bool {
+        self.clip_from_world.iter().all(|value| value.is_finite())
+    }
+}
+
+impl Default for VulkanStaticCamera {
+    fn default() -> Self {
+        Self {
+            clip_from_world: [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+        }
+    }
+}
+
+fn multiply_row_major(left: [f32; 16], right: [f32; 16]) -> [f32; 16] {
+    let mut result = [0.0; 16];
+    for row in 0..4 {
+        for column in 0..4 {
+            result[row * 4 + column] = (0..4)
+                .map(|inner| left[row * 4 + inner] * right[inner * 4 + column])
+                .sum();
+        }
+    }
+    result
 }
 
 /// Static indexed geometry uploaded to live Vulkan buffers.
@@ -176,17 +231,17 @@ impl VulkanStaticMesh {
         Self {
             vertices: vec![
                 VulkanStaticVertex {
-                    position: [0.0, -0.55],
+                    position: [0.0, -0.55, 0.0],
                     color: [1.0, 0.2, 0.2],
                     uv: [0.5, 0.0],
                 },
                 VulkanStaticVertex {
-                    position: [0.55, 0.55],
+                    position: [0.55, 0.55, 0.0],
                     color: [0.2, 1.0, 0.2],
                     uv: [1.0, 1.0],
                 },
                 VulkanStaticVertex {
-                    position: [-0.55, 0.55],
+                    position: [-0.55, 0.55, 0.0],
                     color: [0.2, 0.4, 1.0],
                     uv: [0.0, 1.0],
                 },
@@ -248,6 +303,44 @@ mod static_mesh_tests {
 
         assert_eq!(mesh.indices, vec![0, 1, 2]);
         assert_eq!(mesh.validate(), Ok(()));
+    }
+
+    #[test]
+    fn static_camera_composes_recovered_d3d7_view_before_projection() {
+        let transform = RawCameraTransform {
+            words: [
+                0.0_f32.to_bits(),
+                (-1.0_f32).to_bits(),
+                0.0_f32.to_bits(),
+                10.0_f32.to_bits(),
+                1.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                20.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                1.0_f32.to_bits(),
+                30.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                1.0_f32.to_bits(),
+            ],
+        };
+        let projection = LegacyD3d7Projection {
+            viewport: [0, 0, 1024, 768],
+            near_plane: 0.5,
+            far_plane: 700.0,
+            field_of_view_radians: 1.3,
+        };
+
+        let camera = VulkanStaticCamera::from_legacy_d3d7(transform, projection)
+            .expect("recovered camera inputs are valid");
+
+        assert!(camera.is_finite());
+        assert_eq!(camera.clip_from_world[0], 0.65_f32.cos());
+        assert_eq!(camera.clip_from_world[6], 700.0_f32 / 699.5);
+        assert_eq!(camera.clip_from_world[7], 0.65_f32.sin());
     }
 
     #[test]
@@ -547,6 +640,11 @@ pub enum VulkanSmokeRendererError {
         /// Validation failure detail.
         context: &'static str,
     },
+    /// The static camera matrix contains a non-finite element.
+    InvalidStaticCamera {
+        /// Validation failure detail.
+        context: &'static str,
+    },
     /// The submitted static texture cannot be represented by this path.
     InvalidStaticTexture {
         /// Validation failure detail.
@@ -574,6 +672,9 @@ impl std::fmt::Display for VulkanSmokeRendererError {
                 write!(f, "{context}: no compatible Vulkan memory type")
             }
             Self::InvalidStaticMesh { context } => write!(f, "invalid static mesh: {context}"),
+            Self::InvalidStaticCamera { context } => {
+                write!(f, "invalid static camera: {context}")
+            }
             Self::InvalidStaticTexture { context } => {
                 write!(f, "invalid static texture: {context}")
             }
@@ -600,6 +701,7 @@ pub struct VulkanSmokeRenderer {
     pub(super) textures: Vec<VulkanAllocatedImage>,
     pub(super) draw_ranges: Vec<VulkanStaticDrawRange>,
     pub(super) draw_texture_indices: Vec<usize>,
+    pub(super) camera: VulkanStaticCamera,
     pub(super) frame_sync: Vec<VulkanFrameSync>,
     pub(super) images_in_flight: Vec<vk::Fence>,
     pub(super) current_frame: usize,

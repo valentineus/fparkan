@@ -211,7 +211,7 @@ pub(super) fn create_static_mesh_vertex_buffer(
     device: &VulkanLogicalDeviceProbe,
     mesh: &VulkanStaticMesh,
 ) -> Result<VulkanAllocatedBuffer, VulkanSmokeRendererError> {
-    let mut bytes = Vec::with_capacity(mesh.vertices.len() * 7 * std::mem::size_of::<f32>());
+    let mut bytes = Vec::with_capacity(mesh.vertices.len() * 8 * std::mem::size_of::<f32>());
     for vertex in &mesh.vertices {
         for value in vertex
             .position

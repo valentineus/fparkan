@@ -20,7 +20,7 @@ pub(crate) const SPIRV_VALIDATOR_BINARY_SHA256: &str =
 pub(crate) const TRIANGLE_VERTEX_SOURCE_PATH: &str =
     "adapters/fparkan-render-vulkan/shaders/triangle.vert";
 pub(crate) const TRIANGLE_VERTEX_SOURCE_SHA256: &str =
-    "82f9ee39a30b094203041205954576ca820d75771421bb27ddd300359e4e9043";
+    "fe3721202477220d2d9677b6572d7f3baecb374e94f04eea9d7286ed5e98b6c9";
 pub(crate) const TRIANGLE_VERTEX_SPIRV_PATH: &str =
     "adapters/fparkan-render-vulkan/shaders/triangle.vert.spv";
 pub(crate) const TRIANGLE_VERTEX_COMPILE_COMMAND: &str =
@@ -29,7 +29,7 @@ pub(crate) const TRIANGLE_VERTEX_VALIDATE_COMMAND: &str =
     "spirv-val --target-env vulkan1.1 adapters/fparkan-render-vulkan/shaders/triangle.vert.spv";
 const TRIANGLE_FRAGMENT_SOURCE_PATH: &str = "adapters/fparkan-render-vulkan/shaders/triangle.frag";
 const TRIANGLE_FRAGMENT_SOURCE_SHA256: &str =
-    "f9162fccce56111e85fdf0f58251798393c37aa23f9f3d979ba404bf6773c27b";
+    "fb3ed435af48e4fb4a817f160b467f7a561c7c547c87b6f0c1e89f5f58af7329";
 const TRIANGLE_FRAGMENT_SPIRV_PATH: &str =
     "adapters/fparkan-render-vulkan/shaders/triangle.frag.spv";
 const TRIANGLE_FRAGMENT_COMPILE_COMMAND: &str =
@@ -213,7 +213,7 @@ pub fn triangle_shader_manifest() -> Vec<VulkanShaderModuleManifest> {
             stage: VulkanShaderStage::Vertex,
             entry_point: "main",
             descriptor_sets: 0,
-            push_constant_bytes: 0,
+            push_constant_bytes: 64,
             source_path: TRIANGLE_VERTEX_SOURCE_PATH,
             source_sha256: TRIANGLE_VERTEX_SOURCE_SHA256,
             spirv_path: TRIANGLE_VERTEX_SPIRV_PATH,
@@ -226,7 +226,7 @@ pub fn triangle_shader_manifest() -> Vec<VulkanShaderModuleManifest> {
             stage: VulkanShaderStage::Fragment,
             entry_point: "main",
             descriptor_sets: 1,
-            push_constant_bytes: 4,
+            push_constant_bytes: 68,
             source_path: TRIANGLE_FRAGMENT_SOURCE_PATH,
             source_sha256: TRIANGLE_FRAGMENT_SOURCE_SHA256,
             spirv_path: TRIANGLE_FRAGMENT_SPIRV_PATH,

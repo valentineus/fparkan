@@ -669,13 +669,13 @@ fn triangle_shader_manifest_hashes_are_stable() {
         TRIANGLE_VERTEX_SOURCE_SHA256
     );
     assert_eq!(report.modules[0].spirv_path, TRIANGLE_VERTEX_SPIRV_PATH);
-    assert_eq!(report.modules[0].word_count, 290);
+    assert_eq!(report.modules[0].word_count, 358);
     assert_eq!(
         report.modules[0].sha256,
-        "1984662f78873b70135ec444ccd86d86fa66dfca3f615d19ddaf0cda1587d4cf"
+        "4e2051ac43b933a57e5557e596bcc95952b4efbfcb45315180f89581e094398d"
     );
     assert_eq!(report.modules[0].descriptor_sets, 0);
-    assert_eq!(report.modules[0].push_constant_bytes, 0);
+    assert_eq!(report.modules[0].push_constant_bytes, 64);
     assert_eq!(
         report.modules[0].compile_command,
         TRIANGLE_VERTEX_COMPILE_COMMAND
@@ -687,11 +687,11 @@ fn triangle_shader_manifest_hashes_are_stable() {
     assert!(!report.modules[0].interface_hash.is_empty());
     assert_eq!(
         report.modules[1].sha256,
-        "536a5c9a4389f9d34ca11a25f20d0acbc53d3eb0782c18375326647319336a85"
+        "8ab7bf835e166892b04b10fa1100258daf355d2f693ad311d014dbee22de5c7b"
     );
     assert_eq!(
         report.manifest_hash,
-        "5a16fb791e86bb790cd2d85151627e0d39193c5c073a9294130f149d4ff5ba58"
+        "cf471972978ddb5c8919711ad64c93d0d64e18b1f590a89ce014f1e2a743cfb5"
     );
 }
 

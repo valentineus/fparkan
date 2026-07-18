@@ -71,8 +71,8 @@ pub use self::smoke_types::{
     VulkanReadbackArtifact, VulkanSmokeBootstrapProgress, VulkanSmokeBootstrapSnapshot,
     VulkanSmokeFrameOutcome, VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo,
     VulkanSmokeRendererError, VulkanSmokeRendererReport, VulkanSmokeShutdownReport,
-    VulkanStaticDrawRange, VulkanStaticMaterial, VulkanStaticMesh, VulkanStaticTexture,
-    VulkanStaticVertex, VulkanValidationReport,
+    VulkanStaticCamera, VulkanStaticDrawRange, VulkanStaticMaterial, VulkanStaticMesh,
+    VulkanStaticTexture, VulkanStaticVertex, VulkanValidationReport,
 };
 #[cfg(test)]
 use self::surface::extension_name;
@@ -497,7 +497,7 @@ const fn spirv_words<const WORD_COUNT: usize>(bytes: &[u8]) -> [u32; WORD_COUNT]
     words
 }
 
-static TRIANGLE_VERTEX_SHADER_DATA: [u32; 290] =
+static TRIANGLE_VERTEX_SHADER_DATA: [u32; 358] =
     spirv_words(include_bytes!("../shaders/triangle.vert.spv"));
 static TRIANGLE_FRAGMENT_SHADER_DATA: [u32; 296] =
     spirv_words(include_bytes!("../shaders/triangle.frag.spv"));

@@ -1412,10 +1412,20 @@ An elevated read-only AutoDemo probe sampled a 1024×768 renderer with
 near=`0.5`, far=`700`, FOV=`1.3` radians and showed its view-source pointer
 byte-identical to the active Terrain outer camera's selector-0 block. This
 proves ownership and the D3D7 boundary, while keeping the earlier
-`CBufferingCamera` FOV=`1.04` as a distinct upstream interface value. The
-backend-neutral render crate now exposes the two recovered D3D7 matrices, but
-does not yet use them as Vulkan matrices: vector and clip-space conversion is
-still an explicit next task.
+`CBufferingCamera` FOV=`1.04` as a distinct upstream interface value.
+
+The Vulkan static path now accepts this recovered camera as
+`VulkanStaticCamera`. It composes the row-major D3D7 result as
+`view * projection`, uploads its 64 bytes through a vertex-stage push constant,
+and changes static vertices from XY to XYZ. GLSL reads the same bytes as its
+default column-major `mat4`; therefore `matrix * vec4(position, 1)` is the
+transpose-equivalent of the original D3D7 row-vector multiplication. Both APIs
+use the 0..1 depth range, and this renderer uses a positive viewport height, so
+this narrow bridge needs no extra depth or Y correction. The fragment alpha
+cutoff moved to byte offset 64 in its own push-constant range. The default
+identity camera deliberately preserves the old XY diagnostic preview; feeding
+live terrain camera/projection values into mission rendering remains later
+runtime wiring, not a claim of scene parity.
 
 A fresh no-input launch of the canonical `iron_3d.exe` did create a responsive
 window titled `Parkan. Железная Стратегия`. A read-only probe then requested
