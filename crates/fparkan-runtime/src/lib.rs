@@ -34,7 +34,9 @@ use fparkan_prototype::{
     UnitComponentRecord,
 };
 use fparkan_resource::{resource_name, CachedResourceRepository, ResourceRepository};
-use fparkan_script::{ScriptPackage, VarSet};
+use fparkan_script::{
+    Handler19DwordWrite, Handler19InitInput, ScriptDispatchSelector, ScriptPackage, VarSet,
+};
 use fparkan_terrain::SurfaceQuery;
 use fparkan_vfs::{Vfs, VfsError};
 use fparkan_world::{
@@ -248,7 +250,8 @@ pub struct MissionScriptBundle {
     pub base_path: String,
     /// Resolved compiled `.scr` path.
     pub script_path: String,
-    /// Losslessly decoded compiled package; not yet executed by runtime.
+    /// Losslessly decoded compiled package; only proven `Handler(19)` Init
+    /// writes are resolved and retained by runtime.
     pub package: ScriptPackage,
 }
 
@@ -256,7 +259,7 @@ pub struct MissionScriptBundle {
 ///
 /// GOG `ai.dll` first tries `<bundle-base>.var`, then falls back to the shared
 /// `MISSIONS/SCRIPTS/varset.var`. This stores the successfully selected source
-/// without claiming that the not-yet-recovered VM executes its declarations.
+/// and supplies the typed targets for the proven `Handler(19)` Init writes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MissionScriptVarSet {
     /// Resolved `.var` path selected by the original fallback order.
@@ -265,6 +268,21 @@ pub struct MissionScriptVarSet {
     pub used_fallback: bool,
     /// Typed numeric declaration defaults in source order.
     pub declarations: VarSet,
+}
+
+/// One resolved, corpus-proven `Init` result for a mission clan.
+///
+/// This is intentionally limited to `Handler(19)`: an `Init` event's other
+/// selectors are retained in [`MissionScriptBundle::package`] but are not
+/// guessed as executable behavior.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissionScriptInitState {
+    /// TMA clan index that owns the `SuperAI` instance and varset.
+    pub clan_index: usize,
+    /// Raw event word preserved from the compiled `Init` event.
+    pub event_word: u32,
+    /// Exact three DWORD writes made by each proven `Handler(19)` instruction.
+    pub writes: Vec<Handler19DwordWrite>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -277,6 +295,7 @@ struct MissionLoadOptions {
 struct LoadedMissionScripts {
     bundles: Vec<MissionScriptBundle>,
     varset: Option<MissionScriptVarSet>,
+    init_states: Vec<MissionScriptInitState>,
 }
 
 /// Selects how much of the resolved mission asset graph to prepare.
@@ -366,6 +385,8 @@ pub struct LoadedMission {
     pub script_event_count: usize,
     /// Numeric script defaults loaded through the original bundle/fallback rule.
     pub script_varset_declaration_count: usize,
+    /// `Handler(19)` Init results resolved for mission clans.
+    pub script_init_state_count: usize,
 }
 
 /// Frame result.
@@ -404,6 +425,7 @@ struct LoadedMissionState {
     object_drafts: Vec<MissionObjectDraft>,
     script_bundles: Vec<MissionScriptBundle>,
     script_varset: Option<MissionScriptVarSet>,
+    script_init_states: Vec<MissionScriptInitState>,
 }
 
 /// Engine error.
@@ -439,6 +461,13 @@ pub enum EngineError {
         /// Script-default path.
         path: String,
         /// Parse diagnostic.
+        message: String,
+    },
+    /// A recovered `Handler(19)` Init input or target was not representable.
+    ScriptInit {
+        /// Owning TMA clan index.
+        clan_index: usize,
+        /// Proven-contract diagnostic.
         message: String,
     },
     /// `NRes` decode error.
@@ -577,6 +606,10 @@ impl std::fmt::Display for EngineError {
             Self::Vfs { path, source } => write!(f, "{path}: {source}"),
             Self::Script { path, message } => write!(f, "{path}: script decode failed: {message}"),
             Self::VarSet { path, message } => write!(f, "{path}: varset decode failed: {message}"),
+            Self::ScriptInit {
+                clan_index,
+                message,
+            } => write!(f, "clan {clan_index}: script Init failed: {message}"),
             Self::Nres { path, source } => write!(f, "{path}: {source}"),
             Self::Mission { path, source } => write!(f, "{path}: {source}"),
             Self::TerrainFormat { path, source } => write!(f, "{path}: {source}"),
@@ -619,6 +652,7 @@ impl std::error::Error for EngineError {
             Self::MissingVfs
             | Self::Script { .. }
             | Self::VarSet { .. }
+            | Self::ScriptInit { .. }
             | Self::Movement(_)
             | Self::PrototypeGraph { .. }
             | Self::SchedulerPhaseOrder { .. }
@@ -1064,6 +1098,7 @@ fn load_mission_with_options_and_progress(
             .varset
             .as_ref()
             .map_or(0, |varset| varset.declarations.declarations.len()),
+        script_init_state_count: loaded_scripts.init_states.len(),
     };
 
     engine.world = new_runtime_world;
@@ -1079,6 +1114,7 @@ fn load_mission_with_options_and_progress(
         object_drafts,
         script_bundles: loaded_scripts.bundles,
         script_varset: loaded_scripts.varset,
+        script_init_states: loaded_scripts.init_states,
     });
     Ok((summary, trace))
 }
@@ -1175,6 +1211,18 @@ pub fn loaded_mission_script_varset(engine: &Engine) -> Option<&MissionScriptVar
         .loaded
         .as_ref()
         .and_then(|state| state.script_varset.as_ref())
+}
+
+/// Returns the proven script `Init` writes resolved for the loaded mission.
+///
+/// The list has one entry for each clan whose `Init` event contains recovered
+/// `Handler(19)` instructions. It is not a general script event executor.
+#[must_use]
+pub fn loaded_mission_script_init_states(engine: &Engine) -> Option<&[MissionScriptInitState]> {
+    engine
+        .loaded
+        .as_ref()
+        .map(|state| state.script_init_states.as_slice())
 }
 
 /// Returns terrain runtime data for the loaded mission.
@@ -1341,7 +1389,99 @@ fn load_mission_scripts(
         .as_deref()
         .map(|base_path| load_script_varset(vfs, base_path))
         .transpose()?;
-    Ok(LoadedMissionScripts { bundles, varset })
+    let init_states = match &varset {
+        Some(varset) => resolve_handler19_init_states(
+            &mission
+                .clans
+                .iter()
+                .map(|clan| clan.anchor)
+                .collect::<Vec<_>>(),
+            &bundles,
+            varset,
+        )?,
+        None => Vec::new(),
+    };
+    Ok(LoadedMissionScripts {
+        bundles,
+        varset,
+        init_states,
+    })
+}
+
+fn resolve_handler19_init_states(
+    clan_anchors: &[[f32; 2]],
+    bundles: &[MissionScriptBundle],
+    varset: &MissionScriptVarSet,
+) -> Result<Vec<MissionScriptInitState>, EngineError> {
+    let mut states = Vec::new();
+    for bundle in bundles {
+        let Some(anchor) = clan_anchors.get(bundle.clan_index) else {
+            return Err(EngineError::ScriptInit {
+                clan_index: bundle.clan_index,
+                message: "script bundle clan index is outside the decoded mission".to_string(),
+            });
+        };
+        let input = Handler19InitInput {
+            first_x87_word: handler19_x87_truncated_u32(anchor[0], bundle.clan_index, "x")?,
+            second_x87_word: handler19_x87_truncated_u32(anchor[1], bundle.clan_index, "y")?,
+            third_word: u32::try_from(bundle.clan_index).map_err(|_| EngineError::ScriptInit {
+                clan_index: bundle.clan_index,
+                message: "clan index does not fit the recovered DWORD ClanID field".to_string(),
+            })?,
+        };
+        for event in &bundle.package.events {
+            if event.name_raw.as_slice() != b"Init\0" {
+                continue;
+            }
+            let writes: Vec<Handler19DwordWrite> = event
+                .instructions
+                .iter()
+                .filter(|instruction| {
+                    instruction.dispatch_selector() == ScriptDispatchSelector::Handler(19)
+                })
+                .map(|instruction| {
+                    varset
+                        .declarations
+                        .resolve_handler19(instruction, input)
+                        .map_err(|source| EngineError::ScriptInit {
+                            clan_index: bundle.clan_index,
+                            message: source.to_string(),
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect();
+            if !writes.is_empty() {
+                states.push(MissionScriptInitState {
+                    clan_index: bundle.clan_index,
+                    event_word: event.event_word,
+                    writes,
+                });
+            }
+        }
+    }
+    Ok(states)
+}
+
+fn handler19_x87_truncated_u32(
+    value: f32,
+    clan_index: usize,
+    axis: &'static str,
+) -> Result<u32, EngineError> {
+    if !value.is_finite() || !(0.0..=10_000.0).contains(&value) {
+        return Err(EngineError::ScriptInit {
+            clan_index,
+            message: format!(
+                "ClanBase{axis}={value:?} is outside the recovered CreateSuperAI base range"
+            ),
+        });
+    }
+    // ai.dll's __ftol saves the x87 control word, sets rounding-control bits
+    // to truncate, performs `fistp qword`, and restores the control word.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let word = value.trunc() as u32;
+    Ok(word)
 }
 
 fn load_script_varset(
@@ -1485,6 +1625,70 @@ mod tests {
         assert!(matches!(
             load_script_varset(&vfs, "MISSIONS/SCRIPTS/custom"),
             Err(EngineError::VarSet { path, .. }) if path == "MISSIONS/SCRIPTS/custom.var"
+        ));
+    }
+
+    #[test]
+    fn handler_nineteen_init_executes_from_clan_anchor_for_each_bundle() {
+        let declarations = fparkan_script::parse_varset(
+            b"VAR( DWORD, ClanBaseX, 950)\nVAR( DWORD, ClanBaseY, 1000)\nVAR( DWORD, ClanID, 0)\n",
+        )
+        .expect("varset");
+        let varset = MissionScriptVarSet {
+            path: FALLBACK_SCRIPT_VARSET_PATH.to_string(),
+            used_fallback: true,
+            declarations,
+        };
+        let bundles = [MissionScriptBundle {
+            clan_index: 1,
+            base_path: "MISSIONS/SCRIPTS/default".to_string(),
+            script_path: "MISSIONS/SCRIPTS/default.scr".to_string(),
+            package: ScriptPackage {
+                opcode_handler_count: 73,
+                events: vec![fparkan_script::ScriptEvent {
+                    name_len: 4,
+                    name_raw: b"Init\0".to_vec(),
+                    event_word: 0x1234_5678,
+                    instructions: vec![fparkan_script::ScriptInstruction {
+                        header_words: [19, 0, 0, 0, 0, 3, 0],
+                        references: vec![0, 1, 2],
+                    }],
+                }],
+                trailing_bytes: Vec::new(),
+                raw: Arc::from(&b""[..]),
+            },
+        }];
+
+        let states =
+            resolve_handler19_init_states(&[[500.0, 752.0], [728.0, 449.0]], &bundles, &varset)
+                .expect("exact Init execution");
+        assert_eq!(
+            states,
+            vec![MissionScriptInitState {
+                clan_index: 1,
+                event_word: 0x1234_5678,
+                writes: vec![
+                    Handler19DwordWrite {
+                        index: 0,
+                        value: 728
+                    },
+                    Handler19DwordWrite {
+                        index: 1,
+                        value: 449
+                    },
+                    Handler19DwordWrite { index: 2, value: 1 },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn handler_nineteen_init_rejects_anchor_outside_recovered_base_range() {
+        let error = handler19_x87_truncated_u32(-0.5, 0, "x").expect_err("negative anchor");
+        assert!(matches!(
+            error,
+            EngineError::ScriptInit { clan_index: 0, message }
+                if message.contains("outside the recovered CreateSuperAI base range")
         ));
     }
 

@@ -190,6 +190,26 @@ a license to replace the first two conversions with Rust float casts: their
 rounding behavior remains an x87 compatibility boundary until it has captured
 test vectors.
 
+The missing source-field provenance is now constrained by the public creation
+boundary. `CreateSuperAI` at `ai.dll` VA `0x1000f710` allocates `0x8b0` bytes
+and calls constructor `0x10001000` with its first eight arguments. That
+constructor calls `0x10006340(this + 0x7c, clan_id, base_x, base_y)`: these are
+the fields later read by `Handler(19)`. `base_x` and `base_y` are unsigned and
+the constructor rejects values greater than `10000`. The actual `__ftol` helper
+at `0x1001df70` saves the x87 control word, sets its rounding-control bits to
+truncate, executes `fistp qword`, then restores the control word.
+
+Consequently the runtime resolves and retains this one proved vertical slice
+during mission loading: each selected clan's TMA anchor is accepted only in the recovered
+`0..=10000` base range, truncated through the recovered x87 rule, and paired
+with its zero-based clan index. For every `Init` instruction whose selector is
+`Handler(19)`, `VarSet::resolve_handler19` produces the three per-clan DWORD
+immutable `MissionScriptInitState` writes. Other Init selectors and all other events remain decoded but
+unexecuted. AutoDemo validates the path end-to-end: its non-integral first
+anchor (`500.2857`) yields captured `ClanBaseX=500`, and the live GOG process
+contains two initialized SuperAI entries `(500, 752, 0)` and `(728, 449, 1)`;
+the Rust loader reports `script_init_states=2`.
+
 `GetSuperAI` returns element `n` of the 64-pointer global table at preferred
 `ai.dll + 0x55398` for `n <= 63`. The read-only
 `tools/capture-ai-init.ps1` probe observed the running GOG AutoDemo values
@@ -199,11 +219,14 @@ profile.
 
 The Rust reader exposes `VarSet::resolve_handler19`. It accepts the already
 converted first two words and the third raw word, produces three typed writes,
-and rejects missing, out-of-range, or non-`DWORD` targets. It deliberately does
-not guess how the mission creates the three source fields or execute a script
-event yet. The associated Ghidra scripts are
+and rejects missing, out-of-range, or non-`DWORD` targets. The runtime only
+binds it to the proven creation/anchor path above; it does not guess the
+remaining script event semantics. The associated Ghidra scripts are
 `ExportAiVmHandler19.java`, `ExportAiVmHandler19Setter.java`,
 `ExportAiVmHandler19SetterCallee.java`, and `ExportAiGetSuperAi.java`.
+The creation and conversion boundaries are reproducible with
+`ExportAiCreateSuperAi.java`, `ExportAiSuperAiConstructor.java`, and
+`ExportAiFtol.java`.
 
 ### Handler(8): problem-record state write
 
