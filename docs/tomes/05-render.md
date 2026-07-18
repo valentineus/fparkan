@@ -877,6 +877,14 @@ bytes с зафиксированным reference capture.
 
 ### First synchronized Vulkan pixel-readback artifact
 
+The current artifact contract is one final swapchain image, not a
+concatenation of every swapchain allocation. After the final successful
+graphics submission, the renderer retains that image index; synchronized
+teardown reads only its matching buffer. The raw payload is therefore exactly
+`width * height * 4` bytes for the current format-50 path. Historical
+multi-image byte counts below describe the superseded concatenation behavior
+and are not comparable to this final-image contract.
+
 Stage 3 static viewer теперь выполняет фактический readback для surface с
 `TRANSFER_SRC`: на каждый swapchain image создаётся host-visible coherent
 `TRANSFER_DST` buffer. После render pass command buffer переводит image из
@@ -895,8 +903,11 @@ static viewer. Он ещё не захватывает original DirectDraw frame
 fixed original camera и не сравнивает два изображения, поэтому pixel-parity
 acceptance остаётся blocked.
 
-Smoke также сохраняет raw artifact рядом с JSON: `<report-stem>.readback-vkformat-<raw>.raw`.
-Это concatenated current-swapchain images in Vulkan order, каждый с dimensions
+The following paragraph records the superseded multi-image export only as
+historical bootstrap evidence; it is not the current artifact contract.
+
+Smoke также сохранял raw artifact рядом с JSON: `<report-stem>.readback-vkformat-<raw>.raw`.
+Это были concatenated current-swapchain images in Vulkan order, каждый с dimensions
 из JSON и четырьмя bytes per pixel; format намеренно указан в имени файла,
 потому что bytes не перекодируются; JSON содержит actual raw enum. GOG selected `50` and produced a 4,147,200-byte file
 for two 960x540 images. Артефакт остаётся локальным output и не попадает в Git.
@@ -1536,13 +1547,12 @@ not yet pixel parity, because the static bridge still lacks the full runtime
 camera-selection timing, terrain composition, culling, lighting, UI and FX.
 
 For visual regression work, `fparkan-game --backend static-vulkan` also accepts
-`--readback-out <path>`. It writes the final synchronized Vulkan readback bytes
-only after the renderer has completed its normal teardown evidence; the JSON
-report records the raw Vulkan format, byte count, hash, and requested path. A
-three-frame diagnostic AutoDemo run wrote 7,372,800 bytes at format `50`
-(`VK_FORMAT_B8G8R8A8_UNORM`) with the same frame hash reported by the renderer.
-The artifact is a Vulkan-side comparison input, not an asserted original-frame
-image.
+`--readback-out <path>`. It writes the final synchronized Vulkan swapchain
+image only after the renderer has completed its normal teardown evidence; the
+JSON report records its raw Vulkan format, byte count, hash, and requested
+path. At 1280x720, format `50` (`VK_FORMAT_B8G8R8A8_UNORM`) produces exactly
+3,686,400 bytes. The artifact is a Vulkan-side comparison input, not an
+asserted original-frame image.
 
 The first bounded launch showed that repeated fingerprinting, rather than
 Vulkan initialization, was the load-path bottleneck: each new MAT0/TEXM request

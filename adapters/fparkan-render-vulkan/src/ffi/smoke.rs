@@ -235,6 +235,7 @@ impl VulkanSmokeRenderer {
             frame_sync: Vec::new(),
             images_in_flight: Vec::new(),
             current_frame: 0,
+            last_readback_image_index: None,
             depth_request: create_info.render_request.depth,
             pending_extent: None,
             swapchain_recreate_count: 0,
@@ -519,6 +520,7 @@ impl VulkanSmokeRenderer {
         })?;
         if !self.resources_ref()?.readback_buffers.is_empty() {
             self.report.readback_copy_count = self.report.readback_copy_count.saturating_add(1);
+            self.last_readback_image_index = Some(image_index_usize);
         }
 
         let present_wait = [render_finished];
@@ -621,6 +623,7 @@ impl VulkanSmokeRenderer {
         let resources = resources.commit();
         self.images_in_flight = vec![vk::Fence::null(); resources.image_views.len()];
         self.frame_sync = frame_sync;
+        self.last_readback_image_index = None;
         self.report.swapchain_extent = swapchain_extent;
         self.report.swapchain_image_count = swapchain_image_count;
         self.report.swapchain_image_format = self.swapchain_ref()?.report.plan.format.format;
@@ -941,13 +944,19 @@ impl VulkanSmokeRenderer {
         if resources.readback_buffers.is_empty() {
             return Ok(None);
         }
-        let mut artifact =
-            Vec::with_capacity(byte_len.saturating_mul(resources.readback_buffers.len()));
-        for buffer in &resources.readback_buffers {
-            let bytes = readback_buffer_bytes(device, buffer, byte_len)?;
-            artifact.extend_from_slice(&bytes);
-        }
-        Ok(Some(artifact))
+        let Some(image_index) = completed_readback_buffer_index(
+            self.last_readback_image_index,
+            resources.readback_buffers.len(),
+        )?
+        else {
+            return Ok(None);
+        };
+        let buffer = resources.readback_buffers.get(image_index).ok_or(
+            VulkanSmokeRendererError::InvariantViolation {
+                context: "last readback image index",
+            },
+        )?;
+        Ok(Some(readback_buffer_bytes(device, buffer, byte_len)?))
     }
 
     fn teardown(&mut self) {
@@ -965,6 +974,19 @@ impl VulkanSmokeRenderer {
         );
         self.validation.take();
         self.instance.take();
+    }
+}
+
+fn completed_readback_buffer_index(
+    last_image_index: Option<usize>,
+    buffer_count: usize,
+) -> Result<Option<usize>, VulkanSmokeRendererError> {
+    match last_image_index {
+        None => Ok(None),
+        Some(index) if index < buffer_count => Ok(Some(index)),
+        Some(_) => Err(VulkanSmokeRendererError::InvariantViolation {
+            context: "last readback image index",
+        }),
     }
 }
 
@@ -991,8 +1013,8 @@ impl Drop for VulkanSmokeRenderer {
 #[cfg(test)]
 mod tests {
     use super::{
-        take_runtime_children_with_validation_snapshot, take_runtime_owners_in_dependency_order,
-        RollbackOnDrop,
+        completed_readback_buffer_index, take_runtime_children_with_validation_snapshot,
+        take_runtime_owners_in_dependency_order, RollbackOnDrop,
     };
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1073,6 +1095,13 @@ mod tests {
                 TeardownStep::Instance,
             ]
         );
+    }
+
+    #[test]
+    fn completed_readback_selects_only_the_last_submitted_image() {
+        assert_eq!(completed_readback_buffer_index(None, 2), Ok(None));
+        assert_eq!(completed_readback_buffer_index(Some(1), 2), Ok(Some(1)));
+        assert!(completed_readback_buffer_index(Some(2), 2).is_err());
     }
 
     #[test]

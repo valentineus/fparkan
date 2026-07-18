@@ -603,7 +603,7 @@ pub struct VulkanValidationReport {
     pub vuids: Vec<String>,
 }
 
-/// CPU-owned copy of the final completed swapchain readback buffers.
+/// CPU-owned copy of the final completed swapchain image readback.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VulkanReadbackArtifact {
     /// Vulkan swapchain format as a raw enum value.
@@ -612,7 +612,8 @@ pub struct VulkanReadbackArtifact {
     pub width: u32,
     /// Height of each image in pixels.
     pub height: u32,
-    /// Concatenated raw four-byte-per-pixel images in swapchain order.
+    /// One raw four-byte-per-pixel image: the last successfully submitted
+    /// swapchain image before synchronized teardown.
     pub bytes: Vec<u8>,
 }
 
@@ -735,6 +736,10 @@ pub struct VulkanSmokeRenderer {
     pub(super) frame_sync: Vec<VulkanFrameSync>,
     pub(super) images_in_flight: Vec<vk::Fence>,
     pub(super) current_frame: usize,
+    /// Last swapchain image whose color attachment was copied after a
+    /// successful graphics submission. Reset whenever swapchain resources are
+    /// replaced so a teardown never reads a buffer from an old swapchain.
+    pub(super) last_readback_image_index: Option<usize>,
     pub(super) depth_request: fparkan_platform::DepthStencilSupport,
     pub(super) pending_extent: Option<(u32, u32)>,
     pub(super) swapchain_recreate_count: u32,
