@@ -206,6 +206,32 @@ CreateCollObject
 тригонометрию и `g_FastProc`. Это подтверждает его положение между gameplay
 object и геометрией мира.
 
+Статическая сверка GOG `Control.dll` уточняет границу, но пока не раскрывает
+per-tick solver. PE32 image base — `0x10000000`; exports имеют следующие RVA:
+
+```text
+InitializeSettings  0x32260
+LoadControlSystem   0x32280
+LoadPhysicalModel   0x32580
+CreateCollManager   0x325d0
+CreateCollObject    0x32600
+```
+
+`LoadControlSystem` возвращается `ret 0x20`, следовательно ABI снимает со
+стека восемь 32-bit аргументов. Оно выбирает allocation размером `0x668` при
+mode `9` и `0x670` для другого mode, создаёт внутренний reader через virtual
+dispatch с selector `10`, переносит несколько caller strings в локальные
+buffers и передаёт собранную settings-структуру дальше через virtual slot
+`+0x08` с key `0x80000020`. Это доказывает loader/configuration boundary и
+два layout variants, но не даёт права назвать поля скоростью или acceleration.
+`LoadPhysicalModel` аналогично создаёт `0xa0`-byte reader и возвращается
+`ret 0x0c`; `CreateCollManager` и `CreateCollObject` возвращают interface
+pointer с поправкой `+4` после внутренней инициализации.
+
+Именно update methods этих private objects, а не пять exports, остаются
+следующим объектом динамической трассировки. Поэтому reference movement в
+новом runtime намеренно не использует неподтверждённые параметры Control.
+
 ### Control system и physical model
 
 `LoadControlSystem` загружает настройки controller-а: ограничения скорости,
