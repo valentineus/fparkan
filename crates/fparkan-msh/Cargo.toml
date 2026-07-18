@@ -7,10 +7,8 @@ repository.workspace = true
 
 [dependencies]
 encoding_rs = "0.8"
-fparkan-nres = { path = "../fparkan-nres", version = "0.1.0" }
-
-[dev-dependencies]
 fparkan-animation = { path = "../fparkan-animation", version = "0.1.0" }
+fparkan-nres = { path = "../fparkan-nres", version = "0.1.0" }
 
 [lints]
 workspace = true

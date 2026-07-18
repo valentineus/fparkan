@@ -1598,6 +1598,15 @@ MSH static bridge теперь также перестал отправлять 
 parent hierarchy и animation-key/fallback semantics. Модели без layout Node38
 сохраняют прежний all-batches diagnostic fallback.
 
+Чтобы следующий шаг не перечитывал raw NRes streams в renderer, validated
+`ModelAsset` теперь переносит `ModelAnimation` с decoded type-8 keys, type-19
+map и declared frame count. `node38_fallback_pose` возвращает exact fallback
+key pose, а offset `+2` остаётся именованным только как `parent_or_link_raw`.
+Licensed gates Part 1/Part 2 повторно подтвердили 435/511 models, 157/200
+animated models, 3,469/5,233 node samples и утверждённые captures. Это
+доказывает production handoff animation data, не семантику parent links и не
+готовую model assembly.
+
 Параллельно bridge для legacy-camera path теперь переводит только высоту
 `Land.msh` в world units с масштабом `1/32`: raw AutoDemo heights
 `95.29412..288.23532` становятся `2.978..9.007`, что согласуется с TMA Z и

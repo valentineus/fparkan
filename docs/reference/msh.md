@@ -43,6 +43,12 @@ struct Node38 {
 `slot_index[lod * 5 + group]` выбирает geometry slot. `0xFFFF` означает
 отсутствие геометрии для комбинации LOD/group.
 
+Validated `ModelAsset` также сохраняет decoded type 8 keys и type 19 map как
+`ModelAnimation`. `node38_fallback_pose` возвращает pose по `fallback_key`,
+то есть доказанный static input. Значение `parent_or_link` сохраняется как raw
+field, пока runtime evidence не подтверждает, является ли оно parent index или
+другой link semantic.
+
 ## Slot and batch
 
 Type 2 содержит header `0x8C`, затем `Slot68`:

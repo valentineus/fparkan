@@ -21,6 +21,7 @@
 //! Stage-3 MSH asset contract.
 
 use encoding_rs::WINDOWS_1251;
+use fparkan_animation::{AnimKey24, Pose};
 use fparkan_nres::{EntryMeta, NresDocument, NresError};
 
 /// Node table stream.
@@ -110,6 +111,22 @@ pub struct ModelAsset {
     pub batches: Vec<Batch>,
     /// Optional decoded node names.
     pub node_names: Option<Vec<Option<String>>>,
+    /// Optional decoded node-animation streams.
+    pub animation: Option<ModelAnimation>,
+}
+
+/// Decoded MSH node-animation streams.
+///
+/// This preserves the exact type-8/type-19 boundary used by `Node38` without
+/// assigning runtime-state ownership to a static asset.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelAnimation {
+    /// Type-8 animation keys in source order.
+    pub keys: Vec<AnimKey24>,
+    /// Type-19 frame-to-key mapping words in source order.
+    pub frame_map: Vec<u16>,
+    /// Declared frame count from type-19 `attr2`.
+    pub frame_count: u32,
 }
 
 /// Node id.
@@ -125,6 +142,17 @@ pub struct SlotId(pub u32);
 pub struct Node {
     /// Raw node bytes.
     pub raw: Vec<u8>,
+}
+
+/// Raw fields of the standard 38-byte node layout that precede slot selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Node38Metadata {
+    /// Unassigned source link value at byte offset two.
+    pub parent_or_link_raw: u16,
+    /// Offset into the type-19 frame map, or `0xFFFF` for no map.
+    pub anim_map_start: u16,
+    /// Fallback type-8 key index.
+    pub fallback_key: u16,
 }
 
 /// Slot descriptor.
@@ -387,6 +415,41 @@ pub fn selected_slot(model: &ModelAsset, node: NodeId, lod: Lod, group: Group) -
     (slot < model.slots.len()).then_some(SlotId(u32::from(raw)))
 }
 
+/// Returns the undecorated metadata of a standard 38-byte node.
+#[must_use]
+pub fn node38_metadata(model: &ModelAsset, node: NodeId) -> Option<Node38Metadata> {
+    if model.node_stride != 38 {
+        return None;
+    }
+    let node_index = usize::try_from(node.0).ok()?;
+    if node_index >= model.node_count {
+        return None;
+    }
+    let offset = node_index.checked_mul(model.node_stride)?;
+    Some(Node38Metadata {
+        parent_or_link_raw: read_u16(&model.nodes_raw, offset + 2)?,
+        anim_map_start: read_u16(&model.nodes_raw, offset + 4)?,
+        fallback_key: read_u16(&model.nodes_raw, offset + 6)?,
+    })
+}
+
+/// Returns the source fallback pose of a standard node.
+///
+/// The legacy sampler uses this key when a node has no frame map or its current
+/// frame falls outside that map. It is a static-pose input only; callers must
+/// still recover animation state and the meaning of `parent_or_link_raw` before
+/// assembling a runtime hierarchy.
+#[must_use]
+pub fn node38_fallback_pose(model: &ModelAsset, node: NodeId) -> Option<Pose> {
+    let metadata = node38_metadata(model, node)?;
+    model
+        .animation
+        .as_ref()?
+        .keys
+        .get(usize::from(metadata.fallback_key))
+        .map(AnimKey24::sampling_pose)
+}
+
 /// Returns draw batches for a validated slot.
 ///
 /// # Errors
@@ -526,6 +589,7 @@ fn parse_model_document(document: &NresDocument) -> Result<ModelAsset, MshError>
     let node_names = read_optional_stream(document, STREAM_NAMES)?
         .map(|raw| parse_res10_names(&raw.bytes, node_count))
         .transpose()?;
+    let animation = parse_optional_animation(document)?;
 
     Ok(ModelAsset {
         node_stride,
@@ -538,7 +602,35 @@ fn parse_model_document(document: &NresDocument) -> Result<ModelAsset, MshError>
         indices,
         batches,
         node_names,
+        animation,
     })
+}
+
+fn parse_optional_animation(document: &NresDocument) -> Result<Option<ModelAnimation>, MshError> {
+    let keys = read_optional_stream(document, STREAM_ANIMATION_KEYS)?;
+    let frame_map = read_optional_stream(document, STREAM_ANIMATION_FRAME_MAP)?;
+    let (Some(keys), Some(frame_map)) = (keys, frame_map) else {
+        return Ok(None);
+    };
+    if !keys.bytes.len().is_multiple_of(24) {
+        return Err(invalid_resource_size("Res8", keys.bytes.len(), 24));
+    }
+    if !frame_map.bytes.len().is_multiple_of(2) {
+        return Err(invalid_resource_size("Res19", frame_map.bytes.len(), 2));
+    }
+    let keys = keys
+        .bytes
+        .chunks_exact(24)
+        .map(AnimKey24::decode)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| MshError::InvalidGeometry(format!("invalid Res8 animation key: {err}")))?;
+    let frame_count = frame_map.attributes.attr2;
+    let frame_map = parse_u16_array(&frame_map.bytes, "Res19")?;
+    Ok(Some(ModelAnimation {
+        keys,
+        frame_map,
+        frame_count,
+    }))
 }
 
 struct RawStream {
@@ -1061,6 +1153,55 @@ mod tests {
             Some(SlotId(1))
         );
         assert_eq!(selected_slot(&model, NodeId(0), Lod(2), Group(4)), None);
+    }
+
+    #[test]
+    fn standard_node_exposes_fallback_pose_and_unassigned_link() {
+        let mut node = node38([u16::MAX; 15]);
+        node[2..4].copy_from_slice(&7_u16.to_le_bytes());
+        node[4..6].copy_from_slice(&u16::MAX.to_le_bytes());
+        node[6..8].copy_from_slice(&0_u16.to_le_bytes());
+        let mut key = Vec::new();
+        push_f32(&mut key, 1.0);
+        push_f32(&mut key, 2.0);
+        push_f32(&mut key, 3.0);
+        push_f32(&mut key, 0.0);
+        push_u16(&mut key, 0);
+        push_u16(&mut key, 0);
+        push_u16(&mut key, 0);
+        push_u16(&mut key, 32_767);
+        let document = decode_nested(&build_nres(&[
+            stream(STREAM_NODE_TABLE, 38, b"Res1", &node),
+            stream(STREAM_SLOTS, 0, b"Res2", &slots_payload(&[])),
+            stream(STREAM_POSITIONS, 0, b"Res3", &[]),
+            stream(STREAM_INDICES, 0, b"Res6", &[]),
+            stream(STREAM_ANIMATION_KEYS, 0, b"Res8", &key),
+            stream(STREAM_BATCHES, 0, b"Res13", &[]),
+            stream(STREAM_ANIMATION_FRAME_MAP, 0, b"Res19", &[]),
+        ]))
+        .expect("nested NRes");
+        let model =
+            validate_msh(&decode_msh(&document).expect("msh document")).expect("model asset");
+
+        assert_eq!(
+            node38_metadata(&model, NodeId(0)),
+            Some(Node38Metadata {
+                parent_or_link_raw: 7,
+                anim_map_start: u16::MAX,
+                fallback_key: 0,
+            })
+        );
+        assert_eq!(
+            node38_fallback_pose(&model, NodeId(0)).map(|pose| pose.translation),
+            Some([1.0, 2.0, 3.0])
+        );
+        assert_eq!(
+            model
+                .animation
+                .as_ref()
+                .map(|animation| animation.keys.len()),
+            Some(1)
+        );
     }
 
     #[test]

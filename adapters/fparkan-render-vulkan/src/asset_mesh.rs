@@ -566,6 +566,7 @@ mod tests {
             indices,
             batches,
             node_names: None,
+            animation: None,
         }
     }
 
@@ -626,6 +627,7 @@ mod tests {
                 },
             ],
             node_names: None,
+            animation: None,
         };
 
         let selected = static_model_preview_batches(&model).expect("valid selected slot");
