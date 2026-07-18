@@ -36,6 +36,7 @@ pub struct TerrainWorld {
     grid: RuntimeGrid,
     adjacency: Vec<Vec<ArealId>>,
     surfaces: Vec<RuntimeTriangle>,
+    surface_bvh: SurfaceBvh,
     source_mesh: Option<LandMeshDocument>,
 }
 
@@ -239,6 +240,7 @@ impl TerrainWorld {
             grid,
             adjacency,
             surfaces: Vec::new(),
+            surface_bvh: SurfaceBvh::default(),
             source_mesh: None,
         })
     }
@@ -252,9 +254,11 @@ impl TerrainWorld {
     pub fn from_land_msh(mesh: &LandMeshDocument) -> Result<Self, TerrainError> {
         Ok(Self {
             surfaces: build_surfaces(mesh)?,
+            surface_bvh: SurfaceBvh::default(),
             source_mesh: Some(mesh.clone()),
             ..Self::default()
-        })
+        }
+        .with_surface_bvh())
     }
 
     /// Builds terrain runtime data from decoded `Land.msh` and `Land.map`.
@@ -269,6 +273,7 @@ impl TerrainWorld {
     ) -> Result<Self, TerrainError> {
         let mut world = Self::from_land_map(map)?;
         world.surfaces = build_surfaces(mesh)?;
+        world.surface_bvh = SurfaceBvh::from_surfaces(&world.surfaces);
         world.source_mesh = Some(mesh.clone());
         Ok(world)
     }
@@ -301,6 +306,11 @@ impl TerrainWorld {
         self.source_mesh
             .as_ref()
             .map(|mesh| mesh.positions.as_slice())
+    }
+
+    fn with_surface_bvh(mut self) -> Self {
+        self.surface_bvh = SurfaceBvh::from_surfaces(&self.surfaces);
+        self
     }
 
     fn locate_by_candidates(
@@ -399,7 +409,8 @@ impl SurfaceQuery for TerrainWorld {
             return Err(TerrainError::Unsupported);
         }
         let mut best = None;
-        for triangle in &self.surfaces {
+        for index in self.surface_bvh.xy_candidates(position) {
+            let triangle = &self.surfaces[index];
             if let Some(height) = triangle.height_at(position) {
                 best = Some(best.map_or(height, |current: f32| current.max(height)));
             }
@@ -416,8 +427,11 @@ impl SurfaceQuery for TerrainWorld {
         if self.surfaces.is_empty() {
             return Err(TerrainError::Unsupported);
         }
+        let mut candidates = self.surface_bvh.ray_candidates(origin, direction);
+        candidates.sort_unstable();
         let mut best: Option<SurfaceHit> = None;
-        for triangle in &self.surfaces {
+        for index in candidates {
+            let triangle = &self.surfaces[index];
             if mask.0 != 0 && triangle.mask.0 & mask.0 == 0 {
                 continue;
             }
@@ -470,6 +484,202 @@ struct RuntimeTriangle {
     face: usize,
     mask: FullSurfaceMask,
     vertices: [[f32; 3]; 3],
+}
+
+const SURFACE_BVH_LEAF_SIZE: usize = 8;
+const SURFACE_BOUNDS_EPSILON: f32 = 1.0e-4;
+
+/// Deterministic CPU index over validated terrain triangles.
+///
+/// The index changes only candidate selection: triangle math and observable
+/// tie-breaking remain in [`SurfaceQuery`] above.
+#[derive(Clone, Debug, Default)]
+struct SurfaceBvh {
+    nodes: Vec<SurfaceBvhNode>,
+    triangle_indices: Vec<usize>,
+    root: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct SurfaceBvhNode {
+    min: [f32; 3],
+    max: [f32; 3],
+    kind: SurfaceBvhNodeKind,
+}
+
+#[derive(Clone, Debug)]
+enum SurfaceBvhNodeKind {
+    Leaf { first: usize, count: usize },
+    Branch { left: usize, right: usize },
+}
+
+impl SurfaceBvh {
+    fn from_surfaces(surfaces: &[RuntimeTriangle]) -> Self {
+        if surfaces.is_empty() {
+            return Self::default();
+        }
+        let mut index = Self {
+            nodes: Vec::with_capacity(surfaces.len().saturating_mul(2)),
+            triangle_indices: Vec::with_capacity(surfaces.len()),
+            root: None,
+        };
+        let indices: Vec<usize> = (0..surfaces.len()).collect();
+        index.root = Some(index.build(surfaces, indices));
+        index
+    }
+
+    fn build(&mut self, surfaces: &[RuntimeTriangle], mut indices: Vec<usize>) -> usize {
+        let (min, max) = surface_bounds(surfaces, &indices);
+        if indices.len() <= SURFACE_BVH_LEAF_SIZE {
+            indices.sort_unstable();
+            let first = self.triangle_indices.len();
+            let count = indices.len();
+            self.triangle_indices.extend(indices);
+            let node = self.nodes.len();
+            self.nodes.push(SurfaceBvhNode {
+                min,
+                max,
+                kind: SurfaceBvhNodeKind::Leaf { first, count },
+            });
+            return node;
+        }
+
+        let axis = longest_axis(min, max);
+        indices.sort_by(|left, right| {
+            surface_centroid(&surfaces[*left])[axis]
+                .total_cmp(&surface_centroid(&surfaces[*right])[axis])
+                .then_with(|| left.cmp(right))
+        });
+        let right_indices = indices.split_off(indices.len() / 2);
+        let left = self.build(surfaces, indices);
+        let right = self.build(surfaces, right_indices);
+        let node = self.nodes.len();
+        self.nodes.push(SurfaceBvhNode {
+            min,
+            max,
+            kind: SurfaceBvhNodeKind::Branch { left, right },
+        });
+        node
+    }
+
+    fn xy_candidates(&self, point: [f32; 2]) -> Vec<usize> {
+        let mut candidates = Vec::new();
+        let Some(root) = self.root else {
+            return candidates;
+        };
+        let mut pending = vec![root];
+        while let Some(node_index) = pending.pop() {
+            let node = &self.nodes[node_index];
+            if !point_within_surface_bounds(point, node.min, node.max) {
+                continue;
+            }
+            match node.kind {
+                SurfaceBvhNodeKind::Leaf { first, count } => {
+                    candidates.extend_from_slice(&self.triangle_indices[first..first + count]);
+                }
+                SurfaceBvhNodeKind::Branch { left, right } => {
+                    pending.push(right);
+                    pending.push(left);
+                }
+            }
+        }
+        candidates
+    }
+
+    fn ray_candidates(&self, origin: [f32; 3], direction: [f32; 3]) -> Vec<usize> {
+        let mut candidates = Vec::new();
+        let Some(root) = self.root else {
+            return candidates;
+        };
+        let mut pending = vec![root];
+        while let Some(node_index) = pending.pop() {
+            let node = &self.nodes[node_index];
+            if !ray_intersects_surface_bounds(origin, direction, node.min, node.max) {
+                continue;
+            }
+            match node.kind {
+                SurfaceBvhNodeKind::Leaf { first, count } => {
+                    candidates.extend_from_slice(&self.triangle_indices[first..first + count]);
+                }
+                SurfaceBvhNodeKind::Branch { left, right } => {
+                    pending.push(right);
+                    pending.push(left);
+                }
+            }
+        }
+        candidates
+    }
+}
+
+fn surface_bounds(surfaces: &[RuntimeTriangle], indices: &[usize]) -> ([f32; 3], [f32; 3]) {
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for index in indices {
+        for vertex in surfaces[*index].vertices {
+            for axis in 0..3 {
+                min[axis] = min[axis].min(vertex[axis]);
+                max[axis] = max[axis].max(vertex[axis]);
+            }
+        }
+    }
+    (min, max)
+}
+
+fn surface_centroid(triangle: &RuntimeTriangle) -> [f32; 3] {
+    let mut centroid = [0.0; 3];
+    for vertex in triangle.vertices {
+        for axis in 0..3 {
+            centroid[axis] += vertex[axis] / 3.0;
+        }
+    }
+    centroid
+}
+
+fn longest_axis(min: [f32; 3], max: [f32; 3]) -> usize {
+    let extent = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+    if extent[1] > extent[0] && extent[1] >= extent[2] {
+        1
+    } else if extent[2] > extent[0] && extent[2] > extent[1] {
+        2
+    } else {
+        0
+    }
+}
+
+fn point_within_surface_bounds(point: [f32; 2], min: [f32; 3], max: [f32; 3]) -> bool {
+    point[0] >= min[0] - SURFACE_BOUNDS_EPSILON
+        && point[0] <= max[0] + SURFACE_BOUNDS_EPSILON
+        && point[1] >= min[1] - SURFACE_BOUNDS_EPSILON
+        && point[1] <= max[1] + SURFACE_BOUNDS_EPSILON
+}
+
+fn ray_intersects_surface_bounds(
+    origin: [f32; 3],
+    direction: [f32; 3],
+    min: [f32; 3],
+    max: [f32; 3],
+) -> bool {
+    let mut near = 0.0_f32;
+    let mut far = f32::INFINITY;
+    for axis in 0..3 {
+        if direction[axis].abs() <= f32::EPSILON {
+            if origin[axis] < min[axis] - SURFACE_BOUNDS_EPSILON
+                || origin[axis] > max[axis] + SURFACE_BOUNDS_EPSILON
+            {
+                return false;
+            }
+            continue;
+        }
+        let inverse = 1.0 / direction[axis];
+        let first = (min[axis] - origin[axis]) * inverse;
+        let second = (max[axis] - origin[axis]) * inverse;
+        near = near.max(first.min(second));
+        far = far.min(first.max(second));
+        if far < near {
+            return false;
+        }
+    }
+    far >= 0.0
 }
 
 impl RuntimeTriangle {
@@ -844,6 +1054,30 @@ mod tests {
     }
 
     #[test]
+    fn surface_bvh_reduces_candidates_without_changing_surface_math() {
+        let surfaces: Vec<_> = (0_u16..16)
+            .map(|face| {
+                let x = f32::from(face) * 10.0;
+                RuntimeTriangle {
+                    face: usize::from(face),
+                    mask: FullSurfaceMask(1),
+                    vertices: [[x, 0.0, x], [x + 1.0, 0.0, x], [x, 1.0, x]],
+                }
+            })
+            .collect();
+        let index = SurfaceBvh::from_surfaces(&surfaces);
+
+        let xy = index.xy_candidates([0.25, 0.25]);
+        assert!(xy.contains(&0));
+        assert!(xy.len() < surfaces.len());
+        assert_eq!(surfaces[xy[0]].height_at([0.25, 0.25]), Some(0.0));
+
+        let ray = index.ray_candidates([0.25, 0.25, 5.0], [0.0, 0.0, -1.0]);
+        assert!(ray.contains(&0));
+        assert!(ray.len() < surfaces.len());
+    }
+
+    #[test]
     #[ignore = "requires licensed corpus"]
     fn licensed_corpus_land_maps_build_navigation_worlds() {
         for (corpus, expected_files, expected_areals) in [
@@ -907,6 +1141,7 @@ mod tests {
             let root = corpus_root(corpus);
             let mut files = 0usize;
             let mut faces = 0usize;
+            let mut indexed_queries = 0usize;
             for path in files_under(&root) {
                 if !path
                     .file_name()
@@ -925,12 +1160,33 @@ mod tests {
                     .unwrap_or_else(|err| panic!("{corpus} {path:?}: {err}"));
                 let world = TerrainWorld::from_land_msh(&mesh)
                     .unwrap_or_else(|err| panic!("{corpus} {path:?}: {err}"));
+                if world.surface_count() > SURFACE_BVH_LEAF_SIZE {
+                    let triangle = &world.surfaces[0];
+                    let point = [
+                        (triangle.vertices[0][0]
+                            + triangle.vertices[1][0]
+                            + triangle.vertices[2][0])
+                            / 3.0,
+                        (triangle.vertices[0][1]
+                            + triangle.vertices[1][1]
+                            + triangle.vertices[2][1])
+                            / 3.0,
+                    ];
+                    let candidates = world.surface_bvh.xy_candidates(point);
+                    assert!(candidates.contains(&0), "{corpus} {path:?} face zero");
+                    assert!(
+                        candidates.len() < world.surface_count(),
+                        "{corpus} {path:?} surface index did not reduce candidates"
+                    );
+                    indexed_queries += 1;
+                }
                 files += 1;
                 faces += world.surface_count();
             }
 
             assert_eq!(files, expected_files, "{corpus} Land.msh count");
             assert_eq!(faces, expected_faces, "{corpus} surface face count");
+            assert_eq!(indexed_queries, files, "{corpus} indexed Land.msh count");
         }
     }
 
