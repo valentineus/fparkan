@@ -237,8 +237,8 @@ The creation and conversion boundaries are reproducible with
 but reads operands from instantiated per-clan cells rather than textual
 defaults. Runtime exposes `resolve_loaded_handler30` for the exact opaque
 `(mode=0, first, second)` callback command. It intentionally returns that
-command without invoking a guessed game-side consumer: the tenth
-`CreateSuperAI` callback argument still needs its own recovery.
+command without automatically invoking a game-side consumer: only one
+consumer branch has a safe Rust meaning so far.
 
 The live GOG AutoDemo closes that consumer boundary: the read-only callback
 pointer at `ai.dll + 0x555e4` is `0x100611d0`, or `iron3d.dll + 0x611d0` at
@@ -247,10 +247,27 @@ payload)`, matching `Handler(30)` as `(0, first, second)`. In `mode == 0`,
 `command == 0` and `payload == 0` selects `VOICE_MISSION_FAIL`, records the
 failed status, and clears an IGame byte; `payload == 1` selects
 `VOICE_MISSION_COMPLETE`, records completion, and sets that byte. Commands
-1, 3, 4, and 5 have additional game-side paths; mode 2 is a separate IGame
-call. Those branches are not yet assigned Rust gameplay meanings. Reproduce
-the current evidence with `capture-ai-init.ps1` and
-`ExportIron3dAiCallback.java`.
+3, 4, and 5 have additional game-side paths; mode 2 is a separate IGame
+call.
+
+`command == 1` is now statically traced, but still has no justified domain
+name. Its payload is a signed integer key for a binary-search tree: the
+receiver's `+0x04` is the sentinel/root, each node has child links at `+0x08`
+and `+0x0c`, a key at `+0x10`, and a dispatched payload at `+0x14`. A matching
+node reaches `FUN_10095600(node + 0x14)`. That payload has one-shot flag
+`+0x19` and a second flag `+0x18`. On its first dispatch, Iron3D sets `+0x19`,
+obtains a resource-manager string through virtual slot `+0x1c`, and passes the
+payload's `+0x0c` through `FUN_10061fb0`. On later dispatches it uses
+resource-manager IDs `0x181a` and `0x184f`, an IGame selector `0x2ed`, and
+emits an opaque request with category `3` or `4` selected by `+0x18`. This
+proves the lookup and one-shot/repeat split, not the UI/message subject or the
+semantics of either resource ID; Rust therefore retains command `1` as
+`Unhandled`.
+
+Reproduce the callback and the command-one consumers with
+`capture-ai-init.ps1`, `ExportIron3dAiCallback.java`,
+`ExportIron3dAiCallbackCommand1.java`, and
+`ExportIron3dAiCallbackCommand1Dispatch.java`.
 
 Runtime now applies only this recovered branch as
 `apply_loaded_script_host_callback`: `(0, 0, 0)` transitions a loaded mission
