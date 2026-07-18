@@ -12,6 +12,129 @@ use std::sync::Arc;
 const INSTRUCTION_HEADER_BYTES: u64 = 28;
 const INSTRUCTION_WORDS: usize = 7;
 const GOG_HANDLER_COUNT: u32 = 73;
+const MAX_VARSET_DECLARATIONS: usize = 4096;
+
+/// Parsed defaults from the text `varset.var` source shared by AI packages.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct VarSet {
+    /// Declarations in original source order.
+    pub declarations: Vec<VarSetDeclaration>,
+}
+
+/// One supported `VAR(...)` declaration from `varset.var`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VarSetDeclaration {
+    /// Variable type spelling used by the original source.
+    pub type_name: VarSetType,
+    /// ASCII variable name.
+    pub name: String,
+    /// Typed default value.
+    pub default_value: VarSetDefault,
+}
+
+/// Numeric declaration types present in the shipped GOG `varset.var`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VarSetType {
+    /// `VAR(float, ...)`.
+    Float,
+    /// `VAR(DWORD, ...)`.
+    Dword,
+}
+
+/// A lossless-in-meaning numeric default from `varset.var`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VarSetDefault {
+    /// IEEE-754 bits parsed from a `float` literal.
+    FloatBits(u32),
+    /// Unsigned 32-bit integer parsed from a decimal or hexadecimal `DWORD` literal.
+    Dword(u32),
+}
+
+impl VarSetDefault {
+    /// Returns the float value when this is a `float` default.
+    #[must_use]
+    pub fn as_float(self) -> Option<f32> {
+        match self {
+            Self::FloatBits(bits) => Some(f32::from_bits(bits)),
+            Self::Dword(_) => None,
+        }
+    }
+
+    /// Returns the integer value when this is a `DWORD` default.
+    #[must_use]
+    pub fn as_dword(self) -> Option<u32> {
+        match self {
+            Self::FloatBits(_) => None,
+            Self::Dword(value) => Some(value),
+        }
+    }
+}
+
+/// Error while parsing the documented `varset.var` declaration subset.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VarSetError {
+    /// A line beginning with `VAR(` did not have a closing parenthesis.
+    UnterminatedDeclaration {
+        /// One-based source line containing the declaration.
+        line: usize,
+    },
+    /// A declaration omitted one of its first three fields.
+    MissingField {
+        /// One-based source line containing the declaration.
+        line: usize,
+    },
+    /// A declaration type is not one of the observed GOG numeric types.
+    UnsupportedType {
+        /// One-based source line containing the declaration.
+        line: usize,
+    },
+    /// A declaration name or numeric literal was not ASCII text.
+    NonAsciiField {
+        /// One-based source line containing the declaration.
+        line: usize,
+    },
+    /// A `float` default was not a finite Rust-compatible decimal literal.
+    InvalidFloat {
+        /// One-based source line containing the declaration.
+        line: usize,
+    },
+    /// A `DWORD` default was neither a decimal nor a hexadecimal `u32`.
+    InvalidDword {
+        /// One-based source line containing the declaration.
+        line: usize,
+    },
+    /// The input exceeded the bounded declaration count.
+    TooManyDeclarations {
+        /// Maximum accepted declaration count.
+        limit: usize,
+    },
+}
+
+impl std::fmt::Display for VarSetError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnterminatedDeclaration { line } => {
+                write!(formatter, "unterminated VAR declaration at line {line}")
+            }
+            Self::MissingField { line } => write!(formatter, "missing VAR field at line {line}"),
+            Self::UnsupportedType { line } => {
+                write!(formatter, "unsupported VAR type at line {line}")
+            }
+            Self::NonAsciiField { line } => write!(formatter, "non-ASCII VAR field at line {line}"),
+            Self::InvalidFloat { line } => {
+                write!(formatter, "invalid float default at line {line}")
+            }
+            Self::InvalidDword { line } => {
+                write!(formatter, "invalid DWORD default at line {line}")
+            }
+            Self::TooManyDeclarations { limit } => {
+                write!(formatter, "VAR declaration count exceeds limit {limit}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VarSetError {}
 
 /// A compiled `.scr` package.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -212,6 +335,114 @@ fn is_f32_zero_bits(bits: u32) -> bool {
     matches!(bits, 0 | 0x8000_0000)
 }
 
+/// Parses the numeric `VAR(...)` declarations from a legacy `varset.var` file.
+///
+/// Parsing is line-oriented and byte-safe: non-UTF-8 comments remain opaque,
+/// while the declaration head, type, name, and default value must be ASCII.
+/// `STRING(...)`, `FUNCTION(...)`, and all other non-`VAR` lines remain outside
+/// this recovered numeric-default contract.
+///
+/// # Errors
+///
+/// Returns a typed error for malformed supported declarations or inputs above
+/// the fixed declaration limit.
+pub fn parse_varset(bytes: &[u8]) -> Result<VarSet, VarSetError> {
+    let mut declarations = Vec::new();
+    for (line_index, raw_line) in bytes.split(|byte| *byte == b'\n').enumerate() {
+        let line = trim_ascii(strip_line_comment(raw_line));
+        if !line.starts_with(b"VAR(") {
+            continue;
+        }
+        if declarations.len() == MAX_VARSET_DECLARATIONS {
+            return Err(VarSetError::TooManyDeclarations {
+                limit: MAX_VARSET_DECLARATIONS,
+            });
+        }
+        declarations.push(parse_varset_declaration(line, line_index + 1)?);
+    }
+    Ok(VarSet { declarations })
+}
+
+fn strip_line_comment(line: &[u8]) -> &[u8] {
+    line.windows(2)
+        .position(|window| window == b"//")
+        .map_or(line, |index| &line[..index])
+}
+
+fn trim_ascii(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |index| index + 1);
+    &bytes[start..end]
+}
+
+fn parse_varset_declaration(
+    line: &[u8],
+    line_number: usize,
+) -> Result<VarSetDeclaration, VarSetError> {
+    let declaration = line
+        .strip_prefix(b"VAR(")
+        .and_then(|body| body.strip_suffix(b")"))
+        .or_else(|| {
+            line.strip_prefix(b"VAR(")
+                .and_then(|body| body.strip_suffix(b");"))
+        })
+        .ok_or(VarSetError::UnterminatedDeclaration { line: line_number })?;
+    let mut fields = declaration.split(|byte| *byte == b',').map(trim_ascii);
+    let type_raw = fields
+        .next()
+        .filter(|field| !field.is_empty())
+        .ok_or(VarSetError::MissingField { line: line_number })?;
+    let name_raw = fields
+        .next()
+        .filter(|field| !field.is_empty())
+        .ok_or(VarSetError::MissingField { line: line_number })?;
+    let default_raw = fields
+        .next()
+        .filter(|field| !field.is_empty())
+        .ok_or(VarSetError::MissingField { line: line_number })?;
+    let type_text = std::str::from_utf8(type_raw)
+        .map_err(|_| VarSetError::NonAsciiField { line: line_number })?;
+    let name = std::str::from_utf8(name_raw)
+        .map_err(|_| VarSetError::NonAsciiField { line: line_number })?
+        .to_owned();
+    let default_text = std::str::from_utf8(default_raw)
+        .map_err(|_| VarSetError::NonAsciiField { line: line_number })?;
+    let (type_name, default_value) = match type_text {
+        "float" => {
+            let value = default_text
+                .parse::<f32>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .ok_or(VarSetError::InvalidFloat { line: line_number })?;
+            (VarSetType::Float, VarSetDefault::FloatBits(value.to_bits()))
+        }
+        "DWORD" => (
+            VarSetType::Dword,
+            VarSetDefault::Dword(parse_varset_dword(default_text, line_number)?),
+        ),
+        _ => return Err(VarSetError::UnsupportedType { line: line_number }),
+    };
+    Ok(VarSetDeclaration {
+        type_name,
+        name,
+        default_value,
+    })
+}
+
+fn parse_varset_dword(value: &str, line: usize) -> Result<u32, VarSetError> {
+    let (radix, digits) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map_or((10, value), |digits| (16, digits));
+    u32::from_str_radix(digits, radix).map_err(|_| VarSetError::InvalidDword { line })
+}
+
 impl ScriptInstruction {
     /// Returns the recovered dispatch selector from the first disk word.
     #[must_use]
@@ -351,8 +582,9 @@ fn read_instruction(
 #[cfg(test)]
 mod tests {
     use super::{
-        decode, decode_with_limits, Handler2RecordInput, Handler2RecordScheduler,
-        ScriptDispatchSelector, GOG_HANDLER_COUNT, INSTRUCTION_WORDS,
+        decode, decode_with_limits, parse_varset, Handler2RecordInput, Handler2RecordScheduler,
+        ScriptDispatchSelector, VarSetDefault, VarSetError, VarSetType, GOG_HANDLER_COUNT,
+        INSTRUCTION_WORDS,
     };
     use fparkan_binary::{DecodeError, Limits};
 
@@ -441,6 +673,49 @@ mod tests {
         assert!(!update.refreshed);
         assert_eq!(scheduler.records()[0].counter, 5);
         assert_eq!(scheduler.records()[0].scalar_6.to_bits(), 3.0_f32.to_bits());
+    }
+
+    #[test]
+    fn varset_parser_preserves_typed_defaults_and_legacy_comment_bytes() {
+        let source = b"// \xff legacy comment\r\n\
+VAR( float, fDifficulty, 0.5) // ignored\r\n\
+VAR( DWORD, CLASS_BUILDING, 0x80000000);\r\n\
+STRING( 8, ignored, ignored, ignored)\r\n";
+        let parsed = parse_varset(source).expect("valid varset declarations");
+        assert_eq!(parsed.declarations.len(), 2);
+        assert_eq!(parsed.declarations[0].type_name, VarSetType::Float);
+        assert_eq!(parsed.declarations[0].name, "fDifficulty");
+        assert_eq!(
+            parsed.declarations[0].default_value,
+            VarSetDefault::FloatBits(0.5_f32.to_bits())
+        );
+        assert_eq!(parsed.declarations[1].type_name, VarSetType::Dword);
+        assert_eq!(parsed.declarations[1].name, "CLASS_BUILDING");
+        assert_eq!(
+            parsed.declarations[1].default_value.as_dword(),
+            Some(0x8000_0000)
+        );
+        assert_eq!(parsed.declarations[0].default_value.as_float(), Some(0.5));
+    }
+
+    #[test]
+    fn varset_parser_rejects_malformed_supported_declarations() {
+        assert_eq!(
+            parse_varset(b"VAR( float, f0, nope)\n"),
+            Err(VarSetError::InvalidFloat { line: 1 })
+        );
+        assert_eq!(
+            parse_varset(b"VAR( BYTE, b0, 1)\n"),
+            Err(VarSetError::UnsupportedType { line: 1 })
+        );
+        assert_eq!(
+            parse_varset(b"VAR( DWORD, d0, 0x100000000)\n"),
+            Err(VarSetError::InvalidDword { line: 1 })
+        );
+        assert_eq!(
+            parse_varset(b"VAR( DWORD, d0, 1\n"),
+            Err(VarSetError::UnterminatedDeclaration { line: 1 })
+        );
     }
 
     #[test]

@@ -17,7 +17,13 @@ handlers, второй — числом event records. Каждый event хра
 records. Вложенный record сохраняет семь `u32` header words (в disk order),
 список `u32` references после шестого header word и trailing seventh word.
 Никакой из этих words ещё не получает semantic name. `.fml` — текстовый
-symbol/formula oracle; `varset.var` задаёт `VAR(...)`/`STRING(...)` defaults;
+symbol/formula oracle; `varset.var` задаёт `VAR(...)`/`STRING(...)` defaults.
+`fparkan-script::parse_varset` уже читает подтверждённые numeric
+`VAR(float|DWORD, name, default)` declarations byte-safe (comments остаются
+opaque, поэтому legacy non-UTF-8 text не ломает загрузку); `STRING(...)` и
+`FUNCTION(...)` пока сохранены за границей этого numeric contract;
+GOG `MISSIONS/SCRIPTS/varset.var` даёт через него ровно 231 declaration:
+31 `float` и 200 `DWORD` (от `f0` до `fY`);
 `.trf` — NRes tables, чей framing подтверждён, а field semantics местами лишь
 consumer-inferred.
 

@@ -245,6 +245,17 @@ struct ScriptHeaderWordCount {
     instructions: usize,
 }
 
+#[derive(Serialize)]
+struct VarSetInspectOutput<'a> {
+    schema_version: &'static str,
+    path: &'a str,
+    declarations: usize,
+    float_defaults: usize,
+    dword_defaults: usize,
+    first_name: Option<&'a str>,
+    last_name: Option<&'a str>,
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = run(&args);
@@ -313,6 +324,10 @@ fn run(args: &[String]) -> Result<(), String> {
             let rest = strip_format_json(rest)?;
             inspect_script(&rest)
         }
+        [domain, command, rest @ ..] if domain == "varset" && command == "inspect" => {
+            let rest = strip_format_json(rest)?;
+            inspect_varset(&rest)
+        }
         _ => Err(usage()),
     }
 }
@@ -361,6 +376,40 @@ fn script_inspect_json(
                 instructions,
             })
             .collect(),
+    })
+}
+
+fn inspect_varset(args: &[String]) -> Result<(), String> {
+    let path = parse_file_path(args, "varset inspect")?;
+    let bytes = std::fs::read(&path).map_err(|err| format!("{}: {err}", path.display()))?;
+    let varset =
+        fparkan_script::parse_varset(&bytes).map_err(|err| format!("{}: {err}", path.display()))?;
+    let display_path = path.display().to_string();
+    println!("{}", varset_inspect_json(&display_path, &varset)?);
+    Ok(())
+}
+
+fn varset_inspect_json(path: &str, varset: &fparkan_script::VarSet) -> Result<String, String> {
+    let float_defaults = varset
+        .declarations
+        .iter()
+        .filter(|declaration| declaration.type_name == fparkan_script::VarSetType::Float)
+        .count();
+    let dword_defaults = varset.declarations.len() - float_defaults;
+    serialize_json(&VarSetInspectOutput {
+        schema_version: "fparkan-varset-inspect-v1",
+        path,
+        declarations: varset.declarations.len(),
+        float_defaults,
+        dword_defaults,
+        first_name: varset
+            .declarations
+            .first()
+            .map(|declaration| declaration.name.as_str()),
+        last_name: varset
+            .declarations
+            .last()
+            .map(|declaration| declaration.name.as_str()),
     })
 }
 
@@ -839,7 +888,7 @@ fn prototype_graph_requiredness_label(
 }
 
 fn usage() -> String {
-    "usage: fparkan corpus discover|validate --root <path> [--format json] | archive inspect <file> [--format json] | terrain inspect <Land.msh> [--format json] | wear inspect --root <path> --archive <archive> --resource <wear.wea> [--format json] | model inspect --root <path> --archive <archive> --resource <model.msh> [--format json] | script inspect <file> [--format json] | prototype inspect --root <path> --key <key> [--format json] | mission graph|inspect --root <path> --mission <path> [--format json]".to_string()
+    "usage: fparkan corpus discover|validate --root <path> [--format json] | archive inspect <file> [--format json] | terrain inspect <Land.msh> [--format json] | wear inspect --root <path> --archive <archive> --resource <wear.wea> [--format json] | model inspect --root <path> --archive <archive> --resource <model.msh> [--format json] | script inspect <file> [--format json] | varset inspect <file> [--format json] | prototype inspect --root <path> --key <key> [--format json] | mission graph|inspect --root <path> --mission <path> [--format json]".to_string()
 }
 
 #[cfg(test)]
@@ -875,6 +924,17 @@ mod tests {
         assert_eq!(
             script_inspect_json("script.scr", &package),
             Ok("{\"schema_version\":\"fparkan-script-inspect-v2\",\"path\":\"script.scr\",\"opcode_handler_count\":73,\"events\":0,\"instructions\":0,\"references\":0,\"trailing_bytes\":0,\"first_header_word_candidates\":[]}".to_string())
+        );
+    }
+
+    #[test]
+    fn varset_inspect_json_has_canonical_field_order() {
+        let varset =
+            fparkan_script::parse_varset(b"VAR( float, f0, 0)\nVAR( DWORD, d0, 0xffffffff)\n")
+                .expect("minimal varset");
+        assert_eq!(
+            varset_inspect_json("varset.var", &varset),
+            Ok("{\"schema_version\":\"fparkan-varset-inspect-v1\",\"path\":\"varset.var\",\"declarations\":2,\"float_defaults\":1,\"dword_defaults\":1,\"first_name\":\"f0\",\"last_name\":\"d0\"}".to_string())
         );
     }
 
