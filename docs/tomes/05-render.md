@@ -1735,6 +1735,26 @@ recovered lookup routine. Therefore a future runtime implementation must treat
 cache availability as contextual and cannot dereference or prebuild the cache
 solely from constructor state.
 
+`tools/capture-terrain-shade-cache.ps1` now makes the same evidence repeatable
+without debugger attachment. It discovers `Terrain.dll` with Toolhelp, opens
+only `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ`, searches readable
+32-bit-process regions for the already proven cache vtable, and excludes the
+Terrain image itself because relocations there also contain that pointer value.
+It reports only addresses and count metadata; it does not alter the process or
+save game resources. On the unattended GOG AutoDemo process 5632 on 2026-07-18
+it found the live cache at `0x035C64B4`, with entry table `0x17284590` and
+exclusive count `3462`. Two adjacent passive captures retained the cache
+address/table/count but returned result views `0x0274BD89` and `0x008A60DC`.
+That changing result view is direct evidence that it is transient lookup
+state, not a persistent cache identity or a WEAR row. The observation narrows
+the next terrain task to profiling the cache's generated entries and their
+consumer; it still does not establish a Land1 blend equation.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File `
+  tools\capture-terrain-shade-cache.ps1 -ProcessId <iron_3d-pid>
+```
+
 The static Vulkan bridge now carries each contiguous face run as a separate
 draw range keyed by the original packed `material_tag`; it neither reorders
 triangles nor collapses the high byte. For the first usable visual layer, the
