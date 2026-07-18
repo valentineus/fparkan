@@ -853,6 +853,13 @@ depth attachment либо alpha-test shader variant, поэтому он не д
 дополнительного дизассемблирования. Это частично реализованная compatibility
 boundary, а не заявление о готовой parity fixed-function state.
 
+Выбор будущего depth/stencil attachment уже отделён от renderer lifetime:
+`select_depth_stencil_attachment_format` применяет тот же фиксированный порядок
+форматов, что и capability gate, к фактически поддерживаемому списку GPU.
+Это исключает ситуацию, когда admission принимает один совместимый формат, а
+allocation позднее выбирает другой; сам attachment и render-pass integration
+остаются следующей отдельной задачей.
+
 После последнего world pass renderer закрывает сцену и выводит back buffer.
 World3D снимает `in_render`, восстанавливает временный viewport state и вызывает
 `on_end_render` у active objects. Только после этого допустимо освобождать

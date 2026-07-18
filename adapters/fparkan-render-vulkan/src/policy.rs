@@ -806,11 +806,25 @@ fn supports_depth_stencil_request(
     if depth.depth_bits == 0 && depth.stencil_bits == 0 {
         return true;
     }
-    required_depth_stencil_formats(depth).iter().any(|format| {
-        device
-            .supported_depth_stencil_formats
-            .contains(&format.as_raw())
-    })
+    select_depth_stencil_attachment_format(&device.supported_depth_stencil_formats, depth).is_some()
+}
+
+/// Selects the first canonical depth/stencil attachment format supported by a device.
+///
+/// The order is part of the Windows Vulkan compatibility contract and is shared
+/// by device admission and future render-pass allocation.
+#[must_use]
+pub fn select_depth_stencil_attachment_format(
+    supported_formats: &[i32],
+    depth: DepthStencilSupport,
+) -> Option<i32> {
+    if depth.depth_bits == 0 && depth.stencil_bits == 0 {
+        return None;
+    }
+    required_depth_stencil_formats(depth)
+        .iter()
+        .map(|format| format.as_raw())
+        .find(|format| supported_formats.contains(format))
 }
 
 fn informational_capabilities(

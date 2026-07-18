@@ -321,6 +321,45 @@ fn capability_gate_respects_request_specific_depth_profiles() {
 }
 
 #[test]
+fn depth_attachment_selection_is_canonical_and_request_scoped() {
+    let supported = [
+        vk::Format::D32_SFLOAT_S8_UINT.as_raw(),
+        vk::Format::D24_UNORM_S8_UINT.as_raw(),
+        vk::Format::D32_SFLOAT.as_raw(),
+    ];
+    assert_eq!(
+        select_depth_stencil_attachment_format(
+            &supported,
+            DepthStencilSupport {
+                depth_bits: 24,
+                stencil_bits: 8,
+            },
+        ),
+        Some(vk::Format::D24_UNORM_S8_UINT.as_raw())
+    );
+    assert_eq!(
+        select_depth_stencil_attachment_format(
+            &supported,
+            DepthStencilSupport {
+                depth_bits: 32,
+                stencil_bits: 0,
+            },
+        ),
+        Some(vk::Format::D32_SFLOAT.as_raw())
+    );
+    assert_eq!(
+        select_depth_stencil_attachment_format(
+            &supported,
+            DepthStencilSupport {
+                depth_bits: 0,
+                stencil_bits: 0,
+            },
+        ),
+        None
+    );
+}
+
+#[test]
 fn capability_report_preserves_informational_sampled_formats_and_limits() {
     let report = select_physical_device(&[device(
         "Telemetry GPU",
