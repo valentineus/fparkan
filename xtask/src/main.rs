@@ -127,15 +127,10 @@ fn run(args: &[String]) -> Result<(), String> {
             run_stage_tests(options.stage, TestSuite::Licensed, Some(&roots))
         }
         [cmd, subcmd, rest @ ..] if cmd == "corpus" && subcmd == "baseline" => {
-            let root = parse_root(rest)?;
-            let manifest =
-                discover(&root, DiscoverOptions::default()).map_err(|e| e.to_string())?;
-            let report = report(&root, &manifest).map_err(|e| e.to_string())?;
-            println!("{}", render_report_json(&report));
-            Ok(())
+            run_corpus_baseline(&parse_corpus_baseline_options(rest)?)
         }
         _ => Err(
-            "usage: cargo xtask ci | policy | shader-provenance | acceptance report --suite synthetic|licensed [--stage 0..5|all] [--manifest corpora.toml] [--out <path>] | acceptance audit [--roadmap <path>] [--coverage <path>] [--out <path>] [--strict] | native-smoke audit --dir <path> [--expected-commit <sha>] [--expected-shader-manifest-hash <sha256>] | package --target <triple> --app viewer|game|headless|cli | test synthetic|licensed [--stage 0..5|all] [--manifest corpora.toml] | corpus baseline --root <path>"
+            "usage: cargo xtask ci | policy | shader-provenance | acceptance report --suite synthetic|licensed [--stage 0..5|all] [--manifest corpora.toml] [--out <path>] | acceptance audit [--roadmap <path>] [--coverage <path>] [--out <path>] [--strict] | native-smoke audit --dir <path> [--expected-commit <sha>] [--expected-shader-manifest-hash <sha256>] | package --target <triple> --app viewer|game|headless|cli | test synthetic|licensed [--stage 0..5|all] [--manifest corpora.toml] | corpus baseline --root <path> [--out <path>]"
                 .to_string(),
         ),
     }
@@ -754,17 +749,56 @@ fn validate_licensed_part(kind: &str, root: &Path) -> Result<(), String> {
     }
 }
 
-fn parse_root(args: &[String]) -> Result<PathBuf, String> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CorpusBaselineOptions {
+    root: PathBuf,
+    out: Option<PathBuf>,
+}
+
+fn parse_corpus_baseline_options(args: &[String]) -> Result<CorpusBaselineOptions, String> {
+    let mut root = None;
+    let mut out = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
-        if arg == "--root" {
-            return iter
-                .next()
-                .map(PathBuf::from)
-                .ok_or_else(|| "--root requires a path".to_string());
+        match arg.as_str() {
+            "--root" => {
+                root = Some(
+                    iter.next()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--root requires a path".to_string())?,
+                );
+            }
+            "--out" => {
+                out = Some(
+                    iter.next()
+                        .map(PathBuf::from)
+                        .ok_or_else(|| "--out requires a path".to_string())?,
+                );
+            }
+            other => return Err(format!("unknown corpus baseline option: {other}")),
         }
     }
-    Err("missing --root".to_string())
+    Ok(CorpusBaselineOptions {
+        root: root.ok_or_else(|| "missing --root".to_string())?,
+        out,
+    })
+}
+
+fn run_corpus_baseline(options: &CorpusBaselineOptions) -> Result<(), String> {
+    let manifest =
+        discover(&options.root, DiscoverOptions::default()).map_err(|error| error.to_string())?;
+    let baseline = report(&options.root, &manifest).map_err(|error| error.to_string())?;
+    let json = render_report_json(&baseline);
+    if let Some(out) = &options.out {
+        if let Some(parent) = out.parent() {
+            fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
+        }
+        fs::write(out, json).map_err(|error| format!("{}: {error}", out.display()))?;
+        println!("{}", out.display());
+    } else {
+        println!("{json}");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3004,6 +3038,24 @@ mod tests {
                 stage: Stage::Number(3),
                 root: PathBuf::from("fixtures"),
                 manifest: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_corpus_baseline_output_option() {
+        let options = parse_corpus_baseline_options(&strings(&[
+            "--root",
+            "C:/GOG Games/Parkan - Iron Strategy",
+            "--out",
+            "target/fparkan/corpus/part1.json",
+        ]));
+
+        assert_eq!(
+            options,
+            Ok(CorpusBaselineOptions {
+                root: PathBuf::from("C:/GOG Games/Parkan - Iron Strategy"),
+                out: Some(PathBuf::from("target/fparkan/corpus/part1.json")),
             })
         );
     }
