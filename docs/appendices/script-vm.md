@@ -53,6 +53,15 @@ cargo run -p fparkan-cli -- script inspect `
 records, 20 references и 0 trailing bytes. Это corpus evidence для reader-а,
 но не разрешение на исполнение неизвестных 73 opcodes.
 
+Теперь установлен selector: loader `0x10001000` создаёт 73 pointers в
+фиксированном порядке, а `0x10011e70` копирует их без перестановки в runtime
+array. Во всех 58 GOG `.scr` первый header word каждого nested record равен
+`0..72` либо `0xffff_ffff`: соответственно 2095 handler selectors и 3992
+sentinel records. Поэтому `ScriptInstruction::dispatch_selector()` возвращает
+`Handler(0..72)`, `Sentinel` или сохраняемый `Unknown(u32)`. Первый handler
+(`Handler(0)`, VA `0x10008034`) только устанавливает current context и flag
+`+0x50 = 1`; это не даёт ему игрового имени и не заменяет runtime trace.
+
 TMA properties остаются four raw `u32` words плюс имя, пока consumer/schema не
 задаст тип (integer/float bits/ObjectId/enum/fixed-point/index). В том числе
 сохраняются `NOT USED`; corpus подтверждает `Invulnerability`, life state,

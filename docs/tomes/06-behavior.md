@@ -143,6 +143,14 @@ references каждого record, жёстко ограничивает counts/a
 файла, но не таблица семантик: названия opcode/words появятся только после
 handler contracts и runtime traces.
 
+Связь первого header word с dispatch теперь доказана статически: `ai.dll`
+создаёт 73 handler pointers в известном порядке и копирует table без
+перестановки. По всем 58 GOG packages первый word — индекс `0..72` либо
+`0xffff_ffff` sentinel; `fparkan-script` отражает это как typed
+`ScriptDispatchSelector`, сохраняя неожиданные значения `Unknown`. Первый
+handler лишь инициирует execution context (`+0x50 = 1`); его gameplay meaning
+пока не назван.
+
 Безопасная runtime-модель:
 
 ```text

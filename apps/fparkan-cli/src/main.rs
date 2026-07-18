@@ -48,7 +48,7 @@ const MISSION_INSPECT_SCHEMA: &str = "fparkan-mission-inspect-v1";
 const TERRAIN_INSPECT_SCHEMA: &str = "fparkan-terrain-inspect-v1";
 const MODEL_INSPECT_SCHEMA: &str = "fparkan-model-inspect-v1";
 const WEAR_INSPECT_SCHEMA: &str = "fparkan-wear-inspect-v1";
-const SCRIPT_INSPECT_SCHEMA: &str = "fparkan-script-inspect-v1";
+const SCRIPT_INSPECT_SCHEMA: &str = "fparkan-script-inspect-v2";
 
 #[derive(Serialize)]
 struct ArchiveInspectOutput<'a> {
@@ -236,6 +236,13 @@ struct ScriptInspectOutput<'a> {
     instructions: usize,
     references: usize,
     trailing_bytes: usize,
+    first_header_word_candidates: Vec<ScriptHeaderWordCount>,
+}
+
+#[derive(Serialize)]
+struct ScriptHeaderWordCount {
+    value: u32,
+    instructions: usize,
 }
 
 fn main() {
@@ -335,6 +342,10 @@ fn script_inspect_json(
         .flat_map(|event| &event.instructions)
         .map(|instruction| instruction.references.len())
         .sum();
+    let mut candidates = std::collections::BTreeMap::<u32, usize>::new();
+    for instruction in package.events.iter().flat_map(|event| &event.instructions) {
+        *candidates.entry(instruction.header_words[0]).or_insert(0) += 1;
+    }
     serialize_json(&ScriptInspectOutput {
         schema_version: SCRIPT_INSPECT_SCHEMA,
         path,
@@ -343,6 +354,13 @@ fn script_inspect_json(
         instructions,
         references,
         trailing_bytes: package.trailing_bytes.len(),
+        first_header_word_candidates: candidates
+            .into_iter()
+            .map(|(value, instructions)| ScriptHeaderWordCount {
+                value,
+                instructions,
+            })
+            .collect(),
     })
 }
 
@@ -856,7 +874,7 @@ mod tests {
             fparkan_script::decode(&[73, 0, 0, 0, 0, 0, 0, 0]).expect("minimal script package");
         assert_eq!(
             script_inspect_json("script.scr", &package),
-            Ok("{\"schema_version\":\"fparkan-script-inspect-v1\",\"path\":\"script.scr\",\"opcode_handler_count\":73,\"events\":0,\"instructions\":0,\"references\":0,\"trailing_bytes\":0}".to_string())
+            Ok("{\"schema_version\":\"fparkan-script-inspect-v2\",\"path\":\"script.scr\",\"opcode_handler_count\":73,\"events\":0,\"instructions\":0,\"references\":0,\"trailing_bytes\":0,\"first_header_word_candidates\":[]}".to_string())
         );
     }
 

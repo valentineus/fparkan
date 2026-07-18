@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 const INSTRUCTION_HEADER_BYTES: u64 = 28;
 const INSTRUCTION_WORDS: usize = 7;
+const GOG_HANDLER_COUNT: u32 = 73;
 
 /// A compiled `.scr` package.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,6 +49,38 @@ pub struct ScriptInstruction {
     pub header_words: [u32; INSTRUCTION_WORDS],
     /// References stored after header word five and before word six.
     pub references: Vec<u32>,
+}
+
+/// The recovered selector for an instruction's installed handler table.
+///
+/// The GOG AI loader copies 73 function pointers in order. Across all checked
+/// GOG packages the first disk word is either one of these indices or the
+/// explicit `u32::MAX` sentinel. This is a disassembly contract, not an
+/// instruction executor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScriptDispatchSelector {
+    /// One of the ordered handlers installed by `ai.dll`.
+    Handler(u8),
+    /// The on-disk `0xffff_ffff` sentinel.
+    Sentinel,
+    /// A value not yet observed or accepted by the GOG handler table.
+    Unknown(u32),
+}
+
+impl ScriptInstruction {
+    /// Returns the recovered dispatch selector from the first disk word.
+    #[must_use]
+    pub fn dispatch_selector(&self) -> ScriptDispatchSelector {
+        match self.header_words[0] {
+            value if value < GOG_HANDLER_COUNT =>
+            {
+                #[allow(clippy::cast_possible_truncation)]
+                ScriptDispatchSelector::Handler(self.header_words[0] as u8)
+            }
+            u32::MAX => ScriptDispatchSelector::Sentinel,
+            value => ScriptDispatchSelector::Unknown(value),
+        }
+    }
 }
 
 /// Decodes a compiled AI package using default safety limits.
@@ -172,7 +205,9 @@ fn read_instruction(
 
 #[cfg(test)]
 mod tests {
-    use super::{decode, decode_with_limits};
+    use super::{
+        decode, decode_with_limits, ScriptDispatchSelector, GOG_HANDLER_COUNT, INSTRUCTION_WORDS,
+    };
     use fparkan_binary::{DecodeError, Limits};
 
     #[test]
@@ -203,6 +238,10 @@ mod tests {
             [1, 2, 3, 4, 5, 2, 6]
         );
         assert_eq!(package.events[0].instructions[0].references, [7, 8]);
+        assert_eq!(
+            package.events[0].instructions[0].dispatch_selector(),
+            ScriptDispatchSelector::Handler(1)
+        );
         assert_eq!(package.trailing_bytes, [0xaa, 0xbb]);
     }
 
@@ -250,5 +289,22 @@ mod tests {
             decode_with_limits(&bytes, limits),
             Err(DecodeError::LimitExceeded { .. })
         ));
+    }
+
+    #[test]
+    fn dispatch_selector_preserves_sentinel_and_unobserved_values() {
+        let mut instruction = super::ScriptInstruction {
+            header_words: [u32::MAX; INSTRUCTION_WORDS],
+            references: Vec::new(),
+        };
+        assert_eq!(
+            instruction.dispatch_selector(),
+            ScriptDispatchSelector::Sentinel
+        );
+        instruction.header_words[0] = GOG_HANDLER_COUNT;
+        assert_eq!(
+            instruction.dispatch_selector(),
+            ScriptDispatchSelector::Unknown(GOG_HANDLER_COUNT)
+        );
     }
 }
