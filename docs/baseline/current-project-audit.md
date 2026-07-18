@@ -53,13 +53,28 @@ system.
 
 ## Current stage model
 
-The active implementation plan has five dependency-ordered stages:
+The canonical Vulkan-revision plan has six dependency-ordered stages numbered
+0--5.  Keeping its original numbering matters: Stage 4 is an evidence-gated
+animation/FX runtime, while Stage 5 is the mission/world vertical slice that
+depends on it.  They must not be reported as one completed stage.
 
-1. reproducible Windows/Vulkan foundation;
-2. paths, VFS and lossless archives;
-3. prototype graph and prepared CPU assets;
-4. static Vulkan model/terrain viewer;
-5. animation/FX runtime and transactional map/mission/world vertical slice.
+0. reproducible Windows/Vulkan foundation;
+1. paths, VFS and lossless archives;
+2. prototype graph and prepared CPU assets;
+3. static Vulkan model/terrain viewer;
+4. animation and FX runtime, with reference-only semantics until runtime
+   captures close the x87 and effect-lifecycle evidence gaps;
+5. transactional map, mission and world vertical slice, rendered from the
+   same immutable snapshot through Vulkan.
+
+This is a local, Windows-only adoption of the Notion page "План реализации
+stage 0--5: Vulkan revision" (reviewed on 2026-07-18).  Its former
+Linux/macOS portability and hosted-CI goals are intentionally not imported:
+they conflict with the current supported-platform boundary above.  The
+portable architectural rules that do apply -- backend-neutral commands,
+runtime capability queries, narrow Vulkan/FFI `unsafe`, offline shader
+validation, and command capture before pixel comparison -- are retained in
+this audit and the rendering tome.
 
 Contract tests and failure tests precede implementation. Synthetic checks never
 read licensed roots; licensed corpus checks use absolute paths from the local
