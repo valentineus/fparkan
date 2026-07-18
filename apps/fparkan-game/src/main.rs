@@ -25,8 +25,9 @@ use fparkan_assets::PreparedVisual;
 use fparkan_platform::WindowPort;
 use fparkan_platform_winit::WinitWindow;
 use fparkan_render::{
-    DrawCommand, DrawId, GpuMaterialId, GpuMeshId, IndexRange, RenderBackend, RenderCommand,
-    RenderCommandList, RenderPhase,
+    build_commands, CameraSnapshot, DrawId, GpuMaterialId, GpuMeshId, IndexRange, RenderBackend,
+    RenderCommand, RenderCommandList, RenderPhase, RenderProfile, RenderSnapshot,
+    RenderSnapshotDraw,
 };
 use fparkan_render_vulkan::VulkanPlanningBackend;
 use fparkan_runtime::{
@@ -84,7 +85,8 @@ fn run(args: &[String]) -> Result<String, String> {
         last_tick = result.snapshot.tick.0;
         last_hash = result.snapshot.hash.0;
         let mission_assets = loaded_mission_assets(&engine);
-        let commands = render_snapshot_commands_with_assets(&result.snapshot, mission_assets);
+        let commands = render_snapshot_commands_with_assets(&result.snapshot, mission_assets)
+            .map_err(|err| format!("render snapshot: {err}"))?;
         last_draw_count = commands
             .commands
             .iter()
@@ -111,16 +113,23 @@ fn run(args: &[String]) -> Result<String, String> {
 }
 
 #[cfg(test)]
-fn render_snapshot_commands(snapshot: &WorldSnapshot) -> RenderCommandList {
+fn render_snapshot_commands(snapshot: &WorldSnapshot) -> Result<RenderCommandList, String> {
     render_snapshot_commands_with_assets(snapshot, None)
 }
 
 fn render_snapshot_commands_with_assets(
     snapshot: &WorldSnapshot,
     mission_assets: Option<&MissionAssets>,
-) -> RenderCommandList {
-    let mut commands = Vec::with_capacity(snapshot.objects.len() + 2);
-    commands.push(RenderCommand::BeginFrame);
+) -> Result<RenderCommandList, String> {
+    let render_snapshot = render_snapshot_with_assets(snapshot, mission_assets);
+    build_commands(&render_snapshot, RenderProfile::default()).map_err(|err| err.to_string())
+}
+
+fn render_snapshot_with_assets(
+    snapshot: &WorldSnapshot,
+    mission_assets: Option<&MissionAssets>,
+) -> RenderSnapshot {
+    let mut draws = Vec::with_capacity(snapshot.objects.len());
     for (index, handle) in snapshot.objects.iter().enumerate() {
         let stable_order = u64::from(handle.slot);
         let prepared = mission_assets.and_then(|assets| {
@@ -146,19 +155,22 @@ fn render_snapshot_commands_with_assets(
             .0
             .wrapping_mul(1_000_003)
             .wrapping_add(stable_order);
-        commands.push(RenderCommand::Draw(DrawCommand {
+        draws.push(RenderSnapshotDraw {
             id: DrawId(draw_id),
             phase: RenderPhase::Opaque,
             object_id: None,
             mesh,
-            material,
+            material_slots: vec![material],
+            material_index: 0,
             transform: identity_transform(index_to_f32(index)),
             range: IndexRange { start: 0, count: 3 },
             stable_order,
-        }));
+        });
     }
-    commands.push(RenderCommand::EndFrame);
-    RenderCommandList { commands }
+    RenderSnapshot {
+        camera: CameraSnapshot::default(),
+        draws,
+    }
 }
 
 fn identity_transform(x: f32) -> [f32; 16] {
@@ -305,12 +317,18 @@ mod tests {
             hash: StateHash([0; 32]),
         };
 
-        let commands = render_snapshot_commands(&snapshot);
+        let commands = render_snapshot_commands(&snapshot)?;
 
         assert_eq!(commands.commands.len(), 4);
-        assert!(matches!(commands.commands[0], RenderCommand::BeginFrame));
-        assert!(matches!(commands.commands[3], RenderCommand::EndFrame));
-        let RenderCommand::Draw(first) = &commands.commands[1] else {
+        assert!(matches!(
+            commands.commands[0],
+            fparkan_render::RenderCommand::BeginFrame
+        ));
+        assert!(matches!(
+            commands.commands[3],
+            fparkan_render::RenderCommand::EndFrame
+        ));
+        let fparkan_render::RenderCommand::Draw(first) = &commands.commands[1] else {
             return Err("expected draw".to_string());
         };
         assert_eq!(first.mesh, GpuMeshId(3));
