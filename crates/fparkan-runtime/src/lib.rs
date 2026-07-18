@@ -298,6 +298,31 @@ pub struct MissionScriptVarSetState {
     pub values: Vec<VarSetDefault>,
 }
 
+/// Recovered mission outcome controlled by the `Iron3D` script host callback.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MissionScriptOutcome {
+    /// No recovered callback has ended the mission.
+    #[default]
+    Active,
+    /// `Handler(30)` reached the proven mission-complete callback branch.
+    Completed,
+    /// `Handler(30)` reached the proven mission-fail callback branch.
+    Failed,
+}
+
+/// Result of applying one recovered script host callback command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MissionScriptHostEffect {
+    /// The callback did not match a currently recovered host branch.
+    Unhandled,
+    /// A previously active or failed mission became completed.
+    MissionCompleted,
+    /// A previously active or completed mission became failed.
+    MissionFailed,
+    /// The recovered target state was already current, so `Iron3D` has no state transition.
+    NoChange,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct MissionLoadOptions {
     fail_after_registered_objects: Option<usize>,
@@ -443,6 +468,7 @@ struct LoadedMissionState {
     script_varset: Option<MissionScriptVarSet>,
     script_init_states: Vec<MissionScriptInitState>,
     script_varset_states: Vec<MissionScriptVarSetState>,
+    script_outcome: MissionScriptOutcome,
 }
 
 /// Engine error.
@@ -1146,6 +1172,7 @@ fn load_mission_with_options_and_progress(
         script_varset: loaded_scripts.varset,
         script_init_states: loaded_scripts.init_states,
         script_varset_states: loaded_scripts.varset_states,
+        script_outcome: MissionScriptOutcome::Active,
     });
     Ok((summary, trace))
 }
@@ -1304,6 +1331,62 @@ pub fn resolve_loaded_handler30(
             message: "instantiated mission varset is unavailable".to_string(),
         })?;
     resolve_handler30_from_varset_state(declarations, values, instruction)
+}
+
+/// Returns the currently recovered mission outcome, if a mission is loaded.
+#[must_use]
+pub fn loaded_mission_script_outcome(engine: &Engine) -> Option<MissionScriptOutcome> {
+    engine.loaded.as_ref().map(|state| state.script_outcome)
+}
+
+/// Applies the recovered `Iron3D` host-callback mission branch.
+///
+/// Only `(mode=0, command=0, payload=0|1)` has a proven independent meaning:
+/// payload zero marks failure and payload one marks completion. Other callback
+/// commands are retained as [`MissionScriptHostEffect::Unhandled`] until their
+/// `Iron3D` consumer branches are recovered.
+///
+/// # Errors
+///
+/// Returns an error if no mission is loaded.
+pub fn apply_loaded_script_host_callback(
+    engine: &mut Engine,
+    command: VmHostCallbackCommand,
+) -> Result<MissionScriptHostEffect, EngineError> {
+    let state = engine
+        .loaded
+        .as_mut()
+        .ok_or_else(|| EngineError::ScriptRuntime {
+            clan_index: 0,
+            message: "mission script host state is unavailable".to_string(),
+        })?;
+    Ok(apply_recovered_script_host_callback(
+        &mut state.script_outcome,
+        command,
+    ))
+}
+
+fn apply_recovered_script_host_callback(
+    outcome: &mut MissionScriptOutcome,
+    command: VmHostCallbackCommand,
+) -> MissionScriptHostEffect {
+    if command.mode != 0 || command.first != 0 {
+        return MissionScriptHostEffect::Unhandled;
+    }
+    let next = match command.second {
+        0 => MissionScriptOutcome::Failed,
+        1 => MissionScriptOutcome::Completed,
+        _ => return MissionScriptHostEffect::Unhandled,
+    };
+    if *outcome == next {
+        return MissionScriptHostEffect::NoChange;
+    }
+    *outcome = next;
+    match next {
+        MissionScriptOutcome::Completed => MissionScriptHostEffect::MissionCompleted,
+        MissionScriptOutcome::Failed => MissionScriptHostEffect::MissionFailed,
+        MissionScriptOutcome::Active => MissionScriptHostEffect::Unhandled,
+    }
 }
 
 fn resolve_handler30_from_varset_state(
@@ -1860,6 +1943,57 @@ mod tests {
             EngineError::ScriptInit { clan_index: 0, message }
                 if message.contains("outside the recovered CreateSuperAI base range")
         ));
+    }
+
+    #[test]
+    fn recovered_handler_thirty_host_callback_transitions_mission_outcome() {
+        let mut outcome = MissionScriptOutcome::Active;
+        assert_eq!(
+            apply_recovered_script_host_callback(
+                &mut outcome,
+                VmHostCallbackCommand {
+                    mode: 0,
+                    first: 0,
+                    second: 0,
+                },
+            ),
+            MissionScriptHostEffect::MissionFailed
+        );
+        assert_eq!(outcome, MissionScriptOutcome::Failed);
+        assert_eq!(
+            apply_recovered_script_host_callback(
+                &mut outcome,
+                VmHostCallbackCommand {
+                    mode: 0,
+                    first: 0,
+                    second: 1,
+                },
+            ),
+            MissionScriptHostEffect::MissionCompleted
+        );
+        assert_eq!(outcome, MissionScriptOutcome::Completed);
+        assert_eq!(
+            apply_recovered_script_host_callback(
+                &mut outcome,
+                VmHostCallbackCommand {
+                    mode: 0,
+                    first: 0,
+                    second: 1,
+                },
+            ),
+            MissionScriptHostEffect::NoChange
+        );
+        assert_eq!(
+            apply_recovered_script_host_callback(
+                &mut outcome,
+                VmHostCallbackCommand {
+                    mode: 0,
+                    first: 3,
+                    second: 42,
+                },
+            ),
+            MissionScriptHostEffect::Unhandled
+        );
     }
 
     #[test]

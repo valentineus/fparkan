@@ -252,6 +252,13 @@ call. Those branches are not yet assigned Rust gameplay meanings. Reproduce
 the current evidence with `capture-ai-init.ps1` and
 `ExportIron3dAiCallback.java`.
 
+Runtime now applies only this recovered branch as
+`apply_loaded_script_host_callback`: `(0, 0, 0)` transitions a loaded mission
+to `Failed`, `(0, 0, 1)` transitions it to `Completed`, and a repeated target
+state is a no-op just as the Iron3D guards require. The effect is deliberately
+separate from audio/UI playback; commands 1, 3, 4, 5 and mode 2 return
+`Unhandled` until their consumers are recovered.
+
 ### Handler(8): problem-record state write
 
 `Handler(8)` is the ninth VM-table entry at GOG `ai.dll` VA `0x10009b0d`.
