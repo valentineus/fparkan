@@ -1559,7 +1559,11 @@ two WEAR selectors must not be collapsed into an invented one-layer material,
 and the type-18 `aux18` stream is now documented as microtexture mapping data.
 `TerrainFace28::material_layers` exposes the evidenced high-byte `Land1`
 selector (with `0xff` absent sentinel) and low-byte `Land2` selector. The
-manager's actual blend/pass operation remains unrecovered.
+manager's actual blend/pass operation remains unrecovered. `World3D.dll`
+supplies the manager ABI: its load slot appends `Land1` as table 0 and `Land2`
+as table 1, while its material-phase lookup receives the exact 32-bit selector
+`(table_index << 16) | material_index`. `TerrainMaterialSelection` preserves
+that key for the renderer without assuming how the two phases are blended.
 
 The static Vulkan bridge now carries each contiguous face run as a separate
 draw range keyed by the original packed `material_tag`; it neither reorders

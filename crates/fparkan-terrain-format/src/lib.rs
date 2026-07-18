@@ -74,6 +74,57 @@ pub struct TerrainMaterialLayers {
     pub land2_selector: u8,
 }
 
+/// One `World3D` material-manager lookup key.
+///
+/// The original manager selects a WEAR table in the upper 16 bits and its
+/// positional material row in the lower 16 bits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerrainMaterialSelection {
+    /// Zero-based material-manager table index.
+    pub table_index: u16,
+    /// Positional material row in that WEAR table.
+    pub material_index: u16,
+}
+
+impl TerrainMaterialSelection {
+    /// Encodes the original material-manager phase lookup key.
+    #[must_use]
+    pub fn phase_key(self) -> u32 {
+        (u32::from(self.table_index) << 16) | u32::from(self.material_index)
+    }
+}
+
+impl TerrainMaterialLayers {
+    /// Constructs the decoded pair from its on-disk packed tag.
+    #[must_use]
+    pub const fn from_packed_tag(material_tag: u16) -> Self {
+        let [land2_selector, land1] = material_tag.to_le_bytes();
+        Self {
+            land1_selector: if land1 == u8::MAX { None } else { Some(land1) },
+            land2_selector,
+        }
+    }
+
+    /// Returns the table-zero `Land1.wea` selection when it exists.
+    #[must_use]
+    pub fn land1_selection(self) -> Option<TerrainMaterialSelection> {
+        self.land1_selector
+            .map(|material_index| TerrainMaterialSelection {
+                table_index: 0,
+                material_index: u16::from(material_index),
+            })
+    }
+
+    /// Returns the table-one `Land2.wea` selection.
+    #[must_use]
+    pub fn land2_selection(self) -> TerrainMaterialSelection {
+        TerrainMaterialSelection {
+            table_index: 1,
+            material_index: u16::from(self.land2_selector),
+        }
+    }
+}
+
 /// Terrain face with 28-byte source layout.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TerrainFace28 {
@@ -97,11 +148,7 @@ impl TerrainFace28 {
     /// Decodes the proven two-table selector layout of [`Self::material_tag`].
     #[must_use]
     pub const fn material_layers(&self) -> TerrainMaterialLayers {
-        let [land2_selector, land1] = self.material_tag.to_le_bytes();
-        TerrainMaterialLayers {
-            land1_selector: if land1 == u8::MAX { None } else { Some(land1) },
-            land2_selector,
-        }
+        TerrainMaterialLayers::from_packed_tag(self.material_tag)
     }
 }
 
@@ -1427,6 +1474,20 @@ mod tests {
                 land2_selector: 2,
             }
         );
+        assert_eq!(
+            document.faces[0].material_layers().land1_selection(),
+            Some(TerrainMaterialSelection {
+                table_index: 0,
+                material_index: 1,
+            })
+        );
+        assert_eq!(
+            document.faces[0]
+                .material_layers()
+                .land2_selection()
+                .phase_key(),
+            0x0001_0002
+        );
 
         raw_face[4..6].copy_from_slice(&0xff03_u16.to_le_bytes());
         let nres = decode_nres(&minimal_land_msh(&raw_face)).expect("nres");
@@ -1436,6 +1497,14 @@ mod tests {
             TerrainMaterialLayers {
                 land1_selector: None,
                 land2_selector: 3,
+            }
+        );
+        assert_eq!(document.faces[0].material_layers().land1_selection(), None);
+        assert_eq!(
+            document.faces[0].material_layers().land2_selection(),
+            TerrainMaterialSelection {
+                table_index: 1,
+                material_index: 3,
             }
         );
     }

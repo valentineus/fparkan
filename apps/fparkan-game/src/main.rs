@@ -45,6 +45,7 @@ use fparkan_runtime::{
     loaded_mission_assets, loaded_mission_object_drafts, loaded_terrain, EngineConfig, EngineMode,
     EngineServices, MissionAssets, MissionLoadPhase, MissionObjectDraft, MissionRequest,
 };
+use fparkan_terrain::TerrainMaterialLayers;
 use fparkan_terrain::TerrainWorld;
 use fparkan_vfs::DirectoryVfs;
 #[cfg(test)]
@@ -477,9 +478,11 @@ fn static_preview_terrain_base_materials(
     packed_tags
         .into_iter()
         .map(|packed_tag| {
-            let selector = packed_tag & 0x00ff;
+            let selection = TerrainMaterialLayers::from_packed_tag(packed_tag).land2_selection();
             let selected = load_standalone_wear_material_texture_mip0_rgba8_from_root(
-                root, &wear_path, selector,
+                root,
+                &wear_path,
+                selection.material_index,
             )
             .map_err(|err| {
                 format!(

@@ -23,6 +23,12 @@
 use fparkan_terrain_format::{FullSurfaceMask, LandMapDocument, LandMeshDocument};
 use std::collections::VecDeque;
 
+/// Terrain material-selector contract preserved from the decoded map mesh.
+///
+/// Applications access this semantic terrain API through this terrain crate
+/// rather than taking a direct dependency on the binary-format parser.
+pub use fparkan_terrain_format::{TerrainMaterialLayers, TerrainMaterialSelection};
+
 /// Terrain world.
 #[derive(Clone, Debug, Default)]
 pub struct TerrainWorld {
