@@ -97,9 +97,19 @@ record fields `+0x0c` и `+0x14`, затем вызывает его refresh pat
 `<base>_Continue`, сохраняет их IDs в indexed state и materializes новый
 internal record. В этой ветке не видно прямого World3D/Behavior call, поэтому
 это доказанная scheduler/event-record boundary, а не команда движения, атаки
-или строительства. Semantic names семи slots, key equality и consumer нового
-record остаются открытыми; до dynamic capture Rust возвращает явный
+или строительства. Semantic names семи slots и consumer нового record остаются
+открытыми; до dynamic capture Rust возвращает явный
 unsupported result, а не «примерный» game command.
+
+Следующий static pass закрывает equality/update policy. Identity ровно равна
+`(slot0 word, slot4 IEEE-754 bits, slot5 IEEE-754 bits)`, поэтому `-0.0` и
+`+0.0` различаются. Новый 100-byte record получает slot1 в поле `+0x14`,
+slot2 одновременно в `+0x24/+0x28`, slot3 в `+0x2c` и slot6 в `+0x0c`. При
+совпавшем key refresh случается только когда slot1 сравнивается unequal
+(включая NaN); он заменяет `+0x14` и `+0x0c`, затем прибавляет сохранённый
+`+0x28` к `+0x24` с x86 wrapping arithmetic. `fparkan-script` отражает эту
+изолированную часть как `Handler2RecordScheduler`; он не выполняет bytecode,
+не назначает игровых имён и не делает event lookup за original VM.
 
 На границе mission runtime выбранный TMA clan `first_resource` теперь
 материализуется как отдельный `MissionScriptBundle`: loader нормализует

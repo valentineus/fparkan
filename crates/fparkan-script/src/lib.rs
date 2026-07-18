@@ -67,6 +67,151 @@ pub enum ScriptDispatchSelector {
     Unknown(u32),
 }
 
+/// Raw inputs resolved by the corpus-reachable `Handler(2)` before it reaches
+/// the original event-record scheduler.
+///
+/// The field names preserve handler slot order, not guessed gameplay meaning.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Handler2RecordInput {
+    /// Resolved slot 0 word.
+    pub word_0: u32,
+    /// Resolved slot 1 scalar.
+    pub scalar_1: f32,
+    /// Resolved slot 2 word.
+    pub word_2: u32,
+    /// Resolved slot 3 word.
+    pub word_3: u32,
+    /// Resolved slot 4 scalar.
+    pub scalar_4: f32,
+    /// Resolved slot 5 scalar.
+    pub scalar_5: f32,
+    /// Resolved slot 6 scalar.
+    pub scalar_6: f32,
+}
+
+/// The exact three-word identity used by the original `Handler(2)` scheduler.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Handler2RecordKey {
+    /// First identity word from resolved slot 0.
+    pub word_0: u32,
+    /// IEEE-754 bits of resolved slot 4.
+    pub scalar_4_bits: u32,
+    /// IEEE-754 bits of resolved slot 5.
+    pub scalar_5_bits: u32,
+}
+
+impl From<Handler2RecordInput> for Handler2RecordKey {
+    fn from(input: Handler2RecordInput) -> Self {
+        Self {
+            word_0: input.word_0,
+            scalar_4_bits: input.scalar_4.to_bits(),
+            scalar_5_bits: input.scalar_5.to_bits(),
+        }
+    }
+}
+
+/// A single backend-neutral event record created by `Handler(2)`.
+///
+/// This mirrors only the fields whose construction and update rules are
+/// statically recovered. Event-name lookup and the downstream consumer remain
+/// separate runtime work.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Handler2Record {
+    /// The three-word scheduler identity.
+    pub key: Handler2RecordKey,
+    /// Resolved slot 1 scalar.
+    pub scalar_1: f32,
+    /// Initial and per-refresh counter word from resolved slot 2.
+    pub counter: u32,
+    /// Resolved slot 3 word.
+    pub word_3: u32,
+    /// Resolved slot 6 scalar.
+    pub scalar_6: f32,
+}
+
+/// The result of submitting one resolved `Handler(2)` record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Handler2RecordUpdate {
+    /// Stable record position in insertion order.
+    pub index: usize,
+    /// Whether a new record was created.
+    pub created: bool,
+    /// Whether an existing record took the original refresh path.
+    pub refreshed: bool,
+}
+
+/// Deterministic model of the original `Handler(2)` event-record collection.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Handler2RecordScheduler {
+    records: Vec<Handler2Record>,
+}
+
+impl Handler2RecordScheduler {
+    /// Returns event records in original insertion order.
+    #[must_use]
+    pub fn records(&self) -> &[Handler2Record] {
+        &self.records
+    }
+
+    /// Inserts or refreshes one resolved handler input.
+    ///
+    /// The original compares the three identity words bit-for-bit. On an
+    /// existing key, it refreshes only when `scalar_1` compares unequal; that
+    /// update replaces `scalar_1` and `scalar_6`, then adds the record's own
+    /// slot-2 counter word with x86 wrapping arithmetic.
+    pub fn submit(&mut self, input: Handler2RecordInput) -> Handler2RecordUpdate {
+        let key = Handler2RecordKey::from(input);
+        if let Some((index, record)) = self
+            .records
+            .iter_mut()
+            .enumerate()
+            .find(|(_, record)| record.key == key)
+        {
+            if !handler_two_scalar_equal(record.scalar_1, input.scalar_1) {
+                record.scalar_1 = input.scalar_1;
+                record.scalar_6 = input.scalar_6;
+                record.counter = record.counter.wrapping_add(input.word_2);
+                return Handler2RecordUpdate {
+                    index,
+                    created: false,
+                    refreshed: true,
+                };
+            }
+            return Handler2RecordUpdate {
+                index,
+                created: false,
+                refreshed: false,
+            };
+        }
+        let index = self.records.len();
+        self.records.push(Handler2Record {
+            key,
+            scalar_1: input.scalar_1,
+            counter: input.word_2,
+            word_3: input.word_3,
+            scalar_6: input.scalar_6,
+        });
+        Handler2RecordUpdate {
+            index,
+            created: true,
+            refreshed: false,
+        }
+    }
+}
+
+fn handler_two_scalar_equal(left: f32, right: f32) -> bool {
+    if left.is_nan() || right.is_nan() {
+        return false;
+    }
+    let left_bits = left.to_bits();
+    let right_bits = right.to_bits();
+    left_bits == right_bits || (is_f32_zero_bits(left_bits) && is_f32_zero_bits(right_bits))
+}
+
+fn is_f32_zero_bits(bits: u32) -> bool {
+    matches!(bits, 0 | 0x8000_0000)
+}
+
 impl ScriptInstruction {
     /// Returns the recovered dispatch selector from the first disk word.
     #[must_use]
@@ -206,9 +351,97 @@ fn read_instruction(
 #[cfg(test)]
 mod tests {
     use super::{
-        decode, decode_with_limits, ScriptDispatchSelector, GOG_HANDLER_COUNT, INSTRUCTION_WORDS,
+        decode, decode_with_limits, Handler2RecordInput, Handler2RecordScheduler,
+        ScriptDispatchSelector, GOG_HANDLER_COUNT, INSTRUCTION_WORDS,
     };
     use fparkan_binary::{DecodeError, Limits};
+
+    fn handler_two_input(
+        scalar_1: f32,
+        scalar_4: f32,
+        scalar_5: f32,
+        scalar_6: f32,
+        word_2: u32,
+    ) -> Handler2RecordInput {
+        Handler2RecordInput {
+            word_0: 7,
+            scalar_1,
+            word_2,
+            word_3: 11,
+            scalar_4,
+            scalar_5,
+            scalar_6,
+        }
+    }
+
+    #[test]
+    fn handler_two_scheduler_uses_three_word_bit_identity_and_refresh_contract() {
+        let mut scheduler = Handler2RecordScheduler::default();
+        let first = handler_two_input(1.5, -0.0, 3.0, 9.0, 4);
+        assert_eq!(
+            scheduler.submit(first),
+            super::Handler2RecordUpdate {
+                index: 0,
+                created: true,
+                refreshed: false,
+            }
+        );
+        assert_eq!(scheduler.records().len(), 1);
+        assert_eq!(scheduler.records()[0].counter, 4);
+
+        let unchanged = handler_two_input(1.5, -0.0, 3.0, 12.0, 99);
+        assert_eq!(
+            scheduler.submit(unchanged),
+            super::Handler2RecordUpdate {
+                index: 0,
+                created: false,
+                refreshed: false,
+            }
+        );
+        assert_eq!(scheduler.records()[0].counter, 4);
+        assert_eq!(scheduler.records()[0].scalar_6.to_bits(), 9.0_f32.to_bits());
+
+        let refreshed = handler_two_input(2.5, -0.0, 3.0, 12.0, 99);
+        assert_eq!(
+            scheduler.submit(refreshed),
+            super::Handler2RecordUpdate {
+                index: 0,
+                created: false,
+                refreshed: true,
+            }
+        );
+        assert_eq!(scheduler.records()[0].counter, 103);
+        assert_eq!(
+            scheduler.records()[0].scalar_6.to_bits(),
+            12.0_f32.to_bits()
+        );
+
+        let positive_zero_key = handler_two_input(2.5, 0.0, 3.0, 12.0, 1);
+        assert_eq!(scheduler.submit(positive_zero_key).index, 1);
+        assert_eq!(scheduler.records().len(), 2);
+    }
+
+    #[test]
+    fn handler_two_scheduler_refreshes_nan_and_wraps_counter() {
+        let mut scheduler = Handler2RecordScheduler::default();
+        scheduler.submit(handler_two_input(f32::NAN, 1.0, 2.0, 3.0, u32::MAX));
+        let update = scheduler.submit(handler_two_input(f32::NAN, 1.0, 2.0, 4.0, 2));
+        assert_eq!(update.index, 0);
+        assert!(update.refreshed);
+        assert_eq!(scheduler.records()[0].counter, 1);
+        assert_eq!(scheduler.records()[0].scalar_6.to_bits(), 4.0_f32.to_bits());
+    }
+
+    #[test]
+    fn handler_two_scheduler_treats_signed_zero_value_as_unchanged() {
+        let mut scheduler = Handler2RecordScheduler::default();
+        scheduler.submit(handler_two_input(-0.0, 1.0, 2.0, 3.0, 5));
+        let update = scheduler.submit(handler_two_input(0.0, 1.0, 2.0, 4.0, 9));
+        assert!(!update.created);
+        assert!(!update.refreshed);
+        assert_eq!(scheduler.records()[0].counter, 5);
+        assert_eq!(scheduler.records()[0].scalar_6.to_bits(), 3.0_f32.to_bits());
+    }
 
     #[test]
     fn decodes_lossless_event_and_instruction_records() {
