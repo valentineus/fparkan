@@ -1,7 +1,7 @@
 //! Format-to-GPU geometry bridge for the initial static asset renderer.
 
 use crate::{VulkanStaticDrawRange, VulkanStaticMesh, VulkanStaticVertex};
-use fparkan_msh::ModelAsset;
+use fparkan_msh::{selected_slot, Group, Lod, ModelAsset, NodeId};
 use fparkan_render::{LegacyIron3dEulerTransform, LegacyPipelineState};
 use fparkan_terrain_format::LandMeshDocument;
 
@@ -447,8 +447,9 @@ fn static_model_indices_and_ranges(
     model: &ModelAsset,
 ) -> Result<(Vec<u32>, Vec<VulkanStaticDrawRange>), VulkanAssetMeshError> {
     let mut indices = Vec::new();
-    let mut draw_ranges = Vec::with_capacity(model.batches.len());
-    for batch in &model.batches {
+    let batches = static_model_preview_batches(model)?;
+    let mut draw_ranges = Vec::with_capacity(batches.len());
+    for batch in batches {
         let first_index =
             u32::try_from(indices.len()).map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?;
         let start = usize::try_from(batch.index_start)
@@ -481,6 +482,49 @@ fn static_model_indices_and_ranges(
     Ok((indices, draw_ranges))
 }
 
+/// Returns the source batches selected by the initial static model pose.
+///
+/// A `Node38` has a three-LOD by five-group slot map. The static bridge has no
+/// recovered animation or group-selection controller, so it uses the source's
+/// first LOD/group entry for every node instead of submitting every batch in the
+/// file (which also includes alternate LODs and groups). Models without the
+/// standard node layout retain the prior all-batches diagnostic fallback.
+fn static_model_preview_batches(
+    model: &ModelAsset,
+) -> Result<Vec<&fparkan_msh::Batch>, VulkanAssetMeshError> {
+    if model.node_stride != 38 || model.node_count == 0 {
+        return Ok(model.batches.iter().collect());
+    }
+
+    let mut selected = Vec::new();
+    for node_index in 0..model.node_count {
+        let node =
+            NodeId(u32::try_from(node_index).map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?);
+        let Some(slot) = selected_slot(model, node, Lod(0), Group(0)) else {
+            continue;
+        };
+        let slot = model
+            .slots
+            .get(usize::try_from(slot.0).map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?)
+            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?;
+        let start = usize::from(slot.batch_start);
+        let end = start
+            .checked_add(usize::from(slot.batch_count))
+            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?;
+        selected.extend(
+            model
+                .batches
+                .get(start..end)
+                .ok_or(VulkanAssetMeshError::IndexOutOfRange)?,
+        );
+    }
+
+    if selected.is_empty() {
+        return Ok(model.batches.iter().collect());
+    }
+    Ok(selected)
+}
+
 fn static_mesh_xy_bounds(
     positions: &[[f32; 3]],
     indices: &[u32],
@@ -507,7 +551,7 @@ fn static_mesh_xy_bounds(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fparkan_msh::{Batch, ModelAsset};
+    use fparkan_msh::{Batch, ModelAsset, Slot};
     use fparkan_terrain_format::{FullSurfaceMask, TerrainFace28, TerrainSlotTable};
 
     fn model(positions: Vec<[f32; 3]>, indices: Vec<u16>, batches: Vec<Batch>) -> ModelAsset {
@@ -536,6 +580,57 @@ mod tests {
             opaque14: 0,
             base_vertex,
         }
+    }
+
+    #[test]
+    fn static_preview_uses_first_lod_group_slot_for_standard_nodes() {
+        let mut node = vec![0_u8; 38];
+        node[8..10].copy_from_slice(&1_u16.to_le_bytes());
+        let model = ModelAsset {
+            node_stride: 38,
+            node_count: 1,
+            nodes_raw: node,
+            slots: vec![
+                Slot {
+                    tri_start: 0,
+                    tri_count: 0,
+                    batch_start: 0,
+                    batch_count: 1,
+                    aabb_min: [0.0; 3],
+                    aabb_max: [1.0; 3],
+                    sphere_center: [0.0; 3],
+                    sphere_radius: 1.0,
+                    opaque: [0; 5],
+                },
+                Slot {
+                    tri_start: 0,
+                    tri_count: 0,
+                    batch_start: 1,
+                    batch_count: 1,
+                    aabb_min: [0.0; 3],
+                    aabb_max: [1.0; 3],
+                    sphere_center: [0.0; 3],
+                    sphere_radius: 1.0,
+                    opaque: [0; 5],
+                },
+            ],
+            positions: Vec::new(),
+            normals: None,
+            uv0: None,
+            indices: Vec::new(),
+            batches: vec![
+                batch(0, 0, 0),
+                Batch {
+                    material_index: 1,
+                    ..batch(0, 0, 0)
+                },
+            ],
+            node_names: None,
+        };
+
+        let selected = static_model_preview_batches(&model).expect("valid selected slot");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].material_index, 1);
     }
 
     #[test]
