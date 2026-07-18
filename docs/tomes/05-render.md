@@ -1063,6 +1063,15 @@ provenance while avoiding repeat format work for repeated components. The same
 demonstrate an additional checkpoint advance from this cache; it must not be
 reported as a measured startup improvement.
 
+`Assets` now has three ordered diagnostic sub-checkpoints: `AssetModels`
+(MSH and WEAR), `AssetMaterials` (MAT0) and `AssetTextures` (diffuse TEXM and
+lightmaps). The callback is observational: it neither changes the preparation
+order nor deduplicates requests. A fresh controlled 60-second canonical GOG
+`Autodemo.00` first-root probe reached `AssetModels` and did not reach
+`AssetMaterials`; its created process was terminated and no native frame was
+reported. This narrows the next investigation to model/WEAR preparation, but
+does not by itself attribute the delay to either decoder or I/O.
+
 The same source-axis proof now applies to `TerrainWorld`: its `Land.msh` surface
 height query and `Land.map` areal/grid lookup use XY ground coordinates, return
 source Z height, and leave raycasts as full 3D intersections. The Part 1 and

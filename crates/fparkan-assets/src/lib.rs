@@ -455,6 +455,17 @@ pub struct AssetPreparationReport {
     pub texture_pixels: u64,
 }
 
+/// Asset preparation checkpoint emitted while resolving visual dependencies.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssetPreparationPhase {
+    /// Decode a model and its corresponding WEAR table.
+    ModelAndWear,
+    /// Resolve MAT0 material documents referenced by a WEAR table.
+    Materials,
+    /// Decode diffuse textures and baked lightmaps.
+    Textures,
+}
+
 /// Errors raised while preparing CPU-side assets.
 #[derive(Debug)]
 pub enum AssetError {
@@ -571,6 +582,25 @@ impl<R: ResourceRepository> AssetManager<R> {
         prepare_mission_assets_with_repository(&self.repository, root_prototype_spans, prototypes)
     }
 
+    /// Builds mission assets and reports the active dependency class.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssetError`] if any visual dependency is missing or malformed.
+    pub fn prepare_mission_assets_with_progress(
+        &self,
+        root_prototype_spans: &[std::ops::Range<usize>],
+        prototypes: &[EffectivePrototype],
+        on_phase: impl FnMut(AssetPreparationPhase),
+    ) -> Result<MissionAssets, AssetError> {
+        prepare_mission_assets_with_repository_with_progress(
+            &self.repository,
+            root_prototype_spans,
+            prototypes,
+            on_phase,
+        )
+    }
+
     /// Builds mission assets together with a bounded preparation report.
     ///
     /// # Errors
@@ -656,6 +686,28 @@ pub fn prepare_mission_assets_with_repository<R: ResourceRepository>(
     .0)
 }
 
+/// Builds mission assets and reports the active dependency class.
+///
+/// # Errors
+///
+/// Returns [`AssetError`] if any visual dependency is missing or malformed.
+pub fn prepare_mission_assets_with_repository_with_progress<R: ResourceRepository>(
+    repository: &R,
+    root_prototype_spans: &[std::ops::Range<usize>],
+    prototypes: &[EffectivePrototype],
+    mut on_phase: impl FnMut(AssetPreparationPhase),
+) -> Result<MissionAssets, AssetError> {
+    Ok(prepare_mission_assets_with_repository_internal(
+        repository,
+        root_prototype_spans,
+        prototypes,
+        AssetIdentityPolicy::default(),
+        AssetPreparationLimits::default(),
+        &mut on_phase,
+    )?
+    .0)
+}
+
 /// Builds mission assets while enforcing explicit preparation limits.
 ///
 /// # Errors
@@ -668,12 +720,14 @@ pub fn prepare_mission_assets_profiled_with_repository<R: ResourceRepository>(
     prototypes: &[EffectivePrototype],
     limits: AssetPreparationLimits,
 ) -> Result<(MissionAssets, AssetPreparationReport), AssetError> {
+    let mut ignore_phase = |_| {};
     prepare_mission_assets_with_repository_internal(
         repository,
         root_prototype_spans,
         prototypes,
         AssetIdentityPolicy::default(),
         limits,
+        &mut ignore_phase,
     )
 }
 
@@ -686,6 +740,7 @@ fn prepare_mission_assets_with_repository_internal<R: ResourceRepository>(
     prototypes: &[EffectivePrototype],
     identity_policy: AssetIdentityPolicy,
     limits: AssetPreparationLimits,
+    on_phase: &mut dyn FnMut(AssetPreparationPhase),
 ) -> Result<(MissionAssets, AssetPreparationReport), AssetError> {
     if prototypes.is_empty() {
         return Ok((MissionAssets::default(), AssetPreparationReport::default()));
@@ -725,6 +780,7 @@ fn prepare_mission_assets_with_repository_internal<R: ResourceRepository>(
                     proto,
                     identity_policy,
                     &mut preparation_cache,
+                    on_phase,
                 )?;
                 if bundle.visual.id != visual_id {
                     // Defensive check. stable IDs are deterministic for the same inputs.
@@ -1416,6 +1472,7 @@ pub fn prepare_visual_with_repository<R: ResourceRepository>(
         proto,
         AssetIdentityPolicy::default(),
         &mut preparation_cache,
+        &mut |_| {},
     )?
     .visual)
 }
@@ -1444,6 +1501,7 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
     proto: &EffectivePrototype,
     identity_policy: AssetIdentityPolicy,
     preparation_cache: &mut PreparationCache,
+    on_phase: &mut dyn FnMut(AssetPreparationPhase),
 ) -> Result<PreparedVisualBundle, AssetError> {
     let PrototypeGeometry::Mesh(mesh_key) = &proto.geometry else {
         return Ok(PreparedVisualBundle {
@@ -1455,6 +1513,7 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
         });
     };
 
+    on_phase(AssetPreparationPhase::ModelAndWear);
     let model = prepare_model_cached(repository, mesh_key, preparation_cache)?;
     let model_id = AssetId::new((identity_policy.model)(proto));
     let prepared_model = PreparedModel {
@@ -1491,6 +1550,7 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
         .iter()
         .map(|lightmap| lightmap.lightmap.clone())
         .collect();
+    on_phase(AssetPreparationPhase::Materials);
     for material_index in 0..wear.entries.len() {
         let material_index = u16::try_from(material_index).map_err(|_| {
             AssetError::InvalidPrototype("material index does not fit archive format".to_string())
@@ -1520,6 +1580,7 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
         });
 
         for texture in texture_requests {
+            on_phase(AssetPreparationPhase::Textures);
             let prepared_texture = prepare_texture_cached(
                 repository,
                 &texture,
@@ -1534,6 +1595,7 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
     }
 
     for lightmap in &wear.lightmaps {
+        on_phase(AssetPreparationPhase::Textures);
         let prepared_lightmap = prepare_texture_cached(
             repository,
             &lightmap.lightmap,
@@ -2830,6 +2892,7 @@ mod tests {
             &prototypes,
             policy,
             AssetPreparationLimits::default(),
+            &mut |_| {},
         )
         .expect_err("collision should fail");
 

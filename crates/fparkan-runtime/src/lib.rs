@@ -23,9 +23,9 @@
 use fparkan_assets::{
     decode_mission_land_path, decode_mission_payload, decode_nres_payload,
     derive_mission_land_paths, extend_graph_report_with_visual_dependencies, prepare_terrain_world,
-    AssetError as AssetPreparationError, AssetId, AssetManager, BuildCategory, MissionAssetPlan,
-    MissionDocument, MissionError, MissionTerrainPaths, NresError, PreparedVisual,
-    TerrainFormatError, TerrainPreparationError, TerrainWorld, TmaProfile,
+    AssetError as AssetPreparationError, AssetId, AssetManager, AssetPreparationPhase,
+    BuildCategory, MissionAssetPlan, MissionDocument, MissionError, MissionTerrainPaths, NresError,
+    PreparedVisual, TerrainFormatError, TerrainPreparationError, TerrainWorld, TmaProfile,
 };
 use fparkan_path::{normalize_relative, NormalizedPath, PathError, PathPolicy};
 use fparkan_prototype::{
@@ -120,6 +120,12 @@ pub enum MissionLoadPhase {
     GraphVisuals,
     /// Prepare all reachable visual/resource dependencies.
     Assets,
+    /// Decode model meshes and their WEAR tables.
+    AssetModels,
+    /// Resolve MAT0 material documents.
+    AssetMaterials,
+    /// Decode diffuse textures and baked lightmaps.
+    AssetTextures,
     /// Construct all object drafts before registration.
     Construct,
     /// Register constructed objects.
@@ -698,22 +704,38 @@ fn load_mission_with_options_and_progress(
     }
     record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::Assets);
     let asset_manager = AssetManager::new(repository);
+    let mut last_asset_phase = None;
+    let mut observe_asset_phase = |phase| {
+        let runtime_phase = match phase {
+            AssetPreparationPhase::ModelAndWear => MissionLoadPhase::AssetModels,
+            AssetPreparationPhase::Materials => MissionLoadPhase::AssetMaterials,
+            AssetPreparationPhase::Textures => MissionLoadPhase::AssetTextures,
+        };
+        if last_asset_phase != Some(runtime_phase) {
+            record_load_phase(&mut trace, &mut on_phase, runtime_phase);
+            last_asset_phase = Some(runtime_phase);
+        }
+    };
     let mission_assets = match options.asset_scope {
-        MissionAssetScope::Full => asset_manager.prepare_mission_assets(
+        MissionAssetScope::Full => asset_manager.prepare_mission_assets_with_progress(
             &prototype_graph.root_prototype_request_spans,
             &resolved_prototypes,
+            &mut observe_asset_phase,
         ),
         MissionAssetScope::FirstMeshPreview => prepare_first_preview_assets(
             &asset_manager,
             &prototype_graph.root_prototype_request_spans,
             &resolved_prototypes,
+            &mut observe_asset_phase,
         ),
-        MissionAssetScope::PreviewRoots(root_count) => asset_manager.prepare_mission_assets(
-            &prototype_graph.root_prototype_request_spans[..root_count
-                .get()
-                .min(prototype_graph.root_prototype_request_spans.len())],
-            &resolved_prototypes,
-        ),
+        MissionAssetScope::PreviewRoots(root_count) => asset_manager
+            .prepare_mission_assets_with_progress(
+                &prototype_graph.root_prototype_request_spans[..root_count
+                    .get()
+                    .min(prototype_graph.root_prototype_request_spans.len())],
+                &resolved_prototypes,
+                &mut observe_asset_phase,
+            ),
     }
     .map_err(|source| EngineError::AssetPreparation {
         mission: request.key.clone(),
@@ -831,10 +853,14 @@ fn prepare_first_preview_assets<R: ResourceRepository>(
     asset_manager: &AssetManager<R>,
     root_spans: &[std::ops::Range<usize>],
     prototypes: &[fparkan_prototype::EffectivePrototype],
+    on_phase: &mut dyn FnMut(AssetPreparationPhase),
 ) -> Result<MissionAssets, AssetPreparationError> {
     for span in root_spans {
-        let assets =
-            asset_manager.prepare_mission_assets(std::slice::from_ref(span), prototypes)?;
+        let assets = asset_manager.prepare_mission_assets_with_progress(
+            std::slice::from_ref(span),
+            prototypes,
+            &mut *on_phase,
+        )?;
         if !assets.models.is_empty() {
             return Ok(assets);
         }
