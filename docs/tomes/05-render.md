@@ -1094,6 +1094,13 @@ process was terminated. This gives no Part 2 GPU acceptance or pixel result and
 does not attribute the delay to Vulkan; its visual-dependency corpus remains a
 separate profiling and compatibility target.
 
+`GraphVisuals` is now split observationally into `GraphVisualWears`,
+`GraphVisualMaterials` and `GraphVisualTextures`; it preserves the existing
+graph traversal, edge order and validation semantics. Repeating the controlled
+180-second Part 2 probe ended at `GraphVisualTextures`. Thus Part 2 had passed
+WEAR and MAT0 expansion before timeout; its remaining bottleneck is TEXM
+validation/archive work, not Vulkan submission or the base prototype graph.
+
 `Assets` now has four ordered diagnostic sub-checkpoints: `AssetModelMeshes`
 (MSH), `AssetWearTables` (WEAR), `AssetMaterials` (MAT0) and `AssetTextures`
 (diffuse TEXM and lightmaps). The callback is observational: it neither changes

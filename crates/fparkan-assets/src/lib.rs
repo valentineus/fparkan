@@ -468,6 +468,17 @@ pub enum AssetPreparationPhase {
     Textures,
 }
 
+/// Visual dependency class currently being expanded into a prototype graph.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VisualDependencyPhase {
+    /// Resolve a mesh's WEAR table.
+    Wear,
+    /// Resolve MAT0 material documents selected by WEAR.
+    Material,
+    /// Validate diffuse TEXM textures and lightmaps.
+    Texture,
+}
+
 /// Errors raised while preparing CPU-side assets.
 #[derive(Debug)]
 pub enum AssetError {
@@ -1104,6 +1115,29 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
     graph: &mut PrototypeGraph,
     prototypes: &[EffectivePrototype],
 ) {
+    extend_graph_report_with_visual_dependencies_and_progress(
+        repository,
+        report,
+        graph,
+        prototypes,
+        |_| {},
+    );
+}
+
+/// Extends a prototype dependency report while reporting each visual dependency class.
+///
+/// # Panics
+///
+/// Panics only if the hard-coded, host-compatible `material.lib` path stops
+/// satisfying the path policy, which indicates a programming error in this module.
+#[allow(clippy::too_many_lines)]
+pub fn extend_graph_report_with_visual_dependencies_and_progress<R: ResourceRepository>(
+    repository: &R,
+    report: &mut PrototypeGraphReport,
+    graph: &mut PrototypeGraph,
+    prototypes: &[EffectivePrototype],
+    mut on_phase: impl FnMut(VisualDependencyPhase),
+) {
     if graph.visual_dependencies_expanded {
         return;
     }
@@ -1140,6 +1174,7 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
         let mesh_parent_edge = mesh_edge_id(graph, prototype_node_id);
         let root_index = root_index_for_prototype(graph, prototype_index);
 
+        on_phase(VisualDependencyPhase::Wear);
         match resolve_wear_table(repository, mesh) {
             Ok(table) => {
                 report.wear_resolved_count += 1;
@@ -1178,6 +1213,7 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
                     &mut next_edge,
                 );
                 report.material_slot_count += table.entries.len();
+                on_phase(VisualDependencyPhase::Material);
                 for (material_index, _entry) in table.entries.iter().enumerate() {
                     let Ok(material_index) = u16::try_from(material_index) else {
                         push_visual_failure(
@@ -1224,6 +1260,7 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
                                 &mut next_edge,
                             );
                             for texture in material.document.texture_requests() {
+                                on_phase(VisualDependencyPhase::Texture);
                                 report.texture_request_count += 1;
                                 match resolve_texm_validation_cached(
                                     repository,
@@ -1284,6 +1321,7 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
                     }
                 }
                 for lightmap in &table.lightmaps {
+                    on_phase(VisualDependencyPhase::Texture);
                     report.lightmap_request_count += 1;
                     match resolve_texm_validation_cached(
                         repository,

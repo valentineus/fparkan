@@ -22,10 +22,11 @@
 
 use fparkan_assets::{
     decode_mission_land_path, decode_mission_payload, decode_nres_payload,
-    derive_mission_land_paths, extend_graph_report_with_visual_dependencies, prepare_terrain_world,
-    AssetError as AssetPreparationError, AssetId, AssetManager, AssetPreparationPhase,
-    BuildCategory, MissionAssetPlan, MissionDocument, MissionError, MissionTerrainPaths, NresError,
-    PreparedVisual, TerrainFormatError, TerrainPreparationError, TerrainWorld, TmaProfile,
+    derive_mission_land_paths, extend_graph_report_with_visual_dependencies_and_progress,
+    prepare_terrain_world, AssetError as AssetPreparationError, AssetId, AssetManager,
+    AssetPreparationPhase, BuildCategory, MissionAssetPlan, MissionDocument, MissionError,
+    MissionTerrainPaths, NresError, PreparedVisual, TerrainFormatError, TerrainPreparationError,
+    TerrainWorld, TmaProfile, VisualDependencyPhase,
 };
 use fparkan_path::{normalize_relative, NormalizedPath, PathError, PathPolicy};
 use fparkan_prototype::{
@@ -118,6 +119,12 @@ pub enum MissionLoadPhase {
     Graph,
     /// Expand model-backed visual dependencies of the prototype graph.
     GraphVisuals,
+    /// Resolve WEAR tables while expanding visual dependencies.
+    GraphVisualWears,
+    /// Resolve MAT0 documents while expanding visual dependencies.
+    GraphVisualMaterials,
+    /// Validate TEXM documents while expanding visual dependencies.
+    GraphVisualTextures,
     /// Prepare all reachable visual/resource dependencies.
     Assets,
     /// Decode and validate MSH model meshes.
@@ -693,11 +700,23 @@ fn load_mission_with_options_and_progress(
     let (mut prototype_graph, resolved_prototypes, mut prototype_report) =
         build_prototype_graph_report(&repository, vfs.as_ref(), scoped_graph_roots);
     record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::GraphVisuals);
-    extend_graph_report_with_visual_dependencies(
+    let mut last_graph_visual_phase = None;
+    extend_graph_report_with_visual_dependencies_and_progress(
         &repository,
         &mut prototype_report,
         &mut prototype_graph,
         &resolved_prototypes,
+        |phase| {
+            let runtime_phase = match phase {
+                VisualDependencyPhase::Wear => MissionLoadPhase::GraphVisualWears,
+                VisualDependencyPhase::Material => MissionLoadPhase::GraphVisualMaterials,
+                VisualDependencyPhase::Texture => MissionLoadPhase::GraphVisualTextures,
+            };
+            if last_graph_visual_phase != Some(runtime_phase) {
+                record_load_phase(&mut trace, &mut on_phase, runtime_phase);
+                last_graph_visual_phase = Some(runtime_phase);
+            }
+        },
     );
     if !prototype_report.is_success() {
         return Err(EngineError::PrototypeGraph {
