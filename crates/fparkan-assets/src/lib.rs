@@ -1251,6 +1251,8 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
             continue;
         };
         let root_index = root_index_for_prototype(graph, prototype_index);
+        let unit_component_index =
+            mesh_parent_edge.and_then(|edge| unit_component_index_for_edge(graph, edge));
 
         wear_requests = wear_requests.saturating_add(1);
         report_visual_dependency_progress(
@@ -1301,6 +1303,7 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
                     Some(provenance_for_resource(
                         root_index,
                         mesh_parent_edge,
+                        unit_component_index,
                         &wear_key,
                     )),
                     &mut next_edge,
@@ -1375,6 +1378,7 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
                                 Some(provenance_for_resource(
                                     root_index,
                                     Some(wear_edge_id),
+                                    unit_component_index,
                                     &material_key,
                                 )),
                                 &mut next_edge,
@@ -1424,6 +1428,7 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
                                                 Some(provenance_for_resource(
                                                     root_index,
                                                     Some(material_edge_id),
+                                                    unit_component_index,
                                                     &texture_key,
                                                 )),
                                                 &mut next_edge,
@@ -1500,6 +1505,7 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
                                     Some(provenance_for_resource(
                                         root_index,
                                         Some(wear_edge_id),
+                                        unit_component_index,
                                         &lightmap_key,
                                     )),
                                     &mut next_edge,
@@ -1622,12 +1628,13 @@ fn prototype_mesh_node_id(
 fn provenance_for_resource(
     root_index: usize,
     parent_edge: Option<fparkan_prototype::PrototypeGraphEdgeId>,
+    unit_component_index: Option<usize>,
     resource: &ResourceKey,
 ) -> PrototypeGraphProvenance {
     PrototypeGraphProvenance {
         root_index,
         parent_edge,
-        unit_component_index: None,
+        unit_component_index,
         archive: Some(resource.archive.display_lossy().to_string()),
         resource: Some(resource.name.0.clone()),
         span: None,
@@ -2011,6 +2018,8 @@ fn push_visual_failure(
 ) {
     let root_index = root_index_for_prototype(graph, prototype_index);
     let parent_edge = parent_edge_for_failure(graph, prototype_index, edge);
+    let unit_component_index =
+        parent_edge.and_then(|value| unit_component_index_for_edge(graph, value));
     let dependency = mesh_dependency_resource(graph, prototype_index);
     report.failures.push(PrototypeGraphFailure {
         root_index,
@@ -2021,7 +2030,7 @@ fn push_visual_failure(
         provenance: Some(PrototypeGraphProvenance {
             root_index,
             parent_edge,
-            unit_component_index: None,
+            unit_component_index,
             archive: dependency.map(|resource| resource.archive.as_str().to_string()),
             resource: Some(resource_raw),
             span: None,
@@ -2036,6 +2045,18 @@ fn root_index_for_prototype(graph: &PrototypeGraph, prototype_index: usize) -> u
         }
     }
     0
+}
+
+fn unit_component_index_for_edge(
+    graph: &PrototypeGraph,
+    edge_id: fparkan_prototype::PrototypeGraphEdgeId,
+) -> Option<usize> {
+    graph
+        .edges
+        .iter()
+        .find(|edge| edge.id == edge_id)
+        .and_then(|edge| edge.provenance.as_ref())
+        .and_then(|provenance| provenance.unit_component_index)
 }
 
 fn parent_edge_for_failure(
@@ -2726,6 +2747,19 @@ mod tests {
             dependencies: Vec::new(),
         };
         let mut graph = prototype_graph_for_mesh(&prototype);
+        graph
+            .edges
+            .iter_mut()
+            .find(|edge| edge.kind == fparkan_prototype::PrototypeGraphEdgeKind::PrototypeToMesh)
+            .expect("mesh edge")
+            .provenance = Some(PrototypeGraphProvenance {
+            root_index: 0,
+            parent_edge: Some(fparkan_prototype::PrototypeGraphEdgeId(0)),
+            unit_component_index: Some(3),
+            archive: Some("static.rlb".to_string()),
+            resource: Some(b"tree.msh".to_vec()),
+            span: None,
+        });
         let mut report = PrototypeGraphReport {
             root_count: 1,
             direct_reference_count: 1,
@@ -2799,6 +2833,14 @@ mod tests {
             .iter()
             .filter_map(|edge| edge.provenance.as_ref())
             .all(|provenance| provenance.root_index == 0));
+        for edge in [wear_edge, material_edge, texture_edge, lightmap_edge] {
+            assert_eq!(
+                edge.provenance
+                    .as_ref()
+                    .and_then(|provenance| provenance.unit_component_index),
+                Some(3)
+            );
+        }
     }
 
     #[test]
