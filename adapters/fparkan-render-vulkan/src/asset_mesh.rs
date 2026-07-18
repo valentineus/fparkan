@@ -174,6 +174,38 @@ pub fn project_msh_to_static_mesh_in_xy_frame(
     })
 }
 
+/// Projects a static MSH preview through the recovered placement transform and
+/// then into a shared diagnostic XY frame.
+///
+/// This is the diagnostic-camera counterpart of
+/// [`project_msh_to_static_mesh_in_world_space_with_node_fallback_poses`]. It
+/// deliberately keeps the diagnostic camera itself separate from the original
+/// D3D7 camera, while ensuring that mission placement uses the same proven
+/// `Rz(z) * Ry(y) * Rx(x)` convention in both preview paths.
+///
+/// # Errors
+///
+/// Returns [`VulkanAssetMeshError`] when the model cannot be represented by
+/// the static bridge or a transformed coordinate is non-finite.
+pub fn project_msh_to_static_mesh_in_xy_frame_with_node_fallback_poses(
+    model: &ModelAsset,
+    frame: VulkanStaticXyFrame,
+    transform: LegacyIron3dEulerTransform,
+    scale: [f32; 3],
+) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
+    let mut mesh = project_msh_to_static_mesh_in_world_space_with_node_fallback_poses(
+        model, transform, scale,
+    )?;
+    for vertex in &mut mesh.vertices {
+        if !vertex.position.iter().all(|value| value.is_finite()) {
+            return Err(VulkanAssetMeshError::NonFinitePosition);
+        }
+        let projected = frame.project(vertex.position);
+        vertex.position = [projected[0], projected[1], 0.0];
+    }
+    Ok(mesh)
+}
+
 /// Projects MSH geometry into source world coordinates with known translation and scale.
 ///
 /// Unlike [`project_msh_to_static_mesh_in_xy_frame`], this does not normalize
@@ -904,6 +936,32 @@ mod tests {
         assert_eq!(mesh.vertices[0].position, [7.0, 24.0, 32.0]);
         assert_eq!(mesh.vertices[1].position, [10.0, 20.0, 30.0]);
         assert_eq!(mesh.vertices[2].position, [10.0, 22.0, 30.0]);
+    }
+
+    #[test]
+    fn xy_preview_applies_recovered_iron3d_orientation_before_framing() {
+        let source = model(
+            vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]],
+            vec![0, 1, 2],
+            vec![batch(0, 3, 0)],
+        );
+        let frame =
+            VulkanStaticXyFrame::from_bounds(0.0, 4.0, 0.0, 4.0).expect("valid diagnostic frame");
+
+        let mesh = project_msh_to_static_mesh_in_xy_frame_with_node_fallback_poses(
+            &source,
+            frame,
+            LegacyIron3dEulerTransform {
+                translation: [2.0, 1.0, 0.0],
+                orientation_radians: [0.0, 0.0, std::f32::consts::FRAC_PI_2],
+            },
+            [1.0; 3],
+        )
+        .expect("diagnostic static mesh");
+
+        assert!(mesh.vertices[0].position[0].abs() < 0.0001);
+        assert!(mesh.vertices[0].position[1].abs() < 0.0001);
+        assert_eq!(mesh.vertices[0].position[2], 0.0);
     }
 
     #[test]

@@ -13,7 +13,7 @@
 | `RecordingBackend` | No | No | Optional CPU-side IDs only | `covered-planning` | Stable command capture for backend-neutral tests | Native window, Vulkan, GPU resource lifetime, pixels |
 | `NullBackend` | No | No | Optional CPU-side IDs only | Usually `covered` for validation-only rows | Command stream framing and bounds validation | Capture stability, GPU execution, pixels |
 | `VulkanAssetRenderer` | Yes | Yes | Yes | `covered-gpu` | Static original asset rendering: MSH/Texm/WEAR/MAT0/terrain through Vulkan | Animation/FX parity unless explicitly wired |
-| `fparkan-game --backend static-vulkan` | Yes, GOG `Autodemo.00` | Yes, full static AutoDemo preview | Eight mission objects, 66 MSH components, original diffuse TEXM and Land2 terrain base layer | `covered-gpu` for the bounded static-scene bridge | Captured legacy camera, placed translation/scale/Z Euler transform, fallback node hierarchy, source-world geometry, 32-bit GPU indices, diffuse descriptors, terrain base draws and synchronized teardown telemetry | Material phases, Land1 blend/microtexture/lightmaps, animated keys, FX, camera control and gameplay parity |
+| `fparkan-game --backend static-vulkan` | Yes, GOG `Autodemo.00` | Yes, full static AutoDemo preview | Eight mission objects, 66 MSH components, original diffuse TEXM and Land2 terrain base layer | `covered-gpu` for the bounded static-scene bridge | Diagnostic XY framing with recovered translation/scale/Z Euler placement, fallback node hierarchy, optional captured legacy camera, 32-bit GPU indices, diffuse descriptors, terrain base draws and synchronized teardown telemetry | Material phases, Land1 blend/microtexture/lightmaps, animated keys, FX, camera control and gameplay parity |
 | Future rendered `fparkan-game` mode | Yes | Yes | Yes | `covered-gpu` plus original-evidence IDs | Mission-driven render snapshot execution and pixel capture | Original-runtime parity for animation/FX/x87 without dedicated captures |
 
 ## Rules
@@ -36,10 +36,11 @@
   synthetic window descriptor и `VulkanPlanningBackend`. Opt-in `--backend static-vulkan`
   создаёт native `winit` window. Для GOG `MISSIONS/Autodemo.00/data.tma` он уже
   рендерит весь статический набор из восьми mission objects и 66 MSH components с
-  captured legacy camera, доказанным `Rz * Ry * Rx` placement transform,
+  diagnostic XY camera (or an optional captured legacy camera), доказанным `Rz * Ry * Rx` placement transform,
   fallback node hierarchy и Land2 base terrain. Последний validation-clean
-  трёхкадровый запуск имел 67 material descriptors, `clip_visible_vertices=3415`
-  и readback hash `1275533143935640133`. Это `covered-gpu` для ограниченного
+  текущий трёхкадровый запуск после применения placement transform в XY path
+  имел 71 material descriptor, `clip_visible_vertices=75543` и readback hash
+  `5444013368935681345`. Это `covered-gpu` для ограниченного
   static-scene bridge, но не pixel parity и не доказательство material phase,
   Land1 blend, microtexture, lightmap, dynamic animation, FX, live camera
   selection или gameplay rendering.

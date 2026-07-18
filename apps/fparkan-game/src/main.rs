@@ -35,9 +35,10 @@ use fparkan_render_vulkan::{
     project_land_msh_to_static_mesh_in_legacy_world_space,
     project_land_msh_to_static_mesh_in_xy_frame,
     project_msh_to_static_mesh_in_world_space_with_node_fallback_poses,
-    project_msh_to_static_mesh_in_xy_frame, VulkanPlanningBackend, VulkanSmokeFrameOutcome,
-    VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo, VulkanStaticCamera, VulkanStaticMaterial,
-    VulkanStaticMesh, VulkanStaticTexture, VulkanStaticXyFrame,
+    project_msh_to_static_mesh_in_xy_frame_with_node_fallback_poses, VulkanPlanningBackend,
+    VulkanSmokeFrameOutcome, VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo,
+    VulkanStaticCamera, VulkanStaticMaterial, VulkanStaticMesh, VulkanStaticTexture,
+    VulkanStaticXyFrame,
 };
 use fparkan_runtime::{
     create, frame, load_mission, load_mission_static_preview, load_mission_static_preview_roots,
@@ -310,10 +311,13 @@ fn static_preview_mesh_and_materials(
                 )
             } else {
                 let frame = xy_frame.ok_or_else(|| "missing diagnostic XY frame".to_string())?;
-                project_msh_to_static_mesh_in_xy_frame(
+                project_msh_to_static_mesh_in_xy_frame_with_node_fallback_poses(
                     &model.validated,
                     frame,
-                    root.position,
+                    LegacyIron3dEulerTransform {
+                        translation: root.position,
+                        orientation_radians: root.orientation_raw,
+                    },
                     root.scale,
                 )
             }
@@ -422,16 +426,16 @@ fn static_preview_xy_frame(
                 format!("static preview visual {visual_id:?} references unknown model {model_id:?}")
             })?;
             for position in &model.validated.positions {
+                let position = LegacyIron3dEulerTransform {
+                    translation: root.position,
+                    orientation_radians: root.orientation_raw,
+                }
+                .try_transform_scaled_point(*position, root.scale)
+                .ok_or_else(|| {
+                    "static preview contains a non-finite transformed XY position".to_string()
+                })?;
                 extend_static_preview_xy_bounds(
-                    [
-                        position[0] * root.scale[0] + root.position[0],
-                        position[1] * root.scale[1] + root.position[1],
-                        position[2] * root.scale[2] + root.position[2],
-                    ],
-                    &mut min_x,
-                    &mut max_x,
-                    &mut min_y,
-                    &mut max_y,
+                    position, &mut min_x, &mut max_x, &mut min_y, &mut max_y,
                 )?;
             }
         }

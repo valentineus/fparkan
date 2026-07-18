@@ -985,8 +985,11 @@ The bounded native preview now retains the already validated `Land.msh` inside
 runtime boundary instead of decoding archive formats a second time. It merges
 one terrain component with the first TMA root's 14 reachable MSH components in
 one explicit top-down XY frame. The frame is computed from terrain positions
-and the root models after applying only the decoded TMA `position` and `scale`.
-Raw TMA orientation is deliberately excluded: its convention is not proven.
+and the root models after applying decoded TMA placement: non-uniform `scale`,
+then the recovered `Rz * Ry * Rx` orientation, then `position`. The XY camera
+itself remains diagnostic; applying the established placement transform here
+prevents differently oriented mission objects from being framed or rasterized
+at a false location.
 
 Terrain is assigned an explicit 1x1 white diagnostic texture, rather than a
 guessed terrain material. `Land.msh` slot selection, `material_tag`, masks,
@@ -1004,10 +1007,11 @@ geometry and descriptor set changed; it is not an original-frame comparison.
 ### Multiple static-preview roots
 
 The native bridge now combines every mesh-backed visual of each selected root,
-using that root's preserved TMA `position` and `scale` in the shared diagnostic
-XY frame. It reports the actual selected root count as `preview_roots`, rather
-than implying that all mission objects are rendered. Raw orientation, original
-camera/frustum and visibility remain unresolved.
+using that root's recovered static TMA placement (`Rz * Ry * Rx` after scale)
+in the shared diagnostic XY frame. It reports the actual selected root count as
+`preview_roots`, rather than implying that all mission objects are rendered.
+The original camera/frustum, dynamic orientation ownership and visibility
+remain unresolved.
 
 Fresh canonical GOG `Autodemo.00` evidence with `--preview-roots 2` completed
 in 59.7 seconds: 25 submitted MSH components, one terrain component and 26
@@ -1430,13 +1434,14 @@ runtime wiring, not a claim of scene parity.
 
 The geometry side of that handoff is also explicit. The static mesh adapter now
 has source-world projections for `Land.msh` and MSH: terrain positions retain
-all three decoded coordinates; model positions retain Z and apply only the
-already decoded mission translation and scale. These APIs preserve triangle
-order, batch ranges and packed UV decoding, but do not interpret the still
-unproven raw object orientation. The current game preview deliberately stays
-on its XY diagnostic projection until a runtime supplies a real legacy camera;
-selecting source-world coordinates with identity camera would be a misleading
-empty/off-screen viewer rather than a compatibility result.
+all three decoded coordinates; model positions retain Z and apply the recovered
+static mission placement. The diagnostic XY counterpart uses that same placement
+before normalizing X/Y, so it no longer silently omits authored object rotation.
+These APIs preserve triangle order, batch ranges and packed UV decoding. The
+current game preview deliberately stays on its XY diagnostic projection until a
+runtime supplies a real legacy camera; selecting source-world coordinates with
+identity camera would be a misleading empty/off-screen viewer rather than a
+compatibility result.
 
 Static analysis of GOG `iron3d.dll` recovers the placement primitive at RVA
 `0x36610`: it evaluates a row-major affine `Rz(z) * Ry(y) * Rx(x)` and writes
