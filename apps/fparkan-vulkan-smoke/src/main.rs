@@ -420,13 +420,10 @@ impl SmokeApp {
             event_loop.exit();
             return;
         }
-        let renderer = match self.renderer.take() {
-            Some(renderer) => renderer,
-            None => {
-                self.error = Some("native smoke renderer was not initialized".to_string());
-                event_loop.exit();
-                return;
-            }
+        let Some(renderer) = self.renderer.take() else {
+            self.error = Some("native smoke renderer was not initialized".to_string());
+            event_loop.exit();
+            return;
         };
         let final_renderer = match renderer.shutdown() {
             Ok(report) => RendererSnapshot::from(report),

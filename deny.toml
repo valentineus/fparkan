@@ -14,8 +14,6 @@ deny = [
 ]
 
 [licenses]
-unlicensed = "deny"
-copyleft = "allow"
 allow = [
   "Apache-2.0",
   "BSD-2-Clause",

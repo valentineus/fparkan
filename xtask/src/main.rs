@@ -543,15 +543,7 @@ fn run_cargo_deny() -> Result<(), String> {
     }
 
     let status = Command::new(cargo_deny)
-        .args([
-            "check",
-            "--workspace",
-            "--all-features",
-            "advisories",
-            "bans",
-            "licenses",
-            "sources",
-        ])
+        .args(["check", "advisories", "bans", "licenses", "sources"])
         .status()
         .map_err(|err| format!("failed to run cargo-deny: {err}"))?;
     if status.success() {
@@ -1886,7 +1878,7 @@ fn parse_native_smoke_audit_options(args: &[String]) -> Result<NativeSmokeAuditO
                         "--expected-commit must be a 40-character lowercase or uppercase hex string, found {value:?}"
                     ));
                 }
-                expected_commit = value.to_string();
+                expected_commit.clone_from(value);
             }
             "--expected-shader-manifest-hash" => {
                 let value = iter.next().ok_or_else(|| {
@@ -1895,7 +1887,7 @@ fn parse_native_smoke_audit_options(args: &[String]) -> Result<NativeSmokeAuditO
                 if value.trim().is_empty() {
                     return Err("--expected-shader-manifest-hash must be non-empty".to_string());
                 }
-                expected_shader_manifest_hash = value.to_string();
+                expected_shader_manifest_hash.clone_from(value);
             }
             _ => return Err(format!("unknown native-smoke audit option: {arg}")),
         }

@@ -312,7 +312,7 @@ fn graph_mission(args: &[String]) -> Result<(), String> {
 
 fn inspect_archive(args: &[String]) -> Result<(), String> {
     let path = parse_archive_path(args)?;
-    let inspection = inspect_archive_file(&path, 0).map_err(|err| err.to_string())?;
+    let inspection = inspect_archive_file(&path, 0).map_err(|err| err.clone())?;
 
     match inspection {
         ArchiveInspection::Nres {

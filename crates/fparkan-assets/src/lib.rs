@@ -664,6 +664,9 @@ pub fn prepare_mission_assets_profiled_with_repository<R: ResourceRepository>(
     )
 }
 
+// This orchestration intentionally keeps preparation, deduplication, and limit enforcement
+// together so all fallible asset construction remains transactional.
+#[allow(clippy::too_many_lines)]
 fn prepare_mission_assets_with_repository_internal<R: ResourceRepository>(
     repository: &R,
     root_prototype_spans: &[std::ops::Range<usize>],
@@ -692,7 +695,7 @@ fn prepare_mission_assets_with_repository_internal<R: ResourceRepository>(
     let mut prototype_visual_ids = Vec::with_capacity(prototypes.len());
 
     for proto in prototypes {
-        let visual_id = AssetId::new((identity_policy.visual_id)(proto));
+        let visual_id = AssetId::new((identity_policy.visual)(proto));
         let signature = prepared_visual_signature(proto);
         match visual_index_by_id.get(&visual_id) {
             Some(existing) if existing != &signature => {
@@ -813,21 +816,21 @@ enum PreparedVisualSignature {
 
 #[derive(Clone, Copy)]
 struct AssetIdentityPolicy {
-    visual_id: fn(&EffectivePrototype) -> u64,
-    model_id: fn(&EffectivePrototype) -> u64,
-    wear_id: fn(&EffectivePrototype) -> u64,
-    material_id: fn(&EffectivePrototype, u16, &ResourceName) -> u64,
-    texture_id: fn(&ResourceKey, PreparedTextureUsage) -> u64,
+    visual: fn(&EffectivePrototype) -> u64,
+    model: fn(&EffectivePrototype) -> u64,
+    wear: fn(&EffectivePrototype) -> u64,
+    material: fn(&EffectivePrototype, u16, &ResourceName) -> u64,
+    texture: fn(&ResourceKey, PreparedTextureUsage) -> u64,
 }
 
 impl Default for AssetIdentityPolicy {
     fn default() -> Self {
         Self {
-            visual_id: stable_visual_id,
-            model_id: stable_model_id,
-            wear_id: stable_wear_id,
-            material_id: stable_material_id,
-            texture_id: stable_texture_id,
+            visual: stable_visual_id,
+            model: stable_model_id,
+            wear: stable_wear_id,
+            material: stable_material_id,
+            texture: stable_texture_id,
         }
     }
 }
@@ -1011,6 +1014,14 @@ fn enforce_asset_preparation_limits(
 ///
 /// This function validates WEAR/material/TEXM/LIGHTMAP resolution for each resolved
 /// prototype without constructing full immutable assets.
+///
+/// # Panics
+///
+/// Panics only if the hard-coded, host-compatible `material.lib` path stops satisfying
+/// the path policy, which indicates a programming error in this module.
+// The graph expansion is deliberately a single transactional traversal so every generated
+// edge receives the correct parent provenance and node/edge sequence.
+#[allow(clippy::too_many_lines)]
 pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
     repository: &R,
     report: &mut PrototypeGraphReport,
@@ -1020,6 +1031,7 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
     if graph.visual_dependencies_expanded {
         return;
     }
+    #[allow(clippy::expect_used)]
     let material_archive = parse_path("material.lib")
         .expect("static material archive path must satisfy host-compatible normalization");
     let mut next_node = graph
@@ -1382,6 +1394,8 @@ struct PreparedVisualBundle {
     textures: Vec<PreparedTexture>,
 }
 
+// Keeps the complete model -> WEAR -> material -> texture transaction in one fallible boundary.
+#[allow(clippy::too_many_lines)]
 fn prepare_visual_with_repository_internal<R: ResourceRepository>(
     repository: &R,
     proto: &EffectivePrototype,
@@ -1404,7 +1418,7 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
     .map_err(AssetError::Nres)?;
     let msh_document = decode_msh(&nres).map_err(AssetError::Msh)?;
     let model = validate_msh(&msh_document).map_err(AssetError::Msh)?;
-    let model_id = AssetId::new((identity_policy.model_id)(proto));
+    let model_id = AssetId::new((identity_policy.model)(proto));
     let prepared_model = PreparedModel {
         id: model_id,
         source: mesh_key.clone(),
@@ -1420,7 +1434,7 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
     };
     let wear = decode_wear(&read_key(repository, &wear_key, Some("wear"))?)
         .map_err(AssetError::Material)?;
-    let wear_id = AssetId::new((identity_policy.wear_id)(proto));
+    let wear_id = AssetId::new((identity_policy.wear)(proto));
     let prepared_wear = PreparedWear {
         id: wear_id,
         source: wear_key.clone(),
@@ -1447,7 +1461,7 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
         let material =
             resolve_material(repository, &wear, material_index).map_err(AssetError::Material)?;
         material_count += 1;
-        let material_id = AssetId::new((identity_policy.material_id)(
+        let material_id = AssetId::new((identity_policy.material)(
             proto,
             material_index,
             &material.name,
@@ -1495,7 +1509,7 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
 
     Ok(PreparedVisualBundle {
         visual: PreparedVisual {
-            id: AssetId::new((identity_policy.visual_id)(proto)),
+            id: AssetId::new((identity_policy.visual)(proto)),
             mesh: Some(mesh_key.clone()),
             model_id: Some(model_id),
             wear_id: Some(wear_id),
@@ -1764,7 +1778,7 @@ fn prepare_texture<R: ResourceRepository>(
     };
     let texm = decode_texm(bytes).map_err(AssetError::Texture)?;
     Ok(PreparedTexture {
-        id: AssetId::new((identity_policy.texture_id)(&key, usage)),
+        id: AssetId::new((identity_policy.texture)(&key, usage)),
         source: key,
         texm,
         usage,
@@ -2415,7 +2429,7 @@ mod tests {
     fn forced_model_id_collision_is_rejected() {
         assert_forced_collision(
             AssetIdentityPolicy {
-                model_id: |_| 7,
+                model: |_| 7,
                 ..AssetIdentityPolicy::default()
             },
             "stable model id collision",
@@ -2426,7 +2440,7 @@ mod tests {
     fn forced_wear_id_collision_is_rejected() {
         assert_forced_collision(
             AssetIdentityPolicy {
-                wear_id: |_| 11,
+                wear: |_| 11,
                 ..AssetIdentityPolicy::default()
             },
             "stable wear id collision",
@@ -2437,7 +2451,7 @@ mod tests {
     fn forced_material_id_collision_is_rejected() {
         assert_forced_collision(
             AssetIdentityPolicy {
-                material_id: |_, _, _| 13,
+                material: |_, _, _| 13,
                 ..AssetIdentityPolicy::default()
             },
             "stable material id collision",
@@ -2448,7 +2462,7 @@ mod tests {
     fn forced_texture_id_collision_is_rejected() {
         assert_forced_collision(
             AssetIdentityPolicy {
-                texture_id: |_, _| 17,
+                texture: |_, _| 17,
                 ..AssetIdentityPolicy::default()
             },
             "stable texture id collision",
