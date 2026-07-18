@@ -40,6 +40,16 @@ end-of-render.
 Подготовленный item должен ссылаться на immutable данные кадра. Изменение phase
 или texture cache посреди прохода не должно менять уже собранную очередь.
 
+## GOG camera dispatch evidence
+
+For the GOG `World3D.dll` baseline with SHA-256
+`17e4a3089b2583a8cf2356c9db0390b1aba138356a09130d79b4e7e4791da61e`,
+the exported `stdRenderGame` is RVA `0x13BD0`. It first calls
+`Terrain::stdSetCurrentCamera2(camera)`, stores the camera pointer only for
+the frame, and clears it before return. `sendEndOfRender` is a separate export
+at RVA `0x13D90`. This is frame-order evidence only: the camera ABI, matrices
+and viewport values still require dynamic capture or further decompilation.
+
 ## Parity risks
 
 - x87 precision and rounding;

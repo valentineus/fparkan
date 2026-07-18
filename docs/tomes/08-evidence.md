@@ -198,9 +198,9 @@ legacy ABI:        n3d*, vrt*, bsp* compatibility entries
 Адреса указаны как RVA конкретной исследованной сборки:
 
 ```text
-World3D stdCalculateGame    0x13910
-World3D stdRenderGame       0x13B60
-World3D sendEndOfRender     0x13D20
+World3D stdCalculateGame    0x139A0
+World3D stdRenderGame       0x13BD0
+World3D sendEndOfRender     0x13D90
 World3D UpdateManualEvents  0x10E10
 World3D ClearManualEvents   0x11180
 World3D DeleteGameObject    0x087B0
@@ -228,6 +228,21 @@ implementation не должна встраивать их как постоян
 World3D.dll 17e4a3089b2583a8cf2356c9db0390b1aba138356a09130d79b4e7e4791da61e
 Ngi32.dll   bab9840d94f4e4e74ffc26677724fa896cf4823845504d09a9e025f80016edf5
 ```
+
+Повторный headless IDA/Hex-Rays review GOG `World3D.dll` с этим hash уточнил
+RVA export-ов: `stdCalculateGame=0x139A0`, `stdRenderGame=0x13BD0`,
+`sendEndOfRender=0x13D90`, `stdSetCurrentCamera=0x13E60` и
+`stdGetCurrentCamera=0x13E80`. Предыдущая таблица была сдвинута и не должна
+использоваться для hooks или differential capture.
+
+`stdRenderGame(camera)` сначала вызывает экспорт Terrain
+`stdSetCurrentCamera2(camera)`, затем сохраняет текущий camera pointer в
+глобальном состоянии World3D. После этого виден запрос camera interface через
+selector `6`, запрос связанного service через selector `264`, renderer/world
+boundary slots и traversal render queues. В конце pointer очищается; dispatch
+end-of-render callbacks вынесен также в отдельный `sendEndOfRender`.
+Это доказывает порядок передачи camera и границы frame lifecycle, но не layout
+camera object, не матрицы projection/view и не значения viewport selectors.
 
 ### Vtable и interface negotiation
 
