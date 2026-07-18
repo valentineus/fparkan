@@ -13,7 +13,7 @@
 | `RecordingBackend` | No | No | Optional CPU-side IDs only | `covered-planning` | Stable command capture for backend-neutral tests | Native window, Vulkan, GPU resource lifetime, pixels |
 | `NullBackend` | No | No | Optional CPU-side IDs only | Usually `covered` for validation-only rows | Command stream framing and bounds validation | Capture stability, GPU execution, pixels |
 | `VulkanAssetRenderer` | Yes | Yes | Yes | `covered-gpu` | Static original asset rendering: MSH/Texm/WEAR/MAT0/terrain through Vulkan | Animation/FX parity unless explicitly wired |
-| `fparkan-game --backend static-vulkan` | Yes, GOG/Part 1/Part 2 `Autodemo.00` | Yes, merged static MSH component draws | All prepared MSH components from first mission root; first MAT0 diffuse TEXM per source selector | `covered-gpu` only for the narrow static-preview bridge | Opt-in mission-to-native-window bootstrap, component mesh merge, preview-local selector remap, diffuse descriptor upload and synchronized teardown telemetry | Full mission scene, later MAT0 phases/animation, lightmaps, placed transforms/orientation, camera, gameplay, original-runtime parity |
+| `fparkan-game --backend static-vulkan` | Yes, GOG `Autodemo.00` | Yes, full static AutoDemo preview | Eight mission objects, 66 MSH components, original diffuse TEXM and Land2 terrain base layer | `covered-gpu` for the bounded static-scene bridge | Captured legacy camera, placed translation/scale/Z Euler transform, fallback node hierarchy, source-world geometry, 32-bit GPU indices, diffuse descriptors, terrain base draws and synchronized teardown telemetry | Material phases, Land1 blend/microtexture/lightmaps, animated keys, FX, camera control and gameplay parity |
 | Future rendered `fparkan-game` mode | Yes | Yes | Yes | `covered-gpu` plus original-evidence IDs | Mission-driven render snapshot execution and pixel capture | Original-runtime parity for animation/FX/x87 without dedicated captures |
 
 ## Rules
@@ -32,21 +32,17 @@
 
 - Реальный Vulkan в репозитории имеет smoke triangle path и узкий static asset bridge. `VulkanStaticDrawRange` сохраняет исходный `Batch20.material_index`; когда smoke запускается с `--wear-root`, `--wear-archive`, `--wear-name` без override, он дедуплицирует selectors, проходит каждый через `WEAR → MAT0 → Textures.lib`, создаёт по одному image/descriptor set и бинит set непосредственно перед соответствующим indexed draw. Direct TEXM и `--material-index` — намеренно однотекстурные compatibility modes. Fresh GOG `fortif.rlb::FR_L_MTP.msh` подтверждает 237 batch draws, но его selectors все `0`, поэтому live report содержит один binding `MTP_01.0`; unit contract подтверждает точное сопоставление двух разных selectors с разными descriptor sets. Это не доказывает material phase animation, lightmaps, alpha/depth/cull state, terrain, camera/node transforms или pixel approval.
 - Lightmap остаётся отдельным, не реализованным contract: оригинальный `World3D.dll` экспортирует самостоятельный `SetLightMapLib` наряду с `SetTexturesLib` и `SetMaterialLib`; WEAR содержит независимый блок `LIGHTMAPS`. Текущая документация не подтверждает связь этих slots с `Batch20.material_index` или их UV/channel semantics, поэтому viewer не подменяет lightmap diffuse texture и не добавляет недоказанное binding.
-- `apps/fparkan-game` по умолчанию выдает `render-planning` JSON report поверх
+- `apps/fparkan-game` по умолчанию выдаёт `render-planning` JSON report поверх
   synthetic window descriptor и `VulkanPlanningBackend`. Opt-in `--backend static-vulkan`
-  уже создаёт native `winit` window и передаёт все подготовленные MSH-компоненты первого root в
-  `VulkanSmokeRenderer`. Каждый исходный `Batch20.material_index` сначала разрешается внутри
-  собственного WEAR/MAT0 visual, затем получает уникальный preview-local selector и первый
-  diffuse TEXM. Режим использует
-  отдельный first-root preview loader: normal `load_mission` по-прежнему готовит все reachable
-  assets и весь graph, тогда как preview строит graph и готовит assets только для первого
-  mission root. `--load-progress <file>` writes the last entered loader phase synchronously for
-  timeout diagnosis. Fresh GOG `MISSIONS/Autodemo.00/data.tma` run passed in 38.7 seconds with
-  one presented frame, native 1280×720 swapchain (2 images), 14 mesh components and 14 original
-  diffuse material descriptors, 7,372,800-byte readback hash `16595193636416981301`, and
-  validation warnings/errors `0/0`. Part 1 matches that artifact; Part 2 passes validation with
-  14/14 but has a distinct hash `18268338333658342130`. This is `covered-gpu` evidence for that
-  narrow static-preview bridge only, not full-scene or original-renderer parity.
+  создаёт native `winit` window. Для GOG `MISSIONS/Autodemo.00/data.tma` он уже
+  рендерит весь статический набор из восьми mission objects и 66 MSH components с
+  captured legacy camera, доказанным `Rz * Ry * Rx` placement transform,
+  fallback node hierarchy и Land2 base terrain. Последний validation-clean
+  трёхкадровый запуск имел 67 material descriptors, `clip_visible_vertices=3415`
+  и readback hash `1275533143935640133`. Это `covered-gpu` для ограниченного
+  static-scene bridge, но не pixel parity и не доказательство material phase,
+  Land1 blend, microtexture, lightmap, dynamic animation, FX, live camera
+  selection или gameplay rendering.
 - `apps/fparkan-viewer` сейчас inspection-only CLI и не открывает live Vulkan
   asset viewer.
 - Следующий реальный milestone для rendered acceptance: `VulkanAssetRenderer`
