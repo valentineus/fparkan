@@ -378,8 +378,32 @@ impl VarSet {
         &self,
         instruction: &ScriptInstruction,
     ) -> Result<VmHostCallbackCommand, Handler30ResolveError> {
-        let first = self.resolve_handler30_operand(instruction, 0)?;
-        let second = self.resolve_handler30_operand(instruction, 1)?;
+        let values: Vec<_> = self
+            .declarations
+            .iter()
+            .map(|declaration| declaration.default_value)
+            .collect();
+        self.resolve_handler30_with_values(instruction, &values)
+    }
+
+    /// Resolves `Handler(30)` against instantiated runtime varset values.
+    ///
+    /// The declaration table still establishes the original numeric kind; the
+    /// supplied cells carry state after prior recovered handlers have written
+    /// it. This is the execution-time counterpart of [`Self::resolve_handler30`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same bounded errors as [`Self::resolve_handler30`] when an
+    /// instruction, declaration, or runtime cell cannot satisfy the proven
+    /// DWORD operand contract.
+    pub fn resolve_handler30_with_values(
+        &self,
+        instruction: &ScriptInstruction,
+        values: &[VarSetDefault],
+    ) -> Result<VmHostCallbackCommand, Handler30ResolveError> {
+        let first = self.resolve_handler30_operand_with_values(instruction, values, 0)?;
+        let second = self.resolve_handler30_operand_with_values(instruction, values, 1)?;
         Ok(VmHostCallbackCommand {
             mode: 0,
             first,
@@ -387,28 +411,34 @@ impl VarSet {
         })
     }
 
-    fn resolve_handler30_operand(
+    fn resolve_handler30_operand_with_values(
         &self,
         instruction: &ScriptInstruction,
+        values: &[VarSetDefault],
         position: usize,
     ) -> Result<u32, Handler30ResolveError> {
         let index = *instruction
             .references
             .get(position)
             .ok_or(Handler30ResolveError::MissingReference { position })?;
-        match self.declarations.get(index as usize) {
-            Some(VarSetDeclaration {
-                default_value: VarSetDefault::Dword(value),
-                ..
-            }) => Ok(*value),
-            Some(VarSetDeclaration {
-                default_value: VarSetDefault::FloatBits(_),
-                ..
-            }) => Err(Handler30ResolveError::FloatRequiresX87 { index }),
-            None => Err(Handler30ResolveError::VarSetIndexOutOfBounds {
+        let declaration = self.declarations.get(index as usize).ok_or(
+            Handler30ResolveError::VarSetIndexOutOfBounds {
                 index,
                 declarations: self.declarations.len(),
-            }),
+            },
+        )?;
+        let value =
+            values
+                .get(index as usize)
+                .ok_or(Handler30ResolveError::VarSetIndexOutOfBounds {
+                    index,
+                    declarations: values.len(),
+                })?;
+        match (declaration.type_name, value) {
+            (VarSetType::Dword, VarSetDefault::Dword(value)) => Ok(*value),
+            (VarSetType::Float, _) | (_, VarSetDefault::FloatBits(_)) => {
+                Err(Handler30ResolveError::FloatRequiresX87 { index })
+            }
         }
     }
 
@@ -1319,6 +1349,27 @@ STRING( 8, ignored, ignored, ignored)\r\n";
                 mode: 0,
                 first: 0x12,
                 second: 9,
+            })
+        );
+    }
+
+    #[test]
+    fn handler_thirty_reads_instantiated_dword_cells_instead_of_defaults() {
+        let varset =
+            parse_varset(b"VAR( DWORD, first, 0x12)\nVAR( DWORD, second, 9)\n").expect("varset");
+        let instruction = ScriptInstruction {
+            header_words: [30, 0, 0, 0, 0, 2, 0],
+            references: vec![0, 1],
+        };
+        assert_eq!(
+            varset.resolve_handler30_with_values(
+                &instruction,
+                &[VarSetDefault::Dword(728), VarSetDefault::Dword(449)],
+            ),
+            Ok(VmHostCallbackCommand {
+                mode: 0,
+                first: 728,
+                second: 449,
             })
         );
     }

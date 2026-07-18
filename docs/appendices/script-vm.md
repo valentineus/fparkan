@@ -231,6 +231,15 @@ The creation and conversion boundaries are reproducible with
 `ExportAiCreateSuperAi.java`, `ExportAiSuperAiConstructor.java`, and
 `ExportAiFtol.java`.
 
+### Runtime Handler(30) operand binding
+
+`resolve_handler30_with_values` preserves the recovered declaration-kind ABI
+but reads operands from instantiated per-clan cells rather than textual
+defaults. Runtime exposes `resolve_loaded_handler30` for the exact opaque
+`(mode=0, first, second)` callback command. It intentionally returns that
+command without invoking a guessed game-side consumer: the tenth
+`CreateSuperAI` callback argument still needs its own recovery.
+
 ### Handler(8): problem-record state write
 
 `Handler(8)` is the ninth VM-table entry at GOG `ai.dll` VA `0x10009b0d`.

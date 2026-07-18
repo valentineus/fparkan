@@ -35,8 +35,8 @@ use fparkan_prototype::{
 };
 use fparkan_resource::{resource_name, CachedResourceRepository, ResourceRepository};
 use fparkan_script::{
-    Handler19DwordWrite, Handler19InitInput, ScriptDispatchSelector, ScriptPackage, VarSet,
-    VarSetDefault,
+    Handler19DwordWrite, Handler19InitInput, ScriptDispatchSelector, ScriptInstruction,
+    ScriptPackage, VarSet, VarSetDefault, VmHostCallbackCommand,
 };
 use fparkan_terrain::SurfaceQuery;
 use fparkan_vfs::{Vfs, VfsError};
@@ -487,6 +487,13 @@ pub enum EngineError {
         /// Proven-contract diagnostic.
         message: String,
     },
+    /// A recovered script handler could not resolve against runtime state.
+    ScriptRuntime {
+        /// Owning TMA clan index.
+        clan_index: usize,
+        /// Handler-specific diagnostic.
+        message: String,
+    },
     /// `NRes` decode error.
     Nres {
         /// Resource path.
@@ -627,6 +634,10 @@ impl std::fmt::Display for EngineError {
                 clan_index,
                 message,
             } => write!(f, "clan {clan_index}: script Init failed: {message}"),
+            Self::ScriptRuntime {
+                clan_index,
+                message,
+            } => write!(f, "clan {clan_index}: script runtime failed: {message}"),
             Self::Nres { path, source } => write!(f, "{path}: {source}"),
             Self::Mission { path, source } => write!(f, "{path}: {source}"),
             Self::TerrainFormat { path, source } => write!(f, "{path}: {source}"),
@@ -670,6 +681,7 @@ impl std::error::Error for EngineError {
             | Self::Script { .. }
             | Self::VarSet { .. }
             | Self::ScriptInit { .. }
+            | Self::ScriptRuntime { .. }
             | Self::Movement(_)
             | Self::PrototypeGraph { .. }
             | Self::SchedulerPhaseOrder { .. }
@@ -1253,6 +1265,61 @@ pub fn loaded_mission_script_varset_states(engine: &Engine) -> Option<&[MissionS
         .map(|state| state.script_varset_states.as_slice())
 }
 
+/// Resolves the proven opaque callback command for one `Handler(30)` record.
+///
+/// Unlike the loader-only resolver, operands are read from the selected
+/// clan's instantiated varset cells. Dispatching the returned host callback
+/// remains outside this function because its game-side consumer is not yet
+/// recovered.
+///
+/// # Errors
+///
+/// Returns an explicit error when no mission, declaration table, or clan state
+/// is available, or if the instruction violates the proven handler contract.
+pub fn resolve_loaded_handler30(
+    engine: &Engine,
+    clan_index: usize,
+    instruction: &ScriptInstruction,
+) -> Result<VmHostCallbackCommand, EngineError> {
+    let state = engine
+        .loaded
+        .as_ref()
+        .ok_or_else(|| EngineError::ScriptRuntime {
+            clan_index,
+            message: "mission script state is unavailable".to_string(),
+        })?;
+    let declarations = state
+        .script_varset
+        .as_ref()
+        .ok_or_else(|| EngineError::ScriptRuntime {
+            clan_index,
+            message: "mission varset declarations are unavailable".to_string(),
+        })?;
+    let values = state
+        .script_varset_states
+        .iter()
+        .find(|varset| varset.clan_index == clan_index)
+        .ok_or_else(|| EngineError::ScriptRuntime {
+            clan_index,
+            message: "instantiated mission varset is unavailable".to_string(),
+        })?;
+    resolve_handler30_from_varset_state(declarations, values, instruction)
+}
+
+fn resolve_handler30_from_varset_state(
+    declarations: &MissionScriptVarSet,
+    values: &MissionScriptVarSetState,
+    instruction: &ScriptInstruction,
+) -> Result<VmHostCallbackCommand, EngineError> {
+    declarations
+        .declarations
+        .resolve_handler30_with_values(instruction, &values.values)
+        .map_err(|source| EngineError::ScriptRuntime {
+            clan_index: values.clan_index,
+            message: source.to_string(),
+        })
+}
+
 /// Returns terrain runtime data for the loaded mission.
 #[must_use]
 pub fn loaded_terrain(engine: &Engine) -> Option<&TerrainWorld> {
@@ -1765,6 +1832,23 @@ mod tests {
                     VarSetDefault::Dword(1),
                 ],
             }]
+        );
+        let callback = resolve_handler30_from_varset_state(
+            &varset,
+            &runtime_varsets[0],
+            &ScriptInstruction {
+                header_words: [30, 0, 0, 0, 0, 2, 0],
+                references: vec![0, 2],
+            },
+        )
+        .expect("runtime Handler(30) callback");
+        assert_eq!(
+            callback,
+            VmHostCallbackCommand {
+                mode: 0,
+                first: 728,
+                second: 1,
+            }
         );
     }
 
