@@ -254,6 +254,14 @@ Terrain object. Следовательно, selector `18`, slot `+12` и global 
 должны оставаться именованными evidence boundary до dynamic capture; считать
 `stdGetCurrentCamera2` getter-ом переданной camera было бы ошибкой.
 
+Локальная IDA-база уточняет адреса этой связи: `stdGetCurrentCamera2` — это
+шестибайтный getter по RVA `0x4FD80`, который возвращает `dword` по RVA
+`0x7355C`. Единственный найденный initializer этого global — функция Terrain
+по RVA `0x4D4D0`: она запрашивает selector `8` у своего `this` и сохраняет
+полученный interface pointer. Это доказывает адрес хранения и путь заполнения,
+но не разрешает трактовать pointer как конкретный layout камеры либо читать его
+как runtime evidence без доступа к процессу на том же уровне привилегий.
+
 ### Vtable и interface negotiation
 
 Вызовы вида `object->vfunc(offset)` доказывают порядок slots, даже когда имя
