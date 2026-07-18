@@ -1279,7 +1279,7 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
                             mesh.name.0.clone(),
                             PrototypeGraphEdge::WearToMaterial,
                             PrototypeGraphRequiredness::Required,
-                            &message.to_string(),
+                            &message.clone(),
                         ),
                     }
                 }
