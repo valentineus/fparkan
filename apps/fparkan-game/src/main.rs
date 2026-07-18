@@ -22,6 +22,7 @@
 //! `FParkan` render-planning composition root.
 
 use fparkan_assets::{PreparedTextureUsage, PreparedVisual};
+use fparkan_inspection::load_standalone_wear_material_texture_mip0_rgba8_from_root;
 use fparkan_platform::WindowPort;
 use fparkan_platform_winit::{window_native_handles, WinitWindow, WinitWindowPlan};
 use fparkan_render::{
@@ -102,7 +103,14 @@ fn run(args: &[String]) -> Result<String, String> {
             .as_deref()
             .map(load_legacy_camera_capture)
             .transpose()?;
-        let preview = static_preview_mesh_and_materials(mission_assets, terrain, roots, camera)?;
+        let preview = static_preview_mesh_and_materials(
+            mission_assets,
+            terrain,
+            roots,
+            camera,
+            &args.root,
+            &loaded.land_msh_path,
+        )?;
         return run_static_vulkan_mode(
             preview,
             roots.len(),
@@ -236,14 +244,18 @@ struct StaticPreviewScene {
 /// bounded static-preview root into one diagnostic XY frame.
 ///
 /// This intentionally takes only the first MAT0 texture request for each MSH
-/// batch selector. The terrain uses an explicit white diagnostic texture;
-/// terrain slot/material selection, orientation, camera, later material phases,
-/// animation, lightmaps and gameplay visibility remain outside this bridge.
+/// batch selector. Terrain maps its proven low-byte packed tag channel through
+/// the map-local `Land2.wea` table. The high-byte `Land1.wea` channel is
+/// retained on draw ranges but awaits a recovered blend equation; orientation,
+/// later material phases, animation, lightmaps and gameplay visibility remain
+/// outside this bridge.
 fn static_preview_mesh_and_materials(
     assets: &MissionAssets,
     terrain: &TerrainWorld,
     roots: &[MissionObjectDraft],
     legacy_camera: Option<VulkanStaticCamera>,
+    root: &std::path::Path,
+    land_msh_path: &str,
 ) -> Result<StaticPreviewScene, String> {
     let terrain_mesh = terrain
         .source_mesh()
@@ -257,14 +269,7 @@ fn static_preview_mesh_and_materials(
         indices: Vec::new(),
         draw_ranges: Vec::new(),
     };
-    let mut materials = vec![VulkanStaticMaterial {
-        material_index: 0,
-        texture: VulkanStaticTexture {
-            width: 1,
-            height: 1,
-            rgba8: vec![255, 255, 255, 255],
-        },
-    }];
+    let mut materials = Vec::new();
     let terrain_component = if legacy_camera.is_some() {
         project_land_msh_to_static_mesh_in_legacy_world_space(terrain_mesh)
     } else {
@@ -272,7 +277,13 @@ fn static_preview_mesh_and_materials(
         project_land_msh_to_static_mesh_in_xy_frame(terrain_mesh, frame)
     }
     .map_err(|err| format!("project mission terrain for Vulkan: {err}"))?;
-    append_static_preview_component(&mut mesh, terrain_component, &[(0, 0)])?;
+    let terrain_materials = static_preview_terrain_base_materials(
+        root,
+        land_msh_path,
+        &terrain_component,
+        &mut materials,
+    )?;
+    append_static_preview_component(&mut mesh, terrain_component, &terrain_materials)?;
     let mut mesh_components = 0;
     for (object_index, root) in roots.iter().enumerate() {
         for visual_id in assets.visuals_for_object(object_index) {
@@ -443,6 +454,53 @@ fn extend_static_preview_xy_bounds(
     *min_y = min_y.min(position[1]);
     *max_y = max_y.max(position[1]);
     Ok(())
+}
+
+fn static_preview_terrain_base_materials(
+    root: &std::path::Path,
+    land_msh_path: &str,
+    mesh: &VulkanStaticMesh,
+    materials: &mut Vec<VulkanStaticMaterial>,
+) -> Result<Vec<(u16, u16)>, String> {
+    let land_path = root.join(land_msh_path);
+    let wear_path = land_path
+        .parent()
+        .ok_or_else(|| format!("terrain mesh has no parent path: {}", land_path.display()))?
+        .join("Land2.wea");
+    let mut packed_tags = mesh
+        .draw_ranges
+        .iter()
+        .map(|range| range.material_index)
+        .collect::<Vec<_>>();
+    packed_tags.sort_unstable();
+    packed_tags.dedup();
+    packed_tags
+        .into_iter()
+        .map(|packed_tag| {
+            let selector = packed_tag & 0x00ff;
+            let selected = load_standalone_wear_material_texture_mip0_rgba8_from_root(
+                root, &wear_path, selector,
+            )
+            .map_err(|err| {
+                format!(
+                    "resolve terrain base material tag 0x{packed_tag:04x} through {}: {err}",
+                    wear_path.display()
+                )
+            })?;
+            let preview_selector = u16::try_from(materials.len()).map_err(|_| {
+                "static preview exceeds the available 16-bit material selector space".to_string()
+            })?;
+            materials.push(VulkanStaticMaterial {
+                material_index: preview_selector,
+                texture: VulkanStaticTexture {
+                    width: selected.image.width,
+                    height: selected.image.height,
+                    rgba8: selected.image.rgba8,
+                },
+            });
+            Ok((packed_tag, preview_selector))
+        })
+        .collect()
 }
 
 fn static_preview_component_materials(

@@ -1550,6 +1550,18 @@ This is evidence for a two-layer terrain-material contract, but not yet for
 its blend equation, so the Vulkan bridge intentionally remains texture-agnostic
 until the base/overlay composition is recovered.
 
+The static Vulkan bridge now carries each contiguous face run as a separate
+draw range keyed by the original packed `material_tag`; it neither reorders
+triangles nor collapses the high byte. For the first usable visual layer, the
+low byte resolves positionally through the adjacent standalone `Land2.wea`,
+then the existing `MAT0 -> Textures.lib -> TEXM` chain supplies the RGBA8
+descriptor. `Land1.wea` remains preserved as the high byte/overlay channel and
+is deliberately not drawn until its blend equation is recovered. A canonical
+three-frame AutoDemo run now uses 71 descriptors (66 MSH plus five terrain
+tags), produces readback hash `17034026600547661445`, and stays at zero Vulkan
+validation warnings/errors. This is original terrain texture upload, not
+terrain visual parity.
+
 ```powershell
 cargo run -q -p fparkan-cli -- terrain inspect `
   'C:\GOG Games\Parkan - Iron Strategy\DATA\MAPS\AutoMAP\Land.msh' --format json

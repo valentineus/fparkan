@@ -484,6 +484,43 @@ pub fn load_wear_material_texture_mip0_rgba8_from_root(
     })
 }
 
+/// Resolves phase-zero diffuse TEXM through a standalone map-local WEAR file.
+///
+/// Map terrain keeps its two WEAR tables adjacent to `Land.msh`, while their
+/// MAT0 and TEXM resources remain in the game root's normal archives. This
+/// preserves that split instead of treating the sidecar as an archive entry.
+///
+/// # Errors
+///
+/// Returns a string error if the standalone WEAR file, global material
+/// resources, or selected diffuse TEXM cannot be decoded.
+pub fn load_standalone_wear_material_texture_mip0_rgba8_from_root(
+    root: &Path,
+    wear_path: &Path,
+    material_index: u16,
+) -> Result<WearMaterialTexture, String> {
+    let wear_bytes =
+        fs::read(wear_path).map_err(|err| format!("{}: {err}", wear_path.display()))?;
+    let wear = decode_wear(&wear_bytes).map_err(|err| err.to_string())?;
+    let repository = CachedResourceRepository::new(Arc::new(DirectoryVfs::new(root)));
+    let material =
+        resolve_material(&repository, &wear, material_index).map_err(|err| err.to_string())?;
+    let texture = material.document.primary_texture().ok_or_else(|| {
+        "MAT0 phase zero declares an intentionally untextured material".to_string()
+    })?;
+    let texture_name = String::from_utf8_lossy(&texture.0).into_owned();
+    let image = load_texture_mip0_rgba8_from_root(root, "Textures.lib", &texture_name)?;
+    Ok(WearMaterialTexture {
+        wear_archive: "<standalone>".to_string(),
+        wear_resource: wear_path.display().to_string(),
+        material_index,
+        material_name: String::from_utf8_lossy(&material.name.0).into_owned(),
+        material_fallback: material.fallback,
+        texture_name,
+        image,
+    })
+}
+
 /// Inspects a terrain land file by path.
 ///
 /// # Errors
@@ -809,6 +846,35 @@ mod tests {
 
         assert_eq!(selected.material_name, "MAT");
         assert_eq!(selected.material_fallback, MaterialFallback::Exact);
+        assert_eq!(selected.texture_name, "TEX");
+        assert_eq!(selected.image.rgba8, vec![0x11, 0x22, 0x33, 0x40]);
+    }
+
+    #[test]
+    fn standalone_wear_material_texture_loader_keeps_map_sidecar_separate() {
+        let dir = temp_dir("standalone-wear-material-texture");
+        let wear_path = dir.join("Land2.wea");
+        fs::write(&wear_path, b"1\n0 MAT\n").expect("standalone wear");
+        let mut mat0 = vec![0; 4 + 34];
+        mat0[0..2].copy_from_slice(&1_u16.to_le_bytes());
+        mat0[22..25].copy_from_slice(b"TEX");
+        fs::write(
+            dir.join("material.lib"),
+            build_single_entry_nres_with_meta(b"MAT", fparkan_material::MAT0_KIND, 0, &mat0),
+        )
+        .expect("material archive");
+        fs::write(
+            dir.join("Textures.lib"),
+            build_single_entry_nres(b"TEX", &texm_argb8888_pixel([0x40, 0x11, 0x22, 0x33])),
+        )
+        .expect("texture archive");
+
+        let selected =
+            load_standalone_wear_material_texture_mip0_rgba8_from_root(&dir, &wear_path, 0)
+                .expect("resolved material texture");
+
+        assert_eq!(selected.wear_archive, "<standalone>");
+        assert_eq!(selected.wear_resource, wear_path.display().to_string());
         assert_eq!(selected.texture_name, "TEX");
         assert_eq!(selected.image.rgba8, vec![0x11, 0x22, 0x33, 0x40]);
     }

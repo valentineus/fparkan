@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 fparkan-assets = { path = "../../crates/fparkan-assets", version = "0.1.0" }
+fparkan-inspection = { path = "../../crates/fparkan-inspection", version = "0.1.0" }
 fparkan-platform = { path = "../../crates/fparkan-platform", version = "0.1.0" }
 fparkan-render = { path = "../../crates/fparkan-render", version = "0.1.0" }
 fparkan-platform-winit = { path = "../../adapters/fparkan-platform-winit", version = "0.1.0" }

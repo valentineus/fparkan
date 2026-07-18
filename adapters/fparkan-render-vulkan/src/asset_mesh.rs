@@ -420,8 +420,10 @@ fn rotate_by_quaternion(position: [f32; 3], rotation: [f32; 4]) -> [f32; 3] {
 /// Projects validated `Land.msh` terrain geometry into the static Vulkan path.
 ///
 /// This bridge preserves the source triangle order from `TerrainFace28` and
-/// consumes its validated position and UV0 streams. It is deliberately a
-/// geometry-only terrain slice: source slot/material selection, camera
+/// consumes its validated position and UV0 streams. Contiguous source faces are
+/// retained as separate draw ranges keyed by their exact packed
+/// `TerrainFace28.material_tag`, so a caller can resolve the map-local
+/// material contract without changing topology. Slot selection, camera
 /// transforms, fog and surface-mask shading need their own evidence before
 /// they can be modeled as renderer state.
 ///
@@ -592,16 +594,32 @@ fn static_terrain_indices(terrain: &LandMeshDocument) -> Result<Vec<u32>, Vulkan
 fn static_terrain_draw_ranges(
     terrain: &LandMeshDocument,
 ) -> Result<Vec<VulkanStaticDrawRange>, VulkanAssetMeshError> {
-    Ok(vec![VulkanStaticDrawRange {
-        first_index: 0,
-        index_count: u32::try_from(terrain.faces.len())
-            .map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?
-            .checked_mul(3)
-            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?,
-        material_index: 0,
-        pipeline_state: LegacyPipelineState::default(),
-        alpha_test_reference: 0,
-    }])
+    let mut ranges = Vec::new();
+    let mut start_face = 0usize;
+    while start_face < terrain.faces.len() {
+        let material_index = terrain.faces[start_face].material_tag;
+        let mut end_face = start_face + 1;
+        while end_face < terrain.faces.len()
+            && terrain.faces[end_face].material_tag == material_index
+        {
+            end_face += 1;
+        }
+        ranges.push(VulkanStaticDrawRange {
+            first_index: u32::try_from(start_face)
+                .map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?
+                .checked_mul(3)
+                .ok_or(VulkanAssetMeshError::IndexOutOfRange)?,
+            index_count: u32::try_from(end_face - start_face)
+                .map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?
+                .checked_mul(3)
+                .ok_or(VulkanAssetMeshError::IndexOutOfRange)?,
+            material_index,
+            pipeline_state: LegacyPipelineState::default(),
+            alpha_test_reference: 0,
+        });
+        start_face = end_face;
+    }
+    Ok(ranges)
 }
 
 fn static_model_indices_and_ranges(
@@ -1109,14 +1127,55 @@ mod tests {
     }
 
     fn terrain_face(vertices: [u16; 3]) -> TerrainFace28 {
+        terrain_face_with_tag(0, vertices)
+    }
+
+    fn terrain_face_with_tag(material_tag: u16, vertices: [u16; 3]) -> TerrainFace28 {
         TerrainFace28 {
             flags: FullSurfaceMask(0),
-            material_tag: 0,
+            material_tag,
             aux_tag: 0,
             vertices,
             neighbors: [None; 3],
             tail_raw: [0; 8],
             raw: [0; 28],
         }
+    }
+
+    #[test]
+    fn terrain_ranges_preserve_face_order_and_packed_material_tags() {
+        let terrain = LandMeshDocument {
+            streams: Vec::new(),
+            nodes_raw: Vec::new(),
+            slots: TerrainSlotTable {
+                header_raw: Vec::new(),
+                slots_raw: Vec::new(),
+            },
+            positions: vec![[0.0, 0.0, 0.0]; 3],
+            normals: Vec::new(),
+            uv0: vec![[0, 0]; 3],
+            accelerator: Vec::new(),
+            aux14: Vec::new(),
+            aux18: Vec::new(),
+            faces: vec![
+                terrain_face_with_tag(0xff01, [0, 1, 2]),
+                terrain_face_with_tag(0xff01, [0, 1, 2]),
+                terrain_face_with_tag(0x0102, [0, 1, 2]),
+                terrain_face_with_tag(0xff01, [0, 1, 2]),
+            ],
+        };
+
+        let ranges = static_terrain_draw_ranges(&terrain).expect("representable terrain");
+
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[0].first_index, 0);
+        assert_eq!(ranges[0].index_count, 6);
+        assert_eq!(ranges[0].material_index, 0xff01);
+        assert_eq!(ranges[1].first_index, 6);
+        assert_eq!(ranges[1].index_count, 3);
+        assert_eq!(ranges[1].material_index, 0x0102);
+        assert_eq!(ranges[2].first_index, 9);
+        assert_eq!(ranges[2].index_count, 3);
+        assert_eq!(ranges[2].material_index, 0xff01);
     }
 }

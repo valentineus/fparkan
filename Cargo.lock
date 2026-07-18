@@ -447,6 +447,7 @@ name = "fparkan-game"
 version = "0.1.0"
 dependencies = [
  "fparkan-assets",
+ "fparkan-inspection",
  "fparkan-platform",
  "fparkan-platform-winit",
  "fparkan-render",
