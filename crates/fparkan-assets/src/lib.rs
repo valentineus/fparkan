@@ -693,6 +693,7 @@ fn prepare_mission_assets_with_repository_internal<R: ResourceRepository>(
     let mut textures = Vec::new();
     let mut visuals = Vec::new();
     let mut prototype_visual_ids = Vec::with_capacity(prototypes.len());
+    let mut texture_cache = TexturePreparationCache::default();
 
     for proto in prototypes {
         let visual_id = AssetId::new((identity_policy.visual)(proto));
@@ -706,8 +707,12 @@ fn prepare_mission_assets_with_repository_internal<R: ResourceRepository>(
             Some(_) => {}
             None => {
                 visual_index_by_id.insert(visual_id, signature);
-                let bundle =
-                    prepare_visual_with_repository_internal(repository, proto, identity_policy)?;
+                let bundle = prepare_visual_with_repository_internal(
+                    repository,
+                    proto,
+                    identity_policy,
+                    &mut texture_cache,
+                )?;
                 if bundle.visual.id != visual_id {
                     // Defensive check. stable IDs are deterministic for the same inputs.
                     return Err(AssetError::InvalidPrototype(
@@ -1380,10 +1385,14 @@ pub fn prepare_visual_with_repository<R: ResourceRepository>(
     repository: &R,
     proto: &EffectivePrototype,
 ) -> Result<PreparedVisual, AssetError> {
-    Ok(
-        prepare_visual_with_repository_internal(repository, proto, AssetIdentityPolicy::default())?
-            .visual,
-    )
+    let mut texture_cache = TexturePreparationCache::default();
+    Ok(prepare_visual_with_repository_internal(
+        repository,
+        proto,
+        AssetIdentityPolicy::default(),
+        &mut texture_cache,
+    )?
+    .visual)
 }
 
 struct PreparedVisualBundle {
@@ -1394,12 +1403,19 @@ struct PreparedVisualBundle {
     textures: Vec<PreparedTexture>,
 }
 
+#[derive(Default)]
+struct TexturePreparationCache {
+    diffuse: HashMap<Vec<u8>, PreparedTexture>,
+    lightmaps: HashMap<Vec<u8>, PreparedTexture>,
+}
+
 // Keeps the complete model -> WEAR -> material -> texture transaction in one fallible boundary.
 #[allow(clippy::too_many_lines)]
 fn prepare_visual_with_repository_internal<R: ResourceRepository>(
     repository: &R,
     proto: &EffectivePrototype,
     identity_policy: AssetIdentityPolicy,
+    texture_cache: &mut TexturePreparationCache,
 ) -> Result<PreparedVisualBundle, AssetError> {
     let PrototypeGeometry::Mesh(mesh_key) = &proto.geometry else {
         return Ok(PreparedVisualBundle {
@@ -1483,11 +1499,12 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
         });
 
         for texture in texture_requests {
-            let prepared_texture = prepare_texture(
+            let prepared_texture = prepare_texture_cached(
                 repository,
                 &texture,
                 PreparedTextureUsage::Diffuse,
                 identity_policy,
+                texture_cache,
             )?;
             texture_ids.push(prepared_texture.id);
             prepared_textures.push(prepared_texture);
@@ -1496,11 +1513,12 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
     }
 
     for lightmap in &wear.lightmaps {
-        let prepared_lightmap = prepare_texture(
+        let prepared_lightmap = prepare_texture_cached(
             repository,
             &lightmap.lightmap,
             PreparedTextureUsage::Lightmap,
             identity_policy,
+            texture_cache,
         )?;
         lightmap_ids.push(prepared_lightmap.id);
         prepared_textures.push(prepared_lightmap);
@@ -1783,6 +1801,25 @@ fn prepare_texture<R: ResourceRepository>(
         texm,
         usage,
     })
+}
+
+fn prepare_texture_cached<R: ResourceRepository>(
+    repository: &R,
+    name: &ResourceName,
+    usage: PreparedTextureUsage,
+    identity_policy: AssetIdentityPolicy,
+    cache: &mut TexturePreparationCache,
+) -> Result<PreparedTexture, AssetError> {
+    let entries = match usage {
+        PreparedTextureUsage::Diffuse => &mut cache.diffuse,
+        PreparedTextureUsage::Lightmap => &mut cache.lightmaps,
+    };
+    if let Some(texture) = entries.get(&name.0) {
+        return Ok(texture.clone());
+    }
+    let texture = prepare_texture(repository, name, usage, identity_policy)?;
+    entries.insert(name.0.clone(), texture.clone());
+    Ok(texture)
 }
 
 fn resolve_texm<R: ResourceRepository>(
@@ -2423,6 +2460,43 @@ mod tests {
         assert_eq!(visual.material_ids, vec![assets.materials[0].id]);
         assert_eq!(visual.texture_ids.len(), 1);
         assert_eq!(visual.lightmap_ids.len(), 1);
+    }
+
+    #[test]
+    fn texture_preparation_cache_reuses_exact_request_within_one_mission() {
+        let texm = texm_payload();
+        let repo = repository_with_archives_meta(&[(
+            TEXTURES_ARCHIVE,
+            &[TestNresEntry {
+                name: b"TEX_A",
+                payload: &texm,
+                type_id: 0,
+                attr2: 0,
+            }],
+        )]);
+        let name = resource_name(b"TEX_A");
+        let mut cache = TexturePreparationCache::default();
+
+        let first = prepare_texture_cached(
+            &repo,
+            &name,
+            PreparedTextureUsage::Diffuse,
+            AssetIdentityPolicy::default(),
+            &mut cache,
+        )
+        .expect("first texture");
+        let second = prepare_texture_cached(
+            &repo,
+            &name,
+            PreparedTextureUsage::Diffuse,
+            AssetIdentityPolicy::default(),
+            &mut cache,
+        )
+        .expect("cached texture");
+
+        assert_eq!(first.id, second.id);
+        assert_eq!(cache.diffuse.len(), 1);
+        assert!(cache.lightmaps.is_empty());
     }
 
     #[test]
