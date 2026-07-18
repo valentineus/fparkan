@@ -62,6 +62,21 @@ sentinel records. Поэтому `ScriptInstruction::dispatch_selector()` воз
 (`Handler(0)`, VA `0x10008034`) только устанавливает current context и flag
 `+0x50 = 1`; это не даёт ему игрового имени и не заменяет runtime trace.
 
+`Handler(1)` — второй table entry, VA `0x10007fd0`, — не создаёт игровую
+команду. Он сохраняет active VM context, берёт один instruction-derived index
+через current event/instruction offsets `+0x48/+0x4c`, а затем разрешает его
+в varset object по `this + 0x18`. Resolver `0x10002d30` проверяет
+`0 <= index < count` и возвращает record `base + index * 0x30`; invalid index
+вызывает C++ exception, а не становится нулём. Полученный 48-byte record
+передаётся в `0x10013190`, который возвращает x87 floating result: kinds `0`
+и `4` идут через отдельный opaque conversion path, kind `1` — signed integer,
+kind `2` выбирает одну из двух static scalar constants по нулевости payload,
+kind `3` — float, kind `5` — unsigned integer; остальные и пустые cases дают
+один fixed fallback scalar. Это доказанный numeric
+bridge для VM, но пока не Rust handler: неизвестны точный disk operand slot,
+ownership значения на FPU stack и следующий consumer, поэтому нельзя назвать
+его арифметическим opcode или silently заменить portable `f32` execution.
+
 `Handler(2)` (третья entry table, VA `0x10009610`) уже имеет статический
 contract, но ещё не Rust execution: он выбирает active event/instruction через
 runtime offsets `+0x48/+0x4c`, разрешает семь 32-bit slots через varset object
