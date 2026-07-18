@@ -1750,6 +1750,18 @@ state, not a persistent cache identity or a WEAR row. The observation narrows
 the next terrain task to profiling the cache's generated entries and their
 consumer; it still does not establish a Land1 blend equation.
 
+The probe now also reads the bounded eight-byte entry table and only hashes
+the fixed 212-byte profile banks it observes; raw process bytes never enter
+the repository. The same AutoDemo cache had 3,426 materialized record pointers
+among 3,462 entries and referenced banks `0..4`. Two consecutive captures
+kept that count, bank set, and all five FNV-1a-64 bank hashes stable:
+`9426539192111566946`, `2915543853261903601`, `13156371703608727216`,
+`11280405573172155968`, and `18234288329145104612`. Their result views changed
+from `0x008A565C` to `0x008A55A8`. Thus the generated cache/profile state is
+stable over these render samples while the shared result view is not. This
+still identifies neither the record-field semantics nor the final terrain
+blend/pass operation.
+
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File `
   tools\capture-terrain-shade-cache.ps1 -ProcessId <iron_3d-pid>

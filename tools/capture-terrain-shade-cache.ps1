@@ -78,6 +78,17 @@ public static class FparkanTerrainShadeProbe {
         }
         return -1;
     }
+
+    public static ulong Fnv1a64(byte[] bytes, int offset, int length) {
+        ulong hash = 14695981039346656037UL;
+        unchecked {
+            for (int index = offset; index < offset + length; index++) {
+                hash ^= bytes[index];
+                hash *= 1099511628211UL;
+            }
+        }
+        return hash;
+    }
 }
 '@
 
@@ -175,6 +186,45 @@ function Find-ShadeCache {
     return $null
 }
 
+function Get-ShadeCacheSummary {
+    param([IntPtr]$Process, [Int64]$Cache, [byte[]]$Header)
+    $entryTable = [BitConverter]::ToUInt32($Header, 316)
+    $entryCount = [BitConverter]::ToUInt32($Header, 320)
+    $summary = [ordered]@{
+        materialized_entries = $null
+        profile_banks = @()
+    }
+    # The count field is runtime data. Keep a hard observer bound so a corrupt
+    # or stale candidate cannot turn a passive sample into an excessive read.
+    if ($entryTable -lt 0x1000 -or $entryCount -gt 100000) { return $summary }
+    $entryBytes = Read-Bytes $Process $entryTable ([int]($entryCount * 8))
+    if ($null -eq $entryBytes) { return $summary }
+    $materialized = 0
+    $banks = [System.Collections.Generic.SortedSet[int]]::new()
+    for ($index = 0; $index -lt $entryCount; $index++) {
+        $offset = $index * 8
+        if ([BitConverter]::ToUInt32($entryBytes, $offset) -ge 0x1000) {
+            $materialized++
+            [void]$banks.Add([int]$entryBytes[$offset + 4])
+        }
+    }
+    $summary.materialized_entries = $materialized
+    if ($banks.Count -eq 0) { return $summary }
+    $maxBank = $banks.Max
+    if ($maxBank -ge 100) { return $summary }
+    $bankBytes = Read-Bytes $Process ($Cache + 332) (($maxBank + 1) * 212)
+    if ($null -eq $bankBytes) { return $summary }
+    $profiles = [System.Collections.Generic.List[object]]::new()
+    foreach ($bank in $banks) {
+        $profiles.Add([ordered]@{
+            bank = $bank
+            fnv1a64 = [FparkanTerrainShadeProbe]::Fnv1a64($bankBytes, $bank * 212, 212).ToString()
+        })
+    }
+    $summary.profile_banks = @($profiles)
+    return $summary
+}
+
 if ($SearchEnd -le $SearchStart) { throw 'SearchEnd must exceed SearchStart' }
 $terrainBase = Get-TerrainModuleBase $ProcessId
 $process = [FparkanTerrainShadeProbe]::OpenProcess(
@@ -194,6 +244,7 @@ try {
         if ($null -ne $cache) {
             $header = Read-Bytes $process $cache 324
             if ($null -ne $header) {
+                $summary = Get-ShadeCacheSummary $process $cache $header
                 [ordered]@{
                     schema = 'fparkan-terrain-shade-cache-v1'
                     process_id = $ProcessId
@@ -203,6 +254,8 @@ try {
                     result_view = ('0x{0:X8}' -f [BitConverter]::ToUInt32($header, 24))
                     entry_table = ('0x{0:X8}' -f [BitConverter]::ToUInt32($header, 316))
                     entry_count = [BitConverter]::ToUInt32($header, 320)
+                    materialized_entries = $summary.materialized_entries
+                    profile_banks = $summary.profile_banks
                     scan_attempt = $attempt
                 } | ConvertTo-Json -Compress
                 exit 0
