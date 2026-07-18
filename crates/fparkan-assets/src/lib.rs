@@ -48,6 +48,7 @@ use std::sync::Arc;
 
 const TEXTURES_ARCHIVE: &str = "textures.lib";
 const LIGHTMAP_ARCHIVE: &str = "lightmap.lib";
+const VISUAL_DEPENDENCY_PROGRESS_INTERVAL: usize = 64;
 
 /// Canonical terrain archive paths derived from a mission land reference.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -477,6 +478,15 @@ pub enum VisualDependencyPhase {
     Material,
     /// Validate diffuse TEXM textures and lightmaps.
     Texture,
+}
+
+/// Throttled visual-dependency expansion progress.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VisualDependencyProgress {
+    /// Dependency class currently being expanded.
+    pub phase: VisualDependencyPhase,
+    /// Number of requests reached in this class during the current expansion.
+    pub request_count: usize,
 }
 
 /// Errors raised while preparing CPU-side assets.
@@ -1138,6 +1148,39 @@ pub fn extend_graph_report_with_visual_dependencies_and_progress<R: ResourceRepo
     prototypes: &[EffectivePrototype],
     mut on_phase: impl FnMut(VisualDependencyPhase),
 ) {
+    let mut last_phase = None;
+    extend_graph_report_with_visual_dependencies_with_progress(
+        repository,
+        report,
+        graph,
+        prototypes,
+        |progress| {
+            if last_phase != Some(progress.phase) {
+                on_phase(progress.phase);
+                last_phase = Some(progress.phase);
+            }
+        },
+    );
+}
+
+/// Extends a prototype dependency report with throttled request progress.
+///
+/// The callback receives each dependency-class entrance, its first request,
+/// and every subsequent multiple of 64 requests. Graph traversal, edge order
+/// and validation remain unchanged.
+///
+/// # Panics
+///
+/// Panics only if the hard-coded, host-compatible `material.lib` path stops
+/// satisfying the path policy, which indicates a programming error in this module.
+#[allow(clippy::too_many_lines)]
+pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRepository>(
+    repository: &R,
+    report: &mut PrototypeGraphReport,
+    graph: &mut PrototypeGraph,
+    prototypes: &[EffectivePrototype],
+    mut on_progress: impl FnMut(VisualDependencyProgress),
+) {
     if graph.visual_dependencies_expanded {
         return;
     }
@@ -1159,6 +1202,9 @@ pub fn extend_graph_report_with_visual_dependencies_and_progress<R: ResourceRepo
     let mut diffuse_texture_validation = HashMap::new();
     let mut lightmap_texture_validation = HashMap::new();
     let mut material_validation = HashMap::new();
+    let mut wear_requests = 0usize;
+    let mut material_requests = 0usize;
+    let mut texture_requests = 0usize;
 
     for (prototype_index, prototype) in prototypes.iter().enumerate() {
         let PrototypeGeometry::Mesh(mesh) = &prototype.geometry else {
@@ -1174,7 +1220,12 @@ pub fn extend_graph_report_with_visual_dependencies_and_progress<R: ResourceRepo
         let mesh_parent_edge = mesh_edge_id(graph, prototype_node_id);
         let root_index = root_index_for_prototype(graph, prototype_index);
 
-        on_phase(VisualDependencyPhase::Wear);
+        wear_requests = wear_requests.saturating_add(1);
+        report_visual_dependency_progress(
+            &mut on_progress,
+            VisualDependencyPhase::Wear,
+            wear_requests,
+        );
         match resolve_wear_table(repository, mesh) {
             Ok(table) => {
                 report.wear_resolved_count += 1;
@@ -1213,8 +1264,17 @@ pub fn extend_graph_report_with_visual_dependencies_and_progress<R: ResourceRepo
                     &mut next_edge,
                 );
                 report.material_slot_count += table.entries.len();
-                on_phase(VisualDependencyPhase::Material);
+                on_progress(VisualDependencyProgress {
+                    phase: VisualDependencyPhase::Material,
+                    request_count: material_requests,
+                });
                 for (material_index, _entry) in table.entries.iter().enumerate() {
+                    material_requests = material_requests.saturating_add(1);
+                    report_visual_dependency_progress(
+                        &mut on_progress,
+                        VisualDependencyPhase::Material,
+                        material_requests,
+                    );
                     let Ok(material_index) = u16::try_from(material_index) else {
                         push_visual_failure(
                             report,
@@ -1260,7 +1320,12 @@ pub fn extend_graph_report_with_visual_dependencies_and_progress<R: ResourceRepo
                                 &mut next_edge,
                             );
                             for texture in material.document.texture_requests() {
-                                on_phase(VisualDependencyPhase::Texture);
+                                texture_requests = texture_requests.saturating_add(1);
+                                report_visual_dependency_progress(
+                                    &mut on_progress,
+                                    VisualDependencyPhase::Texture,
+                                    texture_requests,
+                                );
                                 report.texture_request_count += 1;
                                 match resolve_texm_validation_cached(
                                     repository,
@@ -1321,7 +1386,12 @@ pub fn extend_graph_report_with_visual_dependencies_and_progress<R: ResourceRepo
                     }
                 }
                 for lightmap in &table.lightmaps {
-                    on_phase(VisualDependencyPhase::Texture);
+                    texture_requests = texture_requests.saturating_add(1);
+                    report_visual_dependency_progress(
+                        &mut on_progress,
+                        VisualDependencyPhase::Texture,
+                        texture_requests,
+                    );
                     report.lightmap_request_count += 1;
                     match resolve_texm_validation_cached(
                         repository,
@@ -1382,6 +1452,19 @@ pub fn extend_graph_report_with_visual_dependencies_and_progress<R: ResourceRepo
         }
     }
     graph.visual_dependencies_expanded = true;
+}
+
+fn report_visual_dependency_progress(
+    on_progress: &mut impl FnMut(VisualDependencyProgress),
+    phase: VisualDependencyPhase,
+    request_count: usize,
+) {
+    if request_count == 1 || request_count.is_multiple_of(VISUAL_DEPENDENCY_PROGRESS_INTERVAL) {
+        on_progress(VisualDependencyProgress {
+            phase,
+            request_count,
+        });
+    }
 }
 
 fn push_graph_resource_node(
@@ -2199,6 +2282,36 @@ mod tests {
     use fparkan_resource::{resource_name, CachedResourceRepository};
     use fparkan_vfs::{DirectoryVfs, MemoryVfs, Vfs};
     use std::path::PathBuf;
+
+    #[test]
+    fn visual_dependency_progress_is_throttled_at_fixed_request_intervals() {
+        let mut progress = Vec::new();
+        for request_count in 1..=129 {
+            report_visual_dependency_progress(
+                &mut |event| progress.push(event),
+                VisualDependencyPhase::Texture,
+                request_count,
+            );
+        }
+
+        assert_eq!(
+            progress,
+            vec![
+                VisualDependencyProgress {
+                    phase: VisualDependencyPhase::Texture,
+                    request_count: 1,
+                },
+                VisualDependencyProgress {
+                    phase: VisualDependencyPhase::Texture,
+                    request_count: 64,
+                },
+                VisualDependencyProgress {
+                    phase: VisualDependencyPhase::Texture,
+                    request_count: 128,
+                },
+            ]
+        );
+    }
 
     #[test]
     fn count_only_plan_uses_graph_requests() {

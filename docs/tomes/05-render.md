@@ -1097,9 +1097,18 @@ separate profiling and compatibility target.
 `GraphVisuals` is now split observationally into `GraphVisualWears`,
 `GraphVisualMaterials` and `GraphVisualTextures`; it preserves the existing
 graph traversal, edge order and validation semantics. Repeating the controlled
-180-second Part 2 probe ended at `GraphVisualTextures`. Thus Part 2 had passed
-WEAR and MAT0 expansion before timeout; its remaining bottleneck is TEXM
-validation/archive work, not Vulkan submission or the base prototype graph.
+180-second Part 2 probe once ended at `GraphVisualTextures`. That particular
+execution had passed WEAR and MAT0 expansion before timeout, but a checkpoint
+is only the last phase reached in one run: it is not proof of a single global
+bottleneck or of Vulkan involvement.
+
+Visual expansion now reports each dependency-class entrance, its first request
+and every 64th later request; this is diagnostic-only and does not alter
+traversal, edges or validation. A
+later controlled 180-second Part 2 probe ended at `GraphVisualMaterials`,
+before the first TEXM progress marker. The differing checkpoints rule out the
+previous overly narrow claim that TEXM is the sole remaining target. Profiling
+must compare WEAR, MAT0, TEXM, graph allocation and archive I/O quantitatively.
 
 Mission loading now raises the decoded-payload cache entry budget from 64 to
 256 while retaining its 64 MiB byte budget. This avoids premature entry-count

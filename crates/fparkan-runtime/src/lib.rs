@@ -22,7 +22,7 @@
 
 use fparkan_assets::{
     decode_mission_land_path, decode_mission_payload, decode_nres_payload,
-    derive_mission_land_paths, extend_graph_report_with_visual_dependencies_and_progress,
+    derive_mission_land_paths, extend_graph_report_with_visual_dependencies_with_progress,
     prepare_terrain_world, AssetError as AssetPreparationError, AssetId, AssetManager,
     AssetPreparationPhase, BuildCategory, MissionAssetPlan, MissionDocument, MissionError,
     MissionTerrainPaths, NresError, PreparedVisual, TerrainFormatError, TerrainPreparationError,
@@ -127,6 +127,8 @@ pub enum MissionLoadPhase {
     GraphVisualMaterials,
     /// Validate TEXM documents while expanding visual dependencies.
     GraphVisualTextures,
+    /// Progress marker emitted after each 64 TEXM validation requests.
+    GraphVisualTextureRequests(usize),
     /// Prepare all reachable visual/resource dependencies.
     Assets,
     /// Decode and validate MSH model meshes.
@@ -706,13 +708,13 @@ fn load_mission_with_options_and_progress(
         build_prototype_graph_report(&repository, vfs.as_ref(), scoped_graph_roots);
     record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::GraphVisuals);
     let mut last_graph_visual_phase = None;
-    extend_graph_report_with_visual_dependencies_and_progress(
+    extend_graph_report_with_visual_dependencies_with_progress(
         &repository,
         &mut prototype_report,
         &mut prototype_graph,
         &resolved_prototypes,
-        |phase| {
-            let runtime_phase = match phase {
+        |progress| {
+            let runtime_phase = match progress.phase {
                 VisualDependencyPhase::Wear => MissionLoadPhase::GraphVisualWears,
                 VisualDependencyPhase::Material => MissionLoadPhase::GraphVisualMaterials,
                 VisualDependencyPhase::Texture => MissionLoadPhase::GraphVisualTextures,
@@ -720,6 +722,13 @@ fn load_mission_with_options_and_progress(
             if last_graph_visual_phase != Some(runtime_phase) {
                 record_load_phase(&mut trace, &mut on_phase, runtime_phase);
                 last_graph_visual_phase = Some(runtime_phase);
+            }
+            if progress.phase == VisualDependencyPhase::Texture && progress.request_count > 1 {
+                record_load_phase(
+                    &mut trace,
+                    &mut on_phase,
+                    MissionLoadPhase::GraphVisualTextureRequests(progress.request_count),
+                );
             }
         },
     );
