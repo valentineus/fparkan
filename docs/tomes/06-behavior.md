@@ -314,6 +314,22 @@ Licensed test на GOG `Autodemo.00` запускает этот путь для
 доказывает связывание current runtime data, но не доказывает семантику
 оригинального движения.
 
+Путь доступен и через самостоятельный composition root:
+
+```powershell
+fparkan-headless --root "C:\GOG Games\Parkan - Iron Strategy" `
+  --mission MISSIONS/Autodemo.00/data.tma `
+  --move-object 0 419.10318 717.433 0.25 --ticks 1
+```
+
+`--move-object` принимает original object ID, target X/Y и maximum step;
+требует `--root` и `--mission`, допускается один раз за запуск и отвергает
+non-finite/неположительный шаг ещё при разборе аргументов. Приложение печатает
+`reached`, затем normal headless tick/hash. Проверка на GOG 18 июля 2026 года
+загрузила 8 objects, 343 areals и 3 174 terrain surfaces без graph failures;
+команда для объекта `0` вернула `reached=false`, что подтверждает именно
+ограниченный шаг, а не телепортацию к цели.
+
 ### Различия Control в Части 2
 
 `Control.dll` пересобрана при неизменных размере, imports и пяти именах/ordinals

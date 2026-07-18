@@ -22,10 +22,11 @@
 //! `FParkan` headless runtime entrypoint.
 
 use fparkan_runtime::{
-    create, load_mission, step_headless, EngineConfig, EngineMode, EngineServices, MissionRequest,
+    advance_reference_movement, create, load_mission, step_headless, EngineConfig, EngineMode,
+    EngineServices, MissionRequest,
 };
 use fparkan_vfs::DirectoryVfs;
-use fparkan_world::InputSnapshot;
+use fparkan_world::{InputSnapshot, OriginalObjectId};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -68,6 +69,19 @@ fn run() -> Result<(), String> {
             loaded.graph_failure_count
         );
     }
+    if let Some(movement) = args.reference_movement {
+        let reached = advance_reference_movement(
+            &mut engine,
+            OriginalObjectId(movement.original_id),
+            movement.target_xy,
+            movement.max_step,
+        )
+        .map_err(|err| format!("{err}"))?;
+        println!(
+            "reference_movement original_id={} target_xy=[{},{}] max_step={} reached={reached}",
+            movement.original_id, movement.target_xy[0], movement.target_xy[1], movement.max_step,
+        );
+    }
     let mut last = None;
     for _ in 0..args.ticks {
         last = Some(step_headless(&mut engine, InputSnapshot).map_err(|err| format!("{err}"))?);
@@ -81,10 +95,19 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug)]
 struct Args {
     root: Option<PathBuf>,
     mission: Option<String>,
     ticks: u64,
+    reference_movement: Option<ReferenceMovement>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ReferenceMovement {
+    original_id: u32,
+    target_xy: [f32; 2],
+    max_step: f32,
 }
 
 impl Args {
@@ -93,6 +116,7 @@ impl Args {
             root: None,
             mission: None,
             ticks: 1,
+            reference_movement: None,
         };
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
@@ -118,16 +142,121 @@ impl Args {
                         .parse()
                         .map_err(|_| "--ticks must be an integer".to_string())?;
                 }
+                "--move-object" => {
+                    if parsed.reference_movement.is_some() {
+                        return Err("--move-object may be specified once".to_string());
+                    }
+                    let original_id = iter
+                        .next()
+                        .ok_or_else(|| "--move-object requires an original object id".to_string())?
+                        .parse()
+                        .map_err(|_| {
+                            "--move-object object id must be an unsigned integer".to_string()
+                        })?;
+                    let x = parse_finite_argument(
+                        iter.next(),
+                        "--move-object requires a finite X target",
+                    )?;
+                    let y = parse_finite_argument(
+                        iter.next(),
+                        "--move-object requires a finite Y target",
+                    )?;
+                    let max_step = parse_finite_argument(
+                        iter.next(),
+                        "--move-object requires a finite positive maximum step",
+                    )?;
+                    if max_step <= 0.0 {
+                        return Err("--move-object maximum step must be positive".to_string());
+                    }
+                    parsed.reference_movement = Some(ReferenceMovement {
+                        original_id,
+                        target_xy: [x, y],
+                        max_step,
+                    });
+                }
                 _ => return Err(usage()),
             }
         }
         if parsed.mission.is_some() && parsed.root.is_none() {
             return Err("--mission requires --root".to_string());
         }
+        if parsed.reference_movement.is_some() && parsed.mission.is_none() {
+            return Err("--move-object requires --mission".to_string());
+        }
         Ok(parsed)
     }
 }
 
+fn parse_finite_argument(value: Option<&String>, error: &str) -> Result<f32, String> {
+    let value: f32 = value
+        .ok_or_else(|| error.to_string())?
+        .parse()
+        .map_err(|_| error.to_string())?;
+    value
+        .is_finite()
+        .then_some(value)
+        .ok_or_else(|| error.to_string())
+}
+
 fn usage() -> String {
-    "usage: fparkan-headless [--root <path> --mission <path>] [--ticks <n>]".to_string()
+    "usage: fparkan-headless [--root <path> --mission <path>] [--move-object <original-id> <x> <y> <max-step>] [--ticks <n>]".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn move_object_parses_a_single_finite_reference_command() {
+        let parsed = Args::parse(&args(&[
+            "--root",
+            "C:/game",
+            "--mission",
+            "MISSIONS/Autodemo.00/data.tma",
+            "--move-object",
+            "7",
+            "12.5",
+            "-3",
+            "0.25",
+            "--ticks",
+            "2",
+        ]))
+        .expect("args");
+        assert_eq!(parsed.ticks, 2);
+        assert_eq!(
+            parsed.reference_movement,
+            Some(ReferenceMovement {
+                original_id: 7,
+                target_xy: [12.5, -3.0],
+                max_step: 0.25,
+            })
+        );
+    }
+
+    #[test]
+    fn move_object_requires_a_loaded_mission_and_valid_step() {
+        assert_eq!(
+            Args::parse(&args(&["--move-object", "7", "1", "2", "1"])).expect_err("mission"),
+            "--move-object requires --mission"
+        );
+        assert_eq!(
+            Args::parse(&args(&[
+                "--root",
+                "C:/game",
+                "--mission",
+                "M/data.tma",
+                "--move-object",
+                "7",
+                "1",
+                "2",
+                "0",
+            ]))
+            .expect_err("step"),
+            "--move-object maximum step must be positive"
+        );
+    }
 }
