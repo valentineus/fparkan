@@ -490,6 +490,10 @@ pub struct VisualDependencyProgress {
     pub phase: VisualDependencyPhase,
     /// Number of requests reached in this class during the current expansion.
     pub request_count: usize,
+    /// Resource graph nodes materialized before this request is resolved.
+    pub graph_node_count: usize,
+    /// Resource graph edges materialized before this request is resolved.
+    pub graph_edge_count: usize,
 }
 
 /// Errors raised while preparing CPU-side assets.
@@ -1239,6 +1243,8 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
             &mut on_progress,
             VisualDependencyPhase::Wear,
             wear_requests,
+            graph.nodes.len(),
+            graph.edges.len(),
         );
         match resolve_wear_table_cached(repository, mesh, &mut wear_validation) {
             Ok(table) => {
@@ -1281,6 +1287,8 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
                 on_progress(VisualDependencyProgress {
                     phase: VisualDependencyPhase::Material,
                     request_count: material_requests,
+                    graph_node_count: graph.nodes.len(),
+                    graph_edge_count: graph.edges.len(),
                 });
                 for (material_index, _entry) in table.entries.iter().enumerate() {
                     material_requests = material_requests.saturating_add(1);
@@ -1288,6 +1296,8 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
                         &mut on_progress,
                         VisualDependencyPhase::Material,
                         material_requests,
+                        graph.nodes.len(),
+                        graph.edges.len(),
                     );
                     let Ok(material_index) = u16::try_from(material_index) else {
                         push_visual_failure(
@@ -1339,6 +1349,8 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
                                     &mut on_progress,
                                     VisualDependencyPhase::Texture,
                                     texture_requests,
+                                    graph.nodes.len(),
+                                    graph.edges.len(),
                                 );
                                 report.texture_request_count += 1;
                                 match resolve_texm_validation_cached(
@@ -1405,6 +1417,8 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
                         &mut on_progress,
                         VisualDependencyPhase::Texture,
                         texture_requests,
+                        graph.nodes.len(),
+                        graph.edges.len(),
                     );
                     report.lightmap_request_count += 1;
                     match resolve_texm_validation_cached(
@@ -1472,11 +1486,15 @@ fn report_visual_dependency_progress(
     on_progress: &mut impl FnMut(VisualDependencyProgress),
     phase: VisualDependencyPhase,
     request_count: usize,
+    graph_node_count: usize,
+    graph_edge_count: usize,
 ) {
     if request_count == 1 || request_count.is_multiple_of(VISUAL_DEPENDENCY_PROGRESS_INTERVAL) {
         on_progress(VisualDependencyProgress {
             phase,
             request_count,
+            graph_node_count,
+            graph_edge_count,
         });
     }
 }
@@ -2320,6 +2338,8 @@ mod tests {
                 &mut |event| progress.push(event),
                 VisualDependencyPhase::Texture,
                 request_count,
+                37,
+                41,
             );
         }
 
@@ -2329,14 +2349,20 @@ mod tests {
                 VisualDependencyProgress {
                     phase: VisualDependencyPhase::Texture,
                     request_count: 1,
+                    graph_node_count: 37,
+                    graph_edge_count: 41,
                 },
                 VisualDependencyProgress {
                     phase: VisualDependencyPhase::Texture,
                     request_count: 64,
+                    graph_node_count: 37,
+                    graph_edge_count: 41,
                 },
                 VisualDependencyProgress {
                     phase: VisualDependencyPhase::Texture,
                     request_count: 128,
+                    graph_node_count: 37,
+                    graph_edge_count: 41,
                 },
             ]
         );

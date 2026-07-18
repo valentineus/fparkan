@@ -1126,6 +1126,13 @@ termination. It does not preserve the simultaneous TEXM count, so it neither
 identifies a slow individual material nor attributes time to MAT0 parsing; the
 next profiler revision needs one cumulative snapshot of all classes.
 
+Visual MAT0/TEXM request markers now also carry the graph node and edge counts
+materialized immediately before that request resolves. A rebuilt bounded Part 2
+probe recorded MAT0 request 3 at 52 nodes / 51 edges and request 4 at 55 nodes
+/ 54 edges. These are observational snapshots for graph-growth profiling only:
+they do not change traversal order, node or edge identities, provenance,
+validation, cache semantics, or rendering.
+
 `fparkan-game --load-progress` now initializes its file with `Starting` and
 appends each later mission-load event instead of replacing the prior line. A
 bounded probe can therefore retain both MAT0 and TEXM request milestones even

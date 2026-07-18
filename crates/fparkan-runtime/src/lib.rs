@@ -126,11 +126,25 @@ pub enum MissionLoadPhase {
     /// Resolve MAT0 documents while expanding visual dependencies.
     GraphVisualMaterials,
     /// Progress marker emitted after each 64 MAT0 validation requests.
-    GraphVisualMaterialRequests(usize),
+    GraphVisualMaterialRequests {
+        /// Number of MAT0 validation requests started.
+        request_count: usize,
+        /// Graph nodes materialized before the request.
+        graph_node_count: usize,
+        /// Graph edges materialized before the request.
+        graph_edge_count: usize,
+    },
     /// Validate TEXM documents while expanding visual dependencies.
     GraphVisualTextures,
     /// Progress marker emitted after each 64 TEXM validation requests.
-    GraphVisualTextureRequests(usize),
+    GraphVisualTextureRequests {
+        /// Number of TEXM validation requests started.
+        request_count: usize,
+        /// Graph nodes materialized before the request.
+        graph_node_count: usize,
+        /// Graph edges materialized before the request.
+        graph_edge_count: usize,
+    },
     /// Prepare all reachable visual/resource dependencies.
     Assets,
     /// Decode and validate MSH model meshes.
@@ -728,12 +742,20 @@ fn load_mission_with_options_and_progress(
             if progress.request_count > 1 {
                 let request_phase = match progress.phase {
                     VisualDependencyPhase::Wear => None,
-                    VisualDependencyPhase::Material => Some(
-                        MissionLoadPhase::GraphVisualMaterialRequests(progress.request_count),
-                    ),
-                    VisualDependencyPhase::Texture => Some(
-                        MissionLoadPhase::GraphVisualTextureRequests(progress.request_count),
-                    ),
+                    VisualDependencyPhase::Material => {
+                        Some(MissionLoadPhase::GraphVisualMaterialRequests {
+                            request_count: progress.request_count,
+                            graph_node_count: progress.graph_node_count,
+                            graph_edge_count: progress.graph_edge_count,
+                        })
+                    }
+                    VisualDependencyPhase::Texture => {
+                        Some(MissionLoadPhase::GraphVisualTextureRequests {
+                            request_count: progress.request_count,
+                            graph_node_count: progress.graph_node_count,
+                            graph_edge_count: progress.graph_edge_count,
+                        })
+                    }
                 };
                 if let Some(request_phase) = request_phase {
                     record_load_phase(&mut trace, &mut on_phase, request_phase);

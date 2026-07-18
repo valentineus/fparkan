@@ -1089,14 +1089,18 @@ mod tests {
         write_load_progress(
             &path,
             std::time::Duration::from_millis(34),
-            MissionLoadPhase::GraphVisualMaterialRequests(64),
+            MissionLoadPhase::GraphVisualMaterialRequests {
+                request_count: 64,
+                graph_node_count: 128,
+                graph_edge_count: 192,
+            },
         )?;
         let progress = std::fs::read_to_string(&path).map_err(|err| err.to_string())?;
         std::fs::remove_file(&path).map_err(|err| err.to_string())?;
 
         assert_eq!(
             progress,
-            "Starting\telapsed_ms=0\nGraphVisualMaterials\telapsed_ms=12\nGraphVisualMaterialRequests(64)\telapsed_ms=34\n"
+            "Starting\telapsed_ms=0\nGraphVisualMaterials\telapsed_ms=12\nGraphVisualMaterialRequests { request_count: 64, graph_node_count: 128, graph_edge_count: 192 }\telapsed_ms=34\n"
         );
         Ok(())
     }
