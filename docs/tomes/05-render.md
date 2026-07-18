@@ -916,6 +916,15 @@ prepared visual сохраняет один compatibility fallback draw. Это 
 multi-component prototype graph для будущего real Vulkan renderer, однако
 текущий game app всё ещё использует planning backend и triangle ranges.
 
+### Mission position/scale render bridge
+
+`fparkan-game` now maps preserved TMA position and non-uniform scale into each
+backend-neutral draw matrix instead of diagnostic index placement. Raw
+orientation deliberately remains uninterpreted: the original Euler order and
+matrix convention are not yet proven. This preserves authored values without
+inventing transform math; the app still uses planning backend and triangle
+ranges, so it is not a full renderer claim.
+
 `Land.msh` использует отдельный geometry-only bridge: validated `TerrainFace28`
 сохраняет source triangle order, а его positions и packed UV0 попадают в тот же
 static vertex/index upload path. Для текущего диагностического viewer XZ bounds

@@ -32,7 +32,7 @@ use fparkan_render::{
 use fparkan_render_vulkan::VulkanPlanningBackend;
 use fparkan_runtime::{
     create, frame, load_mission, loaded_mission_assets, EngineConfig, EngineMode, EngineServices,
-    MissionAssets, MissionRequest,
+    MissionAssets, MissionObjectDraft, MissionRequest,
 };
 use fparkan_vfs::DirectoryVfs;
 use fparkan_world::WorldSnapshot;
@@ -85,8 +85,10 @@ fn run(args: &[String]) -> Result<String, String> {
         last_tick = result.snapshot.tick.0;
         last_hash = result.snapshot.hash.0;
         let mission_assets = loaded_mission_assets(&engine);
-        let commands = render_snapshot_commands_with_assets(&result.snapshot, mission_assets)
-            .map_err(|err| format!("render snapshot: {err}"))?;
+        let mission_drafts = fparkan_runtime::loaded_mission_object_drafts(&engine);
+        let commands =
+            render_snapshot_commands_with_assets(&result.snapshot, mission_assets, mission_drafts)
+                .map_err(|err| format!("render snapshot: {err}"))?;
         last_draw_count = commands
             .commands
             .iter()
@@ -114,20 +116,22 @@ fn run(args: &[String]) -> Result<String, String> {
 
 #[cfg(test)]
 fn render_snapshot_commands(snapshot: &WorldSnapshot) -> Result<RenderCommandList, String> {
-    render_snapshot_commands_with_assets(snapshot, None)
+    render_snapshot_commands_with_assets(snapshot, None, None)
 }
 
 fn render_snapshot_commands_with_assets(
     snapshot: &WorldSnapshot,
     mission_assets: Option<&MissionAssets>,
+    mission_drafts: Option<&[MissionObjectDraft]>,
 ) -> Result<RenderCommandList, String> {
-    let render_snapshot = render_snapshot_with_assets(snapshot, mission_assets);
+    let render_snapshot = render_snapshot_with_assets(snapshot, mission_assets, mission_drafts);
     build_commands(&render_snapshot, RenderProfile::default()).map_err(|err| err.to_string())
 }
 
 fn render_snapshot_with_assets(
     snapshot: &WorldSnapshot,
     mission_assets: Option<&MissionAssets>,
+    mission_drafts: Option<&[MissionObjectDraft]>,
 ) -> RenderSnapshot {
     let mut draws = Vec::with_capacity(snapshot.objects.len());
     for (index, handle) in snapshot.objects.iter().enumerate() {
@@ -168,7 +172,12 @@ fn render_snapshot_with_assets(
                 material_slots: vec![material],
                 material_index: 0,
                 pipeline_state: fparkan_render::LegacyPipelineState::default(),
-                transform: identity_transform(index_to_f32(index)),
+                transform: mission_drafts
+                    .and_then(|drafts| drafts.get(index))
+                    .map_or_else(
+                        || identity_transform(index_to_f32(index)),
+                        mission_position_scale_transform,
+                    ),
                 range: IndexRange { start: 0, count: 3 },
                 stable_order,
             });
@@ -178,6 +187,27 @@ fn render_snapshot_with_assets(
         camera: CameraSnapshot::default(),
         draws,
     }
+}
+
+fn mission_position_scale_transform(draft: &MissionObjectDraft) -> [f32; 16] {
+    [
+        draft.scale[0],
+        0.0,
+        0.0,
+        draft.position[0],
+        0.0,
+        draft.scale[1],
+        0.0,
+        draft.position[1],
+        0.0,
+        0.0,
+        draft.scale[2],
+        draft.position[2],
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ]
 }
 
 fn identity_transform(x: f32) -> [f32; 16] {
@@ -362,7 +392,7 @@ mod tests {
             object_visuals: vec![vec![AssetId::new(101), AssetId::new(102)]],
             ..MissionAssets::default()
         };
-        let commands = render_snapshot_commands_with_assets(&snapshot, Some(&assets))?;
+        let commands = render_snapshot_commands_with_assets(&snapshot, Some(&assets), None)?;
         let draws: Vec<_> = commands
             .commands
             .iter()
@@ -378,6 +408,24 @@ mod tests {
         assert_eq!(draws[1].material, GpuMaterialId(202));
         assert_ne!(draws[0].stable_order, draws[1].stable_order);
         Ok(())
+    }
+
+    #[test]
+    fn render_snapshot_uses_mission_position_and_scale_without_interpreting_orientation() {
+        let draft = MissionObjectDraft {
+            original_id: None,
+            resource_name_raw: Vec::new(),
+            identity_or_clan_raw: 0,
+            position: [10.0, 20.0, 30.0],
+            orientation_raw: [1.0, 2.0, 3.0],
+            scale: [2.0, 3.0, 4.0],
+            visual_ids: Vec::new(),
+            properties: Vec::new(),
+        };
+        assert_eq!(
+            mission_position_scale_transform(&draft),
+            [2.0, 0.0, 0.0, 10.0, 0.0, 3.0, 0.0, 20.0, 0.0, 0.0, 4.0, 30.0, 0.0, 0.0, 0.0, 1.0,]
+        );
     }
 
     fn prepared_visual(id: u64, material: u64) -> PreparedVisual {
