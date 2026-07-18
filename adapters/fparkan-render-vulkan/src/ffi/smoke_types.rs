@@ -457,6 +457,8 @@ pub struct VulkanSmokeRendererReport {
     pub swapchain_extent: (u32, u32),
     /// Current swapchain image count.
     pub swapchain_image_count: u32,
+    /// Current swapchain image format as a raw Vulkan enum value.
+    pub swapchain_image_format: i32,
     /// Current swapchain image-usage flags as raw Vulkan bits.
     pub swapchain_image_usage: u32,
     /// Number of submitted swapchain image-to-buffer copy commands.
