@@ -404,6 +404,7 @@ dependencies = [
  "fparkan-prototype",
  "fparkan-resource",
  "fparkan-runtime",
+ "fparkan-script",
  "fparkan-vfs",
  "serde",
  "serde_json",
@@ -610,6 +611,13 @@ dependencies = [
  "fparkan-terrain",
  "fparkan-vfs",
  "fparkan-world",
+]
+
+[[package]]
+name = "fparkan-script"
+version = "0.1.0"
+dependencies = [
+ "fparkan-binary",
 ]
 
 [[package]]

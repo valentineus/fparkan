@@ -48,6 +48,7 @@ const MISSION_INSPECT_SCHEMA: &str = "fparkan-mission-inspect-v1";
 const TERRAIN_INSPECT_SCHEMA: &str = "fparkan-terrain-inspect-v1";
 const MODEL_INSPECT_SCHEMA: &str = "fparkan-model-inspect-v1";
 const WEAR_INSPECT_SCHEMA: &str = "fparkan-wear-inspect-v1";
+const SCRIPT_INSPECT_SCHEMA: &str = "fparkan-script-inspect-v1";
 
 #[derive(Serialize)]
 struct ArchiveInspectOutput<'a> {
@@ -226,6 +227,17 @@ struct PrototypeGraphEdgeInspectOutput {
     resource_raw_hex: Option<String>,
 }
 
+#[derive(Serialize)]
+struct ScriptInspectOutput<'a> {
+    schema_version: &'static str,
+    path: &'a str,
+    opcode_handler_count: u32,
+    events: usize,
+    instructions: usize,
+    references: usize,
+    trailing_bytes: usize,
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = run(&args);
@@ -290,8 +302,48 @@ fn run(args: &[String]) -> Result<(), String> {
             let rest = strip_format_json(rest)?;
             inspect_model(&rest)
         }
+        [domain, command, rest @ ..] if domain == "script" && command == "inspect" => {
+            let rest = strip_format_json(rest)?;
+            inspect_script(&rest)
+        }
         _ => Err(usage()),
     }
+}
+
+fn inspect_script(args: &[String]) -> Result<(), String> {
+    let path = parse_file_path(args, "script inspect")?;
+    let bytes = std::fs::read(&path).map_err(|err| format!("{}: {err}", path.display()))?;
+    let package =
+        fparkan_script::decode(&bytes).map_err(|err| format!("{}: {err}", path.display()))?;
+    let display_path = path.display().to_string();
+    println!("{}", script_inspect_json(&display_path, &package)?);
+    Ok(())
+}
+
+fn script_inspect_json(
+    path: &str,
+    package: &fparkan_script::ScriptPackage,
+) -> Result<String, String> {
+    let instructions = package
+        .events
+        .iter()
+        .map(|event| event.instructions.len())
+        .sum();
+    let references = package
+        .events
+        .iter()
+        .flat_map(|event| &event.instructions)
+        .map(|instruction| instruction.references.len())
+        .sum();
+    serialize_json(&ScriptInspectOutput {
+        schema_version: SCRIPT_INSPECT_SCHEMA,
+        path,
+        opcode_handler_count: package.opcode_handler_count,
+        events: package.events.len(),
+        instructions,
+        references,
+        trailing_bytes: package.trailing_bytes.len(),
+    })
 }
 
 fn exit_code(result: &Result<(), String>) -> i32 {
@@ -769,7 +821,7 @@ fn prototype_graph_requiredness_label(
 }
 
 fn usage() -> String {
-    "usage: fparkan corpus discover|validate --root <path> [--format json] | archive inspect <file> [--format json] | terrain inspect <Land.msh> [--format json] | wear inspect --root <path> --archive <archive> --resource <wear.wea> [--format json] | model inspect --root <path> --archive <archive> --resource <model.msh> [--format json] | prototype inspect --root <path> --key <key> [--format json] | mission graph|inspect --root <path> --mission <path> [--format json]".to_string()
+    "usage: fparkan corpus discover|validate --root <path> [--format json] | archive inspect <file> [--format json] | terrain inspect <Land.msh> [--format json] | wear inspect --root <path> --archive <archive> --resource <wear.wea> [--format json] | model inspect --root <path> --archive <archive> --resource <model.msh> [--format json] | script inspect <file> [--format json] | prototype inspect --root <path> --key <key> [--format json] | mission graph|inspect --root <path> --mission <path> [--format json]".to_string()
 }
 
 #[cfg(test)]
@@ -795,6 +847,16 @@ mod tests {
         assert_eq!(
             strip_format_json(&strings(&["--format", "text"])),
             Err("unsupported output format: text".to_string())
+        );
+    }
+
+    #[test]
+    fn script_inspect_json_has_canonical_field_order() {
+        let package =
+            fparkan_script::decode(&[73, 0, 0, 0, 0, 0, 0, 0]).expect("minimal script package");
+        assert_eq!(
+            script_inspect_json("script.scr", &package),
+            Ok("{\"schema_version\":\"fparkan-script-inspect-v1\",\"path\":\"script.scr\",\"opcode_handler_count\":73,\"events\":0,\"instructions\":0,\"references\":0,\"trailing_bytes\":0}".to_string())
         );
     }
 

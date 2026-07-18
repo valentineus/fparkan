@@ -18,6 +18,7 @@ members = [
     "crates/fparkan-render",
     "crates/fparkan-resource",
     "crates/fparkan-rsli",
+    "crates/fparkan-script",
     "crates/fparkan-runtime",
     "crates/fparkan-terrain",
     "crates/fparkan-terrain-format",

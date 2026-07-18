@@ -10,9 +10,16 @@ messages, teleports, задачи, research и campaign transitions. Точки 
 и `briefing.cfg`.
 
 `.scr` — binary package с version checks, symbol/event sections и offsets;
-полная opcode grammar не доказана. `.fml` — текстовый symbol/formula oracle;
-`varset.var` задаёт `VAR(...)`/`STRING(...)` defaults; `.trf` — NRes tables,
-чей framing подтверждён, а field semantics местами лишь consumer-inferred.
+полная opcode grammar не доказана. Его внешний framing теперь читает
+`fparkan-script`: первый little-endian `u32` является числом required opcode
+handlers, второй — числом event records. Каждый event хранит `name_len`,
+`name_len + 1` raw bytes с обязательным NUL, opaque event word и count вложенных
+records. Вложенный record сохраняет семь `u32` header words (в disk order),
+список `u32` references после шестого header word и trailing seventh word.
+Никакой из этих words ещё не получает semantic name. `.fml` — текстовый
+symbol/formula oracle; `varset.var` задаёт `VAR(...)`/`STRING(...)` defaults;
+`.trf` — NRes tables, чей framing подтверждён, а field semantics местами лишь
+consumer-inferred.
 
 ## Безопасная модель исполнения
 
@@ -31,6 +38,20 @@ instruction dispatcher или jump table `.scr`: bytecode opcode table всё е
 требует отдельного доказательства. Unknown opcode нельзя пропустить как один
 byte: это ломает синхронизацию. Для каждого доказанного opcode фиксируются
 number, size, operands, control flow, effects, errors и минимальный test.
+
+GOG `ai.dll` доказывает этот framing двумя consumer-ами: loader по
+`0x10001000` открывает `<bundle>.scr`, `varset.var`, `<bundle>.fml`, затем
+собирает ровно 73 pointers handlers; `0x10011b20` читает описанную count-driven
+структуру. Команда
+
+```powershell
+cargo run -p fparkan-cli -- script inspect `
+  'C:\GOG Games\Parkan - Iron Strategy\MISSIONS\SCRIPTS\c1m2p.scr' --format json
+```
+
+на исходном пакете возвращает `opcode_handler_count=73`, 9 events, 17 nested
+records, 20 references и 0 trailing bytes. Это corpus evidence для reader-а,
+но не разрешение на исполнение неизвестных 73 opcodes.
 
 TMA properties остаются four raw `u32` words плюс имя, пока consumer/schema не
 задаст тип (integer/float bits/ObjectId/enum/fixed-point/index). В том числе

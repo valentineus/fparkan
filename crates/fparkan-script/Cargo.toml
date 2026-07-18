@@ -1,0 +1,12 @@
+[package]
+name = "fparkan-script"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fparkan-binary = { path = "../fparkan-binary", version = "0.1.0" }
+
+[lints]
+workspace = true

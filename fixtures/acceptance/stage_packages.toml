@@ -35,6 +35,7 @@ schema = 1
 "4" = [
   "fparkan-animation",
   "fparkan-fx",
+  "fparkan-script",
 ]
 "5" = [
   "fparkan-game",

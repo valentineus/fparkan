@@ -13,6 +13,7 @@ fparkan-inspection = { path = "../../crates/fparkan-inspection", version = "0.1.
 fparkan-path = { path = "../../crates/fparkan-path", version = "0.1.0" }
 fparkan-resource = { path = "../../crates/fparkan-resource", version = "0.1.0" }
 fparkan-runtime = { path = "../../crates/fparkan-runtime", version = "0.1.0" }
+fparkan-script = { path = "../../crates/fparkan-script", version = "0.1.0" }
 fparkan-vfs = { path = "../../crates/fparkan-vfs", version = "0.1.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
