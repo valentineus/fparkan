@@ -453,17 +453,28 @@ impl CachedResourceRepository {
 
 impl ResourceRepository for CachedResourceRepository {
     fn open_archive(&self, path: &NormalizedPath) -> Result<ArchiveId, ResourceError> {
-        let mut state = self.state.lock().map_err(|_| ResourceError::Poisoned)?;
         let key = path.identity_bytes().to_vec();
         loop {
-            // Decode outside the repository lock, then verify the VFS still points
-            // at the same bytes before committing the slot under the lock.
-            drop(state);
+            // Read outside the repository lock. The content hash doubles as the
+            // cache-validation value, so an unchanged open archive avoids both
+            // decode and a second whole-archive metadata read.
             let bytes = self
                 .vfs
                 .read(path)
                 .map_err(|err| resource_error_from_vfs(path, err))?;
             let observed_fingerprint = sha256(&bytes);
+            let mut state = self.state.lock().map_err(|_| ResourceError::Poisoned)?;
+            if let Some(id) = state.paths.get(&key).copied() {
+                let current = state.archive(id)?;
+                if current.document.is_some() && current.fingerprint == observed_fingerprint {
+                    state.touch_archive(id)?;
+                    return Ok(id);
+                }
+            }
+
+            // A new or changed archive still receives the full decode and a
+            // post-decode VFS fingerprint check before it commits to the cache.
+            drop(state);
             let mut slot = decode_archive(path.clone(), bytes, observed_fingerprint)?;
             let current_vfs_fingerprint = self
                 .vfs
@@ -907,6 +918,7 @@ mod tests {
     use super::*;
     use fparkan_vfs::{DirectoryVfs, MemoryVfs, Vfs, VfsEntry, VfsError, VfsMetadata};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Condvar;
     use std::thread;
 
@@ -931,6 +943,41 @@ mod tests {
                 FailingReadMode::Io => Err(VfsError::Io(std::io::Error::other("disk offline"))),
                 FailingReadMode::Path => Err(VfsError::Path),
             }
+        }
+
+        fn list(&self, _prefix: &NormalizedPath) -> Result<Vec<VfsEntry>, VfsError> {
+            unreachable!("list is not used in these tests");
+        }
+    }
+
+    struct CountingVfs {
+        bytes: Arc<[u8]>,
+        reads: AtomicUsize,
+        metadata_reads: AtomicUsize,
+    }
+
+    impl CountingVfs {
+        fn new(bytes: Arc<[u8]>) -> Self {
+            Self {
+                bytes,
+                reads: AtomicUsize::new(0),
+                metadata_reads: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Vfs for CountingVfs {
+        fn metadata(&self, _path: &NormalizedPath) -> Result<VfsMetadata, VfsError> {
+            self.metadata_reads.fetch_add(1, Ordering::Relaxed);
+            Ok(VfsMetadata {
+                len: self.bytes.len() as u64,
+                fingerprint: sha256(&self.bytes),
+            })
+        }
+
+        fn read(&self, _path: &NormalizedPath) -> Result<Arc<[u8]>, VfsError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(Arc::clone(&self.bytes))
         }
 
         fn list(&self, _prefix: &NormalizedPath) -> Result<Vec<VfsEntry>, VfsError> {
@@ -1035,6 +1082,21 @@ mod tests {
             }),
             Err(ResourceError::InvalidHandle)
         ));
+    }
+
+    #[test]
+    fn cached_archive_fast_path_skips_second_metadata_fingerprint() {
+        let path = archive_path(b"archives/test.lib").expect("path");
+        let bytes = Arc::from(build_nres(&[("one", b"payload")]).into_boxed_slice());
+        let vfs = Arc::new(CountingVfs::new(bytes));
+        let repo = CachedResourceRepository::new(Arc::clone(&vfs) as Arc<dyn Vfs>);
+
+        let first = repo.open_archive(&path).expect("first open");
+        let second = repo.open_archive(&path).expect("cached open");
+
+        assert_eq!(first, second);
+        assert_eq!(vfs.reads.load(Ordering::Relaxed), 2);
+        assert_eq!(vfs.metadata_reads.load(Ordering::Relaxed), 1);
     }
 
     #[test]
