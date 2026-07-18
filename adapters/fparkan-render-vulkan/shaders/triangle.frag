@@ -6,6 +6,13 @@ layout(location = 0) out vec4 out_color;
 
 layout(set = 0, binding = 0) uniform sampler2D base_color;
 
+layout(push_constant) uniform AlphaTestConstants {
+    float alpha_cutoff;
+} alpha_test;
+
 void main() {
     out_color = texture(base_color, in_uv) * vec4(in_color, 1.0);
+    if (out_color.a < alpha_test.alpha_cutoff) {
+        discard;
+    }
 }

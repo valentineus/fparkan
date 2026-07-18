@@ -678,6 +678,14 @@ impl VulkanSmokeRenderer {
                     std::slice::from_ref(descriptor_set),
                     &[],
                 );
+                let alpha_cutoff = range.alpha_test_cutoff().to_ne_bytes();
+                device.device().cmd_push_constants(
+                    command_buffer,
+                    resources.pipeline_layout,
+                    vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    &alpha_cutoff,
+                );
                 device.device().cmd_draw_indexed(
                     command_buffer,
                     range.index_count,

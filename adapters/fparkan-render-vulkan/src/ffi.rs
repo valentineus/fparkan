@@ -494,7 +494,7 @@ const fn spirv_words<const WORD_COUNT: usize>(bytes: &[u8]) -> [u32; WORD_COUNT]
 
 static TRIANGLE_VERTEX_SHADER_DATA: [u32; 290] =
     spirv_words(include_bytes!("../shaders/triangle.vert.spv"));
-static TRIANGLE_FRAGMENT_SHADER_DATA: [u32; 197] =
+static TRIANGLE_FRAGMENT_SHADER_DATA: [u32; 296] =
     spirv_words(include_bytes!("../shaders/triangle.frag.spv"));
 pub(crate) const TRIANGLE_VERTEX_SHADER_WORDS: &[u32] = &TRIANGLE_VERTEX_SHADER_DATA;
 pub(crate) const TRIANGLE_FRAGMENT_SHADER_WORDS: &[u32] = &TRIANGLE_FRAGMENT_SHADER_DATA;

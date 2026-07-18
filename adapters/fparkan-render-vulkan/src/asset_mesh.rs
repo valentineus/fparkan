@@ -71,6 +71,7 @@ pub fn project_msh_to_static_mesh(
             index_count: u32::from(batch.index_count),
             material_index: batch.material_index,
             pipeline_state: LegacyPipelineState::default(),
+            alpha_test_reference: 0,
         });
     }
     if indices.is_empty() {
@@ -186,6 +187,7 @@ mod tests {
                 index_count: 3,
                 material_index: 0,
                 pipeline_state: LegacyPipelineState::default(),
+                alpha_test_reference: 0,
             }]
         );
         assert_eq!(mesh.vertices[1].position, [-0.8, -0.8]);
@@ -233,12 +235,14 @@ mod tests {
                     index_count: 3,
                     material_index: 0,
                     pipeline_state: LegacyPipelineState::default(),
+                    alpha_test_reference: 0,
                 },
                 VulkanStaticDrawRange {
                     first_index: 3,
                     index_count: 3,
                     material_index: 7,
                     pipeline_state: LegacyPipelineState::default(),
+                    alpha_test_reference: 0,
                 },
             ]
         );

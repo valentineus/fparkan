@@ -381,7 +381,13 @@ fn create_pipeline_layout(
     descriptor_set_layout: vk::DescriptorSetLayout,
 ) -> Result<vk::PipelineLayout, VulkanSmokeRendererError> {
     let set_layouts = [descriptor_set_layout];
-    let create_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
+    let push_constant_ranges = [vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+        .offset(0)
+        .size(u32::try_from(std::mem::size_of::<f32>()).unwrap_or(u32::MAX))];
+    let create_info = vk::PipelineLayoutCreateInfo::default()
+        .set_layouts(&set_layouts)
+        .push_constant_ranges(&push_constant_ranges);
     // SAFETY: The descriptor-set layout belongs to this live logical device.
     unsafe { device.device().create_pipeline_layout(&create_info, None) }.map_err(|error| {
         VulkanSmokeRendererError::VulkanOperation {
@@ -562,12 +568,6 @@ fn create_graphics_pipeline(
     extent: (u32, u32),
     state: LegacyPipelineState,
 ) -> Result<vk::Pipeline, VulkanSmokeRendererError> {
-    if state.alpha_test {
-        return Err(VulkanSmokeRendererError::InvalidStaticMesh {
-            context:
-                "static renderer has no alpha-test shader variant for requested pipeline state",
-        });
-    }
     let vertex_shader = create_shader_module(device, TRIANGLE_VERTEX_SHADER_WORDS)?;
     let fragment_shader = match create_shader_module(device, TRIANGLE_FRAGMENT_SHADER_WORDS) {
         Ok(module) => module,

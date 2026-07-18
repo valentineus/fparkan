@@ -73,6 +73,8 @@ pub struct VulkanStaticDrawRange {
     pub material_index: u16,
     /// Backend-neutral fixed-function state for this source range.
     pub pipeline_state: LegacyPipelineState,
+    /// Alpha-test reference in legacy 0..=255 units; dynamic material data.
+    pub alpha_test_reference: u8,
 }
 
 impl VulkanStaticDrawRange {
@@ -80,6 +82,16 @@ impl VulkanStaticDrawRange {
     #[must_use]
     pub fn pipeline_key(self) -> PipelineKey {
         self.pipeline_state.into()
+    }
+
+    /// Returns the normalized cutoff consumed by the fragment shader.
+    #[must_use]
+    pub fn alpha_test_cutoff(self) -> f32 {
+        if self.pipeline_state.alpha_test {
+            f32::from(self.alpha_test_reference) / 255.0
+        } else {
+            0.0
+        }
     }
 }
 
@@ -185,6 +197,7 @@ impl VulkanStaticMesh {
                 index_count: 3,
                 material_index: 0,
                 pipeline_state: LegacyPipelineState::default(),
+                alpha_test_reference: 0,
             }],
         }
     }
@@ -252,6 +265,7 @@ mod static_mesh_tests {
                 index_count: 2,
                 material_index: 0,
                 pipeline_state: LegacyPipelineState::default(),
+                alpha_test_reference: 0,
             }],
         };
         let out_of_range_index = VulkanStaticMesh {
@@ -279,12 +293,14 @@ mod static_mesh_tests {
                 index_count: 3,
                 material_index: 7,
                 pipeline_state: LegacyPipelineState::default(),
+                alpha_test_reference: 0,
             },
             VulkanStaticDrawRange {
                 first_index: 3,
                 index_count: 3,
                 material_index: 2,
                 pipeline_state: LegacyPipelineState::default(),
+                alpha_test_reference: 0,
             },
         ];
         let texture = || VulkanStaticTexture {
@@ -322,6 +338,25 @@ mod static_mesh_tests {
 
         assert_eq!(base.pipeline_key().packed(), 0);
         assert_ne!(base.pipeline_key(), blended.pipeline_key());
+    }
+
+    #[test]
+    fn alpha_cutoff_is_dynamic_and_disabled_outside_alpha_test_pipeline() {
+        let base = VulkanStaticMesh::smoke_triangle().draw_ranges[0];
+        let disabled = VulkanStaticDrawRange {
+            alpha_test_reference: 200,
+            ..base
+        };
+        let enabled = VulkanStaticDrawRange {
+            pipeline_state: LegacyPipelineState {
+                alpha_test: true,
+                ..LegacyPipelineState::default()
+            },
+            alpha_test_reference: 128,
+            ..base
+        };
+        assert_eq!(disabled.alpha_test_cutoff(), 0.0);
+        assert_eq!(enabled.alpha_test_cutoff(), 128.0 / 255.0);
     }
 }
 

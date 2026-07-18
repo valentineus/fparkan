@@ -669,11 +669,11 @@ fn triangle_shader_manifest_hashes_are_stable() {
     assert!(!report.modules[0].interface_hash.is_empty());
     assert_eq!(
         report.modules[1].sha256,
-        "49dae3e1c46d5d23cccf3b161c36ea0b3a606e89c2289dbfed3e4fe991eb8556"
+        "536a5c9a4389f9d34ca11a25f20d0acbc53d3eb0782c18375326647319336a85"
     );
     assert_eq!(
         report.manifest_hash,
-        "038ecdb57832ac2d45a1ca6da5ec058b34f4f31b7170aa68fa612ac9d0ae7565"
+        "5a16fb791e86bb790cd2d85151627e0d39193c5c073a9294130f149d4ff5ba58"
     );
 }
 
