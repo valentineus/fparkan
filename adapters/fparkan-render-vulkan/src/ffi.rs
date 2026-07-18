@@ -42,8 +42,9 @@ mod validation;
 pub use self::asset_mesh::{
     project_land_msh_to_static_mesh, project_land_msh_to_static_mesh_in_world_space,
     project_land_msh_to_static_mesh_in_xy_frame, project_msh_to_static_mesh,
-    project_msh_to_static_mesh_in_world_space, project_msh_to_static_mesh_in_xy_frame,
-    VulkanAssetMeshError, VulkanStaticXyFrame,
+    project_msh_to_static_mesh_in_world_space,
+    project_msh_to_static_mesh_in_world_space_with_transform,
+    project_msh_to_static_mesh_in_xy_frame, VulkanAssetMeshError, VulkanStaticXyFrame,
 };
 pub use self::capabilities::{
     probe_vulkan_runtime_capabilities, probe_vulkan_runtime_capabilities_for_request,

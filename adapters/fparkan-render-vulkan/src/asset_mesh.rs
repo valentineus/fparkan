@@ -2,7 +2,7 @@
 
 use crate::{VulkanStaticDrawRange, VulkanStaticMesh, VulkanStaticVertex};
 use fparkan_msh::ModelAsset;
-use fparkan_render::LegacyPipelineState;
+use fparkan_render::{LegacyIron3dEulerTransform, LegacyPipelineState};
 use fparkan_terrain_format::LandMeshDocument;
 
 /// Error returned when a validated MSH cannot enter the current static GPU path.
@@ -185,8 +185,36 @@ pub fn project_msh_to_static_mesh_in_world_space(
     translation: [f32; 3],
     scale: [f32; 3],
 ) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
-    if !translation
+    project_msh_to_static_mesh_in_world_space_with_transform(
+        model,
+        LegacyIron3dEulerTransform {
+            translation,
+            orientation_radians: [0.0; 3],
+        },
+        scale,
+    )
+}
+
+/// Projects MSH geometry using the recovered `Iron3D` placement transform.
+///
+/// This preserves source-world coordinates and applies the proven
+/// `Rz(z) * Ry(y) * Rx(x)` rotation after local component-wise scale. It is
+/// intended for the opt-in legacy-camera static preview, not yet for animated
+/// or gameplay-owned transforms.
+///
+/// # Errors
+///
+/// Returns [`VulkanAssetMeshError`] when geometry or transform values cannot
+/// be represented by the static Vulkan input contract.
+pub fn project_msh_to_static_mesh_in_world_space_with_transform(
+    model: &ModelAsset,
+    transform: LegacyIron3dEulerTransform,
+    scale: [f32; 3],
+) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
+    if !transform
+        .translation
         .iter()
+        .chain(transform.orientation_radians.iter())
         .chain(scale.iter())
         .all(|value| value.is_finite())
     {
@@ -201,11 +229,9 @@ pub fn project_msh_to_static_mesh_in_world_space(
             if !position.iter().all(|value| value.is_finite()) {
                 return Err(VulkanAssetMeshError::NonFinitePosition);
             }
-            let position = [
-                position[0] * scale[0] + translation[0],
-                position[1] * scale[1] + translation[1],
-                position[2] * scale[2] + translation[2],
-            ];
+            let position = transform
+                .try_transform_scaled_point(*position, scale)
+                .ok_or(VulkanAssetMeshError::NonFinitePosition)?;
             Ok(VulkanStaticVertex {
                 position,
                 color: [0.82, 0.72, 0.31],
@@ -550,6 +576,29 @@ mod tests {
         assert_eq!(mesh.vertices[0].position, [104.0, 203.0, 302.0]);
         assert_eq!(mesh.vertices[1].position, [100.0, 199.0, 301.0]);
         assert_eq!(mesh.vertices[0].uv, [1.0, -0.5]);
+    }
+
+    #[test]
+    fn world_space_msh_applies_recovered_iron3d_orientation_after_scale() {
+        let source = model(
+            vec![[2.0, 3.0, 4.0], [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            vec![0, 1, 2],
+            vec![batch(0, 3, 0)],
+        );
+
+        let mesh = project_msh_to_static_mesh_in_world_space_with_transform(
+            &source,
+            LegacyIron3dEulerTransform {
+                translation: [10.0, 20.0, 30.0],
+                orientation_radians: [0.0, 0.0, std::f32::consts::FRAC_PI_2],
+            },
+            [2.0, 1.0, 0.5],
+        )
+        .expect("finite recovered transform");
+
+        assert_eq!(mesh.vertices[0].position, [7.0, 24.0, 32.0]);
+        assert_eq!(mesh.vertices[1].position, [10.0, 20.0, 30.0]);
+        assert_eq!(mesh.vertices[2].position, [10.0, 22.0, 30.0]);
     }
 
     #[test]

@@ -1437,16 +1437,20 @@ on its XY diagnostic projection until a runtime supplies a real legacy camera;
 selecting source-world coordinates with identity camera would be a misleading
 empty/off-screen viewer rather than a compatibility result.
 
-Static analysis of GOG `iron3d.dll` now recovers an exact adjacent placement
-primitive: RVA `0x36610` evaluates a row-major affine
-`Rz(z) * Ry(y) * Rx(x)` and writes translation in the final column. The
-backend-neutral `LegacyIron3dEulerTransform` preserves that finite portable
-formula with a golden yaw-vector test. This is deliberately not wired to TMA:
-AutoDemo records strongly suggest the candidate `(0, 0, z)` radians (all eight
-objects have zero first two values and `z` in approximately `[-pi, pi]`), but
-the current static trace has not proved that those raw record fields reach this
-builder unchanged for every mission object category. The remaining link needs
-a direct loader-to-builder dataflow or a dynamic placement capture.
+Static analysis of GOG `iron3d.dll` recovers the placement primitive at RVA
+`0x36610`: it evaluates a row-major affine `Rz(z) * Ry(y) * Rx(x)` and writes
+translation in the final column. The backend-neutral
+`LegacyIron3dEulerTransform` preserves that finite portable formula with golden
+yaw and scaled-point tests. A read-only elevated AutoDemo scan closes the
+previous TMA binding gap for static placement: it finds the exact raw mission
+records (position, `(0, 0, z)`, scale) and live object blocks at the same
+world positions. For example, `z = 1.6262363` produces the observed pair
+`-sin(z) = -0.99846`, `cos(z) = -0.05541`; matching pairs occur for the other
+observed objects. The opt-in captured-camera path therefore applies
+`R * (scale * local_position) + translation` before Vulkan upload. It remains
+a static-placement contract: dynamic/animated transforms, physics ownership,
+terrain material selection, lighting and gameplay parity are still separate
+evidence tasks.
 
 `VulkanSmokeRenderer::set_camera` now accepts a new finite camera between frame
 submissions and uses it for the next command buffer without rebuilding the
@@ -1494,9 +1498,12 @@ indices remain decoded in their original 16-bit representations and are widened
 only at the static-render bridge. A regression test crosses the former boundary.
 The full captured-camera AutoDemo preview completed at 13.369 seconds and
 rendered three 1280×720 native frames: 8 mission objects, 66 mesh components,
-67 material descriptors, and zero Vulkan validation warnings or errors. It is
-still a static source-world preview: raw mission orientation, terrain material
-selection, lighting and animation have not yet been claimed as parity.
+67 material descriptors, and zero Vulkan validation warnings or errors. A later
+orientation-enabled run rendered the same full scene for three 1280×720 frames
+with `validation_warnings=0`, `validation_errors=0` and readback hash
+`6406107678925513509`. It is still a static source-world preview: terrain
+material selection, lighting, animation, physics and gameplay behavior have
+not yet been claimed as parity.
 
 A fresh no-input launch of the canonical `iron_3d.exe` did create a responsive
 window titled `Parkan. Железная Стратегия`. A read-only probe then requested

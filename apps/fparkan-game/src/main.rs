@@ -26,15 +26,16 @@ use fparkan_platform::WindowPort;
 use fparkan_platform_winit::{window_native_handles, WinitWindow, WinitWindowPlan};
 use fparkan_render::{
     build_commands, CameraSnapshot, DrawId, GpuMaterialId, GpuMeshId, IndexRange,
-    LegacyD3d7Projection, RawCameraTransform, RenderBackend, RenderCommand, RenderCommandList,
-    RenderPhase, RenderProfile, RenderSnapshot, RenderSnapshotDraw,
+    LegacyD3d7Projection, LegacyIron3dEulerTransform, RawCameraTransform, RenderBackend,
+    RenderCommand, RenderCommandList, RenderPhase, RenderProfile, RenderSnapshot,
+    RenderSnapshotDraw,
 };
 use fparkan_render_vulkan::{
     project_land_msh_to_static_mesh_in_world_space, project_land_msh_to_static_mesh_in_xy_frame,
-    project_msh_to_static_mesh_in_world_space, project_msh_to_static_mesh_in_xy_frame,
-    VulkanPlanningBackend, VulkanSmokeFrameOutcome, VulkanSmokeRenderer,
-    VulkanSmokeRendererCreateInfo, VulkanStaticCamera, VulkanStaticMaterial, VulkanStaticMesh,
-    VulkanStaticTexture, VulkanStaticXyFrame,
+    project_msh_to_static_mesh_in_world_space_with_transform,
+    project_msh_to_static_mesh_in_xy_frame, VulkanPlanningBackend, VulkanSmokeFrameOutcome,
+    VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo, VulkanStaticCamera, VulkanStaticMaterial,
+    VulkanStaticMesh, VulkanStaticTexture, VulkanStaticXyFrame,
 };
 use fparkan_runtime::{
     create, frame, load_mission, load_mission_static_preview, load_mission_static_preview_roots,
@@ -285,9 +286,12 @@ fn static_preview_mesh_and_materials(
                 format!("static preview visual {visual_id:?} references unknown model {model_id:?}")
             })?;
             let component = if legacy_camera.is_some() {
-                project_msh_to_static_mesh_in_world_space(
+                project_msh_to_static_mesh_in_world_space_with_transform(
                     &model.validated,
-                    root.position,
+                    LegacyIron3dEulerTransform {
+                        translation: root.position,
+                        orientation_radians: root.orientation_raw,
+                    },
                     root.scale,
                 )
             } else {

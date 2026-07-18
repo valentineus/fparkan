@@ -304,6 +304,37 @@ impl LegacyIron3dEulerTransform {
             .all(|value| value.is_finite())
             .then_some(matrix)
     }
+
+    /// Applies the recovered rotation after a component-wise local scale.
+    ///
+    /// This is the affine `R * (scale * point) + translation` convention used
+    /// by the static source-world bridge. The original dynamic transform path
+    /// needs its own capture evidence before it may replace this static path.
+    #[must_use]
+    pub fn try_transform_scaled_point(self, point: [f32; 3], scale: [f32; 3]) -> Option<[f32; 3]> {
+        if !point
+            .iter()
+            .chain(scale.iter())
+            .all(|value| value.is_finite())
+        {
+            return None;
+        }
+        let matrix = self.try_row_major()?;
+        let scaled = [
+            point[0] * scale[0],
+            point[1] * scale[1],
+            point[2] * scale[2],
+        ];
+        let transformed = [
+            matrix[0] * scaled[0] + matrix[1] * scaled[1] + matrix[2] * scaled[2] + matrix[3],
+            matrix[4] * scaled[0] + matrix[5] * scaled[1] + matrix[6] * scaled[2] + matrix[7],
+            matrix[8] * scaled[0] + matrix[9] * scaled[1] + matrix[10] * scaled[2] + matrix[11],
+        ];
+        transformed
+            .iter()
+            .all(|value| value.is_finite())
+            .then_some(transformed)
+    }
 }
 
 /// Raw camera state observed through the original Terrain camera interface.
@@ -1210,6 +1241,14 @@ mod tests {
         assert_eq!(matrix[7], 717.433);
         assert_eq!(matrix[11], 3.040_938_9);
         assert_eq!(matrix[15], 1.0);
+        assert_eq!(
+            LegacyIron3dEulerTransform {
+                translation: [10.0, 20.0, 30.0],
+                orientation_radians: [0.0, 0.0, std::f32::consts::FRAC_PI_2],
+            }
+            .try_transform_scaled_point([2.0, 3.0, 4.0], [2.0, 1.0, 0.5]),
+            Some([7.0, 24.0, 32.0])
+        );
         assert_eq!(
             LegacyIron3dEulerTransform {
                 translation: [0.0, 0.0, 0.0],
