@@ -8,7 +8,7 @@
 
 | Path | Native window / swapchain | Draws pixels | Uses original assets | Acceptance class | Что доказывает | Чего не доказывает |
 | --- | --- | --- | --- | --- | --- | --- |
-| `fparkan-vulkan-smoke` / `VulkanSmokeRenderer` | Yes | Yes | Static MSH plus sampled TEXM | `covered-gpu` for Stage 0 smoke and explicit MSH/TEXM/descriptor bridge IDs | Loader, instance, surface, swapchain, submit/present, validation-clean triangle path; original MSH indexed draw; TEXM RGBA8 staging upload, sampler/descriptor binding, fragment sampling and one explicitly selected WEAR/MAT0 material path | Per-batch material selection, phase animation, lightmaps, terrain, gameplay rendering |
+| `fparkan-vulkan-smoke` / `VulkanSmokeRenderer` | Yes | Yes | Static MSH plus sampled TEXM | `covered-gpu` for Stage 0 smoke and explicit MSH/TEXM/descriptor bridge IDs | Loader, instance, surface, swapchain, submit/present, validation-clean triangle path; original MSH indexed draw; TEXM RGBA8 staging upload; per-batch WEAR/MAT0 diffuse descriptors and fragment sampling | MAT0 phase animation, lightmaps, legacy blend/depth/cull states, terrain, camera/node transforms, gameplay rendering |
 | `VulkanPlanningBackend` | No | No | Optional CPU-side IDs only | `covered-planning` | Deterministic command validation, canonical capture, frame submission planning | Любой live GPU draw, pixel parity, validation-clean asset frame |
 | `RecordingBackend` | No | No | Optional CPU-side IDs only | `covered-planning` | Stable command capture for backend-neutral tests | Native window, Vulkan, GPU resource lifetime, pixels |
 | `NullBackend` | No | No | Optional CPU-side IDs only | Usually `covered` for validation-only rows | Command stream framing and bounds validation | Capture stability, GPU execution, pixels |
@@ -30,6 +30,7 @@
 ## Current repository status
 
 - Реальный Vulkan в репозитории имеет smoke triangle path и узкий static asset bridge. `VulkanStaticDrawRange` сохраняет исходный `Batch20.material_index`; когда smoke запускается с `--wear-root`, `--wear-archive`, `--wear-name` без override, он дедуплицирует selectors, проходит каждый через `WEAR → MAT0 → Textures.lib`, создаёт по одному image/descriptor set и бинит set непосредственно перед соответствующим indexed draw. Direct TEXM и `--material-index` — намеренно однотекстурные compatibility modes. Fresh GOG `fortif.rlb::FR_L_MTP.msh` подтверждает 237 batch draws, но его selectors все `0`, поэтому live report содержит один binding `MTP_01.0`; unit contract подтверждает точное сопоставление двух разных selectors с разными descriptor sets. Это не доказывает material phase animation, lightmaps, alpha/depth/cull state, terrain, camera/node transforms или pixel approval.
+- Lightmap остаётся отдельным, не реализованным contract: оригинальный `World3D.dll` экспортирует самостоятельный `SetLightMapLib` наряду с `SetTexturesLib` и `SetMaterialLib`; WEAR содержит независимый блок `LIGHTMAPS`. Текущая документация не подтверждает связь этих slots с `Batch20.material_index` или их UV/channel semantics, поэтому viewer не подменяет lightmap diffuse texture и не добавляет недоказанное binding.
 - `apps/fparkan-game` сейчас выдает `render-planning` JSON report поверх
   synthetic window descriptor и `VulkanPlanningBackend`.
 - `apps/fparkan-viewer` сейчас inspection-only CLI и не открывает live Vulkan
