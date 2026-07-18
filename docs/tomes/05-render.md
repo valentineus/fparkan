@@ -1598,20 +1598,30 @@ The cache boundary is now mechanically separated from the WEAR loader. In the
 `GetShade` object, the `Shade.wea` manager is stored at byte offset `3092`, but
 the dispatcher calls a distinct object at byte offset `3244`. Its virtual slot
 `+16` receives every type-11 key repeatedly with mode values `512`, `16`,
-`20497`, and `20752`, and returns a runtime record rather than a WEAR row. The
-dispatcher reads that record's flags at `+60`, a secondary selector at `+24`,
-an optional byte at `+88`, a referenced state block at `+104`, three signed
-shorts at `+108`, and another selector at `+112`. Those fields are inputs to
-visibility tests, primitive construction and texture/secondary passes, but the
-cache builder and bit meanings are still not recovered; the Vulkan path must
-not map any of them to invented pipeline state.
+`20497`, and `20752`. The cache object itself has an eight-byte entry table at
+`+316` and its exclusive key count at `+320`: the first dword of an entry is a
+stored-record pointer and its byte at `+4` selects a 212-byte profile bank. A
+key outside that count, or an entry pointer below `0x1000`, fails the lookup.
+On success the method returns the shared result view at cache offset `+24`, not
+the stored-record pointer and not a WEAR row. Thus the dispatcher's observed
+flags at result-view `+60`, secondary selector `+24`, optional byte `+88`,
+referenced state block `+104`, three signed shorts `+108`, and another selector
+`+112` are materialized lookup state, not yet proven on-disk record offsets.
+Mode `0x0200` (`512`) only validates the key in the recovered path; mode
+`0x5011` includes the recovered selector-table transfer and mode `0x5110`
+includes the recovered bank-byte transfer. The meanings of their remaining
+bits, the cache builder, and the result fields remain unrecovered, so the Vulkan
+path must not map any of them to invented pipeline state.
 
 A read-only elevated AutoDemo probe confirms that this is a lifecycle boundary,
 not a permanently allocated table: the live `GetShade` singleton is initialized
 and its `Shade.wea` manager pointer is non-null, while its byte-offset `3244`
-cache pointer was null at the sampled instant. Therefore a future runtime
-implementation must treat cache availability as contextual and cannot dereference
-or prebuild the cache solely from constructor state.
+cache pointer is normally null. Passive 100-ms sampling of the unattended
+AutoDemo caught it briefly at `0x035C64B4`; its relocated vtable is
+`Terrain.dll` RVA `0x643D0` and slot `+16` is RVA `0x10910`, matching the
+recovered lookup routine. Therefore a future runtime implementation must treat
+cache availability as contextual and cannot dereference or prebuild the cache
+solely from constructor state.
 
 The static Vulkan bridge now carries each contiguous face run as a separate
 draw range keyed by the original packed `material_tag`; it neither reorders
