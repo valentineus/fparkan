@@ -3,7 +3,7 @@
 use ash::vk;
 
 use super::{
-    color_subresource_range, VulkanAllocatedBuffer, VulkanLogicalDeviceProbe,
+    color_subresource_range, VulkanAllocatedBuffer, VulkanAllocatedImage, VulkanLogicalDeviceProbe,
     VulkanSmokeRendererError, VulkanSwapchainProbe, TRIANGLE_FRAGMENT_SHADER_WORDS,
     TRIANGLE_VERTEX_SHADER_WORDS,
 };
@@ -12,6 +12,10 @@ pub(super) struct VulkanSwapchainResources {
     pub(super) image_views: Vec<vk::ImageView>,
     pub(super) render_pass: vk::RenderPass,
     pub(super) pipeline_layout: vk::PipelineLayout,
+    pub(super) descriptor_set_layout: vk::DescriptorSetLayout,
+    pub(super) descriptor_pool: vk::DescriptorPool,
+    pub(super) descriptor_set: vk::DescriptorSet,
+    pub(super) sampler: vk::Sampler,
     pub(super) pipeline: vk::Pipeline,
     pub(super) framebuffers: Vec<vk::Framebuffer>,
     pub(super) command_buffers: Vec<vk::CommandBuffer>,
@@ -21,6 +25,9 @@ struct PartialSwapchainResources {
     image_views: Vec<vk::ImageView>,
     render_pass: Option<vk::RenderPass>,
     pipeline_layout: Option<vk::PipelineLayout>,
+    descriptor_set_layout: Option<vk::DescriptorSetLayout>,
+    descriptor_pool: Option<vk::DescriptorPool>,
+    sampler: Option<vk::Sampler>,
     pipeline: Option<vk::Pipeline>,
     framebuffers: Vec<vk::Framebuffer>,
     command_buffers: Vec<vk::CommandBuffer>,
@@ -32,6 +39,7 @@ pub(super) fn create_swapchain_resources(
     command_pool: vk::CommandPool,
     vertex_buffer: &VulkanAllocatedBuffer,
     index_buffer: &VulkanAllocatedBuffer,
+    texture: &VulkanAllocatedImage,
     reuse_command_pool: bool,
 ) -> Result<VulkanSwapchainResources, VulkanSmokeRendererError> {
     // SAFETY: The swapchain is live and owned by this renderer for the duration of the query.
@@ -52,14 +60,26 @@ pub(super) fn create_swapchain_resources(
         )?,
         render_pass: None,
         pipeline_layout: None,
+        descriptor_set_layout: None,
+        descriptor_pool: None,
+        sampler: None,
         pipeline: None,
         framebuffers: Vec::new(),
         command_buffers: Vec::new(),
     };
-    let (render_pass, pipeline_layout, pipeline) = match create_swapchain_pipeline_bundle(
+    let (
+        render_pass,
+        pipeline_layout,
+        pipeline,
+        descriptor_set_layout,
+        descriptor_pool,
+        descriptor_set,
+        sampler,
+    ) = match create_swapchain_pipeline_bundle(
         device,
         swapchain.report.plan.format.format,
         swapchain.report.plan.extent,
+        texture,
     ) {
         Ok(bundle) => bundle,
         Err(error) => {
@@ -69,6 +89,9 @@ pub(super) fn create_swapchain_resources(
     };
     partial.render_pass = Some(render_pass);
     partial.pipeline_layout = Some(pipeline_layout);
+    partial.descriptor_set_layout = Some(descriptor_set_layout);
+    partial.descriptor_pool = Some(descriptor_pool);
+    partial.sampler = Some(sampler);
     partial.pipeline = Some(pipeline);
     let framebuffers = match create_swapchain_framebuffers(
         device,
@@ -101,6 +124,10 @@ pub(super) fn create_swapchain_resources(
         image_views: partial.image_views,
         render_pass,
         pipeline_layout,
+        descriptor_set_layout,
+        descriptor_pool,
+        descriptor_set,
+        sampler,
         pipeline,
         framebuffers: partial.framebuffers,
         command_buffers: partial.command_buffers,
@@ -119,16 +146,44 @@ fn create_swapchain_image_views(
     Ok(image_views)
 }
 
+#[allow(clippy::type_complexity)]
 fn create_swapchain_pipeline_bundle(
     device: &VulkanLogicalDeviceProbe,
     format: i32,
     extent: (u32, u32),
-) -> Result<(vk::RenderPass, vk::PipelineLayout, vk::Pipeline), VulkanSmokeRendererError> {
+    texture: &VulkanAllocatedImage,
+) -> Result<
+    (
+        vk::RenderPass,
+        vk::PipelineLayout,
+        vk::Pipeline,
+        vk::DescriptorSetLayout,
+        vk::DescriptorPool,
+        vk::DescriptorSet,
+        vk::Sampler,
+    ),
+    VulkanSmokeRendererError,
+> {
     let render_pass = create_render_pass(device, format)?;
-    let pipeline_layout = create_pipeline_layout(device).inspect_err(|_| {
-        // SAFETY: The render pass was created above on this live logical device and is destroyed on setup failure.
-        unsafe { device.device().destroy_render_pass(render_pass, None) };
-    })?;
+    let (descriptor_set_layout, descriptor_pool, descriptor_set, sampler) =
+        create_texture_descriptor_bundle(device, texture).inspect_err(|_| {
+            // SAFETY: The render pass was created above on this live logical device and is destroyed on setup failure.
+            unsafe { device.device().destroy_render_pass(render_pass, None) };
+        })?;
+    let pipeline_layout =
+        create_pipeline_layout(device, descriptor_set_layout).inspect_err(|_| {
+            // SAFETY: The descriptor resources and render pass were created above and are rolled back on this device.
+            unsafe {
+                device.device().destroy_sampler(sampler, None);
+                device
+                    .device()
+                    .destroy_descriptor_pool(descriptor_pool, None);
+                device
+                    .device()
+                    .destroy_descriptor_set_layout(descriptor_set_layout, None);
+                device.device().destroy_render_pass(render_pass, None);
+            }
+        })?;
     let pipeline = create_graphics_pipeline(device, render_pass, pipeline_layout, extent)
         .inspect_err(|_| {
             // SAFETY: These objects were created above on this live logical device and are destroyed on setup failure.
@@ -136,10 +191,25 @@ fn create_swapchain_pipeline_bundle(
                 device
                     .device()
                     .destroy_pipeline_layout(pipeline_layout, None);
+                device.device().destroy_sampler(sampler, None);
+                device
+                    .device()
+                    .destroy_descriptor_pool(descriptor_pool, None);
+                device
+                    .device()
+                    .destroy_descriptor_set_layout(descriptor_set_layout, None);
                 device.device().destroy_render_pass(render_pass, None);
             }
         })?;
-    Ok((render_pass, pipeline_layout, pipeline))
+    Ok((
+        render_pass,
+        pipeline_layout,
+        pipeline,
+        descriptor_set_layout,
+        descriptor_pool,
+        descriptor_set,
+        sampler,
+    ))
 }
 
 fn create_swapchain_framebuffers(
@@ -248,15 +318,117 @@ fn create_render_pass(
 
 fn create_pipeline_layout(
     device: &VulkanLogicalDeviceProbe,
+    descriptor_set_layout: vk::DescriptorSetLayout,
 ) -> Result<vk::PipelineLayout, VulkanSmokeRendererError> {
-    let create_info = vk::PipelineLayoutCreateInfo::default();
-    // SAFETY: The pipeline layout has no descriptor sets or push constants in Stage 0 smoke.
+    let set_layouts = [descriptor_set_layout];
+    let create_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
+    // SAFETY: The descriptor-set layout belongs to this live logical device.
     unsafe { device.device().create_pipeline_layout(&create_info, None) }.map_err(|error| {
         VulkanSmokeRendererError::VulkanOperation {
             context: "vkCreatePipelineLayout",
             result: error,
         }
     })
+}
+
+#[allow(clippy::too_many_lines)]
+fn create_texture_descriptor_bundle(
+    device: &VulkanLogicalDeviceProbe,
+    texture: &VulkanAllocatedImage,
+) -> Result<
+    (
+        vk::DescriptorSetLayout,
+        vk::DescriptorPool,
+        vk::DescriptorSet,
+        vk::Sampler,
+    ),
+    VulkanSmokeRendererError,
+> {
+    let binding = vk::DescriptorSetLayoutBinding::default()
+        .binding(0)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+    let bindings = [binding];
+    let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
+    // SAFETY: The layout description is stack-owned and references no external memory.
+    let layout = unsafe {
+        device
+            .device()
+            .create_descriptor_set_layout(&layout_info, None)
+    }
+    .map_err(|result| VulkanSmokeRendererError::VulkanOperation {
+        context: "vkCreateDescriptorSetLayout",
+        result,
+    })?;
+    let pool_size = vk::DescriptorPoolSize::default()
+        .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(1);
+    let pool_sizes = [pool_size];
+    let pool_info = vk::DescriptorPoolCreateInfo::default()
+        .pool_sizes(&pool_sizes)
+        .max_sets(1);
+    let pool =
+        // SAFETY: The pool description is stack-owned and reserves exactly one descriptor.
+        unsafe { device.device().create_descriptor_pool(&pool_info, None) }.map_err(|result| {
+            // SAFETY: The layout was created above on this device and is rolled back once.
+            unsafe { device.device().destroy_descriptor_set_layout(layout, None) };
+            VulkanSmokeRendererError::VulkanOperation {
+                context: "vkCreateDescriptorPool",
+                result,
+            }
+        })?;
+    let layouts = [layout];
+    let allocate_info = vk::DescriptorSetAllocateInfo::default()
+        .descriptor_pool(pool)
+        .set_layouts(&layouts);
+    // SAFETY: The pool and layout are live on this logical device.
+    let descriptor_set = unsafe { device.device().allocate_descriptor_sets(&allocate_info) }
+        .map_err(|result| {
+            // SAFETY: Resources were created above on this device and are rolled back once.
+            unsafe {
+                device.device().destroy_descriptor_pool(pool, None);
+                device.device().destroy_descriptor_set_layout(layout, None);
+            };
+            VulkanSmokeRendererError::VulkanOperation {
+                context: "vkAllocateDescriptorSets",
+                result,
+            }
+        })?[0];
+    let sampler_info = vk::SamplerCreateInfo::default()
+        .mag_filter(vk::Filter::LINEAR)
+        .min_filter(vk::Filter::LINEAR)
+        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+        .address_mode_u(vk::SamplerAddressMode::REPEAT)
+        .address_mode_v(vk::SamplerAddressMode::REPEAT)
+        .address_mode_w(vk::SamplerAddressMode::REPEAT)
+        .max_lod(0.0);
+    let sampler =
+        // SAFETY: The sampler create info is stack-owned and has no unsupported optional features.
+        unsafe { device.device().create_sampler(&sampler_info, None) }.map_err(|result| {
+            // SAFETY: Resources were created above on this device and are rolled back once.
+            unsafe {
+                device.device().destroy_descriptor_pool(pool, None);
+                device.device().destroy_descriptor_set_layout(layout, None);
+            };
+            VulkanSmokeRendererError::VulkanOperation {
+                context: "vkCreateSampler",
+                result,
+            }
+        })?;
+    let image_info = vk::DescriptorImageInfo::default()
+        .sampler(sampler)
+        .image_view(texture.view)
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    let image_infos = [image_info];
+    let write = vk::WriteDescriptorSet::default()
+        .dst_set(descriptor_set)
+        .dst_binding(0)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .image_info(&image_infos);
+    // SAFETY: The descriptor set, sampler and image view are live and the texture upload completed its shader-read transition.
+    unsafe { device.device().update_descriptor_sets(&[write], &[]) };
+    Ok((layout, pool, descriptor_set, sampler))
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -293,7 +465,7 @@ fn create_graphics_pipeline(
     ];
     let vertex_binding = vk::VertexInputBindingDescription::default()
         .binding(0)
-        .stride(u32::try_from(5 * std::mem::size_of::<f32>()).unwrap_or(u32::MAX))
+        .stride(u32::try_from(7 * std::mem::size_of::<f32>()).unwrap_or(u32::MAX))
         .input_rate(vk::VertexInputRate::VERTEX);
     let vertex_attributes = [
         vk::VertexInputAttributeDescription::default()
@@ -306,6 +478,11 @@ fn create_graphics_pipeline(
             .location(1)
             .format(vk::Format::R32G32B32_SFLOAT)
             .offset(u32::try_from(2 * std::mem::size_of::<f32>()).unwrap_or(u32::MAX)),
+        vk::VertexInputAttributeDescription::default()
+            .binding(0)
+            .location(2)
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset(u32::try_from(5 * std::mem::size_of::<f32>()).unwrap_or(u32::MAX)),
     ];
     let vertex_bindings = [vertex_binding];
     let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default()
@@ -461,6 +638,13 @@ pub(super) fn destroy_swapchain_resources(
         device
             .device()
             .destroy_pipeline_layout(resources.pipeline_layout, None);
+        device.device().destroy_sampler(resources.sampler, None);
+        device
+            .device()
+            .destroy_descriptor_pool(resources.descriptor_pool, None);
+        device
+            .device()
+            .destroy_descriptor_set_layout(resources.descriptor_set_layout, None);
         device
             .device()
             .destroy_render_pass(resources.render_pass, None);
@@ -492,6 +676,19 @@ fn destroy_partial_swapchain_resources(
             device
                 .device()
                 .destroy_pipeline_layout(pipeline_layout, None);
+        }
+        if let Some(sampler) = partial.sampler {
+            device.device().destroy_sampler(sampler, None);
+        }
+        if let Some(descriptor_pool) = partial.descriptor_pool {
+            device
+                .device()
+                .destroy_descriptor_pool(descriptor_pool, None);
+        }
+        if let Some(descriptor_set_layout) = partial.descriptor_set_layout {
+            device
+                .device()
+                .destroy_descriptor_set_layout(descriptor_set_layout, None);
         }
         if let Some(render_pass) = partial.render_pass {
             device.device().destroy_render_pass(render_pass, None);

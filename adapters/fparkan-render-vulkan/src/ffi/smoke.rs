@@ -181,21 +181,25 @@ impl VulkanSmokeRenderer {
                     return Err(error);
                 }
             };
-        let texture = match create_info.texture.as_ref() {
-            None => None,
-            Some(texture) => {
-                match create_static_texture_image(&instance, &device, command_pool, texture) {
-                    Ok(image) => Some(image),
-                    Err(error) => {
-                        // SAFETY: These resources belong to this live device and are rolled back before it drops.
-                        unsafe { device.device().destroy_command_pool(command_pool, None) };
-                        destroy_allocated_buffer(&device, &index_buffer);
-                        destroy_allocated_buffer(&device, &vertex_buffer);
-                        return Err(error);
-                    }
-                }
-            }
+        // Keep the compatibility triangle path valid: it samples a white texel
+        // when no original TEXM was supplied.
+        let fallback_texture = super::VulkanStaticTexture {
+            width: 1,
+            height: 1,
+            rgba8: vec![255, 255, 255, 255],
         };
+        let texture_source = create_info.texture.as_ref().unwrap_or(&fallback_texture);
+        let texture =
+            match create_static_texture_image(&instance, &device, command_pool, texture_source) {
+                Ok(image) => Some(image),
+                Err(error) => {
+                    // SAFETY: These resources belong to this live device and are rolled back before it drops.
+                    unsafe { device.device().destroy_command_pool(command_pool, None) };
+                    destroy_allocated_buffer(&device, &index_buffer);
+                    destroy_allocated_buffer(&device, &vertex_buffer);
+                    return Err(error);
+                }
+            };
         let mut renderer = Self {
             instance: Some(instance),
             validation,
@@ -315,6 +319,14 @@ impl VulkanSmokeRenderer {
             .as_ref()
             .ok_or(VulkanSmokeRendererError::InvariantViolation {
                 context: "instance",
+            })
+    }
+
+    fn texture_ref(&self) -> Result<&super::VulkanAllocatedImage, VulkanSmokeRendererError> {
+        self.texture
+            .as_ref()
+            .ok_or(VulkanSmokeRendererError::InvariantViolation {
+                context: "static material texture",
             })
     }
 
@@ -532,6 +544,7 @@ impl VulkanSmokeRenderer {
                 self.command_pool,
                 self.vertex_buffer_ref()?,
                 self.index_buffer_ref()?,
+                self.texture_ref()?,
                 reuse_command_pool,
             )?,
             |resources| destroy_swapchain_resources(device, self.command_pool, resources),
@@ -607,6 +620,14 @@ impl VulkanSmokeRenderer {
                 command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
                 resources.pipeline,
+            );
+            device.device().cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                resources.pipeline_layout,
+                0,
+                &[resources.descriptor_set],
+                &[],
             );
             let vertex_buffers = [self.vertex_buffer_ref()?.buffer];
             let offsets = [0_u64];

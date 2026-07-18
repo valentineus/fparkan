@@ -90,7 +90,8 @@ const EXT_DEBUG_UTILS_EXTENSION: &str = "VK_EXT_debug_utils";
 const VALIDATION_LAYER_NAME: &str = "VK_LAYER_KHRONOS_validation";
 pub(crate) const SPIRV_MAGIC: u32 = 0x0723_0203;
 pub(crate) const SPIRV_VERSION_1_0: u32 = 0x0001_0000;
-pub(crate) const TRIANGLE_VERTEX_SHADER_WORDS: &[u32] = &[
+#[allow(dead_code)]
+const LEGACY_TRIANGLE_VERTEX_SHADER_WORDS: &[u32] = &[
     0x0723_0203,
     0x0001_0300,
     0x0008_000b,
@@ -345,7 +346,8 @@ pub(crate) const TRIANGLE_VERTEX_SHADER_WORDS: &[u32] = &[
     0x0001_00fd,
     0x0001_0038,
 ];
-pub(crate) const TRIANGLE_FRAGMENT_SHADER_WORDS: &[u32] = &[
+#[allow(dead_code)]
+const LEGACY_TRIANGLE_FRAGMENT_SHADER_WORDS: &[u32] = &[
     0x0723_0203,
     0x0001_0300,
     0x0008_000b,
@@ -472,6 +474,29 @@ pub(crate) const TRIANGLE_FRAGMENT_SHADER_WORDS: &[u32] = &[
     0x0001_00fd,
     0x0001_0038,
 ];
+
+const fn spirv_words<const WORD_COUNT: usize>(bytes: &[u8]) -> [u32; WORD_COUNT] {
+    let mut words = [0_u32; WORD_COUNT];
+    let mut index = 0;
+    while index < WORD_COUNT {
+        let offset = index * 4;
+        words[index] = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
+        index += 1;
+    }
+    words
+}
+
+static TRIANGLE_VERTEX_SHADER_DATA: [u32; 290] =
+    spirv_words(include_bytes!("../shaders/triangle.vert.spv"));
+static TRIANGLE_FRAGMENT_SHADER_DATA: [u32; 197] =
+    spirv_words(include_bytes!("../shaders/triangle.frag.spv"));
+pub(crate) const TRIANGLE_VERTEX_SHADER_WORDS: &[u32] = &TRIANGLE_VERTEX_SHADER_DATA;
+pub(crate) const TRIANGLE_FRAGMENT_SHADER_WORDS: &[u32] = &TRIANGLE_FRAGMENT_SHADER_DATA;
 
 #[cfg(test)]
 mod tests;

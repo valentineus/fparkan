@@ -100,6 +100,13 @@ pub fn project_msh_to_static_mesh(
                 (position[2] - center_z) * scale,
             ],
             color: [0.82, 0.72, 0.31],
+            // The exact fixed-point normalization of Res5 is still under
+            // disassembly. Until then the asset viewer uses its documented XZ
+            // planar projection, rather than inventing a scale for raw i16 UV0.
+            uv: [
+                (position[0] - center_x) / extent + 0.5,
+                (position[2] - center_z) / extent + 0.5,
+            ],
         })
         .collect();
 

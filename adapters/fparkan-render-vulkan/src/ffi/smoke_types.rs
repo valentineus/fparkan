@@ -42,6 +42,8 @@ pub struct VulkanStaticVertex {
     pub position: [f32; 2],
     /// Linear RGB vertex color.
     pub color: [f32; 3],
+    /// Texture coordinate consumed by the static material bridge.
+    pub uv: [f32; 2],
 }
 
 /// Static indexed geometry uploaded to live Vulkan buffers.
@@ -94,14 +96,17 @@ impl VulkanStaticMesh {
                 VulkanStaticVertex {
                     position: [0.0, -0.55],
                     color: [1.0, 0.2, 0.2],
+                    uv: [0.5, 0.0],
                 },
                 VulkanStaticVertex {
                     position: [0.55, 0.55],
                     color: [0.2, 1.0, 0.2],
+                    uv: [1.0, 1.0],
                 },
                 VulkanStaticVertex {
                     position: [-0.55, 0.55],
                     color: [0.2, 0.4, 1.0],
+                    uv: [0.0, 1.0],
                 },
             ],
             indices: vec![0, 1, 2],

@@ -20,7 +20,7 @@ pub(crate) const SPIRV_VALIDATOR_BINARY_SHA256: &str =
 pub(crate) const TRIANGLE_VERTEX_SOURCE_PATH: &str =
     "adapters/fparkan-render-vulkan/shaders/triangle.vert";
 pub(crate) const TRIANGLE_VERTEX_SOURCE_SHA256: &str =
-    "1e57f14d193fc61457c0749081c452ad25669998913107df12f3ccc3c33e0341";
+    "82f9ee39a30b094203041205954576ca820d75771421bb27ddd300359e4e9043";
 pub(crate) const TRIANGLE_VERTEX_SPIRV_PATH: &str =
     "adapters/fparkan-render-vulkan/shaders/triangle.vert.spv";
 pub(crate) const TRIANGLE_VERTEX_COMPILE_COMMAND: &str =
@@ -29,7 +29,7 @@ pub(crate) const TRIANGLE_VERTEX_VALIDATE_COMMAND: &str =
     "spirv-val --target-env vulkan1.1 adapters/fparkan-render-vulkan/shaders/triangle.vert.spv";
 const TRIANGLE_FRAGMENT_SOURCE_PATH: &str = "adapters/fparkan-render-vulkan/shaders/triangle.frag";
 const TRIANGLE_FRAGMENT_SOURCE_SHA256: &str =
-    "f19e74d001d07fb537d4b0f9e621f9b8bc40eeb68816130220853abea6bd4445";
+    "70b600a0c79b6cdee1747a47caf7854bbe0bb9a693b3fe29345e659df549d96f";
 const TRIANGLE_FRAGMENT_SPIRV_PATH: &str =
     "adapters/fparkan-render-vulkan/shaders/triangle.frag.spv";
 const TRIANGLE_FRAGMENT_COMPILE_COMMAND: &str =
@@ -225,7 +225,7 @@ pub fn triangle_shader_manifest() -> Vec<VulkanShaderModuleManifest> {
             name: "triangle.frag",
             stage: VulkanShaderStage::Fragment,
             entry_point: "main",
-            descriptor_sets: 0,
+            descriptor_sets: 1,
             push_constant_bytes: 0,
             source_path: TRIANGLE_FRAGMENT_SOURCE_PATH,
             source_sha256: TRIANGLE_FRAGMENT_SOURCE_SHA256,
