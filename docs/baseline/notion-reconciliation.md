@@ -28,3 +28,34 @@ corpus statistics уже находятся рядом с соответству
 MoltenVK, GLES/RG40XX и hosted CI. Они не считаются пробелами. Текущие
 доказательства Windows/Vulkan и все последующие уточнения ведутся только в
 локальных файлах.
+
+## Повторная содержательная сверка (18 июля 2026)
+
+Повторная сверка проверяет не количество дочерних страниц в Notion, а
+утверждения, которые они добавляют к реализации. Источником были корневая
+страница `FParkan`, восемь оглавлений с 42 статьями, а также две специальные
+страницы: `План реализации stage 0–5: Vulkan revision` (редакция 18 июля) и
+`Ревью перехода на Vulkan: решение, доказательства и ограничения`.
+
+| Контракт из Notion | Локальное подтверждение | Результат |
+| --- | --- | --- |
+| Статьи 1–3: терминология, уровень доказательств, методика | `tomes/01-guide.md` | Полностью покрыто. |
+| Статьи 4–8: bootstrap, DLL, frame loop, World3D | `tomes/02-architecture.md` | Полностью покрыто. |
+| Статьи 9–13: VFS, NRes, RsLi, registry, unit и auxiliary formats | `tomes/03-resources.md` и `reference/` | Полностью покрыто. |
+| Статьи 14–18: TMA, mission loader, Land, ArealMap и world construction | `tomes/04-world.md`, `reference/tma.md`, `reference/msh.md` | Полностью покрыто. |
+| Статьи 19–27: Ngi32, MSH, animation, MAT0/WEAR/Texm, terrain и кадр | `tomes/05-render.md`, `reference/`, `rendering/` | Покрыто; локально дополнено более свежими evidence по D3D7 camera, Node38 и Terrain/GetShade. |
+| Статьи 28–32: AI, control, camera, audio, network | `tomes/06-behavior.md`, `appendices/script-vm.md` | Полностью покрыто. |
+| Статьи 33–37 и Vulkan revision: ports, stages, deterministic gates, Vulkan profile | `tomes/07-implementation.md`, `baseline/vulkan-revision-plan.md` | Полностью покрыто в Windows-only редакции. |
+| Статьи 38–42 и приложения A–D: ABI, corpus, knowledge boundaries, glossary, shell, saves, VM | `tomes/08-evidence.md`, `appendices/`, `evidence/`, этот audit | Полностью покрыто. |
+
+Пропущенных применимых технических контрактов в этом срезе не найдено. В
+частности, локальный Vulkan plan уже содержит независимость решений Vulkan и
+`winit`, Vulkan 1.1 baseline, `ash`-изоляцию, SPIR-V manifest/hash, capability
+gates, canonical RGBA8 upload и первичность backend-neutral command capture.
+Не переносились только исторические cross-platform acceptance требования из
+Notion: они прямо отменены текущим Windows-only scope, а не потеряны при
+синхронизации.
+
+Следовательно, новые факты следует добавлять непосредственно в тематический
+локальный документ; повторный перенос дерева или дублирование страниц Notion
+не требуется.
