@@ -1142,6 +1142,15 @@ timestamps measure whole elapsed intervals, including archive I/O, allocation,
 validation, cache effects and progress-file writes; they are not per-parser
 benchmarks.
 
+One bounded Part 2 trace reached `GraphVisualTextureRequests(64)` at 134,793
+ms but did not reach `Assets`: its MAT0 markers were 3/4 at 28,823/35,473 ms,
+13/16 at 88,260/88,334 ms, 25 at 108,137 ms, 38 at 121,369 ms, and 47 at
+128,160 ms. The process was stopped immediately after the 134.8-second marker.
+This makes visual-graph expansion, rather than asset preparation or Vulkan,
+the measured unfinished interval for this run. It still does not allocate that
+time among MAT0 decode, graph allocation, archive I/O, OS cache state, or the
+interleaved TEXM requests.
+
 A rebuilt executable then ran a controlled 180-second Part 2 `Autodemo.00`
 probe with the append-only trace. Before exact-child termination it recorded
 `GraphVisualTextureRequests(64)`, `GraphVisualMaterialRequests(100)`, and every
