@@ -3,6 +3,10 @@ all-features = true
 
 [advisories]
 yanked = "deny"
+ignore = [
+  { id = "RUSTSEC-2026-0194", reason = "quick-xml is only reached by the build-time wayland-scanner proc macro while compiling trusted Wayland protocol XML shipped by dependencies; winit 0.30's current wayland-scanner release cannot accept quick-xml 0.41 yet." },
+  { id = "RUSTSEC-2026-0195", reason = "quick-xml is only reached by the build-time wayland-scanner proc macro while compiling trusted Wayland protocol XML shipped by dependencies; winit 0.30's current wayland-scanner release cannot accept quick-xml 0.41 yet." },
+]
 
 [bans]
 multiple-versions = "allow"
