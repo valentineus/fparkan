@@ -14,9 +14,9 @@
 use fparkan_platform::RenderRequest;
 use fparkan_platform_winit::{window_native_handles, WinitWindowPlan};
 use fparkan_render_vulkan::{
-    VulkanSmokeBootstrapProgress, VulkanSmokeFrameOutcome, VulkanSmokeRenderer,
-    VulkanSmokeRendererCreateInfo, VulkanSmokeRendererReport, VulkanSmokeShutdownReport,
-    VulkanStaticMesh, VulkanValidationReport,
+    project_msh_to_static_mesh, VulkanSmokeBootstrapProgress, VulkanSmokeFrameOutcome,
+    VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo, VulkanSmokeRendererReport,
+    VulkanSmokeShutdownReport, VulkanStaticMesh, VulkanValidationReport,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -55,6 +55,7 @@ fn main() {
 
 fn run(args: &[String]) -> Result<String, String> {
     let options = SmokeOptions::parse(args)?;
+    let mesh = options.load_mesh()?;
     remove_stale_output(&options)?;
     let event_loop = EventLoop::new().map_err(|err| format!("winit event loop: {err}"))?;
     event_loop.set_control_flow(ControlFlow::Poll);
@@ -65,7 +66,7 @@ fn run(args: &[String]) -> Result<String, String> {
         Arc::clone(&completed),
         Arc::clone(&progress),
     );
-    let mut app = SmokeApp::new(options, completed, progress);
+    let mut app = SmokeApp::new(options, mesh, completed, progress);
     if let Err(err) = event_loop.run_app(&mut app) {
         app.error = Some(format!("winit event loop: {err}"));
     }
@@ -110,6 +111,40 @@ struct SmokeOptions {
     frames: u32,
     resize_frame: u32,
     timeout_seconds: u64,
+    mesh_input: MeshInput,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MeshInput {
+    SmokeTriangle,
+    Msh {
+        root: PathBuf,
+        archive: String,
+        name: String,
+    },
+}
+
+impl MeshInput {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::SmokeTriangle => "synthetic-smoke-triangle",
+            Self::Msh { .. } => "original-msh",
+        }
+    }
+
+    fn archive(&self) -> &str {
+        match self {
+            Self::SmokeTriangle => "",
+            Self::Msh { archive, .. } => archive,
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::SmokeTriangle => "",
+            Self::Msh { name, .. } => name,
+        }
+    }
 }
 
 impl SmokeOptions {
@@ -118,6 +153,9 @@ impl SmokeOptions {
         let mut frames = DEFAULT_TARGET_FRAMES;
         let mut resize_frame = DEFAULT_RESIZE_FRAME;
         let mut timeout_seconds = DEFAULT_TIMEOUT_SECONDS;
+        let mut model_root = None;
+        let mut model_archive = None;
+        let mut model_name = None;
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -149,6 +187,27 @@ impl SmokeOptions {
                         .parse()
                         .map_err(|_| "--timeout-seconds must be an integer".to_string())?;
                 }
+                "--model-root" => {
+                    model_root = Some(
+                        iter.next()
+                            .map(PathBuf::from)
+                            .ok_or_else(|| "--model-root requires a path".to_string())?,
+                    );
+                }
+                "--model-archive" => {
+                    model_archive = Some(
+                        iter.next()
+                            .cloned()
+                            .ok_or_else(|| "--model-archive requires a value".to_string())?,
+                    );
+                }
+                "--model-name" => {
+                    model_name = Some(
+                        iter.next()
+                            .cloned()
+                            .ok_or_else(|| "--model-name requires a value".to_string())?,
+                    );
+                }
                 _ => return Err(format!("unknown native smoke option: {arg}")),
             }
         }
@@ -161,17 +220,47 @@ impl SmokeOptions {
         if timeout_seconds == 0 {
             return Err("native smoke requires --timeout-seconds >= 1".to_string());
         }
+        let mesh_input = match (model_root, model_archive, model_name) {
+            (None, None, None) => MeshInput::SmokeTriangle,
+            (Some(root), Some(archive), Some(name)) => MeshInput::Msh {
+                root,
+                archive,
+                name,
+            },
+            _ => {
+                return Err(
+                    "--model-root, --model-archive and --model-name must be supplied together"
+                        .to_string(),
+                );
+            }
+        };
         Ok(Self {
             out,
             frames,
             resize_frame,
             timeout_seconds,
+            mesh_input,
         })
+    }
+
+    fn load_mesh(&self) -> Result<VulkanStaticMesh, String> {
+        match &self.mesh_input {
+            MeshInput::SmokeTriangle => Ok(VulkanStaticMesh::smoke_triangle()),
+            MeshInput::Msh {
+                root,
+                archive,
+                name,
+            } => {
+                let model = fparkan_inspection::load_model_from_root(root, archive, name)?;
+                project_msh_to_static_mesh(&model).map_err(|err| err.to_string())
+            }
+        }
     }
 }
 
 struct SmokeApp {
     options: SmokeOptions,
+    mesh: VulkanStaticMesh,
     completed: Arc<AtomicBool>,
     progress: Arc<SharedSmokeProgress>,
     window_id: Option<WindowId>,
@@ -215,11 +304,13 @@ impl From<VulkanSmokeShutdownReport> for RendererSnapshot {
 impl SmokeApp {
     fn new(
         options: SmokeOptions,
+        mesh: VulkanStaticMesh,
         completed: Arc<AtomicBool>,
         progress: Arc<SharedSmokeProgress>,
     ) -> Self {
         Self {
             options,
+            mesh,
             completed,
             progress,
             window_id: None,
@@ -278,6 +369,7 @@ impl SmokeApp {
             .or_else(|| self.live_renderer_snapshot())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn render_report(
         &self,
         status: &'static str,
@@ -310,6 +402,11 @@ impl SmokeApp {
             validation_vuids: &validation.vuids,
             requested_frames: self.options.frames,
             timeout_seconds: self.options.timeout_seconds,
+            mesh_source: self.options.mesh_input.kind(),
+            mesh_archive: self.options.mesh_input.archive(),
+            mesh_name: self.options.mesh_input.name(),
+            mesh_vertex_count: self.mesh.vertices.len(),
+            mesh_index_count: self.mesh.indices.len(),
             shader_manifest_hash: renderer
                 .as_ref()
                 .map_or("", |snapshot| snapshot.report.shader_manifest_hash.as_str()),
@@ -509,6 +606,11 @@ fn render_timeout_failure_report(
         validation_vuids: &[],
         requested_frames: options.frames,
         timeout_seconds: options.timeout_seconds,
+        mesh_source: options.mesh_input.kind(),
+        mesh_archive: options.mesh_input.archive(),
+        mesh_name: options.mesh_input.name(),
+        mesh_vertex_count: 0,
+        mesh_index_count: 0,
         shader_manifest_hash: "",
         vulkan_loader_status: if bootstrap.loader_available {
             "available"
@@ -603,7 +705,7 @@ impl ApplicationHandler for SmokeApp {
             drawable_extent: (size.width.max(1), size.height.max(1)),
             render_request: RenderRequest::conservative(),
             enable_validation: true,
-            mesh: VulkanStaticMesh::smoke_triangle(),
+            mesh: self.mesh.clone(),
             bootstrap_progress: Some(Arc::clone(&self.progress.bootstrap)),
         }) {
             Ok(renderer) => renderer,
@@ -731,6 +833,11 @@ struct SmokeReport<'a> {
     validation_vuids: &'a [String],
     requested_frames: u32,
     timeout_seconds: u64,
+    mesh_source: &'a str,
+    mesh_archive: &'a str,
+    mesh_name: &'a str,
+    mesh_vertex_count: usize,
+    mesh_index_count: usize,
     shader_manifest_hash: &'a str,
     vulkan_loader_status: &'a str,
     vulkan_instance_status: &'a str,
@@ -972,6 +1079,7 @@ mod tests {
                 frames: DEFAULT_TARGET_FRAMES,
                 resize_frame: DEFAULT_RESIZE_FRAME,
                 timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+                mesh_input: MeshInput::SmokeTriangle,
             })
         );
     }
@@ -1007,6 +1115,7 @@ mod tests {
                 frames: DEFAULT_TARGET_FRAMES,
                 resize_frame: DEFAULT_RESIZE_FRAME,
                 timeout_seconds: 45,
+                mesh_input: MeshInput::SmokeTriangle,
             })
         );
     }
@@ -1023,6 +1132,46 @@ mod tests {
         assert_eq!(
             parsed,
             Err("native smoke requires --timeout-seconds >= 1".to_string())
+        );
+    }
+
+    #[test]
+    fn parses_original_msh_input_as_one_atomic_request() {
+        let parsed = SmokeOptions::parse(&[
+            "--out".to_string(),
+            "target/report.json".to_string(),
+            "--model-root".to_string(),
+            "C:/GOG".to_string(),
+            "--model-archive".to_string(),
+            "system.rlb".to_string(),
+            "--model-name".to_string(),
+            "MTCHECK.MSH".to_string(),
+        ]);
+
+        assert!(matches!(
+            parsed,
+            Ok(SmokeOptions {
+                mesh_input: MeshInput::Msh { archive, name, .. },
+                ..
+            }) if archive == "system.rlb" && name == "MTCHECK.MSH"
+        ));
+    }
+
+    #[test]
+    fn rejects_partial_original_msh_input() {
+        let parsed = SmokeOptions::parse(&[
+            "--out".to_string(),
+            "target/report.json".to_string(),
+            "--model-root".to_string(),
+            "C:/GOG".to_string(),
+        ]);
+
+        assert_eq!(
+            parsed,
+            Err(
+                "--model-root, --model-archive and --model-name must be supplied together"
+                    .to_string()
+            )
         );
     }
 
@@ -1085,6 +1234,11 @@ mod tests {
             validation_vuids: &["VUID-A".to_string(), "VUID-B".to_string()],
             requested_frames: 300,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
+            mesh_source: "original-msh",
+            mesh_archive: "system.rlb",
+            mesh_name: "MTCHECK.MSH",
+            mesh_vertex_count: 128,
+            mesh_index_count: 252,
             shader_manifest_hash: "deadbeef",
             vulkan_loader_status: "available",
             vulkan_instance_status: "created",
@@ -1109,6 +1263,7 @@ mod tests {
         assert!(json.contains("\"validation_vuids\": ["));
         assert!(json.contains("\"vulkan_device_name\": \"Windows test GPU\""));
         assert!(json.contains("\"runner_architecture\": \"x86_64\""));
+        assert!(json.contains("\"mesh_source\": \"original-msh\""));
     }
 
     #[test]
@@ -1130,7 +1285,9 @@ mod tests {
                 frames: DEFAULT_TARGET_FRAMES,
                 resize_frame: DEFAULT_RESIZE_FRAME,
                 timeout_seconds: 7,
+                mesh_input: MeshInput::SmokeTriangle,
             },
+            mesh: VulkanStaticMesh::smoke_triangle(),
             completed: Arc::new(AtomicBool::new(false)),
             progress: Arc::new(SharedSmokeProgress::default()),
             window_id: None,

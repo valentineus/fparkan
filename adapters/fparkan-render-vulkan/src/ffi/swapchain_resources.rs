@@ -337,7 +337,9 @@ fn create_graphics_pipeline(
         .rasterizer_discard_enable(false)
         .polygon_mode(vk::PolygonMode::FILL)
         .line_width(1.0)
-        .cull_mode(vk::CullModeFlags::BACK)
+        // Static MSH viewer mode has no original material/cull state yet; draw
+        // both windings so every source batch is visible during the bridge.
+        .cull_mode(vk::CullModeFlags::NONE)
         .front_face(vk::FrontFace::CLOCKWISE)
         .depth_bias_enable(false);
     let multisample_state = vk::PipelineMultisampleStateCreateInfo::default()

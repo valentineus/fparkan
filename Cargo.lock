@@ -561,6 +561,7 @@ dependencies = [
  "ash",
  "ash-window",
  "fparkan-binary",
+ "fparkan-msh",
  "fparkan-platform",
  "fparkan-render",
  "serde",
@@ -650,6 +651,7 @@ dependencies = [
 name = "fparkan-vulkan-smoke"
 version = "0.1.0"
 dependencies = [
+ "fparkan-inspection",
  "fparkan-platform",
  "fparkan-platform-winit",
  "fparkan-render-vulkan",

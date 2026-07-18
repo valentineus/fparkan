@@ -1,0 +1,161 @@
+//! Format-to-GPU geometry bridge for the initial static asset renderer.
+
+use crate::{VulkanStaticMesh, VulkanStaticVertex};
+use fparkan_msh::ModelAsset;
+
+/// Error returned when a validated MSH cannot enter the current static GPU path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VulkanAssetMeshError {
+    /// The model has no triangle batches.
+    EmptyGeometry,
+    /// A position used by a batch is non-finite.
+    NonFinitePosition,
+    /// The view-plane extent is zero or otherwise not usable for normalization.
+    DegenerateViewExtent,
+    /// The indexed model exceeds the current 16-bit Vulkan input contract.
+    IndexOutOfRange,
+}
+
+impl std::fmt::Display for VulkanAssetMeshError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyGeometry => write!(f, "MSH contains no triangle geometry"),
+            Self::NonFinitePosition => write!(f, "MSH contains a non-finite position"),
+            Self::DegenerateViewExtent => write!(f, "MSH has a degenerate XZ view extent"),
+            Self::IndexOutOfRange => write!(f, "MSH index exceeds the static Vulkan u16 contract"),
+        }
+    }
+}
+
+impl std::error::Error for VulkanAssetMeshError {}
+
+/// Projects validated MSH geometry into the current static Vulkan clip-space path.
+///
+/// The original engine's node transforms, camera and material pipeline are not
+/// substituted here. This bridge is intentionally a static asset-viewer step:
+/// it preserves every batch's `index_start`, `index_count` and `base_vertex`,
+/// projects the conventional `Iron3D` XZ ground plane into the current XY shader
+/// input, and scales the used bounds uniformly into the visible clip rectangle.
+///
+/// # Errors
+///
+/// Returns [`VulkanAssetMeshError`] if the source cannot be represented by the
+/// current 16-bit, triangle-list viewer input.
+pub fn project_msh_to_static_mesh(
+    model: &ModelAsset,
+) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
+    let mut indices = Vec::new();
+    for batch in &model.batches {
+        let start = usize::try_from(batch.index_start)
+            .map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?;
+        let end = start
+            .checked_add(usize::from(batch.index_count))
+            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?;
+        for &raw_index in model
+            .indices
+            .get(start..end)
+            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?
+        {
+            let index = batch
+                .base_vertex
+                .checked_add(u32::from(raw_index))
+                .ok_or(VulkanAssetMeshError::IndexOutOfRange)?;
+            indices.push(u16::try_from(index).map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?);
+        }
+    }
+    if indices.is_empty() {
+        return Err(VulkanAssetMeshError::EmptyGeometry);
+    }
+
+    let mut min_x = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut min_z = f32::INFINITY;
+    let mut max_z = f32::NEG_INFINITY;
+    for &index in &indices {
+        let position = model
+            .positions
+            .get(usize::from(index))
+            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?;
+        if !position.iter().all(|value| value.is_finite()) {
+            return Err(VulkanAssetMeshError::NonFinitePosition);
+        }
+        min_x = min_x.min(position[0]);
+        max_x = max_x.max(position[0]);
+        min_z = min_z.min(position[2]);
+        max_z = max_z.max(position[2]);
+    }
+    let extent = (max_x - min_x).max(max_z - min_z);
+    if !extent.is_finite() || extent <= f32::EPSILON {
+        return Err(VulkanAssetMeshError::DegenerateViewExtent);
+    }
+    let center_x = (min_x + max_x) * 0.5;
+    let center_z = (min_z + max_z) * 0.5;
+    let scale = 1.6 / extent;
+    let vertices = model
+        .positions
+        .iter()
+        .map(|position| VulkanStaticVertex {
+            position: [
+                (position[0] - center_x) * scale,
+                (position[2] - center_z) * scale,
+            ],
+            color: [0.82, 0.72, 0.31],
+        })
+        .collect();
+
+    Ok(VulkanStaticMesh { vertices, indices })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fparkan_msh::{Batch, ModelAsset};
+
+    fn model(positions: Vec<[f32; 3]>, indices: Vec<u16>, batches: Vec<Batch>) -> ModelAsset {
+        ModelAsset {
+            node_stride: 0,
+            node_count: 0,
+            nodes_raw: Vec::new(),
+            slots: Vec::new(),
+            positions,
+            normals: None,
+            uv0: None,
+            indices,
+            batches,
+            node_names: None,
+        }
+    }
+
+    fn batch(index_start: u32, index_count: u16, base_vertex: u32) -> Batch {
+        Batch {
+            batch_flags: 0,
+            material_index: 0,
+            opaque4: 0,
+            opaque6: 0,
+            index_count,
+            index_start,
+            opaque14: 0,
+            base_vertex,
+        }
+    }
+
+    #[test]
+    fn projects_xz_geometry_and_applies_base_vertex() {
+        let mesh = project_msh_to_static_mesh(&model(
+            vec![
+                [99.0, 0.0, 99.0],
+                [-2.0, 4.0, -1.0],
+                [2.0, 8.0, -1.0],
+                [-2.0, 1.0, 3.0],
+            ],
+            vec![0, 1, 2],
+            vec![batch(0, 3, 1)],
+        ))
+        .expect("representable MSH");
+
+        assert_eq!(mesh.indices, vec![1, 2, 3]);
+        assert_eq!(mesh.vertices[1].position, [-0.8, -0.8]);
+        assert_eq!(mesh.vertices[2].position, [0.8, -0.8]);
+        assert_eq!(mesh.vertices[3].position, [-0.8, 0.8]);
+    }
+}

@@ -294,14 +294,14 @@ S2-PLANNING-RENDER-006	covered	cargo test -p fparkan-render --offline invalid_ra
 S2-PLANNING-RENDER-007	covered	cargo test -p fparkan-render --offline capture_is_stable
 S2-PLANNING-RENDER-008	covered-planning	cargo test -p fparkan-render --offline recording_backend_stores_captures
 S2-PLANNING-RENDER-009	covered	cargo xtask policy
-S3-VK-MESH-UPLOAD-001	blocked	awaits Stage 3 Vulkan asset renderer and GPU upload path
+S3-VK-MESH-UPLOAD-001	covered-gpu	cargo run -p fparkan-vulkan-smoke --release --locked -- --out target/fparkan/stage3-mtcheck-msh.json --frames 300 --resize-frame 120 --timeout-seconds 90 --model-root <GOG_ROOT> --model-archive system.rlb --model-name MTCHECK.MSH; original MSH reports 128 vertices and 252 indices
 S3-VK-TEXM-UPLOAD-001	blocked	awaits Stage 3 Vulkan texture upload path
 S3-VK-DESCRIPTOR-001	blocked	awaits Stage 3 descriptor set contract implementation
 S3-VK-PIPELINE-001	blocked	awaits Stage 3 graphics pipeline key and cache implementation
-S3-VK-DRAW-MODEL-001	blocked	awaits Stage 3 real Vulkan indexed model draw path
+S3-VK-DRAW-MODEL-001	covered-gpu	cargo run -p fparkan-vulkan-smoke --release --locked -- --out target/fparkan/stage3-mtcheck-msh.json --frames 300 --resize-frame 120 --timeout-seconds 90 --model-root <GOG_ROOT> --model-archive system.rlb --model-name MTCHECK.MSH; live Win32 Vulkan indexed MSH draw/present
 S3-VK-DRAW-TERRAIN-001	blocked	awaits Stage 3 terrain Vulkan draw path
 S3-VK-PIXEL-CAPTURE-001	blocked	awaits Stage 3 fixed-camera pixel capture approval flow
-S3-VK-VALIDATION-001	blocked	awaits Stage 3 validation-clean GPU frame execution
+S3-VK-VALIDATION-001	covered-gpu	cargo run -p fparkan-vulkan-smoke --release --locked -- --out target/fparkan/stage3-mtcheck-msh.json --frames 300 --resize-frame 120 --timeout-seconds 90 --model-root <GOG_ROOT> --model-archive system.rlb --model-name MTCHECK.MSH; validation_warning_count=0 and validation_error_count=0
 S3-GL-001	omitted	legacy OpenGL adapters are outside the Windows-only Vulkan renderer scope
 S3-GL-002	omitted	GLES2 and portable-device targets are outside the Windows-only Vulkan renderer scope
 S3-GL-003	blocked	legacy fparkan-render-gl adapter removed while Vulkan renderer path is being brought in as the stage-3 backend

@@ -10,6 +10,7 @@ build = "build.rs"
 ash = "0.38"
 ash-window = "0.13"
 fparkan-binary = { path = "../../crates/fparkan-binary", version = "0.1.0" }
+fparkan-msh = { path = "../../crates/fparkan-msh", version = "0.1.0" }
 fparkan-platform = { path = "../../crates/fparkan-platform", version = "0.1.0" }
 fparkan-render = { path = "../../crates/fparkan-render", version = "0.1.0" }
 serde = { version = "1.0", features = ["derive"] }
