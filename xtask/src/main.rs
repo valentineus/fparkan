@@ -43,8 +43,8 @@ const SUPPLY_CHAIN_POLICY_CONFIG: &str = "deny.toml";
 const REQUIRED_NATIVE_SMOKE_PLATFORMS: &[&str] = &["macos"];
 const APPROVED_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const SUPPLY_CHAIN_BANNED_PACKAGES: &[&str] = &["native-tls", "openssl", "openssl-sys"];
-const PINNED_RUST_TOOLCHAIN: &str = "1.87.0";
-const WORKSPACE_MSRV: &str = "1.87";
+const PINNED_RUST_TOOLCHAIN: &str = "1.97.1";
+const WORKSPACE_MSRV: &str = "1.97";
 const ALLOW_SUPPLY_CHAIN_FALLBACK_ENV: &str = "FPARKAN_ALLOW_SUPPLY_CHAIN_FALLBACK";
 
 fn workspace_root_path() -> PathBuf {
@@ -3156,8 +3156,8 @@ mod tests {
         assert!(json.contains("\"commit_sha\": \"0123456789abcdef0123456789abcdef01234567\""));
         assert!(json.contains("\"git_dirty\": false"));
         assert!(json.contains("\"runner_identity\": \"github-actions/12345/stage0-macos\""));
-        assert!(json.contains("\"rust_toolchain\": \"1.87.0\""));
-        assert!(json.contains("\"msrv\": \"1.87\""));
+        assert!(json.contains("\"rust_toolchain\": \"1.97.1\""));
+        assert!(json.contains("\"msrv\": \"1.97\""));
     }
 
     #[test]
@@ -3410,7 +3410,7 @@ mod tests {
         fs::write(
             &manifest,
             format!(
-                "schema = 1\n\n[[corpus]]\nid = \"part1-local\"\nkind = \"part1\"\nroot = \"{}\"\nexpected_profile = \"parkan-is-part1\"\n\n[[corpus]]\nid = \"part2-local\"\nkind = \"part2\"\nroot = \"{}\"\nexpected_profile = \"parkan-is-part2\"\n",
+                "schema = 1\n\n[[corpus]]\nid = \"part1-local\"\nkind = \"part1\"\nroot = '{}'\nexpected_profile = \"parkan-is-part1\"\n\n[[corpus]]\nid = \"part2-local\"\nkind = \"part2\"\nroot = '{}'\nexpected_profile = \"parkan-is-part2\"\n",
                 part1.display(),
                 part2.display()
             ),
@@ -3538,7 +3538,7 @@ fparkan-render-vulkan = { path = "../../adapters/fparkan-render-vulkan" }
         .map_err(|err| err.to_string())?;
         fs::write(
             root.join("Cargo.toml"),
-            "[workspace]\n[workspace.package]\nrust-version = \"1.87\"\n",
+            "[workspace]\n[workspace.package]\nrust-version = \"1.97\"\n",
         )
         .map_err(|err| err.to_string())?;
 

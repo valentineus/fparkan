@@ -364,10 +364,14 @@ fn file_identity(metadata: &fs::Metadata) -> Option<u64> {
 #[cfg(windows)]
 #[allow(clippy::unnecessary_wraps)]
 fn file_identity(metadata: &fs::Metadata) -> Option<u64> {
+    // Stable Rust does not expose the Windows file index.  Keep a best-effort
+    // replacement detector from metadata that is available through the
+    // supported standard-library API; `read` also compares size and
+    // last-write time before returning bytes.
     Some(
-        (metadata.volume_serial_number() as u64).rotate_left(40)
-            ^ ((metadata.file_index_high() as u64) << 32)
-            ^ metadata.file_index_low() as u64,
+        metadata.creation_time().rotate_left(17)
+            ^ metadata.last_write_time().rotate_left(31)
+            ^ u64::from(metadata.file_attributes()).rotate_left(47),
     )
 }
 

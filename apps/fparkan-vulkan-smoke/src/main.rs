@@ -1076,7 +1076,7 @@ mod tests {
             git_dirty: false,
             runner_identity: "github-actions/12345/stage0-macos".to_string(),
             runner_architecture: "aarch64",
-            rust_toolchain: "1.87.0".to_string(),
+            rust_toolchain: "1.97.1".to_string(),
             target_triple: "aarch64-apple-darwin".to_string(),
             platform: "macos",
             status: "passed",
