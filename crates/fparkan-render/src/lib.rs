@@ -43,6 +43,90 @@ impl RawCameraTransform {
     pub fn translation(self) -> [f32; 3] {
         Self::TRANSLATION_WORD_INDICES.map(|index| f32::from_bits(self.words[index]))
     }
+
+    /// Inverts a finite row-major affine transform without assigning it a
+    /// camera-space meaning.
+    ///
+    /// The legacy SIMD dispatch multiplies these blocks as ordinary row-major
+    /// matrices and the confirmed camera samples have translation in the last
+    /// column. `Some` therefore means only that this block has a non-singular
+    /// affine inverse. Callers must still establish whether it is a
+    /// camera-to-world transform before using the result as a view matrix.
+    #[must_use]
+    pub fn try_inverse_affine_row_major(self) -> Option<[f32; 16]> {
+        let matrix = self.words.map(f32::from_bits);
+        if !matrix.iter().all(|value| value.is_finite())
+            || matrix[12].abs() > f32::EPSILON
+            || matrix[13].abs() > f32::EPSILON
+            || matrix[14].abs() > f32::EPSILON
+            || (matrix[15] - 1.0).abs() > f32::EPSILON
+        {
+            return None;
+        }
+
+        let [m00, m01, m02, _, m10, m11, m12, _, m20, m21, m22, _, _, _, _, _] = matrix;
+        let cofactor00 = m11.mul_add(m22, -(m12 * m21));
+        let cofactor01 = m02.mul_add(m21, -(m01 * m22));
+        let cofactor02 = m01.mul_add(m12, -(m02 * m11));
+        let determinant = m00.mul_add(cofactor00, m10.mul_add(cofactor01, m20 * cofactor02));
+        if !determinant.is_finite() || determinant == 0.0 {
+            return None;
+        }
+
+        let inverse_determinant = determinant.recip();
+        let inverse = [
+            cofactor00 * inverse_determinant,
+            m02.mul_add(m21, -(m01 * m22)) * inverse_determinant,
+            cofactor02 * inverse_determinant,
+            0.0,
+            m12.mul_add(m20, -(m10 * m22)) * inverse_determinant,
+            m00.mul_add(m22, -(m02 * m20)) * inverse_determinant,
+            m02.mul_add(m10, -(m00 * m12)) * inverse_determinant,
+            0.0,
+            m10.mul_add(m21, -(m11 * m20)) * inverse_determinant,
+            m01.mul_add(m20, -(m00 * m21)) * inverse_determinant,
+            m00.mul_add(m11, -(m01 * m10)) * inverse_determinant,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ];
+        let [translation_x, translation_y, translation_z] = self.translation();
+        let translation = [
+            -(inverse[0].mul_add(
+                translation_x,
+                inverse[1].mul_add(translation_y, inverse[2] * translation_z),
+            )),
+            -(inverse[4].mul_add(
+                translation_x,
+                inverse[5].mul_add(translation_y, inverse[6] * translation_z),
+            )),
+            -(inverse[8].mul_add(
+                translation_x,
+                inverse[9].mul_add(translation_y, inverse[10] * translation_z),
+            )),
+        ];
+
+        Some([
+            inverse[0],
+            inverse[1],
+            inverse[2],
+            translation[0],
+            inverse[4],
+            inverse[5],
+            inverse[6],
+            translation[1],
+            inverse[8],
+            inverse[9],
+            inverse[10],
+            translation[2],
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ])
+    }
 }
 
 /// Raw camera state observed through the original Terrain camera interface.
@@ -745,6 +829,28 @@ fn identity_transform() -> [f32; 16] {
 mod tests {
     use super::*;
 
+    fn multiply_row_major(left: [f32; 16], right: [f32; 16]) -> [f32; 16] {
+        let mut result = [0.0; 16];
+        for row in 0..4 {
+            for column in 0..4 {
+                result[row * 4 + column] = (0..4)
+                    .map(|index| left[row * 4 + index] * right[index * 4 + column])
+                    .sum();
+            }
+        }
+        result
+    }
+
+    fn assert_matrix_approximately_identity(matrix: [f32; 16]) {
+        for (index, value) in matrix.into_iter().enumerate() {
+            let expected = if index / 4 == index % 4 { 1.0 } else { 0.0 };
+            assert!(
+                (value - expected).abs() < 0.000_02,
+                "matrix element {index}: expected {expected}, got {value}"
+            );
+        }
+    }
+
     #[test]
     fn raw_camera_pose_preserves_words_and_extracts_confirmed_translation() {
         let mut active = [0_u32; 16];
@@ -766,6 +872,26 @@ mod tests {
             [491.562_5, 761.550_8, 7.361_0]
         );
         assert_eq!(CameraSnapshot::default().raw_pose, None);
+    }
+
+    #[test]
+    fn raw_camera_transform_inverts_only_non_singular_affine_blocks() {
+        let source = [
+            0.0, -1.0, 0.0, 433.544_7, 0.948_985, 0.0, 0.315_322, 652.292_5, -0.315_322, 0.0,
+            0.948_985, 10.673_42, 0.0, 0.0, 0.0, 1.0,
+        ];
+        let transform = RawCameraTransform {
+            words: source.map(f32::to_bits),
+        };
+        let inverse = transform
+            .try_inverse_affine_row_major()
+            .expect("observed affine transform is invertible");
+
+        assert_matrix_approximately_identity(multiply_row_major(source, inverse));
+        assert_matrix_approximately_identity(multiply_row_major(inverse, source));
+
+        let singular = RawCameraTransform { words: [0_u32; 16] };
+        assert_eq!(singular.try_inverse_affine_row_major(), None);
     }
 
     fn snapshot_draw(

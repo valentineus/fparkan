@@ -1328,6 +1328,23 @@ to use its existing view/projection matrices: raw pose capture is intentionally
 not converted into a view matrix until the original transform/projection
 convention has evidence.
 
+The next live sample strengthens the representation contract but still does
+not name the transform's camera-space direction. For six no-input samples of
+one auto-demo camera object, selectors `0` and `2` were byte-identical,
+finite affine blocks with bottom row `(0, 0, 0, 1)`. Their upper 3x3 basis
+was normalized and their last-column translations changed from approximately
+`(441.038, 687.481, 10.754)` to `(433.545, 652.293, 10.673)`.
+
+This storage/order is not guessed: live `NGI32.dll!g_FastProc[23]` dispatches
+to RVA `0x1D9A0`, whose SSE implementation writes each output row as the sum
+of four scalar-weighted rows. Thus a contiguous 16-float block is multiplied
+as a conventional row-major 4x4 matrix. The render contract now exposes a
+mathematical `try_inverse_affine_row_major` helper for such finite,
+non-singular `[R | t; 0 0 0 1]` blocks. It returns no result for a singular or
+non-affine block and, crucially, does **not** identify that inverse as a view
+matrix. Whether a selector result is camera-to-world or already a renderer
+transform remains an evidence boundary.
+
 A fresh no-input launch of the canonical `iron_3d.exe` did create a responsive
 window titled `Parkan. Железная Стратегия`. A read-only probe then requested
 `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ` and attempted to read the known
