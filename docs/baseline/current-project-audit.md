@@ -11,6 +11,9 @@ Result on 2026-07-18:
 - canonical pipeline passes locally with Rust 1.97.1: formatting, policy,
   shader provenance, workspace tests, `clippy`, docs and `cargo deny` are
   executed through `cargo xtask ci`;
+- `rust-toolchain.toml` pins Rust 1.97.1 and installs only the
+  `x86_64-pc-windows-msvc` target; Linux and macOS target installation is not
+  part of the default developer setup;
 - internal path dependencies are version-pinned and the Windows-only winit
   graph enables only `rwh_06`, excluding Unix window-system dependencies;
 - `cargo deny` runs without advisory exceptions in the supported Windows graph.
