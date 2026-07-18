@@ -1182,6 +1182,13 @@ handedness, or initial mission camera selection. The Vulkan path must therefore
 continue to label its XY projection as diagnostic until a dynamic capture or
 further Terrain disassembly proves these contracts.
 
+On 2026-07-18 the canonical windowed GOG process was confirmed running with
+one targetable window titled `Parkan. Железная Стратегия`. Two read-only
+Windows.Graphics.Capture attempts failed before returning a frame with
+`SetIsBorderRequired failed: Интерфейс не поддерживается (0x80004002)`. No game
+input was sent and this contributes no visual, camera, timing, or memory
+evidence; a different capture/debugger path is required for dynamic analysis.
+
 The public `World3D.dll!stdSetCurrentCamera` is a one-pointer `__stdcall`
 wrapper: it delegates to the Terrain `stdSetCurrentCamera2` IAT thunk and then
 writes the same pointer to a World3D mirror global. An `iron3d.dll` call site
