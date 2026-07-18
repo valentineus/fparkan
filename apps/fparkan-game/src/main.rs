@@ -82,10 +82,11 @@ fn run(args: &[String]) -> Result<String, String> {
     if args.backend == RenderBackendMode::StaticVulkan {
         let mission_assets = loaded_mission_assets(&engine)
             .ok_or_else(|| "mission assets are unavailable after loading".to_string())?;
-        let (mesh, materials) = static_preview_mesh_and_materials(mission_assets)?;
+        let preview = static_preview_mesh_and_materials(mission_assets)?;
         return run_static_vulkan_mode(
-            mesh,
-            materials,
+            preview.mesh,
+            preview.materials,
+            preview.mesh_components,
             args.frames,
             &args.mission,
             loaded.object_count,
@@ -177,48 +178,87 @@ fn load_requested_mission(
     .map_err(|err| err.to_string())
 }
 
-/// Projects the explicitly bounded static-preview root into geometry and its
-/// selector-keyed diffuse material descriptors.
+/// Static geometry and descriptors belonging to the first preview root.
+struct StaticPreviewScene {
+    mesh: VulkanStaticMesh,
+    materials: Vec<VulkanStaticMaterial>,
+    mesh_components: usize,
+}
+
+/// Projects every MSH component of the explicitly bounded static-preview root
+/// into one mesh and selector-keyed diffuse material descriptors.
 ///
 /// This intentionally takes only the first MAT0 texture request for each MSH
 /// batch selector. Later material phases, animation, lightmaps, transforms,
 /// and gameplay visibility remain outside this preview bridge.
-fn static_preview_mesh_and_materials(
+fn static_preview_mesh_and_materials(assets: &MissionAssets) -> Result<StaticPreviewScene, String> {
+    let visual_ids = assets.visuals_for_object(0);
+    if visual_ids.is_empty() {
+        return Err("first static preview root has no prepared visuals".to_string());
+    }
+    let mut mesh = VulkanStaticMesh {
+        vertices: Vec::new(),
+        indices: Vec::new(),
+        draw_ranges: Vec::new(),
+    };
+    let mut materials = Vec::new();
+    let mut mesh_components = 0;
+    for visual_id in visual_ids {
+        let visual = assets.visual_by_id(*visual_id).ok_or_else(|| {
+            format!("first static preview root references unknown visual {visual_id:?}")
+        })?;
+        let Some(model_id) = visual.model_id else {
+            continue;
+        };
+        let model = assets.model_by_id(model_id).ok_or_else(|| {
+            format!("static preview visual {visual_id:?} references unknown model {model_id:?}")
+        })?;
+        let component = project_msh_to_static_mesh(&model.validated)
+            .map_err(|err| format!("project mission MSH for Vulkan: {err}"))?;
+        let selector_remap =
+            static_preview_component_materials(assets, visual, &component, &mut materials)?;
+        append_static_preview_component(&mut mesh, component, &selector_remap)?;
+        mesh_components += 1;
+    }
+    if mesh_components == 0 {
+        return Err("first static preview root has no mesh-backed visual".to_string());
+    }
+    Ok(StaticPreviewScene {
+        mesh,
+        materials,
+        mesh_components,
+    })
+}
+
+fn static_preview_component_materials(
     assets: &MissionAssets,
-) -> Result<(VulkanStaticMesh, Vec<VulkanStaticMaterial>), String> {
-    let model = assets.models.first().ok_or_else(|| {
-        "mission has no mesh-backed model for the static Vulkan bridge".to_string()
-    })?;
-    let mesh = project_msh_to_static_mesh(&model.validated)
-        .map_err(|err| format!("project mission MSH for Vulkan: {err}"))?;
-    let visual = assets
-        .visuals
-        .iter()
-        .find(|visual| visual.model_id == Some(model.id))
-        .ok_or_else(|| "static preview model has no prepared visual".to_string())?;
-    let mut selectors = mesh
+    visual: &PreparedVisual,
+    mesh: &VulkanStaticMesh,
+    materials: &mut Vec<VulkanStaticMaterial>,
+) -> Result<Vec<(u16, u16)>, String> {
+    let mut source_selectors = mesh
         .draw_ranges
         .iter()
         .map(|range| range.material_index)
         .collect::<Vec<_>>();
-    selectors.sort_unstable();
-    selectors.dedup();
-
-    let materials = selectors
+    source_selectors.sort_unstable();
+    source_selectors.dedup();
+    source_selectors
         .into_iter()
-        .map(|material_index| {
-            let material_id = visual.material_ids.get(usize::from(material_index)).ok_or_else(|| {
-                format!(
-                    "static preview MSH batch selector {material_index} has no prepared WEAR material"
-                )
-            })?;
+        .map(|source_selector| {
+            let material_id = visual
+                .material_ids
+                .get(usize::from(source_selector))
+                .ok_or_else(|| {
+                    format!(
+                        "static preview MSH batch selector {source_selector} has no prepared WEAR material"
+                    )
+                })?;
             let material = assets.material_by_id(*material_id).ok_or_else(|| {
-                format!(
-                    "static preview prepared material {material_index} is unavailable"
-                )
+                format!("static preview prepared material {source_selector} is unavailable")
             })?;
             let texture_name = material.texture_requests.first().ok_or_else(|| {
-                format!("static preview material {material_index} has no MAT0 diffuse texture")
+                format!("static preview material {source_selector} has no MAT0 diffuse texture")
             })?;
             let texture = assets
                 .textures
@@ -229,25 +269,81 @@ fn static_preview_mesh_and_materials(
                 })
                 .ok_or_else(|| {
                     format!(
-                        "static preview diffuse texture {texture_name:?} for material {material_index} is unavailable"
+                        "static preview diffuse texture {texture_name:?} for material {source_selector} is unavailable"
                     )
                 })?;
             let image = texture.decode_mip_rgba8(0).map_err(|err| {
                 format!(
-                    "decode static preview diffuse texture {texture_name:?} for material {material_index}: {err}"
+                    "decode static preview diffuse texture {texture_name:?} for material {source_selector}: {err}"
                 )
             })?;
-            Ok(VulkanStaticMaterial {
-                material_index,
+            let preview_selector = u16::try_from(materials.len()).map_err(|_| {
+                "static preview exceeds the available 16-bit material selector space".to_string()
+            })?;
+            materials.push(VulkanStaticMaterial {
+                material_index: preview_selector,
                 texture: VulkanStaticTexture {
                     width: image.width,
                     height: image.height,
                     rgba8: image.rgba8,
                 },
-            })
+            });
+            Ok((source_selector, preview_selector))
         })
-        .collect::<Result<Vec<_>, String>>()?;
-    Ok((mesh, materials))
+        .collect()
+}
+
+fn append_static_preview_component(
+    target: &mut VulkanStaticMesh,
+    component: VulkanStaticMesh,
+    selector_remap: &[(u16, u16)],
+) -> Result<(), String> {
+    let vertex_base = u16::try_from(target.vertices.len()).map_err(|_| {
+        "static preview exceeds the available 16-bit vertex index space".to_string()
+    })?;
+    let first_index_base = u32::try_from(target.indices.len())
+        .map_err(|_| "static preview index count exceeds u32".to_string())?;
+    target
+        .vertices
+        .len()
+        .checked_add(component.vertices.len())
+        .filter(|count| *count <= usize::from(u16::MAX) + 1)
+        .ok_or_else(|| {
+            "static preview exceeds the available 16-bit vertex index space".to_string()
+        })?;
+    target.vertices.extend(component.vertices);
+    target.indices.extend(
+        component
+            .indices
+            .into_iter()
+            .map(|index| {
+                index.checked_add(vertex_base).ok_or_else(|| {
+                    "static preview exceeds the available 16-bit vertex index space".to_string()
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    for range in component.draw_ranges {
+        let material_index = selector_remap
+            .iter()
+            .find_map(|(source, preview)| (*source == range.material_index).then_some(*preview))
+            .ok_or_else(|| {
+                format!(
+                    "static preview component has no material remap for selector {}",
+                    range.material_index
+                )
+            })?;
+        target
+            .draw_ranges
+            .push(fparkan_render_vulkan::VulkanStaticDrawRange {
+                first_index: first_index_base
+                    .checked_add(range.first_index)
+                    .ok_or_else(|| "static preview index range exceeds u32".to_string())?,
+                material_index,
+                ..range
+            });
+    }
+    Ok(())
 }
 
 fn prepare_load_progress_path(path: &std::path::Path) -> Result<(), String> {
@@ -264,13 +360,21 @@ fn write_load_progress(path: &std::path::Path, phase: MissionLoadPhase) -> Resul
 fn run_static_vulkan_mode(
     mesh: VulkanStaticMesh,
     materials: Vec<VulkanStaticMaterial>,
+    mesh_components: usize,
     target_frames: u64,
     mission: &str,
     object_count: usize,
 ) -> Result<String, String> {
     let event_loop = EventLoop::new().map_err(|err| format!("winit event loop: {err}"))?;
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = StaticVulkanApp::new(mesh, materials, target_frames, mission, object_count);
+    let mut app = StaticVulkanApp::new(
+        mesh,
+        materials,
+        mesh_components,
+        target_frames,
+        mission,
+        object_count,
+    );
     if let Err(err) = event_loop.run_app(&mut app) {
         app.error = Some(format!("winit event loop: {err}"));
     }
@@ -280,6 +384,7 @@ fn run_static_vulkan_mode(
 struct StaticVulkanApp {
     mesh: VulkanStaticMesh,
     materials: Vec<VulkanStaticMaterial>,
+    mesh_components: usize,
     target_frames: u64,
     mission: String,
     object_count: usize,
@@ -295,6 +400,7 @@ impl StaticVulkanApp {
     fn new(
         mesh: VulkanStaticMesh,
         materials: Vec<VulkanStaticMaterial>,
+        mesh_components: usize,
         target_frames: u64,
         mission: &str,
         object_count: usize,
@@ -302,6 +408,7 @@ impl StaticVulkanApp {
         Self {
             mesh,
             materials,
+            mesh_components,
             target_frames,
             mission: mission.to_string(),
             object_count,
@@ -344,10 +451,11 @@ impl StaticVulkanApp {
             return;
         }
         self.output = Some(format!(
-            "{{\"report_kind\":\"rendered-static-mission\",\"backend\":\"vulkan-static\",\"window\":\"native\",\"mission\":{},\"objects\":{},\"frames\":{},\"material_descriptors\":{},\"swapchain\":[{},{}],\"swapchain_images\":{},\"validation_warnings\":{},\"validation_errors\":{},\"readback_bytes\":{},\"readback_hash\":{}}}",
+            "{{\"report_kind\":\"rendered-static-mission\",\"backend\":\"vulkan-static\",\"window\":\"native\",\"mission\":{},\"objects\":{},\"frames\":{},\"mesh_components\":{},\"material_descriptors\":{},\"swapchain\":[{},{}],\"swapchain_images\":{},\"validation_warnings\":{},\"validation_errors\":{},\"readback_bytes\":{},\"readback_hash\":{}}}",
             json_string(&self.mission),
             self.object_count,
             self.frames_presented,
+            self.mesh_components,
             self.materials.len(),
             report.renderer_report.swapchain_extent.0,
             report.renderer_report.swapchain_extent.1,
@@ -774,6 +882,35 @@ mod tests {
                 load_progress: Some(PathBuf::from("target/probe.txt")),
             })
         );
+    }
+
+    #[test]
+    fn static_preview_component_merge_offsets_indices_and_remaps_local_selectors(
+    ) -> Result<(), String> {
+        let mut merged = VulkanStaticMesh {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            draw_ranges: Vec::new(),
+        };
+        append_static_preview_component(
+            &mut merged,
+            VulkanStaticMesh::smoke_triangle(),
+            &[(0, 4)],
+        )?;
+        append_static_preview_component(
+            &mut merged,
+            VulkanStaticMesh::smoke_triangle(),
+            &[(0, 9)],
+        )?;
+
+        assert_eq!(merged.vertices.len(), 6);
+        assert_eq!(merged.indices, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(merged.draw_ranges.len(), 2);
+        assert_eq!(merged.draw_ranges[0].first_index, 0);
+        assert_eq!(merged.draw_ranges[0].material_index, 4);
+        assert_eq!(merged.draw_ranges[1].first_index, 3);
+        assert_eq!(merged.draw_ranges[1].material_index, 9);
+        Ok(())
     }
 
     #[test]

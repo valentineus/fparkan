@@ -938,33 +938,38 @@ from a runtime slot or draw order.
 
 `fparkan-game --backend static-vulkan` is an explicit native-window experiment,
 not the default planning path. It visits only the first mission root, selects
-its prepared MSH model, sends it through the existing static XZ clip-space
-projection and renders a requested number of frames through
+every prepared MSH component of that root, merges their static XZ clip-space
+geometry, and renders a requested number of frames through
 `VulkanSmokeRenderer`; teardown rejects validation warnings/errors and reports
 swapchain/readback telemetry. For each used `Batch20.material_index`, it resolves
 the positional prepared WEAR material and uploads mip 0 of that material's first
-MAT0 diffuse texture request as a selector-keyed descriptor.
+MAT0 diffuse texture request. Because `material_index` is local to an MSH/WEAR
+component, the merged preview assigns a unique preview-local selector only after
+this source resolution; it does not falsely treat equal local indexes as equal
+materials.
 
 This is a narrow bootstrap from mission assets to a live Vulkan renderer. It
 does not render every placed object, apply TMA transforms or orientation, select
 later MAT0 phases or animation, bind lightmaps, or establish a game camera. Fresh GOG
 `MISSIONS/Autodemo.00/data.tma` evidence now proves the narrow GPU bridge: one
-presented frame completed in 38.7 seconds with a native 1280×720 two-image
-swapchain, one selector-keyed original diffuse descriptor, 7,372,800-byte
-synchronized readback (FNV-1a `12332214764918703197`) and validation
+presented frame completed in 39.6 seconds with a native 1280×720 two-image
+swapchain, 14 merged mesh components and 14 selector-keyed original diffuse
+descriptors, 7,372,800-byte synchronized readback (FNV-1a
+`16595193636416981301`) and validation
 warnings/errors `0/0`. This is not a
 full-scene or original-renderer pixel-parity claim.
 
 The same bounded command was then run against the licensed installed Part 1
 (`C:\\Program Files (x86)\\Nikita\\IS`) and Part 2
 (`C:\\Program Files (x86)\\Nikita\\IS2`) corpora supplied for testing. Both
-`MISSIONS/Autodemo.00/data.tma` runs completed with the same one-material,
-1280×720 two-image report, the same `12332214764918703197` readback hash and
-validation warnings/errors `0/0`; Part 1 took 28.5 seconds and Part 2 took
-94.5 seconds. Part 2's synchronous checkpoint was `Graph` while it was still
-loading, so the longer startup is not attributed to Vulkan. This is only a
-cross-corpus confirmation of the first-root static-preview bridge, not a claim
-that the two games' full mission renderers are compatible.
+`MISSIONS/Autodemo.00/data.tma` runs completed with 14 mesh components and 14
+original diffuse descriptors. Part 1 took 28.2 seconds and matched the GOG
+readback hash `16595193636416981301`; Part 2 took 93.6 seconds and remained
+validation-clean but produced distinct hash `18268338333658342130`. Part 2's
+synchronous checkpoint was `Graph` while it was still loading, so the longer
+startup is not attributed to Vulkan. This is only a cross-corpus confirmation
+of the first-root static-preview bridge, not a claim that the two games' full
+mission renderers are compatible.
 
 The preview now asks `load_mission_static_preview` for both graph and assets.
 Normal mission loading remains full and transactional; preview graph traversal

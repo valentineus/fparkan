@@ -13,7 +13,7 @@
 | `RecordingBackend` | No | No | Optional CPU-side IDs only | `covered-planning` | Stable command capture for backend-neutral tests | Native window, Vulkan, GPU resource lifetime, pixels |
 | `NullBackend` | No | No | Optional CPU-side IDs only | Usually `covered` for validation-only rows | Command stream framing and bounds validation | Capture stability, GPU execution, pixels |
 | `VulkanAssetRenderer` | Yes | Yes | Yes | `covered-gpu` | Static original asset rendering: MSH/Texm/WEAR/MAT0/terrain through Vulkan | Animation/FX parity unless explicitly wired |
-| `fparkan-game --backend static-vulkan` | Yes, GOG `Autodemo.00` | Yes, static MSH draw | First MSH from first mission root; first MAT0 diffuse TEXM per used selector | `covered-gpu` only for the narrow static-preview bridge | Opt-in mission-to-native-window bootstrap, static MSH projection, selector-keyed diffuse descriptor upload and synchronized teardown telemetry | Full mission scene, later MAT0 phases/animation, lightmaps, placed transforms/orientation, camera, gameplay, original-runtime parity |
+| `fparkan-game --backend static-vulkan` | Yes, GOG/Part 1/Part 2 `Autodemo.00` | Yes, merged static MSH component draws | All prepared MSH components from first mission root; first MAT0 diffuse TEXM per source selector | `covered-gpu` only for the narrow static-preview bridge | Opt-in mission-to-native-window bootstrap, component mesh merge, preview-local selector remap, diffuse descriptor upload and synchronized teardown telemetry | Full mission scene, later MAT0 phases/animation, lightmaps, placed transforms/orientation, camera, gameplay, original-runtime parity |
 | Future rendered `fparkan-game` mode | Yes | Yes | Yes | `covered-gpu` plus original-evidence IDs | Mission-driven render snapshot execution and pixel capture | Original-runtime parity for animation/FX/x87 without dedicated captures |
 
 ## Rules
@@ -34,17 +34,19 @@
 - Lightmap остаётся отдельным, не реализованным contract: оригинальный `World3D.dll` экспортирует самостоятельный `SetLightMapLib` наряду с `SetTexturesLib` и `SetMaterialLib`; WEAR содержит независимый блок `LIGHTMAPS`. Текущая документация не подтверждает связь этих slots с `Batch20.material_index` или их UV/channel semantics, поэтому viewer не подменяет lightmap diffuse texture и не добавляет недоказанное binding.
 - `apps/fparkan-game` по умолчанию выдает `render-planning` JSON report поверх
   synthetic window descriptor и `VulkanPlanningBackend`. Opt-in `--backend static-vulkan`
-  уже создаёт native `winit` window и передаёт первую подготовленную MSH модели миссии в
-  `VulkanSmokeRenderer` вместе с первым diffuse TEXM из MAT0 для каждого реально используемого
-  `Batch20.material_index`. Режим использует
+  уже создаёт native `winit` window и передаёт все подготовленные MSH-компоненты первого root в
+  `VulkanSmokeRenderer`. Каждый исходный `Batch20.material_index` сначала разрешается внутри
+  собственного WEAR/MAT0 visual, затем получает уникальный preview-local selector и первый
+  diffuse TEXM. Режим использует
   отдельный first-root preview loader: normal `load_mission` по-прежнему готовит все reachable
   assets и весь graph, тогда как preview строит graph и готовит assets только для первого
   mission root. `--load-progress <file>` writes the last entered loader phase synchronously for
   timeout diagnosis. Fresh GOG `MISSIONS/Autodemo.00/data.tma` run passed in 38.7 seconds with
-  one presented frame, native 1280×720 swapchain (2 images), one original diffuse material
-  descriptor, 7,372,800-byte readback hash `12332214764918703197`, and validation
-  warnings/errors `0/0`. This is `covered-gpu` evidence for that narrow static-preview bridge
-  only, not full-scene or original-renderer parity.
+  one presented frame, native 1280×720 swapchain (2 images), 14 mesh components and 14 original
+  diffuse material descriptors, 7,372,800-byte readback hash `16595193636416981301`, and
+  validation warnings/errors `0/0`. Part 1 matches that artifact; Part 2 passes validation with
+  14/14 but has a distinct hash `18268338333658342130`. This is `covered-gpu` evidence for that
+  narrow static-preview bridge only, not full-scene or original-renderer parity.
 - `apps/fparkan-viewer` сейчас inspection-only CLI и не открывает live Vulkan
   asset viewer.
 - Следующий реальный milestone для rendered acceptance: `VulkanAssetRenderer`
