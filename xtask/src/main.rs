@@ -41,7 +41,8 @@ const CI_ACCEPTANCE_REPORT: &str = "target/fparkan/acceptance/stage-0-audit.json
 const SHADER_MANIFEST_REPORT: &str = "adapters/fparkan-render-vulkan/shaders/manifest.json";
 const STAGE_PACKAGE_MANIFEST: &str = "fixtures/acceptance/stage_packages.toml";
 const SUPPLY_CHAIN_POLICY_CONFIG: &str = "deny.toml";
-const REQUIRED_NATIVE_SMOKE_PLATFORMS: &[&str] = &["macos"];
+/// Windows is the only supported native runtime platform.
+const REQUIRED_NATIVE_SMOKE_PLATFORMS: &[&str] = &["windows"];
 const APPROVED_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const SUPPLY_CHAIN_BANNED_PACKAGES: &[&str] = &["native-tls", "openssl", "openssl-sys"];
 const PINNED_RUST_TOOLCHAIN: &str = "1.97.1";
@@ -2160,22 +2161,6 @@ fn validate_native_smoke_runtime_fields(
         2,
         failures,
     );
-    if platform == "macos" {
-        expect_bool_field_value(
-            platform,
-            report,
-            "vulkan_portability_enumeration",
-            true,
-            failures,
-        );
-        expect_bool_field_value(
-            platform,
-            report,
-            "vulkan_portability_subset_enabled",
-            true,
-            failures,
-        );
-    }
 }
 
 fn expect_string_field(
@@ -2260,8 +2245,6 @@ fn expect_target_triple_matches_platform(
         return;
     };
     let matches_platform = match platform {
-        "macos" => target_triple.contains("apple-darwin"),
-        "linux" => target_triple.contains("linux"),
         "windows" => target_triple.contains("windows"),
         _ => true,
     };
@@ -2280,10 +2263,7 @@ fn expect_runner_architecture_matches_platform(
     let Ok(runner_architecture) = json_string_field(report, "runner_architecture") else {
         return;
     };
-    let matches_platform = match platform {
-        "macos" => runner_architecture == "aarch64",
-        _ => !runner_architecture.trim().is_empty(),
-    };
+    let matches_platform = !runner_architecture.trim().is_empty();
     if !matches_platform {
         failures.push(format!(
             "{platform}: runner_architecture {runner_architecture:?} does not match platform policy"
@@ -3157,7 +3137,7 @@ mod tests {
         let mut audit = AcceptanceAudit {
             commit_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
             git_dirty: false,
-            runner_identity: "github-actions/12345/stage0-macos".to_string(),
+            runner_identity: "windows-local/stage0".to_string(),
             rust_toolchain: PINNED_RUST_TOOLCHAIN.to_string(),
             msrv: WORKSPACE_MSRV.to_string(),
             required_total: 1,
@@ -3183,7 +3163,7 @@ mod tests {
         assert!(json.contains("quoted \\\"value\\\""));
         assert!(json.contains("\"commit_sha\": \"0123456789abcdef0123456789abcdef01234567\""));
         assert!(json.contains("\"git_dirty\": false"));
-        assert!(json.contains("\"runner_identity\": \"github-actions/12345/stage0-macos\""));
+        assert!(json.contains("\"runner_identity\": \"windows-local/stage0\""));
         assert!(json.contains("\"rust_toolchain\": \"1.97.1\""));
         assert!(json.contains("\"msrv\": \"1.97\""));
     }
@@ -3193,12 +3173,10 @@ mod tests {
         let expected_commit = "0123456789abcdef0123456789abcdef01234567";
         let expected_shader_manifest_hash =
             "dd293e4ff08ffca1c037900d08b0ffd415db39f238b4fcdde46468fa049b679c";
-        let reports = ["macos"]
+        let reports = ["windows"]
             .into_iter()
             .map(|platform| {
                 let target_triple = match platform {
-                    "macos" => "aarch64-apple-darwin",
-                    "linux" => "x86_64-unknown-linux-gnu",
                     "windows" => "x86_64-pc-windows-msvc",
                     _ => "unknown-target",
                 };
@@ -3208,8 +3186,8 @@ mod tests {
                         "schema_version": "fparkan-native-smoke-v1",
                         "commit_sha": "0123456789abcdef0123456789abcdef01234567",
                         "git_dirty": false,
-                        "runner_identity": "github-actions/12345/stage0-macos",
-                        "runner_architecture": "aarch64",
+                        "runner_identity": "windows-local/stage0",
+                        "runner_architecture": "x86_64",
                         "rust_toolchain": measured_rust_toolchain_version(),
                         "target_triple": target_triple,
                         "platform": platform,
@@ -3234,8 +3212,8 @@ mod tests {
                         "vulkan_swapchain_width": 1280,
                         "vulkan_swapchain_height": 720,
                         "vulkan_swapchain_image_count": 3,
-                        "vulkan_portability_enumeration": true,
-                        "vulkan_portability_subset_enabled": true
+                        "vulkan_portability_enumeration": false,
+                        "vulkan_portability_subset_enabled": false
                     }),
                 )
             })
@@ -3253,7 +3231,7 @@ mod tests {
         let expected_shader_manifest_hash =
             "dd293e4ff08ffca1c037900d08b0ffd415db39f238b4fcdde46468fa049b679c";
         let reports = [(
-            "macos".to_string(),
+            "windows".to_string(),
             serde_json::json!({
                 "schema_version": "fparkan-native-smoke-v1",
                 "commit_sha": "unknown",
@@ -3262,7 +3240,7 @@ mod tests {
                 "runner_architecture": "x86_64",
                 "rust_toolchain": measured_rust_toolchain_version(),
                 "target_triple": "x86_64-unknown-linux-gnu",
-                "platform": "macos",
+                "platform": "windows",
                 "status": "blocked",
                 "frames": 0,
                 "resize_count": 0,
@@ -3284,25 +3262,21 @@ mod tests {
         let failures =
             audit_native_smoke_reports(&reports, expected_commit, expected_shader_manifest_hash);
 
-        assert!(
-            failures.contains(&"macos: status expected \"passed\", found \"blocked\"".to_string())
-        );
-        assert!(failures.contains(
-            &"macos: commit_sha must be a 40-character lowercase or uppercase hex string"
-                .to_string()
-        ));
-        assert!(failures.contains(&"macos: git_dirty expected false, found true".to_string()));
-        assert!(failures.contains(&"macos: runner_identity must be non-empty".to_string()));
-        assert!(failures.contains(
-            &"macos: target_triple \"x86_64-unknown-linux-gnu\" does not match platform"
-                .to_string()
-        ));
-        assert!(failures.contains(
-            &"macos: runner_architecture \"x86_64\" does not match platform policy".to_string()
-        ));
-        assert!(failures.contains(&"macos: frames expected >= 300, found 0".to_string()));
         assert!(failures
-            .contains(&"macos: validation_error_count must be an unsigned integer".to_string()));
+            .contains(&"windows: status expected \"passed\", found \"blocked\"".to_string()));
+        assert!(failures.contains(
+            &"windows: commit_sha must be a 40-character lowercase or uppercase hex string"
+                .to_string()
+        ));
+        assert!(failures.contains(&"windows: git_dirty expected false, found true".to_string()));
+        assert!(failures.contains(&"windows: runner_identity must be non-empty".to_string()));
+        assert!(failures.contains(
+            &"windows: target_triple \"x86_64-unknown-linux-gnu\" does not match platform"
+                .to_string()
+        ));
+        assert!(failures.contains(&"windows: frames expected >= 300, found 0".to_string()));
+        assert!(failures
+            .contains(&"windows: validation_error_count must be an unsigned integer".to_string()));
     }
 
     #[test]
@@ -3310,16 +3284,16 @@ mod tests {
         let expected_shader_manifest_hash =
             "dd293e4ff08ffca1c037900d08b0ffd415db39f238b4fcdde46468fa049b679c";
         let reports = [(
-            "macos".to_string(),
+            "windows".to_string(),
             serde_json::json!({
                 "schema_version": "fparkan-native-smoke-v1",
                 "commit_sha": "fedcba98765432100123456789abcdef01234567",
                 "git_dirty": false,
-                "runner_identity": "github-actions/12345/stage0-macos",
-                "runner_architecture": "aarch64",
+                "runner_identity": "windows-local/stage0",
+                "runner_architecture": "x86_64",
                 "rust_toolchain": measured_rust_toolchain_version(),
-                "target_triple": "aarch64-apple-darwin",
-                "platform": "macos",
+                "target_triple": "x86_64-pc-windows-msvc",
+                "platform": "windows",
                 "status": "passed",
                 "frames": 300,
                 "resize_count": 1,
@@ -3332,7 +3306,7 @@ mod tests {
                 "window_status": "created",
                 "vulkan_surface_status": "created",
                 "vulkan_device_status": "selected",
-                "vulkan_device_name": "Apple GPU",
+                "vulkan_device_name": "Windows test GPU",
                 "vulkan_logical_device_status": "created",
                 "vulkan_logical_device_graphics_queue_family": 0,
                 "vulkan_logical_device_present_queue_family": 0,
@@ -3341,8 +3315,8 @@ mod tests {
                 "vulkan_swapchain_width": 1280,
                 "vulkan_swapchain_height": 720,
                 "vulkan_swapchain_image_count": 3,
-                "vulkan_portability_enumeration": true,
-                "vulkan_portability_subset_enabled": true
+                "vulkan_portability_enumeration": false,
+                "vulkan_portability_subset_enabled": false
             }),
         )]
         .into_iter()
@@ -3355,7 +3329,7 @@ mod tests {
         );
 
         assert!(failures.contains(
-            &"macos: commit_sha expected \"0123456789abcdef0123456789abcdef01234567\", found \"fedcba98765432100123456789abcdef01234567\"".to_string()
+            &"windows: commit_sha expected \"0123456789abcdef0123456789abcdef01234567\", found \"fedcba98765432100123456789abcdef01234567\"".to_string()
         ));
     }
 
@@ -3363,16 +3337,16 @@ mod tests {
     fn native_smoke_audit_rejects_stale_shader_manifest_hash() {
         let expected_commit = "0123456789abcdef0123456789abcdef01234567";
         let reports = [(
-            "macos".to_string(),
+            "windows".to_string(),
             serde_json::json!({
                 "schema_version": "fparkan-native-smoke-v1",
                 "commit_sha": expected_commit,
                 "git_dirty": false,
-                "runner_identity": "github-actions/12345/stage0-macos",
-                "runner_architecture": "aarch64",
+                "runner_identity": "windows-local/stage0",
+                "runner_architecture": "x86_64",
                 "rust_toolchain": measured_rust_toolchain_version(),
-                "target_triple": "aarch64-apple-darwin",
-                "platform": "macos",
+                "target_triple": "x86_64-pc-windows-msvc",
+                "platform": "windows",
                 "status": "passed",
                 "frames": 300,
                 "resize_count": 1,
@@ -3385,7 +3359,7 @@ mod tests {
                 "window_status": "created",
                 "vulkan_surface_status": "created",
                 "vulkan_device_status": "selected",
-                "vulkan_device_name": "Apple GPU",
+                "vulkan_device_name": "Windows test GPU",
                 "vulkan_logical_device_status": "created",
                 "vulkan_logical_device_graphics_queue_family": 0,
                 "vulkan_logical_device_present_queue_family": 0,
@@ -3394,8 +3368,8 @@ mod tests {
                 "vulkan_swapchain_width": 1280,
                 "vulkan_swapchain_height": 720,
                 "vulkan_swapchain_image_count": 3,
-                "vulkan_portability_enumeration": true,
-                "vulkan_portability_subset_enabled": true
+                "vulkan_portability_enumeration": false,
+                "vulkan_portability_subset_enabled": false
             }),
         )]
         .into_iter()
@@ -3408,7 +3382,7 @@ mod tests {
         );
 
         assert!(failures.contains(
-            &"macos: shader_manifest_hash expected \"dd293e4ff08ffca1c037900d08b0ffd415db39f238b4fcdde46468fa049b679c\", found \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"".to_string()
+            &"windows: shader_manifest_hash expected \"dd293e4ff08ffca1c037900d08b0ffd415db39f238b4fcdde46468fa049b679c\", found \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"".to_string()
         ));
     }
 

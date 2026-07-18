@@ -32,7 +32,9 @@ impl VulkanInstanceConfig {
         Self {
             application_name: application_name.into(),
             required_extensions: Vec::new(),
-            enable_portability_enumeration: cfg!(target_os = "macos"),
+            // The runtime is Windows-only, so portability enumeration is not part of
+            // the supported instance contract.
+            enable_portability_enumeration: false,
             enable_validation: false,
         }
     }

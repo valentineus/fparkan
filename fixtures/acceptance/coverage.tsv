@@ -1,7 +1,7 @@
 # Acceptance coverage manifest.
 # Format: <acceptance-id>\t<covered|covered-planning|covered-stub|covered-gpu|partial|blocked|omitted>\t<evidence>
-# Scope note: Stage 0 is closed for the macOS/codebase review scope.
-# Scope note: cross-platform native runtime and hosted CI evidence remain deferred.
+# Scope note: Stage 0 native runtime acceptance is Windows-only.
+# Scope note: Linux/macOS and hosted CI are outside the project scope.
 L0-COPYRIGHT-001	covered	cargo test -p fparkan-corpus --offline report_json_contains_metrics_and_hashes_not_paths_or_payloads
 L0-P1-001	covered	cargo test -p fparkan-corpus --offline licensed_part1_manifest_profile_and_counts_match_baseline
 L0-P1-002	covered	cargo test -p fparkan-corpus --offline licensed_part1_has_no_casefold_relative_path_collisions
@@ -17,7 +17,7 @@ S0-ARCH-007	covered	cargo xtask ci runs fmt, policy, workspace test, clippy, rus
 S0-ARCH-008	covered	cargo xtask policy rejects moving Rust toolchains and workspace rust-version drift
 S0-ARCH-009	covered	.github/workflows/ci.yml runs a pinned MSRV backend-neutral crate job
 S0-ARCH-010	covered	cargo xtask acceptance audit emits measured commit_sha, git_dirty, runner_identity, rust_toolchain, and msrv metadata into the JSON artifact
-S0-ARCH-011	covered	.github/workflows/ci.yml runs cargo run -p fparkan-vulkan-smoke --locked -- --out target/fparkan/native-smoke/macos.json and cargo xtask native-smoke audit enforces a passed macOS 300-frame report with measured resize/recreate, validation=0, clean git provenance, exact commit SHA shape, and a platform-consistent target triple
+S0-ARCH-011	covered	cargo xtask native-smoke audit requires a passed Windows 300-frame report with measured resize/recreate, validation=0, clean git provenance, exact commit SHA shape, and a Windows target triple
 S0-DIAG-001	covered	cargo test -p fparkan-diagnostics --offline diagnostic_chain_preserves_context
 S0-DIAG-002	covered	cargo test -p fparkan-diagnostics --offline json_is_stable
 S0-CORPUS-001	covered	cargo test -p fparkan-corpus --offline deterministic_traversal_is_creation_order_independent
@@ -302,8 +302,8 @@ S3-VK-DRAW-MODEL-001	blocked	awaits Stage 3 real Vulkan indexed model draw path
 S3-VK-DRAW-TERRAIN-001	blocked	awaits Stage 3 terrain Vulkan draw path
 S3-VK-PIXEL-CAPTURE-001	blocked	awaits Stage 3 fixed-camera pixel capture approval flow
 S3-VK-VALIDATION-001	blocked	awaits Stage 3 validation-clean GPU frame execution
-S3-GL-001	omitted	permanent macOS Desktop GL 3.3 adapter is not implemented; historical CGL probe is retained as external evidence only
-S3-GL-002	omitted	outside the current macOS-focused goal scope; GLES2 remains documented for portable/non-macOS targets
+S3-GL-001	omitted	legacy OpenGL adapters are outside the Windows-only Vulkan renderer scope
+S3-GL-002	omitted	GLES2 and portable-device targets are outside the Windows-only Vulkan renderer scope
 S3-GL-003	blocked	legacy fparkan-render-gl adapter removed while Vulkan renderer path is being brought in as the stage-3 backend
 S3-VIEWER-001	covered	cargo test -p fparkan-viewer --offline model_fixture_uses_viewer_service_and_render_commands
 S4-ANIM-001	covered	cargo test -p fparkan-animation --offline anim_key24_decodes_signed_quaternion
@@ -314,7 +314,7 @@ S4-ANIM-005	covered	cargo test -p fparkan-animation --offline exact_key_time_ret
 S4-ANIM-006	covered	cargo test -p fparkan-animation --offline pose_track_blends_translation_and_rotation
 S4-ANIM-007	covered	cargo test -p fparkan-animation --offline quaternion_shortest_path_sign_flip_is_stable
 S4-ANIM-008	covered	cargo test -p fparkan-animation --offline zero_or_degenerate_key_interval_is_rejected
-S4-ANIM-009	omitted	current sampler is a portable reference path; runtime-captured x87 parity vectors are not implemented in the macOS-focused scope
+S4-ANIM-009	omitted	current sampler is a portable reference path; runtime-captured x87 parity vectors are not implemented
 S4-ANIM-010	omitted	current sampler accepts the profile marker but does not implement an independent x87 compatibility path
 S4-ANIM-011	covered	cargo test -p fparkan-animation --offline blend_optional_pose_uses_valid_side
 S4-ANIM-012	covered	cargo test -p fparkan-animation --offline hierarchy_evaluates_parent_before_child_and_rejects_cycles
@@ -443,5 +443,5 @@ L5-P1-HEADLESS-001	covered	cargo test -p fparkan-runtime --offline selected_is_a
 L5-P2-HEADLESS-001	covered	cargo test -p fparkan-runtime --offline selected_is_and_is2_missions_execute_10000_deterministic_ticks
 L5-P1-RENDER-001	covered-planning	cargo test -p fparkan-game --offline selected_is_and_is2_missions_produce_approved_render_captures
 L5-P2-RENDER-001	covered-planning	cargo test -p fparkan-game --offline selected_is_and_is2_missions_produce_approved_render_captures
-L3-DEVICE-001	omitted	outside the current macOS-focused goal scope; RG40XX-capable device/profile evidence remains documented for the portable target scope
-L5-RG40-001	omitted	outside the current macOS-focused goal scope; RG40XX 640x480 on-device mission smoke/performance/memory evidence remains documented for the portable target scope
+L3-DEVICE-001	omitted	RG40XX and portable-device profiles are outside the Windows-only runtime scope
+L5-RG40-001	omitted	RG40XX 640x480 on-device mission smoke/performance/memory evidence is outside the Windows-only runtime scope

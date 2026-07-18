@@ -815,8 +815,6 @@ impl AtomicWindowPhase {
 
 fn actual_platform() -> &'static str {
     match std::env::consts::OS {
-        "macos" => "macos",
-        "linux" => "linux",
         "windows" => "windows",
         other => other,
     }
@@ -1071,11 +1069,11 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             commit_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
             git_dirty: false,
-            runner_identity: "github-actions/12345/stage0-macos".to_string(),
-            runner_architecture: "aarch64",
+            runner_identity: "windows-local/stage0".to_string(),
+            runner_architecture: "x86_64",
             rust_toolchain: "1.97.1".to_string(),
-            target_triple: "aarch64-apple-darwin".to_string(),
-            platform: "macos",
+            target_triple: "x86_64-pc-windows-msvc".to_string(),
+            platform: "windows",
             status: "passed",
             failure_reason: None,
             frames: 300,
@@ -1092,7 +1090,7 @@ mod tests {
             window_status: "created",
             vulkan_surface_status: "created",
             vulkan_device_status: "selected",
-            vulkan_device_name: "Apple GPU",
+            vulkan_device_name: "Windows test GPU",
             vulkan_logical_device_status: "created",
             vulkan_logical_device_graphics_queue_family: 0,
             vulkan_logical_device_present_queue_family: 0,
@@ -1101,15 +1099,15 @@ mod tests {
             vulkan_swapchain_width: 960,
             vulkan_swapchain_height: 540,
             vulkan_swapchain_image_count: 3,
-            vulkan_portability_enumeration: true,
-            vulkan_portability_subset_enabled: true,
+            vulkan_portability_enumeration: false,
+            vulkan_portability_subset_enabled: false,
         })
         .expect("smoke report should serialize");
 
         assert!(json.contains("\"schema_version\": \"fparkan-native-smoke-v1\""));
         assert!(json.contains("\"validation_vuids\": ["));
-        assert!(json.contains("\"vulkan_device_name\": \"Apple GPU\""));
-        assert!(json.contains("\"runner_architecture\": \"aarch64\""));
+        assert!(json.contains("\"vulkan_device_name\": \"Windows test GPU\""));
+        assert!(json.contains("\"runner_architecture\": \"x86_64\""));
     }
 
     #[test]
