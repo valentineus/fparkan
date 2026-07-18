@@ -116,6 +116,8 @@ pub enum MissionLoadPhase {
     Map,
     /// Expand object roots into a prototype graph.
     Graph,
+    /// Expand model-backed visual dependencies of the prototype graph.
+    GraphVisuals,
     /// Prepare all reachable visual/resource dependencies.
     Assets,
     /// Construct all object drafts before registration.
@@ -682,6 +684,7 @@ fn load_mission_with_options_and_progress(
     };
     let (mut prototype_graph, resolved_prototypes, mut prototype_report) =
         build_prototype_graph_report(&repository, vfs.as_ref(), scoped_graph_roots);
+    record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::GraphVisuals);
     extend_graph_report_with_visual_dependencies(
         &repository,
         &mut prototype_report,
@@ -693,6 +696,7 @@ fn load_mission_with_options_and_progress(
             failures: prototype_report.failures.clone(),
         });
     }
+    record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::Assets);
     let asset_manager = AssetManager::new(repository);
     let mission_assets = match options.asset_scope {
         MissionAssetScope::Full => asset_manager.prepare_mission_assets(
@@ -738,8 +742,6 @@ fn load_mission_with_options_and_progress(
                 .collect(),
         })
         .collect();
-    record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::Assets);
-
     let mut new_runtime_world = new_world(WorldConfig);
     let mut handles = Vec::with_capacity(mission.objects.len());
     record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::Construct);
@@ -1176,6 +1178,7 @@ mod tests {
                 MissionLoadPhase::Map,
                 MissionLoadPhase::Tma,
                 MissionLoadPhase::Graph,
+                MissionLoadPhase::GraphVisuals,
                 MissionLoadPhase::Assets,
                 MissionLoadPhase::Construct,
                 MissionLoadPhase::Register,

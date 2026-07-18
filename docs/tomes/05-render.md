@@ -1038,6 +1038,15 @@ to 120 seconds but remained at the existing `Graph` loading checkpoint and were
 terminated without a native frame/report; therefore no new readback hash or GPU
 acceptance result is claimed for the corrected projection yet.
 
+The load trace now splits base root expansion (`Graph`) from MSH/WEAR/MAT0/TEXM
+visual-dependency expansion (`GraphVisuals`) and enters `Assets` immediately
+before actual asset preparation. A controlled 60-second GOG first-root run of
+the XY build stopped at `GraphVisuals`; the process was terminated by the probe
+and produced no frame. The startup bottleneck is therefore narrowed to visual
+graph expansion, rather than the base prototype graph, asset decoding, window
+creation or Vulkan submission. This is a diagnostic boundary, not a claim that
+the visual expansion is semantically optional or may be skipped.
+
 The same source-axis proof now applies to `TerrainWorld`: its `Land.msh` surface
 height query and `Land.map` areal/grid lookup use XY ground coordinates, return
 source Z height, and leave raycasts as full 3D intersections. The Part 1 and
