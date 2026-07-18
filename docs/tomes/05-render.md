@@ -1475,6 +1475,18 @@ is a real original-asset rendering milestone, but not pixel parity or gameplay
 camera parity: it intentionally renders the bounded first preview root and
 uses a one-time offline camera capture.
 
+Expanding that same preview to all eight AutoDemo mission objects exposed a
+different, renderer-local limit: the merged static scene crossed 65,535
+vertices before any Vulkan command was recorded. `VulkanStaticMesh` now uses a
+32-bit GPU index buffer (`VK_INDEX_TYPE_UINT32`), while source MSH/TerrainFace28
+indices remain decoded in their original 16-bit representations and are widened
+only at the static-render bridge. A regression test crosses the former boundary.
+The full captured-camera AutoDemo preview completed at 13.369 seconds and
+rendered three 1280×720 native frames: 8 mission objects, 66 mesh components,
+67 material descriptors, and zero Vulkan validation warnings or errors. It is
+still a static source-world preview: raw mission orientation, terrain material
+selection, lighting and animation have not yet been claimed as parity.
+
 A fresh no-input launch of the canonical `iron_3d.exe` did create a responsive
 window titled `Parkan. Железная Стратегия`. A read-only probe then requested
 `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ` and attempted to read the known

@@ -236,7 +236,7 @@ pub(super) fn create_static_mesh_index_buffer(
     device: &VulkanLogicalDeviceProbe,
     mesh: &VulkanStaticMesh,
 ) -> Result<VulkanAllocatedBuffer, VulkanSmokeRendererError> {
-    let mut bytes = Vec::with_capacity(mesh.indices.len() * std::mem::size_of::<u16>());
+    let mut bytes = Vec::with_capacity(mesh.indices.len() * std::mem::size_of::<u32>());
     for &index in &mesh.indices {
         bytes.extend_from_slice(&index.to_ne_bytes());
     }

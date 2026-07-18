@@ -126,7 +126,7 @@ pub struct VulkanStaticMesh {
     /// Vertex data in pipeline order.
     pub vertices: Vec<VulkanStaticVertex>,
     /// Triangle-list indices into [`Self::vertices`].
-    pub indices: Vec<u16>,
+    pub indices: Vec<u32>,
     /// Source-preserving triangle draw ranges in [`Self::indices`].
     pub draw_ranges: Vec<VulkanStaticDrawRange>,
 }
@@ -296,11 +296,11 @@ impl VulkanStaticMesh {
         if usize::try_from(expected_first).ok() != Some(self.indices.len()) {
             return Err("static mesh draw ranges must cover all indices");
         }
-        if self
-            .indices
-            .iter()
-            .any(|&index| usize::from(index) >= self.vertices.len())
-        {
+        if self.indices.iter().any(|&index| {
+            usize::try_from(index)
+                .ok()
+                .is_none_or(|index| index >= self.vertices.len())
+        }) {
             return Err("static mesh index exceeds vertex count");
         }
         Ok(())

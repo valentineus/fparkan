@@ -701,7 +701,7 @@ impl VulkanSmokeRenderer {
                 command_buffer,
                 self.index_buffer_ref()?.buffer,
                 0,
-                vk::IndexType::UINT16,
+                vk::IndexType::UINT32,
             );
             let clip_from_world = matrix_bytes(self.camera.clip_from_world);
             device.device().cmd_push_constants(

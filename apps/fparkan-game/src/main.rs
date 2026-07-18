@@ -465,28 +465,24 @@ fn append_static_preview_component(
     component: VulkanStaticMesh,
     selector_remap: &[(u16, u16)],
 ) -> Result<(), String> {
-    let vertex_base = u16::try_from(target.vertices.len()).map_err(|_| {
-        "static preview exceeds the available 16-bit vertex index space".to_string()
-    })?;
+    let vertex_base = u32::try_from(target.vertices.len())
+        .map_err(|_| "static preview vertex count exceeds u32".to_string())?;
     let first_index_base = u32::try_from(target.indices.len())
         .map_err(|_| "static preview index count exceeds u32".to_string())?;
     target
         .vertices
         .len()
         .checked_add(component.vertices.len())
-        .filter(|count| *count <= usize::from(u16::MAX) + 1)
-        .ok_or_else(|| {
-            "static preview exceeds the available 16-bit vertex index space".to_string()
-        })?;
+        .ok_or_else(|| "static preview vertex count exceeds addressable memory".to_string())?;
     target.vertices.extend(component.vertices);
     target.indices.extend(
         component
             .indices
             .into_iter()
             .map(|index| {
-                index.checked_add(vertex_base).ok_or_else(|| {
-                    "static preview exceeds the available 16-bit vertex index space".to_string()
-                })
+                index
+                    .checked_add(vertex_base)
+                    .ok_or_else(|| "static preview vertex index exceeds u32".to_string())
             })
             .collect::<Result<Vec<_>, _>>()?,
     );
@@ -1289,6 +1285,29 @@ mod tests {
         assert_eq!(merged.draw_ranges[0].material_index, 4);
         assert_eq!(merged.draw_ranges[1].first_index, 3);
         assert_eq!(merged.draw_ranges[1].material_index, 9);
+        Ok(())
+    }
+
+    #[test]
+    fn static_preview_component_merge_keeps_indices_above_u16() -> Result<(), String> {
+        let vertex = fparkan_render_vulkan::VulkanStaticVertex {
+            position: [0.0, 0.0, 0.0],
+            color: [1.0, 1.0, 1.0],
+            uv: [0.0, 0.0],
+        };
+        let mut merged = VulkanStaticMesh {
+            vertices: vec![vertex; usize::from(u16::MAX) + 1],
+            indices: Vec::new(),
+            draw_ranges: Vec::new(),
+        };
+
+        append_static_preview_component(
+            &mut merged,
+            VulkanStaticMesh::smoke_triangle(),
+            &[(0, 0)],
+        )?;
+
+        assert_eq!(merged.indices, vec![65_536, 65_537, 65_538]);
         Ok(())
     }
 

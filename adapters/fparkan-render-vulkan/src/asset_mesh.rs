@@ -251,7 +251,7 @@ pub fn project_land_msh_to_static_mesh(
             .ok_or(VulkanAssetMeshError::IndexOutOfRange)?,
     );
     for face in &terrain.faces {
-        indices.extend(face.vertices);
+        indices.extend(face.vertices.map(u32::from));
     }
     if indices.is_empty() {
         return Err(VulkanAssetMeshError::EmptyGeometry);
@@ -280,7 +280,7 @@ pub fn project_land_msh_to_static_mesh_in_xy_frame(
             .ok_or(VulkanAssetMeshError::IndexOutOfRange)?,
     );
     for face in &terrain.faces {
-        indices.extend(face.vertices);
+        indices.extend(face.vertices.map(u32::from));
     }
     if indices.is_empty() {
         return Err(VulkanAssetMeshError::EmptyGeometry);
@@ -357,7 +357,7 @@ pub fn project_land_msh_to_static_mesh_in_world_space(
     })
 }
 
-fn static_terrain_indices(terrain: &LandMeshDocument) -> Result<Vec<u16>, VulkanAssetMeshError> {
+fn static_terrain_indices(terrain: &LandMeshDocument) -> Result<Vec<u32>, VulkanAssetMeshError> {
     let mut indices = Vec::with_capacity(
         terrain
             .faces
@@ -366,7 +366,7 @@ fn static_terrain_indices(terrain: &LandMeshDocument) -> Result<Vec<u16>, Vulkan
             .ok_or(VulkanAssetMeshError::IndexOutOfRange)?,
     );
     for face in &terrain.faces {
-        indices.extend(face.vertices);
+        indices.extend(face.vertices.map(u32::from));
     }
     if indices.is_empty() {
         return Err(VulkanAssetMeshError::EmptyGeometry);
@@ -391,7 +391,7 @@ fn static_terrain_draw_ranges(
 
 fn static_model_indices_and_ranges(
     model: &ModelAsset,
-) -> Result<(Vec<u16>, Vec<VulkanStaticDrawRange>), VulkanAssetMeshError> {
+) -> Result<(Vec<u32>, Vec<VulkanStaticDrawRange>), VulkanAssetMeshError> {
     let mut indices = Vec::new();
     let mut draw_ranges = Vec::with_capacity(model.batches.len());
     for batch in &model.batches {
@@ -411,7 +411,7 @@ fn static_model_indices_and_ranges(
                 .base_vertex
                 .checked_add(u32::from(raw_index))
                 .ok_or(VulkanAssetMeshError::IndexOutOfRange)?;
-            indices.push(u16::try_from(index).map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?);
+            indices.push(index);
         }
         draw_ranges.push(VulkanStaticDrawRange {
             first_index,
@@ -429,7 +429,7 @@ fn static_model_indices_and_ranges(
 
 fn static_mesh_xy_bounds(
     positions: &[[f32; 3]],
-    indices: &[u16],
+    indices: &[u32],
 ) -> Result<(f32, f32, f32, f32), VulkanAssetMeshError> {
     let mut min_x = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;
@@ -437,7 +437,7 @@ fn static_mesh_xy_bounds(
     let mut max_y = f32::NEG_INFINITY;
     for &index in indices {
         let position = positions
-            .get(usize::from(index))
+            .get(usize::try_from(index).map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?)
             .ok_or(VulkanAssetMeshError::IndexOutOfRange)?;
         if !position.iter().all(|value| value.is_finite()) {
             return Err(VulkanAssetMeshError::NonFinitePosition);
