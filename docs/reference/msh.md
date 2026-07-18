@@ -49,6 +49,15 @@ Validated `ModelAsset` также сохраняет decoded type 8 keys и type
 field, пока runtime evidence не подтверждает, является ли оно parent index или
 другой link semantic.
 
+В legacy-camera static preview стандартный узел уже получает свой fallback pose
+до внешнего TMA/Iron3D transform: quaternion поворачивает local vertex, затем
+добавляется node translation, после чего применяется `Rz * Ry * Rx`, scale и
+mission translation. Геометрия намеренно дублируется на draw-range узла, потому
+что один source vertex может быть нарисован разными node poses. Это local-pose
+assembly, а не skeleton: `parent_or_link` по-прежнему не используется, поэтому
+вложенные parent transforms и dynamic frame-map sampling остаются отдельной
+задачей runtime recovery.
+
 ## Slot and batch
 
 Type 2 содержит header `0x8C`, затем `Slot68`:

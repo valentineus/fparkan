@@ -566,6 +566,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "ash-window",
+ "fparkan-animation",
  "fparkan-binary",
  "fparkan-msh",
  "fparkan-platform",

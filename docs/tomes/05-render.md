@@ -1607,6 +1607,20 @@ animated models, 3,469/5,233 node samples и утверждённые captures. 
 доказывает production handoff animation data, не семантику parent links и не
 готовую model assembly.
 
+Следующий узкий шаг применяет этот уже декодированный `fallback_key` в
+legacy-camera static preview. Для каждого выбранного `Node38` bridge поворачивает
+вершины normalized quaternion, прибавляет local translation pose и только затем
+применяет доказанный TMA `Rz * Ry * Rx`, scale и mission translation. Вершины
+намеренно разворачиваются per node/draw range, чтобы один source vertex мог
+получить разные poses. `parent_or_link_raw` не читается как parent, frame map не
+семплируется, поэтому это не заявляет восстановленную hierarchy или animation.
+На той же GOG `MISSIONS/Autodemo.00/data.tma` и offline Ngi32 camera capture
+full preview из 8 objects / 66 mesh components / 67 descriptors завершился за
+один native Vulkan run с `clip_visible_vertices=2584`, `validation_warnings=0`,
+`validation_errors=0` и readback hash `5769837558651835265`. Рост с 938
+видимых вершин подтверждает, что local source poses реально вошли в geometry
+path; он не является оценкой сходства с original frame.
+
 Параллельно bridge для legacy-camera path теперь переводит только высоту
 `Land.msh` в world units с масштабом `1/32`: raw AutoDemo heights
 `95.29412..288.23532` становятся `2.978..9.007`, что согласуется с TMA Z и

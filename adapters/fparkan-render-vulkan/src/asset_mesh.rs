@@ -1,7 +1,9 @@
 //! Format-to-GPU geometry bridge for the initial static asset renderer.
 
 use crate::{VulkanStaticDrawRange, VulkanStaticMesh, VulkanStaticVertex};
-use fparkan_msh::{selected_slot, Group, Lod, ModelAsset, NodeId};
+use fparkan_msh::{
+    draw_batches, node38_fallback_pose, selected_slot, Group, Lod, ModelAsset, NodeId,
+};
 use fparkan_render::{LegacyIron3dEulerTransform, LegacyPipelineState};
 use fparkan_terrain_format::LandMeshDocument;
 
@@ -254,6 +256,167 @@ pub fn project_msh_to_static_mesh_in_world_space_with_transform(
         indices,
         draw_ranges,
     })
+}
+
+/// Projects a standard `Node38` model using each selected node's decoded
+/// fallback pose before its recovered `Iron3D` placement transform.
+///
+/// This is deliberately not a skeleton evaluator: the source field at
+/// `Node38 + 2` is still an unassigned link, so no parent transform is
+/// inferred here.  Each node's source fallback pose is nevertheless enough to
+/// keep independently stored static components at their authored local pose.
+/// Models without complete standard-node pose data retain the established
+/// unposed static bridge.
+///
+/// # Errors
+///
+/// Returns [`VulkanAssetMeshError`] when source geometry or transforms cannot
+/// be represented by the current static Vulkan input contract.
+pub fn project_msh_to_static_mesh_in_world_space_with_node_fallback_poses(
+    model: &ModelAsset,
+    transform: LegacyIron3dEulerTransform,
+    scale: [f32; 3],
+) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
+    if !transform
+        .translation
+        .iter()
+        .chain(transform.orientation_radians.iter())
+        .chain(scale.iter())
+        .all(|value| value.is_finite())
+    {
+        return Err(VulkanAssetMeshError::NonFinitePosition);
+    }
+    if model.node_stride != 38 || model.node_count == 0 || model.animation.is_none() {
+        return project_msh_to_static_mesh_in_world_space_with_transform(model, transform, scale);
+    }
+
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let mut draw_ranges = Vec::new();
+    for node_index in 0..model.node_count {
+        let node =
+            NodeId(u32::try_from(node_index).map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?);
+        let Some(slot) = selected_slot(model, node, Lod(0), Group(0)) else {
+            continue;
+        };
+        let Some(pose) = node38_fallback_pose(model, node) else {
+            return project_msh_to_static_mesh_in_world_space_with_transform(
+                model, transform, scale,
+            );
+        };
+        if !pose
+            .translation
+            .iter()
+            .chain(pose.rotation.iter())
+            .all(|value| value.is_finite())
+        {
+            return Err(VulkanAssetMeshError::NonFinitePosition);
+        }
+        for batch in draw_batches(model, slot).map_err(|_| VulkanAssetMeshError::IndexOutOfRange)? {
+            append_node_fallback_batch(
+                model,
+                batch,
+                pose.translation,
+                pose.rotation,
+                transform,
+                scale,
+                &mut vertices,
+                &mut indices,
+                &mut draw_ranges,
+            )?;
+        }
+    }
+    if indices.is_empty() {
+        return project_msh_to_static_mesh_in_world_space_with_transform(model, transform, scale);
+    }
+    Ok(VulkanStaticMesh {
+        vertices,
+        indices,
+        draw_ranges,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_node_fallback_batch(
+    model: &ModelAsset,
+    batch: &fparkan_msh::Batch,
+    translation: [f32; 3],
+    rotation: [f32; 4],
+    transform: LegacyIron3dEulerTransform,
+    scale: [f32; 3],
+    vertices: &mut Vec<VulkanStaticVertex>,
+    indices: &mut Vec<u32>,
+    draw_ranges: &mut Vec<VulkanStaticDrawRange>,
+) -> Result<(), VulkanAssetMeshError> {
+    let first_index =
+        u32::try_from(indices.len()).map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?;
+    let start =
+        usize::try_from(batch.index_start).map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?;
+    let end = start
+        .checked_add(usize::from(batch.index_count))
+        .ok_or(VulkanAssetMeshError::IndexOutOfRange)?;
+    for &raw_index in model
+        .indices
+        .get(start..end)
+        .ok_or(VulkanAssetMeshError::IndexOutOfRange)?
+    {
+        let source_index = batch
+            .base_vertex
+            .checked_add(u32::from(raw_index))
+            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?;
+        let source_index =
+            usize::try_from(source_index).map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?;
+        let position = *model
+            .positions
+            .get(source_index)
+            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?;
+        if !position.iter().all(|value| value.is_finite()) {
+            return Err(VulkanAssetMeshError::NonFinitePosition);
+        }
+        let local_position = rotate_by_quaternion(position, rotation);
+        let local_position = [
+            local_position[0] + translation[0],
+            local_position[1] + translation[1],
+            local_position[2] + translation[2],
+        ];
+        let position = transform
+            .try_transform_scaled_point(local_position, scale)
+            .ok_or(VulkanAssetMeshError::NonFinitePosition)?;
+        let vertex_index =
+            u32::try_from(vertices.len()).map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?;
+        vertices.push(VulkanStaticVertex {
+            position,
+            color: [0.82, 0.72, 0.31],
+            uv: model
+                .uv0
+                .as_ref()
+                .and_then(|uv0| uv0.get(source_index))
+                .map_or([0.0, 0.0], |uv| {
+                    [f32::from(uv[0]) / 1024.0, f32::from(uv[1]) / 1024.0]
+                }),
+        });
+        indices.push(vertex_index);
+    }
+    draw_ranges.push(VulkanStaticDrawRange {
+        first_index,
+        index_count: u32::from(batch.index_count),
+        material_index: batch.material_index,
+        pipeline_state: LegacyPipelineState::default(),
+        alpha_test_reference: 0,
+    });
+    Ok(())
+}
+
+fn rotate_by_quaternion(position: [f32; 3], rotation: [f32; 4]) -> [f32; 3] {
+    let [x, y, z, w] = rotation;
+    let tx = 2.0 * (y * position[2] - z * position[1]);
+    let ty = 2.0 * (z * position[0] - x * position[2]);
+    let tz = 2.0 * (x * position[1] - y * position[0]);
+    [
+        position[0] + w * tx + (y * tz - z * ty),
+        position[1] + w * ty + (z * tx - x * tz),
+        position[2] + w * tz + (x * ty - y * tx),
+    ]
 }
 
 /// Projects validated `Land.msh` terrain geometry into the static Vulkan path.
@@ -551,7 +714,8 @@ fn static_mesh_xy_bounds(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fparkan_msh::{Batch, ModelAsset, Slot};
+    use fparkan_animation::{AnimKey24, AnimationTime, Pose};
+    use fparkan_msh::{Batch, ModelAnimation, ModelAsset, Slot};
     use fparkan_terrain_format::{FullSurfaceMask, TerrainFace28, TerrainSlotTable};
 
     fn model(positions: Vec<[f32; 3]>, indices: Vec<u16>, batches: Vec<Batch>) -> ModelAsset {
@@ -724,6 +888,96 @@ mod tests {
         assert_eq!(mesh.vertices[0].position, [7.0, 24.0, 32.0]);
         assert_eq!(mesh.vertices[1].position, [10.0, 20.0, 30.0]);
         assert_eq!(mesh.vertices[2].position, [10.0, 22.0, 30.0]);
+    }
+
+    #[test]
+    fn world_space_msh_applies_each_node_fallback_pose_before_root_transform() {
+        let mut nodes = vec![0_u8; 76];
+        nodes[8..10].copy_from_slice(&0_u16.to_le_bytes());
+        nodes[38 + 6..38 + 8].copy_from_slice(&1_u16.to_le_bytes());
+        nodes[38 + 8..38 + 10].copy_from_slice(&1_u16.to_le_bytes());
+        let source = ModelAsset {
+            node_stride: 38,
+            node_count: 2,
+            nodes_raw: nodes,
+            slots: vec![
+                Slot {
+                    tri_start: 0,
+                    tri_count: 0,
+                    batch_start: 0,
+                    batch_count: 1,
+                    aabb_min: [0.0; 3],
+                    aabb_max: [1.0; 3],
+                    sphere_center: [0.0; 3],
+                    sphere_radius: 1.0,
+                    opaque: [0; 5],
+                },
+                Slot {
+                    tri_start: 0,
+                    tri_count: 0,
+                    batch_start: 1,
+                    batch_count: 1,
+                    aabb_min: [0.0; 3],
+                    aabb_max: [1.0; 3],
+                    sphere_center: [0.0; 3],
+                    sphere_radius: 1.0,
+                    opaque: [0; 5],
+                },
+            ],
+            positions: vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            normals: None,
+            uv0: None,
+            indices: vec![0, 1, 2, 0, 1, 2],
+            batches: vec![batch(0, 3, 0), batch(3, 3, 0)],
+            node_names: None,
+            animation: Some(ModelAnimation {
+                keys: vec![
+                    AnimKey24 {
+                        time: AnimationTime(0.0),
+                        pose: Pose::default(),
+                    },
+                    AnimKey24 {
+                        time: AnimationTime(0.0),
+                        pose: Pose {
+                            translation: [10.0, 0.0, 0.0],
+                            rotation: [0.0, 0.0, 0.0, 1.0],
+                        },
+                    },
+                ],
+                frame_map: Vec::new(),
+                frame_count: 0,
+            }),
+        };
+
+        let mesh = project_msh_to_static_mesh_in_world_space_with_node_fallback_poses(
+            &source,
+            LegacyIron3dEulerTransform {
+                translation: [100.0, 0.0, 0.0],
+                orientation_radians: [0.0; 3],
+            },
+            [1.0; 3],
+        )
+        .expect("fallback-pose static mesh");
+
+        assert_eq!(mesh.vertices[0].position, [101.0, 0.0, 0.0]);
+        assert_eq!(mesh.vertices[3].position, [111.0, 0.0, 0.0]);
+        assert_eq!(mesh.indices, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn rotates_point_by_unit_quaternion() {
+        let rotated = rotate_by_quaternion(
+            [1.0, 0.0, 0.0],
+            [
+                0.0,
+                0.0,
+                std::f32::consts::FRAC_1_SQRT_2,
+                std::f32::consts::FRAC_1_SQRT_2,
+            ],
+        );
+        assert!((rotated[0]).abs() < 0.0001);
+        assert!((rotated[1] - 1.0).abs() < 0.0001);
+        assert!((rotated[2]).abs() < 0.0001);
     }
 
     #[test]

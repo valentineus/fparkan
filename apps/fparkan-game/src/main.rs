@@ -33,7 +33,7 @@ use fparkan_render::{
 use fparkan_render_vulkan::{
     project_land_msh_to_static_mesh_in_legacy_world_space,
     project_land_msh_to_static_mesh_in_xy_frame,
-    project_msh_to_static_mesh_in_world_space_with_transform,
+    project_msh_to_static_mesh_in_world_space_with_node_fallback_poses,
     project_msh_to_static_mesh_in_xy_frame, VulkanPlanningBackend, VulkanSmokeFrameOutcome,
     VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo, VulkanStaticCamera, VulkanStaticMaterial,
     VulkanStaticMesh, VulkanStaticTexture, VulkanStaticXyFrame,
@@ -288,7 +288,7 @@ fn static_preview_mesh_and_materials(
                 format!("static preview visual {visual_id:?} references unknown model {model_id:?}")
             })?;
             let component = if legacy_camera.is_some() {
-                project_msh_to_static_mesh_in_world_space_with_transform(
+                project_msh_to_static_mesh_in_world_space_with_node_fallback_poses(
                     &model.validated,
                     LegacyIron3dEulerTransform {
                         translation: root.position,
