@@ -32,7 +32,7 @@ S0-PLAT-001	covered	cargo test -p fparkan-platform-winit --offline window_port_r
 S0-PLAT-002	covered	cargo clippy -p fparkan-platform -p fparkan-platform-winit --all-targets --all-features --locked -- -D warnings
 S0-PLAT-003	covered	cargo test -p fparkan-platform-winit --offline smoke_window_plan_requires_native_handles_and_nonzero_extent smoke_window_plan_rejects_zero_extent
 S0-PLAT-004	covered	cargo test -p fparkan-platform-winit --offline smoke_window_app_requires_created_native_window smoke_window_app_rejects_synthetic_window_without_native_handles
-S0-VK-001	covered-planning	cargo test -p fparkan-render-vulkan --offline planning_backend_tracks_render_request_and_simulated_present
+S0-VK-001	covered-gpu	Windows fparkan-vulkan-smoke native audit: real instance, Win32 surface, logical device, swapchain and indexed triangle presentation
 S0-VK-002	covered	cargo test -p fparkan-render-vulkan --offline device_scoring_is_deterministic_and_prefers_discrete_unified_queue
 S0-VK-003	covered	cargo test -p fparkan-render-vulkan --offline portability_subset_is_reported_and_enabled_when_exposed
 S0-VK-004	covered	cargo test -p fparkan-render-vulkan --offline rejects_missing_graphics_present_swapchain_and_format
@@ -52,8 +52,8 @@ S0-VK-017	covered	cargo test -p fparkan-render-vulkan --offline swapchain_plan_j
 S0-VK-018	covered	cargo test -p fparkan-render-vulkan --offline triangle_shader_manifest_hashes_are_stable checked_in_shader_manifest_matches_generated_report
 S0-VK-019	covered	cargo test -p fparkan-render-vulkan --offline shader_manifest_report_json_is_stable
 S0-VK-020	covered	cargo test -p fparkan-render-vulkan --offline shader_manifest_rejects_invalid_spirv_containers
-S0-VK-021	covered-planning	cargo test -p fparkan-render-vulkan --offline frame_submission_plan_json_is_stable
-S0-VK-022	covered-planning	cargo test -p fparkan-render-vulkan --offline planning_backend_tracks_render_request_and_simulated_present
+S0-VK-021	covered-gpu	Windows fparkan-vulkan-smoke native audit: real submit/present loop, 300 frames and validation-clean teardown
+S0-VK-022	covered-gpu	Windows fparkan-vulkan-smoke native audit: resize drives swapchain recreation before clean shutdown
 S0-VK-023	covered	cargo test -p fparkan-vulkan-smoke --offline rejects_false_pass_without_full_evidence blocked_report_includes_shader_manifest_and_bootstrap_status
 S0-VK-024	covered	cargo test -p fparkan-vulkan-smoke --offline rejects_passed_without_loader_probe formats_vulkan_api_version
 S0-VK-025	covered	cargo test -p fparkan-vulkan-smoke --offline rejects_passed_without_instance_probe parses_instance_probe_as_loader_probe
