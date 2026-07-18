@@ -78,6 +78,19 @@ drivers и video modes, проверяет поддержку 3D, перевод
 функции DirectDraw/Direct3D семейства 5-7 и публикует refcounted renderer.
 `niGet3DRender` возвращает уже созданный объект и увеличивает число владельцев.
 
+Статическая проверка подтверждает этот вывод без подмены его runtime-паритетом:
+`Ngi32.dll` импортирует `LoadLibraryA`, `GetProcAddress` и `FreeLibrary`, но не
+имеет статического импорта `DDRAW.dll`; в нём присутствуют строки `DDRAW`,
+`DirectDrawCreate`, `DirectDrawCreateEx`, `DirectDrawEnumerateA` и
+`DirectDrawEnumerateExA`, а также GUID семейств `IDirectDraw` 1/2/4/7,
+`IDirect3D` 1/2/3/7 и соответствующих `IDirect3DDevice`. Следовательно,
+современная реализация заменяет наблюдаемую fixed-function семантику над этой
+границей, а не должна эмулировать COM-объекты DirectX. Равный SHA-256 Ngi32 в
+Частях 1 и 2 зафиксирован в
+[evidence](../evidence/original_engine_hashes.md); это поддерживает единый
+Vulkan backend contract, но не отменяет раздельных corpus/capture baselines
+для изменённых assets и gameplay DLL.
+
 ```text
 enumerate adapters and video modes
   -> choose CURRENT_D3DCARD
