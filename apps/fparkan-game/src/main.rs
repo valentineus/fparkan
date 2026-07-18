@@ -54,7 +54,7 @@ use fparkan_terrain::TerrainWorld;
 use fparkan_vfs::DirectoryVfs;
 #[cfg(test)]
 use fparkan_world::OriginalObjectId;
-use fparkan_world::WorldSnapshot;
+use fparkan_world::{TransformState, WorldSnapshot};
 use serde::Deserialize;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -1024,12 +1024,14 @@ fn render_snapshot_with_assets(
                 material_slots: vec![material],
                 material_index: 0,
                 pipeline_state: fparkan_render::LegacyPipelineState::default(),
-                transform: mission_drafts
-                    .and_then(|drafts| drafts.get(index))
-                    .map_or_else(
-                        || identity_transform(index_to_f32(index)),
-                        mission_position_scale_transform,
-                    ),
+                transform: snapshot_transform(snapshot, *handle).unwrap_or_else(|| {
+                    mission_drafts
+                        .and_then(|drafts| drafts.get(index))
+                        .map_or_else(
+                            || identity_transform(index_to_f32(index)),
+                            mission_position_scale_transform,
+                        )
+                }),
                 range: IndexRange { start: 0, count: 3 },
                 stable_order,
             });
@@ -1039,6 +1041,40 @@ fn render_snapshot_with_assets(
         camera: CameraSnapshot::default(),
         draws,
     }
+}
+
+fn snapshot_transform(
+    snapshot: &WorldSnapshot,
+    handle: fparkan_world::ObjectHandle,
+) -> Option<[f32; 16]> {
+    snapshot
+        .transforms
+        .iter()
+        .find_map(|(candidate, transform)| (*candidate == handle).then_some(*transform))
+        .map(transform_state_position_scale_transform)
+}
+
+fn transform_state_position_scale_transform(transform: TransformState) -> [f32; 16] {
+    let position = transform.position.map(f32::from_bits);
+    let scale = transform.scale.map(f32::from_bits);
+    [
+        scale[0],
+        0.0,
+        0.0,
+        position[0],
+        0.0,
+        scale[1],
+        0.0,
+        position[1],
+        0.0,
+        0.0,
+        scale[2],
+        position[2],
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ]
 }
 
 fn mission_position_scale_transform(draft: &MissionObjectDraft) -> [f32; 16] {
@@ -1779,6 +1815,55 @@ mod tests {
             mission_position_scale_transform(&draft),
             [2.0, 0.0, 0.0, 10.0, 0.0, 3.0, 0.0, 20.0, 0.0, 0.0, 4.0, 30.0, 0.0, 0.0, 0.0, 1.0,]
         );
+    }
+
+    #[test]
+    fn render_snapshot_prefers_world_transform_over_mission_draft() -> Result<(), String> {
+        let handle = ObjectHandle {
+            generation: 1,
+            slot: 0,
+        };
+        let snapshot = WorldSnapshot {
+            tick: Tick(1),
+            objects: vec![handle],
+            transforms: vec![(
+                handle,
+                TransformState {
+                    position: [
+                        100.0_f32.to_bits(),
+                        200.0_f32.to_bits(),
+                        300.0_f32.to_bits(),
+                    ],
+                    orientation: [0; 3],
+                    scale: [4.0_f32.to_bits(), 5.0_f32.to_bits(), 6.0_f32.to_bits()],
+                },
+            )],
+            events: Vec::new(),
+            hash: StateHash([0; 32]),
+        };
+        let drafts = vec![MissionObjectDraft {
+            original_id: None,
+            resource_name_raw: Vec::new(),
+            identity_or_clan_raw: 0,
+            position: [1.0; 3],
+            orientation_raw: [0.0; 3],
+            scale: [1.0; 3],
+            visual_ids: Vec::new(),
+            properties: Vec::new(),
+        }];
+
+        let commands = render_snapshot_commands_with_assets(&snapshot, None, Some(&drafts))?;
+        let RenderCommand::Draw(draw) = &commands.commands[1] else {
+            return Err("expected draw".to_string());
+        };
+        assert_eq!(
+            draw.transform,
+            [
+                4.0, 0.0, 0.0, 100.0, 0.0, 5.0, 0.0, 200.0, 0.0, 0.0, 6.0, 300.0, 0.0, 0.0, 0.0,
+                1.0
+            ]
+        );
+        Ok(())
     }
 
     #[test]

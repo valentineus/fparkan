@@ -390,6 +390,13 @@ deterministic ticks. This is the state foundation for a future route/movement
 controller; it does not claim recovered velocity, collision or original
 behavior-controller semantics.
 
+The ordinary planning renderer now consumes this snapshot state before falling
+back to a mission draft. Its current transform bridge applies the preserved
+position and non-uniform scale only; raw orientation remains uninterpreted in
+this backend-neutral path. A GOG AutoDemo planning run on 2026-07-18 completed
+two ticks with eight objects, 66 draws and state hash
+`a54855a4f47ffa380911228f295dd49a9a7b88d6ff271a23db48ba318b1fbbb4`.
+
 Записывается начальная миссия, seed, input events, network messages и значения
 внешних часов. На контрольных ticks сохраняется canonical state hash:
 
