@@ -113,36 +113,22 @@ key, configuration, device profile, initial state, input/time script и верс
 
 ## Local evidence requests
 
-На текущем рабочем месте закрыты статические, corpus и headless runtime gates.
-Для локально воспроизводимого Desktop backend подтверждено только command/state trace
-в существующем GL-воркфлоу:
+Поддерживаемая desktop-платформа — только Windows/Vulkan. Локальный smoke
+`fparkan-vulkan-smoke` уже подтверждает настоящий Win32 surface/swapchain,
+300 кадров, controlled resize и отсутствие validation warnings/errors.
+Это закрывает фундамент Stage 0, но не доказывает визуальный паритет игры.
 
-- `fixtures/acceptance/macos-gl33-triangle-capture.json`;
+Следующие доказательства всё ещё нужны именно для Iron3D-compatible рендера:
 
-`S3-GL-001` пока не закрыт: текущая evidence не отражает полноценный
-`winit`+`fparkan-render-vulkan` path с real surface/present pipeline.
-Для закрытия требования требуется постоянный workspace-владельческий backend на
-`winit`/`fparkan-platform-winit` + `fparkan-render-vulkan` с реальным
-surface/present pipeline, command/state parity и licensed frame capture.
+- capability-gated capture из оригинального GOG процесса с camera/matrix,
+  draw/state и frame-boundary provenance;
+- фиксированные Windows Vulkan captures статической модели, lightmapped модели
+  и terrain после совпадения backend-neutral command capture;
+- затем controlled captures анимации, FX, прозрачности, теней и атмосферы.
 
-Для повышения `S3-GL-002` до `covered` всё ещё нужен воспроизводимый GLES2
-backend profile: GLES2 должен создать кадр, сохранить pixel capture и тот же
-command/state trace. Локальный Docker probe существующего Rust image не нашёл
-`libGL`, `libEGL`, `libGLES` или `libOSMesa`, поэтому закрытие этого gate требует
-отдельно предоставленного Docker image с Rust + Mesa/EGL/OSMesa либо разрешения
-на установку соответствующего проверочного окружения.
-
-Для текущей macOS-focused цели `S3-GL-002`, `L3-DEVICE-001` и `L5-RG40-001`
-помечены как `omitted`: они остаются требованиями portable target scope, но не
-блокируют локальный macOS acceptance-аудит. При возврате RG40XX/GLES2 в область
-цели эти gates снова должны требовать внешнего evidence.
-
-`L3-DEVICE-001` и `L5-RG40-001` не закрываются локально без RG40XX H или
-эквивалентного удалённого runner-а. Требуемое доказательство: запуск выбранной
-миссии при 640x480 на целевом профиле, сохранённые stdout/stderr, build
-fingerprint, manifest игрового каталога, frame/tick budget, memory budget и
-итоговый pass/fail report. Desktop/headless результаты не считаются заменой
-on-device smoke.
+Linux/macOS, GLES2, RG40XX и удалённые portability runners не являются
+acceptance-гейтами этого проекта. Они не должны появляться в списке блокеров
+или подменять Windows evidence.
 
 ## Closure criteria
 
