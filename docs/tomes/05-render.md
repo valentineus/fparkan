@@ -1080,6 +1080,13 @@ FNV-1a `6451493914305554398`. This is the first GPU acceptance evidence for
 the corrected XY diagnostic projection; the hash is not compared with the
 original renderer and does not establish original camera, shading or parity.
 
+The identical bounded XY command also completed against the supplied licensed
+Part 1 installation (`C:\\Program Files (x86)\\Nikita\\IS`). Its report had
+the same 14 root MSH components, terrain component, 15 descriptors, native
+1280x720 two-image swapchain, validation `0/0`, and FNV-1a
+`6451493914305554398`. This confirms the current first-root diagnostic bridge
+across GOG and Part 1 data; it does not claim full mission or Part 2 parity.
+
 `Assets` now has four ordered diagnostic sub-checkpoints: `AssetModelMeshes`
 (MSH), `AssetWearTables` (WEAR), `AssetMaterials` (MAT0) and `AssetTextures`
 (diffuse TEXM and lightmaps). The callback is observational: it neither changes
