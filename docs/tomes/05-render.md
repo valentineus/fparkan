@@ -1602,6 +1602,18 @@ the dispatcher calls a distinct object at byte offset `3244`. Its virtual slot
 `+316` and its exclusive key count at `+320`: the first dword of an entry is a
 stored-record pointer and its byte at `+4` selects a 212-byte profile bank. A
 key outside that count, or an entry pointer below `0x1000`, fails the lookup.
+
+The static constructor now identifies this object as the embedded `CLandscape`
+subobject whose vtable is `Terrain.dll` RVA `0x643D0`. It installs that vtable
+at parent offset `+316`, allocates the entry table at parent `+632` (subobject
+`+316`) as `0x1f40` bytes / 1,000 eight-byte entries, and initializes its count
+to zero. The profile-bank region starts at subobject `+332`: every one of the
+100 banks has a 116-byte header followed by a 96-byte initialized stream, hence
+the recovered 212-byte stride. The byte selected from each table entry is
+therefore a bank index into a constructor-owned, fixed 100-bank region. This
+proves the cache's allocation layout; it does **not** yet identify the code that
+populates individual entry records from map resources.
+
 On success the method returns the shared result view at cache offset `+24`, not
 the stored-record pointer and not a WEAR row. Thus the dispatcher's observed
 flags at result-view `+60`, secondary selector `+24`, optional byte `+88`,
@@ -1610,7 +1622,7 @@ referenced state block `+104`, three signed shorts `+108`, and another selector
 Mode `0x0200` (`512`) only validates the key in the recovered path; mode
 `0x5011` includes the recovered selector-table transfer and mode `0x5110`
 includes the recovered bank-byte transfer. The meanings of their remaining
-bits, the cache builder, and the result fields remain unrecovered, so the Vulkan
+bits, record population, and the result fields remain unrecovered, so the Vulkan
 path must not map any of them to invented pipeline state.
 
 A read-only elevated AutoDemo probe confirms that this is a lifecycle boundary,
