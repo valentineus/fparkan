@@ -35,8 +35,8 @@ use fparkan_prototype::{
 use fparkan_resource::{resource_name, CachedResourceRepository, ResourceRepository};
 use fparkan_vfs::{Vfs, VfsError};
 use fparkan_world::{
-    construct_object, new as new_world, register_object, step, InputSnapshot, ObjectDraft,
-    OriginalObjectId, World, WorldConfig, WorldSnapshot,
+    construct_object, new as new_world, register_object, set_transform, step, InputSnapshot,
+    ObjectDraft, OriginalObjectId, TransformState, World, WorldConfig, WorldSnapshot,
 };
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -852,9 +852,18 @@ fn load_mission_with_options_and_progress(
     let mut new_runtime_world = new_world(WorldConfig);
     let mut handles = Vec::with_capacity(mission.objects.len());
     record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::Construct);
-    for (index, _object) in mission.objects.iter().enumerate() {
+    for (index, object) in mission.objects.iter().enumerate() {
         let original_id = u32::try_from(index).ok().map(OriginalObjectId);
         let handle = construct_object(&mut new_runtime_world, ObjectDraft { original_id })?;
+        set_transform(
+            &mut new_runtime_world,
+            handle,
+            TransformState {
+                position: object.position.map(f32::to_bits),
+                orientation: object.orientation.map(f32::to_bits),
+                scale: object.scale.map(f32::to_bits),
+            },
+        )?;
         handles.push(handle);
     }
     trace.drafts_before_registration = handles.len();

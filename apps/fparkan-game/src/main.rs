@@ -1702,6 +1702,7 @@ mod tests {
                     slot: 5,
                 },
             ],
+            transforms: Vec::new(),
             events: Vec::new(),
             hash: StateHash([0; 32]),
         };
@@ -1733,6 +1734,7 @@ mod tests {
                 generation: 1,
                 slot: 7,
             }],
+            transforms: Vec::new(),
             events: Vec::new(),
             hash: StateHash([0; 32]),
         };
@@ -1787,6 +1789,7 @@ mod tests {
                 generation: 1,
                 slot: 0,
             }],
+            transforms: Vec::new(),
             events: Vec::new(),
             hash: StateHash([0; 32]),
         };

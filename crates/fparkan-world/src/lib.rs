@@ -23,7 +23,7 @@
 use fparkan_binary::sha256;
 use std::collections::VecDeque;
 
-const WORLD_STATE_HASH_SCHEMA: &[u8] = b"fparkan-world-state-v2\0";
+const WORLD_STATE_HASH_SCHEMA: &[u8] = b"fparkan-world-state-v3\0";
 
 /// Object handle with generation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -49,6 +49,20 @@ pub struct Tick(pub u64);
 /// State hash.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StateHash(pub [u8; 32]);
+
+/// Exact source transform carried by one world object.
+///
+/// Values are IEEE-754 bit patterns so mission transforms retain their input
+/// identity in deterministic state before a controller interprets them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TransformState {
+    /// Position words in source axis order.
+    pub position: [u32; 3],
+    /// Orientation words in source axis order.
+    pub orientation: [u32; 3],
+    /// Non-uniform scale words in source axis order.
+    pub scale: [u32; 3],
+}
 
 /// World phase.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -110,6 +124,8 @@ pub struct WorldSnapshot {
     pub tick: Tick,
     /// Live object handles.
     pub objects: Vec<ObjectHandle>,
+    /// Exact transforms for live registered objects in object-handle order.
+    pub transforms: Vec<(ObjectHandle, TransformState)>,
     /// Commands processed during this step.
     pub events: Vec<WorldEvent>,
     /// State hash.
@@ -167,6 +183,7 @@ struct Slot {
     owner_id: Option<OwnerId>,
     mirror_id: Option<OriginalObjectId>,
     registration_sequence: Option<u64>,
+    transform: TransformState,
 }
 
 /// World.
@@ -248,6 +265,7 @@ pub fn construct_object(world: &mut World, draft: ObjectDraft) -> Result<ObjectH
         owner_id: None,
         mirror_id: None,
         registration_sequence: None,
+        transform: TransformState::default(),
     });
     Ok(handle)
 }
@@ -333,6 +351,29 @@ pub fn identity_metadata(
         mirror_id: slot.mirror_id,
         owner_id: slot.owner_id,
     })
+}
+
+/// Sets the exact source transform for a live object.
+///
+/// # Errors
+///
+/// Returns [`WorldError`] if the handle is stale, deleted, or out of range.
+pub fn set_transform(
+    world: &mut World,
+    handle: ObjectHandle,
+    transform: TransformState,
+) -> Result<(), WorldError> {
+    checked_slot_mut(world, handle)?.transform = transform;
+    Ok(())
+}
+
+/// Returns the exact source transform for a live object.
+///
+/// # Errors
+///
+/// Returns [`WorldError`] if the handle is stale, deleted, or out of range.
+pub fn transform_state(world: &World, handle: ObjectHandle) -> Result<TransformState, WorldError> {
+    Ok(checked_slot(world, handle)?.transform)
 }
 
 /// Requests deletion.
@@ -423,6 +464,7 @@ where
         let snapshot = WorldSnapshot {
             tick: world.tick,
             objects: live_registered(world),
+            transforms: live_registered_with_transforms(world),
             events,
             hash: canonical_state_hash(world),
         };
@@ -459,6 +501,7 @@ fn canonical_state_bytes(world: &World) -> Vec<u8> {
         push_optional_u32(&mut out, slot.mirror_id.map(|id| id.0));
         push_optional_u16(&mut out, slot.owner_id.map(|id| id.0));
         push_optional_u64(&mut out, slot.registration_sequence);
+        push_transform(&mut out, slot.transform);
     }
     push_len(&mut out, world.queue.len());
     for command in &world.queue {
@@ -639,6 +682,17 @@ fn push_handle(out: &mut Vec<u8>, handle: ObjectHandle) {
     push_u32(out, handle.slot);
 }
 
+fn push_transform(out: &mut Vec<u8>, transform: TransformState) {
+    for word in transform
+        .position
+        .into_iter()
+        .chain(transform.orientation)
+        .chain(transform.scale)
+    {
+        push_u32(out, word);
+    }
+}
+
 fn checked_slot(world: &World, handle: ObjectHandle) -> Result<&Slot, WorldError> {
     let slot = world
         .slots
@@ -689,6 +743,24 @@ fn live_registered(world: &World) -> Vec<ObjectHandle> {
         .collect()
 }
 
+fn live_registered_with_transforms(world: &World) -> Vec<(ObjectHandle, TransformState)> {
+    world
+        .slots
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, slot)| {
+            let slot_index = u32::try_from(idx).ok()?;
+            (slot.live && slot.registered).then_some((
+                ObjectHandle {
+                    generation: slot.generation,
+                    slot: slot_index,
+                },
+                slot.transform,
+            ))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,6 +774,25 @@ mod tests {
         register_object(&mut world, handle).expect("register");
         let after = step(&mut world, &InputSnapshot).expect("step");
         assert_eq!(after.objects, vec![handle]);
+    }
+
+    #[test]
+    fn transform_is_exactly_snapshotted_and_changes_state_hash() {
+        let mut world = new(WorldConfig);
+        let handle =
+            construct_object(&mut world, ObjectDraft { original_id: None }).expect("object");
+        register_object(&mut world, handle).expect("register");
+        let before = step(&mut world, &InputSnapshot).expect("before");
+        let transform = TransformState {
+            position: [1.0_f32.to_bits(), (-2.0_f32).to_bits(), 3.0_f32.to_bits()],
+            orientation: [0.0_f32.to_bits(), 0.5_f32.to_bits(), (-0.25_f32).to_bits()],
+            scale: [1.0_f32.to_bits(), 2.0_f32.to_bits(), 0.5_f32.to_bits()],
+        };
+        set_transform(&mut world, handle, transform).expect("set transform");
+        let after = step(&mut world, &InputSnapshot).expect("after");
+        assert_eq!(transform_state(&world, handle), Ok(transform));
+        assert_eq!(after.transforms, vec![(handle, transform)]);
+        assert_ne!(before.hash, after.hash);
     }
 
     #[test]

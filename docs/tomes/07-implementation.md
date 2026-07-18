@@ -374,6 +374,22 @@ Demo mission total: 201 objects -> 501 prototypes -> 501 object MSH/WEAR.
 
 ### Deterministic simulation replay
 
+#### Mission transform state in the world contract
+
+`fparkan-world` now carries a `TransformState` for every live object: the
+three TMA position words, three orientation words and three scale words are
+preserved as exact IEEE-754 bit patterns. This stores source identity before a
+movement or physics controller interprets axes, units or Euler order.
+`WorldSnapshot` publishes transforms in stable object-handle order and the
+canonical SHA-256 state hash includes every transform word.
+
+Mission loading assigns this state after construction and before registration.
+A headless licensed GOG AutoDemo run on 2026-07-18 loaded eight objects, 343
+areals and 3,174 terrain surfaces with zero graph failures, then completed two
+deterministic ticks. This is the state foundation for a future route/movement
+controller; it does not claim recovered velocity, collision or original
+behavior-controller semantics.
+
 Записывается начальная миссия, seed, input events, network messages и значения
 внешних часов. На контрольных ticks сохраняется canonical state hash:
 
