@@ -1278,8 +1278,13 @@ fn load_legacy_camera_capture(path: &std::path::Path) -> Result<VulkanStaticCame
 }
 
 fn parse_legacy_camera_capture(bytes: &[u8]) -> Result<VulkanStaticCamera, String> {
-    let capture: LegacyCameraCapture = serde_json::from_slice(bytes)
-        .map_err(|err| format!("invalid legacy camera JSON: {err}"))?;
+    // Windows PowerShell 5.1 writes redirected text as UTF-16LE with a BOM.
+    // `capture-original-camera.ps1` intentionally emits plain JSON, so accept
+    // that normal hand-off format as well as UTF-8 without making the caller
+    // re-encode a read-only capture file.
+    let json = decode_legacy_camera_capture_json(bytes)?;
+    let capture: LegacyCameraCapture =
+        serde_json::from_str(&json).map_err(|err| format!("invalid legacy camera JSON: {err}"))?;
     if capture.schema != "fparkan-legacy-camera-v1" {
         return Err("unsupported legacy camera capture schema".to_string());
     }
@@ -1295,6 +1300,43 @@ fn parse_legacy_camera_capture(bytes: &[u8]) -> Result<VulkanStaticCamera, Strin
         },
     )
     .ok_or_else(|| "legacy camera capture contains an invalid D3D7 camera".to_string())
+}
+
+fn decode_legacy_camera_capture_json(bytes: &[u8]) -> Result<String, String> {
+    let decode_utf16 = |words: Vec<u16>| {
+        String::from_utf16(&words)
+            .map_err(|err| format!("invalid UTF-16 legacy camera JSON: {err}"))
+    };
+    match bytes {
+        [0xff, 0xfe, rest @ ..] => {
+            let chunks = rest.chunks_exact(2);
+            if !chunks.remainder().is_empty() {
+                return Err("invalid UTF-16LE legacy camera JSON length".to_string());
+            }
+            decode_utf16(
+                chunks
+                    .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                    .collect(),
+            )
+        }
+        [0xfe, 0xff, rest @ ..] => {
+            let chunks = rest.chunks_exact(2);
+            if !chunks.remainder().is_empty() {
+                return Err("invalid UTF-16BE legacy camera JSON length".to_string());
+            }
+            decode_utf16(
+                chunks
+                    .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+                    .collect(),
+            )
+        }
+        [0xef, 0xbb, 0xbf, rest @ ..] => std::str::from_utf8(rest)
+            .map(str::to_owned)
+            .map_err(|err| format!("invalid UTF-8 legacy camera JSON: {err}")),
+        _ => std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|err| format!("invalid UTF-8 legacy camera JSON: {err}")),
+    }
 }
 
 fn json_string(value: &str) -> String {
@@ -1634,6 +1676,14 @@ mod tests {
 
         assert!(camera.is_finite());
         assert_eq!(camera.clip_from_world[0], 0.65_f32.cos());
+        let mut utf16le = vec![0xff, 0xfe];
+        utf16le.extend(json.encode_utf16().flat_map(u16::to_le_bytes));
+        assert_eq!(
+            parse_legacy_camera_capture(&utf16le)
+                .expect("PowerShell UTF-16LE capture must be accepted")
+                .clip_from_world,
+            camera.clip_from_world
+        );
         assert_eq!(
             parse_legacy_camera_capture(br#"{"schema":"unknown","selector0_words":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"viewport":[0,0,1,1],"near_plane":0.1,"far_plane":1.0,"field_of_view_radians":1.0}"#),
             Err("unsupported legacy camera capture schema".to_string())

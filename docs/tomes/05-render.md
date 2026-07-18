@@ -1909,6 +1909,28 @@ the licensed GOG `MISSIONS/Autodemo.00/data.tma` run with all eight roots,
 mesh components, 75,543 clip-visible vertices, a 1280×720 / 3,686,400-byte
 readback hash `4638497144561211935`, and validation warnings/errors `0/0`.
 
+### Windows PowerShell camera-capture hand-off
+
+`tools/capture-original-camera.ps1` is an observer: it opens the original
+process only with `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ`, samples the
+active Terrain camera and emits `fparkan-legacy-camera-v1` JSON. Windows
+PowerShell 5.1 commonly redirects or pipes that text as UTF-16LE with a BOM.
+The Vulkan viewer now accepts BOM-marked UTF-16LE and UTF-16BE in addition to
+UTF-8 (including an UTF-8 BOM), so a normal PowerShell capture can be used
+directly as `--legacy-camera-capture` without a lossy manual re-encoding step.
+Malformed byte lengths and invalid Unicode remain explicit load errors.
+
+Fresh read-only evidence from the running licensed GOG AutoDemo sampled outer
+camera `0x0B368FD8` in `Terrain.dll` at base `0x02510000`; selector-0
+translation was `(548.020752, 559.672852, 3.00516248)`. Passing the captured
+UTF-16LE file to the native Vulkan viewer rendered all eight mission roots
+with `camera_mode="legacy-d3d7-capture"`, 66 mesh components, 6,787
+clip-visible vertices, 71 material descriptors, a 1280x720 / 3,686,400-byte
+format-50 readback hash `7904810245714997753`, and validation warnings/errors
+`0/0`. This proves the live-camera hand-off and projection path; it does not
+establish frame-by-frame camera-selection parity, terrain shading or pixel
+parity with the original renderer.
+
 ### Explicit MAT0 phase preview
 
 `fparkan-game --backend static-vulkan --static-material-phase <u16>` now
