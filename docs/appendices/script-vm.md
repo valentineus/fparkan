@@ -84,14 +84,22 @@ ownership значения на FPU stack и следующий consumer, поэ
 
 `Handler(2)` (третья entry table, VA `0x10009610`) уже имеет статический
 contract, но ещё не Rust execution: он выбирает active event/instruction через
-runtime offsets `+0x48/+0x4c`, разрешает семь 32-bit slots через varset object
-`+0x18`, допускает integer-kind `5` и float-kind `3` для трёх numeric slots
-(`+0x10/+0x14/+0x18`, иначе использует `0.0`), затем вызывает opaque AI object
-по `this + 0x7c` и очищает flag `+0x50`. Три первых slots передаются без
-доказанной semantic type/name. Следующий закрывающий capture должен записать
-raw seven slots, resolved variable values и вход/выход вызова `0x100059f0` в
-controlled mission. До него compatibility VM возвращает явный unsupported
-result, а не «примерный» game command.
+runtime offsets `+0x48/+0x4c` и разрешает семь 32-bit slots через varset object
+`+0x18`. Их доказанный dataflow: slot 0 даёт один `u32` и base string, slot 1
+даёт numeric scalar, slots 2 и 3 — по `u32`, slots 4, 5 и 6 принимают только
+kind `5`/`3` и иначе дают `0.0`. Затем он вызывает `0x100059f0` объекта по
+`this + 0x7c` и очищает flag `+0x50`.
+
+Этот callee больше не opaque. Он строит key из семи значений, ищет matching
+record в своей collection по `this + 0x24` и при совпадении обновляет только
+record fields `+0x0c` и `+0x14`, затем вызывает его refresh path `0x10005070`.
+При отсутствии record он лениво ищет в event table имена `<base>_Start` и
+`<base>_Continue`, сохраняет их IDs в indexed state и materializes новый
+internal record. В этой ветке не видно прямого World3D/Behavior call, поэтому
+это доказанная scheduler/event-record boundary, а не команда движения, атаки
+или строительства. Semantic names семи slots, key equality и consumer нового
+record остаются открытыми; до dynamic capture Rust возвращает явный
+unsupported result, а не «примерный» game command.
 
 На границе mission runtime выбранный TMA clan `first_resource` теперь
 материализуется как отдельный `MissionScriptBundle`: loader нормализует

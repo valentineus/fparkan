@@ -153,10 +153,12 @@ handler лишь инициирует execution context (`+0x50 = 1`); его ga
 
 Первый часто встречающийся table entry с side effect — `Handler(2)` (176
 records в corpus). Он берёт active instruction, разрешает семь slots через
-varset, приводит три значения к float по observed kinds `5`/`3`, вызывает
-внутренний AI object и сбрасывает active flag. Смысл вызова и slot names ещё
-не установлены динамически, поэтому Rust не исполняет этот handler как
-гипотетическую команду движения/атаки/строительства.
+varset, приводит три значения к float по observed kinds `5`/`3`, затем
+materializes или refresh-ит внутренний event record. Его base string связывает
+`<base>_Start` и `<base>_Continue` с event table; прямого World3D/Behavior
+call на этой ветке не найдено. Slot names и consumer record ещё не установлены
+динамически, поэтому Rust не исполняет handler как гипотетическую команду
+движения/атаки/строительства.
 
 Безопасная runtime-модель:
 
