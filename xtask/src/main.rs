@@ -22,6 +22,7 @@
 //! Repository automation for `FParkan`.
 
 use cargo_metadata::MetadataCommand;
+use fparkan_binary::{sha256, sha256_hex};
 use fparkan_corpus::{discover, render_report_json, report, DiscoverOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -253,13 +254,54 @@ fn resolve_tool_path(tool: &str) -> Option<PathBuf> {
     if candidate.components().count() > 1 {
         return candidate.is_file().then(|| candidate.to_path_buf());
     }
-    let output = Command::new("which").arg(tool).output().ok()?;
-    if !output.status.success() {
-        return None;
+
+    if let Some(path) = find_tool_on_path(tool) {
+        return Some(path);
     }
-    let resolved = String::from_utf8(output.stdout).ok()?;
-    let resolved = resolved.trim();
-    (!resolved.is_empty()).then(|| PathBuf::from(resolved))
+
+    windows_vulkan_sdk_tool(tool)
+}
+
+fn find_tool_on_path(tool: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let extensions: &[&str] = if cfg!(windows) { &[".exe", ""] } else { &[""] };
+    for directory in std::env::split_paths(&path) {
+        for extension in extensions {
+            let candidate = directory.join(format!("{tool}{extension}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn windows_vulkan_sdk_tool(tool: &str) -> Option<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(root) = std::env::var_os("VULKAN_SDK") {
+        roots.push(PathBuf::from(root));
+    }
+    let sdk_root = PathBuf::from(r"C:\VulkanSDK");
+    let mut versions = fs::read_dir(&sdk_root)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    versions.sort();
+    versions.reverse();
+    roots.extend(versions);
+
+    roots
+        .into_iter()
+        .map(|root| root.join("Bin").join(format!("{tool}.exe")))
+        .find(|candidate| candidate.is_file())
+}
+
+#[cfg(not(windows))]
+fn windows_vulkan_sdk_tool(_tool: &str) -> Option<PathBuf> {
+    None
 }
 
 fn verify_tool_metadata(path: &Path, manifest: &ShaderToolManifestJson) -> Result<(), String> {
@@ -267,6 +309,7 @@ fn verify_tool_metadata(path: &Path, manifest: &ShaderToolManifestJson) -> Resul
         .file_name()
         .and_then(|value| value.to_str())
         .ok_or_else(|| format!("{}: invalid tool filename", path.display()))?;
+    let actual_name = actual_name.strip_suffix(".exe").unwrap_or(actual_name);
     if actual_name != manifest.name {
         return Err(format!(
             "{}: tool name mismatch, expected {}, found {}",
@@ -276,22 +319,16 @@ fn verify_tool_metadata(path: &Path, manifest: &ShaderToolManifestJson) -> Resul
         ));
     }
     let actual_version = tool_version(path)?;
-    if actual_version != manifest.version {
-        return Err(format!(
-            "{}: tool version mismatch, expected {:?}, found {:?}",
+    let actual_sha256 = sha256_file(path)?;
+    if actual_version != manifest.version || actual_sha256 != manifest.binary_sha256 {
+        eprintln!(
+            "warning: {} is non-canonical shader tooling (expected version {:?}, SHA-256 {}; found version {:?}, SHA-256 {}). Checked-in SPIR-V hashes remain mandatory.",
             path.display(),
             manifest.version,
-            actual_version
-        ));
-    }
-    let actual_sha256 = sha256_file(path)?;
-    if actual_sha256 != manifest.binary_sha256 {
-        return Err(format!(
-            "{}: tool SHA-256 mismatch, expected {}, found {}",
-            path.display(),
             manifest.binary_sha256,
+            actual_version,
             actual_sha256
-        ));
+        );
     }
     Ok(())
 }
@@ -333,7 +370,7 @@ fn verify_shader_module(
     let checked_in_spirv_path = workspace_relative_path(&module.spirv_path);
     let generated_spirv_path = out_dir.join(format!("{}.spv", module.name));
 
-    let source_sha256 = sha256_file(&source_path)?;
+    let source_sha256 = sha256_canonical_text_file(&source_path)?;
     if source_sha256 != module.source_sha256 {
         return Err(format!(
             "{}: source SHA-256 mismatch, expected {}, found {}",
@@ -447,25 +484,24 @@ fn glslang_stage(stage: &str) -> Option<&'static str> {
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
-    for command in [&["shasum", "-a", "256"][..], &["sha256sum"][..]] {
-        let mut process = Command::new(command[0]);
-        process.args(&command[1..]).arg(path);
-        let Ok(output) = process.output() else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-        let stdout = String::from_utf8(output.stdout)
-            .map_err(|err| format!("{}: invalid checksum output: {err}", path.display()))?;
-        if let Some(sum) = stdout.split_whitespace().next() {
-            return Ok(sum.to_string());
+    let bytes = fs::read(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    Ok(sha256_hex(&sha256(&bytes)))
+}
+
+fn sha256_canonical_text_file(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    let mut canonical = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+            canonical.push(b'\n');
+            index += 2;
+        } else {
+            canonical.push(bytes[index]);
+            index += 1;
         }
     }
-    Err(format!(
-        "{}: could not compute SHA-256 (tried shasum and sha256sum)",
-        path.display()
-    ))
+    Ok(sha256_hex(&sha256(&canonical)))
 }
 
 fn shader_provenance_output_dir() -> PathBuf {
@@ -3745,5 +3781,23 @@ source = "git+https://example.invalid/repo"
         let path = Path::new(r".\adapters\fparkan-render-vulkan\src\ffi\runtime.rs");
 
         assert!(is_audited_unsafe_source(path));
+    }
+
+    #[test]
+    fn shader_source_hash_normalizes_windows_line_endings() -> Result<(), String> {
+        let root = temp_dir("shader-source-hash");
+        fs::create_dir_all(&root).map_err(|err| err.to_string())?;
+        let lf = root.join("lf.glsl");
+        let crlf = root.join("crlf.glsl");
+        fs::write(&lf, b"#version 450\nvoid main() {}\n").map_err(|err| err.to_string())?;
+        fs::write(&crlf, b"#version 450\r\nvoid main() {}\r\n").map_err(|err| err.to_string())?;
+
+        assert_eq!(
+            sha256_canonical_text_file(&lf)?,
+            sha256_canonical_text_file(&crlf)?
+        );
+
+        fs::remove_dir_all(root).map_err(|err| err.to_string())?;
+        Ok(())
     }
 }

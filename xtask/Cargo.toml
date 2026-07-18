@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+fparkan-binary = { path = "../crates/fparkan-binary" }
 fparkan-corpus = { path = "../crates/fparkan-corpus" }
 cargo_metadata = "0.23.0"
 serde = { version = "1.0", features = ["derive"] }
