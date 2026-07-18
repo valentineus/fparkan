@@ -1064,6 +1064,8 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
         .map(|edge| edge.id.0)
         .max()
         .map_or(0, |value| value.saturating_add(1));
+    let mut diffuse_texture_validation = HashMap::new();
+    let mut lightmap_texture_validation = HashMap::new();
 
     for (prototype_index, prototype) in prototypes.iter().enumerate() {
         let PrototypeGeometry::Mesh(mesh) = &prototype.geometry else {
@@ -1159,7 +1161,13 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
                             );
                             for texture in material.document.texture_requests() {
                                 report.texture_request_count += 1;
-                                match resolve_texture(repository, &texture) {
+                                match resolve_texm_validation_cached(
+                                    repository,
+                                    &texture,
+                                    TEXTURES_ARCHIVE,
+                                    "texture",
+                                    &mut diffuse_texture_validation,
+                                ) {
                                     Ok(()) => {
                                         report.texture_resolved_count += 1;
                                         if let Ok(texture_key) =
@@ -1187,7 +1195,6 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
                                         }
                                     }
                                     Err(message) => {
-                                        let message = message.to_string();
                                         push_visual_failure(
                                             report,
                                             graph,
@@ -1214,7 +1221,13 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
                 }
                 for lightmap in &table.lightmaps {
                     report.lightmap_request_count += 1;
-                    match resolve_lightmap(repository, &lightmap.lightmap) {
+                    match resolve_texm_validation_cached(
+                        repository,
+                        &lightmap.lightmap,
+                        LIGHTMAP_ARCHIVE,
+                        "lightmap",
+                        &mut lightmap_texture_validation,
+                    ) {
                         Ok(()) => {
                             report.lightmap_resolved_count += 1;
                             if let Ok(lightmap_key) =
@@ -1242,7 +1255,6 @@ pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
                             }
                         }
                         Err(message) => {
-                            let message = message.to_string();
                             push_visual_failure(
                                 report,
                                 graph,
@@ -1776,18 +1788,19 @@ fn mesh_dependency_resource(
         .and_then(|node| node.resource.as_ref())
 }
 
-fn resolve_texture<R: ResourceRepository>(
+fn resolve_texm_validation_cached<R: ResourceRepository>(
     repository: &R,
     name: &ResourceName,
-) -> Result<(), AssetError> {
-    resolve_texm(repository, name, TEXTURES_ARCHIVE, "texture")
-}
-
-fn resolve_lightmap<R: ResourceRepository>(
-    repository: &R,
-    name: &ResourceName,
-) -> Result<(), AssetError> {
-    resolve_texm(repository, name, LIGHTMAP_ARCHIVE, "lightmap")
+    archive: &str,
+    label: &'static str,
+    cache: &mut HashMap<Vec<u8>, Result<(), String>>,
+) -> Result<(), String> {
+    if let Some(result) = cache.get(&name.0) {
+        return result.clone();
+    }
+    let result = resolve_texm(repository, name, archive, label).map_err(|error| error.to_string());
+    cache.insert(name.0.clone(), result.clone());
+    result
 }
 
 fn prepare_texture<R: ResourceRepository>(

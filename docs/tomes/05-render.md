@@ -1047,6 +1047,15 @@ graph expansion, rather than the base prototype graph, asset decoding, window
 creation or Vulkan submission. This is a diagnostic boundary, not a claim that
 the visual expansion is semantically optional or may be skipped.
 
+Visual expansion now caches the validation result of each unique diffuse TEXM
+and each unique lightmap TEXM independently. It still emits an edge and request
+count for every original material reference, and it replays the same cached
+success or failure at every reference; only duplicate archive open/read/decode
+work is removed. Under the same controlled 60-second GOG first-root probe, the
+last checkpoint advanced to `Assets`. The process was deliberately terminated
+before a frame, so this proves reduced visual-graph work rather than a Vulkan
+acceptance result.
+
 The same source-axis proof now applies to `TerrainWorld`: its `Land.msh` surface
 height query and `Land.map` areal/grid lookup use XY ground coordinates, return
 source Z height, and leave raycasts as full 3D intersections. The Part 1 and
