@@ -128,10 +128,21 @@ non-sentinel selector — `Handler(30)`, 246 records. Его VA `0x1000c266`
 у `Handler(57)` с первым word `2` и у отдельного lifecycle path с первым word
 `1`; предметная семантика этих modes ещё не доказана. В частности, это пока
 не основание назвать Handler(30) сообщением, приказом или UI opcode. Точный
-text-to-varset resolver ещё расположен за wrapper `0x10011ea0` в
-`0x100174a0`, поэтому Rust не dispatch-ит Handler(30) до восстановления
-индексации. Воспроизводимые exports: `ExportAiVmHandler30.java`,
+text-to-varset resolver расположен за wrapper `0x10011ea0` в
+`0x100174a0`. Воспроизводимые exports: `ExportAiVmHandler30.java`,
 `FindAiVmHandler30Callback.java`, `ExportAiVarSetLoader.java`.
+
+Следующий pass восстанавливает эту индексацию. `0x100174a0` добавляет каждый
+recognized source declaration в encounter order как 48-byte record; GOG shared
+`varset.var` не содержит `STRING(...)`, поэтому его 231 numeric `VAR` entries
+образуют точно это index space. `0x10013570` возвращает `DWORD` record kind
+raw `u32`; float kind проходит `__ftol`, чей x87 rounding profile ещё требует
+capture. Полный GOG scan всех 246 Handler(30) instructions показывает 492
+operand references: все 492 in-range и указывают на `DWORD`. Поэтому
+`VarSet::resolve_handler30` уже materializes точный opaque callback command
+`(mode=0, first, second)` для данного corpus path, но явно отклоняет float,
+out-of-range и incomplete instructions вместо silent coercion. Extractors:
+`ExportAiVarSetParser.java`, `ExportAiVarSetU32Resolver.java`.
 
 Следующий static pass закрывает equality/update policy. Identity ровно равна
 `(slot0 word, slot4 IEEE-754 bits, slot5 IEEE-754 bits)`, поэтому `-0.0` и

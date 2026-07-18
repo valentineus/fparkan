@@ -50,6 +50,116 @@ pub enum VarSetDefault {
     Dword(u32),
 }
 
+/// One opaque command delivered by a VM handler to the host-supplied callback.
+///
+/// The numeric mode belongs to the callback ABI; it has no inferred gameplay
+/// meaning yet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VmHostCallbackCommand {
+    /// First callback ABI word.
+    pub mode: u32,
+    /// First resolved callback payload word.
+    pub first: u32,
+    /// Second resolved callback payload word.
+    pub second: u32,
+}
+
+/// Error resolving the proven `Handler(30)` callback contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Handler30ResolveError {
+    /// The instruction did not contain one of Handler(30)'s required references.
+    MissingReference {
+        /// Zero-based required reference position.
+        position: usize,
+    },
+    /// A reference index was outside the loaded varset.
+    VarSetIndexOutOfBounds {
+        /// Referenced index from the compiled instruction.
+        index: u32,
+        /// Available declaration count.
+        declarations: usize,
+    },
+    /// A `float` declaration would require the still-unrecovered x87 `__ftol` policy.
+    FloatRequiresX87 {
+        /// Referenced index from the compiled instruction.
+        index: u32,
+    },
+}
+
+impl std::fmt::Display for Handler30ResolveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingReference { position } => {
+                write!(formatter, "Handler(30) is missing reference {position}")
+            }
+            Self::VarSetIndexOutOfBounds {
+                index,
+                declarations,
+            } => write!(
+                formatter,
+                "Handler(30) reference {index} is outside {declarations} varset declarations"
+            ),
+            Self::FloatRequiresX87 { index } => write!(
+                formatter,
+                "Handler(30) reference {index} requires unrecovered x87 float-to-u32 conversion"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Handler30ResolveError {}
+
+impl VarSet {
+    /// Resolves the two index operands consumed by the GOG `Handler(30)`.
+    ///
+    /// The original invokes its host callback with mode zero after resolving
+    /// both operands through `FUN_10013570`. The shipped GOG corpus uses only
+    /// `DWORD` declarations at these positions. A float is rejected until a
+    /// captured x87 `__ftol` conversion profile exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for missing references, out-of-range varset
+    /// indices, or a float operand requiring unrecovered x87 behavior.
+    pub fn resolve_handler30(
+        &self,
+        instruction: &ScriptInstruction,
+    ) -> Result<VmHostCallbackCommand, Handler30ResolveError> {
+        let first = self.resolve_handler30_operand(instruction, 0)?;
+        let second = self.resolve_handler30_operand(instruction, 1)?;
+        Ok(VmHostCallbackCommand {
+            mode: 0,
+            first,
+            second,
+        })
+    }
+
+    fn resolve_handler30_operand(
+        &self,
+        instruction: &ScriptInstruction,
+        position: usize,
+    ) -> Result<u32, Handler30ResolveError> {
+        let index = *instruction
+            .references
+            .get(position)
+            .ok_or(Handler30ResolveError::MissingReference { position })?;
+        match self.declarations.get(index as usize) {
+            Some(VarSetDeclaration {
+                default_value: VarSetDefault::Dword(value),
+                ..
+            }) => Ok(*value),
+            Some(VarSetDeclaration {
+                default_value: VarSetDefault::FloatBits(_),
+                ..
+            }) => Err(Handler30ResolveError::FloatRequiresX87 { index }),
+            None => Err(Handler30ResolveError::VarSetIndexOutOfBounds {
+                index,
+                declarations: self.declarations.len(),
+            }),
+        }
+    }
+}
+
 impl VarSetDefault {
     /// Returns the float value when this is a `float` default.
     #[must_use]
@@ -583,8 +693,8 @@ fn read_instruction(
 mod tests {
     use super::{
         decode, decode_with_limits, parse_varset, Handler2RecordInput, Handler2RecordScheduler,
-        ScriptDispatchSelector, VarSetDefault, VarSetError, VarSetType, GOG_HANDLER_COUNT,
-        INSTRUCTION_WORDS,
+        Handler30ResolveError, ScriptDispatchSelector, ScriptInstruction, VarSetDefault,
+        VarSetError, VarSetType, VmHostCallbackCommand, GOG_HANDLER_COUNT, INSTRUCTION_WORDS,
     };
     use fparkan_binary::{DecodeError, Limits};
 
@@ -715,6 +825,59 @@ STRING( 8, ignored, ignored, ignored)\r\n";
         assert_eq!(
             parse_varset(b"VAR( DWORD, d0, 1\n"),
             Err(VarSetError::UnterminatedDeclaration { line: 1 })
+        );
+    }
+
+    #[test]
+    fn handler_thirty_resolves_only_proven_dword_operands() {
+        let varset = parse_varset(
+            b"VAR( float, f0, 0.5)\nVAR( DWORD, first, 0x12)\nVAR( DWORD, second, 9)\n",
+        )
+        .expect("varset");
+        let instruction = ScriptInstruction {
+            header_words: [30, 0, 0, 0, 0, 2, 0],
+            references: vec![1, 2],
+        };
+        assert_eq!(
+            varset.resolve_handler30(&instruction),
+            Ok(VmHostCallbackCommand {
+                mode: 0,
+                first: 0x12,
+                second: 9,
+            })
+        );
+    }
+
+    #[test]
+    fn handler_thirty_keeps_float_and_malformed_references_explicit() {
+        let varset = parse_varset(b"VAR( float, f0, 0.5)\n").expect("varset");
+        let float_operand = ScriptInstruction {
+            header_words: [30, 0, 0, 0, 0, 2, 0],
+            references: vec![0, 0],
+        };
+        assert_eq!(
+            varset.resolve_handler30(&float_operand),
+            Err(Handler30ResolveError::FloatRequiresX87 { index: 0 })
+        );
+        let dword_varset = parse_varset(b"VAR( DWORD, d0, 1)\n").expect("dword varset");
+        let missing_operand = ScriptInstruction {
+            header_words: [30, 0, 0, 0, 0, 1, 0],
+            references: vec![0],
+        };
+        assert_eq!(
+            dword_varset.resolve_handler30(&missing_operand),
+            Err(Handler30ResolveError::MissingReference { position: 1 })
+        );
+        let out_of_range = ScriptInstruction {
+            header_words: [30, 0, 0, 0, 0, 2, 0],
+            references: vec![1, 1],
+        };
+        assert_eq!(
+            dword_varset.resolve_handler30(&out_of_range),
+            Err(Handler30ResolveError::VarSetIndexOutOfBounds {
+                index: 1,
+                declarations: 1,
+            })
         );
     }
 
