@@ -891,19 +891,32 @@ fn validate_cargo_metadata_dependency_closures(
     root: &Path,
     failures: &mut Vec<String>,
 ) -> Result<(), String> {
-    let mut manifests = Vec::new();
-    collect_cargo_manifests(root, &mut manifests)?;
-    let mut deps_by_package = BTreeMap::new();
-    for manifest in manifests {
-        let policy = load_cargo_manifest_policy(&manifest)?;
-        let Some(package) = policy.package_name() else {
-            continue;
-        };
-        deps_by_package.insert(package.to_string(), policy.dependency_names());
-    }
-
+    let metadata = workspace_metadata(root)?;
+    let deps_by_package = workspace_dependency_names(&metadata);
     validate_package_closure_excludes("fparkan-headless", &deps_by_package, failures);
     Ok(())
+}
+
+/// Returns declared direct dependencies for each workspace package from Cargo's
+/// own metadata model. Cargo, rather than a source-text heuristic, resolves
+/// package identities and workspace membership before this policy sees them.
+fn workspace_dependency_names(
+    metadata: &cargo_metadata::Metadata,
+) -> BTreeMap<String, BTreeSet<String>> {
+    metadata
+        .workspace_packages()
+        .iter()
+        .map(|package| {
+            (
+                package.name.to_string(),
+                package
+                    .dependencies
+                    .iter()
+                    .map(|dependency| dependency.name.clone())
+                    .collect(),
+            )
+        })
+        .collect()
 }
 
 fn validate_package_closure_excludes(
@@ -3478,6 +3491,18 @@ mod tests {
 
         validate_stage_package_entries(&manifest, &workspace_packages, &manifest_path)?;
 
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_metadata_keeps_headless_closure_platform_free() -> Result<(), String> {
+        let metadata = workspace_metadata(&workspace_root_path())?;
+        let dependencies = workspace_dependency_names(&metadata);
+        let mut failures = Vec::new();
+
+        validate_package_closure_excludes("fparkan-headless", &dependencies, &mut failures);
+
+        assert!(failures.is_empty(), "{failures:?}");
         Ok(())
     }
 
