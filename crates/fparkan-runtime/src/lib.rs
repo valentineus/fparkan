@@ -34,7 +34,7 @@ use fparkan_prototype::{
     UnitComponentRecord,
 };
 use fparkan_resource::{resource_name, CachedResourceRepository, ResourceRepository};
-use fparkan_script::ScriptPackage;
+use fparkan_script::{ScriptPackage, VarSet};
 use fparkan_terrain::SurfaceQuery;
 use fparkan_vfs::{Vfs, VfsError};
 use fparkan_world::{
@@ -48,6 +48,7 @@ use std::sync::Arc;
 pub use fparkan_assets::MissionAssets;
 
 const MISSION_DECODED_PAYLOAD_CACHE_ENTRIES: usize = 256;
+const FALLBACK_SCRIPT_VARSET_PATH: &str = "MISSIONS/SCRIPTS/varset.var";
 
 /// Engine mode.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -251,10 +252,31 @@ pub struct MissionScriptBundle {
     pub package: ScriptPackage,
 }
 
+/// Numeric script defaults selected for the mission's first script bundle.
+///
+/// GOG `ai.dll` first tries `<bundle-base>.var`, then falls back to the shared
+/// `MISSIONS/SCRIPTS/varset.var`. This stores the successfully selected source
+/// without claiming that the not-yet-recovered VM executes its declarations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissionScriptVarSet {
+    /// Resolved `.var` path selected by the original fallback order.
+    pub path: String,
+    /// Whether the shared `MISSIONS/SCRIPTS/varset.var` fallback was used.
+    pub used_fallback: bool,
+    /// Typed numeric declaration defaults in source order.
+    pub declarations: VarSet,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct MissionLoadOptions {
     fail_after_registered_objects: Option<usize>,
     asset_scope: MissionAssetScope,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct LoadedMissionScripts {
+    bundles: Vec<MissionScriptBundle>,
+    varset: Option<MissionScriptVarSet>,
 }
 
 /// Selects how much of the resolved mission asset graph to prepare.
@@ -342,6 +364,8 @@ pub struct LoadedMission {
     pub script_bundle_count: usize,
     /// Total named events in loaded script packages.
     pub script_event_count: usize,
+    /// Numeric script defaults loaded through the original bundle/fallback rule.
+    pub script_varset_declaration_count: usize,
 }
 
 /// Frame result.
@@ -379,6 +403,7 @@ struct LoadedMissionState {
     asset_plan: MissionAssetPlan,
     object_drafts: Vec<MissionObjectDraft>,
     script_bundles: Vec<MissionScriptBundle>,
+    script_varset: Option<MissionScriptVarSet>,
 }
 
 /// Engine error.
@@ -407,6 +432,13 @@ pub enum EngineError {
         /// Script path.
         path: String,
         /// Decode diagnostic.
+        message: String,
+    },
+    /// Script defaults could not be decoded.
+    VarSet {
+        /// Script-default path.
+        path: String,
+        /// Parse diagnostic.
         message: String,
     },
     /// `NRes` decode error.
@@ -544,6 +576,7 @@ impl std::fmt::Display for EngineError {
             }
             Self::Vfs { path, source } => write!(f, "{path}: {source}"),
             Self::Script { path, message } => write!(f, "{path}: script decode failed: {message}"),
+            Self::VarSet { path, message } => write!(f, "{path}: varset decode failed: {message}"),
             Self::Nres { path, source } => write!(f, "{path}: {source}"),
             Self::Mission { path, source } => write!(f, "{path}: {source}"),
             Self::TerrainFormat { path, source } => write!(f, "{path}: {source}"),
@@ -585,6 +618,7 @@ impl std::error::Error for EngineError {
             Self::AssetPreparation { source, .. } => Some(source),
             Self::MissingVfs
             | Self::Script { .. }
+            | Self::VarSet { .. }
             | Self::Movement(_)
             | Self::PrototypeGraph { .. }
             | Self::SchedulerPhaseOrder { .. }
@@ -803,7 +837,7 @@ fn load_mission_with_options_and_progress(
             source,
         }
     })?;
-    let script_bundles = load_mission_script_bundles(&vfs, &mission)?;
+    let loaded_scripts = load_mission_scripts(&vfs, &mission)?;
     trace.transforms = mission
         .objects
         .iter()
@@ -1020,11 +1054,16 @@ fn load_mission_with_options_and_progress(
         asset_material_count: mission_asset_plan.material_count,
         asset_texture_count: mission_asset_plan.texture_count,
         asset_lightmap_count: mission_asset_plan.lightmap_count,
-        script_bundle_count: script_bundles.len(),
-        script_event_count: script_bundles
+        script_bundle_count: loaded_scripts.bundles.len(),
+        script_event_count: loaded_scripts
+            .bundles
             .iter()
             .map(|bundle| bundle.package.events.len())
             .sum(),
+        script_varset_declaration_count: loaded_scripts
+            .varset
+            .as_ref()
+            .map_or(0, |varset| varset.declarations.declarations.len()),
     };
 
     engine.world = new_runtime_world;
@@ -1038,7 +1077,8 @@ fn load_mission_with_options_and_progress(
         mission_assets,
         asset_plan: mission_asset_plan,
         object_drafts,
-        script_bundles,
+        script_bundles: loaded_scripts.bundles,
+        script_varset: loaded_scripts.varset,
     });
     Ok((summary, trace))
 }
@@ -1126,6 +1166,15 @@ pub fn loaded_mission_script_bundles(engine: &Engine) -> Option<&[MissionScriptB
         .loaded
         .as_ref()
         .map(|state| state.script_bundles.as_slice())
+}
+
+/// Returns the numeric script defaults selected by the original `.var` fallback rule.
+#[must_use]
+pub fn loaded_mission_script_varset(engine: &Engine) -> Option<&MissionScriptVarSet> {
+    engine
+        .loaded
+        .as_ref()
+        .and_then(|state| state.script_varset.as_ref())
 }
 
 /// Returns terrain runtime data for the loaded mission.
@@ -1258,12 +1307,13 @@ fn normalize_engine_path(role: &'static str, value: &str) -> Result<NormalizedPa
     })
 }
 
-fn load_mission_script_bundles(
+fn load_mission_scripts(
     vfs: &Arc<dyn Vfs>,
     mission: &MissionDocument,
-) -> Result<Vec<MissionScriptBundle>, EngineError> {
+) -> Result<LoadedMissionScripts, EngineError> {
     let script_bases = mission_script_bundle_bases(mission);
     let mut bundles = Vec::with_capacity(script_bases.len());
+    let mut first_base_path = None;
     for script_base in script_bases {
         let base_path = String::from_utf8_lossy(&script_base.path_raw).into_owned();
         let script_path = if base_path.to_ascii_lowercase().ends_with(".scr") {
@@ -1277,6 +1327,9 @@ fn load_mission_script_bundles(
             path: normalized.as_str().to_string(),
             message: source.to_string(),
         })?;
+        if first_base_path.is_none() {
+            first_base_path = Some(base_path.clone());
+        }
         bundles.push(MissionScriptBundle {
             clan_index: script_base.clan_index,
             base_path,
@@ -1284,7 +1337,47 @@ fn load_mission_script_bundles(
             package,
         });
     }
-    Ok(bundles)
+    let varset = first_base_path
+        .as_deref()
+        .map(|base_path| load_script_varset(vfs, base_path))
+        .transpose()?;
+    Ok(LoadedMissionScripts { bundles, varset })
+}
+
+fn load_script_varset(
+    vfs: &Arc<dyn Vfs>,
+    base_path: &str,
+) -> Result<MissionScriptVarSet, EngineError> {
+    let base_path = base_path
+        .strip_suffix(".scr")
+        .or_else(|| base_path.strip_suffix(".SCR"))
+        .unwrap_or(base_path);
+    let primary_path = normalize_engine_path("mission script varset", &format!("{base_path}.var"))?;
+    let (path, bytes, used_fallback) = match vfs.read(&primary_path) {
+        Ok(bytes) => (primary_path, bytes, false),
+        Err(VfsError::NotFound(_)) => {
+            let fallback_path =
+                normalize_engine_path("fallback script varset", FALLBACK_SCRIPT_VARSET_PATH)?;
+            let bytes = read_vfs(vfs, &fallback_path)?;
+            (fallback_path, bytes, true)
+        }
+        Err(source) => {
+            return Err(EngineError::Vfs {
+                path: primary_path.as_str().to_string(),
+                source,
+            });
+        }
+    };
+    let declarations =
+        fparkan_script::parse_varset(&bytes).map_err(|source| EngineError::VarSet {
+            path: path.as_str().to_string(),
+            message: source.to_string(),
+        })?;
+    Ok(MissionScriptVarSet {
+        path: path.as_str().to_string(),
+        used_fallback,
+        declarations,
+    })
 }
 
 fn read_vfs(vfs: &Arc<dyn Vfs>, path: &NormalizedPath) -> Result<Arc<[u8]>, EngineError> {
@@ -1297,7 +1390,7 @@ fn read_vfs(vfs: &Arc<dyn Vfs>, path: &NormalizedPath) -> Result<Arc<[u8]>, Engi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fparkan_vfs::{DirectoryVfs, VfsEntry, VfsMetadata};
+    use fparkan_vfs::{DirectoryVfs, MemoryVfs, VfsEntry, VfsMetadata};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -1344,6 +1437,55 @@ mod tests {
 
         assert!(matches!(err, EngineError::MissingVfs));
         assert_eq!(phases, vec![MissionLoadPhase::Context]);
+    }
+
+    #[test]
+    fn script_varset_prefers_bundle_adjacent_file_then_uses_shared_fallback() {
+        let mut personal_files = MemoryVfs::default();
+        personal_files.insert(
+            normalize_engine_path("test", "MISSIONS/SCRIPTS/custom.var").expect("path"),
+            Arc::from(&b"VAR( DWORD, personal, 7)\n"[..]),
+        );
+        personal_files.insert(
+            normalize_engine_path("test", FALLBACK_SCRIPT_VARSET_PATH).expect("path"),
+            Arc::from(&b"VAR( DWORD, fallback, 8)\n"[..]),
+        );
+        let personal_vfs: Arc<dyn Vfs> = Arc::new(personal_files);
+        let personal =
+            load_script_varset(&personal_vfs, "MISSIONS/SCRIPTS/custom").expect("personal varset");
+        assert_eq!(personal.path, "MISSIONS/SCRIPTS/custom.var");
+        assert!(!personal.used_fallback);
+        assert_eq!(personal.declarations.declarations[0].name, "personal");
+
+        let mut fallback_files = MemoryVfs::default();
+        fallback_files.insert(
+            normalize_engine_path("test", FALLBACK_SCRIPT_VARSET_PATH).expect("path"),
+            Arc::from(&b"VAR( float, fallback, 0.5)\n"[..]),
+        );
+        let fallback_vfs: Arc<dyn Vfs> = Arc::new(fallback_files);
+        let fallback =
+            load_script_varset(&fallback_vfs, "MISSIONS/SCRIPTS/custom").expect("fallback varset");
+        assert_eq!(fallback.path, FALLBACK_SCRIPT_VARSET_PATH);
+        assert!(fallback.used_fallback);
+        assert_eq!(fallback.declarations.declarations[0].name, "fallback");
+    }
+
+    #[test]
+    fn malformed_personal_script_varset_does_not_silently_use_fallback() {
+        let mut files = MemoryVfs::default();
+        files.insert(
+            normalize_engine_path("test", "MISSIONS/SCRIPTS/custom.var").expect("path"),
+            Arc::from(&b"VAR( DWORD, broken, nope)\n"[..]),
+        );
+        files.insert(
+            normalize_engine_path("test", FALLBACK_SCRIPT_VARSET_PATH).expect("path"),
+            Arc::from(&b"VAR( DWORD, fallback, 8)\n"[..]),
+        );
+        let vfs: Arc<dyn Vfs> = Arc::new(files);
+        assert!(matches!(
+            load_script_varset(&vfs, "MISSIONS/SCRIPTS/custom"),
+            Err(EngineError::VarSet { path, .. }) if path == "MISSIONS/SCRIPTS/custom.var"
+        ));
     }
 
     #[test]

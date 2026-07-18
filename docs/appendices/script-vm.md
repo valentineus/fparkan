@@ -24,6 +24,10 @@ opaque, поэтому legacy non-UTF-8 text не ломает загрузку)
 `FUNCTION(...)` пока сохранены за границей этого numeric contract;
 GOG `MISSIONS/SCRIPTS/varset.var` даёт через него ровно 231 declaration:
 31 `float` и 200 `DWORD` (от `f0` до `fY`);
+loader `ai.dll!0x10001000` сначала открывает `<bundle-base>.var` и только при
+`not found` откатывается к этому shared file. Runtime повторяет данный порядок
+транзакционно и публикует selected `MissionScriptVarSet` с путём/provenance, но
+ещё не исполняет declarations как VM state;
 `.trf` — NRes tables, чей framing подтверждён, а field semantics местами лишь
 consumer-inferred.
 
