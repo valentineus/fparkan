@@ -1420,6 +1420,16 @@ byte-identical to the active Terrain outer camera's selector-0 block. This
 proves ownership and the D3D7 boundary, while keeping the earlier
 `CBufferingCamera` FOV=`1.04` as a distinct upstream interface value.
 
+The live GOG layout is now independently repeatable without invoking any game
+method: `Terrain.dll + 0x7355c` contains the current camera interface pointer,
+whose vtable relocates to `Terrain.dll` RVA `0x665b4`. Its selector-0 block
+starts with one 32-bit internal tag at interface `+28`; the actual sixteen
+row-major matrix words begin at `+32`. Captures for `RawCameraTransform` must
+therefore contain those sixteen payload words, not the tag. A passive AutoDemo
+sample produced a finite affine camera matrix and passed through the offline
+Vulkan adapter as source-world geometry, rather than relying on a guessed
+identity view.
+
 The Vulkan static path now accepts this recovered camera as
 `VulkanStaticCamera`. It composes the row-major D3D7 result as
 `view * projection`, uploads its 64 bytes through a vertex-stage push constant,
@@ -1478,6 +1488,15 @@ is the base of the `0x1A4` camera object (vtables at `+0` and `+4`), while
 `LoadCamera`'s public return is the separate interface view at `base + 0x134`
 with its own vtable. This capture format deliberately preserves the former
 base-object interpretation and does not invent camera ownership.
+
+A three-frame GOG AutoDemo run with one such read-only capture selected the
+`legacy-d3d7-capture` path, rendered all eight mission roots / 66 MSH
+components plus terrain, reported 5,226 vertices inside the recovered clip
+volume, produced a 7,372,800-byte readback with FNV-1a
+`1737487240747766901`, and ended with zero Vulkan validation warnings and
+errors. This validates the offline handoff for one captured instant; it does
+not claim live camera tracking, material parity, or an original-frame pixel
+comparison.
 
 The first bounded launch showed that repeated fingerprinting, rather than
 Vulkan initialization, was the load-path bottleneck: each new MAT0/TEXM request
