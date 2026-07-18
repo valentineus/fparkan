@@ -29,7 +29,7 @@
 
 ## Current repository status
 
-- Реальный Vulkan в репозитории имеет smoke triangle path и узкий static asset bridge: `fparkan-vulkan-smoke --model-root <GOG_ROOT> --model-archive system.rlb --model-name MTCHECK.MSH --texture-root <GOG_ROOT> --texture-archive Textures.lib --texture-name DEFAULT.0` загружает validated original MSH, разворачивает batch `base_vertex`, нормализует XZ viewer plane, выполняет real indexed draw и загружает decoded TEXM mip-0 в device-local image. Image переходит в sampling layout, записывается в `set=0,binding=0` combined image sampler и sampled fragment shader-ом. Для static viewer UV сейчас XZ-planar: parser сохраняет raw packed `Res5` UV0, но его fixed-point scale ещё не доказан. Это не WEAR/MAT0, exact material, terrain или gameplay renderer.
+- Реальный Vulkan в репозитории имеет smoke triangle path и узкий static asset bridge: `fparkan-vulkan-smoke --model-root <GOG_ROOT> --model-archive system.rlb --model-name MTCHECK.MSH --texture-root <GOG_ROOT> --texture-archive Textures.lib --texture-name DEFAULT.0` загружает validated original MSH, разворачивает batch `base_vertex`, нормализует XZ viewer plane, выполняет real indexed draw и загружает decoded TEXM mip-0 в device-local image. Image переходит в sampling layout, записывается в `set=0,binding=0` combined image sampler и sampled fragment shader-ом. `Res5` UV0 декодируется как signed fixed point `int16 / 1024.0`; XZ-planar UV остаётся только fallback для модели без optional stream. Это не WEAR/MAT0, exact material, terrain или gameplay renderer.
 - `apps/fparkan-game` сейчас выдает `render-planning` JSON report поверх
   synthetic window descriptor и `VulkanPlanningBackend`.
 - `apps/fparkan-viewer` сейчас inspection-only CLI и не открывает live Vulkan

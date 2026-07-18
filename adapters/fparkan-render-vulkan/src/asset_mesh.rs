@@ -94,19 +94,23 @@ pub fn project_msh_to_static_mesh(
     let vertices = model
         .positions
         .iter()
-        .map(|position| VulkanStaticVertex {
+        .enumerate()
+        .map(|(index, position)| VulkanStaticVertex {
             position: [
                 (position[0] - center_x) * scale,
                 (position[2] - center_z) * scale,
             ],
             color: [0.82, 0.72, 0.31],
-            // The exact fixed-point normalization of Res5 is still under
-            // disassembly. Until then the asset viewer uses its documented XZ
-            // planar projection, rather than inventing a scale for raw i16 UV0.
-            uv: [
-                (position[0] - center_x) / extent + 0.5,
-                (position[2] - center_z) / extent + 0.5,
-            ],
+            // Iron3D stores Res5 UV0 as signed fixed point with 1/1024 units.
+            // Models that omit this optional stream retain the static viewer's
+            // XZ planar fallback instead of receiving fabricated raw UV values.
+            uv: model.uv0.as_ref().and_then(|uv0| uv0.get(index)).map_or(
+                [
+                    (position[0] - center_x) / extent + 0.5,
+                    (position[2] - center_z) / extent + 0.5,
+                ],
+                |uv| [f32::from(uv[0]) / 1024.0, f32::from(uv[1]) / 1024.0],
+            ),
         })
         .collect();
 
@@ -164,5 +168,21 @@ mod tests {
         assert_eq!(mesh.vertices[1].position, [-0.8, -0.8]);
         assert_eq!(mesh.vertices[2].position, [0.8, -0.8]);
         assert_eq!(mesh.vertices[3].position, [-0.8, 0.8]);
+    }
+
+    #[test]
+    fn projects_packed_uv0_using_documented_fixed_point_scale() {
+        let mut source = model(
+            vec![[-2.0, 0.0, -1.0], [2.0, 0.0, -1.0], [-2.0, 0.0, 3.0]],
+            vec![0, 1, 2],
+            vec![batch(0, 3, 0)],
+        );
+        source.uv0 = Some(vec![[1024, -512], [0, 2048], [-1024, 512]]);
+
+        let mesh = project_msh_to_static_mesh(&source).expect("representable MSH");
+
+        assert_eq!(mesh.vertices[0].uv, [1.0, -0.5]);
+        assert_eq!(mesh.vertices[1].uv, [0.0, 2.0]);
+        assert_eq!(mesh.vertices[2].uv, [-1.0, 0.5]);
     }
 }
