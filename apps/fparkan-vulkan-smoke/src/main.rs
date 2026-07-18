@@ -111,6 +111,13 @@ fn compare_readback_files(
     expected: &std::path::Path,
     actual: &std::path::Path,
 ) -> Result<(), String> {
+    let expected_format = readback_format_from_path(expected)?;
+    let actual_format = readback_format_from_path(actual)?;
+    if expected_format != actual_format {
+        return Err(format!(
+            "pixel readback format mismatch: expected={expected_format} actual={actual_format}"
+        ));
+    }
     let expected_bytes =
         std::fs::read(expected).map_err(|err| format!("{}: {err}", expected.display()))?;
     let actual_bytes =
@@ -133,6 +140,34 @@ fn compare_readback_files(
         ));
     }
     Ok(())
+}
+
+fn readback_format_from_path(path: &std::path::Path) -> Result<i32, String> {
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .ok_or_else(|| {
+            format!(
+                "pixel readback artifact has no UTF-8 file name: {}",
+                path.display()
+            )
+        })?;
+    let prefix = ".readback-vkformat-";
+    let raw = name
+        .strip_suffix(".raw")
+        .and_then(|stem| stem.rsplit_once(prefix).map(|(_, raw)| raw))
+        .ok_or_else(|| {
+            format!(
+                "pixel readback artifact lacks format identity: {}",
+                path.display()
+            )
+        })?;
+    raw.parse::<i32>().map_err(|_| {
+        format!(
+            "pixel readback artifact has invalid format identity: {}",
+            path.display()
+        )
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1894,8 +1929,8 @@ mod tests {
     fn readback_comparator_accepts_exact_bytes_and_reports_first_difference() {
         let root = std::env::temp_dir().join(format!("fparkan-readback-{}", std::process::id()));
         std::fs::create_dir_all(&root).expect("temp dir");
-        let expected = root.join("expected.raw");
-        let actual = root.join("actual.raw");
+        let expected = root.join("expected.readback-vkformat-50.raw");
+        let actual = root.join("actual.readback-vkformat-50.raw");
         std::fs::write(&expected, [1_u8, 2, 3]).expect("expected");
         std::fs::write(&actual, [1_u8, 2, 3]).expect("actual");
         assert_eq!(compare_readback_files(&expected, &actual), Ok(()));
@@ -1903,6 +1938,12 @@ mod tests {
         assert_eq!(
             compare_readback_files(&expected, &actual),
             Err("pixel readback mismatch at byte 1: expected=2 actual=9".to_string())
+        );
+        let incompatible = root.join("incompatible.readback-vkformat-37.raw");
+        std::fs::write(&incompatible, [1_u8, 2, 3]).expect("incompatible actual");
+        assert_eq!(
+            compare_readback_files(&expected, &incompatible),
+            Err("pixel readback format mismatch: expected=50 actual=37".to_string())
         );
         std::fs::remove_dir_all(root).expect("cleanup");
     }

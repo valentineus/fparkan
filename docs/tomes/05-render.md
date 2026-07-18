@@ -905,6 +905,9 @@ Smoke option `--expected-readback <path>` выполняет exact byte comparis
 readback и завершает run с первым differing byte или length mismatch. Fresh GOG
 run с предыдущим format-50 artifact прошёл этот gate. Это regression contract
 нашего static Vulkan viewer, не comparison с оригинальным renderer.
+Comparator прежде сравнивает `vkformat` identity из имен обоих artifacts и
+отклоняет mismatch до byte scan; raw blobs разных Vulkan formats нельзя
+считать сопоставимыми без явной conversion contract.
 
 `Land.msh` использует отдельный geometry-only bridge: validated `TerrainFace28`
 сохраняет source triangle order, а его positions и packed UV0 попадают в тот же
