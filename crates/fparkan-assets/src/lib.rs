@@ -24,7 +24,7 @@ use fparkan_material::{
     decode_wear, resolve_material, Mat0Document, MaterialError, ResolvedMaterial, WearTable,
     MAT0_KIND, WEAR_KIND,
 };
-use fparkan_mission_format::{decode_tma, decode_tma_land_path};
+use fparkan_mission_format::{decode_tma, decode_tma_land_path, ClanBody};
 pub use fparkan_mission_format::{LpString, MissionDocument, MissionError, TmaProfile};
 use fparkan_msh::{decode_msh, validate_msh, ModelAsset, MshError};
 use fparkan_nres::{decode as decode_nres, ReadProfile};
@@ -61,6 +61,17 @@ pub struct MissionTerrainPaths {
     pub land_msh: NormalizedPath,
     /// Landscape map archive path.
     pub land_map: NormalizedPath,
+}
+
+/// Raw compiled-script base selected by one TMA clan.
+///
+/// The path remains raw legacy bytes until the runtime applies its path policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissionScriptBundleBase {
+    /// Index in the mission clan array.
+    pub clan_index: usize,
+    /// First clan resource path, without a required `.scr` suffix.
+    pub path_raw: Vec<u8>,
 }
 
 /// Terrain loading errors that include runtime world construction failures.
@@ -119,6 +130,29 @@ pub fn decode_mission_land_path(
     profile: TmaProfile,
 ) -> Result<LpString, MissionError> {
     decode_tma_land_path(bytes, profile)
+}
+
+/// Returns non-empty script/formula bases selected by TMA clans.
+///
+/// The first resource has the same position in the standard and spatial clan
+/// layouts. Its consumer-specific meaning is intentionally left to runtime.
+#[must_use]
+pub fn mission_script_bundle_bases(mission: &MissionDocument) -> Vec<MissionScriptBundleBase> {
+    mission
+        .clans
+        .iter()
+        .enumerate()
+        .filter_map(|(clan_index, clan)| {
+            let path_raw = match &clan.body {
+                ClanBody::Standard { first_resource, .. } => first_resource.path.raw.clone(),
+                ClanBody::Spatial { first_resource, .. } => first_resource.raw.clone(),
+            };
+            (!path_raw.is_empty()).then_some(MissionScriptBundleBase {
+                clan_index,
+                path_raw,
+            })
+        })
+        .collect()
 }
 
 /// Builds canonical mission terrain paths from the mission `Land` reference.

@@ -73,6 +73,14 @@ raw seven slots, resolved variable values и вход/выход вызова `0
 controlled mission. До него compatibility VM возвращает явный unsupported
 result, а не «примерный» game command.
 
+На границе mission runtime выбранный TMA clan `first_resource` теперь
+материализуется как отдельный `MissionScriptBundle`: loader нормализует
+`<base>.scr`, декодирует его тем же bounded reader-ом и публикует immutable
+package вместе с clan provenance. Headless report выводит число таких packages
+и их named events. Это именно wiring входных данных, не VM execution: Init и
+остальные events пока не dispatch-ятся, а ошибка чтения сохраняет
+transactional rollback mission loader-а.
+
 TMA properties остаются four raw `u32` words плюс имя, пока consumer/schema не
 задаст тип (integer/float bits/ObjectId/enum/fixed-point/index). В том числе
 сохраняются `NOT USED`; corpus подтверждает `Invulnerability`, life state,

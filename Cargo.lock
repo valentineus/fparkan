@@ -608,6 +608,7 @@ dependencies = [
  "fparkan-prototype",
  "fparkan-render",
  "fparkan-resource",
+ "fparkan-script",
  "fparkan-terrain",
  "fparkan-vfs",
  "fparkan-world",

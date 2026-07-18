@@ -23,10 +23,10 @@
 use fparkan_assets::{
     decode_mission_land_path, decode_mission_payload, decode_nres_payload,
     derive_mission_land_paths, extend_graph_report_with_visual_dependencies_with_progress,
-    prepare_terrain_world, AssetError as AssetPreparationError, AssetId, AssetManager,
-    AssetPreparationPhase, BuildCategory, MissionAssetPlan, MissionDocument, MissionError,
-    MissionTerrainPaths, NresError, PreparedVisual, TerrainFormatError, TerrainPreparationError,
-    TerrainWorld, TmaProfile, VisualDependencyPhase,
+    mission_script_bundle_bases, prepare_terrain_world, AssetError as AssetPreparationError,
+    AssetId, AssetManager, AssetPreparationPhase, BuildCategory, MissionAssetPlan, MissionDocument,
+    MissionError, MissionTerrainPaths, NresError, PreparedVisual, TerrainFormatError,
+    TerrainPreparationError, TerrainWorld, TmaProfile, VisualDependencyPhase,
 };
 use fparkan_path::{normalize_relative, NormalizedPath, PathError, PathPolicy};
 use fparkan_prototype::{
@@ -34,6 +34,7 @@ use fparkan_prototype::{
     UnitComponentRecord,
 };
 use fparkan_resource::{resource_name, CachedResourceRepository, ResourceRepository};
+use fparkan_script::ScriptPackage;
 use fparkan_terrain::SurfaceQuery;
 use fparkan_vfs::{Vfs, VfsError};
 use fparkan_world::{
@@ -237,6 +238,19 @@ pub struct MissionObjectDraft {
     pub unit_components: Vec<UnitComponentRecord>,
 }
 
+/// A compiled script bundle selected by one mission clan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissionScriptBundle {
+    /// TMA clan index selecting this bundle.
+    pub clan_index: usize,
+    /// Lossy display form of the raw bundle base path from the clan resource.
+    pub base_path: String,
+    /// Resolved compiled `.scr` path.
+    pub script_path: String,
+    /// Losslessly decoded compiled package; not yet executed by runtime.
+    pub package: ScriptPackage,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct MissionLoadOptions {
     fail_after_registered_objects: Option<usize>,
@@ -324,6 +338,10 @@ pub struct LoadedMission {
     pub asset_texture_count: usize,
     /// Mission asset plan lightmap count after dependency preparation.
     pub asset_lightmap_count: usize,
+    /// Script bundles selected by mission clans.
+    pub script_bundle_count: usize,
+    /// Total named events in loaded script packages.
+    pub script_event_count: usize,
 }
 
 /// Frame result.
@@ -360,6 +378,7 @@ struct LoadedMissionState {
     mission_assets: MissionAssets,
     asset_plan: MissionAssetPlan,
     object_drafts: Vec<MissionObjectDraft>,
+    script_bundles: Vec<MissionScriptBundle>,
 }
 
 /// Engine error.
@@ -382,6 +401,13 @@ pub enum EngineError {
         path: String,
         /// Source error.
         source: VfsError,
+    },
+    /// Compiled script package could not be decoded.
+    Script {
+        /// Script path.
+        path: String,
+        /// Decode diagnostic.
+        message: String,
     },
     /// `NRes` decode error.
     Nres {
@@ -517,6 +543,7 @@ impl std::fmt::Display for EngineError {
                 write!(f, "invalid {role} path '{value}': {source}")
             }
             Self::Vfs { path, source } => write!(f, "{path}: {source}"),
+            Self::Script { path, message } => write!(f, "{path}: script decode failed: {message}"),
             Self::Nres { path, source } => write!(f, "{path}: {source}"),
             Self::Mission { path, source } => write!(f, "{path}: {source}"),
             Self::TerrainFormat { path, source } => write!(f, "{path}: {source}"),
@@ -557,6 +584,7 @@ impl std::error::Error for EngineError {
             Self::World(source) => Some(source),
             Self::AssetPreparation { source, .. } => Some(source),
             Self::MissingVfs
+            | Self::Script { .. }
             | Self::Movement(_)
             | Self::PrototypeGraph { .. }
             | Self::SchedulerPhaseOrder { .. }
@@ -775,6 +803,7 @@ fn load_mission_with_options_and_progress(
             source,
         }
     })?;
+    let script_bundles = load_mission_script_bundles(&vfs, &mission)?;
     trace.transforms = mission
         .objects
         .iter()
@@ -991,6 +1020,11 @@ fn load_mission_with_options_and_progress(
         asset_material_count: mission_asset_plan.material_count,
         asset_texture_count: mission_asset_plan.texture_count,
         asset_lightmap_count: mission_asset_plan.lightmap_count,
+        script_bundle_count: script_bundles.len(),
+        script_event_count: script_bundles
+            .iter()
+            .map(|bundle| bundle.package.events.len())
+            .sum(),
     };
 
     engine.world = new_runtime_world;
@@ -1004,6 +1038,7 @@ fn load_mission_with_options_and_progress(
         mission_assets,
         asset_plan: mission_asset_plan,
         object_drafts,
+        script_bundles,
     });
     Ok((summary, trace))
 }
@@ -1082,6 +1117,15 @@ pub fn loaded_mission(engine: &Engine) -> Option<&LoadedMission> {
 #[must_use]
 pub fn loaded_mission_document(engine: &Engine) -> Option<&MissionDocument> {
     engine.loaded.as_ref().map(|state| &state.mission)
+}
+
+/// Returns compiled script bundles selected by TMA clan resources.
+#[must_use]
+pub fn loaded_mission_script_bundles(engine: &Engine) -> Option<&[MissionScriptBundle]> {
+    engine
+        .loaded
+        .as_ref()
+        .map(|state| state.script_bundles.as_slice())
 }
 
 /// Returns terrain runtime data for the loaded mission.
@@ -1212,6 +1256,35 @@ fn normalize_engine_path(role: &'static str, value: &str) -> Result<NormalizedPa
             source,
         }
     })
+}
+
+fn load_mission_script_bundles(
+    vfs: &Arc<dyn Vfs>,
+    mission: &MissionDocument,
+) -> Result<Vec<MissionScriptBundle>, EngineError> {
+    let script_bases = mission_script_bundle_bases(mission);
+    let mut bundles = Vec::with_capacity(script_bases.len());
+    for script_base in script_bases {
+        let base_path = String::from_utf8_lossy(&script_base.path_raw).into_owned();
+        let script_path = if base_path.to_ascii_lowercase().ends_with(".scr") {
+            base_path.clone()
+        } else {
+            format!("{base_path}.scr")
+        };
+        let normalized = normalize_engine_path("mission script", &script_path)?;
+        let bytes = read_vfs(vfs, &normalized)?;
+        let package = fparkan_script::decode(&bytes).map_err(|source| EngineError::Script {
+            path: normalized.as_str().to_string(),
+            message: source.to_string(),
+        })?;
+        bundles.push(MissionScriptBundle {
+            clan_index: script_base.clan_index,
+            base_path,
+            script_path: normalized.as_str().to_string(),
+            package,
+        });
+    }
+    Ok(bundles)
 }
 
 fn read_vfs(vfs: &Arc<dyn Vfs>, path: &NormalizedPath) -> Result<Arc<[u8]>, EngineError> {
