@@ -191,7 +191,7 @@ enum MissionAssetScope {
     /// Prepare every reachable asset; required by normal runtime loading.
     #[default]
     Full,
-    /// Prepare one root at a time until a mesh-backed preview model is found.
+    /// Prepare only the first mission root for a static preview.
     FirstMeshPreview,
 }
 
@@ -476,9 +476,9 @@ pub fn load_mission(
 /// Loads a mission using the bounded static-preview asset scope.
 ///
 /// This mode preserves map, TMA, graph, construction and registration work,
-/// but prepares only the first root that supplies a mesh-backed model. It is
-/// intended solely for the opt-in static Vulkan preview and must not be used
-/// for normal gameplay, where all reachable assets remain required.
+/// but visits only the first mission root. It is intended solely for the
+/// opt-in static Vulkan preview and must not be used for normal gameplay,
+/// where all reachable assets remain required.
 ///
 /// # Errors
 ///
@@ -630,8 +630,12 @@ fn load_mission_with_options_and_progress(
         .iter()
         .map(|object| resource_name(&object.resource_name.raw))
         .collect();
+    let scoped_graph_roots = match options.asset_scope {
+        MissionAssetScope::Full => graph_roots.as_slice(),
+        MissionAssetScope::FirstMeshPreview => graph_roots.get(..1).unwrap_or_default(),
+    };
     let (mut prototype_graph, resolved_prototypes, mut prototype_report) =
-        build_prototype_graph_report(&repository, vfs.as_ref(), &graph_roots);
+        build_prototype_graph_report(&repository, vfs.as_ref(), scoped_graph_roots);
     extend_graph_report_with_visual_dependencies(
         &repository,
         &mut prototype_report,
@@ -649,7 +653,7 @@ fn load_mission_with_options_and_progress(
             &prototype_graph.root_prototype_request_spans,
             &resolved_prototypes,
         ),
-        MissionAssetScope::FirstMeshPreview => prepare_first_mesh_preview_assets(
+        MissionAssetScope::FirstMeshPreview => prepare_first_preview_assets(
             &asset_manager,
             &prototype_graph.root_prototype_request_spans,
             &resolved_prototypes,
@@ -769,7 +773,7 @@ fn record_load_phase(
     }
 }
 
-fn prepare_first_mesh_preview_assets<R: ResourceRepository>(
+fn prepare_first_preview_assets<R: ResourceRepository>(
     asset_manager: &AssetManager<R>,
     root_spans: &[std::ops::Range<usize>],
     prototypes: &[fparkan_prototype::EffectivePrototype],

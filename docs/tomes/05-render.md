@@ -937,8 +937,8 @@ from a runtime slot or draw order.
 ### Opt-in mission static-Vulkan bridge
 
 `fparkan-game --backend static-vulkan` is an explicit native-window experiment,
-not the default planning path. After mission loading it selects the first
-prepared MSH model, sends it through the existing static XZ clip-space
+not the default planning path. It visits only the first mission root, selects
+its prepared MSH model, sends it through the existing static XZ clip-space
 projection and renders a requested number of frames through
 `VulkanSmokeRenderer`; teardown rejects validation warnings/errors and reports
 swapchain/readback telemetry. It deliberately supplies no material textures,
@@ -946,21 +946,20 @@ so the renderer's documented white fallback is used.
 
 This is a narrow bootstrap from mission assets to a live Vulkan renderer. It
 does not render every placed object, apply TMA transforms or orientation, bind
-WEAR/MAT0/TEXM material data, or establish a game camera. A GOG
-`MISSIONS/Autodemo.00/data.tma` attempt exceeded the local 120-second runner
-limit before the window/report, so this mode has implementation and unit/lint
-evidence only, not a corpus GPU acceptance claim.
+WEAR/MAT0/TEXM material data, or establish a game camera. Fresh GOG
+`MISSIONS/Autodemo.00/data.tma` evidence now proves the narrow GPU bridge: one
+presented frame completed in 38.7 seconds with a native 1280×720 two-image
+swapchain, 7,372,800-byte synchronized readback (FNV-1a
+`10681850560830502773`) and validation warnings/errors `0/0`. This is not a
+full-scene or original-renderer pixel-parity claim.
 
-The preview now asks `load_mission_static_preview` for assets. Normal mission
-loading remains full and transactional; the preview scope walks root spans in
-TMA order and stops asset preparation after the first mesh-backed model. It is
-therefore not a hidden relaxation of gameplay validation. A second GOG
-`Autodemo.00` attempt with this narrower asset scope still exceeded 120 seconds
-before opening a window. The diagnostic `--load-progress <file>` checkpoint
-reported `Graph`, which proves the remaining startup cost is in prototype graph
-construction/visual-dependency expansion rather than terrain decode, asset
-preparation, window creation or the Vulkan draw loop. The timeout probe does
-not distinguish individual graph suboperations; no renderer acceptance follows.
+The preview now asks `load_mission_static_preview` for both graph and assets.
+Normal mission loading remains full and transactional; preview graph traversal
+and asset preparation are restricted to the first TMA root. It is therefore not
+a hidden relaxation of gameplay validation. The preceding all-root preview
+probe timed out at `Graph`; this reduction is what allowed the successful GOG
+native run. If that first root has no usable MSH, static preview fails explicitly
+rather than expanding later roots or pretending to render the entire mission.
 
 `Land.msh` использует отдельный geometry-only bridge: validated `TerrainFace28`
 сохраняет source triangle order, а его positions и packed UV0 попадают в тот же
