@@ -27,12 +27,12 @@ Open source проект с реализацией компонентов игр
 - [apps/fparkan-cli](apps/fparkan-cli) — CLI для архивов, графов и acceptance-отчетов.
 - [apps/fparkan-viewer](apps/fparkan-viewer) — inspection-only CLI для archive/model/texture/map без live Vulkan draw path.
 - [apps/fparkan-headless](apps/fparkan-headless) — headless runtime composition root.
-- [apps/fparkan-game](apps/fparkan-game) — mission composition root: по умолчанию выдаёт planning report; opt-in `--backend static-vulkan` использует first-root preview loader и открывает native Vulkan окно для всех подготовленных MSH-компонентов выбранного root.
+- [apps/fparkan-game](apps/fparkan-game) — mission composition root: по умолчанию выдаёт planning report; opt-in `--backend static-vulkan` открывает native Vulkan окно и рисует terrain и все подготовленные MSH-компоненты выбранных mission roots. По умолчанию выбираются все roots; `--preview-roots N` оставляет bounded diagnostic scope.
 
 ## Текущий статус рендера
 
 - `fparkan-vulkan-smoke` доказывает живой Stage 0 Vulkan triangle path с native window, swapchain и validation telemetry.
-- `VulkanPlanningBackend` и default-режим `fparkan-game` подтверждают только deterministic command planning/capture, а не draw пикселей. `fparkan-game --backend static-vulkan` — узкий mission-to-native-Vulkan bridge: для первого root он объединяет все подготовленные MSH-компоненты и загружает первую MAT0 diffuse texture на каждый используемый selector с preview-local remap; полный corpus, material phases, transforms и pixel parity ещё не подтверждены.
+- `VulkanPlanningBackend` и default-режим `fparkan-game` подтверждают только deterministic command planning/capture, а не draw пикселей. `fparkan-game --backend static-vulkan` — узкий mission-to-native-Vulkan bridge: он объединяет terrain и подготовленные MSH-компоненты всех выбранных roots, применяет static TMA transforms и загружает первую MAT0 diffuse texture на каждый используемый selector с preview-local remap. Legacy D3D7 camera capture поддерживается; полный corpus, material phases, dynamic ownership/visibility и pixel parity ещё не подтверждены.
 - `fparkan-viewer` пока является инспектором ассетов. `fparkan-vulkan-smoke` имеет live Stage 3 bridge для original `MSH`/`Texm`/`WEAR`/`MAT0` и geometry-only `Land.msh`; полноценный viewer, исходные terrain-material states, camera и pixel parity ещё не закрыты.
 - Truth table и evidence-артефакты вынесены в [`docs/rendering/renderer_truth_table.md`](docs/rendering/renderer_truth_table.md) и [`docs/evidence/`](docs/evidence).
 

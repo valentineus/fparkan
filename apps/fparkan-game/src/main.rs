@@ -237,7 +237,7 @@ fn load_requested_mission(
     .map_err(|err| err.to_string())
 }
 
-/// Static geometry and descriptors belonging to the first preview root.
+/// Static geometry and descriptors belonging to the selected preview roots.
 struct StaticPreviewScene {
     mesh: VulkanStaticMesh,
     materials: Vec<VulkanStaticMaterial>,
@@ -251,7 +251,7 @@ struct StaticPreviewScene {
 }
 
 /// Projects the mission terrain plus every MSH component of the explicitly
-/// bounded static-preview root into one diagnostic XY frame.
+/// bounded static-preview roots into one diagnostic XY frame.
 ///
 /// This intentionally takes only the first MAT0 texture request for each MSH
 /// batch selector. Terrain maps its proven low-byte packed tag channel through
