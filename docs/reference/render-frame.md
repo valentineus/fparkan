@@ -57,6 +57,16 @@ selector `18` on the supplied object and invokes slot `+12` on that result. It
 does not store the supplied pointer in `stdGetCurrentCamera2`; that getter
 returns a Terrain global populated by selector `8` during Terrain initialization.
 
+`Terrain.dll!LoadCamera` adds a separate factory-side contract. Its GOG entry
+at RVA `0x4EBE0` is `__stdcall` with four machine-word arguments, allocates
+`0x1A4` bytes, calls the constructor at RVA `0x4EC60`, and returns the interface
+at object offset `+0x134`. The constructor passes arguments 3 and 4 into base
+initialization at `this + 4`, writes argument 3 to `this + 0x138`, and calls a
+helper at RVA `0x4CEF0` with arguments 1, 2 and 4 plus `this`. Argument 1 is a
+mode string: only `REFLECTION` and `REFLECTION_SHIFTED` produce a non-zero mode
+value at `this + 0x1A0`. This is factory ABI evidence, not a recovered view or
+projection matrix contract.
+
 ## Parity risks
 
 - x87 precision and rounding;

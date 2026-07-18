@@ -1009,9 +1009,16 @@ thunk: it jumps through IAT `0x10020148` to `Terrain.dll!LoadCamera`. The
 Terrain export is at RVA `0x4EBE0` and is a `__stdcall` entry with `ret 0x10`,
 so it receives four machine-word arguments. It allocates a `0x1A4`-byte object,
 forwards those four words to its constructor, and returns a pointer at object
-offset `+0x134`; the meaning and concrete types of those arguments are not yet
-established. `Terrain.dll!stdGetCurrentCamera2` returns a global camera pointer,
-and `stdSetCurrentCamera2` updates it through the object's interface methods.
+offset `+0x134`. The constructor is at RVA `0x4EC60`: it passes arguments 3 and
+4 to the base initialization at `this + 4`, stores argument 3 at `this + 0x138`,
+and passes arguments 1, 2 and 4 plus `this` to its helper at RVA `0x4CEF0`.
+Argument 1 is a NUL-terminated mode string at this call boundary: only the
+embedded literals `REFLECTION` and `REFLECTION_SHIFTED` select a non-zero value
+stored at `this + 0x1A0`. This proves that `LoadCamera` supports reflection
+variants, but not the semantic types of its remaining arguments or the meaning
+of the resulting value. `Terrain.dll!stdGetCurrentCamera2` returns a global
+camera pointer, and `stdSetCurrentCamera2` updates it through the object's
+interface methods.
 
 This establishes that original camera creation/selection is Terrain-owned and
 not a field that can safely be inferred from a TMA transform. It does **not**
