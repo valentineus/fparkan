@@ -116,6 +116,75 @@ pub struct Handler15Invocation {
     pub target: Handler15TargetPayload,
 }
 
+/// The proven reset branch selected before a `Handler(8)` state write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Handler8Reset {
+    /// No reset helper is called before the state field is written.
+    None,
+    /// State `2`: helper resets record words `0..=3` and `6`, then invokes
+    /// two still-opaque callback slots.
+    StateTwo,
+    /// State `3`: helper resets record words `0..=2` and `6`, then invokes
+    /// the same callback slots.
+    StateThree,
+}
+
+/// One opaque 100-byte AI-record state transition requested by `Handler(8)`.
+///
+/// The record index is the runtime value of original `dCurrentProblem`; it is
+/// intentionally separate from a compiled instruction reference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Handler8StateChange {
+    /// Checked `dCurrentProblem` record index in the handler's `this + 0xa0` table.
+    pub record_index: u32,
+    /// Resolved instruction DWORD written at record offset `+0x18`.
+    pub next_state: u32,
+    /// Proven pre-write reset branch.
+    pub reset: Handler8Reset,
+}
+
+/// Error resolving the one-operand `Handler(8)` contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Handler8ResolveError {
+    /// The instruction omitted its required DWORD reference.
+    MissingReference,
+    /// The instruction reference is outside the loaded varset.
+    VarSetIndexOutOfBounds {
+        /// Referenced compiled-varset index.
+        index: u32,
+        /// Available declaration count.
+        declarations: usize,
+    },
+    /// The reference was not a DWORD declaration.
+    UnexpectedType {
+        /// Observed declaration type.
+        found: VarSetType,
+    },
+}
+
+impl std::fmt::Display for Handler8ResolveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingReference => write!(formatter, "Handler(8) is missing reference 0"),
+            Self::VarSetIndexOutOfBounds {
+                index,
+                declarations,
+            } => write!(
+                formatter,
+                "Handler(8) reference {index} is outside {declarations} varset declarations"
+            ),
+            Self::UnexpectedType { found } => {
+                write!(
+                    formatter,
+                    "Handler(8) reference 0 has {found:?}, expected Dword"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for Handler8ResolveError {}
+
 /// Error resolving the corpus-proven `Handler(15)` input layout.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Handler15ResolveError {
@@ -270,6 +339,56 @@ impl VarSet {
                 declarations: self.declarations.len(),
             }),
         }
+    }
+
+    /// Resolves the one DWORD operand consumed by GOG `Handler(8)`.
+    ///
+    /// `current_problem_record_index` is the caller's live value of the
+    /// loader-bound `dCurrentProblem` varset entry. The original bounds-checks
+    /// it against a table at `this + 0xa0`; table ownership and callback
+    /// semantics remain outside this package-level resolver.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error instead of coercing a missing, invalid, or float
+    /// reference into a state transition.
+    pub fn resolve_handler8(
+        &self,
+        instruction: &ScriptInstruction,
+        current_problem_record_index: u32,
+    ) -> Result<Handler8StateChange, Handler8ResolveError> {
+        let index = *instruction
+            .references
+            .first()
+            .ok_or(Handler8ResolveError::MissingReference)?;
+        let declaration = self.declarations.get(index as usize).ok_or(
+            Handler8ResolveError::VarSetIndexOutOfBounds {
+                index,
+                declarations: self.declarations.len(),
+            },
+        )?;
+        let next_state = match declaration {
+            VarSetDeclaration {
+                type_name: VarSetType::Dword,
+                default_value: VarSetDefault::Dword(value),
+                ..
+            } => *value,
+            declaration => {
+                return Err(Handler8ResolveError::UnexpectedType {
+                    found: declaration.type_name,
+                });
+            }
+        };
+        let reset = match next_state {
+            2 => Handler8Reset::StateTwo,
+            3 => Handler8Reset::StateThree,
+            _ => Handler8Reset::None,
+        };
+        Ok(Handler8StateChange {
+            record_index: current_problem_record_index,
+            next_state,
+            reset,
+        })
     }
 
     /// Resolves the fixed-width, corpus-proven operands of GOG `Handler(15)`.
@@ -914,9 +1033,9 @@ fn read_instruction(
 mod tests {
     use super::{
         decode, decode_with_limits, parse_varset, Handler15ResolveError, Handler15TargetPayload,
-        Handler2RecordInput, Handler2RecordScheduler, Handler30ResolveError,
-        ScriptDispatchSelector, ScriptInstruction, VarSetDefault, VarSetError, VarSetType,
-        VmHostCallbackCommand, GOG_HANDLER_COUNT, INSTRUCTION_WORDS,
+        Handler2RecordInput, Handler2RecordScheduler, Handler30ResolveError, Handler8Reset,
+        Handler8ResolveError, ScriptDispatchSelector, ScriptInstruction, VarSetDefault,
+        VarSetError, VarSetType, VmHostCallbackCommand, GOG_HANDLER_COUNT, INSTRUCTION_WORDS,
     };
     use fparkan_binary::{DecodeError, Limits};
 
@@ -1097,6 +1216,73 @@ STRING( 8, ignored, ignored, ignored)\r\n";
         assert_eq!(
             dword_varset.resolve_handler30(&out_of_range),
             Err(Handler30ResolveError::VarSetIndexOutOfBounds {
+                index: 1,
+                declarations: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn handler_eight_resolves_dword_state_and_proven_reset_branches() {
+        let varset = parse_varset(
+            b"VAR( DWORD, solving, 1)\nVAR( DWORD, solved, 2)\nVAR( DWORD, state_three, 3)\n",
+        )
+        .expect("valid Handler(8) varset");
+        for (reference, reset) in [
+            (0, Handler8Reset::None),
+            (1, Handler8Reset::StateTwo),
+            (2, Handler8Reset::StateThree),
+        ] {
+            let change = varset
+                .resolve_handler8(
+                    &ScriptInstruction {
+                        header_words: [8, 0, 0, 0, 0, 1, 0],
+                        references: vec![reference],
+                    },
+                    17,
+                )
+                .expect("typed Handler(8) state");
+            assert_eq!(change.record_index, 17);
+            assert_eq!(change.next_state, reference + 1);
+            assert_eq!(change.reset, reset);
+        }
+    }
+
+    #[test]
+    fn handler_eight_rejects_missing_float_and_out_of_range_operands() {
+        let empty = parse_varset(b"").expect("empty varset");
+        assert_eq!(
+            empty.resolve_handler8(
+                &ScriptInstruction {
+                    header_words: [8, 0, 0, 0, 0, 0, 0],
+                    references: Vec::new(),
+                },
+                0,
+            ),
+            Err(Handler8ResolveError::MissingReference)
+        );
+        let float = parse_varset(b"VAR( float, value, 1.0)\n").expect("float varset");
+        assert_eq!(
+            float.resolve_handler8(
+                &ScriptInstruction {
+                    header_words: [8, 0, 0, 0, 0, 1, 0],
+                    references: vec![0],
+                },
+                0,
+            ),
+            Err(Handler8ResolveError::UnexpectedType {
+                found: VarSetType::Float,
+            })
+        );
+        assert_eq!(
+            float.resolve_handler8(
+                &ScriptInstruction {
+                    header_words: [8, 0, 0, 0, 0, 1, 0],
+                    references: vec![1],
+                },
+                0,
+            ),
+            Err(Handler8ResolveError::VarSetIndexOutOfBounds {
                 index: 1,
                 declarations: 1,
             })

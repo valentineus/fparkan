@@ -173,6 +173,26 @@ layout prerequisites/modifiers/unlocks. Formula evaluator требует strict
 grammar/version, typed operands, deterministic numeric policy, bounded stack и
 явных errors; x87-compatible rounding нужен там, где оно выбирает ветку.
 
+### Handler(8): problem-record state write
+
+`Handler(8)` is the ninth VM-table entry at GOG `ai.dll` VA `0x10009b0d`.
+All 179 corpus records have exactly one in-range `DWORD` reference; the two
+observed entries are `ST_SOLVING=1` (122 records) and `ST_SOLVED=2` (57).
+The handler resolves loader-bound `dCurrentProblem` through varset index
+`this+0x868`, uses that live DWORD as a bounds-checked index into a table at
+`this+0xa0` with 100-byte records, then resolves the instruction's one DWORD
+and writes it to the selected record at `+0x18`.
+
+The write has two statically proven exceptional branches. State `2` calls a
+reset helper that zeroes record words `0..=3` and `6` before invoking two
+opaque callback slots; state `3` does the same except word `3` is preserved.
+Both then write `+0x18`. Every other state simply writes the state word.
+`VarSet::resolve_handler8` emits a `Handler8StateChange` with the caller-owned
+live record index, resolved state, and explicit reset kind. It does not invent
+the table owner, the pre-reset helper, or callback semantics. Reproduce the
+evidence with `ExportAiVmHandler8.java`, `ExportAiVmHandler8Callees.java`, and
+`ExportAiVmHandler8Transitions.java`.
+
 ### Handler(15): typed target-call boundary
 
 `Handler(15)` is the sixteenth VM-table entry at GOG `ai.dll` VA `0x10008054`
