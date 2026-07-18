@@ -400,6 +400,7 @@ dependencies = [
  "fparkan-assets",
  "fparkan-corpus",
  "fparkan-inspection",
+ "fparkan-path",
  "fparkan-prototype",
  "fparkan-resource",
  "fparkan-runtime",

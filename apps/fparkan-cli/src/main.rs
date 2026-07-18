@@ -21,16 +21,19 @@
 #![allow(clippy::print_stderr, clippy::print_stdout)]
 //! `FParkan` command-line tools.
 
-use fparkan_assets::extend_graph_report_with_visual_dependencies;
+use fparkan_assets::{
+    decode_mission_payload, extend_graph_report_with_visual_dependencies, TmaProfile,
+};
 use fparkan_corpus::{discover, render_report_json, report, DiscoverOptions};
 use fparkan_inspection::inspect_archive_file;
 use fparkan_inspection::ArchiveInspection;
+use fparkan_path::{normalize_relative, PathPolicy};
 use fparkan_prototype::build_prototype_graph_report;
 use fparkan_resource::{resource_name, CachedResourceRepository};
 use fparkan_runtime::{
     create, load_mission, EngineConfig, EngineMode, EngineServices, MissionRequest,
 };
-use fparkan_vfs::DirectoryVfs;
+use fparkan_vfs::{DirectoryVfs, Vfs};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,6 +41,7 @@ use std::sync::Arc;
 const ARCHIVE_INSPECT_SCHEMA: &str = "fparkan-archive-inspect-v1";
 const PROTOTYPE_INSPECT_SCHEMA: &str = "fparkan-prototype-inspect-v1";
 const MISSION_GRAPH_SCHEMA: &str = "fparkan-mission-graph-v1";
+const MISSION_INSPECT_SCHEMA: &str = "fparkan-mission-inspect-v1";
 
 #[derive(Serialize)]
 struct ArchiveInspectOutput<'a> {
@@ -92,6 +96,22 @@ struct MissionGraphOutput {
     lightmaps: usize,
     is_success: bool,
     failures: usize,
+}
+
+#[derive(Serialize)]
+struct MissionInspectOutput {
+    schema_version: &'static str,
+    mission: String,
+    objects: Vec<MissionObjectInspectOutput>,
+}
+
+#[derive(Serialize)]
+struct MissionObjectInspectOutput {
+    index: usize,
+    resource: String,
+    position: [f32; 3],
+    orientation_raw: [f32; 3],
+    scale: [f32; 3],
 }
 
 #[derive(Serialize)]
@@ -153,6 +173,10 @@ fn run(args: &[String]) -> Result<(), String> {
         [domain, command, rest @ ..] if domain == "mission" && command == "graph" => {
             let rest = strip_format_json(rest)?;
             graph_mission(&rest)
+        }
+        [domain, command, rest @ ..] if domain == "mission" && command == "inspect" => {
+            let rest = strip_format_json(rest)?;
+            inspect_mission(&rest)
         }
         _ => Err(usage()),
     }
@@ -310,6 +334,38 @@ fn graph_mission(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn inspect_mission(args: &[String]) -> Result<(), String> {
+    let root = parse_root_alias(args)?;
+    let mission = parse_required(args, &["--mission"], "--mission")?;
+    let mission_path = normalize_relative(mission.as_bytes(), PathPolicy::StrictLegacy)
+        .map_err(|err| err.to_string())?;
+    let vfs = DirectoryVfs::new(root);
+    let bytes = vfs.read(&mission_path).map_err(|err| err.to_string())?;
+    let document =
+        decode_mission_payload(bytes, TmaProfile::Strict).map_err(|err| err.to_string())?;
+    let objects = document
+        .objects
+        .iter()
+        .enumerate()
+        .map(|(index, object)| MissionObjectInspectOutput {
+            index,
+            resource: String::from_utf8_lossy(&object.resource_name.raw).into_owned(),
+            position: object.position,
+            orientation_raw: object.orientation,
+            scale: object.scale,
+        })
+        .collect();
+    println!(
+        "{}",
+        serialize_json(&MissionInspectOutput {
+            schema_version: MISSION_INSPECT_SCHEMA,
+            mission,
+            objects,
+        })?
+    );
+    Ok(())
+}
+
 fn inspect_archive(args: &[String]) -> Result<(), String> {
     let path = parse_archive_path(args)?;
     let inspection = inspect_archive_file(&path, 0).map_err(|err| err.clone())?;
@@ -416,7 +472,7 @@ fn prototype_graph_requiredness_label(
 }
 
 fn usage() -> String {
-    "usage: fparkan corpus discover|validate --root <path> [--format json] | archive inspect <file> [--format json] | prototype inspect --root <path> --key <key> [--format json] | mission graph --root <path> --mission <path> [--format json]".to_string()
+    "usage: fparkan corpus discover|validate --root <path> [--format json] | archive inspect <file> [--format json] | prototype inspect --root <path> --key <key> [--format json] | mission graph|inspect --root <path> --mission <path> [--format json]".to_string()
 }
 
 #[cfg(test)]
@@ -505,6 +561,27 @@ mod tests {
         assert_eq!(
             json,
             "{\"schema_version\":\"fparkan-mission-graph-v1\",\"mission\":\"MISSIONS/Autodemo.00/data.tma\",\"objects\":2,\"paths\":3,\"clans\":4,\"extras\":5,\"roots\":6,\"node_count\":7,\"edge_count\":8,\"direct_references\":9,\"unit_references\":10,\"unit_components\":11,\"prototype_requests\":12,\"wear_requests\":13,\"wear\":14,\"materials\":15,\"textures\":16,\"lightmaps\":17,\"is_success\":true,\"failures\":0}"
+        );
+    }
+
+    #[test]
+    fn mission_inspect_output_retains_raw_transform_fields() {
+        let json = serialize_json(&MissionInspectOutput {
+            schema_version: MISSION_INSPECT_SCHEMA,
+            mission: "MISSIONS/test/data.tma".to_string(),
+            objects: vec![MissionObjectInspectOutput {
+                index: 1,
+                resource: "unit.dat".to_string(),
+                position: [1.0, 2.0, 3.0],
+                orientation_raw: [4.0, 5.0, 6.0],
+                scale: [7.0, 8.0, 9.0],
+            }],
+        })
+        .expect("serialize mission inspection");
+
+        assert_eq!(
+            json,
+            "{\"schema_version\":\"fparkan-mission-inspect-v1\",\"mission\":\"MISSIONS/test/data.tma\",\"objects\":[{\"index\":1,\"resource\":\"unit.dat\",\"position\":[1.0,2.0,3.0],\"orientation_raw\":[4.0,5.0,6.0],\"scale\":[7.0,8.0,9.0]}]}"
         );
     }
 }

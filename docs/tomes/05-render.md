@@ -1017,6 +1017,18 @@ warnings/errors `0/0`. The readback FNV-1a remained
 does **not** prove the second root is visible or equivalent: it is recorded as
 a camera/frustum/overlap investigation target, not hidden as a parity result.
 
+The reproducible `fparkan-cli mission inspect` probe closes two tempting but
+incorrect explanations for that equality. GOG `Autodemo.00` root 0 is
+`w_m_wlk2.dat` at `(418.10318, 717.433, 3.0409389)` while root 1 is
+`w_s_wlk1.dat` at `(479.12396, 795.95337, 1.6228507)`; therefore the TMA data
+is neither duplicate nor co-located. Separately, the Vulkan static submit loop
+calls `cmd_draw_indexed` for every prepared draw range and its depth comparison
+is `LESS_OR_EQUAL`. The unresolved equality is consequently evidence about the
+diagnostic camera/projection or visibility framing, not grounds to patch a
+missing draw or a `LESS` depth bug. The inspector intentionally reports raw
+orientation as well as position and scale so later camera/transform work can
+be checked against the original mission bytes.
+
 ### Camera ownership boundary from the GOG renderer
 
 The GOG `World3D.dll` export `LoadCamera` at RVA `0x1FB06` is only an import

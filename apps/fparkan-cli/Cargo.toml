@@ -10,6 +10,7 @@ fparkan-assets = { path = "../../crates/fparkan-assets", version = "0.1.0" }
 fparkan-corpus = { path = "../../crates/fparkan-corpus", version = "0.1.0" }
 fparkan-prototype = { path = "../../crates/fparkan-prototype", version = "0.1.0" }
 fparkan-inspection = { path = "../../crates/fparkan-inspection", version = "0.1.0" }
+fparkan-path = { path = "../../crates/fparkan-path", version = "0.1.0" }
 fparkan-resource = { path = "../../crates/fparkan-resource", version = "0.1.0" }
 fparkan-runtime = { path = "../../crates/fparkan-runtime", version = "0.1.0" }
 fparkan-vfs = { path = "../../crates/fparkan-vfs", version = "0.1.0" }
