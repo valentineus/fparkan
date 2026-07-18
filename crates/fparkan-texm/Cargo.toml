@@ -8,7 +8,7 @@ repository.workspace = true
 [dependencies]
 
 [dev-dependencies]
-fparkan-nres = { path = "../fparkan-nres" }
+fparkan-nres = { path = "../fparkan-nres", version = "0.1.0" }
 
 [lints]
 workspace = true

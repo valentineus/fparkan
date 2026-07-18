@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-fparkan-platform = { path = "../../crates/fparkan-platform" }
+fparkan-platform = { path = "../../crates/fparkan-platform", version = "0.1.0" }
 raw-window-handle = "0.6"
 winit = "0.30"
 

@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-fparkan-binary = { path = "../fparkan-binary" }
+fparkan-binary = { path = "../fparkan-binary", version = "0.1.0" }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [lints]

@@ -6,8 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-fparkan-inspection = { path = "../../crates/fparkan-inspection" }
-fparkan-render = { path = "../../crates/fparkan-render" }
+fparkan-inspection = { path = "../../crates/fparkan-inspection", version = "0.1.0" }
+fparkan-render = { path = "../../crates/fparkan-render", version = "0.1.0" }
 
 [lints]
 workspace = true

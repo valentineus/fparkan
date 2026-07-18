@@ -6,9 +6,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-fparkan-runtime = { path = "../../crates/fparkan-runtime" }
-fparkan-vfs = { path = "../../crates/fparkan-vfs" }
-fparkan-world = { path = "../../crates/fparkan-world" }
+fparkan-runtime = { path = "../../crates/fparkan-runtime", version = "0.1.0" }
+fparkan-vfs = { path = "../../crates/fparkan-vfs", version = "0.1.0" }
+fparkan-world = { path = "../../crates/fparkan-world", version = "0.1.0" }
 
 [lints]
 workspace = true

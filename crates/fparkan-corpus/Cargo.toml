@@ -6,17 +6,17 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-fparkan-binary = { path = "../fparkan-binary" }
-fparkan-fx = { path = "../fparkan-fx" }
-fparkan-material = { path = "../fparkan-material" }
-fparkan-msh = { path = "../fparkan-msh" }
-fparkan-mission-format = { path = "../fparkan-mission-format" }
-fparkan-nres = { path = "../fparkan-nres" }
-fparkan-prototype = { path = "../fparkan-prototype" }
-fparkan-path = { path = "../fparkan-path" }
-fparkan-rsli = { path = "../fparkan-rsli" }
-fparkan-texm = { path = "../fparkan-texm" }
-fparkan-terrain-format = { path = "../fparkan-terrain-format" }
+fparkan-binary = { path = "../fparkan-binary", version = "0.1.0" }
+fparkan-fx = { path = "../fparkan-fx", version = "0.1.0" }
+fparkan-material = { path = "../fparkan-material", version = "0.1.0" }
+fparkan-msh = { path = "../fparkan-msh", version = "0.1.0" }
+fparkan-mission-format = { path = "../fparkan-mission-format", version = "0.1.0" }
+fparkan-nres = { path = "../fparkan-nres", version = "0.1.0" }
+fparkan-prototype = { path = "../fparkan-prototype", version = "0.1.0" }
+fparkan-path = { path = "../fparkan-path", version = "0.1.0" }
+fparkan-rsli = { path = "../fparkan-rsli", version = "0.1.0" }
+fparkan-texm = { path = "../fparkan-texm", version = "0.1.0" }
+fparkan-terrain-format = { path = "../fparkan-terrain-format", version = "0.1.0" }
 
 [lints]
 workspace = true

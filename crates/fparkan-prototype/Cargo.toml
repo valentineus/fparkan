@@ -7,13 +7,13 @@ repository.workspace = true
 
 [dependencies]
 encoding_rs = "0.8"
-fparkan-binary = { path = "../fparkan-binary" }
-fparkan-path = { path = "../fparkan-path" }
-fparkan-resource = { path = "../fparkan-resource" }
-fparkan-vfs = { path = "../fparkan-vfs" }
+fparkan-binary = { path = "../fparkan-binary", version = "0.1.0" }
+fparkan-path = { path = "../fparkan-path", version = "0.1.0" }
+fparkan-resource = { path = "../fparkan-resource", version = "0.1.0" }
+fparkan-vfs = { path = "../fparkan-vfs", version = "0.1.0" }
 
 [lints]
 workspace = true
 
 [dev-dependencies]
-fparkan-nres = { path = "../fparkan-nres" }
+fparkan-nres = { path = "../fparkan-nres", version = "0.1.0" }
