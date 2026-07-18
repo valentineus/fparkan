@@ -36,6 +36,7 @@ use fparkan_prototype::{
 use fparkan_resource::{resource_name, CachedResourceRepository, ResourceRepository};
 use fparkan_script::{
     Handler19DwordWrite, Handler19InitInput, ScriptDispatchSelector, ScriptPackage, VarSet,
+    VarSetDefault,
 };
 use fparkan_terrain::SurfaceQuery;
 use fparkan_vfs::{Vfs, VfsError};
@@ -285,6 +286,18 @@ pub struct MissionScriptInitState {
     pub writes: Vec<Handler19DwordWrite>,
 }
 
+/// Per-clan mutable-value model of one instantiated mission varset.
+///
+/// Declarations remain shared source metadata; these values are the runtime
+/// cells that later recovered handlers will read and write.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissionScriptVarSetState {
+    /// TMA clan index owning this instantiated varset.
+    pub clan_index: usize,
+    /// Values in the original varset declaration order.
+    pub values: Vec<VarSetDefault>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct MissionLoadOptions {
     fail_after_registered_objects: Option<usize>,
@@ -296,6 +309,7 @@ struct LoadedMissionScripts {
     bundles: Vec<MissionScriptBundle>,
     varset: Option<MissionScriptVarSet>,
     init_states: Vec<MissionScriptInitState>,
+    varset_states: Vec<MissionScriptVarSetState>,
 }
 
 /// Selects how much of the resolved mission asset graph to prepare.
@@ -387,6 +401,8 @@ pub struct LoadedMission {
     pub script_varset_declaration_count: usize,
     /// `Handler(19)` Init results resolved for mission clans.
     pub script_init_state_count: usize,
+    /// Instantiated per-clan varsets whose Init writes have been applied.
+    pub script_varset_state_count: usize,
 }
 
 /// Frame result.
@@ -426,6 +442,7 @@ struct LoadedMissionState {
     script_bundles: Vec<MissionScriptBundle>,
     script_varset: Option<MissionScriptVarSet>,
     script_init_states: Vec<MissionScriptInitState>,
+    script_varset_states: Vec<MissionScriptVarSetState>,
 }
 
 /// Engine error.
@@ -1099,6 +1116,7 @@ fn load_mission_with_options_and_progress(
             .as_ref()
             .map_or(0, |varset| varset.declarations.declarations.len()),
         script_init_state_count: loaded_scripts.init_states.len(),
+        script_varset_state_count: loaded_scripts.varset_states.len(),
     };
 
     engine.world = new_runtime_world;
@@ -1115,6 +1133,7 @@ fn load_mission_with_options_and_progress(
         script_bundles: loaded_scripts.bundles,
         script_varset: loaded_scripts.varset,
         script_init_states: loaded_scripts.init_states,
+        script_varset_states: loaded_scripts.varset_states,
     });
     Ok((summary, trace))
 }
@@ -1223,6 +1242,15 @@ pub fn loaded_mission_script_init_states(engine: &Engine) -> Option<&[MissionScr
         .loaded
         .as_ref()
         .map(|state| state.script_init_states.as_slice())
+}
+
+/// Returns instantiated per-clan varsets after proven Init writes are applied.
+#[must_use]
+pub fn loaded_mission_script_varset_states(engine: &Engine) -> Option<&[MissionScriptVarSetState]> {
+    engine
+        .loaded
+        .as_ref()
+        .map(|state| state.script_varset_states.as_slice())
 }
 
 /// Returns terrain runtime data for the loaded mission.
@@ -1401,11 +1429,56 @@ fn load_mission_scripts(
         )?,
         None => Vec::new(),
     };
+    let varset_states = match &varset {
+        Some(varset) => materialize_script_varset_states(&bundles, varset, &init_states)?,
+        None => Vec::new(),
+    };
     Ok(LoadedMissionScripts {
         bundles,
         varset,
         init_states,
+        varset_states,
     })
+}
+
+fn materialize_script_varset_states(
+    bundles: &[MissionScriptBundle],
+    varset: &MissionScriptVarSet,
+    init_states: &[MissionScriptInitState],
+) -> Result<Vec<MissionScriptVarSetState>, EngineError> {
+    let defaults: Vec<_> = varset
+        .declarations
+        .declarations
+        .iter()
+        .map(|declaration| declaration.default_value)
+        .collect();
+    bundles
+        .iter()
+        .map(|bundle| {
+            let mut values = defaults.clone();
+            for init in init_states
+                .iter()
+                .filter(|init| init.clan_index == bundle.clan_index)
+            {
+                for write in &init.writes {
+                    let Some(value) = values.get_mut(write.index as usize) else {
+                        return Err(EngineError::ScriptInit {
+                            clan_index: bundle.clan_index,
+                            message: format!(
+                                "Handler(19) write index {} is outside the instantiated varset",
+                                write.index
+                            ),
+                        });
+                    };
+                    *value = VarSetDefault::Dword(write.value);
+                }
+            }
+            Ok(MissionScriptVarSetState {
+                clan_index: bundle.clan_index,
+                values,
+            })
+        })
+        .collect()
 }
 
 fn resolve_handler19_init_states(
@@ -1677,6 +1750,19 @@ mod tests {
                         value: 449
                     },
                     Handler19DwordWrite { index: 2, value: 1 },
+                ],
+            }]
+        );
+        let runtime_varsets = materialize_script_varset_states(&bundles, &varset, &states)
+            .expect("materialized per-clan varset");
+        assert_eq!(
+            runtime_varsets,
+            vec![MissionScriptVarSetState {
+                clan_index: 1,
+                values: vec![
+                    VarSetDefault::Dword(728),
+                    VarSetDefault::Dword(449),
+                    VarSetDefault::Dword(1),
                 ],
             }]
         );

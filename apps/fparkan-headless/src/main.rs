@@ -56,7 +56,7 @@ fn run() -> Result<(), String> {
         let loaded = load_mission(&mut engine, MissionRequest { key: mission })
             .map_err(|err| format!("{err}"))?;
         println!(
-            "mission objects={} areals={} surfaces={} graph_roots={} components={} wear={} material_slots={} textures={} lightmaps={} scripts={} script_events={} script_varset_declarations={} script_init_states={} graph_failures={}",
+            "mission objects={} areals={} surfaces={} graph_roots={} components={} wear={} material_slots={} textures={} lightmaps={} scripts={} script_events={} script_varset_declarations={} script_init_states={} script_varset_states={} graph_failures={}",
             loaded.object_count,
             loaded.areal_count,
             loaded.surface_count,
@@ -70,6 +70,7 @@ fn run() -> Result<(), String> {
             loaded.script_event_count,
             loaded.script_varset_declaration_count,
             loaded.script_init_state_count,
+            loaded.script_varset_state_count,
             loaded.graph_failure_count
         );
     }

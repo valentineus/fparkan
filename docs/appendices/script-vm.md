@@ -204,11 +204,14 @@ during mission loading: each selected clan's TMA anchor is accepted only in the 
 `0..=10000` base range, truncated through the recovered x87 rule, and paired
 with its zero-based clan index. For every `Init` instruction whose selector is
 `Handler(19)`, `VarSet::resolve_handler19` produces the three per-clan DWORD
-immutable `MissionScriptInitState` writes. Other Init selectors and all other events remain decoded but
-unexecuted. AutoDemo validates the path end-to-end: its non-integral first
+writes. The runtime then materializes an independent declaration-ordered value
+array for each selected clan and applies those writes, so later recovered
+handlers can consume `ClanBaseX`, `ClanBaseY`, and `ClanID` as runtime cells
+rather than loader defaults. Other Init selectors and all other events remain
+decoded but unexecuted. AutoDemo validates the path end-to-end: its non-integral first
 anchor (`500.2857`) yields captured `ClanBaseX=500`, and the live GOG process
 contains two initialized SuperAI entries `(500, 752, 0)` and `(728, 449, 1)`;
-the Rust loader reports `script_init_states=2`.
+the Rust loader reports `script_init_states=2` and `script_varset_states=2`.
 
 `GetSuperAI` returns element `n` of the 64-pointer global table at preferred
 `ai.dll + 0x55398` for `n <= 63`. The read-only
