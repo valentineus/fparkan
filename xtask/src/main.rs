@@ -1563,7 +1563,7 @@ const AUDITED_UNSAFE_SOURCE_FILES: &[&str] = &[
 ];
 
 fn is_audited_unsafe_source(path: &Path) -> bool {
-    let as_path = path.as_os_str().to_string_lossy();
+    let as_path = path.as_os_str().to_string_lossy().replace('\\', "/");
     AUDITED_UNSAFE_SOURCE_FILES
         .iter()
         .any(|candidate| as_path.ends_with(candidate))
@@ -3738,5 +3738,12 @@ source = "git+https://example.invalid/repo"
                 non_audited.display()
             )]
         );
+    }
+
+    #[test]
+    fn audited_unsafe_allowlist_accepts_windows_separators() {
+        let path = Path::new(r".\adapters\fparkan-render-vulkan\src\ffi\runtime.rs");
+
+        assert!(is_audited_unsafe_source(path));
     }
 }
