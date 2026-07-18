@@ -895,12 +895,11 @@ fn validate_cargo_metadata_dependency_closures(
     collect_cargo_manifests(root, &mut manifests)?;
     let mut deps_by_package = BTreeMap::new();
     for manifest in manifests {
-        let text = fs::read_to_string(&manifest)
-            .map_err(|err| format!("{}: {err}", manifest.display()))?;
-        let Some(package) = parse_package_name(&text) else {
+        let policy = load_cargo_manifest_policy(&manifest)?;
+        let Some(package) = policy.package_name() else {
             continue;
         };
-        deps_by_package.insert(package, parse_manifest_dependencies(&text));
+        deps_by_package.insert(package.to_string(), policy.dependency_names());
     }
 
     validate_package_closure_excludes("fparkan-headless", &deps_by_package, failures);
@@ -1109,9 +1108,8 @@ fn validate_workspace_license(root: &Path, failures: &mut Vec<String>) -> Result
     manifests.dedup();
 
     for manifest in manifests {
-        let text = fs::read_to_string(&manifest)
-            .map_err(|err| format!("{}: {err}", manifest.display()))?;
-        let explicit_license = parse_manifest_license(&text);
+        let policy = load_cargo_manifest_policy(&manifest)?;
+        let explicit_license = policy.license();
         let is_root = manifest == root.join("Cargo.toml");
         if is_root {
             if explicit_license.as_deref() != Some(expected) {
@@ -1136,9 +1134,8 @@ fn validate_dependency_boundaries(root: &Path, failures: &mut Vec<String>) -> Re
     let mut manifests = Vec::new();
     collect_cargo_manifests(root, &mut manifests)?;
     for manifest in manifests {
-        let text = fs::read_to_string(&manifest)
-            .map_err(|err| format!("{}: {err}", manifest.display()))?;
-        let Some(package) = parse_package_name(&text) else {
+        let policy = load_cargo_manifest_policy(&manifest)?;
+        let Some(package) = policy.package_name() else {
             continue;
         };
         if is_removed_legacy_adapter_manifest(root, &manifest) {
@@ -1148,8 +1145,8 @@ fn validate_dependency_boundaries(root: &Path, failures: &mut Vec<String>) -> Re
             ));
             continue;
         }
-        let dependencies = parse_manifest_dependencies(&text);
-        if !is_adapter_like_package(&package) && !is_app_package(&package) {
+        let dependencies = policy.dependency_names();
+        if !is_adapter_like_package(package) && !is_app_package(package) {
             for dependency in &dependencies {
                 if is_forbidden_gui_dependency(dependency) {
                     failures.push(format!(
@@ -1159,7 +1156,7 @@ fn validate_dependency_boundaries(root: &Path, failures: &mut Vec<String>) -> Re
                 }
             }
         }
-        if is_app_package(&package) {
+        if is_app_package(package) {
             if let Some(forbidden) = first_forbidden_parser_dependency(&dependencies) {
                 failures.push(format!(
                     "{}: app package {package} depends on parser crate {forbidden}",
@@ -1328,71 +1325,75 @@ fn collect_cargo_manifests(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), Str
     Ok(())
 }
 
-fn parse_manifest_license(manifest: &str) -> Option<String> {
-    let mut in_package = false;
-    let mut in_workspace_package = false;
-    for line in manifest.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_package = trimmed == "[package]";
-            in_workspace_package = trimmed == "[workspace.package]";
-            continue;
-        }
-        if (in_package || in_workspace_package) && trimmed.starts_with("license") {
-            return parse_toml_string_value(trimmed);
-        }
-    }
-    None
+/// Typed Cargo manifest subset used by the architecture policy.
+///
+/// Dependency values deliberately remain `toml::Value`: the policy only needs
+/// keys and Cargo accepts several value forms (version string, inline table,
+/// or workspace inheritance).
+#[derive(Debug, Default, Deserialize)]
+struct CargoManifestPolicy {
+    package: Option<CargoPackagePolicy>,
+    workspace: Option<CargoWorkspacePolicy>,
+    dependencies: Option<BTreeMap<String, toml::Value>>,
+    #[serde(rename = "dev-dependencies")]
+    dev_dependencies: Option<BTreeMap<String, toml::Value>>,
+    #[serde(rename = "build-dependencies")]
+    build_dependencies: Option<BTreeMap<String, toml::Value>>,
 }
 
-fn parse_package_name(manifest: &str) -> Option<String> {
-    let mut in_package = false;
-    for line in manifest.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_package = trimmed == "[package]";
-            continue;
-        }
-        if in_package && trimmed.starts_with("name") {
-            return parse_toml_string_value(trimmed);
-        }
-    }
-    None
+#[derive(Debug, Deserialize)]
+struct CargoPackagePolicy {
+    name: String,
+    license: Option<toml::Value>,
 }
 
-fn parse_manifest_dependencies(manifest: &str) -> BTreeSet<String> {
-    let mut dependencies = BTreeSet::new();
-    let mut in_dependency_section = false;
-    for line in manifest.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_dependency_section = matches!(
-                trimmed,
-                "[dependencies]" | "[dev-dependencies]" | "[build-dependencies]"
-            );
-            continue;
-        }
-        if !in_dependency_section || trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let Some((name, _)) = trimmed.split_once('=') else {
-            continue;
-        };
-        let dependency = name.trim().trim_matches('"');
-        if !dependency.is_empty() {
-            dependencies.insert(dependency.to_string());
-        }
-    }
-    dependencies
+#[derive(Debug, Deserialize)]
+struct CargoWorkspacePolicy {
+    package: Option<CargoWorkspacePackagePolicy>,
 }
 
-fn parse_toml_string_value(line: &str) -> Option<String> {
-    let (_, value) = line.split_once('=')?;
-    let value = value.trim();
-    if !(value.starts_with('"') && value.ends_with('"')) {
-        return None;
+#[derive(Debug, Deserialize)]
+struct CargoWorkspacePackagePolicy {
+    license: Option<toml::Value>,
+}
+
+impl CargoManifestPolicy {
+    fn package_name(&self) -> Option<&str> {
+        self.package.as_ref().map(|package| package.name.as_str())
     }
-    Some(value.trim_matches('"').to_string())
+
+    fn license(&self) -> Option<String> {
+        self.package
+            .as_ref()
+            .and_then(|package| cargo_license_string(package.license.as_ref()))
+            .or_else(|| {
+                self.workspace
+                    .as_ref()
+                    .and_then(|workspace| workspace.package.as_ref())
+                    .and_then(|package| cargo_license_string(package.license.as_ref()))
+            })
+    }
+
+    fn dependency_names(&self) -> BTreeSet<String> {
+        [
+            self.dependencies.as_ref(),
+            self.dev_dependencies.as_ref(),
+            self.build_dependencies.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .flat_map(|dependencies| dependencies.keys().cloned())
+        .collect()
+    }
+}
+
+fn cargo_license_string(value: Option<&toml::Value>) -> Option<String> {
+    value.and_then(toml::Value::as_str).map(ToString::to_string)
+}
+
+fn load_cargo_manifest_policy(path: &Path) -> Result<CargoManifestPolicy, String> {
+    let text = fs::read_to_string(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    toml::from_str(&text).map_err(|err| format!("{}: invalid Cargo TOML: {err}", path.display()))
 }
 
 fn is_removed_legacy_adapter_manifest(root: &Path, manifest: &Path) -> bool {
@@ -3494,14 +3495,28 @@ fparkan-render = { path = "../fparkan-render" }
 fparkan-render-vulkan = { path = "../../adapters/fparkan-render-vulkan" }
 "#;
 
-        assert_eq!(
-            parse_package_name(manifest),
-            Some("fparkan-example".to_string())
-        );
-        let deps = parse_manifest_dependencies(manifest);
+        let policy = toml::from_str::<CargoManifestPolicy>(manifest)
+            .expect("typed policy manifest should parse");
+        assert_eq!(policy.package_name(), Some("fparkan-example"));
+        let deps = policy.dependency_names();
         assert!(deps.contains("fparkan-render"));
         assert!(deps.contains("quoted-dep"));
         assert!(deps.contains("fparkan-render-vulkan"));
+    }
+
+    #[test]
+    fn typed_manifest_policy_accepts_workspace_inherited_license() {
+        let manifest = r#"
+[package]
+name = "fparkan-example"
+license.workspace = true
+"#;
+
+        let policy = toml::from_str::<CargoManifestPolicy>(manifest)
+            .expect("workspace inheritance should be valid Cargo TOML");
+
+        assert_eq!(policy.package_name(), Some("fparkan-example"));
+        assert_eq!(policy.license(), None);
     }
 
     #[test]
