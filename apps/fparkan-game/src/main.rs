@@ -35,7 +35,9 @@ use fparkan_render_vulkan::{
     project_land_msh_to_static_mesh_in_legacy_world_space,
     project_land_msh_to_static_mesh_in_xy_frame,
     project_msh_to_static_mesh_in_world_space_with_node_fallback_poses,
-    project_msh_to_static_mesh_in_xy_frame_with_node_fallback_poses, VulkanPlanningBackend,
+    project_msh_to_static_mesh_in_world_space_with_node_sampled_poses,
+    project_msh_to_static_mesh_in_xy_frame_with_node_fallback_poses,
+    project_msh_to_static_mesh_in_xy_frame_with_node_sampled_poses, VulkanPlanningBackend,
     VulkanSmokeFrameOutcome, VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo,
     VulkanStaticCamera, VulkanStaticMaterial, VulkanStaticMesh, VulkanStaticTexture,
     VulkanStaticXyFrame,
@@ -110,6 +112,7 @@ fn run(args: &[String]) -> Result<String, String> {
             terrain,
             roots,
             camera,
+            args.static_animation_frame,
             &args.root,
             &loaded.land_msh_path,
         )?;
@@ -241,6 +244,7 @@ struct StaticPreviewScene {
     clip_visible_vertices: usize,
     mesh_components: usize,
     terrain_components: usize,
+    animation_frame: Option<u16>,
 }
 
 /// Projects the mission terrain plus every MSH component of the explicitly
@@ -252,11 +256,13 @@ struct StaticPreviewScene {
 /// retained on draw ranges but awaits a recovered blend equation; orientation,
 /// later material phases, animation, lightmaps and gameplay visibility remain
 /// outside this bridge.
+#[allow(clippy::too_many_lines)]
 fn static_preview_mesh_and_materials(
     assets: &MissionAssets,
     terrain: &TerrainWorld,
     roots: &[MissionObjectDraft],
     legacy_camera: Option<VulkanStaticCamera>,
+    static_animation_frame: Option<u16>,
     root: &std::path::Path,
     land_msh_path: &str,
 ) -> Result<StaticPreviewScene, String> {
@@ -301,26 +307,43 @@ fn static_preview_mesh_and_materials(
             let model = assets.model_by_id(model_id).ok_or_else(|| {
                 format!("static preview visual {visual_id:?} references unknown model {model_id:?}")
             })?;
+            let transform = LegacyIron3dEulerTransform {
+                translation: root.position,
+                orientation_radians: root.orientation_raw,
+            };
             let component = if legacy_camera.is_some() {
-                project_msh_to_static_mesh_in_world_space_with_node_fallback_poses(
-                    &model.validated,
-                    LegacyIron3dEulerTransform {
-                        translation: root.position,
-                        orientation_radians: root.orientation_raw,
-                    },
-                    root.scale,
-                )
+                if let Some(frame) = static_animation_frame {
+                    project_msh_to_static_mesh_in_world_space_with_node_sampled_poses(
+                        &model.validated,
+                        transform,
+                        root.scale,
+                        frame,
+                    )
+                } else {
+                    project_msh_to_static_mesh_in_world_space_with_node_fallback_poses(
+                        &model.validated,
+                        transform,
+                        root.scale,
+                    )
+                }
             } else {
                 let frame = xy_frame.ok_or_else(|| "missing diagnostic XY frame".to_string())?;
-                project_msh_to_static_mesh_in_xy_frame_with_node_fallback_poses(
-                    &model.validated,
-                    frame,
-                    LegacyIron3dEulerTransform {
-                        translation: root.position,
-                        orientation_radians: root.orientation_raw,
-                    },
-                    root.scale,
-                )
+                if let Some(animation_frame) = static_animation_frame {
+                    project_msh_to_static_mesh_in_xy_frame_with_node_sampled_poses(
+                        &model.validated,
+                        frame,
+                        transform,
+                        root.scale,
+                        animation_frame,
+                    )
+                } else {
+                    project_msh_to_static_mesh_in_xy_frame_with_node_fallback_poses(
+                        &model.validated,
+                        frame,
+                        transform,
+                        root.scale,
+                    )
+                }
             }
             .map_err(|err| format!("project mission MSH for Vulkan: {err}"))?;
             let selector_remap =
@@ -345,6 +368,7 @@ fn static_preview_mesh_and_materials(
         },
         mesh_components,
         terrain_components: 1,
+        animation_frame: static_animation_frame,
     })
 }
 
@@ -678,6 +702,7 @@ struct StaticVulkanApp {
     clip_visible_vertices: usize,
     mesh_components: usize,
     terrain_components: usize,
+    animation_frame: Option<u16>,
     preview_roots: usize,
     target_frames: u64,
     mission: String,
@@ -708,6 +733,7 @@ impl StaticVulkanApp {
             clip_visible_vertices: preview.clip_visible_vertices,
             mesh_components: preview.mesh_components,
             terrain_components: preview.terrain_components,
+            animation_frame: preview.animation_frame,
             preview_roots,
             target_frames,
             mission: mission.to_string(),
@@ -776,12 +802,13 @@ impl StaticVulkanApp {
             (None, _) => None,
         };
         self.output = Some(format!(
-            "{{\"report_kind\":\"rendered-static-mission\",\"backend\":\"vulkan-static\",\"camera_mode\":{},\"window\":\"native\",\"mission\":{},\"objects\":{},\"frames\":{},\"preview_roots\":{},\"mesh_components\":{},\"terrain_components\":{},\"clip_visible_vertices\":{},\"material_descriptors\":{},\"swapchain\":[{},{}],\"swapchain_images\":{},\"validation_warnings\":{},\"validation_errors\":{},\"readback_format\":{},\"readback_bytes\":{},\"readback_hash\":{},\"readback_path\":{}}}",
+            "{{\"report_kind\":\"rendered-static-mission\",\"backend\":\"vulkan-static\",\"camera_mode\":{},\"window\":\"native\",\"mission\":{},\"objects\":{},\"frames\":{},\"preview_roots\":{},\"animation_frame\":{},\"mesh_components\":{},\"terrain_components\":{},\"clip_visible_vertices\":{},\"material_descriptors\":{},\"swapchain\":[{},{}],\"swapchain_images\":{},\"validation_warnings\":{},\"validation_errors\":{},\"readback_format\":{},\"readback_bytes\":{},\"readback_hash\":{},\"readback_path\":{}}}",
             json_string(self.camera_mode),
             json_string(&self.mission),
             self.object_count,
             self.frames_presented,
             self.preview_roots,
+            self.animation_frame.map_or_else(|| "null".to_string(), |frame| frame.to_string()),
             self.mesh_components,
             self.terrain_components,
             self.clip_visible_vertices,
@@ -1035,6 +1062,7 @@ struct Args {
     readback_out: Option<PathBuf>,
     preview_roots: NonZeroUsize,
     legacy_camera_capture: Option<PathBuf>,
+    static_animation_frame: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1044,6 +1072,7 @@ enum RenderBackendMode {
 }
 
 impl Args {
+    #[allow(clippy::too_many_lines)]
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut root = None;
         let mut mission = None;
@@ -1057,6 +1086,7 @@ impl Args {
         // remains available for bounded diagnostic work.
         let mut preview_roots = NonZeroUsize::MAX;
         let mut legacy_camera_capture = None;
+        let mut static_animation_frame = None;
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -1119,6 +1149,16 @@ impl Args {
                             "--legacy-camera-capture requires a path".to_string()
                         })?);
                 }
+                "--static-animation-frame" => {
+                    static_animation_frame = Some(
+                        iter.next()
+                            .ok_or_else(|| "--static-animation-frame requires a value".to_string())?
+                            .parse()
+                            .map_err(|_| {
+                                "--static-animation-frame must be a u16 integer".to_string()
+                            })?,
+                    );
+                }
                 _ => return Err(usage()),
             }
         }
@@ -1133,6 +1173,9 @@ impl Args {
         if readback_out.is_some() && backend != RenderBackendMode::StaticVulkan {
             return Err("--readback-out requires --backend static-vulkan".to_string());
         }
+        if static_animation_frame.is_some() && backend != RenderBackendMode::StaticVulkan {
+            return Err("--static-animation-frame requires --backend static-vulkan".to_string());
+        }
         Ok(Self {
             root,
             mission,
@@ -1142,6 +1185,7 @@ impl Args {
             readback_out,
             preview_roots,
             legacy_camera_capture,
+            static_animation_frame,
         })
     }
 }
@@ -1213,7 +1257,7 @@ fn json_hash(hash: &[u8; 32]) -> String {
 }
 
 fn usage() -> String {
-    "usage: fparkan-game --root <path> --mission <path> [--frames <n>] [--backend <planning|static-vulkan>] [--preview-roots <non-zero n>] [--legacy-camera-capture <path>] [--readback-out <path>] [--load-progress <path>]".to_string()
+    "usage: fparkan-game --root <path> --mission <path> [--frames <n>] [--backend <planning|static-vulkan>] [--preview-roots <non-zero n>] [--legacy-camera-capture <path>] [--static-animation-frame <u16>] [--readback-out <path>] [--load-progress <path>]".to_string()
 }
 
 #[cfg(test)]
@@ -1281,6 +1325,7 @@ mod tests {
                 readback_out: None,
                 preview_roots: NonZeroUsize::MAX,
                 legacy_camera_capture: None,
+                static_animation_frame: None,
             })
         );
     }
@@ -1305,6 +1350,7 @@ mod tests {
                 readback_out: None,
                 preview_roots: NonZeroUsize::MAX,
                 legacy_camera_capture: None,
+                static_animation_frame: None,
             })
         );
     }
@@ -1357,6 +1403,34 @@ mod tests {
     }
 
     #[test]
+    fn static_animation_frame_requires_static_vulkan_and_is_retained() {
+        let common = [
+            "--root",
+            "testdata/IS",
+            "--mission",
+            "MISSIONS/Autodemo.00/data.tma",
+            "--static-animation-frame",
+            "12",
+        ];
+        assert_eq!(
+            Args::parse(&strings(&common)),
+            Err("--static-animation-frame requires --backend static-vulkan".to_string())
+        );
+        let parsed = Args::parse(&strings(&[
+            "--root",
+            "testdata/IS",
+            "--mission",
+            "MISSIONS/Autodemo.00/data.tma",
+            "--backend",
+            "static-vulkan",
+            "--static-animation-frame",
+            "12",
+        ]))
+        .expect("valid static animation frame");
+        assert_eq!(parsed.static_animation_frame, Some(12));
+    }
+
+    #[test]
     fn rejects_zero_static_preview_root_count() {
         let error = Args::parse(&strings(&[
             "--root",
@@ -1392,6 +1466,7 @@ mod tests {
                 readback_out: None,
                 preview_roots: NonZeroUsize::MAX,
                 legacy_camera_capture: None,
+                static_animation_frame: None,
             })
         );
     }

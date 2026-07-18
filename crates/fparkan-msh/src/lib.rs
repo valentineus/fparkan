@@ -21,7 +21,10 @@
 //! Stage-3 MSH asset contract.
 
 use encoding_rs::WINDOWS_1251;
-use fparkan_animation::{evaluate_hierarchy, AnimKey24, NodePoseBuffer, ParentIndex, Pose};
+use fparkan_animation::{
+    evaluate_hierarchy, AnimKey24, AnimationTime, NodePoseBuffer, ParentIndex, Pose, TimedPoseKey,
+    TimedPoseTrack,
+};
 use fparkan_nres::{EntryMeta, NresDocument, NresError};
 
 /// Node table stream.
@@ -476,6 +479,88 @@ pub fn node38_fallback_hierarchy(model: &ModelAsset) -> Option<NodePoseBuffer> {
         poses.push(node38_fallback_pose(model, node)?);
     }
     evaluate_hierarchy(&parents, &poses).ok()
+}
+
+/// Evaluates the portable-reference pose hierarchy of a standard `Node38`
+/// model at one explicitly supplied logical frame.
+///
+/// A node without a usable type-19 map, or a requested frame outside the
+/// declared map length, retains its exact fallback key. Mapped keys are
+/// sampled against their immediate successor using the decoded key times.
+/// This is an offline asset-sampling contract; it does not claim ownership of
+/// the original runtime's animation clock or x87 numeric profile.
+///
+/// Returns `None` when the model lacks a complete standard-node animation
+/// representation or the map cannot be safely resolved.
+#[must_use]
+pub fn node38_sampled_hierarchy(model: &ModelAsset, frame: u16) -> Option<NodePoseBuffer> {
+    if model.node_stride != 38 || model.node_count == 0 {
+        return None;
+    }
+    let animation = model.animation.as_ref()?;
+    let mut parents = Vec::with_capacity(model.node_count);
+    let mut poses = Vec::with_capacity(model.node_count);
+    for index in 0..model.node_count {
+        let node = NodeId(u32::try_from(index).ok()?);
+        let metadata = node38_metadata(model, node)?;
+        let parent = if metadata.parent_or_link_raw == u16::MAX {
+            ParentIndex(None)
+        } else {
+            let parent = usize::from(metadata.parent_or_link_raw);
+            (parent < index).then_some(ParentIndex(Some(metadata.parent_or_link_raw)))?
+        };
+        let fallback_index = usize::from(metadata.fallback_key);
+        let _fallback = animation.keys.get(fallback_index)?;
+        let key_index =
+            if metadata.anim_map_start == u16::MAX || u32::from(frame) >= animation.frame_count {
+                fallback_index
+            } else {
+                let mapped_index =
+                    usize::from(*animation.frame_map.get(
+                        usize::from(metadata.anim_map_start).checked_add(usize::from(frame))?,
+                    )?);
+                if mapped_index < fallback_index {
+                    mapped_index
+                } else {
+                    fallback_index
+                }
+            };
+        let pose = sample_node38_key_pair(&animation.keys, key_index, fallback_index, frame)?;
+        parents.push(parent);
+        poses.push(pose);
+    }
+    evaluate_hierarchy(&parents, &poses).ok()
+}
+
+fn sample_node38_key_pair(
+    keys: &[AnimKey24],
+    key_index: usize,
+    fallback_index: usize,
+    frame: u16,
+) -> Option<Pose> {
+    let key = *keys.get(key_index)?;
+    if key_index == fallback_index {
+        return Some(key.sampling_pose());
+    }
+    let next = *keys.get(key_index.checked_add(1)?)?;
+    if next.time.0 <= key.time.0 {
+        return Some(key.sampling_pose());
+    }
+    let track = TimedPoseTrack::new(
+        key.sampling_pose(),
+        vec![
+            TimedPoseKey {
+                time: key.time,
+                pose: key.sampling_pose(),
+            },
+            TimedPoseKey {
+                time: next.time,
+                pose: next.sampling_pose(),
+            },
+        ],
+    )
+    .ok()?;
+    track.sample(AnimationTime(f32::from(frame))).ok()
 }
 
 /// Returns draw batches for a validated slot.
@@ -1271,6 +1356,61 @@ mod tests {
         let hierarchy = node38_fallback_hierarchy(&model).expect("valid node hierarchy");
         assert!((hierarchy.poses[1].translation[0] - 1.0).abs() < 0.001);
         assert!((hierarchy.poses[1].translation[1] - 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn standard_nodes_sample_mapped_key_before_fallback_key() {
+        let mut node = node38([u16::MAX; 15]);
+        node[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
+        node[4..6].copy_from_slice(&0_u16.to_le_bytes());
+        node[6..8].copy_from_slice(&2_u16.to_le_bytes());
+        let model = ModelAsset {
+            node_stride: 38,
+            node_count: 1,
+            nodes_raw: node,
+            slots: Vec::new(),
+            positions: Vec::new(),
+            normals: None,
+            uv0: None,
+            indices: Vec::new(),
+            batches: Vec::new(),
+            node_names: None,
+            animation: Some(ModelAnimation {
+                keys: vec![
+                    AnimKey24 {
+                        time: AnimationTime(0.0),
+                        pose: Pose {
+                            translation: [4.0, 0.0, 0.0],
+                            rotation: [0.0, 0.0, 0.0, 1.0],
+                        },
+                    },
+                    AnimKey24 {
+                        time: AnimationTime(2.0),
+                        pose: Pose {
+                            translation: [8.0, 0.0, 0.0],
+                            rotation: [0.0, 0.0, 0.0, 1.0],
+                        },
+                    },
+                    AnimKey24 {
+                        time: AnimationTime(9.0),
+                        pose: Pose::default(),
+                    },
+                ],
+                frame_map: vec![0, 0, 0],
+                frame_count: 3,
+            }),
+        };
+
+        let pose = node38_sampled_hierarchy(&model, 1)
+            .expect("mapped hierarchy")
+            .poses[0];
+        assert!((pose.translation[0] - 6.0).abs() < f32::EPSILON);
+        assert_eq!(
+            node38_sampled_hierarchy(&model, 9)
+                .expect("fallback hierarchy")
+                .poses[0],
+            Pose::default()
+        );
     }
 
     #[test]

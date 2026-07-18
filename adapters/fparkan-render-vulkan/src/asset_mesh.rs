@@ -2,7 +2,8 @@
 
 use crate::{VulkanStaticDrawRange, VulkanStaticMesh, VulkanStaticVertex};
 use fparkan_msh::{
-    draw_batches, node38_fallback_hierarchy, selected_slot, Group, Lod, ModelAsset, NodeId,
+    draw_batches, node38_fallback_hierarchy, node38_sampled_hierarchy, selected_slot, Group, Lod,
+    ModelAsset, NodeId,
 };
 use fparkan_render::{LegacyIron3dEulerTransform, LegacyPipelineState};
 use fparkan_terrain_format::LandMeshDocument;
@@ -206,6 +207,39 @@ pub fn project_msh_to_static_mesh_in_xy_frame_with_node_fallback_poses(
     Ok(mesh)
 }
 
+/// Projects a standard `Node38` model at one explicit portable-reference
+/// animation frame into a diagnostic XY frame.
+///
+/// This is the diagnostic-camera counterpart of
+/// [`project_msh_to_static_mesh_in_world_space_with_node_sampled_poses`].
+///
+/// # Errors
+///
+/// Returns [`VulkanAssetMeshError`] when the source cannot be represented by
+/// the static bridge or a transformed coordinate is non-finite.
+pub fn project_msh_to_static_mesh_in_xy_frame_with_node_sampled_poses(
+    model: &ModelAsset,
+    frame: VulkanStaticXyFrame,
+    transform: LegacyIron3dEulerTransform,
+    scale: [f32; 3],
+    animation_frame: u16,
+) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
+    let mut mesh = project_msh_to_static_mesh_in_world_space_with_node_sampled_poses(
+        model,
+        transform,
+        scale,
+        animation_frame,
+    )?;
+    for vertex in &mut mesh.vertices {
+        if !vertex.position.iter().all(|value| value.is_finite()) {
+            return Err(VulkanAssetMeshError::NonFinitePosition);
+        }
+        let projected = frame.project(vertex.position);
+        vertex.position = [projected[0], projected[1], 0.0];
+    }
+    Ok(mesh)
+}
+
 /// Projects MSH geometry into source world coordinates with known translation and scale.
 ///
 /// Unlike [`project_msh_to_static_mesh_in_xy_frame`], this does not normalize
@@ -308,6 +342,45 @@ pub fn project_msh_to_static_mesh_in_world_space_with_node_fallback_poses(
     transform: LegacyIron3dEulerTransform,
     scale: [f32; 3],
 ) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
+    project_msh_to_static_mesh_in_world_space_with_node_poses(
+        model,
+        transform,
+        scale,
+        node38_fallback_hierarchy(model),
+    )
+}
+
+/// Projects a standard `Node38` model at one explicit portable-reference
+/// animation frame.
+///
+/// This uses decoded type-8 keys and the type-19 map but deliberately does
+/// not infer the original engine's animation clock or x87 profile. Models
+/// without a complete sampled hierarchy retain the established unposed bridge.
+///
+/// # Errors
+///
+/// Returns [`VulkanAssetMeshError`] when source geometry or transforms cannot
+/// be represented by the current static Vulkan input contract.
+pub fn project_msh_to_static_mesh_in_world_space_with_node_sampled_poses(
+    model: &ModelAsset,
+    transform: LegacyIron3dEulerTransform,
+    scale: [f32; 3],
+    animation_frame: u16,
+) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
+    project_msh_to_static_mesh_in_world_space_with_node_poses(
+        model,
+        transform,
+        scale,
+        node38_sampled_hierarchy(model, animation_frame),
+    )
+}
+
+fn project_msh_to_static_mesh_in_world_space_with_node_poses(
+    model: &ModelAsset,
+    transform: LegacyIron3dEulerTransform,
+    scale: [f32; 3],
+    hierarchy: Option<fparkan_animation::NodePoseBuffer>,
+) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
     if !transform
         .translation
         .iter()
@@ -320,7 +393,7 @@ pub fn project_msh_to_static_mesh_in_world_space_with_node_fallback_poses(
     if model.node_stride != 38 || model.node_count == 0 || model.animation.is_none() {
         return project_msh_to_static_mesh_in_world_space_with_transform(model, transform, scale);
     }
-    let Some(hierarchy) = node38_fallback_hierarchy(model) else {
+    let Some(hierarchy) = hierarchy else {
         return project_msh_to_static_mesh_in_world_space_with_transform(model, transform, scale);
     };
 

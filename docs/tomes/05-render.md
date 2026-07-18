@@ -1841,3 +1841,25 @@ path; он не является оценкой сходства с original fra
 `95.29412..288.23532` становятся `2.978..9.007`, что согласуется с TMA Z и
 live camera height. Это доказанное coordinate conversion, но оно само по себе
 не сделало вершины видимыми и не является заявлением о pixel parity.
+
+### Explicit offline Node38 animation-frame preview
+
+The static Vulkan path now accepts `--static-animation-frame <u16>`. For each
+standard `Node38` model it resolves the already-decoded type-19 map at that
+logical frame, selects its mapped type-8 key when it is valid before the
+node's fallback key, samples the selected key and its immediate successor with
+the portable reference sampler, then composes the resulting parent hierarchy.
+Nodes with no usable map, or a requested frame outside the declared map,
+retain their exact fallback pose. An invalid/incomplete hierarchy deliberately
+falls back to the existing unposed static geometry path instead of guessing a
+runtime state.
+
+This option is a reproducible asset-viewer probe, not a gameplay clock: it
+does not identify the original animation controller, x87 rounding profile,
+clip selection, LOD/group controller, blending or FX timing. The JSON report
+contains `animation_frame` (`null` for the established fallback preview) so
+readbacks from the two modes cannot be mistaken for each other. On 2026-07-18,
+the licensed GOG `MISSIONS/Autodemo.00/data.tma` run with all eight roots,
+`--static-animation-frame 1`, two frames and format `50` completed with 66
+mesh components, 75,543 clip-visible vertices, a 1280×720 / 3,686,400-byte
+readback hash `4638497144561211935`, and validation warnings/errors `0/0`.
