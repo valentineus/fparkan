@@ -955,6 +955,17 @@ synchronized readback (FNV-1a `12332214764918703197`) and validation
 warnings/errors `0/0`. This is not a
 full-scene or original-renderer pixel-parity claim.
 
+The same bounded command was then run against the licensed installed Part 1
+(`C:\\Program Files (x86)\\Nikita\\IS`) and Part 2
+(`C:\\Program Files (x86)\\Nikita\\IS2`) corpora supplied for testing. Both
+`MISSIONS/Autodemo.00/data.tma` runs completed with the same one-material,
+1280×720 two-image report, the same `12332214764918703197` readback hash and
+validation warnings/errors `0/0`; Part 1 took 28.5 seconds and Part 2 took
+94.5 seconds. Part 2's synchronous checkpoint was `Graph` while it was still
+loading, so the longer startup is not attributed to Vulkan. This is only a
+cross-corpus confirmation of the first-root static-preview bridge, not a claim
+that the two games' full mission renderers are compatible.
+
 The preview now asks `load_mission_static_preview` for both graph and assets.
 Normal mission loading remains full and transactional; preview graph traversal
 and asset preparation are restricted to the first TMA root. It is therefore not
