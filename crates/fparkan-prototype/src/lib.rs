@@ -1,23 +1,4 @@
 #![forbid(unsafe_code)]
-#![cfg_attr(
-    test,
-    allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        clippy::cast_precision_loss,
-        clippy::expect_used,
-        clippy::float_cmp,
-        clippy::identity_op,
-        clippy::too_many_lines,
-        clippy::uninlined_format_args,
-        clippy::map_unwrap_or,
-        clippy::needless_raw_string_hashes,
-        clippy::semicolon_if_nothing_returned,
-        clippy::type_complexity,
-        clippy::panic,
-        clippy::unwrap_used
-    )
-)]
 //! Prototype registry and unit DAT primitives.
 
 use encoding_rs::WINDOWS_1251;
@@ -824,7 +805,7 @@ pub fn build_prototype_graph(
 ///
 /// This function reports per-root failures in [`PrototypeGraphReport`] instead
 /// of returning early.
-#[allow(clippy::too_many_lines)]
+
 pub fn build_prototype_graph_report(
     repository: &dyn ResourceRepository,
     vfs: &dyn Vfs,

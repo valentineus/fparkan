@@ -439,7 +439,6 @@ fn project_msh_to_static_mesh_in_world_space_with_node_poses(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn append_node_fallback_batch(
     model: &ModelAsset,
     batch: &fparkan_msh::Batch,

@@ -1,7 +1,5 @@
 use ash::vk;
 use fparkan_platform::{DepthStencilSupport, RenderRequest};
-use fparkan_render::{validate_command_list, RenderCommand, RenderCommandList, RenderError};
-use serde::Serialize;
 
 const MIN_VULKAN_API_VERSION: u32 = vk::API_VERSION_1_1;
 pub(crate) const KHR_SWAPCHAIN_EXTENSION: &str = "VK_KHR_swapchain";
@@ -147,25 +145,6 @@ pub struct VulkanSwapchainRecreationReport {
     pub next_extent: (u32, u32),
 }
 
-/// Deterministic frame submission plan for command buffers and sync objects.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct VulkanFrameSubmissionPlan {
-    /// Report schema version.
-    pub schema: u32,
-    /// Frames allowed in flight.
-    pub frames_in_flight: u32,
-    /// Swapchain-backed primary command buffers.
-    pub command_buffers: u32,
-    /// Binary semaphores allocated per frame.
-    pub semaphores_per_frame: u32,
-    /// Fences allocated per frame.
-    pub fences_per_frame: u32,
-    /// Draw commands encoded into the frame.
-    pub draw_count: u32,
-    /// Total indexed vertices submitted by draw commands.
-    pub indexed_vertex_count: u32,
-}
-
 /// Synthetic physical-device capabilities used by negative tests and reports.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VulkanPhysicalDeviceRecord {
@@ -204,7 +183,7 @@ impl VulkanPhysicalDeviceRecord {
 }
 
 /// Informational device limits relevant to future Stage 0 capability growth.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VulkanDeviceLimits {
     /// Maximum 2D image dimension supported by the device.
     pub max_image_dimension_2d: u32,
@@ -217,7 +196,7 @@ pub struct VulkanDeviceLimits {
 }
 
 /// Informational capabilities preserved in deterministic Stage 0 reports.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VulkanInformationalCapabilities {
     /// Color formats that support sampled-image usage.
     pub sampled_color_formats: Vec<i32>,
@@ -253,7 +232,7 @@ pub struct VulkanCapabilityReport {
 }
 
 /// Deterministic rejection reason for an unsuitable physical device.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VulkanRejectedDeviceReport {
     /// Human-readable device name.
     pub device_name: String,
@@ -446,136 +425,6 @@ pub const fn swapchain_recreation_report(
     }
 }
 
-/// Builds a deterministic frame submission plan for a validated command list.
-///
-/// Stage 0 keeps this as a pure planning boundary so command-pool, command-buffer
-/// and synchronization policy can be tested without requiring a native surface.
-///
-/// # Errors
-///
-/// Returns [`RenderError`] when the command list has invalid frame framing,
-/// ordering, draw ranges, mesh bounds, or non-finite transforms.
-pub fn plan_vulkan_frame_submission(
-    swapchain: &VulkanSwapchainPlan,
-    commands: &RenderCommandList,
-) -> Result<VulkanFrameSubmissionPlan, RenderError> {
-    validate_command_list(commands)?;
-    let mut draw_count = 0_u32;
-    let mut indexed_vertex_count = 0_u32;
-    for command in &commands.commands {
-        if let RenderCommand::Draw(draw) = command {
-            draw_count = draw_count.saturating_add(1);
-            indexed_vertex_count = indexed_vertex_count.saturating_add(draw.range.count);
-        }
-    }
-    Ok(VulkanFrameSubmissionPlan {
-        schema: 1,
-        frames_in_flight: swapchain.image_count.clamp(1, 2),
-        command_buffers: swapchain.image_count,
-        semaphores_per_frame: 2,
-        fences_per_frame: 1,
-        draw_count,
-        indexed_vertex_count,
-    })
-}
-
-/// Renders a deterministic JSON capability report.
-#[must_use]
-pub fn render_capability_report_json(report: &VulkanCapabilityReport) -> String {
-    #[derive(Serialize)]
-    struct CapabilityReportJson<'a> {
-        schema: u32,
-        vulkan_api: String,
-        device_name: &'a str,
-        score: i32,
-        graphics_queue_family: u32,
-        present_queue_family: u32,
-        portability_subset: bool,
-        enabled_extensions: &'a [String],
-        informational_capabilities: &'a VulkanInformationalCapabilities,
-        rejected_devices: &'a [VulkanRejectedDeviceReport],
-    }
-
-    serialize_json_or_fallback(
-        &CapabilityReportJson {
-            schema: report.schema,
-            vulkan_api: format_api_version(report.vulkan_api_version),
-            device_name: &report.device_name,
-            score: report.score,
-            graphics_queue_family: report.graphics_queue_family,
-            present_queue_family: report.present_queue_family,
-            portability_subset: report.portability_subset,
-            enabled_extensions: &report.enabled_extensions,
-            informational_capabilities: &report.informational_capabilities,
-            rejected_devices: &report.rejected_devices,
-        },
-        "{\"schema\":0,\"vulkan_api\":\"0.0.0\",\"device_name\":\"unknown\",\"score\":0,\"graphics_queue_family\":0,\"present_queue_family\":0,\"portability_subset\":false,\"enabled_extensions\":[],\"informational_capabilities\":{\"sampled_color_formats\":[],\"sampled_depth_formats\":[],\"limits\":{\"max_image_dimension_2d\":0,\"max_sampler_allocation_count\":0,\"max_per_stage_descriptor_samplers\":0,\"max_bound_descriptor_sets\":0}},\"rejected_devices\":[]}",
-    )
-}
-
-/// Renders a deterministic JSON swapchain plan.
-#[must_use]
-pub fn render_swapchain_plan_json(plan: &VulkanSwapchainPlan) -> String {
-    #[derive(Serialize)]
-    struct SwapchainPlanJson {
-        schema: u32,
-        extent: [u32; 2],
-        format: i32,
-        color_space: i32,
-        present_mode: i32,
-        image_count: u32,
-        image_usage: u32,
-    }
-
-    serialize_json_or_fallback(
-        &SwapchainPlanJson {
-            schema: plan.schema,
-            extent: [plan.extent.0, plan.extent.1],
-            format: plan.format.format,
-            color_space: plan.format.color_space,
-            present_mode: plan.present_mode,
-            image_count: plan.image_count,
-            image_usage: plan.image_usage,
-        },
-        "{\"schema\":0,\"extent\":[0,0],\"format\":0,\"color_space\":0,\"present_mode\":0,\"image_count\":0,\"image_usage\":0}",
-    )
-}
-
-/// Renders a deterministic JSON swapchain recreation report.
-#[must_use]
-pub fn render_swapchain_recreation_report_json(report: &VulkanSwapchainRecreationReport) -> String {
-    #[derive(Serialize)]
-    struct SwapchainRecreationReportJson<'a> {
-        schema: u32,
-        reason: &'a str,
-        previous_extent: [u32; 2],
-        next_extent: [u32; 2],
-    }
-
-    serialize_json_or_fallback(
-        &SwapchainRecreationReportJson {
-            schema: report.schema,
-            reason: match report.reason {
-                VulkanSwapchainRecreationReason::Resize => "resize",
-                VulkanSwapchainRecreationReason::OutOfDate => "out_of_date",
-                VulkanSwapchainRecreationReason::Suboptimal => "suboptimal",
-            },
-            previous_extent: [report.previous_extent.0, report.previous_extent.1],
-            next_extent: [report.next_extent.0, report.next_extent.1],
-        },
-        "{\"schema\":0,\"reason\":\"unknown\",\"previous_extent\":[0,0],\"next_extent\":[0,0]}",
-    )
-}
-
-/// Renders a deterministic JSON frame submission plan.
-#[must_use]
-pub fn render_frame_submission_plan_json(plan: &VulkanFrameSubmissionPlan) -> String {
-    serialize_json_or_fallback(
-        plan,
-        "{\"schema\":0,\"frames_in_flight\":0,\"command_buffers\":0,\"semaphores_per_frame\":0,\"fences_per_frame\":0,\"draw_count\":0,\"indexed_vertex_count\":0}",
-    )
-}
-
 pub(crate) fn select_composite_alpha(
     supported: vk::CompositeAlphaFlagsKHR,
 ) -> vk::CompositeAlphaFlagsKHR {
@@ -587,13 +436,6 @@ pub(crate) fn select_composite_alpha(
         vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED
     } else {
         vk::CompositeAlphaFlagsKHR::INHERIT
-    }
-}
-
-pub(crate) fn serialize_json_or_fallback<T: Serialize>(value: &T, fallback: &str) -> String {
-    match serde_json::to_string(value) {
-        Ok(json) => json,
-        Err(_) => fallback.to_string(),
     }
 }
 

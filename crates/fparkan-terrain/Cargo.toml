@@ -6,10 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-fparkan-terrain-format = { path = "../fparkan-terrain-format", version = "0.1.0" }
+fparkan-terrain-format = { path = "../fparkan-terrain-format" }
 
 [dev-dependencies]
-fparkan-nres = { path = "../fparkan-nres", version = "0.1.0" }
-
-[lints]
-workspace = true
+fparkan-nres = { path = "../fparkan-nres" }

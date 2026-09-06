@@ -4,10 +4,7 @@ members = [
     "crates/fparkan-animation",
     "crates/fparkan-assets",
     "crates/fparkan-binary",
-    "crates/fparkan-corpus",
-    "crates/fparkan-diagnostics",
     "crates/fparkan-fx",
-    "crates/fparkan-inspection",
     "crates/fparkan-material",
     "crates/fparkan-mission-format",
     "crates/fparkan-msh",
@@ -22,45 +19,19 @@ members = [
     "crates/fparkan-runtime",
     "crates/fparkan-terrain",
     "crates/fparkan-terrain-format",
-    "crates/fparkan-test-support",
     "crates/fparkan-texm",
     "crates/fparkan-vfs",
     "crates/fparkan-world",
     "adapters/fparkan-platform-winit",
     "adapters/fparkan-render-vulkan",
-    "apps/fparkan-cli",
     "apps/fparkan-game",
-    "apps/fparkan-headless",
-    "apps/fparkan-vulkan-smoke",
-    "apps/fparkan-viewer",
-    "xtask",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.97"
 license = "GPL-2.0-only"
 repository = "https://github.com/valentineus/fparkan"
-
-[workspace.lints.rust]
-unsafe_code = "forbid"
-missing_docs = "warn"
-unreachable_pub = "warn"
-unused_must_use = "deny"
-
-[workspace.lints.clippy]
-all = { level = "deny", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
-unwrap_used = "deny"
-expect_used = "deny"
-panic = "deny"
-todo = "deny"
-unimplemented = "deny"
-dbg_macro = "deny"
-print_stdout = "warn"
-print_stderr = "warn"
-lossy_float_literal = "deny"
 
 [profile.release]
 codegen-units = 1

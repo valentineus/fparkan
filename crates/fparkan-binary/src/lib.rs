@@ -1,23 +1,4 @@
 #![forbid(unsafe_code)]
-#![cfg_attr(
-    test,
-    allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        clippy::cast_precision_loss,
-        clippy::expect_used,
-        clippy::float_cmp,
-        clippy::identity_op,
-        clippy::too_many_lines,
-        clippy::uninlined_format_args,
-        clippy::map_unwrap_or,
-        clippy::needless_raw_string_hashes,
-        clippy::semicolon_if_nothing_returned,
-        clippy::type_complexity,
-        clippy::panic,
-        clippy::unwrap_used
-    )
-)]
 //! Bounded little-endian binary cursor and checked layout helpers.
 
 use std::fmt;
@@ -399,7 +380,6 @@ pub fn sha256_hex(digest: &Sha256Digest) -> String {
     out
 }
 
-#[allow(clippy::many_single_char_names)]
 fn compress_sha256_chunk(h: &mut [u32; 8], chunk: &[u8], k: &[u32; 64]) {
     let mut w = [0u32; 64];
     for (idx, word) in w.iter_mut().take(16).enumerate() {

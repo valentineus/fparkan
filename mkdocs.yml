@@ -57,14 +57,14 @@ plugins:
 nav:
   - Начало: index.md
   - Книга:
-      - I. Путеводитель и методика: tomes/01-guide.md
+      - I. Путеводитель: tomes/01-guide.md
       - II. Запуск, архитектура и игровой цикл: tomes/02-architecture.md
       - III. Ресурсная система и форматы: tomes/03-resources.md
       - IV. Мир, миссии и игровой runtime: tomes/04-world.md
       - V. Геометрия, материалы и рендер: tomes/05-render.md
       - VI. Поведение, управление, звук и сеть: tomes/06-behavior.md
-      - VII. Руководство по полной реализации: tomes/07-implementation.md
-      - VIII. Справочник и доказательная база: tomes/08-evidence.md
+      - VII. Работа над движком: tomes/07-implementation.md
+      - VIII. Устройство оригинальной программы: tomes/08-evidence.md
   - Справочник:
       - NRes: reference/nres.md
       - RsLi: reference/rsli.md
@@ -73,12 +73,13 @@ nav:
       - WEAR и MAT0: reference/materials.md
       - Texm: reference/texm.md
       - Render frame: reference/render-frame.md
-      - Renderer Truth Table: rendering/renderer_truth_table.md
-      - Original Engine Hashes: evidence/original_engine_hashes.md
-      - Stage 4 Capture Schema: evidence/stage4_capture_schema.md
+      - Оригинальные модули: reference/original-binaries.md
   - Приложения:
       - Глоссарий: appendices/glossary.md
       - Границы знания: appendices/knowledge-boundaries.md
+      - Сценарная VM: appendices/script-vm.md
+      - Сохранения и кампания: appendices/saves-campaign.md
+      - Интерфейс игры: appendices/ui-shell.md
 
 # Additional configuration
 extra:

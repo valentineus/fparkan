@@ -1,7 +1,6 @@
 #![allow(unsafe_code)]
 
 use ash::vk;
-use serde::Serialize;
 use std::collections::BTreeSet;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -10,7 +9,6 @@ use super::{
     EXT_DEBUG_UTILS_EXTENSION, KHR_PORTABILITY_ENUMERATION_EXTENSION, MIN_VULKAN_API_VERSION,
     VALIDATION_LAYER_NAME,
 };
-use crate::policy::{format_api_version, serialize_json_or_fallback};
 
 /// Vulkan instance bootstrap configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -236,28 +234,6 @@ pub fn create_vulkan_instance_probe(
     })
 }
 
-/// Renders a deterministic JSON Vulkan instance plan.
-#[must_use]
-pub fn render_instance_plan_json(plan: &VulkanInstancePlan) -> String {
-    #[derive(Serialize)]
-    struct InstancePlanJson<'a> {
-        schema: u32,
-        create_flags: u32,
-        validation_requested: bool,
-        enabled_extensions: &'a [String],
-    }
-
-    serialize_json_or_fallback(
-        &InstancePlanJson {
-            schema: plan.schema,
-            create_flags: plan.create_flags,
-            validation_requested: plan.validation_requested,
-            enabled_extensions: &plan.enabled_extensions,
-        },
-        "{\"schema\":0,\"create_flags\":0,\"validation_requested\":false,\"enabled_extensions\":[]}",
-    )
-}
-
 /// Opens the Vulkan loader and reports the supported instance API version.
 ///
 /// # Errors
@@ -286,26 +262,6 @@ pub fn probe_vulkan_loader() -> Result<VulkanLoaderProbeReport, VulkanLoaderErro
 #[must_use]
 pub fn vulkan_entry_symbol_name() -> &'static CStr {
     c"vkGetInstanceProcAddr"
-}
-
-/// Renders a deterministic JSON Vulkan loader report.
-#[must_use]
-pub fn render_loader_probe_report_json(report: &VulkanLoaderProbeReport) -> String {
-    #[derive(Serialize)]
-    struct LoaderProbeReportJson {
-        schema: u32,
-        loader_available: bool,
-        instance_api: String,
-    }
-
-    serialize_json_or_fallback(
-        &LoaderProbeReportJson {
-            schema: report.schema,
-            loader_available: report.loader_available,
-            instance_api: format_api_version(report.instance_api_version),
-        },
-        "{\"schema\":0,\"loader_available\":false,\"instance_api\":\"0.0.0\"}",
-    )
 }
 
 fn available_instance_extensions(entry: &ash::Entry) -> Result<Vec<String>, VulkanInstanceError> {

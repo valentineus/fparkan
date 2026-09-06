@@ -1,32 +1,13 @@
 #![forbid(unsafe_code)]
-#![cfg_attr(
-    test,
-    allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        clippy::cast_precision_loss,
-        clippy::expect_used,
-        clippy::float_cmp,
-        clippy::identity_op,
-        clippy::too_many_lines,
-        clippy::uninlined_format_args,
-        clippy::map_unwrap_or,
-        clippy::needless_raw_string_hashes,
-        clippy::semicolon_if_nothing_returned,
-        clippy::type_complexity,
-        clippy::panic,
-        clippy::unwrap_used
-    )
-)]
-//! Runtime orchestration for headless and rendered modes.
+//! Runtime orchestration for mission loading and world stepping.
 
 use fparkan_assets::{
     decode_mission_land_path, decode_mission_payload, decode_nres_payload,
-    derive_mission_land_paths, extend_graph_report_with_visual_dependencies_with_progress,
+    derive_mission_land_paths, extend_graph_report_with_visual_dependencies,
     mission_script_bundle_bases, prepare_terrain_world, AssetError as AssetPreparationError,
-    AssetId, AssetManager, AssetPreparationPhase, BuildCategory, MissionAssetPlan, MissionDocument,
-    MissionError, MissionTerrainPaths, NresError, PreparedVisual, TerrainFormatError,
-    TerrainPreparationError, TerrainWorld, TmaProfile, VisualDependencyPhase,
+    AssetId, AssetManager, BuildCategory, MissionAssetPlan, MissionDocument, MissionError,
+    MissionTerrainPaths, NresError, PreparedVisual, TerrainFormatError, TerrainPreparationError,
+    TerrainWorld, TmaProfile,
 };
 use fparkan_path::{normalize_relative, NormalizedPath, PathError, PathPolicy};
 use fparkan_prototype::{
@@ -53,47 +34,6 @@ pub use fparkan_assets::MissionAssets;
 const MISSION_DECODED_PAYLOAD_CACHE_ENTRIES: usize = 256;
 const FALLBACK_SCRIPT_VARSET_PATH: &str = "MISSIONS/SCRIPTS/varset.var";
 
-/// Engine mode.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EngineMode {
-    /// Headless.
-    Headless,
-    /// Rendered.
-    Rendered,
-}
-
-/// Scheduler phase.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SchedulerPhase {
-    /// Collect platform events.
-    CollectPlatformEvents,
-    /// Build input snapshot.
-    BuildInputSnapshot,
-    /// Advance clock.
-    AdvanceGameClock,
-    /// Calculate world queue.
-    CalculateWorldQueue,
-    /// Apply deferred operations.
-    ApplyDeferredOperations,
-    /// Update animation/effects.
-    UpdateAnimationAndEffects,
-    /// Publish render snapshot.
-    PublishRenderSnapshot,
-    /// Render world.
-    RenderWorld,
-    /// End frame callbacks.
-    EndFrameCallbacks,
-    /// Maintenance.
-    Maintenance,
-}
-
-/// Engine config.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct EngineConfig {
-    /// Mode.
-    pub mode: EngineMode,
-}
-
 /// Injectable engine services used by composition roots.
 #[derive(Clone, Default)]
 pub struct EngineServices {
@@ -114,97 +54,6 @@ impl EngineServices {
 pub struct MissionRequest {
     /// Mission key/path.
     pub key: String,
-}
-
-/// Mission loading phase captured for diagnostics and acceptance tests.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MissionLoadPhase {
-    /// Resolve services and mission request context.
-    Context,
-    /// Decode and validate TMA.
-    Tma,
-    /// Decode and validate terrain map assets.
-    Map,
-    /// Expand object roots into a prototype graph.
-    Graph,
-    /// Expand model-backed visual dependencies of the prototype graph.
-    GraphVisuals,
-    /// Resolve WEAR tables while expanding visual dependencies.
-    GraphVisualWears,
-    /// Resolve MAT0 documents while expanding visual dependencies.
-    GraphVisualMaterials,
-    /// Progress marker emitted after each 64 MAT0 validation requests.
-    GraphVisualMaterialRequests {
-        /// Number of MAT0 validation requests started.
-        request_count: usize,
-        /// Graph nodes materialized before the request.
-        graph_node_count: usize,
-        /// Graph edges materialized before the request.
-        graph_edge_count: usize,
-        /// Distinct WEAR validation keys retained before the request.
-        wear_cache_entries: usize,
-        /// Distinct MAT0 validation keys retained before the request.
-        material_cache_entries: usize,
-        /// Distinct TEXM validation keys retained before the request.
-        texture_cache_entries: usize,
-    },
-    /// Validate TEXM documents while expanding visual dependencies.
-    GraphVisualTextures,
-    /// Progress marker emitted after each 64 TEXM validation requests.
-    GraphVisualTextureRequests {
-        /// Number of TEXM validation requests started.
-        request_count: usize,
-        /// Graph nodes materialized before the request.
-        graph_node_count: usize,
-        /// Graph edges materialized before the request.
-        graph_edge_count: usize,
-        /// Distinct WEAR validation keys retained before the request.
-        wear_cache_entries: usize,
-        /// Distinct MAT0 validation keys retained before the request.
-        material_cache_entries: usize,
-        /// Distinct TEXM validation keys retained before the request.
-        texture_cache_entries: usize,
-    },
-    /// Prepare all reachable visual/resource dependencies.
-    Assets,
-    /// Decode and validate MSH model meshes.
-    AssetModelMeshes,
-    /// Decode WEAR material tables.
-    AssetWearTables,
-    /// Resolve MAT0 material documents.
-    AssetMaterials,
-    /// Decode diffuse textures and baked lightmaps.
-    AssetTextures,
-    /// Construct all object drafts before registration.
-    Construct,
-    /// Register constructed objects.
-    Register,
-}
-
-/// Raw placed transform preserved by the mission loader.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PlacedTransformProfile {
-    /// Object index in TMA order.
-    pub object_index: usize,
-    /// Raw position vector.
-    pub position: [f32; 3],
-    /// Raw orientation vector. No Euler order is inferred here.
-    pub orientation_raw: [f32; 3],
-    /// Raw scale vector.
-    pub scale: [f32; 3],
-}
-
-/// Mission loading trace.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct MissionLoadTrace {
-    /// Observed phases in execution order.
-    pub phases: Vec<MissionLoadPhase>,
-    /// Number of object drafts constructed before the first registration.
-    pub drafts_before_registration: usize,
-    /// Number of objects registered.
-    pub registered_objects: usize,
-    /// Raw transform profile for placed objects.
-    pub transforms: Vec<PlacedTransformProfile>,
 }
 
 /// Ordered mission property preserved for later runtime stages.
@@ -435,20 +284,10 @@ pub struct LoadedMission {
 pub struct FrameResult {
     /// Snapshot.
     pub snapshot: WorldSnapshot,
-    /// Scheduler phases executed for this frame.
-    pub trace: FrameTrace,
-}
-
-/// Scheduler trace for a completed frame.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct FrameTrace {
-    /// Frame phases in execution order.
-    pub phases: Vec<SchedulerPhase>,
 }
 
 /// Engine.
 pub struct Engine {
-    config: EngineConfig,
     services: EngineServices,
     world: World,
     loaded: Option<LoadedMissionState>,
@@ -559,13 +398,6 @@ pub enum EngineError {
     World(fparkan_world::WorldError),
     /// Reference movement input or terrain query failed.
     Movement(String),
-    /// Scheduler phase order was violated.
-    SchedulerPhaseOrder {
-        /// Previous phase.
-        previous: SchedulerPhase,
-        /// Current phase.
-        current: SchedulerPhase,
-    },
     /// Staged mission world was torn down after a registration-phase failure.
     RegistrationTeardown {
         /// Registered objects before the forced failure.
@@ -676,10 +508,6 @@ impl std::fmt::Display for EngineError {
             }
             Self::World(source) => write!(f, "{source}"),
             Self::Movement(message) => write!(f, "reference movement: {message}"),
-            Self::SchedulerPhaseOrder { previous, current } => write!(
-                f,
-                "scheduler phase order regressed from {previous:?} to {current:?}"
-            ),
             Self::RegistrationTeardown {
                 registered_objects,
                 released_objects,
@@ -710,22 +538,14 @@ impl std::error::Error for EngineError {
             | Self::ScriptRuntime { .. }
             | Self::Movement(_)
             | Self::PrototypeGraph { .. }
-            | Self::SchedulerPhaseOrder { .. }
             | Self::RegistrationTeardown { .. } => None,
         }
     }
 }
 
-/// Creates engine.
-///
-/// # Errors
-///
-/// Currently this constructor is infallible, but it returns
-/// [`EngineError`] to keep the composition-root API stable as services become
-/// mandatory.
-pub fn create(config: EngineConfig, services: EngineServices) -> Result<Engine, EngineError> {
+/// Creates an engine with the supplied services.
+pub fn create(services: EngineServices) -> Result<Engine, EngineError> {
     Ok(Engine {
-        config,
         services,
         world: new_world(WorldConfig),
         loaded: None,
@@ -744,7 +564,7 @@ pub fn load_mission(
     engine: &mut Engine,
     request: MissionRequest,
 ) -> Result<LoadedMission, EngineError> {
-    load_mission_with_trace(engine, request).map(|(loaded, _trace)| loaded)
+    load_mission_with_options(engine, request, MissionLoadOptions::default())
 }
 
 /// Loads a mission using the bounded static-preview asset scope.
@@ -763,7 +583,14 @@ pub fn load_mission_static_preview(
     engine: &mut Engine,
     request: MissionRequest,
 ) -> Result<LoadedMission, EngineError> {
-    load_mission_static_preview_with_progress(engine, request, |_| {})
+    load_mission_with_options(
+        engine,
+        request,
+        MissionLoadOptions {
+            asset_scope: MissionAssetScope::FirstMeshPreview,
+            ..MissionLoadOptions::default()
+        },
+    )
 }
 
 /// Loads a static preview for the first requested non-zero count of mission roots.
@@ -779,107 +606,25 @@ pub fn load_mission_static_preview_roots(
     request: MissionRequest,
     root_count: NonZeroUsize,
 ) -> Result<LoadedMission, EngineError> {
-    load_mission_static_preview_roots_with_progress(engine, request, root_count, |_| {})
-}
-
-/// Loads selected static-preview roots while synchronously reporting phases.
-///
-/// # Errors
-///
-/// Returns [`EngineError`] under the same conditions as
-/// [`load_mission_static_preview_roots`].
-pub fn load_mission_static_preview_roots_with_progress(
-    engine: &mut Engine,
-    request: MissionRequest,
-    root_count: NonZeroUsize,
-    mut on_phase: impl FnMut(MissionLoadPhase),
-) -> Result<LoadedMission, EngineError> {
-    load_mission_with_options_and_progress(
+    load_mission_with_options(
         engine,
         request,
         MissionLoadOptions {
             asset_scope: MissionAssetScope::PreviewRoots(root_count),
             ..MissionLoadOptions::default()
         },
-        Some(&mut on_phase),
     )
-    .map(|(loaded, _trace)| loaded)
 }
 
-/// Loads a static preview while synchronously reporting entered loading phases.
-///
-/// This has the same bounded asset scope as [`load_mission_static_preview`].
-///
-/// # Errors
-///
-/// Returns [`EngineError`] under the same conditions as
-/// [`load_mission_static_preview`].
-pub fn load_mission_static_preview_with_progress(
-    engine: &mut Engine,
-    request: MissionRequest,
-    mut on_phase: impl FnMut(MissionLoadPhase),
-) -> Result<LoadedMission, EngineError> {
-    load_mission_with_options_and_progress(
-        engine,
-        request,
-        MissionLoadOptions {
-            asset_scope: MissionAssetScope::FirstMeshPreview,
-            ..MissionLoadOptions::default()
-        },
-        Some(&mut on_phase),
-    )
-    .map(|(loaded, _trace)| loaded)
-}
-
-/// Loads mission transactionally and returns a diagnostic trace.
-///
-/// # Errors
-///
-/// Returns [`EngineError`] under the same conditions as [`load_mission`].
-pub fn load_mission_with_trace(
-    engine: &mut Engine,
-    request: MissionRequest,
-) -> Result<(LoadedMission, MissionLoadTrace), EngineError> {
-    load_mission_with_options_and_progress(engine, request, MissionLoadOptions::default(), None)
-}
-
-/// Loads a mission while synchronously reporting each entered loading phase.
-///
-/// The observer runs immediately after the phase is recorded in the returned
-/// trace. It is intended for diagnostic progress reporting; it does not alter
-/// loader ordering, validation, or transaction behavior.
-///
-/// # Errors
-///
-/// Returns [`EngineError`] under the same conditions as [`load_mission`].
-pub fn load_mission_with_progress(
-    engine: &mut Engine,
-    request: MissionRequest,
-    mut on_phase: impl FnMut(MissionLoadPhase),
-) -> Result<LoadedMission, EngineError> {
-    load_mission_with_options_and_progress(
-        engine,
-        request,
-        MissionLoadOptions::default(),
-        Some(&mut on_phase),
-    )
-    .map(|(loaded, _trace)| loaded)
-}
-
-#[allow(clippy::too_many_lines)]
-fn load_mission_with_options_and_progress(
+fn load_mission_with_options(
     engine: &mut Engine,
     request: MissionRequest,
     options: MissionLoadOptions,
-    mut on_phase: Option<&mut dyn FnMut(MissionLoadPhase)>,
-) -> Result<(LoadedMission, MissionLoadTrace), EngineError> {
-    let mut trace = MissionLoadTrace::default();
-    record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::Context);
+) -> Result<LoadedMission, EngineError> {
     let vfs = engine.services.vfs.clone().ok_or(EngineError::MissingVfs)?;
     let mission_path = normalize_engine_path("mission", &request.key)?;
     let mission_bytes = read_vfs(&vfs, &mission_path)?;
 
-    record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::Map);
     let land_path =
         decode_mission_land_path(&mission_bytes, TmaProfile::Strict).map_err(|source| {
             EngineError::Mission {
@@ -919,7 +664,6 @@ fn load_mission_with_options_and_progress(
                 TerrainPreparationError::Runtime(source) => EngineError::Terrain(source),
             }
         })?;
-    record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::Tma);
     let mission = decode_mission_payload(mission_bytes, TmaProfile::Strict).map_err(|source| {
         EngineError::Mission {
             path: mission_path.as_str().to_string(),
@@ -927,18 +671,6 @@ fn load_mission_with_options_and_progress(
         }
     })?;
     let loaded_scripts = load_mission_scripts(&vfs, &mission)?;
-    trace.transforms = mission
-        .objects
-        .iter()
-        .enumerate()
-        .map(|(object_index, object)| PlacedTransformProfile {
-            object_index,
-            position: object.position,
-            orientation_raw: object.orientation,
-            scale: object.scale,
-        })
-        .collect();
-    record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::Graph);
     let repository = CachedResourceRepository::with_payload_cache_budget(
         vfs.clone(),
         MISSION_DECODED_PAYLOAD_CACHE_ENTRIES,
@@ -957,93 +689,34 @@ fn load_mission_with_options_and_progress(
     };
     let (mut prototype_graph, resolved_prototypes, mut prototype_report) =
         build_prototype_graph_report(&repository, vfs.as_ref(), scoped_graph_roots);
-    record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::GraphVisuals);
-    let mut last_graph_visual_phase = None;
-    extend_graph_report_with_visual_dependencies_with_progress(
+    extend_graph_report_with_visual_dependencies(
         &repository,
         &mut prototype_report,
         &mut prototype_graph,
         &resolved_prototypes,
-        |progress| {
-            let runtime_phase = match progress.phase {
-                VisualDependencyPhase::Wear => MissionLoadPhase::GraphVisualWears,
-                VisualDependencyPhase::Material => MissionLoadPhase::GraphVisualMaterials,
-                VisualDependencyPhase::Texture => MissionLoadPhase::GraphVisualTextures,
-            };
-            if last_graph_visual_phase != Some(runtime_phase) {
-                record_load_phase(&mut trace, &mut on_phase, runtime_phase);
-                last_graph_visual_phase = Some(runtime_phase);
-            }
-            if progress.request_count > 1 {
-                let request_phase = match progress.phase {
-                    VisualDependencyPhase::Wear => None,
-                    VisualDependencyPhase::Material => {
-                        Some(MissionLoadPhase::GraphVisualMaterialRequests {
-                            request_count: progress.request_count,
-                            graph_node_count: progress.graph_node_count,
-                            graph_edge_count: progress.graph_edge_count,
-                            wear_cache_entries: progress.cache_entries.wear_entries,
-                            material_cache_entries: progress.cache_entries.material_entries,
-                            texture_cache_entries: progress.cache_entries.texture_entries,
-                        })
-                    }
-                    VisualDependencyPhase::Texture => {
-                        Some(MissionLoadPhase::GraphVisualTextureRequests {
-                            request_count: progress.request_count,
-                            graph_node_count: progress.graph_node_count,
-                            graph_edge_count: progress.graph_edge_count,
-                            wear_cache_entries: progress.cache_entries.wear_entries,
-                            material_cache_entries: progress.cache_entries.material_entries,
-                            texture_cache_entries: progress.cache_entries.texture_entries,
-                        })
-                    }
-                };
-                if let Some(request_phase) = request_phase {
-                    record_load_phase(&mut trace, &mut on_phase, request_phase);
-                }
-            }
-        },
     );
     if !prototype_report.is_success() {
         return Err(EngineError::PrototypeGraph {
             failures: prototype_report.failures.clone(),
         });
     }
-    record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::Assets);
     let asset_manager = AssetManager::new(repository);
-    let mut last_asset_phase = None;
-    let mut observe_asset_phase = |phase| {
-        let runtime_phase = match phase {
-            AssetPreparationPhase::ModelMesh => MissionLoadPhase::AssetModelMeshes,
-            AssetPreparationPhase::WearTable => MissionLoadPhase::AssetWearTables,
-            AssetPreparationPhase::Materials => MissionLoadPhase::AssetMaterials,
-            AssetPreparationPhase::Textures => MissionLoadPhase::AssetTextures,
-        };
-        if last_asset_phase != Some(runtime_phase) {
-            record_load_phase(&mut trace, &mut on_phase, runtime_phase);
-            last_asset_phase = Some(runtime_phase);
-        }
-    };
     let mission_assets = match options.asset_scope {
-        MissionAssetScope::Full => asset_manager.prepare_mission_assets_with_progress(
+        MissionAssetScope::Full => asset_manager.prepare_mission_assets(
             &prototype_graph.root_prototype_request_spans,
             &resolved_prototypes,
-            &mut observe_asset_phase,
         ),
         MissionAssetScope::FirstMeshPreview => prepare_first_preview_assets(
             &asset_manager,
             &prototype_graph.root_prototype_request_spans,
             &resolved_prototypes,
-            &mut observe_asset_phase,
         ),
-        MissionAssetScope::PreviewRoots(root_count) => asset_manager
-            .prepare_mission_assets_with_progress(
-                &prototype_graph.root_prototype_request_spans[..root_count
-                    .get()
-                    .min(prototype_graph.root_prototype_request_spans.len())],
-                &resolved_prototypes,
-                &mut observe_asset_phase,
-            ),
+        MissionAssetScope::PreviewRoots(root_count) => asset_manager.prepare_mission_assets(
+            &prototype_graph.root_prototype_request_spans[..root_count
+                .get()
+                .min(prototype_graph.root_prototype_request_spans.len())],
+            &resolved_prototypes,
+        ),
     }
     .map_err(|source| EngineError::AssetPreparation {
         mission: request.key.clone(),
@@ -1079,7 +752,6 @@ fn load_mission_with_options_and_progress(
         .collect();
     let mut new_runtime_world = new_world(WorldConfig);
     let mut handles = Vec::with_capacity(mission.objects.len());
-    record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::Construct);
     for (index, object) in mission.objects.iter().enumerate() {
         let original_id = u32::try_from(index).ok().map(OriginalObjectId);
         let handle = construct_object(&mut new_runtime_world, ObjectDraft { original_id })?;
@@ -1094,19 +766,18 @@ fn load_mission_with_options_and_progress(
         )?;
         handles.push(handle);
     }
-    trace.drafts_before_registration = handles.len();
-    record_load_phase(&mut trace, &mut on_phase, MissionLoadPhase::Register);
+    let mut registered_objects = 0;
     for handle in &handles {
-        if options.fail_after_registered_objects == Some(trace.registered_objects) {
+        if options.fail_after_registered_objects == Some(registered_objects) {
             let report = fparkan_world::shutdown(new_runtime_world);
             return Err(EngineError::RegistrationTeardown {
-                registered_objects: trace.registered_objects,
+                registered_objects,
                 released_objects: report.released_objects.len(),
                 managers_released: report.managers_released,
             });
         }
         register_object(&mut new_runtime_world, *handle)?;
-        trace.registered_objects += 1;
+        registered_objects += 1;
     }
 
     let summary = LoadedMission {
@@ -1174,32 +845,17 @@ fn load_mission_with_options_and_progress(
         script_varset_states: loaded_scripts.varset_states,
         script_outcome: MissionScriptOutcome::Active,
     });
-    Ok((summary, trace))
-}
-
-fn record_load_phase(
-    trace: &mut MissionLoadTrace,
-    on_phase: &mut Option<&mut dyn FnMut(MissionLoadPhase)>,
-    phase: MissionLoadPhase,
-) {
-    trace.phases.push(phase);
-    if let Some(observer) = on_phase.as_deref_mut() {
-        observer(phase);
-    }
+    Ok(summary)
 }
 
 fn prepare_first_preview_assets<R: ResourceRepository>(
     asset_manager: &AssetManager<R>,
     root_spans: &[std::ops::Range<usize>],
     prototypes: &[fparkan_prototype::EffectivePrototype],
-    on_phase: &mut dyn FnMut(AssetPreparationPhase),
 ) -> Result<MissionAssets, AssetPreparationError> {
     for span in root_spans {
-        let assets = asset_manager.prepare_mission_assets_with_progress(
-            std::slice::from_ref(span),
-            prototypes,
-            &mut *on_phase,
-        )?;
+        let assets =
+            asset_manager.prepare_mission_assets(std::slice::from_ref(span), prototypes)?;
         if !assets.models.is_empty() {
             return Ok(assets);
         }
@@ -1216,7 +872,9 @@ pub fn step_headless(
     engine: &mut Engine,
     input: InputSnapshot,
 ) -> Result<FrameResult, EngineError> {
-    run_frame(engine, input, SchedulerPresentation::Headless)
+    Ok(FrameResult {
+        snapshot: step(&mut engine.world, &input)?,
+    })
 }
 
 /// Steps rendered mode.
@@ -1225,20 +883,7 @@ pub fn step_headless(
 ///
 /// Returns [`EngineError`] when the world step fails.
 pub fn frame(engine: &mut Engine) -> Result<FrameResult, EngineError> {
-    match engine.config.mode {
-        EngineMode::Headless => step_headless(engine, InputSnapshot),
-        EngineMode::Rendered => run_frame(engine, InputSnapshot, SchedulerPresentation::Rendered),
-    }
-}
-
-/// Shuts down engine.
-///
-/// # Errors
-///
-/// Currently shutdown is infallible, but the `Result` preserves the lifecycle
-/// API for future service teardown failures.
-pub fn shutdown(_engine: Engine) -> Result<(), EngineError> {
-    Ok(())
+    step_headless(engine, InputSnapshot)
 }
 
 /// Returns the loaded mission summary.
@@ -1451,78 +1096,6 @@ pub fn loaded_mission_object_drafts(engine: &Engine) -> Option<&[MissionObjectDr
         .map(|state| state.object_drafts.as_slice())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SchedulerPresentation {
-    Headless,
-    Rendered,
-}
-
-#[derive(Clone, Debug, Default)]
-struct Scheduler {
-    phase: Option<SchedulerPhase>,
-    trace: FrameTrace,
-}
-
-impl Scheduler {
-    fn enter(&mut self, phase: SchedulerPhase) -> Result<(), EngineError> {
-        if let Some(previous) = self.phase {
-            if scheduler_phase_index(phase) <= scheduler_phase_index(previous) {
-                return Err(EngineError::SchedulerPhaseOrder {
-                    previous,
-                    current: phase,
-                });
-            }
-        }
-        self.phase = Some(phase);
-        self.trace.phases.push(phase);
-        Ok(())
-    }
-
-    fn finish(self) -> FrameTrace {
-        self.trace
-    }
-}
-
-fn run_frame(
-    engine: &mut Engine,
-    input: InputSnapshot,
-    presentation: SchedulerPresentation,
-) -> Result<FrameResult, EngineError> {
-    let mut scheduler = Scheduler::default();
-    scheduler.enter(SchedulerPhase::CollectPlatformEvents)?;
-    scheduler.enter(SchedulerPhase::BuildInputSnapshot)?;
-    scheduler.enter(SchedulerPhase::AdvanceGameClock)?;
-    scheduler.enter(SchedulerPhase::CalculateWorldQueue)?;
-    let snapshot = step(&mut engine.world, &input)?;
-    scheduler.enter(SchedulerPhase::ApplyDeferredOperations)?;
-    scheduler.enter(SchedulerPhase::UpdateAnimationAndEffects)?;
-    if presentation == SchedulerPresentation::Rendered {
-        scheduler.enter(SchedulerPhase::PublishRenderSnapshot)?;
-        scheduler.enter(SchedulerPhase::RenderWorld)?;
-    }
-    scheduler.enter(SchedulerPhase::EndFrameCallbacks)?;
-    scheduler.enter(SchedulerPhase::Maintenance)?;
-    Ok(FrameResult {
-        snapshot,
-        trace: scheduler.finish(),
-    })
-}
-
-fn scheduler_phase_index(phase: SchedulerPhase) -> u8 {
-    match phase {
-        SchedulerPhase::CollectPlatformEvents => 0,
-        SchedulerPhase::BuildInputSnapshot => 1,
-        SchedulerPhase::AdvanceGameClock => 2,
-        SchedulerPhase::CalculateWorldQueue => 3,
-        SchedulerPhase::ApplyDeferredOperations => 4,
-        SchedulerPhase::UpdateAnimationAndEffects => 5,
-        SchedulerPhase::PublishRenderSnapshot => 6,
-        SchedulerPhase::RenderWorld => 7,
-        SchedulerPhase::EndFrameCallbacks => 8,
-        SchedulerPhase::Maintenance => 9,
-    }
-}
-
 fn normalize_engine_path(role: &'static str, value: &str) -> Result<NormalizedPath, EngineError> {
     normalize_relative(value.as_bytes(), PathPolicy::StrictLegacy).map_err(|source| {
         EngineError::Path {
@@ -1702,7 +1275,7 @@ fn handler19_x87_truncated_u32(
     }
     // ai.dll's __ftol saves the x87 control word, sets rounding-control bits
     // to truncate, performs `fistp qword`, and restores the control word.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+
     let word = value.trunc() as u32;
     Ok(word)
 }
@@ -1758,13 +1331,7 @@ mod tests {
 
     #[test]
     fn load_mission_requires_vfs_and_keeps_world_unchanged_on_error() {
-        let mut engine = create(
-            EngineConfig {
-                mode: EngineMode::Headless,
-            },
-            EngineServices::default(),
-        )
-        .expect("engine");
+        let mut engine = create(EngineServices::default()).expect("engine");
         let before = step_headless(&mut engine, InputSnapshot).expect("step");
         let err = load_mission(
             &mut engine,
@@ -1776,30 +1343,6 @@ mod tests {
         assert!(matches!(err, EngineError::MissingVfs));
         let after = step_headless(&mut engine, InputSnapshot).expect("step");
         assert_eq!(before.snapshot.objects, after.snapshot.objects);
-    }
-
-    #[test]
-    fn load_progress_reports_context_before_missing_vfs_error() {
-        let mut engine = create(
-            EngineConfig {
-                mode: EngineMode::Headless,
-            },
-            EngineServices::default(),
-        )
-        .expect("engine");
-        let mut phases = Vec::new();
-
-        let err = load_mission_with_progress(
-            &mut engine,
-            MissionRequest {
-                key: "MISSIONS/Autodemo.00/data.tma".to_string(),
-            },
-            |phase| phases.push(phase),
-        )
-        .expect_err("missing VFS");
-
-        assert!(matches!(err, EngineError::MissingVfs));
-        assert_eq!(phases, vec![MissionLoadPhase::Context]);
     }
 
     #[test]
@@ -1997,87 +1540,8 @@ mod tests {
     }
 
     #[test]
-    fn headless_scheduler_trace_skips_presentation_phases() {
-        let mut engine = create(
-            EngineConfig {
-                mode: EngineMode::Headless,
-            },
-            EngineServices::default(),
-        )
-        .expect("engine");
-
-        let result = frame(&mut engine).expect("frame");
-
-        assert_eq!(result.snapshot.tick.0, 1);
-        assert_eq!(
-            result.trace.phases,
-            vec![
-                SchedulerPhase::CollectPlatformEvents,
-                SchedulerPhase::BuildInputSnapshot,
-                SchedulerPhase::AdvanceGameClock,
-                SchedulerPhase::CalculateWorldQueue,
-                SchedulerPhase::ApplyDeferredOperations,
-                SchedulerPhase::UpdateAnimationAndEffects,
-                SchedulerPhase::EndFrameCallbacks,
-                SchedulerPhase::Maintenance,
-            ]
-        );
-    }
-
-    #[test]
-    fn rendered_scheduler_trace_includes_presentation_after_simulation() {
-        let mut engine = create(
-            EngineConfig {
-                mode: EngineMode::Rendered,
-            },
-            EngineServices::default(),
-        )
-        .expect("engine");
-
-        let result = frame(&mut engine).expect("frame");
-
-        assert_eq!(
-            result.trace.phases,
-            vec![
-                SchedulerPhase::CollectPlatformEvents,
-                SchedulerPhase::BuildInputSnapshot,
-                SchedulerPhase::AdvanceGameClock,
-                SchedulerPhase::CalculateWorldQueue,
-                SchedulerPhase::ApplyDeferredOperations,
-                SchedulerPhase::UpdateAnimationAndEffects,
-                SchedulerPhase::PublishRenderSnapshot,
-                SchedulerPhase::RenderWorld,
-                SchedulerPhase::EndFrameCallbacks,
-                SchedulerPhase::Maintenance,
-            ]
-        );
-    }
-
-    #[test]
-    fn scheduler_rejects_phase_regressions() {
-        let mut scheduler = Scheduler::default();
-        scheduler
-            .enter(SchedulerPhase::BuildInputSnapshot)
-            .expect("enter build input");
-
-        assert!(matches!(
-            scheduler.enter(SchedulerPhase::CollectPlatformEvents),
-            Err(EngineError::SchedulerPhaseOrder {
-                previous: SchedulerPhase::BuildInputSnapshot,
-                current: SchedulerPhase::CollectPlatformEvents,
-            })
-        ));
-    }
-
-    #[test]
     fn reference_movement_rejects_non_finite_or_non_positive_input() {
-        let mut engine = create(
-            EngineConfig {
-                mode: EngineMode::Headless,
-            },
-            EngineServices::default(),
-        )
-        .expect("engine");
+        let mut engine = create(EngineServices::default()).expect("engine");
 
         let err =
             advance_reference_movement(&mut engine, OriginalObjectId(0), [f32::NAN, 0.0], 1.0)
@@ -2095,59 +1559,10 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
-    fn load_trace_records_preparation_before_registration_and_raw_transforms() {
-        let root = licensed_root("IS");
-        let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(&root));
-        let mut engine = create(
-            EngineConfig {
-                mode: EngineMode::Headless,
-            },
-            EngineServices::new(vfs),
-        )
-        .expect("engine");
-
-        let (loaded, trace) = load_mission_with_trace(
-            &mut engine,
-            MissionRequest {
-                key: "MISSIONS/Autodemo.00/data.tma".to_string(),
-            },
-        )
-        .expect("load mission with trace");
-
-        assert_eq!(
-            trace.phases,
-            vec![
-                MissionLoadPhase::Context,
-                MissionLoadPhase::Map,
-                MissionLoadPhase::Tma,
-                MissionLoadPhase::Graph,
-                MissionLoadPhase::GraphVisuals,
-                MissionLoadPhase::Assets,
-                MissionLoadPhase::Construct,
-                MissionLoadPhase::Register,
-            ]
-        );
-        assert_eq!(trace.drafts_before_registration, loaded.object_count);
-        assert_eq!(trace.registered_objects, loaded.object_count);
-        assert_eq!(trace.transforms.len(), loaded.object_count);
-        assert!(trace.transforms.iter().all(|transform| transform
-            .orientation_raw
-            .iter()
-            .all(|component| component.is_finite())));
-    }
-
-    #[test]
-    #[ignore = "requires licensed corpus"]
     fn reference_movement_snaps_a_live_mission_object_to_terrain() {
         let root = licensed_root("IS");
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(&root));
-        let mut engine = create(
-            EngineConfig {
-                mode: EngineMode::Headless,
-            },
-            EngineServices::new(vfs),
-        )
-        .expect("engine");
+        let mut engine = create(EngineServices::new(vfs)).expect("engine");
         load_mission(
             &mut engine,
             MissionRequest {
@@ -2221,13 +1636,7 @@ mod tests {
                 inner: DirectoryVfs::new(&root),
                 denied,
             });
-            let mut engine = create(
-                EngineConfig {
-                    mode: EngineMode::Headless,
-                },
-                EngineServices::new(vfs),
-            )
-            .expect("engine");
+            let mut engine = create(EngineServices::new(vfs)).expect("engine");
             let before = step_headless(&mut engine, InputSnapshot).expect("before");
             let err = load_mission(&mut engine, mission).expect_err("load error");
             match denied {
@@ -2248,16 +1657,10 @@ mod tests {
     fn registration_phase_failure_uses_normal_teardown_and_keeps_engine_world() {
         let root = licensed_root("IS");
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(root));
-        let mut engine = create(
-            EngineConfig {
-                mode: EngineMode::Headless,
-            },
-            EngineServices::new(vfs),
-        )
-        .expect("engine");
+        let mut engine = create(EngineServices::new(vfs)).expect("engine");
         let before = step_headless(&mut engine, InputSnapshot).expect("before");
 
-        let err = load_mission_with_options_and_progress(
+        let err = load_mission_with_options(
             &mut engine,
             MissionRequest {
                 key: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.01/data.tma".to_string(),
@@ -2266,7 +1669,6 @@ mod tests {
                 fail_after_registered_objects: Some(1),
                 ..MissionLoadOptions::default()
             },
-            None,
         )
         .expect_err("forced registration failure");
 
@@ -2326,13 +1728,7 @@ mod tests {
         ] {
             let root = local_testdata_root(case.0);
             let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(root));
-            let mut engine = create(
-                EngineConfig {
-                    mode: EngineMode::Headless,
-                },
-                EngineServices::new(vfs),
-            )
-            .expect("engine");
+            let mut engine = create(EngineServices::new(vfs)).expect("engine");
             let loaded = load_mission(
                 &mut engine,
                 MissionRequest {
@@ -2440,13 +1836,7 @@ mod tests {
     fn run_headless_case(case: HeadlessCase) -> WorldSnapshot {
         let root = licensed_root(case.root);
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(root));
-        let mut engine = create(
-            EngineConfig {
-                mode: EngineMode::Headless,
-            },
-            EngineServices::new(vfs),
-        )
-        .expect("engine");
+        let mut engine = create(EngineServices::new(vfs)).expect("engine");
         let loaded = load_mission(
             &mut engine,
             MissionRequest {
@@ -2474,13 +1864,7 @@ mod tests {
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(root));
         let mut totals = LoadTotals::default();
         for mission in missions {
-            let mut engine = create(
-                EngineConfig {
-                    mode: EngineMode::Headless,
-                },
-                EngineServices::new(vfs.clone()),
-            )
-            .expect("engine");
+            let mut engine = create(EngineServices::new(vfs.clone())).expect("engine");
             let loaded = load_mission(&mut engine, MissionRequest { key: mission })
                 .expect("load mission foundation");
             assert_eq!(loaded.object_count, loaded.registered_objects);

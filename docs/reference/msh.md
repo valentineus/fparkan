@@ -47,7 +47,7 @@ Validated `ModelAsset` также сохраняет decoded type 8 keys и type
 `ModelAnimation`. `node38_fallback_pose` возвращает pose по `fallback_key`,
 то есть доказанный static input. `parent_or_link == 0xFFFF` означает root;
 иначе это parent index, обязательно меньший индекса child. Этот контракт
-подтверждён на licensed animation gates обеих частей и защищён fallback-ом:
+подтверждён на тестах анимации с оригинальными ресурсами обеих частей и защищён fallback-ом:
 модель с нарушенным порядком не получает придуманную hierarchy.
 
 В legacy-camera static preview стандартный узел уже получает свой fallback pose
@@ -57,10 +57,6 @@ pose применяется `Rz * Ry * Rx`, scale и mission translation. Гео
 намеренно дублируется на draw-range узла, потому что один source vertex может
 быть нарисован разными node poses. Это static fallback hierarchy, а не полная
 animation parity: dynamic type-19 frame-map sampling остаётся отдельной задачей.
-
-Для воспроизводимого исследования `fparkan-cli model inspect --root <game>
---archive <archive> --resource <model.msh>` выводит Node38 metadata, включая
-parent index, fallback key и наличие LOD0/group0 geometry.
 
 ## Slot and batch
 

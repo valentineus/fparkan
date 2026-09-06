@@ -17,7 +17,7 @@ use super::{
     VulkanValidationReport,
 };
 use crate::policy::KHR_PORTABILITY_SUBSET_EXTENSION;
-use crate::shader_manifest::{triangle_shader_manifest, validate_shader_manifest};
+use crate::shader::validate_triangle_shaders;
 
 #[cfg(test)]
 fn take_runtime_owners_in_dependency_order<Instance, Validation, Surface, Device, Swapchain>(
@@ -103,7 +103,7 @@ impl VulkanSmokeRenderer {
     ///
     /// Returns [`VulkanSmokeRendererError`] when Vulkan bootstrap, pipeline creation,
     /// memory allocation, or synchronization resource creation fails.
-    #[allow(clippy::too_many_lines)]
+
     pub fn new(
         create_info: &VulkanSmokeRendererCreateInfo,
     ) -> Result<Self, VulkanSmokeRendererError> {
@@ -120,8 +120,7 @@ impl VulkanSmokeRenderer {
             resolve_draw_texture_indices(&create_info.mesh.draw_ranges, &create_info.materials)
                 .map_err(|context| VulkanSmokeRendererError::InvalidStaticMesh { context })?;
         let bootstrap_progress = create_info.bootstrap_progress.as_ref();
-        let shader_manifest = validate_shader_manifest(&triangle_shader_manifest())
-            .map_err(VulkanSmokeRendererError::ShaderManifest)?;
+        validate_triangle_shaders().map_err(VulkanSmokeRendererError::Shader)?;
         let surface_plan = plan_vulkan_surface(Some(create_info.native_handles))
             .map_err(VulkanSmokeRendererError::Surface)?;
         let mut instance_config = VulkanInstanceConfig::smoke(&create_info.application_name);
@@ -240,7 +239,6 @@ impl VulkanSmokeRenderer {
             pending_extent: None,
             swapchain_recreate_count: 0,
             report: VulkanSmokeRendererReport {
-                shader_manifest_hash: shader_manifest.manifest_hash.clone(),
                 portability_enumeration: instance_config.enable_portability_enumeration,
                 portability_subset_enabled: false,
                 device_name: String::new(),
@@ -260,7 +258,6 @@ impl VulkanSmokeRenderer {
         let device_ref = renderer.device_ref()?;
         let swapchain_ref = renderer.swapchain_ref()?;
         renderer.report = VulkanSmokeRendererReport {
-            shader_manifest_hash: shader_manifest.manifest_hash,
             portability_enumeration: renderer
                 .instance
                 .as_ref()
@@ -426,7 +423,7 @@ impl VulkanSmokeRenderer {
     ///
     /// Returns [`VulkanSmokeRendererError`] when synchronization, command recording,
     /// submission, or presentation fails.
-    #[allow(clippy::too_many_lines)]
+
     pub fn draw_frame(&mut self) -> Result<VulkanSmokeFrameOutcome, VulkanSmokeRendererError> {
         if let Some(extent) = self.pending_extent.take() {
             if extent.0 == 0 || extent.1 == 0 {
@@ -632,7 +629,6 @@ impl VulkanSmokeRenderer {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
     fn record_command_buffer(
         &mut self,
         image_index: usize,

@@ -45,7 +45,6 @@ struct PartialSwapchainResources {
     command_buffers: Vec<vk::CommandBuffer>,
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn create_swapchain_resources(
     instance: &VulkanInstanceProbe,
     device: &VulkanLogicalDeviceProbe,
@@ -205,7 +204,6 @@ fn create_swapchain_image_views(
     Ok(image_views)
 }
 
-#[allow(clippy::type_complexity)]
 fn create_swapchain_pipeline_bundle(
     instance: &VulkanInstanceProbe,
     device: &VulkanLogicalDeviceProbe,
@@ -433,7 +431,6 @@ fn create_pipeline_layout(
     })
 }
 
-#[allow(clippy::too_many_lines)]
 fn create_texture_descriptor_bundle(
     device: &VulkanLogicalDeviceProbe,
     textures: &[VulkanAllocatedImage],
@@ -554,12 +551,10 @@ fn create_texture_descriptor_bundle(
     Ok((layout, pool, descriptor_sets, sampler))
 }
 
-#[allow(clippy::cast_precision_loss)]
 fn extent_component_to_f32(value: u32) -> f32 {
     value as f32
 }
 
-#[allow(clippy::too_many_lines)]
 fn create_graphics_pipeline_cache(
     device: &VulkanLogicalDeviceProbe,
     render_pass: vk::RenderPass,
@@ -596,7 +591,6 @@ fn create_graphics_pipeline_cache(
     Ok(pipelines)
 }
 
-#[allow(clippy::too_many_lines)]
 fn create_graphics_pipeline(
     device: &VulkanLogicalDeviceProbe,
     render_pass: vk::RenderPass,

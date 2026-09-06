@@ -1,23 +1,4 @@
 #![forbid(unsafe_code)]
-#![cfg_attr(
-    test,
-    allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        clippy::cast_precision_loss,
-        clippy::expect_used,
-        clippy::float_cmp,
-        clippy::identity_op,
-        clippy::too_many_lines,
-        clippy::uninlined_format_args,
-        clippy::map_unwrap_or,
-        clippy::needless_raw_string_hashes,
-        clippy::semicolon_if_nothing_returned,
-        clippy::type_complexity,
-        clippy::panic,
-        clippy::unwrap_used
-    )
-)]
 //! Asset manager ports and transactional preparation models.
 
 use fparkan_material::{
@@ -35,24 +16,24 @@ use fparkan_prototype::{
     PrototypeGraphFailure, PrototypeGraphNodeKind, PrototypeGraphProvenance, PrototypeGraphReport,
     PrototypeGraphRequiredness,
 };
-use fparkan_resource::{ResourceError, ResourceKey, ResourceRepository};
+use fparkan_resource::{CachedResourceRepository, ResourceError, ResourceKey, ResourceRepository};
 pub use fparkan_terrain::{TerrainError, TerrainWorld};
 use fparkan_terrain_format::{decode_build_dat, decode_land_map, decode_land_msh};
 pub use fparkan_terrain_format::{BuildCategory, TerrainFormatError};
 use fparkan_texm::{decode_mip_rgba8, decode_texm, RgbaImage, TexmDocument, TexmError};
+use fparkan_vfs::DirectoryVfs;
 use std::collections::{hash_map::Entry, HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
+use std::path::Path;
 use std::sync::Arc;
 
 const TEXTURES_ARCHIVE: &str = "textures.lib";
 const LIGHTMAP_ARCHIVE: &str = "lightmap.lib";
-const VISUAL_DEPENDENCY_PROGRESS_INTERVAL: usize = 64;
 
 type WearValidationCache =
     HashMap<(NormalizedPath, Vec<u8>), Result<fparkan_material::WearTable, String>>;
-type TextureValidationCache = HashMap<Vec<u8>, Result<(), String>>;
 
 /// Canonical terrain archive paths derived from a mission land reference.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -186,6 +167,37 @@ pub fn decode_nres_payload(
     bytes: Arc<[u8]>,
 ) -> Result<fparkan_nres::NresDocument, fparkan_nres::NresError> {
     decode_nres(bytes, ReadProfile::Compatible)
+}
+
+/// Loads a phase-zero diffuse texture from a map-local standalone WEAR file.
+///
+/// The sidecar stays beside `Land.msh`; MAT0 and TEXM remain in the normal
+/// game-root archives.
+pub fn load_standalone_wear_material_texture_mip0_rgba8_from_root(
+    root: &Path,
+    wear_path: &Path,
+    material_index: u16,
+) -> Result<RgbaImage, String> {
+    let wear = decode_wear(
+        &std::fs::read(wear_path).map_err(|err| format!("{}: {err}", wear_path.display()))?,
+    )
+    .map_err(|err| err.to_string())?;
+    let repository = CachedResourceRepository::new(Arc::new(DirectoryVfs::new(root)));
+    let material =
+        resolve_material(&repository, &wear, material_index).map_err(|err| err.to_string())?;
+    let texture = material.document.primary_texture().ok_or_else(|| {
+        "MAT0 phase zero declares an intentionally untextured material".to_string()
+    })?;
+    let key = ResourceKey {
+        archive: parse_path(TEXTURES_ARCHIVE).map_err(|err| err.to_string())?,
+        name: texture.clone(),
+        type_id: None,
+    };
+    let bytes = read_optional_key(&repository, &key, Some("texture"))
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| format!("missing texture {texture:?}"))?;
+    let document = decode_texm(bytes).map_err(|err| err.to_string())?;
+    decode_mip_rgba8(&document, 0).map_err(|err| err.to_string())
 }
 
 /// Decodes terrain documents and builds immutable terrain state.
@@ -494,56 +506,6 @@ pub struct AssetPreparationReport {
     pub texture_pixels: u64,
 }
 
-/// Asset preparation checkpoint emitted while resolving visual dependencies.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AssetPreparationPhase {
-    /// Decode and validate an MSH model.
-    ModelMesh,
-    /// Decode the corresponding WEAR table.
-    WearTable,
-    /// Resolve MAT0 material documents referenced by a WEAR table.
-    Materials,
-    /// Decode diffuse textures and baked lightmaps.
-    Textures,
-}
-
-/// Visual dependency class currently being expanded into a prototype graph.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum VisualDependencyPhase {
-    /// Resolve a mesh's WEAR table.
-    Wear,
-    /// Resolve MAT0 material documents selected by WEAR.
-    Material,
-    /// Validate diffuse TEXM textures and lightmaps.
-    Texture,
-}
-
-/// Validation-cache entries retained while expanding visual dependencies.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct VisualDependencyCacheCounts {
-    /// Distinct WEAR archive/name keys resolved so far.
-    pub wear_entries: usize,
-    /// Distinct MAT0 raw names resolved so far.
-    pub material_entries: usize,
-    /// Distinct TEXM archive/name keys resolved so far.
-    pub texture_entries: usize,
-}
-
-/// Throttled visual-dependency expansion progress.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct VisualDependencyProgress {
-    /// Dependency class currently being expanded.
-    pub phase: VisualDependencyPhase,
-    /// Number of requests reached in this class during the current expansion.
-    pub request_count: usize,
-    /// Resource graph nodes materialized before this request is resolved.
-    pub graph_node_count: usize,
-    /// Resource graph edges materialized before this request is resolved.
-    pub graph_edge_count: usize,
-    /// Validation-cache entries retained before this request is resolved.
-    pub cache_entries: VisualDependencyCacheCounts,
-}
-
 /// Errors raised while preparing CPU-side assets.
 #[derive(Debug)]
 pub enum AssetError {
@@ -660,25 +622,6 @@ impl<R: ResourceRepository> AssetManager<R> {
         prepare_mission_assets_with_repository(&self.repository, root_prototype_spans, prototypes)
     }
 
-    /// Builds mission assets and reports the active dependency class.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AssetError`] if any visual dependency is missing or malformed.
-    pub fn prepare_mission_assets_with_progress(
-        &self,
-        root_prototype_spans: &[std::ops::Range<usize>],
-        prototypes: &[EffectivePrototype],
-        on_phase: impl FnMut(AssetPreparationPhase),
-    ) -> Result<MissionAssets, AssetError> {
-        prepare_mission_assets_with_repository_with_progress(
-            &self.repository,
-            root_prototype_spans,
-            prototypes,
-            on_phase,
-        )
-    }
-
     /// Builds mission assets together with a bounded preparation report.
     ///
     /// # Errors
@@ -764,28 +707,6 @@ pub fn prepare_mission_assets_with_repository<R: ResourceRepository>(
     .0)
 }
 
-/// Builds mission assets and reports the active dependency class.
-///
-/// # Errors
-///
-/// Returns [`AssetError`] if any visual dependency is missing or malformed.
-pub fn prepare_mission_assets_with_repository_with_progress<R: ResourceRepository>(
-    repository: &R,
-    root_prototype_spans: &[std::ops::Range<usize>],
-    prototypes: &[EffectivePrototype],
-    mut on_phase: impl FnMut(AssetPreparationPhase),
-) -> Result<MissionAssets, AssetError> {
-    Ok(prepare_mission_assets_with_repository_internal(
-        repository,
-        root_prototype_spans,
-        prototypes,
-        AssetIdentityPolicy::default(),
-        AssetPreparationLimits::default(),
-        &mut on_phase,
-    )?
-    .0)
-}
-
 /// Builds mission assets while enforcing explicit preparation limits.
 ///
 /// # Errors
@@ -798,27 +719,24 @@ pub fn prepare_mission_assets_profiled_with_repository<R: ResourceRepository>(
     prototypes: &[EffectivePrototype],
     limits: AssetPreparationLimits,
 ) -> Result<(MissionAssets, AssetPreparationReport), AssetError> {
-    let mut ignore_phase = |_| {};
     prepare_mission_assets_with_repository_internal(
         repository,
         root_prototype_spans,
         prototypes,
         AssetIdentityPolicy::default(),
         limits,
-        &mut ignore_phase,
     )
 }
 
 // This orchestration intentionally keeps preparation, deduplication, and limit enforcement
 // together so all fallible asset construction remains transactional.
-#[allow(clippy::too_many_lines)]
+
 fn prepare_mission_assets_with_repository_internal<R: ResourceRepository>(
     repository: &R,
     root_prototype_spans: &[std::ops::Range<usize>],
     prototypes: &[EffectivePrototype],
     identity_policy: AssetIdentityPolicy,
     limits: AssetPreparationLimits,
-    on_phase: &mut dyn FnMut(AssetPreparationPhase),
 ) -> Result<(MissionAssets, AssetPreparationReport), AssetError> {
     if prototypes.is_empty() {
         return Ok((MissionAssets::default(), AssetPreparationReport::default()));
@@ -858,7 +776,6 @@ fn prepare_mission_assets_with_repository_internal<R: ResourceRepository>(
                     proto,
                     identity_policy,
                     &mut preparation_cache,
-                    on_phase,
                 )?;
                 if bundle.visual.id != visual_id {
                     // Defensive check. stable IDs are deterministic for the same inputs.
@@ -1173,73 +1090,17 @@ fn enforce_asset_preparation_limits(
 /// the path policy, which indicates a programming error in this module.
 // The graph expansion is deliberately a single transactional traversal so every generated
 // edge receives the correct parent provenance and node/edge sequence.
-#[allow(clippy::too_many_lines)]
+
 pub fn extend_graph_report_with_visual_dependencies<R: ResourceRepository>(
     repository: &R,
     report: &mut PrototypeGraphReport,
     graph: &mut PrototypeGraph,
     prototypes: &[EffectivePrototype],
 ) {
-    extend_graph_report_with_visual_dependencies_and_progress(
-        repository,
-        report,
-        graph,
-        prototypes,
-        |_| {},
-    );
-}
-
-/// Extends a prototype dependency report while reporting each visual dependency class.
-///
-/// # Panics
-///
-/// Panics only if the hard-coded, host-compatible `material.lib` path stops
-/// satisfying the path policy, which indicates a programming error in this module.
-#[allow(clippy::too_many_lines)]
-pub fn extend_graph_report_with_visual_dependencies_and_progress<R: ResourceRepository>(
-    repository: &R,
-    report: &mut PrototypeGraphReport,
-    graph: &mut PrototypeGraph,
-    prototypes: &[EffectivePrototype],
-    mut on_phase: impl FnMut(VisualDependencyPhase),
-) {
-    let mut last_phase = None;
-    extend_graph_report_with_visual_dependencies_with_progress(
-        repository,
-        report,
-        graph,
-        prototypes,
-        |progress| {
-            if last_phase != Some(progress.phase) {
-                on_phase(progress.phase);
-                last_phase = Some(progress.phase);
-            }
-        },
-    );
-}
-
-/// Extends a prototype dependency report with throttled request progress.
-///
-/// The callback receives each dependency-class entrance, its first request,
-/// and every subsequent multiple of 64 requests. Graph traversal, edge order
-/// and validation remain unchanged.
-///
-/// # Panics
-///
-/// Panics only if the hard-coded, host-compatible `material.lib` path stops
-/// satisfying the path policy, which indicates a programming error in this module.
-#[allow(clippy::too_many_lines)]
-pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRepository>(
-    repository: &R,
-    report: &mut PrototypeGraphReport,
-    graph: &mut PrototypeGraph,
-    prototypes: &[EffectivePrototype],
-    mut on_progress: impl FnMut(VisualDependencyProgress),
-) {
     if graph.visual_dependencies_expanded {
         return;
     }
-    #[allow(clippy::expect_used)]
+
     let material_archive = parse_path("material.lib")
         .expect("static material archive path must satisfy host-compatible normalization");
     let mut next_node = graph
@@ -1258,9 +1119,6 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
     let mut lightmap_texture_validation = HashMap::new();
     let mut material_validation = HashMap::new();
     let mut wear_validation = HashMap::new();
-    let mut wear_requests = 0usize;
-    let mut material_requests = 0usize;
-    let mut texture_requests = 0usize;
     // Capture all base-graph anchors before this traversal appends visual
     // resources and edges. Looking them up again from the growing graph would
     // make each later prototype scan an ever larger collection.
@@ -1288,22 +1146,6 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
         let unit_component_index =
             mesh_parent_edge.and_then(|edge| unit_component_index_for_edge(graph, edge));
 
-        wear_requests = wear_requests.saturating_add(1);
-        report_visual_dependency_progress(
-            &mut on_progress,
-            VisualDependencyProgress {
-                phase: VisualDependencyPhase::Wear,
-                request_count: wear_requests,
-                graph_node_count: graph.nodes.len(),
-                graph_edge_count: graph.edges.len(),
-                cache_entries: visual_dependency_cache_counts(
-                    &wear_validation,
-                    &material_validation,
-                    &diffuse_texture_validation,
-                    &lightmap_texture_validation,
-                ),
-            },
-        );
         match resolve_wear_table_cached(repository, mesh, &mut wear_validation) {
             Ok(table) => {
                 report.wear_resolved_count += 1;
@@ -1343,35 +1185,7 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
                     &mut next_edge,
                 );
                 report.material_slot_count += table.entries.len();
-                on_progress(VisualDependencyProgress {
-                    phase: VisualDependencyPhase::Material,
-                    request_count: material_requests,
-                    graph_node_count: graph.nodes.len(),
-                    graph_edge_count: graph.edges.len(),
-                    cache_entries: visual_dependency_cache_counts(
-                        &wear_validation,
-                        &material_validation,
-                        &diffuse_texture_validation,
-                        &lightmap_texture_validation,
-                    ),
-                });
                 for (material_index, _entry) in table.entries.iter().enumerate() {
-                    material_requests = material_requests.saturating_add(1);
-                    report_visual_dependency_progress(
-                        &mut on_progress,
-                        VisualDependencyProgress {
-                            phase: VisualDependencyPhase::Material,
-                            request_count: material_requests,
-                            graph_node_count: graph.nodes.len(),
-                            graph_edge_count: graph.edges.len(),
-                            cache_entries: visual_dependency_cache_counts(
-                                &wear_validation,
-                                &material_validation,
-                                &diffuse_texture_validation,
-                                &lightmap_texture_validation,
-                            ),
-                        },
-                    );
                     let Ok(material_index) = u16::try_from(material_index) else {
                         push_visual_failure(
                             report,
@@ -1418,22 +1232,6 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
                                 &mut next_edge,
                             );
                             for texture in material.document.texture_requests() {
-                                texture_requests = texture_requests.saturating_add(1);
-                                report_visual_dependency_progress(
-                                    &mut on_progress,
-                                    VisualDependencyProgress {
-                                        phase: VisualDependencyPhase::Texture,
-                                        request_count: texture_requests,
-                                        graph_node_count: graph.nodes.len(),
-                                        graph_edge_count: graph.edges.len(),
-                                        cache_entries: visual_dependency_cache_counts(
-                                            &wear_validation,
-                                            &material_validation,
-                                            &diffuse_texture_validation,
-                                            &lightmap_texture_validation,
-                                        ),
-                                    },
-                                );
                                 report.texture_request_count += 1;
                                 match resolve_texm_validation_cached(
                                     repository,
@@ -1495,22 +1293,6 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
                     }
                 }
                 for lightmap in &table.lightmaps {
-                    texture_requests = texture_requests.saturating_add(1);
-                    report_visual_dependency_progress(
-                        &mut on_progress,
-                        VisualDependencyProgress {
-                            phase: VisualDependencyPhase::Texture,
-                            request_count: texture_requests,
-                            graph_node_count: graph.nodes.len(),
-                            graph_edge_count: graph.edges.len(),
-                            cache_entries: visual_dependency_cache_counts(
-                                &wear_validation,
-                                &material_validation,
-                                &diffuse_texture_validation,
-                                &lightmap_texture_validation,
-                            ),
-                        },
-                    );
                     report.lightmap_request_count += 1;
                     match resolve_texm_validation_cached(
                         repository,
@@ -1572,34 +1354,6 @@ pub fn extend_graph_report_with_visual_dependencies_with_progress<R: ResourceRep
         }
     }
     graph.visual_dependencies_expanded = true;
-}
-
-fn report_visual_dependency_progress(
-    on_progress: &mut impl FnMut(VisualDependencyProgress),
-    progress: VisualDependencyProgress,
-) {
-    if progress.request_count == 1
-        || progress
-            .request_count
-            .is_multiple_of(VISUAL_DEPENDENCY_PROGRESS_INTERVAL)
-    {
-        on_progress(progress);
-    }
-}
-
-fn visual_dependency_cache_counts(
-    wear_validation: &WearValidationCache,
-    material_validation: &HashMap<Vec<u8>, Result<ResolvedMaterial, String>>,
-    diffuse_texture_validation: &TextureValidationCache,
-    lightmap_texture_validation: &TextureValidationCache,
-) -> VisualDependencyCacheCounts {
-    VisualDependencyCacheCounts {
-        wear_entries: wear_validation.len(),
-        material_entries: material_validation.len(),
-        texture_entries: diffuse_texture_validation
-            .len()
-            .saturating_add(lightmap_texture_validation.len()),
-    }
 }
 
 fn push_graph_resource_node(
@@ -1738,7 +1492,6 @@ pub fn prepare_visual_with_repository<R: ResourceRepository>(
         proto,
         AssetIdentityPolicy::default(),
         &mut preparation_cache,
-        &mut |_| {},
     )?
     .visual)
 }
@@ -1761,13 +1514,12 @@ struct PreparationCache {
 }
 
 // Keeps the complete model -> WEAR -> material -> texture transaction in one fallible boundary.
-#[allow(clippy::too_many_lines)]
+
 fn prepare_visual_with_repository_internal<R: ResourceRepository>(
     repository: &R,
     proto: &EffectivePrototype,
     identity_policy: AssetIdentityPolicy,
     preparation_cache: &mut PreparationCache,
-    on_phase: &mut dyn FnMut(AssetPreparationPhase),
 ) -> Result<PreparedVisualBundle, AssetError> {
     let PrototypeGeometry::Mesh(mesh_key) = &proto.geometry else {
         return Ok(PreparedVisualBundle {
@@ -1779,7 +1531,6 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
         });
     };
 
-    on_phase(AssetPreparationPhase::ModelMesh);
     let model = prepare_model_cached(repository, mesh_key, preparation_cache)?;
     let model_id = AssetId::new((identity_policy.model)(proto));
     let prepared_model = PreparedModel {
@@ -1795,7 +1546,6 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
         name: wear_name,
         type_id: Some(WEAR_KIND),
     };
-    on_phase(AssetPreparationPhase::WearTable);
     let wear = prepare_wear_cached(repository, &wear_key, preparation_cache)?;
     let wear_id = AssetId::new((identity_policy.wear)(proto));
     let prepared_wear = PreparedWear {
@@ -1817,7 +1567,6 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
         .iter()
         .map(|lightmap| lightmap.lightmap.clone())
         .collect();
-    on_phase(AssetPreparationPhase::Materials);
     for material_index in 0..wear.entries.len() {
         let material_index = u16::try_from(material_index).map_err(|_| {
             AssetError::InvalidPrototype("material index does not fit archive format".to_string())
@@ -1847,7 +1596,6 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
         });
 
         for texture in texture_requests {
-            on_phase(AssetPreparationPhase::Textures);
             let prepared_texture = prepare_texture_cached(
                 repository,
                 &texture,
@@ -1862,7 +1610,6 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
     }
 
     for lightmap in &wear.lightmaps {
-        on_phase(AssetPreparationPhase::Textures);
         let prepared_lightmap = prepare_texture_cached(
             repository,
             &lightmap.lightmap,
@@ -2449,66 +2196,6 @@ mod tests {
     use fparkan_resource::{resource_name, CachedResourceRepository};
     use fparkan_vfs::{DirectoryVfs, MemoryVfs, Vfs};
     use std::path::PathBuf;
-
-    #[test]
-    fn visual_dependency_progress_is_throttled_at_fixed_request_intervals() {
-        let mut progress = Vec::new();
-        for request_count in 1..=129 {
-            report_visual_dependency_progress(
-                &mut |event| progress.push(event),
-                VisualDependencyProgress {
-                    phase: VisualDependencyPhase::Texture,
-                    request_count,
-                    graph_node_count: 37,
-                    graph_edge_count: 41,
-                    cache_entries: VisualDependencyCacheCounts {
-                        wear_entries: 3,
-                        material_entries: 5,
-                        texture_entries: 7,
-                    },
-                },
-            );
-        }
-
-        assert_eq!(
-            progress,
-            vec![
-                VisualDependencyProgress {
-                    phase: VisualDependencyPhase::Texture,
-                    request_count: 1,
-                    graph_node_count: 37,
-                    graph_edge_count: 41,
-                    cache_entries: VisualDependencyCacheCounts {
-                        wear_entries: 3,
-                        material_entries: 5,
-                        texture_entries: 7,
-                    },
-                },
-                VisualDependencyProgress {
-                    phase: VisualDependencyPhase::Texture,
-                    request_count: 64,
-                    graph_node_count: 37,
-                    graph_edge_count: 41,
-                    cache_entries: VisualDependencyCacheCounts {
-                        wear_entries: 3,
-                        material_entries: 5,
-                        texture_entries: 7,
-                    },
-                },
-                VisualDependencyProgress {
-                    phase: VisualDependencyPhase::Texture,
-                    request_count: 128,
-                    graph_node_count: 37,
-                    graph_edge_count: 41,
-                    cache_entries: VisualDependencyCacheCounts {
-                        wear_entries: 3,
-                        material_entries: 5,
-                        texture_entries: 7,
-                    },
-                },
-            ]
-        );
-    }
 
     #[test]
     fn wear_validation_cache_replays_archive_qualified_failure() {
@@ -3315,7 +3002,6 @@ mod tests {
             &prototypes,
             policy,
             AssetPreparationLimits::default(),
-            &mut |_| {},
         )
         .expect_err("collision should fail");
 

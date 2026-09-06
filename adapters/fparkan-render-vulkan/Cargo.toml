@@ -4,35 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-build = "build.rs"
 
 [dependencies]
 ash = "0.38"
 ash-window = "0.13"
-fparkan-animation = { path = "../../crates/fparkan-animation", version = "0.1.0" }
-fparkan-binary = { path = "../../crates/fparkan-binary", version = "0.1.0" }
-fparkan-msh = { path = "../../crates/fparkan-msh", version = "0.1.0" }
-fparkan-platform = { path = "../../crates/fparkan-platform", version = "0.1.0" }
-fparkan-render = { path = "../../crates/fparkan-render", version = "0.1.0" }
-fparkan-terrain-format = { path = "../../crates/fparkan-terrain-format", version = "0.1.0" }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-
-[lints.rust]
-unsafe_code = "allow"
-missing_docs = "warn"
-unreachable_pub = "warn"
-unused_must_use = "deny"
-
-[lints.clippy]
-all = { level = "deny", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
-unwrap_used = "deny"
-expect_used = "deny"
-panic = "deny"
-todo = "deny"
-unimplemented = "deny"
-dbg_macro = "deny"
-print_stdout = "warn"
-print_stderr = "warn"
-lossy_float_literal = "deny"
+fparkan-animation = { path = "../../crates/fparkan-animation" }
+fparkan-binary = { path = "../../crates/fparkan-binary" }
+fparkan-msh = { path = "../../crates/fparkan-msh" }
+fparkan-platform = { path = "../../crates/fparkan-platform" }
+fparkan-render = { path = "../../crates/fparkan-render" }
+fparkan-terrain-format = { path = "../../crates/fparkan-terrain-format" }

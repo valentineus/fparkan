@@ -1,5 +1,4 @@
 #![forbid(unsafe_code)]
-#![cfg_attr(test, allow(clippy::expect_used, clippy::panic, clippy::unwrap_used))]
 //! Lossless, bounded reader for compiled AI `.scr` packages.
 //!
 //! This module preserves the layout proven by the GOG `ai.dll` reader.  It
@@ -1061,9 +1060,7 @@ impl ScriptInstruction {
     #[must_use]
     pub fn dispatch_selector(&self) -> ScriptDispatchSelector {
         match self.header_words[0] {
-            value if value < GOG_HANDLER_COUNT =>
-            {
-                #[allow(clippy::cast_possible_truncation)]
+            value if value < GOG_HANDLER_COUNT => {
                 ScriptDispatchSelector::Handler(self.header_words[0] as u8)
             }
             u32::MAX => ScriptDispatchSelector::Sentinel,

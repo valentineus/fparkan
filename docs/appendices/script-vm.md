@@ -52,18 +52,11 @@ number, size, operands, control flow, effects, errors и минимальный 
 GOG `ai.dll` доказывает этот framing двумя consumer-ами: loader по
 `0x10001000` открывает `<bundle>.scr`, `varset.var`, `<bundle>.fml`, затем
 собирает ровно 73 pointers handlers; `0x10011b20` читает описанную count-driven
-структуру. Команда
+структуру. В GOG `c1m2p.scr` reader находит 73 handler slots,
+9 events, 17 nested records и 20 references, заканчивая на EOF.
+Это подтверждает разбор пакета, но не смысл всех opcodes.
 
-```powershell
-cargo run -p fparkan-cli -- script inspect `
-  'C:\GOG Games\Parkan - Iron Strategy\MISSIONS\SCRIPTS\c1m2p.scr' --format json
-```
-
-на исходном пакете возвращает `opcode_handler_count=73`, 9 events, 17 nested
-records, 20 references и 0 trailing bytes. Это corpus evidence для reader-а,
-но не разрешение на исполнение неизвестных 73 opcodes.
-
-Теперь установлен selector: loader `0x10001000` создаёт 73 pointers в
+Selector устроен следующим образом: loader `0x10001000` создаёт 73 pointers в
 фиксированном порядке, а `0x10011e70` копирует их без перестановки в runtime
 array. Во всех 58 GOG `.scr` первый header word каждого nested record равен
 `0..72` либо `0xffff_ffff`: соответственно 2095 handler selectors и 3992
@@ -157,9 +150,8 @@ slot2 одновременно в `+0x24/+0x28`, slot3 в `+0x2c` и slot6 в `+
 На границе mission runtime выбранный TMA clan `first_resource` теперь
 материализуется как отдельный `MissionScriptBundle`: loader нормализует
 `<base>.scr`, декодирует его тем же bounded reader-ом и публикует immutable
-package вместе с clan provenance. Headless report выводит число таких packages
-и их named events. Это именно wiring входных данных, не VM execution: Init и
-остальные events пока не dispatch-ятся, а ошибка чтения сохраняет
+package вместе с clan provenance. Это именно wiring входных данных, не VM
+execution: Init и остальные events пока не dispatch-ятся, а ошибка чтения сохраняет
 transactional rollback mission loader-а.
 
 TMA properties остаются four raw `u32` words плюс имя, пока consumer/schema не

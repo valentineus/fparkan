@@ -26,7 +26,6 @@ pub(super) struct VulkanDepthAttachment {
     pub(super) format: vk::Format,
 }
 
-#[allow(clippy::too_many_lines)]
 pub(super) fn create_depth_attachment(
     instance: &VulkanInstanceProbe,
     device: &VulkanLogicalDeviceProbe,
@@ -249,7 +248,6 @@ pub(super) fn create_static_mesh_index_buffer(
     )
 }
 
-#[allow(clippy::too_many_lines)]
 pub(super) fn create_static_texture_image(
     instance: &VulkanInstanceProbe,
     device: &VulkanLogicalDeviceProbe,
@@ -376,7 +374,6 @@ pub(super) fn create_static_texture_image(
     })
 }
 
-#[allow(clippy::too_many_lines)]
 fn upload_static_texture(
     device: &VulkanLogicalDeviceProbe,
     command_pool: vk::CommandPool,

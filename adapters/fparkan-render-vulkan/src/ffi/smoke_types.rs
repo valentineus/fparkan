@@ -10,7 +10,7 @@ use super::{
     VulkanSurfaceProbe, VulkanSwapchainProbe, VulkanSwapchainProbeError, VulkanSwapchainResources,
     VulkanValidationMessenger,
 };
-use crate::shader_manifest::VulkanShaderManifestError;
+use crate::shader::VulkanShaderError;
 
 /// Creates a live native Vulkan renderer for the Stage 0 smoke loop.
 #[derive(Clone, Debug)]
@@ -536,7 +536,7 @@ impl VulkanSmokeBootstrapProgress {
 
 /// Stable snapshot of measured bootstrap progress.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(clippy::struct_excessive_bools)]
+
 pub struct VulkanSmokeBootstrapSnapshot {
     /// Whether the Vulkan loader was resolved.
     pub loader_available: bool,
@@ -562,8 +562,6 @@ const BOOTSTRAP_SWAPCHAIN_CREATED: u8 = 1 << 5;
 /// Stable smoke renderer bootstrap report.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VulkanSmokeRendererReport {
-    /// Checked-in shader manifest hash used by the renderer.
-    pub shader_manifest_hash: String,
     /// Whether portability enumeration was enabled at instance creation.
     pub portability_enumeration: bool,
     /// Whether the logical device enabled `VK_KHR_portability_subset`.
@@ -652,8 +650,8 @@ pub enum VulkanSmokeRendererError {
     LogicalDevice(VulkanLogicalDeviceError),
     /// Swapchain bootstrap failed.
     Swapchain(VulkanSwapchainProbeError),
-    /// Shader manifest validation failed.
-    ShaderManifest(VulkanShaderManifestError),
+    /// Checked-in shader validation failed.
+    Shader(VulkanShaderError),
     /// Vulkan operation failed.
     VulkanOperation {
         /// Operation context.
@@ -695,7 +693,7 @@ impl std::fmt::Display for VulkanSmokeRendererError {
             Self::Surface(error) => write!(f, "{error}"),
             Self::LogicalDevice(error) => write!(f, "{error}"),
             Self::Swapchain(error) => write!(f, "{error}"),
-            Self::ShaderManifest(error) => write!(f, "{error}"),
+            Self::Shader(error) => write!(f, "{error}"),
             Self::VulkanOperation { context, result } => {
                 write!(f, "{context}: {result:?}")
             }

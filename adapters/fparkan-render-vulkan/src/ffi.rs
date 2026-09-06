@@ -1,22 +1,3 @@
-#![cfg_attr(
-    test,
-    allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        clippy::cast_precision_loss,
-        clippy::expect_used,
-        clippy::float_cmp,
-        clippy::identity_op,
-        clippy::too_many_lines,
-        clippy::uninlined_format_args,
-        clippy::map_unwrap_or,
-        clippy::needless_raw_string_hashes,
-        clippy::semicolon_if_nothing_returned,
-        clippy::type_complexity,
-        clippy::panic,
-        clippy::unwrap_used
-    )
-)]
 #![deny(unsafe_op_in_unsafe_fn)]
 //! Vulkan adapter facade and migration-ready backend surface contract.
 //!
@@ -57,9 +38,8 @@ pub use self::capabilities::{
 };
 pub use self::instance::{
     create_vulkan_instance_probe, plan_vulkan_instance, probe_vulkan_loader,
-    render_instance_plan_json, render_loader_probe_report_json, vulkan_entry_symbol_name,
-    VulkanInstanceConfig, VulkanInstanceError, VulkanInstancePlan, VulkanInstanceProbe,
-    VulkanLoaderError, VulkanLoaderProbeReport,
+    vulkan_entry_symbol_name, VulkanInstanceConfig, VulkanInstanceError, VulkanInstancePlan,
+    VulkanInstanceProbe, VulkanLoaderError, VulkanLoaderProbeReport,
 };
 #[cfg(test)]
 use self::instance::{cstring_vec, ensure_instance_extensions_available};
@@ -84,8 +64,8 @@ pub use self::smoke_types::{
 #[cfg(test)]
 use self::surface::extension_name;
 pub use self::surface::{
-    create_vulkan_surface_probe, plan_vulkan_surface, render_surface_plan_json, VulkanSurfaceError,
-    VulkanSurfacePlan, VulkanSurfaceProbe,
+    create_vulkan_surface_probe, plan_vulkan_surface, VulkanSurfaceError, VulkanSurfacePlan,
+    VulkanSurfaceProbe,
 };
 pub use self::swapchain::{
     create_vulkan_swapchain_probe, create_vulkan_swapchain_probe_for_extent, VulkanSwapchainProbe,

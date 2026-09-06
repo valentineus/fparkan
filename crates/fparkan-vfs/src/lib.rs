@@ -1,23 +1,4 @@
 #![forbid(unsafe_code)]
-#![cfg_attr(
-    test,
-    allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        clippy::cast_precision_loss,
-        clippy::expect_used,
-        clippy::float_cmp,
-        clippy::identity_op,
-        clippy::too_many_lines,
-        clippy::uninlined_format_args,
-        clippy::map_unwrap_or,
-        clippy::needless_raw_string_hashes,
-        clippy::semicolon_if_nothing_returned,
-        clippy::type_complexity,
-        clippy::panic,
-        clippy::unwrap_used
-    )
-)]
 //! Virtual filesystem ports for resource loading.
 
 use fparkan_binary::{sha256, Sha256Digest};
@@ -312,7 +293,7 @@ pub struct MemoryVfs {
 
 impl MemoryVfs {
     /// Inserts a file.
-    #[allow(clippy::needless_pass_by_value)]
+
     pub fn insert(&mut self, path: NormalizedPath, bytes: Arc<[u8]>) {
         let path = path.as_bytes().to_vec();
         self.files.insert(path, bytes);
@@ -347,13 +328,13 @@ impl MemoryVfs {
 }
 
 #[cfg(unix)]
-#[allow(clippy::unnecessary_wraps)]
+
 fn file_identity(metadata: &fs::Metadata) -> Option<u64> {
     Some(metadata.dev().rotate_left(32) ^ metadata.ino())
 }
 
 #[cfg(windows)]
-#[allow(clippy::unnecessary_wraps)]
+
 fn file_identity(metadata: &fs::Metadata) -> Option<u64> {
     // Stable Rust does not expose the Windows file index.  Keep a best-effort
     // replacement detector from metadata that is available through the

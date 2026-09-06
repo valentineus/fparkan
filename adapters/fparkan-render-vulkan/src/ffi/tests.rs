@@ -1,114 +1,9 @@
 use super::*;
+use crate::ffi::{SPIRV_MAGIC, SPIRV_VERSION_1_0};
 use crate::policy::{KHR_PORTABILITY_SUBSET_EXTENSION, KHR_SWAPCHAIN_EXTENSION};
-use crate::shader_manifest::{
-    SHADER_COMPILER_BINARY_SHA256, SHADER_COMPILER_NAME, SHADER_COMPILER_VERSION,
-    SHADER_MANIFEST_SCHEMA, SHADER_TARGET_ENV, SPIRV_MAGIC, SPIRV_VALIDATOR_BINARY_SHA256,
-    SPIRV_VALIDATOR_NAME, SPIRV_VALIDATOR_VERSION, SPIRV_VERSION_1_0,
-    TRIANGLE_VERTEX_COMPILE_COMMAND, TRIANGLE_VERTEX_SOURCE_PATH, TRIANGLE_VERTEX_SOURCE_SHA256,
-    TRIANGLE_VERTEX_SPIRV_PATH, TRIANGLE_VERTEX_VALIDATE_COMMAND,
-};
+use crate::shader::{validate_spirv_container, validate_triangle_shaders, VulkanShaderError};
 use crate::*;
 use fparkan_platform::{DepthStencilSupport, RenderRequest};
-use fparkan_render::{
-    DrawCommand, DrawId, GpuMaterialId, GpuMeshId, IndexRange, LegacyPipelineState, RenderCommand,
-    RenderPhase,
-};
-use fparkan_render::{RenderBackend, RenderError};
-
-#[test]
-fn planning_backend_tracks_render_request_and_simulated_present() -> Result<(), RenderError> {
-    let mut backend = VulkanPlanningBackend::new();
-    let request = RenderRequest {
-        presentation: fparkan_platform::PresentationMode::Immediate,
-        ..RenderRequest::conservative()
-    };
-    backend.set_render_request(request);
-    assert_eq!(backend.render_request(), request);
-    assert_eq!(backend.report().request.current_request, request);
-    assert_eq!(backend.report().request.request_updates, 1);
-
-    let commands = fparkan_render::RenderCommandList {
-        commands: vec![
-            RenderCommand::BeginFrame,
-            RenderCommand::Draw(DrawCommand {
-                id: DrawId(11),
-                phase: RenderPhase::Opaque,
-                object_id: None,
-                mesh: GpuMeshId(1),
-                material: GpuMaterialId(2),
-                pipeline_key: LegacyPipelineState::default().into(),
-                transform: [1.0; 16],
-                range: IndexRange { start: 0, count: 3 },
-                stable_order: 7,
-            }),
-            RenderCommand::EndFrame,
-        ],
-    };
-
-    backend.execute(&commands)?;
-    assert_eq!(backend.state(), VulkanPlanningBackendState::Configured);
-    assert_eq!(backend.report().execution.planned_frames, 1);
-    assert_eq!(backend.report().execution.submission_plans, 1);
-    assert_eq!(backend.report().execution.simulated_presents, 1);
-    assert!(backend.report().execution.last_capture_size > 0);
-    assert_eq!(
-        backend.report().last_frame_submission,
-        Some(VulkanFrameSubmissionPlan {
-            schema: 1,
-            frames_in_flight: 2,
-            command_buffers: 2,
-            semaphores_per_frame: 2,
-            fences_per_frame: 1,
-            draw_count: 1,
-            indexed_vertex_count: 3,
-        })
-    );
-    Ok(())
-}
-
-#[test]
-fn frame_submission_plan_json_is_stable() -> Result<(), RenderError> {
-    let commands = fparkan_render::RenderCommandList {
-        commands: vec![
-            RenderCommand::BeginFrame,
-            RenderCommand::Draw(DrawCommand {
-                id: DrawId(11),
-                phase: RenderPhase::Opaque,
-                object_id: None,
-                mesh: GpuMeshId(1),
-                material: GpuMaterialId(2),
-                pipeline_key: LegacyPipelineState::default().into(),
-                transform: [1.0; 16],
-                range: IndexRange { start: 0, count: 3 },
-                stable_order: 7,
-            }),
-            RenderCommand::EndFrame,
-        ],
-    };
-    let swapchain = VulkanSwapchainPlan {
-        schema: 1,
-        extent: (1, 1),
-        format: VulkanSurfaceFormat {
-            format: vk::Format::B8G8R8A8_SRGB.as_raw(),
-            color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR.as_raw(),
-        },
-        present_mode: vk::PresentModeKHR::FIFO.as_raw(),
-        image_count: 3,
-        image_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT.as_raw(),
-    };
-
-    let plan = plan_vulkan_frame_submission(&swapchain, &commands)?;
-
-    assert_eq!(plan.frames_in_flight, 2);
-    assert_eq!(plan.command_buffers, 3);
-    assert_eq!(plan.draw_count, 1);
-    assert_eq!(plan.indexed_vertex_count, 3);
-    assert_eq!(
-        render_frame_submission_plan_json(&plan),
-        "{\"schema\":1,\"frames_in_flight\":2,\"command_buffers\":3,\"semaphores_per_frame\":2,\"fences_per_frame\":1,\"draw_count\":1,\"indexed_vertex_count\":3}"
-    );
-    Ok(())
-}
 
 #[test]
 fn device_scoring_is_deterministic_and_prefers_discrete_unified_queue() {
@@ -391,38 +286,6 @@ fn capability_report_preserves_informational_sampled_formats_and_limits() {
 }
 
 #[test]
-fn capability_report_json_is_stable() {
-    let mut rejected = device("Rejected", VulkanDeviceType::IntegratedGpu, 0, true, false);
-    rejected.present_modes.clear();
-    let report = select_physical_device(&[
-        rejected,
-        device("GPU \"A\"", VulkanDeviceType::DiscreteGpu, 3, true, false),
-    ])
-    .expect("selected device");
-
-    assert_eq!(
-        render_capability_report_json(&report),
-        "{\"schema\":1,\"vulkan_api\":\"1.1.0\",\"device_name\":\"GPU \\\"A\\\"\",\"score\":1101,\"graphics_queue_family\":3,\"present_queue_family\":3,\"portability_subset\":false,\"enabled_extensions\":[\"VK_KHR_swapchain\"],\"informational_capabilities\":{\"sampled_color_formats\":[50],\"sampled_depth_formats\":[126],\"limits\":{\"max_image_dimension_2d\":4096,\"max_sampler_allocation_count\":4096,\"max_per_stage_descriptor_samplers\":16,\"max_bound_descriptor_sets\":4}},\"rejected_devices\":[{\"device_name\":\"Rejected\",\"reason_code\":\"missing_present_mode\",\"reason\":\"Vulkan device Rejected has no supported present mode\"}]}"
-    );
-}
-
-#[test]
-fn loader_probe_report_json_is_stable() {
-    assert_eq!(
-        vulkan_entry_symbol_name().to_bytes(),
-        b"vkGetInstanceProcAddr"
-    );
-    assert_eq!(
-        render_loader_probe_report_json(&VulkanLoaderProbeReport {
-            schema: 1,
-            loader_available: true,
-            instance_api_version: vk::API_VERSION_1_2,
-        }),
-        "{\"schema\":1,\"loader_available\":true,\"instance_api\":\"1.2.0\"}"
-    );
-}
-
-#[test]
 fn loader_error_display_is_actionable() {
     assert_eq!(
         VulkanLoaderError::Unavailable {
@@ -446,9 +309,15 @@ fn instance_plan_is_sorted_deduplicated_and_portability_aware() {
         enable_validation: true,
     });
 
+    assert_eq!(plan.create_flags, 1);
+    assert!(plan.validation_requested);
     assert_eq!(
-        render_instance_plan_json(&plan),
-        "{\"schema\":1,\"create_flags\":1,\"validation_requested\":true,\"enabled_extensions\":[\"VK_EXT_debug_utils\",\"VK_KHR_portability_enumeration\",\"VK_KHR_surface\"]}"
+        plan.enabled_extensions,
+        vec![
+            "VK_EXT_debug_utils".to_string(),
+            KHR_PORTABILITY_ENUMERATION_EXTENSION.to_string(),
+            "VK_KHR_surface".to_string(),
+        ]
     );
 }
 
@@ -506,20 +375,6 @@ fn surface_plan_requires_native_handles() {
     assert_eq!(
         VulkanSurfaceError::MissingNativeHandles.to_string(),
         "native window/display handles are required for Vulkan surface creation"
-    );
-}
-
-#[test]
-fn surface_plan_json_is_stable() {
-    assert_eq!(
-        render_surface_plan_json(&VulkanSurfacePlan {
-            schema: 1,
-            required_instance_extensions: vec![
-                "VK_KHR_surface".to_string(),
-                "VK_EXT_metal_surface".to_string(),
-            ],
-        }),
-        "{\"schema\":1,\"required_instance_extensions\":[\"VK_KHR_surface\",\"VK_EXT_metal_surface\"]}"
     );
 }
 
@@ -620,128 +475,31 @@ fn swapchain_plan_rejects_missing_surface_data_and_empty_extent() {
 }
 
 #[test]
-fn swapchain_plan_json_and_recreation_reports_are_stable() {
-    let plan = plan_vulkan_swapchain(&swapchain_request()).expect("swapchain plan");
-    assert_eq!(
-        render_swapchain_plan_json(&plan),
-        "{\"schema\":1,\"extent\":[1024,720],\"format\":50,\"color_space\":0,\"present_mode\":1,\"image_count\":3,\"image_usage\":16}"
-    );
-
-    let report = swapchain_recreation_report(
-        VulkanSwapchainRecreationReason::OutOfDate,
-        (1024, 720),
-        (1280, 720),
-    );
-    assert_eq!(
-        render_swapchain_recreation_report_json(&report),
-        "{\"schema\":1,\"reason\":\"out_of_date\",\"previous_extent\":[1024,720],\"next_extent\":[1280,720]}"
-    );
+fn checked_in_shaders_have_valid_spirv_containers() {
+    assert_eq!(validate_triangle_shaders(), Ok(()));
 }
 
 #[test]
-fn triangle_shader_manifest_hashes_are_stable() {
-    let report = validate_shader_manifest(&triangle_shader_manifest()).expect("shader manifest");
-
-    assert_eq!(report.schema, SHADER_MANIFEST_SCHEMA);
-    assert_eq!(report.target_env, SHADER_TARGET_ENV);
+fn shader_container_rejects_invalid_spirv() {
     assert_eq!(
-        report.compiler,
-        VulkanShaderToolManifest {
-            name: SHADER_COMPILER_NAME,
-            version: SHADER_COMPILER_VERSION,
-            binary_sha256: SHADER_COMPILER_BINARY_SHA256,
-        }
-    );
-    assert_eq!(
-        report.validator,
-        VulkanShaderToolManifest {
-            name: SPIRV_VALIDATOR_NAME,
-            version: SPIRV_VALIDATOR_VERSION,
-            binary_sha256: SPIRV_VALIDATOR_BINARY_SHA256,
-        }
-    );
-    assert_eq!(report.modules.len(), 2);
-    assert_eq!(report.modules[0].name, "triangle.vert");
-    assert_eq!(report.modules[0].stage, VulkanShaderStage::Vertex);
-    assert_eq!(report.modules[0].source_path, TRIANGLE_VERTEX_SOURCE_PATH);
-    assert_eq!(
-        report.modules[0].source_sha256,
-        TRIANGLE_VERTEX_SOURCE_SHA256
-    );
-    assert_eq!(report.modules[0].spirv_path, TRIANGLE_VERTEX_SPIRV_PATH);
-    assert_eq!(report.modules[0].word_count, 358);
-    assert_eq!(
-        report.modules[0].sha256,
-        "4e2051ac43b933a57e5557e596bcc95952b4efbfcb45315180f89581e094398d"
-    );
-    assert_eq!(report.modules[0].descriptor_sets, 0);
-    assert_eq!(report.modules[0].push_constant_bytes, 64);
-    assert_eq!(
-        report.modules[0].compile_command,
-        TRIANGLE_VERTEX_COMPILE_COMMAND
-    );
-    assert_eq!(
-        report.modules[0].validate_command,
-        TRIANGLE_VERTEX_VALIDATE_COMMAND
-    );
-    assert!(!report.modules[0].interface_hash.is_empty());
-    assert_eq!(
-        report.modules[1].sha256,
-        "8ab7bf835e166892b04b10fa1100258daf355d2f693ad311d014dbee22de5c7b"
-    );
-    assert_eq!(
-        report.manifest_hash,
-        "cf471972978ddb5c8919711ad64c93d0d64e18b1f590a89ce014f1e2a743cfb5"
-    );
-}
-
-#[test]
-fn shader_manifest_report_json_is_stable() {
-    let report = validate_shader_manifest(&triangle_shader_manifest()).expect("shader manifest");
-    let json = render_shader_manifest_report_json(&report);
-
-    assert!(json.contains(SHADER_COMPILER_NAME));
-    assert!(json.contains(SPIRV_VALIDATOR_NAME));
-    assert!(json.contains(TRIANGLE_VERTEX_SOURCE_PATH));
-    assert!(json.contains(TRIANGLE_VERTEX_COMPILE_COMMAND));
-}
-
-#[test]
-fn checked_in_shader_manifest_matches_generated_report() {
-    let report = validate_shader_manifest(&triangle_shader_manifest()).expect("shader manifest");
-    assert_eq!(
-        render_shader_manifest_report_json(&report),
-        include_str!("../../shaders/manifest.json").trim()
-    );
-}
-
-#[test]
-fn shader_manifest_rejects_invalid_spirv_containers() {
-    let mut module = triangle_shader_manifest().remove(0);
-    module.words = &[0xFFFF_FFFF, SPIRV_VERSION_1_0, 0, 1, 0];
-    assert_eq!(
-        validate_shader_manifest(&[module]),
-        Err(VulkanShaderManifestError::InvalidMagic {
+        validate_spirv_container("triangle.vert", &[0xFFFF_FFFF, SPIRV_VERSION_1_0, 0, 1, 0]),
+        Err(VulkanShaderError::InvalidMagic {
             name: "triangle.vert",
             found: 0xFFFF_FFFF,
         })
     );
 
-    let mut module = triangle_shader_manifest().remove(0);
-    module.words = &[SPIRV_MAGIC, 0, 0, 1, 0];
     assert_eq!(
-        validate_shader_manifest(&[module]),
-        Err(VulkanShaderManifestError::UnsupportedVersion {
+        validate_spirv_container("triangle.vert", &[SPIRV_MAGIC, 0, 0, 1, 0]),
+        Err(VulkanShaderError::UnsupportedVersion {
             name: "triangle.vert",
             found: 0,
         })
     );
 
-    let mut module = triangle_shader_manifest().remove(0);
-    module.words = &[SPIRV_MAGIC, SPIRV_VERSION_1_0, 0, 0, 0];
     assert_eq!(
-        validate_shader_manifest(&[module]),
-        Err(VulkanShaderManifestError::InvalidBound {
+        validate_spirv_container("triangle.vert", &[SPIRV_MAGIC, SPIRV_VERSION_1_0, 0, 0, 0]),
+        Err(VulkanShaderError::InvalidBound {
             name: "triangle.vert",
         })
     );

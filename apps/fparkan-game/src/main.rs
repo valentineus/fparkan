@@ -1,60 +1,32 @@
 #![forbid(unsafe_code)]
-#![cfg_attr(
-    test,
-    allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_possible_wrap,
-        clippy::cast_precision_loss,
-        clippy::expect_used,
-        clippy::float_cmp,
-        clippy::identity_op,
-        clippy::too_many_lines,
-        clippy::uninlined_format_args,
-        clippy::map_unwrap_or,
-        clippy::needless_raw_string_hashes,
-        clippy::semicolon_if_nothing_returned,
-        clippy::type_complexity,
-        clippy::panic,
-        clippy::unwrap_used
-    )
-)]
-#![allow(clippy::print_stderr, clippy::print_stdout)]
+
 //! `FParkan` render-planning composition root.
 
-use fparkan_assets::{PreparedTextureUsage, PreparedVisual};
-use fparkan_inspection::load_standalone_wear_material_texture_mip0_rgba8_from_root;
-use fparkan_path::ResourceName;
-use fparkan_platform::WindowPort;
-use fparkan_platform_winit::{window_native_handles, WinitWindow, WinitWindowPlan};
-use fparkan_render::{
-    build_commands, CameraSnapshot, DrawId, GpuMaterialId, GpuMeshId, IndexRange,
-    LegacyD3d7Projection, LegacyIron3dEulerTransform, RawCameraTransform, RenderBackend,
-    RenderCommand, RenderCommandList, RenderPhase, RenderProfile, RenderSnapshot,
-    RenderSnapshotDraw,
+use fparkan_assets::{
+    load_standalone_wear_material_texture_mip0_rgba8_from_root, PreparedTextureUsage,
+    PreparedVisual,
 };
+use fparkan_path::ResourceName;
+use fparkan_platform_winit::{window_native_handles, WinitWindow, WinitWindowPlan};
+use fparkan_render::{LegacyD3d7Projection, LegacyIron3dEulerTransform, RawCameraTransform};
 use fparkan_render_vulkan::{
     project_land_msh_to_static_mesh_in_legacy_world_space,
     project_land_msh_to_static_mesh_in_xy_frame,
     project_msh_to_static_mesh_in_world_space_with_node_fallback_poses,
     project_msh_to_static_mesh_in_world_space_with_node_sampled_poses,
     project_msh_to_static_mesh_in_xy_frame_with_node_fallback_poses,
-    project_msh_to_static_mesh_in_xy_frame_with_node_sampled_poses, VulkanPlanningBackend,
-    VulkanSmokeFrameOutcome, VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo,
-    VulkanStaticCamera, VulkanStaticMaterial, VulkanStaticMesh, VulkanStaticTexture,
-    VulkanStaticXyFrame,
+    project_msh_to_static_mesh_in_xy_frame_with_node_sampled_poses, VulkanSmokeFrameOutcome,
+    VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo, VulkanStaticCamera, VulkanStaticMaterial,
+    VulkanStaticMesh, VulkanStaticTexture, VulkanStaticXyFrame,
 };
 use fparkan_runtime::{
-    create, frame, load_mission, load_mission_static_preview, load_mission_static_preview_roots,
-    load_mission_static_preview_roots_with_progress, load_mission_with_progress,
-    loaded_mission_assets, loaded_mission_object_drafts, loaded_terrain, EngineConfig, EngineMode,
-    EngineServices, MissionAssets, MissionLoadPhase, MissionObjectDraft, MissionRequest,
+    create, load_mission_static_preview, load_mission_static_preview_roots, loaded_mission_assets,
+    loaded_mission_object_drafts, loaded_terrain, EngineServices, MissionAssets,
+    MissionObjectDraft, MissionRequest,
 };
 use fparkan_terrain::TerrainMaterialLayers;
 use fparkan_terrain::TerrainWorld;
 use fparkan_vfs::DirectoryVfs;
-#[cfg(test)]
-use fparkan_world::OriginalObjectId;
-use fparkan_world::{TransformState, WorldSnapshot};
 use serde::Deserialize;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -83,91 +55,42 @@ fn main() {
 fn run(args: &[String]) -> Result<String, String> {
     let args = Args::parse(args)?;
     let services = EngineServices::new(Arc::new(DirectoryVfs::new(&args.root)));
-    let mut engine = create(
-        EngineConfig {
-            mode: EngineMode::Rendered,
-        },
-        services,
-    )
-    .map_err(|err| err.to_string())?;
+    let mut engine = create(services).map_err(|err| err.to_string())?;
     let loaded = load_requested_mission(&mut engine, &args)?;
 
-    if args.backend == RenderBackendMode::StaticVulkan {
-        let mission_assets = loaded_mission_assets(&engine)
-            .ok_or_else(|| "mission assets are unavailable after loading".to_string())?;
-        let terrain = loaded_terrain(&engine)
-            .ok_or_else(|| "mission terrain is unavailable after loading".to_string())?;
-        let roots = loaded_mission_object_drafts(&engine)
-            .map(|drafts| &drafts[..args.preview_roots.get().min(drafts.len())])
-            .filter(|roots| !roots.is_empty())
-            .ok_or_else(|| {
-                "selected mission object drafts are unavailable after loading".to_string()
-            })?;
-        let camera = args
-            .legacy_camera_capture
-            .as_deref()
-            .map(load_legacy_camera_capture)
-            .transpose()?;
-        let preview = static_preview_mesh_and_materials(
-            mission_assets,
-            terrain,
-            roots,
-            camera,
-            args.static_animation_frame,
-            args.static_material_phase,
-            &args.root,
-            &loaded.land_msh_path,
-        )?;
-        return run_static_vulkan_mode(
-            preview,
-            roots.len(),
-            args.frames,
-            &args.mission,
-            loaded.object_count,
-            args.readback_out.as_deref(),
-        );
-    }
-
-    let mut backend = VulkanPlanningBackend::new();
-    let _request = WinitWindow::default_render_request();
-    let window = WinitWindow::synthetic(1280, 720);
-    let _ = window.drawable_size();
-    let _ = window.handle();
-    let mut last_draw_count = 0usize;
-    let mut last_tick = 0u64;
-    let mut last_hash = [0u8; 32];
-    for _ in 0..args.frames {
-        let result = frame(&mut engine).map_err(|err| err.to_string())?;
-        last_tick = result.snapshot.tick.0;
-        last_hash = result.snapshot.hash.0;
-        let mission_assets = loaded_mission_assets(&engine);
-        let mission_drafts = fparkan_runtime::loaded_mission_object_drafts(&engine);
-        let commands =
-            render_snapshot_commands_with_assets(&result.snapshot, mission_assets, mission_drafts)
-                .map_err(|err| format!("render snapshot: {err}"))?;
-        last_draw_count = commands
-            .commands
-            .iter()
-            .filter(|command| matches!(command, RenderCommand::Draw(_)))
-            .count();
-        backend
-            .execute(&commands)
-            .map_err(|err| format!("render backend: {err}"))?;
-    }
-
-    let capture_report = backend.report();
-
-    Ok(format!(
-        "{{\"report_kind\":\"render-planning\",\"backend\":\"vulkan-planning\",\"window\":\"synthetic\",\"mission\":{},\"objects\":{},\"frames\":{},\"tick\":{},\"draws\":{},\"submission_plans\":{},\"last_command_capture_bytes\":{},\"hash\":{}}}",
-        json_string(&args.mission),
-        loaded.object_count,
+    let mission_assets = loaded_mission_assets(&engine)
+        .ok_or_else(|| "mission assets are unavailable after loading".to_string())?;
+    let terrain = loaded_terrain(&engine)
+        .ok_or_else(|| "mission terrain is unavailable after loading".to_string())?;
+    let roots = loaded_mission_object_drafts(&engine)
+        .map(|drafts| &drafts[..args.preview_roots.get().min(drafts.len())])
+        .filter(|roots| !roots.is_empty())
+        .ok_or_else(|| {
+            "selected mission object drafts are unavailable after loading".to_string()
+        })?;
+    let camera = args
+        .legacy_camera_capture
+        .as_deref()
+        .map(load_legacy_camera_capture)
+        .transpose()?;
+    let preview = static_preview_mesh_and_materials(
+        mission_assets,
+        terrain,
+        roots,
+        camera,
+        args.static_animation_frame,
+        args.static_material_phase,
+        &args.root,
+        &loaded.land_msh_path,
+    )?;
+    run_static_vulkan_mode(
+        preview,
         args.frames,
-        last_tick,
-        last_draw_count,
-        capture_report.execution.submission_plans,
-        capture_report.execution.last_capture_size,
-        json_hash(&last_hash)
-    ))
+        &args.mission,
+        loaded.object_count,
+        args.readback_out.as_deref(),
+        args.validation,
+    )
 }
 
 fn load_requested_mission(
@@ -177,62 +100,10 @@ fn load_requested_mission(
     let request = MissionRequest {
         key: args.mission.clone(),
     };
-    if let Some(progress_path) = args.load_progress.as_ref() {
-        prepare_load_progress_path(progress_path)?;
-        let progress_started = std::time::Instant::now();
-        let mut write_error = None;
-        let loaded = if args.backend == RenderBackendMode::StaticVulkan {
-            load_mission_static_preview_roots_with_progress(
-                engine,
-                request,
-                args.preview_roots,
-                |phase| {
-                    if write_error.is_none() {
-                        if let Err(err) =
-                            write_load_progress(progress_path, progress_started.elapsed(), phase)
-                        {
-                            write_error = Some(err);
-                        }
-                    }
-                },
-            )
-        } else {
-            load_mission_with_progress(engine, request, |phase| {
-                if write_error.is_none() {
-                    if let Err(err) =
-                        write_load_progress(progress_path, progress_started.elapsed(), phase)
-                    {
-                        write_error = Some(err);
-                    }
-                }
-            })
-        }
-        .map_err(|err| err.to_string())?;
-        if let Some(err) = write_error {
-            return Err(err);
-        }
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(progress_path)
-            .and_then(|mut file| {
-                use std::io::Write;
-                writeln!(
-                    file,
-                    "Complete\telapsed_ms={}",
-                    progress_started.elapsed().as_millis()
-                )
-            })
-            .map_err(|err| format!("{}: {err}", progress_path.display()))?;
-        return Ok(loaded);
-    }
-    if args.backend == RenderBackendMode::StaticVulkan {
-        if args.preview_roots.get() == 1 {
-            load_mission_static_preview(engine, request)
-        } else {
-            load_mission_static_preview_roots(engine, request, args.preview_roots)
-        }
+    if args.preview_roots.get() == 1 {
+        load_mission_static_preview(engine, request)
     } else {
-        load_mission(engine, request)
+        load_mission_static_preview_roots(engine, request, args.preview_roots)
     }
     .map_err(|err| err.to_string())
 }
@@ -243,11 +114,8 @@ struct StaticPreviewScene {
     materials: Vec<VulkanStaticMaterial>,
     camera: VulkanStaticCamera,
     camera_mode: &'static str,
-    clip_visible_vertices: usize,
     mesh_components: usize,
     terrain_components: usize,
-    animation_frame: Option<u16>,
-    material_phase: Option<u16>,
 }
 
 /// Projects the mission terrain plus every MSH component of the explicitly
@@ -259,7 +127,7 @@ struct StaticPreviewScene {
 /// retained on draw ranges but awaits a recovered blend equation; orientation,
 /// later material phases, animation, lightmaps and gameplay visibility remain
 /// outside this bridge.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+
 fn static_preview_mesh_and_materials(
     assets: &MissionAssets,
     terrain: &TerrainWorld,
@@ -366,7 +234,6 @@ fn static_preview_mesh_and_materials(
     }
     let camera = legacy_camera.unwrap_or_default();
     Ok(StaticPreviewScene {
-        clip_visible_vertices: static_preview_clip_visible_vertices(&mesh, camera),
         mesh,
         materials,
         camera,
@@ -377,49 +244,7 @@ fn static_preview_mesh_and_materials(
         },
         mesh_components,
         terrain_components: 1,
-        animation_frame: static_animation_frame,
-        material_phase: static_material_phase,
     })
-}
-
-/// Counts source vertices inside the Vulkan clip volume for a static preview.
-///
-/// The static vertex shader receives row-major D3D7 matrix data as a GLSL
-/// column-major `mat4`; its multiplication is consequently equivalent to this
-/// row-vector calculation. This remains CPU-only diagnostic evidence and does
-/// not change the renderer's clipping rules.
-fn static_preview_clip_visible_vertices(
-    mesh: &VulkanStaticMesh,
-    camera: VulkanStaticCamera,
-) -> usize {
-    mesh.vertices
-        .iter()
-        .filter(|vertex| {
-            let [x, y, z] = vertex.position;
-            let matrix = camera.clip_from_world;
-            let clip_x = x.mul_add(
-                matrix[0],
-                y.mul_add(matrix[4], z.mul_add(matrix[8], matrix[12])),
-            );
-            let clip_y = x.mul_add(
-                matrix[1],
-                y.mul_add(matrix[5], z.mul_add(matrix[9], matrix[13])),
-            );
-            let clip_z = x.mul_add(
-                matrix[2],
-                y.mul_add(matrix[6], z.mul_add(matrix[10], matrix[14])),
-            );
-            let clip_w = x.mul_add(
-                matrix[3],
-                y.mul_add(matrix[7], z.mul_add(matrix[11], matrix[15])),
-            );
-            clip_w.is_finite()
-                && clip_w > 0.0
-                && (-clip_w..=clip_w).contains(&clip_x)
-                && (-clip_w..=clip_w).contains(&clip_y)
-                && (0.0..=clip_w).contains(&clip_z)
-        })
-        .count()
 }
 
 fn static_preview_xy_frame(
@@ -518,7 +343,7 @@ fn static_preview_terrain_base_materials(
         .into_iter()
         .map(|packed_tag| {
             let selection = TerrainMaterialLayers::from_packed_tag(packed_tag).land2_selection();
-            let selected = load_standalone_wear_material_texture_mip0_rgba8_from_root(
+            let image = load_standalone_wear_material_texture_mip0_rgba8_from_root(
                 root,
                 &wear_path,
                 selection.material_index,
@@ -535,9 +360,9 @@ fn static_preview_terrain_base_materials(
             materials.push(VulkanStaticMaterial {
                 material_index: preview_selector,
                 texture: VulkanStaticTexture {
-                    width: selected.image.width,
-                    height: selected.image.height,
-                    rgba8: selected.image.rgba8,
+                    width: image.width,
+                    height: image.height,
+                    rgba8: image.rgba8,
                 },
             });
             Ok((packed_tag, preview_selector))
@@ -664,46 +489,23 @@ fn append_static_preview_component(
     Ok(())
 }
 
-fn prepare_load_progress_path(path: &std::path::Path) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
-    }
-    std::fs::write(path, "Starting\telapsed_ms=0\n")
-        .map_err(|err| format!("{}: {err}", path.display()))
-}
-
-fn write_load_progress(
-    path: &std::path::Path,
-    elapsed: std::time::Duration,
-    phase: MissionLoadPhase,
-) -> Result<(), String> {
-    use std::io::Write;
-
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .map_err(|err| format!("{}: {err}", path.display()))?;
-    writeln!(file, "{phase:?}\telapsed_ms={}", elapsed.as_millis())
-        .map_err(|err| format!("{}: {err}", path.display()))
-}
-
 fn run_static_vulkan_mode(
     preview: StaticPreviewScene,
-    preview_roots: usize,
     target_frames: u64,
     mission: &str,
     object_count: usize,
     readback_out: Option<&std::path::Path>,
+    enable_validation: bool,
 ) -> Result<String, String> {
     let event_loop = EventLoop::new().map_err(|err| format!("winit event loop: {err}"))?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = StaticVulkanApp::new(
         preview,
-        preview_roots,
         target_frames,
         mission,
         object_count,
         readback_out.map(std::path::Path::to_path_buf),
+        enable_validation,
     );
     if let Err(err) = event_loop.run_app(&mut app) {
         app.error = Some(format!("winit event loop: {err}"));
@@ -716,16 +518,13 @@ struct StaticVulkanApp {
     materials: Vec<VulkanStaticMaterial>,
     camera: VulkanStaticCamera,
     camera_mode: &'static str,
-    clip_visible_vertices: usize,
     mesh_components: usize,
     terrain_components: usize,
-    animation_frame: Option<u16>,
-    material_phase: Option<u16>,
-    preview_roots: usize,
     target_frames: u64,
     mission: String,
     object_count: usize,
     readback_out: Option<PathBuf>,
+    enable_validation: bool,
     window_id: Option<WindowId>,
     window: Option<Window>,
     renderer: Option<VulkanSmokeRenderer>,
@@ -737,27 +536,24 @@ struct StaticVulkanApp {
 impl StaticVulkanApp {
     fn new(
         preview: StaticPreviewScene,
-        preview_roots: usize,
         target_frames: u64,
         mission: &str,
         object_count: usize,
         readback_out: Option<PathBuf>,
+        enable_validation: bool,
     ) -> Self {
         Self {
             mesh: preview.mesh,
             materials: preview.materials,
             camera: preview.camera,
             camera_mode: preview.camera_mode,
-            clip_visible_vertices: preview.clip_visible_vertices,
             mesh_components: preview.mesh_components,
             terrain_components: preview.terrain_components,
-            animation_frame: preview.animation_frame,
-            material_phase: preview.material_phase,
-            preview_roots,
             target_frames,
             mission: mission.to_string(),
             object_count,
             readback_out,
+            enable_validation,
             window_id: None,
             window: None,
             renderer: None,
@@ -788,7 +584,9 @@ impl StaticVulkanApp {
             }
         };
         self.window.take();
-        if report.validation.warning_count != 0 || report.validation.error_count != 0 {
+        if self.enable_validation
+            && (report.validation.warning_count != 0 || report.validation.error_count != 0)
+        {
             self.error = Some(format!(
                 "native Vulkan validation must stay clean (warnings={}, errors={})",
                 report.validation.warning_count, report.validation.error_count
@@ -796,6 +594,11 @@ impl StaticVulkanApp {
             event_loop.exit();
             return;
         }
+        let validation_status = if self.enable_validation {
+            "clean"
+        } else {
+            "disabled"
+        };
         let readback_path = match (&self.readback_out, &report.readback_artifact) {
             (Some(path), Some(artifact)) => {
                 if let Some(parent) = path.parent() {
@@ -821,27 +624,16 @@ impl StaticVulkanApp {
             (None, _) => None,
         };
         self.output = Some(format!(
-            "{{\"report_kind\":\"rendered-static-mission\",\"backend\":\"vulkan-static\",\"camera_mode\":{},\"window\":\"native\",\"mission\":{},\"objects\":{},\"frames\":{},\"preview_roots\":{},\"animation_frame\":{},\"material_phase\":{},\"mesh_components\":{},\"terrain_components\":{},\"clip_visible_vertices\":{},\"material_descriptors\":{},\"swapchain\":[{},{}],\"swapchain_images\":{},\"validation_warnings\":{},\"validation_errors\":{},\"readback_format\":{},\"readback_bytes\":{},\"readback_hash\":{},\"readback_path\":{}}}",
-            json_string(self.camera_mode),
-            json_string(&self.mission),
-            self.object_count,
+            "rendered mission {}: {} frames, {} objects, {} mesh components, {} terrain components, camera={}, materials={}, validation={}, readback={}",
+            self.mission,
             self.frames_presented,
-            self.preview_roots,
-            self.animation_frame.map_or_else(|| "null".to_string(), |frame| frame.to_string()),
-            self.material_phase.map_or_else(|| "null".to_string(), |phase| phase.to_string()),
+            self.object_count,
             self.mesh_components,
             self.terrain_components,
-            self.clip_visible_vertices,
+            self.camera_mode,
             self.materials.len(),
-            report.renderer_report.swapchain_extent.0,
-            report.renderer_report.swapchain_extent.1,
-            report.renderer_report.swapchain_image_count,
-            report.validation.warning_count,
-            report.validation.error_count,
-            report.readback_artifact.as_ref().map_or(0, |artifact| artifact.format),
-            report.renderer_report.readback_byte_count,
-            report.renderer_report.readback_fnv1a64,
-            readback_path.as_deref().map_or_else(|| "null".to_string(), json_string),
+            validation_status,
+            readback_path.as_deref().unwrap_or("none"),
         ));
         event_loop.exit();
     }
@@ -890,7 +682,7 @@ impl ApplicationHandler for StaticVulkanApp {
             native_handles,
             drawable_extent: (size.width.max(1), size.height.max(1)),
             render_request: WinitWindow::default_render_request(),
-            enable_validation: true,
+            enable_validation: self.enable_validation,
             mesh: self.mesh.clone(),
             camera: self.camera,
             materials: self.materials.clone(),
@@ -920,8 +712,7 @@ impl ApplicationHandler for StaticVulkanApp {
         }
         match event {
             WindowEvent::CloseRequested => {
-                self.error = Some("native Vulkan window closed before completion".to_string());
-                event_loop.exit();
+                self.complete(event_loop);
             }
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
@@ -964,157 +755,12 @@ impl ApplicationHandler for StaticVulkanApp {
     }
 }
 
-#[cfg(test)]
-fn render_snapshot_commands(snapshot: &WorldSnapshot) -> Result<RenderCommandList, String> {
-    render_snapshot_commands_with_assets(snapshot, None, None)
-}
-
-fn render_snapshot_commands_with_assets(
-    snapshot: &WorldSnapshot,
-    mission_assets: Option<&MissionAssets>,
-    mission_drafts: Option<&[MissionObjectDraft]>,
-) -> Result<RenderCommandList, String> {
-    let render_snapshot = render_snapshot_with_assets(snapshot, mission_assets, mission_drafts);
-    build_commands(&render_snapshot, RenderProfile::default()).map_err(|err| err.to_string())
-}
-
-fn render_snapshot_with_assets(
-    snapshot: &WorldSnapshot,
-    mission_assets: Option<&MissionAssets>,
-    mission_drafts: Option<&[MissionObjectDraft]>,
-) -> RenderSnapshot {
-    let mut draws = Vec::with_capacity(snapshot.objects.len());
-    for (index, handle) in snapshot.objects.iter().enumerate() {
-        let visuals = mission_assets.map_or(&[][..], |assets| assets.visuals_for_object(index));
-        let visual_count = visuals.len().max(1);
-        for visual_index in 0..visual_count {
-            let prepared = mission_assets.and_then(|assets| {
-                visuals
-                    .get(visual_index)
-                    .and_then(|visual_id| assets.visual_by_id(*visual_id))
-            });
-            let mesh = prepared.map_or_else(
-                || GpuMeshId(u64::from(handle.slot) + 1),
-                |visual| GpuMeshId(visual.id.raw()),
-            );
-            let material = prepared
-                .and_then(PreparedVisual::primary_material_id)
-                .map_or(GpuMaterialId(1), |material_id| {
-                    GpuMaterialId(material_id.raw())
-                });
-            let stable_order = if visual_count == 1 {
-                u64::from(handle.slot)
-            } else {
-                u64::from(handle.slot)
-                    .wrapping_mul(1_000_003)
-                    .wrapping_add(u64::try_from(visual_index).unwrap_or(u64::MAX))
-            };
-            let draw_id = snapshot
-                .tick
-                .0
-                .wrapping_mul(1_000_003)
-                .wrapping_add(stable_order);
-            draws.push(RenderSnapshotDraw {
-                id: DrawId(draw_id),
-                phase: RenderPhase::Opaque,
-                object_id: mission_drafts
-                    .and_then(|drafts| drafts.get(index))
-                    .and_then(|draft| draft.original_id),
-                mesh,
-                material_slots: vec![material],
-                material_index: 0,
-                pipeline_state: fparkan_render::LegacyPipelineState::default(),
-                transform: snapshot_transform(snapshot, *handle).unwrap_or_else(|| {
-                    mission_drafts
-                        .and_then(|drafts| drafts.get(index))
-                        .map_or_else(
-                            || identity_transform(index_to_f32(index)),
-                            mission_position_scale_transform,
-                        )
-                }),
-                range: IndexRange { start: 0, count: 3 },
-                stable_order,
-            });
-        }
-    }
-    RenderSnapshot {
-        camera: CameraSnapshot::default(),
-        draws,
-    }
-}
-
-fn snapshot_transform(
-    snapshot: &WorldSnapshot,
-    handle: fparkan_world::ObjectHandle,
-) -> Option<[f32; 16]> {
-    snapshot
-        .transforms
-        .iter()
-        .find_map(|(candidate, transform)| (*candidate == handle).then_some(*transform))
-        .map(transform_state_position_scale_transform)
-}
-
-fn transform_state_position_scale_transform(transform: TransformState) -> [f32; 16] {
-    let position = transform.position.map(f32::from_bits);
-    let scale = transform.scale.map(f32::from_bits);
-    [
-        scale[0],
-        0.0,
-        0.0,
-        position[0],
-        0.0,
-        scale[1],
-        0.0,
-        position[1],
-        0.0,
-        0.0,
-        scale[2],
-        position[2],
-        0.0,
-        0.0,
-        0.0,
-        1.0,
-    ]
-}
-
-fn mission_position_scale_transform(draft: &MissionObjectDraft) -> [f32; 16] {
-    [
-        draft.scale[0],
-        0.0,
-        0.0,
-        draft.position[0],
-        0.0,
-        draft.scale[1],
-        0.0,
-        draft.position[1],
-        0.0,
-        0.0,
-        draft.scale[2],
-        draft.position[2],
-        0.0,
-        0.0,
-        0.0,
-        1.0,
-    ]
-}
-
-fn identity_transform(x: f32) -> [f32; 16] {
-    [
-        1.0, 0.0, 0.0, x, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
-    ]
-}
-
-fn index_to_f32(index: usize) -> f32 {
-    u16::try_from(index).map_or(f32::from(u16::MAX), f32::from)
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Args {
     root: PathBuf,
     mission: String,
     frames: u64,
-    backend: RenderBackendMode,
-    load_progress: Option<PathBuf>,
+    validation: bool,
     readback_out: Option<PathBuf>,
     preview_roots: NonZeroUsize,
     legacy_camera_capture: Option<PathBuf>,
@@ -1122,20 +768,12 @@ struct Args {
     static_material_phase: Option<u16>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RenderBackendMode {
-    Planning,
-    StaticVulkan,
-}
-
 impl Args {
-    #[allow(clippy::too_many_lines)]
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut root = None;
         let mut mission = None;
         let mut frames = 1;
-        let mut backend = RenderBackendMode::Planning;
-        let mut load_progress = None;
+        let mut validation = false;
         let mut readback_out = None;
         // A native static-Vulkan invocation is the usable mission preview, so
         // its default scope covers every root. `PreviewRoots` is clamped by the
@@ -1169,23 +807,8 @@ impl Args {
                         .parse()
                         .map_err(|_| "--frames must be an integer".to_string())?;
                 }
-                "--backend" => {
-                    backend = match iter
-                        .next()
-                        .ok_or_else(|| "--backend requires a value".to_string())?
-                        .as_str()
-                    {
-                        "planning" => RenderBackendMode::Planning,
-                        "static-vulkan" => RenderBackendMode::StaticVulkan,
-                        _ => return Err("--backend must be planning or static-vulkan".to_string()),
-                    };
-                }
-                "--load-progress" => {
-                    load_progress = Some(
-                        iter.next()
-                            .map(PathBuf::from)
-                            .ok_or_else(|| "--load-progress requires a path".to_string())?,
-                    );
+                "--validation" => {
+                    validation = true;
                 }
                 "--readback-out" => {
                     readback_out = Some(
@@ -1235,24 +858,11 @@ impl Args {
         if frames == 0 {
             return Err("--frames must be greater than zero".to_string());
         }
-        if legacy_camera_capture.is_some() && backend != RenderBackendMode::StaticVulkan {
-            return Err("--legacy-camera-capture requires --backend static-vulkan".to_string());
-        }
-        if readback_out.is_some() && backend != RenderBackendMode::StaticVulkan {
-            return Err("--readback-out requires --backend static-vulkan".to_string());
-        }
-        if static_animation_frame.is_some() && backend != RenderBackendMode::StaticVulkan {
-            return Err("--static-animation-frame requires --backend static-vulkan".to_string());
-        }
-        if static_material_phase.is_some() && backend != RenderBackendMode::StaticVulkan {
-            return Err("--static-material-phase requires --backend static-vulkan".to_string());
-        }
         Ok(Self {
             root,
             mission,
             frames,
-            backend,
-            load_progress,
+            validation,
             readback_out,
             preview_roots,
             legacy_camera_capture,
@@ -1339,84 +949,16 @@ fn decode_legacy_camera_capture_json(bytes: &[u8]) -> Result<String, String> {
     }
 }
 
-fn json_string(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if c.is_control() => {
-                use std::fmt::Write as _;
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-fn json_hash(hash: &[u8; 32]) -> String {
-    let mut out = String::from("\"");
-    for byte in hash {
-        use std::fmt::Write as _;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out.push('"');
-    out
-}
-
 fn usage() -> String {
-    "usage: fparkan-game --root <path> --mission <path> [--frames <n>] [--backend <planning|static-vulkan>] [--preview-roots <non-zero n>] [--legacy-camera-capture <path>] [--static-animation-frame <u16>] [--static-material-phase <u16>] [--readback-out <path>] [--load-progress <path>]".to_string()
+    "usage: fparkan-game --root <path> --mission <path> [--frames <n>] [--validation] [--preview-roots <non-zero n>] [--legacy-camera-capture <path>] [--static-animation-frame <u16>] [--static-material-phase <u16>] [--readback-out <path>]".to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fparkan_assets::AssetId;
-    use fparkan_world::{ObjectHandle, StateHash, Tick};
-    use std::path::Path;
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
-    }
-
-    #[test]
-    fn static_preview_clip_diagnostic_matches_vulkan_clip_bounds() {
-        let mesh = VulkanStaticMesh {
-            vertices: vec![
-                fparkan_render_vulkan::VulkanStaticVertex {
-                    position: [0.0, 0.0, 0.0],
-                    color: [0.0; 3],
-                    uv: [0.0; 2],
-                },
-                fparkan_render_vulkan::VulkanStaticVertex {
-                    position: [1.0, -1.0, 1.0],
-                    color: [0.0; 3],
-                    uv: [0.0; 2],
-                },
-                fparkan_render_vulkan::VulkanStaticVertex {
-                    position: [1.01, 0.0, 0.0],
-                    color: [0.0; 3],
-                    uv: [0.0; 2],
-                },
-                fparkan_render_vulkan::VulkanStaticVertex {
-                    position: [0.0, 0.0, -0.01],
-                    color: [0.0; 3],
-                    uv: [0.0; 2],
-                },
-            ],
-            indices: Vec::new(),
-            draw_ranges: Vec::new(),
-        };
-        assert_eq!(
-            static_preview_clip_visible_vertices(&mesh, VulkanStaticCamera::default()),
-            2
-        );
     }
 
     #[test]
@@ -1434,8 +976,7 @@ mod tests {
                 root: PathBuf::from("testdata/IS"),
                 mission: "MISSIONS/Autodemo.00/data.tma".to_string(),
                 frames: 3,
-                backend: RenderBackendMode::Planning,
-                load_progress: None,
+                validation: false,
                 readback_out: None,
                 preview_roots: NonZeroUsize::MAX,
                 legacy_camera_capture: None,
@@ -1446,29 +987,16 @@ mod tests {
     }
 
     #[test]
-    fn parses_static_vulkan_backend() {
-        assert_eq!(
-            Args::parse(&strings(&[
-                "--root",
-                "testdata/IS",
-                "--mission",
-                "MISSIONS/Autodemo.00/data.tma",
-                "--backend",
-                "static-vulkan",
-            ])),
-            Ok(Args {
-                root: PathBuf::from("testdata/IS"),
-                mission: "MISSIONS/Autodemo.00/data.tma".to_string(),
-                frames: 1,
-                backend: RenderBackendMode::StaticVulkan,
-                load_progress: None,
-                readback_out: None,
-                preview_roots: NonZeroUsize::MAX,
-                legacy_camera_capture: None,
-                static_animation_frame: None,
-                static_material_phase: None,
-            })
-        );
+    fn parses_validation_flag() {
+        let parsed = Args::parse(&strings(&[
+            "--root",
+            "testdata/IS",
+            "--mission",
+            "MISSIONS/Autodemo.00/data.tma",
+            "--validation",
+        ]))
+        .expect("valid validation flag");
+        assert!(parsed.validation);
     }
 
     #[test]
@@ -1478,8 +1006,6 @@ mod tests {
             "testdata/IS",
             "--mission",
             "MISSIONS/Autodemo.00/data.tma",
-            "--backend",
-            "static-vulkan",
             "--preview-roots",
             "2",
         ]))
@@ -1491,26 +1017,12 @@ mod tests {
     }
 
     #[test]
-    fn readback_output_requires_static_vulkan_and_is_retained() {
-        let common = [
-            "--root",
-            "testdata/IS",
-            "--mission",
-            "MISSIONS/Autodemo.00/data.tma",
-            "--readback-out",
-            "target/frame.raw",
-        ];
-        assert_eq!(
-            Args::parse(&strings(&common)),
-            Err("--readback-out requires --backend static-vulkan".to_string())
-        );
+    fn parses_readback_output() {
         let parsed = Args::parse(&strings(&[
             "--root",
             "testdata/IS",
             "--mission",
             "MISSIONS/Autodemo.00/data.tma",
-            "--backend",
-            "static-vulkan",
             "--readback-out",
             "target/frame.raw",
         ]))
@@ -1519,26 +1031,12 @@ mod tests {
     }
 
     #[test]
-    fn static_animation_frame_requires_static_vulkan_and_is_retained() {
-        let common = [
-            "--root",
-            "testdata/IS",
-            "--mission",
-            "MISSIONS/Autodemo.00/data.tma",
-            "--static-animation-frame",
-            "12",
-        ];
-        assert_eq!(
-            Args::parse(&strings(&common)),
-            Err("--static-animation-frame requires --backend static-vulkan".to_string())
-        );
+    fn parses_static_animation_frame() {
         let parsed = Args::parse(&strings(&[
             "--root",
             "testdata/IS",
             "--mission",
             "MISSIONS/Autodemo.00/data.tma",
-            "--backend",
-            "static-vulkan",
             "--static-animation-frame",
             "12",
         ]))
@@ -1547,26 +1045,12 @@ mod tests {
     }
 
     #[test]
-    fn static_material_phase_requires_static_vulkan_and_is_retained() {
-        let common = [
-            "--root",
-            "testdata/IS",
-            "--mission",
-            "MISSIONS/Autodemo.00/data.tma",
-            "--static-material-phase",
-            "2",
-        ];
-        assert_eq!(
-            Args::parse(&strings(&common)),
-            Err("--static-material-phase requires --backend static-vulkan".to_string())
-        );
+    fn parses_static_material_phase() {
         let parsed = Args::parse(&strings(&[
             "--root",
             "testdata/IS",
             "--mission",
             "MISSIONS/Autodemo.00/data.tma",
-            "--backend",
-            "static-vulkan",
             "--static-material-phase",
             "2",
         ]))
@@ -1591,52 +1075,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_load_progress_path() {
-        assert_eq!(
-            Args::parse(&strings(&[
-                "--root",
-                "testdata/IS",
-                "--mission",
-                "MISSIONS/Autodemo.00/data.tma",
-                "--load-progress",
-                "target/probe.txt",
-            ])),
-            Ok(Args {
-                root: PathBuf::from("testdata/IS"),
-                mission: "MISSIONS/Autodemo.00/data.tma".to_string(),
-                frames: 1,
-                backend: RenderBackendMode::Planning,
-                load_progress: Some(PathBuf::from("target/probe.txt")),
-                readback_out: None,
-                preview_roots: NonZeroUsize::MAX,
-                legacy_camera_capture: None,
-                static_animation_frame: None,
-                static_material_phase: None,
-            })
-        );
-    }
-
-    #[test]
-    fn legacy_camera_capture_requires_static_vulkan_and_is_retained() {
-        let common = [
-            "--root",
-            "testdata/IS",
-            "--mission",
-            "MISSIONS/Autodemo.00/data.tma",
-            "--legacy-camera-capture",
-            "target/camera.json",
-        ];
-        assert_eq!(
-            Args::parse(&strings(&common)),
-            Err("--legacy-camera-capture requires --backend static-vulkan".to_string())
-        );
+    fn parses_legacy_camera_capture_path() {
         let valid = Args::parse(&strings(&[
             "--root",
             "testdata/IS",
             "--mission",
             "MISSIONS/Autodemo.00/data.tma",
-            "--backend",
-            "static-vulkan",
             "--legacy-camera-capture",
             "target/camera.json",
         ]))
@@ -1691,38 +1135,6 @@ mod tests {
     }
 
     #[test]
-    fn load_progress_retains_prior_milestones() -> Result<(), String> {
-        let path =
-            std::env::temp_dir().join(format!("fparkan-game-progress-{}.txt", std::process::id()));
-        prepare_load_progress_path(&path)?;
-        write_load_progress(
-            &path,
-            std::time::Duration::from_millis(12),
-            MissionLoadPhase::GraphVisualMaterials,
-        )?;
-        write_load_progress(
-            &path,
-            std::time::Duration::from_millis(34),
-            MissionLoadPhase::GraphVisualMaterialRequests {
-                request_count: 64,
-                graph_node_count: 128,
-                graph_edge_count: 192,
-                wear_cache_entries: 8,
-                material_cache_entries: 16,
-                texture_cache_entries: 32,
-            },
-        )?;
-        let progress = std::fs::read_to_string(&path).map_err(|err| err.to_string())?;
-        std::fs::remove_file(&path).map_err(|err| err.to_string())?;
-
-        assert_eq!(
-            progress,
-            "Starting\telapsed_ms=0\nGraphVisualMaterials\telapsed_ms=12\nGraphVisualMaterialRequests { request_count: 64, graph_node_count: 128, graph_edge_count: 192, wear_cache_entries: 8, material_cache_entries: 16, texture_cache_entries: 32 }\telapsed_ms=34\n"
-        );
-        Ok(())
-    }
-
-    #[test]
     fn static_preview_component_merge_offsets_indices_and_remaps_local_selectors(
     ) -> Result<(), String> {
         let mut merged = VulkanStaticMesh {
@@ -1772,268 +1184,5 @@ mod tests {
 
         assert_eq!(merged.indices, vec![65_536, 65_537, 65_538]);
         Ok(())
-    }
-
-    #[test]
-    fn render_commands_follow_snapshot_order() -> Result<(), String> {
-        let snapshot = WorldSnapshot {
-            tick: Tick(7),
-            objects: vec![
-                ObjectHandle {
-                    generation: 1,
-                    slot: 2,
-                },
-                ObjectHandle {
-                    generation: 1,
-                    slot: 5,
-                },
-            ],
-            transforms: Vec::new(),
-            events: Vec::new(),
-            hash: StateHash([0; 32]),
-        };
-
-        let commands = render_snapshot_commands(&snapshot)?;
-
-        assert_eq!(commands.commands.len(), 4);
-        assert!(matches!(
-            commands.commands[0],
-            fparkan_render::RenderCommand::BeginFrame
-        ));
-        assert!(matches!(
-            commands.commands[3],
-            fparkan_render::RenderCommand::EndFrame
-        ));
-        let fparkan_render::RenderCommand::Draw(first) = &commands.commands[1] else {
-            return Err("expected draw".to_string());
-        };
-        assert_eq!(first.mesh, GpuMeshId(3));
-        assert_eq!(first.stable_order, 2);
-        Ok(())
-    }
-
-    #[test]
-    fn render_snapshot_retains_every_prepared_visual_for_an_object() -> Result<(), String> {
-        let snapshot = WorldSnapshot {
-            tick: Tick(3),
-            objects: vec![ObjectHandle {
-                generation: 1,
-                slot: 7,
-            }],
-            transforms: Vec::new(),
-            events: Vec::new(),
-            hash: StateHash([0; 32]),
-        };
-        let first = prepared_visual(101, 201);
-        let second = prepared_visual(102, 202);
-        let assets = MissionAssets {
-            visuals: vec![first, second],
-            object_visuals: vec![vec![AssetId::new(101), AssetId::new(102)]],
-            ..MissionAssets::default()
-        };
-        let commands = render_snapshot_commands_with_assets(&snapshot, Some(&assets), None)?;
-        let draws: Vec<_> = commands
-            .commands
-            .iter()
-            .filter_map(|command| match command {
-                RenderCommand::Draw(draw) => Some(draw),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(draws.len(), 2);
-        assert_eq!(draws[0].mesh, GpuMeshId(101));
-        assert_eq!(draws[1].mesh, GpuMeshId(102));
-        assert_eq!(draws[0].material, GpuMaterialId(201));
-        assert_eq!(draws[1].material, GpuMaterialId(202));
-        assert_ne!(draws[0].stable_order, draws[1].stable_order);
-        Ok(())
-    }
-
-    #[test]
-    fn render_snapshot_uses_mission_position_and_scale_without_interpreting_orientation() {
-        let draft = MissionObjectDraft {
-            original_id: None,
-            resource_name_raw: Vec::new(),
-            identity_or_clan_raw: 0,
-            position: [10.0, 20.0, 30.0],
-            orientation_raw: [1.0, 2.0, 3.0],
-            scale: [2.0, 3.0, 4.0],
-            visual_ids: Vec::new(),
-            properties: Vec::new(),
-            unit_components: Vec::new(),
-        };
-        assert_eq!(
-            mission_position_scale_transform(&draft),
-            [2.0, 0.0, 0.0, 10.0, 0.0, 3.0, 0.0, 20.0, 0.0, 0.0, 4.0, 30.0, 0.0, 0.0, 0.0, 1.0,]
-        );
-    }
-
-    #[test]
-    fn render_snapshot_prefers_world_transform_over_mission_draft() -> Result<(), String> {
-        let handle = ObjectHandle {
-            generation: 1,
-            slot: 0,
-        };
-        let snapshot = WorldSnapshot {
-            tick: Tick(1),
-            objects: vec![handle],
-            transforms: vec![(
-                handle,
-                TransformState {
-                    position: [
-                        100.0_f32.to_bits(),
-                        200.0_f32.to_bits(),
-                        300.0_f32.to_bits(),
-                    ],
-                    orientation: [0; 3],
-                    scale: [4.0_f32.to_bits(), 5.0_f32.to_bits(), 6.0_f32.to_bits()],
-                },
-            )],
-            events: Vec::new(),
-            hash: StateHash([0; 32]),
-        };
-        let drafts = vec![MissionObjectDraft {
-            original_id: None,
-            resource_name_raw: Vec::new(),
-            identity_or_clan_raw: 0,
-            position: [1.0; 3],
-            orientation_raw: [0.0; 3],
-            scale: [1.0; 3],
-            visual_ids: Vec::new(),
-            properties: Vec::new(),
-            unit_components: Vec::new(),
-        }];
-
-        let commands = render_snapshot_commands_with_assets(&snapshot, None, Some(&drafts))?;
-        let RenderCommand::Draw(draw) = &commands.commands[1] else {
-            return Err("expected draw".to_string());
-        };
-        assert_eq!(
-            draw.transform,
-            [
-                4.0, 0.0, 0.0, 100.0, 0.0, 5.0, 0.0, 200.0, 0.0, 0.0, 6.0, 300.0, 0.0, 0.0, 0.0,
-                1.0
-            ]
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn render_snapshot_preserves_mission_original_object_id() -> Result<(), String> {
-        let snapshot = WorldSnapshot {
-            tick: Tick(1),
-            objects: vec![ObjectHandle {
-                generation: 1,
-                slot: 0,
-            }],
-            transforms: Vec::new(),
-            events: Vec::new(),
-            hash: StateHash([0; 32]),
-        };
-        let drafts = vec![MissionObjectDraft {
-            original_id: Some(OriginalObjectId(42)),
-            resource_name_raw: Vec::new(),
-            identity_or_clan_raw: 0,
-            position: [0.0; 3],
-            orientation_raw: [0.0; 3],
-            scale: [1.0; 3],
-            visual_ids: Vec::new(),
-            properties: Vec::new(),
-            unit_components: Vec::new(),
-        }];
-
-        let commands = render_snapshot_commands_with_assets(&snapshot, None, Some(&drafts))?;
-        let RenderCommand::Draw(draw) = &commands.commands[1] else {
-            return Err("expected draw".to_string());
-        };
-        assert_eq!(draw.object_id, Some(OriginalObjectId(42)));
-        Ok(())
-    }
-
-    fn prepared_visual(id: u64, material: u64) -> PreparedVisual {
-        PreparedVisual {
-            id: AssetId::new(id),
-            mesh: None,
-            model_id: None,
-            wear_id: None,
-            model_nodes: 0,
-            model_slots: 0,
-            model_batches: 0,
-            material_count: 1,
-            material_ids: vec![AssetId::new(material)],
-            texture_ids: Vec::new(),
-            lightmap_ids: Vec::new(),
-            texture_count: 0,
-            lightmap_count: 0,
-        }
-    }
-
-    #[test]
-    #[ignore = "requires licensed corpus"]
-    fn selected_is_and_is2_missions_produce_approved_render_captures() {
-        for case in [
-            RenderCase {
-                root: "IS",
-                mission: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.01/data.tma",
-                expected: "{\"report_kind\":\"render-planning\",\"backend\":\"vulkan-planning\",\"window\":\"synthetic\",\"mission\":\"MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.01/data.tma\",\"objects\":33,\"frames\":1,\"tick\":1,\"draws\":33,\"submission_plans\":1,\"last_command_capture_bytes\":2008,\"hash\":\"ca17cc76e55c45e83c1c9c1c088e84bf1a698be91a7730943210fe27596af841\"}",
-            },
-            RenderCase {
-                root: "IS2",
-                mission: "MISSIONS/Campaign/CAMPAIGN.00/Mission.02/data.tma",
-                expected: "{\"report_kind\":\"render-planning\",\"backend\":\"vulkan-planning\",\"window\":\"synthetic\",\"mission\":\"MISSIONS/Campaign/CAMPAIGN.00/Mission.02/data.tma\",\"objects\":10,\"frames\":1,\"tick\":1,\"draws\":10,\"submission_plans\":1,\"last_command_capture_bytes\":605,\"hash\":\"5d720b3ab690076a398a79a404850bbeaee2e33811b5bb570ec8a96d4a7a2fc4\"}",
-            },
-        ] {
-            assert_eq!(
-                run(&render_args(&licensed_root(case.root), case.mission)),
-                Ok(case.expected.to_string())
-            );
-        }
-    }
-
-    #[test]
-    fn json_hash_is_hex() {
-        let mut hash = [0; 32];
-        hash[0] = 0xab;
-        hash[31] = 0xcd;
-
-        assert_eq!(
-            json_hash(&hash),
-            "\"ab000000000000000000000000000000000000000000000000000000000000cd\""
-        );
-    }
-
-    #[derive(Clone, Copy)]
-    struct RenderCase {
-        root: &'static str,
-        mission: &'static str,
-        expected: &'static str,
-    }
-
-    fn render_args(root: &Path, mission: &str) -> Vec<String> {
-        vec![
-            "--root".to_string(),
-            root.to_str().expect("utf8 root").to_string(),
-            "--mission".to_string(),
-            mission.to_string(),
-            "--frames".to_string(),
-            "1".to_string(),
-        ]
-    }
-
-    fn licensed_root(name: &str) -> PathBuf {
-        let variable = match name {
-            "IS" => "FPARKAN_CORPUS_PART1_ROOT",
-            "IS2" => "FPARKAN_CORPUS_PART2_ROOT",
-            _ => panic!("unknown licensed corpus part: {name}"),
-        };
-        let root = std::env::var_os(variable)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| panic!("{variable} is required for licensed corpus tests"));
-        assert!(
-            root.is_dir(),
-            "licensed corpus root is missing: {}",
-            root.display()
-        );
-        root
     }
 }

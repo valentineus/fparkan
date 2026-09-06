@@ -2,12 +2,10 @@
 
 use ash::{khr::surface, vk};
 use fparkan_platform::NativeWindowHandles;
-use serde::Serialize;
 use std::ffi::CStr;
 use std::os::raw::c_char;
 
 use super::VulkanInstanceProbe;
-use crate::policy::serialize_json_or_fallback;
 
 /// Deterministic Vulkan surface creation plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,24 +128,6 @@ pub fn create_vulkan_surface_probe(
         surface,
         report,
     })
-}
-
-/// Renders a deterministic JSON Vulkan surface plan.
-#[must_use]
-pub fn render_surface_plan_json(plan: &VulkanSurfacePlan) -> String {
-    #[derive(Serialize)]
-    struct SurfacePlanJson<'a> {
-        schema: u32,
-        required_instance_extensions: &'a [String],
-    }
-
-    serialize_json_or_fallback(
-        &SurfacePlanJson {
-            schema: plan.schema,
-            required_instance_extensions: &plan.required_instance_extensions,
-        },
-        "{\"schema\":0,\"required_instance_extensions\":[]}",
-    )
 }
 
 pub(super) fn extension_name(extension: *const c_char) -> Result<String, VulkanSurfaceError> {
