@@ -871,9 +871,12 @@ RVA `0x36610` строит `Rz(z) * Ry(y) * Rx(x)` с переносом в по
 Повороты и переносы узлов модели применяются до размещения объекта в миссии.
 
 Горизонтальная плоскость карты — XY, высота — Z. У GOG AutoDemo диапазон XY
-ландшафта составляет `0..1190.6976`. Высоты, сохранённые в `Land.msh`, переводятся
-в единицы мира делением на 32. Это отдельное преобразование ландшафта;
-применять его к координатам размещённых объектов нельзя.
+ландшафта составляет `0..1190.6976`, а исходный диапазон Z в `Land.msh` —
+`0..94.50981`. Проверенный native frame с той же камерой совпадает с силуэтом
+ландшафта при прямом использовании исходного Z; деление на 32 опускало бы этот
+горизонт примерно на 185 пикселей. Terrain, camera floor, shadow receivers и
+sun-ray queries поэтому используют исходные координаты `Land.msh` без
+преобразования Z.
 
 `Ngi32!niGet3DRender` (RVA `0x5640`) возвращает графический интерфейс.
 Вызов Direct3D7 `SetTransform` устанавливает projection из RVA `0x7030`
@@ -946,7 +949,23 @@ projected shadows и audio events обновляются вместе с кам�
 `--atmosphere-seconds` задаёт старт времени, `--frames 0` оставляет цикл
 бесконечным, а `--preview-roots` служит только диагностическим ограничителем.
 `--legacy-camera-capture` выбирает воспроизводимую камеру без free-flight
-управления.
+управления: запись selector 0 задаёт D3D7 transform, clip параметры и native
+viewport RECT `[left, top, right, bottom]`. Путь сохраняет оси basis из view
+matrix вместе с roll, переносит полученный `clip_from_world` в preview camera,
+переводит RECT в физический drawable размер `(right - left) × (bottom - top)`
+и отклоняет несовпадение размера при
+создании или resize вместо растягивания кадра. Результат нужно сравнивать с
+тем же crop исходного PNG `[left, top, right, bottom]`. Контроллер
+`FreeFlightCamera` в этом режиме не создаётся, но redraw продолжает обновлять
+environment и projected shadows от captured camera. Перед environment update и
+его audio events listener получает position, forward и up captured camera;
+начальная сортировка world draw использует её же position. Phase capture может
+содержать наблюдаемый mission path и проверенный `atmosphere_seconds`; viewer
+использует эту абсолютную фазу по умолчанию, если не указан явный CLI override,
+и удерживает sample атмосферы на ней через readback frames. FX по-прежнему
+получает реальный frame time. Это не полное simulation time: `weather`, RNG и
+остальное mission state остаются неизвестными, поэтому совпадение камеры и
+фазы не доказывает visual parity с native frame.
 
 Для сохранения кадра surface должен поддерживать `TRANSFER_SRC`. Renderer
 копирует последний отправленный swapchain image в host-visible buffer и

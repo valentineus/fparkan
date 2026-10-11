@@ -9,9 +9,6 @@ use fparkan_msh::{
 use fparkan_render::{LegacyDepthMode, LegacyIron3dEulerTransform, LegacyPipelineState};
 use fparkan_terrain_format::LandMeshDocument;
 
-/// Legacy `Land.msh` stored-height to mission-world-height scale.
-const LEGACY_LAND_HEIGHT_SCALE: f32 = 1.0 / 32.0;
-
 fn world_pipeline_state() -> LegacyPipelineState {
     LegacyPipelineState {
         depth: LegacyDepthMode::TestWrite,
@@ -1139,31 +1136,6 @@ pub fn project_land_msh_to_static_mesh_in_world_space(
     })
 }
 
-/// Projects terrain into the mission space consumed by the legacy D3D7 camera.
-///
-/// `Land.msh` stores horizontal coordinates directly, while its height stream
-/// uses 1/32 units. The scale is evidenced by the GOG `AutoDemo` map: raw terrain
-/// heights `95.29412..288.23532` become `2.978..9.007`, matching its placed
-/// object heights and the live Ngi32 camera's world-space Z coordinate.
-///
-/// This conversion is intentionally confined to the captured legacy-camera
-/// path. [`project_land_msh_to_static_mesh_in_world_space`] remains the raw
-/// source-coordinate bridge for format inspection.
-///
-/// # Errors
-///
-/// Returns [`VulkanAssetMeshError`] when the terrain cannot enter the static
-/// Vulkan input contract.
-pub fn project_land_msh_to_static_mesh_in_legacy_world_space(
-    terrain: &LandMeshDocument,
-) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
-    let mut mesh = project_land_msh_to_static_mesh_in_world_space(terrain)?;
-    for vertex in &mut mesh.vertices {
-        vertex.position[2] *= LEGACY_LAND_HEIGHT_SCALE;
-    }
-    Ok(mesh)
-}
-
 fn static_terrain_indices(terrain: &LandMeshDocument) -> Result<Vec<u32>, VulkanAssetMeshError> {
     let mut indices = Vec::with_capacity(
         terrain
@@ -2068,7 +2040,7 @@ mod tests {
     }
 
     #[test]
-    fn world_space_terrain_preserves_source_coordinates_and_faces() {
+    fn world_space_terrain_preserves_nonzero_source_heights_and_faces() {
         let terrain = LandMeshDocument {
             streams: Vec::new(),
             nodes_raw: Vec::new(),
@@ -2076,7 +2048,11 @@ mod tests {
                 header_raw: Vec::new(),
                 slots_raw: Vec::new(),
             },
-            positions: vec![[10.0, 20.0, 30.0], [40.0, 50.0, 60.0], [70.0, 80.0, 90.0]],
+            positions: vec![
+                [100.0, 200.0, 32.0],
+                [300.0, 400.0, 288.0],
+                [500.0, 600.0, 96.0],
+            ],
             normals: Vec::new(),
             uv0: vec![[1024, 65024], [0, 2048], [64512, 512]],
             accelerator: Vec::new(),
@@ -2089,39 +2065,10 @@ mod tests {
             .expect("representable source-space terrain");
 
         assert_eq!(mesh.indices, vec![2, 0, 1]);
-        assert_eq!(mesh.vertices[0].position, [10.0, 20.0, 30.0]);
-        assert_eq!(mesh.vertices[2].position, [70.0, 80.0, 90.0]);
+        assert_eq!(mesh.vertices[0].position, [100.0, 200.0, 32.0]);
+        assert_eq!(mesh.vertices[1].position, [300.0, 400.0, 288.0]);
+        assert_eq!(mesh.vertices[2].position, [500.0, 600.0, 96.0]);
         assert_eq!(mesh.vertices[0].uv, [1.0, 63.5]);
-    }
-
-    #[test]
-    fn legacy_world_space_terrain_scales_only_stored_height() {
-        let terrain = LandMeshDocument {
-            streams: Vec::new(),
-            nodes_raw: Vec::new(),
-            slots: TerrainSlotTable {
-                header_raw: Vec::new(),
-                slots_raw: Vec::new(),
-            },
-            positions: vec![
-                [100.0, 200.0, 96.0],
-                [300.0, 400.0, 288.0],
-                [500.0, 600.0, 192.0],
-            ],
-            normals: Vec::new(),
-            uv0: vec![[0, 0]; 3],
-            accelerator: Vec::new(),
-            aux14: Vec::new(),
-            aux18: Vec::new(),
-            faces: vec![terrain_face([0, 1, 2])],
-        };
-
-        let mesh = project_land_msh_to_static_mesh_in_legacy_world_space(&terrain)
-            .expect("representable terrain");
-
-        assert_eq!(mesh.vertices[0].position, [100.0, 200.0, 3.0]);
-        assert_eq!(mesh.vertices[1].position, [300.0, 400.0, 9.0]);
-        assert_eq!(mesh.vertices[2].position, [500.0, 600.0, 6.0]);
     }
 
     fn terrain_face(vertices: [u16; 3]) -> TerrainFace28 {

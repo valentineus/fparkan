@@ -37,8 +37,7 @@ use fparkan_render::{
 };
 use fparkan_render_vulkan::{
     node38_pose, node38_pose_from_hierarchy, node38_pose_relative_to_root,
-    node38_pose_relative_to_root_from_hierarchy,
-    project_land_msh_to_static_mesh_in_legacy_world_space,
+    node38_pose_relative_to_root_from_hierarchy, project_land_msh_to_static_mesh_in_world_space,
     project_msh_to_static_mesh_in_world_space_with_node_fallback_poses,
     project_msh_to_static_mesh_in_world_space_with_node_fallback_poses_and_mount,
     project_msh_to_static_mesh_in_world_space_with_node_pose_buffer,
@@ -110,6 +109,8 @@ fn run(args: &[String]) -> Result<String, String> {
         .as_deref()
         .map(load_legacy_camera_capture)
         .transpose()?;
+    let atmosphere_seconds = selected_atmosphere_seconds(args.atmosphere_seconds, camera.as_ref());
+    let hold_schedule_phase = camera.is_some() && atmosphere_seconds.is_some();
     let terrain_materials_duration_started = Instant::now();
     let preview = static_preview_mesh_and_materials(
         mission_assets,
@@ -127,7 +128,12 @@ fn run(args: &[String]) -> Result<String, String> {
     // sky to the selected map (there are many `sky.ske` files in the campaign
     // tree).
     let sky_started = Instant::now();
-    let environment = load_environment(&args.root, &args.mission, args.atmosphere_seconds)?;
+    let environment = load_environment(
+        &args.root,
+        &args.mission,
+        atmosphere_seconds,
+        hold_schedule_phase,
+    )?;
     let sky_duration = sky_started.elapsed();
     let audio = match audio::GameAudio::new(Arc::new(DirectoryVfs::new(&args.root)), &args.mission)
     {
@@ -290,7 +296,6 @@ impl FreeFlightCamera {
                 .ok()
                 .flatten()
                 .filter(|height| height.is_finite())
-                .map(|height| height / 32.0)
         };
         let (spawn_xy, spawn_ground) = sample_offsets
             .into_iter()
@@ -433,6 +438,95 @@ impl FreeFlightCamera {
         VulkanStaticCamera {
             clip_from_world: multiply_row_major(view, projection),
         }
+    }
+
+    fn preview_frame(self, aspect: f32) -> PreviewCameraFrame {
+        let camera = self.vulkan_camera(aspect);
+        PreviewCameraFrame {
+            position: self.position,
+            forward: self.forward(),
+            right: self.right(),
+            up: self.up(),
+            vertical_fov: self.vertical_fov,
+            near_plane: self.near_plane,
+            far_plane: self.far_plane,
+            clip_from_world: camera.clip_from_world,
+        }
+    }
+}
+
+/// Immutable view data shared by the environment renderers. The optional
+/// `FreeFlightCamera` remains only the input controller; captured views keep
+/// their original basis and clip transform, including roll.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PreviewCameraFrame {
+    position: [f32; 3],
+    forward: [f32; 3],
+    right: [f32; 3],
+    up: [f32; 3],
+    vertical_fov: f32,
+    near_plane: f32,
+    far_plane: f32,
+    clip_from_world: [f32; 16],
+}
+
+impl PreviewCameraFrame {
+    fn from_legacy_d3d7(
+        transform: RawCameraTransform,
+        projection: LegacyD3d7Projection,
+    ) -> Option<Self> {
+        let camera = VulkanStaticCamera::from_legacy_d3d7(transform, projection)?;
+        let view = transform.try_direct3d7_view_row_major()?;
+        let width = projection.viewport[2].checked_sub(projection.viewport[0])?;
+        let height = projection.viewport[3].checked_sub(projection.viewport[1])?;
+        if width <= 0 || height <= 0 {
+            return None;
+        }
+        let aspect = width as f32 / height as f32;
+        let vertical_fov = 2.0 * ((projection.field_of_view_radians * 0.5).tan() / aspect).atan();
+        let frame = Self {
+            position: transform.translation(),
+            // The camera axes are the columns of Ngi32's D3D7 view matrix.
+            // Keeping them directly preserves native roll and avoids
+            // reconstructing an incomplete yaw/pitch camera.
+            right: [view[0], view[4], view[8]],
+            up: [view[1], view[5], view[9]],
+            forward: [view[2], view[6], view[10]],
+            vertical_fov,
+            near_plane: projection.near_plane,
+            far_plane: projection.far_plane,
+            clip_from_world: camera.clip_from_world,
+        };
+        (frame.position.iter().all(|value| value.is_finite())
+            && frame.forward.iter().all(|value| value.is_finite())
+            && frame.right.iter().all(|value| value.is_finite())
+            && frame.up.iter().all(|value| value.is_finite())
+            && frame.vertical_fov.is_finite()
+            && frame.vertical_fov > 0.0
+            && frame.vertical_fov < std::f32::consts::PI)
+            .then_some(frame)
+    }
+
+    fn vulkan_camera(self) -> VulkanStaticCamera {
+        VulkanStaticCamera {
+            clip_from_world: self.clip_from_world,
+        }
+    }
+
+    fn forward(self) -> [f32; 3] {
+        self.forward
+    }
+
+    fn right(self) -> [f32; 3] {
+        self.right
+    }
+
+    fn up(self) -> [f32; 3] {
+        self.up
+    }
+
+    fn yaw(self) -> f32 {
+        self.forward[1].atan2(self.forward[0])
     }
 }
 
@@ -1244,7 +1338,7 @@ fn terrain_shadow_receivers(
                     .get(usize::from(index))
                     .copied()
                     .unwrap_or([0.0; 3]);
-                [source[0], source[1], source[2] / 32.0]
+                source
             });
             if !positions.iter().flatten().all(|value| value.is_finite()) {
                 return Err("terrain shadow receiver contains a non-finite position".to_string());
@@ -1715,7 +1809,7 @@ fn quad_indices(slot_count: usize) -> Result<Vec<u32>, String> {
 }
 
 fn placeholder_quad_vertices(
-    camera: &FreeFlightCamera,
+    camera: &PreviewCameraFrame,
     slot_count: usize,
     size: f32,
 ) -> Vec<VulkanStaticVertex> {
@@ -1738,7 +1832,7 @@ fn placeholder_quad_vertices(
 }
 
 fn screen_gradient_quad_vertices(
-    camera: &FreeFlightCamera,
+    camera: &PreviewCameraFrame,
     viewport: [f32; 2],
     color: [f32; 3],
 ) -> [VulkanStaticVertex; 4] {
@@ -1785,7 +1879,7 @@ impl EnvironmentGpuScene {
         environment_materials: &SkyMaterials,
         material_assets: &HashMap<String, EnvironmentMaterialAsset>,
         sky_mesh: &SkyMesh,
-        camera: &FreeFlightCamera,
+        camera: &PreviewCameraFrame,
         shadow_range_index: &mut usize,
     ) -> Result<Self, String> {
         let mut names = HashMap::new();
@@ -2238,7 +2332,7 @@ impl EnvironmentGpuScene {
         sky_frame: &SkyFrame,
         sky_mesh: &SkyMesh,
         environment_frame: &EnvironmentFrame,
-        camera: &FreeFlightCamera,
+        camera: &PreviewCameraFrame,
         viewport: [f32; 2],
         material_clock_ms: u32,
         terrain: &TerrainWorld,
@@ -2280,7 +2374,7 @@ impl EnvironmentGpuScene {
                 (optics.primary_color[index] - sky_frame.sun.color[index]).max(0.0)
             })
         });
-        let gradient = sky_frame.screen_gradient(camera.yaw, glare_rgb_delta);
+        let gradient = sky_frame.screen_gradient(camera.yaw(), glare_rgb_delta);
         if let Some(optics) = optics {
             let mut uniforms = renderer.frame_uniforms();
             if sky_frame.sun.active {
@@ -2589,7 +2683,7 @@ fn sprite_frame_for_row<'frame, 'materials>(
         .find(|sprite| sprite.row == row)
 }
 
-fn horizontal_fov(camera: &FreeFlightCamera, aspect: f32) -> f32 {
+fn horizontal_fov(camera: &PreviewCameraFrame, aspect: f32) -> f32 {
     let aspect = if aspect.is_finite() && aspect > 0.0 {
         aspect
     } else {
@@ -2602,14 +2696,14 @@ fn horizontal_fov(camera: &FreeFlightCamera, aspect: f32) -> f32 {
 ///
 /// The native CSun caller starts a half-unit in front of the camera along the
 /// normalized geometry direction, then queries the finite segment ending at
-/// the sun center. `Land.msh` stores Z in the native 32x height unit while the
-/// renderer's world projection divides it by 32, so only the Z components are
-/// scaled before the terrain query. The ray parameter remains normalized to
-/// the finite segment and is therefore independent of world distance.
+/// the sun center. Terrain source positions and captured-camera positions both
+/// use the `Land.msh` coordinate units, so the ray is queried without a Z
+/// conversion. Its parameter remains normalized to the finite segment and is
+/// therefore independent of world distance.
 #[cfg(test)]
 fn native_sun_unoccluded(
     terrain: &TerrainWorld,
-    camera: &FreeFlightCamera,
+    camera: &PreviewCameraFrame,
     direction: [f32; 3],
 ) -> bool {
     let empty_mesh = VulkanStaticMesh {
@@ -2624,7 +2718,7 @@ fn native_sun_unoccluded_with_world(
     terrain: &TerrainWorld,
     world_mesh: &VulkanStaticMesh,
     sun_occlusion_range_indices: &[usize],
-    camera: &FreeFlightCamera,
+    camera: &PreviewCameraFrame,
     direction: [f32; 3],
 ) -> bool {
     // Native CSun requests object kinds 1, 3, 4, and 10 (the aggregate
@@ -2655,11 +2749,9 @@ fn native_sun_unoccluded_with_world(
     if dot3(segment, segment) <= f32::EPSILON {
         return true;
     }
-    let origin = [start[0], start[1], start[2] * 32.0];
-    let terrain_segment = [segment[0], segment[1], segment[2] * 32.0];
     if let Ok(Some(hit)) = terrain.raycast_excluding(
-        origin,
-        terrain_segment,
+        start,
+        segment,
         FullSurfaceMask(0),
         FullSurfaceMask(0x0000_0020),
     ) {
@@ -2782,7 +2874,7 @@ fn first_indexed_vertex_distance(
 }
 
 fn project_direction_pixels(
-    camera: &FreeFlightCamera,
+    camera: &PreviewCameraFrame,
     direction: [f32; 3],
     viewport: [f32; 2],
 ) -> Option<[f32; 2]> {
@@ -2809,7 +2901,7 @@ fn project_direction_pixels(
 }
 
 fn screen_ray_from_pixels(
-    camera: &FreeFlightCamera,
+    camera: &PreviewCameraFrame,
     pixels: [f32; 2],
     viewport: [f32; 2],
 ) -> Option<[f32; 3]> {
@@ -2835,7 +2927,7 @@ fn screen_ray_from_pixels(
 }
 
 fn sprite_quad_vertices_pixels(
-    camera: &FreeFlightCamera,
+    camera: &PreviewCameraFrame,
     direction: [f32; 3],
     distance: f32,
     half_width_pixels: f32,
@@ -2878,7 +2970,7 @@ fn precipitation_quad_vertices(
     kind: PrecipitationKind,
     screen: &ScreenBillboard,
     color: [f32; 4],
-    camera: &FreeFlightCamera,
+    camera: &PreviewCameraFrame,
     viewport: [f32; 2],
 ) -> [VulkanStaticVertex; 4] {
     let rgb = [color[0], color[1], color[2]];
@@ -2902,7 +2994,7 @@ fn precipitation_quad_vertices(
 }
 
 fn world_from_ndc(
-    camera: &FreeFlightCamera,
+    camera: &PreviewCameraFrame,
     ndc: [f32; 2],
     depth: f32,
     viewport: [f32; 2],
@@ -2945,13 +3037,15 @@ struct DynamicEnvironment {
     material_assets: HashMap<String, EnvironmentMaterialAsset>,
     schedule_offset_seconds: f32,
     time_seconds: f32,
+    fixed_schedule_seconds: Option<f32>,
+    fixed_phase_reported: bool,
 }
 
 impl DynamicEnvironment {
     fn update(
         &mut self,
         dt_seconds: f32,
-        camera: &FreeFlightCamera,
+        camera: &PreviewCameraFrame,
         aspect: f32,
         viewport: [f32; 2],
         renderer: &mut VulkanSmokeRenderer,
@@ -2962,12 +3056,21 @@ impl DynamicEnvironment {
         } else {
             0.0
         };
-        self.time_seconds = if self.time_seconds.is_finite() {
-            self.time_seconds + dt_seconds
-        } else {
-            0.0
-        };
-        let absolute_time_seconds = self.schedule_offset_seconds + self.time_seconds;
+        let (time_seconds, absolute_time_seconds) = environment_sample_time(
+            self.time_seconds,
+            self.schedule_offset_seconds,
+            dt_seconds,
+            self.fixed_schedule_seconds,
+        );
+        self.time_seconds = time_seconds;
+        if let Some(seconds) = self.fixed_schedule_seconds {
+            if !self.fixed_phase_reported {
+                eprintln!(
+                    "CAPTURE_PHASE_SAMPLE absolute_seconds={seconds:.6} schedule_frozen=true"
+                );
+                self.fixed_phase_reported = true;
+            }
+        }
         let atmosphere = self.schedule.sample(absolute_time_seconds);
         let mut sky_mesh = self.sky.mesh().clone();
         let sky_frame =
@@ -2987,7 +3090,7 @@ impl DynamicEnvironment {
         }
 
         let mut uniforms = renderer.frame_uniforms();
-        uniforms.clip_from_world = camera.vulkan_camera(aspect).clip_from_world;
+        uniforms.clip_from_world = camera.clip_from_world;
         for (target, source) in uniforms
             .directional_lights
             .iter_mut()
@@ -3053,6 +3156,7 @@ fn load_environment(
     root: &Path,
     mission: &str,
     atmosphere_seconds: Option<f32>,
+    hold_schedule_phase: bool,
 ) -> Result<Option<DynamicEnvironment>, String> {
     let mission_dir = mission_asset_directory(root, mission)?;
     let Some(sky_path) = find_mission_file(&mission_dir, "sky.ske")? else {
@@ -3198,6 +3302,11 @@ fn load_environment(
     let time_seconds = atmosphere_seconds
         .map(|seconds| seconds - initial_offset_seconds)
         .unwrap_or(0.0);
+    let fixed_schedule_seconds = if hold_schedule_phase {
+        atmosphere_seconds
+    } else {
+        None
+    };
     let mut environment = EnvironmentSystem::new(0x4650_4152_4B41_4E_u64);
     environment.set_lightning_effect(lightning_effect);
     Ok(Some(DynamicEnvironment {
@@ -3208,7 +3317,30 @@ fn load_environment(
         material_assets,
         schedule_offset_seconds: initial_offset_seconds,
         time_seconds,
+        fixed_schedule_seconds,
+        fixed_phase_reported: false,
     }))
+}
+
+fn environment_sample_time(
+    time_seconds: f32,
+    schedule_offset_seconds: f32,
+    dt_seconds: f32,
+    fixed_schedule_seconds: Option<f32>,
+) -> (f32, f32) {
+    if let Some(absolute_seconds) = fixed_schedule_seconds {
+        return (time_seconds, absolute_seconds);
+    }
+
+    let next_time_seconds = if time_seconds.is_finite() {
+        time_seconds + dt_seconds
+    } else {
+        0.0
+    };
+    (
+        next_time_seconds,
+        schedule_offset_seconds + next_time_seconds,
+    )
 }
 
 /// Returns the host directory containing the selected mission's assets.
@@ -3353,10 +3485,33 @@ struct StaticPreviewScene {
     shadow_material_index: usize,
     terrain: Arc<TerrainWorld>,
     camera: VulkanStaticCamera,
+    view_camera: PreviewCameraFrame,
+    captured_viewport: Option<CapturedViewport>,
     free_camera: Option<FreeFlightCamera>,
     camera_mode: &'static str,
     mesh_components: usize,
     terrain_components: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CapturedViewport {
+    /// Original D3D7 viewport rectangle `(left, top, right, bottom)`. The
+    /// preview window renders `extent` and should be compared with this crop.
+    rect: [i32; 4],
+    extent: [u32; 2],
+}
+
+fn validate_captured_drawable_extent(
+    captured: CapturedViewport,
+    actual: [u32; 2],
+) -> Result<(), String> {
+    if actual == captured.extent {
+        return Ok(());
+    }
+    Err(format!(
+        "legacy camera viewport crop {:?} requires a {}x{} drawable, but the window provides {}x{}; refusing to compare a stretched render",
+        captured.rect, captured.extent[0], captured.extent[1], actual[0], actual[1]
+    ))
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -3519,7 +3674,7 @@ fn static_preview_mesh_and_materials(
     assets: &MissionAssets,
     terrain: &TerrainWorld,
     roots: &[MissionObjectDraft],
-    legacy_camera: Option<VulkanStaticCamera>,
+    legacy_camera: Option<LegacyCameraCapture>,
     static_animation_frame: Option<u16>,
     static_material_phase: Option<u16>,
     root: &std::path::Path,
@@ -3539,7 +3694,7 @@ fn static_preview_mesh_and_materials(
     let mut shadow_casters = Vec::new();
     let shadow_receivers = terrain_shadow_receivers(terrain_mesh)?;
     let mut terrain_material_loader = StandaloneWearMaterialLoader::new(root);
-    let terrain_component = project_land_msh_to_static_mesh_in_legacy_world_space(terrain_mesh)
+    let terrain_component = project_land_msh_to_static_mesh_in_world_space(terrain_mesh)
         .map_err(|err| format!("project mission terrain for Vulkan: {err}"))?;
     let terrain_materials = static_preview_terrain_base_materials(
         &mut terrain_material_loader,
@@ -3853,11 +4008,18 @@ fn static_preview_mesh_and_materials(
     } else {
         None
     };
-    let camera = legacy_camera.unwrap_or_else(|| {
+    let captured_viewport = legacy_camera
+        .as_ref()
+        .map(LegacyCameraCapture::captured_viewport)
+        .transpose()?;
+    let view_camera = if let Some(capture) = legacy_camera.as_ref() {
+        capture.preview_camera_frame()?
+    } else {
         free_camera
-            .map(|camera| camera.vulkan_camera(16.0 / 9.0))
-            .unwrap_or_default()
-    });
+            .map(|camera| camera.preview_frame(16.0 / 9.0))
+            .ok_or_else(|| "static preview camera is unavailable".to_string())?
+    };
+    let camera = view_camera.vulkan_camera();
     let shadow_material_index = append_shadow_material(&mut materials)?;
     Ok(StaticPreviewScene {
         mesh,
@@ -3869,6 +4031,8 @@ fn static_preview_mesh_and_materials(
         shadow_material_index,
         terrain: Arc::new(terrain.clone()),
         camera,
+        view_camera,
+        captured_viewport,
         free_camera,
         camera_mode: if legacy_camera.is_some() {
             "legacy-d3d7-capture"
@@ -4560,17 +4724,7 @@ fn run_static_vulkan_mode(
     )?;
     let environment_gpu = match environment.as_mut() {
         Some(environment) => {
-            let camera = preview.free_camera.unwrap_or_else(|| {
-                FreeFlightCamera::from_mesh(&preview.mesh).unwrap_or(FreeFlightCamera {
-                    position: [0.0; 3],
-                    yaw: 0.0,
-                    pitch: 0.0,
-                    vertical_fov: std::f32::consts::FRAC_PI_3,
-                    near_plane: 0.1,
-                    far_plane: 100_000.0,
-                    move_speed: 1.0,
-                })
-            });
+            let camera = preview.view_camera;
             let environment_materials = environment.materials.clone();
             let material_assets = environment.material_assets.clone();
             let sky_mesh = environment.sky.mesh().clone();
@@ -4620,6 +4774,8 @@ struct StaticVulkanApp {
     world_range_indices: Vec<usize>,
     world_range_index_counts: HashMap<usize, u32>,
     camera: VulkanStaticCamera,
+    view_camera: PreviewCameraFrame,
+    captured_viewport: Option<CapturedViewport>,
     free_camera: Option<FreeFlightCamera>,
     environment: Option<DynamicEnvironment>,
     environment_gpu: Option<EnvironmentGpuScene>,
@@ -4698,6 +4854,8 @@ impl StaticVulkanApp {
             world_range_indices,
             world_range_index_counts,
             camera: preview.camera,
+            view_camera: preview.view_camera,
+            captured_viewport: preview.captured_viewport,
             free_camera: preview.free_camera,
             environment,
             environment_gpu,
@@ -4832,21 +4990,18 @@ impl StaticVulkanApp {
         } else {
             size.width as f32 / size.height as f32
         };
-        let (camera, listener_position, listener_forward, listener_up) = {
+        let view_camera = {
             let free_camera = self
                 .free_camera
                 .as_mut()
                 .ok_or_else(|| "free-flight camera disappeared".to_string())?;
             free_camera.advance(&self.pressed_keys, elapsed.as_secs_f32());
-            (
-                free_camera.vulkan_camera(aspect),
-                free_camera.position,
-                free_camera.forward(),
-                free_camera.up(),
-            )
+            free_camera.preview_frame(aspect)
         };
+        let camera = view_camera.vulkan_camera();
+        self.view_camera = view_camera;
         self.camera = camera;
-        let sort_keys = self.world_draw_sort_keys(listener_position)?;
+        let sort_keys = self.world_draw_sort_keys(view_camera.position)?;
         if let Some(renderer) = self.renderer.as_mut() {
             renderer
                 .set_camera(camera)
@@ -4858,11 +5013,6 @@ impl StaticVulkanApp {
                         format!("update world draw range {range_index} sort key: {error}")
                     })?;
             }
-        }
-        if let Some(audio) = self.audio.as_mut() {
-            audio
-                .update_listener(listener_position, listener_forward, listener_up)
-                .map_err(|error| format!("update audio listener: {error}"))?;
         }
         Ok(())
     }
@@ -4934,14 +5084,18 @@ impl StaticVulkanApp {
         let Some(renderer) = self.renderer.as_mut() else {
             return Ok(());
         };
-        let viewport = self
-            .window
-            .as_ref()
-            .map(|window| {
-                let size = window.inner_size();
-                [size.width.max(1) as f32, size.height.max(1) as f32]
-            })
-            .unwrap_or([1280.0, 720.0]);
+        let viewport = self.captured_viewport.map_or_else(
+            || {
+                self.window
+                    .as_ref()
+                    .map(|window| {
+                        let size = window.inner_size();
+                        [size.width.max(1) as f32, size.height.max(1) as f32]
+                    })
+                    .unwrap_or([1280.0, 720.0])
+            },
+            |viewport| [viewport.extent[0] as f32, viewport.extent[1] as f32],
+        );
         let aspect = viewport[0] / viewport[1].max(1.0);
         let now = Instant::now();
         let dt = now
@@ -4963,8 +5117,13 @@ impl StaticVulkanApp {
             &active_materials,
             renderer,
         )?;
-        let free_camera = self.free_camera;
-        if let (Some(camera), Some(environment)) = (free_camera, self.environment.as_mut()) {
+        let camera = self.view_camera;
+        if let Some(audio) = self.audio.as_mut() {
+            audio
+                .update_listener(camera.position, camera.forward, camera.up)
+                .map_err(|error| format!("update audio listener: {error}"))?;
+        }
+        if let Some(environment) = self.environment.as_mut() {
             let (sky_frame, sky_mesh, environment_frame) =
                 environment.update(dt, &camera, aspect, viewport, renderer, self.audio.as_mut())?;
             self.environment_primitive_count = environment_frame.primitives.len();
@@ -5003,7 +5162,7 @@ impl StaticVulkanApp {
                 Some(shadow_camera),
             )?;
         } else {
-            let shadow_camera = free_camera.map(|camera| ShadowCamera {
+            let shadow_camera = Some(ShadowCamera {
                 position: camera.position,
                 viewport_width: viewport[0],
                 horizontal_fov: horizontal_fov(&camera, aspect),
@@ -5114,14 +5273,24 @@ impl StaticVulkanApp {
             .map_or(report.renderer_report.swapchain_image_format, |artifact| {
                 artifact.format
             });
+        let captured_crop = self.captured_viewport.map_or_else(
+            || "none".to_string(),
+            |viewport| {
+                format!(
+                    "{:?} ({}x{})",
+                    viewport.rect, viewport.extent[0], viewport.extent[1]
+                )
+            },
+        );
         self.output = Some(format!(
-            "rendered mission {}: {} frames, {} objects, {} mesh components, {} terrain components, camera={}, materials={}, environment_primitives={}, shadow_casters={}, shadow_indices={}, swapchain_recreates={}, validation={}, swapchain_format={}, readback_format={}, readback={}, startup_ms={{mission_assets:{:.1},terrain_materials:{:.1},sky:{:.1},gpu_initialization:{:.1}}}",
+            "rendered mission {}: {} frames, {} objects, {} mesh components, {} terrain components, camera={}, captured_viewport_crop={}, materials={}, environment_primitives={}, shadow_casters={}, shadow_indices={}, swapchain_recreates={}, validation={}, swapchain_format={}, readback_format={}, readback={}, startup_ms={{mission_assets:{:.1},terrain_materials:{:.1},sky:{:.1},gpu_initialization:{:.1}}}",
             self.mission,
             self.frames_presented,
             self.object_count,
             self.mesh_components,
             self.terrain_components,
             self.camera_mode,
+            captured_crop,
             self.materials.len(),
             self.environment_primitive_count,
             self.shadow_last_evidence.visible_casters,
@@ -5176,9 +5345,17 @@ impl ApplicationHandler for StaticVulkanApp {
                 return;
             }
         };
+        let (width, height) = self
+            .captured_viewport
+            .map(|viewport| (viewport.extent[0], viewport.extent[1]))
+            .unwrap_or((plan.width, plan.height));
         let attributes = Window::default_attributes()
             .with_title("FParkan mission")
-            .with_inner_size(WinitPhysicalSize::new(plan.width, plan.height));
+            .with_inner_size(WinitPhysicalSize::new(width, height))
+            // The captured clip matrix is exact for the recorded viewport
+            // aspect. Keep that drawable fixed; compare it with the same
+            // (left, top, right, bottom) crop in the original capture.
+            .with_resizable(self.captured_viewport.is_none());
         let window = match event_loop.create_window(attributes) {
             Ok(window) => window,
             Err(err) => {
@@ -5187,12 +5364,21 @@ impl ApplicationHandler for StaticVulkanApp {
                 return;
             }
         };
+        let size = window.inner_size();
+        if let Some(captured_viewport) = self.captured_viewport {
+            if let Err(error) =
+                validate_captured_drawable_extent(captured_viewport, [size.width, size.height])
+            {
+                self.error = Some(error);
+                event_loop.exit();
+                return;
+            }
+        }
         let Some(native_handles) = window_native_handles(&window) else {
             self.error = Some("winit window does not expose native handles".to_string());
             event_loop.exit();
             return;
         };
-        let size = window.inner_size();
         let gpu_initialization_started = Instant::now();
         let mut renderer = match VulkanSmokeRenderer::new(&VulkanSmokeRendererCreateInfo {
             application_name: "fparkan-game".to_string(),
@@ -5206,8 +5392,8 @@ impl ApplicationHandler for StaticVulkanApp {
             bootstrap_progress: None,
         }) {
             Ok(renderer) => renderer,
-            Err(err) => {
-                self.error = Some(err.to_string());
+            Err(error) => {
+                self.error = Some(error.to_string());
                 event_loop.exit();
                 return;
             }
@@ -5217,32 +5403,29 @@ impl ApplicationHandler for StaticVulkanApp {
             event_loop.exit();
             return;
         }
-        if let Some(free_camera) = self.free_camera {
-            match self.world_draw_sort_keys(free_camera.position) {
-                Ok(sort_keys) => {
-                    for (range_index, sort_key) in sort_keys {
-                        if let Err(error) = renderer.set_draw_range_sort_key(range_index, sort_key)
-                        {
-                            self.error = Some(format!(
-                                "update world draw range {range_index} sort key: {error}"
-                            ));
-                            event_loop.exit();
-                            return;
-                        }
+        match self.world_draw_sort_keys(self.view_camera.position) {
+            Ok(sort_keys) => {
+                for (range_index, sort_key) in sort_keys {
+                    if let Err(error) = renderer.set_draw_range_sort_key(range_index, sort_key) {
+                        self.error = Some(format!(
+                            "update world draw range {range_index} sort key: {error}"
+                        ));
+                        event_loop.exit();
+                        return;
                     }
                 }
-                Err(error) => {
-                    self.error = Some(error);
-                    event_loop.exit();
-                    return;
-                }
+            }
+            Err(error) => {
+                self.error = Some(error);
+                event_loop.exit();
+                return;
             }
         }
         self.startup_timings.gpu_initialization = gpu_initialization_started.elapsed();
         renderer.set_readback_enabled(self.readback_out.is_some());
         self.window_id = Some(window.id());
-        self.renderer = Some(renderer);
         self.window = Some(window);
+        self.renderer = Some(renderer);
         self.last_tick = Instant::now();
         self.environment_last_tick = Instant::now();
         self.material_last_tick = Instant::now();
@@ -5300,8 +5483,26 @@ impl ApplicationHandler for StaticVulkanApp {
             }
             WindowEvent::CursorMoved { .. } => {}
             WindowEvent::Resized(size) => {
+                // Queued creation resize events can predate the current physical drawable.
+                let drawable_size = if self.captured_viewport.is_some() {
+                    self.window.as_ref().map(Window::inner_size).unwrap_or(size)
+                } else {
+                    size
+                };
+                if let Some(captured_viewport) = self.captured_viewport {
+                    if drawable_size.width != 0 && drawable_size.height != 0 {
+                        if let Err(error) = validate_captured_drawable_extent(
+                            captured_viewport,
+                            [drawable_size.width, drawable_size.height],
+                        ) {
+                            self.error = Some(error);
+                            event_loop.exit();
+                            return;
+                        }
+                    }
+                }
                 if let Some(renderer) = self.renderer.as_mut() {
-                    renderer.request_resize((size.width, size.height));
+                    renderer.request_resize((drawable_size.width, drawable_size.height));
                 }
             }
             WindowEvent::RedrawRequested => {
@@ -5484,22 +5685,70 @@ impl Args {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 struct LegacyCameraCapture {
     schema: String,
+    render_input_usable: Option<bool>,
     selector0_words: [u32; 16],
     viewport: [i32; 4],
     near_plane: f32,
     far_plane: f32,
     field_of_view_radians: f32,
+    atmosphere_seconds: Option<f32>,
 }
 
-fn load_legacy_camera_capture(path: &std::path::Path) -> Result<VulkanStaticCamera, String> {
+fn selected_atmosphere_seconds(
+    command_line: Option<f32>,
+    capture: Option<&LegacyCameraCapture>,
+) -> Option<f32> {
+    command_line.or_else(|| capture.and_then(|capture| capture.atmosphere_seconds))
+}
+
+impl LegacyCameraCapture {
+    fn captured_viewport(&self) -> Result<CapturedViewport, String> {
+        let width = self.viewport[2]
+            .checked_sub(self.viewport[0])
+            .filter(|width| *width > 0)
+            .ok_or_else(|| "legacy camera capture has an invalid viewport width".to_string())?;
+        let height = self.viewport[3]
+            .checked_sub(self.viewport[1])
+            .filter(|height| *height > 0)
+            .ok_or_else(|| "legacy camera capture has an invalid viewport height".to_string())?;
+        Ok(CapturedViewport {
+            rect: self.viewport,
+            extent: [
+                u32::try_from(width)
+                    .map_err(|_| "legacy camera viewport width exceeds u32".to_string())?,
+                u32::try_from(height)
+                    .map_err(|_| "legacy camera viewport height exceeds u32".to_string())?,
+            ],
+        })
+    }
+
+    fn preview_camera_frame(&self) -> Result<PreviewCameraFrame, String> {
+        let frame = PreviewCameraFrame::from_legacy_d3d7(
+            RawCameraTransform {
+                words: self.selector0_words,
+            },
+            LegacyD3d7Projection {
+                viewport: self.viewport,
+                near_plane: self.near_plane,
+                far_plane: self.far_plane,
+                field_of_view_radians: self.field_of_view_radians,
+            },
+        )
+        .ok_or_else(|| "legacy camera capture contains an invalid D3D7 camera".to_string())?;
+        self.captured_viewport()?;
+        Ok(frame)
+    }
+}
+
+fn load_legacy_camera_capture(path: &std::path::Path) -> Result<LegacyCameraCapture, String> {
     let bytes = std::fs::read(path).map_err(|err| format!("{}: {err}", path.display()))?;
     parse_legacy_camera_capture(&bytes).map_err(|err| format!("{}: {err}", path.display()))
 }
 
-fn parse_legacy_camera_capture(bytes: &[u8]) -> Result<VulkanStaticCamera, String> {
+fn parse_legacy_camera_capture(bytes: &[u8]) -> Result<LegacyCameraCapture, String> {
     // Windows PowerShell 5.1 writes redirected text as UTF-16LE with a BOM.
     // `capture-original-camera.ps1` intentionally emits plain JSON, so accept
     // that normal hand-off format as well as UTF-8 without making the caller
@@ -5510,18 +5759,19 @@ fn parse_legacy_camera_capture(bytes: &[u8]) -> Result<VulkanStaticCamera, Strin
     if capture.schema != "fparkan-legacy-camera-v1" {
         return Err("unsupported legacy camera capture schema".to_string());
     }
-    VulkanStaticCamera::from_legacy_d3d7(
-        RawCameraTransform {
-            words: capture.selector0_words,
-        },
-        LegacyD3d7Projection {
-            viewport: capture.viewport,
-            near_plane: capture.near_plane,
-            far_plane: capture.far_plane,
-            field_of_view_radians: capture.field_of_view_radians,
-        },
-    )
-    .ok_or_else(|| "legacy camera capture contains an invalid D3D7 camera".to_string())
+    if capture.render_input_usable == Some(false) {
+        return Err("legacy camera capture is marked render_input_usable=false".to_string());
+    }
+    if capture
+        .atmosphere_seconds
+        .is_some_and(|seconds| !seconds.is_finite() || seconds < 0.0)
+    {
+        return Err(
+            "legacy camera capture atmosphere_seconds must be finite and non-negative".to_string(),
+        );
+    }
+    capture.preview_camera_frame()?;
+    Ok(capture)
 }
 
 fn decode_legacy_camera_capture_json(bytes: &[u8]) -> Result<String, String> {
@@ -5662,7 +5912,7 @@ mod tests {
                 "{mission}: empty material set"
             );
 
-            if load_environment(&root, &mission, None)
+            if load_environment(&root, &mission, None, false)
                 .unwrap_or_else(|error| panic!("prepare environment mission {mission}: {error}"))
                 .is_some()
             {
@@ -6025,19 +6275,20 @@ mod tests {
             near_plane: 0.1,
             far_plane: 100.0,
             move_speed: 1.0,
-        };
+        }
+        .preview_frame(16.0 / 9.0);
         let terrain = TerrainWorld::default();
         assert!(native_sun_unoccluded(&terrain, &camera, [1.0, 0.0, 0.0]));
         assert!(!native_sun_unoccluded(&terrain, &camera, [0.0, 0.0, 0.0]));
 
-        let terrain = TerrainWorld::from_land_msh(&fparkan_terrain_format::LandMeshDocument {
+        let land = fparkan_terrain_format::LandMeshDocument {
             streams: Vec::new(),
             nodes_raw: Vec::new(),
             slots: fparkan_terrain_format::TerrainSlotTable {
                 header_raw: Vec::new(),
                 slots_raw: Vec::new(),
             },
-            // The native Land.msh height is 32; renderer world Z is 1.
+            // Nonzero source Z is shared by the camera, terrain and shadows.
             positions: vec![[0.0, 0.0, 32.0], [1.0, 0.0, 32.0], [0.0, 1.0, 32.0]],
             normals: Vec::new(),
             uv0: Vec::new(),
@@ -6053,17 +6304,25 @@ mod tests {
                 tail_raw: [0; 8],
                 raw: [0; 28],
             }],
-        })
-        .expect("synthetic sun-occluder terrain");
+        };
+        let shadow_receivers = terrain_shadow_receivers(&land).expect("raw-height receivers");
+        assert_eq!(shadow_receivers[0].positions[0], [0.0, 0.0, 32.0]);
+        let terrain = TerrainWorld::from_land_msh(&land).expect("synthetic terrain");
+        assert_eq!(terrain.height_at([0.25, 0.25]).unwrap(), Some(32.0));
+        let floor_camera =
+            FreeFlightCamera::from_mesh_and_terrain(&VulkanStaticMesh::smoke_triangle(), &terrain)
+                .expect("camera above nonzero terrain");
+        assert_eq!(floor_camera.position[2], 34.0);
         let blocked_camera = FreeFlightCamera {
-            position: [0.25, 0.25, 2.0],
+            position: [0.25, 0.25, 34.0],
             yaw: 0.0,
             pitch: 0.0,
             vertical_fov: 1.0,
             near_plane: 0.1,
             far_plane: 100.0,
             move_speed: 1.0,
-        };
+        }
+        .preview_frame(16.0 / 9.0);
         assert!(!native_sun_unoccluded(
             &terrain,
             &blocked_camera,
@@ -6072,7 +6331,7 @@ mod tests {
 
         // The same hit is beyond a short native sun segment, so it must not
         // occlude the light even though the terrain contains a surface.
-        let short_segment_camera = FreeFlightCamera {
+        let short_segment_camera = PreviewCameraFrame {
             far_plane: 1.0,
             ..blocked_camera
         };
@@ -6383,19 +6642,35 @@ mod tests {
             1.0_f32.to_bits(),
         ];
         let json = format!(
-            "{{\"schema\":\"fparkan-legacy-camera-v1\",\"selector0_words\":{:?},\"viewport\":[0,0,1024,768],\"near_plane\":0.5,\"far_plane\":700.0,\"field_of_view_radians\":1.3}}",
+            "{{\"schema\":\"fparkan-legacy-camera-v1\",\"render_input_usable\":true,\"atmosphere_seconds\":56.227,\"selector0_words\":{:?},\"viewport\":[23,17,1047,785],\"near_plane\":0.5,\"far_plane\":700.0,\"field_of_view_radians\":1.3}}",
             words
         );
 
-        let camera = parse_legacy_camera_capture(json.as_bytes()).expect("valid legacy camera");
+        let capture = parse_legacy_camera_capture(json.as_bytes()).expect("valid legacy camera");
+        let camera = capture.preview_camera_frame().expect("valid preview frame");
 
-        assert!(camera.is_finite());
+        assert_eq!(capture.render_input_usable, Some(true));
+        assert_eq!(capture.atmosphere_seconds, Some(56.227));
+        assert!(camera.clip_from_world.iter().all(|value| value.is_finite()));
         assert_eq!(camera.clip_from_world[0], 0.65_f32.cos());
+        assert_eq!(capture.viewport, [23, 17, 1047, 785]);
+        assert_eq!(
+            capture.captured_viewport().unwrap().rect,
+            [23, 17, 1047, 785]
+        );
+        assert_eq!(capture.captured_viewport().unwrap().extent, [1024, 768]);
+        assert!((horizontal_fov(&camera, 4.0 / 3.0) - 1.3).abs() < 1.0e-5);
+        assert_eq!(
+            camera.vulkan_camera().clip_from_world,
+            camera.clip_from_world
+        );
         let mut utf16le = vec![0xff, 0xfe];
         utf16le.extend(json.encode_utf16().flat_map(u16::to_le_bytes));
         assert_eq!(
             parse_legacy_camera_capture(&utf16le)
                 .expect("PowerShell UTF-16LE capture must be accepted")
+                .preview_camera_frame()
+                .expect("UTF-16 preview frame")
                 .clip_from_world,
             camera.clip_from_world
         );
@@ -6403,6 +6678,125 @@ mod tests {
             parse_legacy_camera_capture(br#"{"schema":"unknown","selector0_words":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"viewport":[0,0,1,1],"near_plane":0.1,"far_plane":1.0,"field_of_view_radians":1.0}"#),
             Err("unsupported legacy camera capture schema".to_string())
         );
+    }
+
+    #[test]
+    fn captured_atmosphere_is_default_and_cli_time_takes_precedence() {
+        let capture = LegacyCameraCapture {
+            schema: "fparkan-legacy-camera-v1".to_string(),
+            render_input_usable: None,
+            selector0_words: [0; 16],
+            viewport: [0, 0, 1, 1],
+            near_plane: 0.1,
+            far_plane: 1.0,
+            field_of_view_radians: 1.0,
+            atmosphere_seconds: Some(56.227),
+        };
+
+        assert_eq!(
+            selected_atmosphere_seconds(None, Some(&capture)),
+            Some(56.227)
+        );
+        assert_eq!(
+            selected_atmosphere_seconds(Some(100.0), Some(&capture)),
+            Some(100.0)
+        );
+        assert_eq!(selected_atmosphere_seconds(None, None), None);
+    }
+
+    #[test]
+    fn captured_environment_holds_exact_phase_while_free_time_advances() {
+        let (fixed_relative, fixed_absolute) =
+            environment_sample_time(0.227, 56.0, 0.25, Some(56.227));
+        assert_eq!(fixed_relative, 0.227);
+        assert_eq!(fixed_absolute, 56.227);
+
+        let (free_relative, free_absolute) = environment_sample_time(0.227, 56.0, 0.25, None);
+        assert_eq!(free_relative, 0.477);
+        assert_eq!(free_absolute, 56.477);
+    }
+
+    #[test]
+    fn legacy_camera_capture_rejects_invalid_phase_and_unusable_input() {
+        let base = r#"{"schema":"fparkan-legacy-camera-v1","selector0_words":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"viewport":[0,0,1,1],"near_plane":0.1,"far_plane":1.0,"field_of_view_radians":1.0}"#;
+        let invalid_phase = base.replace(
+            "\"near_plane\"",
+            "\"atmosphere_seconds\":-1.0,\"near_plane\"",
+        );
+        assert!(parse_legacy_camera_capture(invalid_phase.as_bytes())
+            .expect_err("negative captured phase")
+            .contains("atmosphere_seconds must be finite and non-negative"));
+
+        let unusable = base.replace(
+            "\"near_plane\"",
+            "\"render_input_usable\":false,\"near_plane\"",
+        );
+        assert!(parse_legacy_camera_capture(unusable.as_bytes())
+            .expect_err("explicitly unusable camera capture")
+            .contains("render_input_usable=false"));
+    }
+
+    #[test]
+    fn captured_camera_frame_keeps_native_roll_basis() {
+        let roll = 0.37_f32;
+        let (sin, cos) = roll.sin_cos();
+        let transform = RawCameraTransform {
+            words: [
+                1.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                cos.to_bits(),
+                (-sin).to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                sin.to_bits(),
+                cos.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                1.0_f32.to_bits(),
+            ],
+        };
+        let projection = LegacyD3d7Projection {
+            viewport: [0, 0, 800, 600],
+            near_plane: 0.1,
+            far_plane: 500.0,
+            field_of_view_radians: 1.0,
+        };
+        let view = transform
+            .try_direct3d7_view_row_major()
+            .expect("valid native camera basis");
+        let frame = PreviewCameraFrame::from_legacy_d3d7(transform, projection)
+            .expect("valid captured frame");
+
+        assert_eq!(frame.forward, [view[2], view[6], view[10]]);
+        assert_eq!(frame.right, [view[0], view[4], view[8]]);
+        assert_eq!(frame.up, [view[1], view[5], view[9]]);
+        assert!(frame.right[2].abs() > 0.3, "roll must tilt the right axis");
+        assert!(frame.up[1].abs() > 0.3, "roll must tilt the up axis");
+        assert_eq!(
+            frame.clip_from_world,
+            VulkanStaticCamera::from_legacy_d3d7(transform, projection)
+                .expect("legacy clip matrix")
+                .clip_from_world
+        );
+    }
+
+    #[test]
+    fn captured_camera_refuses_a_different_drawable_extent() {
+        let captured = CapturedViewport {
+            rect: [23, 17, 1047, 785],
+            extent: [1024, 768],
+        };
+        assert!(validate_captured_drawable_extent(captured, [1024, 768]).is_ok());
+        let error = validate_captured_drawable_extent(captured, [1280, 720])
+            .expect_err("a mismatched surface must not stretch the captured view");
+        assert!(error.contains("[23, 17, 1047, 785]"));
+        assert!(error.contains("1024x768"));
+        assert!(error.contains("1280x720"));
     }
 
     #[test]
@@ -6473,7 +6867,8 @@ mod tests {
             near_plane: 0.1,
             far_plane: 100.0,
             move_speed: 1.0,
-        };
+        }
+        .preview_frame(1.0);
         let screen = ScreenBillboard {
             world_head: [0.0; 3],
             world_tail: [0.0; 3],
@@ -6523,7 +6918,8 @@ mod tests {
             near_plane: 0.1,
             far_plane: 100.0,
             move_speed: 1.0,
-        };
+        }
+        .preview_frame(1.0);
         let uv = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]];
         let vertices = sprite_quad_vertices_pixels(
             &camera,

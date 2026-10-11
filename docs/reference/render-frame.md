@@ -48,7 +48,17 @@ the exported `stdRenderGame` is RVA `0x13BD0`. It first calls
 `Terrain::stdSetCurrentCamera2(camera)`, stores the camera pointer only for
 the frame, and clears it before return. `sendEndOfRender` is a separate export
 at RVA `0x13D90`. This is frame-order evidence only: the camera ABI, matrices
-and viewport values still require dynamic capture or further decompilation.
+and viewport values are not recovered by this call-order analysis. The
+implemented preview path below accepts selector-0 input produced through the
+[native frame capture workflow](../../tools/native-frame-capture/README.md).
+The capture workflow also records an observed mission path and, when
+its thread/generation and clock checks succeed, an `atmosphere_seconds` sample.
+For a fixed-camera preview, the renderer uses that optional absolute schedule
+phase when no `--atmosphere-seconds` override is supplied and keeps schedule
+sampling at that exact phase across readback frames. An explicit CLI value takes
+precedence. The phase sample is not full simulation time: weather, RNG, and
+other mission state remain unknown, so this evidence does not establish
+full-frame parity.
 
 Receiver-side GOG Terrain evidence refines this contract. `stdSetCurrentCamera2`
 (RVA `0x4FD40` in Terrain SHA-256
@@ -66,6 +76,29 @@ helper at RVA `0x4CEF0` with arguments 1, 2 and 4 plus `this`. Argument 1 is a
 mode string: only `REFLECTION` and `REFLECTION_SHIFTED` produce a non-zero mode
 value at `this + 0x1A0`. This is factory ABI evidence, not a recovered view or
 projection matrix contract.
+
+## Legacy camera preview path
+
+`fparkan-game --legacy-camera-capture <json>` consumes the selector-0 transform,
+the native D3D7 viewport RECT `[left, top, right, bottom]`, near/far planes and
+field of view. It derives the D3D7 view and clip transform from those inputs,
+carries the resulting `clip_from_world` matrix into the preview camera, and
+keeps the view-matrix camera axes directly, so the captured basis, including
+roll, is not reduced to yaw/pitch. The RECT becomes a physical drawable extent
+of `right - left` by `bottom - top`. The preview window is fixed to that extent;
+startup and non-zero resize events reject a physical-size mismatch instead of
+stretching the captured view. Compare the result with the corresponding
+`[left, top, right, bottom]` crop of the original PNG. `FreeFlightCamera` is not
+created in this mode, but redraws still update environment and projected
+shadows from the captured camera. Before environment updates can emit sound
+events, the audio listener receives the captured position, forward and up axes;
+initial world draw sorting uses the same captured position. A phase capture may
+include an observed mission path and a verified `atmosphere_seconds` value; the
+latter is used only when no explicit CLI override is supplied. This value pins
+the atmosphere schedule sample during a fixed-camera comparison while FX still
+receives real frame time. `simulation_time_seconds`, weather, RNG and complete
+mission state remain unknown, and a camera/phase match alone does not establish
+visual parity with a native frame.
 
 ## Parity risks
 
