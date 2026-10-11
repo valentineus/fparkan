@@ -735,10 +735,27 @@ struct FxResourceRef64 {
 };
 ```
 
-Имена сравниваются case-insensitive по ASCII, а tail после первого nul byte
-сохраняется. Resolve выполняется при создании command object или лениво при
-первом запуске, но ошибка должна включать имя эффекта, номер команды, archive
-и resource name.
+Offsets относятся к body команды, сразу после `command_word`. Native loaders
+получают pointer на всю запись, поэтому record offset на 4 байта больше:
+
+| Opcode | Body offset | Record offset |
+| --- | ---: | ---: |
+| 2 | `0x50` | `0x54` |
+| 3 | `0x84` | `0x88` |
+| 4 | `0x84` | `0x88` |
+| 5 | `0x2C` | `0x30` |
+| 7 | `0x8C` | `0x90` |
+| 8 | `0xB4` | `0xB8` |
+| 9 | `0x84` | `0x88` |
+| 10 | `0x8C` | `0x90` |
+
+Parser сохраняет все 64 байта пары, включая suffix после первого nul byte и
+пустые поля. Декодированные имена заканчиваются на первом nul byte.
+Извлечение dependency не подтверждает визуальную parity команд.
+
+Имена сравниваются case-insensitive по ASCII. Resolve выполняется при создании
+command object или лениво при первом запуске, но ошибка должна включать имя
+эффекта, номер команды, archive и resource name.
 
 Базовый normalized age:
 

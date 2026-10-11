@@ -99,7 +99,8 @@ pub struct FxCommand {
     pub native_flag: bool,
     /// Command body after the word.
     pub raw_body: Arc<[u8]>,
-    /// Resource references discovered in known command layouts.
+    /// Resource references discovered in known command layouts, using
+    /// offsets relative to `raw_body` (the first byte after the command word).
     pub resource_refs: Vec<FxResourceRef>,
 }
 
@@ -549,11 +550,11 @@ fn command_size(opcode: FxOpcode) -> usize {
 }
 
 fn resource_refs(index: u32, opcode: FxOpcode, body: &[u8]) -> Result<Vec<FxResourceRef>, FxError> {
-    if !has_resource_ref(opcode) {
+    let Some(offset) = resource_ref_offset(opcode) else {
         return Ok(Vec::new());
-    }
+    };
     let raw = body
-        .get(..64)
+        .get(offset..offset + 64)
         .ok_or(FxError::InvalidResourceRef { index, opcode })?;
     let mut archive_raw = [0; 32];
     let mut name_raw = [0; 32];
@@ -565,18 +566,19 @@ fn resource_refs(index: u32, opcode: FxOpcode, body: &[u8]) -> Result<Vec<FxReso
     }])
 }
 
-fn has_resource_ref(opcode: FxOpcode) -> bool {
-    matches!(
-        opcode,
-        FxOpcode::Op2
-            | FxOpcode::Op3
-            | FxOpcode::Op4
-            | FxOpcode::Op5
-            | FxOpcode::Op7
-            | FxOpcode::Op8
-            | FxOpcode::Op9
-            | FxOpcode::Op10
-    )
+/// Known fixed resource fields, relative to the command body. Native loaders
+/// receive the command-record pointer, which starts with the 4-byte command
+/// word, so their record-relative offsets are four bytes larger: Op2 `0x54`,
+/// Op3/4/9 `0x88`, Op5 `0x30`, Op7/10 `0x90`, and Op8 `0xB8`.
+fn resource_ref_offset(opcode: FxOpcode) -> Option<usize> {
+    match opcode {
+        FxOpcode::Op2 => Some(0x50),
+        FxOpcode::Op3 | FxOpcode::Op4 | FxOpcode::Op9 => Some(0x84),
+        FxOpcode::Op5 => Some(0x2C),
+        FxOpcode::Op7 | FxOpcode::Op10 => Some(0x8C),
+        FxOpcode::Op8 => Some(0xB4),
+        FxOpcode::Op1 | FxOpcode::Op6 => None,
+    }
 }
 
 fn bounded_cstr(raw: &[u8]) -> &[u8] {
@@ -606,7 +608,13 @@ mod tests {
     #[test]
     fn decodes_synthetic_opcodes_and_refs() {
         let mut bytes = header(2);
-        bytes.extend_from_slice(&command_with_ref(0x0102, 148, b"sounds.lib", b"boom.wav"));
+        bytes.extend_from_slice(&command_with_ref_at(
+            0x0102,
+            148,
+            0x50,
+            b"sounds.lib",
+            b"boom.wav",
+        ));
         bytes.extend_from_slice(&command(0x0106, 4));
         let document = decode_fxid(Arc::from(bytes.into_boxed_slice())).expect("fx");
 
@@ -706,27 +714,81 @@ mod tests {
     }
 
     #[test]
-    fn fixed_resource_refs_preserve_tails() {
-        let mut bytes = header(1);
-        let mut command = command_with_ref(0x0102, 148, b"sounds.lib", b"boom.wav");
-        command[4 + 20] = 0xAB;
-        command[36 + 20] = 0xCD;
-        bytes.extend_from_slice(&command);
+    fn mixed_opcode_resource_refs_use_body_offsets_and_preserve_raw_tails() {
+        let layouts = [
+            (2, 0x50, b"sounds.lib".as_slice(), b"boom.wav".as_slice()),
+            (3, 0x84, b"material.lib".as_slice(), b"jet_r".as_slice()),
+            (4, 0x84, b"material.lib".as_slice(), b"glow_y".as_slice()),
+            (5, 0x2C, b"material.lib".as_slice(), b"shook2_b".as_slice()),
+            (
+                7,
+                0x8C,
+                b"material.lib".as_slice(),
+                b"fire_smoke".as_slice(),
+            ),
+            (
+                8,
+                0xB4,
+                b"material.lib".as_slice(),
+                b"fire_smoke".as_slice(),
+            ),
+            (
+                9,
+                0x84,
+                b"material.lib".as_slice(),
+                b"laser_y_hit".as_slice(),
+            ),
+            (
+                10,
+                0x8C,
+                b"material.lib".as_slice(),
+                b"NE_Gibs_Aln".as_slice(),
+            ),
+        ];
+        let mut bytes = header(u32::try_from(layouts.len() + 1).expect("command count"));
+        for (opcode, offset, archive, name) in layouts {
+            let mut record = command(0x0100 | opcode, opcode_size(opcode));
+            let body = &mut record[4..];
+            for (index, word) in body[..64].chunks_exact_mut(4).enumerate() {
+                word.copy_from_slice(&0x3F80_0000_u32.wrapping_add(index as u32).to_le_bytes());
+            }
+            body[offset..offset + 64].fill(0);
+            copy_cstr(&mut body[offset..offset + 32], archive);
+            copy_cstr(&mut body[offset + 32..offset + 64], name);
+            body[offset + 20] = 0xAB;
+            body[offset + 52] = 0xCD;
+            bytes.extend_from_slice(&record);
+        }
+        let mut op1 = command(0x0101, opcode_size(1));
+        for (index, word) in op1[4..68].chunks_exact_mut(4).enumerate() {
+            word.copy_from_slice(&0x3F80_0000_u32.wrapping_add(index as u32).to_le_bytes());
+        }
+        bytes.extend_from_slice(&op1);
         let document = decode_fxid(Arc::from(bytes.into_boxed_slice())).expect("fx");
 
-        let reference = &document.commands()[0].resource_refs[0];
-        assert_eq!(reference.archive_name(), b"sounds.lib");
-        assert_eq!(reference.resource_name(), b"boom.wav");
-        assert_eq!(reference.archive_raw[20], 0xAB);
-        assert_eq!(reference.name_raw[20], 0xCD);
+        for (command, (_, _, archive, name)) in document.commands().iter().zip(layouts) {
+            assert_eq!(command.resource_refs.len(), 1);
+            let reference = &command.resource_refs[0];
+            assert_eq!(reference.archive_name(), archive);
+            assert_eq!(reference.resource_name(), name);
+            assert_eq!(reference.archive_raw[20], 0xAB);
+            assert_eq!(reference.name_raw[20], 0xCD);
+        }
+        assert!(document
+            .commands()
+            .last()
+            .expect("Op1")
+            .resource_refs
+            .is_empty());
     }
 
     #[test]
     fn missing_dependency_error_contains_effect_command_archive_and_name() {
         let mut bytes = header(1);
-        bytes.extend_from_slice(&command_with_ref(
+        bytes.extend_from_slice(&command_with_ref_at(
             0x0102,
             148,
+            0x50,
             b"sounds.lib",
             b"missing.wav",
         ));
@@ -988,10 +1050,17 @@ mod tests {
         out
     }
 
-    fn command_with_ref(word: u32, size: usize, archive: &[u8], name: &[u8]) -> Vec<u8> {
+    fn command_with_ref_at(
+        word: u32,
+        size: usize,
+        body_offset: usize,
+        archive: &[u8],
+        name: &[u8],
+    ) -> Vec<u8> {
         let mut out = command(word, size);
-        copy_cstr(&mut out[4..36], archive);
-        copy_cstr(&mut out[36..68], name);
+        let start = 4 + body_offset;
+        copy_cstr(&mut out[start..start + 32], archive);
+        copy_cstr(&mut out[start + 32..start + 64], name);
         out
     }
 
