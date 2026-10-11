@@ -50,6 +50,11 @@ internal static partial class NativeFrameCapture
     private const uint ProjectionSnapshotRva = 0x13CE4;
     private const uint RenderReturnRva = 0x13D7B;
     private const uint AtmospherePhaseRva = 0x421DC;
+    private const uint FogConsumerRva = 0x2F230;
+    private const uint FogConsumerVtableRva = 0x6527C;
+    private const uint FogConsumerKnownCallerRva = 0x18A6A;
+    private const uint FogGeometryVtableRva = 0x64E48;
+    private const uint FogGeometryDistanceMethodRva = 0x246A0;
     private const uint PresentBoundaryRva = 0x6E1B;
     private const uint RelocatedGlobalRva = 0x79518C;
     private const uint ExternalCameraVtableRva = 0x665B4;
@@ -58,6 +63,10 @@ internal static partial class NativeFrameCapture
     private const uint MissionImportThunkRva = 0xCD01C;
     private const int MissionProbeAttemptLimit = 8;
     private const int FrameCaptureTimeoutSeconds = 300;
+    private const int NativeFogSampleLimit = 512;
+    private static readonly byte[] FogConsumerFileSignature = new byte[]
+        { 0xD9, 0x42, 0x14, 0xD8, 0x15, 0x7C, 0x41, 0x06, 0x10 };
+    private static readonly byte[] FogConsumerLivePrefix = new byte[] { 0xD9, 0x42, 0x14 };
 
     private static readonly Dictionary<string, string> ExpectedSha256 =
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
@@ -97,6 +106,22 @@ internal static partial class NativeFrameCapture
         public string MissionEvidence;
         public bool SelectedCameraRequested;
         public SelectedCameraState SelectedCamera;
+        public NativeFogReadback NativeFog;
+        public readonly List<NativeFogReadback> NativeFogPairedSamples = new List<NativeFogReadback>();
+        public readonly List<NativeFogReadback> NativeFogPendingSamples = new List<NativeFogReadback>();
+        public uint NativeFogObservedCalls;
+        public uint NativeFogOverflowCalls;
+        public uint NativeFogPairedSampleCount;
+        public uint NativeFogRejectedCalls;
+        public uint NativeFogIgnoredOtherThreadCalls;
+        public uint NativeFogIgnoredMatrixCalls;
+        public bool NativeFogArmPending;
+        public bool NativeFogSamplingComplete;
+        public bool NativeFogSamplingStopped;
+        public bool NativeFogSampleLimitExceeded;
+        public string NativeFogConflictReason;
+        public string NativeFogFailureReason;
+        public string NativeFogStatus;
     }
 
     private sealed class AtmosphereReadback
@@ -121,6 +146,43 @@ internal static partial class NativeFrameCapture
         public uint MatchedRenderGeneration;
         public uint MatchedRenderThreadId;
         public bool SameGenerationVerified;
+    }
+
+    private sealed class NativeFogReadback
+    {
+        public uint SampleThreadId;
+        public uint CameraThreadIdAtSample;
+        public uint CameraGenerationAtSample;
+        public uint CameraPointerAtSample;
+        public string CameraMatrixSha256AtSample;
+        public uint SinkPointer;
+        public uint SinkVtable;
+        public uint Slot10Target;
+        public byte RawFlags;
+        public uint[] SinkRgbBits;
+        public uint StartBits;
+        public uint EndBits;
+        public string TerrainModuleSha256;
+        public bool TerrainModuleHashVerified;
+        public bool BoundarySignatureVerified;
+        public uint ReturnAddress;
+        public uint DistanceArgumentBits;
+        public uint BypassArgumentRawDword;
+        public byte BypassArgumentEffectiveByte;
+        public uint OutputColorArgument;
+        public uint OutputAlphaArgument;
+        public uint SourceColorPointer;
+        public uint[] SourceColorBits;
+        public uint GeometryEbpCandidate;
+        public uint GeometryVtable;
+        public uint GeometrySlot14Target;
+        public ushort GeometryTypePlus0x6E;
+        public bool GeometryContractVerified;
+        public string ReturnAddressTerrainRva;
+        public uint MatchedRenderGeneration;
+        public uint MatchedRenderThreadId;
+        public bool SameGenerationVerified;
+        public bool CameraMatrixMatchesProjection;
     }
 
     private sealed class PendingStep
@@ -520,6 +582,58 @@ internal static partial class NativeFrameCapture
             + BitConverter.ToString(code) + " rawClock=EBP origin=[ESI+0x144]"
             + " period=[ESI+0x150] remainder=EDX";
         return match && firstByte == 0x57;
+    }
+
+    private static bool VerifyNativeFogConsumerBoundary(IntPtr process, string terrainPath,
+        uint terrainBase, out byte firstByte, out string evidence)
+    {
+        firstByte = 0;
+        byte[] fileBytes = ReadPeRva(terrainPath, FogConsumerRva, FogConsumerFileSignature.Length);
+        bool fileMatch = ByteArraysEqual(fileBytes, FogConsumerFileSignature);
+        byte[] livePrefix = new byte[FogConsumerLivePrefix.Length];
+        uint address = unchecked(terrainBase + FogConsumerRva);
+        bool liveReadable = ReadExact(process, address, livePrefix);
+        bool liveMatch = liveReadable && ByteArraysEqual(livePrefix, FogConsumerLivePrefix);
+        if (liveReadable) firstByte = livePrefix[0];
+        evidence = "base=0x" + terrainBase.ToString("X8") + " RVA=0x2F230 fileBytes="
+            + BitConverter.ToString(fileBytes) + " livePrefix="
+            + (liveReadable ? BitConverter.ToString(livePrefix) : "unreadable")
+            + " relocationAwareLivePrefixBytes=" + FogConsumerLivePrefix.Length;
+        return fileMatch && liveMatch && firstByte == FogConsumerLivePrefix[0];
+    }
+
+    private static byte[] ReadPeRva(string path, uint rva, int length)
+    {
+        if (String.IsNullOrEmpty(path) || length <= 0)
+            throw new ArgumentException("A PE path and positive read length are required.");
+        byte[] image = File.ReadAllBytes(path);
+        if (image.Length < 0x100 || BitConverter.ToUInt16(image, 0) != 0x5A4D)
+            throw new InvalidDataException("Invalid PE image: " + path);
+        int nt = BitConverter.ToInt32(image, 0x3C);
+        if (nt < 0 || nt + 0x18 > image.Length || BitConverter.ToUInt32(image, nt) != 0x00004550)
+            throw new InvalidDataException("Invalid PE header: " + path);
+        ushort sectionCount = BitConverter.ToUInt16(image, nt + 6);
+        ushort optionalSize = BitConverter.ToUInt16(image, nt + 20);
+        int sectionOffset = checked(nt + 24 + optionalSize);
+        for (int i = 0; i < sectionCount; i++)
+        {
+            int section = checked(sectionOffset + i * 40);
+            if (section < 0 || section + 40 > image.Length) break;
+            uint virtualSize = BitConverter.ToUInt32(image, section + 8);
+            uint virtualAddress = BitConverter.ToUInt32(image, section + 12);
+            uint rawSize = BitConverter.ToUInt32(image, section + 16);
+            uint rawPointer = BitConverter.ToUInt32(image, section + 20);
+            ulong span = Math.Max(virtualSize, rawSize);
+            if (rva < virtualAddress || (ulong)rva + (uint)length > (ulong)virtualAddress + span)
+                continue;
+            ulong raw = (ulong)rawPointer + (rva - virtualAddress);
+            if (raw + (uint)length > (ulong)image.Length)
+                break;
+            byte[] result = new byte[length];
+            Buffer.BlockCopy(image, (int)raw, result, 0, length);
+            return result;
+        }
+        throw new InvalidDataException("RVA 0x" + rva.ToString("X") + " is not in a raw PE section: " + path);
     }
 
     private static bool VerifyMissionIdentityBoundary(IntPtr process, uint iron3dBase,
@@ -953,6 +1067,499 @@ internal static partial class NativeFrameCapture
                 && SelectedMatrixMatchesProjection(frame)));
     }
 
+    private static void ResetNativeFogForGeneration(FrameSnapshot frame)
+    {
+        frame.NativeFog = null;
+        frame.NativeFogPairedSamples.Clear();
+        frame.NativeFogPendingSamples.Clear();
+        frame.NativeFogObservedCalls = 0;
+        frame.NativeFogOverflowCalls = 0;
+        frame.NativeFogPairedSampleCount = 0;
+        frame.NativeFogRejectedCalls = 0;
+        frame.NativeFogIgnoredOtherThreadCalls = 0;
+        frame.NativeFogIgnoredMatrixCalls = 0;
+        frame.NativeFogArmPending = false;
+        frame.NativeFogSamplingComplete = false;
+        frame.NativeFogSamplingStopped = false;
+        frame.NativeFogSampleLimitExceeded = false;
+        frame.NativeFogConflictReason = null;
+        frame.NativeFogFailureReason = null;
+        frame.NativeFogStatus = "waiting-for-render-sample";
+    }
+
+    private static bool CanSampleNativeFogForFrame(FrameSnapshot frame, uint threadId)
+    {
+        if (frame == null || frame.Camera == null || !frame.Camera.LayoutVerified
+            || frame.Camera.Camera == 0 || frame.CameraThreadId != threadId || frame.CameraGeneration == 0)
+            return false;
+        if (!frame.SelectedCameraRequested) return true;
+        SelectedCameraState selected = frame.SelectedCamera;
+        return selected != null && selected.Applied && selected.CameraPointer == frame.Camera.Camera
+            && selected.ThreadId == threadId && selected.Generation == frame.CameraGeneration
+            && selected.Input != null && selected.Input.MatrixBytes != null
+            && ByteArraysEqual(frame.Camera.EntryMatrixBytes, selected.Input.MatrixBytes)
+            && !selected.PixelAttributionInvalidated;
+    }
+
+    private static void EnsureFogConsumerBreakpoint(IntPtr process, uint terrainBase,
+        byte expectedByte, FrameSnapshot frame, uint threadId, ref BreakpointInfo fogConsumerBreakpoint)
+    {
+        if (!CanSampleNativeFogForFrame(frame, threadId))
+        {
+            Log("NATIVE_FOG_ARM_SKIPPED without verified camera identity for thread=" + threadId);
+            return;
+        }
+        uint address = unchecked(terrainBase + FogConsumerRva);
+        if (fogConsumerBreakpoint == null)
+        {
+            fogConsumerBreakpoint = ArmBreakpoint(process, "Terrain.native-fog-consumer", address, expectedByte);
+            Log("NATIVE_FOG_SAMPLING_ARMED generation=" + frame.CameraGeneration + " tid=" + threadId
+                + " camera=0x" + frame.Camera.Camera.ToString("X8")
+                + " matrixSha256=" + frame.Camera.EntryMatrixSha256);
+            return;
+        }
+        if (fogConsumerBreakpoint.Address != address || fogConsumerBreakpoint.OriginalByte != expectedByte)
+            throw new InvalidOperationException("The verified Terrain native fog consumer boundary changed during this capture.");
+        if (fogConsumerBreakpoint.Armed) return;
+        byte[] current = new byte[1];
+        if (!Read(process, address, current) || current[0] != fogConsumerBreakpoint.OriginalByte)
+            throw new InvalidOperationException("Terrain native fog consumer signature changed before re-arming.");
+        if (!WriteByte(process, address, 0xCC))
+            throw new InvalidOperationException("Could not re-arm Terrain native fog consumer boundary.");
+        fogConsumerBreakpoint.Armed = true;
+        Log("BREAKPOINT_REARMED Terrain.native-fog-consumer address=0x" + address.ToString("X8")
+            + " generation=" + frame.CameraGeneration + " tid=" + threadId);
+    }
+
+    private static NativeFogReadback CaptureNativeFogConsumerSample(IntPtr process, byte[] context,
+        uint threadId, uint terrainBase, string terrainModuleSha256, FrameSnapshot frame)
+    {
+        if (!CanSampleNativeFogForFrame(frame, threadId))
+            throw new InvalidOperationException("The fog consumer hit did not match an active verified camera generation.");
+        uint eip = BitConverter.ToUInt32(context, ContextEipOffset);
+        uint esp = BitConverter.ToUInt32(context, ContextEspOffset);
+        uint sink = BitConverter.ToUInt32(context, ContextEcxOffset);
+        uint sourceColor = BitConverter.ToUInt32(context, ContextEdxOffset);
+        uint geometryEbp = BitConverter.ToUInt32(context, ContextEbpOffset);
+        if (eip != unchecked(terrainBase + FogConsumerRva + 1)
+            || sink == 0 || sink > UInt32.MaxValue - 0x63
+            || sourceColor == 0 || sourceColor > UInt32.MaxValue - 0x24
+            || esp > UInt32.MaxValue - 0x14)
+            throw new InvalidOperationException("Fog consumer registers or pointer ranges failed bounded checks.");
+
+        uint sinkVtable = ReadU32Exact(process, sink);
+        uint expectedVtable = unchecked(terrainBase + FogConsumerVtableRva);
+        if (sinkVtable != expectedVtable)
+            throw new InvalidOperationException("Fog consumer sink vptr did not match Terrain+0x6527C.");
+        uint slot10Target = ReadU32Exact(process, unchecked(sinkVtable + 0x10));
+        uint expectedTarget = unchecked(terrainBase + FogConsumerRva);
+        if (slot10Target != expectedTarget)
+            throw new InvalidOperationException("Fog consumer slot+0x10 did not match Terrain+0x2F230.");
+
+        byte[] args = new byte[0x14];
+        byte[] sourceColorBits = new byte[0x10];
+        byte[] sinkFlags = new byte[1];
+        byte[] sinkRgb = new byte[0x0C];
+        if (!ReadExact(process, esp, args)
+            || !ReadExact(process, unchecked(sourceColor + 0x14), sourceColorBits)
+            || !ReadExact(process, unchecked(sink + 0x3C), sinkFlags)
+            || !ReadExact(process, unchecked(sink + 0x48), sinkRgb))
+            throw new InvalidOperationException("Fog consumer stack, color, flags, or RGB evidence was unreadable.");
+
+        uint returnAddress = BitConverter.ToUInt32(args, 0);
+        bool knownGeometryCaller = IsKnownNativeFogGeometryCaller(terrainBase, returnAddress);
+        uint geometryVtable = 0;
+        uint geometrySlot14Target = 0;
+        ushort geometryTypeValue = 0;
+        bool geometryContractVerified = false;
+        if (knownGeometryCaller && geometryEbp != 0 && geometryEbp <= UInt32.MaxValue - 0x70)
+        {
+            byte[] geometryVtableBytes = new byte[4];
+            if (ReadExact(process, geometryEbp, geometryVtableBytes))
+            {
+                uint candidateVtable = BitConverter.ToUInt32(geometryVtableBytes, 0);
+                byte[] geometrySlot14Bytes = new byte[4];
+                if (candidateVtable != 0 && candidateVtable <= UInt32.MaxValue - 0x14
+                    && ReadExact(process, unchecked(candidateVtable + 0x14), geometrySlot14Bytes))
+                {
+                    uint candidateSlot14 = BitConverter.ToUInt32(geometrySlot14Bytes, 0);
+                    geometrySlot14Target = candidateSlot14;
+                    if (IsVerifiedNativeFogGeometryLayout(terrainBase, candidateVtable, candidateSlot14))
+                    {
+                        byte[] geometryType = new byte[2];
+                        if (ReadExact(process, unchecked(geometryEbp + 0x6E), geometryType))
+                        {
+                            geometryVtable = candidateVtable;
+                            geometryTypeValue = BitConverter.ToUInt16(geometryType, 0);
+                            geometryContractVerified = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        uint camera = frame.Camera.Camera;
+        if (camera > UInt32.MaxValue - 0x60)
+            throw new InvalidOperationException("Fog consumer camera pointer range overflowed x86 address space.");
+        string cameraMatrixSha256 = HashBytes(ReadCameraMatrix(process, camera));
+
+        NativeFogReadback result = new NativeFogReadback();
+        result.SampleThreadId = threadId;
+        result.CameraThreadIdAtSample = frame.CameraThreadId;
+        result.CameraGenerationAtSample = frame.CameraGeneration;
+        result.CameraPointerAtSample = camera;
+        result.CameraMatrixSha256AtSample = cameraMatrixSha256;
+        result.SinkPointer = sink;
+        result.SinkVtable = sinkVtable;
+        result.Slot10Target = slot10Target;
+        result.RawFlags = sinkFlags[0];
+        result.SinkRgbBits = new uint[3];
+        for (int i = 0; i < result.SinkRgbBits.Length; i++)
+            result.SinkRgbBits[i] = BitConverter.ToUInt32(sinkRgb, i * 4);
+        result.StartBits = ReadU32Exact(process, unchecked(sink + 0x5C));
+        result.EndBits = ReadU32Exact(process, unchecked(sink + 0x60));
+        result.TerrainModuleSha256 = terrainModuleSha256;
+        result.TerrainModuleHashVerified = String.Equals(terrainModuleSha256,
+            ExpectedSha256[TerrainName], StringComparison.OrdinalIgnoreCase);
+        result.BoundarySignatureVerified = true;
+        result.ReturnAddress = returnAddress;
+        result.DistanceArgumentBits = BitConverter.ToUInt32(args, 4);
+        result.BypassArgumentRawDword = BitConverter.ToUInt32(args, 8);
+        result.BypassArgumentEffectiveByte = NativeFogBypassEffectiveByte(result.BypassArgumentRawDword);
+        result.OutputColorArgument = BitConverter.ToUInt32(args, 0x0C);
+        result.OutputAlphaArgument = BitConverter.ToUInt32(args, 0x10);
+        result.SourceColorPointer = sourceColor;
+        result.SourceColorBits = new uint[4];
+        for (int i = 0; i < result.SourceColorBits.Length; i++)
+            result.SourceColorBits[i] = BitConverter.ToUInt32(sourceColorBits, i * 4);
+        result.GeometryEbpCandidate = geometryEbp;
+        result.GeometryVtable = geometryVtable;
+        result.GeometrySlot14Target = geometryContractVerified ? geometrySlot14Target : 0;
+        result.GeometryTypePlus0x6E = geometryTypeValue;
+        result.GeometryContractVerified = geometryContractVerified;
+        if (knownGeometryCaller)
+            result.ReturnAddressTerrainRva = "Terrain.dll+0x18A6A";
+        for (int i = 0; i < result.SinkRgbBits.Length; i++)
+            if (!IsFinite(BitConverter.ToSingle(BitConverter.GetBytes(result.SinkRgbBits[i]), 0)))
+                throw new InvalidOperationException("Native fog sink RGB contains a non-finite value.");
+        if (!IsFinite(BitConverter.ToSingle(BitConverter.GetBytes(result.StartBits), 0))
+            || !IsFinite(BitConverter.ToSingle(BitConverter.GetBytes(result.EndBits), 0)))
+            throw new InvalidOperationException("Native fog range contains a non-finite value.");
+        return result;
+    }
+
+    private static bool IsKnownNativeFogGeometryCaller(uint terrainBase, uint returnAddress)
+    {
+        return terrainBase != 0 && returnAddress == unchecked(terrainBase + FogConsumerKnownCallerRva);
+    }
+
+    private static bool IsVerifiedNativeFogGeometryLayout(uint terrainBase,
+        uint geometryVtable, uint geometrySlot14Target)
+    {
+        return terrainBase != 0
+            && geometryVtable == unchecked(terrainBase + FogGeometryVtableRva)
+            && geometrySlot14Target == unchecked(terrainBase + FogGeometryDistanceMethodRva);
+    }
+
+    private static byte NativeFogBypassEffectiveByte(uint rawDword)
+    {
+        return unchecked((byte)(rawDword & 0xFF));
+    }
+
+    private static bool CanPairNativeFogSample(FrameSnapshot frame, NativeFogReadback sample, uint threadId)
+    {
+        return sample != null && sample.TerrainModuleHashVerified && sample.BoundarySignatureVerified
+            && CanArmPresentForFrame(frame, threadId)
+            && sample.SampleThreadId == threadId && sample.CameraThreadIdAtSample == threadId
+            && sample.CameraGenerationAtSample == frame.CameraGeneration
+            && sample.CameraPointerAtSample == frame.Camera.Camera
+            && !String.IsNullOrEmpty(sample.CameraMatrixSha256AtSample)
+            && String.Equals(sample.CameraMatrixSha256AtSample, frame.Camera.ProjectionMatrixSha256,
+                StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void PairPendingNativeFogSamples(FrameSnapshot frame, uint threadId)
+    {
+        if (frame == null || frame.NativeFogPendingSamples.Count == 0
+            || !CanArmPresentForFrame(frame, threadId)) return;
+        for (int i = 0; i < frame.NativeFogPendingSamples.Count; i++)
+        {
+            NativeFogReadback sample = frame.NativeFogPendingSamples[i];
+            if (CanPairNativeFogSample(frame, sample, threadId))
+                AddPairedNativeFogSample(frame, sample, threadId);
+            else
+            {
+                frame.NativeFogIgnoredMatrixCalls++;
+                frame.NativeFogSamplingStopped = true;
+                frame.NativeFogFailureReason = "A same-thread fog sample did not match the verified camera and projection matrix.";
+            }
+        }
+        frame.NativeFogPendingSamples.Clear();
+    }
+
+    private static void RecordNativeFogSample(FrameSnapshot frame, NativeFogReadback sample)
+    {
+        if (frame == null || sample == null) throw new ArgumentNullException();
+        if (frame.Projection != null && frame.ProjectionGeneration == frame.CameraGeneration
+            && frame.ProjectionThreadId == sample.SampleThreadId)
+        {
+            if (CanPairNativeFogSample(frame, sample, sample.SampleThreadId))
+                AddPairedNativeFogSample(frame, sample, sample.SampleThreadId);
+            else
+            {
+                frame.NativeFogIgnoredMatrixCalls++;
+                frame.NativeFogSamplingStopped = true;
+                frame.NativeFogFailureReason = "A same-thread fog sample did not match the verified camera and projection matrix.";
+            }
+            return;
+        }
+        if (frame.NativeFogPendingSamples.Count >= NativeFogSampleLimit)
+        {
+            frame.NativeFogSampleLimitExceeded = true;
+            frame.NativeFogSamplingStopped = true;
+            frame.NativeFogFailureReason = "The bounded pre-projection fog sample limit was reached.";
+            return;
+        }
+        frame.NativeFogPendingSamples.Add(sample);
+    }
+
+    private static bool TryCountNativeFogCall(FrameSnapshot frame)
+    {
+        if (frame == null) throw new ArgumentNullException("frame");
+        if (frame.NativeFogObservedCalls >= NativeFogSampleLimit)
+        {
+            frame.NativeFogOverflowCalls++;
+            frame.NativeFogSampleLimitExceeded = true;
+            frame.NativeFogSamplingStopped = true;
+            if (frame.NativeFogFailureReason == null)
+                frame.NativeFogFailureReason = "The bounded 512-call native fog capture limit was reached.";
+            return false;
+        }
+        frame.NativeFogObservedCalls++;
+        return true;
+    }
+
+    private static void StopNativeFogAtCallLimit(FrameSnapshot frame)
+    {
+        if (frame == null || frame.NativeFogObservedCalls < NativeFogSampleLimit) return;
+        frame.NativeFogSampleLimitExceeded = true;
+        frame.NativeFogSamplingStopped = true;
+        if (frame.NativeFogFailureReason == null)
+            frame.NativeFogFailureReason = "The bounded 512-call native fog capture limit was reached.";
+    }
+
+    private static void AddPairedNativeFogSample(FrameSnapshot frame,
+        NativeFogReadback sample, uint threadId)
+    {
+        sample.SameGenerationVerified = true;
+        sample.CameraMatrixMatchesProjection = true;
+        sample.MatchedRenderGeneration = frame.CameraGeneration;
+        sample.MatchedRenderThreadId = threadId;
+        if (frame.NativeFog == null) frame.NativeFog = sample;
+        else
+        {
+            string conflict = NativeFogSettingsConflict(frame.NativeFog, sample);
+            if (conflict != null && frame.NativeFogConflictReason == null)
+            {
+                frame.NativeFogConflictReason = conflict;
+                frame.NativeFogSamplingStopped = true;
+                frame.NativeFogStatus = "conflict";
+            }
+        }
+        frame.NativeFogPairedSamples.Add(sample);
+        frame.NativeFogPairedSampleCount++;
+    }
+
+    private static string NativeFogSettingsConflict(NativeFogReadback first, NativeFogReadback next)
+    {
+        if (first == null || next == null) return "a paired fog sample was missing";
+        if (first.SinkPointer != next.SinkPointer || first.SinkVtable != next.SinkVtable
+            || first.Slot10Target != next.Slot10Target)
+            return "sink identity changed across paired fog calls";
+        if (first.RawFlags != next.RawFlags)
+            return "effective sink flags changed across paired fog calls";
+        if (!UInt32ArraysEqual(first.SinkRgbBits, next.SinkRgbBits))
+            return "effective sink RGB changed across paired fog calls";
+        if (first.StartBits != next.StartBits || first.EndBits != next.EndBits)
+            return "effective fog range changed across paired fog calls";
+        return null;
+    }
+
+    private static bool UInt32ArraysEqual(uint[] left, uint[] right)
+    {
+        if (left == null || right == null || left.Length != right.Length) return false;
+        for (int i = 0; i < left.Length; i++) if (left[i] != right[i]) return false;
+        return true;
+    }
+
+    private static void FinalizeNativeFogAtPresent(FrameSnapshot frame, uint threadId)
+    {
+        if (frame == null) return;
+        PairPendingNativeFogSamples(frame, threadId);
+        frame.NativeFogSamplingComplete = true;
+        if (frame.NativeFogSampleLimitExceeded)
+        {
+            frame.NativeFogStatus = "incomplete";
+            if (frame.NativeFogFailureReason == null)
+                frame.NativeFogFailureReason = "The bounded fog sample limit was reached before Present.";
+        }
+        else if (frame.NativeFogConflictReason != null) frame.NativeFogStatus = "conflict";
+        else if (frame.NativeFogFailureReason != null) frame.NativeFogStatus = "incomplete";
+        else if (!CanArmPresentForFrame(frame, threadId) || frame.NativeFogPairedSampleCount == 0)
+        {
+            frame.NativeFogStatus = "unpaired";
+            if (frame.NativeFogFailureReason == null)
+                frame.NativeFogFailureReason = frame.NativeFogObservedCalls == 0
+                    ? "No Terrain+0x2F230 call was observed between this camera entry and Present."
+                    : "No fog consumer sample matched the camera pointer, matrix hash, thread, generation, and verified projection.";
+        }
+        else if (frame.NativeFogSamplingStopped)
+        {
+            frame.NativeFogStatus = "incomplete";
+            if (frame.NativeFogFailureReason == null)
+                frame.NativeFogFailureReason = "Fog sampling stopped before the verified Present boundary.";
+        }
+        else frame.NativeFogStatus = "paired";
+    }
+
+    private static bool IsVerifiedNativeFogForFrame(FrameSnapshot frame, uint threadId)
+    {
+        NativeFogReadback fog = frame == null ? null : frame.NativeFog;
+        return frame != null && frame.NativeFogSamplingComplete
+            && String.Equals(frame.NativeFogStatus, "paired", StringComparison.Ordinal)
+            && frame.NativeFogConflictReason == null && frame.NativeFogFailureReason == null
+            && !frame.NativeFogSamplingStopped && !frame.NativeFogSampleLimitExceeded
+            && frame.NativeFogPairedSampleCount > 0 && fog != null
+            && (uint)frame.NativeFogPairedSamples.Count == frame.NativeFogPairedSampleCount
+            && fog.SameGenerationVerified && fog.CameraMatrixMatchesProjection
+            && String.Equals(fog.TerrainModuleSha256, ExpectedSha256[TerrainName], StringComparison.OrdinalIgnoreCase)
+            && CanPairNativeFogSample(frame, fog, threadId);
+    }
+
+    private static string JsonFloatFromBits(uint bits)
+    {
+        float value = BitConverter.ToSingle(BitConverter.GetBytes(bits), 0);
+        return IsFinite(value) ? value.ToString("R", CultureInfo.InvariantCulture) : "null";
+    }
+
+    private static string JsonHexU32(uint value)
+    {
+        return JsonString("0x" + value.ToString("X8"));
+    }
+
+    private static void AppendNativeFogJson(StringBuilder json, FrameSnapshot frame, uint threadId)
+    {
+        bool verified = IsVerifiedNativeFogForFrame(frame, threadId);
+        string status = frame == null || String.IsNullOrEmpty(frame.NativeFogStatus)
+            ? "not-sampled" : frame.NativeFogStatus;
+        string reason = frame == null ? null
+            : (frame.NativeFogConflictReason ?? frame.NativeFogFailureReason);
+        json.AppendLine("  \"native_fog_status\": " + JsonString(status) + ",");
+        json.AppendLine("  \"native_fog_status_reason\": " + (String.IsNullOrEmpty(reason) ? "null" : JsonString(reason)) + ",");
+        ulong observedCalls = frame == null ? 0UL : (ulong)frame.NativeFogObservedCalls + frame.NativeFogOverflowCalls;
+        json.AppendLine("  \"native_fog_observed_calls\": " + observedCalls.ToString(CultureInfo.InvariantCulture) + ",");
+        json.AppendLine("  \"native_fog_processed_calls\": " + (frame == null ? "0" : frame.NativeFogObservedCalls.ToString(CultureInfo.InvariantCulture)) + ",");
+        json.AppendLine("  \"native_fog_overflow_calls\": " + (frame == null ? "0" : frame.NativeFogOverflowCalls.ToString(CultureInfo.InvariantCulture)) + ",");
+        json.AppendLine("  \"native_fog_paired_sample_count\": " + (frame == null ? "0" : frame.NativeFogPairedSampleCount.ToString(CultureInfo.InvariantCulture)) + ",");
+        json.AppendLine("  \"native_fog_rejected_calls\": " + (frame == null ? "0" : frame.NativeFogRejectedCalls.ToString(CultureInfo.InvariantCulture)) + ",");
+        json.AppendLine("  \"native_fog_ignored_other_thread_calls\": " + (frame == null ? "0" : frame.NativeFogIgnoredOtherThreadCalls.ToString(CultureInfo.InvariantCulture)) + ",");
+        json.AppendLine("  \"native_fog_ignored_matrix_calls\": " + (frame == null ? "0" : frame.NativeFogIgnoredMatrixCalls.ToString(CultureInfo.InvariantCulture)) + ",");
+        json.AppendLine("  \"native_fog_sample_limit\": " + NativeFogSampleLimit.ToString(CultureInfo.InvariantCulture) + ",");
+        if (!verified)
+        {
+            json.AppendLine("  \"native_fog\": null,");
+            return;
+        }
+
+        NativeFogReadback fog = frame.NativeFog;
+        json.AppendLine("  \"native_fog\": {");
+        json.AppendLine("    \"sample_thread_id\": " + fog.SampleThreadId.ToString(CultureInfo.InvariantCulture) + ",");
+        json.AppendLine("    \"camera_generation_at_sample\": " + fog.CameraGenerationAtSample.ToString(CultureInfo.InvariantCulture) + ",");
+        json.AppendLine("    \"matched_render_generation\": " + fog.MatchedRenderGeneration.ToString(CultureInfo.InvariantCulture) + ",");
+        json.AppendLine("    \"matched_render_thread_id\": " + fog.MatchedRenderThreadId.ToString(CultureInfo.InvariantCulture) + ",");
+        json.AppendLine("    \"same_generation_verified\": " + (fog.SameGenerationVerified ? "true" : "false") + ",");
+        json.AppendLine("    \"camera_matrix_matches_projection\": " + (fog.CameraMatrixMatchesProjection ? "true" : "false") + ",");
+        json.AppendLine("    \"camera_argument\": " + JsonHexU32(fog.CameraPointerAtSample) + ",");
+        json.AppendLine("    \"camera_matrix_sha256_at_sample\": " + JsonString(fog.CameraMatrixSha256AtSample) + ",");
+        json.AppendLine("    \"terrain_module_sha256\": " + JsonString(fog.TerrainModuleSha256) + ",");
+        json.AppendLine("    \"terrain_sha256_verified\": " + (fog.TerrainModuleHashVerified ? "true" : "false") + ",");
+        json.AppendLine("    \"boundary_signature_verified\": " + (fog.BoundarySignatureVerified ? "true" : "false") + ",");
+        json.AppendLine("    \"sink_pointer\": " + JsonHexU32(fog.SinkPointer) + ",");
+        json.AppendLine("    \"sink_vtable\": " + JsonHexU32(fog.SinkVtable) + ",");
+        json.AppendLine("    \"slot_10_target\": " + JsonHexU32(fog.Slot10Target) + ",");
+        json.AppendLine("    \"effective\": {");
+        json.AppendLine("      \"flags_byte\": " + JsonString("0x" + fog.RawFlags.ToString("X2")) + ",");
+        json.Append("      \"sink_rgb_bits\": [");
+        for (int i = 0; i < fog.SinkRgbBits.Length; i++)
+        {
+            if (i != 0) json.Append(", ");
+            json.Append(JsonHexU32(fog.SinkRgbBits[i]));
+        }
+        json.AppendLine("],");
+        json.Append("      \"sink_rgb\": [");
+        for (int i = 0; i < fog.SinkRgbBits.Length; i++)
+        {
+            if (i != 0) json.Append(", ");
+            json.Append(JsonFloatFromBits(fog.SinkRgbBits[i]));
+        }
+        json.AppendLine("],");
+        json.AppendLine("      \"start_bits\": " + JsonHexU32(fog.StartBits) + ",");
+        json.AppendLine("      \"start\": " + JsonFloatFromBits(fog.StartBits) + ",");
+        json.AppendLine("      \"end_bits\": " + JsonHexU32(fog.EndBits) + ",");
+        json.AppendLine("      \"end\": " + JsonFloatFromBits(fog.EndBits));
+        json.AppendLine("    },");
+        json.AppendLine("    \"draw_evidence\": [");
+        for (int i = 0; i < frame.NativeFogPairedSamples.Count; i++)
+        {
+            NativeFogReadback draw = frame.NativeFogPairedSamples[i];
+            if (i != 0) json.AppendLine(",");
+            json.AppendLine("      {");
+            json.AppendLine("        \"return_address\": " + JsonHexU32(draw.ReturnAddress) + ",");
+            json.AppendLine("        \"return_address_terrain_rva\": " + (draw.ReturnAddressTerrainRva == null ? "null" : JsonString(draw.ReturnAddressTerrainRva)) + ",");
+            json.AppendLine("        \"distance_argument_bits\": " + JsonHexU32(draw.DistanceArgumentBits) + ",");
+            json.AppendLine("        \"distance_argument\": " + JsonFloatFromBits(draw.DistanceArgumentBits) + ",");
+            json.AppendLine("        \"bypass_argument_raw_dword\": " + JsonHexU32(draw.BypassArgumentRawDword) + ",");
+            json.AppendLine("        \"bypass_argument_effective_byte\": " + JsonString("0x" + draw.BypassArgumentEffectiveByte.ToString("X2")) + ",");
+            json.AppendLine("        \"bypass_effective\": " + (draw.BypassArgumentEffectiveByte != 0 ? "true" : "false") + ",");
+            json.AppendLine("        \"output_color_argument\": " + JsonHexU32(draw.OutputColorArgument) + ",");
+            json.AppendLine("        \"output_alpha_argument\": " + JsonHexU32(draw.OutputAlphaArgument) + ",");
+            json.AppendLine("        \"source_color_pointer\": " + JsonHexU32(draw.SourceColorPointer) + ",");
+            json.Append("        \"source_color_bits\": [");
+            for (int channel = 0; channel < draw.SourceColorBits.Length; channel++)
+            {
+                if (channel != 0) json.Append(", ");
+                json.Append(JsonHexU32(draw.SourceColorBits[channel]));
+            }
+            json.AppendLine("],");
+            json.Append("        \"source_color\": [");
+            for (int channel = 0; channel < draw.SourceColorBits.Length; channel++)
+            {
+                if (channel != 0) json.Append(", ");
+                json.Append(JsonFloatFromBits(draw.SourceColorBits[channel]));
+            }
+            json.AppendLine("],");
+            bool geometryVerified = draw.GeometryContractVerified
+                && String.Equals(draw.ReturnAddressTerrainRva, "Terrain.dll+0x18A6A", StringComparison.Ordinal)
+                && draw.GeometryVtable != 0 && draw.GeometrySlot14Target != 0;
+            if (!geometryVerified)
+                json.AppendLine("        \"distance_geometry\": null");
+            else
+            {
+                json.AppendLine("        \"distance_geometry\": {");
+                json.AppendLine("          \"object\": " + JsonHexU32(draw.GeometryEbpCandidate) + ",");
+                json.AppendLine("          \"vtable\": " + JsonHexU32(draw.GeometryVtable) + ",");
+                json.AppendLine("          \"slot_14_target\": " + JsonHexU32(draw.GeometrySlot14Target) + ",");
+                json.AppendLine("          \"type_plus_0x6e\": " + draw.GeometryTypePlus0x6E.ToString(CultureInfo.InvariantCulture) + ",");
+                json.AppendLine("          \"contract_verified\": true");
+                json.AppendLine("        }");
+            }
+            json.Append("      }");
+        }
+        json.AppendLine();
+        json.AppendLine("    ]");
+        json.AppendLine("  },");
+    }
+
     private static bool IsViewportInsideSurface(int[] viewport, uint width, uint height)
     {
         return viewport != null && viewport.Length == 4 && width > 0 && height > 0
@@ -1080,6 +1687,7 @@ internal static partial class NativeFrameCapture
             + (frame.Atmosphere != null && frame.Atmosphere.WorldTimeMatchesRawClock ? "true" : "false") + ",");
         json.AppendLine("    \"same_generation_verified\": " + (atmosphereVerified ? "true" : "false"));
         json.AppendLine("  },");
+        AppendNativeFogJson(json, frame, frame.ProjectionThreadId);
         json.AppendLine("  \"weather_state\": null,");
         json.AppendLine("  \"rng_state\": null,");
         json.AppendLine("  \"raw_world_game_time_word32A38\": " + JsonString("0x" + frame.WorldGameTimeWord.ToString("X8")) + ",");
@@ -1107,6 +1715,7 @@ internal static partial class NativeFrameCapture
     {
         if (IntPtr.Size != 4) throw new InvalidOperationException("This helper must be compiled and run as x86.");
         SelfCheckCameraInput();
+        SelfCheckNativeFogPairing();
         SelfCheckRenderInvocationGates();
         uint relocated = 0x10000000u + RelocatedGlobalRva;
         if (relocated != 0x1079518Cu) throw new InvalidOperationException("relocation self-check failed");
@@ -1280,8 +1889,294 @@ internal static partial class NativeFrameCapture
                 + " resumedEspOk=" + resumedEspOk + " resumedTrapCleared=" + resumedTrapCleared
                 + " ThreadQueryInformation=" + ThreadQueryInformation + " Ebx=" + ContextEbxOffset
                 + " Edx=" + ContextEdxOffset + " Ecx=" + ContextEcxOffset);
-        Console.WriteLine("self-check: x86 CONTEXT layout, relocation RVA, validated camera JSON, post-prologue invocation identity/stack gates, camera/projection gates, wrapping atmosphere phase arithmetic/clock pairing, and recovery states OK");
+        Console.WriteLine("self-check: x86 CONTEXT layout, relocation RVA, legacy camera JSON compatibility, native fog pairing/settings consistency, geometry caller/layout gates, low-byte bypass, nullable fog JSON, 512-call bound, camera/projection gates, wrapping atmosphere phase arithmetic/clock pairing, and recovery states OK");
         return SelfCheckReadback();
+    }
+
+    private static void SelfCheckNativeFogPairing()
+    {
+        if (FogConsumerRva != 0x2F230 || FogConsumerVtableRva != 0x6527C
+            || FogConsumerKnownCallerRva != 0x18A6A || NativeFogSampleLimit != 512
+            || FogGeometryVtableRva != 0x64E48 || FogGeometryDistanceMethodRva != 0x246A0
+            || !ByteArraysEqual(FogConsumerFileSignature,
+                new byte[] { 0xD9, 0x42, 0x14, 0xD8, 0x15, 0x7C, 0x41, 0x06, 0x10 })
+            || !ByteArraysEqual(FogConsumerLivePrefix, new byte[] { 0xD9, 0x42, 0x14 }))
+            throw new InvalidOperationException("Self-check failed: pinned Terrain native-fog boundary signature.");
+        bool exactGeometryCallerAccepted = IsKnownNativeFogGeometryCaller(0x10000000, 0x10018A6A);
+        bool otherGeometryCallerRejected = !IsKnownNativeFogGeometryCaller(0x10000000, 0x10018A6B);
+        bool exactGeometryLayoutAccepted = IsVerifiedNativeFogGeometryLayout(0x10000000,
+            0x10064E48, 0x100246A0);
+        bool changedGeometryLayoutRejected = !IsVerifiedNativeFogGeometryLayout(0x10000000,
+            0x10064E48, 0x100246A4);
+        bool nativeBypassUsesLowByte = NativeFogBypassEffectiveByte(0x00000101) == 1
+            && NativeFogBypassEffectiveByte(0x00000100) == 0;
+
+        FrameSnapshot frame = new FrameSnapshot
+        {
+            CameraGeneration = 7,
+            CameraThreadId = 11,
+            Camera = new CameraReadback
+            {
+                Camera = 0x200000,
+                LayoutVerified = true,
+                MatrixFinite = true,
+                CurrentAtProjectionVerified = true,
+                EntryMatrixSha256 = "MATRIX-A",
+                ProjectionMatrixSha256 = "MATRIX-A"
+            },
+            ProjectionGeneration = 7,
+            ProjectionThreadId = 11,
+            Projection = new ProjectionReadback { Verified = true, Mode = 1 }
+        };
+        NativeFogReadback first = new NativeFogReadback
+        {
+            SampleThreadId = 11,
+            CameraThreadIdAtSample = 11,
+            CameraGenerationAtSample = 7,
+            CameraPointerAtSample = 0x200000,
+            CameraMatrixSha256AtSample = "MATRIX-A",
+            SinkPointer = 0x300000,
+            SinkVtable = 0x1006527C,
+            Slot10Target = 0x1002F230,
+            RawFlags = 0x0C,
+            SinkRgbBits = new uint[] { 0x3E70F0F2, 0x3E68E8EA, 0x3EA2A2A3 },
+            StartBits = 0,
+            EndBits = 0x442F8000,
+            TerrainModuleSha256 = ExpectedSha256[TerrainName],
+            TerrainModuleHashVerified = true,
+            BoundarySignatureVerified = true
+        };
+        bool matched = CanPairNativeFogSample(frame, first, 11);
+        bool wrongThreadRejected = !CanPairNativeFogSample(frame,
+            new NativeFogReadback
+            {
+                SampleThreadId = 12, CameraThreadIdAtSample = 12, CameraGenerationAtSample = 7,
+                CameraPointerAtSample = 0x200000, CameraMatrixSha256AtSample = "MATRIX-A",
+                TerrainModuleHashVerified = true, BoundarySignatureVerified = true
+            }, 11);
+        bool wrongGenerationRejected = !CanPairNativeFogSample(frame,
+            new NativeFogReadback
+            {
+                SampleThreadId = 11, CameraThreadIdAtSample = 11, CameraGenerationAtSample = 8,
+                CameraPointerAtSample = 0x200000, CameraMatrixSha256AtSample = "MATRIX-A",
+                TerrainModuleHashVerified = true, BoundarySignatureVerified = true
+            }, 11);
+        bool wrongCameraRejected = !CanPairNativeFogSample(frame,
+            new NativeFogReadback
+            {
+                SampleThreadId = 11, CameraThreadIdAtSample = 11, CameraGenerationAtSample = 7,
+                CameraPointerAtSample = 0x200004, CameraMatrixSha256AtSample = "MATRIX-A",
+                TerrainModuleHashVerified = true, BoundarySignatureVerified = true
+            }, 11);
+        bool wrongMatrixRejected = !CanPairNativeFogSample(frame,
+            new NativeFogReadback
+            {
+                SampleThreadId = 11, CameraThreadIdAtSample = 11, CameraGenerationAtSample = 7,
+                CameraPointerAtSample = 0x200000, CameraMatrixSha256AtSample = "MATRIX-B",
+                TerrainModuleHashVerified = true, BoundarySignatureVerified = true
+            }, 11);
+        FrameSnapshot badProjection = new FrameSnapshot
+        {
+            CameraGeneration = 7, CameraThreadId = 11, Camera = frame.Camera,
+            ProjectionGeneration = 7, ProjectionThreadId = 11,
+            Projection = new ProjectionReadback { Verified = false, Mode = 1 }
+        };
+        bool invalidProjectionRejected = !CanPairNativeFogSample(badProjection, first, 11);
+
+        NativeFogReadback perDrawVariation = new NativeFogReadback
+        {
+            SinkPointer = first.SinkPointer, SinkVtable = first.SinkVtable, Slot10Target = first.Slot10Target,
+            RawFlags = first.RawFlags, SinkRgbBits = (uint[])first.SinkRgbBits.Clone(),
+            StartBits = first.StartBits, EndBits = first.EndBits,
+            ReturnAddress = first.ReturnAddress + 4, DistanceArgumentBits = first.DistanceArgumentBits + 1,
+            SourceColorPointer = 0x400000, SourceColorBits = new uint[] { 1, 2, 3, 4 },
+            GeometryEbpCandidate = 0x500000, GeometryVtable = 0x10064E48,
+            GeometryTypePlus0x6E = 1, GeometryContractVerified = true
+        };
+        bool perDrawEvidenceIgnoredForConsistency = NativeFogSettingsConflict(first, perDrawVariation) == null;
+        NativeFogReadback changedSettings = new NativeFogReadback
+        {
+            SinkPointer = first.SinkPointer, SinkVtable = first.SinkVtable, Slot10Target = first.Slot10Target,
+            RawFlags = (byte)(first.RawFlags ^ 1), SinkRgbBits = (uint[])first.SinkRgbBits.Clone(),
+            StartBits = first.StartBits, EndBits = first.EndBits
+        };
+        bool settingsConflictDetected = NativeFogSettingsConflict(first, changedSettings) != null;
+        FrameSnapshot accumulated = new FrameSnapshot { CameraGeneration = 7, CameraThreadId = 11 };
+        NativeFogReadback pairedFirst = new NativeFogReadback
+        {
+            SinkPointer = first.SinkPointer, SinkVtable = first.SinkVtable, Slot10Target = first.Slot10Target,
+            RawFlags = first.RawFlags, SinkRgbBits = (uint[])first.SinkRgbBits.Clone(),
+            StartBits = first.StartBits, EndBits = first.EndBits
+        };
+        NativeFogReadback pairedSecond = new NativeFogReadback
+        {
+            SinkPointer = perDrawVariation.SinkPointer, SinkVtable = perDrawVariation.SinkVtable,
+            Slot10Target = perDrawVariation.Slot10Target, RawFlags = perDrawVariation.RawFlags,
+            SinkRgbBits = (uint[])perDrawVariation.SinkRgbBits.Clone(),
+            StartBits = perDrawVariation.StartBits, EndBits = perDrawVariation.EndBits
+        };
+        AddPairedNativeFogSample(accumulated, pairedFirst, 11);
+        AddPairedNativeFogSample(accumulated, pairedSecond, 11);
+        bool repeatedDrawsConsistent = accumulated.NativeFogPairedSampleCount == 2
+            && accumulated.NativeFogConflictReason == null;
+        AddPairedNativeFogSample(accumulated, changedSettings, 11);
+        bool repeatedDrawConflictRejected = accumulated.NativeFogPairedSampleCount == 3
+            && accumulated.NativeFogConflictReason != null && accumulated.NativeFogSamplingStopped;
+
+        if (!exactGeometryCallerAccepted || !otherGeometryCallerRejected
+            || !exactGeometryLayoutAccepted || !changedGeometryLayoutRejected || !nativeBypassUsesLowByte
+            || !matched || !wrongThreadRejected || !wrongGenerationRejected || !wrongCameraRejected
+            || !wrongMatrixRejected || !invalidProjectionRejected || !perDrawEvidenceIgnoredForConsistency
+            || !settingsConflictDetected || !repeatedDrawsConsistent || !repeatedDrawConflictRejected)
+            throw new InvalidOperationException("Self-check failed: native fog sample pairing or consistency gate.");
+        SelfCheckNativeFogJsonAndLimit(frame);
+    }
+
+    private static Dictionary<string, object> ParseNativeFogJsonFragmentForSelfCheck(FrameSnapshot frame)
+    {
+        StringBuilder fragment = new StringBuilder();
+        AppendNativeFogJson(fragment, frame, frame.ProjectionThreadId);
+        string content = fragment.ToString().Trim();
+        if (content.Length == 0 || content[content.Length - 1] != ',')
+            throw new InvalidOperationException("Self-check failed: native fog JSON fragment did not end with a property separator.");
+        string json = "{" + content.Substring(0, content.Length - 1) + "}";
+        object parsed = new System.Web.Script.Serialization.JavaScriptSerializer().DeserializeObject(json);
+        Dictionary<string, object> root = parsed as Dictionary<string, object>;
+        if (root == null) throw new InvalidOperationException("Self-check failed: native fog JSON fragment was not an object.");
+        return root;
+    }
+
+    private static void SelfCheckNativeFogJsonAndLimit(FrameSnapshot baseFrame)
+    {
+        NativeFogReadback sample = new NativeFogReadback
+        {
+            SampleThreadId = 11,
+            CameraThreadIdAtSample = 11,
+            CameraGenerationAtSample = 7,
+            CameraPointerAtSample = 0x200000,
+            CameraMatrixSha256AtSample = "MATRIX-A",
+            SinkPointer = 0x300000,
+            SinkVtable = 0x1006527C,
+            Slot10Target = 0x1002F230,
+            RawFlags = 0x0C,
+            SinkRgbBits = new uint[] { 0x3E70F0F2, 0x3E68E8EA, 0x3EA2A2A3 },
+            StartBits = 0,
+            EndBits = 0x442F8000,
+            TerrainModuleSha256 = ExpectedSha256[TerrainName],
+            TerrainModuleHashVerified = true,
+            BoundarySignatureVerified = true,
+            ReturnAddress = 0x10018A6A,
+            ReturnAddressTerrainRva = "Terrain.dll+0x18A6A",
+            DistanceArgumentBits = 0x42CAC000,
+            BypassArgumentRawDword = 0x00000100,
+            BypassArgumentEffectiveByte = 0,
+            OutputColorArgument = 0x400000,
+            OutputAlphaArgument = 0x400004,
+            SourceColorPointer = 0x410000,
+            SourceColorBits = new uint[] { 0x3F800000, 0x3F800000, 0x3F000000, 0x3F800000 },
+            GeometryEbpCandidate = 0x500000,
+            GeometryVtable = 0x10064E48,
+            GeometrySlot14Target = 0x100246A0,
+            GeometryTypePlus0x6E = 1,
+            GeometryContractVerified = true,
+            MatchedRenderGeneration = 7,
+            MatchedRenderThreadId = 11,
+            SameGenerationVerified = true,
+            CameraMatrixMatchesProjection = true
+        };
+        FrameSnapshot paired = new FrameSnapshot
+        {
+            CameraGeneration = baseFrame.CameraGeneration,
+            CameraThreadId = baseFrame.CameraThreadId,
+            Camera = baseFrame.Camera,
+            ProjectionGeneration = baseFrame.ProjectionGeneration,
+            ProjectionThreadId = baseFrame.ProjectionThreadId,
+            Projection = baseFrame.Projection,
+            NativeFog = sample,
+            NativeFogSamplingComplete = true,
+            NativeFogStatus = "paired",
+            NativeFogPairedSampleCount = 1
+        };
+        paired.NativeFogPairedSamples.Add(sample);
+        Dictionary<string, object> pairedJson = ParseNativeFogJsonFragmentForSelfCheck(paired);
+        object fogValue;
+        Dictionary<string, object> fogJson = pairedJson.TryGetValue("native_fog", out fogValue)
+            ? fogValue as Dictionary<string, object> : null;
+        object drawValue;
+        object[] draws = fogJson != null && fogJson.TryGetValue("draw_evidence", out drawValue)
+            ? drawValue as object[] : null;
+        Dictionary<string, object> drawJson = draws != null && draws.Length == 1
+            ? draws[0] as Dictionary<string, object> : null;
+        object geometryValue;
+        Dictionary<string, object> geometryJson = drawJson != null
+            && drawJson.TryGetValue("distance_geometry", out geometryValue)
+            ? geometryValue as Dictionary<string, object> : null;
+        bool exactCallerGeometrySerialized = geometryJson != null
+            && geometryJson.ContainsKey("slot_14_target") && geometryJson.ContainsKey("type_plus_0x6e");
+        sample.ReturnAddress = 0x10012345;
+        sample.ReturnAddressTerrainRva = null;
+        sample.GeometryContractVerified = false;
+        sample.GeometryVtable = 0;
+        sample.GeometrySlot14Target = 0;
+        Dictionary<string, object> unknownCallerJson = ParseNativeFogJsonFragmentForSelfCheck(paired);
+        Dictionary<string, object> unknownFogJson = unknownCallerJson["native_fog"] as Dictionary<string, object>;
+        object unknownDrawValue;
+        object[] unknownDraws = unknownFogJson != null && unknownFogJson.TryGetValue("draw_evidence", out unknownDrawValue)
+            ? unknownDrawValue as object[] : null;
+        Dictionary<string, object> unknownDrawJson = unknownDraws != null && unknownDraws.Length == 1
+            ? unknownDraws[0] as Dictionary<string, object> : null;
+        object unknownGeometryValue;
+        bool unknownCallerHasNoInterpretedGeometry = unknownDrawJson != null
+            && unknownDrawJson.TryGetValue("distance_geometry", out unknownGeometryValue) && unknownGeometryValue == null;
+
+        FrameSnapshot conflict = new FrameSnapshot
+        {
+            CameraGeneration = paired.CameraGeneration,
+            CameraThreadId = paired.CameraThreadId,
+            Camera = paired.Camera,
+            ProjectionGeneration = paired.ProjectionGeneration,
+            ProjectionThreadId = paired.ProjectionThreadId,
+            Projection = paired.Projection,
+            NativeFog = sample,
+            NativeFogSamplingComplete = true,
+            NativeFogSamplingStopped = true,
+            NativeFogStatus = "conflict",
+            NativeFogConflictReason = "test settings conflict",
+            NativeFogPairedSampleCount = 2
+        };
+        object conflictFog;
+        bool conflictIsNull = ParseNativeFogJsonFragmentForSelfCheck(conflict)
+            .TryGetValue("native_fog", out conflictFog) && conflictFog == null;
+        FrameSnapshot unpaired = new FrameSnapshot
+        {
+            NativeFogSamplingComplete = true,
+            NativeFogStatus = "unpaired"
+        };
+        object unpairedFog;
+        bool unpairedIsNull = ParseNativeFogJsonFragmentForSelfCheck(unpaired)
+            .TryGetValue("native_fog", out unpairedFog) && unpairedFog == null;
+
+        FrameSnapshot bounded = new FrameSnapshot();
+        NativeFogReadback pending = new NativeFogReadback();
+        for (int i = 0; i < NativeFogSampleLimit; i++) RecordNativeFogSample(bounded, pending);
+        RecordNativeFogSample(bounded, pending);
+        bool limitIsBounded = bounded.NativeFogPendingSamples.Count == NativeFogSampleLimit
+            && bounded.NativeFogSampleLimitExceeded && bounded.NativeFogSamplingStopped;
+        FrameSnapshot boundedCalls = new FrameSnapshot();
+        bool allInRangeCallsAccepted = true;
+        for (int i = 0; i < NativeFogSampleLimit; i++)
+            if (!TryCountNativeFogCall(boundedCalls)) allInRangeCallsAccepted = false;
+        StopNativeFogAtCallLimit(boundedCalls);
+        bool overflowRejected = !TryCountNativeFogCall(boundedCalls);
+        bool eventCallLimitIsBounded = allInRangeCallsAccepted
+            && boundedCalls.NativeFogObservedCalls == NativeFogSampleLimit
+            && boundedCalls.NativeFogOverflowCalls == 1
+            && boundedCalls.NativeFogSampleLimitExceeded && boundedCalls.NativeFogSamplingStopped
+            && overflowRejected;
+        if (!exactCallerGeometrySerialized || !unknownCallerHasNoInterpretedGeometry
+            || !conflictIsNull || !unpairedIsNull
+            || !limitIsBounded || !eventCallLimitIsBounded)
+            throw new InvalidOperationException("Self-check failed: nullable fog JSON, unknown caller gate, or bounded sample list.");
     }
 
     private static int Main(string[] args)
@@ -1381,6 +2276,8 @@ internal static partial class NativeFrameCapture
         uint ngiBase = 0;
         byte presentOriginalByte = 0;
         bool presentBoundaryVerified = false;
+        byte fogConsumerOriginalByte = 0;
+        bool fogConsumerBoundaryVerified = false;
         bool attached = false;
         bool detached = false;
         bool breakpointsRestored = false;
@@ -1405,6 +2302,7 @@ internal static partial class NativeFrameCapture
         BreakpointInfo projectionBreakpoint = null;
         BreakpointInfo returnBreakpoint = null;
         BreakpointInfo atmosphereBreakpoint = null;
+        BreakpointInfo fogConsumerBreakpoint = null;
         BreakpointInfo presentBreakpoint = null;
         BreakpointInfo missionBreakpoint = null;
         int missionProbeAttempts = 0;
@@ -1541,8 +2439,14 @@ internal static partial class NativeFrameCapture
                                 throw new InvalidOperationException("Terrain atmosphere phase boundary signature failed: " + atmosphereEvidence);
                             atmosphereBreakpoint = ArmBreakpoint(process, "Terrain.atmosphere-phase",
                                 unchecked(terrainBase + AtmospherePhaseRva), atmosphereByte);
+                            string fogConsumerEvidence;
+                            if (!VerifyNativeFogConsumerBoundary(process, imagePath, terrainBase,
+                                out fogConsumerOriginalByte, out fogConsumerEvidence))
+                                throw new InvalidOperationException("Terrain native fog consumer boundary signature failed: "
+                                    + fogConsumerEvidence);
+                            fogConsumerBoundaryVerified = true;
                             Log("Terrain verified base=0x" + terrainBase.ToString("X8") + " sha256=" + hash
-                                + " " + atmosphereEvidence);
+                                + " " + atmosphereEvidence + " nativeFogConsumer=" + fogConsumerEvidence);
                         }
                         if (imagePath.Length != 0 && String.Equals(imagePath, NormalizePath(expectedIron3d), StringComparison.OrdinalIgnoreCase))
                         {
@@ -1671,6 +2575,9 @@ internal static partial class NativeFrameCapture
                                         selectedCamera.RestoreDeadlineUtc = DateTime.UtcNow.AddSeconds(5);
                                         frame.SelectedCamera = selectedCamera;
                                         frame.Camera = appliedCamera;
+                                        if (fogConsumerBoundaryVerified)
+                                            EnsureFogConsumerBreakpoint(process, terrainBase, fogConsumerOriginalByte,
+                                                frame, eventTid, ref fogConsumerBreakpoint);
                                         Log("CAMERA_SETTER_APPLY_VERIFIED generation=" + selectedCamera.Generation
                                             + " camera=0x" + selectedCamera.CameraPointer.ToString("X8")
                                             + " matrixSha256=" + selectedCamera.Input.MatrixSha256
@@ -1848,6 +2755,8 @@ internal static partial class NativeFrameCapture
                                 hitBreakpoint = returnBreakpoint;
                             else if (atmosphereBreakpoint != null && atmosphereBreakpoint.Armed && exceptionAddress == atmosphereBreakpoint.Address)
                                 hitBreakpoint = atmosphereBreakpoint;
+                            else if (fogConsumerBreakpoint != null && fogConsumerBreakpoint.Armed && exceptionAddress == fogConsumerBreakpoint.Address)
+                                hitBreakpoint = fogConsumerBreakpoint;
                             else if (missionBreakpoint != null && missionBreakpoint.Armed && exceptionAddress == missionBreakpoint.Address)
                                 hitBreakpoint = missionBreakpoint;
                             else if (presentBreakpoint != null && presentBreakpoint.Armed && exceptionAddress == presentBreakpoint.Address)
@@ -1881,7 +2790,11 @@ internal static partial class NativeFrameCapture
                                     }
                                     else
                                     {
+                                        if (fogConsumerBreakpoint != null && fogConsumerBreakpoint.Armed
+                                            && !RestoreBreakpointWhileStopped(process, fogConsumerBreakpoint))
+                                            throw new InvalidOperationException("Could not disarm the previous generation's native fog boundary.");
                                         frame.CameraGeneration++;
+                                        ResetNativeFogForGeneration(frame);
                                         frame.CameraThreadId = eventTid;
                                         frame.CameraWorldGameTimeWordReadable = false;
                                         if (world3dBase != 0)
@@ -1962,6 +2875,10 @@ internal static partial class NativeFrameCapture
                                                 + " layoutVerified=" + frame.Camera.LayoutVerified
                                                 + " matrixSha256=" + frame.Camera.EntryMatrixSha256
                                                 + " requestedSha256=" + selectedCamera.Input.MatrixSha256);
+
+                                        if (fogConsumerBoundaryVerified && frame.Camera != null && frame.Camera.LayoutVerified)
+                                            EnsureFogConsumerBreakpoint(process, terrainBase, fogConsumerOriginalByte,
+                                                frame, eventTid, ref fogConsumerBreakpoint);
                                     }
                                 }
                                 else if (hitBreakpoint == projectionBreakpoint)
@@ -2060,6 +2977,7 @@ internal static partial class NativeFrameCapture
                                                     + " inputFov=" + selectedCamera.Input.FieldOfView.ToString("R", CultureInfo.InvariantCulture)
                                                     + " actualFov=" + frame.Projection.Fov.ToString("R", CultureInfo.InvariantCulture));
                                             }
+                                            PairPendingNativeFogSamples(frame, eventTid);
                                             Log("PROJECTION_GENERATION " + frame.ProjectionGeneration + " tid=" + eventTid
                                                 + " renderer=0x" + frame.Projection.Renderer.ToString("X8")
                                                 + " viewport=" + (frame.Projection.Viewport == null ? "unreadable" : String.Join(",", frame.Projection.Viewport))
@@ -2151,6 +3069,69 @@ internal static partial class NativeFrameCapture
                                         Log("ATMOSPHERE_PHASE_SAMPLE_REJECTED tid=" + eventTid + " " + atmosphereError.Message);
                                     }
                                 }
+                                else if (hitBreakpoint == fogConsumerBreakpoint)
+                                {
+                                    if (!TryCountNativeFogCall(frame))
+                                    {
+                                        Log("NATIVE_FOG_SAMPLE_LIMIT_REACHED tid=" + eventTid
+                                            + " processed=" + frame.NativeFogObservedCalls + " max=" + NativeFogSampleLimit);
+                                    }
+                                    else
+                                    {
+                                        if (frame.NativeFogSamplingStopped)
+                                        {
+                                            Log("NATIVE_FOG_SAMPLE_SKIPPED_AFTER_STOP tid=" + eventTid
+                                                + " generation=" + frame.CameraGeneration);
+                                        }
+                                        else if (eventTid != frame.CameraThreadId)
+                                        {
+                                            frame.NativeFogIgnoredOtherThreadCalls++;
+                                            Log("NATIVE_FOG_SAMPLE_IGNORED_OTHER_THREAD tid=" + eventTid
+                                                + " renderTid=" + frame.CameraThreadId
+                                                + " generation=" + frame.CameraGeneration);
+                                        }
+                                        else if (!CanSampleNativeFogForFrame(frame, eventTid))
+                                        {
+                                            frame.NativeFogRejectedCalls++;
+                                            frame.NativeFogSamplingStopped = true;
+                                            frame.NativeFogFailureReason = "The fog consumer call no longer matched the active verified camera generation.";
+                                            Log("NATIVE_FOG_SAMPLE_REJECTED tid=" + eventTid
+                                                + " generation=" + frame.CameraGeneration + " camera/projection gate failed");
+                                        }
+                                        else
+                                        {
+                                            try
+                                            {
+                                                NativeFogReadback sample = CaptureNativeFogConsumerSample(process,
+                                                    stoppedContext, eventTid, terrainBase, terrainModuleSha256, frame);
+                                                RecordNativeFogSample(frame, sample);
+                                                Log("NATIVE_FOG_SAMPLE tid=" + eventTid
+                                                    + " generation=" + sample.CameraGenerationAtSample
+                                                    + " sink=0x" + sample.SinkPointer.ToString("X8")
+                                                    + " flags=0x" + sample.RawFlags.ToString("X2")
+                                                    + " startBits=0x" + sample.StartBits.ToString("X8")
+                                                    + " endBits=0x" + sample.EndBits.ToString("X8")
+                                                    + " return=0x" + sample.ReturnAddress.ToString("X8")
+                                                    + " distanceBits=0x" + sample.DistanceArgumentBits.ToString("X8")
+                                                    + " bypassRaw=0x" + sample.BypassArgumentRawDword.ToString("X8")
+                                                    + " bypassByte=0x" + sample.BypassArgumentEffectiveByte.ToString("X2")
+                                                    + " paired=" + sample.SameGenerationVerified
+                                                    + " geometryVerified=" + sample.GeometryContractVerified);
+                                            }
+                                            catch (Exception fogError)
+                                            {
+                                                frame.NativeFogRejectedCalls++;
+                                                frame.NativeFogSamplingStopped = true;
+                                                frame.NativeFogFailureReason = "A native fog consumer sample failed validation: " + fogError.Message;
+                                                Log("NATIVE_FOG_SAMPLE_REJECTED tid=" + eventTid + " " + fogError.Message);
+                                            }
+                                        }
+                                        StopNativeFogAtCallLimit(frame);
+                                        if (frame.NativeFogSampleLimitExceeded)
+                                            Log("NATIVE_FOG_SAMPLE_LIMIT_REACHED tid=" + eventTid
+                                                + " processed=" + frame.NativeFogObservedCalls + " max=" + NativeFogSampleLimit);
+                                    }
+                                }
                                 else if (hitBreakpoint == missionBreakpoint)
                                 {
                                     missionProbeAttempts++;
@@ -2178,6 +3159,16 @@ internal static partial class NativeFrameCapture
                                 }
                                 else if (hitBreakpoint == presentBreakpoint)
                                 {
+                                    FinalizeNativeFogAtPresent(frame, eventTid);
+                                    if (!RestoreBreakpointWhileStopped(process, fogConsumerBreakpoint))
+                                        throw new InvalidOperationException("Could not restore the native fog consumer breakpoint before Present readback.");
+                                    Log("NATIVE_FOG_FINAL status=" + frame.NativeFogStatus
+                                        + " observed=" + frame.NativeFogObservedCalls
+                                        + " paired=" + frame.NativeFogPairedSampleCount
+                                        + " rejected=" + frame.NativeFogRejectedCalls
+                                        + " otherThread=" + frame.NativeFogIgnoredOtherThreadCalls
+                                        + " matrixMismatch=" + frame.NativeFogIgnoredMatrixCalls
+                                        + " reason=" + (frame.NativeFogConflictReason ?? frame.NativeFogFailureReason ?? "none"));
                                     if (CanArmPresentForFrame(frame, eventTid))
                                     {
                                         try { remote = StartRemoteReadback(process, eventTid, ngiBase, presentBreakpoint, frame, outputPath); }
@@ -2195,6 +3186,9 @@ internal static partial class NativeFrameCapture
                                 {
                                     bool rearmAfterStep = hitBreakpoint != presentBreakpoint
                                         && !(hitBreakpoint == missionBreakpoint && missionProbeFinished);
+                                    if (hitBreakpoint == fogConsumerBreakpoint)
+                                        rearmAfterStep = !frame.NativeFogSamplingStopped
+                                            && !frame.NativeFogSampleLimitExceeded;
                                     BeginSingleStep(process, eventTid, hitBreakpoint, stoppedContext,
                                         out pendingStep, rearmAfterStep);
                                     Log("SINGLE_STEP_STARTED boundary=" + hitBreakpoint.Name + " tid=" + eventTid);
@@ -2267,7 +3261,8 @@ internal static partial class NativeFrameCapture
                     captureFailure = captureFailure ?? "No matching native camera/projection/present frame completed before the bounded timeout.";
                     Log("NO_FRAME_CAPTURE bounded timeout at stopped debug event");
                     if (!RestoreArmedBreakpointsWhileStopped(process,
-                        cameraBreakpoint, projectionBreakpoint, returnBreakpoint, atmosphereBreakpoint, presentBreakpoint, missionBreakpoint))
+                        cameraBreakpoint, projectionBreakpoint, returnBreakpoint, atmosphereBreakpoint,
+                        fogConsumerBreakpoint, presentBreakpoint, missionBreakpoint))
                     {
                         Log("FATAL_TIMEOUT_BREAKPOINT_RESTORE_FAILED; terminating own verified scratch process");
                         TerminateProcess(process, 0xE007);
@@ -2286,11 +3281,13 @@ internal static partial class NativeFrameCapture
                         || projectionBreakpoint != null && projectionBreakpoint.Armed
                         || returnBreakpoint != null && returnBreakpoint.Armed
                         || atmosphereBreakpoint != null && atmosphereBreakpoint.Armed
+                        || fogConsumerBreakpoint != null && fogConsumerBreakpoint.Armed
                         || presentBreakpoint != null && presentBreakpoint.Armed
                         || missionBreakpoint != null && missionBreakpoint.Armed))
                 {
                     if (!RestoreArmedBreakpointsWhileStopped(process,
-                        cameraBreakpoint, projectionBreakpoint, returnBreakpoint, atmosphereBreakpoint, presentBreakpoint, missionBreakpoint))
+                        cameraBreakpoint, projectionBreakpoint, returnBreakpoint, atmosphereBreakpoint,
+                        fogConsumerBreakpoint, presentBreakpoint, missionBreakpoint))
                     {
                         Log("FATAL_STOP_BREAKPOINT_RESTORE_FAILED; terminating own verified scratch process");
                         TerminateProcess(process, 0xE008);
@@ -2324,6 +3321,7 @@ internal static partial class NativeFrameCapture
                 || projectionBreakpoint != null && projectionBreakpoint.Armed
                 || returnBreakpoint != null && returnBreakpoint.Armed
                 || atmosphereBreakpoint != null && atmosphereBreakpoint.Armed
+                || fogConsumerBreakpoint != null && fogConsumerBreakpoint.Armed
                 || presentBreakpoint != null && presentBreakpoint.Armed
                 || missionBreakpoint != null && missionBreakpoint.Armed))
             {
@@ -2396,7 +3394,8 @@ internal static partial class NativeFrameCapture
                 else Log("PROCESS_STATE_AFTER_DETACH unreadable error=" + Marshal.GetLastWin32Error());
             }
             breakpointsRestored = processExited || AreBreakpointsRestored(cameraBreakpoint,
-                projectionBreakpoint, returnBreakpoint, atmosphereBreakpoint, presentBreakpoint, missionBreakpoint);
+                projectionBreakpoint, returnBreakpoint, atmosphereBreakpoint,
+                fogConsumerBreakpoint, presentBreakpoint, missionBreakpoint);
             Log("FINAL_BREAKPOINT_STATE restored=" + breakpointsRestored + " processExited=" + processExited);
             if (eventBuffer != IntPtr.Zero) Marshal.FreeHGlobal(eventBuffer);
             if (process != IntPtr.Zero) CloseHandle(process);
@@ -2486,25 +3485,29 @@ internal static partial class NativeFrameCapture
 
     private static bool RestoreArmedBreakpointsWhileStopped(IntPtr process,
         BreakpointInfo cameraBreakpoint, BreakpointInfo projectionBreakpoint, BreakpointInfo returnBreakpoint,
-        BreakpointInfo atmosphereBreakpoint, BreakpointInfo presentBreakpoint, BreakpointInfo missionBreakpoint)
+        BreakpointInfo atmosphereBreakpoint, BreakpointInfo fogConsumerBreakpoint,
+        BreakpointInfo presentBreakpoint, BreakpointInfo missionBreakpoint)
     {
         return RestoreBreakpointWhileStopped(process, cameraBreakpoint)
             && RestoreBreakpointWhileStopped(process, projectionBreakpoint)
             && RestoreBreakpointWhileStopped(process, returnBreakpoint)
             && RestoreBreakpointWhileStopped(process, atmosphereBreakpoint)
+            && RestoreBreakpointWhileStopped(process, fogConsumerBreakpoint)
             && RestoreBreakpointWhileStopped(process, presentBreakpoint)
             && RestoreBreakpointWhileStopped(process, missionBreakpoint);
     }
 
     private static bool AreBreakpointsRestored(BreakpointInfo cameraBreakpoint,
         BreakpointInfo projectionBreakpoint, BreakpointInfo returnBreakpoint,
-        BreakpointInfo atmosphereBreakpoint, BreakpointInfo presentBreakpoint,
+        BreakpointInfo atmosphereBreakpoint, BreakpointInfo fogConsumerBreakpoint,
+        BreakpointInfo presentBreakpoint,
         BreakpointInfo missionBreakpoint)
     {
         return (cameraBreakpoint == null || !cameraBreakpoint.Armed)
             && (projectionBreakpoint == null || !projectionBreakpoint.Armed)
             && (returnBreakpoint == null || !returnBreakpoint.Armed)
             && (atmosphereBreakpoint == null || !atmosphereBreakpoint.Armed)
+            && (fogConsumerBreakpoint == null || !fogConsumerBreakpoint.Armed)
             && (presentBreakpoint == null || !presentBreakpoint.Armed)
             && (missionBreakpoint == null || !missionBreakpoint.Armed);
     }
