@@ -1139,6 +1139,8 @@ fn sky_sample(key: &InterpolatedKey) -> SkySample {
 fn sun_sample(key: &InterpolatedKey, birth: Option<SunBirth>) -> SunSample {
     let source = key.colors[12].rgba();
     let intensity = key.parameters[2];
+    // Native selector-0 outputs 5/6 are palette[9]/[14] (Terrain.dll RVA 0x3DFB0);
+    // CSun uses slot 5 alpha for flare opacity (+0x4B3AB) and slot 6 RGB for secondary light (+0x4B4BE).
     SunSample {
         active: birth.is_some(),
         rgb: [
@@ -1147,7 +1149,7 @@ fn sun_sample(key: &InterpolatedKey, birth: Option<SunBirth>) -> SunSample {
             source[2] * intensity,
         ],
         values: [key.parameters[0], key.parameters[1]],
-        packed: [key.colors[10], key.colors[14]],
+        packed: [key.colors[9], key.colors[14]],
         intensity,
         birth,
     }
@@ -1583,6 +1585,53 @@ mod tests {
         let middle = parsed.sample_day(0, 6.0 * 3_600.0);
         assert!((middle.sun.intensity - 1.5).abs() < 0.01);
         assert_eq!(middle.rain.intensity, 0.0);
+    }
+
+    #[test]
+    fn sun_packed_slots_feed_native_flare_alpha_and_secondary_light() {
+        let mut palette = [0xFF00_0000_u32; KEY_COLOR_COUNT];
+        palette[9] = 0x4011_2233;
+        palette[10] = 0xFFAA_BBCC;
+        palette[12] = 0xFFFF_FFFF;
+        palette[14] = 0x8044_5566;
+        let bytes = document(2, |out| {
+            key(out, 0, 0, 0, palette, [0.0, 0.0, 1.5, 0.0], &[]);
+            key(out, 12, 0, 1, palette, [0.0, 0.0, 1.5, 0.0], &[]);
+        });
+        let mut parsed = TypedAtmosphere::parse(&bytes).expect("parse");
+        for key in &mut parsed.tracks[0].keys {
+            key.strings[0] = AtmosphereString {
+                raw: b"sun".to_vec(),
+                text: "sun".to_owned(),
+            };
+        }
+
+        let sampled = parsed.sample_day(0, 0.0);
+        assert!(sampled.sun.active);
+        assert_eq!(sampled.sun.packed[0], PackedColor(palette[9]));
+        assert_eq!(sampled.sun.packed[1], PackedColor(palette[14]));
+
+        let birth = sampled.sun.birth.expect("sun birth");
+        let sun = crate::sky::SunFrame::from_sample(
+            &sampled.sun,
+            0.0,
+            crate::sky::SunConfig::from_birth(birth),
+        );
+        assert_eq!(sun.sprite_color, PackedColor(palette[9]).rgba());
+        assert_eq!(sun.secondary_color, PackedColor(palette[14]).rgba()[..3]);
+
+        let optics = crate::sky::sun_optics(
+            sun,
+            crate::sky::SunVisibility {
+                projected_sun: [50.0, 50.0],
+                viewport: [100.0, 100.0],
+                view_forward: sun.direction,
+                unoccluded: true,
+            },
+        )
+        .expect("sun optics");
+        assert!(optics.flares[0].active);
+        assert!((optics.flares[0].color[3] - 64.0 / 255.0).abs() < 1.0e-6);
     }
 
     #[test]
