@@ -521,14 +521,18 @@ struct TexmHeader32 {
 556    R5 G5 B6
 4444   A4 R4 G4 B4
 88     L8 A8
-888    RGB8 в четырёхбайтовом element
-8888   A8 R8 G8 B8
+888    packed 0xXXRRGGBB; little-endian bytes [B,G,R,X], RGBA output использует alpha 255
+8888   packed 0xAARRGGBB; little-endian bytes [B,G,R,A], декодируется как RGBA
 ```
 
 Formats 556 и 88 являются loader-confirmed, но не corpus-verified для
 доступных игровых payload. CPU decoder расширяет короткие каналы до 8 bit через
 повторение значимых bit, а не простым shift. Для 888 служебный четвёртый byte
-сохраняется при roundtrip.
+сохраняется в raw mip, но не попадает в RGBA output.
+Нативный код Ngi32 подтверждает layout: VA `0x10005930` упаковывает
+`0xAARRGGBB` в ARGB4444, а VA `0x1000F620`/`0x1000F70C` направляют 888/8888
+по byte-copy пути `0x1000F730` без перестановки каналов. На диске little-endian
+байты имеют порядок `[B,G,R,A]` для 8888 и `[B,G,R,X]` для 888.
 
 Layout:
 

@@ -825,17 +825,17 @@ fn decode_luminance_alpha88(word: u16) -> [u8; 4] {
 }
 
 fn decode_rgb888x(dword: u32) -> [u8; 4] {
-    let red = u8::try_from(dword & 0xFF).unwrap_or(u8::MAX);
+    let red = u8::try_from((dword >> 16) & 0xFF).unwrap_or(u8::MAX);
     let green = u8::try_from((dword >> 8) & 0xFF).unwrap_or(u8::MAX);
-    let blue = u8::try_from((dword >> 16) & 0xFF).unwrap_or(u8::MAX);
+    let blue = u8::try_from(dword & 0xFF).unwrap_or(u8::MAX);
     [red, green, blue, 255]
 }
 
 fn decode_argb8888(dword: u32) -> [u8; 4] {
-    let alpha = u8::try_from(dword & 0xFF).unwrap_or(u8::MAX);
-    let red = u8::try_from((dword >> 8) & 0xFF).unwrap_or(u8::MAX);
-    let green = u8::try_from((dword >> 16) & 0xFF).unwrap_or(u8::MAX);
-    let blue = u8::try_from((dword >> 24) & 0xFF).unwrap_or(u8::MAX);
+    let alpha = u8::try_from((dword >> 24) & 0xFF).unwrap_or(u8::MAX);
+    let red = u8::try_from((dword >> 16) & 0xFF).unwrap_or(u8::MAX);
+    let green = u8::try_from((dword >> 8) & 0xFF).unwrap_or(u8::MAX);
+    let blue = u8::try_from(dword & 0xFF).unwrap_or(u8::MAX);
     [red, green, blue, alpha]
 }
 
@@ -907,6 +907,53 @@ mod tests {
     }
 
     #[test]
+    fn decodes_8888_and_888x_in_native_argb_dword_order() {
+        let transparent_white_bytes = [0xFF, 0xFF, 0xFF, 0x00];
+        let transparent_white = decode_texm(Arc::from(
+            payload(1, 1, 8888, &[&transparent_white_bytes]).into_boxed_slice(),
+        ))
+        .expect("8888 transparent white texture");
+        assert_eq!(
+            decode_mip_rgba8(&transparent_white, 0)
+                .expect("decode transparent white")
+                .rgba8,
+            [0xFF, 0xFF, 0xFF, 0x00]
+        );
+
+        let argb_bytes = 0xF123_4567_u32.to_le_bytes();
+        let argb = decode_texm(Arc::from(
+            payload(1, 1, 8888, &[&argb_bytes]).into_boxed_slice(),
+        ))
+        .expect("8888 ARGB texture");
+        assert_eq!(
+            decode_mip_rgba8(&argb, 0).expect("decode ARGB").rgba8,
+            [0x23, 0x45, 0x67, 0xF1]
+        );
+
+        let rgb888x_bytes = [0x67, 0x45, 0x23, 0xA9];
+        let rgb888x = decode_texm(Arc::from(
+            payload(1, 1, 888, &[&rgb888x_bytes]).into_boxed_slice(),
+        ))
+        .expect("888 RGB texture");
+        assert_eq!(rgb888x.mip_level(0).expect("raw mip").bytes, rgb888x_bytes);
+        assert_eq!(
+            decode_mip_rgba8(&rgb888x, 0).expect("decode RGB888X").rgba8,
+            [0x23, 0x45, 0x67, 0xFF]
+        );
+
+        let native_4444 = decode_texm(Arc::from(
+            payload(1, 1, 4444, &[&0xF246_u16.to_le_bytes()]).into_boxed_slice(),
+        ))
+        .expect("4444 ARGB texture");
+        assert_eq!(
+            decode_mip_rgba8(&native_4444, 0)
+                .expect("decode native 4444")
+                .rgba8,
+            [0x22, 0x44, 0x66, 0xFF]
+        );
+    }
+
+    #[test]
     fn rejects_zero_dimensions() {
         let err = decode_texm(Arc::from(
             payload(0, 1, 8888, &[&[0, 0, 0, 0]]).into_boxed_slice(),
@@ -972,7 +1019,7 @@ mod tests {
         );
         assert_eq!(
             decode_mip_rgba8(&document, 0).expect("rgba").rgba8,
-            vec![0x11, 0x22, 0x33, 0xFF]
+            vec![0x33, 0x22, 0x11, 0xFF]
         );
     }
 
