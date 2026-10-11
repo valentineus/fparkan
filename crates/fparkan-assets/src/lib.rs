@@ -905,6 +905,34 @@ pub struct PreparedComponentControl {
     pub bindings: Vec<PreparedControlNodeBinding>,
     /// Parsed native effect rows in this component's control resource.
     pub effect_section: PreparedControlEffectSection,
+    /// Component-local points selected for parsed effect rows, when present.
+    pub point_list: Option<PreparedControlPointList>,
+}
+
+/// Decoded point records selected by a component's Control configuration.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedControlPointList {
+    /// CPT resource paired with the component control resource.
+    pub source: ResourceKey,
+    /// Point records in their original component-local order.
+    pub points: Vec<PreparedControlPoint>,
+}
+
+/// One 36-byte native CPT point record and its parallel fixed-width name.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedControlPoint {
+    /// Raw native flag bits.
+    pub raw_flags: u32,
+    /// Raw signed 32-bit word at byte offset +4 in the native record.
+    pub raw_signed_field_04: i32,
+    /// Raw signed 32-bit word at byte offset +8 in the native record.
+    pub raw_signed_field_08: i32,
+    /// Three stored coordinate values at byte offset +0x0C.
+    pub position: [f32; 3],
+    /// Three stored direction values at byte offset +0x18.
+    pub direction: [f32; 3],
+    /// Parallel raw 32-byte name entry, including NUL padding.
+    pub name: [u8; 32],
 }
 
 /// Status of the trailing typed/effect data in a CTLD resource.
@@ -1534,6 +1562,7 @@ fn prepare_mission_assets_with_repository_internal<R: ResourceRepository>(
         let control = prepare_component_control_from_resource(
             repository,
             source,
+            prototype.point_resource.clone(),
             model.validated.node_count,
             prototype_index,
         )?;
@@ -2831,13 +2860,125 @@ fn read_optional_key<R: ResourceRepository>(
 fn prepare_component_control_from_resource<R: ResourceRepository>(
     repository: &R,
     source: ResourceKey,
+    point_source: Option<ResourceKey>,
     model_node_count: usize,
     prototype_index: usize,
 ) -> Result<Option<PreparedComponentControl>, AssetError> {
     let Some(payload) = read_optional_key(repository, &source, Some("component control"))? else {
         return Ok(None);
     };
-    decode_component_control_payload(&payload, source, model_node_count, prototype_index).map(Some)
+    let mut control =
+        decode_component_control_payload(&payload, source, model_node_count, prototype_index)?;
+    let has_effect_rows = matches!(
+        &control.effect_section,
+        PreparedControlEffectSection::Parsed(rows) if !rows.is_empty()
+    );
+    let Some(point_source) = point_source.filter(|_| has_effect_rows) else {
+        return Ok(Some(control));
+    };
+    let Some(point_payload) =
+        read_optional_key(repository, &point_source, Some("component point list"))?
+    else {
+        return Ok(Some(control));
+    };
+    control.point_list = Some(decode_component_point_list(
+        &point_payload,
+        point_source,
+        prototype_index,
+    )?);
+    Ok(Some(control))
+}
+
+fn decode_component_point_list(
+    payload: &[u8],
+    source: ResourceKey,
+    prototype_index: usize,
+) -> Result<PreparedControlPointList, AssetError> {
+    const HEADER_BYTES: usize = 4;
+    const POINT_BYTES: usize = 36;
+    const NAME_BYTES: usize = 32;
+    const POINT_LIMIT: usize = 65_536;
+
+    let invalid = |message: &str| {
+        AssetError::InvalidPrototype(format!(
+            "prototype {prototype_index} point list {}:{}: {message}",
+            source.archive.as_str(),
+            String::from_utf8_lossy(&source.name.0),
+        ))
+    };
+    let point_count =
+        usize::try_from(control_u32_at(payload, 0).ok_or_else(|| invalid("missing point count"))?)
+            .map_err(|_| invalid("point count overflows usize"))?;
+    if point_count > POINT_LIMIT {
+        return Err(invalid("point count exceeds the supported limit"));
+    }
+    let point_bytes = point_count
+        .checked_mul(POINT_BYTES)
+        .ok_or_else(|| invalid("point table byte length overflows"))?;
+    let names_start = HEADER_BYTES
+        .checked_add(point_bytes)
+        .ok_or_else(|| invalid("point name table offset overflows"))?;
+    let names_bytes = point_count
+        .checked_mul(NAME_BYTES)
+        .ok_or_else(|| invalid("point name table byte length overflows"))?;
+    let expected_len = names_start
+        .checked_add(names_bytes)
+        .ok_or_else(|| invalid("point list end offset overflows"))?;
+    if payload.len() != expected_len {
+        return Err(invalid(
+            "payload length does not match its point and name counts",
+        ));
+    }
+
+    let mut points = Vec::with_capacity(point_count);
+    for index in 0..point_count {
+        let point_start = HEADER_BYTES + index * POINT_BYTES;
+        let position = control_vec3_at(payload, point_start + 12)
+            .expect("complete CPT point record was checked");
+        let direction = control_vec3_at(payload, point_start + 24)
+            .expect("complete CPT point record was checked");
+        if position
+            .into_iter()
+            .chain(direction)
+            .any(|value| !value.is_finite())
+        {
+            return Err(invalid(
+                "point position or direction contains a non-finite value",
+            ));
+        }
+        let name_start = names_start + index * NAME_BYTES;
+        points.push(PreparedControlPoint {
+            raw_flags: control_u32_at(payload, point_start).expect("checked point flags"),
+            raw_signed_field_04: control_i32_at(payload, point_start + 4)
+                .expect("checked signed point word at +4"),
+            raw_signed_field_08: control_i32_at(payload, point_start + 8)
+                .expect("checked signed point word at +8"),
+            position,
+            direction,
+            name: payload[name_start..name_start + NAME_BYTES]
+                .try_into()
+                .expect("fixed point name is 32 bytes"),
+        });
+    }
+    Ok(PreparedControlPointList { source, points })
+}
+
+fn control_vec3_at(payload: &[u8], offset: usize) -> Option<[f32; 3]> {
+    Some([
+        control_f32_at(payload, offset)?,
+        control_f32_at(payload, offset.checked_add(4)?)?,
+        control_f32_at(payload, offset.checked_add(8)?)?,
+    ])
+}
+
+fn control_f32_at(payload: &[u8], offset: usize) -> Option<f32> {
+    Some(f32::from_bits(control_u32_at(payload, offset)?))
+}
+
+fn control_i32_at(payload: &[u8], offset: usize) -> Option<i32> {
+    Some(i32::from_le_bytes(
+        control_u32_at(payload, offset)?.to_le_bytes(),
+    ))
 }
 
 const CONTROL_TYPED_COMMON_PARSER_TAGS: &[u32] = &[1, 8, 9, 12, 13, 15, 19, 21, 25, 26];
@@ -3156,6 +3297,7 @@ fn decode_component_control_payload(
         source,
         bindings,
         effect_section,
+        point_list: None,
     })
 }
 
@@ -3456,6 +3598,206 @@ mod tests {
     }
 
     #[test]
+    fn component_control_loads_explicit_cpt_points_for_effect_offsets() {
+        let mut control = component_control_payload(&[(1, 0.0, 1.0, 0.25, 0)]);
+        control[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        control.resize(control.len() + CONTROL_EFFECT_GROUP_HEADER_BYTES, 0);
+        append_effect_table(
+            &mut control,
+            &[
+                effect_row(
+                    4,
+                    [0; 3],
+                    [104, 105, 106],
+                    17,
+                    "effects.rlb",
+                    "f_smalllight_y",
+                ),
+                effect_row(
+                    4,
+                    [0; 3],
+                    [119, 120, 121],
+                    3300,
+                    "effects.rlb",
+                    "smoke_fr_02",
+                ),
+            ],
+        );
+        let mut cpt = cpt_payload(122);
+        write_cpt_point(
+            &mut cpt,
+            104,
+            0,
+            23,
+            23,
+            [-12.964_036, 12.991_658, -21.119_995],
+            [0.0, 0.0, 1.0],
+            "Sign_Recharge1",
+        );
+        write_cpt_point(
+            &mut cpt,
+            119,
+            0x8000_0000,
+            24,
+            24,
+            [0.0, 0.166_994_02, 32.7812],
+            [0.0, 0.0, 1.0],
+            "Smoke_w",
+        );
+        let repository = repository_with_archives(&[
+            ("controls.rlb", &[(b"parts.ctl", &control)]),
+            ("points.rlb", &[(b"attachments.cpt", &cpt)]),
+        ]);
+        let source = ResourceKey {
+            archive: parse_path("controls.rlb").expect("control archive"),
+            name: resource_name(b"parts.ctl"),
+            type_id: None,
+        };
+        let point_source = ResourceKey {
+            archive: parse_path("points.rlb").expect("point archive"),
+            name: resource_name(b"attachments.cpt"),
+            type_id: None,
+        };
+
+        let control =
+            prepare_component_control_from_resource(&repository, source, Some(point_source), 2, 0)
+                .expect("loaded CTL and its explicit CPT")
+                .expect("CTL entry");
+        let point_list = control.point_list.as_ref().expect("point list is attached");
+
+        assert_eq!(point_list.source.archive.as_str(), "points.rlb");
+        assert_eq!(point_list.source.name, resource_name(b"attachments.cpt"));
+        assert_eq!(point_list.points.len(), 122);
+        let PreparedControlEffectSection::Parsed(rows) = &control.effect_section else {
+            panic!("effect rows parsed");
+        };
+        assert_eq!(rows[0].point_offsets, [104, 105, 106]);
+        assert_eq!(rows[1].point_offsets, [119, 120, 121]);
+        assert_eq!(point_list.points[104].raw_signed_field_04, 23);
+        assert_eq!(point_list.points[104].raw_signed_field_08, 23);
+        assert_eq!(
+            point_list.points[104].position,
+            [-12.964_036, 12.991_658, -21.119_995]
+        );
+        assert_eq!(point_list.points[104].name, fixed_name("Sign_Recharge1"));
+        assert_eq!(point_list.points[119].raw_flags, 0x8000_0000);
+        assert_eq!(point_list.points[119].name, fixed_name("Smoke_w"));
+    }
+
+    #[test]
+    fn component_point_list_rejects_bad_bounds_and_non_finite_points() {
+        let source = ResourceKey {
+            archive: parse_path("controls.rlb").expect("archive"),
+            name: resource_name(b"parts.cpt"),
+            type_id: None,
+        };
+        let valid = cpt_payload(1);
+        assert!(decode_component_point_list(&valid[..valid.len() - 1], source.clone(), 0).is_err());
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        assert!(decode_component_point_list(&trailing, source.clone(), 0).is_err());
+
+        let mut non_finite = valid;
+        non_finite[16..20].copy_from_slice(&f32::INFINITY.to_bits().to_le_bytes());
+        assert!(decode_component_point_list(&non_finite, source, 0).is_err());
+    }
+
+    #[test]
+    fn component_control_preserves_unresolved_point_offset_sentinels() {
+        let mut control = component_control_payload(&[(1, 0.0, 1.0, 0.25, 0)]);
+        control[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        control.resize(control.len() + CONTROL_EFFECT_GROUP_HEADER_BYTES, 0);
+        append_effect_table(
+            &mut control,
+            &[effect_row(
+                4,
+                [0; 3],
+                [u32::MAX; 3],
+                17,
+                "effects.rlb",
+                "f_smalllight_y",
+            )],
+        );
+        let cpt = cpt_payload(1);
+        let repository = repository_with_archives(&[
+            ("controls.rlb", &[(b"parts.ctl", &control)]),
+            ("points.rlb", &[(b"attachments.cpt", &cpt)]),
+        ]);
+        let source = ResourceKey {
+            archive: parse_path("controls.rlb").expect("control archive"),
+            name: resource_name(b"parts.ctl"),
+            type_id: None,
+        };
+        let point_source = ResourceKey {
+            archive: parse_path("points.rlb").expect("point archive"),
+            name: resource_name(b"attachments.cpt"),
+            type_id: None,
+        };
+
+        let control =
+            prepare_component_control_from_resource(&repository, source, Some(point_source), 2, 0)
+                .expect("point-offset sentinel is retained without guessed bounds")
+                .expect("CTL entry");
+        let PreparedControlEffectSection::Parsed(rows) = control.effect_section else {
+            panic!("effect rows parsed");
+        };
+        assert_eq!(rows[0].point_offsets, [u32::MAX; 3]);
+        assert_eq!(
+            control
+                .point_list
+                .expect("explicit CPT loaded")
+                .points
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn component_control_keeps_missing_explicit_cpt_unavailable() {
+        let mut control = component_control_payload(&[(1, 0.0, 1.0, 0.25, 0)]);
+        control[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        control.resize(control.len() + CONTROL_EFFECT_GROUP_HEADER_BYTES, 0);
+        append_effect_table(
+            &mut control,
+            &[effect_row(
+                4,
+                [0; 3],
+                [0; 3],
+                17,
+                "effects.rlb",
+                "f_smalllight_y",
+            )],
+        );
+        let repository = repository_with_archives(&[("controls.rlb", &[(b"parts.ctl", &control)])]);
+        let source = ResourceKey {
+            archive: parse_path("controls.rlb").expect("control archive"),
+            name: resource_name(b"parts.ctl"),
+            type_id: None,
+        };
+        let missing_point_source = ResourceKey {
+            archive: parse_path("points.rlb").expect("point archive"),
+            name: resource_name(b"attachments.cpt"),
+            type_id: None,
+        };
+
+        let control = prepare_component_control_from_resource(
+            &repository,
+            source,
+            Some(missing_point_source),
+            2,
+            0,
+        )
+        .expect("an absent optional CPT leaves rows inspectable")
+        .expect("CTL entry");
+
+        assert_eq!(control.point_list, None);
+        assert!(matches!(
+            control.effect_section,
+            PreparedControlEffectSection::Parsed(rows) if rows.len() == 1
+        ));
+    }
+
+    #[test]
     fn component_control_max_length_uses_wrapped_empty_tail() {
         let source = ResourceKey {
             archive: parse_path("controls.rlb").expect("archive"),
@@ -3546,6 +3888,43 @@ mod tests {
 
     fn write_fixed_name(target: &mut [u8], value: &str) {
         target[..value.len()].copy_from_slice(value.as_bytes());
+    }
+
+    fn cpt_payload(point_count: usize) -> Vec<u8> {
+        let mut payload = vec![0; 4 + point_count * 36 + point_count * 32];
+        payload[..4].copy_from_slice(
+            &u32::try_from(point_count)
+                .expect("point count")
+                .to_le_bytes(),
+        );
+        payload
+    }
+
+    fn write_cpt_point(
+        payload: &mut [u8],
+        index: usize,
+        raw_flags: u32,
+        signed_field_04: i32,
+        signed_field_08: i32,
+        position: [f32; 3],
+        direction: [f32; 3],
+        name: &str,
+    ) {
+        let count = control_u32_at(payload, 0).expect("point count") as usize;
+        assert!(index < count);
+        let point_start = 4 + index * 36;
+        payload[point_start..point_start + 4].copy_from_slice(&raw_flags.to_le_bytes());
+        payload[point_start + 4..point_start + 8].copy_from_slice(&signed_field_04.to_le_bytes());
+        payload[point_start + 8..point_start + 12].copy_from_slice(&signed_field_08.to_le_bytes());
+        for (offset, value) in position.into_iter().chain(direction).enumerate() {
+            let start = point_start + 12 + offset * 4;
+            payload[start..start + 4].copy_from_slice(&value.to_bits().to_le_bytes());
+        }
+        let names_start = 4 + count * 36;
+        write_fixed_name(
+            &mut payload[names_start + index * 32..names_start + (index + 1) * 32],
+            name,
+        );
     }
 
     #[test]
@@ -3664,6 +4043,7 @@ mod tests {
             source_type: None,
             dependencies: Vec::new(),
             control_resource: None,
+            point_resource: None,
         };
         let second = EffectivePrototype {
             key: fparkan_prototype::PrototypeKey(resource_name(b"mesh")),
@@ -3677,6 +4057,7 @@ mod tests {
             source_type: None,
             dependencies: Vec::new(),
             control_resource: None,
+            point_resource: None,
         };
 
         assert_ne!(stable_visual_id(&first), stable_visual_id(&second));
@@ -3741,6 +4122,7 @@ mod tests {
             source_type: None,
             dependencies: vec![mesh_key.clone()],
             control_resource: None,
+            point_resource: None,
         };
         let mut graph = prototype_graph_for_mesh(&prototype);
         let mut report = PrototypeGraphReport {
@@ -3856,6 +4238,7 @@ mod tests {
             source_type: None,
             dependencies: Vec::new(),
             control_resource: None,
+            point_resource: None,
         };
         let mut graph = prototype_graph_for_mesh(&prototype);
         graph
@@ -4009,6 +4392,7 @@ mod tests {
             source_type: None,
             dependencies: Vec::new(),
             control_resource: None,
+            point_resource: None,
         };
         let mut graph = prototype_graph_for_mesh(&prototype);
         let mut report = PrototypeGraphReport {
@@ -4053,8 +4437,32 @@ mod tests {
         let mat0 = mat0_with_texture(b"TEX_A");
         let texm = texm_payload();
         let lightmap_texm = texm_payload();
-        let first_control = component_control_payload(&[(0, 1.25, 2.5, 0.25, 0)]);
+        let mut first_control = component_control_payload(&[(0, 1.25, 2.5, 0.25, 0)]);
+        first_control[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        first_control.resize(first_control.len() + CONTROL_EFFECT_GROUP_HEADER_BYTES, 0);
+        append_effect_table(
+            &mut first_control,
+            &[effect_row(
+                4,
+                [0; 3],
+                [0; 3],
+                17,
+                "effects.rlb",
+                "f_smalllight_y",
+            )],
+        );
         let second_control = component_control_payload(&[(0, 2.5, 3.75, 0.75, 0)]);
+        let mut points = cpt_payload(1);
+        write_cpt_point(
+            &mut points,
+            0,
+            0x8000_0000,
+            -23,
+            -24,
+            [2.0, 3.0, 4.0],
+            [0.0, 0.0, 1.0],
+            "LightAnchor",
+        );
         let repo = repository_with_archives_meta(&[
             (
                 "static.rlb",
@@ -4117,6 +4525,15 @@ mod tests {
                     },
                 ],
             ),
+            (
+                "points.rlb",
+                &[TestNresEntry {
+                    name: b"attachments.cpt",
+                    payload: &points,
+                    type_id: 0,
+                    attr2: 0,
+                }],
+            ),
         ]);
         let prototypes = [
             EffectivePrototype {
@@ -4128,6 +4545,11 @@ mod tests {
                 control_resource: Some(ResourceKey {
                     archive: parse_path("controls.rlb").expect("control archive"),
                     name: resource_name(b"first.ctl"),
+                    type_id: None,
+                }),
+                point_resource: Some(ResourceKey {
+                    archive: parse_path("points.rlb").expect("point archive"),
+                    name: resource_name(b"attachments.cpt"),
                     type_id: None,
                 }),
             },
@@ -4142,6 +4564,7 @@ mod tests {
                     name: resource_name(b"second.ctl"),
                     type_id: None,
                 }),
+                point_resource: None,
             },
             EffectivePrototype {
                 key: fparkan_prototype::PrototypeKey(resource_name(b"tree-c")),
@@ -4154,6 +4577,7 @@ mod tests {
                     name: resource_name(b"missing.ctl"),
                     type_id: None,
                 }),
+                point_resource: None,
             },
         ];
 
@@ -4184,6 +4608,14 @@ mod tests {
                 .name,
             resource_name(b"first.ctl")
         );
+        let first = controls[0].as_ref().expect("first component control");
+        let points = first.point_list.as_ref().expect("explicit CPT was loaded");
+        assert_eq!(points.source.archive.as_str(), "points.rlb");
+        assert_eq!(points.source.name, resource_name(b"attachments.cpt"));
+        assert_eq!(points.points.len(), 1);
+        assert_eq!(points.points[0].raw_signed_field_04, -23);
+        assert_eq!(points.points[0].raw_signed_field_08, -24);
+        assert_eq!(points.points[0].name, fixed_name("LightAnchor"));
         assert_eq!(
             controls[1]
                 .as_ref()
@@ -4239,6 +4671,7 @@ mod tests {
                 name: resource_name(b"marker.ctl"),
                 type_id: None,
             }),
+            point_resource: None,
         };
 
         let assets = prepare_mission_assets_with_repository(&repository, &[0..1], &[prototype])
@@ -4434,6 +4867,7 @@ mod tests {
             source_type: None,
             dependencies: vec![mesh_key.clone()],
             control_resource: None,
+            point_resource: None,
         };
         let mut graph = prototype_graph_for_mesh(&prototype);
         let mut report = PrototypeGraphReport {
@@ -4643,6 +5077,7 @@ mod tests {
                 source_type: None,
                 dependencies: Vec::new(),
                 control_resource: None,
+                point_resource: None,
             },
             EffectivePrototype {
                 key: fparkan_prototype::PrototypeKey(resource_name(b"tree_b")),
@@ -4655,6 +5090,7 @@ mod tests {
                 source_type: None,
                 dependencies: Vec::new(),
                 control_resource: None,
+                point_resource: None,
             },
         ];
         (repo, prototypes)

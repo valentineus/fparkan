@@ -111,6 +111,9 @@ pub struct EffectivePrototype {
     /// state belongs to each component instance and must not alter shared
     /// mesh/material cache identity.
     pub control_resource: Option<ResourceKey>,
+    /// Explicit component point resource referenced by this prototype's
+    /// resolved `objects.rlb` registry inheritance chain, when present.
+    pub point_resource: Option<ResourceKey>,
 }
 
 /// Prototype resolution source.
@@ -1141,7 +1144,14 @@ fn resolve_archive_model(
     let Some(mesh) = find_mesh_resource(repository, archive, model_key)? else {
         return Ok(None);
     };
-    Ok(Some(effective(model_key.clone(), mesh, source, None, None)))
+    Ok(Some(effective(
+        model_key.clone(),
+        mesh,
+        source,
+        None,
+        None,
+        None,
+    )))
 }
 
 fn resolve_objects_registry_model(
@@ -1165,6 +1175,7 @@ fn resolve_objects_registry_model(
         return Ok(None);
     };
     let control_resource = resolve_explicit_control_resource(object_key, &refs)?;
+    let point_resource = resolve_explicit_point_resource(object_key, &refs)?;
 
     let mut missing_mesh_refs = Vec::new();
     for item in refs.iter().filter(|item| is_explicit_mesh_ref(item)) {
@@ -1175,6 +1186,7 @@ fn resolve_objects_registry_model(
             cstr_bytes(&item.resource_raw),
             source_type,
             control_resource.clone(),
+            point_resource.clone(),
         )? {
             return Ok(Some(prototype));
         }
@@ -1195,6 +1207,7 @@ fn resolve_objects_registry_model(
         source_type,
         dependencies: Vec::new(),
         control_resource,
+        point_resource,
     }))
 }
 
@@ -1262,6 +1275,7 @@ fn resolve_object_ref_model(
     model_name: &[u8],
     source_type: Option<u32>,
     control_resource: Option<ResourceKey>,
+    point_resource: Option<ResourceKey>,
 ) -> Result<Option<EffectivePrototype>, PrototypeError> {
     let archive = normalized_path_from_name(&ResourceName(cstr_bytes(&item.archive_raw).to_vec()))?;
     let Some(mesh) = find_mesh_resource(repository, &archive, &ResourceName(model_name.to_vec()))?
@@ -1274,6 +1288,7 @@ fn resolve_object_ref_model(
         PrototypeSource::ObjectsRegistry,
         source_type,
         control_resource,
+        point_resource,
     )))
 }
 
@@ -1285,18 +1300,37 @@ fn is_explicit_control_ref(item: &ObjectRefRecord) -> bool {
     has_extension_bytes(cstr_bytes(&item.resource_raw), b"ctl")
 }
 
+fn is_explicit_point_ref(item: &ObjectRefRecord) -> bool {
+    has_extension_bytes(cstr_bytes(&item.resource_raw), b"cpt")
+}
+
 fn resolve_explicit_control_resource(
     requested: &ResourceName,
     refs: &[ObjectRefRecord],
 ) -> Result<Option<ResourceKey>, PrototypeError> {
+    resolve_explicit_resource(requested, refs, is_explicit_control_ref, "control")
+}
+
+fn resolve_explicit_point_resource(
+    requested: &ResourceName,
+    refs: &[ObjectRefRecord],
+) -> Result<Option<ResourceKey>, PrototypeError> {
+    resolve_explicit_resource(requested, refs, is_explicit_point_ref, "point")
+}
+
+fn resolve_explicit_resource(
+    requested: &ResourceName,
+    refs: &[ObjectRefRecord],
+    is_match: fn(&ObjectRefRecord) -> bool,
+    label: &str,
+) -> Result<Option<ResourceKey>, PrototypeError> {
     let mut resolved = Vec::new();
-    for item in refs.iter().filter(|item| is_explicit_control_ref(item)) {
+    for item in refs.iter().filter(|item| is_match(item)) {
         let archive =
             normalized_path_from_name(&ResourceName(cstr_bytes(&item.archive_raw).to_vec()))?;
         let name = resource_name(cstr_bytes(&item.resource_raw));
-        // CTLD is an optional pose sidecar. Keep the exact registry reference
-        // here, then let asset preparation treat a missing archive/entry as an
-        // absent override while still rejecting a present malformed payload.
+        // Keep exact registry references; asset preparation decides how to
+        // handle an absent optional sidecar and validates present payloads.
         let key = ResourceKey {
             archive,
             name,
@@ -1313,7 +1347,7 @@ fn resolve_explicit_control_resource(
         0 => Ok(None),
         1 => Ok(resolved.pop()),
         _ => Err(PrototypeError::Resource(ResourceError::Format(format!(
-            "prototype {} has ambiguous explicit control resources: {}",
+            "prototype {} has ambiguous explicit {label} resources: {}",
             String::from_utf8_lossy(&requested.0),
             resolved
                 .iter()
@@ -1386,6 +1420,7 @@ fn effective(
     source: PrototypeSource,
     source_type: Option<u32>,
     control_resource: Option<ResourceKey>,
+    point_resource: Option<ResourceKey>,
 ) -> EffectivePrototype {
     EffectivePrototype {
         key: PrototypeKey(requested),
@@ -1394,6 +1429,7 @@ fn effective(
         source_type,
         dependencies: vec![mesh],
         control_resource,
+        point_resource,
     }
 }
 
@@ -2133,6 +2169,7 @@ mod tests {
                         b"parent_proto".as_slice(),
                         build_object_refs(&[
                             (b"static.rlb".as_slice(), b"parent_proto.msh".as_slice()),
+                            (b"fortif.rlb".as_slice(), b"parent_proto.cpt".as_slice()),
                             (b"fortif.rlb".as_slice(), b"parent_proto.ctl".as_slice()),
                         ])
                         .as_slice(),
@@ -2142,6 +2179,7 @@ mod tests {
                         build_object_refs(&[
                             (b"objects.rlb".as_slice(), b"parent_proto".as_slice()),
                             (b"fortif.rlb".as_slice(), b"child_proto.bas".as_slice()),
+                            (b"fortif.rlb".as_slice(), b"parent_proto.cpt".as_slice()),
                             (b"fortif.rlb".as_slice(), b"parent_proto.ctl".as_slice()),
                         ])
                         .as_slice(),
@@ -2162,6 +2200,7 @@ mod tests {
                 build_nres(&[
                     (b"child_proto.bas".as_slice(), b"base"),
                     (b"parent_proto.ctl".as_slice(), b"control"),
+                    (b"parent_proto.cpt".as_slice(), b"points"),
                 ])
                 .into_boxed_slice(),
             ),
@@ -2181,6 +2220,9 @@ mod tests {
         let control = resolved.control_resource.expect("inherited explicit CTL");
         assert_eq!(control.archive.as_str(), "fortif.rlb");
         assert!(control.name.0.eq_ignore_ascii_case(b"parent_proto.ctl"));
+        let points = resolved.point_resource.expect("inherited explicit CPT");
+        assert_eq!(points.archive.as_str(), "fortif.rlb");
+        assert!(points.name.0.eq_ignore_ascii_case(b"parent_proto.cpt"));
     }
 
     #[test]
@@ -2199,6 +2241,10 @@ mod tests {
                         (
                             b"missing.rlb".as_slice(),
                             b"optional_control.ctl".as_slice(),
+                        ),
+                        (
+                            b"explicit_points.rlb".as_slice(),
+                            b"other_points.cpt".as_slice(),
                         ),
                     ])
                     .as_slice(),
@@ -2230,6 +2276,11 @@ mod tests {
         assert_eq!(control.archive.as_str(), "missing.rlb");
         assert_eq!(control.name, resource_name(b"optional_control.ctl"));
         assert_eq!(control.type_id, None);
+        let points = resolved
+            .point_resource
+            .expect("preserve independent explicit CPT reference");
+        assert_eq!(points.archive.as_str(), "explicit_points.rlb");
+        assert_eq!(points.name, resource_name(b"other_points.cpt"));
     }
 
     #[test]

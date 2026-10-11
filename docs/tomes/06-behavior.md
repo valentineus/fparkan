@@ -414,17 +414,44 @@ sentinel `-1`. Повторные node ID сохраняют исходный п
 runtime animation path. Остальные
 секции CTLD shape records и contact solver не входят в эту интерпретацию.
 
-Asset reader traverses common typed-record framing and preserves supported
-type-4 effect rows as data: table and row indices, raw condition words, selector,
-resource pair, and three offsets into the component-local CPT list. An unknown
-typed tag or unsupported layout sets the effect section to
-`PreparedControlEffectSection::Unsupported`, сохраняя уже разобранные pose
-bindings; malformed распознанная структура отклоняет подготовку ресурса. В
-read-only GOG corpus pass `fr_l_plant.ctl` дал 38 type-4 rows, включая четыре
-`f_smalllight_y` rows с offsets 104–107 и `smoke_fr_02` с offsets 119–121;
-`fr_l_gener.ctl` дал 35 rows, включая `f_gener_ball` с offset 85. Это только
-разбор ресурсов: разрешение CPT, оценка условий, activation, выполнение FX
-opcodes и видимый рендер эффектов здесь не реализованы.
+Читатель ресурсов проходит общую структуру typed records и сохраняет строки
+эффектов type 4 как данные: индексы таблицы и строки, raw condition words,
+selector, пару ресурсов и три offsets в point list компонента. Неизвестный tag
+или неподдерживаемый layout задаёт `PreparedControlEffectSection::Unsupported`,
+сохраняя уже разобранные pose bindings; повреждённая распознанная структура
+отклоняет подготовку ресурса. В GOG corpus `fr_l_plant.ctl` содержит 38 строк
+type 4, в том числе четыре `f_smalllight_y` с offsets 104–107 и `smoke_fr_02` с
+offsets 119–121. В `fr_l_gener.ctl` найдено 35 строк type 4, включая
+`f_gener_ball` с offset 85.
+
+Resolver прототипов хранит явную registry-ссылку на `.cpt` отдельно от ссылки
+на `.ctl`. Если строки type 4 разобраны и явная ссылка на CPT есть, подготовка
+читает ровно указанные archive/name; имя CPT не выводится из имени CTL. В CPT
+сначала идёт `u32` count, затем `count` записей по 36 байт и параллельные им
+имена по 32 байта. Подготовка проверяет count, точную длину и конечность шести
+float-полей. Она сохраняет flags, знаковые слова по смещениям `+4` и `+8`, два
+набора из трёх float и raw name. `Control+0xB210` копирует слово `+4` в
+производную запись точки, а `Control+0x1B4F0` передаёт это значение callback-у
+выбора model node; роль слова `+8` и координатный frame float-полей пока не
+назначены.
+
+Native lookup выбирает первую группу CPT с тем же C0, а type-4 path прибавляет
+к её началу row offset. Для корневых компонентов `fr_l_plant` и `fr_l_gener`
+C0 равен 0, поэтому найденные offsets 104–107, 119–121 и 75–82, 85 указывают на
+соответствующие записи в их CPT-списках. Общий путь выбора группы для других C0
+и семантика sentinel `u32::MAX` пока не реализованы; reader сохраняет offsets
+как raw значения. Отсутствующая явная CPT оставляет `point_list` отсутствующим,
+но не мешает исследовать строки эффектов. Это только чтение ресурсов: проверка
+условий, загрузка FX materials, activation, выполнение FX opcodes и видимый
+рендер эффектов пока не реализованы.
+
+CPU-only обход `MISSIONS/Autodemo.00/data.tma` подготовил четыре CTL с 80
+строками type 4 и четыре явных CPT-списка (всего 322 записи). Среди пар были
+`fortif.rlb/fr_l_plant.ctl` и `fortif.rlb/fr_l_plant.cpt` (155 точек), а также
+`parts.rlb/u_all_def_a_01.ctl` и `parts.rlb/u_all_def_a_01.cpt` (6 точек). Среди
+240 raw offset words не встретился `u32::MAX`; наибольшее значение — 121. Это
+наблюдение ограничено указанной выборкой и не определяет sentinel для других
+ресурсов.
 
 ### Terrain queries и movement handoff
 
