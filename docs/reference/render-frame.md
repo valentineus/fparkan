@@ -100,6 +100,15 @@ receives real frame time. `simulation_time_seconds`, weather, RNG and complete
 mission state remain unknown, and a camera/phase match alone does not establish
 visual parity with a native frame.
 
+The preview's sky heading is `atan2(forward.x, forward.y)`, matching the second
+output calculated at `Terrain.dll` RVA `0x4F9C0`; `CSky` adds π at RVA `0x481C5`
+when selecting screen-gradient sectors. This mapping is applied only at the sky
+boundary and does not change `FreeFlightCamera` yaw or movement controls.
+Matched same-camera, same-phase three-frame captures at phases 56.227 and
+998.893 showed zero changed pixels before and after this correction; the
+remaining sky and color mismatch is unresolved, so this source-level match does
+not establish visual parity.
+
 ## Parity risks
 
 `VulkanStaticCamera::from_legacy_d3d7` keeps the D3D7 view and projection

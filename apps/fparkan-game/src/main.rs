@@ -525,8 +525,9 @@ impl PreviewCameraFrame {
         self.up
     }
 
-    fn yaw(self) -> f32 {
-        self.forward[1].atan2(self.forward[0])
+    fn native_sky_heading(self) -> f32 {
+        // Terrain+0x4F9C0 uses atan2(forward.x, forward.y); CSky+0x481C5 adds pi later.
+        self.forward[0].atan2(self.forward[1])
     }
 }
 
@@ -2374,7 +2375,7 @@ impl EnvironmentGpuScene {
                 (optics.primary_color[index] - sky_frame.sun.color[index]).max(0.0)
             })
         });
-        let gradient = sky_frame.screen_gradient(camera.yaw(), glare_rgb_delta);
+        let gradient = sky_frame.screen_gradient(camera.native_sky_heading(), glare_rgb_delta);
         if let Some(optics) = optics {
             let mut uniforms = renderer.frame_uniforms();
             if sky_frame.sun.active {
@@ -6258,6 +6259,86 @@ mod tests {
         assert!(camera_right[0] / camera_right[3] > 0.0);
         assert!(world_up[1] / world_up[3] < 0.0);
         nearly_equal(far[2] / far[3], 1.0);
+    }
+
+    #[test]
+    fn native_sky_heading_selects_matching_gradient_sectors_for_both_camera_origins() {
+        use fparkan_fx::atmosphere::{PackedColor, SkySample, SKY_COLOR_COUNT};
+
+        let mut colors = [PackedColor(0xFF00_0000); SKY_COLOR_COUNT];
+        colors[..4].copy_from_slice(&[
+            PackedColor(0xFF11_0000),
+            PackedColor(0xFF00_2200),
+            PackedColor(0xFF00_0033),
+            PackedColor(0xFF44_4400),
+        ]);
+        let sample = SkySample {
+            colors,
+            values: [0.0; 2],
+            packed: [PackedColor(0); 2],
+        };
+        let projection = LegacyD3d7Projection {
+            viewport: [0, 0, 1280, 720],
+            near_plane: 0.5,
+            far_plane: 700.0,
+            field_of_view_radians: 1.596_851_4,
+        };
+
+        let cardinal_forwards: [([f32; 3], usize); 4] = [
+            ([0.0, 1.0, 0.0], 0),
+            ([1.0, 0.0, 0.0], 1),
+            ([0.0, -1.0, 0.0], 2),
+            ([-1.0, 0.0, 0.0], 3),
+        ];
+        for (forward, sector) in cardinal_forwards {
+            let free_flight = FreeFlightCamera {
+                position: [0.0; 3],
+                yaw: forward[1].atan2(forward[0]),
+                pitch: 0.0,
+                vertical_fov: std::f32::consts::FRAC_PI_3,
+                near_plane: projection.near_plane,
+                far_plane: projection.far_plane,
+                move_speed: 1.0,
+            }
+            .preview_frame(1280.0 / 720.0);
+
+            let right = normalize3(cross3(forward, [0.0, 0.0, 1.0])).expect("camera right");
+            let up = normalize3(cross3(right, forward)).expect("camera up");
+            let raw_transform = RawCameraTransform {
+                words: [
+                    forward[0].to_bits(),
+                    (-right[0]).to_bits(),
+                    up[0].to_bits(),
+                    0.0_f32.to_bits(),
+                    forward[1].to_bits(),
+                    (-right[1]).to_bits(),
+                    up[1].to_bits(),
+                    0.0_f32.to_bits(),
+                    forward[2].to_bits(),
+                    (-right[2]).to_bits(),
+                    up[2].to_bits(),
+                    0.0_f32.to_bits(),
+                    0.0_f32.to_bits(),
+                    0.0_f32.to_bits(),
+                    0.0_f32.to_bits(),
+                    1.0_f32.to_bits(),
+                ],
+            };
+            let captured = PreviewCameraFrame::from_legacy_d3d7(raw_transform, projection)
+                .expect("captured camera frame");
+
+            for (origin, camera) in [("free flight", free_flight), ("captured", captured)] {
+                let gradient = fparkan_fx::sky::screen_gradient_frame(
+                    &sample,
+                    camera.native_sky_heading(),
+                    [0.0; 3],
+                );
+                assert_eq!(
+                    gradient.color, sample.colors[sector],
+                    "{origin} camera heading for forward {forward:?}"
+                );
+            }
+        }
     }
 
     #[test]
