@@ -276,6 +276,9 @@ internal static partial class NativeFrameCapture
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool DebugActiveProcessStop(uint processId);
 
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool DebugSetProcessKillOnExit(bool killOnExit);
 
@@ -1717,6 +1720,7 @@ internal static partial class NativeFrameCapture
         SelfCheckCameraInput();
         SelfCheckNativeFogPairing();
         SelfCheckRenderInvocationGates();
+        SelfCheckDebugEventHandleOwnership();
         uint relocated = 0x10000000u + RelocatedGlobalRva;
         if (relocated != 0x1079518Cu) throw new InvalidOperationException("relocation self-check failed");
         bool offsetsMatch = Marshal.SizeOf(typeof(X86ContextLayout)) == X86ContextSize
@@ -2179,6 +2183,194 @@ internal static partial class NativeFrameCapture
             throw new InvalidOperationException("Self-check failed: nullable fog JSON, unknown caller gate, or bounded sample list.");
     }
 
+    private static void SelfCheckDebugEventHandleOwnership()
+    {
+        BreakpointInfo owned = new BreakpointInfo { Address = 0x12345678, Armed = true };
+        uint ownedStatus = FrameDebugEventContinueStatus(ExceptionDebugEvent, 0x80000003,
+            owned.Address, new BreakpointInfo[] { owned });
+        uint unrelatedStatus = FrameDebugEventContinueStatus(ExceptionDebugEvent, 0x80000003,
+            0x12345679, new BreakpointInfo[] { owned });
+        if (!ShouldExplicitlyCloseDebugEventFileHandle(CreateProcessDebugEvent)
+            || ShouldExplicitlyCloseDebugEventFileHandle(CreateThreadDebugEvent)
+            || !ShouldExplicitlyCloseDebugEventFileHandle(LoadDllDebugEvent)
+            || ShouldExplicitlyCloseDebugEventFileHandle(ExitThreadDebugEvent)
+            || ShouldExplicitlyCloseDebugEventFileHandle(ExitProcessDebugEvent)
+            || ownedStatus != DbgContinue || unrelatedStatus != DbgExceptionNotHandled
+            || FrameDebugEventContinueStatus(CreateThreadDebugEvent, 0, 0, null) != DbgContinue)
+            throw new InvalidOperationException("Debug-event handle ownership self-check failed.");
+    }
+
+    // Win32 debug-event process/thread handles are system-owned and closed on
+    // the matching EXIT event's ContinueDebugEvent. Only image-file handles
+    // are explicitly closed by the debugger. See:
+    // https://learn.microsoft.com/en-us/windows/win32/debug/writing-the-debugger-s-main-loop
+    // https://learn.microsoft.com/en-us/windows/win32/api/debugapi/nf-debugapi-continuedebugevent
+    private static bool ShouldExplicitlyCloseDebugEventFileHandle(uint eventCode)
+    {
+        return eventCode == CreateProcessDebugEvent || eventCode == LoadDllDebugEvent;
+    }
+
+    private static void CloseExplicitDebugEventFileHandle(IntPtr eventBuffer, uint eventCode)
+    {
+        if (!ShouldExplicitlyCloseDebugEventFileHandle(eventCode)) return;
+        IntPtr handle = Marshal.ReadIntPtr(eventBuffer, 12);
+        if (handle != IntPtr.Zero && !CloseHandle(handle))
+            Log("DEBUG_EVENT_FILE_HANDLE_CLOSE_FAILED code=" + eventCode + " offset=12"
+                + " error=" + Marshal.GetLastWin32Error());
+    }
+
+    private static uint FrameDebugEventContinueStatus(uint eventCode, uint exceptionCode,
+        uint exceptionAddress, BreakpointInfo[] breakpoints)
+    {
+        if (eventCode != ExceptionDebugEvent) return DbgContinue;
+        if (exceptionCode == 0x80000003 && breakpoints != null)
+        {
+            for (int i = 0; i < breakpoints.Length; i++)
+                if (breakpoints[i] != null && breakpoints[i].Armed
+                    && breakpoints[i].Address == exceptionAddress)
+                    return DbgContinue;
+        }
+        return DbgExceptionNotHandled;
+    }
+
+    private static bool VerifyFrameTerminationIdentity(Process identity, uint processId,
+        string expectedPath, long expectedStartTicks, out string evidence)
+    {
+        evidence = "identity_unavailable";
+        try
+        {
+            if (identity == null) return false;
+            identity.Refresh();
+            if (identity.HasExited) { evidence = "already_exited"; return false; }
+            string actualPath = Path.GetFullPath(identity.MainModule.FileName);
+            long actualTicks = identity.StartTime.ToUniversalTime().Ticks;
+            if ((uint)identity.Id != processId || identity.ProcessName != "iron_3d"
+                || actualTicks != expectedStartTicks
+                || !String.Equals(actualPath, expectedPath, StringComparison.OrdinalIgnoreCase))
+            {
+                evidence = "pid=" + identity.Id + ";path=" + actualPath + ";startTicks=" + actualTicks;
+                return false;
+            }
+            string hash = HashFile(actualPath);
+            if (!String.Equals(hash, ExpectedSha256[GameExe], StringComparison.OrdinalIgnoreCase))
+            {
+                evidence = "pid=" + processId + ";path=" + actualPath + ";startTicks=" + actualTicks + ";sha256=" + hash;
+                return false;
+            }
+            evidence = "pid=" + processId + ";path=" + actualPath + ";startTicks=" + actualTicks + ";sha256=" + hash;
+            return true;
+        }
+        catch (Exception error)
+        {
+            evidence = error.GetType().Name + ":" + error.Message;
+            return false;
+        }
+    }
+
+    private static bool DrainFrameTerminationEvents(IntPtr process, IntPtr eventBuffer, uint processId,
+        ref bool eventOutstanding, ref uint outstandingPid, ref uint outstandingTid,
+        ref uint outstandingCode, ref uint outstandingContinueStatus, ref bool outstandingFileHandleClosed,
+        BreakpointInfo[] breakpoints, out string evidence)
+    {
+        DateTime deadline = DateTime.UtcNow.AddSeconds(5);
+        bool targetExitEventContinued = false;
+        uint drainThreadId = GetCurrentThreadId();
+        if (eventOutstanding)
+        {
+            targetExitEventContinued = outstandingCode == ExitProcessDebugEvent && outstandingPid == processId;
+            if (!outstandingFileHandleClosed)
+            {
+                CloseExplicitDebugEventFileHandle(eventBuffer, outstandingCode);
+                outstandingFileHandleClosed = true;
+            }
+            if (!ContinueDebugEvent(outstandingPid, outstandingTid, outstandingContinueStatus))
+            {
+                int error = Marshal.GetLastWin32Error();
+                evidence = "continue_outstanding_failed;code=" + outstandingCode + ";pid=" + outstandingPid
+                    + ";tid=" + outstandingTid + ";status=0x" + outstandingContinueStatus.ToString("X8")
+                    + ";osThreadId=" + GetCurrentThreadId() + ";error=" + error;
+                return false;
+            }
+            Log("FRAME_TERMINATION_OUTSTANDING_EVENT_CONTINUED code=" + outstandingCode
+                + " pid=" + outstandingPid + " tid=" + outstandingTid
+                + " status=0x" + outstandingContinueStatus.ToString("X8")
+                + " osThreadId=" + GetCurrentThreadId() + " targetExitEvent=" + targetExitEventContinued);
+            eventOutstanding = false;
+            outstandingPid = outstandingTid = outstandingCode = 0;
+            outstandingContinueStatus = DbgContinue;
+            outstandingFileHandleClosed = false;
+        }
+
+        while (!targetExitEventContinued && DateTime.UtcNow < deadline)
+        {
+            uint waitThreadId = GetCurrentThreadId();
+            int remaining = (int)Math.Max(1, Math.Min(250, (deadline - DateTime.UtcNow).TotalMilliseconds));
+            if (!WaitForDebugEvent(eventBuffer, (uint)remaining))
+            {
+                int error = Marshal.GetLastWin32Error();
+                if (error == 121 || error == 258) continue;
+                evidence = "wait_for_exit_event_failed;osThreadId=" + GetCurrentThreadId() + ";error=" + error;
+                return false;
+            }
+
+            uint code = unchecked((uint)Marshal.ReadInt32(eventBuffer, 0));
+            uint pid = unchecked((uint)Marshal.ReadInt32(eventBuffer, 4));
+            uint tid = unchecked((uint)Marshal.ReadInt32(eventBuffer, 8));
+            uint exceptionCode = code == ExceptionDebugEvent
+                ? unchecked((uint)Marshal.ReadInt32(eventBuffer, 12)) : 0;
+            uint exceptionAddress = code == ExceptionDebugEvent
+                ? unchecked((uint)Marshal.ReadInt32(eventBuffer, 24)) : 0;
+            uint status = FrameDebugEventContinueStatus(code, exceptionCode, exceptionAddress, breakpoints);
+            eventOutstanding = true;
+            outstandingPid = pid;
+            outstandingTid = tid;
+            outstandingCode = code;
+            outstandingContinueStatus = status;
+            outstandingFileHandleClosed = false;
+            Log("FRAME_TERMINATION_DEBUG_EVENT code=" + code + " pid=" + pid + " tid=" + tid
+                + " waitOsThreadId=" + waitThreadId + " continueStatus=0x" + status.ToString("X8")
+                + (code == ExceptionDebugEvent ? " exception=0x" + exceptionCode.ToString("X8")
+                    + " address=0x" + exceptionAddress.ToString("X8") : ""));
+            CloseExplicitDebugEventFileHandle(eventBuffer, code);
+            outstandingFileHandleClosed = true;
+            uint continueThreadId = GetCurrentThreadId();
+            if (!ContinueDebugEvent(pid, tid, status))
+            {
+                int error = Marshal.GetLastWin32Error();
+                evidence = "continue_exit_drain_event_failed;code=" + code + ";pid=" + pid + ";tid=" + tid
+                    + ";status=0x" + status.ToString("X8") + ";osThreadId=" + continueThreadId + ";error=" + error;
+                return false;
+            }
+            Log("FRAME_TERMINATION_DEBUG_EVENT_CONTINUED code=" + code + " pid=" + pid + " tid=" + tid
+                + " status=0x" + status.ToString("X8") + " osThreadId=" + continueThreadId);
+            eventOutstanding = false;
+            outstandingPid = outstandingTid = outstandingCode = 0;
+            outstandingContinueStatus = DbgContinue;
+            outstandingFileHandleClosed = false;
+            if (code == ExitProcessDebugEvent && pid == processId) targetExitEventContinued = true;
+        }
+
+        if (!targetExitEventContinued)
+        {
+            evidence = "target_exit_process_event_not_drained_within_5s;osThreadId=" + drainThreadId;
+            return false;
+        }
+        uint waitResult = WaitForSingleObject(process, 2000);
+        uint exitCode;
+        bool exitRead = GetExitCodeProcess(process, out exitCode);
+        if (waitResult != 0)
+        {
+            evidence = "exit_event_continued_but_process_not_signaled;waitResult=0x" + waitResult.ToString("X8")
+                + ";exitCode=" + (exitRead ? "0x" + exitCode.ToString("X8") : "unreadable")
+                + ";osThreadId=" + GetCurrentThreadId();
+            return false;
+        }
+        evidence = "targetExitEventContinued=true;waitResult=0x" + waitResult.ToString("X8")
+            + ";exitCode=" + (exitRead ? "0x" + exitCode.ToString("X8") : "unreadable")
+            + ";osThreadId=" + GetCurrentThreadId();
+        return exitRead;
+    }
+
     private static int Main(string[] args)
     {
         try
@@ -2284,6 +2476,7 @@ internal static partial class NativeFrameCapture
         bool fatal = false;
         bool processExited = false;
         bool processExitUnconfirmed = false;
+        int detachError = 0;
         bool captured = false;
         SurfaceReadback completedSurface = null;
         FrameSnapshot completedFrame = null;
@@ -2310,6 +2503,13 @@ internal static partial class NativeFrameCapture
         PendingStep pendingStep = null;
         RemoteReadbackSession remote = null;
         RemoteCameraSetterSession cameraSetter = null;
+        bool eventOutstanding = false, outstandingFileHandleClosed = false;
+        uint outstandingPid = 0, outstandingTid = 0, outstandingCode = 0, outstandingContinueStatus = DbgContinue;
+        uint attachOsThreadId = 0, lastWaitOsThreadId = 0, lastContinueOsThreadId = 0;
+        uint debugEventsSeen = 0, debugEventsContinued = 0, lastDebugEventCode = 0;
+        uint debugCreateThreadEvents = 0, debugExitThreadEvents = 0, debugLoadDllEvents = 0;
+        uint debugExceptionEvents = 0, debugSingleStepEvents = 0, lastDebugEventPid = 0, lastDebugEventTid = 0;
+        const uint ProcessAccessForFrameCapture = 0x0001 | 0x0008 | 0x0010 | 0x0020 | 0x0400 | 0x00100000;
         FrameSnapshot frame = new FrameSnapshot();
         frame.SelectedCameraRequested = selectedCameraInput != null;
         SelectedCameraState selectedCamera = selectedCameraInput == null ? null
@@ -2321,19 +2521,27 @@ internal static partial class NativeFrameCapture
                 || !String.Equals(Path.GetFullPath(identityProcess.MainModule.FileName), expectedPath,
                     StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("The retained process identity changed before debugger attach.");
+            process = OpenProcess(ProcessAccessForFrameCapture, false, processId);
+            if (process == IntPtr.Zero) throw new InvalidOperationException("OpenProcess failed: " + Marshal.GetLastWin32Error());
+            eventBuffer = Marshal.AllocHGlobal(128);
+            attachOsThreadId = GetCurrentThreadId();
+            Log("DEBUG_ATTACH_REQUEST osThreadId=" + attachOsThreadId + " pid=" + processId
+                + " processAccess=0x" + ProcessAccessForFrameCapture.ToString("X8")
+                + " openProcessBeforeAttach=true threadContextAccess=0x" + (ThreadGetContext | ThreadSetContext).ToString("X8"));
             if (!DebugActiveProcess(processId))
                 throw new InvalidOperationException("DebugActiveProcess failed: " + Marshal.GetLastWin32Error());
             attached = true;
+            Log("DEBUG_ATTACH_RESULT success=true osThreadId=" + GetCurrentThreadId() + " pid=" + processId);
             if (identityProcess.HasExited || identityProcess.StartTime.ToUniversalTime().Ticks != expectedStartTicks
                 || !String.Equals(Path.GetFullPath(identityProcess.MainModule.FileName), expectedPath,
                     StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("The retained process identity changed during debugger attach.");
             if (!DebugSetProcessKillOnExit(false))
                 throw new InvalidOperationException("DebugSetProcessKillOnExit(false) failed: " + Marshal.GetLastWin32Error());
-            process = OpenProcess(ProcessTerminate | ProcessVmOperation | ProcessVmRead | ProcessVmWrite
-                | ProcessQueryInformation | Synchronize, false, processId);
-            if (process == IntPtr.Zero) throw new InvalidOperationException("OpenProcess failed: " + Marshal.GetLastWin32Error());
-            eventBuffer = Marshal.AllocHGlobal(128);
+            Log("DEBUG_KILL_ON_EXIT_DISABLED osThreadId=" + GetCurrentThreadId());
+            Log("DEBUG_ACCESS processMask=0x" + ProcessAccessForFrameCapture.ToString("X8")
+                + " threadContextMask=0x" + (ThreadGetContext | ThreadSetContext).ToString("X8")
+                + " remoteThreadCreation=false");
             Log("frame capture attached; waiting for verified camera/projection/present boundaries for "
                 + timeoutSeconds + " seconds");
 
@@ -2379,6 +2587,7 @@ internal static partial class NativeFrameCapture
                     fatal = true;
                     continue;
                 }
+                lastWaitOsThreadId = GetCurrentThreadId();
                 if (!WaitForDebugEvent(eventBuffer, 1000))
                 {
                     int waitError = Marshal.GetLastWin32Error();
@@ -2389,6 +2598,34 @@ internal static partial class NativeFrameCapture
                 uint eventCode = unchecked((uint)Marshal.ReadInt32(eventBuffer, 0));
                 uint eventPid = unchecked((uint)Marshal.ReadInt32(eventBuffer, 4));
                 uint eventTid = unchecked((uint)Marshal.ReadInt32(eventBuffer, 8));
+                uint eventExceptionCode = eventCode == ExceptionDebugEvent
+                    ? unchecked((uint)Marshal.ReadInt32(eventBuffer, 12)) : 0;
+                uint eventExceptionAddress = eventCode == ExceptionDebugEvent
+                    ? unchecked((uint)Marshal.ReadInt32(eventBuffer, 24)) : 0;
+                eventOutstanding = true;
+                outstandingPid = eventPid;
+                outstandingTid = eventTid;
+                outstandingCode = eventCode;
+                outstandingContinueStatus = DbgContinue;
+                outstandingFileHandleClosed = false;
+                debugEventsSeen++;
+                lastDebugEventCode = eventCode;
+                lastDebugEventPid = eventPid;
+                lastDebugEventTid = eventTid;
+                if (eventCode == CreateThreadDebugEvent) debugCreateThreadEvents++;
+                else if (eventCode == ExitThreadDebugEvent) debugExitThreadEvents++;
+                else if (eventCode == LoadDllDebugEvent) debugLoadDllEvents++;
+                else if (eventCode == ExceptionDebugEvent)
+                {
+                    debugExceptionEvents++;
+                    if (eventExceptionCode == 0x80000004) debugSingleStepEvents++;
+                }
+                if (eventCode != ExceptionDebugEvent || eventExceptionCode != 0x80000004)
+                    Log("DEBUG_EVENT sequence=" + debugEventsSeen + " code=" + eventCode
+                        + " pid=" + eventPid + " tid=" + eventTid
+                        + " exception=0x" + eventExceptionCode.ToString("X8")
+                        + " address=0x" + eventExceptionAddress.ToString("X8")
+                        + " waitOsThreadId=" + lastWaitOsThreadId);
                 uint continueStatus = DbgContinue;
                 bool shouldStop = false;
                 BreakpointInfo hitBreakpoint = null;
@@ -2398,21 +2635,17 @@ internal static partial class NativeFrameCapture
                     if (eventCode == CreateProcessDebugEvent)
                     {
                         IntPtr imageFile = Marshal.ReadIntPtr(eventBuffer, 12);
-                        IntPtr processHandle = Marshal.ReadIntPtr(eventBuffer, 16);
-                        IntPtr threadHandle = Marshal.ReadIntPtr(eventBuffer, 20);
                         string imagePath = PathForHandle(imageFile);
                         if (imagePath.Length != 0 && !String.Equals(imagePath, NormalizePath(expectedPath), StringComparison.OrdinalIgnoreCase))
                             throw new InvalidOperationException("CREATE_PROCESS image path mismatch: " + imagePath);
-                        if (processHandle != IntPtr.Zero) CloseHandle(processHandle);
-                        if (threadHandle != IntPtr.Zero) CloseHandle(threadHandle);
-                        if (imageFile != IntPtr.Zero) CloseHandle(imageFile);
-                        Log("CREATE_PROCESS path=" + imagePath);
+                        CloseExplicitDebugEventFileHandle(eventBuffer, eventCode);
+                        outstandingFileHandleClosed = true;
+                        Log("CREATE_PROCESS path=" + imagePath
+                            + " debuggerOwnedProcessInitialThreadHandles=retainedForSystemExitCleanup");
                     }
                     else if (eventCode == CreateThreadDebugEvent)
                     {
-                        IntPtr threadHandle = Marshal.ReadIntPtr(eventBuffer, 12);
-                        if (threadHandle != IntPtr.Zero) CloseHandle(threadHandle);
-                        Log("CREATE_THREAD tid=" + eventTid + " handleClosed=" + (threadHandle != IntPtr.Zero));
+                        Log("CREATE_THREAD tid=" + eventTid + " debuggerOwnedThreadHandle=retainedForSystemExitCleanup");
                     }
                     else if (eventCode == ExitThreadDebugEvent)
                     {
@@ -2510,7 +2743,11 @@ internal static partial class NativeFrameCapture
                                     presentOriginalByte, ref presentBreakpoint);
                         }
                         }
-                        finally { if (imageFile != IntPtr.Zero) CloseHandle(imageFile); }
+                        finally
+                        {
+                            CloseExplicitDebugEventFileHandle(eventBuffer, eventCode);
+                            outstandingFileHandleClosed = true;
+                        }
                     }
                     else if (eventCode == ExceptionDebugEvent)
                     {
@@ -3295,14 +3532,28 @@ internal static partial class NativeFrameCapture
                     }
                 }
 
+                outstandingContinueStatus = continueStatus;
+                lastContinueOsThreadId = GetCurrentThreadId();
                 if (!ContinueDebugEvent(eventPid, eventTid, continueStatus))
                 {
                     fatal = true;
-                    Log("FATAL ContinueDebugEvent failed=" + Marshal.GetLastWin32Error());
+                    int continueError = Marshal.GetLastWin32Error();
+                    Log("FATAL ContinueDebugEvent failed=" + continueError + " code=" + eventCode
+                        + " pid=" + eventPid + " tid=" + eventTid + " status=0x" + continueStatus.ToString("X8")
+                        + " osThreadId=" + lastContinueOsThreadId);
                     if (process != IntPtr.Zero && !TerminateProcess(process, 0xE009))
                         Log("FATAL ContinueDebugEvent recovery terminate failed=" + Marshal.GetLastWin32Error());
                     break;
                 }
+                eventOutstanding = false;
+                outstandingPid = outstandingTid = outstandingCode = 0;
+                outstandingContinueStatus = DbgContinue;
+                outstandingFileHandleClosed = false;
+                debugEventsContinued++;
+                if (eventCode != ExceptionDebugEvent || eventExceptionCode != 0x80000004)
+                    Log("DEBUG_CONTINUE_OK sequence=" + debugEventsContinued + " code=" + eventCode
+                        + " pid=" + eventPid + " tid=" + eventTid + " status=0x" + continueStatus.ToString("X8")
+                        + " osThreadId=" + lastContinueOsThreadId);
                 if (shouldStop || CanStopCapture(captured, stopAfterAttempt, remote != null || cameraSetter != null,
                     pendingStep != null, selectedCamera != null && selectedCamera.Applied && !selectedCamera.RestoreVerified)) break;
             }
@@ -3316,7 +3567,7 @@ internal static partial class NativeFrameCapture
         {
             bool cameraMutationUnrestored = selectedCamera != null && selectedCamera.Applied && !selectedCamera.RestoreVerified;
             if (!processExited && process != IntPtr.Zero && (remote != null || cameraSetter != null || pendingStep != null
-                || cameraMutationUnrestored
+                || cameraMutationUnrestored || eventOutstanding
                 || cameraBreakpoint != null && cameraBreakpoint.Armed
                 || projectionBreakpoint != null && projectionBreakpoint.Armed
                 || returnBreakpoint != null && returnBreakpoint.Armed
@@ -3328,26 +3579,63 @@ internal static partial class NativeFrameCapture
                 string state = remote != null ? "REMOTE_STUB_IN_FLIGHT" : (cameraSetter != null ? "CAMERA_SETTER_IN_FLIGHT"
                     : (cameraMutationUnrestored ? "SELECTED_CAMERA_MUTATION_NOT_RESTORED"
                     : (pendingStep != null ? "SINGLE_STEP_IN_FLIGHT" : "ARMED_BREAKPOINTS_WITHOUT_STOPPED_EVENT")));
-                Log("FINAL_" + state + "; terminating only the path/tick/hash-verified scratch process before detach");
-                if (!TerminateProcess(process, 0xE006))
-                    Log("FINAL_TERMINATE_FAILED error=" + Marshal.GetLastWin32Error());
-                if (WaitForSingleObject(process, 2000) == 0) processExited = true;
+                string identityEvidence;
+                if (!VerifyFrameTerminationIdentity(identityProcess, processId, expectedPath,
+                    expectedStartTicks, out identityEvidence))
+                {
+                    processExitUnconfirmed = true;
+                    fatal = true;
+                    Log("FINAL_TERMINATION_REFUSED identity=" + identityEvidence + " state=" + state);
+                }
                 else
                 {
-                    fatal = true;
-                    processExitUnconfirmed = true;
-                    Log("FATAL scratch termination was not confirmed before detach");
+                    Log("FINAL_" + state + "; terminating verified scratch before detach identity=" + identityEvidence);
+                    if (!TerminateProcess(process, 0xE006))
+                        Log("FINAL_TERMINATE_FAILED error=" + Marshal.GetLastWin32Error());
+                    string drainEvidence;
+                    if (DrainFrameTerminationEvents(process, eventBuffer, processId,
+                        ref eventOutstanding, ref outstandingPid, ref outstandingTid, ref outstandingCode,
+                        ref outstandingContinueStatus, ref outstandingFileHandleClosed,
+                        new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint, returnBreakpoint,
+                            atmosphereBreakpoint, fogConsumerBreakpoint, presentBreakpoint, missionBreakpoint },
+                        out drainEvidence))
+                    {
+                        processExited = true;
+                        Log("FINAL_TERMINATION_DRAIN_CONFIRMED " + drainEvidence);
+                    }
+                    else
+                    {
+                        fatal = true;
+                        processExitUnconfirmed = true;
+                        Log("FATAL_FINAL_TERMINATION_DRAIN_FAILED " + drainEvidence);
+                    }
                 }
             }
             if (attached && !processExitUnconfirmed)
             {
+                Log("DEBUG_DETACH_REQUEST osThreadId=" + GetCurrentThreadId()
+                    + " attachOsThreadId=" + attachOsThreadId + " processId=" + processId
+                    + " eventOutstanding=" + eventOutstanding + " outstandingCode=" + outstandingCode
+                    + " outstandingPid=" + outstandingPid + " outstandingTid=" + outstandingTid
+                    + " outstandingContinueStatus=0x" + outstandingContinueStatus.ToString("X8")
+                    + " waitOsThreadId=" + lastWaitOsThreadId + " lastContinueOsThreadId=" + lastContinueOsThreadId
+                    + " lastEventCode=" + lastDebugEventCode + " lastEventPid=" + lastDebugEventPid
+                    + " lastEventTid=" + lastDebugEventTid + " eventsSeen=" + debugEventsSeen
+                    + " eventsContinued=" + debugEventsContinued + " createThreads=" + debugCreateThreadEvents
+                    + " exitThreads=" + debugExitThreadEvents + " dllLoads=" + debugLoadDllEvents
+                    + " exceptions=" + debugExceptionEvents + " singleSteps=" + debugSingleStepEvents);
                 detached = DebugActiveProcessStop(processId);
-                if (detached) Log("DEBUG_DETACHED");
+                if (detached) Log("DEBUG_DETACHED osThreadId=" + GetCurrentThreadId());
                 else
                 {
                     fatal = true;
-                    int detachError = Marshal.GetLastWin32Error();
-                    Log("FATAL DebugActiveProcessStop failed=" + detachError);
+                    detachError = Marshal.GetLastWin32Error();
+                    Log("FATAL DebugActiveProcessStop failed=" + detachError
+                        + " osThreadId=" + GetCurrentThreadId() + " eventOutstanding=" + eventOutstanding
+                        + " eventsSeen=" + debugEventsSeen + " eventsContinued=" + debugEventsContinued
+                        + " lastEventCode=" + lastDebugEventCode + " lastEventPid=" + lastDebugEventPid
+                        + " lastEventTid=" + lastDebugEventTid + " lastWaitOsThreadId=" + lastWaitOsThreadId
+                        + " lastContinueOsThreadId=" + lastContinueOsThreadId);
                     if (process != IntPtr.Zero)
                     {
                         uint waitBeforeRecovery = WaitForSingleObject(process, 0);
@@ -3360,22 +3648,41 @@ internal static partial class NativeFrameCapture
                             + " waitError=" + waitBeforeError + " exitError=" + exitBeforeError);
                         if (waitBeforeRecovery == 0x00000102 && exitRead && exitBeforeRecovery == 0x00000103)
                         {
-                            Log("DETACH_FAILURE_TARGET_STILL_ACTIVE; terminating only exact verified scratch after state snapshot");
-                            if (!TerminateProcess(process, 0xE00A))
+                            string terminationEvidence;
+                            if (!VerifyFrameTerminationIdentity(identityProcess, processId, expectedPath,
+                                expectedStartTicks, out terminationEvidence))
                             {
-                                int terminateError = Marshal.GetLastWin32Error();
-                                Log("DETACH_FAILURE_TERMINATE_FAILED error=" + terminateError);
+                                processExitUnconfirmed = true;
+                                Log("DETACH_FAILURE_TERMINATION_REFUSED identity=" + terminationEvidence);
                             }
-                            uint waitAfterRecovery = WaitForSingleObject(process, 2000);
-                            int waitAfterError = waitAfterRecovery == 0xFFFFFFFF ? Marshal.GetLastWin32Error() : 0;
-                            uint exitAfterRecovery;
-                            bool exitAfterRead = GetExitCodeProcess(process, out exitAfterRecovery);
-                            int exitAfterError = exitAfterRead ? 0 : Marshal.GetLastWin32Error();
-                            Log("PROCESS_STATE_AFTER_DETACH_FAILURE_RECOVERY waitResult=0x" + waitAfterRecovery.ToString("X8")
-                                + " exitCode=" + (exitAfterRead ? "0x" + exitAfterRecovery.ToString("X8") : "unreadable")
-                                + " waitError=" + waitAfterError + " exitError=" + exitAfterError);
-                            if (waitAfterRecovery == 0) processExited = true;
-                            else processExitUnconfirmed = true;
+                            else
+                            {
+                                Log("DETACH_FAILURE_TARGET_STILL_ACTIVE; terminating verified scratch identity=" + terminationEvidence);
+                                if (!TerminateProcess(process, 0xE00A))
+                                    Log("DETACH_FAILURE_TERMINATE_FAILED error=" + Marshal.GetLastWin32Error());
+                                string drainEvidence;
+                                if (DrainFrameTerminationEvents(process, eventBuffer, processId,
+                                    ref eventOutstanding, ref outstandingPid, ref outstandingTid, ref outstandingCode,
+                                    ref outstandingContinueStatus, ref outstandingFileHandleClosed,
+                                    new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint, returnBreakpoint,
+                                        atmosphereBreakpoint, fogConsumerBreakpoint, presentBreakpoint, missionBreakpoint },
+                                    out drainEvidence))
+                                {
+                                    processExited = true;
+                                    Log("DETACH_FAILURE_TERMINATION_DRAIN_CONFIRMED " + drainEvidence);
+                                    uint detachThreadId = GetCurrentThreadId();
+                                    bool detachedAfterExit = DebugActiveProcessStop(processId);
+                                    int detachAfterExitError = detachedAfterExit ? 0 : Marshal.GetLastWin32Error();
+                                    Log("DEBUG_DETACH_AFTER_TERMINATION success=" + detachedAfterExit
+                                        + " osThreadId=" + detachThreadId + " error=" + detachAfterExitError);
+                                    detached = detachedAfterExit;
+                                }
+                                else
+                                {
+                                    processExitUnconfirmed = true;
+                                    Log("DETACH_FAILURE_TERMINATION_DRAIN_FAILED " + drainEvidence);
+                                }
+                            }
                         }
                     }
                 }
