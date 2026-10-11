@@ -15,6 +15,9 @@ const UNIT_DAT_MIN_SIZE: usize = 0x48;
 const UNIT_DAT_MAGIC: u32 = 0x0000_F0F1;
 const PROTOTYPE_INHERITANCE_DEPTH_LIMIT: usize = 32;
 
+/// `objects.rlb` external geometry entry type (`EXTO`).
+pub const PROTOTYPE_TYPE_EXTO: u32 = u32::from_le_bytes(*b"EXTO");
+
 /// Prototype key.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct PrototypeKey(pub ResourceName);
@@ -61,10 +64,21 @@ pub struct UnitComponentRecord {
     pub parent_or_link: i32,
     /// Description raw bytes.
     pub description_raw: [u8; 32],
-    /// Opaque tail.
+    /// Opaque record word at offset `0x68`.
     pub tail0: u32,
-    /// Opaque tail.
-    pub tail1: u32,
+    /// Number of immediate children in the preorder unit tree.
+    pub immediate_child_count: u32,
+}
+
+/// One node in a decoded Unit DAT preorder tree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnitComponentTreeNode {
+    /// Original preorder record index.
+    pub record_index: usize,
+    /// Parent record index, or `None` for the root.
+    pub parent_index: Option<usize>,
+    /// Direct child record indices in source order.
+    pub children: Vec<usize>,
 }
 
 /// Prototype geometry.
@@ -85,8 +99,18 @@ pub struct EffectivePrototype {
     pub geometry: PrototypeGeometry,
     /// Resolution source.
     pub source: PrototypeSource,
+    /// Source registry entry type, when the prototype came from an NRes
+    /// object registry (for example `EXTO`, `INTO`, or `BTLU`).
+    pub source_type: Option<u32>,
     /// Resource dependencies discovered while resolving this prototype.
     pub dependencies: Vec<ResourceKey>,
+    /// Explicit control-data resource referenced by this prototype's resolved
+    /// `objects.rlb` registry inheritance chain, when present.
+    ///
+    /// This is deliberately separate from visual dependencies: controller
+    /// state belongs to each component instance and must not alter shared
+    /// mesh/material cache identity.
+    pub control_resource: Option<ResourceKey>,
 }
 
 /// Prototype resolution source.
@@ -401,6 +425,8 @@ pub enum PrototypeError {
     InvalidSize,
     /// Invalid unit DAT magic.
     InvalidUnitDatMagic(u32),
+    /// Unit DAT child counts do not describe one complete preorder tree.
+    InvalidUnitHierarchy(String),
     /// Invalid path.
     InvalidPath(String),
     /// VFS error.
@@ -435,6 +461,9 @@ impl std::fmt::Display for PrototypeError {
             Self::InvalidUnitDatMagic(magic) => {
                 write!(f, "invalid unit DAT magic: {magic:#010X}")
             }
+            Self::InvalidUnitHierarchy(message) => {
+                write!(f, "invalid unit DAT preorder hierarchy: {message}")
+            }
             Self::InvalidPath(value) => write!(f, "invalid path: {value}"),
             Self::Vfs(source) => write!(f, "vfs error: {source}"),
             Self::Resource(source) => write!(f, "resource error: {source}"),
@@ -446,7 +475,10 @@ impl std::error::Error for PrototypeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Decode(source) => Some(source),
-            Self::InvalidSize | Self::InvalidUnitDatMagic(_) | Self::InvalidPath(_) => None,
+            Self::InvalidSize
+            | Self::InvalidUnitDatMagic(_)
+            | Self::InvalidUnitHierarchy(_)
+            | Self::InvalidPath(_) => None,
             Self::Vfs(source) => Some(source),
             Self::Resource(source) => Some(source),
         }
@@ -512,7 +544,7 @@ pub fn decode_unit_dat(payload: &[u8]) -> Result<UnitDat, PrototypeError> {
         let parent_or_link = cursor.read_i32_le()?;
         description_raw.copy_from_slice(cursor.read_exact(32)?);
         let tail0 = cursor.read_u32_le()?;
-        let tail1 = cursor.read_u32_le()?;
+        let immediate_child_count = cursor.read_u32_le()?;
         records.push(UnitComponentRecord {
             archive_raw,
             resource_raw,
@@ -520,7 +552,7 @@ pub fn decode_unit_dat(payload: &[u8]) -> Result<UnitDat, PrototypeError> {
             parent_or_link,
             description_raw,
             tail0,
-            tail1,
+            immediate_child_count,
         });
     }
     cursor.require_eof()?;
@@ -528,6 +560,86 @@ pub fn decode_unit_dat(payload: &[u8]) -> Result<UnitDat, PrototypeError> {
         header_opaque,
         records,
     })
+}
+
+/// Builds the immediate-child tree encoded by Unit DAT record counts.
+///
+/// Records are stored in preorder.  The final word of each 112-byte record is
+/// the number of immediate children, so the tree can be reconstructed without
+/// treating `parent_or_link` as a parent index.  That field is retained as the
+/// native mount-socket value for attachment consumers.
+///
+/// # Errors
+///
+/// Returns [`PrototypeError::InvalidUnitHierarchy`] when child counts consume
+/// too few or too many records.
+pub fn unit_component_tree(
+    records: &[UnitComponentRecord],
+) -> Result<Vec<UnitComponentTreeNode>, PrototypeError> {
+    if records.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let root_child_count = usize::try_from(records[0].immediate_child_count).map_err(|_| {
+        PrototypeError::InvalidUnitHierarchy("record 0 child count does not fit usize".to_string())
+    })?;
+    let mut nodes = Vec::with_capacity(records.len());
+    nodes.push(UnitComponentTreeNode {
+        record_index: 0,
+        parent_index: None,
+        children: Vec::new(),
+    });
+    // Each open frame holds a preorder node and the direct children still due.
+    // This keeps hostile deep chains off the call stack.
+    let mut open_parents = vec![(0_usize, root_child_count)];
+    let mut cursor = 1_usize;
+    while cursor < records.len() {
+        while open_parents
+            .last()
+            .is_some_and(|(_, remaining_children)| *remaining_children == 0)
+        {
+            open_parents.pop();
+        }
+        let Some((parent_node_index, remaining_children)) = open_parents.last_mut() else {
+            return Err(PrototypeError::InvalidUnitHierarchy(format!(
+                "root tree consumed {cursor} records, but {} were encoded",
+                records.len()
+            )));
+        };
+        let parent_node_index = *parent_node_index;
+        *remaining_children -= 1;
+
+        let record_index = cursor;
+        let record = &records[record_index];
+        let child_count = usize::try_from(record.immediate_child_count).map_err(|_| {
+            PrototypeError::InvalidUnitHierarchy(format!(
+                "record {record_index} child count does not fit usize"
+            ))
+        })?;
+        let node_index = nodes.len();
+        nodes.push(UnitComponentTreeNode {
+            record_index,
+            parent_index: Some(nodes[parent_node_index].record_index),
+            children: Vec::new(),
+        });
+        nodes[parent_node_index].children.push(node_index);
+        cursor += 1;
+        open_parents.push((node_index, child_count));
+    }
+
+    while open_parents
+        .last()
+        .is_some_and(|(_, remaining_children)| *remaining_children == 0)
+    {
+        open_parents.pop();
+    }
+    if !open_parents.is_empty() {
+        return Err(PrototypeError::InvalidUnitHierarchy(format!(
+            "child count reached record {cursor}, but only {} records exist",
+            records.len()
+        )));
+    }
+    Ok(nodes)
 }
 
 /// Decodes a mission unit DAT binding.
@@ -1029,7 +1141,7 @@ fn resolve_archive_model(
     let Some(mesh) = find_mesh_resource(repository, archive, model_key)? else {
         return Ok(None);
     };
-    Ok(Some(effective(model_key.clone(), mesh, source)))
+    Ok(Some(effective(model_key.clone(), mesh, source, None, None)))
 }
 
 fn resolve_objects_registry_model(
@@ -1037,17 +1149,33 @@ fn resolve_objects_registry_model(
     registry_archive: &NormalizedPath,
     object_key: &ResourceName,
 ) -> Result<Option<EffectivePrototype>, PrototypeError> {
+    let source_type = match repository.open_archive(registry_archive) {
+        Ok(archive_id) => {
+            find_any_candidate(repository, archive_id, &mesh_name_candidates(&object_key.0))?
+                .map(|(entry, _)| repository.entry_info(entry))
+                .transpose()?
+                .and_then(|info| info.key.type_id)
+        }
+        Err(ResourceError::MissingArchive { .. }) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
     let Some(refs) =
         collect_registry_refs(repository, registry_archive, object_key, &mut Vec::new(), 0)?
     else {
         return Ok(None);
     };
+    let control_resource = resolve_explicit_control_resource(object_key, &refs)?;
 
     let mut missing_mesh_refs = Vec::new();
     for item in refs.iter().filter(|item| is_explicit_mesh_ref(item)) {
-        if let Some(prototype) =
-            resolve_object_ref_model(repository, object_key, item, cstr_bytes(&item.resource_raw))?
-        {
+        if let Some(prototype) = resolve_object_ref_model(
+            repository,
+            object_key,
+            item,
+            cstr_bytes(&item.resource_raw),
+            source_type,
+            control_resource.clone(),
+        )? {
             return Ok(Some(prototype));
         }
         missing_mesh_refs.push(describe_object_ref(item));
@@ -1064,7 +1192,9 @@ fn resolve_objects_registry_model(
         key: PrototypeKey(object_key.clone()),
         geometry: PrototypeGeometry::NonGeometric,
         source: PrototypeSource::ObjectsRegistry,
+        source_type,
         dependencies: Vec::new(),
+        control_resource,
     }))
 }
 
@@ -1130,6 +1260,8 @@ fn resolve_object_ref_model(
     requested: &ResourceName,
     item: &ObjectRefRecord,
     model_name: &[u8],
+    source_type: Option<u32>,
+    control_resource: Option<ResourceKey>,
 ) -> Result<Option<EffectivePrototype>, PrototypeError> {
     let archive = normalized_path_from_name(&ResourceName(cstr_bytes(&item.archive_raw).to_vec()))?;
     let Some(mesh) = find_mesh_resource(repository, &archive, &ResourceName(model_name.to_vec()))?
@@ -1140,11 +1272,68 @@ fn resolve_object_ref_model(
         requested.clone(),
         mesh,
         PrototypeSource::ObjectsRegistry,
+        source_type,
+        control_resource,
     )))
 }
 
 fn is_explicit_mesh_ref(item: &ObjectRefRecord) -> bool {
     has_extension_bytes(cstr_bytes(&item.resource_raw), b"msh")
+}
+
+fn is_explicit_control_ref(item: &ObjectRefRecord) -> bool {
+    has_extension_bytes(cstr_bytes(&item.resource_raw), b"ctl")
+}
+
+fn resolve_explicit_control_resource(
+    requested: &ResourceName,
+    refs: &[ObjectRefRecord],
+) -> Result<Option<ResourceKey>, PrototypeError> {
+    let mut resolved = Vec::new();
+    for item in refs.iter().filter(|item| is_explicit_control_ref(item)) {
+        let archive =
+            normalized_path_from_name(&ResourceName(cstr_bytes(&item.archive_raw).to_vec()))?;
+        let name = resource_name(cstr_bytes(&item.resource_raw));
+        // CTLD is an optional pose sidecar. Keep the exact registry reference
+        // here, then let asset preparation treat a missing archive/entry as an
+        // absent override while still rejecting a present malformed payload.
+        let key = ResourceKey {
+            archive,
+            name,
+            type_id: None,
+        };
+        if !resolved
+            .iter()
+            .any(|existing| same_resource_key(existing, &key))
+        {
+            resolved.push(key);
+        }
+    }
+    match resolved.len() {
+        0 => Ok(None),
+        1 => Ok(resolved.pop()),
+        _ => Err(PrototypeError::Resource(ResourceError::Format(format!(
+            "prototype {} has ambiguous explicit control resources: {}",
+            String::from_utf8_lossy(&requested.0),
+            resolved
+                .iter()
+                .map(|key| format!(
+                    "{}:{}",
+                    key.archive.as_str(),
+                    String::from_utf8_lossy(&key.name.0)
+                ))
+                .collect::<Vec<_>>()
+                .join(", "),
+        )))),
+    }
+}
+
+fn same_resource_key(left: &ResourceKey, right: &ResourceKey) -> bool {
+    left.archive
+        .as_str()
+        .eq_ignore_ascii_case(right.archive.as_str())
+        && eq_ignore_ascii_case(&left.name.0, &right.name.0)
+        && left.type_id == right.type_id
 }
 
 fn describe_object_ref(item: &ObjectRefRecord) -> String {
@@ -1195,12 +1384,16 @@ fn effective(
     requested: ResourceName,
     mesh: ResourceKey,
     source: PrototypeSource,
+    source_type: Option<u32>,
+    control_resource: Option<ResourceKey>,
 ) -> EffectivePrototype {
     EffectivePrototype {
         key: PrototypeKey(requested),
         geometry: PrototypeGeometry::Mesh(mesh.clone()),
         source,
+        source_type,
         dependencies: vec![mesh],
+        control_resource,
     }
 }
 
@@ -1380,7 +1573,7 @@ mod tests {
         assert_eq!(record.parent_or_link, -7);
         assert_eq!(&record.description_raw[..description.len()], description);
         assert_eq!(record.tail0, 0x1122_3344);
-        assert_eq!(record.tail1, 0x5566_7788);
+        assert_eq!(record.immediate_child_count, 0x5566_7788);
     }
 
     #[test]
@@ -1404,6 +1597,88 @@ mod tests {
         let unit = decode_unit_dat(&bytes).expect("unit");
 
         assert_eq!(unit.records[0].parent_or_link, 12);
+    }
+
+    #[test]
+    fn unit_component_tree_follows_preorder_child_counts_and_keeps_mount_links() {
+        let mut bytes = build_unit_dat(&[
+            (b"objects.rlb".as_slice(), b"root".as_slice()),
+            (b"objects.rlb".as_slice(), b"child".as_slice()),
+            (b"objects.rlb".as_slice(), b"grandchild".as_slice()),
+        ]);
+        bytes[8 + 68..8 + 72].copy_from_slice(&(-1_i32).to_le_bytes());
+        bytes[8 + 108..8 + 112].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[8 + 112 + 68..8 + 112 + 72].copy_from_slice(&7_i32.to_le_bytes());
+        bytes[8 + 112 + 108..8 + 112 + 112].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[8 + 224 + 68..8 + 224 + 72].copy_from_slice(&3_i32.to_le_bytes());
+
+        let unit = decode_unit_dat(&bytes).expect("unit");
+        let tree = unit_component_tree(&unit.records).expect("preorder tree");
+        assert_eq!(tree.len(), 3);
+        assert_eq!(tree[0].record_index, 0);
+        assert_eq!(tree[0].parent_index, None);
+        assert_eq!(tree[0].children, vec![1]);
+        assert_eq!(tree[1].parent_index, Some(0));
+        assert_eq!(tree[1].children, vec![2]);
+        assert_eq!(tree[2].parent_index, Some(1));
+        assert_eq!(tree[2].children, Vec::<usize>::new());
+        assert_eq!(unit.records[1].parent_or_link, 7);
+        assert_eq!(unit.records[2].parent_or_link, 3);
+    }
+
+    #[test]
+    fn unit_component_tree_handles_deep_preorder_chains_iteratively() {
+        const DEPTH: usize = 32_768;
+        let records: Vec<_> = (0..DEPTH)
+            .map(|index| UnitComponentRecord {
+                archive_raw: [0; 32],
+                resource_raw: [0; 32],
+                kind: 0,
+                parent_or_link: 0,
+                description_raw: [0; 32],
+                tail0: 0,
+                immediate_child_count: u32::from(index + 1 < DEPTH),
+            })
+            .collect();
+
+        let tree = unit_component_tree(&records).expect("deep preorder chain");
+
+        assert_eq!(tree.len(), DEPTH);
+        assert_eq!(tree[0].parent_index, None);
+        assert_eq!(tree[0].children, vec![1]);
+        assert_eq!(tree[DEPTH / 2].parent_index, Some(DEPTH / 2 - 1));
+        assert_eq!(tree[DEPTH - 2].children, vec![DEPTH - 1]);
+        assert_eq!(tree[DEPTH - 1].parent_index, Some(DEPTH - 2));
+        assert!(tree[DEPTH - 1].children.is_empty());
+    }
+
+    #[test]
+    fn unit_component_tree_rejects_missing_child_records() {
+        let bytes = build_unit_dat(&[
+            (b"objects.rlb".as_slice(), b"root".as_slice()),
+            (b"objects.rlb".as_slice(), b"child".as_slice()),
+        ]);
+        let mut unit = decode_unit_dat(&bytes).expect("unit");
+        unit.records[0].immediate_child_count = 2;
+
+        assert!(matches!(
+            unit_component_tree(&unit.records),
+            Err(PrototypeError::InvalidUnitHierarchy(message))
+                if message.contains("child count reached record 2")
+        ));
+    }
+
+    #[test]
+    fn unit_component_tree_rejects_unconsumed_preorder_records() {
+        let bytes = build_unit_dat(&[
+            (b"objects.rlb".as_slice(), b"root".as_slice()),
+            (b"objects.rlb".as_slice(), b"child".as_slice()),
+        ]);
+        let unit = decode_unit_dat(&bytes).expect("unit");
+        assert!(matches!(
+            unit_component_tree(&unit.records),
+            Err(PrototypeError::InvalidUnitHierarchy(_))
+        ));
     }
 
     #[test]
@@ -1436,6 +1711,7 @@ mod tests {
             .expect("prototype");
 
         assert_eq!(resolved.source, PrototypeSource::ObjectsRegistry);
+        assert!(resolved.control_resource.is_none());
         let PrototypeGeometry::Mesh(mesh) = resolved.geometry else {
             panic!("expected mesh");
         };
@@ -1855,10 +2131,10 @@ mod tests {
                 build_nres(&[
                     (
                         b"parent_proto".as_slice(),
-                        build_object_refs(&[(
-                            b"static.rlb".as_slice(),
-                            b"parent_proto.msh".as_slice(),
-                        )])
+                        build_object_refs(&[
+                            (b"static.rlb".as_slice(), b"parent_proto.msh".as_slice()),
+                            (b"fortif.rlb".as_slice(), b"parent_proto.ctl".as_slice()),
+                        ])
                         .as_slice(),
                     ),
                     (
@@ -1866,6 +2142,7 @@ mod tests {
                         build_object_refs(&[
                             (b"objects.rlb".as_slice(), b"parent_proto".as_slice()),
                             (b"fortif.rlb".as_slice(), b"child_proto.bas".as_slice()),
+                            (b"fortif.rlb".as_slice(), b"parent_proto.ctl".as_slice()),
                         ])
                         .as_slice(),
                     ),
@@ -1881,7 +2158,13 @@ mod tests {
         );
         vfs.insert(
             fortif_path,
-            Arc::from(build_nres(&[(b"child_proto.bas".as_slice(), b"base")]).into_boxed_slice()),
+            Arc::from(
+                build_nres(&[
+                    (b"child_proto.bas".as_slice(), b"base"),
+                    (b"parent_proto.ctl".as_slice(), b"control"),
+                ])
+                .into_boxed_slice(),
+            ),
         );
         let vfs = Arc::new(vfs);
         let repo = CachedResourceRepository::new(vfs.clone());
@@ -1895,6 +2178,108 @@ mod tests {
         };
         assert_eq!(mesh.archive.as_str(), "static.rlb");
         assert!(mesh.name.0.eq_ignore_ascii_case(b"parent_proto.msh"));
+        let control = resolved.control_resource.expect("inherited explicit CTL");
+        assert_eq!(control.archive.as_str(), "fortif.rlb");
+        assert!(control.name.0.eq_ignore_ascii_case(b"parent_proto.ctl"));
+    }
+
+    #[test]
+    fn objects_registry_retains_missing_explicit_control_metadata() {
+        let mut vfs = MemoryVfs::default();
+        let objects_path = resource_archive_path(b"objects.rlb").expect("objects path");
+        let static_path = resource_archive_path(b"static.rlb").expect("static path");
+        let mesh = minimal_msh_payload();
+        vfs.insert(
+            objects_path,
+            Arc::from(
+                build_nres(&[(
+                    b"optional_control".as_slice(),
+                    build_object_refs(&[
+                        (b"static.rlb".as_slice(), b"optional_control.msh".as_slice()),
+                        (
+                            b"missing.rlb".as_slice(),
+                            b"optional_control.ctl".as_slice(),
+                        ),
+                    ])
+                    .as_slice(),
+                )])
+                .into_boxed_slice(),
+            ),
+        );
+        vfs.insert(
+            static_path,
+            Arc::from(
+                build_nres(&[(b"optional_control.msh".as_slice(), mesh.as_slice())])
+                    .into_boxed_slice(),
+            ),
+        );
+
+        let vfs = Arc::new(vfs);
+        let repository = CachedResourceRepository::new(vfs.clone());
+        let resolved = resolve_prototype_single(
+            &repository,
+            vfs.as_ref(),
+            &resource_name(b"optional_control"),
+        )
+        .expect("resolve despite absent optional CTL")
+        .expect("prototype");
+
+        let control = resolved
+            .control_resource
+            .expect("preserve explicit missing CTL reference");
+        assert_eq!(control.archive.as_str(), "missing.rlb");
+        assert_eq!(control.name, resource_name(b"optional_control.ctl"));
+        assert_eq!(control.type_id, None);
+    }
+
+    #[test]
+    fn objects_registry_rejects_distinct_explicit_controls() {
+        let mut vfs = MemoryVfs::default();
+        let objects_path = resource_archive_path(b"objects.rlb").expect("objects path");
+        let static_path = resource_archive_path(b"static.rlb").expect("static path");
+        let controls_path = resource_archive_path(b"controls.rlb").expect("controls path");
+        let mesh = minimal_msh_payload();
+        vfs.insert(
+            objects_path,
+            Arc::from(
+                build_nres(&[(
+                    b"prototype".as_slice(),
+                    build_object_refs(&[
+                        (b"static.rlb".as_slice(), b"prototype.msh".as_slice()),
+                        (b"controls.rlb".as_slice(), b"first.ctl".as_slice()),
+                        (b"controls.rlb".as_slice(), b"second.ctl".as_slice()),
+                    ])
+                    .as_slice(),
+                )])
+                .into_boxed_slice(),
+            ),
+        );
+        vfs.insert(
+            static_path,
+            Arc::from(
+                build_nres(&[(b"prototype.msh".as_slice(), mesh.as_slice())]).into_boxed_slice(),
+            ),
+        );
+        vfs.insert(
+            controls_path,
+            Arc::from(
+                build_nres(&[
+                    (b"first.ctl".as_slice(), b"first control"),
+                    (b"second.ctl".as_slice(), b"second control"),
+                ])
+                .into_boxed_slice(),
+            ),
+        );
+        let vfs = Arc::new(vfs);
+        let repo = CachedResourceRepository::new(vfs.clone());
+        let error = resolve_prototype_single(&repo, vfs.as_ref(), &resource_name(b"prototype"))
+            .expect_err("distinct explicit controls are ambiguous");
+
+        assert!(matches!(
+            error,
+            PrototypeError::Resource(ResourceError::Format(message))
+                if message.contains("ambiguous explicit control resources")
+        ));
     }
 
     #[test]

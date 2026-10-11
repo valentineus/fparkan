@@ -10,7 +10,7 @@ messages, teleports, задачи, research и campaign transitions. Точки 
 и `briefing.cfg`.
 
 `.scr` — binary package с version checks, symbol/event sections и offsets;
-полная opcode grammar не доказана. Его внешний framing теперь читает
+полная opcode grammar не доказана. Его внешний framing читает
 `fparkan-script`: первый little-endian `u32` является числом required opcode
 handlers, второй — числом event records. Каждый event хранит `name_len`,
 `name_len + 1` raw bytes с обязательным NUL, opaque event word и count вложенных
@@ -108,24 +108,21 @@ unsupported result, а не «примерный» game command.
 записи `0x100059f0` вызывает `0x1000f920`, а Ghidra 12.1.2 декомпилирует эту
 функцию как пустой `return`. Следовательно, найденные `<base>_Start` и
 `<base>_Continue` только кэшируются в scheduler state; их фактический consumer
-находится в отдельном позднем update path. Воспроизводимый read-only extractor:
-`tools/ghidra/ExportAiVmHandler2Dispatch.java`.
+находится в отдельном позднем update path.
 
-Corpus priority теперь измерен, а не предполагается: во всех 58 GOG `.scr`
-имеются 6 087 instruction records, из них 3 992 sentinel; самый частый
-non-sentinel selector — `Handler(30)`, 246 records. Его VA `0x1000c266`
-читает первые два reference words активной instruction, разрешает каждый
-через varset (`0x10002d30` и `0x10013570`) и вызывает внешний callback с
-тремя `u32`: `(0, first, second)`. Callback не принадлежит `ai.dll`: его
+Во всех 58 GOG `.scr` имеются 6 087 instruction records, включая 3 992
+sentinel. Самый частый non-sentinel selector — `Handler(30)`, 246 records.
+Его VA `0x1000c266` читает первые два reference words активной instruction,
+разрешает каждый через varset (`0x10002d30` и `0x10013570`) и вызывает внешний
+callback с тремя `u32`: `(0, first, second)`. Callback не принадлежит `ai.dll`: его
 кладёт десятый argument экспортного `CreateSuperAI`. Тот же callback встречен
 у `Handler(57)` с первым word `2` и у отдельного lifecycle path с первым word
 `1`; предметная семантика этих modes ещё не доказана. В частности, это пока
 не основание назвать Handler(30) сообщением, приказом или UI opcode. Точный
 text-to-varset resolver расположен за wrapper `0x10011ea0` в
-`0x100174a0`. Воспроизводимые exports: `ExportAiVmHandler30.java`,
-`FindAiVmHandler30Callback.java`, `ExportAiVarSetLoader.java`.
+`0x100174a0`.
 
-Следующий pass восстанавливает эту индексацию. `0x100174a0` добавляет каждый
+`0x100174a0` добавляет каждый
 recognized source declaration в encounter order как 48-byte record; GOG shared
 `varset.var` не содержит `STRING(...)`, поэтому его 231 numeric `VAR` entries
 образуют точно это index space. `0x10013570` возвращает `DWORD` record kind
@@ -134,10 +131,9 @@ capture. Полный GOG scan всех 246 Handler(30) instructions показ�
 operand references: все 492 in-range и указывают на `DWORD`. Поэтому
 `VarSet::resolve_handler30` уже materializes точный opaque callback command
 `(mode=0, first, second)` для данного corpus path, но явно отклоняет float,
-out-of-range и incomplete instructions вместо silent coercion. Extractors:
-`ExportAiVarSetParser.java`, `ExportAiVarSetU32Resolver.java`.
+out-of-range и incomplete instructions вместо silent coercion.
 
-Следующий static pass закрывает equality/update policy. Identity ровно равна
+Identity ровно равна
 `(slot0 word, slot4 IEEE-754 bits, slot5 IEEE-754 bits)`, поэтому `-0.0` и
 `+0.0` различаются. Новый 100-byte record получает slot1 в поле `+0x14`,
 slot2 одновременно в `+0x24/+0x28`, slot3 в `+0x2c` и slot6 в `+0x0c`. При
@@ -147,7 +143,7 @@ slot2 одновременно в `+0x24/+0x28`, slot3 в `+0x2c` и slot6 в `+
 изолированную часть как `Handler2RecordScheduler`; он не выполняет bytecode,
 не назначает игровых имён и не делает event lookup за original VM.
 
-На границе mission runtime выбранный TMA clan `first_resource` теперь
+На границе mission runtime выбранный TMA clan `first_resource`
 материализуется как отдельный `MissionScriptBundle`: loader нормализует
 `<base>.scr`, декодирует его тем же bounded reader-ом и публикует immutable
 package вместе с clan provenance. Это именно wiring входных данных, не VM
@@ -206,9 +202,9 @@ contains two initialized SuperAI entries `(500, 752, 0)` and `(728, 449, 1)`;
 the Rust loader reports `script_init_states=2` and `script_varset_states=2`.
 
 `GetSuperAI` returns element `n` of the 64-pointer global table at preferred
-`ai.dll + 0x55398` for `n <= 63`. The read-only
-`tools/capture-ai-init.ps1` probe observed the running GOG AutoDemo values
-`(500, 752, 0)` for entry 0 and `(728, 449, 1)` for entry 1 at fields
+`ai.dll + 0x55398` for `n <= 63`. A read-only capture of the running GOG
+AutoDemo process observed `(500, 752, 0)` for entry 0 and `(728, 449, 1)` for
+entry 1 at fields
 `(+0x80, +0x84, +0x7c)`. These values are integral samples, not a rounding
 profile.
 
@@ -216,12 +212,7 @@ The Rust reader exposes `VarSet::resolve_handler19`. It accepts the already
 converted first two words and the third raw word, produces three typed writes,
 and rejects missing, out-of-range, or non-`DWORD` targets. The runtime only
 binds it to the proven creation/anchor path above; it does not guess the
-remaining script event semantics. The associated Ghidra scripts are
-`ExportAiVmHandler19.java`, `ExportAiVmHandler19Setter.java`,
-`ExportAiVmHandler19SetterCallee.java`, and `ExportAiGetSuperAi.java`.
-The creation and conversion boundaries are reproducible with
-`ExportAiCreateSuperAi.java`, `ExportAiSuperAiConstructor.java`, and
-`ExportAiFtol.java`.
+remaining script event semantics.
 
 ### Runtime Handler(30) operand binding
 
@@ -256,12 +247,7 @@ proves the lookup and one-shot/repeat split, not the UI/message subject or the
 semantics of either resource ID; Rust therefore retains command `1` as
 `Unhandled`.
 
-Reproduce the callback and the command-one consumers with
-`capture-ai-init.ps1`, `ExportIron3dAiCallback.java`,
-`ExportIron3dAiCallbackCommand1.java`, and
-`ExportIron3dAiCallbackCommand1Dispatch.java`.
-
-Runtime now applies only this recovered branch as
+Runtime applies only this branch as
 `apply_loaded_script_host_callback`: `(0, 0, 0)` transitions a loaded mission
 to `Failed`, `(0, 0, 1)` transitions it to `Completed`, and a repeated target
 state is a no-op just as the Iron3D guards require. The effect is deliberately
@@ -284,9 +270,7 @@ opaque callback slots; state `3` does the same except word `3` is preserved.
 Both then write `+0x18`. Every other state simply writes the state word.
 `VarSet::resolve_handler8` emits a `Handler8StateChange` with the caller-owned
 live record index, resolved state, and explicit reset kind. It does not invent
-the table owner, the pre-reset helper, or callback semantics. Reproduce the
-evidence with `ExportAiVmHandler8.java`, `ExportAiVmHandler8Callees.java`, and
-`ExportAiVmHandler8Transitions.java`.
+the table owner, the pre-reset helper, or callback semantics.
 
 ### Handler(15): typed target-call boundary
 
@@ -314,8 +298,7 @@ with that record and the third word. Its zero/non-zero result becomes
 return value remain unproven. Accordingly `VarSet::resolve_handler15` only
 materializes a type-checked `Handler15Invocation` and `Handler15TargetPayload`;
 it never executes the opaque target call. Missing, out-of-range, wrong-type,
-and unobserved-mode inputs are explicit errors. Reproduce the static evidence
-with `tools/ghidra/ExportAiVmHandler15.java`.
+and unobserved-mode inputs are explicit errors.
 
 ## Готовность
 

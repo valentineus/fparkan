@@ -386,13 +386,13 @@ fn static_surface_extension_name_is_decoded() {
 }
 
 #[test]
-fn swapchain_plan_prefers_srgb_mailbox_and_clamps_extent() {
+fn swapchain_plan_prefers_unorm_mailbox_and_clamps_extent() {
     let plan = plan_vulkan_swapchain(&swapchain_request()).expect("swapchain plan");
 
     assert_eq!(
         plan.format,
         VulkanSurfaceFormat {
-            format: vk::Format::B8G8R8A8_SRGB.as_raw(),
+            format: vk::Format::R8G8B8A8_UNORM.as_raw(),
             color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR.as_raw(),
         }
     );
@@ -444,7 +444,7 @@ fn swapchain_plan_accepts_undefined_surface_format_by_picking_stage0_default() {
     assert_eq!(
         plan.format,
         VulkanSurfaceFormat {
-            format: vk::Format::B8G8R8A8_SRGB.as_raw(),
+            format: vk::Format::R8G8B8A8_UNORM.as_raw(),
             color_space: vk::ColorSpaceKHR::SRGB_NONLINEAR.as_raw(),
         }
     );
@@ -477,6 +477,66 @@ fn swapchain_plan_rejects_missing_surface_data_and_empty_extent() {
 #[test]
 fn checked_in_shaders_have_valid_spirv_containers() {
     assert_eq!(validate_triangle_shaders(), Ok(()));
+}
+
+#[test]
+fn fragment_shader_dispatches_all_four_material_modes() {
+    let fragment = include_str!("../../shaders/triangle.frag");
+    assert!(fragment.contains("int mode = int(round(material.material_mode));"));
+    assert!(fragment.contains("mode == 0"));
+    assert!(fragment.contains("mode == 1"));
+    assert!(fragment.contains("mode == 2"));
+    assert!(fragment.contains("mode == 3"));
+    assert!(!fragment.contains("material_mode > 1.5"));
+    assert!(!fragment.contains("material_mode > 2.5"));
+}
+
+#[test]
+fn native_specular_reference_uses_squared_power_and_total_overflow_curve() {
+    fn reference_power(cosine: f32, power: u8) -> f32 {
+        if power == 0 {
+            return 0.0;
+        }
+        let mut result = cosine;
+        for _ in 0..power.saturating_sub(1) {
+            result *= result;
+        }
+        result
+    }
+    fn reference_curve(value: f32) -> f32 {
+        if value <= 1.0 {
+            0.8 * value
+        } else if value <= 3.0 {
+            0.1 * value + 0.7
+        } else {
+            1.0
+        }
+    }
+
+    assert_eq!(reference_power(0.5, 0), 0.0);
+    assert!((reference_power(0.5, 1) - 0.5).abs() < 1e-6);
+    assert!((reference_power(0.5, 2) - 0.25).abs() < 1e-6);
+    assert!((reference_power(0.5, 3) - 0.0625).abs() < 1e-6);
+    let compressed_diffuse = 1.5;
+    let material_specular = 0.75;
+    assert!((reference_curve(material_specular + (compressed_diffuse - 1.0)) - 0.825).abs() < 1e-6);
+
+    let vertex = include_str!("../../shaders/triangle.vert");
+    assert!(vertex.contains("result *= result;"));
+    assert!(
+        vertex.contains("vec3 total_specular = specular + max(compressed - vec3(1.0), vec3(0.0));")
+    );
+    assert!(vertex.contains("if (power <= 0.0 || cosine <= 0.0)"));
+}
+
+#[test]
+fn shader_computes_radial_fog_per_vertex_and_interpolates_it() {
+    let vertex = include_str!("../../shaders/triangle.vert");
+    let fragment = include_str!("../../shaders/triangle.frag");
+    assert!(vertex.contains("out_fog_factor = native_fog_factor(in_position);"));
+    assert!(fragment.contains("layout(location = 4) in float in_fog_factor;"));
+    assert!(!fragment.contains("distance(in_world_position"));
+    assert!(!fragment.contains("float fog_factor()"));
 }
 
 #[test]

@@ -359,9 +359,16 @@ local.set_translation(pose.position);
 world[n] = world[parent(n)] * local;
 ```
 
-Для parity особенно важны x87-compatible округление при выборе frame index и
-порядок операций. Одинаковая формула на SSE может выбрать соседний кадр возле
-границы.
+Статический Vulkan preview берёт начальный кадр узла из явной ссылки прототипа
+на CTLD `.ctl`. Используются только включённые строки, а при повторе node ID
+поздняя строка заменяет раннюю. Без `--static-animation-frame` preview применяет
+эти настройки узлов; узлы без настройки остаются на кадре `0`. Явный
+`--static-animation-frame N` переопределяет их и задаёт `N` всем узлам.
+Результат — одна статическая поза, не обновление анимации, Control или AI.
+MSH sampler выбирает type 19 frame округлением `(time - 0.5)` к ближайшему
+целому с ties-to-even, затем интерполирует выбранный type 8 key и следующий
+key в исходном `time`; это portable-вариант native x87 conversion в default
+rounding mode, без обещания совпадения при любом x87 control word.
 
 Проверки animation data:
 
@@ -611,11 +618,20 @@ Lightmap не является обычной diffuse texture. WEAR содерж
 diffuse texture ломает LOD, atlas coordinates и динамическую модуляцию.
 
 Тени проходят отдельным render pass. Terrain содержит пути для теней зданий и
-роботов, ограничения максимального числа, detail level и smoothing. Доказаны
-shadow manager/pass, настройки detail/smoothing/count и зависимость от
-Terrain/CShade; полная формула projection geometry для каждого caster требует
-dynamic trace. Unknown settings из `shade.cfg` читаются и сохраняются по
-именам, а не заменяются произвольными modern defaults.
+роботов, ограничения максимального числа, detail level и smoothing. Реализованы
+native visibility по шести Vulkan clip-плоскостям с радиусом sphere +100,
+порядок кандидатов и лимит 20 до построения страниц, projected-size LOD,
+directional/point light contribution, native page layout, raster, smoothing и
+receiver projection с edge clipping. Unknown settings из `shade.cfg` читаются и
+сохраняются по именам, а не заменяются произвольными modern defaults. Для native ray query
+surface descriptor в `+0x10` требует наличия всех переданных bits, а descriptor
+в `+0x14` исключает поверхности с любым переданным bit. Общий shadow query
+использует full exclusion mask `0x2000`; actor four-ray path получает compact
+mask `0x8008`, который landscape boundary разворачивает в full mask
+`0x00200020`. Sun path передаёт full `0x20`, кодирует его как compact bit `8`
+и затем получает тот же full bit после разворачивания. Hit record хранит в
+`+0x20` квадрат евклидовой длины луча, поэтому native four-ray fade использует
+`distance² * 1e-4`, а не линейную дальность.
 
 Atmosphere manager создаёт world objects для фоновых и погодных явлений.
 Отдельно подтверждены lightning, sun render, flare, `env_lightning`, rain
@@ -623,6 +639,9 @@ background sound и обязательные ссылки на lightning effect.
 обновляются по игровому времени, но часть параметров зависит от camera: flare
 требует screen position и occlusion test, rain -- области рядом с observer,
 sound -- listener. Их нельзя один раз запечь в terrain.
+
+Sun occlusion начинается от точки `camera + 0.5 * normalize(sun - camera)`;
+этот offset является частью native query, а не произвольным bias renderer-а.
 
 RNG для lightning, atmosphere phases и FX должен иметь стабильный порядок.
 Даже правильный средний интервал не даёт повторяемый кадр, если random values
@@ -677,11 +696,14 @@ settings ID сохраняются.
 
 ```text
 opcode  = command_word & 0xFF
-enabled = (command_word >> 8) & 1
+native_flag = (command_word >> 8) & 1
 ```
 
-Bits 9-31 являются частью данных и сохраняются. Между командами нет
-выравнивания. Размер команды, включая word:
+`native_flag` передаётся созданному native command object как режим/feature
+flag и не отключает команду. Например, реальный `env_lightning` использует
+`native_flag == 0` для opcode 3, opcode 1 и opcode 2, и все три команды
+исполняются. Bits 9-31 являются частью данных и сохраняются. Между командами
+нет выравнивания. Размер команды, включая word:
 
 ```text
 opcode 1   224 байта
@@ -896,8 +918,11 @@ Shade cache в GOG `Terrain.dll` имеет vtable RVA `0x643D0`. Его таб�
 находится по `+320`; банки начинаются с `+332`, их шаг — 212 байт. Lookup
 RVA `0x10910` возвращает временное представление по `+24`, а не саму запись.
 Построение в RVA `0x10280` и `0x12e20` использует созданную загрузчиком геометрию.
-Поэтому повторить terrain shader только разбором WEAR нельзя. Точная композиция
-слоёв и микротекстур остаётся открытым вопросом.
+В рабочем Vulkan-пути `TerrainMaterialLayers` разрешает для каждого terrain slot
+базовую, detail, overlay и overlay-detail фазы из WEAR/MAT0; их UV, alpha и
+lightmap state передаются в `VulkanStaticMaterial`, а shader последовательно
+сэмплирует эти четыре стадии. Animation clock обновляет выбранные фазы и
+коэффициенты без пересборки terrain mesh, сохраняя native type-14 overlay mask.
 
 ## Реализация Vulkan
 
@@ -905,12 +930,23 @@ RVA `0x10910` возвращает временное представление
 получается ключ Vulkan pipeline. Alpha reference передаётся отдельно через
 push constant; он не требует нового pipeline.
 
-Статический путь `fparkan-game` загружает ландшафт и MSH-компоненты выбранных
-объектов. Локальные material slots разрешаются через WEAR и MAT0 перед
-объединением геометрии. Индексы GPU имеют тип `u32`: вся карта может содержать
-больше 65 535 вершин, даже если каждый исходный mesh использует `u16`.
-Текущий путь берёт базовую текстуру Land2; свет, составные слои и атмосфера
-пока не участвуют в этом статическом изображении.
+Рабочий путь `fparkan-game` загружает terrain и все выбранные mission roots
+(по умолчанию весь список объектов), разрешая локальные material slots через
+WEAR и MAT0 до объединения геометрии. Индексы GPU имеют тип `u32`: вся карта
+может содержать больше 65 535 вершин, даже если каждый исходный mesh использует
+`u16`. Terrain передаёт в shader базовый, detail и overlay stages, lightmap и
+animation phase; object batches сохраняют их legacy blend/depth/alpha state.
+
+После загрузки world path создаёт интерактивную free-flight камеру (`WASD`,
+`E/Q`, `Shift`, `Ctrl`, RMB relative-look), обновляет listener и на каждом
+кадре собирает environment frame. Mission-local `sky.ske`/`sky.wea` выбирают
+атмосферное расписание и sky materials, `effects.rlb/env_lightning` даёт
+lightning visual; weather particles, flares, sun/moon, point lights,
+projected shadows и audio events обновляются вместе с камерой и временем.
+`--atmosphere-seconds` задаёт старт времени, `--frames 0` оставляет цикл
+бесконечным, а `--preview-roots` служит только диагностическим ограничителем.
+`--legacy-camera-capture` выбирает воспроизводимую камеру без free-flight
+управления.
 
 Для сохранения кадра surface должен поддерживать `TRANSFER_SRC`. Renderer
 копирует последний отправленный swapchain image в host-visible buffer и

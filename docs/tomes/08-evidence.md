@@ -241,45 +241,20 @@ near/far mapping, handedness или initial camera selection. Важно, что
 `ICamera::GetTransformMatrix` (RVA `0x4F850`) ведут только в obsolete-call
 stubs и не дают usable ABI.
 
-Live elevated read-only probe впервые подтвердил relocation-aware runtime связь:
-`Terrain.dll` был загружен по `0x02510000`, global `base + 0x7355C` содержал
-non-null `0x0B37DF08`, а первый dword этого объекта был `0x025765B4` — ровно
-relocated `off_100665B4` из `LoadCamera` construction path. Это доказывает
-live camera object с outer vtable, но одновременно исправляет прежнее слишком
-сильное сопоставление offsets: raw read `global + 0x10` не дал finite 4x4 matrix,
-а `+0x234` был zero в данном sample. Receiver static procedures `0x4D740`/
-`0x4D9C0` и exported global ещё не доказаны как один layout без interface
-adjustment; их offsets остаются unassigned до recovery selector relationship.
+Глобальная camera boundary имеет более точное статическое описание.
+`stdGetCurrentCamera2` — короткий getter Terrain по RVA `0x4FD80`, который
+читает указатель из global RVA `0x7355C`; initializer по RVA `0x4D4D0`
+запрашивает selector `8` у своего `this` и сохраняет полученный interface
+pointer. Запрос selector `18` у landscape object проходит через RVA `0x106D0`
+и `0x107E0`, возвращает subobject по `base + 0x138`.
 
-Локальная IDA-база уточняет адреса этой связи: `stdGetCurrentCamera2` — это
-шестибайтный getter по RVA `0x4FD80`, который возвращает `dword` по RVA
-`0x7355C`. Единственный найденный **direct static** initializer этого global — функция Terrain
-по RVA `0x4D4D0`: она запрашивает selector `8` у своего `this` и сохраняет
-полученный interface pointer. Это доказывает адрес хранения и путь заполнения,
-но не разрешает трактовать pointer как конкретный layout камеры либо читать его
-как runtime evidence без доступа к процессу на том же уровне привилегий.
-
-Elevated live sampling теперь доказывает, что direct static xref не исчерпывает
-runtime writers: за 25 секунд autoplay global переключился между тремя heap
-pointer, все с relocated outer vtables `0x025765B4`/`0x02576558`. У двух объектов
-paired blocks `+0x2C/+0x3C/+0x4C` и `+0x6C/+0x7C/+0x8C` синхронно несли
-world-like translation, например `(491.562, 761.551, 7.361)`; третий давал
-normalized-looking `(0.098, 0.018, 0.856)` и не совпадал с paired block.
-Наблюдение согласуется с автоматическими camera switches, но не маркирует mode;
-оно запрещает называть `0x4D4D0` единственным runtime writer и требует recovery
-indirect/unanalyzed write path.
-
-Outer vtable `off_100665B4` теперь даёт exact transform adjustment для
-world-like sample. Slot `+0x54` вызывает у subobject `outer + 4` slot `+0x20`
-с selector `0`, затем копирует returned `+0x0C/+0x1C/+0x2C`. В live объекте
-selector field `outer + 0x10` был `0xFFFFFFFF`; реализация selector `0` при
-этом возвращает `outer + 0x20`. Значит observed triple
-`outer + 0x2C/+0x3C/+0x4C` — доказанная translation часть active affine
-transform, а не корреляция. Selector `2` возвращает paired block `outer + 0x60`;
-outer slot `+0x70` применяет `atan2` к его axis values, что доказывает
-orientation-angle path. Названия полей, angle order и handedness пока не
-установлены, но raw affine transform и translation можно сохранять как
-backend-neutral camera pose без догадок.
+Внешняя camera vtable по RVA `0x665B4` имеет slot `+0x54`, который вызывает у
+subobject `outer + 0x4` slot `+0x20` с selector `0` и копирует возвращённые
+компоненты `+0x0C`, `+0x1C` и `+0x2C`. При значении selector field
+`outer + 0x10 = -1` selector `0` возвращает `outer + 0x20`; selector `2`
+возвращает `outer + 0x60`, а slot `+0x70` выводит углы через `atan2`.
+Это фиксирует пути чтения положения и ориентации, но не назначает имена полям,
+порядок углов или handedness.
 
 ### Vtable и interface negotiation
 
@@ -287,6 +262,11 @@ backend-neutral camera pose без догадок.
 метода неизвестно. Renderer slots около `+0x28`, `+0x30`, `+0x34` окружают
 world traversal; camera и viewport получаются через selector-based interface
 calls; shared objects используют ранний slot как AddRef-подобную операцию.
+
+Запрос selector `18` у landscape object проходит через RVA `0x106D0` и
+`0x107E0`, возвращает subobject по `base + 0x138`, а его vtable slot `+0x18`
+ведёт через RVA `0x14230` к обработчику `0x127D0`. Это geometry-interface
+boundary, отдельная от хранения активной camera.
 
 Правила реконструкции:
 
@@ -298,45 +278,6 @@ calls; shared objects используют ранний slot как AddRef-по�
 
 Нельзя добавлять virtual destructor в начало reconstructed interface: это
 сдвинет все slots.
-
-### ABI-матрица Частей 1 и 2
-
-Во всех пятнадцати DLL совпадают export names, ordinals и import sets. Общее
-число exports остаётся 313. Обе полные части содержат 1 134 imported function
-slots; значение 1 126 относится к демоверсии и хранится отдельно.
-
-Побайтно идентичны девять DLL:
-
-```text
-ai.dll
-Behavior.dll
-Joystick.dll
-MisLoad.dll
-Net.dll
-Ngi32.dll
-Terrain.dll
-Wizard.dll
-World3D.dll
-```
-
-Пересобраны `AniMesh.dll`, `ArealMap.dll`, `Control.dll`, `Effect.dll`,
-`iron3d.dll`, `services.dll`.
-
-Изменение export RVA:
-
-```text
-AniMesh    2 / 2
-Control    5 / 5
-iron3d     8 / 8
-services   6 / 6
-ArealMap   0 / 9
-Effect     0 / 2
-```
-
-Нулевое изменение export RVA не доказывает идентичность тела функции:
-`ArealMap.dll` и `Effect.dll` имеют изменённый `.text` при прежних адресах
-exports. Compatibility headers фиксируют внешний ABI один раз, но внутренняя
-таблица адресов, тестов и semantic deltas выбирается по build fingerprint.
 
 ## Файловая поверхность
 

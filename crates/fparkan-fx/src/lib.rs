@@ -6,6 +6,11 @@
 //! reference stub until opcode timing, gates, RNG, and command-body semantics
 //! are backed by runtime-captured evidence.
 
+pub mod atmosphere;
+pub mod environment;
+pub mod shadow;
+pub mod sky;
+
 use fparkan_binary::{Cursor, DecodeError};
 use std::sync::Arc;
 
@@ -85,8 +90,13 @@ pub struct FxCommand {
     pub word: u32,
     /// Decoded opcode.
     pub opcode: FxOpcode,
-    /// Enabled bit.
-    pub enabled: bool,
+    /// Native command flag stored in bit 8 of the command word.
+    ///
+    /// This flag is passed to the native command object as a mode/feature
+    /// flag. It does not disable the command: real effects such as
+    /// `env_lightning` use zero for all three command flags and still execute
+    /// opcode 3, opcode 1, and opcode 2.
+    pub native_flag: bool,
     /// Command body after the word.
     pub raw_body: Arc<[u8]>,
     /// Resource references discovered in known command layouts.
@@ -314,7 +324,7 @@ pub fn decode_fxid(bytes: Arc<[u8]>) -> Result<FxDocument, FxError> {
         commands.push(FxCommand {
             word,
             opcode,
-            enabled: ((word >> 8) & 1) != 0,
+            native_flag: ((word >> 8) & 1) != 0,
             raw_body,
             resource_refs,
         });
@@ -369,9 +379,6 @@ pub fn emit(state: &FxState, out: &mut Vec<FxEmission>) -> Result<(), FxError> {
         return Ok(());
     }
     for (index, command) in state.document.commands.iter().enumerate() {
-        if !command.enabled {
-            continue;
-        }
         let command_index = u32::try_from(index).map_err(|_| DecodeError::IntegerOverflow)?;
         if command.opcode == FxOpcode::Op2 {
             out.push(FxEmission::Sound(FxSoundEvent { command_index }));
@@ -605,7 +612,7 @@ mod tests {
 
         assert_eq!(document.header().command_count, 2);
         assert_eq!(document.commands()[0].opcode, FxOpcode::Op2);
-        assert!(document.commands()[0].enabled);
+        assert!(document.commands()[0].native_flag);
         assert_eq!(
             document.commands()[0].resource_refs[0].archive_name(),
             b"sounds.lib"
@@ -638,6 +645,25 @@ mod tests {
 
         assert_eq!(document.commands()[0].opcode, FxOpcode::Op6);
         assert!(document.commands()[0].raw_body.is_empty());
+    }
+
+    #[test]
+    fn zero_native_flags_still_emit_every_command() {
+        let mut bytes = header(3);
+        bytes.extend_from_slice(&command(0x0003, 200));
+        bytes.extend_from_slice(&command(0x0001, 224));
+        bytes.extend_from_slice(&command(0x0002, 148));
+        let document = Arc::new(decode_fxid(Arc::from(bytes.into_boxed_slice())).expect("fx"));
+
+        assert!(document
+            .commands()
+            .iter()
+            .all(|command| !command.native_flag));
+        let state = create_instance(document, FxSeed(9), Transform::default()).expect("state");
+        assert_eq!(
+            canonical_emission_capture(&state).expect("capture"),
+            b"P,0, Op3\nP,1, Op1\nS,2\n"
+        );
     }
 
     #[test]

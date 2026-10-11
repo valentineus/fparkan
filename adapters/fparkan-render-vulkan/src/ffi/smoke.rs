@@ -1,15 +1,19 @@
 #![allow(unsafe_code)]
 
 use ash::vk;
+use fparkan_render::LegacyDepthMode;
 
 use super::smoke_types::resolve_draw_texture_indices;
+use super::update_material_texture_descriptor;
 use super::{
-    create_command_pool, create_frame_sync, create_static_mesh_index_buffer,
+    create_command_pool, create_frame_sync, create_index_buffer, create_static_mesh_index_buffer,
     create_static_mesh_vertex_buffer, create_static_texture_image, create_swapchain_resources,
-    create_validation_messenger, create_vulkan_instance_probe,
+    create_validation_messenger, create_vertex_buffer, create_vulkan_instance_probe,
     create_vulkan_logical_device_probe_for_request, create_vulkan_surface_probe,
     create_vulkan_swapchain_probe_for_extent, destroy_allocated_buffer, destroy_allocated_image,
-    destroy_swapchain_resources, plan_vulkan_surface, readback_buffer_bytes, VulkanAllocatedBuffer,
+    destroy_swapchain_resources, plan_vulkan_surface, readback_buffer_bytes,
+    update_static_texture_image, write_frame_uniform, write_material_specular_buffer,
+    write_static_mesh_index_buffer, write_static_mesh_vertex_buffer, VulkanAllocatedBuffer,
     VulkanInstanceConfig, VulkanInstanceProbe, VulkanLogicalDeviceProbe, VulkanReadbackArtifact,
     VulkanSmokeFrameOutcome, VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo,
     VulkanSmokeRendererError, VulkanSmokeRendererReport, VulkanSmokeShutdownReport,
@@ -185,38 +189,225 @@ impl VulkanSmokeRenderer {
                     return Err(error);
                 }
             };
-        // Keep the compatibility triangle path valid: it samples a white texel
-        // when no original TEXM was supplied.
+        // Keep the compatibility triangle path valid: a white base texel,
+        // neutral detail texels and a transparent white overlay make the
+        // additional terrain stages mathematically transparent.
         let fallback_texture = super::VulkanStaticTexture {
             width: 1,
             height: 1,
             rgba8: vec![255, 255, 255, 255],
+            mip_levels: Vec::new(),
         };
+        let fallback_detail_texture = super::VulkanStaticTexture {
+            width: 1,
+            height: 1,
+            rgba8: vec![128, 128, 128, 255],
+            mip_levels: Vec::new(),
+        };
+        let fallback_overlay_texture = super::VulkanStaticTexture {
+            width: 1,
+            height: 1,
+            rgba8: vec![255, 255, 255, 0],
+            mip_levels: Vec::new(),
+        };
+        // Fallback stages are immutable compatibility images. Keep one
+        // allocation for each fallback kind and map every logical material
+        // slot to it. Authored images remain one-per-slot because dynamic
+        // phase uploads must never couple two materials.
         let texture_sources = if create_info.materials.is_empty() {
-            vec![&fallback_texture]
+            vec![
+                (&fallback_texture, Some(0_usize)),
+                (&fallback_detail_texture, Some(1_usize)),
+                (&fallback_overlay_texture, Some(2_usize)),
+                (&fallback_detail_texture, Some(1_usize)),
+            ]
+        } else {
+            let mut sources = Vec::with_capacity(create_info.materials.len() * 4);
+            for material in &create_info.materials {
+                sources.push((&material.texture, None));
+                sources.push((
+                    material
+                        .detail_texture
+                        .as_ref()
+                        .map_or(&fallback_detail_texture, |texture| texture),
+                    material.detail_texture.is_none().then_some(1_usize),
+                ));
+                sources.push((
+                    material
+                        .overlay_texture
+                        .as_ref()
+                        .map_or(&fallback_overlay_texture, |texture| texture),
+                    material.overlay_texture.is_none().then_some(2_usize),
+                ));
+                sources.push((
+                    material
+                        .overlay_detail_texture
+                        .as_ref()
+                        .map_or(&fallback_detail_texture, |texture| texture),
+                    material.overlay_detail_texture.is_none().then_some(1_usize),
+                ));
+            }
+            sources
+        };
+        let mut textures = Vec::with_capacity(texture_sources.len());
+        let mut texture_slot_indices = Vec::with_capacity(texture_sources.len());
+        let mut fallback_image_indices = [None; 3];
+        for (texture_source, fallback_kind) in texture_sources {
+            let texture_index = if let Some(fallback_kind) = fallback_kind {
+                if let Some(texture_index) = fallback_image_indices[fallback_kind] {
+                    texture_index
+                } else {
+                    let image = match create_static_texture_image(
+                        &instance,
+                        &device,
+                        command_pool,
+                        texture_source,
+                    ) {
+                        Ok(image) => image,
+                        Err(error) => {
+                            for texture in &textures {
+                                destroy_allocated_image(&device, texture);
+                            }
+                            // SAFETY: These resources belong to this live device and are rolled back before it drops.
+                            unsafe { device.device().destroy_command_pool(command_pool, None) };
+                            destroy_allocated_buffer(&device, &index_buffer);
+                            destroy_allocated_buffer(&device, &vertex_buffer);
+                            return Err(error);
+                        }
+                    };
+                    let texture_index = textures.len();
+                    textures.push(image);
+                    fallback_image_indices[fallback_kind] = Some(texture_index);
+                    texture_index
+                }
+            } else {
+                let image = match create_static_texture_image(
+                    &instance,
+                    &device,
+                    command_pool,
+                    texture_source,
+                ) {
+                    Ok(image) => image,
+                    Err(error) => {
+                        for texture in &textures {
+                            destroy_allocated_image(&device, texture);
+                        }
+                        // SAFETY: These resources belong to this live device and are rolled back before it drops.
+                        unsafe { device.device().destroy_command_pool(command_pool, None) };
+                        destroy_allocated_buffer(&device, &index_buffer);
+                        destroy_allocated_buffer(&device, &vertex_buffer);
+                        return Err(error);
+                    }
+                };
+                let texture_index = textures.len();
+                textures.push(image);
+                texture_index
+            };
+            texture_slot_indices.push(texture_index);
+        }
+        let material_alphas = if create_info.materials.is_empty() {
+            vec![[1.0, 0.0]]
         } else {
             create_info
                 .materials
                 .iter()
-                .map(|material| &material.texture)
+                .map(|material| {
+                    [
+                        material.diffuse_alpha,
+                        material.overlay_diffuse_alpha.unwrap_or(0.0),
+                    ]
+                })
                 .collect()
         };
-        let mut textures = Vec::with_capacity(texture_sources.len());
-        for texture_source in texture_sources {
-            match create_static_texture_image(&instance, &device, command_pool, texture_source) {
-                Ok(image) => textures.push(image),
-                Err(error) => {
-                    for texture in &textures {
-                        destroy_allocated_image(&device, texture);
-                    }
-                    // SAFETY: These resources belong to this live device and are rolled back before it drops.
-                    unsafe { device.device().destroy_command_pool(command_pool, None) };
-                    destroy_allocated_buffer(&device, &index_buffer);
-                    destroy_allocated_buffer(&device, &vertex_buffer);
-                    return Err(error);
-                }
-            }
-        }
+        let material_lighting = if create_info.materials.is_empty() {
+            vec![[[1.0; 3], [0.0; 3], [1.0; 3], [0.0; 3]]]
+        } else {
+            create_info
+                .materials
+                .iter()
+                .map(|material| {
+                    [
+                        material.directional_rgb,
+                        material.additive_rgb,
+                        material.overlay_directional_rgb.unwrap_or([1.0; 3]),
+                        material.overlay_additive_rgb.unwrap_or([0.0; 3]),
+                    ]
+                })
+                .collect()
+        };
+        let material_uv_transforms = if create_info.materials.is_empty() {
+            vec![[[0.0, 0.0, 1.0, 1.0]; 4]]
+        } else {
+            create_info
+                .materials
+                .iter()
+                .map(|material| {
+                    [
+                        material.uv_transform,
+                        material.detail_uv_transform,
+                        material
+                            .overlay_uv_transform
+                            .unwrap_or([0.0, 0.0, 1.0, 1.0]),
+                        material
+                            .overlay_detail_uv_transform
+                            .unwrap_or([0.0, 0.0, 1.0, 1.0]),
+                    ]
+                })
+                .collect()
+        };
+        let material_unlit = if create_info.materials.is_empty() {
+            vec![0.0]
+        } else {
+            create_info
+                .materials
+                .iter()
+                .map(|material| {
+                    let combiner_mode = if material.lightmap_mode {
+                        3.0
+                    } else if material.sky_nebula_stars {
+                        2.0
+                    } else if material.unlit {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    combiner_mode + if material.sky_far_depth { 4.0 } else { 0.0 }
+                })
+                .collect()
+        };
+        let material_specular = if create_info.materials.is_empty() {
+            vec![[[0.0; 4]; 2]]
+        } else {
+            create_info
+                .materials
+                .iter()
+                .map(|material| {
+                    [
+                        [
+                            material.specular_rgb[0],
+                            material.specular_rgb[1],
+                            material.specular_rgb[2],
+                            f32::from(material.specular_power),
+                        ],
+                        [
+                            material.overlay_specular_rgb.unwrap_or([0.0; 3])[0],
+                            material.overlay_specular_rgb.unwrap_or([0.0; 3])[1],
+                            material.overlay_specular_rgb.unwrap_or([0.0; 3])[2],
+                            f32::from(material.overlay_specular_power.unwrap_or(0)),
+                        ],
+                    ]
+                })
+                .collect()
+        };
+        let material_selectors = if create_info.materials.is_empty() {
+            vec![0]
+        } else {
+            create_info
+                .materials
+                .iter()
+                .map(|material| material.material_index)
+                .collect()
+        };
         let mut renderer = Self {
             instance: Some(instance),
             validation,
@@ -227,10 +418,38 @@ impl VulkanSmokeRenderer {
             swapchain_resources: None,
             vertex_buffer: Some(vertex_buffer),
             index_buffer: Some(index_buffer),
+            texture_slot_indices,
             textures,
+            vertex_count: create_info.mesh.vertices.len(),
+            index_capacity: create_info.mesh.indices.len(),
+            draw_range_capacities: create_info
+                .mesh
+                .draw_ranges
+                .iter()
+                .map(|range| range.index_count)
+                .collect(),
             draw_ranges: create_info.mesh.draw_ranges.clone(),
             draw_texture_indices,
+            draw_order: (0..create_info.mesh.draw_ranges.len()).collect(),
+            draw_range_sort_keys: vec![None; create_info.mesh.draw_ranges.len()],
+            draw_order_dirty: false,
+            draw_range_world_queue: vec![None; create_info.mesh.draw_ranges.len()],
+            draw_range_base_pipeline_states: create_info
+                .mesh
+                .draw_ranges
+                .iter()
+                .map(|range| range.pipeline_state)
+                .collect(),
+            material_alphas,
+            material_lighting,
+            material_uv_transforms,
+            material_unlit,
+            material_specular,
+            material_selectors,
+            material_specular_dirty: true,
+            readback_enabled: false,
             camera: create_info.camera,
+            frame_uniforms: super::VulkanFrameUniforms::from_camera(create_info.camera),
             frame_sync: Vec::new(),
             images_in_flight: Vec::new(),
             current_frame: 0,
@@ -318,6 +537,12 @@ impl VulkanSmokeRenderer {
         self.camera
     }
 
+    /// Returns the frame state uploaded before the next recorded frame.
+    #[must_use]
+    pub const fn frame_uniforms(&self) -> super::VulkanFrameUniforms {
+        self.frame_uniforms
+    }
+
     /// Replaces the camera for subsequent frames without recreating GPU resources.
     ///
     /// # Errors
@@ -335,6 +560,585 @@ impl VulkanSmokeRenderer {
             });
         }
         self.camera = camera;
+        self.frame_uniforms.clip_from_world = camera.clip_from_world;
+        Ok(())
+    }
+
+    /// Replaces lighting, fog, camera-position and matrix state for
+    /// subsequent frames without recreating GPU resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VulkanSmokeRendererError::InvalidStaticCamera`] when any
+    /// submitted value is non-finite. The caller must update only between
+    /// [`Self::draw_frame`] calls on the renderer-owning thread.
+    pub fn set_frame_uniforms(
+        &mut self,
+        frame_uniforms: super::VulkanFrameUniforms,
+    ) -> Result<(), VulkanSmokeRendererError> {
+        if !frame_uniforms.is_finite() {
+            return Err(VulkanSmokeRendererError::InvalidStaticCamera {
+                context: "non-finite frame uniform",
+            });
+        }
+        self.camera.clip_from_world = frame_uniforms.clip_from_world;
+        self.frame_uniforms = frame_uniforms;
+        Ok(())
+    }
+
+    /// Enables the optional swapchain image copy used by screenshot/readback
+    /// callers. Runtime frames leave it disabled to avoid a transfer every
+    /// frame.
+    pub fn set_readback_enabled(&mut self, enabled: bool) {
+        self.readback_enabled = enabled;
+        if !enabled {
+            self.last_readback_image_index = None;
+        }
+    }
+
+    /// Replaces the shared vertex allocation between frames.
+    ///
+    /// The initial mesh owns enough vertices for the scene's dynamic slots;
+    /// callers update those slots in place as camera-relative environment
+    /// geometry moves.  The device is idled before the host-visible write so
+    /// no submitted command can observe a partial update.
+    pub fn update_vertices(
+        &mut self,
+        vertices: &[super::VulkanStaticVertex],
+    ) -> Result<(), VulkanSmokeRendererError> {
+        if vertices.len() != self.vertex_count {
+            return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "updated static mesh vertex count differs from allocation",
+            });
+        }
+        // SAFETY: The renderer owns the queue and all submitted work; waiting
+        // for idle makes the shared vertex allocation quiescent.
+        unsafe { self.device_ref()?.device().device_wait_idle() }.map_err(|result| {
+            VulkanSmokeRendererError::VulkanOperation {
+                context: "vkDeviceWaitIdle(static mesh vertex update)",
+                result,
+            }
+        })?;
+        write_static_mesh_vertex_buffer(self.device_ref()?, self.vertex_buffer_ref()?, vertices)
+    }
+
+    /// Uploads the current shared mesh while retaining dynamic draw state.
+    ///
+    /// Environment geometry and projected shadow geometry share the original
+    /// vertex/index allocations. `geometry_ranges` carries only the ranges
+    /// whose index segment changed; material selection, blend/depth state,
+    /// transparency classification, and active counts owned by other setters
+    /// remain untouched. The allocations grow to the largest submitted frame
+    /// and never grow for a frame that fits the retained capacity.
+    ///
+    /// A range with `index_count == 0` is valid and disables that range for the
+    /// frame. The mesh itself still needs at least one vertex and one index so
+    /// Vulkan never receives a zero-sized allocation.
+    pub fn update_mesh_geometry(
+        &mut self,
+        vertices: &[super::VulkanStaticVertex],
+        indices: &[u32],
+        geometry_ranges: &[super::VulkanDynamicDrawRange],
+    ) -> Result<(), VulkanSmokeRendererError> {
+        validate_geometry_upload(
+            vertices,
+            indices,
+            &self.draw_ranges,
+            geometry_ranges,
+            self.vertex_count,
+            self.index_capacity,
+        )?;
+
+        let vertex_grew = vertices.len() > self.vertex_count;
+        let index_grew = indices.len() > self.index_capacity;
+
+        // SAFETY: The renderer owns the queue and all submitted work. Waiting
+        // before either writing or replacing a shared allocation keeps old
+        // command buffers from observing a partial upload.
+        unsafe { self.device_ref()?.device().device_wait_idle() }.map_err(|result| {
+            VulkanSmokeRendererError::VulkanOperation {
+                context: "vkDeviceWaitIdle(dynamic mesh update)",
+                result,
+            }
+        })?;
+
+        let (new_vertex_buffer, new_index_buffer) = if vertex_grew || index_grew {
+            let instance = self.instance_ref()?;
+            let device = self.device_ref()?;
+            let new_vertex_buffer = if vertex_grew {
+                Some(create_vertex_buffer(instance, device, vertices)?)
+            } else {
+                None
+            };
+            let new_index_buffer = if index_grew {
+                match create_index_buffer(instance, device, indices) {
+                    Ok(buffer) => Some(buffer),
+                    Err(error) => {
+                        if let Some(buffer) = new_vertex_buffer.as_ref() {
+                            destroy_allocated_buffer(device, buffer);
+                        }
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
+            if !vertex_grew {
+                if let Err(error) =
+                    write_static_mesh_vertex_buffer(device, self.vertex_buffer_ref()?, vertices)
+                {
+                    if let Some(buffer) = new_vertex_buffer.as_ref() {
+                        destroy_allocated_buffer(device, buffer);
+                    }
+                    if let Some(buffer) = new_index_buffer.as_ref() {
+                        destroy_allocated_buffer(device, buffer);
+                    }
+                    return Err(error);
+                }
+            }
+            if !index_grew {
+                if let Err(error) =
+                    write_static_mesh_index_buffer(device, self.index_buffer_ref()?, indices)
+                {
+                    if let Some(buffer) = new_vertex_buffer.as_ref() {
+                        destroy_allocated_buffer(device, buffer);
+                    }
+                    if let Some(buffer) = new_index_buffer.as_ref() {
+                        destroy_allocated_buffer(device, buffer);
+                    }
+                    return Err(error);
+                }
+            }
+            (new_vertex_buffer, new_index_buffer)
+        } else {
+            let device = self.device_ref()?;
+            write_static_mesh_vertex_buffer(device, self.vertex_buffer_ref()?, vertices)?;
+            write_static_mesh_index_buffer(device, self.index_buffer_ref()?, indices)?;
+            (None, None)
+        };
+
+        if let Some(buffer) = new_vertex_buffer {
+            let old = self.vertex_buffer.replace(buffer);
+            if let Some(old) = old {
+                destroy_allocated_buffer(self.device_ref()?, &old);
+            }
+            self.vertex_count = vertices.len();
+        }
+        if let Some(buffer) = new_index_buffer {
+            let old = self.index_buffer.replace(buffer);
+            if let Some(old) = old {
+                destroy_allocated_buffer(self.device_ref()?, &old);
+            }
+            self.index_capacity = indices.len();
+        }
+
+        apply_geometry_range_updates(
+            &mut self.draw_ranges,
+            &mut self.draw_range_capacities,
+            geometry_ranges,
+        );
+        Ok(())
+    }
+
+    /// Replaces one material texture in place while retaining its descriptor
+    /// set and sampler.  This is used by dynamic fixed-size atlases such as
+    /// the native 256 by 256 projected-shadow texture.
+    ///
+    /// The updated image must have the same dimensions and generated/authored
+    /// mip count as the texture allocated during renderer creation.  The
+    /// renderer idles its device before the transfer, so callers may invoke
+    /// this between frame updates without taking ownership of Vulkan handles.
+    pub fn update_material_texture(
+        &mut self,
+        material_index: usize,
+        texture_slot: usize,
+        texture: &super::VulkanStaticTexture,
+    ) -> Result<(), VulkanSmokeRendererError> {
+        if texture_slot >= 4 {
+            return Err(VulkanSmokeRendererError::InvalidStaticTexture {
+                context: "dynamic material texture slot is out of bounds",
+            });
+        }
+        let logical_texture_index = material_index
+            .checked_mul(4)
+            .and_then(|index| index.checked_add(texture_slot))
+            .ok_or(VulkanSmokeRendererError::InvalidStaticTexture {
+                context: "dynamic material texture index overflows address space",
+            })?;
+        let texture_index = self
+            .texture_slot_indices
+            .get(logical_texture_index)
+            .copied()
+            .ok_or(VulkanSmokeRendererError::InvalidStaticTexture {
+                context: "dynamic material texture index is out of bounds",
+            })?;
+        if self.textures.get(texture_index).is_none() {
+            return Err(VulkanSmokeRendererError::InvalidStaticTexture {
+                context: "dynamic material texture index is out of bounds",
+            });
+        }
+        {
+            let device = self.device_ref()?;
+            // SAFETY: every submission made by this renderer uses this device; the
+            // idle wait makes all descriptor image reads quiescent before upload.
+            unsafe { device.device().device_wait_idle() }.map_err(|result| {
+                VulkanSmokeRendererError::VulkanOperation {
+                    context: "vkDeviceWaitIdle(dynamic texture update)",
+                    result,
+                }
+            })?;
+        }
+        let shared_texture = self
+            .texture_slot_indices
+            .iter()
+            .filter(|mapped_index| **mapped_index == texture_index)
+            .count()
+            > 1;
+        if shared_texture {
+            // A fallback image can serve many logical slots. Detach the
+            // requested slot before uploading so this public update method
+            // keeps its one-material/one-slot semantics.
+            let image = {
+                let instance = self.instance_ref()?;
+                let device = self.device_ref()?;
+                create_static_texture_image(instance, device, self.command_pool, texture)?
+            };
+            let new_texture_index = self.textures.len();
+            self.textures.push(image);
+            self.texture_slot_indices[logical_texture_index] = new_texture_index;
+            let device = self.device_ref()?;
+            let resources = self.resources_ref()?;
+            update_material_texture_descriptor(
+                device,
+                resources,
+                material_index,
+                texture_slot,
+                &self.textures[new_texture_index],
+            )
+        } else {
+            let instance = self.instance_ref()?;
+            let device = self.device_ref()?;
+            let image = self.textures.get(texture_index).ok_or(
+                VulkanSmokeRendererError::InvalidStaticTexture {
+                    context: "dynamic material texture index is out of bounds",
+                },
+            )?;
+            update_static_texture_image(instance, device, self.command_pool, image, texture)
+        }
+    }
+
+    /// Changes one draw range's active index count while retaining its
+    /// pipeline and material selector.  This lets a fixed-capacity weather
+    /// allocation draw only the particles emitted in the current frame.
+    pub fn set_draw_range_index_count(
+        &mut self,
+        range_index: usize,
+        index_count: u32,
+    ) -> Result<(), VulkanSmokeRendererError> {
+        if index_count % 3 != 0 {
+            return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic draw range index count is not a triangle count",
+            });
+        }
+        let capacity = self.draw_range_capacities.get(range_index).copied().ok_or(
+            VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic draw range index is out of bounds",
+            },
+        )?;
+        if index_count > capacity {
+            return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic draw range exceeds its index allocation",
+            });
+        }
+        let range = self.draw_ranges.get_mut(range_index).ok_or(
+            VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic draw range index is out of bounds",
+            },
+        )?;
+        range.index_count = index_count;
+        Ok(())
+    }
+
+    /// Sets the native per-range alpha reference in legacy 0..=255 units.
+    ///
+    /// A value of zero selects the renderer's proven native default (one) for
+    /// alpha-test ranges.  The update is dynamic and does not recreate a
+    /// graphics pipeline.
+    pub fn set_draw_range_alpha_test_reference(
+        &mut self,
+        range_index: usize,
+        alpha_test_reference: u8,
+    ) -> Result<(), VulkanSmokeRendererError> {
+        let range = self.draw_ranges.get_mut(range_index).ok_or(
+            VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic draw range index is out of bounds",
+            },
+        )?;
+        range.alpha_test_reference = alpha_test_reference;
+        Ok(())
+    }
+
+    /// Marks a draw range as belonging to the native transparent queue.
+    ///
+    /// The flag is deliberately independent of the blend category: native
+    /// materials can blend while retaining depth writes, and some alpha
+    /// materials are depth-tested opaque.  When enabled, a range that uses a
+    /// depth attachment switches to depth-test/read-only.  The original depth
+    /// state is retained so disabling the flag restores the caller's state.
+    ///
+    /// The transparent flag only participates in the world draw order.  The
+    /// backend keeps every unmarked range in its original slot, which leaves
+    /// the fixed screen/sky/weather pass order intact.
+    pub fn set_draw_range_transparency(
+        &mut self,
+        range_index: usize,
+        transparent: bool,
+    ) -> Result<(), VulkanSmokeRendererError> {
+        let base_state = *self
+            .draw_range_base_pipeline_states
+            .get(range_index)
+            .ok_or(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic draw range index is out of bounds",
+            })?;
+        let range = self.draw_ranges.get_mut(range_index).ok_or(
+            VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic draw range index is out of bounds",
+            },
+        )?;
+        let depth = if transparent && base_state.depth != LegacyDepthMode::Disabled {
+            LegacyDepthMode::TestReadOnly
+        } else {
+            base_state.depth
+        };
+        let mut next_state = base_state;
+        next_state.depth = depth;
+        let pipeline_changed = range.pipeline_state != next_state;
+        range.pipeline_state = next_state;
+        // Calling this setter opts the range into the world queue.  Fixed
+        // screen/sky/weather ranges remain `None` because their pass order is
+        // intentionally owned by the caller.
+        self.draw_range_world_queue[range_index] = Some(transparent);
+        self.draw_order_dirty = true;
+        if pipeline_changed {
+            self.rebuild_pipeline_resources()?;
+        }
+        Ok(())
+    }
+
+    /// Supplies the native camera-sort key returned by the draw-item camera
+    /// callback.  The native callback computes Euclidean distance from the
+    /// camera to the first world vertex of the whole indexed batch.
+    ///
+    /// The recovered comparator inserts in descending floating-point camera
+    /// key order.  Keeping the key separate from the range handle mirrors the
+    /// native layer's callback result and its `[item pointer, key]` entries.
+    pub fn set_draw_range_sort_key(
+        &mut self,
+        range_index: usize,
+        sort_key: f32,
+    ) -> Result<(), VulkanSmokeRendererError> {
+        if !sort_key.is_finite() {
+            return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "native draw sort key must be finite",
+            });
+        }
+        let key = self.draw_range_sort_keys.get_mut(range_index).ok_or(
+            VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic draw range index is out of bounds",
+            },
+        )?;
+        *key = Some(sort_key);
+        self.draw_order_dirty = true;
+        Ok(())
+    }
+
+    /// Returns the current stable range-handle order used by command
+    /// recording.  Handles are indices into the original `draw_ranges` vector.
+    #[must_use]
+    pub fn draw_order(&self) -> &[usize] {
+        &self.draw_order
+    }
+
+    /// Changes the diffuse and overlay alpha values carried by one material's
+    /// push constants.  The descriptor images remain unchanged.
+    pub fn set_material_alphas(
+        &mut self,
+        material_index: usize,
+        diffuse_alpha: f32,
+        overlay_alpha: f32,
+    ) -> Result<(), VulkanSmokeRendererError> {
+        if !diffuse_alpha.is_finite()
+            || !overlay_alpha.is_finite()
+            || !(0.0..=1.0).contains(&diffuse_alpha)
+            || !(0.0..=1.0).contains(&overlay_alpha)
+        {
+            return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic material alpha must be finite and 0..1",
+            });
+        }
+        let alphas = self.material_alphas.get_mut(material_index).ok_or(
+            VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic material index is out of bounds",
+            },
+        )?;
+        *alphas = [diffuse_alpha, overlay_alpha];
+        Ok(())
+    }
+
+    /// Changes the base directional and additive lighting coefficients of one
+    /// material while retaining its descriptor images and pipeline state.
+    pub fn set_material_lighting(
+        &mut self,
+        material_index: usize,
+        directional_rgb: [f32; 3],
+        additive_rgb: [f32; 3],
+    ) -> Result<(), VulkanSmokeRendererError> {
+        self.set_material_lighting_with_overlay(
+            material_index,
+            directional_rgb,
+            additive_rgb,
+            None,
+            None,
+        )
+    }
+
+    /// Changes base and optional overlay directional/additive coefficients
+    /// while retaining descriptor images and pipeline state.
+    pub fn set_material_lighting_with_overlay(
+        &mut self,
+        material_index: usize,
+        directional_rgb: [f32; 3],
+        additive_rgb: [f32; 3],
+        overlay_directional_rgb: Option<[f32; 3]>,
+        overlay_additive_rgb: Option<[f32; 3]>,
+    ) -> Result<(), VulkanSmokeRendererError> {
+        if directional_rgb
+            .into_iter()
+            .chain(additive_rgb)
+            .chain(overlay_directional_rgb.into_iter().flatten())
+            .chain(overlay_additive_rgb.into_iter().flatten())
+            .any(|value| !value.is_finite() || value < 0.0)
+        {
+            return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic material lighting must be finite and non-negative",
+            });
+        }
+        let lighting = self.material_lighting.get_mut(material_index).ok_or(
+            VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic material index is out of bounds",
+            },
+        )?;
+        lighting[0] = directional_rgb;
+        lighting[1] = additive_rgb;
+        lighting[2] = overlay_directional_rgb.unwrap_or([1.0; 3]);
+        lighting[3] = overlay_additive_rgb.unwrap_or([0.0; 3]);
+        Ok(())
+    }
+
+    /// Replaces the four Page transforms carried by one material's push
+    /// constants.  The transform order is base, detail, overlay, and overlay
+    /// detail, matching the material shader's texture bindings.
+    ///
+    /// The update is kept CPU-side and is consumed by the next recorded draw;
+    /// no descriptor or image resource is recreated.  This is intentionally a
+    /// complete replacement so an animated MAT0 phase cannot leave one stale
+    /// Page rectangle behind when its texture set is unchanged.
+    pub fn set_material_uv_transforms(
+        &mut self,
+        material_index: usize,
+        uv_transforms: [[f32; 4]; 4],
+    ) -> Result<(), VulkanSmokeRendererError> {
+        if uv_transforms
+            .into_iter()
+            .flatten()
+            .any(|value| !value.is_finite())
+        {
+            return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic material UV transform must be finite",
+            });
+        }
+        let transforms = self.material_uv_transforms.get_mut(material_index).ok_or(
+            VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic material index is out of bounds",
+            },
+        )?;
+        *transforms = uv_transforms;
+        Ok(())
+    }
+
+    /// Replaces the base and overlay specular records used by the vertex
+    /// Gouraud lighting path.  RGB values remain normalized; powers retain
+    /// the native MAT0 byte and are encoded as the fourth float in each GPU
+    /// record.
+    pub fn set_material_specular(
+        &mut self,
+        material_index: usize,
+        specular_rgb: [f32; 3],
+        power: u8,
+        overlay_specular_rgb: Option<[f32; 3]>,
+        overlay_power: Option<u8>,
+    ) -> Result<(), VulkanSmokeRendererError> {
+        if specular_rgb
+            .into_iter()
+            .chain(overlay_specular_rgb.into_iter().flatten())
+            .any(|value| !value.is_finite() || value < 0.0)
+        {
+            return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic material specular RGB must be finite and non-negative",
+            });
+        }
+        let specular = self.material_specular.get_mut(material_index).ok_or(
+            VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic material index is out of bounds",
+            },
+        )?;
+        let overlay_rgb = overlay_specular_rgb.unwrap_or([0.0; 3]);
+        let next = [
+            [
+                specular_rgb[0],
+                specular_rgb[1],
+                specular_rgb[2],
+                f32::from(power),
+            ],
+            [
+                overlay_rgb[0],
+                overlay_rgb[1],
+                overlay_rgb[2],
+                f32::from(overlay_power.unwrap_or(0)),
+            ],
+        ];
+        if *specular == next {
+            return Ok(());
+        }
+        *specular = next;
+        self.material_specular_dirty = true;
+        Ok(())
+    }
+
+    /// Rebinds one draw range to a positional material slot without
+    /// reallocating any vertex or descriptor resources.
+    pub fn set_draw_range_material(
+        &mut self,
+        range_index: usize,
+        material_index: usize,
+    ) -> Result<(), VulkanSmokeRendererError> {
+        let selector = *self.material_selectors.get(material_index).ok_or(
+            VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic material index is out of bounds",
+            },
+        )?;
+        let range = self.draw_ranges.get_mut(range_index).ok_or(
+            VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic draw range index is out of bounds",
+            },
+        )?;
+        range.material_index = selector;
+        let texture_index = self.draw_texture_indices.get_mut(range_index).ok_or(
+            VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic draw range index is out of bounds",
+            },
+        )?;
+        *texture_index = material_index;
         Ok(())
     }
 
@@ -434,9 +1238,12 @@ impl VulkanSmokeRenderer {
             return Ok(VulkanSmokeFrameOutcome::Recreated);
         }
 
-        let sync = &self.frame_sync[self.current_frame];
+        let sync = self.frame_sync.get(self.current_frame).ok_or(
+            VulkanSmokeRendererError::InvariantViolation {
+                context: "frame synchronization state",
+            },
+        )?;
         let image_available = sync.image_available;
-        let render_finished = sync.render_finished;
         let in_flight_fence = sync.fence;
         // SAFETY: The fence belongs to this live logical device and is waited from one thread.
         unsafe {
@@ -448,6 +1255,27 @@ impl VulkanSmokeRenderer {
             context: "vkWaitForFences",
             result: error,
         })?;
+        if self.material_specular_dirty {
+            // The storage buffer is shared by all in-flight frames.  Wait for
+            // every prior use before replacing the records so a setter cannot
+            // race a vertex shader from the previous frame.
+            // SAFETY: The renderer owns the logical device and no submission
+            // can observe the host write after this idle point.
+            unsafe { self.device_ref()?.device().device_wait_idle() }.map_err(|result| {
+                VulkanSmokeRendererError::VulkanOperation {
+                    context: "vkDeviceWaitIdle(material specular update)",
+                    result,
+                }
+            })?;
+            let resources = self.resources_ref()?;
+            write_material_specular_buffer(
+                self.device_ref()?,
+                &resources.material_specular_buffer,
+                resources.material_specular_stride,
+                &self.material_specular,
+            )?;
+            self.material_specular_dirty = false;
+        }
         // SAFETY: The swapchain, semaphore and fence inputs are live for the duration of the acquire call.
         let acquire = unsafe {
             self.swapchain_ref()?.loader().acquire_next_image(
@@ -485,6 +1313,26 @@ impl VulkanSmokeRenderer {
             })?;
         }
         self.images_in_flight[image_index_usize] = in_flight_fence;
+        let frame_bytes = self.frame_uniforms.to_ne_bytes();
+        let resources = self.resources_ref()?;
+        write_frame_uniform(
+            self.device_ref()?,
+            &resources.frame_uniform_buffer,
+            resources.frame_uniform_stride,
+            self.current_frame,
+            &frame_bytes,
+        )?;
+        let render_finished = self
+            .resources_ref()?
+            .render_finished
+            .get(image_index_usize)
+            .copied()
+            .ok_or(VulkanSmokeRendererError::InvariantViolation {
+                context: "render-finished semaphore for swapchain image",
+            })?;
+        self.record_command_buffer(image_index_usize)?;
+        // Reset only after recording succeeds. A recording error leaves the
+        // signaled fence available for the next recovery attempt.
         // SAFETY: The fence belongs to this frame context and is not in use after the wait above.
         unsafe { self.device_ref()?.device().reset_fences(&[in_flight_fence]) }.map_err(
             |error| VulkanSmokeRendererError::VulkanOperation {
@@ -492,8 +1340,6 @@ impl VulkanSmokeRenderer {
                 result: error,
             },
         )?;
-
-        self.record_command_buffer(image_index_usize)?;
         let wait_semaphores = [image_available];
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
         let command_buffers = [self.resources_ref()?.command_buffers[image_index_usize]];
@@ -515,7 +1361,7 @@ impl VulkanSmokeRenderer {
             context: "vkQueueSubmit",
             result: error,
         })?;
-        if !self.resources_ref()?.readback_buffers.is_empty() {
+        if self.readback_enabled && !self.resources_ref()?.readback_buffers.is_empty() {
             self.report.readback_copy_count = self.report.readback_copy_count.saturating_add(1);
             self.last_readback_image_index = Some(image_index_usize);
         }
@@ -607,6 +1453,7 @@ impl VulkanSmokeRenderer {
                 self.vertex_buffer_ref()?,
                 self.index_buffer_ref()?,
                 self.textures_ref()?,
+                &self.texture_slot_indices,
                 &self.draw_ranges,
                 self.depth_request,
                 reuse_command_pool,
@@ -621,6 +1468,7 @@ impl VulkanSmokeRenderer {
         self.images_in_flight = vec![vk::Fence::null(); resources.image_views.len()];
         self.frame_sync = frame_sync;
         self.last_readback_image_index = None;
+        self.material_specular_dirty = true;
         self.report.swapchain_extent = swapchain_extent;
         self.report.swapchain_image_count = swapchain_image_count;
         self.report.swapchain_image_format = self.swapchain_ref()?.report.plan.format.format;
@@ -629,10 +1477,54 @@ impl VulkanSmokeRenderer {
         Ok(())
     }
 
+    /// Rebuilds only the swapchain-owned pipeline bundle after a structural
+    /// range-state change.  Draw-range setters can be called while a renderer
+    /// is live, so all prior submissions are completed before handles are
+    /// destroyed and recreated.
+    fn rebuild_pipeline_resources(&mut self) -> Result<(), VulkanSmokeRendererError> {
+        if self.swapchain_resources.is_none() {
+            return Ok(());
+        }
+        let device = self.device_ref()?;
+        // SAFETY: The renderer owns every submission on this device.  Waiting
+        // here makes the old pipelines, framebuffers, and command buffers
+        // quiescent before their destruction.
+        unsafe { device.device().device_wait_idle() }.map_err(|result| {
+            VulkanSmokeRendererError::VulkanOperation {
+                context: "vkDeviceWaitIdle(draw range pipeline update)",
+                result,
+            }
+        })?;
+        self.destroy_swapchain_resources();
+        self.rebuild_swapchain_resources(true)
+    }
+
+    /// Recomputes the stable command-recording order.  Only ranges explicitly
+    /// marked transparent are reordered, and they remain in the slots occupied
+    /// by that queue.  This preserves the caller's fixed sky/screen/weather
+    /// pass order while matching the native descending key comparator for the
+    /// world transparent queue.
+    fn rebuild_draw_order(&mut self) {
+        let range_count = self.draw_ranges.len();
+        if self.draw_order.len() != range_count {
+            self.draw_order = (0..range_count).collect();
+        }
+        self.draw_order = sorted_world_draw_order(
+            range_count,
+            &self.draw_ranges,
+            &self.draw_range_world_queue,
+            &self.draw_range_sort_keys,
+        );
+    }
+
     fn record_command_buffer(
         &mut self,
         image_index: usize,
     ) -> Result<(), VulkanSmokeRendererError> {
+        if self.draw_order_dirty {
+            self.rebuild_draw_order();
+            self.draw_order_dirty = false;
+        }
         let device = self.device_ref()?;
         let swapchain = self.swapchain_ref()?;
         let resources = self.resources_ref()?;
@@ -702,15 +1594,17 @@ impl VulkanSmokeRenderer {
                 0,
                 vk::IndexType::UINT32,
             );
-            let clip_from_world = matrix_bytes(self.camera.clip_from_world);
-            device.device().cmd_push_constants(
-                command_buffer,
-                resources.pipeline_layout,
-                vk::ShaderStageFlags::VERTEX,
-                0,
-                &clip_from_world,
-            );
-            for (range, &texture_index) in self.draw_ranges.iter().zip(&self.draw_texture_indices) {
+            for &range_index in &self.draw_order {
+                let range = self.draw_ranges.get(range_index).ok_or(
+                    VulkanSmokeRendererError::InvariantViolation {
+                        context: "stable draw order range handle",
+                    },
+                )?;
+                let texture_index = *self.draw_texture_indices.get(range_index).ok_or(
+                    VulkanSmokeRendererError::InvariantViolation {
+                        context: "stable draw texture range handle",
+                    },
+                )?;
                 let pipeline = resources.pipelines.get(&range.pipeline_key()).ok_or(
                     VulkanSmokeRendererError::InvariantViolation {
                         context: "static draw pipeline variant",
@@ -721,6 +1615,18 @@ impl VulkanSmokeRenderer {
                     vk::PipelineBindPoint::GRAPHICS,
                     *pipeline,
                 );
+                let frame_offset = u32::try_from(
+                    resources
+                        .frame_uniform_stride
+                        .saturating_mul(u64::try_from(self.current_frame).unwrap_or(u64::MAX)),
+                )
+                .unwrap_or(u32::MAX);
+                let material_offset = u32::try_from(
+                    resources
+                        .material_specular_stride
+                        .saturating_mul(u64::try_from(texture_index).unwrap_or(u64::MAX)),
+                )
+                .unwrap_or(u32::MAX);
                 let descriptor_set = resources.descriptor_sets.get(texture_index).ok_or(
                     VulkanSmokeRendererError::InvariantViolation {
                         context: "static material descriptor set",
@@ -732,15 +1638,79 @@ impl VulkanSmokeRenderer {
                     resources.pipeline_layout,
                     0,
                     std::slice::from_ref(descriptor_set),
-                    &[],
+                    &[frame_offset, material_offset],
                 );
                 let alpha_cutoff = range.alpha_test_cutoff().to_ne_bytes();
                 device.device().cmd_push_constants(
                     command_buffer,
                     resources.pipeline_layout,
-                    vk::ShaderStageFlags::FRAGMENT,
-                    64,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    0,
                     &alpha_cutoff,
+                );
+                let material_alpha = self.material_alphas.get(texture_index).ok_or(
+                    VulkanSmokeRendererError::InvariantViolation {
+                        context: "static material alpha",
+                    },
+                )?;
+                let material_alphas = [
+                    material_alpha[0].to_ne_bytes(),
+                    material_alpha[1].to_ne_bytes(),
+                ]
+                .concat();
+                device.device().cmd_push_constants(
+                    command_buffer,
+                    resources.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    4,
+                    &material_alphas,
+                );
+                let material_lighting = self.material_lighting.get(texture_index).ok_or(
+                    VulkanSmokeRendererError::InvariantViolation {
+                        context: "static material lighting",
+                    },
+                )?;
+                let material_lighting = material_lighting
+                    .iter()
+                    .flatten()
+                    .flat_map(|value| value.to_ne_bytes())
+                    .collect::<Vec<_>>();
+                device.device().cmd_push_constants(
+                    command_buffer,
+                    resources.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    12,
+                    &material_lighting,
+                );
+                let material_uv_transforms = self.material_uv_transforms.get(texture_index).ok_or(
+                    VulkanSmokeRendererError::InvariantViolation {
+                        context: "static material UV transforms",
+                    },
+                )?;
+                let material_uv_transforms = material_uv_transforms
+                    .iter()
+                    .flatten()
+                    .flat_map(|value| value.to_ne_bytes())
+                    .collect::<Vec<_>>();
+                device.device().cmd_push_constants(
+                    command_buffer,
+                    resources.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    60,
+                    &material_uv_transforms,
+                );
+                let unlit = self.material_unlit.get(texture_index).ok_or(
+                    VulkanSmokeRendererError::InvariantViolation {
+                        context: "static material unlit flag",
+                    },
+                )?;
+                let unlit = [unlit.to_ne_bytes()];
+                device.device().cmd_push_constants(
+                    command_buffer,
+                    resources.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                    124,
+                    &unlit.concat(),
                 );
                 device.device().cmd_draw_indexed(
                     command_buffer,
@@ -752,63 +1722,65 @@ impl VulkanSmokeRenderer {
                 );
             }
             device.device().cmd_end_render_pass(command_buffer);
-            if let (Some(image), Some(readback)) = (
-                resources.images.get(image_index),
-                resources.readback_buffers.get(image_index),
-            ) {
-                let range = super::color_subresource_range();
-                let to_transfer = vk::ImageMemoryBarrier::default()
-                    .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                    .image(*image)
-                    .subresource_range(range);
-                let back_to_present = vk::ImageMemoryBarrier::default()
-                    .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
-                    .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
-                    .src_access_mask(vk::AccessFlags::TRANSFER_READ)
-                    .dst_access_mask(vk::AccessFlags::empty())
-                    .image(*image)
-                    .subresource_range(range);
-                let region = vk::BufferImageCopy::default()
-                    .image_subresource(
-                        vk::ImageSubresourceLayers::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .mip_level(0)
-                            .base_array_layer(0)
-                            .layer_count(1),
-                    )
-                    .image_extent(vk::Extent3D {
-                        width: swapchain.report.plan.extent.0,
-                        height: swapchain.report.plan.extent.1,
-                        depth: 1,
-                    });
-                device.device().cmd_pipeline_barrier(
-                    command_buffer,
-                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[to_transfer],
-                );
-                device.device().cmd_copy_image_to_buffer(
-                    command_buffer,
-                    *image,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    readback.buffer,
-                    &[region],
-                );
-                device.device().cmd_pipeline_barrier(
-                    command_buffer,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[back_to_present],
-                );
+            if self.readback_enabled {
+                if let (Some(image), Some(readback)) = (
+                    resources.images.get(image_index),
+                    resources.readback_buffers.get(image_index),
+                ) {
+                    let range = super::color_subresource_range(1);
+                    let to_transfer = vk::ImageMemoryBarrier::default()
+                        .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                        .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                        .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                        .image(*image)
+                        .subresource_range(range);
+                    let back_to_present = vk::ImageMemoryBarrier::default()
+                        .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                        .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                        .src_access_mask(vk::AccessFlags::TRANSFER_READ)
+                        .dst_access_mask(vk::AccessFlags::empty())
+                        .image(*image)
+                        .subresource_range(range);
+                    let region = vk::BufferImageCopy::default()
+                        .image_subresource(
+                            vk::ImageSubresourceLayers::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .mip_level(0)
+                                .base_array_layer(0)
+                                .layer_count(1),
+                        )
+                        .image_extent(vk::Extent3D {
+                            width: swapchain.report.plan.extent.0,
+                            height: swapchain.report.plan.extent.1,
+                            depth: 1,
+                        });
+                    device.device().cmd_pipeline_barrier(
+                        command_buffer,
+                        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[to_transfer],
+                    );
+                    device.device().cmd_copy_image_to_buffer(
+                        command_buffer,
+                        *image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        readback.buffer,
+                        &[region],
+                    );
+                    device.device().cmd_pipeline_barrier(
+                        command_buffer,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[back_to_present],
+                    );
+                }
             }
         }
 
@@ -832,9 +1804,6 @@ impl VulkanSmokeRenderer {
                 device
                     .device()
                     .destroy_semaphore(sync.image_available, None);
-                device
-                    .device()
-                    .destroy_semaphore(sync.render_finished, None);
                 device.device().destroy_fence(sync.fence, None);
             }
         }
@@ -937,7 +1906,7 @@ impl VulkanSmokeRenderer {
             .ok_or(VulkanSmokeRendererError::InvalidStaticMesh {
                 context: "completed readback byte length",
             })?;
-        if resources.readback_buffers.is_empty() {
+        if !self.readback_enabled || resources.readback_buffers.is_empty() {
             return Ok(None);
         }
         let Some(image_index) = completed_readback_buffer_index(
@@ -986,14 +1955,6 @@ fn completed_readback_buffer_index(
     }
 }
 
-fn matrix_bytes(matrix: [f32; 16]) -> [u8; 64] {
-    let mut bytes = [0; 64];
-    for (index, value) in matrix.into_iter().enumerate() {
-        bytes[index * 4..(index + 1) * 4].copy_from_slice(&value.to_ne_bytes());
-    }
-    bytes
-}
-
 fn fnv1a64(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
@@ -1006,12 +1967,242 @@ impl Drop for VulkanSmokeRenderer {
     }
 }
 
+fn validate_geometry_upload(
+    vertices: &[super::VulkanStaticVertex],
+    indices: &[u32],
+    current_ranges: &[super::VulkanStaticDrawRange],
+    geometry_ranges: &[super::VulkanDynamicDrawRange],
+    retained_vertex_capacity: usize,
+    retained_index_capacity: usize,
+) -> Result<(), VulkanSmokeRendererError> {
+    if vertices.is_empty() || indices.is_empty() {
+        return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+            context: "dynamic mesh upload cannot have zero-sized geometry",
+        });
+    }
+    if !indices.len().is_multiple_of(3) {
+        return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+            context: "dynamic mesh index upload is not a triangle list",
+        });
+    }
+    if vertices.iter().any(|vertex| {
+        !vertex
+            .position
+            .iter()
+            .chain(vertex.color.iter())
+            .chain(vertex.normal.iter())
+            .chain(vertex.uv.iter())
+            .chain(vertex.detail_uv.iter())
+            .chain(std::iter::once(&vertex.overlay_alpha))
+            .all(|value| value.is_finite())
+            || !(0.0..=1.0).contains(&vertex.overlay_alpha)
+    }) {
+        return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+            context: "dynamic mesh vertex attributes must be finite and overlay alpha must be 0..1",
+        });
+    }
+    if indices.iter().any(|&index| {
+        usize::try_from(index)
+            .ok()
+            .is_none_or(|index| index >= vertices.len())
+    }) {
+        return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+            context: "dynamic mesh index exceeds vertex count",
+        });
+    }
+    if retained_vertex_capacity == 0 || retained_index_capacity == 0 {
+        return Err(VulkanSmokeRendererError::InvariantViolation {
+            context: "dynamic mesh retained allocation is empty",
+        });
+    }
+
+    let mut next_ranges = current_ranges.to_vec();
+    let mut changed = vec![false; current_ranges.len()];
+    for geometry in geometry_ranges {
+        if geometry.range_index >= current_ranges.len() {
+            return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic mesh range index is out of bounds",
+            });
+        }
+        if changed[geometry.range_index] {
+            return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic mesh range is updated more than once",
+            });
+        }
+        changed[geometry.range_index] = true;
+        if geometry.first_index % 3 != 0 || geometry.index_count % 3 != 0 {
+            return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic mesh range is not triangle aligned",
+            });
+        }
+        let first = usize::try_from(geometry.first_index).map_err(|_| {
+            VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic mesh range first index exceeds address space",
+            }
+        })?;
+        let count = usize::try_from(geometry.index_count).map_err(|_| {
+            VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic mesh range index count exceeds address space",
+            }
+        })?;
+        let end = first
+            .checked_add(count)
+            .ok_or(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic mesh range exceeds address space",
+            })?;
+        if end > indices.len() {
+            return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic mesh range exceeds uploaded indices",
+            });
+        }
+        next_ranges[geometry.range_index].first_index = geometry.first_index;
+        next_ranges[geometry.range_index].index_count = geometry.index_count;
+    }
+
+    for range in next_ranges {
+        if range.first_index % 3 != 0 || range.index_count % 3 != 0 {
+            return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "retained dynamic mesh range is not triangle aligned",
+            });
+        }
+        let first = usize::try_from(range.first_index).map_err(|_| {
+            VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "retained dynamic mesh range first index exceeds address space",
+            }
+        })?;
+        let count = usize::try_from(range.index_count).map_err(|_| {
+            VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "retained dynamic mesh range index count exceeds address space",
+            }
+        })?;
+        let end = first
+            .checked_add(count)
+            .ok_or(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "retained dynamic mesh range exceeds address space",
+            })?;
+        if end > indices.len() {
+            return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "retained dynamic mesh range exceeds uploaded indices",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn apply_geometry_range_updates(
+    ranges: &mut [super::VulkanStaticDrawRange],
+    capacities: &mut [u32],
+    geometry_ranges: &[super::VulkanDynamicDrawRange],
+) {
+    for geometry in geometry_ranges {
+        // `validate_geometry_upload` has already checked every handle. Keep
+        // this helper infallible so state is changed only after the Vulkan
+        // upload succeeds.
+        let range = &mut ranges[geometry.range_index];
+        range.first_index = geometry.first_index;
+        range.index_count = geometry.index_count;
+        // A moved segment no longer owns the old tail. Keeping the previous
+        // range capacity would let a later count setter read indices from a
+        // different segment. The shared GPU allocation itself remains
+        // retained; this is the logical capacity of this range's segment.
+        capacities[geometry.range_index] = geometry.index_count;
+    }
+}
+
+/// Replays the native queue construction from the original stable range
+/// order. Fixed passes stay in their original slots; world opaque ranges are
+/// emitted first, followed by world transparent ranges inserted by descending
+/// camera distance. Zero-index-count ranges are inactive and are omitted.
+fn sorted_world_draw_order(
+    range_count: usize,
+    ranges: &[super::VulkanStaticDrawRange],
+    world_queue: &[Option<bool>],
+    keys: &[Option<f32>],
+) -> Vec<usize> {
+    let mut next = (0..range_count).collect::<Vec<_>>();
+    let mut world_opaque = Vec::new();
+    let mut world_transparent = Vec::new();
+    for range_index in 0..range_count {
+        if ranges
+            .get(range_index)
+            .is_none_or(|range| range.index_count == 0)
+        {
+            continue;
+        }
+        match world_queue.get(range_index).copied().flatten() {
+            Some(false) => world_opaque.push(range_index),
+            Some(true) => world_transparent.push(range_index),
+            None => {}
+        }
+    }
+
+    // Native equal-key insertion is a midpoint insertion rather than a
+    // documented stable sort. Replay that insertion shape from original range
+    // order instead of repeatedly sorting the previous frame's order.
+    let mut ordered_transparent = Vec::with_capacity(world_transparent.len());
+    for range_index in world_transparent {
+        let new_key = keys.get(range_index).and_then(|key| *key);
+        let mut low = 0usize;
+        let mut high = ordered_transparent.len().saturating_sub(1);
+        while high > low {
+            let middle = low + (high - low) / 2;
+            let existing_key = keys.get(ordered_transparent[middle]).and_then(|key| *key);
+            match (new_key, existing_key) {
+                (Some(new_key), Some(existing_key)) if new_key > existing_key => high = middle,
+                (Some(new_key), Some(existing_key)) if new_key < existing_key => low = middle + 1,
+                (Some(_), Some(_)) => {
+                    low = middle;
+                    break;
+                }
+                (Some(_), None) => high = middle,
+                (None, Some(_)) => low = middle + 1,
+                (None, None) => {
+                    low = middle;
+                    break;
+                }
+            }
+        }
+        if !ordered_transparent.is_empty() && high == low {
+            let existing_key = keys.get(ordered_transparent[low]).and_then(|key| *key);
+            let insert_after = match (new_key, existing_key) {
+                (Some(new_key), Some(existing_key)) => new_key < existing_key,
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            if insert_after {
+                low += 1;
+            }
+        }
+        ordered_transparent.insert(low, range_index);
+    }
+
+    let mut world_order = world_opaque;
+    world_order.extend(ordered_transparent);
+    let mut world_cursor = 0usize;
+    for slot in &mut next {
+        if world_queue.get(*slot).copied().flatten().is_some()
+            && ranges
+                .get(*slot)
+                .is_some_and(|range| range.index_count != 0)
+        {
+            if let Some(&replacement) = world_order.get(world_cursor) {
+                *slot = replacement;
+                world_cursor += 1;
+            }
+        }
+    }
+    next
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::{VulkanDynamicDrawRange, VulkanStaticDrawRange, VulkanStaticMesh};
     use super::{
-        completed_readback_buffer_index, take_runtime_children_with_validation_snapshot,
-        take_runtime_owners_in_dependency_order, RollbackOnDrop,
+        apply_geometry_range_updates, completed_readback_buffer_index, sorted_world_draw_order,
+        take_runtime_children_with_validation_snapshot, take_runtime_owners_in_dependency_order,
+        validate_geometry_upload, RollbackOnDrop,
     };
+    use fparkan_render::{LegacyBlendMode, LegacyDepthMode, LegacyPipelineState};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -1098,6 +2289,84 @@ mod tests {
         assert_eq!(completed_readback_buffer_index(None, 2), Ok(None));
         assert_eq!(completed_readback_buffer_index(Some(1), 2), Ok(Some(1)));
         assert!(completed_readback_buffer_index(Some(2), 2).is_err());
+    }
+
+    #[test]
+    fn geometry_updates_preserve_other_range_runtime_state() {
+        let base_state = LegacyPipelineState {
+            blend: LegacyBlendMode::SourceAlpha,
+            depth: LegacyDepthMode::TestReadOnly,
+            ..LegacyPipelineState::default()
+        };
+        let mut ranges = vec![
+            VulkanStaticDrawRange {
+                first_index: 0,
+                index_count: 3,
+                material_index: 7,
+                lightmap_index: 4,
+                batch_flags: 0x108,
+                pipeline_state: base_state,
+                alpha_test_reference: 17,
+            },
+            VulkanStaticDrawRange {
+                first_index: 3,
+                index_count: 3,
+                material_index: 9,
+                lightmap_index: u8::MAX,
+                batch_flags: 0,
+                pipeline_state: LegacyPipelineState::default(),
+                alpha_test_reference: 0,
+            },
+        ];
+        let original = ranges[0];
+        let mut capacities = vec![3, 3];
+        apply_geometry_range_updates(
+            &mut ranges,
+            &mut capacities,
+            &[VulkanDynamicDrawRange {
+                range_index: 1,
+                first_index: 3,
+                index_count: 9,
+            }],
+        );
+        assert_eq!(ranges[0], original);
+        assert_eq!(capacities, vec![3, 9]);
+        assert_eq!(ranges[1].first_index, 3);
+        assert_eq!(ranges[1].index_count, 9);
+
+        apply_geometry_range_updates(
+            &mut ranges,
+            &mut capacities,
+            &[VulkanDynamicDrawRange {
+                range_index: 1,
+                first_index: 3,
+                index_count: 3,
+            }],
+        );
+        assert_eq!(ranges[0], original);
+        assert_eq!(capacities, vec![3, 3]);
+        assert_eq!(ranges[1].index_count, 3);
+    }
+
+    #[test]
+    fn geometry_update_can_disable_empty_shadow_range_without_zero_sized_upload() {
+        let mesh = VulkanStaticMesh::smoke_triangle();
+        let geometry = [VulkanDynamicDrawRange {
+            range_index: 0,
+            first_index: 3,
+            index_count: 0,
+        }];
+        assert_eq!(
+            validate_geometry_upload(
+                &mesh.vertices,
+                &mesh.indices,
+                &mesh.draw_ranges,
+                &geometry,
+                3,
+                3,
+            ),
+            Ok(())
+        );
     }
 
     #[test]
@@ -1217,5 +2486,84 @@ mod tests {
         drop(tracker);
 
         assert_eq!(log.borrow().as_slice(), &[TeardownStep::Swapchain]);
+    }
+
+    #[test]
+    fn native_transparent_order_is_descending_and_keeps_fixed_pass_slots() {
+        let ranges = (0..5)
+            .map(|_| super::super::VulkanStaticDrawRange {
+                first_index: 0,
+                index_count: 3,
+                material_index: 0,
+                lightmap_index: u8::MAX,
+                batch_flags: 0,
+                pipeline_state: fparkan_render::LegacyPipelineState::default(),
+                alpha_test_reference: 0,
+            })
+            .collect::<Vec<_>>();
+        let order = sorted_world_draw_order(
+            5,
+            &ranges,
+            &[None, Some(true), None, Some(true), Some(false)],
+            &[None, Some(2.0), None, Some(9.0), Some(-3.0)],
+        );
+        assert_eq!(order, vec![0, 4, 2, 3, 1]);
+    }
+
+    #[test]
+    fn inactive_world_range_is_not_reused_as_a_sort_slot() {
+        let ranges = vec![
+            super::super::VulkanStaticDrawRange {
+                first_index: 0,
+                index_count: 3,
+                material_index: 0,
+                lightmap_index: u8::MAX,
+                batch_flags: 0,
+                pipeline_state: fparkan_render::LegacyPipelineState::default(),
+                alpha_test_reference: 0,
+            },
+            super::super::VulkanStaticDrawRange {
+                first_index: 3,
+                index_count: 0,
+                material_index: 0,
+                lightmap_index: u8::MAX,
+                batch_flags: 0,
+                pipeline_state: fparkan_render::LegacyPipelineState::default(),
+                alpha_test_reference: 0,
+            },
+            super::super::VulkanStaticDrawRange {
+                first_index: 3,
+                index_count: 3,
+                material_index: 0,
+                lightmap_index: u8::MAX,
+                batch_flags: 0,
+                pipeline_state: fparkan_render::LegacyPipelineState::default(),
+                alpha_test_reference: 0,
+            },
+        ];
+        let order = sorted_world_draw_order(
+            3,
+            &ranges,
+            &[None, Some(true), Some(true)],
+            &[None, Some(100.0), Some(1.0)],
+        );
+        assert_eq!(order, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn native_equal_key_insertion_uses_inclusive_midpoint() {
+        let ranges = (0..4)
+            .map(|index| super::super::VulkanStaticDrawRange {
+                first_index: index * 3,
+                index_count: 3,
+                material_index: 0,
+                lightmap_index: u8::MAX,
+                batch_flags: 0,
+                pipeline_state: fparkan_render::LegacyPipelineState::default(),
+                alpha_test_reference: 0,
+            })
+            .collect::<Vec<_>>();
+        let order = sorted_world_draw_order(4, &ranges, &[Some(true); 4], &[Some(1.0); 4]);
+        assert_eq!(order, vec![2, 3, 1, 0]);
     }
 }

@@ -43,16 +43,18 @@ pub struct CompactSurfaceMask(pub u16);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MaterialClassMask(pub u8);
 
-/// The two positional material-table selectors packed into a terrain face tag.
+/// The base and overlay selectors packed into a terrain face tag.
 ///
-/// The high byte selects from map-local `Land1.wea`; `0xff` is the observed
-/// no-selection sentinel. The low byte selects from `Land2.wea`.
+/// Both selectors address the map-local `Land1.wea` table. The low byte is
+/// always the base row; the high byte is an optional overlay row and uses
+/// `0xff` as its no-overlay sentinel. `Land2.wea` is a separate detail bank
+/// selected by the corresponding detail path.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TerrainMaterialLayers {
-    /// Optional high-byte selector for `Land1.wea`.
-    pub land1_selector: Option<u8>,
-    /// Low-byte selector for `Land2.wea`.
-    pub land2_selector: u8,
+    /// Low-byte base selector for `Land1.wea`.
+    pub base_selector: u8,
+    /// Optional high-byte overlay selector for `Land1.wea`.
+    pub overlay_selector: Option<u8>,
 }
 
 /// One `World3D` material-manager lookup key.
@@ -79,30 +81,55 @@ impl TerrainMaterialLayers {
     /// Constructs the decoded pair from its on-disk packed tag.
     #[must_use]
     pub const fn from_packed_tag(material_tag: u16) -> Self {
-        let [land2_selector, land1] = material_tag.to_le_bytes();
+        let [base_selector, overlay] = material_tag.to_le_bytes();
         Self {
-            land1_selector: if land1 == u8::MAX { None } else { Some(land1) },
-            land2_selector,
+            base_selector,
+            overlay_selector: if overlay == u8::MAX {
+                None
+            } else {
+                Some(overlay)
+            },
         }
     }
 
-    /// Returns the table-zero `Land1.wea` selection when it exists.
+    /// Returns the base selection from `Land1.wea`.
     #[must_use]
-    pub fn land1_selection(self) -> Option<TerrainMaterialSelection> {
-        self.land1_selector
+    pub fn base_selection(self) -> TerrainMaterialSelection {
+        TerrainMaterialSelection {
+            table_index: 0,
+            material_index: u16::from(self.base_selector),
+        }
+    }
+
+    /// Returns the optional overlay selection from `Land1.wea`.
+    #[must_use]
+    pub fn overlay_selection(self) -> Option<TerrainMaterialSelection> {
+        self.overlay_selector
             .map(|material_index| TerrainMaterialSelection {
                 table_index: 0,
                 material_index: u16::from(material_index),
             })
     }
 
-    /// Returns the table-one `Land2.wea` selection.
+    /// Returns the detail selection corresponding to the base row in
+    /// `Land2.wea`.
     #[must_use]
-    pub fn land2_selection(self) -> TerrainMaterialSelection {
+    pub fn detail_base_selection(self) -> TerrainMaterialSelection {
         TerrainMaterialSelection {
             table_index: 1,
-            material_index: u16::from(self.land2_selector),
+            material_index: u16::from(self.base_selector),
         }
+    }
+
+    /// Returns the optional detail selection corresponding to the overlay row
+    /// in `Land2.wea`.
+    #[must_use]
+    pub fn detail_overlay_selection(self) -> Option<TerrainMaterialSelection> {
+        self.overlay_selector
+            .map(|material_index| TerrainMaterialSelection {
+                table_index: 1,
+                material_index: u16::from(material_index),
+            })
     }
 }
 
@@ -231,7 +258,7 @@ pub struct LandMeshDocument {
     /// Packed normals from type 4.
     pub normals: Vec<[i8; 4]>,
     /// Packed UV from type 5.
-    pub uv0: Vec<[i16; 2]>,
+    pub uv0: Vec<[u16; 2]>,
     /// Type 11 accelerator words.
     pub accelerator: Vec<[u8; 4]>,
     /// Type 14 auxiliary words.
@@ -631,7 +658,7 @@ pub fn decode_land_msh(nres: &NresDocument) -> Result<LandMeshDocument, TerrainF
     validate_slots(nres, slots)?;
     let positions = parse_positions(nres, positions)?;
     let normals = parse_i8x4_stream(nres, TYPE_NORMALS, normals)?;
-    let uv0 = parse_i16x2_stream(nres, TYPE_UV0, uv0)?;
+    let uv0 = parse_u16x2_stream(nres, TYPE_UV0, uv0)?;
     let accelerator = parse_word_stream(nres, TYPE_ACCELERATOR, accelerator)?;
     let aux14 = parse_word_stream(nres, TYPE_AUX14, aux14)?;
     let aux18 = parse_word_stream(nres, TYPE_AUX18, aux18)?;
@@ -683,6 +710,11 @@ pub fn decode_land_map(nres: &NresDocument) -> Result<LandMapDocument, TerrainFo
     let payload = nres.payload(entry.id())?;
     let areal_count =
         usize::try_from(meta.attr1).map_err(|_| TerrainFormatError::IntegerOverflow)?;
+    checked_count_bytes(
+        u64::from(meta.attr1),
+        u64::try_from(AREAL_PREFIX_SIZE).map_err(|_| TerrainFormatError::IntegerOverflow)?,
+        payload.len() as u64,
+    )?;
     let mut cursor = Cursor::new(payload);
     let mut areals = Vec::with_capacity(areal_count);
     for area_index in 0..areal_count {
@@ -1072,11 +1104,11 @@ fn parse_i8x4_stream(
         .collect())
 }
 
-fn parse_i16x2_stream(
+fn parse_u16x2_stream(
     nres: &NresDocument,
     type_id: u32,
     payload: &[u8],
-) -> Result<Vec<[i16; 2]>, TerrainFormatError> {
+) -> Result<Vec<[u16; 2]>, TerrainFormatError> {
     if !payload.len().is_multiple_of(4) {
         return Err(TerrainFormatError::InvalidSize {
             type_id,
@@ -1088,7 +1120,7 @@ fn parse_i16x2_stream(
     validate_stream(nres, type_id, 4, count)?;
     let mut out = Vec::with_capacity(count);
     for chunk in payload.chunks_exact(4) {
-        out.push([read_i16(chunk, 0)?, read_i16(chunk, 2)?]);
+        out.push([read_u16(chunk, 0)?, read_u16(chunk, 2)?]);
     }
     Ok(out)
 }
@@ -1311,6 +1343,7 @@ fn parse_areal_grid(
     if cell_count == 0 {
         return Err(TerrainFormatError::InvalidGridSize { cells_x, cells_y });
     }
+    checked_count_bytes(u64::from(cell_count), 2, cursor.remaining() as u64)?;
     let cell_count_usize =
         usize::try_from(cell_count).map_err(|_| TerrainFormatError::IntegerOverflow)?;
     let mut cells = Vec::with_capacity(cell_count_usize);
@@ -1362,13 +1395,6 @@ fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, TerrainFormatError> {
         .get(offset..offset + 2)
         .ok_or(TerrainFormatError::IntegerOverflow)?;
     Ok(u16::from_le_bytes([raw[0], raw[1]]))
-}
-
-fn read_i16(bytes: &[u8], offset: usize) -> Result<i16, TerrainFormatError> {
-    let raw = bytes
-        .get(offset..offset + 2)
-        .ok_or(TerrainFormatError::IntegerOverflow)?;
-    Ok(i16::from_le_bytes([raw[0], raw[1]]))
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, TerrainFormatError> {
@@ -1574,7 +1600,7 @@ mod tests {
     }
 
     #[test]
-    fn terrain_material_tag_decodes_two_sidecar_selectors() {
+    fn terrain_material_tag_decodes_base_overlay_and_detail_selectors() {
         let mut raw_face = face([0, 1, 2], [None, None, None]);
         raw_face[4..6].copy_from_slice(&0x0102_u16.to_le_bytes());
         let nres = decode_nres(&minimal_land_msh(&raw_face)).expect("nres");
@@ -1583,23 +1609,39 @@ mod tests {
         assert_eq!(
             document.faces[0].material_layers(),
             TerrainMaterialLayers {
-                land1_selector: Some(1),
-                land2_selector: 2,
+                base_selector: 2,
+                overlay_selector: Some(1),
             }
         );
         assert_eq!(
-            document.faces[0].material_layers().land1_selection(),
-            Some(TerrainMaterialSelection {
+            document.faces[0].material_layers().base_selection(),
+            TerrainMaterialSelection {
                 table_index: 0,
-                material_index: 1,
-            })
+                material_index: 2,
+            }
         );
         assert_eq!(
             document.faces[0]
                 .material_layers()
-                .land2_selection()
+                .overlay_selection()
+                .expect("overlay")
+                .phase_key(),
+            0x0000_0001
+        );
+        assert_eq!(
+            document.faces[0]
+                .material_layers()
+                .detail_base_selection()
                 .phase_key(),
             0x0001_0002
+        );
+        assert_eq!(
+            document.faces[0]
+                .material_layers()
+                .detail_overlay_selection()
+                .expect("detail overlay")
+                .phase_key(),
+            0x0001_0001
         );
 
         raw_face[4..6].copy_from_slice(&0xff03_u16.to_le_bytes());
@@ -1608,17 +1650,27 @@ mod tests {
         assert_eq!(
             document.faces[0].material_layers(),
             TerrainMaterialLayers {
-                land1_selector: None,
-                land2_selector: 3,
+                base_selector: 3,
+                overlay_selector: None,
             }
         );
-        assert_eq!(document.faces[0].material_layers().land1_selection(), None);
         assert_eq!(
-            document.faces[0].material_layers().land2_selection(),
+            document.faces[0].material_layers().base_selection(),
             TerrainMaterialSelection {
-                table_index: 1,
+                table_index: 0,
                 material_index: 3,
             }
+        );
+        assert_eq!(
+            document.faces[0].material_layers().overlay_selection(),
+            None
+        );
+        assert_eq!(
+            document.faces[0]
+                .material_layers()
+                .detail_base_selection()
+                .phase_key(),
+            0x0001_0003
         );
     }
 
@@ -1635,6 +1687,21 @@ mod tests {
         assert_eq!(document.grid.cells_y, 1);
         assert_eq!(document.grid.cells[0].area_ids, [0]);
         assert_eq!(document.grid.compact_cells, [0x0040_0000]);
+    }
+
+    #[test]
+    fn land_map_bounds_area_and_grid_reservations_by_payload() {
+        let empty = build_nres(&[entry(TYPE_AREAL_MAP, u32::MAX, 0, &[])]);
+        let nres = decode_nres(&empty).expect("nres");
+        assert!(decode_land_map(&nres).is_err());
+
+        let mut payload = Vec::new();
+        push_areal_prefix(&mut payload, 0, 0);
+        push_u32(&mut payload, 65_535);
+        push_u32(&mut payload, 65_535);
+        let bytes = build_nres(&[entry(TYPE_AREAL_MAP, 1, 0, &payload)]);
+        let nres = decode_nres(&bytes).expect("nres");
+        assert!(decode_land_map(&nres).is_err());
     }
 
     #[test]

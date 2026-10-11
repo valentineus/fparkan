@@ -38,13 +38,9 @@ MAT0 имеет type ID `0x3054414D`, обычно расположен в `Mate
 
 ```c
 #pragma pack(push, 1)
-struct Mat0PrefixV4Plus {
+struct Mat0Header {
     uint16_t phase_count;
     uint16_t animation_block_count;
-    uint8_t  metadata_a;
-    uint8_t  metadata_b;
-    uint32_t metadata_c_raw;
-    uint32_t metadata_d_raw;
 };
 
 struct Phase34 {
@@ -54,8 +50,78 @@ struct Phase34 {
 #pragma pack(pop)
 ```
 
-Versioned fields читаются только если версия их содержит. Для старых версий
-используются runtime defaults, а raw values сохраняются.
+`attr1` читается из NRes entry metadata и сохраняется вместе с разрешённым
+материалом. Это runtime flags материала; его нельзя путать с `attr2`, который
+задаёт версию payload. Versioned prefix bytes читаются только если версия их
+содержит, а raw values сохраняются для последующих слоёв.
+
+### Pipeline category
+
+Call site извлекает native category как `(attr1 >> 2) & 0xF` и передаёт её в
+`LegacyPipelineState::with_material_category`. Таблица содержит пять
+подтверждённых категорий; helper возвращает `None` для остальных значений и не
+меняет уже выбранные depth и cull state.
+
+| category | source/destination colour factors | alpha test |
+| ---: | --- | --- |
+| 0 | `ONE / ZERO`, blending disabled | disabled |
+| 1 | `SRC_ALPHA / INV_SRC_ALPHA` | enabled, `GREATER_EQUAL` |
+| 2 | `SRC_ALPHA / ONE` | enabled, `GREATER_EQUAL` |
+| 3 | `ZERO / SRC_COLOR` | enabled, `GREATER_EQUAL` |
+| 4 | `DEST_COLOR / SRC_COLOR` | enabled, `GREATER_EQUAL` |
+
+The mapping comes from the native five render-state pairs selected by the
+material category. Alpha reference remains draw-range data, while the Vulkan
+pipeline key includes the blend mode, depth mode, cull mode and alpha-test
+variant so ranges with different native state do not share a pipeline.
+
+Каждая phase занимает 34 байта: 18 parameter bytes и 16-byte C string имени
+текстуры. Loader переводит параметры в коэффициенты так:
+
+| bytes | runtime value |
+| --- | --- |
+| `p0..p2` | additive RGB, `p / 255` |
+| `p3` | opacity, `p * 0.01` |
+| `p4..p7` | directional values, `p / 255` |
+| `p8..p11` | specular values, `p / 255` |
+| `p12..p15` | extra values, `p / 255` |
+| `p16` | integer power |
+| `p17` | signed TEXM page index |
+
+Texture name и page index выбираются из текущей phase. Они не смешиваются с
+соседней phase.
+
+## Animation
+
+После phase table идут `animation_block_count` плотных блоков. Каждый блок имеет
+`u32 header_raw`, `u16 key_count`, затем `key_count` записей по три `u16`:
+
+```text
+u32 header_raw
+u16 key_count
+repeat key_count:
+    u16 phase_index
+    u16 end_time_ms
+    u16 raw_k2
+```
+
+`header_raw & 7` задаёт режим: `0` loop, `1` ping-pong, `2` clamp, `3`
+random-per-query. Значения `4..7` сохраняются как unknown. `header_raw >> 3`
+является interpolation mask: bits `1`, `2`, `4`, `8` смешивают группы
+`p0..p2`, `p4..p6`, `p8..p10`, `p12..p14`, а bit `16` смешивает `p3`.
+Компоненты `p7`, `p11`, `p15`, `p16` и `p17` копируются из текущей phase.
+
+Время для блока вычисляется как `clock_ms - wear_row_start_ms` с wrapping
+`u32` subtraction. Для loop берётся остаток от последнего `end_time_ms`, для
+ping-pong нечётный цикл идёт в обратном направлении, clamp после duration
+выбирает последнюю phase, а random-per-query использует переданное случайное
+значение по модулю duration. Ключ выбирается по интервалу
+`previous_end <= local_time < end_time`; следующий ключ циклически замыкается на
+первый. На ping-pong turnaround и clamp после duration native routine проходит
+общий float interpolation path, включая unsigned subtraction endpoint arithmetic;
+это может дать extrapolated coefficients при ненулевой mask. Переданный в
+sampler `animation_block_index` уже выбран вызывающим runtime из block table;
+packed WEAR handle и номер строки WEAR являются отдельными значениями.
 
 ## Fallback
 

@@ -1,15 +1,23 @@
 //! Format-to-GPU geometry bridge for the initial static asset renderer.
 
 use crate::{VulkanStaticDrawRange, VulkanStaticMesh, VulkanStaticVertex};
+use fparkan_animation::{NodePoseBuffer, Pose};
 use fparkan_msh::{
     draw_batches, node38_fallback_hierarchy, node38_sampled_hierarchy, selected_slot, Group, Lod,
     ModelAsset, NodeId,
 };
-use fparkan_render::{LegacyIron3dEulerTransform, LegacyPipelineState};
+use fparkan_render::{LegacyDepthMode, LegacyIron3dEulerTransform, LegacyPipelineState};
 use fparkan_terrain_format::LandMeshDocument;
 
 /// Legacy `Land.msh` stored-height to mission-world-height scale.
 const LEGACY_LAND_HEIGHT_SCALE: f32 = 1.0 / 32.0;
+
+fn world_pipeline_state() -> LegacyPipelineState {
+    LegacyPipelineState {
+        depth: LegacyDepthMode::TestWrite,
+        ..LegacyPipelineState::default()
+    }
+}
 
 /// Error returned when a validated MSH cannot enter the current static GPU path.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -22,6 +30,22 @@ pub enum VulkanAssetMeshError {
     DegenerateViewExtent,
     /// The indexed model exceeds the current 16-bit Vulkan input contract.
     IndexOutOfRange,
+    /// A caller-supplied node pose buffer has a different length than its model.
+    NodePoseCountMismatch {
+        /// Number of nodes in the model.
+        expected: usize,
+        /// Number of supplied node poses.
+        actual: usize,
+    },
+}
+
+/// Evaluated world pose of one standard Node38 node in model-local space.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VulkanNodePose {
+    /// Translation in the model's local coordinate system.
+    pub translation: [f32; 3],
+    /// Unit quaternion in `[x, y, z, w]` order.
+    pub rotation: [f32; 4],
 }
 
 /// Shared XY frame for a deliberately top-down diagnostic static scene.
@@ -83,6 +107,10 @@ impl std::fmt::Display for VulkanAssetMeshError {
             Self::NonFinitePosition => write!(f, "MSH contains a non-finite position"),
             Self::DegenerateViewExtent => write!(f, "MSH has a degenerate XY view extent"),
             Self::IndexOutOfRange => write!(f, "MSH index exceeds the static Vulkan u16 contract"),
+            Self::NodePoseCountMismatch { expected, actual } => write!(
+                f,
+                "node pose buffer has {actual} poses, but the MSH has {expected} nodes"
+            ),
         }
     }
 }
@@ -153,8 +181,9 @@ pub fn project_msh_to_static_mesh_in_xy_frame(
                     frame.project(transformed)[1],
                     0.0,
                 ],
-                color: [0.82, 0.72, 0.31],
-                // Iron3D stores Res5 UV0 as signed fixed point with 1/1024 units.
+                color: [1.0, 1.0, 1.0],
+                normal: model_normal(model, index),
+                // Iron3D stores Res5 UV0 as unsigned fixed point with 1/1024 units.
                 // Models that omit this optional stream retain the static viewer's
                 // XY planar fallback instead of receiving fabricated raw UV values.
                 uv: model
@@ -164,6 +193,8 @@ pub fn project_msh_to_static_mesh_in_xy_frame(
                     .map_or(frame.planar_uv(transformed), |uv| {
                         [f32::from(uv[0]) / 1024.0, f32::from(uv[1]) / 1024.0]
                     }),
+                detail_uv: model_detail_uv(model, index),
+                overlay_alpha: 0.0,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -282,6 +313,17 @@ pub fn project_msh_to_static_mesh_in_world_space_with_transform(
     transform: LegacyIron3dEulerTransform,
     scale: [f32; 3],
 ) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
+    project_msh_to_static_mesh_in_world_space_with_transform_and_root_pose(
+        model, transform, scale, None,
+    )
+}
+
+fn project_msh_to_static_mesh_in_world_space_with_transform_and_root_pose(
+    model: &ModelAsset,
+    transform: LegacyIron3dEulerTransform,
+    scale: [f32; 3],
+    root_pose: Option<Pose>,
+) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
     if !transform
         .translation
         .iter()
@@ -300,12 +342,35 @@ pub fn project_msh_to_static_mesh_in_world_space_with_transform(
             if !position.iter().all(|value| value.is_finite()) {
                 return Err(VulkanAssetMeshError::NonFinitePosition);
             }
+            let local_position = root_pose.map_or(
+                Pose {
+                    translation: *position,
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                },
+                |root| {
+                    compose_pose(
+                        root,
+                        Pose {
+                            translation: *position,
+                            rotation: [0.0, 0.0, 0.0, 1.0],
+                        },
+                    )
+                },
+            );
             let position = transform
-                .try_transform_scaled_point(*position, scale)
+                .try_transform_scaled_point(local_position.translation, scale)
                 .ok_or(VulkanAssetMeshError::NonFinitePosition)?;
             Ok(VulkanStaticVertex {
                 position,
-                color: [0.82, 0.72, 0.31],
+                color: [1.0, 1.0, 1.0],
+                normal: transform_normal(
+                    transform,
+                    root_pose.map_or(model_normal(model, index), |root| {
+                        rotate_by_quaternion(model_normal(model, index), root.rotation)
+                    }),
+                    scale,
+                )
+                .ok_or(VulkanAssetMeshError::NonFinitePosition)?,
                 uv: model
                     .uv0
                     .as_ref()
@@ -313,6 +378,8 @@ pub fn project_msh_to_static_mesh_in_world_space_with_transform(
                     .map_or([0.0, 0.0], |uv| {
                         [f32::from(uv[0]) / 1024.0, f32::from(uv[1]) / 1024.0]
                     }),
+                detail_uv: model_detail_uv(model, index),
+                overlay_alpha: 0.0,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -347,6 +414,8 @@ pub fn project_msh_to_static_mesh_in_world_space_with_node_fallback_poses(
         transform,
         scale,
         node38_fallback_hierarchy(model),
+        None,
+        false,
     )
 }
 
@@ -372,6 +441,203 @@ pub fn project_msh_to_static_mesh_in_world_space_with_node_sampled_poses(
         transform,
         scale,
         node38_sampled_hierarchy(model, animation_frame),
+        None,
+        false,
+    )
+}
+
+/// Projects a Node38 model using a hierarchy sampled by the caller.
+///
+/// This keeps geometry in sync with any sockets or bounds that the caller
+/// derives from the same pose buffer.
+///
+/// # Errors
+///
+/// Returns [`VulkanAssetMeshError`] when source geometry or transforms cannot
+/// be represented by the current static Vulkan input contract.
+pub fn project_msh_to_static_mesh_in_world_space_with_node_pose_buffer(
+    model: &ModelAsset,
+    transform: LegacyIron3dEulerTransform,
+    scale: [f32; 3],
+    node_poses: &NodePoseBuffer,
+) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
+    project_msh_to_static_mesh_in_world_space_with_node_poses(
+        model,
+        transform,
+        scale,
+        Some(node_poses.clone()),
+        None,
+        false,
+    )
+}
+
+/// Projects a mounted Node38 model using a caller-sampled hierarchy and the
+/// parent socket pose derived from its own caller-sampled hierarchy.
+///
+/// # Errors
+///
+/// Returns [`VulkanAssetMeshError`] when source geometry or transforms cannot
+/// be represented by the current static Vulkan input contract.
+pub fn project_msh_to_static_mesh_in_world_space_with_node_pose_buffer_and_mount(
+    model: &ModelAsset,
+    transform: LegacyIron3dEulerTransform,
+    scale: [f32; 3],
+    node_poses: &NodePoseBuffer,
+    mount_pose: VulkanNodePose,
+) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
+    project_msh_to_static_mesh_in_world_space_with_node_poses(
+        model,
+        transform,
+        scale,
+        Some(node_poses.clone()),
+        Some(Pose {
+            translation: mount_pose.translation,
+            rotation: mount_pose.rotation,
+        }),
+        true,
+    )
+}
+
+/// Evaluates one Node38 node pose for a unit mount socket.
+#[must_use]
+pub fn node38_pose(
+    model: &ModelAsset,
+    animation_frame: Option<u16>,
+    node_index: usize,
+) -> Option<VulkanNodePose> {
+    node38_pose_with_root_replacement(model, animation_frame, node_index, false)
+}
+
+/// Evaluates one Node38 socket relative to a replacement root pose.
+///
+/// This is used when the model itself is already mounted: node zero belongs to
+/// the parent socket and must not be composed a second time.
+#[must_use]
+pub fn node38_pose_relative_to_root(
+    model: &ModelAsset,
+    animation_frame: Option<u16>,
+    node_index: usize,
+) -> Option<VulkanNodePose> {
+    node38_pose_with_root_replacement(model, animation_frame, node_index, true)
+}
+
+/// Returns one node's evaluated pose from an already sampled hierarchy.
+#[must_use]
+pub fn node38_pose_from_hierarchy(
+    hierarchy: &NodePoseBuffer,
+    node_index: usize,
+) -> Option<VulkanNodePose> {
+    node38_pose_value_from_hierarchy(hierarchy, node_index, false).map(vulkan_node_pose)
+}
+
+/// Returns a node's pose relative to a root pose that will be replaced by a
+/// parent socket.
+#[must_use]
+pub fn node38_pose_relative_to_root_from_hierarchy(
+    hierarchy: &NodePoseBuffer,
+    node_index: usize,
+) -> Option<VulkanNodePose> {
+    node38_pose_value_from_hierarchy(hierarchy, node_index, true).map(vulkan_node_pose)
+}
+
+fn node38_pose_value_from_hierarchy(
+    hierarchy: &NodePoseBuffer,
+    node_index: usize,
+    root_replaced: bool,
+) -> Option<Pose> {
+    let pose = *hierarchy.poses.get(node_index)?;
+    if !root_replaced {
+        return Some(pose);
+    }
+    if node_index == 0 {
+        return Some(Pose::default());
+    }
+    let root = *hierarchy.poses.first()?;
+    Some(compose_pose(inverse_pose(root), pose))
+}
+
+fn vulkan_node_pose(pose: Pose) -> VulkanNodePose {
+    VulkanNodePose {
+        translation: pose.translation,
+        rotation: pose.rotation,
+    }
+}
+
+fn node38_pose_with_root_replacement(
+    model: &ModelAsset,
+    animation_frame: Option<u16>,
+    node_index: usize,
+    root_replaced: bool,
+) -> Option<VulkanNodePose> {
+    let hierarchy = animation_frame.map_or_else(
+        || node38_fallback_hierarchy(model),
+        |frame| node38_sampled_hierarchy(model, frame),
+    )?;
+    let hierarchy = if root_replaced {
+        strip_node38_root_pose(hierarchy)?
+    } else {
+        hierarchy
+    };
+    let pose = *hierarchy.poses.get(node_index)?;
+    Some(VulkanNodePose {
+        translation: pose.translation,
+        rotation: pose.rotation,
+    })
+}
+
+/// Projects a mounted Node38 model while preserving its local hierarchy.
+///
+/// The native unit loader mounts a child root at the parent's selected local
+/// socket. The child root node itself is a socket placeholder and is hidden;
+/// nodes `1..` retain their evaluated local hierarchy and are composed with the
+/// parent's world socket pose. The mission transform remains applied once.
+///
+/// # Errors
+///
+/// Returns [`VulkanAssetMeshError`] when geometry or transforms cannot be
+/// represented by the static input contract.
+pub fn project_msh_to_static_mesh_in_world_space_with_node_sampled_poses_and_mount(
+    model: &ModelAsset,
+    transform: LegacyIron3dEulerTransform,
+    scale: [f32; 3],
+    animation_frame: u16,
+    mount_pose: VulkanNodePose,
+) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
+    project_msh_to_static_mesh_in_world_space_with_node_poses(
+        model,
+        transform,
+        scale,
+        node38_sampled_hierarchy(model, animation_frame),
+        Some(Pose {
+            translation: mount_pose.translation,
+            rotation: mount_pose.rotation,
+        }),
+        true,
+    )
+}
+
+/// Projects a mounted Node38 model at its decoded fallback pose.
+///
+/// # Errors
+///
+/// Returns [`VulkanAssetMeshError`] when geometry or transforms cannot be
+/// represented by the static input contract.
+pub fn project_msh_to_static_mesh_in_world_space_with_node_fallback_poses_and_mount(
+    model: &ModelAsset,
+    transform: LegacyIron3dEulerTransform,
+    scale: [f32; 3],
+    mount_pose: VulkanNodePose,
+) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
+    project_msh_to_static_mesh_in_world_space_with_node_poses(
+        model,
+        transform,
+        scale,
+        node38_fallback_hierarchy(model),
+        Some(Pose {
+            translation: mount_pose.translation,
+            rotation: mount_pose.rotation,
+        }),
+        true,
     )
 }
 
@@ -380,7 +646,17 @@ fn project_msh_to_static_mesh_in_world_space_with_node_poses(
     transform: LegacyIron3dEulerTransform,
     scale: [f32; 3],
     hierarchy: Option<fparkan_animation::NodePoseBuffer>,
+    mount_pose: Option<Pose>,
+    hide_root_node: bool,
 ) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
+    if let Some(hierarchy) = hierarchy.as_ref() {
+        if hierarchy.poses.len() != model.node_count {
+            return Err(VulkanAssetMeshError::NodePoseCountMismatch {
+                expected: model.node_count,
+                actual: hierarchy.poses.len(),
+            });
+        }
+    }
     if !transform
         .translation
         .iter()
@@ -391,10 +667,19 @@ fn project_msh_to_static_mesh_in_world_space_with_node_poses(
         return Err(VulkanAssetMeshError::NonFinitePosition);
     }
     if model.node_stride != 38 || model.node_count == 0 || model.animation.is_none() {
-        return project_msh_to_static_mesh_in_world_space_with_transform(model, transform, scale);
+        return project_msh_to_static_mesh_in_world_space_with_transform_and_root_pose(
+            model, transform, scale, mount_pose,
+        );
     }
+    let hierarchy = if mount_pose.is_some() {
+        hierarchy.and_then(strip_node38_root_pose)
+    } else {
+        hierarchy
+    };
     let Some(hierarchy) = hierarchy else {
-        return project_msh_to_static_mesh_in_world_space_with_transform(model, transform, scale);
+        return project_msh_to_static_mesh_in_world_space_with_transform_and_root_pose(
+            model, transform, scale, mount_pose,
+        );
     };
 
     let mut vertices = Vec::new();
@@ -406,7 +691,12 @@ fn project_msh_to_static_mesh_in_world_space_with_node_poses(
         let Some(slot) = selected_slot(model, node, Lod(0), Group(0)) else {
             continue;
         };
-        let pose = hierarchy.poses[node_index];
+        if hide_root_node && node_index == 0 {
+            continue;
+        }
+        let pose = mount_pose.map_or(hierarchy.poses[node_index], |mount| {
+            compose_pose(mount, hierarchy.poses[node_index])
+        });
         if !pose
             .translation
             .iter()
@@ -430,13 +720,64 @@ fn project_msh_to_static_mesh_in_world_space_with_node_poses(
         }
     }
     if indices.is_empty() {
-        return project_msh_to_static_mesh_in_world_space_with_transform(model, transform, scale);
+        // A valid Node38 hierarchy may intentionally select no drawable
+        // batches for this component (for example, a mounted attachment
+        // whose root is hidden at the chosen LOD/group). Preserve that empty
+        // result instead of falling back to every source batch and drawing
+        // geometry that the node selection excluded.
+        return Ok(VulkanStaticMesh {
+            vertices,
+            indices,
+            draw_ranges,
+        });
     }
     Ok(VulkanStaticMesh {
         vertices,
         indices,
         draw_ranges,
     })
+}
+
+/// Replaces Node38 node zero with the identity pose while retaining every
+/// descendant's pose relative to that root. Mounted components use this
+/// because the native loader substitutes their root with the parent socket.
+fn strip_node38_root_pose(
+    mut hierarchy: fparkan_animation::NodePoseBuffer,
+) -> Option<fparkan_animation::NodePoseBuffer> {
+    let root = *hierarchy.poses.first()?;
+    let inverse_root = inverse_pose(root);
+    hierarchy.poses[0] = Pose::default();
+    for pose in hierarchy.poses.iter_mut().skip(1) {
+        *pose = compose_pose(inverse_root, *pose);
+    }
+    Some(hierarchy)
+}
+
+fn inverse_pose(pose: Pose) -> Pose {
+    let [x, y, z, w] = pose.rotation;
+    let length_squared = x * x + y * y + z * z + w * w;
+    let inverse_rotation = if length_squared.is_finite() && length_squared > f32::EPSILON {
+        [
+            -x / length_squared,
+            -y / length_squared,
+            -z / length_squared,
+            w / length_squared,
+        ]
+    } else {
+        [0.0, 0.0, 0.0, 1.0]
+    };
+    let translation = rotate_by_quaternion(
+        [
+            -pose.translation[0],
+            -pose.translation[1],
+            -pose.translation[2],
+        ],
+        inverse_rotation,
+    );
+    Pose {
+        translation,
+        rotation: inverse_rotation,
+    }
 }
 
 fn append_node_fallback_batch(
@@ -450,6 +791,15 @@ fn append_node_fallback_batch(
     indices: &mut Vec<u32>,
     draw_ranges: &mut Vec<VulkanStaticDrawRange>,
 ) -> Result<(), VulkanAssetMeshError> {
+    // Some authored MSH tables retain empty alternate batches. They do not
+    // describe a drawable range and would violate the renderer's contiguous
+    // non-empty draw-range contract when a full mission root set is loaded.
+    if batch.index_count == 0 {
+        return Ok(());
+    }
+    if !usize::from(batch.index_count).is_multiple_of(3) {
+        return Err(VulkanAssetMeshError::IndexOutOfRange);
+    }
     let first_index =
         u32::try_from(indices.len()).map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?;
     let start =
@@ -488,7 +838,12 @@ fn append_node_fallback_batch(
             u32::try_from(vertices.len()).map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?;
         vertices.push(VulkanStaticVertex {
             position,
-            color: [0.82, 0.72, 0.31],
+            color: [1.0, 1.0, 1.0],
+            normal: {
+                let normal = rotate_by_quaternion(model_normal(model, source_index), rotation);
+                transform_normal(transform, normal, scale)
+                    .ok_or(VulkanAssetMeshError::NonFinitePosition)?
+            },
             uv: model
                 .uv0
                 .as_ref()
@@ -496,17 +851,44 @@ fn append_node_fallback_batch(
                 .map_or([0.0, 0.0], |uv| {
                     [f32::from(uv[0]) / 1024.0, f32::from(uv[1]) / 1024.0]
                 }),
+            detail_uv: model_detail_uv(model, source_index),
+            overlay_alpha: 0.0,
         });
         indices.push(vertex_index);
     }
     draw_ranges.push(VulkanStaticDrawRange {
         first_index,
         index_count: u32::from(batch.index_count),
-        material_index: batch.material_index,
-        pipeline_state: LegacyPipelineState::default(),
+        material_index: u16::from(batch.material_index),
+        lightmap_index: batch.lightmap_index,
+        batch_flags: batch.batch_flags,
+        pipeline_state: world_pipeline_state(),
         alpha_test_reference: 0,
     });
     Ok(())
+}
+
+fn compose_pose(parent: Pose, child: Pose) -> Pose {
+    let translation = rotate_by_quaternion(child.translation, parent.rotation);
+    Pose {
+        translation: [
+            parent.translation[0] + translation[0],
+            parent.translation[1] + translation[1],
+            parent.translation[2] + translation[2],
+        ],
+        rotation: multiply_quaternions(parent.rotation, child.rotation),
+    }
+}
+
+fn multiply_quaternions(left: [f32; 4], right: [f32; 4]) -> [f32; 4] {
+    let [lx, ly, lz, lw] = left;
+    let [rx, ry, rz, rw] = right;
+    [
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
+        lw * rw - lx * rx - ly * ry - lz * rz,
+    ]
 }
 
 fn rotate_by_quaternion(position: [f32; 3], rotation: [f32; 4]) -> [f32; 3] {
@@ -519,6 +901,104 @@ fn rotate_by_quaternion(position: [f32; 3], rotation: [f32; 4]) -> [f32; 3] {
         position[1] + w * ty + (z * tx - x * tz),
         position[2] + w * tz + (x * ty - y * tx),
     ]
+}
+
+fn model_normal(model: &ModelAsset, index: usize) -> [f32; 3] {
+    model
+        .normals
+        .as_ref()
+        .and_then(|normals| normals.get(index))
+        .map_or([0.0, 0.0, 1.0], |raw| {
+            // Indexed MSH stores signed bytes.  The native decoder divides
+            // by 127 without clamping or renormalizing, so the packed length
+            // (including -128/127) reaches the shader unchanged.
+            [
+                f32::from(raw[0]) / 127.0,
+                f32::from(raw[1]) / 127.0,
+                f32::from(raw[2]) / 127.0,
+            ]
+        })
+}
+
+/// Decodes the optional MSH type-18 secondary UV stream.  Native model and
+/// terrain samplers use the same unsigned 16-bit fixed-point 1/1024 scale for
+/// both texture stages; an absent stream leaves the neutral detail coordinate.
+fn model_detail_uv(model: &ModelAsset, index: usize) -> [f32; 2] {
+    model
+        .uv1
+        .as_ref()
+        .and_then(|uv1| uv1.get(index))
+        .map_or([0.0, 0.0], |uv| {
+            [f32::from(uv[0]) / 1024.0, f32::from(uv[1]) / 1024.0]
+        })
+}
+
+fn terrain_normal(terrain: &LandMeshDocument, index: usize) -> [f32; 3] {
+    terrain.normals.get(index).map_or([0.0, 0.0, 1.0], |raw| {
+        // Ngi32's normal decoder sign-extends each source byte and multiplies
+        // it by the literal 1/128.  Preserve the packed magnitude here: the
+        // shader consumes the native vector directly, and normalizing it
+        // changes the lighting response for every authored byte.
+        [
+            f32::from(raw[0]) * (1.0 / 128.0),
+            f32::from(raw[1]) * (1.0 / 128.0),
+            f32::from(raw[2]) * (1.0 / 128.0),
+        ]
+    })
+}
+
+fn transform_normal(
+    transform: LegacyIron3dEulerTransform,
+    normal: [f32; 3],
+    scale: [f32; 3],
+) -> Option<[f32; 3]> {
+    if !normal.iter().all(|value| value.is_finite())
+        || !scale
+            .iter()
+            .all(|value| value.is_finite() && value.abs() > f32::EPSILON)
+    {
+        return None;
+    }
+    // Positions use `R * (scale * point)`. Normals therefore use the
+    // inverse-transpose linear transform: inverse scale first, then R.
+    let inverse_scaled = [
+        normal[0] / scale[0],
+        normal[1] / scale[1],
+        normal[2] / scale[2],
+    ];
+    let matrix = transform.try_row_major()?;
+    let transformed = [
+        matrix[0] * inverse_scaled[0]
+            + matrix[1] * inverse_scaled[1]
+            + matrix[2] * inverse_scaled[2],
+        matrix[4] * inverse_scaled[0]
+            + matrix[5] * inverse_scaled[1]
+            + matrix[6] * inverse_scaled[2],
+        matrix[8] * inverse_scaled[0]
+            + matrix[9] * inverse_scaled[1]
+            + matrix[10] * inverse_scaled[2],
+    ];
+    let transformed_length = transformed[0].mul_add(
+        transformed[0],
+        transformed[1].mul_add(transformed[1], transformed[2] * transformed[2]),
+    );
+    if !transformed_length.is_finite() || transformed_length <= f32::EPSILON {
+        return Some([0.0; 3]);
+    }
+    let source_length = normal[0].mul_add(
+        normal[0],
+        normal[1].mul_add(normal[1], normal[2] * normal[2]),
+    );
+    if !source_length.is_finite() || source_length <= f32::EPSILON {
+        return Some([0.0; 3]);
+    }
+    let magnitude = source_length.sqrt();
+    let inverse_transformed_length = transformed_length.sqrt().recip();
+    Some([
+        transformed[0] * inverse_transformed_length * magnitude,
+        transformed[1] * inverse_transformed_length * magnitude,
+        transformed[2] * inverse_transformed_length * magnitude,
+    ])
 }
 
 /// Projects validated `Land.msh` terrain geometry into the static Vulkan path.
@@ -595,13 +1075,16 @@ pub fn project_land_msh_to_static_mesh_in_xy_frame(
                     frame.project(*position)[1],
                     0.0,
                 ],
-                color: [0.31, 0.58, 0.27],
+                color: [1.0, 1.0, 1.0],
+                normal: terrain_normal(terrain, index),
                 uv: terrain
                     .uv0
                     .get(index)
                     .map_or(frame.planar_uv(*position), |uv| {
                         [f32::from(uv[0]) / 1024.0, f32::from(uv[1]) / 1024.0]
                     }),
+                detail_uv: terrain_detail_uv(terrain, index),
+                overlay_alpha: terrain_overlay_alpha(terrain, index),
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -638,10 +1121,13 @@ pub fn project_land_msh_to_static_mesh_in_world_space(
             }
             Ok(VulkanStaticVertex {
                 position: *position,
-                color: [0.31, 0.58, 0.27],
+                color: [1.0, 1.0, 1.0],
+                normal: terrain_normal(terrain, index),
                 uv: terrain.uv0.get(index).map_or([0.0, 0.0], |uv| {
                     [f32::from(uv[0]) / 1024.0, f32::from(uv[1]) / 1024.0]
                 }),
+                detail_uv: terrain_detail_uv(terrain, index),
+                overlay_alpha: terrain_overlay_alpha(terrain, index),
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -695,6 +1181,38 @@ fn static_terrain_indices(terrain: &LandMeshDocument) -> Result<Vec<u32>, Vulkan
     Ok(indices)
 }
 
+/// Decodes the terrain type-18 repeating detail coordinate. The original
+/// stream stores two unsigned 16-bit fixed-point coordinates with the same
+/// 1/1024 texture scale used by the texture sampler.
+fn terrain_detail_uv(terrain: &LandMeshDocument, index: usize) -> [f32; 2] {
+    terrain.aux18.get(index).map_or([0.0, 0.0], |raw| {
+        [
+            f32::from(u16::from_le_bytes([raw[0], raw[1]])) / 1024.0,
+            f32::from(u16::from_le_bytes([raw[2], raw[3]])) / 1024.0,
+        ]
+    })
+}
+
+/// Decodes the terrain type-14 overlay mask as the source float alpha.
+/// Invalid or out-of-range values are disabled at the static bridge boundary;
+/// valid map data is the continuous 0..1 mask consumed by the original shade
+/// path.
+fn terrain_overlay_alpha(terrain: &LandMeshDocument, index: usize) -> f32 {
+    terrain
+        .aux14
+        .get(index)
+        .map_or(0.0, |raw| f32::from_le_bytes(*raw))
+        .is_finite()
+        .then_some(
+            terrain
+                .aux14
+                .get(index)
+                .map_or(0.0, |raw| f32::from_le_bytes(*raw))
+                .clamp(0.0, 1.0),
+        )
+        .unwrap_or(0.0)
+}
+
 fn static_terrain_draw_ranges(
     terrain: &LandMeshDocument,
 ) -> Result<Vec<VulkanStaticDrawRange>, VulkanAssetMeshError> {
@@ -718,7 +1236,9 @@ fn static_terrain_draw_ranges(
                 .checked_mul(3)
                 .ok_or(VulkanAssetMeshError::IndexOutOfRange)?,
             material_index,
-            pipeline_state: LegacyPipelineState::default(),
+            lightmap_index: u8::MAX,
+            batch_flags: 0,
+            pipeline_state: world_pipeline_state(),
             alpha_test_reference: 0,
         });
         start_face = end_face;
@@ -733,6 +1253,12 @@ fn static_model_indices_and_ranges(
     let batches = static_model_preview_batches(model)?;
     let mut draw_ranges = Vec::with_capacity(batches.len());
     for batch in batches {
+        if batch.index_count == 0 {
+            continue;
+        }
+        if !usize::from(batch.index_count).is_multiple_of(3) {
+            return Err(VulkanAssetMeshError::IndexOutOfRange);
+        }
         let first_index =
             u32::try_from(indices.len()).map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?;
         let start = usize::try_from(batch.index_start)
@@ -754,8 +1280,10 @@ fn static_model_indices_and_ranges(
         draw_ranges.push(VulkanStaticDrawRange {
             first_index,
             index_count: u32::from(batch.index_count),
-            material_index: batch.material_index,
-            pipeline_state: LegacyPipelineState::default(),
+            material_index: u16::from(batch.material_index),
+            lightmap_index: batch.lightmap_index,
+            batch_flags: batch.batch_flags,
+            pipeline_state: world_pipeline_state(),
             alpha_test_reference: 0,
         });
     }
@@ -843,10 +1371,13 @@ mod tests {
             node_stride: 0,
             node_count: 0,
             nodes_raw: Vec::new(),
+            bounding_sphere_center: [0.0; 3],
+            bounding_sphere_radius: 0.0,
             slots: Vec::new(),
             positions,
             normals: None,
             uv0: None,
+            uv1: None,
             indices,
             batches,
             node_names: None,
@@ -857,12 +1388,13 @@ mod tests {
     fn batch(index_start: u32, index_count: u16, base_vertex: u32) -> Batch {
         Batch {
             batch_flags: 0,
+            material_index_hi: 0,
             material_index: 0,
-            opaque4: 0,
-            opaque6: 0,
+            lightmap_index: 0,
+            local_batch_index: 0,
             index_count,
             index_start,
-            opaque14: 0,
+            vertex_count: 0,
             base_vertex,
         }
     }
@@ -875,6 +1407,8 @@ mod tests {
             node_stride: 38,
             node_count: 1,
             nodes_raw: node,
+            bounding_sphere_center: [0.0; 3],
+            bounding_sphere_radius: 0.0,
             slots: vec![
                 Slot {
                     tri_start: 0,
@@ -902,6 +1436,7 @@ mod tests {
             positions: Vec::new(),
             normals: None,
             uv0: None,
+            uv1: None,
             indices: Vec::new(),
             batches: vec![
                 batch(0, 0, 0),
@@ -940,7 +1475,9 @@ mod tests {
                 first_index: 0,
                 index_count: 3,
                 material_index: 0,
-                pipeline_state: LegacyPipelineState::default(),
+                lightmap_index: 0,
+                batch_flags: 0,
+                pipeline_state: world_pipeline_state(),
                 alpha_test_reference: 0,
             }]
         );
@@ -956,13 +1493,13 @@ mod tests {
             vec![0, 1, 2],
             vec![batch(0, 3, 0)],
         );
-        source.uv0 = Some(vec![[1024, -512], [0, 2048], [-1024, 512]]);
+        source.uv0 = Some(vec![[1024, 65024], [0, 2048], [64512, 512]]);
 
         let mesh = project_msh_to_static_mesh(&source).expect("representable MSH");
 
-        assert_eq!(mesh.vertices[0].uv, [1.0, -0.5]);
+        assert_eq!(mesh.vertices[0].uv, [1.0, 63.5]);
         assert_eq!(mesh.vertices[1].uv, [0.0, 2.0]);
-        assert_eq!(mesh.vertices[2].uv, [-1.0, 0.5]);
+        assert_eq!(mesh.vertices[2].uv, [63.0, 0.5]);
     }
 
     #[test]
@@ -972,7 +1509,7 @@ mod tests {
             vec![0, 1, 2],
             vec![batch(0, 3, 0)],
         );
-        source.uv0 = Some(vec![[1024, -512], [0, 2048], [-1024, 512]]);
+        source.uv0 = Some(vec![[1024, 65024], [0, 2048], [64512, 512]]);
 
         let mesh = project_msh_to_static_mesh_in_world_space(
             &source,
@@ -984,7 +1521,7 @@ mod tests {
         assert_eq!(mesh.indices, vec![0, 1, 2]);
         assert_eq!(mesh.vertices[0].position, [104.0, 203.0, 302.0]);
         assert_eq!(mesh.vertices[1].position, [100.0, 199.0, 301.0]);
-        assert_eq!(mesh.vertices[0].uv, [1.0, -0.5]);
+        assert_eq!(mesh.vertices[0].uv, [1.0, 63.5]);
     }
 
     #[test]
@@ -1008,6 +1545,65 @@ mod tests {
         assert_eq!(mesh.vertices[0].position, [7.0, 24.0, 32.0]);
         assert_eq!(mesh.vertices[1].position, [10.0, 20.0, 30.0]);
         assert_eq!(mesh.vertices[2].position, [10.0, 22.0, 30.0]);
+    }
+
+    #[test]
+    fn world_space_msh_transforms_normals_with_inverse_scale() {
+        let mut source = model(
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            vec![0, 1, 2],
+            vec![batch(0, 3, 0)],
+        );
+        source.normals = Some(vec![[127, 127, 0, 0]; 3]);
+
+        let mesh = project_msh_to_static_mesh_in_world_space_with_transform(
+            &source,
+            LegacyIron3dEulerTransform {
+                translation: [0.0; 3],
+                orientation_radians: [0.0; 3],
+            },
+            [2.0, 3.0, 1.0],
+        )
+        .expect("finite transformed normals");
+
+        let expected_magnitude = 2.0_f32.sqrt() * (127.0 / 127.0);
+        assert!((mesh.vertices[0].normal[0] - 0.83205 * expected_magnitude).abs() < 0.0001);
+        assert!((mesh.vertices[0].normal[1] - 0.55470 * expected_magnitude).abs() < 0.0001);
+        assert_eq!(mesh.vertices[0].normal[2], 0.0);
+    }
+
+    #[test]
+    fn indexed_msh_normal_bytes_keep_packed_magnitude_through_uniform_scale() {
+        let mut source = model(
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            vec![0, 1, 2],
+            vec![batch(0, 3, 0)],
+        );
+        source.normals = Some(vec![[-128, 0, 0, 0], [64, 0, 0, 0], [0, 0, 127, 0]]);
+        let mesh = project_msh_to_static_mesh_in_world_space_with_transform(
+            &source,
+            LegacyIron3dEulerTransform {
+                translation: [0.0; 3],
+                orientation_radians: [0.0, 0.0, std::f32::consts::FRAC_PI_2],
+            },
+            [2.0; 3],
+        )
+        .expect("finite packed normals");
+        let lengths = mesh
+            .vertices
+            .iter()
+            .map(|vertex| {
+                vertex.normal[0]
+                    .mul_add(
+                        vertex.normal[0],
+                        vertex.normal[1]
+                            .mul_add(vertex.normal[1], vertex.normal[2] * vertex.normal[2]),
+                    )
+                    .sqrt()
+            })
+            .collect::<Vec<_>>();
+        assert!((lengths[0] - 128.0 / 127.0).abs() < 0.0001);
+        assert!((lengths[1] - 64.0 / 127.0).abs() < 0.0001);
     }
 
     #[test]
@@ -1048,6 +1644,8 @@ mod tests {
             node_stride: 38,
             node_count: 2,
             nodes_raw: nodes,
+            bounding_sphere_center: [0.0; 3],
+            bounding_sphere_radius: 0.0,
             slots: vec![
                 Slot {
                     tri_start: 0,
@@ -1075,6 +1673,7 @@ mod tests {
             positions: vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             normals: None,
             uv0: None,
+            uv1: None,
             indices: vec![0, 1, 2, 0, 1, 2],
             batches: vec![batch(0, 3, 0), batch(3, 3, 0)],
             node_names: None,
@@ -1110,6 +1709,248 @@ mod tests {
         assert_eq!(mesh.vertices[0].position, [101.0, 0.0, 0.0]);
         assert_eq!(mesh.vertices[3].position, [111.0, 0.0, 0.0]);
         assert_eq!(mesh.indices, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn mounted_socket_pose_strips_only_a_replaced_parent_root() {
+        let mut nodes = vec![0_u8; 76];
+        nodes[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
+        nodes[6..8].copy_from_slice(&0_u16.to_le_bytes());
+        nodes[38 + 2..38 + 4].copy_from_slice(&0_u16.to_le_bytes());
+        nodes[38 + 6..38 + 8].copy_from_slice(&1_u16.to_le_bytes());
+        let source = ModelAsset {
+            node_stride: 38,
+            node_count: 2,
+            nodes_raw: nodes,
+            bounding_sphere_center: [0.0; 3],
+            bounding_sphere_radius: 0.0,
+            slots: Vec::new(),
+            positions: Vec::new(),
+            normals: None,
+            uv0: None,
+            uv1: None,
+            indices: Vec::new(),
+            batches: Vec::new(),
+            node_names: None,
+            animation: Some(ModelAnimation {
+                keys: vec![
+                    AnimKey24 {
+                        time: AnimationTime(0.0),
+                        pose: Pose {
+                            translation: [5.0, 0.0, 0.0],
+                            rotation: [0.0, 0.0, 0.0, 1.0],
+                        },
+                    },
+                    AnimKey24 {
+                        time: AnimationTime(0.0),
+                        pose: Pose {
+                            translation: [2.0, 0.0, 0.0],
+                            rotation: [0.0, 0.0, 0.0, 1.0],
+                        },
+                    },
+                ],
+                frame_map: Vec::new(),
+                frame_count: 0,
+            }),
+        };
+
+        assert_eq!(
+            node38_pose(&source, None, 1)
+                .expect("full socket")
+                .translation,
+            [7.0, 0.0, 0.0]
+        );
+        assert_eq!(
+            node38_pose_relative_to_root(&source, None, 1)
+                .expect("relative socket")
+                .translation,
+            [2.0, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn mounted_child_uses_precomputed_hierarchies_for_socket_and_geometry() {
+        let parent_hierarchy = NodePoseBuffer {
+            poses: vec![
+                Pose {
+                    translation: [20.0, 0.0, 0.0],
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                },
+                Pose {
+                    translation: [25.0, 0.0, 0.0],
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                },
+            ],
+        };
+        let parent_socket = node38_pose_relative_to_root_from_hierarchy(&parent_hierarchy, 1)
+            .expect("sampled parent socket relative to its mounted root");
+        assert_eq!(parent_socket.translation, [5.0, 0.0, 0.0]);
+        assert_eq!(
+            node38_pose_from_hierarchy(&parent_hierarchy, 1)
+                .expect("sampled parent socket")
+                .translation,
+            [25.0, 0.0, 0.0]
+        );
+
+        let mut child_root = vec![0_u8; 38];
+        child_root[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
+        child_root[6..8].copy_from_slice(&0_u16.to_le_bytes());
+        let mut child_node = vec![0_u8; 38];
+        child_node[2..4].copy_from_slice(&0_u16.to_le_bytes());
+        child_node[6..8].copy_from_slice(&1_u16.to_le_bytes());
+        child_node[8..10].copy_from_slice(&1_u16.to_le_bytes());
+        let mut nodes = child_root;
+        nodes.extend(child_node);
+        let child = ModelAsset {
+            node_stride: 38,
+            node_count: 2,
+            nodes_raw: nodes,
+            bounding_sphere_center: [0.0; 3],
+            bounding_sphere_radius: 0.0,
+            slots: vec![
+                Slot {
+                    tri_start: 0,
+                    tri_count: 0,
+                    batch_start: 0,
+                    batch_count: 1,
+                    aabb_min: [0.0; 3],
+                    aabb_max: [1.0; 3],
+                    sphere_center: [0.0; 3],
+                    sphere_radius: 1.0,
+                    opaque: [0; 5],
+                },
+                Slot {
+                    tri_start: 0,
+                    tri_count: 0,
+                    batch_start: 1,
+                    batch_count: 1,
+                    aabb_min: [0.0; 3],
+                    aabb_max: [1.0; 3],
+                    sphere_center: [0.0; 3],
+                    sphere_radius: 1.0,
+                    opaque: [0; 5],
+                },
+            ],
+            positions: vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            normals: None,
+            uv0: None,
+            uv1: None,
+            indices: vec![0, 1, 2, 0, 1, 2],
+            batches: vec![batch(0, 3, 0), batch(3, 3, 0)],
+            node_names: None,
+            animation: Some(ModelAnimation {
+                keys: vec![AnimKey24 {
+                    time: AnimationTime(0.0),
+                    pose: Pose::default(),
+                }],
+                frame_map: Vec::new(),
+                frame_count: 0,
+            }),
+        };
+        let child_hierarchy = NodePoseBuffer {
+            poses: vec![
+                Pose {
+                    translation: [10.0, 0.0, 0.0],
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                },
+                Pose {
+                    translation: [14.0, 0.0, 0.0],
+                    rotation: [0.0, 0.0, 0.0, 1.0],
+                },
+            ],
+        };
+        let child_socket = node38_pose_relative_to_root_from_hierarchy(&child_hierarchy, 1)
+            .expect("child node relative to its mounted root");
+        assert_eq!(child_socket.translation, [4.0, 0.0, 0.0]);
+
+        // The parent component's world root is at x=100, so its sampled socket
+        // at x=5 places the child root at x=105. The child geometry uses the
+        // same child hierarchy as the socket path: root x=10 is stripped and
+        // node 1 contributes x=4 before the source vertex at x=1.
+        let mesh = project_msh_to_static_mesh_in_world_space_with_node_pose_buffer_and_mount(
+            &child,
+            LegacyIron3dEulerTransform {
+                translation: [0.0; 3],
+                orientation_radians: [0.0; 3],
+            },
+            [1.0; 3],
+            &child_hierarchy,
+            VulkanNodePose {
+                translation: [105.0, 0.0, 0.0],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            },
+        )
+        .expect("mounted child geometry from sampled pose buffer");
+        assert_eq!(mesh.vertices[0].position, [110.0, 0.0, 0.0]);
+        assert_eq!(mesh.indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn supplied_node_pose_buffer_must_match_model_node_count() {
+        let source = model(Vec::new(), Vec::new(), Vec::new());
+        let error = project_msh_to_static_mesh_in_world_space_with_node_pose_buffer(
+            &source,
+            LegacyIron3dEulerTransform {
+                translation: [0.0; 3],
+                orientation_radians: [0.0; 3],
+            },
+            [1.0; 3],
+            &NodePoseBuffer {
+                poses: vec![Pose::default()],
+            },
+        )
+        .expect_err("mismatched node pose count");
+        assert_eq!(
+            error,
+            VulkanAssetMeshError::NodePoseCountMismatch {
+                expected: 0,
+                actual: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn node_pose_projection_preserves_an_intentionally_empty_component() {
+        let mut node = vec![0_u8; 38];
+        node[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
+        node[6..8].copy_from_slice(&0_u16.to_le_bytes());
+        node[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
+        let source = ModelAsset {
+            node_stride: 38,
+            node_count: 1,
+            nodes_raw: node,
+            bounding_sphere_center: [0.0; 3],
+            bounding_sphere_radius: 0.0,
+            slots: Vec::new(),
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: None,
+            uv0: None,
+            uv1: None,
+            indices: vec![0, 1, 2],
+            batches: vec![batch(0, 3, 0)],
+            node_names: None,
+            animation: Some(ModelAnimation {
+                keys: vec![AnimKey24 {
+                    time: AnimationTime(0.0),
+                    pose: Pose::default(),
+                }],
+                frame_map: Vec::new(),
+                frame_count: 0,
+            }),
+        };
+
+        let mesh = project_msh_to_static_mesh_in_world_space_with_node_fallback_poses(
+            &source,
+            LegacyIron3dEulerTransform {
+                translation: [10.0, 20.0, 30.0],
+                orientation_radians: [0.0; 3],
+            },
+            [1.0; 3],
+        )
+        .expect("empty node component remains representable");
+        assert!(mesh.vertices.is_empty());
+        assert!(mesh.indices.is_empty());
+        assert!(mesh.draw_ranges.is_empty());
     }
 
     #[test]
@@ -1151,14 +1992,18 @@ mod tests {
                     first_index: 0,
                     index_count: 3,
                     material_index: 0,
-                    pipeline_state: LegacyPipelineState::default(),
+                    lightmap_index: 0,
+                    batch_flags: 0,
+                    pipeline_state: world_pipeline_state(),
                     alpha_test_reference: 0,
                 },
                 VulkanStaticDrawRange {
                     first_index: 3,
                     index_count: 3,
                     material_index: 7,
-                    pipeline_state: LegacyPipelineState::default(),
+                    lightmap_index: 0,
+                    batch_flags: 0,
+                    pipeline_state: world_pipeline_state(),
                     alpha_test_reference: 0,
                 },
             ]
@@ -1181,7 +2026,7 @@ mod tests {
                 [2.0, 3.0, 1.0],
             ],
             normals: Vec::new(),
-            uv0: vec![[1024, -512], [0, 2048], [-1024, 512], [512, 0]],
+            uv0: vec![[1024, 65024], [0, 2048], [64512, 512], [512, 0]],
             accelerator: Vec::new(),
             aux14: Vec::new(),
             aux18: Vec::new(),
@@ -1195,8 +2040,31 @@ mod tests {
         assert_eq!(mesh.draw_ranges[0].index_count, 6);
         assert_eq!(mesh.vertices[0].position, [-0.8, -0.8, 0.0]);
         assert_eq!(mesh.vertices[3].position, [0.8, 0.8, 0.0]);
-        assert_eq!(mesh.vertices[0].uv, [1.0, -0.5]);
-        assert_eq!(mesh.vertices[2].uv, [-1.0, 0.5]);
+        assert_eq!(mesh.vertices[0].uv, [1.0, 63.5]);
+        assert_eq!(mesh.vertices[2].uv, [63.0, 0.5]);
+    }
+
+    #[test]
+    fn terrain_normals_keep_native_one_over_128_scale() {
+        let terrain = LandMeshDocument {
+            streams: Vec::new(),
+            nodes_raw: Vec::new(),
+            slots: TerrainSlotTable {
+                header_raw: Vec::new(),
+                slots_raw: Vec::new(),
+            },
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: vec![[127, -128, 64, 0]; 3],
+            uv0: vec![[0, 0]; 3],
+            accelerator: Vec::new(),
+            aux14: Vec::new(),
+            aux18: Vec::new(),
+            faces: vec![terrain_face([0, 1, 2])],
+        };
+
+        let mesh = project_land_msh_to_static_mesh_in_world_space(&terrain)
+            .expect("representable terrain normals");
+        assert_eq!(mesh.vertices[0].normal, [127.0 / 128.0, -1.0, 0.5]);
     }
 
     #[test]
@@ -1210,7 +2078,7 @@ mod tests {
             },
             positions: vec![[10.0, 20.0, 30.0], [40.0, 50.0, 60.0], [70.0, 80.0, 90.0]],
             normals: Vec::new(),
-            uv0: vec![[1024, -512], [0, 2048], [-1024, 512]],
+            uv0: vec![[1024, 65024], [0, 2048], [64512, 512]],
             accelerator: Vec::new(),
             aux14: Vec::new(),
             aux18: Vec::new(),
@@ -1223,7 +2091,7 @@ mod tests {
         assert_eq!(mesh.indices, vec![2, 0, 1]);
         assert_eq!(mesh.vertices[0].position, [10.0, 20.0, 30.0]);
         assert_eq!(mesh.vertices[2].position, [70.0, 80.0, 90.0]);
-        assert_eq!(mesh.vertices[0].uv, [1.0, -0.5]);
+        assert_eq!(mesh.vertices[0].uv, [1.0, 63.5]);
     }
 
     #[test]

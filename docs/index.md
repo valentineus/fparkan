@@ -18,6 +18,13 @@ FParkan воспроизводит его работу на Rust и Vulkan. На
 7. [Работа над движком](tomes/07-implementation.md): код, тесты и проверка результата.
 8. [Устройство оригинальной программы](tomes/08-evidence.md): DLL, адреса и конфигурация.
 
+В справочнике можно быстро сверить [NRes](reference/nres.md),
+[RsLi](reference/rsli.md), [TMA](reference/tma.md), [MSH](reference/msh.md),
+[материалы](reference/materials.md), [Texm](reference/texm.md),
+[кадр рендера](reference/render-frame.md), [атмосферу и небо](reference/atmosphere.md)
+и [эффекты окружения](reference/environment-effects.md). Таблица DLL находится
+в [описании оригинальных модулей](reference/original-binaries.md).
+
 В [глоссарии](appendices/glossary.md) собраны термины, а в
 [открытых вопросах](appendices/knowledge-boundaries.md) — ещё не восстановленное
 поведение. Описание алгоритма оригинала и возможности текущего приложения

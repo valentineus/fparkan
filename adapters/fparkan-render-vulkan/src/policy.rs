@@ -458,8 +458,23 @@ fn select_surface_format(
         .iter()
         .copied()
         .find(|format| {
-            format.format == vk::Format::B8G8R8A8_SRGB.as_raw()
+            format.format == vk::Format::R8G8B8A8_UNORM.as_raw()
                 && format.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR.as_raw()
+        })
+        .or_else(|| {
+            formats.iter().copied().find(|format| {
+                format.format == vk::Format::B8G8R8A8_UNORM.as_raw()
+                    && format.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR.as_raw()
+            })
+        })
+        // Keep an sRGB attachment as the final compatibility fallback.  The
+        // fragment shader emits legacy byte-equivalent linear values, so an
+        // UNORM attachment is preferred whenever the surface exposes one.
+        .or_else(|| {
+            formats.iter().copied().find(|format| {
+                format.format == vk::Format::B8G8R8A8_SRGB.as_raw()
+                    && format.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR.as_raw()
+            })
         })
         .or_else(|| formats.first().copied())
         .ok_or(VulkanSwapchainError::MissingSurfaceFormat)
@@ -470,7 +485,7 @@ fn undefined_surface_format_override(
 ) -> Option<VulkanSurfaceFormat> {
     match formats {
         [format] if format.format == vk::Format::UNDEFINED.as_raw() => Some(VulkanSurfaceFormat {
-            format: vk::Format::B8G8R8A8_SRGB.as_raw(),
+            format: vk::Format::R8G8B8A8_UNORM.as_raw(),
             color_space: format.color_space,
         }),
         _ => None,

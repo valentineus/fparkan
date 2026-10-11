@@ -1761,7 +1761,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
-    fn licensed_corpora_load_all_mission_foundations() {
+    fn licensed_corpus_part1_loads_all_mission_foundations() {
         let part1 = load_all(&licensed_root("IS"));
         assert_eq!(part1.missions, 29);
         assert_eq!(part1.paths, 34);
@@ -1781,7 +1781,11 @@ mod tests {
         assert_eq!(part1.material_slots, part1.material_resolved);
         assert_eq!(part1.texture_requests, part1.texture_resolved);
         assert_eq!(part1.lightmap_requests, part1.lightmap_resolved);
+    }
 
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_corpus_part2_loads_all_mission_foundations() {
         let part2 = load_all(&licensed_root("IS2"));
         assert_eq!(part2.missions, 31);
         assert_eq!(part2.paths, 61);

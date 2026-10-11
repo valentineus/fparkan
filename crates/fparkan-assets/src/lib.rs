@@ -2,8 +2,12 @@
 //! Asset manager ports and transactional preparation models.
 
 use fparkan_material::{
-    decode_wear, resolve_material, Mat0Document, MaterialError, ResolvedMaterial, WearTable,
+    decode_mat0, decode_wear, resolve_material, MaterialFallback, ResolvedMaterial, WearTable,
     MAT0_KIND, WEAR_KIND,
+};
+pub use fparkan_material::{
+    sample_material_phase, Mat0Document, MaterialCoefficients, MaterialError, MaterialPhase,
+    MaterialPhaseSample,
 };
 use fparkan_mission_format::{decode_tma, decode_tma_land_path, ClanBody};
 pub use fparkan_mission_format::{LpString, MissionDocument, MissionError, TmaProfile};
@@ -20,20 +24,58 @@ use fparkan_resource::{CachedResourceRepository, ResourceError, ResourceKey, Res
 pub use fparkan_terrain::{TerrainError, TerrainWorld};
 use fparkan_terrain_format::{decode_build_dat, decode_land_map, decode_land_msh};
 pub use fparkan_terrain_format::{BuildCategory, TerrainFormatError};
-use fparkan_texm::{decode_mip_rgba8, decode_texm, RgbaImage, TexmDocument, TexmError};
+use fparkan_texm::{decode_mip_rgba8, decode_texm, TexmDocument, TexmError};
+pub use fparkan_texm::{PageRect, RgbaImage};
 use fparkan_vfs::DirectoryVfs;
-use std::collections::{hash_map::Entry, HashMap, HashSet};
+use std::collections::{hash_map::Entry, HashMap};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const TEXTURES_ARCHIVE: &str = "textures.lib";
 const LIGHTMAP_ARCHIVE: &str = "lightmap.lib";
 
+/// Material coefficients decoded from one selected MAT0 phase.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PreparedMaterialPhase {
+    /// Raw NRes MAT0 entry flags retained from the archive directory.
+    pub attr1: u32,
+    /// Native material pipeline category `(attr1 >> 2) & 0xF`.
+    pub pipeline_category: u8,
+    /// Native material feature bit `attr1 & 0x40`.
+    pub native_flag_40: bool,
+    /// Phase parameters 4..6, normalized directional light RGB coefficient.
+    pub directional_rgb: [f32; 3],
+    /// Phase parameters 0..2, normalized additive RGB coefficient.
+    pub additive_rgb: [f32; 3],
+    /// Phase parameter 3, stored as a percentage.
+    pub diffuse_alpha: f32,
+    /// Phase parameters 8..10, normalized specular RGB coefficient.
+    pub specular_rgb: [f32; 3],
+    /// Phase parameter 16, integer specular power.
+    pub power: u8,
+    /// Signed phase parameter 17 selecting a TEXM Page rectangle, or -1.
+    pub page_index: i8,
+    /// Normalized atlas transform `[offset_x, offset_y, scale_x, scale_y]`.
+    pub page_uv_transform: [f32; 4],
+}
+
 type WearValidationCache =
     HashMap<(NormalizedPath, Vec<u8>), Result<fparkan_material::WearTable, String>>;
+
+/// Extracts the native pipeline category from a MAT0 NRes entry's `attr1`.
+#[must_use]
+pub const fn material_pipeline_category(attr1: u32) -> u8 {
+    ((attr1 >> 2) & 0x0F) as u8
+}
+
+/// Returns whether a MAT0 NRes entry carries native feature bit `0x40`.
+#[must_use]
+pub const fn material_native_flag_40(attr1: u32) -> bool {
+    (attr1 & 0x40) != 0
+}
 
 /// Canonical terrain archive paths derived from a mission land reference.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -169,35 +211,587 @@ pub fn decode_nres_payload(
     decode_nres(bytes, ReadProfile::Compatible)
 }
 
-/// Loads a phase-zero diffuse texture from a map-local standalone WEAR file.
-///
-/// The sidecar stays beside `Land.msh`; MAT0 and TEXM remain in the normal
-/// game-root archives.
-pub fn load_standalone_wear_material_texture_mip0_rgba8_from_root(
+/// Loads every authored RGBA8 mip and the selected phase coefficients from a
+/// map-local standalone WEAR table.
+pub fn load_standalone_wear_material_texture_rgba8_and_phase_from_root(
     root: &Path,
     wear_path: &Path,
     material_index: u16,
-) -> Result<RgbaImage, String> {
+) -> Result<(Vec<RgbaImage>, PreparedMaterialPhase), String> {
+    load_standalone_wear_material_texture_rgba8_and_phase_at_index_from_root(
+        root,
+        wear_path,
+        material_index,
+        0,
+    )
+}
+
+/// Loads an authored TEXM mip chain and MAT0 coefficients for one phase.
+/// Empty phase texture names are treated as intentionally untextured.
+pub fn load_standalone_wear_material_texture_rgba8_and_phase_at_index_from_root(
+    root: &Path,
+    wear_path: &Path,
+    material_index: u16,
+    phase_index: u16,
+) -> Result<(Vec<RgbaImage>, PreparedMaterialPhase), String> {
+    let mut loader = StandaloneWearMaterialLoader::new(root);
+    loader.load(wear_path, material_index, phase_index)
+}
+
+/// Reusable standalone WEAR/MAT0/TEXM loader for map-local preview paths.
+///
+/// The native preview can request many rows from `Land1.wea` and `Land2.wea`.
+/// Keeping one repository and one decoded table per path avoids repeating the
+/// archive fingerprint, WEAR parse, and material lookup work for every row.
+pub struct StandaloneWearMaterialLoader {
+    repository: CachedResourceRepository,
+    wears: HashMap<PathBuf, WearTable>,
+    materials: HashMap<(PathBuf, u16), ResolvedMaterial>,
+    loaded: HashMap<(PathBuf, u16, u16), (Vec<RgbaImage>, PreparedMaterialPhase)>,
+}
+
+impl StandaloneWearMaterialLoader {
+    /// Creates a loader over an immutable install root.
+    #[must_use]
+    pub fn new(root: &Path) -> Self {
+        Self {
+            repository: CachedResourceRepository::new(Arc::new(DirectoryVfs::new(root))),
+            wears: HashMap::new(),
+            materials: HashMap::new(),
+            loaded: HashMap::new(),
+        }
+    }
+
+    /// Loads one material row and phase from a map-local WEAR table.
+    ///
+    /// # Errors
+    ///
+    /// Returns a formatted error when the table, material, or texture cannot
+    /// be decoded.
+    pub fn load(
+        &mut self,
+        wear_path: &Path,
+        material_index: u16,
+        phase_index: u16,
+    ) -> Result<(Vec<RgbaImage>, PreparedMaterialPhase), String> {
+        let cache_key = wear_path.to_path_buf();
+        if !self.wears.contains_key(&cache_key) {
+            let wear = decode_wear(
+                &std::fs::read(wear_path)
+                    .map_err(|err| format!("{}: {err}", wear_path.display()))?,
+            )
+            .map_err(|err| err.to_string())?;
+            self.wears.insert(cache_key.clone(), wear);
+        }
+        let material = self.resolve_material(&cache_key, material_index)?;
+        let loaded_key = (cache_key.clone(), material_index, phase_index);
+        if let Some(result) = self.loaded.get(&loaded_key) {
+            return Ok(result.clone());
+        }
+        let result = load_resolved_material_texture_rgba8_and_phase(
+            &self.repository,
+            &material,
+            phase_index,
+        )?;
+        self.loaded.insert(loaded_key, result.clone());
+        Ok(result)
+    }
+
+    /// Returns the decoded MAT0 document for one map-local WEAR row.
+    ///
+    /// The document is cloned at this boundary so callers can retain a
+    /// frame-sampling binding while the loader continues to cache resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns a formatted error when the WEAR table or material cannot be
+    /// resolved.
+    pub fn material_document(
+        &mut self,
+        wear_path: &Path,
+        material_index: u16,
+    ) -> Result<Mat0Document, String> {
+        let cache_key = wear_path.to_path_buf();
+        self.ensure_wear(&cache_key)?;
+        self.resolve_material(&cache_key, material_index)
+            .map(|material| material.document)
+    }
+
+    fn ensure_wear(&mut self, cache_key: &Path) -> Result<(), String> {
+        if self.wears.contains_key(cache_key) {
+            return Ok(());
+        }
+        let wear = decode_wear(
+            &std::fs::read(cache_key).map_err(|err| format!("{}: {err}", cache_key.display()))?,
+        )
+        .map_err(|err| err.to_string())?;
+        self.wears.insert(cache_key.to_path_buf(), wear);
+        Ok(())
+    }
+
+    fn resolve_material(
+        &mut self,
+        cache_key: &Path,
+        material_index: u16,
+    ) -> Result<ResolvedMaterial, String> {
+        let material_key = (cache_key.to_path_buf(), material_index);
+        if let Some(material) = self.materials.get(&material_key) {
+            return Ok(material.clone());
+        }
+        let wear = self
+            .wears
+            .get(cache_key)
+            .ok_or_else(|| "standalone WEAR cache insertion failed".to_string())?;
+        let material = resolve_material(&self.repository, wear, material_index)
+            .map_err(|err| err.to_string())?;
+        self.materials.insert(material_key, material.clone());
+        Ok(material)
+    }
+}
+
+/// Loads named map-local materials together with their complete MAT0
+/// documents.  This is the runtime form used by sky/environment bindings;
+/// the older helper remains available for callers that only need phase zero.
+pub fn load_standalone_wear_named_material_textures_rgba8_and_phases_with_documents_from_root(
+    root: &Path,
+    wear_path: &Path,
+    phase_index: u16,
+) -> Result<Vec<(Vec<u8>, Vec<RgbaImage>, PreparedMaterialPhase, Mat0Document)>, String> {
     let wear = decode_wear(
         &std::fs::read(wear_path).map_err(|err| format!("{}: {err}", wear_path.display()))?,
     )
     .map_err(|err| err.to_string())?;
     let repository = CachedResourceRepository::new(Arc::new(DirectoryVfs::new(root)));
-    let material =
-        resolve_material(&repository, &wear, material_index).map_err(|err| err.to_string())?;
-    let texture = material.document.primary_texture().ok_or_else(|| {
-        "MAT0 phase zero declares an intentionally untextured material".to_string()
-    })?;
-    let key = ResourceKey {
+    wear.entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let material_index =
+                u16::try_from(index).map_err(|_| "WEAR material index exceeds u16".to_string())?;
+            let material = resolve_material(&repository, &wear, material_index)
+                .map_err(|err| err.to_string())?;
+            let (mips, phase) = load_resolved_material_texture_rgba8_and_phase(
+                &repository,
+                &material,
+                phase_index,
+            )?;
+            Ok((entry.material.0.clone(), mips, phase, material.document))
+        })
+        .collect()
+}
+
+/// Loads every named MAT0 entry in a map-local WEAR table through one cached
+/// resource repository.  Sky material rows use this path: their names are
+/// material.lib entries, not direct textures.lib TEXM names.
+pub fn load_standalone_wear_named_material_textures_rgba8_and_phases_from_root(
+    root: &Path,
+    wear_path: &Path,
+    phase_index: u16,
+) -> Result<Vec<(Vec<u8>, Vec<RgbaImage>, PreparedMaterialPhase)>, String> {
+    let wear = decode_wear(
+        &std::fs::read(wear_path).map_err(|err| format!("{}: {err}", wear_path.display()))?,
+    )
+    .map_err(|err| err.to_string())?;
+    let repository = CachedResourceRepository::new(Arc::new(DirectoryVfs::new(root)));
+    wear.entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| {
+            let material_index =
+                u16::try_from(index).map_err(|_| "WEAR material index exceeds u16".to_string())?;
+            let material = resolve_material(&repository, &wear, material_index)
+                .map_err(|err| err.to_string())?;
+            let (mips, phase) = load_resolved_material_texture_rgba8_and_phase(
+                &repository,
+                &material,
+                phase_index,
+            )?;
+            Ok((entry.material.0.clone(), mips, phase))
+        })
+        .collect()
+}
+
+fn load_resolved_material_texture_rgba8_and_phase<R: ResourceRepository>(
+    repository: &R,
+    material: &ResolvedMaterial,
+    phase_index: u16,
+) -> Result<(Vec<RgbaImage>, PreparedMaterialPhase), String> {
+    let phase = material
+        .document
+        .phases
+        .get(usize::from(phase_index))
+        .or_else(|| material.document.phases.first())
+        .ok_or_else(|| "MAT0 declares no material phases".to_string())?;
+    let texture_bytes = phase
+        .texture_raw
+        .iter()
+        .copied()
+        .take_while(|byte| *byte != 0)
+        .collect::<Vec<_>>();
+    let document = if texture_bytes.is_empty() {
+        None
+    } else {
+        let texture = ResourceName(texture_bytes);
+        let key = ResourceKey {
+            archive: parse_path(TEXTURES_ARCHIVE).map_err(|err| err.to_string())?,
+            name: texture.clone(),
+            type_id: None,
+        };
+        let bytes = read_optional_key(repository, &key, Some("texture"))
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| format!("missing texture {texture:?}"))?;
+        Some(decode_texm(bytes).map_err(|err| err.to_string())?)
+    };
+    let page_index = i8::from_ne_bytes([phase.parameters[17]]);
+    let page_uv = match document.as_ref() {
+        Some(document) => page_uv_transform(
+            document.width(),
+            document.height(),
+            &document.page_rects(),
+            page_index,
+        )?,
+        None => [0.0, 0.0, 1.0, 1.0],
+    };
+    let phase = PreparedMaterialPhase {
+        attr1: material.attr1,
+        pipeline_category: material_pipeline_category(material.attr1),
+        native_flag_40: material_native_flag_40(material.attr1),
+        directional_rgb: [
+            f32::from(phase.parameters[4]) / 255.0,
+            f32::from(phase.parameters[5]) / 255.0,
+            f32::from(phase.parameters[6]) / 255.0,
+        ],
+        additive_rgb: [
+            f32::from(phase.parameters[0]) / 255.0,
+            f32::from(phase.parameters[1]) / 255.0,
+            f32::from(phase.parameters[2]) / 255.0,
+        ],
+        diffuse_alpha: f32::from(phase.parameters[3]) * 0.01,
+        specular_rgb: [
+            f32::from(phase.parameters[8]) / 255.0,
+            f32::from(phase.parameters[9]) / 255.0,
+            f32::from(phase.parameters[10]) / 255.0,
+        ],
+        power: phase.parameters[16],
+        page_index,
+        page_uv_transform: page_uv,
+    };
+    let mips = match document {
+        Some(document) => (0..document.mip_count())
+            .map(|level| decode_mip_rgba8(&document, u32::try_from(level).unwrap_or(u32::MAX)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| err.to_string())?,
+        None => vec![RgbaImage {
+            width: 1,
+            height: 1,
+            rgba8: vec![255, 255, 255, 255],
+        }],
+    };
+    Ok((mips, phase))
+}
+
+/// Loads a named `material.lib` MAT0 entry and its selected texture phase.
+/// This is used by FX resources whose opcode carries a direct material
+/// reference instead of a WEAR-table index.
+pub fn load_material_name_texture_rgba8_and_phase_from_root(
+    root: &Path,
+    material_name: &str,
+    phase_index: u16,
+) -> Result<(Vec<RgbaImage>, PreparedMaterialPhase), String> {
+    load_material_name_texture_rgba8_and_phase_with_document_from_root(
+        root,
+        material_name,
+        phase_index,
+    )
+    .map(|(mips, phase, _document)| (mips, phase))
+}
+
+/// Loads a named `material.lib` entry, its selected texture phase, and the
+/// complete MAT0 document used by the runtime animation sampler.
+pub fn load_material_name_texture_rgba8_and_phase_with_document_from_root(
+    root: &Path,
+    material_name: &str,
+    phase_index: u16,
+) -> Result<(Vec<RgbaImage>, PreparedMaterialPhase, Mat0Document), String> {
+    if material_name.is_empty() {
+        return Err("material name is empty".to_string());
+    }
+    let repository = CachedResourceRepository::new(Arc::new(DirectoryVfs::new(root)));
+    let archive = parse_path("material.lib").map_err(|err| err.to_string())?;
+    let archive_id = repository
+        .open_archive(&archive)
+        .map_err(|err| err.to_string())?;
+    let name = ResourceName(material_name.as_bytes().to_vec());
+    let entry = repository
+        .find(archive_id, &name)
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| format!("missing material {material_name:?}"))?;
+    let info = repository
+        .entry_info(entry)
+        .map_err(|err| err.to_string())?;
+    if info.key.type_id != Some(MAT0_KIND) {
+        return Err(format!("material {material_name:?} is not a MAT0 entry"));
+    }
+    let document = decode_mat0(
+        repository
+            .read(entry)
+            .map_err(|err| err.to_string())?
+            .as_slice(),
+        info.attr2,
+    )
+    .map_err(|err| err.to_string())?;
+    let material = ResolvedMaterial {
+        name: info.key.name,
+        fallback: MaterialFallback::Exact,
+        attr1: info.attr1,
+        document,
+    };
+    let document = material.document.clone();
+    let (mips, phase) =
+        load_resolved_material_texture_rgba8_and_phase(&repository, &material, phase_index)?;
+    Ok((mips, phase, document))
+}
+
+/// Reads one named entry from a legacy resource archive through the same
+/// cached repository used by the material loaders.
+pub fn load_resource_entry_bytes_from_root(
+    root: &Path,
+    archive_name: &str,
+    entry_name: &str,
+) -> Result<Arc<[u8]>, String> {
+    if archive_name.is_empty() || entry_name.is_empty() {
+        return Err("resource archive and entry names must be non-empty".to_string());
+    }
+    let repository = CachedResourceRepository::new(Arc::new(DirectoryVfs::new(root)));
+    let archive = parse_path(archive_name).map_err(|err| err.to_string())?;
+    let archive_id = repository
+        .open_archive(&archive)
+        .map_err(|err| err.to_string())?;
+    let entry = repository
+        .find(archive_id, &ResourceName(entry_name.as_bytes().to_vec()))
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| format!("missing resource {archive_name}/{entry_name}"))?;
+    Ok(Arc::from(
+        repository
+            .read(entry)
+            .map_err(|err| err.to_string())?
+            .into_owned()
+            .into_boxed_slice(),
+    ))
+}
+
+/// Loads every authored mip of a named entry from the normal texture archive.
+///
+/// Environment material tables (`sky.wea`) contain direct texture entry names
+/// rather than WEAR indirections, so they use this small archive helper.
+pub fn load_texture_rgba8_mips_from_root(
+    root: &Path,
+    texture_name: &str,
+) -> Result<Vec<RgbaImage>, String> {
+    if texture_name.is_empty() {
+        return Err("texture name is empty".to_string());
+    }
+    let repository = CachedResourceRepository::new(Arc::new(DirectoryVfs::new(root)));
+    let archive = ResourceKey {
         archive: parse_path(TEXTURES_ARCHIVE).map_err(|err| err.to_string())?,
-        name: texture.clone(),
+        name: ResourceName(texture_name.as_bytes().to_vec()),
         type_id: None,
     };
-    let bytes = read_optional_key(&repository, &key, Some("texture"))
+    let archive_id = repository
+        .open_archive(&archive.archive)
+        .map_err(|err| err.to_string())?;
+    let entry = repository
+        .find(archive_id, &archive.name)
         .map_err(|err| err.to_string())?
-        .ok_or_else(|| format!("missing texture {texture:?}"))?;
-    let document = decode_texm(bytes).map_err(|err| err.to_string())?;
-    decode_mip_rgba8(&document, 0).map_err(|err| err.to_string())
+        .ok_or_else(|| format!("missing texture {texture_name:?}"))?;
+    let bytes = repository.read(entry).map_err(|err| err.to_string())?;
+    let document = decode_texm(Arc::from(bytes.as_slice().to_vec().into_boxed_slice()))
+        .map_err(|err| err.to_string())?;
+    (0..document.mip_count())
+        .map(|level| decode_mip_rgba8(&document, u32::try_from(level).unwrap_or(u32::MAX)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| err.to_string())
+}
+
+/// Returns the native normalized atlas transform for a signed MAT0 page index.
+///
+/// The transform is `[offset_x, offset_y, scale_x, scale_y]` and is applied as
+/// `atlas_uv = offset + page_local_uv * scale`. A negative selector addresses
+/// the complete texture.
+pub fn page_uv_transform(
+    width: u32,
+    height: u32,
+    page_rects: &[PageRect],
+    page_index: i8,
+) -> Result<[f32; 4], String> {
+    if width == 0 || height == 0 {
+        return Err("TEXM page transform has zero texture extent".to_string());
+    }
+    if page_index < 0 {
+        return Ok([0.0, 0.0, 1.0, 1.0]);
+    }
+    let rect = page_rects
+        .get(usize::from(page_index as u8))
+        .ok_or_else(|| {
+            format!(
+                "MAT0 page selector {page_index} exceeds TEXM Page rect count {}",
+                page_rects.len()
+            )
+        })?;
+    if rect.x < 0 || rect.y < 0 || rect.w <= 0 || rect.h <= 0 {
+        return Err(format!(
+            "TEXM Page rect is invalid: x={} y={} w={} h={}",
+            rect.x, rect.y, rect.w, rect.h
+        ));
+    }
+    if i64::from(rect.x) + i64::from(rect.w) > i64::from(width)
+        || i64::from(rect.y) + i64::from(rect.h) > i64::from(height)
+    {
+        return Err(format!(
+            "TEXM Page rect exceeds base extent {width}x{height}: x={} y={} w={} h={}",
+            rect.x, rect.y, rect.w, rect.h
+        ));
+    }
+    Ok([
+        f32::from(rect.x) / width as f32,
+        f32::from(rect.y) / height as f32,
+        f32::from(rect.w) / width as f32,
+        f32::from(rect.h) / height as f32,
+    ])
+}
+
+/// Crops decoded TEXM mips to a signed MAT0 page selector.
+///
+/// A selector of `-1` means that the texture has no page selection and is
+/// returned unchanged. Non-negative selectors address the TEXM `Page` table;
+/// rectangles are scaled with floor origin and ceil end for each mip level.
+/// The returned images use page-local 0..1 UVs, matching the native atlas
+/// sampling contract.
+pub fn crop_rgba8_mips_to_page(
+    mips: Vec<RgbaImage>,
+    page_rects: &[PageRect],
+    page_index: i8,
+) -> Result<Vec<RgbaImage>, String> {
+    if page_index < 0 {
+        return Ok(mips);
+    }
+    let (base_width_u32, base_height_u32) = mips
+        .first()
+        .map(|base| (base.width, base.height))
+        .ok_or_else(|| "cannot select a page from an empty TEXM mip chain".to_string())?;
+    let rect = page_rects
+        .get(usize::from(page_index as u8))
+        .ok_or_else(|| {
+            format!(
+                "MAT0 page selector {page_index} exceeds TEXM Page rect count {}",
+                page_rects.len()
+            )
+        })?;
+    if rect.x < 0 || rect.y < 0 || rect.w <= 0 || rect.h <= 0 {
+        return Err(format!(
+            "TEXM Page rect is invalid: x={} y={} w={} h={}",
+            rect.x, rect.y, rect.w, rect.h
+        ));
+    }
+    let base_x_end = i64::from(rect.x) + i64::from(rect.w);
+    let base_y_end = i64::from(rect.y) + i64::from(rect.h);
+    if base_x_end > i64::from(base_width_u32) || base_y_end > i64::from(base_height_u32) {
+        return Err(format!(
+            "TEXM Page rect exceeds base extent {}x{}: x={} y={} w={} h={}",
+            base_width_u32, base_height_u32, rect.x, rect.y, rect.w, rect.h
+        ));
+    }
+    mips.into_iter()
+        .enumerate()
+        .map(|(level, image)| {
+            let scale_width = i64::from(image.width);
+            let scale_height = i64::from(image.height);
+            let base_width = i64::from(base_width_u32);
+            let base_height = i64::from(base_height_u32);
+            let x0 = floor_mul_div(i64::from(rect.x), scale_width, base_width);
+            let x1 = ceil_mul_div(base_x_end, scale_width, base_width);
+            let y0 = floor_mul_div(i64::from(rect.y), scale_height, base_height);
+            let y1 = ceil_mul_div(base_y_end, scale_height, base_height);
+            let x0 = u32::try_from(x0)
+                .map_err(|_| format!("TEXM Page mip {level} x origin is invalid"))?;
+            let y0 = u32::try_from(y0)
+                .map_err(|_| format!("TEXM Page mip {level} y origin is invalid"))?;
+            let x1 =
+                u32::try_from(x1).map_err(|_| format!("TEXM Page mip {level} x end is invalid"))?;
+            let y1 =
+                u32::try_from(y1).map_err(|_| format!("TEXM Page mip {level} y end is invalid"))?;
+            if x0 >= x1 || y0 >= y1 || x1 > image.width || y1 > image.height {
+                return Err(format!(
+                    "TEXM Page mip {level} scaled rect is outside {}x{}: {x0},{y0}..{x1},{y1}",
+                    image.width, image.height
+                ));
+            }
+            let width = x1 - x0;
+            let height = y1 - y0;
+            let row_bytes = usize::try_from(width)
+                .ok()
+                .and_then(|width| width.checked_mul(4))
+                .ok_or_else(|| format!("TEXM Page mip {level} row size overflows"))?;
+            let capacity = usize::try_from(width)
+                .ok()
+                .and_then(|width| {
+                    usize::try_from(height)
+                        .ok()
+                        .and_then(|height| width.checked_mul(height))
+                })
+                .and_then(|pixels| pixels.checked_mul(4))
+                .ok_or_else(|| format!("TEXM Page mip {level} size overflows"))?;
+            let mut rgba8 = Vec::with_capacity(capacity);
+            let source_stride = usize::try_from(image.width)
+                .ok()
+                .and_then(|width| width.checked_mul(4))
+                .ok_or_else(|| format!("TEXM Page mip {level} source stride overflows"))?;
+            let start_x = usize::try_from(x0)
+                .ok()
+                .and_then(|x| x.checked_mul(4))
+                .ok_or_else(|| format!("TEXM Page mip {level} x offset overflows"))?;
+            for row in y0..y1 {
+                let row_start = usize::try_from(row)
+                    .ok()
+                    .and_then(|row| row.checked_mul(source_stride))
+                    .and_then(|offset| offset.checked_add(start_x))
+                    .ok_or_else(|| format!("TEXM Page mip {level} row offset overflows"))?;
+                let row_end = row_start
+                    .checked_add(row_bytes)
+                    .ok_or_else(|| format!("TEXM Page mip {level} row end overflows"))?;
+                let source = image
+                    .rgba8
+                    .get(row_start..row_end)
+                    .ok_or_else(|| format!("TEXM Page mip {level} row exceeds decoded pixels"))?;
+                rgba8.extend_from_slice(source);
+            }
+            Ok(RgbaImage {
+                width,
+                height,
+                rgba8,
+            })
+        })
+        .collect()
+}
+
+fn floor_mul_div(value: i64, scale: i64, base: i64) -> i64 {
+    let product = value.saturating_mul(scale);
+    let quotient = product / base;
+    if product < 0 && product % base != 0 {
+        quotient - 1
+    } else {
+        quotient
+    }
+}
+
+fn ceil_mul_div(value: i64, scale: i64, base: i64) -> i64 {
+    let product = value.saturating_mul(scale);
+    let quotient = product / base;
+    if product > 0 && product % base != 0 {
+        quotient + 1
+    } else {
+        quotient
+    }
 }
 
 /// Decodes terrain documents and builds immutable terrain state.
@@ -271,6 +865,8 @@ pub struct PreparedVisual {
     pub id: AssetId<PreparedVisual>,
     /// Optional mesh resource backing the visual.
     pub mesh: Option<ResourceKey>,
+    /// Source registry entry type (`EXTO`/`INTO`/etc.) when preserved.
+    pub source_type: Option<u32>,
     /// Prepared model backing the visual, when geometry is present.
     pub model_id: Option<AssetId<PreparedModel>>,
     /// Prepared WEAR table backing the visual, when geometry is present.
@@ -293,6 +889,35 @@ pub struct PreparedVisual {
     pub texture_count: usize,
     /// Number of lightmap requests decoded as TEXM.
     pub lightmap_count: usize,
+}
+
+/// Component-local animation bindings loaded from an explicitly referenced
+/// CTLD resource.
+///
+/// This data is kept beside mission component instances rather than on the
+/// shared visual/model cache, because two instances of one mesh may use
+/// different control resources.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedComponentControl {
+    /// CTLD resource that supplied these bindings.
+    pub source: ResourceKey,
+    /// Enabled source rows in their original order, including duplicate nodes.
+    pub bindings: Vec<PreparedControlNodeBinding>,
+}
+
+/// One enabled CTLD row targeting a node in a component model.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PreparedControlNodeBinding {
+    /// Target node index in the component model.
+    pub node_index: usize,
+    /// First source animation endpoint, kept as an f32 value.
+    pub frame_a: f32,
+    /// Second source animation endpoint, kept as an f32 value.
+    pub frame_b: f32,
+    /// Initial source blend value.
+    pub initial_blend: f32,
+    /// Raw native row flags.
+    pub flags: u32,
 }
 
 /// CPU-side validated model ready for a renderer upload path.
@@ -328,6 +953,12 @@ pub struct PreparedMaterial {
     pub source: ResourceKey,
     /// Parsed material key retained for compatibility with older callers.
     pub name: ResourceName,
+    /// Raw NRes MAT0 entry flags retained for runtime pipeline selection.
+    pub attr1: u32,
+    /// Native material pipeline category `(attr1 >> 2) & 0xF`.
+    pub pipeline_category: u8,
+    /// Native material feature bit `attr1 & 0x40`.
+    pub native_flag_40: bool,
     /// Decoded MAT0 payload.
     pub mat0: Mat0Document,
     /// Texture requests declared by MAT0 phases.
@@ -393,6 +1024,10 @@ pub struct MissionAssets {
     pub visuals: Vec<PreparedVisual>,
     /// Visual ids available for each mission object index.
     pub object_visuals: Vec<Vec<AssetId<PreparedVisual>>>,
+    /// Optional component-local controls aligned with each object's visual
+    /// component list. `None` means no CTLD pose override is available because
+    /// there is no explicit reference or its referenced archive/entry is absent.
+    pub object_component_controls: Vec<Vec<Option<PreparedComponentControl>>>,
 }
 
 impl MissionAssets {
@@ -829,7 +1464,38 @@ fn prepare_mission_assets_with_repository_internal<R: ResourceRepository>(
         prototype_visual_ids.push(visual_id);
     }
 
+    let mut prototype_component_controls = Vec::with_capacity(prototypes.len());
+    for (prototype_index, prototype) in prototypes.iter().enumerate() {
+        let Some(source) = prototype.control_resource.clone() else {
+            prototype_component_controls.push(None);
+            continue;
+        };
+        let PrototypeGeometry::Mesh(mesh_key) = &prototype.geometry else {
+            prototype_component_controls.push(None);
+            continue;
+        };
+        let model = models
+            .iter()
+            .find(|model| model.source == *mesh_key)
+            .ok_or_else(|| {
+                AssetError::InvalidPrototype(format!(
+                    "prototype {} references control resource {}:{} but its prepared model is missing",
+                    String::from_utf8_lossy(&prototype.key.0.0),
+                    source.archive.as_str(),
+                    String::from_utf8_lossy(&source.name.0),
+                ))
+            })?;
+        let control = prepare_component_control_from_resource(
+            repository,
+            source,
+            model.validated.node_count,
+            prototype_index,
+        )?;
+        prototype_component_controls.push(control);
+    }
+
     let mut object_visuals = Vec::with_capacity(root_prototype_spans.len());
+    let mut object_component_controls = Vec::with_capacity(root_prototype_spans.len());
     for (root_index, span) in root_prototype_spans.iter().enumerate() {
         if span.start > span.end || span.end > prototype_visual_ids.len() {
             return Err(AssetError::InvalidPrototype(format!(
@@ -837,14 +1503,17 @@ fn prepare_mission_assets_with_repository_internal<R: ResourceRepository>(
             )));
         }
         let mut ids = Vec::new();
-        let mut dedup = HashSet::new();
+        let mut controls = Vec::new();
         for index in span.clone() {
             let visual_id = prototype_visual_ids[index];
-            if dedup.insert(visual_id) {
-                ids.push(visual_id);
-            }
+            // A unit DAT is an instance tree.  Reusing one prepared visual
+            // must not collapse two component instances (for example the two
+            // identical cannons on w_m_wlk2).
+            ids.push(visual_id);
+            controls.push(prototype_component_controls[index].clone());
         }
         object_visuals.push(ids);
+        object_component_controls.push(controls);
     }
 
     let assets = MissionAssets {
@@ -854,6 +1523,7 @@ fn prepare_mission_assets_with_repository_internal<R: ResourceRepository>(
         textures,
         visuals,
         object_visuals,
+        object_component_controls,
     };
     let report = AssetPreparationReport {
         model_count: assets.models.len(),
@@ -876,9 +1546,11 @@ enum PreparedVisualSignature {
         archive: Vec<u8>,
         name: Vec<u8>,
         type_id: Option<u32>,
+        source_type: Option<u32>,
         dependency_count: usize,
     },
     NonGeometric {
+        source_type: Option<u32>,
         dependency_count: usize,
     },
 }
@@ -929,6 +1601,9 @@ struct PreparedWearSignature {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PreparedMaterialSignature {
     source: ResourceSignature,
+    attr1: u32,
+    pipeline_category: u8,
+    native_flag_40: bool,
     texture_requests: Vec<Vec<u8>>,
     lightmap_requests: Vec<Vec<u8>>,
 }
@@ -948,9 +1623,11 @@ fn prepared_visual_signature(proto: &EffectivePrototype) -> PreparedVisualSignat
             archive: key.archive.identity_bytes().to_vec(),
             name: key.name.0.clone(),
             type_id: key.type_id,
+            source_type: proto.source_type,
             dependency_count: proto.dependencies.len(),
         },
         PrototypeGeometry::NonGeometric => PreparedVisualSignature::NonGeometric {
+            source_type: proto.source_type,
             dependency_count: proto.dependencies.len(),
         },
     }
@@ -984,6 +1661,9 @@ fn prepared_wear_signature(wear: &PreparedWear) -> PreparedWearSignature {
 fn prepared_material_signature(material: &PreparedMaterial) -> PreparedMaterialSignature {
     PreparedMaterialSignature {
         source: resource_signature(&material.source),
+        attr1: material.attr1,
+        pipeline_category: material.pipeline_category,
+        native_flag_40: material.native_flag_40,
         texture_requests: material
             .texture_requests
             .iter()
@@ -1462,6 +2142,7 @@ pub fn prepare_visual(proto: &EffectivePrototype) -> Result<PreparedVisual, Asse
     Ok(PreparedVisual {
         id: AssetId::new(id),
         mesh,
+        source_type: proto.source_type,
         model_id: None,
         wear_id: None,
         model_nodes: 0,
@@ -1590,6 +2271,9 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
             id: material_id,
             source: material_key,
             name: material.name.clone(),
+            attr1: material.attr1,
+            pipeline_category: material_pipeline_category(material.attr1),
+            native_flag_40: material_native_flag_40(material.attr1),
             mat0: material.document.clone(),
             texture_requests: texture_requests.clone(),
             lightmap_requests: lightmap_requests.clone(),
@@ -1626,6 +2310,7 @@ fn prepare_visual_with_repository_internal<R: ResourceRepository>(
         visual: PreparedVisual {
             id: AssetId::new((identity_policy.visual)(proto)),
             mesh: Some(mesh_key.clone()),
+            source_type: proto.source_type,
             model_id: Some(model_id),
             wear_id: Some(wear_id),
             model_nodes: model.node_count,
@@ -2097,6 +2782,123 @@ fn read_optional_key<R: ResourceRepository>(
     Ok(Some(Arc::from(bytes.into_owned())))
 }
 
+fn prepare_component_control_from_resource<R: ResourceRepository>(
+    repository: &R,
+    source: ResourceKey,
+    model_node_count: usize,
+    prototype_index: usize,
+) -> Result<Option<PreparedComponentControl>, AssetError> {
+    let Some(payload) = read_optional_key(repository, &source, Some("component control"))? else {
+        return Ok(None);
+    };
+    decode_component_control_payload(&payload, source, model_node_count, prototype_index).map(Some)
+}
+
+fn decode_component_control_payload(
+    payload: &[u8],
+    source: ResourceKey,
+    model_node_count: usize,
+    prototype_index: usize,
+) -> Result<PreparedComponentControl, AssetError> {
+    const HEADER_BYTES: usize = 5 * 4;
+    const FIXED_SECTION_BYTES: usize = 108;
+    const SECTION_FIXED_BYTES: usize = 156;
+    const SECTION_NODE_BYTES: usize = 16;
+    const ROW_BYTES: usize = 36;
+
+    let invalid = |message: &str| {
+        AssetError::InvalidPrototype(format!(
+            "prototype {prototype_index} control {}:{}: {message}",
+            source.archive.as_str(),
+            String::from_utf8_lossy(&source.name.0),
+        ))
+    };
+    if payload.len() < HEADER_BYTES {
+        return Err(invalid("payload is shorter than its five-word header"));
+    }
+    let mut header = [0_u32; 5];
+    for (index, word) in header.iter_mut().enumerate() {
+        let offset = index * 4;
+        let bytes: [u8; 4] = payload[offset..offset + 4]
+            .try_into()
+            .expect("header slice is exactly four bytes");
+        *word = u32::from_le_bytes(bytes);
+    }
+
+    let section_count =
+        usize::try_from(header[0]).map_err(|_| invalid("section count overflows usize"))?;
+    let per_section_nodes =
+        usize::try_from(header[1]).map_err(|_| invalid("section node count overflows usize"))?;
+    let row_count =
+        usize::try_from(header[2]).map_err(|_| invalid("binding count overflows usize"))?;
+    let per_section_node_bytes = SECTION_NODE_BYTES
+        .checked_mul(per_section_nodes)
+        .ok_or_else(|| invalid("section node bytes overflow"))?;
+    let section_bytes = section_count
+        .checked_mul(
+            SECTION_FIXED_BYTES
+                .checked_add(per_section_node_bytes)
+                .ok_or_else(|| invalid("section size overflows"))?,
+        )
+        .ok_or_else(|| invalid("section table bytes overflow"))?;
+    let matrix_bytes = section_count
+        .checked_mul(section_count)
+        .and_then(|count| count.checked_mul(4))
+        .ok_or_else(|| invalid("section matrix bytes overflow"))?;
+    let row_start = HEADER_BYTES
+        .checked_add(FIXED_SECTION_BYTES)
+        .and_then(|offset| offset.checked_add(section_bytes))
+        .and_then(|offset| offset.checked_add(matrix_bytes))
+        .ok_or_else(|| invalid("binding table offset overflows"))?;
+    let row_bytes = row_count
+        .checked_mul(ROW_BYTES)
+        .ok_or_else(|| invalid("binding table bytes overflow"))?;
+    let row_end = row_start
+        .checked_add(row_bytes)
+        .ok_or_else(|| invalid("binding table end overflows"))?;
+    if row_end > payload.len() {
+        return Err(invalid("complete binding table extends past the payload"));
+    }
+
+    let mut bindings = Vec::with_capacity(row_count);
+    for row_index in 0..row_count {
+        let row_start = row_start + row_index * ROW_BYTES;
+        let row = &payload[row_start..row_start + ROW_BYTES];
+        let flags = u32::from_le_bytes(row[0x20..0x24].try_into().expect("row flags"));
+        if flags & 4 != 0 {
+            continue;
+        }
+        let node_index = u32::from_le_bytes(row[0..4].try_into().expect("row node index")) as usize;
+        if node_index >= model_node_count {
+            return Err(invalid("enabled binding node index is outside the model"));
+        }
+        let frame_a = f32::from_bits(u32::from_le_bytes(row[4..8].try_into().expect("frame A")));
+        let frame_b = f32::from_bits(u32::from_le_bytes(row[8..12].try_into().expect("frame B")));
+        let initial_blend = f32::from_bits(u32::from_le_bytes(
+            row[12..16].try_into().expect("initial blend"),
+        ));
+        if !frame_a.is_finite()
+            || !frame_b.is_finite()
+            || !initial_blend.is_finite()
+            || frame_a < 0.0
+            || frame_b < 0.0
+        {
+            return Err(invalid(
+                "enabled binding contains a non-finite or negative value",
+            ));
+        }
+        bindings.push(PreparedControlNodeBinding {
+            node_index,
+            frame_a,
+            frame_b,
+            initial_blend,
+            flags,
+        });
+    }
+
+    Ok(PreparedComponentControl { source, bindings })
+}
+
 fn sibling_name(key: &ResourceKey, extension: &str) -> Result<ResourceName, AssetError> {
     let dot = key
         .name
@@ -2114,6 +2916,7 @@ fn sibling_name(key: &ResourceKey, extension: &str) -> Result<ResourceName, Asse
 
 fn stable_visual_id(proto: &EffectivePrototype) -> u64 {
     let mut hasher = StableHasher::default();
+    proto.source_type.hash(&mut hasher);
     match &proto.geometry {
         PrototypeGeometry::Mesh(key) => {
             1_u8.hash(&mut hasher);
@@ -2198,6 +3001,105 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    fn component_control_rows_preserve_f32_values_and_source_order() {
+        let source = ResourceKey {
+            archive: parse_path("controls.rlb").expect("archive"),
+            name: resource_name(b"parts.ctl"),
+            type_id: None,
+        };
+        let payload = component_control_payload(&[
+            (99, f32::NAN, -1.0, -1.0, 4),
+            (1, 1.25, 2.5, 0.0, 0),
+            (1, 2.0, 0.0, 0.75, 1),
+        ]);
+
+        let control =
+            decode_component_control_payload(&payload, source, 2, 7).expect("valid enabled rows");
+
+        assert_eq!(control.bindings.len(), 2);
+        assert_eq!(control.bindings[0].node_index, 1);
+        assert_eq!(control.bindings[0].frame_a, 1.25);
+        assert_eq!(control.bindings[0].frame_b, 2.5);
+        assert_eq!(control.bindings[0].initial_blend, 0.0);
+        assert_eq!(control.bindings[1].node_index, 1);
+        assert_eq!(control.bindings[1].frame_a, 2.0);
+        assert_eq!(control.bindings[1].flags, 1);
+    }
+
+    #[test]
+    fn component_control_rejects_bad_bounds_but_keeps_sampler_inputs_raw() {
+        let source = ResourceKey {
+            archive: parse_path("controls.rlb").expect("archive"),
+            name: resource_name(b"parts.ctl"),
+            type_id: None,
+        };
+        let mut overflow = vec![0; 20];
+        overflow[0..4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode_component_control_payload(&overflow, source.clone(), 2, 0).is_err());
+
+        let out_of_range_node = component_control_payload(&[(2, 0.0, 1.0, 0.0, 0)]);
+        assert!(
+            decode_component_control_payload(&out_of_range_node, source.clone(), 2, 0,).is_err()
+        );
+
+        let fallback_input = component_control_payload(&[(1, 0.0, 4.0, -0.5, 0)]);
+        let control = decode_component_control_payload(&fallback_input, source.clone(), 2, 0)
+            .expect("sampler decides out-of-map fallback and blend normalization");
+        assert_eq!(control.bindings[0].frame_b, 4.0);
+        assert_eq!(control.bindings[0].initial_blend, -0.5);
+
+        let non_finite = component_control_payload(&[(1, f32::NAN, 1.0, 0.0, 0)]);
+        assert!(decode_component_control_payload(&non_finite, source, 2, 0).is_err());
+    }
+
+    fn component_control_payload(rows: &[(u32, f32, f32, f32, u32)]) -> Vec<u8> {
+        const ROW_START: usize = 5 * 4 + 108;
+        const ROW_BYTES: usize = 36;
+        let mut payload = vec![0; ROW_START + rows.len() * ROW_BYTES];
+        payload[8..12].copy_from_slice(&u32::try_from(rows.len()).expect("count").to_le_bytes());
+        for (index, (node, frame_a, frame_b, blend, flags)) in rows.iter().enumerate() {
+            let row = ROW_START + index * ROW_BYTES;
+            payload[row..row + 4].copy_from_slice(&node.to_le_bytes());
+            payload[row + 4..row + 8].copy_from_slice(&frame_a.to_bits().to_le_bytes());
+            payload[row + 8..row + 12].copy_from_slice(&frame_b.to_bits().to_le_bytes());
+            payload[row + 12..row + 16].copy_from_slice(&blend.to_bits().to_le_bytes());
+            payload[row + 0x20..row + 0x24].copy_from_slice(&flags.to_le_bytes());
+        }
+        payload
+    }
+
+    #[test]
+    fn page_uv_transform_matches_normalized_native_atlas_record() {
+        assert_eq!(
+            page_uv_transform(
+                8,
+                4,
+                &[PageRect {
+                    x: 2,
+                    w: 4,
+                    y: 1,
+                    h: 2,
+                }],
+                0,
+            ),
+            Ok([0.25, 0.25, 0.5, 0.5])
+        );
+        assert_eq!(page_uv_transform(8, 4, &[], -1), Ok([0.0, 0.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn page_uv_transform_rejects_missing_or_out_of_bounds_page() {
+        let rects = [PageRect {
+            x: 7,
+            w: 2,
+            y: 0,
+            h: 1,
+        }];
+        assert!(page_uv_transform(8, 4, &[], 0).is_err());
+        assert!(page_uv_transform(8, 4, &rects, 0).is_err());
+    }
+
+    #[test]
     fn wear_validation_cache_replays_archive_qualified_failure() {
         let repository = repository_with_archives(&[]);
         let mesh = ResourceKey {
@@ -2279,7 +3181,9 @@ mod tests {
                 type_id: Some(0x4853_454D),
             }),
             source: fparkan_prototype::PrototypeSource::DirectArchive,
+            source_type: None,
             dependencies: Vec::new(),
+            control_resource: None,
         };
         let second = EffectivePrototype {
             key: fparkan_prototype::PrototypeKey(resource_name(b"mesh")),
@@ -2290,7 +3194,9 @@ mod tests {
                 type_id: Some(0x4853_454D),
             }),
             source: fparkan_prototype::PrototypeSource::DirectArchive,
+            source_type: None,
             dependencies: Vec::new(),
+            control_resource: None,
         };
 
         assert_ne!(stable_visual_id(&first), stable_visual_id(&second));
@@ -2352,7 +3258,9 @@ mod tests {
             key: fparkan_prototype::PrototypeKey(resource_name(b"tree")),
             geometry: PrototypeGeometry::Mesh(mesh_key.clone()),
             source: fparkan_prototype::PrototypeSource::DirectArchive,
+            source_type: None,
             dependencies: vec![mesh_key.clone()],
+            control_resource: None,
         };
         let mut graph = prototype_graph_for_mesh(&prototype);
         let mut report = PrototypeGraphReport {
@@ -2465,7 +3373,9 @@ mod tests {
             key: fparkan_prototype::PrototypeKey(resource_name(b"tree")),
             geometry: PrototypeGeometry::Mesh(mesh_key),
             source: fparkan_prototype::PrototypeSource::DirectArchive,
+            source_type: None,
             dependencies: Vec::new(),
+            control_resource: None,
         };
         let mut graph = prototype_graph_for_mesh(&prototype);
         graph
@@ -2616,7 +3526,9 @@ mod tests {
             key: fparkan_prototype::PrototypeKey(resource_name(b"tree")),
             geometry: PrototypeGeometry::Mesh(mesh_key),
             source: fparkan_prototype::PrototypeSource::DirectArchive,
+            source_type: None,
             dependencies: Vec::new(),
+            control_resource: None,
         };
         let mut graph = prototype_graph_for_mesh(&prototype);
         let mut report = PrototypeGraphReport {
@@ -2649,16 +3561,20 @@ mod tests {
     }
 
     #[test]
-    fn prepare_single_visual_mission_assets_materialize_model_wear_material_and_texture_payloads() {
+    fn prepare_mission_assets_keep_instance_controls_beside_deduplicated_visuals() {
         let mesh_key = ResourceKey {
             archive: parse_path("static.rlb").expect("archive"),
             name: resource_name(b"tree.msh"),
             type_id: Some(0x4853_454D),
         };
-        let msh = minimal_model_archive();
+        let mut node = vec![0; 38];
+        node[8..].fill(0xff);
+        let msh = minimal_model_archive_with_nodes(&node);
         let mat0 = mat0_with_texture(b"TEX_A");
         let texm = texm_payload();
         let lightmap_texm = texm_payload();
+        let first_control = component_control_payload(&[(0, 1.25, 2.5, 0.25, 0)]);
+        let second_control = component_control_payload(&[(0, 2.5, 3.75, 0.75, 0)]);
         let repo = repository_with_archives_meta(&[
             (
                 "static.rlb",
@@ -2704,27 +3620,122 @@ mod tests {
                     attr2: 0,
                 }],
             ),
+            (
+                "controls.rlb",
+                &[
+                    TestNresEntry {
+                        name: b"first.ctl",
+                        payload: &first_control,
+                        type_id: 0,
+                        attr2: 0,
+                    },
+                    TestNresEntry {
+                        name: b"second.ctl",
+                        payload: &second_control,
+                        type_id: 0,
+                        attr2: 0,
+                    },
+                ],
+            ),
         ]);
-        let prototype = EffectivePrototype {
-            key: fparkan_prototype::PrototypeKey(resource_name(b"tree")),
-            geometry: PrototypeGeometry::Mesh(mesh_key),
-            source: fparkan_prototype::PrototypeSource::DirectArchive,
-            dependencies: Vec::new(),
-        };
+        let prototypes = [
+            EffectivePrototype {
+                key: fparkan_prototype::PrototypeKey(resource_name(b"tree-a")),
+                geometry: PrototypeGeometry::Mesh(mesh_key.clone()),
+                source: fparkan_prototype::PrototypeSource::DirectArchive,
+                source_type: None,
+                dependencies: vec![mesh_key.clone()],
+                control_resource: Some(ResourceKey {
+                    archive: parse_path("controls.rlb").expect("control archive"),
+                    name: resource_name(b"first.ctl"),
+                    type_id: None,
+                }),
+            },
+            EffectivePrototype {
+                key: fparkan_prototype::PrototypeKey(resource_name(b"tree-b")),
+                geometry: PrototypeGeometry::Mesh(mesh_key.clone()),
+                source: fparkan_prototype::PrototypeSource::DirectArchive,
+                source_type: None,
+                dependencies: vec![mesh_key.clone()],
+                control_resource: Some(ResourceKey {
+                    archive: parse_path("controls.rlb").expect("control archive"),
+                    name: resource_name(b"second.ctl"),
+                    type_id: None,
+                }),
+            },
+            EffectivePrototype {
+                key: fparkan_prototype::PrototypeKey(resource_name(b"tree-c")),
+                geometry: PrototypeGeometry::Mesh(mesh_key.clone()),
+                source: fparkan_prototype::PrototypeSource::DirectArchive,
+                source_type: None,
+                dependencies: vec![mesh_key],
+                control_resource: Some(ResourceKey {
+                    archive: parse_path("controls.rlb").expect("control archive"),
+                    name: resource_name(b"missing.ctl"),
+                    type_id: None,
+                }),
+            },
+        ];
 
-        let assets = prepare_mission_assets_with_repository(
-            &repo,
-            std::slice::from_ref(&(0..1)),
-            std::slice::from_ref(&prototype),
-        )
-        .expect("prepared mission assets");
+        let assets = prepare_mission_assets_with_repository(&repo, &[0..3], &prototypes)
+            .expect("prepared mission assets");
 
         assert_eq!(assets.models.len(), 1);
         assert_eq!(assets.wears.len(), 1);
         assert_eq!(assets.materials.len(), 1);
         assert_eq!(assets.textures.len(), 2);
         assert_eq!(assets.visuals.len(), 1);
-        assert_eq!(assets.object_visuals, vec![vec![assets.visuals[0].id]]);
+        assert_eq!(
+            assets.object_visuals,
+            vec![vec![
+                assets.visuals[0].id,
+                assets.visuals[0].id,
+                assets.visuals[0].id
+            ]]
+        );
+        assert_eq!(assets.object_component_controls.len(), 1);
+        let controls = &assets.object_component_controls[0];
+        assert_eq!(controls.len(), 3);
+        assert_eq!(
+            controls[0]
+                .as_ref()
+                .expect("first component control")
+                .source
+                .name,
+            resource_name(b"first.ctl")
+        );
+        assert_eq!(
+            controls[1]
+                .as_ref()
+                .expect("second component control")
+                .source
+                .name,
+            resource_name(b"second.ctl")
+        );
+        assert!(
+            controls[2].is_none(),
+            "missing explicit CTL means no override"
+        );
+        assert_eq!(
+            controls[0].as_ref().expect("first control").bindings,
+            vec![PreparedControlNodeBinding {
+                node_index: 0,
+                frame_a: 1.25,
+                frame_b: 2.5,
+                initial_blend: 0.25,
+                flags: 0,
+            }]
+        );
+        assert_eq!(
+            controls[1].as_ref().expect("second control").bindings,
+            vec![PreparedControlNodeBinding {
+                node_index: 0,
+                frame_a: 2.5,
+                frame_b: 3.75,
+                initial_blend: 0.75,
+                flags: 0,
+            }]
+        );
 
         let visual = &assets.visuals[0];
         assert_eq!(visual.model_id, Some(assets.models[0].id));
@@ -2732,6 +3743,29 @@ mod tests {
         assert_eq!(visual.material_ids, vec![assets.materials[0].id]);
         assert_eq!(visual.texture_ids.len(), 1);
         assert_eq!(visual.lightmap_ids.len(), 1);
+    }
+
+    #[test]
+    fn non_geometric_explicit_control_does_not_break_visual_preparation() {
+        let repository = repository_with_archives(&[]);
+        let prototype = EffectivePrototype {
+            key: fparkan_prototype::PrototypeKey(resource_name(b"marker")),
+            geometry: PrototypeGeometry::NonGeometric,
+            source: fparkan_prototype::PrototypeSource::ObjectsRegistry,
+            source_type: None,
+            dependencies: Vec::new(),
+            control_resource: Some(ResourceKey {
+                archive: parse_path("controls.rlb").expect("control archive"),
+                name: resource_name(b"marker.ctl"),
+                type_id: None,
+            }),
+        };
+
+        let assets = prepare_mission_assets_with_repository(&repository, &[0..1], &[prototype])
+            .expect("non-geometric visual remains valid");
+
+        assert_eq!(assets.object_visuals.len(), 1);
+        assert_eq!(assets.object_component_controls, vec![vec![None]]);
     }
 
     #[test]
@@ -2917,7 +3951,9 @@ mod tests {
             key: fparkan_prototype::PrototypeKey(resource_name(b"tree")),
             geometry: PrototypeGeometry::Mesh(mesh_key.clone()),
             source: fparkan_prototype::PrototypeSource::DirectArchive,
+            source_type: None,
             dependencies: vec![mesh_key.clone()],
+            control_resource: None,
         };
         let mut graph = prototype_graph_for_mesh(&prototype);
         let mut report = PrototypeGraphReport {
@@ -3124,7 +4160,9 @@ mod tests {
                     type_id: Some(0x4853_454D),
                 }),
                 source: fparkan_prototype::PrototypeSource::DirectArchive,
+                source_type: None,
                 dependencies: Vec::new(),
+                control_resource: None,
             },
             EffectivePrototype {
                 key: fparkan_prototype::PrototypeKey(resource_name(b"tree_b")),
@@ -3134,7 +4172,9 @@ mod tests {
                     type_id: Some(0x4853_454D),
                 }),
                 source: fparkan_prototype::PrototypeSource::DirectArchive,
+                source_type: None,
                 dependencies: Vec::new(),
+                control_resource: None,
             },
         ];
         (repo, prototypes)
@@ -3196,6 +4236,10 @@ mod tests {
     }
 
     fn minimal_model_archive() -> Vec<u8> {
+        minimal_model_archive_with_nodes(&[])
+    }
+
+    fn minimal_model_archive_with_nodes(nodes: &[u8]) -> Vec<u8> {
         struct MshEntry<'a> {
             type_id: u32,
             attr3: u32,
@@ -3208,7 +4252,7 @@ mod tests {
                 type_id: 1,
                 attr3: 38,
                 name: b"Res1",
-                payload: &[],
+                payload: nodes,
             },
             MshEntry {
                 type_id: 2,

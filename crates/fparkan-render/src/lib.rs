@@ -319,7 +319,7 @@ impl LegacyIron3dEulerTransform {
 
 /// Fixed-function blend behaviour represented without a graphics API type.
 ///
-/// This is a compatibility contract, not yet a decoded MAT0 mapping.
+/// This is the compatibility contract for the native MAT0 pipeline category.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum LegacyBlendMode {
     /// Do not blend the fragment with the existing colour.
@@ -327,6 +327,14 @@ pub enum LegacyBlendMode {
     Opaque,
     /// Blend using source alpha.
     SourceAlpha,
+    /// Add the source-alpha-scaled fragment to the existing colour.
+    Additive,
+    /// Replace the source factor with zero and use source colour as the
+    /// destination factor.
+    ZeroSourceColor,
+    /// Multiply the source by destination colour and destination by source
+    /// colour, matching the native two-colour blend mode.
+    DestColorSourceColor,
 }
 
 /// Depth-buffer behaviour represented without a graphics API type.
@@ -369,10 +377,36 @@ pub struct LegacyPipelineState {
     pub alpha_test: bool,
 }
 
+impl LegacyPipelineState {
+    /// Applies the native MAT0 pipeline category while retaining the caller's
+    /// depth and cull state.
+    ///
+    /// Categories 0..4 are the complete table recovered from the native
+    /// material path. The native table enables `GREATER_EQUAL` alpha testing
+    /// for categories 1..4; the alpha reference remains per draw range.
+    #[must_use]
+    pub const fn with_material_category(self, category: u8) -> Option<Self> {
+        let (blend, alpha_test) = match category {
+            0 => (LegacyBlendMode::Opaque, false),
+            1 => (LegacyBlendMode::SourceAlpha, true),
+            2 => (LegacyBlendMode::Additive, true),
+            3 => (LegacyBlendMode::ZeroSourceColor, true),
+            4 => (LegacyBlendMode::DestColorSourceColor, true),
+            _ => return None,
+        };
+        Some(Self {
+            blend,
+            alpha_test,
+            ..self
+        })
+    }
+}
+
 /// Canonical, backend-neutral key for a graphics-pipeline variant.
 ///
 /// The value is explicitly packed rather than hashed, so captures and caches
-/// remain stable across processes and Rust toolchain updates.
+/// remain stable across processes and Rust toolchain updates. Three bits are
+/// reserved for the five native material blend modes.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PipelineKey(u8);
 
@@ -389,6 +423,9 @@ impl From<LegacyPipelineState> for PipelineKey {
         let blend = match state.blend {
             LegacyBlendMode::Opaque => 0,
             LegacyBlendMode::SourceAlpha => 1,
+            LegacyBlendMode::Additive => 2,
+            LegacyBlendMode::ZeroSourceColor => 3,
+            LegacyBlendMode::DestColorSourceColor => 4,
         };
         let depth = match state.depth {
             LegacyDepthMode::Disabled => 0,
@@ -400,7 +437,7 @@ impl From<LegacyPipelineState> for PipelineKey {
             LegacyCullMode::BackFace => 1,
             LegacyCullMode::FrontFace => 2,
         };
-        Self(blend | (depth << 1) | (cull << 3) | (u8::from(state.alpha_test) << 5))
+        Self(blend | (depth << 3) | (cull << 5) | (u8::from(state.alpha_test) << 7))
     }
 }
 
@@ -548,5 +585,50 @@ mod tests {
             .try_row_major(),
             None
         );
+    }
+
+    #[test]
+    fn native_material_categories_preserve_depth_and_cull_state() {
+        let base = LegacyPipelineState {
+            depth: LegacyDepthMode::TestWrite,
+            cull: LegacyCullMode::BackFace,
+            ..LegacyPipelineState::default()
+        };
+        let expected = [
+            (LegacyBlendMode::Opaque, false),
+            (LegacyBlendMode::SourceAlpha, true),
+            (LegacyBlendMode::Additive, true),
+            (LegacyBlendMode::ZeroSourceColor, true),
+            (LegacyBlendMode::DestColorSourceColor, true),
+        ];
+        for (category, (blend, alpha_test)) in expected.into_iter().enumerate() {
+            let state = base
+                .with_material_category(category as u8)
+                .expect("native category is represented");
+            assert_eq!(state.blend, blend);
+            assert_eq!(state.alpha_test, alpha_test);
+            assert_eq!(state.depth, base.depth);
+            assert_eq!(state.cull, base.cull);
+        }
+        assert_eq!(base.with_material_category(5), None);
+    }
+
+    #[test]
+    fn native_material_categories_have_distinct_pipeline_keys() {
+        let base = LegacyPipelineState {
+            depth: LegacyDepthMode::TestWrite,
+            ..LegacyPipelineState::default()
+        };
+        let keys: Vec<_> = (0..=4)
+            .map(|category| {
+                PipelineKey::from(
+                    base.with_material_category(category)
+                        .expect("native category is represented"),
+                )
+            })
+            .collect();
+        for (index, key) in keys.iter().enumerate() {
+            assert!(keys[index + 1..].iter().all(|other| other != key));
+        }
     }
 }

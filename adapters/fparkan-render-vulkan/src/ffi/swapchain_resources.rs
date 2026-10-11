@@ -8,38 +8,85 @@ use fparkan_render::{
 use std::collections::BTreeMap;
 
 use super::{
-    color_subresource_range, create_depth_attachment, destroy_depth_attachment,
-    VulkanAllocatedBuffer, VulkanAllocatedImage, VulkanDepthAttachment, VulkanInstanceProbe,
-    VulkanLogicalDeviceProbe, VulkanSmokeRendererError, VulkanSwapchainProbe,
-    TRIANGLE_FRAGMENT_SHADER_WORDS, TRIANGLE_VERTEX_SHADER_WORDS,
+    color_subresource_range, create_depth_attachment, create_material_specular_buffer,
+    destroy_depth_attachment, VulkanAllocatedBuffer, VulkanAllocatedImage, VulkanDepthAttachment,
+    VulkanInstanceProbe, VulkanLogicalDeviceProbe, VulkanSmokeRendererError, VulkanSwapchainProbe,
+    TRIANGLE_FRAGMENT_SHADER_WORDS, TRIANGLE_VERTEX_SHADER_WORDS, VULKAN_FRAME_UNIFORM_BYTES,
+    VULKAN_MATERIAL_SPECULAR_RECORD_BYTES,
 };
 
 pub(super) struct VulkanSwapchainResources {
     pub(super) image_views: Vec<vk::ImageView>,
     pub(super) images: Vec<vk::Image>,
     pub(super) readback_buffers: Vec<VulkanAllocatedBuffer>,
-    pub(super) depth_attachment: VulkanDepthAttachment,
+    /// One depth image per swapchain image so frames can overlap safely.
+    pub(super) depth_attachments: Vec<VulkanDepthAttachment>,
+    /// A render-finished semaphore dedicated to each swapchain image.
+    pub(super) render_finished: Vec<vk::Semaphore>,
     pub(super) render_pass: vk::RenderPass,
     pub(super) pipeline_layout: vk::PipelineLayout,
     pub(super) descriptor_set_layout: vk::DescriptorSetLayout,
     pub(super) descriptor_pool: vk::DescriptorPool,
     pub(super) descriptor_sets: Vec<vk::DescriptorSet>,
     pub(super) sampler: vk::Sampler,
+    pub(super) frame_uniform_buffer: VulkanAllocatedBuffer,
+    pub(super) frame_uniform_stride: u64,
+    pub(super) material_specular_buffer: VulkanAllocatedBuffer,
+    pub(super) material_specular_stride: u64,
     /// Live graphics pipelines indexed by canonical backend-neutral state.
     pub(super) pipelines: BTreeMap<PipelineKey, vk::Pipeline>,
     pub(super) framebuffers: Vec<vk::Framebuffer>,
     pub(super) command_buffers: Vec<vk::CommandBuffer>,
 }
 
+pub(super) fn update_material_texture_descriptor(
+    device: &VulkanLogicalDeviceProbe,
+    resources: &VulkanSwapchainResources,
+    material_index: usize,
+    texture_slot: usize,
+    texture: &VulkanAllocatedImage,
+) -> Result<(), VulkanSmokeRendererError> {
+    if texture_slot >= 4 {
+        return Err(VulkanSmokeRendererError::InvalidStaticTexture {
+            context: "dynamic material texture slot is out of bounds",
+        });
+    }
+    let descriptor_set = resources
+        .descriptor_sets
+        .get(material_index)
+        .copied()
+        .ok_or(VulkanSmokeRendererError::InvalidStaticTexture {
+            context: "dynamic material descriptor set is out of bounds",
+        })?;
+    let image_info = vk::DescriptorImageInfo::default()
+        .sampler(resources.sampler)
+        .image_view(texture.view)
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    let write = vk::WriteDescriptorSet::default()
+        .dst_set(descriptor_set)
+        .dst_binding(u32::try_from(texture_slot).unwrap_or(u32::MAX))
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .image_info(std::slice::from_ref(&image_info));
+    // SAFETY: the renderer idles the device before changing a descriptor that
+    // may be referenced by an in-flight command buffer.
+    unsafe { device.device().update_descriptor_sets(&[write], &[]) };
+    Ok(())
+}
+
 struct PartialSwapchainResources {
     image_views: Vec<vk::ImageView>,
     readback_buffers: Vec<VulkanAllocatedBuffer>,
-    depth_attachment: Option<VulkanDepthAttachment>,
+    depth_attachments: Vec<VulkanDepthAttachment>,
+    render_finished: Vec<vk::Semaphore>,
     render_pass: Option<vk::RenderPass>,
     pipeline_layout: Option<vk::PipelineLayout>,
     descriptor_set_layout: Option<vk::DescriptorSetLayout>,
     descriptor_pool: Option<vk::DescriptorPool>,
     sampler: Option<vk::Sampler>,
+    frame_uniform_buffer: Option<VulkanAllocatedBuffer>,
+    frame_uniform_stride: u64,
+    material_specular_buffer: Option<VulkanAllocatedBuffer>,
+    material_specular_stride: u64,
     pipelines: BTreeMap<PipelineKey, vk::Pipeline>,
     framebuffers: Vec<vk::Framebuffer>,
     command_buffers: Vec<vk::CommandBuffer>,
@@ -53,6 +100,7 @@ pub(super) fn create_swapchain_resources(
     vertex_buffer: &VulkanAllocatedBuffer,
     index_buffer: &VulkanAllocatedBuffer,
     textures: &[VulkanAllocatedImage],
+    texture_slot_indices: &[usize],
     draw_ranges: &[super::VulkanStaticDrawRange],
     depth_request: DepthStencilSupport,
     reuse_command_pool: bool,
@@ -74,16 +122,57 @@ pub(super) fn create_swapchain_resources(
             swapchain.report.plan.format.format,
         )?,
         readback_buffers: Vec::new(),
-        depth_attachment: None,
+        depth_attachments: Vec::new(),
+        render_finished: Vec::new(),
         render_pass: None,
         pipeline_layout: None,
         descriptor_set_layout: None,
         descriptor_pool: None,
         sampler: None,
+        frame_uniform_buffer: None,
+        frame_uniform_stride: 0,
+        material_specular_buffer: None,
+        material_specular_stride: 0,
         pipelines: BTreeMap::new(),
         framebuffers: Vec::new(),
         command_buffers: Vec::new(),
     };
+    let semaphore_info = vk::SemaphoreCreateInfo::default();
+    for _ in &images {
+        // SAFETY: The semaphore belongs to this live logical device and is
+        // destroyed with the swapchain resources.
+        match unsafe { device.device().create_semaphore(&semaphore_info, None) } {
+            Ok(semaphore) => partial.render_finished.push(semaphore),
+            Err(result) => {
+                destroy_partial_swapchain_resources(device, command_pool, partial);
+                return Err(VulkanSmokeRendererError::VulkanOperation {
+                    context: "vkCreateSemaphore(render_finished)",
+                    result,
+                });
+            }
+        }
+    }
+    let (frame_uniform_buffer, frame_uniform_stride) =
+        match super::create_frame_uniform_buffer(instance, device) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                destroy_partial_swapchain_resources(device, command_pool, partial);
+                return Err(error);
+            }
+        };
+    partial.frame_uniform_stride = frame_uniform_stride;
+    partial.frame_uniform_buffer = Some(frame_uniform_buffer);
+    let material_count = texture_slot_indices.len() / 4;
+    let (material_specular_buffer, material_specular_stride) =
+        match create_material_specular_buffer(instance, device, material_count) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                destroy_partial_swapchain_resources(device, command_pool, partial);
+                return Err(error);
+            }
+        };
+    partial.material_specular_stride = material_specular_stride;
+    partial.material_specular_buffer = Some(material_specular_buffer);
     let (
         depth_attachment,
         render_pass,
@@ -99,8 +188,17 @@ pub(super) fn create_swapchain_resources(
         swapchain.report.plan.format.format,
         swapchain.report.plan.extent,
         textures,
+        texture_slot_indices,
         draw_ranges,
         depth_request,
+        partial
+            .frame_uniform_buffer
+            .as_ref()
+            .expect("frame uniform buffer is present before descriptor creation"),
+        partial
+            .material_specular_buffer
+            .as_ref()
+            .expect("material specular buffer is present before descriptor creation"),
     ) {
         Ok(bundle) => bundle,
         Err(error) => {
@@ -108,19 +206,35 @@ pub(super) fn create_swapchain_resources(
             return Err(error);
         }
     };
-    let depth_view = depth_attachment.image.view;
-    partial.depth_attachment = Some(depth_attachment);
+    // Keep every handle from the bundle in the partial owner before creating
+    // the remaining per-image depth attachments. That loop can fail after the
+    // first attachment, and its error path must destroy the whole bundle.
+    partial.depth_attachments.push(depth_attachment);
     partial.render_pass = Some(render_pass);
     partial.pipeline_layout = Some(pipeline_layout);
     partial.descriptor_set_layout = Some(descriptor_set_layout);
     partial.descriptor_pool = Some(descriptor_pool);
     partial.sampler = Some(sampler);
     partial.pipelines = pipelines;
+    for _ in 1..images.len() {
+        match create_depth_attachment(
+            instance,
+            device,
+            swapchain.report.plan.extent,
+            depth_request,
+        ) {
+            Ok(attachment) => partial.depth_attachments.push(attachment),
+            Err(error) => {
+                destroy_partial_swapchain_resources(device, command_pool, partial);
+                return Err(error);
+            }
+        }
+    }
     let framebuffers = match create_swapchain_framebuffers(
         device,
         render_pass,
         &partial.image_views,
-        depth_view,
+        &partial.depth_attachments,
         swapchain.report.plan.extent,
     ) {
         Ok(framebuffers) => framebuffers,
@@ -168,24 +282,44 @@ pub(super) fn create_swapchain_resources(
     };
     partial.command_buffers = command_buffers;
     let _ = (vertex_buffer, index_buffer);
-    let depth_attachment =
-        partial
-            .depth_attachment
-            .take()
-            .ok_or(VulkanSmokeRendererError::InvariantViolation {
-                context: "depth attachment ownership after swapchain setup",
-            })?;
+    if partial.depth_attachments.len() != images.len()
+        || partial.render_finished.len() != images.len()
+    {
+        destroy_partial_swapchain_resources(device, command_pool, partial);
+        return Err(VulkanSmokeRendererError::InvariantViolation {
+            context: "swapchain per-image resource count after setup",
+        });
+    }
     Ok(VulkanSwapchainResources {
         image_views: partial.image_views,
         images,
         readback_buffers: partial.readback_buffers,
-        depth_attachment,
-        render_pass,
-        pipeline_layout,
-        descriptor_set_layout,
-        descriptor_pool,
+        depth_attachments: partial.depth_attachments,
+        render_finished: partial.render_finished,
+        render_pass: partial
+            .render_pass
+            .expect("render pass is present after successful swapchain setup"),
+        pipeline_layout: partial
+            .pipeline_layout
+            .expect("pipeline layout is present after successful swapchain setup"),
+        descriptor_set_layout: partial
+            .descriptor_set_layout
+            .expect("descriptor set layout is present after successful swapchain setup"),
+        descriptor_pool: partial
+            .descriptor_pool
+            .expect("descriptor pool is present after successful swapchain setup"),
         descriptor_sets,
-        sampler,
+        sampler: partial
+            .sampler
+            .expect("sampler is present after successful swapchain setup"),
+        frame_uniform_buffer: partial
+            .frame_uniform_buffer
+            .expect("frame uniform buffer is present after successful swapchain setup"),
+        frame_uniform_stride: partial.frame_uniform_stride,
+        material_specular_buffer: partial
+            .material_specular_buffer
+            .expect("material specular buffer is present after successful swapchain setup"),
+        material_specular_stride: partial.material_specular_stride,
         pipelines: partial.pipelines,
         framebuffers: partial.framebuffers,
         command_buffers: partial.command_buffers,
@@ -210,8 +344,11 @@ fn create_swapchain_pipeline_bundle(
     format: i32,
     extent: (u32, u32),
     textures: &[VulkanAllocatedImage],
+    texture_slot_indices: &[usize],
     draw_ranges: &[super::VulkanStaticDrawRange],
     depth_request: DepthStencilSupport,
+    frame_uniform_buffer: &VulkanAllocatedBuffer,
+    material_specular_buffer: &VulkanAllocatedBuffer,
 ) -> Result<
     (
         VulkanDepthAttachment,
@@ -234,7 +371,14 @@ fn create_swapchain_pipeline_bundle(
         }
     };
     let (descriptor_set_layout, descriptor_pool, descriptor_sets, sampler) =
-        create_texture_descriptor_bundle(device, textures).inspect_err(|_| {
+        create_texture_descriptor_bundle(
+            device,
+            textures,
+            texture_slot_indices,
+            frame_uniform_buffer,
+            material_specular_buffer,
+        )
+        .inspect_err(|_| {
             // SAFETY: The render pass was created above on this live logical device and is destroyed on setup failure.
             unsafe { device.device().destroy_render_pass(render_pass, None) };
             destroy_depth_attachment(device, &depth_attachment);
@@ -289,12 +433,23 @@ fn create_swapchain_framebuffers(
     device: &VulkanLogicalDeviceProbe,
     render_pass: vk::RenderPass,
     image_views: &[vk::ImageView],
-    depth_view: vk::ImageView,
+    depth_attachments: &[VulkanDepthAttachment],
     extent: (u32, u32),
 ) -> Result<Vec<vk::Framebuffer>, VulkanSmokeRendererError> {
+    if image_views.len() != depth_attachments.len() {
+        return Err(VulkanSmokeRendererError::InvariantViolation {
+            context: "swapchain color/depth attachment count",
+        });
+    }
     let mut framebuffers = Vec::with_capacity(image_views.len());
-    for image_view in image_views.iter().copied() {
-        match create_framebuffer(device, render_pass, image_view, depth_view, extent) {
+    for (image_view, depth_attachment) in image_views.iter().copied().zip(depth_attachments) {
+        match create_framebuffer(
+            device,
+            render_pass,
+            image_view,
+            depth_attachment.image.view,
+            extent,
+        ) {
             Ok(framebuffer) => framebuffers.push(framebuffer),
             Err(error) => {
                 // SAFETY: These framebuffers were created above on this live logical device and are destroyed on setup failure.
@@ -339,7 +494,7 @@ fn create_image_view(
         .image(image)
         .view_type(vk::ImageViewType::TYPE_2D)
         .format(vk::Format::from_raw(format))
-        .subresource_range(color_subresource_range());
+        .subresource_range(color_subresource_range(1));
     // SAFETY: The image comes from the live swapchain and the subresource range covers its color aspect.
     unsafe { device.device().create_image_view(&create_info, None) }.map_err(|error| {
         VulkanSmokeRendererError::VulkanOperation {
@@ -384,10 +539,21 @@ fn create_render_pass(
     let dependency = vk::SubpassDependency::default()
         .src_subpass(vk::SUBPASS_EXTERNAL)
         .dst_subpass(0)
-        .src_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
-        .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+        .src_stage_mask(
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+        )
+        .dst_stage_mask(
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+        )
         .src_access_mask(vk::AccessFlags::empty())
-        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE);
+        .dst_access_mask(
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        );
     let attachments = [color_attachment, depth_attachment];
     let subpasses = [subpass];
     let dependencies = [dependency];
@@ -409,16 +575,16 @@ fn create_pipeline_layout(
     descriptor_set_layout: vk::DescriptorSetLayout,
 ) -> Result<vk::PipelineLayout, VulkanSmokeRendererError> {
     let set_layouts = [descriptor_set_layout];
-    let push_constant_ranges = [
-        vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::VERTEX)
-            .offset(0)
-            .size(64),
-        vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-            .offset(64)
-            .size(u32::try_from(std::mem::size_of::<f32>()).unwrap_or(u32::MAX)),
-    ];
+    // Material data occupies one 128-byte push-constant allocation shared by
+    // both stages; the vertex stage also reads its specular pair from the
+    // dynamic storage buffer at descriptor binding 5.  Camera data is supplied
+    // by the dynamic frame UBO at descriptor binding 4.
+    // Expose the complete block from offset zero so drivers validate the
+    // fragment member's declared offset against the pipeline layout.
+    let push_constant_ranges = [vk::PushConstantRange::default()
+        .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
+        .offset(0)
+        .size(32 * u32::try_from(std::mem::size_of::<f32>()).unwrap_or(u32::MAX))];
     let create_info = vk::PipelineLayoutCreateInfo::default()
         .set_layouts(&set_layouts)
         .push_constant_ranges(&push_constant_ranges);
@@ -434,6 +600,9 @@ fn create_pipeline_layout(
 fn create_texture_descriptor_bundle(
     device: &VulkanLogicalDeviceProbe,
     textures: &[VulkanAllocatedImage],
+    texture_slot_indices: &[usize],
+    frame_uniform_buffer: &VulkanAllocatedBuffer,
+    material_specular_buffer: &VulkanAllocatedBuffer,
 ) -> Result<
     (
         vk::DescriptorSetLayout,
@@ -443,12 +612,32 @@ fn create_texture_descriptor_bundle(
     ),
     VulkanSmokeRendererError,
 > {
-    let binding = vk::DescriptorSetLayoutBinding::default()
-        .binding(0)
-        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-        .descriptor_count(1)
-        .stage_flags(vk::ShaderStageFlags::FRAGMENT);
-    let bindings = [binding];
+    const TEXTURES_PER_MATERIAL: usize = 4;
+    const FRAME_BINDING: u32 = 4;
+    const MATERIAL_SPECULAR_BINDING: u32 = 5;
+    let mut bindings = (0..TEXTURES_PER_MATERIAL)
+        .map(|binding| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(u32::try_from(binding).unwrap_or(u32::MAX))
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+        })
+        .collect::<Vec<_>>();
+    bindings.push(
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(FRAME_BINDING)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
+    );
+    bindings.push(
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(MATERIAL_SPECULAR_BINDING)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER_DYNAMIC)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX),
+    );
     let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
     // SAFETY: The layout description is stack-owned and references no external memory.
     let layout = unsafe {
@@ -460,23 +649,40 @@ fn create_texture_descriptor_bundle(
         context: "vkCreateDescriptorSetLayout",
         result,
     })?;
-    let texture_count = u32::try_from(textures.len()).map_err(|_| {
+    let texture_count = u32::try_from(texture_slot_indices.len()).map_err(|_| {
         VulkanSmokeRendererError::InvariantViolation {
             context: "static material texture count exceeds Vulkan descriptor limit",
         }
     })?;
-    if texture_count == 0 {
+    if texture_count == 0
+        || !texture_slot_indices
+            .len()
+            .is_multiple_of(TEXTURES_PER_MATERIAL)
+        || texture_slot_indices
+            .iter()
+            .any(|texture_index| *texture_index >= textures.len())
+    {
+        // SAFETY: The layout was created above on this device and is rolled
+        // back before reporting malformed material-slot input.
+        unsafe { device.device().destroy_descriptor_set_layout(layout, None) };
         return Err(VulkanSmokeRendererError::InvariantViolation {
-            context: "static material texture list is empty",
+            context: "static material texture slots are invalid",
         });
     }
+    let material_count = texture_count / u32::try_from(TEXTURES_PER_MATERIAL).unwrap_or(1);
     let pool_size = vk::DescriptorPoolSize::default()
         .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
         .descriptor_count(texture_count);
-    let pool_sizes = [pool_size];
+    let frame_pool_size = vk::DescriptorPoolSize::default()
+        .ty(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+        .descriptor_count(material_count);
+    let material_specular_pool_size = vk::DescriptorPoolSize::default()
+        .ty(vk::DescriptorType::STORAGE_BUFFER_DYNAMIC)
+        .descriptor_count(material_count);
+    let pool_sizes = [pool_size, frame_pool_size, material_specular_pool_size];
     let pool_info = vk::DescriptorPoolCreateInfo::default()
         .pool_sizes(&pool_sizes)
-        .max_sets(texture_count);
+        .max_sets(material_count);
     let pool =
         // SAFETY: The pool description is stack-owned and reserves exactly one descriptor.
         unsafe { device.device().create_descriptor_pool(&pool_info, None) }.map_err(|result| {
@@ -487,7 +693,7 @@ fn create_texture_descriptor_bundle(
                 result,
             }
         })?;
-    let layouts = vec![layout; textures.len()];
+    let layouts = vec![layout; usize::try_from(material_count).unwrap_or(0)];
     let allocate_info = vk::DescriptorSetAllocateInfo::default()
         .descriptor_pool(pool)
         .set_layouts(&layouts);
@@ -511,7 +717,9 @@ fn create_texture_descriptor_bundle(
         .address_mode_u(vk::SamplerAddressMode::REPEAT)
         .address_mode_v(vk::SamplerAddressMode::REPEAT)
         .address_mode_w(vk::SamplerAddressMode::REPEAT)
-        .max_lod(0.0);
+        // The uploaded images carry a complete CPU-generated mip chain; the
+        // sampler clamps to the largest legal level for each image.
+        .max_lod(16.0);
     let sampler =
         // SAFETY: The sampler create info is stack-owned and has no unsupported optional features.
         unsafe { device.device().create_sampler(&sampler_info, None) }.map_err(|result| {
@@ -525,27 +733,51 @@ fn create_texture_descriptor_bundle(
                 result,
             }
         })?;
-    let image_infos = textures
+    let image_infos = texture_slot_indices
         .iter()
-        .map(|texture| {
+        .map(|texture_index| {
+            let texture = &textures[*texture_index];
             vk::DescriptorImageInfo::default()
                 .sampler(sampler)
                 .image_view(texture.view)
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
         })
         .collect::<Vec<_>>();
-    let writes = descriptor_sets
-        .iter()
-        .copied()
-        .zip(image_infos.iter())
-        .map(|(descriptor_set, image_info)| {
+    let frame_info = vk::DescriptorBufferInfo::default()
+        .buffer(frame_uniform_buffer.buffer)
+        .offset(0)
+        .range(VULKAN_FRAME_UNIFORM_BYTES as u64);
+    let material_specular_info = vk::DescriptorBufferInfo::default()
+        .buffer(material_specular_buffer.buffer)
+        .offset(0)
+        .range(VULKAN_MATERIAL_SPECULAR_RECORD_BYTES as u64);
+    let mut writes = Vec::with_capacity(descriptor_sets.len() * (TEXTURES_PER_MATERIAL + 2));
+    for (set_index, descriptor_set) in descriptor_sets.iter().copied().enumerate() {
+        for binding in 0..TEXTURES_PER_MATERIAL {
+            let image_info = &image_infos[set_index * TEXTURES_PER_MATERIAL + binding];
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(u32::try_from(binding).unwrap_or(u32::MAX))
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(image_info)),
+            );
+        }
+        writes.push(
             vk::WriteDescriptorSet::default()
                 .dst_set(descriptor_set)
-                .dst_binding(0)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .image_info(std::slice::from_ref(image_info))
-        })
-        .collect::<Vec<_>>();
+                .dst_binding(FRAME_BINDING)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+                .buffer_info(std::slice::from_ref(&frame_info)),
+        );
+        writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(MATERIAL_SPECULAR_BINDING)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER_DYNAMIC)
+                .buffer_info(std::slice::from_ref(&material_specular_info)),
+        );
+    }
     // SAFETY: Descriptor sets, sampler and image views are live; every texture upload completed its shader-read transition.
     unsafe { device.device().update_descriptor_sets(&writes, &[]) };
     Ok((layout, pool, descriptor_sets, sampler))
@@ -598,15 +830,16 @@ fn create_graphics_pipeline(
     extent: (u32, u32),
     state: LegacyPipelineState,
 ) -> Result<vk::Pipeline, VulkanSmokeRendererError> {
-    let vertex_shader = create_shader_module(device, TRIANGLE_VERTEX_SHADER_WORDS)?;
-    let fragment_shader = match create_shader_module(device, TRIANGLE_FRAGMENT_SHADER_WORDS) {
-        Ok(module) => module,
-        Err(error) => {
-            // SAFETY: The shader module was created above on this live logical device and is destroyed on setup failure.
-            unsafe { device.device().destroy_shader_module(vertex_shader, None) };
-            return Err(error);
-        }
-    };
+    let vertex_shader = create_shader_module(device, TRIANGLE_VERTEX_SHADER_WORDS, "vertex")?;
+    let fragment_shader =
+        match create_shader_module(device, TRIANGLE_FRAGMENT_SHADER_WORDS, "fragment") {
+            Ok(module) => module,
+            Err(error) => {
+                // SAFETY: The shader module was created above on this live logical device and is destroyed on setup failure.
+                unsafe { device.device().destroy_shader_module(vertex_shader, None) };
+                return Err(error);
+            }
+        };
     let entry_point = c"main";
     let shader_stages = [
         vk::PipelineShaderStageCreateInfo::default()
@@ -620,7 +853,7 @@ fn create_graphics_pipeline(
     ];
     let vertex_binding = vk::VertexInputBindingDescription::default()
         .binding(0)
-        .stride(u32::try_from(8 * std::mem::size_of::<f32>()).unwrap_or(u32::MAX))
+        .stride(u32::try_from(14 * std::mem::size_of::<f32>()).unwrap_or(u32::MAX))
         .input_rate(vk::VertexInputRate::VERTEX);
     let vertex_attributes = [
         vk::VertexInputAttributeDescription::default()
@@ -636,8 +869,23 @@ fn create_graphics_pipeline(
         vk::VertexInputAttributeDescription::default()
             .binding(0)
             .location(2)
-            .format(vk::Format::R32G32_SFLOAT)
+            .format(vk::Format::R32G32B32_SFLOAT)
             .offset(u32::try_from(6 * std::mem::size_of::<f32>()).unwrap_or(u32::MAX)),
+        vk::VertexInputAttributeDescription::default()
+            .binding(0)
+            .location(3)
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset(u32::try_from(9 * std::mem::size_of::<f32>()).unwrap_or(u32::MAX)),
+        vk::VertexInputAttributeDescription::default()
+            .binding(0)
+            .location(4)
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset(u32::try_from(11 * std::mem::size_of::<f32>()).unwrap_or(u32::MAX)),
+        vk::VertexInputAttributeDescription::default()
+            .binding(0)
+            .location(5)
+            .format(vk::Format::R32_SFLOAT)
+            .offset(u32::try_from(13 * std::mem::size_of::<f32>()).unwrap_or(u32::MAX)),
     ];
     let vertex_bindings = [vertex_binding];
     let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default()
@@ -685,6 +933,21 @@ fn create_graphics_pipeline(
         .depth_compare_op(vk::CompareOp::LESS_OR_EQUAL)
         .depth_bounds_test_enable(false)
         .stencil_test_enable(false);
+    let (blend_enable, src_color_blend_factor, dst_color_blend_factor) = match state.blend {
+        LegacyBlendMode::Opaque => (false, vk::BlendFactor::ONE, vk::BlendFactor::ZERO),
+        LegacyBlendMode::SourceAlpha => (
+            true,
+            vk::BlendFactor::SRC_ALPHA,
+            vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+        ),
+        LegacyBlendMode::Additive => (true, vk::BlendFactor::SRC_ALPHA, vk::BlendFactor::ONE),
+        LegacyBlendMode::ZeroSourceColor => {
+            (true, vk::BlendFactor::ZERO, vk::BlendFactor::SRC_COLOR)
+        }
+        LegacyBlendMode::DestColorSourceColor => {
+            (true, vk::BlendFactor::DST_COLOR, vk::BlendFactor::SRC_COLOR)
+        }
+    };
     let color_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
         .color_write_mask(
             vk::ColorComponentFlags::R
@@ -692,12 +955,12 @@ fn create_graphics_pipeline(
                 | vk::ColorComponentFlags::B
                 | vk::ColorComponentFlags::A,
         )
-        .blend_enable(state.blend == LegacyBlendMode::SourceAlpha)
-        .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
-        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .blend_enable(blend_enable)
+        .src_color_blend_factor(src_color_blend_factor)
+        .dst_color_blend_factor(dst_color_blend_factor)
         .color_blend_op(vk::BlendOp::ADD)
-        .src_alpha_blend_factor(vk::BlendFactor::ONE)
-        .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .src_alpha_blend_factor(src_color_blend_factor)
+        .dst_alpha_blend_factor(dst_color_blend_factor)
         .alpha_blend_op(vk::BlendOp::ADD);
     let color_blend_attachments = [color_blend_attachment];
     let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
@@ -738,12 +1001,17 @@ fn create_graphics_pipeline(
 fn create_shader_module(
     device: &VulkanLogicalDeviceProbe,
     words: &[u32],
+    stage: &'static str,
 ) -> Result<vk::ShaderModule, VulkanSmokeRendererError> {
     let create_info = vk::ShaderModuleCreateInfo::default().code(words);
     // SAFETY: The SPIR-V slice points to static checked-in words and lives for the duration of the call.
     unsafe { device.device().create_shader_module(&create_info, None) }.map_err(|error| {
         VulkanSmokeRendererError::VulkanOperation {
-            context: "vkCreateShaderModule",
+            context: if stage == "vertex" {
+                "vkCreateShaderModule(vertex)"
+            } else {
+                "vkCreateShaderModule(fragment)"
+            },
             result: error,
         }
     })
@@ -821,7 +1089,9 @@ pub(super) fn destroy_swapchain_resources(
         device
             .device()
             .destroy_render_pass(resources.render_pass, None);
-        destroy_depth_attachment(device, &resources.depth_attachment);
+        for depth_attachment in resources.depth_attachments {
+            destroy_depth_attachment(device, &depth_attachment);
+        }
         for image_view in resources.image_views {
             device.device().destroy_image_view(image_view, None);
         }
@@ -829,6 +1099,21 @@ pub(super) fn destroy_swapchain_resources(
             device.device().destroy_buffer(buffer.buffer, None);
             device.device().free_memory(buffer.memory, None);
         }
+        for semaphore in resources.render_finished {
+            device.device().destroy_semaphore(semaphore, None);
+        }
+        device
+            .device()
+            .destroy_buffer(resources.frame_uniform_buffer.buffer, None);
+        device
+            .device()
+            .free_memory(resources.frame_uniform_buffer.memory, None);
+        device
+            .device()
+            .destroy_buffer(resources.material_specular_buffer.buffer, None);
+        device
+            .device()
+            .free_memory(resources.material_specular_buffer.memory, None);
     }
 }
 
@@ -871,13 +1156,24 @@ fn destroy_partial_swapchain_resources(
         if let Some(render_pass) = partial.render_pass {
             device.device().destroy_render_pass(render_pass, None);
         }
-        if let Some(depth_attachment) = partial.depth_attachment {
+        for depth_attachment in partial.depth_attachments {
             destroy_depth_attachment(device, &depth_attachment);
         }
         for image_view in partial.image_views {
             device.device().destroy_image_view(image_view, None);
         }
         for buffer in partial.readback_buffers {
+            device.device().destroy_buffer(buffer.buffer, None);
+            device.device().free_memory(buffer.memory, None);
+        }
+        for semaphore in partial.render_finished {
+            device.device().destroy_semaphore(semaphore, None);
+        }
+        if let Some(buffer) = partial.frame_uniform_buffer {
+            device.device().destroy_buffer(buffer.buffer, None);
+            device.device().free_memory(buffer.memory, None);
+        }
+        if let Some(buffer) = partial.material_specular_buffer {
             device.device().destroy_buffer(buffer.buffer, None);
             device.device().free_memory(buffer.memory, None);
         }

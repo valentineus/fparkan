@@ -67,6 +67,26 @@ pub struct MaterialPhase {
     pub texture_raw: [u8; 16],
 }
 
+impl MaterialPhase {
+    /// Decodes the native floating-point material coefficients.
+    #[must_use]
+    pub fn coefficients(&self) -> MaterialCoefficients {
+        let normalized = |index: usize| f32::from(self.parameters[index]) / 255.0;
+        MaterialCoefficients {
+            additive_rgb: [normalized(0), normalized(1), normalized(2)],
+            opacity: f32::from(self.parameters[3]) * 0.01,
+            directional_rgb: [normalized(4), normalized(5), normalized(6)],
+            directional_extra: normalized(7),
+            specular_rgb: [normalized(8), normalized(9), normalized(10)],
+            specular_extra: normalized(11),
+            extra_rgb: [normalized(12), normalized(13), normalized(14)],
+            extra_alpha: normalized(15),
+            power: self.parameters[16],
+            page_index: i8::from_ne_bytes([self.parameters[17]]),
+        }
+    }
+}
+
 /// Material animation block.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaterialAnimationBlock {
@@ -100,38 +120,88 @@ pub enum MaterialFallback {
     FirstEntry,
 }
 
-/// Material timeline mode.
+/// Native MAT0 animation mode encoded by `header_raw & 7`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MaterialTimelineMode {
-    /// Play once from phase zero.
-    OneShot,
-    /// Clamp frame to the last phase.
-    Clamp,
-    /// Loop over all phases.
+pub enum MaterialAnimationMode {
+    /// Repeat the timeline from its first key.
     Loop,
-    /// Ping-pong over all phases.
+    /// Repeat the timeline in alternating forward and reverse directions.
     PingPong,
+    /// Hold the final key after the timeline duration.
+    Clamp,
+    /// Choose a fresh time from the caller-provided random value per query.
+    RandomPerQuery,
+    /// Preserve an unknown native mode without making the sampler panic.
+    Unknown(u8),
 }
 
-/// Material runtime sampling profile.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MaterialTimelineProfile {
-    /// Timeline mode.
-    pub mode: MaterialTimelineMode,
-    /// Apply deterministic material-only random offset.
-    pub random_offset: bool,
+impl MaterialAnimationMode {
+    /// Decodes the low three mode bits from a native block header.
+    #[must_use]
+    pub const fn from_header(header_raw: u32) -> Self {
+        match (header_raw & 7) as u8 {
+            0 => Self::Loop,
+            1 => Self::PingPong,
+            2 => Self::Clamp,
+            3 => Self::RandomPerQuery,
+            other => Self::Unknown(other),
+        }
+    }
 }
 
-/// Sampled material phase.
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl MaterialAnimationBlock {
+    /// Returns the native timeline mode from this block's header.
+    #[must_use]
+    pub const fn mode(&self) -> MaterialAnimationMode {
+        MaterialAnimationMode::from_header(self.header_raw)
+    }
+
+    /// Returns the native interpolation bit mask from `header_raw >> 3`.
+    #[must_use]
+    pub const fn interpolation_mask(&self) -> u32 {
+        self.header_raw >> 3
+    }
+
+    /// Returns the final key end time in milliseconds, if a key exists.
+    #[must_use]
+    pub fn duration_ms(&self) -> Option<u32> {
+        self.keys.last().map(|key| u32::from(key.k1))
+    }
+}
+
+/// Coefficients produced by the native MAT0 phase loader.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MaterialCoefficients {
+    /// Parameters 0..2, normalized additive RGB.
+    pub additive_rgb: [f32; 3],
+    /// Parameter 3, stored as a percentage (`raw * 0.01`).
+    pub opacity: f32,
+    /// Parameters 4..6, normalized directional RGB.
+    pub directional_rgb: [f32; 3],
+    /// Parameter 7, normalized and held when the animation mask is bit 2.
+    pub directional_extra: f32,
+    /// Parameters 8..10, normalized specular RGB.
+    pub specular_rgb: [f32; 3],
+    /// Parameter 11, normalized and held when the animation mask is bit 4.
+    pub specular_extra: f32,
+    /// Parameters 12..14, normalized extra RGB.
+    pub extra_rgb: [f32; 3],
+    /// Parameter 15, normalized and held when the animation mask is bit 8.
+    pub extra_alpha: f32,
+    /// Parameter 16, an integer material power value.
+    pub power: u8,
+    /// Parameter 17, a signed TEXM page selector.
+    pub page_index: i8,
+}
+
+/// Sampled native material phase.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MaterialPhaseSample {
     /// Selected phase index.
     pub phase_index: usize,
-    /// Effective frame after mode and random offset.
-    pub effective_frame: u32,
-    /// Sampled parameter bytes.
-    pub parameters: [u8; 18],
-    /// Sampled texture bytes.
+    /// Native floating-point coefficients after optional interpolation.
+    pub coefficients: MaterialCoefficients,
+    /// Texture name bytes from the selected phase; never interpolated.
     pub texture_raw: [u8; 16],
 }
 
@@ -142,6 +212,8 @@ pub struct ResolvedMaterial {
     pub name: ResourceName,
     /// Fallback path.
     pub fallback: MaterialFallback,
+    /// Raw NRes `attr1`, retained for renderer blend/category selection.
+    pub attr1: u32,
     /// Decoded document.
     pub document: Mat0Document,
 }
@@ -221,6 +293,29 @@ pub enum MaterialError {
     MissingMaterial(String),
     /// A material document has no phases for runtime sampling.
     EmptyMaterial,
+    /// An animation block has no positive duration for a multi-key timeline.
+    InvalidAnimationDuration {
+        /// Selected animation block.
+        block_index: usize,
+    },
+    /// An animation key points outside the decoded phase table.
+    InvalidAnimationPhaseIndex {
+        /// Selected animation block.
+        block_index: usize,
+        /// Key index within the block.
+        key_index: usize,
+        /// Raw phase index from the key.
+        phase_index: u16,
+        /// Number of decoded phases.
+        phase_count: usize,
+    },
+    /// Animation key end times are not strictly increasing.
+    InvalidAnimationKeyTimes {
+        /// Selected animation block.
+        block_index: usize,
+        /// Key index whose end time is invalid.
+        key_index: usize,
+    },
 }
 
 impl From<ResourceError> for MaterialError {
@@ -271,6 +366,25 @@ impl std::fmt::Display for MaterialError {
             Self::Resource(message) => write!(f, "{message}"),
             Self::MissingMaterial(name) => write!(f, "missing material: {name}"),
             Self::EmptyMaterial => write!(f, "material has no phases"),
+            Self::InvalidAnimationDuration { block_index } => {
+                write!(f, "MAT0 animation block {block_index} has zero duration")
+            }
+            Self::InvalidAnimationPhaseIndex {
+                block_index,
+                key_index,
+                phase_index,
+                phase_count,
+            } => write!(
+                f,
+                "MAT0 animation block {block_index} key {key_index} phase {phase_index} outside {phase_count} phases"
+            ),
+            Self::InvalidAnimationKeyTimes {
+                block_index,
+                key_index,
+            } => write!(
+                f,
+                "MAT0 animation block {block_index} key {key_index} has non-increasing end time"
+            ),
         }
     }
 }
@@ -294,7 +408,8 @@ pub fn decode_wear(bytes: &[u8]) -> Result<WearTable, MaterialError> {
         return Err(MaterialError::ZeroWearCount);
     }
 
-    let mut entries = Vec::with_capacity(count);
+    let available_lines = lines.clone().count();
+    let mut entries = Vec::with_capacity(count.min(available_lines));
     for index in 0..count {
         let line = lines
             .next()
@@ -425,97 +540,214 @@ pub fn resolve_material(
     ))
 }
 
-/// Samples a material phase with deterministic runtime timeline semantics.
+/// Samples one native MAT0 animation block.
+///
+/// `animation_block_index` selects a block from the already-resolved material
+/// table. The packed WEAR handle (table and row) is resolved by the caller;
+/// its high half is not an animation-block selector. An out-of-range block
+/// uses block zero, matching `GetPhase`. `clock_ms` is the paused-compensated
+/// `timeGetTime` value and `wear_row_start_ms` is the start timestamp captured
+/// for the owning WEA row; the sampler subtracts the latter with wrapping
+/// `u32` arithmetic. For mode [`MaterialAnimationMode::RandomPerQuery`],
+/// `random_value` is the caller's fresh native-style random value for this
+/// query. The sampler does not own an RNG.
 ///
 /// # Errors
 ///
-/// Returns [`MaterialError::EmptyMaterial`] when the MAT0 document has no
-/// phases.
+/// Returns an error for an empty material, a malformed multi-key duration,
+/// non-increasing key end times, or a key that references no phase.
 pub fn sample_material_phase(
     document: &Mat0Document,
-    profile: MaterialTimelineProfile,
-    frame: u32,
-    seed: u64,
+    animation_block_index: usize,
+    clock_ms: u32,
+    wear_row_start_ms: u32,
+    random_value: u32,
 ) -> Result<MaterialPhaseSample, MaterialError> {
-    if document.phases.is_empty() {
+    let Some(first_phase) = document.phases.first() else {
         return Err(MaterialError::EmptyMaterial);
-    }
-    let phase_count = document.phases.len();
-    let offset = if profile.random_offset {
-        material_random_offset(seed, phase_count)
-    } else {
-        0
     };
-    let effective_frame = frame.wrapping_add(offset);
-    let phase_index = select_phase_index(profile.mode, effective_frame, phase_count);
-    let phase = &document.phases[phase_index];
+
+    let Some((selected_block_index, block)) = document
+        .animation_blocks
+        .get(animation_block_index)
+        .map(|block| (animation_block_index, block))
+        .or_else(|| document.animation_blocks.first().map(|block| (0, block)))
+    else {
+        return Ok(sample_static_phase(0, first_phase));
+    };
+
+    if block.keys.is_empty() {
+        return Ok(sample_static_phase(0, first_phase));
+    }
+
+    let keys = &block.keys;
+    let resolve_phase = |key_index: usize, key: &MaterialKey| {
+        let phase_index = usize::from(key.k0);
+        document
+            .phases
+            .get(phase_index)
+            .map(|phase| (phase_index, phase))
+            .ok_or(MaterialError::InvalidAnimationPhaseIndex {
+                block_index: selected_block_index,
+                key_index,
+                phase_index: key.k0,
+                phase_count: document.phases.len(),
+            })
+    };
+
+    if keys.len() == 1 {
+        let (phase_index, phase) = resolve_phase(0, &keys[0])?;
+        return Ok(sample_static_phase(phase_index, phase));
+    }
+
+    let duration_ms = u32::from(keys[keys.len() - 1].k1);
+    if duration_ms == 0 {
+        return Err(MaterialError::InvalidAnimationDuration {
+            block_index: selected_block_index,
+        });
+    }
+    validate_key_times(keys, selected_block_index)?;
+    for (key_index, key) in keys.iter().enumerate() {
+        resolve_phase(key_index, key)?;
+    }
+
+    let elapsed_ms = clock_ms.wrapping_sub(wear_row_start_ms);
+    let mode = block.mode();
+    let (local_time_ms, forced_last_key) = match mode {
+        MaterialAnimationMode::Loop | MaterialAnimationMode::Unknown(_) => {
+            (elapsed_ms % duration_ms, false)
+        }
+        MaterialAnimationMode::PingPong => {
+            let cycle = elapsed_ms / duration_ms;
+            let remainder = elapsed_ms % duration_ms;
+            let local_time = if cycle & 1 == 0 {
+                remainder
+            } else {
+                duration_ms - remainder
+            };
+            (local_time, false)
+        }
+        MaterialAnimationMode::Clamp => {
+            if elapsed_ms >= duration_ms {
+                // Native clamp selects the last key and leaves the local
+                // remainder at zero before entering the common interpolation
+                // path, preserving its unsigned endpoint arithmetic.
+                (0, true)
+            } else {
+                (elapsed_ms, false)
+            }
+        }
+        MaterialAnimationMode::RandomPerQuery => (random_value % duration_ms, false),
+    };
+
+    let (key_index, previous_end_ms) = if forced_last_key {
+        (keys.len() - 1, u32::from(keys[keys.len() - 2].k1))
+    } else {
+        select_key(keys, local_time_ms)
+    };
+    let key = &keys[key_index];
+    let next_key_index = (key_index + 1) % keys.len();
+    let next_key = &keys[next_key_index];
+    let (phase_index, phase) = resolve_phase(key_index, key)?;
+    let (_, next_phase) = resolve_phase(next_key_index, next_key)?;
+    let span_ms = u32::from(key.k1).wrapping_sub(previous_end_ms);
+    if span_ms == 0 {
+        return Err(MaterialError::InvalidAnimationKeyTimes {
+            block_index: selected_block_index,
+            key_index,
+        });
+    }
+    // The original routine subtracts unsigned dwords before converting both
+    // values to floating point. Clamp's post-duration endpoint intentionally
+    // retains this wraparound behavior.
+    let fraction = local_time_ms.wrapping_sub(previous_end_ms) as f32 / span_ms as f32;
+    let coefficients =
+        interpolate_coefficients(phase, next_phase, block.interpolation_mask(), fraction);
     Ok(MaterialPhaseSample {
         phase_index,
-        effective_frame,
-        parameters: phase.parameters,
+        coefficients,
         texture_raw: phase.texture_raw,
     })
 }
 
-/// Interpolates selected parameter bytes according to a bit mask.
-///
-/// Unmasked fields are copied from `left`; masked fields are linearly blended
-/// and rounded to nearest integer.
-#[must_use]
-pub fn interpolate_parameter_bytes(
-    left: [u8; 18],
-    right: [u8; 18],
-    interpolation_mask: u32,
-    t: f32,
-) -> [u8; 18] {
-    let mut out = left;
-    for (index, value) in out.iter_mut().enumerate() {
-        if interpolation_mask & (1_u32 << index) == 0 {
-            continue;
+fn sample_static_phase(phase_index: usize, phase: &MaterialPhase) -> MaterialPhaseSample {
+    MaterialPhaseSample {
+        phase_index,
+        coefficients: phase.coefficients(),
+        texture_raw: phase.texture_raw,
+    }
+}
+
+fn validate_key_times(keys: &[MaterialKey], block_index: usize) -> Result<(), MaterialError> {
+    let mut previous_end = 0_u32;
+    for (key_index, key) in keys.iter().enumerate() {
+        let end = u32::from(key.k1);
+        if end <= previous_end {
+            return Err(MaterialError::InvalidAnimationKeyTimes {
+                block_index,
+                key_index,
+            });
         }
-        let blended =
-            f32::from(left[index]) + (f32::from(right[index]) - f32::from(left[index])) * t;
-        *value = rounded_clamped_byte(blended);
+        previous_end = end;
     }
-    out
+    Ok(())
 }
 
-fn rounded_clamped_byte(value: f32) -> u8 {
-    let rounded = value.round();
-    if !rounded.is_finite() || rounded <= 0.0 {
-        return 0;
+fn select_key(keys: &[MaterialKey], local_time_ms: u32) -> (usize, u32) {
+    let mut previous_end = 0_u32;
+    for (key_index, key) in keys.iter().enumerate() {
+        let end = u32::from(key.k1);
+        if local_time_ms < end {
+            return (key_index, previous_end);
+        }
+        previous_end = end;
     }
-    if rounded >= f32::from(u8::MAX) {
-        return u8::MAX;
+    // The native backward search falls through to key zero when the local
+    // value is exactly the duration (the ping-pong turnaround endpoint).
+    if local_time_ms >= u32::from(keys[keys.len() - 1].k1) {
+        (0, 0)
+    } else {
+        (keys.len() - 1, previous_end)
     }
-    (0_u8..=u8::MAX)
-        .find(|candidate| f32::from(*candidate) >= rounded)
-        .unwrap_or(u8::MAX)
 }
 
-/// Builds a deterministic capture for material phase sampling.
-///
-/// # Errors
-///
-/// Returns [`MaterialError`] when sampling fails.
-pub fn material_phase_capture(
-    document: &Mat0Document,
-    profile: MaterialTimelineProfile,
-    frames: &[u32],
-    seed: u64,
-) -> Result<Vec<u8>, MaterialError> {
-    let mut out = Vec::new();
-    for frame in frames {
-        let sample = sample_material_phase(document, profile, *frame, seed)?;
-        out.extend_from_slice(
-            format!(
-                "M,{},{},{}\n",
-                frame, sample.effective_frame, sample.phase_index
-            )
-            .as_bytes(),
-        );
+fn interpolate_coefficients(
+    left: &MaterialPhase,
+    right: &MaterialPhase,
+    mask: u32,
+    fraction: f32,
+) -> MaterialCoefficients {
+    let left = left.coefficients();
+    let right = right.coefficients();
+    let mut output = left;
+    if mask & 1 != 0 {
+        output.additive_rgb = lerp3(left.additive_rgb, right.additive_rgb, fraction);
     }
-    Ok(out)
+    if mask & 2 != 0 {
+        output.directional_rgb = lerp3(left.directional_rgb, right.directional_rgb, fraction);
+    }
+    if mask & 4 != 0 {
+        output.specular_rgb = lerp3(left.specular_rgb, right.specular_rgb, fraction);
+    }
+    if mask & 8 != 0 {
+        output.extra_rgb = lerp3(left.extra_rgb, right.extra_rgb, fraction);
+    }
+    if mask & 16 != 0 {
+        output.opacity = lerp(left.opacity, right.opacity, fraction);
+    }
+    output
+}
+
+fn lerp(left: f32, right: f32, fraction: f32) -> f32 {
+    left + (right - left) * fraction
+}
+
+fn lerp3(left: [f32; 3], right: [f32; 3], fraction: f32) -> [f32; 3] {
+    [
+        lerp(left[0], right[0], fraction),
+        lerp(left[1], right[1], fraction),
+        lerp(left[2], right[2], fraction),
+    ]
 }
 
 impl Mat0Document {
@@ -541,46 +773,6 @@ impl Mat0Document {
     }
 }
 
-fn select_phase_index(mode: MaterialTimelineMode, frame: u32, phase_count: usize) -> usize {
-    let count = u32::try_from(phase_count).unwrap_or(u32::MAX).max(1);
-    let index = match mode {
-        MaterialTimelineMode::OneShot | MaterialTimelineMode::Clamp => frame.min(count - 1),
-        MaterialTimelineMode::Loop => frame % count,
-        MaterialTimelineMode::PingPong => {
-            if count == 1 {
-                0
-            } else {
-                let period = count.saturating_mul(2).saturating_sub(2);
-                let local = frame % period;
-                if local < count {
-                    local
-                } else {
-                    period - local
-                }
-            }
-        }
-    };
-    usize::try_from(index).unwrap_or(phase_count.saturating_sub(1))
-}
-
-fn material_random_offset(seed: u64, phase_count: usize) -> u32 {
-    let count = u64::try_from(phase_count).unwrap_or(u64::MAX).max(1);
-    let mut state = 0xa076_1d64_78bd_642f_u64 ^ seed;
-    for byte in b"material" {
-        state ^= u64::from(*byte);
-        state = splitmix64(state);
-    }
-    u32::try_from(splitmix64(state) % count).unwrap_or(0)
-}
-
-fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    let mut mixed = value;
-    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    mixed ^ (mixed >> 31)
-}
-
 fn load_material_entry(
     repository: &dyn ResourceRepository,
     archive: fparkan_resource::ArchiveId,
@@ -599,6 +791,7 @@ fn load_material_entry(
     Ok(Some(ResolvedMaterial {
         name: info.key.name,
         fallback,
+        attr1: info.attr1,
         document,
     }))
 }
@@ -619,6 +812,7 @@ fn load_first_material_entry(
     Ok(Some(ResolvedMaterial {
         name: info.key.name,
         fallback: MaterialFallback::FirstEntry,
+        attr1: info.attr1,
         document,
     }))
 }
@@ -642,7 +836,8 @@ fn parse_lightmaps(lines: &[&str]) -> Result<Vec<LightmapEntry>, MaterialError> 
     let count = parse_count(count_line)
         .map_err(|_| MaterialError::InvalidLightmapCount((*count_line).to_string()))?;
     cursor += 1;
-    let mut lightmaps = Vec::with_capacity(count);
+    let available_lines = lines.len().saturating_sub(cursor);
+    let mut lightmaps = Vec::with_capacity(count.min(available_lines));
     for index in 0..count {
         let line = lines
             .get(cursor)
@@ -783,6 +978,7 @@ mod tests {
     use fparkan_nres::ReadProfile;
     use fparkan_resource::CachedResourceRepository;
     use fparkan_vfs::MemoryVfs;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
@@ -811,6 +1007,27 @@ mod tests {
         let table = decode_wear(b"1\n0 MAT\n\nLIGHTMAPS\n1\n0 LM_A\n").expect("wear");
         assert_eq!(table.lightmaps.len(), 1);
         assert_eq!(table.lightmaps[0].lightmap.0, b"LM_A");
+    }
+
+    #[test]
+    fn wear_and_lightmap_counts_do_not_reserve_beyond_available_lines() {
+        let wear = format!("{}\n", usize::MAX);
+        assert!(matches!(
+            decode_wear(wear.as_bytes()),
+            Err(MaterialError::MissingWearRow {
+                index: 0,
+                count: usize::MAX
+            })
+        ));
+
+        let lightmaps = format!("1\n0 MAT\n\nLIGHTMAPS\n{}\n", usize::MAX);
+        assert!(matches!(
+            decode_wear(lightmaps.as_bytes()),
+            Err(MaterialError::MissingLightmapRow {
+                index: 0,
+                count: usize::MAX
+            })
+        ));
     }
 
     #[test]
@@ -899,7 +1116,7 @@ mod tests {
     #[test]
     fn resolve_material_uses_exact_match() {
         let repo = material_repo(&[
-            material_entry(b"MAT_A", &mat0_with_texture(b"TEX_A")),
+            material_entry_with_attr1(b"MAT_A", &mat0_with_texture(b"TEX_A"), 0x1234_5678),
             material_entry(b"DEFAULT", &mat0_with_texture(b"TEX_DEFAULT")),
         ]);
         let table = decode_wear(b"1\n0 MAT_A\n").expect("wear");
@@ -908,6 +1125,7 @@ mod tests {
 
         assert_eq!(resolved.name.0, b"MAT_A");
         assert_eq!(resolved.fallback, MaterialFallback::Exact);
+        assert_eq!(resolved.attr1, 0x1234_5678);
         assert_eq!(
             resolved.document.primary_texture().expect("texture").0,
             b"TEX_A"
@@ -980,146 +1198,303 @@ mod tests {
     }
 
     #[test]
-    fn material_modes_zero_to_three_choose_stable_phases() {
-        let document =
-            decode_mat0(&mat0_with_phase_textures(&[b"A", b"B", b"C"]), 0).expect("mat0");
+    fn material_animation_header_decodes_native_mode_and_mask() {
+        let block = MaterialAnimationBlock {
+            header_raw: (0x1f_u32 << 3) | 3,
+            keys: Vec::new(),
+            bytes: Vec::new(),
+        };
 
-        let cases = [
-            (MaterialTimelineMode::OneShot, 9, 2),
-            (MaterialTimelineMode::Clamp, 9, 2),
-            (MaterialTimelineMode::Loop, 4, 1),
-            (MaterialTimelineMode::PingPong, 3, 1),
-        ];
-        for (mode, frame, expected_phase) in cases {
-            let sample = sample_material_phase(
-                &document,
-                MaterialTimelineProfile {
-                    mode,
-                    random_offset: false,
-                },
-                frame,
-                0,
-            )
-            .expect("sample");
-            assert_eq!(sample.phase_index, expected_phase, "{mode:?}");
-        }
+        assert_eq!(block.mode(), MaterialAnimationMode::RandomPerQuery);
+        assert_eq!(block.interpolation_mask(), 0x1f);
+        assert_eq!(
+            MaterialAnimationMode::from_header(4),
+            MaterialAnimationMode::Unknown(4)
+        );
     }
 
     #[test]
-    fn material_exact_key_boundary_selects_exact_phase() {
-        let document =
-            decode_mat0(&mat0_with_phase_textures(&[b"A", b"B", b"C"]), 0).expect("mat0");
+    fn material_phase_coefficients_decode_native_parameter_slots() {
+        let mut parameters = [0_u8; 18];
+        parameters.copy_from_slice(&[
+            0, 64, 128, 25, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 9, 0xfe,
+        ]);
+        let phase = MaterialPhase {
+            parameters,
+            texture_raw: [0; 16],
+        };
 
-        let sample = sample_material_phase(
-            &document,
-            MaterialTimelineProfile {
-                mode: MaterialTimelineMode::Clamp,
-                random_offset: false,
+        let coefficients = phase.coefficients();
+        assert_eq!(
+            coefficients.additive_rgb,
+            [0.0, 64.0 / 255.0, 128.0 / 255.0]
+        );
+        assert!((coefficients.opacity - 0.25).abs() < f32::EPSILON);
+        assert_eq!(
+            coefficients.directional_rgb,
+            [10.0 / 255.0, 20.0 / 255.0, 30.0 / 255.0]
+        );
+        assert_eq!(coefficients.directional_extra, 40.0 / 255.0);
+        assert_eq!(
+            coefficients.specular_rgb,
+            [50.0 / 255.0, 60.0 / 255.0, 70.0 / 255.0]
+        );
+        assert_eq!(coefficients.specular_extra, 80.0 / 255.0);
+        assert_eq!(
+            coefficients.extra_rgb,
+            [90.0 / 255.0, 100.0 / 255.0, 110.0 / 255.0]
+        );
+        assert_eq!(coefficients.extra_alpha, 120.0 / 255.0);
+        assert_eq!(coefficients.power, 9);
+        assert_eq!(coefficients.page_index, -2);
+    }
+
+    #[test]
+    fn material_loop_interpolates_native_groups_and_selects_current_texture() {
+        let left = phase_with_parameters(
+            [
+                0, 10, 20, 25, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 7, 1,
+            ],
+            b"LEFT",
+        );
+        let right = phase_with_parameters(
+            [
+                255, 110, 220, 75, 230, 240, 250, 160, 170, 180, 190, 200, 210, 220, 230, 240, 9, 2,
+            ],
+            b"RIGHT",
+        );
+        let document = animation_document(
+            0x1f_u32 << 3,
+            vec![left, right],
+            vec![
+                MaterialKey {
+                    k0: 0,
+                    k1: 100,
+                    k2: 0,
+                },
+                MaterialKey {
+                    k0: 1,
+                    k1: 200,
+                    k2: 0,
+                },
+            ],
+        );
+
+        let sample = sample_material_phase(&document, 0, 150, 0, 0).expect("sample");
+
+        assert_eq!(sample.phase_index, 1);
+        assert_eq!(&sample.texture_raw[..5], b"RIGHT");
+        assert!((sample.coefficients.additive_rgb[0] - (127.5 / 255.0)).abs() < 1e-6);
+        assert!((sample.coefficients.opacity - 0.5).abs() < 1e-6);
+        assert!((sample.coefficients.directional_rgb[1] - (140.0 / 255.0)).abs() < 1e-6);
+        assert_eq!(sample.coefficients.directional_extra, 160.0 / 255.0);
+        assert!((sample.coefficients.specular_rgb[2] - (140.0 / 255.0)).abs() < 1e-6);
+        assert_eq!(sample.coefficients.specular_extra, 200.0 / 255.0);
+        assert!((sample.coefficients.extra_rgb[0] - (160.0 / 255.0)).abs() < 1e-6);
+        assert_eq!(sample.coefficients.extra_alpha, 240.0 / 255.0);
+        assert_eq!(sample.coefficients.power, 9);
+        assert_eq!(sample.coefficients.page_index, 2);
+
+        let boundary = sample_material_phase(&document, 0, 100, 0, 0).expect("boundary");
+        assert_eq!(boundary.phase_index, 1);
+        assert_eq!(&boundary.texture_raw[..5], b"RIGHT");
+        assert_eq!(boundary.coefficients.additive_rgb[0], 1.0);
+
+        let wrapped = sample_material_phase(&document, 0, 200, 0, 0).expect("wrapped");
+        assert_eq!(wrapped.phase_index, 0);
+        assert_eq!(&wrapped.texture_raw[..4], b"LEFT");
+    }
+
+    #[test]
+    fn material_ping_pong_reverses_local_time_and_clamp_holds_last_phase() {
+        let phases = vec![
+            phase_with_parameters([0; 18], b"A"),
+            phase_with_parameters([255; 18], b"B"),
+        ];
+        let keys = vec![
+            MaterialKey {
+                k0: 0,
+                k1: 100,
+                k2: 0,
             },
-            1,
-            0,
-        )
-        .expect("sample");
+            MaterialKey {
+                k0: 1,
+                k1: 200,
+                k2: 0,
+            },
+        ];
+        let ping_pong = animation_document((0x1_u32) | (1 << 3), phases.clone(), keys.clone());
+        assert_eq!(
+            sample_material_phase(&ping_pong, 0, 100, 0, 0)
+                .expect("turn")
+                .phase_index,
+            1
+        );
+        assert_eq!(
+            sample_material_phase(&ping_pong, 0, 150, 0, 0)
+                .expect("reverse")
+                .phase_index,
+            1
+        );
+        assert_eq!(
+            sample_material_phase(&ping_pong, 0, 200, 0, 0)
+                .expect("restart")
+                .phase_index,
+            0
+        );
+        let turnaround = sample_material_phase(&ping_pong, 0, 200, 0, 0).expect("turnaround");
+        assert!((turnaround.coefficients.additive_rgb[0] - 2.0).abs() < 1e-6);
 
+        let clamp = animation_document((2_u32) | (1 << 3), phases, keys);
+        let sample = sample_material_phase(&clamp, 0, 500, 0, 0).expect("clamp");
+        assert_eq!(sample.phase_index, 1);
+        assert!(sample.coefficients.additive_rgb[0] < 0.0);
+    }
+
+    #[test]
+    fn material_random_mode_uses_caller_value_and_invalid_block_uses_block_zero() {
+        let phases = vec![
+            phase_with_parameters([0; 18], b"A"),
+            phase_with_parameters([255; 18], b"B"),
+        ];
+        let keys = vec![
+            MaterialKey {
+                k0: 0,
+                k1: 100,
+                k2: 0,
+            },
+            MaterialKey {
+                k0: 1,
+                k1: 200,
+                k2: 0,
+            },
+        ];
+        let document = Mat0Document {
+            version: 0,
+            animation_block_count: 2,
+            phases,
+            prefix: Vec::new(),
+            header_opaque: [2, 0],
+            animation_blocks: vec![
+                MaterialAnimationBlock {
+                    header_raw: 3,
+                    keys: keys.clone(),
+                    bytes: Vec::new(),
+                },
+                MaterialAnimationBlock {
+                    header_raw: 2,
+                    keys,
+                    bytes: Vec::new(),
+                },
+            ],
+        };
+
+        let sample = sample_material_phase(&document, 0, 0, 0, 150).expect("random");
+        assert_eq!(sample.phase_index, 1);
+        let fallback = sample_material_phase(&document, 99, 500, 0, 0).expect("fallback");
+        assert_eq!(fallback.phase_index, 0);
+    }
+
+    #[test]
+    fn material_static_and_single_key_sampling_uses_phase_zero_or_key_phase() {
+        let phases = vec![
+            phase_with_parameters([1; 18], b"A"),
+            phase_with_parameters([2; 18], b"B"),
+        ];
+        let static_document = Mat0Document {
+            version: 0,
+            animation_block_count: 0,
+            phases: phases.clone(),
+            prefix: Vec::new(),
+            header_opaque: [0, 0],
+            animation_blocks: Vec::new(),
+        };
+        assert_eq!(
+            sample_material_phase(&static_document, 0, 123, 50, 0)
+                .expect("static")
+                .phase_index,
+            0
+        );
+
+        let single_document = animation_document(
+            0,
+            phases,
+            vec![MaterialKey {
+                k0: 1,
+                k1: 0,
+                k2: 0,
+            }],
+        );
+        let sample = sample_material_phase(&single_document, 0, 123, 50, 0).expect("single");
         assert_eq!(sample.phase_index, 1);
         assert_eq!(&sample.texture_raw[..1], b"B");
     }
 
     #[test]
-    fn material_interpolation_mask_affects_only_selected_fields() {
-        let mut left = [10_u8; 18];
-        let mut right = [20_u8; 18];
-        left[1] = 100;
-        right[1] = 200;
-
-        let out = interpolate_parameter_bytes(left, right, 0b101, 0.5);
-
-        assert_eq!(out[0], 15);
-        assert_eq!(out[1], 100);
-        assert_eq!(out[2], 15);
-        assert_eq!(out[3], 10);
-    }
-
-    #[test]
-    fn material_timeline_profile_cases_are_evidence_labeled() {
-        let document =
-            decode_mat0(&mat0_with_phase_textures(&[b"A", b"B", b"C"]), 0).expect("mat0");
-
-        assert_eq!(
-            material_phase_capture(
-                &document,
-                MaterialTimelineProfile {
-                    mode: MaterialTimelineMode::OneShot,
-                    random_offset: false,
+    fn material_sampling_rejects_bad_timeline_data() {
+        let phase = phase_with_parameters([0; 18], b"A");
+        let invalid_ref = animation_document(
+            0,
+            vec![phase.clone()],
+            vec![
+                MaterialKey {
+                    k0: 0,
+                    k1: 10,
+                    k2: 0,
                 },
-                &[0, 1, 4],
-                0,
-            )
-            .expect("one-shot"),
-            b"M,0,0,0\nM,1,1,1\nM,4,4,2\n"
-        );
-        assert_eq!(
-            material_phase_capture(
-                &document,
-                MaterialTimelineProfile {
-                    mode: MaterialTimelineMode::Loop,
-                    random_offset: false,
+                MaterialKey {
+                    k0: 4,
+                    k1: 20,
+                    k2: 0,
                 },
-                &[0, 1, 4],
-                0,
-            )
-            .expect("loop"),
-            b"M,0,0,0\nM,1,1,1\nM,4,4,1\n"
+            ],
         );
-        assert_eq!(
-            material_phase_capture(
-                &document,
-                MaterialTimelineProfile {
-                    mode: MaterialTimelineMode::PingPong,
-                    random_offset: false,
+        assert!(matches!(
+            sample_material_phase(&invalid_ref, 0, 0, 0, 0),
+            Err(MaterialError::InvalidAnimationPhaseIndex { .. })
+        ));
+
+        let invalid_times = animation_document(
+            0,
+            vec![phase.clone()],
+            vec![
+                MaterialKey {
+                    k0: 0,
+                    k1: 20,
+                    k2: 0,
                 },
-                &[0, 1, 3],
-                0,
-            )
-            .expect("ping-pong"),
-            b"M,0,0,0\nM,1,1,1\nM,3,3,1\n"
+                MaterialKey {
+                    k0: 0,
+                    k1: 10,
+                    k2: 0,
+                },
+            ],
         );
-    }
+        assert!(matches!(
+            sample_material_phase(&invalid_times, 0, 0, 0, 0),
+            Err(MaterialError::InvalidAnimationKeyTimes { .. })
+        ));
 
-    #[test]
-    fn material_random_offset_uses_material_stream_only() {
-        let document =
-            decode_mat0(&mat0_with_phase_textures(&[b"A", b"B", b"C"]), 0).expect("mat0");
-        let profile = MaterialTimelineProfile {
-            mode: MaterialTimelineMode::Loop,
-            random_offset: true,
-        };
-        let before = material_phase_capture(&document, profile, &[0, 1, 2], 99).expect("capture");
-        let mut unrelated = 0x5555_u64;
-        for _ in 0..16 {
-            unrelated = unrelated.rotate_left(11).wrapping_mul(31);
-        }
-
-        assert_ne!(unrelated, 0);
-        assert_eq!(
-            material_phase_capture(&document, profile, &[0, 1, 2], 99).expect("capture"),
-            before
+        let zero_duration = animation_document(
+            0,
+            vec![phase],
+            vec![
+                MaterialKey {
+                    k0: 0,
+                    k1: 0,
+                    k2: 0,
+                },
+                MaterialKey {
+                    k0: 0,
+                    k1: 0,
+                    k2: 0,
+                },
+            ],
         );
-    }
-
-    #[test]
-    fn material_same_seed_and_timeline_produces_same_phase_capture() {
-        let document =
-            decode_mat0(&mat0_with_phase_textures(&[b"A", b"B", b"C"]), 0).expect("mat0");
-        let profile = MaterialTimelineProfile {
-            mode: MaterialTimelineMode::Loop,
-            random_offset: true,
-        };
-
-        assert_eq!(
-            material_phase_capture(&document, profile, &[0, 4, 7], 123).expect("first"),
-            material_phase_capture(&document, profile, &[0, 4, 7], 123).expect("second")
-        );
+        assert!(matches!(
+            sample_material_phase(&zero_duration, 0, 0, 0, 0),
+            Err(MaterialError::InvalidAnimationDuration { .. })
+        ));
     }
 
     #[test]
@@ -1133,6 +1508,8 @@ mod tests {
             let mut mat0_count = 0usize;
             let mut archive_wear_count = 0usize;
             let mut standalone_wear_count = 0usize;
+            let mut animation_modes = BTreeMap::<u8, usize>::new();
+            let mut interpolation_masks = BTreeSet::<u32>::new();
             for path in files_under(&root) {
                 let Ok(bytes) = std::fs::read(&path) else {
                     continue;
@@ -1156,9 +1533,16 @@ mod tests {
                     let payload = archive.payload(entry.id()).expect("payload");
                     match entry.meta().type_id {
                         MAT0_KIND => {
-                            decode_mat0(payload, entry.meta().attr2).unwrap_or_else(|err| {
-                                panic!("{corpus} {path:?} {:?}: {err}", entry.name_bytes())
-                            });
+                            let document =
+                                decode_mat0(payload, entry.meta().attr2).unwrap_or_else(|err| {
+                                    panic!("{corpus} {path:?} {:?}: {err}", entry.name_bytes())
+                                });
+                            for block in &document.animation_blocks {
+                                *animation_modes
+                                    .entry((block.header_raw & 7) as u8)
+                                    .or_default() += 1;
+                                interpolation_masks.insert(block.interpolation_mask());
+                            }
                             mat0_count += 1;
                         }
                         WEAR_KIND => {
@@ -1179,6 +1563,9 @@ mod tests {
             assert_eq!(
                 standalone_wear_count, expected_standalone_wear,
                 "{corpus} standalone WEAR count"
+            );
+            eprintln!(
+                "{corpus} MAT0 animation inventory: modes={animation_modes:?}, masks={interpolation_masks:?}"
             );
         }
     }
@@ -1223,6 +1610,7 @@ mod tests {
     struct TestMaterialEntry<'a> {
         name: &'a [u8],
         type_id: u32,
+        attr1: u32,
         attr2: u32,
         payload: &'a [u8],
     }
@@ -1231,6 +1619,21 @@ mod tests {
         TestMaterialEntry {
             name,
             type_id: MAT0_KIND,
+            attr1: 0,
+            attr2: 0,
+            payload,
+        }
+    }
+
+    fn material_entry_with_attr1<'a>(
+        name: &'a [u8],
+        payload: &'a [u8],
+        attr1: u32,
+    ) -> TestMaterialEntry<'a> {
+        TestMaterialEntry {
+            name,
+            type_id: MAT0_KIND,
+            attr1,
             attr2: 0,
             payload,
         }
@@ -1254,20 +1657,33 @@ mod tests {
         bytes
     }
 
-    fn mat0_with_phase_textures(textures: &[&[u8]]) -> Vec<u8> {
-        let mut bytes = vec![0; 4 + textures.len() * 34];
-        bytes[0..2].copy_from_slice(
-            &u16::try_from(textures.len())
-                .expect("phase count")
-                .to_le_bytes(),
-        );
-        for (index, texture) in textures.iter().enumerate() {
-            let offset = 4 + index * 34;
-            bytes[offset] = u8::try_from(index).expect("index");
-            let len = texture.len().min(16);
-            bytes[offset + 18..offset + 18 + len].copy_from_slice(&texture[..len]);
+    fn phase_with_parameters(parameters: [u8; 18], texture: &[u8]) -> MaterialPhase {
+        let mut texture_raw = [0_u8; 16];
+        let len = texture.len().min(texture_raw.len());
+        texture_raw[..len].copy_from_slice(&texture[..len]);
+        MaterialPhase {
+            parameters,
+            texture_raw,
         }
-        bytes
+    }
+
+    fn animation_document(
+        header_raw: u32,
+        phases: Vec<MaterialPhase>,
+        keys: Vec<MaterialKey>,
+    ) -> Mat0Document {
+        Mat0Document {
+            version: 0,
+            animation_block_count: 1,
+            phases,
+            prefix: Vec::new(),
+            header_opaque: [1, 0],
+            animation_blocks: vec![MaterialAnimationBlock {
+                header_raw,
+                keys,
+                bytes: Vec::new(),
+            }],
+        }
     }
 
     fn build_material_nres(entries: &[TestMaterialEntry<'_>]) -> Vec<u8> {
@@ -1283,7 +1699,7 @@ mod tests {
         order.sort_by(|left, right| entries[*left].name.cmp(entries[*right].name));
         for (idx, entry) in entries.iter().enumerate() {
             push_u32(&mut out, entry.type_id);
-            push_u32(&mut out, 0);
+            push_u32(&mut out, entry.attr1);
             push_u32(&mut out, entry.attr2);
             push_u32(
                 &mut out,

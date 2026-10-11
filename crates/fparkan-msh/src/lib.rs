@@ -18,6 +18,9 @@ pub const STREAM_POSITIONS: u32 = 3;
 pub const STREAM_NORMALS: u32 = 4;
 /// Texture coordinate stream.
 pub const STREAM_UV0: u32 = 5;
+/// Optional secondary texture coordinate stream used by native lightmap/detail
+/// stages.  MSH stores it as the type-18 four-byte packed UV stream.
+pub const STREAM_UV1: u32 = 18;
 /// Triangle index stream.
 pub const STREAM_INDICES: u32 = 6;
 /// Animation key stream.
@@ -81,14 +84,20 @@ pub struct ModelAsset {
     pub node_count: usize,
     /// Raw node table.
     pub nodes_raw: Vec<u8>,
+    /// Model-level bounding sphere center from the Res2 header.
+    pub bounding_sphere_center: [f32; 3],
+    /// Model-level bounding sphere radius from the Res2 header.
+    pub bounding_sphere_radius: f32,
     /// Slot table.
     pub slots: Vec<Slot>,
     /// Vertex positions.
     pub positions: Vec<[f32; 3]>,
     /// Optional normals.
     pub normals: Option<Vec<[i8; 4]>>,
-    /// Optional texture coordinates.
-    pub uv0: Option<Vec<[i16; 2]>>,
+    /// Optional primary packed texture coordinates from type 5.
+    pub uv0: Option<Vec<[u16; 2]>>,
+    /// Optional secondary packed texture coordinates from type 18.
+    pub uv1: Option<Vec<[u16; 2]>>,
     /// Triangle indices.
     pub indices: Vec<u16>,
     /// Draw batches.
@@ -167,18 +176,24 @@ pub struct Slot {
 pub struct Batch {
     /// Batch flags.
     pub batch_flags: u16,
-    /// Material index.
-    pub material_index: u16,
-    /// Opaque field.
-    pub opaque4: u16,
-    /// Opaque field.
-    pub opaque6: u16,
+    /// High material selector/slot field at byte offset `+0x02`.
+    ///
+    /// The ordinary WEAR material selector is the byte at `+0x04`. This
+    /// field is retained separately because the native path can override it
+    /// with a forced material index.
+    pub material_index_hi: u16,
+    /// WEAR material selector at byte offset `+0x04`.
+    pub material_index: u8,
+    /// Lightmap selector at byte offset `+0x05`.
+    pub lightmap_index: u8,
+    /// Local batch index at byte offset `+0x06`.
+    pub local_batch_index: u16,
     /// Index count.
     pub index_count: u16,
     /// First index offset.
     pub index_start: u32,
-    /// Opaque field.
-    pub opaque14: u16,
+    /// Vertex count at byte offset `+0x0E`.
+    pub vertex_count: u16,
     /// Base vertex.
     pub base_vertex: u32,
 }
@@ -194,8 +209,10 @@ pub struct VertexStreams {
     pub positions: Vec<[f32; 3]>,
     /// Optional normals.
     pub normals: Option<Vec<[i8; 4]>>,
-    /// Optional texture coordinates.
-    pub uv0: Option<Vec<[i16; 2]>>,
+    /// Optional primary packed texture coordinates from type 5.
+    pub uv0: Option<Vec<[u16; 2]>>,
+    /// Optional secondary packed texture coordinates from type 18.
+    pub uv1: Option<Vec<[u16; 2]>>,
 }
 
 /// Preserved non-core stream.
@@ -209,11 +226,11 @@ pub struct PreservedStream {
     pub bytes: std::sync::Arc<[u8]>,
 }
 
-/// LOD id.
+/// Native state id kept under the historical `Lod` API name.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Lod(pub u8);
 
-/// Group id.
+/// Native LOD id kept under the historical `Group` API name.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Group(pub u8);
 
@@ -377,7 +394,10 @@ pub fn validate_msh(document: &MshDocument) -> Result<ModelAsset, MshError> {
     Ok(model)
 }
 
-/// Returns the selected slot for a node/lod/group tuple.
+/// Returns the selected slot for a node/native-state/native-LOD tuple.
+///
+/// The argument names are retained for API compatibility: `Lod` is the
+/// three-value native state and `Group` is the five-value native LOD.
 #[must_use]
 pub fn selected_slot(model: &ModelAsset, node: NodeId, lod: Lod, group: Group) -> Option<SlotId> {
     if model.node_stride != 38 || lod.0 >= 3 || group.0 >= 5 {
@@ -417,12 +437,13 @@ pub fn node38_metadata(model: &ModelAsset, node: NodeId) -> Option<Node38Metadat
     })
 }
 
-/// Returns the source fallback pose of a standard node.
+/// Returns the fallback key as a native Node38 source-local pose.
 ///
 /// The legacy sampler uses this key when a node has no frame map or its current
 /// frame falls outside that map. It is a static-pose input only; callers must
 /// still recover animation state and the meaning of `parent_or_link_raw` before
-/// assembling a runtime hierarchy.
+/// assembling a runtime hierarchy. Its quaternion is converted to match native
+/// AniMesh's quaternion-to-matrix convention.
 #[must_use]
 pub fn node38_fallback_pose(model: &ModelAsset, node: NodeId) -> Option<Pose> {
     let metadata = node38_metadata(model, node)?;
@@ -432,6 +453,18 @@ pub fn node38_fallback_pose(model: &ModelAsset, node: NodeId) -> Option<Pose> {
         .keys
         .get(usize::from(metadata.fallback_key))
         .map(AnimKey24::sampling_pose)
+        .map(node38_native_local_pose)
+}
+
+/// Converts a sampled MSH source-local quaternion into the native AniMesh
+/// quaternion-matrix convention before Node38 hierarchy composition. Native
+/// AniMesh's matrix coefficients are the transpose of the portable `Pose`
+/// basis.
+fn node38_native_local_pose(mut pose: Pose) -> Pose {
+    pose.rotation[0] = -pose.rotation[0];
+    pose.rotation[1] = -pose.rotation[1];
+    pose.rotation[2] = -pose.rotation[2];
+    pose
 }
 
 /// Evaluates the static fallback pose hierarchy of a standard `Node38` model.
@@ -462,8 +495,9 @@ pub fn node38_fallback_hierarchy(model: &ModelAsset) -> Option<NodePoseBuffer> {
     evaluate_hierarchy(&parents, &poses).ok()
 }
 
-/// Evaluates the portable-reference pose hierarchy of a standard `Node38`
-/// model at one explicitly supplied logical frame.
+/// Evaluates a standard `Node38` hierarchy at one explicitly supplied logical
+/// frame, using portable key sampling and native AniMesh local-matrix
+/// convention.
 ///
 /// A node without a usable type-19 map, or a requested frame outside the
 /// declared map length, retains its exact fallback key. Mapped keys are
@@ -475,6 +509,59 @@ pub fn node38_fallback_hierarchy(model: &ModelAsset) -> Option<NodePoseBuffer> {
 /// representation or the map cannot be safely resolved.
 #[must_use]
 pub fn node38_sampled_hierarchy(model: &ModelAsset, frame: u16) -> Option<NodePoseBuffer> {
+    node38_sampled_hierarchy_with_selector(model, |_| {
+        Some((u32::from(frame), AnimationTime(f32::from(frame))))
+    })
+}
+
+/// Evaluates a standard `Node38` hierarchy with an independent floating-point
+/// sample time for each node.
+///
+/// `Some(time)` uses the nearest-even integer to `time - 0.5` as the type-19
+/// frame-map selector, then samples the selected key and its immediate
+/// successor at the original fractional time. This matches the native
+/// sampler's selector calculation while keeping interpolation time fractional.
+/// The selector uses Rust's default-nearest, ties-to-even rounding. This is
+/// the portable counterpart of the native x87 conversion under its default
+/// rounding mode; it does not claim parity under every x87 control-word mode.
+/// A missing time uses that node's exact fallback key. Supplied times must be
+/// finite and non-negative; the caller owns choosing the per-node times.
+///
+/// Returns `None` when the model is not a complete standard-node animation,
+/// the slice does not match the node count, any supplied time is invalid, or a
+/// frame-map entry cannot be safely resolved.
+#[must_use]
+pub fn node38_sampled_hierarchy_at_times(
+    model: &ModelAsset,
+    node_times: &[Option<AnimationTime>],
+) -> Option<NodePoseBuffer> {
+    if node_times.len() != model.node_count
+        || node_times
+            .iter()
+            .flatten()
+            .any(|time| !time.0.is_finite() || time.0 < 0.0)
+    {
+        return None;
+    }
+    node38_sampled_hierarchy_with_selector(model, |index| {
+        let time = node_times[index]?;
+        let selector = (time.0 - 0.5).round_ties_even();
+        // A finite, non-negative time can still be beyond the representable
+        // map range. Saturate to a frame that will resolve to the node's
+        // fallback key rather than allowing a float-to-index wraparound.
+        let map_frame = if selector < 0.0 || selector >= u32::MAX as f32 {
+            u32::MAX
+        } else {
+            selector as u32
+        };
+        Some((map_frame, time))
+    })
+}
+
+fn node38_sampled_hierarchy_with_selector(
+    model: &ModelAsset,
+    mut selector_for_node: impl FnMut(usize) -> Option<(u32, AnimationTime)>,
+) -> Option<NodePoseBuffer> {
     if model.node_stride != 38 || model.node_count == 0 {
         return None;
     }
@@ -492,21 +579,36 @@ pub fn node38_sampled_hierarchy(model: &ModelAsset, frame: u16) -> Option<NodePo
         };
         let fallback_index = usize::from(metadata.fallback_key);
         let _fallback = animation.keys.get(fallback_index)?;
-        let key_index =
-            if metadata.anim_map_start == u16::MAX || u32::from(frame) >= animation.frame_count {
+        let sample = selector_for_node(index);
+        let key_index = if let Some((map_frame, _)) = sample {
+            if metadata.anim_map_start == u16::MAX
+                || map_frame == u32::MAX
+                || map_frame >= animation.frame_count
+            {
                 fallback_index
             } else {
-                let mapped_index =
-                    usize::from(*animation.frame_map.get(
-                        usize::from(metadata.anim_map_start).checked_add(usize::from(frame))?,
-                    )?);
+                let mapped_index = usize::from(
+                    *animation.frame_map.get(
+                        usize::from(metadata.anim_map_start)
+                            .checked_add(usize::try_from(map_frame).ok()?)?,
+                    )?,
+                );
                 if mapped_index < fallback_index {
                     mapped_index
                 } else {
                     fallback_index
                 }
-            };
-        let pose = sample_node38_key_pair(&animation.keys, key_index, fallback_index, frame)?;
+            }
+        } else {
+            fallback_index
+        };
+        let sample_time = sample.map_or(AnimationTime(0.0), |(_, time)| time);
+        let pose = node38_native_local_pose(sample_node38_key_pair(
+            &animation.keys,
+            key_index,
+            fallback_index,
+            sample_time,
+        )?);
         parents.push(parent);
         poses.push(pose);
     }
@@ -517,7 +619,7 @@ fn sample_node38_key_pair(
     keys: &[AnimKey24],
     key_index: usize,
     fallback_index: usize,
-    frame: u16,
+    sample_time: AnimationTime,
 ) -> Option<Pose> {
     let key = *keys.get(key_index)?;
     if key_index == fallback_index {
@@ -541,7 +643,7 @@ fn sample_node38_key_pair(
         ],
     )
     .ok()?;
-    track.sample(AnimationTime(f32::from(frame))).ok()
+    track.sample(sample_time).ok()
 }
 
 /// Returns draw batches for a validated slot.
@@ -667,6 +769,8 @@ fn parse_model_document(document: &NresDocument) -> Result<ModelAsset, MshError>
     }
     let node_count = nodes_stream.bytes.len() / node_stride;
 
+    let (bounding_sphere_center, bounding_sphere_radius) =
+        parse_res2_bounding_sphere(&slots_stream.bytes)?;
     let slots = parse_slots(&slots_stream.bytes)?;
     let positions = parse_positions(&positions_stream.bytes)?;
     let indices = parse_u16_array(&indices_stream.bytes, "Res6")?;
@@ -678,7 +782,10 @@ fn parse_model_document(document: &NresDocument) -> Result<ModelAsset, MshError>
         .map(|raw| parse_i8x4_array(&raw.bytes, "Res4"))
         .transpose()?;
     let uv0 = read_optional_stream(document, STREAM_UV0)?
-        .map(|raw| parse_i16x2_array(&raw.bytes, "Res5"))
+        .map(|raw| parse_u16x2_array(&raw.bytes, "Res5"))
+        .transpose()?;
+    let uv1 = read_optional_stream(document, STREAM_UV1)?
+        .map(|raw| parse_secondary_uv_stream(raw, positions.len()))
         .transpose()?;
     let node_names = read_optional_stream(document, STREAM_NAMES)?
         .map(|raw| parse_res10_names(&raw.bytes, node_count))
@@ -689,10 +796,13 @@ fn parse_model_document(document: &NresDocument) -> Result<ModelAsset, MshError>
         node_stride,
         node_count,
         nodes_raw: nodes_stream.bytes,
+        bounding_sphere_center,
+        bounding_sphere_radius,
         slots,
         positions,
         normals,
         uv0,
+        uv1,
         indices,
         batches,
         node_names,
@@ -822,6 +932,27 @@ fn parse_slots(data: &[u8]) -> Result<Vec<Slot>, MshError> {
     Ok(slots)
 }
 
+fn parse_res2_bounding_sphere(data: &[u8]) -> Result<([f32; 3], f32), MshError> {
+    if data.len() < 0x8C {
+        return Err(MshError::InvalidGeometry(format!(
+            "invalid Res2 size: {}",
+            data.len()
+        )));
+    }
+    let center = [
+        read_f32(data, 0x60)?,
+        read_f32(data, 0x64)?,
+        read_f32(data, 0x68)?,
+    ];
+    let radius = read_f32(data, 0x6C)?;
+    if !center.iter().all(|value| value.is_finite()) || !radius.is_finite() || radius < 0.0 {
+        return Err(MshError::InvalidGeometry(
+            "invalid Res2 bounding sphere".to_string(),
+        ));
+    }
+    Ok((center, radius))
+}
+
 fn parse_positions(data: &[u8]) -> Result<Vec<[f32; 3]>, MshError> {
     if !data.len().is_multiple_of(12) {
         return Err(invalid_resource_size("Res3", data.len(), 12));
@@ -845,12 +976,17 @@ fn parse_batches(data: &[u8]) -> Result<Vec<Batch>, MshError> {
     for offset in (0..data.len()).step_by(20) {
         out.push(Batch {
             batch_flags: read_u16_required(data, offset)?,
-            material_index: read_u16_required(data, offset + 2)?,
-            opaque4: read_u16_required(data, offset + 4)?,
-            opaque6: read_u16_required(data, offset + 6)?,
+            material_index_hi: read_u16_required(data, offset + 2)?,
+            material_index: *data
+                .get(offset + 4)
+                .ok_or_else(|| MshError::InvalidGeometry("batch material selector".to_string()))?,
+            lightmap_index: *data
+                .get(offset + 5)
+                .ok_or_else(|| MshError::InvalidGeometry("batch lightmap selector".to_string()))?,
+            local_batch_index: read_u16_required(data, offset + 6)?,
             index_count: read_u16_required(data, offset + 8)?,
             index_start: read_u32(data, offset + 10)?,
-            opaque14: read_u16_required(data, offset + 14)?,
+            vertex_count: read_u16_required(data, offset + 14)?,
             base_vertex: read_u32(data, offset + 16)?,
         });
     }
@@ -884,15 +1020,49 @@ fn parse_i8x4_array(data: &[u8], label: &'static str) -> Result<Vec<[i8; 4]>, Ms
     Ok(out)
 }
 
-fn parse_i16x2_array(data: &[u8], label: &'static str) -> Result<Vec<[i16; 2]>, MshError> {
+fn parse_u16x2_array(data: &[u8], label: &'static str) -> Result<Vec<[u16; 2]>, MshError> {
     if !data.len().is_multiple_of(4) {
         return Err(invalid_resource_size(label, data.len(), 4));
     }
     let mut out = Vec::with_capacity(data.len() / 4);
     for offset in (0..data.len()).step_by(4) {
-        out.push([read_i16(data, offset)?, read_i16(data, offset + 2)?]);
+        out.push([
+            read_u16_required(data, offset)?,
+            read_u16_required(data, offset + 2)?,
+        ]);
     }
     Ok(out)
+}
+
+fn parse_secondary_uv_stream(
+    stream: RawStream,
+    position_count: usize,
+) -> Result<Vec<[u16; 2]>, MshError> {
+    if stream.attributes.attr3 != 4 {
+        return Err(MshError::InvalidGeometry(format!(
+            "invalid Res18 stride: expected 4, got {}",
+            stream.attributes.attr3
+        )));
+    }
+    let values = parse_u16x2_array(&stream.bytes, "Res18")?;
+    let declared_count = usize::try_from(stream.attributes.attr1).map_err(|_| {
+        MshError::InvalidGeometry("Res18 vertex count does not fit usize".to_string())
+    })?;
+    if declared_count != values.len() {
+        return Err(MshError::InvalidGeometry(format!(
+            "Res18 vertex count does not match payload: declared={}, decoded={}",
+            declared_count,
+            values.len()
+        )));
+    }
+    if values.len() != position_count {
+        return Err(MshError::InvalidGeometry(format!(
+            "Res18 vertex count does not match Res3: uv1={}, positions={}",
+            values.len(),
+            position_count
+        )));
+    }
+    Ok(values)
 }
 
 fn parse_res10_names(data: &[u8], node_count: usize) -> Result<Vec<Option<String>>, MshError> {
@@ -1036,16 +1206,6 @@ fn read_u16_required(bytes: &[u8], offset: usize) -> Result<u16, MshError> {
         .try_into()
         .map_err(|_| MshError::InvalidGeometry("integer overflow".to_string()))?;
     Ok(u16::from_le_bytes(arr))
-}
-
-fn read_i16(bytes: &[u8], offset: usize) -> Result<i16, MshError> {
-    let raw = bytes
-        .get(offset..offset.saturating_add(2))
-        .ok_or_else(|| MshError::InvalidGeometry("integer overflow".to_string()))?;
-    let arr: [u8; 2] = raw
-        .try_into()
-        .map_err(|_| MshError::InvalidGeometry("integer overflow".to_string()))?;
-    Ok(i16::from_le_bytes(arr))
 }
 
 fn read_i8(bytes: &[u8], offset: usize) -> Result<i8, MshError> {
@@ -1309,18 +1469,21 @@ mod tests {
         let mut nodes = root;
         nodes.extend(child);
         let mut keys = Vec::new();
-        for (x, y, z, qz, qw) in [
+        // Type 8 stores WXYZ, which `AnimKey24::decode` reorders to XYZW.
+        // The native Node38 local-basis conversion happens before hierarchy
+        // evaluation, not in the generic animation decoder.
+        for (x, y, z, qw, qz) in [
             (1.0, 0.0, 0.0, 23_170_i16, 23_170_i16),
-            (2.0, 0.0, 0.0, 0_i16, 32_767_i16),
+            (2.0, 0.0, 0.0, 32_767_i16, 0_i16),
         ] {
             push_f32(&mut keys, x);
             push_f32(&mut keys, y);
             push_f32(&mut keys, z);
             push_f32(&mut keys, 0.0);
+            push_u16(&mut keys, qw.cast_unsigned());
             push_u16(&mut keys, 0);
             push_u16(&mut keys, 0);
             push_u16(&mut keys, qz.cast_unsigned());
-            push_u16(&mut keys, qw.cast_unsigned());
         }
         let document = decode_nested(&build_nres(&[
             stream(STREAM_NODE_TABLE, 38, b"Res1", &nodes),
@@ -1336,7 +1499,78 @@ mod tests {
             validate_msh(&decode_msh(&document).expect("msh document")).expect("model asset");
         let hierarchy = node38_fallback_hierarchy(&model).expect("valid node hierarchy");
         assert!((hierarchy.poses[1].translation[0] - 1.0).abs() < 0.001);
-        assert!((hierarchy.poses[1].translation[1] - 2.0).abs() < 0.001);
+        assert!((hierarchy.poses[1].translation[1] + 2.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn node38_native_x_rotation_moves_child_translation_for_fallback_and_sampled_paths() {
+        let mut root = node38([u16::MAX; 15]);
+        root[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
+        root[4..6].copy_from_slice(&0_u16.to_le_bytes());
+        root[6..8].copy_from_slice(&1_u16.to_le_bytes());
+        let mut child = node38([u16::MAX; 15]);
+        child[2..4].copy_from_slice(&0_u16.to_le_bytes());
+        child[4..6].copy_from_slice(&u16::MAX.to_le_bytes());
+        child[6..8].copy_from_slice(&2_u16.to_le_bytes());
+        let mut nodes = root;
+        nodes.extend(child);
+        let half_sqrt_two = std::f32::consts::FRAC_1_SQRT_2;
+        let root_rotation = [half_sqrt_two, 0.0, 0.0, half_sqrt_two];
+        let identity = [0.0, 0.0, 0.0, 1.0];
+        let child_translation = [0.0, -1.01209, -0.001792];
+        let model = ModelAsset {
+            node_stride: 38,
+            node_count: 2,
+            nodes_raw: nodes,
+            bounding_sphere_center: [0.0; 3],
+            bounding_sphere_radius: 1.0,
+            slots: Vec::new(),
+            positions: Vec::new(),
+            normals: None,
+            uv0: None,
+            uv1: None,
+            indices: Vec::new(),
+            batches: Vec::new(),
+            node_names: None,
+            animation: Some(ModelAnimation {
+                keys: vec![
+                    AnimKey24 {
+                        time: AnimationTime(0.0),
+                        pose: Pose {
+                            translation: [0.0; 3],
+                            rotation: root_rotation,
+                        },
+                    },
+                    AnimKey24 {
+                        time: AnimationTime(1.0),
+                        pose: Pose {
+                            translation: [0.0; 3],
+                            rotation: root_rotation,
+                        },
+                    },
+                    AnimKey24 {
+                        time: AnimationTime(0.0),
+                        pose: Pose {
+                            translation: child_translation,
+                            rotation: identity,
+                        },
+                    },
+                ],
+                frame_map: vec![0],
+                frame_count: 1,
+            }),
+        };
+
+        let fallback_root = node38_fallback_pose(&model, NodeId(0)).expect("fallback root pose");
+        assert!(fallback_root.rotation[0] < -0.7);
+        let fallback = node38_fallback_hierarchy(&model).expect("fallback hierarchy");
+        let sampled = node38_sampled_hierarchy(&model, 0).expect("sampled hierarchy");
+        for hierarchy in [&fallback, &sampled] {
+            let child_translation = hierarchy.poses[1].translation;
+            assert!(child_translation[0].abs() < 0.0001);
+            assert!((child_translation[1] + 0.001792).abs() < 0.0001);
+            assert!((child_translation[2] - 1.01209).abs() < 0.0001);
+        }
     }
 
     #[test]
@@ -1349,10 +1583,13 @@ mod tests {
             node_stride: 38,
             node_count: 1,
             nodes_raw: node,
+            bounding_sphere_center: [0.0; 3],
+            bounding_sphere_radius: 1.0,
             slots: Vec::new(),
             positions: Vec::new(),
             normals: None,
             uv0: None,
+            uv1: None,
             indices: Vec::new(),
             batches: Vec::new(),
             node_names: None,
@@ -1395,6 +1632,105 @@ mod tests {
     }
 
     #[test]
+    fn standard_nodes_sample_independent_fractional_times_and_selector_rounding() {
+        let mut root = node38([u16::MAX; 15]);
+        root[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
+        root[4..6].copy_from_slice(&0_u16.to_le_bytes());
+        root[6..8].copy_from_slice(&4_u16.to_le_bytes());
+        let mut child = node38([u16::MAX; 15]);
+        child[2..4].copy_from_slice(&0_u16.to_le_bytes());
+        child[4..6].copy_from_slice(&2_u16.to_le_bytes());
+        child[6..8].copy_from_slice(&5_u16.to_le_bytes());
+        let mut nodes = root;
+        nodes.extend(child);
+        let model = ModelAsset {
+            node_stride: 38,
+            node_count: 2,
+            nodes_raw: nodes,
+            bounding_sphere_center: [0.0; 3],
+            bounding_sphere_radius: 1.0,
+            slots: Vec::new(),
+            positions: Vec::new(),
+            normals: None,
+            uv0: None,
+            uv1: None,
+            indices: Vec::new(),
+            batches: Vec::new(),
+            node_names: None,
+            animation: Some(ModelAnimation {
+                keys: vec![
+                    AnimKey24 {
+                        time: AnimationTime(0.0),
+                        pose: Pose {
+                            translation: [4.0, 0.0, 0.0],
+                            rotation: [0.0, 0.0, 0.0, 1.0],
+                        },
+                    },
+                    AnimKey24 {
+                        time: AnimationTime(2.0),
+                        pose: Pose {
+                            translation: [8.0, 0.0, 0.0],
+                            rotation: [0.0, 0.0, 0.0, 1.0],
+                        },
+                    },
+                    AnimKey24 {
+                        time: AnimationTime(1.0),
+                        pose: Pose {
+                            translation: [20.0, 0.0, 0.0],
+                            rotation: [0.0, 0.0, 0.0, 1.0],
+                        },
+                    },
+                    AnimKey24 {
+                        time: AnimationTime(2.0),
+                        pose: Pose {
+                            translation: [30.0, 0.0, 0.0],
+                            rotation: [0.0, 0.0, 0.0, 1.0],
+                        },
+                    },
+                    AnimKey24 {
+                        time: AnimationTime(9.0),
+                        pose: Pose {
+                            translation: [100.0, 0.0, 0.0],
+                            rotation: [0.0, 0.0, 0.0, 1.0],
+                        },
+                    },
+                    AnimKey24 {
+                        time: AnimationTime(9.0),
+                        pose: Pose {
+                            translation: [300.0, 0.0, 0.0],
+                            rotation: [0.0, 0.0, 0.0, 1.0],
+                        },
+                    },
+                ],
+                frame_map: vec![0, 1, 0, 2],
+                frame_count: 4,
+            }),
+        };
+
+        let hierarchy = node38_sampled_hierarchy_at_times(
+            &model,
+            &[Some(AnimationTime(1.0)), Some(AnimationTime(1.55))],
+        )
+        .expect("per-node fractional hierarchy");
+        // The root's tie selects map frame zero and interpolates to x=6. The
+        // child independently selects frame one and samples its own 1.55 time;
+        // its global pose includes the root translation.
+        assert!((hierarchy.poses[0].translation[0] - 6.0).abs() < f32::EPSILON);
+        assert!((hierarchy.poses[1].translation[0] - 31.5).abs() < 0.001);
+        let fallback = node38_sampled_hierarchy_at_times(&model, &[Some(AnimationTime(1.0)), None])
+            .expect("per-node fallback hierarchy");
+        assert_eq!(fallback.poses[1].translation[0], 306.0);
+        assert!(node38_sampled_hierarchy_at_times(&model, &[Some(AnimationTime(1.0))]).is_none());
+        for invalid in [-1.0, f32::NAN, f32::INFINITY] {
+            assert!(node38_sampled_hierarchy_at_times(
+                &model,
+                &[Some(AnimationTime(invalid)), None]
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
     fn type2_header_and_slot_tail_framing_are_exact() {
         let too_small = decode_nested(&build_nres(&[
             stream(STREAM_NODE_TABLE, 38, b"Res1", &[]),
@@ -1418,6 +1754,44 @@ mod tests {
         .expect("nested");
         let err = validate_msh(&decode_msh(&bad_tail).expect("msh")).expect_err("tail");
         assert!(matches!(err, MshError::InvalidGeometry(_)));
+    }
+
+    #[test]
+    fn type2_header_bounding_sphere_is_preserved_and_rejects_invalid_values() {
+        let valid_slots = slots_payload_with_bounds([1.25, -2.5, 3.75], 4.5, &[]);
+        let document = decode_nested(&build_nres(&[
+            stream(STREAM_NODE_TABLE, 38, b"Res1", &[]),
+            stream(STREAM_SLOTS, 0, b"Res2", &valid_slots),
+            stream(STREAM_POSITIONS, 0, b"Res3", &[]),
+            stream(STREAM_INDICES, 0, b"Res6", &[]),
+            stream(STREAM_BATCHES, 0, b"Res13", &[]),
+        ]))
+        .expect("nested");
+        let model = validate_msh(&decode_msh(&document).expect("msh")).expect("model");
+        assert_eq!(model.bounding_sphere_center, [1.25, -2.5, 3.75]);
+        assert_eq!(model.bounding_sphere_radius, 4.5);
+
+        for (offset, value) in [
+            (0x60, f32::NAN),
+            (0x68, f32::INFINITY),
+            (0x6C, f32::NAN),
+            (0x6C, -1.0),
+        ] {
+            let mut slots = slots_payload(&[]);
+            slots[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            let document = decode_nested(&build_nres(&[
+                stream(STREAM_NODE_TABLE, 38, b"Res1", &[]),
+                stream(STREAM_SLOTS, 0, b"Res2", &slots),
+                stream(STREAM_POSITIONS, 0, b"Res3", &[]),
+                stream(STREAM_INDICES, 0, b"Res6", &[]),
+                stream(STREAM_BATCHES, 0, b"Res13", &[]),
+            ]))
+            .expect("nested");
+            assert!(matches!(
+                validate_msh(&decode_msh(&document).expect("msh")),
+                Err(MshError::InvalidGeometry(_))
+            ));
+        }
     }
 
     #[test]
@@ -1448,6 +1822,7 @@ mod tests {
             (STREAM_POSITIONS, b"Res3".as_slice(), vec![0; 11]),
             (STREAM_NORMALS, b"Res4".as_slice(), vec![0; 3]),
             (STREAM_UV0, b"Res5".as_slice(), vec![0; 3]),
+            (STREAM_UV1, b"Res18".as_slice(), vec![0; 3]),
             (STREAM_INDICES, b"Res6".as_slice(), vec![0; 1]),
         ] {
             let slots = slots_payload(&[]);
@@ -1472,6 +1847,127 @@ mod tests {
     }
 
     #[test]
+    fn type18_secondary_uv_decodes_unsigned_pairs_for_each_source_vertex() {
+        let positions = positions_payload(&[[0.0, 0.0, 0.0]; 4]);
+        let mut uv1 = Vec::new();
+        for pair in [[2_u16, 5_u16], [12, 8], [16, 30], [34, 2]] {
+            push_u16(&mut uv1, pair[0]);
+            push_u16(&mut uv1, pair[1]);
+        }
+        let document = decode_nested(&build_nres(&[
+            stream(STREAM_NODE_TABLE, 38, b"Res1", &[]),
+            stream(STREAM_SLOTS, 0, b"Res2", &slots_payload(&[])),
+            stream(STREAM_POSITIONS, 12, b"Res3", &positions),
+            stream(STREAM_INDICES, 0, b"Res6", &[]),
+            stream(STREAM_BATCHES, 0, b"Res13", &[]),
+            stream_with_attr1(STREAM_UV1, 4, 4, b"Res18", &uv1),
+        ]))
+        .expect("nested");
+        let model = validate_msh(&decode_msh(&document).expect("msh")).expect("model");
+
+        assert_eq!(model.positions.len(), 4);
+        assert_eq!(model.uv1, Some(vec![[2, 5], [12, 8], [16, 30], [34, 2]]));
+    }
+
+    #[test]
+    fn type18_secondary_uv_rejects_untrusted_count_or_stride() {
+        let positions = positions_payload(&[[0.0, 0.0, 0.0]; 1]);
+        for (attr1, attr3, expected) in [(1, 8, "stride"), (2, 4, "count")] {
+            let mut uv1 = Vec::new();
+            push_u16(&mut uv1, 2);
+            push_u16(&mut uv1, 5);
+            let document = decode_nested(&build_nres(&[
+                stream(STREAM_NODE_TABLE, 38, b"Res1", &[]),
+                stream(STREAM_SLOTS, 0, b"Res2", &slots_payload(&[])),
+                stream(STREAM_POSITIONS, 12, b"Res3", &positions),
+                stream(STREAM_INDICES, 0, b"Res6", &[]),
+                stream(STREAM_BATCHES, 0, b"Res13", &[]),
+                stream_with_attr1(STREAM_UV1, attr1, attr3, b"Res18", &uv1),
+            ]))
+            .expect("nested");
+            let err = validate_msh(&decode_msh(&document).expect("msh")).expect_err("invalid");
+            let message = err.to_string();
+            assert!(message.contains(expected), "{message}");
+        }
+    }
+
+    #[test]
+    fn installed_gog_secondary_uv_fixture_is_aligned_and_real() {
+        let Some(root) = std::env::var_os("FPARKAN_GAME_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        assert!(
+            root.is_dir(),
+            "FPARKAN_GAME_ROOT is missing: {}",
+            root.display()
+        );
+
+        let mut models_with_uv1 = 0usize;
+        let mut fixture_found = false;
+        for path in files_under(&root) {
+            if !path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("rlb"))
+            {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(archive) =
+                fparkan_nres::decode(Arc::from(bytes.into_boxed_slice()), ReadProfile::Compatible)
+            else {
+                continue;
+            };
+            for entry in archive
+                .entries()
+                .iter()
+                .filter(|entry| has_msh_extension(entry.name_bytes()))
+            {
+                let payload = archive.payload(entry.id()).expect("payload");
+                let nested = fparkan_nres::decode(
+                    Arc::from(payload.to_vec().into_boxed_slice()),
+                    ReadProfile::Compatible,
+                )
+                .unwrap_or_else(|err| panic!("{path:?} {:?}: {err}", entry.name_bytes()));
+                let msh = decode_msh(&nested)
+                    .unwrap_or_else(|err| panic!("{path:?} {:?}: {err}", entry.name_bytes()));
+                let model = validate_msh(&msh)
+                    .unwrap_or_else(|err| panic!("{path:?} {:?}: {err}", entry.name_bytes()));
+                let Some(uv1) = model.uv1.as_ref() else {
+                    continue;
+                };
+                models_with_uv1 += 1;
+                assert_eq!(
+                    uv1.len(),
+                    model.positions.len(),
+                    "{path:?} {:?}",
+                    entry.name_bytes()
+                );
+                let descriptor = msh
+                    .streams()
+                    .iter()
+                    .find(|stream| stream.type_id == STREAM_UV1)
+                    .expect("Res18 descriptor");
+                assert_eq!(descriptor.attributes.attr1 as usize, uv1.len());
+                assert_eq!(descriptor.attributes.attr3, 4);
+
+                if entry.name_bytes().eq_ignore_ascii_case(b"fr_l_gener.msh") {
+                    assert_eq!(&uv1[..4], &[[2, 5], [12, 8], [16, 30], [34, 2]]);
+                    fixture_found = true;
+                }
+            }
+        }
+
+        assert!(models_with_uv1 > 0, "FPARKAN_GAME_ROOT has no type18 MSH");
+        assert!(
+            fixture_found,
+            "FPARKAN_GAME_ROOT lacks fr_l_gener.msh fixture"
+        );
+    }
+
+    #[test]
     fn batch20_uses_unaligned_field_offsets() {
         let positions = positions_payload(&[[0.0, 0.0, 0.0]]);
         let mut indices = Vec::new();
@@ -1488,12 +1984,13 @@ mod tests {
         let model = validate_msh(&decode_msh(&document).expect("msh")).expect("model");
 
         assert_eq!(model.batches[0].batch_flags, 0x1100);
-        assert_eq!(model.batches[0].material_index, 0x2200);
-        assert_eq!(model.batches[0].opaque4, 0x3300);
-        assert_eq!(model.batches[0].opaque6, 0x4400);
+        assert_eq!(model.batches[0].material_index_hi, 0x2200);
+        assert_eq!(model.batches[0].material_index, 0x00);
+        assert_eq!(model.batches[0].lightmap_index, 0x33);
+        assert_eq!(model.batches[0].local_batch_index, 0x4400);
         assert_eq!(model.batches[0].index_count, 1);
         assert_eq!(model.batches[0].index_start, 0);
-        assert_eq!(model.batches[0].opaque14, 0x5500);
+        assert_eq!(model.batches[0].vertex_count, 0x5500);
         assert_eq!(model.batches[0].base_vertex, 0);
     }
 
@@ -1587,44 +2084,49 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
-    fn licensed_corpus_msh_assets_validate() {
-        for (corpus, expected) in [("IS", 435_usize), ("IS2", 511_usize)] {
-            let root = corpus_root(corpus);
-            let mut count = 0usize;
-            for path in files_under(&root) {
-                let Ok(bytes) = std::fs::read(&path) else {
-                    continue;
-                };
-                let Ok(archive) = fparkan_nres::decode(
-                    Arc::from(bytes.into_boxed_slice()),
+    fn licensed_corpus_part1_msh_assets_validate() {
+        validate_licensed_corpus_msh_assets("IS", 435);
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_corpus_part2_msh_assets_validate() {
+        validate_licensed_corpus_msh_assets("IS2", 511);
+    }
+
+    fn validate_licensed_corpus_msh_assets(corpus: &str, expected: usize) {
+        let root = corpus_root(corpus);
+        let mut count = 0usize;
+        for path in files_under(&root) {
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(archive) =
+                fparkan_nres::decode(Arc::from(bytes.into_boxed_slice()), ReadProfile::Compatible)
+            else {
+                continue;
+            };
+            for entry in archive
+                .entries()
+                .iter()
+                .filter(|entry| has_msh_extension(entry.name_bytes()))
+            {
+                let payload = archive.payload(entry.id()).expect("payload");
+                let nested = fparkan_nres::decode(
+                    Arc::from(payload.to_vec().into_boxed_slice()),
                     ReadProfile::Compatible,
-                ) else {
-                    continue;
-                };
-                for entry in archive
-                    .entries()
-                    .iter()
-                    .filter(|entry| has_msh_extension(entry.name_bytes()))
-                {
-                    let payload = archive.payload(entry.id()).expect("payload");
-                    let nested = fparkan_nres::decode(
-                        Arc::from(payload.to_vec().into_boxed_slice()),
-                        ReadProfile::Compatible,
-                    )
-                    .unwrap_or_else(|err| {
-                        panic!("{corpus} {path:?} {:?}: {err}", entry.name_bytes())
-                    });
-                    let msh = decode_msh(&nested).unwrap_or_else(|err| {
-                        panic!("{corpus} {path:?} {:?}: {err}", entry.name_bytes())
-                    });
-                    validate_msh(&msh).unwrap_or_else(|err| {
-                        panic!("{corpus} {path:?} {:?}: {err}", entry.name_bytes())
-                    });
-                    count += 1;
-                }
+                )
+                .unwrap_or_else(|err| panic!("{corpus} {path:?} {:?}: {err}", entry.name_bytes()));
+                let msh = decode_msh(&nested).unwrap_or_else(|err| {
+                    panic!("{corpus} {path:?} {:?}: {err}", entry.name_bytes())
+                });
+                validate_msh(&msh).unwrap_or_else(|err| {
+                    panic!("{corpus} {path:?} {:?}: {err}", entry.name_bytes())
+                });
+                count += 1;
             }
-            assert_eq!(count, expected, "{corpus} MSH count");
         }
+        assert_eq!(count, expected, "{corpus} MSH count");
     }
 
     #[test]
@@ -1932,6 +2434,23 @@ mod tests {
     fn stream<'a>(type_id: u32, attr3: u32, name: &'a [u8], payload: &'a [u8]) -> TestEntry<'a> {
         TestEntry {
             type_id,
+            attr1: 0,
+            attr3,
+            name,
+            payload,
+        }
+    }
+
+    fn stream_with_attr1<'a>(
+        type_id: u32,
+        attr1: u32,
+        attr3: u32,
+        name: &'a [u8],
+        payload: &'a [u8],
+    ) -> TestEntry<'a> {
+        TestEntry {
+            type_id,
+            attr1,
             attr3,
             name,
             payload,
@@ -1940,6 +2459,7 @@ mod tests {
 
     struct TestEntry<'a> {
         type_id: u32,
+        attr1: u32,
         attr3: u32,
         name: &'a [u8],
         payload: &'a [u8],
@@ -1958,7 +2478,7 @@ mod tests {
         order.sort_by(|left, right| entries[*left].name.cmp(entries[*right].name));
         for (idx, entry) in entries.iter().enumerate() {
             push_u32(&mut out, entry.type_id);
-            push_u32(&mut out, 0);
+            push_u32(&mut out, entry.attr1);
             push_u32(&mut out, 0);
             push_u32(
                 &mut out,
@@ -2000,7 +2520,19 @@ mod tests {
     }
 
     fn slots_payload(records: &[Vec<u8>]) -> Vec<u8> {
+        slots_payload_with_bounds([0.0; 3], 1.0, records)
+    }
+
+    fn slots_payload_with_bounds(center: [f32; 3], radius: f32, records: &[Vec<u8>]) -> Vec<u8> {
         let mut out = vec![0; 0x8c];
+        for (offset, value) in [
+            (0x60, center[0]),
+            (0x64, center[1]),
+            (0x68, center[2]),
+            (0x6C, radius),
+        ] {
+            out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
         for record in records {
             assert_eq!(record.len(), 68);
             out.extend_from_slice(record);

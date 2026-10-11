@@ -18,6 +18,9 @@ pub(super) struct VulkanAllocatedImage {
     pub(super) image: vk::Image,
     pub(super) memory: vk::DeviceMemory,
     pub(super) view: vk::ImageView,
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) mip_levels: u32,
 }
 
 /// Depth/stencil image and the exact format selected for its render pass.
@@ -134,6 +137,9 @@ pub(super) fn create_depth_attachment(
             image,
             memory,
             view,
+            width: extent.0,
+            height: extent.1,
+            mip_levels: 1,
         },
         format,
     })
@@ -186,7 +192,6 @@ fn depth_aspect(format: vk::Format) -> vk::ImageAspectFlags {
 
 pub(super) struct VulkanFrameSync {
     pub(super) image_available: vk::Semaphore,
-    pub(super) render_finished: vk::Semaphore,
     pub(super) fence: vk::Fence,
 }
 
@@ -210,17 +215,7 @@ pub(super) fn create_static_mesh_vertex_buffer(
     device: &VulkanLogicalDeviceProbe,
     mesh: &VulkanStaticMesh,
 ) -> Result<VulkanAllocatedBuffer, VulkanSmokeRendererError> {
-    let mut bytes = Vec::with_capacity(mesh.vertices.len() * 8 * std::mem::size_of::<f32>());
-    for vertex in &mesh.vertices {
-        for value in vertex
-            .position
-            .into_iter()
-            .chain(vertex.color)
-            .chain(vertex.uv)
-        {
-            bytes.extend_from_slice(&value.to_ne_bytes());
-        }
-    }
+    let bytes = encode_static_vertices(&mesh.vertices)?;
     create_host_visible_buffer(
         instance,
         device,
@@ -230,22 +225,160 @@ pub(super) fn create_static_mesh_vertex_buffer(
     )
 }
 
+/// Allocates a vertex buffer for a frame's retained mesh capacity.
+pub(super) fn create_vertex_buffer(
+    instance: &VulkanInstanceProbe,
+    device: &VulkanLogicalDeviceProbe,
+    vertices: &[super::VulkanStaticVertex],
+) -> Result<VulkanAllocatedBuffer, VulkanSmokeRendererError> {
+    let bytes = encode_static_vertices(vertices)?;
+    create_host_visible_buffer(
+        instance,
+        device,
+        &bytes,
+        vk::BufferUsageFlags::VERTEX_BUFFER,
+        "dynamic mesh vertex buffer",
+    )
+}
+
+/// Replaces the bytes of a host-visible static vertex allocation.
+///
+/// The live renderer waits for the device before calling this helper, so a
+/// single shared allocation can safely carry camera-relative sky and weather
+/// geometry between frames.
+pub(super) fn write_static_mesh_vertex_buffer(
+    device: &VulkanLogicalDeviceProbe,
+    buffer: &VulkanAllocatedBuffer,
+    vertices: &[super::VulkanStaticVertex],
+) -> Result<(), VulkanSmokeRendererError> {
+    let bytes = encode_static_vertices(vertices)?;
+    write_mapped_buffer(
+        device,
+        buffer,
+        &bytes,
+        "vkMapMemory(static mesh vertex update)",
+    )
+}
+
+fn encode_static_vertices(
+    vertices: &[super::VulkanStaticVertex],
+) -> Result<Vec<u8>, VulkanSmokeRendererError> {
+    let byte_len = vertices
+        .len()
+        .checked_mul(14)
+        .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or(VulkanSmokeRendererError::InvalidStaticMesh {
+            context: "static mesh vertex data size overflows address space",
+        })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(byte_len)
+        .map_err(|_| VulkanSmokeRendererError::InvalidStaticMesh {
+            context: "static mesh vertex data exceeds addressable memory",
+        })?;
+    for vertex in vertices {
+        for value in vertex
+            .position
+            .into_iter()
+            .chain(vertex.color)
+            .chain(vertex.normal)
+            .chain(vertex.uv)
+            .chain(vertex.detail_uv)
+            .chain([vertex.overlay_alpha])
+        {
+            bytes.extend_from_slice(&value.to_ne_bytes());
+        }
+    }
+    Ok(bytes)
+}
+
+fn write_mapped_buffer(
+    device: &VulkanLogicalDeviceProbe,
+    buffer: &VulkanAllocatedBuffer,
+    bytes: &[u8],
+    context: &'static str,
+) -> Result<(), VulkanSmokeRendererError> {
+    let byte_len =
+        u64::try_from(bytes.len()).map_err(|_| VulkanSmokeRendererError::InvalidStaticMesh {
+            context: "static mesh upload exceeds address space",
+        })?;
+    if byte_len == 0 {
+        return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+            context: "static mesh upload cannot be empty",
+        });
+    }
+    // SAFETY: The caller validates that the allocation is large enough and
+    // waits for all queue work that could read it before this write.
+    let mapped = unsafe {
+        device
+            .device()
+            .map_memory(buffer.memory, 0, byte_len, vk::MemoryMapFlags::empty())
+    }
+    .map_err(|result| VulkanSmokeRendererError::VulkanOperation { context, result })?;
+    // SAFETY: `mapped` covers exactly the byte slice copied below.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
+        device.device().unmap_memory(buffer.memory);
+    }
+    Ok(())
+}
+
 pub(super) fn create_static_mesh_index_buffer(
     instance: &VulkanInstanceProbe,
     device: &VulkanLogicalDeviceProbe,
     mesh: &VulkanStaticMesh,
 ) -> Result<VulkanAllocatedBuffer, VulkanSmokeRendererError> {
-    let mut bytes = Vec::with_capacity(mesh.indices.len() * std::mem::size_of::<u32>());
-    for &index in &mesh.indices {
-        bytes.extend_from_slice(&index.to_ne_bytes());
-    }
+    create_index_buffer(instance, device, &mesh.indices)
+}
+
+/// Allocates an index buffer for a frame's retained mesh capacity.
+pub(super) fn create_index_buffer(
+    instance: &VulkanInstanceProbe,
+    device: &VulkanLogicalDeviceProbe,
+    indices: &[u32],
+) -> Result<VulkanAllocatedBuffer, VulkanSmokeRendererError> {
+    let bytes = encode_static_indices(indices)?;
     create_host_visible_buffer(
         instance,
         device,
         &bytes,
         vk::BufferUsageFlags::INDEX_BUFFER,
-        "static mesh index buffer",
+        "dynamic mesh index buffer",
     )
+}
+
+/// Replaces the bytes of a host-visible static index allocation.
+pub(super) fn write_static_mesh_index_buffer(
+    device: &VulkanLogicalDeviceProbe,
+    buffer: &VulkanAllocatedBuffer,
+    indices: &[u32],
+) -> Result<(), VulkanSmokeRendererError> {
+    let bytes = encode_static_indices(indices)?;
+    write_mapped_buffer(
+        device,
+        buffer,
+        &bytes,
+        "vkMapMemory(static mesh index update)",
+    )
+}
+
+fn encode_static_indices(indices: &[u32]) -> Result<Vec<u8>, VulkanSmokeRendererError> {
+    let byte_len = indices
+        .len()
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or(VulkanSmokeRendererError::InvalidStaticMesh {
+            context: "static mesh index data size overflows address space",
+        })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(byte_len)
+        .map_err(|_| VulkanSmokeRendererError::InvalidStaticMesh {
+            context: "static mesh index data exceeds addressable memory",
+        })?;
+    for &index in indices {
+        bytes.extend_from_slice(&index.to_ne_bytes());
+    }
+    Ok(bytes)
 }
 
 pub(super) fn create_static_texture_image(
@@ -254,10 +387,14 @@ pub(super) fn create_static_texture_image(
     command_pool: vk::CommandPool,
     texture: &VulkanStaticTexture,
 ) -> Result<VulkanAllocatedImage, VulkanSmokeRendererError> {
+    texture
+        .validate()
+        .map_err(|context| VulkanSmokeRendererError::InvalidStaticTexture { context })?;
+    let (mip_bytes, mip_levels) = build_static_texture_mip_chain(texture);
     let staging = create_host_visible_buffer(
         instance,
         device,
-        &texture.rgba8,
+        &mip_bytes,
         vk::BufferUsageFlags::TRANSFER_SRC,
         "static texture staging buffer",
     )?;
@@ -269,7 +406,7 @@ pub(super) fn create_static_texture_image(
             height: texture.height,
             depth: 1,
         })
-        .mip_levels(1)
+        .mip_levels(mip_levels)
         .array_layers(1)
         .samples(vk::SampleCountFlags::TYPE_1)
         .tiling(vk::ImageTiling::OPTIMAL)
@@ -336,6 +473,7 @@ pub(super) fn create_static_texture_image(
         image,
         texture.width,
         texture.height,
+        mip_levels,
     ) {
         // SAFETY: Both resources were created on this device and are being rolled back once.
         unsafe {
@@ -350,7 +488,7 @@ pub(super) fn create_static_texture_image(
         .image(image)
         .view_type(vk::ImageViewType::TYPE_2D)
         .format(vk::Format::R8G8B8A8_UNORM)
-        .subresource_range(color_subresource_range());
+        .subresource_range(color_subresource_range(mip_levels));
     // SAFETY: The image is live, initialized and has the stated color subresource.
     let view = {
         // SAFETY: The image is live, initialized and has the stated color subresource.
@@ -371,7 +509,209 @@ pub(super) fn create_static_texture_image(
         image,
         memory,
         view,
+        width: texture.width,
+        height: texture.height,
+        mip_levels,
     })
+}
+
+/// Allocates two aligned camera slots used by the dynamic frame UBO.
+pub(super) fn create_frame_uniform_buffer(
+    instance: &VulkanInstanceProbe,
+    device: &VulkanLogicalDeviceProbe,
+) -> Result<(VulkanAllocatedBuffer, u64), VulkanSmokeRendererError> {
+    const FRAME_SLOTS: u64 = 2;
+    const FRAME_BYTES: u64 = super::VULKAN_FRAME_UNIFORM_BYTES as u64;
+    let limits =
+        // SAFETY: The physical device belongs to this live instance and the query returns a value copy.
+        unsafe { instance.instance.get_physical_device_properties(device.physical_device()) };
+    let alignment = u64::from(limits.limits.min_uniform_buffer_offset_alignment).max(1);
+    let stride = FRAME_BYTES.checked_add(alignment - 1).ok_or(
+        VulkanSmokeRendererError::InvalidStaticMesh {
+            context: "frame uniform stride overflow",
+        },
+    )? / alignment
+        * alignment;
+    let size =
+        stride
+            .checked_mul(FRAME_SLOTS)
+            .ok_or(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "frame uniform buffer size overflow",
+            })?;
+    let bytes = vec![
+        0_u8;
+        usize::try_from(size).map_err(|_| {
+            VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "frame uniform buffer size exceeds address space",
+            }
+        })?
+    ];
+    let buffer = create_host_visible_buffer(
+        instance,
+        device,
+        &bytes,
+        vk::BufferUsageFlags::UNIFORM_BUFFER,
+        "frame uniform buffer",
+    )?;
+    Ok((buffer, stride))
+}
+
+/// Allocates one aligned storage-buffer record for every material descriptor.
+///
+/// The descriptor uses a dynamic storage-buffer offset.  Keeping the stride
+/// aligned to the physical device limit lets the renderer select a material
+/// record with the same descriptor set for every draw without baking material
+/// indices into the pipeline layout.
+pub(super) fn create_material_specular_buffer(
+    instance: &VulkanInstanceProbe,
+    device: &VulkanLogicalDeviceProbe,
+    material_count: usize,
+) -> Result<(VulkanAllocatedBuffer, u64), VulkanSmokeRendererError> {
+    if material_count == 0 {
+        return Err(VulkanSmokeRendererError::InvariantViolation {
+            context: "material specular buffer has no material records",
+        });
+    }
+    let limits =
+        // SAFETY: The physical device belongs to this live instance and the query returns a value copy.
+        unsafe { instance.instance.get_physical_device_properties(device.physical_device()) };
+    let alignment = limits.limits.min_storage_buffer_offset_alignment.max(1);
+    let record_bytes = super::VULKAN_MATERIAL_SPECULAR_RECORD_BYTES as u64;
+    let stride = record_bytes.checked_add(alignment - 1).ok_or(
+        VulkanSmokeRendererError::InvalidStaticMesh {
+            context: "material specular stride overflow",
+        },
+    )? / alignment
+        * alignment;
+    let count =
+        u64::try_from(material_count).map_err(|_| VulkanSmokeRendererError::InvalidStaticMesh {
+            context: "material specular count exceeds address space",
+        })?;
+    let size = stride
+        .checked_mul(count)
+        .ok_or(VulkanSmokeRendererError::InvalidStaticMesh {
+            context: "material specular buffer size overflow",
+        })?;
+    let bytes =
+        vec![
+            0_u8;
+            usize::try_from(size).map_err(|_| VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "material specular buffer size exceeds address space",
+            })?
+        ];
+    let buffer = create_host_visible_buffer(
+        instance,
+        device,
+        &bytes,
+        vk::BufferUsageFlags::STORAGE_BUFFER,
+        "material specular buffer",
+    )?;
+    Ok((buffer, stride))
+}
+
+/// Replaces all material specular records in one host-coherent upload.
+pub(super) fn write_material_specular_buffer(
+    device: &VulkanLogicalDeviceProbe,
+    buffer: &VulkanAllocatedBuffer,
+    stride: u64,
+    records: &[[[f32; 4]; 2]],
+) -> Result<(), VulkanSmokeRendererError> {
+    if records.is_empty() {
+        return Err(VulkanSmokeRendererError::InvariantViolation {
+            context: "material specular upload has no records",
+        });
+    }
+    let record_bytes = super::VULKAN_MATERIAL_SPECULAR_RECORD_BYTES;
+    let total_bytes = stride
+        .checked_mul(u64::try_from(records.len()).unwrap_or(u64::MAX))
+        .ok_or(VulkanSmokeRendererError::InvariantViolation {
+            context: "material specular upload size",
+        })?;
+    let total_bytes_usize =
+        usize::try_from(total_bytes).map_err(|_| VulkanSmokeRendererError::InvariantViolation {
+            context: "material specular upload size exceeds address space",
+        })?;
+    let mut bytes = vec![0_u8; total_bytes_usize];
+    for (record_index, record) in records.iter().enumerate() {
+        let record_offset = usize::try_from(
+            stride
+                .checked_mul(u64::try_from(record_index).unwrap_or(u64::MAX))
+                .ok_or(VulkanSmokeRendererError::InvariantViolation {
+                    context: "material specular upload offset",
+                })?,
+        )
+        .map_err(|_| VulkanSmokeRendererError::InvariantViolation {
+            context: "material specular upload offset exceeds address space",
+        })?;
+        let mut offset = record_offset;
+        for vector in record {
+            for value in vector {
+                bytes[offset..offset + std::mem::size_of::<f32>()]
+                    .copy_from_slice(&value.to_ne_bytes());
+                offset += std::mem::size_of::<f32>();
+            }
+        }
+        debug_assert_eq!(offset - record_offset, record_bytes);
+    }
+    // SAFETY: The storage buffer is host-visible and the caller has waited for
+    // all prior uses before replacing its records.
+    let mapped = unsafe {
+        device
+            .device()
+            .map_memory(buffer.memory, 0, total_bytes, vk::MemoryMapFlags::empty())
+    }
+    .map_err(|result| VulkanSmokeRendererError::VulkanOperation {
+        context: "vkMapMemory(material specular buffer)",
+        result,
+    })?;
+    // SAFETY: The mapped range is the complete upload and the destination is
+    // valid for the exact byte count copied below.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
+        device.device().unmap_memory(buffer.memory);
+    }
+    Ok(())
+}
+
+/// Writes one complete frame block into the slot selected by the
+/// fence-safe frame index.
+pub(super) fn write_frame_uniform(
+    device: &VulkanLogicalDeviceProbe,
+    buffer: &VulkanAllocatedBuffer,
+    stride: u64,
+    frame_index: usize,
+    bytes: &[u8; super::VULKAN_FRAME_UNIFORM_BYTES],
+) -> Result<(), VulkanSmokeRendererError> {
+    let slot =
+        u64::try_from(frame_index).map_err(|_| VulkanSmokeRendererError::InvariantViolation {
+            context: "frame uniform slot index",
+        })?;
+    let offset = stride
+        .checked_mul(slot)
+        .ok_or(VulkanSmokeRendererError::InvariantViolation {
+            context: "frame uniform slot offset",
+        })?;
+    // SAFETY: The offset is one of the two allocated aligned slots and the
+    // mapped range is exactly one complete frame block.
+    let mapped = unsafe {
+        device.device().map_memory(
+            buffer.memory,
+            offset,
+            super::VULKAN_FRAME_UNIFORM_BYTES as u64,
+            vk::MemoryMapFlags::empty(),
+        )
+    }
+    .map_err(|result| VulkanSmokeRendererError::VulkanOperation {
+        context: "vkMapMemory(frame uniform buffer)",
+        result,
+    })?;
+    // SAFETY: The destination is the mapped frame slot and the byte slice lives
+    // for this copy.
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
+        device.device().unmap_memory(buffer.memory);
+    }
+    Ok(())
 }
 
 fn upload_static_texture(
@@ -381,6 +721,7 @@ fn upload_static_texture(
     image: vk::Image,
     width: u32,
     height: u32,
+    mip_levels: u32,
 ) -> Result<(), VulkanSmokeRendererError> {
     let allocate_info = vk::CommandBufferAllocateInfo::default()
         .command_pool(command_pool)
@@ -407,7 +748,7 @@ fn upload_static_texture(
             result,
         });
     }
-    let range = color_subresource_range();
+    let range = color_subresource_range(mip_levels);
     let to_transfer = vk::ImageMemoryBarrier::default()
         .old_layout(vk::ImageLayout::UNDEFINED)
         .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
@@ -415,19 +756,34 @@ fn upload_static_texture(
         .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
         .image(image)
         .subresource_range(range);
-    let region = vk::BufferImageCopy::default()
-        .image_subresource(
-            vk::ImageSubresourceLayers::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .mip_level(0)
-                .base_array_layer(0)
-                .layer_count(1),
-        )
-        .image_extent(vk::Extent3D {
-            width,
-            height,
-            depth: 1,
-        });
+    let mut regions = Vec::with_capacity(usize::try_from(mip_levels).unwrap_or(0));
+    let mut buffer_offset = 0_u64;
+    let mut mip_width = width;
+    let mut mip_height = height;
+    for mip_level in 0..mip_levels {
+        let mip_bytes = u64::from(mip_width)
+            .saturating_mul(u64::from(mip_height))
+            .saturating_mul(4);
+        regions.push(
+            vk::BufferImageCopy::default()
+                .buffer_offset(buffer_offset)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(mip_level)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D {
+                    width: mip_width,
+                    height: mip_height,
+                    depth: 1,
+                }),
+        );
+        buffer_offset = buffer_offset.saturating_add(mip_bytes);
+        mip_width = (mip_width / 2).max(1);
+        mip_height = (mip_height / 2).max(1);
+    }
     let to_sampled = vk::ImageMemoryBarrier::default()
         .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
         .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
@@ -451,7 +807,7 @@ fn upload_static_texture(
             staging_buffer,
             image,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &[region],
+            &regions,
         );
         device.device().cmd_pipeline_barrier(
             command_buffer,
@@ -498,6 +854,246 @@ fn upload_static_texture(
         context: "vkQueueSubmit/WaitIdle(texture upload)",
         result,
     })
+}
+
+/// Replaces the contents of an already sampled texture without changing its
+/// image view or descriptor set.  The caller must wait for the renderer's
+/// submitted work before invoking this function.
+pub(super) fn update_static_texture_image(
+    instance: &VulkanInstanceProbe,
+    device: &VulkanLogicalDeviceProbe,
+    command_pool: vk::CommandPool,
+    image: &VulkanAllocatedImage,
+    texture: &VulkanStaticTexture,
+) -> Result<(), VulkanSmokeRendererError> {
+    texture
+        .validate()
+        .map_err(|context| VulkanSmokeRendererError::InvalidStaticTexture { context })?;
+    let (mip_bytes, mip_levels) = build_static_texture_mip_chain(texture);
+    if texture.width != image.width
+        || texture.height != image.height
+        || mip_levels != image.mip_levels
+    {
+        return Err(VulkanSmokeRendererError::InvalidStaticTexture {
+            context: "dynamic texture extent or mip count differs from allocation",
+        });
+    }
+    let staging = create_host_visible_buffer(
+        instance,
+        device,
+        &mip_bytes,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+        "dynamic texture staging buffer",
+    )?;
+    let allocate_info = vk::CommandBufferAllocateInfo::default()
+        .command_pool(command_pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(1);
+    // SAFETY: The command pool is live and owned by the current logical device.
+    let command_buffer = unsafe { device.device().allocate_command_buffers(&allocate_info) }
+        .map_err(|result| {
+            destroy_allocated_buffer(device, &staging);
+            VulkanSmokeRendererError::VulkanOperation {
+                context: "vkAllocateCommandBuffers(dynamic texture upload)",
+                result,
+            }
+        })?[0];
+    let begin =
+        vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    // SAFETY: The command buffer is freshly allocated from the current pool.
+    if let Err(result) = unsafe { device.device().begin_command_buffer(command_buffer, &begin) } {
+        // SAFETY: The command buffer belongs to this pool and is released on failure.
+        unsafe {
+            device
+                .device()
+                .free_command_buffers(command_pool, &[command_buffer]);
+        };
+        destroy_allocated_buffer(device, &staging);
+        return Err(VulkanSmokeRendererError::VulkanOperation {
+            context: "vkBeginCommandBuffer(dynamic texture upload)",
+            result,
+        });
+    }
+    let range = color_subresource_range(mip_levels);
+    let to_transfer = vk::ImageMemoryBarrier::default()
+        .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .src_access_mask(vk::AccessFlags::SHADER_READ)
+        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .image(image.image)
+        .subresource_range(range);
+    let mut regions = Vec::with_capacity(usize::try_from(mip_levels).unwrap_or(0));
+    let mut buffer_offset = 0_u64;
+    let mut mip_width = texture.width;
+    let mut mip_height = texture.height;
+    for mip_level in 0..mip_levels {
+        let mip_bytes = u64::from(mip_width)
+            .saturating_mul(u64::from(mip_height))
+            .saturating_mul(4);
+        regions.push(
+            vk::BufferImageCopy::default()
+                .buffer_offset(buffer_offset)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(mip_level)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D {
+                    width: mip_width,
+                    height: mip_height,
+                    depth: 1,
+                }),
+        );
+        buffer_offset = buffer_offset.saturating_add(mip_bytes);
+        mip_width = (mip_width / 2).max(1);
+        mip_height = (mip_height / 2).max(1);
+    }
+    let to_sampled = vk::ImageMemoryBarrier::default()
+        .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+        .image(image.image)
+        .subresource_range(range);
+    // SAFETY: The caller has made all prior shader reads idle, and the image
+    // remains exclusively owned by this graphics queue.
+    unsafe {
+        device.device().cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_transfer],
+        );
+        device.device().cmd_copy_buffer_to_image(
+            command_buffer,
+            staging.buffer,
+            image.image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &regions,
+        );
+        device.device().cmd_pipeline_barrier(
+            command_buffer,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[to_sampled],
+        );
+    }
+    // SAFETY: Command recording is complete on the current command buffer.
+    if let Err(result) = unsafe { device.device().end_command_buffer(command_buffer) } {
+        // SAFETY: The command buffer belongs to this pool and is released on failure.
+        unsafe {
+            device
+                .device()
+                .free_command_buffers(command_pool, &[command_buffer]);
+        };
+        destroy_allocated_buffer(device, &staging);
+        return Err(VulkanSmokeRendererError::VulkanOperation {
+            context: "vkEndCommandBuffer(dynamic texture upload)",
+            result,
+        });
+    }
+    let command_buffers = [command_buffer];
+    let submit = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
+    // SAFETY: The graphics queue and submitted command buffer remain live
+    // until this synchronous wait completes.
+    let submit_result = unsafe {
+        device
+            .device()
+            .queue_submit(device.graphics_queue(), &submit, vk::Fence::null())
+    };
+    let result = submit_result
+        .and_then(|()| unsafe { device.device().queue_wait_idle(device.graphics_queue()) });
+    // SAFETY: Submission completed or failed synchronously.
+    unsafe {
+        device
+            .device()
+            .free_command_buffers(command_pool, &[command_buffer]);
+    }
+    destroy_allocated_buffer(device, &staging);
+    result.map_err(|result| VulkanSmokeRendererError::VulkanOperation {
+        context: "vkQueueSubmit/WaitIdle(dynamic texture upload)",
+        result,
+    })
+}
+
+/// Builds an RGBA8 mip chain on the CPU so texture upload does not depend on
+/// optional linear-blit support for the device's UNORM format.
+fn build_static_texture_mip_chain(texture: &VulkanStaticTexture) -> (Vec<u8>, u32) {
+    if !texture.mip_levels.is_empty() {
+        let mut bytes = Vec::new();
+        for mip in &texture.mip_levels {
+            bytes.extend_from_slice(&mip.rgba8);
+        }
+        return (
+            bytes,
+            u32::try_from(texture.mip_levels.len()).unwrap_or(u32::MAX),
+        );
+    }
+    let mut bytes = texture.rgba8.clone();
+    let mut level = texture.rgba8.clone();
+    let mut width = texture.width;
+    let mut height = texture.height;
+    let mut mip_levels = 1_u32;
+
+    while width > 1 || height > 1 {
+        let next_width = (width / 2).max(1);
+        let next_height = (height / 2).max(1);
+        let mut next = vec![
+            0_u8;
+            usize::try_from(next_width)
+                .unwrap_or(0)
+                .saturating_mul(usize::try_from(next_height).unwrap_or(0))
+                .saturating_mul(4)
+        ];
+        for y in 0..next_height {
+            for x in 0..next_width {
+                let dst = (usize::try_from(y).unwrap_or(0)
+                    * usize::try_from(next_width).unwrap_or(0)
+                    + usize::try_from(x).unwrap_or(0))
+                    * 4;
+                let x0 = x.saturating_mul(2).min(width.saturating_sub(1));
+                let y0 = y.saturating_mul(2).min(height.saturating_sub(1));
+                let x1 = x0.saturating_add(1).min(width.saturating_sub(1));
+                let y1 = y0.saturating_add(1).min(height.saturating_sub(1));
+                let source_width = usize::try_from(width).unwrap_or(0);
+                let samples = [
+                    (usize::try_from(y0).unwrap_or(0) * source_width
+                        + usize::try_from(x0).unwrap_or(0))
+                        * 4,
+                    (usize::try_from(y0).unwrap_or(0) * source_width
+                        + usize::try_from(x1).unwrap_or(0))
+                        * 4,
+                    (usize::try_from(y1).unwrap_or(0) * source_width
+                        + usize::try_from(x0).unwrap_or(0))
+                        * 4,
+                    (usize::try_from(y1).unwrap_or(0) * source_width
+                        + usize::try_from(x1).unwrap_or(0))
+                        * 4,
+                ];
+                for channel in 0..4 {
+                    let sum: u16 = samples
+                        .iter()
+                        .map(|&offset| u16::from(level[offset + channel]))
+                        .sum();
+                    next[dst + channel] = u8::try_from((sum + 2) / 4).unwrap_or(u8::MAX);
+                }
+            }
+        }
+        bytes.extend_from_slice(&next);
+        level = next;
+        width = next_width;
+        height = next_height;
+        mip_levels = mip_levels.saturating_add(1);
+    }
+    (bytes, mip_levels)
 }
 
 pub(super) fn destroy_allocated_image(
@@ -624,36 +1220,24 @@ pub(super) fn create_frame_sync(
     let mut sync = Vec::with_capacity(2);
     for _ in 0..2 {
         // SAFETY: The sync objects belong to this live logical device and are destroyed at teardown.
-        let image_available = unsafe { device.device().create_semaphore(&semaphore_info, None) }
-            .map_err(|error| VulkanSmokeRendererError::VulkanOperation {
-                context: "vkCreateSemaphore(image_available)",
-                result: error,
-            })?;
-        let render_finished = {
-            // SAFETY: The sync objects belong to this live logical device and are destroyed at teardown.
+        let image_available =
             match unsafe { device.device().create_semaphore(&semaphore_info, None) } {
-                Ok(render_finished) => render_finished,
+                Ok(image_available) => image_available,
                 Err(error) => {
                     destroy_frame_sync_objects(device, &sync);
-                    // SAFETY: The semaphore was created above on this logical device and is destroyed on setup failure.
-                    unsafe { device.device().destroy_semaphore(image_available, None) };
                     return Err(VulkanSmokeRendererError::VulkanOperation {
-                        context: "vkCreateSemaphore(render_finished)",
+                        context: "vkCreateSemaphore(image_available)",
                         result: error,
                     });
                 }
-            }
-        };
+            };
         // SAFETY: The fence belongs to this live logical device and is destroyed at teardown.
         let fence = match unsafe { device.device().create_fence(&fence_info, None) } {
             Ok(fence) => fence,
             Err(error) => {
                 destroy_frame_sync_objects(device, &sync);
-                // SAFETY: These semaphores were created above on this logical device and are destroyed on setup failure.
-                unsafe {
-                    device.device().destroy_semaphore(image_available, None);
-                    device.device().destroy_semaphore(render_finished, None);
-                }
+                // SAFETY: The semaphore was created above on this logical device and is destroyed on setup failure.
+                unsafe { device.device().destroy_semaphore(image_available, None) };
                 return Err(VulkanSmokeRendererError::VulkanOperation {
                     context: "vkCreateFence",
                     result: error,
@@ -662,7 +1246,6 @@ pub(super) fn create_frame_sync(
         };
         sync.push(VulkanFrameSync {
             image_available,
-            render_finished,
             fence,
         });
     }
@@ -676,9 +1259,6 @@ fn destroy_frame_sync_objects(device: &VulkanLogicalDeviceProbe, sync: &[VulkanF
             device
                 .device()
                 .destroy_semaphore(frame_sync.image_available, None);
-            device
-                .device()
-                .destroy_semaphore(frame_sync.render_finished, None);
             device.device().destroy_fence(frame_sync.fence, None);
         }
     }
@@ -738,11 +1318,11 @@ pub(super) fn readback_buffer_bytes(
     Ok(bytes)
 }
 
-pub(super) fn color_subresource_range() -> vk::ImageSubresourceRange {
+pub(super) fn color_subresource_range(level_count: u32) -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
         .base_mip_level(0)
-        .level_count(1)
+        .level_count(level_count)
         .base_array_layer(0)
         .layer_count(1)
 }

@@ -254,12 +254,16 @@ impl AnimKey24 {
         ];
         let time = AnimationTime(read_f32(bytes, 12)?);
         validate_time(time)?;
-        let raw_rotation = [
+        let disk_wxyz = [
             f32::from(read_i16(bytes, 16)?) / 32767.0,
             f32::from(read_i16(bytes, 18)?) / 32767.0,
             f32::from(read_i16(bytes, 20)?) / 32767.0,
             f32::from(read_i16(bytes, 22)?) / 32767.0,
         ];
+        // Native AniMesh stores the scalar first (WXYZ). The portable pose
+        // contract is XYZW, matching the rotate/multiply helpers below. Keep
+        // the decoded values unnormalized; sampling_pose owns normalization.
+        let raw_rotation = [disk_wxyz[1], disk_wxyz[2], disk_wxyz[3], disk_wxyz[0]];
         Ok(Self {
             time,
             pose: Pose {
@@ -870,9 +874,47 @@ mod tests {
 
         assert_eq!(key.time, AnimationTime(12.5));
         assert_eq!(key.pose.translation, [-1.0, 2.0, 0.0]);
-        assert!(key.pose.rotation[1] < 0.0);
-        assert!((key.pose.rotation[1] + std::f32::consts::FRAC_1_SQRT_2).abs() < 0.000_05);
-        assert!((key.pose.rotation[3] - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.000_05);
+        assert!(key.pose.rotation[0] < 0.0);
+        assert!((key.pose.rotation[0] + std::f32::consts::FRAC_1_SQRT_2).abs() < 0.000_05);
+        assert!((key.pose.rotation[2] - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.000_05);
+    }
+
+    #[test]
+    fn anim_key24_preserves_disk_wxyz_as_internal_xyzw() {
+        let mut bytes = [0_u8; 24];
+        bytes[12..16].copy_from_slice(&0.0_f32.to_bits().to_le_bytes());
+        bytes[16..18].copy_from_slice(&32609_i16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&0_i16.to_le_bytes());
+        bytes[20..22].copy_from_slice(&0_i16.to_le_bytes());
+        bytes[22..24].copy_from_slice(&3211_i16.to_le_bytes());
+
+        let key = AnimKey24::decode(&bytes).expect("bunker key");
+        let expected = [0.0, 0.0, 3211.0 / 32767.0, 32609.0 / 32767.0];
+
+        assert_eq!(key.pose.rotation, expected);
+    }
+
+    #[test]
+    fn bunker_fallback_pose_rotates_a_point_with_native_matrix_contract() {
+        let mut bytes = [0_u8; 24];
+        bytes[12..16].copy_from_slice(&0.0_f32.to_bits().to_le_bytes());
+        bytes[16..18].copy_from_slice(&32609_i16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&0_i16.to_le_bytes());
+        bytes[20..22].copy_from_slice(&0_i16.to_le_bytes());
+        bytes[22..24].copy_from_slice(&3211_i16.to_le_bytes());
+
+        let pose = AnimKey24::decode(&bytes)
+            .expect("bunker key")
+            .sampling_pose();
+        let rotated = rotate_point(pose.rotation, [0.0, 1.0, 0.0]);
+
+        assert!((pose.rotation[0] - 0.0).abs() < 0.000_001);
+        assert!((pose.rotation[1] - 0.0).abs() < 0.000_001);
+        assert!((pose.rotation[2] - 0.097_995_8).abs() < 0.000_01);
+        assert!((pose.rotation[3] - 0.995_186_8).abs() < 0.000_01);
+        assert!((rotated[0] + 0.195_048_3).abs() < 0.000_01);
+        assert!((rotated[1] - 0.980_793_6).abs() < 0.000_01);
+        assert!(rotated[2].abs() < 0.000_01);
     }
 
     #[test]

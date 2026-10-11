@@ -69,6 +69,14 @@ projection matrix contract.
 
 ## Parity risks
 
+`VulkanStaticCamera::from_legacy_d3d7` keeps the D3D7 view and projection
+reconstruction in `fparkan-render`, then negates the vertical projection term
+once at the Vulkan adapter boundary. D3D7's top-down viewport places positive
+NDC Y at the top; the Vulkan swapchain uses a positive viewport height, so the
+adapter flips NDC Y while the shader preserves `gl_Position`. The generic
+`from_row_major_view_projection` path remains unchanged; its callers supply
+Vulkan-ready matrices, as the free-flight camera already does.
+
 - x87 precision and rounding;
 - scalar/SIMD `g_FastProc` differences;
 - object, batch and transparent primitive order;

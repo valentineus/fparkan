@@ -1,14 +1,16 @@
 #![forbid(unsafe_code)]
 //! Validated terrain runtime queries using XY ground coordinates and Z height.
 
-use fparkan_terrain_format::{FullSurfaceMask, LandMapDocument, LandMeshDocument};
+use fparkan_terrain_format::{LandMapDocument, LandMeshDocument};
 use std::collections::VecDeque;
 
 /// Terrain material-selector contract preserved from the decoded map mesh.
 ///
 /// Applications access this semantic terrain API through this terrain crate
 /// rather than taking a direct dependency on the binary-format parser.
-pub use fparkan_terrain_format::{TerrainMaterialLayers, TerrainMaterialSelection};
+pub use fparkan_terrain_format::{
+    FullSurfaceMask, TerrainMaterialLayers, TerrainMaterialSelection,
+};
 
 /// Terrain world.
 #[derive(Clone, Debug, Default)]
@@ -140,6 +142,21 @@ pub trait SurfaceQuery {
         origin: [f32; 3],
         direction: [f32; 3],
         mask: FullSurfaceMask,
+    ) -> Result<Option<SurfaceHit>, TerrainError>;
+
+    /// Raycast while requiring every bit in `include` and rejecting every
+    /// face carrying a bit in `exclude`.
+    ///
+    /// The native landscape query has both predicates.  The legacy
+    /// [`Self::raycast`] shorthand keeps its historical include-only form;
+    /// callers that model a native receiver or visibility test should use
+    /// this method so exclusion flags cannot be mistaken for inclusion bits.
+    fn raycast_excluding(
+        &self,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        include: FullSurfaceMask,
+        exclude: FullSurfaceMask,
     ) -> Result<Option<SurfaceHit>, TerrainError>;
 }
 
@@ -405,6 +422,28 @@ impl SurfaceQuery for TerrainWorld {
         direction: [f32; 3],
         mask: FullSurfaceMask,
     ) -> Result<Option<SurfaceHit>, TerrainError> {
+        self.raycast_filtered(origin, direction, mask, FullSurfaceMask(0))
+    }
+
+    fn raycast_excluding(
+        &self,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        include: FullSurfaceMask,
+        exclude: FullSurfaceMask,
+    ) -> Result<Option<SurfaceHit>, TerrainError> {
+        self.raycast_filtered(origin, direction, include, exclude)
+    }
+}
+
+impl TerrainWorld {
+    fn raycast_filtered(
+        &self,
+        origin: [f32; 3],
+        direction: [f32; 3],
+        include: FullSurfaceMask,
+        exclude: FullSurfaceMask,
+    ) -> Result<Option<SurfaceHit>, TerrainError> {
         if self.surfaces.is_empty() {
             return Err(TerrainError::Unsupported);
         }
@@ -413,7 +452,10 @@ impl SurfaceQuery for TerrainWorld {
         let mut best: Option<SurfaceHit> = None;
         for index in candidates {
             let triangle = &self.surfaces[index];
-            if mask.0 != 0 && triangle.mask.0 & mask.0 == 0 {
+            if include.0 != 0 && triangle.mask.0 & include.0 != include.0 {
+                continue;
+            }
+            if triangle.mask.0 & exclude.0 != 0 {
                 continue;
             }
             let Some(distance) = triangle.raycast(origin, direction) else {
@@ -1030,6 +1072,31 @@ mod tests {
                     FullSurfaceMask(0x8000_0000)
                 )
                 .expect("raycast"),
+            None
+        );
+
+        // Native include masks require every requested bit, while exclusion
+        // masks reject any matching face bit.
+        assert_eq!(
+            world
+                .raycast_excluding(
+                    [0.25, 0.25, 2.0],
+                    [0.0, 0.0, -1.0],
+                    FullSurfaceMask(0x0000_0003),
+                    FullSurfaceMask(0),
+                )
+                .expect("raycast include all bits"),
+            None
+        );
+        assert_eq!(
+            world
+                .raycast_excluding(
+                    [0.25, 0.25, 2.0],
+                    [0.0, 0.0, -1.0],
+                    FullSurfaceMask(0),
+                    FullSurfaceMask(0x0000_0001),
+                )
+                .expect("raycast exclusion"),
             None
         );
     }

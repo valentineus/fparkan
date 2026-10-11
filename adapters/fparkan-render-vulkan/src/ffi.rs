@@ -21,16 +21,22 @@ mod swapchain_resources;
 mod validation;
 
 pub use self::asset_mesh::{
-    project_land_msh_to_static_mesh, project_land_msh_to_static_mesh_in_legacy_world_space,
+    node38_pose, node38_pose_from_hierarchy, node38_pose_relative_to_root,
+    node38_pose_relative_to_root_from_hierarchy, project_land_msh_to_static_mesh,
+    project_land_msh_to_static_mesh_in_legacy_world_space,
     project_land_msh_to_static_mesh_in_world_space, project_land_msh_to_static_mesh_in_xy_frame,
     project_msh_to_static_mesh, project_msh_to_static_mesh_in_world_space,
     project_msh_to_static_mesh_in_world_space_with_node_fallback_poses,
+    project_msh_to_static_mesh_in_world_space_with_node_fallback_poses_and_mount,
+    project_msh_to_static_mesh_in_world_space_with_node_pose_buffer,
+    project_msh_to_static_mesh_in_world_space_with_node_pose_buffer_and_mount,
     project_msh_to_static_mesh_in_world_space_with_node_sampled_poses,
+    project_msh_to_static_mesh_in_world_space_with_node_sampled_poses_and_mount,
     project_msh_to_static_mesh_in_world_space_with_transform,
     project_msh_to_static_mesh_in_xy_frame,
     project_msh_to_static_mesh_in_xy_frame_with_node_fallback_poses,
     project_msh_to_static_mesh_in_xy_frame_with_node_sampled_poses, VulkanAssetMeshError,
-    VulkanStaticXyFrame,
+    VulkanNodePose, VulkanStaticXyFrame,
 };
 pub use self::capabilities::{
     probe_vulkan_runtime_capabilities, probe_vulkan_runtime_capabilities_for_request,
@@ -45,21 +51,27 @@ pub use self::instance::{
 use self::instance::{cstring_vec, ensure_instance_extensions_available};
 use self::resources::{
     color_subresource_range, create_command_pool, create_depth_attachment, create_frame_sync,
+    create_frame_uniform_buffer, create_index_buffer, create_material_specular_buffer,
     create_readback_buffer, create_static_mesh_index_buffer, create_static_mesh_vertex_buffer,
-    create_static_texture_image, destroy_allocated_buffer, destroy_allocated_image,
-    destroy_depth_attachment, readback_buffer_bytes, VulkanAllocatedBuffer, VulkanAllocatedImage,
-    VulkanDepthAttachment, VulkanFrameSync,
+    create_static_texture_image, create_vertex_buffer, destroy_allocated_buffer,
+    destroy_allocated_image, destroy_depth_attachment, readback_buffer_bytes,
+    update_static_texture_image, write_frame_uniform, write_material_specular_buffer,
+    write_static_mesh_index_buffer, write_static_mesh_vertex_buffer, VulkanAllocatedBuffer,
+    VulkanAllocatedImage, VulkanDepthAttachment, VulkanFrameSync,
 };
 pub use self::runtime::{
     create_vulkan_logical_device_probe, create_vulkan_logical_device_probe_for_request,
     VulkanLogicalDeviceError, VulkanLogicalDeviceProbe, VulkanLogicalDeviceReport,
 };
 pub use self::smoke_types::{
+    VulkanDirectionalLight, VulkanDynamicDrawRange, VulkanFrameUniforms, VulkanPointLight,
     VulkanReadbackArtifact, VulkanSmokeBootstrapProgress, VulkanSmokeBootstrapSnapshot,
     VulkanSmokeFrameOutcome, VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo,
     VulkanSmokeRendererError, VulkanSmokeRendererReport, VulkanSmokeShutdownReport,
     VulkanStaticCamera, VulkanStaticDrawRange, VulkanStaticMaterial, VulkanStaticMesh,
-    VulkanStaticTexture, VulkanStaticVertex, VulkanValidationReport,
+    VulkanStaticTexture, VulkanStaticTextureMip, VulkanStaticVertex, VulkanValidationReport,
+    VULKAN_DIRECTIONAL_LIGHT_COUNT, VULKAN_FRAME_UNIFORM_BYTES,
+    VULKAN_MATERIAL_SPECULAR_RECORD_BYTES,
 };
 #[cfg(test)]
 use self::surface::extension_name;
@@ -72,7 +84,8 @@ pub use self::swapchain::{
     VulkanSwapchainProbeError, VulkanSwapchainReport,
 };
 use self::swapchain_resources::{
-    create_swapchain_resources, destroy_swapchain_resources, VulkanSwapchainResources,
+    create_swapchain_resources, destroy_swapchain_resources, update_material_texture_descriptor,
+    VulkanSwapchainResources,
 };
 use self::validation::{create_validation_messenger, VulkanValidationMessenger};
 use ash::vk;
@@ -469,6 +482,8 @@ const LEGACY_TRIANGLE_FRAGMENT_SHADER_WORDS: &[u32] = &[
 ];
 
 const fn spirv_words<const WORD_COUNT: usize>(bytes: &[u8]) -> [u32; WORD_COUNT] {
+    assert!(bytes.len() % 4 == 0);
+    assert!(bytes.len() == WORD_COUNT * 4);
     let mut words = [0_u32; WORD_COUNT];
     let mut index = 0;
     while index < WORD_COUNT {
@@ -484,10 +499,12 @@ const fn spirv_words<const WORD_COUNT: usize>(bytes: &[u8]) -> [u32; WORD_COUNT]
     words
 }
 
-static TRIANGLE_VERTEX_SHADER_DATA: [u32; 358] =
-    spirv_words(include_bytes!("../shaders/triangle.vert.spv"));
-static TRIANGLE_FRAGMENT_SHADER_DATA: [u32; 296] =
-    spirv_words(include_bytes!("../shaders/triangle.frag.spv"));
+const TRIANGLE_VERTEX_SHADER_BYTES: &[u8] = include_bytes!("../shaders/triangle.vert.spv");
+const TRIANGLE_FRAGMENT_SHADER_BYTES: &[u8] = include_bytes!("../shaders/triangle.frag.spv");
+static TRIANGLE_VERTEX_SHADER_DATA: [u32; TRIANGLE_VERTEX_SHADER_BYTES.len() / 4] =
+    spirv_words(TRIANGLE_VERTEX_SHADER_BYTES);
+static TRIANGLE_FRAGMENT_SHADER_DATA: [u32; TRIANGLE_FRAGMENT_SHADER_BYTES.len() / 4] =
+    spirv_words(TRIANGLE_FRAGMENT_SHADER_BYTES);
 pub(crate) const TRIANGLE_VERTEX_SHADER_WORDS: &[u32] = &TRIANGLE_VERTEX_SHADER_DATA;
 pub(crate) const TRIANGLE_FRAGMENT_SHADER_WORDS: &[u32] = &TRIANGLE_FRAGMENT_SHADER_DATA;
 

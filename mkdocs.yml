@@ -73,6 +73,8 @@ nav:
       - WEAR и MAT0: reference/materials.md
       - Texm: reference/texm.md
       - Render frame: reference/render-frame.md
+      - Атмосфера и небо: reference/atmosphere.md
+      - Эффекты окружения: reference/environment-effects.md
       - Оригинальные модули: reference/original-binaries.md
   - Приложения:
       - Глоссарий: appendices/glossary.md
