@@ -414,6 +414,18 @@ sentinel `-1`. Повторные node ID сохраняют исходный п
 runtime animation path. Остальные
 секции CTLD shape records и contact solver не входят в эту интерпретацию.
 
+Asset reader traverses common typed-record framing and preserves supported
+type-4 effect rows as data: table and row indices, raw condition words, selector,
+resource pair, and three offsets into the component-local CPT list. An unknown
+typed tag or unsupported layout sets the effect section to
+`PreparedControlEffectSection::Unsupported`, сохраняя уже разобранные pose
+bindings; malformed распознанная структура отклоняет подготовку ресурса. В
+read-only GOG corpus pass `fr_l_plant.ctl` дал 38 type-4 rows, включая четыре
+`f_smalllight_y` rows с offsets 104–107 и `smoke_fr_02` с offsets 119–121;
+`fr_l_gener.ctl` дал 35 rows, включая `f_gener_ball` с offset 85. Это только
+разбор ресурсов: разрешение CPT, оценка условий, activation, выполнение FX
+opcodes и видимый рендер эффектов здесь не реализованы.
+
 ### Terrain queries и movement handoff
 
 Control получает world-interface Terrain и использует поверхность, faces и

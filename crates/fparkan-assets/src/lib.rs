@@ -903,6 +903,52 @@ pub struct PreparedComponentControl {
     pub source: ResourceKey,
     /// Enabled source rows in their original order, including duplicate nodes.
     pub bindings: Vec<PreparedControlNodeBinding>,
+    /// Parsed native effect rows in this component's control resource.
+    pub effect_section: PreparedControlEffectSection,
+}
+
+/// Status of the trailing typed/effect data in a CTLD resource.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PreparedControlEffectSection {
+    /// The resource advertises no trailing typed or effect data.
+    Absent,
+    /// The resource contains a layout this reader does not yet understand.
+    /// Existing node bindings remain available in this case.
+    Unsupported {
+        /// Index of the first unparsed typed record, when one was present.
+        typed_record_index: Option<usize>,
+        /// Native tag on the first unparsed typed record, when available.
+        typed_record_tag: Option<u32>,
+    },
+    /// Effect rows whose native fixed-row layout is understood.
+    Parsed(Vec<PreparedControlEffectRow>),
+}
+
+/// One native type-4 effect row, with point indices kept relative to the
+/// component-local CPT list selected by its control message.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedControlEffectRow {
+    /// Index of the enclosing fixed-size row table.
+    pub table_index: usize,
+    /// Index within the enclosing fixed-size row table.
+    pub row_index: usize,
+    /// The first three raw condition words consumed by the native checker.
+    pub raw_condition: [u32; 3],
+    /// Component-local offsets into the selected point list.
+    pub point_offsets: [u32; 3],
+    /// The raw native effect selector, including `u32::MAX` auto-selector.
+    pub selector: u32,
+    /// Raw fixed-width archive/resource strings from the row.
+    pub resource: PreparedControlResourcePair,
+}
+
+/// Fixed-width resource strings carried by a native Control effect row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedControlResourcePair {
+    /// Raw 32-byte archive field, including any trailing NUL padding.
+    pub archive: [u8; 32],
+    /// Raw 32-byte resource field, including any trailing NUL padding.
+    pub name: [u8; 32],
 }
 
 /// One enabled CTLD row targeting a node in a component model.
@@ -2794,6 +2840,204 @@ fn prepare_component_control_from_resource<R: ResourceRepository>(
     decode_component_control_payload(&payload, source, model_node_count, prototype_index).map(Some)
 }
 
+const CONTROL_TYPED_COMMON_PARSER_TAGS: &[u32] = &[1, 8, 9, 12, 13, 15, 19, 21, 25, 26];
+const CONTROL_TYPED_RECORD_FIXED_BYTES: usize = 0xB0;
+const CONTROL_TYPED_RECORD_COUNT_OFFSET: usize = 0xAC;
+const CONTROL_TYPED_RECORD_LIMIT: usize = 4096;
+const CONTROL_TYPED_VALUE_LIMIT: usize = 65_536;
+const CONTROL_TYPED_STRING_LIMIT: usize = 4096;
+const CONTROL_EFFECT_GROUP_LIMIT: usize = 4096;
+const CONTROL_EFFECT_ROW_LIMIT: usize = 65_536;
+const CONTROL_EFFECT_GROUP_HEADER_BYTES: usize = 0x54;
+const CONTROL_EFFECT_ROW_BYTES: usize = 100;
+
+fn decode_component_effect_section<F>(
+    payload: &[u8],
+    mut cursor: usize,
+    typed_record_count: usize,
+    effect_group_count: usize,
+    invalid: &F,
+) -> Result<PreparedControlEffectSection, AssetError>
+where
+    F: Fn(&str) -> AssetError,
+{
+    if typed_record_count == 0 && effect_group_count == 0 {
+        return Ok(if cursor == payload.len() {
+            PreparedControlEffectSection::Absent
+        } else {
+            PreparedControlEffectSection::Unsupported {
+                typed_record_index: None,
+                typed_record_tag: None,
+            }
+        });
+    }
+    if typed_record_count > CONTROL_TYPED_RECORD_LIMIT {
+        return Err(invalid("typed record count exceeds the supported limit"));
+    }
+    if effect_group_count > CONTROL_EFFECT_GROUP_LIMIT {
+        return Err(invalid("effect group count exceeds the supported limit"));
+    }
+
+    for record_index in 0..typed_record_count {
+        let tag = control_u32_at(payload, cursor)
+            .ok_or_else(|| invalid("typed record is missing its tag"))?;
+        if !CONTROL_TYPED_COMMON_PARSER_TAGS.contains(&tag) {
+            return Ok(PreparedControlEffectSection::Unsupported {
+                typed_record_index: Some(record_index),
+                typed_record_tag: Some(tag),
+            });
+        }
+
+        let fixed_end = cursor
+            .checked_add(CONTROL_TYPED_RECORD_FIXED_BYTES)
+            .and_then(|offset| offset.checked_add(4))
+            .ok_or_else(|| invalid("typed record header offset overflows"))?;
+        if fixed_end > payload.len() {
+            return Err(invalid("typed record header extends past the payload"));
+        }
+        let value_count = usize::try_from(
+            control_u32_at(payload, cursor + CONTROL_TYPED_RECORD_COUNT_OFFSET)
+                .expect("typed record header was checked"),
+        )
+        .map_err(|_| invalid("typed record value count overflows usize"))?;
+        if value_count > CONTROL_TYPED_VALUE_LIMIT {
+            return Err(invalid(
+                "typed record value count exceeds the supported limit",
+            ));
+        }
+        let values_bytes = value_count
+            .checked_mul(4)
+            .ok_or_else(|| invalid("typed record value byte length overflows"))?;
+        let length_offset = cursor
+            .checked_add(CONTROL_TYPED_RECORD_FIXED_BYTES)
+            .and_then(|offset| offset.checked_add(values_bytes))
+            .ok_or_else(|| invalid("typed record tail offset overflows"))?;
+        let string_length = control_u32_at(payload, length_offset)
+            .ok_or_else(|| invalid("typed record length word extends past the payload"))?;
+        let after_length = length_offset
+            .checked_add(4)
+            .ok_or_else(|| invalid("typed record end offset overflows"))?;
+
+        // Native parsing returns immediately for length zero. For UINT32_MAX,
+        // its signed length+1 wraps to zero, also consuming no string bytes.
+        let string_bytes = if string_length == 0 || string_length == u32::MAX {
+            0
+        } else {
+            usize::try_from(string_length)
+                .ok()
+                .and_then(|length| length.checked_add(1))
+                .ok_or_else(|| invalid("typed record string length overflows"))?
+        };
+        if string_bytes == 0 {
+            cursor = after_length;
+            continue;
+        }
+        if string_bytes > CONTROL_TYPED_STRING_LIMIT {
+            return Err(invalid("typed record string exceeds the supported limit"));
+        }
+        let string_end = after_length
+            .checked_add(string_bytes)
+            .ok_or_else(|| invalid("typed record string end overflows"))?;
+        if string_end > payload.len() {
+            return Err(invalid("typed record string extends past the payload"));
+        }
+        if payload[string_end - 1] != 0 {
+            return Err(invalid("typed record string is missing its trailing NUL"));
+        }
+        cursor = string_end;
+    }
+
+    if effect_group_count == 0 {
+        return Ok(if cursor == payload.len() {
+            PreparedControlEffectSection::Parsed(Vec::new())
+        } else {
+            PreparedControlEffectSection::Unsupported {
+                typed_record_index: None,
+                typed_record_tag: None,
+            }
+        });
+    }
+
+    cursor = cursor
+        .checked_add(CONTROL_EFFECT_GROUP_HEADER_BYTES)
+        .ok_or_else(|| invalid("effect group header end overflows"))?;
+    if cursor > payload.len() {
+        return Err(invalid("effect group header extends past the payload"));
+    }
+
+    let mut effect_rows = Vec::new();
+    for table_index in 0..effect_group_count {
+        let row_count = usize::try_from(
+            control_u32_at(payload, cursor)
+                .ok_or_else(|| invalid("effect table is missing its row count"))?,
+        )
+        .map_err(|_| invalid("effect row count overflows usize"))?;
+        if row_count > CONTROL_EFFECT_ROW_LIMIT {
+            return Err(invalid("effect row count exceeds the supported limit"));
+        }
+        let rows_start = cursor
+            .checked_add(4)
+            .ok_or_else(|| invalid("effect row start overflows"))?;
+        let row_bytes = row_count
+            .checked_mul(CONTROL_EFFECT_ROW_BYTES)
+            .ok_or_else(|| invalid("effect row byte length overflows"))?;
+        let rows_end = rows_start
+            .checked_add(row_bytes)
+            .ok_or_else(|| invalid("effect table end overflows"))?;
+        if rows_end > payload.len() {
+            return Err(invalid("complete effect table extends past the payload"));
+        }
+
+        for row_index in 0..row_count {
+            let row_start = rows_start + row_index * CONTROL_EFFECT_ROW_BYTES;
+            let row = &payload[row_start..row_start + CONTROL_EFFECT_ROW_BYTES];
+            if control_u32_at(row, 0x0C) != Some(4) {
+                continue;
+            }
+            let raw_condition = [
+                control_u32_at(row, 0).expect("fixed effect row has condition word 0"),
+                control_u32_at(row, 4).expect("fixed effect row has condition word 1"),
+                control_u32_at(row, 8).expect("fixed effect row has condition word 2"),
+            ];
+            let point_offsets = [
+                control_u32_at(row, 0x10).expect("fixed effect row has point offset 0"),
+                control_u32_at(row, 0x14).expect("fixed effect row has point offset 1"),
+                control_u32_at(row, 0x18).expect("fixed effect row has point offset 2"),
+            ];
+            effect_rows.push(PreparedControlEffectRow {
+                table_index,
+                row_index,
+                raw_condition,
+                point_offsets,
+                selector: control_u32_at(row, 0x1C).expect("fixed effect row has selector"),
+                resource: PreparedControlResourcePair {
+                    archive: row[0x24..0x44]
+                        .try_into()
+                        .expect("fixed archive field is 32 bytes"),
+                    name: row[0x44..0x64]
+                        .try_into()
+                        .expect("fixed resource field is 32 bytes"),
+                },
+            });
+        }
+        cursor = rows_end;
+    }
+
+    if cursor != payload.len() {
+        return Ok(PreparedControlEffectSection::Unsupported {
+            typed_record_index: None,
+            typed_record_tag: None,
+        });
+    }
+    Ok(PreparedControlEffectSection::Parsed(effect_rows))
+}
+
+fn control_u32_at(payload: &[u8], offset: usize) -> Option<u32> {
+    let end = offset.checked_add(4)?;
+    let bytes = payload.get(offset..end)?;
+    Some(u32::from_le_bytes(bytes.try_into().ok()?))
+}
+
 fn decode_component_control_payload(
     payload: &[u8],
     source: ResourceKey,
@@ -2831,6 +3075,10 @@ fn decode_component_control_payload(
         usize::try_from(header[1]).map_err(|_| invalid("section node count overflows usize"))?;
     let row_count =
         usize::try_from(header[2]).map_err(|_| invalid("binding count overflows usize"))?;
+    let typed_record_count =
+        usize::try_from(header[3]).map_err(|_| invalid("typed record count overflows usize"))?;
+    let effect_group_count =
+        usize::try_from(header[4]).map_err(|_| invalid("effect group count overflows usize"))?;
     let per_section_node_bytes = SECTION_NODE_BYTES
         .checked_mul(per_section_nodes)
         .ok_or_else(|| invalid("section node bytes overflow"))?;
@@ -2896,7 +3144,19 @@ fn decode_component_control_payload(
         });
     }
 
-    Ok(PreparedComponentControl { source, bindings })
+    let effect_section = decode_component_effect_section(
+        payload,
+        row_end,
+        typed_record_count,
+        effect_group_count,
+        &invalid,
+    )?;
+
+    Ok(PreparedComponentControl {
+        source,
+        bindings,
+        effect_section,
+    })
 }
 
 fn sibling_name(key: &ResourceKey, extension: &str) -> Result<ResourceName, AssetError> {
@@ -3052,6 +3312,173 @@ mod tests {
         assert!(decode_component_control_payload(&non_finite, source, 2, 0).is_err());
     }
 
+    #[test]
+    fn component_control_unknown_effect_tag_preserves_node_bindings() {
+        let source = ResourceKey {
+            archive: parse_path("controls.rlb").expect("archive"),
+            name: resource_name(b"parts.ctl"),
+            type_id: None,
+        };
+        let mut payload = component_control_payload(&[(1, 0.0, 1.0, 0.25, 0)]);
+        payload[12..16].copy_from_slice(&1_u32.to_le_bytes());
+        payload[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        payload.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+
+        let control = decode_component_control_payload(&payload, source, 2, 3)
+            .expect("unknown tag is retained");
+
+        assert_eq!(control.bindings.len(), 1);
+        assert_eq!(control.bindings[0].node_index, 1);
+        assert_eq!(control.bindings[0].frame_b, 1.0);
+        assert_eq!(
+            control.effect_section,
+            PreparedControlEffectSection::Unsupported {
+                typed_record_index: Some(0),
+                typed_record_tag: Some(0xDEAD_BEEF),
+            }
+        );
+    }
+
+    #[test]
+    fn component_control_zero_length_typed_record_ends_before_group_header() {
+        let source = ResourceKey {
+            archive: parse_path("controls.rlb").expect("archive"),
+            name: resource_name(b"parts.ctl"),
+            type_id: None,
+        };
+        let mut payload = component_control_payload(&[(1, 0.0, 1.0, 0.25, 0)]);
+        payload[12..16].copy_from_slice(&1_u32.to_le_bytes());
+        payload[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        append_typed_record(&mut payload, 21, 0);
+        let group_header_start = payload.len();
+        payload.resize(group_header_start + CONTROL_EFFECT_GROUP_HEADER_BYTES, 0);
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+
+        let control = decode_component_control_payload(&payload, source, 2, 3)
+            .expect("zero-length record has no trailing string byte");
+
+        assert_eq!(control.bindings.len(), 1);
+        assert_eq!(
+            control.effect_section,
+            PreparedControlEffectSection::Parsed(Vec::new())
+        );
+    }
+
+    #[test]
+    fn component_control_malformed_recognized_typed_tail_is_rejected() {
+        let source = ResourceKey {
+            archive: parse_path("controls.rlb").expect("archive"),
+            name: resource_name(b"parts.ctl"),
+            type_id: None,
+        };
+        let mut payload = component_control_payload(&[(1, 0.0, 1.0, 0.25, 0)]);
+        payload[12..16].copy_from_slice(&1_u32.to_le_bytes());
+        append_typed_record(&mut payload, 21, 2);
+
+        assert!(decode_component_control_payload(&payload, source, 2, 3).is_err());
+    }
+
+    #[test]
+    fn component_control_type4_rows_preserve_fields_and_skip_other_types() {
+        let source = ResourceKey {
+            archive: parse_path("controls.rlb").expect("archive"),
+            name: resource_name(b"parts.ctl"),
+            type_id: None,
+        };
+        let mut payload = component_control_payload(&[(1, 0.0, 1.0, 0.25, 0)]);
+        payload[12..16].copy_from_slice(&1_u32.to_le_bytes());
+        payload[16..20].copy_from_slice(&2_u32.to_le_bytes());
+        append_typed_record(&mut payload, 21, 0);
+        payload.resize(payload.len() + CONTROL_EFFECT_GROUP_HEADER_BYTES, 0);
+        append_effect_table(
+            &mut payload,
+            &[
+                effect_row(
+                    3,
+                    [1, 2, 3],
+                    [10, 0, 0],
+                    8000,
+                    "effects.rlb",
+                    "door_open_02",
+                ),
+                effect_row(
+                    4,
+                    [0, 7, 9],
+                    [104, 105, 106],
+                    17,
+                    "effects.rlb",
+                    "f_smalllight_y",
+                ),
+            ],
+        );
+        append_effect_table(
+            &mut payload,
+            &[effect_row(
+                4,
+                [13, 14, 15],
+                [85, 85, 85],
+                26,
+                "effects.rlb",
+                "f_gener_ball",
+            )],
+        );
+
+        let control = decode_component_control_payload(&payload, source, 2, 3)
+            .expect("complete type-4 effect tables");
+
+        assert_eq!(
+            control.effect_section,
+            PreparedControlEffectSection::Parsed(vec![
+                PreparedControlEffectRow {
+                    table_index: 0,
+                    row_index: 1,
+                    raw_condition: [0, 7, 9],
+                    point_offsets: [104, 105, 106],
+                    selector: 17,
+                    resource: PreparedControlResourcePair {
+                        archive: fixed_name("effects.rlb"),
+                        name: fixed_name("f_smalllight_y"),
+                    },
+                },
+                PreparedControlEffectRow {
+                    table_index: 1,
+                    row_index: 0,
+                    raw_condition: [13, 14, 15],
+                    point_offsets: [85, 85, 85],
+                    selector: 26,
+                    resource: PreparedControlResourcePair {
+                        archive: fixed_name("effects.rlb"),
+                        name: fixed_name("f_gener_ball"),
+                    },
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn component_control_max_length_uses_wrapped_empty_tail() {
+        let source = ResourceKey {
+            archive: parse_path("controls.rlb").expect("archive"),
+            name: resource_name(b"parts.ctl"),
+            type_id: None,
+        };
+        let mut payload = component_control_payload(&[(1, 0.0, 1.0, 0.25, 0)]);
+        payload[12..16].copy_from_slice(&1_u32.to_le_bytes());
+        payload[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        append_typed_record(&mut payload, 21, u32::MAX);
+        payload.resize(payload.len() + CONTROL_EFFECT_GROUP_HEADER_BYTES, 0);
+        append_effect_table(&mut payload, &[]);
+
+        let control = decode_component_control_payload(&payload, source, 2, 3)
+            .expect("wrapped empty string tail");
+
+        assert_eq!(control.bindings.len(), 1);
+        assert_eq!(
+            control.effect_section,
+            PreparedControlEffectSection::Parsed(Vec::new())
+        );
+    }
+
     fn component_control_payload(rows: &[(u32, f32, f32, f32, u32)]) -> Vec<u8> {
         const ROW_START: usize = 5 * 4 + 108;
         const ROW_BYTES: usize = 36;
@@ -3066,6 +3493,59 @@ mod tests {
             payload[row + 0x20..row + 0x24].copy_from_slice(&flags.to_le_bytes());
         }
         payload
+    }
+
+    fn append_typed_record(payload: &mut Vec<u8>, tag: u32, string_length: u32) {
+        let record_start = payload.len();
+        payload.resize(record_start + CONTROL_TYPED_RECORD_FIXED_BYTES + 4, 0);
+        payload[record_start..record_start + 4].copy_from_slice(&tag.to_le_bytes());
+        payload[record_start + CONTROL_TYPED_RECORD_COUNT_OFFSET
+            ..record_start + CONTROL_TYPED_RECORD_COUNT_OFFSET + 4]
+            .copy_from_slice(&0_u32.to_le_bytes());
+        payload[record_start + CONTROL_TYPED_RECORD_FIXED_BYTES
+            ..record_start + CONTROL_TYPED_RECORD_FIXED_BYTES + 4]
+            .copy_from_slice(&string_length.to_le_bytes());
+    }
+
+    fn append_effect_table(payload: &mut Vec<u8>, rows: &[[u8; CONTROL_EFFECT_ROW_BYTES]]) {
+        payload.extend_from_slice(&u32::try_from(rows.len()).expect("row count").to_le_bytes());
+        for row in rows {
+            payload.extend_from_slice(row);
+        }
+    }
+
+    fn effect_row(
+        kind: u32,
+        condition: [u32; 3],
+        point_offsets: [u32; 3],
+        selector: u32,
+        archive: &str,
+        name: &str,
+    ) -> [u8; CONTROL_EFFECT_ROW_BYTES] {
+        let mut row = [0_u8; CONTROL_EFFECT_ROW_BYTES];
+        for (index, word) in condition.into_iter().enumerate() {
+            let offset = index * 4;
+            row[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        row[0x0C..0x10].copy_from_slice(&kind.to_le_bytes());
+        for (index, word) in point_offsets.into_iter().enumerate() {
+            let offset = 0x10 + index * 4;
+            row[offset..offset + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        row[0x1C..0x20].copy_from_slice(&selector.to_le_bytes());
+        write_fixed_name(&mut row[0x24..0x44], archive);
+        write_fixed_name(&mut row[0x44..0x64], name);
+        row
+    }
+
+    fn fixed_name(value: &str) -> [u8; 32] {
+        let mut result = [0_u8; 32];
+        write_fixed_name(&mut result, value);
+        result
+    }
+
+    fn write_fixed_name(target: &mut [u8], value: &str) {
+        target[..value.len()].copy_from_slice(value.as_bytes());
     }
 
     #[test]
