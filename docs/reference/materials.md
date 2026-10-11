@@ -57,10 +57,12 @@ struct Phase34 {
 
 ### Pipeline category
 
-Call site извлекает native category как `(attr1 >> 2) & 0xF` и передаёт её в
-`LegacyPipelineState::with_material_category`. Таблица содержит пять
-подтверждённых категорий; helper возвращает `None` для остальных значений и не
-меняет уже выбранные depth и cull state.
+Call site извлекает native category как `(attr1 >> 2) & 0xF` и сохраняет её на
+разрешённом phase material. World draw ranges получают состояние для начального
+selector при подготовке, а animated selector обновляет category вместе с
+material selector. Fixed environment ranges keep their authored pipeline state.
+Таблица содержит пять подтверждённых категорий; helper возвращает `None` для
+остальных значений и не меняет уже выбранные depth и cull state.
 
 | category | source/destination colour factors | alpha test |
 | ---: | --- | --- |
@@ -74,6 +76,13 @@ The mapping comes from the native five render-state pairs selected by the
 material category. Alpha reference remains draw-range data, while the Vulkan
 pipeline key includes the blend mode, depth mode, cull mode and alpha-test
 variant so ranges with different native state do not share a pipeline.
+
+World transparency is a separate draw-queue decision. A world range joins that
+queue when sampled diffuse opacity is below one or any bit in the native
+`0x108` batch-flag mask is set; the MAT0 category alone does not make it
+transparent. A queued range
+with a depth attachment tests depth without writing it. Unsupported categories
+fail world-range setup instead of silently falling back to opaque state.
 
 Каждая phase занимает 34 байта: 18 parameter bytes и 16-byte C string имени
 текстуры. Loader переводит параметры в коэффициенты так:

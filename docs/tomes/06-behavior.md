@@ -275,14 +275,17 @@ buffers и передаёт собранную settings-структуру да�
 `ret 0x0c`; `CreateCollManager` и `CreateCollObject` возвращают interface
 pointer с поправкой `+4` после внутренней инициализации.
 
-Headless Ghidra 12.1.2 decompile GOG binary подтверждает ABI формой экспортов
-`LoadControlSystem(char*, char*, char*, char*, char*, u32, void*, i32)`,
+Инструкциям x86 в GOG `Control.dll` (`+0x32280`) и caller-у в `AniMesh.dll`
+(`+0x32e7`) соответствует ABI `LoadControlSystem(char*, char*, char*, char*,
+char*, char*, void*, i32)`: шесть C-string pointers, resource context и mode.
+Функция заканчивается `ret 0x20`, то есть снимает все восемь 32-bit stack
+arguments; arg7 передаётся constructor-у как context, arg8 выбирает mode.
+Прежняя декомпиляция ошибочно определяла шестой строковый аргумент как `u32`.
+Остальные exports имеют формы
 `LoadPhysicalModel(u32, u32, u32)`, `CreateCollManager(u32)` и
-`CreateCollObject(u32, u32)`. Первые пять параметров Control loader — строки,
-а mode передаётся последним; decompiler не восстанавливает предметные имена
-остальных слов. `InitializeSettings` получает `CreateGameSettings()` из
-World3D и делает virtual call slot `+0x24` с literal `0x15` и строкой по RVA
-`0x42478`.
+`CreateCollObject(u32, u32)`. `InitializeSettings` получает
+`CreateGameSettings()` из World3D и делает virtual call slot `+0x24` с literal
+`0x15` и строкой по RVA `0x42478`.
 
 Именно update methods этих private objects, а не пять exports, остаются
 следующим объектом динамической трассировки. Поэтому reference movement в

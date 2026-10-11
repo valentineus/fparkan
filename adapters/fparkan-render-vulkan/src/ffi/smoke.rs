@@ -1,7 +1,7 @@
 #![allow(unsafe_code)]
 
 use ash::vk;
-use fparkan_render::LegacyDepthMode;
+use fparkan_render::{LegacyDepthMode, LegacyPipelineState};
 
 use super::smoke_types::resolve_draw_texture_indices;
 use super::update_material_texture_descriptor;
@@ -434,6 +434,7 @@ impl VulkanSmokeRenderer {
             draw_range_sort_keys: vec![None; create_info.mesh.draw_ranges.len()],
             draw_order_dirty: false,
             draw_range_world_queue: vec![None; create_info.mesh.draw_ranges.len()],
+            world_transparent_background_ranges: Vec::new(),
             draw_range_base_pipeline_states: create_info
                 .mesh
                 .draw_ranges
@@ -878,6 +879,74 @@ impl VulkanSmokeRenderer {
         Ok(())
     }
 
+    /// Applies the active MAT0 phase's blend and alpha-test category to one
+    /// range while retaining its authored depth and cull state.
+    pub fn set_draw_range_material_category(
+        &mut self,
+        range_index: usize,
+        category: u8,
+    ) -> Result<(), VulkanSmokeRendererError> {
+        let base_state = *self
+            .draw_range_base_pipeline_states
+            .get(range_index)
+            .ok_or(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic draw range index is out of bounds",
+            })?;
+        let world_queue = self
+            .draw_range_world_queue
+            .get(range_index)
+            .copied()
+            .ok_or(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic draw range index is out of bounds",
+            })?;
+        // Fixed sky, sprite, weather, and shadow ranges own explicit states.
+        // MAT0 categories apply only after a range has entered the world queue.
+        let (next_base, next_state) =
+            world_material_pipeline_states(base_state, category, world_queue).ok_or(
+                VulkanSmokeRendererError::InvalidStaticMesh {
+                    context: "MAT0 pipeline category is outside the native 0..=4 table",
+                },
+            )?;
+        let range = self.draw_ranges.get_mut(range_index).ok_or(
+            VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic draw range index is out of bounds",
+            },
+        )?;
+        self.draw_range_base_pipeline_states[range_index] = next_base;
+        let pipeline_changed = range.pipeline_state != next_state;
+        range.pipeline_state = next_state;
+        if pipeline_changed {
+            self.rebuild_pipeline_resources()?;
+        }
+        Ok(())
+    }
+
+    /// Places nebula, dome, and cloud ranges between opaque and transparent
+    /// world draws. The list is explicit so unrelated fixed passes keep their
+    /// established order.
+    pub fn set_world_transparent_background_ranges(
+        &mut self,
+        range_indices: &[usize],
+    ) -> Result<(), VulkanSmokeRendererError> {
+        let mut seen = vec![false; self.draw_ranges.len()];
+        for &range_index in range_indices {
+            let Some(slot) = seen.get_mut(range_index) else {
+                return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+                    context: "world background range index is out of bounds",
+                });
+            };
+            if *slot || self.draw_range_world_queue[range_index].is_some() {
+                return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+                    context: "world background range is duplicated or already queued",
+                });
+            }
+            *slot = true;
+        }
+        self.world_transparent_background_ranges = range_indices.to_vec();
+        self.draw_order_dirty = true;
+        Ok(())
+    }
+
     /// Marks a draw range as belonging to the native transparent queue.
     ///
     /// The flag is deliberately independent of the blend category: native
@@ -886,14 +955,25 @@ impl VulkanSmokeRenderer {
     /// depth attachment switches to depth-test/read-only.  The original depth
     /// state is retained so disabling the flag restores the caller's state.
     ///
-    /// The transparent flag only participates in the world draw order.  The
-    /// backend keeps every unmarked range in its original slot, which leaves
-    /// the fixed screen/sky/weather pass order intact.
+    /// The transparent flag only participates in the world draw order. Without
+    /// explicit backgrounds, opaque and transparent ranges replace the
+    /// existing world slots. With explicit backgrounds, opaque ranges compact
+    /// into those slots and the sorted transparent ranges are inserted after
+    /// the last background; unrelated fixed ranges keep relative order but
+    /// may shift slots.
     pub fn set_draw_range_transparency(
         &mut self,
         range_index: usize,
         transparent: bool,
     ) -> Result<(), VulkanSmokeRendererError> {
+        if self
+            .world_transparent_background_ranges
+            .contains(&range_index)
+        {
+            return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "world background range cannot join the world queue",
+            });
+        }
         let base_state = *self
             .draw_range_base_pipeline_states
             .get(range_index)
@@ -905,13 +985,7 @@ impl VulkanSmokeRenderer {
                 context: "dynamic draw range index is out of bounds",
             },
         )?;
-        let depth = if transparent && base_state.depth != LegacyDepthMode::Disabled {
-            LegacyDepthMode::TestReadOnly
-        } else {
-            base_state.depth
-        };
-        let mut next_state = base_state;
-        next_state.depth = depth;
+        let next_state = apply_world_transparency(base_state, transparent);
         let pipeline_changed = range.pipeline_state != next_state;
         range.pipeline_state = next_state;
         // Calling this setter opts the range into the world queue.  Fixed
@@ -1499,11 +1573,13 @@ impl VulkanSmokeRenderer {
         self.rebuild_swapchain_resources(true)
     }
 
-    /// Recomputes the stable command-recording order.  Only ranges explicitly
-    /// marked transparent are reordered, and they remain in the slots occupied
-    /// by that queue.  This preserves the caller's fixed sky/screen/weather
-    /// pass order while matching the native descending key comparator for the
-    /// world transparent queue.
+    /// Recomputes the stable command-recording order. Without explicit
+    /// backgrounds, opaque world ranges followed by the sorted transparent
+    /// world ranges replace the existing world slots. With explicit
+    /// backgrounds, opaque ranges compact into the world slots and sorted
+    /// transparent ranges are inserted after the last background; unrelated
+    /// fixed ranges keep relative order but may shift slots. The transparent
+    /// queue matches the native descending key comparator.
     fn rebuild_draw_order(&mut self) {
         let range_count = self.draw_ranges.len();
         if self.draw_order.len() != range_count {
@@ -1514,6 +1590,7 @@ impl VulkanSmokeRenderer {
             &self.draw_ranges,
             &self.draw_range_world_queue,
             &self.draw_range_sort_keys,
+            &self.world_transparent_background_ranges,
         );
     }
 
@@ -2109,15 +2186,46 @@ fn apply_geometry_range_updates(
     }
 }
 
+fn apply_world_transparency(
+    base_state: LegacyPipelineState,
+    transparent: bool,
+) -> LegacyPipelineState {
+    if transparent && base_state.depth != LegacyDepthMode::Disabled {
+        LegacyPipelineState {
+            depth: LegacyDepthMode::TestReadOnly,
+            ..base_state
+        }
+    } else {
+        base_state
+    }
+}
+
+fn world_material_pipeline_states(
+    original: LegacyPipelineState,
+    category: u8,
+    world_queue: Option<bool>,
+) -> Option<(LegacyPipelineState, LegacyPipelineState)> {
+    let categorized = original.with_material_category(category)?;
+    let Some(transparent) = world_queue else {
+        return Some((original, original));
+    };
+    let base = categorized;
+    Some((base, apply_world_transparency(base, transparent)))
+}
+
 /// Replays the native queue construction from the original stable range
-/// order. Fixed passes stay in their original slots; world opaque ranges are
-/// emitted first, followed by world transparent ranges inserted by descending
-/// camera distance. Zero-index-count ranges are inactive and are omitted.
+/// order. Without explicit background ranges, world opaque ranges replace the
+/// existing world slots and world transparent ranges follow in descending
+/// camera distance order. With explicit backgrounds, opaque ranges are
+/// compacted into world positions and sorted transparent ranges are inserted
+/// after the last active background; fixed passes keep their relative order but
+/// can shift slots. Zero-index-count ranges are inactive and are omitted.
 fn sorted_world_draw_order(
     range_count: usize,
     ranges: &[super::VulkanStaticDrawRange],
     world_queue: &[Option<bool>],
     keys: &[Option<f32>],
+    transparent_background_ranges: &[usize],
 ) -> Vec<usize> {
     let mut next = (0..range_count).collect::<Vec<_>>();
     let mut world_opaque = Vec::new();
@@ -2176,33 +2284,70 @@ fn sorted_world_draw_order(
         ordered_transparent.insert(low, range_index);
     }
 
-    let mut world_order = world_opaque;
-    world_order.extend(ordered_transparent);
-    let mut world_cursor = 0usize;
-    for slot in &mut next {
-        if world_queue.get(*slot).copied().flatten().is_some()
-            && ranges
-                .get(*slot)
-                .is_some_and(|range| range.index_count != 0)
-        {
-            if let Some(&replacement) = world_order.get(world_cursor) {
-                *slot = replacement;
-                world_cursor += 1;
+    if transparent_background_ranges.is_empty() {
+        let mut world_order = world_opaque;
+        world_order.extend(ordered_transparent);
+        let mut world_cursor = 0usize;
+        for slot in &mut next {
+            if world_queue.get(*slot).copied().flatten().is_some()
+                && ranges
+                    .get(*slot)
+                    .is_some_and(|range| range.index_count != 0)
+            {
+                if let Some(&replacement) = world_order.get(world_cursor) {
+                    *slot = replacement;
+                    world_cursor += 1;
+                }
             }
         }
+        return next;
     }
-    next
+
+    // Fixed sky backgrounds are not world-queue members. Remove the world
+    // transparent slots, compact opaque ranges into the world slots, then
+    // insert the sorted transparent queue after the explicit background group.
+    let mut opaque_cursor = 0usize;
+    let mut next_without_transparency = Vec::with_capacity(range_count);
+    for slot in 0..range_count {
+        let active_world = ranges.get(slot).is_some_and(|range| range.index_count != 0);
+        match world_queue.get(slot).copied().flatten() {
+            Some(true) if active_world => {}
+            Some(false) if active_world => {
+                if let Some(&replacement) = world_opaque.get(opaque_cursor) {
+                    next_without_transparency.push(replacement);
+                    opaque_cursor += 1;
+                } else {
+                    next_without_transparency.push(slot);
+                }
+            }
+            _ => next_without_transparency.push(slot),
+        }
+    }
+    let insertion = transparent_background_ranges
+        .iter()
+        .filter_map(|background| {
+            next_without_transparency
+                .iter()
+                .position(|range| range == background)
+        })
+        .max()
+        .map(|index| index + 1);
+    if let Some(insertion) = insertion {
+        next_without_transparency.splice(insertion..insertion, ordered_transparent);
+    }
+    next_without_transparency
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::{VulkanDynamicDrawRange, VulkanStaticDrawRange, VulkanStaticMesh};
     use super::{
-        apply_geometry_range_updates, completed_readback_buffer_index, sorted_world_draw_order,
-        take_runtime_children_with_validation_snapshot, take_runtime_owners_in_dependency_order,
-        validate_geometry_upload, RollbackOnDrop,
+        apply_geometry_range_updates, apply_world_transparency, completed_readback_buffer_index,
+        sorted_world_draw_order, take_runtime_children_with_validation_snapshot,
+        take_runtime_owners_in_dependency_order, validate_geometry_upload,
+        world_material_pipeline_states, RollbackOnDrop,
     };
-    use fparkan_render::{LegacyBlendMode, LegacyDepthMode, LegacyPipelineState};
+    use fparkan_render::{LegacyBlendMode, LegacyCullMode, LegacyDepthMode, LegacyPipelineState};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -2506,6 +2651,7 @@ mod tests {
             &ranges,
             &[None, Some(true), None, Some(true), Some(false)],
             &[None, Some(2.0), None, Some(9.0), Some(-3.0)],
+            &[],
         );
         assert_eq!(order, vec![0, 4, 2, 3, 1]);
     }
@@ -2546,6 +2692,7 @@ mod tests {
             &ranges,
             &[None, Some(true), Some(true)],
             &[None, Some(100.0), Some(1.0)],
+            &[],
         );
         assert_eq!(order, vec![0, 1, 2]);
     }
@@ -2563,7 +2710,99 @@ mod tests {
                 alpha_test_reference: 0,
             })
             .collect::<Vec<_>>();
-        let order = sorted_world_draw_order(4, &ranges, &[Some(true); 4], &[Some(1.0); 4]);
+        let order = sorted_world_draw_order(4, &ranges, &[Some(true); 4], &[Some(1.0); 4], &[]);
         assert_eq!(order, vec![2, 3, 1, 0]);
+    }
+
+    #[test]
+    fn tree_canopy_queue_follows_sky_and_precedes_foreground_effects() {
+        const SCREEN_GRADIENT: usize = 0;
+        const TERRAIN: usize = 1;
+        const CANOPY_NEAR: usize = 2;
+        const BUILDING: usize = 3;
+        const CANOPY_FAR: usize = 4;
+        const SHADOW: usize = 5;
+        const NEBULA: usize = 6;
+        const DOME: usize = 7;
+        const CLOUDS: usize = 8;
+        const SUN: usize = 9;
+        const WEATHER: usize = 10;
+        let ranges = (0..11)
+            .map(|index| VulkanStaticDrawRange {
+                first_index: index * 3,
+                index_count: 3,
+                material_index: 0,
+                lightmap_index: u8::MAX,
+                batch_flags: 0,
+                pipeline_state: LegacyPipelineState::default(),
+                alpha_test_reference: 0,
+            })
+            .collect::<Vec<_>>();
+        let mut world_queue = vec![None; ranges.len()];
+        world_queue[TERRAIN] = Some(false);
+        world_queue[CANOPY_NEAR] = Some(true);
+        world_queue[BUILDING] = Some(false);
+        world_queue[CANOPY_FAR] = Some(true);
+        let mut sort_keys = vec![None; ranges.len()];
+        sort_keys[CANOPY_NEAR] = Some(2.0);
+        sort_keys[CANOPY_FAR] = Some(9.0);
+        let order = sorted_world_draw_order(
+            ranges.len(),
+            &ranges,
+            &world_queue,
+            &sort_keys,
+            &[NEBULA, DOME, CLOUDS],
+        );
+        assert_eq!(
+            order,
+            vec![
+                SCREEN_GRADIENT,
+                TERRAIN,
+                BUILDING,
+                SHADOW,
+                NEBULA,
+                DOME,
+                CLOUDS,
+                CANOPY_FAR,
+                CANOPY_NEAR,
+                SUN,
+                WEATHER,
+            ]
+        );
+    }
+
+    #[test]
+    fn material_category_and_transparency_preserve_world_state_in_either_order() {
+        let original = LegacyPipelineState {
+            blend: LegacyBlendMode::Opaque,
+            depth: LegacyDepthMode::TestWrite,
+            cull: LegacyCullMode::FrontFace,
+            alpha_test: false,
+        };
+        let (base, category_first) =
+            world_material_pipeline_states(original, 1, Some(true)).expect("category 1");
+        let transparency_first = apply_world_transparency(original, true)
+            .with_material_category(1)
+            .expect("category 1 after transparency");
+        assert_eq!(category_first, transparency_first);
+        assert_eq!(base.blend, LegacyBlendMode::SourceAlpha);
+        assert!(base.alpha_test);
+        assert_eq!(base.depth, LegacyDepthMode::TestWrite);
+        assert_eq!(base.cull, LegacyCullMode::FrontFace);
+        assert_eq!(category_first.depth, LegacyDepthMode::TestReadOnly);
+        assert_eq!(category_first.cull, LegacyCullMode::FrontFace);
+
+        let fixed_state = LegacyPipelineState {
+            blend: LegacyBlendMode::Additive,
+            depth: LegacyDepthMode::Disabled,
+            cull: LegacyCullMode::Disabled,
+            alpha_test: false,
+        };
+        assert_eq!(
+            world_material_pipeline_states(fixed_state, 1, None),
+            Some((fixed_state, fixed_state))
+        );
+        assert!(world_material_pipeline_states(original, 5, Some(false)).is_none());
+        assert!(world_material_pipeline_states(fixed_state, 5, None).is_none());
     }
 }

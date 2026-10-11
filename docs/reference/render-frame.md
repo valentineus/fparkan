@@ -40,6 +40,47 @@ end-of-render.
 Подготовленный item должен ссылаться на immutable данные кадра. Изменение phase
 или texture cache посреди прохода не должно менять уже собранную очередь.
 
+## MAT0 state and transparent backgrounds
+
+For mission world ranges, the selected MAT0 material supplies its native
+pipeline category. The category sets blend and alpha-test state while preserving
+the range's depth and cull state; an animated material selector updates the
+category with the selector. Queue membership is independent: sampled opacity
+below one or native batch flags `0x108` mark a world range transparent, and a
+queued range with depth enabled tests depth without writing it. Fixed
+environment ranges keep their explicit states.
+
+The fixed-camera preview explicitly marks nebula/stars, dome and cloud ranges as
+transparent backgrounds. Opaque world ranges stay in their world slots; the
+transparent world queue is sorted back-to-front and inserted immediately after
+the last marked background. Other fixed ranges retain their relative order.
+Thus cloud layers can be drawn before transparent foliage, while later sun,
+weather and other foreground ranges keep their existing relative order. This
+is a narrow queue rule, not a reordering of every sky or effects pass.
+
+## Regression evidence
+
+`cargo test -p fparkan-render-vulkan --lib material_category_and_transparency_preserve_world_state_in_either_order --offline`
+checks that category 1 remains source-alpha with alpha testing, retains depth
+and cull settings in either update order, and rejects unsupported categories.
+`cargo test -p fparkan-render-vulkan --lib tree_canopy_queue_follows_sky_and_precedes_foreground_effects --offline`
+checks the explicit queue order: screen gradient, opaque terrain/building,
+shadow, nebula/dome/clouds, far-to-near transparent canopy, then sun/weather.
+
+Viewer-only paired readbacks used `--frames 3 --validation
+--legacy-camera-capture` with the pre-fix and patched builds. On AutoDemo TMA
+object 4 (`wor_l_n1.dat`, `fr_l_plant`), the 1280x720 camera at eye
+`[464.319, 904.719, 38.0]`, aimed at `[374.319, 814.719, 12.0]` with FOV
+`0.62`, changed the two black facade panels to tinted, textured portal
+surfaces. On Mission.01 object 12 (`s_tree_04`), the 1280x1024 camera at eye
+`[492.63855, 312.90244, 46.5]` aimed at
+`[492.63855, 442.90244, 55.0]` crosses the canopy against open sky; paired
+three-frame captures at the same synthetic atmosphere phase (600 seconds) show
+the patched build restoring the missing upper/right fronds along that sky
+boundary. Both runs reported clean Vulkan validation. These captures verify our
+preview behavior and do not prove the native renderer's pass order, portal
+transmittance or exact color.
+
 ## GOG camera dispatch evidence
 
 For the GOG `World3D.dll` baseline with SHA-256

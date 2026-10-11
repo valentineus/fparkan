@@ -449,6 +449,8 @@ impl VulkanStaticDrawRange {
 pub struct VulkanStaticMaterial {
     /// Positional material selector used by one or more source batches.
     pub material_index: u16,
+    /// Native MAT0 pipeline category selected for this phase (0..=4).
+    pub pipeline_category: u8,
     /// Decoded RGBA8 diffuse texture for this selector.
     pub texture: VulkanStaticTexture,
     /// Phase parameters 4..6, normalized directional light RGB coefficient.
@@ -1003,6 +1005,7 @@ mod static_mesh_tests {
         let materials = [
             VulkanStaticMaterial {
                 material_index: 2,
+                pipeline_category: 0,
                 texture: texture(),
                 detail_texture: None,
                 overlay_texture: None,
@@ -1028,6 +1031,7 @@ mod static_mesh_tests {
             },
             VulkanStaticMaterial {
                 material_index: 7,
+                pipeline_category: 0,
                 texture: texture(),
                 detail_texture: None,
                 overlay_texture: None,
@@ -1379,6 +1383,8 @@ pub struct VulkanSmokeRenderer {
     /// a fixed screen/sky/weather pass; `Some(false)` is world opaque and
     /// `Some(true)` is world transparent.
     pub(super) draw_range_world_queue: Vec<Option<bool>>,
+    /// Fixed sky background ranges placed between world opaque and transparent.
+    pub(super) world_transparent_background_ranges: Vec<usize>,
     /// Pipeline state before transparent queue depth policy is applied.
     pub(super) draw_range_base_pipeline_states: Vec<LegacyPipelineState>,
     pub(super) material_alphas: Vec<[f32; 2]>,

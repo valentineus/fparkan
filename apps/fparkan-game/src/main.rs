@@ -657,6 +657,7 @@ impl MaterialPhaseBinding {
 struct MaterialVariantSet {
     phase_material_indices: Vec<usize>,
     range_indices: Vec<usize>,
+    pipeline_category: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -674,6 +675,19 @@ struct MaterialAnimationBinding {
 struct ActiveMaterialState {
     material_index: usize,
     diffuse_alpha: f32,
+}
+
+fn selected_material_phase(
+    variant: &MaterialVariantSet,
+    phase_index: usize,
+    pipeline_category_for: impl FnOnce(usize) -> Option<u8>,
+) -> Result<(usize, u8), String> {
+    let material_index = selected_material_variant_index(variant, phase_index)
+        .ok_or_else(|| "MAT0 material animation has no texture variant".to_string())?;
+    let pipeline_category = pipeline_category_for(material_index).ok_or_else(|| {
+        format!("MAT0 material animation selector {material_index} is out of bounds")
+    })?;
+    Ok((material_index, pipeline_category))
 }
 
 fn update_material_animations(
@@ -706,9 +720,13 @@ fn update_material_animations(
             .map(|overlay_detail| overlay_detail.sample(binding.initial_phase_index, clock_ms))
             .transpose()?;
         let mut updated_materials = HashSet::new();
-        for variant in &binding.variants {
-            let material_index = selected_material_variant_index(variant, base_sample.phase_index)
-                .ok_or_else(|| "MAT0 material animation has no texture variant".to_string())?;
+        for variant in &mut binding.variants {
+            let (material_index, pipeline_category) =
+                selected_material_phase(variant, base_sample.phase_index, |index| {
+                    materials
+                        .get(index)
+                        .map(|material| material.pipeline_category)
+                })?;
             for &range_index in &variant.range_indices {
                 active_materials.insert(
                     range_index,
@@ -720,7 +738,15 @@ fn update_material_animations(
                 renderer
                     .set_draw_range_material(range_index, material_index)
                     .map_err(|error| format!("update MAT0 material draw selector: {error}"))?;
+                if variant.pipeline_category != pipeline_category {
+                    renderer
+                        .set_draw_range_material_category(range_index, pipeline_category)
+                        .map_err(|error| {
+                            format!("update MAT0 material pipeline category: {error}")
+                        })?;
+                }
             }
+            variant.pipeline_category = pipeline_category;
             if !updated_materials.insert(material_index) {
                 continue;
             }
@@ -885,6 +911,37 @@ fn update_material_animations(
 
 fn native_world_transparent(range: &VulkanStaticDrawRange, diffuse_alpha: f32) -> bool {
     diffuse_alpha < 1.0 || (range.batch_flags & 0x108) != 0
+}
+
+fn configure_world_material_categories(
+    mesh: &mut VulkanStaticMesh,
+    materials: &[VulkanStaticMaterial],
+    world_range_indices: &[usize],
+) -> Result<(), String> {
+    for &range_index in world_range_indices {
+        let range = mesh
+            .draw_ranges
+            .get_mut(range_index)
+            .ok_or_else(|| "world material range index is out of bounds".to_string())?;
+        let material = materials
+            .get(usize::from(range.material_index))
+            .ok_or_else(|| {
+                format!(
+                    "world material selector {} is out of bounds",
+                    range.material_index
+                )
+            })?;
+        range.pipeline_state = range
+            .pipeline_state
+            .with_material_category(material.pipeline_category)
+            .ok_or_else(|| {
+                format!(
+                    "world material selector {} has unsupported native pipeline category {}",
+                    range.material_index, material.pipeline_category
+                )
+            })?;
+    }
+    Ok(())
 }
 
 fn register_material_range(
@@ -1164,6 +1221,7 @@ fn append_environment_material(
         })?;
         materials.push(VulkanStaticMaterial {
             material_index,
+            pipeline_category: phase.pipeline_category,
             texture: asset
                 .phase_textures
                 .get(phase_index)
@@ -1201,6 +1259,7 @@ fn append_environment_material(
         variants: vec![MaterialVariantSet {
             phase_material_indices,
             range_indices: Vec::new(),
+            pipeline_category: phases[0].pipeline_category,
         }],
         base: MaterialPhaseBinding {
             document,
@@ -1228,6 +1287,7 @@ fn append_environment_gradient_material(
     })?;
     materials.push(VulkanStaticMaterial {
         material_index,
+        pipeline_category: 0,
         texture: solid_environment_texture([255, 255, 255, 255]),
         directional_rgb: [1.0; 3],
         additive_rgb: [0.0; 3],
@@ -1275,6 +1335,7 @@ fn append_shadow_material(materials: &mut Vec<VulkanStaticMaterial>) -> Result<u
     let index = materials.len();
     materials.push(VulkanStaticMaterial {
         material_index,
+        pipeline_category: 0,
         texture: shadow_atlas_texture(),
         directional_rgb: [1.0; 3],
         additive_rgb: [0.0; 3],
@@ -1859,6 +1920,19 @@ fn screen_gradient_quad_vertices(
 }
 
 impl EnvironmentGpuScene {
+    fn transparent_background_range_indices(&self) -> Vec<usize> {
+        self.sky_layers
+            .iter()
+            .filter(|layer| {
+                matches!(
+                    layer.kind,
+                    SkyPassKind::NebulaStars | SkyPassKind::DomeGradient | SkyPassKind::Clouds
+                )
+            })
+            .map(|layer| layer.range.range_index)
+            .collect()
+    }
+
     fn fixed_range_indices(&self) -> HashSet<usize> {
         self.sky_layers
             .iter()
@@ -2289,9 +2363,9 @@ impl EnvironmentGpuScene {
                 && *index != cloud_index
         }));
         old_order.push(*shadow_range_index);
-        old_order.extend([nebula_index, dome_index]);
+        old_order.extend([nebula_index, dome_index, cloud_index]);
         old_order.extend(sprite_indices.iter().copied());
-        old_order.extend([cloud_index, rain_index, snow_index, lightning_index]);
+        old_order.extend([rain_index, snow_index, lightning_index]);
         let remap = reorder_draw_ranges(mesh, &old_order)?;
         for layer in &mut scene.sky_layers {
             layer.range.range_index = *remap
@@ -4165,6 +4239,7 @@ fn static_preview_terrain_base_materials(
                 })?;
                 materials.push(VulkanStaticMaterial {
                     material_index: preview_selector,
+                    pipeline_category: base_phase.pipeline_category,
                     texture: base.clone(),
                     detail_texture: Some(detail.clone()),
                     overlay_texture: overlay.map(|(texture, _)| texture.clone()),
@@ -4257,6 +4332,7 @@ fn static_preview_terrain_base_materials(
                 variants: vec![MaterialVariantSet {
                     phase_material_indices,
                     range_indices: Vec::new(),
+                    pipeline_category: base_phases[initial_phase_index].1.pipeline_category,
                 }],
                 base: MaterialPhaseBinding {
                     document: base_document,
@@ -4369,6 +4445,7 @@ fn static_preview_component_materials(
                 })?;
                 materials.push(VulkanStaticMaterial {
                     material_index: preview_selector,
+                    pipeline_category: material.pipeline_category,
                     texture,
                     detail_texture: None,
                     overlay_texture: None,
@@ -4405,6 +4482,7 @@ fn static_preview_component_materials(
                 variants: vec![MaterialVariantSet {
                     phase_material_indices,
                     range_indices: Vec::new(),
+                    pipeline_category: material.pipeline_category,
                 }],
                 base: MaterialPhaseBinding {
                     document: material.mat0.clone(),
@@ -4551,6 +4629,7 @@ fn append_static_preview_component_with_lightmaps(
                                 "static preview material selector {source_material_index} has no MAT0 animation binding"
                             )
                         })?;
+                let initial_phase_index = bindings[binding_index].initial_phase_index;
                 let lightmap = lightmap_textures
                     .get(usize::from(range.lightmap_index))
                     .expect("lightmap presence checked above");
@@ -4590,6 +4669,16 @@ fn append_static_preview_component_with_lightmaps(
                     materials.push(lightmap_material);
                     phase_material_indices.push(usize::from(index));
                 }
+                let initial_selector = phase_material_indices
+                    .get(initial_phase_index)
+                    .copied()
+                    .ok_or_else(|| "static preview lightmap phase table is empty".to_string())?;
+                let pipeline_category = materials
+                    .get(initial_selector)
+                    .map(|material| material.pipeline_category)
+                    .ok_or_else(|| {
+                        "static preview lightmap material selector is unavailable".to_string()
+                    })?;
                 let bindings = material_animations.as_deref_mut().ok_or_else(|| {
                     "static preview lightmap animation storage is unavailable".to_string()
                 })?;
@@ -4597,6 +4686,7 @@ fn append_static_preview_component_with_lightmaps(
                 bindings[binding_index].variants.push(MaterialVariantSet {
                     phase_material_indices: phase_material_indices.clone(),
                     range_indices: Vec::new(),
+                    pipeline_category,
                 });
                 let value = (phase_material_indices, binding_index, variant_index);
                 lightmap_materials.insert(key, value.clone());
@@ -4913,6 +5003,16 @@ impl StaticVulkanApp {
             renderer
                 .set_draw_range_transparency(range_index, transparent)
                 .map_err(|error| format!("configure world draw range {range_index}: {error}"))?;
+            let category = self
+                .materials
+                .get(usize::from(range.material_index))
+                .ok_or_else(|| "world draw range has no material selector".to_string())?
+                .pipeline_category;
+            renderer
+                .set_draw_range_material_category(range_index, category)
+                .map_err(|error| {
+                    format!("configure world material category {range_index}: {error}")
+                })?;
             renderer
                 .set_draw_range_index_count(
                     range_index,
@@ -5381,6 +5481,15 @@ impl ApplicationHandler for StaticVulkanApp {
             return;
         };
         let gpu_initialization_started = Instant::now();
+        if let Err(error) = configure_world_material_categories(
+            &mut self.mesh,
+            &self.materials,
+            &self.world_range_indices,
+        ) {
+            self.error = Some(error);
+            event_loop.exit();
+            return;
+        }
         let mut renderer = match VulkanSmokeRenderer::new(&VulkanSmokeRendererCreateInfo {
             application_name: "fparkan-game".to_string(),
             native_handles,
@@ -5399,6 +5508,15 @@ impl ApplicationHandler for StaticVulkanApp {
                 return;
             }
         };
+        let background_ranges = self.environment_gpu.as_ref().map_or_else(
+            Vec::new,
+            EnvironmentGpuScene::transparent_background_range_indices,
+        );
+        if let Err(error) = renderer.set_world_transparent_background_ranges(&background_ranges) {
+            self.error = Some(format!("configure world background ranges: {error}"));
+            event_loop.exit();
+            return;
+        }
         if let Err(error) = self.configure_world_draw_ranges(&mut renderer) {
             self.error = Some(error);
             event_loop.exit();
@@ -5975,6 +6093,7 @@ mod tests {
             variants: vec![MaterialVariantSet {
                 phase_material_indices: vec![10],
                 range_indices: vec![0, 2],
+                pipeline_category: 0,
             }],
             base: empty_binding(),
             detail: None,
@@ -6027,6 +6146,30 @@ mod tests {
             &range(LegacyBlendMode::Opaque, 0x8),
             1.0
         ));
+    }
+
+    #[test]
+    fn material_animation_selects_pipeline_category_with_active_phase() {
+        let variant = MaterialVariantSet {
+            phase_material_indices: vec![10, 11],
+            range_indices: vec![3],
+            pipeline_category: 1,
+        };
+        let category_for = |material_index| match material_index {
+            10 => Some(1),
+            11 => Some(2),
+            _ => None,
+        };
+
+        assert_eq!(
+            selected_material_phase(&variant, 0, category_for),
+            Ok((10, 1))
+        );
+        assert_eq!(
+            selected_material_phase(&variant, 1, category_for),
+            Ok((11, 2))
+        );
+        assert!(selected_material_phase(&variant, 2, category_for).is_err());
     }
 
     #[test]
@@ -6187,6 +6330,7 @@ mod tests {
             variants: vec![MaterialVariantSet {
                 phase_material_indices: vec![10, 11],
                 range_indices: Vec::new(),
+                pipeline_category: 0,
             }],
             base: MaterialPhaseBinding {
                 document: empty_mat0,
@@ -6207,6 +6351,7 @@ mod tests {
         bindings[binding_index].variants.push(MaterialVariantSet {
             phase_material_indices: vec![20, 21],
             range_indices: vec![7],
+            pipeline_category: 0,
         });
 
         let lightmap_variant = &bindings[binding_index].variants[1];
