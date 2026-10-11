@@ -31,9 +31,9 @@ struct TexmHeader32 {
 Короткие каналы расширяются до 8 bits повторением значимых bits. Для 888
 служебный четвёртый byte сохраняется в raw mip, но не попадает в RGBA output.
 Native Ngi32 code confirms this layout: VA `0x10005930` packs `0xAARRGGBB` into
-ARGB4444, while VA `0x1000F620`/`0x1000F70C` route 888/8888 through the byte-copy
-path at `0x1000F730`, without a channel swizzle. On disk, little-endian bytes
-are `[B,G,R,A]` for 8888 and `[B,G,R,X]` for 888.
+ARGB4444. VA `0x1000F620`/`0x1000F70C` select the format-specific converter for
+888/8888; the mip pointer is passed unchanged, without a channel swizzle. On
+disk, little-endian bytes are `[B,G,R,A]` for 8888 and `[B,G,R,X]` for 888.
 
 ## Layout
 
