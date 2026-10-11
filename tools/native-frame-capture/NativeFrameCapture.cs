@@ -2509,7 +2509,8 @@ internal static partial class NativeFrameCapture
         uint debugEventsSeen = 0, debugEventsContinued = 0, lastDebugEventCode = 0;
         uint debugCreateThreadEvents = 0, debugExitThreadEvents = 0, debugLoadDllEvents = 0;
         uint debugExceptionEvents = 0, debugSingleStepEvents = 0, lastDebugEventPid = 0, lastDebugEventTid = 0;
-        const uint ProcessAccessForFrameCapture = 0x0001 | 0x0008 | 0x0010 | 0x0020 | 0x0400 | 0x00100000;
+        const uint ProcessAccessForFrameCapture = ProcessTerminate | ProcessVmOperation | ProcessVmRead
+            | ProcessVmWrite | ProcessQueryInformation | Synchronize;
         FrameSnapshot frame = new FrameSnapshot();
         frame.SelectedCameraRequested = selectedCameraInput != null;
         SelectedCameraState selectedCamera = selectedCameraInput == null ? null
