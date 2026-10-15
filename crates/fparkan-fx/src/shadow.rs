@@ -893,13 +893,11 @@ fn project_receivers(
         if !use_rays && !use_general {
             continue;
         }
-        let normal = normalize(receiver.normal).unwrap_or_else(|| {
-            normalize(cross(
-                sub(receiver.positions[1], receiver.positions[0]),
-                sub(receiver.positions[2], receiver.positions[0]),
-            ))
-            .unwrap_or([0.0, 0.0, 0.0])
-        });
+        // Reject collapsed geometry even when the caller supplied a valid fallback normal.
+        let Some(geometric_normal) = geometric_triangle_normal(receiver.positions) else {
+            continue;
+        };
+        let normal = normalize(receiver.normal).unwrap_or(geometric_normal);
         let normal_term = dot(page.projection.shadow_axis, normal);
         if normal_term <= 0.0 || !normal_term.is_finite() {
             continue;
@@ -1134,6 +1132,25 @@ fn validate_triangle(triangle: &ShadowTriangle, field: &'static str) -> Result<(
         return Err(ShadowError::InvalidInput(field));
     }
     Ok(())
+}
+
+fn geometric_triangle_normal(positions: [[f32; 3]; 3]) -> Option<[f32; 3]> {
+    let a = positions[0].map(f64::from);
+    let b = positions[1].map(f64::from);
+    let c = positions[2].map(f64::from);
+    let ab = std::array::from_fn::<_, 3, _>(|axis| b[axis] - a[axis]);
+    let ac = std::array::from_fn::<_, 3, _>(|axis| c[axis] - a[axis]);
+    let cross = [
+        ab[1] * ac[2] - ab[2] * ac[1],
+        ab[2] * ac[0] - ab[0] * ac[2],
+        ab[0] * ac[1] - ab[1] * ac[0],
+    ];
+    let length_squared = cross.iter().map(|value| value * value).sum::<f64>();
+    if !length_squared.is_finite() || length_squared == 0.0 {
+        return None;
+    }
+    let length = length_squared.sqrt();
+    Some(cross.map(|value| (value / length) as f32))
 }
 
 fn validate_light(light: &ShadowLight) -> Result<(), ShadowError> {
@@ -1751,6 +1768,46 @@ mod tests {
         .expect("masked receiver");
         assert_eq!(filtered.vertices.len(), accepted.vertices.len());
         assert_eq!(filtered.indices.len(), accepted.indices.len());
+    }
+
+    #[test]
+    fn degenerate_receivers_with_supplied_normal_are_skipped_without_losing_neighbors() {
+        let caster = caster(1, 1.0, 3, Vec::new());
+        let light = ShadowLight::Directional {
+            direction: [0.0, 0.0, 1.0],
+            rgb: [1.0; 3],
+            active: true,
+            flags: SHADOW_PRIMARY_DIRECTIONAL_FLAG,
+        };
+        let valid = triangle([[-1.0, -1.0, 1.0], [0.0, 1.0, 1.0], [1.0, -1.0, 1.0]], 0);
+        let point = ShadowTriangle {
+            positions: [[0.0, 0.0, 1.0]; 3],
+            normal: [0.0, 0.0, 1.0],
+            mask: 0,
+        };
+        let collinear = ShadowTriangle {
+            positions: [[-1.0, 0.0, 1.0], [0.0, 0.0, 1.0], [1.0, 0.0, 1.0]],
+            normal: [0.0, 0.0, 1.0],
+            mask: 0,
+        };
+        let build = |receivers: &[ShadowTriangle]| {
+            build_shadow_frame(ShadowScene {
+                lights: &[light],
+                casters: &[caster.clone()],
+                receivers,
+                fade: 1.0,
+                smooth_passes: 0,
+                camera: None,
+                lod: ShadowLodSettings::default(),
+            })
+            .expect("shadow frame")
+        };
+
+        let expected = build(&[valid]);
+        let actual = build(&[point, collinear, valid]);
+        assert!(!expected.indices.is_empty(), "valid neighbor must render");
+        assert_eq!(actual.vertices, expected.vertices);
+        assert_eq!(actual.indices, expected.indices);
     }
 
     fn triangle(positions: [[f32; 3]; 3], mask: u32) -> ShadowTriangle {
