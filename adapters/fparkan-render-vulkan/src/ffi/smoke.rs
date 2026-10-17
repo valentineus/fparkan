@@ -862,9 +862,9 @@ impl VulkanSmokeRenderer {
 
     /// Sets the native per-range alpha reference in legacy 0..=255 units.
     ///
-    /// A value of zero selects the renderer's proven native default (one) for
-    /// alpha-test ranges.  The update is dynamic and does not recreate a
-    /// graphics pipeline.
+    /// Zero remains an explicit value; use the native-default constant when
+    /// matching the renderer's initial state. The update is dynamic and does
+    /// not recreate a graphics pipeline.
     pub fn set_draw_range_alpha_test_reference(
         &mut self,
         range_index: usize,

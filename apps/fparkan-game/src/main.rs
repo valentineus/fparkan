@@ -1792,7 +1792,7 @@ fn append_environment_range(
             lightmap_index: u8::MAX,
             batch_flags: 0,
             pipeline_state,
-            alpha_test_reference: 0,
+            alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
         });
     Ok(EnvironmentGpuRange {
         range_index,

@@ -860,7 +860,7 @@ fn append_node_fallback_batch(
         lightmap_index: batch.lightmap_index,
         batch_flags: batch.batch_flags,
         pipeline_state: world_pipeline_state(),
-        alpha_test_reference: 0,
+        alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
     });
     Ok(())
 }
@@ -1211,7 +1211,7 @@ fn static_terrain_draw_ranges(
             lightmap_index: u8::MAX,
             batch_flags: 0,
             pipeline_state: world_pipeline_state(),
-            alpha_test_reference: 0,
+            alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
         });
         start_face = end_face;
     }
@@ -1256,7 +1256,7 @@ fn static_model_indices_and_ranges(
             lightmap_index: batch.lightmap_index,
             batch_flags: batch.batch_flags,
             pipeline_state: world_pipeline_state(),
-            alpha_test_reference: 0,
+            alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
         });
     }
     if indices.is_empty() {
@@ -1441,6 +1441,14 @@ mod tests {
         .expect("representable MSH");
 
         assert_eq!(mesh.indices, vec![1, 2, 3]);
+        let alpha_test_range = VulkanStaticDrawRange {
+            pipeline_state: mesh.draw_ranges[0]
+                .pipeline_state
+                .with_material_category(1)
+                .expect("native alpha-test material category"),
+            ..mesh.draw_ranges[0]
+        };
+        assert_eq!(alpha_test_range.alpha_test_cutoff(), 1.0 / 255.0);
         assert_eq!(
             mesh.draw_ranges,
             vec![VulkanStaticDrawRange {
@@ -1450,7 +1458,7 @@ mod tests {
                 lightmap_index: 0,
                 batch_flags: 0,
                 pipeline_state: world_pipeline_state(),
-                alpha_test_reference: 0,
+                alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
             }]
         );
         assert_eq!(mesh.vertices[1].position, [-0.8, -0.8, 0.0]);
@@ -1681,6 +1689,10 @@ mod tests {
         assert_eq!(mesh.vertices[0].position, [101.0, 0.0, 0.0]);
         assert_eq!(mesh.vertices[3].position, [111.0, 0.0, 0.0]);
         assert_eq!(mesh.indices, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(
+            mesh.draw_ranges[0].alpha_test_reference,
+            VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE
+        );
     }
 
     #[test]
@@ -1967,7 +1979,8 @@ mod tests {
                     lightmap_index: 0,
                     batch_flags: 0,
                     pipeline_state: world_pipeline_state(),
-                    alpha_test_reference: 0,
+                    alpha_test_reference:
+                        VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
                 },
                 VulkanStaticDrawRange {
                     first_index: 3,
@@ -1976,7 +1989,8 @@ mod tests {
                     lightmap_index: 0,
                     batch_flags: 0,
                     pipeline_state: world_pipeline_state(),
-                    alpha_test_reference: 0,
+                    alpha_test_reference:
+                        VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
                 },
             ]
         );
@@ -2122,5 +2136,8 @@ mod tests {
         assert_eq!(ranges[2].first_index, 9);
         assert_eq!(ranges[2].index_count, 3);
         assert_eq!(ranges[2].material_index, 0xff01);
+        assert!(ranges.iter().all(|range| {
+            range.alpha_test_reference == VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE
+        }));
     }
 }
