@@ -717,6 +717,10 @@ fn interpolate_coefficients(
     mask: u32,
     fraction: f32,
 ) -> MaterialCoefficients {
+    // World3D 0x3030 receives source and destination wrappers one dword before
+    // each D3DMATERIAL7 body. Its +4/+14/+24/+34 offsets therefore select
+    // parameters 4..6, 0..2, 8..10, and 12..14; +0x20 selects parameter 3.
+    // The other alpha/extra fields, power, and page remain from the left phase.
     let left = left.coefficients();
     let right = right.coefficients();
     let mut output = left;
@@ -1303,6 +1307,59 @@ mod tests {
         let wrapped = sample_material_phase(&document, 0, 200, 0, 0).expect("wrapped");
         assert_eq!(wrapped.phase_index, 0);
         assert_eq!(&wrapped.texture_raw[..4], b"LEFT");
+    }
+
+    #[test]
+    fn material_animation_interpolation_masks_match_native_rebased_offsets() {
+        let left = phase_with_parameters(
+            [
+                10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180,
+            ],
+            b"LEFT",
+        );
+        let right = phase_with_parameters(
+            [
+                70, 80, 90, 100, 110, 120, 130, 140, 150, 160, 170, 180, 190, 200, 210, 220, 230,
+                240,
+            ],
+            b"RIGHT",
+        );
+        let rgb = |first: u8| [first, first + 10, first + 20].map(|value| f32::from(value) / 255.0);
+        let cases = [
+            (0, rgb(10), rgb(50), rgb(90), rgb(130), 0.4),
+            (1, rgb(40), rgb(50), rgb(90), rgb(130), 0.4),
+            (2, rgb(10), rgb(80), rgb(90), rgb(130), 0.4),
+            (4, rgb(10), rgb(50), rgb(120), rgb(130), 0.4),
+            (8, rgb(10), rgb(50), rgb(90), rgb(160), 0.4),
+            (16, rgb(10), rgb(50), rgb(90), rgb(130), 0.7),
+            (0x1f, rgb(40), rgb(80), rgb(120), rgb(160), 0.7),
+        ];
+
+        for (mask, additive, directional, specular, extra, opacity) in cases {
+            let output = interpolate_coefficients(&left, &right, mask, 0.5);
+            for (actual, expected) in [
+                (output.additive_rgb, additive),
+                (output.directional_rgb, directional),
+                (output.specular_rgb, specular),
+                (output.extra_rgb, extra),
+            ] {
+                for channel in 0..3 {
+                    assert!(
+                        (actual[channel] - expected[channel]).abs() < 1e-6,
+                        "mask {mask:#x}, channel {channel}: got {}, expected {}",
+                        actual[channel],
+                        expected[channel]
+                    );
+                }
+            }
+
+            assert!((output.opacity - opacity).abs() < 1e-6, "mask {mask:#x}");
+            assert_eq!(output.directional_extra, 80.0 / 255.0);
+            assert_eq!(output.specular_extra, 120.0 / 255.0);
+            assert_eq!(output.extra_alpha, 160.0 / 255.0);
+            assert_eq!(output.power, 170);
+            assert_eq!(output.page_index, -76);
+        }
     }
 
     #[test]
