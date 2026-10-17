@@ -1091,10 +1091,10 @@ impl VulkanSmokeRenderer {
             .chain(additive_rgb)
             .chain(overlay_directional_rgb.into_iter().flatten())
             .chain(overlay_additive_rgb.into_iter().flatten())
-            .any(|value| !value.is_finite() || value < 0.0)
+            .any(|value| !value.is_finite())
         {
             return Err(VulkanSmokeRendererError::InvalidStaticMesh {
-                context: "dynamic material lighting must be finite and non-negative",
+                context: "dynamic material lighting must be finite",
             });
         }
         let lighting = self.material_lighting.get_mut(material_index).ok_or(
@@ -1155,10 +1155,10 @@ impl VulkanSmokeRenderer {
         if specular_rgb
             .into_iter()
             .chain(overlay_specular_rgb.into_iter().flatten())
-            .any(|value| !value.is_finite() || value < 0.0)
+            .any(|value| !value.is_finite())
         {
             return Err(VulkanSmokeRendererError::InvalidStaticMesh {
-                context: "dynamic material specular RGB must be finite and non-negative",
+                context: "dynamic material specular RGB must be finite",
             });
         }
         let specular = self.material_specular.get_mut(material_index).ok_or(

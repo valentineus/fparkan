@@ -622,9 +622,9 @@ pub(super) fn resolve_draw_texture_indices(
             .chain(material.additive_rgb)
             .chain(material.specular_rgb)
             .chain(material.overlay_specular_rgb.into_iter().flatten())
-            .any(|value| !value.is_finite() || value < 0.0)
+            .any(|value| !value.is_finite())
         {
-            return Err("static material lighting and specular RGB parameters must be finite and non-negative");
+            return Err("static material lighting and specular RGB parameters must be finite");
         }
         if material
             .uv_transform
@@ -645,9 +645,9 @@ pub(super) fn resolve_draw_texture_indices(
             .into_iter()
             .flatten()
             .chain(material.overlay_additive_rgb.into_iter().flatten())
-            .any(|value| !value.is_finite() || value < 0.0)
+            .any(|value| !value.is_finite())
         {
-            return Err("static material overlay RGB parameters must be finite and non-negative");
+            return Err("static material overlay RGB parameters must be finite");
         }
         if material
             .overlay_uv_transform
@@ -1012,15 +1012,15 @@ mod static_mesh_tests {
                 overlay_detail_texture: None,
                 diffuse_alpha: 1.0,
                 overlay_diffuse_alpha: None,
-                directional_rgb: [1.0; 3],
-                additive_rgb: [0.0; 3],
-                specular_rgb: [0.0; 3],
+                directional_rgb: [-0.25; 3],
+                additive_rgb: [-0.5; 3],
+                specular_rgb: [-0.75; 3],
                 specular_power: 0,
-                overlay_specular_rgb: None,
+                overlay_specular_rgb: Some([-1.0; 3]),
                 overlay_specular_power: None,
                 uv_transform: [0.0, 0.0, 1.0, 1.0],
-                overlay_directional_rgb: None,
-                overlay_additive_rgb: None,
+                overlay_directional_rgb: Some([-0.125; 3]),
+                overlay_additive_rgb: Some([-0.375; 3]),
                 detail_uv_transform: [0.0, 0.0, 1.0, 1.0],
                 overlay_uv_transform: None,
                 overlay_detail_uv_transform: None,
@@ -1060,6 +1060,20 @@ mod static_mesh_tests {
         assert_eq!(
             resolve_draw_texture_indices(&ranges, &materials),
             Ok(vec![1, 0])
+        );
+
+        let mut non_finite_base = materials.clone();
+        non_finite_base[0].specular_rgb[0] = f32::NAN;
+        assert_eq!(
+            resolve_draw_texture_indices(&ranges, &non_finite_base),
+            Err("static material lighting and specular RGB parameters must be finite")
+        );
+
+        let mut non_finite_overlay = materials.clone();
+        non_finite_overlay[0].overlay_additive_rgb = Some([f32::INFINITY, 0.0, 0.0]);
+        assert_eq!(
+            resolve_draw_texture_indices(&ranges, &non_finite_overlay),
+            Err("static material overlay RGB parameters must be finite")
         );
     }
 
