@@ -87,7 +87,9 @@ drivers и video modes, проверяет поддержку 3D, перевод
 современная реализация заменяет наблюдаемую fixed-function семантику над этой
 границей, а не должна эмулировать COM-объекты DirectX. Равный SHA-256 Ngi32 в
 Частях 1 и 2 зафиксирован в [таблице оригинальных модулей](../reference/original-binaries.md);
-это поддерживает единый контракт Vulkan backend.
+это поддерживает единый контракт Vulkan backend. RVA относятся к конкретной
+сборке DLL: перед переносом адреса на другую установку сверяйте размер и
+SHA-256 соответствующего модуля в этой таблице.
 
 ```text
 enumerate adapters and video modes
@@ -269,7 +271,7 @@ static_assert(sizeof(Batch20) == 20);
 ```c
 for (Node& node : model.nodes) {
     Matrix node_world = parent_world * local_transform(node);
-    uint16_t sid = node.slot_index[lod * 5 + group];
+    uint16_t sid = node.slot_index[native_state * 5 + native_lod];
     if (sid == 0xFFFF) continue;
 
     Slot& slot = model.slots[sid];
@@ -306,17 +308,17 @@ render queues и сортировка, но связи данных остают
 struct AnimKey24 {
     float position[3];
     float time;
+    int16_t qw;
     int16_t qx;
     int16_t qy;
     int16_t qz;
-    int16_t qw;
 };
 ```
 
-Quaternion components декодируются как signed value / `32767.0`. На диске
-порядок полей XYZ-W, но runtime math использует логическое `[w, x, y, z]`.
-Безусловная современная нормализация после чтения не добавляется без parity
-проверки: она может изменить крайние кадры.
+На диске quaternion записан в порядке WXYZ; каждый signed component
+декодируется делением на `32767.0`. Декодер переставляет поля в portable
+`Pose.rotation = [x, y, z, w]` и оставляет их ненормализованными. Нормализация
+выполняется при подготовке pose к sampling.
 
 Type 19 является массивом `uint16_t`; его `attr2` задаёт общее число кадров
 timeline. Для конкретного узла `anim_map_start` указывает на блок длиной
@@ -622,14 +624,18 @@ Lightmap не является обычной diffuse texture. WEAR содерж
 отдельным slot или texture stage. Замена lightmap предварительным умножением в
 diffuse texture ломает LOD, atlas coordinates и динамическую модуляцию.
 
-Тени проходят отдельным render pass. Terrain содержит пути для теней зданий и
-роботов, ограничения максимального числа, detail level и smoothing. Реализованы
-native visibility по шести Vulkan clip-плоскостям с радиусом sphere +100,
-порядок кандидатов и лимит 20 до построения страниц, projected-size LOD,
-directional/point light contribution, native page layout, raster, smoothing и
-receiver projection с edge clipping. Unknown settings из `shade.cfg` читаются и
-сохраняются по именам, а не заменяются произвольными modern defaults. Для native ray query
-surface descriptor в `+0x10` требует наличия всех переданных bits, а descriptor
+Vulkan preview строит projected shadows для выбранных зданий и роботов,
+отбрасывает spheres вне шести clip-плоскостей с радиусом `sphere + 100` и
+сохраняет порядок видимых кандидатов; frame builder обрабатывает не более 20
+casters. Текущая реализация выделяет страницы в atlas `256 x 256` с 28 page
+slots и использует одну smoothing pass. Вызов preview передаёт `fade = 1.0` и
+LOD defaults: minimum LOD `1` и detail multiplier `1.0` отдельно для зданий и
+роботов. Rust-путь не загружает `shade.cfg`: эти значения задаются кодом, а
+параметры файла пока не влияют на preview. Проекция учитывает вклад
+directional и point lights.
+
+Receiver projection обрезает projected quad по рёбрам треугольника. Native ray
+query descriptor в `+0x10` требует наличия всех переданных bits, а descriptor
 в `+0x14` исключает поверхности с любым переданным bit. Общий shadow query
 использует full exclusion mask `0x2000`; actor four-ray path получает compact
 mask `0x8008`, который landscape boundary разворачивает в full mask
