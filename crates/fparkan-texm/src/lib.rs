@@ -665,10 +665,10 @@ fn decode_mip_rgba8_internal(
                     continue;
                 }
                 let out = index.saturating_mul(4);
-                rgba[out] = palette[palette_offset];
+                rgba[out] = palette[palette_offset + 2];
                 rgba[out + 1] = palette[palette_offset + 1];
-                rgba[out + 2] = palette[palette_offset + 2];
-                rgba[out + 3] = palette[palette_offset + 3];
+                rgba[out + 2] = palette[palette_offset];
+                rgba[out + 3] = 255;
             }
         }
         DiskPixelFormat::Rgb565 => decode_words(level_data, pixel_count, &mut rgba, decode_rgb565),
@@ -996,6 +996,17 @@ mod tests {
     }
 
     #[test]
+    fn indexed_palette_decodes_bgrx_as_opaque_rgba() {
+        let document =
+            decode_texm(Arc::from(indexed_payload().into_boxed_slice())).expect("indexed document");
+
+        assert_eq!(
+            decode_mip_rgba8(&document, 0).expect("rgba").rgba8,
+            [30, 20, 10, 255]
+        );
+    }
+
+    #[test]
     fn channel_expansion_boundary_values_are_stable() {
         let document = decode_texm(Arc::from(
             payload(2, 1, 565, &[&[0x00, 0x00, 0xFF, 0xFF]]).into_boxed_slice(),
@@ -1155,7 +1166,7 @@ mod tests {
 
     fn indexed_payload() -> Vec<u8> {
         let mut palette = [0_u8; 1024];
-        palette[4..8].copy_from_slice(&[10, 20, 30, 255]);
+        palette[4..8].copy_from_slice(&[10, 20, 30, 0]);
         let mut out = header(1, 1, 1, 0);
         out.extend_from_slice(&palette);
         out.push(1);
