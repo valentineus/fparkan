@@ -7,9 +7,11 @@ use fparkan_assets::{
     load_material_name_texture_rgba8_and_phase_with_document_from_root,
     load_resource_entry_bytes_from_root,
     load_standalone_wear_named_material_textures_rgba8_and_phases_with_documents_from_root,
-    page_uv_transform, sample_material_phase, Mat0Document, MaterialPhase, MaterialPhaseSample,
-    PreparedControlNodeBinding, PreparedMaterialPhase, PreparedTexture, PreparedTextureUsage,
-    PreparedVisual, RgbaImage, StandaloneWearMaterialLoader,
+    page_uv_transform, sample_control_node_times, sample_material_phase, ControlInstanceState,
+    ControlSamplingError, Mat0Document, MaterialPhase, MaterialPhaseSample,
+    PreparedComponentControl, PreparedControlGateProvider, PreparedControlNodeBinding,
+    PreparedMaterialPhase, PreparedTexture, PreparedTextureUsage, PreparedVisual, RgbaImage,
+    StandaloneWearMaterialLoader,
 };
 use fparkan_fx::atmosphere::TypedAtmosphere;
 use fparkan_fx::environment::{
@@ -3981,6 +3983,68 @@ fn static_preview_component_pose_buffer(
         .or_else(|| node38_fallback_hierarchy(model)))
 }
 
+fn initial_control_gate_values(control: &PreparedComponentControl) -> Vec<Option<f32>> {
+    control
+        .typed_records
+        .iter()
+        .filter(|record| record.tag == 21)
+        .map(|record| match &record.gate_provider {
+            PreparedControlGateProvider::Resolved {
+                initial_type1_value,
+                ..
+            } if initial_type1_value.is_finite() => Some(*initial_type1_value),
+            _ => None,
+        })
+        .collect()
+}
+
+fn static_preview_control_pose_buffer(
+    model: &ModelAsset,
+    control: &PreparedComponentControl,
+    native_clock_ms: u32,
+    state: &mut ControlInstanceState,
+) -> Result<Option<NodePoseBuffer>, String> {
+    if control.model_node_count != model.node_count {
+        return Err(format!(
+            "control model node count {} does not match MSH node count {}",
+            control.model_node_count, model.node_count
+        ));
+    }
+    let gate_values = initial_control_gate_values(control);
+    let sampled_times = match sample_control_node_times(
+        control,
+        native_clock_ms,
+        &gate_values,
+        state,
+    ) {
+        Ok(times) => times,
+        Err(
+            error @ (ControlSamplingError::UnsupportedTag21Mode { .. }
+            | ControlSamplingError::UnsupportedVariableMapping { .. }
+            | ControlSamplingError::MissingGateProvider { .. }
+            | ControlSamplingError::GateProviderKeyOutOfRange { .. }
+            | ControlSamplingError::MissingGateProviderValue { .. }
+            | ControlSamplingError::GateProviderCountMismatch { .. }),
+        ) => {
+            return static_preview_component_pose_buffer(model, &control.bindings, None)
+                .map_err(|fallback| {
+                    format!(
+                        "control timeline sample failed ({error:?}) and static CTLD fallback failed: {fallback}"
+                    )
+                });
+        }
+        Err(error) => {
+            return Err(format!("control timeline sample failed: {error:?}"));
+        }
+    };
+    let node_times = sampled_times
+        .into_iter()
+        .map(|time| time.map(AnimationTime))
+        .collect::<Vec<_>>();
+    Ok(node38_sampled_hierarchy_at_times(model, &node_times)
+        .or_else(|| node38_fallback_hierarchy(model)))
+}
+
 fn static_preview_mesh_and_materials(
     assets: &MissionAssets,
     terrain: &TerrainWorld,
@@ -4088,15 +4152,23 @@ fn static_preview_mesh_and_materials(
             let Some(model) = *model else {
                 continue;
             };
-            let component_bindings = component_controls
+            let component_control = component_controls
                 .and_then(|controls| controls.get(component_index))
-                .and_then(Option::as_ref)
-                .map_or(&[][..], |control| control.bindings.as_slice());
-            component_pose_buffers[component_index] = static_preview_component_pose_buffer(
-                &model.validated,
-                component_bindings,
-                static_animation_frame,
-            )?;
+                .and_then(Option::as_ref);
+            component_pose_buffers[component_index] =
+                match (static_animation_frame, component_control) {
+                    (None, Some(control)) => static_preview_control_pose_buffer(
+                        &model.validated,
+                        control,
+                        0,
+                        &mut ControlInstanceState::default(),
+                    )?,
+                    (animation_frame, control) => static_preview_component_pose_buffer(
+                        &model.validated,
+                        control.map_or(&[][..], |control| control.bindings.as_slice()),
+                        animation_frame,
+                    )?,
+                };
             let should_render = tree.as_ref().map_or(true, |_| {
                 unit_component_is_visible(component_index, visual.source_type)
             });
@@ -6205,6 +6277,159 @@ fn usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn control_pose_test_model() -> ModelAsset {
+        let mut nodes = vec![u8::MAX; 38];
+        nodes[..2].copy_from_slice(&[0, 0]);
+        nodes[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
+        nodes[4..6].copy_from_slice(&0_u16.to_le_bytes());
+        nodes[6..8].copy_from_slice(&1_u16.to_le_bytes());
+        ModelAsset {
+            node_stride: 38,
+            node_count: 1,
+            nodes_raw: nodes,
+            bounding_sphere_center: [0.0; 3],
+            bounding_sphere_radius: 1.0,
+            slots: vec![],
+            positions: vec![],
+            normals: None,
+            uv0: None,
+            uv1: None,
+            indices: vec![],
+            batches: vec![],
+            node_names: None,
+            animation: Some(fparkan_msh::ModelAnimation {
+                keys: vec![
+                    fparkan_animation::AnimKey24 {
+                        time: AnimationTime(0.0),
+                        pose: fparkan_animation::Pose::default(),
+                    },
+                    fparkan_animation::AnimKey24 {
+                        time: AnimationTime(1.0),
+                        pose: fparkan_animation::Pose {
+                            translation: [0.0, 2.0, 0.0],
+                            rotation: [0.0, 0.0, 0.0, 1.0],
+                        },
+                    },
+                ],
+                frame_map: vec![0, 1],
+                frame_count: 2,
+            }),
+        }
+    }
+
+    fn control_pose_test_control() -> PreparedComponentControl {
+        let mut fixed_words = [0; 44];
+        fixed_words[2] = 0;
+        fixed_words[6] = u32::MAX;
+        fixed_words[9] = 1.0_f32.to_bits();
+        fixed_words[10] = 1.0_f32.to_bits();
+        let archive = || {
+            fparkan_path::normalize_relative(b"test.rlb", fparkan_path::PathPolicy::HostCompatible)
+                .expect("test archive path")
+        };
+        PreparedComponentControl {
+            source: fparkan_resource::ResourceKey {
+                archive: archive(),
+                name: ResourceName(b"animated.ctl".to_vec()),
+                type_id: None,
+            },
+            model_node_count: 1,
+            bindings: vec![],
+            timeline_rows: vec![fparkan_assets::PreparedControlTimelineRow {
+                row_index: 0,
+                node_index: 0,
+                frame_a: 0.0,
+                frame_b: 1.0,
+                initial_blend: 0.0,
+                raw_parameters: [u32::MAX, u32::MAX, 1.0_f32.to_bits(), 0],
+                flags: 0,
+            }],
+            typed_records: vec![fparkan_assets::PreparedControlTypedRecord {
+                tag: 21,
+                fixed_words,
+                values: vec![0],
+                string_bytes: vec![],
+                gate_provider: PreparedControlGateProvider::Resolved {
+                    key: 0,
+                    ndp_source: fparkan_resource::ResourceKey {
+                        archive: archive(),
+                        name: ResourceName(b"animated.ndp".to_vec()),
+                        type_id: None,
+                    },
+                    row_count: 1,
+                    initial_type1_value: 1.0,
+                },
+            }],
+            node_data: None,
+            effect_section: fparkan_assets::PreparedControlEffectSection::Absent,
+            point_list: None,
+        }
+    }
+
+    #[test]
+    fn control_timeline_and_ndp_gate_change_component_pose_at_sampled_time() {
+        let model = control_pose_test_model();
+        let control = control_pose_test_control();
+        let gate_values = initial_control_gate_values(&control);
+        let mut raw_state = ControlInstanceState::default();
+        let raw_initial = sample_control_node_times(&control, 0, &gate_values, &mut raw_state)
+            .expect("initial raw control timeline");
+        let raw_later = sample_control_node_times(&control, 225, &gate_values, &mut raw_state)
+            .expect("later raw control timeline");
+        assert_eq!(raw_initial, vec![Some(0.0)]);
+        assert!((raw_later[0].expect("node 0 time") - 0.225).abs() < 1.0e-5);
+
+        let mut state = ControlInstanceState::default();
+        let initial = static_preview_control_pose_buffer(&model, &control, 0, &mut state)
+            .expect("initial control pose")
+            .expect("sampled initial hierarchy");
+        let later = static_preview_control_pose_buffer(&model, &control, 225, &mut state)
+            .expect("later control pose")
+            .expect("sampled later hierarchy");
+
+        assert_eq!(initial.poses[0].translation, [0.0; 3]);
+        assert!(
+            (later.poses[0].translation[1] - 0.45).abs() < 1.0e-4,
+            "later sampled pose: {:?}",
+            later.poses[0]
+        );
+
+        let mut closed_gate = control.clone();
+        let ndp_source = match &control.typed_records[0].gate_provider {
+            PreparedControlGateProvider::Resolved { ndp_source, .. } => ndp_source.clone(),
+            _ => panic!("fixture has a resolved NDP source"),
+        };
+        closed_gate.typed_records[0].gate_provider = PreparedControlGateProvider::Resolved {
+            key: 0,
+            ndp_source,
+            row_count: 1,
+            initial_type1_value: 0.0,
+        };
+        let mut closed_state = ControlInstanceState::default();
+        let closed_initial =
+            static_preview_control_pose_buffer(&model, &closed_gate, 0, &mut closed_state)
+                .expect("closed-gate initial pose")
+                .expect("closed-gate initial hierarchy");
+        let closed_later =
+            static_preview_control_pose_buffer(&model, &closed_gate, 225, &mut closed_state)
+                .expect("closed-gate control pose")
+                .expect("closed-gate hierarchy");
+        assert_eq!(initial.poses[0], closed_initial.poses[0]);
+        assert_eq!(closed_initial.poses[0], closed_later.poses[0]);
+        assert_ne!(later.poses[0], closed_later.poses[0]);
+
+        let mut mismatched_control = control.clone();
+        mismatched_control.model_node_count += 1;
+        let mismatch = static_preview_control_pose_buffer(
+            &model,
+            &mismatched_control,
+            225,
+            &mut ControlInstanceState::default(),
+        )
+        .expect_err("control/mesh node-count mismatch is rejected");
+        assert!(mismatch.contains("does not match MSH node count"));
+    }
 
     fn set_test_terrain_lod0_range(terrain: &mut fparkan_terrain_format::LandMeshDocument) {
         const NODE_STRIDE: usize = 38;
