@@ -1036,7 +1036,9 @@ animation phase; object batches сохраняют их legacy blend/depth/alpha
 
 После загрузки world path создаёт интерактивную free-flight камеру (`WASD`,
 `E/Q`, `Shift`, `Ctrl`, RMB relative-look), обновляет listener и на каждом
-кадре собирает environment frame. Mission-local `sky.ske`/`sky.wea` выбирают
+кадре собирает environment frame. После шага движения камера проверяет высоту
+`TerrainWorld`: над конечной поверхностью сохраняется начальный просвет, а вне
+поверхности высота не ограничивается. Mission-local `sky.ske`/`sky.wea` выбирают
 атмосферное расписание и sky materials, `effects.rlb/env_lightning` даёт
 lightning visual; weather particles, flares, sun/moon, point lights,
 projected shadows и audio events обновляются вместе с камерой и временем.

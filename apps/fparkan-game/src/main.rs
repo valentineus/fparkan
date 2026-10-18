@@ -191,6 +191,7 @@ struct FreeFlightCamera {
     near_plane: f32,
     far_plane: f32,
     move_speed: f32,
+    ground_clearance: f32,
 }
 
 impl FreeFlightCamera {
@@ -248,6 +249,7 @@ impl FreeFlightCamera {
             // Keep the default traversal speed comfortable on a full mission
             // map; Shift/Ctrl still provide the coarse speed controls.
             move_speed: (radius * 0.03).clamp(4.0, 40.0),
+            ground_clearance: 0.0,
         })
     }
 
@@ -313,6 +315,7 @@ impl FreeFlightCamera {
             .ok_or_else(|| "free-flight terrain has no queryable spawn surface".to_string())?;
         let target_ground = height_world(center).unwrap_or(spawn_ground);
         let clearance = (extent * 0.005).clamp(2.0, 8.0);
+        camera.ground_clearance = clearance;
         camera.position = [spawn_xy[0], spawn_xy[1], spawn_ground + clearance];
         let target = [center[0], center[1], target_ground + 1.5];
         let direction = sub3(target, camera.position);
@@ -321,6 +324,27 @@ impl FreeFlightCamera {
         camera.yaw = direction[1].atan2(direction[0]);
         camera.pitch = (direction[2] / distance).clamp(-1.0, 1.0).asin();
         Ok(camera)
+    }
+
+    fn keep_above_terrain(&mut self, terrain: &TerrainWorld) -> Result<(), String> {
+        if !self.ground_clearance.is_finite() || self.ground_clearance < 0.0 {
+            return Err("free-flight ground clearance must be finite and nonnegative".to_string());
+        }
+        let Some(ground_height) = terrain
+            .height_at([self.position[0], self.position[1]])
+            .map_err(|error| format!("free-flight terrain height query: {error}"))?
+        else {
+            return Ok(());
+        };
+        if !ground_height.is_finite() {
+            return Err("free-flight terrain height is not finite".to_string());
+        }
+        let minimum_z = ground_height + self.ground_clearance;
+        if !minimum_z.is_finite() {
+            return Err("free-flight terrain floor is not finite".to_string());
+        }
+        self.position[2] = self.position[2].max(minimum_z);
+        Ok(())
     }
 
     fn forward(self) -> [f32; 3] {
@@ -5735,6 +5759,7 @@ impl StaticVulkanApp {
                 .as_mut()
                 .ok_or_else(|| "free-flight camera disappeared".to_string())?;
             free_camera.advance(&self.pressed_keys, elapsed.as_secs_f32());
+            free_camera.keep_above_terrain(&self.terrain)?;
             free_camera.preview_frame(aspect)
         };
         let camera = view_camera.vulkan_camera();
@@ -7072,6 +7097,7 @@ mod tests {
             near_plane: 0.1,
             far_plane: 100.0,
             move_speed: 1.0,
+            ground_clearance: 0.0,
         }
         .preview_frame(16.0 / 9.0);
         let preview = StaticPreviewScene {
@@ -7662,6 +7688,7 @@ mod tests {
             near_plane: 1.0,
             far_plane: 11.0,
             move_speed: 1.0,
+            ground_clearance: 0.0,
         };
 
         let nearly_equal = |left: f32, right: f32| assert!((left - right).abs() < 1.0e-5);
@@ -7775,6 +7802,7 @@ mod tests {
             near_plane: 0.5,
             far_plane: 700.0,
             move_speed: 1.0,
+            ground_clearance: 0.0,
         }
         .preview_frame(16.0 / 9.0);
         let viewport = [1280.0, 720.0];
@@ -7830,6 +7858,7 @@ mod tests {
                 near_plane: projection.near_plane,
                 far_plane: projection.far_plane,
                 move_speed: 1.0,
+                ground_clearance: 0.0,
             }
             .preview_frame(1280.0 / 720.0);
 
@@ -7887,6 +7916,7 @@ mod tests {
             near_plane: 0.1,
             far_plane: 100.0,
             move_speed: 1.0,
+            ground_clearance: 0.0,
         }
         .preview_frame(16.0 / 9.0);
         let terrain = TerrainWorld::default();
@@ -7931,6 +7961,7 @@ mod tests {
             FreeFlightCamera::from_mesh_and_terrain(&VulkanStaticMesh::smoke_triangle(), &terrain)
                 .expect("camera above nonzero terrain");
         assert_eq!(floor_camera.position[2], 34.0);
+        assert_eq!(floor_camera.ground_clearance, 2.0);
         let blocked_camera = FreeFlightCamera {
             position: [0.25, 0.25, 34.0],
             yaw: 0.0,
@@ -7939,6 +7970,7 @@ mod tests {
             near_plane: 0.1,
             far_plane: 100.0,
             move_speed: 1.0,
+            ground_clearance: 0.0,
         }
         .preview_frame(16.0 / 9.0);
         assert!(!native_sun_unoccluded(
@@ -8021,6 +8053,84 @@ mod tests {
     }
 
     #[test]
+    fn free_flight_camera_keeps_clearance_after_descending_and_moving_uphill() {
+        let mut land = fparkan_terrain_format::LandMeshDocument {
+            streams: Vec::new(),
+            nodes_raw: Vec::new(),
+            slots: fparkan_terrain_format::TerrainSlotTable {
+                header_raw: Vec::new(),
+                slots_raw: Vec::new(),
+            },
+            positions: vec![[0.0, 0.0, 32.0], [1.0, 0.0, 34.0], [0.0, 1.0, 36.0]],
+            normals: Vec::new(),
+            uv0: Vec::new(),
+            accelerator: Vec::new(),
+            aux14: Vec::new(),
+            aux18: Vec::new(),
+            faces: vec![fparkan_terrain_format::TerrainFace28 {
+                flags: FullSurfaceMask(1),
+                material_tag: 0,
+                aux_tag: 0,
+                vertices: [0, 1, 2],
+                neighbors: [None, None, None],
+                tail_raw: [0; 8],
+                raw: [0; 28],
+            }],
+        };
+        set_test_terrain_lod0_range(&mut land);
+        let terrain = TerrainWorld::from_land_msh(&land).expect("sloped terrain");
+        assert_eq!(terrain.height_at([0.25, 0.25]).unwrap(), Some(33.5));
+        assert_eq!(terrain.height_at([0.75, 0.25]).unwrap(), Some(34.5));
+
+        let mut camera = FreeFlightCamera {
+            position: [0.25, 0.25, 37.0],
+            yaw: 0.0,
+            pitch: 0.0,
+            horizontal_fov: 1.0,
+            near_plane: 0.1,
+            far_plane: 100.0,
+            move_speed: 4.0,
+            ground_clearance: 2.0,
+        };
+        let mut keys = HashSet::from([KeyCode::KeyQ]);
+        camera.advance(&keys, 1.0);
+        camera
+            .keep_above_terrain(&terrain)
+            .expect("floor query after descent");
+        assert_eq!(camera.position, [0.25, 0.25, 35.5]);
+
+        keys.clear();
+        keys.insert(KeyCode::KeyW);
+        camera.move_speed = 1.0;
+        camera.advance(&keys, 0.5);
+        camera
+            .keep_above_terrain(&terrain)
+            .expect("floor query after uphill movement");
+        assert_eq!(camera.position, [0.75, 0.25, 36.5]);
+
+        let mut outside_camera = FreeFlightCamera {
+            position: [2.0, 2.0, -17.0],
+            ground_clearance: 2.0,
+            ..camera
+        };
+        let unchanged = outside_camera.position;
+        outside_camera
+            .keep_above_terrain(&terrain)
+            .expect("missing terrain sample leaves the camera alone");
+        assert_eq!(outside_camera.position, unchanged);
+
+        let mut unsupported_camera = FreeFlightCamera {
+            position: [0.25, 0.25, 35.5],
+            ground_clearance: 2.0,
+            ..camera
+        };
+        assert!(unsupported_camera
+            .keep_above_terrain(&TerrainWorld::default())
+            .expect_err("terrain query errors must propagate")
+            .contains("terrain height query"));
+    }
+
+    #[test]
     fn world_sort_key_uses_the_first_indexed_vertex() {
         let mesh = VulkanStaticMesh::smoke_triangle();
         let distance = first_indexed_vertex_distance(&mesh, 0, [0.0, -0.55, -3.0])
@@ -8038,6 +8148,7 @@ mod tests {
             near_plane: 0.1,
             far_plane: 100.0,
             move_speed: 2.0,
+            ground_clearance: 0.0,
         };
         let mut keys = HashSet::new();
         keys.insert(KeyCode::KeyW);
@@ -8065,6 +8176,7 @@ mod tests {
             near_plane: 0.1,
             far_plane: 100.0,
             move_speed: 2.0,
+            ground_clearance: 0.0,
         };
         let old_right = camera.right();
         let old_forward = camera.forward();
@@ -8551,6 +8663,7 @@ mod tests {
             near_plane: 0.1,
             far_plane: 100.0,
             move_speed: 1.0,
+            ground_clearance: 0.0,
         }
         .preview_frame(1.0);
         let screen = ScreenBillboard {
@@ -8602,6 +8715,7 @@ mod tests {
             near_plane: 0.1,
             far_plane: 100.0,
             move_speed: 1.0,
+            ground_clearance: 0.0,
         }
         .preview_frame(1.0);
         let uv = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]];
@@ -8682,6 +8796,7 @@ mod tests {
             near_plane: 0.5,
             far_plane: 700.0,
             move_speed: 1.0,
+            ground_clearance: 0.0,
         };
         let frame = camera.preview_frame(16.0 / 9.0);
         let opaque_clip = row_vector_transform([320.0, 0.0, 0.0, 1.0], frame.clip_from_world);
@@ -8806,6 +8921,7 @@ mod tests {
             near_plane: 0.5,
             far_plane: 700.0,
             move_speed: 1.0,
+            ground_clearance: 0.0,
         }
         .preview_frame(1280.0 / 1024.0);
 
