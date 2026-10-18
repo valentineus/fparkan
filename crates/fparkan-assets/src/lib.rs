@@ -949,6 +949,9 @@ pub struct PreparedComponentControl {
     pub node_data: Option<PreparedControlNodeDataTable>,
     /// Parsed native effect rows in this component's control resource.
     pub effect_section: PreparedControlEffectSection,
+    /// Validated group selected by native Control's first effect-group
+    /// header word; `None` is the native no-group sentinel or an invalid index.
+    pub initial_effect_group: Option<usize>,
     /// Component-local points selected for parsed effect rows, when present.
     pub point_list: Option<PreparedControlPointList>,
 }
@@ -3647,6 +3650,7 @@ const CONTROL_EFFECT_ROW_BYTES: usize = 100;
 
 struct DecodedComponentEffectSection {
     section: PreparedControlEffectSection,
+    initial_effect_group: Option<usize>,
     typed_records: Vec<PreparedControlTypedRecord>,
 }
 
@@ -3670,6 +3674,7 @@ where
                     typed_record_tag: None,
                 }
             },
+            initial_effect_group: None,
             typed_records: Vec::new(),
         });
     }
@@ -3690,6 +3695,7 @@ where
                     typed_record_index: Some(record_index),
                     typed_record_tag: Some(tag),
                 },
+                initial_effect_group: None,
                 typed_records,
             });
         }
@@ -3788,16 +3794,24 @@ where
                     typed_record_tag: None,
                 }
             },
+            initial_effect_group: None,
             typed_records,
         });
     }
 
-    cursor = cursor
+    let group_header_end = cursor
         .checked_add(CONTROL_EFFECT_GROUP_HEADER_BYTES)
         .ok_or_else(|| invalid("effect group header end overflows"))?;
-    if cursor > payload.len() {
+    if group_header_end > payload.len() {
         return Err(invalid("effect group header extends past the payload"));
     }
+    let initial_effect_group = usize::try_from(
+        control_u32_at(payload, cursor)
+            .expect("validated effect group header contains its initial selector"),
+    )
+    .ok()
+    .filter(|group| *group < effect_group_count);
+    cursor = group_header_end;
 
     let mut effect_rows = Vec::new();
     for table_index in 0..effect_group_count {
@@ -3863,11 +3877,13 @@ where
                 typed_record_index: None,
                 typed_record_tag: None,
             },
+            initial_effect_group: None,
             typed_records,
         });
     }
     Ok(DecodedComponentEffectSection {
         section: PreparedControlEffectSection::Parsed(effect_rows),
+        initial_effect_group,
         typed_records,
     })
 }
@@ -4016,6 +4032,7 @@ fn decode_component_control_payload(
         typed_records: decoded_effect.typed_records,
         node_data: None,
         effect_section: decoded_effect.section,
+        initial_effect_group: decoded_effect.initial_effect_group,
         point_list: None,
     })
 }
@@ -4505,6 +4522,58 @@ mod tests {
                 },
             ])
         );
+    }
+
+    #[test]
+    fn component_control_uses_validated_initial_effect_group_header_word() {
+        let source = ResourceKey {
+            archive: parse_path("controls.rlb").expect("archive"),
+            name: resource_name(b"parts.ctl"),
+            type_id: None,
+        };
+        let mut payload = component_control_payload(&[(1, 0.0, 1.0, 0.25, 0)]);
+        payload[12..16].copy_from_slice(&1_u32.to_le_bytes());
+        payload[16..20].copy_from_slice(&9_u32.to_le_bytes());
+        append_typed_record(&mut payload, 21, 0);
+        let group_header = payload.len();
+        payload.resize(group_header + CONTROL_EFFECT_GROUP_HEADER_BYTES, 0);
+        payload[group_header..group_header + 4].copy_from_slice(&8_u32.to_le_bytes());
+        for group in 0..9 {
+            if group == 8 {
+                append_effect_table(
+                    &mut payload,
+                    &[effect_row(
+                        4,
+                        [0; 3],
+                        [0; 3],
+                        17,
+                        "effects.rlb",
+                        "f_smalllight_y",
+                    )],
+                );
+            } else {
+                append_effect_table(&mut payload, &[]);
+            }
+        }
+
+        let control = decode_component_control_payload(&payload, source.clone(), 2, 3)
+            .expect("nine declared effect groups parse");
+        assert_eq!(control.initial_effect_group, Some(8));
+        let PreparedControlEffectSection::Parsed(rows) = control.effect_section else {
+            panic!("effect groups should parse");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].table_index, 8);
+
+        payload[group_header..group_header + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let no_default = decode_component_control_payload(&payload, source.clone(), 2, 3)
+            .expect("native no-group sentinel is accepted");
+        assert_eq!(no_default.initial_effect_group, None);
+
+        payload[group_header..group_header + 4].copy_from_slice(&9_u32.to_le_bytes());
+        let out_of_range = decode_component_control_payload(&payload, source, 2, 3)
+            .expect("out-of-range selector does not invalidate tables");
+        assert_eq!(out_of_range.initial_effect_group, None);
     }
 
     #[test]

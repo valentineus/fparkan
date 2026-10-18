@@ -6363,6 +6363,7 @@ mod tests {
             }],
             node_data: None,
             effect_section: fparkan_assets::PreparedControlEffectSection::Absent,
+            initial_effect_group: None,
             point_list: None,
         }
     }
