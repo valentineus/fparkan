@@ -341,7 +341,7 @@ impl TerrainWorld {
         let mut surfaces = Vec::with_capacity(foundation.fragments.len());
         let mut generated = 0_usize;
         for (fragment_index, fragment) in foundation.fragments.iter().enumerate() {
-            if !valid_foundation_triangle(fragment.positions) {
+            if !valid_foundation_triangle(fragment.positions, fragment.source_face.is_none()) {
                 return Err(TerrainError::InvalidFoundationFragment {
                     fragment: fragment_index,
                 });
@@ -1031,7 +1031,7 @@ fn build_surfaces(mesh: &LandMeshDocument) -> Result<Vec<RuntimeTriangle>, Terra
     Ok(triangles)
 }
 
-fn valid_foundation_triangle(vertices: [[f32; 3]; 3]) -> bool {
+fn valid_foundation_triangle(vertices: [[f32; 3]; 3], allow_zero_xy_area: bool) -> bool {
     if !vertices.iter().flatten().all(|value| value.is_finite()) {
         return false;
     }
@@ -1043,7 +1043,9 @@ fn valid_foundation_triangle(vertices: [[f32; 3]; 3]) -> bool {
         f64::from(vertices[2][0]) - f64::from(vertices[0][0]),
         f64::from(vertices[2][1]) - f64::from(vertices[0][1]),
     ];
-    first[0] * second[1] - first[1] * second[0] != 0.0
+    let cross = first[0] * second[1] - first[1] * second[0];
+    // Native vertex welding can collapse generated band faces; query math naturally misses zero area.
+    cross != 0.0 || allow_zero_xy_area
 }
 
 fn surface_vertex(
@@ -1365,6 +1367,54 @@ mod tests {
     }
 
     #[test]
+    fn foundation_install_keeps_finite_welded_zero_area_band_for_queries() {
+        let mesh = synthetic_land_mesh();
+        let positions = [
+            [1644.398, 1118.5295, 132.54382],
+            [1644.4183, 1118.5342, 132.54755],
+            [1644.4183, 1118.5342, 132.54755],
+        ];
+        let foundation = BasementFoundation {
+            fragments: vec![BasementFoundationFragment {
+                source_face: None,
+                surface_mask: FullSurfaceMask(0x8300),
+                positions,
+            }],
+            placements: Vec::new(),
+        };
+        let world = TerrainWorld::from_land_msh(&mesh)
+            .expect("source world")
+            .with_basement_foundation(foundation)
+            .expect("finite generated fragment retained after native vertex welding");
+
+        assert_eq!(world.surface_count(), 1);
+        assert_eq!(
+            world
+                .basement_foundation()
+                .expect("installed foundation")
+                .fragments[0]
+                .positions,
+            positions
+        );
+        assert_eq!(
+            world
+                .height_at([positions[1][0], positions[1][1]])
+                .expect("degenerate height query"),
+            None
+        );
+        assert_eq!(
+            world
+                .raycast(
+                    [positions[1][0], positions[1][1], 200.0],
+                    [0.0, 0.0, -1.0],
+                    FullSurfaceMask(0),
+                )
+                .expect("degenerate ray query"),
+            None
+        );
+    }
+
+    #[test]
     fn foundation_install_rejects_invalid_source_identity_masks_and_generated_flags() {
         let mesh = synthetic_land_mesh();
         let source_triangle = [[0.0, 0.0, 0.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0]];
@@ -1384,6 +1434,11 @@ mod tests {
                 source_face: None,
                 surface_mask: FullSurfaceMask(0x0300),
                 positions: generated_triangle,
+            },
+            BasementFoundationFragment {
+                source_face: None,
+                surface_mask: FullSurfaceMask(0x8300),
+                positions: [[0.0, 0.0, 0.0], [0.25, 0.0, 0.0], [0.0, f32::NAN, 0.0]],
             },
         ];
 
