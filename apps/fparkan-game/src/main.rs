@@ -6599,6 +6599,9 @@ struct LegacyCameraCapture {
     schema: String,
     render_input_usable: Option<bool>,
     selector0_words: [u32; 16],
+    parented_camera: Option<bool>,
+    effective_world_matrix_space: Option<String>,
+    effective_world_matrix_words: Option<[u32; 16]>,
     viewport: [i32; 4],
     near_plane: f32,
     far_plane: f32,
@@ -6614,6 +6617,26 @@ fn selected_atmosphere_seconds(
 }
 
 impl LegacyCameraCapture {
+    fn preview_matrix_words(&self) -> Result<[u32; 16], String> {
+        match (
+            self.effective_world_matrix_space.as_deref(),
+            self.effective_world_matrix_words,
+        ) {
+            (Some("world"), Some(words)) => Ok(words),
+            (Some(_), _) => Err(
+                "legacy camera effective_world_matrix_space must be 'world'".to_string(),
+            ),
+            (None, Some(_)) => Err(
+                "legacy camera effective_world_matrix_words requires an explicit world-space marker"
+                    .to_string(),
+            ),
+            (None, None) if self.parented_camera == Some(true) => Err(
+                "parented legacy camera requires an effective world-space matrix".to_string(),
+            ),
+            (None, None) => Ok(self.selector0_words),
+        }
+    }
+
     fn captured_viewport(&self) -> Result<CapturedViewport, String> {
         let width = self.viewport[2]
             .checked_sub(self.viewport[0])
@@ -6637,7 +6660,7 @@ impl LegacyCameraCapture {
     fn preview_camera_frame(&self) -> Result<PreviewCameraFrame, String> {
         let frame = PreviewCameraFrame::from_legacy_d3d7(
             RawCameraTransform {
-                words: self.selector0_words,
+                words: self.preview_matrix_words()?,
             },
             LegacyD3d7Projection {
                 viewport: self.viewport,
@@ -6667,6 +6690,14 @@ fn parse_legacy_camera_capture(bytes: &[u8]) -> Result<LegacyCameraCapture, Stri
         serde_json::from_str(&json).map_err(|err| format!("invalid legacy camera JSON: {err}"))?;
     if capture.schema != "fparkan-legacy-camera-v1" {
         return Err("unsupported legacy camera capture schema".to_string());
+    }
+    if capture.effective_world_matrix_space.is_some()
+        != capture.effective_world_matrix_words.is_some()
+    {
+        return Err(
+            "effective_world_matrix_space and effective_world_matrix_words must be supplied together"
+                .to_string(),
+        );
     }
     if capture.render_input_usable == Some(false) {
         return Err("legacy camera capture is marked render_input_usable=false".to_string());
@@ -8269,11 +8300,76 @@ mod tests {
     }
 
     #[test]
+    fn parented_camera_preview_uses_effective_world_matrix_fixture() {
+        let fixture = include_bytes!("../testdata/legacy-camera-parented.json");
+        let capture = parse_legacy_camera_capture(fixture).expect("valid parented camera fixture");
+        let parse_value = |value: serde_json::Value| {
+            let bytes = serde_json::to_vec(&value).expect("serialize camera fixture");
+            parse_legacy_camera_capture(&bytes)
+        };
+        assert_eq!(capture.parented_camera, Some(true));
+        assert_eq!(
+            capture.preview_camera_frame().unwrap().position,
+            [10.0, 20.0, 30.0]
+        );
+        assert_eq!(
+            capture.preview_matrix_words().unwrap(),
+            capture.effective_world_matrix_words.unwrap()
+        );
+
+        let mut missing_world: serde_json::Value =
+            serde_json::from_slice(fixture).expect("valid fixture JSON");
+        missing_world
+            .as_object_mut()
+            .unwrap()
+            .remove("effective_world_matrix_words");
+        let missing_world = serde_json::to_vec(&missing_world).unwrap();
+        assert!(parse_legacy_camera_capture(&missing_world)
+            .expect_err("incomplete world matrix pair")
+            .contains("effective_world_matrix_space and effective_world_matrix_words"));
+
+        let mut parented_without_world: serde_json::Value =
+            serde_json::from_slice(fixture).expect("valid fixture JSON");
+        let parented_without_world = parented_without_world.as_object_mut().unwrap();
+        parented_without_world.remove("effective_world_matrix_space");
+        parented_without_world.remove("effective_world_matrix_words");
+        assert!(
+            parse_value(serde_json::Value::Object(parented_without_world.clone()))
+                .expect_err("parented camera without its world matrix")
+                .contains("parented legacy camera requires an effective world-space matrix")
+        );
+
+        let mut invalid_marker: serde_json::Value =
+            serde_json::from_slice(fixture).expect("valid fixture JSON");
+        invalid_marker["effective_world_matrix_space"] =
+            serde_json::Value::String("local".to_string());
+        assert!(parse_value(invalid_marker)
+            .expect_err("unknown matrix space")
+            .contains("effective_world_matrix_space must be 'world'"));
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(fixture).expect("valid fixture JSON");
+        let legacy = legacy.as_object_mut().unwrap();
+        legacy.remove("parented_camera");
+        legacy.remove("effective_world_matrix_space");
+        legacy.remove("effective_world_matrix_words");
+        let legacy = parse_value(serde_json::Value::Object(legacy.clone()))
+            .expect("older local-only camera capture");
+        assert_eq!(
+            legacy.preview_camera_frame().unwrap().position,
+            [1.0, 2.0, 3.0]
+        );
+    }
+
+    #[test]
     fn captured_atmosphere_is_default_and_cli_time_takes_precedence() {
         let capture = LegacyCameraCapture {
             schema: "fparkan-legacy-camera-v1".to_string(),
             render_input_usable: None,
             selector0_words: [0; 16],
+            parented_camera: None,
+            effective_world_matrix_space: None,
+            effective_world_matrix_words: None,
             viewport: [0, 0, 1, 1],
             near_plane: 0.1,
             far_plane: 1.0,

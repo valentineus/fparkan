@@ -24,6 +24,7 @@ internal static partial class NativeFrameCapture
     private const uint PageExecuteReadWrite = 0x40;
     private const uint ThreadGetContext = 0x0008;
     private const uint ThreadSetContext = 0x0010;
+    private const int ContextEaxOffset = 176;
     private const int ContextEipOffset = 184;
     private const int ContextEbxOffset = 164;
     private const int ContextEdxOffset = 168;
@@ -56,6 +57,9 @@ internal static partial class NativeFrameCapture
     private const uint FogGeometryVtableRva = 0x64E48;
     private const uint FogGeometryDistanceMethodRva = 0x246A0;
     private const uint PresentBoundaryRva = 0x6E1B;
+    private const uint PresentCompletionRva = 0x6E2C;
+    private const uint BeginSceneStateRva = 0x6FB8;
+    private const uint EndSceneStateRva = 0x7008;
     private const uint RelocatedGlobalRva = 0x79518C;
     private const uint ExternalCameraVtableRva = 0x665B4;
     private const uint MissionFactoryRva = 0xA1FE1;
@@ -63,6 +67,7 @@ internal static partial class NativeFrameCapture
     private const uint MissionImportThunkRva = 0xCD01C;
     private const int MissionProbeAttemptLimit = 8;
     private const int FrameCaptureTimeoutSeconds = 300;
+    private const int BoundaryTraceTimeoutSeconds = 60;
     private const int NativeFogSampleLimit = 512;
     private static readonly byte[] FogConsumerFileSignature = new byte[]
         { 0xD9, 0x42, 0x14, 0xD8, 0x15, 0x7C, 0x41, 0x06, 0x10 };
@@ -218,6 +223,129 @@ internal static partial class NativeFrameCapture
         public uint ReturnAddress;
         public byte[] OriginalMatrixBytes;
         public string OriginalMatrixSha256;
+        public uint OriginalParentPointer;
+    }
+
+    private sealed class BoundaryTraceProgress
+    {
+        public bool BeginSceneSeen;
+        public uint BeginSceneGeneration;
+        public uint BeginSceneThread;
+        public bool ProjectionSelected;
+        public uint SelectedGeneration;
+        public uint SelectedThread;
+        public bool EndSceneSeen;
+        public bool PresentSeen;
+        public bool WorldReturnSeen;
+        public bool AttributionInvalidated;
+
+        public bool ObserveBeginScene(uint generation, uint cameraThreadId, uint eventThreadId,
+            uint rendererState, bool succeeded)
+        {
+            if (AttributionInvalidated || ProjectionSelected || !succeeded || rendererState != 1 || generation == 0
+                || cameraThreadId == 0 || eventThreadId != cameraThreadId) return false;
+            BeginSceneSeen = true;
+            BeginSceneGeneration = generation;
+            BeginSceneThread = eventThreadId;
+            return true;
+        }
+
+        public bool ObserveProjection(uint generation, uint cameraThreadId, uint eventThreadId,
+            bool verifiedPair, bool selectorMatch)
+        {
+            if (ProjectionSelected)
+            {
+                if (!verifiedPair || !selectorMatch || generation == 0 || cameraThreadId == 0
+                    || eventThreadId != cameraThreadId
+                    || !IsMatchingBoundaryTracePair(SelectedGeneration, SelectedThread,
+                        generation, eventThreadId))
+                    AttributionInvalidated = true;
+                return false;
+            }
+            if (AttributionInvalidated || !verifiedPair || !selectorMatch || generation == 0
+                || cameraThreadId == 0 || eventThreadId != cameraThreadId) return false;
+            if (!BeginSceneSeen || !IsMatchingBoundaryTracePair(
+                BeginSceneGeneration, BeginSceneThread, generation, eventThreadId)) return false;
+            ProjectionSelected = true;
+            SelectedGeneration = generation;
+            SelectedThread = eventThreadId;
+            return true;
+        }
+
+        public bool ObserveEndScene(uint generation, uint cameraThreadId, uint eventThreadId,
+            uint rendererState, bool succeeded)
+        {
+            if (!ProjectionSelected || !BeginSceneSeen || EndSceneSeen || AttributionInvalidated
+                || !succeeded || rendererState != 0 || cameraThreadId != eventThreadId
+                || !IsMatchingBoundaryTracePair(SelectedGeneration, SelectedThread,
+                    generation, eventThreadId)) return false;
+            EndSceneSeen = true;
+            return true;
+        }
+
+        public bool ObservePresent(uint generation, uint cameraThreadId, uint eventThreadId)
+        {
+            if (!ProjectionSelected || !EndSceneSeen || PresentSeen || AttributionInvalidated
+                || cameraThreadId != eventThreadId
+                || !IsMatchingBoundaryTracePair(SelectedGeneration, SelectedThread,
+                    generation, eventThreadId)) return false;
+            PresentSeen = true;
+            return true;
+        }
+
+        public bool ObserveWorldReturn(uint generation, uint cameraThreadId, uint eventThreadId)
+        {
+            if (!ProjectionSelected || !PresentSeen || WorldReturnSeen || AttributionInvalidated
+                || cameraThreadId != eventThreadId
+                || !IsMatchingBoundaryTracePair(SelectedGeneration, SelectedThread,
+                    generation, eventThreadId)) return false;
+            WorldReturnSeen = true;
+            return true;
+        }
+
+        public void ResetBeginScene()
+        {
+            if (ProjectionSelected) return;
+            BeginSceneSeen = false;
+            BeginSceneGeneration = 0;
+            BeginSceneThread = 0;
+        }
+
+        public bool ObserveCameraEntry()
+        {
+            if (ProjectionSelected && !WorldReturnSeen)
+            {
+                Invalidate();
+                return true;
+            }
+            if (!ProjectionSelected) ResetBeginScene();
+            return false;
+        }
+
+        public void Invalidate()
+        {
+            AttributionInvalidated = true;
+        }
+
+        public bool IsSequenceComplete()
+        {
+            return BeginSceneSeen && ProjectionSelected && EndSceneSeen && PresentSeen
+                && WorldReturnSeen && !AttributionInvalidated;
+        }
+
+        public bool IsComplete(bool breakpointsRestored, bool detached, bool fatal,
+            bool processExited, bool probesSucceeded)
+        {
+            return IsSequenceComplete() && breakpointsRestored && detached
+                && !fatal && !processExited && probesSucceeded;
+        }
+    }
+
+    private static bool IsMatchingBoundaryTracePair(uint expectedGeneration, uint expectedThread,
+        uint generation, uint threadId)
+    {
+        return expectedGeneration != 0 && expectedThread != 0
+            && generation == expectedGeneration && threadId == expectedThread;
     }
 
     private enum RemoteReadbackPhase { Acquire, Cleanup }
@@ -232,6 +360,7 @@ internal static partial class NativeFrameCapture
         public byte[] OriginalContext;
         public byte[] PresentStackArguments;
         public bool PresentStackArgumentsIntact;
+        public bool ValidatePresentStackArguments;
         public bool RemoteContextIntact;
         public BreakpointInfo PresentBreakpoint;
         public FrameSnapshot Frame;
@@ -247,11 +376,17 @@ internal static partial class NativeFrameCapture
         public uint GetHr;
         public uint LockHr;
         public uint UnlockHr;
+        public bool SurfaceProbeOnly;
+        public string PixelBoundary;
+        public BreakpointInfo ResumeBreakpoint;
+        public BreakpointInfo[] SuspendedBreakpoints;
+        public uint ProbeSurfacePointer;
     }
 
     [StructLayout(LayoutKind.Explicit, Size = X86ContextSize)]
     private struct X86ContextLayout
     {
+        [FieldOffset(ContextEaxOffset)] public uint Eax;
         [FieldOffset(ContextEipOffset)] public uint Eip;
         [FieldOffset(ContextEsiOffset)] public uint Esi;
         [FieldOffset(ContextEbpOffset)] public uint Ebp;
@@ -948,6 +1083,51 @@ internal static partial class NativeFrameCapture
         return match;
     }
 
+    private static bool VerifyPresentCompletionBoundary(IntPtr process, uint ngiBase,
+        out byte firstByte, out string evidence)
+    {
+        byte[] expected = new byte[] { 0x5E, 0x83, 0xC4, 0x14, 0xC3 };
+        byte[] actual = new byte[expected.Length];
+        bool readable = ReadExact(process, unchecked(ngiBase + PresentCompletionRva), actual);
+        firstByte = readable ? actual[0] : (byte)0;
+        bool match = readable && ByteArraysEqual(expected, actual);
+        evidence = "base=0x" + ngiBase.ToString("X8") + " RVA=0x" + PresentCompletionRva.ToString("X")
+            + " bytes=" + BitConverter.ToString(actual)
+            + " post-call=0x6E1E pop ebx/pop edi; HRESULT stored at +0x6E27; post-store boundary=0x6E2C";
+        return match;
+    }
+
+    private static bool VerifySceneStateBoundaries(IntPtr process, uint ngiBase,
+        out byte beginByte, out byte endByte, out string evidence)
+    {
+        byte[] beginExpected = new byte[] {
+            0xFF, 0x51, 0x14, 0xA3, 0, 0, 0, 0,
+            0xC6, 0x86, 0x19, 0x01, 0x00, 0x00, 0x01, 0x5E
+        };
+        byte[] endExpected = new byte[] {
+            0xFF, 0x51, 0x18, 0xA3, 0, 0, 0, 0,
+            0xC6, 0x86, 0x19, 0x01, 0x00, 0x00, 0x00,
+            0xC6, 0x86, 0x1A, 0x01, 0x00, 0x00, 0x01
+        };
+        byte[] lastErrorAddress = BitConverter.GetBytes(unchecked(ngiBase + NgiLastErrorGlobalRva));
+        Buffer.BlockCopy(lastErrorAddress, 0, beginExpected, 4, 4);
+        Buffer.BlockCopy(lastErrorAddress, 0, endExpected, 4, 4);
+        byte[] beginActual = new byte[beginExpected.Length];
+        byte[] endActual = new byte[endExpected.Length];
+        bool beginRead = ReadExact(process, unchecked(ngiBase + BeginSceneStateRva - 15), beginActual);
+        bool endRead = ReadExact(process, unchecked(ngiBase + EndSceneStateRva - 15), endActual);
+        beginByte = beginRead ? beginActual[15] : (byte)0;
+        endByte = endRead ? endActual[15] : (byte)0;
+        bool match = beginRead && endRead && ByteArraysEqual(beginExpected, beginActual)
+            && ByteArraysEqual(endExpected, endActual);
+        evidence = "base=0x" + ngiBase.ToString("X8") + " relocatedLastError=0x"
+            + unchecked(ngiBase + NgiLastErrorGlobalRva).ToString("X8")
+            + " begin=RVA0x" + BeginSceneStateRva.ToString("X") + " bytes=" + BitConverter.ToString(beginActual)
+            + " end=RVA0x" + EndSceneStateRva.ToString("X") + " bytes=" + BitConverter.ToString(endActual)
+            + " beginFlagOffset=renderer+0x119 endFlagOffset=renderer+0x119";
+        return match;
+    }
+
     private static byte[] ContextAtBreakpoint(byte[] original, uint address, bool singleStep)
     {
         if (original == null || original.Length != X86ContextSize)
@@ -999,17 +1179,18 @@ internal static partial class NativeFrameCapture
         breakpoint.Armed = pending.RearmOnComplete;
     }
 
-    private static void ResumeOriginalPresent(IntPtr process, RemoteReadbackSession session)
+    private static void ResumeReadbackBoundary(IntPtr process, RemoteReadbackSession session)
     {
         BreakpointInfo breakpoint = session.PresentBreakpoint;
+        if (breakpoint == null) throw new InvalidOperationException("Readback resume boundary is missing.");
         if (breakpoint.Armed)
         {
             if (!WriteByte(process, breakpoint.Address, breakpoint.OriginalByte))
-                throw new InvalidOperationException("Could not restore Ngi32 present call after readback.");
+                throw new InvalidOperationException("Could not restore " + breakpoint.Name + " after readback.");
             breakpoint.Armed = false;
         }
         IntPtr thread = OpenThread(ThreadGetContext | ThreadSetContext, false, session.ThreadId);
-        if (thread == IntPtr.Zero) throw new InvalidOperationException("OpenThread to resume Ngi32 present failed: " + Marshal.GetLastWin32Error());
+        if (thread == IntPtr.Zero) throw new InvalidOperationException("OpenThread to resume " + breakpoint.Name + " failed: " + Marshal.GetLastWin32Error());
         try
         {
             byte[] resumeContext = ContextAtBreakpoint(session.OriginalContext, breakpoint.Address, false);
@@ -1018,14 +1199,29 @@ internal static partial class NativeFrameCapture
             uint expectedEsp = BitConverter.ToUInt32(session.OriginalContext, ContextEspOffset);
             uint restoredEip = BitConverter.ToUInt32(restoredContext, ContextEipOffset);
             uint restoredEsp = BitConverter.ToUInt32(restoredContext, ContextEspOffset);
-            Log("PRESENT_RESUME_CONTEXT expectedEip=0x" + breakpoint.Address.ToString("X8")
+            Log("READBACK_RESUME_CONTEXT boundary=" + breakpoint.Name + " expectedEip=0x" + breakpoint.Address.ToString("X8")
                 + " actualEip=0x" + restoredEip.ToString("X8")
                 + " expectedEsp=0x" + expectedEsp.ToString("X8")
                 + " actualEsp=0x" + restoredEsp.ToString("X8"));
             if (restoredEip != breakpoint.Address || restoredEsp != expectedEsp)
-                throw new InvalidOperationException("Could not verify restored Ngi32 present EIP/ESP.");
+                throw new InvalidOperationException("Could not verify restored " + breakpoint.Name + " EIP/ESP.");
         }
         finally { CloseHandle(thread); }
+    }
+
+    private static PendingStep ResumeReadbackAfterRemote(IntPtr process, RemoteReadbackSession session)
+    {
+        if (session.SuspendedBreakpoints == null)
+        {
+            ResumeReadbackBoundary(process, session);
+            return null;
+        }
+        RearmSuspendedBreakpoints(process, session);
+        PendingStep pending;
+        BeginSingleStep(process, session.ThreadId, session.ResumeBreakpoint,
+            session.OriginalContext, out pending, true);
+        Log("SINGLE_STEP_STARTED boundary=" + session.ResumeBreakpoint.Name + " tid=" + session.ThreadId);
+        return pending;
     }
 
     private static bool CanStopCapture(bool captured, bool stopAfterAttempt,
@@ -1047,13 +1243,28 @@ internal static partial class NativeFrameCapture
                 && SelectedMatrixMatchesProjection(frame)));
     }
 
+    private static bool CanReadSelectedBoundaryPixels(bool selected, bool invalidated,
+        bool sameThread, bool sameGeneration, bool sameRenderer, uint sceneFlag, uint endSceneHresult)
+    {
+        return selected && !invalidated && sameThread && sameGeneration && sameRenderer
+            && sceneFlag == 0 && endSceneHresult == 0;
+    }
+
+    private static bool CanAcceptBoundaryPresent(bool pixelsStaged, bool invalidated,
+        bool sameThread, bool sameGeneration, uint presentHresult)
+    {
+        return pixelsStaged && !invalidated && sameThread && sameGeneration && presentHresult == 0;
+    }
+
     private static bool SelectedMatrixMatchesProjection(FrameSnapshot frame)
     {
         if (frame == null || !frame.SelectedCameraRequested) return true;
         return frame.SelectedCamera != null && frame.SelectedCamera.Input != null
             && frame.Camera != null && frame.Camera.CurrentAtProjectionVerified
-            && !frame.Camera.WordsChangedAtProjection
-            && ByteArraysEqual(frame.Camera.ProjectionMatrixBytes, frame.SelectedCamera.Input.MatrixBytes);
+            && frame.Camera.EffectiveWorldAtProjectionVerified
+            && !frame.Camera.EffectiveWorldChangedAtProjection
+            && CameraMatricesNearlyEqual(frame.Camera.ProjectionEffectiveWorldMatrixBytes,
+                frame.SelectedCamera.Input.MatrixBytes);
     }
 
     private static bool CanArmPresentForFrame(FrameSnapshot frame, uint threadId)
@@ -1100,7 +1311,8 @@ internal static partial class NativeFrameCapture
         return selected != null && selected.Applied && selected.CameraPointer == frame.Camera.Camera
             && selected.ThreadId == threadId && selected.Generation == frame.CameraGeneration
             && selected.Input != null && selected.Input.MatrixBytes != null
-            && ByteArraysEqual(frame.Camera.EntryMatrixBytes, selected.Input.MatrixBytes)
+            && frame.Camera.EffectiveWorldMatrixFinite
+            && CameraMatricesNearlyEqual(frame.Camera.EntryEffectiveWorldMatrixBytes, selected.Input.MatrixBytes)
             && !selected.PixelAttributionInvalidated;
     }
 
@@ -1581,6 +1793,7 @@ internal static partial class NativeFrameCapture
         CameraReadback camera = frame.Camera;
         ProjectionReadback projection = frame.Projection;
         if (!camera.LayoutVerified || !camera.MatrixFinite || !camera.CurrentAtProjectionVerified
+            || !camera.EffectiveWorldMatrixFinite || !camera.EffectiveWorldAtProjectionVerified
             || !projection.Verified || projection.Mode == 0)
             throw new InvalidOperationException("Refusing to emit app-compatible JSON from an unverified camera or non-perspective projection.");
         if (!IsViewportInsideSurface(projection.Viewport, surface.Width, surface.Height))
@@ -1590,23 +1803,39 @@ internal static partial class NativeFrameCapture
         json.AppendLine("  \"schema\": \"fparkan-legacy-camera-v1\",");
         json.AppendLine("  \"capture_status\": \"native-frame-captured\",");
         json.AppendLine("  \"render_input_usable\": true,");
+        json.AppendLine("  \"pixel_capture_boundary\": " + JsonString(remote == null || String.IsNullOrEmpty(remote.PixelBoundary)
+            ? "Ngi32 Present" : remote.PixelBoundary) + ",");
+        json.AppendLine("  \"pixel_review_status\": \"candidate-awaiting-visual-review\",");
         json.AppendLine("  \"source\": \"GOG World3D stdRenderGame + Ngi32 D3D7 render target\",");
         json.AppendLine("  \"scratch_executable\": " + JsonString(gamePath) + ",");
         json.AppendLine("  \"world3d_module_base\": " + JsonString("0x" + world3dBase.ToString("X8")) + ",");
         json.AppendLine("  \"ngi32_module_base\": " + JsonString("0x" + ngiBase.ToString("X8")) + ",");
         json.AppendLine("  \"frame_generation\": " + frame.CameraGeneration.ToString(CultureInfo.InvariantCulture) + ",");
         json.AppendLine("  \"camera_argument\": " + JsonString("0x" + camera.Camera.ToString("X8")) + ",");
+        json.AppendLine("  \"camera_parent\": " + JsonString("0x" + camera.Parent.ToString("X8")) + ",");
+        json.AppendLine("  \"parented_camera\": " + (camera.Parented ? "true" : "false") + ",");
         json.AppendLine("  \"camera_vtable\": " + JsonString("0x" + camera.Vtable.ToString("X8")) + ",");
         json.AppendLine("  \"selector_field_plus_0x10\": " + JsonString("0x" + camera.SelectorField.ToString("X8")) + ",");
         json.AppendLine("  \"camera_words_sampled_at\": \"World3D+0x13CE4\",");
         json.AppendLine("  \"camera_words_changed_since_render_entry\": " + (camera.WordsChangedAtProjection ? "true" : "false") + ",");
         json.AppendLine("  \"camera_words_render_entry_sha256\": " + JsonString(camera.EntryMatrixSha256) + ",");
         json.AppendLine("  \"camera_words_projection_boundary_sha256\": " + JsonString(camera.ProjectionMatrixSha256) + ",");
+        json.AppendLine("  \"effective_world_matrix_space\": \"world\",");
+        json.AppendLine("  \"effective_world_matrix_render_entry_sha256\": " + JsonString(camera.EntryEffectiveWorldMatrixSha256) + ",");
+        json.AppendLine("  \"effective_world_matrix_projection_boundary_sha256\": " + JsonString(camera.ProjectionEffectiveWorldMatrixSha256) + ",");
+        json.AppendLine("  \"effective_world_matrix_changed_since_render_entry\": " + (camera.EffectiveWorldChangedAtProjection ? "true" : "false") + ",");
         json.Append("  \"selector0_words\": [");
         for (int i = 0; i < camera.Words.Length; i++)
         {
             if (i != 0) json.Append(", ");
             json.Append(camera.Words[i].ToString(CultureInfo.InvariantCulture));
+        }
+        json.AppendLine("],");
+        json.Append("  \"effective_world_matrix_words\": [");
+        for (int i = 0; i < camera.EffectiveWorldWords.Length; i++)
+        {
+            if (i != 0) json.Append(", ");
+            json.Append(camera.EffectiveWorldWords[i].ToString(CultureInfo.InvariantCulture));
         }
         json.AppendLine("],");
         json.AppendLine("  \"viewport\": [" + String.Join(", ", projection.Viewport) + "],");
@@ -1620,6 +1849,8 @@ internal static partial class NativeFrameCapture
             SelectedCameraState selected = frame.SelectedCamera;
             json.AppendLine("  \"selected_camera\": {");
             json.AppendLine("    \"input_json\": " + JsonString(selected.Input.Path) + ",");
+            json.AppendLine("    \"input_kind\": " + JsonString(selected.Input.Synthetic
+                ? "synthetic-camera-plan" : "native-capture") + ",");
             json.AppendLine("    \"requested_matrix_sha256\": " + JsonString(selected.Input.MatrixSha256) + ",");
             json.AppendLine("    \"preflight_camera_argument\": " + JsonString("0x" + selected.CandidateCameraPointer.ToString("X8")) + ",");
             json.AppendLine("    \"preflight_thread_id\": " + selected.CandidateThreadId.ToString(CultureInfo.InvariantCulture) + ",");
@@ -1729,19 +1960,23 @@ internal static partial class NativeFrameCapture
             && Marshal.OffsetOf(typeof(X86ContextLayout), "Ebp").ToInt32() == ContextEbpOffset
             && Marshal.OffsetOf(typeof(X86ContextLayout), "Esp").ToInt32() == ContextEspOffset;
         FrameSnapshot matched = new FrameSnapshot { CameraGeneration = 7, CameraThreadId = 11,
-            Camera = new CameraReadback { LayoutVerified = true, MatrixFinite = true, CurrentAtProjectionVerified = true },
+            Camera = new CameraReadback { LayoutVerified = true, MatrixFinite = true, CurrentAtProjectionVerified = true,
+                EffectiveWorldMatrixFinite = true, EffectiveWorldAtProjectionVerified = true },
             ProjectionGeneration = 7, ProjectionThreadId = 11,
             Projection = new ProjectionReadback { Verified = true, Mode = 1 } };
         byte[] selectedMatrixBytes = new byte[64];
-        selectedMatrixBytes[0] = 1;
+        Buffer.BlockCopy(BitConverter.GetBytes(1.0f), 0, selectedMatrixBytes, 0, 4);
         byte[] changedSelectedMatrixBytes = (byte[])selectedMatrixBytes.Clone();
-        changedSelectedMatrixBytes[0] = 2;
+        Buffer.BlockCopy(BitConverter.GetBytes(2.0f), 0, changedSelectedMatrixBytes, 0, 4);
         SelectedCameraInput selectedInput = new SelectedCameraInput { MatrixBytes = selectedMatrixBytes };
         FrameSnapshot selectedMatched = new FrameSnapshot
         {
             CameraGeneration = 8, CameraThreadId = 11,
             Camera = new CameraReadback { LayoutVerified = true, MatrixFinite = true, CurrentAtProjectionVerified = true,
-                EntryMatrixBytes = (byte[])selectedMatrixBytes.Clone(), ProjectionMatrixBytes = (byte[])selectedMatrixBytes.Clone() },
+                EffectiveWorldMatrixFinite = true, EffectiveWorldAtProjectionVerified = true,
+                EntryMatrixBytes = (byte[])selectedMatrixBytes.Clone(), ProjectionMatrixBytes = (byte[])selectedMatrixBytes.Clone(),
+                EntryEffectiveWorldMatrixBytes = (byte[])selectedMatrixBytes.Clone(),
+                ProjectionEffectiveWorldMatrixBytes = (byte[])selectedMatrixBytes.Clone() },
             ProjectionGeneration = 8, ProjectionThreadId = 11,
             Projection = new ProjectionReadback { Verified = true, Mode = 1 },
             SelectedCameraRequested = true,
@@ -1778,7 +2013,10 @@ internal static partial class NativeFrameCapture
         {
             CameraGeneration = 8, CameraThreadId = 11,
             Camera = new CameraReadback { LayoutVerified = true, MatrixFinite = true, CurrentAtProjectionVerified = true,
-                EntryMatrixBytes = (byte[])selectedMatrixBytes.Clone(), ProjectionMatrixBytes = changedSelectedMatrixBytes },
+                EffectiveWorldMatrixFinite = true, EffectiveWorldAtProjectionVerified = true,
+                EntryMatrixBytes = (byte[])selectedMatrixBytes.Clone(), ProjectionMatrixBytes = (byte[])changedSelectedMatrixBytes.Clone(),
+                EntryEffectiveWorldMatrixBytes = (byte[])selectedMatrixBytes.Clone(),
+                ProjectionEffectiveWorldMatrixBytes = changedSelectedMatrixBytes },
             ProjectionGeneration = 8, ProjectionThreadId = 11,
             Projection = new ProjectionReadback { Verified = true, Mode = 1 },
             SelectedCameraRequested = true,
@@ -1856,6 +2094,86 @@ internal static partial class NativeFrameCapture
         bool selectedIntervenedRejected = !IsMatchingPerspectiveFrame(selectedIntervened, 11);
         bool selectedChangedMatrixRejected = !CanArmPresentForFrame(selectedMatrixChanged, 11)
             && !IsMatchingPerspectiveFrame(selectedMatrixChanged, 11);
+        bool selectedBoundaryReadAllowed = CanReadSelectedBoundaryPixels(true, false,
+            true, true, true, 0, 0);
+        bool boundaryReadRejectsUnselected = !CanReadSelectedBoundaryPixels(false, false,
+            true, true, true, 0, 0);
+        bool boundaryReadRejectsInvalidated = !CanReadSelectedBoundaryPixels(true, true,
+            true, true, true, 0, 0);
+        bool boundaryReadRejectsWrongThread = !CanReadSelectedBoundaryPixels(true, false,
+            false, true, true, 0, 0);
+        bool boundaryReadRejectsWrongGeneration = !CanReadSelectedBoundaryPixels(true, false,
+            true, false, true, 0, 0);
+        bool boundaryReadRejectsWrongRenderer = !CanReadSelectedBoundaryPixels(true, false,
+            true, true, false, 0, 0);
+        bool boundaryReadRejectsActiveScene = !CanReadSelectedBoundaryPixels(true, false,
+            true, true, true, 1, 0);
+        bool boundaryReadRejectsFailedEndScene = !CanReadSelectedBoundaryPixels(true, false,
+            true, true, true, 0, 0x80004005);
+        bool boundaryPresentAccepted = CanAcceptBoundaryPresent(true, false,
+            true, true, 0);
+        bool boundaryPresentRejectsChangedFrame = !CanAcceptBoundaryPresent(true, false,
+            true, false, 0);
+        bool boundaryPresentRejectsFailed = !CanAcceptBoundaryPresent(true, false,
+            true, true, 0x80004005);
+        bool boundaryPresentRejectsInvalidated = !CanAcceptBoundaryPresent(true, true,
+            true, true, 0);
+        BoundaryTraceProgress traceHappyPath = new BoundaryTraceProgress();
+        bool traceBeginAccepted = traceHappyPath.ObserveBeginScene(7, 11, 11, 1, true);
+        bool traceProjectionAccepted = traceHappyPath.ObserveProjection(7, 11, 11, true, true);
+        bool traceEndAccepted = traceHappyPath.ObserveEndScene(7, 11, 11, 0, true);
+        bool tracePresentAccepted = traceHappyPath.ObservePresent(7, 11, 11);
+        bool traceReturnAccepted = traceHappyPath.ObserveWorldReturn(7, 11, 11);
+        bool traceSequenceComplete = traceHappyPath.IsSequenceComplete();
+        bool traceProbeFailureRejected = !traceHappyPath.IsComplete(true, true, false, false, false);
+        bool traceFatalRejected = !traceHappyPath.IsComplete(true, true, true, false, true);
+        bool traceExitedRejected = !traceHappyPath.IsComplete(true, true, false, true, true);
+        bool traceCleanupRequired = !traceHappyPath.IsComplete(false, true, false, false, true)
+            && !traceHappyPath.IsComplete(true, false, false, false, true)
+            && traceHappyPath.IsComplete(true, true, false, false, true);
+        BoundaryTraceProgress traceFailedBegin = new BoundaryTraceProgress();
+        bool traceFailedBeginRejected = !traceFailedBegin.ObserveBeginScene(7, 11, 11, 1, false)
+            && !traceFailedBegin.ObserveBeginScene(7, 11, 11, 0, true)
+            && !traceFailedBegin.ObserveProjection(7, 11, 11, true, true);
+        BoundaryTraceProgress traceOutOfOrder = new BoundaryTraceProgress();
+        bool traceOutOfOrderRejected = traceOutOfOrder.ObserveBeginScene(7, 11, 11, 1, true)
+            && !traceOutOfOrder.ObserveEndScene(7, 11, 11, 0, true)
+            && !traceOutOfOrder.ObservePresent(7, 11, 11)
+            && !traceOutOfOrder.ObserveWorldReturn(7, 11, 11)
+            && !traceOutOfOrder.IsSequenceComplete();
+        BoundaryTraceProgress traceWrongPairs = new BoundaryTraceProgress();
+        bool traceWrongPairBegin = traceWrongPairs.ObserveBeginScene(7, 11, 11, 1, true);
+        bool traceWrongPairsRejected = !traceWrongPairs.ObserveProjection(8, 11, 11, true, true)
+            && !traceWrongPairs.ObserveProjection(7, 11, 12, true, true)
+            && traceWrongPairs.ObserveProjection(7, 11, 11, true, true)
+            && !traceWrongPairs.ObserveEndScene(8, 11, 11, 0, true)
+            && !traceWrongPairs.ObserveEndScene(7, 11, 12, 0, true)
+            && traceWrongPairs.ObserveEndScene(7, 11, 11, 0, true)
+            && !traceWrongPairs.ObservePresent(8, 11, 11)
+            && !traceWrongPairs.ObservePresent(7, 11, 12)
+            && traceWrongPairs.ObservePresent(7, 11, 11)
+            && !traceWrongPairs.ObserveWorldReturn(8, 11, 11)
+            && !traceWrongPairs.ObserveWorldReturn(7, 11, 12)
+            && traceWrongPairs.ObserveWorldReturn(7, 11, 11);
+        BoundaryTraceProgress traceReplacement = new BoundaryTraceProgress();
+        bool traceReplacementInvalidated = traceReplacement.ObserveBeginScene(7, 11, 11, 1, true)
+            && traceReplacement.ObserveProjection(7, 11, 11, true, true)
+            && !traceReplacement.ObserveProjection(8, 11, 11, true, true)
+            && traceReplacement.AttributionInvalidated && !traceReplacement.IsSequenceComplete();
+        BoundaryTraceProgress traceProjectionChanged = new BoundaryTraceProgress();
+        bool traceProjectionChangeInvalidated = traceProjectionChanged.ObserveBeginScene(7, 11, 11, 1, true)
+            && traceProjectionChanged.ObserveProjection(7, 11, 11, true, true)
+            && !traceProjectionChanged.ObserveProjection(7, 11, 11, true, false)
+            && traceProjectionChanged.AttributionInvalidated && !traceProjectionChanged.IsSequenceComplete();
+        BoundaryTraceProgress traceCameraChanged = new BoundaryTraceProgress();
+        bool traceCameraEntryInvalidated = traceCameraChanged.ObserveBeginScene(7, 11, 11, 1, true)
+            && traceCameraChanged.ObserveProjection(7, 11, 11, true, true)
+            && traceCameraChanged.ObserveCameraEntry() && traceCameraChanged.AttributionInvalidated
+            && !traceCameraChanged.IsSequenceComplete();
+        BoundaryTraceProgress traceReset = new BoundaryTraceProgress();
+        bool traceResetDropsOldBegin = traceReset.ObserveBeginScene(6, 11, 11, 1, true);
+        traceResetDropsOldBegin = traceReset.ObserveCameraEntry() == false && traceResetDropsOldBegin
+            && !traceReset.ObserveProjection(7, 11, 11, true, true);
         bool stopAfterCapture = CanStopCapture(true, false, false, false, false);
         bool stopAfterFailure = CanStopCapture(false, true, false, false, false);
         bool waitsForRemote = !CanStopCapture(true, false, true, false, false);
@@ -1874,6 +2192,19 @@ internal static partial class NativeFrameCapture
             || !selectedFrameValid || !selectedUnrestoredRejected || !selectedUnrestoredCaptureEligible
             || !selectedIntervenedCaptureRejected || !selectedIntervenedRejected
             || !selectedChangedMatrixRejected
+            || !selectedBoundaryReadAllowed || !boundaryReadRejectsUnselected
+            || !boundaryReadRejectsInvalidated || !boundaryReadRejectsWrongThread
+            || !boundaryReadRejectsWrongGeneration || !boundaryReadRejectsWrongRenderer
+            || !boundaryReadRejectsActiveScene || !boundaryReadRejectsFailedEndScene
+            || !boundaryPresentAccepted || !boundaryPresentRejectsChangedFrame
+            || !boundaryPresentRejectsFailed || !boundaryPresentRejectsInvalidated
+            || !traceBeginAccepted || !traceProjectionAccepted || !traceEndAccepted
+            || !tracePresentAccepted || !traceReturnAccepted || !traceSequenceComplete
+            || !traceCleanupRequired || !traceProbeFailureRejected || !traceFatalRejected
+            || !traceExitedRejected || !traceFailedBeginRejected || !traceOutOfOrderRejected
+            || !traceWrongPairBegin || !traceWrongPairsRejected || !traceWrongPairs.IsSequenceComplete()
+            || !traceReplacementInvalidated || !traceProjectionChangeInvalidated
+            || !traceCameraEntryInvalidated || !traceResetDropsOldBegin
             || !stopAfterCapture || !stopAfterFailure || !waitsForRemote || !waitsForStep || !waitsForCameraRestore
             || !resumedEipOk || !resumedEspOk || !resumedTrapCleared)
             throw new InvalidOperationException("Self-check failed: offsets=" + offsetsMatch
@@ -1887,6 +2218,31 @@ internal static partial class NativeFrameCapture
                 + " selectedIntervenedCaptureRejected=" + selectedIntervenedCaptureRejected
                 + " selectedIntervenedRejected=" + selectedIntervenedRejected
                 + " selectedChangedMatrixRejected=" + selectedChangedMatrixRejected
+                + " selectedBoundaryReadAllowed=" + selectedBoundaryReadAllowed
+                + " boundaryReadRejectsUnselected=" + boundaryReadRejectsUnselected
+                + " boundaryReadRejectsInvalidated=" + boundaryReadRejectsInvalidated
+                + " boundaryReadRejectsWrongThread=" + boundaryReadRejectsWrongThread
+                + " boundaryReadRejectsWrongGeneration=" + boundaryReadRejectsWrongGeneration
+                + " boundaryReadRejectsWrongRenderer=" + boundaryReadRejectsWrongRenderer
+                + " boundaryReadRejectsActiveScene=" + boundaryReadRejectsActiveScene
+                + " boundaryReadRejectsFailedEndScene=" + boundaryReadRejectsFailedEndScene
+                + " boundaryPresentAccepted=" + boundaryPresentAccepted
+                + " boundaryPresentRejectsChangedFrame=" + boundaryPresentRejectsChangedFrame
+                + " boundaryPresentRejectsFailed=" + boundaryPresentRejectsFailed
+                + " boundaryPresentRejectsInvalidated=" + boundaryPresentRejectsInvalidated
+                + " traceHappy=" + (traceBeginAccepted && traceProjectionAccepted && traceEndAccepted
+                    && tracePresentAccepted && traceReturnAccepted && traceSequenceComplete)
+                + " traceCleanupRequired=" + traceCleanupRequired
+                + " traceProbeFailureRejected=" + traceProbeFailureRejected
+                + " traceFatalRejected=" + traceFatalRejected
+                + " traceExitedRejected=" + traceExitedRejected
+                + " traceFailedBeginRejected=" + traceFailedBeginRejected
+                + " traceOutOfOrderRejected=" + traceOutOfOrderRejected
+                + " traceWrongPairsRejected=" + traceWrongPairsRejected
+                + " traceReplacementInvalidated=" + traceReplacementInvalidated
+                + " traceProjectionChangeInvalidated=" + traceProjectionChangeInvalidated
+                + " traceCameraEntryInvalidated=" + traceCameraEntryInvalidated
+                + " traceResetDropsOldBegin=" + traceResetDropsOldBegin
                 + " stopAfterFailure=" + stopAfterFailure + " waitsForRemote=" + waitsForRemote
                 + " waitsForStep=" + waitsForStep + " waitsForCameraRestore=" + waitsForCameraRestore
                 + " resumedEipOk=" + resumedEipOk
@@ -1894,6 +2250,8 @@ internal static partial class NativeFrameCapture
                 + " ThreadQueryInformation=" + ThreadQueryInformation + " Ebx=" + ContextEbxOffset
                 + " Edx=" + ContextEdxOffset + " Ecx=" + ContextEcxOffset);
         Console.WriteLine("self-check: x86 CONTEXT layout, relocation RVA, legacy camera JSON compatibility, native fog pairing/settings consistency, geometry caller/layout gates, low-byte bypass, nullable fog JSON, 512-call bound, camera/projection gates, wrapping atmosphere phase arithmetic/clock pairing, and recovery states OK");
+        Console.WriteLine("self-check: selected EndScene readback requires same-thread/generation/renderer, idle scene state and successful HRESULT; Present confirms staged pixels without intervening render OK");
+        Console.WriteLine("self-check: boundary trace requires matching BeginScene/projection/EndScene/Present/World3D-return order, successful probes, and verified cleanup; probe failure, process exit, fatal state, and invalid event sequences cannot report success");
         return SelfCheckReadback();
     }
 
@@ -2387,11 +2745,23 @@ internal static partial class NativeFrameCapture
                     + " mode=" + validated.ProjectionMode);
                 return 0;
             }
-            bool hasCameraInput = args.Length == 6 && args[4] == "--camera-input";
-            if ((args.Length != 4 && !hasCameraInput) || args[0] != "--capture")
+            bool hasCameraInput = args.Length == 6 && args[0] == "--capture" && args[4] == "--camera-input";
+            bool boundaryTrace = args.Length == 6 && args[0] == "--trace-boundaries" && args[4] == "--camera-input";
+            bool boundaryCameraSetter = args.Length == 7 && args[0] == "--capture-world-boundary"
+                && args[4] == "--camera-input" && args[6] == "--set-camera";
+            bool boundaryCapture = (args.Length == 6 || boundaryCameraSetter)
+                && args[0] == "--capture-world-boundary" && args[4] == "--camera-input";
+            if (args.Length == 0
+                || (!boundaryTrace && !boundaryCapture && args[0] != "--capture")
+                || (!hasCameraInput && !boundaryTrace && !boundaryCapture && args.Length != 4)
+                || ((hasCameraInput || boundaryTrace) && args.Length != 6)
+                || (boundaryCapture && args.Length != 6 && !boundaryCameraSetter))
             {
                 Console.Error.WriteLine("       NativeFrameCapture.exe --capture <pid> <expected-start-utc-ticks> <output.json>");
                 Console.Error.WriteLine("           [--camera-input <native-frame.json>]");
+                Console.Error.WriteLine("       NativeFrameCapture.exe --trace-boundaries <pid> <expected-start-utc-ticks> <output.log> --camera-input <native-frame.json>");
+                Console.Error.WriteLine("       NativeFrameCapture.exe --capture-world-boundary <pid> <expected-start-utc-ticks> <output.json> --camera-input <world-frame.json>");
+                Console.Error.WriteLine("           [--set-camera] applies the selected camera and verifies its restoration after Present");
                 Console.Error.WriteLine("       NativeFrameCapture.exe --validate-camera-input <native-frame.json>");
                 Console.Error.WriteLine("       NativeFrameCapture.exe --self-check");
                 return 2;
@@ -2399,26 +2769,46 @@ internal static partial class NativeFrameCapture
             if (IntPtr.Size != 4) throw new InvalidOperationException("Run the x86 build only.");
             uint processId = UInt32.Parse(args[1], CultureInfo.InvariantCulture);
             long expectedStartTicks = Int64.Parse(args[2], CultureInfo.InvariantCulture);
-            SelectedCameraInput selectedCameraInput = hasCameraInput ? LoadSelectedCameraInput(args[5]) : null;
+            SelectedCameraInput traceCameraInput = boundaryTrace || boundaryCapture ? LoadSelectedCameraInput(args[5]) : null;
+            SelectedCameraInput selectedCameraInput = hasCameraInput ? LoadSelectedCameraInput(args[5])
+                : boundaryCameraSetter ? traceCameraInput : null;
             if (selectedCameraInput != null)
                 Log("validated selected camera input path=" + selectedCameraInput.Path
+                    + " inputKind=" + (selectedCameraInput.Synthetic ? "synthetic-camera-plan" : "native-capture")
                     + " matrixSha256=" + selectedCameraInput.MatrixSha256
                     + " viewport=" + String.Join(",", selectedCameraInput.Viewport)
                     + " near=" + selectedCameraInput.Near.ToString("R", CultureInfo.InvariantCulture)
                     + " far=" + selectedCameraInput.Far.ToString("R", CultureInfo.InvariantCulture)
                     + " fov=" + selectedCameraInput.FieldOfView.ToString("R", CultureInfo.InvariantCulture)
                     + " mode=" + selectedCameraInput.ProjectionMode);
+            if (traceCameraInput != null)
+                Log("validated boundary " + (boundaryCapture ? "capture" : "trace") + " projection selector path=" + traceCameraInput.Path
+                    + " inputKind=" + (traceCameraInput.Synthetic ? "synthetic-camera-plan" : "native-capture")
+                    + " matrixSha256=" + traceCameraInput.MatrixSha256
+                    + " viewport=" + String.Join(",", traceCameraInput.Viewport)
+                    + " near=" + traceCameraInput.Near.ToString("R", CultureInfo.InvariantCulture)
+                    + " far=" + traceCameraInput.Far.ToString("R", CultureInfo.InvariantCulture)
+                    + " fov=" + traceCameraInput.FieldOfView.ToString("R", CultureInfo.InvariantCulture)
+                    + " mode=" + traceCameraInput.ProjectionMode
+                    + " cameraMutation=" + boundaryCameraSetter);
             string repositoryRoot = FindRepositoryRoot();
             string expectedPath = Path.GetFullPath(VerifyScratchFiles(repositoryRoot));
             string outputPath = Path.GetFullPath(args[3]);
             string targetRoot = Path.GetFullPath(Path.Combine(repositoryRoot, "target")) + Path.DirectorySeparatorChar;
             if (!outputPath.StartsWith(targetRoot, StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("Output must be beneath the repository target directory: " + targetRoot);
-            if (!String.Equals(Path.GetExtension(outputPath), ".json", StringComparison.OrdinalIgnoreCase))
+            bool logOnly = boundaryTrace;
+            if (!String.Equals(Path.GetExtension(outputPath), logOnly ? ".log" : ".json", StringComparison.OrdinalIgnoreCase))
+            {
+                string expectedExtension = logOnly ? ".log" : ".json";
+                throw new InvalidOperationException("Output must use the " + expectedExtension + " extension for this mode.");
+            }
+            if (!boundaryTrace && !String.Equals(Path.GetExtension(outputPath), ".json", StringComparison.OrdinalIgnoreCase))
                 throw new InvalidOperationException("Capture output must use a .json extension so PNG/log paths cannot overlap it.");
             string outputPng = Path.ChangeExtension(outputPath, ".png");
-            string outputLog = Path.ChangeExtension(outputPath, ".log");
-            if (File.Exists(outputPath) || File.Exists(outputPng) || File.Exists(outputLog))
+            string outputLog = boundaryTrace ? outputPath : Path.ChangeExtension(outputPath, ".log");
+            if (File.Exists(outputPath) || (!logOnly && File.Exists(outputPng))
+                || (!boundaryTrace && File.Exists(outputLog)))
                 throw new InvalidOperationException("Output JSON, PNG, or log already exists; choose a fresh basename: " + outputPath);
             Directory.CreateDirectory(Path.GetDirectoryName(outputPath));
             _logPath = outputLog;
@@ -2441,7 +2831,8 @@ internal static partial class NativeFrameCapture
                 foreach (KeyValuePair<string, string> expected in ExpectedSha256)
                     Log("verified sha256 " + expected.Key + "=" + expected.Value);
                 return AttachForFrame(processId, expectedPath, expectedStartTicks, outputPath,
-                    selectedCameraInput, target, FrameCaptureTimeoutSeconds);
+                    selectedCameraInput, traceCameraInput, boundaryTrace, boundaryCapture, target,
+                    boundaryTrace ? BoundaryTraceTimeoutSeconds : boundaryCapture ? BoundaryTraceTimeoutSeconds : FrameCaptureTimeoutSeconds);
             }
         }
         catch (Exception exception)
@@ -2453,7 +2844,8 @@ internal static partial class NativeFrameCapture
     }
 
     private static int AttachForFrame(uint processId, string expectedPath, long expectedStartTicks,
-        string outputPath, SelectedCameraInput selectedCameraInput, Process identityProcess, int timeoutSeconds)
+        string outputPath, SelectedCameraInput selectedCameraInput, SelectedCameraInput traceCameraInput,
+        bool boundaryTrace, bool boundaryCapture, Process identityProcess, int timeoutSeconds)
     {
         const uint ProcessTerminate = 0x0001;
         const uint ProcessVmRead = 0x0010;
@@ -2478,6 +2870,15 @@ internal static partial class NativeFrameCapture
         bool processExitUnconfirmed = false;
         int detachError = 0;
         bool captured = false;
+        bool boundaryCaptureComplete = false;
+        bool boundaryCaptureSelected = false;
+        bool boundaryCaptureInvalidated = false;
+        bool boundaryCapturePixelsStaged = false;
+        bool boundaryCapturePresentVerified = false;
+        uint boundaryCaptureGeneration = 0;
+        uint boundaryCaptureThread = 0;
+        BoundaryTraceProgress trace = new BoundaryTraceProgress();
+        uint traceEventSequence = 0;
         SurfaceReadback completedSurface = null;
         FrameSnapshot completedFrame = null;
         RemoteReadbackSession completedReadback = null;
@@ -2495,8 +2896,11 @@ internal static partial class NativeFrameCapture
         BreakpointInfo projectionBreakpoint = null;
         BreakpointInfo returnBreakpoint = null;
         BreakpointInfo atmosphereBreakpoint = null;
+        BreakpointInfo beginSceneBreakpoint = null;
+        BreakpointInfo endSceneBreakpoint = null;
         BreakpointInfo fogConsumerBreakpoint = null;
         BreakpointInfo presentBreakpoint = null;
+        BreakpointInfo presentCompletionBreakpoint = null;
         BreakpointInfo missionBreakpoint = null;
         int missionProbeAttempts = 0;
         bool missionProbeFinished = false;
@@ -2512,6 +2916,7 @@ internal static partial class NativeFrameCapture
         const uint ProcessAccessForFrameCapture = ProcessTerminate | ProcessVmOperation | ProcessVmRead
             | ProcessVmWrite | ProcessQueryInformation | Synchronize;
         FrameSnapshot frame = new FrameSnapshot();
+        bool projectionSelectorMode = boundaryTrace || boundaryCapture;
         frame.SelectedCameraRequested = selectedCameraInput != null;
         SelectedCameraState selectedCamera = selectedCameraInput == null ? null
             : new SelectedCameraState { Input = selectedCameraInput };
@@ -2543,11 +2948,15 @@ internal static partial class NativeFrameCapture
             Log("DEBUG_ACCESS processMask=0x" + ProcessAccessForFrameCapture.ToString("X8")
                 + " threadContextMask=0x" + (ThreadGetContext | ThreadSetContext).ToString("X8")
                 + " remoteThreadCreation=false");
-            Log("frame capture attached; waiting for verified camera/projection/present boundaries for "
+            Log((boundaryTrace ? "boundary trace attached; waiting for verified world/cockpit/scene/Present events for "
+                    : boundaryCapture ? "boundary capture attached; waiting for selected projection/EndScene/Present for "
+                    : "frame capture attached; waiting for verified camera/projection/present boundaries for ")
                 + timeoutSeconds + " seconds");
 
-            while (!fatal && !CanStopCapture(captured, stopAfterAttempt, remote != null || cameraSetter != null,
-                    pendingStep != null, selectedCamera != null && selectedCamera.Applied && !selectedCamera.RestoreVerified)
+            while (!fatal && (boundaryTrace || boundaryCapture
+                    ? (!(trace.WorldReturnSeen || boundaryCaptureComplete) || remote != null || pendingStep != null || cameraSetter != null)
+                    : !CanStopCapture(captured, stopAfterAttempt, remote != null || cameraSetter != null,
+                        pendingStep != null, selectedCamera != null && selectedCamera.Applied && !selectedCamera.RestoreVerified))
                 && (DateTime.UtcNow < deadline || remote != null || cameraSetter != null || pendingStep != null
                     || selectedCamera != null && selectedCamera.Applied && !selectedCamera.RestoreVerified))
             {
@@ -2673,14 +3082,18 @@ internal static partial class NativeFrameCapture
                                 throw new InvalidOperationException("Terrain atmosphere phase boundary signature failed: " + atmosphereEvidence);
                             atmosphereBreakpoint = ArmBreakpoint(process, "Terrain.atmosphere-phase",
                                 unchecked(terrainBase + AtmospherePhaseRva), atmosphereByte);
-                            string fogConsumerEvidence;
-                            if (!VerifyNativeFogConsumerBoundary(process, imagePath, terrainBase,
-                                out fogConsumerOriginalByte, out fogConsumerEvidence))
-                                throw new InvalidOperationException("Terrain native fog consumer boundary signature failed: "
-                                    + fogConsumerEvidence);
-                            fogConsumerBoundaryVerified = true;
                             Log("Terrain verified base=0x" + terrainBase.ToString("X8") + " sha256=" + hash
-                                + " " + atmosphereEvidence + " nativeFogConsumer=" + fogConsumerEvidence);
+                                + " " + atmosphereEvidence + " phasePairingEnabled=" + projectionSelectorMode);
+                            if (!projectionSelectorMode)
+                            {
+                                string fogConsumerEvidence;
+                                if (!VerifyNativeFogConsumerBoundary(process, imagePath, terrainBase,
+                                    out fogConsumerOriginalByte, out fogConsumerEvidence))
+                                    throw new InvalidOperationException("Terrain native fog consumer boundary signature failed: "
+                                        + fogConsumerEvidence);
+                                fogConsumerBoundaryVerified = true;
+                                Log("Terrain nativeFogConsumer=" + fogConsumerEvidence);
+                            }
                         }
                         if (imagePath.Length != 0 && String.Equals(imagePath, NormalizePath(expectedIron3d), StringComparison.OrdinalIgnoreCase))
                         {
@@ -2688,6 +3101,13 @@ internal static partial class NativeFrameCapture
                             string hash = HashFile(loadedPath);
                             if (!String.Equals(hash, ExpectedSha256[Iron3dName], StringComparison.OrdinalIgnoreCase))
                                 throw new InvalidOperationException("Loaded iron3d hash mismatch: " + hash);
+                            if (projectionSelectorMode)
+                            {
+                                iron3dBase = imageBase;
+                                Log("iron3d verified sha256=" + hash + " mission-path probe disabled in boundary-trace mode");
+                            }
+                            else
+                            {
                             byte missionByte;
                             string missionEvidence;
                             if (!VerifyMissionIdentityBoundary(process, imageBase, out missionByte, out missionEvidence))
@@ -2696,6 +3116,7 @@ internal static partial class NativeFrameCapture
                             missionBreakpoint = ArmBreakpoint(process, "iron3d.mission-path-vtable-call",
                                 unchecked(imageBase + MissionVtableCallRva), missionByte);
                             Log("iron3d verified sha256=" + hash + " " + missionEvidence);
+                            }
                         }
                         if (imagePath.Length != 0 && String.Equals(imagePath, NormalizePath(expectedWorld3D), StringComparison.OrdinalIgnoreCase))
                         {
@@ -2713,17 +3134,17 @@ internal static partial class NativeFrameCapture
                                 throw new InvalidOperationException("World3D render-entry signature failed: " + renderEvidence);
                             if (!VerifyProjectionBoundary(process, imageBase, out projectionByte, out projectionEvidence))
                                 throw new InvalidOperationException("World3D projection signature failed: " + projectionEvidence);
-                            if (selectedCameraInput != null
+                                    if ((selectedCameraInput != null || boundaryTrace)
                                 && !VerifyRenderReturnBoundary(process, imageBase, out returnByte, out returnEvidence))
                                 throw new InvalidOperationException("World3D selected-camera restore boundary failed: " + returnEvidence);
                             world3dBase = imageBase;
                             cameraBreakpoint = ArmBreakpoint(process, "World3D.stdRenderGame", imageBase + RenderGameRva, renderByte);
                             projectionBreakpoint = ArmBreakpoint(process, "World3D.projection-snapshot", imageBase + ProjectionSnapshotRva, projectionByte);
-                            if (selectedCameraInput != null)
+                                    if (selectedCameraInput != null || boundaryTrace)
                                 returnBreakpoint = ArmBreakpoint(process, "World3D.stdRenderGame-restore-return",
                                     imageBase + RenderReturnRva, returnByte);
                             Log("World3D verified sha256=" + hash + " " + renderEvidence + " " + projectionEvidence
-                                + (selectedCameraInput == null ? "" : " " + returnEvidence));
+                                        + (selectedCameraInput == null && !boundaryTrace ? "" : " " + returnEvidence));
                         }
                         if (imagePath.Length != 0 && String.Equals(imagePath, NormalizePath(expectedNgi32), StringComparison.OrdinalIgnoreCase))
                         {
@@ -2739,6 +3160,32 @@ internal static partial class NativeFrameCapture
                             presentOriginalByte = presentByte;
                             presentBoundaryVerified = true;
                             Log("Ngi32 verified sha256=" + hash + " " + presentEvidence);
+                            if (boundaryCapture)
+                            {
+                                byte completionByte;
+                                string completionEvidence;
+                                if (!VerifyPresentCompletionBoundary(process, imageBase,
+                                    out completionByte, out completionEvidence))
+                                    throw new InvalidOperationException("Ngi32 Present completion signature failed: " + completionEvidence);
+                                presentCompletionBreakpoint = ArmBreakpoint(process, "Ngi32.present-completion",
+                                    unchecked(imageBase + PresentCompletionRva), completionByte);
+                                Log("Ngi32 Present completion verified " + completionEvidence);
+                            }
+                            if (projectionSelectorMode)
+                            {
+                                byte beginByte;
+                                byte endByte;
+                                string sceneEvidence;
+                                if (!VerifySceneStateBoundaries(process, imageBase, out beginByte, out endByte, out sceneEvidence))
+                                    throw new InvalidOperationException("Ngi32 BeginScene/EndScene state signatures failed: " + sceneEvidence);
+                                beginSceneBreakpoint = ArmBreakpoint(process, "Ngi32.begin-scene-state",
+                                    unchecked(imageBase + BeginSceneStateRva), beginByte);
+                                endSceneBreakpoint = ArmBreakpoint(process, "Ngi32.end-scene-state",
+                                    unchecked(imageBase + EndSceneStateRva), endByte);
+                                Log("Ngi32 scene boundaries verified " + sceneEvidence
+                                    + " beginPostCall=0x" + (imageBase + BeginSceneStateRva).ToString("X8")
+                                    + " endPostCall=0x" + (imageBase + EndSceneStateRva).ToString("X8"));
+                            }
                             if (IsMatchingPerspectiveFrame(frame, frame.CameraThreadId))
                                 EnsurePresentBreakpoint(process, ngiBase, frame, frame.CameraThreadId,
                                     presentOriginalByte, ref presentBreakpoint);
@@ -2772,16 +3219,24 @@ internal static partial class NativeFrameCapture
                             {
                                 string returnEvidence;
                                 bool returnContextOk = VerifyCameraSetterReturnContext(process, cameraSetter, out returnEvidence);
-                                byte[] actualMatrix = ReadCameraMatrix(process, cameraSetter.Camera);
-                                bool matrixMatches = ByteArraysEqual(actualMatrix, cameraSetter.MatrixBytes);
+                                byte[] actualMatrix = cameraSetter.Phase == CameraSetterPhase.Apply
+                                    ? ReadEffectiveWorldCameraMatrix(process, cameraSetter.Camera)
+                                    : ReadCameraMatrix(process, cameraSetter.Camera);
+                                bool matrixMatches = cameraSetter.Phase == CameraSetterPhase.Apply
+                                    ? CameraMatricesNearlyEqual(actualMatrix, cameraSetter.MatrixBytes)
+                                    : ByteArraysEqual(actualMatrix, cameraSetter.MatrixBytes);
+                                uint actualParent = ReadCameraParent(process, cameraSetter.Camera);
+                                bool parentMatches = selectedCamera != null
+                                    && actualParent == selectedCamera.OriginalParentPointer;
                                 string abiEvidence;
                                 uint transformInterface;
                                 bool abiStillValid = VerifyCameraSetterAbi(process, terrainBase,
                                     cameraSetter.Camera, out transformInterface, out abiEvidence);
                                 Log("CAMERA_SETTER_RETURN phase=" + cameraSetter.Phase
                                     + " contextOk=" + returnContextOk + " matrixMatches=" + matrixMatches
+                                    + " parent=0x" + actualParent.ToString("X8") + " parentMatches=" + parentMatches
                                     + " abiStillValid=" + abiStillValid + " " + returnEvidence + " " + abiEvidence);
-                                if (!returnContextOk || !matrixMatches || !abiStillValid)
+                                if (!returnContextOk || !matrixMatches || !parentMatches || !abiStillValid)
                                 {
                                     captureFailure = "Native camera setter could not be verified; the isolated scratch process will be stopped.";
                                     Log("CAMERA_SETTER_UNVERIFIED; terminating the verified scratch process before detach");
@@ -2793,7 +3248,7 @@ internal static partial class NativeFrameCapture
                                     CameraReadback appliedCamera = frame.Camera;
                                     if (selectedCamera == null || appliedCamera == null || !appliedCamera.LayoutVerified
                                         || appliedCamera.Camera != selectedCamera.CameraPointer
-                                        || !ByteArraysEqual(actualMatrix, selectedCamera.Input.MatrixBytes))
+                                        || !CameraMatricesNearlyEqual(actualMatrix, selectedCamera.Input.MatrixBytes))
                                     {
                                         captureFailure = "Native setter did not leave the requested selected-camera matrix in place.";
                                         Log("CAMERA_SETTER_APPLY_READBACK_FAILED; terminating the verified scratch process");
@@ -2802,13 +3257,23 @@ internal static partial class NativeFrameCapture
                                     }
                                     else
                                     {
-                                        appliedCamera.EntryMatrixBytes = (byte[])selectedCamera.Input.MatrixBytes.Clone();
-                                        appliedCamera.EntryMatrixSha256 = selectedCamera.Input.MatrixSha256;
+                                        byte[] appliedLocalMatrix = ReadCameraMatrix(process, cameraSetter.Camera);
+                                        appliedCamera.Parent = actualParent;
+                                        appliedCamera.Parented = actualParent != 0;
+                                        appliedCamera.EntryMatrixBytes = (byte[])appliedLocalMatrix.Clone();
+                                        appliedCamera.EntryMatrixSha256 = HashBytes(appliedLocalMatrix);
+                                        appliedCamera.Words = MatrixWords(appliedLocalMatrix);
+                                        appliedCamera.EntryEffectiveWorldMatrixBytes = (byte[])actualMatrix.Clone();
+                                        appliedCamera.EntryEffectiveWorldMatrixSha256 = HashBytes(actualMatrix);
+                                        appliedCamera.EffectiveWorldWords = MatrixWords(actualMatrix);
                                         appliedCamera.ProjectionMatrixSha256 = null;
+                                        appliedCamera.ProjectionEffectiveWorldMatrixSha256 = null;
                                         appliedCamera.CurrentAtProjectionVerified = false;
+                                        appliedCamera.EffectiveWorldAtProjectionVerified = false;
                                         appliedCamera.WordsChangedAtProjection = false;
-                                        appliedCamera.Words = (uint[])selectedCamera.Input.MatrixWords.Clone();
+                                        appliedCamera.EffectiveWorldChangedAtProjection = false;
                                         appliedCamera.MatrixFinite = true;
+                                        appliedCamera.EffectiveWorldMatrixFinite = true;
                                         selectedCamera.Applied = true;
                                         selectedCamera.RestoreDeadlineUtc = DateTime.UtcNow.AddSeconds(5);
                                         frame.SelectedCamera = selectedCamera;
@@ -2846,6 +3311,18 @@ internal static partial class NativeFrameCapture
                                         Log("CAMERA_SETTER_RESTORE_VERIFIED camera=0x" + selectedCamera.CameraPointer.ToString("X8")
                                             + " matrixSha256=" + selectedCamera.OriginalMatrixSha256
                                             + " returnBoundary=World3D+0x13D7B");
+                                        if (boundaryCapture && boundaryCapturePixelsStaged
+                                            && boundaryCapturePresentVerified
+                                            && !boundaryCaptureInvalidated
+                                            && frame.CameraGeneration == boundaryCaptureGeneration
+                                            && frame.CameraThreadId == boundaryCaptureThread)
+                                        {
+                                            boundaryCaptureComplete = true;
+                                            captured = true;
+                                            Log("BOUNDARY_CAPTURE_COMPLETE after verified selected-camera restore"
+                                                + " generation=" + boundaryCaptureGeneration
+                                                + " tid=" + boundaryCaptureThread);
+                                        }
                                         BeginSingleStep(process, eventTid, cameraSetter.ResumeBreakpoint,
                                             cameraSetter.OriginalContext, out pendingStep, cameraSetter.RearmOnStep);
                                         Log("SINGLE_STEP_STARTED boundary=" + cameraSetter.ResumeBreakpoint.Name + " tid=" + eventTid);
@@ -2873,12 +3350,54 @@ internal static partial class NativeFrameCapture
                                 uint data = remote.Acquire.DataBase;
                                 remote.Status = ReadU32Exact(process, data + RemoteDataStatusOffset);
                                 remote.GetHr = ReadU32Exact(process, data + RemoteDataGetHrOffset);
-                                remote.LockHr = ReadU32Exact(process, data + RemoteDataLockHrOffset);
                                 remote.ReleaseResult = ReadU32Exact(process, data + RemoteDataReleaseCountOffset);
+                                if (remote.SurfaceProbeOnly)
+                                {
+                                    remote.ProbeSurfacePointer = ReadU32Exact(process, data + RemoteDataSurfaceOffset);
+                                    remote.RemoteContextIntact = VerifyRemoteStubContext(process, remote,
+                                        unchecked(remote.Acquire.TrapAddress + 1), "after-get-render-target-and-release");
+                                    bool surfaceProbeSucceeded = remote.Status == 8
+                                        && unchecked((int)remote.GetHr) >= 0 && remote.ProbeSurfacePointer != 0;
+                                    Log("BOUNDARY_PROBE_DONE kind=" + (remote.ResumeBreakpoint == null ? "unknown" : remote.ResumeBreakpoint.Name)
+                                        + " status=" + remote.Status + " getHR=0x" + remote.GetHr.ToString("X8")
+                                        + " surface=0x" + remote.ProbeSurfacePointer.ToString("X8")
+                                        + " releaseResult=0x" + remote.ReleaseResult.ToString("X8")
+                                        + " device=0x" + ReadU32(process, unchecked(ngiBase + NgiDeviceGlobalRva)).ToString("X8")
+                                        + " lockCalled=false probeSucceeded=" + surfaceProbeSucceeded
+                                        + " contextIntact=" + remote.RemoteContextIntact);
+                                    if (!surfaceProbeSucceeded)
+                                    {
+                                        captureFailure = "D3D7 boundary surface probe did not return a valid render target (status "
+                                            + remote.Status + ", HRESULT 0x" + remote.GetHr.ToString("X8")
+                                            + ", surface 0x" + remote.ProbeSurfacePointer.ToString("X8") + ").";
+                                        Log("BOUNDARY_PROBE_FAILED " + captureFailure);
+                                    }
+                                    if (!remote.RemoteContextIntact)
+                                    {
+                                        captureFailure = "The read-only surface probe did not return with the original render-thread stack/context.";
+                                        Log("BOUNDARY_PROBE_CONTEXT_CORRUPTION; terminating the verified scratch process before detach");
+                                        fatal = true;
+                                    }
+                                    else
+                                    {
+                                        RearmSuspendedBreakpoints(process, remote);
+                                        BeginSingleStep(process, remote.ThreadId, remote.ResumeBreakpoint,
+                                            remote.OriginalContext, out pendingStep, true);
+                                        Log("SINGLE_STEP_STARTED boundary=" + remote.ResumeBreakpoint.Name + " tid=" + remote.ThreadId);
+                                        if (VirtualFreeEx(process, Ptr(remote.Region), UIntPtr.Zero, 0x8000))
+                                            Log("BOUNDARY_PROBE_REGION_FREED");
+                                        else Log("BOUNDARY_PROBE_REGION_FREE_FAILED error=" + Marshal.GetLastWin32Error());
+                                        remote = null;
+                                    }
+                                }
+                                else
+                                {
+                                remote.LockHr = ReadU32Exact(process, data + RemoteDataLockHrOffset);
                                 Log("REMOTE_ACQUIRE_DONE status=" + remote.Status + " getHR=0x" + remote.GetHr.ToString("X8")
                                     + " lockHR=0x" + remote.LockHr.ToString("X8") + " release=0x" + remote.ReleaseResult.ToString("X8"));
                                 remote.PresentStackArgumentsIntact = remote.PresentStackArgumentsIntact
-                                    && VerifyPresentStackArguments(process, remote, "after-get-render-target-and-lock");
+                                    && (!remote.ValidatePresentStackArguments
+                                        || VerifyPresentStackArguments(process, remote, "after-get-render-target-and-lock"));
                                 remote.RemoteContextIntact = remote.RemoteContextIntact
                                     && VerifyRemoteStubContext(process, remote, unchecked(remote.Acquire.TrapAddress + 1),
                                         "after-get-render-target-and-lock");
@@ -2890,8 +3409,10 @@ internal static partial class NativeFrameCapture
                                 }
                                 else if (!remote.PresentStackArgumentsIntact || !remote.RemoteContextIntact)
                                 {
-                                    captureFailure = "Present call stack arguments changed during D3D7 readback.";
-                                    Log("PRESENT_STACK_CORRUPTION_UNRECOVERED; terminating the verified scratch process before detach");
+                                    captureFailure = remote.ValidatePresentStackArguments
+                                        ? "Present call stack arguments changed during D3D7 readback."
+                                        : "The EndScene readback changed render-thread context or stack state.";
+                                    Log("REMOTE_READBACK_CONTEXT_CORRUPTION_UNRECOVERED; terminating the verified scratch process before detach");
                                     fatal = true;
                                 }
                                 else
@@ -2900,10 +3421,16 @@ internal static partial class NativeFrameCapture
                                         + " (GetRenderTarget 0x" + remote.GetHr.ToString("X8")
                                         + ", Lock 0x" + remote.LockHr.ToString("X8") + ").";
                                     Log("REMOTE_CAPTURE_RETRY " + captureFailure);
-                                    ResumeOriginalPresent(process, remote);
+                                    if (remote.SuspendedBreakpoints != null)
+                                    {
+                                        pendingStep = ResumeReadbackAfterRemote(process, remote);
+                                        Log("BOUNDARY_READBACK_REJECTED; resumed original boundary and will retry on a later selected frame");
+                                    }
+                                    else ResumeReadbackBoundary(process, remote);
                                     VirtualFreeEx(process, Ptr(remote.Region), UIntPtr.Zero, 0x8000);
                                     remote = null;
                                 }
+                            }
                             }
                             else
                             {
@@ -2915,7 +3442,8 @@ internal static partial class NativeFrameCapture
                                     + " release=0x" + remote.ReleaseResult.ToString("X8"));
                                 bool unlocked = remote.Status == 6 && unchecked((int)remote.UnlockHr) >= 0;
                                 remote.PresentStackArgumentsIntact = remote.PresentStackArgumentsIntact
-                                    && VerifyPresentStackArguments(process, remote, "after-unlock-and-release");
+                                    && (!remote.ValidatePresentStackArguments
+                                        || VerifyPresentStackArguments(process, remote, "after-unlock-and-release"));
                                 remote.RemoteContextIntact = remote.RemoteContextIntact
                                     && VerifyRemoteStubContext(process, remote, unchecked(remote.Cleanup.TrapAddress + 1),
                                         "after-unlock-and-release");
@@ -2932,8 +3460,10 @@ internal static partial class NativeFrameCapture
                                 }
                                 else if (!remote.PresentStackArgumentsIntact || !remote.RemoteContextIntact)
                                 {
-                                    captureFailure = "Present call stack arguments changed during D3D7 readback.";
-                                    Log("PRESENT_STACK_CORRUPTION_UNRECOVERED; terminating the verified scratch process before detach");
+                                    captureFailure = remote.ValidatePresentStackArguments
+                                        ? "Present call stack arguments changed during D3D7 readback."
+                                        : "The EndScene readback changed render-thread context or stack state.";
+                                    Log("REMOTE_READBACK_CONTEXT_CORRUPTION_UNRECOVERED; terminating the verified scratch process before detach");
                                     fatal = true;
                                 }
                                 else
@@ -2961,15 +3491,31 @@ internal static partial class NativeFrameCapture
                                     {
                                         captureFailure = remote.PixelFailure ?? "D3D7 Lock succeeded, but pixel rows were not available.";
                                         Log("FRAME_CAPTURE_NOT_USABLE " + captureFailure);
-                                        stopAfterAttempt = true;
+                                        if (!boundaryCapture) stopAfterAttempt = true;
                                     }
 
-                                    ResumeOriginalPresent(process, remote);
+                                    if (remote.SuspendedBreakpoints != null)
+                                    {
+                                        pendingStep = ResumeReadbackAfterRemote(process, remote);
+                                        if (outputStaged)
+                                        {
+                                            boundaryCapturePixelsStaged = true;
+                                            Log("BOUNDARY_CAPTURE_PIXELS_STAGED generation=" + remote.Generation
+                                                + " beforePresent=true rowsSha256=" + remote.Surface.Sha256);
+                                        }
+                                        else
+                                        {
+                                            boundaryCaptureSelected = false;
+                                            boundaryCaptureInvalidated = true;
+                                            if (!boundaryCapture) stopAfterAttempt = true;
+                                        }
+                                    }
+                                    else ResumeReadbackBoundary(process, remote);
                                     if (VirtualFreeEx(process, Ptr(remote.Region), UIntPtr.Zero, 0x8000))
                                         Log("REMOTE_READBACK_REGION_FREED");
                                     else Log("REMOTE_READBACK_REGION_FREE_FAILED error=" + Marshal.GetLastWin32Error());
                                     remote = null;
-                                    if (outputStaged)
+                                    if (outputStaged && !boundaryCapture)
                                     {
                                         captured = true;
                                         Log("FRAME_CAPTURE_CONTEXT_RESTORED; awaiting camera restore and safe detach before writing outputs");
@@ -2993,12 +3539,19 @@ internal static partial class NativeFrameCapture
                                 hitBreakpoint = returnBreakpoint;
                             else if (atmosphereBreakpoint != null && atmosphereBreakpoint.Armed && exceptionAddress == atmosphereBreakpoint.Address)
                                 hitBreakpoint = atmosphereBreakpoint;
+                            else if (beginSceneBreakpoint != null && beginSceneBreakpoint.Armed && exceptionAddress == beginSceneBreakpoint.Address)
+                                hitBreakpoint = beginSceneBreakpoint;
+                            else if (endSceneBreakpoint != null && endSceneBreakpoint.Armed && exceptionAddress == endSceneBreakpoint.Address)
+                                hitBreakpoint = endSceneBreakpoint;
                             else if (fogConsumerBreakpoint != null && fogConsumerBreakpoint.Armed && exceptionAddress == fogConsumerBreakpoint.Address)
                                 hitBreakpoint = fogConsumerBreakpoint;
                             else if (missionBreakpoint != null && missionBreakpoint.Armed && exceptionAddress == missionBreakpoint.Address)
                                 hitBreakpoint = missionBreakpoint;
                             else if (presentBreakpoint != null && presentBreakpoint.Armed && exceptionAddress == presentBreakpoint.Address)
                                 hitBreakpoint = presentBreakpoint;
+                            else if (presentCompletionBreakpoint != null && presentCompletionBreakpoint.Armed
+                                && exceptionAddress == presentCompletionBreakpoint.Address)
+                                hitBreakpoint = presentCompletionBreakpoint;
 
                             if (hitBreakpoint != null)
                             {
@@ -3011,6 +3564,29 @@ internal static partial class NativeFrameCapture
 
                                 if (hitBreakpoint == cameraBreakpoint)
                                 {
+                                    if (boundaryCapture && boundaryCaptureSelected && !boundaryCaptureComplete)
+                                    {
+                                        boundaryCaptureInvalidated = true;
+                                        boundaryCaptureSelected = false;
+                                        if (boundaryCapturePixelsStaged)
+                                        {
+                                            completedSurface = null;
+                                            completedFrame = null;
+                                            completedReadback = null;
+                                            boundaryCapturePixelsStaged = false;
+                                        }
+                                        Log("BOUNDARY_CAPTURE_ATTRIBUTION_INVALIDATED additional World3D.stdRenderGame entry"
+                                            + " selectedGeneration=" + boundaryCaptureGeneration
+                                            + " selectedTid=" + boundaryCaptureThread
+                                            + " nextGeneration=" + (frame.CameraGeneration + 1)
+                                            + " tid=" + eventTid);
+                                    }
+                                    if (boundaryTrace && trace.ObserveCameraEntry())
+                                    {
+                                        Log("TRACE_ATTRIBUTION_INVALIDATED additional World3D.stdRenderGame entry after selected world generation="
+                                            + trace.SelectedGeneration + " tid=" + eventTid
+                                            + " nextGeneration=" + (frame.CameraGeneration + 1));
+                                    }
                                     if (selectedCamera != null && selectedCamera.Applied)
                                     {
                                         if (!selectedCamera.PixelAttributionInvalidated)
@@ -3076,6 +3652,7 @@ internal static partial class NativeFrameCapture
                                                 selectedCamera.ReturnAddress = frame.Camera.ReturnAddress;
                                                 selectedCamera.OriginalMatrixBytes = (byte[])frame.Camera.EntryMatrixBytes.Clone();
                                                 selectedCamera.OriginalMatrixSha256 = frame.Camera.EntryMatrixSha256;
+                                                selectedCamera.OriginalParentPointer = frame.Camera.Parent;
                                                 frame.SelectedCamera = selectedCamera;
                                                 cameraSetter = StartCameraSetter(process, eventTid, terrainBase,
                                                     selectedCamera.CameraPointer, selectedCamera.Input.MatrixBytes,
@@ -3166,6 +3743,19 @@ internal static partial class NativeFrameCapture
                                     {
                                         frame.Projection = null;
                                         frame.ProjectionGeneration = 0;
+                                        if (boundaryTrace && trace.ProjectionSelected
+                                            && (frame.Camera == null || frame.CameraThreadId != eventTid
+                                                || frame.CameraGeneration != trace.SelectedGeneration
+                                                || eventTid != trace.SelectedThread))
+                                        {
+                                            trace.Invalidate();
+                                            Log("TRACE_ATTRIBUTION_INVALIDATED projection snapshot replaced selected camera pair"
+                                                + " selectedGeneration=" + trace.SelectedGeneration
+                                                + " selectedTid=" + trace.SelectedThread
+                                                + " currentGeneration=" + frame.CameraGeneration
+                                                + " currentCameraTid=" + frame.CameraThreadId
+                                                + " projectionTid=" + eventTid);
+                                        }
                                         if (frame.Camera != null && frame.CameraThreadId == eventTid && ngiBase != 0)
                                         {
                                             bool cameraWordsCurrent = RefreshCameraWordsAtProjection(process, frame.Camera,
@@ -3189,6 +3779,62 @@ internal static partial class NativeFrameCapture
                                             bool projectionMatchesInput = selectedCamera == null
                                                 || ProjectionMatchesCameraInput(frame.Projection, selectedCamera.Input)
                                                     && cameraMatrixMatchesInput;
+                                            bool traceProjectionMatchesInput = projectionSelectorMode && traceCameraInput != null
+                                                && ProjectionMatchesCameraInput(frame.Projection, traceCameraInput);
+                                            bool targetProjectionMatchesInput = projectionSelectorMode
+                                                ? traceProjectionMatchesInput : projectionMatchesInput;
+                                            if (boundaryTrace)
+                                            {
+                                                bool verifiedTracePair = frame.Camera != null
+                                                    && frame.CameraThreadId == eventTid
+                                                    && frame.ProjectionThreadId == eventTid
+                                                    && frame.CameraGeneration != 0
+                                                    && frame.ProjectionGeneration == frame.CameraGeneration
+                                                    && cameraWordsCurrent && frame.Projection.Verified
+                                                    && frame.Projection.Mode != 0;
+                                                bool accepted = trace.ObserveProjection(frame.CameraGeneration,
+                                                    frame.CameraThreadId, eventTid, verifiedTracePair,
+                                                    traceProjectionMatchesInput);
+                                                traceEventSequence++;
+                                                Log("TRACE_EVENT order=" + traceEventSequence
+                                                    + " kind=projection-snapshot tid=" + eventTid
+                                                    + " cameraGeneration=" + frame.CameraGeneration
+                                                    + " projectionGeneration=" + frame.ProjectionGeneration
+                                                    + " selectorMatch=" + traceProjectionMatchesInput
+                                                    + " verifiedPair=" + verifiedTracePair
+                                                    + " beginSceneSeen=" + trace.BeginSceneSeen
+                                                    + " accepted=" + accepted);
+                                            }
+                                            if (boundaryCapture)
+                                            {
+                                                bool sameProjectionInvocation = frame.Camera != null
+                                                    && frame.CameraThreadId == eventTid
+                                                    && frame.ProjectionThreadId == eventTid
+                                                    && frame.ProjectionGeneration == frame.CameraGeneration;
+                                                boundaryCaptureSelected = sameProjectionInvocation
+                                                    && cameraWordsCurrent && frame.Projection.Verified
+                                                    && frame.Projection.Mode != 0 && targetProjectionMatchesInput;
+                                                boundaryCaptureInvalidated = false;
+                                                boundaryCapturePixelsStaged = false;
+                                                boundaryCapturePresentVerified = false;
+                                                if (completedSurface != null)
+                                                {
+                                                    completedSurface = null;
+                                                    completedFrame = null;
+                                                    completedReadback = null;
+                                                }
+                                                if (boundaryCaptureSelected)
+                                                {
+                                                    boundaryCaptureGeneration = frame.CameraGeneration;
+                                                    boundaryCaptureThread = eventTid;
+                                                    Log("BOUNDARY_CAPTURE_PROJECTION_SELECTED generation=" + boundaryCaptureGeneration
+                                                        + " tid=" + boundaryCaptureThread
+                                                        + " renderer=0x" + frame.Projection.Renderer.ToString("X8")
+                                                        + " near=" + frame.Projection.Near.ToString("R", CultureInfo.InvariantCulture)
+                                                        + " far=" + frame.Projection.Far.ToString("R", CultureInfo.InvariantCulture)
+                                                        + " fov=" + frame.Projection.Fov.ToString("R", CultureInfo.InvariantCulture));
+                                                }
+                                            }
                                             if (selectedCamera != null)
                                             {
                                                 if (selectedCamera.Applied)
@@ -3221,10 +3867,10 @@ internal static partial class NativeFrameCapture
                                                 + " viewport=" + (frame.Projection.Viewport == null ? "unreadable" : String.Join(",", frame.Projection.Viewport))
                                                 + " mode=" + frame.Projection.Mode + " cameraWordsCurrent=" + cameraWordsCurrent
                                                 + " usable=" + (cameraWordsCurrent && frame.Projection.Verified && frame.Projection.Mode != 0
-                                                    && projectionMatchesInput)
+                                                    && targetProjectionMatchesInput)
                                                 + " rawWorldTime=0x" + frame.WorldGameTimeWord.ToString("X8"));
                                             if (cameraWordsCurrent && frame.Projection.Verified && frame.Projection.Mode != 0
-                                                && projectionMatchesInput && ngiBase != 0 && presentBoundaryVerified)
+                                                && targetProjectionMatchesInput && ngiBase != 0 && presentBoundaryVerified)
                                                 EnsurePresentBreakpoint(process, ngiBase, frame, eventTid,
                                                     presentOriginalByte, ref presentBreakpoint);
                                         }
@@ -3234,7 +3880,62 @@ internal static partial class NativeFrameCapture
                                 }
                                 else if (hitBreakpoint == returnBreakpoint)
                                 {
-                                    if (selectedCamera != null && selectedCamera.Applied && !selectedCamera.Restored)
+                                    if (boundaryTrace)
+                                    {
+                                        bool paired = frame.Camera != null && frame.Projection != null
+                                            && frame.CameraThreadId == eventTid && frame.ProjectionThreadId == eventTid
+                                            && frame.CameraGeneration != 0 && frame.ProjectionGeneration == frame.CameraGeneration
+                                            && frame.Projection.Verified && frame.Projection.Mode != 0;
+                                        bool selectedWorld = paired && traceCameraInput != null
+                                            && ProjectionMatchesCameraInput(frame.Projection, traceCameraInput);
+                                        uint renderer = frame.Projection == null ? 0 : frame.Projection.Renderer;
+                                        uint device = ngiBase == 0 ? 0 : ReadU32(process, unchecked(ngiBase + NgiDeviceGlobalRva));
+                                        uint sceneState = renderer == 0 ? 0
+                                            : (ReadU32(process, unchecked(renderer + 0x118)) >> 8) & 0xFF;
+                                        bool acceptedReturn = selectedWorld
+                                            && trace.ObserveWorldReturn(frame.CameraGeneration,
+                                                frame.CameraThreadId, eventTid);
+                                        traceEventSequence++;
+                                        Log("TRACE_EVENT order=" + traceEventSequence
+                                            + " kind=" + (selectedWorld ? "world-return" : "cockpit-candidate-return")
+                                            + " tid=" + eventTid + " cameraGeneration=" + frame.CameraGeneration
+                                            + " projectionGeneration=" + frame.ProjectionGeneration
+                                            + " paired=" + paired + " camera=0x"
+                                            + (frame.Camera == null ? 0 : frame.Camera.Camera).ToString("X8")
+                                            + " viewport=" + (frame.Projection == null || frame.Projection.Viewport == null
+                                                ? "unreadable" : String.Join(",", frame.Projection.Viewport))
+                                            + " near=" + (frame.Projection == null ? "unreadable" : frame.Projection.Near.ToString("R", CultureInfo.InvariantCulture))
+                                            + " far=" + (frame.Projection == null ? "unreadable" : frame.Projection.Far.ToString("R", CultureInfo.InvariantCulture))
+                                            + " fov=" + (frame.Projection == null ? "unreadable" : frame.Projection.Fov.ToString("R", CultureInfo.InvariantCulture))
+                                            + " renderer=0x" + renderer.ToString("X8")
+                                            + " beginSceneFlag=" + sceneState + " device=0x" + device.ToString("X8")
+                                            + " projectionSelectorMatch=" + selectedWorld
+                                            + " selectedGeneration=" + trace.SelectedGeneration
+                                            + " selectedThread=" + trace.SelectedThread
+                                            + " accepted=" + acceptedReturn);
+                                        if (acceptedReturn)
+                                        {
+                                            try
+                                            {
+                                                remote = StartRemoteSurfaceProbe(process, eventTid, ngiBase,
+                                                    returnBreakpoint, frame,
+                                                    new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint,
+                                                        returnBreakpoint, atmosphereBreakpoint, beginSceneBreakpoint,
+                                                        fogConsumerBreakpoint,
+                                                        endSceneBreakpoint, presentBreakpoint,
+                                                        presentCompletionBreakpoint, missionBreakpoint });
+                                            }
+                                            catch (Exception probeError)
+                                            {
+                                                captureFailure = "Could not query the active render target at the selected world return: "
+                                                    + probeError.Message;
+                                                Log("BOUNDARY_PROBE_START_FAILED kind=world-return " + probeError);
+                                                stopAfterAttempt = true;
+                                            }
+                                            stopAfterAttempt = true;
+                                        }
+                                    }
+                                    else if (selectedCamera != null && selectedCamera.Applied && !selectedCamera.Restored)
                                     {
                                         string returnEvidence;
                                         // World3D+0x13D47 repurposes ESI for registry traversal before this epilogue.
@@ -3253,9 +3954,11 @@ internal static partial class NativeFrameCapture
                                         {
                                         try
                                         {
-                                            byte[] selectedAtReturn = ReadCameraMatrix(process, selectedCamera.CameraPointer);
-                                            selectedCamera.MatrixIntactAtReturn = ByteArraysEqual(selectedAtReturn,
-                                                selectedCamera.Input.MatrixBytes);
+                                            byte[] selectedAtReturn = ReadEffectiveWorldCameraMatrix(process,
+                                                selectedCamera.CameraPointer);
+                                            uint parentAtReturn = ReadCameraParent(process, selectedCamera.CameraPointer);
+                                            selectedCamera.MatrixIntactAtReturn = parentAtReturn == selectedCamera.OriginalParentPointer
+                                                && CameraMatricesNearlyEqual(selectedAtReturn, selectedCamera.Input.MatrixBytes);
                                         }
                                         catch (Exception matrixReadError)
                                         {
@@ -3265,7 +3968,7 @@ internal static partial class NativeFrameCapture
                                         if (!selectedCamera.MatrixIntactAtReturn)
                                         {
                                             selectedCamera.PixelAttributionInvalidated = true;
-                                            selectedCamera.PixelAttributionFailure = "Selected camera matrix changed or became unreadable before its verified render return.";
+                                            selectedCamera.PixelAttributionFailure = "Selected camera effective-world matrix or parent changed before its verified render return.";
                                             captureFailure = selectedCamera.PixelAttributionFailure;
                                             stopAfterAttempt = true;
                                             Log("SELECTED_CAMERA_CHANGED_BEFORE_RETURN; restoring the original native matrix but rejecting pixels");
@@ -3305,6 +4008,128 @@ internal static partial class NativeFrameCapture
                                     catch (Exception atmosphereError)
                                     {
                                         Log("ATMOSPHERE_PHASE_SAMPLE_REJECTED tid=" + eventTid + " " + atmosphereError.Message);
+                                    }
+                                }
+                                else if (hitBreakpoint == beginSceneBreakpoint)
+                                {
+                                    if (projectionSelectorMode)
+                                    {
+                                        uint renderer = ReadU32(process, unchecked(ngiBase + NgiRendererGlobalRva));
+                                        uint state = renderer == 0 ? 0
+                                            : (ReadU32(process, unchecked(renderer + 0x118)) >> 8) & 0xFF;
+                                        uint device = ReadU32(process, unchecked(ngiBase + NgiDeviceGlobalRva));
+                                        uint beginHresult = BitConverter.ToUInt32(stoppedContext, ContextEaxOffset);
+                                        bool accepted = false;
+                                        if (boundaryTrace)
+                                        {
+                                            accepted = trace.ObserveBeginScene(frame.CameraGeneration,
+                                                frame.CameraThreadId, eventTid, state, beginHresult == 0);
+                                            traceEventSequence++;
+                                            Log("TRACE_EVENT order=" + traceEventSequence + " kind=begin-scene"
+                                                + " tid=" + eventTid + " cameraGeneration=" + frame.CameraGeneration
+                                                + " renderer=0x" + renderer.ToString("X8") + " beginSceneFlag=" + state
+                                                + " device=0x" + device.ToString("X8")
+                                                + " hresult=0x" + beginHresult.ToString("X8")
+                                                + " accepted=" + accepted);
+                                        }
+                                    }
+                                }
+                                else if (hitBreakpoint == endSceneBreakpoint)
+                                {
+                                    if (boundaryTrace)
+                                    {
+                                        uint renderer = ReadU32(process, unchecked(ngiBase + NgiRendererGlobalRva));
+                                        uint state = renderer == 0 ? 0
+                                            : (ReadU32(process, unchecked(renderer + 0x118)) >> 8) & 0xFF;
+                                        uint device = ReadU32(process, unchecked(ngiBase + NgiDeviceGlobalRva));
+                                        bool sameThread = eventTid == trace.SelectedThread
+                                            && frame.CameraThreadId == trace.SelectedThread;
+                                        bool sameGeneration = frame.CameraGeneration == trace.SelectedGeneration
+                                            && frame.CameraGeneration != 0;
+                                        bool sameRenderer = frame.Projection != null
+                                            && frame.Projection.Renderer == renderer;
+                                        uint endHresult = BitConverter.ToUInt32(stoppedContext, ContextEaxOffset);
+                                        bool accepted = trace.ObserveEndScene(frame.CameraGeneration,
+                                            frame.CameraThreadId, eventTid, state,
+                                            endHresult == 0 && sameRenderer);
+                                        traceEventSequence++;
+                                        Log("TRACE_EVENT order=" + traceEventSequence + " kind=end-scene"
+                                            + " tid=" + eventTid + " cameraGeneration=" + frame.CameraGeneration
+                                            + " renderer=0x" + renderer.ToString("X8") + " beginSceneFlag=" + state
+                                            + " device=0x" + device.ToString("X8")
+                                            + " hresult=0x" + endHresult.ToString("X8")
+                                            + " selectedProjectionSeen=" + trace.ProjectionSelected
+                                            + " sameSelectedThread=" + sameThread + " sameSelectedGeneration=" + sameGeneration
+                                            + " sameRenderer=" + sameRenderer + " accepted=" + accepted);
+                                        if (accepted)
+                                        {
+                                            try
+                                            {
+                                                remote = StartRemoteSurfaceProbe(process, eventTid, ngiBase,
+                                                    endSceneBreakpoint, frame,
+                                                    new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint,
+                                                        returnBreakpoint, atmosphereBreakpoint, beginSceneBreakpoint,
+                                                        endSceneBreakpoint,
+                                                        fogConsumerBreakpoint, presentBreakpoint,
+                                                        presentCompletionBreakpoint, missionBreakpoint });
+                                            }
+                                            catch (Exception probeError)
+                                            {
+                                                captureFailure = "Could not query the active render target at the first same-thread EndScene: "
+                                                    + probeError.Message;
+                                                Log("BOUNDARY_PROBE_START_FAILED kind=end-scene " + probeError);
+                                                stopAfterAttempt = true;
+                                            }
+                                        }
+                                    }
+                                    else if (boundaryCapture)
+                                    {
+                                        uint renderer = ngiBase == 0 ? 0
+                                            : ReadU32(process, unchecked(ngiBase + NgiRendererGlobalRva));
+                                        uint state = renderer == 0 ? UInt32.MaxValue
+                                            : (ReadU32(process, unchecked(renderer + 0x118)) >> 8) & 0xFF;
+                                        uint endHresult = BitConverter.ToUInt32(stoppedContext, ContextEaxOffset);
+                                        bool sameThread = eventTid == boundaryCaptureThread
+                                            && frame.CameraThreadId == boundaryCaptureThread
+                                            && frame.ProjectionThreadId == boundaryCaptureThread;
+                                        bool sameGeneration = frame.CameraGeneration == boundaryCaptureGeneration
+                                            && frame.ProjectionGeneration == boundaryCaptureGeneration;
+                                        bool sameRenderer = frame.Projection != null && frame.Projection.Renderer == renderer;
+                                        bool canRead = !boundaryCapturePixelsStaged
+                                            && CanReadSelectedBoundaryPixels(boundaryCaptureSelected,
+                                            boundaryCaptureInvalidated, sameThread, sameGeneration, sameRenderer,
+                                            state, endHresult);
+                                        Log("BOUNDARY_CAPTURE_ENDSCENE tid=" + eventTid
+                                            + " selected=" + boundaryCaptureSelected
+                                            + " invalidated=" + boundaryCaptureInvalidated
+                                            + " selectedGeneration=" + boundaryCaptureGeneration
+                                            + " cameraGeneration=" + frame.CameraGeneration
+                                            + " projectionGeneration=" + frame.ProjectionGeneration
+                                            + " sameThread=" + sameThread + " sameGeneration=" + sameGeneration
+                                            + " sameRenderer=" + sameRenderer + " beginSceneFlag=" + state
+                                            + " hresult=0x" + endHresult.ToString("X8")
+                                            + " readbackEligible=" + canRead);
+                                        if (canRead)
+                                        {
+                                            try
+                                            {
+                                                remote = StartRemoteBoundaryReadback(process, eventTid, ngiBase,
+                                                    endSceneBreakpoint, frame, outputPath,
+                                                    new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint,
+                                                        returnBreakpoint, atmosphereBreakpoint, beginSceneBreakpoint,
+                                                        endSceneBreakpoint,
+                                                        fogConsumerBreakpoint, presentBreakpoint,
+                                                        presentCompletionBreakpoint, missionBreakpoint });
+                                            }
+                                            catch (Exception readbackError)
+                                            {
+                                                captureFailure = "Could not read back the selected frame after EndScene: "
+                                                    + readbackError.Message;
+                                                Log("BOUNDARY_READBACK_START_FAILED " + readbackError);
+                                                boundaryCaptureInvalidated = true;
+                                                boundaryCaptureSelected = false;
+                                            }
+                                        }
                                     }
                                 }
                                 else if (hitBreakpoint == fogConsumerBreakpoint)
@@ -3395,8 +4220,85 @@ internal static partial class NativeFrameCapture
                                         + MissionProbeAttemptLimit + " found=" + found
                                         + " path=" + (missionPath ?? "unknown") + " evidence=" + missionEvidence);
                                 }
+                                else if (hitBreakpoint == presentCompletionBreakpoint)
+                                {
+                                    if (boundaryCapture)
+                                    {
+                                        bool sameThread = eventTid == boundaryCaptureThread
+                                            && frame.CameraThreadId == boundaryCaptureThread
+                                            && frame.ProjectionThreadId == boundaryCaptureThread;
+                                        bool sameGeneration = frame.CameraGeneration == boundaryCaptureGeneration
+                                            && frame.ProjectionGeneration == boundaryCaptureGeneration;
+                                        uint presentHresult = BitConverter.ToUInt32(stoppedContext, ContextEaxOffset);
+                                        bool validPresent = CanAcceptBoundaryPresent(boundaryCapturePixelsStaged,
+                                            boundaryCaptureInvalidated, sameThread, sameGeneration, presentHresult);
+                                        Log("BOUNDARY_CAPTURE_PRESENT_COMPLETE tid=" + eventTid
+                                            + " selectedGeneration=" + boundaryCaptureGeneration
+                                            + " cameraGeneration=" + frame.CameraGeneration
+                                            + " projectionGeneration=" + frame.ProjectionGeneration
+                                            + " pixelsStaged=" + boundaryCapturePixelsStaged
+                                            + " invalidated=" + boundaryCaptureInvalidated
+                                            + " sameThread=" + sameThread + " sameGeneration=" + sameGeneration
+                                            + " hresult=0x" + presentHresult.ToString("X8")
+                                            + " valid=" + validPresent);
+                                        if (validPresent)
+                                        {
+                                            boundaryCapturePresentVerified = true;
+                                            if (selectedCamera == null)
+                                            {
+                                                boundaryCaptureComplete = true;
+                                                captured = true;
+                                            }
+                                        }
+                                        else if (boundaryCapturePixelsStaged)
+                                        {
+                                            completedSurface = null;
+                                            completedFrame = null;
+                                            completedReadback = null;
+                                            boundaryCapturePixelsStaged = false;
+                                            boundaryCaptureSelected = false;
+                                            boundaryCaptureInvalidated = true;
+                                            captureFailure = "The readback did not reach a same-thread, same-generation successful Present.";
+                                        }
+                                    }
+                                }
                                 else if (hitBreakpoint == presentBreakpoint)
                                 {
+                                    if (boundaryTrace)
+                                    {
+                                        bool accepted = trace.ObservePresent(frame.CameraGeneration,
+                                            frame.CameraThreadId, eventTid);
+                                        traceEventSequence++;
+                                        bool sameGeneration = frame.CameraGeneration == trace.SelectedGeneration
+                                            && frame.CameraGeneration != 0;
+                                        Log("TRACE_EVENT order=" + traceEventSequence + " kind=present"
+                                            + " tid=" + eventTid + " cameraGeneration=" + frame.CameraGeneration
+                                            + " selectedGeneration=" + trace.SelectedGeneration
+                                            + " sameSelectedThread=" + (eventTid == trace.SelectedThread
+                                                && frame.CameraThreadId == trace.SelectedThread)
+                                            + " sameGeneration=" + sameGeneration
+                                            + " endSceneSeen=" + trace.EndSceneSeen
+                                            + " attributionInvalidated=" + trace.AttributionInvalidated
+                                            + " accepted=" + accepted);
+                                    }
+                                    else if (boundaryCapture)
+                                    {
+                                        bool sameThread = eventTid == boundaryCaptureThread
+                                            && frame.CameraThreadId == boundaryCaptureThread
+                                            && frame.ProjectionThreadId == boundaryCaptureThread;
+                                        bool sameGeneration = frame.CameraGeneration == boundaryCaptureGeneration
+                                            && frame.ProjectionGeneration == boundaryCaptureGeneration;
+                                        Log("BOUNDARY_CAPTURE_PRESENT_CALL tid=" + eventTid
+                                            + " selectedGeneration=" + boundaryCaptureGeneration
+                                            + " cameraGeneration=" + frame.CameraGeneration
+                                            + " projectionGeneration=" + frame.ProjectionGeneration
+                                            + " pixelsStaged=" + boundaryCapturePixelsStaged
+                                            + " invalidated=" + boundaryCaptureInvalidated
+                                            + " sameThread=" + sameThread + " sameGeneration=" + sameGeneration
+                                            + " resultPending=true");
+                                    }
+                                    else
+                                    {
                                     FinalizeNativeFogAtPresent(frame, eventTid);
                                     if (!RestoreBreakpointWhileStopped(process, fogConsumerBreakpoint))
                                         throw new InvalidOperationException("Could not restore the native fog consumer breakpoint before Present readback.");
@@ -3418,11 +4320,15 @@ internal static partial class NativeFrameCapture
                                         }
                                     }
                                     else Log("PRESENT_SKIPPED without matching verified perspective camera/projection");
+                                    }
                                 }
 
                                 if (remote == null && cameraSetter == null)
                                 {
                                     bool rearmAfterStep = hitBreakpoint != presentBreakpoint
+                                        || boundaryTrace && !trace.WorldReturnSeen
+                                        || boundaryCapture && !boundaryCaptureComplete;
+                                    rearmAfterStep = rearmAfterStep
                                         && !(hitBreakpoint == missionBreakpoint && missionProbeFinished);
                                     if (hitBreakpoint == fogConsumerBreakpoint)
                                         rearmAfterStep = !frame.NativeFogSamplingStopped
@@ -3500,7 +4406,9 @@ internal static partial class NativeFrameCapture
                     Log("NO_FRAME_CAPTURE bounded timeout at stopped debug event");
                     if (!RestoreArmedBreakpointsWhileStopped(process,
                         cameraBreakpoint, projectionBreakpoint, returnBreakpoint, atmosphereBreakpoint,
-                        fogConsumerBreakpoint, presentBreakpoint, missionBreakpoint))
+                        beginSceneBreakpoint,
+                        endSceneBreakpoint, fogConsumerBreakpoint, presentBreakpoint,
+                        presentCompletionBreakpoint, missionBreakpoint))
                     {
                         Log("FATAL_TIMEOUT_BREAKPOINT_RESTORE_FAILED; terminating own verified scratch process");
                         TerminateProcess(process, 0xE007);
@@ -3519,13 +4427,18 @@ internal static partial class NativeFrameCapture
                         || projectionBreakpoint != null && projectionBreakpoint.Armed
                         || returnBreakpoint != null && returnBreakpoint.Armed
                         || atmosphereBreakpoint != null && atmosphereBreakpoint.Armed
+                        || beginSceneBreakpoint != null && beginSceneBreakpoint.Armed
+                        || endSceneBreakpoint != null && endSceneBreakpoint.Armed
                         || fogConsumerBreakpoint != null && fogConsumerBreakpoint.Armed
                         || presentBreakpoint != null && presentBreakpoint.Armed
+                        || presentCompletionBreakpoint != null && presentCompletionBreakpoint.Armed
                         || missionBreakpoint != null && missionBreakpoint.Armed))
                 {
                     if (!RestoreArmedBreakpointsWhileStopped(process,
                         cameraBreakpoint, projectionBreakpoint, returnBreakpoint, atmosphereBreakpoint,
-                        fogConsumerBreakpoint, presentBreakpoint, missionBreakpoint))
+                        beginSceneBreakpoint,
+                        endSceneBreakpoint, fogConsumerBreakpoint, presentBreakpoint,
+                        presentCompletionBreakpoint, missionBreakpoint))
                     {
                         Log("FATAL_STOP_BREAKPOINT_RESTORE_FAILED; terminating own verified scratch process");
                         TerminateProcess(process, 0xE008);
@@ -3573,8 +4486,11 @@ internal static partial class NativeFrameCapture
                 || projectionBreakpoint != null && projectionBreakpoint.Armed
                 || returnBreakpoint != null && returnBreakpoint.Armed
                 || atmosphereBreakpoint != null && atmosphereBreakpoint.Armed
+                || beginSceneBreakpoint != null && beginSceneBreakpoint.Armed
+                || endSceneBreakpoint != null && endSceneBreakpoint.Armed
                 || fogConsumerBreakpoint != null && fogConsumerBreakpoint.Armed
                 || presentBreakpoint != null && presentBreakpoint.Armed
+                || presentCompletionBreakpoint != null && presentCompletionBreakpoint.Armed
                 || missionBreakpoint != null && missionBreakpoint.Armed))
             {
                 string state = remote != null ? "REMOTE_STUB_IN_FLIGHT" : (cameraSetter != null ? "CAMERA_SETTER_IN_FLIGHT"
@@ -3598,7 +4514,8 @@ internal static partial class NativeFrameCapture
                         ref eventOutstanding, ref outstandingPid, ref outstandingTid, ref outstandingCode,
                         ref outstandingContinueStatus, ref outstandingFileHandleClosed,
                         new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint, returnBreakpoint,
-                            atmosphereBreakpoint, fogConsumerBreakpoint, presentBreakpoint, missionBreakpoint },
+                            atmosphereBreakpoint, beginSceneBreakpoint, endSceneBreakpoint, fogConsumerBreakpoint,
+                            presentBreakpoint, presentCompletionBreakpoint, missionBreakpoint },
                         out drainEvidence))
                     {
                         processExited = true;
@@ -3666,7 +4583,8 @@ internal static partial class NativeFrameCapture
                                     ref eventOutstanding, ref outstandingPid, ref outstandingTid, ref outstandingCode,
                                     ref outstandingContinueStatus, ref outstandingFileHandleClosed,
                                     new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint, returnBreakpoint,
-                                        atmosphereBreakpoint, fogConsumerBreakpoint, presentBreakpoint, missionBreakpoint },
+                                        atmosphereBreakpoint, beginSceneBreakpoint, endSceneBreakpoint, fogConsumerBreakpoint,
+                                        presentBreakpoint, presentCompletionBreakpoint, missionBreakpoint },
                                     out drainEvidence))
                                 {
                                     processExited = true;
@@ -3702,15 +4620,57 @@ internal static partial class NativeFrameCapture
                 else Log("PROCESS_STATE_AFTER_DETACH unreadable error=" + Marshal.GetLastWin32Error());
             }
             breakpointsRestored = processExited || AreBreakpointsRestored(cameraBreakpoint,
-                projectionBreakpoint, returnBreakpoint, atmosphereBreakpoint,
-                fogConsumerBreakpoint, presentBreakpoint, missionBreakpoint);
+                projectionBreakpoint, returnBreakpoint, atmosphereBreakpoint, beginSceneBreakpoint,
+                endSceneBreakpoint, fogConsumerBreakpoint, presentBreakpoint,
+                presentCompletionBreakpoint, missionBreakpoint);
             Log("FINAL_BREAKPOINT_STATE restored=" + breakpointsRestored + " processExited=" + processExited);
             if (eventBuffer != IntPtr.Zero) Marshal.FreeHGlobal(eventBuffer);
             if (process != IntPtr.Zero) CloseHandle(process);
         }
 
+        if (boundaryTrace)
+        {
+            bool boundaryTraceComplete = trace.IsComplete(breakpointsRestored, detached,
+                fatal, processExited, captureFailure == null);
+            bool traceSequenceComplete = trace.IsSequenceComplete();
+            Log("BOUNDARY_TRACE_RESULT complete=" + boundaryTraceComplete
+                + " sequenceComplete=" + traceSequenceComplete
+                + " beginSceneSeen=" + trace.BeginSceneSeen
+                + " projectionSelected=" + trace.ProjectionSelected
+                + " endSceneSeen=" + trace.EndSceneSeen
+                + " presentSeen=" + trace.PresentSeen
+                + " worldReturnSeen=" + trace.WorldReturnSeen
+                + " attributionInvalidated=" + trace.AttributionInvalidated
+                + " breakpointsRestored=" + breakpointsRestored + " detached=" + detached);
+            if (!breakpointsRestored)
+                throw new InvalidOperationException("Boundary trace ended without confirmed breakpoint restoration; inspect its log.");
+            if (boundaryTraceComplete)
+            {
+                Console.WriteLine("boundary trace complete (no pixels captured): " + outputPath);
+                return 0;
+            }
+            if (captureFailure == null)
+                captureFailure = "Boundary trace did not reach the ordered BeginScene/projection/EndScene/Present/World3D-return sequence before its timeout.";
+        }
         if (!detached) throw new InvalidOperationException("Debug detach not confirmed; inspect the frame log before reuse.");
         if (fatal) throw new InvalidOperationException("The native frame capture could not recover safely; inspect the frame log.");
+        if (boundaryCapture)
+        {
+            Log("BOUNDARY_CAPTURE_RESULT complete=" + boundaryCaptureComplete
+                + " projectionSelected=" + boundaryCaptureSelected
+                + " pixelsStaged=" + boundaryCapturePixelsStaged
+                + " presentVerified=" + boundaryCapturePresentVerified
+                + " invalidated=" + boundaryCaptureInvalidated
+                + " generation=" + boundaryCaptureGeneration
+                + " tid=" + boundaryCaptureThread
+                + " breakpointsRestored=" + breakpointsRestored + " detached=" + detached);
+            if (!breakpointsRestored)
+                throw new InvalidOperationException("Boundary capture ended without confirmed breakpoint restoration; inspect its log.");
+            if (boundaryCaptureComplete && (!captured || !boundaryCapturePixelsStaged || !boundaryCapturePresentVerified))
+                throw new InvalidOperationException("Boundary capture completed without staged pixels and a verified Present boundary.");
+            if (!boundaryCaptureComplete && captureFailure == null)
+                captureFailure = "Boundary capture did not reach a matching successful EndScene/Present before timeout.";
+        }
         if (captured)
         {
             bool pngCreated = false;
@@ -3793,30 +4753,39 @@ internal static partial class NativeFrameCapture
 
     private static bool RestoreArmedBreakpointsWhileStopped(IntPtr process,
         BreakpointInfo cameraBreakpoint, BreakpointInfo projectionBreakpoint, BreakpointInfo returnBreakpoint,
-        BreakpointInfo atmosphereBreakpoint, BreakpointInfo fogConsumerBreakpoint,
-        BreakpointInfo presentBreakpoint, BreakpointInfo missionBreakpoint)
+        BreakpointInfo atmosphereBreakpoint, BreakpointInfo beginSceneBreakpoint, BreakpointInfo endSceneBreakpoint,
+        BreakpointInfo fogConsumerBreakpoint,
+        BreakpointInfo presentBreakpoint, BreakpointInfo presentCompletionBreakpoint,
+        BreakpointInfo missionBreakpoint)
     {
         return RestoreBreakpointWhileStopped(process, cameraBreakpoint)
             && RestoreBreakpointWhileStopped(process, projectionBreakpoint)
             && RestoreBreakpointWhileStopped(process, returnBreakpoint)
             && RestoreBreakpointWhileStopped(process, atmosphereBreakpoint)
+            && RestoreBreakpointWhileStopped(process, beginSceneBreakpoint)
+            && RestoreBreakpointWhileStopped(process, endSceneBreakpoint)
             && RestoreBreakpointWhileStopped(process, fogConsumerBreakpoint)
             && RestoreBreakpointWhileStopped(process, presentBreakpoint)
+            && RestoreBreakpointWhileStopped(process, presentCompletionBreakpoint)
             && RestoreBreakpointWhileStopped(process, missionBreakpoint);
     }
 
     private static bool AreBreakpointsRestored(BreakpointInfo cameraBreakpoint,
         BreakpointInfo projectionBreakpoint, BreakpointInfo returnBreakpoint,
-        BreakpointInfo atmosphereBreakpoint, BreakpointInfo fogConsumerBreakpoint,
-        BreakpointInfo presentBreakpoint,
+        BreakpointInfo atmosphereBreakpoint, BreakpointInfo beginSceneBreakpoint, BreakpointInfo endSceneBreakpoint,
+        BreakpointInfo fogConsumerBreakpoint,
+        BreakpointInfo presentBreakpoint, BreakpointInfo presentCompletionBreakpoint,
         BreakpointInfo missionBreakpoint)
     {
         return (cameraBreakpoint == null || !cameraBreakpoint.Armed)
             && (projectionBreakpoint == null || !projectionBreakpoint.Armed)
             && (returnBreakpoint == null || !returnBreakpoint.Armed)
             && (atmosphereBreakpoint == null || !atmosphereBreakpoint.Armed)
+            && (beginSceneBreakpoint == null || !beginSceneBreakpoint.Armed)
+            && (endSceneBreakpoint == null || !endSceneBreakpoint.Armed)
             && (fogConsumerBreakpoint == null || !fogConsumerBreakpoint.Armed)
             && (presentBreakpoint == null || !presentBreakpoint.Armed)
+            && (presentCompletionBreakpoint == null || !presentCompletionBreakpoint.Armed)
             && (missionBreakpoint == null || !missionBreakpoint.Armed);
     }
 

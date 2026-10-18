@@ -1,0 +1,14 @@
+{
+  "schema": "fparkan-legacy-camera-v1",
+  "capture_status": "native-frame-captured",
+  "render_input_usable": true,
+  "parented_camera": true,
+  "selector0_words": [1065353216, 0, 0, 1065353216, 0, 1065353216, 0, 1073741824, 0, 0, 1065353216, 1077936128, 0, 0, 0, 1065353216],
+  "effective_world_matrix_space": "world",
+  "effective_world_matrix_words": [1065353216, 0, 0, 1092616192, 0, 1065353216, 0, 1101004800, 0, 0, 1065353216, 1106247680, 0, 0, 0, 1065353216],
+  "viewport": [0, 0, 1280, 1024],
+  "near_plane": 0.5,
+  "far_plane": 700.0,
+  "field_of_view_radians": 1.04,
+  "projection_mode_byte": 1
+}

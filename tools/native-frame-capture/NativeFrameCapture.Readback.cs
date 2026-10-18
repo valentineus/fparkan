@@ -14,6 +14,7 @@ using System.Drawing.Imaging;
 internal static partial class NativeFrameCapture
 {
     private const uint NgiRendererGlobalRva = 0x3A460;
+    private const uint NgiLastErrorGlobalRva = 0x3A464;
     private const uint NgiDeviceGlobalRva = 0x3A488;
     private const uint NgiRendererVtableRva = 0x315E0;
     private const uint NgiWindowedPresentRva = 0x6E1B;
@@ -55,9 +56,12 @@ internal static partial class NativeFrameCapture
     private const uint CameraSetterMatrixOffset = 64;
     private const uint CameraTransformInterfaceVtableRva = 0x66558;
     private const uint CameraTransformSetterRva = 0x54C70;
+    private const uint CameraTransformGetterRva = 0x55110;
     private const uint CameraTransformInvalidatorRva = 0x55280;
     private const uint CameraTransformSetterSlotOffset = 0x1C;
+    private const uint CameraTransformGetterSlotOffset = 0x20;
     private const uint CameraTransformInvalidatorSlotOffset = 0x30;
+    private const uint CameraSetterWorldMatrixPointerOffset = 128;
     private const uint RenderFunctionStackFrameBytes = 0x70;
 
     [StructLayout(LayoutKind.Sequential)]
@@ -125,6 +129,8 @@ internal static partial class NativeFrameCapture
     private sealed class CameraReadback
     {
         public uint Camera;
+        public uint Parent;
+        public bool Parented;
         public uint Vtable;
         public uint TransformInterface;
         public uint TransformVtable;
@@ -133,13 +139,21 @@ internal static partial class NativeFrameCapture
         public uint ReturnAddress;
         public uint SelectorField;
         public uint[] Words;
+        public uint[] EffectiveWorldWords;
         public byte[] EntryMatrixBytes;
         public byte[] ProjectionMatrixBytes;
+        public byte[] EntryEffectiveWorldMatrixBytes;
+        public byte[] ProjectionEffectiveWorldMatrixBytes;
         public bool CurrentAtProjectionVerified;
+        public bool EffectiveWorldAtProjectionVerified;
         public bool WordsChangedAtProjection;
+        public bool EffectiveWorldChangedAtProjection;
         public string EntryMatrixSha256;
         public string ProjectionMatrixSha256;
+        public string EntryEffectiveWorldMatrixSha256;
+        public string ProjectionEffectiveWorldMatrixSha256;
         public bool MatrixFinite;
+        public bool EffectiveWorldMatrixFinite;
         public bool LayoutVerified;
         public string Failure;
     }
@@ -147,8 +161,13 @@ internal static partial class NativeFrameCapture
     private sealed class SelectedCameraInput
     {
         public string Path;
+        public bool Synthetic;
+        public bool ParentedCamera;
+        public bool UsedEffectiveWorldMatrix;
         public byte[] MatrixBytes;
         public uint[] MatrixWords;
+        public byte[] Selector0MatrixBytes;
+        public uint[] Selector0MatrixWords;
         public string MatrixSha256;
         public int[] Viewport;
         public float Near;
@@ -539,17 +558,92 @@ internal static partial class NativeFrameCapture
         return result;
     }
 
-    private static RemoteCode BuildCameraSetterStub(uint allocationBase, uint transformInterface)
+    // Boundary tracing only asks the already-active D3D7 device for its current
+    // render target, records the returned interface pointer, and balances the
+    // COM AddRef with Release. It deliberately never locks or reads pixels.
+    private static RemoteCode BuildSurfaceProbeStub(uint allocationBase, uint device)
     {
+        uint data = unchecked(allocationBase + RemoteDataOffset);
+        uint statusAddress = unchecked(data + RemoteDataStatusOffset);
+        uint getHrAddress = unchecked(data + RemoteDataGetHrOffset);
+        uint releaseAddress = unchecked(data + RemoteDataReleaseCountOffset);
+        uint surfaceAddress = unchecked(data + RemoteDataSurfaceOffset);
+        X86CodeBuilder code = new X86CodeBuilder();
+        code.Emit(0xBE); code.EmitU32(device); // mov esi, device
+        code.Emit(0x8B, 0x06);                 // mov eax, [esi]
+        code.Emit(0x8D, 0x3D); code.EmitU32(surfaceAddress); // lea edi, [surface]
+        code.PushReg(0x57); code.PushReg(0x56); // push output; push this
+        code.CallStdCall(8, 0xFF, 0x50, (byte)D3dDeviceGetRenderTargetOffset);
+        code.Emit(0xA3); code.EmitU32(getHrAddress); // mov [getHr], eax
+        code.Emit(0x85, 0xC0);                 // test eax,eax
+        code.JumpIf(0x89, "get_succeeded");   // jns
+        code.Emit(0xC7, 0x05); code.EmitU32(statusAddress); code.EmitU32(9);
+        code.Jump("release_surface");
+        code.Mark("get_succeeded");
+        code.Emit(0x8B, 0x35); code.EmitU32(surfaceAddress); // mov esi,[surface]
+        code.Emit(0x85, 0xF6);                 // test esi,esi
+        code.JumpIf(0x84, "no_surface");
+        code.Emit(0xC7, 0x05); code.EmitU32(statusAddress); code.EmitU32(8);
+        code.Jump("release_surface");
+        code.Mark("no_surface");
+        code.Emit(0xC7, 0x05); code.EmitU32(statusAddress); code.EmitU32(10);
+        code.Jump("stop");
+        code.Mark("release_surface");
+        code.Emit(0x8B, 0x35); code.EmitU32(surfaceAddress);
+        code.Emit(0x85, 0xF6);
+        code.JumpIf(0x84, "stop");
+        code.Emit(0x8B, 0x06);
+        code.PushReg(0x56);
+        code.CallStdCall(4, 0xFF, 0x50, (byte)DdSurfaceReleaseOffset);
+        code.Emit(0xA3); code.EmitU32(releaseAddress);
+        code.Mark("stop");
+        code.EmitTerminalInt3();
+        byte[] bytes = code.Finish();
+        code.AssertTerminalControlFlow(bytes, 6);
+        if (code.MaxCallStackBytes != 12 || bytes.Length > RemoteCodePage)
+            throw new InvalidOperationException("Surface probe stub has an unexpected stack footprint or size.");
+        RemoteCode result = new RemoteCode();
+        result.Base = allocationBase;
+        result.DataBase = data;
+        result.Bytes = bytes;
+        result.CallInstructionOffsets = code.CallInstructionOffsets;
+        result.MaxCallStackBytes = code.MaxCallStackBytes;
+        result.TrapAddress = unchecked(allocationBase + (uint)code.TerminalOffset);
+        return result;
+    }
+
+    private static byte CameraSetterMode(CameraSetterPhase phase)
+    {
+        // Native setter mode 2 treats the supplied matrix as world space and
+        // converts it relative to camera+0x0C. Restoring a captured +0x20
+        // selector-0 value must use local mode 1.
+        return phase == CameraSetterPhase.Apply ? (byte)2 : (byte)1;
+    }
+
+    private static RemoteCode BuildCameraSetterStub(uint allocationBase, uint transformInterface, byte mode)
+    {
+        if (mode != 1 && mode != 2)
+            throw new ArgumentOutOfRangeException("mode", "Only verified local and world camera setter modes are supported.");
         uint dataBase = unchecked(allocationBase + RemoteDataOffset);
         uint matrixAddress = unchecked(dataBase + CameraSetterMatrixOffset);
         X86CodeBuilder code = new X86CodeBuilder();
         code.Emit(0xBE); code.EmitU32(transformInterface); // mov esi, transform interface
         code.Emit(0x8B, 0x0E);                           // mov ecx, [esi] (verified vtable)
         code.PushImm32(matrixAddress);                   // argument 3: 64-byte transform
-        code.PushImm8(1);                                // argument 2: mode 1
+        code.PushImm8(mode);                             // argument 2: native transform space
         code.PushReg(0x56);                              // argument 1: this
         code.CallStdCall(12, 0xFF, 0x51, (byte)CameraTransformSetterSlotOffset);
+        if (mode == 2)
+        {
+            // Mode 2 stores a parent-relative local matrix and invalidates the
+            // effective-world cache at transformInterface+0x11C (camera+0x120). The selector-2 getter
+            // recomputes camera+0x60 before the caller verifies the new pose.
+            code.Emit(0x8B, 0x0E);                       // mov ecx, [esi] (verified vtable)
+            code.PushImm32(unchecked(dataBase + CameraSetterWorldMatrixPointerOffset));
+            code.PushImm8(2);                            // selector 2: effective world matrix
+            code.PushReg(0x56);                          // argument 1: transform interface
+            code.CallStdCall(12, 0xFF, 0x51, (byte)CameraTransformGetterSlotOffset);
+        }
         code.EmitTerminalInt3();
         byte[] bytes = code.Finish();
         code.AssertTerminalControlFlow(bytes, 0);
@@ -575,16 +669,19 @@ internal static partial class NativeFrameCapture
         bool modeRead = ReadExact(process, unchecked(camera + 0x1A0), modeBytes);
         uint transformVtable = ReadU32(process, transformInterface);
         uint setter = ReadU32(process, unchecked(transformVtable + CameraTransformSetterSlotOffset));
+        uint getter = ReadU32(process, unchecked(transformVtable + CameraTransformGetterSlotOffset));
         uint invalidate = ReadU32(process, unchecked(transformVtable + CameraTransformInvalidatorSlotOffset));
         bool valid = terrainBase != 0
             && primaryVtable == unchecked(terrainBase + ExternalCameraVtableRva)
             && transformVtable == unchecked(terrainBase + CameraTransformInterfaceVtableRva)
             && setter == unchecked(terrainBase + CameraTransformSetterRva)
+            && getter == unchecked(terrainBase + CameraTransformGetterRva)
             && invalidate == unchecked(terrainBase + CameraTransformInvalidatorRva)
             && selector == 0xFFFFFFFF && modeRead && modeBytes[0] == 0;
         evidence = "camera=0x" + camera.ToString("X8") + " primaryVtable=0x" + primaryVtable.ToString("X8")
             + " transform=0x" + transformInterface.ToString("X8") + " transformVtable=0x" + transformVtable.ToString("X8")
-            + " setter=0x" + setter.ToString("X8") + " invalidator=0x" + invalidate.ToString("X8")
+            + " setter=0x" + setter.ToString("X8") + " getter=0x" + getter.ToString("X8")
+            + " invalidator=0x" + invalidate.ToString("X8")
             + " selector=0x" + selector.ToString("X8")
             + " mode=" + (modeRead ? modeBytes[0].ToString(CultureInfo.InvariantCulture) : "unreadable")
             + " valid=" + valid;
@@ -603,8 +700,11 @@ internal static partial class NativeFrameCapture
         uint transformInterface;
         if (!VerifyCameraSetterAbi(process, terrainBase, camera, out transformInterface, out abiEvidence))
             throw new InvalidOperationException("Camera setter ABI refused: " + abiEvidence);
+        byte setterMode = CameraSetterMode(phase);
         Log("verified native camera setter ABI " + abiEvidence + " slot=+0x1C this=0x"
-            + transformInterface.ToString("X8") + " mode=1 matrixBytes=64 ret=0x0C");
+            + transformInterface.ToString("X8") + " mode=" + setterMode
+            + " matrixSpace=" + (phase == CameraSetterPhase.Apply ? "world" : "local")
+            + " matrixBytes=64 ret=0x0C");
 
         uint expectedEip = unchecked(resumeBreakpoint.Address + 1);
         uint originalEip = BitConverter.ToUInt32(originalContext, ContextEipOffset);
@@ -639,7 +739,7 @@ internal static partial class NativeFrameCapture
         {
             uint safeEsp = ComputeSafeNativeStackPointer(process, thread, originalContext);
             region = AllocateReadbackRegion(process);
-            RemoteCode code = BuildCameraSetterStub(region, transformInterface);
+            RemoteCode code = BuildCameraSetterStub(region, transformInterface, setterMode);
             WriteRemoteStub(process, code, false);
             UIntPtr written;
             if (!WriteProcessMemory(process, Ptr(unchecked(code.DataBase + CameraSetterMatrixOffset)), matrixBytes,
@@ -730,6 +830,46 @@ internal static partial class NativeFrameCapture
         if (!ReadExact(process, unchecked(camera + 0x20), matrix))
             throw new InvalidOperationException("Could not read back the native camera selector-0 matrix.");
         return matrix;
+    }
+
+    private static uint ReadCameraParent(IntPtr process, uint camera)
+    {
+        if (camera == 0 || camera > UInt32.MaxValue - 0x0C)
+            throw new InvalidOperationException("Camera pointer is outside the verified parent-field range.");
+        return ReadU32(process, unchecked(camera + 0x0C));
+    }
+
+    private static byte[] ReadEffectiveWorldCameraMatrix(IntPtr process, uint camera)
+    {
+        byte[] matrix = new byte[64];
+        if (camera == 0 || camera > UInt32.MaxValue - 0x60
+            || !ReadExact(process, unchecked(camera + 0x60), matrix))
+            throw new InvalidOperationException("Could not read the native effective-world camera matrix at camera+0x60.");
+        return matrix;
+    }
+
+    private static uint[] MatrixWords(byte[] matrixBytes)
+    {
+        if (matrixBytes == null || matrixBytes.Length != 64)
+            throw new ArgumentException("A camera matrix must contain exactly 64 bytes.", "matrixBytes");
+        uint[] words = new uint[16];
+        for (int i = 0; i < words.Length; i++)
+            words[i] = BitConverter.ToUInt32(matrixBytes, i * 4);
+        return words;
+    }
+
+    private static bool CameraMatricesNearlyEqual(byte[] left, byte[] right)
+    {
+        if (left == null || right == null || left.Length != 64 || right.Length != 64) return false;
+        const double absoluteTolerance = 0.001;
+        for (int i = 0; i < 16; i++)
+        {
+            float a = BitConverter.ToSingle(left, i * 4);
+            float b = BitConverter.ToSingle(right, i * 4);
+            if (!IsFinite(a) || !IsFinite(b) || Math.Abs((double)a - b) > absoluteTolerance)
+                return false;
+        }
+        return true;
     }
 
     private static bool CameraFunctionStackMatches(CameraSetterPhase phase, byte[] stackWords,
@@ -891,6 +1031,7 @@ internal static partial class NativeFrameCapture
             session.OriginalContext = originalContext;
             session.PresentStackArguments = presentStackArguments;
             session.PresentStackArgumentsIntact = true;
+            session.ValidatePresentStackArguments = true;
             session.RemoteContextIntact = true;
             session.PresentBreakpoint = present;
             session.Frame = frame;
@@ -905,6 +1046,188 @@ internal static partial class NativeFrameCapture
                 + " terminal=0x" + acquire.TrapAddress.ToString("X8") + " safeEsp=0x" + safeEsp.ToString("X8")
                 + " generation=" + session.Generation);
             SetFullX86Context(thread, ContextForRemoteCode(originalContext, acquire.Base, safeEsp));
+            return session;
+        }
+        catch
+        {
+            if (region != 0) VirtualFreeEx(process, Ptr(region), UIntPtr.Zero, 0x8000);
+            throw;
+        }
+        finally { CloseHandle(thread); }
+    }
+
+    private static RemoteReadbackSession StartRemoteBoundaryReadback(IntPtr process, uint threadId,
+        uint ngiBase, BreakpointInfo boundary, FrameSnapshot frame, string outputJson,
+        BreakpointInfo[] allBreakpoints)
+    {
+        uint device;
+        uint getRenderTarget;
+        string evidence;
+        if (!VerifyD3d7GetRenderTarget(process, ngiBase, out device, out getRenderTarget, out evidence))
+            throw new InvalidOperationException("D3D7 EndScene render-target readback was refused: " + evidence);
+        uint renderer = ReadU32Exact(process, unchecked(ngiBase + NgiRendererGlobalRva));
+        if (frame == null || frame.Projection == null || !frame.Projection.Verified
+            || frame.Projection.Renderer != renderer
+            || ReadU32Exact(process, renderer) != unchecked(ngiBase + NgiRendererVtableRva))
+            throw new InvalidOperationException("EndScene readback renderer changed since the selected projection snapshot.");
+        if (ReadU32Exact(process, unchecked(renderer + 0x114)) == 0)
+            throw new InvalidOperationException("Ngi32 is not in the verified windowed render-target path.");
+
+        IntPtr thread = OpenThread(ThreadGetContext | ThreadSetContext | ThreadQueryInformation, false, threadId);
+        if (thread == IntPtr.Zero)
+            throw new InvalidOperationException("OpenThread for selected EndScene readback failed: " + Marshal.GetLastWin32Error());
+        uint region = 0;
+        try
+        {
+            byte[] originalContext = GetFullX86Context(thread);
+            if (boundary == null || BitConverter.ToUInt32(originalContext, ContextEipOffset)
+                != unchecked(boundary.Address + 1))
+                throw new InvalidOperationException("Selected EndScene EIP did not match its verified post-call boundary.");
+            uint safeEsp = ComputeSafeNativeStackPointer(process, thread, originalContext);
+            region = AllocateReadbackRegion(process);
+            RemoteCode acquire = BuildReadbackStub(region, device, false);
+            WriteRemoteStub(process, acquire, true);
+            BreakpointInfo[] suspended;
+            if (!SuspendBreakpointsWhileStopped(process, allBreakpoints, out suspended))
+                throw new InvalidOperationException("Could not suspend every armed breakpoint before EndScene readback.");
+            RemoteReadbackSession session = new RemoteReadbackSession();
+            session.Acquire = acquire;
+            session.Region = region;
+            session.ThreadId = threadId;
+            session.SafeEsp = safeEsp;
+            session.OriginalContext = originalContext;
+            session.PresentStackArgumentsIntact = true;
+            session.ValidatePresentStackArguments = false;
+            session.RemoteContextIntact = true;
+            session.PresentBreakpoint = boundary;
+            session.ResumeBreakpoint = boundary;
+            session.SuspendedBreakpoints = suspended;
+            session.Frame = frame;
+            session.Generation = frame.CameraGeneration;
+            session.OutputJson = outputJson;
+            session.OutputPng = Path.ChangeExtension(outputJson, ".png");
+            session.DeadlineUtc = DateTime.UtcNow.AddSeconds(5);
+            session.Phase = RemoteReadbackPhase.Acquire;
+            session.PixelBoundary = "Ngi32 EndScene after selected World3D projection, before Present";
+            Log("BOUNDARY_READBACK_STARTED kind=" + boundary.Name + " tid=" + threadId
+                + " device=0x" + device.ToString("X8") + " renderer=0x" + renderer.ToString("X8")
+                + " generation=" + session.Generation + " stub=0x" + acquire.Base.ToString("X8")
+                + " suspendedBreakpoints=" + suspended.Length + " presentStackArgs=not-applicable");
+            SetFullX86Context(thread, ContextForRemoteCode(originalContext, acquire.Base, safeEsp));
+            return session;
+        }
+        catch
+        {
+            if (region != 0) VirtualFreeEx(process, Ptr(region), UIntPtr.Zero, 0x8000);
+            throw;
+        }
+        finally { CloseHandle(thread); }
+    }
+
+    private static bool SuspendBreakpointsWhileStopped(IntPtr process, BreakpointInfo[] candidates,
+        out BreakpointInfo[] suspended)
+    {
+        List<BreakpointInfo> active = new List<BreakpointInfo>();
+        if (candidates != null)
+            for (int i = 0; i < candidates.Length; i++)
+            {
+                BreakpointInfo breakpoint = candidates[i];
+                if (breakpoint == null || !breakpoint.Armed || active.Contains(breakpoint)) continue;
+                active.Add(breakpoint);
+                if (!WriteByte(process, breakpoint.Address, breakpoint.OriginalByte))
+                {
+                    bool rollbackSucceeded = true;
+                    foreach (BreakpointInfo suspendedBreakpoint in active)
+                    {
+                        if (!WriteByte(process, suspendedBreakpoint.Address, 0xCC))
+                        {
+                            rollbackSucceeded = false;
+                            Log("FATAL boundary probe could not roll back breakpoint suspension for "
+                                + suspendedBreakpoint.Name + " error=" + Marshal.GetLastWin32Error());
+                        }
+                        // Leave this true even after a failed write so final cleanup retries
+                        // restoring the original byte before any detach.
+                        suspendedBreakpoint.Armed = true;
+                    }
+                    suspended = active.ToArray();
+                    Log("BOUNDARY_PROBE_SUSPEND_FAILED name=" + breakpoint.Name
+                        + " rollbackSucceeded=" + rollbackSucceeded);
+                    return false;
+                }
+                breakpoint.Armed = false;
+                Log("BOUNDARY_PROBE_BREAKPOINT_SUSPENDED " + breakpoint.Name);
+            }
+        suspended = active.ToArray();
+        return true;
+    }
+
+    private static void RearmSuspendedBreakpoints(IntPtr process, RemoteReadbackSession session)
+    {
+        if (session == null || session.SuspendedBreakpoints == null) return;
+        foreach (BreakpointInfo breakpoint in session.SuspendedBreakpoints)
+        {
+            if (breakpoint == null || breakpoint == session.ResumeBreakpoint) continue;
+            if (!WriteByte(process, breakpoint.Address, 0xCC))
+                throw new InvalidOperationException("Could not re-arm suspended boundary probe breakpoint " + breakpoint.Name);
+            breakpoint.Armed = true;
+            Log("BOUNDARY_PROBE_BREAKPOINT_REARMED " + breakpoint.Name);
+        }
+        if (session.ResumeBreakpoint != null) session.ResumeBreakpoint.Armed = true;
+    }
+
+    private static RemoteReadbackSession StartRemoteSurfaceProbe(IntPtr process, uint threadId,
+        uint ngiBase, BreakpointInfo resumeBreakpoint, FrameSnapshot frame,
+        BreakpointInfo[] allBreakpoints)
+    {
+        uint device;
+        uint getRenderTarget;
+        string evidence;
+        if (!VerifyD3d7GetRenderTarget(process, ngiBase, out device, out getRenderTarget, out evidence))
+            throw new InvalidOperationException("D3D7 surface probe refused: " + evidence);
+        uint renderer = ReadU32Exact(process, unchecked(ngiBase + NgiRendererGlobalRva));
+        if (frame == null || frame.Projection == null || !frame.Projection.Verified
+            || frame.Projection.Renderer != renderer
+            || ReadU32Exact(process, renderer) != unchecked(ngiBase + NgiRendererVtableRva))
+            throw new InvalidOperationException("Surface probe renderer did not match the verified active projection snapshot.");
+        Log("BOUNDARY_PROBE_GET_RENDER_TARGET_ABI " + evidence + " renderer=0x" + renderer.ToString("X8")
+            + " beginScene=" + (ReadU32Exact(process, unchecked(renderer + 0x118)) >> 8 & 0xFF));
+
+        IntPtr thread = OpenThread(ThreadGetContext | ThreadSetContext | ThreadQueryInformation, false, threadId);
+        if (thread == IntPtr.Zero) throw new InvalidOperationException("OpenThread for D3D7 boundary probe failed: " + Marshal.GetLastWin32Error());
+        uint region = 0;
+        try
+        {
+            byte[] originalContext = GetFullX86Context(thread);
+            if (resumeBreakpoint == null || BitConverter.ToUInt32(originalContext, ContextEipOffset)
+                != unchecked(resumeBreakpoint.Address + 1))
+                throw new InvalidOperationException("Boundary probe EIP did not match the verified breakpoint.");
+            uint safeEsp = ComputeSafeNativeStackPointer(process, thread, originalContext);
+            region = AllocateReadbackRegion(process);
+            RemoteCode code = BuildSurfaceProbeStub(region, device);
+            WriteRemoteStub(process, code, true);
+            BreakpointInfo[] suspended;
+            if (!SuspendBreakpointsWhileStopped(process, allBreakpoints, out suspended))
+                throw new InvalidOperationException("Could not suspend every armed breakpoint before the read-only surface query.");
+            RemoteReadbackSession session = new RemoteReadbackSession();
+            session.Acquire = code;
+            session.Region = region;
+            session.ThreadId = threadId;
+            session.SafeEsp = safeEsp;
+            session.OriginalContext = originalContext;
+            session.RemoteContextIntact = true;
+            session.PresentBreakpoint = resumeBreakpoint;
+            session.ResumeBreakpoint = resumeBreakpoint;
+            session.SuspendedBreakpoints = suspended;
+            session.SurfaceProbeOnly = true;
+            session.Frame = frame;
+            session.Generation = frame.CameraGeneration;
+            session.DeadlineUtc = DateTime.UtcNow.AddSeconds(5);
+            session.Phase = RemoteReadbackPhase.Acquire;
+            SetFullX86Context(thread, ContextForRemoteCode(originalContext, code.Base, safeEsp));
+            Log("BOUNDARY_PROBE_STARTED kind=" + resumeBreakpoint.Name + " tid=" + threadId
+                + " device=0x" + device.ToString("X8") + " renderer=0x" + renderer.ToString("X8")
+                + " generation=" + session.Generation + " stub=0x" + code.Base.ToString("X8")
+                + " lockCalled=false");
             return session;
         }
         catch
@@ -1337,15 +1660,18 @@ internal static partial class NativeFrameCapture
             uint returnAddress = ReadU32(process, esp);
             uint camera = ReadU32(process, unchecked(esp + 4));
             uint vtable = ReadU32(process, camera);
+            uint parent = ReadCameraParent(process, camera);
             uint transformInterface = unchecked(camera + 4);
             uint transformVtable = ReadU32(process, transformInterface);
             uint selectorField = ReadU32(process, unchecked(camera + 0x10));
             byte[] modeBytes = new byte[1];
             byte cameraMode = ReadExact(process, unchecked(camera + 0x1A0), modeBytes) ? modeBytes[0] : (byte)0xFF;
             byte[] matrixBytes = new byte[64];
-            if (camera == 0 || !ReadExact(process, unchecked(camera + 0x20), matrixBytes))
+            byte[] effectiveWorldMatrixBytes = new byte[64];
+            if (camera == 0 || !ReadExact(process, unchecked(camera + 0x20), matrixBytes)
+                || !ReadExact(process, unchecked(camera + 0x60), effectiveWorldMatrixBytes))
             {
-                result.Failure = "World3D camera argument or 64-byte selector matrix was unreadable";
+                result.Failure = "World3D camera argument, selector-0 matrix, or effective-world matrix was unreadable";
                 return result;
             }
             uint[] words = new uint[16];
@@ -1355,6 +1681,15 @@ internal static partial class NativeFrameCapture
                 words[i] = BitConverter.ToUInt32(matrixBytes, i * 4);
                 if (!IsFinite(BitConverter.ToSingle(matrixBytes, i * 4))) matrixFinite = false;
             }
+            uint[] effectiveWorldWords = MatrixWords(effectiveWorldMatrixBytes);
+            bool effectiveWorldMatrixFinite = true;
+            for (int i = 0; i < effectiveWorldWords.Length; i++)
+                if (!IsFinite(BitConverter.ToSingle(effectiveWorldMatrixBytes, i * 4)))
+                    effectiveWorldMatrixFinite = false;
+            string worldMatrixFailure = null;
+            bool effectiveWorldMatrixRigid = effectiveWorldMatrixFinite
+                && IsOrthonormalAffineCamera(effectiveWorldMatrixBytes, out worldMatrixFailure);
+            if (!effectiveWorldMatrixFinite) worldMatrixFailure = "effective-world matrix contains a nonfinite value";
             uint expectedVtable = unchecked(terrainBase + ExternalCameraVtableRva);
             uint expectedTransformVtable = unchecked(terrainBase + 0x66558);
             uint setterSlot = ReadU32(process, unchecked(transformVtable + 0x1C));
@@ -1363,6 +1698,8 @@ internal static partial class NativeFrameCapture
                 && setterSlot == unchecked(terrainBase + 0x54C70)
                 && invalidateSlot == unchecked(terrainBase + 0x55280);
             result.Camera = camera;
+            result.Parent = parent;
+            result.Parented = parent != 0;
             result.Vtable = vtable;
             result.TransformInterface = transformInterface;
             result.TransformVtable = transformVtable;
@@ -1371,14 +1708,19 @@ internal static partial class NativeFrameCapture
             result.ReturnAddress = returnAddress;
             result.SelectorField = selectorField;
             result.Words = words;
+            result.EffectiveWorldWords = effectiveWorldWords;
             result.EntryMatrixBytes = (byte[])matrixBytes.Clone();
+            result.EntryEffectiveWorldMatrixBytes = (byte[])effectiveWorldMatrixBytes.Clone();
             result.EntryMatrixSha256 = HashBytes(matrixBytes);
+            result.EntryEffectiveWorldMatrixSha256 = HashBytes(effectiveWorldMatrixBytes);
             result.MatrixFinite = matrixFinite;
+            result.EffectiveWorldMatrixFinite = effectiveWorldMatrixRigid;
             result.LayoutVerified = terrainBase != 0 && vtable == expectedVtable
-                && setterAbiVerified && cameraMode == 0
+                && setterAbiVerified && cameraMode == 0 && effectiveWorldMatrixRigid
                 && selectorField == 0xFFFFFFFF && matrixFinite;
             if (!result.LayoutVerified)
-                result.Failure = "external camera primary/transform vtables, setter slots, normal mode, selector field, or matrix finite check failed";
+                result.Failure = "external camera primary/transform vtables, setter slots, normal mode, selector field, local matrix, or effective-world matrix check failed"
+                    + (effectiveWorldMatrixRigid ? "" : ": " + worldMatrixFailure);
             return result;
         }
         finally
@@ -1537,26 +1879,75 @@ internal static partial class NativeFrameCapture
     private static SelectedCameraInput ParseSelectedCameraJson(string json, string sourcePath)
     {
         Dictionary<string, object> root = ParseJsonObject(json);
-        bool renderInputUsable = RequiredJsonField(root, "render_input_usable") is bool
-            && (bool)RequiredJsonField(root, "render_input_usable");
+        object renderInputUsableValue;
+        bool renderInputUsable = root.TryGetValue("render_input_usable", out renderInputUsableValue)
+            && renderInputUsableValue is bool && (bool)renderInputUsableValue;
+        object syntheticCameraValue;
+        bool syntheticCamera = root.TryGetValue("synthetic_camera", out syntheticCameraValue)
+            && syntheticCameraValue is bool && (bool)syntheticCameraValue;
+        bool nativeCapture = String.Equals(JsonStringField(root, "capture_status"),
+            "native-frame-captured", StringComparison.Ordinal) && renderInputUsable;
         if (!String.Equals(JsonStringField(root, "schema"), "fparkan-legacy-camera-v1", StringComparison.Ordinal)
-            || !String.Equals(JsonStringField(root, "capture_status"), "native-frame-captured", StringComparison.Ordinal)
-            || !renderInputUsable)
-            throw new InvalidDataException("Camera input must be a usable fparkan-legacy-camera-v1 native capture.");
+            || (!nativeCapture && !syntheticCamera))
+            throw new InvalidDataException("Camera input must be a usable native capture or an explicitly marked synthetic camera with a verified projection tuple.");
 
         SelectedCameraInput input = new SelectedCameraInput();
         input.Path = Path.GetFullPath(sourcePath);
-        object[] words = JsonArrayField(root, "selector0_words");
-        if (words.Length != 16) throw new InvalidDataException("selector0_words must contain exactly 16 uint32 values.");
-        input.MatrixWords = new uint[16];
-        input.MatrixBytes = new byte[64];
-        for (int i = 0; i < words.Length; i++)
+        input.Synthetic = syntheticCamera;
+        object parentedValue;
+        if (root.TryGetValue("parented_camera", out parentedValue))
+        {
+            if (!(parentedValue is bool))
+                throw new InvalidDataException("parented_camera must be a boolean when present.");
+            input.ParentedCamera = (bool)parentedValue;
+        }
+
+        object[] localWords = JsonArrayField(root, "selector0_words");
+        if (localWords.Length != 16) throw new InvalidDataException("selector0_words must contain exactly 16 uint32 values.");
+        input.Selector0MatrixWords = new uint[16];
+        input.Selector0MatrixBytes = new byte[64];
+        for (int i = 0; i < localWords.Length; i++)
         {
             uint word;
-            if (!TryJsonUInt32(words[i], out word))
+            if (!TryJsonUInt32(localWords[i], out word))
                 throw new InvalidDataException("selector0_words contains a value outside uint32 range.");
-            input.MatrixWords[i] = word;
-            Buffer.BlockCopy(BitConverter.GetBytes(word), 0, input.MatrixBytes, i * 4, 4);
+            input.Selector0MatrixWords[i] = word;
+            Buffer.BlockCopy(BitConverter.GetBytes(word), 0, input.Selector0MatrixBytes, i * 4, 4);
+        }
+
+        object worldSpaceValue;
+        object worldWordsValue;
+        bool hasWorldSpace = root.TryGetValue("effective_world_matrix_space", out worldSpaceValue);
+        bool hasWorldWords = root.TryGetValue("effective_world_matrix_words", out worldWordsValue);
+        if (hasWorldSpace != hasWorldWords)
+            throw new InvalidDataException("effective_world_matrix_space and effective_world_matrix_words must be supplied together.");
+        if (hasWorldSpace)
+        {
+            string worldSpace = worldSpaceValue as string;
+            if (!String.Equals(worldSpace, "world", StringComparison.Ordinal))
+                throw new InvalidDataException("effective_world_matrix_space must be 'world'.");
+            IList worldWordList = worldWordsValue as IList;
+            if (worldWordList == null || worldWordList.Count != 16)
+                throw new InvalidDataException("effective_world_matrix_words must contain exactly 16 uint32 values.");
+            input.MatrixWords = new uint[16];
+            input.MatrixBytes = new byte[64];
+            for (int i = 0; i < 16; i++)
+            {
+                uint word;
+                if (!TryJsonUInt32(worldWordList[i], out word))
+                    throw new InvalidDataException("effective_world_matrix_words contains a value outside uint32 range.");
+                input.MatrixWords[i] = word;
+                Buffer.BlockCopy(BitConverter.GetBytes(word), 0, input.MatrixBytes, i * 4, 4);
+            }
+            input.UsedEffectiveWorldMatrix = true;
+        }
+        else
+        {
+            if (input.ParentedCamera)
+                throw new InvalidDataException("A parented camera requires its effective world matrix; selector0_words is local space.");
+            input.MatrixWords = (uint[])input.Selector0MatrixWords.Clone();
+            input.MatrixBytes = (byte[])input.Selector0MatrixBytes.Clone();
+            input.UsedEffectiveWorldMatrix = false;
         }
         string matrixFailure;
         if (!IsOrthonormalAffineCamera(input.MatrixBytes, out matrixFailure))
@@ -1628,11 +2019,49 @@ internal static partial class NativeFrameCapture
             + "\"viewport\":[0,0,1280,1024],\"near_plane\":0.5,\"far_plane\":700,"
             + "\"field_of_view_radians\":1.04,\"projection_mode_byte\":1}";
         SelectedCameraInput parsed = ParseSelectedCameraJson(valid, "input.json");
-        if (parsed.MatrixBytes.Length != 64 || parsed.Viewport[2] != 1280 || parsed.MatrixSha256.Length != 64)
+        if (parsed.MatrixBytes.Length != 64 || parsed.Selector0MatrixBytes.Length != 64
+            || parsed.Viewport[2] != 1280 || parsed.MatrixSha256.Length != 64
+            || parsed.UsedEffectiveWorldMatrix || parsed.MatrixWords[3] != parsed.Selector0MatrixWords[3])
             throw new InvalidOperationException("Camera JSON parser self-check failed on a valid rigid transform.");
+        string parentedWorld = valid.Replace("\"viewport\":",
+            "\"parented_camera\":true,\"effective_world_matrix_space\":\"world\","
+            + "\"effective_world_matrix_words\":[1065353216,0,0,1092616192,0,1065353216,0,1101004800,"
+            + "0,0,1065353216,1106247680,0,0,0,1065353216],\"viewport\":");
+        SelectedCameraInput parsedParentedWorld = ParseSelectedCameraJson(parentedWorld, "parented.json");
+        if (!parsedParentedWorld.ParentedCamera || !parsedParentedWorld.UsedEffectiveWorldMatrix
+            || parsedParentedWorld.MatrixWords[3] != 1092616192
+            || parsedParentedWorld.Selector0MatrixWords[3] != 1065353216)
+            throw new InvalidOperationException("Camera JSON parser did not prefer the effective world matrix while preserving selector-0 local words.");
+        if (CameraMatricesNearlyEqual(parsedParentedWorld.MatrixBytes,
+                parsedParentedWorld.Selector0MatrixBytes)
+            || parsedParentedWorld.Selector0MatrixWords[3] != 1065353216)
+            throw new InvalidOperationException("Camera setter self-check did not keep the original local matrix distinct for restore.");
+        bool rejected;
+        string parentedWithoutWorld = valid.Replace("\"viewport\":", "\"parented_camera\":true,\"viewport\":");
+        rejected = false;
+        try { ParseSelectedCameraJson(parentedWithoutWorld, "bad-parented.json"); }
+        catch (InvalidDataException) { rejected = true; }
+        if (!rejected) throw new InvalidOperationException("Camera JSON parser accepted a parented camera without an effective world matrix.");
+        string wrongWorldSpace = parentedWorld.Replace("\"effective_world_matrix_space\":\"world\"",
+            "\"effective_world_matrix_space\":\"local\"");
+        rejected = false;
+        try { ParseSelectedCameraJson(wrongWorldSpace, "bad-space.json"); }
+        catch (InvalidDataException) { rejected = true; }
+        if (!rejected) throw new InvalidOperationException("Camera JSON parser accepted a non-world effective matrix marker.");
+        string synthetic = valid.Replace("\"capture_status\":\"native-frame-captured\",",
+                "\"capture_status\":\"synthetic-camera-plan\",\"synthetic_camera\":true,")
+            .Replace("\"render_input_usable\":true,", "");
+        SelectedCameraInput parsedSynthetic = ParseSelectedCameraJson(synthetic, "synthetic-input.json");
+        if (!parsedSynthetic.Synthetic || parsedSynthetic.ProjectionMode != 1)
+            throw new InvalidOperationException("Camera JSON parser failed to preserve explicit synthetic-camera provenance.");
+        string unmarkedSynthetic = synthetic.Replace("\"synthetic_camera\":true", "\"synthetic_camera\":false");
+        rejected = false;
+        try { ParseSelectedCameraJson(unmarkedSynthetic, "bad.json"); }
+        catch (InvalidDataException) { rejected = true; }
+        if (!rejected) throw new InvalidOperationException("Camera JSON parser accepted an unmarked synthetic camera plan.");
         string zeroMatrix = valid.Replace("1065353216,0,0,1065353216,0,1065353216,0,1073741824,0,0,1065353216,1077936128,0,0,0,1065353216",
             "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0");
-        bool rejected = false;
+        rejected = false;
         try { ParseSelectedCameraJson(zeroMatrix, "bad.json"); }
         catch (InvalidDataException) { rejected = true; }
         if (!rejected) throw new InvalidOperationException("Camera JSON parser accepted a singular all-zero matrix.");
@@ -1664,15 +2093,20 @@ internal static partial class NativeFrameCapture
 
         uint vtable = ReadU32(process, camera.Camera);
         uint selectorField = ReadU32(process, unchecked(camera.Camera + 0x10));
+        uint parent = ReadCameraParent(process, camera.Camera);
         uint expectedVtable = unchecked(terrainBase + ExternalCameraVtableRva);
         byte[] current = new byte[64];
-        if (vtable != expectedVtable || selectorField != 0xFFFFFFFF
-            || !ReadExact(process, unchecked(camera.Camera + 0x20), current))
+        byte[] effectiveWorldCurrent = new byte[64];
+        if (vtable != expectedVtable || selectorField != 0xFFFFFFFF || parent != camera.Parent
+            || !ReadExact(process, unchecked(camera.Camera + 0x20), current)
+            || !ReadExact(process, unchecked(camera.Camera + 0x60), effectiveWorldCurrent))
         {
             camera.CurrentAtProjectionVerified = false;
-            camera.Failure = "camera pointer, vtable, selector, or matrix changed before projection";
+            camera.EffectiveWorldAtProjectionVerified = false;
+            camera.Failure = "camera pointer, parent, vtable, selector, local matrix, or world matrix changed before projection";
             Log("CAMERA_MATRIX_AT_PROJECTION_REJECTED generation=" + generation
                 + " vtable=0x" + vtable.ToString("X8") + " selector=0x" + selectorField.ToString("X8")
+                + " parent=0x" + parent.ToString("X8") + " expectedParent=0x" + camera.Parent.ToString("X8")
                 + " expectedVtable=0x" + expectedVtable.ToString("X8"));
             return false;
         }
@@ -1687,22 +2121,54 @@ internal static partial class NativeFrameCapture
         if (!finite)
         {
             camera.CurrentAtProjectionVerified = false;
+            camera.EffectiveWorldAtProjectionVerified = false;
             camera.Failure = "camera matrix contains a non-finite value at projection boundary";
             Log("CAMERA_MATRIX_AT_PROJECTION_REJECTED generation=" + generation + " nonFinite=true");
             return false;
         }
 
+        uint[] effectiveWorldWords = MatrixWords(effectiveWorldCurrent);
+        bool effectiveWorldFinite = true;
+        for (int i = 0; i < effectiveWorldWords.Length; i++)
+            if (!IsFinite(BitConverter.ToSingle(effectiveWorldCurrent, i * 4)))
+                effectiveWorldFinite = false;
+        string worldFailure = null;
+        bool effectiveWorldRigid = effectiveWorldFinite
+            && IsOrthonormalAffineCamera(effectiveWorldCurrent, out worldFailure);
+        if (!effectiveWorldFinite) worldFailure = "effective-world matrix contains a nonfinite value";
+        if (!effectiveWorldRigid)
+        {
+            camera.CurrentAtProjectionVerified = false;
+            camera.EffectiveWorldAtProjectionVerified = false;
+            camera.Failure = "effective-world matrix failed validation at projection: " + worldFailure;
+            Log("CAMERA_WORLD_MATRIX_AT_PROJECTION_REJECTED generation=" + generation + " reason=" + worldFailure);
+            return false;
+        }
+
         bool changed = !ByteArraysEqual(camera.EntryMatrixBytes, current);
+        bool effectiveWorldChanged = !ByteArraysEqual(camera.EntryEffectiveWorldMatrixBytes, effectiveWorldCurrent);
         camera.Vtable = vtable;
         camera.SelectorField = selectorField;
+        camera.Parent = parent;
+        camera.Parented = parent != 0;
         camera.Words = words;
+        camera.EffectiveWorldWords = effectiveWorldWords;
         camera.ProjectionMatrixBytes = (byte[])current.Clone();
+        camera.ProjectionEffectiveWorldMatrixBytes = (byte[])effectiveWorldCurrent.Clone();
         camera.MatrixFinite = true;
+        camera.EffectiveWorldMatrixFinite = true;
         camera.CurrentAtProjectionVerified = true;
+        camera.EffectiveWorldAtProjectionVerified = true;
         camera.WordsChangedAtProjection = changed;
+        camera.EffectiveWorldChangedAtProjection = effectiveWorldChanged;
         camera.ProjectionMatrixSha256 = HashBytes(current);
+        camera.ProjectionEffectiveWorldMatrixSha256 = HashBytes(effectiveWorldCurrent);
         Log("CAMERA_MATRIX_AT_PROJECTION generation=" + generation + " verified=true changedSinceEntry=" + changed
             + " entrySha256=" + camera.EntryMatrixSha256 + " projectionSha256=" + camera.ProjectionMatrixSha256);
+        Log("CAMERA_WORLD_MATRIX_AT_PROJECTION generation=" + generation + " verified=true"
+            + " parent=0x" + parent.ToString("X8") + " changedSinceEntry=" + effectiveWorldChanged
+            + " entrySha256=" + camera.EntryEffectiveWorldMatrixSha256
+            + " projectionSha256=" + camera.ProjectionEffectiveWorldMatrixSha256);
         return true;
     }
 
@@ -1725,7 +2191,20 @@ internal static partial class NativeFrameCapture
             throw new InvalidOperationException("DDLOCK flag self-check failed.");
         RemoteCode acquire = BuildReadbackStub(0x10000000, 0x20000000, false);
         RemoteCode cleanup = BuildReadbackStub(0x10000000, 0, true);
-        RemoteCode cameraSetter = BuildCameraSetterStub(0x30000000, 0x40000000);
+        RemoteCode surfaceProbe = BuildSurfaceProbeStub(0x18000000, 0x28000000);
+        RemoteCode cameraSetterApply = BuildCameraSetterStub(0x30000000, 0x40000000, 2);
+        RemoteCode cameraSetterRestore = BuildCameraSetterStub(0x31000000, 0x40000000, 1);
+        int[] cameraApplyCalls = cameraSetterApply.CallInstructionOffsets;
+        int[] cameraRestoreCalls = cameraSetterRestore.CallInstructionOffsets;
+        int effectiveWorldGetterCall = cameraApplyCalls != null && cameraApplyCalls.Length > 1
+            ? cameraApplyCalls[1] : -1;
+        bool effectiveWorldGetterArgumentsMatch = effectiveWorldGetterCall >= 8
+            && cameraSetterApply.Bytes[effectiveWorldGetterCall - 1] == 0x56
+            && cameraSetterApply.Bytes[effectiveWorldGetterCall - 2] == 2
+            && cameraSetterApply.Bytes[effectiveWorldGetterCall - 3] == 0x6A
+            && cameraSetterApply.Bytes[effectiveWorldGetterCall - 8] == 0x68
+            && BitConverter.ToUInt32(cameraSetterApply.Bytes, effectiveWorldGetterCall - 7)
+                == 0x30000000 + RemoteDataOffset + CameraSetterWorldMatrixPointerOffset;
         string[] d3d7DeviceVtable = new string[] {
             "QueryInterface", "AddRef", "Release", "GetCaps", "EnumTextureFormats", "BeginScene", "EndScene",
             "GetDirect3D", "SetRenderTarget", "GetRenderTarget", "Clear", "SetTransform", "GetTransform",
@@ -1759,11 +2238,28 @@ internal static partial class NativeFrameCapture
             || Marshal.OffsetOf(typeof(X86ContextLayout), "Esp").ToInt32() != ContextEspOffset
             || ContextAllX86 != 0x0001003F || acquire.Bytes.Length == 0 || cleanup.Bytes.Length == 0
             || acquire.MaxCallStackBytes != RemoteStubMaxCallStackBytes || cleanup.MaxCallStackBytes != 12
-            || cameraSetter.Bytes.Length == 0 || cameraSetter.MaxCallStackBytes != 16
-            || cameraSetter.CallInstructionOffsets == null || cameraSetter.CallInstructionOffsets.Length != 1
-            || DecodeIndirectCallDisplacement(cameraSetter.Bytes, cameraSetter.CallInstructionOffsets[0])
+            || cameraSetterApply.Bytes.Length == 0 || cameraSetterApply.MaxCallStackBytes != 16
+            || cameraSetterApply.Bytes[12] != 0x6A || cameraSetterApply.Bytes[13] != 2
+            || cameraSetterRestore.Bytes[12] != 0x6A || cameraSetterRestore.Bytes[13] != 1
+            || CameraSetterMode(CameraSetterPhase.Apply) != 2 || CameraSetterMode(CameraSetterPhase.Restore) != 1
+            || cameraApplyCalls == null || cameraApplyCalls.Length != 2
+            || cameraRestoreCalls == null || cameraRestoreCalls.Length != 1
+            || DecodeIndirectCallDisplacement(cameraSetterApply.Bytes, cameraApplyCalls[0])
                 != CameraTransformSetterSlotOffset
-            || cameraSetter.TrapAddress != 0x30000000 + cameraSetter.Bytes.Length - 1
+            || DecodeIndirectCallDisplacement(cameraSetterApply.Bytes, effectiveWorldGetterCall)
+                != CameraTransformGetterSlotOffset
+            || DecodeIndirectCallDisplacement(cameraSetterRestore.Bytes, cameraRestoreCalls[0])
+                != CameraTransformSetterSlotOffset
+            || !effectiveWorldGetterArgumentsMatch
+            || cameraSetterApply.TrapAddress - cameraSetterApply.Base != (uint)(effectiveWorldGetterCall + 3)
+            || cameraSetterApply.TrapAddress != 0x30000000 + cameraSetterApply.Bytes.Length - 1
+            || surfaceProbe.Bytes.Length == 0 || surfaceProbe.MaxCallStackBytes != 12
+            || surfaceProbe.CallInstructionOffsets == null || surfaceProbe.CallInstructionOffsets.Length != 2
+            || DecodeIndirectCallDisplacement(surfaceProbe.Bytes, surfaceProbe.CallInstructionOffsets[0])
+                != D3dDeviceGetRenderTargetOffset
+            || DecodeIndirectCallDisplacement(surfaceProbe.Bytes, surfaceProbe.CallInstructionOffsets[1])
+                != DdSurfaceReleaseOffset
+            || surfaceProbe.TrapAddress != 0x18000000 + surfaceProbe.Bytes.Length - 1
             || VtableOffset(d3d7DeviceVtable, "GetRenderTarget") != D3dDeviceGetRenderTargetOffset
             || VtableOffset(surface7Vtable, "Lock") != DdSurfaceLockOffset
             || VtableOffset(surface7Vtable, "SetOverlayPosition") != 0x78
@@ -1824,8 +2320,9 @@ internal static partial class NativeFrameCapture
             Rows = new byte[] { 1, 2, 3, 4, 5, 6 }, RgbMasksVerified = true
         }), 4, 5, 6, 255, 1, 2, 3, 255);
         Console.WriteLine("self-check: D3D7 GetRenderTarget and Surface7 Lock/Unlock/Release SDK vtable ordinals OK");
+        Console.WriteLine("self-check: boundary surface probe calls GetRenderTarget/Release only; no Lock; 12-byte max stack OK");
         Console.WriteLine("self-check: caller stack footprint (24/12 bytes), original ESP, committed writable range and guard rejection OK");
-        Console.WriteLine("self-check: selected-camera setter stub uses verified interface slot +0x1C and 16-byte maximum caller stack OK");
+        Console.WriteLine("self-check: selected-camera mode-2 setter refreshes selector-2 world cache before trap; local restore uses verified setter slot +0x1C; 16-byte maximum caller stack OK");
         Console.WriteLine("self-check: 24-byte present call arguments compare unchanged and detect a changed byte");
         Console.WriteLine("self-check: return context logging verifies remote EIP/ESP before restoring the original present call");
         Console.WriteLine("self-check: viewport bounds fit the captured pixel surface OK");
