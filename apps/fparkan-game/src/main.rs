@@ -32,7 +32,7 @@ use fparkan_msh::{
 };
 use fparkan_path::ResourceName;
 use fparkan_platform_winit::{window_native_handles, WinitWindow, WinitWindowPlan};
-use fparkan_prototype::{unit_component_tree, PROTOTYPE_TYPE_EXTO};
+use fparkan_prototype::{unit_component_tree, UnitComponentTreeNode, PROTOTYPE_TYPE_EXTO};
 use fparkan_render::{
     LegacyBlendMode, LegacyCullMode, LegacyD3d7Projection, LegacyDepthMode,
     LegacyIron3dEulerTransform, LegacyPipelineState, RawCameraTransform,
@@ -1586,6 +1586,49 @@ fn static_mesh_shadow_triangles(mesh: &VulkanStaticMesh) -> Vec<ShadowTriangle> 
                 .then_some(shadow_triangle(positions, 0))
         })
         .collect()
+}
+
+fn expand_shadow_sphere_to_triangles(
+    sphere: &mut ShadowSphere,
+    triangles: &[ShadowTriangle],
+) -> Result<bool, String> {
+    if !sphere.radius.is_finite()
+        || sphere.radius < 0.0
+        || !sphere.center.iter().all(|value| value.is_finite())
+    {
+        return Err("animated shadow caster has an invalid bounding sphere".to_string());
+    }
+    let mut changed = false;
+    for point in triangles.iter().flat_map(|triangle| triangle.positions) {
+        if !point.iter().all(|value| value.is_finite()) {
+            return Err("animated shadow triangle has a non-finite position".to_string());
+        }
+        let offset = sub3(point, sphere.center);
+        let distance = length3(offset)
+            .ok_or_else(|| "animated shadow point distance is non-finite".to_string())?;
+        if distance <= sphere.radius {
+            continue;
+        }
+        let next_radius = 0.5 * (sphere.radius + distance);
+        let center_shift = if distance > f32::EPSILON {
+            scale3(offset, (next_radius - sphere.radius) / distance)
+        } else {
+            [0.0; 3]
+        };
+        sphere.center = add3(sphere.center, center_shift);
+        sphere.radius = next_radius;
+        changed = true;
+    }
+    Ok(changed)
+}
+
+fn shadow_sphere_enclosing_triangles(
+    baseline: ShadowSphere,
+    triangles: &[ShadowTriangle],
+) -> Result<ShadowSphere, String> {
+    let mut sphere = baseline;
+    expand_shadow_sphere_to_triangles(&mut sphere, triangles)?;
+    Ok(sphere)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3781,9 +3824,16 @@ struct StaticPreviewScene {
     material_animations: Vec<MaterialAnimationBinding>,
     sun_occlusion_range_indices: Vec<usize>,
     shadow_casters: Vec<ShadowCaster>,
+    shadow_sphere_baselines: Vec<ShadowSphere>,
     shadow_receivers: Vec<ShadowTriangle>,
     shadow_material_index: usize,
     terrain: Arc<TerrainWorld>,
+    component_pose_buffers: Vec<Vec<Option<NodePoseBuffer>>>,
+    component_mount_poses: Vec<Vec<Option<VulkanNodePose>>>,
+    control_animation_instances: Vec<ControlAnimationInstance>,
+    dynamic_component_geometry: Vec<DynamicComponentGeometry>,
+    dynamic_component_mounts: Vec<DynamicComponentMount>,
+    shadow_caster_indices_by_object: Vec<Option<usize>>,
     camera: VulkanStaticCamera,
     view_camera: PreviewCameraFrame,
     captured_viewport: Option<CapturedViewport>,
@@ -3791,6 +3841,35 @@ struct StaticPreviewScene {
     camera_mode: &'static str,
     mesh_components: usize,
     terrain_components: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ControlAnimationInstance {
+    object_index: usize,
+    component_index: usize,
+    model: Arc<ModelAsset>,
+    control: PreparedComponentControl,
+    state: ControlInstanceState,
+}
+
+#[derive(Clone, Debug)]
+struct DynamicComponentGeometry {
+    object_index: usize,
+    component_index: usize,
+    model: Arc<ModelAsset>,
+    transform: LegacyIron3dEulerTransform,
+    scale: [f32; 3],
+    vertex_start: usize,
+    vertex_count: usize,
+    shadow_triangle_range: Option<std::ops::Range<usize>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DynamicComponentMount {
+    object_index: usize,
+    component_index: usize,
+    parent_index: usize,
+    socket: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3998,6 +4077,90 @@ fn initial_control_gate_values(control: &PreparedComponentControl) -> Vec<Option
         .collect()
 }
 
+fn control_has_tag21(control: &PreparedComponentControl) -> bool {
+    control.typed_records.iter().any(|record| record.tag == 21)
+}
+
+fn component_chain_has_tag21(
+    tree: Option<&[UnitComponentTreeNode]>,
+    controls: &[Option<PreparedComponentControl>],
+    component_index: usize,
+) -> bool {
+    let Some(tree) = tree else {
+        return false;
+    };
+    let mut current = Some(component_index);
+    for _ in 0..=tree.len() {
+        let Some(index) = current else {
+            return false;
+        };
+        if controls
+            .get(index)
+            .and_then(Option::as_ref)
+            .is_some_and(control_has_tag21)
+        {
+            return true;
+        }
+        current = tree.get(index).and_then(|node| node.parent_index);
+    }
+    false
+}
+
+fn refresh_dynamic_component_mounts(
+    mounts: &[DynamicComponentMount],
+    pose_buffers: &[Vec<Option<NodePoseBuffer>>],
+    mount_poses: &mut [Vec<Option<VulkanNodePose>>],
+) -> Result<bool, String> {
+    let mut changed = false;
+    for mount in mounts {
+        let parent_mounted = mount_poses
+            .get(mount.object_index)
+            .and_then(|poses| poses.get(mount.parent_index))
+            .copied()
+            .flatten();
+        let parent_hierarchy = pose_buffers
+            .get(mount.object_index)
+            .and_then(|buffers| buffers.get(mount.parent_index))
+            .and_then(Option::as_ref)
+            .ok_or_else(|| {
+                format!(
+                    "dynamic component {} parent {} has no sampled Node38 hierarchy",
+                    mount.component_index, mount.parent_index
+                )
+            })?;
+        let socket_pose = if parent_mounted.is_some() {
+            node38_pose_relative_to_root_from_hierarchy(parent_hierarchy, mount.socket)
+        } else {
+            node38_pose_from_hierarchy(parent_hierarchy, mount.socket)
+        }
+        .ok_or_else(|| {
+            format!(
+                "dynamic component {} mount socket {} is absent from parent {}",
+                mount.component_index, mount.socket, mount.parent_index
+            )
+        })?;
+        let root_pose = parent_mounted.unwrap_or(VulkanNodePose {
+            translation: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+        });
+        let next_pose = compose_unit_pose(root_pose, socket_pose);
+        let slot = mount_poses
+            .get_mut(mount.object_index)
+            .and_then(|poses| poses.get_mut(mount.component_index))
+            .ok_or_else(|| {
+                format!(
+                    "dynamic component {} mount slot is outside object {}",
+                    mount.component_index, mount.object_index
+                )
+            })?;
+        if *slot != Some(next_pose) {
+            *slot = Some(next_pose);
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
 fn static_preview_control_pose_buffer(
     model: &ModelAsset,
     control: &PreparedComponentControl,
@@ -4045,6 +4208,35 @@ fn static_preview_control_pose_buffer(
         .or_else(|| node38_fallback_hierarchy(model)))
 }
 
+fn project_dynamic_component_geometry(
+    dynamic: &DynamicComponentGeometry,
+    pose: &NodePoseBuffer,
+    mount: Option<VulkanNodePose>,
+) -> Result<VulkanStaticMesh, String> {
+    let projected = if let Some(mount) = mount {
+        project_msh_to_static_mesh_in_world_space_with_node_pose_buffer_and_mount(
+            &dynamic.model,
+            dynamic.transform,
+            dynamic.scale,
+            pose,
+            mount,
+        )
+    } else {
+        project_msh_to_static_mesh_in_world_space_with_node_pose_buffer(
+            &dynamic.model,
+            dynamic.transform,
+            dynamic.scale,
+            pose,
+        )
+    };
+    projected.map_err(|error| {
+        format!(
+            "update mission object {} component {} geometry: {error}",
+            dynamic.object_index, dynamic.component_index
+        )
+    })
+}
+
 fn static_preview_mesh_and_materials(
     assets: &MissionAssets,
     terrain: &TerrainWorld,
@@ -4068,6 +4260,13 @@ fn static_preview_mesh_and_materials(
     let mut material_animations = Vec::new();
     let mut sun_occlusion_range_indices = Vec::new();
     let mut shadow_casters = Vec::new();
+    let mut shadow_sphere_baselines = Vec::new();
+    let mut shadow_caster_indices_by_object = Vec::with_capacity(roots.len());
+    let mut component_pose_buffers_by_object = Vec::with_capacity(roots.len());
+    let mut component_mount_poses_by_object = Vec::with_capacity(roots.len());
+    let mut control_animation_instances = Vec::new();
+    let mut dynamic_component_geometry = Vec::new();
+    let mut dynamic_component_mounts = Vec::new();
     let shadow_receivers = terrain_shadow_receivers(terrain_mesh)?;
     let mut terrain_material_loader = StandaloneWearMaterialLoader::new(root);
     let terrain_component = project_land_msh_to_static_mesh_in_world_space(terrain_mesh)
@@ -4136,6 +4335,7 @@ fn static_preview_mesh_and_materials(
                 component_controls.map_or(0, Vec::len)
             ));
         }
+        let component_controls = component_controls.map_or(&[][..], Vec::as_slice);
         let root_native_kind = component_refs
             .first()
             .and_then(|(visual, _)| native_shadow_kind(visual.source_type));
@@ -4153,15 +4353,25 @@ fn static_preview_mesh_and_materials(
                 continue;
             };
             let component_control = component_controls
-                .and_then(|controls| controls.get(component_index))
+                .get(component_index)
                 .and_then(Option::as_ref);
+            let control_animates_component = component_control.is_some_and(control_has_tag21);
+            let timeline_moves_component = static_animation_frame.is_none()
+                && (control_animates_component
+                    || component_chain_has_tag21(
+                        tree.as_deref(),
+                        component_controls,
+                        component_index,
+                    ));
+            let runtime_model = timeline_moves_component.then(|| Arc::new(model.validated.clone()));
+            let mut control_state = ControlInstanceState::default();
             component_pose_buffers[component_index] =
                 match (static_animation_frame, component_control) {
                     (None, Some(control)) => static_preview_control_pose_buffer(
                         &model.validated,
                         control,
                         0,
-                        &mut ControlInstanceState::default(),
+                        &mut control_state,
                     )?,
                     (animation_frame, control) => static_preview_component_pose_buffer(
                         &model.validated,
@@ -4169,6 +4379,20 @@ fn static_preview_mesh_and_materials(
                         animation_frame,
                     )?,
                 };
+            if control_animates_component && static_animation_frame.is_none() {
+                control_animation_instances.push(ControlAnimationInstance {
+                    object_index,
+                    component_index,
+                    model: runtime_model
+                        .as_ref()
+                        .map(Arc::clone)
+                        .ok_or_else(|| "animated component model was not retained".to_string())?,
+                    control: component_control
+                        .ok_or_else(|| "tag-21 component control disappeared".to_string())?
+                        .clone(),
+                    state: control_state,
+                });
+            }
             let should_render = tree.as_ref().map_or(true, |_| {
                 unit_component_is_visible(component_index, visual.source_type)
             });
@@ -4263,6 +4487,31 @@ fn static_preview_mesh_and_materials(
             if let Some(mount_pose) = mount_pose {
                 component_mount_poses[component_index] = Some(mount_pose);
             }
+            if timeline_moves_component && mount_pose.is_some() {
+                let parent_index = tree
+                    .as_ref()
+                    .and_then(|tree| tree[component_index].parent_index)
+                    .ok_or_else(|| {
+                        format!("mounted dynamic component {component_index} has no parent")
+                    })?;
+                let socket = usize::try_from(
+                    records
+                        .get(component_index)
+                        .ok_or_else(|| {
+                            format!("unit component {component_index} is outside decoded records")
+                        })?
+                        .parent_or_link,
+                )
+                .map_err(|_| {
+                    format!("unit component {component_index} has a negative mount socket")
+                })?;
+                dynamic_component_mounts.push(DynamicComponentMount {
+                    object_index,
+                    component_index,
+                    parent_index,
+                    socket,
+                });
+            }
 
             let transform = LegacyIron3dEulerTransform {
                 translation: mission_root.position,
@@ -4328,6 +4577,11 @@ fn static_preview_mesh_and_materials(
                         native_msh_cull_mode(range.batch_flags, component_handedness);
                 }
                 let component_shadow_triangles = static_mesh_shadow_triangles(&component);
+                let shadow_triangle_range = root_native_kind.map(|_| {
+                    let start = root_shadow_triangles.len();
+                    let end = start.saturating_add(component_shadow_triangles.len());
+                    start..end
+                });
                 if root_native_kind.is_some() {
                     root_shadow_triangles.extend(component_shadow_triangles);
                     let node1_pose = mount_pose.and_then(|_| match pose_buffer {
@@ -4356,6 +4610,8 @@ fn static_preview_mesh_and_materials(
                     &mut material_animations,
                 )?;
                 let lightmap_textures = static_preview_lightmap_textures(assets, visual)?;
+                let vertex_start = mesh.vertices.len();
+                let vertex_count = component.vertices.len();
                 let range_start = mesh.draw_ranges.len();
                 append_static_preview_component_with_lightmaps(
                     &mut mesh,
@@ -4371,15 +4627,31 @@ fn static_preview_mesh_and_materials(
                 if root_sun_eligible {
                     sun_occlusion_range_indices.extend(range_start..mesh.draw_ranges.len());
                 }
+                if timeline_moves_component && vertex_count != 0 {
+                    dynamic_component_geometry.push(DynamicComponentGeometry {
+                        object_index,
+                        component_index,
+                        model: runtime_model.as_ref().map(Arc::clone).ok_or_else(|| {
+                            "animated component model was not retained".to_string()
+                        })?,
+                        transform,
+                        scale: mission_root.scale,
+                        vertex_start,
+                        vertex_count,
+                        shadow_triangle_range,
+                    });
+                }
                 mesh_components += 1;
             }
         }
-        if let Some(native_kind) =
+        component_pose_buffers_by_object.push(component_pose_buffers);
+        component_mount_poses_by_object.push(component_mount_poses);
+        let shadow_caster_index = if let Some(native_kind) =
             root_native_kind.filter(|kind| native_shadow_caster_enabled(*kind))
         {
             let caster_id = u32::try_from(shadow_casters.len())
                 .map_err(|_| "shadow caster id exceeds u32".to_string())?;
-            if let Some(caster) = aggregate_shadow_caster(
+            aggregate_shadow_caster(
                 caster_id,
                 native_kind,
                 LegacyIron3dEulerTransform {
@@ -4389,10 +4661,17 @@ fn static_preview_mesh_and_materials(
                 mission_root.scale,
                 root_shadow_triangles,
                 &root_shadow_spheres,
-            ) {
+            )
+            .map(|caster| {
+                let index = shadow_casters.len();
+                shadow_sphere_baselines.push(caster.sphere);
                 shadow_casters.push(caster);
-            }
-        }
+                index
+            })
+        } else {
+            None
+        };
+        shadow_caster_indices_by_object.push(shadow_caster_index);
     }
     if mesh_components == 0 {
         return Err("selected static preview roots have no mesh-backed visual".to_string());
@@ -4422,9 +4701,16 @@ fn static_preview_mesh_and_materials(
         material_animations,
         sun_occlusion_range_indices,
         shadow_casters,
+        shadow_sphere_baselines,
         shadow_receivers,
         shadow_material_index,
         terrain: Arc::new(terrain.clone()),
+        component_pose_buffers: component_pose_buffers_by_object,
+        component_mount_poses: component_mount_poses_by_object,
+        control_animation_instances,
+        dynamic_component_geometry,
+        dynamic_component_mounts,
+        shadow_caster_indices_by_object,
         camera,
         view_camera,
         captured_viewport,
@@ -5186,6 +5472,13 @@ struct StaticVulkanApp {
     material_animations: Vec<MaterialAnimationBinding>,
     sun_occlusion_range_indices: Vec<usize>,
     terrain: Arc<TerrainWorld>,
+    component_pose_buffers: Vec<Vec<Option<NodePoseBuffer>>>,
+    component_mount_poses: Vec<Vec<Option<VulkanNodePose>>>,
+    control_animation_instances: Vec<ControlAnimationInstance>,
+    dynamic_component_geometry: Vec<DynamicComponentGeometry>,
+    dynamic_component_mounts: Vec<DynamicComponentMount>,
+    shadow_caster_indices_by_object: Vec<Option<usize>>,
+    shadow_sphere_baselines: Vec<ShadowSphere>,
     world_range_indices: Vec<usize>,
     world_range_index_counts: HashMap<usize, u32>,
     camera: VulkanStaticCamera,
@@ -5267,6 +5560,13 @@ impl StaticVulkanApp {
             material_animations: preview.material_animations,
             sun_occlusion_range_indices: preview.sun_occlusion_range_indices,
             terrain: preview.terrain,
+            component_pose_buffers: preview.component_pose_buffers,
+            component_mount_poses: preview.component_mount_poses,
+            control_animation_instances: preview.control_animation_instances,
+            dynamic_component_geometry: preview.dynamic_component_geometry,
+            dynamic_component_mounts: preview.dynamic_component_mounts,
+            shadow_caster_indices_by_object: preview.shadow_caster_indices_by_object,
+            shadow_sphere_baselines: preview.shadow_sphere_baselines,
             world_range_indices,
             world_range_index_counts,
             camera: preview.camera,
@@ -5467,6 +5767,151 @@ impl StaticVulkanApp {
         // accumulated duration. This preserves sub-millisecond frame deltas
         // instead of dropping them once per redraw.
         self.material_time_ms = self.material_elapsed.as_millis() as u32;
+    }
+
+    fn update_controlled_component_geometry(&mut self) -> Result<(), String> {
+        let mut pose_changed = false;
+        for instance in &mut self.control_animation_instances {
+            let pose = static_preview_control_pose_buffer(
+                &instance.model,
+                &instance.control,
+                self.material_time_ms,
+                &mut instance.state,
+            )?;
+            let slot = self
+                .component_pose_buffers
+                .get_mut(instance.object_index)
+                .and_then(|buffers| buffers.get_mut(instance.component_index))
+                .ok_or_else(|| {
+                    format!(
+                        "animated component {} pose slot is outside object {}",
+                        instance.component_index, instance.object_index
+                    )
+                })?;
+            if *slot != pose {
+                *slot = pose;
+                pose_changed = true;
+            }
+        }
+        if !pose_changed {
+            return Ok(());
+        }
+
+        // Mounts are recalculated from the sampled hierarchy even when the
+        // parent has no visible draw geometry of its own.
+        let mounts_changed = refresh_dynamic_component_mounts(
+            &self.dynamic_component_mounts,
+            &self.component_pose_buffers,
+            &mut self.component_mount_poses,
+        )?;
+        let mut geometry_changed = false;
+        let mut shadow_updates = Vec::new();
+        let mut updated_shadow_casters = HashSet::new();
+        for dynamic in &self.dynamic_component_geometry {
+            let pose = self
+                .component_pose_buffers
+                .get(dynamic.object_index)
+                .and_then(|buffers| buffers.get(dynamic.component_index))
+                .and_then(Option::as_ref)
+                .ok_or_else(|| {
+                    format!(
+                        "animated component {} has no current Node38 hierarchy",
+                        dynamic.component_index
+                    )
+                })?;
+            let mount = self
+                .component_mount_poses
+                .get(dynamic.object_index)
+                .and_then(|poses| poses.get(dynamic.component_index))
+                .copied()
+                .flatten();
+            let projected = project_dynamic_component_geometry(dynamic, pose, mount)?;
+            if projected.vertices.len() != dynamic.vertex_count {
+                return Err(format!(
+                    "animated component {} changed projected vertex count from {} to {}",
+                    dynamic.component_index,
+                    dynamic.vertex_count,
+                    projected.vertices.len()
+                ));
+            }
+            let end = dynamic
+                .vertex_start
+                .checked_add(dynamic.vertex_count)
+                .ok_or_else(|| "animated component vertex range overflowed".to_string())?;
+            let destination = self
+                .mesh
+                .vertices
+                .get_mut(dynamic.vertex_start..end)
+                .ok_or_else(|| {
+                    format!(
+                        "animated component {} vertex range is outside the shared mesh",
+                        dynamic.component_index
+                    )
+                })?;
+            if destination != projected.vertices.as_slice() {
+                destination.copy_from_slice(&projected.vertices);
+                geometry_changed = true;
+            }
+            if let Some(range) = dynamic.shadow_triangle_range.clone() {
+                let triangles = static_mesh_shadow_triangles(&projected);
+                if triangles.len() != range.len() {
+                    return Err(format!(
+                        "animated component {} changed shadow triangle count from {} to {}",
+                        dynamic.component_index,
+                        range.len(),
+                        triangles.len()
+                    ));
+                }
+                shadow_updates.push((dynamic.object_index, range, triangles));
+            }
+        }
+        for (object_index, range, triangles) in shadow_updates {
+            let Some(caster_index) = self
+                .shadow_caster_indices_by_object
+                .get(object_index)
+                .copied()
+                .flatten()
+            else {
+                continue;
+            };
+            let caster = self
+                .shadow_casters
+                .get_mut(caster_index)
+                .ok_or_else(|| format!("shadow caster {caster_index} is unavailable"))?;
+            let destination = caster.triangles.get_mut(range).ok_or_else(|| {
+                format!("animated component shadow range is outside caster {caster_index}")
+            })?;
+            destination.clone_from_slice(&triangles);
+            updated_shadow_casters.insert(caster_index);
+        }
+        for caster_index in updated_shadow_casters {
+            let baseline = self
+                .shadow_sphere_baselines
+                .get(caster_index)
+                .copied()
+                .ok_or_else(|| format!("shadow sphere baseline {caster_index} is unavailable"))?;
+            let caster = self
+                .shadow_casters
+                .get_mut(caster_index)
+                .ok_or_else(|| format!("shadow caster {caster_index} is unavailable"))?;
+            // shortcut: native animated sphere updates are unverified; derive
+            // a conservative envelope from the native startup sphere and all
+            // current triangles, never from a prior frame's expanded bounds.
+            caster.sphere = shadow_sphere_enclosing_triangles(baseline, &caster.triangles)?;
+        }
+        if geometry_changed || mounts_changed {
+            let sort_keys = self.world_draw_sort_keys(self.view_camera.position)?;
+            if let Some(renderer) = self.renderer.as_mut() {
+                for (range_index, sort_key) in sort_keys {
+                    renderer
+                        .set_draw_range_sort_key(range_index, sort_key)
+                        .map_err(|error| {
+                            format!("update animated component sort key {range_index}: {error}")
+                        })?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn update_shadow(
@@ -5971,6 +6416,11 @@ impl ApplicationHandler for StaticVulkanApp {
                     return;
                 }
                 self.update_material_clock();
+                if let Err(error) = self.update_controlled_component_geometry() {
+                    self.error = Some(error);
+                    event_loop.exit();
+                    return;
+                }
                 if let Err(error) = self.update_environment() {
                     self.error = Some(error);
                     event_loop.exit();
@@ -6318,6 +6768,39 @@ mod tests {
         }
     }
 
+    fn control_pose_drawable_test_model() -> ModelAsset {
+        let mut model = control_pose_test_model();
+        model.nodes_raw[8..10].copy_from_slice(&0_u16.to_le_bytes());
+        model.slots = vec![fparkan_msh::Slot {
+            tri_start: 0,
+            tri_count: 1,
+            batch_start: 0,
+            batch_count: 1,
+            aabb_min: [0.0; 3],
+            aabb_max: [1.0; 3],
+            sphere_center: [0.0; 3],
+            sphere_radius: 1.0,
+            opaque: [0; 5],
+        }];
+        model.positions = vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        model.normals = Some(vec![[0, 0, 127, 0]; 3]);
+        model.uv0 = Some(vec![[0, 0]; 3]);
+        model.uv1 = None;
+        model.indices = vec![0, 1, 2];
+        model.batches = vec![fparkan_msh::Batch {
+            batch_flags: 0,
+            material_index_hi: 0,
+            material_index: 0,
+            lightmap_index: u8::MAX,
+            local_batch_index: 0,
+            index_count: 3,
+            index_start: 0,
+            vertex_count: 3,
+            base_vertex: 0,
+        }];
+        model
+    }
+
     fn control_pose_test_control() -> PreparedComponentControl {
         let mut fixed_words = [0; 44];
         fixed_words[2] = 0;
@@ -6430,6 +6913,222 @@ mod tests {
         )
         .expect_err("control/mesh node-count mismatch is rejected");
         assert!(mismatch.contains("does not match MSH node count"));
+    }
+
+    #[test]
+    fn exto_parent_control_updates_visible_child_mount_without_draw_geometry() {
+        let mut model = control_pose_test_model();
+        let mut socket_node = vec![u8::MAX; model.node_stride];
+        socket_node[..2].copy_from_slice(&[0, 0]);
+        socket_node[2..4].copy_from_slice(&0_u16.to_le_bytes());
+        socket_node[4..6].copy_from_slice(&u16::MAX.to_le_bytes());
+        socket_node[6..8].copy_from_slice(&1_u16.to_le_bytes());
+        model.nodes_raw.extend(socket_node);
+        model.node_count = 2;
+        let mut control = control_pose_test_control();
+        control.model_node_count = 2;
+        let unit_record = |immediate_child_count| fparkan_prototype::UnitComponentRecord {
+            archive_raw: [0; 32],
+            resource_raw: [0; 32],
+            kind: 0,
+            parent_or_link: 1,
+            description_raw: [0; 32],
+            tail0: 0,
+            immediate_child_count,
+        };
+        let unit_tree = unit_component_tree(&[unit_record(1), unit_record(1), unit_record(0)])
+            .expect("preorder Unit DAT tree");
+        let controls = vec![None, Some(control.clone()), None];
+        assert!(unit_component_is_visible(1, Some(PROTOTYPE_TYPE_EXTO)));
+        assert!(unit_component_is_visible(2, Some(PROTOTYPE_TYPE_EXTO)));
+        assert!(component_chain_has_tag21(Some(&unit_tree), &controls, 2));
+        assert_eq!(unit_tree[1].parent_index, Some(0));
+        assert_eq!(unit_tree[2].parent_index, Some(1));
+        assert!(
+            unit_tree[2]
+                .parent_index
+                .is_some_and(|parent_index| parent_index < 2),
+            "Unit DAT preorder places a parent before its child"
+        );
+        let mut state = ControlInstanceState::default();
+        let initial_hierarchy = static_preview_control_pose_buffer(&model, &control, 0, &mut state)
+            .expect("initial EXTO parent pose")
+            .expect("initial parent hierarchy");
+        let later_hierarchy = static_preview_control_pose_buffer(&model, &control, 225, &mut state)
+            .expect("animated EXTO parent pose")
+            .expect("animated parent hierarchy");
+        let mut pose_buffers = vec![vec![None, Some(initial_hierarchy), None]];
+        let mounts = [DynamicComponentMount {
+            object_index: 0,
+            component_index: 2,
+            parent_index: 1,
+            socket: 1,
+        }];
+        let initial = node38_pose_from_hierarchy(
+            pose_buffers[0][1].as_ref().expect("EXTO parent hierarchy"),
+            1,
+        )
+        .expect("parent socket");
+        let mut mount_poses = vec![vec![None, None, Some(initial)]];
+        pose_buffers[0][1] = Some(later_hierarchy);
+        let parent_geometry = DynamicComponentGeometry {
+            object_index: 0,
+            component_index: 1,
+            model: Arc::new(model.clone()),
+            transform: LegacyIron3dEulerTransform {
+                translation: [0.0; 3],
+                orientation_radians: [0.0; 3],
+            },
+            scale: [1.0; 3],
+            vertex_start: 0,
+            vertex_count: 0,
+            shadow_triangle_range: None,
+        };
+        let empty_parent_mesh = project_dynamic_component_geometry(
+            &parent_geometry,
+            pose_buffers[0][1].as_ref().expect("EXTO parent hierarchy"),
+            None,
+        )
+        .expect("zero-geometry EXTO parent");
+        assert!(empty_parent_mesh.vertices.is_empty());
+        assert!(empty_parent_mesh.indices.is_empty());
+
+        assert!(
+            refresh_dynamic_component_mounts(&mounts, &pose_buffers, &mut mount_poses)
+                .expect("refresh child mount")
+        );
+        assert_eq!(
+            mount_poses[0][2].expect("child mount").translation,
+            [0.0, 2.45, 0.0]
+        );
+        // The EXTO parent has a sampled Node38 hierarchy but no projected draw
+        // vertices. Its hierarchy still drives the visible child's mount.
+    }
+
+    #[test]
+    fn controlled_component_update_keeps_vertices_and_shadow_triangles_in_sync() {
+        let model = Arc::new(control_pose_drawable_test_model());
+        let control = control_pose_test_control();
+        let dynamic = DynamicComponentGeometry {
+            object_index: 0,
+            component_index: 0,
+            model: Arc::clone(&model),
+            transform: LegacyIron3dEulerTransform {
+                translation: [0.0; 3],
+                orientation_radians: [0.0; 3],
+            },
+            scale: [1.0; 3],
+            vertex_start: 0,
+            vertex_count: 3,
+            shadow_triangle_range: Some(0..1),
+        };
+        let mut state = ControlInstanceState::default();
+        let initial_pose = static_preview_control_pose_buffer(&model, &control, 0, &mut state)
+            .expect("initial hierarchy")
+            .expect("initial Node38 pose");
+        let initial_mesh = project_dynamic_component_geometry(&dynamic, &initial_pose, None)
+            .expect("initial projected component");
+        let initial_triangles = static_mesh_shadow_triangles(&initial_mesh);
+        let baseline = ShadowSphere {
+            center: [0.0; 3],
+            radius: 1.0,
+        };
+        let view_camera = FreeFlightCamera {
+            position: [0.0; 3],
+            yaw: 0.0,
+            pitch: 0.0,
+            horizontal_fov: 1.0,
+            near_plane: 0.1,
+            far_plane: 100.0,
+            move_speed: 1.0,
+        }
+        .preview_frame(16.0 / 9.0);
+        let preview = StaticPreviewScene {
+            mesh: initial_mesh.clone(),
+            native_handedness_by_range: HashMap::new(),
+            materials: Vec::new(),
+            material_animations: Vec::new(),
+            sun_occlusion_range_indices: Vec::new(),
+            shadow_casters: vec![ShadowCaster {
+                id: 0,
+                world_axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                sphere: baseline,
+                native_kind: 4,
+                triangles: initial_triangles.clone(),
+            }],
+            shadow_sphere_baselines: vec![baseline],
+            shadow_receivers: Vec::new(),
+            shadow_material_index: 0,
+            terrain: Arc::new(TerrainWorld::default()),
+            component_pose_buffers: vec![vec![Some(initial_pose)]],
+            component_mount_poses: vec![vec![None]],
+            control_animation_instances: vec![ControlAnimationInstance {
+                object_index: 0,
+                component_index: 0,
+                model: Arc::clone(&model),
+                control,
+                state,
+            }],
+            dynamic_component_geometry: vec![dynamic],
+            dynamic_component_mounts: Vec::new(),
+            shadow_caster_indices_by_object: vec![Some(0)],
+            camera: view_camera.vulkan_camera(),
+            view_camera,
+            captured_viewport: None,
+            free_camera: None,
+            camera_mode: "test",
+            mesh_components: 1,
+            terrain_components: 0,
+        };
+        let mut app = StaticVulkanApp::new(
+            preview,
+            None,
+            None,
+            EnvironmentGpuRange {
+                range_index: usize::MAX,
+                vertex_start: initial_mesh.vertices.len(),
+                vertex_capacity: 0,
+                material_index: 0,
+            },
+            initial_mesh.vertices.len(),
+            initial_mesh.indices.len(),
+            None,
+            0,
+            "control-test",
+            1,
+            None,
+            false,
+            StartupTimings::default(),
+        );
+        app.material_time_ms = 225;
+        app.update_controlled_component_geometry()
+            .expect("update projected component and caster");
+
+        assert_eq!(app.mesh.indices, initial_mesh.indices);
+        assert_eq!(app.mesh.vertices.len(), initial_mesh.vertices.len());
+        assert_ne!(
+            initial_mesh.vertices[0].position,
+            app.mesh.vertices[0].position
+        );
+        assert!((app.mesh.vertices[0].position[1] - 0.45).abs() < 1.0e-4);
+        let b_vertices = app.mesh.vertices.clone();
+        let b_triangles = app.shadow_casters[0].triangles.clone();
+        let b_sphere = app.shadow_casters[0].sphere;
+        assert_ne!(b_triangles, initial_triangles);
+        assert!(b_sphere.radius > baseline.radius);
+
+        app.update_controlled_component_geometry()
+            .expect("repeat the same control timestamp");
+        assert_eq!(app.mesh.vertices, b_vertices);
+        assert_eq!(app.shadow_casters[0].triangles, b_triangles);
+        assert_eq!(app.shadow_casters[0].sphere, b_sphere);
+
+        app.material_time_ms = 0;
+        app.update_controlled_component_geometry()
+            .expect("return to first control pose");
+        assert_eq!(app.mesh.vertices, initial_mesh.vertices);
+        assert_eq!(app.shadow_casters[0].triangles, initial_triangles);
+        assert_eq!(app.shadow_casters[0].sphere, baseline);
     }
 
     fn set_test_terrain_lod0_range(terrain: &mut fparkan_terrain_format::LandMeshDocument) {
@@ -6735,6 +7434,39 @@ mod tests {
             &test_shadow_caster(2, [101.0, 0.0, 0.0]),
             matrix
         ));
+    }
+
+    #[test]
+    fn animated_shadow_bounds_rebuild_from_native_baseline() {
+        let baseline = ShadowSphere {
+            center: [0.0; 3],
+            radius: 1.0,
+        };
+        let pose_a = [shadow_triangle(
+            [[0.5, 0.0, 0.0], [0.0, 0.5, 0.0], [0.0, 0.0, 0.5]],
+            0,
+        )];
+        let pose_b = [shadow_triangle(
+            [[3.0, 0.0, 0.0], [4.0, 0.0, 0.0], [3.0, 1.0, 0.0]],
+            0,
+        )];
+
+        let first_a =
+            shadow_sphere_enclosing_triangles(baseline, &pose_a).expect("initial animated bounds");
+        assert_eq!(first_a, baseline);
+        let at_b =
+            shadow_sphere_enclosing_triangles(baseline, &pose_b).expect("expanded animated bounds");
+        assert!((at_b.center[0] - 1.5).abs() < 1.0e-5);
+        assert!((at_b.radius - 2.5).abs() < 1.0e-5);
+        assert!(length3(at_b.center).expect("finite sphere center") + 1.0 <= at_b.radius);
+        for point in pose_b.iter().flat_map(|triangle| triangle.positions) {
+            assert!(
+                length3(sub3(point, at_b.center)).expect("finite point distance") <= at_b.radius
+            );
+        }
+        let second_a = shadow_sphere_enclosing_triangles(baseline, &pose_a)
+            .expect("return to first animated pose");
+        assert_eq!(second_a, first_a);
     }
 
     #[test]

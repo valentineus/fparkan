@@ -362,18 +362,30 @@ local.set_translation(pose.position);
 world[n] = world[parent(n)] * local;
 ```
 
-Статический Vulkan preview берёт начальный кадр узла из явной ссылки прототипа
-на CTLD `.ctl`. Для поддерживаемых Control timeline и tag 21 он выполняет один
-сэмпл при native clock `0`, передавая конечные type-1 значения разрешённых NDP
-providers; неподдерживаемый режим/variable mapping и отсутствующий или
-неразрешённый gate value возвращают preview к статическим CTLD bindings.
-Используются только включённые строки, а при повторе node ID поздняя строка
-заменяет раннюю. Без
-`--static-animation-frame` preview применяет эти настройки узлов; узлы без
-настройки остаются на кадре `0`. Явный `--static-animation-frame N`
-переопределяет их и задаёт `N` всем узлам, пропуская Control-сэмпл.
-Результат — одна стартовая статическая поза, не обновление анимации, Control
-или AI по ходу кадров.
+Статический Vulkan preview берёт CTLD `.ctl` из явной ссылки прототипа.
+Поддерживаемые Control timeline с tag 21 сэмплируются при запуске на native
+clock `0`; разрешённые NDP providers передают конечные type-1 значения.
+Неподдерживаемый режим или variable mapping, а также отсутствующее или
+неразрешённое gate value оставляют компонент на статических CTLD bindings. В
+timeline участвуют только включённые строки; при повторном node ID поздняя
+строка заменяет раннюю.
+
+Без `--static-animation-frame` preview сохраняет экземпляр Control и при
+каждом redraw сэмплирует поддерживаемый timeline на текущем native clock.
+Обновлённая Node38-поза перепроецирует видимую геометрию в заранее выделенный
+vertex span, оставляя индексы и draw ranges неизменными. Если в пути Unit DAT
+компонента есть такой Control, заново вычисляется его EXTO mount socket и
+перепроецируется дочерняя геометрия; дочерний mount использует preorder-порядок
+Unit DAT. Внутренние INTO-компоненты здесь не считаются глобальными MSH
+socket mounts. Обновлённые вершины и shadow-треугольники попадают в общий
+mesh upload перед следующим кадром. Culling sphere восстанавливается от
+начальной native sphere и расширяется до текущих shadow-треугольников; это
+`shortcut:`, потому что native обновление bounding sphere для анимированной
+геометрии пока не установлено. Это путь сэмплирования Control-позы, не AI или
+анимация эффектов.
+
+Явный `--static-animation-frame N` переопределяет timeline и задаёт `N` всем
+узлам, пропуская runtime Control-сэмпл.
 MSH sampler выбирает type 19 frame округлением `(time - 0.5)` к ближайшему
 целому с ties-to-even, затем интерполирует выбранный type 8 key и следующий
 key в исходном `time`; это portable-вариант native x87 conversion в default
