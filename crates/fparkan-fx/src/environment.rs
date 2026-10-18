@@ -7,7 +7,7 @@
 //! loading behind the simulation.
 
 use crate::sky::SkyMaterials;
-use crate::{FxDocument, FxError, FxOpcode};
+use crate::{FxCommand, FxDocument, FxError, FxOpcode};
 use std::sync::Arc;
 
 // Terrain.dll writes these velocity vectors into the shared precipitation
@@ -597,12 +597,14 @@ impl LightningBounds {
 pub struct PointLightFrame {
     /// Opcode 1 type word. `env_lightning` uses type 7.
     pub effect_type: u32,
-    /// Effect age supplied to the native evaluator, in seconds.
-    pub elapsed_seconds: f32,
+    /// Native LightManager selector selected from the opcode 1 type.
+    pub light_selector: u32,
+    /// Native LightManager flags selected from the opcode 1 type.
+    pub native_flags: u32,
+    /// Native update value compared with the opcode 1 start/end fields.
+    pub command_time: f32,
     /// Interpolation parameter between the opcode 1 start/end times.
     pub normalized_time: f32,
-    /// FXID lifetime in seconds.
-    pub duration_seconds: f32,
     /// World-space LightManager position.
     pub position: [f32; 3],
     /// World-space direction submitted alongside the point-light record.
@@ -616,8 +618,144 @@ pub struct PointLightFrame {
     /// The scalar at body offset 116. Its native role is an effect factor,
     /// not alpha or a UV parameter, so it is preserved without reinterpretation.
     pub effect_factor: f32,
-    /// Whether the opcode 1 command is active at `elapsed_seconds`.
+    /// Whether the opcode 1 command is active at `command_time`.
     pub active: bool,
+}
+
+/// Evaluates a native opcode 1 point-light command at `command_time` and
+/// applies a parent basis to its local position and direction. `basis` stores
+/// the world-space vectors corresponding to local +X, +Y, and +Z.
+/// `command_time` is resolved by the caller; FX header duration and lifecycle
+/// remain with that caller. The interpolated range is retained as authored;
+/// native Op1 does not clamp it to zero.
+#[must_use]
+pub fn evaluate_op1_point_light_with_basis(
+    command: &FxCommand,
+    command_time: f32,
+    origin: [f32; 3],
+    basis: [[f32; 3]; 3],
+) -> Option<PointLightFrame> {
+    if command.opcode != FxOpcode::Op1
+        || !command_time.is_finite()
+        || !origin
+            .into_iter()
+            .chain(basis.into_iter().flatten())
+            .all(f32::is_finite)
+    {
+        return None;
+    }
+
+    let body = command.raw_body.as_ref();
+    const FLOAT_OFFSETS: &[usize] = &[
+        4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 76, 80, 84, 88, 108,
+        112, 116, 120, 124, 128,
+    ];
+    if body.len() < 132
+        || FLOAT_OFFSETS
+            .iter()
+            .any(|&offset| read_f32(body, offset).is_none_or(|value| !value.is_finite()))
+    {
+        return None;
+    }
+    let normalized_time = native_opcode1_interval(body, command_time)?;
+    if !normalized_time.is_finite() {
+        return None;
+    }
+    let sample = sample_op1_point_light(body, normalized_time)?;
+    let (light_selector, native_flags) = opcode1_light_manager_mapping(sample.effect_type)?;
+    if light_selector != 1 {
+        return None;
+    }
+    let transformed_direction = transform3(basis, sample.local_direction);
+    let position = add3(origin, transform3(basis, sample.local_position));
+    if !position.into_iter().all(f32::is_finite)
+        || !transformed_direction.into_iter().all(f32::is_finite)
+        || !sample.color.into_iter().all(f32::is_finite)
+        || !sample.range.is_finite()
+        || !sample.attenuation.into_iter().all(f32::is_finite)
+        || !sample.effect_factor.is_finite()
+    {
+        return None;
+    }
+    let direction = normalize_op1_direction(transformed_direction);
+
+    Some(PointLightFrame {
+        effect_type: sample.effect_type,
+        light_selector,
+        native_flags,
+        command_time,
+        normalized_time,
+        position,
+        direction,
+        color: sample.color,
+        range: sample.range,
+        attenuation: sample.attenuation,
+        effect_factor: sample.effect_factor,
+        active: true,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct Op1PointLightSample {
+    effect_type: u32,
+    local_position: [f32; 3],
+    local_direction: [f32; 3],
+    color: [f32; 4],
+    range: f32,
+    attenuation: [f32; 3],
+    effect_factor: f32,
+}
+
+fn sample_op1_point_light(body: &[u8], normalized_time: f32) -> Option<Op1PointLightSample> {
+    Some(Op1PointLightSample {
+        effect_type: read_u32(body, 0)?,
+        local_position: lerp3(read_vec3(body, 12)?, read_vec3(body, 24)?, normalized_time),
+        local_direction: lerp3(read_vec3(body, 36)?, read_vec3(body, 48)?, normalized_time),
+        color: lerp4(read_vec4(body, 60)?, read_vec4(body, 76)?, normalized_time),
+        range: lerp(read_f32(body, 108)?, read_f32(body, 112)?, normalized_time),
+        attenuation: [
+            read_f32(body, 120)?,
+            read_f32(body, 124)?,
+            read_f32(body, 128)?,
+        ],
+        effect_factor: read_f32(body, 116)?,
+    })
+}
+
+fn normalize_op1_direction(direction: [f32; 3]) -> [f32; 3] {
+    // Native FastProc normalization preserves a degenerate vector as zero;
+    // this path must not invent a fallback axis.
+    let length =
+        (direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2])
+            .sqrt();
+    if length.is_finite() && length > 0.0 {
+        direction.map(|component| component / length)
+    } else {
+        [0.0; 3]
+    }
+}
+
+fn lightning_point_light_direction(local_direction: [f32; 3], basis: [[f32; 3]; 3]) -> [f32; 3] {
+    // Preserve the pre-existing Lightning consumer fallback, which is
+    // separate from the generic native Op1 behavior.
+    finite_unit(transform3(basis, local_direction))
+        .unwrap_or_else(|| finite_unit(basis[0]).unwrap_or([1.0, 0.0, 0.0]))
+}
+
+/// Maps the native opcode 1 type switch to its LightManager record selector
+/// and flags. Types 3 and 4 select non-point record classes; generic point
+/// lights reject those selectors, while Lightning keeps the full mapping.
+fn opcode1_light_manager_mapping(effect_type: u32) -> Option<(u32, u32)> {
+    Some(match effect_type {
+        1 => (1, 0x8000_0000),
+        2 => (1, 0),
+        3 => (3, 0),
+        4 => (4, 0),
+        5 => (1, 0),
+        6 => (1, 0xA000_0000),
+        7 => (1, 0x2000_0000),
+        _ => return None,
+    })
 }
 
 /// Native quad produced by the opcode 3 lightning visual.
@@ -959,32 +1097,24 @@ impl LightningEffect {
         }
 
         let body = self.opcode1_body.as_ref();
-        let effect_type = read_u32(body, 0)?;
         let (normalized_time, _) = active_interval(body, elapsed_seconds, self.duration_seconds)?;
-        let local_position = lerp3(read_vec3(body, 12)?, read_vec3(body, 24)?, normalized_time);
-        let local_direction = lerp3(read_vec3(body, 36)?, read_vec3(body, 48)?, normalized_time);
-        let color = lerp4(read_vec4(body, 60)?, read_vec4(body, 76)?, normalized_time);
-        let range = lerp(read_f32(body, 108)?, read_f32(body, 112)?, normalized_time);
-        let attenuation = [
-            read_f32(body, 120)?,
-            read_f32(body, 124)?,
-            read_f32(body, 128)?,
-        ];
-        let effect_factor = read_f32(body, 116)?;
-        let direction = finite_unit(transform3(basis, local_direction))
-            .unwrap_or_else(|| finite_unit(basis[0]).unwrap_or([1.0, 0.0, 0.0]));
+        let sample = sample_op1_point_light(body, normalized_time)?;
+        let (light_selector, native_flags) =
+            opcode1_light_manager_mapping(sample.effect_type).unwrap_or((0, 0));
+        let direction = lightning_point_light_direction(sample.local_direction, basis);
 
         Some(PointLightFrame {
-            effect_type,
-            elapsed_seconds,
+            effect_type: sample.effect_type,
+            light_selector,
+            native_flags,
+            command_time: elapsed_seconds,
             normalized_time,
-            duration_seconds: self.duration_seconds,
-            position: add3(origin, transform3(basis, local_position)),
+            position: add3(origin, transform3(basis, sample.local_position)),
             direction,
-            color: color.map(sanitize_float),
-            range: sanitize_float(range).max(0.0),
-            attenuation: attenuation.map(sanitize_float),
-            effect_factor: sanitize_float(effect_factor),
+            color: sample.color.map(sanitize_float),
+            range: sanitize_float(sample.range).max(0.0),
+            attenuation: sample.attenuation.map(sanitize_float),
+            effect_factor: sanitize_float(sample.effect_factor),
             active: true,
         })
     }
@@ -1960,6 +2090,31 @@ fn active_interval(body: &[u8], elapsed: f32, duration: f32) -> Option<(f32, f32
     Some((normalized, end.min(duration)))
 }
 
+fn native_opcode1_interval(body: &[u8], command_time: f32) -> Option<f32> {
+    let start = read_f32(body, 4)?;
+    let end = read_f32(body, 8)?;
+    if !command_time.is_finite()
+        || !start.is_finite()
+        || !end.is_finite()
+        || command_time < start
+        || command_time > end
+    {
+        return None;
+    }
+    let span = end - start;
+    if !span.is_finite() {
+        return None;
+    }
+    // Effect.dll divides by the interval span without an epsilon gate
+    // (1000F703-1000F783). A zero-width interval produces 0/0, which cannot
+    // yield a finite LightManager sample; keep that command inactive here.
+    if span == 0.0 {
+        return None;
+    }
+    let normalized = ((command_time - start) / span).clamp(0.0, 1.0);
+    normalized.is_finite().then_some(normalized)
+}
+
 fn evaluate_position(body: &[u8], normalized_time: f32) -> Option<[f32; 3]> {
     let start = read_vec3(body, 36)?;
     let delta = read_vec3(body, 48)?;
@@ -2590,6 +2745,172 @@ mod tests {
             .flatten()
             .all(|value| value.is_finite()));
         assert!(effect.evaluate_point_light(1.01, [0.0; 3]).is_none());
+    }
+
+    #[test]
+    fn generic_opcode1_uses_native_command_time_not_header_duration_phase() {
+        // These type/start/end values come from the shipped f_blinklight_r
+        // (header mode 2, duration 2s) and b_sphere_main (mode 0, duration
+        // 6s) Op1 records. Their local command clocks must reach their own
+        // authored windows; dividing by the FX lifetime would miss both.
+        let blinklight = op1_test_command(6, 0.75, 1.0);
+        let sphere = op1_test_command(5, 1.0 / 3.0, 1.0);
+
+        let blink_midpoint = evaluate_op1_point_light_identity(&blinklight, 0.875, [0.0; 3])
+            .expect("blink light command midpoint");
+        let sphere_midpoint = evaluate_op1_point_light_identity(&sphere, 2.0 / 3.0, [0.0; 3])
+            .expect("sphere command midpoint");
+        assert_eq!(blink_midpoint.effect_type, 6);
+        assert_eq!(blink_midpoint.light_selector, 1);
+        assert_eq!(blink_midpoint.native_flags, 0xA000_0000);
+        assert_eq!(blink_midpoint.command_time, 0.875);
+        assert!((blink_midpoint.normalized_time - 0.5).abs() < 1.0e-6);
+        assert_eq!(sphere_midpoint.effect_type, 5);
+        assert_eq!(sphere_midpoint.light_selector, 1);
+        assert_eq!(sphere_midpoint.native_flags, 0);
+        assert!((sphere_midpoint.normalized_time - 0.5).abs() < 1.0e-6);
+
+        // The native comparisons accept the endpoint; the effect remains
+        // active at `end`, where its interpolation reaches one.
+        let blink_end = evaluate_op1_point_light_identity(&blinklight, 1.0, [0.0; 3])
+            .expect("inclusive end of native interval");
+        assert_eq!(blink_end.normalized_time, 1.0);
+        assert!(
+            evaluate_op1_point_light_identity(&blinklight, 1.0 + f32::EPSILON, [0.0; 3]).is_none()
+        );
+        assert!(
+            evaluate_op1_point_light_identity(&op1_test_command(3, 0.0, 1.0), 0.5, [0.0; 3])
+                .is_none()
+        );
+        assert!(
+            evaluate_op1_point_light_identity(&op1_test_command(4, 0.0, 1.0), 0.5, [0.0; 3])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn generic_opcode1_preserves_narrow_native_intervals_and_rejects_zero_span() {
+        let narrow_end = f32::EPSILON * 0.5;
+        let narrow = op1_test_command(5, 0.0, narrow_end);
+        let sample = evaluate_op1_point_light_identity(&narrow, narrow_end * 0.5, [0.0; 3])
+            .expect("non-zero native interval below epsilon");
+        assert!((sample.normalized_time - 0.5).abs() < 1.0e-6);
+
+        let zero_width = op1_test_command(5, 0.0, 0.0);
+        assert!(evaluate_op1_point_light_identity(&zero_width, 0.0, [0.0; 3]).is_none());
+    }
+
+    #[test]
+    fn generic_opcode1_preserves_negative_native_range() {
+        let mut command = op1_test_command(5, 0.0, 1.0);
+        let mut body = command.raw_body.to_vec();
+        body[108..112].copy_from_slice(&(-2.0_f32).to_le_bytes());
+        body[112..116].copy_from_slice(&(-4.0_f32).to_le_bytes());
+        command.raw_body = Arc::from(body.into_boxed_slice());
+
+        let sample = evaluate_op1_point_light_identity(&command, 0.5, [0.0; 3])
+            .expect("native Op1 sample with a negative range");
+        assert_eq!(sample.range, -3.0);
+    }
+
+    #[test]
+    fn generic_opcode1_keeps_zero_direction_zero() {
+        let mut command = op1_test_command(5, 0.0, 1.0);
+        let mut body = command.raw_body.to_vec();
+        body[36..60].fill(0);
+        command.raw_body = Arc::from(body.into_boxed_slice());
+
+        let sample = evaluate_op1_point_light_identity(&command, 0.5, [0.0; 3])
+            .expect("native Op1 sample with a zero direction");
+        assert_eq!(sample.direction, [0.0; 3]);
+    }
+
+    #[test]
+    fn generic_opcode1_validates_only_values_consumed_by_the_handler() {
+        let mut command = op1_test_command(7, 0.0, 1.0);
+        let mut body = command.raw_body.to_vec();
+        body[92..96].copy_from_slice(&f32::NAN.to_le_bytes());
+        command.raw_body = Arc::from(body.into_boxed_slice());
+        assert!(evaluate_op1_point_light_identity(&command, 0.5, [0.0; 3]).is_some());
+
+        let mut body = command.raw_body.to_vec();
+        body[80..84].copy_from_slice(&f32::NAN.to_le_bytes());
+        command.raw_body = Arc::from(body.into_boxed_slice());
+        assert!(evaluate_op1_point_light_identity(&command, 0.5, [0.0; 3]).is_none());
+    }
+
+    #[test]
+    fn generic_opcode1_rejects_non_finite_transformed_values() {
+        let command = op1_test_command(5, 0.0, 1.0);
+
+        assert!(evaluate_op1_point_light_with_basis(
+            &command,
+            0.5,
+            [f32::MAX, 0.0, 0.0],
+            [[f32::MAX, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        )
+        .is_none());
+    }
+
+    fn op1_test_command(effect_type: u32, start: f32, end: f32) -> FxCommand {
+        let mut body = vec![0; 132];
+        body[0..4].copy_from_slice(&effect_type.to_le_bytes());
+        body[4..8].copy_from_slice(&start.to_le_bytes());
+        body[8..12].copy_from_slice(&end.to_le_bytes());
+        body[12..24].copy_from_slice(
+            &[0.0_f32; 3]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        body[24..36].copy_from_slice(
+            &[2.0_f32, 4.0, 6.0]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        body[36..48].copy_from_slice(
+            &[1.0_f32, 0.0, 0.0]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        body[48..60].copy_from_slice(
+            &[0.0_f32, 1.0, 0.0]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        body[60..76].copy_from_slice(
+            &[1.0_f32, 1.0, 1.0, 1.0]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        body[76..92].copy_from_slice(
+            &[3.0_f32, 3.0, 3.0, 1.0]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
+        body[108..112].copy_from_slice(&10.0_f32.to_le_bytes());
+        body[112..116].copy_from_slice(&20.0_f32.to_le_bytes());
+        body[116..120].copy_from_slice(&0.5_f32.to_le_bytes());
+        FxCommand {
+            word: 1,
+            opcode: FxOpcode::Op1,
+            native_flag: false,
+            raw_body: Arc::from(body.into_boxed_slice()),
+            resource_refs: Vec::new(),
+        }
+    }
+
+    fn evaluate_op1_point_light_identity(
+        command: &FxCommand,
+        command_time: f32,
+        origin: [f32; 3],
+    ) -> Option<PointLightFrame> {
+        evaluate_op1_point_light_with_basis(command, command_time, origin, identity_basis())
     }
 
     #[test]
