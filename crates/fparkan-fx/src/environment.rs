@@ -1695,7 +1695,9 @@ impl PrecipitationEmitter {
         let size = camera.precipitation_size_scalar() * size_factor;
         for index in 0..desired {
             let particle = &mut self.particles[index];
-            particle.previous_position = particle.position;
+            if dt_seconds > 0.0 {
+                particle.previous_position = particle.position;
+            }
             particle.position[0] += velocity[0] * dt_seconds;
             particle.position[1] += velocity[1] * dt_seconds;
             particle.position[2] += velocity[2] * dt_seconds;
@@ -2467,6 +2469,29 @@ mod tests {
         assert_eq!(update.sounds.len(), 1);
         assert_eq!(update.sounds[0].action, SoundAction::SetLoopVolume);
         assert_eq!(update.sounds[0].volume, 0.5);
+    }
+
+    #[test]
+    fn duplicate_zero_delta_keeps_rain_frame_and_tail_unchanged() {
+        let mut system = EnvironmentSystem::new(3);
+        let camera = Camera::new([10.0, 20.0, 30.0]);
+        let weather = WeatherInput {
+            rain: WeatherState::with_resources(true, 0.01, [1.0; 4], ["atm_rain1.wav"]),
+            ..WeatherInput::clear()
+        };
+        let _ = system.update(0.0, weather.clone(), camera);
+        let advanced = system.update(0.001, weather.clone(), camera);
+        let time_seconds = system.time_seconds();
+        let repeated = system.update(0.0, weather, camera);
+
+        assert_eq!(system.time_seconds(), time_seconds);
+        assert_eq!(advanced, repeated);
+        assert!(advanced.primitives.iter().any(|primitive| match primitive {
+            EnvironmentPrimitive::Particle { screen, .. } => {
+                screen.world_head != screen.world_tail
+            }
+            EnvironmentPrimitive::Lightning(_) => false,
+        }));
     }
 
     #[test]
