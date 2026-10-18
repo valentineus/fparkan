@@ -1252,6 +1252,34 @@ impl VulkanSmokeRenderer {
         self.shutdown_inner()
     }
 
+    /// Returns the latest submitted frame using the existing optional readback copy.
+    ///
+    /// This synchronizes the device before mapping the host-coherent buffer, so
+    /// callers should use it only for bounded diagnostic captures.
+    pub fn readback_last_submitted_frame(
+        &self,
+    ) -> Result<Option<VulkanReadbackArtifact>, VulkanSmokeRendererError> {
+        let device = self.device_ref()?;
+        // SAFETY: The renderer owns this device and all submitted work; idling
+        // prevents the last readback transfer from racing the host buffer map.
+        unsafe { device.device().device_wait_idle() }.map_err(|error| {
+            VulkanSmokeRendererError::VulkanOperation {
+                context: "vkDeviceWaitIdle(readback frame)",
+                result: error,
+            }
+        })?;
+        let Some(bytes) = self.completed_readback(device)? else {
+            return Ok(None);
+        };
+        let format = self.swapchain_ref()?.report.plan.format.format;
+        Ok(Some(VulkanReadbackArtifact {
+            format,
+            width: self.report.swapchain_extent.0,
+            height: self.report.swapchain_extent.1,
+            bytes,
+        }))
+    }
+
     /// Requests swapchain recreation for a new drawable extent.
     pub fn request_resize(&mut self, extent: (u32, u32)) {
         self.pending_extent = Some(extent);

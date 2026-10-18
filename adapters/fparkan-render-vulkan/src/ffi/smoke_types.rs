@@ -1295,7 +1295,7 @@ pub struct VulkanValidationReport {
     pub vuids: Vec<String>,
 }
 
-/// CPU-owned copy of the final completed swapchain image readback.
+/// CPU-owned copy of a completed swapchain image readback.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VulkanReadbackArtifact {
     /// Vulkan swapchain format as a raw enum value.
@@ -1304,8 +1304,8 @@ pub struct VulkanReadbackArtifact {
     pub width: u32,
     /// Height of each image in pixels.
     pub height: u32,
-    /// One raw four-byte-per-pixel image: the last successfully submitted
-    /// swapchain image before synchronized teardown.
+    /// One raw four-byte-per-pixel image from the last successfully submitted
+    /// swapchain image at the synchronization point.
     pub bytes: Vec<u8>,
 }
 
