@@ -10,8 +10,22 @@ pub mod ambient_op3;
 pub mod atmosphere;
 pub mod environment;
 pub mod fx_visual;
+pub mod op7;
 pub mod shadow;
 pub mod sky;
+
+/// Advances the native FX 16-bit-pair random state and returns its new high half.
+///
+/// Native helpers store `low' = low * 2 ^ high` and `high' = high >> 1 ^ low'`.
+#[must_use]
+pub fn advance_native_fx_random_state(state: &mut u32) -> u16 {
+    let low = *state as u16;
+    let high = (*state >> 16) as u16;
+    let next_low = low.wrapping_shl(1) ^ high;
+    let next_high = (high >> 1) ^ next_low;
+    *state = u32::from(next_low) | (u32::from(next_high) << 16);
+    next_high
+}
 
 use fparkan_binary::{Cursor, DecodeError};
 use std::sync::Arc;
