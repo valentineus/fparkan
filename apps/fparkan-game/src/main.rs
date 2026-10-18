@@ -185,7 +185,7 @@ struct FreeFlightCamera {
     position: [f32; 3],
     yaw: f32,
     pitch: f32,
-    vertical_fov: f32,
+    horizontal_fov: f32,
     near_plane: f32,
     far_plane: f32,
     move_speed: f32,
@@ -240,9 +240,9 @@ impl FreeFlightCamera {
             position,
             yaw,
             pitch,
-            vertical_fov: std::f32::consts::FRAC_PI_3,
-            near_plane: (radius * 0.01).clamp(0.05, 0.1),
-            far_plane: (radius * 32.0).max(100.0),
+            horizontal_fov: 1.3,
+            near_plane: 0.5,
+            far_plane: 700.0,
             // Keep the default traversal speed comfortable on a full mission
             // map; Shift/Ctrl still provide the coarse speed controls.
             move_speed: (radius * 0.03).clamp(4.0, 40.0),
@@ -335,6 +335,15 @@ impl FreeFlightCamera {
         normalize3(cross3(self.right(), self.forward())).unwrap_or([0.0, 0.0, 1.0])
     }
 
+    fn vertical_fov(self, aspect: f32) -> f32 {
+        let aspect = if aspect.is_finite() && aspect > f32::EPSILON {
+            aspect
+        } else {
+            16.0 / 9.0
+        };
+        2.0 * ((self.horizontal_fov * 0.5).tan() / aspect).atan()
+    }
+
     fn look_delta(&mut self, dx: f64, dy: f64) {
         const SENSITIVITY: f32 = 0.0025;
         let dx = dx as f32;
@@ -415,7 +424,7 @@ impl FreeFlightCamera {
             -dot3(forward, self.position),
             1.0,
         ];
-        let half_fov = (self.vertical_fov * 0.5).clamp(0.05, 1.5);
+        let half_fov = self.vertical_fov(aspect) * 0.5;
         let focal = half_fov.tan().recip();
         let near_plane = self.near_plane.max(0.001);
         let far_plane = self.far_plane.max(near_plane + 0.001);
@@ -449,7 +458,7 @@ impl FreeFlightCamera {
             forward: self.forward(),
             right: self.right(),
             up: self.up(),
-            vertical_fov: self.vertical_fov,
+            vertical_fov: self.vertical_fov(aspect),
             near_plane: self.near_plane,
             far_plane: self.far_plane,
             clip_from_world: camera.clip_from_world,
@@ -1934,7 +1943,7 @@ fn screen_gradient_quad_vertices(
     let width = viewport[0].max(1.0);
     let height = viewport[1].max(1.0);
     let aspect = width / height;
-    let fov = camera.vertical_fov.clamp(0.05, 3.0);
+    let fov = camera.vertical_fov;
     // The quad is placed close to the camera and drawn with depth disabled.
     // It therefore covers the complete projected viewport while the later
     // dome, terrain, and object ranges provide their own depth-tested detail.
@@ -2797,7 +2806,7 @@ fn horizontal_fov(camera: &PreviewCameraFrame, aspect: f32) -> f32 {
     } else {
         16.0 / 9.0
     };
-    2.0 * ((camera.vertical_fov.clamp(0.05, 3.0) * 0.5).tan() * aspect).atan()
+    2.0 * ((camera.vertical_fov * 0.5).tan() * aspect).atan()
 }
 
 /// Tests the camera-to-sun segment against the validated mission terrain.
@@ -2993,11 +3002,11 @@ fn project_direction_pixels(
         return None;
     }
     let depth = dot3(camera.forward(), direction);
-    if !depth.is_finite() || depth <= camera.near_plane.max(0.001) {
+    if !depth.is_finite() || depth <= 1.0e-4 {
         return None;
     }
     let aspect = width / height;
-    let half_vertical = (camera.vertical_fov.clamp(0.05, 3.0) * 0.5).tan();
+    let half_vertical = (camera.vertical_fov * 0.5).tan();
     let half_horizontal = half_vertical * aspect;
     let ndc_x = dot3(camera.right(), direction) / (depth * half_horizontal);
     let ndc_y = dot3(camera.up(), direction) / (depth * half_vertical);
@@ -3021,7 +3030,7 @@ fn screen_ray_from_pixels(
         return None;
     }
     let aspect = viewport[0] / viewport[1];
-    let half_vertical = (camera.vertical_fov.clamp(0.05, 3.0) * 0.5).tan();
+    let half_vertical = (camera.vertical_fov * 0.5).tan();
     let half_horizontal = half_vertical * aspect;
     let ndc_x = pixels[0] / viewport[0] * 2.0 - 1.0;
     let ndc_y = 1.0 - pixels[1] / viewport[1] * 2.0;
@@ -3053,7 +3062,7 @@ fn sprite_quad_vertices_pixels(
     let width = viewport[0].max(1.0);
     let height = viewport[1].max(1.0);
     let aspect = width / height;
-    let vertical_fov = camera.vertical_fov.clamp(0.05, 3.0);
+    let vertical_fov = camera.vertical_fov;
     let horizontal_fov_radians = horizontal_fov(camera, aspect);
     let world_per_pixel_x = 2.0 * depth * (horizontal_fov_radians * 0.5).tan() / width;
     let world_per_pixel_y = 2.0 * depth * (vertical_fov * 0.5).tan() / height;
@@ -3113,7 +3122,7 @@ fn world_from_ndc(
         camera.near_plane.max(0.001)
     };
     let aspect = viewport[0].max(1.0) / viewport[1].max(1.0);
-    let half_vertical = (camera.vertical_fov.clamp(0.05, 3.0) * 0.5).tan();
+    let half_vertical = (camera.vertical_fov * 0.5).tan();
     let half_horizontal = half_vertical * aspect;
     let offset = add3(
         scale3(camera.right(), ndc[0] * half_horizontal),
@@ -6429,7 +6438,7 @@ mod tests {
             position: [0.0, 0.0, 0.0],
             yaw: 0.0,
             pitch: 0.0,
-            vertical_fov: std::f32::consts::FRAC_PI_2,
+            horizontal_fov: std::f32::consts::FRAC_PI_2,
             near_plane: 1.0,
             far_plane: 11.0,
             move_speed: 1.0,
@@ -6451,6 +6460,116 @@ mod tests {
         assert!(camera_right[0] / camera_right[3] > 0.0);
         assert!(world_up[1] / world_up[3] < 0.0);
         nearly_equal(far[2] / far[3], 1.0);
+    }
+
+    #[test]
+    fn free_flight_camera_uses_native_horizontal_fov_for_every_viewport_aspect() {
+        let horizontal_fov = 1.3_f32;
+        let camera = FreeFlightCamera::from_bounds([0.0; 3], [100.0; 3])
+            .expect("finite free-flight bounds");
+        assert_eq!(camera.horizontal_fov, horizontal_fov);
+        assert_eq!(camera.near_plane, 0.5);
+        assert_eq!(camera.far_plane, 700.0);
+
+        let assert_edges = |frame: PreviewCameraFrame, aspect: f32| {
+            let expected_vertical_fov =
+                2.0 * ((horizontal_fov * 0.5).tan() / aspect).atan();
+            assert!((frame.vertical_fov - expected_vertical_fov).abs() < 1.0e-5);
+            let depth = 10.0;
+            let center = add3(frame.position, scale3(frame.forward, depth));
+            let right_edge = add3(
+                center,
+                scale3(frame.right, depth * (horizontal_fov * 0.5).tan()),
+            );
+            let top_edge = add3(
+                center,
+                scale3(frame.up, depth * (expected_vertical_fov * 0.5).tan()),
+            );
+            let center_clip = row_vector_transform(
+                [center[0], center[1], center[2], 1.0],
+                frame.clip_from_world,
+            );
+            let right_clip = row_vector_transform(
+                [right_edge[0], right_edge[1], right_edge[2], 1.0],
+                frame.clip_from_world,
+            );
+            let top_clip = row_vector_transform(
+                [top_edge[0], top_edge[1], top_edge[2], 1.0],
+                frame.clip_from_world,
+            );
+            assert!(center_clip[3] > 0.0 && right_clip[3] > 0.0 && top_clip[3] > 0.0);
+            assert!(center_clip[0].abs() < 5.0e-4, "aspect {aspect}: {center_clip:?}");
+            assert!(center_clip[1].abs() < 5.0e-4, "aspect {aspect}: {center_clip:?}");
+            assert!(
+                (right_clip[0] / right_clip[3] - 1.0).abs() < 1.0e-4,
+                "aspect {aspect}: {right_clip:?}"
+            );
+            assert!(
+                (top_clip[1] / top_clip[3] + 1.0).abs() < 1.0e-4,
+                "aspect {aspect}: {top_clip:?}"
+            );
+        };
+
+        for aspect in [0.05, 0.75, 4.0 / 3.0, 16.0 / 9.0, 20.0] {
+            assert_edges(camera.preview_frame(aspect), aspect);
+
+            let projection = LegacyD3d7Projection {
+                viewport: [0, 0, 1000, (1000.0 / aspect).round() as i32],
+                near_plane: 0.5,
+                far_plane: 700.0,
+                field_of_view_radians: horizontal_fov,
+            };
+            let raw_transform = RawCameraTransform {
+                words: [
+                    1.0_f32.to_bits(),
+                    0.0_f32.to_bits(),
+                    0.0_f32.to_bits(),
+                    0.0_f32.to_bits(),
+                    0.0_f32.to_bits(),
+                    1.0_f32.to_bits(),
+                    0.0_f32.to_bits(),
+                    0.0_f32.to_bits(),
+                    0.0_f32.to_bits(),
+                    0.0_f32.to_bits(),
+                    1.0_f32.to_bits(),
+                    0.0_f32.to_bits(),
+                    0.0_f32.to_bits(),
+                    0.0_f32.to_bits(),
+                    0.0_f32.to_bits(),
+                    1.0_f32.to_bits(),
+                ],
+            };
+            let captured = PreviewCameraFrame::from_legacy_d3d7(raw_transform, projection)
+                .expect("valid D3D7 projection");
+            assert_edges(captured, projection.viewport[2] as f32 / projection.viewport[3] as f32);
+        }
+    }
+
+    #[test]
+    fn direction_projection_accepts_front_offscreen_rays_but_rejects_horizon() {
+        let camera = FreeFlightCamera {
+            position: [0.0; 3],
+            yaw: 0.0,
+            pitch: 0.0,
+            horizontal_fov: 1.3,
+            near_plane: 0.5,
+            far_plane: 700.0,
+            move_speed: 1.0,
+        }
+        .preview_frame(16.0 / 9.0);
+        let viewport = [1280.0, 720.0];
+        let offscreen = project_direction_pixels(&camera, [0.2, 0.979_795_9, 0.0], viewport)
+            .expect("front-facing directions are not rejected by the near distance");
+        assert!(offscreen[0] < 0.0 || offscreen[0] > viewport[0]);
+        assert!(project_direction_pixels(&camera, [1.0e-5, 1.0, 0.0], viewport).is_none());
+        assert!(project_direction_pixels(&camera, [-1.0, 0.0, 0.0], viewport).is_none());
+
+        let ray = screen_ray_from_pixels(&camera, [viewport[0] * 1.1, viewport[1] * 0.5], viewport)
+            .expect("an offscreen pixel still has a view ray");
+        let ray_pixels = project_direction_pixels(&camera, ray, viewport)
+            .expect("the offscreen ray remains in the front hemisphere");
+        assert!((ray_pixels[0] - viewport[0] * 1.1).abs() < 1.0e-3);
+        assert!((ray_pixels[1] - viewport[1] * 0.5).abs() < 1.0e-3);
     }
 
     #[test]
@@ -6487,7 +6606,7 @@ mod tests {
                 position: [0.0; 3],
                 yaw: forward[1].atan2(forward[0]),
                 pitch: 0.0,
-                vertical_fov: std::f32::consts::FRAC_PI_3,
+                horizontal_fov: projection.field_of_view_radians,
                 near_plane: projection.near_plane,
                 far_plane: projection.far_plane,
                 move_speed: 1.0,
@@ -6544,7 +6663,7 @@ mod tests {
             position: [10.0, 20.0, 30.0],
             yaw: 0.0,
             pitch: 0.0,
-            vertical_fov: 1.0,
+            horizontal_fov: 1.0,
             near_plane: 0.1,
             far_plane: 100.0,
             move_speed: 1.0,
@@ -6596,7 +6715,7 @@ mod tests {
             position: [0.25, 0.25, 34.0],
             yaw: 0.0,
             pitch: 0.0,
-            vertical_fov: 1.0,
+            horizontal_fov: 1.0,
             near_plane: 0.1,
             far_plane: 100.0,
             move_speed: 1.0,
@@ -6695,7 +6814,7 @@ mod tests {
             position: [0.0, 0.0, 0.0],
             yaw: 0.0,
             pitch: 0.0,
-            vertical_fov: 1.0,
+            horizontal_fov: 1.0,
             near_plane: 0.1,
             far_plane: 100.0,
             move_speed: 2.0,
@@ -6722,7 +6841,7 @@ mod tests {
             position: [0.0, 0.0, 0.0],
             yaw: 0.0,
             pitch: 0.6,
-            vertical_fov: 1.0,
+            horizontal_fov: 1.0,
             near_plane: 0.1,
             far_plane: 100.0,
             move_speed: 2.0,
@@ -7143,7 +7262,7 @@ mod tests {
             position: [10.0, 20.0, 30.0],
             yaw: 0.0,
             pitch: 0.0,
-            vertical_fov: std::f32::consts::FRAC_PI_2,
+            horizontal_fov: std::f32::consts::FRAC_PI_2,
             near_plane: 0.1,
             far_plane: 100.0,
             move_speed: 1.0,
@@ -7194,7 +7313,7 @@ mod tests {
             position: [0.0; 3],
             yaw: 0.0,
             pitch: 0.0,
-            vertical_fov: 1.0,
+            horizontal_fov: 1.0,
             near_plane: 0.1,
             far_plane: 100.0,
             move_speed: 1.0,
