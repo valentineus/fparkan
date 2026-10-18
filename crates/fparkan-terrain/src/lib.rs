@@ -1272,6 +1272,49 @@ mod tests {
     }
 
     #[test]
+    fn surface_queries_use_lod0_and_reject_missing_node_metadata() {
+        let mut mesh = synthetic_land_mesh();
+        mesh.positions = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 100.0],
+            [1.0, 0.0, 100.0],
+            [0.0, 1.0, 100.0],
+        ];
+        mesh.faces = vec![
+            terrain_face(FullSurfaceMask(1), [0, 1, 2]),
+            terrain_face(FullSurfaceMask(2), [3, 4, 5]),
+        ];
+        assign_terrain_lod_slots(&mut mesh, &[[0, 1]], &[[0, 1], [1, 1]]);
+
+        let world = TerrainWorld::from_land_msh(&mesh).expect("LOD0 terrain");
+        assert_eq!(world.surface_count(), 1);
+        assert_eq!(world.height_at([0.25, 0.25]).expect("height"), Some(0.0));
+        assert_eq!(
+            world
+                .raycast([0.25, 0.25, 101.0], [0.0, 0.0, -1.0], FullSurfaceMask(2),)
+                .expect("LOD1-only mask"),
+            None
+        );
+
+        mesh.nodes_raw.clear();
+        assert!(matches!(
+            TerrainWorld::from_land_msh(&mesh),
+            Err(TerrainError::InvalidLodMapping(
+                fparkan_terrain_format::TerrainLodError::MissingNodes { face_count: 2 }
+            ))
+        ));
+        mesh.faces.clear();
+        assert_eq!(
+            TerrainWorld::from_land_msh(&mesh)
+                .expect("empty scene without Node38")
+                .surface_count(),
+            0
+        );
+    }
+
+    #[test]
     fn foundation_world_queries_use_the_canonical_cut_and_generated_band() {
         use crate::{build_basement_foundations, BasementFootprint};
 
@@ -1415,7 +1458,7 @@ mod tests {
     }
 
     #[test]
-    fn foundation_install_rejects_invalid_source_identity_masks_and_generated_flags() {
+    fn foundation_install_rejects_invalid_source_identity_masks_flags_and_non_finite_geometry() {
         let mesh = synthetic_land_mesh();
         let source_triangle = [[0.0, 0.0, 0.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0]];
         let generated_triangle = [[0.0, 0.0, 0.0], [0.25, 0.0, 0.0], [0.0, 0.25, 0.0]];
@@ -1600,8 +1643,35 @@ mod tests {
                 .unwrap_or_else(|err| panic!("{corpus} {path:?}: {err}"));
                 let mesh = fparkan_terrain_format::decode_land_msh(&nres)
                     .unwrap_or_else(|err| panic!("{corpus} {path:?}: {err}"));
+                let expected_lod0_faces = mesh
+                    .face_lod_assignments()
+                    .unwrap_or_else(|err| panic!("{corpus} {path:?}: {err}"))
+                    .iter()
+                    .filter(|assignment| assignment.lod == TerrainLod::Lod0)
+                    .count();
                 let world = TerrainWorld::from_land_msh(&mesh)
                     .unwrap_or_else(|err| panic!("{corpus} {path:?}: {err}"));
+                assert_eq!(
+                    world.surface_count(),
+                    expected_lod0_faces,
+                    "{corpus} {path:?}"
+                );
+                if corpus == "IS" {
+                    let map_name = path
+                        .parent()
+                        .and_then(Path::file_name)
+                        .and_then(|name| name.to_str())
+                        .map(str::to_ascii_lowercase);
+                    let expected = match map_name.as_deref() {
+                        Some("automap") => Some(1_912),
+                        Some("prol") => Some(5_868),
+                        Some("tut_1") => Some(5_046),
+                        _ => None,
+                    };
+                    if let Some(expected) = expected {
+                        assert_eq!(world.surface_count(), expected, "{corpus} {path:?}");
+                    }
+                }
                 if world.surface_count() > SURFACE_BVH_LEAF_SIZE {
                     let triangle = &world.surfaces[0];
                     let point = [
@@ -1657,13 +1727,29 @@ mod tests {
             aux18: Vec::new(),
             faces: vec![face0, face1],
         };
-        let mut node = vec![u8::MAX; 38];
-        node[8..10].copy_from_slice(&0_u16.to_le_bytes());
-        let mut slot = [0_u8; 68];
-        slot[2..4].copy_from_slice(&(mesh.faces.len() as u16).to_le_bytes());
-        mesh.nodes_raw = node;
-        mesh.slots.slots_raw.push(slot);
+        assign_terrain_lod_slots(&mut mesh, &[[0, u16::MAX]], &[[0, 2]]);
         mesh
+    }
+
+    fn assign_terrain_lod_slots(
+        mesh: &mut LandMeshDocument,
+        node_slots: &[[u16; 2]],
+        face_ranges: &[[u16; 2]],
+    ) {
+        const NODE_STRIDE: usize = 38;
+        let mut nodes = vec![u8::MAX; node_slots.len() * NODE_STRIDE];
+        for (node_index, [lod0, lod1]) in node_slots.iter().copied().enumerate() {
+            let offset = node_index * NODE_STRIDE + 8;
+            nodes[offset..offset + 2].copy_from_slice(&lod0.to_le_bytes());
+            nodes[offset + 2..offset + 4].copy_from_slice(&lod1.to_le_bytes());
+        }
+        let mut slots = vec![[0_u8; 68]; face_ranges.len()];
+        for (slot, [start, count]) in slots.iter_mut().zip(face_ranges.iter().copied()) {
+            slot[..2].copy_from_slice(&start.to_le_bytes());
+            slot[2..4].copy_from_slice(&count.to_le_bytes());
+        }
+        mesh.nodes_raw = nodes;
+        mesh.slots.slots_raw = slots;
     }
 
     fn terrain_face(

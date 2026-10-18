@@ -1853,11 +1853,43 @@ mod tests {
         missing_nodes.faces.clear();
         assert_eq!(missing_nodes.face_lod_assignments(), Ok(Vec::new()));
 
-        let mut overlapping = mesh;
+        let mut overlapping = mesh.clone();
         overlapping.slots.slots_raw[3][..2].copy_from_slice(&2_u16.to_le_bytes());
         assert_eq!(
             overlapping.face_lod_assignments(),
             Err(TerrainLodError::DuplicateFaceAssignment { face: 2 })
+        );
+
+        let mut uncovered = mesh.clone();
+        uncovered.slots.slots_raw[1][2..4].copy_from_slice(&0_u16.to_le_bytes());
+        assert_eq!(
+            uncovered.face_lod_assignments(),
+            Err(TerrainLodError::MissingFaceAssignment { face: 1 })
+        );
+
+        let mut out_of_bounds = mesh.clone();
+        out_of_bounds.slots.slots_raw[3][..2].copy_from_slice(&4_u16.to_le_bytes());
+        assert_eq!(
+            out_of_bounds.face_lod_assignments(),
+            Err(TerrainLodError::FaceRangeOutOfBounds {
+                node: 1,
+                lod: TerrainLod::Lod1,
+                slot: 3,
+                start: 4,
+                count: 1,
+                face_count: 4,
+            })
+        );
+
+        let mut unsupported = mesh;
+        unsupported.nodes_raw[12..14].copy_from_slice(&0_u16.to_le_bytes());
+        assert_eq!(
+            unsupported.face_lod_assignments(),
+            Err(TerrainLodError::UnsupportedNodeSlot {
+                node: 0,
+                slot_index: 2,
+                slot: 0,
+            })
         );
     }
 
