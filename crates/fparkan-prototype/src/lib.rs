@@ -114,6 +114,9 @@ pub struct EffectivePrototype {
     /// Explicit component point resource referenced by this prototype's
     /// resolved `objects.rlb` registry inheritance chain, when present.
     pub point_resource: Option<ResourceKey>,
+    /// Explicit component NDP/provider resource referenced by this
+    /// prototype's resolved `objects.rlb` registry inheritance chain.
+    pub node_data_resource: Option<ResourceKey>,
 }
 
 /// Prototype resolution source.
@@ -1151,6 +1154,7 @@ fn resolve_archive_model(
         None,
         None,
         None,
+        None,
     )))
 }
 
@@ -1176,6 +1180,7 @@ fn resolve_objects_registry_model(
     };
     let control_resource = resolve_explicit_control_resource(object_key, &refs)?;
     let point_resource = resolve_explicit_point_resource(object_key, &refs)?;
+    let node_data_resource = resolve_explicit_node_data_resource(object_key, &refs)?;
 
     let mut missing_mesh_refs = Vec::new();
     for item in refs.iter().filter(|item| is_explicit_mesh_ref(item)) {
@@ -1187,6 +1192,7 @@ fn resolve_objects_registry_model(
             source_type,
             control_resource.clone(),
             point_resource.clone(),
+            node_data_resource.clone(),
         )? {
             return Ok(Some(prototype));
         }
@@ -1208,6 +1214,7 @@ fn resolve_objects_registry_model(
         dependencies: Vec::new(),
         control_resource,
         point_resource,
+        node_data_resource,
     }))
 }
 
@@ -1276,6 +1283,7 @@ fn resolve_object_ref_model(
     source_type: Option<u32>,
     control_resource: Option<ResourceKey>,
     point_resource: Option<ResourceKey>,
+    node_data_resource: Option<ResourceKey>,
 ) -> Result<Option<EffectivePrototype>, PrototypeError> {
     let archive = normalized_path_from_name(&ResourceName(cstr_bytes(&item.archive_raw).to_vec()))?;
     let Some(mesh) = find_mesh_resource(repository, &archive, &ResourceName(model_name.to_vec()))?
@@ -1289,6 +1297,7 @@ fn resolve_object_ref_model(
         source_type,
         control_resource,
         point_resource,
+        node_data_resource,
     )))
 }
 
@@ -1304,6 +1313,10 @@ fn is_explicit_point_ref(item: &ObjectRefRecord) -> bool {
     has_extension_bytes(cstr_bytes(&item.resource_raw), b"cpt")
 }
 
+fn is_explicit_node_data_ref(item: &ObjectRefRecord) -> bool {
+    has_extension_bytes(cstr_bytes(&item.resource_raw), b"ndp")
+}
+
 fn resolve_explicit_control_resource(
     requested: &ResourceName,
     refs: &[ObjectRefRecord],
@@ -1316,6 +1329,13 @@ fn resolve_explicit_point_resource(
     refs: &[ObjectRefRecord],
 ) -> Result<Option<ResourceKey>, PrototypeError> {
     resolve_explicit_resource(requested, refs, is_explicit_point_ref, "point")
+}
+
+fn resolve_explicit_node_data_resource(
+    requested: &ResourceName,
+    refs: &[ObjectRefRecord],
+) -> Result<Option<ResourceKey>, PrototypeError> {
+    resolve_explicit_resource(requested, refs, is_explicit_node_data_ref, "node data")
 }
 
 fn resolve_explicit_resource(
@@ -1421,6 +1441,7 @@ fn effective(
     source_type: Option<u32>,
     control_resource: Option<ResourceKey>,
     point_resource: Option<ResourceKey>,
+    node_data_resource: Option<ResourceKey>,
 ) -> EffectivePrototype {
     EffectivePrototype {
         key: PrototypeKey(requested),
@@ -1430,6 +1451,7 @@ fn effective(
         dependencies: vec![mesh],
         control_resource,
         point_resource,
+        node_data_resource,
     }
 }
 
@@ -2171,6 +2193,7 @@ mod tests {
                             (b"static.rlb".as_slice(), b"parent_proto.msh".as_slice()),
                             (b"fortif.rlb".as_slice(), b"parent_proto.cpt".as_slice()),
                             (b"fortif.rlb".as_slice(), b"parent_proto.ctl".as_slice()),
+                            (b"fortif.rlb".as_slice(), b"parent_proto.ndp".as_slice()),
                         ])
                         .as_slice(),
                     ),
@@ -2201,6 +2224,7 @@ mod tests {
                     (b"child_proto.bas".as_slice(), b"base"),
                     (b"parent_proto.ctl".as_slice(), b"control"),
                     (b"parent_proto.cpt".as_slice(), b"points"),
+                    (b"parent_proto.ndp".as_slice(), b"node data"),
                 ])
                 .into_boxed_slice(),
             ),
@@ -2223,6 +2247,11 @@ mod tests {
         let points = resolved.point_resource.expect("inherited explicit CPT");
         assert_eq!(points.archive.as_str(), "fortif.rlb");
         assert!(points.name.0.eq_ignore_ascii_case(b"parent_proto.cpt"));
+        let node_data = resolved
+            .node_data_resource
+            .expect("inherited explicit NDP provider table");
+        assert_eq!(node_data.archive.as_str(), "fortif.rlb");
+        assert!(node_data.name.0.eq_ignore_ascii_case(b"parent_proto.ndp"));
     }
 
     #[test]
@@ -2330,6 +2359,33 @@ mod tests {
             error,
             PrototypeError::Resource(ResourceError::Format(message))
                 if message.contains("ambiguous explicit control resources")
+        ));
+    }
+
+    #[test]
+    fn objects_registry_rejects_distinct_explicit_node_data() {
+        let raw_name = |value: &[u8]| {
+            let mut raw = [0; 32];
+            raw[..value.len()].copy_from_slice(value);
+            raw
+        };
+        let refs = [
+            ObjectRefRecord {
+                archive_raw: raw_name(b"first.rlb"),
+                resource_raw: raw_name(b"first.ndp"),
+            },
+            ObjectRefRecord {
+                archive_raw: raw_name(b"second.rlb"),
+                resource_raw: raw_name(b"second.ndp"),
+            },
+        ];
+
+        let error = resolve_explicit_node_data_resource(&resource_name(b"prototype"), &refs)
+            .expect_err("distinct explicit node data resources are ambiguous");
+        assert!(matches!(
+            error,
+            PrototypeError::Resource(ResourceError::Format(message))
+                if message.contains("ambiguous explicit node data resources")
         ));
     }
 

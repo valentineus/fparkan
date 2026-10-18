@@ -901,12 +901,104 @@ pub struct PreparedVisual {
 pub struct PreparedComponentControl {
     /// CTLD resource that supplied these bindings.
     pub source: ResourceKey,
+    /// Number of nodes in the component model this control targets.
+    pub model_node_count: usize,
     /// Enabled source rows in their original order, including duplicate nodes.
     pub bindings: Vec<PreparedControlNodeBinding>,
+    /// Every raw 36-byte animation row in source order. The typed controller
+    /// map refers to these original row indices, including disabled rows.
+    pub timeline_rows: Vec<PreparedControlTimelineRow>,
+    /// Parsed typed records retained for the native controller evaluator.
+    pub typed_records: Vec<PreparedControlTypedRecord>,
+    /// Explicit NDP sidecar and its validated rows, when resolved.
+    pub node_data: Option<PreparedControlNodeDataTable>,
     /// Parsed native effect rows in this component's control resource.
     pub effect_section: PreparedControlEffectSection,
     /// Component-local points selected for parsed effect rows, when present.
     pub point_list: Option<PreparedControlPointList>,
+}
+
+/// Raw and decoded fields from one 36-byte CTLD animation row.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PreparedControlTimelineRow {
+    /// Original row index, used by typed-record map values.
+    pub row_index: usize,
+    /// Target node index in the component model.
+    pub node_index: usize,
+    /// First animation endpoint.
+    pub frame_a: f32,
+    /// Second animation endpoint.
+    pub frame_b: f32,
+    /// Initial blend written by native Control during setup.
+    pub initial_blend: f32,
+    /// Native auxiliary words at row offsets +0x10, +0x14, +0x18, and +0x1C.
+    pub raw_parameters: [u32; 4],
+    /// Raw native row flags at +0x20.
+    pub flags: u32,
+}
+
+/// One parsed 0xB0-byte typed-record body and its following value/string data.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedControlTypedRecord {
+    /// Native record tag at body offset 0.
+    pub tag: u32,
+    /// All 44 raw little-endian words from the fixed 0xB0-byte body.
+    pub fixed_words: [u32; 44],
+    /// Raw values following the fixed body; tag-specific parsing is deferred.
+    pub values: Vec<u32>,
+    /// Raw bytes following the value array, excluding the required trailing NUL.
+    pub string_bytes: Vec<u8>,
+    /// Native tag-21 query provider resolved from the explicit NDP sidecar.
+    /// Other tags use `NotApplicable`.
+    pub gate_provider: PreparedControlGateProvider,
+}
+
+/// Initial tag-21 query provider resolution for one typed controller record.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PreparedControlGateProvider {
+    /// The record is not a tag-21 controller.
+    NotApplicable,
+    /// Its raw key selects a validated NDP row. Native Control initializes
+    /// this type-1 query value to 1.0 before runtime state changes.
+    Resolved {
+        key: u32,
+        ndp_source: ResourceKey,
+        row_count: usize,
+        initial_type1_value: f32,
+    },
+    /// No NDP reference was present, or its referenced archive/entry is absent.
+    MissingResource {
+        key: u32,
+        ndp_source: Option<ResourceKey>,
+    },
+    /// The key is not a row in the validated NDP table.
+    KeyOutOfRange {
+        key: u32,
+        ndp_source: ResourceKey,
+        row_count: usize,
+    },
+}
+
+/// Parsed NDP sidecar used as the native Control query-provider table.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedControlNodeDataTable {
+    /// Explicit NDP resource paired with the component prototype.
+    pub source: ResourceKey,
+    /// Provider rows in their native table order.
+    pub rows: Vec<PreparedControlNodeDataRow>,
+}
+
+/// One validated 76-byte NDP sidecar row.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedControlNodeDataRow {
+    /// Raw native flag bits.
+    pub raw_flags: u32,
+    /// Maximum volume value at row offset +4.
+    pub max_volume: f32,
+    /// Mobility-per-volume value at row offset +8.
+    pub mobility_per_volume: f32,
+    /// Effect resource pair at row offset +12.
+    pub effect: PreparedControlResourcePair,
 }
 
 /// Decoded point records selected by a component's Control configuration.
@@ -992,6 +1084,382 @@ pub struct PreparedControlNodeBinding {
     pub initial_blend: f32,
     /// Raw native row flags.
     pub flags: u32,
+}
+
+/// Per-component instance state for native tag-21 control animation.
+///
+/// Keep one value per model component instance; controls on shared models can
+/// have independent clocks and gate samples.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ControlInstanceState {
+    initialized: bool,
+    node_times: Vec<Option<f32>>,
+    tag21_tracks: Vec<ControlTag21InstanceState>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ControlTag21InstanceState {
+    phase: f32,
+    segment_start_ms: f32,
+    segment_end_ms: f32,
+    reciprocal_duration: f32,
+    initialized: bool,
+    maps: Vec<ControlTag21MapInstanceState>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ControlTag21MapInstanceState {
+    row_index: usize,
+    previous: f32,
+    next: f32,
+    current: f32,
+}
+
+impl Default for ControlTag21InstanceState {
+    fn default() -> Self {
+        Self {
+            phase: 0.0,
+            segment_start_ms: 0.0,
+            segment_end_ms: 0.0,
+            reciprocal_duration: 1.0,
+            initialized: false,
+            maps: Vec::new(),
+        }
+    }
+}
+
+/// Input or metadata prevented a safe native control sample.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlSamplingError {
+    /// A state object was reused with a different model node count.
+    StateNodeCountMismatch { expected: usize, actual: usize },
+    /// A state object was reused with a different number of tag-21 records.
+    StateTimelineCountMismatch { expected: usize, actual: usize },
+    /// The caller did not provide one query-provider value per tag-21 record.
+    GateProviderCountMismatch { expected: usize, actual: usize },
+    /// A tag-21 record has no corresponding NDP provider resource.
+    MissingGateProvider { record_index: usize, key: u32 },
+    /// A tag-21 query key does not select a row in its NDP table.
+    GateProviderKeyOutOfRange {
+        record_index: usize,
+        key: u32,
+        row_count: usize,
+    },
+    /// A resolved provider lacks a finite current type-1 value.
+    MissingGateProviderValue { record_index: usize, key: u32 },
+    /// The record uses a tag-21 mode whose native selector is not yet decoded.
+    UnsupportedTag21Mode { record_index: usize, packed: u32 },
+    /// A tag-21 record did not retain a valid source-row map index.
+    InvalidTag21MapIndex {
+        record_index: usize,
+        map_index: usize,
+    },
+    /// A mapped source row reuses the previous typed row's current value.
+    ///
+    /// This native flag is currently rejected so callers can use their static
+    /// fallback instead of silently sampling the wrong row value.
+    UnsupportedPreviousRowMapping { row_index: usize },
+    /// A mapped raw source row has an invalid rate at +0x18.
+    InvalidTransitionRate { row_index: usize },
+    /// A mapped raw source row uses external variable selectors at +0x10/+0x14.
+    UnsupportedVariableMapping { row_index: usize },
+    /// The controller computation produced a non-finite sample.
+    NonFiniteSample { record_index: usize },
+}
+
+/// Samples per-node animation times using the decoded Control timeline.
+///
+/// `native_clock_ms` is the absolute u32 millisecond clock passed to native
+/// Control::Update. `gate_values` carries one provider type-1 float per tag-21
+/// record, in source order. Native query 0x21820 returns 1 when that float is
+/// zero, and the tag-21 update stops when that query returns 1; thus each
+/// record updates when its provider value is nonzero. `None` values are
+/// rejected explicitly. Values are not blend values. The state must be private
+/// to one component instance and retained between calls. Rows and typed maps
+/// are processed in source order, so later rows targeting one node win as in
+/// native Control.
+pub fn sample_control_node_times(
+    control: &PreparedComponentControl,
+    native_clock_ms: u32,
+    gate_values: &[Option<f32>],
+    state: &mut ControlInstanceState,
+) -> Result<Vec<Option<f32>>, ControlSamplingError> {
+    let node_count = control.model_node_count;
+    let tag21_records: Vec<&PreparedControlTypedRecord> = control
+        .typed_records
+        .iter()
+        .filter(|record| record.tag == 21)
+        .collect();
+    if gate_values.len() != tag21_records.len() {
+        return Err(ControlSamplingError::GateProviderCountMismatch {
+            expected: tag21_records.len(),
+            actual: gate_values.len(),
+        });
+    }
+
+    if state.initialized {
+        if state.node_times.len() != node_count {
+            return Err(ControlSamplingError::StateNodeCountMismatch {
+                expected: node_count,
+                actual: state.node_times.len(),
+            });
+        }
+        if state.tag21_tracks.len() != tag21_records.len() {
+            return Err(ControlSamplingError::StateTimelineCountMismatch {
+                expected: tag21_records.len(),
+                actual: state.tag21_tracks.len(),
+            });
+        }
+    } else {
+        state.node_times = vec![Some(0.0); node_count];
+        for binding in &control.bindings {
+            if binding.flags & 4 == 0 && binding.node_index < node_count {
+                let blend = native_control_blend(binding.initial_blend, binding.flags);
+                state.node_times[binding.node_index] =
+                    Some((1.0 - blend) * binding.frame_a + blend * binding.frame_b);
+            }
+        }
+        state.tag21_tracks = tag21_records
+            .iter()
+            .enumerate()
+            .map(|(record_index, record)| {
+                let mut track = ControlTag21InstanceState::default();
+                for map_index in &record.values {
+                    let row_index = usize::try_from(*map_index).unwrap_or(usize::MAX);
+                    let Some(row) = control.timeline_rows.get(row_index) else {
+                        return Err(ControlSamplingError::InvalidTag21MapIndex {
+                            record_index,
+                            map_index: row_index,
+                        });
+                    };
+                    track.maps.push(ControlTag21MapInstanceState {
+                        row_index,
+                        previous: row.initial_blend,
+                        next: row.initial_blend,
+                        current: row.initial_blend,
+                    });
+                }
+                Ok(track)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        state.initialized = true;
+    }
+
+    let now_ms = native_clock_ms as f32;
+    for (record_index, record) in tag21_records.iter().enumerate() {
+        let packed = record.fixed_words[2];
+        let raw_flags = record.fixed_words[6];
+        let controller_flags = if raw_flags == u32::MAX { 5 } else { raw_flags };
+        if packed != 0 || controller_flags != 5 {
+            return Err(ControlSamplingError::UnsupportedTag21Mode {
+                record_index,
+                packed,
+            });
+        }
+        let coefficient = f32::from_bits(record.fixed_words[9]);
+        let unused_coefficient = f32::from_bits(record.fixed_words[10]);
+        if !coefficient.is_finite() || !unused_coefficient.is_finite() {
+            return Err(ControlSamplingError::NonFiniteSample { record_index });
+        }
+
+        let key = record.fixed_words[1];
+        match &record.gate_provider {
+            PreparedControlGateProvider::Resolved {
+                key: provider_key,
+                row_count,
+                ..
+            } if *provider_key == key && usize::try_from(key).is_ok_and(|key| key < *row_count) => {
+            }
+            PreparedControlGateProvider::KeyOutOfRange {
+                key: provider_key,
+                row_count,
+                ..
+            } if *provider_key == key => {
+                return Err(ControlSamplingError::GateProviderKeyOutOfRange {
+                    record_index,
+                    key,
+                    row_count: *row_count,
+                });
+            }
+            PreparedControlGateProvider::MissingResource {
+                key: provider_key, ..
+            } if *provider_key == key => {
+                return Err(ControlSamplingError::MissingGateProvider { record_index, key });
+            }
+            _ => return Err(ControlSamplingError::MissingGateProvider { record_index, key }),
+        }
+        let provider_value = gate_values[record_index]
+            .ok_or(ControlSamplingError::MissingGateProviderValue { record_index, key })?;
+        if !provider_value.is_finite() {
+            return Err(ControlSamplingError::MissingGateProviderValue { record_index, key });
+        }
+
+        let track = &mut state.tag21_tracks[record_index];
+        let mut catch_up_steps = 0_usize;
+        while !track.initialized || now_ms > track.segment_end_ms {
+            if track.initialized {
+                // 2D260 calls 21A30 before opening the next interval. Since
+                // this loop runs only after `clock > end`, that sample has
+                // reached every typed map's next value.
+                for mapping in &mut track.maps {
+                    mapping.current = mapping.next;
+                }
+            }
+            if provider_value == 0.0 {
+                // A closed native gate keeps the current value and rebases the
+                // next transition to this absolute sample time.
+                for mapping in &mut track.maps {
+                    mapping.previous = mapping.current;
+                    mapping.next = mapping.current;
+                }
+                track.segment_start_ms = now_ms;
+                track.segment_end_ms = now_ms;
+                track.reciprocal_duration = 1.0;
+                track.initialized = true;
+                break;
+            }
+
+            let direction = match controller_flags & 3 {
+                1 => 1.0,
+                2 => -1.0,
+                _ => 0.0,
+            };
+            let mut next_phase = track.phase + coefficient * 0.45 * direction;
+            if controller_flags & 0x0C == 4 {
+                next_phase = wrap_control_value_once(next_phase);
+            } else if controller_flags & 0x0C == 8 {
+                next_phase = next_phase.clamp(0.0, 1.0);
+            }
+            let mut duration_ms = 0.0_f32;
+            for mapping in &mut track.maps {
+                let row = &control.timeline_rows[mapping.row_index];
+                if row.flags & 0x40 != 0 {
+                    return Err(ControlSamplingError::UnsupportedPreviousRowMapping {
+                        row_index: mapping.row_index,
+                    });
+                }
+                if row.raw_parameters[0] != u32::MAX || row.raw_parameters[1] != u32::MAX {
+                    return Err(ControlSamplingError::UnsupportedVariableMapping {
+                        row_index: mapping.row_index,
+                    });
+                }
+                let rate = f32::from_bits(row.raw_parameters[2]);
+                if !rate.is_finite() || rate <= 0.0 {
+                    return Err(ControlSamplingError::InvalidTransitionRate {
+                        row_index: mapping.row_index,
+                    });
+                }
+                mapping.previous = mapping.current;
+                mapping.next = next_phase;
+                let direct_distance = (mapping.next - mapping.previous).abs();
+                let distance = if row.flags & 1 != 0 {
+                    shortest_wrapped_distance(mapping.previous, mapping.next)
+                } else {
+                    direct_distance
+                };
+                let transition_speed = coefficient.abs() * rate;
+                let candidate_duration = if transition_speed > 0.0 {
+                    1000.0 * distance / transition_speed
+                } else {
+                    100.0
+                };
+                if !candidate_duration.is_finite() {
+                    return Err(ControlSamplingError::NonFiniteSample { record_index });
+                }
+                duration_ms = duration_ms.max(candidate_duration);
+            }
+
+            // Native Control only substitutes 100 ms when the proposed
+            // interval is shorter than 1 ms; ordinary short transitions stay
+            // short (for example 22.5 ms at rate 20).
+            if duration_ms < 1.0 {
+                duration_ms = 100.0;
+            }
+            track.segment_start_ms = track.segment_end_ms;
+            track.phase = next_phase;
+            track.segment_end_ms = track.segment_start_ms + duration_ms;
+            let actual_duration = track.segment_end_ms - track.segment_start_ms;
+            track.reciprocal_duration = if actual_duration > 0.0 {
+                1.0 / actual_duration
+            } else {
+                1.0
+            };
+            track.initialized = true;
+            catch_up_steps += 1;
+            if catch_up_steps > 100_000 {
+                // shortcut: cap catch-up at 100,000 transitions; replace with a bounded
+                // fast-forward if valid long clock stalls must reproduce every transition.
+                return Err(ControlSamplingError::NonFiniteSample { record_index });
+            }
+        }
+
+        let duration = track.segment_end_ms - track.segment_start_ms;
+        let alpha = if duration > 0.0 {
+            ((now_ms - track.segment_start_ms) * track.reciprocal_duration).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        for mapping in &mut track.maps {
+            let row = &control.timeline_rows[mapping.row_index];
+            if row.flags & 4 != 0 || row.node_index >= node_count {
+                continue;
+            }
+            let mut delta = mapping.next - mapping.previous;
+            if row.flags & 1 != 0 {
+                if delta > 0.5 {
+                    delta -= 1.0;
+                } else if delta < -0.5 {
+                    delta += 1.0;
+                }
+                mapping.current = wrap_control_value_once(mapping.previous + delta * alpha);
+            } else {
+                mapping.current = (mapping.previous + delta * alpha).clamp(0.0, 1.0);
+            }
+            if !mapping.current.is_finite() {
+                return Err(ControlSamplingError::NonFiniteSample { record_index });
+            }
+            let blend = native_control_blend(mapping.current, row.flags);
+            let time = (1.0 - blend) * row.frame_a + blend * row.frame_b;
+            if !time.is_finite() || time < 0.0 {
+                return Err(ControlSamplingError::NonFiniteSample { record_index });
+            }
+            state.node_times[row.node_index] = Some(time);
+        }
+    }
+
+    Ok(state.node_times.clone())
+}
+
+fn shortest_wrapped_distance(previous: f32, next: f32) -> f32 {
+    let direct = (next - previous).abs();
+    direct.min((1.0 - direct).abs())
+}
+
+fn wrap_control_value_once(mut value: f32) -> f32 {
+    if value > 1.0 {
+        value -= 1.0;
+    }
+    if value < 0.0 {
+        value += 1.0;
+    }
+    value
+}
+
+fn native_control_blend(mut blend: f32, flags: u32) -> f32 {
+    if flags & 1 != 0 {
+        if blend > 1.0 {
+            blend -= 1.0;
+        }
+        if blend < 0.0 {
+            blend += 1.0;
+        }
+    } else {
+        blend = blend.clamp(0.0, 1.0);
+    }
+    if flags & 2 != 0 {
+        blend = 1.0 - blend;
+    }
+    blend
 }
 
 /// CPU-side validated model ready for a renderer upload path.
@@ -1563,6 +2031,7 @@ fn prepare_mission_assets_with_repository_internal<R: ResourceRepository>(
             repository,
             source,
             prototype.point_resource.clone(),
+            prototype.node_data_resource.clone(),
             model.validated.node_count,
             prototype_index,
         )?;
@@ -2861,6 +3330,7 @@ fn prepare_component_control_from_resource<R: ResourceRepository>(
     repository: &R,
     source: ResourceKey,
     point_source: Option<ResourceKey>,
+    node_data_source: Option<ResourceKey>,
     model_node_count: usize,
     prototype_index: usize,
 ) -> Result<Option<PreparedComponentControl>, AssetError> {
@@ -2869,6 +3339,19 @@ fn prepare_component_control_from_resource<R: ResourceRepository>(
     };
     let mut control =
         decode_component_control_payload(&payload, source, model_node_count, prototype_index)?;
+    let node_data_payload = match node_data_source.as_ref() {
+        Some(source) => read_optional_key(repository, source, Some("component node data"))?,
+        None => None,
+    };
+    control.node_data = match (node_data_source.as_ref(), node_data_payload) {
+        (Some(source), Some(payload)) => Some(decode_component_node_data_table(
+            &payload,
+            source.clone(),
+            prototype_index,
+        )?),
+        _ => None,
+    };
+    resolve_control_gate_providers(&mut control, node_data_source.as_ref());
     let has_effect_rows = matches!(
         &control.effect_section,
         PreparedControlEffectSection::Parsed(rows) if !rows.is_empty()
@@ -2887,6 +3370,94 @@ fn prepare_component_control_from_resource<R: ResourceRepository>(
         prototype_index,
     )?);
     Ok(Some(control))
+}
+
+fn decode_component_node_data_table(
+    payload: &[u8],
+    source: ResourceKey,
+    prototype_index: usize,
+) -> Result<PreparedControlNodeDataTable, AssetError> {
+    const HEADER_BYTES: usize = 4;
+    const ROW_BYTES: usize = 76;
+    const ROW_LIMIT: usize = 65_536;
+
+    let invalid = |message: &str| {
+        AssetError::InvalidPrototype(format!(
+            "prototype {prototype_index} node data {}:{}: {message}",
+            source.archive.as_str(),
+            String::from_utf8_lossy(&source.name.0),
+        ))
+    };
+    let row_count =
+        usize::try_from(control_u32_at(payload, 0).ok_or_else(|| invalid("missing row count"))?)
+            .map_err(|_| invalid("row count overflows usize"))?;
+    if row_count > ROW_LIMIT {
+        return Err(invalid("row count exceeds the supported limit"));
+    }
+    let table_bytes = row_count
+        .checked_mul(ROW_BYTES)
+        .ok_or_else(|| invalid("row table byte length overflows"))?;
+    let expected_len = HEADER_BYTES
+        .checked_add(table_bytes)
+        .ok_or_else(|| invalid("row table end offset overflows"))?;
+    if payload.len() != expected_len {
+        return Err(invalid(
+            "payload length does not match its declared 76-byte row count",
+        ));
+    }
+
+    let mut rows = Vec::with_capacity(row_count);
+    for row_index in 0..row_count {
+        let start = HEADER_BYTES + row_index * ROW_BYTES;
+        let word = |offset: usize| {
+            control_u32_at(payload, start + offset).expect("validated 76-byte NDP row")
+        };
+        let mut archive = [0; 32];
+        let mut name = [0; 32];
+        archive.copy_from_slice(&payload[start + 12..start + 44]);
+        name.copy_from_slice(&payload[start + 44..start + 76]);
+        rows.push(PreparedControlNodeDataRow {
+            raw_flags: word(0),
+            max_volume: f32::from_bits(word(4)),
+            mobility_per_volume: f32::from_bits(word(8)),
+            effect: PreparedControlResourcePair { archive, name },
+        });
+    }
+    Ok(PreparedControlNodeDataTable { source, rows })
+}
+
+fn resolve_control_gate_providers(
+    control: &mut PreparedComponentControl,
+    node_data_source: Option<&ResourceKey>,
+) {
+    const INITIAL_TYPE1_VALUE: f32 = 1.0;
+    let row_count = control.node_data.as_ref().map(|table| table.rows.len());
+    for record in control
+        .typed_records
+        .iter_mut()
+        .filter(|record| record.tag == 21)
+    {
+        let key = record.fixed_words[1];
+        record.gate_provider = match (control.node_data.as_ref(), row_count) {
+            (Some(table), Some(count)) if usize::try_from(key).is_ok_and(|key| key < count) => {
+                PreparedControlGateProvider::Resolved {
+                    key,
+                    ndp_source: table.source.clone(),
+                    row_count: count,
+                    initial_type1_value: INITIAL_TYPE1_VALUE,
+                }
+            }
+            (Some(table), Some(count)) => PreparedControlGateProvider::KeyOutOfRange {
+                key,
+                ndp_source: table.source.clone(),
+                row_count: count,
+            },
+            _ => PreparedControlGateProvider::MissingResource {
+                key,
+                ndp_source: node_data_source.cloned(),
+            },
+        };
+    }
 }
 
 fn decode_component_point_list(
@@ -2992,24 +3563,32 @@ const CONTROL_EFFECT_ROW_LIMIT: usize = 65_536;
 const CONTROL_EFFECT_GROUP_HEADER_BYTES: usize = 0x54;
 const CONTROL_EFFECT_ROW_BYTES: usize = 100;
 
+struct DecodedComponentEffectSection {
+    section: PreparedControlEffectSection,
+    typed_records: Vec<PreparedControlTypedRecord>,
+}
+
 fn decode_component_effect_section<F>(
     payload: &[u8],
     mut cursor: usize,
     typed_record_count: usize,
     effect_group_count: usize,
     invalid: &F,
-) -> Result<PreparedControlEffectSection, AssetError>
+) -> Result<DecodedComponentEffectSection, AssetError>
 where
     F: Fn(&str) -> AssetError,
 {
     if typed_record_count == 0 && effect_group_count == 0 {
-        return Ok(if cursor == payload.len() {
-            PreparedControlEffectSection::Absent
-        } else {
-            PreparedControlEffectSection::Unsupported {
-                typed_record_index: None,
-                typed_record_tag: None,
-            }
+        return Ok(DecodedComponentEffectSection {
+            section: if cursor == payload.len() {
+                PreparedControlEffectSection::Absent
+            } else {
+                PreparedControlEffectSection::Unsupported {
+                    typed_record_index: None,
+                    typed_record_tag: None,
+                }
+            },
+            typed_records: Vec::new(),
         });
     }
     if typed_record_count > CONTROL_TYPED_RECORD_LIMIT {
@@ -3019,13 +3598,17 @@ where
         return Err(invalid("effect group count exceeds the supported limit"));
     }
 
+    let mut typed_records = Vec::with_capacity(typed_record_count);
     for record_index in 0..typed_record_count {
         let tag = control_u32_at(payload, cursor)
             .ok_or_else(|| invalid("typed record is missing its tag"))?;
         if !CONTROL_TYPED_COMMON_PARSER_TAGS.contains(&tag) {
-            return Ok(PreparedControlEffectSection::Unsupported {
-                typed_record_index: Some(record_index),
-                typed_record_tag: Some(tag),
+            return Ok(DecodedComponentEffectSection {
+                section: PreparedControlEffectSection::Unsupported {
+                    typed_record_index: Some(record_index),
+                    typed_record_tag: Some(tag),
+                },
+                typed_records,
             });
         }
 
@@ -3061,41 +3644,69 @@ where
 
         // Native parsing returns immediately for length zero. For UINT32_MAX,
         // its signed length+1 wraps to zero, also consuming no string bytes.
-        let string_bytes = if string_length == 0 || string_length == u32::MAX {
-            0
+        let (string_end, string_content_end) = if string_length == 0 || string_length == u32::MAX {
+            (after_length, after_length)
         } else {
-            usize::try_from(string_length)
+            let string_bytes = usize::try_from(string_length)
                 .ok()
                 .and_then(|length| length.checked_add(1))
-                .ok_or_else(|| invalid("typed record string length overflows"))?
+                .ok_or_else(|| invalid("typed record string length overflows"))?;
+            if string_bytes > CONTROL_TYPED_STRING_LIMIT {
+                return Err(invalid("typed record string exceeds the supported limit"));
+            }
+            let string_end = after_length
+                .checked_add(string_bytes)
+                .ok_or_else(|| invalid("typed record string end overflows"))?;
+            if string_end > payload.len() {
+                return Err(invalid("typed record string extends past the payload"));
+            }
+            if payload[string_end - 1] != 0 {
+                return Err(invalid("typed record string is missing its trailing NUL"));
+            }
+            (string_end, string_end - 1)
         };
-        if string_bytes == 0 {
-            cursor = after_length;
-            continue;
+        let mut fixed_words = [0_u32; 44];
+        for (word_index, word) in fixed_words.iter_mut().enumerate() {
+            *word = control_u32_at(payload, cursor + word_index * 4)
+                .expect("typed record fixed header was checked");
         }
-        if string_bytes > CONTROL_TYPED_STRING_LIMIT {
-            return Err(invalid("typed record string exceeds the supported limit"));
-        }
-        let string_end = after_length
-            .checked_add(string_bytes)
-            .ok_or_else(|| invalid("typed record string end overflows"))?;
-        if string_end > payload.len() {
-            return Err(invalid("typed record string extends past the payload"));
-        }
-        if payload[string_end - 1] != 0 {
-            return Err(invalid("typed record string is missing its trailing NUL"));
-        }
+        let values = (0..value_count)
+            .map(|index| {
+                control_u32_at(
+                    payload,
+                    cursor + CONTROL_TYPED_RECORD_FIXED_BYTES + index * 4,
+                )
+                .expect("typed record values were checked")
+            })
+            .collect();
+        typed_records.push(PreparedControlTypedRecord {
+            tag,
+            fixed_words,
+            values,
+            string_bytes: payload[after_length..string_content_end].to_vec(),
+            gate_provider: if tag == 21 {
+                PreparedControlGateProvider::MissingResource {
+                    key: fixed_words[1],
+                    ndp_source: None,
+                }
+            } else {
+                PreparedControlGateProvider::NotApplicable
+            },
+        });
         cursor = string_end;
     }
 
     if effect_group_count == 0 {
-        return Ok(if cursor == payload.len() {
-            PreparedControlEffectSection::Parsed(Vec::new())
-        } else {
-            PreparedControlEffectSection::Unsupported {
-                typed_record_index: None,
-                typed_record_tag: None,
-            }
+        return Ok(DecodedComponentEffectSection {
+            section: if cursor == payload.len() {
+                PreparedControlEffectSection::Parsed(Vec::new())
+            } else {
+                PreparedControlEffectSection::Unsupported {
+                    typed_record_index: None,
+                    typed_record_tag: None,
+                }
+            },
+            typed_records,
         });
     }
 
@@ -3165,12 +3776,18 @@ where
     }
 
     if cursor != payload.len() {
-        return Ok(PreparedControlEffectSection::Unsupported {
-            typed_record_index: None,
-            typed_record_tag: None,
+        return Ok(DecodedComponentEffectSection {
+            section: PreparedControlEffectSection::Unsupported {
+                typed_record_index: None,
+                typed_record_tag: None,
+            },
+            typed_records,
         });
     }
-    Ok(PreparedControlEffectSection::Parsed(effect_rows))
+    Ok(DecodedComponentEffectSection {
+        section: PreparedControlEffectSection::Parsed(effect_rows),
+        typed_records,
+    })
 }
 
 fn control_u32_at(payload: &[u8], offset: usize) -> Option<u32> {
@@ -3250,22 +3867,38 @@ fn decode_component_control_payload(
     }
 
     let mut bindings = Vec::with_capacity(row_count);
+    let mut timeline_rows = Vec::with_capacity(row_count);
     for row_index in 0..row_count {
         let row_start = row_start + row_index * ROW_BYTES;
         let row = &payload[row_start..row_start + ROW_BYTES];
         let flags = u32::from_le_bytes(row[0x20..0x24].try_into().expect("row flags"));
-        if flags & 4 != 0 {
-            continue;
-        }
         let node_index = u32::from_le_bytes(row[0..4].try_into().expect("row node index")) as usize;
-        if node_index >= model_node_count {
-            return Err(invalid("enabled binding node index is outside the model"));
-        }
         let frame_a = f32::from_bits(u32::from_le_bytes(row[4..8].try_into().expect("frame A")));
         let frame_b = f32::from_bits(u32::from_le_bytes(row[8..12].try_into().expect("frame B")));
         let initial_blend = f32::from_bits(u32::from_le_bytes(
             row[12..16].try_into().expect("initial blend"),
         ));
+        let raw_parameters = [
+            u32::from_le_bytes(row[0x10..0x14].try_into().expect("row parameter +0x10")),
+            u32::from_le_bytes(row[0x14..0x18].try_into().expect("row parameter +0x14")),
+            u32::from_le_bytes(row[0x18..0x1C].try_into().expect("row parameter +0x18")),
+            u32::from_le_bytes(row[0x1C..0x20].try_into().expect("row parameter +0x1C")),
+        ];
+        timeline_rows.push(PreparedControlTimelineRow {
+            row_index,
+            node_index,
+            frame_a,
+            frame_b,
+            initial_blend,
+            raw_parameters,
+            flags,
+        });
+        if flags & 4 != 0 {
+            continue;
+        }
+        if node_index >= model_node_count {
+            return Err(invalid("enabled binding node index is outside the model"));
+        }
         if !frame_a.is_finite()
             || !frame_b.is_finite()
             || !initial_blend.is_finite()
@@ -3285,7 +3918,7 @@ fn decode_component_control_payload(
         });
     }
 
-    let effect_section = decode_component_effect_section(
+    let decoded_effect = decode_component_effect_section(
         payload,
         row_end,
         typed_record_count,
@@ -3295,8 +3928,12 @@ fn decode_component_control_payload(
 
     Ok(PreparedComponentControl {
         source,
+        model_node_count,
         bindings,
-        effect_section,
+        timeline_rows,
+        typed_records: decoded_effect.typed_records,
+        node_data: None,
+        effect_section: decoded_effect.section,
         point_list: None,
     })
 }
@@ -3402,6 +4039,164 @@ mod tests {
     use fparkan_vfs::{DirectoryVfs, MemoryVfs, Vfs};
     use std::path::PathBuf;
 
+    // Preserve the authored CTLD fixture bits; this is not the `f32` value of tau.
+    const AUTHORED_TAG21_RAW_PARAMETER_3: f32 = f32::from_bits(0x40C8_F5C3);
+
+    fn tag21_fullcycle_control() -> PreparedComponentControl {
+        let source = ResourceKey {
+            archive: parse_path("parts.rlb").expect("archive"),
+            name: resource_name(b"u_all_def_a_01.ctl"),
+            type_id: None,
+        };
+        let mut payload = component_control_payload(&[(1, 0.0, 4.0, 0.0, 1)]);
+        let row_start = 5 * 4 + 108;
+        payload[row_start + 0x10..row_start + 0x14].copy_from_slice(&u32::MAX.to_le_bytes());
+        payload[row_start + 0x14..row_start + 0x18].copy_from_slice(&u32::MAX.to_le_bytes());
+        payload[row_start + 0x18..row_start + 0x1C]
+            .copy_from_slice(&0.5_f32.to_bits().to_le_bytes());
+        payload[row_start + 0x1C..row_start + 0x20]
+            .copy_from_slice(&AUTHORED_TAG21_RAW_PARAMETER_3.to_bits().to_le_bytes());
+        payload[12..16].copy_from_slice(&1_u32.to_le_bytes());
+
+        let typed_start = payload.len();
+        let mut fixed = [0_u8; CONTROL_TYPED_RECORD_FIXED_BYTES];
+        fixed[0..4].copy_from_slice(&21_u32.to_le_bytes());
+        fixed[8..12].copy_from_slice(&0_u32.to_le_bytes());
+        fixed[0x18..0x1C].copy_from_slice(&u32::MAX.to_le_bytes());
+        fixed[0x24..0x28].copy_from_slice(&1.0_f32.to_bits().to_le_bytes());
+        fixed[0x28..0x2C].copy_from_slice(&1.0_f32.to_bits().to_le_bytes());
+        fixed[CONTROL_TYPED_RECORD_COUNT_OFFSET..CONTROL_TYPED_RECORD_COUNT_OFFSET + 4]
+            .copy_from_slice(&1_u32.to_le_bytes());
+        payload.extend_from_slice(&fixed);
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        assert_eq!(
+            typed_start + CONTROL_TYPED_RECORD_FIXED_BYTES + 8,
+            payload.len()
+        );
+
+        let mut control =
+            decode_component_control_payload(&payload, source, 2, 0).expect("tag21 CTLD");
+        control.typed_records[0].gate_provider = PreparedControlGateProvider::Resolved {
+            key: 0,
+            ndp_source: ResourceKey {
+                archive: parse_path("parts.rlb").expect("NDP archive"),
+                name: resource_name(b"u_all_def_a_01.ndp"),
+                type_id: None,
+            },
+            row_count: 1,
+            initial_type1_value: 1.0,
+        };
+        control
+    }
+
+    #[test]
+    fn tag21_sampler_replays_authored_fullcycle_clock_and_gate() {
+        let control = tag21_fullcycle_control();
+        assert_eq!(control.model_node_count, 2);
+        assert_eq!(control.typed_records.len(), 1);
+        assert_eq!(control.typed_records[0].tag, 21);
+        assert_eq!(control.typed_records[0].values, vec![0]);
+        assert_eq!(
+            f32::from_bits(control.timeline_rows[0].raw_parameters[2]),
+            0.5
+        );
+        assert_eq!(
+            f32::from_bits(control.timeline_rows[0].raw_parameters[3]),
+            AUTHORED_TAG21_RAW_PARAMETER_3
+        );
+
+        // Native Control receives 1.0 from the first default NDP provider row.
+        // Since 0x21820 tests for zero and its caller stops on return value 1,
+        // a nonzero provider value opens the tag-21 update path.
+        let default_provider_value = 1.0_f32;
+        let gate_values = [Some(default_provider_value)];
+        let mut state = ControlInstanceState::default();
+        let at_zero = sample_control_node_times(&control, 0, &gate_values, &mut state)
+            .expect("initial tag21 sample");
+        assert_eq!(at_zero, vec![Some(0.0), Some(0.0)]);
+
+        let at_quarter_step = sample_control_node_times(&control, 225, &gate_values, &mut state)
+            .expect("quarter-step tag21 sample");
+        assert!((at_quarter_step[1].expect("node 1") - 0.45).abs() < 1.0e-5);
+
+        let at_first_transition =
+            sample_control_node_times(&control, 900, &gate_values, &mut state)
+                .expect("first tag21 transition");
+        assert!((at_first_transition[1].expect("node 1") - 1.8).abs() < 1.0e-5);
+
+        let at_second_transition =
+            sample_control_node_times(&control, 1800, &gate_values, &mut state)
+                .expect("second tag21 transition");
+        assert!((at_second_transition[1].expect("node 1") - 3.6).abs() < 1.0e-5);
+
+        let at_wrap = sample_control_node_times(&control, 2700, &gate_values, &mut state)
+            .expect("wrapped tag21 transition");
+        assert!((at_wrap[1].expect("node 1") - 1.4).abs() < 1.0e-5);
+
+        let at_fullcycle = sample_control_node_times(&control, 18_000, &gate_values, &mut state)
+            .expect("fullcycle tag21 transition");
+        assert!(
+            (at_fullcycle[1].expect("node 1") - 4.0).abs() < 1.0e-4,
+            "full-cycle node time was {at_fullcycle:?}"
+        );
+        let zero_provider_value = 0.0_f32;
+        let gate_closed = [Some(zero_provider_value)];
+        let mut closed_gate_state = ControlInstanceState::default();
+        for clock in [0, 100, 500, 1000] {
+            let sample =
+                sample_control_node_times(&control, clock, &gate_closed, &mut closed_gate_state)
+                    .expect("closed native gate holds the initial blend");
+            assert_eq!(sample[1], Some(0.0));
+        }
+        let reopened_provider_value = 1.0_f32;
+        let reopened_gate = [Some(reopened_provider_value)];
+        let opened_gate =
+            sample_control_node_times(&control, 1001, &reopened_gate, &mut closed_gate_state)
+                .expect("open native gate starts a transition");
+        assert!(opened_gate[1].expect("node 1") > 0.0);
+    }
+
+    #[test]
+    fn tag21_sampler_preserves_fast_rates_and_rejects_previous_row_mapping() {
+        let mut fast = tag21_fullcycle_control();
+        fast.timeline_rows[0].raw_parameters[2] = 20.0_f32.to_bits();
+        let mut fast_state = ControlInstanceState::default();
+        let at_half_transition =
+            sample_control_node_times(&fast, 11, &[Some(1.0)], &mut fast_state)
+                .expect("fast sample");
+        assert!((at_half_transition[1].expect("node 1") - 0.88).abs() < 1.0e-5);
+        let at_transition_end = sample_control_node_times(&fast, 23, &[Some(1.0)], &mut fast_state)
+            .expect("fast transition");
+        assert!((at_transition_end[1].expect("node 1") - 1.84).abs() < 1.0e-5);
+
+        let mut direct = tag21_fullcycle_control();
+        direct.timeline_rows[0].flags = 0;
+        direct.typed_records[0].fixed_words[9] = 2.0_f32.to_bits();
+        let direct_sample = sample_control_node_times(
+            &direct,
+            100,
+            &[Some(1.0)],
+            &mut ControlInstanceState::default(),
+        )
+        .expect("non-wrapping transition");
+        assert!((direct_sample[1].expect("node 1") - 0.4).abs() < 1.0e-5);
+
+        let mut previous_row = tag21_fullcycle_control();
+        previous_row.timeline_rows[0].flags = 0x40;
+        let error = sample_control_node_times(
+            &previous_row,
+            0,
+            &[Some(1.0)],
+            &mut ControlInstanceState::default(),
+        )
+        .expect_err("previous-row mapping must not silently use the wrong blend");
+        assert_eq!(
+            error,
+            ControlSamplingError::UnsupportedPreviousRowMapping { row_index: 0 }
+        );
+    }
+
     #[test]
     fn component_control_rows_preserve_f32_values_and_source_order() {
         let source = ResourceKey {
@@ -3455,30 +4250,32 @@ mod tests {
     }
 
     #[test]
-    fn component_control_unknown_effect_tag_preserves_node_bindings() {
+    fn component_control_unproven_effect_tags_preserve_node_bindings() {
         let source = ResourceKey {
             archive: parse_path("controls.rlb").expect("archive"),
             name: resource_name(b"parts.ctl"),
             type_id: None,
         };
-        let mut payload = component_control_payload(&[(1, 0.0, 1.0, 0.25, 0)]);
-        payload[12..16].copy_from_slice(&1_u32.to_le_bytes());
-        payload[16..20].copy_from_slice(&1_u32.to_le_bytes());
-        payload.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        for tag in [2_u32, 5, 0xDEAD_BEEF] {
+            let mut payload = component_control_payload(&[(1, 0.0, 1.0, 0.25, 0)]);
+            payload[12..16].copy_from_slice(&1_u32.to_le_bytes());
+            payload[16..20].copy_from_slice(&1_u32.to_le_bytes());
+            payload.extend_from_slice(&tag.to_le_bytes());
 
-        let control = decode_component_control_payload(&payload, source, 2, 3)
-            .expect("unknown tag is retained");
+            let control = decode_component_control_payload(&payload, source.clone(), 2, 3)
+                .expect("unproven tag is preserved as unsupported");
 
-        assert_eq!(control.bindings.len(), 1);
-        assert_eq!(control.bindings[0].node_index, 1);
-        assert_eq!(control.bindings[0].frame_b, 1.0);
-        assert_eq!(
-            control.effect_section,
-            PreparedControlEffectSection::Unsupported {
-                typed_record_index: Some(0),
-                typed_record_tag: Some(0xDEAD_BEEF),
-            }
-        );
+            assert_eq!(control.bindings.len(), 1);
+            assert_eq!(control.bindings[0].node_index, 1);
+            assert_eq!(control.bindings[0].frame_b, 1.0);
+            assert_eq!(
+                control.effect_section,
+                PreparedControlEffectSection::Unsupported {
+                    typed_record_index: Some(0),
+                    typed_record_tag: Some(tag),
+                }
+            );
+        }
     }
 
     #[test]
@@ -3496,7 +4293,7 @@ mod tests {
         payload.resize(group_header_start + CONTROL_EFFECT_GROUP_HEADER_BYTES, 0);
         payload.extend_from_slice(&0_u32.to_le_bytes());
 
-        let control = decode_component_control_payload(&payload, source, 2, 3)
+        let control = decode_component_control_payload(&payload, source.clone(), 2, 3)
             .expect("zero-length record has no trailing string byte");
 
         assert_eq!(control.bindings.len(), 1);
@@ -3565,7 +4362,7 @@ mod tests {
             )],
         );
 
-        let control = decode_component_control_payload(&payload, source, 2, 3)
+        let control = decode_component_control_payload(&payload, source.clone(), 2, 3)
             .expect("complete type-4 effect tables");
 
         assert_eq!(
@@ -3595,6 +4392,118 @@ mod tests {
                 },
             ])
         );
+    }
+
+    #[test]
+    fn tag21_gate_provider_comes_from_validated_explicit_ndp() {
+        let source = ResourceKey {
+            archive: parse_path("parts.rlb").expect("CTL archive"),
+            name: resource_name(b"locator.ctl"),
+            type_id: None,
+        };
+        let ndp_source = ResourceKey {
+            archive: parse_path("parts.rlb").expect("NDP archive"),
+            name: resource_name(b"locator.ndp"),
+            type_id: None,
+        };
+        let control_payload = tag21_control_payload(0);
+        let ndp_payload = node_data_payload(1);
+        let repository = repository_with_archives(&[(
+            "parts.rlb",
+            &[
+                (b"locator.ctl", &control_payload),
+                (b"locator.ndp", &ndp_payload),
+            ],
+        )]);
+        let prepared = prepare_component_control_from_resource(
+            &repository,
+            source.clone(),
+            None,
+            Some(ndp_source.clone()),
+            2,
+            0,
+        )
+        .expect("prepare CTL and NDP")
+        .expect("CTL exists");
+        let table = prepared.node_data.as_ref().expect("NDP table attached");
+        assert_eq!(table.source, ndp_source);
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(table.rows[0].max_volume, 6000.0);
+        assert_eq!(table.rows[0].mobility_per_volume, 500.0);
+        assert!(matches!(
+            prepared.typed_records[0].gate_provider,
+            PreparedControlGateProvider::Resolved {
+                key: 0,
+                row_count: 1,
+                initial_type1_value: 1.0,
+                ..
+            }
+        ));
+
+        let mut state = ControlInstanceState::default();
+        sample_control_node_times(&prepared, 225, &[Some(1.0)], &mut state)
+            .expect("resolved nonzero provider opens the transition");
+
+        let missing_repository =
+            repository_with_archives(&[("parts.rlb", &[(b"locator.ctl", &control_payload)])]);
+        let missing = prepare_component_control_from_resource(
+            &missing_repository,
+            source.clone(),
+            None,
+            Some(ResourceKey {
+                archive: parse_path("parts.rlb").expect("archive"),
+                name: resource_name(b"missing.ndp"),
+                type_id: None,
+            }),
+            2,
+            0,
+        )
+        .expect("missing optional NDP is retained as metadata")
+        .expect("CTL exists");
+        assert!(matches!(
+            sample_control_node_times(&missing, 0, &[None], &mut ControlInstanceState::default()),
+            Err(ControlSamplingError::MissingGateProvider { key: 0, .. })
+        ));
+
+        let out_of_range_payload = tag21_control_payload(1);
+        let out_of_range_repository = repository_with_archives(&[(
+            "parts.rlb",
+            &[
+                (b"locator.ctl", &out_of_range_payload),
+                (b"locator.ndp", &ndp_payload),
+            ],
+        )]);
+        let out_of_range = prepare_component_control_from_resource(
+            &out_of_range_repository,
+            source,
+            None,
+            Some(ResourceKey {
+                archive: parse_path("parts.rlb").expect("archive"),
+                name: resource_name(b"locator.ndp"),
+                type_id: None,
+            }),
+            2,
+            0,
+        )
+        .expect("out-of-range key remains inspectable")
+        .expect("CTL exists");
+        assert!(matches!(
+            sample_control_node_times(
+                &out_of_range,
+                0,
+                &[None],
+                &mut ControlInstanceState::default(),
+            ),
+            Err(ControlSamplingError::GateProviderKeyOutOfRange {
+                key: 1,
+                row_count: 1,
+                ..
+            })
+        ));
+
+        let mut malformed_ndp = ndp_payload;
+        malformed_ndp.push(0);
+        assert!(decode_component_node_data_table(&malformed_ndp, ndp_source, 0).is_err());
     }
 
     #[test]
@@ -3659,10 +4568,16 @@ mod tests {
             type_id: None,
         };
 
-        let control =
-            prepare_component_control_from_resource(&repository, source, Some(point_source), 2, 0)
-                .expect("loaded CTL and its explicit CPT")
-                .expect("CTL entry");
+        let control = prepare_component_control_from_resource(
+            &repository,
+            source,
+            Some(point_source),
+            None,
+            2,
+            0,
+        )
+        .expect("loaded CTL and its explicit CPT")
+        .expect("CTL entry");
         let point_list = control.point_list.as_ref().expect("point list is attached");
 
         assert_eq!(point_list.source.archive.as_str(), "points.rlb");
@@ -3734,10 +4649,16 @@ mod tests {
             type_id: None,
         };
 
-        let control =
-            prepare_component_control_from_resource(&repository, source, Some(point_source), 2, 0)
-                .expect("point-offset sentinel is retained without guessed bounds")
-                .expect("CTL entry");
+        let control = prepare_component_control_from_resource(
+            &repository,
+            source,
+            Some(point_source),
+            None,
+            2,
+            0,
+        )
+        .expect("point-offset sentinel is retained without guessed bounds")
+        .expect("CTL entry");
         let PreparedControlEffectSection::Parsed(rows) = control.effect_section else {
             panic!("effect rows parsed");
         };
@@ -3784,6 +4705,7 @@ mod tests {
             &repository,
             source,
             Some(missing_point_source),
+            None,
             2,
             0,
         )
@@ -3833,6 +4755,46 @@ mod tests {
             payload[row + 8..row + 12].copy_from_slice(&frame_b.to_bits().to_le_bytes());
             payload[row + 12..row + 16].copy_from_slice(&blend.to_bits().to_le_bytes());
             payload[row + 0x20..row + 0x24].copy_from_slice(&flags.to_le_bytes());
+        }
+        payload
+    }
+
+    fn tag21_control_payload(provider_key: u32) -> Vec<u8> {
+        let mut payload = component_control_payload(&[(1, 0.0, 4.0, 0.0, 1)]);
+        let row_start = 5 * 4 + 108;
+        payload[row_start + 0x10..row_start + 0x14].copy_from_slice(&u32::MAX.to_le_bytes());
+        payload[row_start + 0x14..row_start + 0x18].copy_from_slice(&u32::MAX.to_le_bytes());
+        payload[row_start + 0x18..row_start + 0x1C]
+            .copy_from_slice(&0.5_f32.to_bits().to_le_bytes());
+        payload[row_start + 0x1C..row_start + 0x20]
+            .copy_from_slice(&AUTHORED_TAG21_RAW_PARAMETER_3.to_bits().to_le_bytes());
+        payload[12..16].copy_from_slice(&1_u32.to_le_bytes());
+
+        let mut fixed = [0_u8; CONTROL_TYPED_RECORD_FIXED_BYTES];
+        fixed[0..4].copy_from_slice(&21_u32.to_le_bytes());
+        fixed[4..8].copy_from_slice(&provider_key.to_le_bytes());
+        fixed[0x18..0x1C].copy_from_slice(&u32::MAX.to_le_bytes());
+        fixed[0x24..0x28].copy_from_slice(&1.0_f32.to_bits().to_le_bytes());
+        fixed[0x28..0x2C].copy_from_slice(&1.0_f32.to_bits().to_le_bytes());
+        fixed[CONTROL_TYPED_RECORD_COUNT_OFFSET..CONTROL_TYPED_RECORD_COUNT_OFFSET + 4]
+            .copy_from_slice(&1_u32.to_le_bytes());
+        payload.extend_from_slice(&fixed);
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload
+    }
+
+    fn node_data_payload(count: u32) -> Vec<u8> {
+        const ROW_BYTES: usize = 76;
+        let mut payload = vec![0; 4 + usize::try_from(count).expect("count") * ROW_BYTES];
+        payload[0..4].copy_from_slice(&count.to_le_bytes());
+        for row_index in 0..usize::try_from(count).expect("count") {
+            let start = 4 + row_index * ROW_BYTES;
+            payload[start..start + 4].copy_from_slice(&0_u32.to_le_bytes());
+            payload[start + 4..start + 8].copy_from_slice(&6000.0_f32.to_bits().to_le_bytes());
+            payload[start + 8..start + 12].copy_from_slice(&500.0_f32.to_bits().to_le_bytes());
+            write_fixed_name(&mut payload[start + 12..start + 44], "system.rlb");
+            write_fixed_name(&mut payload[start + 44..start + 76], "explode_frt_m.exp");
         }
         payload
     }
@@ -4044,6 +5006,7 @@ mod tests {
             dependencies: Vec::new(),
             control_resource: None,
             point_resource: None,
+            node_data_resource: None,
         };
         let second = EffectivePrototype {
             key: fparkan_prototype::PrototypeKey(resource_name(b"mesh")),
@@ -4058,6 +5021,7 @@ mod tests {
             dependencies: Vec::new(),
             control_resource: None,
             point_resource: None,
+            node_data_resource: None,
         };
 
         assert_ne!(stable_visual_id(&first), stable_visual_id(&second));
@@ -4123,6 +5087,7 @@ mod tests {
             dependencies: vec![mesh_key.clone()],
             control_resource: None,
             point_resource: None,
+            node_data_resource: None,
         };
         let mut graph = prototype_graph_for_mesh(&prototype);
         let mut report = PrototypeGraphReport {
@@ -4239,6 +5204,7 @@ mod tests {
             dependencies: Vec::new(),
             control_resource: None,
             point_resource: None,
+            node_data_resource: None,
         };
         let mut graph = prototype_graph_for_mesh(&prototype);
         graph
@@ -4393,6 +5359,7 @@ mod tests {
             dependencies: Vec::new(),
             control_resource: None,
             point_resource: None,
+            node_data_resource: None,
         };
         let mut graph = prototype_graph_for_mesh(&prototype);
         let mut report = PrototypeGraphReport {
@@ -4552,6 +5519,7 @@ mod tests {
                     name: resource_name(b"attachments.cpt"),
                     type_id: None,
                 }),
+                node_data_resource: None,
             },
             EffectivePrototype {
                 key: fparkan_prototype::PrototypeKey(resource_name(b"tree-b")),
@@ -4565,6 +5533,7 @@ mod tests {
                     type_id: None,
                 }),
                 point_resource: None,
+                node_data_resource: None,
             },
             EffectivePrototype {
                 key: fparkan_prototype::PrototypeKey(resource_name(b"tree-c")),
@@ -4578,6 +5547,7 @@ mod tests {
                     type_id: None,
                 }),
                 point_resource: None,
+                node_data_resource: None,
             },
         ];
 
@@ -4672,6 +5642,7 @@ mod tests {
                 type_id: None,
             }),
             point_resource: None,
+            node_data_resource: None,
         };
 
         let assets = prepare_mission_assets_with_repository(&repository, &[0..1], &[prototype])
@@ -4868,6 +5839,7 @@ mod tests {
             dependencies: vec![mesh_key.clone()],
             control_resource: None,
             point_resource: None,
+            node_data_resource: None,
         };
         let mut graph = prototype_graph_for_mesh(&prototype);
         let mut report = PrototypeGraphReport {
@@ -5078,6 +6050,7 @@ mod tests {
                 dependencies: Vec::new(),
                 control_resource: None,
                 point_resource: None,
+                node_data_resource: None,
             },
             EffectivePrototype {
                 key: fparkan_prototype::PrototypeKey(resource_name(b"tree_b")),
@@ -5091,6 +6064,7 @@ mod tests {
                 dependencies: Vec::new(),
                 control_resource: None,
                 point_resource: None,
+                node_data_resource: None,
             },
         ];
         (repo, prototypes)
