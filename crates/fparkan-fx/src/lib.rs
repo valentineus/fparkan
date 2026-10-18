@@ -8,6 +8,7 @@
 
 pub mod atmosphere;
 pub mod environment;
+pub mod fx_visual;
 pub mod shadow;
 pub mod sky;
 
