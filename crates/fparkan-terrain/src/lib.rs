@@ -4,6 +4,15 @@
 use fparkan_terrain_format::{LandMapDocument, LandMeshDocument};
 use std::collections::VecDeque;
 
+mod contour;
+mod foundation;
+
+use foundation::basement_surface_mask;
+pub use foundation::{
+    build_basement_foundations, BasementFootprint, BasementFoundation, BasementFoundationError,
+    BasementFoundationFragment, BasementPlacement,
+};
+
 /// Terrain material-selector contract preserved from the decoded map mesh.
 ///
 /// Applications access this semantic terrain API through this terrain crate
@@ -21,6 +30,7 @@ pub struct TerrainWorld {
     surfaces: Vec<RuntimeTriangle>,
     surface_bvh: SurfaceBvh,
     source_mesh: Option<LandMeshDocument>,
+    basement_foundation: Option<BasementFoundation>,
 }
 
 /// Surface hit.
@@ -91,6 +101,13 @@ pub enum TerrainError {
         /// Position count.
         position_count: usize,
     },
+    /// A basement fragment does not preserve a valid LOD0 source face and mask.
+    InvalidFoundationFragment {
+        /// Fragment index.
+        fragment: usize,
+    },
+    /// Foundation fragments require a retained source Land.msh document.
+    FoundationRequiresMesh,
     /// Terrain Node38/Slot68 records do not assign every face to one LOD.
     InvalidLodMapping(TerrainLodError),
 }
@@ -119,6 +136,12 @@ impl std::fmt::Display for TerrainError {
                 f,
                 "terrain face {face} references vertex {vertex} outside {position_count} positions"
             ),
+            Self::InvalidFoundationFragment { fragment } => {
+                write!(f, "invalid basement foundation fragment {fragment}")
+            }
+            Self::FoundationRequiresMesh => {
+                write!(f, "basement foundation requires a source Land.msh")
+            }
             Self::InvalidLodMapping(error) => write!(f, "invalid terrain LOD mapping: {error}"),
         }
     }
@@ -132,7 +155,9 @@ impl std::error::Error for TerrainError {
             | Self::TooManyAreals { .. }
             | Self::InvalidGridReference { .. }
             | Self::InvalidArealReference { .. }
-            | Self::InvalidSurfaceVertex { .. } => None,
+            | Self::InvalidSurfaceVertex { .. }
+            | Self::InvalidFoundationFragment { .. }
+            | Self::FoundationRequiresMesh => None,
         }
     }
 }
@@ -254,6 +279,7 @@ impl TerrainWorld {
             surfaces: Vec::new(),
             surface_bvh: SurfaceBvh::default(),
             source_mesh: None,
+            basement_foundation: None,
         })
     }
 
@@ -288,6 +314,87 @@ impl TerrainWorld {
         world.surface_bvh = SurfaceBvh::from_surfaces(&world.surfaces);
         world.source_mesh = Some(mesh.clone());
         Ok(world)
+    }
+
+    /// Returns a new world whose surface queries use exactly the canonical
+    /// source and generated triangles from a basement foundation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TerrainError`] if this world has no source mesh or any
+    /// fragment does not preserve valid LOD0 identity, flags, and geometry.
+    pub fn with_basement_foundation(
+        mut self,
+        foundation: BasementFoundation,
+    ) -> Result<Self, TerrainError> {
+        let mesh = self
+            .source_mesh
+            .as_ref()
+            .ok_or(TerrainError::FoundationRequiresMesh)?;
+        let assignments = mesh
+            .face_lod_assignments()
+            .map_err(TerrainError::InvalidLodMapping)?;
+        let is_lod0 = assignments
+            .iter()
+            .map(|assignment| assignment.lod == TerrainLod::Lod0)
+            .collect::<Vec<_>>();
+        let mut surfaces = Vec::with_capacity(foundation.fragments.len());
+        let mut generated = 0_usize;
+        for (fragment_index, fragment) in foundation.fragments.iter().enumerate() {
+            if !valid_foundation_triangle(fragment.positions) {
+                return Err(TerrainError::InvalidFoundationFragment {
+                    fragment: fragment_index,
+                });
+            }
+            let face = if let Some(source_face) = fragment.source_face {
+                let Some(source) = mesh.faces.get(source_face) else {
+                    return Err(TerrainError::InvalidFoundationFragment {
+                        fragment: fragment_index,
+                    });
+                };
+                if !is_lod0.get(source_face).copied().unwrap_or(false)
+                    || source.flags != fragment.surface_mask
+                {
+                    return Err(TerrainError::InvalidFoundationFragment {
+                        fragment: fragment_index,
+                    });
+                }
+                source_face
+            } else {
+                if basement_surface_mask(fragment.positions) != fragment.surface_mask {
+                    return Err(TerrainError::InvalidFoundationFragment {
+                        fragment: fragment_index,
+                    });
+                }
+                let face = mesh.faces.len().checked_add(generated).ok_or(
+                    TerrainError::InvalidFoundationFragment {
+                        fragment: fragment_index,
+                    },
+                )?;
+                generated =
+                    generated
+                        .checked_add(1)
+                        .ok_or(TerrainError::InvalidFoundationFragment {
+                            fragment: fragment_index,
+                        })?;
+                face
+            };
+            surfaces.push(RuntimeTriangle {
+                face,
+                mask: fragment.surface_mask,
+                vertices: fragment.positions,
+            });
+        }
+        self.surfaces = surfaces;
+        self.surface_bvh = SurfaceBvh::from_surfaces(&self.surfaces);
+        self.basement_foundation = Some(foundation);
+        Ok(self)
+    }
+
+    /// Returns the canonical basement geometry used by the surface query index.
+    #[must_use]
+    pub fn basement_foundation(&self) -> Option<&BasementFoundation> {
+        self.basement_foundation.as_ref()
     }
 
     /// Returns the number of navigation areas.
@@ -740,26 +847,31 @@ impl RuntimeTriangle {
     }
 
     fn raycast(&self, origin: [f32; 3], direction: [f32; 3]) -> Option<f32> {
-        let edge1 = sub3(self.vertices[1], self.vertices[0]);
-        let edge2 = sub3(self.vertices[2], self.vertices[0]);
-        let pvec = cross3(direction, edge2);
-        let det = dot3(edge1, pvec);
-        if det.abs() <= 1.0e-6 {
+        let edge1 = sub3_f64(self.vertices[1], self.vertices[0]);
+        let edge2 = sub3_f64(self.vertices[2], self.vertices[0]);
+        let direction = direction.map(f64::from);
+        let pvec = cross3_f64(direction, edge2);
+        let det = dot3_f64(edge1, pvec);
+        if det == 0.0 || !det.is_finite() {
             return None;
         }
         let inv_det = 1.0 / det;
-        let tvec = sub3(origin, self.vertices[0]);
-        let u = dot3(tvec, pvec) * inv_det;
+        let tvec = sub3_f64(origin, self.vertices[0]);
+        let u = dot3_f64(tvec, pvec) * inv_det;
         if !(-1.0e-5..=1.00001).contains(&u) {
             return None;
         }
-        let qvec = cross3(tvec, edge1);
-        let v = dot3(direction, qvec) * inv_det;
+        let qvec = cross3_f64(tvec, edge1);
+        let v = dot3_f64(direction, qvec) * inv_det;
         if v < -1.0e-5 || u + v > 1.00001 {
             return None;
         }
-        let distance = dot3(edge2, qvec) * inv_det;
-        (distance >= 0.0).then_some(distance)
+        let distance = dot3_f64(edge2, qvec) * inv_det;
+        if distance >= 0.0 && distance.is_finite() && distance <= f64::from(f32::MAX) {
+            Some(distance as f32)
+        } else {
+            None
+        }
     }
 }
 
@@ -919,6 +1031,21 @@ fn build_surfaces(mesh: &LandMeshDocument) -> Result<Vec<RuntimeTriangle>, Terra
     Ok(triangles)
 }
 
+fn valid_foundation_triangle(vertices: [[f32; 3]; 3]) -> bool {
+    if !vertices.iter().flatten().all(|value| value.is_finite()) {
+        return false;
+    }
+    let first = [
+        f64::from(vertices[1][0]) - f64::from(vertices[0][0]),
+        f64::from(vertices[1][1]) - f64::from(vertices[0][1]),
+    ];
+    let second = [
+        f64::from(vertices[2][0]) - f64::from(vertices[0][0]),
+        f64::from(vertices[2][1]) - f64::from(vertices[0][1]),
+    ];
+    first[0] * second[1] - first[1] * second[0] != 0.0
+}
+
 fn surface_vertex(
     mesh: &LandMeshDocument,
     face: usize,
@@ -940,25 +1067,41 @@ fn barycentric_2d(
     second: [f32; 2],
     third: [f32; 2],
 ) -> Option<[f32; 3]> {
-    let edge_second = [second[0] - first[0], second[1] - first[1]];
-    let edge_third = [third[0] - first[0], third[1] - first[1]];
-    let point_delta = [point[0] - first[0], point[1] - first[1]];
+    let edge_second = [
+        f64::from(second[0]) - f64::from(first[0]),
+        f64::from(second[1]) - f64::from(first[1]),
+    ];
+    let edge_third = [
+        f64::from(third[0]) - f64::from(first[0]),
+        f64::from(third[1]) - f64::from(first[1]),
+    ];
+    let point_delta = [
+        f64::from(point[0]) - f64::from(first[0]),
+        f64::from(point[1]) - f64::from(first[1]),
+    ];
     let denom = edge_second[0] * edge_third[1] - edge_third[0] * edge_second[1];
-    if denom.abs() <= 1.0e-6 {
+    if denom == 0.0 {
         return None;
     }
-    let inv = 1.0 / denom;
-    let second_weight = (point_delta[0] * edge_third[1] - edge_third[0] * point_delta[1]) * inv;
-    let third_weight = (edge_second[0] * point_delta[1] - point_delta[0] * edge_second[1]) * inv;
+    let second_weight = (point_delta[0] * edge_third[1] - edge_third[0] * point_delta[1]) / denom;
+    let third_weight = (edge_second[0] * point_delta[1] - point_delta[0] * edge_second[1]) / denom;
     let first_weight = 1.0 - second_weight - third_weight;
-    Some([first_weight, second_weight, third_weight])
+    let weights = [first_weight, second_weight, third_weight];
+    if weights.iter().any(|weight| !weight.is_finite()) {
+        return None;
+    }
+    Some(weights.map(|weight| weight as f32))
 }
 
-fn sub3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+fn sub3_f64(a: [f32; 3], b: [f32; 3]) -> [f64; 3] {
+    [
+        f64::from(a[0]) - f64::from(b[0]),
+        f64::from(a[1]) - f64::from(b[1]),
+        f64::from(a[2]) - f64::from(b[2]),
+    ]
 }
 
-fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+fn cross3_f64(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [
         a[1] * b[2] - a[2] * b[1],
         a[2] * b[0] - a[0] * b[2],
@@ -966,7 +1109,7 @@ fn cross3(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     ]
 }
 
-fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+fn dot3_f64(a: [f64; 3], b: [f64; 3]) -> f64 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
@@ -1124,6 +1267,177 @@ mod tests {
                 .expect("raycast exclusion"),
             None
         );
+    }
+
+    #[test]
+    fn foundation_world_queries_use_the_canonical_cut_and_generated_band() {
+        use crate::{build_basement_foundations, BasementFootprint};
+
+        let mesh = synthetic_land_mesh();
+        let outer = [[0.1, 0.1], [0.9, 0.1], [0.9, 0.9], [0.1, 0.9]];
+        let inner = [
+            [0.4, 0.4, 1.0],
+            [0.6, 0.4, 1.0],
+            [0.6, 0.6, 1.0],
+            [0.4, 0.6, 1.0],
+        ];
+        let foundation = build_basement_foundations(
+            &mesh,
+            &[BasementFootprint {
+                outer: &outer,
+                inner: &inner,
+                flatten_inner_to_mean_outer_z: true,
+            }],
+        )
+        .expect("foundation");
+        let expected_fragments = foundation.fragments.clone();
+        let expected_fragment_count = foundation.fragments.len();
+        let world = TerrainWorld::from_land_msh(&mesh)
+            .expect("source world")
+            .with_basement_foundation(foundation)
+            .expect("foundation world");
+
+        assert_eq!(world.surface_count(), expected_fragment_count);
+        assert_eq!(
+            world
+                .basement_foundation()
+                .map(|value| value.fragments.as_slice()),
+            Some(expected_fragments.as_slice())
+        );
+        assert!(world
+            .height_at([0.05, 0.05])
+            .expect("band height")
+            .is_some());
+        assert!(world.height_at([0.3, 0.3]).expect("band height").is_some());
+        assert_eq!(world.height_at([0.5, 0.5]).expect("hole height"), None);
+        assert_eq!(
+            world
+                .raycast([0.5, 0.5, 4.0], [0.0, 0.0, -1.0], FullSurfaceMask(0),)
+                .expect("hole ray"),
+            None
+        );
+
+        let mut generated_face = mesh.faces.len();
+        for (runtime, fragment) in world.surfaces.iter().zip(&expected_fragments) {
+            assert_eq!(runtime.mask, fragment.surface_mask);
+            assert_eq!(runtime.vertices, fragment.positions);
+            if let Some(source_face) = fragment.source_face {
+                assert_eq!(runtime.face, source_face);
+                assert_eq!(runtime.mask, mesh.faces[source_face].flags);
+            } else {
+                assert_eq!(runtime.face, generated_face);
+                generated_face += 1;
+            }
+        }
+        assert!(generated_face > mesh.faces.len());
+    }
+
+    #[test]
+    fn foundation_install_accepts_thin_nonzero_fragments_for_surface_queries() {
+        let mesh = synthetic_land_mesh();
+        let fragment = BasementFoundationFragment {
+            source_face: Some(0),
+            surface_mask: mesh.faces[0].flags,
+            positions: [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.000_000_5, 0.0]],
+        };
+        let foundation = BasementFoundation {
+            fragments: vec![fragment],
+            placements: Vec::new(),
+        };
+        let world = TerrainWorld::from_land_msh(&mesh)
+            .expect("source world")
+            .with_basement_foundation(foundation)
+            .expect("thin but non-degenerate triangle");
+
+        assert_eq!(world.surface_count(), 1);
+        assert_eq!(
+            world.height_at([0.25, 0.000_000_125]).expect("height"),
+            Some(0.0)
+        );
+        assert!(world
+            .raycast(
+                [0.25, 0.000_000_125, 1.0],
+                [0.0, 0.0, -1.0],
+                FullSurfaceMask(0),
+            )
+            .expect("raycast")
+            .is_some());
+    }
+
+    #[test]
+    fn foundation_install_rejects_invalid_source_identity_masks_and_generated_flags() {
+        let mesh = synthetic_land_mesh();
+        let source_triangle = [[0.0, 0.0, 0.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0]];
+        let generated_triangle = [[0.0, 0.0, 0.0], [0.25, 0.0, 0.0], [0.0, 0.25, 0.0]];
+        let invalid = [
+            BasementFoundationFragment {
+                source_face: Some(mesh.faces.len()),
+                surface_mask: mesh.faces[0].flags,
+                positions: source_triangle,
+            },
+            BasementFoundationFragment {
+                source_face: Some(0),
+                surface_mask: FullSurfaceMask(mesh.faces[0].flags.0 ^ 1),
+                positions: source_triangle,
+            },
+            BasementFoundationFragment {
+                source_face: None,
+                surface_mask: FullSurfaceMask(0x0300),
+                positions: generated_triangle,
+            },
+        ];
+
+        for (index, fragment) in invalid.into_iter().enumerate() {
+            let foundation = BasementFoundation {
+                fragments: vec![fragment],
+                placements: Vec::new(),
+            };
+            assert!(
+                matches!(
+                    TerrainWorld::from_land_msh(&mesh)
+                        .expect("source world")
+                        .with_basement_foundation(foundation),
+                    Err(TerrainError::InvalidFoundationFragment { fragment: 0 })
+                ),
+                "invalid fragment case {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn foundation_install_rejects_lod1_source_faces() {
+        use fparkan_terrain_format::TerrainLod;
+
+        let mut mesh = synthetic_land_mesh();
+        mesh.positions.push([0.0, 0.0, 2.0]);
+        mesh.positions.push([1.0, 0.0, 2.0]);
+        mesh.positions.push([0.0, 1.0, 2.0]);
+        mesh.faces
+            .push(terrain_face(FullSurfaceMask(0x0000_0003), [4, 5, 6]));
+        mesh.nodes_raw[10..12].copy_from_slice(&1_u16.to_le_bytes());
+        let mut lod1_slot = [0_u8; 68];
+        lod1_slot[0..2].copy_from_slice(&2_u16.to_le_bytes());
+        lod1_slot[2..4].copy_from_slice(&1_u16.to_le_bytes());
+        mesh.slots.slots_raw.push(lod1_slot);
+        assert_eq!(
+            mesh.face_lod_assignments().expect("LOD assignment")[2].lod,
+            TerrainLod::Lod1
+        );
+
+        let foundation = BasementFoundation {
+            fragments: vec![BasementFoundationFragment {
+                source_face: Some(2),
+                surface_mask: mesh.faces[2].flags,
+                positions: [[0.0, 0.0, 2.0], [1.0, 0.0, 2.0], [0.0, 1.0, 2.0]],
+            }],
+            placements: Vec::new(),
+        };
+        assert!(matches!(
+            TerrainWorld::from_land_msh(&mesh)
+                .expect("source world")
+                .with_basement_foundation(foundation),
+            Err(TerrainError::InvalidFoundationFragment { fragment: 0 })
+        ));
     }
 
     #[test]
