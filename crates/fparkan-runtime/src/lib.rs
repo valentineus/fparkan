@@ -12,7 +12,7 @@ use fparkan_assets::{
 use fparkan_path::{normalize_relative, NormalizedPath, PathError, PathPolicy};
 use fparkan_prototype::{
     build_prototype_graph_report, PrototypeGraph, PrototypeGraphFailure, PrototypeGraphReport,
-    UnitComponentRecord,
+    UnitComponentRecord, UNIT_DAT_BAS_PLACEMENT_FLAG,
 };
 use fparkan_resource::{resource_name, CachedResourceRepository, ResourceRepository};
 use fparkan_script::{
@@ -74,6 +74,13 @@ pub struct MissionObjectDraft {
     pub resource_name_raw: Vec<u8>,
     /// Raw identity/clan word from the mission.
     pub identity_or_clan_raw: u32,
+    /// Raw word after the mission object's instance name. Native BAS
+    /// placement uses its zero/nonzero state only when the Unit DAT header
+    /// gate is set.
+    pub raw_after_name: u32,
+    /// Second word of the root Unit DAT header, when it was decoded. A direct
+    /// prototype root has no Unit DAT header.
+    pub unit_dat_header_flags: Option<u32>,
     /// Raw position vector.
     pub position: [f32; 3],
     /// Raw orientation vector.
@@ -89,6 +96,49 @@ pub struct MissionObjectDraft {
     /// The records preserve source provenance for future controller loading;
     /// their fields intentionally have no inferred Control/physics semantics.
     pub unit_components: Vec<UnitComponentRecord>,
+}
+
+/// Native terrain adjustment selected for a mission object's BAS geometry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BasementPlacementMode {
+    /// Flatten the BAS inner boundary to mean outer terrain height and adjust
+    /// the object root transform by the native placement delta.
+    FlattenInnerAndAdjustRoot,
+    /// Keep authored BAS inner heights and leave the object root transform as
+    /// supplied by the mission.
+    PreserveAuthoredInnerHeight,
+}
+
+impl MissionObjectDraft {
+    /// Returns the BAS mode selected by the native Unit DAT gate and mission
+    /// word, independent of resource path naming.
+    #[must_use]
+    pub fn basement_placement_mode(&self) -> Option<BasementPlacementMode> {
+        let header_flags = self.unit_dat_header_flags?;
+        if header_flags & UNIT_DAT_BAS_PLACEMENT_FLAG == 0 {
+            return None;
+        }
+        Some(if self.raw_after_name == 0 {
+            BasementPlacementMode::FlattenInnerAndAdjustRoot
+        } else {
+            BasementPlacementMode::PreserveAuthoredInnerHeight
+        })
+    }
+
+    /// Returns this mission root's position after applying the native BAS
+    /// transform adjustment once. Native code subtracts
+    /// `authored_inner_z - mean_outer_z` from matrix element 11. Component
+    /// local transforms should continue to be composed beneath this adjusted
+    /// root position without applying the delta again.
+    #[must_use]
+    pub fn root_position_with_basement_delta(&self, placement_delta: f32) -> [f32; 3] {
+        let mut position = self.position;
+        if self.basement_placement_mode() == Some(BasementPlacementMode::FlattenInnerAndAdjustRoot)
+        {
+            position[2] -= placement_delta;
+        }
+        position
+    }
 }
 
 /// A compiled script bundle selected by one mission clan.
@@ -731,6 +781,12 @@ fn load_mission_with_options(
             original_id: u32::try_from(index).ok().map(OriginalObjectId),
             resource_name_raw: object.resource_raw.clone(),
             identity_or_clan_raw: object.identity_or_clan_raw,
+            raw_after_name: object.raw_after_name,
+            unit_dat_header_flags: prototype_graph
+                .root_unit_dat_header_flags
+                .get(index)
+                .copied()
+                .flatten(),
             position: object.position,
             orientation_raw: object.orientation,
             scale: object.scale,
@@ -1328,6 +1384,58 @@ mod tests {
     use super::*;
     use fparkan_vfs::{DirectoryVfs, MemoryVfs, VfsEntry, VfsMetadata};
     use std::path::{Path, PathBuf};
+
+    fn basement_draft(header_flags: Option<u32>, raw_after_name: u32) -> MissionObjectDraft {
+        MissionObjectDraft {
+            original_id: Some(OriginalObjectId(7)),
+            resource_name_raw: b"BUILDS/example.dat".to_vec(),
+            identity_or_clan_raw: 0,
+            raw_after_name,
+            unit_dat_header_flags: header_flags,
+            position: [12.0, 34.0, 100.0],
+            orientation_raw: [0.0; 3],
+            scale: [1.0; 3],
+            visual_ids: Vec::new(),
+            properties: Vec::new(),
+            unit_components: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn native_basement_mode_uses_unit_header_gate_not_builds_path() {
+        assert_eq!(
+            basement_draft(Some(UNIT_DAT_BAS_PLACEMENT_FLAG), 0).basement_placement_mode(),
+            Some(BasementPlacementMode::FlattenInnerAndAdjustRoot)
+        );
+        assert_eq!(
+            basement_draft(Some(UNIT_DAT_BAS_PLACEMENT_FLAG), 1).basement_placement_mode(),
+            Some(BasementPlacementMode::PreserveAuthoredInnerHeight)
+        );
+        assert_eq!(basement_draft(Some(0), 0).basement_placement_mode(), None);
+        assert_eq!(basement_draft(None, 1).basement_placement_mode(), None);
+    }
+
+    #[test]
+    fn native_basement_delta_adjusts_only_flattened_root_once() {
+        let flatten = basement_draft(Some(UNIT_DAT_BAS_PLACEMENT_FLAG), 0);
+        let root = flatten.root_position_with_basement_delta(3.25);
+        assert_eq!(root, [12.0, 34.0, 96.75]);
+        // A component remains local to the root; it receives the root shift
+        // through composition instead of applying the delta itself.
+        let child_local_z = 8.0;
+        assert_eq!(root[2] + child_local_z, 104.75);
+
+        let preserve = basement_draft(Some(UNIT_DAT_BAS_PLACEMENT_FLAG), 0x40);
+        assert_eq!(
+            preserve.root_position_with_basement_delta(3.25),
+            preserve.position
+        );
+        let no_gate = basement_draft(Some(0), 0);
+        assert_eq!(
+            no_gate.root_position_with_basement_delta(3.25),
+            no_gate.position
+        );
+    }
 
     #[test]
     fn load_mission_requires_vfs_and_keeps_world_unchanged_on_error() {

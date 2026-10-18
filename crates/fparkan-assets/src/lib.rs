@@ -16,9 +16,9 @@ use fparkan_nres::{decode as decode_nres, ReadProfile};
 pub use fparkan_nres::{NresDocument, NresError};
 use fparkan_path::{normalize_relative, NormalizedPath, PathError, PathPolicy, ResourceName};
 use fparkan_prototype::{
-    EffectivePrototype, PrototypeGeometry, PrototypeGraph, PrototypeGraphEdge,
-    PrototypeGraphFailure, PrototypeGraphNodeKind, PrototypeGraphProvenance, PrototypeGraphReport,
-    PrototypeGraphRequiredness,
+    decode_bas_geometry, BasGeometry, EffectivePrototype, PrototypeGeometry, PrototypeGraph,
+    PrototypeGraphEdge, PrototypeGraphFailure, PrototypeGraphNodeKind, PrototypeGraphProvenance,
+    PrototypeGraphReport, PrototypeGraphRequiredness,
 };
 use fparkan_resource::{CachedResourceRepository, ResourceError, ResourceKey, ResourceRepository};
 pub use fparkan_terrain::{TerrainError, TerrainWorld};
@@ -918,6 +918,17 @@ pub struct PreparedComponentControl {
     pub point_list: Option<PreparedControlPointList>,
 }
 
+/// Component-local BAS geometry loaded from an explicitly referenced BAS
+/// resource. This remains aligned with each component instance, not the shared
+/// model cache.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedComponentBas {
+    /// BAS resource that supplied this geometry.
+    pub source: ResourceKey,
+    /// Decoded BAS point sections.
+    pub geometry: BasGeometry,
+}
+
 /// Raw and decoded fields from one 36-byte CTLD animation row.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PreparedControlTimelineRow {
@@ -1570,6 +1581,10 @@ pub struct MissionAssets {
     /// component list. `None` means no CTLD pose override is available because
     /// there is no explicit reference or its referenced archive/entry is absent.
     pub object_component_controls: Vec<Vec<Option<PreparedComponentControl>>>,
+    /// Optional component-local BAS geometry aligned with each object's visual
+    /// component list. `None` means there is no explicit BAS reference or its
+    /// archive/entry is absent.
+    pub object_component_bas: Vec<Vec<Option<PreparedComponentBas>>>,
 }
 
 impl MissionAssets {
@@ -2007,7 +2022,15 @@ fn prepare_mission_assets_with_repository_internal<R: ResourceRepository>(
     }
 
     let mut prototype_component_controls = Vec::with_capacity(prototypes.len());
+    let mut prototype_component_bas = Vec::with_capacity(prototypes.len());
     for (prototype_index, prototype) in prototypes.iter().enumerate() {
+        let bas = match prototype.bas_resource.clone() {
+            Some(source) => {
+                prepare_component_bas_from_resource(repository, source, prototype_index)?
+            }
+            None => None,
+        };
+        prototype_component_bas.push(bas);
         let Some(source) = prototype.control_resource.clone() else {
             prototype_component_controls.push(None);
             continue;
@@ -2040,6 +2063,7 @@ fn prepare_mission_assets_with_repository_internal<R: ResourceRepository>(
 
     let mut object_visuals = Vec::with_capacity(root_prototype_spans.len());
     let mut object_component_controls = Vec::with_capacity(root_prototype_spans.len());
+    let mut object_component_bas = Vec::with_capacity(root_prototype_spans.len());
     for (root_index, span) in root_prototype_spans.iter().enumerate() {
         if span.start > span.end || span.end > prototype_visual_ids.len() {
             return Err(AssetError::InvalidPrototype(format!(
@@ -2048,6 +2072,7 @@ fn prepare_mission_assets_with_repository_internal<R: ResourceRepository>(
         }
         let mut ids = Vec::new();
         let mut controls = Vec::new();
+        let mut bases = Vec::new();
         for index in span.clone() {
             let visual_id = prototype_visual_ids[index];
             // A unit DAT is an instance tree.  Reusing one prepared visual
@@ -2055,9 +2080,11 @@ fn prepare_mission_assets_with_repository_internal<R: ResourceRepository>(
             // identical cannons on w_m_wlk2).
             ids.push(visual_id);
             controls.push(prototype_component_controls[index].clone());
+            bases.push(prototype_component_bas[index].clone());
         }
         object_visuals.push(ids);
         object_component_controls.push(controls);
+        object_component_bas.push(bases);
     }
 
     let assets = MissionAssets {
@@ -2068,6 +2095,7 @@ fn prepare_mission_assets_with_repository_internal<R: ResourceRepository>(
         visuals,
         object_visuals,
         object_component_controls,
+        object_component_bas,
     };
     let report = AssetPreparationReport {
         model_count: assets.models.len(),
@@ -3372,6 +3400,25 @@ fn prepare_component_control_from_resource<R: ResourceRepository>(
     Ok(Some(control))
 }
 
+fn prepare_component_bas_from_resource<R: ResourceRepository>(
+    repository: &R,
+    source: ResourceKey,
+    prototype_index: usize,
+) -> Result<Option<PreparedComponentBas>, AssetError> {
+    let Some(payload) = read_optional_key(repository, &source, Some("component BAS geometry"))?
+    else {
+        return Ok(None);
+    };
+    let geometry = decode_bas_geometry(&payload).map_err(|error| {
+        AssetError::InvalidPrototype(format!(
+            "prototype {prototype_index} BAS geometry {}:{}: {error}",
+            source.archive.as_str(),
+            String::from_utf8_lossy(&source.name.0),
+        ))
+    })?;
+    Ok(Some(PreparedComponentBas { source, geometry }))
+}
+
 fn decode_component_node_data_table(
     payload: &[u8],
     source: ResourceKey,
@@ -4618,6 +4665,89 @@ mod tests {
     }
 
     #[test]
+    fn mission_assets_keep_explicit_bas_geometry_at_component_index() {
+        let mut bas = Vec::new();
+        bas.extend_from_slice(&1_u32.to_le_bytes()); // first-section records
+        bas.extend_from_slice(&1_u32.to_le_bytes()); // declared count
+        for point in [[1.0_f32, 2.0, 3.0], [4.0, 5.0, 6.0]] {
+            for value in point {
+                bas.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        bas.extend_from_slice(&0x1122_3344_u32.to_le_bytes());
+        bas.extend_from_slice(&0x5566_7788_u32.to_le_bytes());
+        bas.extend_from_slice(&1_u32.to_le_bytes()); // second-section records
+        bas.extend_from_slice(&1_u32.to_le_bytes());
+        for point in [[7.0_f32, 8.0, 9.0], [10.0, 11.0, 12.0]] {
+            for value in point {
+                bas.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        let repository = repository_with_archives(&[("fortif.rlb", &[(b"fr_b_plant.bas", &bas)])]);
+        let source = ResourceKey {
+            archive: parse_path("fortif.rlb").expect("archive"),
+            name: resource_name(b"fr_b_plant.bas"),
+            type_id: None,
+        };
+        let without_bas = EffectivePrototype {
+            key: fparkan_prototype::PrototypeKey(resource_name(b"unrelated")),
+            geometry: PrototypeGeometry::NonGeometric,
+            source: fparkan_prototype::PrototypeSource::ObjectsRegistry,
+            source_type: None,
+            dependencies: Vec::new(),
+            control_resource: None,
+            point_resource: None,
+            node_data_resource: None,
+            bas_resource: None,
+        };
+        let prototype = EffectivePrototype {
+            key: fparkan_prototype::PrototypeKey(resource_name(b"fr_b_plant")),
+            geometry: PrototypeGeometry::NonGeometric,
+            source: fparkan_prototype::PrototypeSource::ObjectsRegistry,
+            source_type: None,
+            dependencies: Vec::new(),
+            control_resource: None,
+            point_resource: None,
+            node_data_resource: None,
+            bas_resource: Some(source.clone()),
+        };
+
+        let assets =
+            prepare_mission_assets_with_repository(&repository, &[0..2], &[without_bas, prototype])
+                .expect("mission BAS sidecar");
+        assert_eq!(assets.object_component_bas[0].len(), 2);
+        assert!(assets.object_component_bas[0][0].is_none());
+        let prepared = assets.object_component_bas[0][1]
+            .as_ref()
+            .expect("BAS aligned with component one");
+        assert_eq!(prepared.source, source);
+        assert_eq!(prepared.geometry.first[0].points[1], [4.0, 5.0, 6.0]);
+        assert_eq!(prepared.geometry.first[0].opaque_words_a, [0x1122_3344]);
+        assert_eq!(prepared.geometry.second[0].points[1], [10.0, 11.0, 12.0]);
+    }
+
+    #[test]
+    fn malformed_explicit_bas_geometry_is_reported_at_preparation_boundary() {
+        let bad_payload = u32::MAX.to_le_bytes();
+        let repository =
+            repository_with_archives(&[("fortif.rlb", &[(b"broken.bas", &bad_payload)])]);
+        let source = ResourceKey {
+            archive: parse_path("fortif.rlb").expect("archive"),
+            name: resource_name(b"broken.bas"),
+            type_id: None,
+        };
+
+        let error = prepare_component_bas_from_resource(&repository, source, 3)
+            .expect_err("malformed BAS counts are rejected");
+        assert!(matches!(
+            error,
+            AssetError::InvalidPrototype(message)
+                if message.contains("prototype 3 BAS geometry fortif.rlb:broken.bas")
+                    && message.contains("limit")
+        ));
+    }
+
+    #[test]
     fn component_control_preserves_unresolved_point_offset_sentinels() {
         let mut control = component_control_payload(&[(1, 0.0, 1.0, 0.25, 0)]);
         control[16..20].copy_from_slice(&1_u32.to_le_bytes());
@@ -5007,6 +5137,7 @@ mod tests {
             control_resource: None,
             point_resource: None,
             node_data_resource: None,
+            bas_resource: None,
         };
         let second = EffectivePrototype {
             key: fparkan_prototype::PrototypeKey(resource_name(b"mesh")),
@@ -5022,6 +5153,7 @@ mod tests {
             control_resource: None,
             point_resource: None,
             node_data_resource: None,
+            bas_resource: None,
         };
 
         assert_ne!(stable_visual_id(&first), stable_visual_id(&second));
@@ -5088,6 +5220,7 @@ mod tests {
             control_resource: None,
             point_resource: None,
             node_data_resource: None,
+            bas_resource: None,
         };
         let mut graph = prototype_graph_for_mesh(&prototype);
         let mut report = PrototypeGraphReport {
@@ -5205,6 +5338,7 @@ mod tests {
             control_resource: None,
             point_resource: None,
             node_data_resource: None,
+            bas_resource: None,
         };
         let mut graph = prototype_graph_for_mesh(&prototype);
         graph
@@ -5360,6 +5494,7 @@ mod tests {
             control_resource: None,
             point_resource: None,
             node_data_resource: None,
+            bas_resource: None,
         };
         let mut graph = prototype_graph_for_mesh(&prototype);
         let mut report = PrototypeGraphReport {
@@ -5520,6 +5655,7 @@ mod tests {
                     type_id: None,
                 }),
                 node_data_resource: None,
+                bas_resource: None,
             },
             EffectivePrototype {
                 key: fparkan_prototype::PrototypeKey(resource_name(b"tree-b")),
@@ -5534,6 +5670,7 @@ mod tests {
                 }),
                 point_resource: None,
                 node_data_resource: None,
+                bas_resource: None,
             },
             EffectivePrototype {
                 key: fparkan_prototype::PrototypeKey(resource_name(b"tree-c")),
@@ -5548,6 +5685,7 @@ mod tests {
                 }),
                 point_resource: None,
                 node_data_resource: None,
+                bas_resource: None,
             },
         ];
 
@@ -5643,6 +5781,7 @@ mod tests {
             }),
             point_resource: None,
             node_data_resource: None,
+            bas_resource: None,
         };
 
         let assets = prepare_mission_assets_with_repository(&repository, &[0..1], &[prototype])
@@ -5840,6 +5979,7 @@ mod tests {
             control_resource: None,
             point_resource: None,
             node_data_resource: None,
+            bas_resource: None,
         };
         let mut graph = prototype_graph_for_mesh(&prototype);
         let mut report = PrototypeGraphReport {
@@ -6051,6 +6191,7 @@ mod tests {
                 control_resource: None,
                 point_resource: None,
                 node_data_resource: None,
+                bas_resource: None,
             },
             EffectivePrototype {
                 key: fparkan_prototype::PrototypeKey(resource_name(b"tree_b")),
@@ -6065,6 +6206,7 @@ mod tests {
                 control_resource: None,
                 point_resource: None,
                 node_data_resource: None,
+                bas_resource: None,
             },
         ];
         (repo, prototypes)
@@ -6227,6 +6369,7 @@ mod tests {
             prototype_requests: vec![prototype.key.clone()],
             root_prototype_request_spans: std::iter::once(0..1).collect(),
             root_unit_components: vec![Vec::new()],
+            root_unit_dat_header_flags: vec![None],
             visual_dependencies_expanded: false,
             nodes: vec![root_node, prototype_node, mesh_node],
             edges: vec![

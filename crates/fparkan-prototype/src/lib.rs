@@ -2,7 +2,7 @@
 //! Prototype registry and unit DAT primitives.
 
 use encoding_rs::WINDOWS_1251;
-use fparkan_binary::{checked_count_bytes, Cursor, DecodeError};
+use fparkan_binary::{checked_allocation_len, checked_count_bytes, Cursor, DecodeError, Limits};
 use fparkan_path::{normalize_relative, NormalizedPath, PathPolicy, ResourceName};
 use fparkan_resource::{
     archive_path, resource_name, ResourceError, ResourceKey, ResourceRepository,
@@ -17,6 +17,9 @@ const PROTOTYPE_INHERITANCE_DEPTH_LIMIT: usize = 32;
 
 /// `objects.rlb` external geometry entry type (`EXTO`).
 pub const PROTOTYPE_TYPE_EXTO: u32 = u32::from_le_bytes(*b"EXTO");
+
+/// Unit DAT second-header-word bit that enables native BAS placement handling.
+pub const UNIT_DAT_BAS_PLACEMENT_FLAG: u32 = 0x8000_0000;
 
 /// Prototype key.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -38,6 +41,48 @@ pub struct UnitDat {
     pub header_opaque: [u8; 8],
     /// Component records.
     pub records: Vec<UnitComponentRecord>,
+}
+
+/// BAS payload with two ordered point-record sections.
+///
+/// The `first` and `second` fields describe stream order only. The native
+/// loader reads one record shape in the first section and a point-only shape
+/// in the second, but this type does not assign gameplay or geometry meaning
+/// to either section.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BasGeometry {
+    /// First ordered section, whose records also carry two opaque word arrays.
+    pub first: Vec<BasGeometryRecord>,
+    /// Second ordered section of point sequences.
+    pub second: Vec<BasPointSequence>,
+}
+
+/// BAS record from the first ordered section.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BasGeometryRecord {
+    /// Count value stored before the point sequence.
+    pub declared_count: u32,
+    /// `declared_count + 1` points copied by the native loader.
+    ///
+    /// Point sequences are preserved as read; closure is not imposed by the
+    /// binary decoder.
+    pub points: Vec<[f32; 3]>,
+    /// First opaque word array, containing `declared_count` entries.
+    pub opaque_words_a: Vec<u32>,
+    /// Second opaque word array, containing `declared_count` entries.
+    pub opaque_words_b: Vec<u32>,
+}
+
+/// BAS point sequence from the second ordered section.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BasPointSequence {
+    /// Count value stored before the point sequence.
+    pub declared_count: u32,
+    /// `declared_count + 1` points copied by the native loader.
+    ///
+    /// Point sequences are preserved as read; closure is not imposed by the
+    /// binary decoder.
+    pub points: Vec<[f32; 3]>,
 }
 
 /// Unit DAT binding used by mission object references.
@@ -117,6 +162,9 @@ pub struct EffectivePrototype {
     /// Explicit component NDP/provider resource referenced by this
     /// prototype's resolved `objects.rlb` registry inheritance chain.
     pub node_data_resource: Option<ResourceKey>,
+    /// Explicit BAS geometry resource referenced by this prototype's resolved
+    /// `objects.rlb` registry inheritance chain.
+    pub bas_resource: Option<ResourceKey>,
 }
 
 /// Prototype resolution source.
@@ -146,6 +194,10 @@ pub struct PrototypeGraph {
     /// assigning runtime semantics to their `kind`, links, descriptions, or
     /// opaque tails.
     pub root_unit_components: Vec<Vec<UnitComponentRecord>>,
+    /// Second word of each standard component Unit DAT header. This vector is
+    /// aligned with [`Self::roots`]; direct prototype roots, legacy one-model
+    /// bindings, and failed decodes are `None`.
+    pub root_unit_dat_header_flags: Vec<Option<u32>>,
     /// Whether visual dependency expansion has already been applied.
     pub visual_dependencies_expanded: bool,
     /// Materialized prototype dependency graph nodes.
@@ -568,6 +620,190 @@ pub fn decode_unit_dat(payload: &[u8]) -> Result<UnitDat, PrototypeError> {
     })
 }
 
+/// Decodes a BAS payload as two ordered sections of point records.
+///
+/// Each section begins with a record count. Every record stores a declared
+/// count followed by that count plus one little-endian `Vec3` values. Records
+/// in the first section then carry two arrays of `declared_count` opaque
+/// words. The decoder preserves points and words without assigning geometric
+/// meaning or requiring the point sequence to be closed.
+///
+/// # Errors
+///
+/// Returns [`PrototypeError::Decode`] when a count exceeds the shared binary
+/// limits, a record is truncated, a point is not finite, or trailing bytes
+/// remain.
+pub fn decode_bas_geometry(payload: &[u8]) -> Result<BasGeometry, PrototypeError> {
+    let limits = Limits::default();
+    let payload_len = u64::try_from(payload.len()).map_err(|_| DecodeError::IntegerOverflow)?;
+    if payload_len > limits.max_file_bytes {
+        return Err(DecodeError::LimitExceeded {
+            count: payload_len,
+            limit: limits.max_file_bytes,
+        }
+        .into());
+    }
+
+    let mut cursor = Cursor::new(payload);
+    let mut budget = BasAllocationBudget::new(limits.max_decoded_bytes);
+
+    let first_count = read_bas_count(&mut cursor, limits.max_entries)?;
+    check_bas_section_minimum(&cursor, first_count)?;
+    let first_capacity =
+        budget.reserve::<BasGeometryRecord>(u64::from(first_count), limits.max_entries)?;
+    let mut first = Vec::with_capacity(first_capacity);
+    for _ in 0..first_count {
+        let declared_count = read_bas_count(&mut cursor, limits.max_array_items)?;
+        let point_count = bas_point_count(declared_count, limits.max_array_items)?;
+        check_bas_first_record(&cursor, declared_count, point_count)?;
+
+        let points = read_bas_points(&mut cursor, point_count, &mut budget, limits)?;
+        let opaque_words_a = read_bas_words(&mut cursor, declared_count, &mut budget, limits)?;
+        let opaque_words_b = read_bas_words(&mut cursor, declared_count, &mut budget, limits)?;
+        first.push(BasGeometryRecord {
+            declared_count,
+            points,
+            opaque_words_a,
+            opaque_words_b,
+        });
+    }
+
+    let second_count = read_bas_count(&mut cursor, limits.max_entries)?;
+    check_bas_section_minimum(&cursor, second_count)?;
+    let second_capacity =
+        budget.reserve::<BasPointSequence>(u64::from(second_count), limits.max_entries)?;
+    let mut second = Vec::with_capacity(second_capacity);
+    for _ in 0..second_count {
+        let declared_count = read_bas_count(&mut cursor, limits.max_array_items)?;
+        let point_count = bas_point_count(declared_count, limits.max_array_items)?;
+        let remaining =
+            u64::try_from(cursor.remaining()).map_err(|_| DecodeError::IntegerOverflow)?;
+        checked_count_bytes(point_count, 12, remaining)?;
+        let points = read_bas_points(&mut cursor, point_count, &mut budget, limits)?;
+        second.push(BasPointSequence {
+            declared_count,
+            points,
+        });
+    }
+
+    cursor.require_eof()?;
+    Ok(BasGeometry { first, second })
+}
+
+fn read_bas_count(cursor: &mut Cursor<'_>, limit: u32) -> Result<u32, DecodeError> {
+    let count = cursor.read_u32_le()?;
+    if count > limit {
+        return Err(DecodeError::LimitExceeded {
+            count: u64::from(count),
+            limit: u64::from(limit),
+        });
+    }
+    Ok(count)
+}
+
+fn bas_point_count(declared_count: u32, limit: u32) -> Result<u64, DecodeError> {
+    let point_count = u64::from(declared_count)
+        .checked_add(1)
+        .ok_or(DecodeError::IntegerOverflow)?;
+    if point_count > u64::from(limit) {
+        return Err(DecodeError::LimitExceeded {
+            count: point_count,
+            limit: u64::from(limit),
+        });
+    }
+    Ok(point_count)
+}
+
+fn check_bas_section_minimum(cursor: &Cursor<'_>, record_count: u32) -> Result<(), DecodeError> {
+    let remaining = u64::try_from(cursor.remaining()).map_err(|_| DecodeError::IntegerOverflow)?;
+    // Each record has a count word and at least one point (count zero).
+    checked_count_bytes(u64::from(record_count), 16, remaining)?;
+    Ok(())
+}
+
+fn check_bas_first_record(
+    cursor: &Cursor<'_>,
+    declared_count: u32,
+    point_count: u64,
+) -> Result<(), DecodeError> {
+    let remaining = u64::try_from(cursor.remaining()).map_err(|_| DecodeError::IntegerOverflow)?;
+    let point_bytes = checked_count_bytes(point_count, 12, remaining)?;
+    let after_points = remaining
+        .checked_sub(u64::try_from(point_bytes).map_err(|_| DecodeError::IntegerOverflow)?)
+        .ok_or(DecodeError::IntegerOverflow)?;
+    // The two unnamed word arrays each contain `declared_count` u32 entries.
+    checked_count_bytes(u64::from(declared_count), 8, after_points)?;
+    Ok(())
+}
+
+fn read_bas_points(
+    cursor: &mut Cursor<'_>,
+    point_count: u64,
+    budget: &mut BasAllocationBudget,
+    limits: Limits,
+) -> Result<Vec<[f32; 3]>, DecodeError> {
+    let capacity = budget.reserve::<[f32; 3]>(point_count, limits.max_array_items)?;
+    let mut points = Vec::with_capacity(capacity);
+    for _ in 0..point_count {
+        let point = [
+            cursor.read_f32_le()?,
+            cursor.read_f32_le()?,
+            cursor.read_f32_le()?,
+        ];
+        if !point.iter().all(|value| value.is_finite()) {
+            return Err(DecodeError::Invalid("BAS point is not finite"));
+        }
+        points.push(point);
+    }
+    Ok(points)
+}
+
+fn read_bas_words(
+    cursor: &mut Cursor<'_>,
+    word_count: u32,
+    budget: &mut BasAllocationBudget,
+    limits: Limits,
+) -> Result<Vec<u32>, DecodeError> {
+    let capacity = budget.reserve::<u32>(u64::from(word_count), limits.max_array_items)?;
+    let mut words = Vec::with_capacity(capacity);
+    for _ in 0..word_count {
+        words.push(cursor.read_u32_le()?);
+    }
+    Ok(words)
+}
+
+struct BasAllocationBudget {
+    used: u64,
+    limit: u64,
+}
+
+impl BasAllocationBudget {
+    const fn new(limit: u64) -> Self {
+        Self { used: 0, limit }
+    }
+
+    fn reserve<T>(&mut self, count: u64, count_limit: u32) -> Result<usize, DecodeError> {
+        let capacity = checked_allocation_len(count, u64::from(count_limit))?;
+        let element_size =
+            u64::try_from(std::mem::size_of::<T>()).map_err(|_| DecodeError::IntegerOverflow)?;
+        let allocation = count
+            .checked_mul(element_size)
+            .ok_or(DecodeError::IntegerOverflow)?;
+        let total = self
+            .used
+            .checked_add(allocation)
+            .ok_or(DecodeError::IntegerOverflow)?;
+        if total > self.limit {
+            return Err(DecodeError::LimitExceeded {
+                count: total,
+                limit: self.limit,
+            });
+        }
+        self.used = total;
+        Ok(capacity)
+    }
+}
+
 /// Builds the immediate-child tree encoded by Unit DAT record counts.
 ///
 /// Records are stored in preorder.  The final word of each 112-byte record is
@@ -750,6 +986,7 @@ struct ResolvedPrototypeRequests {
     expected_count: usize,
     prototypes: Vec<EffectivePrototype>,
     unit_components: Vec<UnitComponentRecord>,
+    unit_dat_header_flags: Option<u32>,
 }
 
 fn resolve_prototype_requests(
@@ -766,6 +1003,7 @@ fn resolve_prototype_requests(
         expected_count: 1,
         prototypes: prototype.into_iter().collect(),
         unit_components: Vec::new(),
+        unit_dat_header_flags: None,
     })
 }
 
@@ -801,6 +1039,11 @@ fn resolve_unit_dat_prototype_requests(
             expected_count: unit.records.len(),
             prototypes,
             unit_components: unit.records,
+            unit_dat_header_flags: Some(u32::from_le_bytes(
+                unit.header_opaque[4..8]
+                    .try_into()
+                    .expect("fixed Unit DAT header slice"),
+            )),
         });
     }
 
@@ -813,6 +1056,7 @@ fn resolve_unit_dat_prototype_requests(
         expected_count: 1,
         prototypes: prototype.into_iter().collect(),
         unit_components: Vec::new(),
+        unit_dat_header_flags: None,
     })
 }
 
@@ -860,6 +1104,9 @@ pub fn build_prototype_graph(
         graph
             .root_unit_components
             .push(expansion.unit_components.clone());
+        graph
+            .root_unit_dat_header_flags
+            .push(expansion.unit_dat_header_flags);
         let unit_component_count = expansion.unit_components.len();
         for (prototype_index, prototype) in expansion.prototypes.into_iter().enumerate() {
             let unit_component_index = is_unit_dat_root
@@ -966,6 +1213,9 @@ pub fn build_prototype_graph_report(
                 graph
                     .root_unit_components
                     .push(expansion.unit_components.clone());
+                graph
+                    .root_unit_dat_header_flags
+                    .push(expansion.unit_dat_header_flags);
                 if edge == PrototypeGraphEdge::MissionToUnitDat {
                     report.unit_component_count += expected;
                 }
@@ -1066,6 +1316,9 @@ pub fn build_prototype_graph_report(
         if graph.root_unit_components.len() <= root_index {
             graph.root_unit_components.push(Vec::new());
         }
+        if graph.root_unit_dat_header_flags.len() <= root_index {
+            graph.root_unit_dat_header_flags.push(None);
+        }
         let end = graph.prototype_requests.len();
         graph.root_prototype_request_spans.push(start..end);
     }
@@ -1155,6 +1408,7 @@ fn resolve_archive_model(
         None,
         None,
         None,
+        None,
     )))
 }
 
@@ -1181,6 +1435,7 @@ fn resolve_objects_registry_model(
     let control_resource = resolve_explicit_control_resource(object_key, &refs)?;
     let point_resource = resolve_explicit_point_resource(object_key, &refs)?;
     let node_data_resource = resolve_explicit_node_data_resource(object_key, &refs)?;
+    let bas_resource = resolve_explicit_bas_resource(object_key, &refs)?;
 
     let mut missing_mesh_refs = Vec::new();
     for item in refs.iter().filter(|item| is_explicit_mesh_ref(item)) {
@@ -1193,6 +1448,7 @@ fn resolve_objects_registry_model(
             control_resource.clone(),
             point_resource.clone(),
             node_data_resource.clone(),
+            bas_resource.clone(),
         )? {
             return Ok(Some(prototype));
         }
@@ -1215,6 +1471,7 @@ fn resolve_objects_registry_model(
         control_resource,
         point_resource,
         node_data_resource,
+        bas_resource,
     }))
 }
 
@@ -1284,6 +1541,7 @@ fn resolve_object_ref_model(
     control_resource: Option<ResourceKey>,
     point_resource: Option<ResourceKey>,
     node_data_resource: Option<ResourceKey>,
+    bas_resource: Option<ResourceKey>,
 ) -> Result<Option<EffectivePrototype>, PrototypeError> {
     let archive = normalized_path_from_name(&ResourceName(cstr_bytes(&item.archive_raw).to_vec()))?;
     let Some(mesh) = find_mesh_resource(repository, &archive, &ResourceName(model_name.to_vec()))?
@@ -1298,6 +1556,7 @@ fn resolve_object_ref_model(
         control_resource,
         point_resource,
         node_data_resource,
+        bas_resource,
     )))
 }
 
@@ -1315,6 +1574,10 @@ fn is_explicit_point_ref(item: &ObjectRefRecord) -> bool {
 
 fn is_explicit_node_data_ref(item: &ObjectRefRecord) -> bool {
     has_extension_bytes(cstr_bytes(&item.resource_raw), b"ndp")
+}
+
+fn is_explicit_bas_ref(item: &ObjectRefRecord) -> bool {
+    has_extension_bytes(cstr_bytes(&item.resource_raw), b"bas")
 }
 
 fn resolve_explicit_control_resource(
@@ -1336,6 +1599,13 @@ fn resolve_explicit_node_data_resource(
     refs: &[ObjectRefRecord],
 ) -> Result<Option<ResourceKey>, PrototypeError> {
     resolve_explicit_resource(requested, refs, is_explicit_node_data_ref, "node data")
+}
+
+fn resolve_explicit_bas_resource(
+    requested: &ResourceName,
+    refs: &[ObjectRefRecord],
+) -> Result<Option<ResourceKey>, PrototypeError> {
+    resolve_explicit_resource(requested, refs, is_explicit_bas_ref, "BAS geometry")
 }
 
 fn resolve_explicit_resource(
@@ -1442,6 +1712,7 @@ fn effective(
     control_resource: Option<ResourceKey>,
     point_resource: Option<ResourceKey>,
     node_data_resource: Option<ResourceKey>,
+    bas_resource: Option<ResourceKey>,
 ) -> EffectivePrototype {
     EffectivePrototype {
         key: PrototypeKey(requested),
@@ -1452,6 +1723,7 @@ fn effective(
         control_resource,
         point_resource,
         node_data_resource,
+        bas_resource,
     }
 }
 
@@ -1587,6 +1859,70 @@ mod tests {
     }
 
     #[test]
+    fn bas_geometry_preserves_both_sections_and_open_point_sequences() {
+        let bytes = build_bas_geometry_payload();
+
+        let geometry = decode_bas_geometry(&bytes).expect("BAS geometry");
+
+        assert_eq!(geometry.first.len(), 2);
+        assert_eq!(geometry.first[0].declared_count, 1);
+        assert_eq!(
+            geometry.first[0].points,
+            vec![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+        );
+        assert_eq!(geometry.first[0].opaque_words_a, vec![0x1122_3344]);
+        assert_eq!(geometry.first[0].opaque_words_b, vec![0x5566_7788]);
+        assert_eq!(geometry.first[1].declared_count, 2);
+        assert_eq!(
+            geometry.first[1].points,
+            vec![[10.0, 11.0, 12.0], [13.0, 14.0, 15.0], [16.0, 17.0, 18.0]]
+        );
+        assert_eq!(geometry.first[1].opaque_words_a, vec![7, 8]);
+        assert_eq!(geometry.first[1].opaque_words_b, vec![9, 10]);
+        assert_eq!(geometry.second.len(), 1);
+        assert_eq!(geometry.second[0].declared_count, 1);
+        assert_eq!(
+            geometry.second[0].points,
+            vec![[20.0, 21.0, 22.0], [23.0, 24.0, 25.0]]
+        );
+    }
+
+    #[test]
+    fn bas_geometry_rejects_truncated_records_and_extreme_counts() {
+        let mut truncated = build_bas_geometry_payload();
+        truncated.pop();
+        assert!(matches!(
+            decode_bas_geometry(&truncated),
+            Err(PrototypeError::Decode(DecodeError::UnexpectedEof { .. }))
+        ));
+
+        assert!(matches!(
+            decode_bas_geometry(&u32::MAX.to_le_bytes()),
+            Err(PrototypeError::Decode(DecodeError::LimitExceeded { .. }))
+        ));
+    }
+
+    #[test]
+    fn bas_geometry_rejects_non_finite_points_and_trailing_bytes() {
+        let mut non_finite = build_bas_geometry_payload();
+        // The first point follows the first section and first record counts.
+        non_finite[8..12].copy_from_slice(&f32::NAN.to_bits().to_le_bytes());
+        assert!(matches!(
+            decode_bas_geometry(&non_finite),
+            Err(PrototypeError::Decode(DecodeError::Invalid(
+                "BAS point is not finite"
+            )))
+        ));
+
+        let mut trailing = build_bas_geometry_payload();
+        trailing.push(0);
+        assert!(matches!(
+            decode_bas_geometry(&trailing),
+            Err(PrototypeError::Decode(DecodeError::TrailingBytes { .. }))
+        ));
+    }
+
+    #[test]
     fn unit_zero_records_uses_exact_size() {
         let bytes = [0_u8; 8];
         let unit = decode_unit_dat(&bytes).expect("unit");
@@ -1628,6 +1964,10 @@ mod tests {
         let unit = decode_unit_dat(&bytes).expect("unit");
         let record = &unit.records[0];
         assert_eq!(unit.header_opaque, [0xF1, 0xF0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(
+            u32::from_le_bytes(unit.header_opaque[4..8].try_into().unwrap()),
+            0x0605_0403
+        );
         assert_eq!(record.parent_or_link, -7);
         assert_eq!(&record.description_raw[..description.len()], description);
         assert_eq!(record.tail0, 0x1122_3344);
@@ -1806,6 +2146,7 @@ mod tests {
         let (graph, resolved, report) = build_prototype_graph_report(&repo, vfs.as_ref(), &roots);
 
         assert_eq!(graph.roots.len(), 2);
+        assert_eq!(graph.root_unit_dat_header_flags, vec![None, None]);
         assert_eq!(resolved.len(), 1);
         assert_eq!(report.root_count, 2);
         assert_eq!(report.direct_reference_count, 2);
@@ -1838,6 +2179,13 @@ mod tests {
         );
         let vfs = Arc::new(vfs);
         let repo = CachedResourceRepository::new(vfs.clone());
+        let (graph, _, report) = build_prototype_graph_report(
+            &repo,
+            vfs.as_ref(),
+            &[resource_name(b"UNITS/AUTO/unit.dat")],
+        );
+        assert!(report.is_success());
+        assert_eq!(graph.root_unit_dat_header_flags, vec![None]);
         let resolved =
             resolve_prototype_single(&repo, vfs.as_ref(), &resource_name(b"UNITS/AUTO/unit.dat"))
                 .expect("resolve")
@@ -1923,16 +2271,12 @@ mod tests {
         let objects_path = resource_archive_path(b"objects.rlb").expect("objects path");
         let static_path = resource_archive_path(b"static.rlb").expect("static path");
         let mesh = minimal_msh_payload();
-        vfs.insert(
-            dat_path,
-            Arc::from(
-                build_unit_dat(&[
-                    (b"objects.rlb".as_slice(), b"component_a".as_slice()),
-                    (b"objects.rlb".as_slice(), b"component_b".as_slice()),
-                ])
-                .into_boxed_slice(),
-            ),
-        );
+        let mut unit_dat = build_unit_dat(&[
+            (b"objects.rlb".as_slice(), b"component_a".as_slice()),
+            (b"objects.rlb".as_slice(), b"component_b".as_slice()),
+        ]);
+        unit_dat[4..8].copy_from_slice(&UNIT_DAT_BAS_PLACEMENT_FLAG.to_le_bytes());
+        vfs.insert(dat_path, Arc::from(unit_dat.into_boxed_slice()));
         vfs.insert(
             objects_path,
             Arc::from(
@@ -2077,16 +2421,12 @@ mod tests {
         let objects_path = resource_archive_path(b"objects.rlb").expect("objects path");
         let static_path = resource_archive_path(b"static.rlb").expect("static path");
         let mesh = minimal_msh_payload();
-        vfs.insert(
-            dat_path,
-            Arc::from(
-                build_unit_dat(&[
-                    (b"objects.rlb".as_slice(), b"component_a".as_slice()),
-                    (b"objects.rlb".as_slice(), b"component_b".as_slice()),
-                ])
-                .into_boxed_slice(),
-            ),
-        );
+        let mut unit_dat = build_unit_dat(&[
+            (b"objects.rlb".as_slice(), b"component_a".as_slice()),
+            (b"objects.rlb".as_slice(), b"component_b".as_slice()),
+        ]);
+        unit_dat[4..8].copy_from_slice(&UNIT_DAT_BAS_PLACEMENT_FLAG.to_le_bytes());
+        vfs.insert(dat_path, Arc::from(unit_dat.into_boxed_slice()));
         vfs.insert(
             objects_path,
             Arc::from(
@@ -2132,6 +2472,10 @@ mod tests {
         assert_eq!(graph.prototype_requests[1].0 .0, b"component_b");
         assert_eq!(graph.root_unit_components.len(), 1);
         assert_eq!(graph.root_unit_components[0].len(), 2);
+        assert_eq!(
+            graph.root_unit_dat_header_flags,
+            vec![Some(UNIT_DAT_BAS_PLACEMENT_FLAG)]
+        );
         assert_eq!(
             cstr_bytes(&graph.root_unit_components[0][0].resource_raw),
             b"component_a"
@@ -2204,6 +2548,7 @@ mod tests {
                             (b"fortif.rlb".as_slice(), b"child_proto.bas".as_slice()),
                             (b"fortif.rlb".as_slice(), b"parent_proto.cpt".as_slice()),
                             (b"fortif.rlb".as_slice(), b"parent_proto.ctl".as_slice()),
+                            (b"fortif.rlb".as_slice(), b"parent_proto.ndp".as_slice()),
                         ])
                         .as_slice(),
                     ),
@@ -2252,6 +2597,11 @@ mod tests {
             .expect("inherited explicit NDP provider table");
         assert_eq!(node_data.archive.as_str(), "fortif.rlb");
         assert!(node_data.name.0.eq_ignore_ascii_case(b"parent_proto.ndp"));
+        let bas = resolved
+            .bas_resource
+            .expect("child-local explicit BAS geometry");
+        assert_eq!(bas.archive.as_str(), "fortif.rlb");
+        assert!(bas.name.0.eq_ignore_ascii_case(b"child_proto.bas"));
     }
 
     #[test]
@@ -2386,6 +2736,33 @@ mod tests {
             error,
             PrototypeError::Resource(ResourceError::Format(message))
                 if message.contains("ambiguous explicit node data resources")
+        ));
+    }
+
+    #[test]
+    fn objects_registry_rejects_distinct_explicit_bas_resources() {
+        let raw_name = |value: &[u8]| {
+            let mut raw = [0; 32];
+            raw[..value.len()].copy_from_slice(value);
+            raw
+        };
+        let refs = [
+            ObjectRefRecord {
+                archive_raw: raw_name(b"first.rlb"),
+                resource_raw: raw_name(b"first.bas"),
+            },
+            ObjectRefRecord {
+                archive_raw: raw_name(b"second.rlb"),
+                resource_raw: raw_name(b"second.bas"),
+            },
+        ];
+
+        let error = resolve_explicit_bas_resource(&resource_name(b"prototype"), &refs)
+            .expect_err("distinct explicit BAS resources are ambiguous");
+        assert!(matches!(
+            error,
+            PrototypeError::Resource(ResourceError::Format(message))
+                if message.contains("ambiguous explicit BAS geometry resources")
         ));
     }
 
@@ -2782,6 +3159,27 @@ mod tests {
             assert_eq!(mesh.archive.as_str().to_ascii_lowercase(), archive);
             assert!(mesh.name.0.eq_ignore_ascii_case(model));
         }
+
+        let plant = resolve_prototype_single(&repo, vfs.as_ref(), &resource_name(b"fr_b_plant"))
+            .expect("resolve factory prototype")
+            .expect("factory prototype");
+        let bas = plant.bas_resource.expect("explicit BAS registry reference");
+        assert_eq!(bas.archive.as_str().to_ascii_lowercase(), "fortif.rlb");
+        assert!(bas.name.0.eq_ignore_ascii_case(b"fr_b_plant.bas"));
+        let bas_archive = repo
+            .open_archive(&bas.archive)
+            .expect("open explicit BAS archive");
+        let bas_entry = repo
+            .find(bas_archive, &bas.name)
+            .expect("find explicit BAS entry")
+            .expect("BAS entry exists");
+        let bas_payload = repo.read(bas_entry).expect("read explicit BAS entry");
+        let geometry =
+            decode_bas_geometry(bas_payload.as_slice()).expect("decode licensed BAS geometry");
+        assert_eq!(geometry.first.len(), 1);
+        assert_eq!(geometry.second.len(), 1);
+        assert_eq!(geometry.first[0].points.len(), 21);
+        assert_eq!(geometry.second[0].points.len(), 15);
     }
 
     #[test]
@@ -2999,6 +3397,53 @@ mod tests {
             out.extend_from_slice(&record);
         }
         out
+    }
+
+    fn build_bas_geometry_payload() -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&2_u32.to_le_bytes());
+
+        push_bas_record_with_words(
+            &mut out,
+            1,
+            &[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+            &[0x1122_3344],
+            &[0x5566_7788],
+        );
+        push_bas_record_with_words(
+            &mut out,
+            2,
+            &[[10.0, 11.0, 12.0], [13.0, 14.0, 15.0], [16.0, 17.0, 18.0]],
+            &[7, 8],
+            &[9, 10],
+        );
+
+        out.extend_from_slice(&1_u32.to_le_bytes());
+        out.extend_from_slice(&1_u32.to_le_bytes());
+        push_bas_points(&mut out, &[[20.0, 21.0, 22.0], [23.0, 24.0, 25.0]]);
+        out
+    }
+
+    fn push_bas_record_with_words(
+        out: &mut Vec<u8>,
+        declared_count: u32,
+        points: &[[f32; 3]],
+        words_a: &[u32],
+        words_b: &[u32],
+    ) {
+        out.extend_from_slice(&declared_count.to_le_bytes());
+        push_bas_points(out, points);
+        for word in words_a.iter().chain(words_b) {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+    }
+
+    fn push_bas_points(out: &mut Vec<u8>, points: &[[f32; 3]]) {
+        for point in points {
+            for value in point {
+                out.extend_from_slice(&value.to_le_bytes());
+            }
+        }
     }
 
     fn build_object_refs(items: &[(&[u8], &[u8])]) -> Vec<u8> {
