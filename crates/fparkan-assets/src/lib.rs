@@ -6,8 +6,8 @@ use fparkan_material::{
     MAT0_KIND, WEAR_KIND,
 };
 pub use fparkan_material::{
-    sample_material_phase, Mat0Document, MaterialCoefficients, MaterialError, MaterialPhase,
-    MaterialPhaseSample,
+    sample_material_normalized_phase, sample_material_phase, Mat0Document, MaterialCoefficients,
+    MaterialError, MaterialPhase, MaterialPhaseSample,
 };
 use fparkan_mission_format::{decode_tma, decode_tma_land_path, ClanBody};
 pub use fparkan_mission_format::{LpString, MissionDocument, MissionError, TmaProfile};
@@ -513,11 +513,44 @@ pub fn load_material_name_texture_rgba8_and_phase_with_document_from_root(
     material_name: &str,
     phase_index: u16,
 ) -> Result<(Vec<RgbaImage>, PreparedMaterialPhase, Mat0Document), String> {
+    load_material_archive_name_texture_rgba8_and_phase_with_document_from_root(
+        root,
+        "material.lib",
+        material_name,
+        phase_index,
+    )
+}
+
+/// Loads a named MAT0 entry from an FX-selected archive, its selected texture
+/// phase, and the complete document used by the runtime animation sampler.
+pub fn load_material_archive_name_texture_rgba8_and_phase_with_document_from_root(
+    root: &Path,
+    archive_name: &str,
+    material_name: &str,
+    phase_index: u16,
+) -> Result<(Vec<RgbaImage>, PreparedMaterialPhase, Mat0Document), String> {
+    if archive_name.is_empty() {
+        return Err("material archive name is empty".to_string());
+    }
     if material_name.is_empty() {
         return Err("material name is empty".to_string());
     }
     let repository = CachedResourceRepository::new(Arc::new(DirectoryVfs::new(root)));
-    let archive = parse_path("material.lib").map_err(|err| err.to_string())?;
+    load_material_archive_name_texture_rgba8_and_phase_from_repository(
+        &repository,
+        archive_name,
+        material_name,
+        phase_index,
+    )
+}
+
+fn load_material_archive_name_texture_rgba8_and_phase_from_repository<R: ResourceRepository>(
+    repository: &R,
+    archive_name: &str,
+    material_name: &str,
+    phase_index: u16,
+) -> Result<(Vec<RgbaImage>, PreparedMaterialPhase, Mat0Document), String> {
+    let archive = parse_path(archive_name).map_err(|err| err.to_string())?;
     let archive_id = repository
         .open_archive(&archive)
         .map_err(|err| err.to_string())?;
@@ -525,12 +558,14 @@ pub fn load_material_name_texture_rgba8_and_phase_with_document_from_root(
     let entry = repository
         .find(archive_id, &name)
         .map_err(|err| err.to_string())?
-        .ok_or_else(|| format!("missing material {material_name:?}"))?;
+        .ok_or_else(|| format!("missing material {archive_name}/{material_name}"))?;
     let info = repository
         .entry_info(entry)
         .map_err(|err| err.to_string())?;
     if info.key.type_id != Some(MAT0_KIND) {
-        return Err(format!("material {material_name:?} is not a MAT0 entry"));
+        return Err(format!(
+            "material {archive_name}/{material_name} is not a MAT0 entry"
+        ));
     }
     let document = decode_mat0(
         repository
@@ -548,7 +583,7 @@ pub fn load_material_name_texture_rgba8_and_phase_with_document_from_root(
     };
     let document = material.document.clone();
     let (mips, phase) =
-        load_resolved_material_texture_rgba8_and_phase(&repository, &material, phase_index)?;
+        load_resolved_material_texture_rgba8_and_phase(repository, &material, phase_index)?;
     Ok((mips, phase, document))
 }
 
@@ -6276,6 +6311,62 @@ mod tests {
         CachedResourceRepository::new(Arc::new(vfs))
     }
 
+    #[test]
+    fn fx_material_loader_uses_the_archive_named_by_the_fx_command() {
+        let fx_mat0 = mat0_with_texture(b"FX_LAMP_TEX");
+        let default_mat0 = mat0_with_texture(b"DEFAULT_TEX");
+        let texm = texm_payload_with_page_rect();
+        let repo = repository_with_archives_meta(&[
+            (
+                "effects.rlb",
+                &[TestNresEntry {
+                    name: b"lamp",
+                    payload: &fx_mat0,
+                    type_id: MAT0_KIND,
+                    attr2: 0,
+                }],
+            ),
+            (
+                "material.lib",
+                &[TestNresEntry {
+                    name: b"lamp",
+                    payload: &default_mat0,
+                    type_id: MAT0_KIND,
+                    attr2: 0,
+                }],
+            ),
+            (
+                TEXTURES_ARCHIVE,
+                &[
+                    TestNresEntry {
+                        name: b"FX_LAMP_TEX",
+                        payload: &texm,
+                        type_id: 0,
+                        attr2: 0,
+                    },
+                    TestNresEntry {
+                        name: b"DEFAULT_TEX",
+                        payload: &texm,
+                        type_id: 0,
+                        attr2: 0,
+                    },
+                ],
+            ),
+        ]);
+
+        let (_, _, document) = load_material_archive_name_texture_rgba8_and_phase_from_repository(
+            &repo,
+            "effects.rlb",
+            "lamp",
+            0,
+        )
+        .expect("FX-selected archive has a valid MAT0");
+        assert_eq!(
+            document.primary_texture(),
+            Some(resource_name(b"FX_LAMP_TEX"))
+        );
+    }
+
     fn texm_payload() -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&0x6d78_6554_u32.to_le_bytes());
@@ -6287,6 +6378,17 @@ mod tests {
         out.extend_from_slice(&0_u32.to_le_bytes());
         out.extend_from_slice(&565_u32.to_le_bytes());
         out.extend_from_slice(&0xffff_u16.to_le_bytes());
+        out
+    }
+
+    fn texm_payload_with_page_rect() -> Vec<u8> {
+        let mut out = texm_payload();
+        out.extend_from_slice(&0x6567_6150_u32.to_le_bytes());
+        out.extend_from_slice(&1_u32.to_le_bytes());
+        out.extend_from_slice(&0_i16.to_le_bytes());
+        out.extend_from_slice(&1_i16.to_le_bytes());
+        out.extend_from_slice(&0_i16.to_le_bytes());
+        out.extend_from_slice(&1_i16.to_le_bytes());
         out
     }
 
