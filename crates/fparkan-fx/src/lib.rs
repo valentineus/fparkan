@@ -13,6 +13,7 @@ pub mod fx_visual;
 pub mod op7;
 pub mod shadow;
 pub mod sky;
+pub mod smoke;
 
 /// Advances the native FX 16-bit-pair random state and returns its new high half.
 ///
