@@ -11,14 +11,14 @@ use super::{
     create_validation_messenger, create_vertex_buffer, create_vulkan_instance_probe,
     create_vulkan_logical_device_probe_for_request, create_vulkan_surface_probe,
     create_vulkan_swapchain_probe_for_extent, destroy_allocated_buffer, destroy_allocated_image,
-    destroy_swapchain_resources, plan_vulkan_surface, readback_buffer_bytes,
-    update_static_texture_image, write_frame_uniform, write_material_specular_buffer,
-    write_static_mesh_index_buffer, write_static_mesh_vertex_buffer, VulkanAllocatedBuffer,
-    VulkanInstanceConfig, VulkanInstanceProbe, VulkanLogicalDeviceProbe, VulkanReadbackArtifact,
-    VulkanSmokeFrameOutcome, VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo,
-    VulkanSmokeRendererError, VulkanSmokeRendererReport, VulkanSmokeShutdownReport,
-    VulkanSurfaceProbe, VulkanSwapchainProbe, VulkanSwapchainResources, VulkanValidationMessenger,
-    VulkanValidationReport,
+    destroy_swapchain_resources, ensure_point_light_capacity, plan_vulkan_surface,
+    readback_buffer_bytes, update_static_texture_image, write_frame_uniform,
+    write_material_specular_buffer, write_point_light_buffer, write_static_mesh_index_buffer,
+    write_static_mesh_vertex_buffer, VulkanAllocatedBuffer, VulkanInstanceConfig,
+    VulkanInstanceProbe, VulkanLogicalDeviceProbe, VulkanReadbackArtifact, VulkanSmokeFrameOutcome,
+    VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo, VulkanSmokeRendererError,
+    VulkanSmokeRendererReport, VulkanSmokeShutdownReport, VulkanSurfaceProbe, VulkanSwapchainProbe,
+    VulkanSwapchainResources, VulkanValidationMessenger, VulkanValidationReport,
 };
 use crate::policy::KHR_PORTABILITY_SUBSET_EXTENSION;
 use crate::shader::validate_triangle_shaders;
@@ -440,6 +440,8 @@ impl VulkanSmokeRenderer {
             readback_enabled: false,
             camera: create_info.camera,
             frame_uniforms: super::VulkanFrameUniforms::from_camera(create_info.camera),
+            point_lights: Vec::new(),
+            point_lights_explicit: false,
             frame_sync: Vec::new(),
             images_in_flight: Vec::new(),
             current_frame: 0,
@@ -573,6 +575,41 @@ impl VulkanSmokeRenderer {
         }
         self.camera.clip_from_world = frame_uniforms.clip_from_world;
         self.frame_uniforms = frame_uniforms;
+        Ok(())
+    }
+
+    /// Replaces the complete dynamic point-light set for subsequent frames.
+    ///
+    /// The storage buffer grows on demand and rejects counts beyond the
+    /// device's `maxStorageBufferRange`; it never truncates scene lights.
+    /// Values are uploaded to the current fence-safe frame slot by
+    /// [`Self::draw_frame`].
+    pub fn set_point_lights(
+        &mut self,
+        point_lights: &[super::VulkanPointLight],
+    ) -> Result<(), VulkanSmokeRendererError> {
+        let max_count = self.resources_ref()?.max_point_light_count;
+        if point_lights.len() > max_count {
+            return Err(VulkanSmokeRendererError::InvalidPointLights {
+                context: "point-light count exceeds maxStorageBufferRange",
+            });
+        }
+        if point_lights.iter().any(|light| {
+            !light
+                .position
+                .into_iter()
+                .chain(light.rgb)
+                .chain([light.range])
+                .chain(light.coefficients)
+                .all(f32::is_finite)
+        }) {
+            return Err(VulkanSmokeRendererError::InvalidPointLights {
+                context: "non-finite point-light field",
+            });
+        }
+        self.point_lights.clear();
+        self.point_lights.extend_from_slice(point_lights);
+        self.point_lights_explicit = true;
         Ok(())
     }
 
@@ -1318,6 +1355,44 @@ impl VulkanSmokeRenderer {
             context: "vkWaitForFences",
             result: error,
         })?;
+        let legacy_point_light = self.frame_uniforms.point_light;
+        let point_light_count = if self.point_lights_explicit {
+            self.point_lights.len()
+        } else {
+            usize::from(legacy_point_light.active)
+        };
+        let needs_point_light_growth =
+            point_light_count > self.resources_ref()?.point_light_capacity;
+        if needs_point_light_growth {
+            // Updating every material's binding 6 and replacing the shared
+            // SSBO requires all prior command buffers to finish.
+            // SAFETY: The renderer owns the logical device and no submission
+            // can observe the replacement after this idle point.
+            unsafe { self.device_ref()?.device().device_wait_idle() }.map_err(|result| {
+                VulkanSmokeRendererError::VulkanOperation {
+                    context: "vkDeviceWaitIdle(point-light buffer growth)",
+                    result,
+                }
+            })?;
+            let instance =
+                self.instance
+                    .as_ref()
+                    .ok_or(VulkanSmokeRendererError::InvariantViolation {
+                        context: "Vulkan instance during point-light growth",
+                    })?;
+            let device =
+                self.device
+                    .as_ref()
+                    .ok_or(VulkanSmokeRendererError::InvariantViolation {
+                        context: "logical device during point-light growth",
+                    })?;
+            let resources = self.swapchain_resources.as_mut().ok_or(
+                VulkanSmokeRendererError::InvariantViolation {
+                    context: "swapchain resources during point-light growth",
+                },
+            )?;
+            ensure_point_light_capacity(instance, device, resources, point_light_count)?;
+        }
         if self.material_specular_dirty {
             // The storage buffer is shared by all in-flight frames.  Wait for
             // every prior use before replacing the records so a setter cannot
@@ -1377,14 +1452,42 @@ impl VulkanSmokeRenderer {
         }
         self.images_in_flight[image_index_usize] = in_flight_fence;
         let frame_bytes = self.frame_uniforms.to_ne_bytes();
-        let resources = self.resources_ref()?;
-        write_frame_uniform(
-            self.device_ref()?,
-            &resources.frame_uniform_buffer,
-            resources.frame_uniform_stride,
-            self.current_frame,
-            &frame_bytes,
-        )?;
+        {
+            let explicit_point_lights = self.point_lights_explicit;
+            let legacy_point_light = self.frame_uniforms.point_light;
+            let point_lights = if explicit_point_lights {
+                self.point_lights.as_slice()
+            } else if legacy_point_light.active {
+                std::slice::from_ref(&legacy_point_light)
+            } else {
+                &[]
+            };
+            let device =
+                self.device
+                    .as_ref()
+                    .ok_or(VulkanSmokeRendererError::InvariantViolation {
+                        context: "logical device during frame upload",
+                    })?;
+            let resources = self.swapchain_resources.as_ref().ok_or(
+                VulkanSmokeRendererError::InvariantViolation {
+                    context: "swapchain resources during frame upload",
+                },
+            )?;
+            write_frame_uniform(
+                device,
+                &resources.frame_uniform_buffer,
+                resources.frame_uniform_stride,
+                self.current_frame,
+                &frame_bytes,
+            )?;
+            write_point_light_buffer(
+                device,
+                &resources.point_light_buffer,
+                resources.point_light_stride,
+                self.current_frame,
+                point_lights,
+            )?;
+        }
         let render_finished = self
             .resources_ref()?
             .render_finished
@@ -1693,6 +1796,12 @@ impl VulkanSmokeRenderer {
                         .saturating_mul(u64::try_from(texture_index).unwrap_or(u64::MAX)),
                 )
                 .unwrap_or(u32::MAX);
+                let point_light_offset = u32::try_from(
+                    resources
+                        .point_light_stride
+                        .saturating_mul(u64::try_from(self.current_frame).unwrap_or(u64::MAX)),
+                )
+                .unwrap_or(u32::MAX);
                 let descriptor_set = resources.descriptor_sets.get(texture_index).ok_or(
                     VulkanSmokeRendererError::InvariantViolation {
                         context: "static material descriptor set",
@@ -1704,7 +1813,7 @@ impl VulkanSmokeRenderer {
                     resources.pipeline_layout,
                     0,
                     std::slice::from_ref(descriptor_set),
-                    &[frame_offset, material_offset],
+                    &[frame_offset, material_offset, point_light_offset],
                 );
                 let alpha_cutoff = range.alpha_test_cutoff().to_ne_bytes();
                 device.device().cmd_push_constants(

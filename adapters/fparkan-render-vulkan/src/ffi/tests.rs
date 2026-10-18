@@ -492,6 +492,51 @@ fn fragment_shader_dispatches_all_four_material_modes() {
 }
 
 #[test]
+fn point_light_storage_payload_is_counted_and_packed_as_three_vec4s() {
+    let lights = [VulkanPointLight {
+        position: [1.0, 2.0, 3.0],
+        rgb: [4.0, 5.0, 6.0],
+        range: 7.0,
+        coefficients: [8.0, 9.0, 10.0],
+        active: true,
+    }];
+    let bytes = super::resources::encode_point_lights(&lights).expect("point-light payload");
+    assert_eq!(
+        bytes.len(),
+        VULKAN_POINT_LIGHT_HEADER_BYTES + VULKAN_POINT_LIGHT_RECORD_BYTES
+    );
+    assert_eq!(u32::from_ne_bytes(bytes[0..4].try_into().unwrap()), 1);
+    let values = (0..12)
+        .map(|index| {
+            let offset = VULKAN_POINT_LIGHT_HEADER_BYTES + index * std::mem::size_of::<f32>();
+            f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        values,
+        vec![1.0, 2.0, 3.0, 7.0, 4.0, 5.0, 6.0, 1.0, 8.0, 9.0, 10.0, 1.0]
+    );
+
+    let many = vec![VulkanPointLight::default(); 33];
+    let bytes = super::resources::encode_point_lights(&many).expect("uncapped point-light payload");
+    assert_eq!(u32::from_ne_bytes(bytes[0..4].try_into().unwrap()), 33);
+    assert_eq!(
+        bytes.len(),
+        VULKAN_POINT_LIGHT_HEADER_BYTES + 33 * VULKAN_POINT_LIGHT_RECORD_BYTES
+    );
+}
+
+#[test]
+fn vertex_shader_sums_the_runtime_point_light_array() {
+    let vertex = include_str!("../../shaders/triangle.vert");
+    assert!(
+        vertex.contains("layout(std430, set = 0, binding = 6) readonly buffer PointLightBuffer")
+    );
+    assert!(vertex.contains("for (uint index = 0u; index < point_light_buffer.header.x; ++index)"));
+    assert!(!vertex.contains("if (point_rgb_active.w"));
+}
+
+#[test]
 fn native_specular_reference_uses_squared_power_and_total_overflow_curve() {
     fn reference_power(cosine: f32, power: u8) -> f32 {
         if power == 0 {

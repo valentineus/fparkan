@@ -4,8 +4,8 @@ use ash::vk;
 use fparkan_platform::DepthStencilSupport;
 
 use super::{
-    VulkanInstanceProbe, VulkanLogicalDeviceProbe, VulkanSmokeRendererError, VulkanStaticMesh,
-    VulkanStaticTexture,
+    VulkanInstanceProbe, VulkanLogicalDeviceProbe, VulkanPointLight, VulkanSmokeRendererError,
+    VulkanStaticMesh, VulkanStaticTexture,
 };
 use crate::select_depth_stencil_attachment_format;
 
@@ -520,7 +520,6 @@ pub(super) fn create_frame_uniform_buffer(
     instance: &VulkanInstanceProbe,
     device: &VulkanLogicalDeviceProbe,
 ) -> Result<(VulkanAllocatedBuffer, u64), VulkanSmokeRendererError> {
-    const FRAME_SLOTS: u64 = 2;
     const FRAME_BYTES: u64 = super::VULKAN_FRAME_UNIFORM_BYTES as u64;
     let limits =
         // SAFETY: The physical device belongs to this live instance and the query returns a value copy.
@@ -532,12 +531,11 @@ pub(super) fn create_frame_uniform_buffer(
         },
     )? / alignment
         * alignment;
-    let size =
-        stride
-            .checked_mul(FRAME_SLOTS)
-            .ok_or(VulkanSmokeRendererError::InvalidStaticMesh {
-                context: "frame uniform buffer size overflow",
-            })?;
+    let size = stride
+        .checked_mul(super::VULKAN_FRAME_SLOT_COUNT as u64)
+        .ok_or(VulkanSmokeRendererError::InvalidStaticMesh {
+            context: "frame uniform buffer size overflow",
+        })?;
     let bytes = vec![
         0_u8;
         usize::try_from(size).map_err(|_| {
@@ -554,6 +552,192 @@ pub(super) fn create_frame_uniform_buffer(
         "frame uniform buffer",
     )?;
     Ok((buffer, stride))
+}
+
+/// Returns the per-frame descriptor range, aligned slot stride, total bytes,
+/// and maximum light count accepted by the device's storage-buffer limit.
+pub(super) fn point_light_buffer_layout(
+    instance: &VulkanInstanceProbe,
+    device: &VulkanLogicalDeviceProbe,
+    capacity: usize,
+) -> Result<(u64, u64, u64, usize), VulkanSmokeRendererError> {
+    let limits =
+        // SAFETY: The physical device belongs to this live instance and the query returns a value copy.
+        unsafe { instance.instance.get_physical_device_properties(device.physical_device()) }
+            .limits;
+    let max_range = u64::from(limits.max_storage_buffer_range);
+    let header_bytes = super::VULKAN_POINT_LIGHT_HEADER_BYTES as u64;
+    let record_bytes = super::VULKAN_POINT_LIGHT_RECORD_BYTES as u64;
+    if max_range < header_bytes {
+        return Err(VulkanSmokeRendererError::InvalidPointLights {
+            context: "device storage-buffer range cannot hold the point-light header",
+        });
+    }
+    let max_count = usize::try_from((max_range - header_bytes) / record_bytes).map_err(|_| {
+        VulkanSmokeRendererError::InvalidPointLights {
+            context: "device point-light capacity exceeds address space",
+        }
+    })?;
+    if capacity > max_count {
+        return Err(VulkanSmokeRendererError::InvalidPointLights {
+            context: "point-light count exceeds maxStorageBufferRange",
+        });
+    }
+    let capacity_u64 =
+        u64::try_from(capacity).map_err(|_| VulkanSmokeRendererError::InvalidPointLights {
+            context: "point-light capacity exceeds address space",
+        })?;
+    let range = header_bytes
+        .checked_add(record_bytes.checked_mul(capacity_u64).ok_or(
+            VulkanSmokeRendererError::InvalidPointLights {
+                context: "point-light descriptor range overflow",
+            },
+        )?)
+        .ok_or(VulkanSmokeRendererError::InvalidPointLights {
+            context: "point-light descriptor range overflow",
+        })?;
+    let alignment = u64::from(limits.min_storage_buffer_offset_alignment).max(1);
+    let stride =
+        range
+            .checked_add(alignment - 1)
+            .ok_or(VulkanSmokeRendererError::InvalidPointLights {
+                context: "point-light frame stride overflow",
+            })?
+            / alignment
+            * alignment;
+    let total = stride
+        .checked_mul(u64::try_from(super::VULKAN_FRAME_SLOT_COUNT).unwrap_or(u64::MAX))
+        .ok_or(VulkanSmokeRendererError::InvalidPointLights {
+            context: "point-light buffer size overflow",
+        })?;
+    if stride
+        .checked_mul(u64::try_from(super::VULKAN_FRAME_SLOT_COUNT - 1).unwrap_or(u64::MAX))
+        .is_none_or(|last_offset| last_offset > u64::from(u32::MAX))
+    {
+        return Err(VulkanSmokeRendererError::InvalidPointLights {
+            context: "point-light dynamic offset exceeds Vulkan's 32-bit limit",
+        });
+    }
+    Ok((range, stride, total, max_count))
+}
+
+/// Allocates a fence-safe point-light SSBO with one aligned segment per frame.
+pub(super) fn create_point_light_buffer(
+    instance: &VulkanInstanceProbe,
+    device: &VulkanLogicalDeviceProbe,
+    capacity: usize,
+) -> Result<(VulkanAllocatedBuffer, u64, u64, usize), VulkanSmokeRendererError> {
+    let (range, stride, total, max_count) = point_light_buffer_layout(instance, device, capacity)?;
+    let bytes =
+        vec![
+            0_u8;
+            usize::try_from(total).map_err(|_| VulkanSmokeRendererError::InvalidPointLights {
+                context: "point-light buffer size exceeds address space",
+            })?
+        ];
+    let buffer = create_host_visible_buffer(
+        instance,
+        device,
+        &bytes,
+        vk::BufferUsageFlags::STORAGE_BUFFER,
+        "point-light storage buffer",
+    )?;
+    Ok((buffer, range, stride, max_count))
+}
+
+pub(super) fn encode_point_lights(
+    lights: &[VulkanPointLight],
+) -> Result<Vec<u8>, VulkanSmokeRendererError> {
+    let count =
+        u32::try_from(lights.len()).map_err(|_| VulkanSmokeRendererError::InvalidPointLights {
+            context: "point-light count exceeds the storage header",
+        })?;
+    let total = super::VULKAN_POINT_LIGHT_HEADER_BYTES
+        .checked_add(
+            super::VULKAN_POINT_LIGHT_RECORD_BYTES
+                .checked_mul(lights.len())
+                .ok_or(VulkanSmokeRendererError::InvalidPointLights {
+                    context: "point-light upload size overflow",
+                })?,
+        )
+        .ok_or(VulkanSmokeRendererError::InvalidPointLights {
+            context: "point-light upload size overflow",
+        })?;
+    let mut bytes = vec![0; total];
+    bytes[0..4].copy_from_slice(&count.to_ne_bytes());
+    let mut offset = super::VULKAN_POINT_LIGHT_HEADER_BYTES;
+    for light in lights {
+        for value in light
+            .position
+            .into_iter()
+            .chain([light.range])
+            .chain(light.rgb)
+            .chain([if light.active { 1.0 } else { 0.0 }])
+            .chain(light.coefficients)
+            .chain([if light.active { 1.0 } else { 0.0 }])
+        {
+            bytes[offset..offset + std::mem::size_of::<f32>()]
+                .copy_from_slice(&value.to_ne_bytes());
+            offset += std::mem::size_of::<f32>();
+        }
+    }
+    debug_assert_eq!(offset, total);
+    Ok(bytes)
+}
+
+/// Uploads the current light set into the frame slot whose fence has completed.
+pub(super) fn write_point_light_buffer(
+    device: &VulkanLogicalDeviceProbe,
+    buffer: &VulkanAllocatedBuffer,
+    stride: u64,
+    frame_index: usize,
+    lights: &[VulkanPointLight],
+) -> Result<(), VulkanSmokeRendererError> {
+    let slot =
+        u64::try_from(frame_index).map_err(|_| VulkanSmokeRendererError::InvariantViolation {
+            context: "point-light frame slot index",
+        })?;
+    if frame_index >= super::VULKAN_FRAME_SLOT_COUNT {
+        return Err(VulkanSmokeRendererError::InvariantViolation {
+            context: "point-light frame slot is out of bounds",
+        });
+    }
+    let offset = stride
+        .checked_mul(slot)
+        .ok_or(VulkanSmokeRendererError::InvariantViolation {
+            context: "point-light frame slot offset",
+        })?;
+    let bytes = encode_point_lights(lights)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > stride {
+        return Err(VulkanSmokeRendererError::InvalidPointLights {
+            context: "point-light upload exceeds the allocated frame slot",
+        });
+    }
+    let total = stride
+        .checked_mul(u64::try_from(super::VULKAN_FRAME_SLOT_COUNT).unwrap_or(u64::MAX))
+        .ok_or(VulkanSmokeRendererError::InvariantViolation {
+            context: "point-light buffer mapped size",
+        })?;
+    let offset =
+        usize::try_from(offset).map_err(|_| VulkanSmokeRendererError::InvariantViolation {
+            context: "point-light frame slot offset exceeds address space",
+        })?;
+    // Map the whole allocation because the Vulkan minimum map alignment may
+    // exceed minStorageBufferOffsetAlignment used by the dynamic frame offset.
+    let mapped = unsafe {
+        device
+            .device()
+            .map_memory(buffer.memory, 0, total, vk::MemoryMapFlags::empty())
+    }
+    .map_err(|result| VulkanSmokeRendererError::VulkanOperation {
+        context: "vkMapMemory(point-light buffer)",
+        result,
+    })?;
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>().add(offset), bytes.len());
+        device.device().unmap_memory(buffer.memory);
+    }
+    Ok(())
 }
 
 /// Allocates one aligned storage-buffer record for every material descriptor.

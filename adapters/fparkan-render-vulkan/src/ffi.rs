@@ -51,12 +51,13 @@ use self::instance::{cstring_vec, ensure_instance_extensions_available};
 use self::resources::{
     color_subresource_range, create_command_pool, create_depth_attachment, create_frame_sync,
     create_frame_uniform_buffer, create_index_buffer, create_material_specular_buffer,
-    create_readback_buffer, create_static_mesh_index_buffer, create_static_mesh_vertex_buffer,
-    create_static_texture_image, create_vertex_buffer, destroy_allocated_buffer,
-    destroy_allocated_image, destroy_depth_attachment, readback_buffer_bytes,
-    update_static_texture_image, write_frame_uniform, write_material_specular_buffer,
-    write_static_mesh_index_buffer, write_static_mesh_vertex_buffer, VulkanAllocatedBuffer,
-    VulkanAllocatedImage, VulkanDepthAttachment, VulkanFrameSync,
+    create_point_light_buffer, create_readback_buffer, create_static_mesh_index_buffer,
+    create_static_mesh_vertex_buffer, create_static_texture_image, create_vertex_buffer,
+    destroy_allocated_buffer, destroy_allocated_image, destroy_depth_attachment,
+    readback_buffer_bytes, update_static_texture_image, write_frame_uniform,
+    write_material_specular_buffer, write_point_light_buffer, write_static_mesh_index_buffer,
+    write_static_mesh_vertex_buffer, VulkanAllocatedBuffer, VulkanAllocatedImage,
+    VulkanDepthAttachment, VulkanFrameSync,
 };
 pub use self::runtime::{
     create_vulkan_logical_device_probe, create_vulkan_logical_device_probe_for_request,
@@ -69,8 +70,9 @@ pub use self::smoke_types::{
     VulkanSmokeRendererError, VulkanSmokeRendererReport, VulkanSmokeShutdownReport,
     VulkanStaticCamera, VulkanStaticDrawRange, VulkanStaticMaterial, VulkanStaticMesh,
     VulkanStaticTexture, VulkanStaticTextureMip, VulkanStaticVertex, VulkanValidationReport,
-    VULKAN_DIRECTIONAL_LIGHT_COUNT, VULKAN_FRAME_UNIFORM_BYTES,
-    VULKAN_MATERIAL_SPECULAR_RECORD_BYTES,
+    VULKAN_DIRECTIONAL_LIGHT_COUNT, VULKAN_FRAME_SLOT_COUNT, VULKAN_FRAME_UNIFORM_BYTES,
+    VULKAN_MATERIAL_SPECULAR_RECORD_BYTES, VULKAN_POINT_LIGHT_HEADER_BYTES,
+    VULKAN_POINT_LIGHT_RECORD_BYTES,
 };
 #[cfg(test)]
 use self::surface::extension_name;
@@ -83,8 +85,8 @@ pub use self::swapchain::{
     VulkanSwapchainProbeError, VulkanSwapchainReport,
 };
 use self::swapchain_resources::{
-    create_swapchain_resources, destroy_swapchain_resources, update_material_texture_descriptor,
-    VulkanSwapchainResources,
+    create_swapchain_resources, destroy_swapchain_resources, ensure_point_light_capacity,
+    update_material_texture_descriptor, VulkanSwapchainResources,
 };
 use self::validation::{create_validation_messenger, VulkanValidationMessenger};
 use ash::vk;

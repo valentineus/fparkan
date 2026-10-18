@@ -9,9 +9,10 @@ use std::collections::BTreeMap;
 
 use super::{
     color_subresource_range, create_depth_attachment, create_material_specular_buffer,
-    destroy_depth_attachment, VulkanAllocatedBuffer, VulkanAllocatedImage, VulkanDepthAttachment,
-    VulkanInstanceProbe, VulkanLogicalDeviceProbe, VulkanSmokeRendererError, VulkanSwapchainProbe,
-    TRIANGLE_FRAGMENT_SHADER_WORDS, TRIANGLE_VERTEX_SHADER_WORDS, VULKAN_FRAME_UNIFORM_BYTES,
+    create_point_light_buffer, destroy_depth_attachment, VulkanAllocatedBuffer,
+    VulkanAllocatedImage, VulkanDepthAttachment, VulkanInstanceProbe, VulkanLogicalDeviceProbe,
+    VulkanSmokeRendererError, VulkanSwapchainProbe, TRIANGLE_FRAGMENT_SHADER_WORDS,
+    TRIANGLE_VERTEX_SHADER_WORDS, VULKAN_FRAME_UNIFORM_BYTES,
     VULKAN_MATERIAL_SPECULAR_RECORD_BYTES,
 };
 
@@ -33,6 +34,11 @@ pub(super) struct VulkanSwapchainResources {
     pub(super) frame_uniform_stride: u64,
     pub(super) material_specular_buffer: VulkanAllocatedBuffer,
     pub(super) material_specular_stride: u64,
+    pub(super) point_light_buffer: VulkanAllocatedBuffer,
+    pub(super) point_light_range: u64,
+    pub(super) point_light_stride: u64,
+    pub(super) point_light_capacity: usize,
+    pub(super) max_point_light_count: usize,
     /// Live graphics pipelines indexed by canonical backend-neutral state.
     pub(super) pipelines: BTreeMap<PipelineKey, vk::Pipeline>,
     pub(super) framebuffers: Vec<vk::Framebuffer>,
@@ -73,6 +79,71 @@ pub(super) fn update_material_texture_descriptor(
     Ok(())
 }
 
+/// Grows the dynamic light SSBO when the scene adds lights beyond its current
+/// capacity. The caller must idle the device before updating these descriptors.
+pub(super) fn ensure_point_light_capacity(
+    instance: &VulkanInstanceProbe,
+    device: &VulkanLogicalDeviceProbe,
+    resources: &mut VulkanSwapchainResources,
+    needed: usize,
+) -> Result<(), VulkanSmokeRendererError> {
+    if needed <= resources.point_light_capacity {
+        return Ok(());
+    }
+    if needed > resources.max_point_light_count {
+        return Err(VulkanSmokeRendererError::InvalidPointLights {
+            context: "point-light count exceeds maxStorageBufferRange",
+        });
+    }
+    let target = resources
+        .point_light_capacity
+        .saturating_mul(2)
+        .max(1)
+        .max(needed)
+        .min(resources.max_point_light_count);
+    let (new_buffer, new_range, new_stride, max_count) =
+        create_point_light_buffer(instance, device, target)?;
+    if max_count != resources.max_point_light_count {
+        unsafe {
+            device.device().destroy_buffer(new_buffer.buffer, None);
+            device.device().free_memory(new_buffer.memory, None);
+        }
+        return Err(VulkanSmokeRendererError::InvariantViolation {
+            context: "point-light capacity changed for the active device",
+        });
+    }
+    let info = vk::DescriptorBufferInfo::default()
+        .buffer(new_buffer.buffer)
+        .offset(0)
+        .range(new_range);
+    let writes = resources
+        .descriptor_sets
+        .iter()
+        .copied()
+        .map(|descriptor_set| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(6)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER_DYNAMIC)
+                .buffer_info(std::slice::from_ref(&info))
+        })
+        .collect::<Vec<_>>();
+    // SAFETY: The caller waited for device idle before replacing a descriptor
+    // that submitted command buffers may reference.
+    unsafe { device.device().update_descriptor_sets(&writes, &[]) };
+    let old_buffer = std::mem::replace(&mut resources.point_light_buffer, new_buffer);
+    resources.point_light_range = new_range;
+    resources.point_light_stride = new_stride;
+    resources.point_light_capacity = target;
+    // SAFETY: All prior submissions have completed and descriptors now point
+    // at the replacement allocation.
+    unsafe {
+        device.device().destroy_buffer(old_buffer.buffer, None);
+        device.device().free_memory(old_buffer.memory, None);
+    }
+    Ok(())
+}
+
 struct PartialSwapchainResources {
     image_views: Vec<vk::ImageView>,
     readback_buffers: Vec<VulkanAllocatedBuffer>,
@@ -87,6 +158,11 @@ struct PartialSwapchainResources {
     frame_uniform_stride: u64,
     material_specular_buffer: Option<VulkanAllocatedBuffer>,
     material_specular_stride: u64,
+    point_light_buffer: Option<VulkanAllocatedBuffer>,
+    point_light_range: u64,
+    point_light_stride: u64,
+    point_light_capacity: usize,
+    max_point_light_count: usize,
     pipelines: BTreeMap<PipelineKey, vk::Pipeline>,
     framebuffers: Vec<vk::Framebuffer>,
     command_buffers: Vec<vk::CommandBuffer>,
@@ -133,6 +209,11 @@ pub(super) fn create_swapchain_resources(
         frame_uniform_stride: 0,
         material_specular_buffer: None,
         material_specular_stride: 0,
+        point_light_buffer: None,
+        point_light_range: 0,
+        point_light_stride: 0,
+        point_light_capacity: 0,
+        max_point_light_count: 0,
         pipelines: BTreeMap::new(),
         framebuffers: Vec::new(),
         command_buffers: Vec::new(),
@@ -173,6 +254,20 @@ pub(super) fn create_swapchain_resources(
         };
     partial.material_specular_stride = material_specular_stride;
     partial.material_specular_buffer = Some(material_specular_buffer);
+    let point_light_capacity = 1;
+    let (point_light_buffer, point_light_range, point_light_stride, max_point_light_count) =
+        match create_point_light_buffer(instance, device, point_light_capacity) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                destroy_partial_swapchain_resources(device, command_pool, partial);
+                return Err(error);
+            }
+        };
+    partial.point_light_range = point_light_range;
+    partial.point_light_stride = point_light_stride;
+    partial.point_light_capacity = point_light_capacity;
+    partial.max_point_light_count = max_point_light_count;
+    partial.point_light_buffer = Some(point_light_buffer);
     let (
         depth_attachment,
         render_pass,
@@ -199,6 +294,11 @@ pub(super) fn create_swapchain_resources(
             .material_specular_buffer
             .as_ref()
             .expect("material specular buffer is present before descriptor creation"),
+        partial
+            .point_light_buffer
+            .as_ref()
+            .expect("point-light buffer is present before descriptor creation"),
+        partial.point_light_range,
     ) {
         Ok(bundle) => bundle,
         Err(error) => {
@@ -320,6 +420,13 @@ pub(super) fn create_swapchain_resources(
             .material_specular_buffer
             .expect("material specular buffer is present after successful swapchain setup"),
         material_specular_stride: partial.material_specular_stride,
+        point_light_buffer: partial
+            .point_light_buffer
+            .expect("point-light buffer is present after successful swapchain setup"),
+        point_light_range: partial.point_light_range,
+        point_light_stride: partial.point_light_stride,
+        point_light_capacity: partial.point_light_capacity,
+        max_point_light_count: partial.max_point_light_count,
         pipelines: partial.pipelines,
         framebuffers: partial.framebuffers,
         command_buffers: partial.command_buffers,
@@ -349,6 +456,8 @@ fn create_swapchain_pipeline_bundle(
     depth_request: DepthStencilSupport,
     frame_uniform_buffer: &VulkanAllocatedBuffer,
     material_specular_buffer: &VulkanAllocatedBuffer,
+    point_light_buffer: &VulkanAllocatedBuffer,
+    point_light_range: u64,
 ) -> Result<
     (
         VulkanDepthAttachment,
@@ -377,6 +486,8 @@ fn create_swapchain_pipeline_bundle(
             texture_slot_indices,
             frame_uniform_buffer,
             material_specular_buffer,
+            point_light_buffer,
+            point_light_range,
         )
         .inspect_err(|_| {
             // SAFETY: The render pass was created above on this live logical device and is destroyed on setup failure.
@@ -603,6 +714,8 @@ fn create_texture_descriptor_bundle(
     texture_slot_indices: &[usize],
     frame_uniform_buffer: &VulkanAllocatedBuffer,
     material_specular_buffer: &VulkanAllocatedBuffer,
+    point_light_buffer: &VulkanAllocatedBuffer,
+    point_light_range: u64,
 ) -> Result<
     (
         vk::DescriptorSetLayout,
@@ -615,6 +728,7 @@ fn create_texture_descriptor_bundle(
     const TEXTURES_PER_MATERIAL: usize = 4;
     const FRAME_BINDING: u32 = 4;
     const MATERIAL_SPECULAR_BINDING: u32 = 5;
+    const POINT_LIGHT_BINDING: u32 = 6;
     let mut bindings = (0..TEXTURES_PER_MATERIAL)
         .map(|binding| {
             vk::DescriptorSetLayoutBinding::default()
@@ -634,6 +748,13 @@ fn create_texture_descriptor_bundle(
     bindings.push(
         vk::DescriptorSetLayoutBinding::default()
             .binding(MATERIAL_SPECULAR_BINDING)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER_DYNAMIC)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX),
+    );
+    bindings.push(
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(POINT_LIGHT_BINDING)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER_DYNAMIC)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::VERTEX),
@@ -676,10 +797,17 @@ fn create_texture_descriptor_bundle(
     let frame_pool_size = vk::DescriptorPoolSize::default()
         .ty(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
         .descriptor_count(material_count);
-    let material_specular_pool_size = vk::DescriptorPoolSize::default()
+    let storage_pool_size = vk::DescriptorPoolSize::default()
         .ty(vk::DescriptorType::STORAGE_BUFFER_DYNAMIC)
-        .descriptor_count(material_count);
-    let pool_sizes = [pool_size, frame_pool_size, material_specular_pool_size];
+        .descriptor_count(material_count.checked_mul(2).ok_or_else(|| {
+            // SAFETY: The layout was created above on this device and is
+            // rolled back before reporting an impossible descriptor count.
+            unsafe { device.device().destroy_descriptor_set_layout(layout, None) };
+            VulkanSmokeRendererError::InvariantViolation {
+                context: "dynamic storage descriptor count overflow",
+            }
+        })?);
+    let pool_sizes = [pool_size, frame_pool_size, storage_pool_size];
     let pool_info = vk::DescriptorPoolCreateInfo::default()
         .pool_sizes(&pool_sizes)
         .max_sets(material_count);
@@ -751,7 +879,11 @@ fn create_texture_descriptor_bundle(
         .buffer(material_specular_buffer.buffer)
         .offset(0)
         .range(VULKAN_MATERIAL_SPECULAR_RECORD_BYTES as u64);
-    let mut writes = Vec::with_capacity(descriptor_sets.len() * (TEXTURES_PER_MATERIAL + 2));
+    let point_light_info = vk::DescriptorBufferInfo::default()
+        .buffer(point_light_buffer.buffer)
+        .offset(0)
+        .range(point_light_range);
+    let mut writes = Vec::with_capacity(descriptor_sets.len() * (TEXTURES_PER_MATERIAL + 3));
     for (set_index, descriptor_set) in descriptor_sets.iter().copied().enumerate() {
         for binding in 0..TEXTURES_PER_MATERIAL {
             let image_info = &image_infos[set_index * TEXTURES_PER_MATERIAL + binding];
@@ -776,6 +908,13 @@ fn create_texture_descriptor_bundle(
                 .dst_binding(MATERIAL_SPECULAR_BINDING)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER_DYNAMIC)
                 .buffer_info(std::slice::from_ref(&material_specular_info)),
+        );
+        writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(POINT_LIGHT_BINDING)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER_DYNAMIC)
+                .buffer_info(std::slice::from_ref(&point_light_info)),
         );
     }
     // SAFETY: Descriptor sets, sampler and image views are live; every texture upload completed its shader-read transition.
@@ -1114,6 +1253,12 @@ pub(super) fn destroy_swapchain_resources(
         device
             .device()
             .free_memory(resources.material_specular_buffer.memory, None);
+        device
+            .device()
+            .destroy_buffer(resources.point_light_buffer.buffer, None);
+        device
+            .device()
+            .free_memory(resources.point_light_buffer.memory, None);
     }
 }
 
@@ -1174,6 +1319,10 @@ fn destroy_partial_swapchain_resources(
             device.device().free_memory(buffer.memory, None);
         }
         if let Some(buffer) = partial.material_specular_buffer {
+            device.device().destroy_buffer(buffer.buffer, None);
+            device.device().free_memory(buffer.memory, None);
+        }
+        if let Some(buffer) = partial.point_light_buffer {
             device.device().destroy_buffer(buffer.buffer, None);
             device.device().free_memory(buffer.memory, None);
         }

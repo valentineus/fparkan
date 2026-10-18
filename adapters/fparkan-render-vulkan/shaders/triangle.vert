@@ -39,6 +39,17 @@ layout(std430, set = 0, binding = 5) readonly buffer MaterialSpecular {
     vec4 overlay;
 } material_specular;
 
+struct PointLightRecord {
+    vec4 position_range;
+    vec4 rgb_active;
+    vec4 coefficients_active;
+};
+
+layout(std430, set = 0, binding = 6) readonly buffer PointLightBuffer {
+    uvec4 header;
+    PointLightRecord records[];
+} point_light_buffer;
+
 layout(push_constant) uniform MaterialConstants {
     layout(offset = 0) float alpha_cutoff;
     layout(offset = 4) float diffuse_alpha;
@@ -180,29 +191,30 @@ LightingTerms native_material_lighting(
             1.0
         );
     }
-    vec4 point_position_range = frame.point_position_range;
-    vec4 point_rgb_active = frame.point_rgb_active;
-    vec4 point_coefficients_active = frame.point_coefficients_active;
-    vec3 to_light = point_position_range.xyz - world_position;
-    float distance_squared = dot(to_light, to_light);
-    float range = point_position_range.w;
-    if (point_rgb_active.w > 0.5 && range > 0.0 && distance_squared <= range * range) {
+    for (uint index = 0u; index < point_light_buffer.header.x; ++index) {
+        PointLightRecord point_light = point_light_buffer.records[index];
+        vec3 to_light = point_light.position_range.xyz - world_position;
+        float distance_squared = dot(to_light, to_light);
+        float range = point_light.position_range.w;
+        if (point_light.rgb_active.w <= 0.5 || range <= 0.0 || distance_squared > range * range) {
+            continue;
+        }
         float distance_to_light = sqrt(distance_squared);
         if (distance_to_light > 0.000001) {
             vec3 light_direction = to_light / distance_to_light;
             float ndotl = dot(normal, light_direction);
             if (ndotl > 0.0) {
                 float t = (range - distance_to_light) / range;
-                float attenuation = point_coefficients_active.x
-                    + point_coefficients_active.y * t
-                    + point_coefficients_active.z * t * t;
+                float attenuation = point_light.coefficients_active.x
+                    + point_light.coefficients_active.y * t
+                    + point_light.coefficients_active.z * t * t;
                 attenuation = max(attenuation, 0.0);
-                accumulated += ndotl * directional_rgb * point_rgb_active.rgb * attenuation;
+                accumulated += ndotl * directional_rgb * point_light.rgb_active.rgb * attenuation;
                 specular += specular_from_light(
                     normal,
                     view_direction,
                     light_direction,
-                    point_rgb_active.rgb,
+                    point_light.rgb_active.rgb,
                     specular_rgb,
                     specular_power,
                     attenuation

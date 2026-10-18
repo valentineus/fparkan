@@ -194,6 +194,15 @@ impl Default for VulkanPointLight {
 /// state.
 pub const VULKAN_FRAME_UNIFORM_BYTES: usize = 368;
 
+/// Number of CPU/GPU frame slots shared by the swapchain renderer.
+pub const VULKAN_FRAME_SLOT_COUNT: usize = 2;
+
+/// `uvec4` header bytes for the dynamic point-light storage buffer.
+pub const VULKAN_POINT_LIGHT_HEADER_BYTES: usize = 16;
+
+/// Three `vec4` records per dynamically uploaded point light.
+pub const VULKAN_POINT_LIGHT_RECORD_BYTES: usize = 3 * 4 * std::mem::size_of::<f32>();
+
 /// Bytes occupied by one material's base and overlay specular records.
 ///
 /// Each record is one `vec4`: RGB followed by the native integer power stored
@@ -1359,6 +1368,11 @@ pub enum VulkanSmokeRendererError {
         /// Validation failure detail.
         context: &'static str,
     },
+    /// Submitted dynamic point-light data exceeds the Vulkan storage range or contains invalid values.
+    InvalidPointLights {
+        /// Validation failure detail.
+        context: &'static str,
+    },
     /// The submitted static texture cannot be represented by this path.
     InvalidStaticTexture {
         /// Validation failure detail.
@@ -1389,6 +1403,7 @@ impl std::fmt::Display for VulkanSmokeRendererError {
             Self::InvalidStaticCamera { context } => {
                 write!(f, "invalid static camera: {context}")
             }
+            Self::InvalidPointLights { context } => write!(f, "invalid point lights: {context}"),
             Self::InvalidStaticTexture { context } => {
                 write!(f, "invalid static texture: {context}")
             }
@@ -1454,6 +1469,10 @@ pub struct VulkanSmokeRenderer {
     pub(super) readback_enabled: bool,
     pub(super) camera: VulkanStaticCamera,
     pub(super) frame_uniforms: VulkanFrameUniforms,
+    /// Dynamically sized point-light records submitted by the client.
+    pub(super) point_lights: Vec<VulkanPointLight>,
+    /// Whether `set_point_lights` has replaced legacy `frame_uniforms.point_light`.
+    pub(super) point_lights_explicit: bool,
     pub(super) frame_sync: Vec<VulkanFrameSync>,
     pub(super) images_in_flight: Vec<vk::Fence>,
     pub(super) current_frame: usize,
