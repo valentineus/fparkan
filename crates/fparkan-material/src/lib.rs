@@ -293,6 +293,8 @@ pub enum MaterialError {
     MissingMaterial(String),
     /// A material document has no phases for runtime sampling.
     EmptyMaterial,
+    /// A normalized MAT0 sample phase is not finite.
+    InvalidNormalizedPhase,
     /// An animation block has no positive duration for a multi-key timeline.
     InvalidAnimationDuration {
         /// Selected animation block.
@@ -366,6 +368,9 @@ impl std::fmt::Display for MaterialError {
             Self::Resource(message) => write!(f, "{message}"),
             Self::MissingMaterial(name) => write!(f, "missing material: {name}"),
             Self::EmptyMaterial => write!(f, "material has no phases"),
+            Self::InvalidNormalizedPhase => {
+                write!(f, "normalized MAT0 phase must be finite")
+            }
             Self::InvalidAnimationDuration { block_index } => {
                 write!(f, "MAT0 animation block {block_index} has zero duration")
             }
@@ -670,6 +675,115 @@ pub fn sample_material_phase(
     })
 }
 
+/// Samples a MAT0 animation block from the normalized phase used by native
+/// material effects.
+///
+/// Unlike [`sample_material_phase`], this path does not interpret the block's
+/// animation mode or derive a local time from a clock. It multiplies the
+/// normalized phase by the final key end time, truncates to an integer tick,
+/// searches key intervals from the end, and interpolates the selected phase
+/// with the following phase using the block's native interpolation mask.
+/// Finite phases outside `0..=1` use the native fallback phase `0.5`;
+/// non-finite inputs are rejected. As with [`sample_material_phase`], a
+/// missing block index falls back to block zero and an unanimated document
+/// samples its first phase.
+///
+/// # Errors
+///
+/// Returns an error for a non-finite phase, an empty material, a malformed
+/// multi-key duration, non-increasing key end times, or a key that references
+/// no phase.
+pub fn sample_material_normalized_phase(
+    document: &Mat0Document,
+    animation_block_index: usize,
+    normalized_phase: f32,
+) -> Result<MaterialPhaseSample, MaterialError> {
+    if !normalized_phase.is_finite() {
+        return Err(MaterialError::InvalidNormalizedPhase);
+    }
+
+    let normalized_phase = if (0.0..=1.0).contains(&normalized_phase) {
+        normalized_phase
+    } else {
+        0.5
+    };
+
+    let Some(first_phase) = document.phases.first() else {
+        return Err(MaterialError::EmptyMaterial);
+    };
+
+    let Some((selected_block_index, block)) = document
+        .animation_blocks
+        .get(animation_block_index)
+        .map(|block| (animation_block_index, block))
+        .or_else(|| document.animation_blocks.first().map(|block| (0, block)))
+    else {
+        return Ok(sample_static_phase(0, first_phase));
+    };
+
+    if block.keys.is_empty() {
+        return Ok(sample_static_phase(0, first_phase));
+    }
+
+    let keys = &block.keys;
+    let resolve_phase = |key_index: usize, key: &MaterialKey| {
+        let phase_index = usize::from(key.k0);
+        document
+            .phases
+            .get(phase_index)
+            .map(|phase| (phase_index, phase))
+            .ok_or(MaterialError::InvalidAnimationPhaseIndex {
+                block_index: selected_block_index,
+                key_index,
+                phase_index: key.k0,
+                phase_count: document.phases.len(),
+            })
+    };
+
+    if keys.len() == 1 {
+        let (phase_index, phase) = resolve_phase(0, &keys[0])?;
+        return Ok(sample_static_phase(phase_index, phase));
+    }
+
+    let duration = u32::from(keys[keys.len() - 1].k1);
+    if duration == 0 {
+        return Err(MaterialError::InvalidAnimationDuration {
+            block_index: selected_block_index,
+        });
+    }
+    validate_key_times(keys, selected_block_index)?;
+    for (key_index, key) in keys.iter().enumerate() {
+        resolve_phase(key_index, key)?;
+    }
+
+    // f64 preserves the exact u16-duration by f32-phase product, matching the
+    // native x87 extended product before truncation toward zero.
+    let tick = ((duration as f64) * f64::from(normalized_phase)).trunc() as u32;
+    let (key_index, previous_end) = select_key_backwards(keys, tick);
+    let key = &keys[key_index];
+    let next_key_index = (key_index + 1) % keys.len();
+    let next_key = &keys[next_key_index];
+    let (phase_index, phase) = resolve_phase(key_index, key)?;
+    let (_, next_phase) = resolve_phase(next_key_index, next_key)?;
+    let span = u32::from(key.k1) - previous_end;
+    if span == 0 {
+        return Err(MaterialError::InvalidAnimationKeyTimes {
+            block_index: selected_block_index,
+            key_index,
+        });
+    }
+    // Keep the native endpoint behavior: phase 1 produces `tick == duration`,
+    // falls back to key zero, and may extrapolate beyond its first interval.
+    let fraction = tick.wrapping_sub(previous_end) as f32 / span as f32;
+    let coefficients =
+        interpolate_coefficients(phase, next_phase, block.interpolation_mask(), fraction);
+    Ok(MaterialPhaseSample {
+        phase_index,
+        coefficients,
+        texture_raw: phase.texture_raw,
+    })
+}
+
 fn sample_static_phase(phase_index: usize, phase: &MaterialPhase) -> MaterialPhaseSample {
     MaterialPhaseSample {
         phase_index,
@@ -709,6 +823,19 @@ fn select_key(keys: &[MaterialKey], local_time_ms: u32) -> (usize, u32) {
     } else {
         (keys.len() - 1, previous_end)
     }
+}
+
+fn select_key_backwards(keys: &[MaterialKey], tick: u32) -> (usize, u32) {
+    let mut key_index = keys.len() - 1;
+    while key_index > 0 {
+        let start = u32::from(keys[key_index - 1].k1);
+        let end = u32::from(keys[key_index].k1);
+        if start <= tick && tick < end {
+            return (key_index, start);
+        }
+        key_index -= 1;
+    }
+    (0, 0)
 }
 
 fn interpolate_coefficients(
@@ -1363,6 +1490,125 @@ mod tests {
     }
 
     #[test]
+    fn normalized_material_phase_uses_truncated_tick_and_native_fallback_endpoint() {
+        let phases = vec![
+            phase_with_parameters([0; 18], b"LEFT"),
+            phase_with_parameters([255; 18], b"RIGHT"),
+        ];
+        let keys = vec![
+            MaterialKey {
+                k0: 0,
+                k1: 100,
+                k2: 0,
+            },
+            MaterialKey {
+                k0: 1,
+                k1: 200,
+                k2: 0,
+            },
+        ];
+        // RandomPerQuery must not override the explicit normalized phase.
+        let document = animation_document((0x1f_u32 << 3) | 3, phases, keys);
+
+        let early = sample_material_normalized_phase(&document, 0, 0.25).expect("early");
+        assert_eq!(early.phase_index, 0);
+        assert_eq!(&early.texture_raw[..4], b"LEFT");
+        assert!((early.coefficients.additive_rgb[0] - 0.5).abs() < 1e-6);
+
+        // 200 * 0.504 = 100.8; truncation yields tick 100, at the start of key 1.
+        let truncated = sample_material_normalized_phase(&document, 0, 0.504).expect("tick");
+        assert_eq!(truncated.phase_index, 1);
+        assert_eq!(&truncated.texture_raw[..5], b"RIGHT");
+        assert_eq!(truncated.coefficients.additive_rgb[0], 1.0);
+
+        // Native backward search falls through to key zero at the final tick.
+        let endpoint = sample_material_normalized_phase(&document, 0, 1.0).expect("endpoint");
+        assert_eq!(endpoint.phase_index, 0);
+        assert_eq!(&endpoint.texture_raw[..4], b"LEFT");
+        assert!((endpoint.coefficients.additive_rgb[0] - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn normalized_material_phase_preserves_precision_before_native_truncation() {
+        let document = animation_document(
+            1 << 3,
+            vec![
+                phase_with_parameters([0; 18], b"LEFT"),
+                phase_with_parameters([255; 18], b"RIGHT"),
+            ],
+            vec![
+                MaterialKey {
+                    k0: 0,
+                    k1: 32_765,
+                    k2: 0,
+                },
+                MaterialKey {
+                    k0: 1,
+                    k1: 32_767,
+                    k2: 0,
+                },
+            ],
+        );
+
+        // The exact product is below 32_767; f32 multiplication rounds it up.
+        let sample = sample_material_normalized_phase(&document, 0, f32::from_bits(0x3f7f_ffff))
+            .expect("near endpoint");
+        assert_eq!(sample.phase_index, 1);
+        assert_eq!(&sample.texture_raw[..5], b"RIGHT");
+    }
+
+    #[test]
+    fn normalized_material_phase_uses_half_for_finite_out_of_range_values() {
+        let document = animation_document(
+            1 << 3,
+            vec![
+                phase_with_parameters([0; 18], b"LEFT"),
+                phase_with_parameters([255; 18], b"RIGHT"),
+            ],
+            vec![
+                MaterialKey {
+                    k0: 0,
+                    k1: 100,
+                    k2: 0,
+                },
+                MaterialKey {
+                    k0: 1,
+                    k1: 200,
+                    k2: 0,
+                },
+            ],
+        );
+
+        let midpoint = sample_material_normalized_phase(&document, 0, 0.5).expect("midpoint");
+        let below = sample_material_normalized_phase(&document, 0, -0.1).expect("below");
+        let above = sample_material_normalized_phase(&document, 0, 1.1).expect("above");
+        assert_eq!(below, midpoint);
+        assert_eq!(above, midpoint);
+    }
+
+    #[test]
+    fn normalized_material_phase_rejects_non_finite_values() {
+        let document = animation_document(
+            0,
+            vec![phase_with_parameters([0; 18], b"ONLY")],
+            vec![MaterialKey {
+                k0: 0,
+                k1: 0,
+                k2: 0,
+            }],
+        );
+
+        assert!(matches!(
+            sample_material_normalized_phase(&document, 0, f32::NAN),
+            Err(MaterialError::InvalidNormalizedPhase)
+        ));
+        assert!(matches!(
+            sample_material_normalized_phase(&document, 0, f32::INFINITY),
+            Err(MaterialError::InvalidNormalizedPhase)
+        ));
+    }
+
+    #[test]
     fn material_ping_pong_reverses_local_time_and_clamp_holds_last_phase() {
         let phases = vec![
             phase_with_parameters([0; 18], b"A"),
@@ -1510,6 +1756,10 @@ mod tests {
             sample_material_phase(&invalid_ref, 0, 0, 0, 0),
             Err(MaterialError::InvalidAnimationPhaseIndex { .. })
         ));
+        assert!(matches!(
+            sample_material_normalized_phase(&invalid_ref, 0, 0.5),
+            Err(MaterialError::InvalidAnimationPhaseIndex { .. })
+        ));
 
         let invalid_times = animation_document(
             0,
@@ -1531,6 +1781,10 @@ mod tests {
             sample_material_phase(&invalid_times, 0, 0, 0, 0),
             Err(MaterialError::InvalidAnimationKeyTimes { .. })
         ));
+        assert!(matches!(
+            sample_material_normalized_phase(&invalid_times, 0, 0.5),
+            Err(MaterialError::InvalidAnimationKeyTimes { .. })
+        ));
 
         let zero_duration = animation_document(
             0,
@@ -1550,6 +1804,10 @@ mod tests {
         );
         assert!(matches!(
             sample_material_phase(&zero_duration, 0, 0, 0, 0),
+            Err(MaterialError::InvalidAnimationDuration { .. })
+        ));
+        assert!(matches!(
+            sample_material_normalized_phase(&zero_duration, 0, 0.5),
             Err(MaterialError::InvalidAnimationDuration { .. })
         ));
     }

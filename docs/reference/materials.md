@@ -132,6 +132,13 @@ ping-pong нечётный цикл идёт в обратном направл�
 sampler `animation_block_index` уже выбран вызывающим runtime из block table;
 packed WEAR handle и номер строки WEAR являются отдельными значениями.
 
+Для native effect path с явной normalized phase режим блока не вычисляется:
+конечное значение вне `0..=1` заменяется на `0.5`, затем phase умножается на
+последний `end_time_ms` и усекается до целого tick. Поиск интервала идёт от
+последнего ключа к первому. При phase `1.0` tick равен duration, поэтому ни один
+интервал не подходит: выбирается key 0 и общий interpolation path может
+экстраполировать за пределы его первого интервала.
+
 ## Fallback
 
 Material resolve:
