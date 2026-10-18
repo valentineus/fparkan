@@ -7,7 +7,7 @@ use fparkan_msh::{
     ModelAsset, NodeId,
 };
 use fparkan_render::{LegacyDepthMode, LegacyIron3dEulerTransform, LegacyPipelineState};
-use fparkan_terrain_format::LandMeshDocument;
+use fparkan_terrain_format::{LandMeshDocument, TerrainFaceLod, TerrainLod, TerrainLodError};
 
 fn world_pipeline_state() -> LegacyPipelineState {
     LegacyPipelineState {
@@ -34,6 +34,8 @@ pub enum VulkanAssetMeshError {
         /// Number of supplied node poses.
         actual: usize,
     },
+    /// Terrain Node38/Slot68 records do not assign every face to one LOD.
+    InvalidTerrainLodMapping(TerrainLodError),
 }
 
 /// Evaluated world pose of one standard Node38 node in model-local space.
@@ -108,6 +110,9 @@ impl std::fmt::Display for VulkanAssetMeshError {
                 f,
                 "node pose buffer has {actual} poses, but the MSH has {expected} nodes"
             ),
+            Self::InvalidTerrainLodMapping(error) => {
+                write!(f, "invalid terrain LOD mapping: {error}")
+            }
         }
     }
 }
@@ -1016,23 +1021,15 @@ fn transform_normal(
 pub fn project_land_msh_to_static_mesh(
     terrain: &LandMeshDocument,
 ) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
-    let mut indices = Vec::with_capacity(
-        terrain
-            .faces
-            .len()
-            .checked_mul(3)
-            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?,
-    );
-    for face in &terrain.faces {
-        indices.extend(face.vertices.map(u32::from));
-    }
+    let lod0 = static_terrain_lod0_assignments(terrain)?;
+    let indices = static_terrain_indices(terrain, &lod0)?;
     if indices.is_empty() {
         return Err(VulkanAssetMeshError::EmptyGeometry);
     }
 
     let (min_x, max_x, min_y, max_y) = static_mesh_xy_bounds(&terrain.positions, &indices)?;
     let frame = VulkanStaticXyFrame::from_bounds(min_x, max_x, min_y, max_y)?;
-    project_land_msh_to_static_mesh_in_xy_frame(terrain, frame)
+    project_land_msh_to_static_mesh_with_lod0(terrain, frame, &lod0)
 }
 
 /// Projects `Land.msh` terrain geometry into a shared diagnostic XY frame.
@@ -1045,16 +1042,16 @@ pub fn project_land_msh_to_static_mesh_in_xy_frame(
     terrain: &LandMeshDocument,
     frame: VulkanStaticXyFrame,
 ) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
-    let mut indices = Vec::with_capacity(
-        terrain
-            .faces
-            .len()
-            .checked_mul(3)
-            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?,
-    );
-    for face in &terrain.faces {
-        indices.extend(face.vertices.map(u32::from));
-    }
+    let lod0 = static_terrain_lod0_assignments(terrain)?;
+    project_land_msh_to_static_mesh_with_lod0(terrain, frame, &lod0)
+}
+
+fn project_land_msh_to_static_mesh_with_lod0(
+    terrain: &LandMeshDocument,
+    frame: VulkanStaticXyFrame,
+    lod0: &[TerrainFaceLod],
+) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
+    let indices = static_terrain_indices(terrain, lod0)?;
     if indices.is_empty() {
         return Err(VulkanAssetMeshError::EmptyGeometry);
     }
@@ -1089,7 +1086,7 @@ pub fn project_land_msh_to_static_mesh_in_xy_frame(
     Ok(VulkanStaticMesh {
         vertices,
         indices,
-        draw_ranges: static_terrain_draw_ranges(terrain)?,
+        draw_ranges: static_terrain_draw_ranges(terrain, lod0)?,
     })
 }
 
@@ -1107,7 +1104,8 @@ pub fn project_land_msh_to_static_mesh_in_xy_frame(
 pub fn project_land_msh_to_static_mesh_in_world_space(
     terrain: &LandMeshDocument,
 ) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
-    let indices = static_terrain_indices(terrain)?;
+    let lod0 = static_terrain_lod0_assignments(terrain)?;
+    let indices = static_terrain_indices(terrain, &lod0)?;
     let vertices = terrain
         .positions
         .iter()
@@ -1132,19 +1130,34 @@ pub fn project_land_msh_to_static_mesh_in_world_space(
     Ok(VulkanStaticMesh {
         vertices,
         indices,
-        draw_ranges: static_terrain_draw_ranges(terrain)?,
+        draw_ranges: static_terrain_draw_ranges(terrain, &lod0)?,
     })
 }
 
-fn static_terrain_indices(terrain: &LandMeshDocument) -> Result<Vec<u32>, VulkanAssetMeshError> {
+fn static_terrain_lod0_assignments(
+    terrain: &LandMeshDocument,
+) -> Result<Vec<TerrainFaceLod>, VulkanAssetMeshError> {
+    let mut assignments = terrain
+        .face_lod_assignments()
+        .map_err(VulkanAssetMeshError::InvalidTerrainLodMapping)?;
+    assignments.retain(|assignment| assignment.lod == TerrainLod::Lod0);
+    Ok(assignments)
+}
+
+fn static_terrain_indices(
+    terrain: &LandMeshDocument,
+    lod0: &[TerrainFaceLod],
+) -> Result<Vec<u32>, VulkanAssetMeshError> {
     let mut indices = Vec::with_capacity(
-        terrain
-            .faces
-            .len()
+        lod0.len()
             .checked_mul(3)
             .ok_or(VulkanAssetMeshError::IndexOutOfRange)?,
     );
-    for face in &terrain.faces {
+    for assignment in lod0 {
+        let face = terrain
+            .faces
+            .get(assignment.face_index)
+            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?;
         indices.extend(face.vertices.map(u32::from));
     }
     if indices.is_empty() {
@@ -1187,14 +1200,24 @@ fn terrain_overlay_alpha(terrain: &LandMeshDocument, index: usize) -> f32 {
 
 fn static_terrain_draw_ranges(
     terrain: &LandMeshDocument,
+    lod0: &[TerrainFaceLod],
 ) -> Result<Vec<VulkanStaticDrawRange>, VulkanAssetMeshError> {
     let mut ranges = Vec::new();
     let mut start_face = 0usize;
-    while start_face < terrain.faces.len() {
-        let material_index = terrain.faces[start_face].material_tag;
+    while start_face < lod0.len() {
+        let material_index = terrain
+            .faces
+            .get(lod0[start_face].face_index)
+            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?
+            .material_tag;
         let mut end_face = start_face + 1;
-        while end_face < terrain.faces.len()
-            && terrain.faces[end_face].material_tag == material_index
+        while end_face < lod0.len()
+            && terrain
+                .faces
+                .get(lod0[end_face].face_index)
+                .ok_or(VulkanAssetMeshError::IndexOutOfRange)?
+                .material_tag
+                == material_index
         {
             end_face += 1;
         }
@@ -1998,7 +2021,7 @@ mod tests {
 
     #[test]
     fn projects_land_faces_in_source_order_with_packed_uv0() {
-        let terrain = LandMeshDocument {
+        let mut terrain = LandMeshDocument {
             streams: Vec::new(),
             nodes_raw: Vec::new(),
             slots: TerrainSlotTable {
@@ -2018,6 +2041,7 @@ mod tests {
             aux18: Vec::new(),
             faces: vec![terrain_face([0, 1, 2]), terrain_face([1, 3, 2])],
         };
+        set_terrain_lod_slots(&mut terrain, &[[0, u16::MAX]], &[[0, 2]]);
 
         let mesh = project_land_msh_to_static_mesh(&terrain).expect("representable terrain");
 
@@ -2031,8 +2055,60 @@ mod tests {
     }
 
     #[test]
+    fn terrain_projection_filters_interleaved_lods_in_source_face_order() {
+        let mut terrain = LandMeshDocument {
+            streams: Vec::new(),
+            nodes_raw: Vec::new(),
+            slots: TerrainSlotTable {
+                header_raw: Vec::new(),
+                slots_raw: Vec::new(),
+            },
+            positions: vec![
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [10.0, 10.0, 10.0],
+                [11.0, 10.0, 10.0],
+                [10.0, 11.0, 10.0],
+            ],
+            normals: Vec::new(),
+            uv0: Vec::new(),
+            accelerator: Vec::new(),
+            aux14: Vec::new(),
+            aux18: Vec::new(),
+            faces: vec![
+                terrain_face_with_tag(0x0101, [0, 1, 2]),
+                terrain_face_with_tag(0x0202, [3, 4, 5]),
+                terrain_face_with_tag(0x0101, [0, 1, 2]),
+                terrain_face_with_tag(0x0202, [3, 4, 5]),
+            ],
+        };
+        set_terrain_lod_slots(
+            &mut terrain,
+            &[[0, 1], [2, 3]],
+            &[[0, 1], [1, 1], [2, 1], [3, 1]],
+        );
+
+        let mesh = project_land_msh_to_static_mesh_in_world_space(&terrain)
+            .expect("LOD0 terrain projection");
+        assert_eq!(mesh.indices, [0, 1, 2, 0, 1, 2]);
+        assert_eq!(mesh.draw_ranges.len(), 1);
+        assert_eq!(mesh.draw_ranges[0].first_index, 0);
+        assert_eq!(mesh.draw_ranges[0].index_count, 6);
+        assert_eq!(mesh.draw_ranges[0].material_index, 0x0101);
+
+        terrain.nodes_raw.clear();
+        assert!(matches!(
+            project_land_msh_to_static_mesh_in_world_space(&terrain),
+            Err(VulkanAssetMeshError::InvalidTerrainLodMapping(
+                TerrainLodError::MissingNodes { face_count: 4 }
+            ))
+        ));
+    }
+
+    #[test]
     fn terrain_normals_keep_native_one_over_128_scale() {
-        let terrain = LandMeshDocument {
+        let mut terrain = LandMeshDocument {
             streams: Vec::new(),
             nodes_raw: Vec::new(),
             slots: TerrainSlotTable {
@@ -2047,6 +2123,7 @@ mod tests {
             aux18: Vec::new(),
             faces: vec![terrain_face([0, 1, 2])],
         };
+        set_terrain_lod_slots(&mut terrain, &[[0, u16::MAX]], &[[0, 1]]);
 
         let mesh = project_land_msh_to_static_mesh_in_world_space(&terrain)
             .expect("representable terrain normals");
@@ -2055,7 +2132,7 @@ mod tests {
 
     #[test]
     fn world_space_terrain_preserves_nonzero_source_heights_and_faces() {
-        let terrain = LandMeshDocument {
+        let mut terrain = LandMeshDocument {
             streams: Vec::new(),
             nodes_raw: Vec::new(),
             slots: TerrainSlotTable {
@@ -2074,6 +2151,7 @@ mod tests {
             aux18: Vec::new(),
             faces: vec![terrain_face([2, 0, 1])],
         };
+        set_terrain_lod_slots(&mut terrain, &[[0, u16::MAX]], &[[0, 1]]);
 
         let mesh = project_land_msh_to_static_mesh_in_world_space(&terrain)
             .expect("representable source-space terrain");
@@ -2101,9 +2179,30 @@ mod tests {
         }
     }
 
+    fn set_terrain_lod_slots(
+        terrain: &mut LandMeshDocument,
+        node_slots: &[[u16; 2]],
+        face_ranges: &[[u16; 2]],
+    ) {
+        const NODE_STRIDE: usize = 38;
+        let mut nodes = vec![u8::MAX; node_slots.len() * NODE_STRIDE];
+        for (node_index, [lod0, lod1]) in node_slots.iter().copied().enumerate() {
+            let offset = node_index * NODE_STRIDE + 8;
+            nodes[offset..offset + 2].copy_from_slice(&lod0.to_le_bytes());
+            nodes[offset + 2..offset + 4].copy_from_slice(&lod1.to_le_bytes());
+        }
+        let mut slots = vec![[0_u8; 68]; face_ranges.len()];
+        for (slot, [start, count]) in slots.iter_mut().zip(face_ranges.iter().copied()) {
+            slot[..2].copy_from_slice(&start.to_le_bytes());
+            slot[2..4].copy_from_slice(&count.to_le_bytes());
+        }
+        terrain.nodes_raw = nodes;
+        terrain.slots.slots_raw = slots;
+    }
+
     #[test]
     fn terrain_ranges_preserve_face_order_and_packed_material_tags() {
-        let terrain = LandMeshDocument {
+        let mut terrain = LandMeshDocument {
             streams: Vec::new(),
             nodes_raw: Vec::new(),
             slots: TerrainSlotTable {
@@ -2123,8 +2222,10 @@ mod tests {
                 terrain_face_with_tag(0xff01, [0, 1, 2]),
             ],
         };
+        set_terrain_lod_slots(&mut terrain, &[[0, u16::MAX]], &[[0, 4]]);
 
-        let ranges = static_terrain_draw_ranges(&terrain).expect("representable terrain");
+        let lod0 = static_terrain_lod0_assignments(&terrain).expect("terrain LOD0");
+        let ranges = static_terrain_draw_ranges(&terrain, &lod0).expect("representable terrain");
 
         assert_eq!(ranges.len(), 3);
         assert_eq!(ranges[0].first_index, 0);

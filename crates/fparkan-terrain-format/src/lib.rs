@@ -28,6 +28,7 @@ const REQUIRED_TYPES: [u32; 9] = [
 const AREAL_PREFIX_SIZE: usize = 56;
 const SLOT_HEADER_SIZE: usize = 0x8c;
 const SLOT_STRIDE: usize = 68;
+const NODE38_STRIDE: usize = 38;
 const GRID_HIT_COUNT_BITS: u32 = 10;
 const GRID_POOL_OFFSET_MASK: u32 = (1 << 22) - 1;
 
@@ -152,6 +153,129 @@ pub struct TerrainFace28 {
     pub raw: [u8; 28],
 }
 
+/// Terrain detail level selected by one Node38 slot reference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerrainLod {
+    /// Near terrain geometry.
+    Lod0,
+    /// Far terrain geometry.
+    Lod1,
+}
+
+/// Node and detail level that own one source face.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerrainFaceLod {
+    /// Index into [`LandMeshDocument::faces`].
+    pub face_index: usize,
+    /// Index into the Node38 stream.
+    pub node_index: usize,
+    /// Selected terrain detail level.
+    pub lod: TerrainLod,
+}
+
+/// Error in the terrain Node38-to-face slot mapping.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TerrainLodError {
+    /// Nonempty terrain has no Node38 records to select its slots.
+    MissingNodes { face_count: usize },
+    /// Node stream size is not a whole number of 38-byte records.
+    InvalidNodeStreamSize { size: usize },
+    /// Terrain uses a slot group beyond its two supported detail levels.
+    UnsupportedNodeSlot {
+        /// Node containing the unsupported slot.
+        node: usize,
+        /// Index in the 15-entry Node38 slot map.
+        slot_index: usize,
+        /// Raw terrain slot id.
+        slot: u16,
+    },
+    /// A Node38 entry references a missing Slot68 record.
+    SlotOutOfRange {
+        /// Node containing the reference.
+        node: usize,
+        /// Selected detail level.
+        lod: TerrainLod,
+        /// Raw terrain slot id.
+        slot: u16,
+        /// Number of decoded Slot68 records.
+        slot_count: usize,
+    },
+    /// A Slot68 triangle range exceeds the source face array.
+    FaceRangeOutOfBounds {
+        /// Node containing the slot.
+        node: usize,
+        /// Selected detail level.
+        lod: TerrainLod,
+        /// Raw terrain slot id.
+        slot: u16,
+        /// First source face.
+        start: usize,
+        /// Number of faces.
+        count: usize,
+        /// Number of source faces.
+        face_count: usize,
+    },
+    /// A source face belongs to more than one terrain slot.
+    DuplicateFaceAssignment { face: usize },
+    /// A source face is absent from every supported terrain slot.
+    MissingFaceAssignment { face: usize },
+    /// A checked index calculation overflowed.
+    IntegerOverflow,
+}
+
+impl std::fmt::Display for TerrainLodError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingNodes { face_count } => write!(
+                f,
+                "terrain has {face_count} faces but no Node38 records"
+            ),
+            Self::InvalidNodeStreamSize { size } => write!(
+                f,
+                "terrain Node38 stream has {size} bytes, not a multiple of {NODE38_STRIDE}"
+            ),
+            Self::UnsupportedNodeSlot {
+                node,
+                slot_index,
+                slot,
+            } => write!(
+                f,
+                "terrain Node38 {node} uses unsupported slot group {slot_index} ({slot})"
+            ),
+            Self::SlotOutOfRange {
+                node,
+                lod,
+                slot,
+                slot_count,
+            } => write!(
+                f,
+                "terrain Node38 {node} LOD {lod:?} references slot {slot} outside {slot_count} slots"
+            ),
+            Self::FaceRangeOutOfBounds {
+                node,
+                lod,
+                slot,
+                start,
+                count,
+                face_count,
+            } => write!(
+                f,
+                "terrain Node38 {node} LOD {lod:?} slot {slot} range {start}..{} exceeds {face_count} faces",
+                start.saturating_add(*count)
+            ),
+            Self::DuplicateFaceAssignment { face } => {
+                write!(f, "terrain face {face} belongs to more than one slot")
+            }
+            Self::MissingFaceAssignment { face } => {
+                write!(f, "terrain face {face} is not assigned to a supported slot")
+            }
+            Self::IntegerOverflow => write!(f, "terrain slot index overflow"),
+        }
+    }
+}
+
+impl std::error::Error for TerrainLodError {}
+
 impl TerrainFace28 {
     /// Decodes the proven two-table selector layout of [`Self::material_tag`].
     #[must_use]
@@ -273,6 +397,106 @@ pub struct LandMeshDocument {
 }
 
 impl LandMeshDocument {
+    /// Resolves each source face to the Node38 and terrain LOD that own it.
+    ///
+    /// The supported terrain layout uses slot-map entries 0 and 1 for LOD0
+    /// and LOD1. The other 13 entries must be empty. Every source face must be
+    /// covered exactly once; empty terrain may omit Node38 records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TerrainLodError`] for missing or unsupported slots, invalid
+    /// ranges, overlaps, or uncovered faces.
+    pub fn face_lod_assignments(&self) -> Result<Vec<TerrainFaceLod>, TerrainLodError> {
+        if self.faces.is_empty() && self.nodes_raw.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !self.nodes_raw.len().is_multiple_of(NODE38_STRIDE) {
+            return Err(TerrainLodError::InvalidNodeStreamSize {
+                size: self.nodes_raw.len(),
+            });
+        }
+        if self.nodes_raw.is_empty() {
+            return Err(TerrainLodError::MissingNodes {
+                face_count: self.faces.len(),
+            });
+        }
+
+        let mut assignments = vec![None; self.faces.len()];
+        for (node_index, node) in self.nodes_raw.chunks_exact(NODE38_STRIDE).enumerate() {
+            for slot_index in 2..15 {
+                let offset = 8 + slot_index * 2;
+                let slot = u16::from_le_bytes([node[offset], node[offset + 1]]);
+                if slot != u16::MAX {
+                    return Err(TerrainLodError::UnsupportedNodeSlot {
+                        node: node_index,
+                        slot_index,
+                        slot,
+                    });
+                }
+            }
+
+            for (lod_index, lod) in [TerrainLod::Lod0, TerrainLod::Lod1].into_iter().enumerate() {
+                let offset = 8 + lod_index * 2;
+                let slot = u16::from_le_bytes([node[offset], node[offset + 1]]);
+                if slot == u16::MAX {
+                    continue;
+                }
+                let slot_index = usize::from(slot);
+                let raw = self.slots.slots_raw.get(slot_index).ok_or(
+                    TerrainLodError::SlotOutOfRange {
+                        node: node_index,
+                        lod,
+                        slot,
+                        slot_count: self.slots.slots_raw.len(),
+                    },
+                )?;
+                let start = usize::from(u16::from_le_bytes([raw[0], raw[1]]));
+                let count = usize::from(u16::from_le_bytes([raw[2], raw[3]]));
+                let end = start
+                    .checked_add(count)
+                    .ok_or(TerrainLodError::IntegerOverflow)?;
+                if end > self.faces.len() {
+                    return Err(TerrainLodError::FaceRangeOutOfBounds {
+                        node: node_index,
+                        lod,
+                        slot,
+                        start,
+                        count,
+                        face_count: self.faces.len(),
+                    });
+                }
+                for face_index in start..end {
+                    let assignment = assignments.get_mut(face_index).ok_or(
+                        TerrainLodError::FaceRangeOutOfBounds {
+                            node: node_index,
+                            lod,
+                            slot,
+                            start,
+                            count,
+                            face_count: self.faces.len(),
+                        },
+                    )?;
+                    if assignment.is_some() {
+                        return Err(TerrainLodError::DuplicateFaceAssignment { face: face_index });
+                    }
+                    *assignment = Some(TerrainFaceLod {
+                        face_index,
+                        node_index,
+                        lod,
+                    });
+                }
+            }
+        }
+        assignments
+            .into_iter()
+            .enumerate()
+            .map(|(face_index, assignment)| {
+                assignment.ok_or(TerrainLodError::MissingFaceAssignment { face: face_index })
+            })
+            .collect()
+    }
+
     /// Resolves the type-11 material pairs addressed by one 68-byte slot.
     ///
     /// Returns `None` when the slot is absent or its pair range does not fit
@@ -1564,6 +1788,80 @@ mod tests {
     }
 
     #[test]
+    fn terrain_face_lod_assignments_keep_interleaved_source_order_and_reject_missing_nodes() {
+        let mut nodes_raw = vec![u8::MAX; 2 * NODE38_STRIDE];
+        for (node_index, [lod0_slot, lod1_slot]) in [[0_u16, 1_u16], [2, 3]].into_iter().enumerate()
+        {
+            let offset = node_index * NODE38_STRIDE + 8;
+            nodes_raw[offset..offset + 2].copy_from_slice(&lod0_slot.to_le_bytes());
+            nodes_raw[offset + 2..offset + 4].copy_from_slice(&lod1_slot.to_le_bytes());
+        }
+        let mut slots_raw = vec![[0_u8; SLOT_STRIDE]; 4];
+        for (raw, start) in slots_raw.iter_mut().zip([0_u16, 1, 2, 3]) {
+            raw[..2].copy_from_slice(&start.to_le_bytes());
+            raw[2..4].copy_from_slice(&1_u16.to_le_bytes());
+        }
+        let mesh = LandMeshDocument {
+            streams: Vec::new(),
+            nodes_raw,
+            slots: TerrainSlotTable {
+                header_raw: Vec::new(),
+                slots_raw,
+            },
+            positions: Vec::new(),
+            normals: Vec::new(),
+            uv0: Vec::new(),
+            accelerator: Vec::new(),
+            aux14: Vec::new(),
+            aux18: Vec::new(),
+            faces: (0..4).map(|_| terrain_face([0, 1, 2])).collect(),
+        };
+
+        let assignments = mesh.face_lod_assignments().expect("complete slot mapping");
+        assert_eq!(
+            assignments,
+            vec![
+                TerrainFaceLod {
+                    face_index: 0,
+                    node_index: 0,
+                    lod: TerrainLod::Lod0,
+                },
+                TerrainFaceLod {
+                    face_index: 1,
+                    node_index: 0,
+                    lod: TerrainLod::Lod1,
+                },
+                TerrainFaceLod {
+                    face_index: 2,
+                    node_index: 1,
+                    lod: TerrainLod::Lod0,
+                },
+                TerrainFaceLod {
+                    face_index: 3,
+                    node_index: 1,
+                    lod: TerrainLod::Lod1,
+                },
+            ]
+        );
+
+        let mut missing_nodes = mesh.clone();
+        missing_nodes.nodes_raw.clear();
+        assert_eq!(
+            missing_nodes.face_lod_assignments(),
+            Err(TerrainLodError::MissingNodes { face_count: 4 })
+        );
+        missing_nodes.faces.clear();
+        assert_eq!(missing_nodes.face_lod_assignments(), Ok(Vec::new()));
+
+        let mut overlapping = mesh;
+        overlapping.slots.slots_raw[3][..2].copy_from_slice(&2_u16.to_le_bytes());
+        assert_eq!(
+            overlapping.face_lod_assignments(),
+            Err(TerrainLodError::DuplicateFaceAssignment { face: 2 })
+        );
+    }
+
+    #[test]
     fn slot_material_pairs_use_type11_pair_table_and_preserve_flags() {
         let nres =
             decode_nres(&minimal_land_msh(&face([0, 1, 2], [None, None, None]))).expect("nres");
@@ -1836,6 +2134,42 @@ Generator 1
                 .unwrap_or_else(|err| panic!("{corpus} {path:?}: {err}"));
                 let document =
                     decode_land_msh(&nres).unwrap_or_else(|err| panic!("{corpus} {path:?}: {err}"));
+                let assignments = document
+                    .face_lod_assignments()
+                    .unwrap_or_else(|err| panic!("{corpus} {path:?}: {err}"));
+                assert_eq!(assignments.len(), document.faces.len(), "{corpus} {path:?}");
+                for (face_index, assignment) in assignments.iter().enumerate() {
+                    assert_eq!(assignment.face_index, face_index, "{corpus} {path:?}");
+                }
+                let lod0_faces = assignments
+                    .iter()
+                    .filter(|assignment| assignment.lod == TerrainLod::Lod0)
+                    .count();
+                let lod1_faces = assignments
+                    .iter()
+                    .filter(|assignment| assignment.lod == TerrainLod::Lod1)
+                    .count();
+                assert_eq!(
+                    lod0_faces + lod1_faces,
+                    document.faces.len(),
+                    "{corpus} {path:?}"
+                );
+                if corpus == "IS" {
+                    let map_name = path
+                        .parent()
+                        .and_then(Path::file_name)
+                        .and_then(|name| name.to_str())
+                        .map(str::to_ascii_lowercase);
+                    let expected_lod0 = match map_name.as_deref() {
+                        Some("automap") => Some(1_912),
+                        Some("prol") => Some(5_868),
+                        Some("tut_1") => Some(5_046),
+                        _ => None,
+                    };
+                    if let Some(expected) = expected_lod0 {
+                        assert_eq!(lod0_faces, expected, "{corpus} {path:?} LOD0 face count");
+                    }
+                }
                 files += 1;
                 vertices += document.positions.len();
                 faces += document.faces.len();
@@ -2125,6 +2459,18 @@ Generator 1
         }
         out[20..28].copy_from_slice(b"TAILFACE");
         out
+    }
+
+    fn terrain_face(vertices: [u16; 3]) -> TerrainFace28 {
+        TerrainFace28 {
+            flags: FullSurfaceMask(0),
+            material_tag: 0,
+            aux_tag: 0,
+            vertices,
+            neighbors: [None; 3],
+            tail_raw: *b"TAILFACE",
+            raw: face(vertices, [None; 3]),
+        }
     }
 
     fn entry(type_id: u32, attr1: u32, attr3: u32, payload: &[u8]) -> TestEntry<'_> {

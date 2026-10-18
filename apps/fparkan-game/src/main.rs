@@ -54,7 +54,9 @@ use fparkan_runtime::{
     loaded_mission_object_drafts, loaded_terrain, EngineServices, MissionAssets,
     MissionObjectDraft, MissionRequest,
 };
-use fparkan_terrain::{FullSurfaceMask, SurfaceQuery, TerrainMaterialLayers, TerrainWorld};
+use fparkan_terrain::{
+    FullSurfaceMask, SurfaceQuery, TerrainLod, TerrainMaterialLayers, TerrainWorld,
+};
 use fparkan_vfs::DirectoryVfs;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -1390,24 +1392,55 @@ fn shadow_triangle(positions: [[f32; 3]; 3], mask: u32) -> ShadowTriangle {
 fn terrain_shadow_receivers(
     terrain: &fparkan_terrain_format::LandMeshDocument,
 ) -> Result<Vec<ShadowTriangle>, String> {
-    terrain
-        .faces
-        .iter()
-        .map(|face| {
-            let positions = face.vertices.map(|index| {
-                let source = terrain
-                    .positions
-                    .get(usize::from(index))
-                    .copied()
-                    .unwrap_or([0.0; 3]);
-                source
-            });
-            if !positions.iter().flatten().all(|value| value.is_finite()) {
-                return Err("terrain shadow receiver contains a non-finite position".to_string());
-            }
-            Ok(shadow_triangle(positions, face.flags.0))
-        })
-        .collect()
+    let assignments = terrain
+        .face_lod_assignments()
+        .map_err(|error| error.to_string())?;
+    let mut receivers = Vec::with_capacity(
+        assignments
+            .iter()
+            .filter(|assignment| assignment.lod == TerrainLod::Lod0)
+            .count(),
+    );
+    for assignment in assignments {
+        if assignment.lod != TerrainLod::Lod0 {
+            continue;
+        }
+        let face = terrain.faces.get(assignment.face_index).ok_or_else(|| {
+            format!(
+                "terrain LOD0 references unknown face {}",
+                assignment.face_index
+            )
+        })?;
+        let positions = [
+            terrain_shadow_vertex_position(terrain, assignment.face_index, face.vertices[0])?,
+            terrain_shadow_vertex_position(terrain, assignment.face_index, face.vertices[1])?,
+            terrain_shadow_vertex_position(terrain, assignment.face_index, face.vertices[2])?,
+        ];
+        receivers.push(shadow_triangle(positions, face.flags.0));
+    }
+    Ok(receivers)
+}
+
+fn terrain_shadow_vertex_position(
+    terrain: &fparkan_terrain_format::LandMeshDocument,
+    face_index: usize,
+    vertex_index: u16,
+) -> Result<[f32; 3], String> {
+    let position = terrain
+        .positions
+        .get(usize::from(vertex_index))
+        .copied()
+        .ok_or_else(|| {
+            format!(
+                "terrain LOD0 shadow face {face_index} references unknown vertex {vertex_index}"
+            )
+        })?;
+    if !position.iter().all(|value| value.is_finite()) {
+        return Err(format!(
+            "terrain LOD0 shadow face {face_index} has a non-finite vertex {vertex_index}"
+        ));
+    }
+    Ok(position)
 }
 
 fn static_mesh_shadow_triangles(mesh: &VulkanStaticMesh) -> Vec<ShadowTriangle> {
@@ -5938,6 +5971,20 @@ fn usage() -> String {
 mod tests {
     use super::*;
 
+    fn set_test_terrain_lod0_range(terrain: &mut fparkan_terrain_format::LandMeshDocument) {
+        const NODE_STRIDE: usize = 38;
+        const SLOT_STRIDE: usize = 68;
+        let mut node = vec![u8::MAX; NODE_STRIDE];
+        node[8..10].copy_from_slice(&0_u16.to_le_bytes());
+        node[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
+        let mut slot = [0_u8; SLOT_STRIDE];
+        slot[..2].copy_from_slice(&0_u16.to_le_bytes());
+        let face_count = u16::try_from(terrain.faces.len()).expect("test face count fits");
+        slot[2..4].copy_from_slice(&face_count.to_le_bytes());
+        terrain.nodes_raw = node;
+        terrain.slots.slots_raw = vec![slot];
+    }
+
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
     }
@@ -6507,7 +6554,7 @@ mod tests {
         assert!(native_sun_unoccluded(&terrain, &camera, [1.0, 0.0, 0.0]));
         assert!(!native_sun_unoccluded(&terrain, &camera, [0.0, 0.0, 0.0]));
 
-        let land = fparkan_terrain_format::LandMeshDocument {
+        let mut land = fparkan_terrain_format::LandMeshDocument {
             streams: Vec::new(),
             nodes_raw: Vec::new(),
             slots: fparkan_terrain_format::TerrainSlotTable {
@@ -6531,8 +6578,14 @@ mod tests {
                 raw: [0; 28],
             }],
         };
+        set_test_terrain_lod0_range(&mut land);
         let shadow_receivers = terrain_shadow_receivers(&land).expect("raw-height receivers");
         assert_eq!(shadow_receivers[0].positions[0], [0.0, 0.0, 32.0]);
+        let mut invalid_shadow_face = land.clone();
+        invalid_shadow_face.faces[0].vertices[2] = u16::MAX;
+        assert!(terrain_shadow_receivers(&invalid_shadow_face)
+            .expect_err("bad terrain indices must fail instead of inventing vertices")
+            .contains("unknown vertex 65535"));
         let terrain = TerrainWorld::from_land_msh(&land).expect("synthetic terrain");
         assert_eq!(terrain.height_at([0.25, 0.25]).unwrap(), Some(32.0));
         let floor_camera =
@@ -6583,31 +6636,32 @@ mod tests {
             [0.0, 0.0, -1.0]
         ));
 
+        let mut excluded_land = fparkan_terrain_format::LandMeshDocument {
+            streams: Vec::new(),
+            nodes_raw: Vec::new(),
+            slots: fparkan_terrain_format::TerrainSlotTable {
+                header_raw: Vec::new(),
+                slots_raw: Vec::new(),
+            },
+            positions: vec![[0.0, 0.0, 32.0], [1.0, 0.0, 32.0], [0.0, 1.0, 32.0]],
+            normals: Vec::new(),
+            uv0: Vec::new(),
+            accelerator: Vec::new(),
+            aux14: Vec::new(),
+            aux18: Vec::new(),
+            faces: vec![fparkan_terrain_format::TerrainFace28 {
+                flags: FullSurfaceMask(0x20),
+                material_tag: 0,
+                aux_tag: 0,
+                vertices: [0, 1, 2],
+                neighbors: [None, None, None],
+                tail_raw: [0; 8],
+                raw: [0; 28],
+            }],
+        };
+        set_test_terrain_lod0_range(&mut excluded_land);
         let excluded_terrain =
-            TerrainWorld::from_land_msh(&fparkan_terrain_format::LandMeshDocument {
-                streams: Vec::new(),
-                nodes_raw: Vec::new(),
-                slots: fparkan_terrain_format::TerrainSlotTable {
-                    header_raw: Vec::new(),
-                    slots_raw: Vec::new(),
-                },
-                positions: vec![[0.0, 0.0, 32.0], [1.0, 0.0, 32.0], [0.0, 1.0, 32.0]],
-                normals: Vec::new(),
-                uv0: Vec::new(),
-                accelerator: Vec::new(),
-                aux14: Vec::new(),
-                aux18: Vec::new(),
-                faces: vec![fparkan_terrain_format::TerrainFace28 {
-                    flags: FullSurfaceMask(0x20),
-                    material_tag: 0,
-                    aux_tag: 0,
-                    vertices: [0, 1, 2],
-                    neighbors: [None, None, None],
-                    tail_raw: [0; 8],
-                    raw: [0; 28],
-                }],
-            })
-            .expect("excluded terrain");
+            TerrainWorld::from_land_msh(&excluded_land).expect("excluded terrain");
         assert!(native_sun_unoccluded_with_world(
             &excluded_terrain,
             &world_mesh,

@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 /// Applications access this semantic terrain API through this terrain crate
 /// rather than taking a direct dependency on the binary-format parser.
 pub use fparkan_terrain_format::{
-    FullSurfaceMask, TerrainMaterialLayers, TerrainMaterialSelection,
+    FullSurfaceMask, TerrainLod, TerrainLodError, TerrainMaterialLayers, TerrainMaterialSelection,
 };
 
 /// Terrain world.
@@ -91,6 +91,8 @@ pub enum TerrainError {
         /// Position count.
         position_count: usize,
     },
+    /// Terrain Node38/Slot68 records do not assign every face to one LOD.
+    InvalidLodMapping(TerrainLodError),
 }
 
 impl std::fmt::Display for TerrainError {
@@ -117,11 +119,23 @@ impl std::fmt::Display for TerrainError {
                 f,
                 "terrain face {face} references vertex {vertex} outside {position_count} positions"
             ),
+            Self::InvalidLodMapping(error) => write!(f, "invalid terrain LOD mapping: {error}"),
         }
     }
 }
 
-impl std::error::Error for TerrainError {}
+impl std::error::Error for TerrainError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidLodMapping(error) => Some(error),
+            Self::Unsupported
+            | Self::TooManyAreals { .. }
+            | Self::InvalidGridReference { .. }
+            | Self::InvalidArealReference { .. }
+            | Self::InvalidSurfaceVertex { .. } => None,
+        }
+    }
+}
 
 /// Surface query.
 pub trait SurfaceQuery {
@@ -247,8 +261,8 @@ impl TerrainWorld {
     ///
     /// # Errors
     ///
-    /// Returns [`TerrainError`] if a face cannot be represented by runtime
-    /// indexes.
+    /// Returns [`TerrainError`] if terrain LOD metadata or a face cannot be
+    /// represented by runtime indexes.
     pub fn from_land_msh(mesh: &LandMeshDocument) -> Result<Self, TerrainError> {
         Ok(Self {
             surfaces: build_surfaces(mesh)?,
@@ -878,8 +892,19 @@ impl RuntimeGrid {
 }
 
 fn build_surfaces(mesh: &LandMeshDocument) -> Result<Vec<RuntimeTriangle>, TerrainError> {
-    let mut triangles = Vec::with_capacity(mesh.faces.len());
-    for (face_index, face) in mesh.faces.iter().enumerate() {
+    let assignments = mesh
+        .face_lod_assignments()
+        .map_err(TerrainError::InvalidLodMapping)?;
+    let lod0_count = assignments
+        .iter()
+        .filter(|assignment| assignment.lod == TerrainLod::Lod0)
+        .count();
+    let mut triangles = Vec::with_capacity(lod0_count);
+    for (face, assignment) in mesh.faces.iter().zip(assignments.iter()) {
+        if assignment.lod != TerrainLod::Lod0 {
+            continue;
+        }
+        let face_index = assignment.face_index;
         let vertices = [
             surface_vertex(mesh, face_index, face.vertices[0])?,
             surface_vertex(mesh, face_index, face.vertices[1])?,
@@ -1243,7 +1268,7 @@ mod tests {
 
         let face0 = terrain_face(FullSurfaceMask(0x0000_0001), [0, 1, 2]);
         let face1 = terrain_face(FullSurfaceMask(0x0000_0002), [1, 3, 2]);
-        LandMeshDocument {
+        let mut mesh = LandMeshDocument {
             streams: Vec::<TerrainStream>::new(),
             nodes_raw: Vec::new(),
             slots: TerrainSlotTable {
@@ -1262,7 +1287,14 @@ mod tests {
             aux14: Vec::new(),
             aux18: Vec::new(),
             faces: vec![face0, face1],
-        }
+        };
+        let mut node = vec![u8::MAX; 38];
+        node[8..10].copy_from_slice(&0_u16.to_le_bytes());
+        let mut slot = [0_u8; 68];
+        slot[2..4].copy_from_slice(&(mesh.faces.len() as u16).to_le_bytes());
+        mesh.nodes_raw = node;
+        mesh.slots.slots_raw.push(slot);
+        mesh
     }
 
     fn terrain_face(
