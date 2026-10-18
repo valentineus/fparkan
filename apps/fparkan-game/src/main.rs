@@ -1944,6 +1944,7 @@ fn append_environment_range(
             lightmap_index: u8::MAX,
             batch_flags: 0,
             pipeline_state,
+            terrain_base_only: false,
             alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
         });
     Ok(EnvironmentGpuRange {
@@ -6347,6 +6348,7 @@ mod tests {
                 LegacyBlendMode::Opaque,
                 LegacyDepthMode::TestReadOnly,
             ),
+            terrain_base_only: false,
             alpha_test_reference: 0,
         };
         let mut mesh = VulkanStaticMesh {
@@ -6405,6 +6407,7 @@ mod tests {
             lightmap_index: u8::MAX,
             batch_flags,
             pipeline_state: world_pipeline_state(blend, LegacyDepthMode::TestReadOnly),
+            terrain_base_only: false,
             alpha_test_reference: 0,
         };
 
@@ -7645,6 +7648,7 @@ mod tests {
             lightmap_index: 0,
             batch_flags,
             pipeline_state: LegacyPipelineState::default(),
+            terrain_base_only: false,
             alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
         };
         let mesh = VulkanStaticMesh {

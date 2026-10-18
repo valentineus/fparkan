@@ -1902,18 +1902,23 @@ impl VulkanSmokeRenderer {
                     60,
                     &material_uv_transforms,
                 );
-                let unlit = self.material_unlit.get(texture_index).ok_or(
+                let material_mode = self.material_unlit.get(texture_index).ok_or(
                     VulkanSmokeRendererError::InvariantViolation {
                         context: "static material unlit flag",
                     },
                 )?;
-                let unlit = [unlit.to_ne_bytes()];
+                let material_mode = if range.terrain_base_only {
+                    ((*material_mode).round() as i32 | 16) as f32
+                } else {
+                    *material_mode
+                };
+                let material_mode = [material_mode.to_ne_bytes()];
                 device.device().cmd_push_constants(
                     command_buffer,
                     resources.pipeline_layout,
                     vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
                     124,
-                    &unlit.concat(),
+                    &material_mode.concat(),
                 );
                 device.device().cmd_draw_indexed(
                     command_buffer,
@@ -2577,6 +2582,7 @@ mod tests {
                 lightmap_index: 4,
                 batch_flags: 0x108,
                 pipeline_state: base_state,
+                terrain_base_only: false,
                 alpha_test_reference: 17,
             },
             VulkanStaticDrawRange {
@@ -2586,6 +2592,7 @@ mod tests {
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
                 pipeline_state: LegacyPipelineState::default(),
+                terrain_base_only: false,
                 alpha_test_reference: 0,
             },
         ];
@@ -2769,6 +2776,7 @@ mod tests {
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
                 pipeline_state: fparkan_render::LegacyPipelineState::default(),
+                terrain_base_only: false,
                 alpha_test_reference: 0,
             })
             .collect::<Vec<_>>();
@@ -2792,6 +2800,7 @@ mod tests {
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
                 pipeline_state: fparkan_render::LegacyPipelineState::default(),
+                terrain_base_only: false,
                 alpha_test_reference: 0,
             },
             super::super::VulkanStaticDrawRange {
@@ -2801,6 +2810,7 @@ mod tests {
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
                 pipeline_state: fparkan_render::LegacyPipelineState::default(),
+                terrain_base_only: false,
                 alpha_test_reference: 0,
             },
             super::super::VulkanStaticDrawRange {
@@ -2810,6 +2820,7 @@ mod tests {
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
                 pipeline_state: fparkan_render::LegacyPipelineState::default(),
+                terrain_base_only: false,
                 alpha_test_reference: 0,
             },
         ];
@@ -2833,6 +2844,7 @@ mod tests {
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
                 pipeline_state: fparkan_render::LegacyPipelineState::default(),
+                terrain_base_only: false,
                 alpha_test_reference: 0,
             })
             .collect::<Vec<_>>();
@@ -2861,6 +2873,7 @@ mod tests {
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
                 pipeline_state: LegacyPipelineState::default(),
+                terrain_base_only: false,
                 alpha_test_reference: 0,
             })
             .collect::<Vec<_>>();

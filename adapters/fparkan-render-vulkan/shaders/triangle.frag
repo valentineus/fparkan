@@ -114,7 +114,8 @@ void main() {
         0.0,
         1.0
     );
-    vec3 base_rgb = 2.0 * base.rgb * detail.rgb;
+    bool terrain_base_only = (mode & 16) != 0;
+    vec3 base_rgb = terrain_base_only ? base.rgb : 2.0 * base.rgb * detail.rgb;
     vec3 overlay_rgb = 2.0 * overlay.rgb * overlay_detail_sample.rgb;
     vec3 base_lit_rgb = base_rgb * in_base_diffuse + in_base_specular;
     vec3 overlay_lit_rgb = overlay_rgb * in_overlay_diffuse + in_overlay_specular;

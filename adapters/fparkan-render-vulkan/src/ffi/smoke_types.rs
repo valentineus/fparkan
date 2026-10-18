@@ -422,6 +422,8 @@ pub struct VulkanStaticDrawRange {
     /// Bits `0x100` and `0x008` opt a range into that queue independently of
     /// the material blend category.
     pub batch_flags: u16,
+    /// Terrain ranges that use the native lit base-only path (face flag 0x400 clear).
+    pub terrain_base_only: bool,
     /// Backend-neutral fixed-function state for this source range.
     pub pipeline_state: LegacyPipelineState,
     /// Alpha-test reference in legacy 0..=255 units; dynamic material data.
@@ -754,6 +756,7 @@ impl VulkanStaticMesh {
                 material_index: 0,
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
+                terrain_base_only: false,
                 pipeline_state: LegacyPipelineState::default(),
                 alpha_test_reference: 0,
             }],
@@ -989,6 +992,7 @@ mod static_mesh_tests {
                 material_index: 0,
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
+                terrain_base_only: false,
                 pipeline_state: LegacyPipelineState::default(),
                 alpha_test_reference: 0,
             }],
@@ -1019,6 +1023,7 @@ mod static_mesh_tests {
                 material_index: 7,
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
+                terrain_base_only: false,
                 pipeline_state: LegacyPipelineState::default(),
                 alpha_test_reference: 0,
             },
@@ -1028,6 +1033,7 @@ mod static_mesh_tests {
                 material_index: 2,
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
+                terrain_base_only: false,
                 pipeline_state: LegacyPipelineState::default(),
                 alpha_test_reference: 0,
             },

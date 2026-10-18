@@ -865,6 +865,7 @@ fn append_node_fallback_batch(
         lightmap_index: batch.lightmap_index,
         batch_flags: batch.batch_flags,
         pipeline_state: world_pipeline_state(),
+        terrain_base_only: false,
         alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
     });
     Ok(())
@@ -1205,20 +1206,23 @@ fn static_terrain_draw_ranges(
     let mut ranges = Vec::new();
     let mut start_face = 0usize;
     while start_face < lod0.len() {
-        let material_index = terrain
+        let first_face = terrain
             .faces
             .get(lod0[start_face].face_index)
-            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?
-            .material_tag;
+            .ok_or(VulkanAssetMeshError::IndexOutOfRange)?;
+        let material_index = first_face.material_tag;
+        let terrain_base_only = first_face.flags.0 & 0x400 == 0;
         let mut end_face = start_face + 1;
-        while end_face < lod0.len()
-            && terrain
+        while end_face < lod0.len() {
+            let next_face = terrain
                 .faces
                 .get(lod0[end_face].face_index)
-                .ok_or(VulkanAssetMeshError::IndexOutOfRange)?
-                .material_tag
-                == material_index
-        {
+                .ok_or(VulkanAssetMeshError::IndexOutOfRange)?;
+            if next_face.material_tag != material_index
+                || (next_face.flags.0 & 0x400 == 0) != terrain_base_only
+            {
+                break;
+            }
             end_face += 1;
         }
         ranges.push(VulkanStaticDrawRange {
@@ -1234,6 +1238,7 @@ fn static_terrain_draw_ranges(
             lightmap_index: u8::MAX,
             batch_flags: 0,
             pipeline_state: world_pipeline_state(),
+            terrain_base_only,
             alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
         });
         start_face = end_face;
@@ -1279,6 +1284,7 @@ fn static_model_indices_and_ranges(
             lightmap_index: batch.lightmap_index,
             batch_flags: batch.batch_flags,
             pipeline_state: world_pipeline_state(),
+            terrain_base_only: false,
             alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
         });
     }
@@ -1481,6 +1487,7 @@ mod tests {
                 lightmap_index: 0,
                 batch_flags: 0,
                 pipeline_state: world_pipeline_state(),
+                terrain_base_only: false,
                 alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
             }]
         );
@@ -2002,6 +2009,7 @@ mod tests {
                     lightmap_index: 0,
                     batch_flags: 0,
                     pipeline_state: world_pipeline_state(),
+                    terrain_base_only: false,
                     alpha_test_reference:
                         VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
                 },
@@ -2012,6 +2020,7 @@ mod tests {
                     lightmap_index: 0,
                     batch_flags: 0,
                     pipeline_state: world_pipeline_state(),
+                    terrain_base_only: false,
                     alpha_test_reference:
                         VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
                 },
@@ -2168,8 +2177,16 @@ mod tests {
     }
 
     fn terrain_face_with_tag(material_tag: u16, vertices: [u16; 3]) -> TerrainFace28 {
+        terrain_face_with_tag_and_flags(material_tag, 0, vertices)
+    }
+
+    fn terrain_face_with_tag_and_flags(
+        material_tag: u16,
+        flags: u32,
+        vertices: [u16; 3],
+    ) -> TerrainFace28 {
         TerrainFace28 {
-            flags: FullSurfaceMask(0),
+            flags: FullSurfaceMask(flags),
             material_tag,
             aux_tag: 0,
             vertices,
@@ -2201,7 +2218,7 @@ mod tests {
     }
 
     #[test]
-    fn terrain_ranges_preserve_face_order_and_packed_material_tags() {
+    fn terrain_ranges_merge_only_contiguous_equal_material_and_surface_mode() {
         let mut terrain = LandMeshDocument {
             streams: Vec::new(),
             nodes_raw: Vec::new(),
@@ -2216,27 +2233,35 @@ mod tests {
             aux14: Vec::new(),
             aux18: Vec::new(),
             faces: vec![
-                terrain_face_with_tag(0xff01, [0, 1, 2]),
-                terrain_face_with_tag(0xff01, [0, 1, 2]),
+                terrain_face_with_tag_and_flags(0xff00, 0x400, [0, 1, 2]),
+                terrain_face_with_tag_and_flags(0xff00, 0x400, [0, 1, 2]),
+                terrain_face_with_tag_and_flags(0xff00, 0, [0, 1, 2]),
                 terrain_face_with_tag(0x0102, [0, 1, 2]),
-                terrain_face_with_tag(0xff01, [0, 1, 2]),
+                terrain_face_with_tag_and_flags(0xff00, 0x400, [0, 1, 2]),
             ],
         };
-        set_terrain_lod_slots(&mut terrain, &[[0, u16::MAX]], &[[0, 4]]);
+        set_terrain_lod_slots(&mut terrain, &[[0, u16::MAX]], &[[0, 5]]);
 
         let lod0 = static_terrain_lod0_assignments(&terrain).expect("terrain LOD0");
         let ranges = static_terrain_draw_ranges(&terrain, &lod0).expect("representable terrain");
 
-        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges.len(), 4);
         assert_eq!(ranges[0].first_index, 0);
         assert_eq!(ranges[0].index_count, 6);
-        assert_eq!(ranges[0].material_index, 0xff01);
+        assert_eq!(ranges[0].material_index, 0xff00);
+        assert!(!ranges[0].terrain_base_only);
         assert_eq!(ranges[1].first_index, 6);
         assert_eq!(ranges[1].index_count, 3);
-        assert_eq!(ranges[1].material_index, 0x0102);
+        assert_eq!(ranges[1].material_index, 0xff00);
+        assert!(ranges[1].terrain_base_only);
         assert_eq!(ranges[2].first_index, 9);
         assert_eq!(ranges[2].index_count, 3);
-        assert_eq!(ranges[2].material_index, 0xff01);
+        assert_eq!(ranges[2].material_index, 0x0102);
+        assert!(ranges[2].terrain_base_only);
+        assert_eq!(ranges[3].first_index, 12);
+        assert_eq!(ranges[3].index_count, 3);
+        assert_eq!(ranges[3].material_index, 0xff00);
+        assert!(!ranges[3].terrain_base_only);
         assert!(ranges.iter().all(|range| {
             range.alpha_test_reference == VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE
         }));
