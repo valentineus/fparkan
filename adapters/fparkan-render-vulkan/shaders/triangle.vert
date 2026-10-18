@@ -232,9 +232,10 @@ void main() {
     out_uv = in_uv;
     out_detail_uv = in_detail_uv;
     out_overlay_alpha = in_overlay_alpha;
-    out_fog_factor = native_fog_factor(in_position);
     int mode = int(round(material.material_mode));
     int combiner_mode = mode & 3;
+    bool screen_tl = (mode & 8) != 0;
+    out_fog_factor = screen_tl ? 0.0 : native_fog_factor(in_position);
     if (combiner_mode == 0) {
         LightingTerms base_terms = native_material_lighting(
             in_position,
@@ -262,12 +263,14 @@ void main() {
         out_overlay_diffuse = vec3(1.0);
         out_overlay_specular = vec3(0.0);
     }
-    vec4 clip_position = frame.clip_from_world * vec4(in_position, 1.0);
+    vec4 clip_position = screen_tl
+        ? vec4(in_position, 1.0)
+        : frame.clip_from_world * vec4(in_position, 1.0);
     // Sky far-depth is a Vulkan projection choice for layers authored around
     // the camera. Keep world positions, normals, and UVs intact while placing
     // the resulting primitive at the far depth; this does not assert native
     // D3D depth-bit equivalence.
-    if ((mode & 4) != 0) {
+    if ((mode & 4) != 0 && !screen_tl) {
         clip_position.z = clip_position.w;
     }
     gl_Position = clip_position;

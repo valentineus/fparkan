@@ -533,7 +533,7 @@ fn native_specular_reference_uses_squared_power_and_total_overflow_curve() {
 fn shader_computes_radial_fog_per_vertex_and_interpolates_it() {
     let vertex = include_str!("../../shaders/triangle.vert");
     let fragment = include_str!("../../shaders/triangle.frag");
-    assert!(vertex.contains("out_fog_factor = native_fog_factor(in_position);"));
+    assert!(vertex.contains("out_fog_factor = screen_tl ? 0.0 : native_fog_factor(in_position);"));
     assert!(fragment.contains("layout(location = 4) in float in_fog_factor;"));
     assert!(!fragment.contains("distance(in_world_position"));
     assert!(!fragment.contains("float fog_factor()"));

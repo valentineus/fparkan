@@ -505,6 +505,33 @@ pub struct VulkanStaticMaterial {
     /// renderer projection choice; it is not a claim about the original D3D
     /// depth-bit encoding.
     pub sky_far_depth: bool,
+    /// Push material mode bit 8 and treat positions as Vulkan clip-space
+    /// `XYZRHW` vertices. Their x/y coordinates are converted from viewport
+    /// pixels by the caller and z retains the native `0.999` depth.
+    pub screen_tl: bool,
+}
+
+impl VulkanStaticMaterial {
+    pub(crate) fn encoded_material_mode(&self) -> f32 {
+        let combiner_mode = if self.screen_tl {
+            1.0
+        } else if self.lightmap_mode {
+            3.0
+        } else if self.sky_nebula_stars {
+            2.0
+        } else if self.unlit {
+            1.0
+        } else {
+            0.0
+        };
+        combiner_mode
+            + if self.sky_far_depth && !self.screen_tl {
+                4.0
+            } else {
+                0.0
+            }
+            + if self.screen_tl { 8.0 } else { 0.0 }
+    }
 }
 
 /// One authored RGBA8 mip level accepted by the Vulkan texture upload path.
@@ -1028,6 +1055,7 @@ mod static_mesh_tests {
                 sky_nebula_stars: false,
                 lightmap_mode: false,
                 sky_far_depth: false,
+                screen_tl: false,
             },
             VulkanStaticMaterial {
                 material_index: 7,
@@ -1054,8 +1082,18 @@ mod static_mesh_tests {
                 sky_nebula_stars: false,
                 lightmap_mode: false,
                 sky_far_depth: false,
+                screen_tl: false,
             },
         ];
+
+        let mut screen_tl = materials[0].clone();
+        screen_tl.screen_tl = true;
+        screen_tl.sky_far_depth = true;
+        assert_eq!(screen_tl.encoded_material_mode(), 9.0);
+        let mut far_sky = materials[0].clone();
+        far_sky.unlit = true;
+        far_sky.sky_far_depth = true;
+        assert_eq!(far_sky.encoded_material_mode(), 5.0);
 
         assert_eq!(
             resolve_draw_texture_indices(&ranges, &materials),

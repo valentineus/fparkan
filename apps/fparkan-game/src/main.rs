@@ -1261,6 +1261,7 @@ fn append_environment_material(
             sky_nebula_stars: false,
             lightmap_mode: false,
             sky_far_depth: matches!(fallback_row, 0..=2),
+            screen_tl: ENVIRONMENT_SPRITE_ROWS.contains(&fallback_row),
         });
         phase_material_indices.push(index);
     }
@@ -1321,6 +1322,7 @@ fn append_environment_gradient_material(
         sky_nebula_stars: false,
         lightmap_mode: false,
         sky_far_depth: true,
+        screen_tl: false,
     });
     Ok(index)
 }
@@ -1371,6 +1373,7 @@ fn append_shadow_material(materials: &mut Vec<VulkanStaticMaterial>) -> Result<u
         sky_nebula_stars: false,
         lightmap_mode: false,
         sky_far_depth: false,
+        screen_tl: false,
     });
     Ok(index)
 }
@@ -2648,17 +2651,33 @@ impl EnvironmentGpuScene {
                         viewport,
                         horizontal_fov(camera, viewport[0] / viewport[1].max(1.0)),
                     ) {
-                        vertices = Some(sprite_quad_vertices_pixels(
-                            camera,
-                            frame.direction,
-                            (camera.far_plane * 0.5).max(camera.near_plane * 2.0),
-                            half_width,
-                            half_height,
-                            viewport,
-                            frame.color,
-                            frame.alpha,
-                            frame.uv,
-                        ));
+                        if ENVIRONMENT_SPRITE_ROWS.contains(&sprite.row) {
+                            if let Some(center_pixels) = projected {
+                                vertices = Some(screen_tl_quad_vertices_pixels(
+                                    center_pixels,
+                                    half_width,
+                                    half_height,
+                                    viewport,
+                                    frame.color,
+                                    frame.alpha,
+                                    frame.uv,
+                                ));
+                            } else {
+                                active = false;
+                            }
+                        } else {
+                            vertices = Some(sprite_quad_vertices_pixels(
+                                camera,
+                                frame.direction,
+                                (camera.far_plane * 0.5).max(camera.near_plane * 2.0),
+                                half_width,
+                                half_height,
+                                viewport,
+                                frame.color,
+                                frame.alpha,
+                                frame.uv,
+                            ));
+                        }
                     } else {
                         active = false;
                     }
@@ -3081,6 +3100,50 @@ fn sprite_quad_vertices_pixels(
         environment_vertex_with_alpha(add3(sub3(center, right), up), color, alpha, uv[2]),
         environment_vertex_with_alpha(add3(add3(center, right), up), color, alpha, uv[3]),
     ]
+}
+
+fn screen_tl_quad_vertices_pixels(
+    center_pixels: [f32; 2],
+    half_width_pixels: f32,
+    half_height_pixels: f32,
+    viewport: [f32; 2],
+    color: [f32; 3],
+    alpha: f32,
+    uv: [[f32; 2]; 4],
+) -> [VulkanStaticVertex; 4] {
+    let width = viewport[0].max(1.0);
+    let height = viewport[1].max(1.0);
+    let half_width = half_width_pixels.max(0.0);
+    let half_height = half_height_pixels.max(0.0);
+    let pixel_corners = [
+        [
+            center_pixels[0] - half_width,
+            center_pixels[1] + half_height,
+        ],
+        [
+            center_pixels[0] + half_width,
+            center_pixels[1] + half_height,
+        ],
+        [
+            center_pixels[0] - half_width,
+            center_pixels[1] - half_height,
+        ],
+        [
+            center_pixels[0] + half_width,
+            center_pixels[1] - half_height,
+        ],
+    ];
+    // Positive-height Vulkan viewports map NDC -Y to top-down screen pixels.
+    let uv = [uv[1], uv[2], uv[0], uv[3]];
+    std::array::from_fn(|index| {
+        let pixel = pixel_corners[index];
+        let position = [
+            pixel[0] * (2.0 / width) - 1.0,
+            pixel[1] * (2.0 / height) - 1.0,
+            0.999,
+        ];
+        environment_vertex_with_alpha(position, color, alpha, uv[index])
+    })
 }
 
 fn precipitation_quad_vertices(
@@ -4305,6 +4368,7 @@ fn static_preview_terrain_base_materials(
                     sky_nebula_stars: false,
                     lightmap_mode: false,
                     sky_far_depth: false,
+                    screen_tl: false,
                 });
                 phase_material_indices.push(usize::from(preview_selector));
             }
@@ -4510,6 +4574,7 @@ fn static_preview_component_materials(
                     sky_nebula_stars: false,
                     lightmap_mode: false,
                     sky_far_depth: false,
+                    screen_tl: false,
                 });
                 phase_material_indices.push(usize::from(preview_selector));
             }
@@ -7335,5 +7400,74 @@ mod tests {
             vertices.map(|vertex| vertex.uv),
             [uv[1], uv[2], uv[0], uv[3]]
         );
+    }
+
+    #[test]
+    fn native_tl_sprite_pixels_use_current_viewport_and_preserve_depth_999() {
+        let uv = [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]];
+        let small = screen_tl_quad_vertices_pixels(
+            [160.0, 120.0],
+            40.0,
+            30.0,
+            [640.0, 480.0],
+            [1.0; 3],
+            1.0,
+            uv,
+        );
+        let resized = screen_tl_quad_vertices_pixels(
+            [320.0, 240.0],
+            80.0,
+            60.0,
+            [1280.0, 960.0],
+            [1.0; 3],
+            1.0,
+            uv,
+        );
+        let wide = screen_tl_quad_vertices_pixels(
+            [640.0, 360.0],
+            100.0,
+            45.0,
+            [1280.0, 720.0],
+            [1.0; 3],
+            1.0,
+            uv,
+        );
+
+        for (small, resized) in small.iter().zip(resized) {
+            for axis in 0..2 {
+                assert!((small.position[axis] - resized.position[axis]).abs() < 1.0e-6);
+            }
+            assert_eq!(small.position[2], 0.999);
+            assert_eq!(resized.position[2], 0.999);
+        }
+        assert_eq!(small[0].uv, [0.0, 1.0]);
+        assert_eq!(small[2].uv, [0.0, 0.0]);
+        for (actual, expected) in [
+            (wide[0].position, [-0.15625, 0.125, 0.999]),
+            (wide[2].position, [-0.15625, -0.125, 0.999]),
+        ] {
+            for axis in 0..3 {
+                assert!((actual[axis] - expected[axis]).abs() < 1.0e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn native_tl_depth_999_is_nearer_than_opaque_geometry_at_320_units() {
+        let camera = FreeFlightCamera {
+            position: [0.0; 3],
+            yaw: 0.0,
+            pitch: 0.0,
+            horizontal_fov: 1.3,
+            near_plane: 0.5,
+            far_plane: 700.0,
+            move_speed: 1.0,
+        };
+        let frame = camera.preview_frame(16.0 / 9.0);
+        let opaque_clip = row_vector_transform([320.0, 0.0, 0.0, 1.0], frame.clip_from_world);
+        let opaque_depth = opaque_clip[2] / opaque_clip[3];
+
+        assert!((opaque_depth - 0.999151_18).abs() < 1.0e-6);
+        assert!(0.999 < opaque_depth);
     }
 }

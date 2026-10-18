@@ -3,7 +3,7 @@
 use ash::vk;
 use fparkan_render::{LegacyDepthMode, LegacyPipelineState};
 
-use super::smoke_types::resolve_draw_texture_indices;
+use super::smoke_types::{resolve_draw_texture_indices, VulkanStaticMaterial};
 use super::update_material_texture_descriptor;
 use super::{
     create_command_pool, create_frame_sync, create_index_buffer, create_static_mesh_index_buffer,
@@ -361,18 +361,7 @@ impl VulkanSmokeRenderer {
             create_info
                 .materials
                 .iter()
-                .map(|material| {
-                    let combiner_mode = if material.lightmap_mode {
-                        3.0
-                    } else if material.sky_nebula_stars {
-                        2.0
-                    } else if material.unlit {
-                        1.0
-                    } else {
-                        0.0
-                    };
-                    combiner_mode + if material.sky_far_depth { 4.0 } else { 0.0 }
-                })
+                .map(VulkanStaticMaterial::encoded_material_mode)
                 .collect()
         };
         let material_specular = if create_info.materials.is_empty() {
