@@ -32,8 +32,8 @@ use fparkan_path::ResourceName;
 use fparkan_platform_winit::{window_native_handles, WinitWindow, WinitWindowPlan};
 use fparkan_prototype::{unit_component_tree, PROTOTYPE_TYPE_EXTO};
 use fparkan_render::{
-    LegacyBlendMode, LegacyD3d7Projection, LegacyDepthMode, LegacyIron3dEulerTransform,
-    LegacyPipelineState, RawCameraTransform,
+    LegacyBlendMode, LegacyCullMode, LegacyD3d7Projection, LegacyDepthMode,
+    LegacyIron3dEulerTransform, LegacyPipelineState, RawCameraTransform,
 };
 use fparkan_render_vulkan::{
     node38_pose, node38_pose_from_hierarchy, node38_pose_relative_to_root,
@@ -922,6 +922,113 @@ fn update_material_animations(
 
 fn native_world_transparent(range: &VulkanStaticDrawRange, diffuse_alpha: f32) -> bool {
     diffuse_alpha < 1.0 || (range.batch_flags & 0x108) != 0
+}
+
+fn native_msh_handedness(transform: LegacyIron3dEulerTransform, scale: [f32; 3]) -> i8 {
+    let Some(origin) = transform.try_transform_scaled_point([0.0; 3], scale) else {
+        return 0;
+    };
+    let Some(x_axis) = transform
+        .try_transform_scaled_point([1.0, 0.0, 0.0], scale)
+        .map(|point| sub3(point, origin))
+    else {
+        return 0;
+    };
+    let Some(y_axis) = transform
+        .try_transform_scaled_point([0.0, 1.0, 0.0], scale)
+        .map(|point| sub3(point, origin))
+    else {
+        return 0;
+    };
+    let Some(z_axis) = transform
+        .try_transform_scaled_point([0.0, 0.0, 1.0], scale)
+        .map(|point| sub3(point, origin))
+    else {
+        return 0;
+    };
+    // Node and mount poses in the preview are unit-quaternion rotations, so
+    // they have determinant +1 and preserve this exact object-transform sign.
+    let determinant_sign = dot3(x_axis, cross3(y_axis, z_axis));
+    if !determinant_sign.is_finite() || determinant_sign == 0.0 {
+        0
+    } else if determinant_sign < 0.0 {
+        -1
+    } else {
+        1
+    }
+}
+
+fn native_msh_cull_mode(batch_flags: u16, handedness: i8) -> LegacyCullMode {
+    if batch_flags & 0x2 != 0 || batch_flags & 0x4000 != 0 || handedness == 0 {
+        LegacyCullMode::Disabled
+    } else if handedness > 0 {
+        // The Y-negated projection maps native d > 0 faces to Vulkan's back
+        // under the renderer's CLOCKWISE front-face convention.
+        LegacyCullMode::FrontFace
+    } else {
+        LegacyCullMode::BackFace
+    }
+}
+
+fn native_msh_first_triangle_visible(
+    mesh: &VulkanStaticMesh,
+    range: &VulkanStaticDrawRange,
+    eye_world: [f32; 3],
+    handedness: i8,
+) -> bool {
+    if range.batch_flags & 0x2 != 0 || range.batch_flags & 0x4000 == 0 {
+        return true;
+    }
+    if handedness == 0 {
+        return false;
+    }
+    let Some(indices) = usize::try_from(range.first_index)
+        .ok()
+        .and_then(|first| mesh.indices.get(first..first.checked_add(3)?))
+    else {
+        return false;
+    };
+    let Some(v0) = usize::try_from(indices[0])
+        .ok()
+        .and_then(|index| mesh.vertices.get(index))
+    else {
+        return false;
+    };
+    let Some(v1) = usize::try_from(indices[1])
+        .ok()
+        .and_then(|index| mesh.vertices.get(index))
+    else {
+        return false;
+    };
+    let Some(v2) = usize::try_from(indices[2])
+        .ok()
+        .and_then(|index| mesh.vertices.get(index))
+    else {
+        return false;
+    };
+    let [v0, v1, v2] = [v0.position, v1.position, v2.position];
+    let face = cross3(sub3(v1, v0), sub3(v2, v0));
+    let facing = dot3(sub3(eye_world, v0), face) * f32::from(handedness);
+    facing.is_finite() && facing > 0.0
+}
+
+fn world_draw_range_index_count(
+    mesh: &VulkanStaticMesh,
+    range: &VulkanStaticDrawRange,
+    original_index_count: u32,
+    diffuse_alpha: f32,
+    eye_world: [f32; 3],
+    native_msh_handedness: Option<i8>,
+) -> u32 {
+    if !(diffuse_alpha > 0.0) {
+        return 0;
+    }
+    if native_msh_handedness.is_some_and(|handedness| {
+        !native_msh_first_triangle_visible(mesh, range, eye_world, handedness)
+    }) {
+        return 0;
+    }
+    original_index_count
 }
 
 fn configure_world_material_categories(
@@ -1993,6 +2100,7 @@ impl EnvironmentGpuScene {
 
     fn new(
         mesh: &mut VulkanStaticMesh,
+        native_handedness_by_range: &mut HashMap<usize, i8>,
         materials: &mut Vec<VulkanStaticMaterial>,
         preview_material_animations: &mut Vec<MaterialAnimationBinding>,
         sun_occlusion_range_indices: &mut Vec<usize>,
@@ -2412,6 +2520,14 @@ impl EnvironmentGpuScene {
         old_order.extend(sprite_indices.iter().copied());
         old_order.extend([rain_index, snow_index, lightning_index]);
         let remap = reorder_draw_ranges(mesh, &old_order)?;
+        let mut remapped_handedness = HashMap::with_capacity(native_handedness_by_range.len());
+        for (old_range_index, handedness) in std::mem::take(native_handedness_by_range) {
+            let new_range_index = remap.get(old_range_index).copied().ok_or_else(|| {
+                format!("native MSH draw range remap is missing range {old_range_index}")
+            })?;
+            remapped_handedness.insert(new_range_index, handedness);
+        }
+        *native_handedness_by_range = remapped_handedness;
         for layer in &mut scene.sky_layers {
             layer.range.range_index = *remap
                 .get(layer.range.range_index)
@@ -3657,6 +3773,7 @@ fn multiply_row_major(left: [f32; 16], right: [f32; 16]) -> [f32; 16] {
 
 struct StaticPreviewScene {
     mesh: VulkanStaticMesh,
+    native_handedness_by_range: HashMap<usize, i8>,
     materials: Vec<VulkanStaticMaterial>,
     material_animations: Vec<MaterialAnimationBinding>,
     sun_occlusion_range_indices: Vec<usize>,
@@ -3868,6 +3985,7 @@ fn static_preview_mesh_and_materials(
         indices: Vec::new(),
         draw_ranges: Vec::new(),
     };
+    let mut native_handedness_by_range = HashMap::new();
     let mut materials = Vec::new();
     let mut material_animations = Vec::new();
     let mut sun_occlusion_range_indices = Vec::new();
@@ -4066,7 +4184,7 @@ fn static_preview_mesh_and_materials(
             };
             if should_render {
                 let pose_buffer = component_pose_buffers[component_index].as_ref();
-                let component = match (pose_buffer, mount_pose, static_animation_frame) {
+                let mut component = match (pose_buffer, mount_pose, static_animation_frame) {
                     (Some(poses), Some(mount), _) => {
                         project_msh_to_static_mesh_in_world_space_with_node_pose_buffer_and_mount(
                             &model.validated,
@@ -4118,6 +4236,11 @@ fn static_preview_mesh_and_materials(
                     }
                 }
                 .map_err(|err| format!("project mission MSH for Vulkan: {err}"))?;
+                let component_handedness = native_msh_handedness(transform, mission_root.scale);
+                for range in &mut component.draw_ranges {
+                    range.pipeline_state.cull =
+                        native_msh_cull_mode(range.batch_flags, component_handedness);
+                }
                 let component_shadow_triangles = static_mesh_shadow_triangles(&component);
                 if root_native_kind.is_some() {
                     root_shadow_triangles.extend(component_shadow_triangles);
@@ -4156,6 +4279,9 @@ fn static_preview_mesh_and_materials(
                     &lightmap_textures,
                     Some(&mut material_animations),
                 )?;
+                for range_index in range_start..mesh.draw_ranges.len() {
+                    native_handedness_by_range.insert(range_index, component_handedness);
+                }
                 if root_sun_eligible {
                     sun_occlusion_range_indices.extend(range_start..mesh.draw_ranges.len());
                 }
@@ -4203,6 +4329,7 @@ fn static_preview_mesh_and_materials(
     let shadow_material_index = append_shadow_material(&mut materials)?;
     Ok(StaticPreviewScene {
         mesh,
+        native_handedness_by_range,
         materials,
         material_animations,
         sun_occlusion_range_indices,
@@ -4928,6 +5055,7 @@ fn run_static_vulkan_mode(
             let sky_mesh = environment.sky.mesh().clone();
             Some(EnvironmentGpuScene::new(
                 &mut preview.mesh,
+                &mut preview.native_handedness_by_range,
                 &mut preview.materials,
                 &mut preview.material_animations,
                 &mut preview.sun_occlusion_range_indices,
@@ -4965,6 +5093,7 @@ fn run_static_vulkan_mode(
 
 struct StaticVulkanApp {
     mesh: VulkanStaticMesh,
+    native_handedness_by_range: HashMap<usize, i8>,
     materials: Vec<VulkanStaticMaterial>,
     material_animations: Vec<MaterialAnimationBinding>,
     sun_occlusion_range_indices: Vec<usize>,
@@ -5045,6 +5174,7 @@ impl StaticVulkanApp {
             .collect();
         Self {
             mesh: preview.mesh,
+            native_handedness_by_range: preview.native_handedness_by_range,
             materials: preview.materials,
             material_animations: preview.material_animations,
             sun_occlusion_range_indices: preview.sun_occlusion_range_indices,
@@ -5123,7 +5253,14 @@ impl StaticVulkanApp {
             renderer
                 .set_draw_range_index_count(
                     range_index,
-                    if alpha > 0.0 { range.index_count } else { 0 },
+                    world_draw_range_index_count(
+                        &self.mesh,
+                        range,
+                        range.index_count,
+                        alpha,
+                        self.view_camera.position,
+                        self.native_handedness_by_range.get(&range_index).copied(),
+                    ),
                 )
                 .map_err(|error| {
                     format!("configure world draw range {range_index} count: {error}")
@@ -5137,6 +5274,8 @@ impl StaticVulkanApp {
         materials: &[VulkanStaticMaterial],
         world_range_indices: &[usize],
         world_range_index_counts: &HashMap<usize, u32>,
+        native_handedness_by_range: &HashMap<usize, i8>,
+        eye_world: [f32; 3],
         active_materials: &HashMap<usize, ActiveMaterialState>,
         renderer: &mut VulkanSmokeRenderer,
     ) -> Result<(), String> {
@@ -5157,13 +5296,17 @@ impl StaticVulkanApp {
             renderer
                 .set_draw_range_transparency(range_index, native_world_transparent(range, alpha))
                 .map_err(|error| format!("update world draw range {range_index}: {error}"))?;
-            let count = if alpha > 0.0 {
-                *world_range_index_counts
-                    .get(&range_index)
-                    .ok_or_else(|| "world draw range count is missing".to_string())?
-            } else {
-                0
-            };
+            let original_index_count = *world_range_index_counts
+                .get(&range_index)
+                .ok_or_else(|| "world draw range count is missing".to_string())?;
+            let count = world_draw_range_index_count(
+                mesh,
+                range,
+                original_index_count,
+                alpha,
+                eye_world,
+                native_handedness_by_range.get(&range_index).copied(),
+            );
             renderer
                 .set_draw_range_index_count(range_index, count)
                 .map_err(|error| format!("update world draw range {range_index} count: {error}"))?;
@@ -5322,6 +5465,8 @@ impl StaticVulkanApp {
             &self.materials,
             &self.world_range_indices,
             &self.world_range_index_counts,
+            &self.native_handedness_by_range,
+            self.view_camera.position,
             &active_materials,
             renderer,
         )?;
@@ -7469,5 +7614,234 @@ mod tests {
 
         assert!((opaque_depth - 0.999151_18).abs() < 1.0e-6);
         assert!(0.999 < opaque_depth);
+    }
+
+    fn facing_mesh(
+        batch_flags: u16,
+        positions: &[[f32; 3]],
+    ) -> (VulkanStaticMesh, VulkanStaticDrawRange) {
+        let range = VulkanStaticDrawRange {
+            first_index: 0,
+            index_count: u32::try_from(positions.len()).expect("fixture index count fits u32"),
+            material_index: 0,
+            lightmap_index: 0,
+            batch_flags,
+            pipeline_state: LegacyPipelineState::default(),
+            alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
+        };
+        let mesh = VulkanStaticMesh {
+            vertices: positions
+                .iter()
+                .copied()
+                .map(|position| VulkanStaticVertex {
+                    position,
+                    color: [1.0; 3],
+                    normal: [0.0, 0.0, 1.0],
+                    uv: [0.0; 2],
+                    detail_uv: [0.0; 2],
+                    overlay_alpha: 0.0,
+                })
+                .collect(),
+            indices: (0..positions.len())
+                .map(|index| u32::try_from(index).expect("fixture index fits u32"))
+                .collect(),
+            draw_ranges: vec![range],
+        };
+        (mesh, range)
+    }
+
+    fn native_front_triangle() -> [[f32; 3]; 3] {
+        [[-0.2, -0.2, -1.0], [0.2, -0.2, -1.0], [0.0, 0.2, -1.0]]
+    }
+
+    fn camera_face_triangle(camera: PreviewCameraFrame, mirror: bool) -> [[f32; 3]; 3] {
+        let center = add3(camera.position, scale3(camera.forward, 10.0));
+        let mirror = if mirror { -1.0 } else { 1.0 };
+        [
+            add3(
+                add3(center, scale3(camera.right, -2.0 * mirror)),
+                scale3(camera.up, -2.0),
+            ),
+            add3(
+                add3(center, scale3(camera.right, 2.0 * mirror)),
+                scale3(camera.up, -2.0),
+            ),
+            add3(center, scale3(camera.up, 2.0)),
+        ]
+    }
+
+    fn projected_vulkan_area(camera: PreviewCameraFrame, triangle: [[f32; 3]; 3]) -> f32 {
+        let screen = triangle.map(|point| {
+            let clip =
+                row_vector_transform([point[0], point[1], point[2], 1.0], camera.clip_from_world);
+            assert!(clip[3] > 0.0 && clip.iter().all(|value| value.is_finite()));
+            // This is the positive-height viewport transform used by the Vulkan renderer.
+            [
+                (clip[0] / clip[3] + 1.0) * 0.5,
+                (clip[1] / clip[3] + 1.0) * 0.5,
+            ]
+        });
+        let shoelace = (0..3)
+            .map(|index| {
+                let next = (index + 1) % 3;
+                screen[index][0] * screen[next][1] - screen[next][0] * screen[index][1]
+            })
+            .sum::<f32>()
+            * 0.5;
+        // Vulkan's framebuffer signed-area definition is the negative shoelace area.
+        -shoelace
+    }
+
+    #[test]
+    fn native_msh_cull_mode_matches_legacy_and_free_flight_camera_projection() {
+        let identity = RawCameraTransform {
+            words: [
+                1.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                1.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                1.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                1.0_f32.to_bits(),
+            ],
+        };
+        let projection = LegacyD3d7Projection {
+            viewport: [0, 0, 1280, 1024],
+            near_plane: 0.5,
+            far_plane: 700.0,
+            field_of_view_radians: 1.3,
+        };
+        let legacy = PreviewCameraFrame::from_legacy_d3d7(identity, projection)
+            .expect("valid legacy camera projection");
+        let free_flight = FreeFlightCamera {
+            position: legacy.position,
+            yaw: 0.0,
+            pitch: 0.0,
+            horizontal_fov: 1.3,
+            near_plane: 0.5,
+            far_plane: 700.0,
+            move_speed: 1.0,
+        }
+        .preview_frame(1280.0 / 1024.0);
+
+        for camera in [legacy, free_flight] {
+            let front = camera_face_triangle(camera, false);
+            let back = [front[0], front[2], front[1]];
+            let front_d = dot3(
+                sub3(camera.position, front[0]),
+                cross3(sub3(front[1], front[0]), sub3(front[2], front[0])),
+            );
+            let back_d = dot3(
+                sub3(camera.position, back[0]),
+                cross3(sub3(back[1], back[0]), sub3(back[2], back[0])),
+            );
+            assert!(front_d > 0.0);
+            assert!(back_d < 0.0);
+
+            let front_vk_area = projected_vulkan_area(camera, front);
+            let back_vk_area = projected_vulkan_area(camera, back);
+            // Vulkan CLOCKWISE front faces have negative framebuffer area.
+            // The native-visible d>0 face is therefore a Vulkan back face.
+            assert!(front_vk_area > 0.0, "front area: {front_vk_area}");
+            assert!(back_vk_area < 0.0, "back area: {back_vk_area}");
+            assert_eq!(native_msh_cull_mode(0, 1), LegacyCullMode::FrontFace);
+
+            let mirrored_front = camera_face_triangle(camera, true);
+            let mirrored_d = dot3(
+                sub3(camera.position, mirrored_front[0]),
+                cross3(
+                    sub3(mirrored_front[1], mirrored_front[0]),
+                    sub3(mirrored_front[2], mirrored_front[0]),
+                ),
+            );
+            assert!(mirrored_d < 0.0);
+            assert!(projected_vulkan_area(camera, mirrored_front) < 0.0);
+            assert_eq!(native_msh_cull_mode(0, -1), LegacyCullMode::BackFace);
+        }
+    }
+
+    #[test]
+    fn native_msh_handedness_uses_full_placement_transform_and_handles_singular_scale() {
+        let rotated = LegacyIron3dEulerTransform {
+            translation: [8.0, -4.0, 3.0],
+            orientation_radians: [0.4, -0.7, 1.2],
+        };
+        assert_eq!(native_msh_handedness(rotated, [2.0, 3.0, 4.0]), 1);
+        assert_eq!(native_msh_handedness(rotated, [-2.0, 3.0, 4.0]), -1);
+        assert_eq!(native_msh_handedness(rotated, [0.0, 3.0, 4.0]), 0);
+        assert_eq!(native_msh_cull_mode(0, 0), LegacyCullMode::Disabled);
+    }
+
+    #[test]
+    fn native_msh_4000_samples_only_first_triangle_and_raw_two_sided_bypasses_it() {
+        let front = native_front_triangle();
+        let back = front.map(|point| [-point[0], point[1], point[2]]);
+        let front_then_back = [front[0], front[1], front[2], back[0], back[1], back[2]];
+        let (mesh, range) = facing_mesh(0x4000, &front_then_back);
+        assert!(native_msh_first_triangle_visible(
+            &mesh, &range, [0.0; 3], 1
+        ));
+
+        let back_then_front = [back[0], back[1], back[2], front[0], front[1], front[2]];
+        let (mesh, range) = facing_mesh(0x4000, &back_then_front);
+        assert!(!native_msh_first_triangle_visible(
+            &mesh, &range, [0.0; 3], 1
+        ));
+
+        let (mesh, range) = facing_mesh(0x4002, &back_then_front);
+        assert!(native_msh_first_triangle_visible(
+            &mesh, &range, [0.0; 3], 1
+        ));
+        assert_eq!(
+            native_msh_cull_mode(range.batch_flags, 1),
+            LegacyCullMode::Disabled
+        );
+    }
+
+    #[test]
+    fn world_draw_range_count_restores_after_alpha_and_msh_facing_changes() {
+        let triangle = native_front_triangle();
+        let (mesh, range) = facing_mesh(0x4000, &triangle);
+        let original_count = range.index_count;
+
+        assert_eq!(
+            world_draw_range_index_count(&mesh, &range, original_count, 0.0, [0.0; 3], Some(1)),
+            0
+        );
+        assert_eq!(
+            world_draw_range_index_count(
+                &mesh,
+                &range,
+                original_count,
+                1.0,
+                [0.0, 0.0, -2.0],
+                Some(1),
+            ),
+            0
+        );
+        assert_eq!(
+            world_draw_range_index_count(&mesh, &range, original_count, 1.0, [0.0; 3], Some(1)),
+            original_count
+        );
+        assert_eq!(
+            world_draw_range_index_count(
+                &mesh,
+                &range,
+                original_count,
+                1.0,
+                [0.0, 0.0, -2.0],
+                None,
+            ),
+            original_count
+        );
     }
 }
