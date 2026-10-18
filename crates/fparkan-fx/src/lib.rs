@@ -6,6 +6,7 @@
 //! reference stub until opcode timing, gates, RNG, and command-body semantics
 //! are backed by runtime-captured evidence.
 
+pub mod ambient_op3;
 pub mod atmosphere;
 pub mod environment;
 pub mod fx_visual;

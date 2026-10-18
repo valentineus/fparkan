@@ -255,6 +255,16 @@ global RNG остаются задачей владельца. `fparkan-game` п
 категорию 0 с наибольшей детализацией; выбор категории по projected size ещё
 не реализован.
 
+Для Op3 поддерживаются body-типы 0, 1 и 2. Поля отсчитываются от
+`FxCommand.raw_body`, то есть после 4-байтового command word. Типы 0 и 1
+используют общие position/scale/phase/opacity tracks и camera-facing основу;
+тип 1 и тип 2 также интерполируют ось, а тип 2 строит basis через native
+D110-порядок. Все три evaluator-а принимают уже собранную матрицу владельца и
+не выбирают Control row или attachment. Текущий путь для типов 0 и 1
+предполагает native render context 0: `Effect.dll` проверяет общий gate
+`context + 0x60 < 8`, а API этих evaluator-ов не выбирает другой context.
+Evaluator типа 2 принимает индекс context явно и учитывает этот gate в `active`.
+
 ## Что остаётся за владельцем
 
 `EnvironmentSystem` не извлекает камеру из renderer, не разрешает материалы
