@@ -3599,7 +3599,7 @@ fn control_i32_at(payload: &[u8], offset: usize) -> Option<i32> {
     ))
 }
 
-const CONTROL_TYPED_COMMON_PARSER_TAGS: &[u32] = &[1, 8, 9, 12, 13, 15, 19, 21, 25, 26];
+const CONTROL_TYPED_COMMON_PARSER_TAGS: &[u32] = &[1, 2, 5, 8, 9, 12, 13, 15, 19, 21, 25, 26];
 const CONTROL_TYPED_RECORD_FIXED_BYTES: usize = 0xB0;
 const CONTROL_TYPED_RECORD_COUNT_OFFSET: usize = 0xAC;
 const CONTROL_TYPED_RECORD_LIMIT: usize = 4096;
@@ -4297,32 +4297,30 @@ mod tests {
     }
 
     #[test]
-    fn component_control_unproven_effect_tags_preserve_node_bindings() {
+    fn component_control_unknown_effect_tag_preserves_node_bindings() {
         let source = ResourceKey {
             archive: parse_path("controls.rlb").expect("archive"),
             name: resource_name(b"parts.ctl"),
             type_id: None,
         };
-        for tag in [2_u32, 5, 0xDEAD_BEEF] {
-            let mut payload = component_control_payload(&[(1, 0.0, 1.0, 0.25, 0)]);
-            payload[12..16].copy_from_slice(&1_u32.to_le_bytes());
-            payload[16..20].copy_from_slice(&1_u32.to_le_bytes());
-            payload.extend_from_slice(&tag.to_le_bytes());
+        let mut payload = component_control_payload(&[(1, 0.0, 1.0, 0.25, 0)]);
+        payload[12..16].copy_from_slice(&1_u32.to_le_bytes());
+        payload[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        payload.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
 
-            let control = decode_component_control_payload(&payload, source.clone(), 2, 3)
-                .expect("unproven tag is preserved as unsupported");
+        let control = decode_component_control_payload(&payload, source.clone(), 2, 3)
+            .expect("unknown tag is retained");
 
-            assert_eq!(control.bindings.len(), 1);
-            assert_eq!(control.bindings[0].node_index, 1);
-            assert_eq!(control.bindings[0].frame_b, 1.0);
-            assert_eq!(
-                control.effect_section,
-                PreparedControlEffectSection::Unsupported {
-                    typed_record_index: Some(0),
-                    typed_record_tag: Some(tag),
-                }
-            );
-        }
+        assert_eq!(control.bindings.len(), 1);
+        assert_eq!(control.bindings[0].node_index, 1);
+        assert_eq!(control.bindings[0].frame_b, 1.0);
+        assert_eq!(
+            control.effect_section,
+            PreparedControlEffectSection::Unsupported {
+                typed_record_index: Some(0),
+                typed_record_tag: Some(0xDEAD_BEEF),
+            }
+        );
     }
 
     #[test]
@@ -4344,6 +4342,39 @@ mod tests {
             .expect("zero-length record has no trailing string byte");
 
         assert_eq!(control.bindings.len(), 1);
+        assert_eq!(
+            control.effect_section,
+            PreparedControlEffectSection::Parsed(Vec::new())
+        );
+    }
+
+    #[test]
+    fn component_control_tags2_and5_share_the_typed_cursor_parser() {
+        let source = ResourceKey {
+            archive: parse_path("controls.rlb").expect("archive"),
+            name: resource_name(b"parts.ctl"),
+            type_id: None,
+        };
+        let mut payload = component_control_payload(&[(1, 0.0, 1.0, 0.25, 0)]);
+        payload[12..16].copy_from_slice(&3_u32.to_le_bytes());
+        append_typed_record(&mut payload, 2, 0);
+        append_typed_record(&mut payload, 5, 2);
+        payload.extend_from_slice(b"fx\0");
+        append_typed_record(&mut payload, 21, 0);
+
+        let control = decode_component_control_payload(&payload, source, 2, 0)
+            .expect("tags 2 and 5 share the native typed cursor parser");
+
+        assert_eq!(
+            control
+                .typed_records
+                .iter()
+                .map(|record| record.tag)
+                .collect::<Vec<_>>(),
+            [2, 5, 21],
+            "tag 21 must begin at the cursor returned after tag 5's string"
+        );
+        assert_eq!(control.typed_records[1].string_bytes, b"fx");
         assert_eq!(
             control.effect_section,
             PreparedControlEffectSection::Parsed(Vec::new())
