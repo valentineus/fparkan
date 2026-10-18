@@ -625,15 +625,20 @@ Lightmap не является обычной diffuse texture. WEAR содерж
 отдельным slot или texture stage. Замена lightmap предварительным умножением в
 diffuse texture ломает LOD, atlas coordinates и динамическую модуляцию.
 
-Vulkan preview строит projected shadows для выбранных зданий и роботов,
-отбрасывает spheres вне шести clip-плоскостей с радиусом `sphere + 100` и
+Vulkan preview строит проецируемые тени для объектов, отбрасывающих тени,
+отбрасывает сферы вне шести clip-плоскостей с радиусом `sphere + 100` и
 сохраняет порядок видимых кандидатов; frame builder обрабатывает не более 20
-casters. Текущая реализация выделяет страницы в atlas `256 x 256` с 28 page
-slots и использует одну smoothing pass. Вызов preview передаёт `fade = 1.0` и
-LOD defaults: minimum LOD `1` и detail multiplier `1.0` отдельно для зданий и
-роботов. Rust-путь не загружает `shade.cfg`: эти значения задаются кодом, а
-параметры файла пока не влияют на preview. Проекция учитывает вклад
-directional и point lights.
+объектов. Текущая реализация выделяет страницы в atlas `256 x 256` с 28 page
+slots и использует одно сглаживание. Preview применяет native defaults
+`RobShadowsOn = true` и `BldShadowsOn = false`: объект kind `4` проверяет
+первый флаг, остальные kinds — второй. Поэтому роботы BTLU остаются объектами,
+отбрасывающими тени, а объекты FORT и STAT их не создают. Preview пока не
+загружает `shade.cfg`, поэтому значения из пользовательского файла не меняют
+список объектов, отбрасывающих тени. Проверка действует только на проецируемые
+тени: отдельный список объектов для затенения солнца по-прежнему включает
+FORT, BTLU и STAT. Вызов preview передаёт `fade = 1.0` и LOD defaults:
+minimum LOD `1` и detail multiplier `1.0` отдельно для зданий и роботов.
+Проекция учитывает вклад directional и point lights.
 
 Receiver projection обрезает projected quad по рёбрам треугольника. Native ray
 query descriptor в `+0x10` требует наличия всех переданных bits, а descriptor

@@ -3841,6 +3841,11 @@ const PROTOTYPE_TYPE_FORT: u32 = u32::from_le_bytes(*b"FORT");
 const PROTOTYPE_TYPE_BTLU: u32 = u32::from_le_bytes(*b"BTLU");
 const PROTOTYPE_TYPE_STAT: u32 = u32::from_le_bytes(*b"STAT");
 
+// shortcut: the preview does not load shade.cfg yet, so use CShade's native
+// defaults until the settings loader is implemented.
+const NATIVE_DEFAULT_ROB_SHADOWS_ON: bool = true;
+const NATIVE_DEFAULT_BLD_SHADOWS_ON: bool = false;
+
 /// Maps the resolved registry type to the native object-kind selector used by
 /// CSun/CShade.  The mission object's raw kind is an unrelated TMA field; the
 /// renderer receives the registry provenance from the prepared visual.
@@ -3850,6 +3855,14 @@ fn native_shadow_kind(source_type: Option<u32>) -> Option<u32> {
         Some(PROTOTYPE_TYPE_BTLU) => Some(4),
         Some(PROTOTYPE_TYPE_STAT) => Some(10),
         _ => None,
+    }
+}
+
+fn native_shadow_caster_enabled(native_kind: u32) -> bool {
+    if native_kind == 4 {
+        NATIVE_DEFAULT_ROB_SHADOWS_ON
+    } else {
+        NATIVE_DEFAULT_BLD_SHADOWS_ON
     }
 }
 
@@ -4288,7 +4301,9 @@ fn static_preview_mesh_and_materials(
                 mesh_components += 1;
             }
         }
-        if let Some(native_kind) = root_native_kind {
+        if let Some(native_kind) =
+            root_native_kind.filter(|kind| native_shadow_caster_enabled(*kind))
+        {
             let caster_id = u32::try_from(shadow_casters.len())
                 .map_err(|_| "shadow caster id exceeds u32".to_string())?;
             if let Some(caster) = aggregate_shadow_caster(
@@ -6439,10 +6454,13 @@ mod tests {
     }
 
     #[test]
-    fn native_sun_object_source_types_map_to_world_kinds() {
+    fn native_shadow_kind_mapping_keeps_sun_eligibility_separate_from_caster_defaults() {
         assert_eq!(native_shadow_kind(Some(PROTOTYPE_TYPE_FORT)), Some(3));
         assert_eq!(native_shadow_kind(Some(PROTOTYPE_TYPE_BTLU)), Some(4));
         assert_eq!(native_shadow_kind(Some(PROTOTYPE_TYPE_STAT)), Some(10));
+        assert!(!native_shadow_caster_enabled(3));
+        assert!(native_shadow_caster_enabled(4));
+        assert!(!native_shadow_caster_enabled(10));
         assert!(native_sun_object_kind_eligible(Some(PROTOTYPE_TYPE_FORT)));
         assert!(native_sun_object_kind_eligible(Some(PROTOTYPE_TYPE_BTLU)));
         assert!(native_sun_object_kind_eligible(Some(PROTOTYPE_TYPE_STAT)));
