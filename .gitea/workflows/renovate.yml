@@ -5,7 +5,7 @@ on:
     - cron: "@daily"
   push:
     branches:
-      - trunk
+      - master
 
 jobs:
   renovate:
@@ -15,10 +15,14 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+
       - name: Run renovate
-        run: renovate
+        run: |
+          renovate
         env:
-          RENOVATE_GITHUB_COM_TOKEN: ${{ secrets.RENOVATE_GITHUB_TOKEN }}
+          GITHUB_COM_TOKEN: ${{ secrets.RENOVATE_GITHUB_TOKEN }}
+          LOG_LEVEL: ${{ vars.RENOVATE_LOG_LEVEL }}
           RENOVATE_CONFIG_FILE: renovate.config.cjs
+          RENOVATE_LOG_LEVEL: ${{ vars.RENOVATE_LOG_LEVEL }}
           RENOVATE_REPOSITORIES: ${{ gitea.repository }}
           RENOVATE_TOKEN: ${{ secrets.RENOVATE_TOKEN }}

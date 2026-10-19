@@ -1,0 +1,30 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":disableDependencyDashboard"
+  ],
+  "assignees": [
+    "valentineus"
+  ],
+  "labels": [
+    "dependencies",
+    "automated"
+  ],
+  "packageRules": [
+    {
+      "groupName": "all digest updates",
+      "groupSlug": "all-digest",
+      "matchUpdateTypes": [
+        "minor",
+        "patch",
+        "pin",
+        "digest"
+      ],
+      "matchPackageNames": [
+        "*"
+      ],
+      "automerge": true
+    }
+  ]
+}
