@@ -186,14 +186,25 @@ unsupported result, а не «примерный» game command.
 
 Во всех 58 GOG `.scr` имеются 6 087 instruction records, включая 3 992
 sentinel. Самый частый non-sentinel selector — `Handler(30)`, 246 records.
-Его VA `0x1000c266` читает первые два reference words активной instruction,
-разрешает каждый через varset (`0x10002d30` и `0x10013570`) и вызывает внешний
-callback с тремя `u32`: `(0, first, second)`. Callback не принадлежит `ai.dll`: его
-кладёт десятый argument экспортного `CreateSuperAI`. Тот же callback встречен
-у `Handler(57)` с первым word `2` и у отдельного lifecycle path с первым word
-`1`; предметная семантика этих modes ещё не доказана. В частности, это пока
-не основание назвать Handler(30) сообщением, приказом или UI opcode. Точный
-text-to-varset resolver расположен за wrapper `0x10011ea0` в
+Его VA `0x1000c266` читает первые два слова-ссылки активной инструкции,
+разрешает каждое через varset (`0x10002d30` и `0x10013570`) и вызывает внешний
+обратный вызов с тремя `u32`: `(0, first, second)`. Он не принадлежит `ai.dll`:
+указатель из десятого аргумента сохраняет экспорт `CreateSuperAI`. В
+проверенном GOG AutoDemo он указывает на `iron3d.dll` RVA `0x611d0` (SHA-256
+`d1dc4ea8535e2069b0a05c9e8be2724dd438ba44cca7a83007d8b2e50f9e35fa`).
+Вызываемая функция использует ABI `__cdecl(mode, command, payload)`. При
+`mode == 0`, `command == 0` аргумент `payload` со значением `0` выбирает ветвь
+отказа, а `1` — ветвь завершения миссии; обе срабатывают только при условиях,
+описанных ниже. Среда выполнения Rust может
+записать соответствующее целевое состояние в собственный
+`MissionScriptOutcome`, но не проверяет эти условия и пока не исполняет
+команду из диспетчера `.scr`.
+`Handler(57)` передаёт тому же обратному вызову режим `2`, для которого в
+вызываемой функции есть отдельная ветвь IGame; отдельный путь жизненного цикла
+передаёт режим `1`, но ветви для него в `FUN_100611d0` не найдено. По одному
+вызову нельзя присвоить общее игровое имя остальным командам или называть весь
+`Handler(30)` сообщением, приказом либо кодом интерфейса. Преобразователь
+текстовых ссылок в varset находится за обёрткой `0x10011ea0`, в
 `0x100174a0`.
 
 `0x100174a0` добавляет каждый
@@ -325,45 +336,54 @@ and rejects missing, out-of-range, or non-`DWORD` targets. The runtime only
 binds it to the proven creation/anchor path above; it does not guess the
 remaining script event semantics.
 
-### Runtime Handler(30) operand binding
+### Аргументы и обратный вызов Handler(30)
 
-`resolve_handler30_with_values` preserves the recovered declaration-kind ABI
-but reads operands from instantiated per-clan cells rather than textual
-defaults. Runtime exposes `resolve_loaded_handler30` for the exact opaque
-`(mode=0, first, second)` callback command. It intentionally returns that
-command without automatically invoking a game-side consumer: only one
-consumer branch has a safe Rust meaning so far.
+`resolve_handler30_with_values` сохраняет восстановленное ABI типов объявлений,
+но читает аргументы из экземпляра ячеек varset конкретного клана, а не из
+текстовых значений по умолчанию. `resolve_loaded_handler30` возвращает точную
+команду обратного вызова `(mode=0, first, second)`, не приписывая ей
+дополнительный смысл. Отдельная функция `apply_loaded_script_host_callback`
+отображает в Rust состояние исхода только `(0, 0, payload=0|1)`; она не
+выбирает событие `.scr` и не исполняет ветвь оригинальной игры.
 
-The live GOG AutoDemo closes that consumer boundary: the read-only callback
-pointer at `ai.dll + 0x555e4` is `0x100611d0`, or `iron3d.dll + 0x611d0` at
-the observed load base. Its recovered `__cdecl` ABI is `(mode, command,
-payload)`, matching `Handler(30)` as `(0, first, second)`. In `mode == 0`,
-`command == 0` and `payload == 0` selects `VOICE_MISSION_FAIL`, records the
-failed status, and clears an IGame byte; `payload == 1` selects
-`VOICE_MISSION_COMPLETE`, records completion, and sets that byte. Commands
-3, 4, and 5 have additional game-side paths; mode 2 is a separate IGame
-call.
+Снимок работающей GOG AutoDemo определяет обратный вызов: прочитанный без записи
+указатель по `ai.dll + 0x555e4` равен `0x100611d0`, то есть `iron3d.dll +
+0x611d0` при наблюдавшейся базе загрузки. Восстановленное ABI вызываемой
+функции — `__cdecl(mode, command, payload)`; `Handler(30)` передаёт те же поля как
+`(0, first, second)`. В режиме `mode == 0` команда `command == 0` выполняется,
+только если контрольный байт по `IGame + 0xe5` равен нулю. Ветвь отказа при
+значении аргумента `payload`, равном `0`, срабатывает лишь когда слово по
+`IGame + 8` не равно `1`: игра запускает
+`VOICE_MISSION_FAIL`, записывает `1` в это слово и обнуляет байт по
+`*(IGame + 4) + 0x157`. Ветвь завершения при `payload`, равном `1`, срабатывает
+лишь когда слово не равно `0`: игра запускает `VOICE_MISSION_COMPLETE`, записывает
+`0` в слово и устанавливает байт в `1`. Команды 3, 4 и 5 ведут к другим
+ветвям игры; режим `2` выполняет отдельный вызов IGame, а ветви для режима `1`
+в этой функции нет.
 
-`command == 1` is now statically traced, but still has no justified domain
-name. Its payload is a signed integer key for a binary-search tree: the
-receiver's `+0x04` is the sentinel/root, each node has child links at `+0x08`
-and `+0x0c`, a key at `+0x10`, and a dispatched payload at `+0x14`. A matching
-node reaches `FUN_10095600(node + 0x14)`. That payload has one-shot flag
-`+0x19` and a second flag `+0x18`. On its first dispatch, Iron3D sets `+0x19`,
-obtains a resource-manager string through virtual slot `+0x1c`, and passes the
-payload's `+0x0c` through `FUN_10061fb0`. On later dispatches it uses
-resource-manager IDs `0x181a` and `0x184f`, an IGame selector `0x2ed`, and
-emits an opaque request with category `3` or `4` selected by `+0x18`. This
-proves the lookup and one-shot/repeat split, not the UI/message subject or the
-semantics of either resource ID; Rust therefore retains command `1` as
-`Unhandled`.
+Статический анализ восстановил также `command == 1`, но не дал основания
+присвоить этой ветви предметное имя. Её аргумент `payload` — знаковый ключ
+бинарного дерева поиска. Поле `+0x04` у получателя указывает на корневой
+сторожевой узел; в каждом узле ссылки на дочерние узлы лежат по `+0x08` и
+`+0x0c`, ключ — по `+0x10`, а передаваемый дальше аргумент — по `+0x14`. При
+совпадении ключа вызывается `FUN_10095600(node + 0x14)`. У этого объекта есть
+одноразовый флаг `+0x19` и второй флаг `+0x18`. При первом вызове Iron3D
+устанавливает `+0x19`, получает строку из менеджера ресурсов через виртуальный
+слот `+0x1c` и передаёт значение `+0x0c` объекта-аргумента в `FUN_10061fb0`.
+При повторных вызовах используются идентификаторы менеджера ресурсов `0x181a`
+и `0x184f`, селектор IGame `0x2ed` и непрозрачный запрос с категорией `3` или
+`4`, выбираемой по `+0x18`. Это подтверждает поиск и различие первого и
+повторных вызовов, но не назначение сообщения интерфейса или смысл этих
+идентификаторов; в Rust команда `1` поэтому остаётся `Unhandled`.
 
-Runtime applies only this branch as
-`apply_loaded_script_host_callback`: `(0, 0, 0)` transitions a loaded mission
-to `Failed`, `(0, 0, 1)` transitions it to `Completed`, and a repeated target
-state is a no-op just as the Iron3D guards require. The effect is deliberately
-separate from audio/UI playback; commands 1, 3, 4, 5 and mode 2 return
-`Unhandled` until their consumers are recovered.
+Сейчас `apply_loaded_script_host_callback` отображает `(0, 0, 0)` в локальное
+состояние `Failed`, `(0, 0, 1)` — в `Completed`, а повтор уже записанного
+состояния возвращает `NoChange`. Эта дедупликация относится только к модели
+Rust и не заменяет проверки Iron3D: в Rust нет ни байта блокировки
+`IGame + 0xe5`, ни слова состояния `IGame + 8`. Значение `Active` назначается
+при загрузке миссии, но его соответствие исходному состоянию игры пока не
+подтверждено. Команды 1, 3, 4, 5 и режим 2 остаются `Unhandled` в этом
+обработчике исхода.
 
 ### Handler(8): problem-record state write
 

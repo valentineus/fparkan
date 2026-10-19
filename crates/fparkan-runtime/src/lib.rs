@@ -197,28 +197,28 @@ pub struct MissionScriptVarSetState {
     pub values: Vec<VarSetDefault>,
 }
 
-/// Recovered mission outcome controlled by the `Iron3D` script host callback.
+/// Rust-side outcome selected by the recovered `Iron3D` host-callback mapper.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MissionScriptOutcome {
-    /// No recovered callback has ended the mission.
+    /// No outcome has been recorded in the Rust model.
     #[default]
     Active,
-    /// `Handler(30)` reached the proven mission-complete callback branch.
+    /// Rust outcome corresponding to completion payload `1`.
     Completed,
-    /// `Handler(30)` reached the proven mission-fail callback branch.
+    /// Rust outcome corresponding to failure payload `0`.
     Failed,
 }
 
 /// Result of applying one recovered script host callback command.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MissionScriptHostEffect {
-    /// The callback did not match a currently recovered host branch.
+    /// The input did not match a currently modeled command.
     Unhandled,
-    /// A previously active or failed mission became completed.
+    /// The Rust outcome changed to completed.
     MissionCompleted,
-    /// A previously active or completed mission became failed.
+    /// The Rust outcome changed to failed.
     MissionFailed,
-    /// The recovered target state was already current, so `Iron3D` has no state transition.
+    /// The Rust outcome already held this target state.
     NoChange,
 }
 
@@ -997,8 +997,8 @@ pub fn loaded_mission_script_varset_states(engine: &Engine) -> Option<&[MissionS
 ///
 /// Unlike the loader-only resolver, operands are read from the selected
 /// clan's instantiated varset cells. Dispatching the returned host callback
-/// remains outside this function because its game-side consumer is not yet
-/// recovered.
+/// remains separate from this function; the Rust outcome mapper does not model
+/// the native `IGame` guards or initial status word.
 ///
 /// # Errors
 ///
@@ -1040,12 +1040,13 @@ pub fn loaded_mission_script_outcome(engine: &Engine) -> Option<MissionScriptOut
     engine.loaded.as_ref().map(|state| state.script_outcome)
 }
 
-/// Applies the recovered `Iron3D` host-callback mission branch.
+/// Records the recovered `Iron3D` host-callback target in the Rust outcome.
 ///
-/// Only `(mode=0, command=0, payload=0|1)` has a proven independent meaning:
-/// payload zero marks failure and payload one marks completion. Other callback
-/// commands are retained as [`MissionScriptHostEffect::Unhandled`] until their
-/// `Iron3D` consumer branches are recovered.
+/// `(mode=0, command=0, payload=0|1)` maps payload zero to failure and one to
+/// completion. Iron3D also checks the gate byte at `IGame + 0xe5` and the
+/// status word at `IGame + 8`; those native guards and the initial status are
+/// not represented here. Other callback commands return
+/// [`MissionScriptHostEffect::Unhandled`].
 ///
 /// # Errors
 ///
