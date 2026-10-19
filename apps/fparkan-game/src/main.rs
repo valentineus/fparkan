@@ -739,7 +739,6 @@ impl MaterialPhaseBinding {
 struct MaterialVariantSet {
     phase_material_indices: Vec<usize>,
     range_indices: Vec<usize>,
-    pipeline_category: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -753,7 +752,7 @@ struct MaterialAnimationBinding {
     stage_textures: Option<MaterialStageTextures>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct ActiveMaterialState {
     material_index: usize,
     diffuse_alpha: f32,
@@ -772,19 +771,51 @@ fn selected_material_phase(
     Ok((material_index, pipeline_category))
 }
 
-fn update_material_animations(
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MaterialRangeSelection {
+    range_index: usize,
+    material_index: usize,
+    pipeline_category: u8,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MaterialPropertiesUpdate {
+    material_index: usize,
+    diffuse_alpha: f32,
+    overlay_alpha: f32,
+    base_directional: [f32; 3],
+    base_additive: [f32; 3],
+    overlay_directional: Option<[f32; 3]>,
+    overlay_additive: Option<[f32; 3]>,
+    specular_rgb: [f32; 3],
+    specular_power: u8,
+    overlay_specular_rgb: Option<[f32; 3]>,
+    overlay_power: Option<u8>,
+    uv_transforms: [[f32; 4]; 4],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct MaterialStagePhaseUpdate {
+    binding_index: usize,
+    material_index: usize,
+    phases: [usize; 3],
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct MaterialFrameUpdate {
+    active_materials: HashMap<usize, ActiveMaterialState>,
+    range_selections: Vec<MaterialRangeSelection>,
+    properties: Vec<MaterialPropertiesUpdate>,
+    stage_phases: Vec<MaterialStagePhaseUpdate>,
+}
+
+fn sample_material_animations(
     bindings: &mut [MaterialAnimationBinding],
     materials: &[VulkanStaticMaterial],
-    renderer: &mut VulkanSmokeRenderer,
     clock_ms: u32,
-) -> Result<HashMap<usize, ActiveMaterialState>, String> {
-    // Keep the resolved selector beside the draw range for this frame.  The
-    // renderer's material arrays are keyed by selector, so any later
-    // environment pass that writes alpha or lighting must target the phase
-    // variant selected above rather than the material that happened to be
-    // active when the range was allocated.
-    let mut active_materials = HashMap::new();
-    for binding in bindings {
+) -> Result<MaterialFrameUpdate, String> {
+    let mut update = MaterialFrameUpdate::default();
+    for (binding_index, binding) in bindings.iter_mut().enumerate() {
         let base_sample = binding.base.sample(binding.initial_phase_index, clock_ms)?;
         let detail_sample = binding
             .detail
@@ -802,7 +833,7 @@ fn update_material_animations(
             .map(|overlay_detail| overlay_detail.sample(binding.initial_phase_index, clock_ms))
             .transpose()?;
         let mut updated_materials = HashSet::new();
-        for variant in &mut binding.variants {
+        for variant in &binding.variants {
             let (material_index, pipeline_category) =
                 selected_material_phase(variant, base_sample.phase_index, |index| {
                     materials
@@ -810,25 +841,19 @@ fn update_material_animations(
                         .map(|material| material.pipeline_category)
                 })?;
             for &range_index in &variant.range_indices {
-                active_materials.insert(
+                update.active_materials.insert(
                     range_index,
                     ActiveMaterialState {
                         material_index,
                         diffuse_alpha: base_sample.coefficients.opacity,
                     },
                 );
-                renderer
-                    .set_draw_range_material(range_index, material_index)
-                    .map_err(|error| format!("update MAT0 material draw selector: {error}"))?;
-                if variant.pipeline_category != pipeline_category {
-                    renderer
-                        .set_draw_range_material_category(range_index, pipeline_category)
-                        .map_err(|error| {
-                            format!("update MAT0 material pipeline category: {error}")
-                        })?;
-                }
+                update.range_selections.push(MaterialRangeSelection {
+                    range_index,
+                    material_index,
+                    pipeline_category,
+                });
             }
-            variant.pipeline_category = pipeline_category;
             if !updated_materials.insert(material_index) {
                 continue;
             }
@@ -852,87 +877,16 @@ fn update_material_animations(
                         overlay_coefficients.map(|coefficients| coefficients.additive_rgb),
                     )
                 };
-            renderer
-                .set_material_alphas(
+            if !material.lightmap_mode && binding.stage_textures.is_some() {
+                update.stage_phases.push(MaterialStagePhaseUpdate {
+                    binding_index,
                     material_index,
-                    base_coefficients.opacity.clamp(0.0, 1.0),
-                    overlay_coefficients
-                        .map_or(0.0, |coefficients| coefficients.opacity.clamp(0.0, 1.0)),
-                )
-                .map_err(|error| format!("update MAT0 material alpha: {error}"))?;
-            renderer
-                .set_material_lighting_with_overlay(
-                    material_index,
-                    base_directional,
-                    base_additive,
-                    overlay_directional,
-                    overlay_additive,
-                )
-                .map_err(|error| format!("update MAT0 material lighting: {error}"))?;
-            renderer
-                .set_material_specular(
-                    material_index,
-                    base_coefficients.specular_rgb,
-                    base_coefficients.power,
-                    overlay_coefficients.map(|coefficients| coefficients.specular_rgb),
-                    overlay_coefficients.map(|coefficients| coefficients.power),
-                )
-                .map_err(|error| format!("update MAT0 material specular: {error}"))?;
-
-            // Detail and overlay textures have independent MAT0 phase
-            // selectors.  Their descriptor images are updated only when a
-            // selected base material sees a new stage tuple; this keeps the
-            // steady-state frame path from idling Vulkan for every draw.
-            if !material.lightmap_mode {
-                if let Some(stage_textures) = binding.stage_textures.as_mut() {
-                    let stage_phases = [
+                    phases: [
                         detail_sample.map_or(0, |sample| sample.phase_index),
                         overlay_sample.map_or(0, |sample| sample.phase_index),
                         overlay_detail_sample.map_or(0, |sample| sample.phase_index),
-                    ];
-                    if stage_textures
-                        .applied_material_phases
-                        .get(&material_index)
-                        .copied()
-                        != Some(stage_phases)
-                    {
-                        let detail_texture = stage_textures
-                            .detail
-                            .as_ref()
-                            .and_then(|textures| textures.get(stage_phases[0]))
-                            .cloned();
-                        let overlay_texture = stage_textures
-                            .overlay
-                            .as_ref()
-                            .and_then(|textures| textures.get(stage_phases[1]))
-                            .cloned();
-                        let overlay_detail_texture = stage_textures
-                            .overlay_detail
-                            .as_ref()
-                            .and_then(|textures| textures.get(stage_phases[2]))
-                            .cloned();
-                        if let Some(texture) = detail_texture.as_ref() {
-                            renderer
-                                .update_material_texture(material_index, 1, texture)
-                                .map_err(|error| format!("update MAT0 detail texture: {error}"))?;
-                        }
-                        if let Some(texture) = overlay_texture.as_ref() {
-                            renderer
-                                .update_material_texture(material_index, 2, texture)
-                                .map_err(|error| format!("update MAT0 overlay texture: {error}"))?;
-                        }
-                        if let Some(texture) = overlay_detail_texture.as_ref() {
-                            renderer
-                                .update_material_texture(material_index, 3, texture)
-                                .map_err(|error| {
-                                    format!("update MAT0 overlay detail texture: {error}")
-                                })?;
-                        }
-                        stage_textures
-                            .applied_material_phases
-                            .insert(material_index, stage_phases);
-                    }
-                }
+                    ],
+                });
             }
             let overlay_uv = overlay_sample
                 .map(|sample| {
@@ -980,15 +934,113 @@ fn update_material_animations(
             let base_uv = binding
                 .base
                 .checked_page_uv_transform(base_sample.phase_index)?;
-            renderer
-                .set_material_uv_transforms(
-                    material_index,
-                    [base_uv, detail_uv, overlay_uv, overlay_detail_uv],
-                )
-                .map_err(|error| format!("update MAT0 material Page transform: {error}"))?;
+            update.properties.push(MaterialPropertiesUpdate {
+                material_index,
+                diffuse_alpha: base_coefficients.opacity.clamp(0.0, 1.0),
+                overlay_alpha: overlay_coefficients
+                    .map_or(0.0, |coefficients| coefficients.opacity.clamp(0.0, 1.0)),
+                base_directional,
+                base_additive,
+                overlay_directional,
+                overlay_additive,
+                specular_rgb: base_coefficients.specular_rgb,
+                specular_power: base_coefficients.power,
+                overlay_specular_rgb: overlay_coefficients
+                    .map(|coefficients| coefficients.specular_rgb),
+                overlay_power: overlay_coefficients.map(|coefficients| coefficients.power),
+                uv_transforms: [base_uv, detail_uv, overlay_uv, overlay_detail_uv],
+            });
         }
     }
-    Ok(active_materials)
+    Ok(update)
+}
+
+fn apply_material_frame_update(
+    update: &MaterialFrameUpdate,
+    bindings: &mut [MaterialAnimationBinding],
+    renderer: &mut VulkanSmokeRenderer,
+) -> Result<(), String> {
+    for selection in &update.range_selections {
+        renderer
+            .set_draw_range_material(selection.range_index, selection.material_index)
+            .map_err(|error| format!("update MAT0 material draw selector: {error}"))?;
+        renderer
+            .set_draw_range_material_category(selection.range_index, selection.pipeline_category)
+            .map_err(|error| format!("update MAT0 material pipeline category: {error}"))?;
+    }
+    for properties in &update.properties {
+        renderer
+            .set_material_alphas(
+                properties.material_index,
+                properties.diffuse_alpha,
+                properties.overlay_alpha,
+            )
+            .map_err(|error| format!("update MAT0 material alpha: {error}"))?;
+        renderer
+            .set_material_lighting_with_overlay(
+                properties.material_index,
+                properties.base_directional,
+                properties.base_additive,
+                properties.overlay_directional,
+                properties.overlay_additive,
+            )
+            .map_err(|error| format!("update MAT0 material lighting: {error}"))?;
+        renderer
+            .set_material_specular(
+                properties.material_index,
+                properties.specular_rgb,
+                properties.specular_power,
+                properties.overlay_specular_rgb,
+                properties.overlay_power,
+            )
+            .map_err(|error| format!("update MAT0 material specular: {error}"))?;
+        renderer
+            .set_material_uv_transforms(properties.material_index, properties.uv_transforms)
+            .map_err(|error| format!("update MAT0 material Page transform: {error}"))?;
+    }
+    for stage_update in &update.stage_phases {
+        let stage_textures = bindings
+            .get_mut(stage_update.binding_index)
+            .and_then(|binding| binding.stage_textures.as_mut())
+            .ok_or_else(|| "MAT0 stage texture binding disappeared".to_string())?;
+        if stage_textures
+            .applied_material_phases
+            .get(&stage_update.material_index)
+            .copied()
+            == Some(stage_update.phases)
+        {
+            continue;
+        }
+        let textures = [
+            stage_textures
+                .detail
+                .as_ref()
+                .and_then(|textures| textures.get(stage_update.phases[0])),
+            stage_textures
+                .overlay
+                .as_ref()
+                .and_then(|textures| textures.get(stage_update.phases[1])),
+            stage_textures
+                .overlay_detail
+                .as_ref()
+                .and_then(|textures| textures.get(stage_update.phases[2])),
+        ];
+        for (stage, texture) in textures.into_iter().enumerate() {
+            if let Some(texture) = texture {
+                renderer
+                    .update_material_texture(stage_update.material_index, stage + 1, texture)
+                    .map_err(|error| match stage {
+                        0 => format!("update MAT0 detail texture: {error}"),
+                        1 => format!("update MAT0 overlay texture: {error}"),
+                        _ => format!("update MAT0 overlay detail texture: {error}"),
+                    })?;
+            }
+        }
+        stage_textures
+            .applied_material_phases
+            .insert(stage_update.material_index, stage_update.phases);
+    }
+    Ok(())
 }
 
 fn native_world_transparent(range: &VulkanStaticDrawRange, diffuse_alpha: f32) -> bool {
@@ -1449,7 +1501,6 @@ fn append_environment_material(
         variants: vec![MaterialVariantSet {
             phase_material_indices,
             range_indices: Vec::new(),
-            pipeline_category: phases[0].pipeline_category,
         }],
         base: MaterialPhaseBinding {
             document,
@@ -2678,23 +2729,17 @@ impl EnvironmentGpuScene {
     fn update(
         &mut self,
         mesh: &mut VulkanStaticMesh,
-        materials: &[VulkanStaticMaterial],
         renderer: &mut VulkanSmokeRenderer,
+        material_update: &MaterialFrameUpdate,
         sky_frame: &SkyFrame,
         sky_mesh: &SkyMesh,
         environment_frame: &EnvironmentFrame,
         camera: &PreviewCameraFrame,
         viewport: [f32; 2],
-        material_clock_ms: u32,
         terrain: &TerrainWorld,
         sun_occlusion_range_indices: &[usize],
     ) -> Result<(), String> {
-        let active_materials = update_material_animations(
-            &mut self.material_animations,
-            materials,
-            renderer,
-            material_clock_ms,
-        )?;
+        let active_materials = &material_update.active_materials;
         // Resolve the native glare once for the frame.  CSky feeds the
         // boosted primary color back into the light manager and uses the
         // positive boost delta for both the screen-gradient horizon floor and
@@ -5033,7 +5078,6 @@ fn static_preview_terrain_base_materials(
                 variants: vec![MaterialVariantSet {
                     phase_material_indices,
                     range_indices: Vec::new(),
-                    pipeline_category: base_phases[initial_phase_index].1.pipeline_category,
                 }],
                 base: MaterialPhaseBinding {
                     document: base_document,
@@ -5184,7 +5228,6 @@ fn static_preview_component_materials(
                 variants: vec![MaterialVariantSet {
                     phase_material_indices,
                     range_indices: Vec::new(),
-                    pipeline_category: material.pipeline_category,
                 }],
                 base: MaterialPhaseBinding {
                     document: material.mat0.clone(),
@@ -5299,7 +5342,7 @@ fn append_static_preview_component_with_lightmaps(
     // advances to another phase.  The range's original selector identifies
     // the base binding, while the lightmap selector identifies the secondary
     // texture.  Keep the generated phase family and the binding/variant it
-    // belongs to so update_material_animations can rebind every frame.
+    // belongs to so the pending MAT0 packet can rebind every frame.
     let mut lightmap_materials: HashMap<(usize, u8), (Vec<usize>, usize, usize)> = HashMap::new();
     for range in component.draw_ranges {
         let source_material_index = selector_remap
@@ -5331,7 +5374,6 @@ fn append_static_preview_component_with_lightmaps(
                                 "static preview material selector {source_material_index} has no MAT0 animation binding"
                             )
                         })?;
-                let initial_phase_index = bindings[binding_index].initial_phase_index;
                 let lightmap = lightmap_textures
                     .get(usize::from(range.lightmap_index))
                     .expect("lightmap presence checked above");
@@ -5371,16 +5413,6 @@ fn append_static_preview_component_with_lightmaps(
                     materials.push(lightmap_material);
                     phase_material_indices.push(usize::from(index));
                 }
-                let initial_selector = phase_material_indices
-                    .get(initial_phase_index)
-                    .copied()
-                    .ok_or_else(|| "static preview lightmap phase table is empty".to_string())?;
-                let pipeline_category = materials
-                    .get(initial_selector)
-                    .map(|material| material.pipeline_category)
-                    .ok_or_else(|| {
-                        "static preview lightmap material selector is unavailable".to_string()
-                    })?;
                 let bindings = material_animations.as_deref_mut().ok_or_else(|| {
                     "static preview lightmap animation storage is unavailable".to_string()
                 })?;
@@ -5388,7 +5420,6 @@ fn append_static_preview_component_with_lightmaps(
                 bindings[binding_index].variants.push(MaterialVariantSet {
                     phase_material_indices: phase_material_indices.clone(),
                     range_indices: Vec::new(),
-                    pipeline_category,
                 });
                 let value = (phase_material_indices, binding_index, variant_index);
                 lightmap_materials.insert(key, value.clone());
@@ -5580,6 +5611,8 @@ struct SceneFrameUpdate {
     camera: PreviewCameraFrame,
     viewport: [f32; 2],
     aspect: f32,
+    material_update: MaterialFrameUpdate,
+    environment_material_update: Option<MaterialFrameUpdate>,
     environment: Option<DynamicEnvironmentFrame>,
 }
 
@@ -6123,34 +6156,6 @@ impl StaticVulkanApp {
         if self.renderer.is_none() {
             return Ok(None);
         }
-        let active_materials = {
-            let renderer = self
-                .renderer
-                .as_mut()
-                .ok_or_else(|| "native Vulkan renderer was not initialized".to_string())?;
-            update_material_animations(
-                &mut self.material_animations,
-                &self.materials,
-                renderer,
-                self.material_time_ms,
-            )?
-        };
-        {
-            let renderer = self
-                .renderer
-                .as_mut()
-                .ok_or_else(|| "native Vulkan renderer was not initialized".to_string())?;
-            Self::update_world_transparency(
-                &self.mesh,
-                &self.materials,
-                &self.world_range_indices,
-                &self.world_range_index_counts,
-                &self.native_handedness_by_range,
-                self.view_camera.position,
-                &active_materials,
-                renderer,
-            )?;
-        }
         let camera = self.view_camera;
         if let Some(audio) = self.audio.as_mut() {
             audio
@@ -6180,13 +6185,13 @@ impl StaticVulkanApp {
         if let Some(frame) = environment_frame.as_ref() {
             self.environment_primitive_count = frame.environment_frame.primitives.len();
         }
-        self.apply_environment_view(environment_frame.as_ref(), camera, viewport)?;
         Ok(environment_frame)
     }
 
     fn apply_environment_view(
         &mut self,
         frame: Option<&DynamicEnvironmentFrame>,
+        environment_material_update: Option<&MaterialFrameUpdate>,
         camera: PreviewCameraFrame,
         viewport: [f32; 2],
     ) -> Result<(), String> {
@@ -6205,16 +6210,17 @@ impl StaticVulkanApp {
                 frame.absolute_time_seconds,
             );
             if let Some(environment_gpu) = self.environment_gpu.as_mut() {
+                let material_update = environment_material_update
+                    .ok_or_else(|| "sampled environment material state is missing".to_string())?;
                 environment_gpu.update(
                     &mut self.mesh,
-                    &self.materials,
                     renderer,
+                    material_update,
                     &sky_frame,
                     &frame.sky_mesh,
                     &frame.environment_frame,
                     &camera,
                     viewport,
-                    self.material_time_ms,
                     &self.terrain,
                     &self.sun_occlusion_range_indices,
                 )?;
@@ -6285,12 +6291,57 @@ impl StaticVulkanApp {
                 .environment_frame
                 .reproject_for_camera(environment_camera);
         }
-        self.apply_environment_view(update.environment.as_ref(), camera, viewport)?;
         update.camera = camera;
         update.viewport = viewport;
         update.aspect = aspect;
         self.lifecycle.pending = Some(update);
         Ok(())
+    }
+
+    fn apply_pending_scene_update(&mut self) -> Result<(), String> {
+        let Some(frame) = self.lifecycle.pending.take() else {
+            return Ok(());
+        };
+        let result = (|| {
+            {
+                let Some(renderer) = self.renderer.as_mut() else {
+                    return Err("native Vulkan renderer was not initialized".to_string());
+                };
+                apply_material_frame_update(
+                    &frame.material_update,
+                    &mut self.material_animations,
+                    renderer,
+                )?;
+                Self::update_world_transparency(
+                    &self.mesh,
+                    &self.materials,
+                    &self.world_range_indices,
+                    &self.world_range_index_counts,
+                    &self.native_handedness_by_range,
+                    frame.camera.position,
+                    &frame.material_update.active_materials,
+                    renderer,
+                )?;
+                if let Some(material_update) = frame.environment_material_update.as_ref() {
+                    let environment_gpu = self.environment_gpu.as_mut().ok_or_else(|| {
+                        "sampled environment material state lost its owner".to_string()
+                    })?;
+                    apply_material_frame_update(
+                        material_update,
+                        &mut environment_gpu.material_animations,
+                        renderer,
+                    )?;
+                }
+            }
+            self.apply_environment_view(
+                frame.environment.as_ref(),
+                frame.environment_material_update.as_ref(),
+                frame.camera,
+                frame.viewport,
+            )
+        })();
+        self.lifecycle.pending = Some(frame);
+        result
     }
 
     fn sample_frame_clock(&mut self) -> FrameClockSample {
@@ -6324,12 +6375,30 @@ impl StaticVulkanApp {
         self.update_free_camera(sample.delta_seconds, viewport)?;
         self.update_material_clock(sample);
         self.update_controlled_component_geometry(sample)?;
+        let material_update = sample_material_animations(
+            &mut self.material_animations,
+            &self.materials,
+            self.material_time_ms,
+        )?;
+        let environment_material_update = self
+            .environment_gpu
+            .as_mut()
+            .map(|environment_gpu| {
+                sample_material_animations(
+                    &mut environment_gpu.material_animations,
+                    &self.materials,
+                    self.material_time_ms,
+                )
+            })
+            .transpose()?;
         let environment = self.update_environment(sample, viewport)?;
         Ok(SceneFrameUpdate {
             sample,
             camera: self.view_camera,
             viewport,
             aspect,
+            material_update,
+            environment_material_update,
             environment,
         })
     }
@@ -6678,6 +6747,13 @@ impl ApplicationHandler for StaticVulkanApp {
                     let size = window.inner_size();
                     size.width != 0 && size.height != 0
                 });
+                if drawable_available {
+                    if let Err(error) = self.apply_pending_scene_update() {
+                        self.error = Some(error);
+                        event_loop.exit();
+                        return;
+                    }
+                }
                 let outcome = {
                     let Some(renderer) = self.renderer.as_mut() else {
                         self.error = Some("native Vulkan renderer was not initialized".to_string());
@@ -7080,6 +7156,168 @@ fn usage() -> String {
 mod tests {
     use super::*;
     use fparkan_fx::environment::{WeatherInput, WeatherState};
+    use fparkan_material::{MaterialAnimationBlock, MaterialKey};
+
+    fn material_test_phase(parameters: [u8; 18]) -> MaterialPhase {
+        MaterialPhase {
+            parameters,
+            texture_raw: [0; 16],
+        }
+    }
+
+    fn random_material_binding(range_index: usize) -> MaterialAnimationBinding {
+        let mut overlay_phase = [0; 18];
+        overlay_phase[..3].copy_from_slice(&[100, 50, 25]);
+        overlay_phase[3] = 25;
+        overlay_phase[4..7].copy_from_slice(&[30, 60, 90]);
+        overlay_phase[8..11].copy_from_slice(&[40, 80, 120]);
+        overlay_phase[16] = 5;
+        let mut active_phase = [0; 18];
+        active_phase[..3].copy_from_slice(&[25, 50, 75]);
+        active_phase[3] = 75;
+        active_phase[4..7].copy_from_slice(&[64, 128, 192]);
+        active_phase[8..11].copy_from_slice(&[100, 150, 200]);
+        active_phase[16] = 9;
+        active_phase[17] = 1;
+        let document = Mat0Document {
+            version: 0,
+            animation_block_count: 1,
+            phases: vec![
+                material_test_phase(overlay_phase),
+                material_test_phase(active_phase),
+            ],
+            prefix: Vec::new(),
+            header_opaque: [0; 2],
+            animation_blocks: vec![MaterialAnimationBlock {
+                header_raw: 3,
+                keys: vec![
+                    MaterialKey {
+                        k0: 0,
+                        k1: 20,
+                        k2: 0,
+                    },
+                    MaterialKey {
+                        k0: 1,
+                        k1: 40,
+                        k2: 0,
+                    },
+                ],
+                bytes: Vec::new(),
+            }],
+        };
+        let frozen_binding = |phase_index: usize, uv_transform: [f32; 4]| MaterialPhaseBinding {
+            document: document.clone(),
+            animation_block_index: 0,
+            wear_row_start_ms: 0,
+            random_state: 0,
+            frozen_phase_index: Some(phase_index),
+            phase_uv_transforms: vec![uv_transform; 2],
+        };
+        let texture = solid_environment_texture([255; 4]);
+        MaterialAnimationBinding {
+            initial_phase_index: 0,
+            variants: vec![MaterialVariantSet {
+                phase_material_indices: vec![4, 5],
+                range_indices: vec![range_index],
+            }],
+            base: MaterialPhaseBinding {
+                document: document.clone(),
+                animation_block_index: 0,
+                wear_row_start_ms: 0,
+                random_state: 0,
+                frozen_phase_index: None,
+                phase_uv_transforms: vec![[0.0, 0.0, 0.5, 0.5], [0.5, 0.25, 0.25, 0.5]],
+            },
+            detail: Some(frozen_binding(1, [0.1, 0.2, 0.3, 0.4])),
+            overlay: Some(frozen_binding(0, [0.3, 0.4, 0.5, 0.6])),
+            overlay_detail: Some(frozen_binding(1, [0.6, 0.7, 0.8, 0.9])),
+            stage_textures: Some(MaterialStageTextures {
+                detail: Some(vec![texture.clone(), texture.clone()]),
+                overlay: Some(vec![texture.clone()]),
+                overlay_detail: Some(vec![texture.clone(), texture]),
+                applied_material_phases: HashMap::from([(5, [1, 0, 1])]),
+            }),
+        }
+    }
+
+    fn packet_test_materials() -> Vec<VulkanStaticMaterial> {
+        let mut materials = Vec::new();
+        for _ in 0..6 {
+            append_environment_gradient_material(&mut materials).expect("test material");
+        }
+        materials[4].pipeline_category = 1;
+        materials[5].pipeline_category = 3;
+        materials
+    }
+
+    #[test]
+    fn sampled_material_packet_keeps_native_selector_properties_and_stage_phases() {
+        let materials = packet_test_materials();
+        let mut bindings = vec![random_material_binding(7)];
+        let packet = sample_material_animations(&mut bindings, &materials, 500)
+            .expect("sample random MAT0 state");
+
+        assert_eq!(
+            packet.range_selections,
+            vec![MaterialRangeSelection {
+                range_index: 7,
+                material_index: 5,
+                pipeline_category: 3,
+            }]
+        );
+        assert_eq!(
+            packet.active_materials.get(&7),
+            Some(&ActiveMaterialState {
+                material_index: 5,
+                diffuse_alpha: 0.75,
+            })
+        );
+        let properties = packet.properties[0];
+        assert_eq!(
+            (properties.diffuse_alpha, properties.overlay_alpha),
+            (0.75, 0.25)
+        );
+        assert_eq!(
+            (properties.base_directional, properties.base_additive),
+            (
+                [64.0 / 255.0, 128.0 / 255.0, 192.0 / 255.0],
+                [25.0 / 255.0, 50.0 / 255.0, 75.0 / 255.0],
+            )
+        );
+        assert_eq!(
+            (properties.overlay_directional, properties.overlay_additive),
+            (
+                Some([30.0 / 255.0, 60.0 / 255.0, 90.0 / 255.0]),
+                Some([100.0 / 255.0, 50.0 / 255.0, 25.0 / 255.0]),
+            )
+        );
+        assert_eq!(
+            (properties.specular_rgb, properties.specular_power),
+            ([100.0 / 255.0, 150.0 / 255.0, 200.0 / 255.0], 9)
+        );
+        assert_eq!(
+            (properties.overlay_specular_rgb, properties.overlay_power),
+            (Some([40.0 / 255.0, 80.0 / 255.0, 120.0 / 255.0]), Some(5))
+        );
+        assert_eq!(
+            properties.uv_transforms,
+            [
+                [0.5, 0.25, 0.25, 0.5],
+                [0.1, 0.2, 0.3, 0.4],
+                [0.3, 0.4, 0.5, 0.6],
+                [0.6, 0.7, 0.8, 0.9],
+            ]
+        );
+        assert_eq!(
+            packet.stage_phases,
+            vec![MaterialStagePhaseUpdate {
+                binding_index: 0,
+                material_index: 5,
+                phases: [1, 0, 1],
+            }]
+        );
+        assert_eq!(bindings[0].base.random_state, 2_531_011);
+    }
 
     fn control_pose_test_model() -> ModelAsset {
         let mut nodes = vec![u8::MAX; 38];
@@ -7482,6 +7720,18 @@ mod tests {
         );
         app.free_camera = Some(free_camera);
         app.pressed_keys.insert(KeyCode::KeyW);
+        app.materials = packet_test_materials();
+        app.material_animations = vec![random_material_binding(0)];
+        let empty_range = app.shadow_range;
+        app.environment_gpu = Some(EnvironmentGpuScene {
+            material_animations: vec![random_material_binding(1)],
+            sky_layers: Vec::new(),
+            sprites: Vec::new(),
+            rain: empty_range,
+            snow: empty_range,
+            lightning: empty_range,
+            lightning_material_index: 0,
+        });
         let start = app.last_tick;
         let sample = app.sample_live_frame_clock_at(start + Duration::from_millis(225));
         assert_eq!(sample.time_ms, 225);
@@ -7489,6 +7739,17 @@ mod tests {
         let mut update = app
             .prepare_scene_update(sample, [1280.0, 720.0])
             .expect("apply one full live tick to the scene");
+        assert!(update.environment.is_none());
+        assert!(update.environment_material_update.is_some());
+        let world_material_packet = update.material_update.clone();
+        let sky_material_packet = update.environment_material_update.clone();
+        assert_eq!(app.material_animations[0].base.random_state, 2_531_011);
+        assert_eq!(
+            app.environment_gpu.as_ref().unwrap().material_animations[0]
+                .base
+                .random_state,
+            2_531_011
+        );
         let expected_resized_camera = app
             .free_camera
             .expect("free-flight input controller")
@@ -7560,8 +7821,37 @@ mod tests {
         let controller_after_input = app.free_camera.unwrap();
         app.refresh_pending_viewport([800.0, 600.0])
             .expect("refresh only viewport-dependent state after recreation");
-        let refreshed = app.lifecycle.pending.as_ref().expect("pending sample");
+        let refreshed = app
+            .lifecycle
+            .pending
+            .as_ref()
+            .expect("pending sample")
+            .clone();
         assert_eq!(refreshed.sample, sample);
+        assert_eq!(refreshed.material_update, world_material_packet);
+        assert_eq!(refreshed.environment_material_update, sky_material_packet);
+        assert_eq!(app.material_animations[0].base.random_state, 2_531_011);
+        assert_eq!(
+            app.environment_gpu.as_ref().unwrap().material_animations[0]
+                .base
+                .random_state,
+            2_531_011
+        );
+        app.refresh_pending_viewport([1024.0, 768.0])
+            .expect("refresh the same pending sample a second time");
+        let repeated = app.lifecycle.pending.as_ref().expect("pending sample");
+        assert_eq!(repeated.sample, sample);
+        assert_eq!(repeated.material_update, world_material_packet);
+        assert_eq!(repeated.environment_material_update, sky_material_packet);
+        assert_eq!(repeated.viewport, [1024.0, 768.0]);
+        assert_eq!(repeated.aspect, 4.0 / 3.0);
+        assert_eq!(app.material_animations[0].base.random_state, 2_531_011);
+        assert_eq!(
+            app.environment_gpu.as_ref().unwrap().material_animations[0]
+                .base
+                .random_state,
+            2_531_011
+        );
         assert_eq!(refreshed.viewport, [800.0, 600.0]);
         assert_eq!(refreshed.aspect, 4.0 / 3.0);
         assert_eq!(refreshed.camera.position, update.camera.position);
@@ -7635,6 +7925,25 @@ mod tests {
             reprojected_counts[slot] += 1;
         }
         assert!(reprojected_counts.iter().all(|count| *count > 0));
+        assert_eq!(
+            app.apply_pending_scene_update().unwrap_err(),
+            "native Vulkan renderer was not initialized"
+        );
+        let restored = app
+            .lifecycle
+            .pending
+            .as_ref()
+            .expect("restored pending sample");
+        assert_eq!(restored.sample, sample);
+        assert_eq!(restored.material_update, world_material_packet);
+        assert_eq!(restored.environment_material_update, sky_material_packet);
+        assert_eq!(app.material_animations[0].base.random_state, 2_531_011);
+        assert_eq!(
+            app.environment_gpu.as_ref().unwrap().material_animations[0]
+                .base
+                .random_state,
+            2_531_011
+        );
         assert_eq!(app.mesh.vertices, b_vertices);
         assert_eq!(app.shadow_casters[0].triangles, b_triangles);
         assert_eq!(
@@ -7710,6 +8019,8 @@ mod tests {
             camera,
             viewport,
             aspect,
+            material_update: MaterialFrameUpdate::default(),
+            environment_material_update: None,
             environment: None,
         }
     }
@@ -7866,7 +8177,6 @@ mod tests {
             variants: vec![MaterialVariantSet {
                 phase_material_indices: vec![10],
                 range_indices: vec![0, 2],
-                pipeline_category: 0,
             }],
             base: empty_binding(),
             detail: None,
@@ -7927,7 +8237,6 @@ mod tests {
         let variant = MaterialVariantSet {
             phase_material_indices: vec![10, 11],
             range_indices: vec![3],
-            pipeline_category: 1,
         };
         let category_for = |material_index| match material_index {
             10 => Some(1),
@@ -8195,7 +8504,6 @@ mod tests {
             variants: vec![MaterialVariantSet {
                 phase_material_indices: vec![10, 11],
                 range_indices: Vec::new(),
-                pipeline_category: 0,
             }],
             base: MaterialPhaseBinding {
                 document: empty_mat0,
@@ -8216,7 +8524,6 @@ mod tests {
         bindings[binding_index].variants.push(MaterialVariantSet {
             phase_material_indices: vec![20, 21],
             range_indices: vec![7],
-            pipeline_category: 0,
         });
 
         let lightmap_variant = &bindings[binding_index].variants[1];

@@ -507,6 +507,7 @@ dependencies = [
  "fparkan-animation",
  "fparkan-assets",
  "fparkan-fx",
+ "fparkan-material",
  "fparkan-msh",
  "fparkan-path",
  "fparkan-platform-winit",
