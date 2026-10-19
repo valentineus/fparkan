@@ -926,6 +926,50 @@ pub struct EnvironmentFrame {
     pub sounds: Vec<SoundEvent>,
 }
 
+impl EnvironmentFrame {
+    /// Reprojects cached precipitation for a new camera without advancing the
+    /// weather simulation or replaying its sounds.
+    pub fn reproject_for_camera(&mut self, camera: Camera) {
+        let camera = camera.sanitized();
+        let size = camera.precipitation_size_scalar();
+        let mut rain_index = 0;
+        let mut snow_index = 0;
+        for primitive in &mut self.primitives {
+            let EnvironmentPrimitive::Particle {
+                kind,
+                size: particle_size,
+                screen,
+                ..
+            } = primitive
+            else {
+                continue;
+            };
+            let index = match kind {
+                PrecipitationKind::Rain => {
+                    let index = rain_index;
+                    rain_index += 1;
+                    *particle_size = size * RAIN_SIZE_FACTOR;
+                    index
+                }
+                PrecipitationKind::Snow => {
+                    let index = snow_index;
+                    snow_index += 1;
+                    *particle_size = size * SNOW_SIZE_FACTOR;
+                    index
+                }
+            };
+            *screen = screen_billboard(
+                *kind,
+                camera,
+                screen.world_head,
+                screen.world_tail,
+                *particle_size,
+                index,
+            );
+        }
+    }
+}
+
 /// A validated resource name from the `env_lightning` FXID.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EffectResource {
@@ -2596,6 +2640,100 @@ mod tests {
         let expected_fov = 2.0 * ((0.975_f32 * 0.5).tan() * (16.0_f32 / 9.0)).atan();
         assert!((camera.horizontal_fov() - expected_fov).abs() < 1.0e-6);
         assert!((camera.precipitation_size_scalar() - 1920.0 / expected_fov).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn cached_rain_and_snow_reproject_without_advancing_emitter_state() {
+        let old_camera = Camera::with_projection(
+            [10.0, 20.0, 30.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            0.975,
+            16.0 / 9.0,
+        )
+        .with_viewport([1280.0, 720.0]);
+        let new_camera = Camera::with_projection(
+            old_camera.position,
+            old_camera.forward,
+            old_camera.right,
+            old_camera.up,
+            old_camera.vertical_fov,
+            4.0 / 3.0,
+        )
+        .with_viewport([1024.0, 768.0]);
+        let weather = WeatherInput {
+            rain: WeatherState::new(true, 0.03, [0.7, 0.8, 1.0, 0.6]),
+            snow: WeatherState::new(true, 0.03, [0.9, 0.95, 1.0, 0.8]),
+            ..WeatherInput::clear()
+        };
+        let mut system = EnvironmentSystem::new(0xC1_225);
+        let sampled = system.update(0.225, weather.clone(), old_camera);
+        let mut control = system.clone();
+        let mut reprojected = sampled.clone();
+
+        reprojected.reproject_for_camera(new_camera);
+
+        assert_eq!(reprojected.point_lights, sampled.point_lights);
+        assert_eq!(reprojected.sounds, sampled.sounds);
+
+        let mut kind_indices = [0usize; 2];
+        let mut counts = [0usize; 2];
+        for (original, refreshed) in sampled.primitives.iter().zip(&reprojected.primitives) {
+            let (
+                EnvironmentPrimitive::Particle {
+                    kind: original_kind,
+                    position: original_position,
+                    velocity: original_velocity,
+                    screen: original_screen,
+                    ..
+                },
+                EnvironmentPrimitive::Particle {
+                    kind,
+                    position,
+                    velocity,
+                    size,
+                    screen,
+                    ..
+                },
+            ) = (original, refreshed)
+            else {
+                panic!("weather fixture contains only precipitation particles");
+            };
+            assert_eq!(kind, original_kind);
+            assert_eq!(position, original_position);
+            assert_eq!(velocity, original_velocity);
+            let slot = match kind {
+                PrecipitationKind::Rain => 0,
+                PrecipitationKind::Snow => 1,
+            };
+            let index = kind_indices[slot];
+            kind_indices[slot] += 1;
+            counts[slot] += 1;
+            let size_factor = match kind {
+                PrecipitationKind::Rain => RAIN_SIZE_FACTOR,
+                PrecipitationKind::Snow => SNOW_SIZE_FACTOR,
+            };
+            assert_eq!(*size, new_camera.precipitation_size_scalar() * size_factor);
+            assert_eq!(
+                *screen,
+                screen_billboard(
+                    *kind,
+                    new_camera,
+                    original_screen.world_head,
+                    original_screen.world_tail,
+                    *size,
+                    index,
+                )
+            );
+        }
+        assert!(counts[0] >= 17, "rain fixture exercises populated emitters");
+        assert!(counts[1] >= 17, "snow fixture exercises mirror indices");
+
+        assert_eq!(
+            system.update(0.016, weather.clone(), new_camera),
+            control.update(0.016, weather, new_camera)
+        );
     }
 
     #[test]

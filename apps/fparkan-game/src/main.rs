@@ -421,60 +421,17 @@ impl FreeFlightCamera {
     }
 
     fn vulkan_camera(self, aspect: f32) -> VulkanStaticCamera {
-        let aspect = if aspect.is_finite() && aspect > f32::EPSILON {
-            aspect
-        } else {
-            16.0 / 9.0
-        };
-        let forward = self.forward();
-        let right = self.right();
-        let up = self.up();
-        // VulkanStaticCamera carries row-major D3D-style data. GLSL interprets
-        // those bytes as a column-major mat4, so shader multiplication is the
-        // transpose of this row-vector transform: world * V * P. The camera
-        // basis is right-handed with +Z-up world coordinates and +Z depth.
-        let view = [
-            right[0],
-            up[0],
-            forward[0],
-            0.0,
-            right[1],
-            up[1],
-            forward[1],
-            0.0,
-            right[2],
-            up[2],
-            forward[2],
-            0.0,
-            -dot3(right, self.position),
-            -dot3(up, self.position),
-            -dot3(forward, self.position),
-            1.0,
-        ];
-        let half_fov = self.vertical_fov(aspect) * 0.5;
-        let focal = half_fov.tan().recip();
-        let near_plane = self.near_plane.max(0.001);
-        let far_plane = self.far_plane.max(near_plane + 0.001);
-        let projection = [
-            focal / aspect,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            -focal,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            far_plane / (far_plane - near_plane),
-            1.0,
-            0.0,
-            0.0,
-            -(near_plane * far_plane) / (far_plane - near_plane),
-            0.0,
-        ];
         VulkanStaticCamera {
-            clip_from_world: multiply_row_major(view, projection),
+            clip_from_world: clip_from_world_for_view(
+                self.position,
+                self.forward(),
+                self.right(),
+                self.up(),
+                self.vertical_fov(aspect),
+                self.near_plane,
+                self.far_plane,
+                aspect,
+            ),
         }
     }
 
@@ -491,6 +448,71 @@ impl FreeFlightCamera {
             clip_from_world: camera.clip_from_world,
         }
     }
+}
+
+fn preview_aspect(aspect: f32) -> f32 {
+    if aspect.is_finite() && aspect > f32::EPSILON {
+        aspect
+    } else {
+        16.0 / 9.0
+    }
+}
+
+fn clip_from_world_for_view(
+    position: [f32; 3],
+    forward: [f32; 3],
+    right: [f32; 3],
+    up: [f32; 3],
+    vertical_fov: f32,
+    near_plane: f32,
+    far_plane: f32,
+    aspect: f32,
+) -> [f32; 16] {
+    let aspect = preview_aspect(aspect);
+    // VulkanStaticCamera carries row-major D3D-style data. GLSL interprets
+    // those bytes as a column-major mat4, so shader multiplication is the
+    // transpose of this row-vector transform: world * V * P. The camera
+    // basis is right-handed with +Z-up world coordinates and +Z depth.
+    let view = [
+        right[0],
+        up[0],
+        forward[0],
+        0.0,
+        right[1],
+        up[1],
+        forward[1],
+        0.0,
+        right[2],
+        up[2],
+        forward[2],
+        0.0,
+        -dot3(right, position),
+        -dot3(up, position),
+        -dot3(forward, position),
+        1.0,
+    ];
+    let focal = (vertical_fov * 0.5).tan().recip();
+    let near_plane = near_plane.max(0.001);
+    let far_plane = far_plane.max(near_plane + 0.001);
+    let projection = [
+        focal / aspect,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        -focal,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        far_plane / (far_plane - near_plane),
+        1.0,
+        0.0,
+        0.0,
+        -(near_plane * far_plane) / (far_plane - near_plane),
+        0.0,
+    ];
+    multiply_row_major(view, projection)
 }
 
 /// Immutable view data shared by the environment renderers. The optional
@@ -548,6 +570,28 @@ impl PreviewCameraFrame {
     fn vulkan_camera(self) -> VulkanStaticCamera {
         VulkanStaticCamera {
             clip_from_world: self.clip_from_world,
+        }
+    }
+
+    fn with_aspect(self, previous_aspect: f32, aspect: f32) -> Self {
+        let previous_aspect = preview_aspect(previous_aspect);
+        let aspect = preview_aspect(aspect);
+        let horizontal_half_fov_tangent = (self.vertical_fov * 0.5).tan() * previous_aspect;
+        let vertical_fov = 2.0 * (horizontal_half_fov_tangent / aspect).atan();
+        let clip_from_world = clip_from_world_for_view(
+            self.position,
+            self.forward,
+            self.right,
+            self.up,
+            vertical_fov,
+            self.near_plane,
+            self.far_plane,
+            aspect,
+        );
+        Self {
+            vertical_fov,
+            clip_from_world,
+            ..self
         }
     }
 
@@ -3404,6 +3448,22 @@ struct DynamicEnvironmentFrame {
     absolute_time_seconds: f32,
 }
 
+fn environment_camera_for_preview(
+    camera: &PreviewCameraFrame,
+    aspect: f32,
+    viewport: [f32; 2],
+) -> FxCamera {
+    FxCamera::with_projection(
+        camera.position,
+        camera.forward(),
+        camera.right(),
+        camera.up(),
+        camera.vertical_fov,
+        aspect,
+    )
+    .with_viewport(viewport)
+}
+
 struct DynamicEnvironment {
     schedule: TypedAtmosphere,
     sky: SkySystem,
@@ -3489,15 +3549,7 @@ impl DynamicEnvironment {
             .set_frame_uniforms(uniforms)
             .map_err(|error| format!("update sky frame uniforms: {error}"))?;
 
-        let fx_camera = FxCamera::with_projection(
-            camera.position,
-            camera.forward(),
-            camera.right(),
-            camera.up(),
-            camera.vertical_fov,
-            aspect,
-        )
-        .with_viewport(viewport);
+        let fx_camera = environment_camera_for_preview(camera, aspect, viewport);
         let environment_frame = self.environment.update_atmosphere_with_materials(
             dt_seconds,
             &atmosphere,
@@ -6219,17 +6271,20 @@ impl StaticVulkanApp {
         };
         let viewport = [viewport[0].max(1.0), viewport[1].max(1.0)];
         let aspect = viewport[0] / viewport[1];
-        if let Some(free_camera) = self.free_camera.as_ref() {
-            let camera = free_camera.preview_frame(aspect);
-            self.view_camera = camera;
-            self.camera = camera.vulkan_camera();
-            if let Some(renderer) = self.renderer.as_mut() {
-                renderer
-                    .set_camera(self.camera)
-                    .map_err(|error| format!("refresh free-flight camera viewport: {error}"))?;
-            }
+        let camera = update.camera.with_aspect(update.aspect, aspect);
+        self.view_camera = camera;
+        self.camera = camera.vulkan_camera();
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer
+                .set_camera(self.camera)
+                .map_err(|error| format!("refresh free-flight camera viewport: {error}"))?;
         }
-        let camera = self.view_camera;
+        let environment_camera = environment_camera_for_preview(&camera, aspect, viewport);
+        if let Some(environment) = update.environment.as_mut() {
+            environment
+                .environment_frame
+                .reproject_for_camera(environment_camera);
+        }
         self.apply_environment_view(update.environment.as_ref(), camera, viewport)?;
         update.camera = camera;
         update.viewport = viewport;
@@ -7024,6 +7079,7 @@ fn usage() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fparkan_fx::environment::{WeatherInput, WeatherState};
 
     fn control_pose_test_model() -> ModelAsset {
         let mut nodes = vec![u8::MAX; 38];
@@ -7430,13 +7486,54 @@ mod tests {
         let sample = app.sample_live_frame_clock_at(start + Duration::from_millis(225));
         assert_eq!(sample.time_ms, 225);
         assert!((sample.delta_seconds - 0.225).abs() < f32::EPSILON);
-        let update = app
+        let mut update = app
             .prepare_scene_update(sample, [1280.0, 720.0])
             .expect("apply one full live tick to the scene");
+        let expected_resized_camera = app
+            .free_camera
+            .expect("free-flight input controller")
+            .preview_frame(4.0 / 3.0);
         let camera_after_tick = app.free_camera.expect("free-flight camera").position;
         assert!((camera_after_tick[0] - 0.35).abs() < 1.0e-5);
         assert!((camera_after_tick[1] - 0.25).abs() < 1.0e-5);
         assert_eq!(app.material_time_ms, sample.time_ms);
+        let weather = WeatherInput {
+            rain: WeatherState::new(true, 0.03, [0.7, 0.8, 1.0, 0.6]),
+            snow: WeatherState::new(true, 0.03, [0.9, 0.95, 1.0, 0.8]),
+            ..WeatherInput::clear()
+        };
+        let mut weather_system = EnvironmentSystem::new(0xC1_225);
+        let first_environment_frame = weather_system.update(
+            0.225,
+            weather,
+            environment_camera_for_preview(&update.camera, update.aspect, update.viewport),
+        );
+        let mut precipitation_counts = [0usize; 2];
+        for primitive in &first_environment_frame.primitives {
+            if let EnvironmentPrimitive::Particle { kind, .. } = primitive {
+                let slot = match kind {
+                    PrecipitationKind::Rain => 0,
+                    PrecipitationKind::Snow => 1,
+                };
+                precipitation_counts[slot] += 1;
+            }
+        }
+        assert!(precipitation_counts.iter().all(|count| *count > 0));
+        update.environment = Some(DynamicEnvironmentFrame {
+            atmosphere: TypedAtmosphere {
+                marker: 0,
+                version: 0,
+                tracks: Vec::new(),
+                trailer: Default::default(),
+            }
+            .sample(0.225),
+            sky_mesh: SkySystem::new(Default::default(), SkyMaterials::default())
+                .expect("test sky topology")
+                .mesh()
+                .clone(),
+            environment_frame: first_environment_frame.clone(),
+            absolute_time_seconds: 0.225,
+        });
         assert!(app.lifecycle.prepare(update.clone()));
         let control_state_after_tick = app.control_animation_instances[0].state.clone();
         assert_eq!(
@@ -7459,6 +7556,8 @@ mod tests {
         assert_ne!(b_triangles, initial_triangles);
         assert!(b_sphere.radius > baseline.radius);
 
+        app.free_camera.as_mut().unwrap().look_delta(64.0, -24.0);
+        let controller_after_input = app.free_camera.unwrap();
         app.refresh_pending_viewport([800.0, 600.0])
             .expect("refresh only viewport-dependent state after recreation");
         let refreshed = app.lifecycle.pending.as_ref().expect("pending sample");
@@ -7466,10 +7565,76 @@ mod tests {
         assert_eq!(refreshed.viewport, [800.0, 600.0]);
         assert_eq!(refreshed.aspect, 4.0 / 3.0);
         assert_eq!(refreshed.camera.position, update.camera.position);
+        assert_eq!(refreshed.camera.forward, update.camera.forward);
+        assert_eq!(refreshed.camera.right, update.camera.right);
+        assert_eq!(refreshed.camera.up, update.camera.up);
+        assert_eq!(refreshed.camera.position, expected_resized_camera.position);
+        assert_eq!(refreshed.camera.forward, expected_resized_camera.forward);
+        assert_eq!(refreshed.camera.right, expected_resized_camera.right);
+        assert_eq!(refreshed.camera.up, expected_resized_camera.up);
+        assert!(
+            (refreshed.camera.vertical_fov - expected_resized_camera.vertical_fov).abs() < 1.0e-6
+        );
+        assert!(refreshed
+            .camera
+            .clip_from_world
+            .iter()
+            .zip(expected_resized_camera.clip_from_world)
+            .all(|(actual, expected)| (actual - expected).abs() < 1.0e-5));
         assert_ne!(
             refreshed.camera.clip_from_world,
             update.camera.clip_from_world
         );
+        assert_eq!(app.free_camera, Some(controller_after_input));
+        let refreshed_environment_frame =
+            &refreshed.environment.as_ref().unwrap().environment_frame;
+        assert_eq!(
+            refreshed_environment_frame.point_lights,
+            first_environment_frame.point_lights
+        );
+        assert_eq!(
+            refreshed_environment_frame.sounds,
+            first_environment_frame.sounds
+        );
+        let mut reprojected_counts = [0usize; 2];
+        for (sampled, refreshed) in first_environment_frame
+            .primitives
+            .iter()
+            .zip(&refreshed_environment_frame.primitives)
+        {
+            let (
+                EnvironmentPrimitive::Particle {
+                    kind: sampled_kind,
+                    position: sampled_position,
+                    velocity: sampled_velocity,
+                    size: sampled_size,
+                    screen: sampled_screen,
+                    ..
+                },
+                EnvironmentPrimitive::Particle {
+                    kind,
+                    position,
+                    velocity,
+                    size,
+                    screen,
+                    ..
+                },
+            ) = (sampled, refreshed)
+            else {
+                panic!("rain and snow fixture contains only precipitation particles");
+            };
+            assert_eq!(kind, sampled_kind);
+            assert_eq!(position, sampled_position);
+            assert_eq!(velocity, sampled_velocity);
+            assert_ne!(screen, sampled_screen);
+            assert_ne!(size, sampled_size);
+            let slot = match kind {
+                PrecipitationKind::Rain => 0,
+                PrecipitationKind::Snow => 1,
+            };
+            reprojected_counts[slot] += 1;
+        }
+        assert!(reprojected_counts.iter().all(|count| *count > 0));
         assert_eq!(app.mesh.vertices, b_vertices);
         assert_eq!(app.shadow_casters[0].triangles, b_triangles);
         assert_eq!(
@@ -7498,6 +7663,15 @@ mod tests {
         assert_eq!(app.mesh.vertices, initial_mesh.vertices);
         assert_eq!(app.shadow_casters[0].triangles, initial_triangles);
         assert_eq!(app.shadow_casters[0].sphere, baseline);
+
+        let next_sample = app.sample_live_frame_clock_at(start + Duration::from_millis(241));
+        assert_eq!(next_sample.id, SceneSampleId::Live(1));
+        assert_eq!(next_sample.time_ms, 241);
+        let next_update = app
+            .prepare_scene_update(next_sample, [800.0, 600.0])
+            .expect("the next sampled frame adopts mouse input received during retry");
+        assert_ne!(next_update.camera.forward, update.camera.forward);
+        assert_eq!(next_update.camera.forward, controller_after_input.forward());
     }
 
     fn set_test_terrain_lod0_range(terrain: &mut fparkan_terrain_format::LandMeshDocument) {
