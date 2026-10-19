@@ -3468,7 +3468,11 @@ impl DynamicEnvironment {
             target.active = source.active;
         }
         uniforms.lighting_floor = sky_frame.lighting_floor;
-        uniforms.fog_color = sky_frame.fog.color;
+        let fog_rgb = sky_frame
+            .screen_gradient(camera.native_sky_heading(), [0.0; 3])
+            .color
+            .rgba();
+        uniforms.fog_color = [fog_rgb[0], fog_rgb[1], fog_rgb[2]];
         uniforms.fog_start = sky_frame.fog.start.max(0.0);
         uniforms.fog_end = sky_frame.fog.end.max(uniforms.fog_start);
         uniforms.camera_position = camera.position;
@@ -7899,6 +7903,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn captured_native_camera_uses_view_dependent_sky_fog_color() {
+        use fparkan_fx::atmosphere::{PackedColor, SkySample, SKY_COLOR_COUNT};
+
+        // Compact camera fields from the native 1493.337-second AutoDemo capture.
+        let capture = parse_legacy_camera_capture(
+            br#"{"schema":"fparkan-legacy-camera-v1","render_input_usable":true,"parented_camera":true,"effective_world_matrix_space":"world","effective_world_matrix_words":[1052770830,1064129158,991881820,1141874407,3211610778,1052772554,3144770972,1145115441,3146624790,3127057462,1065352580,1087889619,0,0,0,1065353216],"selector0_words":[1063123992,3204380634,996787387,3130169600,1056894806,1063125889,990301923,3129510813,3146181515,3070164857,1065352633,1080608413,0,0,0,1065353216],"viewport":[0,0,1280,1024],"near_plane":5.0,"far_plane":700.0,"field_of_view_radians":1.3,"atmosphere_seconds":1493.337}"#,
+        )
+        .expect("valid native camera fixture");
+        let camera = capture.preview_camera_frame().expect("valid camera frame");
+
+        let mut colors = [PackedColor(0xFF00_0000); SKY_COLOR_COUNT];
+        colors[..4].copy_from_slice(&[
+            PackedColor(0xFF38_3864),
+            PackedColor(0xFF38_3864),
+            PackedColor(0xFF40_4064),
+            PackedColor(0xFF38_3864),
+        ]);
+        let sample = SkySample {
+            colors,
+            values: [0.0; 2],
+            packed: [PackedColor(0); 2],
+        };
+        let fog_color =
+            fparkan_fx::sky::screen_gradient_frame(&sample, camera.native_sky_heading(), [0.0; 3])
+                .color;
+
+        assert_eq!(capture.atmosphere_seconds, Some(1493.337));
+        assert_eq!(fog_color, PackedColor(0xFF3E_3E64));
     }
 
     #[test]

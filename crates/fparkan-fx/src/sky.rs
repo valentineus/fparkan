@@ -957,12 +957,14 @@ impl fmt::Display for SkyUpdateError {
 
 impl std::error::Error for SkyUpdateError {}
 
-/// Fog values sent by the original `CSky` update.
+/// Distance and ambient-light values derived from an original `CSky` sample.
+///
+/// The renderer's `D3DRS_FOGCOLOR` is view-dependent: it is interpolated from
+/// `SkySample::colors[0..4]` using the native sky heading. It is not this
+/// sample-only frame value.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FogFrame {
-    /// Normalized RGB fog color from `SkySample::packed[1]`.
-    pub color: [f32; 3],
-    /// Native global lighting floor from the same sampled RGB state.
+    /// Native global lighting floor from `SkySample::packed[1]`.
     ///
     /// `CShade` merges this vector with the material lighting accumulator by
     /// taking the per-channel maximum before the shader receives the result.
@@ -980,10 +982,8 @@ impl FogFrame {
         let start = finite_or_zero(sample.values[0]) * FOG_DISTANCE_SCALE;
         let end = finite_or_zero(sample.values[1]) * FOG_DISTANCE_SCALE;
         let rgba = sample.packed[1].rgba();
-        let color = [rgba[0], rgba[1], rgba[2]];
         Self {
-            color,
-            lighting_floor: color,
+            lighting_floor: [rgba[0], rgba[1], rgba[2]],
             start,
             end,
         }
@@ -1845,12 +1845,12 @@ mod tests {
     }
 
     #[test]
-    fn fog_uses_original_scale_and_packed_rgb() {
+    fn fog_distances_use_original_scale_and_floor_uses_packed_rgb() {
         let frame = fog_frame(&sample());
         assert_eq!(frame.start, 700.0);
         assert_eq!(frame.end, 1_400.0);
         assert_eq!(
-            frame.color,
+            frame.lighting_floor,
             [
                 0x11 as f32 / 255.0,
                 0x22 as f32 / 255.0,
@@ -1945,11 +1945,10 @@ mod tests {
 
         let mut atmosphere = atmosphere(true);
         atmosphere.sky.colors[12] = PackedColor(0xFF12_3456);
-        let (lighting_floor, fog_color, sprites_have_native_uv) = {
+        let (lighting_floor, sprites_have_native_uv) = {
             let frame = system.update(&atmosphere, 10.0).expect("sky update");
             (
                 frame.lighting_floor,
-                frame.fog.color,
                 frame
                     .sprites
                     .iter()
@@ -1969,7 +1968,8 @@ mod tests {
             positions
         );
         assert_eq!(system.mesh().vertices[0].color, PackedColor(0xFF12_3456));
-        assert_eq!(lighting_floor, fog_color);
+        let packed = atmosphere.sky.packed[1].rgba();
+        assert_eq!(lighting_floor, [packed[0], packed[1], packed[2]]);
         assert!(sprites_have_native_uv);
     }
 

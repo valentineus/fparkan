@@ -20,6 +20,13 @@ sky.wea
 backend разрешает архив и имя звука. Это позволяет одной и той же модели
 погоды работать в preview и в игровом цикле.
 
+Цвета неба, ambient lighting и fog renderer-а используют разные поля того же
+`sky.ske` sample. `SkySample::packed[1]` задаёт глобальный lighting floor;
+`CShade` объединяет его с material lighting по поканальному максимуму.
+`D3DRS_FOGCOLOR` (`0x22`) зависит от направления камеры и интерполируется из
+`SkySample::colors[0..4]` по native sky heading. Значения `sky.values[0..1]`
+продолжают задавать fog start/end, масштабируемые на 700.
+
 ## Входы и границы
 
 Для расписания используется такой вызов:
