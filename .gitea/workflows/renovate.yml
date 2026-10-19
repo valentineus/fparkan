@@ -18,7 +18,7 @@ jobs:
       - name: Run renovate
         run: renovate
         env:
-          RENOVATE_GITHUB_COM_TOKEN: ${{ secrets.RENOVATE_GITHUB_COM_TOKEN }}
+          RENOVATE_GITHUB_COM_TOKEN: ${{ secrets.RENOVATE_GITHUB_TOKEN }}
           RENOVATE_CONFIG_FILE: renovate.config.cjs
           RENOVATE_REPOSITORIES: ${{ gitea.repository }}
           RENOVATE_TOKEN: ${{ secrets.RENOVATE_TOKEN }}
