@@ -1035,15 +1035,25 @@ WEAR и MAT0 до объединения геометрии. Индексы GPU 
 animation phase; object batches сохраняют их legacy blend/depth/alpha state.
 
 После загрузки world path создаёт интерактивную free-flight камеру (`WASD`,
-`E/Q`, `Shift`, `Ctrl`, RMB relative-look), обновляет listener и на каждом
-кадре собирает environment frame. После шага движения камера проверяет высоту
+`E/Q`, `Shift`, `Ctrl`, RMB relative-look), обновляет listener и собирает
+environment frame для каждого подготовленного кадра. Event loop один раз
+сэмплирует камеру, общий animation clock, геометрию и окружение перед запросом
+redraw; redraw потребляет это состояние. Если surface требует пересоздать
+swapchain, тот же sample времени и состояние мира отправляются повторно.
+Перед повторной отправкой projection камеры и viewport-зависимые environment
+и shadow geometry обновляются для нового размера без продвижения сцены.
+Счётчик и replay clock продвигаются только после результата `Presented`.
+После шага движения камера проверяет высоту
 `TerrainWorld`: над конечной поверхностью сохраняется начальный просвет, а вне
 поверхности высота не ограничивается. Mission-local `sky.ske`/`sky.wea` выбирают
 атмосферное расписание и sky materials, `effects.rlb/env_lightning` даёт
 lightning visual; weather particles, flares, sun/moon, point lights,
 projected shadows и audio events обновляются вместе с камерой и временем.
 `--atmosphere-seconds` задаёт старт времени, `--frames 0` оставляет цикл
-бесконечным, а `--preview-roots` служит только диагностическим ограничителем.
+бесконечным, `--control-clock-ms N` воспроизводит общий clock анимации MSH и
+материалов вместе с окружением от нуля до `N` за заданное число кадров и требует
+как минимум два кадра.
+`--preview-roots` служит только диагностическим ограничителем.
 `--legacy-camera-capture` выбирает воспроизводимую камеру без free-flight
 управления: запись selector 0 задаёт D3D7 transform, clip параметры и native
 viewport RECT `[left, top, right, bottom]`. Путь сохраняет оси basis из view
@@ -1052,14 +1062,15 @@ matrix вместе с roll, переносит полученный `clip_from_
 и отклоняет несовпадение размера при
 создании или resize вместо растягивания кадра. Результат нужно сравнивать с
 тем же crop исходного PNG `[left, top, right, bottom]`. Контроллер
-`FreeFlightCamera` в этом режиме не создаётся, но redraw продолжает обновлять
+`FreeFlightCamera` в этом режиме не создаётся. Подготовка кадра обновляет
 environment и projected shadows от captured camera. Перед environment update и
 его audio events listener получает position, forward и up captured camera;
 начальная сортировка world draw использует её же position. Phase capture может
 содержать наблюдаемый mission path и проверенный `atmosphere_seconds`; viewer
 использует эту абсолютную фазу по умолчанию, если не указан явный CLI override,
-и удерживает sample атмосферы на ней через readback frames. FX по-прежнему
-получает реальный frame time. Это не полное simulation time: `weather`, RNG и
+и удерживает sample атмосферы на ней через readback frames. Без
+`--control-clock-ms` FX получает реальный frame time; с параметром environment
+и материалы используют replay clock. Это не полное simulation time: `weather`, RNG и
 остальное mission state остаются неизвестными, поэтому совпадение камеры и
 фазы не доказывает visual parity с native frame.
 

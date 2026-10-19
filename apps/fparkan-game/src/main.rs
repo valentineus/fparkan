@@ -153,6 +153,7 @@ fn run(args: &[String]) -> Result<String, String> {
         environment,
         audio,
         args.frames,
+        args.control_clock_ms,
         &args.mission,
         loaded.object_count,
         args.readback_out.as_deref(),
@@ -3395,6 +3396,14 @@ fn lightning_quad_vertices(
 /// per-frame light/fog block.  The sky mesh and weather primitives stay on the
 /// same update clock, so camera movement cannot leave environment audio or
 /// lighting one frame behind.
+#[derive(Clone, Debug, PartialEq)]
+struct DynamicEnvironmentFrame {
+    atmosphere: fparkan_fx::atmosphere::AtmosphereFrame,
+    sky_mesh: SkyMesh,
+    environment_frame: EnvironmentFrame,
+    absolute_time_seconds: f32,
+}
+
 struct DynamicEnvironment {
     schedule: TypedAtmosphere,
     sky: SkySystem,
@@ -3416,7 +3425,7 @@ impl DynamicEnvironment {
         viewport: [f32; 2],
         renderer: &mut VulkanSmokeRenderer,
         mut audio: Option<&mut audio::GameAudio>,
-    ) -> Result<(SkyFrame<'_>, SkyMesh, EnvironmentFrame), String> {
+    ) -> Result<DynamicEnvironmentFrame, String> {
         let dt_seconds = if dt_seconds.is_finite() {
             dt_seconds.max(0.0)
         } else {
@@ -3518,7 +3527,12 @@ impl DynamicEnvironment {
                     .map_err(|error| format!("play environment sound: {error}"))?;
             }
         }
-        Ok((sky_frame, sky_mesh, environment_frame))
+        Ok(DynamicEnvironmentFrame {
+            atmosphere,
+            sky_mesh,
+            environment_frame,
+            absolute_time_seconds,
+        })
     }
 }
 
@@ -5429,6 +5443,7 @@ fn run_static_vulkan_mode(
     environment: Option<DynamicEnvironment>,
     audio: Option<audio::GameAudio>,
     target_frames: u64,
+    control_clock_target_ms: Option<u32>,
     mission: &str,
     object_count: usize,
     readback_out: Option<&std::path::Path>,
@@ -5481,6 +5496,7 @@ fn run_static_vulkan_mode(
         shadow_base_index,
         audio,
         target_frames,
+        control_clock_target_ms,
         mission,
         object_count,
         readback_out.map(std::path::Path::to_path_buf),
@@ -5491,6 +5507,80 @@ fn run_static_vulkan_mode(
         app.error = Some(format!("winit event loop: {err}"));
     }
     app.finish()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SceneSampleId {
+    Live(u64),
+    Replay(u64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FrameClockSample {
+    id: SceneSampleId,
+    time_ms: u32,
+    delta_seconds: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SceneFrameUpdate {
+    sample: FrameClockSample,
+    camera: PreviewCameraFrame,
+    viewport: [f32; 2],
+    aspect: f32,
+    environment: Option<DynamicEnvironmentFrame>,
+}
+
+#[derive(Debug, Default)]
+struct SceneFrameLifecycle {
+    pending: Option<SceneFrameUpdate>,
+    frames_presented: u64,
+    last_replay_time_ms: u32,
+}
+
+impl SceneFrameLifecycle {
+    fn sample_replay(&self, target_ms: u32, target_frames: u64) -> FrameClockSample {
+        if let Some(pending) = self.pending.as_ref() {
+            return pending.sample;
+        }
+        let time_ms = control_clock_ms_for_frame(target_ms, self.frames_presented, target_frames);
+        FrameClockSample {
+            id: SceneSampleId::Replay(self.frames_presented),
+            time_ms,
+            delta_seconds: replay_environment_delta_seconds(self.last_replay_time_ms, time_ms),
+        }
+    }
+
+    fn prepare(&mut self, update: SceneFrameUpdate) -> bool {
+        if self.pending.is_some() {
+            return false;
+        }
+        self.pending = Some(update);
+        true
+    }
+
+    fn record_presented(&mut self) -> Option<u64> {
+        let sample = self.pending.take()?.sample;
+        let frame_index = self.frames_presented;
+        self.frames_presented = self.frames_presented.saturating_add(1);
+        if matches!(sample.id, SceneSampleId::Replay(_)) {
+            self.last_replay_time_ms = sample.time_ms;
+        }
+        Some(frame_index)
+    }
+}
+
+fn control_clock_ms_for_frame(target_ms: u32, frame_index: u64, target_frames: u64) -> u32 {
+    if target_frames <= 1 {
+        return target_ms;
+    }
+    let last_frame = u128::from(target_frames - 1);
+    let frame = u128::from(frame_index).min(last_frame);
+    ((u128::from(target_ms) * frame) / last_frame) as u32
+}
+
+fn replay_environment_delta_seconds(last_applied_ms: u32, current_ms: u32) -> f32 {
+    current_ms.saturating_sub(last_applied_ms) as f32 / 1_000.0
 }
 
 struct StaticVulkanApp {
@@ -5523,19 +5613,18 @@ struct StaticVulkanApp {
     shadow_receivers: Vec<ShadowTriangle>,
     shadow_cache: ShadowPageCache,
     shadow_last_evidence: ShadowFrameEvidence,
-    environment_last_tick: Instant,
-    material_last_tick: Instant,
-    material_elapsed: Duration,
     material_time_ms: u32,
     environment_primitive_count: usize,
     pressed_keys: HashSet<KeyCode>,
     last_tick: Instant,
+    simulation_elapsed: Duration,
     mouse_look: bool,
     audio: Option<audio::GameAudio>,
     camera_mode: &'static str,
     mesh_components: usize,
     terrain_components: usize,
     target_frames: u64,
+    control_clock_target_ms: Option<u32>,
     mission: String,
     object_count: usize,
     readback_out: Option<PathBuf>,
@@ -5544,7 +5633,7 @@ struct StaticVulkanApp {
     window_id: Option<WindowId>,
     window: Option<Window>,
     renderer: Option<VulkanSmokeRenderer>,
-    frames_presented: u64,
+    lifecycle: SceneFrameLifecycle,
     output: Option<String>,
     error: Option<String>,
 }
@@ -5559,6 +5648,7 @@ impl StaticVulkanApp {
         shadow_base_index: usize,
         audio: Option<audio::GameAudio>,
         target_frames: u64,
+        control_clock_target_ms: Option<u32>,
         mission: &str,
         object_count: usize,
         readback_out: Option<PathBuf>,
@@ -5611,19 +5701,18 @@ impl StaticVulkanApp {
             shadow_receivers: preview.shadow_receivers,
             shadow_cache: ShadowPageCache::default(),
             shadow_last_evidence: ShadowFrameEvidence::default(),
-            environment_last_tick: Instant::now(),
-            material_last_tick: Instant::now(),
-            material_elapsed: Duration::ZERO,
             material_time_ms: 0,
             environment_primitive_count: 0,
             pressed_keys: HashSet::new(),
             last_tick: Instant::now(),
+            simulation_elapsed: Duration::ZERO,
             mouse_look: false,
             audio,
             camera_mode: preview.camera_mode,
             mesh_components: preview.mesh_components,
             terrain_components: preview.terrain_components,
             target_frames,
+            control_clock_target_ms,
             mission: mission.to_string(),
             object_count,
             readback_out,
@@ -5632,7 +5721,7 @@ impl StaticVulkanApp {
             window_id: None,
             window: None,
             renderer: None,
-            frames_presented: 0,
+            lifecycle: SceneFrameLifecycle::default(),
             output: None,
             error: None,
         }
@@ -5739,30 +5828,17 @@ impl StaticVulkanApp {
         Ok(keys)
     }
 
-    fn update_free_camera(&mut self) -> Result<(), String> {
+    fn update_free_camera(&mut self, delta_seconds: f32, viewport: [f32; 2]) -> Result<(), String> {
         if self.free_camera.is_none() {
             return Ok(());
         }
-        let now = Instant::now();
-        let elapsed = now
-            .saturating_duration_since(self.last_tick)
-            .min(Duration::from_millis(100));
-        self.last_tick = now;
-        let Some(window) = self.window.as_ref() else {
-            return Ok(());
-        };
-        let size = window.inner_size();
-        let aspect = if size.height == 0 {
-            16.0 / 9.0
-        } else {
-            size.width as f32 / size.height as f32
-        };
+        let aspect = viewport[0] / viewport[1].max(1.0);
         let view_camera = {
             let free_camera = self
                 .free_camera
                 .as_mut()
                 .ok_or_else(|| "free-flight camera disappeared".to_string())?;
-            free_camera.advance(&self.pressed_keys, elapsed.as_secs_f32());
+            free_camera.advance(&self.pressed_keys, delta_seconds.min(0.1));
             free_camera.keep_above_terrain(&self.terrain)?;
             free_camera.preview_frame(aspect)
         };
@@ -5785,26 +5861,20 @@ impl StaticVulkanApp {
         Ok(())
     }
 
-    fn update_material_clock(&mut self) {
-        let now = Instant::now();
-        let elapsed = now
-            .saturating_duration_since(self.material_last_tick)
-            .min(Duration::from_millis(100));
-        self.material_last_tick = now;
-        self.material_elapsed = self.material_elapsed.saturating_add(elapsed);
-        // Keep the native u32 millisecond clock while flooring only the
-        // accumulated duration. This preserves sub-millisecond frame deltas
-        // instead of dropping them once per redraw.
-        self.material_time_ms = self.material_elapsed.as_millis() as u32;
+    fn update_material_clock(&mut self, sample: FrameClockSample) {
+        self.material_time_ms = sample.time_ms;
     }
 
-    fn update_controlled_component_geometry(&mut self) -> Result<(), String> {
+    fn update_controlled_component_geometry(
+        &mut self,
+        sample: FrameClockSample,
+    ) -> Result<(), String> {
         let mut pose_changed = false;
         for instance in &mut self.control_animation_instances {
             let pose = static_preview_control_pose_buffer(
                 &instance.model,
                 &instance.control,
-                self.material_time_ms,
+                sample.time_ms,
                 &mut instance.state,
             )?;
             let slot = self
@@ -5993,63 +6063,103 @@ impl StaticVulkanApp {
         })
     }
 
-    fn update_environment(&mut self) -> Result<(), String> {
-        let Some(renderer) = self.renderer.as_mut() else {
-            return Ok(());
+    fn update_environment(
+        &mut self,
+        sample: FrameClockSample,
+        viewport: [f32; 2],
+    ) -> Result<Option<DynamicEnvironmentFrame>, String> {
+        if self.renderer.is_none() {
+            return Ok(None);
+        }
+        let active_materials = {
+            let renderer = self
+                .renderer
+                .as_mut()
+                .ok_or_else(|| "native Vulkan renderer was not initialized".to_string())?;
+            update_material_animations(
+                &mut self.material_animations,
+                &self.materials,
+                renderer,
+                self.material_time_ms,
+            )?
         };
-        let viewport = self.captured_viewport.map_or_else(
-            || {
-                self.window
-                    .as_ref()
-                    .map(|window| {
-                        let size = window.inner_size();
-                        [size.width.max(1) as f32, size.height.max(1) as f32]
-                    })
-                    .unwrap_or([1280.0, 720.0])
-            },
-            |viewport| [viewport.extent[0] as f32, viewport.extent[1] as f32],
-        );
-        let aspect = viewport[0] / viewport[1].max(1.0);
-        let now = Instant::now();
-        let dt = now
-            .saturating_duration_since(self.environment_last_tick)
-            .min(Duration::from_millis(100))
-            .as_secs_f32();
-        self.environment_last_tick = now;
-        let active_materials = update_material_animations(
-            &mut self.material_animations,
-            &self.materials,
-            renderer,
-            self.material_time_ms,
-        )?;
-        Self::update_world_transparency(
-            &self.mesh,
-            &self.materials,
-            &self.world_range_indices,
-            &self.world_range_index_counts,
-            &self.native_handedness_by_range,
-            self.view_camera.position,
-            &active_materials,
-            renderer,
-        )?;
+        {
+            let renderer = self
+                .renderer
+                .as_mut()
+                .ok_or_else(|| "native Vulkan renderer was not initialized".to_string())?;
+            Self::update_world_transparency(
+                &self.mesh,
+                &self.materials,
+                &self.world_range_indices,
+                &self.world_range_index_counts,
+                &self.native_handedness_by_range,
+                self.view_camera.position,
+                &active_materials,
+                renderer,
+            )?;
+        }
         let camera = self.view_camera;
         if let Some(audio) = self.audio.as_mut() {
             audio
                 .update_listener(camera.position, camera.forward, camera.up)
                 .map_err(|error| format!("update audio listener: {error}"))?;
         }
-        if let Some(environment) = self.environment.as_mut() {
-            let (sky_frame, sky_mesh, environment_frame) =
-                environment.update(dt, &camera, aspect, viewport, renderer, self.audio.as_mut())?;
-            self.environment_primitive_count = environment_frame.primitives.len();
+        let environment_frame = if self.environment.is_some() {
+            let renderer = self
+                .renderer
+                .as_mut()
+                .ok_or_else(|| "native Vulkan renderer was not initialized".to_string())?;
+            let environment = self
+                .environment
+                .as_mut()
+                .ok_or_else(|| "dynamic environment disappeared".to_string())?;
+            Some(environment.update(
+                sample.delta_seconds,
+                &camera,
+                viewport[0] / viewport[1].max(1.0),
+                viewport,
+                renderer,
+                self.audio.as_mut(),
+            )?)
+        } else {
+            None
+        };
+        if let Some(frame) = environment_frame.as_ref() {
+            self.environment_primitive_count = frame.environment_frame.primitives.len();
+        }
+        self.apply_environment_view(environment_frame.as_ref(), camera, viewport)?;
+        Ok(environment_frame)
+    }
+
+    fn apply_environment_view(
+        &mut self,
+        frame: Option<&DynamicEnvironmentFrame>,
+        camera: PreviewCameraFrame,
+        viewport: [f32; 2],
+    ) -> Result<(), String> {
+        let Some(renderer) = self.renderer.as_mut() else {
+            return Ok(());
+        };
+        let aspect = viewport[0] / viewport[1].max(1.0);
+        if let Some(frame) = frame {
+            let environment = self
+                .environment
+                .as_ref()
+                .ok_or_else(|| "dynamic environment disappeared".to_string())?;
+            let sky_frame = SkyFrame::from_atmosphere(
+                &frame.atmosphere,
+                &environment.materials,
+                frame.absolute_time_seconds,
+            );
             if let Some(environment_gpu) = self.environment_gpu.as_mut() {
                 environment_gpu.update(
                     &mut self.mesh,
                     &self.materials,
                     renderer,
                     &sky_frame,
-                    &sky_mesh,
-                    &environment_frame,
+                    &frame.sky_mesh,
+                    &frame.environment_frame,
                     &camera,
                     viewport,
                     self.material_time_ms,
@@ -6073,7 +6183,7 @@ impl StaticVulkanApp {
                 self.shadow_material_index,
                 renderer,
                 Some(&sky_frame),
-                Some(&environment_frame),
+                Some(&frame.environment_frame),
                 Some(shadow_camera),
             )?;
         } else {
@@ -6098,6 +6208,75 @@ impl StaticVulkanApp {
             )?;
         }
         Ok(())
+    }
+
+    fn refresh_pending_viewport(&mut self, viewport: [f32; 2]) -> Result<(), String> {
+        if self.captured_viewport.is_some() {
+            return Ok(());
+        }
+        let Some(mut update) = self.lifecycle.pending.clone() else {
+            return Ok(());
+        };
+        let viewport = [viewport[0].max(1.0), viewport[1].max(1.0)];
+        let aspect = viewport[0] / viewport[1];
+        if let Some(free_camera) = self.free_camera.as_ref() {
+            let camera = free_camera.preview_frame(aspect);
+            self.view_camera = camera;
+            self.camera = camera.vulkan_camera();
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer
+                    .set_camera(self.camera)
+                    .map_err(|error| format!("refresh free-flight camera viewport: {error}"))?;
+            }
+        }
+        let camera = self.view_camera;
+        self.apply_environment_view(update.environment.as_ref(), camera, viewport)?;
+        update.camera = camera;
+        update.viewport = viewport;
+        update.aspect = aspect;
+        self.lifecycle.pending = Some(update);
+        Ok(())
+    }
+
+    fn sample_frame_clock(&mut self) -> FrameClockSample {
+        if let Some(target_ms) = self.control_clock_target_ms {
+            return self.lifecycle.sample_replay(target_ms, self.target_frames);
+        }
+        self.sample_live_frame_clock_at(Instant::now())
+    }
+
+    fn sample_live_frame_clock_at(&mut self, now: Instant) -> FrameClockSample {
+        if let Some(pending) = self.lifecycle.pending.as_ref() {
+            return pending.sample;
+        }
+        let elapsed = now.saturating_duration_since(self.last_tick);
+        self.last_tick = now;
+        self.simulation_elapsed = self.simulation_elapsed.saturating_add(elapsed);
+        FrameClockSample {
+            id: SceneSampleId::Live(self.lifecycle.frames_presented),
+            time_ms: self.simulation_elapsed.as_millis() as u32,
+            delta_seconds: elapsed.as_secs_f32(),
+        }
+    }
+
+    fn prepare_scene_update(
+        &mut self,
+        sample: FrameClockSample,
+        viewport: [f32; 2],
+    ) -> Result<SceneFrameUpdate, String> {
+        let viewport = [viewport[0].max(1.0), viewport[1].max(1.0)];
+        let aspect = viewport[0] / viewport[1];
+        self.update_free_camera(sample.delta_seconds, viewport)?;
+        self.update_material_clock(sample);
+        self.update_controlled_component_geometry(sample)?;
+        let environment = self.update_environment(sample, viewport)?;
+        Ok(SceneFrameUpdate {
+            sample,
+            camera: self.view_camera,
+            viewport,
+            aspect,
+            environment,
+        })
     }
 
     fn set_mouse_look(&mut self, active: bool) {
@@ -6200,7 +6379,7 @@ impl StaticVulkanApp {
         self.output = Some(format!(
             "rendered mission {}: {} frames, {} objects, {} mesh components, {} terrain components, camera={}, captured_viewport_crop={}, materials={}, environment_primitives={}, shadow_casters={}, shadow_indices={}, swapchain_recreates={}, validation={}, swapchain_format={}, readback_format={}, readback={}, startup_ms={{mission_assets:{:.1},terrain_materials:{:.1},sky:{:.1},gpu_initialization:{:.1}}}",
             self.mission,
-            self.frames_presented,
+            self.lifecycle.frames_presented,
             self.object_count,
             self.mesh_components,
             self.terrain_components,
@@ -6360,15 +6539,8 @@ impl ApplicationHandler for StaticVulkanApp {
         self.window = Some(window);
         self.renderer = Some(renderer);
         self.last_tick = Instant::now();
-        self.environment_last_tick = Instant::now();
-        self.material_last_tick = Instant::now();
-        self.material_elapsed = Duration::ZERO;
+        self.simulation_elapsed = Duration::ZERO;
         self.material_time_ms = 0;
-        if let Err(error) = self.update_free_camera() {
-            self.error = Some(error);
-            event_loop.exit();
-            return;
-        }
         self.schedule_next_redraw();
     }
 
@@ -6437,45 +6609,64 @@ impl ApplicationHandler for StaticVulkanApp {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.request_resize((drawable_size.width, drawable_size.height));
                 }
+                if drawable_size.width == 0 || drawable_size.height == 0 {
+                    event_loop.set_control_flow(ControlFlow::Wait);
+                } else {
+                    event_loop.set_control_flow(ControlFlow::Poll);
+                }
             }
             WindowEvent::RedrawRequested => {
-                if let Err(error) = self.update_free_camera() {
-                    self.error = Some(error);
-                    event_loop.exit();
+                if self.lifecycle.pending.is_none() {
                     return;
                 }
-                self.update_material_clock();
-                if let Err(error) = self.update_controlled_component_geometry() {
-                    self.error = Some(error);
-                    event_loop.exit();
-                    return;
-                }
-                if let Err(error) = self.update_environment() {
-                    self.error = Some(error);
-                    event_loop.exit();
-                    return;
-                }
-                let Some(renderer) = self.renderer.as_mut() else {
-                    self.error = Some("native Vulkan renderer was not initialized".to_string());
-                    event_loop.exit();
-                    return;
+                let drawable_available = self.window.as_ref().is_some_and(|window| {
+                    let size = window.inner_size();
+                    size.width != 0 && size.height != 0
+                });
+                let outcome = {
+                    let Some(renderer) = self.renderer.as_mut() else {
+                        self.error = Some("native Vulkan renderer was not initialized".to_string());
+                        event_loop.exit();
+                        return;
+                    };
+                    renderer.draw_frame()
                 };
-                match renderer.draw_frame() {
+                match outcome {
                     Ok(VulkanSmokeFrameOutcome::Presented) => {
-                        self.frames_presented = self.frames_presented.saturating_add(1);
+                        self.lifecycle.record_presented();
                     }
-                    Ok(
-                        VulkanSmokeFrameOutcome::Recreated | VulkanSmokeFrameOutcome::ZeroExtent,
-                    ) => {}
+                    Ok(VulkanSmokeFrameOutcome::Recreated) => {
+                        if let Some((width, height)) = self
+                            .renderer
+                            .as_ref()
+                            .map(|renderer| renderer.report().swapchain_extent)
+                        {
+                            if width != 0 && height != 0 {
+                                if let Err(error) =
+                                    self.refresh_pending_viewport([width as f32, height as f32])
+                                {
+                                    self.error = Some(error);
+                                    event_loop.exit();
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Ok(VulkanSmokeFrameOutcome::ZeroExtent) => {
+                        if !drawable_available {
+                            event_loop.set_control_flow(ControlFlow::Wait);
+                        }
+                    }
                     Err(err) => {
                         self.error = Some(err.to_string());
                         event_loop.exit();
                         return;
                     }
                 }
-                if self.target_frames != 0 && self.frames_presented >= self.target_frames {
+                if self.target_frames != 0 && self.lifecycle.frames_presented >= self.target_frames
+                {
                     self.complete(event_loop);
-                } else {
+                } else if drawable_available {
                     self.schedule_next_redraw();
                 }
             }
@@ -6483,10 +6674,39 @@ impl ApplicationHandler for StaticVulkanApp {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if self.output.is_none() && self.error.is_none() {
-            self.schedule_next_redraw();
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.output.is_some() || self.error.is_some() {
+            return;
         }
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let size = window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        event_loop.set_control_flow(ControlFlow::Poll);
+        if self.lifecycle.pending.is_none() {
+            let viewport = self
+                .captured_viewport
+                .map_or([size.width as f32, size.height as f32], |captured| {
+                    [captured.extent[0] as f32, captured.extent[1] as f32]
+                });
+            let sample = self.sample_frame_clock();
+            let update = match self.prepare_scene_update(sample, viewport) {
+                Ok(update) => update,
+                Err(error) => {
+                    self.error = Some(error);
+                    event_loop.exit();
+                    return;
+                }
+            };
+            if !self.lifecycle.prepare(update) {
+                return;
+            }
+        }
+        self.schedule_next_redraw();
     }
 }
 
@@ -6496,6 +6716,7 @@ struct Args {
     mission: String,
     frames: u64,
     atmosphere_seconds: Option<f32>,
+    control_clock_ms: Option<u32>,
     validation: bool,
     readback_out: Option<PathBuf>,
     preview_roots: NonZeroUsize,
@@ -6513,6 +6734,7 @@ impl Args {
         // runs and validation scripts.
         let mut frames = 0;
         let mut atmosphere_seconds = None;
+        let mut control_clock_ms = None;
         let mut validation = false;
         let mut readback_out = None;
         // A native static-Vulkan invocation is the usable mission preview, so
@@ -6559,6 +6781,14 @@ impl Args {
                         );
                     }
                     atmosphere_seconds = Some(value);
+                }
+                "--control-clock-ms" => {
+                    control_clock_ms = Some(
+                        iter.next()
+                            .ok_or_else(|| "--control-clock-ms requires a value".to_string())?
+                            .parse()
+                            .map_err(|_| "--control-clock-ms must be a u32 integer".to_string())?,
+                    );
                 }
                 "--validation" => {
                     validation = true;
@@ -6608,11 +6838,18 @@ impl Args {
         }
         let root = root.ok_or_else(|| "missing --root".to_string())?;
         let mission = mission.ok_or_else(|| "missing --mission".to_string())?;
+        if control_clock_ms.is_some() && frames < 2 {
+            return Err(
+                "--control-clock-ms requires --frames of at least 2 to replay the animation clock"
+                    .to_string(),
+            );
+        }
         Ok(Self {
             root,
             mission,
             frames,
             atmosphere_seconds,
+            control_clock_ms,
             validation,
             readback_out,
             preview_roots,
@@ -6781,7 +7018,7 @@ fn decode_legacy_camera_capture_json(bytes: &[u8]) -> Result<String, String> {
 }
 
 fn usage() -> String {
-    "usage: fparkan-game --root <path> --mission <path> [--frames <n>] [--atmosphere-seconds <seconds>] [--validation] [--preview-roots <non-zero n>] [--legacy-camera-capture <path>] [--static-animation-frame <u16>] [--static-material-phase <u16>] [--readback-out <path>]\nstatic preview uses saved per-component CTLD defaults, with uncontrolled nodes at frame 0; --static-animation-frame overrides all components globally.".to_string()
+    "usage: fparkan-game --root <path> --mission <path> [--frames <n>] [--atmosphere-seconds <seconds>] [--control-clock-ms <u32>] [--validation] [--preview-roots <non-zero n>] [--legacy-camera-capture <path>] [--static-animation-frame <u16>] [--static-material-phase <u16>] [--readback-out <path>]\nstatic preview uses saved per-component CTLD defaults, with uncontrolled nodes at frame 0; --static-animation-frame overrides all components globally. --control-clock-ms replays one shared MSH/material/environment clock from zero to the selected time over --frames frames.".to_string()
 }
 
 #[cfg(test)]
@@ -7066,7 +7303,7 @@ mod tests {
     }
 
     #[test]
-    fn controlled_component_update_keeps_vertices_and_shadow_triangles_in_sync() {
+    fn live_tick_and_pending_resize_keep_the_scene_sample_while_refreshing_projection() {
         let model = Arc::new(control_pose_drawable_test_model());
         let control = control_pose_test_control();
         let dynamic = DynamicComponentGeometry {
@@ -7093,8 +7330,33 @@ mod tests {
             center: [0.0; 3],
             radius: 1.0,
         };
-        let view_camera = FreeFlightCamera {
-            position: [0.0; 3],
+        let mut land = fparkan_terrain_format::LandMeshDocument {
+            streams: Vec::new(),
+            nodes_raw: Vec::new(),
+            slots: fparkan_terrain_format::TerrainSlotTable {
+                header_raw: Vec::new(),
+                slots_raw: Vec::new(),
+            },
+            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            normals: Vec::new(),
+            uv0: Vec::new(),
+            accelerator: Vec::new(),
+            aux14: Vec::new(),
+            aux18: Vec::new(),
+            faces: vec![fparkan_terrain_format::TerrainFace28 {
+                flags: FullSurfaceMask(1),
+                material_tag: 0,
+                aux_tag: 0,
+                vertices: [0, 1, 2],
+                neighbors: [None, None, None],
+                tail_raw: [0; 8],
+                raw: [0; 28],
+            }],
+        };
+        set_test_terrain_lod0_range(&mut land);
+        let terrain = Arc::new(TerrainWorld::from_land_msh(&land).expect("test terrain"));
+        let free_camera = FreeFlightCamera {
+            position: [0.25, 0.25, 0.0],
             yaw: 0.0,
             pitch: 0.0,
             horizontal_fov: 1.0,
@@ -7102,8 +7364,8 @@ mod tests {
             far_plane: 100.0,
             move_speed: 1.0,
             ground_clearance: 0.0,
-        }
-        .preview_frame(16.0 / 9.0);
+        };
+        let view_camera = free_camera.preview_frame(16.0 / 9.0);
         let preview = StaticPreviewScene {
             mesh: initial_mesh.clone(),
             native_handedness_by_range: HashMap::new(),
@@ -7120,7 +7382,7 @@ mod tests {
             shadow_sphere_baselines: vec![baseline],
             shadow_receivers: Vec::new(),
             shadow_material_index: 0,
-            terrain: Arc::new(TerrainWorld::default()),
+            terrain,
             component_pose_buffers: vec![vec![Some(initial_pose)]],
             component_mount_poses: vec![vec![None]],
             control_animation_instances: vec![ControlAnimationInstance {
@@ -7155,15 +7417,34 @@ mod tests {
             initial_mesh.indices.len(),
             None,
             0,
+            None,
             "control-test",
             1,
             None,
             false,
             StartupTimings::default(),
         );
-        app.material_time_ms = 225;
-        app.update_controlled_component_geometry()
-            .expect("update projected component and caster");
+        app.free_camera = Some(free_camera);
+        app.pressed_keys.insert(KeyCode::KeyW);
+        let start = app.last_tick;
+        let sample = app.sample_live_frame_clock_at(start + Duration::from_millis(225));
+        assert_eq!(sample.time_ms, 225);
+        assert!((sample.delta_seconds - 0.225).abs() < f32::EPSILON);
+        let update = app
+            .prepare_scene_update(sample, [1280.0, 720.0])
+            .expect("apply one full live tick to the scene");
+        let camera_after_tick = app.free_camera.expect("free-flight camera").position;
+        assert!((camera_after_tick[0] - 0.35).abs() < 1.0e-5);
+        assert!((camera_after_tick[1] - 0.25).abs() < 1.0e-5);
+        assert_eq!(app.material_time_ms, sample.time_ms);
+        assert!(app.lifecycle.prepare(update.clone()));
+        let control_state_after_tick = app.control_animation_instances[0].state.clone();
+        assert_eq!(
+            app.sample_live_frame_clock_at(start + Duration::from_millis(500)),
+            sample
+        );
+        assert_eq!(app.simulation_elapsed, Duration::from_millis(225));
+        assert_eq!(app.lifecycle.pending.as_ref(), Some(&update));
 
         assert_eq!(app.mesh.indices, initial_mesh.indices);
         assert_eq!(app.mesh.vertices.len(), initial_mesh.vertices.len());
@@ -7178,14 +7459,41 @@ mod tests {
         assert_ne!(b_triangles, initial_triangles);
         assert!(b_sphere.radius > baseline.radius);
 
-        app.update_controlled_component_geometry()
+        app.refresh_pending_viewport([800.0, 600.0])
+            .expect("refresh only viewport-dependent state after recreation");
+        let refreshed = app.lifecycle.pending.as_ref().expect("pending sample");
+        assert_eq!(refreshed.sample, sample);
+        assert_eq!(refreshed.viewport, [800.0, 600.0]);
+        assert_eq!(refreshed.aspect, 4.0 / 3.0);
+        assert_eq!(refreshed.camera.position, update.camera.position);
+        assert_ne!(
+            refreshed.camera.clip_from_world,
+            update.camera.clip_from_world
+        );
+        assert_eq!(app.mesh.vertices, b_vertices);
+        assert_eq!(app.shadow_casters[0].triangles, b_triangles);
+        assert_eq!(
+            app.control_animation_instances[0].state,
+            control_state_after_tick
+        );
+        assert_eq!(app.material_time_ms, sample.time_ms);
+        assert_eq!(app.simulation_elapsed, Duration::from_millis(225));
+        assert_eq!(app.lifecycle.frames_presented, 0);
+        assert_eq!(app.lifecycle.record_presented(), Some(0));
+
+        app.update_controlled_component_geometry(sample)
             .expect("repeat the same control timestamp");
         assert_eq!(app.mesh.vertices, b_vertices);
         assert_eq!(app.shadow_casters[0].triangles, b_triangles);
         assert_eq!(app.shadow_casters[0].sphere, b_sphere);
 
-        app.material_time_ms = 0;
-        app.update_controlled_component_geometry()
+        let first_sample = FrameClockSample {
+            id: SceneSampleId::Live(0),
+            time_ms: 0,
+            delta_seconds: 0.0,
+        };
+        app.update_material_clock(first_sample);
+        app.update_controlled_component_geometry(first_sample)
             .expect("return to first control pose");
         assert_eq!(app.mesh.vertices, initial_mesh.vertices);
         assert_eq!(app.shadow_casters[0].triangles, initial_triangles);
@@ -7208,6 +7516,28 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn scene_frame_update(sample: FrameClockSample, viewport: [f32; 2]) -> SceneFrameUpdate {
+        let aspect = viewport[0] / viewport[1];
+        let camera = FreeFlightCamera {
+            position: [0.0; 3],
+            yaw: 0.0,
+            pitch: 0.0,
+            horizontal_fov: 1.0,
+            near_plane: 0.1,
+            far_plane: 100.0,
+            move_speed: 1.0,
+            ground_clearance: 0.0,
+        }
+        .preview_frame(aspect);
+        SceneFrameUpdate {
+            sample,
+            camera,
+            viewport,
+            aspect,
+            environment: None,
+        }
     }
 
     #[test]
@@ -7597,6 +7927,7 @@ mod tests {
                 mission: "MISSIONS/Autodemo.00/data.tma".to_string(),
                 frames: 3,
                 atmosphere_seconds: None,
+                control_clock_ms: None,
                 validation: false,
                 readback_out: None,
                 preview_roots: NonZeroUsize::MAX,
@@ -7619,6 +7950,60 @@ mod tests {
         assert_eq!(parsed.frames, 0);
         assert_eq!(parsed.preview_roots, NonZeroUsize::MAX);
         assert_eq!(parsed.static_animation_frame, None);
+        assert_eq!(parsed.control_clock_ms, None);
+    }
+
+    #[test]
+    fn replay_clock_stays_on_one_sample_until_presented() {
+        let mut lifecycle = SceneFrameLifecycle::default();
+        let first = lifecycle.sample_replay(500, 101);
+        assert_eq!(first.id, SceneSampleId::Replay(0));
+        assert_eq!(first.time_ms, 0);
+        assert_eq!(first.delta_seconds, 0.0);
+        let update = scene_frame_update(first, [1280.0, 720.0]);
+        assert!(lifecycle.prepare(update.clone()));
+
+        // A swapchain recreation retries the same packet and does not count a frame.
+        assert_eq!(lifecycle.sample_replay(500, 101), first);
+        assert_eq!(lifecycle.frames_presented, 0);
+        assert_eq!(lifecycle.pending.as_ref(), Some(&update));
+        assert_eq!(lifecycle.record_presented(), Some(0));
+
+        let second = lifecycle.sample_replay(500, 101);
+        assert_eq!(second.id, SceneSampleId::Replay(1));
+        assert_eq!(second.time_ms, 5);
+        assert!((second.delta_seconds - 0.005).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn replay_clock_requires_at_least_two_requested_frames() {
+        for frame_count in ["0", "1"] {
+            assert!(Args::parse(&strings(&[
+                "--root",
+                "testdata/IS",
+                "--mission",
+                "MISSIONS/Autodemo.00/data.tma",
+                "--frames",
+                frame_count,
+                "--control-clock-ms",
+                "500",
+            ]))
+            .unwrap_err()
+            .contains("--frames of at least 2"));
+        }
+
+        let parsed = Args::parse(&strings(&[
+            "--root",
+            "testdata/IS",
+            "--mission",
+            "MISSIONS/Autodemo.00/data.tma",
+            "--frames",
+            "101",
+            "--control-clock-ms",
+            "500",
+        ]))
+        .expect("valid bounded replay arguments");
+        assert_eq!(parsed.control_clock_ms, Some(500));
     }
 
     #[test]
@@ -7716,15 +8101,14 @@ mod tests {
     #[test]
     fn free_flight_camera_uses_native_horizontal_fov_for_every_viewport_aspect() {
         let horizontal_fov = 1.3_f32;
-        let camera = FreeFlightCamera::from_bounds([0.0; 3], [100.0; 3])
-            .expect("finite free-flight bounds");
+        let camera =
+            FreeFlightCamera::from_bounds([0.0; 3], [100.0; 3]).expect("finite free-flight bounds");
         assert_eq!(camera.horizontal_fov, horizontal_fov);
         assert_eq!(camera.near_plane, 0.5);
         assert_eq!(camera.far_plane, 700.0);
 
         let assert_edges = |frame: PreviewCameraFrame, aspect: f32| {
-            let expected_vertical_fov =
-                2.0 * ((horizontal_fov * 0.5).tan() / aspect).atan();
+            let expected_vertical_fov = 2.0 * ((horizontal_fov * 0.5).tan() / aspect).atan();
             assert!((frame.vertical_fov - expected_vertical_fov).abs() < 1.0e-5);
             let depth = 10.0;
             let center = add3(frame.position, scale3(frame.forward, depth));
@@ -7749,8 +8133,14 @@ mod tests {
                 frame.clip_from_world,
             );
             assert!(center_clip[3] > 0.0 && right_clip[3] > 0.0 && top_clip[3] > 0.0);
-            assert!(center_clip[0].abs() < 5.0e-4, "aspect {aspect}: {center_clip:?}");
-            assert!(center_clip[1].abs() < 5.0e-4, "aspect {aspect}: {center_clip:?}");
+            assert!(
+                center_clip[0].abs() < 5.0e-4,
+                "aspect {aspect}: {center_clip:?}"
+            );
+            assert!(
+                center_clip[1].abs() < 5.0e-4,
+                "aspect {aspect}: {center_clip:?}"
+            );
             assert!(
                 (right_clip[0] / right_clip[3] - 1.0).abs() < 1.0e-4,
                 "aspect {aspect}: {right_clip:?}"
@@ -7792,7 +8182,10 @@ mod tests {
             };
             let captured = PreviewCameraFrame::from_legacy_d3d7(raw_transform, projection)
                 .expect("valid D3D7 projection");
-            assert_edges(captured, projection.viewport[2] as f32 / projection.viewport[3] as f32);
+            assert_edges(
+                captured,
+                projection.viewport[2] as f32 / projection.viewport[3] as f32,
+            );
         }
     }
 
