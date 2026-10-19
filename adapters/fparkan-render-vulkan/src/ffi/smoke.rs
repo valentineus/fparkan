@@ -762,7 +762,9 @@ impl VulkanSmokeRenderer {
         apply_geometry_range_updates(
             &mut self.draw_ranges,
             &mut self.draw_range_capacities,
+            &self.draw_range_world_queue,
             geometry_ranges,
+            &mut self.draw_order_dirty,
         );
         Ok(())
     }
@@ -882,6 +884,19 @@ impl VulkanSmokeRenderer {
                 context: "dynamic draw range index is out of bounds",
             },
         )?;
+        let world_queue = self
+            .draw_range_world_queue
+            .get(range_index)
+            .copied()
+            .ok_or(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic draw range index is out of bounds",
+            })?;
+        mark_draw_order_dirty_on_activity_change(
+            world_queue,
+            range.index_count,
+            index_count,
+            &mut self.draw_order_dirty,
+        );
         range.index_count = index_count;
         Ok(())
     }
@@ -1017,8 +1032,11 @@ impl VulkanSmokeRenderer {
         // Calling this setter opts the range into the world queue.  Fixed
         // screen/sky/weather ranges remain `None` because their pass order is
         // intentionally owned by the caller.
-        self.draw_range_world_queue[range_index] = Some(transparent);
-        self.draw_order_dirty = true;
+        set_and_mark_dirty_if_changed(
+            &mut self.draw_range_world_queue[range_index],
+            Some(transparent),
+            &mut self.draw_order_dirty,
+        );
         if pipeline_changed {
             self.rebuild_pipeline_resources()?;
         }
@@ -1047,8 +1065,7 @@ impl VulkanSmokeRenderer {
                 context: "dynamic draw range index is out of bounds",
             },
         )?;
-        *key = Some(sort_key);
-        self.draw_order_dirty = true;
+        set_and_mark_dirty_if_changed(key, Some(sort_key), &mut self.draw_order_dirty);
         Ok(())
     }
 
@@ -2300,13 +2317,21 @@ fn validate_geometry_upload(
 fn apply_geometry_range_updates(
     ranges: &mut [super::VulkanStaticDrawRange],
     capacities: &mut [u32],
+    world_queues: &[Option<bool>],
     geometry_ranges: &[super::VulkanDynamicDrawRange],
+    draw_order_dirty: &mut bool,
 ) {
     for geometry in geometry_ranges {
         // `validate_geometry_upload` has already checked every handle. Keep
         // this helper infallible so state is changed only after the Vulkan
         // upload succeeds.
         let range = &mut ranges[geometry.range_index];
+        mark_draw_order_dirty_on_activity_change(
+            world_queues[geometry.range_index],
+            range.index_count,
+            geometry.index_count,
+            draw_order_dirty,
+        );
         range.first_index = geometry.first_index;
         range.index_count = geometry.index_count;
         // A moved segment no longer owns the old tail. Keeping the previous
@@ -2469,11 +2494,36 @@ fn sorted_world_draw_order(
     next_without_transparency
 }
 
+fn set_and_mark_dirty_if_changed<T: PartialEq>(
+    current: &mut T,
+    next: T,
+    draw_order_dirty: &mut bool,
+) {
+    if *current == next {
+        return;
+    }
+    *current = next;
+    *draw_order_dirty = true;
+}
+
+fn mark_draw_order_dirty_on_activity_change(
+    world_queue: Option<bool>,
+    current_index_count: u32,
+    next_index_count: u32,
+    draw_order_dirty: &mut bool,
+) {
+    let active_changed = (current_index_count == 0) != (next_index_count == 0);
+    if world_queue.is_some() && active_changed {
+        *draw_order_dirty = true;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{VulkanDynamicDrawRange, VulkanStaticDrawRange, VulkanStaticMesh};
     use super::{
         apply_geometry_range_updates, apply_world_transparency, completed_readback_buffer_index,
+        mark_draw_order_dirty_on_activity_change, set_and_mark_dirty_if_changed,
         sorted_world_draw_order, take_runtime_children_with_validation_snapshot,
         take_runtime_owners_in_dependency_order, validate_geometry_upload,
         world_material_pipeline_states, RollbackOnDrop,
@@ -2598,14 +2648,17 @@ mod tests {
         ];
         let original = ranges[0];
         let mut capacities = vec![3, 3];
+        let mut draw_order_dirty = false;
         apply_geometry_range_updates(
             &mut ranges,
             &mut capacities,
+            &[None, None],
             &[VulkanDynamicDrawRange {
                 range_index: 1,
                 first_index: 3,
                 index_count: 9,
             }],
+            &mut draw_order_dirty,
         );
         assert_eq!(ranges[0], original);
         assert_eq!(capacities, vec![3, 9]);
@@ -2615,11 +2668,13 @@ mod tests {
         apply_geometry_range_updates(
             &mut ranges,
             &mut capacities,
+            &[None, None],
             &[VulkanDynamicDrawRange {
                 range_index: 1,
                 first_index: 3,
                 index_count: 3,
             }],
+            &mut draw_order_dirty,
         );
         assert_eq!(ranges[0], original);
         assert_eq!(capacities, vec![3, 3]);
@@ -2644,6 +2699,72 @@ mod tests {
                 3,
             ),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn geometry_updates_dirty_world_order_on_activation_and_deactivation() {
+        let mut ranges = [VulkanStaticDrawRange {
+            first_index: 0,
+            index_count: 0,
+            material_index: 0,
+            lightmap_index: u8::MAX,
+            batch_flags: 0,
+            pipeline_state: LegacyPipelineState::default(),
+            terrain_base_only: false,
+            alpha_test_reference: 0,
+        }];
+        let mut capacities = [6];
+        let world_queues = [Some(true)];
+        let mut draw_order_dirty = false;
+
+        apply_geometry_range_updates(
+            &mut ranges,
+            &mut capacities,
+            &world_queues,
+            &[VulkanDynamicDrawRange {
+                range_index: 0,
+                first_index: 0,
+                index_count: 3,
+            }],
+            &mut draw_order_dirty,
+        );
+        assert!(
+            draw_order_dirty,
+            "activating the queued range changes order"
+        );
+
+        draw_order_dirty = false;
+        apply_geometry_range_updates(
+            &mut ranges,
+            &mut capacities,
+            &world_queues,
+            &[VulkanDynamicDrawRange {
+                range_index: 0,
+                first_index: 0,
+                index_count: 6,
+            }],
+            &mut draw_order_dirty,
+        );
+        assert!(
+            !draw_order_dirty,
+            "changing an active count does not change order"
+        );
+
+        apply_geometry_range_updates(
+            &mut ranges,
+            &mut capacities,
+            &world_queues,
+            &[VulkanDynamicDrawRange {
+                range_index: 0,
+                first_index: 0,
+                index_count: 0,
+            }],
+            &mut draw_order_dirty,
+        );
+        assert!(
+            draw_order_dirty,
+            "deactivating the queued range changes order"
         );
     }
 
@@ -2850,6 +2971,70 @@ mod tests {
             .collect::<Vec<_>>();
         let order = sorted_world_draw_order(4, &ranges, &[Some(true); 4], &[Some(1.0); 4], &[]);
         assert_eq!(order, vec![2, 3, 1, 0]);
+    }
+
+    #[test]
+    fn unchanged_sort_keys_and_transparency_do_not_dirty_draw_order() {
+        let mut sort_key = None;
+        let mut draw_order_dirty = false;
+
+        set_and_mark_dirty_if_changed(&mut sort_key, Some(3.0), &mut draw_order_dirty);
+        assert_eq!(sort_key, Some(3.0));
+        assert!(draw_order_dirty);
+
+        draw_order_dirty = false;
+        set_and_mark_dirty_if_changed(&mut sort_key, Some(3.0), &mut draw_order_dirty);
+        assert_eq!(sort_key, Some(3.0));
+        assert!(!draw_order_dirty);
+
+        set_and_mark_dirty_if_changed(&mut sort_key, Some(4.0), &mut draw_order_dirty);
+        assert_eq!(sort_key, Some(4.0));
+        assert!(draw_order_dirty);
+
+        let mut transparent = None;
+        draw_order_dirty = false;
+        set_and_mark_dirty_if_changed(&mut transparent, Some(true), &mut draw_order_dirty);
+        assert_eq!(transparent, Some(true));
+        assert!(draw_order_dirty);
+
+        draw_order_dirty = false;
+        set_and_mark_dirty_if_changed(&mut transparent, Some(true), &mut draw_order_dirty);
+        assert_eq!(transparent, Some(true));
+        assert!(!draw_order_dirty);
+
+        set_and_mark_dirty_if_changed(&mut transparent, Some(false), &mut draw_order_dirty);
+        assert_eq!(transparent, Some(false));
+        assert!(draw_order_dirty);
+    }
+
+    #[test]
+    fn world_draw_order_dirties_on_activation_and_deactivation() {
+        let mut draw_order_dirty = false;
+
+        mark_draw_order_dirty_on_activity_change(None, 0, 6, &mut draw_order_dirty);
+        assert!(
+            !draw_order_dirty,
+            "fixed pass slots keep their original order"
+        );
+
+        mark_draw_order_dirty_on_activity_change(Some(true), 0, 6, &mut draw_order_dirty);
+        assert!(
+            draw_order_dirty,
+            "activating a queued range changes its order"
+        );
+
+        draw_order_dirty = false;
+        mark_draw_order_dirty_on_activity_change(Some(false), 6, 12, &mut draw_order_dirty);
+        assert!(
+            !draw_order_dirty,
+            "changing an active count does not change order"
+        );
+
+        mark_draw_order_dirty_on_activity_change(Some(true), 6, 0, &mut draw_order_dirty);
+        assert!(
+            draw_order_dirty,
+            "deactivating a queued range changes its order"
+        );
     }
 
     #[test]
