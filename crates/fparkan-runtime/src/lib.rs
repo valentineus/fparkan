@@ -49,12 +49,25 @@ impl EngineServices {
     }
 }
 
+/// Native mission mode used by the recovered host callback.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MissionMode {
+    /// Native application mode 1, used by the selected `missions/single.*` path.
+    SingleMission,
+    /// Native application mode 3, selected by the main-menu idle timer.
+    AutoDemo,
+}
+
 /// Mission request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MissionRequest {
     /// Mission key/path.
     pub key: String,
+    /// Explicit host mode; this is not inferred from the mission path.
+    pub mode: MissionMode,
 }
+
+const INITIAL_SCRIPT_HOST_STATUS: u32 = 5;
 
 /// Ordered mission property preserved for later runtime stages.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -197,10 +210,11 @@ pub struct MissionScriptVarSetState {
     pub values: Vec<VarSetDefault>,
 }
 
-/// Rust-side outcome selected by the recovered `Iron3D` host-callback mapper.
+/// Rust-side outcome selected by the recovered `Iron3D` host callback.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MissionScriptOutcome {
-    /// No outcome has been recorded in the Rust model.
+    /// No host callback outcome has been recorded; this does not mean that the
+    /// native `IGame` has entered its running state.
     #[default]
     Active,
     /// Rust outcome corresponding to completion payload `1`.
@@ -218,7 +232,7 @@ pub enum MissionScriptHostEffect {
     MissionCompleted,
     /// The Rust outcome changed to failed.
     MissionFailed,
-    /// The Rust outcome already held this target state.
+    /// The native status guard rejected a repeated callback without changing state.
     NoChange,
 }
 
@@ -357,6 +371,8 @@ struct LoadedMissionState {
     script_varset: Option<MissionScriptVarSet>,
     script_init_states: Vec<MissionScriptInitState>,
     script_varset_states: Vec<MissionScriptVarSetState>,
+    script_host_mode: MissionMode,
+    script_host_status: u32,
     script_outcome: MissionScriptOutcome,
 }
 
@@ -899,6 +915,10 @@ fn load_mission_with_options(
         script_varset: loaded_scripts.varset,
         script_init_states: loaded_scripts.init_states,
         script_varset_states: loaded_scripts.varset_states,
+        script_host_mode: request.mode,
+        // Fresh IGame construction seeds this field with 5; this is not the
+        // later status-4 transition performed after native game initialization.
+        script_host_status: INITIAL_SCRIPT_HOST_STATUS,
         script_outcome: MissionScriptOutcome::Active,
     });
     Ok(summary)
@@ -997,8 +1017,9 @@ pub fn loaded_mission_script_varset_states(engine: &Engine) -> Option<&[MissionS
 ///
 /// Unlike the loader-only resolver, operands are read from the selected
 /// clan's instantiated varset cells. Dispatching the returned host callback
-/// remains separate from this function; the Rust outcome mapper does not model
-/// the native `IGame` guards or initial status word.
+/// remains separate from this function. The runtime currently models the
+/// callback's recovered mode and status guards, but not the full game startup
+/// transition or frame/event execution that reaches it.
 ///
 /// # Errors
 ///
@@ -1040,13 +1061,16 @@ pub fn loaded_mission_script_outcome(engine: &Engine) -> Option<MissionScriptOut
     engine.loaded.as_ref().map(|state| state.script_outcome)
 }
 
-/// Records the recovered `Iron3D` host-callback target in the Rust outcome.
+/// Applies the recovered `Iron3D` host-callback guards and records its outcome.
 ///
-/// `(mode=0, command=0, payload=0|1)` maps payload zero to failure and one to
-/// completion. Iron3D also checks the gate byte at `IGame + 0xe5` and the
-/// status word at `IGame + 8`; those native guards and the initial status are
-/// not represented here. Other callback commands return
-/// [`MissionScriptHostEffect::Unhandled`].
+/// Native mission mode `3` closes the callback gate. Otherwise the callback
+/// must have `(mode=0, command=0)` and payload `0` or `1`. Payload `0` writes
+/// status `1` and records failure only when the current status is not `1`;
+/// payload `1` writes status `0` and records completion only when the current
+/// status is not `0`. A duplicate returns [`MissionScriptHostEffect::NoChange`]
+/// without repairing any other state. Loaded mission state seeds the raw
+/// status from the native constructor value `5`; it does not model the later
+/// game-initialization transition to status `4`.
 ///
 /// # Errors
 ///
@@ -1063,31 +1087,36 @@ pub fn apply_loaded_script_host_callback(
             message: "mission script host state is unavailable".to_string(),
         })?;
     Ok(apply_recovered_script_host_callback(
+        state.script_host_mode,
+        &mut state.script_host_status,
         &mut state.script_outcome,
         command,
     ))
 }
 
 fn apply_recovered_script_host_callback(
+    native_mode: MissionMode,
+    status: &mut u32,
     outcome: &mut MissionScriptOutcome,
     command: VmHostCallbackCommand,
 ) -> MissionScriptHostEffect {
-    if command.mode != 0 || command.first != 0 {
+    if native_mode == MissionMode::AutoDemo || command.mode != 0 || command.first != 0 {
         return MissionScriptHostEffect::Unhandled;
     }
-    let next = match command.second {
-        0 => MissionScriptOutcome::Failed,
-        1 => MissionScriptOutcome::Completed,
-        _ => return MissionScriptHostEffect::Unhandled,
-    };
-    if *outcome == next {
-        return MissionScriptHostEffect::NoChange;
-    }
-    *outcome = next;
-    match next {
-        MissionScriptOutcome::Completed => MissionScriptHostEffect::MissionCompleted,
-        MissionScriptOutcome::Failed => MissionScriptHostEffect::MissionFailed,
-        MissionScriptOutcome::Active => MissionScriptHostEffect::Unhandled,
+    match command.second {
+        0 if *status != 1 => {
+            *status = 1;
+            *outcome = MissionScriptOutcome::Failed;
+            MissionScriptHostEffect::MissionFailed
+        }
+        0 => MissionScriptHostEffect::NoChange,
+        1 if *status != 0 => {
+            *status = 0;
+            *outcome = MissionScriptOutcome::Completed;
+            MissionScriptHostEffect::MissionCompleted
+        }
+        1 => MissionScriptHostEffect::NoChange,
+        _ => MissionScriptHostEffect::Unhandled,
     }
 }
 
@@ -1446,6 +1475,7 @@ mod tests {
             &mut engine,
             MissionRequest {
                 key: "MISSIONS/Autodemo.00/data.tma".to_string(),
+                mode: MissionMode::SingleMission,
             },
         )
         .expect_err("missing VFS");
@@ -1598,53 +1628,211 @@ mod tests {
     }
 
     #[test]
-    fn recovered_handler_thirty_host_callback_transitions_mission_outcome() {
+    fn handler_thirty_host_callback_obeys_native_mode_and_status_guards() {
+        fn command(second: u32) -> VmHostCallbackCommand {
+            VmHostCallbackCommand {
+                mode: 0,
+                first: 0,
+                second,
+            }
+        }
+
+        let mut status = 5;
         let mut outcome = MissionScriptOutcome::Active;
         assert_eq!(
             apply_recovered_script_host_callback(
+                MissionMode::SingleMission,
+                &mut status,
                 &mut outcome,
+                command(0),
+            ),
+            MissionScriptHostEffect::MissionFailed
+        );
+        assert_eq!((status, outcome), (1, MissionScriptOutcome::Failed));
+        outcome = MissionScriptOutcome::Completed;
+        assert_eq!(
+            apply_recovered_script_host_callback(
+                MissionMode::SingleMission,
+                &mut status,
+                &mut outcome,
+                command(0),
+            ),
+            MissionScriptHostEffect::NoChange
+        );
+        assert_eq!((status, outcome), (1, MissionScriptOutcome::Completed));
+        outcome = MissionScriptOutcome::Failed;
+
+        assert_eq!(
+            apply_recovered_script_host_callback(
+                MissionMode::SingleMission,
+                &mut status,
+                &mut outcome,
+                command(1),
+            ),
+            MissionScriptHostEffect::MissionCompleted
+        );
+        assert_eq!((status, outcome), (0, MissionScriptOutcome::Completed));
+        assert_eq!(
+            apply_recovered_script_host_callback(
+                MissionMode::SingleMission,
+                &mut status,
+                &mut outcome,
+                command(1),
+            ),
+            MissionScriptHostEffect::NoChange
+        );
+        assert_eq!((status, outcome), (0, MissionScriptOutcome::Completed));
+
+        assert_eq!(
+            apply_recovered_script_host_callback(
+                MissionMode::SingleMission,
+                &mut status,
+                &mut outcome,
+                command(0),
+            ),
+            MissionScriptHostEffect::MissionFailed
+        );
+        assert_eq!((status, outcome), (1, MissionScriptOutcome::Failed));
+
+        status = 4;
+        outcome = MissionScriptOutcome::Active;
+        assert_eq!(
+            apply_recovered_script_host_callback(
+                MissionMode::SingleMission,
+                &mut status,
+                &mut outcome,
+                command(1),
+            ),
+            MissionScriptHostEffect::MissionCompleted
+        );
+        assert_eq!((status, outcome), (0, MissionScriptOutcome::Completed));
+
+        status = 5;
+        outcome = MissionScriptOutcome::Active;
+        assert_eq!(
+            apply_recovered_script_host_callback(
+                MissionMode::AutoDemo,
+                &mut status,
+                &mut outcome,
+                command(0),
+            ),
+            MissionScriptHostEffect::Unhandled
+        );
+        assert_eq!((status, outcome), (5, MissionScriptOutcome::Active));
+
+        for command in [
+            VmHostCallbackCommand {
+                mode: 1,
+                first: 0,
+                second: 0,
+            },
+            VmHostCallbackCommand {
+                mode: 0,
+                first: 3,
+                second: 0,
+            },
+            VmHostCallbackCommand {
+                mode: 0,
+                first: 0,
+                second: 42,
+            },
+        ] {
+            assert_eq!(
+                apply_recovered_script_host_callback(
+                    MissionMode::SingleMission,
+                    &mut status,
+                    &mut outcome,
+                    command,
+                ),
+                MissionScriptHostEffect::Unhandled
+            );
+            assert_eq!((status, outcome), (5, MissionScriptOutcome::Active));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn loaded_host_callback_uses_requested_mode_and_constructor_status() {
+        let root = licensed_root("IS");
+        let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(root));
+        let key = "MISSIONS/Autodemo.00/data.tma".to_string();
+        let mut engine = create(EngineServices::new(vfs)).expect("engine");
+
+        load_mission_static_preview_roots(
+            &mut engine,
+            MissionRequest {
+                key: key.clone(),
+                mode: MissionMode::SingleMission,
+            },
+            NonZeroUsize::new(1).expect("non-zero root count"),
+        )
+        .expect("load single-mission preview");
+        let state = engine.loaded.as_mut().expect("loaded state");
+        assert_eq!(state.script_host_status, INITIAL_SCRIPT_HOST_STATUS);
+        assert_eq!(state.script_outcome, MissionScriptOutcome::Active);
+        assert_eq!(
+            apply_loaded_script_host_callback(
+                &mut engine,
                 VmHostCallbackCommand {
                     mode: 0,
                     first: 0,
                     second: 0,
                 },
-            ),
+            )
+            .expect("apply failure callback"),
             MissionScriptHostEffect::MissionFailed
         );
-        assert_eq!(outcome, MissionScriptOutcome::Failed);
+        assert_eq!(engine.loaded.as_ref().unwrap().script_host_status, 1);
         assert_eq!(
-            apply_recovered_script_host_callback(
-                &mut outcome,
-                VmHostCallbackCommand {
-                    mode: 0,
-                    first: 0,
-                    second: 1,
-                },
-            ),
-            MissionScriptHostEffect::MissionCompleted
+            loaded_mission_script_outcome(&engine),
+            Some(MissionScriptOutcome::Failed)
         );
-        assert_eq!(outcome, MissionScriptOutcome::Completed);
+
+        engine.loaded.as_mut().unwrap().script_outcome = MissionScriptOutcome::Completed;
         assert_eq!(
-            apply_recovered_script_host_callback(
-                &mut outcome,
+            apply_loaded_script_host_callback(
+                &mut engine,
                 VmHostCallbackCommand {
                     mode: 0,
                     first: 0,
-                    second: 1,
+                    second: 0,
                 },
-            ),
+            )
+            .expect("apply repeated failure callback"),
             MissionScriptHostEffect::NoChange
         );
+        assert_eq!(engine.loaded.as_ref().unwrap().script_host_status, 1);
         assert_eq!(
-            apply_recovered_script_host_callback(
-                &mut outcome,
+            loaded_mission_script_outcome(&engine),
+            Some(MissionScriptOutcome::Completed)
+        );
+
+        load_mission_static_preview_roots(
+            &mut engine,
+            MissionRequest {
+                key,
+                mode: MissionMode::AutoDemo,
+            },
+            NonZeroUsize::new(1).expect("non-zero root count"),
+        )
+        .expect("reload AutoDemo preview");
+        assert_eq!(engine.loaded.as_ref().unwrap().script_host_status, 5);
+        assert_eq!(
+            apply_loaded_script_host_callback(
+                &mut engine,
                 VmHostCallbackCommand {
                     mode: 0,
-                    first: 3,
-                    second: 42,
+                    first: 0,
+                    second: 1,
                 },
-            ),
+            )
+            .expect("apply AutoDemo callback"),
             MissionScriptHostEffect::Unhandled
+        );
+        assert_eq!(engine.loaded.as_ref().unwrap().script_host_status, 5);
+        assert_eq!(
+            loaded_mission_script_outcome(&engine),
+            Some(MissionScriptOutcome::Active)
         );
     }
 
@@ -1676,6 +1864,7 @@ mod tests {
             &mut engine,
             MissionRequest {
                 key: "MISSIONS/Autodemo.00/data.tma".to_string(),
+                mode: MissionMode::SingleMission,
             },
         )
         .expect("load mission");
@@ -1732,12 +1921,14 @@ mod tests {
                 DenyRule::Suffix("Land.map"),
                 MissionRequest {
                     key: "MISSIONS/Autodemo.00/data.tma".to_string(),
+                    mode: MissionMode::SingleMission,
                 },
             ),
             (
                 DenyRule::Suffix("objects.rlb"),
                 MissionRequest {
                     key: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.01/data.tma".to_string(),
+                    mode: MissionMode::SingleMission,
                 },
             ),
         ] {
@@ -1773,6 +1964,7 @@ mod tests {
             &mut engine,
             MissionRequest {
                 key: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.01/data.tma".to_string(),
+                mode: MissionMode::SingleMission,
             },
             MissionLoadOptions {
                 fail_after_registered_objects: Some(1),
@@ -1842,6 +2034,7 @@ mod tests {
                 &mut engine,
                 MissionRequest {
                     key: case.1.to_string(),
+                    mode: MissionMode::SingleMission,
                 },
             )
             .expect("load mission");
@@ -1954,6 +2147,7 @@ mod tests {
             &mut engine,
             MissionRequest {
                 key: case.mission.to_string(),
+                mode: MissionMode::SingleMission,
             },
         )
         .expect("load selected mission");
@@ -1978,8 +2172,14 @@ mod tests {
         let mut totals = LoadTotals::default();
         for mission in missions {
             let mut engine = create(EngineServices::new(vfs.clone())).expect("engine");
-            let loaded = load_mission(&mut engine, MissionRequest { key: mission })
-                .expect("load mission foundation");
+            let loaded = load_mission(
+                &mut engine,
+                MissionRequest {
+                    key: mission,
+                    mode: MissionMode::SingleMission,
+                },
+            )
+            .expect("load mission foundation");
             assert_eq!(loaded.object_count, loaded.registered_objects);
             assert_eq!(loaded.object_count, loaded.graph_root_count);
             assert_eq!(

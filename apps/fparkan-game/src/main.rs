@@ -54,7 +54,7 @@ use fparkan_render_vulkan::{
 use fparkan_runtime::{
     create, load_mission_static_preview, load_mission_static_preview_roots, loaded_mission_assets,
     loaded_mission_object_drafts, loaded_terrain, EngineServices, MissionAssets,
-    MissionObjectDraft, MissionRequest,
+    MissionMode, MissionObjectDraft, MissionRequest,
 };
 use fparkan_terrain::{
     FullSurfaceMask, SurfaceQuery, TerrainLod, TerrainMaterialLayers, TerrainWorld,
@@ -173,6 +173,7 @@ fn load_requested_mission(
 ) -> Result<fparkan_runtime::LoadedMission, String> {
     let request = MissionRequest {
         key: args.mission.clone(),
+        mode: MissionMode::SingleMission,
     };
     if args.preview_roots.get() == 1 {
         load_mission_static_preview(engine, request)
@@ -8090,6 +8091,7 @@ mod tests {
                 &mut engine,
                 MissionRequest {
                     key: mission.clone(),
+                    mode: MissionMode::SingleMission,
                 },
                 NonZeroUsize::MAX,
             )
