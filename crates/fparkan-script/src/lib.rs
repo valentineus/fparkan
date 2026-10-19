@@ -856,8 +856,10 @@ pub struct Handler2Record {
     pub key: Handler2RecordKey,
     /// Resolved slot 1 scalar.
     pub scalar_1: f32,
-    /// Initial and per-refresh counter word from resolved slot 2.
+    /// Current counter word stored at original record offset `+0x24`.
     pub counter: u32,
+    /// Original record offset `+0x28`: slot 2 captured when the record was created.
+    increment: u32,
     /// Resolved slot 3 word.
     pub word_3: u32,
     /// Resolved slot 6 scalar.
@@ -892,8 +894,8 @@ impl Handler2RecordScheduler {
     ///
     /// The original compares the three identity words bit-for-bit. On an
     /// existing key, it refreshes only when `scalar_1` compares unequal; that
-    /// update replaces `scalar_1` and `scalar_6`, then adds the record's own
-    /// slot-2 counter word with x86 wrapping arithmetic.
+    /// update replaces `scalar_1` and `scalar_6`, then adds the slot-2 word
+    /// captured when that record was created, with x86 wrapping arithmetic.
     pub fn submit(&mut self, input: Handler2RecordInput) -> Handler2RecordUpdate {
         let key = Handler2RecordKey::from(input);
         if let Some((index, record)) = self
@@ -905,7 +907,7 @@ impl Handler2RecordScheduler {
             if !handler_two_scalar_equal(record.scalar_1, input.scalar_1) {
                 record.scalar_1 = input.scalar_1;
                 record.scalar_6 = input.scalar_6;
-                record.counter = record.counter.wrapping_add(input.word_2);
+                record.counter = record.counter.wrapping_add(record.increment);
                 return Handler2RecordUpdate {
                     index,
                     created: false,
@@ -923,6 +925,7 @@ impl Handler2RecordScheduler {
             key,
             scalar_1: input.scalar_1,
             counter: input.word_2,
+            increment: input.word_2,
             word_3: input.word_3,
             scalar_6: input.scalar_6,
         });
@@ -1254,10 +1257,18 @@ mod tests {
                 refreshed: true,
             }
         );
-        assert_eq!(scheduler.records()[0].counter, 103);
+        assert_eq!(scheduler.records()[0].counter, 8);
         assert_eq!(
             scheduler.records()[0].scalar_6.to_bits(),
             12.0_f32.to_bits()
+        );
+
+        let refreshed_again = handler_two_input(3.5, -0.0, 3.0, 13.0, 7);
+        assert!(scheduler.submit(refreshed_again).refreshed);
+        assert_eq!(scheduler.records()[0].counter, 12);
+        assert_eq!(
+            scheduler.records()[0].scalar_6.to_bits(),
+            13.0_f32.to_bits()
         );
 
         let positive_zero_key = handler_two_input(2.5, 0.0, 3.0, 12.0, 1);
@@ -1272,8 +1283,13 @@ mod tests {
         let update = scheduler.submit(handler_two_input(f32::NAN, 1.0, 2.0, 4.0, 2));
         assert_eq!(update.index, 0);
         assert!(update.refreshed);
-        assert_eq!(scheduler.records()[0].counter, 1);
+        assert_eq!(scheduler.records()[0].counter, u32::MAX - 1);
         assert_eq!(scheduler.records()[0].scalar_6.to_bits(), 4.0_f32.to_bits());
+
+        let update = scheduler.submit(handler_two_input(f32::NAN, 1.0, 2.0, 5.0, 17));
+        assert!(update.refreshed);
+        assert_eq!(scheduler.records()[0].counter, u32::MAX - 2);
+        assert_eq!(scheduler.records()[0].scalar_6.to_bits(), 5.0_f32.to_bits());
     }
 
     #[test]

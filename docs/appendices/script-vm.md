@@ -143,6 +143,43 @@ slot2 одновременно в `+0x24/+0x28`, slot3 в `+0x2c` и slot6 в `+
 изолированную часть как `Handler2RecordScheduler`; он не выполняет bytecode,
 не назначает игровых имён и не делает event lookup за original VM.
 
+Шаг прибавления проверен прямым вызовом оригинального helper-а
+`FUN_10005070` (RVA `0x5070`) из GOG `ai.dll`, SHA-256
+`c19cd6cd31cd2896f8c4ba0f0e700dd3408aec8182daaf4863d98a7d233a2abc`.
+Исходник x86 test harness-а хранится в
+[`handler2_native_oracle.cs`](../../crates/fparkan-script/tests/handler2_native_oracle.cs):
+он сначала сверяет hash DLL, затем вызывает helper с 100-byte record и
+проверяет оба поля. Пример воспроизведения в Windows PowerShell:
+
+```powershell
+$env:FPARKAN_ORIGINAL_AI_DLL = 'C:\GOG Games\Parkan - Iron Strategy\ai.dll'
+& "$env:WINDIR\Microsoft.NET\Framework\v4.0.30319\csc.exe" /nologo /platform:x86 /out:target\Handler2NativeOracle.exe crates\fparkan-script\tests\handler2_native_oracle.cs
+.\target\Handler2NativeOracle.exe
+```
+
+Полученные значения:
+
+| `+0x24` до вызова | сохранённый `+0x28` | `+0x24` после вызова | `+0x28` после вызова |
+| ---: | ---: | ---: | ---: |
+| `0x00000004` | `0x00000004` | `0x00000008` | `0x00000004` |
+| `0x00000008` | `0x00000004` | `0x0000000C` | `0x00000004` |
+| `0xFFFFFFFF` | `0xFFFFFFFF` | `0xFFFFFFFE` | `0xFFFFFFFF` |
+| `0xFFFFFFFE` | `0xFFFFFFFF` | `0xFFFFFFFD` | `0xFFFFFFFF` |
+
+Rust-тест повторяет эти начальные значения. Для первой пары обновлений входы
+несут slot 2, равный `99` и `7`, однако сохранённый при создании шаг равен `4`;
+для второй пары оба счётчика и шаг начинаются с `0xFFFFFFFF`, а новые входы
+несут `2` и `17`. Правило refresh читается прямо из модели:
+
+```rust
+record.counter = record.counter.wrapping_add(record.increment);
+```
+
+Native helper получает только указатель на record, поэтому напрямую проверяет
+сложение текущего `+0x24` с сохранённым `+0x28`; свежий slot 2 принадлежит
+сценарию Rust-теста, а не аргументам helper-а. Проверка не охватывает полный
+scheduler path внутри запущенной игры.
+
 На границе mission runtime выбранный TMA clan `first_resource`
 материализуется как отдельный `MissionScriptBundle`: loader нормализует
 `<base>.scr`, декодирует его тем же bounded reader-ом и публикует immutable
