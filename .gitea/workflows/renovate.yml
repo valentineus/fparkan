@@ -1,0 +1,24 @@
+name: RenovateBot
+
+on:
+  schedule:
+    - cron: "@daily"
+  push:
+    branches:
+      - trunk
+
+jobs:
+  renovate:
+    container: ghcr.io/renovatebot/renovate:44
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+      - name: Run renovate
+        run: renovate
+        env:
+          RENOVATE_GITHUB_COM_TOKEN: ${{ secrets.RENOVATE_GITHUB_COM_TOKEN }}
+          RENOVATE_CONFIG_FILE: renovate.config.cjs
+          RENOVATE_REPOSITORIES: ${{ gitea.repository }}
+          RENOVATE_TOKEN: ${{ secrets.RENOVATE_TOKEN }}
