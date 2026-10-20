@@ -16,8 +16,8 @@ use fparkan_prototype::{
 };
 use fparkan_resource::{resource_name, CachedResourceRepository, ResourceRepository};
 use fparkan_script::{
-    Handler19DwordWrite, Handler19InitInput, ScriptDispatchSelector, ScriptInstruction,
-    ScriptPackage, VarSet, VarSetDefault, VmHostCallbackCommand,
+    Handler19DwordWrite, Handler19InitInput, Handler19InitResolution, Handler19ResolveError,
+    ScriptInstruction, ScriptPackage, VarSet, VarSetDefault, VmHostCallbackCommand,
 };
 use fparkan_terrain::SurfaceQuery;
 use fparkan_vfs::{Vfs, VfsError};
@@ -166,6 +166,8 @@ pub struct MissionScriptBundle {
     /// Losslessly decoded compiled package; only proven `Handler(19)` Init
     /// writes are resolved and retained by runtime.
     pub package: ScriptPackage,
+    /// Outcome of the restricted first-`Init` resolution for this bundle.
+    pub init_execution: MissionScriptInitExecution,
 }
 
 /// Numeric script defaults selected for the mission's first script bundle.
@@ -192,10 +194,34 @@ pub struct MissionScriptVarSet {
 pub struct MissionScriptInitState {
     /// TMA clan index that owns the `SuperAI` instance and varset.
     pub clan_index: usize,
+    /// Zero-based first case-sensitive C-string `Init` event selected by native lookup.
+    pub event_index: usize,
     /// Raw event word preserved from the compiled `Init` event.
     pub event_word: u32,
     /// Exact three DWORD writes made by each proven `Handler(19)` instruction.
     pub writes: Vec<Handler19DwordWrite>,
+}
+
+/// Execution status of the first event whose case-sensitive C-string name is `Init`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MissionScriptInitExecution {
+    /// Native name lookup found no event named `Init` and made no handler call.
+    Missing,
+    /// The selected event completed within the currently recovered action subset.
+    Executed {
+        /// Zero-based event table index selected by native lookup.
+        event_index: usize,
+    },
+    /// A preview retained the decoded package but stopped before the first
+    /// instruction outside the recovered `Handler(19)` action subset.
+    Unsupported {
+        /// Zero-based event table index selected by native lookup.
+        event_index: usize,
+        /// Zero-based instruction index where restricted resolution stopped.
+        instruction_index: usize,
+        /// Typed selector, control, or result-save shape that is not modeled.
+        error: Handler19ResolveError,
+    },
 }
 
 /// Per-clan mutable-value model of one instantiated mission varset.
@@ -418,6 +444,19 @@ pub enum EngineError {
         /// Proven-contract diagnostic.
         message: String,
     },
+    /// A full mission load reached an unsupported instruction in its first Init event.
+    ScriptInitUnsupported {
+        /// Owning TMA clan index.
+        clan_index: usize,
+        /// Resolved `.scr` package path.
+        path: String,
+        /// Zero-based first exact Init event index.
+        event_index: usize,
+        /// Zero-based instruction index within that event.
+        instruction_index: usize,
+        /// Typed unsupported instruction shape.
+        source: Handler19ResolveError,
+    },
     /// A recovered script handler could not resolve against runtime state.
     ScriptRuntime {
         /// Owning TMA clan index.
@@ -558,6 +597,16 @@ impl std::fmt::Display for EngineError {
                 clan_index,
                 message,
             } => write!(f, "clan {clan_index}: script Init failed: {message}"),
+            Self::ScriptInitUnsupported {
+                clan_index,
+                path,
+                event_index,
+                instruction_index,
+                source,
+            } => write!(
+                f,
+                "{path}: clan {clan_index} Init event {event_index} instruction {instruction_index} is unsupported: {source}"
+            ),
             Self::ScriptRuntime {
                 clan_index,
                 message,
@@ -594,6 +643,7 @@ impl std::error::Error for EngineError {
             Self::Nres { source, .. } => Some(source),
             Self::Mission { source, .. } => Some(source),
             Self::TerrainFormat { source, .. } => Some(source),
+            Self::ScriptInitUnsupported { source, .. } => Some(source),
             Self::Terrain(source) => Some(source),
             Self::World(source) => Some(source),
             Self::AssetPreparation { source, .. } => Some(source),
@@ -736,7 +786,7 @@ fn load_mission_with_options(
             source,
         }
     })?;
-    let loaded_scripts = load_mission_scripts(&vfs, &mission)?;
+    let loaded_scripts = load_mission_scripts(&vfs, &mission, options.asset_scope)?;
     let repository = CachedResourceRepository::with_payload_cache_budget(
         vfs.clone(),
         MISSION_DECODED_PAYLOAD_CACHE_ENTRIES,
@@ -1195,6 +1245,7 @@ fn normalize_engine_path(role: &'static str, value: &str) -> Result<NormalizedPa
 fn load_mission_scripts(
     vfs: &Arc<dyn Vfs>,
     mission: &MissionDocument,
+    asset_scope: MissionAssetScope,
 ) -> Result<LoadedMissionScripts, EngineError> {
     let script_bases = mission_script_bundle_bases(mission);
     let mut bundles = Vec::with_capacity(script_bases.len());
@@ -1220,6 +1271,7 @@ fn load_mission_scripts(
             base_path,
             script_path: normalized.as_str().to_string(),
             package,
+            init_execution: MissionScriptInitExecution::Missing,
         });
     }
     let varset = first_base_path
@@ -1233,8 +1285,9 @@ fn load_mission_scripts(
                 .iter()
                 .map(|clan| clan.anchor)
                 .collect::<Vec<_>>(),
-            &bundles,
+            &mut bundles,
             varset,
+            asset_scope,
         )?,
         None => Vec::new(),
     };
@@ -1292,11 +1345,21 @@ fn materialize_script_varset_states(
 
 fn resolve_handler19_init_states(
     clan_anchors: &[[f32; 2]],
-    bundles: &[MissionScriptBundle],
+    bundles: &mut [MissionScriptBundle],
     varset: &MissionScriptVarSet,
+    asset_scope: MissionAssetScope,
 ) -> Result<Vec<MissionScriptInitState>, EngineError> {
     let mut states = Vec::new();
     for bundle in bundles {
+        if !bundle
+            .package
+            .events
+            .iter()
+            .any(|event| event.name_raw.split(|byte| *byte == 0).next() == Some(&b"Init"[..]))
+        {
+            bundle.init_execution = MissionScriptInitExecution::Missing;
+            continue;
+        }
         let Some(anchor) = clan_anchors.get(bundle.clan_index) else {
             return Err(EngineError::ScriptInit {
                 clan_index: bundle.clan_index,
@@ -1304,41 +1367,60 @@ fn resolve_handler19_init_states(
             });
         };
         let input = Handler19InitInput {
-            first_x87_word: handler19_x87_truncated_u32(anchor[0], bundle.clan_index, "x")?,
-            second_x87_word: handler19_x87_truncated_u32(anchor[1], bundle.clan_index, "y")?,
+            first_x87_word: handler19_anchor_word(anchor[0], bundle.clan_index, "x")?,
+            second_x87_word: handler19_anchor_word(anchor[1], bundle.clan_index, "y")?,
             third_word: u32::try_from(bundle.clan_index).map_err(|_| EngineError::ScriptInit {
                 clan_index: bundle.clan_index,
                 message: "clan index does not fit the recovered DWORD ClanID field".to_string(),
             })?,
         };
-        for event in &bundle.package.events {
-            if event.name_raw.as_slice() != b"Init\0" {
-                continue;
+        match varset
+            .declarations
+            .resolve_handler19_init(&bundle.package, input)
+            .map_err(|source| EngineError::ScriptInit {
+                clan_index: bundle.clan_index,
+                message: source.to_string(),
+            })? {
+            Handler19InitResolution::Missing => {
+                bundle.init_execution = MissionScriptInitExecution::Missing;
             }
-            let writes: Vec<Handler19DwordWrite> = event
-                .instructions
-                .iter()
-                .filter(|instruction| {
-                    instruction.dispatch_selector() == ScriptDispatchSelector::Handler(19)
-                })
-                .map(|instruction| {
-                    varset
-                        .declarations
-                        .resolve_handler19(instruction, input)
-                        .map_err(|source| EngineError::ScriptInit {
-                            clan_index: bundle.clan_index,
-                            message: source.to_string(),
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .flatten()
-                .collect();
-            if !writes.is_empty() {
-                states.push(MissionScriptInitState {
+            Handler19InitResolution::Executed {
+                event_index,
+                event_word,
+                writes,
+            } => {
+                bundle.init_execution = MissionScriptInitExecution::Executed { event_index };
+                if !writes.is_empty() {
+                    states.push(MissionScriptInitState {
+                        clan_index: bundle.clan_index,
+                        event_index,
+                        event_word,
+                        writes,
+                    });
+                }
+            }
+            Handler19InitResolution::Unsupported {
+                event_index,
+                instruction_index,
+                error,
+            } if asset_scope != MissionAssetScope::Full => {
+                bundle.init_execution = MissionScriptInitExecution::Unsupported {
+                    event_index,
+                    instruction_index,
+                    error,
+                };
+            }
+            Handler19InitResolution::Unsupported {
+                event_index,
+                instruction_index,
+                error,
+            } => {
+                return Err(EngineError::ScriptInitUnsupported {
                     clan_index: bundle.clan_index,
-                    event_word: event.event_word,
-                    writes,
+                    path: bundle.script_path.clone(),
+                    event_index,
+                    instruction_index,
+                    source: error,
                 });
             }
         }
@@ -1346,24 +1428,29 @@ fn resolve_handler19_init_states(
     Ok(states)
 }
 
-fn handler19_x87_truncated_u32(
+fn handler19_anchor_word(
     value: f32,
     clan_index: usize,
     axis: &'static str,
 ) -> Result<u32, EngineError> {
-    if !value.is_finite() || !(0.0..=10_000.0).contains(&value) {
+    const SIGNED_QWORD_LIMIT: f32 = 9_223_372_036_854_775_808.0;
+
+    let rounded = value.round_ties_even();
+    if !value.is_finite() || rounded < -SIGNED_QWORD_LIMIT || rounded >= SIGNED_QWORD_LIMIT {
         return Err(EngineError::ScriptInit {
             clan_index,
             message: format!(
-                "ClanBase{axis}={value:?} is outside the recovered CreateSuperAI base range"
+                "ClanBase{axis}={value:?} is outside the modeled x87 FISTP qword range"
             ),
         });
     }
-    // ai.dll's __ftol saves the x87 control word, sets rounding-control bits
-    // to truncate, performs `fistp qword`, and restores the control word.
 
-    let word = value.trunc() as u32;
-    Ok(word)
+    // Iron3D FISTP qword keeps its low DWORD; AI FUN_10005c70 then round-trips
+    // that unsigned word through f32 before Handler(19)'s truncating __ftol.
+    let creation_word = (rounded as i64) as u32;
+    let ai_field = creation_word as f32;
+    let handler_qword = ai_field.trunc() as i64;
+    Ok(handler_qword as u32)
 }
 
 fn load_script_varset(
@@ -1412,6 +1499,7 @@ fn read_vfs(vfs: &Arc<dyn Vfs>, path: &NormalizedPath) -> Result<Arc<[u8]>, Engi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fparkan_script::ScriptDispatchSelector;
     use fparkan_vfs::{DirectoryVfs, MemoryVfs, VfsEntry, VfsMetadata};
     use std::path::{Path, PathBuf};
 
@@ -1544,7 +1632,7 @@ mod tests {
             used_fallback: true,
             declarations,
         };
-        let bundles = [MissionScriptBundle {
+        let mut bundles = [MissionScriptBundle {
             clan_index: 1,
             base_path: "MISSIONS/SCRIPTS/default".to_string(),
             script_path: "MISSIONS/SCRIPTS/default.scr".to_string(),
@@ -1555,22 +1643,28 @@ mod tests {
                     name_raw: b"Init\0".to_vec(),
                     event_word: 0x1234_5678,
                     instructions: vec![fparkan_script::ScriptInstruction {
-                        header_words: [19, 0, 0, 0, 0, 3, 0],
+                        header_words: [19, u32::MAX, u32::MAX, 0, 0, 3, 0],
                         references: vec![0, 1, 2],
                     }],
                 }],
                 trailing_bytes: Vec::new(),
                 raw: Arc::from(&b""[..]),
             },
+            init_execution: MissionScriptInitExecution::Missing,
         }];
 
-        let states =
-            resolve_handler19_init_states(&[[500.0, 752.0], [728.0, 449.0]], &bundles, &varset)
-                .expect("exact Init execution");
+        let states = resolve_handler19_init_states(
+            &[[500.0, 752.0], [728.0, 449.0]],
+            &mut bundles,
+            &varset,
+            MissionAssetScope::Full,
+        )
+        .expect("exact Init execution");
         assert_eq!(
             states,
             vec![MissionScriptInitState {
                 clan_index: 1,
+                event_index: 0,
                 event_word: 0x1234_5678,
                 writes: vec![
                     Handler19DwordWrite {
@@ -1618,13 +1712,159 @@ mod tests {
     }
 
     #[test]
-    fn handler_nineteen_init_rejects_anchor_outside_recovered_base_range() {
-        let error = handler19_x87_truncated_u32(-0.5, 0, "x").expect_err("negative anchor");
+    fn handler_nineteen_preview_keeps_unsupported_package_without_partial_writes() {
+        let varset = MissionScriptVarSet {
+            path: FALLBACK_SCRIPT_VARSET_PATH.to_string(),
+            used_fallback: true,
+            declarations: fparkan_script::parse_varset(
+                b"VAR( DWORD, x, 950)\nVAR( DWORD, y, 1000)\nVAR( DWORD, id, 0)\n",
+            )
+            .expect("varset"),
+        };
+        let package = ScriptPackage {
+            opcode_handler_count: 73,
+            events: vec![fparkan_script::ScriptEvent {
+                name_len: 4,
+                name_raw: b"Init\0".to_vec(),
+                event_word: 0x1234,
+                instructions: vec![
+                    fparkan_script::ScriptInstruction {
+                        header_words: [19, u32::MAX, u32::MAX, 0, 0, 3, 0],
+                        references: vec![0, 1, 2],
+                    },
+                    fparkan_script::ScriptInstruction {
+                        header_words: [18, u32::MAX, u32::MAX, 0, 0, 0, 0],
+                        references: Vec::new(),
+                    },
+                ],
+            }],
+            trailing_bytes: Vec::new(),
+            raw: Arc::from(&b""[..]),
+        };
+        let bundle = || MissionScriptBundle {
+            clan_index: 0,
+            base_path: "MISSIONS/SCRIPTS/default".to_string(),
+            script_path: "MISSIONS/SCRIPTS/default.scr".to_string(),
+            package: package.clone(),
+            init_execution: MissionScriptInitExecution::Missing,
+        };
+        let anchors = [[500.0, 752.0]];
+        let mut preview_bundles = vec![bundle()];
+        let preview_states = resolve_handler19_init_states(
+            &anchors,
+            &mut preview_bundles,
+            &varset,
+            MissionAssetScope::FirstMeshPreview,
+        )
+        .expect("static preview retains unsupported script");
+        assert!(preview_states.is_empty(), "no partial writes are retained");
+        assert_eq!(
+            preview_bundles[0].init_execution,
+            MissionScriptInitExecution::Unsupported {
+                event_index: 0,
+                instruction_index: 1,
+                error: Handler19ResolveError::UnsupportedSelector {
+                    found: ScriptDispatchSelector::Handler(18),
+                },
+            }
+        );
+        assert_eq!(
+            materialize_script_varset_states(&preview_bundles, &varset, &preview_states)
+                .expect("preview keeps default varset values"),
+            vec![MissionScriptVarSetState {
+                clan_index: 0,
+                values: vec![
+                    VarSetDefault::Dword(950),
+                    VarSetDefault::Dword(1000),
+                    VarSetDefault::Dword(0),
+                ],
+            }]
+        );
+        assert_eq!(preview_bundles[0].package, package);
+
+        let mut full_bundles = vec![bundle()];
         assert!(matches!(
-            error,
-            EngineError::ScriptInit { clan_index: 0, message }
-                if message.contains("outside the recovered CreateSuperAI base range")
+            resolve_handler19_init_states(
+                &anchors,
+                &mut full_bundles,
+                &varset,
+                MissionAssetScope::Full,
+            ),
+            Err(EngineError::ScriptInitUnsupported {
+                clan_index: 0,
+                event_index: 0,
+                instruction_index: 1,
+                source: Handler19ResolveError::UnsupportedSelector {
+                    found: ScriptDispatchSelector::Handler(18),
+                },
+                ..
+            })
         ));
+
+        let mut malformed_package = package.clone();
+        malformed_package.events[0].instructions[0]
+            .references
+            .clear();
+        let mut malformed_bundle = vec![MissionScriptBundle {
+            package: malformed_package,
+            ..bundle()
+        }];
+        assert!(matches!(
+            resolve_handler19_init_states(
+                &anchors,
+                &mut malformed_bundle,
+                &varset,
+                MissionAssetScope::FirstMeshPreview,
+            ),
+            Err(EngineError::ScriptInit { message, .. })
+                if message.contains("Handler(19) is missing reference 0")
+        ));
+    }
+
+    #[test]
+    fn handler_nineteen_init_matches_original_x87_rounding_and_dword_path() {
+        for (value, expected) in [
+            (500.2857, 500),
+            (751.8217, 752),
+            (500.5, 500),
+            (501.5, 502),
+            (-0.5, 0),
+            (-0.4, 0),
+            (-0.6, 0),
+            (10_000.4, 10_000),
+            (10_000.5, 10_000),
+            (10_000.6, 10_001),
+            (10_001.0, 10_001),
+            (4_294_967_296.0, 0),
+            (u32::MAX as f32, 0),
+            (4_294_967_808.0, 512),
+        ] {
+            assert_eq!(
+                handler19_anchor_word(value, 0, "x").expect("supported anchor"),
+                expected,
+                "anchor {value:?}"
+            );
+        }
+        assert_eq!(u32::MAX as f32, 4_294_967_296.0);
+    }
+
+    #[test]
+    fn handler_nineteen_init_rejects_unmodeled_x87_qword_conversions() {
+        let qword_limit = 9_223_372_036_854_775_808.0_f32;
+        assert_eq!(
+            handler19_anchor_word(-qword_limit, 0, "x").expect("valid signed qword minimum"),
+            0,
+            "the signed qword minimum is representable before low-DWORD conversion"
+        );
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, qword_limit] {
+            let error =
+                handler19_anchor_word(value, 0, "x").expect_err("unmodeled FISTP qword input");
+            assert!(matches!(
+                error,
+                EngineError::ScriptInit { clan_index: 0, message }
+                    if message.contains("outside the modeled x87 FISTP qword range")
+            ));
+        }
     }
 
     #[test]
@@ -1748,6 +1988,111 @@ mod tests {
             );
             assert_eq!((status, outcome), (5, MissionScriptOutcome::Active));
         }
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_autodemo_load_resolves_native_handler19_init_for_both_clans() {
+        let root = licensed_root("IS");
+        let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(root));
+        let mut engine = create(EngineServices::new(vfs)).expect("engine");
+        let loaded = load_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Autodemo.00/data.tma".to_string(),
+                mode: MissionMode::AutoDemo,
+            },
+        )
+        .expect("load licensed AutoDemo");
+
+        assert_eq!(
+            loaded_mission_document(&engine)
+                .expect("mission document")
+                .clans
+                .iter()
+                .map(|clan| clan.anchor)
+                .collect::<Vec<_>>(),
+            vec![[500.2857, 751.8217], [728.0, 449.0]]
+        );
+        assert_eq!(loaded.script_bundle_count, 2);
+        assert_eq!(loaded.script_init_state_count, 2);
+        assert_eq!(loaded.script_varset_state_count, 2);
+        assert!(loaded_mission_script_bundles(&engine)
+            .expect("script bundles")
+            .iter()
+            .all(|bundle| bundle.init_execution
+                == MissionScriptInitExecution::Executed { event_index: 0 }));
+
+        let varsets = loaded_mission_script_varset_states(&engine).expect("per-clan varsets");
+        let clan_zero = varsets
+            .iter()
+            .find(|state| state.clan_index == 0)
+            .expect("first clan varset");
+        let clan_one = varsets
+            .iter()
+            .find(|state| state.clan_index == 1)
+            .expect("second clan varset");
+        assert_eq!(
+            &clan_zero.values[224..227],
+            &[
+                VarSetDefault::Dword(500),
+                VarSetDefault::Dword(752),
+                VarSetDefault::Dword(0),
+            ]
+        );
+        assert_eq!(
+            &clan_one.values[224..227],
+            &[
+                VarSetDefault::Dword(728),
+                VarSetDefault::Dword(449),
+                VarSetDefault::Dword(1),
+            ]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_campaign_preview_keeps_unsupported_init_without_partial_writes() {
+        let root = licensed_root("IS");
+        let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(root));
+        let mut engine = create(EngineServices::new(vfs)).expect("engine");
+        let loaded = load_mission_static_preview_roots(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.01/data.tma".to_string(),
+                mode: MissionMode::SingleMission,
+            },
+            NonZeroUsize::new(1).expect("non-zero root count"),
+        )
+        .expect("load licensed campaign preview");
+
+        let bundles = loaded_mission_script_bundles(&engine).expect("script bundles");
+        let unsupported = bundles
+            .iter()
+            .find(|bundle| {
+                matches!(
+                    &bundle.init_execution,
+                    MissionScriptInitExecution::Unsupported { .. }
+                )
+            })
+            .expect("campaign package with an unsupported Init instruction");
+        let clan_index = unsupported.clan_index;
+        let states = loaded_mission_script_init_states(&engine).expect("Init writes");
+        assert!(states.iter().all(|state| state.clan_index != clan_index));
+        let varset = loaded_mission_script_varset_states(&engine)
+            .expect("per-clan varsets")
+            .iter()
+            .find(|state| state.clan_index == clan_index)
+            .expect("unsupported clan varset");
+        assert_eq!(
+            &varset.values[224..227],
+            &[
+                VarSetDefault::Dword(950),
+                VarSetDefault::Dword(1000),
+                VarSetDefault::Dword(0),
+            ]
+        );
+        assert!(loaded.script_bundle_count >= 1);
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //! Lossless, bounded reader for compiled AI `.scr` packages.
 //!
 //! This module preserves the layout proven by the GOG `ai.dll` reader.  It
-//! deliberately does not assign semantics to instruction words or execute
-//! bytecode: that requires handler-specific evidence.
+//! deliberately does not implement a general bytecode VM. It contains a
+//! narrow, handler-specific resolver for the confirmed `Init` path.
 
 use fparkan_binary::{checked_allocation_len, Cursor, DecodeError, Limits};
 use std::sync::Arc;
@@ -151,6 +151,35 @@ pub struct Handler19DwordWrite {
     pub value: u32,
 }
 
+/// Result of resolving the first event whose case-sensitive C-string name is
+/// `Init` (bytes through the first NUL) with the supported
+/// `Handler(19)` action subset.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Handler19InitResolution {
+    /// No event has the case-sensitive C-string name `Init`; the native lookup
+    /// makes no call.
+    Missing,
+    /// The first `Init\0` event was walked in source order.
+    Executed {
+        /// Zero-based event table index selected by the native name lookup.
+        event_index: usize,
+        /// Opaque event word retained from the selected record.
+        event_word: u32,
+        /// Ordered writes emitted by every supported instruction in the event.
+        writes: Vec<Handler19DwordWrite>,
+    },
+    /// The first unsupported instruction stopped this restricted resolver.
+    /// Any earlier local writes are discarded because the event did not finish.
+    Unsupported {
+        /// Zero-based event table index selected by the native name lookup.
+        event_index: usize,
+        /// Zero-based instruction index within that event.
+        instruction_index: usize,
+        /// Unsupported action shape.
+        error: Handler19ResolveError,
+    },
+}
+
 /// Inputs already expressed at the original `Handler(19)` setter ABI boundary.
 ///
 /// The first two words are results of original x87 `__ftol` calls. Keeping
@@ -169,6 +198,21 @@ pub struct Handler19InitInput {
 /// Error resolving the three-target `Handler(19)` Init contract.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Handler19ResolveError {
+    /// The selected action is not the recovered `Handler(19)` slot.
+    UnsupportedSelector {
+        /// Recovered selector shape.
+        found: ScriptDispatchSelector,
+    },
+    /// Only action instructions with control word `0xffff_ffff` are supported.
+    UnsupportedControlWord {
+        /// Opaque control word from instruction header word one.
+        found: u32,
+    },
+    /// Only instructions with no result-save reference are supported.
+    UnsupportedResultSave {
+        /// Opaque variable reference from instruction header word two.
+        found: u32,
+    },
     /// One of the three required references was absent.
     MissingReference {
         /// Zero-based required target position.
@@ -193,6 +237,17 @@ pub enum Handler19ResolveError {
 impl std::fmt::Display for Handler19ResolveError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::UnsupportedSelector { found } => {
+                write!(formatter, "unsupported script selector {found:?} in Init")
+            }
+            Self::UnsupportedControlWord { found } => write!(
+                formatter,
+                "unsupported Init control word 0x{found:08x}; expected 0xffffffff"
+            ),
+            Self::UnsupportedResultSave { found } => write!(
+                formatter,
+                "unsupported Init result-save reference 0x{found:08x}; expected 0xffffffff"
+            ),
             Self::MissingReference { position } => {
                 write!(formatter, "Handler(19) is missing reference {position}")
             }
@@ -526,6 +581,73 @@ impl VarSet {
                 value: input.third_word,
             },
         ])
+    }
+
+    /// Resolves only the first event whose case-sensitive C-string name is
+    /// `Init` (bytes through the first NUL), and its supported
+    /// `Handler(19)` action instructions in source order.
+    ///
+    /// A missing event is a normal no-write result, matching the native event
+    /// lookup. Unsupported selector/control/result-save forms stop at their
+    /// first instruction and return no partial writes. Malformed handler
+    /// references and declaration types remain errors.
+    pub fn resolve_handler19_init(
+        &self,
+        package: &ScriptPackage,
+        input: Handler19InitInput,
+    ) -> Result<Handler19InitResolution, Handler19ResolveError> {
+        let Some((event_index, event)) = package.events.iter().enumerate().find(|(_, event)| {
+            event.name_raw.split(|byte| *byte == 0).next() == Some(&b"Init"[..])
+        }) else {
+            return Ok(Handler19InitResolution::Missing);
+        };
+
+        let mut writes = Vec::new();
+        for (instruction_index, instruction) in event.instructions.iter().enumerate() {
+            let instruction_writes =
+                match self.resolve_handler19_init_instruction(instruction, input) {
+                    Ok(writes) => writes,
+                    Err(error @ Handler19ResolveError::UnsupportedSelector { .. })
+                    | Err(error @ Handler19ResolveError::UnsupportedControlWord { .. })
+                    | Err(error @ Handler19ResolveError::UnsupportedResultSave { .. }) => {
+                        return Ok(Handler19InitResolution::Unsupported {
+                            event_index,
+                            instruction_index,
+                            error,
+                        });
+                    }
+                    Err(error) => return Err(error),
+                };
+            writes.extend(instruction_writes);
+        }
+
+        Ok(Handler19InitResolution::Executed {
+            event_index,
+            event_word: event.event_word,
+            writes,
+        })
+    }
+
+    fn resolve_handler19_init_instruction(
+        &self,
+        instruction: &ScriptInstruction,
+        input: Handler19InitInput,
+    ) -> Result<[Handler19DwordWrite; 3], Handler19ResolveError> {
+        let selector = instruction.dispatch_selector();
+        if selector != ScriptDispatchSelector::Handler(19) {
+            return Err(Handler19ResolveError::UnsupportedSelector { found: selector });
+        }
+        if instruction.header_words[1] != u32::MAX {
+            return Err(Handler19ResolveError::UnsupportedControlWord {
+                found: instruction.header_words[1],
+            });
+        }
+        if instruction.header_words[2] != u32::MAX {
+            return Err(Handler19ResolveError::UnsupportedResultSave {
+                found: instruction.header_words[2],
+            });
+        }
+        self.resolve_handler19(instruction, input)
     }
 
     fn resolve_handler19_target(
@@ -1196,10 +1318,11 @@ fn read_instruction(
 mod tests {
     use super::{
         decode, decode_with_limits, parse_varset, Handler15ResolveError, Handler15TargetPayload,
-        Handler19DwordWrite, Handler19InitInput, Handler19ResolveError, Handler2RecordInput,
-        Handler2RecordScheduler, Handler30ResolveError, Handler8Reset, Handler8ResolveError,
-        ScriptDispatchSelector, ScriptInstruction, VarSetDefault, VarSetError, VarSetType,
-        VmHostCallbackCommand, GOG_HANDLER_COUNT, INSTRUCTION_WORDS,
+        Handler19DwordWrite, Handler19InitInput, Handler19InitResolution, Handler19ResolveError,
+        Handler2RecordInput, Handler2RecordScheduler, Handler30ResolveError, Handler8Reset,
+        Handler8ResolveError, ScriptDispatchSelector, ScriptEvent, ScriptInstruction,
+        ScriptPackage, VarSetDefault, VarSetError, VarSetType, VmHostCallbackCommand,
+        GOG_HANDLER_COUNT, INSTRUCTION_WORDS,
     };
     use fparkan_binary::{DecodeError, Limits};
 
@@ -1557,6 +1680,281 @@ STRING( 8, ignored, ignored, ignored)\r\n";
                 },
             ),
             Err(Handler19ResolveError::MissingReference { position: 0 })
+        );
+    }
+
+    #[test]
+    fn handler_nineteen_init_uses_first_exact_event_and_keeps_instruction_order() {
+        let varset = parse_varset(b"VAR( DWORD, x, 0)\nVAR( DWORD, y, 0)\nVAR( DWORD, id, 0)\n")
+            .expect("DWORD targets");
+        let action = |references: Vec<u32>| ScriptInstruction {
+            header_words: [19, u32::MAX, u32::MAX, 0, 0, 3, 0],
+            references,
+        };
+        let package = ScriptPackage {
+            opcode_handler_count: 73,
+            events: vec![
+                ScriptEvent {
+                    name_len: 11,
+                    name_raw: b"Init\0suffix\0".to_vec(),
+                    event_word: 0x1234,
+                    instructions: vec![action(vec![0, 1, 2]), action(vec![1, 0, 2])],
+                },
+                ScriptEvent {
+                    name_len: 4,
+                    name_raw: b"Init\0".to_vec(),
+                    event_word: 0x5678,
+                    instructions: vec![ScriptInstruction {
+                        header_words: [18, u32::MAX, u32::MAX, 0, 0, 0, 0],
+                        references: Vec::new(),
+                    }],
+                },
+            ],
+            trailing_bytes: Vec::new(),
+            raw: std::sync::Arc::from(&b""[..]),
+        };
+
+        let result = varset
+            .resolve_handler19_init(
+                &package,
+                Handler19InitInput {
+                    first_x87_word: 7,
+                    second_x87_word: 8,
+                    third_word: 9,
+                },
+            )
+            .expect("valid first Init event");
+        assert_eq!(
+            result,
+            Handler19InitResolution::Executed {
+                event_index: 0,
+                event_word: 0x1234,
+                writes: vec![
+                    Handler19DwordWrite { index: 0, value: 7 },
+                    Handler19DwordWrite { index: 1, value: 8 },
+                    Handler19DwordWrite { index: 2, value: 9 },
+                    Handler19DwordWrite { index: 1, value: 7 },
+                    Handler19DwordWrite { index: 0, value: 8 },
+                    Handler19DwordWrite { index: 2, value: 9 },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn handler_nineteen_init_missing_exact_name_has_no_writes() {
+        let varset = parse_varset(b"").expect("empty varset");
+        let package = ScriptPackage {
+            opcode_handler_count: 73,
+            events: vec![
+                ScriptEvent {
+                    name_len: 4,
+                    name_raw: b"init\0".to_vec(),
+                    event_word: 1,
+                    instructions: Vec::new(),
+                },
+                ScriptEvent {
+                    name_len: 4,
+                    name_raw: b"INIT\0".to_vec(),
+                    event_word: 2,
+                    instructions: Vec::new(),
+                },
+            ],
+            trailing_bytes: Vec::new(),
+            raw: std::sync::Arc::from(&b""[..]),
+        };
+
+        assert_eq!(
+            varset.resolve_handler19_init(
+                &package,
+                Handler19InitInput {
+                    first_x87_word: 7,
+                    second_x87_word: 8,
+                    third_word: 9,
+                },
+            ),
+            Ok(Handler19InitResolution::Missing)
+        );
+    }
+
+    #[test]
+    fn handler_nineteen_init_accepts_empty_first_event_as_executed_with_no_writes() {
+        let varset = parse_varset(b"").expect("empty varset");
+        let package = ScriptPackage {
+            opcode_handler_count: 73,
+            events: vec![
+                ScriptEvent {
+                    name_len: 4,
+                    name_raw: b"Init\0".to_vec(),
+                    event_word: 0x1234,
+                    instructions: Vec::new(),
+                },
+                ScriptEvent {
+                    name_len: 4,
+                    name_raw: b"Init\0".to_vec(),
+                    event_word: 0x5678,
+                    instructions: vec![ScriptInstruction {
+                        header_words: [18, u32::MAX, u32::MAX, 0, 0, 0, 0],
+                        references: Vec::new(),
+                    }],
+                },
+            ],
+            trailing_bytes: Vec::new(),
+            raw: std::sync::Arc::from(&b""[..]),
+        };
+
+        assert_eq!(
+            varset.resolve_handler19_init(
+                &package,
+                Handler19InitInput {
+                    first_x87_word: 7,
+                    second_x87_word: 8,
+                    third_word: 9,
+                },
+            ),
+            Ok(Handler19InitResolution::Executed {
+                event_index: 0,
+                event_word: 0x1234,
+                writes: Vec::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn handler_nineteen_init_reports_unsupported_selector_and_discards_prior_writes() {
+        let varset = parse_varset(b"VAR( DWORD, x, 0)\nVAR( DWORD, y, 0)\nVAR( DWORD, id, 0)\n")
+            .expect("DWORD targets");
+        let package = ScriptPackage {
+            opcode_handler_count: 73,
+            events: vec![ScriptEvent {
+                name_len: 4,
+                name_raw: b"Init\0".to_vec(),
+                event_word: 0,
+                instructions: vec![
+                    ScriptInstruction {
+                        header_words: [19, u32::MAX, u32::MAX, 0, 0, 3, 0],
+                        references: vec![0, 1, 2],
+                    },
+                    ScriptInstruction {
+                        header_words: [18, u32::MAX, u32::MAX, 0, 0, 0, 0],
+                        references: Vec::new(),
+                    },
+                    ScriptInstruction {
+                        header_words: [19, u32::MAX, u32::MAX, 0, 0, 3, 0],
+                        references: vec![0, 1, 2],
+                    },
+                ],
+            }],
+            trailing_bytes: Vec::new(),
+            raw: std::sync::Arc::from(&b""[..]),
+        };
+
+        assert_eq!(
+            varset.resolve_handler19_init(
+                &package,
+                Handler19InitInput {
+                    first_x87_word: 7,
+                    second_x87_word: 8,
+                    third_word: 9,
+                },
+            ),
+            Ok(Handler19InitResolution::Unsupported {
+                event_index: 0,
+                instruction_index: 1,
+                error: Handler19ResolveError::UnsupportedSelector {
+                    found: super::ScriptDispatchSelector::Handler(18),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn handler_nineteen_init_stops_at_unsupported_selector_before_any_write() {
+        let varset = parse_varset(b"VAR( DWORD, x, 0)\nVAR( DWORD, y, 0)\nVAR( DWORD, id, 0)\n")
+            .expect("DWORD targets");
+        let package = ScriptPackage {
+            opcode_handler_count: 73,
+            events: vec![ScriptEvent {
+                name_len: 4,
+                name_raw: b"Init\0".to_vec(),
+                event_word: 0,
+                instructions: vec![
+                    ScriptInstruction {
+                        header_words: [18, u32::MAX, u32::MAX, 0, 0, 0, 0],
+                        references: Vec::new(),
+                    },
+                    ScriptInstruction {
+                        header_words: [19, u32::MAX, u32::MAX, 0, 0, 3, 0],
+                        references: vec![0, 1, 2],
+                    },
+                ],
+            }],
+            trailing_bytes: Vec::new(),
+            raw: std::sync::Arc::from(&b""[..]),
+        };
+
+        assert_eq!(
+            varset.resolve_handler19_init(
+                &package,
+                Handler19InitInput {
+                    first_x87_word: 7,
+                    second_x87_word: 8,
+                    third_word: 9,
+                },
+            ),
+            Ok(Handler19InitResolution::Unsupported {
+                event_index: 0,
+                instruction_index: 0,
+                error: Handler19ResolveError::UnsupportedSelector {
+                    found: super::ScriptDispatchSelector::Handler(18),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn handler_nineteen_init_types_unsupported_control_and_result_save() {
+        let varset = parse_varset(b"VAR( DWORD, x, 0)\nVAR( DWORD, y, 0)\nVAR( DWORD, id, 0)\n")
+            .expect("DWORD targets");
+        let input = Handler19InitInput {
+            first_x87_word: 7,
+            second_x87_word: 8,
+            third_word: 9,
+        };
+        let instruction = |control_word, result_word| ScriptInstruction {
+            header_words: [19, control_word, result_word, 0, 0, 3, 0],
+            references: vec![0, 1, 2],
+        };
+        let resolve = |instruction| {
+            let package = ScriptPackage {
+                opcode_handler_count: 73,
+                events: vec![ScriptEvent {
+                    name_len: 4,
+                    name_raw: b"Init\0".to_vec(),
+                    event_word: 0,
+                    instructions: vec![instruction],
+                }],
+                trailing_bytes: Vec::new(),
+                raw: std::sync::Arc::from(&b""[..]),
+            };
+            varset.resolve_handler19_init(&package, input)
+        };
+
+        assert_eq!(
+            resolve(instruction(0, u32::MAX)),
+            Ok(Handler19InitResolution::Unsupported {
+                event_index: 0,
+                instruction_index: 0,
+                error: Handler19ResolveError::UnsupportedControlWord { found: 0 },
+            })
+        );
+        assert_eq!(
+            resolve(instruction(u32::MAX, 2)),
+            Ok(Handler19InitResolution::Unsupported {
+                event_index: 0,
+                instruction_index: 0,
+                error: Handler19ResolveError::UnsupportedResultSave { found: 2 },
+            })
         );
     }
 

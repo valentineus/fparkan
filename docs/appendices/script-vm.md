@@ -268,8 +268,9 @@ scheduler path внутри запущенной игры.
 На границе mission runtime выбранный TMA clan `first_resource`
 материализуется как отдельный `MissionScriptBundle`: loader нормализует
 `<base>.scr`, декодирует его тем же bounded reader-ом и публикует immutable
-package вместе с clan provenance. Это именно wiring входных данных, не VM
-execution: Init и остальные events пока не dispatch-ятся, а ошибка чтения сохраняет
+package вместе с clan provenance. Для первого события `Init` runtime исполняет
+только подтверждённый фрагмент dispatcher-а с `Handler(19)`; остальные события
+пока остаются только прочитанными данными. Ошибка чтения по-прежнему сохраняет
 transactional rollback mission loader-а.
 
 TMA properties остаются four raw `u32` words плюс имя, пока consumer/schema не
@@ -283,58 +284,136 @@ layout prerequisites/modifiers/unlocks. Formula evaluator требует strict
 grammar/version, typed operands, deterministic numeric policy, bounded stack и
 явных errors; x87-compatible rounding нужен там, где оно выбирает ветку.
 
-### Handler(19): AutoDemo Init varset initialization
+### Первый фрагмент dispatcher-а: `Init` и Handler(19)
 
-`Handler(19)` is the twentieth VM-table entry at GOG `ai.dll` VA `0x1000aa38`.
-It is the only instruction in the `Init` event of the two `default.scr` bundles
-referenced by `MISSIONS\\Autodemo.00\\data.tma`; together those bundles account for
-the observed 18 named script events. Each instruction references varset records
-`224`, `225`, and `226`: `ClanBaseX`, `ClanBaseY`, and `ClanID` respectively.
+Этот контракт относится к проверенной сборке GOG: `ai.dll`, SHA-256
+`c19cd6cd31cd2896f8c4ba0f0e700dd3408aec8182daaf4863d98a7d233a2abc`, PE32 с
+image base `0x10000000`. В ней `FUN_10011f40` (RVA `0x11f40`) ищет имя
+события как C-строку: сравнивает байты до первого NUL, с учётом регистра, и
+возвращает индекс первого совпадения. Поле `name_len` при поиске не используется.
+Если совпадения нет, поиск возвращает `-1`; `FUN_10011f10` (RVA `0x11f10`) не
+вызывает обработчик для такого индекса. Поэтому повторные записи `Init` не
+исполняются все подряд: выбирается первая.
 
-The original writes three raw DWORD values in order. It converts the VM fields
-at `+0x80` and `+0x84` through the x87 `__ftol` helper and stores the resulting
-words into references 0 and 1. It copies the raw word from `+0x7c` into reference
-2, then clears VM field `+0x50`. The default targets are `DWORD` records; the
-shared setter preserves the incoming word for that type. Therefore this is not
-a license to replace the first two conversions with Rust float casts: their
-rounding behavior remains an x87 compatibility boundary until it has captured
-test vectors.
+`FUN_10011f10` передаёт выбранный индекс внутреннему циклу `FUN_10011fb0`
+(RVA `0x11fb0`). Цикл начинает с первой вложенной инструкции, сбрасывает индекс
+инструкции и глубину стека условий, затем идёт по записям в порядке файла.
+В исходном `default.scr` событие `Init` содержит одну инструкцию selector `19`,
+control word `0xffffffff` (действие) и result reference `0xffffffff` (результат
+не сохраняется). Это наблюдаемая форма пакета; поведение оригинала для остальных
+форм здесь не утверждается.
 
-The missing source-field provenance is now constrained by the public creation
-boundary. `CreateSuperAI` at `ai.dll` VA `0x1000f710` allocates `0x8b0` bytes
-and calls constructor `0x10001000` with its first eight arguments. That
-constructor calls `0x10006340(this + 0x7c, clan_id, base_x, base_y)`: these are
-the fields later read by `Handler(19)`. `base_x` and `base_y` are unsigned and
-the constructor rejects values greater than `10000`. The actual `__ftol` helper
-at `0x1001df70` saves the x87 control word, sets its rounding-control bits to
-truncate, executes `fistp qword`, then restores the control word.
+В GOG `default.scr` события `Init` в двух AutoDemo bundles имеют по одной такой
+инструкции. Её ссылки `224`, `225`, `226` ведут к объявлениям `DWORD`
+`ClanBaseX`, `ClanBaseY` и `ClanID`. `Handler(19)` (двадцатая запись таблицы,
+VA `0x1000aa38`, RVA `0xaa38`) пишет их по порядку: поля SuperAI `+0x80` и
+`+0x84` переводит через x87 helper `__ftol`, а поле `+0x7c` копирует как
+неизменённое слово. После вызова он очищает поле SuperAI `+0x50`; соответствующее
+смещение в VM, начинающейся с SuperAI `+8`, равно `+0x48`. Поскольку цели имеют
+тип `DWORD`, общий setter сохраняет полученные слова без дополнительного
+преобразования. Helper `__ftol` в `ai.dll` (VA `0x1001df70`, RVA `0x1df70`)
+сохраняет x87 control word, временно задаёт округление к нулю, выполняет
+`FISTP qword` и восстанавливает control word.
 
-Consequently the runtime resolves and retains this one proved vertical slice
-during mission loading: each selected clan's TMA anchor is accepted only in the recovered
-`0..=10000` base range, truncated through the recovered x87 rule, and paired
-with its zero-based clan index. For every `Init` instruction whose selector is
-`Handler(19)`, `VarSet::resolve_handler19` produces the three per-clan DWORD
-writes. The runtime then materializes an independent declaration-ordered value
-array for each selected clan and applies those writes, so later recovered
-handlers can consume `ClanBaseX`, `ClanBaseY`, and `ClanID` as runtime cells
-rather than loader defaults. Other Init selectors and all other events remain
-decoded but unexecuted. AutoDemo validates the path end-to-end: its non-integral first
-anchor (`500.2857`) yields captured `ClanBaseX=500`, and the live GOG process
-contains two initialized SuperAI entries `(500, 752, 0)` and `(728, 449, 1)`;
-the Rust loader reports `script_init_states=2` and `script_varset_states=2`.
+Входные координаты идут через два DLL. В проверенной сборке `iron3d.dll`
+(SHA-256 `d1dc4ea8535e2069b0a05c9e8be2724dd438ba44cca7a83007d8b2e50f9e35fa`)
+функция `FUN_100392e0` преобразует две координаты TMA из `float` в signed
+64-bit через x87 `FISTP qword` (RVA `0x39307` и `0x3932f`), а пятый и шестой
+аргументы `CreateSuperAI` получает как младшие DWORD этих результатов. Десятый
+аргумент — указатель callback. В прямом вызове оригинала пара
+`(500.2857, 751.8217)` дала `(500, 752)`, а tie-векторы `(500.5, 501.5)` при
+ближайшем режиме дали `(500, 502)`. Например, `-0.6` сначала округляется до
+`-1`, а его младший DWORD равен `0xffffffff`.
 
-`GetSuperAI` returns element `n` of the 64-pointer global table at preferred
-`ai.dll + 0x55398` for `n <= 63`. A read-only capture of the running GOG
-AutoDemo process observed `(500, 752, 0)` for entry 0 and `(728, 449, 1)` for
-entry 1 at fields
-`(+0x80, +0x84, +0x7c)`. These values are integral samples, not a rounding
-profile.
+`CreateSuperAI` в `ai.dll` (VA `0x1000f710`, RVA `0xf710`) выделяет `0x8b0`
+байт и вызывает конструктор `FUN_10001000`. Тот передаёт `clan_id`, `base_x` и
+`base_y` в `FUN_10006340`, которая заполняет поля позднее читаемые
+`Handler(19)`. Значения больше `10000` вызывают исходное предупреждение через
+`MessageBoxA`, после которого конструктор продолжает работу; это не отказ и не
+ограничение координат. `FUN_10005c70` (RVA `0x5c70`) затем расширяет DWORD до
+qword, загружает его через x87 и записывает `float` в поля структуры `+4` и
+`+8` — в этой цепочке это SuperAI `+0x80` и `+0x84`. Поэтому `0xffffffff`
+превращается в `2^32` при округлении до single precision.
+Сам `Handler(19)` применяет `__ftol` с усечением к этим полям и берёт младший
+DWORD: для `2^32` получается `0`, а для `10001.0` — `10001`.
 
-The Rust reader exposes `VarSet::resolve_handler19`. It accepts the already
-converted first two words and the third raw word, produces three typed writes,
-and rejects missing, out-of-range, or non-`DWORD` targets. The runtime only
-binds it to the proven creation/anchor path above; it does not guess the
-remaining script event semantics.
+Rust повторяет весь числовой путь до DWORD, записываемого в `VarSet`:
+nearest-even `FISTP qword`, младший DWORD, преобразование DWORD в `f32`, затем
+усечение результата до qword и его младший DWORD. В частности, это сохраняет
+наблюдаемый переход `-0.6 -> 0xffffffff -> 2^32 -> 0` и не отвергает `10001`.
+Координата, не конечная или не представимая в signed qword на первом шаге,
+остаётся явной ошибкой: поведение такой области здесь не моделируется. Rust не
+показывает исходное предупреждение `MessageBoxA`; оно находится за пределами
+этого числового resolver-а.
+
+Ограниченный Rust-исполнитель `VarSet::resolve_handler19_init` ищет только
+первое событие `Init`, проходит его инструкции по порядку и возвращает
+упорядоченные записи. Runtime применяет их к отдельной копии varset выбранного
+клана лишь после успешного прохода всего события. Отсутствующий `Init` даёт
+статус `Missing` и не создаёт записей инициализации; пустой первый `Init` даёт
+`Executed` без записей. Если форма инструкции пока не поддержана, package
+остаётся доступен в preview режиме со статусом `Unsupported`, а default-значения
+ячеек сохраняются; при полной загрузке миссии такая же форма возвращает ошибку с
+индексами события и инструкции. Предшествующие частичные записи не применяются.
+Повреждённая ссылка или цель неправильного типа остаётся ошибкой в обоих режимах.
+Это правила ограниченного Rust-исполнителя, а не обнаруженное поведение
+оригинального dispatcher-а.
+
+Для проверки использованы два x86 helper-а на синтетической памяти. Первый
+вызывает оригинальные `iron3d.dll` entry points и проверяет преобразование
+TMA-координат в аргументы `CreateSuperAI`. Второй загружает оригинальную
+`ai.dll`, вызывает `FUN_10011f40` и `FUN_10011f10`, а записи читает штатным
+getter-ом `FUN_10013570` (RVA `0x13570`). В нём проверены оба набора AutoDemo,
+первая дублирующаяся запись `Init`, имя `Init\\0suffix\\0`, отсутствие записи
+при пропущенном `Init` и связка `FUN_10005c70` → Handler(19): для входных DWORD
+`(0xffffffff, 10001)` поля стали `(2^32, 10001.0)`, а varset получил
+`(0, 10001, 2)`. Наборы AutoDemo дали `(500, 752, 0)` и `(728, 449, 1)`.
+Эти синтетические вызовы подтверждают изолированные участки ABI, но не доказывают,
+кто в Iron3D запускает `Init` при полном старте игровой миссии.
+
+Обе проверки можно повторить из корня репозитория в Windows PowerShell. Первая
+вызывает оригинальный caller `iron3d.dll`; вторая — original dispatcher, setter
+и getter `ai.dll`:
+
+```powershell
+$env:FPARKAN_ORIGINAL_IRON3D_DLL = 'C:\GOG Games\Parkan - Iron Strategy\iron3d.dll'
+$env:FPARKAN_ORIGINAL_AI_DLL = 'C:\GOG Games\Parkan - Iron Strategy\ai.dll'
+$env:FPARKAN_ORIGINAL_DEFAULT_SCR = 'C:\GOG Games\Parkan - Iron Strategy\MISSIONS\SCRIPTS\default.scr'
+New-Item -ItemType Directory -Force -Path target\handler19-native-oracles | Out-Null
+& "$env:WINDIR\Microsoft.NET\Framework\v4.0.30319\csc.exe" /nologo /platform:x86 /out:target\handler19-native-oracles\AnchorOracle.exe crates\fparkan-runtime\tests\handler19_anchor_native_oracle.cs
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+& "$env:WINDIR\Microsoft.NET\Framework\v4.0.30319\csc.exe" /nologo /platform:x86 /out:target\handler19-native-oracles\InitOracle.exe crates\fparkan-runtime\tests\handler19_init_native_oracle.cs
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+& .\target\handler19-native-oracles\AnchorOracle.exe
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+& .\target\handler19-native-oracles\InitOracle.exe
+exit $LASTEXITCODE
+```
+
+Caller oracle проверяет AutoDemo пару `(500.2857, 751.8217)`, четыре режима
+x87 на tie-векторах, границу `10000` и младший DWORD. AI oracle отдельно
+проверяет, что `FUN_10005c70(0xffffffff, 10001)` даёт поля `(2^32, 10001.0)`,
+а обработчик записывает `(0, 10001, 2)`.
+
+`GetSuperAI` возвращает элемент `n` из таблицы на 64 указателя по RVA `0x55398`
+в `ai.dll`, если `n <= 63`. В режиме только чтения у запущенной GOG AutoDemo
+одновременно сняты исходные координаты кланов в `iron3d.dll` и поля созданных
+SuperAI в этой таблице. Для первого клана raw TMA-слова `0x43fa2492` и
+`0x443bf497` декодируются как `(500.2857, 751.8217)`, а соответствующие поля
+SuperAI `+0x80`, `+0x84`, `+0x7c` содержали `(500.0, 752.0, 0)`. Для второго
+клана сырые координаты и поля совпали: `(728.0, 449.0, 1)`. Связанный снимок
+исходных и конечных значений исключает усечение, направление вверх и направление
+вниз в реально запущенной игре. Отдельный caller oracle вызывает оригинальный
+`FUN_100392e0` при явно заданных x87 RC-режимах, включая nearest; сравнение
+tie-векторов подтверждает реакцию `FISTP`, но не измеряет control word процесса.
+Профиль живой игры выводится из связанной пары raw X/Y → SuperAI.
+
+Нижнеуровневый `VarSet::resolve_handler19` принимает уже преобразованные первые
+два слова и третье исходное слово, выдаёт три типизированные записи и отклоняет
+отсутствующие, выходящие за диапазон или не-`DWORD` цели. Метод
+`resolve_handler19_init` добавляет выбор события и остановку на неподдержанной
+форме инструкции. Всё остальное содержимое `.scr` сохраняется reader-ом, но
+остаётся вне этого исполнения.
 
 ### Аргументы и обратный вызов Handler(30)
 
