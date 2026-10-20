@@ -33,6 +33,7 @@ pub use fparkan_assets::MissionAssets;
 
 const MISSION_DECODED_PAYLOAD_CACHE_ENTRIES: usize = 256;
 const FALLBACK_SCRIPT_VARSET_PATH: &str = "MISSIONS/SCRIPTS/varset.var";
+const INITIAL_BEHAVIOR_RNG_STATE: u32 = 1;
 
 /// Injectable engine services used by composition roots.
 #[derive(Clone, Default)]
@@ -168,6 +169,37 @@ pub struct MissionScriptBundle {
     pub package: ScriptPackage,
     /// Outcome of the restricted first-`Init` resolution for this bundle.
     pub init_execution: MissionScriptInitExecution,
+    /// Recovered per-AI Behavior state computed by a full mission startup.
+    /// Static previews leave this empty because they do not run script startup.
+    pub behavior_warm_start: Option<BehaviorWarmStartState>,
+}
+
+/// Initial Behavior distributor fields recovered from the original warm-start path.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BehaviorWarmStartState {
+    /// Queue-clock value copied to distributor offset `+0x10` when it is zero.
+    pub first_time_ms: u32,
+    /// Initial scheduled time written to distributor offset `+0x14`.
+    pub next_deadline_ms: u32,
+    /// Opaque distributor words at offsets `+0x30..=+0x40`, cleared on first start.
+    pub cleared_words: [u32; 5],
+}
+
+impl BehaviorWarmStartState {
+    fn start(queue_time_ms: u32, rng_state: &mut u32) -> Self {
+        const BASE_INTERVAL_MS: u32 = 3 * 64;
+        const JITTER_RANGE_MS: u32 = 64;
+
+        *rng_state = (*rng_state).wrapping_mul(0x343fd).wrapping_add(0x269ec3);
+        let random = (*rng_state >> 16) & 0x7fff;
+        let jitter_ms = ((random & 0xff) * JITTER_RANGE_MS) >> 8;
+
+        Self {
+            first_time_ms: queue_time_ms,
+            next_deadline_ms: queue_time_ms.wrapping_add(BASE_INTERVAL_MS + jitter_ms),
+            cleared_words: [0; 5],
+        }
+    }
 }
 
 /// Numeric script defaults selected for the mission's first script bundle.
@@ -381,6 +413,7 @@ pub struct Engine {
     services: EngineServices,
     world: World,
     loaded: Option<LoadedMissionState>,
+    behavior_rng_state: u32,
 }
 
 struct LoadedMissionState {
@@ -665,22 +698,35 @@ pub fn create(services: EngineServices) -> Result<Engine, EngineError> {
         services,
         world: new_world(WorldConfig),
         loaded: None,
+        behavior_rng_state: INITIAL_BEHAVIOR_RNG_STATE,
     })
 }
 
-/// Loads mission transactionally.
+/// Loads a mission transactionally and runs the recovered initial script subset.
+///
+/// `queue_time_ms` is the caller-supplied 32-bit queue-clock sample used to
+/// initialize the first Behavior deadline for each script bundle. This runtime
+/// entry point does not acquire the native queue clock or reproduce the full
+/// SuperAI host lifecycle.
 ///
 /// # Errors
 ///
-/// Returns [`EngineError`] when VFS services are missing, mission paths are
+/// Returns [`EngineError`] if VFS services are missing, mission paths are
 /// invalid, required files cannot be read, disk formats fail validation, terrain
-/// runtime data cannot be built, prototype graph roots do not resolve, or
-/// object registration fails.
+/// runtime data cannot be built, prototype graph roots do not resolve, object
+/// registration fails, or a full mission's first `Init` contains an unsupported
+/// action form.
 pub fn load_mission(
     engine: &mut Engine,
     request: MissionRequest,
+    queue_time_ms: u32,
 ) -> Result<LoadedMission, EngineError> {
-    load_mission_with_options(engine, request, MissionLoadOptions::default())
+    load_mission_with_options(
+        engine,
+        request,
+        MissionLoadOptions::default(),
+        Some(queue_time_ms),
+    )
 }
 
 /// Loads a mission using the bounded static-preview asset scope.
@@ -706,6 +752,7 @@ pub fn load_mission_static_preview(
             asset_scope: MissionAssetScope::FirstMeshPreview,
             ..MissionLoadOptions::default()
         },
+        None,
     )
 }
 
@@ -729,6 +776,7 @@ pub fn load_mission_static_preview_roots(
             asset_scope: MissionAssetScope::PreviewRoots(root_count),
             ..MissionLoadOptions::default()
         },
+        None,
     )
 }
 
@@ -736,6 +784,7 @@ fn load_mission_with_options(
     engine: &mut Engine,
     request: MissionRequest,
     options: MissionLoadOptions,
+    queue_time_ms: Option<u32>,
 ) -> Result<LoadedMission, EngineError> {
     let vfs = engine.services.vfs.clone().ok_or(EngineError::MissingVfs)?;
     let mission_path = normalize_engine_path("mission", &request.key)?;
@@ -786,7 +835,7 @@ fn load_mission_with_options(
             source,
         }
     })?;
-    let loaded_scripts = load_mission_scripts(&vfs, &mission, options.asset_scope)?;
+    let mut loaded_scripts = load_mission_scripts(&vfs, &mission, options.asset_scope)?;
     let repository = CachedResourceRepository::with_payload_cache_budget(
         vfs.clone(),
         MISSION_DECODED_PAYLOAD_CACHE_ENTRIES,
@@ -902,6 +951,20 @@ fn load_mission_with_options(
         registered_objects += 1;
     }
 
+    let mut next_behavior_rng_state = engine.behavior_rng_state;
+    if options.asset_scope == MissionAssetScope::Full {
+        let queue_time_ms = queue_time_ms.expect("full mission loading requires a queue time");
+        if let Err(error) = start_mission_scripts(
+            &mission,
+            &mut loaded_scripts,
+            queue_time_ms,
+            &mut next_behavior_rng_state,
+        ) {
+            let _ = fparkan_world::shutdown(new_runtime_world);
+            return Err(error);
+        }
+    }
+
     let summary = LoadedMission {
         key: request.key,
         path_count: mission.paths.len(),
@@ -951,6 +1014,7 @@ fn load_mission_with_options(
     };
 
     engine.world = new_runtime_world;
+    engine.behavior_rng_state = next_behavior_rng_state;
     engine.loaded = Some(LoadedMissionState {
         summary: summary.clone(),
         mission,
@@ -1272,14 +1336,17 @@ fn load_mission_scripts(
             script_path: normalized.as_str().to_string(),
             package,
             init_execution: MissionScriptInitExecution::Missing,
+            behavior_warm_start: None,
         });
     }
     let varset = first_base_path
         .as_deref()
         .map(|base_path| load_script_varset(vfs, base_path))
         .transpose()?;
-    let init_states = match &varset {
-        Some(varset) => resolve_handler19_init_states(
+    let (init_states, varset_states) = if asset_scope == MissionAssetScope::Full {
+        (Vec::new(), Vec::new())
+    } else if let Some(varset) = &varset {
+        let init_states = resolve_handler19_init_states(
             &mission
                 .clans
                 .iter()
@@ -1288,12 +1355,11 @@ fn load_mission_scripts(
             &mut bundles,
             varset,
             asset_scope,
-        )?,
-        None => Vec::new(),
-    };
-    let varset_states = match &varset {
-        Some(varset) => materialize_script_varset_states(&bundles, varset, &init_states)?,
-        None => Vec::new(),
+        )?;
+        let varset_states = materialize_script_varset_states(&bundles, varset, &init_states)?;
+        (init_states, varset_states)
+    } else {
+        (Vec::new(), Vec::new())
     };
     Ok(LoadedMissionScripts {
         bundles,
@@ -1301,6 +1367,46 @@ fn load_mission_scripts(
         init_states,
         varset_states,
     })
+}
+
+fn start_mission_scripts(
+    mission: &MissionDocument,
+    scripts: &mut LoadedMissionScripts,
+    queue_time_ms: u32,
+    behavior_rng_state: &mut u32,
+) -> Result<(), EngineError> {
+    // The recovered slot refreshes one Behavior instance before dispatching
+    // that same instance's Init event. The Rust loader waits until its new
+    // world is registered before it starts this per-bundle sequence.
+    let clan_anchors = mission
+        .clans
+        .iter()
+        .map(|clan| clan.anchor)
+        .collect::<Vec<_>>();
+    let mut init_states = Vec::new();
+    for bundle in &mut scripts.bundles {
+        bundle.behavior_warm_start = Some(BehaviorWarmStartState::start(
+            queue_time_ms,
+            behavior_rng_state,
+        ));
+
+        if let Some(varset) = scripts.varset.as_ref() {
+            init_states.extend(resolve_handler19_init_states(
+                &clan_anchors,
+                std::slice::from_mut(bundle),
+                varset,
+                MissionAssetScope::Full,
+            )?);
+        }
+    }
+    scripts.init_states = init_states;
+    scripts.varset_states = match scripts.varset.as_ref() {
+        Some(varset) => {
+            materialize_script_varset_states(&scripts.bundles, varset, &scripts.init_states)?
+        }
+        None => Vec::new(),
+    };
+    Ok(())
 }
 
 fn materialize_script_varset_states(
@@ -1556,6 +1662,134 @@ mod tests {
     }
 
     #[test]
+    fn behavior_warm_start_uses_native_clock_and_shared_rng_vectors() {
+        let mut rng_state = 1;
+        let first = BehaviorWarmStartState::start(100_000, &mut rng_state);
+        assert_eq!(first.first_time_ms, 100_000);
+        assert_eq!(first.next_deadline_ms, 100_202);
+        assert_eq!(first.cleared_words, [0; 5]);
+        assert_eq!(rng_state, 0x0029_e2c0);
+
+        let second = BehaviorWarmStartState::start(100_500, &mut rng_state);
+        assert_eq!(second.first_time_ms, 100_500);
+        assert_eq!(second.next_deadline_ms, 100_700);
+        assert_eq!(second.cleared_words, [0; 5]);
+        assert_eq!(rng_state, 0xc823_f683);
+
+        let zero = BehaviorWarmStartState::start(0, &mut rng_state);
+        assert_eq!(zero.first_time_ms, 0);
+        assert_eq!(zero.next_deadline_ms, 239);
+        assert_eq!(rng_state, 0x18be_873a);
+
+        // A second fresh AI with a zero queue clock receives its own LCG draw.
+        let second_zero_clock_start = BehaviorWarmStartState::start(0, &mut rng_state);
+        assert_eq!(second_zero_clock_start.first_time_ms, 0);
+        assert_eq!(second_zero_clock_start.next_deadline_ms, 225);
+        assert_eq!(rng_state, 0xe784_7115);
+
+        let wrapping = BehaviorWarmStartState::start(0xffff_ff80, &mut rng_state);
+        assert_eq!(wrapping.next_deadline_ms, 120);
+        assert_eq!(rng_state, 0xcae1_df84);
+    }
+
+    #[test]
+    fn mission_script_start_stops_before_warming_later_bundles() {
+        fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fn push_lp(bytes: &mut Vec<u8>, value: &[u8]) {
+            push_u32(bytes, u32::try_from(value.len()).expect("length fits u32"));
+            bytes.extend_from_slice(value);
+        }
+
+        let mut tma = Vec::new();
+        push_u32(&mut tma, 1); // TMA format version.
+        push_u32(&mut tma, 0); // Paths.
+        push_u32(&mut tma, 6); // Clan section version.
+        push_u32(&mut tma, 2); // Two clans provide Handler(19) anchors.
+        for (x, y) in [(500.0_f32, 752.0_f32), (728.0_f32, 449.0_f32)] {
+            push_lp(&mut tma, b"");
+            push_u32(&mut tma, u32::MAX); // Raw clan id -1.
+            tma.extend_from_slice(&x.to_le_bytes());
+            tma.extend_from_slice(&y.to_le_bytes());
+            push_u32(&mut tma, 1); // Standard clan body.
+            push_lp(&mut tma, b"");
+            push_u32(&mut tma, 0);
+            push_lp(&mut tma, b"");
+            push_u32(&mut tma, 0);
+            push_u32(&mut tma, 0); // Relations.
+        }
+        push_u32(&mut tma, 10); // Object section version.
+        push_u32(&mut tma, 0); // Objects.
+        push_lp(&mut tma, b""); // Landscape path.
+        push_u32(&mut tma, 0); // Mission flag.
+        push_lp(&mut tma, b""); // Description.
+        push_u32(&mut tma, 1); // Extra section version.
+        push_u32(&mut tma, 0); // Extras.
+        let mission = decode_mission_payload(Arc::from(tma), TmaProfile::Strict)
+            .expect("two-clan startup fixture");
+
+        let varset = MissionScriptVarSet {
+            path: FALLBACK_SCRIPT_VARSET_PATH.to_string(),
+            used_fallback: true,
+            declarations: fparkan_script::parse_varset(
+                b"VAR( DWORD, ClanBaseX, 0)\nVAR( DWORD, ClanBaseY, 0)\nVAR( DWORD, ClanID, 0)\n",
+            )
+            .expect("varset"),
+        };
+        let bundle = |clan_index, selector, references: Vec<u32>| MissionScriptBundle {
+            clan_index,
+            base_path: "MISSIONS/SCRIPTS/default".to_string(),
+            script_path: "MISSIONS/SCRIPTS/default.scr".to_string(),
+            package: ScriptPackage {
+                opcode_handler_count: 73,
+                events: vec![fparkan_script::ScriptEvent {
+                    name_len: 4,
+                    name_raw: b"Init\0".to_vec(),
+                    event_word: 0,
+                    instructions: vec![ScriptInstruction {
+                        header_words: [selector, u32::MAX, u32::MAX, 0, 0, 3, 0],
+                        references,
+                    }],
+                }],
+                trailing_bytes: Vec::new(),
+                raw: Arc::from(&b""[..]),
+            },
+            init_execution: MissionScriptInitExecution::Missing,
+            behavior_warm_start: None,
+        };
+        let mut scripts = LoadedMissionScripts {
+            bundles: vec![bundle(0, 18, Vec::new()), bundle(1, 19, vec![0, 1, 2])],
+            varset: Some(varset),
+            ..LoadedMissionScripts::default()
+        };
+        let mut rng_state = INITIAL_BEHAVIOR_RNG_STATE;
+
+        let error = start_mission_scripts(&mission, &mut scripts, 100_000, &mut rng_state)
+            .expect_err("unsupported first Init stops startup before the second bundle");
+
+        assert!(matches!(
+            error,
+            EngineError::ScriptInitUnsupported {
+                source: Handler19ResolveError::UnsupportedSelector {
+                    found: fparkan_script::ScriptDispatchSelector::Handler(18),
+                },
+                ..
+            }
+        ));
+        assert_eq!(
+            scripts.bundles[0].behavior_warm_start,
+            Some(BehaviorWarmStartState {
+                first_time_ms: 100_000,
+                next_deadline_ms: 100_202,
+                cleared_words: [0; 5],
+            })
+        );
+        assert!(scripts.bundles[1].behavior_warm_start.is_none());
+        assert_eq!(rng_state, 0x0029_e2c0);
+    }
+
+    #[test]
     fn load_mission_requires_vfs_and_keeps_world_unchanged_on_error() {
         let mut engine = create(EngineServices::default()).expect("engine");
         let before = step_headless(&mut engine, InputSnapshot).expect("step");
@@ -1565,6 +1799,7 @@ mod tests {
                 key: "MISSIONS/Autodemo.00/data.tma".to_string(),
                 mode: MissionMode::SingleMission,
             },
+            0,
         )
         .expect_err("missing VFS");
         assert!(matches!(err, EngineError::MissingVfs));
@@ -1651,6 +1886,7 @@ mod tests {
                 raw: Arc::from(&b""[..]),
             },
             init_execution: MissionScriptInitExecution::Missing,
+            behavior_warm_start: None,
         }];
 
         let states = resolve_handler19_init_states(
@@ -1747,6 +1983,7 @@ mod tests {
             script_path: "MISSIONS/SCRIPTS/default.scr".to_string(),
             package: package.clone(),
             init_execution: MissionScriptInitExecution::Missing,
+            behavior_warm_start: None,
         };
         let anchors = [[500.0, 752.0]];
         let mut preview_bundles = vec![bundle()];
@@ -2002,6 +2239,7 @@ mod tests {
                 key: "MISSIONS/Autodemo.00/data.tma".to_string(),
                 mode: MissionMode::AutoDemo,
             },
+            100_000,
         )
         .expect("load licensed AutoDemo");
 
@@ -2022,6 +2260,18 @@ mod tests {
             .iter()
             .all(|bundle| bundle.init_execution
                 == MissionScriptInitExecution::Executed { event_index: 0 }));
+        assert_eq!(engine.behavior_rng_state, 0xc823_f683);
+        assert_eq!(
+            loaded_mission_script_bundles(&engine)
+                .expect("warmed script bundles")
+                .iter()
+                .map(|bundle| bundle
+                    .behavior_warm_start
+                    .expect("full startup warms the AI"))
+                .map(|warm_start| warm_start.next_deadline_ms)
+                .collect::<Vec<_>>(),
+            vec![100_202, 100_200]
+        );
 
         let varsets = loaded_mission_script_varset_states(&engine).expect("per-clan varsets");
         let clan_zero = varsets
@@ -2067,6 +2317,10 @@ mod tests {
         .expect("load licensed campaign preview");
 
         let bundles = loaded_mission_script_bundles(&engine).expect("script bundles");
+        assert!(bundles
+            .iter()
+            .all(|bundle| bundle.behavior_warm_start.is_none()));
+        assert_eq!(engine.behavior_rng_state, INITIAL_BEHAVIOR_RNG_STATE);
         let unsupported = bundles
             .iter()
             .find(|bundle| {
@@ -2211,6 +2465,7 @@ mod tests {
                 key: "MISSIONS/Autodemo.00/data.tma".to_string(),
                 mode: MissionMode::SingleMission,
             },
+            0,
         )
         .expect("load mission");
 
@@ -2283,7 +2538,7 @@ mod tests {
             });
             let mut engine = create(EngineServices::new(vfs)).expect("engine");
             let before = step_headless(&mut engine, InputSnapshot).expect("before");
-            let err = load_mission(&mut engine, mission).expect_err("load error");
+            let err = load_mission(&mut engine, mission, 0).expect_err("load error");
             match denied {
                 DenyRule::Suffix("Land.map") => assert!(matches!(err, EngineError::Vfs { .. })),
                 DenyRule::Suffix("objects.rlb") => {
@@ -2315,6 +2570,7 @@ mod tests {
                 fail_after_registered_objects: Some(1),
                 ..MissionLoadOptions::default()
             },
+            Some(0),
         )
         .expect_err("forced registration failure");
 
@@ -2329,6 +2585,73 @@ mod tests {
         assert!(loaded_mission(&engine).is_none());
         let after = step_headless(&mut engine, InputSnapshot).expect("after");
         assert_eq!(before.snapshot.objects, after.snapshot.objects);
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn full_startup_init_failure_keeps_the_previous_world_and_rng() {
+        let root = licensed_root("IS");
+        let original_script = std::fs::read(root.join("MISSIONS/SCRIPTS/default.scr"))
+            .expect("read licensed default.scr");
+        let mut package = fparkan_script::decode(&original_script).expect("decode default.scr");
+        let init_index = package
+            .events
+            .iter()
+            .position(|event| event.name_raw.split(|byte| *byte == 0).next() == Some(&b"Init"[..]))
+            .expect("Init event");
+        assert_eq!(
+            package.events[init_index].instructions[0].header_words[0],
+            19
+        );
+        package.events[init_index].instructions[0].header_words[0] = 18;
+        let replacement = Arc::<[u8]>::from(encode_script_package(&package));
+
+        let vfs = Arc::new(SwappingScriptVfs {
+            inner: DirectoryVfs::new(&root),
+            replacement,
+            enabled: std::sync::atomic::AtomicBool::new(false),
+        });
+        let services_vfs: Arc<dyn Vfs> = vfs.clone();
+        let mut engine = create(EngineServices::new(services_vfs)).expect("engine");
+        let mission = || MissionRequest {
+            key: "MISSIONS/Autodemo.00/data.tma".to_string(),
+            mode: MissionMode::AutoDemo,
+        };
+        load_mission(&mut engine, mission(), 100_000).expect("initial full startup");
+
+        let previous_loaded = loaded_mission(&engine).expect("previous mission").clone();
+        let previous_bundles = loaded_mission_script_bundles(&engine)
+            .expect("previous bundles")
+            .to_vec();
+        let previous_rng = engine.behavior_rng_state;
+        let before = step_headless(&mut engine, InputSnapshot)
+            .expect("step previous world")
+            .snapshot
+            .objects;
+
+        vfs.enabled.store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = load_mission(&mut engine, mission(), 100_500)
+            .expect_err("unsupported Init must fail after new-world registration");
+        assert!(matches!(
+            error,
+            EngineError::ScriptInitUnsupported {
+                source: Handler19ResolveError::UnsupportedSelector {
+                    found: ScriptDispatchSelector::Handler(18),
+                },
+                ..
+            }
+        ));
+        assert_eq!(loaded_mission(&engine), Some(&previous_loaded));
+        assert_eq!(
+            loaded_mission_script_bundles(&engine),
+            Some(previous_bundles.as_slice())
+        );
+        assert_eq!(engine.behavior_rng_state, previous_rng);
+        let after = step_headless(&mut engine, InputSnapshot)
+            .expect("step retained world")
+            .snapshot
+            .objects;
+        assert_eq!(before, after);
     }
 
     #[test]
@@ -2381,6 +2704,7 @@ mod tests {
                     key: case.1.to_string(),
                     mode: MissionMode::SingleMission,
                 },
+                0,
             )
             .expect("load mission");
             let drafts = loaded_mission_object_drafts(&engine).expect("object drafts");
@@ -2494,6 +2818,7 @@ mod tests {
                 key: case.mission.to_string(),
                 mode: MissionMode::SingleMission,
             },
+            0,
         )
         .expect("load selected mission");
         assert_eq!(loaded.object_count, case.object_count);
@@ -2523,6 +2848,7 @@ mod tests {
                     key: mission,
                     mode: MissionMode::SingleMission,
                 },
+                0,
             )
             .expect("load mission foundation");
             assert_eq!(loaded.object_count, loaded.registered_objects);
@@ -2629,6 +2955,39 @@ mod tests {
         root
     }
 
+    fn encode_script_package(package: &ScriptPackage) -> Vec<u8> {
+        fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let mut bytes = Vec::new();
+        push_u32(&mut bytes, package.opcode_handler_count);
+        push_u32(
+            &mut bytes,
+            u32::try_from(package.events.len()).expect("event count fits u32"),
+        );
+        for event in &package.events {
+            push_u32(&mut bytes, event.name_len);
+            bytes.extend_from_slice(&event.name_raw);
+            push_u32(&mut bytes, event.event_word);
+            push_u32(
+                &mut bytes,
+                u32::try_from(event.instructions.len()).expect("instruction count fits u32"),
+            );
+            for instruction in &event.instructions {
+                for word in &instruction.header_words[..6] {
+                    push_u32(&mut bytes, *word);
+                }
+                for reference in &instruction.references {
+                    push_u32(&mut bytes, *reference);
+                }
+                push_u32(&mut bytes, instruction.header_words[6]);
+            }
+        }
+        bytes.extend_from_slice(&package.trailing_bytes);
+        bytes
+    }
+
     #[derive(Clone, Copy)]
     enum DenyRule {
         Suffix(&'static str),
@@ -2637,6 +2996,44 @@ mod tests {
     struct DenyVfs {
         inner: DirectoryVfs,
         denied: DenyRule,
+    }
+
+    struct SwappingScriptVfs {
+        inner: DirectoryVfs,
+        replacement: Arc<[u8]>,
+        enabled: std::sync::atomic::AtomicBool,
+    }
+
+    impl SwappingScriptVfs {
+        fn use_replacement(&self, path: &NormalizedPath) -> bool {
+            self.enabled.load(std::sync::atomic::Ordering::SeqCst)
+                && path
+                    .as_str()
+                    .eq_ignore_ascii_case("MISSIONS/SCRIPTS/default.scr")
+        }
+    }
+
+    impl Vfs for SwappingScriptVfs {
+        fn metadata(&self, path: &NormalizedPath) -> Result<VfsMetadata, VfsError> {
+            if self.use_replacement(path) {
+                return Ok(VfsMetadata {
+                    len: self.replacement.len() as u64,
+                    fingerprint: [0x18; 32],
+                });
+            }
+            self.inner.metadata(path)
+        }
+
+        fn read(&self, path: &NormalizedPath) -> Result<Arc<[u8]>, VfsError> {
+            if self.use_replacement(path) {
+                return Ok(self.replacement.clone());
+            }
+            self.inner.read(path)
+        }
+
+        fn list(&self, prefix: &NormalizedPath) -> Result<Vec<VfsEntry>, VfsError> {
+            self.inner.list(prefix)
+        }
     }
 
     impl DenyVfs {

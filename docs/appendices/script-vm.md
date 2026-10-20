@@ -33,12 +33,13 @@ consumer-inferred.
 
 ## Безопасная модель исполнения
 
-Новая VM разделяет immutable package (bytecode, symbols, events, constants),
-per-mission variables/timers/frames, bindings logical-name/ObjectId/clan/
-research key и typed commands к World3D/Behavior/UI/campaign. После varset
-defaults и bindings она dispatches Init/start, на каждом tick обновляет timers,
-ставит готовые events в стабильную очередь и исполняет bounded instruction
-budget. Опасное удаление идёт через World3D queue и общий deferred lifecycle.
+Целевая VM должна разделять immutable package (bytecode, symbols, events,
+constants), per-mission variables/timers/frames, bindings
+logical-name/ObjectId/clan/research key и typed commands к
+World3D/Behavior/UI/campaign. После varset defaults и bindings она будет
+запускать Init/start, обновлять timers на каждом tick, ставить готовые events
+в стабильную очередь и исполнять bounded instruction budget. Опасное удаление
+должно идти через World3D queue и общий deferred lifecycle.
 
 До восстановления opcode table package mode читает header/strings/symbols/
 event offsets/raw bytecode losslessly. Статический анализ уже выделил отдельный
@@ -267,11 +268,14 @@ scheduler path внутри запущенной игры.
 
 На границе mission runtime выбранный TMA clan `first_resource`
 материализуется как отдельный `MissionScriptBundle`: loader нормализует
-`<base>.scr`, декодирует его тем же bounded reader-ом и публикует immutable
-package вместе с clan provenance. Для первого события `Init` runtime исполняет
-только подтверждённый фрагмент dispatcher-а с `Handler(19)`; остальные события
-пока остаются только прочитанными данными. Ошибка чтения по-прежнему сохраняет
-transactional rollback mission loader-а.
+`<base>.scr`, декодирует его тем же bounded reader-ом и сохраняет clan
+provenance. Полная загрузка получает от вызывающей стороны значение
+32-битного времени очереди, затем для каждого bundle вычисляет начальное
+состояние Behavior и пробует выполнить только восстановленный поднабор первого
+`Init` с `Handler(19)`. Остальные события пока остаются прочитанными данными.
+Статический просмотр не запускает warm-start Behavior, но сохраняет результат
+поддержанных `Handler(19)` writes и создаёт ячейки varset; при неподдержанной
+инструкции оставляет default-значения и статус `Unsupported`.
 
 TMA properties остаются four raw `u32` words плюс имя, пока consumer/schema не
 задаст тип (integer/float bits/ObjectId/enum/fixed-point/index). В том числе
@@ -359,34 +363,78 @@ nearest-even `FISTP qword`, младший DWORD, преобразование D
 Это правила ограниченного Rust-исполнителя, а не обнаруженное поведение
 оригинального dispatcher-а.
 
-Для проверки использованы два x86 helper-а на синтетической памяти. Первый
-вызывает оригинальные `iron3d.dll` entry points и проверяет преобразование
-TMA-координат в аргументы `CreateSuperAI`. Второй загружает оригинальную
-`ai.dll`, вызывает `FUN_10011f40` и `FUN_10011f10`, а записи читает штатным
-getter-ом `FUN_10013570` (RVA `0x13570`). В нём проверены оба набора AutoDemo,
-первая дублирующаяся запись `Init`, имя `Init\\0suffix\\0`, отсутствие записи
-при пропущенном `Init` и связка `FUN_10005c70` → Handler(19): для входных DWORD
-`(0xffffffff, 10001)` поля стали `(2^32, 10001.0)`, а varset получил
-`(0, 10001, 2)`. Наборы AutoDemo дали `(500, 752, 0)` и `(728, 449, 1)`.
-Эти синтетические вызовы подтверждают изолированные участки ABI, но не доказывают,
-кто в Iron3D запускает `Init` при полном старте игровой миссии.
+### Первый вызов Behavior и сценарного `Init`
 
-Обе проверки можно повторить из корня репозитория в Windows PowerShell. Первая
-вызывает оригинальный caller `iron3d.dll`; вторая — original dispatcher, setter
-и getter `ai.dll`:
+В той же GOG-сборке `Behavior.dll` (SHA-256
+`ddfbdbde07832358fe6e35e01c8dba9b58e7313789498b6049ed51d4ed9baf99`) функция
+`FUN_1001adb0` (RVA `0x1adb0`) обновляет один Behavior distributor. Она получает
+текущее время через `GetQueue` и queue vslot `+0x38`. Если distributor `+0x10`
+равен нулю, функция записывает туда текущее время очереди, считает начальный
+deadline `+0x14` по формуле `время + 3*64 + jitter`, где `jitter` лежит в
+`0..63` и получен одним шагом глобального MSVCRT LCG. В этой ветви она также
+обнуляет пять слов `+0x30..+0x40`. При повторном вызове до deadline ненулевой
+`+0x10` оставляет deadline прежним, не расходует новое случайное число и не
+очищает эти слова. Поведение после истечения deadline этим опытом не проверено.
+Если само время очереди равно нулю, `+0x10` остаётся нулевым, и повторный вызов
+снова проходит ветвь начальной подготовки.
+
+Путь host callback в проверенной паре DLL теперь статически известен. В
+`iron3d.dll` функция `FUN_1005ff40` (RVA `0x5ff40`) сначала вызывает
+`FUN_100392e0` для TMA clan records, а затем для записей вызывает
+`FUN_10039440` (RVA `0x39440`). Последняя передаёт AI callback-у аргументы через
+vtable slot `+0x14`. Метод `ai.dll!FUN_10001ae0` (RVA `0x1ae0`) сохраняет это
+слово аргумента в AI `+0x3fc`, сначала обновляет Behavior через объект `AI+0x438`
+и его vslot `+0x2c`, а затем, если latch `AI+0x8a8` ещё сброшен, находит первый
+`Init`. При отсутствии события latch остаётся нулевым. Если событие найдено,
+метод запускает dispatcher только при нулевом recursion guard `AI+0x78`,
+временно ставит guard и снимает его после dispatch; затем ставит latch, даже
+если занятый guard пропустил dispatch. Это определяет одну штатную
+callback-точку входа и порядок внутри неё, но не раскрывает всех смыслов
+входного слова аргумента и не подменяет динамическую трассу полного запуска игры.
+
+`fparkan-runtime::load_mission` получает значение времени очереди явным
+аргументом `queue_time_ms`; Rust не читает оригинальную очередь. Для полной
+загрузки Rust после регистрации объектов запускает последовательность
+подготовки Behavior → ограниченный `Init` по каждому bundle. Путь использует
+локальный RNG engine, начиная с состояния `1`; его шаги LCG общие между
+bundle, но остальные потребители исходного глобального RNG не моделируются.
+В Rust также нет значения аргумента в `AI+0x3fc`, recursion guard `AI+0x78`
+или одноразового latch `AI+0x8a8`. Поэтому это связанный начальный поднабор, а
+не полная активация SuperAI и не обновление Behavior на игровых тиках. При
+ошибке ограниченного `Init` Rust отклоняет полную загрузку и сохраняет прежний
+мир и состояние генератора; такая политика отката принадлежит Rust loader-у.
+
+Для проверки использованы три x86 helper-а на синтетической памяти. Caller
+oracle вызывает оригинальные `iron3d.dll` entry points и проверяет преобразование
+TMA-координат в аргументы `CreateSuperAI`. AI oracle проходит оригинальный
+`iron3d.dll!FUN_10039440` → `ai.dll!FUN_10001ae0` → реальный `Init` dispatcher;
+также проверяет оба AutoDemo-набора, повторный/missing/busy callback и связку
+`FUN_10005c70` → Handler(19). Для входных DWORD `(0xffffffff, 10001)` поля стали
+`(2^32, 10001.0)`, а varset получил `(0, 10001, 2)`. Behavior oracle вызывает
+`FUN_1001adb0` с искусственно заданной очередью и проверяет шаг генератора,
+срок, очистку и повторный вызов. Эти проверки исполняют оригинальные DLL-функции на заданных
+структурах, но не являются трассой штатного старта или последующего игрового
+цикла.
+
+Проверки можно повторить из корня репозитория в Windows PowerShell:
 
 ```powershell
 $env:FPARKAN_ORIGINAL_IRON3D_DLL = 'C:\GOG Games\Parkan - Iron Strategy\iron3d.dll'
 $env:FPARKAN_ORIGINAL_AI_DLL = 'C:\GOG Games\Parkan - Iron Strategy\ai.dll'
+$env:FPARKAN_ORIGINAL_BEHAVIOR_DLL = 'C:\GOG Games\Parkan - Iron Strategy\Behavior.dll'
 $env:FPARKAN_ORIGINAL_DEFAULT_SCR = 'C:\GOG Games\Parkan - Iron Strategy\MISSIONS\SCRIPTS\default.scr'
 New-Item -ItemType Directory -Force -Path target\handler19-native-oracles | Out-Null
 & "$env:WINDIR\Microsoft.NET\Framework\v4.0.30319\csc.exe" /nologo /platform:x86 /out:target\handler19-native-oracles\AnchorOracle.exe crates\fparkan-runtime\tests\handler19_anchor_native_oracle.cs
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & "$env:WINDIR\Microsoft.NET\Framework\v4.0.30319\csc.exe" /nologo /platform:x86 /out:target\handler19-native-oracles\InitOracle.exe crates\fparkan-runtime\tests\handler19_init_native_oracle.cs
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+& "$env:WINDIR\Microsoft.NET\Framework\v4.0.30319\csc.exe" /nologo /platform:x86 /out:target\handler19-native-oracles\BehaviorWarmStartOracle.exe crates\fparkan-runtime\tests\behavior_warm_start_native_oracle.cs
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & .\target\handler19-native-oracles\AnchorOracle.exe
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & .\target\handler19-native-oracles\InitOracle.exe
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+& .\target\handler19-native-oracles\BehaviorWarmStartOracle.exe
 exit $LASTEXITCODE
 ```
 

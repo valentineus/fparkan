@@ -8,10 +8,13 @@ using System.Text;
 internal static class Handler19DispatchOracle {
     private const uint LoadWithAlteredSearchPath = 0x00000008;
     private const string ExpectedAiSha256 = "c19cd6cd31cd2896f8c4ba0f0e700dd3408aec8182daaf4863d98a7d233a2abc";
+    private const string ExpectedIron3dSha256 = "d1dc4ea8535e2069b0a05c9e8be2724dd438ba44cca7a83007d8b2e50f9e35fa";
     private const string ExpectedScriptSha256 = "db1c6fde57aff43181619f19e19e1cacf7301ebb859e8cb883db6b4b7181eced";
     private const int EventLookupRva = 0x11f40;
     private const int EventDispatchRva = 0x11f10;
     private const int Handler19Rva = 0x0aa38;
+    private const int AiWarmStartRva = 0x01ae0;
+    private const int Iron3dClanRefreshRva = 0x39440;
     private const int EventStride = 0x14;
     private const int InstructionStride = 0x20;
     private const int VarSetStride = 0x30;
@@ -24,6 +27,32 @@ internal static class Handler19DispatchOracle {
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate uint DispatchEvent(IntPtr vm, int eventIndex);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate uint ReadVariable(IntPtr record);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void SetDwordPosition(IntPtr record, uint x, uint y);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void RefreshClan(IntPtr record, uint requestedMode);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void HostInterfaceRefresh(IntPtr host);
+
+    private sealed class WarmStartObservation {
+        public int Calls;
+        public IntPtr Host;
+        public IntPtr Record;
+        public IntPtr Ai;
+        public IntPtr Cells;
+        public int EntryMode;
+        public int AiMode;
+        public byte Latch;
+        public uint XCellBeforeDispatch;
+    }
+    private static WarmStartObservation CurrentWarmStartObservation;
+    private static HostInterfaceRefresh WarmStartRecorder = RecordWarmStart;
+
+    private static void RecordWarmStart(IntPtr host) {
+        WarmStartObservation observation = CurrentWarmStartObservation;
+        observation.Calls++;
+        observation.Host = host;
+        observation.EntryMode = Marshal.ReadInt32(observation.Record, 0x18);
+        observation.AiMode = Marshal.ReadInt32(observation.Ai, 0x3fc);
+        observation.Latch = Marshal.ReadByte(observation.Ai, 0x8a8);
+        observation.XCellBeforeDispatch = ReadWord(observation.Cells, 0);
+    }
 
     private sealed class Instruction {
         public readonly uint[] Words;
@@ -59,11 +88,13 @@ internal static class Handler19DispatchOracle {
     private static int Main() {
         if (IntPtr.Size != 4) { Console.Error.WriteLine("Build with /platform:x86."); return 2; }
         string aiPath = Environment.GetEnvironmentVariable("FPARKAN_ORIGINAL_AI_DLL");
+        string iron3dPath = Environment.GetEnvironmentVariable("FPARKAN_ORIGINAL_IRON3D_DLL");
         string scriptPath = Environment.GetEnvironmentVariable("FPARKAN_ORIGINAL_DEFAULT_SCR");
-        if (String.IsNullOrEmpty(aiPath) || !File.Exists(aiPath) || String.IsNullOrEmpty(scriptPath) || !File.Exists(scriptPath)) {
-            Console.Error.WriteLine("Set FPARKAN_ORIGINAL_AI_DLL and FPARKAN_ORIGINAL_DEFAULT_SCR to the installed GOG files."); return 3;
+        if (String.IsNullOrEmpty(aiPath) || !File.Exists(aiPath) || String.IsNullOrEmpty(iron3dPath) || !File.Exists(iron3dPath) || String.IsNullOrEmpty(scriptPath) || !File.Exists(scriptPath)) {
+            Console.Error.WriteLine("Set FPARKAN_ORIGINAL_AI_DLL, FPARKAN_ORIGINAL_IRON3D_DLL, and FPARKAN_ORIGINAL_DEFAULT_SCR to the installed GOG files."); return 3;
         }
         if (Hash(aiPath) != ExpectedAiSha256) { Console.Error.WriteLine("Unexpected ai.dll SHA-256: " + Hash(aiPath)); return 4; }
+        if (Hash(iron3dPath) != ExpectedIron3dSha256) { Console.Error.WriteLine("Unexpected iron3d.dll SHA-256: " + Hash(iron3dPath)); return 4; }
         if (Hash(scriptPath) != ExpectedScriptSha256) { Console.Error.WriteLine("Unexpected default.scr SHA-256: " + Hash(scriptPath)); return 5; }
         Package package = ReadPackage(scriptPath);
         if (package.HandlerCount != 73 || package.Events.Length != 9) throw new InvalidDataException("Unexpected default.scr header.");
@@ -84,10 +115,124 @@ internal static class Handler19DispatchOracle {
             RunInstance(package, find, dispatch, readVariable, module, 500.2857f, 752.0f, 0, 500, 752);
             RunInstance(package, find, dispatch, readVariable, module, 728.0f, 449.0f, 1, 728, 449);
             RunDwordToHandlerRoundTrip(package, find, dispatch, readVariable, setDwordPosition, module);
-            Console.WriteLine("original ai.dll dispatcher passed for default.scr Init instances and DWORD-to-handler round-trip; code bytes were not modified");
+            RunOriginalClanRefreshPath(package, module, iron3dPath);
+            Console.WriteLine("original ai.dll dispatcher passed for default.scr Init instances and DWORD round-trip; original iron3d clan-refresh to AI-vtable Init path also passed; code bytes were not modified");
             return 0;
         }
         finally { FreeLibrary(module); }
+    }
+
+    private static void RunOriginalClanRefreshPath(Package package, IntPtr aiModule, string iron3dPath) {
+        IntPtr iron3d = LoadLibraryEx(iron3dPath, IntPtr.Zero, LoadWithAlteredSearchPath);
+        if (iron3d == IntPtr.Zero) throw new InvalidOperationException("LoadLibraryEx(iron3d.dll) failed: " + Marshal.GetLastWin32Error());
+        try {
+            RefreshClan refresh = (RefreshClan)Marshal.GetDelegateForFunctionPointer(IntPtr.Add(iron3d, Iron3dClanRefreshRva), typeof(RefreshClan));
+            IntPtr method = IntPtr.Add(aiModule, AiWarmStartRva);
+            RunClanRefreshCase(package, aiModule, refresh, method, 1, 2, 2, "forward requested mode");
+            RunClanRefreshCase(package, aiModule, refresh, method, 0, 2, 1, "zero flag forces mode one");
+            RunClanRefreshCase(package, aiModule, refresh, method, 1, 1, 1, "forward mode one");
+            RunClanRefreshMissingCase(package, aiModule, refresh, method);
+            RunClanRefreshBusyCase(package, aiModule, refresh, method);
+            RunClanRefreshNullAiCase(refresh);
+        }
+        finally { FreeLibrary(iron3d); }
+    }
+
+    private static void RunClanRefreshCase(Package package, IntPtr aiModule, RefreshClan refresh, IntPtr method, int forceFlag, uint requestedMode, uint expectedMode, string label) {
+        using (Instance instance = BuildInstance(package, 500.0f, 752.0f, 0, IntPtr.Add(aiModule, Handler19Rva))) {
+            IntPtr host = ConfigureClanRefresh(instance, method);
+            IntPtr record = PrepareClanRecord(instance, forceFlag);
+
+            CurrentWarmStartObservation = new WarmStartObservation { Record = record, Ai = instance.Ai, Cells = instance.Cells };
+            refresh(record, requestedMode);
+            WarmStartObservation observed = CurrentWarmStartObservation;
+            Expect(Marshal.ReadInt32(record, 0x18) == requestedMode, label + ": Iron3D stores the requested per-clan mode");
+            Expect(Marshal.ReadInt32(instance.Ai, 0x3fc) == expectedMode, label + ": AI callback receives the forced/forwarded mode");
+            Expect(observed.Calls == 1 && observed.Host == host, label + ": original AI slot called its host interface first");
+            Expect(observed.EntryMode == requestedMode && observed.AiMode == expectedMode && observed.Latch == 0 && observed.XCellBeforeDispatch == 0,
+                label + ": record and AI mode are stored before host callback, and Init dispatch follows it");
+            Expect(Marshal.ReadByte(instance.Ai, 0x78) == 0, label + ": normal Init dispatch clears the recursion guard");
+            Expect(Marshal.ReadByte(instance.Ai, 0x8a8) == 1, label + ": successful Init lookup latches after dispatch");
+            Expect(ReadWord(instance.Cells, 0) == 500 && ReadWord(instance.Cells, 1) == 752 && ReadWord(instance.Cells, 2) == 0,
+                label + ": original Init handler writes X/Y/clan after host callback");
+            Console.WriteLine("iron3d 39440 -> ai 01ae0 ({0}): entry_mode={1}, ai_mode={2}, latch={3}", label, requestedMode, expectedMode, Marshal.ReadByte(instance.Ai, 0x8a8));
+
+            Marshal.WriteInt32(instance.Cells, 0, unchecked((int)0xfeedface));
+            refresh(record, requestedMode);
+            Expect(observed.Calls == 2 && Marshal.ReadInt32(instance.Ai, 0x3fc) == expectedMode, label + ": repeat still reaches interface before latch check");
+            Expect(ReadWord(instance.Cells, 0) == 0xfeedface, label + ": Init latch suppresses a second event dispatch");
+        }
+    }
+
+    private static void RunClanRefreshMissingCase(Package package, IntPtr aiModule, RefreshClan refresh, IntPtr method) {
+        Event[] events = (Event[])package.Events.Clone();
+        bool replaced = false;
+        for (int i = 0; i < events.Length; i++) {
+            if (Encoding.ASCII.GetString(events[i].Name) == "Init\0") {
+                events[i] = new Event(Encoding.ASCII.GetBytes("Missing\0"), events[i].EventWord, events[i].Instructions);
+                replaced = true; break;
+            }
+        }
+        Expect(replaced, "missing-path package contains Init to remove");
+        using (Instance instance = BuildInstance(new Package(package.HandlerCount, events), 500.0f, 752.0f, 0, IntPtr.Add(aiModule, Handler19Rva))) {
+            ConfigureClanRefresh(instance, method);
+            IntPtr record = PrepareClanRecord(instance, 1);
+            CurrentWarmStartObservation = new WarmStartObservation { Record = record, Ai = instance.Ai, Cells = instance.Cells };
+            refresh(record, 2);
+            Expect(Marshal.ReadByte(instance.Ai, 0x8a8) == 0 && CurrentWarmStartObservation.Calls == 1, "missing Init leaves the native latch clear after the host callback");
+            Expect(ReadWord(instance.Cells, 0) == 0 && ReadWord(instance.Cells, 1) == 0 && ReadWord(instance.Cells, 2) == 0, "missing Init has no Handler(19) writes");
+        }
+    }
+
+    private static void RunClanRefreshBusyCase(Package package, IntPtr aiModule, RefreshClan refresh, IntPtr method) {
+        using (Instance instance = BuildInstance(package, 500.0f, 752.0f, 0, IntPtr.Add(aiModule, Handler19Rva))) {
+            ConfigureClanRefresh(instance, method);
+            Marshal.WriteByte(instance.Ai, 0x78, 1);
+            IntPtr record = PrepareClanRecord(instance, 1);
+            CurrentWarmStartObservation = new WarmStartObservation { Record = record, Ai = instance.Ai, Cells = instance.Cells };
+            refresh(record, 2);
+            Expect(CurrentWarmStartObservation.Calls == 1 && ReadWord(instance.Cells, 0) == 0, "busy recursion guard suppresses Init dispatch");
+            Expect(Marshal.ReadByte(instance.Ai, 0x78) == 1 && Marshal.ReadByte(instance.Ai, 0x8a8) == 1, "found Init latches even when the preexisting busy guard suppresses dispatch");
+            Marshal.WriteByte(instance.Ai, 0x78, 0);
+            Marshal.WriteInt32(instance.Cells, 0, unchecked((int)0xfeedface));
+            refresh(record, 2);
+            Expect(CurrentWarmStartObservation.Calls == 2 && Marshal.ReadByte(instance.Ai, 0x78) == 0 && Marshal.ReadByte(instance.Ai, 0x8a8) == 1,
+                "clearing the busy guard cannot bypass the already-set Init latch");
+            Expect(ReadWord(instance.Cells, 0) == 0xfeedface, "busy-path latch suppresses a later Init dispatch after the guard clears");
+        }
+    }
+
+    private static void RunClanRefreshNullAiCase(RefreshClan refresh) {
+        IntPtr record = Marshal.AllocHGlobal(0x68);
+        try {
+            Zero(record, 0x68);
+            Marshal.WriteInt32(record, 0x0c, 1);
+            Marshal.WriteInt32(record, 0x18, -1);
+            refresh(record, 2);
+            Expect(Marshal.ReadInt32(record, 0x18) == 2, "null AI still stores the requested record mode");
+        }
+        finally { Marshal.FreeHGlobal(record); }
+    }
+
+    private static IntPtr ConfigureClanRefresh(Instance instance, IntPtr method) {
+        IntPtr vtable = instance.Allocate(0x18);
+        IntPtr host = instance.Allocate(4);
+        IntPtr hostVtable = instance.Allocate(0x30);
+        Marshal.WriteInt32(vtable, 0x14, method.ToInt32());
+        Marshal.WriteInt32(instance.Ai, 0, vtable.ToInt32());
+        Marshal.WriteInt32(host, 0, hostVtable.ToInt32());
+        Marshal.WriteInt32(hostVtable, 0x2c, Marshal.GetFunctionPointerForDelegate(WarmStartRecorder).ToInt32());
+        Marshal.WriteInt32(instance.Ai, 0x438, host.ToInt32());
+        Marshal.WriteByte(instance.Ai, 0x78, 0);
+        Marshal.WriteByte(instance.Ai, 0x8a8, 0);
+        return host;
+    }
+
+    private static IntPtr PrepareClanRecord(Instance instance, int forceFlag) {
+        IntPtr record = instance.Allocate(0x68);
+        Marshal.WriteInt32(record, 0x0c, forceFlag);
+        Marshal.WriteInt32(record, 0x50, instance.Ai.ToInt32());
+        return record;
     }
 
     private static void VerifyEventLookupVectors(Package package, FindEvent find, DispatchEvent dispatch, IntPtr module) {
