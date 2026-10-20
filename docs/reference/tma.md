@@ -87,6 +87,8 @@ slot `+0x40` в путь выбора AI в Behavior. Поэтому Rust сох
 `17e4a3089b2583a8cf2356c9db0390b1aba138356a09130d79b4e7e4791da61e` и
 `Behavior.dll`
 `ddfbdbde07832358fe6e35e01c8dba9b58e7313789498b6049ed51d4ed9baf99`.
+Таблица `GetSuperAI` в `ai.dll` находится по RVA `0x55398`; SHA-256 файла —
+`c19cd6cd31cd2896f8c4ba0f0e700dd3408aec8182daaf4863d98a7d233a2abc`.
 
 `Property` состоит из четырёх raw `u32` и имени. Typed views разрешены только
 для доказанных property names и consumers.

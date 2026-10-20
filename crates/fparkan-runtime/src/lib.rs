@@ -23,8 +23,8 @@ use fparkan_terrain::SurfaceQuery;
 use fparkan_vfs::{Vfs, VfsError};
 use fparkan_world::{
     construct_object, handle_by_original_id, new as new_world, register_object, set_transform,
-    step, transform_state, InputSnapshot, ObjectDraft, OriginalObjectId, TransformState, World,
-    WorldConfig, WorldSnapshot,
+    step, transform_state, InputSnapshot, ObjectDraft, ObjectHandle, OriginalObjectId,
+    TransformState, World, WorldConfig, WorldSnapshot,
 };
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -114,6 +114,34 @@ pub struct MissionObjectDraft {
     /// their fields intentionally have no inferred Control/physics semantics.
     pub unit_components: Vec<UnitComponentRecord>,
 }
+
+/// A mission object registered with one clan's native Behavior distributor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BehaviorRegisteredObject {
+    /// Stable identity from the source TMA object order.
+    pub original_id: OriginalObjectId,
+    /// Corresponding live Rust world object.
+    pub handle: ObjectHandle,
+    /// Raw DWORD that selects the `GetSuperAI` table slot.
+    pub selector: u32,
+    /// Class word recovered from the root Unit DAT header.
+    pub class_flags: u32,
+}
+
+/// Resource distributor state associated with one TMA clan's constructed AI.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BehaviorDistributorState {
+    /// TMA clan index; it is not an index into the filtered script bundle list.
+    pub clan_index: usize,
+    /// Whether a successfully loaded script package published this AI to
+    /// `GetSuperAI` in the standard host path.
+    pub super_ai_visible: bool,
+    /// Objects admitted by the currently recovered standard-load registration path.
+    pub registered_objects: Vec<BehaviorRegisteredObject>,
+}
+
+const LAST_SUPER_AI_TABLE_INDEX: u32 = 63;
+const BEHAVIOR_REGISTRATION_KEY_FLAG: u32 = 0x8000_0000;
 
 /// Native terrain adjustment selected for a mission object's BAS geometry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -429,6 +457,7 @@ struct LoadedMissionState {
     mission_assets: MissionAssets,
     asset_plan: MissionAssetPlan,
     object_drafts: Vec<MissionObjectDraft>,
+    behavior_distributors: Vec<BehaviorDistributorState>,
     script_bundles: Vec<MissionScriptBundle>,
     script_varset: Option<MissionScriptVarSet>,
     script_init_states: Vec<MissionScriptInitState>,
@@ -955,6 +984,58 @@ fn load_mission_with_options(
         registered_objects += 1;
     }
 
+    let behavior_distributors = if options.asset_scope == MissionAssetScope::Full {
+        let visible_clan_indices = loaded_scripts
+            .bundles
+            .iter()
+            .map(|bundle| bundle.clan_index)
+            .filter(|clan_index| {
+                *clan_index < mission.clans.len()
+                    && *clan_index <= LAST_SUPER_AI_TABLE_INDEX as usize
+            })
+            .collect::<Vec<_>>();
+        let mut distributors = mission
+            .clans
+            .iter()
+            .enumerate()
+            .map(|(clan_index, _)| BehaviorDistributorState {
+                clan_index,
+                super_ai_visible: visible_clan_indices.contains(&clan_index),
+                registered_objects: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+
+        for (draft, handle) in object_drafts.iter().zip(&handles) {
+            let Some(class_flags) = draft.unit_dat_header_flags else {
+                continue;
+            };
+            if !has_behavior_registration_key(class_flags) {
+                continue;
+            }
+            let Some(clan_index) = behavior_clan_for_selector(
+                draft.raw_after_resource,
+                mission.clans.len(),
+                &visible_clan_indices,
+            ) else {
+                continue;
+            };
+            let Some(original_id) = draft.original_id else {
+                continue;
+            };
+            distributors[clan_index]
+                .registered_objects
+                .push(BehaviorRegisteredObject {
+                    original_id,
+                    handle: *handle,
+                    selector: draft.raw_after_resource,
+                    class_flags,
+                });
+        }
+        distributors
+    } else {
+        Vec::new()
+    };
+
     let mut next_behavior_rng_state = engine.behavior_rng_state;
     if options.asset_scope == MissionAssetScope::Full {
         let queue_time_ms = queue_time_ms.expect("full mission loading requires a queue time");
@@ -1029,6 +1110,7 @@ fn load_mission_with_options(
         mission_assets,
         asset_plan: mission_asset_plan,
         object_drafts,
+        behavior_distributors,
         script_bundles: loaded_scripts.bundles,
         script_varset: loaded_scripts.varset,
         script_init_states: loaded_scripts.init_states,
@@ -1298,6 +1380,33 @@ pub fn loaded_mission_object_drafts(engine: &Engine) -> Option<&[MissionObjectDr
         .loaded
         .as_ref()
         .map(|state| state.object_drafts.as_slice())
+}
+
+/// Returns the clan-indexed Behavior distributors and their registered objects.
+#[must_use]
+pub fn loaded_mission_behavior_distributors(
+    engine: &Engine,
+) -> Option<&[BehaviorDistributorState]> {
+    engine
+        .loaded
+        .as_ref()
+        .map(|state| state.behavior_distributors.as_slice())
+}
+
+fn behavior_clan_for_selector(
+    selector: u32,
+    clan_count: usize,
+    super_ai_clan_indices: &[usize],
+) -> Option<usize> {
+    if selector > LAST_SUPER_AI_TABLE_INDEX {
+        return None;
+    }
+    let clan_index = usize::try_from(selector).ok()?;
+    (clan_index < clan_count && super_ai_clan_indices.contains(&clan_index)).then_some(clan_index)
+}
+
+fn has_behavior_registration_key(class_flags: u32) -> bool {
+    class_flags & BEHAVIOR_REGISTRATION_KEY_FLAG != 0
 }
 
 fn normalize_engine_path(role: &'static str, value: &str) -> Result<NormalizedPath, EngineError> {
@@ -1664,6 +1773,26 @@ mod tests {
             no_gate.root_position_with_basement_delta(3.25),
             no_gate.position
         );
+    }
+
+    #[test]
+    fn behavior_selector_requires_an_exact_visible_clan_slot() {
+        let sparse_slots = [1, 63];
+        assert_eq!(behavior_clan_for_selector(1, 64, &sparse_slots), Some(1));
+        assert_eq!(behavior_clan_for_selector(63, 64, &[63]), Some(63));
+        assert_eq!(behavior_clan_for_selector(0, 64, &[1, 63]), None);
+        assert_eq!(behavior_clan_for_selector(64, 65, &[64]), None);
+        assert_eq!(behavior_clan_for_selector(0xfffe, 65_535, &[0xfffe]), None);
+        assert_eq!(behavior_clan_for_selector(63, 63, &[63]), None);
+    }
+
+    #[test]
+    fn behavior_registration_uses_the_class_high_bit() {
+        assert!(has_behavior_registration_key(0x8000_0010));
+        assert!(has_behavior_registration_key(0x8000_0002));
+        assert!(has_behavior_registration_key(0x8000_0123));
+        assert!(!has_behavior_registration_key(0x0000_0123));
+        assert!(!has_behavior_registration_key(0x7fff_ffff));
     }
 
     #[test]
@@ -2260,6 +2389,80 @@ mod tests {
             assert_eq!(draft.identity_or_clan_raw, object.identity_or_clan_raw);
         }
 
+        let distributors =
+            loaded_mission_behavior_distributors(&engine).expect("Behavior distributors");
+        assert_eq!(
+            distributors
+                .iter()
+                .map(|distributor| (distributor.clan_index, distributor.super_ai_visible))
+                .collect::<Vec<_>>(),
+            vec![(0, true), (1, true)]
+        );
+        let registered = distributors
+            .iter()
+            .flat_map(|distributor| {
+                distributor
+                    .registered_objects
+                    .iter()
+                    .map(move |object| (distributor.clan_index, object))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            registered
+                .iter()
+                .map(|(clan_index, object)| {
+                    let draft = drafts
+                        .iter()
+                        .find(|draft| draft.original_id == Some(object.original_id))
+                        .expect("registered object draft");
+                    (
+                        *clan_index,
+                        object.original_id,
+                        draft.resource_name_raw.as_slice(),
+                        object.selector,
+                        object.class_flags,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    0,
+                    OriginalObjectId(4),
+                    &b"UNITS\\BUILDS\\PLANT\\wor_l_n1.dat"[..],
+                    0,
+                    0x8000_0010,
+                ),
+                (
+                    0,
+                    OriginalObjectId(6),
+                    &b"UNITS\\BUILDS\\GENER\\gener01.dat"[..],
+                    0,
+                    0x8000_0002,
+                ),
+                (
+                    1,
+                    OriginalObjectId(5),
+                    &b"UNITS\\BUILDS\\PLANT\\wor_l_n1.dat"[..],
+                    1,
+                    0x8000_0010,
+                ),
+                (
+                    1,
+                    OriginalObjectId(7),
+                    &b"UNITS\\BUILDS\\GENER\\gener01.dat"[..],
+                    1,
+                    0x8000_0002,
+                ),
+            ]
+        );
+        assert_eq!(registered.len(), 4);
+        for (_, object) in registered {
+            assert_eq!(
+                handle_by_original_id(&engine.world, object.original_id),
+                Some(object.handle)
+            );
+        }
+
         assert_eq!(
             mission
                 .clans
@@ -2333,6 +2536,9 @@ mod tests {
         .expect("load licensed campaign preview");
 
         let bundles = loaded_mission_script_bundles(&engine).expect("script bundles");
+        assert!(loaded_mission_behavior_distributors(&engine)
+            .expect("preview Behavior distributors")
+            .is_empty());
         assert!(bundles
             .iter()
             .all(|bundle| bundle.behavior_warm_start.is_none()));
@@ -2639,6 +2845,9 @@ mod tests {
         let previous_bundles = loaded_mission_script_bundles(&engine)
             .expect("previous bundles")
             .to_vec();
+        let previous_distributors = loaded_mission_behavior_distributors(&engine)
+            .expect("previous Behavior distributors")
+            .to_vec();
         let previous_rng = engine.behavior_rng_state;
         let before = step_headless(&mut engine, InputSnapshot)
             .expect("step previous world")
@@ -2661,6 +2870,10 @@ mod tests {
         assert_eq!(
             loaded_mission_script_bundles(&engine),
             Some(previous_bundles.as_slice())
+        );
+        assert_eq!(
+            loaded_mission_behavior_distributors(&engine),
+            Some(previous_distributors.as_slice())
         );
         assert_eq!(engine.behavior_rng_state, previous_rng);
         let after = step_headless(&mut engine, InputSnapshot)
