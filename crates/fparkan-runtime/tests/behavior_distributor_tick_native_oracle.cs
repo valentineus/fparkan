@@ -5,9 +5,9 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 
-// Calls the original x86 Behavior.dll distributor tick against synthetic vtables.
-// Only the imported GetSystemArealMap IAT slot is replaced; the tick instructions
-// and its internal helpers remain the installed DLL's original code.
+// Calls the original x86 Behavior.dll distributor Add, normalize, and tick paths
+// against synthetic storage. Only GetSystemArealMap and the bounded vector backing
+// are substituted; Behavior's corresponding instructions remain the installed DLL.
 internal static class BehaviorDistributorTickOracle {
     private const uint LoadWithAlteredSearchPath = 0x00000008;
     private const uint MemCommitReserve = 0x00003000;
@@ -16,6 +16,8 @@ internal static class BehaviorDistributorTickOracle {
     private const uint PageReadWrite = 0x04;
     private const string ExpectedBehaviorSha256 = "ddfbdbde07832358fe6e35e01c8dba9b58e7313789498b6049ed51d4ed9baf99";
     private const int TickRva = 0x19e80;
+    private const int AddObjectRva = 0x1aac0;
+    private const int NormalizeRva = 0x1ac90;
     private const int GetSystemArealMapIatRva = 0x59008;
     private const uint ResourceProperty = 0x02000100;
     private static Fixture active;
@@ -28,7 +30,12 @@ internal static class BehaviorDistributorTickOracle {
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool VirtualProtect(IntPtr address, UIntPtr size, uint protect, out uint oldProtect);
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate IntPtr AreaMapGetter();
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void X87ControlWordReader();
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void X87ControlWordWriter();
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void TickDelegate(IntPtr self, float deltaSeconds);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void NativeAddObject(IntPtr self, uint key);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeNormalize(IntPtr self, uint key);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void VectorInsert(IntPtr self, IntPtr source, uint count, uint position);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate IntPtr MapLookup(IntPtr self, uint key);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int ObjectState(IntPtr self);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate uint ObjectClass(IntPtr self);
@@ -40,6 +47,7 @@ internal static class BehaviorDistributorTickOracle {
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int InterfaceSetProperty(IntPtr self, uint selector, IntPtr value);
 
     private static readonly AreaMapGetter AreaMapGetterCallback = GetAreaMap;
+    private static readonly VectorInsert VectorInsertCallback = InsertVector;
     private static readonly MapLookup MapLookupCallback = Lookup;
     private static readonly ObjectState ObjectStateCallback = GetObjectState;
     private static readonly ObjectClass ObjectClassCallback = GetObjectClass;
@@ -53,6 +61,10 @@ internal static class BehaviorDistributorTickOracle {
     private static IntPtr queryObjectThunk;
     private static IntPtr getInterfacePropertyThunk;
     private static IntPtr setInterfacePropertyThunk;
+    private static IntPtr vectorInsertThunk;
+    private static IntPtr x87ControlWordCell;
+    private static X87ControlWordReader x87ControlWordReader;
+    private static X87ControlWordWriter x87ControlWordWriter;
 
     private sealed class NativeObject {
         public IntPtr Self;
@@ -84,6 +96,7 @@ internal static class BehaviorDistributorTickOracle {
     private sealed class Fixture : IDisposable {
         public IntPtr Distributor;
         public IntPtr Entries;
+        public IntPtr VectorVtable;
         public IntPtr Manager;
         public IntPtr ManagerVtable;
         public readonly List<IntPtr> Allocations = new List<IntPtr>();
@@ -91,6 +104,7 @@ internal static class BehaviorDistributorTickOracle {
         public readonly List<string> Calls = new List<string>();
         public readonly List<string> Trace = new List<string>();
         public int LookupCount;
+        public int VectorInsertCalls;
         public NativeObject AddObject(uint key, uint classCode, float powerRate, float oreRate, float property, int state) {
             NativeObject item = new NativeObject();
             item.Key = key;
@@ -129,8 +143,14 @@ internal static class BehaviorDistributorTickOracle {
         }
         public void MakeDistributor(params uint[] keys) {
             Distributor = Allocate(0x44);
-            Entries = Allocate(Math.Max(1, keys.Length) * 0x1c);
+            const int capacity = 32;
+            if (keys.Length > capacity) throw new InvalidOperationException("synthetic distributor capacity exceeded");
+            Entries = Allocate(capacity * 0x1c);
+            VectorVtable = Allocate(0x20);
+            Marshal.WriteIntPtr(VectorVtable, 0x10, vectorInsertThunk);
+            Marshal.WriteIntPtr(Distributor, 0x1c, VectorVtable);
             Marshal.WriteInt32(Distributor, 0x20, keys.Length);
+            Marshal.WriteInt32(Distributor, 0x24, capacity);
             Marshal.WriteIntPtr(Distributor, 0x28, Entries);
             for (int i = 0; i < keys.Length; i++) {
                 IntPtr entry = IntPtr.Add(Entries, i * 0x1c);
@@ -152,6 +172,21 @@ internal static class BehaviorDistributorTickOracle {
     }
 
     private static IntPtr GetAreaMap() { return active.Manager; }
+    private static void InsertVector(IntPtr self, IntPtr source, uint count, uint position) {
+        int length = Marshal.ReadInt32(self, 4);
+        int capacity = Marshal.ReadInt32(self, 8);
+        IntPtr destination = Marshal.ReadIntPtr(self, 12);
+        Expect(count > 0 && count <= (uint)(capacity - length), "bounded vector insertion capacity");
+        Expect(position == 0xffffffff || position == (uint)length, "native append position");
+        byte[] entry = new byte[0x1c];
+        for (uint index = 0; index < count; index++) {
+            Marshal.Copy(IntPtr.Add(source, unchecked((int)(index * 0x1c))), entry, 0, entry.Length);
+            Marshal.Copy(entry, 0, IntPtr.Add(destination, (length + (int)index) * 0x1c), entry.Length);
+        }
+        Marshal.WriteInt32(self, 4, length + (int)count);
+        active.VectorInsertCalls++;
+        active.Trace.Add("insert:" + count.ToString() + ":" + position.ToString("x8"));
+    }
     private static IntPtr Lookup(IntPtr self, uint key) {
         active.Calls.Add("lookup:" + key.ToString("x8"));
         active.LookupCount++;
@@ -283,12 +318,17 @@ internal static class BehaviorDistributorTickOracle {
             queryObjectThunk = WriteFastcallToStdcallThunk(0x00, Marshal.GetFunctionPointerForDelegate(ObjectQueryCallback));
             getInterfacePropertyThunk = WriteFastcallToStdcallThunk(0x40, Marshal.GetFunctionPointerForDelegate(InterfaceGetCallback));
             setInterfacePropertyThunk = WriteFastcallToStdcallThunk(0x80, Marshal.GetFunctionPointerForDelegate(InterfaceSetCallback));
+            vectorInsertThunk = WriteThisCallThreeArgsToStdcallThunk(0xc0, Marshal.GetFunctionPointerForDelegate(VectorInsertCallback));
+            x87ControlWordCell = Marshal.AllocHGlobal(2);
+            Marshal.WriteInt16(x87ControlWordCell, 0);
+            x87ControlWordReader = (X87ControlWordReader)Marshal.GetDelegateForFunctionPointer(WriteX87ControlWordReader(0x100), typeof(X87ControlWordReader));
+            x87ControlWordWriter = (X87ControlWordWriter)Marshal.GetDelegateForFunctionPointer(WriteX87ControlWordWriter(0x120), typeof(X87ControlWordWriter));
             if (!VirtualProtect(import, new UIntPtr((uint)IntPtr.Size), PageReadWrite, out oldProtection))
                 throw new InvalidOperationException("VirtualProtect(GetSystemArealMap IAT) failed: " + Marshal.GetLastWin32Error());
             protectionChanged = true;
             Marshal.WriteIntPtr(import, Marshal.GetFunctionPointerForDelegate(AreaMapGetterCallback));
             RunSmokeCases(module);
-            Console.WriteLine("original Behavior.dll distributor tick oracle passed (RVA 0x19e80; only GetSystemArealMap IAT substituted; this does not compare Rust parity).");
+            Console.WriteLine("original Behavior.dll distributor oracle passed (native Add 0x1aac0, normalize 0x1ac90, tick 0x19e80; only GetSystemArealMap IAT and bounded vector insertion are substituted; this does not compare Rust parity).");
             return 0;
         }
         catch (Exception error) {
@@ -301,18 +341,30 @@ internal static class BehaviorDistributorTickOracle {
                 uint ignored;
                 VirtualProtect(import, new UIntPtr((uint)IntPtr.Size), oldProtection, out ignored);
             }
-            GC.KeepAlive(AreaMapGetterCallback); GC.KeepAlive(MapLookupCallback);
+            GC.KeepAlive(AreaMapGetterCallback); GC.KeepAlive(VectorInsertCallback); GC.KeepAlive(x87ControlWordReader); GC.KeepAlive(x87ControlWordWriter); GC.KeepAlive(MapLookupCallback);
             GC.KeepAlive(ObjectStateCallback); GC.KeepAlive(ObjectClassCallback);
             GC.KeepAlive(ObjectQueryCallback); GC.KeepAlive(ObjectRateCallback);
             GC.KeepAlive(ObjectGetPropertyCallback); GC.KeepAlive(ObjectSetPropertyCallback);
             GC.KeepAlive(InterfaceGetCallback); GC.KeepAlive(InterfaceSetCallback);
             if (thunksAllocated && !VirtualFree(fastcallThunks, UIntPtr.Zero, MemRelease))
                 throw new InvalidOperationException("VirtualFree(fastcall callback thunks) failed: " + Marshal.GetLastWin32Error());
+            if (x87ControlWordCell != IntPtr.Zero) { Marshal.FreeHGlobal(x87ControlWordCell); x87ControlWordCell = IntPtr.Zero; }
             FreeLibrary(module);
         }
     }
 
     private static void RunSmokeCases(IntPtr module) {
+        ushort savedControlWord = CurrentX87ControlWord();
+        Console.WriteLine("x87-control-word-before=0x" + savedControlWord.ToString("x4") + " (x86 oracle process)");
+        try {
+            SetX87ControlWord(0x007f);
+            Console.WriteLine("native-add-normalize-x87-control-word=0x" + CurrentX87ControlWord().ToString("x4"));
+            RunNativeAddCases(module);
+            RunNativeNormalizeCases(module);
+        } finally {
+            SetX87ControlWord(savedControlWord);
+            Console.WriteLine("x87-control-word-restored=0x" + CurrentX87ControlWord().ToString("x4"));
+        }
         TickDelegate tick = (TickDelegate)Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, TickRva), typeof(TickDelegate));
         using (Fixture empty = NewFixture()) {
             empty.MakeDistributor(); active = empty; tick(empty.Distributor, 0.0f);
@@ -334,6 +386,137 @@ internal static class BehaviorDistributorTickOracle {
         RunMissingCase(tick);
         RunSkippedCase(tick);
     }
+
+    private static ushort CurrentX87ControlWord() {
+        if (x87ControlWordReader == null || x87ControlWordCell == IntPtr.Zero)
+            throw new InvalidOperationException("x87 control-word reader is not initialized");
+        x87ControlWordReader();
+        return unchecked((ushort)Marshal.ReadInt16(x87ControlWordCell));
+    }
+
+    private static void SetX87ControlWord(ushort value) {
+        if (x87ControlWordWriter == null || x87ControlWordCell == IntPtr.Zero)
+            throw new InvalidOperationException("x87 control-word writer is not initialized");
+        Marshal.WriteInt16(x87ControlWordCell, unchecked((short)value));
+        x87ControlWordWriter();
+        Expect(CurrentX87ControlWord() == value, "x87 control word 0x" + value.ToString("x4"));
+    }
+
+    private static void AddWithGameControl(NativeAddObject add, IntPtr distributor, uint key) {
+        Expect(CurrentX87ControlWord() == 0x007f, "game x87 control word before native Add");
+        add(distributor, key);
+        Expect(CurrentX87ControlWord() == 0x007f, "game x87 control word after native Add");
+    }
+
+    private static void NormalizeWithGameControl(NativeNormalize normalize, IntPtr distributor, uint key) {
+        Expect(CurrentX87ControlWord() == 0x007f, "game x87 control word before native normalize");
+        normalize(distributor, key);
+        Expect(CurrentX87ControlWord() == 0x007f, "game x87 control word after native normalize");
+    }
+
+    private static void RunNativeAddCases(IntPtr module) {
+        NativeAddObject add = (NativeAddObject)Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, AddObjectRva), typeof(NativeAddObject));
+        using (Fixture fixture = NewFixture()) {
+            fixture.MakeDistributor();
+            active = fixture;
+            AddWithGameControl(add, fixture.Distributor, 0x80000004);
+            Expect(Marshal.ReadInt32(fixture.Distributor, 0x20) == 1, "Add inserts a new first key");
+            ExpectEntry(fixture.Entries, 0, 0x80000004, 0x3f800000, 0, 0, 0, 0, 0);
+
+            AddWithGameControl(add, fixture.Distributor, 0x80000006);
+            Expect(Marshal.ReadInt32(fixture.Distributor, 0x20) == 2, "Add appends a second key");
+            ExpectEntry(fixture.Entries, 0, 0x80000004, 0x3f000000, 0, 0, 0, 0, 0);
+            ExpectEntry(fixture.Entries, 1, 0x80000006, 0x3f000000, 0, 0, 0, 0, 0);
+
+            WriteEntry(fixture.Entries, 0, 0x80000004, 0.2f, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5);
+            AddWithGameControl(add, fixture.Distributor, 0x80000004);
+            Expect(Marshal.ReadInt32(fixture.Distributor, 0x20) == 2, "Add on an existing key does not append");
+            Expect(fixture.VectorInsertCalls == 2, "Add inserts exactly the two new keys");
+            ExpectEntry(fixture.Entries, 0, 0x80000004, 0x3f000000, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5);
+            ExpectEntry(fixture.Entries, 1, 0x80000006, 0x3f000000, 0, 0, 0, 0, 0);
+
+            AddWithGameControl(add, fixture.Distributor, 0x80000008);
+            Expect(Marshal.ReadInt32(fixture.Distributor, 0x20) == 3, "Add appends a third key");
+            Expect(fixture.VectorInsertCalls == 3, "Add inserts each new key exactly once");
+            ExpectEntry(fixture.Entries, 0, 0x80000004, 0x3f000000, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5);
+            uint[] third = ReadEntry(IntPtr.Add(fixture.Entries, 0x38));
+            Console.WriteLine("native-add-third-share: " + Float(third[1]) + " bits=" + Hex(third[1]));
+            Expect(third[0] == 0x80000008 && third[2] == 0 && third[3] == 0 && third[4] == 0 && third[5] == 0 && third[6] == 0,
+                "Add initializes the third record apart from its observed share");
+            ExpectEntry(fixture.Entries, 1, 0x80000006, 0x3e2aaaa8, 0, 0, 0, 0, 0);
+            ExpectEntry(fixture.Entries, 2, 0x80000008, 0x3eaaaaab, 0, 0, 0, 0, 0);
+            Console.WriteLine("native-add: count=3 inserts=" + fixture.VectorInsertCalls + " trace=" + String.Join(",", fixture.Trace.ToArray()) +
+                " entries=[" + FormatEntry(fixture.Entries) + ";" + FormatEntry(IntPtr.Add(fixture.Entries, 0x1c)) + ";" +
+                FormatEntry(IntPtr.Add(fixture.Entries, 0x38)) + "]");
+        }
+    }
+
+    private static void RunNativeNormalizeCases(IntPtr module) {
+        NativeNormalize normalize = (NativeNormalize)Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, NormalizeRva), typeof(NativeNormalize));
+        using (Fixture fixture = NewFixture()) {
+            fixture.MakeDistributor(0x11, 0x22, 0x33);
+            active = fixture;
+            WriteEntry(fixture.Entries, 0, 0x11, 0.2f, 0, 0xaaaaaaaa, 0xbbbbbbbb, 0xcccccccc, 0xdddddddd);
+            WriteEntry(fixture.Entries, 1, 0x22, 0.3f, 1, 0x11111111, 0x22222222, 0x33333333, 0x44444444);
+            WriteEntry(fixture.Entries, 2, 0x33, 0.3f, 0, 0x55555555, 0x66666666, 0x77777777, 0x88888888);
+            NormalizeWithGameControl(normalize, fixture.Distributor, 0x11);
+            ExpectEntry(fixture.Entries, 0, 0x11, FloatBitsUnsigned(0.2f), 0, 0xaaaaaaaa, 0xbbbbbbbb, 0xcccccccc, 0xdddddddd);
+            ExpectEntry(fixture.Entries, 1, 0x22, FloatBitsUnsigned(0.3f), 1, 0x11111111, 0x22222222, 0x33333333, 0x44444444);
+            ExpectEntry(fixture.Entries, 2, 0x33, 0x3f000000, 0, 0x55555555, 0x66666666, 0x77777777, 0x88888888);
+            Console.WriteLine("native-normalize-pinned: shares=[" + Float(ReadEntry(fixture.Entries)[1]) + "," +
+                Float(ReadEntry(IntPtr.Add(fixture.Entries, 0x1c))[1]) + "," +
+                Float(ReadEntry(IntPtr.Add(fixture.Entries, 0x38))[1]) + "] flags=[0,1,0]");
+        }
+        using (Fixture fixture = NewFixture()) {
+            fixture.MakeDistributor(0x41, 0x42, 0x43);
+            active = fixture;
+            WriteEntry(fixture.Entries, 0, 0x41, 0.25f, 0, 0, 0, 0, 0);
+            WriteEntry(fixture.Entries, 1, 0x42, 0.0f, 0, 0, 0, 0, 0);
+            WriteEntry(fixture.Entries, 2, 0x43, 0.0f, 0, 0, 0, 0, 0);
+            NormalizeWithGameControl(normalize, fixture.Distributor, 0x41);
+            ExpectEntry(fixture.Entries, 0, 0x41, 0x3e800000, 0, 0, 0, 0, 0);
+            ExpectEntry(fixture.Entries, 1, 0x42, 0x3ec00000, 0, 0, 0, 0, 0);
+            ExpectEntry(fixture.Entries, 2, 0x43, 0x3ec00000, 0, 0, 0, 0, 0);
+            Console.WriteLine("native-normalize-zero-free-sum: shares=[0.25,0.375,0.375]");
+        }
+        using (Fixture fixture = NewFixture()) {
+            fixture.MakeDistributor(0x51, 0x52, 0x53);
+            active = fixture;
+            WriteEntry(fixture.Entries, 0, 0x51, 0.5f, 0, 0, 0, 0, 0);
+            WriteEntry(fixture.Entries, 1, 0x52, 1.0f, 0, 0, 0, 0, 0);
+            WriteEntry(fixture.Entries, 2, 0x53, 5.9604644775390625e-8f, 0, 0, 0, 0, 0);
+            NormalizeWithGameControl(normalize, fixture.Distributor, 0x51);
+            uint[] nearFirst = ReadEntry(fixture.Entries);
+            uint[] nearSecond = ReadEntry(IntPtr.Add(fixture.Entries, 0x1c));
+            uint[] nearThird = ReadEntry(IntPtr.Add(fixture.Entries, 0x38));
+            Console.WriteLine("native-normalize-near-rounding: shares=[" + Float(nearFirst[1]) + "," + Float(nearSecond[1]) + "," + Float(nearThird[1]) + "] bits=[" + Hex(nearFirst[1]) + "," + Hex(nearSecond[1]) + "," + Hex(nearThird[1]) + "]");
+            ExpectEntry(fixture.Entries, 0, 0x51, 0x3f000000, 0, 0, 0, 0, 0);
+            ExpectEntry(fixture.Entries, 1, 0x52, 0x3f000000, 0, 0, 0, 0, 0);
+            ExpectEntry(fixture.Entries, 2, 0x53, 0x33000000, 0, 0, 0, 0, 0);
+        }
+    }
+
+    private static void WriteEntry(IntPtr entries, int index, uint key, float weight, uint pinned,
+        uint word3, uint word4, uint word5, uint word6) {
+        IntPtr entry = IntPtr.Add(entries, index * 0x1c);
+        Marshal.WriteInt32(entry, 0x00, unchecked((int)key));
+        Marshal.WriteInt32(entry, 0x04, FloatBits(weight));
+        Marshal.WriteInt32(entry, 0x08, unchecked((int)pinned));
+        Marshal.WriteInt32(entry, 0x0c, unchecked((int)word3));
+        Marshal.WriteInt32(entry, 0x10, unchecked((int)word4));
+        Marshal.WriteInt32(entry, 0x14, unchecked((int)word5));
+        Marshal.WriteInt32(entry, 0x18, unchecked((int)word6));
+    }
+
+    private static void ExpectEntry(IntPtr entries, int index, uint key, uint weight, uint pinned,
+        uint word3, uint word4, uint word5, uint word6) {
+        uint[] words = ReadEntry(IntPtr.Add(entries, index * 0x1c));
+        Expect(words[0] == key && words[1] == weight && words[2] == pinned && words[3] == word3 &&
+            words[4] == word4 && words[5] == word5 && words[6] == word6,
+            "native entry " + index + " fields [" + String.Join(",", Array.ConvertAll(words, Hex)) + "]");
+    }
+
+    private static uint FloatBitsUnsigned(float value) { return unchecked((uint)FloatBits(value)); }
 
     private static Fixture NewFixture() {
         Fixture fixture = new Fixture();
@@ -570,6 +753,29 @@ internal static class BehaviorDistributorTickOracle {
         Marshal.Copy(code, 0, thunk, code.Length);
         return thunk;
     }
+    private static IntPtr WriteThisCallThreeArgsToStdcallThunk(int offset, IntPtr stdcallTarget) {
+        // Adapt ECX=self plus three stack arguments to stdcall(self, arg1, arg2, arg3).
+        byte[] code = { 0xff, 0x74, 0x24, 0x0c, 0xff, 0x74, 0x24, 0x0c, 0xff, 0x74, 0x24, 0x0c,
+            0x51, 0xb8, 0, 0, 0, 0, 0xff, 0xd0, 0xc2, 0x0c, 0x00 };
+        WriteImm32(code, 14, stdcallTarget.ToInt32());
+        IntPtr thunk = IntPtr.Add(fastcallThunks, offset);
+        Marshal.Copy(code, 0, thunk, code.Length);
+        return thunk;
+    }
+    private static IntPtr WriteX87ControlWordReader(int offset) {
+        byte[] code = { 0xd9, 0x3d, 0, 0, 0, 0, 0xc3 }; // fnstcw [absolute address]; ret
+        WriteImm32(code, 2, x87ControlWordCell.ToInt32());
+        IntPtr thunk = IntPtr.Add(fastcallThunks, offset);
+        Marshal.Copy(code, 0, thunk, code.Length);
+        return thunk;
+    }
+    private static IntPtr WriteX87ControlWordWriter(int offset) {
+        byte[] code = { 0xd9, 0x2d, 0, 0, 0, 0, 0xc3 }; // fldcw [absolute address]; ret
+        WriteImm32(code, 2, x87ControlWordCell.ToInt32());
+        IntPtr thunk = IntPtr.Add(fastcallThunks, offset);
+        Marshal.Copy(code, 0, thunk, code.Length);
+        return thunk;
+    }
     private static void WriteImm32(byte[] code, int offset, int value) {
         byte[] bytes = BitConverter.GetBytes(value);
         Buffer.BlockCopy(bytes, 0, code, offset, 4);
@@ -585,7 +791,7 @@ internal static class BehaviorDistributorTickOracle {
             foreach (byte value in digest) hex.Append(value.ToString("x2")); return hex.ToString();
         }
     }
-    private static void Expect(bool value, string message) { if (!value) throw new InvalidOperationException("original Behavior tick oracle failed: " + message); }
+    private static void Expect(bool value, string message) { if (!value) throw new InvalidOperationException("original Behavior oracle failed: " + message); }
     private static void ExpectLookupOrder(Fixture fixture, params string[] keys) {
         List<string> actual = new List<string>();
         foreach (string item in fixture.Trace) if (item.StartsWith("lookup:", StringComparison.Ordinal)) actual.Add(item.Substring(7));

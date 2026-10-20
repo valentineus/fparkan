@@ -116,7 +116,7 @@ pub struct MissionObjectDraft {
 }
 
 /// A mission object registered with one clan's native Behavior distributor.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BehaviorRegisteredObject {
     /// Stable identity from the source TMA object order.
     pub original_id: OriginalObjectId,
@@ -126,10 +126,16 @@ pub struct BehaviorRegisteredObject {
     pub selector: u32,
     /// Class word recovered from the root Unit DAT header.
     pub class_flags: u32,
+    /// Native share field at record offset `+0x04`.
+    pub share: f32,
+    /// Raw DWORDs at offsets `+0x08..+0x18`; the first controls whether
+    /// normalization treats this record as fixed, and the remaining words are
+    /// not yet assigned semantics. A normal native Add initializes all five to 0.
+    pub native_tail: [u32; 5],
 }
 
 /// Resource distributor state associated with one TMA clan's constructed AI.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BehaviorDistributorState {
     /// TMA clan index; it is not an index into the filtered script bundle list.
     pub clan_index: usize,
@@ -1022,14 +1028,17 @@ fn load_mission_with_options(
             let Some(original_id) = draft.original_id else {
                 continue;
             };
-            distributors[clan_index]
-                .registered_objects
-                .push(BehaviorRegisteredObject {
+            add_behavior_registered_object(
+                &mut distributors[clan_index],
+                BehaviorRegisteredObject {
                     original_id,
                     handle: *handle,
                     selector: draft.raw_after_resource,
                     class_flags,
-                });
+                    share: 0.0,
+                    native_tail: [0; 5],
+                },
+            );
         }
         distributors
     } else {
@@ -1407,6 +1416,69 @@ fn behavior_clan_for_selector(
 
 fn has_behavior_registration_key(class_flags: u32) -> bool {
     class_flags & BEHAVIOR_REGISTRATION_KEY_FLAG != 0
+}
+
+fn add_behavior_registered_object(
+    distributor: &mut BehaviorDistributorState,
+    mut object: BehaviorRegisteredObject,
+) {
+    let existing_index = distributor
+        .registered_objects
+        .iter()
+        .position(|entry| entry.handle == object.handle);
+    let count = distributor.registered_objects.len() + usize::from(existing_index.is_none());
+
+    // Native Add/normalize ran with x87 control word 0x007f. Keep the list-order
+    // arithmetic in f32 so each operation has the observed 24-bit precision.
+    let share = 1.0_f32 / count as f32;
+    let handle = object.handle;
+    if let Some(index) = existing_index {
+        distributor.registered_objects[index].share = share;
+    } else {
+        object.share = share;
+        object.native_tail = [0; 5];
+        distributor.registered_objects.push(object);
+    }
+
+    normalize_behavior_distributor(distributor, handle);
+}
+
+fn normalize_behavior_distributor(
+    distributor: &mut BehaviorDistributorState,
+    fixed_handle: ObjectHandle,
+) {
+    let mut fixed_sum = 0.0_f32;
+    let mut free_sum = 0.0_f32;
+    let mut adjustable_count = 0_usize;
+
+    for object in &distributor.registered_objects {
+        if object.handle == fixed_handle || object.native_tail[0] != 0 {
+            fixed_sum = fixed_sum + object.share;
+        } else {
+            free_sum = free_sum + object.share;
+            adjustable_count += 1;
+        }
+    }
+
+    if adjustable_count == 0 {
+        return;
+    }
+
+    if free_sum <= 0.0 {
+        let share = (1.0_f32 - fixed_sum) / adjustable_count as f32;
+        for object in &mut distributor.registered_objects {
+            if object.handle != fixed_handle && object.native_tail[0] == 0 {
+                object.share = share;
+            }
+        }
+    } else {
+        let factor = (1.0_f32 - fixed_sum) / free_sum;
+        for object in &mut distributor.registered_objects {
+            if object.handle != fixed_handle && object.native_tail[0] == 0 {
+                object.share = object.share * factor;
+            }
+        }
+    }
 }
 
 fn normalize_engine_path(role: &'static str, value: &str) -> Result<NormalizedPath, EngineError> {
@@ -2421,6 +2493,8 @@ mod tests {
                         draft.resource_name_raw.as_slice(),
                         object.selector,
                         object.class_flags,
+                        object.share.to_bits(),
+                        object.native_tail,
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -2431,6 +2505,8 @@ mod tests {
                     &b"UNITS\\BUILDS\\PLANT\\wor_l_n1.dat"[..],
                     0,
                     0x8000_0010,
+                    0x3f00_0000,
+                    [0; 5],
                 ),
                 (
                     0,
@@ -2438,6 +2514,8 @@ mod tests {
                     &b"UNITS\\BUILDS\\GENER\\gener01.dat"[..],
                     0,
                     0x8000_0002,
+                    0x3f00_0000,
+                    [0; 5],
                 ),
                 (
                     1,
@@ -2445,6 +2523,8 @@ mod tests {
                     &b"UNITS\\BUILDS\\PLANT\\wor_l_n1.dat"[..],
                     1,
                     0x8000_0010,
+                    0x3f00_0000,
+                    [0; 5],
                 ),
                 (
                     1,
@@ -2452,6 +2532,8 @@ mod tests {
                     &b"UNITS\\BUILDS\\GENER\\gener01.dat"[..],
                     1,
                     0x8000_0002,
+                    0x3f00_0000,
+                    [0; 5],
                 ),
             ]
         );
@@ -2516,6 +2598,152 @@ mod tests {
                 VarSetDefault::Dword(449),
                 VarSetDefault::Dword(1),
             ]
+        );
+    }
+
+    fn behavior_test_object(
+        slot: u32,
+        share: f32,
+        native_tail: [u32; 5],
+    ) -> BehaviorRegisteredObject {
+        BehaviorRegisteredObject {
+            original_id: OriginalObjectId(slot),
+            handle: ObjectHandle {
+                generation: 0,
+                slot,
+            },
+            selector: 0,
+            class_flags: 0,
+            share,
+            native_tail,
+        }
+    }
+
+    #[test]
+    fn behavior_distributor_add_uses_handle_and_preserves_duplicate_tail() {
+        let mut distributor = BehaviorDistributorState {
+            clan_index: 0,
+            super_ai_visible: true,
+            registered_objects: Vec::new(),
+        };
+
+        add_behavior_registered_object(&mut distributor, behavior_test_object(4, 0.0, [0; 5]));
+        add_behavior_registered_object(&mut distributor, behavior_test_object(6, 0.0, [0; 5]));
+        assert_eq!(
+            distributor
+                .registered_objects
+                .iter()
+                .map(|object| object.share.to_bits())
+                .collect::<Vec<_>>(),
+            vec![0x3f00_0000, 0x3f00_0000]
+        );
+
+        distributor.registered_objects[0].share = 0.2;
+        distributor.registered_objects[0].native_tail = [0xa1, 0xa2, 0xa3, 0xa4, 0xa5];
+        add_behavior_registered_object(&mut distributor, behavior_test_object(4, 0.0, [0; 5]));
+        assert_eq!(
+            distributor.registered_objects[0].share.to_bits(),
+            0x3f00_0000
+        );
+        assert_eq!(
+            distributor.registered_objects[0].native_tail,
+            [0xa1, 0xa2, 0xa3, 0xa4, 0xa5]
+        );
+
+        add_behavior_registered_object(&mut distributor, behavior_test_object(8, 0.0, [0; 5]));
+        assert_eq!(
+            distributor
+                .registered_objects
+                .iter()
+                .map(|object| object.share.to_bits())
+                .collect::<Vec<_>>(),
+            vec![0x3f00_0000, 0x3e2a_aaa8, 0x3eaa_aaab]
+        );
+        assert_eq!(
+            distributor
+                .registered_objects
+                .iter()
+                .map(|object| object.native_tail)
+                .collect::<Vec<_>>(),
+            vec![[0xa1, 0xa2, 0xa3, 0xa4, 0xa5], [0; 5], [0; 5]]
+        );
+    }
+
+    #[test]
+    fn behavior_distributor_normalize_matches_native_24_bit_vectors() {
+        let mut pinned = BehaviorDistributorState {
+            clan_index: 0,
+            super_ai_visible: true,
+            registered_objects: vec![
+                behavior_test_object(0x11, 0.2, [0; 5]),
+                behavior_test_object(0x22, 0.3, [1, 0x11, 0x22, 0x33, 0x44]),
+                behavior_test_object(0x33, 0.3, [0; 5]),
+            ],
+        };
+        normalize_behavior_distributor(
+            &mut pinned,
+            ObjectHandle {
+                generation: 0,
+                slot: 0x11,
+            },
+        );
+        assert_eq!(
+            pinned
+                .registered_objects
+                .iter()
+                .map(|object| object.share.to_bits())
+                .collect::<Vec<_>>(),
+            vec![0x3e4c_cccd, 0x3e99_999a, 0x3f00_0000]
+        );
+
+        let mut zero_sum = BehaviorDistributorState {
+            clan_index: 0,
+            super_ai_visible: true,
+            registered_objects: vec![
+                behavior_test_object(0x41, 0.25, [0; 5]),
+                behavior_test_object(0x42, 0.0, [0; 5]),
+                behavior_test_object(0x43, 0.0, [0; 5]),
+            ],
+        };
+        normalize_behavior_distributor(
+            &mut zero_sum,
+            ObjectHandle {
+                generation: 0,
+                slot: 0x41,
+            },
+        );
+        assert_eq!(
+            zero_sum
+                .registered_objects
+                .iter()
+                .map(|object| object.share.to_bits())
+                .collect::<Vec<_>>(),
+            vec![0x3e80_0000, 0x3ec0_0000, 0x3ec0_0000]
+        );
+
+        let mut near_rounding = BehaviorDistributorState {
+            clan_index: 0,
+            super_ai_visible: true,
+            registered_objects: vec![
+                behavior_test_object(0x51, 0.5, [0; 5]),
+                behavior_test_object(0x52, 1.0, [0; 5]),
+                behavior_test_object(0x53, f32::from_bits(0x3380_0000), [0; 5]),
+            ],
+        };
+        normalize_behavior_distributor(
+            &mut near_rounding,
+            ObjectHandle {
+                generation: 0,
+                slot: 0x51,
+            },
+        );
+        assert_eq!(
+            near_rounding
+                .registered_objects
+                .iter()
+                .map(|object| object.share.to_bits())
+                .collect::<Vec<_>>(),
+            vec![0x3f00_0000, 0x3f00_0000, 0x3300_0000]
         );
     }
 
