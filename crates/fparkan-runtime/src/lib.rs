@@ -86,6 +86,9 @@ pub struct MissionObjectDraft {
     pub original_id: Option<OriginalObjectId>,
     /// Raw mission resource reference.
     pub resource_name_raw: Vec<u8>,
+    /// Raw word immediately after the mission resource reference. The native
+    /// runtime uses it as an AI-selection index.
+    pub raw_after_resource: u32,
     /// Raw identity/clan word from the mission.
     pub identity_or_clan_raw: u32,
     /// Raw word after the mission object's instance name. Native BAS
@@ -895,6 +898,7 @@ fn load_mission_with_options(
         .map(|(index, object)| MissionObjectDraft {
             original_id: u32::try_from(index).ok().map(OriginalObjectId),
             resource_name_raw: object.resource_raw.clone(),
+            raw_after_resource: object.raw_after_resource,
             identity_or_clan_raw: object.identity_or_clan_raw,
             raw_after_name: object.raw_after_name,
             unit_dat_header_flags: prototype_graph
@@ -1613,6 +1617,7 @@ mod tests {
         MissionObjectDraft {
             original_id: Some(OriginalObjectId(7)),
             resource_name_raw: b"BUILDS/example.dat".to_vec(),
+            raw_after_resource: 0,
             identity_or_clan_raw: 0,
             raw_after_name,
             unit_dat_header_flags: header_flags,
@@ -2243,9 +2248,20 @@ mod tests {
         )
         .expect("load licensed AutoDemo");
 
+        let mission = loaded_mission_document(&engine).expect("mission document");
+        let drafts = loaded_mission_object_drafts(&engine).expect("object drafts");
+        assert_eq!(drafts.len(), mission.objects.len());
+        assert!(mission
+            .objects
+            .iter()
+            .any(|object| object.raw_after_resource != object.identity_or_clan_raw));
+        for (object, draft) in mission.objects.iter().zip(drafts) {
+            assert_eq!(draft.raw_after_resource, object.raw_after_resource);
+            assert_eq!(draft.identity_or_clan_raw, object.identity_or_clan_raw);
+        }
+
         assert_eq!(
-            loaded_mission_document(&engine)
-                .expect("mission document")
+            mission
                 .clans
                 .iter()
                 .map(|clan| clan.anchor)
