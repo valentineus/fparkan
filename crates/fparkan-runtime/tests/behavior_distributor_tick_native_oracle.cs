@@ -5,9 +5,10 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 
-// Calls the original x86 Behavior.dll distributor Add, normalize, and tick paths
-// against synthetic storage. Only GetSystemArealMap and the bounded vector backing
-// are substituted; Behavior's corresponding instructions remain the installed DLL.
+// Calls the original x86 Behavior.dll distributor Add, normalize, indexed resource
+// property, and tick paths against synthetic storage. Only GetSystemArealMap and the
+// bounded vector backing are substituted; Behavior's corresponding instructions
+// remain the installed DLL.
 internal static class BehaviorDistributorTickOracle {
     private const uint LoadWithAlteredSearchPath = 0x00000008;
     private const uint MemCommitReserve = 0x00003000;
@@ -18,6 +19,9 @@ internal static class BehaviorDistributorTickOracle {
     private const int TickRva = 0x19e80;
     private const int AddObjectRva = 0x1aac0;
     private const int NormalizeRva = 0x1ac90;
+    private const int IndexedPropertySetRva = 0x0b470;
+    private const int IndexedPropertyGetRva = 0x0b5b0;
+    private const int OreInitializationRva = 0x08790;
     private const int GetSystemArealMapIatRva = 0x59008;
     private const uint ResourceProperty = 0x02000100;
     private static Fixture active;
@@ -45,6 +49,9 @@ internal static class BehaviorDistributorTickOracle {
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void ObjectSetProperty(IntPtr self, uint property, float value, IntPtr result);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int InterfaceGetProperty(IntPtr self, uint selector, IntPtr result);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int InterfaceSetProperty(IntPtr self, uint selector, IntPtr value);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void IndexedPropertySet(IntPtr self, uint index, uint valueBits);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int IndexedPropertyGet(IntPtr self, uint index, IntPtr resultBits);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeOreInitialization(IntPtr self);
 
     private static readonly AreaMapGetter AreaMapGetterCallback = GetAreaMap;
     private static readonly VectorInsert VectorInsertCallback = InsertVector;
@@ -158,7 +165,7 @@ internal static class BehaviorDistributorTickOracle {
                 Marshal.WriteInt32(entry, 0x04, BitConverter.ToInt32(BitConverter.GetBytes(1.0f), 0));
             }
         }
-        private IntPtr Allocate(int size) {
+        public IntPtr Allocate(int size) {
             IntPtr value = Marshal.AllocHGlobal(size);
             Zero(value, size);
             Allocations.Add(value);
@@ -365,6 +372,8 @@ internal static class BehaviorDistributorTickOracle {
             SetX87ControlWord(savedControlWord);
             Console.WriteLine("x87-control-word-restored=0x" + CurrentX87ControlWord().ToString("x4"));
         }
+        RunNativeIndexedPropertyCases(module);
+        RunNativeOreInitializationCases(module);
         TickDelegate tick = (TickDelegate)Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, TickRva), typeof(TickDelegate));
         using (Fixture empty = NewFixture()) {
             empty.MakeDistributor(); active = empty; tick(empty.Distributor, 0.0f);
@@ -385,6 +394,117 @@ internal static class BehaviorDistributorTickOracle {
         RunMixedPowerCase(tick, "mixed-power-recipient-reserve", 4.0f, 8.0f, 0.5f, 0.75f);
         RunMissingCase(tick);
         RunSkippedCase(tick);
+    }
+
+    private static void RunNativeIndexedPropertyCases(IntPtr module) {
+        IndexedPropertySet set = (IndexedPropertySet)Marshal.GetDelegateForFunctionPointer(
+            IntPtr.Add(module, IndexedPropertySetRva), typeof(IndexedPropertySet));
+        IndexedPropertyGet get = (IndexedPropertyGet)Marshal.GetDelegateForFunctionPointer(
+            IntPtr.Add(module, IndexedPropertyGetRva), typeof(IndexedPropertyGet));
+        using (Fixture fixture = NewFixture()) {
+            // The handlers receive the embedded interface at owner+4. Its descriptor
+            // vector is at interface+0xa3c and its keyed property store at interface+0x5e4.
+            IntPtr owner = fixture.Allocate(0x0b20);
+            IntPtr iface = IntPtr.Add(owner, 4);
+            IntPtr descriptors = fixture.Allocate(6 * 0x18);
+            IntPtr propertyEntry = fixture.Allocate(0x18);
+            IntPtr maximumOutput = fixture.Allocate(sizeof(uint));
+            IntPtr currentOutput = fixture.Allocate(sizeof(uint));
+
+            Marshal.WriteInt32(iface, 0xa3c, 6);
+            Marshal.WriteIntPtr(iface, 0xa44, descriptors);
+            Marshal.WriteInt32(IntPtr.Add(descriptors, 4 * 0x18), 4, 4);
+            Marshal.WriteInt32(IntPtr.Add(descriptors, 5 * 0x18), 4, 5);
+
+            Marshal.WriteInt32(iface, 0x5e4, 0); // vector vtable is not used by these callbacks
+            Marshal.WriteInt32(iface, 0x5e8, 1); // count
+            Marshal.WriteInt32(iface, 0x5ec, 1); // capacity
+            Marshal.WriteIntPtr(iface, 0x5f0, propertyEntry);
+            Marshal.WriteInt32(propertyEntry, 0x00, unchecked((int)ResourceProperty));
+            Marshal.WriteInt32(propertyEntry, 0x04, unchecked((int)0x11223344));
+            Marshal.WriteInt32(propertyEntry, 0x08, FloatBits(2500.0f)); // auxiliary maximum
+            Marshal.WriteInt32(propertyEntry, 0x0c, unchecked((int)0x55667788));
+            Marshal.WriteInt32(propertyEntry, 0x10, unchecked((int)0x99aabbcc));
+            Marshal.WriteInt32(propertyEntry, 0x14, FloatBits(12.5f)); // primary current amount
+
+            Expect(get(iface, 4, maximumOutput) == 1 && Marshal.ReadInt32(maximumOutput) == FloatBits(2500.0f),
+                "descriptor 4 reads keyed auxiliary value as MaximumOre");
+            Expect(get(iface, 5, currentOutput) == 1 && Marshal.ReadInt32(currentOutput) == FloatBits(12.5f),
+                "descriptor 5 reads keyed primary float as CurrentOre");
+
+            set(iface, 5, unchecked((uint)FloatBits(21.75f)));
+            Expect(Marshal.ReadInt32(propertyEntry, 0x14) == FloatBits(21.75f) &&
+                Marshal.ReadInt32(propertyEntry, 0x08) == FloatBits(2500.0f),
+                "descriptor 5 updates CurrentOre and preserves MaximumOre auxiliary value");
+            set(iface, 4, unchecked((uint)FloatBits(999.0f)));
+            Expect(Marshal.ReadInt32(propertyEntry, 0x14) == FloatBits(21.75f) &&
+                Marshal.ReadInt32(propertyEntry, 0x08) == FloatBits(2500.0f),
+                "descriptor 4 is read-only through the indexed setter");
+            Expect(get(iface, 4, maximumOutput) == 1 && Marshal.ReadInt32(maximumOutput) == FloatBits(2500.0f) &&
+                get(iface, 5, currentOutput) == 1 && Marshal.ReadInt32(currentOutput) == FloatBits(21.75f),
+                "indexed resource values remain independently readable after CurrentOre write");
+
+            IntPtr reorderedDescriptors = fixture.Allocate(2 * 0x18);
+            Marshal.WriteInt32(iface, 0xa3c, 2);
+            Marshal.WriteIntPtr(iface, 0xa44, reorderedDescriptors);
+            Marshal.WriteInt32(reorderedDescriptors, 4, 5);
+            Marshal.WriteInt32(IntPtr.Add(reorderedDescriptors, 0x18), 4, 4);
+            Expect(get(iface, 0, currentOutput) == 1 && Marshal.ReadInt32(currentOutput) == FloatBits(21.75f),
+                "descriptor index zero follows its CurrentOre code 5 row");
+            Expect(get(iface, 1, maximumOutput) == 1 && Marshal.ReadInt32(maximumOutput) == FloatBits(2500.0f),
+                "descriptor index one follows its MaximumOre code 4 row");
+            set(iface, 0, unchecked((uint)FloatBits(31.25f)));
+            set(iface, 1, unchecked((uint)FloatBits(999.0f)));
+            Expect(Marshal.ReadInt32(propertyEntry, 0x14) == FloatBits(31.25f) &&
+                Marshal.ReadInt32(propertyEntry, 0x08) == FloatBits(2500.0f),
+                "reordered descriptor rows preserve CurrentOre write and MaximumOre read-only behavior");
+            Expect(get(iface, 0, currentOutput) == 1 && Marshal.ReadInt32(currentOutput) == FloatBits(31.25f) &&
+                get(iface, 1, maximumOutput) == 1 && Marshal.ReadInt32(maximumOutput) == FloatBits(2500.0f),
+                "reordered descriptor rows remain readable after their indexed writes");
+            Console.WriteLine("native-indexed-resource-property: maximum=" + Float(unchecked((uint)Marshal.ReadInt32(maximumOutput))) +
+                " current=" + Float(unchecked((uint)Marshal.ReadInt32(currentOutput))) +
+                "; descriptor4-write=no-op descriptor5-write=primary-only; reordered-indices=verified");
+        }
+    }
+
+    private static void RunNativeOreInitializationCases(IntPtr module) {
+        NativeOreInitialization initialize = (NativeOreInitialization)Marshal.GetDelegateForFunctionPointer(
+            IntPtr.Add(module, OreInitializationRva), typeof(NativeOreInitialization));
+        uint[][] cases = new uint[][] {
+            new uint[] { 0x80000004, 0x00000000, 0x43fa0000 },
+            new uint[] { 0x80000008, 0x00000000, 0x457a0000 },
+            new uint[] { 0x01002000, 0x00000000, 0x44fa0000 },
+            new uint[] { 0x01004000, 0x44fa0000, 0x44fa0000 },
+            new uint[] { 0x01008000, 0x00000000, 0x00000000 }
+        };
+        IntPtr vtable = IntPtr.Add(module, 0x59250);
+        foreach (uint[] test in cases) {
+            using (Fixture fixture = NewFixture()) {
+                IntPtr owner = fixture.Allocate(0x0b20);
+                IntPtr propertyEntry = fixture.Allocate(0x18);
+                Marshal.WriteIntPtr(owner, vtable);
+                Marshal.WriteIntPtr(owner, 0x30, owner);
+                Marshal.WriteInt32(owner, 0xa04, 2);
+                Marshal.WriteInt32(owner, 0xa64, 1); // suppress the wrapper's deferred side effect
+                Marshal.WriteInt32(owner, 0xafc, unchecked((int)test[0]));
+                Marshal.WriteInt32(owner, 0x70c, FloatBits(500.0f));
+                Marshal.WriteInt32(owner, 0x710, FloatBits(4000.0f));
+                Marshal.WriteInt32(owner, 0x720, FloatBits(2000.0f));
+                Marshal.WriteInt32(propertyEntry, 0x00, unchecked((int)ResourceProperty));
+                Marshal.WriteInt32(propertyEntry, 0x08, unchecked((int)0xbf800000)); // native add default auxiliary
+                Marshal.WriteInt32(propertyEntry, 0x14, FloatBits(123.0f)); // prove initialization overwrites primary
+                Marshal.WriteInt32(owner, 0x5ec, 1); // property count
+                Marshal.WriteInt32(owner, 0x5f0, 1); // property capacity
+                Marshal.WriteIntPtr(owner, 0x5f4, propertyEntry);
+
+                initialize(owner);
+
+                Expect(unchecked((uint)Marshal.ReadInt32(propertyEntry, 0x14)) == test[1] &&
+                    unchecked((uint)Marshal.ReadInt32(propertyEntry, 0x08)) == test[2],
+                    "native ore defaults for class 0x" + test[0].ToString("x8"));
+            }
+        }
+        Console.WriteLine("native-behavior-ore-initialization: classes=80000004,80000008,01002000,01004000,01008000; defaults=verified");
     }
 
     private static ushort CurrentX87ControlWord() {

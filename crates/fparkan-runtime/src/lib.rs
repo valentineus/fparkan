@@ -134,6 +134,21 @@ pub struct BehaviorRegisteredObject {
     pub native_tail: [u32; 5],
 }
 
+/// Native `CurrentOre`/`MaximumOre` state for one full Unit DAT mission object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BehaviorOreState {
+    /// Stable identity from the source TMA object order.
+    pub original_id: OriginalObjectId,
+    /// Corresponding live Rust world object.
+    pub handle: ObjectHandle,
+    /// Class word recovered from the root Unit DAT header.
+    pub class_flags: u32,
+    /// Raw bits of the `CurrentOre` float property.
+    pub current_ore_bits: u32,
+    /// Raw bits of the read-only `MaximumOre` float property.
+    pub maximum_ore_bits: u32,
+}
+
 /// Resource distributor state associated with one TMA clan's constructed AI.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BehaviorDistributorState {
@@ -464,6 +479,7 @@ struct LoadedMissionState {
     asset_plan: MissionAssetPlan,
     object_drafts: Vec<MissionObjectDraft>,
     behavior_distributors: Vec<BehaviorDistributorState>,
+    behavior_ore_states: Vec<BehaviorOreState>,
     script_bundles: Vec<MissionScriptBundle>,
     script_varset: Option<MissionScriptVarSet>,
     script_init_states: Vec<MissionScriptInitState>,
@@ -1045,6 +1061,24 @@ fn load_mission_with_options(
         Vec::new()
     };
 
+    let behavior_ore_states = if options.asset_scope == MissionAssetScope::Full {
+        // Property callbacks also run for Unit DAT objects that do not join a distributor.
+        object_drafts
+            .iter()
+            .zip(&handles)
+            .filter_map(|(draft, handle)| {
+                Some(initialize_behavior_ore_state(
+                    draft.original_id?,
+                    *handle,
+                    draft.unit_dat_header_flags?,
+                    &draft.properties,
+                ))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let mut next_behavior_rng_state = engine.behavior_rng_state;
     if options.asset_scope == MissionAssetScope::Full {
         let queue_time_ms = queue_time_ms.expect("full mission loading requires a queue time");
@@ -1120,6 +1154,7 @@ fn load_mission_with_options(
         asset_plan: mission_asset_plan,
         object_drafts,
         behavior_distributors,
+        behavior_ore_states,
         script_bundles: loaded_scripts.bundles,
         script_varset: loaded_scripts.varset,
         script_init_states: loaded_scripts.init_states,
@@ -1402,6 +1437,15 @@ pub fn loaded_mission_behavior_distributors(
         .map(|state| state.behavior_distributors.as_slice())
 }
 
+/// Returns native ore properties attached to full Unit DAT mission objects.
+#[must_use]
+pub fn loaded_mission_behavior_ore_states(engine: &Engine) -> Option<&[BehaviorOreState]> {
+    engine
+        .loaded
+        .as_ref()
+        .map(|state| state.behavior_ore_states.as_slice())
+}
+
 fn behavior_clan_for_selector(
     selector: u32,
     clan_count: usize,
@@ -1416,6 +1460,38 @@ fn behavior_clan_for_selector(
 
 fn has_behavior_registration_key(class_flags: u32) -> bool {
     class_flags & BEHAVIOR_REGISTRATION_KEY_FLAG != 0
+}
+
+fn native_behavior_ore_defaults(class_flags: u32) -> (u32, u32) {
+    match class_flags {
+        0x8000_0004 => (0, 0x43fa_0000),
+        0x8000_0008 => (0, 0x457a_0000),
+        0x0100_2000 => (0, 0x44fa_0000),
+        0x0100_4000 => (0x44fa_0000, 0x44fa_0000),
+        _ => (0, 0),
+    }
+}
+
+fn initialize_behavior_ore_state(
+    original_id: OriginalObjectId,
+    handle: ObjectHandle,
+    class_flags: u32,
+    properties: &[MissionObjectProperty],
+) -> BehaviorOreState {
+    let (mut current_ore_bits, maximum_ore_bits) = native_behavior_ore_defaults(class_flags);
+    if let Some(property) = properties
+        .iter()
+        .find(|property| property.name_raw.as_slice() == b"CurrentOre")
+    {
+        current_ore_bits = property.raw_value[1];
+    }
+    BehaviorOreState {
+        original_id,
+        handle,
+        class_flags,
+        current_ore_bits,
+        maximum_ore_bits,
+    }
 }
 
 fn add_behavior_registered_object(
@@ -2470,6 +2546,26 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, true), (1, true)]
         );
+        let ore_states = loaded_mission_behavior_ore_states(&engine).expect("Behavior ore state");
+        let unit_dat_drafts = drafts
+            .iter()
+            .filter(|draft| draft.unit_dat_header_flags.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(ore_states.len(), unit_dat_drafts.len());
+        assert_eq!(ore_states.len(), 8);
+        for state in ore_states {
+            let draft = unit_dat_drafts
+                .iter()
+                .find(|draft| draft.original_id == Some(state.original_id))
+                .expect("ore state has a Unit DAT source");
+            assert_eq!(
+                state.handle,
+                handle_by_original_id(&engine.world, state.original_id).unwrap()
+            );
+            assert_eq!(state.class_flags, draft.unit_dat_header_flags.unwrap());
+            assert_eq!(state.current_ore_bits, 0);
+            assert_eq!(state.maximum_ore_bits, 0);
+        }
         let registered = distributors
             .iter()
             .flat_map(|distributor| {
@@ -2538,6 +2634,15 @@ mod tests {
             ]
         );
         assert_eq!(registered.len(), 4);
+        assert!(ore_states.iter().any(|state| {
+            state.class_flags == 0x0100_8000
+                && !distributors.iter().any(|distributor| {
+                    distributor
+                        .registered_objects
+                        .iter()
+                        .any(|object| object.handle == state.handle)
+                })
+        }));
         for (_, object) in registered {
             assert_eq!(
                 handle_by_original_id(&engine.world, object.original_id),
@@ -2617,6 +2722,55 @@ mod tests {
             share,
             native_tail,
         }
+    }
+
+    #[test]
+    fn behavior_ore_initialization_uses_first_exact_current_value_and_read_only_maximum() {
+        let handle = ObjectHandle {
+            generation: 7,
+            slot: 19,
+        };
+        let state = initialize_behavior_ore_state(
+            OriginalObjectId(19),
+            handle,
+            0x0100_2000,
+            &[
+                MissionObjectProperty {
+                    name_raw: b"currentore".to_vec(),
+                    raw_value: [0x1111_1111, 0xdead_beef, 0, 0],
+                },
+                MissionObjectProperty {
+                    name_raw: b"CurrentOre".to_vec(),
+                    raw_value: [0x3f80_0000, 0x7fc1_2345, 0, 0],
+                },
+                MissionObjectProperty {
+                    name_raw: b"CurrentOre".to_vec(),
+                    raw_value: [0, 0x4400_0000, 0, 0],
+                },
+                MissionObjectProperty {
+                    name_raw: b"MaximumOre".to_vec(),
+                    raw_value: [0, 0x4123_4567, 0, 0],
+                },
+            ],
+        );
+
+        assert_eq!(state.original_id, OriginalObjectId(19));
+        assert_eq!(state.handle, handle);
+        assert_eq!(state.class_flags, 0x0100_2000);
+        assert_eq!(state.current_ore_bits, 0x7fc1_2345);
+        assert_eq!(state.maximum_ore_bits, 0x44fa_0000);
+    }
+
+    #[test]
+    fn behavior_ore_defaults_follow_native_class_dispatch() {
+        assert_eq!(native_behavior_ore_defaults(0x8000_0004), (0, 0x43fa_0000));
+        assert_eq!(native_behavior_ore_defaults(0x8000_0008), (0, 0x457a_0000));
+        assert_eq!(native_behavior_ore_defaults(0x0100_2000), (0, 0x44fa_0000));
+        assert_eq!(
+            native_behavior_ore_defaults(0x0100_4000),
+            (0x44fa_0000, 0x44fa_0000)
+        );
+        assert_eq!(native_behavior_ore_defaults(0x0100_8000), (0, 0));
     }
 
     #[test]
@@ -2766,6 +2920,9 @@ mod tests {
         let bundles = loaded_mission_script_bundles(&engine).expect("script bundles");
         assert!(loaded_mission_behavior_distributors(&engine)
             .expect("preview Behavior distributors")
+            .is_empty());
+        assert!(loaded_mission_behavior_ore_states(&engine)
+            .expect("preview Behavior ore state")
             .is_empty());
         assert!(bundles
             .iter()
