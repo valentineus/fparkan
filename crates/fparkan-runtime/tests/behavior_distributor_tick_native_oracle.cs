@@ -5,10 +5,9 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 
-// Calls the original x86 Behavior.dll distributor Add, normalize, indexed resource
-// property, and tick paths against synthetic storage. Only GetSystemArealMap and the
-// bounded vector backing are substituted; Behavior's corresponding instructions
-// remain the installed DLL.
+// Calls selected original x86 Behavior.dll, ArealMap.dll, and Control.dll paths
+// against synthetic storage. Only host callbacks, GetSystemArealMap, and bounded
+// vector backing are substituted; the tested module instructions remain installed code.
 internal static class BehaviorDistributorTickOracle {
     private const uint LoadWithAlteredSearchPath = 0x00000008;
     private const uint MemCommitReserve = 0x00003000;
@@ -17,6 +16,7 @@ internal static class BehaviorDistributorTickOracle {
     private const uint PageReadWrite = 0x04;
     private const string ExpectedBehaviorSha256 = "ddfbdbde07832358fe6e35e01c8dba9b58e7313789498b6049ed51d4ed9baf99";
     private const string ExpectedControlSha256 = "bcb86318089028548a178b03a21accdce15df0cc85ddd91674cf3c2f55012c6e";
+    private const string ExpectedArealMapSha256 = "a25f9254ebb339d70e2e07c8121950191e9584ca0858d8e9c2e2b6c671edf6ea";
     private const int TickRva = 0x19e80;
     private const int AddObjectRva = 0x1aac0;
     private const int NormalizeRva = 0x1ac90;
@@ -27,6 +27,20 @@ internal static class BehaviorDistributorTickOracle {
     private const int ControlResourceDeviceGetterRva = 0x21d00;
     private const int ControlProviderInterfaceVtableRva = 0x3d254;
     private const int ControlProviderType1GetterRva = 0x0dc40;
+    private const int ArealMapUnitDatComponentBuilderRva = 0x14b90;
+    private const int ControlResourceDeviceConstructorRva = 0x22980;
+    private const int ControlResourceComponentOverrideRva = 0x2d890;
+    private const int ControlResourceCommonSetterRva = 0x21d50;
+    private const int ControlResourceTag9ConstructorRva = 0x25460;
+    private const int ControlResourceTag15ConstructorRva = 0x22ae0;
+    private const int ControlResourceTag25ConstructorRva = 0x20800;
+    private const int ControlResourceTag9VtableRva = 0x3c938;
+    private const int ControlResourceTag15VtableRva = 0x3c648;
+    private const int ControlResourceTag25VtableRva = 0x3c448;
+    private const int ControlResourceTag9StringPairRva = 0x25600;
+    private const int ControlResourceNoOpStringPairRva = 0x0bcd0;
+    private const int ControlResourceTag19VtableRva = 0x3c608;
+    private const int ControlResourceTag19StringPairNoOpRva = 0x0bcd0;
     private const uint ResourceProperty = 0x02000100;
     private static Fixture active;
 
@@ -57,6 +71,10 @@ internal static class BehaviorDistributorTickOracle {
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int IndexedPropertyGet(IntPtr self, uint index, IntPtr resultBits);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeOreInitialization(IntPtr self);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate float NativeControlResourceDeviceGet(IntPtr self, uint selector);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void NativeFastcallComponentBuilder(IntPtr owner, IntPtr node, uint parentId);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int NativeArealMapEvent(IntPtr owner, uint message, uint subcode, IntPtr descriptor);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate IntPtr NativeControlResourceDeviceConstructor(IntPtr self);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate IntPtr NativeControlResourceComponentOverride(IntPtr self, int deviceIndex, IntPtr typedRecord);
 
     private static readonly AreaMapGetter AreaMapGetterCallback = GetAreaMap;
     private static readonly VectorInsert VectorInsertCallback = InsertVector;
@@ -69,6 +87,8 @@ internal static class BehaviorDistributorTickOracle {
     private static readonly ObjectSetProperty ObjectSetPropertyCallback = SetProperty;
     private static readonly InterfaceGetProperty InterfaceGetCallback = GetInterfaceProperty;
     private static readonly InterfaceSetProperty InterfaceSetCallback = SetInterfaceProperty;
+    private static readonly NativeArealMapEvent ArealMapEventCallback = OnArealMapEvent;
+    private static ArealMapFixture activeArealMap;
     private static IntPtr fastcallThunks;
     private static IntPtr queryObjectThunk;
     private static IntPtr getInterfacePropertyThunk;
@@ -183,7 +203,77 @@ internal static class BehaviorDistributorTickOracle {
         }
     }
 
+    private sealed class ComponentNode {
+        public readonly string ArchiveName;
+        public readonly string ResourceName;
+        public readonly uint Kind;
+        public readonly uint LocalIndex;
+        public readonly ComponentNode[] Children;
+        public ComponentNode(string archiveName, string resourceName, uint kind, uint localIndex, params ComponentNode[] children) {
+            ArchiveName = archiveName;
+            ResourceName = resourceName;
+            Kind = kind;
+            LocalIndex = localIndex;
+            Children = children ?? new ComponentNode[0];
+        }
+    }
+
+    private sealed class CapturedComponentDescriptor {
+        public string ArchiveName;
+        public string ResourceName;
+        public uint ParentId;
+        public uint LocalIndex;
+        public uint AssignedIdBeforeCallback;
+        public uint AssignedId;
+        public uint Message;
+        public uint Subcode;
+    }
+
+    private sealed class ArealMapFixture : IDisposable {
+        public IntPtr Owner;
+        public IntPtr OwnerVtable;
+        public readonly List<IntPtr> Allocations = new List<IntPtr>();
+        public readonly List<CapturedComponentDescriptor> Descriptors = new List<CapturedComponentDescriptor>();
+        public readonly uint[] AssignedIds = new uint[] { 41, 113, 127, 179 };
+        public string CallbackError;
+        public IntPtr Allocate(int size) {
+            IntPtr value = Marshal.AllocHGlobal(size);
+            Zero(value, size);
+            Allocations.Add(value);
+            return value;
+        }
+        public void Dispose() {
+            activeArealMap = null;
+            for (int i = Allocations.Count - 1; i >= 0; i--) Marshal.FreeHGlobal(Allocations[i]);
+            Allocations.Clear();
+        }
+    }
+
     private static IntPtr GetAreaMap() { return active.Manager; }
+    private static int OnArealMapEvent(IntPtr owner, uint message, uint subcode, IntPtr descriptor) {
+        ArealMapFixture fixture = activeArealMap;
+        if (fixture == null) return 0;
+        if (owner != fixture.Owner) fixture.CallbackError = "ArealMap callback received an unexpected owner";
+        if (descriptor == IntPtr.Zero) {
+            fixture.CallbackError = "ArealMap callback received a null descriptor";
+            return 0;
+        }
+        int ordinal = fixture.Descriptors.Count;
+        uint assignedId = ordinal < fixture.AssignedIds.Length ? fixture.AssignedIds[ordinal] : 0xfffffff0u;
+        CapturedComponentDescriptor captured = new CapturedComponentDescriptor();
+        captured.ArchiveName = Marshal.PtrToStringAnsi(descriptor);
+        captured.ResourceName = Marshal.PtrToStringAnsi(IntPtr.Add(descriptor, 0x20));
+        captured.ParentId = unchecked((uint)Marshal.ReadInt32(descriptor, 0x40));
+        captured.LocalIndex = unchecked((uint)Marshal.ReadInt32(descriptor, 0x44));
+        captured.AssignedIdBeforeCallback = unchecked((uint)Marshal.ReadInt32(descriptor, 0x48));
+        captured.AssignedId = assignedId;
+        captured.Message = message;
+        captured.Subcode = subcode;
+        fixture.Descriptors.Add(captured);
+        Marshal.WriteInt32(descriptor, 0x48, unchecked((int)assignedId));
+        return 1;
+    }
+
     private static void InsertVector(IntPtr self, IntPtr source, uint count, uint position) {
         int length = Marshal.ReadInt32(self, 4);
         int capacity = Marshal.ReadInt32(self, 8);
@@ -311,11 +401,40 @@ internal static class BehaviorDistributorTickOracle {
 
     private static int Main() {
         if (IntPtr.Size != 4) { Console.Error.WriteLine("Build with /platform:x86."); return 2; }
+        return RunWithIsolatedWorkingDirectory();
+    }
+
+    private static int RunWithIsolatedWorkingDirectory() {
+        string originalDirectory = Environment.CurrentDirectory;
+        string tempRoot = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        string workDirectory = Path.Combine(tempRoot, "fparkan-native-oracle-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(workDirectory);
+        try {
+            // ArealMap.dll runs its attach initializer on load; keep any relative log output out of the workspace and game directory.
+            Environment.CurrentDirectory = workDirectory;
+            return RunOracle();
+        } finally {
+            Environment.CurrentDirectory = originalDirectory;
+            string fullWorkDirectory = Path.GetFullPath(workDirectory);
+            if (!String.Equals(fullWorkDirectory, workDirectory, StringComparison.OrdinalIgnoreCase) ||
+                !String.Equals(Path.GetDirectoryName(fullWorkDirectory), tempRoot, StringComparison.OrdinalIgnoreCase) ||
+                !Path.GetFileName(fullWorkDirectory).StartsWith("fparkan-native-oracle-", StringComparison.Ordinal))
+                throw new InvalidOperationException("refusing to remove an unexpected native oracle working directory");
+            if (Directory.Exists(fullWorkDirectory)) Directory.Delete(fullWorkDirectory, true);
+        }
+    }
+
+    private static int RunOracle() {
         string controlPath = Environment.GetEnvironmentVariable("FPARKAN_ORIGINAL_CONTROL_DLL");
         if (String.IsNullOrEmpty(controlPath)) controlPath = @"C:\GOG Games\Parkan - Iron Strategy\Control.dll";
         if (!File.Exists(controlPath)) { Console.Error.WriteLine("Set FPARKAN_ORIGINAL_CONTROL_DLL to the installed Control.dll."); return 7; }
         string controlHash = Hash(controlPath);
         if (controlHash != ExpectedControlSha256) { Console.Error.WriteLine("Unexpected Control.dll SHA-256: " + controlHash); return 8; }
+        string arealMapPath = Environment.GetEnvironmentVariable("FPARKAN_ORIGINAL_AREALMAP_DLL");
+        if (String.IsNullOrEmpty(arealMapPath)) arealMapPath = @"C:\GOG Games\Parkan - Iron Strategy\ArealMap.dll";
+        if (!File.Exists(arealMapPath)) { Console.Error.WriteLine("Set FPARKAN_ORIGINAL_AREALMAP_DLL to the installed ArealMap.dll."); return 10; }
+        string arealMapHash = Hash(arealMapPath);
+        if (arealMapHash != ExpectedArealMapSha256) { Console.Error.WriteLine("Unexpected ArealMap.dll SHA-256: " + arealMapHash); return 11; }
         IntPtr controlModule = LoadLibraryEx(controlPath, IntPtr.Zero, LoadWithAlteredSearchPath);
         if (controlModule == IntPtr.Zero) { Console.Error.WriteLine("LoadLibraryEx(Control.dll) failed: " + Marshal.GetLastWin32Error()); return 9; }
         string path = Environment.GetEnvironmentVariable("FPARKAN_ORIGINAL_BEHAVIOR_DLL");
@@ -325,6 +444,11 @@ internal static class BehaviorDistributorTickOracle {
         if (hash != ExpectedBehaviorSha256) { Console.Error.WriteLine("Unexpected Behavior.dll SHA-256: " + hash); FreeLibrary(controlModule); return 4; }
         IntPtr module = LoadLibraryEx(path, IntPtr.Zero, LoadWithAlteredSearchPath);
         if (module == IntPtr.Zero) { Console.Error.WriteLine("LoadLibraryEx(Behavior.dll) failed: " + Marshal.GetLastWin32Error()); FreeLibrary(controlModule); return 5; }
+        IntPtr arealMapModule = LoadLibraryEx(arealMapPath, IntPtr.Zero, LoadWithAlteredSearchPath);
+        if (arealMapModule == IntPtr.Zero) {
+            Console.Error.WriteLine("LoadLibraryEx(ArealMap.dll) failed: " + Marshal.GetLastWin32Error());
+            FreeLibrary(module); FreeLibrary(controlModule); return 12;
+        }
         IntPtr import = IntPtr.Add(module, GetSystemArealMapIatRva);
         IntPtr originalImport = Marshal.ReadIntPtr(import);
         uint oldProtection = 0;
@@ -346,8 +470,8 @@ internal static class BehaviorDistributorTickOracle {
                 throw new InvalidOperationException("VirtualProtect(GetSystemArealMap IAT) failed: " + Marshal.GetLastWin32Error());
             protectionChanged = true;
             Marshal.WriteIntPtr(import, Marshal.GetFunctionPointerForDelegate(AreaMapGetterCallback));
-            RunSmokeCases(module, controlModule);
-            Console.WriteLine("original Behavior.dll distributor oracle passed (native Add 0x1aac0, normalize 0x1ac90, tick 0x19e80; only GetSystemArealMap IAT and bounded vector insertion are substituted; this does not compare Rust parity).");
+            RunSmokeCases(module, controlModule, arealMapModule);
+            Console.WriteLine("original native Behavior/ArealMap/Control oracle passed (Behavior Add 0x1aac0, normalize 0x1ac90, tick 0x19e80; ArealMap UnitDAT projection 0x14b90; Control INTO override 0x2d890; only synthetic host callbacks, GetSystemArealMap IAT, and bounded vector insertion are substituted; this does not compare Rust parity).");
             return 0;
         }
         catch (Exception error) {
@@ -365,15 +489,17 @@ internal static class BehaviorDistributorTickOracle {
             GC.KeepAlive(ObjectQueryCallback); GC.KeepAlive(ObjectRateCallback);
             GC.KeepAlive(ObjectGetPropertyCallback); GC.KeepAlive(ObjectSetPropertyCallback);
             GC.KeepAlive(InterfaceGetCallback); GC.KeepAlive(InterfaceSetCallback);
+            GC.KeepAlive(ArealMapEventCallback);
             if (thunksAllocated && !VirtualFree(fastcallThunks, UIntPtr.Zero, MemRelease))
                 throw new InvalidOperationException("VirtualFree(fastcall callback thunks) failed: " + Marshal.GetLastWin32Error());
             if (x87ControlWordCell != IntPtr.Zero) { Marshal.FreeHGlobal(x87ControlWordCell); x87ControlWordCell = IntPtr.Zero; }
+            FreeLibrary(arealMapModule);
             FreeLibrary(module);
             FreeLibrary(controlModule);
         }
     }
 
-    private static void RunSmokeCases(IntPtr module, IntPtr controlModule) {
+    private static void RunSmokeCases(IntPtr module, IntPtr controlModule, IntPtr arealMapModule) {
         ushort savedControlWord = CurrentX87ControlWord();
         Console.WriteLine("x87-control-word-before=0x" + savedControlWord.ToString("x4") + " (x86 oracle process)");
         try {
@@ -381,6 +507,8 @@ internal static class BehaviorDistributorTickOracle {
             Console.WriteLine("native-add-normalize-x87-control-word=0x" + CurrentX87ControlWord().ToString("x4"));
             RunNativeAddCases(module);
             RunNativeNormalizeCases(module);
+            RunNativeArealMapComponentBuilderCase(arealMapModule);
+            RunNativeControlIntoOverrideCase(controlModule);
             RunNativeControlResourceDeviceCase(controlModule);
         } finally {
             SetX87ControlWord(savedControlWord);
@@ -459,6 +587,150 @@ internal static class BehaviorDistributorTickOracle {
             Marshal.FreeHGlobal(providerRows);
             Marshal.FreeHGlobal(providerOwner);
         }
+    }
+
+    private static void RunNativeArealMapComponentBuilderCase(IntPtr module) {
+        using (ArealMapFixture fixture = new ArealMapFixture()) {
+            fixture.OwnerVtable = fixture.Allocate(0x40);
+            fixture.Owner = fixture.Allocate(4);
+            Marshal.WriteIntPtr(fixture.Owner, 0, fixture.OwnerVtable);
+            Marshal.WriteIntPtr(fixture.OwnerVtable, 0x34, Marshal.GetFunctionPointerForDelegate(ArealMapEventCallback));
+
+            ComponentNode tree = new ComponentNode("objects.rlb", "i_pws_f_df", 1, 9,
+                new ComponentNode("objects.rlb", "nested-slot", 1, 5,
+                    new ComponentNode("objects.rlb", "nested-child", 1, 12)),
+                new ComponentNode("objects.rlb", "zero-kind-parent", 0, 77,
+                    new ComponentNode("objects.rlb", "skipped-descendant", 1, 88)),
+                new ComponentNode("objects.rlb", "later-sibling", 1, 3));
+            IntPtr rootNode = fixture.Allocate(0x78);
+            PopulateUnitDatNode(fixture, rootNode, tree);
+
+            NativeFastcallComponentBuilder build = (NativeFastcallComponentBuilder)Marshal.GetDelegateForFunctionPointer(
+                WriteStdCallToFastcallThunk(0x180, IntPtr.Add(module, ArealMapUnitDatComponentBuilderRva)),
+                typeof(NativeFastcallComponentBuilder));
+            activeArealMap = fixture;
+            build(fixture.Owner, rootNode, 0);
+
+            Expect(fixture.CallbackError == null, "ArealMap descriptor callback owner and pointer");
+            Expect(fixture.Descriptors.Count == 4, "raw kind zero skips its node and descendants while later siblings continue");
+            string[] expectedResources = new string[] { "i_pws_f_df", "nested-slot", "nested-child", "later-sibling" };
+            uint[] expectedParents = new uint[] { 0, 41, 113, 41 };
+            uint[] expectedIndices = new uint[] { 9, 5, 12, 3 };
+            uint[] expectedAssignedIds = new uint[] { 41, 113, 127, 179 };
+            for (int i = 0; i < fixture.Descriptors.Count; i++) {
+                CapturedComponentDescriptor descriptor = fixture.Descriptors[i];
+                Expect(descriptor.ArchiveName == "objects.rlb" && descriptor.ResourceName == expectedResources[i] &&
+                    descriptor.ParentId == expectedParents[i] && descriptor.LocalIndex == expectedIndices[i] &&
+                    descriptor.AssignedIdBeforeCallback == 0xffffffff && descriptor.AssignedId == expectedAssignedIds[i] &&
+                    descriptor.Message == 6 && descriptor.Subcode == 0x80000020,
+                    "ArealMap descriptor " + i + " fields and callback-assigned parent ID");
+            }
+            Console.WriteLine("native-arealmap-unitdat-components: events=" + fixture.Descriptors.Count + " archive=objects.rlb" +
+                " parentIds=[" + String.Join(",", Array.ConvertAll(fixture.Descriptors.ToArray(), d => d.ParentId.ToString())) +
+                "] localIndices=[" + String.Join(",", Array.ConvertAll(fixture.Descriptors.ToArray(), d => d.LocalIndex.ToString())) +
+                "]; kind0-subtree=skipped sparse-assigned-ids=propagated");
+            GC.KeepAlive(build);
+        }
+    }
+
+    private static void RunNativeControlIntoOverrideCase(IntPtr module) {
+        NativeControlResourceComponentOverride applyOverride = (NativeControlResourceComponentOverride)Marshal.GetDelegateForFunctionPointer(
+            IntPtr.Add(module, ControlResourceComponentOverrideRva), typeof(NativeControlResourceComponentOverride));
+        RunNativeControlOverrideReceiverCase(module, 19, 0x94, ControlResourceDeviceConstructorRva,
+            ControlResourceTag19VtableRva, ControlResourceTag19StringPairNoOpRva, applyOverride);
+        RunNativeControlOverrideReceiverCase(module, 9, 0x120, ControlResourceTag9ConstructorRva,
+            ControlResourceTag9VtableRva, ControlResourceTag9StringPairRva, applyOverride);
+        RunNativeControlOverrideReceiverCase(module, 15, 0x98, ControlResourceTag15ConstructorRva,
+            ControlResourceTag15VtableRva, ControlResourceNoOpStringPairRva, applyOverride);
+        RunNativeControlOverrideReceiverCase(module, 25, 0xa4, ControlResourceTag25ConstructorRva,
+            ControlResourceTag25VtableRva, ControlResourceNoOpStringPairRva, applyOverride);
+        GC.KeepAlive(applyOverride);
+    }
+
+    private static void RunNativeControlOverrideReceiverCase(IntPtr module, int tag, int objectSize,
+        int constructorRva, int vtableRva, int stringPairRva,
+        NativeControlResourceComponentOverride applyOverride) {
+        NativeControlResourceDeviceConstructor construct = (NativeControlResourceDeviceConstructor)Marshal.GetDelegateForFunctionPointer(
+            IntPtr.Add(module, constructorRva), typeof(NativeControlResourceDeviceConstructor));
+        IntPtr expectedVtable = IntPtr.Add(module, vtableRva);
+        Expect(Marshal.ReadIntPtr(expectedVtable, 0x1c) == IntPtr.Add(module, ControlResourceCommonSetterRva),
+            "tag-" + tag + " vtable common setter slot resolves to native RVA 0x21d50");
+        Expect(Marshal.ReadIntPtr(expectedVtable, 0x24) == IntPtr.Add(module, stringPairRva),
+            "tag-" + tag + " vtable string-pair slot matches its native callback");
+        using (Fixture fixture = NewFixture()) {
+            IntPtr owner = fixture.Allocate(0x5c4);
+            IntPtr deviceArray = fixture.Allocate(IntPtr.Size);
+            IntPtr targetDevice = fixture.Allocate(objectSize);
+            IntPtr typedRecord = fixture.Allocate(0xb4);
+            Expect(construct(targetDevice) == targetDevice,
+                "native tag-" + tag + " constructor returns its exact-size device object");
+            Marshal.WriteIntPtr(deviceArray, 0, targetDevice);
+            Marshal.WriteIntPtr(owner, 0x5bc, deviceArray);
+            Marshal.WriteInt32(owner, 0x5c0, 1);
+
+            Marshal.WriteInt32(targetDevice, 0x04, unchecked((int)0x22222222));
+            Marshal.WriteInt32(targetDevice, 0x08, unchecked((int)0x12345678)); // component ID
+            Marshal.WriteInt32(targetDevice, 0x4c, unchecked((int)0x40200000)); // multiplier 2.5
+            for (int i = 0; i < 16; i++) {
+                Marshal.WriteInt32(targetDevice, 0x54 + i * 4, unchecked((int)(0xb2000000u + (uint)i)));
+                Marshal.WriteInt32(typedRecord, 0x2c + i * 4, unchecked((int)(0xc3000000u + (uint)i)));
+            }
+            Marshal.WriteInt32(typedRecord, 0x00, 19);
+            Marshal.WriteInt32(typedRecord, 0x04, unchecked((int)0x77777777)); // differs from the existing device key
+            Marshal.WriteInt32(typedRecord, 0x18, -1); // preserve the current class field
+            Marshal.WriteInt32(typedRecord, 0xac, 0); // no map rows or auxiliary string tail
+            if (tag == 9) {
+                // This synthetic receiver has no FX host and the descriptor has no map rows.
+                Marshal.WriteIntPtr(targetDevice, 0x3c, IntPtr.Zero);
+            }
+            int priorWord50 = Marshal.ReadInt32(targetDevice, 0x50);
+
+            IntPtr result = applyOverride(owner, 0, typedRecord);
+            Expect(result == IntPtr.Add(typedRecord, 0xb4),
+                "Control indexed override completes one tag-" + tag + " typed record");
+            Expect(Marshal.ReadInt32(owner, 0x5c0) == 1 && Marshal.ReadIntPtr(owner, 0x5bc) == deviceArray &&
+                Marshal.ReadIntPtr(deviceArray, 0) == targetDevice,
+                "Control INTO override keeps the existing tag-" + tag + " device slot and count");
+            Expect(Marshal.ReadIntPtr(targetDevice, 0) == expectedVtable &&
+                unchecked((uint)Marshal.ReadInt32(targetDevice, 0x04)) == 0x22222222 &&
+                unchecked((uint)Marshal.ReadInt32(targetDevice, 0x08)) == 0x12345678 &&
+                unchecked((uint)Marshal.ReadInt32(targetDevice, 0x4c)) == 0x40200000 &&
+                Marshal.ReadInt32(targetDevice, 0x50) == priorWord50 &&
+                Marshal.ReadIntPtr(targetDevice, 0x48) == typedRecord,
+                "selected tag-" + tag + " device retains class, existing key, component ID, multiplier, word +0x50, and records the replacement descriptor");
+            if (tag == 9)
+                Expect(Marshal.ReadIntPtr(targetDevice, 0x3c) == IntPtr.Zero,
+                    "tag-9 string callback runs with no FX host on the synthetic receiver");
+            for (int i = 0; i < 16; i++) {
+                Expect(unchecked((uint)Marshal.ReadInt32(targetDevice, 0x54 + i * 4)) == 0xc3000000u + (uint)i,
+                    "Control replaces selected tag-" + tag + " device coefficient " + i);
+            }
+            Console.WriteLine("native-control-tag" + tag + "-into-override: size=0x" + objectSize.ToString("x") +
+                " index=0 count=1 key=22222222 component=12345678 multiplier=" +
+                Float(unchecked((uint)Marshal.ReadInt32(targetDevice, 0x4c))) +
+                " original-class=preserved descriptor=attached coefficients=replaced");
+            GC.KeepAlive(construct);
+        }
+    }
+
+    private static void PopulateUnitDatNode(ArealMapFixture fixture, IntPtr destination, ComponentNode node) {
+        Zero(destination, 0x78);
+        Marshal.WriteInt32(destination, 0x04, node.Children.Length);
+        Marshal.WriteInt32(destination, 0x4c, unchecked((int)node.Kind));
+        Marshal.WriteInt32(destination, 0x50, unchecked((int)node.LocalIndex));
+        WriteFixedAnsi(destination, 0x0c, node.ArchiveName, 0x20);
+        WriteFixedAnsi(destination, 0x2c, node.ResourceName, 0x20);
+        if (node.Children.Length == 0) return;
+        IntPtr children = fixture.Allocate(node.Children.Length * 0x78);
+        Marshal.WriteIntPtr(destination, 0x08, children);
+        for (int i = 0; i < node.Children.Length; i++)
+            PopulateUnitDatNode(fixture, IntPtr.Add(children, i * 0x78), node.Children[i]);
+    }
+
+    private static void WriteFixedAnsi(IntPtr destination, int offset, string value, int capacity) {
+        byte[] bytes = Encoding.ASCII.GetBytes(value + "\0");
+        if (bytes.Length > capacity) throw new InvalidOperationException("synthetic UnitDAT string exceeds native field");
+        Marshal.Copy(bytes, 0, IntPtr.Add(destination, offset), bytes.Length);
     }
 
     private static void ExpectControlResourceDeviceResult(
@@ -962,6 +1234,15 @@ internal static class BehaviorDistributorTickOracle {
         byte[] code = { 0xff, 0x74, 0x24, 0x0c, 0xff, 0x74, 0x24, 0x0c, 0xff, 0x74, 0x24, 0x0c,
             0x51, 0xb8, 0, 0, 0, 0, 0xff, 0xd0, 0xc2, 0x0c, 0x00 };
         WriteImm32(code, 14, stdcallTarget.ToInt32());
+        IntPtr thunk = IntPtr.Add(fastcallThunks, offset);
+        Marshal.Copy(code, 0, thunk, code.Length);
+        return thunk;
+    }
+    private static IntPtr WriteStdCallToFastcallThunk(int offset, IntPtr fastcallTarget) {
+        // Adapt stdcall(owner, node, parent ID) to the native __fastcall entry.
+        byte[] code = { 0x8b, 0x4c, 0x24, 0x04, 0x8b, 0x54, 0x24, 0x08, 0xff, 0x74, 0x24, 0x0c,
+            0xb8, 0, 0, 0, 0, 0xff, 0xd0, 0xc2, 0x0c, 0x00 };
+        WriteImm32(code, 13, fastcallTarget.ToInt32());
         IntPtr thunk = IntPtr.Add(fastcallThunks, offset);
         Marshal.Copy(code, 0, thunk, code.Length);
         return thunk;

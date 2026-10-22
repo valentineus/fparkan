@@ -6,15 +6,17 @@ use fparkan_assets::{
     derive_mission_land_paths, extend_graph_report_with_visual_dependencies,
     mission_script_bundle_bases, prepare_terrain_world, AssetError as AssetPreparationError,
     AssetId, AssetManager, BuildCategory, MissionAssetPlan, MissionDocument, MissionError,
-    MissionTerrainPaths, NresError, PreparedVisual, TerrainFormatError, TerrainPreparationError,
+    MissionTerrainPaths, NresError, PreparedComponentControl, PreparedControlEffectSection,
+    PreparedControlTypedRecord, PreparedVisual, TerrainFormatError, TerrainPreparationError,
     TerrainWorld, TmaProfile,
 };
 use fparkan_path::{normalize_relative, NormalizedPath, PathError, PathPolicy};
 use fparkan_prototype::{
-    build_prototype_graph_report, PrototypeGraph, PrototypeGraphFailure, PrototypeGraphReport,
-    UnitComponentRecord, UNIT_DAT_BAS_PLACEMENT_FLAG,
+    build_prototype_graph_report, unit_component_tree, PrototypeGraph, PrototypeGraphFailure,
+    PrototypeGraphReport, UnitComponentRecord, UnitComponentTreeNode, PROTOTYPE_TYPE_EXTO,
+    UNIT_DAT_BAS_PLACEMENT_FLAG,
 };
-use fparkan_resource::{resource_name, CachedResourceRepository, ResourceRepository};
+use fparkan_resource::{resource_name, CachedResourceRepository, ResourceKey, ResourceRepository};
 use fparkan_script::{
     Handler19DwordWrite, Handler19InitInput, Handler19InitResolution, Handler19ResolveError,
     ScriptInstruction, ScriptPackage, VarSet, VarSetDefault, VmHostCallbackCommand,
@@ -149,6 +151,101 @@ pub struct BehaviorOreState {
     pub maximum_ore_bits: u32,
 }
 
+/// Origin of a Control descriptor retained in the effective table projection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ControlDeviceRecordProvenance {
+    /// Unit DAT component index that supplied the descriptor.
+    pub unit_component_index: usize,
+    /// Zero-based record index in that component's CTLD typed-record list.
+    pub typed_record_index: usize,
+    /// CTLD resource that supplied the descriptor.
+    pub source: ResourceKey,
+}
+
+/// Common fields known for one row in a host object's Control device table.
+///
+/// The row index is its position in the containing `Vec`. This stores the
+/// confirmed base fields and latest raw descriptor, not tag-specific callbacks.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EffectiveControlDevice {
+    /// Factory tag of the original device instance; INTO does not replace it.
+    pub factory_tag: u32,
+    /// Native component ID that first appended this row.
+    pub component_id: u32,
+    /// Current common key field. INTO preserves the receiver's key.
+    pub key: u32,
+    /// Sixteen raw DWORD coefficients copied by the common setter.
+    pub coefficient_bits: Option<[u32; 16]>,
+    /// Multiplier bits when the factory default is confirmed.
+    pub multiplier_bits: Option<u32>,
+    /// Current native word at `+0x50` when it is known.
+    pub native_word_50_bits: Option<u32>,
+    /// Current raw descriptor, including typed values and string bytes.
+    pub descriptor: PreparedControlTypedRecord,
+    /// Source location that created the original factory instance.
+    pub factory_provenance: ControlDeviceRecordProvenance,
+    /// Source location of the descriptor currently applied to the row.
+    pub descriptor_provenance: ControlDeviceRecordProvenance,
+}
+
+/// Why the base Control device table could not be projected for an object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MissionControlDeviceTableUnavailableReason {
+    /// The mission root has no decoded Unit DAT component tree.
+    NoUnitDatTree,
+    /// Unit DAT child counts do not form a valid preorder tree.
+    InvalidUnitComponentTree,
+    /// Prototype, visual, and component data are not aligned.
+    ComponentAlignmentMismatch,
+    /// No component explicitly references a Control resource.
+    NoControlResource,
+    /// An explicit Control resource could not be prepared.
+    ControlResourceUnavailable { unit_component_index: usize },
+    /// A Control resource belongs to a non-geometric prototype.
+    NonGeometricControlResource { unit_component_index: usize },
+    /// The parser stopped before the component's typed record list completed.
+    IncompleteTypedRecordList {
+        unit_component_index: usize,
+        first_unparsed_record: usize,
+    },
+    /// An INTO descriptor has no first typed record for its one native override call.
+    MissingOverrideRecord { unit_component_index: usize },
+    /// Native wrapping produced a non-sentinel index outside the current table.
+    OverrideIndexOutOfRange {
+        unit_component_index: usize,
+        target_index: u32,
+    },
+    /// The receiver tag does not have a verified common override method.
+    UnsupportedOverrideReceiver { factory_tag: u32 },
+    /// The EXTO key needs a global model-node mapping that is not available.
+    UnsupportedExToNodeMapping { unit_component_index: usize },
+    /// An unknown component kind prevents calculating EXTO global node offsets.
+    UnknownComponentKindForExTo {
+        unit_component_index: usize,
+        source_type: Option<u32>,
+    },
+}
+
+/// Availability of the confirmed common-field Control table projection.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MissionControlDeviceTableStatus {
+    /// Rows in native global-table order.
+    Available(Vec<EffectiveControlDevice>),
+    /// No complete table is exposed when required source state is unsupported.
+    Unavailable(MissionControlDeviceTableUnavailableReason),
+}
+
+/// Control device table projection attached to one loaded mission object.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MissionControlDeviceTableState {
+    /// Stable identity from the source TMA object order.
+    pub original_id: Option<OriginalObjectId>,
+    /// Corresponding live Rust world object.
+    pub handle: ObjectHandle,
+    /// Complete base projection, or an explicit unsupported boundary.
+    pub status: MissionControlDeviceTableStatus,
+}
+
 /// Resource distributor state associated with one TMA clan's constructed AI.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BehaviorDistributorState {
@@ -163,6 +260,8 @@ pub struct BehaviorDistributorState {
 
 const LAST_SUPER_AI_TABLE_INDEX: u32 = 63;
 const BEHAVIOR_REGISTRATION_KEY_FLAG: u32 = 0x8000_0000;
+#[cfg(test)]
+const PROTOTYPE_TYPE_INTO: u32 = u32::from_le_bytes(*b"INTO");
 
 /// Native terrain adjustment selected for a mission object's BAS geometry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -480,6 +579,7 @@ struct LoadedMissionState {
     object_drafts: Vec<MissionObjectDraft>,
     behavior_distributors: Vec<BehaviorDistributorState>,
     behavior_ore_states: Vec<BehaviorOreState>,
+    control_device_tables: Vec<MissionControlDeviceTableState>,
     script_bundles: Vec<MissionScriptBundle>,
     script_varset: Option<MissionScriptVarSet>,
     script_init_states: Vec<MissionScriptInitState>,
@@ -1079,6 +1179,35 @@ fn load_mission_with_options(
         Vec::new()
     };
 
+    let control_device_tables = if options.asset_scope == MissionAssetScope::Full {
+        object_drafts
+            .iter()
+            .zip(&handles)
+            .enumerate()
+            .map(
+                |(object_index, (draft, handle))| MissionControlDeviceTableState {
+                    original_id: draft.original_id,
+                    handle: *handle,
+                    status: build_control_device_table(
+                        object_index,
+                        draft,
+                        &mission_assets,
+                        prototype_graph
+                            .root_prototype_request_spans
+                            .get(object_index),
+                        &resolved_prototypes,
+                    )
+                    .map_or_else(
+                        MissionControlDeviceTableStatus::Unavailable,
+                        MissionControlDeviceTableStatus::Available,
+                    ),
+                },
+            )
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let mut next_behavior_rng_state = engine.behavior_rng_state;
     if options.asset_scope == MissionAssetScope::Full {
         let queue_time_ms = queue_time_ms.expect("full mission loading requires a queue time");
@@ -1155,6 +1284,7 @@ fn load_mission_with_options(
         object_drafts,
         behavior_distributors,
         behavior_ore_states,
+        control_device_tables,
         script_bundles: loaded_scripts.bundles,
         script_varset: loaded_scripts.varset,
         script_init_states: loaded_scripts.init_states,
@@ -1446,6 +1576,17 @@ pub fn loaded_mission_behavior_ore_states(engine: &Engine) -> Option<&[BehaviorO
         .map(|state| state.behavior_ore_states.as_slice())
 }
 
+/// Returns the base Control device table projections for loaded mission objects.
+#[must_use]
+pub fn loaded_mission_control_device_tables(
+    engine: &Engine,
+) -> Option<&[MissionControlDeviceTableState]> {
+    engine
+        .loaded
+        .as_ref()
+        .map(|state| state.control_device_tables.as_slice())
+}
+
 fn behavior_clan_for_selector(
     selector: u32,
     clan_count: usize,
@@ -1492,6 +1633,491 @@ fn initialize_behavior_ore_state(
         current_ore_bits,
         maximum_ore_bits,
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlTableTarget {
+    Append,
+    Override(u32),
+}
+
+fn native_control_target_action(target: u32) -> ControlTableTarget {
+    if target == u32::MAX {
+        ControlTableTarget::Append
+    } else {
+        ControlTableTarget::Override(target)
+    }
+}
+
+fn native_component_target_index(
+    source_type: Option<u32>,
+    devices: &[EffectiveControlDevice],
+    parent_component_id: u32,
+    raw_local_index: i32,
+) -> u32 {
+    if source_type == Some(PROTOTYPE_TYPE_EXTO) {
+        // AniMesh writes EXTO's mount node to descriptor C4; C8 remains -1,
+        // the Control append sentinel.
+        u32::MAX
+    } else {
+        native_into_table_target_index(devices, parent_component_id, raw_local_index)
+    }
+}
+
+fn native_into_table_target_index(
+    devices: &[EffectiveControlDevice],
+    parent_component_id: u32,
+    raw_local_index: i32,
+) -> u32 {
+    let first_parent_device = devices
+        .iter()
+        .position(|device| device.component_id == parent_component_id)
+        .and_then(|index| u32::try_from(index).ok())
+        .unwrap_or(u32::MAX);
+    first_parent_device.wrapping_add(raw_local_index as u32)
+}
+
+fn native_into_append_key(raw_key: u32) -> u32 {
+    if raw_key == 0 {
+        u32::MAX
+    } else {
+        raw_key
+    }
+}
+
+fn native_ex_to_append_key(
+    raw_key: u32,
+    component_id: u32,
+    mount_node: Option<u32>,
+    first_global_node: Option<u32>,
+) -> Option<u32> {
+    if raw_key == 0 {
+        return mount_node;
+    }
+    if component_id == 0 {
+        return Some(raw_key);
+    }
+    let mount_node = mount_node?;
+    if mount_node == u32::MAX {
+        return Some(raw_key);
+    }
+    let first_global_node = first_global_node.unwrap_or(u32::MAX);
+    Some(raw_key.wrapping_add(first_global_node).wrapping_sub(1))
+}
+
+fn active_unit_component_order(
+    records: &[UnitComponentRecord],
+    tree: &[UnitComponentTreeNode],
+) -> Vec<usize> {
+    if records.is_empty() || tree.is_empty() {
+        return Vec::new();
+    }
+    let mut order = vec![0];
+    let mut pending = tree[0].children.iter().rev().copied().collect::<Vec<_>>();
+    while let Some(node_index) = pending.pop() {
+        let Some(node) = tree.get(node_index) else {
+            continue;
+        };
+        let component_index = node.record_index;
+        let Some(component) = records.get(component_index) else {
+            continue;
+        };
+        if component.kind == 0 {
+            // The native raw-kind guard returns before visiting this subtree.
+            continue;
+        }
+        order.push(component_index);
+        pending.extend(node.children.iter().rev().copied());
+    }
+    order
+}
+
+fn control_device_record_provenance(
+    component_index: usize,
+    record_index: usize,
+    control: &PreparedComponentControl,
+) -> ControlDeviceRecordProvenance {
+    ControlDeviceRecordProvenance {
+        unit_component_index: component_index,
+        typed_record_index: record_index,
+        source: control.source.clone(),
+    }
+}
+
+fn append_effective_control_device(
+    devices: &mut Vec<EffectiveControlDevice>,
+    component_id: u32,
+    key: u32,
+    component_index: usize,
+    record_index: usize,
+    control: &PreparedComponentControl,
+    descriptor: &PreparedControlTypedRecord,
+) {
+    let provenance = control_device_record_provenance(component_index, record_index, control);
+    let mut coefficient_words = [0; 16];
+    coefficient_words.copy_from_slice(&descriptor.fixed_words[11..27]);
+    let coefficient_bits =
+        control_factory_uses_common_setter(descriptor.tag).then_some(coefficient_words);
+    let (multiplier_bits, default_word_50) = native_control_factory_defaults(descriptor.tag);
+    let native_word_50_bits = if descriptor.fixed_words[6] == u32::MAX {
+        default_word_50
+    } else {
+        Some(descriptor.fixed_words[6])
+    };
+    devices.push(EffectiveControlDevice {
+        factory_tag: descriptor.tag,
+        component_id,
+        key,
+        coefficient_bits,
+        multiplier_bits,
+        native_word_50_bits,
+        descriptor: descriptor.clone(),
+        factory_provenance: provenance.clone(),
+        descriptor_provenance: provenance,
+    });
+}
+
+fn apply_effective_control_override(
+    device: &mut EffectiveControlDevice,
+    descriptor: &PreparedControlTypedRecord,
+    component_index: usize,
+    record_index: usize,
+    control: &PreparedComponentControl,
+) {
+    let mut coefficient_words = [0; 16];
+    coefficient_words.copy_from_slice(&descriptor.fixed_words[11..27]);
+    device.coefficient_bits = Some(coefficient_words);
+    if descriptor.fixed_words[6] != u32::MAX {
+        device.native_word_50_bits = Some(descriptor.fixed_words[6]);
+    }
+    device.descriptor = descriptor.clone();
+    device.descriptor_provenance =
+        control_device_record_provenance(component_index, record_index, control);
+}
+
+fn control_factory_uses_common_setter(factory_tag: u32) -> bool {
+    matches!(
+        factory_tag,
+        1 | 2 | 4 | 5 | 8 | 9 | 10 | 15 | 17 | 19 | 25 | 26 | 30
+    )
+}
+
+fn native_control_factory_defaults(factory_tag: u32) -> (Option<u32>, Option<u32>) {
+    let flags = match factory_tag {
+        1 | 4 => 0x200,
+        5 | 8 | 26 => 0x5,
+        10 => 0x2000,
+        17 | 19 => 0x20,
+        _ => return (None, None),
+    };
+    (Some(0x3f80_0000), Some(flags))
+}
+
+fn build_control_device_table(
+    object_index: usize,
+    draft: &MissionObjectDraft,
+    assets: &MissionAssets,
+    prototype_span: Option<&std::ops::Range<usize>>,
+    prototypes: &[fparkan_prototype::EffectivePrototype],
+) -> Result<Vec<EffectiveControlDevice>, MissionControlDeviceTableUnavailableReason> {
+    use MissionControlDeviceTableUnavailableReason as Unavailable;
+
+    draft
+        .unit_dat_header_flags
+        .ok_or(Unavailable::NoUnitDatTree)?;
+    if draft.unit_components.is_empty() {
+        return Err(Unavailable::InvalidUnitComponentTree);
+    }
+    let tree = match unit_component_tree(&draft.unit_components) {
+        Ok(tree) if !tree.is_empty() => tree,
+        _ => return Err(Unavailable::InvalidUnitComponentTree),
+    };
+    let span = prototype_span.ok_or(Unavailable::ComponentAlignmentMismatch)?;
+    let component_controls = assets
+        .object_component_controls
+        .get(object_index)
+        .ok_or(Unavailable::ComponentAlignmentMismatch)?;
+    let object_visuals = assets
+        .object_visuals
+        .get(object_index)
+        .ok_or(Unavailable::ComponentAlignmentMismatch)?;
+    if span.start > span.end
+        || span.end > prototypes.len()
+        || span.end - span.start != draft.unit_components.len()
+        || component_controls.len() != draft.unit_components.len()
+        || object_visuals.len() != draft.unit_components.len()
+    {
+        return Err(Unavailable::ComponentAlignmentMismatch);
+    }
+
+    let prototype_for = |component_index: usize| {
+        span.start
+            .checked_add(component_index)
+            .and_then(|index| prototypes.get(index))
+    };
+    let active_components = active_unit_component_order(&draft.unit_components, &tree);
+    if active_components.first() != Some(&0) {
+        return Err(Unavailable::InvalidUnitComponentTree);
+    }
+
+    let has_ex_to = active_components.iter().any(|component_index| {
+        prototype_for(*component_index)
+            .is_some_and(|prototype| prototype.source_type == Some(PROTOTYPE_TYPE_EXTO))
+    });
+    if has_ex_to {
+        for component_index in active_components
+            .iter()
+            .copied()
+            .filter(|index| *index != 0)
+        {
+            let prototype =
+                prototype_for(component_index).ok_or(Unavailable::ComponentAlignmentMismatch)?;
+            if prototype.source_type.is_none() {
+                return Err(Unavailable::UnknownComponentKindForExTo {
+                    unit_component_index: component_index,
+                    source_type: None,
+                });
+            }
+        }
+    }
+
+    let mut component_ids = vec![None; draft.unit_components.len()];
+    component_ids[0] = Some(0_u32);
+    let mut next_component_id = 1_u32;
+    for component_index in active_components.iter().copied().skip(1) {
+        component_ids[component_index] = Some(next_component_id);
+        let next = next_component_id
+            .checked_add(1)
+            .ok_or(Unavailable::ComponentAlignmentMismatch)?;
+        next_component_id = next;
+    }
+
+    let mut first_global_nodes = vec![None; draft.unit_components.len()];
+    if has_ex_to {
+        let root_prototype = prototype_for(0).ok_or(Unavailable::ComponentAlignmentMismatch)?;
+        let root_is_mesh = matches!(
+            root_prototype.geometry,
+            fparkan_prototype::PrototypeGeometry::Mesh(_)
+        );
+        let root_node_count = object_visuals
+            .first()
+            .and_then(|visual_id| assets.visual_by_id(*visual_id))
+            .map(|visual| visual.model_nodes)
+            .ok_or(Unavailable::UnsupportedExToNodeMapping {
+                unit_component_index: 0,
+            })?;
+        if !root_is_mesh || root_node_count == 0 {
+            return Err(Unavailable::UnsupportedExToNodeMapping {
+                unit_component_index: 0,
+            });
+        }
+        let mut global_node_cursor = u32::try_from(root_node_count).map_err(|_| {
+            Unavailable::UnsupportedExToNodeMapping {
+                unit_component_index: 0,
+            }
+        })?;
+        first_global_nodes[0] = Some(0_u32);
+        for component_index in active_components.iter().copied().skip(1) {
+            let prototype =
+                prototype_for(component_index).ok_or(Unavailable::ComponentAlignmentMismatch)?;
+            match prototype.source_type {
+                Some(PROTOTYPE_TYPE_EXTO) => {
+                    if !matches!(
+                        prototype.geometry,
+                        fparkan_prototype::PrototypeGeometry::Mesh(_)
+                    ) {
+                        return Err(Unavailable::UnsupportedExToNodeMapping {
+                            unit_component_index: component_index,
+                        });
+                    }
+                    let Some(node_count) = object_visuals
+                        .get(component_index)
+                        .and_then(|visual_id| assets.visual_by_id(*visual_id))
+                        .map(|visual| visual.model_nodes)
+                    else {
+                        return Err(Unavailable::UnsupportedExToNodeMapping {
+                            unit_component_index: component_index,
+                        });
+                    };
+                    if node_count == 0 {
+                        return Err(Unavailable::UnsupportedExToNodeMapping {
+                            unit_component_index: component_index,
+                        });
+                    }
+                    if node_count > 1 {
+                        first_global_nodes[component_index] = Some(global_node_cursor);
+                    }
+                    let contribution = u32::try_from(node_count - 1).map_err(|_| {
+                        Unavailable::UnsupportedExToNodeMapping {
+                            unit_component_index: component_index,
+                        }
+                    })?;
+                    let next_cursor =
+                        global_node_cursor
+                            .checked_add(contribution)
+                            .ok_or_else(|| Unavailable::UnsupportedExToNodeMapping {
+                                unit_component_index: component_index,
+                            })?;
+                    global_node_cursor = next_cursor;
+                }
+                Some(_) => {}
+                None => {
+                    return Err(Unavailable::UnknownComponentKindForExTo {
+                        unit_component_index: component_index,
+                        source_type: None,
+                    });
+                }
+            }
+        }
+    }
+
+    let mut devices = Vec::new();
+    let mut has_control_resource = false;
+    for component_index in active_components {
+        let prototype =
+            prototype_for(component_index).ok_or(Unavailable::ComponentAlignmentMismatch)?;
+        if prototype.control_resource.is_none() {
+            continue;
+        }
+        has_control_resource = true;
+        if matches!(
+            prototype.geometry,
+            fparkan_prototype::PrototypeGeometry::NonGeometric
+        ) {
+            return Err(Unavailable::NonGeometricControlResource {
+                unit_component_index: component_index,
+            });
+        }
+        let control = component_controls[component_index].as_ref().ok_or(
+            Unavailable::ControlResourceUnavailable {
+                unit_component_index: component_index,
+            },
+        )?;
+        if let PreparedControlEffectSection::Unsupported {
+            typed_record_index: Some(first_unparsed_record),
+            ..
+        } = &control.effect_section
+        {
+            return Err(Unavailable::IncompleteTypedRecordList {
+                unit_component_index: component_index,
+                first_unparsed_record: *first_unparsed_record,
+            });
+        }
+
+        let component_id =
+            component_ids[component_index].ok_or(Unavailable::ComponentAlignmentMismatch)?;
+        let is_root = component_index == 0;
+        let is_ex_to = prototype.source_type == Some(PROTOTYPE_TYPE_EXTO);
+        if is_root {
+            for (record_index, descriptor) in control.typed_records.iter().enumerate() {
+                append_effective_control_device(
+                    &mut devices,
+                    component_id,
+                    descriptor.fixed_words[1],
+                    component_index,
+                    record_index,
+                    control,
+                    descriptor,
+                );
+            }
+            continue;
+        }
+
+        let raw_local_index = draft.unit_components[component_index].parent_or_link;
+        let parent_component_id = tree
+            .get(component_index)
+            .and_then(|node| node.parent_index)
+            .and_then(|parent_index| component_ids.get(parent_index).copied().flatten())
+            .unwrap_or(u32::MAX);
+        let native_target = native_component_target_index(
+            prototype.source_type,
+            &devices,
+            parent_component_id,
+            raw_local_index,
+        );
+        match native_control_target_action(native_target) {
+            ControlTableTarget::Append => {
+                let mount_node = if is_ex_to {
+                    tree.get(component_index)
+                        .and_then(|node| node.parent_index)
+                        .and_then(|parent_index| {
+                            let parent_id = component_ids.get(parent_index).copied().flatten()?;
+                            let parent_first = first_global_nodes
+                                .get(parent_index)
+                                .copied()
+                                .flatten()
+                                .unwrap_or(u32::MAX);
+                            Some(
+                                parent_first
+                                    .wrapping_add(raw_local_index as u32)
+                                    .wrapping_sub(u32::from(parent_id != 0)),
+                            )
+                        })
+                } else {
+                    None
+                };
+                let first_global_node = first_global_nodes.get(component_index).copied().flatten();
+                for (record_index, descriptor) in control.typed_records.iter().enumerate() {
+                    let raw_key = descriptor.fixed_words[1];
+                    let key = if is_ex_to {
+                        native_ex_to_append_key(
+                            raw_key,
+                            component_id,
+                            mount_node,
+                            first_global_node,
+                        )
+                        .ok_or(
+                            Unavailable::UnsupportedExToNodeMapping {
+                                unit_component_index: component_index,
+                            },
+                        )?
+                    } else {
+                        native_into_append_key(raw_key)
+                    };
+                    append_effective_control_device(
+                        &mut devices,
+                        component_id,
+                        key,
+                        component_index,
+                        record_index,
+                        control,
+                        descriptor,
+                    );
+                }
+            }
+            ControlTableTarget::Override(target_index) => {
+                let descriptor =
+                    control
+                        .typed_records
+                        .first()
+                        .ok_or(Unavailable::MissingOverrideRecord {
+                            unit_component_index: component_index,
+                        })?;
+                let target_index_usize = usize::try_from(target_index).map_err(|_| {
+                    Unavailable::OverrideIndexOutOfRange {
+                        unit_component_index: component_index,
+                        target_index,
+                    }
+                })?;
+                let device = devices.get_mut(target_index_usize).ok_or(
+                    Unavailable::OverrideIndexOutOfRange {
+                        unit_component_index: component_index,
+                        target_index,
+                    },
+                )?;
+                if !matches!(device.factory_tag, 9 | 15 | 19 | 25) {
+                    return Err(Unavailable::UnsupportedOverrideReceiver {
+                        factory_tag: device.factory_tag,
+                    });
+                }
+                apply_effective_control_override(device, descriptor, component_index, 0, control);
+            }
+        }
+    }
+    if !has_control_resource {
+        return Err(Unavailable::NoControlResource);
+    }
+    Ok(devices)
 }
 
 fn add_behavior_registered_object(
@@ -1867,7 +2493,7 @@ fn read_vfs(vfs: &Arc<dyn Vfs>, path: &NormalizedPath) -> Result<Arc<[u8]>, Engi
 mod tests {
     use super::*;
     use fparkan_script::ScriptDispatchSelector;
-    use fparkan_vfs::{DirectoryVfs, MemoryVfs, VfsEntry, VfsMetadata};
+    use fparkan_vfs::{DirectoryVfs, MemoryVfs, OverlayVfs, VfsEntry, VfsMetadata};
     use std::path::{Path, PathBuf};
 
     fn basement_draft(header_flags: Option<u32>, raw_after_name: u32) -> MissionObjectDraft {
@@ -1885,6 +2511,171 @@ mod tests {
             properties: Vec::new(),
             unit_components: Vec::new(),
         }
+    }
+
+    fn synthetic_resource_key(index: usize) -> ResourceKey {
+        ResourceKey {
+            archive: normalize_engine_path("test", &format!("synthetic/{index}.rlb"))
+                .expect("synthetic archive path"),
+            name: fparkan_path::ResourceName(format!("entry{index}").into_bytes()),
+            type_id: None,
+        }
+    }
+
+    fn synthetic_control_record(
+        tag: u32,
+        key: u32,
+        first_coefficient: u32,
+        native_word_50: Option<u32>,
+    ) -> PreparedControlTypedRecord {
+        let mut fixed_words = [0; 44];
+        fixed_words[1] = key;
+        fixed_words[6] = native_word_50.unwrap_or(u32::MAX);
+        fixed_words[11] = first_coefficient;
+        PreparedControlTypedRecord {
+            tag,
+            fixed_words,
+            values: Vec::new(),
+            string_bytes: Vec::new(),
+            gate_provider: fparkan_assets::PreparedControlGateProvider::NotApplicable,
+        }
+    }
+
+    fn synthetic_component_control(
+        index: usize,
+        typed_records: Vec<PreparedControlTypedRecord>,
+        effect_section: PreparedControlEffectSection,
+    ) -> PreparedComponentControl {
+        PreparedComponentControl {
+            source: synthetic_resource_key(100 + index),
+            model_node_count: 0,
+            bindings: Vec::new(),
+            timeline_rows: Vec::new(),
+            typed_records,
+            node_data: None,
+            effect_section,
+            initial_effect_group: None,
+            point_list: None,
+        }
+    }
+
+    fn synthetic_control_fixture(
+        source_types: &[Option<u32>],
+        kinds: &[u32],
+        child_counts: &[u32],
+        parent_or_links: &[i32],
+        model_nodes: &[usize],
+        controls: Vec<Option<PreparedComponentControl>>,
+    ) -> (
+        MissionObjectDraft,
+        MissionAssets,
+        Vec<fparkan_prototype::EffectivePrototype>,
+    ) {
+        let component_count = source_types.len();
+        assert_eq!(kinds.len(), component_count);
+        assert_eq!(child_counts.len(), component_count);
+        assert_eq!(parent_or_links.len(), component_count);
+        assert_eq!(model_nodes.len(), component_count);
+        assert_eq!(controls.len(), component_count);
+
+        let unit_components = (0..component_count)
+            .map(|index| UnitComponentRecord {
+                archive_raw: [0; 32],
+                resource_raw: [0; 32],
+                kind: kinds[index],
+                parent_or_link: parent_or_links[index],
+                description_raw: [0; 32],
+                tail0: 0,
+                immediate_child_count: child_counts[index],
+            })
+            .collect::<Vec<_>>();
+        let mut assets = MissionAssets::default();
+        let mut prototypes = Vec::with_capacity(component_count);
+        let mut visuals = Vec::with_capacity(component_count);
+        let mut visual_ids = Vec::with_capacity(component_count);
+        for index in 0..component_count {
+            let mesh = synthetic_resource_key(200 + index);
+            let visual_id = AssetId::new(index as u64);
+            visual_ids.push(visual_id);
+            visuals.push(PreparedVisual {
+                id: visual_id,
+                mesh: Some(mesh.clone()),
+                source_type: source_types[index],
+                model_id: None,
+                wear_id: None,
+                model_nodes: model_nodes[index],
+                model_slots: 0,
+                model_batches: 0,
+                material_count: 0,
+                material_ids: Vec::new(),
+                texture_ids: Vec::new(),
+                lightmap_ids: Vec::new(),
+                texture_count: 0,
+                lightmap_count: 0,
+            });
+            prototypes.push(fparkan_prototype::EffectivePrototype {
+                key: fparkan_prototype::PrototypeKey(fparkan_path::ResourceName(
+                    format!("prototype{index}").into_bytes(),
+                )),
+                geometry: fparkan_prototype::PrototypeGeometry::Mesh(mesh),
+                source: fparkan_prototype::PrototypeSource::ObjectsRegistry,
+                source_type: source_types[index],
+                dependencies: Vec::new(),
+                control_resource: controls[index]
+                    .as_ref()
+                    .map(|control| control.source.clone()),
+                point_resource: None,
+                node_data_resource: None,
+                bas_resource: None,
+            });
+        }
+        assets.visuals = visuals;
+        assets.object_visuals = vec![visual_ids.clone()];
+        assets.object_component_controls = vec![controls];
+        let draft = MissionObjectDraft {
+            original_id: Some(OriginalObjectId(0)),
+            resource_name_raw: b"TEST/ROOT.DAT".to_vec(),
+            raw_after_resource: 0,
+            identity_or_clan_raw: 0,
+            raw_after_name: 0,
+            unit_dat_header_flags: Some(0),
+            position: [0.0; 3],
+            orientation_raw: [0.0; 3],
+            scale: [1.0; 3],
+            visual_ids,
+            properties: Vec::new(),
+            unit_components,
+        };
+        (draft, assets, prototypes)
+    }
+
+    fn synthetic_control_table(
+        source_types: &[Option<u32>],
+        kinds: &[u32],
+        child_counts: &[u32],
+        parent_or_links: &[i32],
+        model_nodes: &[usize],
+        controls: Vec<Option<PreparedComponentControl>>,
+    ) -> MissionControlDeviceTableStatus {
+        let (draft, assets, prototypes) = synthetic_control_fixture(
+            source_types,
+            kinds,
+            child_counts,
+            parent_or_links,
+            model_nodes,
+            controls,
+        );
+        build_control_device_table(
+            0,
+            &draft,
+            &assets,
+            Some(&(0..prototypes.len())),
+            &prototypes,
+        )
+        .map_or_else(
+            MissionControlDeviceTableStatus::Unavailable,
+            MissionControlDeviceTableStatus::Available,
+        )
     }
 
     #[test]
@@ -2087,6 +2878,428 @@ mod tests {
         assert!(matches!(err, EngineError::MissingVfs));
         let after = step_headless(&mut engine, InputSnapshot).expect("step");
         assert_eq!(before.snapshot.objects, after.snapshot.objects);
+    }
+
+    #[test]
+    fn into_table_target_uses_native_wrapping_and_append_sentinel() {
+        let no_parent_devices = [];
+        let local_one = native_into_table_target_index(&no_parent_devices, 9, 1);
+        assert_eq!(local_one, 0);
+        assert_eq!(
+            native_control_target_action(local_one),
+            ControlTableTarget::Override(0)
+        );
+
+        let local_zero = native_into_table_target_index(&no_parent_devices, 9, 0);
+        assert_eq!(local_zero, u32::MAX);
+        assert_eq!(
+            native_control_target_action(local_zero),
+            ControlTableTarget::Append
+        );
+    }
+
+    #[test]
+    fn into_missing_parent_append_maps_only_zero_key_to_native_minus_one() {
+        assert_eq!(native_into_append_key(0), u32::MAX);
+        assert_eq!(native_into_append_key(0x1234), 0x1234);
+    }
+
+    #[test]
+    fn exto_key_mapping_obeys_native_component_and_mount_sentinels() {
+        assert_eq!(native_ex_to_append_key(2, 0, None, Some(20)), Some(2));
+        assert_eq!(
+            native_ex_to_append_key(2, 1, Some(u32::MAX), Some(20)),
+            Some(2)
+        );
+        assert_eq!(
+            native_ex_to_append_key(0, 1, Some(u32::MAX), None),
+            Some(u32::MAX)
+        );
+        assert_eq!(native_ex_to_append_key(2, 1, Some(4), Some(10)), Some(11));
+        assert_eq!(native_ex_to_append_key(2, 1, Some(4), None), Some(0));
+        assert_eq!(native_ex_to_append_key(1, 5, Some(9), Some(22)), Some(22));
+    }
+
+    #[test]
+    fn synthetic_ex_to_builder_appends_remapped_rows_and_skips_inactive_subtree() {
+        let controls = vec![
+            Some(synthetic_component_control(
+                0,
+                vec![synthetic_control_record(19, 7, 0x10, None)],
+                PreparedControlEffectSection::Parsed(Vec::new()),
+            )),
+            Some(synthetic_component_control(
+                1,
+                vec![
+                    synthetic_control_record(19, 0, 0x20, None),
+                    synthetic_control_record(19, 2, 0x21, None),
+                ],
+                PreparedControlEffectSection::Parsed(Vec::new()),
+            )),
+            Some(synthetic_component_control(
+                2,
+                vec![
+                    synthetic_control_record(19, 0, 0x30, None),
+                    synthetic_control_record(19, 2, 0x31, None),
+                ],
+                PreparedControlEffectSection::Parsed(Vec::new()),
+            )),
+            Some(synthetic_component_control(
+                3,
+                vec![synthetic_control_record(19, 9, 0x40, None)],
+                PreparedControlEffectSection::Parsed(Vec::new()),
+            )),
+            Some(synthetic_component_control(
+                4,
+                vec![synthetic_control_record(19, 10, 0x50, None)],
+                PreparedControlEffectSection::Parsed(Vec::new()),
+            )),
+            Some(synthetic_component_control(
+                5,
+                vec![synthetic_control_record(19, 2, 0x60, None)],
+                PreparedControlEffectSection::Parsed(Vec::new()),
+            )),
+        ];
+        let status = synthetic_control_table(
+            &[
+                Some(PROTOTYPE_TYPE_EXTO),
+                Some(PROTOTYPE_TYPE_EXTO),
+                Some(PROTOTYPE_TYPE_EXTO),
+                None,
+                None,
+                Some(PROTOTYPE_TYPE_EXTO),
+            ],
+            &[1, 1, 1, 0, 1, 1],
+            &[3, 1, 0, 1, 0, 0],
+            &[0, 3, 2, 0, 0, 4],
+            &[5, 3, 2, 1, 1, 2],
+            controls,
+        );
+        let MissionControlDeviceTableStatus::Available(entries) = status else {
+            panic!("synthetic EXTO table should be available: {status:?}");
+        };
+        assert_eq!(entries.len(), 6);
+        // Root EXTO keys remain raw. Child keys map to mount/global nodes.
+        assert_eq!(
+            entries.iter().map(|entry| entry.key).collect::<Vec<_>>(),
+            [7, 3, 6, 6, 8, 9]
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.component_id)
+                .collect::<Vec<_>>(),
+            [0, 1, 1, 2, 2, 3]
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.descriptor_provenance.unit_component_index)
+                .collect::<Vec<_>>(),
+            [0, 1, 1, 2, 2, 5]
+        );
+        assert_ne!(
+            entries[5].component_id as usize,
+            entries[5].descriptor_provenance.unit_component_index
+        );
+    }
+
+    #[test]
+    fn synthetic_into_builder_appends_all_rows_and_overrides_only_first_record() {
+        let append = synthetic_control_table(
+            &[None, Some(PROTOTYPE_TYPE_INTO)],
+            &[1, 1],
+            &[1, 0],
+            &[0, 0],
+            &[1, 0],
+            vec![
+                None,
+                Some(synthetic_component_control(
+                    1,
+                    vec![
+                        synthetic_control_record(19, 0, 0x10, None),
+                        synthetic_control_record(19, 2, 0x20, None),
+                    ],
+                    PreparedControlEffectSection::Parsed(Vec::new()),
+                )),
+            ],
+        );
+        let MissionControlDeviceTableStatus::Available(appended) = append else {
+            panic!("synthetic INTO sentinel should append: {append:?}");
+        };
+        assert_eq!(appended.len(), 2);
+        assert_eq!(
+            appended.iter().map(|entry| entry.key).collect::<Vec<_>>(),
+            [u32::MAX, 2]
+        );
+        assert_eq!(
+            appended
+                .iter()
+                .map(|entry| entry.descriptor_provenance.typed_record_index)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+
+        let override_table = synthetic_control_table(
+            &[None, Some(PROTOTYPE_TYPE_INTO), Some(PROTOTYPE_TYPE_INTO)],
+            &[1, 1, 1],
+            &[2, 0, 0],
+            &[0, 0, 1],
+            &[1, 0, 0],
+            vec![
+                Some(synthetic_component_control(
+                    0,
+                    vec![
+                        synthetic_control_record(19, 11, 0x10, None),
+                        synthetic_control_record(19, 12, 0x20, None),
+                    ],
+                    PreparedControlEffectSection::Parsed(Vec::new()),
+                )),
+                Some(synthetic_component_control(
+                    1,
+                    vec![
+                        synthetic_control_record(21, 99, 0xA1, Some(0x77)),
+                        synthetic_control_record(25, 88, 0xA2, Some(0x88)),
+                    ],
+                    PreparedControlEffectSection::Parsed(Vec::new()),
+                )),
+                Some(synthetic_component_control(
+                    2,
+                    vec![synthetic_control_record(21, 77, 0xB1, None)],
+                    PreparedControlEffectSection::Parsed(Vec::new()),
+                )),
+            ],
+        );
+        let MissionControlDeviceTableStatus::Available(overridden) = override_table else {
+            panic!("synthetic INTO overrides should be available: {override_table:?}");
+        };
+        assert_eq!(overridden.len(), 2);
+        assert_eq!(
+            overridden
+                .iter()
+                .map(|entry| (entry.factory_tag, entry.key, entry.component_id))
+                .collect::<Vec<_>>(),
+            [(19, 11, 0), (19, 12, 0)]
+        );
+        assert_eq!(
+            overridden
+                .iter()
+                .map(|entry| entry.coefficient_bits.map(|words| words[0]))
+                .collect::<Vec<_>>(),
+            [Some(0xA1), Some(0xB1)]
+        );
+        assert_eq!(
+            overridden
+                .iter()
+                .map(|entry| entry.native_word_50_bits)
+                .collect::<Vec<_>>(),
+            [Some(0x77), Some(0x20)]
+        );
+        assert_eq!(
+            overridden
+                .iter()
+                .map(|entry| entry.multiplier_bits)
+                .collect::<Vec<_>>(),
+            [Some(0x3F80_0000); 2]
+        );
+        assert_eq!(
+            overridden
+                .iter()
+                .map(|entry| entry.descriptor_provenance.unit_component_index)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(
+            overridden
+                .iter()
+                .map(|entry| entry.descriptor_provenance.typed_record_index)
+                .collect::<Vec<_>>(),
+            [0, 0]
+        );
+        assert_eq!(overridden[0].descriptor.tag, 21);
+
+        let mut live_device = overridden[0].clone();
+        live_device.multiplier_bits = Some(0x4020_0000); // Live native multiplier 2.5.
+        let replacement = synthetic_control_record(25, 100, 0xC1, None);
+        let replacement_control = synthetic_component_control(
+            3,
+            vec![replacement.clone()],
+            PreparedControlEffectSection::Parsed(Vec::new()),
+        );
+        apply_effective_control_override(
+            &mut live_device,
+            &replacement,
+            3,
+            0,
+            &replacement_control,
+        );
+        assert_eq!(live_device.factory_tag, 19);
+        assert_eq!(live_device.key, 11);
+        assert_eq!(live_device.component_id, 0);
+        assert_eq!(live_device.multiplier_bits, Some(0x4020_0000));
+        assert_eq!(
+            live_device.coefficient_bits,
+            Some([0xC1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+        );
+    }
+
+    #[test]
+    fn synthetic_incomplete_typed_list_does_not_expose_partial_table() {
+        let status = synthetic_control_table(
+            &[None],
+            &[1],
+            &[0],
+            &[0],
+            &[1],
+            vec![Some(synthetic_component_control(
+                0,
+                vec![synthetic_control_record(19, 1, 0x10, None)],
+                PreparedControlEffectSection::Unsupported {
+                    typed_record_index: Some(1),
+                    typed_record_tag: Some(0xDEAD),
+                },
+            ))],
+        );
+        assert_eq!(
+            status,
+            MissionControlDeviceTableStatus::Unavailable(
+                MissionControlDeviceTableUnavailableReason::IncompleteTypedRecordList {
+                    unit_component_index: 0,
+                    first_unparsed_record: 1,
+                }
+            )
+        );
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn full_load_builds_effective_control_device_table_for_mine_unit_dat() {
+        fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fn push_lp(bytes: &mut Vec<u8>, value: &[u8]) {
+            push_u32(bytes, u32::try_from(value.len()).expect("length fits u32"));
+            bytes.extend_from_slice(value);
+        }
+        fn single_unit_tma(land_path: &[u8]) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            push_u32(&mut bytes, 1); // TMA format version.
+            push_u32(&mut bytes, 0); // Paths.
+            push_u32(&mut bytes, 6); // Clan section version.
+            push_u32(&mut bytes, 0); // Clans.
+            push_u32(&mut bytes, 10); // Object section version.
+            push_u32(&mut bytes, 1); // One Unit DAT object.
+            push_u32(&mut bytes, 1); // Raw object kind.
+            push_u32(&mut bytes, 0x8000_0002); // Strict object class/flags word.
+            push_lp(&mut bytes, b"UNITS/BUILDS/MINE/min_l_n1.dat");
+            push_u32(&mut bytes, 0); // Raw word after resource.
+            push_u32(&mut bytes, 0); // Identity/clan.
+            for value in [0.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0] {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            push_lp(&mut bytes, b"mine-control-table-test");
+            push_u32(&mut bytes, 0); // Raw word after name.
+            push_u32(&mut bytes, 0); // Link 0.
+            push_u32(&mut bytes, 0); // Link 1.
+            push_u32(&mut bytes, 1); // Property schema version.
+            push_u32(&mut bytes, 0); // Properties.
+            push_lp(&mut bytes, land_path);
+            push_u32(&mut bytes, 0); // Mission flag.
+            push_lp(&mut bytes, b""); // Description.
+            push_u32(&mut bytes, 1); // Extra section version.
+            push_u32(&mut bytes, 0); // Extras.
+            bytes
+        }
+
+        let root = licensed_root("IS");
+        let source_tma = std::fs::read(root.join("MISSIONS/Autodemo.00/data.tma"))
+            .expect("licensed source mission");
+        let land_path = decode_mission_land_path(&source_tma, TmaProfile::Strict)
+            .expect("source mission land path")
+            .raw;
+        let mut overlay = MemoryVfs::default();
+        overlay.insert(
+            normalize_engine_path("test mission", "MISSIONS/TEST/MINE/data.tma")
+                .expect("mission path"),
+            Arc::from(single_unit_tma(&land_path)),
+        );
+        let vfs = Arc::new(OverlayVfs::from_layers(vec![
+            Arc::new(overlay),
+            Arc::new(DirectoryVfs::new(&root)),
+        ]));
+        let mut engine = create(EngineServices::new(vfs)).expect("engine");
+        let loaded = load_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/TEST/MINE/data.tma".to_string(),
+                mode: MissionMode::SingleMission,
+            },
+            0,
+        )
+        .expect("full normal mission load");
+        assert_eq!(loaded.object_count, 1);
+
+        let draft = &loaded_mission_object_drafts(&engine).expect("object drafts")[0];
+        assert_eq!(draft.unit_components.len(), 6);
+        assert_eq!(draft.unit_components[0].immediate_child_count, 5);
+        let tables = loaded_mission_control_device_tables(&engine).expect("Control tables");
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].original_id, Some(OriginalObjectId(0)));
+        let MissionControlDeviceTableStatus::Available(entries) = &tables[0].status else {
+            panic!(
+                "licensed mine table should be available: {:?}",
+                tables[0].status
+            );
+        };
+        assert_eq!(entries.len(), 11);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.factory_tag)
+                .collect::<Vec<_>>(),
+            [19, 19, 9, 15, 12, 12, 13, 13, 26, 25, 21]
+        );
+        assert_eq!(
+            entries.iter().map(|entry| entry.key).collect::<Vec<_>>(),
+            [2, 2, 1, 1, 18, 21, 15, 16, 2, 1, 22]
+        );
+        assert_eq!(
+            (
+                entries[0].coefficient_bits.map(|words| words[0]),
+                entries[1].coefficient_bits.map(|words| words[0])
+            ),
+            (Some(0x4100_0000), Some(0x4100_0000))
+        );
+        assert_eq!(
+            (entries[0].multiplier_bits, entries[0].native_word_50_bits),
+            (Some(0x3f80_0000), Some(0x20))
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.descriptor_provenance.unit_component_index)
+                .collect::<Vec<_>>(),
+            [1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 5]
+        );
+        assert_eq!(entries[8].descriptor_provenance.typed_record_index, 8);
+        assert_eq!(
+            (
+                entries[9].factory_tag,
+                entries[9].component_id,
+                entries[9].key
+            ),
+            (25, 0, 1)
+        );
+        assert_eq!(entries[9].descriptor.tag, 25);
+        assert_eq!(
+            (
+                entries[10].factory_tag,
+                entries[10].component_id,
+                entries[10].key
+            ),
+            (21, 5, 22)
+        );
+        assert_eq!(entries[10].descriptor.tag, 21);
     }
 
     #[test]

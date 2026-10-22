@@ -477,8 +477,15 @@ struct UnitDatRecord112 {
 
 При построении mission prototype graph FParkan сохраняет для каждого root
 упорядоченный список этих raw records. Список передаётся в
-`MissionObjectDraft` с исходными `kind`, `parent_or_link`, description и tails;
-эти данные пока не объединяются в таблицу эффективных устройств Control.
+`MissionObjectDraft` с исходными `kind`, `parent_or_link`, description и tails.
+Во время полного mission load runtime использует дерево и подготовленные CTL
+resources, чтобы построить для такого объекта упорядоченную базовую таблицу
+Control: корневые строки добавляются, дочерний `INTO` может обновить выбранную
+строку или добавить записи при sentinel `-1`, а `EXTO` добавляет строки с
+переведёнными ключами глобальной MSH-иерархии. Результат хранит исходный factory
+tag и provenance; неизвестные tag-specific callbacks он не выполняет. Preview
+режим эту таблицу не строит, а неполная typed-record list оставляет состояние
+явно unavailable.
 
 Каждый graph edge от `UnitDatRoot` к effective component и далее к его MSH
 dependency также несёт `unit_component_index`. Это индекс исходной записи в
