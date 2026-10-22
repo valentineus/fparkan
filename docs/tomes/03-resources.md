@@ -448,21 +448,28 @@ struct UnitDatRecord112 {
     char     archive_name[32];    // +0x00
     char     resource_name[32];   // +0x20
     uint32_t kind;                // +0x40, в корпусе всегда 1
-    int32_t  parent_or_link;      // +0x44
+    int32_t  parent_or_link;      // +0x44, context-dependent local index
     char     description[32];     // +0x48
     uint32_t tail0;               // +0x68, opaque
-    uint32_t tail1;               // +0x6C, opaque
+    uint32_t tail1;               // +0x6C, immediate_child_count
 };
 #pragma pack(pop)
 ```
 
 Во всех проверенных records `archive_name == "objects.rlb"` и `kind == 1`.
-Поле `parent_or_link` встречается как `-1`, `0`, `1` и другие небольшие индексы
-и связывает компоненты составного unit; точная предметная классификация ссылки
-ещё не закрыта. `description` -- человекочитаемое описание компонента. В Части 2
-есть поля `description[32]`, полностью заполненные без NUL; это валидная bounded
-string длиной 32 байта. Требование обязательного terminator применяется только
-к полям, где оно доказано форматом. `tail0` и `tail1` нельзя нормализовать.
+`tail1` задаёт `immediate_child_count` — число непосредственных дочерних
+записей при построении дерева Unit DAT; оно не opaque. Поле `parent_or_link`
+встречается как `-1`, `0`, `1` и другие небольшие индексы. В подтверждённой
+цепочке Unit DAT → AniMesh → Control оно становится локальным индексом. Для
+`INTO` индекс задаёт устройство Control относительно первого устройства
+родительского компонента, а `EXTO` обрабатывается отдельной ветвью. Поэтому
+поле нельзя трактовать как универсальный parent ID или одинаковую ссылку для
+всех registry types. Детали передачи описаны в [главе о Behavior и Control](06-behavior.md).
+`tail0` сохраняется как raw DWORD без установленной семантики. `description` --
+человекочитаемое описание компонента. В Части 2 есть поля `description[32]`,
+полностью заполненные без NUL; это валидная bounded string длиной 32 байта.
+Требование обязательного terminator применяется только к полям, где оно доказано
+форматом.
 
 Проверено 425 файлов / 5 219 records Части 1 и 676 файлов / 8 145 records
 Части 2. Все соответствуют формуле размера, `kind == 1` и
@@ -470,10 +477,8 @@ string длиной 32 байта. Требование обязательног
 
 При построении mission prototype graph FParkan сохраняет для каждого root
 упорядоченный список этих raw records. Список передаётся в
-`MissionObjectDraft` без преобразования `kind`, `parent_or_link`, description
-или tails в предполагаемые роли. Так runtime уже располагает исходными данными
-составного unit для будущих Control/physics/AniMesh consumers, но не выдаёт
-структурное сходство за доказанную семантику.
+`MissionObjectDraft` с исходными `kind`, `parent_or_link`, description и tails;
+эти данные пока не объединяются в таблицу эффективных устройств Control.
 
 Каждый graph edge от `UnitDatRoot` к effective component и далее к его MSH
 dependency также несёт `unit_component_index`. Это индекс исходной записи в

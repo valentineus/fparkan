@@ -247,6 +247,33 @@ CTLD и связанные resources структурно читаются, coun
 известны. Не названы все секции, shape types, coefficients и точный contact
 solver. То же относится к редким MSH auxiliary streams и части CTPT/NDPR flags.
 
+Одна цепочка Unit DAT → AniMesh descriptor → Control теперь восстановлена
+статически в [главе о Behavior и Control](../tomes/06-behavior.md): raw
+`parent_or_link` копируется в descriptor. В non-`EXTO` registry path parent ID
+разрешается в индекс устройства и сдвигает локальный индекс только когда parent
+ID не равен `-1` и IID `0x202` доступен; иначе используется raw локальный индекс.
+В этом потоке нулевой raw kind пропускает узел вместе с потомками, поэтому общий
+assigned ID нельзя получать из preorder-позиции записи. Это закрывает только
+передачу полей в native loader-е; Rust ещё должен строить такую же проекцию.
+
+Control loader также различает добавление устройств и применение одной записи
+к уже выбранному устройству. Для tag `19` найденные поля и ветви описаны в
+главе, но эффективное слияние пока не реализовано. В Rust parser-е
+`Unsupported { typed_record_index: Some(_) }` означает, что разбор остановился
+внутри списка typed records; без индекса остановки unsupported может относиться
+к effect-tail после уже разобранного списка. Эти случаи нужно различать.
+Ветка default native-фабрики вызывает конструктор по RVA `0x20800`, поэтому
+неизвестный Rust parser-у tag не доказывает отказ оригинального loader-а. Подготовка assets
+сейчас пропускает Control refs у non-geometric prototype, поэтому отсутствие
+подготовленного CTL должно оставаться явным unavailable result, а не
+трактоваться как пустой список.
+
+Глобальные Control selectors `1/2` и setter selector `1` по tag `19` описаны
+там же только по статическому разбору `Control.dll`; execution oracle для этих
+глобальных вызовов нет. Остаются открытыми проверка effective merge на живых
+объектах, полный охват registry types и host factory paths, а также runtime
+жизненный цикл множителя `+0x4c`.
+
 Для `Control.dll` (SHA-256
 `bcb86318089028548a178b03a21accdce15df0cc85ddd91674cf3c2f55012c6e`) tag-26
 getter selector `0x300` восстановлен локально: RVA `0x21d00` читает provider по
