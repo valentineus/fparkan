@@ -178,6 +178,8 @@ pub struct EffectiveControlDevice {
     pub coefficient_bits: Option<[u32; 16]>,
     /// Multiplier bits when the factory default is confirmed.
     pub multiplier_bits: Option<u32>,
+    /// Class-9-only scale used by its selector-0 getter.
+    pub class9_selector0_scale_bits: Option<u32>,
     /// Current native word at `+0x50` when it is known.
     pub native_word_50_bits: Option<u32>,
     /// Current raw descriptor, including typed values and string bytes.
@@ -186,6 +188,43 @@ pub struct EffectiveControlDevice {
     pub factory_provenance: ControlDeviceRecordProvenance,
     /// Source location of the descriptor currently applied to the row.
     pub descriptor_provenance: ControlDeviceRecordProvenance,
+}
+
+/// Why a loaded Control resource query or write could not be represented.
+#[derive(Debug, Eq, PartialEq)]
+pub enum ControlResourceAccessError {
+    /// The requested world object handle is invalid, stale, or deleted.
+    World(fparkan_world::WorldError),
+    /// No mission is currently loaded.
+    MissionUnavailable,
+    /// The live object is not part of the loaded mission projection.
+    ObjectUnavailable { handle: ObjectHandle },
+    /// The object's Control table could not be completely projected.
+    TableUnavailable(MissionControlDeviceTableUnavailableReason),
+    /// This wrapper only implements native resource selectors 1 and 2.
+    UnsupportedSelector(u32),
+    /// A selected row has a factory class whose getter has not been checked.
+    UnsupportedFactoryTag { factory_tag: u32 },
+    /// A selected row lacks a value needed by the native getter or setter.
+    UnsupportedField {
+        factory_tag: u32,
+        field: &'static str,
+    },
+    /// A native float operand or intermediate is not finite.
+    NonFiniteValue {
+        factory_tag: u32,
+        field: &'static str,
+    },
+    /// A native float operand is subnormal and is outside the checked domain.
+    SubnormalValue {
+        factory_tag: u32,
+        field: &'static str,
+    },
+    /// A range probe places a nonzero arithmetic result outside normal f32 range.
+    UnsupportedFloatRange {
+        factory_tag: Option<u32>,
+        field: &'static str,
+    },
 }
 
 /// Why the base Control device table could not be projected for an object.
@@ -1587,6 +1626,244 @@ pub fn loaded_mission_control_device_tables(
         .map(|state| state.control_device_tables.as_slice())
 }
 
+/// Queries native Control global-table selector 1 (weighted ratio) or 2 (sum).
+/// `Ok(None)` preserves the original false/no-result behavior for an empty or
+/// zero-denominator table. Other unsupported native paths are reported as errors.
+/// Inputs and intermediates must be finite and normal, or exact zero.
+///
+/// # Errors
+/// Returns an error for an invalid object handle, unavailable mission/table,
+/// unsupported selector or factory, missing state, or an unsupported float range.
+pub fn query_loaded_mission_control_resource(
+    engine: &Engine,
+    handle: ObjectHandle,
+    selector: u32,
+) -> Result<Option<f32>, ControlResourceAccessError> {
+    transform_state(&engine.world, handle).map_err(ControlResourceAccessError::World)?;
+    let loaded = engine
+        .loaded
+        .as_ref()
+        .ok_or(ControlResourceAccessError::MissionUnavailable)?;
+    let table = loaded
+        .control_device_tables
+        .iter()
+        .find(|table| table.handle == handle)
+        .ok_or(ControlResourceAccessError::ObjectUnavailable { handle })?;
+    query_control_device_table_resource(table, selector)
+}
+
+/// Sets native Control global-table selector 1 on rows whose selector-0 value
+/// is positive. Validation is completed before any row is changed.
+///
+/// # Errors
+/// Returns an error for an invalid object handle, unavailable mission/table,
+/// missing state, a non-finite or subnormal value, or an unsupported float range.
+pub fn set_loaded_mission_control_multiplier(
+    engine: &mut Engine,
+    handle: ObjectHandle,
+    value: f32,
+) -> Result<(), ControlResourceAccessError> {
+    transform_state(&engine.world, handle).map_err(ControlResourceAccessError::World)?;
+    let loaded = engine
+        .loaded
+        .as_mut()
+        .ok_or(ControlResourceAccessError::MissionUnavailable)?;
+    let table = loaded
+        .control_device_tables
+        .iter_mut()
+        .find(|table| table.handle == handle)
+        .ok_or(ControlResourceAccessError::ObjectUnavailable { handle })?;
+    set_control_device_table_multiplier(table, value)
+}
+
+fn query_control_device_table_resource(
+    table: &MissionControlDeviceTableState,
+    selector: u32,
+) -> Result<Option<f32>, ControlResourceAccessError> {
+    if !matches!(selector, 1 | 2) {
+        return Err(ControlResourceAccessError::UnsupportedSelector(selector));
+    }
+    let entries = match &table.status {
+        MissionControlDeviceTableStatus::Available(entries) => entries,
+        MissionControlDeviceTableStatus::Unavailable(reason) => {
+            return Err(ControlResourceAccessError::TableUnavailable(reason.clone()));
+        }
+    };
+
+    let mut numerator = 0.0_f32;
+    let mut denominator = 0.0_f32;
+    for entry in entries.iter().filter(|entry| entry.descriptor.tag == 19) {
+        let base = control_device_selector_zero(entry)?;
+        if base < 0.0 {
+            return Ok(Some(if selector == 1 { 1.0 } else { base }));
+        }
+        if selector == 2 {
+            denominator = checked_control_sum(entry.factory_tag, "sum", denominator, base)?;
+        } else {
+            let multiplier = control_device_float(entry, entry.multiplier_bits, "multiplier")?;
+            let weighted = checked_control_product(
+                entry.factory_tag,
+                "weighted value",
+                control_device_coefficient(entry)?,
+                multiplier,
+            )?;
+            numerator = checked_control_sum(entry.factory_tag, "numerator", numerator, weighted)?;
+            denominator = checked_control_sum(entry.factory_tag, "denominator", denominator, base)?;
+        }
+    }
+
+    if selector == 2 {
+        return Ok((denominator > 0.0).then_some(denominator));
+    }
+    if denominator <= 0.0 {
+        return Ok(None);
+    }
+    checked_control_ratio("ratio", numerator, denominator).map(Some)
+}
+
+fn set_control_device_table_multiplier(
+    table: &mut MissionControlDeviceTableState,
+    value: f32,
+) -> Result<(), ControlResourceAccessError> {
+    let entries = match &mut table.status {
+        MissionControlDeviceTableStatus::Available(entries) => entries,
+        MissionControlDeviceTableStatus::Unavailable(reason) => {
+            return Err(ControlResourceAccessError::TableUnavailable(reason.clone()));
+        }
+    };
+
+    let mut has_target = false;
+    let mut target_factory_tag = 0;
+    for entry in entries.iter() {
+        if entry.descriptor.tag != 19 {
+            continue;
+        }
+        let base = control_device_selector_zero(entry)?;
+        if base > 0.0 {
+            has_target = true;
+            target_factory_tag = entry.factory_tag;
+        }
+    }
+    if !has_target {
+        return Ok(());
+    }
+    checked_control_float(target_factory_tag, "multiplier", value)?;
+    for entry in entries
+        .iter_mut()
+        .filter(|entry| entry.descriptor.tag == 19)
+    {
+        if control_device_selector_zero(entry)? > 0.0 {
+            entry.multiplier_bits = Some(value.to_bits());
+        }
+    }
+    Ok(())
+}
+
+fn control_device_selector_zero(
+    entry: &EffectiveControlDevice,
+) -> Result<f32, ControlResourceAccessError> {
+    let value = match entry.factory_tag {
+        9 => {
+            let coefficient = control_device_coefficient(entry)?;
+            let scale = control_device_float(
+                entry,
+                entry.class9_selector0_scale_bits,
+                "class-9 selector-0 scale",
+            )?;
+            checked_control_product(entry.factory_tag, "selector-0 value", coefficient, scale)?
+        }
+        15 | 19 | 25 => control_device_coefficient(entry)?,
+        factory_tag => {
+            return Err(ControlResourceAccessError::UnsupportedFactoryTag { factory_tag });
+        }
+    };
+    checked_control_float(entry.factory_tag, "selector-0 value", value)
+}
+
+fn control_device_coefficient(
+    entry: &EffectiveControlDevice,
+) -> Result<f32, ControlResourceAccessError> {
+    let words = entry
+        .coefficient_bits
+        .ok_or(ControlResourceAccessError::UnsupportedField {
+            factory_tag: entry.factory_tag,
+            field: "coefficient",
+        })?;
+    control_device_float(entry, Some(words[0]), "coefficient")
+}
+
+fn control_device_float(
+    entry: &EffectiveControlDevice,
+    bits: Option<u32>,
+    field: &'static str,
+) -> Result<f32, ControlResourceAccessError> {
+    let bits = bits.ok_or(ControlResourceAccessError::UnsupportedField {
+        factory_tag: entry.factory_tag,
+        field,
+    })?;
+    checked_control_float(entry.factory_tag, field, f32::from_bits(bits))
+}
+
+fn checked_control_float(
+    factory_tag: u32,
+    field: &'static str,
+    value: f32,
+) -> Result<f32, ControlResourceAccessError> {
+    if !value.is_finite() {
+        return Err(ControlResourceAccessError::NonFiniteValue { factory_tag, field });
+    }
+    if value.is_subnormal() {
+        return Err(ControlResourceAccessError::SubnormalValue { factory_tag, field });
+    }
+    Ok(value)
+}
+
+fn checked_control_product(
+    factory_tag: u32,
+    field: &'static str,
+    lhs: f32,
+    rhs: f32,
+) -> Result<f32, ControlResourceAccessError> {
+    let range_probe = f64::from(lhs) * f64::from(rhs);
+    check_control_range_probe(Some(factory_tag), field, range_probe)?;
+    checked_control_float(factory_tag, field, lhs * rhs)
+}
+
+fn checked_control_ratio(
+    field: &'static str,
+    numerator: f32,
+    denominator: f32,
+) -> Result<f32, ControlResourceAccessError> {
+    let range_probe = f64::from(numerator) / f64::from(denominator);
+    check_control_range_probe(None, field, range_probe)?;
+    checked_control_float(0, field, numerator / denominator)
+}
+
+fn checked_control_sum(
+    factory_tag: u32,
+    field: &'static str,
+    lhs: f32,
+    rhs: f32,
+) -> Result<f32, ControlResourceAccessError> {
+    let range_probe = f64::from(lhs) + f64::from(rhs);
+    check_control_range_probe(Some(factory_tag), field, range_probe)?;
+    checked_control_float(factory_tag, field, lhs + rhs)
+}
+
+fn check_control_range_probe(
+    factory_tag: Option<u32>,
+    field: &'static str,
+    range_probe: f64,
+) -> Result<(), ControlResourceAccessError> {
+    let absolute = range_probe.abs();
+    let minimum_normal = f64::from(f32::MIN_POSITIVE);
+    let maximum = f64::from(f32::MAX);
+    if range_probe != 0.0 && (absolute < minimum_normal || absolute > maximum) {
+        return Err(ControlResourceAccessError::UnsupportedFloatRange { factory_tag, field });
+    }
+    Ok(())
+}
+
 fn behavior_clan_for_selector(
     selector: u32,
     clan_count: usize,
@@ -1770,6 +2047,7 @@ fn append_effective_control_device(
         key,
         coefficient_bits,
         multiplier_bits,
+        class9_selector0_scale_bits: (descriptor.tag == 9).then_some(0x3f80_0000),
         native_word_50_bits,
         descriptor: descriptor.clone(),
         factory_provenance: provenance.clone(),
@@ -1803,14 +2081,14 @@ fn control_factory_uses_common_setter(factory_tag: u32) -> bool {
 }
 
 fn native_control_factory_defaults(factory_tag: u32) -> (Option<u32>, Option<u32>) {
-    let flags = match factory_tag {
-        1 | 4 => 0x200,
-        5 | 8 | 26 => 0x5,
-        10 => 0x2000,
-        17 | 19 => 0x20,
-        _ => return (None, None),
-    };
-    (Some(0x3f80_0000), Some(flags))
+    match factory_tag {
+        1 | 4 => (Some(0x3f80_0000), Some(0x200)),
+        5 | 8 | 26 => (Some(0x3f80_0000), Some(0x5)),
+        10 => (Some(0x3f80_0000), Some(0x2000)),
+        17 | 19 => (Some(0x3f80_0000), Some(0x20)),
+        9 | 15 | 25 => (Some(0x3f80_0000), None),
+        _ => (None, None),
+    }
 }
 
 fn build_control_device_table(
@@ -2678,6 +2956,471 @@ mod tests {
         )
     }
 
+    fn synthetic_effective_control_device(
+        factory_tag: u32,
+        descriptor_tag: u32,
+        coefficient_bits: u32,
+        multiplier_bits: Option<u32>,
+        class9_scale_bits: Option<u32>,
+    ) -> EffectiveControlDevice {
+        let descriptor = synthetic_control_record(descriptor_tag, 2, coefficient_bits, None);
+        let control = synthetic_component_control(
+            0,
+            vec![descriptor.clone()],
+            PreparedControlEffectSection::Parsed(Vec::new()),
+        );
+        let provenance = control_device_record_provenance(0, 0, &control);
+        let mut coefficients = [0; 16];
+        coefficients[0] = coefficient_bits;
+        EffectiveControlDevice {
+            factory_tag,
+            component_id: 3,
+            key: 2,
+            coefficient_bits: Some(coefficients),
+            multiplier_bits,
+            class9_selector0_scale_bits: class9_scale_bits,
+            native_word_50_bits: None,
+            descriptor,
+            factory_provenance: provenance.clone(),
+            descriptor_provenance: provenance,
+        }
+    }
+
+    fn synthetic_control_device_table(
+        status: MissionControlDeviceTableStatus,
+    ) -> MissionControlDeviceTableState {
+        MissionControlDeviceTableState {
+            original_id: Some(OriginalObjectId(7)),
+            handle: ObjectHandle {
+                generation: 5,
+                slot: 7,
+            },
+            status,
+        }
+    }
+
+    #[test]
+    fn control_resource_queries_filter_current_tag_and_use_factory_getters() {
+        let table =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                synthetic_effective_control_device(
+                    9,
+                    19,
+                    2.0_f32.to_bits(),
+                    Some(3.0_f32.to_bits()),
+                    Some(0.5_f32.to_bits()),
+                ),
+                synthetic_effective_control_device(
+                    19,
+                    9,
+                    100.0_f32.to_bits(),
+                    Some(77.0_f32.to_bits()),
+                    None,
+                ),
+                synthetic_effective_control_device(
+                    15,
+                    19,
+                    4.0_f32.to_bits(),
+                    Some(0.5_f32.to_bits()),
+                    None,
+                ),
+                synthetic_effective_control_device(
+                    19,
+                    19,
+                    1.0_f32.to_bits(),
+                    Some(4.0_f32.to_bits()),
+                    None,
+                ),
+            ]));
+
+        assert_eq!(
+            query_control_device_table_resource(&table, 1)
+                .expect("selector 1")
+                .map(f32::to_bits),
+            Some(2.0_f32.to_bits())
+        );
+        assert_eq!(
+            query_control_device_table_resource(&table, 2)
+                .expect("selector 2")
+                .map(f32::to_bits),
+            Some(6.0_f32.to_bits())
+        );
+        assert_eq!(
+            query_control_device_table_resource(&table, 3),
+            Err(ControlResourceAccessError::UnsupportedSelector(3))
+        );
+    }
+
+    #[test]
+    fn control_resource_setter_updates_matching_rows_atomically_and_round_trips() {
+        let mut table =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                synthetic_effective_control_device(
+                    9,
+                    19,
+                    2.0_f32.to_bits(),
+                    Some(3.0_f32.to_bits()),
+                    Some(0.5_f32.to_bits()),
+                ),
+                synthetic_effective_control_device(
+                    19,
+                    9,
+                    100.0_f32.to_bits(),
+                    Some(77.0_f32.to_bits()),
+                    None,
+                ),
+                synthetic_effective_control_device(
+                    15,
+                    19,
+                    4.0_f32.to_bits(),
+                    Some(0.5_f32.to_bits()),
+                    None,
+                ),
+                synthetic_effective_control_device(
+                    19,
+                    19,
+                    1.0_f32.to_bits(),
+                    Some(4.0_f32.to_bits()),
+                    None,
+                ),
+            ]));
+
+        set_control_device_table_multiplier(&mut table, 7.5).expect("setter 1");
+        let MissionControlDeviceTableStatus::Available(entries) = &table.status else {
+            panic!("synthetic table is available");
+        };
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.multiplier_bits)
+                .collect::<Vec<_>>(),
+            [
+                Some(7.5_f32.to_bits()),
+                Some(77.0_f32.to_bits()),
+                Some(7.5_f32.to_bits()),
+                Some(7.5_f32.to_bits())
+            ]
+        );
+        assert_eq!(
+            entries[0].class9_selector0_scale_bits,
+            Some(0.5_f32.to_bits())
+        );
+        assert_eq!(
+            query_control_device_table_resource(&table, 1)
+                .expect("updated selector 1")
+                .map(f32::to_bits),
+            Some(8.75_f32.to_bits())
+        );
+
+        let mut unsupported =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                synthetic_effective_control_device(
+                    19,
+                    19,
+                    2.0_f32.to_bits(),
+                    Some(1.0_f32.to_bits()),
+                    None,
+                ),
+                synthetic_effective_control_device(12, 19, 1.0_f32.to_bits(), None, None),
+            ]));
+        assert_eq!(
+            set_control_device_table_multiplier(&mut unsupported, 2.0),
+            Err(ControlResourceAccessError::UnsupportedFactoryTag { factory_tag: 12 })
+        );
+        let MissionControlDeviceTableStatus::Available(entries) = &unsupported.status else {
+            panic!("synthetic table is available");
+        };
+        assert_eq!(entries[0].multiplier_bits, Some(1.0_f32.to_bits()));
+    }
+
+    #[test]
+    fn control_resource_queries_preserve_native_no_result_and_negative_rules() {
+        let empty =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(Vec::new()));
+        assert_eq!(query_control_device_table_resource(&empty, 1), Ok(None));
+        assert_eq!(query_control_device_table_resource(&empty, 2), Ok(None));
+        assert!(set_control_device_table_multiplier(&mut empty.clone(), f32::NAN).is_ok());
+
+        let zero_denominator =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                synthetic_effective_control_device(
+                    19,
+                    19,
+                    0.0_f32.to_bits(),
+                    Some(2.0_f32.to_bits()),
+                    None,
+                ),
+            ]));
+        assert_eq!(
+            query_control_device_table_resource(&zero_denominator, 1),
+            Ok(None)
+        );
+        assert_eq!(
+            query_control_device_table_resource(&zero_denominator, 2),
+            Ok(None)
+        );
+
+        let nonmatching =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                synthetic_effective_control_device(
+                    19,
+                    9,
+                    4.0_f32.to_bits(),
+                    Some(2.0_f32.to_bits()),
+                    None,
+                ),
+            ]));
+        assert_eq!(
+            query_control_device_table_resource(&nonmatching, 1),
+            Ok(None)
+        );
+
+        let no_multiplier =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                synthetic_effective_control_device(19, 19, 2.0_f32.to_bits(), None, None),
+            ]));
+        assert_eq!(
+            query_control_device_table_resource(&no_multiplier, 2)
+                .expect("selector 2 does not read multiplier")
+                .map(f32::to_bits),
+            Some(2.0_f32.to_bits())
+        );
+
+        let negative =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                synthetic_effective_control_device(19, 19, (-1.0_f32).to_bits(), None, None),
+            ]));
+        assert_eq!(
+            query_control_device_table_resource(&negative, 1)
+                .expect("negative selector 1")
+                .map(f32::to_bits),
+            Some(1.0_f32.to_bits())
+        );
+        assert_eq!(
+            query_control_device_table_resource(&negative, 2)
+                .expect("negative selector 2")
+                .map(f32::to_bits),
+            Some((-1.0_f32).to_bits())
+        );
+
+        let rounded =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                synthetic_effective_control_device(
+                    19,
+                    19,
+                    1.0_f32.to_bits(),
+                    Some(16_777_216.0_f32.to_bits()),
+                    None,
+                ),
+                synthetic_effective_control_device(
+                    19,
+                    19,
+                    1.0_f32.to_bits(),
+                    Some(1.0_f32.to_bits()),
+                    None,
+                ),
+                synthetic_effective_control_device(
+                    19,
+                    19,
+                    1.0_f32.to_bits(),
+                    Some((-16_777_216.0_f32).to_bits()),
+                    None,
+                ),
+            ]));
+        assert_eq!(
+            query_control_device_table_resource(&rounded, 1)
+                .expect("rounded selector 1")
+                .map(f32::to_bits),
+            Some(0.0_f32.to_bits())
+        );
+
+        let mut replaceable =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                synthetic_effective_control_device(
+                    19,
+                    19,
+                    1.0_f32.to_bits(),
+                    Some(f32::INFINITY.to_bits()),
+                    None,
+                ),
+            ]));
+        set_control_device_table_multiplier(&mut replaceable, 2.0)
+            .expect("setter does not read the old multiplier");
+        let MissionControlDeviceTableStatus::Available(entries) = &replaceable.status else {
+            panic!("synthetic table is available");
+        };
+        assert_eq!(entries[0].multiplier_bits, Some(2.0_f32.to_bits()));
+    }
+
+    #[test]
+    fn control_resource_access_reports_unavailable_and_nonfinite_inputs() {
+        let unavailable =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Unavailable(
+                MissionControlDeviceTableUnavailableReason::NoControlResource,
+            ));
+        assert_eq!(
+            query_control_device_table_resource(&unavailable, 1),
+            Err(ControlResourceAccessError::TableUnavailable(
+                MissionControlDeviceTableUnavailableReason::NoControlResource
+            ))
+        );
+
+        let nonfinite =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                synthetic_effective_control_device(
+                    19,
+                    19,
+                    f32::INFINITY.to_bits(),
+                    Some(1.0_f32.to_bits()),
+                    None,
+                ),
+            ]));
+        assert!(matches!(
+            query_control_device_table_resource(&nonfinite, 1),
+            Err(ControlResourceAccessError::NonFiniteValue {
+                factory_tag: 19,
+                field: "coefficient"
+            })
+        ));
+
+        let subnormal =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                synthetic_effective_control_device(19, 19, 1, Some(1.0_f32.to_bits()), None),
+            ]));
+        assert!(matches!(
+            query_control_device_table_resource(&subnormal, 2),
+            Err(ControlResourceAccessError::SubnormalValue {
+                factory_tag: 19,
+                field: "coefficient"
+            })
+        ));
+
+        let mut finite =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                synthetic_effective_control_device(
+                    19,
+                    19,
+                    1.0_f32.to_bits(),
+                    Some(1.0_f32.to_bits()),
+                    None,
+                ),
+            ]));
+        assert!(matches!(
+            set_control_device_table_multiplier(&mut finite, f32::INFINITY),
+            Err(ControlResourceAccessError::NonFiniteValue {
+                factory_tag: 19,
+                field: "multiplier"
+            })
+        ));
+
+        let underflowing_product =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                synthetic_effective_control_device(
+                    19,
+                    19,
+                    f32::MIN_POSITIVE.to_bits(),
+                    Some(f32::MIN_POSITIVE.to_bits()),
+                    None,
+                ),
+            ]));
+        assert!(matches!(
+            query_control_device_table_resource(&underflowing_product, 1),
+            Err(ControlResourceAccessError::UnsupportedFloatRange {
+                factory_tag: Some(19),
+                field: "weighted value"
+            })
+        ));
+
+        let underflowing_ratio =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                synthetic_effective_control_device(
+                    19,
+                    19,
+                    f32::MIN_POSITIVE.to_bits(),
+                    Some(1.0_f32.to_bits()),
+                    None,
+                ),
+                synthetic_effective_control_device(
+                    19,
+                    19,
+                    f32::MAX.to_bits(),
+                    Some(0.0_f32.to_bits()),
+                    None,
+                ),
+            ]));
+        assert!(matches!(
+            query_control_device_table_resource(&underflowing_ratio, 1),
+            Err(ControlResourceAccessError::UnsupportedFloatRange {
+                factory_tag: None,
+                field: "ratio"
+            })
+        ));
+
+        let overflowing_sum =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                synthetic_effective_control_device(19, 19, f32::MAX.to_bits(), None, None),
+                synthetic_effective_control_device(19, 19, f32::MAX.to_bits(), None, None),
+            ]));
+        assert!(matches!(
+            query_control_device_table_resource(&overflowing_sum, 2),
+            Err(ControlResourceAccessError::UnsupportedFloatRange {
+                factory_tag: Some(19),
+                field: "sum"
+            })
+        ));
+    }
+
+    #[test]
+    fn control_resource_api_checks_live_world_handle_before_loaded_state() {
+        let mut engine = create(EngineServices::default()).expect("engine");
+        let handle = construct_object(
+            &mut engine.world,
+            ObjectDraft {
+                original_id: Some(OriginalObjectId(4)),
+            },
+        )
+        .expect("live world object");
+        assert_eq!(
+            query_loaded_mission_control_resource(&engine, handle, 1),
+            Err(ControlResourceAccessError::MissionUnavailable)
+        );
+
+        let stale = ObjectHandle {
+            generation: handle.generation.wrapping_add(1),
+            slot: handle.slot,
+        };
+        assert_eq!(
+            query_loaded_mission_control_resource(&engine, stale, 1),
+            Err(ControlResourceAccessError::World(
+                fparkan_world::WorldError::StaleHandle
+            ))
+        );
+        assert_eq!(
+            set_loaded_mission_control_multiplier(&mut engine, stale, 2.0),
+            Err(ControlResourceAccessError::World(
+                fparkan_world::WorldError::StaleHandle
+            ))
+        );
+
+        fparkan_world::request_delete(&mut engine.world, handle).expect("delete object");
+        assert_eq!(
+            query_loaded_mission_control_resource(&engine, handle, 1),
+            Err(ControlResourceAccessError::World(
+                fparkan_world::WorldError::StaleHandle
+            ))
+        );
+    }
+
+    #[test]
+    fn control_factory_multiplier_defaults_preserve_unknown_word_50() {
+        for factory_tag in [9, 15, 25] {
+            assert_eq!(
+                native_control_factory_defaults(factory_tag),
+                (Some(0x3f80_0000), None)
+            );
+        }
+    }
+
     #[test]
     fn native_basement_mode_uses_unit_header_gate_not_builds_path() {
         assert_eq!(
@@ -3245,6 +3988,19 @@ mod tests {
         let tables = loaded_mission_control_device_tables(&engine).expect("Control tables");
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].original_id, Some(OriginalObjectId(0)));
+        let control_handle = tables[0].handle;
+        assert_eq!(
+            query_loaded_mission_control_resource(&engine, control_handle, 1)
+                .expect("licensed selector 1")
+                .map(f32::to_bits),
+            Some(1.0_f32.to_bits())
+        );
+        assert_eq!(
+            query_loaded_mission_control_resource(&engine, control_handle, 2)
+                .expect("licensed selector 2")
+                .map(f32::to_bits),
+            Some(16.0_f32.to_bits())
+        );
         let MissionControlDeviceTableStatus::Available(entries) = &tables[0].status else {
             panic!(
                 "licensed mine table should be available: {:?}",
@@ -3256,6 +4012,13 @@ mod tests {
             entries
                 .iter()
                 .map(|entry| entry.factory_tag)
+                .collect::<Vec<_>>(),
+            [19, 19, 9, 15, 12, 12, 13, 13, 26, 25, 21]
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.descriptor.tag)
                 .collect::<Vec<_>>(),
             [19, 19, 9, 15, 12, 12, 13, 13, 26, 25, 21]
         );
@@ -3274,6 +4037,10 @@ mod tests {
             (entries[0].multiplier_bits, entries[0].native_word_50_bits),
             (Some(0x3f80_0000), Some(0x20))
         );
+        for index in [2, 3, 9] {
+            assert_eq!(entries[index].multiplier_bits, Some(0x3f80_0000));
+        }
+        assert_eq!(entries[2].class9_selector0_scale_bits, Some(0x3f80_0000));
         assert_eq!(
             entries
                 .iter()
@@ -3300,6 +4067,14 @@ mod tests {
             (21, 5, 22)
         );
         assert_eq!(entries[10].descriptor.tag, 21);
+        set_loaded_mission_control_multiplier(&mut engine, control_handle, 2.5)
+            .expect("licensed setter 1");
+        assert_eq!(
+            query_loaded_mission_control_resource(&engine, control_handle, 1)
+                .expect("updated licensed selector 1")
+                .map(f32::to_bits),
+            Some(2.5_f32.to_bits())
+        );
     }
 
     #[test]

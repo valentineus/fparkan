@@ -25,6 +25,8 @@ internal static class BehaviorDistributorTickOracle {
     private const int OreInitializationRva = 0x08790;
     private const int GetSystemArealMapIatRva = 0x59008;
     private const int ControlResourceDeviceGetterRva = 0x21d00;
+    private const int ControlResourceAggregateQueryRva = 0x2b410;
+    private const int ControlResourceAggregateSetRva = 0x2ba30;
     private const int ControlProviderInterfaceVtableRva = 0x3d254;
     private const int ControlProviderType1GetterRva = 0x0dc40;
     private const int ArealMapUnitDatComponentBuilderRva = 0x14b90;
@@ -75,6 +77,8 @@ internal static class BehaviorDistributorTickOracle {
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int NativeArealMapEvent(IntPtr owner, uint message, uint subcode, IntPtr descriptor);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate IntPtr NativeControlResourceDeviceConstructor(IntPtr self);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate IntPtr NativeControlResourceComponentOverride(IntPtr self, int deviceIndex, IntPtr typedRecord);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int NativeControlAggregateQuery(IntPtr self, uint selector, IntPtr result);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int NativeControlAggregateSet(IntPtr self, uint selector, IntPtr value);
 
     private static readonly AreaMapGetter AreaMapGetterCallback = GetAreaMap;
     private static readonly VectorInsert VectorInsertCallback = InsertVector;
@@ -510,6 +514,7 @@ internal static class BehaviorDistributorTickOracle {
             RunNativeArealMapComponentBuilderCase(arealMapModule);
             RunNativeControlIntoOverrideCase(controlModule);
             RunNativeControlResourceDeviceCase(controlModule);
+            RunNativeControlAggregateResourceCases(controlModule);
         } finally {
             SetX87ControlWord(savedControlWord);
             Console.WriteLine("x87-control-word-restored=0x" + CurrentX87ControlWord().ToString("x4"));
@@ -587,6 +592,118 @@ internal static class BehaviorDistributorTickOracle {
             Marshal.FreeHGlobal(providerRows);
             Marshal.FreeHGlobal(providerOwner);
         }
+    }
+
+    private static void RunNativeControlAggregateResourceCases(IntPtr module) {
+        NativeControlAggregateQuery query = (NativeControlAggregateQuery)Marshal.GetDelegateForFunctionPointer(
+            WriteStdCallToFastcallThunk(0x1c0, IntPtr.Add(module, ControlResourceAggregateQueryRva)),
+            typeof(NativeControlAggregateQuery));
+        NativeControlAggregateSet set = (NativeControlAggregateSet)Marshal.GetDelegateForFunctionPointer(
+            WriteStdCallToFastcallThunk(0x200, IntPtr.Add(module, ControlResourceAggregateSetRva)),
+            typeof(NativeControlAggregateSet));
+        using (Fixture fixture = NewFixture()) {
+            IntPtr owner = fixture.Allocate(0x5b8);
+            IntPtr devices = fixture.Allocate(4 * IntPtr.Size);
+            IntPtr result = fixture.Allocate(sizeof(uint));
+            IntPtr value = fixture.Allocate(sizeof(uint));
+
+            IntPtr tag9Current19 = AddNativeControlAggregateDevice(fixture, module, 9, 19,
+                0x120, ControlResourceTag9ConstructorRva, ControlResourceTag9VtableRva, 2.0f, 3.0f, 0.5f);
+            IntPtr tag19Current9 = AddNativeControlAggregateDevice(fixture, module, 19, 9,
+                0x94, ControlResourceDeviceConstructorRva, ControlResourceTag19VtableRva, 100.0f, 77.0f, 1.0f);
+            IntPtr tag15Current19 = AddNativeControlAggregateDevice(fixture, module, 15, 19,
+                0x98, ControlResourceTag15ConstructorRva, ControlResourceTag15VtableRva, 4.0f, 0.5f, 1.0f);
+            IntPtr tag19Current19 = AddNativeControlAggregateDevice(fixture, module, 19, 19,
+                0x94, ControlResourceDeviceConstructorRva, ControlResourceTag19VtableRva, 1.0f, 4.0f, 1.0f);
+
+            Marshal.WriteIntPtr(devices, 0, tag9Current19);
+            Marshal.WriteIntPtr(devices, IntPtr.Size, tag19Current9);
+            Marshal.WriteIntPtr(devices, 2 * IntPtr.Size, tag15Current19);
+            Marshal.WriteIntPtr(devices, 3 * IntPtr.Size, tag19Current19);
+            Marshal.WriteIntPtr(owner, 0x5b0, devices);
+            Marshal.WriteInt32(owner, 0x5b4, 4);
+
+            Expect(NativeBoolean(query(owner, 1, result)) == 1 && unchecked((uint)Marshal.ReadInt32(result)) == 0x40000000,
+                "Control aggregate selector 1 includes descriptor-19 entries and dispatches their original factory vtables");
+            Expect(NativeBoolean(query(owner, 2, result)) == 1 && unchecked((uint)Marshal.ReadInt32(result)) == 0x40c00000,
+                "Control aggregate selector 2 sums base values for descriptor-19 entries");
+
+            Marshal.WriteInt32(value, 0, FloatBits(7.5f));
+            Expect(NativeBoolean(set(owner, 1, value)) == 1,
+                "Control aggregate setter selector 1 reports success for its recognized selector");
+            Expect(unchecked((uint)Marshal.ReadInt32(tag9Current19, 0x4c)) == 0x40f00000 &&
+                unchecked((uint)Marshal.ReadInt32(tag15Current19, 0x4c)) == 0x40f00000 &&
+                unchecked((uint)Marshal.ReadInt32(tag19Current19, 0x4c)) == 0x40f00000 &&
+                unchecked((uint)Marshal.ReadInt32(tag19Current9, 0x4c)) == FloatBits(77.0f),
+                "Control setter selector 1 updates matching positive devices regardless of factory class, and skips current descriptor tag 9");
+            Expect(NativeBoolean(query(owner, 1, result)) == 1 && unchecked((uint)Marshal.ReadInt32(result)) == 0x410c0000,
+                "Control aggregate selector 1 reflects updated per-device multipliers");
+
+            // Factory tag 9's virtual selector 0 includes +0x11c. A zero base keeps
+            // this selected descriptor out of the native setter's positive-only write.
+            Marshal.WriteInt32(tag9Current19, 0x11c, FloatBits(0.0f));
+            Marshal.WriteInt32(value, 0, FloatBits(9.0f));
+            Expect(NativeBoolean(set(owner, 1, value)) == 1 &&
+                unchecked((uint)Marshal.ReadInt32(tag9Current19, 0x4c)) == 0x40f00000,
+                "Control setter selector 1 leaves the multiplier unchanged when the original factory getter returns zero");
+
+            Marshal.WriteInt32(owner, 0x5b4, 0);
+            Marshal.WriteInt32(result, 0, unchecked((int)0x3f123456));
+            Expect(NativeBoolean(query(owner, 1, result)) == 0 && unchecked((uint)Marshal.ReadInt32(result)) == 0x3f123456,
+                "Control aggregate selector 1 reports no result and leaves output untouched when the table is empty");
+            Expect(NativeBoolean(query(owner, 2, result)) == 0 && unchecked((uint)Marshal.ReadInt32(result)) == 0x3f123456,
+                "Control aggregate selector 2 reports no result and leaves output untouched when the table is empty");
+            Expect(NativeBoolean(set(owner, 1, value)) == 1,
+                "Control aggregate setter selector 1 reports success when the table is empty");
+
+            // The aggregate accumulators spill back to float precision every row.
+            Marshal.WriteInt32(owner, 0x5b4, 3);
+            Marshal.WriteInt32(Marshal.ReadIntPtr(tag19Current9, 0x48), 0, 19);
+            Marshal.WriteInt32(tag9Current19, 0x54, FloatBits(1.0f));
+            Marshal.WriteInt32(tag9Current19, 0x4c, FloatBits(16777216.0f));
+            Marshal.WriteInt32(tag9Current19, 0x11c, FloatBits(1.0f));
+            Marshal.WriteInt32(tag19Current9, 0x54, FloatBits(1.0f));
+            Marshal.WriteInt32(tag19Current9, 0x4c, FloatBits(1.0f));
+            Marshal.WriteInt32(tag15Current19, 0x54, FloatBits(1.0f));
+            Marshal.WriteInt32(tag15Current19, 0x4c, FloatBits(-16777216.0f));
+            Expect(NativeBoolean(query(owner, 1, result)) == 1 && Marshal.ReadInt32(result) == 0,
+                "Control aggregate selector 1 rounds each accumulator to float after each row");
+
+            Marshal.WriteInt32(owner, 0x5b4, 1);
+            Marshal.WriteInt32(tag9Current19, 0x54, FloatBits(-1.0f));
+            Marshal.WriteInt32(tag9Current19, 0x4c, FloatBits(2.0f));
+            Marshal.WriteInt32(result, 0, unchecked((int)0x3f123456));
+            Expect(NativeBoolean(query(owner, 1, result)) == 1 && Marshal.ReadInt32(result) == FloatBits(1.0f),
+                "Control aggregate selector 1 returns one immediately when a selected base value is negative");
+            Expect(NativeBoolean(query(owner, 2, result)) == 1 && Marshal.ReadInt32(result) == FloatBits(-1.0f),
+                "Control aggregate selector 2 returns a selected negative base value immediately");
+
+            Console.WriteLine("native-control-global-resource-table: controlHash=" + ExpectedControlSha256 +
+                " getterRva=0x2b410 setterRva=0x2ba30 selectors=1,2 descriptorFilter=19" +
+                " factory19-descriptor9=excluded factory9-descriptor19-scale=0.5" +
+                " factory15-descriptor19=included initial=[2,6] multiplier=7.5 post-set-getter1=8.75" +
+                " empty=[false/unchanged,false/unchanged,set=true] rounding=0 negative=[1,-1]");
+            GC.KeepAlive(query);
+            GC.KeepAlive(set);
+        }
+    }
+
+    private static IntPtr AddNativeControlAggregateDevice(Fixture fixture, IntPtr module,
+        int factoryTag, int currentDescriptorTag, int objectSize, int constructorRva, int vtableRva,
+        float coefficient, float multiplier, float class9Scale) {
+        IntPtr device = fixture.Allocate(objectSize);
+        NativeControlResourceDeviceConstructor construct = (NativeControlResourceDeviceConstructor)Marshal.GetDelegateForFunctionPointer(
+            IntPtr.Add(module, constructorRva), typeof(NativeControlResourceDeviceConstructor));
+        IntPtr expectedVtable = IntPtr.Add(module, vtableRva);
+        Expect(construct(device) == device && Marshal.ReadIntPtr(device) == expectedVtable,
+            "native factory tag " + factoryTag + " constructor installs its original class vtable");
+        IntPtr descriptor = fixture.Allocate(sizeof(uint));
+        Marshal.WriteInt32(descriptor, 0, currentDescriptorTag);
+        Marshal.WriteIntPtr(device, 0x48, descriptor);
+        Marshal.WriteInt32(device, 0x4c, FloatBits(multiplier));
+        Marshal.WriteInt32(device, 0x54, FloatBits(coefficient));
+        if (factoryTag == 9) Marshal.WriteInt32(device, 0x11c, FloatBits(class9Scale));
+        return device;
     }
 
     private static void RunNativeArealMapComponentBuilderCase(IntPtr module) {
@@ -1276,6 +1393,7 @@ internal static class BehaviorDistributorTickOracle {
             foreach (byte value in digest) hex.Append(value.ToString("x2")); return hex.ToString();
         }
     }
+    private static int NativeBoolean(int eax) { return eax & 0xff; }
     private static void Expect(bool value, string message) { if (!value) throw new InvalidOperationException("original native oracle failed: " + message); }
     private static void ExpectLookupOrder(Fixture fixture, params string[] keys) {
         List<string> actual = new List<string>();
