@@ -1180,6 +1180,19 @@ impl Default for ControlTag21InstanceState {
 /// Input or metadata prevented a safe native control sample.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControlSamplingError {
+    /// This resource-device helper only implements typed-record tag 26.
+    UnsupportedResourceDeviceTag { actual: u32 },
+    /// The record's raw provider key has no resolved NDP table.
+    MissingResourceDeviceNodeData { key: u32 },
+    /// The record's raw provider key is not a row in its NDP table.
+    ResourceDeviceNodeDataKeyOutOfRange { key: u32, row_count: usize },
+    /// The caller did not supply the provider's current type-1 value.
+    MissingResourceDeviceProviderValue { key: u32 },
+    /// A coefficient is outside the helper's finite normal-or-zero contract.
+    InvalidResourceDeviceOperand { operand: &'static str },
+    /// The native x87 intermediate is outside the range represented by normal
+    /// f32 values, so the Rust result could differ from the original.
+    UnsupportedResourceDeviceFloatRange { stage: &'static str },
     /// A state object was reused with a different model node count.
     StateNodeCountMismatch { expected: usize, actual: usize },
     /// A state object was reused with a different number of tag-21 records.
@@ -1214,6 +1227,74 @@ pub enum ControlSamplingError {
     UnsupportedVariableMapping { row_index: usize },
     /// The controller computation produced a non-finite sample.
     NonFiniteSample { record_index: usize },
+}
+
+/// Samples Control's tag-26 typed-record query `0x300` for one current state.
+///
+/// The key in fixed word 1 must select an existing NDP row. The caller supplies
+/// that provider's current type-1 value and the object's current multiplier;
+/// this function does not invent their runtime state. Fixed word 11 is the
+/// coefficient loaded by selector `0x300`. Native code multiplies in the order
+/// `provider_now * coefficient * multiplier_now`.
+///
+/// The source x87 code returns a value with an extended exponent range even
+/// though it uses 24-bit precision. This f32 helper therefore accepts only
+/// finite normal-or-zero operands and normal-or-exact-zero intermediate and
+/// final products. It rejects subnormal or out-of-f32-range products rather
+/// than silently underflowing or overflowing differently from x87.
+pub fn sample_control_resource_device_selector_300(
+    record: &PreparedControlTypedRecord,
+    node_data: Option<&PreparedControlNodeDataTable>,
+    provider_now: Option<f32>,
+    multiplier_now: f32,
+) -> Result<f32, ControlSamplingError> {
+    if record.tag != 26 {
+        return Err(ControlSamplingError::UnsupportedResourceDeviceTag { actual: record.tag });
+    }
+
+    let key = record.fixed_words[1];
+    let Some(node_data) = node_data else {
+        return Err(ControlSamplingError::MissingResourceDeviceNodeData { key });
+    };
+    if !usize::try_from(key).is_ok_and(|key| key < node_data.rows.len()) {
+        return Err(ControlSamplingError::ResourceDeviceNodeDataKeyOutOfRange {
+            key,
+            row_count: node_data.rows.len(),
+        });
+    }
+    let provider_now =
+        provider_now.ok_or(ControlSamplingError::MissingResourceDeviceProviderValue { key })?;
+    let base = f32::from_bits(record.fixed_words[11]);
+
+    for (operand, value) in [
+        ("provider", provider_now),
+        ("base coefficient", base),
+        ("multiplier", multiplier_now),
+    ] {
+        if !value.is_finite() || (value != 0.0 && !value.is_normal()) {
+            return Err(ControlSamplingError::InvalidResourceDeviceOperand { operand });
+        }
+    }
+
+    let provider_times_base =
+        native_range_compatible_product(provider_now, base, "provider times base")?;
+    native_range_compatible_product(provider_times_base, multiplier_now, "then multiplier")
+}
+
+fn native_range_compatible_product(
+    lhs: f32,
+    rhs: f32,
+    stage: &'static str,
+) -> Result<f32, ControlSamplingError> {
+    let exact = f64::from(lhs) * f64::from(rhs);
+    let absolute = exact.abs();
+    let minimum_normal = f64::from(f32::MIN_POSITIVE);
+    let maximum = f64::from(f32::MAX);
+    if exact != 0.0 && (absolute < minimum_normal || absolute > maximum) {
+        return Err(ControlSamplingError::UnsupportedResourceDeviceFloatRange { stage });
+    }
+
+    Ok(lhs * rhs)
 }
 
 /// Samples per-node animation times using the decoded Control timeline.
@@ -4141,6 +4222,203 @@ mod tests {
     // Preserve the authored CTLD fixture bits; this is not the `f32` value of tau.
     const AUTHORED_TAG21_RAW_PARAMETER_3: f32 = f32::from_bits(0x40C8_F5C3);
 
+    fn resource_device_record(tag: u32, key: u32, base_bits: u32) -> PreparedControlTypedRecord {
+        let mut fixed_words = [0; 44];
+        fixed_words[1] = key;
+        fixed_words[11] = base_bits;
+        PreparedControlTypedRecord {
+            tag,
+            fixed_words,
+            values: Vec::new(),
+            string_bytes: Vec::new(),
+            gate_provider: PreparedControlGateProvider::NotApplicable,
+        }
+    }
+
+    fn resource_device_node_data_table(row_count: usize) -> PreparedControlNodeDataTable {
+        PreparedControlNodeDataTable {
+            source: ResourceKey {
+                archive: parse_path("parts.rlb").expect("NDP archive"),
+                name: resource_name(b"resource-device.ndp"),
+                type_id: None,
+            },
+            rows: vec![
+                PreparedControlNodeDataRow {
+                    raw_flags: 0,
+                    max_volume: 0.0,
+                    mobility_per_volume: 0.0,
+                    effect: PreparedControlResourcePair {
+                        archive: [0; 32],
+                        name: [0; 32],
+                    },
+                };
+                row_count
+            ],
+        }
+    }
+
+    #[test]
+    fn tag26_selector_300_multiplies_provider_then_fixed_base_then_multiplier() {
+        let record = resource_device_record(26, 1, 0x3D25_AE4A);
+        let node_data = resource_device_node_data_table(2);
+        let provider_now = f32::from_bits(0x3FE6_982F);
+        let multiplier_now = f32::from_bits(0x4071_5539);
+
+        let sampled = sample_control_resource_device_selector_300(
+            &record,
+            Some(&node_data),
+            Some(provider_now),
+            multiplier_now,
+        )
+        .expect("valid tag-26 resource-device sample");
+
+        assert_eq!(sampled.to_bits(), 0x3E8C_B02E);
+        assert_ne!(
+            sampled.to_bits(),
+            ((provider_now * multiplier_now) * f32::from_bits(record.fixed_words[11])).to_bits(),
+            "the original selector multiplies the provider by the record base first"
+        );
+    }
+
+    #[test]
+    fn tag26_selector_300_requires_its_ndp_row_and_explicit_provider() {
+        let record = resource_device_record(26, 1, 2.0_f32.to_bits());
+        let one_row = resource_device_node_data_table(1);
+        assert_eq!(
+            sample_control_resource_device_selector_300(&record, Some(&one_row), Some(3.0), 4.0,),
+            Err(ControlSamplingError::ResourceDeviceNodeDataKeyOutOfRange {
+                key: 1,
+                row_count: 1,
+            })
+        );
+
+        let two_rows = resource_device_node_data_table(2);
+        assert_eq!(
+            sample_control_resource_device_selector_300(&record, Some(&two_rows), None, 4.0),
+            Err(ControlSamplingError::MissingResourceDeviceProviderValue { key: 1 })
+        );
+        assert_eq!(
+            sample_control_resource_device_selector_300(&record, None, Some(3.0), 4.0),
+            Err(ControlSamplingError::MissingResourceDeviceNodeData { key: 1 })
+        );
+    }
+
+    #[test]
+    fn tag26_selector_300_rejects_other_tags_and_extended_x87_ranges() {
+        let node_data = resource_device_node_data_table(1);
+        let tag21 = resource_device_record(21, 0, 1.0_f32.to_bits());
+        assert_eq!(
+            sample_control_resource_device_selector_300(&tag21, Some(&node_data), Some(1.0), 1.0),
+            Err(ControlSamplingError::UnsupportedResourceDeviceTag { actual: 21 })
+        );
+
+        let tag26 = resource_device_record(26, 0, f32::MIN_POSITIVE.to_bits());
+        assert_eq!(
+            sample_control_resource_device_selector_300(
+                &tag26,
+                Some(&node_data),
+                Some(f32::MIN_POSITIVE),
+                1.0,
+            ),
+            Err(ControlSamplingError::UnsupportedResourceDeviceFloatRange {
+                stage: "provider times base",
+            })
+        );
+    }
+
+    #[test]
+    fn tag26_selector_300_preserves_negative_and_signed_zero_values() {
+        let node_data = resource_device_node_data_table(1);
+        let record = resource_device_record(26, 0, 0.5_f32.to_bits());
+        let negative =
+            sample_control_resource_device_selector_300(&record, Some(&node_data), Some(-2.0), 4.0)
+                .expect("negative factors are not clamped");
+        assert_eq!(negative, -4.0);
+
+        let negative_zero = sample_control_resource_device_selector_300(
+            &resource_device_record(26, 0, 2.0_f32.to_bits()),
+            Some(&node_data),
+            Some(-0.0),
+            3.0,
+        )
+        .expect("signed zero is an exact native input");
+        assert_eq!(negative_zero.to_bits(), (-0.0_f32).to_bits());
+
+        let positive_zero = sample_control_resource_device_selector_300(
+            &resource_device_record(26, 0, 2.0_f32.to_bits()),
+            Some(&node_data),
+            Some(0.0),
+            3.0,
+        )
+        .expect("positive zero is an exact native input");
+        assert_eq!(positive_zero.to_bits(), 0.0_f32.to_bits());
+    }
+
+    #[test]
+    fn tag26_selector_300_rejects_nonfinite_and_subnormal_operands() {
+        let node_data = resource_device_node_data_table(1);
+        for (operand, provider_now, multiplier_now, base_bits) in [
+            ("provider", f32::NAN, 1.0, 1.0_f32.to_bits()),
+            ("multiplier", 1.0, f32::INFINITY, 1.0_f32.to_bits()),
+            ("base coefficient", 1.0, 1.0, 1),
+        ] {
+            let record = resource_device_record(26, 0, base_bits);
+            assert_eq!(
+                sample_control_resource_device_selector_300(
+                    &record,
+                    Some(&node_data),
+                    Some(provider_now),
+                    multiplier_now,
+                ),
+                Err(ControlSamplingError::InvalidResourceDeviceOperand { operand })
+            );
+        }
+    }
+
+    #[test]
+    fn tag26_selector_300_rejects_extended_intermediate_and_final_ranges() {
+        let node_data = resource_device_node_data_table(1);
+        let provider = f32::MAX;
+        let overflowing_intermediate = resource_device_record(26, 0, 2.0_f32.to_bits());
+        assert_eq!(
+            sample_control_resource_device_selector_300(
+                &overflowing_intermediate,
+                Some(&node_data),
+                Some(provider),
+                0.25,
+            ),
+            Err(ControlSamplingError::UnsupportedResourceDeviceFloatRange {
+                stage: "provider times base",
+            })
+        );
+
+        let underflowing_intermediate = resource_device_record(26, 0, f32::MIN_POSITIVE.to_bits());
+        assert_eq!(
+            sample_control_resource_device_selector_300(
+                &underflowing_intermediate,
+                Some(&node_data),
+                Some(f32::MIN_POSITIVE),
+                f32::MAX,
+            ),
+            Err(ControlSamplingError::UnsupportedResourceDeviceFloatRange {
+                stage: "provider times base",
+            })
+        );
+
+        let subnormal_final = resource_device_record(26, 0, 1.0_f32.to_bits());
+        assert_eq!(
+            sample_control_resource_device_selector_300(
+                &subnormal_final,
+                Some(&node_data),
+                Some(f32::MIN_POSITIVE),
+                0.5,
+            ),
+            Err(ControlSamplingError::UnsupportedResourceDeviceFloatRange {
+                stage: "then multiplier",
+            })
+        );
+    }
+
     fn tag21_fullcycle_control() -> PreparedComponentControl {
         let source = ResourceKey {
             archive: parse_path("parts.rlb").expect("archive"),
@@ -6162,6 +6440,60 @@ mod tests {
         assert_eq!(plan.material_count, 62);
         assert_eq!(plan.texture_count, 77);
         assert_eq!(plan.lightmap_count, 0);
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn tag26_selector_300_uses_a_real_control_record_and_ndp_key() {
+        let root = fixture_root("IS");
+        let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(&root));
+        let repository = CachedResourceRepository::new(Arc::clone(&vfs));
+        let roots = [resource_name(b"UNITS/BUILDS/MINE/min_l_n1.dat")];
+        let (_graph, prototypes) =
+            build_prototype_graph(&repository, vfs.as_ref(), &roots).expect("prototype graph");
+        let assets = prepare_mission_assets_with_repository(
+            &repository,
+            &[0..prototypes.len()],
+            &prototypes,
+        )
+        .expect("prepared licensed unit controls");
+
+        let mut sampled_records = 0;
+        for control in assets.object_component_controls.iter().flatten().flatten() {
+            for record in control
+                .typed_records
+                .iter()
+                .filter(|record| record.tag == 26)
+            {
+                let node_data = control
+                    .node_data
+                    .as_ref()
+                    .expect("tag-26 control has its explicit NDP table");
+                assert_eq!(control.source.name.0, b"fr_l_mine.ctl");
+                assert_eq!(node_data.source.name.0, b"fr_l_mine.ndp");
+                assert_eq!(node_data.rows.len(), 22);
+                assert_eq!(record.fixed_words[1], 2);
+                assert_eq!(record.fixed_words[11], 0x3F80_0000);
+                let sample = sample_control_resource_device_selector_300(
+                    record,
+                    Some(node_data),
+                    Some(1.0),
+                    1.0,
+                )
+                .expect("real tag-26 key selects an NDP row");
+                assert_eq!(sample.to_bits(), record.fixed_words[11]);
+                println!(
+                    "control={}: ndp={}: key={} rows={} coefficient=0x{:08x}",
+                    String::from_utf8_lossy(&control.source.name.0),
+                    String::from_utf8_lossy(&node_data.source.name.0),
+                    record.fixed_words[1],
+                    node_data.rows.len(),
+                    record.fixed_words[11],
+                );
+                sampled_records += 1;
+            }
+        }
+        assert_eq!(sampled_records, 1);
     }
 
     #[test]

@@ -16,6 +16,7 @@ internal static class BehaviorDistributorTickOracle {
     private const uint MemRelease = 0x00008000;
     private const uint PageReadWrite = 0x04;
     private const string ExpectedBehaviorSha256 = "ddfbdbde07832358fe6e35e01c8dba9b58e7313789498b6049ed51d4ed9baf99";
+    private const string ExpectedControlSha256 = "bcb86318089028548a178b03a21accdce15df0cc85ddd91674cf3c2f55012c6e";
     private const int TickRva = 0x19e80;
     private const int AddObjectRva = 0x1aac0;
     private const int NormalizeRva = 0x1ac90;
@@ -23,6 +24,9 @@ internal static class BehaviorDistributorTickOracle {
     private const int IndexedPropertyGetRva = 0x0b5b0;
     private const int OreInitializationRva = 0x08790;
     private const int GetSystemArealMapIatRva = 0x59008;
+    private const int ControlResourceDeviceGetterRva = 0x21d00;
+    private const int ControlProviderInterfaceVtableRva = 0x3d254;
+    private const int ControlProviderType1GetterRva = 0x0dc40;
     private const uint ResourceProperty = 0x02000100;
     private static Fixture active;
 
@@ -52,6 +56,7 @@ internal static class BehaviorDistributorTickOracle {
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void IndexedPropertySet(IntPtr self, uint index, uint valueBits);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int IndexedPropertyGet(IntPtr self, uint index, IntPtr resultBits);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeOreInitialization(IntPtr self);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate float NativeControlResourceDeviceGet(IntPtr self, uint selector);
 
     private static readonly AreaMapGetter AreaMapGetterCallback = GetAreaMap;
     private static readonly VectorInsert VectorInsertCallback = InsertVector;
@@ -306,13 +311,20 @@ internal static class BehaviorDistributorTickOracle {
 
     private static int Main() {
         if (IntPtr.Size != 4) { Console.Error.WriteLine("Build with /platform:x86."); return 2; }
+        string controlPath = Environment.GetEnvironmentVariable("FPARKAN_ORIGINAL_CONTROL_DLL");
+        if (String.IsNullOrEmpty(controlPath)) controlPath = @"C:\GOG Games\Parkan - Iron Strategy\Control.dll";
+        if (!File.Exists(controlPath)) { Console.Error.WriteLine("Set FPARKAN_ORIGINAL_CONTROL_DLL to the installed Control.dll."); return 7; }
+        string controlHash = Hash(controlPath);
+        if (controlHash != ExpectedControlSha256) { Console.Error.WriteLine("Unexpected Control.dll SHA-256: " + controlHash); return 8; }
+        IntPtr controlModule = LoadLibraryEx(controlPath, IntPtr.Zero, LoadWithAlteredSearchPath);
+        if (controlModule == IntPtr.Zero) { Console.Error.WriteLine("LoadLibraryEx(Control.dll) failed: " + Marshal.GetLastWin32Error()); return 9; }
         string path = Environment.GetEnvironmentVariable("FPARKAN_ORIGINAL_BEHAVIOR_DLL");
         if (String.IsNullOrEmpty(path)) path = @"C:\GOG Games\Parkan - Iron Strategy\Behavior.dll";
-        if (!File.Exists(path)) { Console.Error.WriteLine("Set FPARKAN_ORIGINAL_BEHAVIOR_DLL to the installed Behavior.dll."); return 3; }
+        if (!File.Exists(path)) { Console.Error.WriteLine("Set FPARKAN_ORIGINAL_BEHAVIOR_DLL to the installed Behavior.dll."); FreeLibrary(controlModule); return 3; }
         string hash = Hash(path);
-        if (hash != ExpectedBehaviorSha256) { Console.Error.WriteLine("Unexpected Behavior.dll SHA-256: " + hash); return 4; }
+        if (hash != ExpectedBehaviorSha256) { Console.Error.WriteLine("Unexpected Behavior.dll SHA-256: " + hash); FreeLibrary(controlModule); return 4; }
         IntPtr module = LoadLibraryEx(path, IntPtr.Zero, LoadWithAlteredSearchPath);
-        if (module == IntPtr.Zero) { Console.Error.WriteLine("LoadLibraryEx(Behavior.dll) failed: " + Marshal.GetLastWin32Error()); return 5; }
+        if (module == IntPtr.Zero) { Console.Error.WriteLine("LoadLibraryEx(Behavior.dll) failed: " + Marshal.GetLastWin32Error()); FreeLibrary(controlModule); return 5; }
         IntPtr import = IntPtr.Add(module, GetSystemArealMapIatRva);
         IntPtr originalImport = Marshal.ReadIntPtr(import);
         uint oldProtection = 0;
@@ -334,7 +346,7 @@ internal static class BehaviorDistributorTickOracle {
                 throw new InvalidOperationException("VirtualProtect(GetSystemArealMap IAT) failed: " + Marshal.GetLastWin32Error());
             protectionChanged = true;
             Marshal.WriteIntPtr(import, Marshal.GetFunctionPointerForDelegate(AreaMapGetterCallback));
-            RunSmokeCases(module);
+            RunSmokeCases(module, controlModule);
             Console.WriteLine("original Behavior.dll distributor oracle passed (native Add 0x1aac0, normalize 0x1ac90, tick 0x19e80; only GetSystemArealMap IAT and bounded vector insertion are substituted; this does not compare Rust parity).");
             return 0;
         }
@@ -357,10 +369,11 @@ internal static class BehaviorDistributorTickOracle {
                 throw new InvalidOperationException("VirtualFree(fastcall callback thunks) failed: " + Marshal.GetLastWin32Error());
             if (x87ControlWordCell != IntPtr.Zero) { Marshal.FreeHGlobal(x87ControlWordCell); x87ControlWordCell = IntPtr.Zero; }
             FreeLibrary(module);
+            FreeLibrary(controlModule);
         }
     }
 
-    private static void RunSmokeCases(IntPtr module) {
+    private static void RunSmokeCases(IntPtr module, IntPtr controlModule) {
         ushort savedControlWord = CurrentX87ControlWord();
         Console.WriteLine("x87-control-word-before=0x" + savedControlWord.ToString("x4") + " (x86 oracle process)");
         try {
@@ -368,6 +381,7 @@ internal static class BehaviorDistributorTickOracle {
             Console.WriteLine("native-add-normalize-x87-control-word=0x" + CurrentX87ControlWord().ToString("x4"));
             RunNativeAddCases(module);
             RunNativeNormalizeCases(module);
+            RunNativeControlResourceDeviceCase(controlModule);
         } finally {
             SetX87ControlWord(savedControlWord);
             Console.WriteLine("x87-control-word-restored=0x" + CurrentX87ControlWord().ToString("x4"));
@@ -394,6 +408,76 @@ internal static class BehaviorDistributorTickOracle {
         RunMixedPowerCase(tick, "mixed-power-recipient-reserve", 4.0f, 8.0f, 0.5f, 0.75f);
         RunMissingCase(tick);
         RunSkippedCase(tick);
+    }
+
+    private static void RunNativeControlResourceDeviceCase(IntPtr module) {
+        Expect(CurrentX87ControlWord() == 0x007f, "Control selector 0x300 uses x87 control word 0x007f");
+        const uint key = 2;
+        const int rowCount = 22;
+        const int providerRow = (int)key * 0x2c;
+        IntPtr providerOwner = Marshal.AllocHGlobal(0x560);
+        IntPtr providerRows = Marshal.AllocHGlobal(rowCount * 0x2c);
+        IntPtr device = IntPtr.Zero;
+        try {
+            Zero(providerOwner, 0x560);
+            Zero(providerRows, rowCount * 0x2c);
+            IntPtr providerInterface = IntPtr.Add(providerOwner, 4);
+            IntPtr providerVtable = IntPtr.Add(module, ControlProviderInterfaceVtableRva);
+            Marshal.WriteIntPtr(providerInterface, providerVtable);
+            Expect(
+                Marshal.ReadIntPtr(providerVtable, 0x0c) == IntPtr.Add(module, ControlProviderType1GetterRva),
+                "Control provider interface vtable uses the native type-1 getter");
+            Marshal.WriteIntPtr(providerOwner, 0x55c, providerRows);
+
+            device = Marshal.AllocHGlobal(0x94);
+            Zero(device, 0x94);
+            Marshal.WriteInt32(device, 0x04, unchecked((int)key));
+            Marshal.WriteIntPtr(device, 0x44, providerInterface);
+
+            NativeControlResourceDeviceGet getter = (NativeControlResourceDeviceGet)
+                Marshal.GetDelegateForFunctionPointer(
+                    IntPtr.Add(module, ControlResourceDeviceGetterRva),
+                    typeof(NativeControlResourceDeviceGet));
+            ExpectControlResourceDeviceResult(getter, device, providerRows, providerRow,
+                0x3fe6982f, 0x3d25ae4a, 0x40715539, 0x3e8cb02e, "order-sensitive normal");
+            ExpectControlResourceDeviceResult(getter, device, providerRows, providerRow,
+                0x7f7fffff, 0x40000000, 0x3e800000, 0x7effffff, "extended intermediate overflow then finite");
+            ExpectControlResourceDeviceResult(getter, device, providerRows, providerRow,
+                0x00800000, 0x00800000, 0x7f7fffff, 0x017fffff, "extended intermediate underflow then finite");
+            ExpectControlResourceDeviceResult(getter, device, providerRows, providerRow,
+                0x00800000, 0x3f800000, 0x3f000000, 0x00400000, "subnormal final result");
+            ExpectControlResourceDeviceResult(getter, device, providerRows, providerRow,
+                0xc0000000, 0x3f000000, 0x40800000, 0xc0800000, "negative factors");
+            ExpectControlResourceDeviceResult(getter, device, providerRows, providerRow,
+                0x80000000, 0x40000000, 0x40400000, 0x80000000, "negative zero");
+            Expect(CurrentX87ControlWord() == 0x007f, "Control selector 0x300 retains x87 control word 0x007f");
+            Console.WriteLine("native-control-tag26-selector-300: controlHash=" + ExpectedControlSha256 +
+                " cw=0x" + CurrentX87ControlWord().ToString("x4") + " key=2 rows=22");
+            GC.KeepAlive(getter);
+        } finally {
+            if (device != IntPtr.Zero) Marshal.FreeHGlobal(device);
+            Marshal.FreeHGlobal(providerRows);
+            Marshal.FreeHGlobal(providerOwner);
+        }
+    }
+
+    private static void ExpectControlResourceDeviceResult(
+        NativeControlResourceDeviceGet getter,
+        IntPtr device,
+        IntPtr providerRows,
+        int providerRow,
+        uint providerBits,
+        uint baseBits,
+        uint multiplierBits,
+        uint expectedBits,
+        string label) {
+        Marshal.WriteInt32(providerRows, providerRow + 0x14, unchecked((int)providerBits));
+        Marshal.WriteInt32(device, 0x54, unchecked((int)baseBits));
+        Marshal.WriteInt32(device, 0x4c, unchecked((int)multiplierBits));
+        uint actualBits = unchecked((uint)FloatBits(getter(device, 0x300)));
+        Expect(actualBits == expectedBits,
+            "Control selector 0x300 " + label + " expected " + Hex(expectedBits) + " but got " + Hex(actualBits));
+        Console.WriteLine("native-control-tag26-selector-300-" + label + ": result=" + Hex(actualBits));
     }
 
     private static void RunNativeIndexedPropertyCases(IntPtr module) {
@@ -911,7 +995,7 @@ internal static class BehaviorDistributorTickOracle {
             foreach (byte value in digest) hex.Append(value.ToString("x2")); return hex.ToString();
         }
     }
-    private static void Expect(bool value, string message) { if (!value) throw new InvalidOperationException("original Behavior oracle failed: " + message); }
+    private static void Expect(bool value, string message) { if (!value) throw new InvalidOperationException("original native oracle failed: " + message); }
     private static void ExpectLookupOrder(Fixture fixture, params string[] keys) {
         List<string> actual = new List<string>();
         foreach (string item in fixture.Trace) if (item.StartsWith("lookup:", StringComparison.Ordinal)) actual.Add(item.Substring(7));

@@ -130,7 +130,7 @@ host construction phases. Не проверена другая лицензир�
 непустым `Init`. Вызов `Behavior.dll!FUN_10019e80` (RVA `0x19e80`, SHA-256
 `ddfbdbde07832358fe6e35e01c8dba9b58e7313789498b6049ed51d4ed9baf99`) исполнялся
 на синтетических интерфейсах. Путь членства в реальных distributor-списках
-теперь связан с полями TMA и Unit DAT: `World3D!CreateObject` передаёт selector
+связан с полями TMA и Unit DAT: `World3D!CreateObject` передаёт selector
 и class word через дескриптор в Behavior (RVA `0x7e55`, `0x7e62`), а
 `Behavior.dll!FUN_10005e60` (RVA `0x5e60`) проверяет высокий бит registration
 key, AI и distributor. Selector из первого DWORD после имени ресурса выбирает
@@ -203,7 +203,15 @@ prototype roots без Unit DAT и отложенные spawn после исх�
 этой модели. Путь в `ArealMap.dll` (SHA-256
 `a25f9254ebb339d70e2e07c8121950191e9584ca0858d8e9c2e2b6c671edf6ea`) к
 `CreateObject` по RVA `0x14fd0`/`0x15290` показывает выбор World3D class 3 или 4
-по старшему биту, но не всю цепочку их Behavior attachment.
+по старшему биту. Для ветки GOG `AniMesh.dll` (SHA-256
+`65659bf67f20e5be77d67a5b2f59968f61b94293143807fa59ca451c560c4f7e`) RVA
+`0x2ff0` показывает одну ветку создания: после QueryInterface для IID `0x204`
+выполняется отдельный импорт `GetQueue()`, а на возвращённом объекте вызывается
+метод через vtable slot `+0x30`. `CreateBehaviour` вызывается только при
+ненулевом результате этого метода и host class `3` или `4`; class `4` получает
+адреса полей prototype `+0x140` и `+0x160`. Семантика метода slot `+0x30` не
+установлена. Другие factory paths, нулевой результат и spawn после исходной
+загрузки остаются за границами подтверждённой ветки.
 
 Для `Handler(30)` отдельно подтверждены обратный вызов `iron3d.dll` RVA
 `0x611d0` (SHA-256 `d1dc4ea8535e2069b0a05c9e8be2724dd438ba44cca7a83007d8b2e50f9e35fa`),
@@ -238,6 +246,23 @@ mission completion, pause и non-default game time.
 CTLD и связанные resources структурно читаются, count patterns и variants
 известны. Не названы все секции, shape types, coefficients и точный contact
 solver. То же относится к редким MSH auxiliary streams и части CTPT/NDPR flags.
+
+Для `Control.dll` (SHA-256
+`bcb86318089028548a178b03a21accdce15df0cc85ddd91674cf3c2f55012c6e`) tag-26
+getter selector `0x300` восстановлен локально: RVA `0x21d00` читает provider по
+ключу `fixed_words[1]`, затем умножает provider, CTLD coefficient `fixed_words[11]`
+и поле объекта `+0x4c` именно в таком порядке. Rust helper принимает текущие
+provider и multiplier извне; он не восстанавливает их жизненный цикл или весь
+Control tick. В x86 oracle при x87 control word `0x007f` проверены порядок,
+signed zero, отрицательные входы, расширенный промежуточный диапазон и
+subnormal return. Helper ограничивает себя normal-or-zero значениями, поэтому
+явно отклоняет промежуточные случаи, где результат выходит за поддерживаемый
+диапазон f32, даже если позднее умножение вернуло бы его в диапазон. Это
+ограничение поддержки Rust helper-а, а не неверный native-результат.
+
+В Unit DAT fixture `UNITS/BUILDS/MINE/min_l_n1.dat` проверена реальная связка
+`fr_l_mine.ctl` + `fr_l_mine.ndp`: tag `26`, ключ `2` в таблице из `22` строк,
+коэффициент `1.0`. Это не запись живого resource-device значения в миссии.
 
 Закрывающий эксперимент: трассировать `LoadControlSystem`,
 `LoadPhysicalModel`, `CreateCollManager` и создание collision objects; связать
