@@ -29,6 +29,8 @@ internal static class BehaviorDistributorTickOracle {
     private const int ControlResourceAggregateSetRva = 0x2ba30;
     private const int ControlProviderInterfaceVtableRva = 0x3d254;
     private const int ControlProviderType1GetterRva = 0x0dc40;
+    private const int ControlProviderRowConstructorRva = 0x0b240;
+    private const int ControlProviderAmountUpdateRva = 0x10f30;
     private const int ArealMapUnitDatComponentBuilderRva = 0x14b90;
     private const int ControlResourceDeviceConstructorRva = 0x22980;
     private const int ControlResourceComponentOverrideRva = 0x2d890;
@@ -79,6 +81,9 @@ internal static class BehaviorDistributorTickOracle {
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate IntPtr NativeControlResourceComponentOverride(IntPtr self, int deviceIndex, IntPtr typedRecord);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int NativeControlAggregateQuery(IntPtr self, uint selector, IntPtr result);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int NativeControlAggregateSet(IntPtr self, uint selector, IntPtr value);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlProviderAmountUpdate(IntPtr self, int nodeIndex, float delta, uint animationFlag);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlProviderRowConstructor(IntPtr self, IntPtr sourceNdpRow);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void NativeControlNodeUpdateCallback(IntPtr self, uint nodeIndex, uint selector, uint valueBits);
 
     private static readonly AreaMapGetter AreaMapGetterCallback = GetAreaMap;
     private static readonly VectorInsert VectorInsertCallback = InsertVector;
@@ -92,7 +97,12 @@ internal static class BehaviorDistributorTickOracle {
     private static readonly InterfaceGetProperty InterfaceGetCallback = GetInterfaceProperty;
     private static readonly InterfaceSetProperty InterfaceSetCallback = SetInterfaceProperty;
     private static readonly NativeArealMapEvent ArealMapEventCallback = OnArealMapEvent;
+    private static readonly NativeControlNodeUpdateCallback ControlNodeUpdateCallback = OnControlNodeUpdate;
     private static ArealMapFixture activeArealMap;
+    private static int controlNodeUpdateCount;
+    private static uint controlNodeUpdateIndex;
+    private static uint controlNodeUpdateSelector;
+    private static uint controlNodeUpdateValueBits;
     private static IntPtr fastcallThunks;
     private static IntPtr queryObjectThunk;
     private static IntPtr getInterfacePropertyThunk;
@@ -398,6 +408,12 @@ internal static class BehaviorDistributorTickOracle {
         active.Trace.Add("iface-set:" + item.Key.ToString("x8") + ":" + iid.ToString("x") + ":" + selector.ToString("x") + ":" + number.ToString("R", System.Globalization.CultureInfo.InvariantCulture));
         return 1;
     }
+    private static void OnControlNodeUpdate(IntPtr self, uint nodeIndex, uint selector, uint valueBits) {
+        controlNodeUpdateCount++;
+        controlNodeUpdateIndex = nodeIndex;
+        controlNodeUpdateSelector = selector;
+        controlNodeUpdateValueBits = valueBits;
+    }
     private static float SequenceValue(float[] sequence, int index, float fallback) {
         if (sequence == null || sequence.Length == 0) return fallback;
         return sequence[Math.Min(index, sequence.Length - 1)];
@@ -493,6 +509,7 @@ internal static class BehaviorDistributorTickOracle {
             GC.KeepAlive(ObjectQueryCallback); GC.KeepAlive(ObjectRateCallback);
             GC.KeepAlive(ObjectGetPropertyCallback); GC.KeepAlive(ObjectSetPropertyCallback);
             GC.KeepAlive(InterfaceGetCallback); GC.KeepAlive(InterfaceSetCallback);
+            GC.KeepAlive(ControlNodeUpdateCallback);
             GC.KeepAlive(ArealMapEventCallback);
             if (thunksAllocated && !VirtualFree(fastcallThunks, UIntPtr.Zero, MemRelease))
                 throw new InvalidOperationException("VirtualFree(fastcall callback thunks) failed: " + Marshal.GetLastWin32Error());
@@ -514,6 +531,7 @@ internal static class BehaviorDistributorTickOracle {
             RunNativeArealMapComponentBuilderCase(arealMapModule);
             RunNativeControlIntoOverrideCase(controlModule);
             RunNativeControlResourceDeviceCase(controlModule);
+            RunNativeControlProviderLiveStateCase(controlModule);
             RunNativeControlAggregateResourceCases(controlModule);
         } finally {
             SetX87ControlWord(savedControlWord);
@@ -591,6 +609,100 @@ internal static class BehaviorDistributorTickOracle {
             if (device != IntPtr.Zero) Marshal.FreeHGlobal(device);
             Marshal.FreeHGlobal(providerRows);
             Marshal.FreeHGlobal(providerOwner);
+        }
+    }
+
+    private static void RunNativeControlProviderLiveStateCase(IntPtr module) {
+        NativeControlProviderRowConstructor constructProviderRow = (NativeControlProviderRowConstructor)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlProviderRowConstructorRva),
+                typeof(NativeControlProviderRowConstructor));
+        NativeControlProviderAmountUpdate update = (NativeControlProviderAmountUpdate)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlProviderAmountUpdateRva),
+                typeof(NativeControlProviderAmountUpdate));
+        NativeControlResourceDeviceGet getter = (NativeControlResourceDeviceGet)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlResourceDeviceGetterRva),
+                typeof(NativeControlResourceDeviceGet));
+
+        using (Fixture fixture = NewFixture()) {
+            IntPtr owner = fixture.Allocate(0x664);
+            IntPtr rows = fixture.Allocate(2 * 0x2c);
+            IntPtr ndpDescriptor = fixture.Allocate(0x4c);
+            IntPtr initializedRow = fixture.Allocate(0x2c);
+            constructProviderRow(initializedRow, ndpDescriptor);
+            uint[] initialWords = new uint[11];
+            for (int i = 0; i < initialWords.Length; i++)
+                initialWords[i] = unchecked((uint)Marshal.ReadInt32(initializedRow, i * 4));
+            uint[] expectedInitialWords = {
+                unchecked((uint)ndpDescriptor.ToInt32()), 0xffffffff, 0x3f800000,
+                0x3f800000, 0, 0x3f800000, 0, 1, 0, 0xffffffff, 0
+            };
+            Expect(String.Join(",", initialWords) == String.Join(",", expectedInitialWords),
+                "Control native NDP provider row constructor initializes all eleven words and type-1 current to 1.0");
+
+            IntPtr providerInterface = IntPtr.Add(owner, 4);
+            IntPtr providerVtable = IntPtr.Add(module, ControlProviderInterfaceVtableRva);
+            IntPtr callbackObject = fixture.Allocate(IntPtr.Size);
+            IntPtr callbackVtable = fixture.Allocate(0x38);
+            IntPtr device = fixture.Allocate(0x94);
+            IntPtr row = IntPtr.Add(rows, 0x2c); // Keep the root row untouched.
+
+            Marshal.WriteIntPtr(providerInterface, providerVtable);
+            Marshal.WriteIntPtr(owner, 0x55c, rows);
+            Marshal.WriteInt32(owner, 0x548, FloatBits(1.0f));
+            Marshal.WriteInt32(owner, 0x590, FloatBits(40.0f));
+            Marshal.WriteInt32(owner, 0x660, FloatBits(1.0f));
+
+            Marshal.WriteIntPtr(row, 0x00, ndpDescriptor);
+            Marshal.WriteInt32(ndpDescriptor, 0x04, FloatBits(100.0f)); // Native selector 3 maximum.
+            Marshal.WriteInt32(row, 0x04, -1); // Root row has no parent node.
+            Marshal.WriteInt32(row, 0x08, FloatBits(40.0f));
+            Marshal.WriteInt32(row, 0x14, FloatBits(0.4f));
+
+            Marshal.WriteIntPtr(callbackObject, 0, callbackVtable);
+            Marshal.WriteIntPtr(callbackVtable, 0x34, Marshal.GetFunctionPointerForDelegate(ControlNodeUpdateCallback));
+            Marshal.WriteIntPtr(owner, 0x20, callbackObject);
+
+            Marshal.WriteInt32(device, 0x04, 1);
+            Marshal.WriteInt32(device, 0x4c, FloatBits(3.0f));
+            Marshal.WriteInt32(device, 0x54, FloatBits(2.0f));
+            Marshal.WriteIntPtr(device, 0x44, providerInterface);
+
+            controlNodeUpdateCount = 0;
+            update(owner, 1, 20.0f, 0);
+            Expect(ReadFloat(row, 0x08) == 60.0f && ReadFloat(row, 0x14) == 0.6f &&
+                ReadFloat(owner, 0x590) == 60.0f,
+                "Control native amount update clamps the node amount, updates the normalized provider value, and keeps the aggregate amount in sync");
+            Expect(controlNodeUpdateCount == 1 && controlNodeUpdateIndex == 1 &&
+                controlNodeUpdateSelector == 0x200 && controlNodeUpdateValueBits == unchecked((uint)FloatBits(0.6f)),
+                "Control native amount update publishes the normalized provider state through the existing node callback");
+            Expect(unchecked((uint)FloatBits(getter(device, 0x300))) ==
+                unchecked((uint)FloatBits(0.6f * 2.0f * 3.0f)),
+                "Control tag-26 selector 0x300 observes the updated NDP provider value through the native provider interface");
+
+            update(owner, 1, -10.0f, 0);
+            Expect(ReadFloat(row, 0x08) == 50.0f && ReadFloat(row, 0x14) == 0.5f &&
+                unchecked((uint)FloatBits(getter(device, 0x300))) == 0x40400000,
+                "Control native amount update is reversible and tag-26 selector 0x300 tracks the changed provider row");
+
+            update(owner, 1, 1000.0f, 0);
+            Expect(ReadFloat(row, 0x08) == 100.0f && ReadFloat(row, 0x14) == 1.0f &&
+                unchecked((uint)FloatBits(getter(device, 0x300))) == 0x40c00000,
+                "Control native amount update clamps the provider value at its native selector-3 maximum");
+
+            update(owner, 1, -200.0f, 0);
+            Expect(ReadFloat(row, 0x08) == 0.0f && ReadFloat(row, 0x14) == 0.0f &&
+                (unchecked((uint)Marshal.ReadInt32(row, 0x28)) & 0x10) != 0 &&
+                unchecked((uint)FloatBits(getter(device, 0x300))) == 0,
+                "Control native depletion sets the exhausted flag and selector 0x300 returns the live zero provider value");
+            Expect(controlNodeUpdateCount == 4 && controlNodeUpdateIndex == 1 &&
+                controlNodeUpdateSelector == 0x200 && controlNodeUpdateValueBits == 0,
+                "Control native node callback receives every normalized provider update through exhaustion");
+
+            Console.WriteLine("native-control-live-ndp-provider: controlHash=" + ExpectedControlSha256 +
+                " rowCtorRva=0xb240 initialType1=1 rowStride=0x2c node=1 max=100 amount=0..100 tag26Selector300=live");
+            GC.KeepAlive(constructProviderRow);
+            GC.KeepAlive(update);
+            GC.KeepAlive(getter);
         }
     }
 

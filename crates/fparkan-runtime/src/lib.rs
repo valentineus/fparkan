@@ -1,14 +1,16 @@
 #![forbid(unsafe_code)]
 //! Runtime orchestration for mission loading and world stepping.
 
+#[cfg(test)]
+use fparkan_assets::PreparedControlResourcePair;
 use fparkan_assets::{
     decode_mission_land_path, decode_mission_payload, decode_nres_payload,
     derive_mission_land_paths, extend_graph_report_with_visual_dependencies,
     mission_script_bundle_bases, prepare_terrain_world, AssetError as AssetPreparationError,
     AssetId, AssetManager, BuildCategory, MissionAssetPlan, MissionDocument, MissionError,
     MissionTerrainPaths, NresError, PreparedComponentControl, PreparedControlEffectSection,
-    PreparedControlTypedRecord, PreparedVisual, TerrainFormatError, TerrainPreparationError,
-    TerrainWorld, TmaProfile,
+    PreparedControlNodeDataRow, PreparedControlNodeDataTable, PreparedControlTypedRecord,
+    PreparedVisual, TerrainFormatError, TerrainPreparationError, TerrainWorld, TmaProfile,
 };
 use fparkan_path::{normalize_relative, NormalizedPath, PathError, PathPolicy};
 use fparkan_prototype::{
@@ -190,6 +192,49 @@ pub struct EffectiveControlDevice {
     pub descriptor_provenance: ControlDeviceRecordProvenance,
 }
 
+/// Initial row in the loaded global Control node-data provider.
+///
+/// The native table is indexed independently of MSH model nodes. Its rows are
+/// appended in root/EXTO resource order and begin with a type-1 value of 1.0.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MissionControlNodeProviderRow {
+    /// NDP resource that contributed the row.
+    pub source: ResourceKey,
+    /// Unit DAT component that contributed the row.
+    pub unit_component_index: usize,
+    /// Index in that component's original NDP table.
+    pub source_row_index: usize,
+    /// Original NDP descriptor fields and provenance for this provider row.
+    pub source_row: PreparedControlNodeDataRow,
+    /// Initial native provider selector-1 value (`+0x14`) as raw bits.
+    pub initial_type1_value_bits: u32,
+}
+
+/// Availability of the initial global Control node-data provider projection.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MissionControlNodeProviderTableStatus {
+    /// Rows in native append order, without padding to the MSH node count.
+    Available(Vec<MissionControlNodeProviderRow>),
+    /// Provider lookup is not modeled for this object's available inputs.
+    Unavailable(MissionControlNodeProviderTableUnavailableReason),
+}
+
+/// Why the global Control node-data provider could not be projected.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MissionControlNodeProviderTableUnavailableReason {
+    /// A root or mounted EXTO Control resource has no resolved NDP sidecar.
+    MissingNodeData {
+        /// Unit DAT component needing the provider rows.
+        unit_component_index: usize,
+        /// Explicitly requested sidecar when the reference was known.
+        source: Option<ResourceKey>,
+    },
+    /// A mounted EXTO needs a first NDP row for the native skip-first path.
+    MissingExToRootRow { unit_component_index: usize },
+    /// The Control component traversal itself was incomplete.
+    DeviceTableUnavailable(MissionControlDeviceTableUnavailableReason),
+}
+
 /// Why a loaded Control resource query or write could not be represented.
 #[derive(Debug, Eq, PartialEq)]
 pub enum ControlResourceAccessError {
@@ -205,6 +250,24 @@ pub enum ControlResourceAccessError {
     UnsupportedSelector(u32),
     /// A selected row has a factory class whose getter has not been checked.
     UnsupportedFactoryTag { factory_tag: u32 },
+    /// A device index does not exist in the object's native Control table.
+    DeviceIndexOutOfRange {
+        /// Requested global Control device index.
+        device_index: usize,
+        /// Projected device count.
+        device_count: usize,
+    },
+    /// The node provider table could not be projected.
+    NodeProviderTableUnavailable(MissionControlNodeProviderTableUnavailableReason),
+    /// A device's native provider key exceeds the actual appended NDP rows.
+    NodeProviderKeyOutOfRange {
+        /// Current native device key, used directly as a provider row index.
+        key: u32,
+        /// Actual global provider row count.
+        row_count: usize,
+    },
+    /// A native tag has an e00 callback that has not been implemented here.
+    UnsupportedCurrentTag { tag: u32 },
     /// A selected row lacks a value needed by the native getter or setter.
     UnsupportedField {
         factory_tag: u32,
@@ -283,6 +346,13 @@ pub struct MissionControlDeviceTableState {
     pub handle: ObjectHandle,
     /// Complete base projection, or an explicit unsupported boundary.
     pub status: MissionControlDeviceTableStatus,
+    /// Initial global NDP provider rows used by indexed Control selectors.
+    pub node_provider_status: MissionControlNodeProviderTableStatus,
+}
+
+struct ControlDeviceProjection {
+    devices: Vec<EffectiveControlDevice>,
+    node_provider_status: MissionControlNodeProviderTableStatus,
 }
 
 /// Resource distributor state associated with one TMA clan's constructed AI.
@@ -1223,25 +1293,36 @@ fn load_mission_with_options(
             .iter()
             .zip(&handles)
             .enumerate()
-            .map(
-                |(object_index, (draft, handle))| MissionControlDeviceTableState {
-                    original_id: draft.original_id,
-                    handle: *handle,
-                    status: build_control_device_table(
-                        object_index,
-                        draft,
-                        &mission_assets,
-                        prototype_graph
-                            .root_prototype_request_spans
-                            .get(object_index),
-                        &resolved_prototypes,
-                    )
-                    .map_or_else(
-                        MissionControlDeviceTableStatus::Unavailable,
-                        MissionControlDeviceTableStatus::Available,
-                    ),
-                },
-            )
+            .map(|(object_index, (draft, handle))| {
+                let projection = build_control_device_projection(
+                    object_index,
+                    draft,
+                    &mission_assets,
+                    prototype_graph
+                        .root_prototype_request_spans
+                        .get(object_index),
+                    &resolved_prototypes,
+                );
+                match projection {
+                    Ok(projection) => MissionControlDeviceTableState {
+                        original_id: draft.original_id,
+                        handle: *handle,
+                        status: MissionControlDeviceTableStatus::Available(projection.devices),
+                        node_provider_status: projection.node_provider_status,
+                    },
+                    Err(reason) => MissionControlDeviceTableState {
+                        original_id: draft.original_id,
+                        handle: *handle,
+                        status: MissionControlDeviceTableStatus::Unavailable(reason.clone()),
+                        node_provider_status:
+                            MissionControlNodeProviderTableStatus::Unavailable(
+                                MissionControlNodeProviderTableUnavailableReason::DeviceTableUnavailable(
+                                    reason,
+                                ),
+                            ),
+                    },
+                }
+            })
             .collect()
     } else {
         Vec::new()
@@ -1652,6 +1733,35 @@ pub fn query_loaded_mission_control_resource(
     query_control_device_table_resource(table, selector)
 }
 
+/// Queries one loaded Control device through its original factory getter.
+///
+/// Selector `0xe00` is currently modeled for current descriptor tag 26 with
+/// factory tag 26. The loaded NDP provider value is its initial native state;
+/// later Control updates are not synchronized into this snapshot.
+///
+/// # Errors
+/// Returns an error for an invalid handle, unavailable mission/table/provider,
+/// an out-of-range device/provider key, or a factory/tag/float path that is not
+/// supported by the current reconstruction.
+pub fn query_loaded_mission_control_device_selector(
+    engine: &Engine,
+    handle: ObjectHandle,
+    device_index: usize,
+    selector: u32,
+) -> Result<Option<f32>, ControlResourceAccessError> {
+    transform_state(&engine.world, handle).map_err(ControlResourceAccessError::World)?;
+    let loaded = engine
+        .loaded
+        .as_ref()
+        .ok_or(ControlResourceAccessError::MissionUnavailable)?;
+    let table = loaded
+        .control_device_tables
+        .iter()
+        .find(|table| table.handle == handle)
+        .ok_or(ControlResourceAccessError::ObjectUnavailable { handle })?;
+    query_control_device_table_selector(table, device_index, selector)
+}
+
 /// Sets native Control global-table selector 1 on rows whose selector-0 value
 /// is positive. Validation is completed before any row is changed.
 ///
@@ -1719,6 +1829,85 @@ fn query_control_device_table_resource(
         return Ok(None);
     }
     checked_control_ratio("ratio", numerator, denominator).map(Some)
+}
+
+fn query_control_device_table_selector(
+    table: &MissionControlDeviceTableState,
+    device_index: usize,
+    selector: u32,
+) -> Result<Option<f32>, ControlResourceAccessError> {
+    if selector != 0xe00 {
+        return Err(ControlResourceAccessError::UnsupportedSelector(selector));
+    }
+    let devices = match &table.status {
+        MissionControlDeviceTableStatus::Available(devices) => devices,
+        MissionControlDeviceTableStatus::Unavailable(reason) => {
+            return Err(ControlResourceAccessError::TableUnavailable(reason.clone()));
+        }
+    };
+    let device =
+        devices
+            .get(device_index)
+            .ok_or(ControlResourceAccessError::DeviceIndexOutOfRange {
+                device_index,
+                device_count: devices.len(),
+            })?;
+    match device.descriptor.tag {
+        26 => {}
+        5 | 10 | 21 => {
+            return Err(ControlResourceAccessError::UnsupportedCurrentTag {
+                tag: device.descriptor.tag,
+            });
+        }
+        _ => return Ok(None),
+    }
+    if device.factory_tag != 26 {
+        return Err(ControlResourceAccessError::UnsupportedFactoryTag {
+            factory_tag: device.factory_tag,
+        });
+    }
+
+    let providers = match &table.node_provider_status {
+        MissionControlNodeProviderTableStatus::Available(providers) => providers,
+        MissionControlNodeProviderTableStatus::Unavailable(reason) => {
+            return Err(ControlResourceAccessError::NodeProviderTableUnavailable(
+                reason.clone(),
+            ));
+        }
+    };
+    let key = usize::try_from(device.key).map_err(|_| {
+        ControlResourceAccessError::NodeProviderKeyOutOfRange {
+            key: device.key,
+            row_count: providers.len(),
+        }
+    })?;
+    let provider =
+        providers
+            .get(key)
+            .ok_or(ControlResourceAccessError::NodeProviderKeyOutOfRange {
+                key: device.key,
+                row_count: providers.len(),
+            })?;
+    let provider_value = checked_control_float(
+        device.factory_tag,
+        "node provider value",
+        f32::from_bits(provider.initial_type1_value_bits),
+    )?;
+    let coefficient = control_device_coefficient(device)?;
+    let multiplier = control_device_float(device, device.multiplier_bits, "multiplier")?;
+    let provider_weighted = checked_control_product(
+        device.factory_tag,
+        "provider times coefficient",
+        provider_value,
+        coefficient,
+    )?;
+    checked_control_product(
+        device.factory_tag,
+        "then multiplier",
+        provider_weighted,
+        multiplier,
+    )
+    .map(Some)
 }
 
 fn set_control_device_table_multiplier(
@@ -1941,6 +2130,30 @@ fn native_component_target_index(
     }
 }
 
+fn native_component_mount_node(
+    tree: &[UnitComponentTreeNode],
+    component_ids: &[Option<u32>],
+    first_global_nodes: &[Option<u32>],
+    component_index: usize,
+    raw_local_index: i32,
+) -> Option<u32> {
+    tree.get(component_index)
+        .and_then(|node| node.parent_index)
+        .and_then(|parent_index| {
+            let parent_id = component_ids.get(parent_index).copied().flatten()?;
+            let parent_first = first_global_nodes
+                .get(parent_index)
+                .copied()
+                .flatten()
+                .unwrap_or(u32::MAX);
+            Some(
+                parent_first
+                    .wrapping_add(raw_local_index as u32)
+                    .wrapping_sub(u32::from(parent_id != 0)),
+            )
+        })
+}
+
 fn native_into_table_target_index(
     devices: &[EffectiveControlDevice],
     parent_component_id: u32,
@@ -2091,6 +2304,7 @@ fn native_control_factory_defaults(factory_tag: u32) -> (Option<u32>, Option<u32
     }
 }
 
+#[cfg(test)]
 fn build_control_device_table(
     object_index: usize,
     draft: &MissionObjectDraft,
@@ -2098,6 +2312,17 @@ fn build_control_device_table(
     prototype_span: Option<&std::ops::Range<usize>>,
     prototypes: &[fparkan_prototype::EffectivePrototype],
 ) -> Result<Vec<EffectiveControlDevice>, MissionControlDeviceTableUnavailableReason> {
+    build_control_device_projection(object_index, draft, assets, prototype_span, prototypes)
+        .map(|projection| projection.devices)
+}
+
+fn build_control_device_projection(
+    object_index: usize,
+    draft: &MissionObjectDraft,
+    assets: &MissionAssets,
+    prototype_span: Option<&std::ops::Range<usize>>,
+    prototypes: &[fparkan_prototype::EffectivePrototype],
+) -> Result<ControlDeviceProjection, MissionControlDeviceTableUnavailableReason> {
     use MissionControlDeviceTableUnavailableReason as Unavailable;
 
     draft
@@ -2250,6 +2475,7 @@ fn build_control_device_table(
     }
 
     let mut devices = Vec::new();
+    let mut node_provider_status = MissionControlNodeProviderTableStatus::Available(Vec::new());
     let mut has_control_resource = false;
     for component_index in active_components {
         let prototype =
@@ -2286,6 +2512,40 @@ fn build_control_device_table(
             component_ids[component_index].ok_or(Unavailable::ComponentAlignmentMismatch)?;
         let is_root = component_index == 0;
         let is_ex_to = prototype.source_type == Some(PROTOTYPE_TYPE_EXTO);
+        let raw_local_index = draft.unit_components[component_index].parent_or_link;
+        let parent_component_id = tree
+            .get(component_index)
+            .and_then(|node| node.parent_index)
+            .and_then(|parent_index| component_ids.get(parent_index).copied().flatten())
+            .unwrap_or(u32::MAX);
+        let mount_node = if is_ex_to {
+            native_component_mount_node(
+                &tree,
+                &component_ids,
+                &first_global_nodes,
+                component_index,
+                raw_local_index,
+            )
+        } else {
+            None
+        };
+        if is_root {
+            append_control_node_provider_rows(
+                &mut node_provider_status,
+                component_index,
+                prototype.node_data_resource.as_ref(),
+                control.node_data.as_ref(),
+                false,
+            );
+        } else if is_ex_to && mount_node.is_some_and(|node| node != u32::MAX) {
+            append_control_node_provider_rows(
+                &mut node_provider_status,
+                component_index,
+                prototype.node_data_resource.as_ref(),
+                control.node_data.as_ref(),
+                true,
+            );
+        }
         if is_root {
             for (record_index, descriptor) in control.typed_records.iter().enumerate() {
                 append_effective_control_device(
@@ -2301,12 +2561,6 @@ fn build_control_device_table(
             continue;
         }
 
-        let raw_local_index = draft.unit_components[component_index].parent_or_link;
-        let parent_component_id = tree
-            .get(component_index)
-            .and_then(|node| node.parent_index)
-            .and_then(|parent_index| component_ids.get(parent_index).copied().flatten())
-            .unwrap_or(u32::MAX);
         let native_target = native_component_target_index(
             prototype.source_type,
             &devices,
@@ -2315,25 +2569,6 @@ fn build_control_device_table(
         );
         match native_control_target_action(native_target) {
             ControlTableTarget::Append => {
-                let mount_node = if is_ex_to {
-                    tree.get(component_index)
-                        .and_then(|node| node.parent_index)
-                        .and_then(|parent_index| {
-                            let parent_id = component_ids.get(parent_index).copied().flatten()?;
-                            let parent_first = first_global_nodes
-                                .get(parent_index)
-                                .copied()
-                                .flatten()
-                                .unwrap_or(u32::MAX);
-                            Some(
-                                parent_first
-                                    .wrapping_add(raw_local_index as u32)
-                                    .wrapping_sub(u32::from(parent_id != 0)),
-                            )
-                        })
-                } else {
-                    None
-                };
                 let first_global_node = first_global_nodes.get(component_index).copied().flatten();
                 for (record_index, descriptor) in control.typed_records.iter().enumerate() {
                     let raw_key = descriptor.fixed_words[1];
@@ -2395,7 +2630,49 @@ fn build_control_device_table(
     if !has_control_resource {
         return Err(Unavailable::NoControlResource);
     }
-    Ok(devices)
+    Ok(ControlDeviceProjection {
+        devices,
+        node_provider_status,
+    })
+}
+
+fn append_control_node_provider_rows(
+    status: &mut MissionControlNodeProviderTableStatus,
+    unit_component_index: usize,
+    requested_source: Option<&ResourceKey>,
+    node_data: Option<&PreparedControlNodeDataTable>,
+    skip_first_row: bool,
+) {
+    let MissionControlNodeProviderTableStatus::Available(rows) = status else {
+        return;
+    };
+    let Some(node_data) = node_data else {
+        *status = MissionControlNodeProviderTableStatus::Unavailable(
+            MissionControlNodeProviderTableUnavailableReason::MissingNodeData {
+                unit_component_index,
+                source: requested_source.cloned(),
+            },
+        );
+        return;
+    };
+    if skip_first_row && node_data.rows.is_empty() {
+        *status = MissionControlNodeProviderTableStatus::Unavailable(
+            MissionControlNodeProviderTableUnavailableReason::MissingExToRootRow {
+                unit_component_index,
+            },
+        );
+        return;
+    }
+    let first_row = usize::from(skip_first_row);
+    for (source_row_index, source_row) in node_data.rows.iter().enumerate().skip(first_row) {
+        rows.push(MissionControlNodeProviderRow {
+            source: node_data.source.clone(),
+            unit_component_index,
+            source_row_index,
+            source_row: source_row.clone(),
+            initial_type1_value_bits: 0x3f80_0000,
+        });
+    }
 }
 
 fn add_behavior_registered_object(
@@ -2837,6 +3114,62 @@ mod tests {
         }
     }
 
+    fn synthetic_control_node_data_table(
+        index: usize,
+        row_count: usize,
+    ) -> PreparedControlNodeDataTable {
+        PreparedControlNodeDataTable {
+            source: synthetic_resource_key(300 + index),
+            rows: (0..row_count)
+                .map(|row_index| PreparedControlNodeDataRow {
+                    raw_flags: u32::try_from(row_index).expect("row index fits u32"),
+                    max_volume: (100 + row_index) as f32,
+                    mobility_per_volume: (200 + row_index) as f32,
+                    effect: PreparedControlResourcePair {
+                        archive: [0; 32],
+                        name: [0; 32],
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    fn control_with_synthetic_node_data(
+        index: usize,
+        typed_records: Vec<PreparedControlTypedRecord>,
+        row_count: usize,
+    ) -> PreparedComponentControl {
+        let mut control = synthetic_component_control(
+            index,
+            typed_records,
+            PreparedControlEffectSection::Parsed(Vec::new()),
+        );
+        control.node_data = Some(synthetic_control_node_data_table(index, row_count));
+        control
+    }
+
+    fn synthetic_node_provider_row(
+        component_index: usize,
+        source_row_index: usize,
+        initial_type1_value_bits: u32,
+    ) -> MissionControlNodeProviderRow {
+        MissionControlNodeProviderRow {
+            source: synthetic_resource_key(300 + component_index),
+            unit_component_index: component_index,
+            source_row_index,
+            source_row: PreparedControlNodeDataRow {
+                raw_flags: u32::try_from(source_row_index).expect("row index fits u32"),
+                max_volume: 100.0,
+                mobility_per_volume: 200.0,
+                effect: PreparedControlResourcePair {
+                    archive: [0; 32],
+                    name: [0; 32],
+                },
+            },
+            initial_type1_value_bits,
+        }
+    }
+
     fn synthetic_control_fixture(
         source_types: &[Option<u32>],
         kinds: &[u32],
@@ -2902,8 +3235,11 @@ mod tests {
                 control_resource: controls[index]
                     .as_ref()
                     .map(|control| control.source.clone()),
+                node_data_resource: controls[index]
+                    .as_ref()
+                    .and_then(|control| control.node_data.as_ref())
+                    .map(|node_data| node_data.source.clone()),
                 point_resource: None,
-                node_data_resource: None,
                 bas_resource: None,
             });
         }
@@ -2956,6 +3292,48 @@ mod tests {
         )
     }
 
+    fn synthetic_control_projection(
+        source_types: &[Option<u32>],
+        kinds: &[u32],
+        child_counts: &[u32],
+        parent_or_links: &[i32],
+        model_nodes: &[usize],
+        controls: Vec<Option<PreparedComponentControl>>,
+    ) -> (
+        MissionControlDeviceTableStatus,
+        MissionControlNodeProviderTableStatus,
+    ) {
+        let (draft, assets, prototypes) = synthetic_control_fixture(
+            source_types,
+            kinds,
+            child_counts,
+            parent_or_links,
+            model_nodes,
+            controls,
+        );
+        let (status, node_provider_status) = match build_control_device_projection(
+            0,
+            &draft,
+            &assets,
+            Some(&(0..prototypes.len())),
+            &prototypes,
+        ) {
+            Ok(projection) => (
+                MissionControlDeviceTableStatus::Available(projection.devices),
+                projection.node_provider_status,
+            ),
+            Err(reason) => (
+                MissionControlDeviceTableStatus::Unavailable(reason.clone()),
+                MissionControlNodeProviderTableStatus::Unavailable(
+                    MissionControlNodeProviderTableUnavailableReason::DeviceTableUnavailable(
+                        reason,
+                    ),
+                ),
+            ),
+        };
+        (status, node_provider_status)
+    }
+
     fn synthetic_effective_control_device(
         factory_tag: u32,
         descriptor_tag: u32,
@@ -2989,6 +3367,16 @@ mod tests {
     fn synthetic_control_device_table(
         status: MissionControlDeviceTableStatus,
     ) -> MissionControlDeviceTableState {
+        synthetic_control_device_table_with_providers(
+            status,
+            MissionControlNodeProviderTableStatus::Available(Vec::new()),
+        )
+    }
+
+    fn synthetic_control_device_table_with_providers(
+        status: MissionControlDeviceTableStatus,
+        node_provider_status: MissionControlNodeProviderTableStatus,
+    ) -> MissionControlDeviceTableState {
         MissionControlDeviceTableState {
             original_id: Some(OriginalObjectId(7)),
             handle: ObjectHandle {
@@ -2996,6 +3384,7 @@ mod tests {
                 slot: 7,
             },
             status,
+            node_provider_status,
         }
     }
 
@@ -3384,6 +3773,10 @@ mod tests {
             query_loaded_mission_control_resource(&engine, handle, 1),
             Err(ControlResourceAccessError::MissionUnavailable)
         );
+        assert_eq!(
+            query_loaded_mission_control_device_selector(&engine, handle, 0, 0xe00),
+            Err(ControlResourceAccessError::MissionUnavailable)
+        );
 
         let stale = ObjectHandle {
             generation: handle.generation.wrapping_add(1),
@@ -3391,6 +3784,12 @@ mod tests {
         };
         assert_eq!(
             query_loaded_mission_control_resource(&engine, stale, 1),
+            Err(ControlResourceAccessError::World(
+                fparkan_world::WorldError::StaleHandle
+            ))
+        );
+        assert_eq!(
+            query_loaded_mission_control_device_selector(&engine, stale, 0, 0xe00),
             Err(ControlResourceAccessError::World(
                 fparkan_world::WorldError::StaleHandle
             ))
@@ -3405,6 +3804,12 @@ mod tests {
         fparkan_world::request_delete(&mut engine.world, handle).expect("delete object");
         assert_eq!(
             query_loaded_mission_control_resource(&engine, handle, 1),
+            Err(ControlResourceAccessError::World(
+                fparkan_world::WorldError::StaleHandle
+            ))
+        );
+        assert_eq!(
+            query_loaded_mission_control_device_selector(&engine, handle, 0, 0xe00),
             Err(ControlResourceAccessError::World(
                 fparkan_world::WorldError::StaleHandle
             ))
@@ -3748,6 +4153,291 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_node_provider_projection_keeps_native_rows_separate_from_mesh_keys() {
+        let controls = vec![
+            Some(control_with_synthetic_node_data(
+                0,
+                vec![synthetic_control_record(26, 1, 2.0_f32.to_bits(), None)],
+                2,
+            )),
+            Some(control_with_synthetic_node_data(
+                1,
+                vec![synthetic_control_record(26, 0, 3.0_f32.to_bits(), None)],
+                7,
+            )),
+            Some(control_with_synthetic_node_data(
+                2,
+                vec![synthetic_control_record(26, 5, 4.0_f32.to_bits(), None)],
+                3,
+            )),
+            Some(control_with_synthetic_node_data(
+                3,
+                vec![synthetic_control_record(26, 0, 5.0_f32.to_bits(), None)],
+                2,
+            )),
+            Some(control_with_synthetic_node_data(
+                4,
+                vec![synthetic_control_record(26, 0, 6.0_f32.to_bits(), None)],
+                6,
+            )),
+            Some(control_with_synthetic_node_data(
+                5,
+                vec![synthetic_control_record(26, 1, 6.0_f32.to_bits(), None)],
+                5,
+            )),
+            Some(control_with_synthetic_node_data(
+                6,
+                vec![synthetic_control_record(26, 1, 7.0_f32.to_bits(), None)],
+                4,
+            )),
+        ];
+        let (status, node_provider_status) = synthetic_control_projection(
+            &[
+                None,
+                Some(PROTOTYPE_TYPE_INTO),
+                Some(PROTOTYPE_TYPE_EXTO),
+                Some(PROTOTYPE_TYPE_EXTO),
+                Some(PROTOTYPE_TYPE_EXTO),
+                None,
+                None,
+            ],
+            &[1, 1, 1, 1, 1, 0, 1],
+            &[4, 0, 1, 0, 0, 1, 0],
+            &[0, -1, 2, 0, -1, 0, 0],
+            &[1, 1, 4, 2, 1, 1, 1],
+            controls,
+        );
+        let table = synthetic_control_device_table_with_providers(status, node_provider_status);
+        let MissionControlNodeProviderTableStatus::Available(rows) = &table.node_provider_status
+        else {
+            panic!(
+                "synthetic provider rows should be available: {:?}",
+                table.node_provider_status
+            );
+        };
+
+        // Root contributes all rows, INTO contributes none, and each mounted
+        // EXTO skips its local row zero. The EXTO with C4=FFFFFFFF contributes
+        // no provider rows. The kind-zero component and its child are absent
+        // from the native active-component walk.
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.unit_component_index, row.source_row_index))
+                .collect::<Vec<_>>(),
+            [(0, 0), (0, 1), (2, 1), (2, 2), (3, 1)]
+        );
+        assert!(rows
+            .iter()
+            .all(|row| row.initial_type1_value_bits == 1.0_f32.to_bits()));
+
+        let MissionControlDeviceTableStatus::Available(devices) = &table.status else {
+            panic!("synthetic devices should be available: {:?}", table.status);
+        };
+        assert_eq!(
+            devices.iter().map(|device| device.key).collect::<Vec<_>>(),
+            [1, u32::MAX, 5, 0, u32::MAX]
+        );
+        assert_eq!(
+            query_control_device_table_selector(&table, 0, 0xe00)
+                .expect("root tag-26 selector")
+                .map(f32::to_bits),
+            Some(2.0_f32.to_bits())
+        );
+        // Device keys still use the confirmed MSH mapping. The provider list
+        // is the real concatenated NDP row count, so no model-node padding or
+        // second key remap hides an out-of-range key.
+        assert_eq!(
+            query_control_device_table_selector(&table, 2, 0xe00),
+            Err(ControlResourceAccessError::NodeProviderKeyOutOfRange {
+                key: 5,
+                row_count: 5
+            })
+        );
+        assert_eq!(
+            query_control_device_table_selector(&table, 3, 0xe00),
+            Ok(Some(5.0))
+        );
+        assert_eq!(
+            query_control_device_table_selector(&table, 4, 0xe00),
+            Err(ControlResourceAccessError::NodeProviderKeyOutOfRange {
+                key: u32::MAX,
+                row_count: 5
+            })
+        );
+    }
+
+    #[test]
+    fn missing_node_provider_does_not_hide_aggregate_queries() {
+        let controls = vec![Some(synthetic_component_control(
+            0,
+            vec![
+                synthetic_control_record(26, 0, 2.0_f32.to_bits(), None),
+                synthetic_control_record(19, 1, 4.0_f32.to_bits(), None),
+            ],
+            PreparedControlEffectSection::Parsed(Vec::new()),
+        ))];
+        let (status, node_provider_status) =
+            synthetic_control_projection(&[None], &[1], &[0], &[0], &[1], controls);
+        let table = synthetic_control_device_table_with_providers(status, node_provider_status);
+        assert!(matches!(
+            &table.node_provider_status,
+            MissionControlNodeProviderTableStatus::Unavailable(
+                MissionControlNodeProviderTableUnavailableReason::MissingNodeData {
+                    unit_component_index: 0,
+                    ..
+                }
+            )
+        ));
+        assert_eq!(
+            query_control_device_table_resource(&table, 1)
+                .expect("aggregate selector 1 remains available")
+                .map(f32::to_bits),
+            Some(1.0_f32.to_bits())
+        );
+        assert_eq!(
+            query_control_device_table_resource(&table, 2)
+                .expect("aggregate selector 2 remains available")
+                .map(f32::to_bits),
+            Some(4.0_f32.to_bits())
+        );
+        assert!(matches!(
+            query_control_device_table_selector(&table, 0, 0xe00),
+            Err(ControlResourceAccessError::NodeProviderTableUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn mounted_exto_requires_a_row_before_native_skip_first() {
+        let controls = vec![
+            Some(control_with_synthetic_node_data(
+                0,
+                vec![synthetic_control_record(26, 0, 1.0_f32.to_bits(), None)],
+                0,
+            )),
+            Some(control_with_synthetic_node_data(1, Vec::new(), 0)),
+        ];
+        let (_, node_provider_status) = synthetic_control_projection(
+            &[None, Some(PROTOTYPE_TYPE_EXTO)],
+            &[1, 1],
+            &[1, 0],
+            &[0, 0],
+            &[2, 2],
+            controls,
+        );
+        assert_eq!(
+            node_provider_status,
+            MissionControlNodeProviderTableStatus::Unavailable(
+                MissionControlNodeProviderTableUnavailableReason::MissingExToRootRow {
+                    unit_component_index: 1,
+                }
+            )
+        );
+
+        // An empty root table is legal, and a mounted EXTO with exactly its
+        // root row skips that row and contributes an empty range.
+        let controls = vec![
+            Some(control_with_synthetic_node_data(
+                0,
+                vec![synthetic_control_record(26, 0, 1.0_f32.to_bits(), None)],
+                0,
+            )),
+            Some(control_with_synthetic_node_data(1, Vec::new(), 1)),
+        ];
+        let (_, node_provider_status) = synthetic_control_projection(
+            &[None, Some(PROTOTYPE_TYPE_EXTO)],
+            &[1, 1],
+            &[1, 0],
+            &[0, 0],
+            &[2, 2],
+            controls,
+        );
+        assert_eq!(
+            node_provider_status,
+            MissionControlNodeProviderTableStatus::Available(Vec::new())
+        );
+    }
+
+    #[test]
+    fn indexed_node_provider_query_handles_current_tags_and_factory_scope() {
+        let available = MissionControlNodeProviderTableStatus::Available(vec![
+            synthetic_node_provider_row(0, 0, 1.0_f32.to_bits()),
+            synthetic_node_provider_row(0, 1, 1.0_f32.to_bits()),
+            synthetic_node_provider_row(0, 2, 1.0_f32.to_bits()),
+        ]);
+        let table = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(vec![
+                synthetic_effective_control_device(
+                    26,
+                    26,
+                    2.0_f32.to_bits(),
+                    Some(3.0_f32.to_bits()),
+                    None,
+                ),
+                synthetic_effective_control_device(
+                    26,
+                    19,
+                    4.0_f32.to_bits(),
+                    Some(5.0_f32.to_bits()),
+                    None,
+                ),
+                synthetic_effective_control_device(
+                    26,
+                    5,
+                    1.0_f32.to_bits(),
+                    Some(1.0_f32.to_bits()),
+                    None,
+                ),
+                synthetic_effective_control_device(
+                    9,
+                    26,
+                    1.0_f32.to_bits(),
+                    Some(1.0_f32.to_bits()),
+                    Some(0.5_f32.to_bits()),
+                ),
+            ]),
+            available,
+        );
+        assert_eq!(
+            query_control_device_table_selector(&table, 0, 0xe00)
+                .expect("tag-26 query")
+                .map(f32::to_bits),
+            Some(6.0_f32.to_bits())
+        );
+        assert_eq!(
+            query_control_device_table_selector(&table, 1, 0xe00),
+            Ok(None)
+        );
+        for tag in [5, 10, 21] {
+            let mut unsupported = table.clone();
+            let MissionControlDeviceTableStatus::Available(entries) = &mut unsupported.status
+            else {
+                unreachable!();
+            };
+            entries[1].descriptor.tag = tag;
+            assert_eq!(
+                query_control_device_table_selector(&unsupported, 1, 0xe00),
+                Err(ControlResourceAccessError::UnsupportedCurrentTag { tag })
+            );
+        }
+        assert_eq!(
+            query_control_device_table_selector(&table, 3, 0xe00),
+            Err(ControlResourceAccessError::UnsupportedFactoryTag { factory_tag: 9 })
+        );
+        assert_eq!(
+            query_control_device_table_selector(&table, 0, 1),
+            Err(ControlResourceAccessError::UnsupportedSelector(1))
+        );
+        assert_eq!(
+            query_control_device_table_selector(&table, 8, 0xe00),
+            Err(ControlResourceAccessError::DeviceIndexOutOfRange {
+                device_index: 8,
+                device_count: 4
+            })
+        );
+    }
+
+    #[test]
     fn synthetic_into_builder_appends_all_rows_and_overrides_only_first_record() {
         let append = synthetic_control_table(
             &[None, Some(PROTOTYPE_TYPE_INTO)],
@@ -4049,6 +4739,49 @@ mod tests {
             [1, 2, 3, 4, 0, 0, 0, 0, 0, 0, 5]
         );
         assert_eq!(entries[8].descriptor_provenance.typed_record_index, 8);
+        assert_eq!(
+            query_loaded_mission_control_device_selector(&engine, control_handle, 8, 0xe00)
+                .expect("licensed tag-26 selector")
+                .map(f32::to_bits),
+            Some(1.0_f32.to_bits())
+        );
+        let prepared_controls = &engine
+            .loaded
+            .as_ref()
+            .expect("loaded mission state")
+            .mission_assets
+            .object_component_controls[0];
+        let root_node_data = prepared_controls[0]
+            .as_ref()
+            .and_then(|control| control.node_data.as_ref())
+            .expect("root NDP sidecar");
+        let ext_node_data = prepared_controls[5]
+            .as_ref()
+            .and_then(|control| control.node_data.as_ref())
+            .expect("EXTO NDP sidecar");
+        let provider_rows = match &tables[0].node_provider_status {
+            MissionControlNodeProviderTableStatus::Available(rows) => rows,
+            MissionControlNodeProviderTableStatus::Unavailable(reason) => {
+                panic!("licensed provider table should be available: {reason:?}");
+            }
+        };
+        assert_eq!(root_node_data.rows.len(), 22);
+        assert_eq!(ext_node_data.rows.len(), 4);
+        assert_eq!(provider_rows.len(), 25);
+        let expected_provider_sources = (0..root_node_data.rows.len())
+            .map(|row| (0, row))
+            .chain((1..ext_node_data.rows.len()).map(|row| (5, row)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            provider_rows
+                .iter()
+                .map(|row| (row.unit_component_index, row.source_row_index))
+                .collect::<Vec<_>>(),
+            expected_provider_sources
+        );
+        assert!(provider_rows
+            .iter()
+            .all(|row| row.initial_type1_value_bits == 1.0_f32.to_bits()));
         assert_eq!(
             (
                 entries[9].factory_tag,
