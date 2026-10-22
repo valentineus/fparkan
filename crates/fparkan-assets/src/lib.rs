@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Asset manager ports and transactional preparation models.
 
+use fparkan_binary::{checked_count_bytes, read_lp_bytes, Cursor, DecodeError};
 use fparkan_material::{
     decode_mat0, decode_wear, resolve_material, MaterialFallback, ResolvedMaterial, WearTable,
     MAT0_KIND, WEAR_KIND,
@@ -60,6 +61,150 @@ pub struct PreparedMaterialPhase {
     pub page_index: i8,
     /// Normalized atlas transform `[offset_x, offset_y, scale_x, scale_y]`.
     pub page_uv_transform: [f32; 4],
+}
+
+/// The two Behavior profile values currently used by recovered resource queries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BehaviorProfileRates {
+    /// Second raw value blob for `Transfer_Ore_OffBoard`.
+    pub transfer_ore_off_board_bits: u32,
+    /// Second raw value blob for `Transfer_Power_Out`.
+    pub transfer_power_out_bits: u32,
+}
+
+/// Error while reading a bounded binary Behavior `.var` profile.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BehaviorProfileVarError {
+    /// The binary record framing is malformed.
+    Decode(DecodeError),
+    /// A bound for one of the two fields used here is not a 32-bit float.
+    InvalidFloatField {
+        name: &'static str,
+        size: u32,
+        type_index: u32,
+    },
+    /// A registered runtime field was absent from the profile.
+    MissingField { name: &'static str },
+}
+
+impl fmt::Display for BehaviorProfileVarError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Decode(source) => write!(f, "{source}"),
+            Self::InvalidFloatField {
+                name,
+                size,
+                type_index,
+            } => write!(
+                f,
+                "field {name} has size {size} and type index {type_index}, expected a 4-byte float"
+            ),
+            Self::MissingField { name } => write!(f, "required field {name} is missing"),
+        }
+    }
+}
+
+impl std::error::Error for BehaviorProfileVarError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Decode(source) => Some(source),
+            Self::InvalidFloatField { .. } | Self::MissingField { .. } => None,
+        }
+    }
+}
+
+impl From<DecodeError> for BehaviorProfileVarError {
+    fn from(value: DecodeError) -> Self {
+        Self::Decode(value)
+    }
+}
+
+/// Reads the two Behavior rate fields from a native binary `.var` profile.
+///
+/// Native records contain two equally sized value blobs. After binding a
+/// registered destination, the original applies the second blob. Field names
+/// are matched case-sensitively as C strings (up to the first NUL), and the
+/// first occurrence wins. Other fields are consumed but their meanings remain
+/// outside this decoder.
+///
+/// # Errors
+///
+/// Returns [`BehaviorProfileVarError`] when record framing is truncated,
+/// contains trailing bytes, omits a registered field, or declares a selected
+/// field that is not a float row.
+pub fn decode_behavior_profile_rates(
+    bytes: &[u8],
+) -> Result<BehaviorProfileRates, BehaviorProfileVarError> {
+    let mut cursor = Cursor::new(bytes);
+    let count = cursor.read_u32_le()?;
+    checked_count_bytes(u64::from(count), 28, cursor.remaining() as u64)?;
+
+    let mut transfer_ore_off_board_bits = None;
+    let mut transfer_power_out_bits = None;
+    for _ in 0..count {
+        let size = cursor.read_u32_le()?;
+        let type_index = cursor.read_u32_le()?;
+        let _flags = cursor.read_u32_le()?;
+        let field_name = read_lp_bytes(&mut cursor, 64 * 1024)?;
+        let c_string_name = field_name
+            .split(|byte| *byte == 0)
+            .next()
+            .unwrap_or_default();
+        let target_name = match c_string_name {
+            b"Transfer_Ore_OffBoard" => Some("Transfer_Ore_OffBoard"),
+            b"Transfer_Power_Out" => Some("Transfer_Power_Out"),
+            _ => None,
+        };
+        let _type_name = read_lp_bytes(&mut cursor, 64 * 1024)?;
+        let value_size = usize::try_from(size).map_err(|_| DecodeError::IntegerOverflow)?;
+        cursor.read_exact(value_size)?;
+        let capture_target = target_name.is_some_and(|name| {
+            if name == "Transfer_Ore_OffBoard" {
+                transfer_ore_off_board_bits.is_none()
+            } else {
+                transfer_power_out_bits.is_none()
+            }
+        });
+        let second_value_bits = if capture_target {
+            let name = target_name.expect("capture requires a target field");
+            if size != 4 || type_index != 3 {
+                return Err(BehaviorProfileVarError::InvalidFloatField {
+                    name,
+                    size,
+                    type_index,
+                });
+            }
+            let value = cursor.read_exact(value_size)?;
+            Some(u32::from_le_bytes(
+                value.try_into().expect("validated four-byte float row"),
+            ))
+        } else {
+            cursor.read_exact(value_size)?;
+            None
+        };
+        cursor.read_exact(8)?;
+
+        if let (Some(name), Some(value_bits)) = (target_name, second_value_bits) {
+            if name == "Transfer_Ore_OffBoard" {
+                transfer_ore_off_board_bits = Some(value_bits);
+            } else {
+                transfer_power_out_bits = Some(value_bits);
+            }
+        }
+    }
+    cursor.require_eof()?;
+    Ok(BehaviorProfileRates {
+        transfer_ore_off_board_bits: transfer_ore_off_board_bits.ok_or(
+            BehaviorProfileVarError::MissingField {
+                name: "Transfer_Ore_OffBoard",
+            },
+        )?,
+        transfer_power_out_bits: transfer_power_out_bits.ok_or(
+            BehaviorProfileVarError::MissingField {
+                name: "Transfer_Power_Out",
+            },
+        )?,
+    })
 }
 
 type WearValidationCache =
@@ -4221,6 +4366,100 @@ mod tests {
 
     // Preserve the authored CTLD fixture bits; this is not the `f32` value of tau.
     const AUTHORED_TAG21_RAW_PARAMETER_3: f32 = f32::from_bits(0x40C8_F5C3);
+
+    fn behavior_var_row(name: &[u8], type_index: u32, first: u32, second: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&type_index.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(name);
+        bytes.extend_from_slice(&0_u32.to_le_bytes()); // Native transfer rows use an empty type-name.
+        bytes.extend_from_slice(&first.to_le_bytes());
+        bytes.extend_from_slice(&second.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes
+    }
+
+    fn behavior_var(rows: &[Vec<u8>]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+        for row in rows {
+            bytes.extend_from_slice(row);
+        }
+        bytes
+    }
+
+    #[test]
+    fn behavior_profile_decoder_uses_first_exact_rows_second_blob_and_float_kind() {
+        let profile = behavior_var(&[
+            behavior_var_row(b"transfer_ore_off_board", 3, 0x1111_1111, 0x2222_2222),
+            behavior_var_row(
+                b"Transfer_Ore_OffBoard\0legacy-suffix",
+                3,
+                0x3333_3333,
+                0x3f80_0000,
+            ),
+            behavior_var_row(b"Transfer_Ore_OffBoard", 3, 0x4444_4444, 0x4000_0000),
+            behavior_var_row(b"Transfer_Power_Out", 3, 0x5555_5555, 0x4120_0000),
+        ]);
+
+        assert_eq!(
+            decode_behavior_profile_rates(&profile),
+            Ok(BehaviorProfileRates {
+                transfer_ore_off_board_bits: 0x3f80_0000,
+                transfer_power_out_bits: 0x4120_0000,
+            })
+        );
+    }
+
+    #[test]
+    fn behavior_profile_decoder_rejects_every_truncation_and_trailing_bytes() {
+        let valid = behavior_var(&[
+            behavior_var_row(b"Transfer_Ore_OffBoard", 3, 0, 0x3f80_0000),
+            behavior_var_row(b"Transfer_Power_Out", 3, 0, 0x4120_0000),
+        ]);
+        for end in 0..valid.len() {
+            assert!(
+                decode_behavior_profile_rates(&valid[..end]).is_err(),
+                "prefix ending at byte {end} was accepted"
+            );
+        }
+
+        let mut with_trailing = valid.clone();
+        with_trailing.push(0);
+        assert!(matches!(
+            decode_behavior_profile_rates(&with_trailing),
+            Err(BehaviorProfileVarError::Decode(
+                fparkan_binary::DecodeError::TrailingBytes { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn behavior_profile_decoder_requires_both_registered_float_fields() {
+        let profile = behavior_var(&[behavior_var_row(b"Transfer_Power_Out", 3, 0, 0x4120_0000)]);
+        assert_eq!(
+            decode_behavior_profile_rates(&profile),
+            Err(BehaviorProfileVarError::MissingField {
+                name: "Transfer_Ore_OffBoard"
+            })
+        );
+
+        let profile = behavior_var(&[
+            behavior_var_row(b"Transfer_Ore_OffBoard", 3, 0, 0x3f80_0000),
+            behavior_var_row(b"Transfer_Power_Out", 1, 0, 0x4120_0000),
+        ]);
+        assert!(matches!(
+            decode_behavior_profile_rates(&profile),
+            Err(BehaviorProfileVarError::InvalidFloatField {
+                name: "Transfer_Power_Out",
+                size: 4,
+                type_index: 1,
+            })
+        ));
+    }
 
     fn resource_device_record(tag: u32, key: u32, base_bits: u32) -> PreparedControlTypedRecord {
         let mut fixed_words = [0; 44];

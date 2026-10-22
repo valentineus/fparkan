@@ -7,10 +7,11 @@ use fparkan_assets::{
     decode_mission_land_path, decode_mission_payload, decode_nres_payload,
     derive_mission_land_paths, extend_graph_report_with_visual_dependencies,
     mission_script_bundle_bases, prepare_terrain_world, AssetError as AssetPreparationError,
-    AssetId, AssetManager, BuildCategory, MissionAssetPlan, MissionDocument, MissionError,
-    MissionTerrainPaths, NresError, PreparedComponentControl, PreparedControlEffectSection,
-    PreparedControlNodeDataRow, PreparedControlNodeDataTable, PreparedControlTypedRecord,
-    PreparedVisual, TerrainFormatError, TerrainPreparationError, TerrainWorld, TmaProfile,
+    AssetId, AssetManager, BehaviorProfileRates, BehaviorProfileVarError, BuildCategory,
+    MissionAssetPlan, MissionDocument, MissionError, MissionTerrainPaths, NresError,
+    PreparedComponentControl, PreparedControlEffectSection, PreparedControlNodeDataRow,
+    PreparedControlNodeDataTable, PreparedControlTypedRecord, PreparedVisual, TerrainFormatError,
+    TerrainPreparationError, TerrainWorld, TmaProfile,
 };
 use fparkan_path::{normalize_relative, NormalizedPath, PathError, PathPolicy};
 use fparkan_prototype::{
@@ -30,6 +31,7 @@ use fparkan_world::{
     step, transform_state, InputSnapshot, ObjectDraft, ObjectHandle, OriginalObjectId,
     TransformState, World, WorldConfig, WorldSnapshot,
 };
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -153,6 +155,23 @@ pub struct BehaviorOreState {
     pub maximum_ore_bits: u32,
 }
 
+/// Initial Behavior rates loaded for one full Unit DAT mission object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BehaviorProfileState {
+    /// Stable identity from the source TMA object order.
+    pub original_id: OriginalObjectId,
+    /// Corresponding live Rust world object.
+    pub handle: ObjectHandle,
+    /// Class word recovered from the root Unit DAT header.
+    pub class_flags: u32,
+    /// Profile selected by the native class mapper; unknown classes use defaults.
+    pub profile_entry: Option<&'static str>,
+    /// Raw bits of `Transfer_Ore_OffBoard` after applying the profile.
+    pub transfer_ore_off_board_bits: u32,
+    /// Raw bits of `Transfer_Power_Out` after applying the profile.
+    pub transfer_power_out_bits: u32,
+}
+
 /// Origin of a Control descriptor retained in the effective table projection.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ControlDeviceRecordProvenance {
@@ -246,7 +265,7 @@ pub enum ControlResourceAccessError {
     ObjectUnavailable { handle: ObjectHandle },
     /// The object's Control table could not be completely projected.
     TableUnavailable(MissionControlDeviceTableUnavailableReason),
-    /// This wrapper only implements native resource selectors 1 and 2.
+    /// The requested resource selector is not implemented for this operation.
     UnsupportedSelector(u32),
     /// A selected row has a factory class whose getter has not been checked.
     UnsupportedFactoryTag { factory_tag: u32 },
@@ -353,6 +372,15 @@ pub struct MissionControlDeviceTableState {
 struct ControlDeviceProjection {
     devices: Vec<EffectiveControlDevice>,
     node_provider_status: MissionControlNodeProviderTableStatus,
+}
+
+#[derive(Clone, Copy)]
+struct PreparedBehaviorProfileState {
+    original_id: OriginalObjectId,
+    class_flags: u32,
+    profile_entry: Option<&'static str>,
+    transfer_ore_off_board_bits: u32,
+    transfer_power_out_bits: u32,
 }
 
 /// Resource distributor state associated with one TMA clan's constructed AI.
@@ -688,6 +716,7 @@ struct LoadedMissionState {
     object_drafts: Vec<MissionObjectDraft>,
     behavior_distributors: Vec<BehaviorDistributorState>,
     behavior_ore_states: Vec<BehaviorOreState>,
+    behavior_profiles: Vec<BehaviorProfileState>,
     control_device_tables: Vec<MissionControlDeviceTableState>,
     script_bundles: Vec<MissionScriptBundle>,
     script_varset: Option<MissionScriptVarSet>,
@@ -794,6 +823,15 @@ pub enum EngineError {
         mission: String,
         /// Source error.
         source: AssetPreparationError,
+    },
+    /// A native Behavior profile could not be found or decoded.
+    BehaviorProfile {
+        /// Behavior profile archive path.
+        path: String,
+        /// Selected `.var` entry name.
+        entry: String,
+        /// Entry, field, or format diagnostic.
+        message: String,
     },
     /// World error.
     World(fparkan_world::WorldError),
@@ -917,6 +955,11 @@ impl std::fmt::Display for EngineError {
             Self::AssetPreparation { mission, source } => {
                 write!(f, "{mission}: asset preparation failed: {source}")
             }
+            Self::BehaviorProfile {
+                path,
+                entry,
+                message,
+            } => write!(f, "{path}:{entry}: Behavior profile failed: {message}"),
             Self::World(source) => write!(f, "{source}"),
             Self::Movement(message) => write!(f, "reference movement: {message}"),
             Self::RegistrationTeardown {
@@ -950,6 +993,7 @@ impl std::error::Error for EngineError {
             | Self::ScriptRuntime { .. }
             | Self::Movement(_)
             | Self::PrototypeGraph { .. }
+            | Self::BehaviorProfile { .. }
             | Self::RegistrationTeardown { .. } => None,
         }
     }
@@ -1185,6 +1229,11 @@ fn load_mission_with_options(
                 .unwrap_or_default(),
         })
         .collect();
+    let prepared_behavior_profiles = if options.asset_scope == MissionAssetScope::Full {
+        prepare_behavior_profile_states(&vfs, &object_drafts)?
+    } else {
+        Vec::new()
+    };
     let mut new_runtime_world = new_world(WorldConfig);
     let mut handles = Vec::with_capacity(mission.objects.len());
     for (index, object) in mission.objects.iter().enumerate() {
@@ -1201,6 +1250,20 @@ fn load_mission_with_options(
         )?;
         handles.push(handle);
     }
+    let behavior_profiles = prepared_behavior_profiles
+        .into_iter()
+        .zip(&handles)
+        .filter_map(|(profile, handle)| {
+            profile.map(|profile| BehaviorProfileState {
+                original_id: profile.original_id,
+                handle: *handle,
+                class_flags: profile.class_flags,
+                profile_entry: profile.profile_entry,
+                transfer_ore_off_board_bits: profile.transfer_ore_off_board_bits,
+                transfer_power_out_bits: profile.transfer_power_out_bits,
+            })
+        })
+        .collect();
     let mut registered_objects = 0;
     for handle in &handles {
         if options.fail_after_registered_objects == Some(registered_objects) {
@@ -1404,6 +1467,7 @@ fn load_mission_with_options(
         object_drafts,
         behavior_distributors,
         behavior_ore_states,
+        behavior_profiles,
         control_device_tables,
         script_bundles: loaded_scripts.bundles,
         script_varset: loaded_scripts.varset,
@@ -1696,6 +1760,15 @@ pub fn loaded_mission_behavior_ore_states(engine: &Engine) -> Option<&[BehaviorO
         .map(|state| state.behavior_ore_states.as_slice())
 }
 
+/// Returns profile-derived Behavior rates attached to full Unit DAT objects.
+#[must_use]
+pub fn loaded_mission_behavior_profiles(engine: &Engine) -> Option<&[BehaviorProfileState]> {
+    engine
+        .loaded
+        .as_ref()
+        .map(|state| state.behavior_profiles.as_slice())
+}
+
 /// Returns the base Control device table projections for loaded mission objects.
 #[must_use]
 pub fn loaded_mission_control_device_tables(
@@ -1760,6 +1833,51 @@ pub fn query_loaded_mission_control_device_selector(
         .find(|table| table.handle == handle)
         .ok_or(ControlResourceAccessError::ObjectUnavailable { handle })?;
     query_control_device_table_selector(table, device_index, selector)
+}
+
+/// Queries the recovered Behavior resource selectors `0x1002` and `0x1005`.
+///
+/// Selector `0x1005` returns the loaded profile's `Transfer_Power_Out` value.
+/// Selector `0x1002` sums supported Control `0xe00` results in native table
+/// order, rounding each addition to `f32`, then multiplies by the profile's
+/// `Transfer_Ore_OffBoard` value. Unsupported table/query paths return an error.
+/// Profile and provider values are initial full-load snapshots; later damage,
+/// Control updates, and profile changes are not synchronized into this state.
+///
+/// # Errors
+/// Returns an error for an invalid handle, unavailable mission/profile/table,
+/// unsupported selector or Control query path, or an unsupported float range.
+pub fn query_loaded_mission_behavior_resource(
+    engine: &Engine,
+    handle: ObjectHandle,
+    selector: u32,
+) -> Result<f32, ControlResourceAccessError> {
+    transform_state(&engine.world, handle).map_err(ControlResourceAccessError::World)?;
+    let loaded = engine
+        .loaded
+        .as_ref()
+        .ok_or(ControlResourceAccessError::MissionUnavailable)?;
+    let profile = loaded
+        .behavior_profiles
+        .iter()
+        .find(|profile| profile.handle == handle)
+        .ok_or(ControlResourceAccessError::ObjectUnavailable { handle })?;
+    match selector {
+        0x1005 => checked_control_float(
+            0,
+            "Transfer_Power_Out",
+            f32::from_bits(profile.transfer_power_out_bits),
+        ),
+        0x1002 => {
+            let table = loaded
+                .control_device_tables
+                .iter()
+                .find(|table| table.handle == handle)
+                .ok_or(ControlResourceAccessError::ObjectUnavailable { handle })?;
+            query_behavior_profile_ore_rate(table, profile.transfer_ore_off_board_bits)
+        }
+        _ => Err(ControlResourceAccessError::UnsupportedSelector(selector)),
+    }
 }
 
 /// Sets native Control global-table selector 1 on rows whose selector-0 value
@@ -1908,6 +2026,37 @@ fn query_control_device_table_selector(
         multiplier,
     )
     .map(Some)
+}
+
+fn query_behavior_profile_ore_rate(
+    table: &MissionControlDeviceTableState,
+    transfer_ore_off_board_bits: u32,
+) -> Result<f32, ControlResourceAccessError> {
+    let devices = match &table.status {
+        MissionControlDeviceTableStatus::Available(devices) => devices,
+        MissionControlDeviceTableStatus::Unavailable(reason) => {
+            return Err(ControlResourceAccessError::TableUnavailable(reason.clone()));
+        }
+    };
+    let mut total = 0.0_f32;
+    for (device_index, device) in devices.iter().enumerate() {
+        if device.descriptor.tag != 26 {
+            continue;
+        }
+        if let Some(value) = query_control_device_table_selector(table, device_index, 0xe00)? {
+            total = checked_control_sum(26, "Behavior resource sum", total, value)?;
+        }
+    }
+    checked_control_product(
+        26,
+        "Transfer_Ore_OffBoard",
+        total,
+        checked_control_float(
+            26,
+            "Transfer_Ore_OffBoard",
+            f32::from_bits(transfer_ore_off_board_bits),
+        )?,
+    )
 }
 
 fn set_control_device_table_multiplier(
@@ -2077,6 +2226,123 @@ fn native_behavior_ore_defaults(class_flags: u32) -> (u32, u32) {
         0x0100_4000 => (0x44fa_0000, 0x44fa_0000),
         _ => (0, 0),
     }
+}
+
+fn behavior_profile_entry_for_class(class_flags: u32) -> Option<&'static str> {
+    match class_flags {
+        0x8000_0004 => Some("prof_mine.var"),
+        0x8000_0008 => Some("prof_storage.var"),
+        0x8000_0002 => Some("prof_generator.var"),
+        0x8000_0010 => Some("prof_plant.var"),
+        0x8000_0040 => Some("prof_angar.var"),
+        0x8000_0200 => Some("prof_mtp.var"),
+        0x8000_0400 => Some("prof_institute.var"),
+        0x8001_0000 | 0x8002_0000 | 0x8004_0000 => Some("prof_bunker.var"),
+        0x8010_0000 | 0x8020_0000 => Some("prof_tower.var"),
+        0x0100_2000 => Some("prof_trn.var"),
+        0x0100_4000 => Some("prof_bld.var"),
+        0x0100_8000 => Some("prof_war.var"),
+        0x0101_0000 => Some("prof_hq.var"),
+        0x0102_0000 => Some("prof_hero.var"),
+        0x2000_0000 => Some("prof_animal.var"),
+        _ => None,
+    }
+}
+
+fn prepare_behavior_profile_states(
+    vfs: &Arc<dyn Vfs>,
+    object_drafts: &[MissionObjectDraft],
+) -> Result<Vec<Option<PreparedBehaviorProfileState>>, EngineError> {
+    const DEFAULT_TRANSFER_ORE_OFF_BOARD_BITS: u32 = 0x40a0_0000;
+    const DEFAULT_TRANSFER_POWER_OUT_BITS: u32 = 0x42c8_0000;
+
+    let has_known_profile = object_drafts.iter().any(|draft| {
+        draft
+            .unit_dat_header_flags
+            .and_then(behavior_profile_entry_for_class)
+            .is_some()
+    });
+    let archive_path = has_known_profile
+        .then(|| normalize_engine_path("Behavior profile archive", "behpsp.res"))
+        .transpose()?;
+    let profile_archive = archive_path
+        .as_ref()
+        .map(|path| {
+            let bytes = read_vfs(vfs, path)?;
+            decode_nres_payload(bytes).map_err(|source| EngineError::Nres {
+                path: path.as_str().to_string(),
+                source,
+            })
+        })
+        .transpose()?;
+    let mut rates_by_entry = HashMap::<&'static str, BehaviorProfileRates>::new();
+    let mut states = Vec::with_capacity(object_drafts.len());
+
+    for draft in object_drafts {
+        let Some(class_flags) = draft.unit_dat_header_flags else {
+            states.push(None);
+            continue;
+        };
+        let Some(original_id) = draft.original_id else {
+            states.push(None);
+            continue;
+        };
+        let profile_entry = behavior_profile_entry_for_class(class_flags);
+        let (transfer_ore_off_board_bits, transfer_power_out_bits) = if let Some(entry_name) =
+            profile_entry
+        {
+            let rates = if let Some(rates) = rates_by_entry.get(entry_name) {
+                *rates
+            } else {
+                let path = archive_path
+                    .as_ref()
+                    .expect("known profiles require the profile archive path");
+                let archive = profile_archive
+                    .as_ref()
+                    .expect("known profiles require the decoded profile archive");
+                let entry_id =
+                    archive
+                        .find(entry_name)
+                        .ok_or_else(|| EngineError::BehaviorProfile {
+                            path: path.as_str().to_string(),
+                            entry: entry_name.to_string(),
+                            message: "entry was not found".to_string(),
+                        })?;
+                let payload = archive
+                    .payload(entry_id)
+                    .map_err(|source| EngineError::Nres {
+                        path: path.as_str().to_string(),
+                        source,
+                    })?;
+                let rates = fparkan_assets::decode_behavior_profile_rates(payload).map_err(
+                    |source: BehaviorProfileVarError| EngineError::BehaviorProfile {
+                        path: path.as_str().to_string(),
+                        entry: entry_name.to_string(),
+                        message: source.to_string(),
+                    },
+                )?;
+                rates_by_entry.insert(entry_name, rates);
+                rates
+            };
+            (
+                rates.transfer_ore_off_board_bits,
+                rates.transfer_power_out_bits,
+            )
+        } else {
+            (
+                DEFAULT_TRANSFER_ORE_OFF_BOARD_BITS,
+                DEFAULT_TRANSFER_POWER_OUT_BITS,
+            )
+        };
+        states.push(Some(PreparedBehaviorProfileState {
+            original_id,
+            class_flags,
+            profile_entry,
+            transfer_ore_off_board_bits,
+            transfer_power_out_bits,
+        }));
+    }
+    Ok(states)
 }
 
 fn initialize_behavior_ore_state(
@@ -3389,6 +3655,82 @@ mod tests {
     }
 
     #[test]
+    fn behavior_profile_selector_1002_sums_control_e00_rows_then_multiplies_profile_rate() {
+        let table = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(vec![
+                synthetic_effective_control_device(
+                    26,
+                    26,
+                    3.0_f32.to_bits(),
+                    Some(4.0_f32.to_bits()),
+                    None,
+                ),
+                synthetic_effective_control_device(
+                    5,
+                    5,
+                    100.0_f32.to_bits(),
+                    Some(100.0_f32.to_bits()),
+                    None,
+                ),
+                synthetic_effective_control_device(
+                    10,
+                    10,
+                    100.0_f32.to_bits(),
+                    Some(100.0_f32.to_bits()),
+                    None,
+                ),
+                synthetic_effective_control_device(
+                    21,
+                    21,
+                    100.0_f32.to_bits(),
+                    Some(100.0_f32.to_bits()),
+                    None,
+                ),
+                synthetic_effective_control_device(
+                    26,
+                    26,
+                    2.0_f32.to_bits(),
+                    Some(2.0_f32.to_bits()),
+                    None,
+                ),
+            ]),
+            MissionControlNodeProviderTableStatus::Available(
+                (0..3)
+                    .map(|index| synthetic_node_provider_row(0, index, 2.0_f32.to_bits()))
+                    .collect(),
+            ),
+        );
+        assert_eq!(
+            query_behavior_profile_ore_rate(&table, 1.5_f32.to_bits())
+                .expect("supported Behavior ore query")
+                .to_bits(),
+            48.0_f32.to_bits()
+        );
+
+        let mut factory_mismatch = table.clone();
+        let MissionControlDeviceTableStatus::Available(devices) = &mut factory_mismatch.status
+        else {
+            unreachable!();
+        };
+        devices[0].factory_tag = 9;
+        assert_eq!(
+            query_behavior_profile_ore_rate(&factory_mismatch, 1.5_f32.to_bits()),
+            Err(ControlResourceAccessError::UnsupportedFactoryTag { factory_tag: 9 })
+        );
+
+        let unavailable =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Unavailable(
+                MissionControlDeviceTableUnavailableReason::NoControlResource,
+            ));
+        assert_eq!(
+            query_behavior_profile_ore_rate(&unavailable, 1.0_f32.to_bits()),
+            Err(ControlResourceAccessError::TableUnavailable(
+                MissionControlDeviceTableUnavailableReason::NoControlResource
+            ))
+        );
+    }
+
+    #[test]
     fn control_resource_queries_filter_current_tag_and_use_factory_getters() {
         let table =
             synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
@@ -3777,6 +4119,10 @@ mod tests {
             query_loaded_mission_control_device_selector(&engine, handle, 0, 0xe00),
             Err(ControlResourceAccessError::MissionUnavailable)
         );
+        assert_eq!(
+            query_loaded_mission_behavior_resource(&engine, handle, 0x1005),
+            Err(ControlResourceAccessError::MissionUnavailable)
+        );
 
         let stale = ObjectHandle {
             generation: handle.generation.wrapping_add(1),
@@ -3790,6 +4136,12 @@ mod tests {
         );
         assert_eq!(
             query_loaded_mission_control_device_selector(&engine, stale, 0, 0xe00),
+            Err(ControlResourceAccessError::World(
+                fparkan_world::WorldError::StaleHandle
+            ))
+        );
+        assert_eq!(
+            query_loaded_mission_behavior_resource(&engine, stale, 0x1005),
             Err(ControlResourceAccessError::World(
                 fparkan_world::WorldError::StaleHandle
             ))
@@ -3810,6 +4162,12 @@ mod tests {
         );
         assert_eq!(
             query_loaded_mission_control_device_selector(&engine, handle, 0, 0xe00),
+            Err(ControlResourceAccessError::World(
+                fparkan_world::WorldError::StaleHandle
+            ))
+        );
+        assert_eq!(
+            query_loaded_mission_behavior_resource(&engine, handle, 0x1005),
             Err(ControlResourceAccessError::World(
                 fparkan_world::WorldError::StaleHandle
             ))
@@ -4650,27 +5008,47 @@ mod tests {
         let land_path = decode_mission_land_path(&source_tma, TmaProfile::Strict)
             .expect("source mission land path")
             .raw;
-        let mut overlay = MemoryVfs::default();
-        overlay.insert(
-            normalize_engine_path("test mission", "MISSIONS/TEST/MINE/data.tma")
-                .expect("mission path"),
-            Arc::from(single_unit_tma(&land_path)),
-        );
-        let vfs = Arc::new(OverlayVfs::from_layers(vec![
-            Arc::new(overlay),
-            Arc::new(DirectoryVfs::new(&root)),
-        ]));
-        let mut engine = create(EngineServices::new(vfs)).expect("engine");
-        let loaded = load_mission(
-            &mut engine,
-            MissionRequest {
-                key: "MISSIONS/TEST/MINE/data.tma".to_string(),
-                mode: MissionMode::SingleMission,
-            },
-            0,
-        )
-        .expect("full normal mission load");
-        assert_eq!(loaded.object_count, 1);
+        // The TMA keeps its strict marker; only the Unit DAT class header is
+        // overridden in the in-memory VFS to exercise both native profiles.
+        let load_full_fixture = |class_flags: u32| {
+            let mut overlay = MemoryVfs::default();
+            overlay.insert(
+                normalize_engine_path("test mission", "MISSIONS/TEST/MINE/data.tma")
+                    .expect("mission path"),
+                Arc::from(single_unit_tma(&land_path)),
+            );
+            let mut unit_dat = std::fs::read(root.join("UNITS/BUILDS/MINE/min_l_n1.dat"))
+                .expect("licensed Unit DAT");
+            let original_class_flags =
+                u32::from_le_bytes(unit_dat[4..8].try_into().expect("Unit DAT header word"));
+            assert_eq!(original_class_flags, 0x8000_0004);
+            if class_flags != original_class_flags {
+                unit_dat[4..8].copy_from_slice(&class_flags.to_le_bytes());
+            }
+            overlay.insert(
+                normalize_engine_path("test Unit DAT", "UNITS/BUILDS/MINE/min_l_n1.dat")
+                    .expect("Unit DAT path"),
+                Arc::from(unit_dat),
+            );
+            let vfs = Arc::new(OverlayVfs::from_layers(vec![
+                Arc::new(overlay),
+                Arc::new(DirectoryVfs::new(&root)),
+            ]));
+            let mut engine = create(EngineServices::new(vfs)).expect("engine");
+            let loaded = load_mission(
+                &mut engine,
+                MissionRequest {
+                    key: "MISSIONS/TEST/MINE/data.tma".to_string(),
+                    mode: MissionMode::SingleMission,
+                },
+                0,
+            )
+            .expect("full normal mission load");
+            assert_eq!(loaded.object_count, 1);
+            engine
+        };
+        let mut engine = load_full_fixture(0x8000_0002);
+        let mine_engine = load_full_fixture(0x8000_0004);
 
         let draft = &loaded_mission_object_drafts(&engine).expect("object drafts")[0];
         assert_eq!(draft.unit_components.len(), 6);
@@ -4744,6 +5122,38 @@ mod tests {
                 .expect("licensed tag-26 selector")
                 .map(f32::to_bits),
             Some(1.0_f32.to_bits())
+        );
+        let profiles = loaded_mission_behavior_profiles(&engine).expect("Behavior profiles");
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].original_id, OriginalObjectId(0));
+        assert_eq!(profiles[0].handle, control_handle);
+        assert_eq!(profiles[0].class_flags, 0x8000_0002);
+        assert_eq!(profiles[0].profile_entry, Some("prof_generator.var"));
+        assert_eq!(profiles[0].transfer_ore_off_board_bits, 0);
+        assert_eq!(profiles[0].transfer_power_out_bits, 10.0_f32.to_bits());
+        assert_eq!(
+            query_loaded_mission_behavior_resource(&engine, control_handle, 0x1005)
+                .expect("licensed profile power-out rate")
+                .to_bits(),
+            10.0_f32.to_bits()
+        );
+        assert_eq!(
+            query_loaded_mission_behavior_resource(&engine, control_handle, 0x1002)
+                .expect("licensed profile ore-off-board rate")
+                .to_bits(),
+            0.0_f32.to_bits()
+        );
+        let mine_profile =
+            loaded_mission_behavior_profiles(&mine_engine).expect("mine Behavior profile")[0];
+        assert_eq!(mine_profile.class_flags, 0x8000_0004);
+        assert_eq!(mine_profile.profile_entry, Some("prof_mine.var"));
+        assert_eq!(mine_profile.transfer_ore_off_board_bits, 1.0_f32.to_bits());
+        assert_eq!(mine_profile.transfer_power_out_bits, 0.0_f32.to_bits());
+        assert_eq!(
+            query_loaded_mission_behavior_resource(&mine_engine, mine_profile.handle, 0x1002)
+                .expect("mine profile ore resource query")
+                .to_bits(),
+            1.0_f32.to_bits()
         );
         let prepared_controls = &engine
             .loaded
@@ -5545,6 +5955,48 @@ mod tests {
     }
 
     #[test]
+    fn behavior_profile_mapper_matches_native_classes_and_unknowns_keep_constructor_defaults() {
+        let mapped = [
+            (0x8000_0004, "prof_mine.var"),
+            (0x8000_0008, "prof_storage.var"),
+            (0x8000_0002, "prof_generator.var"),
+            (0x8000_0010, "prof_plant.var"),
+            (0x8000_0040, "prof_angar.var"),
+            (0x8000_0200, "prof_mtp.var"),
+            (0x8000_0400, "prof_institute.var"),
+            (0x8001_0000, "prof_bunker.var"),
+            (0x8002_0000, "prof_bunker.var"),
+            (0x8004_0000, "prof_bunker.var"),
+            (0x8010_0000, "prof_tower.var"),
+            (0x8020_0000, "prof_tower.var"),
+            (0x0100_2000, "prof_trn.var"),
+            (0x0100_4000, "prof_bld.var"),
+            (0x0100_8000, "prof_war.var"),
+            (0x0101_0000, "prof_hq.var"),
+            (0x0102_0000, "prof_hero.var"),
+            (0x2000_0000, "prof_animal.var"),
+        ];
+        for (class_flags, entry) in mapped {
+            assert_eq!(behavior_profile_entry_for_class(class_flags), Some(entry));
+        }
+        assert_eq!(behavior_profile_entry_for_class(0xdead_beef), None);
+
+        let vfs: Arc<dyn Vfs> = Arc::new(MemoryVfs::default());
+        let drafts = [basement_draft(Some(0xdead_beef), 0)];
+        let states = prepare_behavior_profile_states(&vfs, &drafts)
+            .expect("unknown profile class preserves native constructor defaults");
+        assert_eq!(states.len(), 1);
+        assert_eq!(
+            states[0].map(|state| (
+                state.profile_entry,
+                state.transfer_ore_off_board_bits,
+                state.transfer_power_out_bits,
+            )),
+            Some((None, 0x40a0_0000, 0x42c8_0000))
+        );
+    }
+
+    #[test]
     fn behavior_distributor_normalize_matches_native_24_bit_vectors() {
         let mut pinned = BehaviorDistributorState {
             clan_index: 0,
@@ -5645,6 +6097,9 @@ mod tests {
         assert!(loaded_mission_behavior_ore_states(&engine)
             .expect("preview Behavior ore state")
             .is_empty());
+        assert!(loaded_mission_behavior_profiles(&engine)
+            .expect("preview Behavior profiles")
+            .is_empty());
         assert!(bundles
             .iter()
             .all(|bundle| bundle.behavior_warm_start.is_none()));
@@ -5675,6 +6130,51 @@ mod tests {
             ]
         );
         assert!(loaded.script_bundle_count >= 1);
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn malformed_known_behavior_profile_keeps_previous_mission_and_world() {
+        let root = licensed_root("IS");
+        let mut overlay = MemoryVfs::default();
+        overlay.insert(
+            normalize_engine_path("broken Behavior archive", "behpsp.res")
+                .expect("profile archive path"),
+            Arc::from(&b"bad!"[..]),
+        );
+        let vfs: Arc<dyn Vfs> = Arc::new(OverlayVfs::from_layers(vec![
+            Arc::new(overlay),
+            Arc::new(DirectoryVfs::new(&root)),
+        ]));
+        let mut engine = create(EngineServices::new(vfs)).expect("engine");
+        let request = || MissionRequest {
+            key: "MISSIONS/Autodemo.00/data.tma".to_string(),
+            mode: MissionMode::SingleMission,
+        };
+        load_mission_static_preview_roots(
+            &mut engine,
+            request(),
+            NonZeroUsize::new(1).expect("one root"),
+        )
+        .expect("static preview does not require Behavior profile parsing");
+        let previous_mission = loaded_mission(&engine).expect("loaded preview").clone();
+        let before = step_headless(&mut engine, InputSnapshot)
+            .expect("step preview world")
+            .snapshot
+            .objects;
+
+        let error = load_mission(&mut engine, request(), 0)
+            .expect_err("malformed profile archive prevents full mission load");
+        assert!(matches!(
+            error,
+            EngineError::Nres { ref path, .. } if path == "behpsp.res"
+        ));
+        assert_eq!(loaded_mission(&engine), Some(&previous_mission));
+        let after = step_headless(&mut engine, InputSnapshot)
+            .expect("step retained preview world")
+            .snapshot
+            .objects;
+        assert_eq!(before, after);
     }
 
     #[test]

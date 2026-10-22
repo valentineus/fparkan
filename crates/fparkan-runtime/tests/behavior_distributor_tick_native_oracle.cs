@@ -23,6 +23,9 @@ internal static class BehaviorDistributorTickOracle {
     private const int IndexedPropertySetRva = 0x0b470;
     private const int IndexedPropertyGetRva = 0x0b5b0;
     private const int OreInitializationRva = 0x08790;
+    private const int BehaviorProfileMapRva = 0x08a80;
+    private const int BehaviorVarBlockConstructorRva = 0x22d90;
+    private const int BehaviorVarFieldRegisterRva = 0x22e20;
     private const int GetSystemArealMapIatRva = 0x59008;
     private const int ControlResourceDeviceGetterRva = 0x21d00;
     private const int ControlResourceAggregateQueryRva = 0x2b410;
@@ -45,6 +48,10 @@ internal static class BehaviorDistributorTickOracle {
     private const int ControlResourceNoOpStringPairRva = 0x0bcd0;
     private const int ControlResourceTag19VtableRva = 0x3c608;
     private const int ControlResourceTag19StringPairNoOpRva = 0x0bcd0;
+    private const int BehaviorVarTableVtableRva = 0x591b0;
+    private const int BehaviorVarArrayLoadRva = 0x49fa0;
+    private const int BehaviorVarFieldBindRva = 0x49090;
+    private const int BehaviorVarApplyRva = 0x49170;
     private const uint ResourceProperty = 0x02000100;
     private static Fixture active;
 
@@ -74,6 +81,13 @@ internal static class BehaviorDistributorTickOracle {
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void IndexedPropertySet(IntPtr self, uint index, uint valueBits);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int IndexedPropertyGet(IntPtr self, uint index, IntPtr resultBits);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeOreInitialization(IntPtr self);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate int NativeBehaviorVarArrayLoad(IntPtr self, IntPtr bytes, IntPtr cursorOut);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeBehaviorVarFieldBind(IntPtr self, IntPtr typeName, IntPtr fieldName, IntPtr destination);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeBehaviorVarApply(IntPtr self);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeBehaviorProfileMap(IntPtr self);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeBehaviorVarBlockConstructor(IntPtr self);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeBehaviorVarFieldRegister(IntPtr self, IntPtr table);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void NativeBehaviorProfileLoadCallback(IntPtr owner, uint selector, IntPtr archive, IntPtr entry);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate float NativeControlResourceDeviceGet(IntPtr self, uint selector);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void NativeFastcallComponentBuilder(IntPtr owner, IntPtr node, uint parentId);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int NativeArealMapEvent(IntPtr owner, uint message, uint subcode, IntPtr descriptor);
@@ -111,6 +125,15 @@ internal static class BehaviorDistributorTickOracle {
     private static IntPtr x87ControlWordCell;
     private static X87ControlWordReader x87ControlWordReader;
     private static X87ControlWordWriter x87ControlWordWriter;
+    private static readonly NativeBehaviorProfileLoadCallback BehaviorProfileLoadCallback = CaptureBehaviorProfileLoad;
+    private static readonly List<BehaviorProfileSelection> behaviorProfileSelections = new List<BehaviorProfileSelection>();
+
+    private sealed class BehaviorProfileSelection {
+        public IntPtr Owner;
+        public uint Selector;
+        public string Archive;
+        public string Entry;
+    }
 
     private sealed class NativeObject {
         public IntPtr Self;
@@ -533,6 +556,9 @@ internal static class BehaviorDistributorTickOracle {
             RunNativeControlResourceDeviceCase(controlModule);
             RunNativeControlProviderLiveStateCase(controlModule);
             RunNativeControlAggregateResourceCases(controlModule);
+            RunNativeBehaviorProfileMapCases(module);
+            RunNativeBehaviorVarSyntheticCase(module);
+            RunNativeBehaviorRealProfileCases(module);
         } finally {
             SetX87ControlWord(savedControlWord);
             Console.WriteLine("x87-control-word-restored=0x" + CurrentX87ControlWord().ToString("x4"));
@@ -1091,6 +1117,243 @@ internal static class BehaviorDistributorTickOracle {
         }
         Console.WriteLine("native-behavior-ore-initialization: classes=80000004,80000008,01002000,01004000,01008000; defaults=verified");
     }
+
+    private static void CaptureBehaviorProfileLoad(IntPtr owner, uint selector, IntPtr archive, IntPtr entry) {
+        behaviorProfileSelections.Add(new BehaviorProfileSelection {
+            Owner = owner,
+            Selector = selector,
+            Archive = Marshal.PtrToStringAnsi(archive),
+            Entry = Marshal.PtrToStringAnsi(entry)
+        });
+    }
+
+    private static void RunNativeBehaviorProfileMapCases(IntPtr module) {
+        NativeBehaviorProfileMap map = (NativeBehaviorProfileMap)Marshal.GetDelegateForFunctionPointer(
+            IntPtr.Add(module, BehaviorProfileMapRva), typeof(NativeBehaviorProfileMap));
+        string[][] cases = new string[][] {
+            new string[] { "80000004", "prof_mine.var" },
+            new string[] { "80000008", "prof_storage.var" },
+            new string[] { "80000002", "prof_generator.var" },
+            new string[] { "80000010", "prof_plant.var" },
+            new string[] { "80000040", "prof_angar.var" },
+            new string[] { "80000200", "prof_mtp.var" },
+            new string[] { "80000400", "prof_institute.var" },
+            new string[] { "80010000", "prof_bunker.var" },
+            new string[] { "80020000", "prof_bunker.var" },
+            new string[] { "80040000", "prof_bunker.var" },
+            new string[] { "80100000", "prof_tower.var" },
+            new string[] { "80200000", "prof_tower.var" },
+            new string[] { "01002000", "prof_trn.var" },
+            new string[] { "01004000", "prof_bld.var" },
+            new string[] { "01008000", "prof_war.var" },
+            new string[] { "01010000", "prof_hq.var" },
+            new string[] { "01020000", "prof_hero.var" },
+            new string[] { "20000000", "prof_animal.var" }
+        };
+        using (Fixture fixture = NewFixture()) {
+            IntPtr owner = fixture.Allocate(0x0b00);
+            IntPtr vtable = fixture.Allocate(0x68);
+            Marshal.WriteIntPtr(owner, vtable);
+            Marshal.WriteIntPtr(vtable, 0x64, Marshal.GetFunctionPointerForDelegate(BehaviorProfileLoadCallback));
+            foreach (string[] test in cases) {
+                behaviorProfileSelections.Clear();
+                Marshal.WriteInt32(owner, 0x0afc, unchecked((int)Convert.ToUInt32(test[0], 16)));
+                map(owner);
+                Expect(behaviorProfileSelections.Count == 1, "profile mapper callback count for class 0x" + test[0]);
+                BehaviorProfileSelection selection = behaviorProfileSelections[0];
+                Expect(selection.Owner == owner && selection.Selector == 2 && selection.Archive == "behpsp.res" &&
+                    selection.Entry == test[1], "profile mapper result for class 0x" + test[0]);
+            }
+            string[] noMatch = new string[] { "deadbeef", "8000000c" };
+            foreach (string test in noMatch) {
+                behaviorProfileSelections.Clear();
+                Marshal.WriteInt32(owner, 0x0afc, unchecked((int)Convert.ToUInt32(test, 16)));
+                map(owner);
+                Expect(behaviorProfileSelections.Count == 0, "profile mapper leaves unknown/combined class 0x" + test + " unconfigured");
+            }
+        }
+        Console.WriteLine("native-behavior-profile-map: mapped-classes=" + cases.Length + " (including three bunker and two tower codes); unknown-and-combined=no callback");
+    }
+
+    private static void RunNativeBehaviorVarSyntheticCase(IntPtr module) {
+        NativeBehaviorVarArrayLoad load = (NativeBehaviorVarArrayLoad)Marshal.GetDelegateForFunctionPointer(
+            IntPtr.Add(module, BehaviorVarArrayLoadRva), typeof(NativeBehaviorVarArrayLoad));
+        NativeBehaviorVarFieldBind bind = (NativeBehaviorVarFieldBind)Marshal.GetDelegateForFunctionPointer(
+            IntPtr.Add(module, BehaviorVarFieldBindRva), typeof(NativeBehaviorVarFieldBind));
+        NativeBehaviorVarApply apply = (NativeBehaviorVarApply)Marshal.GetDelegateForFunctionPointer(
+            IntPtr.Add(module, BehaviorVarApplyRva), typeof(NativeBehaviorVarApply));
+        byte[] bytes = SerializeOneBehaviorVarField("Transfer_Ore_OffBoard", "float", 0x3f000000, 0x41200000);
+        using (Fixture fixture = NewFixture()) {
+            IntPtr table = fixture.Allocate(0x18);
+            IntPtr target = fixture.Allocate(sizeof(uint));
+            IntPtr input = fixture.Allocate(bytes.Length);
+            IntPtr cursorOut = fixture.Allocate(IntPtr.Size);
+            IntPtr fieldName = fixture.Allocate(32);
+            IntPtr typeName = fixture.Allocate(8);
+            CopyBytes(input, bytes);
+            WriteFixedAnsi(fieldName, 0, "Transfer_Ore_OffBoard", 32);
+            WriteFixedAnsi(typeName, 0, "float", 8);
+            Marshal.WriteIntPtr(table, IntPtr.Add(module, BehaviorVarTableVtableRva));
+            Marshal.WriteInt32(input, 0, 1);
+
+            Expect(load(table, input, cursorOut) == 1, "native .var parser accepts the synthetic one-row profile");
+            Expect(Marshal.ReadInt32(table, 4) == 1 && Marshal.ReadIntPtr(cursorOut) == IntPtr.Add(input, bytes.Length),
+                "native .var parser consumes the full synthetic profile");
+            bind(table, typeName, fieldName, target);
+            apply(table);
+            Expect(unchecked((uint)Marshal.ReadInt32(target)) == 0x41200000,
+                "native .var apply uses the second value blob after binding");
+            Console.WriteLine("native-behavior-var-synthetic: first=0x3f000000 second=0x41200000 applied=0x" +
+                unchecked((uint)Marshal.ReadInt32(target)).ToString("x8"));
+        }
+    }
+
+    private static void RunNativeBehaviorRealProfileCases(IntPtr module) {
+        string archivePath = Environment.GetEnvironmentVariable("FPARKAN_ORIGINAL_BEHAVIOR_PROFILE_RES");
+        if (String.IsNullOrEmpty(archivePath)) archivePath = @"C:\GOG Games\Parkan - Iron Strategy\behpsp.res";
+        if (!File.Exists(archivePath)) throw new FileNotFoundException(
+            "Set FPARKAN_ORIGINAL_BEHAVIOR_PROFILE_RES to the installed behpsp.res.", archivePath);
+        byte[] archiveBytes = File.ReadAllBytes(archivePath);
+        NativeBehaviorProfileMap map = (NativeBehaviorProfileMap)Marshal.GetDelegateForFunctionPointer(
+            IntPtr.Add(module, BehaviorProfileMapRva), typeof(NativeBehaviorProfileMap));
+        NativeBehaviorVarArrayLoad load = (NativeBehaviorVarArrayLoad)Marshal.GetDelegateForFunctionPointer(
+            IntPtr.Add(module, BehaviorVarArrayLoadRva), typeof(NativeBehaviorVarArrayLoad));
+        NativeBehaviorVarBlockConstructor construct = (NativeBehaviorVarBlockConstructor)Marshal.GetDelegateForFunctionPointer(
+            IntPtr.Add(module, BehaviorVarBlockConstructorRva), typeof(NativeBehaviorVarBlockConstructor));
+        NativeBehaviorVarFieldRegister register = (NativeBehaviorVarFieldRegister)Marshal.GetDelegateForFunctionPointer(
+            IntPtr.Add(module, BehaviorVarFieldRegisterRva), typeof(NativeBehaviorVarFieldRegister));
+        NativeBehaviorVarApply apply = (NativeBehaviorVarApply)Marshal.GetDelegateForFunctionPointer(
+            IntPtr.Add(module, BehaviorVarApplyRva), typeof(NativeBehaviorVarApply));
+
+        string selectedEntry = SelectBehaviorProfile(map, 0x80000004);
+        Expect(selectedEntry == "prof_mine.var", "mine profile is selected by native class mapper");
+        byte[] profile = ReadNresEntry(archiveBytes, selectedEntry);
+        Expect(ReadUInt32(profile, 0) == 27, "native mine profile contains all 27 rows");
+        uint expectedOreOffBoard = FindBehaviorVarSecondBlob(profile, "Transfer_Ore_OffBoard");
+        uint expectedPowerOut = FindBehaviorVarSecondBlob(profile, "Transfer_Power_Out");
+
+        using (Fixture fixture = NewFixture()) {
+            IntPtr table = fixture.Allocate(0x18);
+            IntPtr rawProfile = fixture.Allocate(profile.Length);
+            IntPtr cursorOut = fixture.Allocate(IntPtr.Size);
+            IntPtr block = fixture.Allocate(0x80);
+            CopyBytes(rawProfile, profile);
+            Marshal.WriteIntPtr(table, IntPtr.Add(module, BehaviorVarTableVtableRva));
+
+            Expect(load(table, rawProfile, cursorOut) == 1, "native parser accepts the licensed mine profile");
+            Expect(Marshal.ReadInt32(table, 4) == 27 && Marshal.ReadIntPtr(cursorOut) == IntPtr.Add(rawProfile, profile.Length),
+                "native parser consumes all rows in the licensed mine profile");
+            construct(block);
+            Expect(unchecked((uint)Marshal.ReadInt32(block, 0x58)) == 0x40a00000 &&
+                unchecked((uint)Marshal.ReadInt32(block, 0x60)) == 0x42c80000,
+                "native variable block starts with transfer defaults 5 and 100");
+            register(block, table);
+            apply(table);
+            Expect(unchecked((uint)Marshal.ReadInt32(block, 0x58)) == expectedOreOffBoard &&
+                unchecked((uint)Marshal.ReadInt32(block, 0x60)) == expectedPowerOut,
+                "native profile bind/apply copies second blobs into Transfer_Ore_OffBoard and Transfer_Power_Out");
+            Console.WriteLine("native-behavior-real-profile: class=80000004 entry=" + selectedEntry + " rows=27 Transfer_Ore_OffBoard=" +
+                Hex(expectedOreOffBoard) + " Transfer_Power_Out=" + Hex(expectedPowerOut) + "; native-bind-and-apply=verified");
+        }
+    }
+
+    private static string SelectBehaviorProfile(NativeBehaviorProfileMap map, uint classCode) {
+        using (Fixture fixture = NewFixture()) {
+            IntPtr owner = fixture.Allocate(0x0b00);
+            IntPtr vtable = fixture.Allocate(0x68);
+            Marshal.WriteIntPtr(owner, vtable);
+            Marshal.WriteIntPtr(vtable, 0x64, Marshal.GetFunctionPointerForDelegate(BehaviorProfileLoadCallback));
+            behaviorProfileSelections.Clear();
+            Marshal.WriteInt32(owner, 0x0afc, unchecked((int)classCode));
+            map(owner);
+            Expect(behaviorProfileSelections.Count == 1, "native mapper returned a single profile for class 0x" + classCode.ToString("x8"));
+            BehaviorProfileSelection selection = behaviorProfileSelections[0];
+            Expect(selection.Owner == owner && selection.Selector == 2 && selection.Archive == "behpsp.res",
+                "native mapper selected the behavior profile archive and selector");
+            return selection.Entry;
+        }
+    }
+
+    private static byte[] SerializeOneBehaviorVarField(string fieldName, string typeName, uint firstBits, uint secondBits) {
+        byte[] field = Encoding.ASCII.GetBytes(fieldName);
+        byte[] type = Encoding.ASCII.GetBytes(typeName);
+        using (MemoryStream stream = new MemoryStream()) using (BinaryWriter writer = new BinaryWriter(stream)) {
+            writer.Write((uint)1); // row count
+            writer.Write((uint)4); // value size
+            writer.Write((uint)3); // float type index
+            writer.Write((uint)0); // flags
+            writer.Write((uint)field.Length); writer.Write(field);
+            writer.Write((uint)type.Length); writer.Write(type);
+            writer.Write(firstBits); writer.Write(secondBits);
+            writer.Write((uint)0); writer.Write((uint)0); // trailing row metadata
+            return stream.ToArray();
+        }
+    }
+
+    private static byte[] ReadNresEntry(byte[] archive, string name) {
+        if (archive.Length < 16) throw new InvalidDataException("NRes archive is shorter than its header");
+        uint count = ReadUInt32(archive, 8);
+        if (count > Int32.MaxValue / 64) throw new InvalidDataException("NRes directory count is too large");
+        int directory = checked(archive.Length - (int)count * 64);
+        if (directory < 16) throw new InvalidDataException("NRes directory falls inside the header");
+        for (int index = 0; index < (int)count; index++) {
+            int record = checked(directory + index * 64);
+            int nameEnd = record + 20;
+            while (nameEnd < record + 56 && archive[nameEnd] != 0) nameEnd++;
+            string entryName = Encoding.ASCII.GetString(archive, record + 20, nameEnd - (record + 20));
+            if (!String.Equals(entryName, name, StringComparison.Ordinal)) continue;
+            uint size = ReadUInt32(archive, record + 12);
+            uint dataOffset = ReadUInt32(archive, record + 56);
+            if (size > Int32.MaxValue || dataOffset > Int32.MaxValue || dataOffset + size > archive.Length)
+                throw new InvalidDataException("NRes entry range is outside the archive");
+            byte[] data = new byte[(int)size];
+            Buffer.BlockCopy(archive, (int)dataOffset, data, 0, data.Length);
+            return data;
+        }
+        throw new InvalidDataException("NRes archive does not contain entry " + name);
+    }
+
+    private static uint FindBehaviorVarSecondBlob(byte[] profile, string fieldName) {
+        if (profile.Length < 4) throw new InvalidDataException("Behavior profile is shorter than its row count");
+        uint count = ReadUInt32(profile, 0);
+        if (count > 1024) throw new InvalidDataException("Behavior profile row count is unreasonable");
+        int cursor = 4;
+        for (int index = 0; index < (int)count; index++) {
+            EnsureRange(profile, cursor, 12);
+            uint size = ReadUInt32(profile, cursor);
+            if (size > Int32.MaxValue) throw new InvalidDataException("Behavior variable size is too large");
+            uint type = ReadUInt32(profile, cursor + 4);
+            cursor += 12;
+            uint fieldLength = ReadUInt32(profile, cursor);
+            if (fieldLength > Int32.MaxValue) throw new InvalidDataException("Behavior field name is too large");
+            cursor += 4; EnsureRange(profile, cursor, (int)fieldLength);
+            string name = Encoding.ASCII.GetString(profile, cursor, (int)fieldLength);
+            cursor += (int)fieldLength;
+            uint typeLength = ReadUInt32(profile, cursor);
+            if (typeLength > Int32.MaxValue) throw new InvalidDataException("Behavior variable type name is too large");
+            cursor += 4; EnsureRange(profile, cursor, (int)typeLength);
+            cursor += (int)typeLength;
+            EnsureRange(profile, cursor, checked((int)size * 2 + 8));
+            int secondBlob = checked(cursor + (int)size);
+            if (String.Equals(name, fieldName, StringComparison.Ordinal)) {
+                if (type != 3 || size != 4) throw new InvalidDataException("Expected float profile field " + fieldName);
+                return ReadUInt32(profile, secondBlob);
+            }
+            cursor = checked(cursor + (int)size * 2 + 8);
+        }
+        throw new InvalidDataException("Behavior profile does not contain field " + fieldName);
+    }
+
+    private static uint ReadUInt32(byte[] data, int offset) {
+        EnsureRange(data, offset, 4);
+        return unchecked((uint)(data[offset] | (data[offset + 1] << 8) | (data[offset + 2] << 16) | (data[offset + 3] << 24)));
+    }
+
+    private static void EnsureRange(byte[] data, int offset, int size) {
+        if (offset < 0 || size < 0 || offset > data.Length - size) throw new InvalidDataException("Behavior profile range is outside its input");
+    }
+
+    private static void CopyBytes(IntPtr destination, byte[] source) { Marshal.Copy(source, 0, destination, source.Length); }
 
     private static ushort CurrentX87ControlWord() {
         if (x87ControlWordReader == null || x87ControlWordCell == IntPtr.Zero)

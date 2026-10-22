@@ -469,6 +469,7 @@ version = "0.1.0"
 name = "fparkan-assets"
 version = "0.1.0"
 dependencies = [
+ "fparkan-binary",
  "fparkan-material",
  "fparkan-mission-format",
  "fparkan-msh",
