@@ -6,8 +6,8 @@ using System.Security.Cryptography;
 using System.Text;
 
 // Calls selected original x86 Behavior.dll, ArealMap.dll, and Control.dll paths
-// against synthetic storage. Only host callbacks, GetSystemArealMap, and bounded
-// vector backing are substituted; the tested module instructions remain installed code.
+// against synthetic storage. Only host callbacks, GetSystemArealMap/GetQueue IAT
+// slots, and bounded vector backing are substituted; tested module code remains installed.
 internal static class BehaviorDistributorTickOracle {
     private const uint LoadWithAlteredSearchPath = 0x00000008;
     private const uint MemCommitReserve = 0x00003000;
@@ -36,6 +36,9 @@ internal static class BehaviorDistributorTickOracle {
     private const int ControlProviderType1GetterRva = 0x0dc40;
     private const int ControlProviderRowConstructorRva = 0x0b240;
     private const int ControlProviderAmountUpdateRva = 0x10f30;
+    private const int ControlProviderAmountDistributeRva = 0x10ba0;
+    private const int ControlContactRateUpdateRva = 0x12a40;
+    private const int ControlTimedUpdateRva = 0x0bcf0;
     private const int ArealMapUnitDatComponentBuilderRva = 0x14b90;
     private const int ControlResourceDeviceConstructorRva = 0x22980;
     private const int ControlResourceComponentOverrideRva = 0x2d890;
@@ -101,6 +104,9 @@ internal static class BehaviorDistributorTickOracle {
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int NativeControlAggregateQuery(IntPtr self, uint selector, IntPtr result);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int NativeControlAggregateSet(IntPtr self, uint selector, IntPtr value);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlProviderAmountUpdate(IntPtr self, int nodeIndex, float delta, uint animationFlag);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlProviderAmountDistribute(IntPtr self, float delta, uint mode, uint flags);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlContactRateUpdate(IntPtr self, float deltaSeconds);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlTimedUpdate(IntPtr self, float inputTime);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlProviderRowConstructor(IntPtr self, IntPtr sourceNdpRow);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void NativeControlNodeUpdateCallback(IntPtr self, uint nodeIndex, uint selector, uint valueBits);
 
@@ -124,6 +130,7 @@ internal static class BehaviorDistributorTickOracle {
     private static uint controlNodeUpdateIndex;
     private static uint controlNodeUpdateSelector;
     private static uint controlNodeUpdateValueBits;
+    private static readonly List<uint> controlNodeUpdateIndices = new List<uint>();
     private static IntPtr fastcallThunks;
     private static IntPtr queryObjectThunk;
     private static IntPtr getInterfacePropertyThunk;
@@ -168,6 +175,11 @@ internal static class BehaviorDistributorTickOracle {
         public int Selector2Reads;
         public int Writes;
         public readonly List<string> Calls = new List<string>();
+    }
+
+    private sealed class NativeProviderTable {
+        public IntPtr Owner;
+        public IntPtr Rows;
     }
 
     private sealed class Fixture : IDisposable {
@@ -467,6 +479,7 @@ internal static class BehaviorDistributorTickOracle {
         controlNodeUpdateIndex = nodeIndex;
         controlNodeUpdateSelector = selector;
         controlNodeUpdateValueBits = valueBits;
+        controlNodeUpdateIndices.Add(nodeIndex);
     }
     private static float SequenceValue(float[] sequence, int index, float fallback) {
         if (sequence == null || sequence.Length == 0) return fallback;
@@ -548,7 +561,7 @@ internal static class BehaviorDistributorTickOracle {
             Marshal.WriteIntPtr(import, Marshal.GetFunctionPointerForDelegate(AreaMapGetterCallback));
             Marshal.WriteIntPtr(queueImport, Marshal.GetFunctionPointerForDelegate(QueueGetterCallback));
             RunSmokeCases(module, controlModule, arealMapModule);
-            Console.WriteLine("original native Behavior/ArealMap/Control oracle passed (Behavior Add 0x1aac0, normalize 0x1ac90, scheduler 0x1adb0, tick 0x19e80; ArealMap UnitDAT projection 0x14b90; Control INTO override 0x2d890; synthetic host callbacks, GetSystemArealMap/GetQueue IAT slots, and bounded vector insertion are substituted; scheduler and tick machine code are original; this does not compare Rust parity).");
+            Console.WriteLine("original native Behavior/ArealMap/Control oracle passed (Behavior Add 0x1aac0, normalize 0x1ac90, scheduler 0x1adb0, tick 0x19e80; ArealMap UnitDAT projection 0x14b90; Control INTO override 0x2d890, provider distribution 0x10ba0, class-4 update 0x12a40 and inactive timing baseline 0xbcf0; synthetic host callbacks, GetSystemArealMap/GetQueue IAT slots, and bounded vector insertion are substituted; Control provider selector vtable is original; no full Control update or Rust parity is claimed).");
             return 0;
         }
         catch (Exception error) {
@@ -591,6 +604,9 @@ internal static class BehaviorDistributorTickOracle {
             RunNativeControlIntoOverrideCase(controlModule);
             RunNativeControlResourceDeviceCase(controlModule);
             RunNativeControlProviderLiveStateCase(controlModule);
+            RunNativeControlProviderDistributionCases(controlModule);
+            RunNativeControlContactRateUpdateCase(controlModule);
+            RunNativeControlTimedUpdateBaselineCases(controlModule);
             RunNativeControlAggregateResourceCases(controlModule);
             RunNativeBehaviorProfileMapCases(module);
             RunNativeBehaviorVarSyntheticCase(module);
@@ -839,6 +855,212 @@ internal static class BehaviorDistributorTickOracle {
             GC.KeepAlive(update);
             GC.KeepAlive(getter);
         }
+    }
+
+    private static NativeProviderTable CreateNativeProviderTable(Fixture fixture, IntPtr module,
+        float[] maxima, float[] amounts, byte[] rowFlags) {
+        Expect(maxima.Length == amounts.Length && maxima.Length == rowFlags.Length,
+            "native provider fixture arrays have matching lengths");
+        NativeControlProviderRowConstructor construct = (NativeControlProviderRowConstructor)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlProviderRowConstructorRva),
+                typeof(NativeControlProviderRowConstructor));
+        NativeProviderTable table = new NativeProviderTable();
+        table.Owner = fixture.Allocate(0x664);
+        table.Rows = fixture.Allocate(maxima.Length * 0x2c);
+        IntPtr providerInterface = IntPtr.Add(table.Owner, 4);
+        IntPtr providerVtable = IntPtr.Add(module, ControlProviderInterfaceVtableRva);
+        Marshal.WriteIntPtr(providerInterface, providerVtable);
+        Expect(Marshal.ReadIntPtr(providerVtable, 0x0c) == IntPtr.Add(module, ControlProviderType1GetterRva),
+            "native provider fixture uses the installed selector interface vtable");
+        Marshal.WriteIntPtr(table.Owner, 0x55c, table.Rows);
+        Marshal.WriteInt32(table.Owner, 0x560, maxima.Length);
+        Marshal.WriteInt32(table.Owner, 0x548, FloatBits(1.0f));
+        Marshal.WriteInt32(table.Owner, 0x660, FloatBits(1.0f));
+        Marshal.WriteInt32(table.Owner, 0x550, 0xfffe); // Exclude the separate root-node depletion lifecycle.
+        Marshal.WriteInt32(table.Owner, 0x594, 0);
+        Marshal.WriteInt32(table.Owner, 0x598, 0);
+        Marshal.WriteInt32(table.Owner, 0x618, 0);
+        Marshal.WriteInt32(table.Owner, 0x386, 0);
+
+        float totalMaximum = 0.0f;
+        float totalAmount = 0.0f;
+        for (int i = 0; i < maxima.Length; i++) {
+            IntPtr descriptor = fixture.Allocate(0x80);
+            IntPtr row = IntPtr.Add(table.Rows, i * 0x2c);
+            Marshal.WriteInt32(descriptor, 0x04, FloatBits(maxima[i]));
+            construct(row, descriptor);
+            Marshal.WriteInt32(row, 0x04, -1); // No component parent or stage chain.
+            Marshal.WriteInt32(row, 0x08, FloatBits(amounts[i]));
+            Marshal.WriteInt32(row, 0x10, 0);
+            Marshal.WriteInt32(row, 0x14, FloatBits(amounts[i] / maxima[i]));
+            Marshal.WriteInt32(row, 0x18, 0);
+            Marshal.WriteInt32(row, 0x1c, 0);
+            Marshal.WriteInt32(row, 0x24, -1);
+            Marshal.WriteByte(row, 0x28, rowFlags[i]);
+            totalMaximum += maxima[i];
+            totalAmount += amounts[i];
+        }
+        Marshal.WriteInt32(table.Owner, 0x58c, FloatBits(totalMaximum));
+        Marshal.WriteInt32(table.Owner, 0x590, FloatBits(totalAmount));
+
+        IntPtr callbackObject = fixture.Allocate(IntPtr.Size);
+        IntPtr callbackVtable = fixture.Allocate(0x38);
+        Marshal.WriteIntPtr(callbackObject, 0, callbackVtable);
+        Marshal.WriteIntPtr(callbackVtable, 0x34, Marshal.GetFunctionPointerForDelegate(ControlNodeUpdateCallback));
+        Marshal.WriteIntPtr(table.Owner, 0x20, callbackObject);
+        return table;
+    }
+
+    private static float ReadNativeProviderAmount(NativeProviderTable table, int index) {
+        return ReadFloat(table.Rows, index * 0x2c + 0x08);
+    }
+
+    private static byte ReadNativeProviderFlags(NativeProviderTable table, int index) {
+        return Marshal.ReadByte(table.Rows, index * 0x2c + 0x28);
+    }
+
+    private static void RunNativeControlProviderDistributionCases(IntPtr module) {
+        NativeControlProviderAmountDistribute distribute = (NativeControlProviderAmountDistribute)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlProviderAmountDistributeRva),
+                typeof(NativeControlProviderAmountDistribute));
+
+        using (Fixture fixture = NewFixture()) {
+            NativeProviderTable table = CreateNativeProviderTable(fixture, module,
+                new float[] { 30.0f, 60.0f, 50.0f }, new float[] { 10.0f, 20.0f, 0.0f },
+                new byte[] { 0, 0, 0 });
+            controlNodeUpdateCount = 0;
+            controlNodeUpdateIndices.Clear();
+            distribute(table.Owner, 22.0f, 0, 0);
+            Expect(ReadNativeProviderAmount(table, 0) == 14.0f &&
+                ReadNativeProviderAmount(table, 1) == 28.0f &&
+                ReadNativeProviderAmount(table, 2) == 10.0f,
+                "Control native proportional amount distribution weights each row by its remaining capacity");
+            Expect(controlNodeUpdateCount == 3 && controlNodeUpdateIndex == 2 &&
+                controlNodeUpdateSelector == 0x200,
+                "Control proportional distribution publishes each row update through the existing native node callback");
+            Expect(String.Join(",", controlNodeUpdateIndices.ConvertAll(index => index.ToString()).ToArray()) == "0,1,2",
+                "Control proportional distribution visits rows in ascending order");
+        }
+
+        using (Fixture fixture = NewFixture()) {
+            NativeProviderTable table = CreateNativeProviderTable(fixture, module,
+                new float[] { 30.0f, 60.0f, 50.0f }, new float[] { 10.0f, 20.0f, 30.0f },
+                new byte[] { 0, 0, 0 });
+            controlNodeUpdateIndices.Clear();
+            distribute(table.Owner, -35.0f, 1, 0);
+            Expect(ReadNativeProviderAmount(table, 0) == 10.0f &&
+                ReadNativeProviderAmount(table, 1) == 15.0f &&
+                ReadNativeProviderAmount(table, 2) == 0.0f,
+                "Control native sequential withdrawal consumes rows in reverse order");
+            Expect(String.Join(",", controlNodeUpdateIndices.ConvertAll(index => index.ToString()).ToArray()) == "2,1",
+                "Control sequential withdrawal calls the node updater from the last row backwards");
+        }
+
+        using (Fixture fixture = NewFixture()) {
+            NativeProviderTable table = CreateNativeProviderTable(fixture, module,
+                new float[] { 10.0f, 10.0f }, new float[] { 9.0f, 0.0f },
+                new byte[] { 0, 0x10 });
+            distribute(table.Owner, 10.0f, 1, 0);
+            Expect(ReadNativeProviderAmount(table, 0) == 10.0f &&
+                ReadNativeProviderAmount(table, 1) == 0.0f &&
+                (ReadNativeProviderFlags(table, 1) & 0x10) != 0,
+                "Control sequential distribution clips at active capacity and skips exhausted rows without revive");
+            distribute(table.Owner, -20.0f, 1, 0);
+            Expect(ReadNativeProviderAmount(table, 0) == 0.0f &&
+                (ReadNativeProviderFlags(table, 0) & 0x10) != 0,
+                "Control native depletion marks the row exhausted");
+            distribute(table.Owner, 15.0f, 1, 1);
+            Expect(ReadNativeProviderAmount(table, 0) == 10.0f &&
+                ReadNativeProviderAmount(table, 1) == 5.0f &&
+                (ReadNativeProviderFlags(table, 0) & 0x10) == 0 &&
+                (ReadNativeProviderFlags(table, 1) & 0x10) == 0,
+                "Control native revive flag admits exhausted rows and clears their exhausted flags when refilled");
+        }
+
+        using (Fixture fixture = NewFixture()) {
+            NativeProviderTable table = CreateNativeProviderTable(fixture, module,
+                new float[] { 33554432.0f, 10.0f }, new float[] { 16777216.0f, 2.0f },
+                new byte[] { 0, 0 });
+            controlNodeUpdateIndices.Clear();
+            distribute(table.Owner, -1.0f, 0, 0);
+            uint firstBits = unchecked((uint)FloatBits(ReadNativeProviderAmount(table, 0)));
+            uint secondBits = unchecked((uint)FloatBits(ReadNativeProviderAmount(table, 1)));
+            uint totalBits = unchecked((uint)FloatBits(ReadFloat(table.Owner, 0x590)));
+            Expect(firstBits == unchecked((uint)FloatBits(16777214.0f)) &&
+                secondBits == 0x3ffffffe && totalBits == unchecked((uint)FloatBits(16777216.0f)),
+                "Control proportional distribution preserves the native x87 add-then-subtract rounding at a 2^24 cancellation boundary; actual=[" +
+                Hex(firstBits) + "," + Hex(secondBits) + "] total=" + Hex(totalBits));
+        }
+
+        Console.WriteLine("native-control-provider-distribution: controlHash=" + ExpectedControlSha256 +
+            " rva=0x10ba0 providerVtable=0x3d254 selector3=0xdc40 proportional=[14,28,10]" +
+            " sequentialReverse=[10,15,0] cap/exhausted/revive=verified cancellation=2^24");
+        GC.KeepAlive(distribute);
+    }
+
+    private static void RunNativeControlContactRateUpdateCase(IntPtr module) {
+        NativeControlContactRateUpdate update = (NativeControlContactRateUpdate)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlContactRateUpdateRva),
+                typeof(NativeControlContactRateUpdate));
+        using (Fixture fixture = NewFixture()) {
+            NativeProviderTable table = CreateNativeProviderTable(fixture, module,
+                new float[] { 100.0f }, new float[] { 10.000001f }, new byte[] { 0 });
+            IntPtr profile = fixture.Allocate(0x6c);
+            Marshal.WriteInt32(table.Owner, 0x50, 4);
+            Marshal.WriteInt32(table.Owner, 0x1a4, FloatBits(1.0f));
+            Marshal.WriteIntPtr(table.Owner, 0x46c, profile);
+            Marshal.WriteInt32(profile, 0x68, FloatBits(1.0f));
+            Marshal.WriteInt32(table.Owner, 0x4d8, FloatBits(1.0f));
+            Marshal.WriteInt32(table.Owner, 0x354, FloatBits(1.0f));
+            Marshal.WriteInt32(table.Owner, 0x358, FloatBits(1.0f));
+            Marshal.WriteInt32(table.Owner, 0x1a8, FloatBits(1.0f));
+            controlNodeUpdateCount = 0;
+
+            update(table.Owner, 2.0f);
+            Expect(FloatBits(ReadNativeProviderAmount(table, 0)) == FloatBits(8.000001f) &&
+                FloatBits(ReadFloat(table.Rows, 0x10)) == FloatBits(-2.0f) &&
+                ReadFloat(table.Owner, 0x590) == 8.000001f,
+                "Control class-4 contact-rate update applies negative rate times elapsed seconds and publishes animation amount");
+            const int expectedNormalizedBits = unchecked((int)0x3da3d70c);
+            Expect(Marshal.ReadByte(table.Owner, 0x598) == 0 &&
+                FloatBits(ReadFloat(table.Owner, 0x588)) == expectedNormalizedBits &&
+                controlNodeUpdateCount == 1 && controlNodeUpdateValueBits == unchecked((uint)expectedNormalizedBits),
+                "Control class-4 contact-rate update clears its dirty state after computing the aggregate and provider callback");
+            Console.WriteLine("native-control-contact-rate-update: controlHash=" + ExpectedControlSha256 +
+                " rva=0x12a40 class=4 dt=2 rate=1 current=10.000001->8.000001 animation=-2 normalizedBits=0x" +
+                unchecked((uint)FloatBits(ReadFloat(table.Owner, 0x588))).ToString("x8") + " dirty=cleared");
+        }
+        GC.KeepAlive(update);
+    }
+
+    private static void RunNativeControlTimedUpdateBaselineCases(IntPtr module) {
+        NativeControlTimedUpdate update = (NativeControlTimedUpdate)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlTimedUpdateRva),
+                typeof(NativeControlTimedUpdate));
+        using (Fixture fixture = NewFixture()) {
+            IntPtr owner = fixture.Allocate(0x664);
+            controlNodeUpdateCount = 0;
+            update(owner, 0.5f);
+            Expect(controlNodeUpdateCount == 0 && ReadFloat(owner, 0xe8) == 0.5f &&
+                ReadFloat(owner, 0xe4) == 0.0f && ReadFloat(owner, 0xec) == 0.0f &&
+                ReadFloat(owner, 0xd8) == 0.0f && ReadFloat(owner, 0xdc) == 0.0f,
+                "Control timed update records the sub-threshold delta without entering its active callback path");
+            update(owner, 1.0f);
+            Expect(controlNodeUpdateCount == 0 && ReadFloat(owner, 0xe8) == 1.0f &&
+                ReadFloat(owner, 0xe4) == 1.0f && ReadFloat(owner, 0xec) == 1.0f &&
+                ReadFloat(owner, 0xd8) == 1.0f && ReadFloat(owner, 0xdc) == 1.0f &&
+                Marshal.ReadByte(owner, 0xe0) == 0,
+                "Control timed update accepts the one-unit boundary and synchronizes its baseline while e0 remains clear");
+            update(owner, 2.0f);
+            Expect(controlNodeUpdateCount == 0 && ReadFloat(owner, 0xe8) == 1.0f &&
+                ReadFloat(owner, 0xe4) == 2.0f && ReadFloat(owner, 0xec) == 2.0f &&
+                ReadFloat(owner, 0xd8) == 2.0f && ReadFloat(owner, 0xdc) == 2.0f &&
+                Marshal.ReadByte(owner, 0xe0) == 0,
+                "Control timed update keeps synchronizing accepted times without starting the active branch while e0 is clear");
+            Console.WriteLine("native-control-timed-update-baseline: controlHash=" + ExpectedControlSha256 +
+                " rva=0xbcf0 sub-threshold=0.5 accepted=[1,2] e4/ec/d8/dc synchronized owner.e0=0 callback=none");
+        }
+        GC.KeepAlive(update);
     }
 
     private static void RunNativeControlAggregateResourceCases(IntPtr module) {
