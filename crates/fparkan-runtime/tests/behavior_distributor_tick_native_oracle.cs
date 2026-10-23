@@ -18,6 +18,7 @@ internal static class BehaviorDistributorTickOracle {
     private const string ExpectedControlSha256 = "bcb86318089028548a178b03a21accdce15df0cc85ddd91674cf3c2f55012c6e";
     private const string ExpectedArealMapSha256 = "a25f9254ebb339d70e2e07c8121950191e9584ca0858d8e9c2e2b6c671edf6ea";
     private const int TickRva = 0x19e80;
+    private const int DistributorScheduleRva = 0x1adb0;
     private const int AddObjectRva = 0x1aac0;
     private const int NormalizeRva = 0x1ac90;
     private const int IndexedPropertySetRva = 0x0b470;
@@ -27,6 +28,7 @@ internal static class BehaviorDistributorTickOracle {
     private const int BehaviorVarBlockConstructorRva = 0x22d90;
     private const int BehaviorVarFieldRegisterRva = 0x22e20;
     private const int GetSystemArealMapIatRva = 0x59008;
+    private const int GetQueueIatRva = 0x59110;
     private const int ControlResourceDeviceGetterRva = 0x21d00;
     private const int ControlResourceAggregateQueryRva = 0x2b410;
     private const int ControlResourceAggregateSetRva = 0x2ba30;
@@ -66,6 +68,9 @@ internal static class BehaviorDistributorTickOracle {
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void X87ControlWordReader();
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void X87ControlWordWriter();
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void TickDelegate(IntPtr self, float deltaSeconds);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void NativeBehaviorSchedule(IntPtr self);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate IntPtr QueueGetter();
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate uint QueueClockGetter(IntPtr self);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void NativeAddObject(IntPtr self, uint key);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeNormalize(IntPtr self, uint key);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void VectorInsert(IntPtr self, IntPtr source, uint count, uint position);
@@ -100,6 +105,8 @@ internal static class BehaviorDistributorTickOracle {
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void NativeControlNodeUpdateCallback(IntPtr self, uint nodeIndex, uint selector, uint valueBits);
 
     private static readonly AreaMapGetter AreaMapGetterCallback = GetAreaMap;
+    private static readonly QueueGetter QueueGetterCallback = GetQueue;
+    private static readonly QueueClockGetter QueueClockGetterCallback = GetQueueTime;
     private static readonly VectorInsert VectorInsertCallback = InsertVector;
     private static readonly MapLookup MapLookupCallback = Lookup;
     private static readonly ObjectState ObjectStateCallback = GetObjectState;
@@ -127,6 +134,7 @@ internal static class BehaviorDistributorTickOracle {
     private static X87ControlWordWriter x87ControlWordWriter;
     private static readonly NativeBehaviorProfileLoadCallback BehaviorProfileLoadCallback = CaptureBehaviorProfileLoad;
     private static readonly List<BehaviorProfileSelection> behaviorProfileSelections = new List<BehaviorProfileSelection>();
+    private static Fixture activeQueueFixture;
 
     private sealed class BehaviorProfileSelection {
         public IntPtr Owner;
@@ -168,6 +176,9 @@ internal static class BehaviorDistributorTickOracle {
         public IntPtr VectorVtable;
         public IntPtr Manager;
         public IntPtr ManagerVtable;
+        public IntPtr Queue;
+        public IntPtr QueueVtable;
+        public uint QueueTime;
         public readonly List<IntPtr> Allocations = new List<IntPtr>();
         public readonly Dictionary<uint, NativeObject> ByKey = new Dictionary<uint, NativeObject>();
         public readonly List<string> Calls = new List<string>();
@@ -221,6 +232,8 @@ internal static class BehaviorDistributorTickOracle {
             Marshal.WriteInt32(Distributor, 0x20, keys.Length);
             Marshal.WriteInt32(Distributor, 0x24, capacity);
             Marshal.WriteIntPtr(Distributor, 0x28, Entries);
+            Marshal.WriteInt16(Distributor, 0x18, 3);
+            Marshal.WriteInt16(Distributor, 0x1a, 1);
             for (int i = 0; i < keys.Length; i++) {
                 IntPtr entry = IntPtr.Add(Entries, i * 0x1c);
                 Marshal.WriteInt32(entry, 0x00, unchecked((int)keys[i]));
@@ -233,8 +246,16 @@ internal static class BehaviorDistributorTickOracle {
             Allocations.Add(value);
             return value;
         }
+        public void MakeQueue(uint time) {
+            QueueTime = time;
+            QueueVtable = Allocate(0x40);
+            Queue = Allocate(0x20);
+            Marshal.WriteIntPtr(Queue, 0, QueueVtable);
+            Marshal.WriteIntPtr(QueueVtable, 0x38, Marshal.GetFunctionPointerForDelegate(QueueClockGetterCallback));
+        }
         public void Dispose() {
             active = null;
+            if (activeQueueFixture == this) activeQueueFixture = null;
             for (int i = Allocations.Count - 1; i >= 0; i--) Marshal.FreeHGlobal(Allocations[i]);
             Allocations.Clear();
         }
@@ -287,6 +308,16 @@ internal static class BehaviorDistributorTickOracle {
     }
 
     private static IntPtr GetAreaMap() { return active.Manager; }
+    private static IntPtr GetQueue() {
+        if (activeQueueFixture == null || activeQueueFixture.Queue == IntPtr.Zero)
+            throw new InvalidOperationException("native scheduler requested a queue without a fixture");
+        return activeQueueFixture.Queue;
+    }
+    private static uint GetQueueTime(IntPtr self) {
+        if (activeQueueFixture == null || self != activeQueueFixture.Queue)
+            throw new InvalidOperationException("native scheduler queried an unexpected queue");
+        return activeQueueFixture.QueueTime;
+    }
     private static int OnArealMapEvent(IntPtr owner, uint message, uint subcode, IntPtr descriptor) {
         ArealMapFixture fixture = activeArealMap;
         if (fixture == null) return 0;
@@ -493,7 +524,9 @@ internal static class BehaviorDistributorTickOracle {
             FreeLibrary(module); FreeLibrary(controlModule); return 12;
         }
         IntPtr import = IntPtr.Add(module, GetSystemArealMapIatRva);
+        IntPtr queueImport = IntPtr.Add(module, GetQueueIatRva);
         IntPtr originalImport = Marshal.ReadIntPtr(import);
+        IntPtr originalQueueImport = Marshal.ReadIntPtr(queueImport);
         uint oldProtection = 0;
         bool protectionChanged = false;
         bool thunksAllocated = false;
@@ -513,8 +546,9 @@ internal static class BehaviorDistributorTickOracle {
                 throw new InvalidOperationException("VirtualProtect(GetSystemArealMap IAT) failed: " + Marshal.GetLastWin32Error());
             protectionChanged = true;
             Marshal.WriteIntPtr(import, Marshal.GetFunctionPointerForDelegate(AreaMapGetterCallback));
+            Marshal.WriteIntPtr(queueImport, Marshal.GetFunctionPointerForDelegate(QueueGetterCallback));
             RunSmokeCases(module, controlModule, arealMapModule);
-            Console.WriteLine("original native Behavior/ArealMap/Control oracle passed (Behavior Add 0x1aac0, normalize 0x1ac90, tick 0x19e80; ArealMap UnitDAT projection 0x14b90; Control INTO override 0x2d890; only synthetic host callbacks, GetSystemArealMap IAT, and bounded vector insertion are substituted; this does not compare Rust parity).");
+            Console.WriteLine("original native Behavior/ArealMap/Control oracle passed (Behavior Add 0x1aac0, normalize 0x1ac90, scheduler 0x1adb0, tick 0x19e80; ArealMap UnitDAT projection 0x14b90; Control INTO override 0x2d890; synthetic host callbacks, GetSystemArealMap/GetQueue IAT slots, and bounded vector insertion are substituted; scheduler and tick machine code are original; this does not compare Rust parity).");
             return 0;
         }
         catch (Exception error) {
@@ -524,10 +558,12 @@ internal static class BehaviorDistributorTickOracle {
         finally {
             if (protectionChanged) {
                 Marshal.WriteIntPtr(import, originalImport);
+                Marshal.WriteIntPtr(queueImport, originalQueueImport);
                 uint ignored;
                 VirtualProtect(import, new UIntPtr((uint)IntPtr.Size), oldProtection, out ignored);
             }
-            GC.KeepAlive(AreaMapGetterCallback); GC.KeepAlive(VectorInsertCallback); GC.KeepAlive(x87ControlWordReader); GC.KeepAlive(x87ControlWordWriter); GC.KeepAlive(MapLookupCallback);
+            GC.KeepAlive(AreaMapGetterCallback); GC.KeepAlive(QueueGetterCallback); GC.KeepAlive(QueueClockGetterCallback);
+            GC.KeepAlive(VectorInsertCallback); GC.KeepAlive(x87ControlWordReader); GC.KeepAlive(x87ControlWordWriter); GC.KeepAlive(MapLookupCallback);
             GC.KeepAlive(ObjectStateCallback); GC.KeepAlive(ObjectClassCallback);
             GC.KeepAlive(ObjectQueryCallback); GC.KeepAlive(ObjectRateCallback);
             GC.KeepAlive(ObjectGetPropertyCallback); GC.KeepAlive(ObjectSetPropertyCallback);
@@ -565,6 +601,19 @@ internal static class BehaviorDistributorTickOracle {
         }
         RunNativeIndexedPropertyCases(module);
         RunNativeOreInitializationCases(module);
+        ushort tickControlWord = CurrentX87ControlWord();
+        try {
+            SetX87ControlWord(0x007f);
+            Expect(CurrentX87ControlWord() == 0x007f, "Behavior resource-distributor tick uses the measured game x87 control word");
+            Console.WriteLine("native-behavior-tick-x87-control-word=0x" + CurrentX87ControlWord().ToString("x4"));
+            RunNativeBehaviorTickCases(module);
+            RunNativeBehaviorSchedulerCases(module);
+        } finally {
+            SetX87ControlWord(tickControlWord);
+        }
+    }
+
+    private static void RunNativeBehaviorTickCases(IntPtr module) {
         TickDelegate tick = (TickDelegate)Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, TickRva), typeof(TickDelegate));
         using (Fixture empty = NewFixture()) {
             empty.MakeDistributor(); active = empty; tick(empty.Distributor, 0.0f);
@@ -579,12 +628,72 @@ internal static class BehaviorDistributorTickOracle {
         RunObjectCase(tick, 0x80000008, 0.5f, 0.0f, 3.0f, 0, 2.0f, "ore-80000008");
         RunMixedOreCase(tick, "mixed-ore-producer-recipient", 1.0f, 0.5f);
         RunMixedOreCase(tick, "bounded-ore-store", 0.25f, 0.5f);
+        RunOreAllocationBranch(tick, "ore-allocation-middle", 0.25f, 2.0f, 0.25f, 0.625f, 1.75f, 0.5f);
+        RunOreAllocationBranch(tick, "ore-allocation-surplus", 2.0f, 3.0f, 0.25f, 0.625f, 2.625f, 0.625f);
+        RunOreAllocationBranch(tick, "ore-allocation-equality", 0.375f, 2.0f, 0.25f, 0.625f, 1.625f, 0.625f);
+        RunNativeOreClampCases(tick);
         RunWeightedOreCase(tick);
         RunMixedPowerCase(tick, "mixed-power-sufficient", 4.0f, 1.0f, 0.5f, 0.75f);
         RunMixedPowerCase(tick, "mixed-power-shortage", 0.125f, 1.0f, 0.5f, 0.75f);
         RunMixedPowerCase(tick, "mixed-power-recipient-reserve", 4.0f, 8.0f, 0.5f, 0.75f);
         RunMissingCase(tick);
         RunSkippedCase(tick);
+    }
+
+    private static void RunNativeBehaviorSchedulerCases(IntPtr module) {
+        NativeBehaviorSchedule schedule = (NativeBehaviorSchedule)Marshal.GetDelegateForFunctionPointer(
+            IntPtr.Add(module, DistributorScheduleRva), typeof(NativeBehaviorSchedule));
+        uint[] elapsedVectors = { 1, 1001, 16777217, 16777219, 0xffffffff };
+        uint[] expectedBits = { 0x3a83126f, 0x3f8020c5, 0x46831270, 0x46831271, 0x4a83126f };
+        for (int i = 0; i < elapsedVectors.Length; i++) {
+            uint elapsed = elapsedVectors[i];
+            uint now = unchecked(1u + elapsed);
+            RunNativeSchedulerSample(schedule, now, 1, 0, expectedBits[i], "elapsed-" + elapsed.ToString());
+        }
+
+        using (Fixture fixture = NewFixture()) {
+            NativeObject producer = fixture.AddObject(0x75, 0x80000002, 1.0f, 0.0f, 0.0f, 0);
+            fixture.MakeDistributor(producer.Key);
+            fixture.MakeQueue(10);
+            active = fixture;
+            activeQueueFixture = fixture;
+            Marshal.WriteInt32(fixture.Distributor, 0x10, 1);
+            Marshal.WriteInt32(fixture.Distributor, 0x14, 10);
+            Marshal.WriteInt32(fixture.Distributor, 0x30, unchecked((int)0x41200000));
+            schedule(fixture.Distributor);
+            Expect(fixture.LookupCount == 0 && unchecked((uint)Marshal.ReadInt32(fixture.Distributor, 0x30)) == 0x41200000,
+                "scheduler equality with the deadline performs no resource tick or totals write");
+
+            fixture.QueueTime = 11;
+            schedule(fixture.Distributor);
+            uint deadlineTotal = unchecked((uint)Marshal.ReadInt32(fixture.Distributor, 0x30));
+            Expect(fixture.LookupCount == 2 && deadlineTotal == 0x3c23d70b,
+                "scheduler ticks only after the deadline is strictly passed (lookups=" + fixture.LookupCount +
+                ", total=" + Hex(deadlineTotal) + ")");
+            Console.WriteLine("scheduler-deadline: equality=skip; now=11 delta=0.01; lookups=" + fixture.LookupCount);
+        }
+
+        RunNativeSchedulerSample(schedule, 0, 0xffffffff, 0, 0x3a83126f, "wrapped-elapsed-1");
+        GC.KeepAlive(schedule);
+    }
+
+    private static void RunNativeSchedulerSample(
+        NativeBehaviorSchedule schedule, uint now, uint firstTime, uint deadline, uint expectedTotalBits, string label) {
+        using (Fixture fixture = NewFixture()) {
+            NativeObject producer = fixture.AddObject(0x74, 0x80000002, 1.0f, 0.0f, 0.0f, 0);
+            fixture.MakeDistributor(producer.Key);
+            fixture.MakeQueue(now);
+            active = fixture;
+            activeQueueFixture = fixture;
+            Marshal.WriteInt32(fixture.Distributor, 0x10, unchecked((int)firstTime));
+            Marshal.WriteInt32(fixture.Distributor, 0x14, unchecked((int)deadline));
+            schedule(fixture.Distributor);
+            uint actual = unchecked((uint)Marshal.ReadInt32(fixture.Distributor, 0x30));
+            Expect(actual == expectedTotalBits,
+                label + " native qword-to-f32 scheduler delta expected " + Hex(expectedTotalBits) + " got " + Hex(actual));
+            Console.WriteLine("native-scheduler-" + label + ": now=" + now.ToString("x8") + " first=" + firstTime.ToString("x8") +
+                " total=" + Hex(actual) + " lookups=" + fixture.LookupCount);
+        }
     }
 
     private static void RunNativeControlResourceDeviceCase(IntPtr module) {
@@ -1638,6 +1747,58 @@ internal static class BehaviorDistributorTickOracle {
                 "set:00000043:02000100:0",
                 "set:00000044:02000100:6",
                 "set:00000045:02000100:9");
+        }
+    }
+
+    private static void RunOreAllocationBranch(
+        TickDelegate tick, string label, float rate, float stock, float recipientCurrent, float recipientMaximum,
+        float expectedProducerRemaining, float expectedRecipientResult) {
+        using (Fixture fixture = NewFixture()) {
+            NativeObject producer = fixture.AddObject(0x46, 0x80000004, 0.0f, rate, stock, 0);
+            producer.PropertyMetadata = FloatBits(10.0f);
+            NativeObject recipient = fixture.AddObject(0x47, 0x80000001, 0.0f, 0.0f, recipientCurrent, 0);
+            recipient.PropertyMetadata = FloatBits(recipientMaximum);
+            recipient.InterfaceSelector1 = 0.5f;
+            recipient.InterfaceSelector2 = 0.0f;
+            fixture.MakeDistributor(producer.Key, recipient.Key);
+            Marshal.WriteInt32(fixture.Entries, 0x04, FloatBits(1.0f));
+            Marshal.WriteInt32(fixture.Entries, 0x1c + 0x04, FloatBits(0.5f));
+            active = fixture;
+            tick(fixture.Distributor, 1.0f);
+            Console.WriteLine(label + ": totals=[" + Float(ReadFloat(fixture.Distributor, 0x30)) + "," +
+                Float(ReadFloat(fixture.Distributor, 0x34)) + "," + Float(ReadFloat(fixture.Distributor, 0x38)) + "," +
+                Float(ReadFloat(fixture.Distributor, 0x3c)) + "," + Float(ReadFloat(fixture.Distributor, 0x40)) +
+                "]; stored=[" + Float(producer.Property) + "," + Float(recipient.Property) + "] reads=" + producer.OreRateReads);
+            Expect(ReadFloat(fixture.Distributor, 0x34) == Math.Min(rate, stock) &&
+                ReadFloat(fixture.Distributor, 0x40) == recipientMaximum - recipientCurrent &&
+                producer.Property == expectedProducerRemaining && recipient.Property == expectedRecipientResult &&
+                producer.OreRateReads == 2 && producer.Writes == 1 && recipient.Writes == 1 && fixture.LookupCount == 4,
+                label + " native allocation branch totals and two-pass reread");
+        }
+    }
+
+    private static void RunNativeOreClampCases(TickDelegate tick) {
+        float[][] states = {
+            new float[] { 0.995f, 1.0f, 1.0f },
+            new float[] { 1.25f, 1.0f, 1.0f },
+            new float[] { 0.0f, 0.01f, 0.0f }
+        };
+        foreach (float[] state in states) {
+            float current = state[0];
+            float maximum = state[1];
+            float expected = state[2];
+            using (Fixture fixture = NewFixture()) {
+                NativeObject item = fixture.AddObject(0x48, 0x80000001, 0.0f, 0.0f, current, 0);
+                item.PropertyMetadata = FloatBits(maximum);
+                item.InterfaceSelector2 = 0.0f;
+                fixture.MakeDistributor(item.Key);
+                active = fixture;
+                tick(fixture.Distributor, 1.0f);
+                Expect(item.Property == expected && item.Writes > 0 && fixture.LookupCount == 2,
+                    "native first-pass ore clamp for CurrentOre=" + Float(current));
+                Console.WriteLine("native-ore-clamp: current=" + Float(current) + " maximum=" + Float(maximum) + " result=" +
+                    Float(item.Property) + " writes=" + item.Writes);
+            }
         }
     }
 

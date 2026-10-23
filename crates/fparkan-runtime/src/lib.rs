@@ -134,9 +134,8 @@ pub struct BehaviorRegisteredObject {
     pub class_flags: u32,
     /// Native share field at record offset `+0x04`.
     pub share: f32,
-    /// Raw DWORDs at offsets `+0x08..+0x18`; the first controls whether
-    /// normalization treats this record as fixed, and the remaining words are
-    /// not yet assigned semantics. A normal native Add initializes all five to 0.
+    /// Raw DWORDs at offsets `+0x08..+0x18`: fixed-share flag, power demand,
+    /// power allocation, ore demand, and ore allocation. A native Add zeros them.
     pub native_tail: [u32; 5],
 }
 
@@ -457,19 +456,20 @@ pub struct MissionScriptBundle {
     pub package: ScriptPackage,
     /// Outcome of the restricted first-`Init` resolution for this bundle.
     pub init_execution: MissionScriptInitExecution,
-    /// Recovered per-AI Behavior state computed by a full mission startup.
+    /// Recovered per-AI Behavior scheduler and total state.
     /// Static previews leave this empty because they do not run script startup.
     pub behavior_warm_start: Option<BehaviorWarmStartState>,
 }
 
-/// Initial Behavior distributor fields recovered from the original warm-start path.
+/// Behavior distributor clock and totals tracked from warm start through resource ticks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BehaviorWarmStartState {
-    /// Queue-clock value copied to distributor offset `+0x10` when it is zero.
+    /// Native offset `+0x10`: startup queue time, later replaced by the last due tick time.
     pub first_time_ms: u32,
-    /// Initial scheduled time written to distributor offset `+0x14`.
+    /// Native offset `+0x14`: current deadline, rescheduled after each due tick.
     pub next_deadline_ms: u32,
-    /// Opaque distributor words at offsets `+0x30..=+0x40`, cleared on first start.
+    /// Native totals at offsets `+0x30..=+0x40`: zeroed at startup, then power
+    /// available, ore available, ore in buffer, power usage, and ore usage.
     pub cleared_words: [u32; 5],
 }
 
@@ -488,6 +488,35 @@ impl BehaviorWarmStartState {
             cleared_words: [0; 5],
         }
     }
+}
+
+fn behavior_elapsed_seconds(elapsed_ms: u32) -> f32 {
+    // The exact integer product is rounded once to f32; scaling by 2^-33 is
+    // exact and matches native FILD / FMUL / FSTP under the measured control word.
+    ((u64::from(elapsed_ms) * 0x0083_126f) as f32) * f32::from_bits(0x2f00_0000)
+}
+
+fn schedule_behavior_distributor_tick(
+    state: &mut BehaviorWarmStartState,
+    queue_time_ms: u32,
+    rng_state: &mut u32,
+) -> Option<f32> {
+    if state.first_time_ms == 0 {
+        let initialized = BehaviorWarmStartState::start(queue_time_ms, rng_state);
+        state.first_time_ms = initialized.first_time_ms;
+        state.next_deadline_ms = initialized.next_deadline_ms;
+        state.cleared_words = [0; 5];
+        return None;
+    }
+    if state.next_deadline_ms != 0 && queue_time_ms <= state.next_deadline_ms {
+        return None;
+    }
+
+    let elapsed_ms = queue_time_ms.wrapping_sub(state.first_time_ms);
+    let next = BehaviorWarmStartState::start(queue_time_ms, rng_state);
+    state.first_time_ms = next.first_time_ms;
+    state.next_deadline_ms = next.next_deadline_ms;
+    Some(behavior_elapsed_seconds(elapsed_ms))
 }
 
 /// Numeric script defaults selected for the mission's first script bundle.
@@ -833,6 +862,13 @@ pub enum EngineError {
         /// Entry, field, or format diagnostic.
         message: String,
     },
+    /// A Behavior resource tick could not resolve a required runtime value.
+    BehaviorDistributorTick {
+        /// TMA clan whose distributor could not complete its tick.
+        clan_index: usize,
+        /// Unsupported query, property, or arithmetic detail.
+        message: String,
+    },
     /// World error.
     World(fparkan_world::WorldError),
     /// Reference movement input or terrain query failed.
@@ -960,6 +996,10 @@ impl std::fmt::Display for EngineError {
                 entry,
                 message,
             } => write!(f, "{path}:{entry}: Behavior profile failed: {message}"),
+            Self::BehaviorDistributorTick {
+                clan_index,
+                message,
+            } => write!(f, "Behavior resource tick for clan {clan_index}: {message}"),
             Self::World(source) => write!(f, "{source}"),
             Self::Movement(message) => write!(f, "reference movement: {message}"),
             Self::RegistrationTeardown {
@@ -994,6 +1034,7 @@ impl std::error::Error for EngineError {
             | Self::Movement(_)
             | Self::PrototypeGraph { .. }
             | Self::BehaviorProfile { .. }
+            | Self::BehaviorDistributorTick { .. }
             | Self::RegistrationTeardown { .. } => None,
         }
     }
@@ -1880,6 +1921,100 @@ pub fn query_loaded_mission_behavior_resource(
     }
 }
 
+/// Runs due native Behavior resource-distributor ticks against the loaded mission.
+///
+/// `queue_time_ms` is an explicit sample from the original wrapping 32-bit
+/// queue clock. The method updates the distributor schedule, its five totals,
+/// per-object row values, CurrentOre, and supported Control selector-1 state
+/// atomically. Preview missions and loaded missions without visible Behavior
+/// bundles have no due distributors and return `Ok(0)`. Otherwise it returns
+/// the number of distributors whose schedule was due; this includes a due
+/// tick with zero elapsed time, which leaves resource rows unchanged.
+///
+/// # Errors
+/// Returns an error when a live registered object reaches an unsupported
+/// Behavior profile, Control query, or property state. On error, all
+/// schedules, RNG state, totals, rows, ore values, and Control values remain
+/// unchanged.
+pub fn advance_loaded_mission_resources(
+    engine: &mut Engine,
+    queue_time_ms: u32,
+) -> Result<usize, EngineError> {
+    let Some(loaded) = engine.loaded.as_ref() else {
+        return Ok(0);
+    };
+
+    let mut distributors = loaded.behavior_distributors.clone();
+    let mut ore_states = loaded.behavior_ore_states.clone();
+    let mut control_tables = loaded.control_device_tables.clone();
+    let mut warm_starts = loaded
+        .script_bundles
+        .iter()
+        .map(|bundle| bundle.behavior_warm_start)
+        .collect::<Vec<_>>();
+    let profiles = &loaded.behavior_profiles;
+    let world = &engine.world;
+    let mut rng_state = engine.behavior_rng_state;
+    let mut scheduled_ticks = 0;
+
+    for distributor in distributors.iter_mut() {
+        if !distributor.super_ai_visible {
+            continue;
+        }
+        let bundle_index = loaded
+            .script_bundles
+            .iter()
+            .position(|bundle| bundle.clan_index == distributor.clan_index)
+            .ok_or_else(|| EngineError::BehaviorDistributorTick {
+                clan_index: distributor.clan_index,
+                message: "visible distributor has no matching script bundle".to_string(),
+            })?;
+        let Some(schedule) = warm_starts.get_mut(bundle_index).and_then(Option::as_mut) else {
+            return Err(EngineError::BehaviorDistributorTick {
+                clan_index: distributor.clan_index,
+                message: "visible distributor has no warm-start schedule".to_string(),
+            });
+        };
+
+        let delta_seconds =
+            schedule_behavior_distributor_tick(schedule, queue_time_ms, &mut rng_state);
+        let Some(delta_seconds) = delta_seconds else {
+            continue;
+        };
+        scheduled_ticks += 1;
+        if delta_seconds == 0.0 {
+            continue;
+        }
+
+        let totals = advance_behavior_distributor_tick(
+            distributor,
+            delta_seconds,
+            world,
+            &mut ore_states,
+            profiles,
+            &mut control_tables,
+        )
+        .map_err(|message| EngineError::BehaviorDistributorTick {
+            clan_index: distributor.clan_index,
+            message,
+        })?;
+        schedule.cleared_words = totals;
+    }
+
+    let loaded = engine
+        .loaded
+        .as_mut()
+        .expect("loaded mission was checked above");
+    loaded.behavior_distributors = distributors;
+    loaded.behavior_ore_states = ore_states;
+    loaded.control_device_tables = control_tables;
+    for (bundle, warm_start) in loaded.script_bundles.iter_mut().zip(warm_starts) {
+        bundle.behavior_warm_start = warm_start;
+    }
+    engine.behavior_rng_state = rng_state;
+    Ok(scheduled_ticks)
+}
+
 /// Sets native Control global-table selector 1 on rows whose selector-0 value
 /// is positive. Validation is completed before any row is changed.
 ///
@@ -2057,6 +2192,387 @@ fn query_behavior_profile_ore_rate(
             f32::from_bits(transfer_ore_off_board_bits),
         )?,
     )
+}
+
+#[derive(Clone, Copy, Default)]
+struct BehaviorTickTotals {
+    power_available: f32,
+    ore_available: f32,
+    power_weighted_demand: f32,
+    power_demand: f32,
+    ore_weighted_demand: f32,
+    ore_demand: f32,
+    ore_in_buffer: f32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct BehaviorAllocation {
+    priority: f32,
+    residual: f32,
+    consumption: f32,
+}
+
+fn behavior_difference(lhs: f32, rhs: f32, field: &'static str) -> Result<f32, String> {
+    let range_probe = f64::from(lhs) - f64::from(rhs);
+    check_control_range_probe(None, field, range_probe).map_err(|error| format!("{error:?}"))?;
+    checked_control_float(0, field, lhs - rhs).map_err(|error| format!("{error:?}"))
+}
+
+fn behavior_product(lhs: f32, rhs: f32, field: &'static str) -> Result<f32, String> {
+    checked_control_product(0, field, lhs, rhs).map_err(|error| format!("{error:?}"))
+}
+
+fn behavior_allocation(
+    available: f32,
+    demand: f32,
+    weighted_demand: f32,
+) -> Result<BehaviorAllocation, String> {
+    if available <= 0.0 || demand <= 0.0 {
+        Ok(BehaviorAllocation::default())
+    } else if available <= weighted_demand {
+        Ok(BehaviorAllocation {
+            priority: checked_control_ratio("priority allocation", available, weighted_demand)
+                .map_err(|error| format!("{error:?}"))?,
+            residual: 0.0,
+            consumption: 1.0,
+        })
+    } else if available < demand {
+        let residual_available =
+            behavior_difference(available, weighted_demand, "residual available")?;
+        let residual_demand = behavior_difference(demand, weighted_demand, "residual demand")?;
+        Ok(BehaviorAllocation {
+            priority: 1.0,
+            residual: checked_control_ratio(
+                "residual allocation",
+                residual_available,
+                residual_demand,
+            )
+            .map_err(|error| format!("{error:?}"))?,
+            consumption: 1.0,
+        })
+    } else {
+        Ok(BehaviorAllocation {
+            priority: 1.0,
+            residual: 1.0,
+            consumption: checked_control_ratio("source consumption", demand, available)
+                .map_err(|error| format!("{error:?}"))?,
+        })
+    }
+}
+
+fn behavior_add_total(total: &mut f32, value: f32, field: &'static str) -> Result<(), String> {
+    *total = checked_control_sum(0, field, *total, value).map_err(|error| format!("{error:?}"))?;
+    Ok(())
+}
+
+fn behavior_profile_for_handle<'a>(
+    profiles: &'a [BehaviorProfileState],
+    handle: ObjectHandle,
+) -> Result<&'a BehaviorProfileState, String> {
+    profiles
+        .iter()
+        .find(|profile| profile.handle == handle)
+        .ok_or_else(|| format!("Behavior profile for object {handle:?} is unavailable"))
+}
+
+fn behavior_ore_index_for_handle(
+    ore_states: &[BehaviorOreState],
+    handle: ObjectHandle,
+) -> Result<usize, String> {
+    ore_states
+        .iter()
+        .position(|state| state.handle == handle)
+        .ok_or_else(|| format!("CurrentOre property for object {handle:?} is unavailable"))
+}
+
+fn behavior_control_index_for_handle(
+    control_tables: &[MissionControlDeviceTableState],
+    handle: ObjectHandle,
+) -> Result<usize, String> {
+    let index = control_tables
+        .iter()
+        .position(|table| table.handle == handle)
+        .ok_or_else(|| format!("Control interface for object {handle:?} is unavailable"))?;
+    match &control_tables[index].status {
+        MissionControlDeviceTableStatus::Available(_) => Ok(index),
+        MissionControlDeviceTableStatus::Unavailable(reason) => Err(format!(
+            "Control interface for object {handle:?} is unresolved: {reason:?}"
+        )),
+    }
+}
+
+fn behavior_checked_property(state: &BehaviorOreState, maximum: bool) -> Result<f32, String> {
+    let (field, bits) = if maximum {
+        ("MaximumOre", state.maximum_ore_bits)
+    } else {
+        ("CurrentOre", state.current_ore_bits)
+    };
+    checked_control_float(state.class_flags, field, f32::from_bits(bits))
+        .map_err(|error| format!("{error:?}"))
+}
+
+fn behavior_tick_resource_rate(
+    class_flags: u32,
+    handle: ObjectHandle,
+    selector: u32,
+    profiles: &[BehaviorProfileState],
+    control_tables: &[MissionControlDeviceTableState],
+) -> Result<f32, String> {
+    let profile = behavior_profile_for_handle(profiles, handle)?;
+    match selector {
+        0x1005 => checked_control_float(
+            class_flags,
+            "Transfer_Power_Out",
+            f32::from_bits(profile.transfer_power_out_bits),
+        )
+        .map_err(|error| format!("{error:?}")),
+        0x1002 => {
+            let table_index = behavior_control_index_for_handle(control_tables, handle)?;
+            query_behavior_profile_ore_rate(
+                &control_tables[table_index],
+                profile.transfer_ore_off_board_bits,
+            )
+            .map_err(|error| format!("{error:?}"))
+        }
+        _ => Err(format!(
+            "unsupported Behavior resource selector {selector:#x}"
+        )),
+    }
+}
+
+fn behavior_query_control(
+    control_tables: &[MissionControlDeviceTableState],
+    handle: ObjectHandle,
+    selector: u32,
+) -> Result<f32, String> {
+    let table_index = behavior_control_index_for_handle(control_tables, handle)?;
+    query_control_device_table_resource(&control_tables[table_index], selector)
+        .map(|value| value.unwrap_or(0.0))
+        .map_err(|error| format!("{error:?}"))
+}
+
+fn advance_behavior_distributor_tick(
+    distributor: &mut BehaviorDistributorState,
+    delta_seconds: f32,
+    world: &World,
+    ore_states: &mut [BehaviorOreState],
+    profiles: &[BehaviorProfileState],
+    control_tables: &mut [MissionControlDeviceTableState],
+) -> Result<[u32; 5], String> {
+    let mut totals = BehaviorTickTotals::default();
+
+    // Native pass one measures supply and demand, then records per-row demand.
+    for object in &mut distributor.registered_objects {
+        let Some(live_handle) = handle_by_original_id(world, object.original_id) else {
+            object.native_tail[1] = 0;
+            object.native_tail[3] = 0;
+            continue;
+        };
+        if live_handle != object.handle {
+            return Err(format!(
+                "live original object {} maps to {live_handle:?}, expected {:?}",
+                object.original_id.0, object.handle
+            ));
+        }
+        let share = checked_control_float(object.class_flags, "Behavior share", object.share)
+            .map_err(|error| format!("{error:?}"))?;
+
+        let power_source = matches!(
+            object.class_flags,
+            0x8000_0002 | 0x8001_0000 | 0x8002_0000 | 0x8004_0000
+        );
+        let power_demand = if power_source {
+            let rate = behavior_tick_resource_rate(
+                object.class_flags,
+                live_handle,
+                0x1005,
+                profiles,
+                control_tables,
+            )?;
+            let production = behavior_product(delta_seconds, rate, "power production")?;
+            behavior_add_total(&mut totals.power_available, production, "power available")?;
+            0.0
+        } else {
+            let total_power = behavior_query_control(control_tables, live_handle, 2)?;
+            let power_ratio = behavior_query_control(control_tables, live_handle, 1)?;
+            if total_power > 0.0 {
+                let used_power = behavior_product(power_ratio, total_power, "used power")?;
+                behavior_difference(total_power, used_power, "power demand")?
+            } else {
+                0.0
+            }
+        };
+        object.native_tail[1] = power_demand.to_bits();
+        behavior_add_total(&mut totals.power_demand, power_demand, "power demand")?;
+        behavior_add_total(
+            &mut totals.power_weighted_demand,
+            behavior_product(power_demand, share, "weighted power demand")?,
+            "weighted power demand",
+        )?;
+
+        let ore_source = matches!(object.class_flags, 0x8000_0004 | 0x8000_0008);
+        let ore_index = behavior_ore_index_for_handle(ore_states, live_handle)?;
+        let current = behavior_checked_property(&ore_states[ore_index], false)?;
+        let ore_demand = if ore_source {
+            let rate = behavior_tick_resource_rate(
+                object.class_flags,
+                live_handle,
+                0x1002,
+                profiles,
+                control_tables,
+            )?;
+            let production = behavior_product(delta_seconds, rate, "ore production")?;
+            let available = if current < production {
+                current
+            } else {
+                production
+            };
+            behavior_add_total(&mut totals.ore_available, available, "ore available")?;
+            behavior_add_total(&mut totals.ore_in_buffer, current, "ore in buffer")?;
+            0.0
+        } else {
+            let maximum = behavior_checked_property(&ore_states[ore_index], true)?;
+            let deficit = behavior_difference(maximum, current, "ore deficit")?;
+            if deficit >= f32::from_bits(0x3c23_d70a) {
+                deficit
+            } else {
+                ore_states[ore_index].current_ore_bits = maximum.to_bits();
+                0.0
+            }
+        };
+        object.native_tail[3] = ore_demand.to_bits();
+        behavior_add_total(&mut totals.ore_demand, ore_demand, "ore demand")?;
+        behavior_add_total(
+            &mut totals.ore_weighted_demand,
+            behavior_product(ore_demand, share, "weighted ore demand")?,
+            "weighted ore demand",
+        )?;
+    }
+
+    let power_allocation = behavior_allocation(
+        totals.power_available,
+        totals.power_demand,
+        totals.power_weighted_demand,
+    )?;
+    let ore_allocation = behavior_allocation(
+        totals.ore_available,
+        totals.ore_demand,
+        totals.ore_weighted_demand,
+    )?;
+
+    // Native pass two re-reads callbacks before applying each row in order.
+    for object in &mut distributor.registered_objects {
+        let Some(live_handle) = handle_by_original_id(world, object.original_id) else {
+            object.native_tail[2] = 0;
+            object.native_tail[4] = 0;
+            continue;
+        };
+        if live_handle != object.handle {
+            return Err(format!(
+                "live original object {} maps to {live_handle:?}, expected {:?}",
+                object.original_id.0, object.handle
+            ));
+        }
+        object.native_tail[2] = 0;
+        object.native_tail[4] = 0;
+
+        let power_source = matches!(
+            object.class_flags,
+            0x8000_0002 | 0x8001_0000 | 0x8002_0000 | 0x8004_0000
+        );
+        if power_source {
+            let table_index = behavior_control_index_for_handle(control_tables, live_handle)?;
+            set_control_device_table_multiplier(&mut control_tables[table_index], 1.0)
+                .map_err(|error| format!("{error:?}"))?;
+        } else {
+            let table_index = behavior_control_index_for_handle(control_tables, live_handle)?;
+            let total_power = behavior_query_control(control_tables, live_handle, 2)?;
+            if total_power > 0.0 {
+                let power_ratio = behavior_query_control(control_tables, live_handle, 1)?;
+                let used_power = behavior_product(power_ratio, total_power, "used power")?;
+                let demand = behavior_difference(total_power, used_power, "power demand")?;
+                let share = object.share;
+                let priority_share =
+                    behavior_product(share, power_allocation.priority, "priority power share")?;
+                let residual_share = behavior_product(
+                    behavior_difference(1.0, share, "remaining share")?,
+                    power_allocation.residual,
+                    "residual power share",
+                )?;
+                let fraction = checked_control_sum(
+                    0,
+                    "power allocation fraction",
+                    residual_share,
+                    priority_share,
+                )
+                .map_err(|error| format!("{error:?}"))?;
+                let allocated = behavior_product(demand, fraction, "power allocation")?;
+                let updated =
+                    checked_control_sum(0, "used plus allocated power", used_power, allocated)
+                        .map_err(|error| format!("{error:?}"))?;
+                let new_ratio =
+                    checked_control_ratio("new Control selector 1", updated, total_power)
+                        .map_err(|error| format!("{error:?}"))?;
+                set_control_device_table_multiplier(&mut control_tables[table_index], new_ratio)
+                    .map_err(|error| format!("{error:?}"))?;
+                object.native_tail[2] = allocated.to_bits();
+            }
+        }
+
+        let ore_source = matches!(object.class_flags, 0x8000_0004 | 0x8000_0008);
+        let ore_index = behavior_ore_index_for_handle(ore_states, live_handle)?;
+        let current = behavior_checked_property(&ore_states[ore_index], false)?;
+        if ore_source {
+            let rate = behavior_tick_resource_rate(
+                object.class_flags,
+                live_handle,
+                0x1002,
+                profiles,
+                control_tables,
+            )?;
+            let production = behavior_product(delta_seconds, rate, "ore withdrawal rate")?;
+            let bounded_production = if current < production {
+                current
+            } else {
+                production
+            };
+            let taken = behavior_product(
+                bounded_production,
+                ore_allocation.consumption,
+                "ore withdrawal",
+            )?;
+            ore_states[ore_index].current_ore_bits =
+                behavior_difference(current, taken, "remaining ore")?.to_bits();
+        } else {
+            let maximum = behavior_checked_property(&ore_states[ore_index], true)?;
+            let capacity = behavior_difference(maximum, current, "ore capacity")?;
+            let share = object.share;
+            let priority_share =
+                behavior_product(share, ore_allocation.priority, "priority ore share")?;
+            let residual_share = behavior_product(
+                behavior_difference(1.0, share, "remaining share")?,
+                ore_allocation.residual,
+                "residual ore share",
+            )?;
+            let fraction =
+                checked_control_sum(0, "ore allocation fraction", residual_share, priority_share)
+                    .map_err(|error| format!("{error:?}"))?;
+            let allocated = behavior_product(capacity, fraction, "ore allocation")?;
+            ore_states[ore_index].current_ore_bits =
+                checked_control_sum(0, "current plus allocated ore", current, allocated)
+                    .map_err(|error| format!("{error:?}"))?
+                    .to_bits();
+            object.native_tail[4] = allocated.to_bits();
+        }
+    }
+
+    Ok([
+        totals.power_available.to_bits(),
+        totals.ore_available.to_bits(),
+        totals.ore_in_buffer.to_bits(),
+        totals.power_demand.to_bits(),
+        totals.ore_demand.to_bits(),
+    ])
 }
 
 fn set_control_device_table_multiplier(
@@ -4272,6 +4788,79 @@ mod tests {
     }
 
     #[test]
+    fn behavior_elapsed_seconds_preserve_native_qword_conversion_rounding() {
+        let vectors = [
+            (1, 0x3a83_126f),
+            (1_001, 0x3f80_20c5),
+            (16_777_217, 0x4683_1270),
+            (16_777_219, 0x4683_1271),
+            (u32::MAX, 0x4a83_126f),
+            (u32::MAX - 1, 0x4a83_126f),
+        ];
+        for (elapsed_ms, expected_bits) in vectors {
+            assert_eq!(
+                behavior_elapsed_seconds(elapsed_ms).to_bits(),
+                expected_bits,
+                "elapsed={elapsed_ms}"
+            );
+        }
+    }
+
+    #[test]
+    fn behavior_distributor_scheduler_requires_a_strictly_later_unsigned_time() {
+        let original = BehaviorWarmStartState {
+            first_time_ms: 100,
+            next_deadline_ms: 200,
+            cleared_words: [0x11; 5],
+        };
+        let mut state = original;
+        let mut rng_state = 1;
+
+        assert_eq!(
+            schedule_behavior_distributor_tick(&mut state, 200, &mut rng_state),
+            None
+        );
+        assert_eq!(state, original);
+        assert_eq!(rng_state, 1);
+
+        let elapsed = schedule_behavior_distributor_tick(&mut state, 201, &mut rng_state)
+            .expect("deadline is passed");
+        assert_eq!(elapsed.to_bits(), behavior_elapsed_seconds(101).to_bits());
+        assert_eq!(state.first_time_ms, 201);
+        assert_eq!(state.next_deadline_ms, 403);
+        assert_eq!(state.cleared_words, [0x11; 5]);
+        assert_eq!(rng_state, 0x0029_e2c0);
+    }
+
+    #[test]
+    fn behavior_distributor_scheduler_wraps_elapsed_but_keeps_unsigned_deadline_order() {
+        let mut state = BehaviorWarmStartState {
+            first_time_ms: u32::MAX - 15,
+            next_deadline_ms: 5,
+            cleared_words: [0; 5],
+        };
+        let mut rng_state = 1;
+
+        assert_eq!(
+            schedule_behavior_distributor_tick(&mut state, 5, &mut rng_state),
+            None
+        );
+        assert_eq!(state.next_deadline_ms, 5);
+        let elapsed = schedule_behavior_distributor_tick(&mut state, 6, &mut rng_state)
+            .expect("current time is unsigned-greater than deadline");
+        assert_eq!(elapsed.to_bits(), behavior_elapsed_seconds(22).to_bits());
+        assert_eq!(state.first_time_ms, 6);
+
+        let before = state;
+        assert_eq!(
+            schedule_behavior_distributor_tick(&mut state, 1, &mut rng_state),
+            None,
+            "unsigned 1 is not strictly later than the current deadline"
+        );
+        assert_eq!(state, before);
+    }
+
+    #[test]
     fn mission_script_start_stops_before_warming_later_bundles() {
         fn push_u32(bytes: &mut Vec<u8>, value: u32) {
             bytes.extend_from_slice(&value.to_le_bytes());
@@ -5837,6 +6426,259 @@ mod tests {
         );
     }
 
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_autodemo_resource_ticks_use_queue_time_and_real_generator_profile() {
+        let root = licensed_root("IS");
+        let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(root));
+        let mut engine = create(EngineServices::new(vfs)).expect("engine");
+        load_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Autodemo.00/data.tma".to_string(),
+                mode: MissionMode::AutoDemo,
+            },
+            100_000,
+        )
+        .expect("load licensed AutoDemo");
+
+        let deadlines = loaded_mission_script_bundles(&engine)
+            .expect("script bundles")
+            .iter()
+            .map(|bundle| {
+                (
+                    bundle.clan_index,
+                    bundle
+                        .behavior_warm_start
+                        .expect("full load warm-start")
+                        .next_deadline_ms,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(deadlines, [(0, 100_202), (1, 100_200)]);
+        assert_eq!(
+            advance_loaded_mission_resources(&mut engine, 100_000)
+                .expect("no due resource tick at warm start"),
+            0
+        );
+        assert_eq!(
+            advance_loaded_mission_resources(&mut engine, 100_200)
+                .expect("strict deadline equality is not due"),
+            0
+        );
+
+        assert_eq!(
+            advance_loaded_mission_resources(&mut engine, 100_201).expect("clan 1 resource tick"),
+            1
+        );
+        let first_totals = loaded_mission_script_bundles(&engine)
+            .expect("bundles after first tick")
+            .iter()
+            .find(|bundle| bundle.clan_index == 1)
+            .and_then(|bundle| bundle.behavior_warm_start)
+            .expect("clan 1 scheduler")
+            .cleared_words;
+        assert!(
+            f32::from_bits(first_totals[0]) > 0.0,
+            "clan 1's real prof_generator.var contributes power"
+        );
+        assert_eq!(
+            advance_loaded_mission_resources(&mut engine, 100_202)
+                .expect("clan 0 deadline equality is not due"),
+            0
+        );
+
+        assert_eq!(
+            advance_loaded_mission_resources(&mut engine, 100_203).expect("clan 0 resource tick"),
+            1
+        );
+        let second_totals = loaded_mission_script_bundles(&engine)
+            .expect("bundles after second tick")
+            .iter()
+            .find(|bundle| bundle.clan_index == 0)
+            .and_then(|bundle| bundle.behavior_warm_start)
+            .expect("clan 0 scheduler")
+            .cleared_words;
+        assert!(
+            f32::from_bits(second_totals[0]) > 0.0,
+            "clan 0's real prof_generator.var contributes power"
+        );
+
+        let first_tick_time = 100_500;
+        let deadlines = loaded_mission_script_bundles(&engine)
+            .expect("bundles after one tick per clan")
+            .iter()
+            .map(|bundle| {
+                bundle
+                    .behavior_warm_start
+                    .expect("full load warm-start")
+                    .next_deadline_ms
+            })
+            .collect::<Vec<_>>();
+        assert!(deadlines.iter().all(|deadline| *deadline < first_tick_time));
+        assert_eq!(
+            advance_loaded_mission_resources(&mut engine, first_tick_time)
+                .expect("second resource tick for each clan"),
+            2
+        );
+        let totals_at_100500 = loaded_mission_script_bundles(&engine)
+            .expect("bundles at 100500")
+            .iter()
+            .map(|bundle| {
+                (
+                    bundle.clan_index,
+                    bundle.behavior_warm_start.expect("full load warm-start"),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (clan, warm_start) in &totals_at_100500 {
+            assert_eq!(warm_start.first_time_ms, first_tick_time);
+            let elapsed = if *clan == 0 { 297 } else { 299 };
+            assert_eq!(
+                warm_start.cleared_words[0],
+                (behavior_elapsed_seconds(elapsed) * 10.0).to_bits(),
+                "clan {clan} recomputes power availability from the elapsed interval"
+            );
+        }
+
+        assert_eq!(
+            advance_loaded_mission_resources(&mut engine, 101_000)
+                .expect("third resource tick for each clan"),
+            2
+        );
+        let totals_at_101000 = loaded_mission_script_bundles(&engine)
+            .expect("bundles at 101000")
+            .iter()
+            .map(|bundle| {
+                (
+                    bundle.clan_index,
+                    bundle.behavior_warm_start.expect("full load warm-start"),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (clan, warm_start) in &totals_at_101000 {
+            assert_eq!(warm_start.first_time_ms, 101_000);
+            assert_eq!(
+                warm_start.cleared_words[0],
+                5.0_f32.to_bits(),
+                "clan {clan} replaces totals with the latest interval"
+            );
+            let previous = totals_at_100500
+                .iter()
+                .find(|(previous_clan, _)| previous_clan == clan)
+                .expect("same clan totals at previous tick")
+                .1;
+            assert_ne!(warm_start.cleared_words[0], previous.cleared_words[0]);
+        }
+
+        assert!(loaded_mission_behavior_profiles(&engine)
+            .expect("loaded profiles")
+            .iter()
+            .filter(|profile| profile.class_flags == 0x8000_0002)
+            .all(|profile| profile.transfer_power_out_bits == 10.0_f32.to_bits()));
+
+        for clan in [0, 1] {
+            let distributor = loaded_mission_behavior_distributors(&engine)
+                .expect("loaded distributors")
+                .iter()
+                .find(|distributor| distributor.clan_index == clan)
+                .expect("loaded clan distributor");
+            assert_eq!(distributor.registered_objects.len(), 2);
+            let generator = loaded_mission_behavior_distributors(&engine)
+                .expect("loaded distributors")
+                .iter()
+                .find(|distributor| distributor.clan_index == clan)
+                .and_then(|distributor| {
+                    distributor
+                        .registered_objects
+                        .iter()
+                        .find(|object| object.class_flags == 0x8000_0002)
+                })
+                .expect("licensed AutoDemo generator row");
+            let profile = loaded_mission_behavior_profiles(&engine)
+                .expect("loaded Behavior profiles")
+                .iter()
+                .find(|profile| profile.handle == generator.handle)
+                .expect("generator profile");
+            let totals = totals_at_101000
+                .iter()
+                .find(|(candidate, _)| *candidate == clan)
+                .expect("generator clan totals")
+                .1
+                .cleared_words;
+            println!(
+                "licensed AutoDemo Behavior tick: clan={clan} ObjectId={} profile={} Transfer_Power_Out={} PowerAvailable={} at queue times 100201/100203,100500,101000; registered rows={}",
+                generator.original_id.0,
+                profile.profile_entry.as_deref().unwrap_or("<defaults>"),
+                f32::from_bits(profile.transfer_power_out_bits),
+                f32::from_bits(totals[0]),
+                distributor.registered_objects.len(),
+            );
+        }
+
+        let second_plant = {
+            let loaded = engine.loaded.as_mut().expect("loaded mission state");
+            let second = loaded
+                .behavior_distributors
+                .iter()
+                .find(|distributor| distributor.clan_index == 1)
+                .expect("clan 1 distributor");
+            let plant = second
+                .registered_objects
+                .iter()
+                .find(|object| object.class_flags == 0x8000_0010)
+                .expect("clan 1 plant")
+                .clone();
+            loaded
+                .control_device_tables
+                .retain(|table| table.handle != plant.handle);
+            plant
+        };
+        assert_eq!(second_plant.class_flags, 0x8000_0010);
+        let before_distributors = loaded_mission_behavior_distributors(&engine)
+            .expect("rollback distributor snapshot")
+            .to_vec();
+        let before_ore_states = loaded_mission_behavior_ore_states(&engine)
+            .expect("rollback ore snapshot")
+            .to_vec();
+        let before_controls = loaded_mission_control_device_tables(&engine)
+            .expect("rollback Control snapshot")
+            .to_vec();
+        let before_warm_starts = loaded_mission_script_bundles(&engine)
+            .expect("rollback bundles")
+            .iter()
+            .map(|bundle| bundle.behavior_warm_start)
+            .collect::<Vec<_>>();
+        let before_rng = engine.behavior_rng_state;
+        let error = advance_loaded_mission_resources(&mut engine, 102_000)
+            .expect_err("missing clan 1 plant Control table fails after clan 0 stages a tick");
+        assert!(matches!(
+            error,
+            EngineError::BehaviorDistributorTick { clan_index: 1, .. }
+        ));
+        assert_eq!(
+            loaded_mission_behavior_distributors(&engine),
+            Some(before_distributors.as_slice())
+        );
+        assert_eq!(
+            loaded_mission_behavior_ore_states(&engine),
+            Some(before_ore_states.as_slice())
+        );
+        assert_eq!(
+            loaded_mission_control_device_tables(&engine),
+            Some(before_controls.as_slice())
+        );
+        assert_eq!(
+            loaded_mission_script_bundles(&engine)
+                .expect("bundles after failed transaction")
+                .iter()
+                .map(|bundle| bundle.behavior_warm_start)
+                .collect::<Vec<_>>(),
+            before_warm_starts
+        );
+        assert_eq!(engine.behavior_rng_state, before_rng);
+    }
+
     fn behavior_test_object(
         slot: u32,
         share: f32,
@@ -6072,6 +6914,237 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0x3f00_0000, 0x3f00_0000, 0x3300_0000]
         );
+    }
+
+    #[test]
+    fn behavior_allocation_matches_shortage_middle_surplus_and_equality_branches() {
+        let shortage = behavior_allocation(1.0, 6.0, 3.0).expect("shortage allocation");
+        assert_eq!(shortage.priority.to_bits(), 0x3eaa_aaab);
+        assert_eq!(shortage.residual.to_bits(), 0);
+        assert_eq!(shortage.consumption.to_bits(), 1.0_f32.to_bits());
+
+        let middle = behavior_allocation(0.25, 0.375, 0.1875).expect("middle allocation");
+        assert_eq!(middle.priority.to_bits(), 1.0_f32.to_bits());
+        assert_eq!(middle.residual.to_bits(), 0x3eaa_aaab);
+        assert_eq!(middle.consumption.to_bits(), 1.0_f32.to_bits());
+
+        let surplus = behavior_allocation(2.0, 0.375, 0.1875).expect("surplus allocation");
+        assert_eq!(surplus.priority.to_bits(), 1.0_f32.to_bits());
+        assert_eq!(surplus.residual.to_bits(), 1.0_f32.to_bits());
+        assert_eq!(surplus.consumption.to_bits(), 0x3e40_0000);
+
+        let exact = behavior_allocation(0.375, 0.375, 0.1875).expect("exact allocation");
+        assert_eq!(exact.priority.to_bits(), 1.0_f32.to_bits());
+        assert_eq!(exact.residual.to_bits(), 1.0_f32.to_bits());
+        assert_eq!(exact.consumption.to_bits(), 1.0_f32.to_bits());
+    }
+
+    fn behavior_tick_test_object(
+        world: &mut World,
+        original_id: u32,
+        class_flags: u32,
+        share: f32,
+    ) -> BehaviorRegisteredObject {
+        let original_id = OriginalObjectId(original_id);
+        let handle = construct_object(
+            world,
+            ObjectDraft {
+                original_id: Some(original_id),
+            },
+        )
+        .expect("construct Behavior tick object");
+        register_object(world, handle).expect("register Behavior tick object");
+        BehaviorRegisteredObject {
+            original_id,
+            handle,
+            selector: 0,
+            class_flags,
+            share,
+            native_tail: [0; 5],
+        }
+    }
+
+    fn behavior_tick_test_control_table(
+        original_id: u32,
+        handle: ObjectHandle,
+    ) -> MissionControlDeviceTableState {
+        let device = synthetic_effective_control_device(
+            19,
+            19,
+            0.75_f32.to_bits(),
+            Some(0.5_f32.to_bits()),
+            None,
+        );
+        MissionControlDeviceTableState {
+            original_id: Some(OriginalObjectId(original_id)),
+            handle,
+            status: MissionControlDeviceTableStatus::Available(vec![device]),
+            node_provider_status: MissionControlNodeProviderTableStatus::Available(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn behavior_power_source_also_contributes_ore_demand() {
+        let mut world = new_world(WorldConfig);
+        let producer = behavior_tick_test_object(&mut world, 1, 0x8000_0002, 0.5);
+        let recipient = behavior_tick_test_object(&mut world, 2, 0x8000_0001, 0.5);
+        let mut distributor = BehaviorDistributorState {
+            clan_index: 0,
+            super_ai_visible: true,
+            registered_objects: vec![producer.clone(), recipient.clone()],
+        };
+        let mut ore_states = [producer.clone(), recipient.clone()]
+            .into_iter()
+            .map(|object| BehaviorOreState {
+                original_id: object.original_id,
+                handle: object.handle,
+                class_flags: object.class_flags,
+                current_ore_bits: 1.0_f32.to_bits(),
+                maximum_ore_bits: 10.0_f32.to_bits(),
+            })
+            .collect::<Vec<_>>();
+        let profiles = [BehaviorProfileState {
+            original_id: OriginalObjectId(1),
+            handle: producer.handle,
+            class_flags: producer.class_flags,
+            profile_entry: None,
+            transfer_ore_off_board_bits: 0x40a0_0000,
+            transfer_power_out_bits: 4.0_f32.to_bits(),
+        }];
+        let mut control_tables = vec![
+            behavior_tick_test_control_table(1, producer.handle),
+            behavior_tick_test_control_table(2, recipient.handle),
+        ];
+
+        let totals = advance_behavior_distributor_tick(
+            &mut distributor,
+            1.0,
+            &world,
+            &mut ore_states,
+            &profiles,
+            &mut control_tables,
+        )
+        .expect("tick supported power source and generic receiver");
+
+        assert_eq!(
+            totals[4],
+            18.0_f32.to_bits(),
+            "both native classes compute the non-source ore demand"
+        );
+    }
+
+    #[test]
+    fn behavior_ore_source_also_contributes_power_demand() {
+        let mut world = new_world(WorldConfig);
+        let producer = behavior_tick_test_object(&mut world, 3, 0x8000_0004, 1.0);
+        let mut distributor = BehaviorDistributorState {
+            clan_index: 0,
+            super_ai_visible: true,
+            registered_objects: vec![producer.clone()],
+        };
+        let mut ore_states = [producer.clone()]
+            .into_iter()
+            .map(|object| BehaviorOreState {
+                original_id: object.original_id,
+                handle: object.handle,
+                class_flags: object.class_flags,
+                current_ore_bits: 0.25_f32.to_bits(),
+                maximum_ore_bits: 10.0_f32.to_bits(),
+            })
+            .collect::<Vec<_>>();
+        let profiles = [BehaviorProfileState {
+            original_id: OriginalObjectId(3),
+            handle: producer.handle,
+            class_flags: producer.class_flags,
+            profile_entry: None,
+            transfer_ore_off_board_bits: 4.0_f32.to_bits(),
+            transfer_power_out_bits: 0.0_f32.to_bits(),
+        }];
+        let mut ore_device = synthetic_effective_control_device(
+            26,
+            26,
+            1.0_f32.to_bits(),
+            Some(1.0_f32.to_bits()),
+            None,
+        );
+        ore_device.key = 0;
+        let producer_table = MissionControlDeviceTableState {
+            original_id: Some(OriginalObjectId(3)),
+            handle: producer.handle,
+            status: MissionControlDeviceTableStatus::Available(vec![
+                synthetic_effective_control_device(
+                    19,
+                    19,
+                    0.75_f32.to_bits(),
+                    Some(0.5_f32.to_bits()),
+                    None,
+                ),
+                ore_device,
+            ]),
+            node_provider_status: MissionControlNodeProviderTableStatus::Available(vec![
+                synthetic_node_provider_row(0, 0, 1.0_f32.to_bits()),
+            ]),
+        };
+        let mut control_tables = vec![producer_table];
+
+        let totals = advance_behavior_distributor_tick(
+            &mut distributor,
+            1.0,
+            &world,
+            &mut ore_states,
+            &profiles,
+            &mut control_tables,
+        )
+        .expect("tick supported ore source");
+
+        assert_eq!(
+            totals[3],
+            0.375_f32.to_bits(),
+            "ore producers still query generic Control power demand"
+        );
+    }
+
+    #[test]
+    fn behavior_first_pass_clamps_tiny_deficits_and_overfull_stores() {
+        for (original_id, current, maximum, clamps) in [
+            (4, 0.995_f32, 1.0_f32, true),
+            (5, 1.25, 1.0, true),
+            (6, 0.0, f32::from_bits(0x3c23_d70a), false),
+        ] {
+            let mut world = new_world(WorldConfig);
+            let object = behavior_tick_test_object(&mut world, original_id, 0x8000_0001, 0.5);
+            let mut distributor = BehaviorDistributorState {
+                clan_index: 0,
+                super_ai_visible: true,
+                registered_objects: vec![object.clone()],
+            };
+            let mut ore_states = [BehaviorOreState {
+                original_id: object.original_id,
+                handle: object.handle,
+                class_flags: object.class_flags,
+                current_ore_bits: current.to_bits(),
+                maximum_ore_bits: maximum.to_bits(),
+            }];
+            let mut control_tables = [MissionControlDeviceTableState {
+                original_id: Some(object.original_id),
+                handle: object.handle,
+                status: MissionControlDeviceTableStatus::Available(Vec::new()),
+                node_provider_status: MissionControlNodeProviderTableStatus::Available(Vec::new()),
+            }];
+
+            advance_behavior_distributor_tick(
+                &mut distributor,
+                1.0,
+                &world,
+                &mut ore_states,
+                &[],
+                &mut control_tables,
+            )
+            .expect("native low-deficit clamp path");
+
+            let expected = if clamps { maximum } else { current };
+            assert_eq!(ore_states[0].current_ore_bits, expected.to_bits());
+        }
     }
 
     #[test]
