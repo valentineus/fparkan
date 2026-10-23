@@ -5,7 +5,7 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 
-// Calls selected original x86 Behavior.dll, ArealMap.dll, and Control.dll paths
+// Calls selected original x86 Behavior.dll, ArealMap.dll, AniMesh.dll, and Control.dll paths
 // against synthetic storage. Only host callbacks, GetSystemArealMap/GetQueue IAT
 // slots, and bounded vector backing are substituted; tested module code remains installed.
 internal static class BehaviorDistributorTickOracle {
@@ -17,6 +17,7 @@ internal static class BehaviorDistributorTickOracle {
     private const string ExpectedBehaviorSha256 = "ddfbdbde07832358fe6e35e01c8dba9b58e7313789498b6049ed51d4ed9baf99";
     private const string ExpectedControlSha256 = "bcb86318089028548a178b03a21accdce15df0cc85ddd91674cf3c2f55012c6e";
     private const string ExpectedArealMapSha256 = "a25f9254ebb339d70e2e07c8121950191e9584ca0858d8e9c2e2b6c671edf6ea";
+    private const string ExpectedAniMeshSha256 = "65659bf67f20e5be77d67a5b2f59968f61b94293143807fa59ca451c560c4f7e";
     private const int TickRva = 0x19e80;
     private const int DistributorScheduleRva = 0x1adb0;
     private const int AddObjectRva = 0x1aac0;
@@ -40,6 +41,8 @@ internal static class BehaviorDistributorTickOracle {
     private const int ControlContactRateUpdateRva = 0x12a40;
     private const int ControlTimedUpdateRva = 0x0bcf0;
     private const int ArealMapUnitDatComponentBuilderRva = 0x14b90;
+    private const int AniMeshNodeMetadataQueryRva = 0x051f0;
+    private const int AniMeshNodeStageCountRva = 0x05840;
     private const int ControlResourceDeviceConstructorRva = 0x22980;
     private const int ControlResourceComponentOverrideRva = 0x2d890;
     private const int ControlResourceCommonSetterRva = 0x21d50;
@@ -99,6 +102,8 @@ internal static class BehaviorDistributorTickOracle {
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate float NativeControlResourceDeviceGet(IntPtr self, uint selector);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void NativeFastcallComponentBuilder(IntPtr owner, IntPtr node, uint parentId);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int NativeArealMapEvent(IntPtr owner, uint message, uint subcode, IntPtr descriptor);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int NativeAniMeshNodeMetadataQuery(IntPtr owner, uint nodeIndex, uint selector, IntPtr result);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate uint NativeAniMeshNodeStageCount(IntPtr owner, uint nodeIndex);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate IntPtr NativeControlResourceDeviceConstructor(IntPtr self);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate IntPtr NativeControlResourceComponentOverride(IntPtr self, int deviceIndex, IntPtr typedRecord);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int NativeControlAggregateQuery(IntPtr self, uint selector, IntPtr result);
@@ -522,6 +527,11 @@ internal static class BehaviorDistributorTickOracle {
         if (!File.Exists(arealMapPath)) { Console.Error.WriteLine("Set FPARKAN_ORIGINAL_AREALMAP_DLL to the installed ArealMap.dll."); return 10; }
         string arealMapHash = Hash(arealMapPath);
         if (arealMapHash != ExpectedArealMapSha256) { Console.Error.WriteLine("Unexpected ArealMap.dll SHA-256: " + arealMapHash); return 11; }
+        string aniMeshPath = Environment.GetEnvironmentVariable("FPARKAN_ORIGINAL_ANIMESH_DLL");
+        if (String.IsNullOrEmpty(aniMeshPath)) aniMeshPath = @"C:\GOG Games\Parkan - Iron Strategy\AniMesh.dll";
+        if (!File.Exists(aniMeshPath)) { Console.Error.WriteLine("Set FPARKAN_ORIGINAL_ANIMESH_DLL to the installed AniMesh.dll."); return 13; }
+        string aniMeshHash = Hash(aniMeshPath);
+        if (aniMeshHash != ExpectedAniMeshSha256) { Console.Error.WriteLine("Unexpected AniMesh.dll SHA-256: " + aniMeshHash); return 14; }
         IntPtr controlModule = LoadLibraryEx(controlPath, IntPtr.Zero, LoadWithAlteredSearchPath);
         if (controlModule == IntPtr.Zero) { Console.Error.WriteLine("LoadLibraryEx(Control.dll) failed: " + Marshal.GetLastWin32Error()); return 9; }
         string path = Environment.GetEnvironmentVariable("FPARKAN_ORIGINAL_BEHAVIOR_DLL");
@@ -535,6 +545,11 @@ internal static class BehaviorDistributorTickOracle {
         if (arealMapModule == IntPtr.Zero) {
             Console.Error.WriteLine("LoadLibraryEx(ArealMap.dll) failed: " + Marshal.GetLastWin32Error());
             FreeLibrary(module); FreeLibrary(controlModule); return 12;
+        }
+        IntPtr aniMeshModule = LoadLibraryEx(aniMeshPath, IntPtr.Zero, LoadWithAlteredSearchPath);
+        if (aniMeshModule == IntPtr.Zero) {
+            Console.Error.WriteLine("LoadLibraryEx(AniMesh.dll) failed: " + Marshal.GetLastWin32Error());
+            FreeLibrary(arealMapModule); FreeLibrary(module); FreeLibrary(controlModule); return 15;
         }
         IntPtr import = IntPtr.Add(module, GetSystemArealMapIatRva);
         IntPtr queueImport = IntPtr.Add(module, GetQueueIatRva);
@@ -560,7 +575,7 @@ internal static class BehaviorDistributorTickOracle {
             protectionChanged = true;
             Marshal.WriteIntPtr(import, Marshal.GetFunctionPointerForDelegate(AreaMapGetterCallback));
             Marshal.WriteIntPtr(queueImport, Marshal.GetFunctionPointerForDelegate(QueueGetterCallback));
-            RunSmokeCases(module, controlModule, arealMapModule);
+            RunSmokeCases(module, controlModule, arealMapModule, aniMeshModule);
             Console.WriteLine("original native Behavior/ArealMap/Control oracle passed (Behavior Add 0x1aac0, normalize 0x1ac90, scheduler 0x1adb0, tick 0x19e80; ArealMap UnitDAT projection 0x14b90; Control INTO override 0x2d890, provider distribution 0x10ba0, class-4 update 0x12a40 and inactive timing baseline 0xbcf0; synthetic host callbacks, GetSystemArealMap/GetQueue IAT slots, and bounded vector insertion are substituted; Control provider selector vtable is original; no full Control update or Rust parity is claimed).");
             return 0;
         }
@@ -587,12 +602,13 @@ internal static class BehaviorDistributorTickOracle {
                 throw new InvalidOperationException("VirtualFree(fastcall callback thunks) failed: " + Marshal.GetLastWin32Error());
             if (x87ControlWordCell != IntPtr.Zero) { Marshal.FreeHGlobal(x87ControlWordCell); x87ControlWordCell = IntPtr.Zero; }
             FreeLibrary(arealMapModule);
+            FreeLibrary(aniMeshModule);
             FreeLibrary(module);
             FreeLibrary(controlModule);
         }
     }
 
-    private static void RunSmokeCases(IntPtr module, IntPtr controlModule, IntPtr arealMapModule) {
+    private static void RunSmokeCases(IntPtr module, IntPtr controlModule, IntPtr arealMapModule, IntPtr aniMeshModule) {
         ushort savedControlWord = CurrentX87ControlWord();
         Console.WriteLine("x87-control-word-before=0x" + savedControlWord.ToString("x4") + " (x86 oracle process)");
         try {
@@ -601,6 +617,7 @@ internal static class BehaviorDistributorTickOracle {
             RunNativeAddCases(module);
             RunNativeNormalizeCases(module);
             RunNativeArealMapComponentBuilderCase(arealMapModule);
+            RunNativeAniMeshNodeMetadataCases(aniMeshModule);
             RunNativeControlIntoOverrideCase(controlModule);
             RunNativeControlResourceDeviceCase(controlModule);
             RunNativeControlProviderLiveStateCase(controlModule);
@@ -1217,6 +1234,86 @@ internal static class BehaviorDistributorTickOracle {
                 "]; kind0-subtree=skipped sparse-assigned-ids=propagated");
             GC.KeepAlive(build);
         }
+    }
+
+    private static void RunNativeAniMeshNodeMetadataCases(IntPtr module) {
+        NativeAniMeshNodeMetadataQuery query = (NativeAniMeshNodeMetadataQuery)Marshal.GetDelegateForFunctionPointer(
+            IntPtr.Add(module, AniMeshNodeMetadataQueryRva), typeof(NativeAniMeshNodeMetadataQuery));
+        NativeAniMeshNodeStageCount stageCount = (NativeAniMeshNodeStageCount)Marshal.GetDelegateForFunctionPointer(
+            IntPtr.Add(module, AniMeshNodeStageCountRva), typeof(NativeAniMeshNodeStageCount));
+
+        using (Fixture fixture = new Fixture()) {
+            IntPtr owner = fixture.Allocate(0x1b0);
+            IntPtr meshRows = fixture.Allocate(3 * 0x130);
+            IntPtr nodeData = fixture.Allocate(3 * 0x26);
+            IntPtr slotData = fixture.Allocate(3 * 0x44);
+            IntPtr meshData = fixture.Allocate(3 * IntPtr.Size);
+            IntPtr result = fixture.Allocate(IntPtr.Size);
+            Marshal.WriteIntPtr(meshData, 0, nodeData);
+            Marshal.WriteIntPtr(meshData, 2 * IntPtr.Size, slotData);
+            Marshal.WriteIntPtr(owner, 0x1a8, meshRows);
+            Marshal.WriteInt32(owner, 0x1ac, 3);
+
+            ushort[] headerFlags = new ushort[] { 0x8201, 0x0180, 0x0400 };
+            int[] rawParentIndices = new int[] { 3, 0, 1 };
+            int[] runtimeParentIndices = new int[] { -1, 22, 7 };
+            for (int nodeIndex = 0; nodeIndex < 3; nodeIndex++) {
+                IntPtr rawNode = IntPtr.Add(nodeData, nodeIndex * 0x26);
+                for (int word = 0; word < 19; word++) Marshal.WriteInt16(rawNode, word * 2, -1);
+                Marshal.WriteInt16(rawNode, 0, unchecked((short)headerFlags[nodeIndex]));
+                Marshal.WriteInt16(rawNode, 2, unchecked((short)rawParentIndices[nodeIndex]));
+
+                IntPtr meshRow = IntPtr.Add(meshRows, nodeIndex * 0x130);
+                Marshal.WriteInt32(meshRow, 8, nodeIndex);
+                Marshal.WriteInt32(meshRow, 0x18, runtimeParentIndices[nodeIndex]);
+                Marshal.WriteIntPtr(meshRow, 0x12c, meshData);
+            }
+
+            // Node 0: state0 present, state1 absent, state2 present. Native
+            // GetStateCount stops at the first missing state, so it returns 1.
+            WriteNode38Slot(nodeData, 0, 0, 0);
+            WriteNode38Slot(nodeData, 0, 2, 2);
+            // Node 1: the prefix is empty even though later states are present.
+            WriteNode38Slot(nodeData, 1, 1, 1);
+            WriteNode38Slot(nodeData, 1, 2, 2);
+            // Node 2: all three consecutive state slots are present.
+            WriteNode38Slot(nodeData, 2, 0, 0);
+            WriteNode38Slot(nodeData, 2, 1, 1);
+            WriteNode38Slot(nodeData, 2, 2, 2);
+
+            for (uint nodeIndex = 0; nodeIndex < 3; nodeIndex++) {
+                Marshal.WriteIntPtr(result, IntPtr.Zero);
+                Expect(NativeBoolean(query(owner, nodeIndex, 0x0d, result)) == 1,
+                    "AniMesh selector D returns runtime parent metadata");
+                IntPtr parent = Marshal.ReadIntPtr(result);
+                Expect(runtimeParentIndices[nodeIndex] != rawParentIndices[nodeIndex],
+                    "AniMesh runtime parent fixture differs from the raw Node38 parent");
+                Expect(Marshal.ReadInt32(parent) == runtimeParentIndices[nodeIndex],
+                    "AniMesh selector D copies the indexed global runtime parent, not the raw Node38 link");
+
+                Marshal.WriteIntPtr(result, IntPtr.Zero);
+                Expect(NativeBoolean(query(owner, nodeIndex, 0x0e, result)) == 1,
+                    "AniMesh selector E returns the Node38 header word");
+                IntPtr flags = Marshal.ReadIntPtr(result);
+                Expect(unchecked((uint)Marshal.ReadInt32(flags)) == headerFlags[nodeIndex],
+                    "AniMesh selector E points to the indexed Node38 hdr0");
+            }
+
+            uint[] expectedStageCounts = new uint[] { 1, 0, 3 };
+            for (uint nodeIndex = 0; nodeIndex < expectedStageCounts.Length; nodeIndex++) {
+                Expect(stageCount(owner, nodeIndex) == expectedStageCounts[nodeIndex],
+                    "AniMesh stage count is the consecutive state0-2 prefix");
+            }
+            Console.WriteLine("native-anim-mesh-control-node-metadata: aniMeshHash=" + ExpectedAniMeshSha256 +
+                " D=runtime-parent E=Node38-hdr0 stage-prefix=[1,0,3]");
+        }
+        GC.KeepAlive(query);
+        GC.KeepAlive(stageCount);
+    }
+
+    private static void WriteNode38Slot(IntPtr nodeData, int nodeIndex, int state, ushort slotIndex) {
+        int wordIndex = nodeIndex * 19 + 4 + state * 5;
+        Marshal.WriteInt16(nodeData, wordIndex * 2, unchecked((short)slotIndex));
     }
 
     private static void RunNativeControlIntoOverrideCase(IntPtr module) {

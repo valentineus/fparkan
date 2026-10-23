@@ -13,6 +13,7 @@ use fparkan_assets::{
     PreparedControlNodeDataTable, PreparedControlTypedRecord, PreparedVisual, TerrainFormatError,
     TerrainPreparationError, TerrainWorld, TmaProfile,
 };
+use fparkan_msh::{node38_metadata, selected_slot, Group, Lod, NodeId};
 use fparkan_path::{normalize_relative, NormalizedPath, PathError, PathPolicy};
 use fparkan_prototype::{
     build_prototype_graph_report, unit_component_tree, PrototypeGraph, PrototypeGraphFailure,
@@ -210,10 +211,23 @@ pub struct EffectiveControlDevice {
     pub descriptor_provenance: ControlDeviceRecordProvenance,
 }
 
+/// Initial Control metadata projected from one node in AniMesh's global table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MissionControlNodeInitialMeshState {
+    /// Parent index in AniMesh's concatenated runtime-node table.
+    pub parent_index: i32,
+    /// Node38 header bits translated to the Control row's `+0x28` flags.
+    pub flags: u32,
+    /// Effective state count; an empty native state prefix is exposed as one.
+    pub stage_count: u32,
+}
+
 /// Initial row in the loaded global Control node-data provider.
 ///
 /// The native table is indexed independently of MSH model nodes. Its rows are
 /// appended in root/EXTO resource order and begin with a type-1 value of 1.0.
+/// Mesh metadata uses the global row ordinal; `None` records that the matching
+/// MSH projection was unavailable and does not affect provider queries.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MissionControlNodeProviderRow {
     /// NDP resource that contributed the row.
@@ -226,6 +240,8 @@ pub struct MissionControlNodeProviderRow {
     pub source_row: PreparedControlNodeDataRow,
     /// Initial native provider selector-1 value (`+0x14`) as raw bits.
     pub initial_type1_value_bits: u32,
+    /// MSH state exposed at the same global ordinal, if the mesh projection exists.
+    pub initial_mesh_state: Option<MissionControlNodeInitialMeshState>,
 }
 
 /// Availability of the initial global Control node-data provider projection.
@@ -3256,6 +3272,57 @@ fn build_control_device_projection(
         }
     }
 
+    let mut global_mesh_states = Vec::new();
+    let mut global_node_cursor = 0_usize;
+    for component_index in active_components.iter().copied() {
+        let prototype =
+            prototype_for(component_index).ok_or(Unavailable::ComponentAlignmentMismatch)?;
+        let is_root = component_index == 0;
+        let is_ex_to = !is_root && prototype.source_type == Some(PROTOTYPE_TYPE_EXTO);
+        if !is_root && !is_ex_to {
+            continue;
+        }
+
+        let visual = object_visuals
+            .get(component_index)
+            .and_then(|visual_id| assets.visual_by_id(*visual_id));
+        let node_count = visual.map_or(0, |visual| visual.model_nodes);
+        let model = visual
+            .and_then(|visual| visual.model_id)
+            .and_then(|model_id| assets.model_by_id(model_id));
+        let parent_base = if is_ex_to {
+            i32::try_from(global_node_cursor)
+                .ok()
+                .and_then(|count| count.checked_sub(1))
+                .ok_or(Unavailable::UnsupportedExToNodeMapping {
+                    unit_component_index: component_index,
+                })?
+        } else {
+            0
+        };
+        let mount_node = if is_root {
+            Some(0)
+        } else {
+            native_component_mount_node(
+                &tree,
+                &component_ids,
+                &first_global_nodes,
+                component_index,
+                draft.unit_components[component_index].parent_or_link,
+            )
+        };
+        let first_source_node = usize::from(is_ex_to);
+        for source_node_index in first_source_node..node_count {
+            global_mesh_states.push(model.and_then(|model| {
+                initial_control_mesh_state(model, source_node_index, parent_base, mount_node)
+            }));
+        }
+        let contribution = node_count.saturating_sub(first_source_node);
+        global_node_cursor = global_node_cursor
+            .checked_add(contribution)
+            .ok_or(Unavailable::ComponentAlignmentMismatch)?;
+    }
+
     let mut devices = Vec::new();
     let mut node_provider_status = MissionControlNodeProviderTableStatus::Available(Vec::new());
     let mut has_control_resource = false;
@@ -3412,6 +3479,9 @@ fn build_control_device_projection(
     if !has_control_resource {
         return Err(Unavailable::NoControlResource);
     }
+    if let MissionControlNodeProviderTableStatus::Available(rows) = &mut node_provider_status {
+        attach_initial_mesh_states_by_global_ordinal(rows, &global_mesh_states);
+    }
     Ok(ControlDeviceProjection {
         devices,
         node_provider_status,
@@ -3453,7 +3523,71 @@ fn append_control_node_provider_rows(
             source_row_index,
             source_row: source_row.clone(),
             initial_type1_value_bits: 0x3f80_0000,
+            initial_mesh_state: None,
         });
+    }
+}
+
+fn control_flags_from_node38_header(header_flags: u16) -> u32 {
+    let mut flags = 0;
+    if header_flags & 0x0200 != 0 {
+        flags |= 0x01;
+    }
+    if header_flags & 0x0100 != 0 {
+        flags |= 0x02;
+    }
+    if header_flags & 0x0400 != 0 {
+        flags |= 0x04;
+    }
+    if header_flags & 0x0001 != 0 && header_flags & 0x0080 == 0 {
+        flags |= 0x08;
+    }
+    flags
+}
+
+fn native_mesh_parent_index(
+    parent_or_link_raw: u16,
+    parent_base: i32,
+    mount_node: Option<u32>,
+) -> Option<i32> {
+    if parent_or_link_raw == 0 {
+        i32::try_from(mount_node?).ok()
+    } else {
+        let relative_parent = if parent_or_link_raw == u16::MAX {
+            -1
+        } else {
+            i32::from(parent_or_link_raw)
+        };
+        parent_base.checked_add(relative_parent)
+    }
+}
+
+fn initial_control_mesh_state(
+    model: &fparkan_assets::PreparedModel,
+    source_node_index: usize,
+    parent_base: i32,
+    mount_node: Option<u32>,
+) -> Option<MissionControlNodeInitialMeshState> {
+    let node_index = u32::try_from(source_node_index).ok()?;
+    let node = node38_metadata(&model.validated, NodeId(node_index))?;
+    let stage_prefix = (0..3_u8)
+        .take_while(|state| {
+            selected_slot(&model.validated, NodeId(node_index), Lod(*state), Group(0)).is_some()
+        })
+        .count();
+    Some(MissionControlNodeInitialMeshState {
+        parent_index: native_mesh_parent_index(node.parent_or_link_raw, parent_base, mount_node)?,
+        flags: control_flags_from_node38_header(node.header_flags),
+        stage_count: u32::try_from(stage_prefix.max(1)).ok()?,
+    })
+}
+
+fn attach_initial_mesh_states_by_global_ordinal(
+    provider_rows: &mut [MissionControlNodeProviderRow],
+    global_mesh_states: &[Option<MissionControlNodeInitialMeshState>],
+) {
+    for (ordinal, row) in provider_rows.iter_mut().enumerate() {
+        row.initial_mesh_state = global_mesh_states.get(ordinal).copied().flatten();
     }
 }
 
@@ -3949,7 +4083,74 @@ mod tests {
                 },
             },
             initial_type1_value_bits,
+            initial_mesh_state: None,
         }
+    }
+
+    fn synthetic_node38(
+        header_flags: u16,
+        parent_or_link: u16,
+        group0_states: [bool; 3],
+    ) -> [u8; 38] {
+        let mut node = [0xff; 38];
+        node[0..2].copy_from_slice(&header_flags.to_le_bytes());
+        node[2..4].copy_from_slice(&parent_or_link.to_le_bytes());
+        node[4..6].copy_from_slice(&u16::MAX.to_le_bytes());
+        node[6..8].copy_from_slice(&0_u16.to_le_bytes());
+        for (state, present) in group0_states.into_iter().enumerate() {
+            let slot = if present { 0_u16 } else { u16::MAX };
+            let offset = 8 + state * 10;
+            node[offset..offset + 2].copy_from_slice(&slot.to_le_bytes());
+        }
+        node
+    }
+
+    fn synthetic_model_asset(nodes: &[[u8; 38]]) -> fparkan_msh::ModelAsset {
+        let mut nodes_raw = Vec::with_capacity(nodes.len() * 38);
+        for node in nodes {
+            nodes_raw.extend_from_slice(node);
+        }
+        fparkan_msh::ModelAsset {
+            node_stride: 38,
+            node_count: nodes.len(),
+            nodes_raw,
+            bounding_sphere_center: [0.0; 3],
+            bounding_sphere_radius: 0.0,
+            slots: vec![fparkan_msh::Slot {
+                tri_start: 0,
+                tri_count: 0,
+                batch_start: 0,
+                batch_count: 0,
+                aabb_min: [0.0; 3],
+                aabb_max: [0.0; 3],
+                sphere_center: [0.0; 3],
+                sphere_radius: 0.0,
+                opaque: [0; 5],
+            }],
+            positions: Vec::new(),
+            normals: None,
+            uv0: None,
+            uv1: None,
+            indices: Vec::new(),
+            batches: Vec::new(),
+            node_names: None,
+            animation: None,
+        }
+    }
+
+    fn attach_synthetic_model(
+        assets: &mut MissionAssets,
+        component_index: usize,
+        nodes: &[[u8; 38]],
+    ) {
+        let model_id = AssetId::<fparkan_assets::PreparedModel>::new(100 + component_index as u64);
+        assets.visuals[component_index].model_id = Some(model_id);
+        assets.models.push(fparkan_assets::PreparedModel {
+            id: model_id,
+            source: synthetic_resource_key(500 + component_index),
+            validated: synthetic_model_asset(nodes),
+            mesh_dependencies: Vec::new(),
+        });
     }
 
     fn synthetic_control_fixture(
@@ -5215,6 +5416,134 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_node_provider_projection_joins_flat_mesh_metadata_by_global_ordinal() {
+        let controls = vec![
+            Some(control_with_synthetic_node_data(0, Vec::new(), 3)),
+            Some(control_with_synthetic_node_data(1, Vec::new(), 3)),
+        ];
+        let (draft, mut assets, prototypes) = synthetic_control_fixture(
+            // Even if the root's registry prototype is typed EXTO, its model
+            // contributes every source node; only mounted EXTO rows skip node 0.
+            &[Some(PROTOTYPE_TYPE_EXTO), Some(PROTOTYPE_TYPE_EXTO)],
+            &[1, 1],
+            &[1, 0],
+            &[0, 1],
+            &[2, 3],
+            controls,
+        );
+        attach_synthetic_model(
+            &mut assets,
+            0,
+            &[
+                synthetic_node38(0x0701, 0xffff, [true, true, false]),
+                synthetic_node38(0x0081, 0, [false, true, true]),
+            ],
+        );
+        attach_synthetic_model(
+            &mut assets,
+            1,
+            &[
+                synthetic_node38(0, 0xffff, [true, false, false]),
+                synthetic_node38(0x0200, 0, [true, false, true]),
+                synthetic_node38(0x0400, 0xffff, [true, true, true]),
+            ],
+        );
+
+        let projection = build_control_device_projection(
+            0,
+            &draft,
+            &assets,
+            Some(&(0..prototypes.len())),
+            &prototypes,
+        )
+        .expect("synthetic Control projection");
+        let MissionControlNodeProviderTableStatus::Available(rows) =
+            projection.node_provider_status
+        else {
+            panic!("synthetic provider rows should be available");
+        };
+
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.unit_component_index, row.source_row_index))
+                .collect::<Vec<_>>(),
+            [(0, 0), (0, 1), (0, 2), (1, 1), (1, 2)]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.initial_mesh_state)
+                .collect::<Vec<_>>(),
+            [
+                Some(MissionControlNodeInitialMeshState {
+                    parent_index: -1,
+                    flags: 0x0f,
+                    stage_count: 2,
+                }),
+                Some(MissionControlNodeInitialMeshState {
+                    parent_index: 0,
+                    flags: 0,
+                    stage_count: 1,
+                }),
+                // This row is still from the root NDP. The native global
+                // ordinal has moved on to the first non-root EXTO mesh node.
+                Some(MissionControlNodeInitialMeshState {
+                    parent_index: 1,
+                    flags: 1,
+                    stage_count: 1,
+                }),
+                Some(MissionControlNodeInitialMeshState {
+                    parent_index: 0,
+                    flags: 4,
+                    stage_count: 3,
+                }),
+                None,
+            ]
+        );
+        assert!(rows[..4].iter().all(|row| row.initial_mesh_state.is_some()));
+    }
+
+    #[test]
+    fn missing_initial_mesh_metadata_keeps_provider_query_available() {
+        let mut device = synthetic_effective_control_device(
+            26,
+            26,
+            2.0_f32.to_bits(),
+            Some(3.0_f32.to_bits()),
+            None,
+        );
+        device.key = 0;
+        device.descriptor.fixed_words[1] = 0;
+        let provider = synthetic_node_provider_row(0, 0, 2.0_f32.to_bits());
+        assert_eq!(provider.initial_mesh_state, None);
+        let table = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(vec![device]),
+            MissionControlNodeProviderTableStatus::Available(vec![provider]),
+        );
+
+        assert_eq!(
+            query_control_device_table_selector(&table, 0, 0xe00)
+                .expect("NDP query remains independent of the MSH projection"),
+            Some(12.0)
+        );
+    }
+
+    #[test]
+    fn native_mesh_metadata_maps_control_flags_and_parent_words() {
+        assert_eq!(control_flags_from_node38_header(0x0701), 0x0f);
+        assert_eq!(control_flags_from_node38_header(0x0781), 0x07);
+
+        assert_eq!(native_mesh_parent_index(0xffff, 0, None), Some(-1));
+        assert_eq!(native_mesh_parent_index(0, 0, Some(0)), Some(0));
+        assert_eq!(native_mesh_parent_index(0xffff, 21, None), Some(20));
+        assert_eq!(native_mesh_parent_index(1, 21, None), Some(22));
+        assert_eq!(native_mesh_parent_index(0xfffe, 21, None), Some(65_555));
+        assert_eq!(native_mesh_parent_index(0x8000, 21, None), Some(32_789));
+        assert_eq!(native_mesh_parent_index(0, 21, Some(7)), Some(7));
+        assert_eq!(native_mesh_parent_index(0, 21, None), None);
+    }
+
+    #[test]
     fn missing_node_provider_does_not_hide_aggregate_queries() {
         let controls = vec![Some(synthetic_component_control(
             0,
@@ -5767,6 +6096,118 @@ mod tests {
         assert_eq!(root_node_data.rows.len(), 22);
         assert_eq!(ext_node_data.rows.len(), 4);
         assert_eq!(provider_rows.len(), 25);
+        let mission_assets = &engine
+            .loaded
+            .as_ref()
+            .expect("loaded mission state")
+            .mission_assets;
+        let visual_root_node_count = mission_assets
+            .visual_by_id(mission_assets.object_visuals[0][0])
+            .expect("root visual")
+            .model_nodes;
+        assert_eq!(visual_root_node_count, 22);
+        let assert_mesh_node =
+            |component_index: usize,
+             source_node_index: usize,
+             expected_header: u16,
+             expected_parent: u16,
+             expected_slots: [u16; 15],
+             expected_state: MissionControlNodeInitialMeshState| {
+                let visual_id = mission_assets.object_visuals[0][component_index];
+                let visual = mission_assets
+                    .visual_by_id(visual_id)
+                    .expect("component visual");
+                let model = mission_assets
+                    .model_by_id(visual.model_id.expect("component model"))
+                    .expect("prepared model");
+                let offset = source_node_index * model.validated.node_stride;
+                let raw_flags = u16::from_le_bytes(
+                    model.validated.nodes_raw[offset..offset + 2]
+                        .try_into()
+                        .expect("raw header flags"),
+                );
+                let raw_parent = u16::from_le_bytes(
+                    model.validated.nodes_raw[offset + 2..offset + 4]
+                        .try_into()
+                        .expect("raw parent"),
+                );
+                let raw_slots = std::array::from_fn::<_, 15, _>(|slot| {
+                    u16::from_le_bytes(
+                        model.validated.nodes_raw[offset + 8 + slot * 2..offset + 10 + slot * 2]
+                            .try_into()
+                            .expect("raw slot word"),
+                    )
+                });
+                let global_index = if component_index == 0 {
+                    source_node_index
+                } else {
+                    visual_root_node_count + source_node_index - 1
+                };
+                assert_eq!(raw_flags, expected_header);
+                assert_eq!(raw_parent, expected_parent);
+                assert_eq!(raw_slots, expected_slots);
+                assert_eq!(
+                    provider_rows[global_index].initial_mesh_state,
+                    Some(expected_state)
+                );
+            };
+        assert_mesh_node(
+            0,
+            0,
+            0x0000,
+            0xffff,
+            [0xffff; 15],
+            MissionControlNodeInitialMeshState {
+                parent_index: -1,
+                flags: 0,
+                stage_count: 1,
+            },
+        );
+        assert_mesh_node(
+            0,
+            1,
+            0x0110,
+            0x0000,
+            [
+                0x000b, 0x0025, 0x0026, 0xffff, 0xffff, 0x0013, 0x0027, 0x0028, 0xffff, 0xffff,
+                0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+            ],
+            MissionControlNodeInitialMeshState {
+                parent_index: 0,
+                flags: 2,
+                stage_count: 2,
+            },
+        );
+        assert_mesh_node(
+            5,
+            1,
+            0x0000,
+            0x0000,
+            [
+                0x0000, 0x0001, 0x0002, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+                0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+            ],
+            MissionControlNodeInitialMeshState {
+                parent_index: 9,
+                flags: 0,
+                stage_count: 1,
+            },
+        );
+        assert_mesh_node(
+            5,
+            2,
+            0x0010,
+            0x0001,
+            [
+                0x0004, 0x0007, 0x0008, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+                0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+            ],
+            MissionControlNodeInitialMeshState {
+                parent_index: 22,
+                flags: 0,
+                stage_count: 1,
+            },
+        );
         let expected_provider_sources = (0..root_node_data.rows.len())
             .map(|row| (0, row))
             .chain((1..ext_node_data.rows.len()).map(|row| (5, row)))
@@ -5781,6 +6222,9 @@ mod tests {
         assert!(provider_rows
             .iter()
             .all(|row| row.initial_type1_value_bits == 1.0_f32.to_bits()));
+        assert!(provider_rows
+            .iter()
+            .all(|row| row.initial_mesh_state.is_some()));
         assert_eq!(
             (
                 entries[9].factory_tag,

@@ -140,7 +140,10 @@ pub struct Node {
 /// Raw fields of the standard 38-byte node layout that precede slot selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Node38Metadata {
-    /// Unassigned source link value at byte offset two.
+    /// Raw Node38 header/flag word at byte offset zero.
+    pub header_flags: u16,
+    /// Source-local parent word at byte offset two; `0xFFFF` is the native
+    /// sentinel before component rebasing.
     pub parent_or_link_raw: u16,
     /// Offset into the type-19 frame map, or `0xFFFF` for no map.
     pub anim_map_start: u16,
@@ -431,6 +434,7 @@ pub fn node38_metadata(model: &ModelAsset, node: NodeId) -> Option<Node38Metadat
     }
     let offset = node_index.checked_mul(model.node_stride)?;
     Some(Node38Metadata {
+        header_flags: read_u16(&model.nodes_raw, offset)?,
         parent_or_link_raw: read_u16(&model.nodes_raw, offset + 2)?,
         anim_map_start: read_u16(&model.nodes_raw, offset + 4)?,
         fallback_key: read_u16(&model.nodes_raw, offset + 6)?,
@@ -441,8 +445,8 @@ pub fn node38_metadata(model: &ModelAsset, node: NodeId) -> Option<Node38Metadat
 ///
 /// The legacy sampler uses this key when a node has no frame map or its current
 /// frame falls outside that map. It is a static-pose input only; callers must
-/// still recover animation state and the meaning of `parent_or_link_raw` before
-/// assembling a runtime hierarchy. Its quaternion is converted to match native
+/// assemble the runtime hierarchy separately and apply the component-specific
+/// mapping of `parent_or_link_raw`. Its quaternion is converted to match native
 /// AniMesh's quaternion-to-matrix convention.
 #[must_use]
 pub fn node38_fallback_pose(model: &ModelAsset, node: NodeId) -> Option<Pose> {
@@ -1412,6 +1416,7 @@ mod tests {
     #[test]
     fn standard_node_exposes_fallback_pose_and_unassigned_link() {
         let mut node = node38([u16::MAX; 15]);
+        node[0..2].copy_from_slice(&0x8201_u16.to_le_bytes());
         node[2..4].copy_from_slice(&7_u16.to_le_bytes());
         node[4..6].copy_from_slice(&u16::MAX.to_le_bytes());
         node[6..8].copy_from_slice(&0_u16.to_le_bytes());
@@ -1440,6 +1445,7 @@ mod tests {
         assert_eq!(
             node38_metadata(&model, NodeId(0)),
             Some(Node38Metadata {
+                header_flags: 0x8201,
                 parent_or_link_raw: 7,
                 anim_map_start: u16::MAX,
                 fallback_key: 0,

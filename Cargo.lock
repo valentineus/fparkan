@@ -630,6 +630,7 @@ name = "fparkan-runtime"
 version = "0.1.0"
 dependencies = [
  "fparkan-assets",
+ "fparkan-msh",
  "fparkan-path",
  "fparkan-platform",
  "fparkan-prototype",
