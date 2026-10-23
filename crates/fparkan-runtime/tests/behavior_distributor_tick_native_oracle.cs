@@ -40,11 +40,14 @@ internal static class BehaviorDistributorTickOracle {
     private const int ControlProviderInitialStateRva = 0x0f940;
     private const int ControlProviderAmountUpdateRva = 0x10f30;
     private const int ControlProviderAmountDistributeRva = 0x10ba0;
+    private const int ControlProviderStagePropagationRva = 0x11130;
+    private const int ControlProviderStageUpdateRva = 0x11220;
     private const int ControlContactRateUpdateRva = 0x12a40;
     private const int ControlTimedUpdateRva = 0x0bcf0;
     private const int ArealMapUnitDatComponentBuilderRva = 0x14b90;
     private const int AniMeshNodeMetadataQueryRva = 0x051f0;
     private const int AniMeshNodeStageCountRva = 0x05840;
+    private const int AniMeshNodeStageSetRva = 0x05810;
     private const int ControlResourceDeviceConstructorRva = 0x22980;
     private const int ControlResourceComponentOverrideRva = 0x2d890;
     private const int ControlResourceCommonSetterRva = 0x21d50;
@@ -118,6 +121,9 @@ internal static class BehaviorDistributorTickOracle {
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate IntPtr NativeControlOwnerConstructor(IntPtr self, IntPtr host, uint classCode);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlProviderInitialState(IntPtr self);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void NativeControlNodeUpdateCallback(IntPtr self, uint nodeIndex, uint selector, uint valueBits);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlProviderStageUpdate(IntPtr self, int nodeIndex, uint updateEffects);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void NativeAniMeshStageTransitionCallback(IntPtr self, uint nodeIndex, uint visibleStage);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate uint NativeAniMeshNodeLifecycleCallback(IntPtr self, uint nodeIndex, uint selector, uint mask);
 
     private static readonly AreaMapGetter AreaMapGetterCallback = GetAreaMap;
     private static readonly QueueGetter QueueGetterCallback = GetQueue;
@@ -134,12 +140,28 @@ internal static class BehaviorDistributorTickOracle {
     private static readonly InterfaceSetProperty InterfaceSetCallback = SetInterfaceProperty;
     private static readonly NativeArealMapEvent ArealMapEventCallback = OnArealMapEvent;
     private static readonly NativeControlNodeUpdateCallback ControlNodeUpdateCallback = OnControlNodeUpdate;
+    private static readonly NativeAniMeshStageTransitionCallback AniMeshStageTransitionCallback = OnAniMeshStageTransition;
+    private static readonly NativeAniMeshNodeLifecycleCallback AniMeshNodeLifecycleCallback = OnAniMeshNodeLifecycle;
+    private static readonly NativeAniMeshNodeMetadataQuery AniMeshNodeMetadataQueryCallback = OnAniMeshNodeMetadataQuery;
     private static ArealMapFixture activeArealMap;
     private static int controlNodeUpdateCount;
     private static uint controlNodeUpdateIndex;
     private static uint controlNodeUpdateSelector;
     private static uint controlNodeUpdateValueBits;
     private static readonly List<uint> controlNodeUpdateIndices = new List<uint>();
+    private static readonly List<uint> controlNodeUpdateFlags = new List<uint>();
+    private static readonly List<string> aniMeshStageTransitions = new List<string>();
+    private static readonly List<string> aniMeshNodeLifecycleCallbacks = new List<string>();
+    private static readonly List<string> aniMeshNodeMetadataQueries = new List<string>();
+    private static readonly List<string> controlProviderCallbackTrace = new List<string>();
+    private static NativeAniMeshStageTransitionCallback activeNativeAniMeshStageTransition;
+    private static NativeAniMeshNodeLifecycleCallback activeNativeAniMeshNodeLifecycle;
+    private static NativeAniMeshNodeMetadataQuery activeNativeAniMeshNodeMetadataQuery;
+    private static IntPtr activeControlProviderRows;
+    private static IntPtr activeAniMeshInterface;
+    private static bool aniMeshCallbackOwnerMismatch;
+    private static bool controlNodeUpdateOwnerMismatch;
+    private static bool nativeAniMeshStageCallbackMissing;
     private static IntPtr fastcallThunks;
     private static IntPtr queryObjectThunk;
     private static IntPtr getInterfacePropertyThunk;
@@ -484,11 +506,45 @@ internal static class BehaviorDistributorTickOracle {
         return 1;
     }
     private static void OnControlNodeUpdate(IntPtr self, uint nodeIndex, uint selector, uint valueBits) {
+        if (activeAniMeshInterface != IntPtr.Zero && self != activeAniMeshInterface)
+            controlNodeUpdateOwnerMismatch = true;
         controlNodeUpdateCount++;
         controlNodeUpdateIndex = nodeIndex;
         controlNodeUpdateSelector = selector;
         controlNodeUpdateValueBits = valueBits;
         controlNodeUpdateIndices.Add(nodeIndex);
+        controlProviderCallbackTrace.Add("amount:" + nodeIndex.ToString());
+        if (activeControlProviderRows != IntPtr.Zero)
+            controlNodeUpdateFlags.Add(unchecked((uint)Marshal.ReadInt32(activeControlProviderRows, checked((int)nodeIndex * 0x2c + 0x28))));
+    }
+    private static void OnAniMeshStageTransition(IntPtr self, uint nodeIndex, uint visibleStage) {
+        controlProviderCallbackTrace.Add("stage:" + nodeIndex.ToString() + ":" + visibleStage.ToString());
+        aniMeshStageTransitions.Add(nodeIndex.ToString() + ":" + visibleStage.ToString());
+        if (activeAniMeshInterface != IntPtr.Zero && self != activeAniMeshInterface)
+            aniMeshCallbackOwnerMismatch = true;
+        if (activeNativeAniMeshStageTransition == null) nativeAniMeshStageCallbackMissing = true;
+        else activeNativeAniMeshStageTransition(self, nodeIndex, visibleStage);
+    }
+    private static uint OnAniMeshNodeLifecycle(IntPtr self, uint nodeIndex, uint selector, uint mask) {
+        aniMeshNodeLifecycleCallbacks.Add(nodeIndex.ToString() + ":" + selector.ToString("x") + ":" + mask.ToString("x"));
+        controlProviderCallbackTrace.Add("lifecycle:" + nodeIndex.ToString() + ":" + selector.ToString("x") + ":" + mask.ToString("x"));
+        if (activeAniMeshInterface != IntPtr.Zero && self != activeAniMeshInterface)
+            aniMeshCallbackOwnerMismatch = true;
+        if (activeNativeAniMeshNodeLifecycle == null) {
+            nativeAniMeshStageCallbackMissing = true;
+            return 0;
+        }
+        return activeNativeAniMeshNodeLifecycle(self, nodeIndex, selector, mask);
+    }
+    private static int OnAniMeshNodeMetadataQuery(IntPtr self, uint nodeIndex, uint selector, IntPtr result) {
+        int nativeResult = activeNativeAniMeshNodeMetadataQuery(self, nodeIndex, selector, result);
+        int success = (nativeResult & 0xff) != 0 ? 1 : 0;
+        if (activeAniMeshInterface != IntPtr.Zero && self != activeAniMeshInterface)
+            aniMeshCallbackOwnerMismatch = true;
+        IntPtr value = success != 0 && result != IntPtr.Zero ? Marshal.ReadIntPtr(result) : IntPtr.Zero;
+        aniMeshNodeMetadataQueries.Add(nodeIndex.ToString() + ":" + selector.ToString("x") + ":" +
+            (value == IntPtr.Zero ? "none" : Hex(unchecked((uint)Marshal.ReadInt32(value)))));
+        return success;
     }
     private static float SequenceValue(float[] sequence, int index, float fallback) {
         if (sequence == null || sequence.Length == 0) return fallback;
@@ -627,6 +683,9 @@ internal static class BehaviorDistributorTickOracle {
             RunNativeControlIntoOverrideCase(controlModule);
             RunNativeControlResourceDeviceCase(controlModule);
             RunNativeControlProviderLiveStateCase(controlModule);
+            RunNativeControlProviderStageArithmeticCase(controlModule, aniMeshModule);
+            RunNativeControlProviderHierarchyPropagationCase(controlModule, aniMeshModule);
+            RunNativeControlProviderVisibilityCase(controlModule, aniMeshModule);
             RunNativeControlProviderDistributionCases(controlModule);
             RunNativeControlContactRateUpdateCase(controlModule);
             RunNativeControlTimedUpdateBaselineCases(controlModule);
@@ -878,6 +937,388 @@ internal static class BehaviorDistributorTickOracle {
             GC.KeepAlive(update);
             GC.KeepAlive(getter);
         }
+    }
+
+    private static void RunNativeControlProviderStageArithmeticCase(IntPtr module, IntPtr aniMeshModule) {
+        NativeControlProviderStageUpdate updateStage = (NativeControlProviderStageUpdate)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlProviderStageUpdateRva), typeof(NativeControlProviderStageUpdate));
+        activeNativeAniMeshStageTransition = (NativeAniMeshStageTransitionCallback)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(aniMeshModule, AniMeshNodeStageSetRva),
+                typeof(NativeAniMeshStageTransitionCallback));
+        activeNativeAniMeshNodeLifecycle = (NativeAniMeshNodeLifecycleCallback)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(aniMeshModule, 0x05500),
+                typeof(NativeAniMeshNodeLifecycleCallback));
+        using (Fixture fixture = new Fixture()) {
+            const int rowCount = 9;
+            IntPtr owner = fixture.Allocate(0x664);
+            IntPtr rows = fixture.Allocate(rowCount * 0x2c);
+            IntPtr aniInterface = fixture.Allocate(0x1b0);
+            IntPtr aniVtable = fixture.Allocate(0x50);
+            IntPtr meshRows = fixture.Allocate(rowCount * 0x130);
+            Marshal.WriteIntPtr(aniInterface, 0, aniVtable);
+            Marshal.WriteIntPtr(aniInterface, 0x1a8, meshRows);
+            Marshal.WriteInt32(aniInterface, 0x1ac, rowCount);
+            for (int index = 0; index < rowCount; index++)
+                Marshal.WriteInt32(meshRows, index * 0x130 + 0x1c, -99);
+            Marshal.WriteIntPtr(aniVtable, 0x44, Marshal.GetFunctionPointerForDelegate(AniMeshStageTransitionCallback));
+            Marshal.WriteIntPtr(aniVtable, 0x20, Marshal.GetFunctionPointerForDelegate(AniMeshNodeLifecycleCallback));
+            Marshal.WriteIntPtr(owner, 0x20, aniInterface);
+            Marshal.WriteIntPtr(owner, 0x55c, rows);
+            Marshal.WriteInt32(owner, 0x560, rowCount);
+
+            // Parent ratio .25 yields stage 3 of 4. Bit 4 inherits that ratio;
+            // bit 8 inherits the parent's stage and clamps it to the child's count.
+            WriteProviderStageRow(rows, 0, -1, 40.0f, 91.0f, 0.25f, 0, 4, 0x02);
+            WriteProviderStageRow(rows, 1, 0, 12.0f, 81.0f, 0.875f, 0, 5, 0x06);
+            WriteProviderStageRow(rows, 2, 0, 7.0f, 71.0f, 0.9f, 0, 2, 0x0a);
+            WriteProviderStageRow(rows, 3, 1, 3.0f, 31.0f, 0.1f, 0, 6, 0x0e);
+            // These independent rows distinguish the native ceiling operation
+            // from floor/round for fractional stage products.
+            WriteProviderStageRow(rows, 4, -1, 2.0f, 92.0f, 0.1f, 0, 3, 0x02);
+            WriteProviderStageRow(rows, 5, -1, 3.0f, 93.0f, 0.4f, 0, 3, 0x02);
+            WriteProviderStageRow(rows, 6, -1, 4.0f, 94.0f, 0.5f, 0, 3, 0x02);
+            WriteProviderStageRow(rows, 7, -1, 5.0f, 95.0f, 1.0f, 1, 3, 0x102);
+            WriteProviderStageRow(rows, 8, -1, 6.0f, 96.0f, 0.0f, 0, 3, 0x02);
+
+            aniMeshStageTransitions.Clear();
+            aniMeshNodeLifecycleCallbacks.Clear();
+            controlProviderCallbackTrace.Clear();
+            aniMeshCallbackOwnerMismatch = false;
+            controlNodeUpdateOwnerMismatch = false;
+            nativeAniMeshStageCallbackMissing = false;
+            activeAniMeshInterface = aniInterface;
+            updateStage(owner, 0, 0); // param2=false suppresses effect creation.
+            updateStage(owner, 1, 0);
+            updateStage(owner, 2, 0);
+            updateStage(owner, 3, 0);
+            for (int index = 4; index < rowCount; index++) updateStage(owner, index, 0);
+
+            uint[] expectedStages = { 3, 3, 2, 3, 2, 1, 1, 0, 3 };
+            uint[] expectedVisibleStages = { 3, 3, 1, 3, 2, 1, 1, 0, 2 };
+            uint[] expectedAmounts = { 0x42200000, 0x41400000, 0x40e00000, 0x40400000,
+                0x40000000, 0x40400000, 0x40800000, 0x40a00000, 0x40c00000 };
+            for (int index = 0; index < rowCount; index++) {
+                IntPtr row = IntPtr.Add(rows, index * 0x2c);
+                IntPtr meshRow = IntPtr.Add(meshRows, index * 0x130);
+                Expect(unchecked((uint)Marshal.ReadInt32(row, 0x18)) == expectedStages[index],
+                    "Control 0x11220 computes inherited stage for row " + index);
+                Expect(unchecked((uint)Marshal.ReadInt32(meshRow, 0x1c)) == expectedVisibleStages[index],
+                    "AniMesh RVA 0x5810 receives the bounded visual stage for row " + index);
+                Expect(unchecked((uint)Marshal.ReadInt32(row, 0x08)) == expectedAmounts[index] &&
+                    unchecked((uint)Marshal.ReadInt32(row, 0x0c)) == expectedAmounts[index],
+                    "Control 0x11220 retains amount and updates its processed snapshot for row " + index);
+                Expect((unchecked((uint)Marshal.ReadInt32(row, 0x28)) & 0x200) != 0,
+                    "Control 0x11220 records a stage transition for row " + index);
+            }
+            Expect(unchecked((uint)Marshal.ReadInt32(rows, 0x14)) == 0x3e800000 &&
+                unchecked((uint)Marshal.ReadInt32(rows, 0x2c + 0x14)) == 0x3e800000 &&
+                unchecked((uint)Marshal.ReadInt32(rows, 3 * 0x2c + 0x14)) == 0x3e800000,
+                "Control flag 4 copies the parent type-1 ratio before stage calculation");
+            Expect(String.Join(",", aniMeshStageTransitions.ToArray()) == "0:3,1:3,2:1,3:3,4:2,5:1,6:1,7:0,8:2" &&
+                String.Join(",", aniMeshNodeLifecycleCallbacks.ToArray()) == "7:101:4" && !aniMeshCallbackOwnerMismatch &&
+                !controlNodeUpdateOwnerMismatch && !nativeAniMeshStageCallbackMissing,
+                "Control stage and slot-0x20 callbacks reach the original AniMesh RVA 0x5810 in direct update order");
+            Expect(String.Join(",", controlProviderCallbackTrace.ToArray()) ==
+                "stage:0:3,stage:1:3,stage:2:1,stage:3:3,stage:4:2,stage:5:1,stage:6:1,lifecycle:7:101:4,stage:7:0,stage:8:2",
+                "AniMesh slot 0x20 receives its native node, selector, and mask arguments before stage publication");
+
+            Console.WriteLine("native-control-parent-stage-arithmetic: controlHash=" + ExpectedControlSha256 +
+                " rva=0x11220 bit4=ratio bit8=parent-stage ceil=[0.1,0.4,0.5,1,0]=>[2,1,1,0,3]" +
+                " callbacks=[0:3,1:3,2:1,3:3,4:2,5:1,6:1,lifecycle7:101:4,7:0,8:2]");
+            activeAniMeshInterface = IntPtr.Zero;
+            activeNativeAniMeshStageTransition = null;
+            activeNativeAniMeshNodeLifecycle = null;
+            GC.KeepAlive(updateStage);
+        }
+    }
+
+    private static void RunNativeControlProviderHierarchyPropagationCase(IntPtr module, IntPtr aniMeshModule) {
+        NativeControlProviderStageUpdate propagate = (NativeControlProviderStageUpdate)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlProviderStagePropagationRva), typeof(NativeControlProviderStageUpdate));
+        activeNativeAniMeshStageTransition = (NativeAniMeshStageTransitionCallback)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(aniMeshModule, AniMeshNodeStageSetRva),
+                typeof(NativeAniMeshStageTransitionCallback));
+        activeNativeAniMeshNodeLifecycle = (NativeAniMeshNodeLifecycleCallback)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(aniMeshModule, 0x05500),
+                typeof(NativeAniMeshNodeLifecycleCallback));
+        using (Fixture fixture = new Fixture()) {
+            NativeProviderTable table = CreateNativeProviderTable(fixture, module,
+                new float[] { 100.0f, 20.0f, 10.0f, 30.0f, 14.0f },
+                new float[] { 25.0f, 10.0f, 5.0f, 12.0f, 7.0f },
+                new byte[] { 0x02, 0x02, 0x02, 0x02, 0x02 });
+            const int rowCount = 5;
+            int[] parents = { -1, 0, 1, 0, 0 };
+            uint[] stages = { 4, 2, 3, 2, 2 };
+            uint[] flags = { 0x02, 0x42, 0x02, 0x102, 0x02 };
+            for (int index = 0; index < rowCount; index++) {
+                IntPtr row = IntPtr.Add(table.Rows, index * 0x2c);
+                WriteProviderStageRow(table.Rows, index, parents[index], ReadFloat(row, 0x08),
+                    123.0f + index, ReadFloat(row, 0x14), 0, stages[index], flags[index]);
+            }
+
+            IntPtr aniInterface = fixture.Allocate(0x1b0);
+            IntPtr aniVtable = fixture.Allocate(0x50);
+            IntPtr meshRows = fixture.Allocate(rowCount * 0x130);
+            Marshal.WriteIntPtr(aniInterface, 0, aniVtable);
+            Marshal.WriteIntPtr(aniInterface, 0x1a8, meshRows);
+            Marshal.WriteInt32(aniInterface, 0x1ac, rowCount);
+            for (int index = 0; index < rowCount; index++)
+                Marshal.WriteInt32(meshRows, index * 0x130 + 0x1c, -99);
+            Marshal.WriteIntPtr(aniVtable, 0x20, Marshal.GetFunctionPointerForDelegate(AniMeshNodeLifecycleCallback));
+            Marshal.WriteIntPtr(aniVtable, 0x34, Marshal.GetFunctionPointerForDelegate(ControlNodeUpdateCallback));
+            Marshal.WriteIntPtr(aniVtable, 0x44, Marshal.GetFunctionPointerForDelegate(AniMeshStageTransitionCallback));
+            Marshal.WriteIntPtr(table.Owner, 0x20, aniInterface);
+
+            controlNodeUpdateCount = 0;
+            controlNodeUpdateIndices.Clear();
+            controlNodeUpdateFlags.Clear();
+            aniMeshStageTransitions.Clear();
+            aniMeshNodeLifecycleCallbacks.Clear();
+            controlProviderCallbackTrace.Clear();
+            aniMeshCallbackOwnerMismatch = false;
+            controlNodeUpdateOwnerMismatch = false;
+            nativeAniMeshStageCallbackMissing = false;
+            activeControlProviderRows = table.Rows;
+            activeAniMeshInterface = aniInterface;
+
+            propagate(table.Owner, 0, 0);
+
+            IntPtr parent = table.Rows;
+            IntPtr protected40 = IntPtr.Add(table.Rows, 0x2c);
+            IntPtr grandchild = IntPtr.Add(table.Rows, 2 * 0x2c);
+            IntPtr protected100 = IntPtr.Add(table.Rows, 3 * 0x2c);
+            IntPtr sibling = IntPtr.Add(table.Rows, 4 * 0x2c);
+            IntPtr parentMeshRow = meshRows;
+            IntPtr bit40MeshRow = IntPtr.Add(meshRows, 0x130);
+            IntPtr grandchildMeshRow = IntPtr.Add(meshRows, 2 * 0x130);
+            IntPtr bit100MeshRow = IntPtr.Add(meshRows, 3 * 0x130);
+            IntPtr siblingMeshRow = IntPtr.Add(meshRows, 4 * 0x130);
+            Expect(ReadFloat(parent, 0x08) == 25.0f && ReadFloat(parent, 0x0c) == 25.0f &&
+                unchecked((uint)Marshal.ReadInt32(parent, 0x18)) == 3,
+                "Control 0x11130 updates the parent stage and processed amount first");
+            Expect(ReadFloat(protected40, 0x08) == 0.0f && ReadFloat(protected40, 0x14) == 0.0f &&
+                unchecked((uint)Marshal.ReadInt32(protected40, 0x18)) == 0 &&
+                (unchecked((uint)Marshal.ReadInt32(protected40, 0x28)) & 0x50) == 0x50,
+                "Protected bit 0x40 does not stop child depletion, while its depleted-stage early return remains visible");
+            Expect(ReadFloat(grandchild, 0x08) == 0.0f && ReadFloat(grandchild, 0x0c) == 125.0f &&
+                unchecked((uint)Marshal.ReadInt32(grandchild, 0x18)) == 0 &&
+                (unchecked((uint)Marshal.ReadInt32(grandchild, 0x28)) & 0x90) == 0x90,
+                "Control 0x11130 drains a protected child's descendant but its inherited 0x80 flag preserves the depleted stage snapshot");
+            Expect(ReadFloat(protected100, 0x08) == 0.0f && ReadFloat(protected100, 0x0c) == 0.0f &&
+                unchecked((uint)Marshal.ReadInt32(protected100, 0x18)) == 2,
+                "Protected bit 0x100 does not stop child depletion or its later stage update");
+            Expect(ReadFloat(sibling, 0x08) == 0.0f && ReadFloat(sibling, 0x0c) == 0.0f &&
+                unchecked((uint)Marshal.ReadInt32(sibling, 0x18)) == 2 &&
+                (unchecked((uint)Marshal.ReadInt32(sibling, 0x28)) & 0x100) != 0,
+                "An unprotected sibling retains the native damaged flag while updating its stage");
+            Expect(unchecked((uint)Marshal.ReadInt32(parentMeshRow, 0x1c)) == 3 &&
+                unchecked((uint)Marshal.ReadInt32(bit40MeshRow, 0x1c)) == unchecked((uint)-99) &&
+                unchecked((uint)Marshal.ReadInt32(grandchildMeshRow, 0x1c)) == unchecked((uint)-99) &&
+                unchecked((uint)Marshal.ReadInt32(bit100MeshRow, 0x1c)) == 1 &&
+                unchecked((uint)Marshal.ReadInt32(siblingMeshRow, 0x1c)) == 1,
+                "ANI slot 0x44 reaches native AniMesh RVA 0x5810 for changed visible stages only");
+            Expect(controlNodeUpdateCount == 4 &&
+                String.Join(",", controlNodeUpdateIndices.ConvertAll(index => index.ToString()).ToArray()) == "1,2,3,4" &&
+                String.Join(",", controlNodeUpdateFlags.ConvertAll(value => value.ToString("x")).ToArray()) == "42,82,102,102" &&
+                !controlNodeUpdateOwnerMismatch,
+                "Control 0x11130 traverses descendants depth-first, checking callback owners and protected flags");
+            Expect(String.Join(",", aniMeshStageTransitions.ToArray()) == "0:3,3:1,4:1" &&
+                aniMeshNodeLifecycleCallbacks.Count == 0 &&
+                !aniMeshCallbackOwnerMismatch && !nativeAniMeshStageCallbackMissing,
+                "Control descendant update preserves the native callback order and stage bounds");
+            Expect(String.Join(",", controlProviderCallbackTrace.ToArray()) ==
+                "stage:0:3,amount:1,amount:2,amount:3,stage:3:1,amount:4,stage:4:1",
+                "Control 0x11130 keeps amount, lifecycle, and visual-stage callbacks in native depth-first order");
+            Expect(ReadFloat(table.Owner, 0x590) == 25.0f,
+                "Control 0x10f30 keeps the aggregate amount in sync after recursive child depletion");
+
+            Console.WriteLine("native-control-parent-propagation: controlHash=" + ExpectedControlSha256 +
+                " rva=0x11130 childOrder=[1,2,3,4] protected40/100=depleted bit40-stage-return=preserved" +
+                " callbacks=" + String.Join(",", controlProviderCallbackTrace.ToArray()));
+            activeControlProviderRows = IntPtr.Zero;
+            activeAniMeshInterface = IntPtr.Zero;
+            activeNativeAniMeshStageTransition = null;
+            activeNativeAniMeshNodeLifecycle = null;
+            GC.KeepAlive(propagate);
+        }
+    }
+
+    private static void RunNativeControlProviderVisibilityCase(IntPtr controlModule, IntPtr aniMeshModule) {
+        NativeControlProviderStageUpdate updateStage = (NativeControlProviderStageUpdate)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(controlModule, ControlProviderStageUpdateRva),
+                typeof(NativeControlProviderStageUpdate));
+        NativeAniMeshNodeMetadataQuery queryNode = (NativeAniMeshNodeMetadataQuery)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(aniMeshModule, AniMeshNodeMetadataQueryRva),
+                typeof(NativeAniMeshNodeMetadataQuery));
+        NativeAniMeshNodeLifecycleCallback updateNodeLifecycle = (NativeAniMeshNodeLifecycleCallback)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(aniMeshModule, 0x05500),
+                typeof(NativeAniMeshNodeLifecycleCallback));
+        NativeAniMeshStageTransitionCallback setNodeStage = (NativeAniMeshStageTransitionCallback)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(aniMeshModule, AniMeshNodeStageSetRva),
+                typeof(NativeAniMeshStageTransitionCallback));
+
+        using (Fixture fixture = NewFixture()) {
+            NativeProviderTable table = CreateNativeProviderTable(fixture, controlModule,
+                new float[] { 13.0f }, new float[] { 13.0f }, new byte[] { 0x00 });
+            IntPtr descriptor = Marshal.ReadIntPtr(table.Rows);
+            Marshal.WriteInt32(descriptor, 0x08, FloatBits(0.03125f)); // source mobility per unit volume
+            Marshal.WriteInt32(table.Owner, 0x50, 9); // class 9 makes FUN_1000fca0 return after the visibility change
+            Marshal.WriteInt32(table.Owner, 0x530, FloatBits(100.0f));
+            Marshal.WriteInt32(table.Owner, 0x534, FloatBits(200.0f));
+            Marshal.WriteInt32(table.Owner, 0x538, FloatBits(300.0f));
+            Marshal.WriteInt32(table.Owner, 0x4d8, FloatBits(40.0f));
+            WriteProviderStageRow(table.Rows, 0, -1, 13.0f, 13.0f, 0.0f, 0, 3, 0x00);
+            Marshal.WriteInt32(table.Rows, 0x20, FloatBits(13.0f));
+
+            IntPtr aniInterface = fixture.Allocate(0x1b0);
+            IntPtr aniVtable = fixture.Allocate(0x50);
+            IntPtr meshRows = fixture.Allocate(0x130);
+            IntPtr nodeData = fixture.Allocate(0x26);
+            IntPtr slotData = fixture.Allocate(2 * 0x44);
+            IntPtr meshData = fixture.Allocate(3 * IntPtr.Size);
+            for (int word = 0; word < 19; word++) Marshal.WriteInt16(nodeData, word * 2, -1);
+            for (int stage = 0; stage < 3; stage++)
+                Marshal.WriteInt16(nodeData, 0x08 + stage * 5 * sizeof(ushort), 0);
+            // State 0,1,2 each expose slot 0; 0x11220 publishes visible stage 2 before 0x11920 queries it.
+            Marshal.WriteIntPtr(meshData, 0, nodeData);
+            Marshal.WriteIntPtr(meshData, 2 * IntPtr.Size, slotData);
+            Marshal.WriteIntPtr(aniInterface, 0, aniVtable);
+            Marshal.WriteIntPtr(aniInterface, 0x1a8, meshRows);
+            Marshal.WriteInt32(aniInterface, 0x1ac, 1);
+            Marshal.WriteInt32(aniInterface, 0x158, FloatBits(2.0f));
+            Marshal.WriteInt32(aniInterface, 0x15c, FloatBits(3.0f));
+            Marshal.WriteInt32(aniInterface, 0x160, FloatBits(5.0f));
+            Marshal.WriteInt32(meshRows, 0x00, 0); // ANI model-instance ID used by FUN_10005780/57c0
+            Marshal.WriteInt32(meshRows, 0x1c, 0); // current visible stage selects Node38 slot state 0
+            Marshal.WriteIntPtr(meshRows, 0x12c, meshData);
+            Marshal.WriteInt32(slotData, 0x30, FloatBits(7.0f));
+            Marshal.WriteInt32(slotData, 0x34, FloatBits(11.0f));
+            Marshal.WriteInt32(slotData, 0x44 + 0x30, FloatBits(17.0f));
+            Marshal.WriteInt32(slotData, 0x44 + 0x34, FloatBits(19.0f));
+
+            // Use the original ANI vtable entries exercised by FUN_10011920:
+            // node selector F/10, instance lookup/count, lifecycle flags, and visible stage.
+            activeNativeAniMeshNodeMetadataQuery = queryNode;
+            Marshal.WriteIntPtr(aniVtable, 0x0c, Marshal.GetFunctionPointerForDelegate(AniMeshNodeMetadataQueryCallback));
+            activeNativeAniMeshNodeLifecycle = updateNodeLifecycle;
+            Marshal.WriteIntPtr(aniVtable, 0x20, Marshal.GetFunctionPointerForDelegate(AniMeshNodeLifecycleCallback));
+            Marshal.WriteIntPtr(aniVtable, 0x38, IntPtr.Add(aniMeshModule, 0x05780));
+            Marshal.WriteIntPtr(aniVtable, 0x3c, IntPtr.Add(aniMeshModule, 0x057c0));
+            activeNativeAniMeshStageTransition = setNodeStage;
+            Marshal.WriteIntPtr(aniVtable, 0x44, Marshal.GetFunctionPointerForDelegate(AniMeshStageTransitionCallback));
+            Marshal.WriteIntPtr(table.Owner, 0x20, aniInterface);
+            activeAniMeshInterface = aniInterface;
+
+            IntPtr firstValueOut = fixture.Allocate(IntPtr.Size);
+            IntPtr secondValueOut = fixture.Allocate(IntPtr.Size);
+            Expect(NativeBoolean(queryNode(aniInterface, 0, 0x0f, firstValueOut)) == 1,
+                "AniMesh selector F reads the raw slot state through the original getter");
+            IntPtr firstValue = Marshal.ReadIntPtr(firstValueOut);
+            Expect(ReadFloat(firstValue, 0) == 42.0f,
+                "AniMesh selector F scales slot+0x30 by both XY instance factors");
+            Expect(NativeBoolean(queryNode(aniInterface, 0, 0x10, secondValueOut)) == 1,
+                "AniMesh selector 10 reads the second raw slot field through the original getter");
+            IntPtr secondValue = Marshal.ReadIntPtr(secondValueOut);
+            Expect(firstValue == secondValue && ReadFloat(firstValue, 0) == 330.0f,
+                "AniMesh selectors F and 10 return the same scratch cell; the second query overwrites the first result");
+
+            activeControlProviderRows = table.Rows;
+            aniMeshNodeMetadataQueries.Clear();
+            aniMeshNodeLifecycleCallbacks.Clear();
+            aniMeshStageTransitions.Clear();
+            controlProviderCallbackTrace.Clear();
+            aniMeshCallbackOwnerMismatch = false;
+            nativeAniMeshStageCallbackMissing = false;
+            // At ratio zero, the native ceiling stage rule selects the depleted sentinel
+            // and reaches 0x11920's hide branch. Ratio one reopens that node.
+            updateStage(table.Owner, 0, 0);
+            IntPtr row = table.Rows;
+            IntPtr meshRow = meshRows;
+            Expect(unchecked((uint)Marshal.ReadInt32(row, 0x28)) == 0x220 &&
+                unchecked((uint)Marshal.ReadInt32(row, 0x18)) == 3 &&
+                unchecked((uint)Marshal.ReadInt32(meshRow, 0x14)) == 1 &&
+                unchecked((uint)Marshal.ReadInt32(meshRow, 0x1c)) == 2,
+                "Control RVA 0x11920 hides an exhausted provider in both Control and the original AniMesh node state");
+            Expect(String.Join(",", aniMeshNodeMetadataQueries.ToArray()) == "0:f:0x42280000,0:10:0x43a50000" &&
+                !aniMeshCallbackOwnerMismatch && !nativeAniMeshStageCallbackMissing,
+                "Control RVA 0x11920 queries the shared AniMesh scratch cell before applying its aggregate changes");
+            Console.WriteLine("native-control-provider-hide-values: row20=" + Float(ReadFloat(row, 0x20)) +
+                " totals=[" + Float(ReadFloat(table.Owner, 0x530)) + "," + Float(ReadFloat(table.Owner, 0x534)) +
+                "," + Float(ReadFloat(table.Owner, 0x538)) + "," + Float(ReadFloat(table.Owner, 0x4d8)) +
+                "] queries=[" + String.Join(",", aniMeshNodeMetadataQueries.ToArray()) + "]");
+            Expect(ReadFloat(table.Owner, 0x530) == -230.0f && ReadFloat(table.Owner, 0x534) == -130.0f &&
+                ReadFloat(table.Owner, 0x538) == 287.0f && FloatBits(ReadFloat(table.Owner, 0x4d8)) == FloatBits(42.6875f),
+                "Control RVA 0x11920 removes the aliased AniMesh value from aggregates and applies the volume adjustment");
+
+            Marshal.WriteInt32(row, 0x14, FloatBits(1.0f));
+            updateStage(table.Owner, 0, 0);
+            Expect(unchecked((uint)Marshal.ReadInt32(row, 0x28)) == 0x200 &&
+                unchecked((uint)Marshal.ReadInt32(row, 0x18)) == 0 &&
+                unchecked((uint)Marshal.ReadInt32(meshRow, 0x14)) == 0 &&
+                unchecked((uint)Marshal.ReadInt32(meshRow, 0x1c)) == 0,
+                "Control RVA 0x11920 shows the reopened provider and clears both Control and AniMesh visibility flags");
+            Expect(ReadFloat(table.Owner, 0x530) == 100.0f && ReadFloat(table.Owner, 0x534) == 200.0f &&
+                ReadFloat(table.Owner, 0x538) == 300.0f && FloatBits(ReadFloat(table.Owner, 0x4d8)) == FloatBits(40.0f),
+                "Control RVA 0x11920 restores provider aggregates on the paired show transition");
+            Expect(String.Join(",", aniMeshNodeMetadataQueries.ToArray()) ==
+                "0:f:0x42280000,0:10:0x43a50000,0:f:0x42280000,0:10:0x43a50000" &&
+                String.Join(",", aniMeshNodeLifecycleCallbacks.ToArray()) == "0:100:1,0:101:5" &&
+                String.Join(",", aniMeshStageTransitions.ToArray()) == "0:2,0:0",
+                "Native hide/show repeats the same F/10 queries and original AniMesh callbacks in order");
+
+            // The same native getter follows a new visible state: state 2 now selects
+            // the second MSH slot while state 0 still selects the first.
+            Marshal.WriteInt16(nodeData, 0x08 + 2 * 5 * sizeof(ushort), 1);
+            Marshal.WriteInt32(row, 0x14, FloatBits(0.0f));
+            updateStage(table.Owner, 0, 0);
+            Expect(String.Join(",", aniMeshNodeMetadataQueries.ToArray()) ==
+                "0:f:0x42280000,0:10:0x43a50000,0:f:0x42280000,0:10:0x43a50000," +
+                "0:f:0x42cc0000,0:10:0x440e8000" &&
+                ReadFloat(table.Owner, 0x530) == -470.0f && ReadFloat(table.Owner, 0x534) == -370.0f &&
+                ReadFloat(table.Owner, 0x538) == 287.0f && FloatBits(ReadFloat(table.Owner, 0x4d8)) == FloatBits(35.1875f),
+                "Control hide query follows visible state 2 and applies its different native mesh-slot value");
+            Marshal.WriteInt32(row, 0x14, FloatBits(1.0f));
+            updateStage(table.Owner, 0, 0);
+            Expect(String.Join(",", aniMeshNodeMetadataQueries.ToArray()) ==
+                "0:f:0x42280000,0:10:0x43a50000,0:f:0x42280000,0:10:0x43a50000," +
+                "0:f:0x42cc0000,0:10:0x440e8000,0:f:0x42280000,0:10:0x43a50000" &&
+                ReadFloat(table.Owner, 0x530) == -140.0f && ReadFloat(table.Owner, 0x534) == -40.0f &&
+                ReadFloat(table.Owner, 0x538) == 300.0f && FloatBits(ReadFloat(table.Owner, 0x4d8)) == FloatBits(32.5f),
+                "Control show query returns to visible state 0 rather than reversing the prior state-2 contribution");
+            Expect(String.Join(",", controlProviderCallbackTrace.ToArray()) ==
+                "stage:0:2,lifecycle:0:100:1,stage:0:0,lifecycle:0:101:5," +
+                "stage:0:2,lifecycle:0:100:1,stage:0:0,lifecycle:0:101:5",
+                "Control and AniMesh visibility transitions preserve native callback order and arguments");
+            Expect(!aniMeshCallbackOwnerMismatch && !nativeAniMeshStageCallbackMissing,
+                "Both visibility cycles preserve AniMesh callback owners and original function results");
+
+            Console.WriteLine("native-control-provider-visibility: controlHash=" + ExpectedControlSha256 +
+                " aniMeshHash=" + ExpectedAniMeshSha256 + " rva=0x11920 selectorF/10=same-scratch-cell " +
+                "visible-state-values=[42,330]=>[102,570] hide/show=stage-dependent");
+            activeControlProviderRows = IntPtr.Zero;
+            activeAniMeshInterface = IntPtr.Zero;
+            activeNativeAniMeshNodeMetadataQuery = null;
+            activeNativeAniMeshStageTransition = null;
+            activeNativeAniMeshNodeLifecycle = null;
+            GC.KeepAlive(updateStage);
+            GC.KeepAlive(queryNode);
+            GC.KeepAlive(updateNodeLifecycle);
+            GC.KeepAlive(setNodeStage);
+            GC.KeepAlive(AniMeshNodeLifecycleCallback);
+            GC.KeepAlive(AniMeshStageTransitionCallback);
+        }
+    }
+
+    private static void WriteProviderStageRow(IntPtr rows, int index, int parentIndex,
+        float amount, float processed, float normalized, uint currentStage, uint stageCount, uint flags) {
+        IntPtr row = IntPtr.Add(rows, index * 0x2c);
+        Marshal.WriteInt32(row, 0x04, parentIndex);
+        Marshal.WriteInt32(row, 0x08, FloatBits(amount));
+        Marshal.WriteInt32(row, 0x0c, FloatBits(processed));
+        Marshal.WriteInt32(row, 0x14, FloatBits(normalized));
+        Marshal.WriteInt32(row, 0x18, unchecked((int)currentStage));
+        Marshal.WriteInt32(row, 0x1c, unchecked((int)stageCount));
+        Marshal.WriteInt32(row, 0x28, unchecked((int)flags));
     }
 
     private static NativeProviderTable CreateNativeProviderTable(Fixture fixture, IntPtr module,
