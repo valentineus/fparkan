@@ -238,6 +238,12 @@ pub struct MissionControlNodeProviderRow {
     pub source_row_index: usize,
     /// Original NDP descriptor fields and provenance for this provider row.
     pub source_row: PreparedControlNodeDataRow,
+    /// Shared initial provider amount (`+0x08` and `+0x0c`) as raw bits.
+    ///
+    /// Control initializes both fields from the selector-3 result. On the
+    /// confirmed UnitDAT load path, the two scale factors are 1.0, so this is
+    /// the NDP row's `max_volume`; later mutations can change both fields.
+    pub initial_amount_bits: u32,
     /// Initial native provider selector-1 value (`+0x14`) as raw bits.
     pub initial_type1_value_bits: u32,
     /// MSH state exposed at the same global ordinal, if the mesh projection exists.
@@ -3522,6 +3528,7 @@ fn append_control_node_provider_rows(
             unit_component_index,
             source_row_index,
             source_row: source_row.clone(),
+            initial_amount_bits: source_row.max_volume.to_bits(),
             initial_type1_value_bits: 0x3f80_0000,
             initial_mesh_state: None,
         });
@@ -4082,6 +4089,7 @@ mod tests {
                     name: [0; 32],
                 },
             },
+            initial_amount_bits: 100.0_f32.to_bits(),
             initial_type1_value_bits,
             initial_mesh_state: None,
         }
@@ -5417,10 +5425,18 @@ mod tests {
 
     #[test]
     fn synthetic_node_provider_projection_joins_flat_mesh_metadata_by_global_ordinal() {
-        let controls = vec![
+        let mut controls = vec![
             Some(control_with_synthetic_node_data(0, Vec::new(), 3)),
             Some(control_with_synthetic_node_data(1, Vec::new(), 3)),
         ];
+        controls[0]
+            .as_mut()
+            .expect("root component control")
+            .node_data
+            .as_mut()
+            .expect("root NDP")
+            .rows[0]
+            .max_volume = 0.0;
         let (draft, mut assets, prototypes) = synthetic_control_fixture(
             // Even if the root's registry prototype is typed EXTO, its model
             // contributes every source node; only mounted EXTO rows skip node 0.
@@ -5501,6 +5517,19 @@ mod tests {
             ]
         );
         assert!(rows[..4].iter().all(|row| row.initial_mesh_state.is_some()));
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.initial_amount_bits)
+                .collect::<Vec<_>>(),
+            [
+                0.0_f32.to_bits(),
+                101.0_f32.to_bits(),
+                102.0_f32.to_bits(),
+                101.0_f32.to_bits(),
+                102.0_f32.to_bits(),
+            ]
+        );
+        assert_eq!(rows[0].initial_type1_value_bits, 1.0_f32.to_bits());
     }
 
     #[test]
@@ -6096,6 +6125,16 @@ mod tests {
         assert_eq!(root_node_data.rows.len(), 22);
         assert_eq!(ext_node_data.rows.len(), 4);
         assert_eq!(provider_rows.len(), 25);
+        assert_eq!(provider_rows[0].initial_amount_bits, 1.0_f32.to_bits());
+        assert_eq!(provider_rows[22].initial_amount_bits, 6000.0_f32.to_bits());
+        assert_eq!(
+            provider_rows[0].initial_amount_bits,
+            provider_rows[0].source_row.max_volume.to_bits()
+        );
+        assert_eq!(
+            provider_rows[22].initial_amount_bits,
+            provider_rows[22].source_row.max_volume.to_bits()
+        );
         let mission_assets = &engine
             .loaded
             .as_ref()

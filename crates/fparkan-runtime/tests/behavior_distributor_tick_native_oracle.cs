@@ -36,6 +36,8 @@ internal static class BehaviorDistributorTickOracle {
     private const int ControlProviderInterfaceVtableRva = 0x3d254;
     private const int ControlProviderType1GetterRva = 0x0dc40;
     private const int ControlProviderRowConstructorRva = 0x0b240;
+    private const int ControlOwnerConstructorRva = 0x06bf0;
+    private const int ControlProviderInitialStateRva = 0x0f940;
     private const int ControlProviderAmountUpdateRva = 0x10f30;
     private const int ControlProviderAmountDistributeRva = 0x10ba0;
     private const int ControlContactRateUpdateRva = 0x12a40;
@@ -113,6 +115,8 @@ internal static class BehaviorDistributorTickOracle {
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlContactRateUpdate(IntPtr self, float deltaSeconds);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlTimedUpdate(IntPtr self, float inputTime);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlProviderRowConstructor(IntPtr self, IntPtr sourceNdpRow);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate IntPtr NativeControlOwnerConstructor(IntPtr self, IntPtr host, uint classCode);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlProviderInitialState(IntPtr self);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void NativeControlNodeUpdateCallback(IntPtr self, uint nodeIndex, uint selector, uint valueBits);
 
     private static readonly AreaMapGetter AreaMapGetterCallback = GetAreaMap;
@@ -617,7 +621,9 @@ internal static class BehaviorDistributorTickOracle {
             RunNativeAddCases(module);
             RunNativeNormalizeCases(module);
             RunNativeArealMapComponentBuilderCase(arealMapModule);
+            RunNativeAniMeshScaleLoadSnapshot(aniMeshModule);
             RunNativeAniMeshNodeMetadataCases(aniMeshModule);
+            RunNativeControlProviderInitialStateCase(controlModule, aniMeshModule);
             RunNativeControlIntoOverrideCase(controlModule);
             RunNativeControlResourceDeviceCase(controlModule);
             RunNativeControlProviderLiveStateCase(controlModule);
@@ -1236,6 +1242,18 @@ internal static class BehaviorDistributorTickOracle {
         }
     }
 
+    private static void RunNativeAniMeshScaleLoadSnapshot(IntPtr module) {
+        uint[] actual = new uint[] {
+            unchecked((uint)Marshal.ReadInt32(IntPtr.Add(module, 0x26068))),
+            unchecked((uint)Marshal.ReadInt32(IntPtr.Add(module, 0x2606c))),
+            unchecked((uint)Marshal.ReadInt32(IntPtr.Add(module, 0x26070)))
+        };
+        Expect(actual[0] == 0x3f800000 && actual[1] == 0x3f800000 && actual[2] == 0x3f800000,
+            "AniMesh module load initializes all three runtime scale globals to 1.0");
+        Console.WriteLine("native-anim-mesh-scale-load-snapshot: aniMeshHash=" + ExpectedAniMeshSha256 +
+            " globals=[" + String.Join(",", Array.ConvertAll(actual, Hex)) + "]");
+    }
+
     private static void RunNativeAniMeshNodeMetadataCases(IntPtr module) {
         NativeAniMeshNodeMetadataQuery query = (NativeAniMeshNodeMetadataQuery)Marshal.GetDelegateForFunctionPointer(
             IntPtr.Add(module, AniMeshNodeMetadataQueryRva), typeof(NativeAniMeshNodeMetadataQuery));
@@ -1309,6 +1327,137 @@ internal static class BehaviorDistributorTickOracle {
         }
         GC.KeepAlive(query);
         GC.KeepAlive(stageCount);
+    }
+
+    private static void RunNativeControlProviderInitialStateCase(IntPtr controlModule, IntPtr aniMeshModule) {
+        const int rowCount = 4;
+        NativeControlOwnerConstructor constructOwner = (NativeControlOwnerConstructor)Marshal.GetDelegateForFunctionPointer(
+            IntPtr.Add(controlModule, ControlOwnerConstructorRva), typeof(NativeControlOwnerConstructor));
+        NativeControlProviderRowConstructor constructProviderRow = (NativeControlProviderRowConstructor)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(controlModule, ControlProviderRowConstructorRva),
+                typeof(NativeControlProviderRowConstructor));
+        NativeControlProviderInitialState initialize = (NativeControlProviderInitialState)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(controlModule, ControlProviderInitialStateRva),
+                typeof(NativeControlProviderInitialState));
+        using (Fixture fixture = NewFixture()) {
+            IntPtr owner = fixture.Allocate(0x664);
+            Expect(constructOwner(owner, IntPtr.Zero, 4) == owner,
+                "Control constructor initializes a synthetic class-4 owner without a host object");
+            Expect(unchecked((uint)Marshal.ReadInt32(owner, 0x548)) == 0x3f800000 &&
+                unchecked((uint)Marshal.ReadInt32(owner, 0x660)) == 0x3f800000,
+                "Control constructor starts both provider getter scale factors at 1.0");
+
+            IntPtr aniOwner = fixture.Allocate(0x1b0);
+            IntPtr aniVtable = fixture.Allocate(0x4c);
+            IntPtr meshRows = fixture.Allocate(rowCount * 0x130);
+            IntPtr nodeData = fixture.Allocate(rowCount * 0x26);
+            IntPtr slotData = fixture.Allocate(rowCount * 0x44);
+            IntPtr meshData = fixture.Allocate(3 * IntPtr.Size);
+            IntPtr providerRows = fixture.Allocate(rowCount * 0x2c);
+            Marshal.WriteIntPtr(meshData, 0, nodeData);
+            Marshal.WriteIntPtr(meshData, 2 * IntPtr.Size, slotData);
+            Marshal.WriteIntPtr(aniOwner, 0, aniVtable);
+            Marshal.WriteIntPtr(aniOwner, 0x1a8, meshRows);
+            Marshal.WriteInt32(aniOwner, 0x1ac, rowCount);
+            Marshal.WriteIntPtr(aniVtable, 0x0c, IntPtr.Add(aniMeshModule, AniMeshNodeMetadataQueryRva));
+            Marshal.WriteIntPtr(aniVtable, 0x34, Marshal.GetFunctionPointerForDelegate(ControlNodeUpdateCallback));
+            Marshal.WriteIntPtr(aniVtable, 0x48, IntPtr.Add(aniMeshModule, AniMeshNodeStageCountRva));
+
+            ushort[] headers = { 0x8201, 0x0180, 0x0400, 0x0001 };
+            int[] rawParents = { 3, 0, 1, 0 };
+            int[] runtimeParents = { -1, 22, 7, 11 };
+            float[] sourceMaxima = { 30.0f, 60.0f, 50.0f, 0.0f };
+            for (int nodeIndex = 0; nodeIndex < rowCount; nodeIndex++) {
+                IntPtr rawNode = IntPtr.Add(nodeData, nodeIndex * 0x26);
+                for (int word = 0; word < 19; word++) Marshal.WriteInt16(rawNode, word * 2, -1);
+                Marshal.WriteInt16(rawNode, 0, unchecked((short)headers[nodeIndex]));
+                Marshal.WriteInt16(rawNode, 2, unchecked((short)rawParents[nodeIndex]));
+
+                IntPtr meshRow = IntPtr.Add(meshRows, nodeIndex * 0x130);
+                Marshal.WriteInt32(meshRow, 8, nodeIndex);
+                Marshal.WriteInt32(meshRow, 0x18, runtimeParents[nodeIndex]);
+                Marshal.WriteIntPtr(meshRow, 0x12c, meshData);
+
+                IntPtr descriptor = fixture.Allocate(0x4c);
+                Marshal.WriteInt32(descriptor, 0x04, FloatBits(sourceMaxima[nodeIndex]));
+                constructProviderRow(IntPtr.Add(providerRows, nodeIndex * 0x2c), descriptor);
+            }
+            // Stage counts are the consecutive state-0/1/2 prefix; Control
+            // changes an empty prefix to one for its initial provider row.
+            WriteNode38Slot(nodeData, 0, 0, 0);
+            WriteNode38Slot(nodeData, 0, 2, 2);
+            WriteNode38Slot(nodeData, 1, 1, 1);
+            WriteNode38Slot(nodeData, 1, 2, 2);
+            WriteNode38Slot(nodeData, 2, 0, 0);
+            WriteNode38Slot(nodeData, 2, 1, 1);
+            WriteNode38Slot(nodeData, 2, 2, 2);
+
+            Marshal.WriteIntPtr(owner, 0x20, aniOwner);
+            Marshal.WriteIntPtr(owner, 0x55c, providerRows);
+            Marshal.WriteInt32(owner, 0x560, rowCount);
+            IntPtr providerVtable = Marshal.ReadIntPtr(IntPtr.Add(owner, 4));
+            Expect(providerVtable != IntPtr.Zero &&
+                Marshal.ReadIntPtr(providerVtable, 0x0c) == IntPtr.Add(controlModule, ControlProviderType1GetterRva),
+                "Control constructor installs the original selector-3 provider vtable");
+
+            controlNodeUpdateCount = 0;
+            controlNodeUpdateIndices.Clear();
+            initialize(owner);
+            uint[] expectedFlags = { 0x09, 0x02, 0x04, 0x08 };
+            uint[] expectedStages = { 1, 1, 3, 1 };
+            for (int nodeIndex = 0; nodeIndex < rowCount; nodeIndex++) {
+                IntPtr row = IntPtr.Add(providerRows, nodeIndex * 0x2c);
+                Console.WriteLine("native-control-f940-row=" + nodeIndex + " parent=" + Marshal.ReadInt32(row, 0x04) +
+                    " amount=" + Hex(unchecked((uint)Marshal.ReadInt32(row, 0x08))) +
+                    " processed=" + Hex(unchecked((uint)Marshal.ReadInt32(row, 0x0c))) +
+                    " normalized=" + Hex(unchecked((uint)Marshal.ReadInt32(row, 0x14))) +
+                    " stages=" + Hex(unchecked((uint)Marshal.ReadInt32(row, 0x1c))) +
+                    " flags=" + Hex(unchecked((uint)Marshal.ReadInt32(row, 0x28))));
+                uint expectedAmount = unchecked((uint)FloatBits(sourceMaxima[nodeIndex]));
+                Expect(Marshal.ReadInt32(row, 0x04) == runtimeParents[nodeIndex] &&
+                    unchecked((uint)Marshal.ReadInt32(row, 0x08)) == expectedAmount &&
+                    unchecked((uint)Marshal.ReadInt32(row, 0x0c)) == expectedAmount &&
+                    unchecked((uint)Marshal.ReadInt32(row, 0x14)) == 0x3f800000 &&
+                    unchecked((uint)Marshal.ReadInt32(row, 0x1c)) == expectedStages[nodeIndex] &&
+                    unchecked((uint)Marshal.ReadInt32(row, 0x28)) == expectedFlags[nodeIndex],
+                    "Control f940 initializes row " + nodeIndex + " from AniMesh metadata and selector-3 amount");
+            }
+            Expect(unchecked((uint)Marshal.ReadInt32(owner, 0x590)) == 0x430c0000 &&
+                unchecked((uint)Marshal.ReadInt32(owner, 0x58c)) == 0x430c0000,
+                "Control f940 stores the sum of initial row amounts in both provider aggregates");
+            Expect(controlNodeUpdateCount == rowCount &&
+                String.Join(",", controlNodeUpdateIndices.ConvertAll(index => index.ToString()).ToArray()) == "0,1,2,3" &&
+                controlNodeUpdateSelector == 0x200 && controlNodeUpdateValueBits == 0x3f800000,
+                "Control f940 notifies the host once per row in native append order");
+
+            // Selector 3 is the shared maximum getter. A non-unity owner scale
+            // exercises its native multiplication before the same initializer.
+            Marshal.WriteInt32(owner, 0x660, FloatBits(1.5f));
+            Marshal.WriteInt32(owner, 0x548, FloatBits(0.5f));
+            controlNodeUpdateCount = 0;
+            controlNodeUpdateIndices.Clear();
+            initialize(owner);
+            uint[] scaledAmounts = { 0x41b40000, 0x42340000, 0x42160000, 0x00000000 };
+            for (int nodeIndex = 0; nodeIndex < rowCount; nodeIndex++) {
+                IntPtr row = IntPtr.Add(providerRows, nodeIndex * 0x2c);
+                Expect(unchecked((uint)Marshal.ReadInt32(row, 0x08)) == scaledAmounts[nodeIndex] &&
+                    unchecked((uint)Marshal.ReadInt32(row, 0x0c)) == scaledAmounts[nodeIndex],
+                    "Control f940 selector-3 scaled amount row " + nodeIndex);
+            }
+            Expect(unchecked((uint)Marshal.ReadInt32(owner, 0x590)) == 0x42d20000 &&
+                unchecked((uint)Marshal.ReadInt32(owner, 0x58c)) == 0x42d20000,
+                "Control f940 aggregates its non-unity selector-3 results");
+            Expect(controlNodeUpdateCount == rowCount &&
+                String.Join(",", controlNodeUpdateIndices.ConvertAll(index => index.ToString()).ToArray()) == "0,1,2,3",
+                "Control f940 retains callback order for non-unity amounts");
+
+            Console.WriteLine("native-control-provider-initial-state: controlHash=" + ExpectedControlSha256 +
+                " rva=0xf940 selector3=0xdc40 rows=4 unity=[30,60,50,0] nonunity=[22.5,45,37.5,0]" +
+                " current=processed=sourceMax*owner660*owner548 ratio=1 parents=[-1,22,7,11]");
+            GC.KeepAlive(constructOwner);
+            GC.KeepAlive(constructProviderRow);
+            GC.KeepAlive(initialize);
+        }
     }
 
     private static void WriteNode38Slot(IntPtr nodeData, int nodeIndex, int state, ushort slotIndex) {
