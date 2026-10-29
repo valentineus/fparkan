@@ -517,6 +517,9 @@ pub struct MissionControlOwnerProfile {
         MissionControlOwnerProfileLoadProjection,
         MissionControlOwnerProfileLoadProjectionUnavailableReason,
     >,
+    /// FCA0 status after FAC0, recorded separately from the FAC0 result.
+    /// Native class 9 returns `Ok(())` without changing the prepared copy.
+    pub fca0_projection: Result<(), MissionControlOwnerProfileFca0UnavailableReason>,
 }
 
 /// Initial Control FAC0 load-time values for one owner profile.
@@ -545,6 +548,20 @@ pub enum MissionControlOwnerProfileLoadProjectionUnavailableReason {
     ProviderKeyOutOfRange { key: u32, row_count: usize },
     /// An INTO attempted to change a profile tag before the cache was created.
     MissingProfileCacheOnInto,
+}
+
+/// Why the initial Control FCA0 profile projection is unavailable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MissionControlOwnerProfileFca0UnavailableReason {
+    /// Rust could not project the native Control class for this owner.
+    MissingNativeControlClass,
+    /// A non-class-9 FCA0 route requires a completed FAC0 result; class 9
+    /// returns before this result is inspected.
+    Fac0Unavailable(MissionControlOwnerProfileLoadProjectionUnavailableReason),
+    /// The original current-tag E00 query failed with a typed reason.
+    QueryUnavailable(Arc<ControlResourceAccessError>),
+    /// An input or intermediate float is outside the supported domain.
+    UnsupportedFloat { field: &'static str },
 }
 
 struct ControlDeviceProjection {
@@ -1592,12 +1609,13 @@ fn load_mission_with_options(
                     prototype_span,
                     &resolved_prototypes,
                 );
-                let projection = build_control_device_projection(
+                let projection = build_control_device_projection_with_class(
                     object_index,
                     draft,
                     &mission_assets,
                     prototype_span,
                     &resolved_prototypes,
+                    native_control_class,
                 );
                 match projection {
                     Ok(projection) => MissionControlDeviceTableState {
@@ -2068,10 +2086,13 @@ pub fn query_loaded_mission_control_resource(
 
 /// Queries one loaded Control device through its original factory getter.
 ///
-/// Selector `0xe00` is currently modeled for current descriptor tag 26 with
-/// factory tag 26. The query reads the current provider, coefficient, and
-/// multiplier in the CPU projection. Explicit Control update calls can change
-/// those values; the mission clock does not advance them automatically.
+/// Selector `0xe00` is modeled for current descriptor tags 5 and 26 with
+/// factory tags 5 and 26. Both common factory readers use the device key to
+/// read the current provider value and multiply it by coefficient 0. Only
+/// current tag 26 also multiplies by `M`; current tag 5 ignores `M` and
+/// descriptor word 8 for this selector. Explicit Control update calls can
+/// change current provider or multiplier values; the mission clock does not
+/// advance them automatically.
 ///
 /// # Errors
 /// Returns an error for an invalid handle, unavailable mission/table/provider,
@@ -2764,7 +2785,14 @@ fn control_node_provider_row(
     table: &MissionControlDeviceTableState,
     key: u32,
 ) -> Result<&MissionControlNodeProviderRow, ControlResourceAccessError> {
-    let rows = match &table.node_provider_status {
+    control_node_provider_row_from_status(&table.node_provider_status, key)
+}
+
+fn control_node_provider_row_from_status(
+    status: &MissionControlNodeProviderTableStatus,
+    key: u32,
+) -> Result<&MissionControlNodeProviderRow, ControlResourceAccessError> {
+    let rows = match status {
         MissionControlNodeProviderTableStatus::Available(rows) => rows,
         MissionControlNodeProviderTableStatus::Unavailable(reason) => {
             return Err(ControlResourceAccessError::NodeProviderTableUnavailable(
@@ -3187,7 +3215,14 @@ fn control_device_provider_value(
     table: &MissionControlDeviceTableState,
     device: &EffectiveControlDevice,
 ) -> Result<f32, ControlResourceAccessError> {
-    let provider = control_node_provider_row(table, device.key)?;
+    control_device_provider_value_from_status(&table.node_provider_status, device)
+}
+
+fn control_device_provider_value_from_status(
+    status: &MissionControlNodeProviderTableStatus,
+    device: &EffectiveControlDevice,
+) -> Result<f32, ControlResourceAccessError> {
+    let provider = control_node_provider_row_from_status(status, device.key)?;
     checked_control_float(
         device.factory_tag,
         "node provider value",
@@ -4154,62 +4189,47 @@ fn query_control_device_table_selector(
                 device_index,
                 device_count: devices.len(),
             })?;
+    query_control_device_selector(device, &table.node_provider_status)
+}
+
+fn query_control_device_selector(
+    device: &EffectiveControlDevice,
+    provider_status: &MissionControlNodeProviderTableStatus,
+) -> Result<Option<f32>, ControlResourceAccessError> {
     match device.descriptor.tag {
-        26 => {}
-        5 | 10 | 21 => {
+        5 | 26 => {}
+        10 | 21 => {
             return Err(ControlResourceAccessError::UnsupportedCurrentTag {
                 tag: device.descriptor.tag,
             });
         }
         _ => return Ok(None),
     }
-    if device.factory_tag != 26 {
+    if !matches!(device.factory_tag, 5 | 26) {
         return Err(ControlResourceAccessError::UnsupportedFactoryTag {
             factory_tag: device.factory_tag,
         });
     }
-
-    let providers = match &table.node_provider_status {
-        MissionControlNodeProviderTableStatus::Available(providers) => providers,
-        MissionControlNodeProviderTableStatus::Unavailable(reason) => {
-            return Err(ControlResourceAccessError::NodeProviderTableUnavailable(
-                reason.clone(),
-            ));
-        }
-    };
-    let key = usize::try_from(device.key).map_err(|_| {
-        ControlResourceAccessError::NodeProviderKeyOutOfRange {
-            key: device.key,
-            row_count: providers.len(),
-        }
-    })?;
-    let provider =
-        providers
-            .get(key)
-            .ok_or(ControlResourceAccessError::NodeProviderKeyOutOfRange {
-                key: device.key,
-                row_count: providers.len(),
-            })?;
-    let provider_value = checked_control_float(
-        device.factory_tag,
-        "node provider value",
-        f32::from_bits(provider.current_type1_value_bits),
-    )?;
+    let provider_value = control_device_provider_value_from_status(provider_status, device)?;
     let coefficient = control_device_coefficient(device)?;
-    let multiplier = control_device_float(device, device.multiplier_bits, "multiplier")?;
     let provider_weighted = checked_control_product(
         device.factory_tag,
         "provider times coefficient",
         provider_value,
         coefficient,
     )?;
-    checked_control_product(
-        device.factory_tag,
-        "then multiplier",
-        provider_weighted,
-        multiplier,
-    )
-    .map(Some)
+    if device.descriptor.tag == 26 {
+        let multiplier = control_device_float(device, device.multiplier_bits, "multiplier")?;
+        checked_control_product(
+            device.factory_tag,
+            "then multiplier",
+            provider_weighted,
+            multiplier,
+        )
+        .map(Some)
+    } else {
+        Ok(Some(provider_weighted))
+    }
 }
 
 fn set_control_device_table_selector(
@@ -5029,6 +5049,155 @@ fn project_control_load_profile(
     })
 }
 
+fn control_fca0_float(
+    value: f32,
+    field: &'static str,
+) -> Result<f32, MissionControlOwnerProfileFca0UnavailableReason> {
+    checked_control_float(0, field, value)
+        .map_err(|_| MissionControlOwnerProfileFca0UnavailableReason::UnsupportedFloat { field })
+}
+
+fn control_fca0_product(
+    lhs: f32,
+    rhs: f32,
+    field: &'static str,
+) -> Result<f32, MissionControlOwnerProfileFca0UnavailableReason> {
+    checked_control_product(0, field, lhs, rhs)
+        .map_err(|_| MissionControlOwnerProfileFca0UnavailableReason::UnsupportedFloat { field })
+}
+
+fn control_fca0_sum(
+    lhs: f32,
+    rhs: f32,
+    field: &'static str,
+) -> Result<f32, MissionControlOwnerProfileFca0UnavailableReason> {
+    checked_control_sum(0, field, lhs, rhs)
+        .map_err(|_| MissionControlOwnerProfileFca0UnavailableReason::UnsupportedFloat { field })
+}
+
+fn control_fca0_ratio(
+    numerator: f32,
+    denominator: f32,
+    field: &'static str,
+) -> Result<f32, MissionControlOwnerProfileFca0UnavailableReason> {
+    checked_control_ratio(field, numerator, denominator)
+        .map_err(|_| MissionControlOwnerProfileFca0UnavailableReason::UnsupportedFloat { field })
+}
+
+fn control_fca0_clamp_to_profile_cap(
+    value: f32,
+    cap: f32,
+    field: &'static str,
+) -> Result<f32, MissionControlOwnerProfileFca0UnavailableReason> {
+    let value = control_fca0_float(value, field)?;
+    let cap = control_fca0_float(cap, field)?;
+    let magnitude = if value < 0.0 { -value } else { value };
+    Ok(if magnitude > cap {
+        if value < 0.0 {
+            -cap
+        } else {
+            cap
+        }
+    } else {
+        value
+    })
+}
+
+fn project_control_owner_profile_fca0(
+    native_class: Option<MissionControlClassProjection>,
+    original_words: &[u32; 27],
+    current_words: &[u32; 27],
+    fac0_projection: &Result<
+        MissionControlOwnerProfileLoadProjection,
+        MissionControlOwnerProfileLoadProjectionUnavailableReason,
+    >,
+    devices: &[EffectiveControlDevice],
+    provider_status: &MissionControlNodeProviderTableStatus,
+) -> Result<[u32; 27], MissionControlOwnerProfileFca0UnavailableReason> {
+    use MissionControlOwnerProfileFca0UnavailableReason as Unavailable;
+
+    if native_class.is_some_and(|class| class.class_id == 9) {
+        return Ok(*current_words);
+    }
+    if native_class.is_none() {
+        return Err(Unavailable::MissingNativeControlClass);
+    }
+    if let Err(reason) = fac0_projection {
+        return Err(Unavailable::Fac0Unavailable(reason.clone()));
+    }
+
+    let mut e00_sum = 0.0_f32;
+    for device_index in (0..devices.len()).rev() {
+        if devices[device_index].descriptor.tag != 5 {
+            continue;
+        }
+        if let Some(value) = query_control_device_selector(&devices[device_index], provider_status)
+            .map_err(|error| Unavailable::QueryUnavailable(Arc::new(error)))?
+        {
+            e00_sum = control_fca0_sum(e00_sum, value, "FCA0 reverse E00 sum")?;
+        }
+    }
+
+    // The canonical owner constructor initializes +0x1a8, +0x354, and +0x358
+    // to 1.0; the traced event-4 loader does not overwrite these fields.
+    let owner_scalar = 1.0_f32;
+    let owner_mean = control_fca0_sum(1.0, 1.0, "FCA0 owner scalar mean")?;
+    let owner_mean = control_fca0_product(owner_mean, 0.5, "FCA0 owner scalar mean")?;
+    let weight = control_fca0_product(owner_mean, e00_sum, "FCA0 weighted E00 sum")?;
+    let ratio = control_fca0_ratio(
+        control_fca0_float(f32::from_bits(current_words[26]), "current profile word 26")?,
+        control_fca0_float(
+            f32::from_bits(original_words[26]),
+            "original profile word 26",
+        )?,
+        "FCA0 profile word 26 ratio",
+    )?;
+    let factor_a = control_fca0_product(
+        control_fca0_sum(ratio, 1.0, "FCA0 factor A")?,
+        0.5,
+        "FCA0 factor A",
+    )?;
+    let factor_b = control_fca0_sum(
+        control_fca0_product(ratio, 0.75, "FCA0 factor B")?,
+        0.25,
+        "FCA0 factor B",
+    )?;
+
+    let mut current_words = *current_words;
+    for index in 6..9 {
+        let original = control_fca0_float(
+            f32::from_bits(original_words[index]),
+            "original profile words 6..8",
+        )?;
+        let owner_scaled =
+            control_fca0_product(owner_scalar, original, "FCA0 first profile triple")?;
+        let weighted = control_fca0_product(owner_scaled, weight, "FCA0 first profile triple")?;
+        let factored = control_fca0_product(weighted, factor_a, "FCA0 first profile triple")?;
+        current_words[index] =
+            control_fca0_clamp_to_profile_cap(factored, original, "FCA0 first profile triple")?
+                .to_bits();
+    }
+    for index in 9..12 {
+        let original = control_fca0_float(
+            f32::from_bits(original_words[index]),
+            "original profile words 9..11",
+        )?;
+        let weighted = control_fca0_product(weight, original, "FCA0 second profile triple")?;
+        let factored = control_fca0_product(weighted, factor_b, "FCA0 second profile triple")?;
+        current_words[index] =
+            control_fca0_sum(factored, factored, "FCA0 doubled second profile triple")?.to_bits();
+    }
+    for index in 0..3 {
+        let original = control_fca0_float(
+            f32::from_bits(original_words[index]),
+            "original profile words 0..2",
+        )?;
+        current_words[index] =
+            control_fca0_sum(original, original, "FCA0 doubled profile words")?.to_bits();
+    }
+    Ok(current_words)
+}
+
 fn behavior_clan_for_selector(
     selector: u32,
     clan_count: usize,
@@ -5476,12 +5645,33 @@ fn build_control_device_table(
         .map(|projection| projection.devices)
 }
 
+#[cfg(test)]
 fn build_control_device_projection(
     object_index: usize,
     draft: &MissionObjectDraft,
     assets: &MissionAssets,
     prototype_span: Option<&std::ops::Range<usize>>,
     prototypes: &[fparkan_prototype::EffectivePrototype],
+) -> Result<ControlDeviceProjection, MissionControlDeviceTableUnavailableReason> {
+    let native_class =
+        native_control_class_for_root(draft.unit_dat_header_flags, prototype_span, prototypes);
+    build_control_device_projection_with_class(
+        object_index,
+        draft,
+        assets,
+        prototype_span,
+        prototypes,
+        native_class,
+    )
+}
+
+fn build_control_device_projection_with_class(
+    object_index: usize,
+    draft: &MissionObjectDraft,
+    assets: &MissionAssets,
+    prototype_span: Option<&std::ops::Range<usize>>,
+    prototypes: &[fparkan_prototype::EffectivePrototype],
+    native_control_class: Option<MissionControlClassProjection>,
 ) -> Result<ControlDeviceProjection, MissionControlDeviceTableUnavailableReason> {
     use MissionControlDeviceTableUnavailableReason as Unavailable;
 
@@ -5892,6 +6082,20 @@ fn build_control_device_projection(
                     ),
                 ),
             };
+            let fca0_projection = match project_control_owner_profile_fca0(
+                native_control_class,
+                &original_words,
+                &current_words,
+                &load_projection,
+                &devices,
+                &node_provider_status,
+            ) {
+                Ok(projected_words) => {
+                    current_words = projected_words;
+                    Ok(())
+                }
+                Err(reason) => Err(reason),
+            };
             MissionControlOwnerProfile {
                 source,
                 unit_component_index,
@@ -5899,6 +6103,7 @@ fn build_control_device_projection(
                 original_words,
                 current_words,
                 load_projection,
+                fca0_projection,
             }
         },
     );
@@ -7302,8 +7507,10 @@ mod tests {
         );
         assert_eq!(device.tag26_extra_rate_bits, Some(0));
         device.tag26_extra_rate_bits = Some(0.3_f32.to_bits());
+        device.multiplier_bits = Some(17.0_f32.to_bits());
 
-        let replacement = synthetic_control_record(19, 99, 0x30, None);
+        let mut replacement = synthetic_control_record(5, 99, 3.0_f32.to_bits(), None);
+        replacement.fixed_words[8] = 13.0_f32.to_bits();
         let control = synthetic_component_control(
             1,
             vec![replacement.clone()],
@@ -7312,8 +7519,28 @@ mod tests {
         apply_effective_control_override(&mut device, &replacement, 1, 0, &control);
 
         assert_eq!(device.factory_tag, 26);
-        assert_eq!(device.descriptor.tag, 19);
+        assert_eq!(device.key, 2, "INTO preserves the original provider key");
+        assert_eq!(device.descriptor.tag, 5);
+        assert_eq!(device.coefficient_bits.unwrap()[0], 3.0_f32.to_bits());
+        assert_eq!(device.multiplier_bits, Some(17.0_f32.to_bits()));
+        assert_eq!(device.descriptor.fixed_words[8], 13.0_f32.to_bits());
         assert_eq!(device.tag26_extra_rate_bits, Some(0.3_f32.to_bits()));
+
+        let table = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(vec![device]),
+            MissionControlNodeProviderTableStatus::Available(vec![
+                synthetic_node_provider_row(0, 0, 1.0_f32.to_bits()),
+                synthetic_node_provider_row(0, 1, 2.0_f32.to_bits()),
+                synthetic_node_provider_row(0, 2, 7.0_f32.to_bits()),
+            ]),
+        );
+        assert_eq!(
+            query_control_device_table_selector(&table, 0, 0xe00)
+                .expect("factory-26/current-tag-5 E00 query")
+                .map(f32::to_bits),
+            Some(21.0_f32.to_bits()),
+            "tag-5 E00 uses current coefficient and provider value, without multiplier M or descriptor word 8"
+        );
     }
 
     #[test]
@@ -9719,6 +9946,7 @@ mod tests {
         root.node_data.as_mut().unwrap().rows[0].mobility_per_volume = 2.0;
         let (mut draft, mut assets, prototypes) =
             synthetic_control_fixture(&[None], &[1], &[0], &[0], &[1], vec![Some(root)]);
+        draft.unit_dat_header_flags = Some(UNIT_DAT_CONTROL_CLASS_HIGH_BIT);
         attach_synthetic_model(&mut assets, 0, &[synthetic_node38(0, 0, [true; 3])]);
         assets.models[0].validated.slots[0].opaque =
             [7.0_f32.to_bits(), 11.0_f32.to_bits(), 0, 0, 0];
@@ -9747,10 +9975,272 @@ mod tests {
         assert_eq!(load.row_20_bits, [41.25_f32.to_bits()]);
         assert_eq!(profile.original_words[26], 1000.0_f32.to_bits());
         assert_eq!(profile.current_words[26], 980.75_f32.to_bits());
+        assert_eq!(profile.fca0_projection, Ok(()));
         assert_eq!(
             profile.current_words[..26],
             profile.original_words[..26],
-            "FAC0 changes only mutable profile word 26"
+            "FAC0 changes only word 26 in this tag-19-only fixture; FCA0 has no E00 contribution"
+        );
+    }
+
+    #[test]
+    fn full_control_fca0_late_float_failure_preserves_fac0_copy() {
+        let native_class = MissionControlClassProjection {
+            class_id: 3,
+            source: MissionControlClassSource::UnitDatHighBit { header_flags: 0 },
+        };
+
+        for (failure, coefficient, profile_word2, expected_error) in [
+            (
+                "nonfinite coefficient during E00 query",
+                f32::INFINITY,
+                0.0,
+                Err(
+                    MissionControlOwnerProfileFca0UnavailableReason::QueryUnavailable(Arc::new(
+                        ControlResourceAccessError::NonFiniteValue {
+                            factory_tag: 5,
+                            field: "coefficient",
+                        },
+                    )),
+                ),
+            ),
+            (
+                "overflow in final profile-word doubling",
+                1.0,
+                f32::MAX,
+                Err(
+                    MissionControlOwnerProfileFca0UnavailableReason::UnsupportedFloat {
+                        field: "FCA0 doubled profile words",
+                    },
+                ),
+            ),
+        ] {
+            let mut cache_record = synthetic_control_record(27, 0, 2.0_f32.to_bits(), None);
+            cache_record.fixed_words[7] = 0.0_f32.to_bits();
+            let mut device_record = synthetic_control_record(5, 0, coefficient.to_bits(), None);
+            device_record.fixed_words[7] = 5.25_f32.to_bits();
+            let mut root =
+                control_with_synthetic_node_data(0, vec![cache_record, device_record], 1);
+            root.native_profile_words[0] = 1.0_f32.to_bits();
+            root.native_profile_words[2] = profile_word2.to_bits();
+            root.native_profile_words[26] = 1000.0_f32.to_bits();
+            root.node_data.as_mut().unwrap().rows[0].mobility_per_volume = 2.0;
+            let (mut draft, mut assets, prototypes) =
+                synthetic_control_fixture(&[None], &[1], &[0], &[0], &[1], vec![Some(root)]);
+            attach_synthetic_model(&mut assets, 0, &[synthetic_node38(0, 0, [true; 3])]);
+            assets.models[0].validated.slots[0].opaque =
+                [7.0_f32.to_bits(), 11.0_f32.to_bits(), 0, 0, 0];
+            draft.scale = [2.0, 3.0, 5.0];
+
+            let projection = build_control_device_projection_with_class(
+                0,
+                &draft,
+                &assets,
+                Some(&(0..prototypes.len())),
+                &prototypes,
+                Some(native_class),
+            )
+            .expect("base device and FAC0 projections");
+            let profile = projection
+                .owner_profile
+                .expect("native component-zero profile");
+            assert!(profile.load_projection.is_ok());
+            assert_eq!(profile.current_words[26], 980.75_f32.to_bits());
+            assert_eq!(profile.fca0_projection, expected_error, "{failure}");
+            assert_eq!(
+                profile.current_words[..26],
+                profile.original_words[..26],
+                "{failure} must not publish any partial FCA0 words"
+            );
+        }
+    }
+
+    #[test]
+    fn fca0_load_profile_matches_native_combined_vector() {
+        let mut original_words = [0_u32; 27];
+        original_words[0] = 1.25_f32.to_bits();
+        original_words[1] = (-2.5_f32).to_bits();
+        original_words[2] = 3.0_f32.to_bits();
+        original_words[6] = 1.0_f32.to_bits();
+        original_words[7] = (-2.0_f32).to_bits();
+        original_words[8] = 10.0_f32.to_bits();
+        original_words[9] = 2.0_f32.to_bits();
+        original_words[10] = (-3.0_f32).to_bits();
+        original_words[11] = 0.5_f32.to_bits();
+        original_words[26] = 4.0_f32.to_bits();
+        for index in [3, 4, 5].into_iter().chain(12..26) {
+            original_words[index] = f32::NAN.to_bits();
+        }
+        let mut current_words = original_words;
+        current_words[26] = 6.0_f32.to_bits();
+        let fac0_projection = Ok(MissionControlOwnerProfileLoadProjection {
+            aggregate_530_bits: 0,
+            aggregate_534_bits: 0,
+            aggregate_538_bits: 0,
+            row_20_bits: vec![0; 3],
+        });
+        let mut device = synthetic_effective_control_device(
+            5,
+            5,
+            2.0_f32.to_bits(),
+            Some(17.0_f32.to_bits()),
+            None,
+        );
+        device.key = 2;
+        device.descriptor.fixed_words[8] = 7.0_f32.to_bits();
+        let mut second_device = synthetic_effective_control_device(
+            5,
+            5,
+            0.5_f32.to_bits(),
+            Some(17.0_f32.to_bits()),
+            None,
+        );
+        second_device.key = 0;
+        second_device.descriptor.fixed_words[8] = 7.0_f32.to_bits();
+        let devices = vec![device, second_device];
+        let provider_status = MissionControlNodeProviderTableStatus::Available(vec![
+            synthetic_node_provider_row(0, 0, (-1.5_f32).to_bits()),
+            synthetic_node_provider_row(0, 1, 123.0_f32.to_bits()),
+            synthetic_node_provider_row(0, 2, 3.0_f32.to_bits()),
+        ]);
+        let mut expected = current_words;
+        expected[0] = 2.5_f32.to_bits();
+        expected[1] = (-5.0_f32).to_bits();
+        expected[2] = 6.0_f32.to_bits();
+        expected[6] = 1.0_f32.to_bits();
+        // The native signed-cap comparison turns this negative result into +2.
+        expected[7] = 2.0_f32.to_bits();
+        expected[8] = 10.0_f32.to_bits();
+        expected[9] = 28.875_f32.to_bits();
+        expected[10] = (-43.3125_f32).to_bits();
+        expected[11] = 7.21875_f32.to_bits();
+        for class_id in [0, 3, 4] {
+            assert_eq!(
+                project_control_owner_profile_fca0(
+                    Some(MissionControlClassProjection {
+                        class_id,
+                        source: MissionControlClassSource::UnitDatHighBit { header_flags: 0 },
+                    }),
+                    &original_words,
+                    &current_words,
+                    &fac0_projection,
+                    &devices,
+                    &provider_status,
+                ),
+                Ok(expected),
+                "native class {class_id} follows FCA0 unless it is class 9"
+            );
+        }
+    }
+
+    #[test]
+    fn fca0_load_profile_uses_reverse_device_order_for_e00_sum() {
+        let mut original_words = [0_u32; 27];
+        original_words[6] = 2.0_f32.to_bits();
+        original_words[26] = 1.0_f32.to_bits();
+        let current_words = original_words;
+        let fac0_projection = Ok(MissionControlOwnerProfileLoadProjection {
+            aggregate_530_bits: 0,
+            aggregate_534_bits: 0,
+            aggregate_538_bits: 0,
+            row_20_bits: vec![0; 3],
+        });
+        let mut first = synthetic_effective_control_device(
+            5,
+            5,
+            1.0_f32.to_bits(),
+            Some(1.0_f32.to_bits()),
+            None,
+        );
+        first.key = 2;
+        let mut second = first.clone();
+        second.key = 0;
+        let mut third = first.clone();
+        third.key = 1;
+        let devices = vec![first, second, third];
+        let provider_status = MissionControlNodeProviderTableStatus::Available(vec![
+            synthetic_node_provider_row(0, 0, 1.0_f32.to_bits()),
+            synthetic_node_provider_row(0, 1, (-16_777_216.0_f32).to_bits()),
+            synthetic_node_provider_row(0, 2, 16_777_216.0_f32.to_bits()),
+        ]);
+        let class = MissionControlClassProjection {
+            class_id: 3,
+            source: MissionControlClassSource::UnitDatHighBit { header_flags: 0 },
+        };
+
+        assert_eq!(
+            project_control_owner_profile_fca0(
+                Some(class),
+                &original_words,
+                &current_words,
+                &fac0_projection,
+                &devices,
+                &provider_status,
+            ),
+            Ok(current_words),
+            "reverse E00 order sums to one, so profile word 6 remains capped at two"
+        );
+    }
+
+    #[test]
+    fn fca0_class9_returns_before_profile_or_device_inputs() {
+        let original_words = [f32::NAN.to_bits(); 27];
+        let current_words = [0x7f80_0000; 27];
+        let fac0_projection = Err(
+            MissionControlOwnerProfileLoadProjectionUnavailableReason::UnknownModelMapping {
+                global_node_ordinal: None,
+            },
+        );
+        let provider_status = MissionControlNodeProviderTableStatus::Unavailable(
+            MissionControlNodeProviderTableUnavailableReason::MissingNodeData {
+                unit_component_index: 0,
+                source: None,
+            },
+        );
+        let class9 = MissionControlClassProjection {
+            class_id: 9,
+            source: MissionControlClassSource::RootPrototypeFourCc { source_type: 0 },
+        };
+
+        assert_eq!(
+            project_control_owner_profile_fca0(
+                Some(class9),
+                &original_words,
+                &current_words,
+                &fac0_projection,
+                &[],
+                &provider_status,
+            ),
+            Ok(current_words)
+        );
+        assert_eq!(
+            project_control_owner_profile_fca0(
+                None,
+                &original_words,
+                &current_words,
+                &fac0_projection,
+                &[],
+                &provider_status,
+            ),
+            Err(MissionControlOwnerProfileFca0UnavailableReason::MissingNativeControlClass)
+        );
+        assert_eq!(
+            project_control_owner_profile_fca0(
+                Some(MissionControlClassProjection {
+                    class_id: 4,
+                    source: class9.source,
+                }),
+                &original_words,
+                &current_words,
+                &fac0_projection,
+                &[],
+                &provider_status,
+            ),
+            Err(MissionControlOwnerProfileFca0UnavailableReason::Fac0Unavailable(
+                MissionControlOwnerProfileLoadProjectionUnavailableReason::UnknownModelMapping {
+                    global_node_ordinal: None,
+                }
+            ))
         );
     }
 
@@ -10515,6 +11005,72 @@ mod tests {
     }
 
     #[test]
+    fn factory5_e00_uses_provider_times_coefficient_only() {
+        let mut device = synthetic_effective_control_device(
+            5,
+            5,
+            3.0_f32.to_bits(),
+            Some(17.0_f32.to_bits()),
+            None,
+        );
+        device.descriptor.fixed_words[8] = 13.0_f32.to_bits();
+        let table = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(vec![device]),
+            MissionControlNodeProviderTableStatus::Available(vec![
+                synthetic_node_provider_row(0, 0, 1.0_f32.to_bits()),
+                synthetic_node_provider_row(0, 1, 2.0_f32.to_bits()),
+                synthetic_node_provider_row(0, 2, 7.0_f32.to_bits()),
+            ]),
+        );
+
+        assert_eq!(
+            query_control_device_table_selector(&table, 0, 0xe00)
+                .expect("factory-5 E00 query")
+                .map(f32::to_bits),
+            Some(21.0_f32.to_bits()),
+            "E00 uses the provider row and coefficient, without the multiplier or descriptor word 8"
+        );
+    }
+
+    #[test]
+    fn e00_common_reader_covers_current_tags_and_both_factories() {
+        let devices = [(5, 5), (5, 26), (26, 5), (26, 26)]
+            .into_iter()
+            .map(|(current_tag, factory_tag)| {
+                let mut device = synthetic_effective_control_device(
+                    factory_tag,
+                    current_tag,
+                    3.0_f32.to_bits(),
+                    Some(17.0_f32.to_bits()),
+                    None,
+                );
+                device.descriptor.fixed_words[8] = 13.0_f32.to_bits();
+                device
+            })
+            .collect();
+        let table = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(devices),
+            MissionControlNodeProviderTableStatus::Available(vec![
+                synthetic_node_provider_row(0, 0, 1.0_f32.to_bits()),
+                synthetic_node_provider_row(0, 1, 2.0_f32.to_bits()),
+                synthetic_node_provider_row(0, 2, 7.0_f32.to_bits()),
+            ]),
+        );
+
+        for (device_index, (current_tag, factory_tag)) in
+            [(5, 5), (5, 26), (26, 5), (26, 26)].into_iter().enumerate()
+        {
+            let expected = if current_tag == 5 { 21.0 } else { 357.0 };
+            assert_eq!(
+                query_control_device_table_selector(&table, device_index, 0xe00)
+                    .expect("shared E00 factory getter"),
+                Some(expected),
+                "current tag {current_tag}, factory tag {factory_tag}"
+            );
+        }
+    }
+
+    #[test]
     fn native_mesh_metadata_maps_control_flags_and_parent_words() {
         assert_eq!(control_flags_from_node38_header(0x0701), 0x0f);
         assert_eq!(control_flags_from_node38_header(0x0781), 0x07);
@@ -10670,7 +11226,7 @@ mod tests {
             query_control_device_table_selector(&table, 1, 0xe00),
             Ok(None)
         );
-        for tag in [5, 10, 21] {
+        for tag in [10, 21] {
             let mut unsupported = table.clone();
             let MissionControlDeviceTableStatus::Available(entries) = &mut unsupported.status
             else {
@@ -10682,6 +11238,16 @@ mod tests {
                 Err(ControlResourceAccessError::UnsupportedCurrentTag { tag })
             );
         }
+        let mut current_tag5_factory9 = table.clone();
+        let MissionControlDeviceTableStatus::Available(entries) = &mut current_tag5_factory9.status
+        else {
+            unreachable!();
+        };
+        entries[3].descriptor.tag = 5;
+        assert_eq!(
+            query_control_device_table_selector(&current_tag5_factory9, 3, 0xe00),
+            Err(ControlResourceAccessError::UnsupportedFactoryTag { factory_tag: 9 })
+        );
         assert_eq!(
             query_control_device_table_selector(&table, 3, 0xe00),
             Err(ControlResourceAccessError::UnsupportedFactoryTag { factory_tag: 9 })
@@ -10982,6 +11548,19 @@ mod tests {
             .owner_profile
             .as_ref()
             .expect("loaded root owner profile");
+        let fca0_target_indices = [0, 1, 2, 6, 7, 8, 9, 10, 11];
+        let fca0_target_words = fca0_target_indices.map(|index| owner_profile.current_words[index]);
+        println!(
+            "licensed mine FCA0: class={:?} projection={:?} indices={fca0_target_indices:?} targets={:08x?}",
+            mine_control_before[0].native_control_class,
+            owner_profile.fca0_projection,
+            fca0_target_words,
+        );
+        assert_eq!(owner_profile.fca0_projection, Ok(()));
+        assert_eq!(
+            fca0_target_words,
+            [0x4000_0000, 0x4000_0000, 0x4000_0000, 0, 0, 0, 0, 0, 0,]
+        );
         assert_eq!(owner_profile.unit_component_index, 0);
         assert_eq!(owner_profile.native_component_id, 0);
         assert_eq!(owner_profile.source, root_control.source);
@@ -11035,10 +11614,14 @@ mod tests {
         assert_eq!(mine_fac0.row_20_bits.len(), 25);
         assert_eq!(owner_profile.original_words[26], 0x7f7f_ffff);
         assert_eq!(owner_profile.current_words[26], 0x7f7f_ffff);
-        assert_eq!(
-            &owner_profile.current_words[..26],
-            &root_control.native_profile_words[..26]
-        );
+        for index in 0..26 {
+            if !fca0_target_indices.contains(&index) {
+                assert_eq!(
+                    owner_profile.current_words[index], owner_profile.original_words[index],
+                    "FCA0 leaves profile word {index} unchanged"
+                );
+            }
+        }
         assert_ne!(
             root_control.native_profile_words, child_control.native_profile_words,
             "the licensed child CTLD has its own profile words"

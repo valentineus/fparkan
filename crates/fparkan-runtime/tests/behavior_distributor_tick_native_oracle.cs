@@ -15,6 +15,7 @@ internal static class BehaviorDistributorTickOracle {
     private const uint PageExecuteReadWrite = 0x40;
     private const uint MemRelease = 0x00008000;
     private const uint PageReadWrite = 0x04;
+    private const uint PageNoAccess = 0x01;
     private const string ExpectedBehaviorSha256 = "ddfbdbde07832358fe6e35e01c8dba9b58e7313789498b6049ed51d4ed9baf99";
     private const string ExpectedControlSha256 = "bcb86318089028548a178b03a21accdce15df0cc85ddd91674cf3c2f55012c6e";
     private const string ExpectedArealMapSha256 = "a25f9254ebb339d70e2e07c8121950191e9584ca0858d8e9c2e2b6c671edf6ea";
@@ -82,10 +83,12 @@ internal static class BehaviorDistributorTickOracle {
     private const int ControlResourceTag19VtableRva = 0x3c608;
     private const int ControlResourceTag19StringPairNoOpRva = 0x0bcd0;
     private const int ControlProfileFac0Rva = 0x0fac0;
+    private const int ControlProfileFca0Rva = 0x0fca0;
     private const int ControlProfileOwnerConstructorRva = 0x31490;
     private const int ControlProfileDeviceVtableRva = 0x3d1b4;
     private const int ControlProfileDeviceCountRva = 0x08830;
     private const int ControlProfileDeviceQueryRva = 0x2bb40;
+    private const int ControlResourceTag5VtableRva = 0x3cdf8;
     private const int AniMeshComponentFirstRva = 0x05780;
     private const int AniMeshComponentCountRva = 0x057c0;
     private const int BehaviorVarTableVtableRva = 0x591b0;
@@ -150,6 +153,8 @@ internal static class BehaviorDistributorTickOracle {
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate IntPtr NativeControlResourceComponentOverride(IntPtr self, int deviceIndex, IntPtr typedRecord);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int NativeControlAggregateQuery(IntPtr self, uint selector, IntPtr result);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int NativeControlAggregateSet(IntPtr self, uint selector, IntPtr value);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate uint NativeControlOwnerDeviceQuery(IntPtr ownerInterface, uint deviceIndex, uint selector, IntPtr result);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlDeviceBind(IntPtr device, IntPtr owner, IntPtr provider, IntPtr model);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeAniMeshNodeConstructor(IntPtr self, IntPtr model, IntPtr source, uint component, IntPtr meshData);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlProviderAmountUpdate(IntPtr self, int nodeIndex, float delta, uint animationFlag);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlProviderAmountDistribute(IntPtr self, float delta, uint mode, uint flags);
@@ -700,7 +705,7 @@ internal static class BehaviorDistributorTickOracle {
             Marshal.WriteIntPtr(import, Marshal.GetFunctionPointerForDelegate(AreaMapGetterCallback));
             Marshal.WriteIntPtr(queueImport, Marshal.GetFunctionPointerForDelegate(QueueGetterCallback));
             RunSmokeCases(module, controlModule, arealMapModule, aniMeshModule);
-            Console.WriteLine("original native Behavior/ArealMap/Control oracle passed (Behavior Add 0x1aac0, normalize 0x1ac90, scheduler 0x1adb0, tick 0x19e80; ArealMap UnitDAT projection 0x14b90; Control INTO override 0x2d890, FAC0 load profile 0xfac0, provider distribution 0x10ba0, class-4 update 0x12a40 and bounded class-10 active clock 0xbcf0; FAC0 uses synthetic backing with original AniMesh and Control query methods; other host callbacks, GetSystemArealMap/GetQueue IAT slots, and bounded vector insertion are substituted; no full UnitDAT loading or gameplay parity is claimed).");
+            Console.WriteLine("original native Behavior/ArealMap/Control oracle passed (Behavior Add 0x1aac0, normalize 0x1ac90, scheduler 0x1adb0, tick 0x19e80; ArealMap UnitDAT projection 0x14b90; Control INTO override 0x2d890, FAC0 initial profile 0xfac0, FCA0 initial profile 0xfca0, provider distribution 0x10ba0, class-4 update 0x12a40 and bounded class-10 active clock 0xbcf0; FAC0/FCA0 use synthetic backing with original AniMesh and Control query methods; other host callbacks, GetSystemArealMap/GetQueue IAT slots, and bounded vector insertion are substituted; no full UnitDAT loading or gameplay parity is claimed).");
             return 0;
         }
         catch (Exception error) {
@@ -2801,6 +2806,7 @@ internal static class BehaviorDistributorTickOracle {
         RunFac0NegativeClamp(controlModule, aniMeshModule, constructOwner, fac0, findFirst, countMatches);
         RunFac0NullAndSignedZeroCases(controlModule, aniMeshModule, constructOwner, fac0);
         RunFac0OrderedCase(controlModule, aniMeshModule, constructOwner, fac0);
+        RunNativeControlFca0LoadCases(controlModule, constructOwner);
         Expect(CurrentX87ControlWord() == 0x007f, "FAC0 vectors use x87 control word 0x007f");
         Console.WriteLine("native-control-fac0-load: controlHash=" + ExpectedControlSha256 +
             " aniMeshHash=" + ExpectedAniMeshSha256 + " rva=0x0fac0 cw=0x" +
@@ -2847,11 +2853,11 @@ internal static class BehaviorDistributorTickOracle {
     private static IntPtr CreateFac0Owner(Fixture fixture, IntPtr controlModule,
         NativeControlOwnerConstructor constructOwner, IntPtr ani, uint originalWord26,
         float[] descriptorMobility, float[] mutableAmounts, bool hasCache, float cacheC,
-        uint[] deviceKeys, float[] deviceValues) {
+        uint[] deviceKeys, float[] deviceValues, uint classCode = 4) {
         Expect(descriptorMobility.Length == mutableAmounts.Length, "FAC0 provider fixture lengths");
         Expect(deviceKeys.Length == deviceValues.Length, "FAC0 device fixture lengths");
         IntPtr owner = fixture.Allocate(0x700);
-        Expect(constructOwner(owner, IntPtr.Zero, 4) == owner, "original Control owner constructor 0x31490");
+        Expect(constructOwner(owner, IntPtr.Zero, classCode) == owner, "original Control owner constructor 0x31490");
         IntPtr deviceInterface = IntPtr.Add(owner, 0x0c);
         IntPtr deviceVtable = Marshal.ReadIntPtr(deviceInterface);
         Expect(deviceVtable == IntPtr.Add(controlModule, ControlProfileDeviceVtableRva) &&
@@ -2896,6 +2902,237 @@ internal static class BehaviorDistributorTickOracle {
             Marshal.WriteInt32(owner, 0x5c0, deviceKeys.Length);
         }
         return owner;
+    }
+
+    private static IntPtr CreateFca0Owner(Fixture fixture, IntPtr controlModule,
+        NativeControlOwnerConstructor constructOwner, int rowCount, int deviceCapacity) {
+        float[] rowDefaults = new float[rowCount];
+        IntPtr owner = CreateFac0Owner(fixture, controlModule, constructOwner, IntPtr.Zero,
+            FloatBitsUnsigned(4.0f), rowDefaults, rowDefaults, false, 0.0f,
+            new uint[0], new float[0], 3);
+        IntPtr deviceInterface = IntPtr.Add(owner, 0x0c);
+        Expect(Marshal.ReadIntPtr(owner, 0x38) == deviceInterface,
+            "FCA0 owner+0x38 uses its canonical owner+0x0c interface");
+        IntPtr providerInterface = IntPtr.Add(owner, 4);
+        IntPtr providerVtable = Marshal.ReadIntPtr(providerInterface);
+        Expect(providerVtable == IntPtr.Add(controlModule, ControlProviderInterfaceVtableRva) &&
+            Marshal.ReadIntPtr(providerVtable, 0x0c) == IntPtr.Add(controlModule, ControlProviderType1GetterRva),
+            "FCA0 binder receives owner+4 with the original FUN_1000dc40 provider slot");
+        Marshal.WriteIntPtr(owner, 0x5bc, fixture.Allocate(Math.Max(1, deviceCapacity) * IntPtr.Size));
+        Marshal.WriteInt32(owner, 0x5c0, 0);
+        Marshal.WriteInt32(owner, 0x5c4, deviceCapacity);
+        return owner;
+    }
+
+    private static IntPtr CreateFca0Factory5Device(Fixture fixture, IntPtr controlModule,
+        NativeControlDeviceFactory createDevice, NativeControlDeviceBind bindDevice, IntPtr owner,
+        uint key, float coefficient, float descriptorWord8, int ordinal) {
+        IntPtr deviceArrayBeforeFactory = Marshal.ReadIntPtr(owner, 0x5bc);
+        int countBeforeFactory = Marshal.ReadInt32(owner, 0x5c0);
+        int capacityBeforeFactory = Marshal.ReadInt32(owner, 0x5c4);
+        Expect(ordinal == countBeforeFactory,
+            "factory-5 ordinal matches the owner device count before append " + ordinal);
+        Expect(capacityBeforeFactory > countBeforeFactory + 1,
+            "factory-5 fixture reserves a spare device-vector slot before appending ordinal " + ordinal);
+        IntPtr record = fixture.Allocate(0xc0);
+        Marshal.WriteInt32(record, 0, 5);
+        Marshal.WriteInt32(record, 4, unchecked((int)key));
+        Marshal.WriteInt32(record, 0x18, -1);
+        Marshal.WriteInt32(record, 0x20, FloatBits(descriptorWord8));
+        for (int i = 0; i < 16; i++)
+            Marshal.WriteInt32(record, 0x2c + i * 4, FloatBits(i == 0 ? coefficient : 0.0f));
+        Marshal.WriteInt32(record, 0xac, 0);
+        Marshal.WriteInt32(record, 0xb0, 0);
+        Expect(createDevice(owner, 0, 0, record) == IntPtr.Add(record, 0xb4),
+            "original Control factory-5 dispatch 0x2d4b0 consumes its typed record");
+        Expect(Marshal.ReadIntPtr(owner, 0x5bc) == deviceArrayBeforeFactory,
+            "factory-5 append keeps the owner device-vector pointer captured before construction");
+        Expect(Marshal.ReadInt32(owner, 0x5c0) == countBeforeFactory + 1,
+            "factory-5 append advances the owner device count before reading the captured array");
+        IntPtr device = Marshal.ReadIntPtr(deviceArrayBeforeFactory, ordinal * IntPtr.Size);
+        Expect(device != IntPtr.Zero, "original factory-5 publishes its device at the expected ordinal");
+        IntPtr deviceVtable = Marshal.ReadIntPtr(device);
+        Expect(deviceVtable == IntPtr.Add(controlModule, ControlResourceTag5VtableRva) &&
+            Marshal.ReadIntPtr(deviceVtable, 0x10) == IntPtr.Add(controlModule, ControlResourceDeviceGetterRva) &&
+            Marshal.ReadIntPtr(deviceVtable, 0x1c) == IntPtr.Add(controlModule, ControlResourceCommonSetterRva),
+            "factory-5 vtable uses the original reader 0x21d00 and setter 0x21d50");
+        Expect(Marshal.ReadIntPtr(device, 0x48) == record && Marshal.ReadInt32(device, 4) == unchecked((int)key) &&
+            Marshal.ReadInt32(device, 0x50) == 5 && Marshal.ReadInt32(device, 0x4c) == FloatBits(1.0f),
+            "factory-5 current descriptor, key, and constructor defaults");
+        bindDevice(device, owner, IntPtr.Add(owner, 4), IntPtr.Zero);
+        Expect(Marshal.ReadIntPtr(device, 0x3c) == owner && Marshal.ReadIntPtr(device, 0x44) == IntPtr.Add(owner, 4) &&
+            Marshal.ReadIntPtr(device, 0x40) == IntPtr.Zero,
+            "original binder 0x21990 binds owner and owner+4 with a null model");
+        Console.WriteLine("native-control-fca0-factory5: ordinal=" + ordinal + " key=" + key +
+            " coefficient0=" + Float((uint)FloatBits(coefficient)) + " descriptor+0x20=" + Float((uint)FloatBits(descriptorWord8)) +
+            " model=null vtable=0x3cdf8");
+        return device;
+    }
+
+    private static float QueryFca0E00(IntPtr controlModule, NativeControlOwnerDeviceQuery query,
+        Fixture fixture, IntPtr owner, uint ordinal) {
+        IntPtr ownerInterface = IntPtr.Add(owner, 0x0c);
+        IntPtr ownerVtable = Marshal.ReadIntPtr(ownerInterface);
+        Expect(Marshal.ReadIntPtr(ownerVtable, 0x18) == IntPtr.Add(controlModule, ControlProfileDeviceQueryRva),
+            "owner device query table resolves to original FUN_1002bb40");
+        IntPtr result = fixture.Allocate(sizeof(uint));
+        Expect((query(ownerInterface, ordinal, 0x0e00, result) & 0xff) == 1,
+            "original owner query returns selector E00 for factory-5 device " + ordinal);
+        return ReadFloat(result, 0);
+    }
+
+    private static void RunNativeControlFca0LoadCases(IntPtr controlModule,
+        NativeControlOwnerConstructor constructOwner) {
+        NativeControlProfileFac0 fca0 = (NativeControlProfileFac0)Marshal.GetDelegateForFunctionPointer(
+            WriteStdCallToFastcallOneArgThunk(0x4c0, IntPtr.Add(controlModule, ControlProfileFca0Rva)),
+            typeof(NativeControlProfileFac0));
+        NativeControlOwnerDeviceQuery query = (NativeControlOwnerDeviceQuery)Marshal.GetDelegateForFunctionPointer(
+            WriteStdCallFourArgsToFastcallThunk(0x500, IntPtr.Add(controlModule, ControlProfileDeviceQueryRva)),
+            typeof(NativeControlOwnerDeviceQuery));
+        NativeControlDeviceFactory createDevice = (NativeControlDeviceFactory)Marshal.GetDelegateForFunctionPointer(
+            IntPtr.Add(controlModule, ControlResourceTag26ConstructorRva), typeof(NativeControlDeviceFactory));
+        NativeControlDeviceBind bindDevice = (NativeControlDeviceBind)Marshal.GetDelegateForFunctionPointer(
+            IntPtr.Add(controlModule, 0x21990), typeof(NativeControlDeviceBind));
+        Expect(CurrentX87ControlWord() == 0x007f, "FCA0 vectors start with the game x87 control word");
+
+        using (Fixture fixture = NewFixture()) {
+            IntPtr owner = CreateFca0Owner(fixture, controlModule, constructOwner, 3, 2);
+            Marshal.WriteInt32(owner, 0x1a8, FloatBits(17.0f));
+            Marshal.WriteInt32(owner, 0x354, FloatBits(1.0f));
+            Marshal.WriteInt32(owner, 0x358, FloatBits(1.0f));
+            IntPtr rows = Marshal.ReadIntPtr(owner, 0x55c);
+            Marshal.WriteInt32(rows, 2 * 0x2c + 0x14, FloatBits(7.0f));
+            IntPtr device = CreateFca0Factory5Device(fixture, controlModule, createDevice, bindDevice,
+                owner, 2, 3.0f, 13.0f, 0);
+            Marshal.WriteInt32(device, 0x4c, FloatBits(17.0f));
+            float value = QueryFca0E00(controlModule, query, fixture, owner, 0);
+            Expect(unchecked((uint)FloatBits(value)) == 0x41a80000,
+                "E00 uses provider key 2 value 7 times coefficient 3, ignoring M=17 and descriptor word8=13");
+            Console.WriteLine("native-control-fca0-reader-aligned: class=3 factory=5 ordinal=0 providerKey=2 type1=0x40e00000" +
+                " coefficient0=0x40400000 device+4c(M)=0x41880000 descriptorWord8=13 E00=21 raw=0x" +
+                unchecked((uint)FloatBits(value)).ToString("x8"));
+        }
+
+        using (Fixture fixture = NewFixture()) {
+            IntPtr owner = CreateFca0Owner(fixture, controlModule, constructOwner, 3, 3);
+            IntPtr rows = Marshal.ReadIntPtr(owner, 0x55c);
+            Marshal.WriteInt32(rows, 0x14, FloatBits(-1.5f));
+            Marshal.WriteInt32(rows, 0x2c + 0x14, FloatBits(123.0f));
+            Marshal.WriteInt32(rows, 2 * 0x2c + 0x14, FloatBits(3.0f));
+            Marshal.WriteInt32(owner, 0x1a8, FloatBits(1.0f));
+            Marshal.WriteInt32(owner, 0x354, FloatBits(1.0f));
+            Marshal.WriteInt32(owner, 0x358, FloatBits(1.0f));
+            IntPtr profile = Marshal.ReadIntPtr(owner, 0x46c);
+            float[] words = { 1.25f, -2.5f, 3.0f };
+            for (int i = 0; i < words.Length; i++) Marshal.WriteInt32(profile, i * 4, FloatBits(words[i]));
+            Marshal.WriteInt32(profile, 6 * 4, FloatBits(1.0f));
+            Marshal.WriteInt32(profile, 7 * 4, FloatBits(-2.0f));
+            Marshal.WriteInt32(profile, 8 * 4, FloatBits(10.0f));
+            Marshal.WriteInt32(profile, 9 * 4, FloatBits(2.0f));
+            Marshal.WriteInt32(profile, 10 * 4, FloatBits(-3.0f));
+            Marshal.WriteInt32(profile, 11 * 4, FloatBits(0.5f));
+            Marshal.WriteInt32(profile, 26 * 4, FloatBits(4.0f));
+            Marshal.WriteInt32(owner, 0x4d8, FloatBits(6.0f));
+            CreateFca0Factory5Device(fixture, controlModule, createDevice, bindDevice, owner, 2, 2.0f, 7.0f, 0);
+            CreateFca0Factory5Device(fixture, controlModule, createDevice, bindDevice, owner, 0, 0.5f, 7.0f, 1);
+            float first = QueryFca0E00(controlModule, query, fixture, owner, 0);
+            float second = QueryFca0E00(controlModule, query, fixture, owner, 1);
+            Expect(unchecked((uint)FloatBits(first)) == 0x40c00000 &&
+                unchecked((uint)FloatBits(second)) == 0xbf400000,
+                "canonical FCA0 E00 samples use provider keys 2 and 0");
+            fca0(owner);
+            Expect(CurrentX87ControlWord() == 0x007f, "FCA0 canonical vector retains CW=0x007f");
+            int[] offsets = { 0x470, 0x474, 0x478, 0x488, 0x48c, 0x490, 0x494, 0x498, 0x49c };
+            uint[] expected = {
+                0x40200000, 0xc0a00000, 0x40c00000, 0x3f800000, 0x40000000,
+                0x41200000, 0x41e70000, 0xc22d4000, 0x40e70000
+            };
+            for (int i = 0; i < offsets.Length; i++)
+                Expect(ReadFac0Word(owner, offsets[i]) == expected[i],
+                    "canonical FCA0 owner+0x" + offsets[i].ToString("x") + " raw word " + Hex(expected[i]));
+            Expect(ReadFac0Word(owner, 0x4d8) == FloatBitsUnsigned(6.0f),
+                "FCA0 leaves its current word-26 ratio input unchanged");
+            Console.WriteLine("native-control-fca0-canonical-default: class=3 devices=[i0:key2:E00=0x40c00000,i1:key0:E00=0xbf400000]" +
+                " scalar+1a8=0x3f800000 means+354/+358=0x3f800000 ratio=6/4 outputs=[470=40200000,474=c0a00000,478=40c00000" +
+                ",488=3f800000,48c=40000000,490=41200000,494=41e70000,498=c22d4000,49c=40e70000]");
+        }
+
+        using (Fixture fixture = NewFixture()) {
+            IntPtr owner = CreateFca0Owner(fixture, controlModule, constructOwner, 3, 4);
+            IntPtr rows = Marshal.ReadIntPtr(owner, 0x55c);
+            Marshal.WriteInt32(rows, 0x14, FloatBits(1.0f));
+            Marshal.WriteInt32(rows, 0x2c + 0x14, FloatBits(-16777216.0f));
+            Marshal.WriteInt32(rows, 2 * 0x2c + 0x14, FloatBits(16777216.0f));
+            Marshal.WriteInt32(owner, 0x1a8, FloatBits(1.0f));
+            Marshal.WriteInt32(owner, 0x354, FloatBits(1.0f));
+            Marshal.WriteInt32(owner, 0x358, FloatBits(1.0f));
+            IntPtr profile = Marshal.ReadIntPtr(owner, 0x46c);
+            Marshal.WriteInt32(profile, 6 * 4, FloatBits(2.0f));
+            Marshal.WriteInt32(profile, 26 * 4, FloatBits(1.0f));
+            Marshal.WriteInt32(owner, 0x4d8, FloatBits(1.0f));
+            CreateFca0Factory5Device(fixture, controlModule, createDevice, bindDevice, owner, 2, 1.0f, 1.0f, 0);
+            CreateFca0Factory5Device(fixture, controlModule, createDevice, bindDevice, owner, 0, 1.0f, 1.0f, 1);
+            CreateFca0Factory5Device(fixture, controlModule, createDevice, bindDevice, owner, 1, 1.0f, 1.0f, 2);
+            float[] samples = {
+                QueryFca0E00(controlModule, query, fixture, owner, 0),
+                QueryFca0E00(controlModule, query, fixture, owner, 1),
+                QueryFca0E00(controlModule, query, fixture, owner, 2)
+            };
+            Expect(unchecked((uint)FloatBits(samples[0])) == 0x4b800000 &&
+                unchecked((uint)FloatBits(samples[1])) == 0x3f800000 &&
+                unchecked((uint)FloatBits(samples[2])) == 0xcb800000,
+                "reverse-order vector E00 values");
+            float forward = 0.0f;
+            for (int i = 0; i < samples.Length; i++)
+                forward = BitConverter.ToSingle(BitConverter.GetBytes(forward + samples[i]), 0);
+            float reverse = 0.0f;
+            for (int i = samples.Length - 1; i >= 0; i--)
+                reverse = BitConverter.ToSingle(BitConverter.GetBytes(reverse + samples[i]), 0);
+            Expect(unchecked((uint)FloatBits(forward)) == 0x00000000 &&
+                unchecked((uint)FloatBits(reverse)) == 0x3f800000,
+                "single-precision forward sum is zero while native reverse-order sum is one");
+            fca0(owner);
+            Expect(ReadFac0Word(owner, 0x488) == 0x40000000,
+                "FCA0 owner+0x488 uses reverse E00 sum one times original word 6 two");
+            Console.WriteLine("native-control-fca0-reverse: device-array=[16777216,1,-16777216]" +
+                " reverse-visits=[-16777216,1,16777216] forward=0x00000000 reverse=0x3f800000 owner+488=0x40000000");
+        }
+
+        int pageSize = Environment.SystemPageSize;
+        IntPtr guarded = VirtualAlloc(IntPtr.Zero, new UIntPtr((uint)(pageSize * 2)), MemCommitReserve, PageReadWrite);
+        if (guarded == IntPtr.Zero)
+            throw new InvalidOperationException("VirtualAlloc class-9 FCA0 guard pages error=" + Marshal.GetLastWin32Error());
+        try {
+            for (int i = 0; i < pageSize; i++) Marshal.WriteByte(guarded, i, 0xa5);
+            IntPtr owner = IntPtr.Add(guarded, pageSize - 0x100);
+            Marshal.WriteIntPtr(owner, 0x38, IntPtr.Zero);
+            Marshal.WriteInt32(owner, 0x50, 9);
+            byte[] before = new byte[pageSize];
+            Marshal.Copy(guarded, before, 0, pageSize);
+            uint oldProtect;
+            if (!VirtualProtect(IntPtr.Add(guarded, pageSize), new UIntPtr((uint)pageSize), PageNoAccess, out oldProtect))
+                throw new InvalidOperationException("VirtualProtect class-9 FCA0 guard page error=" + Marshal.GetLastWin32Error());
+            fca0(owner);
+            byte[] after = new byte[pageSize];
+            Marshal.Copy(guarded, after, 0, pageSize);
+            bool unchanged = true;
+            for (int i = 0; i < before.Length; i++) unchanged &= before[i] == after[i];
+            Expect(unchanged && Marshal.ReadInt32(owner, 0x50) == 9,
+                "class 9 FCA0 returns without reading inaccessible profile/output memory or writing owner state");
+            Console.WriteLine("native-control-fca0-class9: owner+50=9 profile/output page is PAGE_NOACCESS; returned without fault or writes");
+        } finally {
+            VirtualFree(guarded, UIntPtr.Zero, MemRelease);
+        }
+
+        Expect(CurrentX87ControlWord() == 0x007f, "FCA0 vectors retain x87 control word 0x007f");
+        Console.WriteLine("native-control-fca0-load: controlHash=" + ExpectedControlSha256 +
+            " rva=0x0fca0 cw=0x" + CurrentX87ControlWord().ToString("x4") +
+            " original owner/factory5/binder/provider/query/reader/setter paths");
+        GC.KeepAlive(fca0);
+        GC.KeepAlive(query);
+        GC.KeepAlive(createDevice);
+        GC.KeepAlive(bindDevice);
+        GC.KeepAlive(constructOwner);
     }
 
     private static uint ReadFac0Word(IntPtr address, int offset) {

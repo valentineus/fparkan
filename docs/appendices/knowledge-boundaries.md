@@ -569,23 +569,52 @@ resource-device значения во время игры.
 и mirror-варианты передают свой transform-вектор setter-у; это отдельная
 граница, как и более поздние placement/tick.
 
-Полный Rust loader теперь вызывает FAC0 при построении
-`build_control_device_projection` и публикует результат в
-`MissionControlOwnerProfile::load_projection`. Игнорируемый corpus-тест
-`full_load_builds_effective_control_device_table_for_mine_unit_dat` на лицензированном
-`min_l_n1.dat` проверяет 11 устройств, все 25 соответствий provider ordinal
-модели и упорядоченные значения `row +0x20`. Его агрегаты —
-`0x470833fc/0x4897e712/0x4d9452cb` для `+0x530/+0x534/+0x538`; исходный и
-начальный mutable word `26` равны `0x7f7fffff`. Это подтверждает Rust full-load
-результат на оригинальных ресурсах, но не совпадение с полным нативным load
-оригинала. Поведение позже при placement/tick и физический смысл raw-полей
-остаётся неизвестным. Точные RVA, owner layout и векторы приведены в
-[описании изолированного прохода FAC0](script-vm.md#изолированный-проход-fac0).
+Полный Rust loader теперь выполняет FAC0, затем FCA0 при построении
+`build_control_device_projection_with_class`. `MissionControlOwnerProfile::load_projection`
+сохраняет отдельный результат FAC0, а `fca0_projection` — статус следующего
+прохода. FCA0 проверяет класс **владельца** `owner +0x50`: класс `9` сразу
+возвращает неизменённую копию; это не условие по device factory tag `9`. Любой
+известный класс, отличный от `9`, включая `0`, проходит общий расчёт. В Rust
+`MissingNativeControlClass` означает, что проекция не восстановила метаданные
+класса, а не то, что оригинальная DLL не содержит класс. `Fac0Unavailable`
+применяется только к не-классу-9 ветви, потому что класс `9` выходит до проверки
+FAC0.
 
-Остаётся сравнить этот полный mine load с original loader при тех же входных
-данных и продолжить трассировку `LoadControlSystem`, `LoadPhysicalModel`,
-`CreateCollManager` и collision objects, если потребуется связать profile words
-с shapes, contacts или реакцией на движение.
+FCA0 суммирует selector `0xe00` в обратном порядке по устройствам с текущим
+descriptor tag `5`. Изолированный x86-вектор исполняет оригинальный reader
+`0x21d00` и FCA0. Статическая проверка двух factory vtables подтверждает общий
+reader `0x21d00` и setter `0x21d50` для tags `5`/`26`; provider getter `0x0dc40`
+использует `owner +4`, а canonical `QueryInterface(0x204)` задаёт
+`owner +0x38 -> owner +0x0c`.
+В каноническом constructor/event-4 пути scalar `+0x1a8` и means `+0x354/+0x358`
+равны `1.0`. На исходном Control.dll с SHA-256
+`bcb86318089028548a178b03a21accdce15df0cc85ddd91674cf3c2f55012c6e` FCA0
+подтверждена по RVA `0x0fca0` при x87 control word `0x007f`. Слова
+`[0,1,2,6,7,8,9,10,11]` в canonical-default векторе имеют биты
+`40200000 c0a00000 40c00000 3f800000 40000000 41200000 41e70000 c22d4000 40e70000`.
+
+Лицензированный тест `full_load_builds_effective_control_device_table_for_mine_unit_dat`
+настоящего `min_l_n1.dat` теперь проверяет class `3`, `fca0_projection = Ok(())`,
+11 устройств и все 25 provider rows. Его девять target words
+`[0,1,2,6,7,8,9,10,11]` равны
+`40000000 40000000 40000000 00000000 00000000 00000000 00000000 00000000 00000000`;
+word `26` после FAC0 остаётся `0x7f7fffff`, а оригинальный блок, FAC0 агрегаты
+`0x470833fc/0x4897e712/0x4d9452cb` и 25 значений строк сохраняются. Это Rust
+full-load результат на оригинальных ресурсах, а не сравнение полного native
+Unit DAT loader-а или gameplay. Rust helper поддерживает только конечные входы
+и промежуточные значения домена `normal-or-zero`; прочие битовые случаи остаются
+вне заявленного диапазона.
+
+Полный динамический жизненный цикл после начальной загрузки не подтверждён:
+поздние изменения owner scalar/means, activation, игровые часы, Control tick и
+placement не сведены в одну проверенную трассу и не включены в Rust-проекцию.
+Отдельные constructor, setter и loader-пути уже прослежены; физические единицы
+слов профиля и накопителей остаются неизвестны. Для закрытия границы нужны
+динамическая трассировка и сравнение полного Unit DAT load с оригинальным
+loader-ом при одинаковых ресурсах и условиях.
+Подробные RVA, QI/provider layout, арифметика и пределы векторов приведены в
+[описании изолированного прохода FAC0](script-vm.md#изолированный-проход-fac0)
+и [разборе FCA0](script-vm.md#изолированный-проход-fca0).
 
 ## DirectPlay wire
 
