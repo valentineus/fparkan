@@ -1088,13 +1088,14 @@ backing. Значения `[2, 3, 5]` относятся только к нем�
 `AniMesh.dll` `65659bf67f20e5be77d67a5b2f59968f61b94293143807fa59ca451c560c4f7e`,
 `Effect.dll` `386a3e8db1ce23f61957825d633c7dae1ed40c25cab0cf10a534385fd7cee789`
 и `Control.dll` `bcb86318089028548a178b03a21accdce15df0cc85ddd91674cf3c2f55012c6e`.
-Сначала `AniMesh::FUN_10002ff0` (RVA `0x2ff0`) вызывает `LoadAniMesh`, затем —
-`LoadControlSystem` на RVA `0x32e7`. После возврата из этой фабрики обычный
-`ArealMap` путь `0x14fd0/0x15290` вызывает `World3D.CreateObject`
-(`0x7cb0/0x7a50`), который до возврата посылает Agent event `0` через primary
-vtable slot `+0x38`. Agent RVA `0x1a80` сначала вызывает базовый обработчик
-`0x17df0`, затем рассылает компонентам event `4` с null payload. Конструктор
-AniMesh задаёт `+0x158/+0x15c/+0x160` равными `1.0`.
+Обычный `ArealMap` путь (`0x14fd0/0x15290`) вызывает `World3D.CreateObject`
+(`0x7cb0/0x7a50`). Выбранная этим вызовом фабрика создаёт Agent:
+`AniMesh::FUN_10002ff0` (RVA `0x2ff0`) сначала вызывает `LoadAniMesh`, затем —
+`LoadControlSystem` на RVA `0x32e7`. После возврата из фабрики
+`World3D::FUN_10007cb0` (RVA `0x7cb0`) до своего возврата посылает Agent event
+`0` через primary vtable slot `+0x38`. Agent RVA `0x1a80` сначала вызывает
+базовый обработчик `0x17df0`, затем рассылает компонентам event `4` с null
+payload. Конструктор AniMesh задаёт `+0x158/+0x15c/+0x160` равными `1.0`.
 Обработчик модели `0x75b0/0x6fc0` привязывает интерфейсы и матрицу, Effect RVA
 `0x3d30` и Control RVA `0x1ce00` сохраняют host/service указатели, а Control
 `0x1fe00` меняет только локальный collision-флаг. Эти ветви не вызывают AniMesh
