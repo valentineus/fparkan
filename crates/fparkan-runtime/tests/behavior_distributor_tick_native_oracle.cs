@@ -125,6 +125,7 @@ internal static class BehaviorDistributorTickOracle {
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate IntPtr NativeControlResourceComponentOverride(IntPtr self, int deviceIndex, IntPtr typedRecord);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int NativeControlAggregateQuery(IntPtr self, uint selector, IntPtr result);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int NativeControlAggregateSet(IntPtr self, uint selector, IntPtr value);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeAniMeshNodeConstructor(IntPtr self, IntPtr model, IntPtr source, uint component, IntPtr meshData);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlProviderAmountUpdate(IntPtr self, int nodeIndex, float delta, uint animationFlag);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlProviderAmountDistribute(IntPtr self, float delta, uint mode, uint flags);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlContactRateUpdate(IntPtr self, float deltaSeconds);
@@ -696,7 +697,7 @@ internal static class BehaviorDistributorTickOracle {
             RunNativeControlProviderInitialStateCase(controlModule, aniMeshModule);
             RunNativeControlIntoOverrideCase(controlModule);
             RunNativeControlResourceDeviceCase(controlModule);
-            RunNativeControlProviderLiveStateCase(controlModule);
+            RunNativeControlProviderLiveStateCase(controlModule, aniMeshModule);
             RunNativeControlProviderStageArithmeticCase(controlModule, aniMeshModule);
             RunNativeControlProviderHierarchyPropagationCase(controlModule, aniMeshModule);
             RunNativeControlProviderVisibilityCase(controlModule, aniMeshModule);
@@ -861,7 +862,7 @@ internal static class BehaviorDistributorTickOracle {
         }
     }
 
-    private static void RunNativeControlProviderLiveStateCase(IntPtr module) {
+    private static void RunNativeControlProviderLiveStateCase(IntPtr module, IntPtr aniMeshModule) {
         NativeControlProviderRowConstructor constructProviderRow = (NativeControlProviderRowConstructor)
             Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlProviderRowConstructorRva),
                 typeof(NativeControlProviderRowConstructor));
@@ -890,7 +891,29 @@ internal static class BehaviorDistributorTickOracle {
 
             IntPtr providerInterface = IntPtr.Add(owner, 4);
             IntPtr providerVtable = IntPtr.Add(module, ControlProviderInterfaceVtableRva);
-            IntPtr callbackObject = fixture.Allocate(IntPtr.Size);
+            IntPtr callbackObject = fixture.Allocate(0x1b0);
+            IntPtr meshRows = fixture.Allocate(2 * 0x130);
+            NativeAniMeshNodeConstructor constructNode = (NativeAniMeshNodeConstructor)Marshal.GetDelegateForFunctionPointer(
+                IntPtr.Add(aniMeshModule, 0x123e0), typeof(NativeAniMeshNodeConstructor));
+            for (int node = 0; node < 2; node++) {
+                constructNode(IntPtr.Add(meshRows, node * 0x130), IntPtr.Zero, IntPtr.Zero, 0, IntPtr.Zero);
+                Expect(Marshal.ReadInt32(meshRows, node * 0x130 + 0x124) == FloatBits(1.0f) &&
+                    Marshal.ReadInt32(meshRows, node * 0x130 + 0x1c) == 0,
+                    "original AniMesh node constructor initializes provider value and visible stage");
+            }
+            Marshal.WriteIntPtr(callbackObject, 0x1a8, meshRows);
+            Marshal.WriteInt32(callbackObject, 0x1ac, 2);
+            Marshal.WriteInt32(meshRows, 0x124, FloatBits(-7.0f));
+            Marshal.WriteInt32(meshRows, 0x130 + 0x1c, 77);
+            NativeControlNodeUpdateCallback setNodeValue = (NativeControlNodeUpdateCallback)Marshal.GetDelegateForFunctionPointer(
+                IntPtr.Add(aniMeshModule, 0x5750), typeof(NativeControlNodeUpdateCallback));
+            NativeControlNodeUpdateCallback forwardNodeValue = delegate(IntPtr self, uint node, uint selector, uint bits) {
+                OnControlNodeUpdate(self, node, selector, bits);
+                setNodeValue(self, node, selector, bits);
+            };
+            setNodeValue(callbackObject, 1, 0x201, unchecked((uint)FloatBits(99.0f)));
+            Expect(ReadFloat(meshRows, 0x130 + 0x124) == 1.0f,
+                "AniMesh node-value setter ignores selectors other than 0x200");
             IntPtr callbackVtable = fixture.Allocate(0x38);
             IntPtr device = fixture.Allocate(0x94);
             IntPtr row = IntPtr.Add(rows, 0x2c); // Keep the root row untouched.
@@ -909,7 +932,7 @@ internal static class BehaviorDistributorTickOracle {
             Marshal.WriteInt32(row, 0x14, FloatBits(0.4f));
 
             Marshal.WriteIntPtr(callbackObject, 0, callbackVtable);
-            Marshal.WriteIntPtr(callbackVtable, 0x34, Marshal.GetFunctionPointerForDelegate(ControlNodeUpdateCallback));
+            Marshal.WriteIntPtr(callbackVtable, 0x34, Marshal.GetFunctionPointerForDelegate(forwardNodeValue));
             Marshal.WriteIntPtr(owner, 0x20, callbackObject);
 
             Marshal.WriteInt32(device, 0x04, 1);
@@ -922,6 +945,9 @@ internal static class BehaviorDistributorTickOracle {
             Expect(ReadFloat(row, 0x08) == 60.0f && ReadFloat(row, 0x14) == 0.6f &&
                 ReadFloat(owner, 0x590) == 60.0f,
                 "Control native amount update clamps the node amount, updates the normalized provider value, and keeps the aggregate amount in sync");
+            Expect(ReadFloat(meshRows, 0x130 + 0x124) == 0.6f && ReadFloat(meshRows, 0x124) == -7.0f &&
+                Marshal.ReadInt32(meshRows, 0x130 + 0x1c) == 77,
+                "Control amount update reaches original AniMesh setter and changes only its target node value");
             Expect(controlNodeUpdateCount == 1 && controlNodeUpdateIndex == 1 &&
                 controlNodeUpdateSelector == 0x200 && controlNodeUpdateValueBits == unchecked((uint)FloatBits(0.6f)),
                 "Control native amount update publishes the normalized provider state through the existing node callback");
@@ -960,11 +986,17 @@ internal static class BehaviorDistributorTickOracle {
             update(owner, 1, -1.0f, 0);
             Expect(Marshal.ReadInt32(row, 8) == 0 && ReadFloat(row, 0x14) == 0.25f &&
                 ReadFloat(row, 0x0c) == 40.0f && ReadFloat(owner, 0x590) == 20.0f &&
-                controlNodeUpdateCount == 5 && (Marshal.ReadInt32(row, 0x28) & 0x10) == 0,
+                controlNodeUpdateCount == 5 && (Marshal.ReadInt32(row, 0x28) & 0x10) == 0 &&
+                ReadFloat(meshRows, 0x130 + 0x124) == 0.1f,
                 "clamping signed zero writes amount bits but leaves ratio, aggregate, flags and publication unchanged");
 
             Console.WriteLine("native-control-live-ndp-provider: controlHash=" + ExpectedControlSha256 +
                 " rowCtorRva=0xb240 initialType1=1 rowStride=0x2c node=1 max=100 amount=0..100 tag26Selector300=live");
+            Console.WriteLine("native-control-to-animesh-node-value: AniMeshCtor=0x123e0 setter=0x5750 rowStride=0x130 value=+0x124" +
+                " selector=0x200 other-node/stage=unchanged signed-zero=no-publication");
+            GC.KeepAlive(constructNode);
+            GC.KeepAlive(setNodeValue);
+            GC.KeepAlive(forwardNodeValue);
             GC.KeepAlive(constructProviderRow);
             GC.KeepAlive(update);
             GC.KeepAlive(getter);
@@ -1046,6 +1078,8 @@ internal static class BehaviorDistributorTickOracle {
                 unchecked((uint)Marshal.ReadInt32(rows, 0x2c + 0x14)) == 0x3e800000 &&
                 unchecked((uint)Marshal.ReadInt32(rows, 3 * 0x2c + 0x14)) == 0x3e800000,
                 "Control flag 4 copies the parent type-1 ratio before stage calculation");
+            Expect(ReadFloat(meshRows, 0x130 + 0x124) == 0.0f && ReadFloat(rows, 0x2c + 0x14) == 0.25f,
+                "inheriting a parent provider ratio does not rewrite the separate AniMesh node value");
             Expect(String.Join(",", aniMeshStageTransitions.ToArray()) == "0:3,1:3,2:1,3:3,4:2,5:1,6:1,7:0,8:2" &&
                 String.Join(",", aniMeshNodeLifecycleCallbacks.ToArray()) == "7:101:4" && !aniMeshCallbackOwnerMismatch &&
                 !controlNodeUpdateOwnerMismatch && !nativeAniMeshStageCallbackMissing,

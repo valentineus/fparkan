@@ -222,6 +222,15 @@ pub struct MissionControlNodeInitialMeshState {
     pub stage_count: u32,
 }
 
+/// Mutable projection of the provider row's matching AniMesh node fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MissionControlNodeMeshState {
+    /// Node value at AniMesh `+0x124`, written by selector `0x200`.
+    pub type1_value_bits: u32,
+    /// Visible MSH stage at AniMesh `+0x1c`; distinct from Control's exhaustion sentinel.
+    pub visible_stage: u32,
+}
+
 /// Source and current state of one loaded global Control node-data provider row.
 ///
 /// The native table is indexed independently of MSH model nodes. Its rows are
@@ -256,12 +265,13 @@ pub struct MissionControlNodeProviderRow {
     pub current_flags: Option<u32>,
     /// MSH state exposed at the same global ordinal, if the mesh projection exists.
     pub initial_mesh_state: Option<MissionControlNodeInitialMeshState>,
+    /// Current model-node fields, when its global ordinal was resolved.
+    pub mesh_state: Option<MissionControlNodeMeshState>,
 }
 
-/// Node-property publication required after a provider amount changes.
+/// Node-property publication applied to CPU model state after an amount change.
 ///
-/// The model-node callback is native selector `0x200`; the caller must publish
-/// this value separately from the later stage and visibility update.
+/// Records native selector `0x200`; stage and visibility updates are separate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[must_use]
 pub struct ControlNodeProviderPublication {
@@ -2157,15 +2167,16 @@ pub fn set_loaded_mission_control_multiplier(
 
 /// Applies the confirmed non-animation-delta path of native Control `0x10f30`.
 ///
-/// Updates amount, ratio, aggregate, exhaustion flag, and dirty state, returning
-/// the required selector-`0x200` node publication. It does not run stage propagation,
+/// Updates amount, ratio, aggregate, exhaustion flag, dirty state, and the CPU
+/// model node's selector-`0x200` value, returning the applied publication.
+/// It does not run stage propagation,
 /// visibility, or the separate Control clock; the processed amount stays unchanged.
 /// The loaded Unit DAT path has unity maximum multipliers.
 ///
 /// # Errors
 /// Rejects invalid handles, unavailable state, unsupported numeric ranges, or
 /// depletion requiring the object's unimplemented lifecycle. No state is changed
-/// on error. The returned node publication must be applied by the caller.
+/// on error. This updates CPU model state, not GPU uploads or window rendering.
 pub fn apply_loaded_mission_control_node_delta(
     engine: &mut Engine,
     handle: ObjectHandle,
@@ -2262,8 +2273,16 @@ fn apply_control_node_delta(
     let change = checked_control_sum(0, "provider amount change", amount, -previous)?;
     let total = checked_control_sum(0, "provider aggregate", total, change)?.max(0.0);
     let ratio = checked_control_ratio("provider ratio", amount, maximum)?;
+    let mesh = row
+        .mesh_state
+        .as_mut()
+        .ok_or(ControlResourceAccessError::UnsupportedField {
+            factory_tag: 0,
+            field: "model node state",
+        })?;
     row.current_amount_bits = amount.to_bits();
     row.current_type1_value_bits = ratio.to_bits();
+    mesh.type1_value_bits = ratio.to_bits();
     row.current_flags = Some(if amount == 0.0 {
         flags | 0x10
     } else {
@@ -3755,6 +3774,7 @@ fn append_control_node_provider_rows(
             current_type1_value_bits: 0x3f80_0000,
             current_flags: None,
             initial_mesh_state: None,
+            mesh_state: None,
         });
     }
 }
@@ -3820,6 +3840,10 @@ fn attach_initial_mesh_states_by_global_ordinal(
     for (ordinal, row) in provider_rows.iter_mut().enumerate() {
         row.initial_mesh_state = global_mesh_states.get(ordinal).copied().flatten();
         row.current_flags = row.initial_mesh_state.map(|state| state.flags);
+        row.mesh_state = row.initial_mesh_state.map(|_| MissionControlNodeMeshState {
+            type1_value_bits: row.initial_type1_value_bits,
+            visible_stage: 0,
+        });
     }
 }
 
@@ -4321,6 +4345,7 @@ mod tests {
             current_type1_value_bits: initial_type1_value_bits,
             current_flags: None,
             initial_mesh_state: None,
+            mesh_state: None,
         }
     }
 
@@ -5157,6 +5182,10 @@ mod tests {
         row.current_amount_bits = 40.0_f32.to_bits();
         row.processed_amount_bits = 40.0_f32.to_bits();
         row.current_flags = Some(0);
+        row.mesh_state = Some(MissionControlNodeMeshState {
+            type1_value_bits: 1.0_f32.to_bits(),
+            visible_stage: 77,
+        });
         let mut device = synthetic_effective_control_device(
             26,
             26,
@@ -5198,6 +5227,13 @@ mod tests {
             };
             assert_eq!(rows[1].current_amount_bits, amount.to_bits());
             assert_eq!(rows[1].processed_amount_bits, 40.0_f32.to_bits());
+            assert_eq!(
+                rows[1].mesh_state,
+                Some(MissionControlNodeMeshState {
+                    type1_value_bits: ratio.to_bits(),
+                    visible_stage: 77
+                })
+            );
             assert_eq!(rows[1].initial_amount_bits, 100.0_f32.to_bits());
             assert_eq!(rows[1].current_flags.unwrap() & 0x10 != 0, exhausted);
             let resource = (ratio * 2.0) * 3.0;
@@ -5260,6 +5296,27 @@ mod tests {
         ));
         assert_eq!(table, before);
         table.node_provider_amount_bits = total;
+        let MissionControlNodeProviderTableStatus::Available(rows) =
+            &mut table.node_provider_status
+        else {
+            panic!()
+        };
+        let mesh = rows[1].mesh_state.take();
+        let before = table.clone();
+        assert!(matches!(
+            apply_control_node_delta(&mut table, 1, 1.0),
+            Err(ControlResourceAccessError::UnsupportedField {
+                field: "model node state",
+                ..
+            })
+        ));
+        assert_eq!(table, before);
+        let MissionControlNodeProviderTableStatus::Available(rows) =
+            &mut table.node_provider_status
+        else {
+            panic!()
+        };
+        rows[1].mesh_state = mesh;
         let before = table.clone();
         assert_eq!(
             apply_control_node_delta(&mut table, 1, -100.0),
@@ -6794,6 +6851,13 @@ mod tests {
         };
         assert_eq!(mine_rows[key as usize].initial_amount_bits, initial);
         assert_eq!(mine_rows[key as usize].processed_amount_bits, initial);
+        assert_eq!(
+            mine_rows[key as usize].mesh_state,
+            Some(MissionControlNodeMeshState {
+                type1_value_bits: 0.5_f32.to_bits(),
+                visible_stage: 0,
+            })
+        );
     }
 
     #[test]
