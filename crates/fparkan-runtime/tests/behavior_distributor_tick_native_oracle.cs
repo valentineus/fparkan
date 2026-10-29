@@ -81,6 +81,13 @@ internal static class BehaviorDistributorTickOracle {
     private const int ControlResourceNoOpStringPairRva = 0x0bcd0;
     private const int ControlResourceTag19VtableRva = 0x3c608;
     private const int ControlResourceTag19StringPairNoOpRva = 0x0bcd0;
+    private const int ControlProfileFac0Rva = 0x0fac0;
+    private const int ControlProfileOwnerConstructorRva = 0x31490;
+    private const int ControlProfileDeviceVtableRva = 0x3d1b4;
+    private const int ControlProfileDeviceCountRva = 0x08830;
+    private const int ControlProfileDeviceQueryRva = 0x2bb40;
+    private const int AniMeshComponentFirstRva = 0x05780;
+    private const int AniMeshComponentCountRva = 0x057c0;
     private const int BehaviorVarTableVtableRva = 0x591b0;
     private const int BehaviorVarArrayLoadRva = 0x49fa0;
     private const int BehaviorVarFieldBindRva = 0x49090;
@@ -129,6 +136,7 @@ internal static class BehaviorDistributorTickOracle {
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void NativeFastcallComponentBuilder(IntPtr owner, IntPtr node, uint parentId);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int NativeArealMapEvent(IntPtr owner, uint message, uint subcode, IntPtr descriptor);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int NativeAniMeshNodeMetadataQuery(IntPtr owner, uint nodeIndex, uint selector, IntPtr result);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate uint NativeAniMeshRangeLookup(IntPtr owner, uint componentId);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate uint NativeAniMeshNodeStageCount(IntPtr owner, uint nodeIndex);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate IntPtr NativeControlResourceDeviceConstructor(IntPtr self);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlResourceBudgetUpdate(IntPtr self, float deltaSeconds);
@@ -151,6 +159,7 @@ internal static class BehaviorDistributorTickOracle {
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlTimedUpdate(IntPtr self, float inputTime);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlProviderRowConstructor(IntPtr self, IntPtr sourceNdpRow);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate IntPtr NativeControlOwnerConstructor(IntPtr self, IntPtr host, uint classCode);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void NativeControlProfileFac0(IntPtr owner);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlProviderInitialState(IntPtr self);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void NativeControlNodeUpdateCallback(IntPtr self, uint nodeIndex, uint selector, uint valueBits);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlProviderStageUpdate(IntPtr self, int nodeIndex, uint updateEffects);
@@ -691,7 +700,7 @@ internal static class BehaviorDistributorTickOracle {
             Marshal.WriteIntPtr(import, Marshal.GetFunctionPointerForDelegate(AreaMapGetterCallback));
             Marshal.WriteIntPtr(queueImport, Marshal.GetFunctionPointerForDelegate(QueueGetterCallback));
             RunSmokeCases(module, controlModule, arealMapModule, aniMeshModule);
-            Console.WriteLine("original native Behavior/ArealMap/Control oracle passed (Behavior Add 0x1aac0, normalize 0x1ac90, scheduler 0x1adb0, tick 0x19e80; ArealMap UnitDAT projection 0x14b90; Control INTO override 0x2d890, provider distribution 0x10ba0, class-4 update 0x12a40 and bounded class-10 active clock 0xbcf0; synthetic host callbacks, GetSystemArealMap/GetQueue IAT slots, and bounded vector insertion are substituted; Control provider selector vtable is original; no full Control update or Rust parity is claimed).");
+            Console.WriteLine("original native Behavior/ArealMap/Control oracle passed (Behavior Add 0x1aac0, normalize 0x1ac90, scheduler 0x1adb0, tick 0x19e80; ArealMap UnitDAT projection 0x14b90; Control INTO override 0x2d890, FAC0 load profile 0xfac0, provider distribution 0x10ba0, class-4 update 0x12a40 and bounded class-10 active clock 0xbcf0; FAC0 uses synthetic backing with original AniMesh and Control query methods; other host callbacks, GetSystemArealMap/GetQueue IAT slots, and bounded vector insertion are substituted; no full UnitDAT loading or gameplay parity is claimed).");
             return 0;
         }
         catch (Exception error) {
@@ -734,6 +743,7 @@ internal static class BehaviorDistributorTickOracle {
             RunNativeArealMapComponentBuilderCase(arealMapModule);
             RunNativeAniMeshScaleLoadSnapshot(aniMeshModule);
             RunNativeAniMeshNodeMetadataCases(aniMeshModule);
+            RunNativeControlFac0LoadCases(controlModule, aniMeshModule);
             RunNativeControlProviderInitialStateCase(controlModule, aniMeshModule);
             RunNativeControlIntoOverrideCase(controlModule);
             RunNativeControlResourceDeviceCase(controlModule);
@@ -2763,6 +2773,268 @@ internal static class BehaviorDistributorTickOracle {
         }
         GC.KeepAlive(query);
         GC.KeepAlive(stageCount);
+    }
+
+    private static void RunNativeControlFac0LoadCases(IntPtr controlModule, IntPtr aniMeshModule) {
+        NativeControlOwnerConstructor constructOwner = (NativeControlOwnerConstructor)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(controlModule, ControlProfileOwnerConstructorRva),
+                typeof(NativeControlOwnerConstructor));
+        NativeControlProfileFac0 fac0 = (NativeControlProfileFac0)Marshal.GetDelegateForFunctionPointer(
+            WriteStdCallToFastcallOneArgThunk(0x440, IntPtr.Add(controlModule, ControlProfileFac0Rva)),
+            typeof(NativeControlProfileFac0));
+        NativeAniMeshNodeMetadataQuery queryNode = (NativeAniMeshNodeMetadataQuery)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(aniMeshModule, AniMeshNodeMetadataQueryRva),
+                typeof(NativeAniMeshNodeMetadataQuery));
+        NativeAniMeshRangeLookup findFirst = (NativeAniMeshRangeLookup)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(aniMeshModule, AniMeshComponentFirstRva),
+                typeof(NativeAniMeshRangeLookup));
+        NativeAniMeshRangeLookup countMatches = (NativeAniMeshRangeLookup)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(aniMeshModule, AniMeshComponentCountRva),
+                typeof(NativeAniMeshRangeLookup));
+
+        RunFac0CombinedCase(controlModule, aniMeshModule, constructOwner, fac0, queryNode, findFirst, countMatches);
+        uint noCache = RunFac0CacheCase(controlModule, aniMeshModule, constructOwner, fac0, false, 0.0f);
+        uint zeroCache = RunFac0CacheCase(controlModule, aniMeshModule, constructOwner, fac0, true, 0.0f);
+        uint nonzeroCache = RunFac0CacheCase(controlModule, aniMeshModule, constructOwner, fac0, true, 2.0f);
+        Expect(noCache == zeroCache && noCache != nonzeroCache,
+            "FAC0 distinguishes a missing cache from its value while a present-zero cache contributes zero");
+        RunFac0NegativeClamp(controlModule, aniMeshModule, constructOwner, fac0, findFirst, countMatches);
+        RunFac0NullAndSignedZeroCases(controlModule, aniMeshModule, constructOwner, fac0);
+        RunFac0OrderedCase(controlModule, aniMeshModule, constructOwner, fac0);
+        Expect(CurrentX87ControlWord() == 0x007f, "FAC0 vectors use x87 control word 0x007f");
+        Console.WriteLine("native-control-fac0-load: controlHash=" + ExpectedControlSha256 +
+            " aniMeshHash=" + ExpectedAniMeshSha256 + " rva=0x0fac0 cw=0x" +
+            CurrentX87ControlWord().ToString("x4") + " original owner/node/device methods");
+        GC.KeepAlive(fac0);
+        GC.KeepAlive(constructOwner);
+        GC.KeepAlive(queryNode);
+        GC.KeepAlive(findFirst);
+        GC.KeepAlive(countMatches);
+    }
+
+    private static IntPtr CreateFac0AniMesh(Fixture fixture, IntPtr aniMeshModule, uint[] componentIds,
+        float scale158, float scale15c, float scale160, float slot30, float slot34) {
+        IntPtr ani = fixture.Allocate(0x1b0);
+        IntPtr vtable = fixture.Allocate(0x50);
+        IntPtr nodes = fixture.Allocate(Math.Max(1, componentIds.Length) * 0x130);
+        IntPtr type1NodeData = fixture.Allocate(0x26);
+        IntPtr slotData = fixture.Allocate(0x44);
+        IntPtr modelContext = fixture.Allocate(3 * IntPtr.Size);
+        Marshal.WriteInt16(type1NodeData, 0x08, 0);
+        Marshal.WriteIntPtr(modelContext, 0, type1NodeData);
+        Marshal.WriteIntPtr(modelContext, 2 * IntPtr.Size, slotData);
+        Marshal.WriteInt32(slotData, 0x30, FloatBits(slot30));
+        Marshal.WriteInt32(slotData, 0x34, FloatBits(slot34));
+        Marshal.WriteIntPtr(ani, 0, vtable);
+        Marshal.WriteIntPtr(ani, 0x1a8, nodes);
+        Marshal.WriteInt32(ani, 0x1ac, componentIds.Length);
+        Marshal.WriteInt32(ani, 0x158, FloatBits(scale158));
+        Marshal.WriteInt32(ani, 0x15c, FloatBits(scale15c));
+        Marshal.WriteInt32(ani, 0x160, FloatBits(scale160));
+        for (int i = 0; i < componentIds.Length; i++) {
+            IntPtr node = IntPtr.Add(nodes, i * 0x130);
+            Marshal.WriteInt32(node, 0, unchecked((int)componentIds[i]));
+            Marshal.WriteInt32(node, 0x08, 0);
+            Marshal.WriteInt32(node, 0x1c, 0);
+            Marshal.WriteIntPtr(node, 0x12c, modelContext);
+        }
+        Marshal.WriteIntPtr(vtable, 0x0c, IntPtr.Add(aniMeshModule, AniMeshNodeMetadataQueryRva));
+        Marshal.WriteIntPtr(vtable, 0x38, IntPtr.Add(aniMeshModule, AniMeshComponentFirstRva));
+        Marshal.WriteIntPtr(vtable, 0x3c, IntPtr.Add(aniMeshModule, AniMeshComponentCountRva));
+        return ani;
+    }
+
+    private static IntPtr CreateFac0Owner(Fixture fixture, IntPtr controlModule,
+        NativeControlOwnerConstructor constructOwner, IntPtr ani, uint originalWord26,
+        float[] descriptorMobility, float[] mutableAmounts, bool hasCache, float cacheC,
+        uint[] deviceKeys, float[] deviceValues) {
+        Expect(descriptorMobility.Length == mutableAmounts.Length, "FAC0 provider fixture lengths");
+        Expect(deviceKeys.Length == deviceValues.Length, "FAC0 device fixture lengths");
+        IntPtr owner = fixture.Allocate(0x700);
+        Expect(constructOwner(owner, IntPtr.Zero, 4) == owner, "original Control owner constructor 0x31490");
+        IntPtr deviceInterface = IntPtr.Add(owner, 0x0c);
+        IntPtr deviceVtable = Marshal.ReadIntPtr(deviceInterface);
+        Expect(deviceVtable == IntPtr.Add(controlModule, ControlProfileDeviceVtableRva) &&
+            Marshal.ReadIntPtr(deviceVtable, 0x0c) == IntPtr.Add(controlModule, ControlProfileDeviceCountRva) &&
+            Marshal.ReadIntPtr(deviceVtable, 0x18) == IntPtr.Add(controlModule, ControlProfileDeviceQueryRva),
+            "constructor installs original Control device count/query methods");
+        Marshal.WriteIntPtr(owner, 0x20, ani);
+        Marshal.WriteIntPtr(owner, 0x38, deviceInterface);
+        IntPtr profile = fixture.Allocate(27 * 4);
+        Marshal.WriteIntPtr(owner, 0x46c, profile);
+        Marshal.WriteInt32(profile, 26 * 4, unchecked((int)originalWord26));
+        Marshal.WriteInt32(owner, 0x4d8, FloatBits(-999.0f));
+        if (descriptorMobility.Length != 0) {
+            IntPtr rows = fixture.Allocate(descriptorMobility.Length * 0x2c);
+            for (int i = 0; i < descriptorMobility.Length; i++) {
+                IntPtr descriptor = fixture.Allocate(0x20);
+                IntPtr row = IntPtr.Add(rows, i * 0x2c);
+                Marshal.WriteInt32(descriptor, 0x08, FloatBits(descriptorMobility[i]));
+                Marshal.WriteIntPtr(row, 0x00, descriptor);
+                Marshal.WriteInt32(row, 0x08, FloatBits(mutableAmounts[i]));
+                Marshal.WriteInt32(row, 0x20, unchecked((int)0xdeadbeef));
+            }
+            Marshal.WriteIntPtr(owner, 0x55c, rows);
+            Marshal.WriteInt32(owner, 0x560, descriptorMobility.Length);
+        }
+        if (hasCache) {
+            IntPtr cache = fixture.Allocate(0x10);
+            Marshal.WriteIntPtr(owner, 0x5b4, cache);
+            Marshal.WriteInt32(cache, 0x0c, FloatBits(cacheC));
+        }
+        if (deviceKeys.Length != 0) {
+            IntPtr devices = fixture.Allocate(deviceKeys.Length * IntPtr.Size);
+            for (int i = 0; i < deviceKeys.Length; i++) {
+                IntPtr device = fixture.Allocate(0x50);
+                IntPtr descriptor = fixture.Allocate(0x20);
+                Marshal.WriteInt32(device, 0x04, unchecked((int)deviceKeys[i]));
+                Marshal.WriteIntPtr(device, 0x48, descriptor);
+                Marshal.WriteInt32(descriptor, 0x1c, FloatBits(deviceValues[i]));
+                Marshal.WriteIntPtr(devices, i * IntPtr.Size, device);
+            }
+            Marshal.WriteIntPtr(owner, 0x5bc, devices);
+            Marshal.WriteInt32(owner, 0x5c0, deviceKeys.Length);
+        }
+        return owner;
+    }
+
+    private static uint ReadFac0Word(IntPtr address, int offset) {
+        return unchecked((uint)Marshal.ReadInt32(address, offset));
+    }
+
+    private static void ExpectFac0Word(IntPtr address, int offset, float expected, string name) {
+        uint expectedBits = FloatBitsUnsigned(expected);
+        Expect(ReadFac0Word(address, offset) == expectedBits,
+            name + " expected " + Hex(expectedBits) + " got " + Hex(ReadFac0Word(address, offset)));
+    }
+
+    private static void RunFac0CombinedCase(IntPtr controlModule, IntPtr aniMeshModule,
+        NativeControlOwnerConstructor constructOwner, NativeControlProfileFac0 fac0,
+        NativeAniMeshNodeMetadataQuery queryNode, NativeAniMeshRangeLookup findFirst,
+        NativeAniMeshRangeLookup countMatches) {
+        using (Fixture fixture = NewFixture()) {
+            IntPtr ani = CreateFac0AniMesh(fixture, aniMeshModule, new uint[] { 1, 0 }, 2.0f, 3.0f, 5.0f, 7.0f, 11.0f);
+            IntPtr owner = CreateFac0Owner(fixture, controlModule, constructOwner, ani,
+                FloatBitsUnsigned(2000.0f), new float[] { 2.0f, 3.0f }, new float[] { 123.0f, 456.0f },
+                true, 2.0f, new uint[] { 1, 0 }, new float[] { 5.25f, 0.5f });
+            Expect(findFirst(ani, 0) == 1 && countMatches(ani, 0) == 1,
+                "AniMesh component-zero range is first=1,count=1");
+            IntPtr outCell = fixture.Allocate(IntPtr.Size);
+            Expect(NativeBoolean(queryNode(ani, 0, 0x0f, outCell)) == 1 &&
+                ReadFloat(Marshal.ReadIntPtr(outCell), 0) == 42.0f, "original AniMesh selector F result");
+            Expect(NativeBoolean(queryNode(ani, 1, 0x10, outCell)) == 1 &&
+                ReadFloat(Marshal.ReadIntPtr(outCell), 0) == 330.0f, "original AniMesh selector 10 result");
+            fac0(owner);
+            Expect(CurrentX87ControlWord() == 0x007f, "FAC0 combined vector retains CW007f");
+            ExpectFac0Word(owner, 0x530, 84.0f, "aggregate +0x530");
+            ExpectFac0Word(owner, 0x534, 660.0f, "aggregate +0x534");
+            ExpectFac0Word(owner, 0x538, 1823.75f, "aggregate +0x538");
+            ExpectFac0Word(owner, 0x4d8, 1166.25f, "range-gated profile word 26");
+            IntPtr rows = Marshal.ReadIntPtr(owner, 0x55c);
+            ExpectFac0Word(rows, 0x20, 744.5f, "provider row 0 after device key 0");
+            ExpectFac0Word(IntPtr.Add(rows, 0x2c), 0x20, 1079.25f, "provider row 1 after device key 1");
+            Console.WriteLine("native-control-fac0-combined: scales=[2,3,5] slots=[7,11] selector-F/10=[42,330]" +
+                " range=[1,1] descriptor+8=[2,3] mutable-row+8=[123,456] device-word7=[5.25,0.5]" +
+                " totals=[530:" + Hex(ReadFac0Word(owner, 0x530)) + ",534:" + Hex(ReadFac0Word(owner, 0x534)) +
+                ",538:" + Hex(ReadFac0Word(owner, 0x538)) + ",4d8:" + Hex(ReadFac0Word(owner, 0x4d8)) +
+                "] rows20=[" + Hex(ReadFac0Word(rows, 0x20)) + "," +
+                Hex(ReadFac0Word(IntPtr.Add(rows, 0x2c), 0x20)) + "]");
+        }
+    }
+
+    private static uint RunFac0CacheCase(IntPtr controlModule, IntPtr aniMeshModule,
+        NativeControlOwnerConstructor constructOwner, NativeControlProfileFac0 fac0,
+        bool hasCache, float cacheC) {
+        using (Fixture fixture = NewFixture()) {
+            IntPtr ani = CreateFac0AniMesh(fixture, aniMeshModule, new uint[] { 0 }, 2.0f, 3.0f, 5.0f, 7.0f, 11.0f);
+            IntPtr owner = CreateFac0Owner(fixture, controlModule, constructOwner, ani,
+                FloatBitsUnsigned(1000.0f), new float[] { 1.0f }, new float[] { 777.0f }, hasCache,
+                cacheC, new uint[0], new float[0]);
+            fac0(owner);
+            uint row20 = ReadFac0Word(Marshal.ReadIntPtr(owner, 0x55c), 0x20);
+            uint expectedRow20 = FloatBitsUnsigned(330.0f + cacheC * 42.0f);
+            uint expectedFinal = FloatBitsUnsigned(hasCache && cacheC != 0.0f ? 916.0f : 1000.0f);
+            Expect(row20 == expectedRow20, "FAC0 row20 reflects cache presence/value");
+            ExpectFac0Word(owner, 0x530, 42.0f, "cache selector F aggregate");
+            ExpectFac0Word(owner, 0x534, 330.0f, "cache selector 10 aggregate");
+            Expect(ReadFac0Word(owner, 0x4d8) == expectedFinal, "FAC0 cache final profile word");
+            Console.WriteLine("native-control-fac0-cache: ptr=" + (hasCache ? "present" : "null") +
+                " C=" + Hex(FloatBitsUnsigned(cacheC)) + " row20=" + Hex(row20) +
+                " total538=" + Hex(ReadFac0Word(owner, 0x538)) + " final4d8=" + Hex(ReadFac0Word(owner, 0x4d8)));
+            return ReadFac0Word(owner, 0x4d8);
+        }
+    }
+
+    private static void RunFac0NegativeClamp(IntPtr controlModule, IntPtr aniMeshModule,
+        NativeControlOwnerConstructor constructOwner, NativeControlProfileFac0 fac0,
+        NativeAniMeshRangeLookup findFirst, NativeAniMeshRangeLookup countMatches) {
+        using (Fixture fixture = NewFixture()) {
+            IntPtr ani = CreateFac0AniMesh(fixture, aniMeshModule, new uint[] { 1 }, 2.0f, 3.0f, 5.0f, 7.0f, 11.0f);
+            IntPtr owner = CreateFac0Owner(fixture, controlModule, constructOwner, ani, 0,
+                new float[] { 1.0f }, new float[] { 44.0f }, false, 0.0f, new uint[0], new float[0]);
+            Expect(findFirst(ani, 0) == 0xffffffff && countMatches(ani, 0) == 0,
+                "AniMesh reports no component-zero range");
+            fac0(owner);
+            ExpectFac0Word(owner, 0x538, 330.0f, "unranged provider aggregate");
+            Expect(ReadFac0Word(owner, 0x4d8) == 0, "negative result clamps to positive zero");
+            Console.WriteLine("native-control-fac0-negative-clamp: total538=" +
+                Hex(ReadFac0Word(owner, 0x538)) + " final4d8=" + Hex(ReadFac0Word(owner, 0x4d8)));
+        }
+    }
+
+    private static void RunFac0NullAndSignedZeroCases(IntPtr controlModule, IntPtr aniMeshModule,
+        NativeControlOwnerConstructor constructOwner, NativeControlProfileFac0 fac0) {
+        using (Fixture fixture = NewFixture()) {
+            IntPtr owner = CreateFac0Owner(fixture, controlModule, constructOwner, IntPtr.Zero,
+                0xc0a00000, new float[0], new float[0], false, 0.0f, new uint[0], new float[0]);
+            fac0(owner);
+            Expect(ReadFac0Word(owner, 0x4d8) == 0xc0a00000 && ReadFac0Word(owner, 0x530) == 0 &&
+                ReadFac0Word(owner, 0x534) == 0 && ReadFac0Word(owner, 0x538) == 0,
+                "null AniMesh returns after copying word 26 and before clamp");
+            Console.WriteLine("native-control-fac0-null-model: original26=0xc0a00000 final4d8=" +
+                Hex(ReadFac0Word(owner, 0x4d8)));
+        }
+        using (Fixture fixture = NewFixture()) {
+            IntPtr ani = CreateFac0AniMesh(fixture, aniMeshModule, new uint[0], 2.0f, 3.0f, 5.0f, 7.0f, 11.0f);
+            IntPtr owner = CreateFac0Owner(fixture, controlModule, constructOwner, ani, 0x80000000,
+                new float[0], new float[0], false, 0.0f, new uint[0], new float[0]);
+            fac0(owner);
+            Expect(ReadFac0Word(owner, 0x4d8) == 0x80000000, "FAC0 preserves negative zero");
+            Console.WriteLine("native-control-fac0-signed-zero: total538=" +
+                Hex(ReadFac0Word(owner, 0x538)) + " final4d8=" + Hex(ReadFac0Word(owner, 0x4d8)));
+        }
+    }
+
+    private static void RunFac0OrderedCase(IntPtr controlModule, IntPtr aniMeshModule,
+        NativeControlOwnerConstructor constructOwner, NativeControlProfileFac0 fac0) {
+        using (Fixture fixture = NewFixture()) {
+            IntPtr ani = CreateFac0AniMesh(fixture, aniMeshModule, new uint[] { 1, 1, 1 },
+                1.0f, 1.0f, 1.0f, 0.0f, 1.0f);
+            IntPtr owner = CreateFac0Owner(fixture, controlModule, constructOwner, ani,
+                FloatBitsUnsigned(10.0f), new float[] { 16777216.0f, 1.0f, -16777216.0f },
+                new float[] { 13.0f, 17.0f, 19.0f }, false, 0.0f, new uint[0], new float[0]);
+            fac0(owner);
+            IntPtr rows = Marshal.ReadIntPtr(owner, 0x55c);
+            Expect(ReadFac0Word(owner, 0x538) == 0 &&
+                ReadFac0Word(owner, 0x534) == FloatBitsUnsigned(3.0f) &&
+                ReadFac0Word(owner, 0x4d8) == FloatBitsUnsigned(10.0f),
+                "FAC0 keeps forward single-precision aggregate rounding");
+            Expect(ReadFac0Word(rows, 0x20) == 0x4b800000 &&
+                ReadFac0Word(IntPtr.Add(rows, 0x2c), 0x20) == 0x3f800000 &&
+                ReadFac0Word(IntPtr.Add(rows, 0x58), 0x20) == 0xcb800000,
+                "FAC0 preserves provider-row products in source order");
+            Console.WriteLine("native-control-fac0-ordered: row-products=[0x4b800000,0x3f800000,0xcb800000]" +
+                " total538=0x00000000 regrouped=0x3f800000");
+        }
+    }
+
+    private static IntPtr WriteStdCallToFastcallOneArgThunk(int offset, IntPtr fastcallTarget) {
+        // Adapt stdcall(owner) to the native fastcall owner register in ECX.
+        byte[] code = { 0x8b, 0x4c, 0x24, 0x04, 0xb8, 0, 0, 0, 0, 0xff, 0xd0, 0xc2, 0x04, 0x00 };
+        WriteImm32(code, 5, fastcallTarget.ToInt32());
+        IntPtr thunk = IntPtr.Add(fastcallThunks, offset);
+        Marshal.Copy(code, 0, thunk, code.Length);
+        return thunk;
     }
 
     private static void RunNativeControlProviderInitialStateCase(IntPtr controlModule, IntPtr aniMeshModule) {

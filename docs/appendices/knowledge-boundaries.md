@@ -540,14 +540,52 @@ resource-device значения во время игры.
 
 ### Профиль владельца Control из CTLD
 
-Смысл отдельных слов, последующие изменения mutable-копии и чтения в Control
-`fca0/fac0` остаются открытыми. Загрузочный тест проверяет CPU-проекцию, но не
-исполнение native полного загрузчика или игрового tick. Точные writer, RVA и
-указатели описаны в [техническом разделе о загрузке CTLD](script-vm.md#профиль-владельца-control-при-загрузке-ctld).
+Общий проход оригинального `Control.dll!FUN_1000fac0` (RVA `0x0fac0`, SHA-256
+`bcb86318089028548a178b03a21accdce15df0cc85ddd91674cf3c2f55012c6e`) проверен
+прямым x86-вызовом под control word `0x007f` на synthetic backing. Оригинальный
+`AniMesh.dll` query `0x51f0` и методы диапазона component ID `0`
+`0x5780/0x57c0` участвуют в векторе; Rust воспроизводит его raw output bits и
+отдельные cache, order, clamp и signed-zero случаи.
 
-Закрывающий эксперимент: трассировать `LoadControlSystem`,
-`LoadPhysicalModel`, `CreateCollManager` и создание collision objects; связать
-каждый изменяемый field с созданным shape, contact или реакцией на движение.
+Для обычной начальной загрузки scale-input тоже закрыт. AniMesh constructor
+оставляет `+0x158/+0x15c/+0x160` равными `1.0`; перед Control event `4` World3D
+проходит Agent event `0`, AniMesh RVA `0x1a80` вызывает базовый return `0x17df0`
+и передаёт event `4/null` модели, FX, CollManager и CollObject. Их проверенные
+ветви `0x75b0/0x6fc0`, Effect RVA `0x3d30`, Control RVA `0x1ce00` и `0x1fe00`
+не вызывают AniMesh setter `0x14770` и не меняют outer scale. Поэтому FAC0 в
+стандартном `LoadAgent` получает `[1, 1, 1]`. Другой маршрут
+`AddNewObjectToGame`/mirror к setter и последующие placement/tick остаются
+отдельными границами. В synthetic x86-векторе по-прежнему явно заданы `[2,3,5]`;
+он не является источником scale для полного load.
+
+Смысл `Slot68 +0x30/+0x34`, tag-27 cache DWORD, owner accumulators `+0x530`,
+`+0x534`, `+0x538` и результата mutable word `26` не имеет доказанных единиц
+измерения. Неизвестные слова остаются raw; их нельзя подписывать как массу или
+площадь. Synthetic x86 vector напрямую записывает scales `[2, 3, 5]` в
+`AniMesh +0x158/+0x15c/+0x160`; это не значения обычной миссии. Проверка
+стандартных `ArealMap`/`World3D` и AniMesh callback-ветвей до FAC0 подтвердила,
+что setter не вызывается, поэтому полный начальный loader использует defaults
+конструктора `[1, 1, 1]`. Конкретный отдельный путь World3D `AddNewObjectToGame`
+и mirror-варианты передают свой transform-вектор setter-у; это отдельная
+граница, как и более поздние placement/tick.
+
+Полный Rust loader теперь вызывает FAC0 при построении
+`build_control_device_projection` и публикует результат в
+`MissionControlOwnerProfile::load_projection`. Игнорируемый corpus-тест
+`full_load_builds_effective_control_device_table_for_mine_unit_dat` на лицензированном
+`min_l_n1.dat` проверяет 11 устройств, все 25 соответствий provider ordinal
+модели и упорядоченные значения `row +0x20`. Его агрегаты —
+`0x470833fc/0x4897e712/0x4d9452cb` для `+0x530/+0x534/+0x538`; исходный и
+начальный mutable word `26` равны `0x7f7fffff`. Это подтверждает Rust full-load
+результат на оригинальных ресурсах, но не совпадение с полным нативным load
+оригинала. Поведение позже при placement/tick и физический смысл raw-полей
+остаётся неизвестным. Точные RVA, owner layout и векторы приведены в
+[описании изолированного прохода FAC0](script-vm.md#изолированный-проход-fac0).
+
+Остаётся сравнить этот полный mine load с original loader при тех же входных
+данных и продолжить трассировку `LoadControlSystem`, `LoadPhysicalModel`,
+`CreateCollManager` и collision objects, если потребуется связать profile words
+с shapes, contacts или реакцией на движение.
 
 ## DirectPlay wire
 

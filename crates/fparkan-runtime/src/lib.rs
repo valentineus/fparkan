@@ -46,6 +46,8 @@ const CONTROL_CLASS_SOURCE_BTLU: u32 = u32::from_le_bytes(*b"BTLU");
 const CONTROL_CLASS_SOURCE_BULL: u32 = u32::from_le_bytes(*b"BULL");
 const CONTROL_CLASS_SOURCE_WPNS: u32 = u32::from_le_bytes(*b"WPNS");
 const CONTROL_CLASS_SOURCE_STAT: u32 = u32::from_le_bytes(*b"STAT");
+// Canonical Unit DAT LoadAgent reaches FAC0 before a scale setter; defaults are unit scale.
+const CONTROL_LOAD_FAC0_SCALE_BITS: [u32; 3] = [0x3f80_0000; 3];
 
 /// Injectable engine services used by composition roots.
 #[derive(Clone, Default)]
@@ -510,12 +512,51 @@ pub struct MissionControlOwnerProfile {
     pub original_words: [u32; 27],
     /// Initial per-owner copy; this is mutated independently from `original_words`.
     pub current_words: [u32; 27],
+    /// Initial FAC0 projection, separate from base device-table availability.
+    pub load_projection: Result<
+        MissionControlOwnerProfileLoadProjection,
+        MissionControlOwnerProfileLoadProjectionUnavailableReason,
+    >,
+}
+
+/// Initial Control FAC0 load-time values for one owner profile.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissionControlOwnerProfileLoadProjection {
+    /// Native owner aggregates at `+0x530`, `+0x534`, and `+0x538`, as raw bits.
+    pub aggregate_530_bits: u32,
+    pub aggregate_534_bits: u32,
+    pub aggregate_538_bits: u32,
+    /// Native provider-row `+0x20` values in provider-row order.
+    ///
+    /// When available, this length equals the loaded provider-row count.
+    pub row_20_bits: Vec<u32>,
+}
+
+/// Why the initial Control FAC0 profile projection is unavailable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MissionControlOwnerProfileLoadProjectionUnavailableReason {
+    /// AniMesh could not provide a known mapping for the requested global node.
+    UnknownModelMapping { global_node_ordinal: Option<u32> },
+    /// FAC0 requires provider rows, but the NDP table could not be projected.
+    ProviderTableUnavailable(MissionControlNodeProviderTableUnavailableReason),
+    /// A source, intermediate, or resulting float is outside the checked domain.
+    UnsupportedFloat { field: &'static str },
+    /// A device's native provider key exceeds the loaded provider-row table.
+    ProviderKeyOutOfRange { key: u32, row_count: usize },
+    /// An INTO attempted to change a profile tag before the cache was created.
+    MissingProfileCacheOnInto,
 }
 
 struct ControlDeviceProjection {
     devices: Vec<EffectiveControlDevice>,
     owner_profile: Option<MissionControlOwnerProfile>,
     node_provider_status: MissionControlNodeProviderTableStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlLoadProfileSlot {
+    Absent,
+    Present([u32; 2]),
 }
 
 #[derive(Clone, Copy)]
@@ -4770,6 +4811,224 @@ fn check_control_range_probe(
     Ok(())
 }
 
+fn control_load_profile_float(
+    value: f32,
+    field: &'static str,
+) -> Result<f32, MissionControlOwnerProfileLoadProjectionUnavailableReason> {
+    checked_control_float(0, field, value).map_err(|_| {
+        MissionControlOwnerProfileLoadProjectionUnavailableReason::UnsupportedFloat { field }
+    })
+}
+
+fn control_load_profile_product(
+    lhs: f32,
+    rhs: f32,
+    field: &'static str,
+) -> Result<f32, MissionControlOwnerProfileLoadProjectionUnavailableReason> {
+    let lhs = control_load_profile_float(lhs, field)?;
+    let rhs = control_load_profile_float(rhs, field)?;
+    checked_control_product(0, field, lhs, rhs).map_err(|_| {
+        MissionControlOwnerProfileLoadProjectionUnavailableReason::UnsupportedFloat { field }
+    })
+}
+
+fn control_load_profile_sum(
+    lhs: f32,
+    rhs: f32,
+    field: &'static str,
+) -> Result<f32, MissionControlOwnerProfileLoadProjectionUnavailableReason> {
+    let lhs = control_load_profile_float(lhs, field)?;
+    let rhs = control_load_profile_float(rhs, field)?;
+    checked_control_sum(0, field, lhs, rhs).map_err(|_| {
+        MissionControlOwnerProfileLoadProjectionUnavailableReason::UnsupportedFloat { field }
+    })
+}
+
+fn control_load_profile_selector10(
+    slot: ControlLoadProfileSlot,
+    scale_bits: [u32; 3],
+) -> Result<u32, MissionControlOwnerProfileLoadProjectionUnavailableReason> {
+    let ControlLoadProfileSlot::Present(slot_words) = slot else {
+        return Ok(0.0_f32.to_bits());
+    };
+    let scale158 = f32::from_bits(scale_bits[0]);
+    let scale15c = f32::from_bits(scale_bits[1]);
+    let scale160 = f32::from_bits(scale_bits[2]);
+    let selector10 = control_load_profile_product(
+        control_load_profile_product(
+            control_load_profile_product(scale160, scale15c, "selector 0x10 scale")?,
+            scale158,
+            "selector 0x10 scale",
+        )?,
+        f32::from_bits(slot_words[1]),
+        "selector 0x10 slot value",
+    )?;
+    Ok(selector10.to_bits())
+}
+
+fn control_load_profile_selector_f(
+    slot: ControlLoadProfileSlot,
+    scale_bits: [u32; 3],
+) -> Result<u32, MissionControlOwnerProfileLoadProjectionUnavailableReason> {
+    let ControlLoadProfileSlot::Present(slot_words) = slot else {
+        return Ok(0.0_f32.to_bits());
+    };
+    let scale158 = f32::from_bits(scale_bits[0]);
+    let scale15c = f32::from_bits(scale_bits[1]);
+    let selector_f = control_load_profile_product(
+        control_load_profile_product(scale15c, scale158, "selector 0xf scale")?,
+        f32::from_bits(slot_words[0]),
+        "selector 0xf slot value",
+    )?;
+    Ok(selector_f.to_bits())
+}
+
+fn project_control_load_profile(
+    original_words: &[u32; 27],
+    current_words: &mut [u32; 27],
+    provider_rows: &[MissionControlNodeProviderRow],
+    devices: &[EffectiveControlDevice],
+    mesh_slots: Option<&[Option<ControlLoadProfileSlot>]>,
+    mesh_component_ids: &[u32],
+    scale_bits: [u32; 3],
+    cache27_bits: Result<Option<u32>, MissionControlOwnerProfileLoadProjectionUnavailableReason>,
+) -> Result<
+    MissionControlOwnerProfileLoadProjection,
+    MissionControlOwnerProfileLoadProjectionUnavailableReason,
+> {
+    use MissionControlOwnerProfileLoadProjectionUnavailableReason as Unavailable;
+
+    let Some(mesh_slots) = mesh_slots else {
+        return Err(Unavailable::UnknownModelMapping {
+            global_node_ordinal: None,
+        });
+    };
+    let cache27_bits = cache27_bits?;
+    let first_component_zero = mesh_component_ids
+        .iter()
+        .position(|component_id| *component_id == 0)
+        .and_then(|ordinal| u32::try_from(ordinal).ok());
+    let component_zero_count = u32::try_from(
+        mesh_component_ids
+            .iter()
+            .filter(|component_id| **component_id == 0)
+            .count(),
+    )
+    .map_err(|_| Unavailable::UnknownModelMapping {
+        global_node_ordinal: None,
+    })?;
+    let component_zero_end = first_component_zero
+        .map(|first| {
+            first
+                .checked_add(component_zero_count)
+                .ok_or(Unavailable::UnknownModelMapping {
+                    global_node_ordinal: None,
+                })
+        })
+        .transpose()?;
+
+    let mut current_word26 =
+        control_load_profile_float(f32::from_bits(original_words[26]), "profile word 26")?;
+    let mut aggregate_530 = 0.0_f32;
+    let mut aggregate_534 = 0.0_f32;
+    let mut aggregate_538 = 0.0_f32;
+    let mut row_20_bits = Vec::with_capacity(provider_rows.len());
+
+    for (row_index, row) in provider_rows.iter().enumerate() {
+        let row_ordinal =
+            u32::try_from(row_index).map_err(|_| Unavailable::UnknownModelMapping {
+                global_node_ordinal: None,
+            })?;
+        let Some(slot) = mesh_slots.get(row_index).copied().flatten() else {
+            return Err(Unavailable::UnknownModelMapping {
+                global_node_ordinal: Some(row_ordinal),
+            });
+        };
+        let selector10_bits = control_load_profile_selector10(slot, scale_bits)?;
+        let selector10 =
+            control_load_profile_float(f32::from_bits(selector10_bits), "selector 0x10")?;
+        aggregate_534 = control_load_profile_sum(aggregate_534, selector10, "aggregate +0x534")?;
+        let base_amount = control_load_profile_product(
+            row.source_row.mobility_per_volume,
+            selector10,
+            "provider row +0x20 base",
+        )?;
+        let mut row_amount = base_amount;
+        if first_component_zero.is_some_and(|first| {
+            row_ordinal >= first && component_zero_end.is_some_and(|end| row_ordinal < end)
+        }) {
+            current_word26 = control_load_profile_sum(
+                current_word26,
+                base_amount,
+                "profile word 26 base addition",
+            )?;
+        }
+
+        let selector_f = control_load_profile_float(
+            f32::from_bits(control_load_profile_selector_f(slot, scale_bits)?),
+            "selector 0xf",
+        )?;
+        aggregate_530 = control_load_profile_sum(aggregate_530, selector_f, "aggregate +0x530")?;
+        if let Some(cache27_bits) = cache27_bits {
+            let cache_contribution = control_load_profile_product(
+                f32::from_bits(cache27_bits),
+                selector_f,
+                "profile cache contribution",
+            )?;
+            row_amount = control_load_profile_sum(
+                row_amount,
+                cache_contribution,
+                "provider row +0x20 cache addition",
+            )?;
+        }
+        aggregate_538 =
+            control_load_profile_sum(aggregate_538, row_amount, "aggregate +0x538 provider rows")?;
+        row_20_bits.push(row_amount.to_bits());
+    }
+
+    for device in devices.iter().rev() {
+        let row_index = usize::try_from(device.key).ok();
+        let Some(row_index) = row_index.filter(|index| *index < row_20_bits.len()) else {
+            return Err(Unavailable::ProviderKeyOutOfRange {
+                key: device.key,
+                row_count: row_20_bits.len(),
+            });
+        };
+        let contribution = control_load_profile_float(
+            f32::from_bits(device.descriptor.fixed_words[7]),
+            "device descriptor word 7",
+        )?;
+        let row_amount = control_load_profile_sum(
+            f32::from_bits(row_20_bits[row_index]),
+            contribution,
+            "provider row +0x20 device contribution",
+        )?;
+        row_20_bits[row_index] = row_amount.to_bits();
+        aggregate_538 = control_load_profile_sum(
+            aggregate_538,
+            contribution,
+            "aggregate +0x538 device contributions",
+        )?;
+    }
+
+    let final_word26 = control_load_profile_sum(
+        current_word26,
+        -aggregate_538,
+        "profile word 26 final subtraction",
+    )?;
+    current_words[26] = if final_word26 >= 0.0 {
+        final_word26.to_bits()
+    } else {
+        0.0_f32.to_bits()
+    };
+    Ok(MissionControlOwnerProfileLoadProjection {
+        aggregate_530_bits: aggregate_530.to_bits(),
+        aggregate_534_bits: aggregate_534.to_bits(),
+        aggregate_538_bits: aggregate_538.to_bits(),
+        row_20_bits,
+    })
+}
+
 fn behavior_clan_for_selector(
     selector: u32,
     clan_count: usize,
@@ -5180,6 +5439,31 @@ fn native_control_factory_byte_94(factory_tag: u32) -> Option<u8> {
     (factory_tag == 15).then_some(0)
 }
 
+fn initialize_control_profile_cache27(
+    cache: &mut Result<Option<u32>, MissionControlOwnerProfileLoadProjectionUnavailableReason>,
+    descriptor: &PreparedControlTypedRecord,
+) {
+    if descriptor.tag == 27 && cache.is_ok() {
+        *cache = Ok(Some(descriptor.fixed_words[11]));
+    }
+}
+
+fn update_control_profile_cache27_on_into(
+    cache: &mut Result<Option<u32>, MissionControlOwnerProfileLoadProjectionUnavailableReason>,
+    descriptor: &PreparedControlTypedRecord,
+) {
+    if descriptor.tag != 27 {
+        return;
+    }
+    match cache {
+        Ok(Some(value)) => *value = descriptor.fixed_words[11],
+        Ok(None) => *cache = Err(
+            MissionControlOwnerProfileLoadProjectionUnavailableReason::MissingProfileCacheOnInto,
+        ),
+        Err(_) => {}
+    }
+}
+
 #[cfg(test)]
 fn build_control_device_table(
     object_index: usize,
@@ -5351,6 +5635,9 @@ fn build_control_device_projection(
     }
 
     let mut global_mesh_states = Vec::new();
+    let mut global_control_profile_slots = Vec::new();
+    let mut global_mesh_component_ids = Vec::new();
+    let mut root_control_profile_model_known = false;
     let mut global_node_cursor = 0_usize;
     for component_index in active_components.iter().copied() {
         let prototype =
@@ -5368,6 +5655,9 @@ fn build_control_device_projection(
         let model = visual
             .and_then(|visual| visual.model_id)
             .and_then(|model_id| assets.model_by_id(model_id));
+        if is_root {
+            root_control_profile_model_known = model.is_some();
+        }
         let parent_base = if is_ex_to {
             i32::try_from(global_node_cursor)
                 .ok()
@@ -5389,11 +5679,17 @@ fn build_control_device_projection(
                 draft.unit_components[component_index].parent_or_link,
             )
         };
+        let component_id =
+            component_ids[component_index].ok_or(Unavailable::ComponentAlignmentMismatch)?;
         let first_source_node = usize::from(is_ex_to);
         for source_node_index in first_source_node..node_count {
             global_mesh_states.push(model.and_then(|model| {
                 initial_control_mesh_state(model, source_node_index, parent_base, mount_node)
             }));
+            global_control_profile_slots.push(
+                model.and_then(|model| initial_control_profile_slot(model, source_node_index)),
+            );
+            global_mesh_component_ids.push(component_id);
         }
         let contribution = node_count.saturating_sub(first_source_node);
         global_node_cursor = global_node_cursor
@@ -5403,6 +5699,7 @@ fn build_control_device_projection(
 
     let mut devices = Vec::new();
     let mut owner_profile = None;
+    let mut profile_cache27_bits = Ok(None);
     let mut node_provider_status = MissionControlNodeProviderTableStatus::Available(Vec::new());
     let mut has_control_resource = false;
     for component_index in active_components {
@@ -5439,13 +5736,12 @@ fn build_control_device_projection(
         let component_id =
             component_ids[component_index].ok_or(Unavailable::ComponentAlignmentMismatch)?;
         if component_id == 0 {
-            owner_profile = Some(MissionControlOwnerProfile {
-                source: control.source.clone(),
-                unit_component_index: component_index,
-                native_component_id: component_id,
-                original_words: control.native_profile_words,
-                current_words: control.native_profile_words,
-            });
+            owner_profile = Some((
+                control.source.clone(),
+                component_index,
+                component_id,
+                control.native_profile_words,
+            ));
         }
         let is_root = component_index == 0;
         let is_ex_to = prototype.source_type == Some(PROTOTYPE_TYPE_EXTO);
@@ -5494,6 +5790,7 @@ fn build_control_device_projection(
                     control,
                     descriptor,
                 );
+                initialize_control_profile_cache27(&mut profile_cache27_bits, descriptor);
             }
             continue;
         }
@@ -5533,6 +5830,7 @@ fn build_control_device_projection(
                         control,
                         descriptor,
                     );
+                    initialize_control_profile_cache27(&mut profile_cache27_bits, descriptor);
                 }
             }
             ControlTableTarget::Override(target_index) => {
@@ -5561,6 +5859,7 @@ fn build_control_device_projection(
                     });
                 }
                 apply_effective_control_override(device, descriptor, component_index, 0, control);
+                update_control_profile_cache27_on_into(&mut profile_cache27_bits, descriptor);
             }
         }
     }
@@ -5570,6 +5869,39 @@ fn build_control_device_projection(
     if let MissionControlNodeProviderTableStatus::Available(rows) = &mut node_provider_status {
         attach_initial_mesh_states_by_global_ordinal(rows, &global_mesh_states);
     }
+    let owner_profile = owner_profile.map(
+        |(source, unit_component_index, native_component_id, original_words)| {
+            let mut current_words = original_words;
+            let load_projection = match &node_provider_status {
+                MissionControlNodeProviderTableStatus::Available(rows) => {
+                    project_control_load_profile(
+                        &original_words,
+                        &mut current_words,
+                        rows,
+                        &devices,
+                        root_control_profile_model_known
+                            .then_some(global_control_profile_slots.as_slice()),
+                        &global_mesh_component_ids,
+                        CONTROL_LOAD_FAC0_SCALE_BITS,
+                        profile_cache27_bits,
+                    )
+                }
+                MissionControlNodeProviderTableStatus::Unavailable(reason) => Err(
+                    MissionControlOwnerProfileLoadProjectionUnavailableReason::ProviderTableUnavailable(
+                        reason.clone(),
+                    ),
+                ),
+            };
+            MissionControlOwnerProfile {
+                source,
+                unit_component_index,
+                native_component_id,
+                original_words,
+                current_words,
+                load_projection,
+            }
+        },
+    );
     Ok(ControlDeviceProjection {
         devices,
         owner_profile,
@@ -5677,6 +6009,35 @@ fn initial_control_mesh_state(
         flags: control_flags_from_node38_header(node.header_flags),
         stage_count: u32::try_from(stage_prefix.max(1)).ok()?,
     })
+}
+
+fn initial_control_profile_slot(
+    model: &fparkan_assets::PreparedModel,
+    source_node_index: usize,
+) -> Option<ControlLoadProfileSlot> {
+    let node_index = u32::try_from(source_node_index).ok()?;
+    let node_id = NodeId(node_index);
+    node38_metadata(&model.validated, node_id)?;
+    let slot_offset = source_node_index
+        .checked_mul(model.validated.node_stride)?
+        .checked_add(8)?;
+    let slot_bytes = model
+        .validated
+        .nodes_raw
+        .get(slot_offset..slot_offset.checked_add(2)?)?;
+    let raw_slot = u16::from_le_bytes([slot_bytes[0], slot_bytes[1]]);
+    if raw_slot == u16::MAX {
+        return Some(ControlLoadProfileSlot::Absent);
+    }
+    let Some(slot_id) = selected_slot(&model.validated, node_id, Lod(0), Group(0)) else {
+        return None;
+    };
+    let slot_index = usize::try_from(slot_id.0).ok()?;
+    let slot = model.validated.slots.get(slot_index)?;
+    Some(ControlLoadProfileSlot::Present([
+        slot.opaque[0],
+        slot.opaque[1],
+    ]))
 }
 
 fn attach_initial_mesh_states_by_global_ordinal(
@@ -9334,9 +9695,95 @@ mod tests {
         assert_eq!(owner_profile.source, root_source);
         assert_eq!(owner_profile.original_words, root_profile);
         assert_eq!(owner_profile.current_words, root_profile);
+        assert!(matches!(
+            owner_profile.load_projection.as_ref(),
+            Err(
+                MissionControlOwnerProfileLoadProjectionUnavailableReason::ProviderTableUnavailable(
+                    _
+                )
+            )
+        ));
         owner_profile.current_words[3] ^= 0xFFFF;
         assert_eq!(owner_profile.original_words, root_profile);
         assert_ne!(owner_profile.current_words, owner_profile.original_words);
+    }
+
+    #[test]
+    fn full_control_projection_uses_constructor_scales_and_writes_derived_profile_copy() {
+        let mut cache_record = synthetic_control_record(27, 0, 2.0_f32.to_bits(), None);
+        cache_record.fixed_words[7] = 0.0_f32.to_bits();
+        let mut device_record = synthetic_control_record(19, 0, 0, None);
+        device_record.fixed_words[7] = 5.25_f32.to_bits();
+        let mut root = control_with_synthetic_node_data(0, vec![cache_record, device_record], 1);
+        root.native_profile_words[26] = 1000.0_f32.to_bits();
+        root.node_data.as_mut().unwrap().rows[0].mobility_per_volume = 2.0;
+        let (mut draft, mut assets, prototypes) =
+            synthetic_control_fixture(&[None], &[1], &[0], &[0], &[1], vec![Some(root)]);
+        attach_synthetic_model(&mut assets, 0, &[synthetic_node38(0, 0, [true; 3])]);
+        assets.models[0].validated.slots[0].opaque =
+            [7.0_f32.to_bits(), 11.0_f32.to_bits(), 0, 0, 0];
+        draft.scale = [2.0, 3.0, 5.0];
+
+        let projection = build_control_device_projection(
+            0,
+            &draft,
+            &assets,
+            Some(&(0..prototypes.len())),
+            &prototypes,
+        )
+        .expect("complete synthetic owner profile");
+        let profile = projection
+            .owner_profile
+            .expect("native component-zero profile");
+        let load = profile.load_projection.expect("FAC0 load projection");
+        assert_eq!(
+            [
+                load.aggregate_530_bits,
+                load.aggregate_534_bits,
+                load.aggregate_538_bits,
+            ],
+            [7.0_f32.to_bits(), 11.0_f32.to_bits(), 41.25_f32.to_bits()]
+        );
+        assert_eq!(load.row_20_bits, [41.25_f32.to_bits()]);
+        assert_eq!(profile.original_words[26], 1000.0_f32.to_bits());
+        assert_eq!(profile.current_words[26], 980.75_f32.to_bits());
+        assert_eq!(
+            profile.current_words[..26],
+            profile.original_words[..26],
+            "FAC0 changes only mutable profile word 26"
+        );
+    }
+
+    #[test]
+    fn full_control_profile_marks_unknown_root_model_for_empty_table() {
+        let root = control_with_synthetic_node_data(0, Vec::new(), 0);
+        let (draft, assets, prototypes) =
+            synthetic_control_fixture(&[None], &[1], &[0], &[0], &[1], vec![Some(root)]);
+
+        let projection = build_control_device_projection(
+            0,
+            &draft,
+            &assets,
+            Some(&(0..prototypes.len())),
+            &prototypes,
+        )
+        .expect("empty Control table still has an owner profile");
+        assert!(projection.devices.is_empty());
+        assert!(matches!(
+            &projection.node_provider_status,
+            MissionControlNodeProviderTableStatus::Available(rows) if rows.is_empty()
+        ));
+        assert_eq!(
+            projection
+                .owner_profile
+                .expect("root owner profile")
+                .load_projection,
+            Err(
+                MissionControlOwnerProfileLoadProjectionUnavailableReason::UnknownModelMapping {
+                    global_node_ordinal: None,
+                }
+            )
+        );
     }
 
     #[test]
@@ -9366,6 +9813,456 @@ mod tests {
         .expect("child-only Control projection");
 
         assert_eq!(projection.owner_profile, None);
+    }
+
+    #[test]
+    fn control_profile_cache27_tracks_initial_records_and_into_order() {
+        let build = |root_records: Vec<PreparedControlTypedRecord>,
+                     into_record: Option<PreparedControlTypedRecord>| {
+            let mut root = control_with_synthetic_node_data(0, root_records, 1);
+            root.node_data.as_mut().expect("root NDP").rows[0].mobility_per_volume = 1.0;
+            let (source_types, child_counts, parent_or_links, model_nodes, controls) =
+                if let Some(into_record) = into_record {
+                    (
+                        vec![None, Some(PROTOTYPE_TYPE_INTO)],
+                        vec![1, 0],
+                        vec![0, 0],
+                        vec![1, 0],
+                        vec![
+                            Some(root),
+                            Some(synthetic_component_control(
+                                1,
+                                vec![into_record],
+                                PreparedControlEffectSection::Parsed(Vec::new()),
+                            )),
+                        ],
+                    )
+                } else {
+                    (vec![None], vec![0], vec![0], vec![1], vec![Some(root)])
+                };
+            let (draft, mut assets, prototypes) = synthetic_control_fixture(
+                &source_types,
+                &vec![1; source_types.len()],
+                &child_counts,
+                &parent_or_links,
+                &model_nodes,
+                controls,
+            );
+            attach_synthetic_model(&mut assets, 0, &[synthetic_node38(0, 0, [true; 3])]);
+            assets.models[0].validated.slots[0].opaque =
+                [2.0_f32.to_bits(), 3.0_f32.to_bits(), 0, 0, 0];
+            build_control_device_projection(
+                0,
+                &draft,
+                &assets,
+                Some(&(0..prototypes.len())),
+                &prototypes,
+            )
+            .expect("synthetic profile-cache projection")
+            .owner_profile
+            .expect("synthetic owner profile")
+        };
+
+        assert_eq!(
+            build(
+                vec![
+                    synthetic_control_record(27, 0, 2.0_f32.to_bits(), None),
+                    synthetic_control_record(27, 0, 5.0_f32.to_bits(), None),
+                ],
+                None,
+            )
+            .load_projection
+            .expect("last initial tag-27 projection")
+            .row_20_bits,
+            [13.0_f32.to_bits()],
+            "the last initial tag-27 constructor owns cache +0x0c"
+        );
+        assert_eq!(
+            build(
+                vec![synthetic_control_record(27, 0, 2.0_f32.to_bits(), None)],
+                Some(synthetic_control_record(19, 0, 7.0_f32.to_bits(), None)),
+            )
+            .load_projection
+            .expect("non-tag-27 INTO projection")
+            .row_20_bits,
+            [7.0_f32.to_bits()],
+            "INTO with a different new tag keeps the previous tag-27 cache"
+        );
+        assert_eq!(
+            build(
+                vec![synthetic_control_record(27, 0, 2.0_f32.to_bits(), None)],
+                Some(synthetic_control_record(27, 0, 7.0_f32.to_bits(), None)),
+            )
+            .load_projection
+            .expect("tag-27 INTO projection")
+            .row_20_bits,
+            [17.0_f32.to_bits()],
+            "INTO tag 27 updates an allocated cache"
+        );
+        assert_eq!(
+            build(
+                vec![synthetic_control_record(19, 0, 2.0_f32.to_bits(), None)],
+                Some(synthetic_control_record(27, 0, 7.0_f32.to_bits(), None)),
+            )
+            .load_projection,
+            Err(MissionControlOwnerProfileLoadProjectionUnavailableReason::MissingProfileCacheOnInto),
+            "INTO tag 27 cannot create a missing cache"
+        );
+        assert_eq!(
+            build(
+                vec![synthetic_control_record(19, 0, 2.0_f32.to_bits(), None)],
+                None,
+            )
+            .load_projection
+            .expect("profile without tag 27 projection")
+            .row_20_bits,
+            [3.0_f32.to_bits()],
+            "without tag 27 native FAC0 has no cache"
+        );
+    }
+
+    #[test]
+    fn control_profile_cache27_missing_into_remains_unavailable_after_later_append() {
+        let mut cache = Ok(None);
+        update_control_profile_cache27_on_into(
+            &mut cache,
+            &synthetic_control_record(27, 0, 3.0_f32.to_bits(), None),
+        );
+        initialize_control_profile_cache27(
+            &mut cache,
+            &synthetic_control_record(27, 0, 5.0_f32.to_bits(), None),
+        );
+        assert_eq!(
+            cache,
+            Err(MissionControlOwnerProfileLoadProjectionUnavailableReason::MissingProfileCacheOnInto)
+        );
+    }
+
+    #[test]
+    fn control_load_profile_projection_matches_native_fac0_vector() {
+        let mut original_words = [0; 27];
+        original_words[26] = 2000.0_f32.to_bits();
+        let mut current_words = [0; 27];
+        current_words[26] = (-999.0_f32).to_bits();
+        let mut rows = vec![
+            synthetic_node_provider_row(0, 0, 1.0_f32.to_bits()),
+            synthetic_node_provider_row(0, 1, 1.0_f32.to_bits()),
+        ];
+        rows[0].source_row.mobility_per_volume = 2.0;
+        rows[1].source_row.mobility_per_volume = 3.0;
+        rows[0].current_amount_bits = 123.0_f32.to_bits();
+        rows[1].current_amount_bits = 456.0_f32.to_bits();
+        let mut key_one =
+            synthetic_effective_control_device(19, 19, 99.0_f32.to_bits(), None, None);
+        key_one.key = 1;
+        key_one.descriptor.fixed_words[7] = 5.25_f32.to_bits();
+        let mut key_zero =
+            synthetic_effective_control_device(19, 19, 101.0_f32.to_bits(), None, None);
+        key_zero.key = 0;
+        key_zero.descriptor.fixed_words[7] = 0.5_f32.to_bits();
+
+        let projection = project_control_load_profile(
+            &original_words,
+            &mut current_words,
+            &rows,
+            &[key_one, key_zero],
+            Some(&[
+                Some(ControlLoadProfileSlot::Present([
+                    7.0_f32.to_bits(),
+                    11.0_f32.to_bits(),
+                ])),
+                Some(ControlLoadProfileSlot::Present([
+                    7.0_f32.to_bits(),
+                    11.0_f32.to_bits(),
+                ])),
+            ]),
+            &[1, 0],
+            [2.0_f32.to_bits(), 3.0_f32.to_bits(), 5.0_f32.to_bits()],
+            Ok(Some(2.0_f32.to_bits())),
+        )
+        .expect("native FAC0 load vector");
+
+        assert_eq!(projection.aggregate_530_bits, 84.0_f32.to_bits());
+        assert_eq!(projection.aggregate_534_bits, 660.0_f32.to_bits());
+        assert_eq!(projection.aggregate_538_bits, 1823.75_f32.to_bits());
+        assert_eq!(
+            projection.row_20_bits,
+            [744.5_f32.to_bits(), 1079.25_f32.to_bits()]
+        );
+        assert_eq!(current_words[26], 1166.25_f32.to_bits());
+        assert_eq!(original_words[26], 2000.0_f32.to_bits());
+        assert_eq!(rows[0].current_amount_bits, 123.0_f32.to_bits());
+        assert_eq!(rows[1].current_amount_bits, 456.0_f32.to_bits());
+    }
+
+    #[test]
+    fn control_load_profile_projection_matches_native_cache_and_clamp_vectors() {
+        let mut row = synthetic_node_provider_row(0, 0, 1.0_f32.to_bits());
+        row.source_row.mobility_per_volume = 1.0;
+        let rows = [row];
+        let slots = [Some(ControlLoadProfileSlot::Present([
+            7.0_f32.to_bits(),
+            11.0_f32.to_bits(),
+        ]))];
+        let component_ids = [0];
+        let scales = [2.0_f32.to_bits(), 3.0_f32.to_bits(), 5.0_f32.to_bits()];
+        for (cache, expected_row, expected_final) in [
+            (Ok(None), 330.0_f32.to_bits(), 1000.0_f32.to_bits()),
+            (
+                Ok(Some(0.0_f32.to_bits())),
+                330.0_f32.to_bits(),
+                1000.0_f32.to_bits(),
+            ),
+            (
+                Ok(Some(2.0_f32.to_bits())),
+                414.0_f32.to_bits(),
+                916.0_f32.to_bits(),
+            ),
+        ] {
+            let mut original_words = [0; 27];
+            original_words[26] = 1000.0_f32.to_bits();
+            let mut current_words = original_words;
+            let projection = project_control_load_profile(
+                &original_words,
+                &mut current_words,
+                &rows,
+                &[],
+                Some(&slots),
+                &component_ids,
+                scales,
+                cache,
+            )
+            .expect("cache load vector");
+            assert_eq!(projection.row_20_bits, [expected_row]);
+            assert_eq!(projection.aggregate_530_bits, 42.0_f32.to_bits());
+            assert_eq!(projection.aggregate_534_bits, 330.0_f32.to_bits());
+            assert_eq!(projection.aggregate_538_bits, expected_row);
+            assert_eq!(current_words[26], expected_final);
+        }
+
+        let original_words = [0; 27];
+        let mut current_words = original_words;
+        let projection = project_control_load_profile(
+            &original_words,
+            &mut current_words,
+            &rows,
+            &[],
+            Some(&slots),
+            &[1],
+            scales,
+            Ok(None),
+        )
+        .expect("negative-clamp vector");
+        assert_eq!(projection.aggregate_538_bits, 330.0_f32.to_bits());
+        assert_eq!(current_words[26], 0.0_f32.to_bits());
+    }
+
+    #[test]
+    fn control_load_profile_projection_preserves_signed_zero_and_reports_unknown_mapping() {
+        let mut original_words = [0; 27];
+        original_words[26] = 0x8000_0000;
+        let mut current_words = original_words;
+        let projection = project_control_load_profile(
+            &original_words,
+            &mut current_words,
+            &[],
+            &[],
+            Some(&[]),
+            &[],
+            [1.0_f32.to_bits(); 3],
+            Ok(None),
+        )
+        .expect("known empty model without provider rows");
+        assert_eq!(projection.aggregate_530_bits, 0.0_f32.to_bits());
+        assert_eq!(projection.aggregate_534_bits, 0.0_f32.to_bits());
+        assert_eq!(projection.aggregate_538_bits, 0.0_f32.to_bits());
+        assert_eq!(current_words[26], 0x8000_0000);
+
+        let mut original_words = [0; 27];
+        original_words[26] = (-5.0_f32).to_bits();
+        let mut current_words = [0; 27];
+        current_words[26] = (-999.0_f32).to_bits();
+        assert_eq!(
+            project_control_load_profile(
+                &original_words,
+                &mut current_words,
+                &[],
+                &[],
+                None,
+                &[],
+                [1.0_f32.to_bits(); 3],
+                Ok(None),
+            ),
+            Err(
+                MissionControlOwnerProfileLoadProjectionUnavailableReason::UnknownModelMapping {
+                    global_node_ordinal: None,
+                }
+            )
+        );
+        assert_eq!(current_words[26], (-999.0_f32).to_bits());
+
+        let rows = [
+            synthetic_node_provider_row(0, 0, 1.0_f32.to_bits()),
+            synthetic_node_provider_row(0, 1, 1.0_f32.to_bits()),
+        ];
+        let mut original_words = [0; 27];
+        original_words[26] = 100.0_f32.to_bits();
+        let mut current_words = [0; 27];
+        current_words[26] = (-999.0_f32).to_bits();
+        assert_eq!(
+            project_control_load_profile(
+                &original_words,
+                &mut current_words,
+                &rows,
+                &[],
+                Some(&[Some(ControlLoadProfileSlot::Present([0; 2])), None,]),
+                &[0, 0],
+                [1.0_f32.to_bits(); 3],
+                Ok(None),
+            ),
+            Err(
+                MissionControlOwnerProfileLoadProjectionUnavailableReason::UnknownModelMapping {
+                    global_node_ordinal: Some(1),
+                }
+            )
+        );
+        assert_eq!(current_words[26], (-999.0_f32).to_bits());
+
+        let negative_scales = [
+            1.0_f32.to_bits(),
+            (-1.0_f32).to_bits(),
+            (-1.0_f32).to_bits(),
+        ];
+        assert_eq!(
+            control_load_profile_selector10(ControlLoadProfileSlot::Absent, negative_scales),
+            Ok(0.0_f32.to_bits())
+        );
+        assert_eq!(
+            control_load_profile_selector_f(ControlLoadProfileSlot::Absent, negative_scales),
+            Ok(0.0_f32.to_bits())
+        );
+    }
+
+    #[test]
+    fn control_load_profile_projection_preserves_native_order_and_rejects_unsupported_inputs() {
+        let mut rows = (0..3)
+            .map(|index| synthetic_node_provider_row(0, index, 1.0_f32.to_bits()))
+            .collect::<Vec<_>>();
+        for (row, mobility) in rows.iter_mut().zip([16_777_216.0_f32, 1.0, -16_777_216.0]) {
+            row.source_row.mobility_per_volume = mobility;
+        }
+        let mut original_words = [0; 27];
+        original_words[26] = 10.0_f32.to_bits();
+        let mut current_words = original_words;
+        let projection = project_control_load_profile(
+            &original_words,
+            &mut current_words,
+            &rows,
+            &[],
+            Some(&[Some(ControlLoadProfileSlot::Present([0, 1.0_f32.to_bits()])); 3]),
+            &[1, 1, 1],
+            [1.0_f32.to_bits(); 3],
+            Ok(None),
+        )
+        .expect("ordered rounding vector");
+        assert_eq!(
+            projection.row_20_bits,
+            [
+                16_777_216.0_f32.to_bits(),
+                1.0_f32.to_bits(),
+                (-16_777_216.0_f32).to_bits()
+            ]
+        );
+        assert_eq!(projection.aggregate_534_bits, 3.0_f32.to_bits());
+        assert_eq!(projection.aggregate_538_bits, 0.0_f32.to_bits());
+        assert_eq!(current_words[26], 10.0_f32.to_bits());
+
+        let one_row = [synthetic_node_provider_row(0, 0, 1.0_f32.to_bits())];
+        let mut out_of_range = synthetic_effective_control_device(19, 19, 0, None, None);
+        out_of_range.key = 1;
+        let mut original_words = [0; 27];
+        original_words[26] = 10.0_f32.to_bits();
+        let mut current_words = original_words;
+        assert_eq!(
+            project_control_load_profile(
+                &original_words,
+                &mut current_words,
+                &one_row,
+                &[out_of_range],
+                Some(&[Some(ControlLoadProfileSlot::Present([0; 2]))]),
+                &[1],
+                [1.0_f32.to_bits(); 3],
+                Ok(None),
+            ),
+            Err(
+                MissionControlOwnerProfileLoadProjectionUnavailableReason::ProviderKeyOutOfRange {
+                    key: 1,
+                    row_count: 1,
+                }
+            )
+        );
+        assert_eq!(current_words[26], 10.0_f32.to_bits());
+
+        let mut unsupported_row = one_row;
+        unsupported_row[0].source_row.mobility_per_volume = f32::INFINITY;
+        assert_eq!(
+            project_control_load_profile(
+                &original_words,
+                &mut current_words,
+                &unsupported_row,
+                &[],
+                Some(&[Some(ControlLoadProfileSlot::Present([0; 2]))]),
+                &[1],
+                [1.0_f32.to_bits(); 3],
+                Ok(None),
+            ),
+            Err(
+                MissionControlOwnerProfileLoadProjectionUnavailableReason::UnsupportedFloat {
+                    field: "provider row +0x20 base",
+                }
+            )
+        );
+        assert_eq!(current_words[26], 10.0_f32.to_bits());
+
+        assert_eq!(
+            project_control_load_profile(
+                &original_words,
+                &mut current_words,
+                &[],
+                &[],
+                Some(&[]),
+                &[],
+                [1.0_f32.to_bits(); 3],
+                Err(MissionControlOwnerProfileLoadProjectionUnavailableReason::MissingProfileCacheOnInto),
+            ),
+            Err(MissionControlOwnerProfileLoadProjectionUnavailableReason::MissingProfileCacheOnInto)
+        );
+        assert_eq!(current_words[26], 10.0_f32.to_bits());
+    }
+
+    #[test]
+    fn initial_control_profile_slot_uses_native_slot68_fields_and_tracks_absence() {
+        let (_, mut assets, _) =
+            synthetic_control_fixture(&[None], &[1], &[0], &[0], &[1], vec![None]);
+        attach_synthetic_model(&mut assets, 0, &[synthetic_node38(0, 0, [true; 3])]);
+        assets.models[0].validated.slots[0].opaque =
+            [7.0_f32.to_bits(), 11.0_f32.to_bits(), 0, 0, 0];
+        let model = &assets.models[0];
+        assert_eq!(
+            initial_control_profile_slot(model, 0),
+            Some(ControlLoadProfileSlot::Present([
+                7.0_f32.to_bits(),
+                11.0_f32.to_bits(),
+            ]))
+        );
+        assets.models[0].validated.nodes_raw[8..10].copy_from_slice(&1_u16.to_le_bytes());
+        assert_eq!(initial_control_profile_slot(&assets.models[0], 0), None);
+        assets.models[0].validated.nodes_raw[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert_eq!(
+            initial_control_profile_slot(&assets.models[0], 0),
+            Some(ControlLoadProfileSlot::Absent)
+        );
+        assert_eq!(initial_control_profile_slot(&assets.models[0], 1), None);
     }
 
     #[test]
@@ -10093,9 +10990,54 @@ mod tests {
             owner_profile.original_words,
             root_control.native_profile_words
         );
+        let mine_fac0 = owner_profile
+            .load_projection
+            .as_ref()
+            .expect("licensed mine FAC0 projection");
         assert_eq!(
-            owner_profile.current_words,
-            root_control.native_profile_words
+            [
+                mine_fac0.aggregate_530_bits,
+                mine_fac0.aggregate_534_bits,
+                mine_fac0.aggregate_538_bits,
+            ],
+            [0x4708_33fc, 0x4897_e712, 0x4d94_52cb]
+        );
+        assert_eq!(
+            mine_fac0.row_20_bits,
+            [
+                0x0000_0000,
+                0x4c5b_f1ca,
+                0x4d20_1bf8,
+                0x4a1c_9e36,
+                0x4b61_82dd,
+                0x4bbc_015f,
+                0x4a77_2242,
+                0x4914_0fe7,
+                0x4914_0fe7,
+                0x0000_0000,
+                0x4817_baa4,
+                0x4a4e_9ec8,
+                0x4ac1_1a66,
+                0x4a2e_79a9,
+                0x4b0d_6df0,
+                0x48d9_d1f6,
+                0x478d_7e31,
+                0x4ac1_1c86,
+                0x478f_dbf5,
+                0x4817_b6da,
+                0x4b0a_1f75,
+                0x478f_dbf9,
+                0x469f_85b4,
+                0x46b5_5e97,
+                0x46b5_5e94,
+            ]
+        );
+        assert_eq!(mine_fac0.row_20_bits.len(), 25);
+        assert_eq!(owner_profile.original_words[26], 0x7f7f_ffff);
+        assert_eq!(owner_profile.current_words[26], 0x7f7f_ffff);
+        assert_eq!(
+            &owner_profile.current_words[..26],
+            &root_control.native_profile_words[..26]
         );
         assert_ne!(
             root_control.native_profile_words, child_control.native_profile_words,
@@ -10107,6 +11049,7 @@ mod tests {
         else {
             panic!("licensed mine device table should be available");
         };
+        assert_eq!(mine_control_devices.len(), 11);
         assert_eq!(
             mine_control_devices
                 .iter()
