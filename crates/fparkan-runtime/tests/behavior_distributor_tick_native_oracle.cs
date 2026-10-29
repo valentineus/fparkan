@@ -54,6 +54,11 @@ internal static class BehaviorDistributorTickOracle {
     private const int ControlResourceTag9ConstructorRva = 0x25460;
     private const int ControlResourceTag15ConstructorRva = 0x22ae0;
     private const int ControlResourceTag25ConstructorRva = 0x20800;
+    private const int ControlResourceTag9RateRva = 0x25700;
+    private const int ControlResourceTag9UpdateRva = 0x257b0;
+    private const int ControlResourceTag9AdjustRva = 0x25a90;
+    private const int ControlResourceDefaultRateRva = 0x21860;
+    private const int ControlResourceDefaultUpdateRva = 0x21890;
     private const int ControlResourceTag15RateRva = 0x22b20;
     private const int ControlResourceTag15UpdateRva = 0x22bb0;
     private const int ControlResourceBudgetUpdateRva = 0x2d340;
@@ -119,6 +124,7 @@ internal static class BehaviorDistributorTickOracle {
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate IntPtr NativeControlResourceDeviceConstructor(IntPtr self);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlResourceBudgetUpdate(IntPtr self, float deltaSeconds);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate float NativeControlResourceDeviceRate(IntPtr self, float deltaSeconds);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlResourceTag9Update(IntPtr self, float deltaSeconds, float allocation);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate int NativeControlResourceDeviceGate(IntPtr self);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate float NativeControlResourceAvailability(IntPtr self, byte flags);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate IntPtr NativeControlDeviceFactory(IntPtr self, uint componentId, uint keyOffset, IntPtr record);
@@ -706,6 +712,8 @@ internal static class BehaviorDistributorTickOracle {
             RunNativeControlTimedUpdateBaselineCases(controlModule);
             RunNativeControlAggregateResourceCases(controlModule);
             RunNativeControlResourceBudgetTag15Case(controlModule);
+            RunNativeControlResourceBudgetClass9Case(controlModule);
+            RunNativeControlGenericDefaultBudgetCase(controlModule);
             RunNativeControlActivationCase(controlModule);
             RunNativeBehaviorProfileMapCases(module);
             RunNativeBehaviorVarSyntheticCase(module);
@@ -1790,6 +1798,198 @@ internal static class BehaviorDistributorTickOracle {
         return device;
     }
 
+    private static void RunNativeControlResourceBudgetClass9Case(IntPtr module) {
+        NativeControlOwnerConstructor constructOwner = (NativeControlOwnerConstructor)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlOwnerConstructorRva),
+                typeof(NativeControlOwnerConstructor));
+        NativeControlResourceDeviceConstructor constructDevice = (NativeControlResourceDeviceConstructor)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlResourceTag9ConstructorRva),
+                typeof(NativeControlResourceDeviceConstructor));
+        NativeControlProviderRowConstructor constructProvider = (NativeControlProviderRowConstructor)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlProviderRowConstructorRva),
+                typeof(NativeControlProviderRowConstructor));
+        NativeControlResourceDeviceRate rate = (NativeControlResourceDeviceRate)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlResourceTag9RateRva),
+                typeof(NativeControlResourceDeviceRate));
+        NativeControlResourceTag9Update update = (NativeControlResourceTag9Update)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlResourceTag9UpdateRva),
+                typeof(NativeControlResourceTag9Update));
+        NativeControlContactRateUpdate adjust = (NativeControlContactRateUpdate)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlResourceTag9AdjustRva),
+                typeof(NativeControlContactRateUpdate));
+
+        using (Fixture fixture = NewFixture()) {
+            IntPtr owner = fixture.Allocate(0x664);
+            Expect(constructOwner(owner, IntPtr.Zero, 4) == owner, "native class-9 budget owner constructor");
+            IntPtr ndp = fixture.Allocate(0x4c);
+            Marshal.WriteInt32(ndp, 4, FloatBits(100.0f));
+            IntPtr provider = fixture.Allocate(0x2c);
+            constructProvider(provider, ndp);
+            Marshal.WriteInt32(provider, 0x14, FloatBits(0.4f));
+            Marshal.WriteIntPtr(owner, 0x55c, provider);
+            Marshal.WriteInt32(owner, 0x560, 1);
+
+            IntPtr device = fixture.Allocate(0x120);
+            Expect(constructDevice(device) == device &&
+                Marshal.ReadIntPtr(device) == IntPtr.Add(module, ControlResourceTag9VtableRva),
+                "native class-9 constructor installs its original vtable");
+            Expect(Marshal.ReadInt32(device, 0x50) == 0x20,
+                "native class-9 constructor enables its budget callback");
+            for (int i = 0; i < 6; i++) {
+                Expect(Marshal.ReadInt32(device, 0x98 + i * 4) == FloatBits(1.0f) &&
+                    Marshal.ReadInt32(device, 0xb0 + i * 4) == 0,
+                    "native class-9 constructor initializes value/delta row " + i);
+            }
+            IntPtr descriptor = fixture.Allocate(0xb4);
+            Marshal.WriteInt32(descriptor, 0, 9);
+            Marshal.WriteInt32(descriptor, 0x20, FloatBits(0.2f));
+            Marshal.WriteIntPtr(device, 0x3c, owner);
+            Marshal.WriteIntPtr(device, 0x44, IntPtr.Add(owner, 4));
+            Marshal.WriteIntPtr(device, 0x48, descriptor);
+            Marshal.WriteInt32(device, 0x54, FloatBits(0.75f));
+            Marshal.WriteInt32(device, 0x58, FloatBits(0.6f));
+            Marshal.WriteInt32(device, 0x5c, FloatBits(2.0f));
+            Marshal.WriteInt32(device, 0x11c, FloatBits(1.25f));
+            float[] values = { 0.0f, 0.25f, 0.5f, 0.75f, 1.0f, 0.9f };
+            float[] deltas = { 0.1f, -0.2f, 0.0f, 0.3f, -0.4f, 0.5f };
+            for (int i = 0; i < 6; i++) {
+                Marshal.WriteInt32(device, 0x98 + i * 4, FloatBits(values[i]));
+                Marshal.WriteInt32(device, 0xb0 + i * 4, FloatBits(deltas[i]));
+            }
+
+            Expect(FloatBits(rate(device, 0.5f)) == unchecked((int)0xbeae147b),
+                "native class-9 rate uses six values and selector-0 scale");
+            update(device, 0.5f, 1.0f);
+            int[] expectedValues = {
+                unchecked((int)0x3d49a637), unchecked((int)0x3e92e795),
+                unchecked((int)0x3f064d32), unchecked((int)0x3f432699),
+                unchecked((int)0x3f800000), unchecked((int)0x3f67a90a),
+            };
+            int[] expectedDeltas = {
+                unchecked((int)0x3e18cff4), unchecked((int)0xbe26fda3),
+                unchecked((int)0x3cc9a637), unchecked((int)0x3e9fe6cc),
+                unchecked((int)0xbecccccd), unchecked((int)0x3f0142a4),
+            };
+            Expect(Marshal.ReadInt32(device, 0x4c) == FloatBits(1.0f),
+                "native class-9 update stores its allocation multiplier");
+            for (int i = 0; i < 6; i++) {
+                Expect(Marshal.ReadInt32(device, 0x98 + i * 4) == expectedValues[i] &&
+                    Marshal.ReadInt32(device, 0xb0 + i * 4) == expectedDeltas[i],
+                    "native class-9 exact value/delta vector row " + i);
+            }
+            Console.WriteLine("native-control-class9-budget: controlHash=" + ExpectedControlSha256 +
+                " rateRva=0x25700 updateRva=0x257b0 adjustRva=0x25a90 dt=0.5" +
+                " rate=0xbeae147b values=" + String.Join(",", Array.ConvertAll(expectedValues,
+                    value => Hex(unchecked((uint)value)))) +
+                " deltas=" + String.Join(",", Array.ConvertAll(expectedDeltas,
+                    value => Hex(unchecked((uint)value)))));
+
+            IntPtr decreasingDevice = fixture.Allocate(0x120);
+            Expect(constructDevice(decreasingDevice) == decreasingDevice,
+                "native class-9 negative-update constructor");
+            IntPtr decreasingDescriptor = fixture.Allocate(0xb4);
+            Marshal.WriteInt32(decreasingDescriptor, 0, 9);
+            Marshal.WriteInt32(decreasingDescriptor, 0x20, FloatBits(0.2f));
+            Marshal.WriteIntPtr(decreasingDevice, 0x3c, owner);
+            Marshal.WriteIntPtr(decreasingDevice, 0x44, IntPtr.Add(owner, 4));
+            Marshal.WriteIntPtr(decreasingDevice, 0x48, decreasingDescriptor);
+            Marshal.WriteInt32(decreasingDevice, 0x54, FloatBits(10.0f));
+            Marshal.WriteInt32(decreasingDevice, 0x58, FloatBits(0.6f));
+            Marshal.WriteInt32(decreasingDevice, 0x5c, FloatBits(2.0f));
+            Marshal.WriteInt32(decreasingDevice, 0x11c, FloatBits(1.0f));
+            Expect(FloatBits(rate(decreasingDevice, 0.5f)) == unchecked((int)0xbdcccccd),
+                "native class-9 negative case rate");
+            update(decreasingDevice, 0.5f, 0.5f);
+            Expect(Marshal.ReadInt32(decreasingDevice, 0x4c) == FloatBits(0.5f),
+                "native class-9 negative case allocation multiplier");
+            for (int i = 0; i < 6; i++) {
+                Expect(Marshal.ReadInt32(decreasingDevice, 0x98 + i * 4) == unchecked((int)0x3f7fe4b1) &&
+                    Marshal.ReadInt32(decreasingDevice, 0xb0 + i * 4) == unchecked((int)0xb9da740e),
+                    "native class-9 negative value/delta row " + i);
+            }
+            Console.WriteLine("native-control-class9-negative: rate=0xbdcccccd M=0x3f000000" +
+                " values=0x3f7fe4b1x6 deltas=0xb9da740ex6");
+
+            IntPtr averageDevice = fixture.Allocate(0x120);
+            Expect(constructDevice(averageDevice) == averageDevice, "native class-9 average constructor");
+            for (int i = 0; i < 6; i++) {
+                Marshal.WriteInt32(averageDevice, 0x98 + i * 4, FloatBits(i == 0 ? 0.0f : 1.0f));
+                Marshal.WriteInt32(averageDevice, 0xb0 + i * 4, 0);
+            }
+            adjust(averageDevice, 0.1f);
+            Expect(Marshal.ReadInt32(averageDevice, 0x98) == unchecked((int)0x3f19999c) &&
+                Marshal.ReadInt32(averageDevice, 0xb0) == unchecked((int)0x3f19999c),
+                "native class-9 adjustment multiplies by the stored 1/6 constant");
+            for (int i = 1; i < 6; i++) {
+                Expect(Marshal.ReadInt32(averageDevice, 0x98 + i * 4) == FloatBits(1.0f) &&
+                    Marshal.ReadInt32(averageDevice, 0xb0 + i * 4) == 0,
+                    "native class-9 constant-average leaves full rows unchanged");
+            }
+            Console.WriteLine("native-control-class9-average: first=0x3f19999c delta=0x3f19999c");
+        }
+        GC.KeepAlive(rate);
+        GC.KeepAlive(update);
+        GC.KeepAlive(adjust);
+    }
+
+    private static void RunNativeControlGenericDefaultBudgetCase(IntPtr module) {
+        NativeControlOwnerConstructor constructOwner = (NativeControlOwnerConstructor)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlOwnerConstructorRva),
+                typeof(NativeControlOwnerConstructor));
+        NativeControlResourceDeviceConstructor constructDefault = (NativeControlResourceDeviceConstructor)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlResourceTag25ConstructorRva),
+                typeof(NativeControlResourceDeviceConstructor));
+        NativeControlResourceDeviceRate rate = (NativeControlResourceDeviceRate)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlResourceDefaultRateRva),
+                typeof(NativeControlResourceDeviceRate));
+        NativeControlResourceTag9Update update = (NativeControlResourceTag9Update)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlResourceDefaultUpdateRva),
+                typeof(NativeControlResourceTag9Update));
+        NativeControlProviderRowConstructor constructProvider = (NativeControlProviderRowConstructor)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlProviderRowConstructorRva),
+                typeof(NativeControlProviderRowConstructor));
+
+        using (Fixture fixture = NewFixture()) {
+            IntPtr owner = fixture.Allocate(0x664);
+            Expect(constructOwner(owner, IntPtr.Zero, 4) == owner,
+                "native generic-budget owner constructor");
+            IntPtr ndp = fixture.Allocate(0x4c);
+            Marshal.WriteInt32(ndp, 4, FloatBits(100.0f));
+            IntPtr provider = fixture.Allocate(0x2c);
+            constructProvider(provider, ndp);
+            Marshal.WriteInt32(provider, 0x14, FloatBits(0.4f));
+            Marshal.WriteIntPtr(owner, 0x55c, provider);
+            Marshal.WriteInt32(owner, 0x560, 1);
+
+            IntPtr device = fixture.Allocate(0xa4);
+            Expect(constructDefault(device) == device, "native generic default-family constructor");
+            IntPtr vtable = Marshal.ReadIntPtr(device);
+            Expect(vtable == IntPtr.Add(module, ControlResourceTag25VtableRva) &&
+                Marshal.ReadIntPtr(vtable, 0x14) == IntPtr.Add(module, ControlResourceDefaultRateRva) &&
+                Marshal.ReadIntPtr(vtable, 0x18) == IntPtr.Add(module, ControlResourceDefaultUpdateRva),
+                "generic default-family vtable installs native rate/update callbacks");
+            Expect(Marshal.ReadInt32(device, 0x50) == 5 &&
+                Marshal.ReadInt32(device, 0x4c) == FloatBits(1.0f),
+                "generic default-family constructor defaults");
+            IntPtr descriptor = fixture.Allocate(0xb4);
+            Marshal.WriteInt32(descriptor, 0, 12);
+            Marshal.WriteInt32(descriptor, 0x20, FloatBits(0.2f));
+            Marshal.WriteIntPtr(device, 0x3c, owner);
+            Marshal.WriteIntPtr(device, 0x44, IntPtr.Add(owner, 4));
+            Marshal.WriteIntPtr(device, 0x48, descriptor);
+            Expect(FloatBits(rate(device, 0.5f)) == FloatBits(-0.1f),
+                "generic native callback rate is negative descriptor rate times dt");
+            update(device, 0.5f, 0.375f);
+            Expect(Marshal.ReadInt32(device, 0x4c) == FloatBits(0.375f),
+                "generic native callback stores allocation multiplier");
+            Console.WriteLine("native-control-generic-default-budget: controlHash=" + ExpectedControlSha256 +
+                " constructorRva=0x20800 vtable=0x3c448 rateRva=0x21860 updateRva=0x21890" +
+                " descriptor=12 B=0.2 dt=0.5 rate=-0.1 allocation=0.375");
+        }
+        GC.KeepAlive(rate);
+        GC.KeepAlive(update);
+    }
+
     private static void RunNativeControlResourceBudgetTag15Case(IntPtr module) {
         RunNativeControlResourceBudgetEmptyCases(module);
         NativeControlOwnerConstructor constructOwner = (NativeControlOwnerConstructor)Marshal.GetDelegateForFunctionPointer(
@@ -2533,6 +2733,10 @@ internal static class BehaviorDistributorTickOracle {
             0x3cbd8, 0x29940, applyOverride);
         RunNativeControlOverrideReceiverCase(module, 3, 0xa4, 0x20800,
             0x3c448, ControlResourceNoOpStringPairRva, applyOverride);
+        RunNativeControlOverrideReceiverCase(module, 12, 0xa4, 0x20800,
+            0x3c448, ControlResourceNoOpStringPairRva, applyOverride);
+        RunNativeControlOverrideReceiverCase(module, 13, 0xa4, 0x20800,
+            0x3c448, ControlResourceNoOpStringPairRva, applyOverride);
         GC.KeepAlive(applyOverride);
     }
 
@@ -2546,14 +2750,21 @@ internal static class BehaviorDistributorTickOracle {
             "tag-" + tag + " vtable reader resolves to its native implementation");
         Expect(Marshal.ReadIntPtr(expectedVtable, 0x24) == IntPtr.Add(module, stringPairRva),
             "tag-" + tag + " vtable string-pair slot matches its native callback");
+        if (vtableRva == 0x3c448 || vtableRva == 0x3c720 ||
+            vtableRva == 0x3c800 || vtableRva == 0x3c528) {
+            Expect(Marshal.ReadIntPtr(expectedVtable, 0x14) == IntPtr.Add(module, ControlResourceDefaultRateRva) &&
+                Marshal.ReadIntPtr(expectedVtable, 0x18) == IntPtr.Add(module, ControlResourceDefaultUpdateRva),
+                "tag-" + tag + " vtable uses the shared default budget callbacks");
+        }
         using (Fixture fixture = NewFixture()) {
             IntPtr owner = fixture.Allocate(0x5c8);
             IntPtr deviceArray = fixture.Allocate(2 * IntPtr.Size);
-            IntPtr targetDevice = (tag == 3 || tag == 5) ? IntPtr.Zero : fixture.Allocate(objectSize);
+            bool defaultFactory = tag == 3 || tag == 5 || tag == 12 || tag == 13;
+            IntPtr targetDevice = defaultFactory ? IntPtr.Zero : fixture.Allocate(objectSize);
             bool variableTail = tag == 2 || tag == 3 || tag == 4 || tag == 5 || tag == 8 || tag == 10 || tag == 21 || tag == 27;
             IntPtr typedRecord = fixture.Allocate(variableTail ? 0xc0 : 0xb4);
-            if (tag == 3 || tag == 5) {
-                // Tag 3 follows the default factory; case 5 also assigns a derived vtable.
+            if (defaultFactory) {
+                // Tags 3/12/13 follow the default factory; case 5 assigns a derived vtable.
                 Marshal.WriteIntPtr(owner, 0x5bc, deviceArray);
                 Marshal.WriteInt32(owner, 0x5c4, 2);
                 Marshal.WriteInt32(typedRecord, 0, tag);
@@ -2573,6 +2784,10 @@ internal static class BehaviorDistributorTickOracle {
                     Marshal.ReadInt32(targetDevice, 0x4c) == FloatBits(1.0f),
                     "native extended factory constructor defaults");
             }
+            if (tag == 12 || tag == 13)
+                Expect(Marshal.ReadInt32(targetDevice, 0x50) == 5 &&
+                    Marshal.ReadInt32(targetDevice, 0x4c) == FloatBits(1.0f),
+                    "native default-factory tag " + tag + " constructor defaults");
             Marshal.WriteIntPtr(deviceArray, 0, targetDevice);
             Marshal.WriteIntPtr(owner, 0x5bc, deviceArray);
             Marshal.WriteInt32(owner, 0x5c0, 1);

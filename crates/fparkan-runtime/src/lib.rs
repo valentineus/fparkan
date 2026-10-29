@@ -201,6 +201,10 @@ pub struct EffectiveControlDevice {
     pub multiplier_bits: Option<u32>,
     /// Class-9-only scale used by its selector-0 getter.
     pub class9_selector0_scale_bits: Option<u32>,
+    /// Six class-9 budget values at native `+0x98..+0xac`.
+    pub class9_values_bits: Option<[u32; 6]>,
+    /// Six accumulated class-9 changes at native `+0xb0..+0xc4`.
+    pub class9_deltas_bits: Option<[u32; 6]>,
     /// Current native word at `+0x50` when it is known.
     pub native_word_50_bits: Option<u32>,
     /// Current native tag-15 byte at `+0x94`; constructors currently set zero.
@@ -419,7 +423,7 @@ pub enum MissionControlDeviceTableUnavailableReason {
         unit_component_index: usize,
         target_index: u32,
     },
-    /// The receiver tag does not have a verified common override method.
+    /// The receiver's override behavior is not supported.
     UnsupportedOverrideReceiver { factory_tag: u32 },
     /// The EXTO key needs a global model-node mapping that is not available.
     UnsupportedExToNodeMapping { unit_component_index: usize },
@@ -2278,8 +2282,9 @@ pub fn distribute_loaded_mission_control_provider_amount(
 
 /// Runs the supported loaded Control resource-budget pass (`Control.dll+0x2d340`).
 ///
-/// The pass currently supports original factory callbacks for tags 15 and 19,
-/// with current descriptor tags 15 and 19 (native categories 0 and 1). It is an explicit CPU update;
+/// The pass supports the original factory callbacks for tags 9, 15, and 19,
+/// plus the generic default callback pair. Current descriptor category tags are
+/// supported for the native map prefix `0..=34`. This is an explicit CPU update;
 /// the mission clock does not call it yet. Rate outputs at `+0x5dc/+0x5e0` are
 /// stored on the table after a successful pass.
 ///
@@ -2924,7 +2929,9 @@ fn control_resource_budget_pass_inner(
     for index in 0..device_count {
         let device = control_budget_device(table, index)?;
         control_budget_category(device.descriptor.tag)?;
-        if !matches!(device.factory_tag, 15 | 19) {
+        if !matches!(device.factory_tag, 9 | 15 | 19)
+            && !control_factory_uses_generic_budget_callbacks(device.factory_tag)
+        {
             return Err(ControlResourceAccessError::UnsupportedFactoryTag {
                 factory_tag: device.factory_tag,
             });
@@ -3019,11 +3026,14 @@ fn control_resource_budget_pass_inner(
 }
 
 fn control_budget_category(tag: u32) -> Result<usize, ControlResourceAccessError> {
-    match tag {
-        15 => Ok(0),
-        19 => Ok(1),
-        _ => Err(ControlResourceAccessError::UnsupportedCurrentTag { tag }),
-    }
+    const NATIVE_CATEGORY_PREFIX: [usize; 35] = [
+        0, 4, 4, 0, 2, 3, 0, 0, 2, 5, 5, 0, 0, 0, 1, 0, 3, 2, 0, 1, 3, 5, 4, 0, 4, 0, 3, 5, 0, 0,
+        4, 0, 1, 2, 4,
+    ];
+    NATIVE_CATEGORY_PREFIX
+        .get(tag as usize)
+        .copied()
+        .ok_or(ControlResourceAccessError::UnsupportedCurrentTag { tag })
 }
 
 fn control_budget_device(
@@ -3192,12 +3202,95 @@ fn control_device_resource_rate(
     let Some(provider_value) = control_device_budget_active_provider_value(table, device)? else {
         return Ok(0.0);
     };
-    let coefficient_0 = control_device_budget_coefficient(device, 0)?;
     let descriptor_rate =
         control_device_budget_descriptor_float(device, 8, "descriptor resource rate +0x20")?;
 
     match device.factory_tag {
+        9 => {
+            let coefficient_0 = control_device_budget_coefficient(device, 0)?;
+            let coefficient_1 = control_device_budget_coefficient(device, 1)?;
+            let coefficient_2 = control_device_budget_coefficient(device, 2)?;
+            let class9_scale = control_device_float(
+                device,
+                device.class9_selector0_scale_bits,
+                "class-9 selector-0 scale",
+            )?;
+            let capacity_scale = checked_control_product(
+                device.factory_tag,
+                "class-9 scaled capacity coefficient",
+                coefficient_0,
+                class9_scale,
+            )?;
+            let values =
+                device
+                    .class9_values_bits
+                    .ok_or(ControlResourceAccessError::UnsupportedField {
+                        factory_tag: device.factory_tag,
+                        field: "class-9 six values +0x98",
+                    })?;
+            let mut value_sum = 0.0_f32;
+            for bits in values {
+                value_sum = checked_control_sum(
+                    device.factory_tag,
+                    "class-9 value sum",
+                    value_sum,
+                    checked_control_float(
+                        device.factory_tag,
+                        "class-9 value",
+                        f32::from_bits(bits),
+                    )?,
+                )?;
+            }
+            let free_values = checked_control_sum(
+                device.factory_tag,
+                "class-9 free value capacity",
+                6.0,
+                -value_sum,
+            )?;
+            let capacity = checked_control_product(
+                device.factory_tag,
+                "class-9 available capacity",
+                free_values,
+                capacity_scale,
+            )?;
+            let query = checked_control_product(
+                device.factory_tag,
+                "class-9 provider coefficient",
+                coefficient_1,
+                provider_value,
+            )?;
+            let query_interval = checked_control_product(
+                device.factory_tag,
+                "class-9 provider rate times interval",
+                query,
+                delta_time_seconds,
+            )?;
+            let interval_rate = checked_control_product(
+                device.factory_tag,
+                "class-9 interval descriptor rate",
+                delta_time_seconds,
+                descriptor_rate,
+            )?;
+            let selected = if capacity < query_interval {
+                capacity
+            } else {
+                query_interval
+            };
+            let coefficient_cost = checked_control_product(
+                device.factory_tag,
+                "class-9 coefficient cost",
+                coefficient_2,
+                selected,
+            )?;
+            checked_control_sum(
+                device.factory_tag,
+                "class-9 resource rate",
+                -interval_rate,
+                -coefficient_cost,
+            )
+        }
         19 => {
+            let coefficient_0 = control_device_budget_coefficient(device, 0)?;
             let multiplier = control_device_float(device, device.multiplier_bits, "multiplier")?;
             let mut raw = checked_control_product(
                 device.factory_tag,
@@ -3236,6 +3329,7 @@ fn control_device_resource_rate(
             }
         }
         15 => {
+            let coefficient_0 = control_device_budget_coefficient(device, 0)?;
             let coefficient_1 = control_device_budget_coefficient(device, 1)?;
             let interval_rate = checked_control_product(
                 device.factory_tag,
@@ -3283,6 +3377,15 @@ fn control_device_resource_rate(
                 base,
                 -coefficient_cost,
             )
+        }
+        factory_tag if control_factory_uses_generic_budget_callbacks(factory_tag) => {
+            let interval_rate = checked_control_product(
+                device.factory_tag,
+                "generic Control interval descriptor rate",
+                delta_time_seconds,
+                descriptor_rate,
+            )?;
+            Ok(-interval_rate)
         }
         factory_tag => Err(ControlResourceAccessError::UnsupportedFactoryTag { factory_tag }),
     }
@@ -3354,6 +3457,82 @@ fn control_device_resource_update(
         return Ok(());
     };
     match device.factory_tag {
+        9 => {
+            set_control_device_multiplier(table, device_index, allocation)?;
+            let device = control_budget_device(table, device_index)?;
+            let rate = control_device_resource_rate(table, device, delta_time_seconds)?;
+            let allocated_rate = checked_control_product(
+                device.factory_tag,
+                "class-9 allocated rate",
+                rate,
+                allocation,
+            )?;
+            let interval_rate = checked_control_product(
+                device.factory_tag,
+                "class-9 interval descriptor rate",
+                delta_time_seconds,
+                control_device_budget_descriptor_float(
+                    device,
+                    8,
+                    "descriptor resource rate +0x20",
+                )?,
+            )?;
+            let remaining = checked_control_sum(
+                device.factory_tag,
+                "class-9 remaining adjustment",
+                -allocated_rate,
+                -interval_rate,
+            )?;
+            if remaining == 0.0 {
+                return Ok(());
+            }
+            let coefficient_2 = control_device_budget_coefficient(device, 2)?;
+            let raw_change = if coefficient_2 > 0.0 {
+                checked_control_ratio("class-9 adjustment coefficient", remaining, coefficient_2)?
+            } else {
+                let coefficient_1 = control_device_budget_coefficient(device, 1)?;
+                let query = checked_control_product(
+                    device.factory_tag,
+                    "class-9 provider coefficient",
+                    coefficient_1,
+                    provider_value,
+                )?;
+                let query_interval = checked_control_product(
+                    device.factory_tag,
+                    "class-9 provider rate times interval",
+                    query,
+                    delta_time_seconds,
+                )?;
+                if remaining > 0.0 {
+                    query_interval
+                } else {
+                    -query_interval
+                }
+            };
+            let class9_scale = control_device_float(
+                device,
+                device.class9_selector0_scale_bits,
+                "class-9 selector-0 scale",
+            )?;
+            let coefficient_0 = control_device_budget_coefficient(device, 0)?;
+            let capacity_scale = checked_control_product(
+                device.factory_tag,
+                "class-9 scaled capacity coefficient",
+                coefficient_0,
+                class9_scale,
+            )?;
+            if !table.node_provider_distribution_suspended && capacity_scale > 0.0 {
+                let divisor = checked_control_product(
+                    device.factory_tag,
+                    "class-9 six-value scale",
+                    capacity_scale,
+                    6.0,
+                )?;
+                let change =
+                    checked_control_ratio("class-9 value adjustment", raw_change, divisor)?;
+                adjust_control_class9_values(table, device_index, change)?;
+            }
+        }
         19 => {
             let coefficient_0 = control_device_budget_coefficient(&device, 0)?;
             if coefficient_0 < 0.0 {
@@ -3484,8 +3663,162 @@ fn control_device_resource_update(
                 )?;
             }
         }
+        factory_tag if control_factory_uses_generic_budget_callbacks(factory_tag) => {
+            set_control_device_multiplier(table, device_index, allocation)?;
+        }
         factory_tag => {
             return Err(ControlResourceAccessError::UnsupportedFactoryTag { factory_tag })
+        }
+    }
+    Ok(())
+}
+
+fn set_control_device_multiplier(
+    table: &mut MissionControlDeviceTableState,
+    device_index: usize,
+    value: f32,
+) -> Result<(), ControlResourceAccessError> {
+    let device = control_budget_device(table, device_index)?;
+    let factory_tag = device.factory_tag;
+    let value = checked_control_float(factory_tag, "multiplier", value)?;
+    match &mut table.status {
+        MissionControlDeviceTableStatus::Available(devices) => {
+            let Some(device) = devices.get_mut(device_index) else {
+                return Err(ControlResourceAccessError::DeviceIndexOutOfRange {
+                    device_index,
+                    device_count: devices.len(),
+                });
+            };
+            device.multiplier_bits = Some(value.to_bits());
+        }
+        MissionControlDeviceTableStatus::Unavailable(reason) => {
+            return Err(ControlResourceAccessError::TableUnavailable(reason.clone()))
+        }
+    }
+    Ok(())
+}
+
+fn adjust_control_class9_values(
+    table: &mut MissionControlDeviceTableState,
+    device_index: usize,
+    change: f32,
+) -> Result<(), ControlResourceAccessError> {
+    const CLASS9_AVERAGE_FACTOR: f32 = f32::from_bits(0x3e2a_aaab);
+
+    let device = control_budget_device(table, device_index)?;
+    let values = device
+        .class9_values_bits
+        .ok_or(ControlResourceAccessError::UnsupportedField {
+            factory_tag: device.factory_tag,
+            field: "class-9 six values +0x98",
+        })?;
+    let deltas = device
+        .class9_deltas_bits
+        .ok_or(ControlResourceAccessError::UnsupportedField {
+            factory_tag: device.factory_tag,
+            field: "class-9 six deltas +0xb0",
+        })?;
+    let factory_tag = device.factory_tag;
+    let mut sum = 0.0_f32;
+    for bits in values {
+        sum = checked_control_sum(
+            factory_tag,
+            "class-9 value sum",
+            sum,
+            checked_control_float(factory_tag, "class-9 value", f32::from_bits(bits))?,
+        )?;
+    }
+    let average = checked_control_product(
+        factory_tag,
+        "class-9 value average",
+        sum,
+        CLASS9_AVERAGE_FACTOR,
+    )?;
+    let mut updated_values = values;
+    let mut updated_deltas = deltas;
+    if change > 0.0 && average != 1.0 {
+        let remaining =
+            checked_control_sum(factory_tag, "class-9 remaining average", 1.0, -average)?;
+        let factor =
+            checked_control_ratio("class-9 positive adjustment factor", change, remaining)?;
+        let factor = if factor > 1.0 { 1.0 } else { factor };
+        for index in 0..6 {
+            let value =
+                checked_control_float(factory_tag, "class-9 value", f32::from_bits(values[index]))?;
+            let delta = checked_control_float(
+                factory_tag,
+                "class-9 accumulated delta",
+                f32::from_bits(deltas[index]),
+            )?;
+            let room = checked_control_sum(factory_tag, "class-9 value room", 1.0, -value)?;
+            let adjustment = checked_control_product(
+                factory_tag,
+                "class-9 positive value adjustment",
+                room,
+                factor,
+            )?;
+            updated_values[index] = checked_control_sum(
+                factory_tag,
+                "class-9 value after positive adjustment",
+                value,
+                adjustment,
+            )?
+            .to_bits();
+            updated_deltas[index] = checked_control_sum(
+                factory_tag,
+                "class-9 delta after positive adjustment",
+                delta,
+                adjustment,
+            )?
+            .to_bits();
+        }
+    } else if change < 0.0 && average != 0.0 {
+        let factor = checked_control_ratio("class-9 negative adjustment factor", -change, average)?;
+        let factor = if factor > 1.0 { 1.0 } else { factor };
+        for index in 0..6 {
+            let value =
+                checked_control_float(factory_tag, "class-9 value", f32::from_bits(values[index]))?;
+            let delta = checked_control_float(
+                factory_tag,
+                "class-9 accumulated delta",
+                f32::from_bits(deltas[index]),
+            )?;
+            let removed = checked_control_product(
+                factory_tag,
+                "class-9 negative value adjustment",
+                factor,
+                value,
+            )?;
+            updated_values[index] = checked_control_sum(
+                factory_tag,
+                "class-9 value after negative adjustment",
+                value,
+                -removed,
+            )?
+            .to_bits();
+            updated_deltas[index] = checked_control_sum(
+                factory_tag,
+                "class-9 delta after negative adjustment",
+                delta,
+                -removed,
+            )?
+            .to_bits();
+        }
+    }
+
+    match &mut table.status {
+        MissionControlDeviceTableStatus::Available(devices) => {
+            let Some(device) = devices.get_mut(device_index) else {
+                return Err(ControlResourceAccessError::DeviceIndexOutOfRange {
+                    device_index,
+                    device_count: devices.len(),
+                });
+            };
+            device.class9_values_bits = Some(updated_values);
+            device.class9_deltas_bits = Some(updated_deltas);
+        }
+        MissionControlDeviceTableStatus::Unavailable(reason) => {
+            return Err(ControlResourceAccessError::TableUnavailable(reason.clone()))
         }
     }
     Ok(())
@@ -4598,8 +4931,7 @@ fn append_effective_control_device(
     let provenance = control_device_record_provenance(component_index, record_index, control);
     let mut coefficient_words = [0; 16];
     coefficient_words.copy_from_slice(&descriptor.fixed_words[11..27]);
-    let coefficient_bits =
-        control_factory_uses_common_setter(descriptor.tag).then_some(coefficient_words);
+    let coefficient_bits = Some(coefficient_words);
     let (multiplier_bits, default_word_50) = native_control_factory_defaults(descriptor.tag);
     let native_byte_94 = native_control_factory_byte_94(descriptor.tag);
     let native_word_50_bits = if descriptor.fixed_words[6] == u32::MAX {
@@ -4614,6 +4946,8 @@ fn append_effective_control_device(
         coefficient_bits,
         multiplier_bits,
         class9_selector0_scale_bits: (descriptor.tag == 9).then_some(0x3f80_0000),
+        class9_values_bits: (descriptor.tag == 9).then_some([0x3f80_0000; 6]),
+        class9_deltas_bits: (descriptor.tag == 9).then_some([0; 6]),
         native_word_50_bits,
         native_byte_94,
         descriptor: descriptor.clone(),
@@ -4640,23 +4974,24 @@ fn apply_effective_control_override(
         control_device_record_provenance(component_index, record_index, control);
 }
 
-fn control_factory_uses_common_setter(factory_tag: u32) -> bool {
-    matches!(
-        factory_tag,
-        1 | 2 | 3 | 4 | 5 | 8 | 9 | 10 | 15 | 17 | 19 | 21 | 25 | 26 | 27 | 30
-    )
+fn control_factory_uses_generic_budget_callbacks(factory_tag: u32) -> bool {
+    !matches!(factory_tag, 1 | 2 | 5 | 9 | 10 | 15 | 17 | 19 | 26 | 30)
+}
+
+fn control_factory_override_is_supported(factory_tag: u32) -> bool {
+    !matches!(factory_tag, 1 | 17 | 26 | 30)
 }
 
 fn native_control_factory_defaults(factory_tag: u32) -> (Option<u32>, Option<u32>) {
     match factory_tag {
         1 | 4 => (Some(0x3f80_0000), Some(0x200)),
-        3 | 5 | 8 | 21 | 26 => (Some(0x3f80_0000), Some(0x5)),
+        3 | 5 | 8 | 21 | 25 | 26 => (Some(0x3f80_0000), Some(0x5)),
         10 => (Some(0x3f80_0000), Some(0x2000)),
         17 | 19 => (Some(0x3f80_0000), Some(0x20)),
         2 | 27 => (Some(0x3f80_0000), Some(0)),
-        9 | 25 => (Some(0x3f80_0000), None),
+        9 => (Some(0x3f80_0000), Some(0x20)),
         15 => (Some(0x3f80_0000), Some(0)),
-        _ => (None, None),
+        _ => (Some(0x3f80_0000), Some(0x5)),
     }
 }
 
@@ -5029,10 +5364,7 @@ fn build_control_device_projection(
                         target_index,
                     },
                 )?;
-                if !matches!(
-                    device.factory_tag,
-                    2 | 3 | 4 | 5 | 8 | 9 | 10 | 15 | 19 | 21 | 25 | 27
-                ) {
+                if !control_factory_override_is_supported(device.factory_tag) {
                     return Err(Unavailable::UnsupportedOverrideReceiver {
                         factory_tag: device.factory_tag,
                     });
@@ -5927,6 +6259,8 @@ mod tests {
             coefficient_bits: Some(coefficients),
             multiplier_bits,
             class9_selector0_scale_bits: class9_scale_bits,
+            class9_values_bits: (factory_tag == 9).then_some([0x3f80_0000; 6]),
+            class9_deltas_bits: (factory_tag == 9).then_some([0; 6]),
             native_word_50_bits,
             native_byte_94: native_control_factory_byte_94(factory_tag),
             descriptor,
@@ -6080,6 +6414,201 @@ mod tests {
     }
 
     #[test]
+    fn control_budget_class9_device_matches_native_rate_and_update_vectors() {
+        let mut device = synthetic_effective_control_device(
+            9,
+            9,
+            0.75_f32.to_bits(),
+            Some(0.25_f32.to_bits()),
+            Some(1.25_f32.to_bits()),
+        );
+        device.key = 0;
+        device.native_word_50_bits = Some(0x20);
+        device.descriptor.fixed_words[8] = 0.2_f32.to_bits();
+        let coefficients = device.coefficient_bits.as_mut().expect("coefficient table");
+        coefficients[1] = 0.6_f32.to_bits();
+        coefficients[2] = 2.0_f32.to_bits();
+        device.class9_values_bits = Some([
+            0.0_f32.to_bits(),
+            0.25_f32.to_bits(),
+            0.5_f32.to_bits(),
+            0.75_f32.to_bits(),
+            1.0_f32.to_bits(),
+            0.9_f32.to_bits(),
+        ]);
+        device.class9_deltas_bits = Some([
+            0.1_f32.to_bits(),
+            (-0.2_f32).to_bits(),
+            0.0_f32.to_bits(),
+            0.3_f32.to_bits(),
+            (-0.4_f32).to_bits(),
+            0.5_f32.to_bits(),
+        ]);
+        let provider = synthetic_node_provider_row(0, 0, 0.4_f32.to_bits());
+        let mut table = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(vec![device]),
+            MissionControlNodeProviderTableStatus::Available(vec![provider]),
+        );
+
+        let rate = {
+            let device = control_budget_device(&table, 0).expect("class-9 device");
+            control_device_resource_rate(&table, device, 0.5).expect("class-9 rate")
+        };
+        assert_eq!(rate.to_bits(), 0xbeae_147b);
+        control_device_resource_update(&mut table, 0, 0.5, 1.0).expect("class-9 update");
+
+        let MissionControlDeviceTableStatus::Available(devices) = &table.status else {
+            unreachable!();
+        };
+        assert_eq!(devices[0].multiplier_bits, Some(0x3f80_0000));
+        assert_eq!(
+            devices[0].class9_values_bits,
+            Some([
+                0x3d49_a637,
+                0x3e92_e795,
+                0x3f06_4d32,
+                0x3f43_2699,
+                0x3f80_0000,
+                0x3f67_a90a,
+            ])
+        );
+        assert_eq!(
+            devices[0].class9_deltas_bits,
+            Some([
+                0x3e18_cff4,
+                0xbe26_fda3,
+                0x3cc9_a637,
+                0x3e9f_e6cc,
+                0xbecc_cccd,
+                0x3f01_42a4,
+            ])
+        );
+
+        let mut decreasing = synthetic_effective_control_device(
+            9,
+            9,
+            10.0_f32.to_bits(),
+            Some(1.0_f32.to_bits()),
+            Some(1.0_f32.to_bits()),
+        );
+        decreasing.key = 0;
+        decreasing.native_word_50_bits = Some(0x20);
+        decreasing.descriptor.fixed_words[8] = 0.2_f32.to_bits();
+        let coefficients = decreasing
+            .coefficient_bits
+            .as_mut()
+            .expect("coefficient table");
+        coefficients[1] = 0.6_f32.to_bits();
+        coefficients[2] = 2.0_f32.to_bits();
+        decreasing.class9_values_bits = Some([0x3f80_0000; 6]);
+        decreasing.class9_deltas_bits = Some([0; 6]);
+        let provider = synthetic_node_provider_row(0, 0, 0.4_f32.to_bits());
+        let mut table = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(vec![decreasing]),
+            MissionControlNodeProviderTableStatus::Available(vec![provider]),
+        );
+        let rate = {
+            let device = control_budget_device(&table, 0).expect("class-9 device");
+            control_device_resource_rate(&table, device, 0.5).expect("class-9 rate")
+        };
+        assert_eq!(rate.to_bits(), 0xbdcc_cccd);
+        control_device_resource_update(&mut table, 0, 0.5, 0.5).expect("class-9 negative update");
+        let MissionControlDeviceTableStatus::Available(devices) = &table.status else {
+            unreachable!();
+        };
+        assert_eq!(devices[0].multiplier_bits, Some(0x3f00_0000));
+        assert_eq!(devices[0].class9_values_bits, Some([0x3f7f_e4b1; 6]));
+        assert_eq!(devices[0].class9_deltas_bits, Some([0xb9da_740e; 6]));
+    }
+
+    #[test]
+    fn control_class9_adjustment_matches_native_stored_average_factor() {
+        let mut device = synthetic_effective_control_device(
+            9,
+            9,
+            1.0_f32.to_bits(),
+            Some(1.0_f32.to_bits()),
+            Some(1.0_f32.to_bits()),
+        );
+        device.class9_values_bits = Some([
+            0,
+            0x3f80_0000,
+            0x3f80_0000,
+            0x3f80_0000,
+            0x3f80_0000,
+            0x3f80_0000,
+        ]);
+        device.class9_deltas_bits = Some([0; 6]);
+        let mut table =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                device,
+            ]));
+
+        adjust_control_class9_values(&mut table, 0, 0.1).expect("class-9 adjustment");
+
+        let MissionControlDeviceTableStatus::Available(devices) = &table.status else {
+            unreachable!();
+        };
+        assert_eq!(
+            devices[0].class9_values_bits,
+            Some([
+                0x3f19_999c,
+                0x3f80_0000,
+                0x3f80_0000,
+                0x3f80_0000,
+                0x3f80_0000,
+                0x3f80_0000
+            ])
+        );
+        assert_eq!(
+            devices[0].class9_deltas_bits,
+            Some([0x3f19_999c, 0, 0, 0, 0, 0])
+        );
+    }
+
+    #[test]
+    fn class9_into_preserves_runtime_values_and_deltas() {
+        let mut device = synthetic_effective_control_device(
+            9,
+            9,
+            1.0_f32.to_bits(),
+            Some(1.0_f32.to_bits()),
+            Some(1.0_f32.to_bits()),
+        );
+        let values = [
+            0x3d49_a637,
+            0x3e92_e795,
+            0x3f06_4d32,
+            0x3f43_2699,
+            0x3f80_0000,
+            0x3f67_a90a,
+        ];
+        let deltas = [
+            0x3e18_cff4,
+            0xbe26_fda3,
+            0x3cc9_a637,
+            0x3e9f_e6cc,
+            0xbecc_cccd,
+            0x3f01_42a4,
+        ];
+        device.class9_values_bits = Some(values);
+        device.class9_deltas_bits = Some(deltas);
+        let replacement = synthetic_control_record(19, 99, 0x30, None);
+        let control = synthetic_component_control(
+            1,
+            vec![replacement.clone()],
+            PreparedControlEffectSection::Parsed(Vec::new()),
+        );
+
+        apply_effective_control_override(&mut device, &replacement, 1, 0, &control);
+
+        assert_eq!(device.factory_tag, 9);
+        assert_eq!(device.descriptor.tag, 19);
+        assert_eq!(device.class9_values_bits, Some(values));
+        assert_eq!(device.class9_deltas_bits, Some(deltas));
+    }
+
+    #[test]
     fn control_budget_dispatch_matches_non_degenerate_native_pair() {
         let mut table = control_budget_test_table(0.25);
         let MissionControlDeviceTableStatus::Available(devices) = &mut table.status else {
@@ -6108,6 +6637,65 @@ mod tests {
         assert_eq!(rows[0].processed_amount_bits, 0x4220_2b85);
         assert_eq!(rows[0].current_type1_value_bits, 0x3ecd_0481);
         assert_eq!(rows[0].current_accumulated_delta_bits, 0x3d2e_1400);
+    }
+
+    #[test]
+    fn control_budget_generic_default_callbacks_match_native_rate_and_update() {
+        for factory_tag in [3, 4, 6, 8, 12, 13, 21, 25, 27, 34] {
+            let mut device = synthetic_effective_control_device(
+                factory_tag,
+                factory_tag,
+                1.0_f32.to_bits(),
+                Some(1.0_f32.to_bits()),
+                None,
+            );
+            device.key = 0;
+            device.native_word_50_bits = Some(5);
+            device.descriptor.fixed_words[8] = 0.2_f32.to_bits();
+            let provider = synthetic_node_provider_row(0, 0, 0.4_f32.to_bits());
+            let mut table = synthetic_control_device_table_with_providers(
+                MissionControlDeviceTableStatus::Available(vec![device]),
+                MissionControlNodeProviderTableStatus::Available(vec![provider]),
+            );
+
+            let rate = {
+                let device = control_budget_device(&table, 0).expect("generic device");
+                control_device_resource_rate(&table, device, 0.5).expect("generic base rate")
+            };
+            assert_eq!(
+                rate.to_bits(),
+                (-0.1_f32).to_bits(),
+                "factory {factory_tag}"
+            );
+            control_device_resource_update(&mut table, 0, 0.5, 0.375).expect("generic base update");
+            let MissionControlDeviceTableStatus::Available(devices) = &table.status else {
+                unreachable!();
+            };
+            assert_eq!(
+                devices[0].multiplier_bits,
+                Some(0.375_f32.to_bits()),
+                "factory {factory_tag}"
+            );
+        }
+    }
+
+    #[test]
+    fn control_budget_current_tag_categories_match_native_prefix() {
+        let categories = [
+            0, 4, 4, 0, 2, 3, 0, 0, 2, 5, 5, 0, 0, 0, 1, 0, 3, 2, 0, 1, 3, 5, 4, 0, 4, 0, 3, 5, 0,
+            0, 4, 0, 1, 2, 4,
+        ];
+        for (tag, category) in categories.into_iter().enumerate() {
+            assert_eq!(
+                control_budget_category(tag as u32),
+                Ok(category),
+                "current descriptor tag {tag}"
+            );
+        }
+        assert_eq!(
+            control_budget_category(35),
+            Err(ControlResourceAccessError::UnsupportedCurrentTag { tag: 35 })
+        );
     }
 
     #[test]
@@ -6162,7 +6750,7 @@ mod tests {
         let mut table = control_budget_test_table(1.0);
         let unsupported = synthetic_effective_control_device(
             26,
-            26,
+            35,
             1.0_f32.to_bits(),
             Some(1.0_f32.to_bits()),
             None,
@@ -6175,7 +6763,7 @@ mod tests {
 
         assert_eq!(
             control_resource_budget_pass(&mut table, 0.5),
-            Err(ControlResourceAccessError::UnsupportedCurrentTag { tag: 26 })
+            Err(ControlResourceAccessError::UnsupportedCurrentTag { tag: 35 })
         );
         assert_eq!(table, before);
     }
@@ -7657,9 +8245,14 @@ mod tests {
             (3, 5),
             (4, 0x200),
             (5, 5),
+            (6, 5),
             (8, 5),
+            (9, 0x20),
             (10, 0x2000),
+            (12, 5),
+            (13, 5),
             (21, 5),
+            (25, 5),
             (27, 0),
         ] {
             let mut root = synthetic_control_record(factory_tag, 2, 0x20, None);
@@ -7697,15 +8290,22 @@ mod tests {
             assert_eq!(device.multiplier_bits, Some(1.0_f32.to_bits()));
             assert_eq!(device.native_word_50_bits, Some(word_50));
             assert_eq!(device.coefficient_bits.unwrap()[0], 0x30);
+            if factory_tag == 9 {
+                assert_eq!(device.class9_values_bits, Some([0x3f80_0000; 6]));
+                assert_eq!(device.class9_deltas_bits, Some([0; 6]));
+            }
+        }
+        for factory_tag in [1, 17, 26, 30] {
+            assert!(!control_factory_override_is_supported(factory_tag));
         }
     }
 
     #[test]
-    fn control_factory_multiplier_defaults_preserve_unknown_word_50() {
-        for factory_tag in [9, 25] {
+    fn control_factory_defaults_match_native_class_construction() {
+        for (factory_tag, word_50) in [(9, 0x20), (12, 5), (13, 5), (25, 5), (34, 5)] {
             assert_eq!(
                 native_control_factory_defaults(factory_tag),
-                (Some(0x3f80_0000), None)
+                (Some(0x3f80_0000), Some(word_50))
             );
         }
         assert_eq!(
@@ -8831,6 +9431,16 @@ mod tests {
                 (21, 21),
             ]
         );
+        assert_eq!(mine_control_devices[2].native_word_50_bits, Some(0x20));
+        assert_eq!(
+            mine_control_devices[2].class9_selector0_scale_bits,
+            Some(0x3f80_0000)
+        );
+        assert_eq!(
+            mine_control_devices[2].class9_values_bits,
+            Some([0x3f80_0000; 6])
+        );
+        assert_eq!(mine_control_devices[2].class9_deltas_bits, Some([0; 6]));
         assert_eq!(
             advance_loaded_mission_control_budget(&mut mine_engine, mine_control_handle, f32::NAN),
             Err(ControlResourceAccessError::NonFiniteValue {
@@ -8840,7 +9450,7 @@ mod tests {
         );
         assert_eq!(
             advance_loaded_mission_control_budget(&mut mine_engine, mine_control_handle, 0.5),
-            Err(ControlResourceAccessError::UnsupportedCurrentTag { tag: 9 })
+            Err(ControlResourceAccessError::UnsupportedFactoryTag { factory_tag: 26 })
         );
         assert_eq!(
             loaded_mission_control_device_tables(&mine_engine),
