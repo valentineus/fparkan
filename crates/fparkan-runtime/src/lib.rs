@@ -203,6 +203,8 @@ pub struct EffectiveControlDevice {
     pub class9_selector0_scale_bits: Option<u32>,
     /// Current native word at `+0x50` when it is known.
     pub native_word_50_bits: Option<u32>,
+    /// Current native tag-15 byte at `+0x94`; constructors currently set zero.
+    pub native_byte_94: Option<u8>,
     /// Current raw descriptor, including typed values and string bytes.
     pub descriptor: PreparedControlTypedRecord,
     /// Source location that created the original factory instance.
@@ -456,6 +458,10 @@ pub struct MissionControlDeviceTableState {
     pub node_provider_dirty: bool,
     /// Native `+0x618`: distribution returns without changing rows while set.
     pub node_provider_distribution_suspended: bool,
+    /// Native `+0x5dc`, last output rate written by the Control budget pass.
+    pub current_output_rate_5dc_bits: u32,
+    /// Native `+0x5e0`, last output rate written by the Control budget pass.
+    pub current_output_rate_5e0_bits: u32,
 }
 
 struct ControlDeviceProjection {
@@ -1508,6 +1514,8 @@ fn load_mission_with_options(
                         node_provider_amount_bits: initial_node_provider_amount(&projection.node_provider_status),
                         node_provider_dirty: true,
                         node_provider_distribution_suspended: false,
+                        current_output_rate_5dc_bits: 0,
+                        current_output_rate_5e0_bits: 0,
                         node_provider_status: projection.node_provider_status,
                     },
                     Err(reason) => MissionControlDeviceTableState {
@@ -1518,6 +1526,8 @@ fn load_mission_with_options(
                         node_provider_amount_bits: None,
                         node_provider_dirty: false,
                         node_provider_distribution_suspended: false,
+                        current_output_rate_5dc_bits: 0,
+                        current_output_rate_5e0_bits: 0,
                         node_provider_status:
                             MissionControlNodeProviderTableStatus::Unavailable(
                                 MissionControlNodeProviderTableUnavailableReason::DeviceTableUnavailable(
@@ -2266,6 +2276,35 @@ pub fn distribute_loaded_mission_control_provider_amount(
     distribute_control_node_amount(table, delta, mode, revive_exhausted)
 }
 
+/// Runs the supported loaded Control resource-budget pass (`Control.dll+0x2d340`).
+///
+/// The pass currently supports original factory callbacks for tags 15 and 19,
+/// with current descriptor tags 15 and 19 (native categories 0 and 1). It is an explicit CPU update;
+/// the mission clock does not call it yet. Rate outputs at `+0x5dc/+0x5e0` are
+/// stored on the table after a successful pass.
+///
+/// # Errors
+/// Rejects unavailable objects or tables, unknown current categories or
+/// callbacks, and unsupported provider or floating-point state. The complete
+/// table is updated only when every category and callback succeeds.
+pub fn advance_loaded_mission_control_budget(
+    engine: &mut Engine,
+    handle: ObjectHandle,
+    delta_time_seconds: f32,
+) -> Result<(), ControlResourceAccessError> {
+    transform_state(&engine.world, handle).map_err(ControlResourceAccessError::World)?;
+    let loaded = engine
+        .loaded
+        .as_mut()
+        .ok_or(ControlResourceAccessError::MissionUnavailable)?;
+    let table = loaded
+        .control_device_tables
+        .iter_mut()
+        .find(|table| table.handle == handle)
+        .ok_or(ControlResourceAccessError::ObjectUnavailable { handle })?;
+    control_resource_budget_pass(table, delta_time_seconds)
+}
+
 /// Applies the confirmed single-node stage path of native Control `0x11220`.
 ///
 /// Copies parent ratio/stage when requested, updates the processed amount and
@@ -2854,6 +2893,602 @@ fn distribute_control_node_amount_inner(
 
     // Native 0x10ba0 always finishes with 0x11130(root, update_effects=true).
     propagate_control_node_stage_inner(table, 0, true)
+}
+
+fn control_resource_budget_pass(
+    table: &mut MissionControlDeviceTableState,
+    delta_time_seconds: f32,
+) -> Result<(), ControlResourceAccessError> {
+    let delta_time_seconds =
+        checked_control_float(0, "Control resource interval", delta_time_seconds)?;
+    let mut updated = table.clone();
+    control_resource_budget_pass_inner(&mut updated, delta_time_seconds)?;
+    *table = updated;
+    Ok(())
+}
+
+fn control_resource_budget_pass_inner(
+    table: &mut MissionControlDeviceTableState,
+    delta_time_seconds: f32,
+) -> Result<(), ControlResourceAccessError> {
+    let device_count = match &table.status {
+        MissionControlDeviceTableStatus::Available(devices) => devices.len(),
+        MissionControlDeviceTableStatus::Unavailable(reason) => {
+            return Err(ControlResourceAccessError::TableUnavailable(reason.clone()))
+        }
+    };
+
+    // Category selection reads the current descriptor, while virtual callbacks
+    // still belong to the original factory. Reject either unsupported side up
+    // front so no unmodeled rate can affect another device's allocation.
+    for index in 0..device_count {
+        let device = control_budget_device(table, index)?;
+        control_budget_category(device.descriptor.tag)?;
+        if !matches!(device.factory_tag, 15 | 19) {
+            return Err(ControlResourceAccessError::UnsupportedFactoryTag {
+                factory_tag: device.factory_tag,
+            });
+        }
+    }
+
+    let mut category_rates = [0.0_f32; 6];
+    let mut positive_rate_sum = 0.0_f32;
+    for index in 0..device_count {
+        let device = control_budget_device(table, index)?;
+        let rate = control_device_resource_rate(table, &device, delta_time_seconds)?;
+        if rate > 0.0 {
+            positive_rate_sum = checked_control_sum(
+                device.factory_tag,
+                "positive Control resource rate",
+                positive_rate_sum,
+                rate,
+            )?;
+        }
+        let category = control_budget_category(device.descriptor.tag)?;
+        category_rates[category] = checked_control_sum(
+            device.factory_tag,
+            "Control category rate",
+            category_rates[category],
+            rate,
+        )?;
+    }
+
+    let mut budget = positive_rate_sum;
+    for mask in [8, 1, 0x24, 0x10] {
+        budget = control_budget_category_pass(
+            table,
+            &mut category_rates,
+            mask,
+            budget,
+            delta_time_seconds,
+        )?;
+    }
+    budget = checked_control_sum(
+        0,
+        "final Control category budget",
+        budget,
+        -positive_rate_sum,
+    )?;
+    let _remaining =
+        control_budget_category_pass(table, &mut category_rates, 2, budget, delta_time_seconds)?;
+
+    let inverse_interval = if delta_time_seconds > 0.0001 {
+        checked_control_ratio("inverse Control resource interval", 1.0, delta_time_seconds)?
+    } else {
+        0.0
+    };
+    let first_output_sum = checked_control_sum(
+        0,
+        "Control output rate 5dc categories",
+        category_rates[2],
+        category_rates[5],
+    )?;
+    let first_output_sum = checked_control_sum(
+        0,
+        "Control output rate 5dc total",
+        first_output_sum,
+        category_rates[0],
+    )?;
+    let second_output_sum = checked_control_sum(
+        0,
+        "Control output rate 5e0 categories",
+        category_rates[4],
+        category_rates[3],
+    )?;
+    let second_output_sum = checked_control_sum(
+        0,
+        "Control output rate 5e0 total",
+        second_output_sum,
+        category_rates[0],
+    )?;
+    table.current_output_rate_5dc_bits = (-checked_control_product(
+        0,
+        "Control output rate 5dc",
+        first_output_sum,
+        inverse_interval,
+    )?)
+    .to_bits();
+    table.current_output_rate_5e0_bits = (-checked_control_product(
+        0,
+        "Control output rate 5e0",
+        second_output_sum,
+        inverse_interval,
+    )?)
+    .to_bits();
+    Ok(())
+}
+
+fn control_budget_category(tag: u32) -> Result<usize, ControlResourceAccessError> {
+    match tag {
+        15 => Ok(0),
+        19 => Ok(1),
+        _ => Err(ControlResourceAccessError::UnsupportedCurrentTag { tag }),
+    }
+}
+
+fn control_budget_device(
+    table: &MissionControlDeviceTableState,
+    device_index: usize,
+) -> Result<&EffectiveControlDevice, ControlResourceAccessError> {
+    let devices = match &table.status {
+        MissionControlDeviceTableStatus::Available(devices) => devices,
+        MissionControlDeviceTableStatus::Unavailable(reason) => {
+            return Err(ControlResourceAccessError::TableUnavailable(reason.clone()))
+        }
+    };
+    devices
+        .get(device_index)
+        .ok_or(ControlResourceAccessError::DeviceIndexOutOfRange {
+            device_index,
+            device_count: devices.len(),
+        })
+}
+
+fn control_device_provider_value(
+    table: &MissionControlDeviceTableState,
+    device: &EffectiveControlDevice,
+) -> Result<f32, ControlResourceAccessError> {
+    let provider = control_node_provider_row(table, device.key)?;
+    checked_control_float(
+        device.factory_tag,
+        "node provider value",
+        f32::from_bits(provider.current_type1_value_bits),
+    )
+}
+
+fn control_device_budget_active_provider_value(
+    table: &MissionControlDeviceTableState,
+    device: &EffectiveControlDevice,
+) -> Result<Option<f32>, ControlResourceAccessError> {
+    let word_50 =
+        device
+            .native_word_50_bits
+            .ok_or(ControlResourceAccessError::UnsupportedField {
+                factory_tag: device.factory_tag,
+                field: "budget callback word +0x50",
+            })?;
+    if word_50 == 0 {
+        return Ok(None);
+    }
+    let provider_value = control_device_provider_value(table, device)?;
+    if provider_value == 0.0 {
+        return Ok(None);
+    }
+    Ok(Some(provider_value))
+}
+
+fn control_device_budget_coefficient(
+    device: &EffectiveControlDevice,
+    index: usize,
+) -> Result<f32, ControlResourceAccessError> {
+    let coefficients =
+        device
+            .coefficient_bits
+            .ok_or(ControlResourceAccessError::UnsupportedField {
+                factory_tag: device.factory_tag,
+                field: "coefficient table",
+            })?;
+    let bits =
+        coefficients
+            .get(index)
+            .copied()
+            .ok_or(ControlResourceAccessError::UnsupportedField {
+                factory_tag: device.factory_tag,
+                field: "coefficient index",
+            })?;
+    control_device_float(device, Some(bits), "coefficient")
+}
+
+fn control_device_budget_descriptor_float(
+    device: &EffectiveControlDevice,
+    word_index: usize,
+    field: &'static str,
+) -> Result<f32, ControlResourceAccessError> {
+    let bits = device
+        .descriptor
+        .fixed_words
+        .get(word_index)
+        .copied()
+        .ok_or(ControlResourceAccessError::UnsupportedField {
+            factory_tag: device.factory_tag,
+            field,
+        })?;
+    checked_control_float(device.factory_tag, field, f32::from_bits(bits))
+}
+
+fn control_device_resource_availability(
+    table: &MissionControlDeviceTableState,
+    factory_tag: u32,
+    revive_exhausted: bool,
+) -> Result<f32, ControlResourceAccessError> {
+    if revive_exhausted {
+        let maximum = table.node_provider_maximum_amount_bits.ok_or(
+            ControlResourceAccessError::UnsupportedField {
+                factory_tag,
+                field: "provider maximum aggregate",
+            },
+        )?;
+        let amount = table.node_provider_amount_bits.ok_or(
+            ControlResourceAccessError::UnsupportedField {
+                factory_tag,
+                field: "provider amount aggregate",
+            },
+        )?;
+        return checked_control_sum(
+            factory_tag,
+            "revive provider availability",
+            checked_control_float(
+                factory_tag,
+                "provider maximum aggregate",
+                f32::from_bits(maximum),
+            )?,
+            -checked_control_float(
+                factory_tag,
+                "provider amount aggregate",
+                f32::from_bits(amount),
+            )?,
+        );
+    }
+
+    let rows = match &table.node_provider_status {
+        MissionControlNodeProviderTableStatus::Available(rows) => rows,
+        MissionControlNodeProviderTableStatus::Unavailable(reason) => {
+            return Err(ControlResourceAccessError::NodeProviderTableUnavailable(
+                reason.clone(),
+            ))
+        }
+    };
+    let mut availability = 0.0_f32;
+    for row in rows {
+        let amount = checked_control_float(
+            factory_tag,
+            "provider amount for availability",
+            f32::from_bits(row.current_amount_bits),
+        )?;
+        if amount > 0.0 {
+            let maximum = checked_control_float(
+                factory_tag,
+                "provider maximum for availability",
+                row.source_row.max_volume,
+            )?;
+            let free =
+                checked_control_sum(factory_tag, "provider free availability", maximum, -amount)?;
+            availability = checked_control_sum(
+                factory_tag,
+                "total provider availability",
+                availability,
+                free,
+            )?;
+        }
+    }
+    Ok(availability)
+}
+
+fn control_device_resource_rate(
+    table: &MissionControlDeviceTableState,
+    device: &EffectiveControlDevice,
+    delta_time_seconds: f32,
+) -> Result<f32, ControlResourceAccessError> {
+    let Some(provider_value) = control_device_budget_active_provider_value(table, device)? else {
+        return Ok(0.0);
+    };
+    let coefficient_0 = control_device_budget_coefficient(device, 0)?;
+    let descriptor_rate =
+        control_device_budget_descriptor_float(device, 8, "descriptor resource rate +0x20")?;
+
+    match device.factory_tag {
+        19 => {
+            let multiplier = control_device_float(device, device.multiplier_bits, "multiplier")?;
+            let mut raw = checked_control_product(
+                device.factory_tag,
+                "generator descriptor rate times multiplier",
+                descriptor_rate,
+                multiplier,
+            )?;
+            raw = checked_control_product(
+                device.factory_tag,
+                "generator rate times provider value",
+                raw,
+                provider_value,
+            )?;
+            raw = checked_control_product(
+                device.factory_tag,
+                "generator rate times interval",
+                raw,
+                delta_time_seconds,
+            )?;
+            if coefficient_0 > 0.0 {
+                let cap = checked_control_product(
+                    device.factory_tag,
+                    "generator coefficient times multiplier",
+                    coefficient_0,
+                    multiplier,
+                )?;
+                let cap = checked_control_product(
+                    device.factory_tag,
+                    "generator cap times provider value",
+                    cap,
+                    provider_value,
+                )?;
+                Ok(if raw < cap { raw } else { cap })
+            } else {
+                Ok(raw)
+            }
+        }
+        15 => {
+            let coefficient_1 = control_device_budget_coefficient(device, 1)?;
+            let interval_rate = checked_control_product(
+                device.factory_tag,
+                "tag-15 interval times descriptor rate",
+                delta_time_seconds,
+                descriptor_rate,
+            )?;
+            let base = -interval_rate;
+            let query = checked_control_product(
+                device.factory_tag,
+                "tag-15 provider coefficient",
+                coefficient_0,
+                provider_value,
+            )?;
+            let query_interval = checked_control_product(
+                device.factory_tag,
+                "tag-15 provider rate times interval",
+                query,
+                delta_time_seconds,
+            )?;
+            let revive_exhausted =
+                device
+                    .native_byte_94
+                    .ok_or(ControlResourceAccessError::UnsupportedField {
+                        factory_tag: device.factory_tag,
+                        field: "tag-15 byte +0x94",
+                    })?
+                    != 0;
+            let available =
+                control_device_resource_availability(table, device.factory_tag, revive_exhausted)?;
+            let selected = if available < query_interval {
+                available
+            } else {
+                query_interval
+            };
+            let coefficient_cost = checked_control_product(
+                device.factory_tag,
+                "tag-15 coefficient cost",
+                coefficient_1,
+                selected,
+            )?;
+            checked_control_sum(
+                device.factory_tag,
+                "tag-15 resource rate",
+                base,
+                -coefficient_cost,
+            )
+        }
+        factory_tag => Err(ControlResourceAccessError::UnsupportedFactoryTag { factory_tag }),
+    }
+}
+
+fn control_budget_category_pass(
+    table: &mut MissionControlDeviceTableState,
+    category_rates: &mut [f32; 6],
+    category_mask: u32,
+    budget: f32,
+    delta_time_seconds: f32,
+) -> Result<f32, ControlResourceAccessError> {
+    const CATEGORY_MASKS: [u32; 6] = [1, 2, 4, 8, 16, 32];
+
+    let mut demand = 0.0_f32;
+    for (index, mask) in CATEGORY_MASKS.into_iter().enumerate() {
+        if category_mask & mask != 0 {
+            demand =
+                checked_control_sum(0, "Control category demand", demand, -category_rates[index])?;
+        }
+    }
+    if demand == 0.0 {
+        return Ok(budget);
+    }
+    let requested_allocation =
+        checked_control_ratio("Control category allocation", budget, demand)?;
+    let allocation = if requested_allocation <= 1.0 {
+        requested_allocation
+    } else {
+        1.0
+    };
+    let spent = checked_control_product(0, "Control category budget spent", allocation, demand)?;
+
+    for (index, mask) in CATEGORY_MASKS.into_iter().enumerate() {
+        if category_mask & mask != 0 {
+            category_rates[index] = checked_control_product(
+                0,
+                "scaled Control category rate",
+                allocation,
+                category_rates[index],
+            )?;
+        }
+    }
+
+    let device_count = match &table.status {
+        MissionControlDeviceTableStatus::Available(devices) => devices.len(),
+        MissionControlDeviceTableStatus::Unavailable(reason) => {
+            return Err(ControlResourceAccessError::TableUnavailable(reason.clone()))
+        }
+    };
+    for index in 0..device_count {
+        let device = control_budget_device(table, index)?;
+        if category_mask & CATEGORY_MASKS[control_budget_category(device.descriptor.tag)?] != 0 {
+            control_device_resource_update(table, index, delta_time_seconds, allocation)?;
+        }
+    }
+
+    checked_control_sum(0, "remaining Control category budget", budget, -spent)
+}
+
+fn control_device_resource_update(
+    table: &mut MissionControlDeviceTableState,
+    device_index: usize,
+    delta_time_seconds: f32,
+    allocation: f32,
+) -> Result<(), ControlResourceAccessError> {
+    let device = control_budget_device(table, device_index)?;
+    let Some(provider_value) = control_device_budget_active_provider_value(table, &device)? else {
+        return Ok(());
+    };
+    match device.factory_tag {
+        19 => {
+            let coefficient_0 = control_device_budget_coefficient(&device, 0)?;
+            if coefficient_0 < 0.0 {
+                return Ok(());
+            }
+            let multiplier = control_device_float(&device, device.multiplier_bits, "multiplier")?;
+            let rate = control_device_resource_rate(table, &device, delta_time_seconds)?;
+            let consumed = checked_control_product(
+                device.factory_tag,
+                "generator allocated rate",
+                rate,
+                allocation,
+            )?;
+            let divisor = checked_control_product(
+                device.factory_tag,
+                "generator reserve divisor",
+                coefficient_0,
+                provider_value,
+            )?;
+            let reserve_change =
+                checked_control_ratio("generator reserve change", consumed, divisor)?;
+            let new_multiplier = checked_control_sum(
+                device.factory_tag,
+                "generator multiplier after budget",
+                multiplier,
+                -reserve_change,
+            )?;
+            match &mut table.status {
+                MissionControlDeviceTableStatus::Available(devices) => {
+                    let Some(device) = devices.get_mut(device_index) else {
+                        return Err(ControlResourceAccessError::DeviceIndexOutOfRange {
+                            device_index,
+                            device_count: devices.len(),
+                        });
+                    };
+                    device.multiplier_bits = Some(new_multiplier.to_bits());
+                }
+                MissionControlDeviceTableStatus::Unavailable(reason) => {
+                    return Err(ControlResourceAccessError::TableUnavailable(reason.clone()))
+                }
+            }
+        }
+        15 => {
+            match &mut table.status {
+                MissionControlDeviceTableStatus::Available(devices) => {
+                    let Some(device) = devices.get_mut(device_index) else {
+                        return Err(ControlResourceAccessError::DeviceIndexOutOfRange {
+                            device_index,
+                            device_count: devices.len(),
+                        });
+                    };
+                    device.multiplier_bits = Some(allocation.to_bits());
+                }
+                MissionControlDeviceTableStatus::Unavailable(reason) => {
+                    return Err(ControlResourceAccessError::TableUnavailable(reason.clone()))
+                }
+            };
+            let device = control_budget_device(table, device_index)?;
+            let coefficient_1 = control_device_budget_coefficient(&device, 1)?;
+            let rate = control_device_resource_rate(table, &device, delta_time_seconds)?;
+            let allocated_rate = checked_control_product(
+                device.factory_tag,
+                "tag-15 allocated rate",
+                rate,
+                allocation,
+            )?;
+            let interval_rate = checked_control_product(
+                device.factory_tag,
+                "tag-15 interval descriptor rate",
+                delta_time_seconds,
+                control_device_budget_descriptor_float(
+                    &device,
+                    8,
+                    "descriptor resource rate +0x20",
+                )?,
+            )?;
+            let remaining = checked_control_sum(
+                device.factory_tag,
+                "tag-15 remaining amount",
+                -allocated_rate,
+                -interval_rate,
+            )?;
+            if remaining < 0.0 {
+                return Ok(());
+            }
+            let revive_exhausted =
+                device
+                    .native_byte_94
+                    .ok_or(ControlResourceAccessError::UnsupportedField {
+                        factory_tag: device.factory_tag,
+                        field: "tag-15 byte +0x94",
+                    })?
+                    != 0;
+            let delta = if coefficient_1 > 0.0 {
+                checked_control_ratio("tag-15 provider amount change", remaining, coefficient_1)?
+            } else {
+                let available = control_device_resource_availability(
+                    table,
+                    device.factory_tag,
+                    revive_exhausted,
+                )?;
+                let provider_value = control_device_provider_value(table, &device)?;
+                let coefficient_0 = control_device_budget_coefficient(&device, 0)?;
+                let query = checked_control_product(
+                    device.factory_tag,
+                    "tag-15 provider coefficient",
+                    coefficient_0,
+                    provider_value,
+                )?;
+                let query_interval = checked_control_product(
+                    device.factory_tag,
+                    "tag-15 provider rate times interval",
+                    query,
+                    delta_time_seconds,
+                )?;
+                if available < query_interval {
+                    available
+                } else {
+                    query_interval
+                }
+            };
+            if !table.node_provider_distribution_suspended && delta != 0.0 {
+                distribute_control_node_amount_inner(
+                    table,
+                    delta,
+                    ControlNodeDistributionMode::Sequential,
+                    revive_exhausted,
+                )?;
+            }
+        }
+        factory_tag => {
+            return Err(ControlResourceAccessError::UnsupportedFactoryTag { factory_tag })
+        }
+    }
+    Ok(())
 }
 
 fn apply_control_node_delta(
@@ -3966,6 +4601,7 @@ fn append_effective_control_device(
     let coefficient_bits =
         control_factory_uses_common_setter(descriptor.tag).then_some(coefficient_words);
     let (multiplier_bits, default_word_50) = native_control_factory_defaults(descriptor.tag);
+    let native_byte_94 = native_control_factory_byte_94(descriptor.tag);
     let native_word_50_bits = if descriptor.fixed_words[6] == u32::MAX {
         default_word_50
     } else {
@@ -3979,6 +4615,7 @@ fn append_effective_control_device(
         multiplier_bits,
         class9_selector0_scale_bits: (descriptor.tag == 9).then_some(0x3f80_0000),
         native_word_50_bits,
+        native_byte_94,
         descriptor: descriptor.clone(),
         factory_provenance: provenance.clone(),
         descriptor_provenance: provenance,
@@ -4017,9 +4654,14 @@ fn native_control_factory_defaults(factory_tag: u32) -> (Option<u32>, Option<u32
         10 => (Some(0x3f80_0000), Some(0x2000)),
         17 | 19 => (Some(0x3f80_0000), Some(0x20)),
         2 | 27 => (Some(0x3f80_0000), Some(0)),
-        9 | 15 | 25 => (Some(0x3f80_0000), None),
+        9 | 25 => (Some(0x3f80_0000), None),
+        15 => (Some(0x3f80_0000), Some(0)),
         _ => (None, None),
     }
+}
+
+fn native_control_factory_byte_94(factory_tag: u32) -> Option<u8> {
+    (factory_tag == 15).then_some(0)
 }
 
 #[cfg(test)]
@@ -5277,6 +5919,7 @@ mod tests {
         let provenance = control_device_record_provenance(0, 0, &control);
         let mut coefficients = [0; 16];
         coefficients[0] = coefficient_bits;
+        let (_, native_word_50_bits) = native_control_factory_defaults(factory_tag);
         EffectiveControlDevice {
             factory_tag,
             component_id: 3,
@@ -5284,7 +5927,8 @@ mod tests {
             coefficient_bits: Some(coefficients),
             multiplier_bits,
             class9_selector0_scale_bits: class9_scale_bits,
-            native_word_50_bits: None,
+            native_word_50_bits,
+            native_byte_94: native_control_factory_byte_94(factory_tag),
             descriptor,
             factory_provenance: provenance.clone(),
             descriptor_provenance: provenance,
@@ -5317,8 +5961,249 @@ mod tests {
             node_provider_amount_bits: initial_node_provider_amount(&node_provider_status),
             node_provider_dirty: false,
             node_provider_distribution_suspended: false,
+            current_output_rate_5dc_bits: 0,
+            current_output_rate_5e0_bits: 0,
             node_provider_status,
         }
+    }
+
+    fn control_budget_test_table(generator_coefficient: f32) -> MissionControlDeviceTableState {
+        let mut generator = synthetic_effective_control_device(
+            19,
+            19,
+            generator_coefficient.to_bits(),
+            Some(1.0_f32.to_bits()),
+            None,
+        );
+        generator.key = 0;
+        generator.coefficient_bits.as_mut().unwrap()[1] = 1.0_f32.to_bits();
+        generator.descriptor.fixed_words[8] = 0.5_f32.to_bits();
+
+        let mut consumer = synthetic_effective_control_device(
+            15,
+            15,
+            1.0_f32.to_bits(),
+            Some(1.0_f32.to_bits()),
+            None,
+        );
+        consumer.key = 0;
+        consumer.coefficient_bits.as_mut().unwrap()[1] = 1.0_f32.to_bits();
+        consumer.native_word_50_bits = Some(1);
+
+        let mut provider = synthetic_node_provider_row(0, 0, 0.4_f32.to_bits());
+        provider.source_row.max_volume = 100.0;
+        provider.initial_amount_bits = 40.0_f32.to_bits();
+        provider.current_amount_bits = 40.0_f32.to_bits();
+        provider.current_accumulated_delta_bits = 0.0_f32.to_bits();
+        provider.processed_amount_bits = 40.0_f32.to_bits();
+        provider.initial_type1_value_bits = 0.4_f32.to_bits();
+        provider.current_type1_value_bits = 0.4_f32.to_bits();
+        provider.current_flags = Some(0);
+        provider.current_stage = 0;
+        provider.initial_mesh_state = Some(MissionControlNodeInitialMeshState {
+            parent_index: -1,
+            flags: 0,
+            stage_count: 1,
+        });
+        provider.mesh_state = Some(MissionControlNodeMeshState {
+            type1_value_bits: 0.4_f32.to_bits(),
+            visible_stage: 0,
+        });
+
+        synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(vec![generator, consumer]),
+            MissionControlNodeProviderTableStatus::Available(vec![provider]),
+        )
+    }
+
+    #[test]
+    fn control_budget_dispatch_writes_negative_zero_for_empty_tables() {
+        for dt in [0.0, 0.5] {
+            let mut table = synthetic_control_device_table(
+                MissionControlDeviceTableStatus::Available(Vec::new()),
+            );
+            control_resource_budget_pass(&mut table, dt).expect("empty budget pass");
+            assert_eq!(table.current_output_rate_5dc_bits, 0x8000_0000);
+            assert_eq!(table.current_output_rate_5e0_bits, 0x8000_0000);
+        }
+    }
+
+    #[test]
+    fn control_budget_dispatch_matches_tag15_tag19_native_vectors() {
+        for (generator_coefficient, amount_bits, ratio_bits, generator_multiplier, scale, rate) in [
+            (
+                1.0_f32,
+                0x4220_6666,
+                0x3ecd_4fdf,
+                0x3f40_0000,
+                0x3f00_0000,
+                0x3e4c_cccd,
+            ),
+            (
+                0.125_f32,
+                0x4220_3333,
+                0x3ecd_0e56,
+                0,
+                0x3e80_0000,
+                0x3dcc_cccd,
+            ),
+        ] {
+            let mut table = control_budget_test_table(generator_coefficient);
+            control_resource_budget_pass(&mut table, 0.5).expect("supported tag-15/tag-19 pass");
+
+            let MissionControlDeviceTableStatus::Available(devices) = &table.status else {
+                unreachable!();
+            };
+            assert_eq!(devices[0].multiplier_bits, Some(generator_multiplier));
+            assert_eq!(devices[1].multiplier_bits, Some(scale));
+            assert_eq!(table.current_output_rate_5dc_bits, rate);
+            assert_eq!(table.current_output_rate_5e0_bits, rate);
+
+            let MissionControlNodeProviderTableStatus::Available(rows) =
+                &table.node_provider_status
+            else {
+                unreachable!();
+            };
+            assert_eq!(rows[0].current_amount_bits, amount_bits);
+            assert_eq!(rows[0].processed_amount_bits, amount_bits);
+            assert_eq!(rows[0].current_type1_value_bits, ratio_bits);
+            assert_eq!(
+                rows[0].current_accumulated_delta_bits,
+                if amount_bits == 0x4220_6666 {
+                    0x3dcc_cc00
+                } else {
+                    0x3d4c_cc00
+                }
+            );
+            assert!(table.node_provider_dirty);
+        }
+    }
+
+    #[test]
+    fn control_budget_dispatch_matches_non_degenerate_native_pair() {
+        let mut table = control_budget_test_table(0.25);
+        let MissionControlDeviceTableStatus::Available(devices) = &mut table.status else {
+            unreachable!();
+        };
+        devices[0].descriptor.fixed_words[8] = 1.0_f32.to_bits();
+        devices[1].descriptor.fixed_words[8] = 0.125_f32.to_bits();
+        devices[1].coefficient_bits.as_mut().unwrap()[0] = 0.75_f32.to_bits();
+        devices[1].coefficient_bits.as_mut().unwrap()[1] = 1.25_f32.to_bits();
+        devices[1].multiplier_bits = Some(0.8_f32.to_bits());
+
+        control_resource_budget_pass(&mut table, 0.375).expect("non-degenerate native vector");
+
+        let MissionControlDeviceTableStatus::Available(devices) = &table.status else {
+            unreachable!();
+        };
+        assert_eq!(devices[0].multiplier_bits, Some(0));
+        assert_eq!(devices[1].multiplier_bits, Some(0x3f08_8889));
+        assert_eq!(table.current_output_rate_5dc_bits, 0x3e88_888a);
+        assert_eq!(table.current_output_rate_5e0_bits, 0x3e88_888a);
+        let MissionControlNodeProviderTableStatus::Available(rows) = &table.node_provider_status
+        else {
+            unreachable!();
+        };
+        assert_eq!(rows[0].current_amount_bits, 0x4220_2b85);
+        assert_eq!(rows[0].processed_amount_bits, 0x4220_2b85);
+        assert_eq!(rows[0].current_type1_value_bits, 0x3ecd_0481);
+        assert_eq!(rows[0].current_accumulated_delta_bits, 0x3d2e_1400);
+    }
+
+    #[test]
+    fn control_budget_dispatch_keeps_callbacks_but_honors_owner_suspension() {
+        let mut table = control_budget_test_table(1.0);
+        table.node_provider_distribution_suspended = true;
+
+        control_resource_budget_pass(&mut table, 0.5).expect("suspended provider distribution");
+
+        let MissionControlDeviceTableStatus::Available(devices) = &table.status else {
+            unreachable!();
+        };
+        assert_eq!(devices[0].multiplier_bits, Some(0x3f40_0000));
+        assert_eq!(devices[1].multiplier_bits, Some(0x3f00_0000));
+        let MissionControlNodeProviderTableStatus::Available(rows) = &table.node_provider_status
+        else {
+            unreachable!();
+        };
+        assert_eq!(rows[0].current_amount_bits, 40.0_f32.to_bits());
+        assert!(!table.node_provider_dirty);
+    }
+
+    #[test]
+    fn control_budget_dispatch_skips_provider_lookup_for_disabled_device() {
+        let mut device = synthetic_effective_control_device(
+            15,
+            15,
+            1.0_f32.to_bits(),
+            Some(1.0_f32.to_bits()),
+            None,
+        );
+        device.native_word_50_bits = Some(0);
+        device.key = u32::MAX;
+        let mut table = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(vec![device]),
+            MissionControlNodeProviderTableStatus::Unavailable(
+                MissionControlNodeProviderTableUnavailableReason::MissingNodeData {
+                    unit_component_index: 0,
+                    source: None,
+                },
+            ),
+        );
+
+        control_resource_budget_pass(&mut table, 0.5)
+            .expect("disabled callback returns before provider lookup");
+        assert_eq!(table.current_output_rate_5dc_bits, 0x8000_0000);
+        assert_eq!(table.current_output_rate_5e0_bits, 0x8000_0000);
+    }
+
+    #[test]
+    fn control_budget_dispatch_rolls_back_unsupported_current_tag() {
+        let mut table = control_budget_test_table(1.0);
+        let unsupported = synthetic_effective_control_device(
+            26,
+            26,
+            1.0_f32.to_bits(),
+            Some(1.0_f32.to_bits()),
+            None,
+        );
+        let MissionControlDeviceTableStatus::Available(devices) = &mut table.status else {
+            unreachable!();
+        };
+        devices.push(unsupported);
+        let before = table.clone();
+
+        assert_eq!(
+            control_resource_budget_pass(&mut table, 0.5),
+            Err(ControlResourceAccessError::UnsupportedCurrentTag { tag: 26 })
+        );
+        assert_eq!(table, before);
+    }
+
+    #[test]
+    fn control_budget_dispatch_rolls_back_late_generator_division_error() {
+        let mut table = control_budget_test_table(0.0);
+        let before = table.clone();
+
+        assert!(matches!(
+            control_resource_budget_pass(&mut table, 0.5),
+            Err(ControlResourceAccessError::UnsupportedFloatRange {
+                field: "generator reserve change",
+                ..
+            })
+        ));
+        assert_eq!(table, before);
+    }
+
+    #[test]
+    fn control_budget_dispatch_keeps_negative_tag19_coefficient_supported() {
+        let mut table = control_budget_test_table(-0.125);
+        control_resource_budget_pass(&mut table, 0.5)
+            .expect("native tag-19 update skips reserve consumption for negative coefficient");
+        let MissionControlDeviceTableStatus::Available(devices) = &table.status else {
+            unreachable!();
+        };
+        assert_eq!(devices[0].multiplier_bits, Some(1.0_f32.to_bits()));
     }
 
     #[test]
@@ -5805,6 +6690,10 @@ mod tests {
             ),
             Err(ControlResourceAccessError::MissionUnavailable)
         );
+        assert_eq!(
+            advance_loaded_mission_control_budget(&mut engine, handle, 0.5),
+            Err(ControlResourceAccessError::MissionUnavailable)
+        );
 
         assert_eq!(
             update_loaded_mission_control_node_stage(&mut engine, handle, 1, false),
@@ -5836,7 +6725,19 @@ mod tests {
             ))
         );
         assert_eq!(
+            advance_loaded_mission_control_budget(&mut engine, invalid, 0.5),
+            Err(ControlResourceAccessError::World(
+                fparkan_world::WorldError::InvalidHandle
+            ))
+        );
+        assert_eq!(
             query_loaded_mission_control_resource(&engine, stale, 1),
+            Err(ControlResourceAccessError::World(
+                fparkan_world::WorldError::StaleHandle
+            ))
+        );
+        assert_eq!(
+            advance_loaded_mission_control_budget(&mut engine, stale, 0.5),
             Err(ControlResourceAccessError::World(
                 fparkan_world::WorldError::StaleHandle
             ))
@@ -5915,6 +6816,12 @@ mod tests {
 
         assert_eq!(
             query_loaded_mission_control_resource(&engine, handle, 1),
+            Err(ControlResourceAccessError::World(
+                fparkan_world::WorldError::StaleHandle
+            ))
+        );
+        assert_eq!(
+            advance_loaded_mission_control_budget(&mut engine, handle, 0.5),
             Err(ControlResourceAccessError::World(
                 fparkan_world::WorldError::StaleHandle
             ))
@@ -6795,12 +7702,17 @@ mod tests {
 
     #[test]
     fn control_factory_multiplier_defaults_preserve_unknown_word_50() {
-        for factory_tag in [9, 15, 25] {
+        for factory_tag in [9, 25] {
             assert_eq!(
                 native_control_factory_defaults(factory_tag),
                 (Some(0x3f80_0000), None)
             );
         }
+        assert_eq!(
+            native_control_factory_defaults(15),
+            (Some(0x3f80_0000), Some(0))
+        );
+        assert_eq!(native_control_factory_byte_94(15), Some(0));
     }
 
     #[test]
@@ -7890,6 +8802,50 @@ mod tests {
         };
         let mut engine = load_full_fixture(0x8000_0002);
         let mut mine_engine = load_full_fixture(0x8000_0004);
+
+        let mine_control_before = loaded_mission_control_device_tables(&mine_engine)
+            .expect("licensed mine Control table")
+            .to_vec();
+        let mine_control_handle = mine_control_before[0].handle;
+        let MissionControlDeviceTableStatus::Available(mine_control_devices) =
+            &mine_control_before[0].status
+        else {
+            panic!("licensed mine device table should be available");
+        };
+        assert_eq!(
+            mine_control_devices
+                .iter()
+                .map(|device| (device.factory_tag, device.descriptor.tag))
+                .collect::<Vec<_>>(),
+            [
+                (19, 19),
+                (19, 19),
+                (9, 9),
+                (15, 15),
+                (12, 12),
+                (12, 12),
+                (13, 13),
+                (13, 13),
+                (26, 26),
+                (25, 25),
+                (21, 21),
+            ]
+        );
+        assert_eq!(
+            advance_loaded_mission_control_budget(&mut mine_engine, mine_control_handle, f32::NAN),
+            Err(ControlResourceAccessError::NonFiniteValue {
+                factory_tag: 0,
+                field: "Control resource interval",
+            })
+        );
+        assert_eq!(
+            advance_loaded_mission_control_budget(&mut mine_engine, mine_control_handle, 0.5),
+            Err(ControlResourceAccessError::UnsupportedCurrentTag { tag: 9 })
+        );
+        assert_eq!(
+            loaded_mission_control_device_tables(&mine_engine),
+            Some(mine_control_before.as_slice())
+        );
 
         let draft = &loaded_mission_object_drafts(&engine).expect("object drafts")[0];
         assert_eq!(draft.unit_components.len(), 6);
@@ -9712,6 +10668,8 @@ mod tests {
             node_provider_amount_bits: Some(0),
             node_provider_dirty: false,
             node_provider_distribution_suspended: false,
+            current_output_rate_5dc_bits: 0,
+            current_output_rate_5e0_bits: 0,
         }
     }
 
@@ -9820,6 +10778,8 @@ mod tests {
             node_provider_amount_bits: Some(100.0_f32.to_bits()),
             node_provider_dirty: false,
             node_provider_distribution_suspended: false,
+            current_output_rate_5dc_bits: 0,
+            current_output_rate_5e0_bits: 0,
         };
         let mut control_tables = vec![producer_table];
 
@@ -9870,6 +10830,8 @@ mod tests {
                 node_provider_amount_bits: Some(0),
                 node_provider_dirty: false,
                 node_provider_distribution_suspended: false,
+                current_output_rate_5dc_bits: 0,
+                current_output_rate_5e0_bits: 0,
             }];
 
             advance_behavior_distributor_tick(

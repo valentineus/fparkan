@@ -1791,6 +1791,7 @@ internal static class BehaviorDistributorTickOracle {
     }
 
     private static void RunNativeControlResourceBudgetTag15Case(IntPtr module) {
+        RunNativeControlResourceBudgetEmptyCases(module);
         NativeControlOwnerConstructor constructOwner = (NativeControlOwnerConstructor)Marshal.GetDelegateForFunctionPointer(
             IntPtr.Add(module, ControlOwnerConstructorRva), typeof(NativeControlOwnerConstructor));
         NativeControlProviderRowConstructor constructProviderRow = (NativeControlProviderRowConstructor)
@@ -1889,6 +1890,7 @@ internal static class BehaviorDistributorTickOracle {
                 Marshal.WriteInt32(generator, 0x1c, 0);
                 Marshal.WriteInt32(providerRow, 8, FloatBits(40.0f));
                 Marshal.WriteInt32(providerRow, 0x0c, FloatBits(40.0f));
+                Marshal.WriteInt32(providerRow, 0x10, 0);
                 Marshal.WriteInt32(providerRow, 0x14, FloatBits(0.4f));
                 Marshal.WriteInt32(owner, 0x590, FloatBits(40.0f));
                 const float dt = 0.5f;
@@ -1941,6 +1943,7 @@ internal static class BehaviorDistributorTickOracle {
                 Marshal.WriteInt32(nativeGenerator, 0x4c, FloatBits(1.0f));
                 Marshal.WriteInt32(providerRow, 8, FloatBits(40.0f));
                 Marshal.WriteInt32(providerRow, 0x0c, FloatBits(40.0f));
+                Marshal.WriteInt32(providerRow, 0x10, 0);
                 Marshal.WriteInt32(providerRow, 0x14, FloatBits(0.4f));
                 Marshal.WriteInt32(owner, 0x590, FloatBits(40.0f));
                 NativeControlResourceDeviceRate generatorRate = (NativeControlResourceDeviceRate)
@@ -1951,17 +1954,74 @@ internal static class BehaviorDistributorTickOracle {
                 update(owner, 0.5f);
                 uint amount = unchecked((uint)Marshal.ReadInt32(providerRow, 8));
                 uint fraction = unchecked((uint)Marshal.ReadInt32(providerRow, 0x14));
+                uint accumulated = unchecked((uint)Marshal.ReadInt32(providerRow, 0x10));
                 uint remaining = unchecked((uint)Marshal.ReadInt32(nativeGenerator, 0x4c));
                 Console.WriteLine("native-control-real-generator-budget: ctor=0x22980 rate=0x229a0 update=0x22a60" +
                     " cap=" + capped + " produced=" + Float(produced) + " amount=" + Hex(amount) +
-                    " ratio=" + Hex(fraction) + " remaining=" + Hex(remaining));
+                    " accumulated=" + Hex(accumulated) + " ratio=" + Hex(fraction) + " remaining=" + Hex(remaining));
                 Expect(amount == (capped == 0 ? 0x42206666u : 0x42203333u) &&
                     fraction == (capped == 0 ? 0x3ecd4fdfu : 0x3ecd0e56u) &&
+                    accumulated == (capped == 0 ? 0x3dcccc00u : 0x3d4ccc00u) &&
                     remaining == unchecked((uint)FloatBits(capped == 0 ? 0.75f : 0.0f)),
-                    "real generator and consumer update exact provider and reserve values in one budget pass");
+                    "real generator and consumer update exact provider amount, delta, ratio, and reserve in one budget pass");
                 GC.KeepAlive(generatorRate);
             }
+
+            Marshal.WriteInt32(typedRecord, 0x20, FloatBits(0.125f));
+            Marshal.WriteInt32(typedRecord, 0x2c, FloatBits(0.75f));
+            Marshal.WriteInt32(typedRecord, 0x30, FloatBits(1.25f));
+            Marshal.WriteInt32(nativeGeneratorRecord, 0x20, FloatBits(1.0f));
+            Marshal.WriteInt32(nativeGeneratorRecord, 0x2c, FloatBits(0.25f));
+            Expect(applyInto(owner, 1, typedRecord) == IntPtr.Add(typedRecord, 0xb4) &&
+                applyInto(owner, 0, nativeGeneratorRecord) == IntPtr.Add(nativeGeneratorRecord, 0xb4),
+                "native non-degenerate tag-19/tag-15 descriptor initializers");
+            Marshal.WriteInt32(device, 0x4c, FloatBits(0.8f));
+            Marshal.WriteInt32(nativeGenerator, 0x4c, FloatBits(1.0f));
+            Marshal.WriteInt32(providerRow, 8, FloatBits(40.0f));
+            Marshal.WriteInt32(providerRow, 0x0c, FloatBits(40.0f));
+            Marshal.WriteInt32(providerRow, 0x10, 0);
+            Marshal.WriteInt32(providerRow, 0x14, FloatBits(0.4f));
+            Marshal.WriteInt32(owner, 0x590, FloatBits(40.0f));
+            NativeControlResourceDeviceRate nativeGeneratorRate = (NativeControlResourceDeviceRate)
+                Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, 0x229a0), typeof(NativeControlResourceDeviceRate));
+            float nonDegenerateProduced = nativeGeneratorRate(nativeGenerator, 0.375f);
+            float nonDegenerateDemand = rate(device, 0.375f);
+            update(owner, 0.375f);
+            uint nonDegenerateAmount = unchecked((uint)Marshal.ReadInt32(providerRow, 8));
+            uint nonDegenerateProcessed = unchecked((uint)Marshal.ReadInt32(providerRow, 0x0c));
+            uint nonDegenerateAccumulated = unchecked((uint)Marshal.ReadInt32(providerRow, 0x10));
+            uint nonDegenerateRatio = unchecked((uint)Marshal.ReadInt32(providerRow, 0x14));
+            uint nonDegenerateConsumerMultiplier = unchecked((uint)Marshal.ReadInt32(device, 0x4c));
+            uint nonDegenerateGeneratorMultiplier = unchecked((uint)Marshal.ReadInt32(nativeGenerator, 0x4c));
+            uint nonDegenerateRate5dc = unchecked((uint)Marshal.ReadInt32(owner, 0x5dc));
+            uint nonDegenerateRate5e0 = unchecked((uint)Marshal.ReadInt32(owner, 0x5e0));
+            Expect(FloatBits(nonDegenerateProduced) == 0x3dcccccd && FloatBits(nonDegenerateDemand) == unchecked((int)0xbe400000) &&
+                nonDegenerateAmount == 0x42202b85 && nonDegenerateProcessed == 0x42202b85 &&
+                nonDegenerateAccumulated == 0x3d2e1400 && nonDegenerateRatio == 0x3ecd0481 &&
+                nonDegenerateConsumerMultiplier == 0x3f088889 && nonDegenerateGeneratorMultiplier == 0 &&
+                nonDegenerateRate5dc == 0x3e88888a && nonDegenerateRate5e0 == 0x3e88888a,
+                "native non-degenerate tag-19/tag-15 budget vector matches amount, delta, rates, and multipliers");
+            Console.WriteLine("native-control-real-complex-budget: dt=0.375 produced=" + Hex(unchecked((uint)FloatBits(nonDegenerateProduced))) +
+                " demand=" + Hex(unchecked((uint)FloatBits(nonDegenerateDemand))) +
+                " amount=" + Hex(nonDegenerateAmount) + " processed=" + Hex(nonDegenerateProcessed) +
+                " accumulated=" + Hex(nonDegenerateAccumulated) + " ratio=" + Hex(nonDegenerateRatio) +
+                " multipliers=" + Hex(nonDegenerateConsumerMultiplier) + "," + Hex(nonDegenerateGeneratorMultiplier) +
+                " rates=" + Hex(nonDegenerateRate5dc) + "," + Hex(nonDegenerateRate5e0));
+            GC.KeepAlive(nativeGeneratorRate);
+
+            // Restore the fixture that the subsequent native clock test uses.
+            Marshal.WriteInt32(typedRecord, 0x20, FloatBits(0.0f));
+            Marshal.WriteInt32(typedRecord, 0x2c, FloatBits(1.0f));
+            Marshal.WriteInt32(typedRecord, 0x30, FloatBits(1.0f));
+            Expect(applyInto(owner, 1, typedRecord) == IntPtr.Add(typedRecord, 0xb4),
+                "restore native tag-15 clock-test descriptor");
+            Marshal.WriteInt32(device, 0x4c, FloatBits(1.0f));
             Marshal.WriteIntPtr(devices, 0, generator);
+            Marshal.WriteInt32(providerRow, 8, FloatBits(40.0f));
+            Marshal.WriteInt32(providerRow, 0x0c, FloatBits(40.0f));
+            Marshal.WriteInt32(providerRow, 0x10, 0);
+            Marshal.WriteInt32(providerRow, 0x14, FloatBits(0.4f));
+            Marshal.WriteInt32(owner, 0x590, FloatBits(40.0f));
             GC.KeepAlive(constructGenerator);
 
             // Bounded active class-10 host: no motion object, no deferred packets.
@@ -2079,6 +2139,27 @@ internal static class BehaviorDistributorTickOracle {
             GC.KeepAlive(timedUpdate);
 
         }
+    }
+
+    private static void RunNativeControlResourceBudgetEmptyCases(IntPtr module) {
+        NativeControlOwnerConstructor constructOwner = (NativeControlOwnerConstructor)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlOwnerConstructorRva),
+                typeof(NativeControlOwnerConstructor));
+        NativeControlResourceBudgetUpdate update = (NativeControlResourceBudgetUpdate)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlResourceBudgetUpdateRva),
+                typeof(NativeControlResourceBudgetUpdate));
+        using (Fixture fixture = NewFixture()) {
+            IntPtr owner = fixture.Allocate(0x664);
+            Expect(constructOwner(owner, IntPtr.Zero, 4) == owner, "native empty-budget owner constructor");
+            foreach (float dt in new[] { 0.0f, 0.5f }) {
+                update(owner, dt);
+                Expect(Marshal.ReadInt32(owner, 0x5dc) == unchecked((int)0x80000000) &&
+                    Marshal.ReadInt32(owner, 0x5e0) == unchecked((int)0x80000000),
+                    "native empty budget writes negative-zero output rates at dt=" + Float(dt));
+            }
+            Console.WriteLine("native-control-empty-budget: dt=0/0.5 rates=0x80000000,0x80000000");
+        }
+        GC.KeepAlive(update);
     }
 
     private static void RunNativeControlActivationCase(IntPtr module) {
