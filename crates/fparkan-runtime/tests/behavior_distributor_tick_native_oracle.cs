@@ -1013,7 +1013,7 @@ internal static class BehaviorDistributorTickOracle {
             Marshal.GetDelegateForFunctionPointer(IntPtr.Add(aniMeshModule, 0x05500),
                 typeof(NativeAniMeshNodeLifecycleCallback));
         using (Fixture fixture = new Fixture()) {
-            const int rowCount = 9;
+            const int rowCount = 11;
             IntPtr owner = fixture.Allocate(0x664);
             IntPtr rows = fixture.Allocate(rowCount * 0x2c);
             IntPtr aniInterface = fixture.Allocate(0x1b0);
@@ -1043,6 +1043,8 @@ internal static class BehaviorDistributorTickOracle {
             WriteProviderStageRow(rows, 6, -1, 4.0f, 94.0f, 0.5f, 0, 3, 0x02);
             WriteProviderStageRow(rows, 7, -1, 5.0f, 95.0f, 1.0f, 1, 3, 0x102);
             WriteProviderStageRow(rows, 8, -1, 6.0f, 96.0f, 0.0f, 0, 3, 0x02);
+            WriteProviderStageRow(rows, 9, -1, 10.0f, 90.0f, 0.5f, 0, 2, 0x02);
+            WriteProviderStageRow(rows, 10, -1, 11.0f, 90.0f, 0.75f, 0, 16777217, 0x02);
 
             aniMeshStageTransitions.Clear();
             aniMeshNodeLifecycleCallbacks.Clear();
@@ -1057,10 +1059,10 @@ internal static class BehaviorDistributorTickOracle {
             updateStage(owner, 3, 0);
             for (int index = 4; index < rowCount; index++) updateStage(owner, index, 0);
 
-            uint[] expectedStages = { 3, 3, 2, 3, 2, 1, 1, 0, 3 };
-            uint[] expectedVisibleStages = { 3, 3, 1, 3, 2, 1, 1, 0, 2 };
+            uint[] expectedStages = { 3, 3, 2, 3, 2, 1, 1, 0, 3, 1, 4194304 };
+            uint[] expectedVisibleStages = { 3, 3, 1, 3, 2, 1, 1, 0, 2, 1, 4194304 };
             uint[] expectedAmounts = { 0x42200000, 0x41400000, 0x40e00000, 0x40400000,
-                0x40000000, 0x40400000, 0x40800000, 0x40a00000, 0x40c00000 };
+                0x40000000, 0x40400000, 0x40800000, 0x40a00000, 0x40c00000, 0x41200000, 0x41300000 };
             for (int index = 0; index < rowCount; index++) {
                 IntPtr row = IntPtr.Add(rows, index * 0x2c);
                 IntPtr meshRow = IntPtr.Add(meshRows, index * 0x130);
@@ -1080,17 +1082,33 @@ internal static class BehaviorDistributorTickOracle {
                 "Control flag 4 copies the parent type-1 ratio before stage calculation");
             Expect(ReadFloat(meshRows, 0x130 + 0x124) == 0.0f && ReadFloat(rows, 0x2c + 0x14) == 0.25f,
                 "inheriting a parent provider ratio does not rewrite the separate AniMesh node value");
-            Expect(String.Join(",", aniMeshStageTransitions.ToArray()) == "0:3,1:3,2:1,3:3,4:2,5:1,6:1,7:0,8:2" &&
+            Expect(String.Join(",", aniMeshStageTransitions.ToArray()) == "0:3,1:3,2:1,3:3,4:2,5:1,6:1,7:0,8:2,9:1,10:4194304" &&
                 String.Join(",", aniMeshNodeLifecycleCallbacks.ToArray()) == "7:101:4" && !aniMeshCallbackOwnerMismatch &&
                 !controlNodeUpdateOwnerMismatch && !nativeAniMeshStageCallbackMissing,
                 "Control stage and slot-0x20 callbacks reach the original AniMesh RVA 0x5810 in direct update order");
             Expect(String.Join(",", controlProviderCallbackTrace.ToArray()) ==
-                "stage:0:3,stage:1:3,stage:2:1,stage:3:3,stage:4:2,stage:5:1,stage:6:1,lifecycle:7:101:4,stage:7:0,stage:8:2",
+                "stage:0:3,stage:1:3,stage:2:1,stage:3:3,stage:4:2,stage:5:1,stage:6:1,lifecycle:7:101:4,stage:7:0,stage:8:2,stage:9:1,stage:10:4194304",
                 "AniMesh slot 0x20 receives its native node, selector, and mask arguments before stage publication");
+
+            int transitionsBeforeNoOp = aniMeshStageTransitions.Count;
+            IntPtr unchanged = IntPtr.Add(rows, 6 * 0x2c);
+            Marshal.WriteInt32(unchanged, 0x0c, FloatBits(999.0f));
+            Marshal.WriteInt32(meshRows, 6 * 0x130 + 0x1c, 77);
+            updateStage(owner, 6, 1);
+            Expect(ReadFloat(unchanged, 0x0c) == ReadFloat(unchanged, 8) &&
+                Marshal.ReadInt32(meshRows, 6 * 0x130 + 0x1c) == 77 &&
+                aniMeshStageTransitions.Count == transitionsBeforeNoOp,
+                "unchanged stage refreshes processed amount without stage or effects callbacks");
+            Marshal.WriteInt32(unchanged, 0x28, 0x52);
+            Marshal.WriteInt32(unchanged, 0x0c, FloatBits(999.0f));
+            updateStage(owner, 6, 0);
+            Expect(ReadFloat(unchanged, 0x0c) == 999.0f &&
+                aniMeshStageTransitions.Count == transitionsBeforeNoOp,
+                "depleted protected node returns without processing its amount");
 
             Console.WriteLine("native-control-parent-stage-arithmetic: controlHash=" + ExpectedControlSha256 +
                 " rva=0x11220 bit4=ratio bit8=parent-stage ceil=[0.1,0.4,0.5,1,0]=>[2,1,1,0,3]" +
-                " callbacks=[0:3,1:3,2:1,3:3,4:2,5:1,6:1,lifecycle7:101:4,7:0,8:2]");
+                " callbacks=[0:3,1:3,2:1,3:3,4:2,5:1,6:1,lifecycle7:101:4,7:0,8:2,9:1,10:4194304]");
             activeAniMeshInterface = IntPtr.Zero;
             activeNativeAniMeshStageTransition = null;
             activeNativeAniMeshNodeLifecycle = null;

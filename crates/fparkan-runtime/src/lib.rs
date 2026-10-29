@@ -263,6 +263,8 @@ pub struct MissionControlNodeProviderRow {
     pub current_type1_value_bits: u32,
     /// Current native `+0x28` flags, when the initial mesh metadata is known.
     pub current_flags: Option<u32>,
+    /// Native Control stage at `+0x18`; `stage_count` is the exhaustion sentinel.
+    pub current_stage: u32,
     /// MSH state exposed at the same global ordinal, if the mesh projection exists.
     pub initial_mesh_state: Option<MissionControlNodeInitialMeshState>,
     /// Current model-node fields, when its global ordinal was resolved.
@@ -341,6 +343,18 @@ pub enum ControlResourceAccessError {
     InvalidNodeProviderAmount { key: u32 },
     /// Depleting a root or critical node needs the unimplemented object lifecycle.
     UnsupportedNodeLifecycle { key: u32 },
+    /// A provider row references a parent outside the loaded table.
+    NodeProviderParentOutOfRange {
+        key: u32,
+        parent_index: i32,
+        row_count: usize,
+    },
+    /// The stage count or ratio is outside the confirmed stage domain.
+    InvalidNodeStageState { key: u32 },
+    /// A stage transition needs the unimplemented geometry/visibility update.
+    UnsupportedNodeVisibility { key: u32 },
+    /// A stage transition requests unimplemented FX and host notifications.
+    UnsupportedNodeEffects { key: u32 },
     /// A native tag has an e00 callback that has not been implemented here.
     UnsupportedCurrentTag { tag: u32 },
     /// A selected row lacks a value needed by the native getter or setter.
@@ -2196,6 +2210,154 @@ pub fn apply_loaded_mission_control_node_delta(
     apply_control_node_delta(table, key, delta)
 }
 
+/// Applies the confirmed single-node stage path of native Control `0x11220`.
+///
+/// Copies parent ratio/stage when requested, updates the processed amount and
+/// CPU visible stage, and returns whether the Control stage changed. It does not
+/// traverse descendants (`0x11130`) or run the separate Control clock.
+/// `update_effects` is the original native argument, not a compatibility fallback.
+///
+/// # Errors
+/// Rejects unavailable state, invalid parent/count/ratio, and transitions needing
+/// unsupported lifecycle, visibility, FX, or host callbacks. No partial state is
+/// published on error. Depleted protected nodes retain the native early return.
+pub fn update_loaded_mission_control_node_stage(
+    engine: &mut Engine,
+    handle: ObjectHandle,
+    key: u32,
+    update_effects: bool,
+) -> Result<bool, ControlResourceAccessError> {
+    transform_state(&engine.world, handle).map_err(ControlResourceAccessError::World)?;
+    let loaded = engine
+        .loaded
+        .as_mut()
+        .ok_or(ControlResourceAccessError::MissionUnavailable)?;
+    let table = loaded
+        .control_device_tables
+        .iter_mut()
+        .find(|table| table.handle == handle)
+        .ok_or(ControlResourceAccessError::ObjectUnavailable { handle })?;
+    update_control_node_stage(table, key, update_effects)
+}
+
+fn update_control_node_stage(
+    table: &mut MissionControlDeviceTableState,
+    key: u32,
+    update_effects: bool,
+) -> Result<bool, ControlResourceAccessError> {
+    let rows = match &mut table.node_provider_status {
+        MissionControlNodeProviderTableStatus::Available(rows) => rows,
+        MissionControlNodeProviderTableStatus::Unavailable(reason) => {
+            return Err(ControlResourceAccessError::NodeProviderTableUnavailable(
+                reason.clone(),
+            ))
+        }
+    };
+    let row_count = rows.len();
+    let index = usize::try_from(key)
+        .ok()
+        .filter(|index| *index < row_count)
+        .ok_or(ControlResourceAccessError::NodeProviderKeyOutOfRange { key, row_count })?;
+    let row = &rows[index];
+    let flags = row
+        .current_flags
+        .ok_or(ControlResourceAccessError::UnsupportedField {
+            factory_tag: 0,
+            field: "provider flags",
+        })?;
+    if flags & 0x1c0 != 0 {
+        if flags & 0x10 == 0 {
+            return Err(ControlResourceAccessError::UnsupportedNodeLifecycle { key });
+        }
+        if flags & 0xc0 != 0 {
+            return Ok(false);
+        }
+    }
+    let metadata = row
+        .initial_mesh_state
+        .ok_or(ControlResourceAccessError::UnsupportedField {
+            factory_tag: 0,
+            field: "provider mesh metadata",
+        })?;
+    let count = metadata.stage_count;
+    if count == 0 {
+        return Err(ControlResourceAccessError::InvalidNodeStageState { key });
+    }
+    let parent = if flags & 0x0c != 0 {
+        Some(
+            usize::try_from(metadata.parent_index)
+                .ok()
+                .and_then(|parent| rows.get(parent))
+                .ok_or(ControlResourceAccessError::NodeProviderParentOutOfRange {
+                    key,
+                    parent_index: metadata.parent_index,
+                    row_count,
+                })?,
+        )
+    } else {
+        None
+    };
+    let ratio_bits = if flags & 4 != 0 {
+        parent
+            .expect("parent validated for inheritance")
+            .current_type1_value_bits
+    } else {
+        row.current_type1_value_bits
+    };
+    let ratio = checked_control_float(0, "provider stage ratio", f32::from_bits(ratio_bits))?;
+    if !(0.0..=1.0).contains(&ratio) {
+        return Err(ControlResourceAccessError::InvalidNodeStageState { key });
+    }
+    let stage = if flags & 8 != 0 {
+        parent
+            .expect("parent validated for inheritance")
+            .current_stage
+            .min(count)
+    } else {
+        let product = control_stage_product(count, ratio);
+        count.wrapping_sub(product.ceil() as u64 as u32).min(count)
+    };
+    let changed = stage != row.current_stage;
+    if changed {
+        if update_effects {
+            return Err(ControlResourceAccessError::UnsupportedNodeEffects { key });
+        }
+        if flags & 2 == 0 && (stage == count || row.current_stage == count) {
+            return Err(ControlResourceAccessError::UnsupportedNodeVisibility { key });
+        }
+        if row.mesh_state.is_none() {
+            return Err(ControlResourceAccessError::UnsupportedField {
+                factory_tag: 0,
+                field: "model node state",
+            });
+        }
+    }
+    let row = &mut rows[index];
+    row.current_type1_value_bits = ratio_bits;
+    row.processed_amount_bits = row.current_amount_bits;
+    if changed {
+        row.current_flags = Some(flags | 0x200);
+        row.current_stage = stage;
+        row.mesh_state
+            .as_mut()
+            .expect("model state validated")
+            .visible_stage = stage.min(count - 1);
+    }
+    Ok(changed)
+}
+
+fn control_stage_product(count: u32, ratio: f32) -> f32 {
+    if ratio == 0.0 {
+        return 0.0;
+    }
+    // FILD keeps the integer exact; round the mantissa product once, then rescale exactly.
+    let bits = ratio.to_bits();
+    let significand = (bits & 0x007f_ffff) | 0x0080_0000;
+    let exponent = ((bits >> 23) & 0xff) as i32 - 150;
+    let product = u64::from(count) * u64::from(significand);
+    (f64::from(product as f32) * 2.0_f64.powi(exponent)) as f32
+}
+
 fn initial_node_provider_amount(status: &MissionControlNodeProviderTableStatus) -> Option<u32> {
     let MissionControlNodeProviderTableStatus::Available(rows) = status else {
         return None;
@@ -3773,6 +3935,7 @@ fn append_control_node_provider_rows(
             processed_amount_bits: source_row.max_volume.to_bits(),
             current_type1_value_bits: 0x3f80_0000,
             current_flags: None,
+            current_stage: 0,
             initial_mesh_state: None,
             mesh_state: None,
         });
@@ -4344,6 +4507,7 @@ mod tests {
             processed_amount_bits: 100.0_f32.to_bits(),
             current_type1_value_bits: initial_type1_value_bits,
             current_flags: None,
+            current_stage: 0,
             initial_mesh_state: None,
             mesh_state: None,
         }
@@ -5110,6 +5274,11 @@ mod tests {
             Err(ControlResourceAccessError::MissionUnavailable)
         );
 
+        assert_eq!(
+            update_loaded_mission_control_node_stage(&mut engine, handle, 1, false),
+            Err(ControlResourceAccessError::MissionUnavailable)
+        );
+
         let stale = ObjectHandle {
             generation: handle.generation.wrapping_add(1),
             slot: handle.slot,
@@ -5146,7 +5315,21 @@ mod tests {
             ))
         );
 
+        assert_eq!(
+            update_loaded_mission_control_node_stage(&mut engine, stale, 1, false),
+            Err(ControlResourceAccessError::World(
+                fparkan_world::WorldError::StaleHandle
+            ))
+        );
+
         fparkan_world::request_delete(&mut engine.world, handle).expect("delete object");
+        assert_eq!(
+            update_loaded_mission_control_node_stage(&mut engine, handle, 1, false),
+            Err(ControlResourceAccessError::World(
+                fparkan_world::WorldError::StaleHandle
+            ))
+        );
+
         assert_eq!(
             apply_loaded_mission_control_node_delta(&mut engine, handle, 1, -1.0),
             Err(ControlResourceAccessError::World(
@@ -5346,6 +5529,171 @@ mod tests {
         assert_eq!(rows[1].current_type1_value_bits, 0.25_f32.to_bits());
         assert_eq!(rows[1].current_flags, Some(1));
         assert_eq!(table.node_provider_amount_bits, total);
+    }
+
+    #[test]
+    fn control_node_stage_matches_native_inheritance_and_visible_sentinel() {
+        let descriptors = [
+            (-1, 0.25_f32, 4, 0x02),
+            (0, 0.875, 5, 0x06),
+            (0, 0.9, 2, 0x0a),
+            (1, 0.1, 6, 0x0e),
+            (-1, 0.1, 3, 0x02),
+            (-1, 0.4, 3, 0x02),
+            (-1, 0.5, 3, 0x02),
+            (-1, 1.0, 3, 0x102),
+            (-1, 0.0, 3, 0x02),
+            (-1, 0.5, 2, 0x02),
+            (-1, 0.75, 16_777_217, 0x02),
+        ];
+        let rows = descriptors
+            .into_iter()
+            .enumerate()
+            .map(|(index, (parent_index, ratio, stage_count, flags))| {
+                let mut row = synthetic_node_provider_row(0, index, ratio.to_bits());
+                row.current_amount_bits = (index as f32 + 1.0).to_bits();
+                row.processed_amount_bits = (90.0 + index as f32).to_bits();
+                row.current_flags = Some(flags);
+                row.current_stage = u32::from(index == 7);
+                row.initial_mesh_state = Some(MissionControlNodeInitialMeshState {
+                    parent_index,
+                    flags,
+                    stage_count,
+                });
+                row.mesh_state = Some(MissionControlNodeMeshState {
+                    type1_value_bits: 0,
+                    visible_stage: (-99_i32) as u32,
+                });
+                row
+            })
+            .collect();
+        let mut table = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(Vec::new()),
+            MissionControlNodeProviderTableStatus::Available(rows),
+        );
+        for key in [0_u32, 1, 2, 3, 4, 5, 6, 8, 9, 10] {
+            assert!(update_control_node_stage(&mut table, key, false).unwrap());
+        }
+        let MissionControlNodeProviderTableStatus::Available(rows) = &table.node_provider_status
+        else {
+            panic!()
+        };
+        for (index, expected) in [3, 3, 2, 3, 2, 1, 1, 1, 3, 1, 4_194_304]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(rows[index].current_stage, expected);
+            if index == 7 {
+                continue;
+            }
+            assert_eq!(
+                rows[index].processed_amount_bits,
+                rows[index].current_amount_bits
+            );
+            assert_eq!(
+                rows[index].mesh_state.unwrap().visible_stage,
+                expected.min(descriptors[index].2 - 1)
+            );
+            assert_eq!(rows[index].mesh_state.unwrap().type1_value_bits, 0);
+            assert_ne!(rows[index].current_flags.unwrap() & 0x200, 0);
+        }
+        assert_eq!(rows[1].current_type1_value_bits, 0.25_f32.to_bits());
+        assert_eq!(rows[3].current_type1_value_bits, 0.25_f32.to_bits());
+        let before = table.clone();
+        assert_eq!(
+            update_control_node_stage(&mut table, 7, false),
+            Err(ControlResourceAccessError::UnsupportedNodeLifecycle { key: 7 })
+        );
+        assert_eq!(table, before);
+        let MissionControlNodeProviderTableStatus::Available(rows) =
+            &mut table.node_provider_status
+        else {
+            panic!()
+        };
+        rows[6].processed_amount_bits = 999.0_f32.to_bits();
+        rows[6].mesh_state.as_mut().unwrap().visible_stage = 77;
+        assert!(!update_control_node_stage(&mut table, 6, true).unwrap());
+        let MissionControlNodeProviderTableStatus::Available(rows) = &table.node_provider_status
+        else {
+            panic!()
+        };
+        assert_eq!(rows[6].processed_amount_bits, rows[6].current_amount_bits);
+        assert_eq!(rows[6].mesh_state.unwrap().visible_stage, 77);
+        let MissionControlNodeProviderTableStatus::Available(rows) =
+            &mut table.node_provider_status
+        else {
+            panic!()
+        };
+        rows[8].current_stage = 0;
+        let before = table.clone();
+        assert_eq!(
+            update_control_node_stage(&mut table, 8, true),
+            Err(ControlResourceAccessError::UnsupportedNodeEffects { key: 8 })
+        );
+        assert_eq!(table, before);
+        let MissionControlNodeProviderTableStatus::Available(rows) =
+            &mut table.node_provider_status
+        else {
+            panic!()
+        };
+        rows[8].current_flags = Some(0);
+        let before = table.clone();
+        assert_eq!(
+            update_control_node_stage(&mut table, 8, false),
+            Err(ControlResourceAccessError::UnsupportedNodeVisibility { key: 8 })
+        );
+        assert_eq!(table, before);
+        let MissionControlNodeProviderTableStatus::Available(rows) =
+            &mut table.node_provider_status
+        else {
+            panic!()
+        };
+        rows[1].initial_mesh_state.as_mut().unwrap().parent_index = -1;
+        let before = table.clone();
+        assert_eq!(
+            update_control_node_stage(&mut table, 1, false),
+            Err(ControlResourceAccessError::NodeProviderParentOutOfRange {
+                key: 1,
+                parent_index: -1,
+                row_count: 11
+            })
+        );
+        assert_eq!(table, before);
+        let MissionControlNodeProviderTableStatus::Available(rows) =
+            &mut table.node_provider_status
+        else {
+            panic!()
+        };
+        rows[1].initial_mesh_state.as_mut().unwrap().parent_index = 0;
+        rows[1].current_stage = 0;
+        rows[1].current_type1_value_bits = 0.875_f32.to_bits();
+        rows[1].mesh_state = None;
+        let before = table.clone();
+        assert!(matches!(
+            update_control_node_stage(&mut table, 1, false),
+            Err(ControlResourceAccessError::UnsupportedField {
+                field: "model node state",
+                ..
+            })
+        ));
+        assert_eq!(
+            table, before,
+            "failed inherited-stage update must not copy the parent ratio"
+        );
+        let MissionControlNodeProviderTableStatus::Available(rows) =
+            &mut table.node_provider_status
+        else {
+            panic!()
+        };
+        rows[6].current_flags = Some(0x52);
+        rows[6].initial_mesh_state = None;
+        rows[6].processed_amount_bits = 999.0_f32.to_bits();
+        let before = table.clone();
+        assert!(!update_control_node_stage(&mut table, 6, false).unwrap());
+        assert_eq!(
+            table, before,
+            "depleted protected node returns before reading metadata or processing amount"
+        );
     }
 
     #[test]
@@ -6858,6 +7206,48 @@ mod tests {
                 visible_stage: 0,
             })
         );
+        let stage_key = 1;
+        let stage_row = &mine_rows[stage_key as usize];
+        assert_eq!(stage_row.initial_mesh_state.unwrap().stage_count, 2);
+        assert_eq!(stage_row.current_flags, Some(2));
+        let stage_initial = stage_row.initial_amount_bits;
+        let _publication = apply_loaded_mission_control_node_delta(
+            &mut mine_engine,
+            mine_profile.handle,
+            stage_key,
+            -f32::from_bits(stage_initial) * 0.5,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(update_loaded_mission_control_node_stage(
+            &mut mine_engine,
+            mine_profile.handle,
+            stage_key,
+            false
+        )
+        .unwrap());
+        let MissionControlNodeProviderTableStatus::Available(rows) =
+            &loaded_mission_control_device_tables(&mine_engine).unwrap()[0].node_provider_status
+        else {
+            panic!()
+        };
+        assert_eq!(rows[stage_key as usize].current_stage, 1);
+        assert_eq!(
+            rows[stage_key as usize].mesh_state.unwrap().visible_stage,
+            1
+        );
+        assert_eq!(
+            rows[stage_key as usize]
+                .mesh_state
+                .unwrap()
+                .type1_value_bits,
+            0.5_f32.to_bits()
+        );
+        assert_eq!(
+            rows[stage_key as usize].processed_amount_bits,
+            rows[stage_key as usize].current_amount_bits
+        );
+        assert_eq!(rows[stage_key as usize].initial_amount_bits, stage_initial);
     }
 
     #[test]
