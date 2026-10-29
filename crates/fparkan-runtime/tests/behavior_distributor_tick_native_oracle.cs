@@ -1892,6 +1892,51 @@ internal static class BehaviorDistributorTickOracle {
                     "budget dirties amount after the preceding contact/aggregate update");
                 Console.WriteLine("native-control-active-clock: class=10 e0=1 period=500 seed=0 sub-ms=skip" +
                     " equality=437.5/skip now=500 e8=62.5 resourceDt=0.5 amount=0x42206666 ec=500");
+
+                // Isolate cadence after the budget vector: no device or stage callbacks run.
+                Marshal.WriteInt32(owner, 0x5c0, 0);
+                Marshal.WriteByte(owner, 0x598, 0);
+                Marshal.WriteInt32(owner, 0xe4, 0);
+                Marshal.WriteInt32(owner, 0xec, 0);
+                Marshal.WriteInt32(randomState, unchecked((int)0x12345678));
+                timedUpdate(owner, 0.5f);
+                Expect(unchecked((uint)Marshal.ReadInt32(randomState)) == 0x12345678 &&
+                    ReadFloat(owner, 0xe4) == 0.0f, "sub-millisecond active calls do not draw random jitter");
+                uint[] expectedRandom = { 0xb7debec4, 0x91b9ca56, 0x4dc90515, 0x610747e3 };
+                float[] expectedResourceClock = { 0, 0, 502, 502 };
+                for (int i = 0; i < expectedRandom.Length; i++) {
+                    float now = 500.0f + i;
+                    timedUpdate(owner, now);
+                    Expect(unchecked((uint)Marshal.ReadInt32(randomState)) == expectedRandom[i] &&
+                        ReadFloat(owner, 0xec) == expectedResourceClock[i] &&
+                        ReadFloat(owner, 0xe4) == now,
+                        "active clock draws once per accepted call and tests a fresh randomized deadline");
+                    Console.WriteLine("native-control-randomized-clock: now=" + Float(now) +
+                        " rng=" + Hex(expectedRandom[i]) + " resourceClock=" + Float(expectedResourceClock[i]));
+                }
+                Marshal.WriteInt32(owner, 0xe4, 0);
+                Marshal.WriteInt32(owner, 0xec, 0);
+                Marshal.WriteInt32(randomState, unchecked((int)0xffff0000));
+                timedUpdate(owner, 500.0f);
+                Expect(unchecked((uint)Marshal.ReadInt32(randomState)) == 0x8000ffff &&
+                    ReadFloat(owner, 0xec) == 0.0f,
+                    "nonzero random state can produce exact deadline equality, which still skips");
+                timedUpdate(owner, 501.0f);
+                Expect(unchecked((uint)Marshal.ReadInt32(randomState)) == 0x3ffe7ffe &&
+                    ReadFloat(owner, 0xec) == 501.0f, "next accepted call redraws jitter after equality");
+                Marshal.WriteInt32(owner, 0xd4, 2);
+                timedUpdate(owner, 502.0f);
+                Console.WriteLine("native-control-forced-clock: rng=" + Hex(unchecked((uint)Marshal.ReadInt32(randomState))) +
+                    " resourceClock=" + Float(ReadFloat(owner, 0xec)) + " counter=" + Marshal.ReadInt32(owner, 0xd4));
+                Expect(unchecked((uint)Marshal.ReadInt32(randomState)) == 0xdffdc002 &&
+                    ReadFloat(owner, 0xec) == 502.0f && Marshal.ReadInt32(owner, 0xd4) == 1,
+                    "forced resource cycle still consumes RNG and decrements its counter");
+                Marshal.WriteByte(owner, 0xe0, 0);
+                timedUpdate(owner, 503.0f);
+                Expect(unchecked((uint)Marshal.ReadInt32(randomState)) == 0xdffdc002 &&
+                    ReadFloat(owner, 0xec) == 503.0f && Marshal.ReadInt32(owner, 0xd4) == 1,
+                    "inactive clock synchronizes resource time without drawing RNG or consuming the forced counter");
+                Console.WriteLine("native-control-randomized-clock-gates: equality=skip redraw=due forced=rng+decrement inactive=no-rng/no-decrement");
             } finally {
                 Marshal.WriteInt32(period, savedPeriod);
                 Marshal.WriteInt32(randomState, savedRandom);
