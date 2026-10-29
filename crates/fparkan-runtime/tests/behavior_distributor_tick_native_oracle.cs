@@ -1464,6 +1464,10 @@ internal static class BehaviorDistributorTickOracle {
         return ReadFloat(table.Rows, index * 0x2c + 0x08);
     }
 
+    private static float ReadNativeProviderAccumulatedDelta(NativeProviderTable table, int index) {
+        return ReadFloat(table.Rows, index * 0x2c + 0x10);
+    }
+
     private static byte ReadNativeProviderFlags(NativeProviderTable table, int index) {
         return Marshal.ReadByte(table.Rows, index * 0x2c + 0x28);
     }
@@ -1489,6 +1493,10 @@ internal static class BehaviorDistributorTickOracle {
                 "Control proportional distribution publishes each row update through the existing native node callback");
             Expect(String.Join(",", controlNodeUpdateIndices.ConvertAll(index => index.ToString()).ToArray()) == "0,1,2",
                 "Control proportional distribution visits rows in ascending order");
+            Expect(ReadNativeProviderAccumulatedDelta(table, 0) == 4.0f &&
+                ReadNativeProviderAccumulatedDelta(table, 1) == 8.0f &&
+                ReadNativeProviderAccumulatedDelta(table, 2) == 10.0f,
+                "Control distribution accumulates each actual amount change in provider row +0x10");
         }
 
         using (Fixture fixture = NewFixture()) {
@@ -1503,6 +1511,58 @@ internal static class BehaviorDistributorTickOracle {
                 "Control native sequential withdrawal consumes rows in reverse order");
             Expect(String.Join(",", controlNodeUpdateIndices.ConvertAll(index => index.ToString()).ToArray()) == "2,1",
                 "Control sequential withdrawal calls the node updater from the last row backwards");
+            Expect(ReadNativeProviderAccumulatedDelta(table, 0) == 0.0f &&
+                ReadNativeProviderAccumulatedDelta(table, 1) == -5.0f &&
+                ReadNativeProviderAccumulatedDelta(table, 2) == -30.0f,
+                "Control reverse withdrawal accumulates the applied changes in provider row +0x10");
+        }
+
+        using (Fixture fixture = NewFixture()) {
+            NativeProviderTable table = CreateNativeProviderTable(fixture, module,
+                new float[] { 33554432.0f, 3.0f }, new float[] { 16777216.0f, 2.0f },
+                new byte[] { 0, 0 });
+            for (int i = 0; i < 2; i++) {
+                IntPtr row = IntPtr.Add(table.Rows, i * 0x2c);
+                Marshal.WriteInt32(row, 0x1c, 1); // Avoid the zero-count synthetic stage boundary.
+                Marshal.WriteByte(row, 0x28, 0x02);
+            }
+            distribute(table.Owner, 33554432.0f, 1, 0);
+            Expect(ReadNativeProviderAmount(table, 0) == 33554432.0f &&
+                ReadNativeProviderAmount(table, 1) == 3.0f,
+                "Control sequential mode keeps the original request after summed free capacity rounds down");
+            Expect(ReadNativeProviderAccumulatedDelta(table, 0) == 16777216.0f &&
+                ReadNativeProviderAccumulatedDelta(table, 1) == 1.0f,
+                "Control sequential mode accumulates each row's applied amount at the capacity-rounding boundary");
+        }
+
+        using (Fixture fixture = NewFixture()) {
+            NativeProviderTable table = CreateNativeProviderTable(fixture, module,
+                new float[] { 33554432.0f, 3.0f }, new float[] { 33554432.0f, 3.0f },
+                new byte[] { 0, 0 });
+            for (int i = 0; i < 2; i++) {
+                IntPtr row = IntPtr.Add(table.Rows, i * 0x2c);
+                Marshal.WriteInt32(row, 0x1c, 1);
+                Marshal.WriteByte(row, 0x28, 0x02);
+            }
+            NativeControlProviderAmountUpdate update = (NativeControlProviderAmountUpdate)
+                Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlProviderAmountUpdateRva),
+                    typeof(NativeControlProviderAmountUpdate));
+            update(table.Owner, 1, -1.0f, 0);
+            update(table.Owner, 1, -1.0f, 0);
+            update(table.Owner, 1, -1.0f, 0);
+            update(table.Owner, 1, 3.0f, 0);
+            int roundedAmount = FloatBits(ReadFloat(table.Owner, 0x590));
+            Expect(ReadNativeProviderAmount(table, 1) == 3.0f &&
+                ReadFloat(table.Owner, 0x58c) == 33554436.0f &&
+                roundedAmount == FloatBits(33554440.0f),
+                "Control ordered aggregate updates can round the current amount above its initial capacity");
+            distribute(table.Owner, 1.0f, 0, 1);
+            Expect(ReadNativeProviderAmount(table, 0) == 33554432.0f &&
+                ReadNativeProviderAmount(table, 1) == 3.0f &&
+                ReadFloat(table.Owner, 0x58c) == 33554436.0f &&
+                ReadFloat(table.Owner, 0x590) == 33554440.0f,
+                "Control proportional revive path preserves signed negative capacity after native aggregate rounding");
+            GC.KeepAlive(update);
         }
 
         using (Fixture fixture = NewFixture()) {
@@ -1524,6 +1584,9 @@ internal static class BehaviorDistributorTickOracle {
                 (ReadNativeProviderFlags(table, 0) & 0x10) == 0 &&
                 (ReadNativeProviderFlags(table, 1) & 0x10) == 0,
                 "Control native revive flag admits exhausted rows and clears their exhausted flags when refilled");
+            Expect(ReadNativeProviderAccumulatedDelta(table, 0) == 1.0f &&
+                ReadNativeProviderAccumulatedDelta(table, 1) == 5.0f,
+                "Control refill adds to the existing provider row +0x10 accumulator");
         }
 
         using (Fixture fixture = NewFixture()) {
@@ -1539,6 +1602,9 @@ internal static class BehaviorDistributorTickOracle {
                 secondBits == 0x3ffffffe && totalBits == unchecked((uint)FloatBits(16777216.0f)),
                 "Control proportional distribution preserves the native x87 add-then-subtract rounding at a 2^24 cancellation boundary; actual=[" +
                 Hex(firstBits) + "," + Hex(secondBits) + "] total=" + Hex(totalBits));
+            Expect(FloatBits(ReadNativeProviderAccumulatedDelta(table, 0)) == FloatBits(-2.0f) &&
+                FloatBits(ReadNativeProviderAccumulatedDelta(table, 1)) == unchecked((int)0xb4800000),
+                "Control distribution accumulates the rounded applied change, not the requested delta");
         }
 
         Console.WriteLine("native-control-provider-distribution: controlHash=" + ExpectedControlSha256 +

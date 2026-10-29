@@ -257,6 +257,8 @@ pub struct MissionControlNodeProviderRow {
     pub initial_type1_value_bits: u32,
     /// Current amount at native `+0x08`.
     pub current_amount_bits: u32,
+    /// Accumulated distribution amount changes at native `+0x10`.
+    pub current_accumulated_delta_bits: u32,
     /// Amount last processed by the stage updater, native `+0x0c`.
     pub processed_amount_bits: u32,
     /// Current normalized provider value at native `+0x14`.
@@ -281,6 +283,15 @@ pub struct ControlNodeProviderPublication {
     pub key: u32,
     /// Normalized provider value sent to the node callback.
     pub type1_value_bits: u32,
+}
+
+/// Allocation rule used by native Control provider amount distribution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlNodeDistributionMode {
+    /// Add by free capacity and withdraw in proportion to current row amounts.
+    Proportional,
+    /// Fill from the first row, or withdraw from the last row backwards.
+    Sequential,
 }
 
 /// Availability of the global Control node-data provider projection.
@@ -437,10 +448,14 @@ pub struct MissionControlDeviceTableState {
     pub status: MissionControlDeviceTableStatus,
     /// Global NDP provider rows used by indexed Control selectors.
     pub node_provider_status: MissionControlNodeProviderTableStatus,
+    /// Native `+0x58c`: total provider capacity in the supported unit-scale domain.
+    pub node_provider_maximum_amount_bits: Option<u32>,
     /// Native `+0x590` amount aggregate; absent if it cannot be represented.
     pub node_provider_amount_bits: Option<u32>,
     /// Native `+0x598`: amount changed since the last aggregate/contact update.
     pub node_provider_dirty: bool,
+    /// Native `+0x618`: distribution returns without changing rows while set.
+    pub node_provider_distribution_suspended: bool,
 }
 
 struct ControlDeviceProjection {
@@ -1487,16 +1502,22 @@ fn load_mission_with_options(
                         original_id: draft.original_id,
                         handle: *handle,
                         status: MissionControlDeviceTableStatus::Available(projection.devices),
+                        node_provider_maximum_amount_bits: initial_node_provider_maximum_amount(
+                            &projection.node_provider_status,
+                        ),
                         node_provider_amount_bits: initial_node_provider_amount(&projection.node_provider_status),
                         node_provider_dirty: true,
+                        node_provider_distribution_suspended: false,
                         node_provider_status: projection.node_provider_status,
                     },
                     Err(reason) => MissionControlDeviceTableState {
                         original_id: draft.original_id,
                         handle: *handle,
                         status: MissionControlDeviceTableStatus::Unavailable(reason.clone()),
+                        node_provider_maximum_amount_bits: None,
                         node_provider_amount_bits: None,
                         node_provider_dirty: false,
+                        node_provider_distribution_suspended: false,
                         node_provider_status:
                             MissionControlNodeProviderTableStatus::Unavailable(
                                 MissionControlNodeProviderTableUnavailableReason::DeviceTableUnavailable(
@@ -2210,6 +2231,41 @@ pub fn apply_loaded_mission_control_node_delta(
     apply_control_node_delta(table, key, delta)
 }
 
+/// Distributes an amount change through one loaded Control object's provider rows.
+///
+/// This follows native `Control.dll+0x10ba0`: proportional mode distributes
+/// additions by free capacity and withdrawals by current amount; sequential
+/// mode fills in row order and withdraws in reverse order. `revive_exhausted`
+/// opts into the native replenishment path. Each row also
+/// accumulates its actual amount change at `+0x10`. The final native stage walk
+/// is required and keeps `update_effects = true`; transitions needing effects or
+/// host callbacks remain explicit errors.
+///
+/// # Errors
+/// Rejects invalid handles, unavailable state, unsupported numeric ranges,
+/// lifecycle changes, and stage/FX callbacks not yet modeled. All row amounts,
+/// accumulators, aggregates, and stages remain unchanged on error. This changes
+/// the CPU projection, not GPU uploads or the windowed game path.
+pub fn distribute_loaded_mission_control_provider_amount(
+    engine: &mut Engine,
+    handle: ObjectHandle,
+    delta: f32,
+    mode: ControlNodeDistributionMode,
+    revive_exhausted: bool,
+) -> Result<(), ControlResourceAccessError> {
+    transform_state(&engine.world, handle).map_err(ControlResourceAccessError::World)?;
+    let loaded = engine
+        .loaded
+        .as_mut()
+        .ok_or(ControlResourceAccessError::MissionUnavailable)?;
+    let table = loaded
+        .control_device_tables
+        .iter_mut()
+        .find(|table| table.handle == handle)
+        .ok_or(ControlResourceAccessError::ObjectUnavailable { handle })?;
+    distribute_control_node_amount(table, delta, mode, revive_exhausted)
+}
+
 /// Applies the confirmed single-node stage path of native Control `0x11220`.
 ///
 /// Copies parent ratio/stage when requested, updates the processed amount and
@@ -2515,10 +2571,312 @@ fn initial_node_provider_amount(status: &MissionControlNodeProviderTableStatus) 
         .map(f32::to_bits)
 }
 
+fn initial_node_provider_maximum_amount(
+    status: &MissionControlNodeProviderTableStatus,
+) -> Option<u32> {
+    let MissionControlNodeProviderTableStatus::Available(rows) = status else {
+        return None;
+    };
+    rows.iter()
+        .try_fold(0.0_f32, |total, row| {
+            let maximum =
+                checked_control_float(0, "initial provider maximum", row.source_row.max_volume)?;
+            checked_control_sum(0, "initial provider maximum aggregate", total, maximum)
+        })
+        .ok()
+        .map(f32::to_bits)
+}
+
+fn control_node_provider_row(
+    table: &MissionControlDeviceTableState,
+    key: u32,
+) -> Result<&MissionControlNodeProviderRow, ControlResourceAccessError> {
+    let rows = match &table.node_provider_status {
+        MissionControlNodeProviderTableStatus::Available(rows) => rows,
+        MissionControlNodeProviderTableStatus::Unavailable(reason) => {
+            return Err(ControlResourceAccessError::NodeProviderTableUnavailable(
+                reason.clone(),
+            ));
+        }
+    };
+    let row_count = rows.len();
+    usize::try_from(key)
+        .ok()
+        .and_then(|index| rows.get(index))
+        .ok_or(ControlResourceAccessError::NodeProviderKeyOutOfRange { key, row_count })
+}
+
+fn checked_control_node_provider_amounts(
+    row: &MissionControlNodeProviderRow,
+    key: u32,
+) -> Result<(f32, f32), ControlResourceAccessError> {
+    let amount = checked_control_float(
+        0,
+        "provider amount",
+        f32::from_bits(row.current_amount_bits),
+    )?;
+    let maximum = checked_control_float(0, "provider maximum", row.source_row.max_volume)?;
+    if amount < 0.0 || maximum < amount {
+        return Err(ControlResourceAccessError::InvalidNodeProviderAmount { key });
+    }
+    Ok((amount, maximum))
+}
+
+fn distribute_control_node_amount(
+    table: &mut MissionControlDeviceTableState,
+    delta: f32,
+    mode: ControlNodeDistributionMode,
+    revive_exhausted: bool,
+) -> Result<(), ControlResourceAccessError> {
+    if table.node_provider_distribution_suspended || delta == 0.0 {
+        return Ok(());
+    }
+    let delta = checked_control_float(0, "provider distribution delta", delta)?;
+    let mut updated = table.clone();
+    distribute_control_node_amount_inner(&mut updated, delta, mode, revive_exhausted)?;
+    *table = updated;
+    Ok(())
+}
+
+fn distribute_control_node_amount_inner(
+    table: &mut MissionControlDeviceTableState,
+    delta: f32,
+    mode: ControlNodeDistributionMode,
+    revive_exhausted: bool,
+) -> Result<(), ControlResourceAccessError> {
+    let row_count = match &table.node_provider_status {
+        MissionControlNodeProviderTableStatus::Available(rows) => rows.len(),
+        MissionControlNodeProviderTableStatus::Unavailable(reason) => {
+            return Err(ControlResourceAccessError::NodeProviderTableUnavailable(
+                reason.clone(),
+            ));
+        }
+    };
+    let aggregate_bits =
+        table
+            .node_provider_amount_bits
+            .ok_or(ControlResourceAccessError::UnsupportedField {
+                factory_tag: 0,
+                field: "provider aggregate",
+            })?;
+    let aggregate = checked_control_float(0, "provider aggregate", f32::from_bits(aggregate_bits))?;
+    if aggregate < 0.0 {
+        return Err(ControlResourceAccessError::InvalidNodeProviderAmount { key: 0 });
+    }
+
+    let capacity = if delta > 0.0 {
+        if revive_exhausted {
+            let maximum_bits = table.node_provider_maximum_amount_bits.ok_or(
+                ControlResourceAccessError::UnsupportedField {
+                    factory_tag: 0,
+                    field: "provider maximum aggregate",
+                },
+            )?;
+            let maximum = checked_control_float(
+                0,
+                "provider maximum aggregate",
+                f32::from_bits(maximum_bits),
+            )?;
+            checked_control_sum(0, "provider remaining total capacity", maximum, -aggregate)?
+        } else {
+            let rows = match &table.node_provider_status {
+                MissionControlNodeProviderTableStatus::Available(rows) => rows,
+                MissionControlNodeProviderTableStatus::Unavailable(reason) => {
+                    return Err(ControlResourceAccessError::NodeProviderTableUnavailable(
+                        reason.clone(),
+                    ));
+                }
+            };
+            let mut capacity = 0.0_f32;
+            for (index, row) in rows.iter().enumerate() {
+                let key = u32::try_from(index).map_err(|_| {
+                    ControlResourceAccessError::NodeProviderKeyOutOfRange {
+                        key: u32::MAX,
+                        row_count,
+                    }
+                })?;
+                let flags =
+                    row.current_flags
+                        .ok_or(ControlResourceAccessError::UnsupportedField {
+                            factory_tag: 0,
+                            field: "provider flags",
+                        })?;
+                if flags & 0x10 != 0 {
+                    continue;
+                }
+                let (amount, maximum) = checked_control_node_provider_amounts(row, key)?;
+                let free = checked_control_sum(0, "provider free capacity", maximum, -amount)?;
+                capacity = checked_control_sum(0, "provider total free capacity", capacity, free)?;
+            }
+            capacity
+        }
+    } else {
+        -aggregate
+    };
+    if capacity == 0.0 {
+        return Ok(());
+    }
+
+    let bounded_delta = if delta > 0.0 {
+        if delta > capacity {
+            capacity
+        } else {
+            delta
+        }
+    } else if delta < capacity {
+        capacity
+    } else {
+        delta
+    };
+
+    match mode {
+        ControlNodeDistributionMode::Proportional => {
+            let adjusted_aggregate = checked_control_sum(
+                0,
+                "provider aggregate after distribution",
+                aggregate,
+                bounded_delta,
+            )?;
+            let applied_delta = checked_control_sum(
+                0,
+                "provider applied distribution delta",
+                adjusted_aggregate,
+                -aggregate,
+            )?;
+            let ratio =
+                checked_control_ratio("provider distribution ratio", applied_delta, capacity)?;
+            for index in 0..row_count {
+                let key = u32::try_from(index).map_err(|_| {
+                    ControlResourceAccessError::NodeProviderKeyOutOfRange {
+                        key: u32::MAX,
+                        row_count,
+                    }
+                })?;
+                if delta > 0.0 && !revive_exhausted {
+                    let flags = control_node_provider_row(table, key)?.current_flags.ok_or(
+                        ControlResourceAccessError::UnsupportedField {
+                            factory_tag: 0,
+                            field: "provider flags",
+                        },
+                    )?;
+                    if flags & 0x10 != 0 {
+                        continue;
+                    }
+                }
+                let (amount, maximum) = checked_control_node_provider_amounts(
+                    control_node_provider_row(table, key)?,
+                    key,
+                )?;
+                let row_delta = if delta > 0.0 {
+                    let free = checked_control_sum(0, "provider free capacity", maximum, -amount)?;
+                    checked_control_product(0, "provider proportional addition", free, ratio)?
+                } else {
+                    -checked_control_product(0, "provider proportional withdrawal", ratio, amount)?
+                };
+                apply_control_node_distribution_delta(table, key, row_delta)?;
+            }
+        }
+        ControlNodeDistributionMode::Sequential => {
+            let mut remaining = delta;
+            if delta > 0.0 {
+                for index in 0..row_count {
+                    if remaining <= 0.0 {
+                        break;
+                    }
+                    let key = u32::try_from(index).map_err(|_| {
+                        ControlResourceAccessError::NodeProviderKeyOutOfRange {
+                            key: u32::MAX,
+                            row_count,
+                        }
+                    })?;
+                    if !revive_exhausted {
+                        let flags = control_node_provider_row(table, key)?.current_flags.ok_or(
+                            ControlResourceAccessError::UnsupportedField {
+                                factory_tag: 0,
+                                field: "provider flags",
+                            },
+                        )?;
+                        if flags & 0x10 != 0 {
+                            continue;
+                        }
+                    }
+                    let (amount, maximum) = checked_control_node_provider_amounts(
+                        control_node_provider_row(table, key)?,
+                        key,
+                    )?;
+                    let free = checked_control_sum(0, "provider free capacity", maximum, -amount)?;
+                    let row_delta = if remaining <= free { remaining } else { free };
+                    if row_delta != 0.0 {
+                        apply_control_node_distribution_delta(table, key, row_delta)?;
+                        remaining = checked_control_sum(
+                            0,
+                            "provider remaining addition",
+                            remaining,
+                            -row_delta,
+                        )?;
+                    }
+                }
+            } else {
+                for index in (0..row_count).rev() {
+                    if remaining >= 0.0 {
+                        break;
+                    }
+                    let key = u32::try_from(index).map_err(|_| {
+                        ControlResourceAccessError::NodeProviderKeyOutOfRange {
+                            key: u32::MAX,
+                            row_count,
+                        }
+                    })?;
+                    let (amount, _) = checked_control_node_provider_amounts(
+                        control_node_provider_row(table, key)?,
+                        key,
+                    )?;
+                    let requested = -remaining;
+                    let removed = if amount < requested {
+                        amount
+                    } else {
+                        requested
+                    };
+                    if removed != 0.0 {
+                        let row_delta = -removed;
+                        apply_control_node_distribution_delta(table, key, row_delta)?;
+                        remaining = checked_control_sum(
+                            0,
+                            "provider remaining withdrawal",
+                            removed,
+                            remaining,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+
+    // Native 0x10ba0 always finishes with 0x11130(root, update_effects=true).
+    propagate_control_node_stage_inner(table, 0, true)
+}
+
 fn apply_control_node_delta(
     table: &mut MissionControlDeviceTableState,
     key: u32,
     delta: f32,
+) -> Result<Option<ControlNodeProviderPublication>, ControlResourceAccessError> {
+    apply_control_node_delta_inner(table, key, delta, false)
+}
+
+fn apply_control_node_distribution_delta(
+    table: &mut MissionControlDeviceTableState,
+    key: u32,
+    delta: f32,
+) -> Result<Option<ControlNodeProviderPublication>, ControlResourceAccessError> {
+    apply_control_node_delta_inner(table, key, delta, true)
+}
+
+fn apply_control_node_delta_inner(
+    table: &mut MissionControlDeviceTableState,
+    key: u32,
+    delta: f32,
+    accumulate_delta: bool,
 ) -> Result<Option<ControlNodeProviderPublication>, ControlResourceAccessError> {
     let rows = match &mut table.node_provider_status {
         MissionControlNodeProviderTableStatus::Available(rows) => rows,
@@ -2575,6 +2933,21 @@ fn apply_control_node_delta(
     let change = checked_control_sum(0, "provider amount change", amount, -previous)?;
     let total = checked_control_sum(0, "provider aggregate", total, change)?.max(0.0);
     let ratio = checked_control_ratio("provider ratio", amount, maximum)?;
+    let accumulated_delta = if accumulate_delta {
+        let previous = checked_control_float(
+            0,
+            "provider accumulated delta",
+            f32::from_bits(row.current_accumulated_delta_bits),
+        )?;
+        Some(checked_control_sum(
+            0,
+            "provider accumulated delta",
+            change,
+            previous,
+        )?)
+    } else {
+        None
+    };
     let mesh = row
         .mesh_state
         .as_mut()
@@ -2583,6 +2956,9 @@ fn apply_control_node_delta(
             field: "model node state",
         })?;
     row.current_amount_bits = amount.to_bits();
+    if let Some(accumulated_delta) = accumulated_delta {
+        row.current_accumulated_delta_bits = accumulated_delta.to_bits();
+    }
     row.current_type1_value_bits = ratio.to_bits();
     mesh.type1_value_bits = ratio.to_bits();
     row.current_flags = Some(if amount == 0.0 {
@@ -4072,6 +4448,7 @@ fn append_control_node_provider_rows(
             initial_amount_bits: source_row.max_volume.to_bits(),
             initial_type1_value_bits: 0x3f80_0000,
             current_amount_bits: source_row.max_volume.to_bits(),
+            current_accumulated_delta_bits: 0,
             processed_amount_bits: source_row.max_volume.to_bits(),
             current_type1_value_bits: 0x3f80_0000,
             current_flags: None,
@@ -4644,6 +5021,7 @@ mod tests {
             initial_amount_bits: 100.0_f32.to_bits(),
             initial_type1_value_bits,
             current_amount_bits: 100.0_f32.to_bits(),
+            current_accumulated_delta_bits: 0,
             processed_amount_bits: 100.0_f32.to_bits(),
             current_type1_value_bits: initial_type1_value_bits,
             current_flags: None,
@@ -4933,8 +5311,12 @@ mod tests {
                 slot: 7,
             },
             status,
+            node_provider_maximum_amount_bits: initial_node_provider_maximum_amount(
+                &node_provider_status,
+            ),
             node_provider_amount_bits: initial_node_provider_amount(&node_provider_status),
             node_provider_dirty: false,
+            node_provider_distribution_suspended: false,
             node_provider_status,
         }
     }
@@ -5413,6 +5795,16 @@ mod tests {
             apply_loaded_mission_control_node_delta(&mut engine, handle, 1, -1.0),
             Err(ControlResourceAccessError::MissionUnavailable)
         );
+        assert_eq!(
+            distribute_loaded_mission_control_provider_amount(
+                &mut engine,
+                handle,
+                -1.0,
+                ControlNodeDistributionMode::Proportional,
+                false,
+            ),
+            Err(ControlResourceAccessError::MissionUnavailable)
+        );
 
         assert_eq!(
             update_loaded_mission_control_node_stage(&mut engine, handle, 1, false),
@@ -5427,6 +5819,22 @@ mod tests {
             generation: handle.generation.wrapping_add(1),
             slot: handle.slot,
         };
+        let invalid = ObjectHandle {
+            generation: 0,
+            slot: u32::MAX,
+        };
+        assert_eq!(
+            distribute_loaded_mission_control_provider_amount(
+                &mut engine,
+                invalid,
+                -1.0,
+                ControlNodeDistributionMode::Proportional,
+                false,
+            ),
+            Err(ControlResourceAccessError::World(
+                fparkan_world::WorldError::InvalidHandle
+            ))
+        );
         assert_eq!(
             query_loaded_mission_control_resource(&engine, stale, 1),
             Err(ControlResourceAccessError::World(
@@ -5454,6 +5862,18 @@ mod tests {
 
         assert_eq!(
             apply_loaded_mission_control_node_delta(&mut engine, stale, 1, -1.0),
+            Err(ControlResourceAccessError::World(
+                fparkan_world::WorldError::StaleHandle
+            ))
+        );
+        assert_eq!(
+            distribute_loaded_mission_control_provider_amount(
+                &mut engine,
+                stale,
+                -1.0,
+                ControlNodeDistributionMode::Proportional,
+                false,
+            ),
             Err(ControlResourceAccessError::World(
                 fparkan_world::WorldError::StaleHandle
             ))
@@ -5685,6 +6105,350 @@ mod tests {
         assert_eq!(rows[1].current_type1_value_bits, 0.25_f32.to_bits());
         assert_eq!(rows[1].current_flags, Some(1));
         assert_eq!(table.node_provider_amount_bits, total);
+    }
+
+    #[test]
+    fn control_provider_distribution_matches_native_and_rolls_back_unsupported_updates() {
+        let make_row = |index: usize, maximum: f32, amount: f32, flags: u32, parent: i32| {
+            let ratio = amount / maximum;
+            let mut row = synthetic_node_provider_row(0, index, ratio.to_bits());
+            row.source_row.max_volume = maximum;
+            row.initial_amount_bits = maximum.to_bits();
+            row.current_amount_bits = amount.to_bits();
+            row.processed_amount_bits = amount.to_bits();
+            row.current_flags = Some(flags);
+            row.initial_mesh_state = Some(MissionControlNodeInitialMeshState {
+                parent_index: parent,
+                flags,
+                stage_count: 1,
+            });
+            row.mesh_state = Some(MissionControlNodeMeshState {
+                type1_value_bits: ratio.to_bits(),
+                visible_stage: 0,
+            });
+            row
+        };
+
+        let mut proportional = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(Vec::new()),
+            MissionControlNodeProviderTableStatus::Available(vec![
+                make_row(0, 30.0, 10.0, 0x02, -1),
+                make_row(1, 60.0, 20.0, 0x02, -1),
+                make_row(2, 50.0, 0.0, 0x02, -1),
+            ]),
+        );
+        distribute_control_node_amount(
+            &mut proportional,
+            22.0,
+            ControlNodeDistributionMode::Proportional,
+            false,
+        )
+        .expect("native proportional distribution");
+        let MissionControlNodeProviderTableStatus::Available(rows) =
+            &proportional.node_provider_status
+        else {
+            panic!("provider rows should be available");
+        };
+        assert_eq!(
+            rows.iter()
+                .map(|row| f32::from_bits(row.current_amount_bits))
+                .collect::<Vec<_>>(),
+            [14.0, 28.0, 10.0]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| f32::from_bits(row.current_accumulated_delta_bits))
+                .collect::<Vec<_>>(),
+            [4.0, 8.0, 10.0]
+        );
+        assert_eq!(
+            proportional.node_provider_amount_bits,
+            Some(52.0_f32.to_bits())
+        );
+
+        let mut accumulated = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(Vec::new()),
+            MissionControlNodeProviderTableStatus::Available(vec![make_row(
+                0, 100.0, 40.0, 0x02, -1,
+            )]),
+        );
+        let MissionControlNodeProviderTableStatus::Available(rows) =
+            &mut accumulated.node_provider_status
+        else {
+            panic!("provider rows should be available");
+        };
+        rows[0].current_accumulated_delta_bits = 7.0_f32.to_bits();
+        let _publication = apply_control_node_delta(&mut accumulated, 0, 10.0)
+            .expect("single-node zero-flag update")
+            .expect("amount changed");
+        let MissionControlNodeProviderTableStatus::Available(rows) =
+            &accumulated.node_provider_status
+        else {
+            panic!("provider rows should be available");
+        };
+        assert_eq!(rows[0].current_accumulated_delta_bits, 7.0_f32.to_bits());
+        distribute_control_node_amount(
+            &mut accumulated,
+            10.0,
+            ControlNodeDistributionMode::Proportional,
+            false,
+        )
+        .expect("distribution adds to the existing accumulator");
+        let MissionControlNodeProviderTableStatus::Available(rows) =
+            &accumulated.node_provider_status
+        else {
+            panic!("provider rows should be available");
+        };
+        assert_eq!(rows[0].current_accumulated_delta_bits, 17.0_f32.to_bits());
+
+        let mut sequential = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(Vec::new()),
+            MissionControlNodeProviderTableStatus::Available(vec![
+                make_row(0, 30.0, 10.0, 0x02, -1),
+                make_row(1, 60.0, 20.0, 0x02, -1),
+                make_row(2, 50.0, 30.0, 0x02, -1),
+            ]),
+        );
+        distribute_control_node_amount(
+            &mut sequential,
+            -35.0,
+            ControlNodeDistributionMode::Sequential,
+            false,
+        )
+        .expect("native reverse sequential withdrawal");
+        let MissionControlNodeProviderTableStatus::Available(rows) =
+            &sequential.node_provider_status
+        else {
+            panic!("provider rows should be available");
+        };
+        assert_eq!(
+            rows.iter()
+                .map(|row| f32::from_bits(row.current_amount_bits))
+                .collect::<Vec<_>>(),
+            [10.0, 15.0, 0.0]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| f32::from_bits(row.current_accumulated_delta_bits))
+                .collect::<Vec<_>>(),
+            [0.0, -5.0, -30.0]
+        );
+
+        let mut rounded_capacity = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(Vec::new()),
+            MissionControlNodeProviderTableStatus::Available(vec![
+                make_row(0, 33_554_432.0, 16_777_216.0, 0x02, -1),
+                make_row(1, 3.0, 2.0, 0x02, -1),
+            ]),
+        );
+        distribute_control_node_amount(
+            &mut rounded_capacity,
+            33_554_432.0,
+            ControlNodeDistributionMode::Sequential,
+            false,
+        )
+        .expect("sequential mode carries the original request across rows");
+        let MissionControlNodeProviderTableStatus::Available(rows) =
+            &rounded_capacity.node_provider_status
+        else {
+            panic!("provider rows should be available");
+        };
+        assert_eq!(
+            rows.iter()
+                .map(|row| f32::from_bits(row.current_amount_bits))
+                .collect::<Vec<_>>(),
+            [33_554_432.0, 3.0]
+        );
+        assert_eq!(
+            rows.iter()
+                .map(|row| f32::from_bits(row.current_accumulated_delta_bits))
+                .collect::<Vec<_>>(),
+            [16_777_216.0, 1.0]
+        );
+
+        let mut rounded_aggregate = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(Vec::new()),
+            MissionControlNodeProviderTableStatus::Available(vec![
+                make_row(0, 33_554_432.0, 33_554_432.0, 0x02, -1),
+                make_row(1, 3.0, 3.0, 0x02, -1),
+            ]),
+        );
+        for _ in 0..3 {
+            let _publication = apply_control_node_delta(&mut rounded_aggregate, 1, -1.0)
+                .expect("direct amount update")
+                .expect("row amount changed");
+        }
+        let _publication = apply_control_node_delta(&mut rounded_aggregate, 1, 3.0)
+            .expect("direct refill")
+            .expect("row amount changed");
+        assert_eq!(
+            rounded_aggregate.node_provider_maximum_amount_bits,
+            Some(33_554_436.0_f32.to_bits())
+        );
+        assert_eq!(
+            rounded_aggregate.node_provider_amount_bits,
+            Some(33_554_440.0_f32.to_bits())
+        );
+        distribute_control_node_amount(
+            &mut rounded_aggregate,
+            1.0,
+            ControlNodeDistributionMode::Proportional,
+            true,
+        )
+        .expect("signed capacity after native aggregate rounding");
+        let MissionControlNodeProviderTableStatus::Available(rows) =
+            &rounded_aggregate.node_provider_status
+        else {
+            panic!("provider rows should be available");
+        };
+        assert_eq!(rows[0].current_amount_bits, 33_554_432.0_f32.to_bits());
+        assert_eq!(rows[1].current_amount_bits, 3.0_f32.to_bits());
+        assert_eq!(
+            rounded_aggregate.node_provider_amount_bits,
+            Some(33_554_440.0_f32.to_bits())
+        );
+
+        let mut rounding = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(Vec::new()),
+            MissionControlNodeProviderTableStatus::Available(vec![
+                make_row(0, 33_554_432.0, 16_777_216.0, 0x02, -1),
+                make_row(1, 10.0, 2.0, 0x02, -1),
+            ]),
+        );
+        distribute_control_node_amount(
+            &mut rounding,
+            -1.0,
+            ControlNodeDistributionMode::Proportional,
+            false,
+        )
+        .expect("native x87 cancellation rounding");
+        let MissionControlNodeProviderTableStatus::Available(rows) = &rounding.node_provider_status
+        else {
+            panic!("provider rows should be available");
+        };
+        assert_eq!(rows[0].current_amount_bits, 16_777_214.0_f32.to_bits());
+        assert_eq!(rows[0].current_accumulated_delta_bits, (-2.0_f32).to_bits());
+        assert_eq!(rows[1].current_amount_bits, 0x3fff_fffe);
+        assert_eq!(rows[1].current_accumulated_delta_bits, 0xb480_0000);
+        assert_eq!(
+            rounding.node_provider_amount_bits,
+            Some(16_777_216.0_f32.to_bits())
+        );
+
+        let mut exhausted = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(Vec::new()),
+            MissionControlNodeProviderTableStatus::Available(vec![
+                make_row(0, 10.0, 9.0, 0x02, -1),
+                make_row(1, 10.0, 0.0, 0x12, 0),
+            ]),
+        );
+        let MissionControlNodeProviderTableStatus::Available(rows) =
+            &mut exhausted.node_provider_status
+        else {
+            panic!("provider rows should be available");
+        };
+        rows[1].current_stage = 1;
+        rows[1].mesh_state.as_mut().unwrap().visible_stage = 0;
+        distribute_control_node_amount(
+            &mut exhausted,
+            10.0,
+            ControlNodeDistributionMode::Sequential,
+            false,
+        )
+        .expect("ordinary distribution skips an exhausted row");
+        let before = exhausted.clone();
+        assert_eq!(
+            distribute_control_node_amount(
+                &mut exhausted,
+                10.0,
+                ControlNodeDistributionMode::Sequential,
+                true,
+            ),
+            Err(ControlResourceAccessError::UnsupportedNodeEffects { key: 1 })
+        );
+        assert_eq!(
+            exhausted, before,
+            "revival with an FX stage transition rolls back"
+        );
+
+        let mut lifecycle = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(Vec::new()),
+            MissionControlNodeProviderTableStatus::Available(vec![
+                make_row(0, 100.0, 20.0, 0x02, -1),
+                make_row(1, 100.0, 40.0, 0x02, 0),
+            ]),
+        );
+        let before = lifecycle.clone();
+        assert_eq!(
+            distribute_control_node_amount(
+                &mut lifecycle,
+                -80.0,
+                ControlNodeDistributionMode::Sequential,
+                false,
+            ),
+            Err(ControlResourceAccessError::UnsupportedNodeLifecycle { key: 0 })
+        );
+        assert_eq!(
+            lifecycle, before,
+            "root lifecycle failure rolls back earlier row updates"
+        );
+
+        for (accumulated_delta, overflow) in [(f32::NAN, false), (f32::MAX, true)] {
+            let second_maximum = if overflow { f32::MAX } else { 100.0 };
+            let second_amount = if overflow { 0.0 } else { 40.0 };
+            let mut malformed = synthetic_control_device_table_with_providers(
+                MissionControlDeviceTableStatus::Available(Vec::new()),
+                MissionControlNodeProviderTableStatus::Available(vec![
+                    make_row(0, 100.0, 20.0, 0x02, -1),
+                    make_row(1, second_maximum, second_amount, 0x02, -1),
+                ]),
+            );
+            let MissionControlNodeProviderTableStatus::Available(rows) =
+                &mut malformed.node_provider_status
+            else {
+                panic!("provider rows should be available");
+            };
+            rows[1].current_accumulated_delta_bits = accumulated_delta.to_bits();
+            let before = malformed.clone();
+            let delta = if overflow { f32::MAX } else { 10.0 };
+            let error = distribute_control_node_amount(
+                &mut malformed,
+                delta,
+                ControlNodeDistributionMode::Proportional,
+                false,
+            )
+            .expect_err("an invalid late-row accumulator must abort the transaction");
+            if overflow {
+                assert_eq!(
+                    error,
+                    ControlResourceAccessError::UnsupportedFloatRange {
+                        factory_tag: Some(0),
+                        field: "provider accumulated delta",
+                    }
+                );
+            } else {
+                assert_eq!(
+                    error,
+                    ControlResourceAccessError::NonFiniteValue {
+                        factory_tag: 0,
+                        field: "provider accumulated delta",
+                    }
+                );
+            }
+            assert_eq!(malformed, before);
+        }
+
+        let mut suspended = proportional.clone();
+        suspended.node_provider_distribution_suspended = true;
+        let before = suspended.clone();
+        distribute_control_node_amount(
+            &mut suspended,
+            -1.0,
+            ControlNodeDistributionMode::Proportional,
+            false,
+        )
+        .expect("native distribution suspension is a no-op");
+        assert_eq!(suspended, before);
     }
 
     #[test]
@@ -7448,24 +8212,88 @@ mod tests {
                 .map(f32::to_bits),
             Some(2.5_f32.to_bits())
         );
-        let mine_table = &loaded_mission_control_device_tables(&mine_engine).unwrap()[0];
-        let MissionControlDeviceTableStatus::Available(mine_devices) = &mine_table.status else {
-            panic!()
+        let (key, initial, initial_amount) = {
+            let mine_table = &loaded_mission_control_device_tables(&mine_engine).unwrap()[0];
+            let MissionControlDeviceTableStatus::Available(mine_devices) = &mine_table.status
+            else {
+                panic!()
+            };
+            let key = mine_devices[8].key;
+            let MissionControlNodeProviderTableStatus::Available(mine_rows) =
+                &mine_table.node_provider_status
+            else {
+                panic!()
+            };
+            let initial = mine_rows[key as usize].initial_amount_bits;
+            let initial_amount = f32::from_bits(initial);
+            assert!(initial_amount > 0.0);
+            let initial_processed = mine_rows[key as usize].processed_amount_bits;
+            assert_eq!(mine_rows[key as usize].current_amount_bits, initial);
+            assert_eq!(initial_processed, initial);
+            (key, initial, initial_amount)
         };
-        let key = mine_devices[8].key;
-        let MissionControlNodeProviderTableStatus::Available(mine_rows) =
-            &mine_table.node_provider_status
-        else {
-            panic!()
+        distribute_loaded_mission_control_provider_amount(
+            &mut mine_engine,
+            mine_profile.handle,
+            -1.0,
+            ControlNodeDistributionMode::Proportional,
+            false,
+        )
+        .expect("licensed proportional provider withdrawal");
+        let (distributed_amount, processed_before_direct_delta, accumulated_before_direct_delta) = {
+            let MissionControlNodeProviderTableStatus::Available(mine_rows) =
+                &loaded_mission_control_device_tables(&mine_engine).unwrap()[0]
+                    .node_provider_status
+            else {
+                panic!()
+            };
+            let distributed_row = &mine_rows[key as usize];
+            let distributed_amount = f32::from_bits(distributed_row.current_amount_bits);
+            let distributed_change = distributed_amount - initial_amount;
+            assert_ne!(distributed_row.current_amount_bits, initial);
+            assert_ne!(
+                distributed_row.current_accumulated_delta_bits,
+                0.0_f32.to_bits()
+            );
+            assert_eq!(
+                distributed_row.current_accumulated_delta_bits,
+                distributed_change.to_bits()
+            );
+            assert_eq!(distributed_row.initial_amount_bits, initial);
+            assert_eq!(
+                distributed_row.processed_amount_bits,
+                distributed_row.current_amount_bits
+            );
+            assert_eq!(
+                query_loaded_mission_control_device_selector(
+                    &mine_engine,
+                    mine_profile.handle,
+                    8,
+                    0xe00
+                )
+                .unwrap()
+                .unwrap()
+                .to_bits(),
+                distributed_row.current_type1_value_bits
+            );
+            assert_eq!(
+                query_loaded_mission_behavior_resource(&mine_engine, mine_profile.handle, 0x1002)
+                    .unwrap()
+                    .to_bits(),
+                distributed_row.current_type1_value_bits
+            );
+            (
+                distributed_amount,
+                distributed_row.processed_amount_bits,
+                distributed_row.current_accumulated_delta_bits,
+            )
         };
-        let initial = mine_rows[key as usize].initial_amount_bits;
-        let amount = f32::from_bits(initial);
-        assert!(amount > 0.0);
+        let amount = distributed_amount;
         let publication = apply_loaded_mission_control_node_delta(
             &mut mine_engine,
             mine_profile.handle,
             key,
-            -amount * 0.5,
+            initial_amount * 0.5 - amount,
         )
         .unwrap()
         .unwrap();
@@ -7507,7 +8335,14 @@ mod tests {
             panic!()
         };
         assert_eq!(mine_rows[key as usize].initial_amount_bits, initial);
-        assert_eq!(mine_rows[key as usize].processed_amount_bits, initial);
+        assert_eq!(
+            mine_rows[key as usize].processed_amount_bits,
+            processed_before_direct_delta
+        );
+        assert_eq!(
+            mine_rows[key as usize].current_accumulated_delta_bits,
+            accumulated_before_direct_delta
+        );
         assert_eq!(
             mine_rows[key as usize].mesh_state,
             Some(MissionControlNodeMeshState {
@@ -7520,11 +8355,12 @@ mod tests {
         assert_eq!(stage_row.initial_mesh_state.unwrap().stage_count, 2);
         assert_eq!(stage_row.current_flags, Some(2));
         let stage_initial = stage_row.initial_amount_bits;
+        let stage_current = stage_row.current_amount_bits;
         let _publication = apply_loaded_mission_control_node_delta(
             &mut mine_engine,
             mine_profile.handle,
             stage_key,
-            -f32::from_bits(stage_initial) * 0.5,
+            f32::from_bits(stage_initial) * 0.5 - f32::from_bits(stage_current),
         )
         .unwrap()
         .unwrap();
@@ -8872,8 +9708,10 @@ mod tests {
             handle,
             status: MissionControlDeviceTableStatus::Available(vec![device]),
             node_provider_status: MissionControlNodeProviderTableStatus::Available(Vec::new()),
+            node_provider_maximum_amount_bits: Some(0),
             node_provider_amount_bits: Some(0),
             node_provider_dirty: false,
+            node_provider_distribution_suspended: false,
         }
     }
 
@@ -8978,8 +9816,10 @@ mod tests {
             node_provider_status: MissionControlNodeProviderTableStatus::Available(vec![
                 synthetic_node_provider_row(0, 0, 1.0_f32.to_bits()),
             ]),
+            node_provider_maximum_amount_bits: Some(100.0_f32.to_bits()),
             node_provider_amount_bits: Some(100.0_f32.to_bits()),
             node_provider_dirty: false,
+            node_provider_distribution_suspended: false,
         };
         let mut control_tables = vec![producer_table];
 
@@ -9026,8 +9866,10 @@ mod tests {
                 handle: object.handle,
                 status: MissionControlDeviceTableStatus::Available(Vec::new()),
                 node_provider_status: MissionControlNodeProviderTableStatus::Available(Vec::new()),
+                node_provider_maximum_amount_bits: Some(0),
                 node_provider_amount_bits: Some(0),
                 node_provider_dirty: false,
+                node_provider_distribution_suspended: false,
             }];
 
             advance_behavior_distributor_tick(
