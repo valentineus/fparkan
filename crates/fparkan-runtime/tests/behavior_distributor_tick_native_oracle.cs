@@ -127,6 +127,8 @@ internal static class BehaviorDistributorTickOracle {
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlProviderAmountUpdate(IntPtr self, int nodeIndex, float delta, uint animationFlag);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlProviderAmountDistribute(IntPtr self, float delta, uint mode, uint flags);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlContactRateUpdate(IntPtr self, float deltaSeconds);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void NativeControlEvent(IntPtr self, uint eventCode, uint payload);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void NativeControlScaleQuery(IntPtr self, IntPtr result);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlTimedUpdate(IntPtr self, float inputTime);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlProviderRowConstructor(IntPtr self, IntPtr sourceNdpRow);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate IntPtr NativeControlOwnerConstructor(IntPtr self, IntPtr host, uint classCode);
@@ -702,6 +704,7 @@ internal static class BehaviorDistributorTickOracle {
             RunNativeControlTimedUpdateBaselineCases(controlModule);
             RunNativeControlAggregateResourceCases(controlModule);
             RunNativeControlResourceBudgetTag15Case(controlModule);
+            RunNativeControlActivationCase(controlModule);
             RunNativeBehaviorProfileMapCases(module);
             RunNativeBehaviorVarSyntheticCase(module);
             RunNativeBehaviorRealProfileCases(module);
@@ -1816,6 +1819,7 @@ internal static class BehaviorDistributorTickOracle {
             IntPtr randomState = IntPtr.Add(module, 0x43228);
             int savedPeriod = Marshal.ReadInt32(period);
             int savedRandom = Marshal.ReadInt32(randomState);
+            Expect(savedPeriod == FloatBits(250.0f), "native Control settings constructor default resource period");
             try {
                 Marshal.WriteInt32(period, FloatBits(500.0f));
                 Marshal.WriteInt32(randomState, 0); // Fixed point: random offset is -period/8.
@@ -1847,6 +1851,81 @@ internal static class BehaviorDistributorTickOracle {
             GC.KeepAlive(timedUpdate);
 
         }
+    }
+
+    private static void RunNativeControlActivationCase(IntPtr module) {
+        NativeControlOwnerConstructor construct = (NativeControlOwnerConstructor)Marshal.GetDelegateForFunctionPointer(
+            IntPtr.Add(module, 0x31490), typeof(NativeControlOwnerConstructor));
+        using (Fixture fixture = NewFixture()) {
+            IntPtr owner = fixture.Allocate(0x670);
+            Expect(construct(owner, IntPtr.Zero, 4) == owner, "native derived Control constructor");
+            IntPtr host = fixture.Allocate(4);
+            IntPtr hostVtable = fixture.Allocate(0x24);
+            IntPtr ani = fixture.Allocate(4);
+            IntPtr aniVtable = fixture.Allocate(0x84);
+            IntPtr scale = fixture.Allocate(4);
+            IntPtr scaleVtable = fixture.Allocate(0x3c);
+            IntPtr matrix = fixture.Allocate(64);
+            for (int i = 0; i < 16; i++) Marshal.WriteInt32(matrix, i * 4, FloatBits(i % 5 == 0 ? 1.0f : 0.0f));
+            Marshal.WriteIntPtr(host, hostVtable);
+            Marshal.WriteIntPtr(ani, aniVtable);
+            Marshal.WriteIntPtr(scale, scaleVtable);
+            List<string> trace = new List<string>();
+            bool wrongArguments = false;
+            InterfaceGetProperty transform = delegate(IntPtr self, uint selector, IntPtr result) {
+                wrongArguments |= self != host || selector != 2;
+                trace.Add("transform"); Marshal.WriteIntPtr(result, matrix); return 1;
+            };
+            NativeControlScaleQuery queryScale = delegate(IntPtr self, IntPtr result) {
+                wrongArguments |= self != scale; trace.Add("scale");
+                for (int i = 0; i < 3; i++) Marshal.WriteInt32(result, i * 4, FloatBits(1.0f));
+            };
+            // Explicit zero-geometry host mocks: capture parameters and supply outputs.
+            InterfaceGetProperty geometryState = delegate(IntPtr self, uint first, IntPtr second) {
+                wrongArguments |= self != ani; trace.Add("geometry-state");
+                Marshal.WriteInt32(new IntPtr(unchecked((int)first)), 0);
+                Marshal.WriteInt32(second, 0); return 1;
+            };
+            InterfaceGetProperty geometrySet = delegate(IntPtr self, uint node, IntPtr value) {
+                wrongArguments |= self != ani || node != 0;
+                trace.Add("geometry-set:" + Hex(unchecked((uint)value.ToInt32()))); return 1;
+            };
+            InterfaceGetProperty geometryPoint = delegate(IntPtr self, uint node, IntPtr result) {
+                wrongArguments |= self != ani || node != 0; trace.Add("geometry-point");
+                for (int i = 0; i < 3; i++) Marshal.WriteInt32(result, i * 4, 0); return 1;
+            };
+            Marshal.WriteIntPtr(hostVtable, 0x20, Marshal.GetFunctionPointerForDelegate(transform));
+            Marshal.WriteIntPtr(scaleVtable, 0x38, Marshal.GetFunctionPointerForDelegate(queryScale));
+            Marshal.WriteIntPtr(aniVtable, 0x68, Marshal.GetFunctionPointerForDelegate(geometryState));
+            Marshal.WriteIntPtr(aniVtable, 0x64, Marshal.GetFunctionPointerForDelegate(geometrySet));
+            Marshal.WriteIntPtr(aniVtable, 0x80, Marshal.GetFunctionPointerForDelegate(geometryPoint));
+            Marshal.WriteIntPtr(owner, 0x1c, host);
+            Marshal.WriteIntPtr(owner, 0x20, ani);
+            Marshal.WriteIntPtr(owner, 0x24, scale);
+            IntPtr eventVtable = Marshal.ReadIntPtr(owner, 4);
+            Expect(Marshal.ReadIntPtr(eventVtable, 8) == IntPtr.Add(module, 0x31ae0), "native activation event interface");
+            NativeControlEvent activate = (NativeControlEvent)Marshal.GetDelegateForFunctionPointer(
+                WriteStdCallToFastcallThunk(0x380, Marshal.ReadIntPtr(eventVtable, 8)), typeof(NativeControlEvent));
+            foreach (uint clock in new uint[] { 1000, 33554433 }) {
+                trace.Clear();
+                activate(IntPtr.Add(owner, 4), 4, clock);
+                float absolute = (float)clock;
+                float baseline = absolute - 100.0f;
+                Expect(Marshal.ReadByte(owner, 0xe0) == 1 &&
+                    ReadFloat(owner, 0xe4) == baseline && ReadFloat(owner, 0xe8) == baseline &&
+                    ReadFloat(owner, 0xec) == baseline && ReadFloat(owner, 0xd8) == absolute && ReadFloat(owner, 0xdc) == absolute,
+                    "native event 4 activates the object and initializes absolute clock baselines");
+                Expect(!wrongArguments && String.Join(",", trace.ToArray()) ==
+                    "transform,scale,geometry-state,geometry-set:0x00000000,geometry-point,geometry-state,geometry-set:0x3f800000",
+                    "native activation zero-geometry host callback order and arguments");
+                Expect(Marshal.ReadInt32(owner, 0x370) == 1, "only first activation queues the initial command");
+                Console.WriteLine("native-control-activation: eventRva=0x31ae0 handlerRva=0x314f0 class=4 clock=" + clock +
+                    " absolute=" + Float(absolute) + " e4/e8/ec=" + Float(baseline) + " e0=1 pending=1 callbacks=" + String.Join(",", trace.ToArray()));
+            }
+            GC.KeepAlive(transform); GC.KeepAlive(queryScale); GC.KeepAlive(geometryState);
+            GC.KeepAlive(geometrySet); GC.KeepAlive(geometryPoint); GC.KeepAlive(activate);
+        }
+        GC.KeepAlive(construct);
     }
 
     private static void RunNativeArealMapComponentBuilderCase(IntPtr module) {
