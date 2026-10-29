@@ -1781,6 +1781,53 @@ internal static class BehaviorDistributorTickOracle {
                     Marshal.ReadInt32(generator, 0x18) == expectedAmounts[i],
                     "native category priority updates tag 15 before the earlier stored generator");
             }
+            NativeControlResourceDeviceConstructor constructGenerator = (NativeControlResourceDeviceConstructor)
+                Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, 0x22980), typeof(NativeControlResourceDeviceConstructor));
+            IntPtr nativeGenerator = fixture.Allocate(0x94);
+            IntPtr nativeGeneratorRecord = fixture.Allocate(0xb4);
+            constructGenerator(nativeGenerator);
+            IntPtr nativeGeneratorVtable = Marshal.ReadIntPtr(nativeGenerator);
+            Expect(nativeGeneratorVtable == IntPtr.Add(module, 0x3c608) &&
+                Marshal.ReadIntPtr(nativeGeneratorVtable, 0x14) == IntPtr.Add(module, 0x229a0) &&
+                Marshal.ReadIntPtr(nativeGeneratorVtable, 0x18) == IntPtr.Add(module, 0x22a60),
+                "native tag-19 generator keeps its original rate and update methods");
+            Marshal.WriteIntPtr(nativeGenerator, 0x3c, owner);
+            Marshal.WriteIntPtr(nativeGenerator, 0x44, IntPtr.Add(owner, 4));
+            Marshal.WriteInt32(nativeGeneratorRecord, 0, 19);
+            Marshal.WriteInt32(nativeGeneratorRecord, 0x18, -1); // Preserve constructor's enabled word 0x20.
+            Marshal.WriteInt32(nativeGeneratorRecord, 0x20, FloatBits(0.5f));
+            Marshal.WriteIntPtr(devices, 0, nativeGenerator);
+            for (int capped = 0; capped < 2; capped++) {
+                Marshal.WriteInt32(nativeGeneratorRecord, 0x2c, FloatBits(capped == 0 ? 1.0f : 0.125f));
+                Expect(applyInto(owner, 0, nativeGeneratorRecord) == IntPtr.Add(nativeGeneratorRecord, 0xb4),
+                    "native tag-19 common record initializer");
+                Expect(Marshal.ReadInt32(nativeGenerator, 0x50) == 0x20, "tag-19 constructor enable word is preserved");
+                Marshal.WriteInt32(nativeGenerator, 0x4c, FloatBits(1.0f));
+                Marshal.WriteInt32(providerRow, 8, FloatBits(40.0f));
+                Marshal.WriteInt32(providerRow, 0x0c, FloatBits(40.0f));
+                Marshal.WriteInt32(providerRow, 0x14, FloatBits(0.4f));
+                Marshal.WriteInt32(owner, 0x590, FloatBits(40.0f));
+                NativeControlResourceDeviceRate generatorRate = (NativeControlResourceDeviceRate)
+                    Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, 0x229a0), typeof(NativeControlResourceDeviceRate));
+                float produced = generatorRate(nativeGenerator, 0.5f);
+                Expect(FloatBits(produced) == FloatBits(capped == 0 ? 0.1f : 0.05f),
+                    "real generator rate applies provider ratio and optional coefficient cap");
+                update(owner, 0.5f);
+                uint amount = unchecked((uint)Marshal.ReadInt32(providerRow, 8));
+                uint fraction = unchecked((uint)Marshal.ReadInt32(providerRow, 0x14));
+                uint remaining = unchecked((uint)Marshal.ReadInt32(nativeGenerator, 0x4c));
+                Console.WriteLine("native-control-real-generator-budget: ctor=0x22980 rate=0x229a0 update=0x22a60" +
+                    " cap=" + capped + " produced=" + Float(produced) + " amount=" + Hex(amount) +
+                    " ratio=" + Hex(fraction) + " remaining=" + Hex(remaining));
+                Expect(amount == (capped == 0 ? 0x42206666u : 0x42203333u) &&
+                    fraction == (capped == 0 ? 0x3ecd4fdfu : 0x3ecd0e56u) &&
+                    remaining == unchecked((uint)FloatBits(capped == 0 ? 0.75f : 0.0f)),
+                    "real generator and consumer update exact provider and reserve values in one budget pass");
+                GC.KeepAlive(generatorRate);
+            }
+            Marshal.WriteIntPtr(devices, 0, generator);
+            GC.KeepAlive(constructGenerator);
+
             // Bounded active class-10 host: no motion object, no deferred packets.
             // These host getters are mocks; the clock, deadline and budget code are native.
             IntPtr host = fixture.Allocate(4);
