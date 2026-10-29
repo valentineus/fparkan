@@ -2240,6 +2240,32 @@ pub fn update_loaded_mission_control_node_stage(
     update_control_node_stage(table, key, update_effects)
 }
 
+/// Updates one loaded Control node and then walks its provider descendants in
+/// native depth-first order (`Control.dll+0x11130`).
+///
+/// Unlike [`update_loaded_mission_control_node_stage`], this also propagates
+/// depletion and stage flags through descendants. The whole provider table is
+/// committed only if every node can be updated; this CPU projection does not
+/// run unsupported visibility, FX, or host callbacks.
+pub fn propagate_loaded_mission_control_node_stage(
+    engine: &mut Engine,
+    handle: ObjectHandle,
+    key: u32,
+    update_effects: bool,
+) -> Result<(), ControlResourceAccessError> {
+    transform_state(&engine.world, handle).map_err(ControlResourceAccessError::World)?;
+    let loaded = engine
+        .loaded
+        .as_mut()
+        .ok_or(ControlResourceAccessError::MissionUnavailable)?;
+    let table = loaded
+        .control_device_tables
+        .iter_mut()
+        .find(|table| table.handle == handle)
+        .ok_or(ControlResourceAccessError::ObjectUnavailable { handle })?;
+    propagate_control_node_stage(table, key, update_effects)
+}
+
 fn update_control_node_stage(
     table: &mut MissionControlDeviceTableState,
     key: u32,
@@ -2344,6 +2370,120 @@ fn update_control_node_stage(
             .visible_stage = stage.min(count - 1);
     }
     Ok(changed)
+}
+
+fn propagate_control_node_stage(
+    table: &mut MissionControlDeviceTableState,
+    key: u32,
+    update_effects: bool,
+) -> Result<(), ControlResourceAccessError> {
+    let mut updated = table.clone();
+    propagate_control_node_stage_inner(&mut updated, key, update_effects)?;
+    *table = updated;
+    Ok(())
+}
+
+fn propagate_control_node_stage_inner(
+    table: &mut MissionControlDeviceTableState,
+    key: u32,
+    update_effects: bool,
+) -> Result<(), ControlResourceAccessError> {
+    let (index, row_count, previous_stage) = match &table.node_provider_status {
+        MissionControlNodeProviderTableStatus::Available(rows) => {
+            let row_count = rows.len();
+            let index = usize::try_from(key)
+                .ok()
+                .filter(|index| *index < row_count)
+                .ok_or(ControlResourceAccessError::NodeProviderKeyOutOfRange { key, row_count })?;
+            (index, row_count, rows[index].current_stage)
+        }
+        MissionControlNodeProviderTableStatus::Unavailable(reason) => {
+            return Err(ControlResourceAccessError::NodeProviderTableUnavailable(
+                reason.clone(),
+            ))
+        }
+    };
+
+    update_control_node_stage(table, key, update_effects)?;
+
+    let (stage, flags) = match &table.node_provider_status {
+        MissionControlNodeProviderTableStatus::Available(rows) => {
+            let row = &rows[index];
+            let flags = row
+                .current_flags
+                .ok_or(ControlResourceAccessError::UnsupportedField {
+                    factory_tag: 0,
+                    field: "provider flags",
+                })?;
+            (row.current_stage, flags)
+        }
+        MissionControlNodeProviderTableStatus::Unavailable(reason) => {
+            return Err(ControlResourceAccessError::NodeProviderTableUnavailable(
+                reason.clone(),
+            ))
+        }
+    };
+    let depleted_or_worsened = previous_stage < stage || flags & 0x10 != 0;
+
+    for child_index in index + 1..row_count {
+        let (metadata, child_flags) = match &table.node_provider_status {
+            MissionControlNodeProviderTableStatus::Available(rows) => {
+                let row = &rows[child_index];
+                let metadata =
+                    row.initial_mesh_state
+                        .ok_or(ControlResourceAccessError::UnsupportedField {
+                            factory_tag: 0,
+                            field: "provider mesh metadata",
+                        })?;
+                let child_flags = row.current_flags;
+                (metadata, child_flags)
+            }
+            MissionControlNodeProviderTableStatus::Unavailable(reason) => {
+                return Err(ControlResourceAccessError::NodeProviderTableUnavailable(
+                    reason.clone(),
+                ))
+            }
+        };
+        if i64::from(metadata.parent_index) != i64::from(key) {
+            continue;
+        }
+
+        let child_key = u32::try_from(child_index)
+            .map_err(|_| ControlResourceAccessError::InvalidNodeStageState { key })?;
+        let child_flags = child_flags.ok_or(ControlResourceAccessError::UnsupportedField {
+            factory_tag: 0,
+            field: "provider flags",
+        })?;
+        if child_flags & 0x140 == 0 {
+            let child_flags = if flags & 0xc0 == 0 {
+                (child_flags | if depleted_or_worsened { 0x100 } else { 0 }) & !0x80
+            } else {
+                child_flags | 0x80
+            };
+            if let MissionControlNodeProviderTableStatus::Available(rows) =
+                &mut table.node_provider_status
+            {
+                rows[child_index].current_flags = Some(child_flags);
+            }
+        }
+
+        if depleted_or_worsened {
+            let child_amount = match &table.node_provider_status {
+                MissionControlNodeProviderTableStatus::Available(rows) => {
+                    f32::from_bits(rows[child_index].current_amount_bits)
+                }
+                MissionControlNodeProviderTableStatus::Unavailable(reason) => {
+                    return Err(ControlResourceAccessError::NodeProviderTableUnavailable(
+                        reason.clone(),
+                    ))
+                }
+            };
+            apply_control_node_delta(table, child_key, -child_amount)?;
+        }
+
+        propagate_control_node_stage_inner(table, child_key, update_effects)?;
+    }
+    Ok(())
 }
 
 fn control_stage_product(count: u32, ratio: f32) -> f32 {
@@ -5278,6 +5418,10 @@ mod tests {
             update_loaded_mission_control_node_stage(&mut engine, handle, 1, false),
             Err(ControlResourceAccessError::MissionUnavailable)
         );
+        assert_eq!(
+            propagate_loaded_mission_control_node_stage(&mut engine, handle, 1, false),
+            Err(ControlResourceAccessError::MissionUnavailable)
+        );
 
         let stale = ObjectHandle {
             generation: handle.generation.wrapping_add(1),
@@ -5321,10 +5465,22 @@ mod tests {
                 fparkan_world::WorldError::StaleHandle
             ))
         );
+        assert_eq!(
+            propagate_loaded_mission_control_node_stage(&mut engine, stale, 1, false),
+            Err(ControlResourceAccessError::World(
+                fparkan_world::WorldError::StaleHandle
+            ))
+        );
 
         fparkan_world::request_delete(&mut engine.world, handle).expect("delete object");
         assert_eq!(
             update_loaded_mission_control_node_stage(&mut engine, handle, 1, false),
+            Err(ControlResourceAccessError::World(
+                fparkan_world::WorldError::StaleHandle
+            ))
+        );
+        assert_eq!(
+            propagate_loaded_mission_control_node_stage(&mut engine, handle, 1, false),
             Err(ControlResourceAccessError::World(
                 fparkan_world::WorldError::StaleHandle
             ))
@@ -5694,6 +5850,132 @@ mod tests {
             table, before,
             "depleted protected node returns before reading metadata or processing amount"
         );
+    }
+
+    #[test]
+    fn control_node_stage_descendants_follow_native_walk_and_rollback() {
+        let make_rows = |parents: [i32; 5]| {
+            parents
+                .into_iter()
+                .enumerate()
+                .map(|(index, parent_index)| {
+                    let flags = if index == 0 { 0xd2 } else { 2 };
+                    let mut row = synthetic_node_provider_row(0, index, 1.0_f32.to_bits());
+                    row.current_flags = Some(flags);
+                    row.initial_mesh_state = Some(MissionControlNodeInitialMeshState {
+                        parent_index,
+                        flags,
+                        stage_count: 2,
+                    });
+                    row.mesh_state = Some(MissionControlNodeMeshState {
+                        type1_value_bits: 1.0_f32.to_bits(),
+                        visible_stage: 0,
+                    });
+                    row
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut rows = make_rows([-1, 0, 0, 1, 3]);
+        rows[1].current_flags = Some(0x140);
+        rows[1].initial_mesh_state.as_mut().unwrap().flags = 0x140;
+        let mut table = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(Vec::new()),
+            MissionControlNodeProviderTableStatus::Available(rows),
+        );
+        propagate_control_node_stage(&mut table, 0, false).unwrap();
+        let MissionControlNodeProviderTableStatus::Available(rows) = &table.node_provider_status
+        else {
+            panic!()
+        };
+        assert_eq!(rows[0].current_flags, Some(0xd2));
+        for index in [1, 3, 4, 2] {
+            assert_eq!(rows[index].current_amount_bits, 0.0_f32.to_bits());
+            assert_eq!(
+                rows[index].current_flags,
+                Some(if index == 1 { 0x150 } else { 0x92 })
+            );
+            assert_eq!(rows[index].processed_amount_bits, 100.0_f32.to_bits());
+        }
+        assert_eq!(table.node_provider_amount_bits, Some(100.0_f32.to_bits()));
+
+        let mut rows = make_rows([-1, 0, 0, 1, 3]);
+        rows[0].current_flags = Some(2);
+        rows[0].current_type1_value_bits = 0.0_f32.to_bits();
+        rows[1].current_flags = Some(0x82);
+        rows[1].initial_mesh_state.as_mut().unwrap().flags = 0x82;
+        let mut table = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(Vec::new()),
+            MissionControlNodeProviderTableStatus::Available(rows),
+        );
+        propagate_control_node_stage(&mut table, 0, false).unwrap();
+        let MissionControlNodeProviderTableStatus::Available(rows) = &table.node_provider_status
+        else {
+            panic!()
+        };
+        assert_eq!(rows[0].current_stage, 2);
+        assert_eq!(rows[0].current_flags, Some(0x202));
+        for index in [1, 3, 4, 2] {
+            assert_eq!(rows[index].current_amount_bits, 0.0_f32.to_bits());
+            assert_eq!(rows[index].current_stage, 2);
+            assert_eq!(rows[index].current_flags, Some(0x312));
+        }
+
+        let mut rows = make_rows([-1, 0, 0, 1, 3]);
+        rows[0].current_flags = Some(2);
+        rows[0].current_stage = 1;
+        rows[0].current_type1_value_bits = 0.5_f32.to_bits();
+        rows[0].initial_mesh_state.as_mut().unwrap().stage_count = 2;
+        rows[1].current_flags = Some(0x8a);
+        rows[1].current_stage = 0;
+        rows[1].current_type1_value_bits = 0.5_f32.to_bits();
+        rows[1].initial_mesh_state.as_mut().unwrap().flags = 0x8a;
+        rows[1].initial_mesh_state.as_mut().unwrap().stage_count = 2;
+        rows[1].mesh_state.as_mut().unwrap().type1_value_bits = 0.5_f32.to_bits();
+        let mut table = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(Vec::new()),
+            MissionControlNodeProviderTableStatus::Available(rows),
+        );
+        let before = table.clone();
+        assert_eq!(
+            propagate_control_node_stage(&mut table, 0, true),
+            Err(ControlResourceAccessError::UnsupportedNodeEffects { key: 1 })
+        );
+        assert_eq!(table, before);
+        propagate_control_node_stage(&mut table, 0, false).unwrap();
+        let MissionControlNodeProviderTableStatus::Available(rows) = &table.node_provider_status
+        else {
+            panic!()
+        };
+        assert_eq!(rows[1].current_flags, Some(0x20a));
+        assert_eq!(rows[1].current_stage, 1);
+        assert_eq!(rows[1].current_amount_bits, 100.0_f32.to_bits());
+        let before = table.clone();
+        assert_eq!(
+            propagate_control_node_stage(&mut table, u32::MAX, false),
+            Err(ControlResourceAccessError::NodeProviderKeyOutOfRange {
+                key: u32::MAX,
+                row_count: 5,
+            })
+        );
+        assert_eq!(table, before);
+
+        let mut rows = make_rows([-1, 0, 0, 1, 3]);
+        rows[2].mesh_state = None;
+        rows[4].current_flags = None;
+        let mut table = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(Vec::new()),
+            MissionControlNodeProviderTableStatus::Available(rows),
+        );
+        let before = table.clone();
+        assert_eq!(
+            propagate_control_node_stage(&mut table, 0, false),
+            Err(ControlResourceAccessError::UnsupportedField {
+                factory_tag: 0,
+                field: "provider flags",
+            })
+        );
+        assert_eq!(table, before);
     }
 
     #[test]
@@ -6848,11 +7130,38 @@ mod tests {
         let draft = &loaded_mission_object_drafts(&engine).expect("object drafts")[0];
         assert_eq!(draft.unit_components.len(), 6);
         assert_eq!(draft.unit_components[0].immediate_child_count, 5);
-        let tables = loaded_mission_control_device_tables(&engine).expect("Control tables");
+        let tables = loaded_mission_control_device_tables(&engine)
+            .expect("Control tables")
+            .to_vec();
         assert_eq!(tables.len(), 1);
         assert_eq!(tables[0].original_id, Some(OriginalObjectId(0)));
         assert!(tables[0].node_provider_dirty);
         let control_handle = tables[0].handle;
+        let node_provider_count = match &tables[0].node_provider_status {
+            MissionControlNodeProviderTableStatus::Available(rows) => rows.len(),
+            MissionControlNodeProviderTableStatus::Unavailable(reason) => {
+                panic!("licensed Control provider rows unavailable: {reason:?}")
+            }
+        };
+        let before_invalid_node_key = loaded_mission_control_device_tables(&engine)
+            .unwrap()
+            .to_vec();
+        assert_eq!(
+            propagate_loaded_mission_control_node_stage(
+                &mut engine,
+                control_handle,
+                u32::MAX,
+                false,
+            ),
+            Err(ControlResourceAccessError::NodeProviderKeyOutOfRange {
+                key: u32::MAX,
+                row_count: node_provider_count,
+            })
+        );
+        assert_eq!(
+            loaded_mission_control_device_tables(&engine),
+            Some(before_invalid_node_key.as_slice())
+        );
         assert_eq!(
             query_loaded_mission_control_resource(&engine, control_handle, 1)
                 .expect("licensed selector 1")
@@ -7219,13 +7528,13 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(update_loaded_mission_control_node_stage(
+        propagate_loaded_mission_control_node_stage(
             &mut mine_engine,
             mine_profile.handle,
             stage_key,
-            false
+            false,
         )
-        .unwrap());
+        .expect("licensed Control descendant stage propagation");
         let MissionControlNodeProviderTableStatus::Available(rows) =
             &loaded_mission_control_device_tables(&mine_engine).unwrap()[0].node_provider_status
         else {

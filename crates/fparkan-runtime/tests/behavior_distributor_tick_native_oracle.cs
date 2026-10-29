@@ -1131,7 +1131,7 @@ internal static class BehaviorDistributorTickOracle {
                 new float[] { 25.0f, 10.0f, 5.0f, 12.0f, 7.0f },
                 new byte[] { 0x02, 0x02, 0x02, 0x02, 0x02 });
             const int rowCount = 5;
-            int[] parents = { -1, 0, 1, 0, 0 };
+            int[] parents = { -1, 0, 0, 1, 3 };
             uint[] stages = { 4, 2, 3, 2, 2 };
             uint[] flags = { 0x02, 0x42, 0x02, 0x102, 0x02 };
             for (int index = 0; index < rowCount; index++) {
@@ -1169,14 +1169,14 @@ internal static class BehaviorDistributorTickOracle {
 
             IntPtr parent = table.Rows;
             IntPtr protected40 = IntPtr.Add(table.Rows, 0x2c);
-            IntPtr grandchild = IntPtr.Add(table.Rows, 2 * 0x2c);
+            IntPtr sibling = IntPtr.Add(table.Rows, 2 * 0x2c);
             IntPtr protected100 = IntPtr.Add(table.Rows, 3 * 0x2c);
-            IntPtr sibling = IntPtr.Add(table.Rows, 4 * 0x2c);
+            IntPtr grandchild = IntPtr.Add(table.Rows, 4 * 0x2c);
             IntPtr parentMeshRow = meshRows;
             IntPtr bit40MeshRow = IntPtr.Add(meshRows, 0x130);
-            IntPtr grandchildMeshRow = IntPtr.Add(meshRows, 2 * 0x130);
+            IntPtr siblingMeshRow = IntPtr.Add(meshRows, 2 * 0x130);
             IntPtr bit100MeshRow = IntPtr.Add(meshRows, 3 * 0x130);
-            IntPtr siblingMeshRow = IntPtr.Add(meshRows, 4 * 0x130);
+            IntPtr grandchildMeshRow = IntPtr.Add(meshRows, 4 * 0x130);
             Expect(ReadFloat(parent, 0x08) == 25.0f && ReadFloat(parent, 0x0c) == 25.0f &&
                 unchecked((uint)Marshal.ReadInt32(parent, 0x18)) == 3,
                 "Control 0x11130 updates the parent stage and processed amount first");
@@ -1184,40 +1184,41 @@ internal static class BehaviorDistributorTickOracle {
                 unchecked((uint)Marshal.ReadInt32(protected40, 0x18)) == 0 &&
                 (unchecked((uint)Marshal.ReadInt32(protected40, 0x28)) & 0x50) == 0x50,
                 "Protected bit 0x40 does not stop child depletion, while its depleted-stage early return remains visible");
-            Expect(ReadFloat(grandchild, 0x08) == 0.0f && ReadFloat(grandchild, 0x0c) == 125.0f &&
-                unchecked((uint)Marshal.ReadInt32(grandchild, 0x18)) == 0 &&
-                (unchecked((uint)Marshal.ReadInt32(grandchild, 0x28)) & 0x90) == 0x90,
-                "Control 0x11130 drains a protected child's descendant but its inherited 0x80 flag preserves the depleted stage snapshot");
             Expect(ReadFloat(protected100, 0x08) == 0.0f && ReadFloat(protected100, 0x0c) == 0.0f &&
-                unchecked((uint)Marshal.ReadInt32(protected100, 0x18)) == 2,
-                "Protected bit 0x100 does not stop child depletion or its later stage update");
+                unchecked((uint)Marshal.ReadInt32(protected100, 0x18)) == 2 &&
+                (unchecked((uint)Marshal.ReadInt32(protected100, 0x28)) & 0x100) != 0,
+                "Protected bit 0x100 skips flag rewriting but does not stop drain or descendant traversal");
+            Expect(ReadFloat(grandchild, 0x08) == 0.0f && ReadFloat(grandchild, 0x0c) == 0.0f &&
+                unchecked((uint)Marshal.ReadInt32(grandchild, 0x18)) == 2 &&
+                (unchecked((uint)Marshal.ReadInt32(grandchild, 0x28)) & 0x100) != 0,
+                "The protected row's grandchild is visited before the root's next sibling");
             Expect(ReadFloat(sibling, 0x08) == 0.0f && ReadFloat(sibling, 0x0c) == 0.0f &&
-                unchecked((uint)Marshal.ReadInt32(sibling, 0x18)) == 2 &&
+                unchecked((uint)Marshal.ReadInt32(sibling, 0x18)) == 3 &&
                 (unchecked((uint)Marshal.ReadInt32(sibling, 0x28)) & 0x100) != 0,
                 "An unprotected sibling retains the native damaged flag while updating its stage");
             Expect(unchecked((uint)Marshal.ReadInt32(parentMeshRow, 0x1c)) == 3 &&
                 unchecked((uint)Marshal.ReadInt32(bit40MeshRow, 0x1c)) == unchecked((uint)-99) &&
-                unchecked((uint)Marshal.ReadInt32(grandchildMeshRow, 0x1c)) == unchecked((uint)-99) &&
+                unchecked((uint)Marshal.ReadInt32(siblingMeshRow, 0x1c)) == 2 &&
                 unchecked((uint)Marshal.ReadInt32(bit100MeshRow, 0x1c)) == 1 &&
-                unchecked((uint)Marshal.ReadInt32(siblingMeshRow, 0x1c)) == 1,
+                unchecked((uint)Marshal.ReadInt32(grandchildMeshRow, 0x1c)) == 1,
                 "ANI slot 0x44 reaches native AniMesh RVA 0x5810 for changed visible stages only");
             Expect(controlNodeUpdateCount == 4 &&
-                String.Join(",", controlNodeUpdateIndices.ConvertAll(index => index.ToString()).ToArray()) == "1,2,3,4" &&
-                String.Join(",", controlNodeUpdateFlags.ConvertAll(value => value.ToString("x")).ToArray()) == "42,82,102,102" &&
+                String.Join(",", controlNodeUpdateIndices.ConvertAll(index => index.ToString()).ToArray()) == "1,3,4,2" &&
+                String.Join(",", controlNodeUpdateFlags.ConvertAll(value => value.ToString("x")).ToArray()) == "42,102,102,102" &&
                 !controlNodeUpdateOwnerMismatch,
                 "Control 0x11130 traverses descendants depth-first, checking callback owners and protected flags");
-            Expect(String.Join(",", aniMeshStageTransitions.ToArray()) == "0:3,3:1,4:1" &&
+            Expect(String.Join(",", aniMeshStageTransitions.ToArray()) == "0:3,3:1,4:1,2:2" &&
                 aniMeshNodeLifecycleCallbacks.Count == 0 &&
                 !aniMeshCallbackOwnerMismatch && !nativeAniMeshStageCallbackMissing,
                 "Control descendant update preserves the native callback order and stage bounds");
             Expect(String.Join(",", controlProviderCallbackTrace.ToArray()) ==
-                "stage:0:3,amount:1,amount:2,amount:3,stage:3:1,amount:4,stage:4:1",
+                "stage:0:3,amount:1,amount:3,stage:3:1,amount:4,stage:4:1,amount:2,stage:2:2",
                 "Control 0x11130 keeps amount, lifecycle, and visual-stage callbacks in native depth-first order");
             Expect(ReadFloat(table.Owner, 0x590) == 25.0f,
                 "Control 0x10f30 keeps the aggregate amount in sync after recursive child depletion");
 
             Console.WriteLine("native-control-parent-propagation: controlHash=" + ExpectedControlSha256 +
-                " rva=0x11130 childOrder=[1,2,3,4] protected40/100=depleted bit40-stage-return=preserved" +
+                " rva=0x11130 childOrder=[1,3,4,2] protected40/100=depleted bit40-stage-return=preserved" +
                 " callbacks=" + String.Join(",", controlProviderCallbackTrace.ToArray()));
             activeControlProviderRows = IntPtr.Zero;
             activeAniMeshInterface = IntPtr.Zero;
