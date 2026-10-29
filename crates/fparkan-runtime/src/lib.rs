@@ -3154,16 +3154,17 @@ fn apply_effective_control_override(
 fn control_factory_uses_common_setter(factory_tag: u32) -> bool {
     matches!(
         factory_tag,
-        1 | 2 | 4 | 5 | 8 | 9 | 10 | 15 | 17 | 19 | 25 | 26 | 30
+        1 | 2 | 3 | 4 | 5 | 8 | 9 | 10 | 15 | 17 | 19 | 21 | 25 | 26 | 27 | 30
     )
 }
 
 fn native_control_factory_defaults(factory_tag: u32) -> (Option<u32>, Option<u32>) {
     match factory_tag {
         1 | 4 => (Some(0x3f80_0000), Some(0x200)),
-        5 | 8 | 26 => (Some(0x3f80_0000), Some(0x5)),
+        3 | 5 | 8 | 21 | 26 => (Some(0x3f80_0000), Some(0x5)),
         10 => (Some(0x3f80_0000), Some(0x2000)),
         17 | 19 => (Some(0x3f80_0000), Some(0x20)),
+        2 | 27 => (Some(0x3f80_0000), Some(0)),
         9 | 15 | 25 => (Some(0x3f80_0000), None),
         _ => (None, None),
     }
@@ -3534,7 +3535,10 @@ fn build_control_device_projection(
                         target_index,
                     },
                 )?;
-                if !matches!(device.factory_tag, 9 | 15 | 19 | 25) {
+                if !matches!(
+                    device.factory_tag,
+                    2 | 3 | 4 | 5 | 8 | 9 | 10 | 15 | 19 | 21 | 25 | 27
+                ) {
                     return Err(Unavailable::UnsupportedOverrideReceiver {
                         factory_tag: device.factory_tag,
                     });
@@ -4958,6 +4962,57 @@ mod tests {
                 fparkan_world::WorldError::StaleHandle
             ))
         );
+    }
+
+    #[test]
+    fn common_factory_into_overrides_preserve_native_constructor_defaults() {
+        const INTO: u32 = u32::from_le_bytes(*b"INTO");
+        for (factory_tag, word_50) in [
+            (2, 0),
+            (3, 5),
+            (4, 0x200),
+            (5, 5),
+            (8, 5),
+            (10, 0x2000),
+            (21, 5),
+            (27, 0),
+        ] {
+            let mut root = synthetic_control_record(factory_tag, 2, 0x20, None);
+            root.fixed_words[6] = u32::MAX;
+            let mut replacement = synthetic_control_record(19, 99, 0x30, None);
+            replacement.fixed_words[6] = u32::MAX;
+            let status = synthetic_control_table(
+                &[None, Some(INTO)],
+                &[1, 1],
+                &[1, 0],
+                &[0, 0],
+                &[1, 1],
+                vec![
+                    Some(synthetic_component_control(
+                        0,
+                        vec![root],
+                        PreparedControlEffectSection::Parsed(Vec::new()),
+                    )),
+                    Some(synthetic_component_control(
+                        1,
+                        vec![replacement],
+                        PreparedControlEffectSection::Parsed(Vec::new()),
+                    )),
+                ],
+            );
+            let MissionControlDeviceTableStatus::Available(devices) = status else {
+                panic!("{status:?}")
+            };
+            assert_eq!(devices.len(), 1);
+            let device = &devices[0];
+            assert_eq!(
+                (device.factory_tag, device.descriptor.tag, device.key),
+                (factory_tag, 19, 2)
+            );
+            assert_eq!(device.multiplier_bits, Some(1.0_f32.to_bits()));
+            assert_eq!(device.native_word_50_bits, Some(word_50));
+            assert_eq!(device.coefficient_bits.unwrap()[0], 0x30);
+        }
     }
 
     #[test]
@@ -6968,6 +7023,38 @@ mod tests {
                 VarSetDefault::Dword(1),
             ]
         );
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn full_load_builds_control_tables_for_autodemo_robots_and_buildings() {
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(
+            licensed_root("IS"),
+        ))))
+        .unwrap();
+        load_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Autodemo.00/data.tma".into(),
+                mode: MissionMode::AutoDemo,
+            },
+            100_000,
+        )
+        .unwrap();
+        let tables = loaded_mission_control_device_tables(&engine).unwrap();
+        let expected_counts = [14, 12, 15, 13, 12, 12, 11, 11];
+        assert_eq!(tables.len(), expected_counts.len());
+        for (table, expected_count) in tables.iter().zip(expected_counts) {
+            let MissionControlDeviceTableStatus::Available(devices) = &table.status else {
+                panic!("object {:?}: {:?}", table.original_id, table.status);
+            };
+            assert_eq!(
+                devices.len(),
+                expected_count,
+                "object {:?}",
+                table.original_id
+            );
+        }
     }
 
     #[test]

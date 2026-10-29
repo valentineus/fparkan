@@ -3863,7 +3863,8 @@ fn control_i32_at(payload: &[u8], offset: usize) -> Option<i32> {
     ))
 }
 
-const CONTROL_TYPED_COMMON_PARSER_TAGS: &[u32] = &[1, 2, 5, 8, 9, 12, 13, 15, 19, 21, 25, 26];
+const CONTROL_TYPED_COMMON_PARSER_TAGS: &[u32] =
+    &[1, 2, 3, 4, 5, 8, 9, 10, 12, 13, 15, 19, 21, 25, 26, 27];
 const CONTROL_TYPED_RECORD_FIXED_BYTES: usize = 0xB0;
 const CONTROL_TYPED_RECORD_COUNT_OFFSET: usize = 0xAC;
 const CONTROL_TYPED_RECORD_LIMIT: usize = 4096;
@@ -4947,6 +4948,41 @@ mod tests {
         assert_eq!(
             control.effect_section,
             PreparedControlEffectSection::Parsed(Vec::new())
+        );
+    }
+
+    #[test]
+    fn component_control_extended_common_tags_preserve_variable_tails_and_next_record() {
+        let source = ResourceKey {
+            archive: parse_path("controls.rlb").unwrap(),
+            name: resource_name(b"parts.ctl"),
+            type_id: None,
+        };
+        let mut payload = component_control_payload(&[(1, 0.0, 1.0, 0.25, 0)]);
+        payload[12..16].copy_from_slice(&4_u32.to_le_bytes());
+        for tag in [3_u32, 4, 10, 27] {
+            let start = payload.len();
+            append_typed_record(&mut payload, tag, 2);
+            payload[start + 0xac..start + 0xb0].copy_from_slice(&2_u32.to_le_bytes());
+            let values = [tag.to_le_bytes(), (tag + 1).to_le_bytes()].concat();
+            payload.splice(start + 0xb0..start + 0xb0, values);
+            payload.extend_from_slice(b"fx\0");
+        }
+        let control = decode_component_control_payload(&payload, source, 2, 0).unwrap();
+        assert_eq!(control.typed_records.len(), 4);
+        for (record, tag) in control.typed_records.iter().zip([3, 4, 10, 27]) {
+            assert_eq!(record.tag, tag);
+            assert_eq!(record.values, [tag, tag + 1]);
+            assert_eq!(record.string_bytes, b"fx");
+        }
+        assert_eq!(
+            control.effect_section,
+            PreparedControlEffectSection::Parsed(Vec::new())
+        );
+        payload.pop();
+        assert!(
+            decode_component_control_payload(&payload, control.source, 2, 0).is_err(),
+            "recognized final record must validate its string terminator"
         );
     }
 

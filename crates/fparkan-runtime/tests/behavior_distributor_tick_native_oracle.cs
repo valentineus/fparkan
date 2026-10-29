@@ -121,6 +121,7 @@ internal static class BehaviorDistributorTickOracle {
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate float NativeControlResourceDeviceRate(IntPtr self, float deltaSeconds);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate int NativeControlResourceDeviceGate(IntPtr self);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate float NativeControlResourceAvailability(IntPtr self, byte flags);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate IntPtr NativeControlDeviceFactory(IntPtr self, uint componentId, uint keyOffset, IntPtr record);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate IntPtr NativeControlResourceComponentOverride(IntPtr self, int deviceIndex, IntPtr typedRecord);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int NativeControlAggregateQuery(IntPtr self, uint selector, IntPtr result);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int NativeControlAggregateSet(IntPtr self, uint selector, IntPtr value);
@@ -2253,6 +2254,22 @@ internal static class BehaviorDistributorTickOracle {
             ControlResourceTag15VtableRva, ControlResourceNoOpStringPairRva, applyOverride);
         RunNativeControlOverrideReceiverCase(module, 25, 0xa4, ControlResourceTag25ConstructorRva,
             ControlResourceTag25VtableRva, ControlResourceNoOpStringPairRva, applyOverride);
+        RunNativeControlOverrideReceiverCase(module, 4, 0xdc, 0x233d0,
+            0x3c720, ControlResourceNoOpStringPairRva, applyOverride);
+        RunNativeControlOverrideReceiverCase(module, 10, 0x94, 0x26470,
+            0x3ca20, ControlResourceNoOpStringPairRva, applyOverride);
+        RunNativeControlOverrideReceiverCase(module, 27, 0x94, 0x218b0,
+            0x3c528, ControlResourceNoOpStringPairRva, applyOverride);
+        RunNativeControlOverrideReceiverCase(module, 5, 0xa4, 0x20800,
+            0x3cdf8, ControlResourceNoOpStringPairRva, applyOverride);
+        RunNativeControlOverrideReceiverCase(module, 8, 0xbc, 0x24310,
+            0x3c800, ControlResourceNoOpStringPairRva, applyOverride);
+        RunNativeControlOverrideReceiverCase(module, 21, 0xa4, 0x20800,
+            0x3c448, ControlResourceNoOpStringPairRva, applyOverride);
+        RunNativeControlOverrideReceiverCase(module, 2, 0x184, 0x294c0,
+            0x3cbd8, 0x29940, applyOverride);
+        RunNativeControlOverrideReceiverCase(module, 3, 0xa4, 0x20800,
+            0x3c448, ControlResourceNoOpStringPairRva, applyOverride);
         GC.KeepAlive(applyOverride);
     }
 
@@ -2262,17 +2279,37 @@ internal static class BehaviorDistributorTickOracle {
         NativeControlResourceDeviceConstructor construct = (NativeControlResourceDeviceConstructor)Marshal.GetDelegateForFunctionPointer(
             IntPtr.Add(module, constructorRva), typeof(NativeControlResourceDeviceConstructor));
         IntPtr expectedVtable = IntPtr.Add(module, vtableRva);
-        Expect(Marshal.ReadIntPtr(expectedVtable, 0x1c) == IntPtr.Add(module, ControlResourceCommonSetterRva),
-            "tag-" + tag + " vtable common setter slot resolves to native RVA 0x21d50");
+        Expect(Marshal.ReadIntPtr(expectedVtable, 0x1c) == IntPtr.Add(module, tag == 2 ? 0x29650 : ControlResourceCommonSetterRva),
+            "tag-" + tag + " vtable reader resolves to its native implementation");
         Expect(Marshal.ReadIntPtr(expectedVtable, 0x24) == IntPtr.Add(module, stringPairRva),
             "tag-" + tag + " vtable string-pair slot matches its native callback");
         using (Fixture fixture = NewFixture()) {
-            IntPtr owner = fixture.Allocate(0x5c4);
-            IntPtr deviceArray = fixture.Allocate(IntPtr.Size);
-            IntPtr targetDevice = fixture.Allocate(objectSize);
-            IntPtr typedRecord = fixture.Allocate(0xb4);
-            Expect(construct(targetDevice) == targetDevice,
-                "native tag-" + tag + " constructor returns its exact-size device object");
+            IntPtr owner = fixture.Allocate(0x5c8);
+            IntPtr deviceArray = fixture.Allocate(2 * IntPtr.Size);
+            IntPtr targetDevice = (tag == 3 || tag == 5) ? IntPtr.Zero : fixture.Allocate(objectSize);
+            bool variableTail = tag == 2 || tag == 3 || tag == 4 || tag == 5 || tag == 8 || tag == 10 || tag == 21 || tag == 27;
+            IntPtr typedRecord = fixture.Allocate(variableTail ? 0xc0 : 0xb4);
+            if (tag == 3 || tag == 5) {
+                // Tag 3 follows the default factory; case 5 also assigns a derived vtable.
+                Marshal.WriteIntPtr(owner, 0x5bc, deviceArray);
+                Marshal.WriteInt32(owner, 0x5c4, 2);
+                Marshal.WriteInt32(typedRecord, 0, tag);
+                Marshal.WriteInt32(typedRecord, 0x18, -1);
+                NativeControlDeviceFactory create = (NativeControlDeviceFactory)Marshal.GetDelegateForFunctionPointer(
+                    IntPtr.Add(module, 0x2d4b0), typeof(NativeControlDeviceFactory));
+                Expect(create(owner, 0, 0, typedRecord) == IntPtr.Add(typedRecord, 0xb4), "native tag-" + tag + " factory cursor");
+                targetDevice = Marshal.ReadIntPtr(deviceArray);
+                GC.KeepAlive(create);
+            } else {
+                Expect(construct(targetDevice) == targetDevice,
+                    "native tag-" + tag + " constructor returns its exact-size device object");
+            }
+            if (variableTail) {
+                int expectedWord = tag == 4 ? 0x200 : (tag == 3 || tag == 5 || tag == 8 || tag == 21) ? 5 : tag == 10 ? 0x2000 : 0;
+                Expect(Marshal.ReadInt32(targetDevice, 0x50) == expectedWord &&
+                    Marshal.ReadInt32(targetDevice, 0x4c) == FloatBits(1.0f),
+                    "native extended factory constructor defaults");
+            }
             Marshal.WriteIntPtr(deviceArray, 0, targetDevice);
             Marshal.WriteIntPtr(owner, 0x5bc, deviceArray);
             Marshal.WriteInt32(owner, 0x5c0, 1);
@@ -2282,7 +2319,7 @@ internal static class BehaviorDistributorTickOracle {
             Marshal.WriteInt32(targetDevice, 0x4c, unchecked((int)0x40200000)); // multiplier 2.5
             for (int i = 0; i < 16; i++) {
                 Marshal.WriteInt32(targetDevice, 0x54 + i * 4, unchecked((int)(0xb2000000u + (uint)i)));
-                Marshal.WriteInt32(typedRecord, 0x2c + i * 4, unchecked((int)(0xc3000000u + (uint)i)));
+                Marshal.WriteInt32(typedRecord, 0x2c + i * 4, unchecked((int)(tag == 2 && i < 2 ? (uint)FloatBits(i == 0 ? 3.5f : 1.25f) : 0xc3000000u + (uint)i)));
             }
             Marshal.WriteInt32(typedRecord, 0x00, 19);
             Marshal.WriteInt32(typedRecord, 0x04, unchecked((int)0x77777777)); // differs from the existing device key
@@ -2292,10 +2329,19 @@ internal static class BehaviorDistributorTickOracle {
                 // This synthetic receiver has no FX host and the descriptor has no map rows.
                 Marshal.WriteIntPtr(targetDevice, 0x3c, IntPtr.Zero);
             }
+            if (variableTail) {
+                Marshal.WriteInt32(typedRecord, 0xac, 2);
+                Marshal.WriteInt32(typedRecord, 0xb0, 7);
+                Marshal.WriteInt32(typedRecord, 0xb4, 9);
+                Marshal.WriteInt32(typedRecord, 0xb8, 2);
+                Marshal.WriteByte(typedRecord, 0xbc, (byte)'f');
+                Marshal.WriteByte(typedRecord, 0xbd, (byte)'x');
+                Marshal.WriteByte(typedRecord, 0xbe, 0);
+            }
             int priorWord50 = Marshal.ReadInt32(targetDevice, 0x50);
 
             IntPtr result = applyOverride(owner, 0, typedRecord);
-            Expect(result == IntPtr.Add(typedRecord, 0xb4),
+            Expect(result == IntPtr.Add(typedRecord, variableTail ? 0xbf : 0xb4),
                 "Control indexed override completes one tag-" + tag + " typed record");
             Expect(Marshal.ReadInt32(owner, 0x5c0) == 1 && Marshal.ReadIntPtr(owner, 0x5bc) == deviceArray &&
                 Marshal.ReadIntPtr(deviceArray, 0) == targetDevice,
@@ -2311,13 +2357,36 @@ internal static class BehaviorDistributorTickOracle {
                 Expect(Marshal.ReadIntPtr(targetDevice, 0x3c) == IntPtr.Zero,
                     "tag-9 string callback runs with no FX host on the synthetic receiver");
             for (int i = 0; i < 16; i++) {
-                Expect(unchecked((uint)Marshal.ReadInt32(targetDevice, 0x54 + i * 4)) == 0xc3000000u + (uint)i,
+                Expect(unchecked((uint)Marshal.ReadInt32(targetDevice, 0x54 + i * 4)) == (tag == 2 && i < 2 ? (uint)FloatBits(i == 0 ? 3.5f : 1.25f) : 0xc3000000u + (uint)i),
                     "Control replaces selected tag-" + tag + " device coefficient " + i);
+            }
+            if (variableTail) {
+                IntPtr map = Marshal.ReadIntPtr(targetDevice, 0x1c);
+                Expect(Marshal.ReadInt32(targetDevice, 0x20) == 2 && Marshal.ReadInt32(map) == 7 &&
+                    Marshal.ReadInt32(map, 0x14) == 9, "native common reader retains both variable map rows");
+            }
+            if (tag == 2) {
+                IntPtr rowState = Marshal.ReadIntPtr(targetDevice, 0x12c);
+                Expect(Marshal.ReadInt32(targetDevice, 0x120) == FloatBits(1.25f) &&
+                    Marshal.ReadInt32(targetDevice, 0x124) == 4 &&
+                    Marshal.ReadInt32(rowState) == 0 && Marshal.ReadInt32(rowState, 4) == 0,
+                    "tag-2 wrapper caches selector 1, rounds selector 0 with x87, and zeros map state");
+                Marshal.WriteInt32(rowState, 1);
+                Marshal.WriteInt32(rowState, 4, 2);
+                Expect(applyOverride(owner, 0, typedRecord) == result &&
+                    Marshal.ReadInt32(targetDevice, 0x20) == 4,
+                    "tag-2 repeated override retains common cursor and appends map rows");
+                rowState = Marshal.ReadIntPtr(targetDevice, 0x12c);
+                for (int i = 0; i < 4; i++)
+                    Expect(Marshal.ReadInt32(rowState, i * 4) == 0,
+                        "tag-2 repeated override clears state for every accumulated map row");
+                Console.WriteLine("native-control-tag2-wrapper: selector1=1.25 selector0=3.5 integer=4 rows=4 state=zero");
             }
             Console.WriteLine("native-control-tag" + tag + "-into-override: size=0x" + objectSize.ToString("x") +
                 " index=0 count=1 key=22222222 component=12345678 multiplier=" +
                 Float(unchecked((uint)Marshal.ReadInt32(targetDevice, 0x4c))) +
-                " original-class=preserved descriptor=attached coefficients=replaced");
+                " original-class=preserved descriptor=attached coefficients=replaced cursor=" +
+                (variableTail ? "0xbf map=[7,9] string=fx" : "0xb4"));
             GC.KeepAlive(construct);
         }
     }
