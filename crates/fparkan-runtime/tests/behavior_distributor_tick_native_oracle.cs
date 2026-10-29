@@ -54,6 +54,13 @@ internal static class BehaviorDistributorTickOracle {
     private const int ControlResourceTag9ConstructorRva = 0x25460;
     private const int ControlResourceTag15ConstructorRva = 0x22ae0;
     private const int ControlResourceTag25ConstructorRva = 0x20800;
+    private const int ControlResourceTag15RateRva = 0x22b20;
+    private const int ControlResourceTag15UpdateRva = 0x22bb0;
+    private const int ControlResourceBudgetUpdateRva = 0x2d340;
+    private const int ControlResourceBudgetCategoryRva = 0x2c3a0;
+    private const int ControlResourceIntoRva = 0x2d890;
+    private const int ControlResourceAvailabilityRva = 0x10b10;
+    private const int ControlResourceTag15GateRva = 0x21820;
     private const int ControlResourceTag9VtableRva = 0x3c938;
     private const int ControlResourceTag15VtableRva = 0x3c648;
     private const int ControlResourceTag25VtableRva = 0x3c448;
@@ -110,6 +117,10 @@ internal static class BehaviorDistributorTickOracle {
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int NativeAniMeshNodeMetadataQuery(IntPtr owner, uint nodeIndex, uint selector, IntPtr result);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate uint NativeAniMeshNodeStageCount(IntPtr owner, uint nodeIndex);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate IntPtr NativeControlResourceDeviceConstructor(IntPtr self);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlResourceBudgetUpdate(IntPtr self, float deltaSeconds);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate float NativeControlResourceDeviceRate(IntPtr self, float deltaSeconds);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate int NativeControlResourceDeviceGate(IntPtr self);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate float NativeControlResourceAvailability(IntPtr self, byte flags);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate IntPtr NativeControlResourceComponentOverride(IntPtr self, int deviceIndex, IntPtr typedRecord);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int NativeControlAggregateQuery(IntPtr self, uint selector, IntPtr result);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int NativeControlAggregateSet(IntPtr self, uint selector, IntPtr value);
@@ -690,6 +701,7 @@ internal static class BehaviorDistributorTickOracle {
             RunNativeControlContactRateUpdateCase(controlModule);
             RunNativeControlTimedUpdateBaselineCases(controlModule);
             RunNativeControlAggregateResourceCases(controlModule);
+            RunNativeControlResourceBudgetTag15Case(controlModule);
             RunNativeBehaviorProfileMapCases(module);
             RunNativeBehaviorVarSyntheticCase(module);
             RunNativeBehaviorRealProfileCases(module);
@@ -1637,6 +1649,136 @@ internal static class BehaviorDistributorTickOracle {
         Marshal.WriteInt32(device, 0x54, FloatBits(coefficient));
         if (factoryTag == 9) Marshal.WriteInt32(device, 0x11c, FloatBits(class9Scale));
         return device;
+    }
+
+    private static void RunNativeControlResourceBudgetTag15Case(IntPtr module) {
+        NativeControlOwnerConstructor constructOwner = (NativeControlOwnerConstructor)Marshal.GetDelegateForFunctionPointer(
+            IntPtr.Add(module, ControlOwnerConstructorRva), typeof(NativeControlOwnerConstructor));
+        NativeControlProviderRowConstructor constructProviderRow = (NativeControlProviderRowConstructor)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlProviderRowConstructorRva),
+                typeof(NativeControlProviderRowConstructor));
+        NativeControlResourceDeviceConstructor constructTag15 = (NativeControlResourceDeviceConstructor)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlResourceTag15ConstructorRva),
+                typeof(NativeControlResourceDeviceConstructor));
+        NativeControlResourceComponentOverride applyInto = (NativeControlResourceComponentOverride)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlResourceIntoRva),
+                typeof(NativeControlResourceComponentOverride));
+        NativeControlResourceDeviceRate rate = (NativeControlResourceDeviceRate)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlResourceTag15RateRva),
+                typeof(NativeControlResourceDeviceRate));
+        NativeControlResourceDeviceGate gate = (NativeControlResourceDeviceGate)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlResourceTag15GateRva),
+                typeof(NativeControlResourceDeviceGate));
+        NativeControlResourceDeviceGet getter = (NativeControlResourceDeviceGet)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlResourceDeviceGetterRva),
+                typeof(NativeControlResourceDeviceGet));
+        NativeControlResourceAvailability availability = (NativeControlResourceAvailability)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlResourceAvailabilityRva),
+                typeof(NativeControlResourceAvailability));
+        NativeControlResourceBudgetUpdate update = (NativeControlResourceBudgetUpdate)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlResourceBudgetUpdateRva),
+                typeof(NativeControlResourceBudgetUpdate));
+
+        using (Fixture fixture = NewFixture()) {
+            IntPtr owner = fixture.Allocate(0x664);
+            Expect(constructOwner(owner, IntPtr.Zero, 4) == owner, "native budget owner constructor");
+            IntPtr providerRow = fixture.Allocate(0x2c);
+            IntPtr ndpDescriptor = fixture.Allocate(0x4c);
+            Marshal.WriteInt32(ndpDescriptor, 4, FloatBits(100.0f));
+            constructProviderRow(providerRow, ndpDescriptor);
+            Marshal.WriteInt32(providerRow, 4, -1); // No parent or stage lifecycle in this budget vector.
+            Marshal.WriteInt32(providerRow, 0x24, -1);
+            Marshal.WriteIntPtr(owner, 0x55c, providerRow);
+            Marshal.WriteInt32(owner, 0x560, 1);
+            Marshal.WriteInt32(owner, 0x65c, FloatBits(1.0f)); // Explicit maximum multiplier read by native selector 3.
+            Marshal.WriteInt32(owner, 0x58c, FloatBits(100.0f));
+            IntPtr ani = fixture.Allocate(4);
+            IntPtr aniVtable = fixture.Allocate(0x38);
+            Marshal.WriteIntPtr(ani, aniVtable);
+            Marshal.WriteIntPtr(aniVtable, 0x34, Marshal.GetFunctionPointerForDelegate(ControlNodeUpdateCallback));
+            Marshal.WriteIntPtr(owner, 0x20, ani);
+
+            IntPtr device = fixture.Allocate(0x98);
+            IntPtr typedRecord = fixture.Allocate(0xb4);
+            Expect(constructTag15(device) == device, "native tag-15 constructor");
+            IntPtr tag15Vtable = Marshal.ReadIntPtr(device);
+            Expect(tag15Vtable == IntPtr.Add(module, ControlResourceTag15VtableRva) &&
+                Marshal.ReadIntPtr(tag15Vtable, 0x14) == IntPtr.Add(module, ControlResourceTag15RateRva) &&
+                Marshal.ReadIntPtr(tag15Vtable, 0x18) == IntPtr.Add(module, ControlResourceTag15UpdateRva),
+                "budget fixture keeps original tag-15 rate and update methods");
+            Marshal.WriteIntPtr(device, 0x3c, owner);
+            Marshal.WriteIntPtr(device, 0x44, IntPtr.Add(owner, 4));
+            Marshal.WriteInt32(typedRecord, 0, 15);
+            Marshal.WriteInt32(typedRecord, 0x18, 1);
+            Marshal.WriteInt32(typedRecord, 0x2c, FloatBits(1.0f));
+            Marshal.WriteInt32(typedRecord, 0x30, FloatBits(1.0f));
+
+            // Mock only the generator: rate is read from +8; update records dt, scale,
+            // provider amount at callback time, and call count. All tag-15 code stays native.
+            IntPtr generator = fixture.Allocate(0x4c);
+            IntPtr generatorRecord = fixture.Allocate(4);
+            IntPtr generatorVtable = fixture.Allocate(0x1c);
+            Marshal.WriteInt32(generatorRecord, 14); // Native category 1, processed after category 0.
+            Marshal.WriteIntPtr(generator, generatorVtable);
+            Marshal.WriteIntPtr(generator, 0x48, generatorRecord);
+            byte[] rateCode = { 0xd9, 0x41, 0x08, 0xc2, 0x04, 0x00 }; // fld [ecx+8]; ret 4
+            IntPtr mockRate = IntPtr.Add(fastcallThunks, 0x280);
+            Marshal.Copy(rateCode, 0, mockRate, rateCode.Length);
+            byte[] updateCode = { 0x8b,0x44,0x24,0x04, 0x89,0x41,0x10,
+                0x8b,0x44,0x24,0x08, 0x89,0x41,0x14, 0xa1,0,0,0,0,
+                0x89,0x41,0x18, 0xff,0x41,0x1c, 0xc2,0x08,0x00 };
+            WriteImm32(updateCode, 15, IntPtr.Add(providerRow, 8).ToInt32());
+            IntPtr mockUpdate = IntPtr.Add(fastcallThunks, 0x2c0);
+            Marshal.Copy(updateCode, 0, mockUpdate, updateCode.Length);
+            Marshal.WriteIntPtr(generatorVtable, 0x14, mockRate);
+            Marshal.WriteIntPtr(generatorVtable, 0x18, mockUpdate);
+            IntPtr devices = fixture.Allocate(8);
+            Marshal.WriteIntPtr(devices, 0, generator); // Reverse storage order makes priority observable.
+            Marshal.WriteIntPtr(devices, 4, device);
+            Marshal.WriteIntPtr(owner, 0x5bc, devices);
+            Marshal.WriteInt32(owner, 0x5c0, 2);
+            Expect(applyInto(owner, 1, typedRecord) == IntPtr.Add(typedRecord, 0xb4) &&
+                Marshal.ReadIntPtr(device, 0x48) == typedRecord, "native tag-15 descriptor initializer");
+            Expect(Marshal.ReadIntPtr(Marshal.ReadIntPtr(owner, 0x0c), 0x24) ==
+                IntPtr.Add(module, ControlResourceBudgetCategoryRva), "native descriptor category dispatch");
+
+            float[] budgets = { 0.1f, 0.5f };
+            int[] expectedAmounts = { unchecked((int)0x42206666), unchecked((int)0x4220cccd) };
+            int[] expectedRatios = { unchecked((int)0x3ecd4fdf), unchecked((int)0x3ecdd2f2) };
+            for (int i = 0; i < budgets.Length; i++) {
+                Marshal.WriteInt32(generator, 8, FloatBits(budgets[i]));
+                Marshal.WriteInt32(generator, 0x1c, 0);
+                Marshal.WriteInt32(providerRow, 8, FloatBits(40.0f));
+                Marshal.WriteInt32(providerRow, 0x0c, FloatBits(40.0f));
+                Marshal.WriteInt32(providerRow, 0x14, FloatBits(0.4f));
+                Marshal.WriteInt32(owner, 0x590, FloatBits(40.0f));
+                const float dt = 0.5f;
+                Expect(gate(device) == 0 && FloatBits(getter(device, 0x100)) == FloatBits(0.4f) &&
+                    FloatBits(availability(owner, 0)) == FloatBits(60.0f), "consistent native provider inputs");
+                Expect(FloatBits(rate(device, dt)) == FloatBits(-0.2f), "native tag-15 demand at non-unity dt");
+                controlNodeUpdateCount = 0;
+                update(owner, dt);
+                Console.WriteLine("native-control-resource-budget-tag15: controlHash=" + ExpectedControlSha256 +
+                    " budgetRva=0x2d340 updateRva=0x22bb0 dt=" + Float(dt) + " budget=" + Float(budgets[i]) +
+                    " scale=" + Float(ReadFloat(device, 0x4c)) + " amount=" + Hex(unchecked((uint)Marshal.ReadInt32(providerRow, 8))) +
+                    " ratio=" + Hex(unchecked((uint)Marshal.ReadInt32(providerRow, 0x14))) +
+                    " total=" + Hex(unchecked((uint)Marshal.ReadInt32(owner, 0x590))) +
+                    " processed=" + Hex(unchecked((uint)Marshal.ReadInt32(providerRow, 0x0c))));
+                Expect(Marshal.ReadInt32(providerRow, 8) == expectedAmounts[i] &&
+                    Marshal.ReadInt32(providerRow, 0x14) == expectedRatios[i] &&
+                    Marshal.ReadInt32(owner, 0x590) == expectedAmounts[i] &&
+                    Marshal.ReadInt32(providerRow, 0x0c) == expectedAmounts[i], "native budget exact provider result");
+                Expect(controlNodeUpdateCount == 1 && controlNodeUpdateIndex == 0 &&
+                    controlNodeUpdateSelector == 0x200 && controlNodeUpdateValueBits == unchecked((uint)expectedRatios[i]),
+                    "native budget publishes updated provider ratio exactly once");
+                Expect(FloatBits(ReadFloat(device, 0x4c)) == FloatBits(i == 0 ? 0.5f : 1.0f), "native budget scale");
+                Expect(Marshal.ReadInt32(generator, 0x1c) == 1 &&
+                    Marshal.ReadInt32(generator, 0x10) == FloatBits(dt) &&
+                    Marshal.ReadInt32(generator, 0x14) == FloatBits((budgets[i] - (i == 0 ? 0.1f : 0.2f) - budgets[i]) / -budgets[i]) &&
+                    Marshal.ReadInt32(generator, 0x18) == expectedAmounts[i],
+                    "native category priority updates tag 15 before the earlier stored generator");
+            }
+        }
     }
 
     private static void RunNativeArealMapComponentBuilderCase(IntPtr module) {
