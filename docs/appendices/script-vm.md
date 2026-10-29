@@ -977,6 +977,61 @@ Ignored Rust-тест также проходит полный неотфиль�
 профилю. Это подтверждает декодирование и CPU-проекцию, но не исполнение native
 полного загрузчика.
 
+#### Входной класс Control при загрузке Unit DAT
+
+Этот класс задаётся до разбора CTLD и не выводится из device tag или MSH-
+геометрии. В GOG `ArealMap.dll` (SHA-256
+`a25f9254ebb339d70e2e07c8121950191e9584ca0858d8e9c2e2b6c671edf6ea`)
+`FUN_10014fd0` (RVA `0x14fd0`) вызывает полный путь `FUN_10015290` (RVA
+`0x15290`), который читает class word разобранного корня Unit DAT по `+0x78`;
+это смещение поля в структуре, а не raw file offset. Установленный старший бит
+выбирает `World3D.CreateObject` selector `3`, снятый — selector `4`. В GOG
+`World3D.dll` (SHA-256
+`17e4a3089b2583a8cf2356c9db0390b1aba138356a09130d79b4e7e4791da61e`) RVA
+`0x7cb0` ведёт к внутренней реализации `0x7a50`, где selectors `3` и `4`
+направляются соответственно в registered CID `1` и `3`.
+`Comp.ini` (SHA-256
+`3ce88fc077fcc9659d7b87ed0caaa6885ba6d2e2307250cbc0eb75661c295df8`)
+связывает CID `1` с `Terrain.LoadBuilding`, а CID `3` — с `AniMesh.LoadAgent`.
+Selector, CID и класс Control — разные значения, хотя первый route приводит к
+совпадающему числу `3`.
+
+У маршрута selector `3` внешний host-аргумент `Terrain.LoadBuilding` пуст.
+`Terrain.dll` (SHA-256
+`af87d1b2e728a0be73c52be3b44cc196ab46da7799f25a15d40f8c9b0b425ead`)
+создаёт `CBuilding` через RVA `0x32490`/`0x324d0`, записывает пустой внешний
+родитель в `+0x14`, затем передаёт сам `CBuilding` в `AniMesh.LoadAgent`.
+`AniMesh+0x2ff0` вызывает `QueryInterface(6)` и получает обратно primary
+указатель `CBuilding`. Его vtable slot `+0x2c` находится по Terrain RVA
+`0x65548` и указывает на `Terrain.dll+0x33ae0`. Вызванные отдельно машинные инструкции
+этого getter-а — `B8 03 00 00 00 C3`, то есть он возвращает класс `3`.
+Постоянный x86 harness проверяет SHA-256, эти байты и прямой вызов getter-а с
+`this = null`; это исполненная проверка getter-а. Связь от Unit DAT через
+wrapper и vtable восстановлена статически, а не прогнана целиком в оригинальной
+игре.
+
+При selector `4` `AniMesh.LoadAgent` получает пустой host. Конструктор начинает
+Agent class field `+0x6d8` с нуля; путь `AniMesh.dll` (SHA-256
+`65659bf67f20e5be77d67a5b2f59968f61b94293143807fa59ca451c560c4f7e`) RVA
+`0x2ff0` берёт FourCC из корневой записи NRes registry. Дальше вызов
+`LoadControlSystem` по AniMesh RVA `0x32e7` передаёт значение `+0x6d8` в качестве
+последнего аргумента; `Control.dll` (SHA-256
+`bcb86318089028548a178b03a21accdce15df0cc85ddd91674cf3c2f55012c6e`) RVA
+`0x32280` выбирает для класса `9` конструктор `0x7330`, а для остальных —
+`0x31490`.
+
+Правило прямого no-host пути: `BTLU → 4`, `BULL → 9`, `WPNS → 2`, `STAT → 10`;
+другой root FourCC даёт `0`. Источник — NRes registry metadata именно корневой
+записи (`EffectivePrototype.source_type`), не первый DWORD CPT payload и не
+запись ребёнка. Если заголовок отсутствует, класс Rust оставляет неопределённым
+(`None`); при установленном старшем бите выбирается `3`, даже если FourCC нет.
+Только в прямом no-host пути отсутствие root FourCC даёт `None`. У произвольного
+ненулевого host, который не возвращает
+нужный интерфейс, native field также остаётся `0`, но FourCC в этой ветви не
+читается; этот generic route не считается одним из двух полных Unit-DAT путей.
+Runtime сохраняет класс и источник выбора, не запуская Control clock или
+конструкторы gameplay state.
+
 #### Активация и начальные часы
 
 Для Control класса `4` oracle вызывает исходный конструктор RVA `0x31490`

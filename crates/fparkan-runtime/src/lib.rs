@@ -41,6 +41,11 @@ pub use fparkan_assets::MissionAssets;
 const MISSION_DECODED_PAYLOAD_CACHE_ENTRIES: usize = 256;
 const FALLBACK_SCRIPT_VARSET_PATH: &str = "MISSIONS/SCRIPTS/varset.var";
 const INITIAL_BEHAVIOR_RNG_STATE: u32 = 1;
+const UNIT_DAT_CONTROL_CLASS_HIGH_BIT: u32 = 0x8000_0000;
+const CONTROL_CLASS_SOURCE_BTLU: u32 = u32::from_le_bytes(*b"BTLU");
+const CONTROL_CLASS_SOURCE_BULL: u32 = u32::from_le_bytes(*b"BULL");
+const CONTROL_CLASS_SOURCE_WPNS: u32 = u32::from_le_bytes(*b"WPNS");
+const CONTROL_CLASS_SOURCE_STAT: u32 = u32::from_le_bytes(*b"STAT");
 
 /// Injectable engine services used by composition roots.
 #[derive(Clone, Default)]
@@ -454,6 +459,8 @@ pub struct MissionControlDeviceTableState {
     pub handle: ObjectHandle,
     /// Complete base projection, or an explicit unsupported boundary.
     pub status: MissionControlDeviceTableStatus,
+    /// Native Control object class chosen by the full Unit DAT load route.
+    pub native_control_class: Option<MissionControlClassProjection>,
     /// Raw CTLD profile retained by native component ID zero and its per-owner copy.
     pub owner_profile: Option<MissionControlOwnerProfile>,
     /// Global NDP provider rows used by indexed Control selectors.
@@ -470,6 +477,24 @@ pub struct MissionControlDeviceTableState {
     pub current_output_rate_5dc_bits: u32,
     /// Native `+0x5e0`, last output rate written by the Control budget pass.
     pub current_output_rate_5e0_bits: u32,
+}
+
+/// Provenance for the class passed to Control's constructor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MissionControlClassSource {
+    /// The Unit DAT class word's high bit selected the World -> Terrain route.
+    UnitDatHighBit { header_flags: u32 },
+    /// The root prototype NRes registry entry selected the direct AniMesh route.
+    RootPrototypeFourCc { source_type: u32 },
+}
+
+/// Native Control object class selected during full Unit DAT loading.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MissionControlClassProjection {
+    /// The class argument received by `Control.dll!LoadControlSystem`.
+    pub class_id: u32,
+    /// Source branch and raw value that selected the class.
+    pub source: MissionControlClassSource,
 }
 
 /// CTLD owner profile selected by native component ID zero.
@@ -1518,13 +1543,19 @@ fn load_mission_with_options(
             .zip(&handles)
             .enumerate()
             .map(|(object_index, (draft, handle))| {
+                let prototype_span = prototype_graph
+                    .root_prototype_request_spans
+                    .get(object_index);
+                let native_control_class = native_control_class_for_root(
+                    draft.unit_dat_header_flags,
+                    prototype_span,
+                    &resolved_prototypes,
+                );
                 let projection = build_control_device_projection(
                     object_index,
                     draft,
                     &mission_assets,
-                    prototype_graph
-                        .root_prototype_request_spans
-                        .get(object_index),
+                    prototype_span,
                     &resolved_prototypes,
                 );
                 match projection {
@@ -1532,6 +1563,7 @@ fn load_mission_with_options(
                         original_id: draft.original_id,
                         handle: *handle,
                         status: MissionControlDeviceTableStatus::Available(projection.devices),
+                        native_control_class,
                         owner_profile: projection.owner_profile,
                         node_provider_maximum_amount_bits: initial_node_provider_maximum_amount(
                             &projection.node_provider_status,
@@ -1547,6 +1579,7 @@ fn load_mission_with_options(
                         original_id: draft.original_id,
                         handle: *handle,
                         status: MissionControlDeviceTableStatus::Unavailable(reason.clone()),
+                        native_control_class,
                         owner_profile: None,
                         node_provider_maximum_amount_bits: None,
                         node_provider_amount_bits: None,
@@ -4996,6 +5029,37 @@ fn native_ex_to_append_key(
     Some(raw_key.wrapping_add(first_global_node).wrapping_sub(1))
 }
 
+fn native_control_class_for_root(
+    unit_dat_header_flags: Option<u32>,
+    prototype_span: Option<&std::ops::Range<usize>>,
+    prototypes: &[fparkan_prototype::EffectivePrototype],
+) -> Option<MissionControlClassProjection> {
+    let header_flags = unit_dat_header_flags?;
+    if header_flags & UNIT_DAT_CONTROL_CLASS_HIGH_BIT != 0 {
+        return Some(MissionControlClassProjection {
+            class_id: 3,
+            source: MissionControlClassSource::UnitDatHighBit { header_flags },
+        });
+    }
+
+    let span = prototype_span?;
+    if span.start >= span.end {
+        return None;
+    }
+    let source_type = prototypes.get(span.start)?.source_type?;
+    let class_id = match source_type {
+        CONTROL_CLASS_SOURCE_BTLU => 4,
+        CONTROL_CLASS_SOURCE_BULL => 9,
+        CONTROL_CLASS_SOURCE_WPNS => 2,
+        CONTROL_CLASS_SOURCE_STAT => 10,
+        _ => 0,
+    };
+    Some(MissionControlClassProjection {
+        class_id,
+        source: MissionControlClassSource::RootPrototypeFourCc { source_type },
+    })
+}
+
 fn active_unit_component_order(
     records: &[UnitComponentRecord],
     tree: &[UnitComponentTreeNode],
@@ -6293,6 +6357,29 @@ mod tests {
         (draft, assets, prototypes)
     }
 
+    fn synthetic_control_class_fixture(
+        source_types: &[Option<u32>],
+    ) -> (
+        MissionObjectDraft,
+        Vec<fparkan_prototype::EffectivePrototype>,
+    ) {
+        let component_count = source_types.len();
+        let mut child_counts = vec![0; component_count];
+        if let Some(root_child_count) = child_counts.first_mut() {
+            *root_child_count =
+                u32::try_from(component_count.saturating_sub(1)).expect("child count fits u32");
+        }
+        let (draft, _, prototypes) = synthetic_control_fixture(
+            source_types,
+            &vec![1; component_count],
+            &child_counts,
+            &vec![0; component_count],
+            &vec![1; component_count],
+            vec![None; component_count],
+        );
+        (draft, prototypes)
+    }
+
     fn synthetic_control_table(
         source_types: &[Option<u32>],
         kinds: &[u32],
@@ -6419,6 +6506,7 @@ mod tests {
                 slot: 7,
             },
             status,
+            native_control_class: None,
             owner_profile: None,
             node_provider_maximum_amount_bits: initial_node_provider_maximum_amount(
                 &node_provider_status,
@@ -9022,6 +9110,82 @@ mod tests {
     }
 
     #[test]
+    fn native_control_class_highbit_selects_class_three_before_root_fourcc() {
+        let btlu = u32::from_le_bytes(*b"BTLU");
+        let unknown = u32::from_le_bytes(*b"ZZZZ");
+        for root_source_type in [Some(btlu), Some(unknown), None] {
+            let (mut draft, prototypes) =
+                synthetic_control_class_fixture(&[root_source_type, Some(btlu)]);
+            draft.unit_dat_header_flags = Some(0x8000_0004);
+            let span = 0..prototypes.len();
+            assert_eq!(
+                native_control_class_for_root(
+                    draft.unit_dat_header_flags,
+                    Some(&span),
+                    &prototypes
+                ),
+                Some(MissionControlClassProjection {
+                    class_id: 3,
+                    source: MissionControlClassSource::UnitDatHighBit {
+                        header_flags: 0x8000_0004,
+                    },
+                }),
+                "Unit DAT high-bit route overrides root source type {root_source_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_control_class_clear_route_uses_root_registry_fourcc() {
+        let source_types = [
+            u32::from_le_bytes(*b"BTLU"),
+            u32::from_le_bytes(*b"BULL"),
+            u32::from_le_bytes(*b"WPNS"),
+            u32::from_le_bytes(*b"STAT"),
+            u32::from_le_bytes(*b"ZZZZ"),
+        ];
+        let expected_classes = [4, 9, 2, 10, 0];
+        let (draft, prototypes) = synthetic_control_class_fixture(&source_types.map(Some));
+
+        for (index, (source_type, class_id)) in
+            source_types.into_iter().zip(expected_classes).enumerate()
+        {
+            let span = index..index + 1;
+            assert_eq!(
+                native_control_class_for_root(
+                    draft.unit_dat_header_flags,
+                    Some(&span),
+                    &prototypes
+                ),
+                Some(MissionControlClassProjection {
+                    class_id,
+                    source: MissionControlClassSource::RootPrototypeFourCc { source_type },
+                }),
+                "source type {source_type:08x} comes from the span's root entry"
+            );
+        }
+    }
+
+    #[test]
+    fn native_control_class_requires_root_metadata_and_never_uses_child_fourcc() {
+        let btlu = u32::from_le_bytes(*b"BTLU");
+        let (mut draft, prototypes) = synthetic_control_class_fixture(&[None, Some(btlu)]);
+        let span = 0..prototypes.len();
+
+        assert_eq!(
+            native_control_class_for_root(draft.unit_dat_header_flags, Some(&span), &prototypes),
+            None,
+            "a child entry cannot substitute for missing root registry metadata"
+        );
+        draft.unit_dat_header_flags = None;
+        assert_eq!(
+            native_control_class_for_root(draft.unit_dat_header_flags, Some(&span), &prototypes),
+            None,
+            "missing Unit DAT class word must remain explicit"
+        );
+    }
+
+    #[test]
     fn exto_key_mapping_obeys_native_component_and_mount_sentinels() {
         assert_eq!(native_ex_to_append_key(2, 0, None, Some(20)), Some(2));
         assert_eq!(
@@ -9896,6 +10060,15 @@ mod tests {
         let mine_control_before = loaded_mission_control_device_tables(&mine_engine)
             .expect("licensed mine Control table")
             .to_vec();
+        assert_eq!(
+            mine_control_before[0].native_control_class,
+            Some(MissionControlClassProjection {
+                class_id: 3,
+                source: MissionControlClassSource::UnitDatHighBit {
+                    header_flags: 0x8000_0004,
+                },
+            })
+        );
         let mine_prepared_controls = &mine_engine
             .loaded
             .as_ref()
@@ -11820,6 +11993,7 @@ mod tests {
             original_id: Some(OriginalObjectId(original_id)),
             handle,
             status: MissionControlDeviceTableStatus::Available(vec![device]),
+            native_control_class: None,
             owner_profile: None,
             node_provider_status: MissionControlNodeProviderTableStatus::Available(Vec::new()),
             node_provider_maximum_amount_bits: Some(0),
@@ -11929,6 +12103,7 @@ mod tests {
                 ),
                 ore_device,
             ]),
+            native_control_class: None,
             owner_profile: None,
             node_provider_status: MissionControlNodeProviderTableStatus::Available(vec![
                 synthetic_node_provider_row(0, 0, 1.0_f32.to_bits()),
@@ -11984,6 +12159,7 @@ mod tests {
                 original_id: Some(object.original_id),
                 handle: object.handle,
                 status: MissionControlDeviceTableStatus::Available(Vec::new()),
+                native_control_class: None,
                 owner_profile: None,
                 node_provider_status: MissionControlNodeProviderTableStatus::Available(Vec::new()),
                 node_provider_maximum_amount_bits: Some(0),

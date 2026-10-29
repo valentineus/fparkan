@@ -202,8 +202,8 @@ Unit DAT создаёт тот же Behavior-компонент во всех ho
 prototype roots без Unit DAT и отложенные spawn после исходной загрузки вне
 этой модели. Путь в `ArealMap.dll` (SHA-256
 `a25f9254ebb339d70e2e07c8121950191e9584ca0858d8e9c2e2b6c671edf6ea`) к
-`CreateObject` по RVA `0x14fd0`/`0x15290` показывает выбор World3D class 3 или 4
-по старшему биту. Для ветки GOG `AniMesh.dll` (SHA-256
+`CreateObject` по RVA `0x14fd0`/`0x15290` показывает выбор World3D factory
+selector `3` или `4` по старшему биту. Для ветки GOG `AniMesh.dll` (SHA-256
 `65659bf67f20e5be77d67a5b2f59968f61b94293143807fa59ca451c560c4f7e`) RVA
 `0x2ff0` показывает одну ветку создания: после QueryInterface для IID `0x204`
 выполняется отдельный импорт `GetQueue()`, а на возвращённом объекте вызывается
@@ -246,6 +246,24 @@ mission completion, pause и non-default game time.
 CTLD и связанные resources структурно читаются, count patterns и variants
 известны. Не названы все секции, shape types, coefficients и точный contact
 solver. То же относится к редким MSH auxiliary streams и части CTPT/NDPR flags.
+
+### Класс Control при загрузке Unit DAT
+
+Для двух подтверждённых полных Unit-DAT путей Rust теперь сохраняет класс,
+который передаётся конструктору Control, вместе с ветвью-источником. Лицензированный
+`min_l_n1.dat` проходит high-bit route и даёт класс `3`; synthetic-тесты покрывают
+оба маршрута, известные FourCC и отсутствующие root metadata. Отдельное
+исполнение проверило только чистый getter `Terrain.dll+0x33ae0` (SHA-256 и точный
+RVA приведены в технической главе). Остальная цепочка через ArealMap, World3D,
+Terrain/AniMesh и создание controller восстановлена по статическим инструкциям,
+таблицам и конфигурации. Она не означает исполнения оригинального полного
+loader-а, Control activation, движения или периодического tick.
+
+Не моделируются произвольный ненулевой host с неудачным QueryInterface, preview
+без полного Unit DAT, отложенный spawn и другие host/factory routes. В частности,
+generic failed-query путь native оставляет class `0` и не читает FourCC; это не
+эквивалентно canonical no-host lookup корневой registry entry. Остаточные вопросы
+об активации и игровом поведении описаны в технической главе.
 
 Одна цепочка Unit DAT → AniMesh descriptor → Control теперь восстановлена
 статически в [главе о Behavior и Control](../tomes/06-behavior.md): raw

@@ -10,6 +10,7 @@ using System.Text;
 // slots, and bounded vector backing are substituted; tested module code remains installed.
 internal static class BehaviorDistributorTickOracle {
     private const uint LoadWithAlteredSearchPath = 0x00000008;
+    private const uint DontResolveDllReferences = 0x00000001;
     private const uint MemCommitReserve = 0x00003000;
     private const uint PageExecuteReadWrite = 0x40;
     private const uint MemRelease = 0x00008000;
@@ -18,7 +19,9 @@ internal static class BehaviorDistributorTickOracle {
     private const string ExpectedControlSha256 = "bcb86318089028548a178b03a21accdce15df0cc85ddd91674cf3c2f55012c6e";
     private const string ExpectedArealMapSha256 = "a25f9254ebb339d70e2e07c8121950191e9584ca0858d8e9c2e2b6c671edf6ea";
     private const string ExpectedAniMeshSha256 = "65659bf67f20e5be77d67a5b2f59968f61b94293143807fa59ca451c560c4f7e";
+    private const string ExpectedTerrainSha256 = "af87d1b2e728a0be73c52be3b44cc196ab46da7799f25a15d40f8c9b0b425ead";
     private const int TickRva = 0x19e80;
+    private const int TerrainClassGetterRva = 0x33ae0;
     private const int DistributorScheduleRva = 0x1adb0;
     private const int AddObjectRva = 0x1aac0;
     private const int NormalizeRva = 0x1ac90;
@@ -96,6 +99,7 @@ internal static class BehaviorDistributorTickOracle {
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void X87ControlWordReader();
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate void X87ControlWordWriter();
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void TickDelegate(IntPtr self, float deltaSeconds);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate uint TerrainClassGetter(IntPtr self);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void NativeBehaviorSchedule(IntPtr self);
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)] private delegate IntPtr QueueGetter();
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate uint QueueClockGetter(IntPtr self);
@@ -579,8 +583,31 @@ internal static class BehaviorDistributorTickOracle {
         return sequence[Math.Min(index, sequence.Length - 1)];
     }
 
+    private static int ProbeTerrainClass() {
+        string terrainPath = Environment.GetEnvironmentVariable("FPARKAN_ORIGINAL_TERRAIN_DLL");
+        if (String.IsNullOrEmpty(terrainPath)) terrainPath = @"C:\GOG Games\Parkan - Iron Strategy\Terrain.dll";
+        if (!File.Exists(terrainPath)) { Console.Error.WriteLine("Set FPARKAN_ORIGINAL_TERRAIN_DLL to the installed Terrain.dll."); return 3; }
+        string hash = Hash(terrainPath);
+        if (hash != ExpectedTerrainSha256) { Console.Error.WriteLine("Unexpected Terrain.dll SHA-256: " + hash); return 4; }
+        IntPtr module = LoadLibraryEx(terrainPath, IntPtr.Zero, DontResolveDllReferences);
+        if (module == IntPtr.Zero) { Console.Error.WriteLine("LoadLibraryEx(Terrain.dll) failed: " + Marshal.GetLastWin32Error()); return 5; }
+        try {
+            IntPtr getterAddress = IntPtr.Add(module, TerrainClassGetterRva);
+            byte[] getterBytes = new byte[6]; Marshal.Copy(getterAddress, getterBytes, 0, getterBytes.Length);
+            string code = BitConverter.ToString(getterBytes).Replace("-", "");
+            if (code != "B803000000C3") { Console.Error.WriteLine("Unexpected Terrain getter bytes: " + code); return 6; }
+            TerrainClassGetter getter = (TerrainClassGetter)Marshal.GetDelegateForFunctionPointer(getterAddress, typeof(TerrainClassGetter));
+            uint classId = getter(IntPtr.Zero);
+            if (classId != 3) { Console.Error.WriteLine("Unexpected Terrain class ID: " + classId); return 7; }
+            Console.WriteLine("PASS sha256=" + hash + " rva=0x33AE0 bytes=" + code + " this=null class=3");
+            return 0;
+        } finally { FreeLibrary(module); }
+    }
+
     private static int Main() {
         if (IntPtr.Size != 4) { Console.Error.WriteLine("Build with /platform:x86."); return 2; }
+        int terrainClass = ProbeTerrainClass();
+        if (terrainClass != 0) return terrainClass;
         return RunWithIsolatedWorkingDirectory();
     }
 
