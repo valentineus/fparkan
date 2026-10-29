@@ -454,6 +454,8 @@ pub struct MissionControlDeviceTableState {
     pub handle: ObjectHandle,
     /// Complete base projection, or an explicit unsupported boundary.
     pub status: MissionControlDeviceTableStatus,
+    /// Raw CTLD profile retained by native component ID zero and its per-owner copy.
+    pub owner_profile: Option<MissionControlOwnerProfile>,
     /// Global NDP provider rows used by indexed Control selectors.
     pub node_provider_status: MissionControlNodeProviderTableStatus,
     /// Native `+0x58c`: total provider capacity in the supported unit-scale domain.
@@ -470,8 +472,24 @@ pub struct MissionControlDeviceTableState {
     pub current_output_rate_5e0_bits: u32,
 }
 
+/// CTLD owner profile selected by native component ID zero.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissionControlOwnerProfile {
+    /// CTLD resource that supplied the profile words.
+    pub source: ResourceKey,
+    /// Unit DAT component that supplied this CTLD resource.
+    pub unit_component_index: usize,
+    /// Native component ID used by Control's profile-selection condition.
+    pub native_component_id: u32,
+    /// Original profile words held by the Control resource cache.
+    pub original_words: [u32; 27],
+    /// Initial per-owner copy; this is mutated independently from `original_words`.
+    pub current_words: [u32; 27],
+}
+
 struct ControlDeviceProjection {
     devices: Vec<EffectiveControlDevice>,
+    owner_profile: Option<MissionControlOwnerProfile>,
     node_provider_status: MissionControlNodeProviderTableStatus,
 }
 
@@ -1514,6 +1532,7 @@ fn load_mission_with_options(
                         original_id: draft.original_id,
                         handle: *handle,
                         status: MissionControlDeviceTableStatus::Available(projection.devices),
+                        owner_profile: projection.owner_profile,
                         node_provider_maximum_amount_bits: initial_node_provider_maximum_amount(
                             &projection.node_provider_status,
                         ),
@@ -1528,6 +1547,7 @@ fn load_mission_with_options(
                         original_id: draft.original_id,
                         handle: *handle,
                         status: MissionControlDeviceTableStatus::Unavailable(reason.clone()),
+                        owner_profile: None,
                         node_provider_maximum_amount_bits: None,
                         node_provider_amount_bits: None,
                         node_provider_dirty: false,
@@ -5318,6 +5338,7 @@ fn build_control_device_projection(
     }
 
     let mut devices = Vec::new();
+    let mut owner_profile = None;
     let mut node_provider_status = MissionControlNodeProviderTableStatus::Available(Vec::new());
     let mut has_control_resource = false;
     for component_index in active_components {
@@ -5353,6 +5374,15 @@ fn build_control_device_projection(
 
         let component_id =
             component_ids[component_index].ok_or(Unavailable::ComponentAlignmentMismatch)?;
+        if component_id == 0 {
+            owner_profile = Some(MissionControlOwnerProfile {
+                source: control.source.clone(),
+                unit_component_index: component_index,
+                native_component_id: component_id,
+                original_words: control.native_profile_words,
+                current_words: control.native_profile_words,
+            });
+        }
         let is_root = component_index == 0;
         let is_ex_to = prototype.source_type == Some(PROTOTYPE_TYPE_EXTO);
         let raw_local_index = draft.unit_components[component_index].parent_or_link;
@@ -5478,6 +5508,7 @@ fn build_control_device_projection(
     }
     Ok(ControlDeviceProjection {
         devices,
+        owner_profile,
         node_provider_status,
     })
 }
@@ -6026,6 +6057,7 @@ mod tests {
     ) -> PreparedComponentControl {
         PreparedComponentControl {
             source: synthetic_resource_key(100 + index),
+            native_profile_words: [0; 27],
             model_node_count: 0,
             bindings: Vec::new(),
             timeline_rows: Vec::new(),
@@ -6387,6 +6419,7 @@ mod tests {
                 slot: 7,
             },
             status,
+            owner_profile: None,
             node_provider_maximum_amount_bits: initial_node_provider_maximum_amount(
                 &node_provider_status,
             ),
@@ -9089,6 +9122,89 @@ mod tests {
     }
 
     #[test]
+    fn control_projection_keeps_native_component_zero_profile_and_mutable_copy() {
+        let root_profile = std::array::from_fn(|index| 0xA500_0000 | index as u32);
+        let child_profile = [0xC11D_0000; 27];
+        let mut root = synthetic_component_control(
+            0,
+            vec![synthetic_control_record(19, 7, 0x10, None)],
+            PreparedControlEffectSection::Parsed(Vec::new()),
+        );
+        root.native_profile_words = root_profile;
+        let mut child = synthetic_component_control(
+            1,
+            vec![synthetic_control_record(19, 7, 0x20, None)],
+            PreparedControlEffectSection::Parsed(Vec::new()),
+        );
+        child.native_profile_words = child_profile;
+        let root_source = root.source.clone();
+        let (draft, assets, prototypes) = synthetic_control_fixture(
+            &[None, Some(PROTOTYPE_TYPE_INTO)],
+            &[1, 1],
+            &[1, 0],
+            &[0, 0],
+            &[1, 1],
+            vec![Some(root), Some(child)],
+        );
+
+        let mut projection = build_control_device_projection(
+            0,
+            &draft,
+            &assets,
+            Some(&(0..prototypes.len())),
+            &prototypes,
+        )
+        .expect("root plus INTO projection");
+        assert_eq!(projection.devices.len(), 1);
+        assert_eq!(
+            projection.devices[0]
+                .descriptor_provenance
+                .unit_component_index,
+            1,
+            "INTO with local index zero overrides the parent's first device"
+        );
+
+        let owner_profile = projection.owner_profile.as_mut().expect("root profile");
+        assert_eq!(owner_profile.unit_component_index, 0);
+        assert_eq!(owner_profile.native_component_id, 0);
+        assert_eq!(owner_profile.source, root_source);
+        assert_eq!(owner_profile.original_words, root_profile);
+        assert_eq!(owner_profile.current_words, root_profile);
+        owner_profile.current_words[3] ^= 0xFFFF;
+        assert_eq!(owner_profile.original_words, root_profile);
+        assert_ne!(owner_profile.current_words, owner_profile.original_words);
+    }
+
+    #[test]
+    fn control_projection_does_not_fall_back_to_child_profile_without_id_zero() {
+        let mut child = synthetic_component_control(
+            1,
+            vec![synthetic_control_record(19, 7, 0x20, None)],
+            PreparedControlEffectSection::Parsed(Vec::new()),
+        );
+        child.native_profile_words = [0xC11D_0000; 27];
+        let (draft, assets, prototypes) = synthetic_control_fixture(
+            &[None, Some(PROTOTYPE_TYPE_INTO)],
+            &[1, 1],
+            &[1, 0],
+            &[0, 0],
+            &[1, 1],
+            vec![None, Some(child)],
+        );
+
+        let projection = build_control_device_projection(
+            0,
+            &draft,
+            &assets,
+            Some(&(0..prototypes.len())),
+            &prototypes,
+        )
+        .expect("child-only Control projection");
+
+        assert_eq!(projection.owner_profile, None);
+    }
+
+    #[test]
     fn synthetic_node_provider_projection_keeps_native_rows_separate_from_mesh_keys() {
         let controls = vec![
             Some(control_with_synthetic_node_data(
@@ -9780,6 +9896,38 @@ mod tests {
         let mine_control_before = loaded_mission_control_device_tables(&mine_engine)
             .expect("licensed mine Control table")
             .to_vec();
+        let mine_prepared_controls = &mine_engine
+            .loaded
+            .as_ref()
+            .expect("loaded licensed mine")
+            .mission_assets
+            .object_component_controls[0];
+        let root_control = mine_prepared_controls[0]
+            .as_ref()
+            .expect("licensed root CTLD");
+        let child_control = mine_prepared_controls[5]
+            .as_ref()
+            .expect("licensed EXTO CTLD");
+        let owner_profile = mine_control_before[0]
+            .owner_profile
+            .as_ref()
+            .expect("loaded root owner profile");
+        assert_eq!(owner_profile.unit_component_index, 0);
+        assert_eq!(owner_profile.native_component_id, 0);
+        assert_eq!(owner_profile.source, root_control.source);
+        assert_eq!(owner_profile.source.name.0.as_slice(), b"fr_l_mine.ctl");
+        assert_eq!(
+            owner_profile.original_words,
+            root_control.native_profile_words
+        );
+        assert_eq!(
+            owner_profile.current_words,
+            root_control.native_profile_words
+        );
+        assert_ne!(
+            root_control.native_profile_words, child_control.native_profile_words,
+            "the licensed child CTLD has its own profile words"
+        );
         let mine_control_handle = mine_control_before[0].handle;
         let MissionControlDeviceTableStatus::Available(mine_control_devices) =
             &mine_control_before[0].status
@@ -11672,6 +11820,7 @@ mod tests {
             original_id: Some(OriginalObjectId(original_id)),
             handle,
             status: MissionControlDeviceTableStatus::Available(vec![device]),
+            owner_profile: None,
             node_provider_status: MissionControlNodeProviderTableStatus::Available(Vec::new()),
             node_provider_maximum_amount_bits: Some(0),
             node_provider_amount_bits: Some(0),
@@ -11780,6 +11929,7 @@ mod tests {
                 ),
                 ore_device,
             ]),
+            owner_profile: None,
             node_provider_status: MissionControlNodeProviderTableStatus::Available(vec![
                 synthetic_node_provider_row(0, 0, 1.0_f32.to_bits()),
             ]),
@@ -11834,6 +11984,7 @@ mod tests {
                 original_id: Some(object.original_id),
                 handle: object.handle,
                 status: MissionControlDeviceTableStatus::Available(Vec::new()),
+                owner_profile: None,
                 node_provider_status: MissionControlNodeProviderTableStatus::Available(Vec::new()),
                 node_provider_maximum_amount_bits: Some(0),
                 node_provider_amount_bits: Some(0),

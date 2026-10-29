@@ -1081,6 +1081,8 @@ pub struct PreparedVisual {
 pub struct PreparedComponentControl {
     /// CTLD resource that supplied these bindings.
     pub source: ResourceKey,
+    /// The 27 raw native owner-profile words at CTLD bytes 20..128.
+    pub native_profile_words: [u32; 27],
     /// Number of nodes in the component model this control targets.
     pub model_node_count: usize,
     /// Enabled source rows in their original order, including duplicate nodes.
@@ -4191,6 +4193,19 @@ fn decode_component_control_payload(
         return Err(invalid("complete binding table extends past the payload"));
     }
 
+    let profile_bytes = payload
+        .get(HEADER_BYTES..HEADER_BYTES + FIXED_SECTION_BYTES)
+        .ok_or_else(|| invalid("fixed owner profile extends past the payload"))?;
+    let mut native_profile_words = [0_u32; FIXED_SECTION_BYTES / 4];
+    for (index, word) in native_profile_words.iter_mut().enumerate() {
+        let offset = index * 4;
+        *word = u32::from_le_bytes(
+            profile_bytes[offset..offset + 4]
+                .try_into()
+                .expect("profile word is exactly four bytes"),
+        );
+    }
+
     let mut bindings = Vec::with_capacity(row_count);
     let mut timeline_rows = Vec::with_capacity(row_count);
     for row_index in 0..row_count {
@@ -4253,6 +4268,7 @@ fn decode_component_control_payload(
 
     Ok(PreparedComponentControl {
         source,
+        native_profile_words,
         model_node_count,
         bindings,
         timeline_rows,
@@ -4838,6 +4854,66 @@ mod tests {
         assert_eq!(control.bindings[1].node_index, 1);
         assert_eq!(control.bindings[1].frame_a, 2.0);
         assert_eq!(control.bindings[1].flags, 1);
+    }
+
+    #[test]
+    fn component_control_preserves_raw_profile_between_header_and_sections() {
+        const PROFILE_START: usize = 20;
+        const PROFILE_WORDS: usize = 27;
+        const SECTION_BYTES: usize = 156 + 16;
+        const MATRIX_BYTES: usize = 4;
+        const ROW_START: usize = PROFILE_START + PROFILE_WORDS * 4 + SECTION_BYTES + MATRIX_BYTES;
+        const ROW_BYTES: usize = 36;
+
+        let source = ResourceKey {
+            archive: parse_path("controls.rlb").expect("archive"),
+            name: resource_name(b"profile.ctl"),
+            type_id: None,
+        };
+        let mut payload = vec![0; ROW_START + ROW_BYTES];
+        payload[0..4].copy_from_slice(&1_u32.to_le_bytes()); // one section
+        payload[4..8].copy_from_slice(&1_u32.to_le_bytes()); // one node per section
+        payload[8..12].copy_from_slice(&1_u32.to_le_bytes()); // one binding row
+        let profile = std::array::from_fn::<_, PROFILE_WORDS, _>(|index| match index {
+            0 => 0xDEAD_BEEF,
+            1 => 0x7FC0_1234,
+            index => 0xA500_0000 | u32::try_from(index).expect("index fits u32"),
+        });
+        for (index, word) in profile.iter().enumerate() {
+            let start = PROFILE_START + index * 4;
+            payload[start..start + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        payload[ROW_START..ROW_START + 4].copy_from_slice(&1_u32.to_le_bytes());
+        payload[ROW_START + 4..ROW_START + 8].copy_from_slice(&1.25_f32.to_bits().to_le_bytes());
+        payload[ROW_START + 8..ROW_START + 12].copy_from_slice(&2.5_f32.to_bits().to_le_bytes());
+        payload[ROW_START + 12..ROW_START + 16].copy_from_slice(&0.75_f32.to_bits().to_le_bytes());
+        payload[ROW_START + 0x20..ROW_START + 0x24].copy_from_slice(&1_u32.to_le_bytes());
+
+        let control =
+            decode_component_control_payload(&payload, source, 2, 0).expect("profile CTLD");
+
+        assert_eq!(control.native_profile_words, profile);
+        assert_eq!(control.timeline_rows.len(), 1);
+        assert_eq!(control.timeline_rows[0].node_index, 1);
+        assert_eq!(
+            control.timeline_rows[0].frame_a.to_bits(),
+            1.25_f32.to_bits()
+        );
+        assert_eq!(
+            control.timeline_rows[0].frame_b.to_bits(),
+            2.5_f32.to_bits()
+        );
+    }
+
+    #[test]
+    fn component_control_rejects_truncated_native_profile() {
+        let source = ResourceKey {
+            archive: parse_path("controls.rlb").expect("archive"),
+            name: resource_name(b"truncated-profile.ctl"),
+            type_id: None,
+        };
+
+        assert!(decode_component_control_payload(&vec![0; 127], source, 0, 0).is_err());
     }
 
     #[test]

@@ -7410,6 +7410,7 @@ mod tests {
                 type_id: None,
             },
             model_node_count: 1,
+            native_profile_words: [0; 27],
             bindings: vec![],
             timeline_rows: vec![fparkan_assets::PreparedControlTimelineRow {
                 row_index: 0,
