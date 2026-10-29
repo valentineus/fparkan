@@ -905,6 +905,7 @@ internal static class BehaviorDistributorTickOracle {
             Marshal.WriteInt32(ndpDescriptor, 0x04, FloatBits(100.0f)); // Native selector 3 maximum.
             Marshal.WriteInt32(row, 0x04, -1); // Root row has no parent node.
             Marshal.WriteInt32(row, 0x08, FloatBits(40.0f));
+            Marshal.WriteInt32(row, 0x0c, FloatBits(40.0f));
             Marshal.WriteInt32(row, 0x14, FloatBits(0.4f));
 
             Marshal.WriteIntPtr(callbackObject, 0, callbackVtable);
@@ -946,6 +947,21 @@ internal static class BehaviorDistributorTickOracle {
             Expect(controlNodeUpdateCount == 4 && controlNodeUpdateIndex == 1 &&
                 controlNodeUpdateSelector == 0x200 && controlNodeUpdateValueBits == 0,
                 "Control native node callback receives every normalized provider update through exhaustion");
+
+            update(owner, 1, 10.0f, 0);
+            Expect(ReadFloat(row, 0x08) == 10.0f && ReadFloat(row, 0x14) == 0.1f &&
+                ReadFloat(row, 0x0c) == 40.0f && ReadFloat(owner, 0x590) == 10.0f &&
+                (Marshal.ReadInt32(row, 0x28) & 0x10) == 0 && controlNodeUpdateCount == 5,
+                "direct provider update revives a leaf without advancing its processed amount");
+
+            Marshal.WriteInt32(row, 8, unchecked((int)0x80000000));
+            Marshal.WriteInt32(row, 0x14, FloatBits(0.25f));
+            Marshal.WriteInt32(owner, 0x590, FloatBits(20.0f));
+            update(owner, 1, -1.0f, 0);
+            Expect(Marshal.ReadInt32(row, 8) == 0 && ReadFloat(row, 0x14) == 0.25f &&
+                ReadFloat(row, 0x0c) == 40.0f && ReadFloat(owner, 0x590) == 20.0f &&
+                controlNodeUpdateCount == 5 && (Marshal.ReadInt32(row, 0x28) & 0x10) == 0,
+                "clamping signed zero writes amount bits but leaves ratio, aggregate, flags and publication unchanged");
 
             Console.WriteLine("native-control-live-ndp-provider: controlHash=" + ExpectedControlSha256 +
                 " rowCtorRva=0xb240 initialType1=1 rowStride=0x2c node=1 max=100 amount=0..100 tag26Selector300=live");
@@ -2226,6 +2242,8 @@ internal static class BehaviorDistributorTickOracle {
             controlNodeUpdateCount = 0;
             controlNodeUpdateIndices.Clear();
             initialize(owner);
+            Expect(Marshal.ReadByte(owner, 0x598) == 1,
+                "Control constructor starts the provider aggregate dirty and f940 preserves it");
             uint[] expectedFlags = { 0x09, 0x02, 0x04, 0x08 };
             uint[] expectedStages = { 1, 1, 3, 1 };
             for (int nodeIndex = 0; nodeIndex < rowCount; nodeIndex++) {
