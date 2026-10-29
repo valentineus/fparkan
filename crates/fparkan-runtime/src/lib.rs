@@ -1560,27 +1560,36 @@ fn prepare_first_preview_assets<R: ResourceRepository>(
     Ok(MissionAssets::default())
 }
 
-/// Steps headless mode.
+/// Steps the world and due Behavior resource distributors at an explicit queue clock.
+///
+/// Resource updates are prepared before queued world commands and deferred deletion,
+/// and published only after the world step succeeds. This does not yet execute the
+/// separate Control clock, movement, or general mission script handlers.
 ///
 /// # Errors
 ///
-/// Returns [`EngineError`] when the world step fails.
+/// Returns [`EngineError`] when the resource or world step fails; neither stage
+/// publishes partial state on failure.
 pub fn step_headless(
     engine: &mut Engine,
     input: InputSnapshot,
+    queue_time_ms: u32,
 ) -> Result<FrameResult, EngineError> {
-    Ok(FrameResult {
-        snapshot: step(&mut engine.world, &input)?,
-    })
+    let resources = prepare_loaded_mission_resources(engine, queue_time_ms)?;
+    let snapshot = step(&mut engine.world, &input)?;
+    if let Some(resources) = resources {
+        resources.apply(engine);
+    }
+    Ok(FrameResult { snapshot })
 }
 
-/// Steps rendered mode.
+/// Steps rendered mode with the same queue-clock semantics as [`step_headless`].
 ///
 /// # Errors
 ///
-/// Returns [`EngineError`] when the world step fails.
-pub fn frame(engine: &mut Engine) -> Result<FrameResult, EngineError> {
-    step_headless(engine, InputSnapshot)
+/// Returns [`EngineError`] when the resource or world step fails.
+pub fn frame(engine: &mut Engine, queue_time_ms: u32) -> Result<FrameResult, EngineError> {
+    step_headless(engine, InputSnapshot, queue_time_ms)
 }
 
 /// Returns the loaded mission summary.
@@ -1962,9 +1971,65 @@ pub fn advance_loaded_mission_resources(
     engine: &mut Engine,
     queue_time_ms: u32,
 ) -> Result<usize, EngineError> {
-    let Some(loaded) = engine.loaded.as_ref() else {
+    let Some(resources) = prepare_loaded_mission_resources(engine, queue_time_ms)? else {
         return Ok(0);
     };
+    let scheduled_ticks = resources.scheduled_ticks;
+    resources.apply(engine);
+    Ok(scheduled_ticks)
+}
+
+struct PreparedMissionResources {
+    distributors: Vec<BehaviorDistributorState>,
+    ore_states: Vec<BehaviorOreState>,
+    control_tables: Vec<MissionControlDeviceTableState>,
+    warm_starts: Vec<Option<BehaviorWarmStartState>>,
+    rng_state: u32,
+    scheduled_ticks: usize,
+}
+
+impl PreparedMissionResources {
+    fn apply(self, engine: &mut Engine) {
+        let loaded = engine
+            .loaded
+            .as_mut()
+            .expect("prepared resources require a loaded mission");
+        loaded.behavior_distributors = self.distributors;
+        loaded.behavior_ore_states = self.ore_states;
+        loaded.control_device_tables = self.control_tables;
+        for (bundle, warm_start) in loaded.script_bundles.iter_mut().zip(self.warm_starts) {
+            bundle.behavior_warm_start = warm_start;
+        }
+        engine.behavior_rng_state = self.rng_state;
+    }
+}
+
+fn prepare_loaded_mission_resources(
+    engine: &Engine,
+    queue_time_ms: u32,
+) -> Result<Option<PreparedMissionResources>, EngineError> {
+    let Some(loaded) = engine.loaded.as_ref() else {
+        return Ok(None);
+    };
+    if loaded
+        .behavior_distributors
+        .iter()
+        .filter(|distributor| distributor.super_ai_visible)
+        .all(|distributor| {
+            loaded
+                .script_bundles
+                .iter()
+                .find(|bundle| bundle.clan_index == distributor.clan_index)
+                .and_then(|bundle| bundle.behavior_warm_start)
+                .is_some_and(|schedule| {
+                    schedule.first_time_ms != 0
+                        && schedule.next_deadline_ms != 0
+                        && queue_time_ms <= schedule.next_deadline_ms
+                })
+        })
+    {
+        return Ok(None);
+    }
 
     let mut distributors = loaded.behavior_distributors.clone();
     let mut ore_states = loaded.behavior_ore_states.clone();
@@ -2023,18 +2088,14 @@ pub fn advance_loaded_mission_resources(
         schedule.cleared_words = totals;
     }
 
-    let loaded = engine
-        .loaded
-        .as_mut()
-        .expect("loaded mission was checked above");
-    loaded.behavior_distributors = distributors;
-    loaded.behavior_ore_states = ore_states;
-    loaded.control_device_tables = control_tables;
-    for (bundle, warm_start) in loaded.script_bundles.iter_mut().zip(warm_starts) {
-        bundle.behavior_warm_start = warm_start;
-    }
-    engine.behavior_rng_state = rng_state;
-    Ok(scheduled_ticks)
+    Ok(Some(PreparedMissionResources {
+        distributors,
+        ore_states,
+        control_tables,
+        warm_starts,
+        rng_state,
+        scheduled_ticks,
+    }))
 }
 
 /// Sets native Control global-table selector 1 on rows whose selector-0 value
@@ -5169,7 +5230,7 @@ mod tests {
     #[test]
     fn load_mission_requires_vfs_and_keeps_world_unchanged_on_error() {
         let mut engine = create(EngineServices::default()).expect("engine");
-        let before = step_headless(&mut engine, InputSnapshot).expect("step");
+        let before = step_headless(&mut engine, InputSnapshot, 0).expect("step");
         let err = load_mission(
             &mut engine,
             MissionRequest {
@@ -5180,7 +5241,7 @@ mod tests {
         )
         .expect_err("missing VFS");
         assert!(matches!(err, EngineError::MissingVfs));
-        let after = step_headless(&mut engine, InputSnapshot).expect("step");
+        let after = step_headless(&mut engine, InputSnapshot, 0).expect("step");
         assert_eq!(before.snapshot.objects, after.snapshot.objects);
     }
 
@@ -6911,6 +6972,116 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
+    fn headless_step_runs_resource_schedule_and_rolls_back_both_error_paths() {
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(
+            licensed_root("IS"),
+        ))))
+        .expect("engine");
+        load_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Autodemo.00/data.tma".into(),
+                mode: MissionMode::AutoDemo,
+            },
+            100_000,
+        )
+        .expect("licensed mission");
+        let schedules = |engine: &Engine| {
+            loaded_mission_script_bundles(engine)
+                .unwrap()
+                .iter()
+                .map(|bundle| bundle.behavior_warm_start)
+                .collect::<Vec<_>>()
+        };
+        let initial = schedules(&engine);
+        frame(&mut engine, 100_200).expect("deadline equality");
+        assert_eq!(schedules(&engine), initial);
+        let result = step_headless(&mut engine, InputSnapshot, 100_201).expect("due clan 1");
+        assert_eq!(result.snapshot.tick.0, 2);
+        let after = schedules(&engine);
+        assert_eq!(after[0], initial[0]);
+        let updated = after[1].expect("clan 1 schedule");
+        assert_eq!(updated.first_time_ms, 100_201);
+        assert!(f32::from_bits(updated.cleared_words[0]) > 0.0);
+
+        let resources = |engine: &Engine| {
+            let state = engine.loaded.as_ref().unwrap();
+            (
+                state.behavior_distributors.clone(),
+                state.behavior_ore_states.clone(),
+                state.control_device_tables.clone(),
+                schedules(engine),
+                engine.behavior_rng_state,
+            )
+        };
+        let saved_controls = engine
+            .loaded
+            .as_ref()
+            .unwrap()
+            .control_device_tables
+            .clone();
+        let plant = engine
+            .loaded
+            .as_ref()
+            .unwrap()
+            .behavior_distributors
+            .iter()
+            .find(|distributor| distributor.clan_index == 1)
+            .unwrap()
+            .registered_objects
+            .iter()
+            .find(|object| object.class_flags == 0x8000_0010)
+            .unwrap()
+            .handle;
+        engine
+            .loaded
+            .as_mut()
+            .unwrap()
+            .control_device_tables
+            .retain(|table| table.handle != plant);
+        let before = resources(&engine);
+        let world_before = fparkan_world::canonical_state_hash(&engine.world);
+        assert!(matches!(
+            step_headless(&mut engine, InputSnapshot, 100_500),
+            Err(EngineError::BehaviorDistributorTick { clan_index: 1, .. })
+        ));
+        assert_eq!(resources(&engine), before);
+        assert_eq!(
+            fparkan_world::canonical_state_hash(&engine.world),
+            world_before
+        );
+
+        engine.loaded.as_mut().unwrap().control_device_tables = saved_controls;
+        let stale = construct_object(&mut engine.world, ObjectDraft { original_id: None }).unwrap();
+        register_object(&mut engine.world, stale).unwrap();
+        fparkan_world::enqueue(
+            &mut engine.world,
+            fparkan_world::WorldCommand {
+                sequence: 0,
+                target: Some(stale),
+            },
+        )
+        .unwrap();
+        fparkan_world::request_delete(&mut engine.world, stale).unwrap();
+        let before = resources(&engine);
+        let world_before = fparkan_world::canonical_state_hash(&engine.world);
+        assert!(matches!(
+            step_headless(&mut engine, InputSnapshot, 100_500),
+            Err(EngineError::World(_))
+        ));
+        assert_eq!(
+            resources(&engine),
+            before,
+            "a failed world step must not publish staged resource ticks"
+        );
+        assert_eq!(
+            fparkan_world::canonical_state_hash(&engine.world),
+            world_before
+        );
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_autodemo_resource_ticks_use_queue_time_and_real_generator_profile() {
         let root = licensed_root("IS");
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(root));
@@ -7714,7 +7885,7 @@ mod tests {
         )
         .expect("static preview does not require Behavior profile parsing");
         let previous_mission = loaded_mission(&engine).expect("loaded preview").clone();
-        let before = step_headless(&mut engine, InputSnapshot)
+        let before = step_headless(&mut engine, InputSnapshot, 0)
             .expect("step preview world")
             .snapshot
             .objects;
@@ -7726,7 +7897,7 @@ mod tests {
             EngineError::Nres { ref path, .. } if path == "behpsp.res"
         ));
         assert_eq!(loaded_mission(&engine), Some(&previous_mission));
-        let after = step_headless(&mut engine, InputSnapshot)
+        let after = step_headless(&mut engine, InputSnapshot, 0)
             .expect("step retained preview world")
             .snapshot
             .objects;
@@ -7921,7 +8092,7 @@ mod tests {
                 denied,
             });
             let mut engine = create(EngineServices::new(vfs)).expect("engine");
-            let before = step_headless(&mut engine, InputSnapshot).expect("before");
+            let before = step_headless(&mut engine, InputSnapshot, 0).expect("before");
             let err = load_mission(&mut engine, mission, 0).expect_err("load error");
             match denied {
                 DenyRule::Suffix("Land.map") => assert!(matches!(err, EngineError::Vfs { .. })),
@@ -7931,7 +8102,7 @@ mod tests {
                 DenyRule::Suffix(unexpected) => panic!("unexpected deny rule {unexpected}"),
             }
             assert!(loaded_mission(&engine).is_none());
-            let after = step_headless(&mut engine, InputSnapshot).expect("after");
+            let after = step_headless(&mut engine, InputSnapshot, 0).expect("after");
             assert_eq!(before.snapshot.objects, after.snapshot.objects);
         }
     }
@@ -7942,7 +8113,7 @@ mod tests {
         let root = licensed_root("IS");
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(root));
         let mut engine = create(EngineServices::new(vfs)).expect("engine");
-        let before = step_headless(&mut engine, InputSnapshot).expect("before");
+        let before = step_headless(&mut engine, InputSnapshot, 0).expect("before");
 
         let err = load_mission_with_options(
             &mut engine,
@@ -7967,7 +8138,7 @@ mod tests {
             }
         ));
         assert!(loaded_mission(&engine).is_none());
-        let after = step_headless(&mut engine, InputSnapshot).expect("after");
+        let after = step_headless(&mut engine, InputSnapshot, 0).expect("after");
         assert_eq!(before.snapshot.objects, after.snapshot.objects);
     }
 
@@ -8011,7 +8182,7 @@ mod tests {
             .expect("previous Behavior distributors")
             .to_vec();
         let previous_rng = engine.behavior_rng_state;
-        let before = step_headless(&mut engine, InputSnapshot)
+        let before = step_headless(&mut engine, InputSnapshot, 0)
             .expect("step previous world")
             .snapshot
             .objects;
@@ -8038,7 +8209,7 @@ mod tests {
             Some(previous_distributors.as_slice())
         );
         assert_eq!(engine.behavior_rng_state, previous_rng);
-        let after = step_headless(&mut engine, InputSnapshot)
+        let after = step_headless(&mut engine, InputSnapshot, 0)
             .expect("step retained world")
             .snapshot
             .objects;
@@ -8217,7 +8388,7 @@ mod tests {
         let mut snapshot = None;
         for _ in 0..10_000 {
             snapshot = Some(
-                step_headless(&mut engine, InputSnapshot)
+                step_headless(&mut engine, InputSnapshot, 0)
                     .expect("selected mission deterministic tick")
                     .snapshot,
             );
