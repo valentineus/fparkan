@@ -647,7 +647,7 @@ internal static class BehaviorDistributorTickOracle {
             Marshal.WriteIntPtr(import, Marshal.GetFunctionPointerForDelegate(AreaMapGetterCallback));
             Marshal.WriteIntPtr(queueImport, Marshal.GetFunctionPointerForDelegate(QueueGetterCallback));
             RunSmokeCases(module, controlModule, arealMapModule, aniMeshModule);
-            Console.WriteLine("original native Behavior/ArealMap/Control oracle passed (Behavior Add 0x1aac0, normalize 0x1ac90, scheduler 0x1adb0, tick 0x19e80; ArealMap UnitDAT projection 0x14b90; Control INTO override 0x2d890, provider distribution 0x10ba0, class-4 update 0x12a40 and inactive timing baseline 0xbcf0; synthetic host callbacks, GetSystemArealMap/GetQueue IAT slots, and bounded vector insertion are substituted; Control provider selector vtable is original; no full Control update or Rust parity is claimed).");
+            Console.WriteLine("original native Behavior/ArealMap/Control oracle passed (Behavior Add 0x1aac0, normalize 0x1ac90, scheduler 0x1adb0, tick 0x19e80; ArealMap UnitDAT projection 0x14b90; Control INTO override 0x2d890, provider distribution 0x10ba0, class-4 update 0x12a40 and bounded class-10 active clock 0xbcf0; synthetic host callbacks, GetSystemArealMap/GetQueue IAT slots, and bounded vector insertion are substituted; Control provider selector vtable is original; no full Control update or Rust parity is claimed).");
             return 0;
         }
         catch (Exception error) {
@@ -1778,6 +1778,74 @@ internal static class BehaviorDistributorTickOracle {
                     Marshal.ReadInt32(generator, 0x18) == expectedAmounts[i],
                     "native category priority updates tag 15 before the earlier stored generator");
             }
+            // Bounded active class-10 host: no motion object, no deferred packets.
+            // These host getters are mocks; the clock, deadline and budget code are native.
+            IntPtr host = fixture.Allocate(4);
+            IntPtr hostVtable = fixture.Allocate(0x94);
+            IntPtr motion = fixture.Allocate(4);
+            IntPtr motionVtable = fixture.Allocate(0x34);
+            Marshal.WriteIntPtr(host, hostVtable);
+            Marshal.WriteIntPtr(motion, motionVtable);
+            byte[] getMotion = { 0xb8,0,0,0,0, 0xc2,0x04,0x00 };
+            WriteImm32(getMotion, 1, motion.ToInt32());
+            Marshal.Copy(getMotion, 0, IntPtr.Add(fastcallThunks, 0x300), getMotion.Length);
+            byte[] hostPresent = { 0xb8,1,0,0,0, 0xc2,0x04,0x00 };
+            Marshal.Copy(hostPresent, 0, IntPtr.Add(fastcallThunks, 0x320), hostPresent.Length);
+            byte[] noMotion = { 0xb8,0xff,0xff,0xff,0xff, 0xc3 };
+            Marshal.Copy(noMotion, 0, IntPtr.Add(fastcallThunks, 0x340), noMotion.Length);
+            Marshal.WriteIntPtr(hostVtable, 0x90, IntPtr.Add(fastcallThunks, 0x300));
+            Marshal.WriteIntPtr(hostVtable, 0x0c, IntPtr.Add(fastcallThunks, 0x320));
+            Marshal.WriteIntPtr(motionVtable, 0x30, IntPtr.Add(fastcallThunks, 0x340));
+            Marshal.WriteIntPtr(owner, 0x40, host);
+            Marshal.WriteIntPtr(owner, 0x1c, host);
+            Marshal.WriteInt32(owner, 0x50, 10);
+            Marshal.WriteByte(owner, 0xe0, 1);
+            Marshal.WriteInt32(owner, 0xe4, 0);
+            Marshal.WriteInt32(owner, 0xec, 0);
+            Marshal.WriteByte(owner, 0x598, 0);
+            Marshal.WriteInt32(owner, 0x588, 0);
+            Marshal.WriteInt32(providerRow, 8, FloatBits(40.0f));
+            Marshal.WriteInt32(providerRow, 0x0c, FloatBits(40.0f));
+            Marshal.WriteInt32(providerRow, 0x14, FloatBits(0.4f));
+            Marshal.WriteInt32(owner, 0x590, FloatBits(40.0f));
+            Marshal.WriteInt32(generator, 8, FloatBits(0.1f));
+            Marshal.WriteInt32(generator, 0x1c, 0);
+            NativeControlTimedUpdate timedUpdate = (NativeControlTimedUpdate)Marshal.GetDelegateForFunctionPointer(
+                IntPtr.Add(module, ControlTimedUpdateRva), typeof(NativeControlTimedUpdate));
+            IntPtr period = IntPtr.Add(module, 0x42480);
+            IntPtr randomState = IntPtr.Add(module, 0x43228);
+            int savedPeriod = Marshal.ReadInt32(period);
+            int savedRandom = Marshal.ReadInt32(randomState);
+            try {
+                Marshal.WriteInt32(period, FloatBits(500.0f));
+                Marshal.WriteInt32(randomState, 0); // Fixed point: random offset is -period/8.
+                timedUpdate(owner, 0.5f);
+                Expect(ReadFloat(owner, 0xe4) == 0.0f && ReadFloat(owner, 0xe8) == 0.5f,
+                    "active clock skips less than one millisecond");
+                timedUpdate(owner, 436.0f);
+                Expect(ReadFloat(owner, 0xe4) == 436.0f && ReadFloat(owner, 0xec) == 0.0f &&
+                    Marshal.ReadInt32(generator, 0x1c) == 0, "active clock skips before resource deadline");
+                timedUpdate(owner, 437.5f);
+                Expect(ReadFloat(owner, 0xe4) == 437.5f && ReadFloat(owner, 0xec) == 0.0f &&
+                    Marshal.ReadInt32(generator, 0x1c) == 0 && ReadFloat(providerRow, 8) == 40.0f,
+                    "active resource clock skips exact randomized deadline equality");
+                timedUpdate(owner, 500.0f);
+                Expect(ReadFloat(owner, 0xec) == 500.0f && ReadFloat(owner, 0xe8) == 62.5f &&
+                    Marshal.ReadInt32(generator, 0x10) == FloatBits(0.5f) &&
+                    Marshal.ReadInt32(generator, 0x1c) == 1 &&
+                    Marshal.ReadInt32(providerRow, 8) == expectedAmounts[0] &&
+                    Marshal.ReadInt32(providerRow, 0x14) == expectedRatios[0],
+                    "active clock converts elapsed since last resource cycle to seconds and executes native budget");
+                Expect(Marshal.ReadByte(owner, 0x598) == 1 && ReadFloat(owner, 0x588) == 0.0f,
+                    "budget dirties amount after the preceding contact/aggregate update");
+                Console.WriteLine("native-control-active-clock: class=10 e0=1 period=500 seed=0 sub-ms=skip" +
+                    " equality=437.5/skip now=500 e8=62.5 resourceDt=0.5 amount=0x42206666 ec=500");
+            } finally {
+                Marshal.WriteInt32(period, savedPeriod);
+                Marshal.WriteInt32(randomState, savedRandom);
+            }
+            GC.KeepAlive(timedUpdate);
+
         }
     }
 
