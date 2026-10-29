@@ -53,6 +53,10 @@ internal static class BehaviorDistributorTickOracle {
     private const int ControlResourceCommonSetterRva = 0x21d50;
     private const int ControlResourceTag9ConstructorRva = 0x25460;
     private const int ControlResourceTag15ConstructorRva = 0x22ae0;
+    private const int ControlResourceTag26ConstructorRva = 0x2d4b0;
+    private const int ControlResourceTag26SetterRva = 0x2c2b0;
+    private const int ControlResourceTag26RateRva = 0x2e540;
+    private const int ControlResourceTag26UpdateRva = 0x21890;
     private const int ControlResourceTag25ConstructorRva = 0x20800;
     private const int ControlResourceTag9RateRva = 0x25700;
     private const int ControlResourceTag9UpdateRva = 0x257b0;
@@ -68,6 +72,7 @@ internal static class BehaviorDistributorTickOracle {
     private const int ControlResourceTag15GateRva = 0x21820;
     private const int ControlResourceTag9VtableRva = 0x3c938;
     private const int ControlResourceTag15VtableRva = 0x3c648;
+    private const int ControlResourceTag26VtableRva = 0x3ce38;
     private const int ControlResourceTag25VtableRva = 0x3c448;
     private const int ControlResourceTag9StringPairRva = 0x25600;
     private const int ControlResourceNoOpStringPairRva = 0x0bcd0;
@@ -125,6 +130,8 @@ internal static class BehaviorDistributorTickOracle {
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlResourceBudgetUpdate(IntPtr self, float deltaSeconds);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate float NativeControlResourceDeviceRate(IntPtr self, float deltaSeconds);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlResourceTag9Update(IntPtr self, float deltaSeconds, float allocation);
+    [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate void NativeControlResourceDeviceUpdate(IntPtr self, float deltaSeconds, float allocation);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate byte NativeControlDeviceSelectorSetter(IntPtr ownerInterface, uint deviceIndex, uint selector, IntPtr value);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate int NativeControlResourceDeviceGate(IntPtr self);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate float NativeControlResourceAvailability(IntPtr self, byte flags);
     [UnmanagedFunctionPointer(CallingConvention.ThisCall)] private delegate IntPtr NativeControlDeviceFactory(IntPtr self, uint componentId, uint keyOffset, IntPtr record);
@@ -712,6 +719,7 @@ internal static class BehaviorDistributorTickOracle {
             RunNativeControlTimedUpdateBaselineCases(controlModule);
             RunNativeControlAggregateResourceCases(controlModule);
             RunNativeControlResourceBudgetTag15Case(controlModule);
+            RunNativeControlResourceBudgetTag26Case(controlModule);
             RunNativeControlResourceBudgetClass9Case(controlModule);
             RunNativeControlGenericDefaultBudgetCase(controlModule);
             RunNativeControlActivationCase(controlModule);
@@ -2362,6 +2370,168 @@ internal static class BehaviorDistributorTickOracle {
         GC.KeepAlive(update);
     }
 
+    private static void RunNativeControlResourceBudgetTag26Case(IntPtr module) {
+        NativeControlOwnerConstructor constructOwner = (NativeControlOwnerConstructor)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlOwnerConstructorRva), typeof(NativeControlOwnerConstructor));
+        NativeControlProviderRowConstructor constructProviderRow = (NativeControlProviderRowConstructor)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlProviderRowConstructorRva), typeof(NativeControlProviderRowConstructor));
+        NativeControlDeviceFactory createDevice = (NativeControlDeviceFactory)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlResourceTag26ConstructorRva), typeof(NativeControlDeviceFactory));
+        NativeControlResourceDeviceConstructor constructTag19 = (NativeControlResourceDeviceConstructor)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlResourceDeviceConstructorRva), typeof(NativeControlResourceDeviceConstructor));
+        NativeControlResourceDeviceRate rate19 = (NativeControlResourceDeviceRate)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, 0x229a0), typeof(NativeControlResourceDeviceRate));
+        NativeControlResourceComponentOverride applyInto = (NativeControlResourceComponentOverride)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlResourceIntoRva), typeof(NativeControlResourceComponentOverride));
+        NativeControlResourceDeviceRate rate = (NativeControlResourceDeviceRate)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlResourceTag26RateRva), typeof(NativeControlResourceDeviceRate));
+        NativeControlResourceDeviceGate gate = (NativeControlResourceDeviceGate)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlResourceTag15GateRva), typeof(NativeControlResourceDeviceGate));
+        NativeControlResourceDeviceUpdate update = (NativeControlResourceDeviceUpdate)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlResourceTag26UpdateRva), typeof(NativeControlResourceDeviceUpdate));
+        NativeControlResourceBudgetUpdate budgetStep = (NativeControlResourceBudgetUpdate)
+            Marshal.GetDelegateForFunctionPointer(IntPtr.Add(module, ControlResourceBudgetUpdateRva), typeof(NativeControlResourceBudgetUpdate));
+        NativeControlDeviceSelectorSetter setSelector = (NativeControlDeviceSelectorSetter)
+            Marshal.GetDelegateForFunctionPointer(
+                WriteStdCallFourArgsToFastcallThunk(0x380, IntPtr.Add(module, ControlResourceTag26SetterRva)),
+                typeof(NativeControlDeviceSelectorSetter));
+
+        using (Fixture fixture = NewFixture()) {
+            IntPtr owner = fixture.Allocate(0x664);
+            Expect(constructOwner(owner, IntPtr.Zero, 4) == owner, "tag-26 budget owner constructor");
+            IntPtr providerRow = fixture.Allocate(0x2c);
+            IntPtr ndpDescriptor = fixture.Allocate(0x4c);
+            Marshal.WriteInt32(ndpDescriptor, 4, FloatBits(100.0f));
+            constructProviderRow(providerRow, ndpDescriptor);
+            Marshal.WriteInt32(providerRow, 4, -1);
+            Marshal.WriteInt32(providerRow, 0x24, -1);
+            Marshal.WriteInt32(providerRow, 8, FloatBits(40.0f));
+            Marshal.WriteInt32(providerRow, 0x0c, FloatBits(40.0f));
+            Marshal.WriteInt32(providerRow, 0x14, FloatBits(0.4f));
+            Marshal.WriteIntPtr(owner, 0x55c, providerRow);
+            Marshal.WriteInt32(owner, 0x560, 1);
+            Marshal.WriteInt32(owner, 0x65c, FloatBits(1.0f));
+            Marshal.WriteInt32(owner, 0x58c, FloatBits(100.0f));
+            Marshal.WriteInt32(owner, 0x590, FloatBits(40.0f));
+            IntPtr devices = fixture.Allocate(8);
+            Marshal.WriteIntPtr(owner, 0x5bc, devices);
+            Marshal.WriteInt32(owner, 0x5c4, 2); // Factory device vector capacity.
+            IntPtr record = fixture.Allocate(0xb4);
+            Marshal.WriteInt32(record, 0, 26);
+            Marshal.WriteInt32(record, 0x18, -1); // Keep factory enable word +0x50.
+            Marshal.WriteInt32(record, 0x20, FloatBits(0.2f));
+            Expect(createDevice(owner, 3, 0, record) == IntPtr.Add(record, 0xb4),
+                "tag-26 native factory consumes one descriptor");
+            IntPtr device = Marshal.ReadIntPtr(devices);
+            Marshal.WriteInt32(owner, 0x5c0, 1);
+            Expect(device != IntPtr.Zero, "tag-26 factory publishes its allocated device pointer");
+            IntPtr vtable = Marshal.ReadIntPtr(device);
+            Expect(vtable == IntPtr.Add(module, ControlResourceTag26VtableRva) &&
+                Marshal.ReadIntPtr(vtable, 0x14) == IntPtr.Add(module, ControlResourceTag26RateRva) &&
+                Marshal.ReadIntPtr(vtable, 0x18) == IntPtr.Add(module, ControlResourceTag26UpdateRva),
+                "tag-26 factory keeps its native rate and update methods");
+            Expect(Marshal.ReadIntPtr(vtable, 0x1c) == IntPtr.Add(module, ControlResourceCommonSetterRva),
+                "tag-26 vtable uses the original common reader 0x21d50");
+            Expect(Marshal.ReadInt32(device, 0xa4) == 0, "tag-26 constructor initializes +0xa4 to zero");
+            // The full owner build path is outside this bounded callback fixture.
+            Marshal.WriteIntPtr(device, 0x3c, owner);
+            Marshal.WriteIntPtr(device, 0x44, IntPtr.Add(owner, 4));
+            Expect(Marshal.ReadInt32(device, 0x50) == 5, "tag-26 common setter preserves enabled default");
+            Expect(gate(device) == 0, "tag-26 provider gate is active");
+
+            IntPtr extra = fixture.Allocate(4);
+            Marshal.WriteInt32(extra, 0, FloatBits(0.3f));
+            byte setterResult = setSelector(IntPtr.Add(owner, 0x0c), 0, 0x500, extra);
+            Expect(setterResult == 1 && Marshal.ReadInt32(device, 0xa4) == FloatBits(0.3f),
+                "native selector 0x500 stores tag-26 extra rate");
+            float firstRate = rate(device, 0.5f);
+            Expect(FloatBits(firstRate) == FloatBits(-0.25f), "tag-26 rate adds +0xa4 before multiplying dt");
+            float orderingRate = rate(device, 0.7f);
+            Expect(unchecked((uint)FloatBits(orderingRate)) == 0xbeb33333u,
+                "native tag-26 f32 order rounds the sum before multiplying dt");
+            update(device, 0.5f, 0.375f);
+            Expect(Marshal.ReadInt32(device, 0x4c) == FloatBits(0.375f) &&
+                Marshal.ReadInt32(device, 0xa4) == FloatBits(0.3f),
+                "tag-26 update writes allocation multiplier and preserves extra rate");
+
+            IntPtr intoRecord = fixture.Allocate(0xb4);
+            Marshal.WriteInt32(intoRecord, 0, 26);
+            Marshal.WriteInt32(intoRecord, 0x18, -1);
+            Marshal.WriteInt32(intoRecord, 0x20, FloatBits(0.1f));
+            Expect(applyInto(owner, 0, intoRecord) == IntPtr.Add(intoRecord, 0xb4), "tag-26 INTO descriptor update");
+            Expect(Marshal.ReadInt32(device, 0xa4) == FloatBits(0.3f) &&
+                FloatBits(rate(device, 0.5f)) == FloatBits(-0.2f),
+                "common INTO setter preserves tag-26 +0xa4 across descriptor replacement");
+            Console.WriteLine("native-control-tag26-callbacks: controlHash=" + ExpectedControlSha256 +
+                " ctorExtra=0 setter500=1 extra=" + Hex(unchecked((uint)Marshal.ReadInt32(device, 0xa4))) +
+                " rateDt0.5=" + Hex(unchecked((uint)FloatBits(firstRate))) +
+                " rateDt0.7=" + Hex(unchecked((uint)FloatBits(orderingRate))) +
+                " updateMultiplier=" + Hex(unchecked((uint)Marshal.ReadInt32(device, 0x4c))) +
+                " intoRate=" + Hex(unchecked((uint)FloatBits(rate(device, 0.5f)))) +
+                " intoExtra=" + Hex(unchecked((uint)Marshal.ReadInt32(device, 0xa4))));
+
+            IntPtr otherTagRecord = fixture.Allocate(0xb4);
+            Marshal.WriteInt32(otherTagRecord, 0, 19);
+            Marshal.WriteInt32(otherTagRecord, 0x18, -1);
+            Marshal.WriteInt32(otherTagRecord, 0x20, FloatBits(0.2f));
+            applyInto(owner, 0, otherTagRecord);
+            byte otherTagSetter = setSelector(IntPtr.Add(owner, 0x0c), 0, 0x500, extra);
+            Expect(otherTagSetter == 0 &&
+                Marshal.ReadInt32(device, 0xa4) == FloatBits(0.3f),
+                "selector 0x500 returns no-result for a different current descriptor tag");
+            Console.WriteLine("native-control-tag26-setter: selector=0x500 tag26=" + setterResult +
+                " otherCurrentTag=" + otherTagSetter + " preservedExtra=" +
+                Hex(unchecked((uint)Marshal.ReadInt32(device, 0xa4))));
+
+            IntPtr budgetRecord = fixture.Allocate(0xb4);
+            Marshal.WriteInt32(budgetRecord, 0, 26);
+            Marshal.WriteInt32(budgetRecord, 0x18, -1);
+            Marshal.WriteInt32(budgetRecord, 0x20, FloatBits(0.2f));
+            applyInto(owner, 0, budgetRecord);
+
+            // The original factory-19 callbacks supply +0.125 against the
+            // original factory-26 demand -0.25; native dispatch allocates one
+            // half to tag26 and updates the generator reserve to 0.6875.
+            IntPtr producer = fixture.Allocate(0x94);
+            Expect(constructTag19(producer) == producer, "native tag-19 supplier constructor");
+            IntPtr producerVtable = Marshal.ReadIntPtr(producer);
+            Expect(producerVtable == IntPtr.Add(module, ControlResourceTag19VtableRva) &&
+                Marshal.ReadIntPtr(producerVtable, 0x14) == IntPtr.Add(module, 0x229a0) &&
+                Marshal.ReadIntPtr(producerVtable, 0x18) == IntPtr.Add(module, 0x22a60),
+                "native tag-19 supplier keeps its original rate and update callbacks");
+            Marshal.WriteIntPtr(producer, 0x3c, owner);
+            Marshal.WriteIntPtr(producer, 0x44, IntPtr.Add(owner, 4));
+            IntPtr producerRecord = fixture.Allocate(0xb4);
+            Marshal.WriteInt32(producerRecord, 0, 19);
+            Marshal.WriteInt32(producerRecord, 0x18, -1);
+            Marshal.WriteInt32(producerRecord, 0x20, FloatBits(0.625f));
+            Marshal.WriteInt32(producerRecord, 0x2c, FloatBits(1.0f));
+            Marshal.WriteIntPtr(devices, 0, producer);
+            Marshal.WriteIntPtr(devices, 4, device);
+            Marshal.WriteInt32(owner, 0x5c0, 2);
+            Expect(applyInto(owner, 0, producerRecord) == IntPtr.Add(producerRecord, 0xb4),
+                "native tag-19 supplier descriptor install");
+            Expect(gate(producer) == 0 && FloatBits(rate19(producer, 0.5f)) == FloatBits(0.125f),
+                "original tag-19 provider-backed supply is 0.125");
+
+            budgetStep(owner, 0.5f);
+            uint outputA = unchecked((uint)Marshal.ReadInt32(owner, 0x5dc));
+            uint outputB = unchecked((uint)Marshal.ReadInt32(owner, 0x5e0));
+            uint consumerScale = unchecked((uint)Marshal.ReadInt32(device, 0x4c));
+            uint producerScale = unchecked((uint)Marshal.ReadInt32(producer, 0x4c));
+            Console.WriteLine("native-control-tag26-budget: controlHash=" + ExpectedControlSha256 +
+                " factory=0x2d4b0 case26Ctor=0x20800 setter=0x2c2b0 rate=0x2e540 update=0x21890 budget=0x2d340" +
+                " provider=0.4 descriptorRate=0.2 extra=0.3 dt=0.5 producerSupply=0.125" +
+                " consumerAllocation=" + Float(ReadFloat(device, 0x4c)) +
+                " producerMultiplier=" + Float(ReadFloat(producer, 0x4c)) +
+                " outputs=" + Hex(outputA) + "," + Hex(outputB));
+            Expect(consumerScale == FloatBits(0.5f) && producerScale == FloatBits(0.6875f),
+                "native budget dispatcher allocates tag-26 demand against a category-1 supplier");
+            Expect(outputA == 0x80000000u && outputB == FloatBits(0.25f),
+                "native tag-26 mixed budget outputs use the scaled factory-26 rate");
+            GC.KeepAlive(setSelector);
+        }
+    }
     private static void RunNativeControlActivationCase(IntPtr module) {
         NativeControlOwnerConstructor construct = (NativeControlOwnerConstructor)Marshal.GetDelegateForFunctionPointer(
             IntPtr.Add(module, 0x31490), typeof(NativeControlOwnerConstructor));
@@ -3688,6 +3858,17 @@ internal static class BehaviorDistributorTickOracle {
         byte[] code = { 0x8b, 0x4c, 0x24, 0x04, 0x8b, 0x54, 0x24, 0x08, 0xff, 0x74, 0x24, 0x0c,
             0xb8, 0, 0, 0, 0, 0xff, 0xd0, 0xc2, 0x0c, 0x00 };
         WriteImm32(code, 13, fastcallTarget.ToInt32());
+        IntPtr thunk = IntPtr.Add(fastcallThunks, offset);
+        Marshal.Copy(code, 0, thunk, code.Length);
+        return thunk;
+    }
+    private static IntPtr WriteStdCallFourArgsToFastcallThunk(int offset, IntPtr fastcallTarget) {
+        // Adapt stdcall(owner, index, selector, value) to ECX=owner, EDX=index,
+        // stack(selector, value) for the native fastcall property setter.
+        byte[] code = { 0xff,0x74,0x24,0x10, 0xff,0x74,0x24,0x10,
+            0x8b,0x54,0x24,0x10, 0x8b,0x4c,0x24,0x0c,
+            0xb8,0,0,0,0, 0xff,0xd0, 0xc2,0x10,0x00 };
+        WriteImm32(code, 17, fastcallTarget.ToInt32());
         IntPtr thunk = IntPtr.Add(fastcallThunks, offset);
         Marshal.Copy(code, 0, thunk, code.Length);
         return thunk;

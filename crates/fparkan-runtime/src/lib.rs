@@ -201,6 +201,8 @@ pub struct EffectiveControlDevice {
     pub multiplier_bits: Option<u32>,
     /// Class-9-only scale used by its selector-0 getter.
     pub class9_selector0_scale_bits: Option<u32>,
+    /// Factory-26 mutable resource-rate addition at native `+0xa4`.
+    pub tag26_extra_rate_bits: Option<u32>,
     /// Six class-9 budget values at native `+0x98..+0xac`.
     pub class9_values_bits: Option<[u32; 6]>,
     /// Six accumulated class-9 changes at native `+0xb0..+0xc4`.
@@ -1973,8 +1975,9 @@ pub fn query_loaded_mission_control_resource(
 /// Queries one loaded Control device through its original factory getter.
 ///
 /// Selector `0xe00` is currently modeled for current descriptor tag 26 with
-/// factory tag 26. The loaded NDP provider value is its initial native state;
-/// later Control updates are not synchronized into this snapshot.
+/// factory tag 26. The query reads the current provider, coefficient, and
+/// multiplier in the CPU projection. Explicit Control update calls can change
+/// those values; the mission clock does not advance them automatically.
 ///
 /// # Errors
 /// Returns an error for an invalid handle, unavailable mission/table/provider,
@@ -1999,14 +2002,46 @@ pub fn query_loaded_mission_control_device_selector(
     query_control_device_table_selector(table, device_index, selector)
 }
 
+/// Sets a supported native Control device property.
+///
+/// Selector `0x500` writes the factory-26 resource-rate addition at `+0xa4`.
+/// A current descriptor tag other than 26 follows the native no-result path
+/// and returns `Ok(false)`; successful writes return `Ok(true)`.
+///
+/// # Errors
+/// Returns an error for an invalid handle, unavailable mission/table, an
+/// out-of-range device index, an unsupported selector/factory layout, or a
+/// non-finite, subnormal, or out-of-range float.
+pub fn set_loaded_mission_control_device_selector(
+    engine: &mut Engine,
+    handle: ObjectHandle,
+    device_index: usize,
+    selector: u32,
+    value: f32,
+) -> Result<bool, ControlResourceAccessError> {
+    transform_state(&engine.world, handle).map_err(ControlResourceAccessError::World)?;
+    let loaded = engine
+        .loaded
+        .as_mut()
+        .ok_or(ControlResourceAccessError::MissionUnavailable)?;
+    let table = loaded
+        .control_device_tables
+        .iter_mut()
+        .find(|table| table.handle == handle)
+        .ok_or(ControlResourceAccessError::ObjectUnavailable { handle })?;
+    set_control_device_table_selector(table, device_index, selector, value)
+}
+
 /// Queries the recovered Behavior resource selectors `0x1002` and `0x1005`.
 ///
 /// Selector `0x1005` returns the loaded profile's `Transfer_Power_Out` value.
 /// Selector `0x1002` sums supported Control `0xe00` results in native table
 /// order, rounding each addition to `f32`, then multiplies by the profile's
 /// `Transfer_Ore_OffBoard` value. Unsupported table/query paths return an error.
-/// Profile and provider values are initial full-load snapshots; later damage,
-/// Control updates, and profile changes are not synchronized into this state.
+/// Profile values come from full mission loading, while `0xe00` reads the
+/// current CPU-projected provider and device state. Explicit Control updates
+/// can therefore change `0x1002`; the mission clock does not update it
+/// automatically.
 ///
 /// # Errors
 /// Returns an error for an invalid handle, unavailable mission/profile/table,
@@ -2282,7 +2317,7 @@ pub fn distribute_loaded_mission_control_provider_amount(
 
 /// Runs the supported loaded Control resource-budget pass (`Control.dll+0x2d340`).
 ///
-/// The pass supports the original factory callbacks for tags 9, 15, and 19,
+/// The pass supports the original factory callbacks for tags 9, 15, 19, and 26,
 /// plus the generic default callback pair. Current descriptor category tags are
 /// supported for the native map prefix `0..=34`. This is an explicit CPU update;
 /// the mission clock does not call it yet. Rate outputs at `+0x5dc/+0x5e0` are
@@ -2929,7 +2964,7 @@ fn control_resource_budget_pass_inner(
     for index in 0..device_count {
         let device = control_budget_device(table, index)?;
         control_budget_category(device.descriptor.tag)?;
-        if !matches!(device.factory_tag, 9 | 15 | 19)
+        if !matches!(device.factory_tag, 9 | 15 | 19 | 26)
             && !control_factory_uses_generic_budget_callbacks(device.factory_tag)
         {
             return Err(ControlResourceAccessError::UnsupportedFactoryTag {
@@ -3288,6 +3323,22 @@ fn control_device_resource_rate(
                 -interval_rate,
                 -coefficient_cost,
             )
+        }
+        26 => {
+            let extra_rate =
+                control_device_float(device, device.tag26_extra_rate_bits, "tag-26 extra rate")?;
+            let rate = checked_control_sum(
+                device.factory_tag,
+                "tag-26 descriptor plus extra rate",
+                descriptor_rate,
+                extra_rate,
+            )?;
+            Ok(-checked_control_product(
+                device.factory_tag,
+                "tag-26 resource rate times interval",
+                rate,
+                delta_time_seconds,
+            )?)
         }
         19 => {
             let coefficient_0 = control_device_budget_coefficient(device, 0)?;
@@ -3663,6 +3714,7 @@ fn control_device_resource_update(
                 )?;
             }
         }
+        26 => set_control_device_multiplier(table, device_index, allocation)?,
         factory_tag if control_factory_uses_generic_budget_callbacks(factory_tag) => {
             set_control_device_multiplier(table, device_index, allocation)?;
         }
@@ -4064,6 +4116,50 @@ fn query_control_device_table_selector(
         multiplier,
     )
     .map(Some)
+}
+
+fn set_control_device_table_selector(
+    table: &mut MissionControlDeviceTableState,
+    device_index: usize,
+    selector: u32,
+    value: f32,
+) -> Result<bool, ControlResourceAccessError> {
+    if selector != 0x500 {
+        return Err(ControlResourceAccessError::UnsupportedSelector(selector));
+    }
+    let devices = match &table.status {
+        MissionControlDeviceTableStatus::Available(devices) => devices,
+        MissionControlDeviceTableStatus::Unavailable(reason) => {
+            return Err(ControlResourceAccessError::TableUnavailable(reason.clone()))
+        }
+    };
+    let device =
+        devices
+            .get(device_index)
+            .ok_or(ControlResourceAccessError::DeviceIndexOutOfRange {
+                device_index,
+                device_count: devices.len(),
+            })?;
+    if device.descriptor.tag != 26 {
+        return Ok(false);
+    }
+    if device.factory_tag != 26 {
+        return Err(ControlResourceAccessError::UnsupportedFactoryTag {
+            factory_tag: device.factory_tag,
+        });
+    }
+    if device.tag26_extra_rate_bits.is_none() {
+        return Err(ControlResourceAccessError::UnsupportedField {
+            factory_tag: device.factory_tag,
+            field: "tag-26 extra rate +0xa4",
+        });
+    }
+    let value = checked_control_float(device.factory_tag, "tag-26 extra rate", value)?;
+    let MissionControlDeviceTableStatus::Available(devices) = &mut table.status else {
+        unreachable!("table status validated before mutation");
+    };
+    devices[device_index].tag26_extra_rate_bits = Some(value.to_bits());
+    Ok(true)
 }
 
 fn query_behavior_profile_ore_rate(
@@ -4946,6 +5042,7 @@ fn append_effective_control_device(
         coefficient_bits,
         multiplier_bits,
         class9_selector0_scale_bits: (descriptor.tag == 9).then_some(0x3f80_0000),
+        tag26_extra_rate_bits: (descriptor.tag == 26).then_some(0),
         class9_values_bits: (descriptor.tag == 9).then_some([0x3f80_0000; 6]),
         class9_deltas_bits: (descriptor.tag == 9).then_some([0; 6]),
         native_word_50_bits,
@@ -4979,7 +5076,7 @@ fn control_factory_uses_generic_budget_callbacks(factory_tag: u32) -> bool {
 }
 
 fn control_factory_override_is_supported(factory_tag: u32) -> bool {
-    !matches!(factory_tag, 1 | 17 | 26 | 30)
+    !matches!(factory_tag, 1 | 17 | 30)
 }
 
 fn native_control_factory_defaults(factory_tag: u32) -> (Option<u32>, Option<u32>) {
@@ -6259,6 +6356,7 @@ mod tests {
             coefficient_bits: Some(coefficients),
             multiplier_bits,
             class9_selector0_scale_bits: class9_scale_bits,
+            tag26_extra_rate_bits: (factory_tag == 26).then_some(0),
             class9_values_bits: (factory_tag == 9).then_some([0x3f80_0000; 6]),
             class9_deltas_bits: (factory_tag == 9).then_some([0; 6]),
             native_word_50_bits,
@@ -6677,6 +6775,262 @@ mod tests {
                 "factory {factory_tag}"
             );
         }
+    }
+
+    #[test]
+    fn control_budget_tag26_rate_matches_native_additive_cost() {
+        let mut device = synthetic_effective_control_device(
+            26,
+            26,
+            1.0_f32.to_bits(),
+            Some(1.0_f32.to_bits()),
+            None,
+        );
+        device.key = 0;
+        device.descriptor.fixed_words[8] = 0.2_f32.to_bits();
+        device.tag26_extra_rate_bits = Some(0.3_f32.to_bits());
+        let provider = synthetic_node_provider_row(0, 0, 0.4_f32.to_bits());
+        let table = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(vec![device.clone()]),
+            MissionControlNodeProviderTableStatus::Available(vec![provider]),
+        );
+
+        assert_eq!(
+            control_device_resource_rate(&table, &device, 0.5)
+                .expect("tag-26 resource rate")
+                .to_bits(),
+            (-0.25_f32).to_bits()
+        );
+        assert_eq!(
+            control_device_resource_rate(&table, &device, 0.7)
+                .expect("tag-26 fadd-before-fmul vector")
+                .to_bits(),
+            0xbeb3_3333
+        );
+    }
+
+    #[test]
+    fn control_budget_tag26_factory_defaults_and_into_preserve_extra_rate() {
+        let mut device = synthetic_effective_control_device(
+            26,
+            26,
+            1.0_f32.to_bits(),
+            Some(1.0_f32.to_bits()),
+            None,
+        );
+        assert_eq!(device.tag26_extra_rate_bits, Some(0));
+        device.tag26_extra_rate_bits = Some(0.3_f32.to_bits());
+
+        let replacement = synthetic_control_record(19, 99, 0x30, None);
+        let control = synthetic_component_control(
+            1,
+            vec![replacement.clone()],
+            PreparedControlEffectSection::Parsed(Vec::new()),
+        );
+        apply_effective_control_override(&mut device, &replacement, 1, 0, &control);
+
+        assert_eq!(device.factory_tag, 26);
+        assert_eq!(device.descriptor.tag, 19);
+        assert_eq!(device.tag26_extra_rate_bits, Some(0.3_f32.to_bits()));
+    }
+
+    #[test]
+    fn control_budget_tag26_gate_returns_zero_before_provider_and_rate_reads() {
+        let mut device = synthetic_effective_control_device(
+            26,
+            26,
+            1.0_f32.to_bits(),
+            Some(1.0_f32.to_bits()),
+            None,
+        );
+        device.key = 9;
+        let mut table = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(vec![device.clone()]),
+            MissionControlNodeProviderTableStatus::Available(Vec::new()),
+        );
+
+        device.native_word_50_bits = Some(0);
+        assert_eq!(
+            control_device_resource_rate(&table, &device, 0.5).expect("disabled tag-26 gate"),
+            0.0
+        );
+
+        device.native_word_50_bits = Some(5);
+        device.key = 0;
+        let mut zero_provider = synthetic_node_provider_row(0, 0, 0.0_f32.to_bits());
+        zero_provider.current_type1_value_bits = 0.0_f32.to_bits();
+        table.node_provider_status =
+            MissionControlNodeProviderTableStatus::Available(vec![zero_provider]);
+        assert_eq!(
+            control_device_resource_rate(&table, &device, 0.5).expect("zero provider tag-26 gate"),
+            0.0
+        );
+    }
+
+    #[test]
+    fn control_device_selector_500_sets_only_matching_factory26_extra_rate() {
+        let device = synthetic_effective_control_device(
+            26,
+            26,
+            1.0_f32.to_bits(),
+            Some(1.0_f32.to_bits()),
+            None,
+        );
+        let mut table =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                device,
+            ]));
+        assert_eq!(
+            set_control_device_table_selector(&mut table, 0, 0x500, 0.25),
+            Ok(true)
+        );
+        let MissionControlDeviceTableStatus::Available(devices) = &table.status else {
+            unreachable!();
+        };
+        assert_eq!(devices[0].tag26_extra_rate_bits, Some(0.25_f32.to_bits()));
+
+        let mut other_current_tag =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                synthetic_effective_control_device(
+                    26,
+                    19,
+                    1.0_f32.to_bits(),
+                    Some(1.0_f32.to_bits()),
+                    None,
+                ),
+            ]));
+        assert_eq!(
+            set_control_device_table_selector(&mut other_current_tag, 0, 0x500, 0.5),
+            Ok(false)
+        );
+        let MissionControlDeviceTableStatus::Available(devices) = &other_current_tag.status else {
+            unreachable!();
+        };
+        assert_eq!(devices[0].tag26_extra_rate_bits, Some(0));
+
+        let mut wrong_factory =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                synthetic_effective_control_device(
+                    9,
+                    26,
+                    1.0_f32.to_bits(),
+                    Some(1.0_f32.to_bits()),
+                    None,
+                ),
+            ]));
+        let wrong_factory_before = wrong_factory.clone();
+        assert_eq!(
+            set_control_device_table_selector(&mut wrong_factory, 0, 0x500, 0.5),
+            Err(ControlResourceAccessError::UnsupportedFactoryTag { factory_tag: 9 })
+        );
+        assert_eq!(wrong_factory, wrong_factory_before);
+
+        let before_bad_index = table.clone();
+        assert_eq!(
+            set_control_device_table_selector(&mut table, 1, 0x500, 0.5),
+            Err(ControlResourceAccessError::DeviceIndexOutOfRange {
+                device_index: 1,
+                device_count: 1,
+            })
+        );
+        assert_eq!(table, before_bad_index);
+
+        for (selector, value, expected) in [
+            (
+                0x501,
+                0.5,
+                ControlResourceAccessError::UnsupportedSelector(0x501),
+            ),
+            (
+                0x500,
+                f32::NAN,
+                ControlResourceAccessError::NonFiniteValue {
+                    factory_tag: 26,
+                    field: "tag-26 extra rate",
+                },
+            ),
+            (
+                0x500,
+                f32::from_bits(1),
+                ControlResourceAccessError::SubnormalValue {
+                    factory_tag: 26,
+                    field: "tag-26 extra rate",
+                },
+            ),
+        ] {
+            let before = table.clone();
+            assert_eq!(
+                set_control_device_table_selector(&mut table, 0, selector, value),
+                Err(expected)
+            );
+            assert_eq!(table, before);
+        }
+    }
+
+    #[test]
+    fn control_budget_tag26_update_uses_native_allocation_multiplier() {
+        let mut device = synthetic_effective_control_device(
+            26,
+            26,
+            1.0_f32.to_bits(),
+            Some(1.0_f32.to_bits()),
+            None,
+        );
+        device.key = 0;
+        let provider = synthetic_node_provider_row(0, 0, 0.4_f32.to_bits());
+        let mut table = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(vec![device]),
+            MissionControlNodeProviderTableStatus::Available(vec![provider]),
+        );
+
+        control_device_resource_update(&mut table, 0, 0.5, 0.375)
+            .expect("tag-26 allocation update");
+
+        let MissionControlDeviceTableStatus::Available(devices) = &table.status else {
+            unreachable!();
+        };
+        assert_eq!(devices[0].multiplier_bits, Some(0x3ec0_0000));
+    }
+
+    #[test]
+    fn control_budget_dispatch_matches_tag26_supply_and_demand() {
+        let mut producer = synthetic_effective_control_device(
+            19,
+            19,
+            1.0_f32.to_bits(),
+            Some(1.0_f32.to_bits()),
+            None,
+        );
+        producer.key = 0;
+        producer.descriptor.fixed_words[8] = 0.625_f32.to_bits();
+
+        let mut consumer = synthetic_effective_control_device(
+            26,
+            26,
+            1.0_f32.to_bits(),
+            Some(1.0_f32.to_bits()),
+            None,
+        );
+        consumer.key = 0;
+        consumer.descriptor.fixed_words[8] = 0.2_f32.to_bits();
+        consumer.tag26_extra_rate_bits = Some(0.3_f32.to_bits());
+
+        let provider = synthetic_node_provider_row(0, 0, 0.4_f32.to_bits());
+        let mut table = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(vec![producer, consumer]),
+            MissionControlNodeProviderTableStatus::Available(vec![provider]),
+        );
+
+        control_resource_budget_pass(&mut table, 0.5)
+            .expect("tag-26 demand is covered by the tag-19 supply");
+
+        let MissionControlDeviceTableStatus::Available(devices) = &table.status else {
+            unreachable!();
+        };
+        assert_eq!(devices[0].multiplier_bits, Some(0x3f30_0000));
+        assert_eq!(devices[1].multiplier_bits, Some(0x3f00_0000));
+        assert_eq!(table.current_output_rate_5dc_bits, 0x8000_0000);
+        assert_eq!(table.current_output_rate_5e0_bits, 0x3e80_0000);
     }
 
     #[test]
@@ -7260,6 +7614,10 @@ mod tests {
             Err(ControlResourceAccessError::MissionUnavailable)
         );
         assert_eq!(
+            set_loaded_mission_control_device_selector(&mut engine, handle, 0, 0x500, 0.25),
+            Err(ControlResourceAccessError::MissionUnavailable)
+        );
+        assert_eq!(
             query_loaded_mission_behavior_resource(&engine, handle, 0x1005),
             Err(ControlResourceAccessError::MissionUnavailable)
         );
@@ -7319,6 +7677,12 @@ mod tests {
             ))
         );
         assert_eq!(
+            set_loaded_mission_control_device_selector(&mut engine, invalid, 0, 0x500, 0.25),
+            Err(ControlResourceAccessError::World(
+                fparkan_world::WorldError::InvalidHandle
+            ))
+        );
+        assert_eq!(
             query_loaded_mission_control_resource(&engine, stale, 1),
             Err(ControlResourceAccessError::World(
                 fparkan_world::WorldError::StaleHandle
@@ -7332,6 +7696,12 @@ mod tests {
         );
         assert_eq!(
             query_loaded_mission_control_device_selector(&engine, stale, 0, 0xe00),
+            Err(ControlResourceAccessError::World(
+                fparkan_world::WorldError::StaleHandle
+            ))
+        );
+        assert_eq!(
+            set_loaded_mission_control_device_selector(&mut engine, stale, 0, 0x500, 0.25),
             Err(ControlResourceAccessError::World(
                 fparkan_world::WorldError::StaleHandle
             ))
@@ -8253,6 +8623,7 @@ mod tests {
             (13, 5),
             (21, 5),
             (25, 5),
+            (26, 5),
             (27, 0),
         ] {
             let mut root = synthetic_control_record(factory_tag, 2, 0x20, None);
@@ -8290,12 +8661,15 @@ mod tests {
             assert_eq!(device.multiplier_bits, Some(1.0_f32.to_bits()));
             assert_eq!(device.native_word_50_bits, Some(word_50));
             assert_eq!(device.coefficient_bits.unwrap()[0], 0x30);
+            if factory_tag == 26 {
+                assert_eq!(device.tag26_extra_rate_bits, Some(0));
+            }
             if factory_tag == 9 {
                 assert_eq!(device.class9_values_bits, Some([0x3f80_0000; 6]));
                 assert_eq!(device.class9_deltas_bits, Some([0; 6]));
             }
         }
-        for factory_tag in [1, 17, 26, 30] {
+        for factory_tag in [1, 17, 30] {
             assert!(!control_factory_override_is_supported(factory_tag));
         }
     }
@@ -9441,6 +9815,7 @@ mod tests {
             Some([0x3f80_0000; 6])
         );
         assert_eq!(mine_control_devices[2].class9_deltas_bits, Some([0; 6]));
+        assert_eq!(mine_control_devices[8].tag26_extra_rate_bits, Some(0));
         assert_eq!(
             advance_loaded_mission_control_budget(&mut mine_engine, mine_control_handle, f32::NAN),
             Err(ControlResourceAccessError::NonFiniteValue {
@@ -9449,13 +9824,37 @@ mod tests {
             })
         );
         assert_eq!(
-            advance_loaded_mission_control_budget(&mut mine_engine, mine_control_handle, 0.5),
-            Err(ControlResourceAccessError::UnsupportedFactoryTag { factory_tag: 26 })
-        );
-        assert_eq!(
             loaded_mission_control_device_tables(&mine_engine),
             Some(mine_control_before.as_slice())
         );
+        advance_loaded_mission_control_budget(&mut mine_engine, mine_control_handle, 0.5)
+            .expect("whole licensed mine table passes supported Control budget callbacks");
+        let mine_control_after = loaded_mission_control_device_tables(&mine_engine)
+            .expect("licensed mine Control table after budget pass");
+        let mine_table_after = &mine_control_after[0];
+        let MissionControlDeviceTableStatus::Available(mine_devices_after) =
+            &mine_table_after.status
+        else {
+            panic!("licensed mine table became unavailable after budget pass");
+        };
+        let mine_multipliers = mine_devices_after
+            .iter()
+            .map(|device| device.multiplier_bits.map(|bits| format!("{bits:08x}")))
+            .collect::<Vec<_>>();
+        println!(
+            "licensed mine full Control budget: devices={} outputs={:08x},{:08x} multipliers={mine_multipliers:?} tag26Extra={:?}",
+            mine_devices_after.len(),
+            mine_table_after.current_output_rate_5dc_bits,
+            mine_table_after.current_output_rate_5e0_bits,
+            mine_devices_after[8].tag26_extra_rate_bits,
+        );
+        assert_eq!(mine_devices_after.len(), 11);
+        assert_eq!(mine_devices_after[8].tag26_extra_rate_bits, Some(0));
+        assert_eq!(mine_table_after.current_output_rate_5dc_bits, 0x3c23_d70a);
+        assert_eq!(mine_table_after.current_output_rate_5e0_bits, 0x3c23_d70a);
+        assert_eq!(mine_devices_after[0].multiplier_bits, Some(0x3f7f_d70a));
+        assert_eq!(mine_devices_after[1].multiplier_bits, Some(0x3f7f_d70a));
+        assert_ne!(mine_control_after, mine_control_before.as_slice());
 
         let draft = &loaded_mission_object_drafts(&engine).expect("object drafts")[0];
         assert_eq!(draft.unit_components.len(), 6);
