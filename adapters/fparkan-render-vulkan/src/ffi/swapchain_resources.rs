@@ -922,8 +922,17 @@ fn create_texture_descriptor_bundle(
     Ok((layout, pool, descriptor_sets, sampler))
 }
 
-fn extent_component_to_f32(value: u32) -> f32 {
-    value as f32
+pub(super) fn draw_viewport(extent: (u32, u32), material_mode: f32) -> vk::Viewport {
+    // Ngi32 RVA 0x7170 maps world depth to 0.1..0.99; TL and sky depth bypass it.
+    let explicit_depth = material_mode.round() as u32 & 12 != 0;
+    vk::Viewport {
+        x: 0.0,
+        y: 0.0,
+        width: extent.0 as f32,
+        height: extent.1 as f32,
+        min_depth: if explicit_depth { 0.0 } else { 0.1 },
+        max_depth: if explicit_depth { 1.0 } else { 0.99 },
+    }
 }
 
 fn create_graphics_pipeline_cache(
@@ -1033,14 +1042,7 @@ fn create_graphics_pipeline(
     let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::default()
         .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
         .primitive_restart_enable(false);
-    let viewports = [vk::Viewport {
-        x: 0.0,
-        y: 0.0,
-        width: extent_component_to_f32(extent.0),
-        height: extent_component_to_f32(extent.1),
-        min_depth: 0.0,
-        max_depth: 1.0,
-    }];
+    let viewports = [draw_viewport(extent, 0.0)];
     let scissors = [vk::Rect2D {
         offset: vk::Offset2D { x: 0, y: 0 },
         extent: vk::Extent2D {
@@ -1105,6 +1107,9 @@ fn create_graphics_pipeline(
     let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
         .logic_op_enable(false)
         .attachments(&color_blend_attachments);
+    let dynamic_states = [vk::DynamicState::VIEWPORT];
+    let dynamic_state =
+        vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
     let create_info = vk::GraphicsPipelineCreateInfo::default()
         .stages(&shader_stages)
         .vertex_input_state(&vertex_input_state)
@@ -1114,6 +1119,7 @@ fn create_graphics_pipeline(
         .multisample_state(&multisample_state)
         .depth_stencil_state(&depth_stencil_state)
         .color_blend_state(&color_blend_state)
+        .dynamic_state(&dynamic_state)
         .layout(pipeline_layout)
         .render_pass(render_pass)
         .subpass(0);
@@ -1325,6 +1331,42 @@ fn destroy_partial_swapchain_resources(
         if let Some(buffer) = partial.point_light_buffer {
             device.device().destroy_buffer(buffer.buffer, None);
             device.device().free_memory(buffer.memory, None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::draw_viewport;
+
+    #[test]
+    fn world_viewport_depth_keeps_distant_geometry_in_front_of_screen_sun() {
+        let projection = fparkan_render::LegacyD3d7Projection {
+            viewport: [0, 0, 1280, 1024],
+            near_plane: 0.5,
+            far_plane: 700.0,
+            field_of_view_radians: 1.04,
+        }
+        .try_direct3d7_projection_row_major()
+        .expect("native projection");
+        for mode in [0.0, 1.0, 2.0, 3.0, 16.0, 17.0] {
+            let viewport = draw_viewport((1280, 1024), mode);
+            assert_eq!([viewport.width, viewport.height], [1280.0, 1024.0]);
+            assert_eq!([viewport.min_depth, viewport.max_depth], [0.1, 0.99]);
+            for distance in [0.5, 100.0, 350.0, 600.0, 700.0] {
+                let clip_z = distance * projection[10] + projection[14];
+                let clip_w = distance * projection[11];
+                let depth = viewport.min_depth
+                    + (viewport.max_depth - viewport.min_depth) * (clip_z / clip_w);
+                assert!(
+                    depth < 0.999,
+                    "mode {mode}, distance {distance}, depth {depth}"
+                );
+            }
+        }
+        for mode in [4.0, 5.0, 6.0, 7.0, 9.0] {
+            let viewport = draw_viewport((640, 480), mode);
+            assert_eq!([viewport.min_depth, viewport.max_depth], [0.0, 1.0]);
         }
     }
 }

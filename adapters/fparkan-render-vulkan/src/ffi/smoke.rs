@@ -1808,6 +1808,7 @@ impl VulkanSmokeRenderer {
                 0,
                 vk::IndexType::UINT32,
             );
+            let mut viewport_depth = None;
             for &range_index in &self.draw_order {
                 let range = self.draw_ranges.get(range_index).ok_or(
                     VulkanSmokeRendererError::InvariantViolation {
@@ -1929,6 +1930,17 @@ impl VulkanSmokeRenderer {
                 } else {
                     *material_mode
                 };
+                let viewport = super::swapchain_resources::draw_viewport(
+                    swapchain.report.plan.extent,
+                    material_mode,
+                );
+                let next_viewport_depth = [viewport.min_depth, viewport.max_depth];
+                if viewport_depth != Some(next_viewport_depth) {
+                    device
+                        .device()
+                        .cmd_set_viewport(command_buffer, 0, &[viewport]);
+                    viewport_depth = Some(next_viewport_depth);
+                }
                 let material_mode = [material_mode.to_ne_bytes()];
                 device.device().cmd_push_constants(
                     command_buffer,
