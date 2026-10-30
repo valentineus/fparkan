@@ -979,6 +979,142 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the original GOG installation"]
+    fn original_tree_ray_58_matches_native_type1_geometry_samples() {
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT")
+            .expect("set FPARKAN_CORPUS_PART1_ROOT to the original GOG installation");
+        let bytes = std::fs::read(std::path::Path::new(&root).join("effects.rlb"))
+            .expect("read effects.rlb");
+        let archive = fparkan_nres::decode(bytes.into(), fparkan_nres::ReadProfile::Compatible)
+            .expect("decode effects.rlb");
+        let entry = archive.find("tree_ray_58").expect("tree_ray_58 FXID");
+        let document = crate::decode_fxid(
+            archive
+                .payload(entry)
+                .expect("FXID payload")
+                .to_vec()
+                .into(),
+        )
+        .expect("decode tree_ray_58");
+        assert_eq!(document.header().time_mode, 2);
+        assert_eq!(document.header().duration_seconds, 3.0);
+        assert_eq!(document.commands().len(), 3);
+
+        let parent = [
+            [0.999_924_123, 0.012_319_660, 0.0, 386.673_400_879],
+            [-0.012_319_660, 0.999_924_123, 0.0, 603.692_321_777],
+            [0.0, 0.0, 1.0, 180.414_703_369],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let center = [390.273_132, 603.647_949, 180.414_703];
+        // Original GOG Effect.dll RVA 0x93D0, x87 CW 0x007F; Rust-sampled keys are supplied separately.
+        let native_samples = [
+            (
+                0,
+                "defl_y_add",
+                [0.0, 35.0, 22.0],
+                [
+                    [386.280, 604.229_431, 179.568_024],
+                    [386.266_876, 603.165_039, 181.261_383],
+                    [394.266_266, 603.066_467, 181.261_383],
+                    [394.279_4, 604.130_859, 179.568_024],
+                ],
+            ),
+            (
+                0,
+                "defl_y_add",
+                [20.0, -30.0, 15.0],
+                [
+                    [386.279, 604.147_4, 181.307_663],
+                    [386.267_883, 603.247_1, 179.521_744],
+                    [394.267_273, 603.148_5, 179.521_744],
+                    [394.278_381, 604.048_8, 181.307_663],
+                ],
+            ),
+            (
+                1,
+                "defl_y1_add",
+                [0.0, 35.0, 22.0],
+                [
+                    [386.276_7, 603.963_3, 179.991_364],
+                    [386.270_172, 603.431_152, 180.838_043],
+                    [394.269_562, 603.332_6, 180.838_043],
+                    [394.276_1, 603.864_746, 179.991_364],
+                ],
+            ),
+        ];
+        for (command_index, material_name, camera_offset, expected_vertices) in native_samples {
+            let camera = std::array::from_fn(|axis| center[axis] + camera_offset[axis]);
+            let frame = evaluate_op3_type1_command(
+                &document.commands()[command_index],
+                command_index,
+                &parent,
+                0.0,
+                0.0,
+                camera,
+            )
+            .expect("active tree ray quad");
+            assert_eq!(frame.material.name, material_name);
+            for (actual, expected) in frame
+                .vertices
+                .iter()
+                .flatten()
+                .zip(expected_vertices.iter().flatten())
+            {
+                assert!(
+                    (actual - expected).abs() < 0.001,
+                    "native sample vertex mismatch: {actual} vs {expected}"
+                );
+            }
+        }
+
+        for (command_index, material_name) in [(0, "defl_y_add"), (1, "defl_y1_add")] {
+            let command = &document.commands()[command_index];
+            assert_eq!(command.opcode, FxOpcode::Op3);
+            assert_eq!(
+                read_u32(&command.raw_body, 0),
+                Some(TYPE1_BODY_DISCRIMINATOR)
+            );
+            let camera_offsets = [[0.0, 35.0, 22.0], [20.0, -30.0, 15.0], [-25.0, 18.0, 10.0]];
+            for elapsed in [0.0_f32, 0.375, 0.75, 1.5, 2.25, 2.999, 3.125] {
+                let phase = elapsed.rem_euclid(3.0) / 3.0;
+                for camera_offset in camera_offsets {
+                    let camera = std::array::from_fn(|axis| center[axis] + camera_offset[axis]);
+                    let frame = evaluate_op3_type1_command(
+                        command,
+                        command_index,
+                        &parent,
+                        elapsed,
+                        phase,
+                        camera,
+                    )
+                    .expect("active tree ray quad");
+                    assert_eq!(frame.material.name, material_name);
+                    assert!(frame.active);
+                    let actual_center: [f32; 3] = std::array::from_fn(|axis| {
+                        frame
+                            .vertices
+                            .iter()
+                            .map(|vertex| vertex[axis])
+                            .sum::<f32>()
+                            * 0.25
+                    });
+                    for axis in 0..3 {
+                        assert!((actual_center[axis] - center[axis]).abs() < 0.001);
+                    }
+                    let authored_axis_edge: [f32; 3] = std::array::from_fn(|axis| {
+                        frame.vertices[2][axis] - frame.vertices[1][axis]
+                    });
+                    let native_axis_edge = [7.999_393, -0.098_557_28, 0.0];
+                    for axis in 0..3 {
+                        assert!((authored_axis_edge[axis] - native_axis_edge[axis]).abs() < 0.001);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn rejects_truncated_bodies_and_non_finite_tracks_or_inputs() {
         let identity = [
             [1.0, 0.0, 0.0, 0.0],
