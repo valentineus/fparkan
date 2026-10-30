@@ -12283,7 +12283,7 @@ mod tests {
                     name_raw: b"Init\0".to_vec(),
                     event_word: 0x1234_5678,
                     instructions: vec![fparkan_script::ScriptInstruction {
-                        header_words: [19, u32::MAX, u32::MAX, 0, 0, 3, 0],
+                        header_words: [19, u32::MAX, u32::MAX, u32::MAX, 6, 3, u32::MAX],
                         references: vec![0, 1, 2],
                     }],
                 }],
@@ -12370,7 +12370,7 @@ mod tests {
                 event_word: 0x1234,
                 instructions: vec![
                     fparkan_script::ScriptInstruction {
-                        header_words: [19, u32::MAX, u32::MAX, 0, 0, 3, 0],
+                        header_words: [19, u32::MAX, u32::MAX, u32::MAX, 6, 3, u32::MAX],
                         references: vec![0, 1, 2],
                     },
                     fparkan_script::ScriptInstruction {
@@ -12784,11 +12784,24 @@ mod tests {
         assert_eq!(loaded.script_bundle_count, 2);
         assert_eq!(loaded.script_init_state_count, 2);
         assert_eq!(loaded.script_varset_state_count, 2);
-        assert!(loaded_mission_script_bundles(&engine)
-            .expect("script bundles")
-            .iter()
-            .all(|bundle| bundle.init_execution
-                == MissionScriptInitExecution::Executed { event_index: 0 }));
+        let script_bundles = loaded_mission_script_bundles(&engine).expect("script bundles");
+        assert_eq!(script_bundles.len(), 2);
+        assert!(script_bundles.iter().all(|bundle| bundle.init_execution
+            == MissionScriptInitExecution::Executed { event_index: 0 }));
+        for bundle in script_bundles {
+            let init = bundle
+                .package
+                .events
+                .iter()
+                .find(|event| event.name_raw.split(|byte| *byte == 0).next() == Some(&b"Init"[..]))
+                .expect("first Init event");
+            let instruction = init.instructions.first().expect("Handler(19) action");
+            assert_eq!(
+                instruction.header_words,
+                [19, u32::MAX, u32::MAX, u32::MAX, 6, 3, u32::MAX]
+            );
+            assert_eq!(instruction.references.as_slice(), &[224, 225, 226]);
+        }
         assert_eq!(engine.behavior_rng_state, 0xc823_f683);
         assert_eq!(
             loaded_mission_script_bundles(&engine)
@@ -13755,6 +13768,16 @@ mod tests {
                 )
             })
             .expect("campaign package with an unsupported Init instruction");
+        assert_eq!(
+            &unsupported.init_execution,
+            &MissionScriptInitExecution::Unsupported {
+                event_index: 0,
+                instruction_index: 1,
+                error: Handler19ResolveError::UnsupportedSelector {
+                    found: fparkan_script::ScriptDispatchSelector::Sentinel,
+                },
+            }
+        );
         let clan_index = unsupported.clan_index;
         let states = loaded_mission_script_init_states(&engine).expect("Init writes");
         assert!(states.iter().all(|state| state.clan_index != clan_index));

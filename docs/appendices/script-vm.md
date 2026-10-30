@@ -16,7 +16,8 @@ handlers, второй — числом event records. Каждый event хра
 `name_len + 1` raw bytes с обязательным NUL, opaque event word и count вложенных
 records. Вложенный record сохраняет семь `u32` header words (в disk order),
 список `u32` references после шестого header word и trailing seventh word.
-Никакой из этих words ещё не получает semantic name. `.fml` — текстовый
+Семантика остальных слов остаётся открытой; поля control и result-save описаны
+в узком `Init` contract ниже. `.fml` — текстовый
 symbol/formula oracle; `varset.var` задаёт `VAR(...)`/`STRING(...)` defaults.
 `fparkan-script::parse_varset` уже читает подтверждённые numeric
 `VAR(float|DWORD, name, default)` declarations byte-safe (comments остаются
@@ -302,10 +303,21 @@ image base `0x10000000`. В ней `FUN_10011f40` (RVA `0x11f40`) ищет им�
 `FUN_10011f10` передаёт выбранный индекс внутреннему циклу `FUN_10011fb0`
 (RVA `0x11fb0`). Цикл начинает с первой вложенной инструкции, сбрасывает индекс
 инструкции и глубину стека условий, затем идёт по записям в порядке файла.
-В исходном `default.scr` событие `Init` содержит одну инструкцию selector `19`,
-control word `0xffffffff` (действие) и result reference `0xffffffff` (результат
-не сохраняется). Это наблюдаемая форма пакета; поведение оригинала для остальных
-форм здесь не утверждается.
+Читатель `FUN_10011b20` (RVA `0x11b20`) переставляет семь disk header words в
+runtime record: `[0, 1, 2, 3, 4, 5, 6]` переходят в offsets
+`[+0, +8, +0x0c, +4, +0x10, +0x18, +0x1c]`; указатель references лежит в `+0x14`.
+Исполнитель `FUN_10012020` (RVA `0x12020`) берёт control из runtime `+0x04`, то
+есть из `header_words[3]`, а result-save reference — из runtime `+0x08`, то есть
+из `header_words[1]`. Disk word `header_words[2]` попадает в `+0x0c` и участвует
+в особой ветви selector `-1`, но не является result-save полем `Handler(19)`.
+
+В исходном `default.scr` событие `Init` содержит действие selector `19` с
+заголовком `[19, 0xffffffff, 0xffffffff, 0xffffffff, 6, 3, 0xffffffff]` и
+references `224, 225, 226`. Для этого действия `header_words[3] = 0xffffffff`
+(action control), а `header_words[1] = 0xffffffff` (результат не сохраняется).
+Одинаковое значение в `header_words[2]` — лишь содержимое этой записи, оно не
+проверяется guard-ом `Handler(19)`. Это наблюдаемая форма пакета; поведение
+оригинала для остальных форм здесь не утверждается.
 
 В GOG `default.scr` события `Init` в двух AutoDemo bundles имеют по одной такой
 инструкции. Её ссылки `224`, `225`, `226` ведут к объявлениям `DWORD`

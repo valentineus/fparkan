@@ -205,12 +205,12 @@ pub enum Handler19ResolveError {
     },
     /// Only action instructions with control word `0xffff_ffff` are supported.
     UnsupportedControlWord {
-        /// Opaque control word from instruction header word one.
+        /// Opaque control word from disk-order header index 3.
         found: u32,
     },
     /// Only instructions with no result-save reference are supported.
     UnsupportedResultSave {
-        /// Opaque variable reference from instruction header word two.
+        /// Opaque variable reference from disk-order header index 1.
         found: u32,
     },
     /// One of the three required references was absent.
@@ -637,14 +637,14 @@ impl VarSet {
         if selector != ScriptDispatchSelector::Handler(19) {
             return Err(Handler19ResolveError::UnsupportedSelector { found: selector });
         }
-        if instruction.header_words[1] != u32::MAX {
+        if instruction.header_words[3] != u32::MAX {
             return Err(Handler19ResolveError::UnsupportedControlWord {
-                found: instruction.header_words[1],
+                found: instruction.header_words[3],
             });
         }
-        if instruction.header_words[2] != u32::MAX {
+        if instruction.header_words[1] != u32::MAX {
             return Err(Handler19ResolveError::UnsupportedResultSave {
-                found: instruction.header_words[2],
+                found: instruction.header_words[1],
             });
         }
         self.resolve_handler19(instruction, input)
@@ -1688,7 +1688,7 @@ STRING( 8, ignored, ignored, ignored)\r\n";
         let varset = parse_varset(b"VAR( DWORD, x, 0)\nVAR( DWORD, y, 0)\nVAR( DWORD, id, 0)\n")
             .expect("DWORD targets");
         let action = |references: Vec<u32>| ScriptInstruction {
-            header_words: [19, u32::MAX, u32::MAX, 0, 0, 3, 0],
+            header_words: [19, u32::MAX, u32::MAX, u32::MAX, 6, 3, u32::MAX],
             references,
         };
         let package = ScriptPackage {
@@ -1832,7 +1832,7 @@ STRING( 8, ignored, ignored, ignored)\r\n";
                 event_word: 0,
                 instructions: vec![
                     ScriptInstruction {
-                        header_words: [19, u32::MAX, u32::MAX, 0, 0, 3, 0],
+                        header_words: [19, u32::MAX, u32::MAX, u32::MAX, 6, 3, u32::MAX],
                         references: vec![0, 1, 2],
                     },
                     ScriptInstruction {
@@ -1840,7 +1840,7 @@ STRING( 8, ignored, ignored, ignored)\r\n";
                         references: Vec::new(),
                     },
                     ScriptInstruction {
-                        header_words: [19, u32::MAX, u32::MAX, 0, 0, 3, 0],
+                        header_words: [19, u32::MAX, u32::MAX, u32::MAX, 6, 3, u32::MAX],
                         references: vec![0, 1, 2],
                     },
                 ],
@@ -1884,7 +1884,7 @@ STRING( 8, ignored, ignored, ignored)\r\n";
                         references: Vec::new(),
                     },
                     ScriptInstruction {
-                        header_words: [19, u32::MAX, u32::MAX, 0, 0, 3, 0],
+                        header_words: [19, u32::MAX, u32::MAX, u32::MAX, 6, 3, u32::MAX],
                         references: vec![0, 1, 2],
                     },
                 ],
@@ -1913,7 +1913,7 @@ STRING( 8, ignored, ignored, ignored)\r\n";
     }
 
     #[test]
-    fn handler_nineteen_init_types_unsupported_control_and_result_save() {
+    fn handler_nineteen_init_uses_disk_control_and_result_fields() {
         let varset = parse_varset(b"VAR( DWORD, x, 0)\nVAR( DWORD, y, 0)\nVAR( DWORD, id, 0)\n")
             .expect("DWORD targets");
         let input = Handler19InitInput {
@@ -1921,18 +1921,17 @@ STRING( 8, ignored, ignored, ignored)\r\n";
             second_x87_word: 8,
             third_word: 9,
         };
-        let instruction = |control_word, result_word| ScriptInstruction {
-            header_words: [19, control_word, result_word, 0, 0, 3, 0],
-            references: vec![0, 1, 2],
-        };
-        let resolve = |instruction| {
+        let resolve = |header_words| {
             let package = ScriptPackage {
                 opcode_handler_count: 73,
                 events: vec![ScriptEvent {
                     name_len: 4,
                     name_raw: b"Init\0".to_vec(),
                     event_word: 0,
-                    instructions: vec![instruction],
+                    instructions: vec![ScriptInstruction {
+                        header_words,
+                        references: vec![0, 1, 2],
+                    }],
                 }],
                 trailing_bytes: Vec::new(),
                 raw: std::sync::Arc::from(&b""[..]),
@@ -1940,21 +1939,34 @@ STRING( 8, ignored, ignored, ignored)\r\n";
             varset.resolve_handler19_init(&package, input)
         };
 
-        assert_eq!(
-            resolve(instruction(0, u32::MAX)),
-            Ok(Handler19InitResolution::Unsupported {
-                event_index: 0,
-                instruction_index: 0,
-                error: Handler19ResolveError::UnsupportedControlWord { found: 0 },
-            })
+        let actual = (
+            resolve([19, u32::MAX, u32::MAX, 2, 6, 3, u32::MAX]),
+            resolve([19, 0x1234, u32::MAX, u32::MAX, 6, 3, u32::MAX]),
+            resolve([19, u32::MAX, 0xdecafbad, u32::MAX, 6, 3, u32::MAX]),
         );
         assert_eq!(
-            resolve(instruction(u32::MAX, 2)),
-            Ok(Handler19InitResolution::Unsupported {
-                event_index: 0,
-                instruction_index: 0,
-                error: Handler19ResolveError::UnsupportedResultSave { found: 2 },
-            })
+            actual,
+            (
+                Ok(Handler19InitResolution::Unsupported {
+                    event_index: 0,
+                    instruction_index: 0,
+                    error: Handler19ResolveError::UnsupportedControlWord { found: 2 },
+                }),
+                Ok(Handler19InitResolution::Unsupported {
+                    event_index: 0,
+                    instruction_index: 0,
+                    error: Handler19ResolveError::UnsupportedResultSave { found: 0x1234 },
+                }),
+                Ok(Handler19InitResolution::Executed {
+                    event_index: 0,
+                    event_word: 0,
+                    writes: vec![
+                        Handler19DwordWrite { index: 0, value: 7 },
+                        Handler19DwordWrite { index: 1, value: 8 },
+                        Handler19DwordWrite { index: 2, value: 9 },
+                    ],
+                }),
+            )
         );
     }
 
