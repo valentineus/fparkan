@@ -644,14 +644,19 @@ Native interoperability подтверждается только успешны
 
 Граница shell подтверждена exports `createShell/getIShell`, `IGUIServer`,
 верхнеуровневым UI-pass и файлами `ui/*.cfg`, `DATA/TextRes.cfg`,
-`gamefont.rlb` и `sprites.lib`. RsLi framing библиотек закрыт, но widget tree,
-layout rules, glyph metrics, sprite command semantics, focus/navigation и HUD
-state machine пока не восстановлены до field-level спецификации.
+`gamefont.rlb` и `sprites.lib`. Для полной GOG-сборки подтверждены раздельные
+форматы: `gamefont.rlb` читается общим RsLi reader, но его native consumer этим
+не установлен; для меню подтверждена цепочка `menu_resources.cfg` → NRes
+`font.lib` → native lookup `MENU_FONT` с получением реального font-объекта.
+`menu_resources.cfg` и шесть вариантов `MENU_FONT`/`GAME_FONT` сопоставлены с
+NRes-записями в [разборе shell и шрифтов](ui-shell.md). Остаются неизвестными
+glyph metrics и drawing, выбор dimension на фактическом дисплее `1280x1024`,
+widget tree, layout rules, sprite command semantics, focus/navigation и HUD
+state machine.
 
-Закрывающий эксперимент: трассировать загрузку `shell_ctrls.cfg`,
-`menu_resources.cfg`, `cursor.cfg`, `game_resources.cfg` и `hq.cfg`, сопоставить
-GUI object factories и снять command/event captures для меню, HUD, briefing и
-диалогов.
+Закрывающий эксперимент: сопоставить оставшиеся детали `shell_ctrls.cfg`,
+`cursor.cfg`, `game_resources.cfg` и `hq.cfg` с GUI object factories и снять
+command/event captures для меню, HUD, briefing и диалогов.
 
 ## Research, economy and properties
 
