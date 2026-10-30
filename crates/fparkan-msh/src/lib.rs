@@ -23,6 +23,9 @@ pub const STREAM_UV0: u32 = 5;
 pub const STREAM_UV1: u32 = 18;
 /// Triangle index stream.
 pub const STREAM_INDICES: u32 = 6;
+/// Optional triangle-descriptor stream.
+pub const STREAM_TRIANGLE_DESCRIPTORS: u32 = 7;
+const TRIANGLE_NORMAL_SCALE: f32 = 1.0 / 32_767.0;
 /// Animation key stream.
 pub const STREAM_ANIMATION_KEYS: u32 = 8;
 /// Node names stream.
@@ -102,6 +105,8 @@ pub struct ModelAsset {
     pub indices: Vec<u16>,
     /// Draw batches.
     pub batches: Vec<Batch>,
+    /// Optional type-7 triangle descriptors.
+    pub triangle_descriptors: Option<Vec<TriangleDescriptor>>,
     /// Optional decoded node names.
     pub node_names: Option<Vec<Option<String>>>,
     /// Optional decoded node-animation streams.
@@ -201,9 +206,48 @@ pub struct Batch {
     pub base_vertex: u32,
 }
 
-/// Preserved triangle descriptor stream marker.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TriangleDescriptor;
+/// One 16-byte type-7 triangle descriptor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TriangleDescriptor {
+    /// Triangle mask flags at byte offset `+0`.
+    pub tri_flags: u16,
+    /// Opaque 16-bit words from offsets `+2`, `+4`, `+6` and `+14`.
+    pub opaque: [u16; 4],
+    /// Signed packed plane normal at byte offsets `+8`, `+10` and `+12`.
+    pub normal: [i16; 3],
+}
+
+/// Include-all and exclude-any masks used by the native MSH query.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SegmentQueryMasks {
+    /// Node38 header bits that must all be set.
+    pub node_include: u16,
+    /// Node38 header bits that must all be clear.
+    pub node_exclude: u16,
+    /// Batch20 leading-DWORD bits that must all be set.
+    pub batch_include: u32,
+    /// Batch20 leading-DWORD bits that must all be clear.
+    pub batch_exclude: u32,
+    /// Type-7 triangle bits that must all be set.
+    pub triangle_include: u16,
+    /// Type-7 triangle bits that must all be clear.
+    pub triangle_exclude: u16,
+}
+
+/// One accepted segment hit from the native MSH triangle-query path.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SegmentHit {
+    /// Hit position in the same coordinate frame as the input segment.
+    pub position: [f32; 3],
+    /// Squared distance from the input segment's first endpoint.
+    pub distance_squared: f32,
+    /// Global Batch20 index.
+    pub batch_index: usize,
+    /// Global type-7 descriptor index.
+    pub triangle_descriptor_index: usize,
+    /// Global Res3 position indices of the hit triangle.
+    pub vertex_indices: [usize; 3],
+}
 
 /// Vertex stream view.
 #[derive(Clone, Debug, PartialEq)]
@@ -685,6 +729,287 @@ pub fn draw_batches(model: &ModelAsset, slot: SlotId) -> Result<&[Batch], MshErr
         })
 }
 
+/// Queries a segment against one slot using the native Node38, Batch20 and
+/// type-7 include-all/exclude-any masks.
+///
+/// The first endpoint is the native forward direction. Batch bit `0x0002`
+/// retries the plane test in reverse only when the forward plane test misses.
+/// The returned distance is always measured from the original first endpoint.
+///
+/// # Errors
+///
+/// Returns [`MshError`] when type 7 is absent, the model does not use Node38,
+/// or the selected slot's descriptor, batch, index or vertex ranges are invalid.
+pub fn query_slot_segment(
+    model: &ModelAsset,
+    node: NodeId,
+    slot: SlotId,
+    endpoints: [[f32; 3]; 2],
+    masks: SegmentQueryMasks,
+) -> Result<Option<SegmentHit>, MshError> {
+    let descriptors = model
+        .triangle_descriptors
+        .as_deref()
+        .ok_or(MshError::MissingStream {
+            type_id: STREAM_TRIANGLE_DESCRIPTORS,
+            label: "Res7",
+        })?;
+    if model.node_stride != 38 {
+        return Err(MshError::InvalidGeometry(format!(
+            "segment query requires Node38 metadata, got node stride {}",
+            model.node_stride
+        )));
+    }
+    if !endpoints.iter().flatten().all(|value| value.is_finite()) {
+        return Err(MshError::InvalidGeometry(
+            "segment endpoints must be finite".to_string(),
+        ));
+    }
+    let node_flags = node38_metadata(model, node)
+        .ok_or_else(|| MshError::InvalidGeometry("invalid Node38 metadata".to_string()))?
+        .header_flags;
+    let slot_index = usize::try_from(slot.0).map_err(|_| MshError::SlotOutOfBounds {
+        slot: slot.0,
+        slot_count: model.slots.len(),
+    })?;
+    let slot_ref = model
+        .slots
+        .get(slot_index)
+        .ok_or(MshError::SlotOutOfBounds {
+            slot: slot.0,
+            slot_count: model.slots.len(),
+        })?;
+    let batches = draw_batches(model, slot)?;
+    let descriptor_start = usize::from(slot_ref.tri_start);
+    let descriptor_end = descriptor_start
+        .checked_add(usize::from(slot_ref.tri_count))
+        .ok_or_else(|| MshError::InvalidGeometry("type-7 range overflow".to_string()))?;
+    if descriptor_end > descriptors.len() {
+        return Err(MshError::InvalidGeometry(format!(
+            "slot {slot_index} type-7 range {descriptor_start}..{descriptor_end} exceeds {} descriptors",
+            descriptors.len()
+        )));
+    }
+
+    let mut face_count = 0usize;
+    for (local_batch, batch) in batches.iter().enumerate() {
+        if batch.index_count % 3 != 0 {
+            return Err(MshError::InvalidGeometry(format!(
+                "batch {} index count {} is not triangle-aligned",
+                usize::from(slot_ref.batch_start) + local_batch,
+                batch.index_count
+            )));
+        }
+        let start = usize::try_from(batch.index_start)
+            .map_err(|_| MshError::InvalidGeometry("batch index range overflow".to_string()))?;
+        let end = start
+            .checked_add(usize::from(batch.index_count))
+            .ok_or_else(|| MshError::InvalidGeometry("batch index range overflow".to_string()))?;
+        if end > model.indices.len() {
+            return Err(MshError::InvalidGeometry(format!(
+                "batch {} index range {start}..{end} exceeds {} indices",
+                usize::from(slot_ref.batch_start) + local_batch,
+                model.indices.len()
+            )));
+        }
+        face_count = face_count
+            .checked_add(usize::from(batch.index_count) / 3)
+            .ok_or_else(|| MshError::InvalidGeometry("slot triangle count overflow".to_string()))?;
+    }
+    if face_count != usize::from(slot_ref.tri_count) {
+        return Err(MshError::InvalidGeometry(format!(
+            "slot {slot_index} declares {} type-7 descriptors but its batches contain {face_count} triangles",
+            slot_ref.tri_count
+        )));
+    }
+    if !mask_matches(
+        u32::from(node_flags),
+        u32::from(masks.node_include),
+        u32::from(masks.node_exclude),
+    ) {
+        return Ok(None);
+    }
+
+    let mut best = None;
+    let mut descriptor_cursor = descriptor_start;
+    for (local_batch, batch) in batches.iter().enumerate() {
+        let batch_index = usize::from(slot_ref.batch_start) + local_batch;
+        let batch_flags = u32::from(batch.batch_flags) | (u32::from(batch.material_index_hi) << 16);
+        let batch_face_count = usize::from(batch.index_count) / 3;
+        if mask_matches(batch_flags, masks.batch_include, masks.batch_exclude) {
+            for local_face in 0..batch_face_count {
+                let triangle_descriptor_index = descriptor_cursor + local_face;
+                let descriptor = descriptors[triangle_descriptor_index];
+                if !mask_matches(
+                    u32::from(descriptor.tri_flags),
+                    u32::from(masks.triangle_include),
+                    u32::from(masks.triangle_exclude),
+                ) {
+                    continue;
+                }
+                let index_start = usize::try_from(batch.index_start)
+                    .expect("validated batch index range")
+                    + local_face * 3;
+                let base_vertex = usize::try_from(batch.base_vertex)
+                    .map_err(|_| MshError::InvalidGeometry("base vertex overflow".to_string()))?;
+                let mut vertex_indices = [0usize; 3];
+                for (triangle_corner, index) in vertex_indices.iter_mut().enumerate() {
+                    let raw_index = usize::from(model.indices[index_start + triangle_corner]);
+                    *index = base_vertex.checked_add(raw_index).ok_or_else(|| {
+                        MshError::InvalidGeometry("resolved vertex index overflow".to_string())
+                    })?;
+                    if *index >= model.positions.len() {
+                        return Err(MshError::VertexIndexOutOfBounds {
+                            batch: batch_index,
+                            vertex: u64::try_from(*index).unwrap_or(u64::MAX),
+                            position_count: model.positions.len(),
+                        });
+                    }
+                }
+                let triangle = vertex_indices.map(|index| model.positions[index]);
+                if !triangle.iter().flatten().all(|value| value.is_finite()) {
+                    return Err(MshError::InvalidGeometry(format!(
+                        "triangle descriptor {triangle_descriptor_index} has a non-finite position"
+                    )));
+                }
+                let normal = descriptor
+                    .normal
+                    .map(|value| f32::from(value) * TRIANGLE_NORMAL_SCALE);
+                if normal == [0.0; 3] {
+                    continue;
+                }
+                let forward =
+                    native_segment_plane_hit(normal, triangle[0], endpoints[0], endpoints[1])?;
+                let position = match forward {
+                    Some(position) => Some(position),
+                    None if batch.batch_flags & 0x0002 != 0 => {
+                        native_segment_plane_hit(normal, triangle[0], endpoints[1], endpoints[0])?
+                    }
+                    None => None,
+                };
+                let Some(position) = position else {
+                    continue;
+                };
+                if !native_point_in_triangle(normal, triangle, position)? {
+                    continue;
+                }
+                let offset = [
+                    position[0] - endpoints[0][0],
+                    position[1] - endpoints[0][1],
+                    position[2] - endpoints[0][2],
+                ];
+                let distance_squared = dot3(offset, offset);
+                if !distance_squared.is_finite() {
+                    return Err(MshError::InvalidGeometry(
+                        "segment hit distance is non-finite".to_string(),
+                    ));
+                }
+                if best.is_none_or(|hit: SegmentHit| distance_squared <= hit.distance_squared) {
+                    best = Some(SegmentHit {
+                        position,
+                        distance_squared,
+                        batch_index,
+                        triangle_descriptor_index,
+                        vertex_indices,
+                    });
+                }
+            }
+        }
+        descriptor_cursor += batch_face_count;
+    }
+    Ok(best)
+}
+
+fn mask_matches(flags: u32, include: u32, exclude: u32) -> bool {
+    flags & include == include && flags & exclude == 0
+}
+
+fn native_segment_plane_hit(
+    normal: [f32; 3],
+    anchor: [f32; 3],
+    start: [f32; 3],
+    end: [f32; 3],
+) -> Result<Option<[f32; 3]>, MshError> {
+    let direction = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
+    let denominator = dot3(normal, direction);
+    let start_distance = dot3(normal, start) - dot3(normal, anchor);
+    let end_distance = start_distance + denominator;
+    if !denominator.is_finite() || !start_distance.is_finite() || !end_distance.is_finite() {
+        return Err(MshError::InvalidGeometry(
+            "segment plane calculation is non-finite".to_string(),
+        ));
+    }
+    if denominator >= 0.0 || start_distance <= 0.0 || end_distance > 0.0 {
+        return Ok(None);
+    }
+    let ratio = start_distance / denominator;
+    let position = [
+        start[0] - direction[0] * ratio,
+        start[1] - direction[1] * ratio,
+        start[2] - direction[2] * ratio,
+    ];
+    if !position.iter().all(|value| value.is_finite()) {
+        return Err(MshError::InvalidGeometry(
+            "segment intersection is non-finite".to_string(),
+        ));
+    }
+    Ok(Some(position))
+}
+
+fn native_point_in_triangle(
+    normal: [f32; 3],
+    triangle: [[f32; 3]; 3],
+    point: [f32; 3],
+) -> Result<bool, MshError> {
+    let absolute = normal.map(f32::abs);
+    let xy_max = if absolute[0] < absolute[1] {
+        absolute[1]
+    } else {
+        absolute[0]
+    };
+    let dominant_axis = if absolute[2] <= xy_max {
+        if absolute[0] < absolute[1] {
+            1
+        } else {
+            0
+        }
+    } else {
+        2
+    };
+    for index in 0..3 {
+        let previous = triangle[(index + 2) % 3];
+        let current = triangle[index];
+        let relative = [
+            point[0] - previous[0],
+            point[1] - previous[1],
+            point[2] - previous[2],
+        ];
+        let edge = [
+            current[0] - previous[0],
+            current[1] - previous[1],
+            current[2] - previous[2],
+        ];
+        let side = match dominant_axis {
+            0 => (relative[2] * edge[1] + relative[1] * -edge[2]) * normal[0],
+            1 => (-edge[0] * relative[2] + relative[0] * edge[2]) * normal[1],
+            _ => (relative[1] * edge[0] - relative[0] * edge[1]) * normal[2],
+        };
+        if !side.is_finite() {
+            return Err(MshError::InvalidGeometry(
+                "triangle edge calculation is non-finite".to_string(),
+            ));
+        }
+        if side < 0.0 {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn dot3(left: [f32; 3], right: [f32; 3]) -> f32 {
+    left[0] * right[0] + left[1] * right[1] + left[2] * right[2]
+}
+
 impl MshDocument {
     /// Returns original stream descriptors.
     #[must_use]
@@ -791,6 +1116,9 @@ fn parse_model_document(document: &NresDocument) -> Result<ModelAsset, MshError>
     let uv1 = read_optional_stream(document, STREAM_UV1)?
         .map(|raw| parse_secondary_uv_stream(raw, positions.len()))
         .transpose()?;
+    let triangle_descriptors = read_optional_triangle_descriptors(document)?
+        .map(|raw| parse_triangle_descriptors(&raw.bytes))
+        .transpose()?;
     let node_names = read_optional_stream(document, STREAM_NAMES)?
         .map(|raw| parse_res10_names(&raw.bytes, node_count))
         .transpose()?;
@@ -809,6 +1137,7 @@ fn parse_model_document(document: &NresDocument) -> Result<ModelAsset, MshError>
         uv1,
         indices,
         batches,
+        triangle_descriptors,
         node_names,
         animation,
     })
@@ -873,6 +1202,28 @@ fn read_optional_stream(
     else {
         return Ok(None);
     };
+    Ok(Some(RawStream {
+        attributes: attributes(entry.meta()),
+        bytes: document.payload(entry.id())?.to_vec(),
+    }))
+}
+
+fn read_optional_triangle_descriptors(
+    document: &NresDocument,
+) -> Result<Option<RawStream>, MshError> {
+    let mut entries = document
+        .entries()
+        .iter()
+        .filter(|entry| entry.meta().type_id == STREAM_TRIANGLE_DESCRIPTORS);
+    let Some(entry) = entries.next() else {
+        return Ok(None);
+    };
+    if entries.next().is_some() {
+        return Err(MshError::DuplicateStream {
+            type_id: STREAM_TRIANGLE_DESCRIPTORS,
+            label: "Res7",
+        });
+    }
     Ok(Some(RawStream {
         attributes: attributes(entry.meta()),
         bytes: document.payload(entry.id())?.to_vec(),
@@ -992,6 +1343,30 @@ fn parse_batches(data: &[u8]) -> Result<Vec<Batch>, MshError> {
             index_start: read_u32(data, offset + 10)?,
             vertex_count: read_u16_required(data, offset + 14)?,
             base_vertex: read_u32(data, offset + 16)?,
+        });
+    }
+    Ok(out)
+}
+
+fn parse_triangle_descriptors(data: &[u8]) -> Result<Vec<TriangleDescriptor>, MshError> {
+    if !data.len().is_multiple_of(16) {
+        return Err(invalid_resource_size("Res7", data.len(), 16));
+    }
+    let mut out = Vec::with_capacity(data.len() / 16);
+    for offset in (0..data.len()).step_by(16) {
+        out.push(TriangleDescriptor {
+            tri_flags: read_u16_required(data, offset)?,
+            opaque: [
+                read_u16_required(data, offset + 2)?,
+                read_u16_required(data, offset + 4)?,
+                read_u16_required(data, offset + 6)?,
+                read_u16_required(data, offset + 14)?,
+            ],
+            normal: [
+                read_i16_required(data, offset + 8)?,
+                read_i16_required(data, offset + 10)?,
+                read_i16_required(data, offset + 12)?,
+            ],
         });
     }
     Ok(out)
@@ -1212,6 +1587,12 @@ fn read_u16_required(bytes: &[u8], offset: usize) -> Result<u16, MshError> {
     Ok(u16::from_le_bytes(arr))
 }
 
+fn read_i16_required(bytes: &[u8], offset: usize) -> Result<i16, MshError> {
+    Ok(i16::from_le_bytes(
+        read_u16_required(bytes, offset)?.to_le_bytes(),
+    ))
+}
+
 fn read_i8(bytes: &[u8], offset: usize) -> Result<i8, MshError> {
     let byte = bytes
         .get(offset)
@@ -1259,6 +1640,352 @@ mod tests {
         assert_eq!(model.node_stride, 38);
         assert_eq!(model.node_count, 0);
         assert!(model.slots.is_empty());
+        assert_eq!(model.triangle_descriptors, None);
+    }
+
+    #[test]
+    fn type7_decodes_optional_records_and_keeps_opaque_words() {
+        let mut raw = Vec::new();
+        push_u16(&mut raw, 0x3456);
+        push_u16(&mut raw, 0x1111);
+        push_u16(&mut raw, 0x2222);
+        push_u16(&mut raw, 0x3333);
+        raw.extend_from_slice(&(-1_i16).to_le_bytes());
+        raw.extend_from_slice(&i16::MIN.to_le_bytes());
+        raw.extend_from_slice(&i16::MAX.to_le_bytes());
+        push_u16(&mut raw, 0x4444);
+        let document = decode_nested(&build_nres(&[
+            stream(STREAM_NODE_TABLE, 38, b"Res1", &[]),
+            stream(STREAM_SLOTS, 0, b"Res2", &slots_payload(&[])),
+            stream(STREAM_POSITIONS, 0, b"Res3", &[]),
+            stream(STREAM_INDICES, 0, b"Res6", &[]),
+            stream(STREAM_BATCHES, 0, b"Res13", &[]),
+            stream(STREAM_TRIANGLE_DESCRIPTORS, 0, b"Res7", &raw),
+        ]))
+        .expect("nested NRes");
+        let msh = decode_msh(&document).expect("optional type7 stream");
+        let model = validate_msh(&msh).expect("model");
+
+        assert_eq!(
+            model.triangle_descriptors,
+            Some(vec![TriangleDescriptor {
+                tri_flags: 0x3456,
+                opaque: [0x1111, 0x2222, 0x3333, 0x4444],
+                normal: [-1, i16::MIN, i16::MAX],
+            }])
+        );
+        let preserved = msh.preserved_streams().expect("preserved streams");
+        assert_eq!(
+            preserved
+                .iter()
+                .find(|stream| stream.type_id == STREAM_TRIANGLE_DESCRIPTORS)
+                .unwrap()
+                .bytes
+                .as_ref(),
+            raw
+        );
+    }
+
+    #[test]
+    fn malformed_or_duplicate_optional_type7_stream_is_an_error() {
+        for entries in [
+            vec![
+                stream(STREAM_NODE_TABLE, 38, b"Res1", &[]),
+                stream(STREAM_SLOTS, 0, b"Res2", &slots_payload(&[])),
+                stream(STREAM_POSITIONS, 0, b"Res3", &[]),
+                stream(STREAM_INDICES, 0, b"Res6", &[]),
+                stream(STREAM_BATCHES, 0, b"Res13", &[]),
+                stream(STREAM_TRIANGLE_DESCRIPTORS, 0, b"Res7", &[0; 15]),
+            ],
+            vec![
+                stream(STREAM_NODE_TABLE, 38, b"Res1", &[]),
+                stream(STREAM_SLOTS, 0, b"Res2", &slots_payload(&[])),
+                stream(STREAM_POSITIONS, 0, b"Res3", &[]),
+                stream(STREAM_INDICES, 0, b"Res6", &[]),
+                stream(STREAM_BATCHES, 0, b"Res13", &[]),
+                stream(STREAM_TRIANGLE_DESCRIPTORS, 0, b"Res7a", &[0; 16]),
+                stream(STREAM_TRIANGLE_DESCRIPTORS, 0, b"Res7b", &[0; 16]),
+            ],
+        ] {
+            let document = decode_nested(&build_nres(&entries)).expect("nested NRes");
+            let msh = decode_msh(&document).expect("required streams");
+            assert!(validate_msh(&msh).is_err());
+        }
+    }
+
+    #[test]
+    fn segment_query_uses_native_one_sided_edge_and_endpoint_rules() {
+        let model = segment_model(&[(0, 0)], &[0]);
+        let hit = query_slot_segment(
+            &model,
+            NodeId(0),
+            SlotId(0),
+            [[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]],
+            SegmentQueryMasks::default(),
+        )
+        .expect("forward segment")
+        .expect("front-to-back hit");
+        assert_eq!(hit.position, [0.0, 0.0, 0.0]);
+        assert_eq!(hit.distance_squared, 1.0);
+        assert_eq!(hit.vertex_indices, [0, 1, 2]);
+
+        assert!(query_slot_segment(
+            &model,
+            NodeId(0),
+            SlotId(0),
+            [[0.0, -1.0, 0.0], [0.0, 1.0, 0.0]],
+            SegmentQueryMasks::default(),
+        )
+        .expect("reverse segment")
+        .is_none());
+        assert!(query_slot_segment(
+            &model,
+            NodeId(0),
+            SlotId(0),
+            [[0.0, 1.0, 0.0], [0.0, 0.0, 0.0]],
+            SegmentQueryMasks::default(),
+        )
+        .expect("endpoint on plane")
+        .is_some());
+        assert!(query_slot_segment(
+            &model,
+            NodeId(0),
+            SlotId(0),
+            [[0.0, 0.0, 0.0], [0.0, -1.0, 0.0]],
+            SegmentQueryMasks::default(),
+        )
+        .expect("start on plane")
+        .is_none());
+        assert!(query_slot_segment(
+            &model,
+            NodeId(0),
+            SlotId(0),
+            [[0.0, 1.0, -1.0], [0.0, -1.0, -1.0]],
+            SegmentQueryMasks::default(),
+        )
+        .expect("segment crossing triangle edge")
+        .is_some());
+
+        let two_sided = segment_model(&[(2, 0)], &[0]);
+        assert!(query_slot_segment(
+            &two_sided,
+            NodeId(0),
+            SlotId(0),
+            [[0.0, -1.0, 0.0], [0.0, 1.0, 0.0]],
+            SegmentQueryMasks::default(),
+        )
+        .expect("two-sided reverse retry")
+        .is_some());
+    }
+
+    #[test]
+    fn segment_query_skips_triangles_with_zero_packed_normals() {
+        let mut model = segment_model(&[(0, 0)], &[0]);
+        model
+            .triangle_descriptors
+            .as_mut()
+            .expect("type-7 descriptors")[0]
+            .normal = [0; 3];
+
+        assert!(query_slot_segment(
+            &model,
+            NodeId(0),
+            SlotId(0),
+            [[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]],
+            SegmentQueryMasks::default(),
+        )
+        .expect("zero normal is a missed triangle")
+        .is_none());
+    }
+
+    #[test]
+    fn segment_query_applies_native_masks_and_advances_filtered_descriptors() {
+        let mut model = segment_model(&[(0x0200, 1), (0, 1), (0, 1)], &[0, 0x0020, 0x0004]);
+        model
+            .triangle_descriptors
+            .as_mut()
+            .expect("type-7 descriptors")
+            .insert(
+                0,
+                TriangleDescriptor {
+                    tri_flags: 0,
+                    opaque: [0; 4],
+                    normal: [0, i16::MAX, 0],
+                },
+            );
+        model.slots[0].tri_start = 1;
+        let masks = SegmentQueryMasks {
+            node_include: 0x0004,
+            node_exclude: 0,
+            batch_include: 0x0001_0000,
+            batch_exclude: 0x0000_0200,
+            triangle_include: 0x0004,
+            triangle_exclude: 0x0020,
+        };
+        let hit = query_slot_segment(
+            &model,
+            NodeId(0),
+            SlotId(0),
+            [[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]],
+            masks,
+        )
+        .expect("native masks")
+        .expect("third descriptor survives");
+        assert_eq!(hit.batch_index, 2);
+        assert_eq!(hit.triangle_descriptor_index, 3);
+        assert_eq!(hit.vertex_indices, [6, 7, 8]);
+
+        for masks in [
+            SegmentQueryMasks {
+                node_include: 0x0008,
+                ..masks
+            },
+            SegmentQueryMasks {
+                node_exclude: 0x0004,
+                ..masks
+            },
+            SegmentQueryMasks {
+                batch_include: 0x0002_0000,
+                ..masks
+            },
+            SegmentQueryMasks {
+                triangle_exclude: 0x0004,
+                ..masks
+            },
+        ] {
+            assert!(query_slot_segment(
+                &model,
+                NodeId(0),
+                SlotId(0),
+                [[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]],
+                masks,
+            )
+            .expect("filtered query")
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn segment_query_replaces_equal_distance_hits_with_the_later_candidate() {
+        let model = segment_model(&[(0, 0), (0, 0)], &[0, 0]);
+        let hit = query_slot_segment(
+            &model,
+            NodeId(0),
+            SlotId(0),
+            [[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]],
+            SegmentQueryMasks::default(),
+        )
+        .expect("equal-distance candidates")
+        .expect("hit");
+        assert_eq!(hit.distance_squared, 1.0);
+        assert_eq!(hit.batch_index, 1);
+        assert_eq!(hit.triangle_descriptor_index, 1);
+    }
+
+    #[test]
+    fn native_point_in_triangle_projects_on_each_dominant_normal_axis() {
+        for (normal, triangle, edge, outside) in [
+            (
+                [1.0, 0.0, 0.0],
+                [[0.0, -1.0, -1.0], [0.0, 1.0, -1.0], [0.0, 0.0, 1.0]],
+                [0.0, 0.0, -1.0],
+                [0.0, 2.0, 0.0],
+            ),
+            (
+                [0.0, 1.0, 0.0],
+                [[-1.0, 0.0, -1.0], [0.0, 0.0, 1.0], [1.0, 0.0, -1.0]],
+                [0.0, 0.0, -1.0],
+                [0.0, 0.0, 2.0],
+            ),
+            (
+                [0.0, 0.0, 1.0],
+                [[-1.0, -1.0, 0.0], [1.0, -1.0, 0.0], [0.0, 1.0, 0.0]],
+                [0.0, -1.0, 0.0],
+                [2.0, 0.0, 0.0],
+            ),
+        ] {
+            assert!(native_point_in_triangle(normal, triangle, [0.0; 3]).expect("inside"));
+            assert!(native_point_in_triangle(normal, triangle, edge).expect("edge"));
+            assert!(!native_point_in_triangle(normal, triangle, outside).expect("outside"));
+        }
+    }
+
+    #[test]
+    fn segment_query_reports_missing_type7_and_invalid_metadata_or_ranges() {
+        let mut model = segment_model(&[(0, 0)], &[0]);
+        model.triangle_descriptors = None;
+        assert!(matches!(
+            query_slot_segment(
+                &model,
+                NodeId(0),
+                SlotId(0),
+                [[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]],
+                SegmentQueryMasks::default(),
+            ),
+            Err(MshError::MissingStream {
+                type_id: STREAM_TRIANGLE_DESCRIPTORS,
+                ..
+            })
+        ));
+
+        let mut model = segment_model(&[(0, 0)], &[0]);
+        model.node_stride = 24;
+        assert!(matches!(
+            query_slot_segment(
+                &model,
+                NodeId(0),
+                SlotId(0),
+                [[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]],
+                SegmentQueryMasks::default(),
+            ),
+            Err(MshError::InvalidGeometry(_))
+        ));
+
+        let mut model = segment_model(&[(0, 0)], &[0]);
+        model.slots[0].tri_start = 1;
+        assert!(query_slot_segment(
+            &model,
+            NodeId(0),
+            SlotId(0),
+            [[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]],
+            SegmentQueryMasks::default(),
+        )
+        .is_err());
+
+        let mut model = segment_model(&[(0, 0)], &[0]);
+        model.slots[0].batch_count = 2;
+        assert!(matches!(
+            query_slot_segment(
+                &model,
+                NodeId(0),
+                SlotId(0),
+                [[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]],
+                SegmentQueryMasks::default(),
+            ),
+            Err(MshError::BatchRangeOutOfBounds { .. })
+        ));
+
+        let mut model = segment_model(&[(0, 0)], &[0]);
+        model.batches[0].index_count = 4;
+        assert!(query_slot_segment(
+            &model,
+            NodeId(0),
+            SlotId(0),
+            [[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]],
+            SegmentQueryMasks::default(),
+        )
+        .is_err());
+
+        let mut model = segment_model(&[(0, 0)], &[0]);
+        model.batches[0].index_start = 3;
+        assert!(query_slot_segment(
+            &model,
+            NodeId(0),
+            SlotId(0),
+            [[0.0, 1.0, 0.0], [0.0, -1.0, 0.0]],
+            SegmentQueryMasks::default(),
+        )
+        .is_err());
     }
 
     #[test]
@@ -1537,6 +2264,7 @@ mod tests {
             uv1: None,
             indices: Vec::new(),
             batches: Vec::new(),
+            triangle_descriptors: None,
             node_names: None,
             animation: Some(ModelAnimation {
                 keys: vec![
@@ -1598,6 +2326,7 @@ mod tests {
             uv1: None,
             indices: Vec::new(),
             batches: Vec::new(),
+            triangle_descriptors: None,
             node_names: None,
             animation: Some(ModelAnimation {
                 keys: vec![
@@ -1662,6 +2391,7 @@ mod tests {
             uv1: None,
             indices: Vec::new(),
             batches: Vec::new(),
+            triangle_descriptors: None,
             node_names: None,
             animation: Some(ModelAnimation {
                 keys: vec![
@@ -2418,6 +3148,155 @@ mod tests {
             ],
         )?;
         track.sample(AnimationTime(frame as f32))
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn factory_wall_door_and_reversed_segments_match_native_query() {
+        let root = corpus_root("IS");
+        let archive_path = files_under(&root)
+            .into_iter()
+            .find(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.eq_ignore_ascii_case("fortif.rlb"))
+            })
+            .expect("fortif.rlb in licensed corpus");
+        let archive_bytes = std::fs::read(&archive_path).expect("fortif.rlb bytes");
+        let archive = fparkan_nres::decode(
+            Arc::from(archive_bytes.into_boxed_slice()),
+            ReadProfile::Compatible,
+        )
+        .expect("fortif.rlb archive");
+        let entry = archive
+            .entries()
+            .iter()
+            .find(|entry| entry.name_bytes().eq_ignore_ascii_case(b"fr_l_plant.msh"))
+            .expect("plant factory MSH");
+        let nested = fparkan_nres::decode(
+            Arc::from(
+                archive
+                    .payload(entry.id())
+                    .expect("MSH payload")
+                    .to_vec()
+                    .into_boxed_slice(),
+            ),
+            ReadProfile::Compatible,
+        )
+        .expect("nested plant MSH");
+        let msh = decode_msh(&nested).expect("plant MSH document");
+        let model = validate_msh(&msh).expect("plant MSH model");
+        let slot = selected_slot(&model, NodeId(1), Lod(0), Group(0)).expect("Node 1 slot");
+        assert_eq!(slot, SlotId(0));
+        let hierarchy = node38_fallback_hierarchy(&model).expect("Node38 poses");
+        let pose = hierarchy.poses[1];
+        assert_eq!(pose.rotation, [0.0, 0.0, 0.0, 1.0]);
+
+        let masks = SegmentQueryMasks {
+            node_include: 0,
+            node_exclude: 0,
+            batch_include: 0,
+            batch_exclude: 0x0208,
+            triangle_include: 0,
+            triangle_exclude: 0x0024,
+        };
+        let local = |point: [f32; 3]| {
+            [
+                point[0] - pose.translation[0],
+                point[1] - pose.translation[1],
+                point[2] - pose.translation[2],
+            ]
+        };
+        let wall = query_slot_segment(
+            &model,
+            NodeId(1),
+            slot,
+            [local([-10.5, 22.16, 2.5]), local([-10.5, 19.16, 2.5])],
+            masks,
+        )
+        .expect("wall query")
+        .expect("solid wall hit");
+        assert_eq!(wall.batch_index, 5);
+        assert_eq!(wall.triangle_descriptor_index, 62);
+        assert_eq!(wall.distance_squared, 4.0);
+        assert!(query_slot_segment(
+            &model,
+            NodeId(1),
+            slot,
+            [local([0.5, 22.16, 2.5]), local([0.5, 19.16, 2.5])],
+            masks,
+        )
+        .expect("door query")
+        .is_none());
+        assert!(query_slot_segment(
+            &model,
+            NodeId(1),
+            slot,
+            [local([-10.5, 19.16, 2.5]), local([-10.5, 22.16, 2.5])],
+            masks,
+        )
+        .expect("reversed wall query")
+        .is_none());
+    }
+
+    fn segment_model(batch_fields: &[(u16, u16)], tri_flags: &[u16]) -> ModelAsset {
+        assert_eq!(batch_fields.len(), tri_flags.len());
+        let mut nodes_raw = node38([u16::MAX; 15]);
+        nodes_raw[0..2].copy_from_slice(&0x0004_u16.to_le_bytes());
+        let mut positions = Vec::with_capacity(batch_fields.len() * 3);
+        let mut indices = Vec::with_capacity(batch_fields.len() * 3);
+        let mut batches = Vec::with_capacity(batch_fields.len());
+        for index in 0..batch_fields.len() {
+            positions.extend_from_slice(&[[-1.0, 0.0, -1.0], [0.0, 0.0, 1.0], [1.0, 0.0, -1.0]]);
+            indices.extend_from_slice(&[0, 1, 2]);
+            batches.push(Batch {
+                batch_flags: batch_fields[index].0,
+                material_index_hi: batch_fields[index].1,
+                material_index: 0,
+                lightmap_index: 0,
+                local_batch_index: u16::try_from(index).expect("local batch index"),
+                index_count: 3,
+                index_start: u32::try_from(index * 3).expect("index start"),
+                vertex_count: 3,
+                base_vertex: u32::try_from(index * 3).expect("base vertex"),
+            });
+        }
+        ModelAsset {
+            node_stride: 38,
+            node_count: 1,
+            nodes_raw,
+            bounding_sphere_center: [0.0; 3],
+            bounding_sphere_radius: 1.0,
+            slots: vec![Slot {
+                tri_start: 0,
+                tri_count: u16::try_from(tri_flags.len()).expect("triangle count"),
+                batch_start: 0,
+                batch_count: u16::try_from(batch_fields.len()).expect("batch count"),
+                aabb_min: [-1.0, 0.0, -1.0],
+                aabb_max: [1.0, 0.0, 1.0],
+                sphere_center: [0.0; 3],
+                sphere_radius: 1.0,
+                opaque: [0; 5],
+            }],
+            positions,
+            normals: None,
+            uv0: None,
+            uv1: None,
+            indices,
+            batches,
+            node_names: None,
+            animation: None,
+            triangle_descriptors: Some(
+                tri_flags
+                    .iter()
+                    .map(|tri_flags| TriangleDescriptor {
+                        tri_flags: *tri_flags,
+                        opaque: [0; 4],
+                        normal: [0, i16::MAX, 0],
+                    })
+                    .collect(),
+            ),
+        }
     }
 
     fn decode_nested(bytes: &[u8]) -> Result<NresDocument, NresError> {

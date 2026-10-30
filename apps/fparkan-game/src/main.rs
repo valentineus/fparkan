@@ -7344,6 +7344,7 @@ mod tests {
             uv1: None,
             indices: vec![],
             batches: vec![],
+            triangle_descriptors: None,
             node_names: None,
             animation: Some(fparkan_msh::ModelAnimation {
                 keys: vec![

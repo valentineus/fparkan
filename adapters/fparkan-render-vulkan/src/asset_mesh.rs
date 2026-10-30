@@ -1381,6 +1381,7 @@ mod tests {
             uv1: None,
             indices,
             batches,
+            triangle_descriptors: None,
             node_names: None,
             animation: None,
         }
@@ -1446,6 +1447,7 @@ mod tests {
                     ..batch(0, 0, 0)
                 },
             ],
+            triangle_descriptors: None,
             node_names: None,
             animation: None,
         };
@@ -1686,6 +1688,7 @@ mod tests {
             uv1: None,
             indices: vec![0, 1, 2, 0, 1, 2],
             batches: vec![batch(0, 3, 0), batch(3, 3, 0)],
+            triangle_descriptors: None,
             node_names: None,
             animation: Some(ModelAnimation {
                 keys: vec![
@@ -1745,6 +1748,7 @@ mod tests {
             uv1: None,
             indices: Vec::new(),
             batches: Vec::new(),
+            triangle_descriptors: None,
             node_names: None,
             animation: Some(ModelAnimation {
                 keys: vec![
@@ -1851,6 +1855,7 @@ mod tests {
             uv1: None,
             indices: vec![0, 1, 2, 0, 1, 2],
             batches: vec![batch(0, 3, 0), batch(3, 3, 0)],
+            triangle_descriptors: None,
             node_names: None,
             animation: Some(ModelAnimation {
                 keys: vec![AnimKey24 {
@@ -1942,6 +1947,7 @@ mod tests {
             uv1: None,
             indices: vec![0, 1, 2],
             batches: vec![batch(0, 3, 0)],
+            triangle_descriptors: None,
             node_names: None,
             animation: Some(ModelAnimation {
                 keys: vec![AnimKey24 {

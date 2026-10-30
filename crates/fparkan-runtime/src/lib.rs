@@ -6810,6 +6810,7 @@ mod tests {
             uv1: None,
             indices: Vec::new(),
             batches: Vec::new(),
+            triangle_descriptors: None,
             node_names: None,
             animation: None,
         }
