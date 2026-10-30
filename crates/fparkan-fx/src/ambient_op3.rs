@@ -471,6 +471,7 @@ fn native_op3_type1_matrix(
 /// `view · axis` value to exactly ±1 before building the cross-product frame;
 /// neither input vector is normalized. The native path normalizes only
 /// `view × axis`, then computes `axis × U` without normalizing the result.
+/// The authored axis is the quad's X column (Effect.dll RVA 0x97F6..0x983C).
 #[must_use]
 fn native_op3_type1_basis(
     view: [f32; 3],
@@ -501,9 +502,9 @@ fn native_op3_type1_basis(
     }
     let w = cross3(axis, u);
     let result = [
-        [u[0], w[0], axis[0], position[0]],
-        [u[1], w[1], axis[1], position[1]],
-        [u[2], w[2], axis[2], position[2]],
+        [axis[0], u[0], w[0], position[0]],
+        [axis[1], u[1], w[1], position[1]],
+        [axis[2], u[2], w[2], position[2]],
         [0.0, 0.0, 0.0, 1.0],
     ];
     result
@@ -837,19 +838,19 @@ mod tests {
         // cross-product frame instead of being normalized before the gate.
         let frame =
             native_op3_type1_basis([2.0, 1.0, 0.0], [1.0, 0.0, 0.0], [3.0, 4.0, 5.0]).unwrap();
-        assert_eq!(frame[0], [0.0, 0.0, 1.0, 3.0]);
-        assert_eq!(frame[1], [0.0, 1.0, 0.0, 4.0]);
-        assert_eq!(frame[2], [-1.0, 0.0, 0.0, 5.0]);
+        assert_eq!(frame[0], [1.0, 0.0, 0.0, 3.0]);
+        assert_eq!(frame[1], [0.0, 0.0, 1.0, 4.0]);
+        assert_eq!(frame[2], [0.0, -1.0, 0.0, 5.0]);
 
         // The axis is not normalized: W and the axis column keep its scale.
         let axis_scaled =
             native_op3_type1_basis([2.0, 1.0, 0.0], [0.0, 0.0, 2.0], [0.0; 3]).unwrap();
         let inv_sqrt_5 = 1.0 / 5.0_f32.sqrt();
-        assert_eq!(axis_scaled[0][0], inv_sqrt_5);
-        assert_eq!(axis_scaled[1][0], -2.0 * inv_sqrt_5);
-        assert_eq!(axis_scaled[0][1], 4.0 * inv_sqrt_5);
-        assert_eq!(axis_scaled[1][1], 2.0 * inv_sqrt_5);
-        assert_eq!(axis_scaled[2][2], 2.0);
+        assert_eq!(axis_scaled[0][1], inv_sqrt_5);
+        assert_eq!(axis_scaled[1][1], -2.0 * inv_sqrt_5);
+        assert_eq!(axis_scaled[0][2], 4.0 * inv_sqrt_5);
+        assert_eq!(axis_scaled[1][2], 2.0 * inv_sqrt_5);
+        assert_eq!(axis_scaled[2][0], 2.0);
 
         assert_eq!(
             native_op3_type1_basis([f32::NAN, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0; 3]),
@@ -907,6 +908,10 @@ mod tests {
         assert_eq!(frame.normalized_time, 0.5);
         assert_eq!(frame.color, [1.0, 1.0, 1.0, 0.5]);
         assert_eq!(frame.material_phase, 0.5);
+        let authored_axis_edge = std::array::from_fn::<_, 3, _>(|axis| {
+            frame.vertices[2][axis] - frame.vertices[1][axis]
+        });
+        assert_eq!(authored_axis_edge, [0.0, 0.0, 1.0]);
         assert!(evaluate_op3_type1_command(
             &command,
             4,
@@ -916,6 +921,61 @@ mod tests {
             [f32::NAN, 1.0, 3.0],
         )
         .is_none());
+    }
+
+    #[test]
+    #[ignore = "requires the original GOG installation"]
+    fn original_deflector_quad_keeps_its_authored_axis_over_time_and_camera_motion() {
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT")
+            .expect("set FPARKAN_CORPUS_PART1_ROOT to the original GOG installation");
+        let bytes = std::fs::read(std::path::Path::new(&root).join("effects.rlb"))
+            .expect("read effects.rlb");
+        let archive = fparkan_nres::decode(bytes.into(), fparkan_nres::ReadProfile::Compatible)
+            .expect("decode effects.rlb");
+        let entry = archive.find("deflector").expect("deflector FXID");
+        let document = crate::decode_fxid(
+            archive
+                .payload(entry)
+                .expect("FXID payload")
+                .to_vec()
+                .into(),
+        )
+        .expect("decode deflector");
+        let command = &document.commands()[0];
+        let parent = [
+            [12.0, 0.0, 0.0, 100.0],
+            [0.0, 3.0, 0.0, 200.0],
+            [0.0, 0.0, 3.0, 20.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        for elapsed in [0.0_f32, 0.125, 0.5, 1.0, 2.5] {
+            for camera in [
+                [160.0, 230.0, 20.0],
+                [160.0, 200.0, 50.0],
+                [160.0, 170.0, 5.0],
+            ] {
+                let frame = evaluate_op3_type1_command(
+                    command,
+                    0,
+                    &parent,
+                    elapsed,
+                    elapsed.min(1.0),
+                    camera,
+                )
+                .expect("active deflector quad");
+                assert!(frame.active);
+                assert_eq!(frame.material.name.to_ascii_lowercase(), "defl_b");
+                let axis_edge = std::array::from_fn::<_, 3, _>(|axis| {
+                    frame.vertices[2][axis] - frame.vertices[1][axis]
+                });
+                assert_eq!(axis_edge, [12.0, 0.0, 0.0]);
+                let center = std::array::from_fn::<_, 3, _>(|axis| {
+                    (frame.vertices[0][axis] + frame.vertices[2][axis]) * 0.5
+                });
+                assert_eq!(center, [106.0, 200.0, 20.0]);
+                assert_eq!(frame.material_phase, (elapsed * 7.0).fract());
+            }
+        }
     }
 
     #[test]
