@@ -22,13 +22,15 @@ symbol/formula oracle; `varset.var` задаёт `VAR(...)`/`STRING(...)` defaul
 `fparkan-script::parse_varset` уже читает подтверждённые numeric
 `VAR(float|DWORD, name, default)` declarations byte-safe (comments остаются
 opaque, поэтому legacy non-UTF-8 text не ломает загрузку); `STRING(...)` и
-`FUNCTION(...)` пока сохранены за границей этого numeric contract;
+general `FUNCTION(...)` evaluation остаётся вне numeric contract, но принятые
+строки сохраняются для доказанных literal assignments первого `Init`;
 GOG `MISSIONS/SCRIPTS/varset.var` даёт через него ровно 231 declaration:
 31 `float` и 200 `DWORD` (от `f0` до `fY`);
 loader `ai.dll!0x10001000` сначала открывает `<bundle-base>.var` и только при
 `not found` откатывается к этому shared file. Runtime повторяет данный порядок
-транзакционно и публикует selected `MissionScriptVarSet` с путём/provenance, но
-ещё не исполняет declarations как VM state;
+транзакционно, создаёт typed varset cells для кланов и применяет поддержанные
+записи первого `Init`. Это начальное состояние сценария, а не исполнение общего
+VM state;
 `.trf` — NRes tables, чей framing подтверждён, а field semantics местами лишь
 consumer-inferred.
 
@@ -285,9 +287,10 @@ TMA properties остаются four raw `u32` words плюс имя, пока c
 
 Research/economy работают в simulation: `LoadResearch` и
 `CalcFullResearchCost` доказывают данные и вычислимую стоимость, но не полный
-layout prerequisites/modifiers/unlocks. Formula evaluator требует strict
-grammar/version, typed operands, deterministic numeric policy, bounded stack и
-явных errors; x87-compatible rounding нужен там, где оно выбирает ветку.
+layout prerequisites/modifiers/unlocks. General formula evaluator требует
+versioned grammar, typed operands, deterministic numeric policy, bounded stack
+и явных errors; x87-compatible rounding нужен там, где оно выбирает ветку.
+Описанный ниже literal-путь первого `Init` не закрывает общий evaluator.
 
 ### Первый фрагмент dispatcher-а: `Init` и Handler(19)
 
@@ -362,10 +365,12 @@ nearest-even `FISTP qword`, младший DWORD, преобразование D
 показывает исходное предупреждение `MessageBoxA`; оно находится за пределами
 этого числового resolver-а.
 
-Ограниченный Rust-исполнитель `VarSet::resolve_handler19_init` ищет только
-первое событие `Init`, проходит его инструкции по порядку и возвращает
-упорядоченные записи. Runtime применяет их к отдельной копии varset выбранного
-клана лишь после успешного прохода всего события. Отсутствующий `Init` даёт
+Ограниченный Rust-исполнитель `VarSet::resolve_init` ищет первое событие
+`Init` и проходит его инструкции по порядку. Он возвращает записи для
+поддержанного `Handler(19)` и числовых literal assignments; прочая форма
+останавливает preview на `Unsupported`. Runtime применяет упорядоченные записи
+к отдельной копии varset выбранного клана лишь после успешного прохода всего
+события. Отсутствующий `Init` даёт
 статус `Missing` и не создаёт записей инициализации; пустой первый `Init` даёт
 `Executed` без записей. Если форма инструкции пока не поддержана, package
 остаётся доступен в preview режиме со статусом `Unsupported`, а default-значения
@@ -374,6 +379,77 @@ nearest-even `FISTP qword`, младший DWORD, преобразование D
 Повреждённая ссылка или цель неправильного типа остаётся ошибкой в обоих режимах.
 Это правила ограниченного Rust-исполнителя, а не обнаруженное поведение
 оригинального dispatcher-а.
+
+#### Числовые литералы `.fml` в `Init`
+
+В той же сборке `ai.dll` (`c19cd6cd31cd2896f8c4ba0f0e700dd3408aec8182daaf4863d98a7d233a2abc`)
+загрузчик `FUN_10001000` открывает `.fml` рядом с базой каждого `.scr`.
+`FUN_10018f40` читает строки в таблицу `FUNCTION`; vtable slot `+0x18`
+компилирует сохранённые строки через `FUN_100152a0` (RVA `0x152a0`).
+Индексы формул — порядковые номера принятых строк, поэтому строки после
+используемого номера тоже остаются в таблице. Native reader обрабатывает
+независимые чанки до 255 байт, включая LF; CRLF нормализуется до LF, `Ctrl-Z`
+завершает ввод, а NUL скрывает остаток своего чанка для C-string поиска.
+Искатель учитывает регистр, ищет подстроку `FUNCTION` и независимо выбирает
+первую `(` и запятые в видимом чанке. Это permissive framing, а не строгий
+разбор сбалансированного вызова. Rust сохраняет принятые записи в этом порядке
+и разбирает выражение только при ссылке из `Init`; отсутствующая соседняя `.fml`
+не мешает одному лишь `Handler(19)`, но ошибка чтения, отличная от `NotFound`,
+остаётся ошибкой VFS.
+
+Native selector `-1` при source `-1` и нулевой глубине условий выбирает
+formula assignment; в native record `header_words[1]` — индекс целевой varset
+ячейки, а `header_words[6]` — индекс formula row. `FUN_100123b0` (RVA `0x123b0`) проверяет индекс строки,
+`FUN_10015b30` (RVA `0x15b30`) возвращает результат единственного literal node
+kind `3`, а `FUN_10013650` передаёт его типизированной ячейке через
+`FUN_10012c00` (RVA `0x12c00`). Компилятор `FUN_100152a0` получает числовой
+prefix как `double` через `FUN_10020af0` (RVA `0x20af0`), затем записывает
+его как `float` в node `+0x10`. Rust ограничивает эту ветвь одним
+digit-starting числовым токеном с необязательным хвостом пробельных байтов;
+ведущие unary `+`/`-`, variable references, операторы и другие node kinds
+остаются явными `UnsupportedExpression`.
+
+Проверенный native tokenizer отличается от обычного строгого decimal parser:
+`1e-2`, `1.`, `1e`, `1e+`, `1ee2` и `1e2.3` были приняты как один literal node
+и дали payload `0x3c23d70a`, `0x3f800000`, `0x3f800000`, `0x3f800000`,
+`0x3f800000` и `0x42c80000`. Для четырёх неполных exponent-форм значение
+получено из распознаваемого числового prefix; это именно проверенные строки,
+а не полное описание всех ошибок компилятора.
+
+Тип целевой ячейки сохраняется при записи: `float` (native tag `3`) принимает
+исходные `f32` bits; `DWORD` (tag `5`) проходит через `__ftol` (RVA `0x1df70`)
+с усечением к нулю и записывает младший DWORD. Поэтому literal `0.8` остаётся
+`0x3f4ccccd` в `float`, но записывается как `0` в `DWORD`; `100.0` даёт raw
+DWORD `100`. Неизвестные выражения не заменяются нулём, а запись всего первого
+`Init` применяется только после успешного прохода.
+
+Native x86 oracle на GOG `ai.dll` SHA-256
+`c19cd6cd31cd2896f8c4ba0f0e700dd3408aec8182daaf4863d98a7d233a2abc` загрузил
+реальный shared `varset.var` (231 declaration) и реальные таблицы
+`tut1_pl2.fml` (26 строк), `scr_pl_1.fml` (5 строк) и `scream.fml` (149 строк).
+В первой кампании formula `0` записывает нули в DWORD `df0..df3` (indices
+188–191); в `Single.01` formula `0` записывает нули в `dT8` и `dT9` (indices
+186–187). Строки `scream` `0..8` задают следующие пары literal → raw cell value:
+
+| Formula | Target | Literal → raw cell value |
+| ---: | --- | --- |
+| 0 | `dMaxBuilder` (`DWORD`) | `0.4 → 0` |
+| 1 | `fDifficulty` (`float`) | `0.8 → 0x3f4ccccd` |
+| 2 | `dCurrentSender` (`DWORD`) | `0.5 → 0` |
+| 3 | `dMaxTower` (`DWORD`) | `1.0 → 1` |
+| 4 | `dMaxStorage` (`DWORD`) | `10 → 10` |
+| 5 | `dMaxTransport` (`DWORD`) | `0.2 → 0` |
+| 6 | `dMaxMine` (`DWORD`) | `100 → 100` |
+| 7 | `dMaxPlant` (`DWORD`) | `400 → 400` |
+| 8 | `d7` (`DWORD`) | `2 → 2` |
+
+Rust сохраняет всю таблицу строк, но вычисляет только формулу, на которую
+ссылается поддержанная запись. Лицензированный runtime-тест подтверждает
+полную загрузку кампании Mission.01 после этих присваиваний; у обычной
+`Single.01` clan 1 после формул остаётся `Handler(43)` в instruction 10, который
+не поддержан и не обходится. Preview оставляет значения этого клана без
+частичных записей, а полный load возвращает ошибку транзакционно. Это не
+подтверждение запуска самой игры или полной VM.
 
 ### Первый вызов Behavior и сценарного `Init`
 
@@ -622,10 +698,10 @@ tie-векторов подтверждает реакцию `FISTP`, но не 
 
 Нижнеуровневый `VarSet::resolve_handler19` принимает уже преобразованные первые
 два слова и третье исходное слово, выдаёт три типизированные записи и отклоняет
-отсутствующие, выходящие за диапазон или не-`DWORD` цели. Метод
-`resolve_handler19_init` добавляет выбор события и остановку на неподдержанной
-форме инструкции. Всё остальное содержимое `.scr` сохраняется reader-ом, но
-остаётся вне этого исполнения.
+отсутствующие, выходящие за диапазон или не-`DWORD` цели. Общий для первого
+события метод `VarSet::resolve_init` добавляет этот `Handler(19)` и формулу из
+одного numeric literal; остальные формы инструкции и содержимое `.scr`
+сохраняются reader-ом, но остаются вне этого исполнения.
 
 ### Изменение provider-состояния Control
 

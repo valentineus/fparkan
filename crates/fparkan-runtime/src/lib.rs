@@ -22,8 +22,9 @@ use fparkan_prototype::{
 };
 use fparkan_resource::{resource_name, CachedResourceRepository, ResourceKey, ResourceRepository};
 use fparkan_script::{
-    Handler19DwordWrite, Handler19InitInput, Handler19InitResolution, Handler19ResolveError,
-    ScriptInstruction, ScriptPackage, VarSet, VarSetDefault, VmHostCallbackCommand,
+    FormulaTable, Handler19InitInput, ScriptInitResolution, ScriptInitResolveError,
+    ScriptInitWrite, ScriptInstruction, ScriptPackage, VarSet, VarSetDefault,
+    VmHostCallbackCommand,
 };
 use fparkan_terrain::SurfaceQuery;
 use fparkan_vfs::{Vfs, VfsError};
@@ -657,9 +658,11 @@ pub struct MissionScriptBundle {
     pub base_path: String,
     /// Resolved compiled `.scr` path.
     pub script_path: String,
-    /// Losslessly decoded compiled package; only proven `Handler(19)` Init
-    /// writes are resolved and retained by runtime.
+    /// Losslessly decoded compiled package; only the recovered first-`Init`
+    /// subset is resolved and retained by runtime.
     pub package: ScriptPackage,
+    /// Optional formula rows loaded from this bundle's sibling `.fml` file.
+    pub formula_table: Option<FormulaTable>,
     /// Outcome of the restricted first-`Init` resolution for this bundle.
     pub init_execution: MissionScriptInitExecution,
     /// Recovered per-AI Behavior scheduler and total state.
@@ -725,11 +728,12 @@ fn schedule_behavior_distributor_tick(
     Some(behavior_elapsed_seconds(elapsed_ms))
 }
 
-/// Numeric script defaults selected for the mission's first script bundle.
+/// Numeric script declarations selected for the mission's first script bundle.
 ///
 /// GOG `ai.dll` first tries `<bundle-base>.var`, then falls back to the shared
 /// `MISSIONS/SCRIPTS/varset.var`. This stores the successfully selected source
-/// and supplies the typed targets for the proven `Handler(19)` Init writes.
+/// and supplies typed targets for recovered `Handler(19)` and numeric formula
+/// assignments in the first `Init` event.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MissionScriptVarSet {
     /// Resolved `.var` path selected by the original fallback order.
@@ -740,11 +744,7 @@ pub struct MissionScriptVarSet {
     pub declarations: VarSet,
 }
 
-/// One resolved, corpus-proven `Init` result for a mission clan.
-///
-/// This is intentionally limited to `Handler(19)`: an `Init` event's other
-/// selectors are retained in [`MissionScriptBundle::package`] but are not
-/// guessed as executable behavior.
+/// One resolved subset of the first `Init` event for a mission clan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MissionScriptInitState {
     /// TMA clan index that owns the `SuperAI` instance and varset.
@@ -753,8 +753,8 @@ pub struct MissionScriptInitState {
     pub event_index: usize,
     /// Raw event word preserved from the compiled `Init` event.
     pub event_word: u32,
-    /// Exact three DWORD writes made by each proven `Handler(19)` instruction.
-    pub writes: Vec<Handler19DwordWrite>,
+    /// Ordered numeric writes made by the supported `Init` instructions.
+    pub writes: Vec<ScriptInitWrite>,
 }
 
 /// Execution status of the first event whose case-sensitive C-string name is `Init`.
@@ -768,14 +768,14 @@ pub enum MissionScriptInitExecution {
         event_index: usize,
     },
     /// A preview retained the decoded package but stopped before the first
-    /// instruction outside the recovered `Handler(19)` action subset.
+    /// instruction outside the recovered numeric `Init` subset.
     Unsupported {
         /// Zero-based event table index selected by native lookup.
         event_index: usize,
         /// Zero-based instruction index where restricted resolution stopped.
         instruction_index: usize,
-        /// Typed selector, control, or result-save shape that is not modeled.
-        error: Handler19ResolveError,
+        /// Typed selector, operand, or expression shape that is not modeled.
+        error: ScriptInitResolveError,
     },
 }
 
@@ -918,7 +918,7 @@ pub struct LoadedMission {
     pub script_event_count: usize,
     /// Numeric script defaults loaded through the original bundle/fallback rule.
     pub script_varset_declaration_count: usize,
-    /// `Handler(19)` Init results resolved for mission clans.
+    /// Writes resolved for the first mission-clan `Init` events.
     pub script_init_state_count: usize,
     /// Instantiated per-clan varsets whose Init writes have been applied.
     pub script_varset_state_count: usize,
@@ -997,7 +997,7 @@ pub enum EngineError {
         /// Parse diagnostic.
         message: String,
     },
-    /// A recovered `Handler(19)` Init input or target was not representable.
+    /// A recovered `Init` input or write target was not representable.
     ScriptInit {
         /// Owning TMA clan index.
         clan_index: usize,
@@ -1015,7 +1015,7 @@ pub enum EngineError {
         /// Zero-based instruction index within that event.
         instruction_index: usize,
         /// Typed unsupported instruction shape.
-        source: Handler19ResolveError,
+        source: ScriptInitResolveError,
     },
     /// A recovered script handler could not resolve against runtime state.
     ScriptRuntime {
@@ -1831,10 +1831,11 @@ pub fn loaded_mission_script_varset(engine: &Engine) -> Option<&MissionScriptVar
         .and_then(|state| state.script_varset.as_ref())
 }
 
-/// Returns the proven script `Init` writes resolved for the loaded mission.
+/// Returns the recovered script `Init` writes resolved for the loaded mission.
 ///
-/// The list has one entry for each clan whose `Init` event contains recovered
-/// `Handler(19)` instructions. It is not a general script event executor.
+/// The list has one entry for each clan whose first `Init` event contains a
+/// supported `Handler(19)` instruction or numeric FML literal assignment. It
+/// is not a general script event executor.
 #[must_use]
 pub fn loaded_mission_script_init_states(engine: &Engine) -> Option<&[MissionScriptInitState]> {
     engine
@@ -6335,6 +6336,37 @@ fn normalize_engine_path(role: &'static str, value: &str) -> Result<NormalizedPa
     })
 }
 
+fn script_bundle_stem(base_path: &str) -> &str {
+    let suffix_start = base_path.len().saturating_sub(4);
+    if base_path
+        .get(suffix_start..)
+        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(".scr"))
+    {
+        &base_path[..suffix_start]
+    } else {
+        base_path
+    }
+}
+
+fn script_sibling_path(base_path: &str, extension: &str) -> String {
+    format!("{}.{extension}", script_bundle_stem(base_path))
+}
+
+fn load_script_formula_table(
+    vfs: &Arc<dyn Vfs>,
+    base_path: &str,
+) -> Result<Option<FormulaTable>, EngineError> {
+    let path = normalize_engine_path("mission formula", &script_sibling_path(base_path, "fml"))?;
+    match vfs.read(&path) {
+        Ok(bytes) => Ok(Some(FormulaTable::parse(&bytes))),
+        Err(VfsError::NotFound(_)) => Ok(None),
+        Err(source) => Err(EngineError::Vfs {
+            path: path.as_str().to_string(),
+            source,
+        }),
+    }
+}
+
 fn load_mission_scripts(
     vfs: &Arc<dyn Vfs>,
     mission: &MissionDocument,
@@ -6356,6 +6388,7 @@ fn load_mission_scripts(
             path: normalized.as_str().to_string(),
             message: source.to_string(),
         })?;
+        let formula_table = load_script_formula_table(vfs, &base_path)?;
         if first_base_path.is_none() {
             first_base_path = Some(base_path.clone());
         }
@@ -6364,6 +6397,7 @@ fn load_mission_scripts(
             base_path,
             script_path: normalized.as_str().to_string(),
             package,
+            formula_table,
             init_execution: MissionScriptInitExecution::Missing,
             behavior_warm_start: None,
         });
@@ -6375,7 +6409,7 @@ fn load_mission_scripts(
     let (init_states, varset_states) = if asset_scope == MissionAssetScope::Full {
         (Vec::new(), Vec::new())
     } else if let Some(varset) = &varset {
-        let init_states = resolve_handler19_init_states(
+        let init_states = resolve_init_states(
             &mission
                 .clans
                 .iter()
@@ -6420,7 +6454,7 @@ fn start_mission_scripts(
         ));
 
         if let Some(varset) = scripts.varset.as_ref() {
-            init_states.extend(resolve_handler19_init_states(
+            init_states.extend(resolve_init_states(
                 &clan_anchors,
                 std::slice::from_mut(bundle),
                 varset,
@@ -6462,12 +6496,12 @@ fn materialize_script_varset_states(
                         return Err(EngineError::ScriptInit {
                             clan_index: bundle.clan_index,
                             message: format!(
-                                "Handler(19) write index {} is outside the instantiated varset",
+                                "Init write index {} is outside the instantiated varset",
                                 write.index
                             ),
                         });
                     };
-                    *value = VarSetDefault::Dword(write.value);
+                    *value = write.value;
                 }
             }
             Ok(MissionScriptVarSetState {
@@ -6478,7 +6512,7 @@ fn materialize_script_varset_states(
         .collect()
 }
 
-fn resolve_handler19_init_states(
+fn resolve_init_states(
     clan_anchors: &[[f32; 2]],
     bundles: &mut [MissionScriptBundle],
     varset: &MissionScriptVarSet,
@@ -6511,15 +6545,15 @@ fn resolve_handler19_init_states(
         };
         match varset
             .declarations
-            .resolve_handler19_init(&bundle.package, input)
+            .resolve_init(&bundle.package, input, bundle.formula_table.as_ref())
             .map_err(|source| EngineError::ScriptInit {
                 clan_index: bundle.clan_index,
                 message: source.to_string(),
             })? {
-            Handler19InitResolution::Missing => {
+            ScriptInitResolution::Missing => {
                 bundle.init_execution = MissionScriptInitExecution::Missing;
             }
-            Handler19InitResolution::Executed {
+            ScriptInitResolution::Executed {
                 event_index,
                 event_word,
                 writes,
@@ -6534,7 +6568,7 @@ fn resolve_handler19_init_states(
                     });
                 }
             }
-            Handler19InitResolution::Unsupported {
+            ScriptInitResolution::Unsupported {
                 event_index,
                 instruction_index,
                 error,
@@ -6545,7 +6579,7 @@ fn resolve_handler19_init_states(
                     error,
                 };
             }
-            Handler19InitResolution::Unsupported {
+            ScriptInitResolution::Unsupported {
                 event_index,
                 instruction_index,
                 error,
@@ -9626,6 +9660,7 @@ mod tests {
                 trailing_bytes: Vec::new(),
                 raw: Arc::from(&b""[..]),
             },
+            formula_table: None,
             init_execution: MissionScriptInitExecution::Missing,
             behavior_warm_start: None,
         };
@@ -9642,7 +9677,7 @@ mod tests {
         assert!(matches!(
             error,
             EngineError::ScriptInitUnsupported {
-                source: Handler19ResolveError::UnsupportedSelector {
+                source: ScriptInitResolveError::UnsupportedSelector {
                     found: fparkan_script::ScriptDispatchSelector::Handler(18),
                 },
                 ..
@@ -12213,6 +12248,204 @@ mod tests {
     }
 
     #[test]
+    fn full_load_applies_a_synthetic_numeric_formula_in_init() {
+        fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
+        fn push_i32(bytes: &mut Vec<u8>, value: i32) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
+        fn push_f32(bytes: &mut Vec<u8>, value: f32) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
+        fn push_lp(bytes: &mut Vec<u8>, value: &[u8]) {
+            push_u32(bytes, u32::try_from(value.len()).expect("length fits u32"));
+            bytes.extend_from_slice(value);
+        }
+
+        fn build_nres(entries: &[(u32, u32, u32, Vec<u8>)]) -> Vec<u8> {
+            let mut bytes = vec![0; 16];
+            let mut offsets = Vec::with_capacity(entries.len());
+            for (_, _, _, payload) in entries {
+                offsets.push(u32::try_from(bytes.len()).expect("offset fits u32"));
+                bytes.extend_from_slice(payload);
+                let padding = (8 - bytes.len() % 8) % 8;
+                bytes.resize(bytes.len() + padding, 0);
+            }
+            for (index, (type_id, attr1, attr3, payload)) in entries.iter().enumerate() {
+                push_u32(&mut bytes, *type_id);
+                push_u32(&mut bytes, *attr1);
+                push_u32(&mut bytes, 0);
+                push_u32(
+                    &mut bytes,
+                    u32::try_from(payload.len()).expect("payload fits u32"),
+                );
+                push_u32(&mut bytes, *attr3);
+                let mut name = [0; 36];
+                name[..4].copy_from_slice(b"Test");
+                bytes.extend_from_slice(&name);
+                push_u32(&mut bytes, offsets[index]);
+                push_u32(&mut bytes, u32::try_from(index).expect("index fits u32"));
+            }
+            bytes[..4].copy_from_slice(b"NRes");
+            bytes[4..8].copy_from_slice(&0x100_u32.to_le_bytes());
+            bytes[8..12].copy_from_slice(
+                &u32::try_from(entries.len())
+                    .expect("count fits u32")
+                    .to_le_bytes(),
+            );
+            let size = u32::try_from(bytes.len()).expect("size fits u32");
+            bytes[12..16].copy_from_slice(&size.to_le_bytes());
+            bytes
+        }
+
+        fn empty_land_mesh() -> Vec<u8> {
+            let streams = [
+                (1, 0, 38, Vec::new()),
+                (2, 0, 0, vec![0; 0x8c]),
+                (3, 0, 12, Vec::new()),
+                (4, 0, 4, Vec::new()),
+                (5, 0, 4, Vec::new()),
+                (18, 0, 4, Vec::new()),
+                (14, 0, 4, Vec::new()),
+                (11, 0, 4, Vec::new()),
+                (21, 0, 28, Vec::new()),
+            ];
+            build_nres(&streams)
+        }
+
+        fn minimal_land_map() -> Vec<u8> {
+            let mut payload = Vec::new();
+            for value in [0.0_f32, 0.0, 0.0, 0.0, 2.0, 0.0, 1.0, 0.0] {
+                push_f32(&mut payload, value);
+            }
+            for value in [0, 0, 7, 0, 2, 0] {
+                push_u32(&mut payload, value);
+            }
+            for value in [0.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0] {
+                push_f32(&mut payload, value);
+            }
+            for _ in 0..2 {
+                push_i32(&mut payload, -1);
+                push_i32(&mut payload, -1);
+            }
+            push_u32(&mut payload, 1);
+            push_u32(&mut payload, 1);
+            payload.extend_from_slice(&1_u16.to_le_bytes());
+            payload.extend_from_slice(&0_u16.to_le_bytes());
+            build_nres(&[(12, 1, 0, payload)])
+        }
+
+        fn synthetic_mission() -> Vec<u8> {
+            let mut bytes = Vec::new();
+            push_u32(&mut bytes, 1);
+            push_u32(&mut bytes, 0);
+            push_u32(&mut bytes, 6);
+            push_u32(&mut bytes, 1);
+            push_lp(&mut bytes, b"Synthetic");
+            push_u32(&mut bytes, u32::MAX);
+            push_f32(&mut bytes, 12.25);
+            push_f32(&mut bytes, 34.75);
+            push_u32(&mut bytes, 1);
+            push_lp(&mut bytes, b"MISSIONS/SCRIPTS/formula");
+            push_i32(&mut bytes, 0);
+            push_lp(&mut bytes, b"");
+            push_i32(&mut bytes, 0);
+            push_u32(&mut bytes, 0);
+            push_u32(&mut bytes, 10);
+            push_u32(&mut bytes, 0);
+            push_lp(&mut bytes, b"DATA\\MAPS\\SYNTHETIC\\land");
+            push_u32(&mut bytes, 0);
+            push_lp(&mut bytes, b"");
+            push_u32(&mut bytes, 1);
+            push_u32(&mut bytes, 0);
+            bytes
+        }
+
+        let package = ScriptPackage {
+            opcode_handler_count: 73,
+            events: vec![fparkan_script::ScriptEvent {
+                name_len: 4,
+                name_raw: b"Init\0".to_vec(),
+                event_word: 0,
+                instructions: vec![
+                    ScriptInstruction {
+                        header_words: [19, u32::MAX, u32::MAX, u32::MAX, 6, 3, u32::MAX],
+                        references: vec![0, 1, 2],
+                    },
+                    ScriptInstruction {
+                        header_words: [u32::MAX, 3, u32::MAX, u32::MAX, 6, 0, 0],
+                        references: Vec::new(),
+                    },
+                ],
+            }],
+            trailing_bytes: Vec::new(),
+            raw: Arc::from(&b""[..]),
+        };
+        let mut files = MemoryVfs::default();
+        for (path, bytes) in [
+            (
+                "MISSIONS/TEST/data.tma",
+                Arc::<[u8]>::from(synthetic_mission().into_boxed_slice()),
+            ),
+            (
+                "DATA/MAPS/SYNTHETIC/Land.msh",
+                Arc::<[u8]>::from(empty_land_mesh().into_boxed_slice()),
+            ),
+            (
+                "DATA/MAPS/SYNTHETIC/Land.map",
+                Arc::<[u8]>::from(minimal_land_map().into_boxed_slice()),
+            ),
+            ("BuildDat.lst", Arc::from(&b""[..])),
+            (
+                "MISSIONS/SCRIPTS/formula.scr",
+                Arc::<[u8]>::from(encode_script_package(&package).into_boxed_slice()),
+            ),
+            (
+                "MISSIONS/SCRIPTS/formula.var",
+                Arc::from(
+                    &b"VAR(DWORD, ClanBaseX, 0)\nVAR(DWORD, ClanBaseY, 0)\nVAR(DWORD, ClanID, 0)\nVAR(float, target, 0.5)\n"[..],
+                ),
+            ),
+            (
+                "MISSIONS/SCRIPTS/formula.fml",
+                Arc::from(&b"// authored literal\n\nFUNCTION( , 0.8,  )\nFUNCTION( later, target + 2, )\n"[..]),
+            ),
+        ] {
+            files.insert(
+                normalize_engine_path("synthetic mission", path).expect("valid path"),
+                bytes,
+            );
+        }
+        let vfs: Arc<dyn Vfs> = Arc::new(files);
+        let mut engine = create(EngineServices::new(vfs)).expect("engine");
+        let loaded = load_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/TEST/data.tma".to_string(),
+                mode: MissionMode::SingleMission,
+            },
+            0,
+        )
+        .expect("full load applies the authored numeric literal");
+
+        assert_eq!(loaded.script_bundle_count, 1);
+        let states = loaded_mission_script_varset_states(&engine).expect("runtime varset");
+        assert_eq!(
+            states[0].values,
+            [
+                VarSetDefault::Dword(12),
+                VarSetDefault::Dword(35),
+                VarSetDefault::Dword(0),
+                VarSetDefault::FloatBits(0x3f4c_cccd),
+            ]
+        );
+    }
+
+    #[test]
     fn script_varset_prefers_bundle_adjacent_file_then_uses_shared_fallback() {
         let mut personal_files = MemoryVfs::default();
         personal_files.insert(
@@ -12262,6 +12495,27 @@ mod tests {
     }
 
     #[test]
+    fn script_formula_table_uses_an_optional_case_insensitive_scr_sibling() {
+        let mut files = MemoryVfs::default();
+        let vfs: Arc<dyn Vfs> = Arc::new(files.clone());
+        assert!(matches!(
+            load_script_formula_table(&vfs, "MISSIONS/SCRIPTS/custom.SCR"),
+            Ok(None)
+        ));
+
+        files.insert(
+            normalize_engine_path("test", "MISSIONS/SCRIPTS/custom.fml").expect("path"),
+            Arc::from(&b"FUNCTION(value, 1.25, )\n"[..]),
+        );
+        let vfs: Arc<dyn Vfs> = Arc::new(files);
+        let formulas = load_script_formula_table(&vfs, "MISSIONS/SCRIPTS/custom.SCR")
+            .expect("load optional formula sibling")
+            .expect("formula file exists");
+        assert_eq!(formulas.rows.len(), 1);
+        assert_eq!(formulas.evaluate_numeric_literal(0), Ok(1.25));
+    }
+
+    #[test]
     fn handler_nineteen_init_executes_from_clan_anchor_for_each_bundle() {
         let declarations = fparkan_script::parse_varset(
             b"VAR( DWORD, ClanBaseX, 950)\nVAR( DWORD, ClanBaseY, 1000)\nVAR( DWORD, ClanID, 0)\n",
@@ -12290,11 +12544,12 @@ mod tests {
                 trailing_bytes: Vec::new(),
                 raw: Arc::from(&b""[..]),
             },
+            formula_table: None,
             init_execution: MissionScriptInitExecution::Missing,
             behavior_warm_start: None,
         }];
 
-        let states = resolve_handler19_init_states(
+        let states = resolve_init_states(
             &[[500.0, 752.0], [728.0, 449.0]],
             &mut bundles,
             &varset,
@@ -12308,15 +12563,18 @@ mod tests {
                 event_index: 0,
                 event_word: 0x1234_5678,
                 writes: vec![
-                    Handler19DwordWrite {
+                    ScriptInitWrite {
                         index: 0,
-                        value: 728
+                        value: VarSetDefault::Dword(728),
                     },
-                    Handler19DwordWrite {
+                    ScriptInitWrite {
                         index: 1,
-                        value: 449
+                        value: VarSetDefault::Dword(449),
                     },
-                    Handler19DwordWrite { index: 2, value: 1 },
+                    ScriptInitWrite {
+                        index: 2,
+                        value: VarSetDefault::Dword(1),
+                    },
                 ],
             }]
         );
@@ -12387,12 +12645,13 @@ mod tests {
             base_path: "MISSIONS/SCRIPTS/default".to_string(),
             script_path: "MISSIONS/SCRIPTS/default.scr".to_string(),
             package: package.clone(),
+            formula_table: None,
             init_execution: MissionScriptInitExecution::Missing,
             behavior_warm_start: None,
         };
         let anchors = [[500.0, 752.0]];
         let mut preview_bundles = vec![bundle()];
-        let preview_states = resolve_handler19_init_states(
+        let preview_states = resolve_init_states(
             &anchors,
             &mut preview_bundles,
             &varset,
@@ -12405,7 +12664,7 @@ mod tests {
             MissionScriptInitExecution::Unsupported {
                 event_index: 0,
                 instruction_index: 1,
-                error: Handler19ResolveError::UnsupportedSelector {
+                error: ScriptInitResolveError::UnsupportedSelector {
                     found: ScriptDispatchSelector::Handler(18),
                 },
             }
@@ -12426,7 +12685,7 @@ mod tests {
 
         let mut full_bundles = vec![bundle()];
         assert!(matches!(
-            resolve_handler19_init_states(
+            resolve_init_states(
                 &anchors,
                 &mut full_bundles,
                 &varset,
@@ -12436,7 +12695,7 @@ mod tests {
                 clan_index: 0,
                 event_index: 0,
                 instruction_index: 1,
-                source: Handler19ResolveError::UnsupportedSelector {
+                source: ScriptInitResolveError::UnsupportedSelector {
                     found: ScriptDispatchSelector::Handler(18),
                 },
                 ..
@@ -12452,7 +12711,7 @@ mod tests {
             ..bundle()
         }];
         assert!(matches!(
-            resolve_handler19_init_states(
+            resolve_init_states(
                 &anchors,
                 &mut malformed_bundle,
                 &varset,
@@ -13731,16 +13990,17 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
-    fn licensed_campaign_preview_keeps_unsupported_init_without_partial_writes() {
+    fn licensed_campaign_full_load_applies_literals_then_single_handler43_rolls_back() {
         let root = licensed_root("IS");
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(root));
-        let mut engine = create(EngineServices::new(vfs)).expect("engine");
+        let mut engine = create(EngineServices::new(vfs.clone())).expect("engine");
+        let campaign_request = || MissionRequest {
+            key: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.01/data.tma".to_string(),
+            mode: MissionMode::SingleMission,
+        };
         let loaded = load_mission_static_preview_roots(
             &mut engine,
-            MissionRequest {
-                key: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.01/data.tma".to_string(),
-                mode: MissionMode::SingleMission,
-            },
+            campaign_request(),
             NonZeroUsize::new(1).expect("non-zero root count"),
         )
         .expect("load licensed campaign preview");
@@ -13759,42 +14019,252 @@ mod tests {
             .iter()
             .all(|bundle| bundle.behavior_warm_start.is_none()));
         assert_eq!(engine.behavior_rng_state, INITIAL_BEHAVIOR_RNG_STATE);
-        let unsupported = bundles
+        let bundle = bundles
             .iter()
-            .find(|bundle| {
-                matches!(
-                    &bundle.init_execution,
-                    MissionScriptInitExecution::Unsupported { .. }
-                )
-            })
-            .expect("campaign package with an unsupported Init instruction");
+            .find(|bundle| bundle.clan_index == 0)
+            .expect("first campaign script bundle");
         assert_eq!(
-            &unsupported.init_execution,
-            &MissionScriptInitExecution::Unsupported {
-                event_index: 0,
-                instruction_index: 1,
-                error: Handler19ResolveError::UnsupportedSelector {
-                    found: fparkan_script::ScriptDispatchSelector::Sentinel,
-                },
-            }
+            bundle.base_path.replace('\\', "/"),
+            "MISSIONS/SCRIPTS/tut1_pl2"
         );
-        let clan_index = unsupported.clan_index;
+        assert_eq!(bundle.formula_table.as_ref().unwrap().rows.len(), 26);
+        assert_eq!(
+            bundle
+                .formula_table
+                .as_ref()
+                .unwrap()
+                .evaluate_numeric_literal(0),
+            Ok(0.0)
+        );
+        assert_eq!(
+            bundle.init_execution,
+            MissionScriptInitExecution::Executed { event_index: 0 }
+        );
         let states = loaded_mission_script_init_states(&engine).expect("Init writes");
-        assert!(states.iter().all(|state| state.clan_index != clan_index));
+        let init = states
+            .iter()
+            .find(|state| state.clan_index == 0)
+            .expect("first clan Init writes");
+        assert_eq!(
+            init.writes
+                .iter()
+                .map(|write| write.index)
+                .collect::<Vec<_>>(),
+            [224, 225, 226, 188, 189, 190, 191]
+        );
+        assert!(init.writes[3..]
+            .iter()
+            .all(|write| write.value == VarSetDefault::Dword(0)));
         let varset = loaded_mission_script_varset_states(&engine)
             .expect("per-clan varsets")
             .iter()
-            .find(|state| state.clan_index == clan_index)
-            .expect("unsupported clan varset");
+            .find(|state| state.clan_index == 0)
+            .expect("first clan varset");
+        assert_eq!(
+            &varset.values[188..192],
+            &[
+                VarSetDefault::Dword(0),
+                VarSetDefault::Dword(0),
+                VarSetDefault::Dword(0),
+                VarSetDefault::Dword(0),
+            ]
+        );
         assert_eq!(
             &varset.values[224..227],
             &[
-                VarSetDefault::Dword(950),
-                VarSetDefault::Dword(1000),
+                VarSetDefault::Dword(549),
+                VarSetDefault::Dword(630),
                 VarSetDefault::Dword(0),
             ]
         );
         assert!(loaded.script_bundle_count >= 1);
+
+        let full = load_mission(&mut engine, campaign_request(), 100_000)
+            .expect("full load licensed campaign mission");
+        assert_eq!(full.script_bundle_count, 4);
+        assert_eq!(full.script_init_state_count, 4);
+        assert_eq!(full.script_varset_state_count, 4);
+        let full_bundles = loaded_mission_script_bundles(&engine).expect("full script bundles");
+        assert_eq!(full_bundles.len(), 4);
+        assert!(full_bundles.iter().all(|bundle| matches!(
+            &bundle.init_execution,
+            MissionScriptInitExecution::Executed { event_index: 0 }
+        )));
+        assert!(full_bundles
+            .iter()
+            .all(|bundle| bundle.behavior_warm_start.is_some()));
+        let full_states = loaded_mission_script_init_states(&engine).expect("full Init writes");
+        let first_full_init = full_states
+            .iter()
+            .find(|state| state.clan_index == 0)
+            .expect("campaign clan 0 Init");
+        assert_eq!(
+            first_full_init
+                .writes
+                .iter()
+                .map(|write| write.index)
+                .collect::<Vec<_>>(),
+            [224, 225, 226, 188, 189, 190, 191]
+        );
+        assert!(first_full_init.writes[3..]
+            .iter()
+            .all(|write| write.value == VarSetDefault::Dword(0)));
+        let campaign_summary = loaded_mission(&engine).expect("full campaign").clone();
+        let campaign_bundles = full_bundles.to_vec();
+        let campaign_init_states = full_states.to_vec();
+        let campaign_varsets = loaded_mission_script_varset_states(&engine)
+            .expect("full per-clan varsets")
+            .to_vec();
+        let campaign_rng = engine.behavior_rng_state;
+        let before = step_headless(&mut engine, InputSnapshot, 0)
+            .expect("step loaded campaign")
+            .snapshot
+            .objects;
+
+        let single_error = load_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Single.01/data.tma".to_string(),
+                mode: MissionMode::SingleMission,
+            },
+            100_500,
+        )
+        .expect_err("Single.01 reaches the later Handler(43) boundary");
+        assert!(matches!(
+            single_error,
+            EngineError::ScriptInitUnsupported {
+                clan_index: 1,
+                path,
+                event_index: 0,
+                instruction_index: 10,
+                source: ScriptInitResolveError::UnsupportedSelector {
+                    found: fparkan_script::ScriptDispatchSelector::Handler(43),
+                },
+            } if path.ends_with("scream.scr")
+        ));
+        assert_eq!(loaded_mission(&engine), Some(&campaign_summary));
+        assert_eq!(
+            loaded_mission_script_bundles(&engine),
+            Some(campaign_bundles.as_slice())
+        );
+        assert_eq!(
+            loaded_mission_script_init_states(&engine),
+            Some(campaign_init_states.as_slice())
+        );
+        assert_eq!(
+            loaded_mission_script_varset_states(&engine),
+            Some(campaign_varsets.as_slice())
+        );
+        assert_eq!(engine.behavior_rng_state, campaign_rng);
+        let after = step_headless(&mut engine, InputSnapshot, 0)
+            .expect("step retained campaign")
+            .snapshot
+            .objects;
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_single_preview_loads_each_formula_table_and_stops_at_handler43() {
+        let root = licensed_root("IS");
+        let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(root));
+        let mut engine = create(EngineServices::new(vfs)).expect("engine");
+        load_mission_static_preview_roots(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Single.01/data.tma".to_string(),
+                mode: MissionMode::SingleMission,
+            },
+            NonZeroUsize::new(1).expect("non-zero root count"),
+        )
+        .expect("load licensed Single.01 preview");
+
+        let bundles = loaded_mission_script_bundles(&engine).expect("script bundles");
+        assert_eq!(bundles.len(), 2);
+        let first = bundles
+            .iter()
+            .find(|bundle| bundle.clan_index == 0)
+            .expect("scr_pl_1 bundle");
+        assert_eq!(
+            first.base_path.replace('\\', "/"),
+            "MISSIONS/SCRIPTS/scr_pl_1"
+        );
+        assert_eq!(first.formula_table.as_ref().unwrap().rows.len(), 5);
+        assert_eq!(
+            first.init_execution,
+            MissionScriptInitExecution::Executed { event_index: 0 }
+        );
+        let second = bundles
+            .iter()
+            .find(|bundle| bundle.clan_index == 1)
+            .expect("scream bundle");
+        assert_eq!(
+            second.base_path.replace('\\', "/"),
+            "MISSIONS/SCRIPTS/scream"
+        );
+        let formulas = second.formula_table.as_ref().expect("scream FML");
+        assert_eq!(formulas.rows.len(), 149);
+        for (index, expected_bits) in [
+            0x3ecc_cccd,
+            0x3f4c_cccd,
+            0x3f00_0000,
+            0x3f80_0000,
+            0x4120_0000,
+            0x3e4c_cccd,
+            0x42c8_0000,
+            0x43c8_0000,
+            0x4000_0000,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                formulas
+                    .evaluate_numeric_literal(index as u32)
+                    .expect("referenced native literal")
+                    .to_bits(),
+                expected_bits
+            );
+        }
+        assert_eq!(
+            second.init_execution,
+            MissionScriptInitExecution::Unsupported {
+                event_index: 0,
+                instruction_index: 10,
+                error: ScriptInitResolveError::UnsupportedSelector {
+                    found: fparkan_script::ScriptDispatchSelector::Handler(43),
+                },
+            }
+        );
+
+        let states = loaded_mission_script_init_states(&engine).expect("preview Init writes");
+        assert!(states.iter().any(|state| state.clan_index == 0));
+        assert!(states.iter().all(|state| state.clan_index != 1));
+        let first_varset = loaded_mission_script_varset_states(&engine)
+            .expect("per-clan varsets")
+            .iter()
+            .find(|state| state.clan_index == 0)
+            .expect("scr_pl_1 varset");
+        assert_eq!(
+            &first_varset.values[186..188],
+            &[VarSetDefault::Dword(0), VarSetDefault::Dword(0)]
+        );
+        let declarations = loaded_mission_script_varset(&engine)
+            .expect("shared script varset")
+            .declarations
+            .declarations
+            .iter()
+            .map(|declaration| declaration.default_value)
+            .collect::<Vec<_>>();
+        let second_varset = loaded_mission_script_varset_states(&engine)
+            .expect("per-clan varsets")
+            .iter()
+            .find(|state| state.clan_index == 1)
+            .expect("scream varset");
+        assert_eq!(second_varset.values, declarations);
+        assert!(bundles
+            .iter()
+            .all(|bundle| bundle.behavior_warm_start.is_none()));
     }
 
     #[test]
@@ -14131,7 +14601,7 @@ mod tests {
         assert!(matches!(
             error,
             EngineError::ScriptInitUnsupported {
-                source: Handler19ResolveError::UnsupportedSelector {
+                source: ScriptInitResolveError::UnsupportedSelector {
                     found: ScriptDispatchSelector::Handler(18),
                 },
                 ..

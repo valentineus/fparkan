@@ -130,27 +130,54 @@ Iron3D и указатели `GetSuperAI` из `ai.dll` (таблица RVA `0x5
 tie-векторы проверяют, как сам `FISTP` реагирует на каждый RC, но не измеряют
 control word процесса.
 
-Отдельно проверены загрузка лицензированного AutoDemo в Rust и preview
-лицензированной кампании. AutoDemo даёт raw TMA anchor-ы
-`[(500.2857, 751.8217), (728.0, 449.0)]` и записи `[(500, 752, 0),
-(728, 449, 1)]`; preview кампании сохраняет package и статус `Unsupported`,
-не применяя частичные записи. Это подтверждает загрузчик и узкий Init resolver
-Rust.
+Лицензированный AutoDemo по-прежнему загружается с raw TMA anchor-ами
+`[(500.2857, 751.8217), (728.0, 449.0)]` и записями `[(500, 752, 0),
+(728, 449, 1)]`. Rust теперь также читает optional `.fml` sibling для каждого
+script base и поддерживает numeric literal assignments в первом `Init`.
+Отсутствующий `.fml` не мешает пакету с одними `Handler(19)`; другие ошибки
+чтения распространяются как VFS errors.
 
 Нативный конструктор показывает предупреждение при координате выше `10000`, но
 продолжает работу. Rust моделирует числовую запись, а не это UI-предупреждение;
 на первом `FISTP qword` он явно завершает загрузку ошибкой для NaN, infinity и
 значений вне signed-qword диапазона. В первом событии `Init` Rust поддерживает
-только action-форму `Handler(19)`: в семи disk header words control находится в
-`header_words[3]`, а result-save reference — в `header_words[1]`; для поддержанной
-формы оба равны `0xffffffff`. Это подтверждается перестановкой записи в
-`ai.dll!FUN_10011b20` (RVA `0x11b20`) и чтениями в исполнителе
-`FUN_10012020` (RVA `0x12020`) той же GOG-сборки. `Handler(19)` (`FUN_1000aa38`,
-RVA `0xaa38`) использует references `0..2`; `header_words[2]` его result-save
-guard-ом не проверяется. Неизвестная инструкция даёт `Unsupported` в preview,
-не применяя накопленные частичные записи; при полной загрузке это ошибка. Это
-ограничение Rust исполнителя, не правило оригинального dispatcher-а. Ошибочные
-ссылки и типы остаются ошибками в обоих режимах.
+два доказанных действия: `Handler(19)` и formula assignment selector `-1` при
+source `-1`, нулевой глубине условий и корректных индексах. У `Handler(19)`
+control находится в `header_words[3]`, а `header_words[1]` — result-save
+reference; оба равны `0xffffffff` в поддержанной форме. У formula assignment
+`header_words[1]` — индекс целевой varset ячейки, `header_words[2]` — source,
+а индекс formula row занимает `header_words[6]`. Маппинг подтверждён
+`ai.dll!FUN_10011b20` (RVA `0x11b20`) и исполнителем `FUN_10012020` (RVA
+`0x12020`), SHA-256 `c19cd6cd31cd2896f8c4ba0f0e700dd3408aec8182daaf4863d98a7d233a2abc`.
+`Handler(19)` (`FUN_1000aa38`, RVA `0xaa38`) использует references `0..2`;
+`header_words[2]` его result-save guard-ом не проверяется.
+
+Formula table загружается из `<bundle-base>.fml`; native `FUN_100123b0`
+(RVA `0x123b0`) проверяет ordinal, compiler `FUN_100152a0` (RVA `0x152a0`)
+строит numeric literal node, а evaluator `FUN_10015b30` (RVA `0x15b30`)
+возвращает его raw `f32`. Target type `3` сохраняет эти bits; type `5` проходит
+через `FUN_10012c00` (RVA `0x12c00`) и `__ftol` (RVA `0x1df70`) к raw DWORD
+с усечением к нулю. Изолированный x86 oracle на оригинальном `ai.dll` и
+настоящих ресурсах подтвердил таблицы `tut1_pl2`/`scr_pl_1`/`scream` с
+26/5/149 строками и 15 присваиваний: кампанийные `df0..df3` и `Single.01`
+`dT8/dT9` получают `0`; `scream` задаёт `fDifficulty = 0.8f` и остальные
+проверенные DWORD `0, 0, 1, 10, 0, 100, 400, 2`.
+
+Граница Rust остаётся узкой: ссылка должна вести на один digit-starting numeric
+token и типизированную `float`/`DWORD` ячейку. Неизвестные expression nodes,
+переменные, unary operators, составные выражения и source-copy ветвь
+`source != 0xffffffff` остаются явными ошибками; native source-copy переносит
+всю varset record, не только числовое значение. В preview package сохраняется,
+но `Unsupported` не применяет частичные writes; полная загрузка отклоняет весь
+новый мир и сохраняет предыдущие world/RNG. Это политика Rust, не правило
+оригинального dispatcher-а.
+
+Лицензированный test загружает одну первую кампанийную миссию
+`CAMPAIGN/CAMPAIGN.00/Mission.01/data.tma` после literal writes; это не проход
+всей цепочки кампании. Обычная `Single.01` доходит до следующего blocker-а:
+`Handler(43)` в clan 1, `Init` instruction 10. Rust не перескакивает его;
+preview оставляет varset этого клана на defaults, а полный load завершает ошибкой
+с rollback. Это ещё не загрузка/запуск игры и не общий dispatcher.
 
 Для GOG-сборки также найден статический host call path в `Init`. В
 `iron3d.dll!FUN_1005ff40` (RVA `0x5ff40`) одна ветвь сначала проходит записи
