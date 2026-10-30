@@ -648,11 +648,15 @@ Native interoperability подтверждается только успешны
 форматы: `gamefont.rlb` читается общим RsLi reader, но его native consumer этим
 не установлен; для меню подтверждена цепочка `menu_resources.cfg` → NRes
 `font.lib` → native lookup `MENU_FONT` с получением реального font-объекта.
-`menu_resources.cfg` и шесть вариантов `MENU_FONT`/`GAME_FONT` сопоставлены с
-NRes-записями в [разборе shell и шрифтов](ui-shell.md). Остаются неизвестными
-glyph metrics и drawing, выбор dimension на фактическом дисплее `1280x1024`,
-widget tree, layout rules, sprite command semantics, focus/navigation и HUD
-state machine.
+Reader `fparkan-font` разбирает 20-байтовый Tfnt prefix, 256 записей фиксированного
+шага и передаёт вложенный Texm общему reader-у. Native consumer подтверждает
+два целочисленных параметра, per-byte spacing и signed advance; смысл трёх glyph DWORD
+и поля заголовка по `0x0c` пока не установлен. Это не реализует выбор шрифта, текстовый
+layout или glyph drawing. `menu_resources.cfg` и шесть вариантов
+`MENU_FONT`/`GAME_FONT` сопоставлены с NRes-записями в
+[разборе shell и шрифтов](ui-shell.md). Также остаются открытыми выбор dimension
+на фактическом дисплее `1280x1024`, widget tree, layout rules, sprite command
+semantics, focus/navigation и HUD state machine.
 
 Закрывающий эксперимент: сопоставить оставшиеся детали `shell_ctrls.cfg`,
 `cursor.cfg`, `game_resources.cfg` и `hq.cfg` с GUI object factories и снять

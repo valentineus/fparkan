@@ -4,6 +4,7 @@ members = [
     "crates/fparkan-animation",
     "crates/fparkan-assets",
     "crates/fparkan-binary",
+    "crates/fparkan-font",
     "crates/fparkan-fx",
     "crates/fparkan-material",
     "crates/fparkan-mission-format",

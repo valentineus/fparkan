@@ -488,6 +488,14 @@ name = "fparkan-binary"
 version = "0.1.0"
 
 [[package]]
+name = "fparkan-font"
+version = "0.1.0"
+dependencies = [
+ "fparkan-nres",
+ "fparkan-texm",
+]
+
+[[package]]
 name = "fparkan-fx"
 version = "0.1.0"
 dependencies = [

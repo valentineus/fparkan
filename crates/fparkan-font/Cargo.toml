@@ -1,0 +1,12 @@
+[package]
+name = "fparkan-font"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fparkan-texm = { path = "../fparkan-texm" }
+
+[dev-dependencies]
+fparkan-nres = { path = "../fparkan-nres" }

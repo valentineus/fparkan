@@ -77,6 +77,53 @@ quirk для `INTERF8.TEX`. В полной GOG-сборке меню отдел
 реального font-объекта, но не конкретной NRes-записи при `1280x1024`, её
 отрисовку или паритет шрифтов.
 
+## Фиксированный reader Tfnt
+
+В подтверждённом пути `World3D.dll` (SHA-256
+`17e4a3089b2583a8cf2356c9db0390b1aba138356a09130d79b4e7e4791da61e`)
+передаёт ordinal NRes-reader-у в RVA `0x1361f`, а затем передаёт полученный
+указатель renderer-у в RVA `0x13624`; бит `0x400000` установлен у вызова в RVA
+`0x1360d`. В `Ngi32.dll` (SHA-256
+`bab9840d94f4e4e74ffc26677724fa896cf4823845504d09a9e025f80016edf5`) vtable
+NRes у RVA `0x318bc` ведёт к `FUN_10011f80` (RVA `0x11f80`), которая возвращает
+`mapped_base + data_offset`. Renderer vtable у RVA `0x315e0` направляет slot
+`+0x58` в `FUN_10007dd0` (RVA `0x7dd0`), затем ресурс проходит через
+`FUN_10010c10` (RVA `0x10c10`) и хранит pointer в `FUN_1000f3d0` (RVA `0x0f3d0`).
+Loader font-объекта `FUN_1000fb30` (RVA `0x0fb30`) при флаге `0x400000`
+использует этот адрес как начало Tfnt payload; отдельная RsLi-обёртка в этом
+пути не читается.
+
+| Смещение | Что читает `fparkan-font` |
+| --- | --- |
+| `0x00..0x03` | Сигнатура `Tfnt`; reader проверяет её на границе файлового API. В наблюдавшемся native loader проверки сигнатуры не было. |
+| `0x04..0x07` | `i32`, нижняя граница ширины в native fixed-width path. |
+| `0x08..0x0b` | `i32`, вертикальный размер для native clipping/drawing. |
+| `0x0c..0x0f` | Сырые биты `u32`, скопированные в font object и участвующие в float-сложении при drawing; имя и смысл поля неизвестны. |
+| `0x10..0x13` | `i32`, прибавляемый один раз на входной байт при native text measurement. |
+| `0x14..0x1013` | 256 записей по 16 байт: три сырых DWORD и signed `i32` advance по смещению `+0x0c`. |
+| `0x1014..конец` | Обычный Texm-документ, передаваемый общему `fparkan-texm::decode_texm`. |
+
+Первые три слова glyph record имеют разные native consumers, но их общая
+семантика не восстановлена: одно слово загружается как float, другое попадает
+в сформированные vertex data, а третье не прояснилось в исследованных ветвях.
+Поэтому reader сохраняет их как `word0..word2`, а поле заголовка по смещению
+`0x0c` — как неинтерпретированные float-биты. Он не выбирает размер текстуры по разрешению
+дисплея и не задаёт диапазон размеров: в проверенных ресурсах встречаются
+`128×128` и `256×256`, а форматы, mip-цепочку и палитру проверяет общий Texm
+reader.
+
+```rust
+let font = decode_tfnt(Arc::<[u8]>::from(raw_font_payload))?;
+let glyph = font.glyphs[usize::from(input_byte)];
+let texture = font.texm;
+```
+
+Игнорируемый corpus-тест разбирает через общий NRes reader девять записей
+`ui/font.lib` и `ARIALTEX.TFT` из `sys.lib`; он сверяет известные размеры,
+Indexed8, одну mip-ступень и выборочные поля `gf_640.tft`. Это проверка байтов
+лицензированной GOG-сборки и parser contract, а не запуск shell или проверка
+отрисовки.
+
 Ключ ресурса, legacy path, локализованный текст и исходные bytes — четыре
 разные идентичности. Archive keys остаются ASCII-casefold; `TextRes.cfg`,
 briefing/messages и script strings могут требовать ANSI/CP1251 decoding.
@@ -95,10 +142,11 @@ design resolution. Отдельно хранятся legacy-layout coordinates, 
 viewport, scale/letterbox policy, mouse-to-layout transform, clipping и
 z-order. Cursor, sprite и hit-test обязаны применять одно преобразование.
 
-Font contract включает glyph image, advance, bearing/offset, line height и
-fallback glyph. Содержимое `gamefont.rlb` и `Tfnt` payload записей `.tft`
-сохраняется без потери bytes через общие readers (`RsLi` и `NRes`), но семантика
-метрик и глифов ещё не восстановлена по consumer trace.
+Font contract включает glyph image, bearing/offset, line height и fallback
+glyph. `fparkan-font` читает фиксированную таблицу Tfnt и отдаёт signed advance
+и embedded Texm; он не выполняет text measurement/layout или glyph drawing.
+`gamefont.rlb` по-прежнему читается общим RsLi reader, но его native consumer не
+установлен.
 
 Нормализованное событие проходит modal widget, затем shell command map; лишь
 разрешённая gameplay-команда превращается в World3D manual event. Held state и
