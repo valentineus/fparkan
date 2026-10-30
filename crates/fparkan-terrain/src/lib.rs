@@ -409,6 +409,13 @@ impl TerrainWorld {
         self.surfaces.len()
     }
 
+    /// Bounds of the indexed surface geometry, excluding unused source vertices.
+    #[must_use]
+    pub fn surface_bounds(&self) -> Option<[[f32; 3]; 2]> {
+        let root = self.surface_bvh.nodes.get(self.surface_bvh.root?)?;
+        Some([root.min, root.max])
+    }
+
     /// Returns the validated source mesh retained for renderer integration.
     ///
     /// Runtime collision queries use their own compact triangle representation;
@@ -1212,6 +1219,15 @@ mod tests {
                 .expect("route"),
             None
         );
+    }
+
+    #[test]
+    fn surface_bounds_cover_query_geometry_and_ignore_unused_positions() {
+        let mut mesh = synthetic_land_mesh();
+        mesh.positions.push([1000.0, -1000.0, 1000.0]);
+        let world = TerrainWorld::from_land_msh(&mesh).expect("world");
+        assert_eq!(world.surface_bounds(), Some([[0.0; 3], [1.0, 1.0, 2.0]]));
+        assert_eq!(TerrainWorld::default().surface_bounds(), None);
     }
 
     #[test]

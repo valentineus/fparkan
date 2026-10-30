@@ -332,6 +332,11 @@ impl FreeFlightCamera {
         if !self.ground_clearance.is_finite() || self.ground_clearance < 0.0 {
             return Err("free-flight ground clearance must be finite and nonnegative".to_string());
         }
+        if let Some([min, max]) = terrain.surface_bounds() {
+            for axis in 0..2 {
+                self.position[axis] = self.position[axis].clamp(min[axis], max[axis]);
+            }
+        }
         let Some(ground_height) = terrain
             .height_at([self.position[0], self.position[1]])
             .map_err(|error| format!("free-flight terrain height query: {error}"))?
@@ -9021,15 +9026,27 @@ mod tests {
         assert_eq!(camera.position, [0.75, 0.25, 36.5]);
 
         let mut outside_camera = FreeFlightCamera {
-            position: [2.0, 2.0, -17.0],
+            position: [2.0, -2.0, -17.0],
             ground_clearance: 2.0,
             ..camera
         };
-        let unchanged = outside_camera.position;
         outside_camera
             .keep_above_terrain(&terrain)
-            .expect("missing terrain sample leaves the camera alone");
-        assert_eq!(outside_camera.position, unchanged);
+            .expect("clamp to the map before sampling the floor");
+        assert_eq!(outside_camera.position, [1.0, 0.0, 36.0]);
+
+        outside_camera.position = [-2.0, 2.0, 100.0];
+        outside_camera
+            .keep_above_terrain(&terrain)
+            .expect("clamp the other map edges without limiting altitude");
+        assert_eq!(outside_camera.position, [0.0, 1.0, 100.0]);
+
+        outside_camera.move_speed = 40.0;
+        outside_camera.advance(&HashSet::from([KeyCode::KeyW, KeyCode::ShiftLeft]), 0.1);
+        outside_camera
+            .keep_above_terrain(&terrain)
+            .expect("accelerated movement still stops at the map edge");
+        assert_eq!(outside_camera.position, [1.0, 1.0, 100.0]);
 
         let mut unsupported_camera = FreeFlightCamera {
             position: [0.25, 0.25, 35.5],
@@ -9040,6 +9057,49 @@ mod tests {
             .keep_above_terrain(&TerrainWorld::default())
             .expect_err("terrain query errors must propagate")
             .contains("terrain height query"));
+    }
+
+    #[test]
+    #[ignore = "requires the original GOG installation"]
+    fn free_flight_camera_stops_at_original_map_edges_under_accelerated_movement() {
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT")
+            .expect("set FPARKAN_CORPUS_PART1_ROOT to the original GOG installation");
+        let mut engine =
+            create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).expect("engine");
+        load_mission_static_preview(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Autodemo.00/data.tma".to_string(),
+                mode: MissionMode::SingleMission,
+            },
+        )
+        .expect("original mission");
+        let terrain = loaded_terrain(&engine).expect("original terrain");
+        let [min, max] = terrain.surface_bounds().expect("original map bounds");
+        let keys = HashSet::from([KeyCode::KeyW, KeyCode::ShiftLeft]);
+        for (axis, yaw, edge) in [
+            (0, 0.0, max[0]),
+            (0, std::f32::consts::PI, min[0]),
+            (1, std::f32::consts::FRAC_PI_2, max[1]),
+            (1, -std::f32::consts::FRAC_PI_2, min[1]),
+        ] {
+            let mut camera = FreeFlightCamera::from_bounds(min, max).expect("camera");
+            camera.position = [
+                (min[0] + max[0]) * 0.5,
+                (min[1] + max[1]) * 0.5,
+                max[2] + 10.0,
+            ];
+            camera.yaw = yaw;
+            camera.pitch = 0.0;
+            for _ in 0..512 {
+                camera.advance(&keys, 0.1);
+                camera.keep_above_terrain(terrain).expect("map constraint");
+                for axis in 0..2 {
+                    assert!((min[axis]..=max[axis]).contains(&camera.position[axis]));
+                }
+            }
+            assert_eq!(camera.position[axis], edge);
+        }
     }
 
     #[test]
