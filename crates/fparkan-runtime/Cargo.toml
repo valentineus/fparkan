@@ -17,3 +17,6 @@ fparkan-resource = { path = "../fparkan-resource" }
 fparkan-script = { path = "../fparkan-script" }
 fparkan-vfs = { path = "../fparkan-vfs" }
 fparkan-world = { path = "../fparkan-world" }
+
+[dev-dependencies]
+fparkan-animation = { path = "../fparkan-animation" }

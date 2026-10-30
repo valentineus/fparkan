@@ -200,7 +200,13 @@ pub struct Batch {
     pub material_index: u8,
     /// Lightmap selector at byte offset `+0x05`.
     pub lightmap_index: u8,
-    /// Local batch index at byte offset `+0x06`.
+    /// Raw word at byte offset `+0x06`.
+    ///
+    /// In the native building-collision helper retry, this word together with
+    /// the model's base index selects the next linked Node38 root. For a
+    /// standalone `ModelAsset`, that base is zero, so the link is this raw
+    /// value. Keep the decoded field lossless; its meaning depends on the
+    /// query path and batch flags.
     pub local_batch_index: u16,
     /// Index count.
     pub index_count: u16,

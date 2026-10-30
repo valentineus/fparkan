@@ -637,6 +637,7 @@ dependencies = [
 name = "fparkan-runtime"
 version = "0.1.0"
 dependencies = [
+ "fparkan-animation",
  "fparkan-assets",
  "fparkan-msh",
  "fparkan-path",
