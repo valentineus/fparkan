@@ -1053,6 +1053,13 @@ fn native_world_transparent(range: &VulkanStaticDrawRange, diffuse_alpha: f32) -
     diffuse_alpha < 1.0 || (range.batch_flags & 0x108) != 0
 }
 
+fn native_msh_diffuse_alpha_override(batch_flags: u16, type16_present: bool) -> Option<f32> {
+    if type16_present || batch_flags & 0x0008 == 0 {
+        return None;
+    }
+    (batch_flags & 0x0040 != 0 && batch_flags & 0x0010 == 0).then_some(0.0)
+}
+
 fn native_msh_handedness(transform: LegacyIron3dEulerTransform, scale: [f32; 3]) -> i8 {
     let Some(origin) = transform.try_transform_scaled_point([0.0; 3], scale) else {
         return 0;
@@ -2273,6 +2280,7 @@ impl EnvironmentGpuScene {
     fn new(
         mesh: &mut VulkanStaticMesh,
         native_handedness_by_range: &mut HashMap<usize, i8>,
+        type16_present_ranges: &mut HashSet<usize>,
         materials: &mut Vec<VulkanStaticMaterial>,
         preview_material_animations: &mut Vec<MaterialAnimationBinding>,
         sun_occlusion_range_indices: &mut Vec<usize>,
@@ -2700,6 +2708,15 @@ impl EnvironmentGpuScene {
             remapped_handedness.insert(new_range_index, handedness);
         }
         *native_handedness_by_range = remapped_handedness;
+        let mut remapped_type16_present_ranges =
+            HashSet::with_capacity(type16_present_ranges.len());
+        for old_range_index in std::mem::take(type16_present_ranges) {
+            let new_range_index = remap.get(old_range_index).copied().ok_or_else(|| {
+                format!("type-16 MSH draw range remap is missing range {old_range_index}")
+            })?;
+            remapped_type16_present_ranges.insert(new_range_index);
+        }
+        *type16_present_ranges = remapped_type16_present_ranges;
         for layer in &mut scene.sky_layers {
             layer.range.range_index = *remap
                 .get(layer.range.range_index)
@@ -3965,6 +3982,7 @@ fn multiply_row_major(left: [f32; 16], right: [f32; 16]) -> [f32; 16] {
 struct StaticPreviewScene {
     mesh: VulkanStaticMesh,
     native_handedness_by_range: HashMap<usize, i8>,
+    type16_present_ranges: HashSet<usize>,
     materials: Vec<VulkanStaticMaterial>,
     material_animations: Vec<MaterialAnimationBinding>,
     sun_occlusion_range_indices: Vec<usize>,
@@ -4401,6 +4419,7 @@ fn static_preview_mesh_and_materials(
         draw_ranges: Vec::new(),
     };
     let mut native_handedness_by_range = HashMap::new();
+    let mut type16_present_ranges = HashSet::new();
     let mut materials = Vec::new();
     let mut material_animations = Vec::new();
     let mut sun_occlusion_range_indices = Vec::new();
@@ -4768,6 +4787,9 @@ fn static_preview_mesh_and_materials(
                 )?;
                 for range_index in range_start..mesh.draw_ranges.len() {
                     native_handedness_by_range.insert(range_index, component_handedness);
+                    if model.validated.type16_present {
+                        type16_present_ranges.insert(range_index);
+                    }
                 }
                 if root_sun_eligible {
                     sun_occlusion_range_indices.extend(range_start..mesh.draw_ranges.len());
@@ -4842,6 +4864,7 @@ fn static_preview_mesh_and_materials(
     Ok(StaticPreviewScene {
         mesh,
         native_handedness_by_range,
+        type16_present_ranges,
         materials,
         material_animations,
         sun_occlusion_range_indices,
@@ -5562,6 +5585,7 @@ fn run_static_vulkan_mode(
             Some(EnvironmentGpuScene::new(
                 &mut preview.mesh,
                 &mut preview.native_handedness_by_range,
+                &mut preview.type16_present_ranges,
                 &mut preview.materials,
                 &mut preview.material_animations,
                 &mut preview.sun_occlusion_range_indices,
@@ -5677,6 +5701,7 @@ fn replay_environment_delta_seconds(last_applied_ms: u32, current_ms: u32) -> f3
 struct StaticVulkanApp {
     mesh: VulkanStaticMesh,
     native_handedness_by_range: HashMap<usize, i8>,
+    type16_present_ranges: HashSet<usize>,
     materials: Vec<VulkanStaticMaterial>,
     material_animations: Vec<MaterialAnimationBinding>,
     sun_occlusion_range_indices: Vec<usize>,
@@ -5765,6 +5790,7 @@ impl StaticVulkanApp {
         Self {
             mesh: preview.mesh,
             native_handedness_by_range: preview.native_handedness_by_range,
+            type16_present_ranges: preview.type16_present_ranges,
             materials: preview.materials,
             material_animations: preview.material_animations,
             sun_occlusion_range_indices: preview.sun_occlusion_range_indices,
@@ -5832,7 +5858,17 @@ impl StaticVulkanApp {
                 .materials
                 .get(usize::from(range.material_index))
                 .map_or(1.0, |material| material.diffuse_alpha);
-            let transparent = native_world_transparent(range, alpha);
+            let alpha_override = native_msh_diffuse_alpha_override(
+                range.batch_flags,
+                self.type16_present_ranges.contains(&range_index),
+            );
+            let effective_alpha = alpha_override.unwrap_or(alpha);
+            renderer
+                .set_draw_range_diffuse_alpha_override(range_index, alpha_override)
+                .map_err(|error| {
+                    format!("configure world draw range {range_index} alpha: {error}")
+                })?;
+            let transparent = native_world_transparent(range, effective_alpha);
             renderer
                 .set_draw_range_transparency(range_index, transparent)
                 .map_err(|error| format!("configure world draw range {range_index}: {error}"))?;
@@ -5853,7 +5889,7 @@ impl StaticVulkanApp {
                         &self.mesh,
                         range,
                         range.index_count,
-                        alpha,
+                        effective_alpha,
                         self.view_camera.position,
                         self.native_handedness_by_range.get(&range_index).copied(),
                     ),
@@ -5869,6 +5905,7 @@ impl StaticVulkanApp {
         mesh: &VulkanStaticMesh,
         materials: &[VulkanStaticMaterial],
         world_range_indices: &[usize],
+        type16_present_ranges: &HashSet<usize>,
         world_range_index_counts: &HashMap<usize, u32>,
         native_handedness_by_range: &HashMap<usize, i8>,
         eye_world: [f32; 3],
@@ -5881,7 +5918,7 @@ impl StaticVulkanApp {
                 .get(range_index)
                 .ok_or_else(|| "world draw range index is out of bounds".to_string())?;
             let state = active_materials.get(&range_index);
-            let alpha = state.map_or_else(
+            let material_alpha = state.map_or_else(
                 || {
                     materials
                         .get(usize::from(range.material_index))
@@ -5889,6 +5926,14 @@ impl StaticVulkanApp {
                 },
                 |state| state.diffuse_alpha,
             );
+            let alpha_override = native_msh_diffuse_alpha_override(
+                range.batch_flags,
+                type16_present_ranges.contains(&range_index),
+            );
+            let alpha = alpha_override.unwrap_or(material_alpha);
+            renderer
+                .set_draw_range_diffuse_alpha_override(range_index, alpha_override)
+                .map_err(|error| format!("update world draw range {range_index} alpha: {error}"))?;
             renderer
                 .set_draw_range_transparency(range_index, native_world_transparent(range, alpha))
                 .map_err(|error| format!("update world draw range {range_index}: {error}"))?;
@@ -6322,6 +6367,7 @@ impl StaticVulkanApp {
                     &self.mesh,
                     &self.materials,
                     &self.world_range_indices,
+                    &self.type16_present_ranges,
                     &self.world_range_index_counts,
                     &self.native_handedness_by_range,
                     frame.camera.position,
@@ -7342,6 +7388,7 @@ mod tests {
             normals: None,
             uv0: None,
             uv1: None,
+            type16_present: false,
             indices: vec![],
             batches: vec![],
             triangle_descriptors: None,
@@ -7671,6 +7718,7 @@ mod tests {
         let preview = StaticPreviewScene {
             mesh: initial_mesh.clone(),
             native_handedness_by_range: HashMap::new(),
+            type16_present_ranges: HashSet::new(),
             materials: Vec::new(),
             material_animations: Vec::new(),
             sun_occlusion_range_indices: Vec::new(),
@@ -8239,6 +8287,17 @@ mod tests {
             &range(LegacyBlendMode::Opaque, 0x8),
             1.0
         ));
+    }
+
+    #[test]
+    fn native_cpu_shaded_msh_alpha_override_uses_only_the_constant_batch_rule() {
+        assert_eq!(native_msh_diffuse_alpha_override(0x0148, false), Some(0.0));
+        assert_eq!(native_msh_diffuse_alpha_override(0x0108, false), None);
+        assert_eq!(native_msh_diffuse_alpha_override(0x0118, false), None);
+        assert_eq!(native_msh_diffuse_alpha_override(0x0058, false), None);
+        assert_eq!(native_msh_diffuse_alpha_override(0x0148, true), None);
+        assert_eq!(native_msh_diffuse_alpha_override(0x0058, true), None);
+        assert_eq!(native_msh_diffuse_alpha_override(0x0040, false), None);
     }
 
     #[test]
@@ -10008,5 +10067,30 @@ mod tests {
             ),
             original_count
         );
+    }
+    #[test]
+    fn world_draw_range_count_clears_and_reapplies_constant_alpha_override() {
+        let triangle = native_front_triangle();
+        let (mesh, mut range) = facing_mesh(0x0148, &triangle);
+        let original_count = range.index_count;
+        let mut alpha_override = None;
+        let update = |range: &VulkanStaticDrawRange, alpha_override: &mut Option<f32>| {
+            *alpha_override = native_msh_diffuse_alpha_override(range.batch_flags, false);
+            world_draw_range_index_count(
+                &mesh,
+                range,
+                original_count,
+                alpha_override.unwrap_or(1.0),
+                [0.0; 3],
+                None,
+            )
+        };
+
+        assert_eq!(update(&range, &mut alpha_override), 0);
+        range.batch_flags = 0x0108;
+        assert_eq!(update(&range, &mut alpha_override), original_count);
+        range.batch_flags = 0x0148;
+        assert_eq!(update(&range, &mut alpha_override), 0);
+        assert_eq!(original_count, 3);
     }
 }

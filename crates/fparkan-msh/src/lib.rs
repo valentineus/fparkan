@@ -21,6 +21,8 @@ pub const STREAM_UV0: u32 = 5;
 /// Optional secondary texture coordinate stream used by native lightmap/detail
 /// stages.  MSH stores it as the type-18 four-byte packed UV stream.
 pub const STREAM_UV1: u32 = 18;
+/// Optional type-16 stream. Its presence marks MSH vertex-colour data.
+pub const STREAM_TYPE_16: u32 = 16;
 /// Triangle index stream.
 pub const STREAM_INDICES: u32 = 6;
 /// Optional triangle-descriptor stream.
@@ -101,6 +103,10 @@ pub struct ModelAsset {
     pub uv0: Option<Vec<[u16; 2]>>,
     /// Optional secondary packed texture coordinates from type 18.
     pub uv1: Option<Vec<[u16; 2]>>,
+    /// Whether the source MSH contains a type-16 vertex-colour stream.
+    ///
+    /// The stream payload is preserved separately and is not decoded here.
+    pub type16_present: bool,
     /// Triangle indices.
     pub indices: Vec<u16>,
     /// Draw batches.
@@ -1116,6 +1122,7 @@ fn parse_model_document(document: &NresDocument) -> Result<ModelAsset, MshError>
     let uv1 = read_optional_stream(document, STREAM_UV1)?
         .map(|raw| parse_secondary_uv_stream(raw, positions.len()))
         .transpose()?;
+    let type16_present = read_optional_stream(document, STREAM_TYPE_16)?.is_some();
     let triangle_descriptors = read_optional_triangle_descriptors(document)?
         .map(|raw| parse_triangle_descriptors(&raw.bytes))
         .transpose()?;
@@ -1135,6 +1142,7 @@ fn parse_model_document(document: &NresDocument) -> Result<ModelAsset, MshError>
         normals,
         uv0,
         uv1,
+        type16_present,
         indices,
         batches,
         triangle_descriptors,
@@ -1641,6 +1649,25 @@ mod tests {
         assert_eq!(model.node_count, 0);
         assert!(model.slots.is_empty());
         assert_eq!(model.triangle_descriptors, None);
+        assert!(!model.type16_present);
+    }
+
+    #[test]
+    fn type16_presence_is_preserved_without_decoding_its_payload() {
+        let payload = [0xDE, 0xAD, 0xBE, 0xEF];
+        let document = decode_nested(&build_nres(&[
+            stream(STREAM_NODE_TABLE, 38, b"Res1", &[]),
+            stream(STREAM_SLOTS, 0, b"Res2", &slots_payload(&[])),
+            stream(STREAM_POSITIONS, 0, b"Res3", &[]),
+            stream(STREAM_INDICES, 0, b"Res6", &[]),
+            stream(STREAM_BATCHES, 0, b"Res13", &[]),
+            stream(STREAM_TYPE_16, 0, b"Res16", &payload),
+        ]))
+        .expect("nested NRes");
+        let model =
+            validate_msh(&decode_msh(&document).expect("MSH document")).expect("model asset");
+
+        assert!(model.type16_present);
     }
 
     #[test]
@@ -2262,6 +2289,7 @@ mod tests {
             normals: None,
             uv0: None,
             uv1: None,
+            type16_present: false,
             indices: Vec::new(),
             batches: Vec::new(),
             triangle_descriptors: None,
@@ -2324,6 +2352,7 @@ mod tests {
             normals: None,
             uv0: None,
             uv1: None,
+            type16_present: false,
             indices: Vec::new(),
             batches: Vec::new(),
             triangle_descriptors: None,
@@ -2389,6 +2418,7 @@ mod tests {
             normals: None,
             uv0: None,
             uv1: None,
+            type16_present: false,
             indices: Vec::new(),
             batches: Vec::new(),
             triangle_descriptors: None,
@@ -3282,6 +3312,7 @@ mod tests {
             normals: None,
             uv0: None,
             uv1: None,
+            type16_present: false,
             indices,
             batches,
             node_names: None,

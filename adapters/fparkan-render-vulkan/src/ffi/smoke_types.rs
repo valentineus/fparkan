@@ -1456,6 +1456,9 @@ pub struct VulkanSmokeRenderer {
     /// a fixed screen/sky/weather pass; `Some(false)` is world opaque and
     /// `Some(true)` is world transparent.
     pub(super) draw_range_world_queue: Vec<Option<bool>>,
+    /// Optional diffuse-alpha override for each draw range, independent of
+    /// the shared material record.
+    pub(super) draw_range_diffuse_alpha_overrides: Vec<Option<f32>>,
     /// Fixed sky background ranges placed between world opaque and transparent.
     pub(super) world_transparent_background_ranges: Vec<usize>,
     /// Pipeline state before transparent queue depth policy is applied.

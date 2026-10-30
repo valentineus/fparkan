@@ -18,6 +18,7 @@ type 9   service stream
 type 10  strings and node names
 type 13  Batch20 records
 type 15  auxiliary stream
+type 16  optional vertex-colour data
 type 17  auxiliary data
 type 18  packed UV1 (optional secondary coordinates)
 type 19  animation frame map
@@ -25,6 +26,9 @@ type 20  rare auxiliary table
 ```
 
 Reader ищет entries по type, но сохраняет исходный порядок для roundtrip.
+Поле `ModelAsset.type16_present` отмечает только наличие entry типа 16. Данные
+payload сохраняются, но этот путь рендера пока не преобразует их в цвета
+вершин.
 
 ## Node and slot selection
 

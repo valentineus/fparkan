@@ -423,6 +423,7 @@ impl VulkanSmokeRenderer {
             draw_range_sort_keys: vec![None; create_info.mesh.draw_ranges.len()],
             draw_order_dirty: false,
             draw_range_world_queue: vec![None; create_info.mesh.draw_ranges.len()],
+            draw_range_diffuse_alpha_overrides: vec![None; create_info.mesh.draw_ranges.len()],
             world_transparent_background_ranges: Vec::new(),
             draw_range_base_pipeline_states: create_info
                 .mesh
@@ -898,6 +899,27 @@ impl VulkanSmokeRenderer {
             &mut self.draw_order_dirty,
         );
         range.index_count = index_count;
+        Ok(())
+    }
+
+    /// Overrides one draw's diffuse alpha without changing its shared material.
+    pub fn set_draw_range_diffuse_alpha_override(
+        &mut self,
+        range_index: usize,
+        diffuse_alpha: Option<f32>,
+    ) -> Result<(), VulkanSmokeRendererError> {
+        if diffuse_alpha.is_some_and(|alpha| !alpha.is_finite() || !(0.0..=1.0).contains(&alpha)) {
+            return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic draw-range diffuse alpha must be finite and 0..1",
+            });
+        }
+        let alpha_override = self
+            .draw_range_diffuse_alpha_overrides
+            .get_mut(range_index)
+            .ok_or(VulkanSmokeRendererError::InvalidStaticMesh {
+                context: "dynamic draw-range alpha index is out of bounds",
+            })?;
+        *alpha_override = diffuse_alpha;
         Ok(())
     }
 
@@ -1874,11 +1896,16 @@ impl VulkanSmokeRenderer {
                         context: "static material alpha",
                     },
                 )?;
-                let material_alphas = [
-                    material_alpha[0].to_ne_bytes(),
-                    material_alpha[1].to_ne_bytes(),
-                ]
-                .concat();
+                let diffuse_alpha_override = self
+                    .draw_range_diffuse_alpha_overrides
+                    .get(range_index)
+                    .ok_or(VulkanSmokeRendererError::InvariantViolation {
+                        context: "draw-range diffuse-alpha override",
+                    })?;
+                let material_alphas =
+                    draw_material_alphas(*material_alpha, *diffuse_alpha_override)
+                        .map(f32::to_ne_bytes)
+                        .concat();
                 device.device().cmd_push_constants(
                     command_buffer,
                     resources.pipeline_layout,
@@ -2368,6 +2395,16 @@ fn apply_world_transparency(
     }
 }
 
+fn draw_material_alphas(
+    material_alphas: [f32; 2],
+    diffuse_alpha_override: Option<f32>,
+) -> [f32; 2] {
+    [
+        diffuse_alpha_override.unwrap_or(material_alphas[0]),
+        material_alphas[1],
+    ]
+}
+
 fn world_material_pipeline_states(
     original: LegacyPipelineState,
     category: u8,
@@ -2535,10 +2572,10 @@ mod tests {
     use super::super::{VulkanDynamicDrawRange, VulkanStaticDrawRange, VulkanStaticMesh};
     use super::{
         apply_geometry_range_updates, apply_world_transparency, completed_readback_buffer_index,
-        mark_draw_order_dirty_on_activity_change, set_and_mark_dirty_if_changed,
-        sorted_world_draw_order, take_runtime_children_with_validation_snapshot,
-        take_runtime_owners_in_dependency_order, validate_geometry_upload,
-        world_material_pipeline_states, RollbackOnDrop,
+        draw_material_alphas, mark_draw_order_dirty_on_activity_change,
+        set_and_mark_dirty_if_changed, sorted_world_draw_order,
+        take_runtime_children_with_validation_snapshot, take_runtime_owners_in_dependency_order,
+        validate_geometry_upload, world_material_pipeline_states, RollbackOnDrop,
     };
     use fparkan_render::{LegacyBlendMode, LegacyCullMode, LegacyDepthMode, LegacyPipelineState};
     use std::cell::RefCell;
@@ -3140,5 +3177,23 @@ mod tests {
         );
         assert!(world_material_pipeline_states(original, 5, Some(false)).is_none());
         assert!(world_material_pipeline_states(fixed_state, 5, None).is_none());
+    }
+
+    #[test]
+    fn draw_alpha_override_is_per_range_and_none_restores_material_alpha() {
+        let shared_material = [0.25, 0.5];
+
+        assert_eq!(draw_material_alphas(shared_material, Some(0.0)), [0.0, 0.5]);
+        assert_eq!(draw_material_alphas(shared_material, None), shared_material);
+
+        let updated_material = [0.75, 0.125];
+        assert_eq!(
+            draw_material_alphas(updated_material, None),
+            updated_material
+        );
+        assert_eq!(
+            draw_material_alphas(updated_material, Some(0.0)),
+            [0.0, 0.125]
+        );
     }
 }

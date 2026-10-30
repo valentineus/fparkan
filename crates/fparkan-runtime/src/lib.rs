@@ -6808,6 +6808,7 @@ mod tests {
             normals: None,
             uv0: None,
             uv1: None,
+            type16_present: false,
             indices: Vec::new(),
             batches: Vec::new(),
             triangle_descriptors: None,
