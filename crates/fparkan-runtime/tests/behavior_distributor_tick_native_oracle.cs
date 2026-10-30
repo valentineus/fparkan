@@ -2601,7 +2601,7 @@ internal static class BehaviorDistributorTickOracle {
                 wrongArguments |= self != scale; trace.Add("scale");
                 for (int i = 0; i < 3; i++) Marshal.WriteInt32(result, i * 4, FloatBits(1.0f));
             };
-            // Explicit zero-geometry host mocks: capture parameters and supply outputs.
+            // Clock/ABI-only class-4 vector: identity matrix, unit scale, zero-geometry mocks.
             InterfaceGetProperty geometryState = delegate(IntPtr self, uint first, IntPtr second) {
                 wrongArguments |= self != ani; trace.Add("geometry-state");
                 Marshal.WriteInt32(new IntPtr(unchecked((int)first)), 0);
@@ -2627,21 +2627,34 @@ internal static class BehaviorDistributorTickOracle {
             Expect(Marshal.ReadIntPtr(eventVtable, 8) == IntPtr.Add(module, 0x31ae0), "native activation event interface");
             NativeControlEvent activate = (NativeControlEvent)Marshal.GetDelegateForFunctionPointer(
                 WriteStdCallToFastcallThunk(0x380, Marshal.ReadIntPtr(eventVtable, 8)), typeof(NativeControlEvent));
-            foreach (uint clock in new uint[] { 1000, 33554433 }) {
+            uint[] clocks = new uint[] { 100, 101, 1000, 33554433, 16777217, 16777219 };
+            uint[] expectedAbsoluteBits = new uint[] { 0x42c80000, 0x42ca0000, 0x447a0000, 0x4c000000, 0x4b800000, 0x4b800002 };
+            uint[] expectedBaselineBits = new uint[] { 0x00000000, 0x3f800000, 0x44610000, 0x4bffffce, 0x4b7fff9d, 0x4b7fff9f };
+            int[] pendingAfter = new int[] { 1, 2, 2, 2, 2, 2 };
+            for (int index = 0; index < clocks.Length; index++) {
+                uint clock = clocks[index];
                 trace.Clear();
                 activate(IntPtr.Add(owner, 4), 4, clock);
-                float absolute = (float)clock;
-                float baseline = absolute - 100.0f;
+                uint expectedAbsolute = expectedAbsoluteBits[index];
+                uint expectedBaseline = expectedBaselineBits[index];
+                uint actualBaselineBits = unchecked((uint)Marshal.ReadInt32(owner, 0xe4));
+                uint actualAbsoluteBits = unchecked((uint)Marshal.ReadInt32(owner, 0xd8));
                 Expect(Marshal.ReadByte(owner, 0xe0) == 1 &&
-                    ReadFloat(owner, 0xe4) == baseline && ReadFloat(owner, 0xe8) == baseline &&
-                    ReadFloat(owner, 0xec) == baseline && ReadFloat(owner, 0xd8) == absolute && ReadFloat(owner, 0xdc) == absolute,
-                    "native event 4 activates the object and initializes absolute clock baselines");
+                    actualBaselineBits == expectedBaseline &&
+                    unchecked((uint)Marshal.ReadInt32(owner, 0xe8)) == actualBaselineBits &&
+                    unchecked((uint)Marshal.ReadInt32(owner, 0xec)) == actualBaselineBits &&
+                    actualAbsoluteBits == expectedAbsolute &&
+                    unchecked((uint)Marshal.ReadInt32(owner, 0xdc)) == expectedAbsolute,
+                    "native activation stores the original clock and baseline raw f32 words for " + clock);
                 Expect(!wrongArguments && String.Join(",", trace.ToArray()) ==
                     "transform,scale,geometry-state,geometry-set:0x00000000,geometry-point,geometry-state,geometry-set:0x3f800000",
                     "native activation zero-geometry host callback order and arguments");
-                Expect(Marshal.ReadInt32(owner, 0x370) == 1, "only first activation queues the initial command");
+                int pending = Marshal.ReadInt32(owner, 0x370);
+                Expect(pending == pendingAfter[index], "native setup uses the old +0xe4 zero check for clock " + clock);
                 Console.WriteLine("native-control-activation: eventRva=0x31ae0 handlerRva=0x314f0 class=4 clock=" + clock +
-                    " absolute=" + Float(absolute) + " e4/e8/ec=" + Float(baseline) + " e0=1 pending=1 callbacks=" + String.Join(",", trace.ToArray()));
+                    " absoluteBits=" + Hex(actualAbsoluteBits) + " baselineBits=" + Hex(actualBaselineBits) +
+                    " pending=" + pending +
+                    " callbacks=" + String.Join(",", trace.ToArray()));
             }
             GC.KeepAlive(transform); GC.KeepAlive(queryScale); GC.KeepAlive(geometryState);
             GC.KeepAlive(geometrySet); GC.KeepAlive(geometryPoint); GC.KeepAlive(activate);
