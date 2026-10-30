@@ -36,7 +36,10 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+mod mesh_collision;
+
 pub use fparkan_assets::MissionAssets;
+pub use mesh_collision::{query_building_segment_world, BuildingMeshHit, BuildingMeshNode};
 
 const MISSION_DECODED_PAYLOAD_CACHE_ENTRIES: usize = 256;
 const FALLBACK_SCRIPT_VARSET_PATH: &str = "MISSIONS/SCRIPTS/varset.var";
