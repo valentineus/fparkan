@@ -10,8 +10,8 @@ use fparkan_assets::{
     page_uv_transform, sample_control_node_times, sample_material_phase, ControlInstanceState,
     ControlSamplingError, Mat0Document, MaterialPhase, MaterialPhaseSample,
     PreparedComponentControl, PreparedControlGateProvider, PreparedControlNodeBinding,
-    PreparedMaterialPhase, PreparedTexture, PreparedTextureUsage, PreparedVisual, RgbaImage,
-    StandaloneWearMaterialLoader,
+    PreparedMaterialPhase, PreparedModel, PreparedTexture, PreparedTextureUsage, PreparedVisual,
+    RgbaImage, StandaloneWearMaterialLoader,
 };
 use fparkan_fx::atmosphere::TypedAtmosphere;
 use fparkan_fx::environment::{
@@ -28,7 +28,7 @@ use fparkan_fx::sky::{
 };
 use fparkan_msh::{
     node38_fallback_hierarchy, node38_sampled_hierarchy, node38_sampled_hierarchy_at_times,
-    ModelAsset,
+    selected_slot, Group, Lod, ModelAsset, NodeId, SlotId,
 };
 use fparkan_path::ResourceName;
 use fparkan_platform_winit::{window_native_handles, WinitWindow, WinitWindowPlan};
@@ -53,8 +53,8 @@ use fparkan_render_vulkan::{
 };
 use fparkan_runtime::{
     create, load_mission_static_preview, load_mission_static_preview_roots, loaded_mission_assets,
-    loaded_mission_object_drafts, loaded_terrain, EngineServices, MissionAssets, MissionMode,
-    MissionObjectDraft, MissionRequest,
+    loaded_mission_object_drafts, loaded_terrain, query_building_segment_world, BuildingMeshNode,
+    EngineServices, MissionAssets, MissionMode, MissionObjectDraft, MissionRequest,
 };
 use fparkan_terrain::{
     FullSurfaceMask, SurfaceQuery, TerrainLod, TerrainMaterialLayers, TerrainWorld,
@@ -3995,6 +3995,7 @@ struct StaticPreviewScene {
     component_mount_poses: Vec<Vec<Option<VulkanNodePose>>>,
     control_animation_instances: Vec<ControlAnimationInstance>,
     dynamic_component_geometry: Vec<DynamicComponentGeometry>,
+    building_collision_bindings: Vec<BuildingCollisionBinding>,
     dynamic_component_mounts: Vec<DynamicComponentMount>,
     shadow_caster_indices_by_object: Vec<Option<usize>>,
     camera: VulkanStaticCamera,
@@ -4025,6 +4026,208 @@ struct DynamicComponentGeometry {
     vertex_start: usize,
     vertex_count: usize,
     shadow_triangle_range: Option<std::ops::Range<usize>>,
+}
+
+#[derive(Clone)]
+struct BuildingCollisionBinding {
+    object_index: usize,
+    component_index: usize,
+    model_source: String,
+    model: Arc<ModelAsset>,
+    root_transform: LegacyIron3dEulerTransform,
+    owner_scale: [f32; 3],
+    mounted: bool,
+    selected_nodes: Vec<(NodeId, SlotId)>,
+}
+
+fn building_collision_binding(
+    object_index: usize,
+    component_index: usize,
+    model_source: String,
+    model: Arc<ModelAsset>,
+    root_transform: LegacyIron3dEulerTransform,
+    owner_scale: [f32; 3],
+    mounted: bool,
+) -> Result<BuildingCollisionBinding, String> {
+    let context = || {
+        format!(
+            "building collision object {object_index} component {component_index} model {model_source}"
+        )
+    };
+    if model.node_stride != 38 || model.node_count == 0 || model.animation.is_none() {
+        return Err(format!("{} has no complete Node38 pose data", context()));
+    }
+    if model.triangle_descriptors.is_none() {
+        return Err(format!("{} has no type-7 collision descriptors", context()));
+    }
+    if root_transform.try_row_major().is_none()
+        || !owner_scale.iter().all(|value| value.is_finite())
+        || owner_scale.contains(&0.0)
+    {
+        return Err(format!("{} has an invalid world transform", context()));
+    }
+    let first_node = usize::from(mounted);
+    let mut selected_nodes = Vec::new();
+    for node_index in first_node..model.node_count {
+        let node = NodeId(
+            u32::try_from(node_index)
+                .map_err(|_| format!("{} node index exceeds u32", context()))?,
+        );
+        let Some(slot) = selected_slot(&model, node, Lod(0), Group(0)) else {
+            continue;
+        };
+        let slot_index = usize::try_from(slot.0)
+            .map_err(|_| format!("{} node {} has an invalid slot id", context(), node.0))?;
+        let slot_data = model.slots.get(slot_index).ok_or_else(|| {
+            format!(
+                "{} node {} selects missing slot {}",
+                context(),
+                node.0,
+                slot.0
+            )
+        })?;
+        let batch_start = usize::from(slot_data.batch_start);
+        let batch_end = batch_start
+            .checked_add(usize::from(slot_data.batch_count))
+            .ok_or_else(|| format!("{} node {} batch range overflows", context(), node.0))?;
+        let batches = model.batches.get(batch_start..batch_end).ok_or_else(|| {
+            format!(
+                "{} node {} batch range {batch_start}..{batch_end} is invalid",
+                context(),
+                node.0
+            )
+        })?;
+        if batches.iter().any(|batch| batch.index_count != 0) {
+            selected_nodes.push((node, slot));
+        }
+    }
+    Ok(BuildingCollisionBinding {
+        object_index,
+        component_index,
+        model_source,
+        model,
+        root_transform,
+        owner_scale,
+        mounted,
+        selected_nodes,
+    })
+}
+
+fn building_collision_nodes(
+    binding: &BuildingCollisionBinding,
+    pose_buffer: Option<&NodePoseBuffer>,
+    mount_pose: Option<VulkanNodePose>,
+) -> Result<Vec<BuildingMeshNode>, String> {
+    let context = || {
+        format!(
+            "building collision object {} component {} model {}",
+            binding.object_index, binding.component_index, binding.model_source
+        )
+    };
+    if binding.mounted != mount_pose.is_some() {
+        return Err(format!(
+            "{} has {} mount pose, expected {}",
+            context(),
+            if mount_pose.is_some() { "a" } else { "no" },
+            if binding.mounted { "a" } else { "no" }
+        ));
+    }
+    binding
+        .selected_nodes
+        .iter()
+        .map(|(node, slot)| {
+            let node_index =
+                usize::try_from(node.0).map_err(|_| format!("{} node id is invalid", context()))?;
+            let pose = match (pose_buffer, binding.mounted) {
+                (Some(hierarchy), true) => {
+                    node38_pose_relative_to_root_from_hierarchy(hierarchy, node_index)
+                }
+                (Some(hierarchy), false) => node38_pose_from_hierarchy(hierarchy, node_index),
+                (None, true) => node38_pose_relative_to_root(&binding.model, None, node_index),
+                (None, false) => node38_pose(&binding.model, None, node_index),
+            }
+            .ok_or_else(|| format!("{} node {} has no current Node38 pose", context(), node.0))?;
+            let world_from_node = component_node_world_matrix(
+                binding.root_transform,
+                binding.owner_scale,
+                mount_pose,
+                pose,
+            )
+            .ok_or_else(|| format!("{} node {} has an invalid world matrix", context(), node.0))?;
+            Ok(BuildingMeshNode {
+                node: *node,
+                slot: *slot,
+                world_from_node,
+            })
+        })
+        .collect()
+}
+
+fn component_node_world_matrix(
+    root_transform: LegacyIron3dEulerTransform,
+    owner_scale: [f32; 3],
+    mount_pose: Option<VulkanNodePose>,
+    node_pose: VulkanNodePose,
+) -> Option<[f32; 16]> {
+    if !owner_scale
+        .iter()
+        .chain(node_pose.translation.iter())
+        .chain(node_pose.rotation.iter())
+        .chain(mount_pose.iter().flat_map(|pose| pose.translation.iter()))
+        .chain(mount_pose.iter().flat_map(|pose| pose.rotation.iter()))
+        .all(|value| value.is_finite())
+    {
+        return None;
+    }
+    let pose_matrix = |pose: VulkanNodePose| {
+        let [x, y, z] = [
+            rotate_unit_vector([1.0, 0.0, 0.0], pose.rotation),
+            rotate_unit_vector([0.0, 1.0, 0.0], pose.rotation),
+            rotate_unit_vector([0.0, 0.0, 1.0], pose.rotation),
+        ];
+        [
+            x[0],
+            y[0],
+            z[0],
+            pose.translation[0],
+            x[1],
+            y[1],
+            z[1],
+            pose.translation[1],
+            x[2],
+            y[2],
+            z[2],
+            pose.translation[2],
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ]
+    };
+    let scale = [
+        owner_scale[0],
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        owner_scale[1],
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        owner_scale[2],
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ];
+    let mut world = multiply_row_major(root_transform.try_row_major()?, scale);
+    if let Some(mount) = mount_pose {
+        world = multiply_row_major(world, pose_matrix(mount));
+    }
+    world = multiply_row_major(world, pose_matrix(node_pose));
+    world.iter().all(|value| value.is_finite()).then_some(world)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4431,6 +4634,9 @@ fn static_preview_mesh_and_materials(
     let mut control_animation_instances = Vec::new();
     let mut dynamic_component_geometry = Vec::new();
     let mut dynamic_component_mounts = Vec::new();
+    let mut building_collision_bindings = Vec::new();
+    let mut collision_models =
+        HashMap::<fparkan_assets::AssetId<PreparedModel>, Arc<ModelAsset>>::new();
     let shadow_receivers = terrain_shadow_receivers(terrain_mesh)?;
     let mut terrain_material_loader = StandaloneWearMaterialLoader::new(root);
     let terrain_component = project_land_msh_to_static_mesh_in_world_space(terrain_mesh)
@@ -4513,7 +4719,15 @@ fn static_preview_mesh_and_materials(
         let mut component_mount_poses = vec![None; component_refs.len()];
         let mut component_pose_buffers = vec![None; component_refs.len()];
         for (component_index, (visual, model)) in component_refs.iter().enumerate() {
+            let should_render = tree.as_ref().map_or(true, |_| {
+                unit_component_is_visible(component_index, visual.source_type)
+            });
             let Some(model) = *model else {
+                if legacy_camera.is_none() && root_native_kind == Some(3) && should_render {
+                    return Err(format!(
+                        "building collision object {object_index} component {component_index} has no model"
+                    ));
+                }
                 continue;
             };
             let component_control = component_controls
@@ -4557,9 +4771,6 @@ fn static_preview_mesh_and_materials(
                     state: control_state,
                 });
             }
-            let should_render = tree.as_ref().map_or(true, |_| {
-                unit_component_is_visible(component_index, visual.source_type)
-            });
             // Native AniMesh only resolves global MSH node sockets for EXTO
             // geometry. Internal INTO components use controller/equipment
             // slots, whose `parent_or_link` values are not MSH node indices.
@@ -4681,6 +4892,21 @@ fn static_preview_mesh_and_materials(
                 translation: mission_root.position,
                 orientation_radians: mission_root.orientation_raw,
             };
+            if legacy_camera.is_none() && root_native_kind == Some(3) && should_render {
+                let shared_model = collision_models
+                    .entry(model.id)
+                    .or_insert_with(|| Arc::new(model.validated.clone()))
+                    .clone();
+                building_collision_bindings.push(building_collision_binding(
+                    object_index,
+                    component_index,
+                    format!("{:?}", model.source),
+                    shared_model,
+                    transform,
+                    mission_root.scale,
+                    mount_pose.is_some(),
+                )?);
+            }
             if should_render {
                 let pose_buffer = component_pose_buffers[component_index].as_ref();
                 let mut component = match (pose_buffer, mount_pose, static_animation_frame) {
@@ -4877,6 +5103,7 @@ fn static_preview_mesh_and_materials(
         component_mount_poses: component_mount_poses_by_object,
         control_animation_instances,
         dynamic_component_geometry,
+        building_collision_bindings,
         dynamic_component_mounts,
         shadow_caster_indices_by_object,
         camera,
@@ -5710,6 +5937,7 @@ struct StaticVulkanApp {
     component_mount_poses: Vec<Vec<Option<VulkanNodePose>>>,
     control_animation_instances: Vec<ControlAnimationInstance>,
     dynamic_component_geometry: Vec<DynamicComponentGeometry>,
+    building_collision_bindings: Vec<BuildingCollisionBinding>,
     dynamic_component_mounts: Vec<DynamicComponentMount>,
     shadow_caster_indices_by_object: Vec<Option<usize>>,
     shadow_sphere_baselines: Vec<ShadowSphere>,
@@ -5799,6 +6027,7 @@ impl StaticVulkanApp {
             component_mount_poses: preview.component_mount_poses,
             control_animation_instances: preview.control_animation_instances,
             dynamic_component_geometry: preview.dynamic_component_geometry,
+            building_collision_bindings: preview.building_collision_bindings,
             dynamic_component_mounts: preview.dynamic_component_mounts,
             shadow_caster_indices_by_object: preview.shadow_caster_indices_by_object,
             shadow_sphere_baselines: preview.shadow_sphere_baselines,
@@ -5965,19 +6194,20 @@ impl StaticVulkanApp {
     }
 
     fn update_free_camera(&mut self, delta_seconds: f32, viewport: [f32; 2]) -> Result<(), String> {
-        if self.free_camera.is_none() {
+        let Some(mut free_camera) = self.free_camera else {
             return Ok(());
-        }
-        let aspect = viewport[0] / viewport[1].max(1.0);
-        let view_camera = {
-            let free_camera = self
-                .free_camera
-                .as_mut()
-                .ok_or_else(|| "free-flight camera disappeared".to_string())?;
-            free_camera.advance(&self.pressed_keys, delta_seconds.min(0.1));
-            free_camera.keep_above_terrain(&self.terrain)?;
-            free_camera.preview_frame(aspect)
         };
+        let aspect = viewport[0] / viewport[1].max(1.0);
+        let safe_position = free_camera.position;
+        free_camera.advance(&self.pressed_keys, delta_seconds.clamp(0.0, 0.1));
+        free_camera.keep_above_terrain(&self.terrain)?;
+        if free_camera.position != safe_position
+            && self.building_segment_blocked([safe_position, free_camera.position])?
+        {
+            free_camera.position = safe_position;
+        }
+        let view_camera = free_camera.preview_frame(aspect);
+        self.free_camera = Some(free_camera);
         let camera = view_camera.vulkan_camera();
         self.view_camera = view_camera;
         self.camera = camera;
@@ -5995,6 +6225,38 @@ impl StaticVulkanApp {
             }
         }
         Ok(())
+    }
+
+    fn building_segment_blocked(&self, world_segment: [[f32; 3]; 2]) -> Result<bool, String> {
+        for binding in &self.building_collision_bindings {
+            if binding.selected_nodes.is_empty() {
+                continue;
+            }
+            let pose_buffer = self
+                .component_pose_buffers
+                .get(binding.object_index)
+                .and_then(|components| components.get(binding.component_index))
+                .and_then(Option::as_ref);
+            let mount_pose = self
+                .component_mount_poses
+                .get(binding.object_index)
+                .and_then(|components| components.get(binding.component_index))
+                .copied()
+                .flatten();
+            let nodes = building_collision_nodes(binding, pose_buffer, mount_pose)?;
+            if query_building_segment_world(&binding.model, &nodes, world_segment)
+                .map_err(|error| {
+                    format!(
+                        "query building collision object {} component {} model {}: {error}",
+                        binding.object_index, binding.component_index, binding.model_source
+                    )
+                })?
+                .is_some()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn update_material_clock(&mut self, sample: FrameClockSample) {
@@ -6424,9 +6686,9 @@ impl StaticVulkanApp {
     ) -> Result<SceneFrameUpdate, String> {
         let viewport = [viewport[0].max(1.0), viewport[1].max(1.0)];
         let aspect = viewport[0] / viewport[1];
-        self.update_free_camera(sample.delta_seconds, viewport)?;
         self.update_material_clock(sample);
         self.update_controlled_component_geometry(sample)?;
+        self.update_free_camera(sample.delta_seconds, viewport)?;
         let material_update = sample_material_animations(
             &mut self.material_animations,
             &self.materials,
@@ -7497,6 +7759,552 @@ mod tests {
         }
     }
 
+    fn node38_fixture(parent: u16, map_start: u16, fallback: u16, drawable: bool) -> Vec<u8> {
+        let mut node = Vec::with_capacity(38);
+        node.extend_from_slice(&[0, 0]);
+        node.extend_from_slice(&parent.to_le_bytes());
+        node.extend_from_slice(&map_start.to_le_bytes());
+        node.extend_from_slice(&fallback.to_le_bytes());
+        for slot in 0..15 {
+            let value = if drawable && slot == 0 { 0 } else { u16::MAX };
+            node.extend_from_slice(&value.to_le_bytes());
+        }
+        node
+    }
+
+    fn collision_fixture_model(root_drawable: bool) -> ModelAsset {
+        let mut nodes = node38_fixture(u16::MAX, u16::MAX, 0, root_drawable);
+        nodes.extend(node38_fixture(0, 0, 1, true));
+        ModelAsset {
+            node_stride: 38,
+            node_count: 2,
+            nodes_raw: nodes,
+            bounding_sphere_center: [0.0; 3],
+            bounding_sphere_radius: 3.0,
+            slots: vec![fparkan_msh::Slot {
+                tri_start: 0,
+                tri_count: 1,
+                batch_start: 0,
+                batch_count: 1,
+                aabb_min: [-2.0, 0.0, -2.0],
+                aabb_max: [2.0, 0.0, 2.0],
+                sphere_center: [0.0; 3],
+                sphere_radius: 2.0,
+                opaque: [0; 5],
+            }],
+            positions: vec![[-2.0, 0.0, -2.0], [0.0, 0.0, 2.0], [2.0, 0.0, -2.0]],
+            normals: Some(vec![[0, 127, 0, 0]; 3]),
+            uv0: None,
+            uv1: None,
+            type16_present: false,
+            indices: vec![0, 1, 2],
+            batches: vec![fparkan_msh::Batch {
+                batch_flags: 0,
+                material_index_hi: 0,
+                material_index: 0,
+                lightmap_index: 0,
+                local_batch_index: 0,
+                index_count: 3,
+                index_start: 0,
+                vertex_count: 3,
+                base_vertex: 0,
+            }],
+            triangle_descriptors: Some(vec![fparkan_msh::TriangleDescriptor {
+                tri_flags: 0,
+                opaque: [0; 4],
+                normal: [0, 32767, 0],
+            }]),
+            node_names: None,
+            animation: Some(fparkan_msh::ModelAnimation {
+                keys: vec![
+                    fparkan_animation::AnimKey24 {
+                        time: AnimationTime(0.0),
+                        pose: fparkan_animation::Pose::default(),
+                    },
+                    fparkan_animation::AnimKey24 {
+                        time: AnimationTime(1.0),
+                        pose: fparkan_animation::Pose {
+                            translation: [20.0, 0.0, 0.0],
+                            rotation: [0.0, 0.0, 0.0, 1.0],
+                        },
+                    },
+                ],
+                frame_map: vec![0, 1],
+                frame_count: 2,
+            }),
+        }
+    }
+
+    fn doorway_collision_model() -> ModelAsset {
+        let mut nodes = node38_fixture(u16::MAX, u16::MAX, 0, false);
+        nodes.extend(node38_fixture(0, u16::MAX, 0, true));
+        ModelAsset {
+            node_stride: 38,
+            node_count: 2,
+            nodes_raw: nodes,
+            bounding_sphere_center: [0.0; 3],
+            bounding_sphere_radius: 5.0,
+            slots: vec![fparkan_msh::Slot {
+                tri_start: 0,
+                tri_count: 4,
+                batch_start: 0,
+                batch_count: 1,
+                aabb_min: [-4.0, 0.0, -2.0],
+                aabb_max: [4.0, 0.0, 2.0],
+                sphere_center: [0.0; 3],
+                sphere_radius: 5.0,
+                opaque: [0; 5],
+            }],
+            positions: vec![
+                [-4.0, 0.0, -2.0],
+                [-1.0, 0.0, -2.0],
+                [-1.0, 0.0, 2.0],
+                [-4.0, 0.0, 2.0],
+                [1.0, 0.0, -2.0],
+                [4.0, 0.0, -2.0],
+                [4.0, 0.0, 2.0],
+                [1.0, 0.0, 2.0],
+            ],
+            normals: None,
+            uv0: None,
+            uv1: None,
+            type16_present: false,
+            indices: vec![0, 3, 2, 0, 2, 1, 4, 7, 6, 4, 6, 5],
+            batches: vec![fparkan_msh::Batch {
+                batch_flags: 0,
+                material_index_hi: 0,
+                material_index: 0,
+                lightmap_index: 0,
+                local_batch_index: 0,
+                index_count: 12,
+                index_start: 0,
+                vertex_count: 8,
+                base_vertex: 0,
+            }],
+            triangle_descriptors: Some(
+                (0..4)
+                    .map(|_| fparkan_msh::TriangleDescriptor {
+                        tri_flags: 0,
+                        opaque: [0; 4],
+                        normal: [0, 32767, 0],
+                    })
+                    .collect(),
+            ),
+            node_names: None,
+            animation: Some(fparkan_msh::ModelAnimation {
+                keys: vec![fparkan_animation::AnimKey24 {
+                    time: AnimationTime(0.0),
+                    pose: fparkan_animation::Pose::default(),
+                }],
+                frame_map: Vec::new(),
+                frame_count: 0,
+            }),
+        }
+    }
+
+    fn collision_test_terrain() -> Arc<TerrainWorld> {
+        let mut land = fparkan_terrain_format::LandMeshDocument {
+            streams: Vec::new(),
+            nodes_raw: Vec::new(),
+            slots: fparkan_terrain_format::TerrainSlotTable {
+                header_raw: Vec::new(),
+                slots_raw: Vec::new(),
+            },
+            positions: vec![
+                [-100.0, -100.0, 0.0],
+                [100.0, -100.0, 0.0],
+                [0.0, 100.0, 0.0],
+            ],
+            normals: Vec::new(),
+            uv0: Vec::new(),
+            accelerator: Vec::new(),
+            aux14: Vec::new(),
+            aux18: Vec::new(),
+            faces: vec![fparkan_terrain_format::TerrainFace28 {
+                flags: FullSurfaceMask(1),
+                material_tag: 0,
+                aux_tag: 0,
+                vertices: [0, 1, 2],
+                neighbors: [None, None, None],
+                tail_raw: [0; 8],
+                raw: [0; 28],
+            }],
+        };
+        set_test_terrain_lod0_range(&mut land);
+        Arc::new(TerrainWorld::from_land_msh(&land).expect("collision test terrain"))
+    }
+
+    fn collision_test_app(
+        model: Arc<ModelAsset>,
+        root_transform: LegacyIron3dEulerTransform,
+        position: [f32; 3],
+    ) -> StaticVulkanApp {
+        let hierarchy = static_preview_component_pose_buffer(&model, &[], None)
+            .expect("fixture static preview pose")
+            .expect("fixture Node38 pose");
+        let camera = FreeFlightCamera {
+            position,
+            yaw: -std::f32::consts::FRAC_PI_2,
+            pitch: 0.0,
+            horizontal_fov: 1.3,
+            near_plane: 0.5,
+            far_plane: 700.0,
+            move_speed: 60.0,
+            ground_clearance: 0.0,
+        };
+        let view_camera = camera.preview_frame(16.0 / 9.0);
+        let preview = StaticPreviewScene {
+            mesh: VulkanStaticMesh {
+                vertices: Vec::new(),
+                indices: Vec::new(),
+                draw_ranges: Vec::new(),
+            },
+            native_handedness_by_range: HashMap::new(),
+            type16_present_ranges: HashSet::new(),
+            materials: Vec::new(),
+            material_animations: Vec::new(),
+            sun_occlusion_range_indices: Vec::new(),
+            shadow_casters: Vec::new(),
+            shadow_sphere_baselines: Vec::new(),
+            shadow_receivers: Vec::new(),
+            shadow_material_index: 0,
+            terrain: collision_test_terrain(),
+            component_pose_buffers: vec![vec![Some(hierarchy)]],
+            component_mount_poses: vec![vec![None]],
+            control_animation_instances: Vec::new(),
+            dynamic_component_geometry: Vec::new(),
+            building_collision_bindings: vec![building_collision_binding(
+                0,
+                0,
+                "collision fixture".to_string(),
+                Arc::clone(&model),
+                root_transform,
+                [1.0; 3],
+                false,
+            )
+            .expect("fixture building collision binding")],
+            dynamic_component_mounts: Vec::new(),
+            shadow_caster_indices_by_object: vec![None],
+            camera: view_camera.vulkan_camera(),
+            view_camera,
+            captured_viewport: None,
+            free_camera: Some(camera),
+            camera_mode: "test",
+            mesh_components: 0,
+            terrain_components: 0,
+        };
+        let mut app = StaticVulkanApp::new(
+            preview,
+            None,
+            None,
+            EnvironmentGpuRange {
+                range_index: usize::MAX,
+                vertex_start: 0,
+                vertex_capacity: 0,
+                material_index: 0,
+            },
+            0,
+            0,
+            None,
+            0,
+            None,
+            "collision-test",
+            1,
+            None,
+            false,
+            StartupTimings::default(),
+        );
+        app.pressed_keys.insert(KeyCode::KeyW);
+        app
+    }
+
+    #[test]
+    fn mounted_static_building_binding_matches_renderer_and_hides_root_node() {
+        let model = collision_fixture_model(true);
+        let binding = building_collision_binding(
+            4,
+            5,
+            "static fixture model".to_string(),
+            Arc::new(model.clone()),
+            LegacyIron3dEulerTransform {
+                translation: [13.0, -4.0, 9.0],
+                orientation_radians: [0.4, -0.3, 0.7],
+            },
+            [2.0, 3.0, 0.5],
+            true,
+        )
+        .expect("static building collision binding");
+        assert_eq!(binding.selected_nodes, vec![(NodeId(1), SlotId(0))]);
+
+        let root = VulkanNodePose {
+            translation: [1.0, 2.0, 3.0],
+            rotation: [0.0, 0.0, 0.29552022, 0.9553365],
+        };
+        let child = compose_unit_pose(
+            root,
+            VulkanNodePose {
+                translation: [2.0, -1.0, 0.5],
+                rotation: [0.0, 0.19866933, 0.0, 0.9800666],
+            },
+        );
+        let hierarchy = NodePoseBuffer {
+            poses: [root, child]
+                .into_iter()
+                .map(|pose| fparkan_animation::Pose {
+                    translation: pose.translation,
+                    rotation: pose.rotation,
+                })
+                .collect(),
+        };
+        let mount = VulkanNodePose {
+            translation: [5.0, 7.0, 11.0],
+            rotation: [0.0, 0.0, 0.38268343, 0.9238795],
+        };
+        let nodes = building_collision_nodes(&binding, Some(&hierarchy), Some(mount))
+            .expect("mounted collision matrices");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].node, NodeId(1));
+
+        let projected = project_msh_to_static_mesh_in_world_space_with_node_pose_buffer_and_mount(
+            &model,
+            binding.root_transform,
+            binding.owner_scale,
+            &hierarchy,
+            mount,
+        )
+        .expect("mounted renderer projection");
+        assert_eq!(projected.vertices.len(), 3);
+        for (actual, source) in projected.vertices.iter().zip(&model.positions) {
+            let matrix = nodes[0].world_from_node;
+            let expected = [
+                matrix[0] * source[0] + matrix[1] * source[1] + matrix[2] * source[2] + matrix[3],
+                matrix[4] * source[0] + matrix[5] * source[1] + matrix[6] * source[2] + matrix[7],
+                matrix[8] * source[0] + matrix[9] * source[1] + matrix[10] * source[2] + matrix[11],
+            ];
+            for axis in 0..3 {
+                assert!((actual.position[axis] - expected[axis]).abs() < 1.0e-4);
+            }
+        }
+    }
+
+    #[test]
+    fn high_speed_free_flight_stops_at_static_building_wall() {
+        let mut app = collision_test_app(
+            Arc::new(collision_fixture_model(false)),
+            LegacyIron3dEulerTransform {
+                translation: [0.0, 5.0, 0.0],
+                orientation_radians: [0.0; 3],
+            },
+            [0.0, 8.0, 0.0],
+        );
+        app.update_free_camera(0.1, [1280.0, 720.0])
+            .expect("continuous building query");
+        assert_eq!(app.free_camera.unwrap().position, [0.0, 8.0, 0.0]);
+    }
+
+    #[test]
+    fn small_nonzero_building_scale_remains_queryable() {
+        let model = Arc::new(collision_fixture_model(false));
+        let binding = building_collision_binding(
+            0,
+            0,
+            "tiny-scale fixture".to_string(),
+            Arc::clone(&model),
+            LegacyIron3dEulerTransform {
+                translation: [0.0, 5.0, 0.0],
+                orientation_radians: [0.0; 3],
+            },
+            [1.0e-8, 1.0, 1.0],
+            false,
+        )
+        .expect("small nonzero scale is invertible");
+        let hierarchy = static_preview_component_pose_buffer(&model, &[], None)
+            .expect("fixture static preview pose")
+            .expect("fixture Node38 pose");
+        let nodes = building_collision_nodes(&binding, Some(&hierarchy), None)
+            .expect("small-scale collision matrix");
+        assert!(query_building_segment_world(
+            &binding.model,
+            &nodes,
+            [[0.0, 8.0, 0.0], [0.0, 2.0, 0.0]],
+        )
+        .expect("small-scale query")
+        .is_some());
+    }
+
+    #[test]
+    fn free_flight_passes_through_authored_doorway() {
+        let mut app = collision_test_app(
+            Arc::new(doorway_collision_model()),
+            LegacyIron3dEulerTransform {
+                translation: [0.0, 5.0, 0.0],
+                orientation_radians: [0.0; 3],
+            },
+            [0.0, 8.0, 0.0],
+        );
+        app.update_free_camera(0.1, [1280.0, 720.0])
+            .expect("doorway query");
+        let position = app.free_camera.unwrap().position;
+        assert!((position[1] - 2.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn shared_building_models_keep_each_placed_instance_query_separate() {
+        let model = Arc::new(collision_fixture_model(false));
+        let far = building_collision_binding(
+            0,
+            0,
+            "shared fixture".to_string(),
+            Arc::clone(&model),
+            LegacyIron3dEulerTransform {
+                translation: [0.0, 100.0, 0.0],
+                orientation_radians: [0.0; 3],
+            },
+            [1.0; 3],
+            false,
+        )
+        .expect("first placed building");
+        let near = building_collision_binding(
+            1,
+            0,
+            "shared fixture".to_string(),
+            Arc::clone(&model),
+            LegacyIron3dEulerTransform {
+                translation: [0.0, 5.0, 0.0],
+                orientation_radians: [0.0; 3],
+            },
+            [1.0; 3],
+            false,
+        )
+        .expect("second placed building");
+        assert!(Arc::ptr_eq(&far.model, &near.model));
+
+        let mut app = collision_test_app(
+            Arc::clone(&model),
+            LegacyIron3dEulerTransform {
+                translation: [0.0, 100.0, 0.0],
+                orientation_radians: [0.0; 3],
+            },
+            [0.0, 8.0, 0.0],
+        );
+        let hierarchy = static_preview_component_pose_buffer(&model, &[], None)
+            .expect("fixture static pose")
+            .expect("fixture Node38 pose");
+        app.component_pose_buffers = vec![vec![Some(hierarchy.clone())], vec![Some(hierarchy)]];
+        app.component_mount_poses = vec![vec![None], vec![None]];
+        app.building_collision_bindings = vec![far, near];
+        app.update_free_camera(0.1, [1280.0, 720.0])
+            .expect("both placed buildings are queried independently");
+        assert_eq!(app.free_camera.unwrap().position, [0.0, 8.0, 0.0]);
+    }
+
+    #[test]
+    fn collision_uses_updated_control_pose_and_pending_retry_does_not_move_again() {
+        let model = Arc::new(collision_fixture_model(false));
+        let mut app = collision_test_app(
+            Arc::clone(&model),
+            LegacyIron3dEulerTransform {
+                translation: [0.0, 5.0, 0.0],
+                orientation_radians: [0.0; 3],
+            },
+            [0.0, 8.0, 0.0],
+        );
+        let mut control = control_pose_test_control();
+        control.model_node_count = 2;
+        control.timeline_rows[0].node_index = 1;
+        if let PreparedControlGateProvider::Resolved {
+            initial_type1_value,
+            ..
+        } = &mut control.typed_records[0].gate_provider
+        {
+            *initial_type1_value = 0.0;
+        } else {
+            panic!("fixture has a resolved NDP gate");
+        }
+        app.control_animation_instances = vec![ControlAnimationInstance {
+            object_index: 0,
+            component_index: 0,
+            model: Arc::clone(&model),
+            control,
+            state: ControlInstanceState::default(),
+        }];
+
+        let first = FrameClockSample {
+            id: SceneSampleId::Replay(0),
+            time_ms: 0,
+            delta_seconds: 0.1,
+        };
+        let update = app
+            .prepare_scene_update(first, [1280.0, 720.0])
+            .expect("closed moving wall blocks the first frame");
+        assert!(app.lifecycle.prepare(update));
+        let safe_position = app.free_camera.unwrap().position;
+        let closed_pose = app.component_pose_buffers[0][0].as_ref().unwrap().poses[1].translation;
+        assert_eq!(safe_position, [0.0, 8.0, 0.0]);
+
+        if let PreparedControlGateProvider::Resolved {
+            initial_type1_value,
+            ..
+        } = &mut app.control_animation_instances[0].control.typed_records[0].gate_provider
+        {
+            *initial_type1_value = 1.0;
+        }
+        app.refresh_pending_viewport([1024.0, 768.0])
+            .expect("pending retry only refreshes its viewport");
+        assert_eq!(app.free_camera.unwrap().position, safe_position);
+        assert_eq!(
+            app.component_pose_buffers[0][0].as_ref().unwrap().poses[1].translation,
+            closed_pose
+        );
+        assert_eq!(app.lifecycle.record_presented(), Some(0));
+
+        app.prepare_scene_update(
+            FrameClockSample {
+                id: SceneSampleId::Replay(1),
+                time_ms: 1000,
+                delta_seconds: 0.1,
+            },
+            [1024.0, 768.0],
+        )
+        .expect("the next sampled pose opens the path");
+        let open_pose = app.component_pose_buffers[0][0].as_ref().unwrap().poses[1].translation;
+        assert!(open_pose[0] > 2.0, "door node did not move: {open_pose:?}");
+        assert!((app.free_camera.unwrap().position[1] - 2.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn missing_free_camera_keeps_legacy_view_without_querying_buildings() {
+        let mut app = collision_test_app(
+            Arc::new(collision_fixture_model(false)),
+            LegacyIron3dEulerTransform {
+                translation: [0.0, 5.0, 0.0],
+                orientation_radians: [0.0; 3],
+            },
+            [0.0, 8.0, 0.0],
+        );
+        app.free_camera = None;
+        app.building_collision_bindings
+            .push(BuildingCollisionBinding {
+                object_index: 0,
+                component_index: 0,
+                model_source: "legacy fixture".to_string(),
+                model: Arc::new(collision_fixture_model(false)),
+                root_transform: LegacyIron3dEulerTransform {
+                    translation: [0.0; 3],
+                    orientation_radians: [0.0; 3],
+                },
+                owner_scale: [1.0; 3],
+                mounted: false,
+                selected_nodes: vec![(NodeId(u32::MAX), SlotId(u32::MAX))],
+            });
+        let camera = app.camera;
+        let view_camera = app.view_camera;
+        app.update_free_camera(0.1, [1024.0, 768.0])
+            .expect("legacy camera skips free-flight collision");
+        assert_eq!(app.camera, camera);
+        assert_eq!(app.view_camera, view_camera);
+    }
+
     #[test]
     fn control_timeline_and_ndp_gate_change_component_pose_at_sampled_time() {
         let model = control_pose_test_model();
@@ -7743,6 +8551,7 @@ mod tests {
                 state,
             }],
             dynamic_component_geometry: vec![dynamic],
+            building_collision_bindings: Vec::new(),
             dynamic_component_mounts: Vec::new(),
             shadow_caster_indices_by_object: vec![Some(0)],
             camera: view_camera.vulkan_camera(),
@@ -8037,6 +8846,289 @@ mod tests {
             .expect("the next sampled frame adopts mouse input received during retry");
         assert_ne!(next_update.camera.forward, update.camera.forward);
         assert_eq!(next_update.camera.forward, controller_after_input.forward());
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_plant_wall_and_door_use_the_app_camera_bridge() {
+        use std::path::PathBuf;
+
+        fn set_segment(app: &mut StaticVulkanApp, segment: [[f32; 3]; 2]) {
+            let delta = sub3(segment[1], segment[0]);
+            let horizontal_distance = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+            app.free_camera = Some(FreeFlightCamera {
+                position: segment[0],
+                yaw: delta[1].atan2(delta[0]),
+                pitch: delta[2].atan2(horizontal_distance),
+                horizontal_fov: 1.3,
+                near_plane: 0.5,
+                far_plane: 700.0,
+                move_speed: length3(delta).expect("nonzero native test segment") / 0.1,
+                ground_clearance: 0.0,
+            });
+            app.pressed_keys.clear();
+            app.pressed_keys.insert(KeyCode::KeyW);
+        }
+
+        const BODY_WALL: [[f32; 3]; 2] = [[-10.5, 22.16, 2.5], [-10.5, 19.16, 2.5]];
+        const BODY_DOOR: [[f32; 3]; 2] = [[0.5, 22.16, 2.5], [0.5, 19.16, 2.5]];
+        let root = PathBuf::from(
+            std::env::var_os("FPARKAN_CORPUS_PART1_ROOT")
+                .expect("FPARKAN_CORPUS_PART1_ROOT is required for licensed tests"),
+        );
+        let mission = "MISSIONS/Autodemo.00/data.tma";
+        let args = Args::parse(&[
+            "--root".to_string(),
+            root.to_string_lossy().into_owned(),
+            "--mission".to_string(),
+            mission.to_string(),
+        ])
+        .expect("licensed AutoDemo app arguments");
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(&args.root))))
+            .expect("create licensed AutoDemo engine");
+        let loaded = load_requested_mission(&mut engine, &args).expect("load AutoDemo mission");
+        let assets = loaded_mission_assets(&engine).expect("AutoDemo assets");
+        let terrain = loaded_terrain(&engine).expect("AutoDemo terrain");
+        let roots = loaded_mission_object_drafts(&engine).expect("AutoDemo object drafts");
+        let preview = static_preview_mesh_and_materials(
+            assets,
+            terrain,
+            roots,
+            None,
+            None,
+            None,
+            &args.root,
+            &loaded.land_msh_path,
+        )
+        .expect("build AutoDemo static preview");
+        let mut component_bindings = preview
+            .building_collision_bindings
+            .iter()
+            .map(|binding| (binding.object_index, binding.component_index))
+            .collect::<Vec<_>>();
+        component_bindings.sort_unstable();
+        assert_eq!(
+            component_bindings,
+            vec![(4, 0), (4, 5), (5, 0), (5, 5), (6, 0), (7, 0)]
+        );
+
+        let shadow_range = EnvironmentGpuRange {
+            range_index: preview.mesh.draw_ranges.len(),
+            vertex_start: 0,
+            vertex_capacity: 0,
+            material_index: preview.shadow_material_index,
+        };
+        let mut app = StaticVulkanApp::new(
+            preview,
+            None,
+            None,
+            shadow_range,
+            0,
+            0,
+            None,
+            2,
+            None,
+            mission,
+            loaded.object_count,
+            None,
+            false,
+            StartupTimings::default(),
+        );
+        let plant = app
+            .building_collision_bindings
+            .iter()
+            .find(|binding| binding.object_index == 4 && binding.component_index == 0)
+            .cloned()
+            .expect("static PLANT root collision binding");
+        let hierarchy = app.component_pose_buffers[4][0]
+            .as_ref()
+            .expect("PLANT current root pose");
+        let plant_nodes =
+            building_collision_nodes(&plant, Some(hierarchy), app.component_mount_poses[4][0])
+                .expect("PLANT current collision nodes");
+        let plant_node = plant_nodes
+            .iter()
+            .copied()
+            .find(|node| node.node == NodeId(1) && node.slot == SlotId(0))
+            .expect("native fixture node and slot");
+        let body_to_world = |point| {
+            plant
+                .root_transform
+                .try_transform_scaled_point(point, plant.owner_scale)
+                .expect("finite placed-body transform")
+        };
+        let world_wall = BODY_WALL.map(body_to_world);
+        let world_door = BODY_DOOR.map(body_to_world);
+        let direct_wall_hit = query_building_segment_world(&plant.model, &[plant_node], world_wall)
+            .expect("direct PLANT body-space query")
+            .expect("verified PLANT wall hit");
+        assert_eq!(direct_wall_hit.node, NodeId(1));
+        assert_eq!(direct_wall_hit.slot, SlotId(0));
+        assert_eq!(direct_wall_hit.batch_index, 5);
+        assert_eq!(direct_wall_hit.triangle_descriptor_index, 62);
+        let closed_door_hit = query_building_segment_world(&plant.model, &plant_nodes, world_door)
+            .expect("linked PLANT door query")
+            .expect("the default Node3 door blocks the center path");
+        assert_eq!(closed_door_hit.node, NodeId(3));
+        assert_eq!(closed_door_hit.batch_index, 100);
+        assert_eq!(closed_door_hit.triangle_descriptor_index, 855);
+
+        let terrain_bounds = app
+            .terrain
+            .surface_bounds()
+            .expect("AutoDemo terrain surface bounds");
+        for point in world_wall.into_iter().chain(world_door) {
+            for axis in 0..2 {
+                assert!(
+                    (terrain_bounds[0][axis]..=terrain_bounds[1][axis]).contains(&point[axis]),
+                    "native fixture endpoint {point:?} is outside terrain bounds {terrain_bounds:?}"
+                );
+            }
+            let floor = app
+                .terrain
+                .height_at([point[0], point[1]])
+                .expect("fixture terrain query");
+            if let Some(floor) = floor {
+                assert!(
+                    point[2] >= floor,
+                    "native fixture height {} is below terrain {floor} at {point:?}",
+                    point[2]
+                );
+            } else {
+                let foundation = app
+                    .terrain
+                    .basement_foundation()
+                    .expect("missing terrain height needs a BAS foundation");
+                assert!(!foundation.fragments.is_empty());
+                let source_floor = terrain
+                    .height_at([point[0], point[1]])
+                    .expect("source fixture terrain query")
+                    .expect("BAS-cut fixture endpoint has source Land.msh terrain");
+                eprintln!(
+                    "native fixture endpoint {point:?} has source Land.msh floor {source_floor} but no BAS-foundation surface"
+                );
+            }
+            let mut constrained = FreeFlightCamera {
+                position: point,
+                yaw: 0.0,
+                pitch: 0.0,
+                horizontal_fov: 1.3,
+                near_plane: 0.5,
+                far_plane: 700.0,
+                move_speed: 0.0,
+                ground_clearance: 0.0,
+            };
+            constrained
+                .keep_above_terrain(&app.terrain)
+                .expect("terrain constraint preserves native fixture height");
+            assert_eq!(constrained.position, point);
+        }
+
+        set_segment(&mut app, world_wall);
+        let zero_delta = FrameClockSample {
+            id: SceneSampleId::Replay(0),
+            time_ms: 0,
+            delta_seconds: 0.0,
+        };
+        let update = app
+            .prepare_scene_update(zero_delta, [1280.0, 720.0])
+            .expect("zero-delta resume initialization");
+        assert!(app.lifecycle.prepare(update));
+        assert_eq!(app.free_camera.unwrap().position, world_wall[0]);
+        assert_eq!(app.lifecycle.record_presented(), Some(0));
+
+        let wall_frame = FrameClockSample {
+            id: SceneSampleId::Replay(1),
+            time_ms: 0,
+            delta_seconds: 0.1,
+        };
+        let update = app
+            .prepare_scene_update(wall_frame, [1280.0, 720.0])
+            .expect("high-speed wall movement through the app update path");
+        assert!(app.lifecycle.prepare(update));
+        assert_eq!(app.free_camera.unwrap().position, world_wall[0]);
+        app.pressed_keys.clear();
+        app.pressed_keys.insert(KeyCode::KeyD);
+        app.refresh_pending_viewport([1024.0, 768.0])
+            .expect("retry of the pending wall frame");
+        assert_eq!(app.free_camera.unwrap().position, world_wall[0]);
+        assert_eq!(app.lifecycle.record_presented(), Some(1));
+
+        set_segment(&mut app, world_door);
+        let closed_frame = FrameClockSample {
+            id: SceneSampleId::Replay(2),
+            time_ms: 0,
+            delta_seconds: 0.1,
+        };
+        let update = app
+            .prepare_scene_update(closed_frame, [1024.0, 768.0])
+            .expect("the closed Node3 door blocks through the app update path");
+        assert!(app.lifecycle.prepare(update));
+        assert_eq!(app.free_camera.unwrap().position, world_door[0]);
+        assert_eq!(app.lifecycle.record_presented(), Some(2));
+
+        let control = assets
+            .object_component_controls
+            .get(4)
+            .and_then(|components| components.first())
+            .and_then(Option::as_ref)
+            .expect("PLANT root retains its CTLD control");
+        let node3_binding = control
+            .bindings
+            .iter()
+            .find(|binding| binding.node_index == 3)
+            .expect("PLANT CTLD binding for the authored Node3 door");
+        assert_eq!(node3_binding.frame_a, 0.0);
+        assert_eq!(node3_binding.frame_b, 1.0);
+        assert_eq!(node3_binding.initial_blend, 0.0);
+        assert_eq!(
+            control
+                .typed_records
+                .iter()
+                .filter(|record| record.tag == 21)
+                .count(),
+            0,
+            "the PLANT control has no tag-21 record to advance Node3 from its initial frame"
+        );
+        let mut open_node_times =
+            static_preview_node_times(plant.model.node_count, &control.bindings)
+                .expect("actual initial PLANT CTLD node times");
+        assert_eq!(open_node_times[3], Some(AnimationTime(0.0)));
+        // This samples the door's authored frame B directly; it does not simulate a mission gate.
+        open_node_times[3] = Some(AnimationTime(1.0));
+        app.component_pose_buffers[4][0] = Some(
+            node38_sampled_hierarchy_at_times(&plant.model, &open_node_times)
+                .expect("sample the actual PLANT model at its authored Node3 frame B"),
+        );
+        refresh_dynamic_component_mounts(
+            &app.dynamic_component_mounts,
+            &app.component_pose_buffers,
+            &mut app.component_mount_poses,
+        )
+        .expect("refresh mounts from the authored open-door hierarchy");
+        let open_hierarchy = app.component_pose_buffers[4][0]
+            .as_ref()
+            .expect("sampled PLANT root pose");
+        let open_nodes = building_collision_nodes(
+            &plant,
+            Some(open_hierarchy),
+            app.component_mount_poses[4][0],
+        )
+        .expect("sampled PLANT collision nodes");
+        assert!(
+            query_building_segment_world(&plant.model, &open_nodes, world_door)
+                .expect("open PLANT door query")
+                .is_none(),
+            "the authored Node3 time-1 pose leaves the doorway ray clear"
+        );
+
+        set_segment(&mut app, world_door);
+        app.update_free_camera(0.1, [1024.0, 768.0])
+            .expect("open doorway movement through the app camera update");
+        let position = app.free_camera.unwrap().position;
+        for axis in 0..3 {
+            assert!((position[axis] - world_door[1][axis]).abs() < 1.0e-4);
+        }
     }
 
     fn set_test_terrain_lod0_range(terrain: &mut fparkan_terrain_format::LandMeshDocument) {
