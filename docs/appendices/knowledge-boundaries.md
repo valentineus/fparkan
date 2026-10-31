@@ -801,20 +801,38 @@ immutable TRF-таблицей. Общий helper может остановит�
 компонентов, поэтому подтверждается только эквивалентность state/selection
 для такого входа, не идентичность callback trace или вычисления этих sums.
 
-Открыты host binding полного Handler(43), factory/ownership/lifetime реального
-исследовательского context при запуске миссии, построение AI candidate list и
-его штатный порядок, live x87 policy, inventory/economy transitions и точная типизация
-всех 16-byte TMA property values. Strict ore comparison и выбор первого
-кандидата при равенстве известны только для supplied-order chooser.
-Ignored acceptance проверяет реальные Part 1 AI DAT prefix и `scream.trf`, но
-byte-sorted порядок не заявляется как native catalog order и не сравнивает
-цену с вызовом chooser-а в mission context.
+Статический перенос владельца исследовательского контекста подтверждён по трём
+GOG-модулям. В `iron3d.dll` (SHA-256
+`d1dc4ea8535e2069b0a05c9e8be2724dd438ba44cca7a83007d8b2e50f9e35fa`)
+`FUN_1005ff40` (RVA `0x5ff40`) передаёт индекс клана в `FUN_100392e0` (RVA
+`0x392e0`), где он сохраняется в `row+0x1c` и копируется в `descriptor[0]`.
+Thunk RVA `0xcd0a0` ведёт к `World3D!GetNetPlayerNum` (RVA `0x9110`), а RVA
+`0xcd08e` — к `World3D!AddNewObjectToGame` (RVA `0x8310`); SHA-256
+`World3D.dll`: `17e4a3089b2583a8cf2356c9db0390b1aba138356a09130d79b4e7e4791da61e`.
+Вызов getter-а без аргументов завершается обычным `RET`; его результат становится
+arg1 следующего вызова. `AddNewObjectToGame` принимает девять DWORD, включая
+указатель на descriptor в arg9, и очищает стек через `RET 0x24`. RVA `0x83e9`
+читает arg9; ветвь class `0xb`/QI `0x502` на RVA `0x853e` загружает
+`descriptor[0]` и передаёт его в слот `+0x5c` на RVA `0x8544`;
+`MisLoad.dll` (SHA-256
+`c607762bb67db14ca530927c8e1347339b62b0a163ac90c708ee83142292e2bf`)
+`FUN_10002a30` (RVA `0x2a30`, `RET 8`) записывает его в `inner+8`. TMA tag
+`row+0x20` ограничивает число вызовов AI slot `+0x38`, но не задаёт владельца.
 
-Закрывающий эксперимент для оставшихся границ: связать startup owner, research
-context и AI candidate selection в реальном `Init`; затем сравнить контекст,
-порядок кандидатов и cost outputs оригинала с Rust на одной миссии. Покупки,
-inventory transitions и typed property schema требуют отдельных контролируемых
-исследований.
+Открыты runtime-выполнение Handler(43), создание и lifetime research context,
+включение factory-цепочки в полный штатный startup миссии, построение AI
+candidate list и штатный порядок кандидатов, live x87 policy,
+inventory/economy transitions и точная типизация всех 16-byte TMA property
+values. Strict ore comparison и выбор первого кандидата при равенстве известны
+только для supplied-order chooser. Ignored acceptance проверяет реальные Part 1
+AI DAT prefix и `scream.trf`, но byte-sorted порядок не заявляется как native
+catalog order и не сравнивает цену с вызовом chooser-а в mission context.
+
+Для проверки оставшихся границ нужно на живой миссии установить, проходит ли
+штатный `Init` по статически восстановленной передаче owner, зафиксировать
+создание и lifetime исследовательского контекста и сравнить порядок кандидатов
+и cost outputs оригинала с Rust. Покупки, inventory transitions и typed
+property schema требуют отдельных контролируемых исследований.
 
 ## Rare branches
 
