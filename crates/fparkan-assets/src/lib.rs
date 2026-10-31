@@ -1910,16 +1910,12 @@ impl MissionAssets {
             visual_count: self.visuals.len(),
             model_count: self.models.len(),
             material_count: self.materials.len(),
-            texture_count: self
-                .textures
-                .iter()
-                .filter(|texture| texture.usage == PreparedTextureUsage::Diffuse)
-                .count(),
+            texture_count: self.visuals.iter().map(|visual| visual.texture_count).sum(),
             lightmap_count: self
-                .textures
+                .visuals
                 .iter()
-                .filter(|texture| texture.usage == PreparedTextureUsage::Lightmap)
-                .count(),
+                .map(|visual| visual.lightmap_count)
+                .sum(),
         }
     }
 }
@@ -8150,6 +8146,90 @@ mod tests {
         assert_eq!(report.material_count, assets.materials.len());
         assert_eq!(report.texture_count, assets.textures.len());
         assert!(report.texture_pixels > 0);
+    }
+
+    #[test]
+    fn mission_asset_plan_counts_texture_and_lightmap_requests() {
+        let msh = minimal_model_archive();
+        let mat0 = mat0_with_texture(b"TEX_A");
+        let texm = texm_payload();
+        let repo = repository_with_archives_meta(&[
+            (
+                "static.rlb",
+                &[
+                    TestNresEntry {
+                        name: b"tree.msh",
+                        payload: &msh,
+                        type_id: 0x4853_454D,
+                        attr2: 0,
+                    },
+                    TestNresEntry {
+                        name: b"tree.wea",
+                        payload: b"2\n0 MAT_A\n1 MAT_A\n\nLIGHTMAPS\n2\n0 LM_A\n1 LM_A\n",
+                        type_id: WEAR_KIND,
+                        attr2: 0,
+                    },
+                ],
+            ),
+            (
+                "material.lib",
+                &[TestNresEntry {
+                    name: b"MAT_A",
+                    payload: &mat0,
+                    type_id: MAT0_KIND,
+                    attr2: 0,
+                }],
+            ),
+            (
+                TEXTURES_ARCHIVE,
+                &[TestNresEntry {
+                    name: b"TEX_A",
+                    payload: &texm,
+                    type_id: 0,
+                    attr2: 0,
+                }],
+            ),
+            (
+                LIGHTMAP_ARCHIVE,
+                &[TestNresEntry {
+                    name: b"LM_A",
+                    payload: &texm,
+                    type_id: 0,
+                    attr2: 0,
+                }],
+            ),
+        ]);
+        let mesh_key = ResourceKey {
+            archive: parse_path("static.rlb").expect("archive"),
+            name: resource_name(b"tree.msh"),
+            type_id: Some(0x4853_454D),
+        };
+        let prototype = EffectivePrototype {
+            key: fparkan_prototype::PrototypeKey(resource_name(b"tree")),
+            geometry: PrototypeGeometry::Mesh(mesh_key.clone()),
+            source: fparkan_prototype::PrototypeSource::DirectArchive,
+            source_type: None,
+            dependencies: vec![mesh_key],
+            control_resource: None,
+            point_resource: None,
+            node_data_resource: None,
+            bas_resource: None,
+        };
+        let (assets, report) = prepare_mission_assets_profiled_with_repository(
+            &repo,
+            &[0..1],
+            &[prototype],
+            AssetPreparationLimits::default(),
+        )
+        .expect("prepared assets");
+        let plan = assets.to_plan();
+
+        assert_eq!(assets.visuals.len(), 1);
+        assert_eq!(assets.visuals[0].texture_count, 2);
+        assert_eq!(assets.visuals[0].lightmap_count, 2);
+        assert_eq!(assets.textures.len(), 2);
+        assert_eq!(report.texture_count, 2);
+        assert_eq!((plan.texture_count, plan.lightmap_count), (2, 2));
     }
 
     #[test]
