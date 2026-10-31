@@ -3867,7 +3867,7 @@ fn control_i32_at(payload: &[u8], offset: usize) -> Option<i32> {
 }
 
 const CONTROL_TYPED_COMMON_PARSER_TAGS: &[u32] =
-    &[1, 2, 3, 4, 5, 8, 9, 10, 12, 13, 15, 19, 21, 25, 26, 27];
+    &[1, 2, 3, 4, 5, 8, 9, 10, 12, 13, 15, 17, 19, 21, 25, 26, 27];
 const CONTROL_TYPED_RECORD_FIXED_BYTES: usize = 0xB0;
 const CONTROL_TYPED_RECORD_COUNT_OFFSET: usize = 0xAC;
 const CONTROL_TYPED_RECORD_LIMIT: usize = 4096;
@@ -4377,7 +4377,8 @@ impl Hasher for StableHasher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fparkan_prototype::build_prototype_graph;
+    use fparkan_binary::{sha256, sha256_hex};
+    use fparkan_prototype::{build_prototype_graph, resolve_prototype_all};
     use fparkan_resource::{resource_name, CachedResourceRepository};
     use fparkan_vfs::{DirectoryVfs, MemoryVfs, Vfs};
     use std::path::PathBuf;
@@ -6534,6 +6535,132 @@ mod tests {
     }
 
     #[test]
+    fn component_control_tag17_shares_common_cursor_and_preserves_raw_record_tails() {
+        let source = ResourceKey {
+            archive: parse_path("controls.rlb").expect("archive"),
+            name: resource_name(b"parts.ctl"),
+            type_id: None,
+        };
+        let mut payload = component_control_payload(&[(1, 0.0, 3.0, 0.5, 0)]);
+        payload[12..16].copy_from_slice(&2_u32.to_le_bytes());
+        payload[16..20].copy_from_slice(&1_u32.to_le_bytes());
+
+        let tag17_start = payload.len();
+        append_typed_record(&mut payload, 17, 2);
+        payload[tag17_start + 0x14..tag17_start + 0x18]
+            .copy_from_slice(&0xAABB_CCDDu32.to_le_bytes());
+        payload[tag17_start + 0xAC..tag17_start + 0xB0].copy_from_slice(&2_u32.to_le_bytes());
+        payload.splice(
+            tag17_start + 0xB0..tag17_start + 0xB0,
+            [0x1122_3344u32.to_le_bytes(), 0x5566_7788u32.to_le_bytes()].concat(),
+        );
+        payload.extend_from_slice(b"fx\0");
+
+        let known_start = payload.len();
+        append_typed_record(&mut payload, 4, 3);
+        payload[known_start + 0x28..known_start + 0x2C]
+            .copy_from_slice(&0xCAFE_D00Du32.to_le_bytes());
+        payload[known_start + 0xAC..known_start + 0xB0].copy_from_slice(&1_u32.to_le_bytes());
+        payload.splice(
+            known_start + 0xB0..known_start + 0xB0,
+            0x0102_0304u32.to_le_bytes(),
+        );
+        payload.extend_from_slice(b"ctl\0");
+
+        let group_header = payload.len();
+        payload.resize(group_header + CONTROL_EFFECT_GROUP_HEADER_BYTES, 0);
+        append_effect_table(
+            &mut payload,
+            &[effect_row(
+                4,
+                [4, 5, 6],
+                [12, 13, 14],
+                15,
+                "effects.rlb",
+                "first",
+            )],
+        );
+
+        let control = decode_component_control_payload(&payload, source, 2, 0)
+            .expect("tag 17 and the following known record share the typed cursor");
+
+        assert_eq!(
+            control
+                .typed_records
+                .iter()
+                .map(|record| record.tag)
+                .collect::<Vec<_>>(),
+            [17, 4]
+        );
+        assert_eq!(control.typed_records[0].fixed_words[5], 0xAABB_CCDD);
+        assert_eq!(control.typed_records[0].values, [0x1122_3344, 0x5566_7788]);
+        assert_eq!(control.typed_records[0].string_bytes, b"fx");
+        assert_eq!(
+            control.typed_records[0].gate_provider,
+            PreparedControlGateProvider::NotApplicable
+        );
+        assert_eq!(control.typed_records[1].fixed_words[10], 0xCAFE_D00D);
+        assert_eq!(control.typed_records[1].values, [0x0102_0304]);
+        assert_eq!(control.typed_records[1].string_bytes, b"ctl");
+        assert_eq!(control.initial_effect_group, Some(0));
+        assert_eq!(
+            control.effect_section,
+            PreparedControlEffectSection::Parsed(vec![PreparedControlEffectRow {
+                table_index: 0,
+                row_index: 0,
+                raw_condition: [4, 5, 6],
+                point_offsets: [12, 13, 14],
+                selector: 15,
+                resource: PreparedControlResourcePair {
+                    archive: fixed_name("effects.rlb"),
+                    name: fixed_name("first"),
+                },
+            }])
+        );
+    }
+
+    #[test]
+    fn component_control_truncated_tag17_frames_are_rejected() {
+        let source = ResourceKey {
+            archive: parse_path("controls.rlb").expect("archive"),
+            name: resource_name(b"parts.ctl"),
+            type_id: None,
+        };
+        let mut valid = component_control_payload(&[]);
+        valid[12..16].copy_from_slice(&1_u32.to_le_bytes());
+        let record_start = valid.len();
+        append_typed_record(&mut valid, 17, 2);
+        valid[record_start + 0xAC..record_start + 0xB0].copy_from_slice(&2_u32.to_le_bytes());
+        valid.splice(
+            record_start + 0xB0..record_start + 0xB0,
+            [0x1234_5678u32.to_le_bytes(), 0x89AB_CDEFu32.to_le_bytes()].concat(),
+        );
+        valid.extend_from_slice(b"xy\0");
+
+        let assert_invalid = |payload: Vec<u8>, label: &str| {
+            assert!(
+                matches!(
+                    decode_component_control_payload(&payload, source.clone(), 0, 0),
+                    Err(AssetError::InvalidPrototype(_))
+                ),
+                "truncated recognized tag 17 {label} must be InvalidPrototype"
+            );
+        };
+
+        for (end, label) in [
+            (record_start + 0xAF, "prefix"),
+            (record_start + 0xB0 + 4, "values"),
+            (record_start + 0xB0 + 8, "length word"),
+            (record_start + 0xB0 + 8 + 4 + 2, "string bytes"),
+        ] {
+            assert_invalid(valid[..end].to_vec(), label);
+        }
+        let mut bad_nul = valid;
+        *bad_nul.last_mut().expect("string has trailing NUL") = b'!';
+        assert_invalid(bad_nul, "trailing NUL");
+    }
+
+    #[test]
     fn component_control_malformed_recognized_typed_tail_is_rejected() {
         let source = ResourceKey {
             archive: parse_path("controls.rlb").expect("archive"),
@@ -8323,6 +8450,165 @@ mod tests {
             report.failures[0].edge,
             PrototypeGraphEdge::MaterialToTexture
         );
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn tag17_bareobject_controls_preserve_explicit_assets_and_real_effect_rows() {
+        let root = fixture_root("IS");
+        let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(&root));
+        let repository = CachedResourceRepository::new(Arc::clone(&vfs));
+        let cases = [
+            (
+                "bm_m_01",
+                "bm_m_01.ctl",
+                "bm_m_a.cpt",
+                "bm_m_01.ndp",
+                "e45658e9f3a6b72519eb47bd03e3f41ebde12ab361361297ccb916d0aed5894d",
+                0x3F66_6666,
+                0x458C_A000,
+                ["engine_mis_m", "smoke_m_ms_01", "gunf_missile_m"],
+            ),
+            (
+                "bm_l_01",
+                "bm_l_01.ctl",
+                "bm_l_a.cpt",
+                "bm_l_01.ndp",
+                "14fadfa27a4d4eab6ab9758f76a89031e085e880b42085219fa117562ab398cc",
+                0x3F59_999A,
+                0x457A_0000,
+                ["engine_mis_l", "smoke_l_ms_01", "gunf_missile_l"],
+            ),
+        ];
+
+        for (
+            root_name,
+            control_name,
+            point_name,
+            ndp_name,
+            payload_hash,
+            word11_bits,
+            word13_bits,
+            names,
+        ) in cases
+        {
+            let prototypes = resolve_prototype_all(
+                &repository,
+                vfs.as_ref(),
+                &resource_name(root_name.as_bytes()),
+            )
+            .expect("resolve the original bare-object registry entry");
+            assert_eq!(prototypes.len(), 1, "{root_name}");
+            let prototype = &prototypes[0];
+            let control_source = prototype
+                .control_resource
+                .clone()
+                .expect("bare object has an explicit CTL reference");
+            let point_source = prototype
+                .point_resource
+                .clone()
+                .expect("bare object has an explicit CPT reference");
+            let ndp_source = prototype
+                .node_data_resource
+                .clone()
+                .expect("bare object has an explicit NDP reference");
+            assert_eq!(control_source.archive.as_str(), "weapon.rlb");
+            assert_eq!(control_source.name, resource_name(control_name.as_bytes()));
+            assert_eq!(point_source.archive.as_str(), "weapon.rlb");
+            assert_eq!(point_source.name, resource_name(point_name.as_bytes()));
+            assert_eq!(ndp_source.archive.as_str(), "weapon.rlb");
+            assert_eq!(ndp_source.name, resource_name(ndp_name.as_bytes()));
+
+            let archive_id = repository
+                .open_archive(&control_source.archive)
+                .expect("open the referenced CTL archive");
+            let entry = repository
+                .find(archive_id, &control_source.name)
+                .expect("find the referenced CTL")
+                .expect("referenced CTL exists");
+            let payload = repository.read(entry).expect("read the referenced CTL");
+            assert_eq!(
+                sha256_hex(&sha256(payload.as_slice())),
+                payload_hash,
+                "{root_name} CTL payload hash"
+            );
+
+            let assets = prepare_mission_assets_with_repository(
+                &repository,
+                &[0..prototypes.len()],
+                &prototypes,
+            )
+            .expect("prepare the resolved object through the production asset path");
+            assert_eq!(assets.object_component_controls.len(), 1, "{root_name}");
+            assert_eq!(assets.object_component_controls[0].len(), 1, "{root_name}");
+            let control = assets.object_component_controls[0][0]
+                .as_ref()
+                .expect("the resolved component has prepared control");
+            assert_eq!(control.source, control_source, "{root_name} CTL source");
+            let point_list = control
+                .point_list
+                .as_ref()
+                .expect("the parsed effect rows load the explicitly registered CPT");
+            assert_eq!(point_list.source, point_source, "{root_name} CPT source");
+            assert!(
+                point_list.points.len() >= 3,
+                "{root_name} effect point indices"
+            );
+            let node_data = control
+                .node_data
+                .as_ref()
+                .expect("the explicit NDP remains attached");
+            assert_eq!(node_data.source, ndp_source, "{root_name} NDP source");
+            assert_eq!(node_data.rows.len(), 1, "{root_name} NDP rows");
+
+            assert_eq!(control.typed_records.len(), 1, "{root_name}");
+            let record = &control.typed_records[0];
+            assert_eq!(record.tag, 17, "{root_name}");
+            let mut expected_fixed_words = [0_u32; 44];
+            expected_fixed_words[0] = 17;
+            expected_fixed_words[3..=6].fill(u32::MAX);
+            expected_fixed_words[9] = 0x3F80_0000;
+            expected_fixed_words[10] = 0x3F80_0000;
+            expected_fixed_words[11] = word11_bits;
+            expected_fixed_words[12] = 0x43FA_0000;
+            expected_fixed_words[13] = word13_bits;
+            assert_eq!(
+                record.fixed_words, expected_fixed_words,
+                "{root_name} raw words"
+            );
+            assert!(record.values.is_empty(), "{root_name} values");
+            assert!(record.string_bytes.is_empty(), "{root_name} string");
+
+            let expected_rows = names
+                .iter()
+                .enumerate()
+                .map(|(row_index, name)| {
+                    let mut raw_name = fixed_name(name);
+                    match row_index {
+                        0 => raw_name[13..15].copy_from_slice(b"rd"),
+                        1 => raw_name[14..16].copy_from_slice(b"rd"),
+                        _ => {}
+                    }
+                    PreparedControlEffectRow {
+                        table_index: 0,
+                        row_index,
+                        raw_condition: [0; 3],
+                        point_offsets: [0, 1, 2],
+                        selector: u32::try_from(row_index + 1).expect("small effect selector"),
+                        resource: PreparedControlResourcePair {
+                            archive: fixed_name("effects.rlb"),
+                            name: raw_name,
+                        },
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(control.initial_effect_group, Some(0), "{root_name}");
+            assert_eq!(
+                control.effect_section,
+                PreparedControlEffectSection::Parsed(expected_rows),
+                "{root_name} parsed type-4 rows"
+            );
+        }
     }
 
     #[test]
