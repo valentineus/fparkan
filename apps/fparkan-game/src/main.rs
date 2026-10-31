@@ -47,8 +47,9 @@ use fparkan_path::ResourceName;
 use fparkan_platform_winit::{window_native_handles, WinitWindow, WinitWindowPlan};
 use fparkan_prototype::{unit_component_tree, PROTOTYPE_TYPE_EXTO};
 use fparkan_render::{
-    LegacyBlendMode, LegacyCullMode, LegacyD3d7Projection, LegacyDepthBias, LegacyDepthMode,
-    LegacyIron3dEulerTransform, LegacyPipelineState, RawCameraTransform,
+    legacy_msh_portal_alpha, LegacyBlendMode, LegacyCullMode, LegacyD3d7Projection,
+    LegacyDepthBias, LegacyDepthMode, LegacyIron3dEulerTransform, LegacyPipelineState,
+    RawCameraTransform,
 };
 use fparkan_render_vulkan::{
     node38_pose, node38_pose_from_hierarchy, node38_pose_relative_to_root,
@@ -1334,11 +1335,29 @@ fn native_world_transparent(range: &VulkanStaticDrawRange, diffuse_alpha: f32) -
     diffuse_alpha < 1.0 || (range.batch_flags & 0x108) != 0
 }
 
-fn native_msh_diffuse_alpha_override(batch_flags: u16, type16_present: bool) -> Option<f32> {
-    if type16_present || batch_flags & 0x0008 == 0 {
-        return None;
+fn native_msh_diffuse_alpha_override(
+    mesh: &VulkanStaticMesh,
+    range_index: usize,
+    type16_present: bool,
+    eye_world: [f32; 3],
+    horizontal_fov: f32,
+) -> Result<Option<f32>, String> {
+    let range = mesh
+        .draw_ranges
+        .get(range_index)
+        .ok_or_else(|| "portal draw range is out of bounds".to_string())?;
+    if type16_present || range.batch_flags & 0x0008 == 0 {
+        return Ok(None);
     }
-    (batch_flags & 0x0040 != 0 && batch_flags & 0x0010 == 0).then_some(0.0)
+    let distance = if range.batch_flags & 0x0050 == 0x0040 {
+        0.0
+    } else {
+        // shortcut: use the first indexed vertex; replace with native CPU clipping selection when clipped-portal captures are available.
+        first_indexed_vertex_distance(mesh, range_index, eye_world)?
+    };
+    legacy_msh_portal_alpha(range.batch_flags, distance, horizontal_fov)
+        .map(Some)
+        .ok_or_else(|| "portal distance or field of view is invalid".to_string())
 }
 
 fn native_msh_handedness(transform: LegacyIron3dEulerTransform, scale: [f32; 3]) -> i8 {
@@ -9408,7 +9427,19 @@ impl StaticVulkanApp {
     fn configure_world_draw_ranges(
         &self,
         renderer: &mut VulkanSmokeRenderer,
+        aspect: f32,
     ) -> Result<(), String> {
+        let approximate_portals = self
+            .world_range_indices
+            .iter()
+            .filter(|&&index| {
+                let flags = self.mesh.draw_ranges[index].batch_flags;
+                flags & 8 != 0
+                    && flags & 0x50 != 0x40
+                    && !self.type16_present_ranges.contains(&index)
+            })
+            .count();
+        eprintln!("render_coverage portal_fade_packet_selection_approx={approximate_portals} (first indexed vertex; native CPU clipping selection pending)");
         for &range_index in &self.world_range_indices {
             let range = self
                 .mesh
@@ -9420,9 +9451,12 @@ impl StaticVulkanApp {
                 .get(usize::from(range.material_index))
                 .map_or(1.0, |material| material.diffuse_alpha);
             let alpha_override = native_msh_diffuse_alpha_override(
-                range.batch_flags,
+                &self.mesh,
+                range_index,
                 self.type16_present_ranges.contains(&range_index),
-            );
+                self.view_camera.position,
+                horizontal_fov(&self.view_camera, aspect),
+            )?;
             let effective_alpha = alpha_override.unwrap_or(alpha);
             renderer
                 .set_draw_range_diffuse_alpha_override(range_index, alpha_override)
@@ -9513,6 +9547,7 @@ impl StaticVulkanApp {
         world_range_index_counts: &HashMap<usize, u32>,
         native_handedness_by_range: &HashMap<usize, i8>,
         eye_world: [f32; 3],
+        horizontal_fov: f32,
         active_materials: &HashMap<usize, ActiveMaterialState>,
         renderer: &mut VulkanSmokeRenderer,
     ) -> Result<(), String> {
@@ -9531,9 +9566,12 @@ impl StaticVulkanApp {
                 |state| state.diffuse_alpha,
             );
             let alpha_override = native_msh_diffuse_alpha_override(
-                range.batch_flags,
+                mesh,
+                range_index,
                 type16_present_ranges.contains(&range_index),
-            );
+                eye_world,
+                horizontal_fov,
+            )?;
             let alpha = alpha_override.unwrap_or(material_alpha);
             renderer
                 .set_draw_range_diffuse_alpha_override(range_index, alpha_override)
@@ -10120,6 +10158,7 @@ impl StaticVulkanApp {
             &self.world_range_index_counts,
             &self.native_handedness_by_range,
             frame.camera.position,
+            horizontal_fov(&frame.camera, frame.aspect),
             &frame.material_update.active_materials,
             renderer,
         )?;
@@ -10517,7 +10556,10 @@ impl ApplicationHandler for StaticVulkanApp {
             event_loop.exit();
             return;
         }
-        if let Err(error) = self.configure_world_draw_ranges(&mut renderer) {
+        if let Err(error) = self.configure_world_draw_ranges(
+            &mut renderer,
+            size.width.max(1) as f32 / size.height.max(1) as f32,
+        ) {
             self.error = Some(error);
             event_loop.exit();
             return;
@@ -11331,23 +11373,32 @@ mod tests {
         let (mesh, mut range) = facing_mesh(0x0148, &triangle);
         let original_count = range.index_count;
         let mut alpha_override = None;
-        let update = |range: &VulkanStaticDrawRange, alpha_override: &mut Option<f32>| {
-            *alpha_override = native_msh_diffuse_alpha_override(range.batch_flags, false);
+        let update = |range: &VulkanStaticDrawRange,
+                      eye_world: [f32; 3],
+                      alpha_override: &mut Option<f32>| {
+            let mut current_mesh = mesh.clone();
+            current_mesh.draw_ranges[0] = *range;
+            *alpha_override =
+                native_msh_diffuse_alpha_override(&current_mesh, 0, false, eye_world, 1.3).unwrap();
             world_draw_range_index_count(
                 &mesh,
                 range,
                 original_count,
                 alpha_override.unwrap_or(1.0),
-                [0.0; 3],
+                eye_world,
                 None,
             )
         };
 
-        assert_eq!(update(&range, &mut alpha_override), 0);
+        assert_eq!(update(&range, [0.0; 3], &mut alpha_override), 0);
         range.batch_flags = 0x0108;
-        assert_eq!(update(&range, &mut alpha_override), original_count);
+        assert_eq!(update(&range, [0.0; 3], &mut alpha_override), 0);
+        assert_eq!(
+            update(&range, [150.0; 3], &mut alpha_override),
+            original_count
+        );
         range.batch_flags = 0x0148;
-        assert_eq!(update(&range, &mut alpha_override), 0);
+        assert_eq!(update(&range, [150.0; 3], &mut alpha_override), 0);
         assert_eq!(original_count, 3);
     }
 
@@ -13077,14 +13128,34 @@ mod tests {
     }
 
     #[test]
-    fn native_cpu_shaded_msh_alpha_override_uses_only_the_constant_batch_rule() {
-        assert_eq!(native_msh_diffuse_alpha_override(0x0148, false), Some(0.0));
-        assert_eq!(native_msh_diffuse_alpha_override(0x0108, false), None);
-        assert_eq!(native_msh_diffuse_alpha_override(0x0118, false), None);
-        assert_eq!(native_msh_diffuse_alpha_override(0x0058, false), None);
-        assert_eq!(native_msh_diffuse_alpha_override(0x0148, true), None);
-        assert_eq!(native_msh_diffuse_alpha_override(0x0058, true), None);
-        assert_eq!(native_msh_diffuse_alpha_override(0x0040, false), None);
+    fn cpu_msh_portal_alpha_updates_with_distance_and_preserves_type16() {
+        let mut mesh = VulkanStaticMesh::smoke_triangle();
+        for flags in [0x0148, 0x0108, 0x0118, 0x0058] {
+            mesh.draw_ranges[0].batch_flags = flags;
+            assert_eq!(
+                native_msh_diffuse_alpha_override(&mesh, 0, false, [0.0, -0.55, -1.0], 1.04),
+                Ok(Some(0.0))
+            );
+            assert_eq!(
+                native_msh_diffuse_alpha_override(&mesh, 0, true, [0.0, -0.55, -1.0], 1.04),
+                Ok(None)
+            );
+        }
+        mesh.draw_ranges[0].batch_flags = 0x0118;
+        let alpha = native_msh_diffuse_alpha_override(&mesh, 0, false, [0.0, -0.55, -25.0], 1.04)
+            .unwrap()
+            .unwrap();
+        assert!((alpha - 0.5).abs() < 0.000_001);
+        assert_eq!(
+            native_msh_diffuse_alpha_override(&mesh, 0, false, [0.0, -0.55, -60.0], 1.04),
+            Ok(Some(1.0))
+        );
+        assert!(native_msh_diffuse_alpha_override(&mesh, 0, false, [0.0; 3], 0.0).is_err());
+        mesh.draw_ranges[0].batch_flags = 0x0040;
+        assert_eq!(
+            native_msh_diffuse_alpha_override(&mesh, 0, false, [0.0; 3], 1.04),
+            Ok(None)
+        );
     }
 
     #[test]

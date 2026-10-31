@@ -361,6 +361,53 @@ pub enum LegacyCullMode {
     FrontFace,
 }
 
+/// CPU diffuse alpha for a colourless MSH batch carrying flag `0x0008`.
+///
+/// `packet_distance` is the distance to the packet's first accepted vertex,
+/// after its object transform. Flag `0x0010` takes precedence over `0x0040`.
+/// Returns `None` for invalid distance or projection inputs. Callers must keep
+/// the material alpha for batches with a type-16 colour stream or without `0x0008`.
+#[must_use]
+pub fn legacy_msh_portal_alpha(
+    batch_flags: u16,
+    packet_distance: f32,
+    horizontal_fov: f32,
+) -> Option<f32> {
+    if !packet_distance.is_finite()
+        || packet_distance < 0.0
+        || !horizontal_fov.is_finite()
+        || horizontal_fov <= 0.0
+    {
+        return None;
+    }
+    let (distance, near, far, slope) = if batch_flags & 0x0010 != 0 {
+        (
+            packet_distance.sqrt(),
+            2.6 / horizontal_fov,
+            7.799_999_7 / horizontal_fov,
+            (1.0 / (7.799_999_7 - 2.6)) * horizontal_fov,
+        )
+    } else if batch_flags & 0x0040 != 0 {
+        return Some(0.0);
+    } else {
+        let near = 75.0 * 1.3;
+        let far = 95.0 * 1.3;
+        (
+            packet_distance,
+            horizontal_fov.recip() * near,
+            horizontal_fov.recip() * far,
+            (1.0 / (far - near)) * horizontal_fov,
+        )
+    };
+    Some(if distance < near {
+        0.0
+    } else if distance > far {
+        1.0
+    } else {
+        ((distance - near) * slope).clamp(0.0, 1.0)
+    })
+}
+
 /// Raster depth adjustment applied to one pipeline variant.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum LegacyDepthBias {
@@ -462,6 +509,40 @@ impl From<LegacyPipelineState> for PipelineKey {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn portal_alpha_matches_native_packet_distance_vectors() {
+        // GOG Terrain+1B0F0 with its real +246A0/+247B0 packet methods,
+        // Ngi32 RSQRTSS dispatch, x87 CW=007F, FOV=1.04.
+        for (distance, flags, expected) in [
+            (0.499_938_96, 0x18, 0.0),
+            (4.999_542, 0x18, 0.0),
+            (9.999_084, 0x18, 0.132_426_6),
+            (25.000_572, 0x18, 0.500_011_44),
+            (59.999_084, 0x18, 1.0),
+            (85.012_48, 0x08, 0.0),
+            (109.994_125, 0x08, 0.649_765_2),
+            (25.000_572, 0x58, 0.500_011_44),
+            (110.0, 0x48, 0.0),
+        ] {
+            let actual = legacy_msh_portal_alpha(flags, distance, 1.04).unwrap();
+            assert!(
+                (actual - expected).abs() < 0.000_002,
+                "{distance}: {actual}"
+            );
+        }
+        assert_eq!(legacy_msh_portal_alpha(8, 60.0, 1.3), Some(0.0));
+        assert!((legacy_msh_portal_alpha(8, 85.0, 1.3).unwrap() - 0.5).abs() < 0.000_001);
+        assert_eq!(legacy_msh_portal_alpha(8, 110.0, 1.3), Some(1.0));
+        for (distance, fov) in [
+            (f32::NAN, 1.3),
+            (-1.0, 1.3),
+            (1.0, 0.0),
+            (1.0, f32::INFINITY),
+        ] {
+            assert_eq!(legacy_msh_portal_alpha(8, distance, fov), None);
+        }
+    }
 
     fn multiply_row_major(left: [f32; 16], right: [f32; 16]) -> [f32; 16] {
         let mut result = [0.0; 16];

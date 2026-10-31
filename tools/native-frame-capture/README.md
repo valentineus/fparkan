@@ -110,3 +110,41 @@ or `44`/`50` for BGRA. Pass the viewer log's `readback_format` value; `37` is
 the verified value for the run above, not a universal surface format. The
 converter uses the installed `System.Drawing` PNG encoder and adds no package
 dependency.
+
+## Сравнение областей кадра
+
+`compare-frames.ps1` собирает пару «оригинал / FParkan» без масштабирования и
+считает средний RGB каждой указанной области. Координаты областей относятся к
+viewport, то есть к PNG просмотрщика. Оригинальный PNG сначала обрезается по
+`viewport` из JSON камеры. Имена выбираются для конкретной сцены: например,
+`sky`, `terrain_near`, `terrain_far`, `facade`, `opening`; невидимые в этом
+ракурсе области добавлять не нужно. Панели HUD и движущиеся объекты следует
+оставлять вне измеряемых прямоугольников.
+
+Пример `regions.json` для интерьера 1280 × 1024:
+
+```json
+[
+  {"name":"ceiling_near","rect":[250,50,550,170]},
+  {"name":"wall","rect":[120,400,200,150]},
+  {"name":"opening","rect":[650,550,220,100]}
+]
+```
+
+```powershell
+& '.\tools\native-frame-capture\compare-frames.ps1' -SelfTest
+& '.\tools\native-frame-capture\compare-frames.ps1' `
+  -NativePng 'target\captures\r1\constructor\interior.png' `
+  -ViewerPng 'target\captures\r1\constructor\interior-after.png' `
+  -CameraJson 'target\captures\r1\constructor\interior.json' `
+  -RegionsJson 'target\captures\r1\constructor\interior-regions.json' `
+  -OutputPrefix 'target\captures\r1\constructor\interior-comparison'
+```
+
+Результат — PNG с парой и отмеченными областями, а также JSON со средними
+значениями каналов в диапазоне 0–255. Это значения сохранённого изображения,
+без перевода в линейное цветовое пространство. Скрипт отклоняет несовпадающие
+размеры, области за границей кадра и существующие выходные файлы. Совпадение
+средних цветов не доказывает совпадение геометрии, поэтому пару нужно также
+просмотреть. Камера и фаза должны происходить из одного нативного захвата;
+интерьер снимается после настоящего входа игрока в здание.
