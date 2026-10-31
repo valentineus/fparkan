@@ -1,7 +1,12 @@
 use crate::{decode_nres_payload, NresDocument};
 use fparkan_binary::{checked_allocation_len, checked_count_bytes, Cursor, DecodeError, Limits};
 use fparkan_nres::{EntryId, NresEntry};
-use fparkan_prototype::{unit_component_tree, PrototypeError, UnitComponentTreeNode, UnitDat};
+use fparkan_path::NormalizedPath;
+use fparkan_prototype::{
+    decode_unit_dat, unit_component_tree, PrototypeError, UnitComponentRecord,
+    UnitComponentTreeNode, UnitDat,
+};
+use fparkan_vfs::Vfs;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -18,6 +23,10 @@ const TRF8: u32 = u32::from_le_bytes(*b"TRF8");
 const TRF9: u32 = u32::from_le_bytes(*b"TRF9");
 const TRFA: u32 = u32::from_le_bytes(*b"TRFA");
 const TRFB: u32 = u32::from_le_bytes(*b"TRFB");
+const UNIT_DAT_MAGIC: u32 = 0x0000_F0F1;
+const UNIT_DAT_HEADER_BYTES: usize = 8;
+const UNIT_DAT_RECORD_BYTES: usize = 112;
+const INITIAL_RESEARCH_COST_BOUND: f32 = f32::from_bits(0x4b18_967f);
 
 const RESEARCH_CHUNKS: [u32; 12] = [
     TRF0, TRF1, TRF2, TRF3, TRF4, TRF5, TRF6, TRF7, TRF8, TRF9, TRFA, TRFB,
@@ -42,6 +51,88 @@ pub struct ResearchTrfDocument {
     name_pool: Vec<u8>,
     relation_2_3: ResearchRelations,
     relation_4_5: ResearchRelations,
+}
+
+/// One ordered research candidate and its native per-entry status byte.
+#[derive(Clone, Debug)]
+pub struct ResearchCandidate {
+    /// Unit DAT path read through the caller's VFS.
+    pub path: NormalizedPath,
+    /// Native status: zero entries are considered by the next refresh.
+    pub status: u8,
+}
+
+/// Mutable candidate catalog and selected-index state for the research chooser.
+#[derive(Clone, Debug, Default)]
+pub struct ResearchCandidateSet {
+    /// Candidate entries in native supplied order.
+    pub entries: Vec<ResearchCandidate>,
+    /// Selected candidate index, preserved when no lower-cost winner exists.
+    pub selected_index: u32,
+    /// Whether the candidate catalog has been loaded.
+    pub loaded: bool,
+    /// Native candidate-set scan status byte.
+    pub status: u8,
+}
+
+impl ResearchCandidateSet {
+    /// Refreshes this set's native selector state from the supplied research table.
+    ///
+    /// # Errors
+    ///
+    /// Returns explicit errors for unsupported lookup semantics or malformed
+    /// research-table fields reached by the predicates.
+    /// Missing paths, invalid candidate DAT framing and an empty-table cost
+    /// failure skip only that entry.
+    pub fn refresh_selection(
+        &mut self,
+        vfs: &dyn Vfs,
+        research: Option<&ResearchTrfDocument>,
+    ) -> Result<(), ResearchError> {
+        let Some(research) = research else {
+            return Ok(());
+        };
+        if !self.loaded {
+            return Ok(());
+        }
+
+        self.status = 1;
+        let mut running_bound = INITIAL_RESEARCH_COST_BOUND;
+        for index in 0..self.entries.len() {
+            if self.entries[index].status != 0 {
+                continue;
+            }
+
+            self.status = 0;
+            let Ok(bytes) = vfs.read(&self.entries[index].path) else {
+                continue;
+            };
+            let Ok((candidate, tree)) = decode_candidate_first_tree(&bytes) else {
+                continue;
+            };
+
+            let first = first_research_predicate(&candidate, &tree, research)?;
+            self.entries[index].status = u8::from(first);
+            if !first {
+                continue;
+            }
+
+            let second = second_research_predicate(&candidate, &tree, research)?;
+            self.entries[index].status = u8::from(second);
+            let cost = match calc_full_research_cost(&candidate, research) {
+                Ok(cost) => cost,
+                Err(ResearchError::EmptyResearchTable) => continue,
+                Err(error) => return Err(error),
+            };
+            if !second && cost.ore < running_bound {
+                let selected_index = u32::try_from(index)
+                    .map_err(|_| ResearchError::Binary(DecodeError::IntegerOverflow))?;
+                running_bound = cost.ore;
+                self.selected_index = selected_index;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -467,6 +558,182 @@ impl ResearchTrfDocument {
             u32::from((flag >> 2) & 1),
         ))
     }
+}
+
+pub(super) fn decode_candidate_first_tree(
+    payload: &[u8],
+) -> Result<(UnitDat, Vec<UnitComponentTreeNode>), PrototypeError> {
+    let limits = Limits::default();
+    let payload_len = u64::try_from(payload.len()).map_err(|_| DecodeError::IntegerOverflow)?;
+    if payload_len > limits.max_file_bytes {
+        return Err(DecodeError::LimitExceeded {
+            count: payload_len,
+            limit: limits.max_file_bytes,
+        }
+        .into());
+    }
+    if payload.len() < UNIT_DAT_HEADER_BYTES {
+        return Err(PrototypeError::InvalidSize);
+    }
+    let magic = u32::from_le_bytes(
+        payload[..4]
+            .try_into()
+            .map_err(|_| PrototypeError::InvalidSize)?,
+    );
+    if magic != UNIT_DAT_MAGIC {
+        return Err(PrototypeError::InvalidUnitDatMagic(magic));
+    }
+
+    let available_body = payload.len() - UNIT_DAT_HEADER_BYTES;
+    let complete_records = available_body / UNIT_DAT_RECORD_BYTES;
+    if complete_records == 0 {
+        return Err(PrototypeError::InvalidSize);
+    }
+    let maximum_records =
+        usize::try_from(limits.max_entries).map_err(|_| DecodeError::IntegerOverflow)?;
+    let scan_records = complete_records.min(maximum_records);
+    let mut pending_nodes = 1_u64;
+    let mut first_tree_count = None;
+
+    for record_index in 0..scan_records {
+        let record_offset = record_index
+            .checked_mul(UNIT_DAT_RECORD_BYTES)
+            .and_then(|offset| UNIT_DAT_HEADER_BYTES.checked_add(offset))
+            .ok_or(DecodeError::IntegerOverflow)?;
+        let children_offset = record_offset
+            .checked_add(108)
+            .ok_or(DecodeError::IntegerOverflow)?;
+        let children_end = children_offset
+            .checked_add(4)
+            .ok_or(DecodeError::IntegerOverflow)?;
+        let child_count = u32::from_le_bytes(
+            payload
+                .get(children_offset..children_end)
+                .ok_or(PrototypeError::InvalidSize)?
+                .try_into()
+                .map_err(|_| PrototypeError::InvalidSize)?,
+        );
+        pending_nodes = pending_nodes
+            .checked_sub(1)
+            .and_then(|pending| pending.checked_add(u64::from(child_count)))
+            .ok_or(DecodeError::IntegerOverflow)?;
+        if pending_nodes > u64::from(limits.max_entries) {
+            return Err(DecodeError::LimitExceeded {
+                count: pending_nodes,
+                limit: u64::from(limits.max_entries),
+            }
+            .into());
+        }
+        if pending_nodes == 0 {
+            first_tree_count = Some(
+                record_index
+                    .checked_add(1)
+                    .ok_or(DecodeError::IntegerOverflow)?,
+            );
+            break;
+        }
+    }
+
+    let Some(record_count) = first_tree_count else {
+        if scan_records == maximum_records {
+            return Err(DecodeError::LimitExceeded {
+                count: u64::from(limits.max_entries) + 1,
+                limit: u64::from(limits.max_entries),
+            }
+            .into());
+        }
+        return Err(PrototypeError::InvalidSize);
+    };
+    let record_count = u64::try_from(record_count).map_err(|_| DecodeError::IntegerOverflow)?;
+    let _record_capacity = checked_allocation_len(record_count, u64::from(limits.max_entries))?;
+    let record_bytes = checked_count_bytes(
+        record_count,
+        UNIT_DAT_RECORD_BYTES as u64,
+        u64::try_from(available_body).map_err(|_| DecodeError::IntegerOverflow)?,
+    )?;
+    let record_size = u64::try_from(std::mem::size_of::<UnitComponentRecord>())
+        .map_err(|_| DecodeError::IntegerOverflow)?;
+    let tree_record_size = std::mem::size_of::<UnitComponentTreeNode>()
+        .checked_add(2 * std::mem::size_of::<usize>())
+        .ok_or(DecodeError::IntegerOverflow)?;
+    let tree_record_size =
+        u64::try_from(tree_record_size).map_err(|_| DecodeError::IntegerOverflow)?;
+    let decoded_bytes = record_size
+        .checked_add(tree_record_size)
+        .and_then(|size| size.checked_mul(record_count))
+        .ok_or(DecodeError::IntegerOverflow)?;
+    let _decoded_capacity = checked_allocation_len(decoded_bytes, limits.max_decoded_bytes)?;
+    let prefix_end = UNIT_DAT_HEADER_BYTES
+        .checked_add(record_bytes)
+        .ok_or(DecodeError::IntegerOverflow)?;
+
+    let candidate = decode_unit_dat(&payload[..prefix_end])?;
+    let tree = unit_component_tree(&candidate.records)?;
+    Ok((candidate, tree))
+}
+
+fn candidate_research_predicate(
+    candidate: &UnitDat,
+    tree: &[UnitComponentTreeNode],
+    research: &ResearchTrfDocument,
+    first_info_word: usize,
+    second_info_word: usize,
+) -> Result<bool, ResearchError> {
+    let mut stack = vec![0_usize];
+    while let Some(node_index) = stack.pop() {
+        let Some(node) = tree.get(node_index) else {
+            return Err(ResearchError::CandidateTree(
+                PrototypeError::InvalidUnitHierarchy(format!(
+                    "component index {node_index} is outside the reconstructed tree"
+                )),
+            ));
+        };
+        let Some(component) = candidate.records.get(node.record_index) else {
+            return Err(ResearchError::CandidateTree(
+                PrototypeError::InvalidUnitHierarchy(format!(
+                    "tree references missing component {}",
+                    node.record_index
+                )),
+            ));
+        };
+        if component.kind == 0 {
+            continue;
+        }
+
+        let Some(key_end) = component.resource_raw.iter().position(|byte| *byte == 0) else {
+            return Err(ResearchError::MissingCandidateKeyTerminator {
+                component_index: node.record_index,
+            });
+        };
+        let Some(research_index) = research.find_key(&component.resource_raw[..key_end])? else {
+            return Ok(false);
+        };
+        let (word0, word1, word2) = research.gates(research_index)?;
+        let info_words = [word0, word1, word2];
+        if info_words[first_info_word] == 0 || info_words[second_info_word] == 0 {
+            return Ok(false);
+        }
+        for child in node.children.iter().rev() {
+            stack.push(*child);
+        }
+    }
+    Ok(true)
+}
+
+fn first_research_predicate(
+    candidate: &UnitDat,
+    tree: &[UnitComponentTreeNode],
+    research: &ResearchTrfDocument,
+) -> Result<bool, ResearchError> {
+    candidate_research_predicate(candidate, tree, research, 1, 2)
+}
+
+fn second_research_predicate(
+    candidate: &UnitDat,
+    tree: &[UnitComponentTreeNode],
+    research: &ResearchTrfDocument,
+) -> Result<bool, ResearchError> {
+    candidate_research_predicate(candidate, tree, research, 0, 2)
 }
 
 /// Calculates the ordered ore and power cost for one candidate Unit DAT tree.

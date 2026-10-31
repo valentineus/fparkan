@@ -29,7 +29,10 @@ use fparkan_texm::{decode_mip_rgba8, decode_texm, TexmDocument, TexmError};
 pub use fparkan_texm::{PageRect, RgbaImage};
 use fparkan_vfs::DirectoryVfs;
 mod research;
-pub use research::{calc_full_research_cost, ResearchCost, ResearchError, ResearchTrfDocument};
+pub use research::{
+    calc_full_research_cost, ResearchCandidate, ResearchCandidateSet, ResearchCost, ResearchError,
+    ResearchTrfDocument,
+};
 use std::collections::{hash_map::Entry, HashMap};
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -4525,6 +4528,405 @@ mod tests {
     }
 
     #[test]
+    fn research_candidate_set_selects_later_lower_cost_and_updates_native_statuses() {
+        let costs = [(200.0, 0.0), (40.0, 0.0)];
+        let aliases = [(b"A".as_slice(), 0), (b"B".as_slice(), 1)];
+        let empty_groups = [&[][..], &[][..]];
+        let bytes = research_fixture(ResearchFixtureSpec {
+            trf0_attr2: 3,
+            flags: &[0x05, 0x05],
+            costs: &costs,
+            aliases: &aliases,
+            row_alias_links: &[0, 1],
+            relations_23: &empty_groups,
+            relations_45: &empty_groups,
+            include_trf3: true,
+            include_trf5: true,
+            omitted_chunks: &[],
+        });
+        let research = ResearchTrfDocument::decode(Arc::from(bytes.into_boxed_slice()))
+            .expect("synthetic research table");
+        let first_path = parse_path("units/first.dat").expect("first candidate path");
+        let second_path = parse_path("units/second.dat").expect("second candidate path");
+        let mut vfs = MemoryVfs::default();
+        vfs.insert(
+            first_path.clone(),
+            Arc::from(research_unit_dat_payload(&[b"A"], &[0], &[1]).into_boxed_slice()),
+        );
+        vfs.insert(
+            second_path.clone(),
+            Arc::from(research_unit_dat_payload(&[b"B"], &[0], &[1]).into_boxed_slice()),
+        );
+        let mut candidates = ResearchCandidateSet {
+            entries: vec![
+                ResearchCandidate {
+                    path: first_path,
+                    status: 0,
+                },
+                ResearchCandidate {
+                    path: second_path,
+                    status: 0,
+                },
+            ],
+            selected_index: 0x1234_5678,
+            loaded: true,
+            status: 0,
+        };
+
+        candidates
+            .refresh_selection(&vfs, Some(&research))
+            .expect("refresh research candidates");
+
+        assert_eq!(
+            candidates.selected_index, 1,
+            "later lower-cost candidate wins"
+        );
+        assert_eq!(
+            candidates.status, 0,
+            "candidate scan status is cleared before reads"
+        );
+        assert_eq!(
+            candidates
+                .entries
+                .iter()
+                .map(|entry| entry.status)
+                .collect::<Vec<_>>(),
+            [0, 0],
+            "both eligible candidates pass predicate two with false status"
+        );
+    }
+
+    #[test]
+    fn research_candidate_set_guards_and_empty_catalog_match_native_state() {
+        let research = research_selector_document(&[0x05], &[(10.0, 0.0)], &[(b"A", 0)], &[0]);
+        let default = ResearchCandidateSet::default();
+        assert!(default.entries.is_empty());
+        assert_eq!(default.selected_index, 0);
+        assert!(!default.loaded);
+        assert_eq!(default.status, 0);
+        let mut candidates = research_candidate_set(&[("missing.dat", 7)], 41, false, 9);
+        candidates
+            .refresh_selection(&MemoryVfs::default(), Some(&research))
+            .expect("unloaded catalog is a no-op");
+        assert_eq!(candidates.selected_index, 41);
+        assert_eq!(candidates.status, 9);
+        assert_eq!(candidates.entries[0].status, 7);
+
+        candidates.loaded = true;
+        candidates
+            .refresh_selection(&MemoryVfs::default(), None)
+            .expect("missing context is a no-op");
+        assert_eq!(candidates.selected_index, 41);
+        assert_eq!(candidates.status, 9);
+        assert_eq!(candidates.entries[0].status, 7);
+
+        let mut empty = research_candidate_set(&[], 63, true, 0);
+        empty
+            .refresh_selection(&MemoryVfs::default(), Some(&research))
+            .expect("loaded empty catalog refresh");
+        assert_eq!(empty.selected_index, 63);
+        assert_eq!(empty.status, 1);
+    }
+
+    #[test]
+    fn research_candidate_set_skips_nonzero_status_without_reading_missing_path() {
+        let research = research_selector_document(&[0x05], &[(10.0, 0.0)], &[(b"A", 0)], &[0]);
+        let mut candidates = research_candidate_set(&[("missing.dat", 1)], 52, true, 0);
+
+        candidates
+            .refresh_selection(&MemoryVfs::default(), Some(&research))
+            .expect("nonzero entry status skips VFS read");
+
+        assert_eq!(candidates.selected_index, 52);
+        assert_eq!(candidates.status, 1);
+        assert_eq!(candidates.entries[0].status, 1);
+    }
+
+    #[test]
+    fn research_candidate_set_short_circuits_false_predicates_on_parsed_dat() {
+        let research = research_selector_document(&[0x03], &[(10.0, 0.0)], &[(b"A", 0)], &[0]);
+        let first_path = "units/predicate-false.dat";
+        let second_path = "units/missing-key.dat";
+        let mut vfs = MemoryVfs::default();
+        insert_research_dat(
+            &mut vfs,
+            first_path,
+            research_unit_dat_payload(&[b"A"], &[0], &[1]),
+        );
+        insert_research_dat(
+            &mut vfs,
+            second_path,
+            research_unit_dat_payload(&[b"Z"], &[0], &[1]),
+        );
+        let mut candidates =
+            research_candidate_set(&[(first_path, 0), (second_path, 0)], 0x1234_5678, true, 0);
+
+        candidates
+            .refresh_selection(&vfs, Some(&research))
+            .expect("false native predicates skip without cost errors");
+
+        assert_eq!(candidates.selected_index, 0x1234_5678);
+        assert_eq!(candidates.status, 0);
+        assert_eq!(
+            candidates
+                .entries
+                .iter()
+                .map(|entry| entry.status)
+                .collect::<Vec<_>>(),
+            [0, 0]
+        );
+    }
+
+    #[test]
+    fn research_candidate_set_prunes_kind_zero_subtree_before_non_ascii_lookup() {
+        let research = research_selector_document(&[0x05], &[(10.0, 0.0)], &[(b"A", 0)], &[0]);
+        let path = "units/pruned-non-ascii-grandchild.dat";
+        let non_ascii = [0xC0];
+        let keys: [&[u8]; 3] = [b"A", b"", &non_ascii];
+        let mut vfs = MemoryVfs::default();
+        insert_research_dat(
+            &mut vfs,
+            path,
+            research_unit_dat_payload(&keys, &[1, 1, 0], &[1, 0, 1]),
+        );
+        let mut candidates = research_candidate_set(&[(path, 0)], 79, true, 0);
+
+        candidates
+            .refresh_selection(&vfs, Some(&research))
+            .expect("kind-zero subtree is pruned before its non-ASCII key");
+
+        assert_eq!(candidates.selected_index, 0);
+        assert_eq!(candidates.status, 0);
+        assert_eq!(candidates.entries[0].status, 0);
+    }
+
+    #[test]
+    fn research_candidate_set_keeps_second_predicate_true_status_and_selection() {
+        let research = research_selector_document(&[0x07], &[(10.0, 0.0)], &[(b"A", 0)], &[0]);
+        let path = "units/second-predicate-true.dat";
+        let mut vfs = MemoryVfs::default();
+        insert_research_dat(
+            &mut vfs,
+            path,
+            research_unit_dat_payload(&[b"A"], &[0], &[1]),
+        );
+        let mut candidates = research_candidate_set(&[(path, 0)], 73, true, 0);
+
+        candidates
+            .refresh_selection(&vfs, Some(&research))
+            .expect("second predicate true is a candidate skip");
+
+        assert_eq!(candidates.selected_index, 73);
+        assert_eq!(candidates.status, 0);
+        assert_eq!(candidates.entries[0].status, 1);
+    }
+
+    #[test]
+    fn research_candidate_set_skips_read_and_parse_failures_then_selects_later_candidate() {
+        let research = research_selector_document(
+            &[0x05, 0x05],
+            &[(200.0, 0.0), (40.0, 0.0)],
+            &[(b"A", 0), (b"B", 1)],
+            &[0, 1],
+        );
+        let wrong_magic = "units/wrong-magic.dat";
+        let excessive_children = "units/excessive-children.dat";
+        let winner = "units/winner.dat";
+        let mut vfs = MemoryVfs::default();
+        let mut wrong_magic_bytes = research_unit_dat_payload(&[b"A"], &[0], &[1]);
+        wrong_magic_bytes[..4].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+        insert_research_dat(&mut vfs, wrong_magic, wrong_magic_bytes);
+        let mut excessive_children_bytes = research_unit_dat_payload(&[b"A"], &[0], &[1]);
+        excessive_children_bytes[8 + 108..8 + 112].copy_from_slice(&u32::MAX.to_le_bytes());
+        insert_research_dat(&mut vfs, excessive_children, excessive_children_bytes);
+        insert_research_dat(
+            &mut vfs,
+            winner,
+            research_unit_dat_payload(&[b"B"], &[0], &[1]),
+        );
+        let mut candidates = research_candidate_set(
+            &[
+                ("units/missing.dat", 0),
+                (wrong_magic, 0),
+                (excessive_children, 0),
+                (winner, 0),
+            ],
+            91,
+            true,
+            0,
+        );
+
+        candidates
+            .refresh_selection(&vfs, Some(&research))
+            .expect("read and parse failures are skipped");
+
+        assert_eq!(candidates.selected_index, 3);
+        assert_eq!(candidates.status, 0);
+        assert_eq!(
+            candidates
+                .entries
+                .iter()
+                .map(|entry| entry.status)
+                .collect::<Vec<_>>(),
+            [0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn research_candidate_set_uses_strict_bound_and_keeps_first_tie() {
+        let tie_research = research_selector_document(
+            &[0x05, 0x05],
+            &[(40.0, 0.0), (40.0, 0.0)],
+            &[(b"A", 0), (b"B", 1)],
+            &[0, 1],
+        );
+        let mut tie_vfs = MemoryVfs::default();
+        insert_research_dat(
+            &mut tie_vfs,
+            "units/tie-a.dat",
+            research_unit_dat_payload(&[b"A"], &[0], &[1]),
+        );
+        insert_research_dat(
+            &mut tie_vfs,
+            "units/tie-b.dat",
+            research_unit_dat_payload(&[b"B"], &[0], &[1]),
+        );
+        let mut tied = research_candidate_set(
+            &[("units/tie-a.dat", 0), ("units/tie-b.dat", 0)],
+            99,
+            true,
+            0,
+        );
+        tied.refresh_selection(&tie_vfs, Some(&tie_research))
+            .expect("strict comparison keeps first tied candidate");
+        assert_eq!(tied.selected_index, 0);
+
+        for ore in [f32::from_bits(0x4b18_967f), f32::NAN] {
+            let research = research_selector_document(&[0x05], &[(ore, 0.0)], &[(b"A", 0)], &[0]);
+            let mut vfs = MemoryVfs::default();
+            insert_research_dat(
+                &mut vfs,
+                "units/no-improvement.dat",
+                research_unit_dat_payload(&[b"A"], &[0], &[1]),
+            );
+            let mut candidates =
+                research_candidate_set(&[("units/no-improvement.dat", 0)], 0xABCD, true, 0);
+            candidates
+                .refresh_selection(&vfs, Some(&research))
+                .expect("equal bound and NaN cost do not select");
+            assert_eq!(candidates.selected_index, 0xABCD);
+            assert_eq!(candidates.entries[0].status, 0);
+        }
+    }
+
+    #[test]
+    fn research_candidate_set_ignores_tail_after_first_root_tree() {
+        let research = research_selector_document(
+            &[0x05, 0x05],
+            &[(200.0, 0.0), (40.0, 0.0)],
+            &[(b"A", 0), (b"B", 1)],
+            &[0, 1],
+        );
+        let trailing = "units/trailing-three-bytes.dat";
+        let orphan = "units/orphan-record.dat";
+        let mut vfs = MemoryVfs::default();
+        let mut trailing_bytes = research_unit_dat_payload(&[b"A"], &[0], &[1]);
+        trailing_bytes[4..8].copy_from_slice(&0xA5A5_5A5A_u32.to_le_bytes());
+        trailing_bytes.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+        let (decoded, tree) = research::decode_candidate_first_tree(&trailing_bytes)
+            .expect("first complete root with trailing bytes");
+        assert_eq!(
+            &decoded.header_opaque[4..8],
+            &0xA5A5_5A5A_u32.to_le_bytes(),
+            "second header DWORD remains opaque"
+        );
+        assert_eq!(decoded.records.len(), 1);
+        assert_eq!(tree.len(), 1);
+        insert_research_dat(&mut vfs, trailing, trailing_bytes);
+
+        let mut orphan_bytes = research_unit_dat_payload(&[b"B"], &[0], &[1]);
+        let orphan_record = research_unit_dat_payload(&[b"Z"], &[0], &[1]);
+        orphan_bytes.extend_from_slice(&orphan_record[8..]);
+        insert_research_dat(&mut vfs, orphan, orphan_bytes);
+        let mut candidates = research_candidate_set(&[(trailing, 0), (orphan, 0)], 99, true, 0);
+
+        candidates
+            .refresh_selection(&vfs, Some(&research))
+            .expect("suffix records are outside the first root tree");
+
+        assert_eq!(candidates.selected_index, 1);
+        assert_eq!(candidates.status, 0);
+    }
+
+    #[test]
+    fn research_candidate_set_preserves_incremental_state_on_non_ascii_error() {
+        let non_ascii = [0xC0];
+        let research = research_selector_document(
+            &[0x05, 0x05],
+            &[(10.0, 0.0), (20.0, 0.0)],
+            &[(b"A", 0), (&non_ascii, 1)],
+            &[0, 1],
+        );
+        let mut vfs = MemoryVfs::default();
+        insert_research_dat(
+            &mut vfs,
+            "units/research-a.dat",
+            research_unit_dat_payload(&[b"A"], &[0], &[1]),
+        );
+        insert_research_dat(
+            &mut vfs,
+            "units/research-non-ascii.dat",
+            research_unit_dat_payload(&[&non_ascii], &[0], &[1]),
+        );
+        let mut candidates = research_candidate_set(
+            &[
+                ("units/research-a.dat", 0),
+                ("units/research-non-ascii.dat", 0),
+            ],
+            0xAABB_CCDD,
+            true,
+            1,
+        );
+
+        assert!(matches!(
+            candidates.refresh_selection(&vfs, Some(&research)),
+            Err(ResearchError::UnsupportedNonAsciiLookup { .. })
+        ));
+
+        assert_eq!(candidates.selected_index, 0);
+        assert_eq!(candidates.status, 0);
+        assert_eq!(
+            candidates
+                .entries
+                .iter()
+                .map(|entry| entry.status)
+                .collect::<Vec<_>>(),
+            [0, 0]
+        );
+    }
+
+    #[test]
+    fn research_candidate_set_skips_empty_table_cost_after_pruned_tree() {
+        let research = research_selector_document(&[], &[], &[], &[]);
+        let path = "units/empty-table-kind-zero.dat";
+        let mut vfs = MemoryVfs::default();
+        insert_research_dat(
+            &mut vfs,
+            path,
+            research_unit_dat_payload(&[b""], &[0], &[0]),
+        );
+        let mut candidates = research_candidate_set(&[(path, 0)], 37, true, 0);
+
+        candidates
+            .refresh_selection(&vfs, Some(&research))
+            .expect("native cost failure skips this candidate");
+
+        assert_eq!(candidates.selected_index, 37);
+        assert_eq!(candidates.status, 0);
+        assert_eq!(candidates.entries[0].status, 1);
+    }
+
+    #[test]
     fn research_trf_reader_preserves_first_alias_raw_link_and_unused_tails() {
         let costs = [(1.0, 10.0), (2.0, 20.0)];
         let aliases = [(b"Key".as_slice(), 0), (b"kEy".as_slice(), 1)];
@@ -5102,6 +5504,72 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed Part 1 corpus"]
+    fn licensed_part1_ai_candidate_prefixes_and_ordered_research_scan() {
+        let root = fixture_root("IS");
+        let vfs = DirectoryVfs::new(&root);
+        let table_path = parse_path("MISSIONS/SCRIPTS/scream.trf").expect("research path");
+        let table_bytes = vfs.read(&table_path).expect("licensed scream.trf");
+        let research = ResearchTrfDocument::decode(table_bytes).expect("decode scream.trf");
+        let prefix = parse_path("UNITS/UNITS/AI").expect("AI unit directory");
+        let mut candidate_paths = vfs
+            .list(&prefix)
+            .expect("list Part 1 AI assets")
+            .into_iter()
+            .filter_map(|entry| {
+                entry
+                    .path
+                    .as_bytes()
+                    .to_ascii_lowercase()
+                    .ends_with(b".dat")
+                    .then_some(entry.path)
+            })
+            .collect::<Vec<_>>();
+        candidate_paths.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        assert!(
+            !candidate_paths.is_empty(),
+            "Part 1 AI catalog has DAT files"
+        );
+        assert!(candidate_paths
+            .iter()
+            .all(|path| path.as_bytes().is_ascii()));
+        assert!(candidate_paths
+            .windows(2)
+            .all(|pair| pair[0].as_bytes() <= pair[1].as_bytes()));
+
+        for path in &candidate_paths {
+            let bytes = vfs
+                .read(path)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.as_str()));
+            research::decode_candidate_first_tree(&bytes)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.as_str()));
+        }
+
+        let mut candidates = ResearchCandidateSet {
+            entries: candidate_paths
+                .iter()
+                .cloned()
+                .map(|path| ResearchCandidate { path, status: 0 })
+                .collect(),
+            selected_index: 0,
+            loaded: true,
+            status: 0xA5,
+        };
+        candidates
+            .refresh_selection(&vfs, Some(&research))
+            .expect("scan Part 1 AI candidates in byte-sorted supplied order");
+        assert!(
+            usize::try_from(candidates.selected_index)
+                .is_ok_and(|index| index < candidate_paths.len()),
+            "selected index remains within the supplied catalog"
+        );
+        assert_eq!(
+            candidates.status, 0,
+            "at least one catalog entry was scanned"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires licensed Part 1 corpus"]
     fn licensed_part1_research_trf_files_all_decode() {
         fn collect_trf_files(directory: &std::path::Path, files: &mut Vec<PathBuf>) {
             for entry in std::fs::read_dir(directory).expect("read licensed directory") {
@@ -5146,6 +5614,56 @@ mod tests {
         include_trf3: bool,
         include_trf5: bool,
         omitted_chunks: &'a [u32],
+    }
+
+    fn research_selector_document(
+        flags: &[u8],
+        costs: &[(f32, f32)],
+        aliases: &[(&[u8], u16)],
+        row_alias_links: &[u16],
+    ) -> ResearchTrfDocument {
+        let empty_groups = vec![&[][..]; costs.len()];
+        let bytes = research_fixture(ResearchFixtureSpec {
+            trf0_attr2: 3,
+            flags,
+            costs,
+            aliases,
+            row_alias_links,
+            relations_23: &empty_groups,
+            relations_45: &empty_groups,
+            include_trf3: true,
+            include_trf5: true,
+            omitted_chunks: &[],
+        });
+        ResearchTrfDocument::decode(Arc::from(bytes.into_boxed_slice()))
+            .expect("synthetic research selector table")
+    }
+
+    fn research_candidate_set(
+        entries: &[(&str, u8)],
+        selected_index: u32,
+        loaded: bool,
+        status: u8,
+    ) -> ResearchCandidateSet {
+        ResearchCandidateSet {
+            entries: entries
+                .iter()
+                .map(|(path, status)| ResearchCandidate {
+                    path: parse_path(path).expect("candidate path"),
+                    status: *status,
+                })
+                .collect(),
+            selected_index,
+            loaded,
+            status,
+        }
+    }
+
+    fn insert_research_dat(vfs: &mut MemoryVfs, path: &str, bytes: Vec<u8>) {
+        vfs.insert(
+            parse_path(path).expect("candidate path"),
+            Arc::from(bytes.into_boxed_slice()),
+        );
     }
 
     fn research_fixture(spec: ResearchFixtureSpec<'_>) -> Vec<u8> {
@@ -5412,11 +5930,7 @@ mod tests {
         panic!("NRes entry type {type_id:#010x} was not built");
     }
 
-    fn research_unit_dat(
-        keys: &[&[u8]],
-        child_counts: &[u32],
-        kinds: &[u32],
-    ) -> fparkan_prototype::UnitDat {
+    fn research_unit_dat_payload(keys: &[&[u8]], child_counts: &[u32], kinds: &[u32]) -> Vec<u8> {
         assert_eq!(keys.len(), child_counts.len());
         assert_eq!(keys.len(), kinds.len());
         let mut bytes = vec![0; 8 + keys.len() * 112];
@@ -5427,7 +5941,16 @@ mod tests {
             bytes[offset + 64..offset + 68].copy_from_slice(&kinds[index].to_le_bytes());
             bytes[offset + 108..offset + 112].copy_from_slice(&child_counts[index].to_le_bytes());
         }
-        fparkan_prototype::decode_unit_dat(&bytes).expect("candidate Unit DAT")
+        bytes
+    }
+
+    fn research_unit_dat(
+        keys: &[&[u8]],
+        child_counts: &[u32],
+        kinds: &[u32],
+    ) -> fparkan_prototype::UnitDat {
+        fparkan_prototype::decode_unit_dat(&research_unit_dat_payload(keys, child_counts, kinds))
+            .expect("candidate Unit DAT")
     }
 
     fn resource_device_record(tag: u32, key: u32, base_bits: u32) -> PreparedControlTypedRecord {

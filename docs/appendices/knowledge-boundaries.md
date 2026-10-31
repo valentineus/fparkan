@@ -177,11 +177,12 @@ token и типизированную `float`/`DWORD` ячейку. Неизве
 всей цепочки кампании. Обычная `Single.01` доходит до следующего blocker-а:
 `Handler(43)` в clan 1, `Init` instruction 10. Rust не перескакивает его;
 preview оставляет varset этого клана на defaults, а полный load завершает ошибкой
-с rollback. Для самого расчёта уже есть отдельный bounded reader research-таблицы
-и pure ore/power core в `fparkan-assets`. Они принимают один Unit DAT и не
-исполняют script instruction: runtime по-прежнему не создаёт владельца живого
-контекста, не перечисляет AI candidates и не выбирает результат Handler(43).
-Это ещё не загрузка/запуск игры и не общий dispatcher.
+с rollback. В `fparkan-assets` теперь есть bounded TRF reader, pure ore/power
+core и `ResearchCandidateSet::refresh_selection`: последний получает уже
+упорядоченные entries и отдельный TRF-контекст, затем читает Unit DAT через VFS.
+Он не строит AI-каталог и не исполняет script instruction. Runtime всё ещё не
+создаёт владельца живого контекста, не передаёт реальные AI candidates и не
+выбирает результат Handler(43). Это не общий dispatcher и не загрузка игры.
 
 Для GOG-сборки также найден статический host call path в `Init`. В
 `iron3d.dll!FUN_1005ff40` (RVA `0x5ff40`) одна ветвь сначала проходит записи
@@ -767,6 +768,15 @@ stdcall `[context, candidate, out1, out2]`, `RET 0x10`, и восстановл�
 установлен в `0x007f`. У набора synthetic context, поэтому он не измеряет
 реальную миссионную стоимость.
 
+Отдельный прямой вызов chooser-а `ai.dll` SHA-256
+`c19cd6cd31cd2896f8c4ba0f0e700dd3408aec8182daaf4863d98a7d233a2abc`
+`FUN_10010f90` (RVA `0x10f90`) прошёл 3 guard-case и frozen-матрицу из 15
+проверок при заданном порядке кандидатов. Тот же код использует конструктор RVA
+`0x10480`, parser первого Unit DAT дерева RVA `0x102c0` и предикаты RVA
+`0x115f0`/`0x11530`. Wrapper Handler(43) по RVA `0xd54a` и catalog loader
+`0x104e0` не вызывались. Эта матрица не подтверждает полный Handler(43),
+миссионный источник списка или штатный порядок AI-каталога.
+
 `fparkan-assets` декодирует используемые NRes chunks, сохраняя сырые TRF0 words
 и непрозрачные данные. Native cost outputs сопоставлены только с двумя raw
 words: out1 складывает TRF0 word 1 и подписан как ore, out2 складывает word 0
@@ -774,12 +784,31 @@ words: out1 складывает TRF0 word 1 и подписан как ore, out
 не установлены. Non-ASCII case folding research keys также остаётся открытым;
 Rust явно возвращает unsupported для таких сравнений.
 
+Rust `ResearchCandidateSet` получает ordered entries, а TRF-context передаётся
+отдельно. Ошибка чтения VFS, неверный Unit DAT magic или неполное первое
+дерево пропускают entry; missing key даёт false predicate. Cost вызывается и
+для пустой таблицы: он возвращает `EmptyResearchTable`, после чего этот entry
+пропускается с сохранением второго status.
+Другие ошибки таблицы и
+`UnsupportedNonAsciiLookup` остаются явными Result-ошибками. Уже записанные
+statuses и выбранный индекс на ошибке не откатываются; это политика Rust API,
+не доказательство полного native error ABI.
+
+Два Rust-предиката повторно обходят один декодированный tree с той же
+immutable TRF-таблицей. Общий helper может остановить второй проход при первом
+ложном флаге; native RVA `0x11530` продолжает обход и накапливает
+неиспользуемые float sums. Первый проход уже проверил ключи всех enabled
+компонентов, поэтому подтверждается только эквивалентность state/selection
+для такого входа, не идентичность callback trace или вычисления этих sums.
+
 Открыты host binding полного Handler(43), factory/ownership/lifetime реального
-исследовательского context при запуске миссии, AI candidate enumeration и tie
-selection, live x87 policy, inventory/economy transitions и точная типизация
-всех 16-byte TMA property values. Контролируемый тест с настоящими
-`scream.trf` и `12hel1.dat` проверяет разбор и API одного candidate, но не
-сравнивает результат с native вызовом реального миссионного context.
+исследовательского context при запуске миссии, построение AI candidate list и
+его штатный порядок, live x87 policy, inventory/economy transitions и точная типизация
+всех 16-byte TMA property values. Strict ore comparison и выбор первого
+кандидата при равенстве известны только для supplied-order chooser.
+Ignored acceptance проверяет реальные Part 1 AI DAT prefix и `scream.trf`, но
+byte-sorted порядок не заявляется как native catalog order и не сравнивает
+цену с вызовом chooser-а в mission context.
 
 Закрывающий эксперимент для оставшихся границ: связать startup owner, research
 context и AI candidate selection в реальном `Init`; затем сравнить контекст,
