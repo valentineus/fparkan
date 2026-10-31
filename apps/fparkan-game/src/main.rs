@@ -10617,6 +10617,12 @@ impl StaticVulkanApp {
             report.renderer_report.mesh_index_upload_bytes,
             report.renderer_report.mesh_full_upload_bytes,
         );
+        eprintln!(
+            "render_texture_upload slots={} initial_images={} detached_images={}",
+            self.materials.len() * 4,
+            report.renderer_report.initial_texture_image_count,
+            report.renderer_report.texture_detach_count,
+        );
         self.output = Some(format!(
             "rendered mission {}: {} frames, {} objects, {} mesh components, {} terrain components, camera={}, captured_viewport_crop={}, control_clock_ms={}, control_clock_mode={}, materials={}, environment_primitives={}, shadow_casters={}, shadow_indices={}, swapchain_recreates={}, validation={}, swapchain_format={}, readback_format={}, readback={}, readback_sequence={}, startup_ms={{mission_assets:{:.1},terrain_materials:{:.1},sky:{:.1},gpu_initialization:{:.1}}}",
             self.mission,

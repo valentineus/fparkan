@@ -210,83 +210,46 @@ impl VulkanSmokeRenderer {
             rgba8: vec![255, 255, 255, 0],
             mip_levels: Vec::new(),
         };
-        // Fallback stages are immutable compatibility images. Keep one
-        // allocation for each fallback kind and map every logical material
-        // slot to it. Authored images remain one-per-slot because dynamic
-        // phase uploads must never couple two materials.
+        // Equal source pixels and authored mip chains can share one image.
+        // Dynamic updates detach their slot before changing a shared image.
         let texture_sources = if create_info.materials.is_empty() {
             vec![
-                (&fallback_texture, Some(0_usize)),
-                (&fallback_detail_texture, Some(1_usize)),
-                (&fallback_overlay_texture, Some(2_usize)),
-                (&fallback_detail_texture, Some(1_usize)),
+                &fallback_texture,
+                &fallback_detail_texture,
+                &fallback_overlay_texture,
+                &fallback_detail_texture,
             ]
         } else {
             let mut sources = Vec::with_capacity(create_info.materials.len() * 4);
             for material in &create_info.materials {
-                sources.push((&material.texture, None));
-                sources.push((
+                sources.push(&material.texture);
+                sources.push(
                     material
                         .detail_texture
                         .as_ref()
-                        .map_or(&fallback_detail_texture, |texture| texture),
-                    material.detail_texture.is_none().then_some(1_usize),
-                ));
-                sources.push((
+                        .unwrap_or(&fallback_detail_texture),
+                );
+                sources.push(
                     material
                         .overlay_texture
                         .as_ref()
-                        .map_or(&fallback_overlay_texture, |texture| texture),
-                    material.overlay_texture.is_none().then_some(2_usize),
-                ));
-                sources.push((
+                        .unwrap_or(&fallback_overlay_texture),
+                );
+                sources.push(
                     material
                         .overlay_detail_texture
                         .as_ref()
-                        .map_or(&fallback_detail_texture, |texture| texture),
-                    material.overlay_detail_texture.is_none().then_some(1_usize),
-                ));
+                        .unwrap_or(&fallback_detail_texture),
+                );
             }
             sources
         };
-        let mut textures = Vec::with_capacity(texture_sources.len());
-        let mut texture_slot_indices = Vec::with_capacity(texture_sources.len());
-        let mut fallback_image_indices = [None; 3];
-        for (texture_source, fallback_kind) in texture_sources {
-            let texture_index = if let Some(fallback_kind) = fallback_kind {
-                if let Some(texture_index) = fallback_image_indices[fallback_kind] {
-                    texture_index
-                } else {
-                    let image = match create_static_texture_image(
-                        &instance,
-                        &device,
-                        command_pool,
-                        texture_source,
-                    ) {
-                        Ok(image) => image,
-                        Err(error) => {
-                            for texture in &textures {
-                                destroy_allocated_image(&device, texture);
-                            }
-                            // SAFETY: These resources belong to this live device and are rolled back before it drops.
-                            unsafe { device.device().destroy_command_pool(command_pool, None) };
-                            destroy_allocated_buffer(&device, &index_buffer);
-                            destroy_allocated_buffer(&device, &vertex_buffer);
-                            return Err(error);
-                        }
-                    };
-                    let texture_index = textures.len();
-                    textures.push(image);
-                    fallback_image_indices[fallback_kind] = Some(texture_index);
-                    texture_index
-                }
-            } else {
-                let image = match create_static_texture_image(
-                    &instance,
-                    &device,
-                    command_pool,
-                    texture_source,
-                ) {
+        let (unique_sources, texture_slot_indices) = deduplicate_texture_sources(&texture_sources);
+        let mut textures = Vec::with_capacity(unique_sources.len());
+        for texture_source in unique_sources {
+            let image =
+                match create_static_texture_image(&instance, &device, command_pool, texture_source)
+                {
                     Ok(image) => image,
                     Err(error) => {
                         for texture in &textures {
@@ -299,12 +262,9 @@ impl VulkanSmokeRenderer {
                         return Err(error);
                     }
                 };
-                let texture_index = textures.len();
-                textures.push(image);
-                texture_index
-            };
-            texture_slot_indices.push(texture_index);
+            textures.push(image);
         }
+        let initial_texture_image_count = textures.len() as u64;
         let material_alphas = if create_info.materials.is_empty() {
             vec![[1.0, 0.0]]
         } else {
@@ -467,6 +427,8 @@ impl VulkanSmokeRenderer {
                 mesh_vertex_upload_bytes: 0,
                 mesh_index_upload_bytes: 0,
                 mesh_full_upload_bytes: 0,
+                initial_texture_image_count,
+                texture_detach_count: 0,
             },
         };
         renderer.rebuild_swapchain_resources(false)?;
@@ -501,6 +463,8 @@ impl VulkanSmokeRenderer {
             mesh_vertex_upload_bytes: 0,
             mesh_index_upload_bytes: 0,
             mesh_full_upload_bytes: 0,
+            initial_texture_image_count,
+            texture_detach_count: 0,
         };
         Ok(renderer)
     }
@@ -846,7 +810,7 @@ impl VulkanSmokeRenderer {
             .count()
             > 1;
         if shared_texture {
-            // A fallback image can serve many logical slots. Detach the
+            // One image can serve many logical slots. Detach the
             // requested slot before uploading so this public update method
             // keeps its one-material/one-slot semantics.
             let image = {
@@ -857,6 +821,7 @@ impl VulkanSmokeRenderer {
             let new_texture_index = self.textures.len();
             self.textures.push(image);
             self.texture_slot_indices[logical_texture_index] = new_texture_index;
+            self.report.texture_detach_count = self.report.texture_detach_count.saturating_add(1);
             let device = self.device_ref()?;
             let resources = self.resources_ref()?;
             update_material_texture_descriptor(
@@ -2256,6 +2221,23 @@ impl Drop for VulkanSmokeRenderer {
     }
 }
 
+fn deduplicate_texture_sources<'a>(
+    sources: &[&'a super::VulkanStaticTexture],
+) -> (Vec<&'a super::VulkanStaticTexture>, Vec<usize>) {
+    let mut indices = std::collections::HashMap::new();
+    let mut unique = Vec::new();
+    let mut slots = Vec::with_capacity(sources.len());
+    for &source in sources {
+        let index = *indices.entry(source).or_insert_with(|| {
+            let index = unique.len();
+            unique.push(source);
+            index
+        });
+        slots.push(index);
+    }
+    (unique, slots)
+}
+
 fn geometry_upload_range(
     count: usize,
     unchanged: usize,
@@ -2614,10 +2596,11 @@ mod tests {
     use super::super::{VulkanDynamicDrawRange, VulkanStaticDrawRange, VulkanStaticMesh};
     use super::{
         apply_geometry_range_updates, apply_world_transparency, completed_readback_buffer_index,
-        draw_material_alphas, geometry_upload_range, mark_draw_order_dirty_on_activity_change,
-        set_and_mark_dirty_if_changed, sorted_world_draw_order,
-        take_runtime_children_with_validation_snapshot, take_runtime_owners_in_dependency_order,
-        validate_geometry_upload, world_material_pipeline_states, RollbackOnDrop,
+        deduplicate_texture_sources, draw_material_alphas, geometry_upload_range,
+        mark_draw_order_dirty_on_activity_change, set_and_mark_dirty_if_changed,
+        sorted_world_draw_order, take_runtime_children_with_validation_snapshot,
+        take_runtime_owners_in_dependency_order, validate_geometry_upload,
+        world_material_pipeline_states, RollbackOnDrop,
     };
     use fparkan_render::{
         LegacyBlendMode, LegacyCullMode, LegacyDepthBias, LegacyDepthMode, LegacyPipelineState,
@@ -2772,6 +2755,54 @@ mod tests {
         assert_eq!(ranges[0], original);
         assert_eq!(capacities, vec![3, 3]);
         assert_eq!(ranges[1].index_count, 3);
+    }
+
+    #[test]
+    fn texture_deduplication_compares_pixels_extents_and_authored_mips() {
+        use super::super::{VulkanStaticTexture, VulkanStaticTextureMip};
+        let base = VulkanStaticTexture {
+            width: 2,
+            height: 2,
+            rgba8: vec![255; 16],
+            mip_levels: Vec::new(),
+        };
+        let copy = base.clone();
+        let authored = VulkanStaticTexture {
+            mip_levels: vec![
+                VulkanStaticTextureMip {
+                    width: 2,
+                    height: 2,
+                    rgba8: base.rgba8.clone(),
+                },
+                VulkanStaticTextureMip {
+                    width: 1,
+                    height: 1,
+                    rgba8: vec![255; 4],
+                },
+            ],
+            ..base.clone()
+        };
+        let mut different_mip = authored.clone();
+        different_mip.mip_levels[1].rgba8[0] = 0;
+        let different_extent = VulkanStaticTexture {
+            width: 1,
+            height: 4,
+            ..base.clone()
+        };
+        let sources = [
+            &base,
+            &copy,
+            &authored,
+            &different_mip,
+            &different_extent,
+            &copy,
+        ];
+        for source in sources {
+            source.validate().expect("valid texture");
+        }
+        let (unique, slots) = deduplicate_texture_sources(&sources);
+        assert_eq!(unique.len(), 4);
+        assert_eq!(slots, [0, 0, 1, 2, 3, 0]);
     }
 
     #[test]

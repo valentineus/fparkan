@@ -559,7 +559,7 @@ impl VulkanStaticMaterial {
 }
 
 /// One authored RGBA8 mip level accepted by the Vulkan texture upload path.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct VulkanStaticTextureMip {
     /// Mip width in texels.
     pub width: u32,
@@ -570,7 +570,7 @@ pub struct VulkanStaticTextureMip {
 }
 
 /// Decoded RGBA8 image accepted by the initial Vulkan texture upload path.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct VulkanStaticTexture {
     /// Image width in texels.
     pub width: u32,
@@ -1339,6 +1339,10 @@ pub struct VulkanSmokeRendererReport {
     pub mesh_index_upload_bytes: u64,
     /// Bytes the same updates would write without retaining unchanged prefixes.
     pub mesh_full_upload_bytes: u64,
+    /// Distinct GPU images allocated for initial material texture slots.
+    pub initial_texture_image_count: u64,
+    /// Shared images detached for independent material-slot updates.
+    pub texture_detach_count: u64,
 }
 
 /// Measured validation counters from the live smoke loop.
@@ -1484,9 +1488,8 @@ pub struct VulkanSmokeRenderer {
     pub(super) swapchain_resources: Option<VulkanSwapchainResources>,
     pub(super) vertex_buffer: Option<VulkanAllocatedBuffer>,
     pub(super) index_buffer: Option<VulkanAllocatedBuffer>,
-    /// Positional material slots mapped to the owned image list. Fallback
-    /// stages may share one image without coupling independently animated
-    /// material textures.
+    /// Positional material slots mapped to deduplicated images. Updating a
+    /// shared image first detaches that slot, preserving independent animation.
     pub(super) texture_slot_indices: Vec<usize>,
     pub(super) textures: Vec<VulkanAllocatedImage>,
     pub(super) vertex_count: usize,
