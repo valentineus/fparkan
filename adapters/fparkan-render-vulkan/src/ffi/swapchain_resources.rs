@@ -3,7 +3,8 @@
 use ash::vk;
 use fparkan_platform::DepthStencilSupport;
 use fparkan_render::{
-    LegacyBlendMode, LegacyCullMode, LegacyDepthMode, LegacyPipelineState, PipelineKey,
+    LegacyBlendMode, LegacyCullMode, LegacyDepthBias, LegacyDepthMode, LegacyPipelineState,
+    PipelineKey,
 };
 use std::collections::BTreeMap;
 
@@ -935,6 +936,14 @@ pub(super) fn draw_viewport(extent: (u32, u32), material_mode: f32) -> vk::Viewp
     }
 }
 
+fn depth_bias_parameters(depth_bias: LegacyDepthBias) -> (bool, f32, f32) {
+    match depth_bias {
+        LegacyDepthBias::Disabled => (false, 0.0, 0.0),
+        // shortcut: Vulkan constantFactor=-1.0/slopeFactor=0.0 is empirical; verify native raster state before claiming parity.
+        LegacyDepthBias::ProjectedDecal => (true, -1.0, 0.0),
+    }
+}
+
 fn create_graphics_pipeline_cache(
     device: &VulkanLogicalDeviceProbe,
     render_pass: vk::RenderPass,
@@ -1053,6 +1062,8 @@ fn create_graphics_pipeline(
     let viewport_state = vk::PipelineViewportStateCreateInfo::default()
         .viewports(&viewports)
         .scissors(&scissors);
+    let (depth_bias_enable, depth_bias_constant_factor, depth_bias_slope_factor) =
+        depth_bias_parameters(state.depth_bias);
     let rasterization_state = vk::PipelineRasterizationStateCreateInfo::default()
         .depth_clamp_enable(false)
         .rasterizer_discard_enable(false)
@@ -1064,7 +1075,10 @@ fn create_graphics_pipeline(
             LegacyCullMode::FrontFace => vk::CullModeFlags::FRONT,
         })
         .front_face(vk::FrontFace::CLOCKWISE)
-        .depth_bias_enable(false);
+        .depth_bias_enable(depth_bias_enable)
+        .depth_bias_constant_factor(depth_bias_constant_factor)
+        .depth_bias_slope_factor(depth_bias_slope_factor)
+        .depth_bias_clamp(0.0);
     let multisample_state = vk::PipelineMultisampleStateCreateInfo::default()
         .sample_shading_enable(false)
         .rasterization_samples(vk::SampleCountFlags::TYPE_1);
@@ -1337,7 +1351,20 @@ fn destroy_partial_swapchain_resources(
 
 #[cfg(test)]
 mod tests {
-    use super::draw_viewport;
+    use super::{depth_bias_parameters, draw_viewport};
+    use fparkan_render::LegacyDepthBias;
+
+    #[test]
+    fn projected_decal_bias_parameters_use_empirical_vulkan_factors() {
+        assert_eq!(
+            depth_bias_parameters(LegacyDepthBias::Disabled),
+            (false, 0.0, 0.0)
+        );
+        assert_eq!(
+            depth_bias_parameters(LegacyDepthBias::ProjectedDecal),
+            (true, -1.0, 0.0)
+        );
+    }
 
     #[test]
     fn world_viewport_depth_keeps_distant_geometry_in_front_of_screen_sun() {

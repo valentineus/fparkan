@@ -756,8 +756,8 @@ impl VulkanStaticMesh {
                 material_index: 0,
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
-                terrain_base_only: false,
                 pipeline_state: LegacyPipelineState::default(),
+                terrain_base_only: false,
                 alpha_test_reference: 0,
             }],
         }
@@ -992,8 +992,8 @@ mod static_mesh_tests {
                 material_index: 0,
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
-                terrain_base_only: false,
                 pipeline_state: LegacyPipelineState::default(),
+                terrain_base_only: false,
                 alpha_test_reference: 0,
             }],
         };
@@ -1023,8 +1023,8 @@ mod static_mesh_tests {
                 material_index: 7,
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
-                terrain_base_only: false,
                 pipeline_state: LegacyPipelineState::default(),
+                terrain_base_only: false,
                 alpha_test_reference: 0,
             },
             VulkanStaticDrawRange {
@@ -1033,8 +1033,8 @@ mod static_mesh_tests {
                 material_index: 2,
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
-                terrain_base_only: false,
                 pipeline_state: LegacyPipelineState::default(),
+                terrain_base_only: false,
                 alpha_test_reference: 0,
             },
         ];
@@ -1101,6 +1101,11 @@ mod static_mesh_tests {
             },
         ];
 
+        assert_eq!(
+            resolve_draw_texture_indices(&ranges, &materials),
+            Ok(vec![1, 0])
+        );
+
         let mut screen_tl = materials[0].clone();
         screen_tl.screen_tl = true;
         screen_tl.sky_far_depth = true;
@@ -1109,11 +1114,9 @@ mod static_mesh_tests {
         far_sky.unlit = true;
         far_sky.sky_far_depth = true;
         assert_eq!(far_sky.encoded_material_mode(), 5.0);
-
-        assert_eq!(
-            resolve_draw_texture_indices(&ranges, &materials),
-            Ok(vec![1, 0])
-        );
+        let mut nebula_with_stars = far_sky.clone();
+        nebula_with_stars.sky_nebula_stars = true;
+        assert_eq!(nebula_with_stars.encoded_material_mode(), 6.0);
 
         let mut non_finite_base = materials.clone();
         non_finite_base[0].specular_rgb[0] = f32::NAN;
@@ -1149,6 +1152,7 @@ mod static_mesh_tests {
     fn alpha_cutoff_is_dynamic_and_disabled_outside_alpha_test_pipeline() {
         let base = VulkanStaticMesh::smoke_triangle().draw_ranges[0];
         let disabled = VulkanStaticDrawRange {
+            terrain_base_only: false,
             alpha_test_reference: 200,
             ..base
         };
@@ -1157,6 +1161,7 @@ mod static_mesh_tests {
                 alpha_test: true,
                 ..LegacyPipelineState::default()
             },
+            terrain_base_only: false,
             alpha_test_reference: 128,
             ..base
         };
@@ -1167,6 +1172,7 @@ mod static_mesh_tests {
                 alpha_test: true,
                 ..LegacyPipelineState::default()
             },
+            terrain_base_only: false,
             alpha_test_reference: 0,
             ..base
         };
@@ -1176,6 +1182,7 @@ mod static_mesh_tests {
                 alpha_test: true,
                 ..LegacyPipelineState::default()
             },
+            terrain_base_only: false,
             alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
             ..base
         };
@@ -1472,8 +1479,8 @@ pub struct VulkanSmokeRenderer {
     pub(super) material_selectors: Vec<u16>,
     /// Whether the host-side specular records need a fence-safe GPU upload.
     pub(super) material_specular_dirty: bool,
-    /// Encoded material mode pushed at offset 124: 0 lit, 1 unlit, 2 native
-    /// sky nebula/stars texture composite, 3 native lightmap composite.
+    /// Encoded material mode pushed at offset 124: low bits select the
+    /// combiner, bit 4 selects sky far-depth, and bit 8 selects screen/TL.
     pub(super) material_unlit: Vec<f32>,
     pub(super) readback_enabled: bool,
     pub(super) camera: VulkanStaticCamera,

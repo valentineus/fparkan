@@ -361,6 +361,17 @@ pub enum LegacyCullMode {
     FrontFace,
 }
 
+/// Raster depth adjustment applied to one pipeline variant.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LegacyDepthBias {
+    /// Preserve the interpolated depth exactly.
+    #[default]
+    Disabled,
+    /// Move projected decals toward the camera so they pass against their
+    /// coplanar receiver under a less-or-equal depth test.
+    ProjectedDecal,
+}
+
 /// Legacy fixed-function state that changes graphics-pipeline structure.
 ///
 /// Alpha reference is deliberately not present: it is dynamic material data,
@@ -375,6 +386,8 @@ pub struct LegacyPipelineState {
     pub cull: LegacyCullMode,
     /// Whether alpha-test shader logic is enabled.
     pub alpha_test: bool,
+    /// Raster depth bias for projected decals.
+    pub depth_bias: LegacyDepthBias,
 }
 
 impl LegacyPipelineState {
@@ -405,15 +418,16 @@ impl LegacyPipelineState {
 /// Canonical, backend-neutral key for a graphics-pipeline variant.
 ///
 /// The value is explicitly packed rather than hashed, so captures and caches
-/// remain stable across processes and Rust toolchain updates. Three bits are
-/// reserved for the five native material blend modes.
+/// remain stable across processes and Rust toolchain updates. Bits 0..7 encode
+/// blend, depth, cull and alpha-test state; bit 8 distinguishes projected
+/// decal depth bias.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct PipelineKey(u8);
+pub struct PipelineKey(u16);
 
 impl PipelineKey {
     /// Returns the canonical packed representation.
     #[must_use]
-    pub const fn packed(self) -> u8 {
+    pub const fn packed(self) -> u16 {
         self.0
     }
 }
@@ -437,7 +451,11 @@ impl From<LegacyPipelineState> for PipelineKey {
             LegacyCullMode::BackFace => 1,
             LegacyCullMode::FrontFace => 2,
         };
-        Self(blend | (depth << 3) | (cull << 5) | (u8::from(state.alpha_test) << 7))
+        let depth_bias = match state.depth_bias {
+            LegacyDepthBias::Disabled => 0,
+            LegacyDepthBias::ProjectedDecal => 1 << 8,
+        };
+        Self(blend | (depth << 3) | (cull << 5) | (u16::from(state.alpha_test) << 7) | depth_bias)
     }
 }
 
@@ -611,6 +629,24 @@ mod tests {
             assert_eq!(state.cull, base.cull);
         }
         assert_eq!(base.with_material_category(5), None);
+    }
+
+    #[test]
+    fn projected_decal_bias_is_a_distinct_preserved_pipeline_state() {
+        let ordinary = LegacyPipelineState::default();
+        let decal = LegacyPipelineState {
+            depth_bias: LegacyDepthBias::ProjectedDecal,
+            ..ordinary
+        };
+        assert_eq!(ordinary.depth_bias, LegacyDepthBias::Disabled);
+        assert_ne!(PipelineKey::from(ordinary), PipelineKey::from(decal));
+        assert_eq!(
+            decal
+                .with_material_category(1)
+                .expect("native category is represented")
+                .depth_bias,
+            LegacyDepthBias::ProjectedDecal
+        );
     }
 
     #[test]

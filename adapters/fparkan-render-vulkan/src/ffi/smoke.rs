@@ -2577,7 +2577,9 @@ mod tests {
         take_runtime_children_with_validation_snapshot, take_runtime_owners_in_dependency_order,
         validate_geometry_upload, world_material_pipeline_states, RollbackOnDrop,
     };
-    use fparkan_render::{LegacyBlendMode, LegacyCullMode, LegacyDepthMode, LegacyPipelineState};
+    use fparkan_render::{
+        LegacyBlendMode, LegacyCullMode, LegacyDepthBias, LegacyDepthMode, LegacyPipelineState,
+    };
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -3145,12 +3147,74 @@ mod tests {
     }
 
     #[test]
+    fn control_fx_queue_follows_opaque_and_sky_without_reactivating_empty_ranges() {
+        const SCREEN_GRADIENT: usize = 0;
+        const CONTROL_FX: usize = 1;
+        const TERRAIN: usize = 2;
+        const BUILDING: usize = 3;
+        const SHADOW: usize = 4;
+        const NEBULA: usize = 5;
+        const DOME: usize = 6;
+        const CLOUDS: usize = 7;
+        const EMPTY_CONTROL_FX: usize = 8;
+        const SUN: usize = 9;
+        const WEATHER: usize = 10;
+        let mut ranges = (0..11)
+            .map(|index| VulkanStaticDrawRange {
+                first_index: index * 3,
+                index_count: 3,
+                material_index: 0,
+                lightmap_index: u8::MAX,
+                batch_flags: 0,
+                pipeline_state: LegacyPipelineState::default(),
+                terrain_base_only: false,
+                alpha_test_reference: 0,
+            })
+            .collect::<Vec<_>>();
+        ranges[EMPTY_CONTROL_FX].index_count = 0;
+        let mut world_queue = vec![None; ranges.len()];
+        world_queue[TERRAIN] = Some(false);
+        world_queue[BUILDING] = Some(false);
+        world_queue[CONTROL_FX] = Some(true);
+        world_queue[EMPTY_CONTROL_FX] = Some(true);
+        let mut sort_keys = vec![None; ranges.len()];
+        sort_keys[CONTROL_FX] = Some(20.0);
+        sort_keys[EMPTY_CONTROL_FX] = Some(30.0);
+
+        let order = sorted_world_draw_order(
+            ranges.len(),
+            &ranges,
+            &world_queue,
+            &sort_keys,
+            &[NEBULA, DOME, CLOUDS],
+        );
+        assert_eq!(
+            order,
+            vec![
+                SCREEN_GRADIENT,
+                TERRAIN,
+                BUILDING,
+                SHADOW,
+                NEBULA,
+                DOME,
+                CLOUDS,
+                CONTROL_FX,
+                EMPTY_CONTROL_FX,
+                SUN,
+                WEATHER,
+            ]
+        );
+        assert_eq!(ranges[EMPTY_CONTROL_FX].index_count, 0);
+    }
+
+    #[test]
     fn material_category_and_transparency_preserve_world_state_in_either_order() {
         let original = LegacyPipelineState {
             blend: LegacyBlendMode::Opaque,
             depth: LegacyDepthMode::TestWrite,
             cull: LegacyCullMode::FrontFace,
             alpha_test: false,
+            depth_bias: LegacyDepthBias::ProjectedDecal,
         };
         let (base, category_first) =
             world_material_pipeline_states(original, 1, Some(true)).expect("category 1");
@@ -3162,14 +3226,17 @@ mod tests {
         assert!(base.alpha_test);
         assert_eq!(base.depth, LegacyDepthMode::TestWrite);
         assert_eq!(base.cull, LegacyCullMode::FrontFace);
+        assert_eq!(base.depth_bias, LegacyDepthBias::ProjectedDecal);
         assert_eq!(category_first.depth, LegacyDepthMode::TestReadOnly);
         assert_eq!(category_first.cull, LegacyCullMode::FrontFace);
+        assert_eq!(category_first.depth_bias, LegacyDepthBias::ProjectedDecal);
 
         let fixed_state = LegacyPipelineState {
             blend: LegacyBlendMode::Additive,
             depth: LegacyDepthMode::Disabled,
             cull: LegacyCullMode::Disabled,
             alpha_test: false,
+            depth_bias: LegacyDepthBias::Disabled,
         };
         assert_eq!(
             world_material_pipeline_states(fixed_state, 1, None),
