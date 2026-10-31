@@ -1510,7 +1510,7 @@ fn load_mission_with_options(
     let research_trf_tables = if options.asset_scope == MissionAssetScope::Full
         && startup_input.is_some_and(|input| input.research_creation_gate)
     {
-        load_mission_research_trf_tables(&vfs, &mission, &loaded_scripts.bundles)?
+        load_mission_research_trf_tables(&vfs, &mission, &loaded_scripts.ai_startup_states)?
     } else {
         Vec::new()
     };
@@ -6613,14 +6613,14 @@ fn load_script_formula_table(
 fn load_mission_research_trf_tables(
     vfs: &Arc<dyn Vfs>,
     mission: &MissionDocument,
-    bundles: &[MissionScriptBundle],
+    ai_startup_states: &[MissionAiStartupState],
 ) -> Result<Vec<MissionResearchTrfTable>, EngineError> {
-    let mut tables = Vec::with_capacity(bundles.len());
-    for bundle in bundles {
-        let Some(clan) = mission.clans.get(bundle.clan_index) else {
+    let mut tables = Vec::with_capacity(ai_startup_states.len());
+    for ai_state in ai_startup_states {
+        let Some(clan) = mission.clans.get(ai_state.clan_index) else {
             return Err(EngineError::ScriptRuntime {
-                clan_index: bundle.clan_index,
-                message: "script bundle clan index is outside the decoded mission".to_string(),
+                clan_index: ai_state.clan_index,
+                message: "AI startup state clan index is outside the decoded mission".to_string(),
             });
         };
         let second_resource = match &clan.body {
@@ -6642,7 +6642,7 @@ fn load_mission_research_trf_tables(
         }
         if !raw_path.is_ascii() {
             return Err(EngineError::ResearchTrfPath {
-                clan_index: bundle.clan_index,
+                clan_index: ai_state.clan_index,
                 path: raw_path.to_vec(),
             });
         }
@@ -6651,12 +6651,12 @@ fn load_mission_research_trf_tables(
         let bytes = read_vfs(vfs, &path)?;
         let document =
             ResearchTrfDocument::decode(bytes).map_err(|source| EngineError::ResearchTrf {
-                clan_index: bundle.clan_index,
+                clan_index: ai_state.clan_index,
                 path: path.as_str().to_string(),
                 source,
             })?;
         tables.push(MissionResearchTrfTable {
-            clan_index: bundle.clan_index,
+            clan_index: ai_state.clan_index,
             path: path.as_str().to_string(),
             document,
         });
@@ -16428,12 +16428,9 @@ mod tests {
     }
 
     #[test]
-    fn full_load_keeps_independent_trf_tables_for_each_script_bundle_clan() {
+    fn full_load_keeps_independent_trf_tables_for_each_ai_state_clan() {
         let vfs = research_startup_test_vfs(
-            &[
-                Some(b"MISSIONS/SCRIPTS/shared"),
-                Some(b"MISSIONS/SCRIPTS/shared"),
-            ],
+            &[Some(b"MISSIONS/SCRIPTS/shared"), None],
             &[
                 b"DATA/Research/shared.trf\0ignored.trf",
                 b"DATA/Research/shared.trf",
@@ -16456,13 +16453,21 @@ mod tests {
         .expect("full load with explicit research gate");
 
         let tables = loaded_mission_research_trf_tables(&engine).expect("TRF tables");
-        assert_eq!(tables.len(), 2, "each loaded script clan owns a table");
+        assert_eq!(tables.len(), 2, "each AI state owner gets a table");
+        let bundles = loaded_mission_script_bundles(&engine).expect("script bundles");
+        assert_eq!(bundles.len(), 1, "only the scripted clan has a bundle");
+        assert_eq!(bundles[0].clan_index, 0);
+        let ai_states = loaded_mission_ai_startup_states(&engine).expect("AI states");
         assert_eq!(
-            loaded_mission_script_bundles(&engine)
-                .expect("script bundles")
-                .len(),
-            2
+            ai_states
+                .iter()
+                .map(|state| state.clan_index)
+                .collect::<Vec<_>>(),
+            [0, 1]
         );
+        assert!(ai_states
+            .iter()
+            .all(|state| state.record_slots == [u32::MAX; 9]));
         assert_eq!(tables[0].clan_index, 0);
         assert_eq!(tables[0].path, "DATA/Research/shared.trf");
         assert_eq!(tables[1].clan_index, 1);
@@ -16480,7 +16485,7 @@ mod tests {
     }
 
     #[test]
-    fn full_load_skips_research_trf_when_gate_bundle_or_c_string_is_missing() {
+    fn full_load_skips_research_trf_when_gate_or_c_string_is_missing() {
         for (script_bases, research_paths, gate, mode) in [
             (
                 vec![Some(&b"MISSIONS/SCRIPTS/shared"[..])],
@@ -16497,12 +16502,6 @@ mod tests {
             (
                 vec![Some(&b"MISSIONS/SCRIPTS/shared"[..])],
                 vec![&b"\0ignored.trf"[..]],
-                true,
-                MissionMode::SingleMission,
-            ),
-            (
-                vec![None],
-                vec![&b"DATA/Research/missing.trf"[..]],
                 true,
                 MissionMode::SingleMission,
             ),
@@ -16529,10 +16528,36 @@ mod tests {
     }
 
     #[test]
-    fn research_trf_read_and_decode_errors_keep_the_loaded_world_and_rng() {
-        let initial_vfs = research_startup_test_vfs(
+    fn static_preview_skips_research_trf_reads() {
+        let vfs = research_startup_test_vfs(
             &[Some(b"MISSIONS/SCRIPTS/shared")],
-            &[b"DATA/Research/shared.trf"],
+            &[b"DATA/Research/missing.trf"],
+            None,
+        );
+        let mut engine = create(EngineServices::new(vfs)).expect("research startup test engine");
+
+        load_mission_static_preview(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/TEST/data.tma".to_string(),
+                mode: MissionMode::SingleMission,
+            },
+        )
+        .expect("preview must not read research TRF paths");
+
+        assert!(loaded_mission_research_trf_tables(&engine)
+            .expect("TRF state")
+            .is_empty());
+        assert!(loaded_mission_ai_startup_states(&engine)
+            .expect("AI state")
+            .is_empty());
+    }
+
+    #[test]
+    fn no_script_ai_research_trf_read_and_decode_errors_keep_loaded_world_and_rng() {
+        let initial_vfs = research_startup_test_vfs(
+            &[Some(b"MISSIONS/SCRIPTS/shared"), None],
+            &[b"", b"DATA/Research/shared.trf"],
             Some(&research_test_trf()),
         );
         let mut engine = create(EngineServices::new(initial_vfs)).expect("research startup engine");
@@ -16564,8 +16589,8 @@ mod tests {
 
         for trf in [None, Some(&b"malformed"[..])] {
             let vfs = research_startup_test_vfs(
-                &[Some(b"MISSIONS/SCRIPTS/shared")],
-                &[b"DATA/Research/shared.trf"],
+                &[Some(b"MISSIONS/SCRIPTS/shared"), None],
+                &[b"", b"DATA/Research/shared.trf"],
                 trf,
             );
             engine.services.vfs = Some(vfs);
@@ -16609,7 +16634,7 @@ mod tests {
                         clan_index, path, ..
                     },
                 ) => {
-                    assert_eq!(clan_index, 0);
+                    assert_eq!(clan_index, 1);
                     assert_eq!(path, "DATA/Research/shared.trf");
                 }
                 (_, error) => panic!("unexpected TRF failure: {error:?}"),
@@ -16620,8 +16645,8 @@ mod tests {
     #[test]
     fn research_trf_c_string_paths_reject_non_ascii_bytes() {
         let vfs = research_startup_test_vfs(
-            &[Some(b"MISSIONS/SCRIPTS/shared")],
-            &[b"DATA/Research/\xe9.trf"],
+            &[Some(b"MISSIONS/SCRIPTS/shared"), None],
+            &[b"", b"DATA/Research/\xe9.trf"],
             None,
         );
         let mut engine = create(EngineServices::new(vfs)).expect("research startup test engine");
@@ -16639,14 +16664,14 @@ mod tests {
         .expect_err("non-ASCII TRF path must fail explicitly");
         assert!(matches!(
             error,
-            EngineError::ResearchTrfPath { clan_index: 0, path }
+            EngineError::ResearchTrfPath { clan_index: 1, path }
                 if path == b"DATA/Research/\xe9.trf"
         ));
     }
 
     #[test]
     #[ignore = "requires licensed corpus"]
-    fn licensed_campaign_full_load_creates_trf_tables_for_script_clan_owners() {
+    fn licensed_campaign_full_load_creates_trf_tables_for_ai_clan_owners() {
         let root = licensed_root("IS");
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(root));
         let mut engine = create(EngineServices::new(vfs)).expect("engine");
