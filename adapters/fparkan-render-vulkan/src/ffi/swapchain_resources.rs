@@ -174,11 +174,12 @@ pub(super) fn create_swapchain_resources(
     device: &VulkanLogicalDeviceProbe,
     swapchain: &VulkanSwapchainProbe,
     command_pool: vk::CommandPool,
+    pipeline_cache: vk::PipelineCache,
     vertex_buffer: &VulkanAllocatedBuffer,
     index_buffer: &VulkanAllocatedBuffer,
     textures: &[VulkanAllocatedImage],
     texture_slot_indices: &[usize],
-    draw_ranges: &[super::VulkanStaticDrawRange],
+    base_pipeline_states: &[LegacyPipelineState],
     depth_request: DepthStencilSupport,
     reuse_command_pool: bool,
 ) -> Result<VulkanSwapchainResources, VulkanSmokeRendererError> {
@@ -281,11 +282,12 @@ pub(super) fn create_swapchain_resources(
     ) = match create_swapchain_pipeline_bundle(
         instance,
         device,
+        pipeline_cache,
         swapchain.report.plan.format.format,
         swapchain.report.plan.extent,
         textures,
         texture_slot_indices,
-        draw_ranges,
+        base_pipeline_states,
         depth_request,
         partial
             .frame_uniform_buffer
@@ -449,11 +451,12 @@ fn create_swapchain_image_views(
 fn create_swapchain_pipeline_bundle(
     instance: &VulkanInstanceProbe,
     device: &VulkanLogicalDeviceProbe,
+    pipeline_cache: vk::PipelineCache,
     format: i32,
     extent: (u32, u32),
     textures: &[VulkanAllocatedImage],
     texture_slot_indices: &[usize],
-    draw_ranges: &[super::VulkanStaticDrawRange],
+    base_pipeline_states: &[LegacyPipelineState],
     depth_request: DepthStencilSupport,
     frame_uniform_buffer: &VulkanAllocatedBuffer,
     material_specular_buffer: &VulkanAllocatedBuffer,
@@ -510,25 +513,31 @@ fn create_swapchain_pipeline_bundle(
             }
             destroy_depth_attachment(device, &depth_attachment);
         })?;
-    let pipelines =
-        create_graphics_pipeline_cache(device, render_pass, pipeline_layout, extent, draw_ranges)
-            .inspect_err(|_| {
-            // SAFETY: These objects were created above on this live logical device and are destroyed on setup failure.
-            unsafe {
-                device
-                    .device()
-                    .destroy_pipeline_layout(pipeline_layout, None);
-                device.device().destroy_sampler(sampler, None);
-                device
-                    .device()
-                    .destroy_descriptor_pool(descriptor_pool, None);
-                device
-                    .device()
-                    .destroy_descriptor_set_layout(descriptor_set_layout, None);
-                device.device().destroy_render_pass(render_pass, None);
-            }
-            destroy_depth_attachment(device, &depth_attachment);
-        })?;
+    let pipelines = create_graphics_pipeline_cache(
+        device,
+        pipeline_cache,
+        render_pass,
+        pipeline_layout,
+        extent,
+        base_pipeline_states,
+    )
+    .inspect_err(|_| {
+        // SAFETY: These objects were created above on this live logical device and are destroyed on setup failure.
+        unsafe {
+            device
+                .device()
+                .destroy_pipeline_layout(pipeline_layout, None);
+            device.device().destroy_sampler(sampler, None);
+            device
+                .device()
+                .destroy_descriptor_pool(descriptor_pool, None);
+            device
+                .device()
+                .destroy_descriptor_set_layout(descriptor_set_layout, None);
+            device.device().destroy_render_pass(render_pass, None);
+        }
+        destroy_depth_attachment(device, &depth_attachment);
+    })?;
     Ok((
         depth_attachment,
         render_pass,
@@ -946,23 +955,29 @@ fn depth_bias_parameters(depth_bias: LegacyDepthBias) -> (bool, f32, f32) {
 
 fn create_graphics_pipeline_cache(
     device: &VulkanLogicalDeviceProbe,
+    pipeline_cache: vk::PipelineCache,
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
     extent: (u32, u32),
-    draw_ranges: &[super::VulkanStaticDrawRange],
+    base_pipeline_states: &[LegacyPipelineState],
 ) -> Result<BTreeMap<PipelineKey, vk::Pipeline>, VulkanSmokeRendererError> {
     let mut pipelines = BTreeMap::new();
-    for range in draw_ranges {
-        let key = range.pipeline_key();
+    for state in base_pipeline_states
+        .iter()
+        .copied()
+        .flat_map(super::smoke::pipeline_variants)
+    {
+        let key = PipelineKey::from(state);
         if pipelines.contains_key(&key) {
             continue;
         }
         let pipeline = match create_graphics_pipeline(
             device,
+            pipeline_cache,
             render_pass,
             pipeline_layout,
             extent,
-            range.pipeline_state,
+            state,
         ) {
             Ok(pipeline) => pipeline,
             Err(error) => {
@@ -982,6 +997,7 @@ fn create_graphics_pipeline_cache(
 
 fn create_graphics_pipeline(
     device: &VulkanLogicalDeviceProbe,
+    pipeline_cache: vk::PipelineCache,
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
     extent: (u32, u32),
@@ -1142,7 +1158,7 @@ fn create_graphics_pipeline(
     let pipeline_result = unsafe {
         device
             .device()
-            .create_graphics_pipelines(vk::PipelineCache::null(), &create_infos, None)
+            .create_graphics_pipelines(pipeline_cache, &create_infos, None)
     };
     // SAFETY: The shader modules were created above on this live logical device and are no longer needed after pipeline creation.
     unsafe {

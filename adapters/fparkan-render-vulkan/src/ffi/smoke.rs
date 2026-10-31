@@ -364,6 +364,7 @@ impl VulkanSmokeRenderer {
             device: Some(device),
             swapchain: Some(swapchain),
             command_pool,
+            pipeline_cache: vk::PipelineCache::null(),
             swapchain_resources: None,
             vertex_buffer: Some(vertex_buffer),
             index_buffer: Some(index_buffer),
@@ -429,8 +430,21 @@ impl VulkanSmokeRenderer {
                 mesh_full_upload_bytes: 0,
                 initial_texture_image_count,
                 texture_detach_count: 0,
+                pipeline_creation_count: 0,
             },
         };
+        // SAFETY: This cache is owned by the renderer and only used from its
+        // exclusive methods; it outlives every pipeline creation and swapchain.
+        renderer.pipeline_cache = unsafe {
+            renderer
+                .device_ref()?
+                .device()
+                .create_pipeline_cache(&vk::PipelineCacheCreateInfo::default(), None)
+        }
+        .map_err(|result| VulkanSmokeRendererError::VulkanOperation {
+            context: "vkCreatePipelineCache",
+            result,
+        })?;
         renderer.rebuild_swapchain_resources(false)?;
         let device_ref = renderer.device_ref()?;
         let swapchain_ref = renderer.swapchain_ref()?;
@@ -465,6 +479,7 @@ impl VulkanSmokeRenderer {
             mesh_full_upload_bytes: 0,
             initial_texture_image_count,
             texture_detach_count: 0,
+            pipeline_creation_count: renderer.report.pipeline_creation_count,
         };
         Ok(renderer)
     }
@@ -962,11 +977,7 @@ impl VulkanSmokeRenderer {
             },
         )?;
         self.draw_range_base_pipeline_states[range_index] = next_base;
-        let pipeline_changed = range.pipeline_state != next_state;
         range.pipeline_state = next_state;
-        if pipeline_changed {
-            self.rebuild_pipeline_resources()?;
-        }
         Ok(())
     }
 
@@ -1035,7 +1046,6 @@ impl VulkanSmokeRenderer {
             },
         )?;
         let next_state = apply_world_transparency(base_state, transparent);
-        let pipeline_changed = range.pipeline_state != next_state;
         range.pipeline_state = next_state;
         // Calling this setter opts the range into the world queue.  Fixed
         // screen/sky/weather ranges remain `None` because their pass order is
@@ -1045,9 +1055,6 @@ impl VulkanSmokeRenderer {
             Some(transparent),
             &mut self.draw_order_dirty,
         );
-        if pipeline_changed {
-            self.rebuild_pipeline_resources()?;
-        }
         Ok(())
     }
 
@@ -1673,11 +1680,12 @@ impl VulkanSmokeRenderer {
                 device,
                 swapchain,
                 self.command_pool,
+                self.pipeline_cache,
                 self.vertex_buffer_ref()?,
                 self.index_buffer_ref()?,
                 self.textures_ref()?,
                 &self.texture_slot_indices,
-                &self.draw_ranges,
+                &self.draw_range_base_pipeline_states,
                 self.depth_request,
                 reuse_command_pool,
             )?,
@@ -1696,30 +1704,12 @@ impl VulkanSmokeRenderer {
         self.report.swapchain_image_count = swapchain_image_count;
         self.report.swapchain_image_format = self.swapchain_ref()?.report.plan.format.format;
         self.report.swapchain_image_usage = swapchain_image_usage;
+        self.report.pipeline_creation_count = self
+            .report
+            .pipeline_creation_count
+            .saturating_add(resources.pipelines.len() as u64);
         self.swapchain_resources = Some(resources);
         Ok(())
-    }
-
-    /// Rebuilds only the swapchain-owned pipeline bundle after a structural
-    /// range-state change.  Draw-range setters can be called while a renderer
-    /// is live, so all prior submissions are completed before handles are
-    /// destroyed and recreated.
-    fn rebuild_pipeline_resources(&mut self) -> Result<(), VulkanSmokeRendererError> {
-        if self.swapchain_resources.is_none() {
-            return Ok(());
-        }
-        let device = self.device_ref()?;
-        // SAFETY: The renderer owns every submission on this device.  Waiting
-        // here makes the old pipelines, framebuffers, and command buffers
-        // quiescent before their destruction.
-        unsafe { device.device().device_wait_idle() }.map_err(|result| {
-            VulkanSmokeRendererError::VulkanOperation {
-                context: "vkDeviceWaitIdle(draw range pipeline update)",
-                result,
-            }
-        })?;
-        self.destroy_swapchain_resources();
-        self.rebuild_swapchain_resources(true)
     }
 
     /// Recomputes the stable command-recording order. Without explicit
@@ -2071,6 +2061,15 @@ impl VulkanSmokeRenderer {
     fn destroy_device_owned_resources(&mut self) {
         self.destroy_swapchain_resources();
         if let Some(device) = self.device.as_ref() {
+            if self.pipeline_cache != vk::PipelineCache::null() {
+                // SAFETY: All pipeline creation has finished on this device.
+                unsafe {
+                    device
+                        .device()
+                        .destroy_pipeline_cache(self.pipeline_cache, None)
+                };
+                self.pipeline_cache = vk::PipelineCache::null();
+            }
             for texture in self.textures.drain(..) {
                 destroy_allocated_image(device, &texture);
             }
@@ -2429,6 +2428,18 @@ fn draw_material_alphas(
     ]
 }
 
+pub(super) fn pipeline_variants(original: LegacyPipelineState) -> [LegacyPipelineState; 12] {
+    std::array::from_fn(|index| match index {
+        0 => original,
+        1 => apply_world_transparency(original, true),
+        _ => {
+            world_material_pipeline_states(original, ((index - 2) / 2) as u8, Some(index % 2 != 0))
+                .expect("categories 0..=4 are valid")
+                .1
+        }
+    })
+}
+
 fn world_material_pipeline_states(
     original: LegacyPipelineState,
     category: u8,
@@ -2597,7 +2608,7 @@ mod tests {
     use super::{
         apply_geometry_range_updates, apply_world_transparency, completed_readback_buffer_index,
         deduplicate_texture_sources, draw_material_alphas, geometry_upload_range,
-        mark_draw_order_dirty_on_activity_change, set_and_mark_dirty_if_changed,
+        mark_draw_order_dirty_on_activity_change, pipeline_variants, set_and_mark_dirty_if_changed,
         sorted_world_draw_order, take_runtime_children_with_validation_snapshot,
         take_runtime_owners_in_dependency_order, validate_geometry_upload,
         world_material_pipeline_states, RollbackOnDrop,
@@ -2755,6 +2766,36 @@ mod tests {
         assert_eq!(ranges[0], original);
         assert_eq!(capacities, vec![3, 3]);
         assert_eq!(ranges[1].index_count, 3);
+    }
+
+    #[test]
+    fn pipeline_variants_keep_authored_alpha_and_prepare_both_depth_policies() {
+        let original = LegacyPipelineState {
+            alpha_test: true,
+            depth: LegacyDepthMode::TestWrite,
+            cull: LegacyCullMode::FrontFace,
+            depth_bias: LegacyDepthBias::ProjectedDecal,
+            ..LegacyPipelineState::default()
+        };
+        let states = pipeline_variants(original);
+        let keys: std::collections::BTreeSet<_> = states
+            .iter()
+            .map(|state| fparkan_render::PipelineKey::from(*state))
+            .collect();
+        assert_eq!(keys.len(), 12);
+        assert_eq!(states[0], original);
+        assert_eq!(states[1], apply_world_transparency(original, true));
+        for state in states {
+            assert_eq!(state.cull, original.cull);
+            assert_eq!(state.depth_bias, original.depth_bias);
+        }
+        let disabled = pipeline_variants(LegacyPipelineState {
+            depth: LegacyDepthMode::Disabled,
+            ..original
+        });
+        assert!(disabled
+            .iter()
+            .all(|state| state.depth == LegacyDepthMode::Disabled));
     }
 
     #[test]

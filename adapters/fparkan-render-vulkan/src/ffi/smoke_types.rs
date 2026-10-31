@@ -1343,6 +1343,8 @@ pub struct VulkanSmokeRendererReport {
     pub initial_texture_image_count: u64,
     /// Shared images detached for independent material-slot updates.
     pub texture_detach_count: u64,
+    /// Graphics pipelines created across swapchain lifetimes.
+    pub pipeline_creation_count: u64,
 }
 
 /// Measured validation counters from the live smoke loop.
@@ -1485,6 +1487,7 @@ pub struct VulkanSmokeRenderer {
     pub(super) device: Option<VulkanLogicalDeviceProbe>,
     pub(super) swapchain: Option<VulkanSwapchainProbe>,
     pub(super) command_pool: vk::CommandPool,
+    pub(super) pipeline_cache: vk::PipelineCache,
     pub(super) swapchain_resources: Option<VulkanSwapchainResources>,
     pub(super) vertex_buffer: Option<VulkanAllocatedBuffer>,
     pub(super) index_buffer: Option<VulkanAllocatedBuffer>,
