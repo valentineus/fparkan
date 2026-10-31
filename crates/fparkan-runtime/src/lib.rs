@@ -2256,20 +2256,22 @@ pub fn query_loaded_mission_control_resource(
     query_control_device_table_resource(table, selector)
 }
 
-/// Queries one loaded Control device through its original factory getter.
+/// Queries one loaded Control device through its indexed selector interface.
 ///
-/// Selector `0xe00` is modeled for current descriptor tags 5 and 26 with
-/// factory tags 5 and 26. Both common factory readers use the device key to
-/// read the current provider value and multiply it by coefficient 0. Only
-/// current tag 26 also multiplies by `M`; current tag 5 ignores `M` and
-/// descriptor word 8 for this selector. Explicit Control update calls can
-/// change current provider or multiplier values; the mission clock does not
-/// advance them automatically.
+/// Selector `0x400` returns the current type-1 value from the provider row
+/// selected by the device key, including signed zero, regardless of current
+/// descriptor or factory tag. Selector `0xe00` is modeled for current
+/// descriptor tags 5 and 26 with factory tags 5 and 26. Both common factory
+/// readers use the device key to read the current provider value and multiply
+/// it by coefficient 0. Only current tag 26 also multiplies by `M`; current
+/// tag 5 ignores `M` and descriptor word 8 for this selector. Explicit Control
+/// update calls can change current provider or multiplier values; the mission
+/// clock does not advance them automatically.
 ///
 /// # Errors
 /// Returns an error for an invalid handle, unavailable mission/table/provider,
-/// an out-of-range device/provider key, or a factory/tag/float path that is not
-/// supported by the current reconstruction.
+/// an out-of-range device/provider key, an unsupported float range, or an
+/// unsupported current/factory tag on selector `0xe00`.
 pub fn query_loaded_mission_control_device_selector(
     engine: &Engine,
     handle: ObjectHandle,
@@ -4371,7 +4373,7 @@ fn query_control_device_table_selector(
     device_index: usize,
     selector: u32,
 ) -> Result<Option<f32>, ControlResourceAccessError> {
-    if selector != 0xe00 {
+    if !matches!(selector, 0x400 | 0xe00) {
         return Err(ControlResourceAccessError::UnsupportedSelector(selector));
     }
     let devices = match &table.status {
@@ -4387,6 +4389,10 @@ fn query_control_device_table_selector(
                 device_index,
                 device_count: devices.len(),
             })?;
+    if selector == 0x400 {
+        return control_device_provider_value_from_status(&table.node_provider_status, device)
+            .map(Some);
+    }
     query_control_device_selector(device, &table.node_provider_status)
 }
 
@@ -11891,6 +11897,71 @@ mod tests {
     }
 
     #[test]
+    fn indexed_provider_value_query_400_reads_current_value_by_device_key() {
+        let mut device = synthetic_effective_control_device(2, 99, 9.0_f32.to_bits(), None, None);
+        device.key = 1;
+        device.native_word_50_bits = Some(0);
+        device.coefficient_bits = None;
+        device.descriptor.fixed_words[8] = 13.0_f32.to_bits();
+        let table = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(vec![device]),
+            MissionControlNodeProviderTableStatus::Available(vec![
+                synthetic_node_provider_row(0, 0, 0.125_f32.to_bits()),
+                synthetic_node_provider_row(0, 1, 0.625_f32.to_bits()),
+                synthetic_node_provider_row(0, 2, 0.875_f32.to_bits()),
+            ]),
+        );
+
+        assert_eq!(
+            query_control_device_table_selector(&table, 0, 0x400),
+            Ok(Some(0.625_f32)),
+            "selector 0x400 returns the current type-1 value at the device's provider key"
+        );
+
+        let mut negative_zero = table.clone();
+        let MissionControlNodeProviderTableStatus::Available(rows) =
+            &mut negative_zero.node_provider_status
+        else {
+            unreachable!();
+        };
+        rows[1].current_type1_value_bits = (-0.0_f32).to_bits();
+        assert_eq!(
+            query_control_device_table_selector(&negative_zero, 0, 0x400)
+                .expect("negative-zero provider value")
+                .map(f32::to_bits),
+            Some((-0.0_f32).to_bits())
+        );
+
+        let reason = MissionControlNodeProviderTableUnavailableReason::MissingNodeData {
+            unit_component_index: 0,
+            source: None,
+        };
+        let unavailable = synthetic_control_device_table_with_providers(
+            table.status.clone(),
+            MissionControlNodeProviderTableStatus::Unavailable(reason.clone()),
+        );
+        assert_eq!(
+            query_control_device_table_selector(&unavailable, 0, 0x400),
+            Err(ControlResourceAccessError::NodeProviderTableUnavailable(
+                reason
+            ))
+        );
+
+        let mut out_of_range = table.clone();
+        let MissionControlDeviceTableStatus::Available(devices) = &mut out_of_range.status else {
+            unreachable!();
+        };
+        devices[0].key = 3;
+        assert_eq!(
+            query_control_device_table_selector(&out_of_range, 0, 0x400),
+            Err(ControlResourceAccessError::NodeProviderKeyOutOfRange {
+                key: 3,
+                row_count: 3,
+            })
+        );
+    }
+
+    #[test]
     fn synthetic_into_builder_appends_all_rows_and_overrides_only_first_record() {
         let append = synthetic_control_table(
             &[None, Some(PROTOTYPE_TYPE_INTO)],
@@ -13832,6 +13903,96 @@ mod tests {
                 .map(f32::to_bits);
             assert_eq!(actual, expected_bits, "original object {original_id}");
         }
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn full_load_queries_indexed_control_selector_400_for_all_autodemo_devices() {
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(
+            licensed_root("IS"),
+        ))))
+        .expect("engine");
+        load_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Autodemo.00/data.tma".into(),
+                mode: MissionMode::AutoDemo,
+            },
+            MissionStartupInput {
+                queue_time_ms: 100_000,
+                research_creation_gate: false,
+            },
+        )
+        .expect("load licensed AutoDemo with explicit startup inputs");
+
+        let tables = loaded_mission_control_device_tables(&engine).expect("Control tables");
+        let expected: [(u32, usize, &[u32]); 8] = [
+            (0, 33, &[0, 0, 0, 0, 0, 0, 16, 19, 16, 18, 27, 30, 31, 32]),
+            (1, 23, &[0, 0, 0, 0, 0, 0, 10, 13, 10, 11, 19, 22]),
+            (2, 26, &[0, 0, 0, 0, 0, 0, 0, 0, 8, 9, 8, 10, 19, 22, 25]),
+            (3, 29, &[0, 0, 0, 0, 0, 0, 16, 21, 16, 20, 26, 27, 28]),
+            (4, 32, &[5, 5, 1, 23, 3, 22, 7, 19, 16, 23, 5, 29]),
+            (5, 32, &[5, 5, 1, 23, 3, 22, 7, 19, 16, 23, 5, 29]),
+            (6, 22, &[17, 19, 19, 15, 13, 14, 10, 11, 4, 5, 7]),
+            (7, 22, &[17, 19, 19, 15, 13, 14, 10, 11, 4, 5, 7]),
+        ];
+        assert_eq!(tables.len(), expected.len());
+
+        let mut queried_devices = 0;
+        for (original_id, expected_provider_rows, expected_keys) in expected {
+            let table = tables
+                .iter()
+                .find(|table| table.original_id == Some(OriginalObjectId(original_id)))
+                .expect("AutoDemo Control table for original object");
+            let devices = match &table.status {
+                MissionControlDeviceTableStatus::Available(devices) => devices,
+                MissionControlDeviceTableStatus::Unavailable(reason) => {
+                    panic!("Control table for object {original_id} is unavailable: {reason:?}");
+                }
+            };
+            let provider_rows = match &table.node_provider_status {
+                MissionControlNodeProviderTableStatus::Available(rows) => rows,
+                MissionControlNodeProviderTableStatus::Unavailable(reason) => {
+                    panic!("provider rows for object {original_id} are unavailable: {reason:?}");
+                }
+            };
+            assert_eq!(
+                devices.len(),
+                expected_keys.len(),
+                "device count for {original_id}"
+            );
+            assert_eq!(
+                provider_rows.len(),
+                expected_provider_rows,
+                "provider row count for {original_id}"
+            );
+
+            for (device_index, expected_key) in expected_keys.iter().copied().enumerate() {
+                let device = &devices[device_index];
+                assert_eq!(
+                    device.key, expected_key,
+                    "provider key for object {original_id}, device {device_index}"
+                );
+                assert!(
+                    (expected_key as usize) < provider_rows.len(),
+                    "provider key for object {original_id}, device {device_index}"
+                );
+                let actual = query_loaded_mission_control_device_selector(
+                    &engine,
+                    table.handle,
+                    device_index,
+                    0x400,
+                )
+                .expect("selector 0x400 query");
+                assert_eq!(
+                    actual.map(f32::to_bits),
+                    Some(0x3f80_0000),
+                    "current provider value for object {original_id}, device {device_index}, key {expected_key}"
+                );
+                queried_devices += 1;
+            }
+        }
+        assert_eq!(queried_devices, 100);
     }
 
     #[test]
