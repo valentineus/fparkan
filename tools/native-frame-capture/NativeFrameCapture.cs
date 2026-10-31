@@ -201,6 +201,8 @@ internal static partial class NativeFrameCapture
     private sealed class SelectedCameraState
     {
         public SelectedCameraInput Input;
+        public int PrecedingFramesRemaining;
+        public int PrecedingFramesCompleted;
         public uint CandidateCameraPointer;
         public uint CandidateThreadId;
         public uint CandidateGeneration;
@@ -224,6 +226,47 @@ internal static partial class NativeFrameCapture
         public byte[] OriginalMatrixBytes;
         public string OriginalMatrixSha256;
         public uint OriginalParentPointer;
+    }
+
+    private static SelectedCameraState NextSelectedWarmupFrame(SelectedCameraState previous)
+    {
+        if (previous.PrecedingFramesRemaining <= 0 || !previous.RestoreVerified
+            || !previous.Restored || !previous.MatrixIntactAtReturn
+            || !previous.ProjectionMatchesInput || previous.PixelAttributionInvalidated)
+            throw new InvalidOperationException("Cannot advance a selected camera before a verified frame and exact restoration.");
+        return new SelectedCameraState
+        {
+            Input = previous.Input,
+            PrecedingFramesRemaining = previous.PrecedingFramesRemaining - 1,
+            PrecedingFramesCompleted = previous.PrecedingFramesCompleted + 1,
+            CandidateCameraPointer = previous.CameraPointer,
+            CandidateThreadId = previous.ThreadId,
+            CandidateGeneration = previous.Generation,
+            CandidateProjectionVerified = true
+        };
+    }
+
+    private static void SelfCheckSelectedCameraWarmup()
+    {
+        SelectedCameraState first = new SelectedCameraState
+        {
+            PrecedingFramesRemaining = 2, CameraPointer = 123, ThreadId = 11, Generation = 8,
+            Restored = true, RestoreVerified = true, MatrixIntactAtReturn = true,
+            ProjectionMatchesInput = true
+        };
+        SelectedCameraState second = NextSelectedWarmupFrame(first);
+        if (second.PrecedingFramesRemaining != 1 || second.PrecedingFramesCompleted != 1
+            || second.CandidateCameraPointer != 123 || second.CandidateThreadId != 11
+            || second.CandidateGeneration != 8 || second.Applied || second.RestoreVerified)
+            throw new InvalidOperationException("Selected camera warmup transition self-check failed.");
+        bool unrestoredRejected = false;
+        try { NextSelectedWarmupFrame(second); }
+        catch (InvalidOperationException) { unrestoredRejected = true; }
+        if (!unrestoredRejected) throw new InvalidOperationException("Unrestored warmup frame was accepted.");
+        second.Restored = second.RestoreVerified = second.MatrixIntactAtReturn = second.ProjectionMatchesInput = true;
+        SelectedCameraState final = NextSelectedWarmupFrame(second);
+        if (final.PrecedingFramesRemaining != 0 || final.PrecedingFramesCompleted != 2)
+            throw new InvalidOperationException("Selected camera final frame self-check failed.");
     }
 
     private sealed class BoundaryTraceProgress
@@ -1236,6 +1279,7 @@ internal static partial class NativeFrameCapture
         return CanArmPresentForFrame(frame, threadId)
             && (!frame.SelectedCameraRequested || (frame.SelectedCamera != null
                 && frame.SelectedCamera.Applied && frame.SelectedCamera.ProjectionMatchesInput
+                && frame.SelectedCamera.PrecedingFramesRemaining == 0
                 && frame.SelectedCamera.CandidateProjectionVerified
                 && frame.SelectedCamera.Restored && frame.SelectedCamera.RestoreVerified
                 && frame.SelectedCamera.MatrixIntactAtReturn
@@ -1276,6 +1320,7 @@ internal static partial class NativeFrameCapture
             && frame.CameraThreadId == threadId && frame.ProjectionThreadId == threadId
             && (!frame.SelectedCameraRequested || (frame.SelectedCamera != null
                 && frame.SelectedCamera.Applied && frame.SelectedCamera.ProjectionMatchesInput
+                && frame.SelectedCamera.PrecedingFramesRemaining == 0
                 && frame.SelectedCamera.CandidateProjectionVerified
                 && !frame.SelectedCamera.PixelAttributionInvalidated
                 && SelectedMatrixMatchesProjection(frame)));
@@ -1848,6 +1893,7 @@ internal static partial class NativeFrameCapture
         {
             SelectedCameraState selected = frame.SelectedCamera;
             json.AppendLine("  \"selected_camera\": {");
+            json.AppendLine("    \"preceding_selected_world_frames\": " + selected.PrecedingFramesCompleted + ",");
             json.AppendLine("    \"input_json\": " + JsonString(selected.Input.Path) + ",");
             json.AppendLine("    \"input_kind\": " + JsonString(selected.Input.Synthetic
                 ? "synthetic-camera-plan" : "native-capture") + ",");
@@ -1949,6 +1995,7 @@ internal static partial class NativeFrameCapture
     {
         if (IntPtr.Size != 4) throw new InvalidOperationException("This helper must be compiled and run as x86.");
         SelfCheckCameraInput();
+        SelfCheckSelectedCameraWarmup();
         SelfCheckNativeFogPairing();
         SelfCheckRenderInvocationGates();
         SelfCheckDebugEventHandleOwnership();
@@ -2088,6 +2135,10 @@ internal static partial class NativeFrameCapture
         bool wrongCameraThreadRejected = !IsMatchingPerspectiveFrame(matched, 12);
         bool emptyCameraFrameRejected = !IsMatchingPerspectiveFrame(new FrameSnapshot(), 11);
         bool selectedFrameValid = IsMatchingPerspectiveFrame(selectedMatched, 11);
+        selectedMatched.SelectedCamera.PrecedingFramesRemaining = 1;
+        bool selectedWarmupRejected = !CanArmPresentForFrame(selectedMatched, 11)
+            && !IsMatchingPerspectiveFrame(selectedMatched, 11);
+        selectedMatched.SelectedCamera.PrecedingFramesRemaining = 0;
         bool selectedUnrestoredRejected = !IsMatchingPerspectiveFrame(selectedUnrestored, 11);
         bool selectedUnrestoredCaptureEligible = CanArmPresentForFrame(selectedUnrestored, 11);
         bool selectedIntervenedCaptureRejected = !CanArmPresentForFrame(selectedIntervened, 11);
@@ -2189,7 +2240,7 @@ internal static partial class NativeFrameCapture
             || !atmosphereFrameValid
             || !atmosphereClockMismatchRejected
             || !cameraFrameValid || !wrongCameraThreadRejected || !emptyCameraFrameRejected
-            || !selectedFrameValid || !selectedUnrestoredRejected || !selectedUnrestoredCaptureEligible
+            || !selectedFrameValid || !selectedWarmupRejected || !selectedUnrestoredRejected || !selectedUnrestoredCaptureEligible
             || !selectedIntervenedCaptureRejected || !selectedIntervenedRejected
             || !selectedChangedMatrixRejected
             || !selectedBoundaryReadAllowed || !boundaryReadRejectsUnselected
@@ -2919,7 +2970,8 @@ internal static partial class NativeFrameCapture
         bool projectionSelectorMode = boundaryTrace || boundaryCapture;
         frame.SelectedCameraRequested = selectedCameraInput != null;
         SelectedCameraState selectedCamera = selectedCameraInput == null ? null
-            : new SelectedCameraState { Input = selectedCameraInput };
+            : new SelectedCameraState { Input = selectedCameraInput,
+                PrecedingFramesRemaining = boundaryCapture ? 0 : 2 };
         try
         {
             if (identityProcess == null || identityProcess.HasExited
@@ -3330,6 +3382,12 @@ internal static partial class NativeFrameCapture
                                             Log("CAMERA_SETTER_REGION_FREED phase=Restore");
                                         else Log("CAMERA_SETTER_REGION_FREE_FAILED phase=Restore error=" + Marshal.GetLastWin32Error());
                                         cameraSetter = null;
+                                        if (!stopAfterAttempt && selectedCamera.PrecedingFramesRemaining > 0)
+                                        {
+                                            selectedCamera = NextSelectedWarmupFrame(selectedCamera);
+                                            Log("SELECTED_CAMERA_WARMUP_COMPLETE completed=" + selectedCamera.PrecedingFramesCompleted
+                                                + " remaining=" + selectedCamera.PrecedingFramesRemaining);
+                                        }
                                     }
                                 }
                             }
@@ -3870,7 +3928,8 @@ internal static partial class NativeFrameCapture
                                                     && targetProjectionMatchesInput)
                                                 + " rawWorldTime=0x" + frame.WorldGameTimeWord.ToString("X8"));
                                             if (cameraWordsCurrent && frame.Projection.Verified && frame.Projection.Mode != 0
-                                                && targetProjectionMatchesInput && ngiBase != 0 && presentBoundaryVerified)
+                                                && targetProjectionMatchesInput && ngiBase != 0 && presentBoundaryVerified
+                                                && (selectedCamera == null || selectedCamera.PrecedingFramesRemaining == 0))
                                                 EnsurePresentBreakpoint(process, ngiBase, frame, eventTid,
                                                     presentOriginalByte, ref presentBreakpoint);
                                         }
@@ -3975,7 +4034,7 @@ internal static partial class NativeFrameCapture
                                         }
                                         cameraSetter = StartCameraSetter(process, eventTid, terrainBase,
                                             selectedCamera.CameraPointer, selectedCamera.OriginalMatrixBytes,
-                                            stoppedContext, returnBreakpoint, false, CameraSetterPhase.Restore,
+                                            stoppedContext, returnBreakpoint, selectedCamera.PrecedingFramesRemaining > 0, CameraSetterPhase.Restore,
                                             selectedCamera.EntryEsp, selectedCamera.ReturnAddress);
                                         Log("SELECTED_CAMERA_RESTORE_STARTED generation=" + selectedCamera.Generation
                                             + " camera=0x" + selectedCamera.CameraPointer.ToString("X8")

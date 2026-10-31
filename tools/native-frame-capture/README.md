@@ -74,6 +74,8 @@ if ($LASTEXITCODE -ne 0) { throw 'Selected-camera capture failed; inspect its lo
 
 This verifies repeatable camera handling, not deterministic whole-scene pixels. The helper has no setter for FOV, near/far planes, or fog, and does not freeze simulation state; `atmosphere_seconds` remains an observed phase sample rather than a restored simulation clock. If the callsite probe cannot verify a mission path, `mission_path` remains `null` and `mission_identity` remains `unknown`.
 
+For `--capture --camera-input`, the requested pose is rendered on three consecutive world frames. The first two are discarded so portal visibility and other render caches can settle. The original local matrix is restored and checked after every frame; the third frame alone supplies the pixels, projection and atmosphere sample. `selected_camera.preceding_selected_world_frames` records the two preceding verified frames. A failed matrix or restoration check stops the sequence. Passive and EndScene-boundary capture keep their single-frame behavior.
+
 For a second capture, reuse the still-running PID only after the first run detached successfully, and choose a new output basename. Reuse the same validated camera input if comparing the same pose. The helper rejects any existing JSON, PNG, or log with the chosen basename and never overwrites those files. After a successful one-shot capture it detaches and leaves the scratch game running. It explicitly closes only image-file handles from `CREATE_PROCESS` and `LOAD_DLL`; the system owns the process/thread handles supplied by `CREATE_PROCESS` and `CREATE_THREAD` until the corresponding exit event is continued. If guarded recovery must terminate the scratch process, the helper drains its outstanding and queued debug events through `EXIT_PROCESS` within five seconds, then verifies the process handle before detaching. It withholds output when process exit cannot be confirmed.
 
 To compare a viewer frame with a native capture, use the same phase JSON for the camera and the PNG conversion. When `atmosphere_seconds` is present, the viewer uses it unless `--atmosphere-seconds` is given, and holds the atmosphere schedule at that sample for the fixed-camera readback. Choose fresh `viewer.bin` and `viewer.png` paths because the viewer writes the raw file and conversion refuses to overwrite an existing PNG.
@@ -146,5 +148,6 @@ viewport, то есть к PNG просмотрщика. Оригинальны�
 без перевода в линейное цветовое пространство. Скрипт отклоняет несовпадающие
 размеры, области за границей кадра и существующие выходные файлы. Совпадение
 средних цветов не доказывает совпадение геометрии, поэтому пару нужно также
-просмотреть. Камера и фаза должны происходить из одного нативного захвата;
-интерьер снимается после настоящего входа игрока в здание.
+просмотреть. Камера и фаза должны происходить из одного нативного захвата.
+Для интерьера нужно проверить наличие комнат в PNG: выбранная камера проходит
+два предварительных мировых кадра, а при пассивном захвате игрок входит в здание.
