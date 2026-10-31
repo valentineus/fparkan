@@ -15,7 +15,14 @@ pub(super) struct LegacyCameraCapture {
     pub(super) far_plane: f32,
     pub(super) field_of_view_radians: f32,
     pub(super) atmosphere_seconds: Option<f32>,
+    pub(super) sky_uv_clock: Option<SkyUvClock>,
     pub(super) geometry_projection: Option<GeometryProjection>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub(super) struct SkyUvClock {
+    pub(super) verified: bool,
+    pub(super) elapsed_milliseconds: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -118,6 +125,9 @@ pub(super) fn load_legacy_camera_capture(
     if capture.geometry_projection.is_none() {
         eprintln!("render_coverage captured_projection_unverified=1 (capture has no geometry_projection; using the recorded camera boundary, which can clip nearby surfaces)");
     }
+    if capture.sky_uv_clock.is_none() {
+        eprintln!("render_coverage captured_sky_phase_unverified=1 (capture has no sky UV clock; using replay elapsed time)");
+    }
     Ok(capture)
 }
 
@@ -142,6 +152,13 @@ pub(super) fn parse_legacy_camera_capture(bytes: &[u8]) -> Result<LegacyCameraCa
     }
     if capture.render_input_usable == Some(false) {
         return Err("legacy camera capture is marked render_input_usable=false".to_string());
+    }
+    if capture
+        .sky_uv_clock
+        .as_ref()
+        .is_some_and(|clock| !clock.verified)
+    {
+        return Err("legacy camera sky UV clock is unverified".to_string());
     }
     if capture
         .atmosphere_seconds

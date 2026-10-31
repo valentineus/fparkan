@@ -141,6 +141,10 @@ fn run(args: &[String]) -> Result<String, String> {
         .map(load_legacy_camera_capture)
         .transpose()?;
     let atmosphere_seconds = selected_atmosphere_seconds(args.atmosphere_seconds, camera.as_ref());
+    let captured_sky_uv_ms = camera
+        .as_ref()
+        .and_then(|c| c.sky_uv_clock.as_ref())
+        .map(|c| c.elapsed_milliseconds);
     let hold_schedule_phase = camera.is_some() && atmosphere_seconds.is_some();
     let terrain_materials_duration_started = Instant::now();
     let preview = static_preview_mesh_and_materials(
@@ -159,12 +163,15 @@ fn run(args: &[String]) -> Result<String, String> {
     // sky to the selected map (there are many `sky.ske` files in the campaign
     // tree).
     let sky_started = Instant::now();
-    let environment = load_environment(
+    let mut environment = load_environment(
         &args.root,
         &args.mission,
         atmosphere_seconds,
         hold_schedule_phase,
     )?;
+    if let Some(environment) = &mut environment {
+        environment.fixed_sky_uv_ms = captured_sky_uv_ms;
+    }
     let sky_duration = sky_started.elapsed();
     let audio = match audio::GameAudio::new(Arc::new(DirectoryVfs::new(&args.root)), &args.mission)
     {
@@ -4188,6 +4195,7 @@ struct DynamicEnvironment {
     time_seconds: f32,
     fixed_schedule_seconds: Option<f32>,
     fixed_phase_reported: bool,
+    fixed_sky_uv_ms: Option<u32>,
 }
 
 struct DynamicEnvironmentFrame {
@@ -4232,6 +4240,7 @@ impl DynamicEnvironment {
     fn update_cpu(
         &mut self,
         dt_seconds: f32,
+        clock_ms: u32,
         camera: &PreviewCameraFrame,
         aspect: f32,
         viewport: [f32; 2],
@@ -4259,6 +4268,7 @@ impl DynamicEnvironment {
         }
         let atmosphere = self.schedule.sample(absolute_time_seconds);
         let mut sky_mesh = self.sky.mesh().clone();
+        sky_mesh.update_uvs(self.fixed_sky_uv_ms.unwrap_or(clock_ms));
         let sky_frame =
             SkyFrame::from_atmosphere(&atmosphere, &self.materials, absolute_time_seconds);
         sky_mesh.update_colors(&sky_frame.sky);
@@ -4465,6 +4475,7 @@ fn load_environment(
         time_seconds,
         fixed_schedule_seconds,
         fixed_phase_reported: false,
+        fixed_sky_uv_ms: None,
     }))
 }
 
@@ -10187,6 +10198,7 @@ impl StaticVulkanApp {
         let environment = if let Some(environment) = self.environment.as_mut() {
             Some(environment.update_cpu(
                 clock.delta_seconds,
+                clock.time_ms,
                 &camera,
                 aspect,
                 viewport,
@@ -13562,6 +13574,7 @@ mod tests {
             time_seconds: 0.0,
             fixed_schedule_seconds: None,
             fixed_phase_reported: false,
+            fixed_sky_uv_ms: None,
         };
 
         let mut land = fparkan_terrain_format::LandMeshDocument {
@@ -13810,6 +13823,34 @@ mod tests {
         assert_eq!(
             app.pending_scene_update.as_ref().unwrap().clock.time_ms,
             500
+        );
+        assert_eq!(
+            app.pending_scene_update
+                .as_ref()
+                .unwrap()
+                .environment
+                .as_ref()
+                .unwrap()
+                .sky_mesh
+                .vertices[0]
+                .uv[2],
+            [0.01, 0.0]
+        );
+        app.environment.as_mut().unwrap().fixed_sky_uv_ms = Some(25_000);
+        next.id = SceneSampleId::Live(2);
+        next.time_ms = 10_000;
+        app.prepare_scene_update(next, [1280.0, 720.0]).unwrap();
+        assert_eq!(
+            app.pending_scene_update
+                .as_ref()
+                .unwrap()
+                .environment
+                .as_ref()
+                .unwrap()
+                .sky_mesh
+                .vertices[0]
+                .uv[2],
+            [0.5, 0.0]
         );
     }
 
@@ -15634,6 +15675,22 @@ mod tests {
     }
 
     #[test]
+    fn captured_sky_uv_phase_requires_verified_clock() {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../testdata/legacy-camera-parented.json"))
+                .unwrap();
+        value["sky_uv_clock"] =
+            serde_json::json!({"verified": true, "elapsed_milliseconds": 4051271258_u32});
+        let capture = parse_legacy_camera_capture(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(
+            capture.sky_uv_clock.unwrap().elapsed_milliseconds,
+            4051271258
+        );
+        value["sky_uv_clock"]["verified"] = serde_json::json!(false);
+        assert!(parse_legacy_camera_capture(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+
+    #[test]
     fn captured_atmosphere_is_default_and_cli_time_takes_precedence() {
         let capture = LegacyCameraCapture {
             schema: "fparkan-legacy-camera-v1".to_string(),
@@ -15648,6 +15705,7 @@ mod tests {
             field_of_view_radians: 1.0,
             atmosphere_seconds: Some(56.227),
             geometry_projection: None,
+            sky_uv_clock: None,
         };
 
         assert_eq!(

@@ -50,6 +50,7 @@ internal static partial class NativeFrameCapture
     private const uint RenderGameRva = 0x13BD0;
     private const uint ProjectionSnapshotRva = 0x13CE4;
     private const uint GeometryProjectionRva = 0x1D110;
+    private const uint SkyRenderRva = 0x48110;
     private const uint RenderReturnRva = 0x13D7B;
     private const uint AtmospherePhaseRva = 0x421DC;
     private const uint FogConsumerRva = 0x2F230;
@@ -105,6 +106,7 @@ internal static partial class NativeFrameCapture
         public ProjectionReadback GeometryProjection;
         public uint GeometryProjectionGeneration;
         public uint GeometryProjectionThreadId;
+        public SkyUvReadback SkyUv;
         public uint CameraWorldGameTimeWord;
         public bool CameraWorldGameTimeWordReadable;
         public uint WorldGameTimeWord;
@@ -131,6 +133,11 @@ internal static partial class NativeFrameCapture
         public string NativeFogConflictReason;
         public string NativeFogFailureReason;
         public string NativeFogStatus;
+    }
+
+    private sealed class SkyUvReadback
+    {
+        public uint Object, Origin, RawClock, ElapsedMilliseconds, Generation, ThreadId;
     }
 
     private sealed class AtmosphereReadback
@@ -777,6 +784,66 @@ internal static partial class NativeFrameCapture
         json.AppendLine("    \"near_plane\": " + p.Near.ToString("R", CultureInfo.InvariantCulture) + ",");
         json.AppendLine("    \"far_plane\": " + p.Far.ToString("R", CultureInfo.InvariantCulture) + ",");
         json.AppendLine("    \"field_of_view_radians\": " + p.Fov.ToString("R", CultureInfo.InvariantCulture));
+        json.AppendLine("  },");
+    }
+
+    private static SkyUvReadback CaptureSkyUv(IntPtr process, uint terrainBase, uint worldBase,
+        byte[] context, FrameSnapshot frame, uint threadId)
+    {
+        uint obj = BitConverter.ToUInt32(context, ContextEcxOffset);
+        uint stack = BitConverter.ToUInt32(context, ContextEspOffset);
+        if (frame.Camera == null || frame.CameraThreadId != threadId || frame.CameraGeneration == 0
+            || ReadU32Exact(process, stack + 4) != frame.Camera.Camera
+            || ReadU32Exact(process, obj) != unchecked(terrainBase + 0x65F98)) return null;
+        uint origin = ReadU32Exact(process, obj + 8);
+        uint rawClock = ReadU32Exact(process, unchecked(worldBase + 0x32A38));
+        uint elapsed = unchecked(rawClock - origin);
+        float[] expected = new float[] {
+            (elapsed % 300000) * 3.3333333e-6f, (elapsed % 300000) * 3.3333333e-6f,
+            (elapsed % 100000) * 1e-5f, (elapsed % 100000) * 1e-5f,
+            (elapsed % 50000) * 2e-5f, 0 };
+        uint[] pointers = new uint[] { ReadU32Exact(process, obj + 0x48),
+            ReadU32Exact(process, obj + 0x40), ReadU32Exact(process, obj + 0x44) };
+        for (int i = 0; i < expected.Length; i++)
+        {
+            float actual = BitConverter.ToSingle(BitConverter.GetBytes(
+                ReadU32Exact(process, pointers[i / 2] + (uint)(i % 2) * 4)), 0);
+            if (Single.IsNaN(actual) || Single.IsInfinity(actual)
+                || Math.Abs(actual - expected[i]) > 1e-6f)
+            {
+                Log("SKY_UV_CLOCK_REJECTED zenith coordinate does not match the current world clock.");
+                return null;
+            }
+        }
+        Log("SKY_UV_CLOCK generation=" + frame.CameraGeneration + " tid=" + threadId
+            + " raw=" + rawClock + " origin=" + origin + " elapsed_ms=" + elapsed);
+        return new SkyUvReadback { Object = obj, Origin = origin, RawClock = rawClock,
+            ElapsedMilliseconds = elapsed, Generation = frame.CameraGeneration, ThreadId = threadId };
+    }
+
+    private static bool SkyUvMatchesFrame(FrameSnapshot frame)
+    {
+        SkyUvReadback sky = frame.SkyUv;
+        return sky != null && sky.Generation == frame.CameraGeneration
+            && sky.Generation == frame.ProjectionGeneration && sky.ThreadId == frame.CameraThreadId
+            && sky.ThreadId == frame.ProjectionThreadId && frame.WorldGameTimeWordReadable
+            && sky.RawClock == frame.WorldGameTimeWord && frame.CameraWorldGameTimeWordReadable
+            && sky.RawClock == frame.CameraWorldGameTimeWord;
+    }
+
+    private static void AppendSkyUvJson(StringBuilder json, FrameSnapshot frame)
+    {
+        if (!SkyUvMatchesFrame(frame)) { json.AppendLine("  \"sky_uv_clock\": null,"); return; }
+        SkyUvReadback sky = frame.SkyUv;
+        json.AppendLine("  \"sky_uv_clock\": {");
+        json.AppendLine("    \"verified\": true,");
+        json.AppendLine("    \"sample_boundary\": \"Terrain+0x48110, sky render\",");
+        json.AppendLine("    \"terrain_module_sha256\": " + JsonString(ExpectedSha256[TerrainName]) + ",");
+        json.AppendLine("    \"raw_clock\": " + sky.RawClock + ",");
+        json.AppendLine("    \"origin_raw_clock\": " + sky.Origin + ",");
+        json.AppendLine("    \"frame_generation\": " + sky.Generation + ",");
+        json.AppendLine("    \"thread_id\": " + sky.ThreadId + ",");
+        json.AppendLine("    \"elapsed_milliseconds\": " + sky.ElapsedMilliseconds);
         json.AppendLine("  },");
     }
 
@@ -1931,6 +1998,7 @@ internal static partial class NativeFrameCapture
         json.AppendLine("  \"field_of_view_radians\": " + projection.Fov.ToString("R", CultureInfo.InvariantCulture) + ",");
         json.AppendLine("  \"projection_mode_byte\": " + projection.Mode.ToString(CultureInfo.InvariantCulture) + ",");
         AppendGeometryProjectionJson(json, frame);
+        AppendSkyUvJson(json, frame);
         if (frame.SelectedCamera == null) json.AppendLine("  \"selected_camera\": null,");
         else
         {
@@ -2040,6 +2108,7 @@ internal static partial class NativeFrameCapture
         SelfCheckCameraInput();
         SelfCheckSelectedCameraWarmup();
         SelfCheckGeometryProjection();
+        SelfCheckSkyUv();
         SelfCheckNativeFogPairing();
         SelfCheckRenderInvocationGates();
         SelfCheckDebugEventHandleOwnership();
@@ -2348,6 +2417,32 @@ internal static partial class NativeFrameCapture
         Console.WriteLine("self-check: selected EndScene readback requires same-thread/generation/renderer, idle scene state and successful HRESULT; Present confirms staged pixels without intervening render OK");
         Console.WriteLine("self-check: boundary trace requires matching BeginScene/projection/EndScene/Present/World3D-return order, successful probes, and verified cleanup; probe failure, process exit, fatal state, and invalid event sequences cannot report success");
         return SelfCheckReadback();
+    }
+
+    private static void SelfCheckSkyUv()
+    {
+        FrameSnapshot frame = new FrameSnapshot { CameraGeneration = 7, ProjectionGeneration = 7,
+            CameraThreadId = 11, ProjectionThreadId = 11, WorldGameTimeWordReadable = true,
+            CameraWorldGameTimeWordReadable = true, CameraWorldGameTimeWord = 265584022,
+            WorldGameTimeWord = 265584022,
+            SkyUv = new SkyUvReadback { Generation = 7, ThreadId = 11, RawClock = 265584022,
+                Origin = 509280060, ElapsedMilliseconds = unchecked(265584022U - 509280060U) } };
+        StringBuilder json = new StringBuilder();
+        AppendSkyUvJson(json, frame);
+        if (!SkyUvMatchesFrame(frame) || json.ToString().IndexOf("4051271258", StringComparison.Ordinal) < 0)
+            throw new InvalidOperationException("Verified sky UV wrapping clock was rejected.");
+        frame.SkyUv.ThreadId++;
+        if (SkyUvMatchesFrame(frame)) throw new InvalidOperationException("Sky UV thread mismatch accepted.");
+        frame.SkyUv.ThreadId--;
+        frame.SkyUv.Generation++;
+        if (SkyUvMatchesFrame(frame)) throw new InvalidOperationException("Sky UV generation mismatch accepted.");
+        frame.SkyUv.Generation--;
+        frame.SkyUv.RawClock++;
+        json.Length = 0;
+        AppendSkyUvJson(json, frame);
+        if (SkyUvMatchesFrame(frame) || json.ToString().IndexOf("null", StringComparison.Ordinal) < 0)
+            throw new InvalidOperationException("Sky UV clock mismatch accepted.");
+        Console.WriteLine("self-check: sky UV clock requires matching thread/generation/world clock and preserves u32 wrap OK");
     }
 
     private static void SelfCheckGeometryProjection()
@@ -3018,6 +3113,7 @@ internal static partial class NativeFrameCapture
         BreakpointInfo cameraBreakpoint = null;
         BreakpointInfo projectionBreakpoint = null;
         BreakpointInfo geometryProjectionBreakpoint = null;
+        BreakpointInfo skyUvBreakpoint = null;
         BreakpointInfo returnBreakpoint = null;
         BreakpointInfo atmosphereBreakpoint = null;
         BreakpointInfo beginSceneBreakpoint = null;
@@ -3208,6 +3304,14 @@ internal static partial class NativeFrameCapture
                                 throw new InvalidOperationException("Terrain geometry projection boundary signature failed.");
                             geometryProjectionBreakpoint = ArmBreakpoint(process, "Terrain.geometry-projection",
                                 unchecked(terrainBase + GeometryProjectionRva), geometryPrefix[0]);
+                            byte[] skyPrefix = new byte[] { 0x6A, 0xFF, 0x68, 0, 0, 0, 0, 0x64, 0xA1, 0, 0, 0, 0 };
+                            Array.Copy(BitConverter.GetBytes(unchecked(terrainBase + 0x637E6)), 0, skyPrefix, 3, 4);
+                            byte[] skyCode = new byte[skyPrefix.Length];
+                            if (!ReadExact(process, unchecked(terrainBase + SkyRenderRva), skyCode)
+                                || !ByteArraysEqual(skyCode, skyPrefix))
+                                throw new InvalidOperationException("Terrain sky render boundary signature failed.");
+                            skyUvBreakpoint = ArmBreakpoint(process, "Terrain.sky-uv-clock",
+                                unchecked(terrainBase + SkyRenderRva), skyPrefix[0]);
                             byte atmosphereByte;
                             string atmosphereEvidence;
                             if (!VerifyAtmospherePhaseBoundary(process, terrainBase, out atmosphereByte, out atmosphereEvidence))
@@ -3676,6 +3780,9 @@ internal static partial class NativeFrameCapture
                             else if (geometryProjectionBreakpoint != null && geometryProjectionBreakpoint.Armed
                                 && exceptionAddress == geometryProjectionBreakpoint.Address)
                                 hitBreakpoint = geometryProjectionBreakpoint;
+                            else if (skyUvBreakpoint != null && skyUvBreakpoint.Armed
+                                && exceptionAddress == skyUvBreakpoint.Address)
+                                hitBreakpoint = skyUvBreakpoint;
                             else if (returnBreakpoint != null && returnBreakpoint.Armed && exceptionAddress == returnBreakpoint.Address)
                                 hitBreakpoint = returnBreakpoint;
                             else if (atmosphereBreakpoint != null && atmosphereBreakpoint.Armed && exceptionAddress == atmosphereBreakpoint.Address)
@@ -3750,6 +3857,10 @@ internal static partial class NativeFrameCapture
                                             throw new InvalidOperationException("Could not disarm the previous generation's native fog boundary.");
                                         frame.CameraGeneration++;
                                         frame.GeometryProjection = null;
+                                        frame.SkyUv = null;
+                                        if (skyUvBreakpoint != null && !skyUvBreakpoint.Armed)
+                                            skyUvBreakpoint = ArmBreakpoint(process, "Terrain.sky-uv-clock",
+                                                skyUvBreakpoint.Address, skyUvBreakpoint.OriginalByte);
                                         frame.GeometryProjectionGeneration = 0;
                                         frame.GeometryProjectionThreadId = 0;
                                         if (geometryProjectionBreakpoint != null && !geometryProjectionBreakpoint.Armed)
@@ -3842,6 +3953,12 @@ internal static partial class NativeFrameCapture
                                             EnsureFogConsumerBreakpoint(process, terrainBase, fogConsumerOriginalByte,
                                                 frame, eventTid, ref fogConsumerBreakpoint);
                                     }
+                                }
+                                else if (hitBreakpoint == skyUvBreakpoint)
+                                {
+                                    if (frame.SkyUv == null && world3dBase != 0)
+                                        frame.SkyUv = CaptureSkyUv(process, terrainBase, world3dBase,
+                                            stoppedContext, frame, eventTid);
                                 }
                                 else if (hitBreakpoint == geometryProjectionBreakpoint)
                                 {
@@ -4086,7 +4203,7 @@ internal static partial class NativeFrameCapture
                                             {
                                                 remote = StartRemoteSurfaceProbe(process, eventTid, ngiBase,
                                                     returnBreakpoint, frame,
-                                                    new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint, geometryProjectionBreakpoint,
+                                                    new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint, geometryProjectionBreakpoint, skyUvBreakpoint,
                                                         returnBreakpoint, atmosphereBreakpoint, beginSceneBreakpoint,
                                                         fogConsumerBreakpoint,
                                                         endSceneBreakpoint, presentBreakpoint,
@@ -4234,7 +4351,7 @@ internal static partial class NativeFrameCapture
                                             {
                                                 remote = StartRemoteSurfaceProbe(process, eventTid, ngiBase,
                                                     endSceneBreakpoint, frame,
-                                                    new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint, geometryProjectionBreakpoint,
+                                                    new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint, geometryProjectionBreakpoint, skyUvBreakpoint,
                                                         returnBreakpoint, atmosphereBreakpoint, beginSceneBreakpoint,
                                                         endSceneBreakpoint,
                                                         fogConsumerBreakpoint, presentBreakpoint,
@@ -4282,7 +4399,7 @@ internal static partial class NativeFrameCapture
                                             {
                                                 remote = StartRemoteBoundaryReadback(process, eventTid, ngiBase,
                                                     endSceneBreakpoint, frame, outputPath,
-                                                    new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint, geometryProjectionBreakpoint,
+                                                    new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint, geometryProjectionBreakpoint, skyUvBreakpoint,
                                                         returnBreakpoint, atmosphereBreakpoint, beginSceneBreakpoint,
                                                         endSceneBreakpoint,
                                                         fogConsumerBreakpoint, presentBreakpoint,
@@ -4502,6 +4619,8 @@ internal static partial class NativeFrameCapture
                                             && !frame.NativeFogSampleLimitExceeded;
                                     if (hitBreakpoint == geometryProjectionBreakpoint)
                                         rearmAfterStep = frame.GeometryProjection == null;
+                                    if (hitBreakpoint == skyUvBreakpoint)
+                                        rearmAfterStep = frame.SkyUv == null;
                                     BeginSingleStep(process, eventTid, hitBreakpoint, stoppedContext,
                                         out pendingStep, rearmAfterStep);
                                     Log("SINGLE_STEP_STARTED boundary=" + hitBreakpoint.Name + " tid=" + eventTid);
@@ -4574,7 +4693,7 @@ internal static partial class NativeFrameCapture
                     captureFailure = captureFailure ?? "No matching native camera/projection/present frame completed before the bounded timeout.";
                     Log("NO_FRAME_CAPTURE bounded timeout at stopped debug event");
                     if (!RestoreArmedBreakpointsWhileStopped(process,
-                        cameraBreakpoint, projectionBreakpoint, geometryProjectionBreakpoint, returnBreakpoint, atmosphereBreakpoint,
+                        cameraBreakpoint, projectionBreakpoint, geometryProjectionBreakpoint, skyUvBreakpoint, returnBreakpoint, atmosphereBreakpoint,
                         beginSceneBreakpoint,
                         endSceneBreakpoint, fogConsumerBreakpoint, presentBreakpoint,
                         presentCompletionBreakpoint, missionBreakpoint))
@@ -4595,6 +4714,7 @@ internal static partial class NativeFrameCapture
                     && (cameraBreakpoint != null && cameraBreakpoint.Armed
                         || projectionBreakpoint != null && projectionBreakpoint.Armed
                         || geometryProjectionBreakpoint != null && geometryProjectionBreakpoint.Armed
+                        || skyUvBreakpoint != null && skyUvBreakpoint.Armed
                         || returnBreakpoint != null && returnBreakpoint.Armed
                         || atmosphereBreakpoint != null && atmosphereBreakpoint.Armed
                         || beginSceneBreakpoint != null && beginSceneBreakpoint.Armed
@@ -4605,7 +4725,7 @@ internal static partial class NativeFrameCapture
                         || missionBreakpoint != null && missionBreakpoint.Armed))
                 {
                     if (!RestoreArmedBreakpointsWhileStopped(process,
-                        cameraBreakpoint, projectionBreakpoint, geometryProjectionBreakpoint, returnBreakpoint, atmosphereBreakpoint,
+                        cameraBreakpoint, projectionBreakpoint, geometryProjectionBreakpoint, skyUvBreakpoint, returnBreakpoint, atmosphereBreakpoint,
                         beginSceneBreakpoint,
                         endSceneBreakpoint, fogConsumerBreakpoint, presentBreakpoint,
                         presentCompletionBreakpoint, missionBreakpoint))
@@ -4655,6 +4775,7 @@ internal static partial class NativeFrameCapture
                 || cameraBreakpoint != null && cameraBreakpoint.Armed
                 || projectionBreakpoint != null && projectionBreakpoint.Armed
                 || geometryProjectionBreakpoint != null && geometryProjectionBreakpoint.Armed
+                || skyUvBreakpoint != null && skyUvBreakpoint.Armed
                 || returnBreakpoint != null && returnBreakpoint.Armed
                 || atmosphereBreakpoint != null && atmosphereBreakpoint.Armed
                 || beginSceneBreakpoint != null && beginSceneBreakpoint.Armed
@@ -4684,7 +4805,7 @@ internal static partial class NativeFrameCapture
                     if (DrainFrameTerminationEvents(process, eventBuffer, processId,
                         ref eventOutstanding, ref outstandingPid, ref outstandingTid, ref outstandingCode,
                         ref outstandingContinueStatus, ref outstandingFileHandleClosed,
-                        new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint, geometryProjectionBreakpoint, returnBreakpoint,
+                        new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint, geometryProjectionBreakpoint, skyUvBreakpoint, returnBreakpoint,
                             atmosphereBreakpoint, beginSceneBreakpoint, endSceneBreakpoint, fogConsumerBreakpoint,
                             presentBreakpoint, presentCompletionBreakpoint, missionBreakpoint },
                         out drainEvidence))
@@ -4753,7 +4874,7 @@ internal static partial class NativeFrameCapture
                                 if (DrainFrameTerminationEvents(process, eventBuffer, processId,
                                     ref eventOutstanding, ref outstandingPid, ref outstandingTid, ref outstandingCode,
                                     ref outstandingContinueStatus, ref outstandingFileHandleClosed,
-                                    new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint, geometryProjectionBreakpoint, returnBreakpoint,
+                                    new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint, geometryProjectionBreakpoint, skyUvBreakpoint, returnBreakpoint,
                                         atmosphereBreakpoint, beginSceneBreakpoint, endSceneBreakpoint, fogConsumerBreakpoint,
                                         presentBreakpoint, presentCompletionBreakpoint, missionBreakpoint },
                                     out drainEvidence))
@@ -4791,7 +4912,7 @@ internal static partial class NativeFrameCapture
                 else Log("PROCESS_STATE_AFTER_DETACH unreadable error=" + Marshal.GetLastWin32Error());
             }
             breakpointsRestored = processExited || AreBreakpointsRestored(cameraBreakpoint,
-                projectionBreakpoint, geometryProjectionBreakpoint, returnBreakpoint, atmosphereBreakpoint, beginSceneBreakpoint,
+                projectionBreakpoint, geometryProjectionBreakpoint, skyUvBreakpoint, returnBreakpoint, atmosphereBreakpoint, beginSceneBreakpoint,
                 endSceneBreakpoint, fogConsumerBreakpoint, presentBreakpoint,
                 presentCompletionBreakpoint, missionBreakpoint);
             Log("FINAL_BREAKPOINT_STATE restored=" + breakpointsRestored + " processExited=" + processExited);
@@ -4923,7 +5044,7 @@ internal static partial class NativeFrameCapture
     }
 
     private static bool RestoreArmedBreakpointsWhileStopped(IntPtr process,
-        BreakpointInfo cameraBreakpoint, BreakpointInfo projectionBreakpoint, BreakpointInfo geometryProjectionBreakpoint, BreakpointInfo returnBreakpoint,
+        BreakpointInfo cameraBreakpoint, BreakpointInfo projectionBreakpoint, BreakpointInfo geometryProjectionBreakpoint, BreakpointInfo skyUvBreakpoint, BreakpointInfo returnBreakpoint,
         BreakpointInfo atmosphereBreakpoint, BreakpointInfo beginSceneBreakpoint, BreakpointInfo endSceneBreakpoint,
         BreakpointInfo fogConsumerBreakpoint,
         BreakpointInfo presentBreakpoint, BreakpointInfo presentCompletionBreakpoint,
@@ -4932,6 +5053,7 @@ internal static partial class NativeFrameCapture
         return RestoreBreakpointWhileStopped(process, cameraBreakpoint)
             && RestoreBreakpointWhileStopped(process, projectionBreakpoint)
             && RestoreBreakpointWhileStopped(process, geometryProjectionBreakpoint)
+            && RestoreBreakpointWhileStopped(process, skyUvBreakpoint)
             && RestoreBreakpointWhileStopped(process, returnBreakpoint)
             && RestoreBreakpointWhileStopped(process, atmosphereBreakpoint)
             && RestoreBreakpointWhileStopped(process, beginSceneBreakpoint)
@@ -4943,7 +5065,7 @@ internal static partial class NativeFrameCapture
     }
 
     private static bool AreBreakpointsRestored(BreakpointInfo cameraBreakpoint,
-        BreakpointInfo projectionBreakpoint, BreakpointInfo geometryProjectionBreakpoint, BreakpointInfo returnBreakpoint,
+        BreakpointInfo projectionBreakpoint, BreakpointInfo geometryProjectionBreakpoint, BreakpointInfo skyUvBreakpoint, BreakpointInfo returnBreakpoint,
         BreakpointInfo atmosphereBreakpoint, BreakpointInfo beginSceneBreakpoint, BreakpointInfo endSceneBreakpoint,
         BreakpointInfo fogConsumerBreakpoint,
         BreakpointInfo presentBreakpoint, BreakpointInfo presentCompletionBreakpoint,
@@ -4952,6 +5074,7 @@ internal static partial class NativeFrameCapture
         return (cameraBreakpoint == null || !cameraBreakpoint.Armed)
             && (projectionBreakpoint == null || !projectionBreakpoint.Armed)
             && (geometryProjectionBreakpoint == null || !geometryProjectionBreakpoint.Armed)
+            && (skyUvBreakpoint == null || !skyUvBreakpoint.Armed)
             && (returnBreakpoint == null || !returnBreakpoint.Armed)
             && (atmosphereBreakpoint == null || !atmosphereBreakpoint.Armed)
             && (beginSceneBreakpoint == null || !beginSceneBreakpoint.Armed)

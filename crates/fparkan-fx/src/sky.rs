@@ -328,6 +328,24 @@ pub struct SkyMesh {
 }
 
 impl SkyMesh {
+    /// Updates native nebula, star and cloud scroll from the sky object's elapsed milliseconds.
+    pub fn update_uvs(&mut self, elapsed_ms: u32) {
+        let offsets = [
+            [(elapsed_ms % 300_000) as f32 * 3.333_333_3e-6; 2],
+            [(elapsed_ms % 100_000) as f32 * 1.0e-5; 2],
+            [(elapsed_ms % 50_000) as f32 * 2.0e-5, 0.0],
+        ];
+        let inverse_radius = self.radius.recip();
+        for vertex in &mut self.vertices {
+            for stage in 0..3 {
+                let scale = inverse_radius * SKY_UV_SCALES[stage];
+                vertex.uv[stage] = std::array::from_fn(|axis| {
+                    scale * vertex.position[axis] + offsets[stage][axis]
+                });
+            }
+        }
+    }
+
     /// Number of triangles in the mesh.
     #[must_use]
     pub fn triangle_count(&self) -> usize {
@@ -1784,6 +1802,26 @@ mod tests {
                 resources: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn scrolling_uvs_match_native_periods_and_wrapped_elapsed_clock() {
+        let mut mesh = SkyGeometryConfig::default().try_mesh(&sample()).unwrap();
+        let topology = mesh.indices.clone();
+        for elapsed in [0, 25_000, 49_999, 50_000, 100_000, 300_000, 4_051_271_258] {
+            mesh.update_uvs(elapsed);
+            let zenith = mesh.vertices[0].uv;
+            assert_eq!(zenith[0], [(elapsed % 300_000) as f32 * 3.333_333_3e-6; 2]);
+            assert_eq!(zenith[1], [(elapsed % 100_000) as f32 * 1e-5; 2]);
+            assert_eq!(zenith[2], [(elapsed % 50_000) as f32 * 2e-5, 0.0]);
+        }
+        // Live GOG sky render: now 265584022, object origin 509280060.
+        mesh.update_uvs(265_584_022_u32.wrapping_sub(509_280_060));
+        assert!((mesh.vertices[0].uv[2][0] - 0.42516).abs() < 1e-7);
+        let once = mesh.vertices.clone();
+        mesh.update_uvs(4_051_271_258);
+        assert_eq!(mesh.vertices, once, "updates must not accumulate drift");
+        assert_eq!(mesh.indices, topology);
     }
 
     #[test]

@@ -1187,10 +1187,15 @@ drawable размер `(right - left) × (bottom - top)` и отклоняет �
 `FreeFlightCamera` в этом режиме не создаётся, но redraw продолжает обновлять
 environment и projected shadows от captured camera. Перед environment update и
 его audio events listener получает position, forward и up captured camera;
-начальная сортировка world draw использует её же position. Phase capture может
+начальная сортировка world draw использует её же position. Облака в обычном
+запуске движутся с отдельным 50-секундным циклом UV; фон и звёзды имеют свои
+периоды. Изменение цвета неба по расписанию не заменяет это движение.
+Phase capture может
 содержать наблюдаемый mission path и проверенный `atmosphere_seconds`; viewer
 использует эту абсолютную фазу по умолчанию, если не указан явный CLI override,
-и удерживает sample атмосферы на ней через readback frames. Фазы FX следуют
+и удерживает sample атмосферы на ней через readback frames. Дополнительный
+`sky_uv_clock` фиксирует положение движущихся текстур на том же кадре;
+без него их начальная фаза не подтверждена. Фазы FX следуют
 выбранному control clock: без `--control-clock-ms` он обновляется по elapsed
 time, а с явным значением readback frames переигрывают заданный clock. Это не
 полное simulation time: `weather`, RNG и
