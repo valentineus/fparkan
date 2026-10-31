@@ -7014,7 +7014,6 @@ fn read_vfs(vfs: &Arc<dyn Vfs>, path: &NormalizedPath) -> Result<Arc<[u8]>, Engi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fparkan_script::ScriptDispatchSelector;
     use fparkan_vfs::{DirectoryVfs, MemoryVfs, OverlayVfs, VfsEntry, VfsMetadata};
     use std::path::{Path, PathBuf};
 
@@ -13350,12 +13349,14 @@ mod tests {
             (
                 "MISSIONS/SCRIPTS/formula.var",
                 Arc::from(
-                    &b"VAR(DWORD, ClanBaseX, 0)\nVAR(DWORD, ClanBaseY, 0)\nVAR(DWORD, ClanID, 0)\nVAR(float, target, 0.5)\n"[..],
+                    &b"VAR(DWORD, ClanBaseX, 0)\nVAR(DWORD, ClanBaseY, 0)\nVAR(DWORD, ClanID, 99)\nVAR(float, target, 0.5)\n"[..],
                 ),
             ),
             (
                 "MISSIONS/SCRIPTS/formula.fml",
-                Arc::from(&b"// authored literal\n\nFUNCTION( , 0.8,  )\nFUNCTION( later, target + 2, )\n"[..]),
+                Arc::from(
+                    &b"// authored Init expression\n\nFUNCTION( , ClanID + 0.8,  )\nFUNCTION( later, target * 2, )\n"[..],
+                ),
             ),
         ] {
             files.insert(
@@ -13388,6 +13389,185 @@ mod tests {
                 VarSetDefault::Dword(0),
                 VarSetDefault::FloatBits(0x3f4c_cccd),
             ]
+        );
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_fml_variable_rows_resolve_from_shared_varset_defaults() {
+        fn formula_action(target: u32, row: u32) -> ScriptInstruction {
+            ScriptInstruction {
+                header_words: [u32::MAX, target, u32::MAX, u32::MAX, 6, 0, row],
+                references: Vec::new(),
+            }
+        }
+
+        fn init_event_index(package: &ScriptPackage) -> usize {
+            package
+                .events
+                .iter()
+                .position(|event| {
+                    event.name_raw.split(|byte| *byte == 0).next() == Some(&b"Init"[..])
+                })
+                .expect("Init event")
+        }
+
+        fn row_is_assigned(instructions: &[ScriptInstruction], row: u32, target: u32) -> bool {
+            instructions.iter().any(|instruction| {
+                instruction.header_words[0] == u32::MAX
+                    && instruction.header_words[1] == target
+                    && instruction.header_words[2] == u32::MAX
+                    && instruction.header_words[3] == u32::MAX
+                    && instruction.header_words[6] == row
+            })
+        }
+
+        let root = licensed_root("IS");
+        let script_dir = root.join("MISSIONS/SCRIPTS");
+        let declarations = fparkan_script::parse_varset(
+            &std::fs::read(script_dir.join("varset.var")).expect("read shared varset"),
+        )
+        .expect("parse shared varset");
+        let formulas3 = FormulaTable::parse(
+            &std::fs::read(script_dir.join("c1m3e.fml")).expect("read c1m3e.fml"),
+        );
+        let package3 = fparkan_script::decode(
+            &std::fs::read(script_dir.join("c1m3e.scr")).expect("read c1m3e.scr"),
+        )
+        .expect("decode c1m3e.scr");
+        let init3_index = init_event_index(&package3);
+        let init3_event_word = package3.events[init3_index].event_word;
+        let init3 = &package3.events[init3_index].instructions;
+        assert!(row_is_assigned(init3, 0, 40));
+        assert!(row_is_assigned(init3, 1, 41));
+        assert!(row_is_assigned(init3, 2, 164));
+        assert!(!row_is_assigned(init3, 19, 158));
+        assert!(!row_is_assigned(init3, 22, 174));
+        assert!(row_is_assigned(
+            &package3
+                .events
+                .iter()
+                .find(|event| event.name_raw.split(|byte| *byte == 0).next()
+                    == Some(&b"Fort_Captured"[..]))
+                .expect("Fort_Captured event")
+                .instructions,
+            19,
+            158,
+        ));
+        assert!(row_is_assigned(
+            &package3
+                .events
+                .iter()
+                .find(|event| event.name_raw.split(|byte| *byte == 0).next()
+                    == Some(&b"PBM_BUILDING_PROTECT_Start"[..]))
+                .expect("building-protection event")
+                .instructions,
+            22,
+            174,
+        ));
+        assert_eq!(formulas3.rows[19].expression_raw, b" 0.8 + fT");
+        assert_eq!(
+            formulas3.rows[22].expression_raw,
+            b" dBuildingProtectHits - dT2"
+        );
+
+        let f_temp = u32::try_from(
+            declarations
+                .declarations
+                .iter()
+                .position(|declaration| declaration.name == "fTemp")
+                .expect("fTemp declaration"),
+        )
+        .expect("fTemp index fits u32");
+        let d_temp3 = u32::try_from(
+            declarations
+                .declarations
+                .iter()
+                .position(|declaration| declaration.name == "dTemp3")
+                .expect("dTemp3 declaration"),
+        )
+        .expect("dTemp3 index fits u32");
+        assert_eq!((f_temp, d_temp3), (158, 174));
+
+        let mut synthetic3 = package3.clone();
+        synthetic3.events[init3_index].instructions =
+            vec![formula_action(f_temp, 19), formula_action(d_temp3, 22)];
+        assert_eq!(
+            declarations.resolve_init(
+                &synthetic3,
+                Handler19InitInput {
+                    first_x87_word: 0,
+                    second_x87_word: 0,
+                    third_word: 0,
+                },
+                Some(&formulas3),
+            ),
+            Ok(ScriptInitResolution::Executed {
+                event_index: init3_index,
+                event_word: init3_event_word,
+                writes: vec![
+                    ScriptInitWrite {
+                        index: f_temp,
+                        value: VarSetDefault::FloatBits(0.8_f32.to_bits()),
+                    },
+                    ScriptInitWrite {
+                        index: d_temp3,
+                        value: VarSetDefault::Dword(2_000_000),
+                    },
+                ],
+            })
+        );
+
+        let formulas4 = FormulaTable::parse(
+            &std::fs::read(script_dir.join("c1m4e.fml")).expect("read c1m4e.fml"),
+        );
+        let package4 = fparkan_script::decode(
+            &std::fs::read(script_dir.join("c1m4e.scr")).expect("read c1m4e.scr"),
+        )
+        .expect("decode c1m4e.scr");
+        let init4_index = init_event_index(&package4);
+        let init4_event_word = package4.events[init4_index].event_word;
+        let init4 = &package4.events[init4_index].instructions;
+        assert!(!row_is_assigned(init4, 0, f_temp));
+        assert!(row_is_assigned(
+            &package4
+                .events
+                .iter()
+                .find(|event| event.name_raw.split(|byte| *byte == 0).next()
+                    == Some(&b"PBM_BUILDING_INF_CAPTURE_Start"[..]))
+                .expect("building-infantry-capture event")
+                .instructions,
+            0,
+            f_temp,
+        ));
+        assert_eq!(formulas4.rows[0].expression_raw, b" fTemp + 0.00001");
+        let mut synthetic4 = package4.clone();
+        synthetic4.events[init4_index].instructions =
+            vec![formula_action(f_temp, 0), formula_action(f_temp, 0)];
+        assert_eq!(
+            declarations.resolve_init(
+                &synthetic4,
+                Handler19InitInput {
+                    first_x87_word: 0,
+                    second_x87_word: 0,
+                    third_word: 0,
+                },
+                Some(&formulas4),
+            ),
+            Ok(ScriptInitResolution::Executed {
+                event_index: init4_index,
+                event_word: init4_event_word,
+                writes: vec![
+                    ScriptInitWrite {
+                        index: f_temp,
+                        value: VarSetDefault::FloatBits(0.00001_f32.to_bits()),
+                    },
+                    ScriptInitWrite {
+                        index: f_temp,
+                        value: VarSetDefault::FloatBits((0.00001_f32 + 0.00001_f32).to_bits()),
+                    },
+                ],
+            })
         );
     }
 
@@ -13558,6 +13738,8 @@ mod tests {
 
     #[test]
     fn handler_nineteen_preview_keeps_unsupported_package_without_partial_writes() {
+        let formula_table =
+            FormulaTable::parse(b"FUNCTION(add, x + 2, )\nFUNCTION(unsupported, x * 2, )\n");
         let varset = MissionScriptVarSet {
             path: FALLBACK_SCRIPT_VARSET_PATH.to_string(),
             used_fallback: true,
@@ -13578,7 +13760,11 @@ mod tests {
                         references: vec![0, 1, 2],
                     },
                     fparkan_script::ScriptInstruction {
-                        header_words: [18, u32::MAX, u32::MAX, 0, 0, 0, 0],
+                        header_words: [u32::MAX, 0, u32::MAX, u32::MAX, 6, 0, 0],
+                        references: Vec::new(),
+                    },
+                    fparkan_script::ScriptInstruction {
+                        header_words: [u32::MAX, 0, u32::MAX, u32::MAX, 6, 0, 1],
                         references: Vec::new(),
                     },
                 ],
@@ -13591,7 +13777,7 @@ mod tests {
             base_path: "MISSIONS/SCRIPTS/default".to_string(),
             script_path: "MISSIONS/SCRIPTS/default.scr".to_string(),
             package: package.clone(),
-            formula_table: None,
+            formula_table: Some(formula_table.clone()),
             init_execution: MissionScriptInitExecution::Missing,
             behavior_warm_start: None,
         };
@@ -13609,9 +13795,10 @@ mod tests {
             preview_bundles[0].init_execution,
             MissionScriptInitExecution::Unsupported {
                 event_index: 0,
-                instruction_index: 1,
-                error: ScriptInitResolveError::UnsupportedSelector {
-                    found: ScriptDispatchSelector::Handler(18),
+                instruction_index: 2,
+                error: ScriptInitResolveError::UnsupportedFormulaExpression {
+                    index: 1,
+                    expression: b" x * 2".to_vec(),
                 },
             }
         );
@@ -13640,12 +13827,13 @@ mod tests {
             Err(EngineError::ScriptInitUnsupported {
                 clan_index: 0,
                 event_index: 0,
-                instruction_index: 1,
-                source: ScriptInitResolveError::UnsupportedSelector {
-                    found: ScriptDispatchSelector::Handler(18),
+                instruction_index: 2,
+                source: ScriptInitResolveError::UnsupportedFormulaExpression {
+                    index: 1,
+                    expression,
                 },
                 ..
-            })
+            }) if expression == b" x * 2"
         ));
 
         let mut malformed_package = package.clone();
@@ -15789,16 +15977,31 @@ mod tests {
             .iter()
             .position(|event| event.name_raw.split(|byte| *byte == 0).next() == Some(&b"Init"[..]))
             .expect("Init event");
-        assert_eq!(
-            package.events[init_index].instructions[0].header_words[0],
-            19
+        let init = &mut package.events[init_index];
+        let handler = init
+            .instructions
+            .first()
+            .expect("original Handler(19) instruction");
+        assert_eq!(handler.header_words[0], 19);
+        assert_eq!(handler.references.as_slice(), &[224, 225, 226]);
+        let original_instruction_count = init.instructions.len();
+        init.instructions.push(ScriptInstruction {
+            header_words: [u32::MAX, 164, u32::MAX, u32::MAX, 6, 0, 0],
+            references: Vec::new(),
+        });
+        init.instructions.push(ScriptInstruction {
+            header_words: [u32::MAX, 158, u32::MAX, u32::MAX, 6, 0, 1],
+            references: Vec::new(),
+        });
+        let replacement_script = Arc::<[u8]>::from(encode_script_package(&package));
+        let replacement_formula = Arc::<[u8]>::from(
+            &b"FUNCTION(add, ClanBaseX + 0.8, )\nFUNCTION(unsupported, fT * 2, )\n"[..],
         );
-        package.events[init_index].instructions[0].header_words[0] = 18;
-        let replacement = Arc::<[u8]>::from(encode_script_package(&package));
 
         let vfs = Arc::new(SwappingScriptVfs {
             inner: DirectoryVfs::new(&root),
-            replacement,
+            replacement_script,
+            replacement_formula,
             enabled: std::sync::atomic::AtomicBool::new(false),
         });
         let services_vfs: Arc<dyn Vfs> = vfs.clone();
@@ -15843,11 +16046,13 @@ mod tests {
         assert!(matches!(
             error,
             EngineError::ScriptInitUnsupported {
-                source: ScriptInitResolveError::UnsupportedSelector {
-                    found: ScriptDispatchSelector::Handler(18),
+                instruction_index,
+                source: ScriptInitResolveError::UnsupportedFormulaExpression {
+                    index: 1,
+                    expression,
                 },
                 ..
-            }
+            } if instruction_index == original_instruction_count + 1 && expression == b" fT * 2"
         ));
         assert_eq!(loaded_mission(&engine), Some(&previous_loaded));
         assert_eq!(
@@ -16731,24 +16936,37 @@ mod tests {
 
     struct SwappingScriptVfs {
         inner: DirectoryVfs,
-        replacement: Arc<[u8]>,
+        replacement_script: Arc<[u8]>,
+        replacement_formula: Arc<[u8]>,
         enabled: std::sync::atomic::AtomicBool,
     }
 
     impl SwappingScriptVfs {
-        fn use_replacement(&self, path: &NormalizedPath) -> bool {
-            self.enabled.load(std::sync::atomic::Ordering::SeqCst)
-                && path
-                    .as_str()
-                    .eq_ignore_ascii_case("MISSIONS/SCRIPTS/default.scr")
+        fn replacement(&self, path: &NormalizedPath) -> Option<&Arc<[u8]>> {
+            if !self.enabled.load(std::sync::atomic::Ordering::SeqCst) {
+                return None;
+            }
+            if path
+                .as_str()
+                .eq_ignore_ascii_case("MISSIONS/SCRIPTS/default.scr")
+            {
+                Some(&self.replacement_script)
+            } else if path
+                .as_str()
+                .eq_ignore_ascii_case("MISSIONS/SCRIPTS/default.fml")
+            {
+                Some(&self.replacement_formula)
+            } else {
+                None
+            }
         }
     }
 
     impl Vfs for SwappingScriptVfs {
         fn metadata(&self, path: &NormalizedPath) -> Result<VfsMetadata, VfsError> {
-            if self.use_replacement(path) {
+            if let Some(replacement) = self.replacement(path) {
                 return Ok(VfsMetadata {
-                    len: self.replacement.len() as u64,
+                    len: replacement.len() as u64,
                     fingerprint: [0x18; 32],
                 });
             }
@@ -16756,8 +16974,8 @@ mod tests {
         }
 
         fn read(&self, path: &NormalizedPath) -> Result<Arc<[u8]>, VfsError> {
-            if self.use_replacement(path) {
-                return Ok(self.replacement.clone());
+            if let Some(replacement) = self.replacement(path) {
+                return Ok(replacement.clone());
             }
             self.inner.read(path)
         }

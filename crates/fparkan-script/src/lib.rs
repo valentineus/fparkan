@@ -3,7 +3,7 @@
 //!
 //! This module preserves the layout proven by the GOG `ai.dll` reader.  It
 //! deliberately does not implement a general bytecode VM. It contains a
-//! narrow resolver for confirmed `Init` handlers and numeric FML literals.
+//! narrow resolver for confirmed `Init` handlers and bounded FML expressions.
 
 use fparkan_binary::{checked_allocation_len, Cursor, DecodeError, Limits};
 use std::sync::Arc;
@@ -214,7 +214,7 @@ pub enum ScriptInitResolveError {
         /// Number of preserved FML rows.
         rows: usize,
     },
-    /// The referenced FML row is not one numeric token.
+    /// The referenced FML row is outside the supported atom-expression subset.
     UnsupportedFormulaExpression {
         /// Zero-based FML row index.
         index: u32,
@@ -259,7 +259,7 @@ impl std::fmt::Display for ScriptInitResolveError {
             ),
             Self::UnsupportedFormulaExpression { index, expression } => write!(
                 formatter,
-                "formula {index} expression {:?} is not one numeric literal",
+                "formula {index} expression {:?} is outside the supported atom and binary +/− subset",
                 String::from_utf8_lossy(expression)
             ),
             Self::DwordConversionOutOfRange { index, value_bits } => write!(
@@ -736,6 +736,7 @@ impl VarSet {
     /// sentinel selector is accepted only for the proven formula assignment
     /// with control and copy-source words both equal to `0xffffffff`; the
     /// referenced row is evaluated only when that instruction is reached.
+    /// Formula atoms read defaults and earlier successful writes in this event.
     ///
     /// # Errors
     ///
@@ -753,10 +754,24 @@ impl VarSet {
             return Ok(ScriptInitResolution::Missing);
         };
 
+        let mut values = self
+            .declarations
+            .iter()
+            .map(|declaration| declaration.default_value)
+            .collect::<Vec<_>>();
         let mut writes = Vec::new();
         for (instruction_index, instruction) in event.instructions.iter().enumerate() {
-            match self.resolve_init_instruction(instruction, input, formulas)? {
+            match self.resolve_init_instruction(instruction, input, formulas, &values)? {
                 InitInstructionResolution::Executed(instruction_writes) => {
+                    for write in &instruction_writes {
+                        let Some(value) = values.get_mut(write.index as usize) else {
+                            return Err(ScriptInitResolveError::VarSetIndexOutOfBounds {
+                                index: write.index,
+                                declarations: self.declarations.len(),
+                            });
+                        };
+                        *value = write.value;
+                    }
                     writes.extend(instruction_writes);
                 }
                 InitInstructionResolution::Unsupported(error) => {
@@ -781,6 +796,7 @@ impl VarSet {
         instruction: &ScriptInstruction,
         input: Handler19InitInput,
         formulas: Option<&FormulaTable>,
+        values: &[VarSetDefault],
     ) -> Result<InitInstructionResolution, ScriptInitResolveError> {
         match instruction.dispatch_selector() {
             ScriptDispatchSelector::Handler(19) => {
@@ -842,22 +858,23 @@ impl VarSet {
                     ));
                 };
                 let formula_index = instruction.header_words[6];
-                let value = match formulas.evaluate_numeric_literal(formula_index) {
-                    Ok(value) => value,
-                    Err(FormulaLiteralError::IndexOutOfBounds { index, rows }) => {
-                        return Err(ScriptInitResolveError::FormulaIndexOutOfBounds {
-                            index,
-                            rows,
-                        });
-                    }
-                    Err(FormulaLiteralError::UnsupportedExpression { index, expression }) => {
-                        return Ok(InitInstructionResolution::Unsupported(
-                            ScriptInitResolveError::UnsupportedFormulaExpression {
-                                index,
-                                expression,
-                            },
-                        ));
-                    }
+                let Some(formula) = formulas.rows.get(formula_index as usize) else {
+                    return Err(ScriptInitResolveError::FormulaIndexOutOfBounds {
+                        index: formula_index,
+                        rows: formulas.rows.len(),
+                    });
+                };
+                let Some(value) = parse_init_formula_expression(
+                    &formula.expression_raw,
+                    &self.declarations,
+                    values,
+                ) else {
+                    return Ok(InitInstructionResolution::Unsupported(
+                        ScriptInitResolveError::UnsupportedFormulaExpression {
+                            index: formula_index,
+                            expression: formula.expression_raw.clone(),
+                        },
+                    ));
                 };
                 let target_index = instruction.header_words[1];
                 let Some(target) = self.declarations.get(target_index as usize) else {
@@ -866,6 +883,20 @@ impl VarSet {
                         declarations: self.declarations.len(),
                     });
                 };
+                let Some(current_target) = values.get(target_index as usize) else {
+                    return Err(ScriptInitResolveError::VarSetIndexOutOfBounds {
+                        index: target_index,
+                        declarations: values.len(),
+                    });
+                };
+                if !varset_value_matches_type(target.type_name, *current_target) {
+                    return Ok(InitInstructionResolution::Unsupported(
+                        ScriptInitResolveError::UnsupportedFormulaExpression {
+                            index: formula_index,
+                            expression: formula.expression_raw.clone(),
+                        },
+                    ));
+                }
                 let value = match target.type_name {
                     VarSetType::Float => VarSetDefault::FloatBits(value.to_bits()),
                     VarSetType::Dword => {
@@ -1357,6 +1388,113 @@ fn native_decimal_prefix_len(token: &[u8]) -> Option<usize> {
     Some(index)
 }
 
+fn parse_init_formula_expression(
+    expression: &[u8],
+    declarations: &[VarSetDeclaration],
+    values: &[VarSetDefault],
+) -> Option<f32> {
+    let (left, left_end) = parse_init_formula_atom(expression, 0, declarations, values)?;
+    let operator_index = skip_native_formula_space(expression, left_end);
+    let Some(&operator @ (b'+' | b'-')) = expression.get(operator_index) else {
+        return expression[left_end..]
+            .iter()
+            .all(|byte| *byte == 0 || *byte <= 32)
+            .then_some(left);
+    };
+    let (right, right_end) =
+        parse_init_formula_atom(expression, operator_index + 1, declarations, values)?;
+    if !expression[right_end..]
+        .iter()
+        .all(|byte| *byte == 0 || *byte <= 32)
+    {
+        return None;
+    }
+    Some(match operator {
+        b'+' => right + left,
+        b'-' => left - right,
+        _ => unreachable!(),
+    })
+}
+
+fn parse_init_formula_atom(
+    expression: &[u8],
+    start: usize,
+    declarations: &[VarSetDeclaration],
+    values: &[VarSetDefault],
+) -> Option<(f32, usize)> {
+    let start = skip_native_formula_space(expression, start);
+    let remaining = expression.get(start..)?;
+    let first = *remaining.first()?;
+    let token_len = if first.is_ascii_digit() {
+        native_numeric_token_len(remaining)?
+    } else {
+        native_variable_token_len(remaining)?
+    };
+    let token = &remaining[..token_len];
+    if is_native_operator_atom(token) {
+        return None;
+    }
+
+    let value = if let Some(index) = declarations
+        .iter()
+        .position(|declaration| declaration.name.as_bytes() == token)
+    {
+        let declaration = &declarations[index];
+        let value = *values.get(index)?;
+        varset_value_as_f32(declaration.type_name, value)?
+    } else {
+        parse_native_numeric_literal(token)?
+    };
+    Some((value, start + token_len))
+}
+
+fn native_variable_token_len(token: &[u8]) -> Option<usize> {
+    let first = *token.first()?;
+    if first == b'^' || !is_native_variable_byte(first) {
+        return None;
+    }
+    Some(
+        token
+            .iter()
+            .take_while(|byte| is_native_variable_byte(**byte))
+            .count(),
+    )
+}
+
+fn is_native_variable_byte(byte: u8) -> bool {
+    byte.is_ascii() && ((byte > b'@' && byte < b'{') || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn is_native_operator_atom(token: &[u8]) -> bool {
+    matches!(
+        token,
+        b"+" | b"-" | b"*" | b"/" | b"^" | b"&" | b"|" | b"!" | b"A" | b"B" | b"N" | b"S"
+    )
+}
+
+fn skip_native_formula_space(expression: &[u8], start: usize) -> usize {
+    expression[start..]
+        .iter()
+        .position(|byte| *byte == 0 || *byte > 32)
+        .map_or(expression.len(), |offset| start + offset)
+}
+
+fn varset_value_as_f32(type_name: VarSetType, value: VarSetDefault) -> Option<f32> {
+    match (type_name, value) {
+        (VarSetType::Float, VarSetDefault::FloatBits(bits)) => Some(f32::from_bits(bits)),
+        (VarSetType::Dword, VarSetDefault::Dword(value)) => Some(value as f32),
+        _ => None,
+    }
+}
+
+fn varset_value_matches_type(type_name: VarSetType, value: VarSetDefault) -> bool {
+    matches!(
+        (type_name, value),
+        (VarSetType::Float, VarSetDefault::FloatBits(_))
+            | (VarSetType::Dword, VarSetDefault::Dword(_))
+    )
+}
+
 fn formula_dword_value(value: f32) -> Option<u32> {
     const SIGNED_QWORD_LIMIT: f64 = 9_223_372_036_854_775_808.0;
     let value = f64::from(value);
@@ -1821,6 +1959,49 @@ mod tests {
         VarSetError, VarSetType, VmHostCallbackCommand, GOG_HANDLER_COUNT, INSTRUCTION_WORDS,
     };
     use fparkan_binary::{DecodeError, Limits};
+
+    fn init_package(instructions: Vec<ScriptInstruction>) -> ScriptPackage {
+        ScriptPackage {
+            opcode_handler_count: 73,
+            events: vec![ScriptEvent {
+                name_len: 4,
+                name_raw: b"Init\0".to_vec(),
+                event_word: 0,
+                instructions,
+            }],
+            trailing_bytes: Vec::new(),
+            raw: std::sync::Arc::from(&b""[..]),
+        }
+    }
+
+    fn init_formula_assignment(target: u32, formula: u32) -> ScriptInstruction {
+        ScriptInstruction {
+            header_words: [u32::MAX, target, u32::MAX, u32::MAX, 6, 0, formula],
+            references: Vec::new(),
+        }
+    }
+
+    fn init_handler19() -> ScriptInstruction {
+        ScriptInstruction {
+            header_words: [19, u32::MAX, u32::MAX, u32::MAX, 6, 3, u32::MAX],
+            references: vec![0, 1, 2],
+        }
+    }
+
+    fn init_input() -> Handler19InitInput {
+        Handler19InitInput {
+            first_x87_word: 10,
+            second_x87_word: 20,
+            third_word: 30,
+        }
+    }
+
+    fn one_formula(expression: &[u8]) -> FormulaTable {
+        let mut source = b"FUNCTION(test, ".to_vec();
+        source.extend_from_slice(expression);
+        source.extend_from_slice(b", )\n");
+        FormulaTable::parse(&source)
+    }
 
     fn handler_two_input(
         scalar_1: f32,
@@ -2625,12 +2806,265 @@ STRING( 8, ignored, ignored, ignored)\r\n";
     }
 
     #[test]
+    fn script_init_formula_variables_read_prior_writes_and_self() {
+        let varset = parse_varset(
+            b"VAR(DWORD, source, 0)\nVAR(DWORD, y, 0)\nVAR(DWORD, id, 0)\nVAR(float, target, 0)\nVAR(DWORD, integer, 0)\n",
+        )
+        .expect("numeric declarations");
+        let formulas = FormulaTable::parse(
+            b"FUNCTION(literal, 7.0, )\nFUNCTION(add, source + 2.0, )\nFUNCTION(subtract, target - source, )\nFUNCTION(self, target + 1.0, )\nFUNCTION(integer, 10.75 + 0.5, )\nFUNCTION(exponent, target + 1e-2, )\n",
+        );
+        let package = init_package(vec![
+            init_handler19(),
+            init_formula_assignment(3, 0),
+            init_formula_assignment(3, 1),
+            init_formula_assignment(3, 2),
+            init_formula_assignment(3, 3),
+            init_formula_assignment(4, 4),
+            init_formula_assignment(3, 5),
+        ]);
+
+        assert_eq!(
+            varset.resolve_init(&package, init_input(), Some(&formulas),),
+            Ok(ScriptInitResolution::Executed {
+                event_index: 0,
+                event_word: 0,
+                writes: vec![
+                    ScriptInitWrite {
+                        index: 0,
+                        value: VarSetDefault::Dword(10),
+                    },
+                    ScriptInitWrite {
+                        index: 1,
+                        value: VarSetDefault::Dword(20),
+                    },
+                    ScriptInitWrite {
+                        index: 2,
+                        value: VarSetDefault::Dword(30),
+                    },
+                    ScriptInitWrite {
+                        index: 3,
+                        value: VarSetDefault::FloatBits(7.0_f32.to_bits()),
+                    },
+                    ScriptInitWrite {
+                        index: 3,
+                        value: VarSetDefault::FloatBits(12.0_f32.to_bits()),
+                    },
+                    ScriptInitWrite {
+                        index: 3,
+                        value: VarSetDefault::FloatBits(2.0_f32.to_bits()),
+                    },
+                    ScriptInitWrite {
+                        index: 3,
+                        value: VarSetDefault::FloatBits(3.0_f32.to_bits()),
+                    },
+                    ScriptInitWrite {
+                        index: 4,
+                        value: VarSetDefault::Dword(11),
+                    },
+                    ScriptInitWrite {
+                        index: 3,
+                        value: VarSetDefault::FloatBits(3.01_f32.to_bits()),
+                    },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn script_init_formula_atoms_use_native_token_and_name_rules() {
+        let varset = parse_varset(
+            b"VAR(float, dup, 1)\nVAR(float, dup, 2)\nVAR(float, Name, 3)\nVAR(float, name, 4)\nVAR(float, 1e-2, 41)\nVAR(float, A, 8)\nVAR(float, A1, 9)\nVAR(DWORD, high, 4294967295)\nVAR(float, large, 16777216)\nVAR(float, target, 0)\nVAR(DWORD, integer, 0)\n",
+        )
+        .expect("numeric declarations");
+        let formulas = FormulaTable::parse(
+            b"FUNCTION(duplicate, dup + 0, )\nFUNCTION(upper, Name + 0, )\nFUNCTION(lower, name + 0, )\nFUNCTION(numeric_name, 1e-2 + 0, )\nFUNCTION(long_operator_prefix, A1 + 0, )\nFUNCTION(unsigned_dword, high + 0, )\nFUNCTION(negative_exponent, 5e-2 + 2e-2, )\nFUNCTION(positive_exponent, 1e+2 + 2e-2, )\nFUNCTION(binary32_rounding, 16777216 + 1, )\nFUNCTION(cancellation, target - 16777215, )\nFUNCTION(dword_target, 10.75 + 0.5, )\nFUNCTION(single_variable, large, )\nFUNCTION(negative_dword_wrap, 2 - 3, )\nFUNCTION(unsigned_dword_wrap, high + 0, )\n",
+        );
+        let package = init_package(
+            (0..14)
+                .map(|formula| {
+                    init_formula_assignment(
+                        if matches!(formula, 10 | 12 | 13) {
+                            10
+                        } else {
+                            9
+                        },
+                        formula,
+                    )
+                })
+                .collect(),
+        );
+
+        let resolved = varset
+            .resolve_init(
+                &package,
+                Handler19InitInput {
+                    first_x87_word: 0,
+                    second_x87_word: 0,
+                    third_word: 0,
+                },
+                Some(&formulas),
+            )
+            .expect("resolve Init")
+            .clone();
+        assert_eq!(
+            resolved,
+            ScriptInitResolution::Executed {
+                event_index: 0,
+                event_word: 0,
+                writes: vec![
+                    ScriptInitWrite {
+                        index: 9,
+                        value: VarSetDefault::FloatBits(1.0_f32.to_bits())
+                    },
+                    ScriptInitWrite {
+                        index: 9,
+                        value: VarSetDefault::FloatBits(3.0_f32.to_bits())
+                    },
+                    ScriptInitWrite {
+                        index: 9,
+                        value: VarSetDefault::FloatBits(4.0_f32.to_bits())
+                    },
+                    ScriptInitWrite {
+                        index: 9,
+                        value: VarSetDefault::FloatBits(41.0_f32.to_bits())
+                    },
+                    ScriptInitWrite {
+                        index: 9,
+                        value: VarSetDefault::FloatBits(9.0_f32.to_bits())
+                    },
+                    ScriptInitWrite {
+                        index: 9,
+                        value: VarSetDefault::FloatBits(4_294_967_296.0_f32.to_bits())
+                    },
+                    ScriptInitWrite {
+                        index: 9,
+                        value: VarSetDefault::FloatBits((0.05_f32 + 0.02_f32).to_bits())
+                    },
+                    ScriptInitWrite {
+                        index: 9,
+                        value: VarSetDefault::FloatBits((100.0_f32 + 0.02_f32).to_bits())
+                    },
+                    ScriptInitWrite {
+                        index: 9,
+                        value: VarSetDefault::FloatBits(16_777_216.0_f32.to_bits())
+                    },
+                    ScriptInitWrite {
+                        index: 9,
+                        value: VarSetDefault::FloatBits(1.0_f32.to_bits())
+                    },
+                    ScriptInitWrite {
+                        index: 10,
+                        value: VarSetDefault::Dword(11)
+                    },
+                    ScriptInitWrite {
+                        index: 9,
+                        value: VarSetDefault::FloatBits(16_777_216.0_f32.to_bits())
+                    },
+                    ScriptInitWrite {
+                        index: 10,
+                        value: VarSetDefault::Dword(u32::MAX)
+                    },
+                    ScriptInitWrite {
+                        index: 10,
+                        value: VarSetDefault::Dword(0)
+                    },
+                ],
+            }
+        );
+        assert!(formulas.evaluate_numeric_literal(0).is_err());
+    }
+
+    #[test]
+    fn script_init_rejects_unsupported_formula_variable_forms() {
+        let varset = parse_varset(
+            b"VAR(float, target, 1)\nVAR(float, A, 2)\nVAR(float, A1, 3)\nVAR(float, ^name, 4)\n",
+        )
+        .expect("numeric declarations");
+        for expression in [
+            &b"target * 2"[..],
+            b"-1",
+            b"target + 1 + 2",
+            b"missing + 1",
+            b"A + 1",
+            b"^name + 1",
+            b"name\xc3\xa9 + 1",
+        ] {
+            let formulas = one_formula(expression);
+            let package = init_package(vec![init_formula_assignment(0, 0)]);
+            assert!(
+                matches!(
+                    varset.resolve_init(
+                        &package,
+                        Handler19InitInput {
+                            first_x87_word: 0,
+                            second_x87_word: 0,
+                            third_word: 0,
+                        },
+                        Some(&formulas),
+                    ),
+                    Ok(ScriptInitResolution::Unsupported {
+                        error: ScriptInitResolveError::UnsupportedFormulaExpression {
+                            index: 0,
+                            ..
+                        },
+                        ..
+                    })
+                ),
+                "accepted unsupported formula {:?}",
+                String::from_utf8_lossy(expression)
+            );
+        }
+
+        let mut inconsistent = varset;
+        inconsistent.declarations[0].default_value = VarSetDefault::Dword(1);
+        let formulas = one_formula(b"target + 1");
+        let package = init_package(vec![init_formula_assignment(0, 0)]);
+        assert!(matches!(
+            inconsistent.resolve_init(
+                &package,
+                Handler19InitInput {
+                    first_x87_word: 0,
+                    second_x87_word: 0,
+                    third_word: 0,
+                },
+                Some(&formulas),
+            ),
+            Ok(ScriptInitResolution::Unsupported {
+                error: ScriptInitResolveError::UnsupportedFormulaExpression { index: 0, .. },
+                ..
+            })
+        ));
+
+        let mut inconsistent_target =
+            parse_varset(b"VAR(float, target, 1)\n").expect("numeric declaration");
+        inconsistent_target.declarations[0].default_value = VarSetDefault::Dword(1);
+        let formulas = one_formula(b"2.0 + 1");
+        assert!(matches!(
+            inconsistent_target.resolve_init(
+                &init_package(vec![init_formula_assignment(0, 0)]),
+                Handler19InitInput {
+                    first_x87_word: 0,
+                    second_x87_word: 0,
+                    third_word: 0,
+                },
+                Some(&formulas),
+            ),
+            Ok(ScriptInitResolution::Unsupported {
+                error: ScriptInitResolveError::UnsupportedFormulaExpression { index: 0, .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn script_init_keeps_unsupported_formula_expressions_lazy_and_transactional() {
-        let varset = parse_varset(b"VAR(DWORD, integer, 0)\n").expect("numeric declaration");
+        let varset = parse_varset(b"VAR(DWORD, target, 0)\nVAR(DWORD, integer, 0)\n")
+            .expect("numeric declaration");
         let formulas =
-            FormulaTable::parse(b"FUNCTION(unsupported, target + 2, )\nFUNCTION(literal, 7.5, )\n");
+            FormulaTable::parse(b"FUNCTION(unsupported, target * 2, )\nFUNCTION(literal, 7.5, )\n");
         let action = |formula_index| ScriptInstruction {
-            header_words: [u32::MAX, 0, u32::MAX, u32::MAX, 6, 0, formula_index],
+            header_words: [u32::MAX, 1, u32::MAX, u32::MAX, 6, 0, formula_index],
             references: Vec::new(),
         };
         let package = |formula_index| ScriptPackage {
@@ -2656,7 +3090,7 @@ STRING( 8, ignored, ignored, ignored)\r\n";
                 event_index: 0,
                 event_word: 0,
                 writes: vec![ScriptInitWrite {
-                    index: 0,
+                    index: 1,
                     value: VarSetDefault::Dword(7),
                 }],
             })
@@ -2668,7 +3102,7 @@ STRING( 8, ignored, ignored, ignored)\r\n";
                 instruction_index: 0,
                 error: ScriptInitResolveError::UnsupportedFormulaExpression {
                     index: 0,
-                    expression: b" target + 2".to_vec(),
+                    expression: b" target * 2".to_vec(),
                 },
             })
         );
@@ -2682,7 +3116,7 @@ STRING( 8, ignored, ignored, ignored)\r\n";
                 instruction_index: 1,
                 error: ScriptInitResolveError::UnsupportedFormulaExpression {
                     index: 0,
-                    expression: b" target + 2".to_vec(),
+                    expression: b" target * 2".to_vec(),
                 },
             })
         );
