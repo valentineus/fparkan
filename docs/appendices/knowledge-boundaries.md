@@ -778,16 +778,19 @@ resource-device значения во время игры.
 `0x5780/0x57c0` участвуют в векторе; Rust воспроизводит его raw output bits и
 отдельные cache, order, clamp и signed-zero случаи.
 
-Для обычной начальной загрузки scale-input тоже закрыт. AniMesh constructor
-оставляет `+0x158/+0x15c/+0x160` равными `1.0`; перед Control event `4` World3D
-проходит Agent event `0`, AniMesh RVA `0x1a80` вызывает базовый return `0x17df0`
-и передаёт event `4/null` модели, FX, CollManager и CollObject. Их проверенные
-ветви `0x75b0/0x6fc0`, Effect RVA `0x3d30`, Control RVA `0x1ce00` и `0x1fe00`
-не вызывают AniMesh setter `0x14770` и не меняют outer scale. Поэтому FAC0 в
-стандартном `LoadAgent` получает `[1, 1, 1]`. Другой маршрут
-`AddNewObjectToGame`/mirror к setter и последующие placement/tick остаются
-отдельными границами. В synthetic x86-векторе по-прежнему явно заданы `[2,3,5]`;
-он не является источником scale для полного load.
+Для обычной начальной загрузки входной масштаб единичный. Конструктор модели
+AniMesh RVA `0x68a0` задаёт `Model+0x158/+0x15c/+0x160 = 1.0`;
+`Agent+0x158` хранит указатель на отдельный Control. Перед Control event `4`
+World3D проходит Agent event `0`: AniMesh RVA `0x1a80` вызывает базовый return
+`0x17df0` и передаёт event `4/null` модели, FX, CollManager и CollObject.
+Проверенные ветви модели `0x75b0/0x6fc0`, Effect `0x3d30` и CollManager
+`0x1ce00` не меняют масштаб. CollObject получает событие через основной
+интерфейс `0x3c2fc`, slot `+0x08 -> 0x1f530`: он кэширует host-интерфейсы,
+а необязательный вызов CollManager `0x1c330` сохраняет только указатель
+`CollObject+0x20` в `CollManager+0x3c`. Поэтому FAC0 получает `[1, 1, 1]`.
+Отдельные пути `AddNewObjectToGame`/mirror и последующие placement/tick остаются
+за этой границей. В synthetic x86-векторе scales `[2,3,5]` заданы отдельно.
+Подробная привязка интерфейсов приведена в [разборе Script VM](script-vm.md).
 
 Смысл `Slot68 +0x30/+0x34`, tag-27 cache DWORD, owner accumulators `+0x530`,
 `+0x534`, `+0x538` и результата mutable word `26` не имеет доказанных единиц
