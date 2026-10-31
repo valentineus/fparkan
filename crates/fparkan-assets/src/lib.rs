@@ -28,6 +28,8 @@ pub use fparkan_terrain_format::{BuildCategory, TerrainFormatError};
 use fparkan_texm::{decode_mip_rgba8, decode_texm, TexmDocument, TexmError};
 pub use fparkan_texm::{PageRect, RgbaImage};
 use fparkan_vfs::DirectoryVfs;
+mod research;
+pub use research::{calc_full_research_cost, ResearchCost, ResearchError, ResearchTrfDocument};
 use std::collections::{hash_map::Entry, HashMap};
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -4476,6 +4478,956 @@ mod tests {
                 type_index: 1,
             })
         ));
+    }
+
+    #[test]
+    fn research_trf_reader_preserves_rows_and_uses_low_u16_alias_link() {
+        let bytes = research_cycle_fixture(3, &[0; 5]);
+        let document = ResearchTrfDocument::decode(Arc::from(bytes.into_boxed_slice()))
+            .expect("synthetic TRF");
+
+        assert_eq!(document.row_count(), 5);
+        assert_eq!(document.find_key(b"a").expect("key lookup"), Some(0));
+        let row = document.row_words(0).expect("first raw row");
+        assert_eq!(row[0], 10.0_f32.to_bits());
+        assert_eq!(row[1], 1.0_f32.to_bits());
+        assert_eq!(row[8], 0x09FF_0000);
+        assert_eq!(document.row_words(2).expect("third row")[8], 0x09FF_0002);
+        assert_eq!(document.flag_byte(0), Some(0));
+        assert_eq!(document.relation_2_3(0).expect("ordered links"), [3, 1]);
+        assert!(document
+            .relation_4_5(0)
+            .expect("empty optional stream")
+            .is_empty());
+    }
+
+    #[test]
+    fn research_trf_reader_rejects_the_native_trf0_attribute_guard() {
+        let bytes = research_cycle_fixture(4, &[0; 5]);
+
+        assert!(ResearchTrfDocument::decode(Arc::from(bytes.into_boxed_slice())).is_err());
+    }
+
+    #[test]
+    fn research_cost_matches_native_cycle_dedup_nonzero_result() {
+        let bytes = research_cycle_fixture(3, &[0; 5]);
+        let research = ResearchTrfDocument::decode(Arc::from(bytes.into_boxed_slice()))
+            .expect("synthetic TRF");
+        let candidate = research_unit_dat(&[b"A", b"B", b"C", b"B"], &[3, 0, 0, 0], &[1; 4]);
+
+        assert_eq!(
+            calc_full_research_cost(&candidate, &research).expect("cost"),
+            ResearchCost {
+                ore: 15.0,
+                power: 150.0,
+            }
+        );
+    }
+
+    #[test]
+    fn research_trf_reader_preserves_first_alias_raw_link_and_unused_tails() {
+        let costs = [(1.0, 10.0), (2.0, 20.0)];
+        let aliases = [(b"Key".as_slice(), 0), (b"kEy".as_slice(), 1)];
+        let row_alias_links = [1, 0];
+        let empty_groups = [&[][..], &[][..]];
+        let bytes = research_fixture(ResearchFixtureSpec {
+            trf0_attr2: 3,
+            flags: &[0x84, 0x05],
+            costs: &costs,
+            aliases: &aliases,
+            row_alias_links: &row_alias_links,
+            relations_23: &empty_groups,
+            relations_45: &empty_groups,
+            include_trf3: true,
+            include_trf5: true,
+            omitted_chunks: &[],
+        });
+        let document = ResearchTrfDocument::decode(Arc::from(bytes.into_boxed_slice()))
+            .expect("synthetic TRF with unused payload tails");
+
+        assert_eq!(document.row_count(), 2);
+        assert_eq!(document.find_key(b"KEY").expect("alias lookup"), Some(0));
+        assert_eq!(document.find_key(b"missing").expect("missing lookup"), None);
+        assert_eq!(document.row_name(0).expect("raw low-u16 link"), b"kEy");
+        assert_eq!(document.row_words(0).expect("raw row")[8], 0x09FF_0001);
+        assert_eq!(document.flag_byte(0), Some(0x84));
+        assert_eq!(document.relation_2_3(0).expect("empty group"), &[]);
+        assert_eq!(document.relation_4_5(0).expect("empty second group"), &[]);
+
+        let trf0 = document
+            .archive()
+            .entries()
+            .iter()
+            .find(|entry| entry.meta().type_id == u32::from_le_bytes(*b"TRF0"))
+            .expect("retained TRF0 chunk");
+        assert!(document
+            .archive()
+            .payload(trf0.id())
+            .expect("retained payload")
+            .ends_with(RESEARCH_TEST_TAIL));
+    }
+
+    #[test]
+    fn research_trf_reader_rejects_required_chunk_and_attribute_errors() {
+        let cycle_costs = [
+            (1.0, 10.0),
+            (2.0, 20.0),
+            (3.0, 30.0),
+            (4.0, 40.0),
+            (5.0, 50.0),
+        ];
+        let names: [&[u8]; 5] = [b"A", b"B", b"C", b"D", b"E"];
+        let aliases: Vec<_> = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (*name, u16::try_from(index).expect("row id")))
+            .collect();
+        let row_alias_links = [0, 1, 2, 3, 4];
+        let no_groups = [&[][..]; 5];
+
+        let invalid_attr = research_fixture(ResearchFixtureSpec {
+            trf0_attr2: 4,
+            flags: &[0; 5],
+            costs: &cycle_costs,
+            aliases: &aliases,
+            row_alias_links: &row_alias_links,
+            relations_23: &no_groups,
+            relations_45: &no_groups,
+            include_trf3: true,
+            include_trf5: true,
+            omitted_chunks: &[],
+        });
+        assert!(matches!(
+            ResearchTrfDocument::decode(Arc::from(invalid_attr.into_boxed_slice())),
+            Err(ResearchError::InvalidTrf0Attribute { got: 4 })
+        ));
+
+        let missing_required = research_fixture(ResearchFixtureSpec {
+            trf0_attr2: 3,
+            flags: &[0; 5],
+            costs: &cycle_costs,
+            aliases: &aliases,
+            row_alias_links: &row_alias_links,
+            relations_23: &no_groups,
+            relations_45: &no_groups,
+            include_trf3: true,
+            include_trf5: true,
+            omitted_chunks: &[u32::from_le_bytes(*b"TRF8")],
+        });
+        assert!(matches!(
+            ResearchTrfDocument::decode(Arc::from(missing_required.into_boxed_slice())),
+            Err(ResearchError::MissingChunk { type_id })
+                if type_id == u32::from_le_bytes(*b"TRF8")
+        ));
+    }
+
+    #[test]
+    fn research_trf_reader_zero_fills_short_flags_and_rejects_long_flags() {
+        let costs = [(1.0, 10.0), (2.0, 20.0)];
+        let aliases = [(b"A".as_slice(), 0), (b"B".as_slice(), 1)];
+        let row_alias_links = [0, 1];
+        let no_groups = [&[][..], &[][..]];
+        let short = research_fixture(ResearchFixtureSpec {
+            trf0_attr2: 3,
+            flags: &[0x84],
+            costs: &costs,
+            aliases: &aliases,
+            row_alias_links: &row_alias_links,
+            relations_23: &no_groups,
+            relations_45: &no_groups,
+            include_trf3: true,
+            include_trf5: true,
+            omitted_chunks: &[],
+        });
+        let document = ResearchTrfDocument::decode(Arc::from(short.into_boxed_slice()))
+            .expect("short TRF1 is zero-filled by native loader");
+        assert_eq!(document.flag_byte(0), Some(0x84));
+        assert_eq!(document.flag_byte(1), Some(0));
+
+        let long = research_fixture(ResearchFixtureSpec {
+            trf0_attr2: 3,
+            flags: &[0; 3],
+            costs: &costs,
+            aliases: &aliases,
+            row_alias_links: &row_alias_links,
+            relations_23: &no_groups,
+            relations_45: &no_groups,
+            include_trf3: true,
+            include_trf5: true,
+            omitted_chunks: &[],
+        });
+        assert!(matches!(
+            ResearchTrfDocument::decode(Arc::from(long.into_boxed_slice())),
+            Err(ResearchError::FlagsTooLong {
+                row_count: 2,
+                actual: 3
+            })
+        ));
+    }
+
+    #[test]
+    fn research_trf_reader_checks_alias_and_pair_bounds_and_non_ascii_policy() {
+        let costs = [(1.0, 10.0), (2.0, 20.0)];
+        let aliases = [(b"A".as_slice(), 0), (b"B".as_slice(), 1)];
+        let row_alias_links = [0, 1];
+        let no_groups = [&[][..], &[][..]];
+        let make_bytes = || {
+            research_fixture(ResearchFixtureSpec {
+                trf0_attr2: 3,
+                flags: &[0; 2],
+                costs: &costs,
+                aliases: &aliases,
+                row_alias_links: &row_alias_links,
+                relations_23: &no_groups,
+                relations_45: &no_groups,
+                include_trf3: true,
+                include_trf5: true,
+                omitted_chunks: &[],
+            })
+        };
+
+        let mut invalid_name_offset = make_bytes();
+        research_set_payload_u16(
+            &mut invalid_name_offset,
+            u32::from_le_bytes(*b"TRFB"),
+            0,
+            u16::MAX,
+        );
+        assert!(matches!(
+            ResearchTrfDocument::decode(Arc::from(invalid_name_offset.into_boxed_slice())),
+            Err(ResearchError::InvalidNameOffset {
+                pair_index: 0,
+                offset: u16::MAX
+            })
+        ));
+
+        let mut unterminated = make_bytes();
+        research_set_payload_byte(&mut unterminated, u32::from_le_bytes(*b"TRF6"), 1, b'X');
+        research_set_payload_byte(&mut unterminated, u32::from_le_bytes(*b"TRF6"), 3, b'X');
+        assert!(matches!(
+            ResearchTrfDocument::decode(Arc::from(unterminated.into_boxed_slice())),
+            Err(ResearchError::UnterminatedName {
+                pair_index: 0,
+                offset: 0
+            })
+        ));
+
+        let mut invalid_record_pair = make_bytes();
+        research_set_payload_u32(
+            &mut invalid_record_pair,
+            u32::from_le_bytes(*b"TRF0"),
+            32,
+            0x09FF_0002,
+        );
+        assert!(matches!(
+            ResearchTrfDocument::decode(Arc::from(invalid_record_pair.into_boxed_slice())),
+            Err(ResearchError::InvalidRecordPair {
+                record_index: 0,
+                pair_index: 2,
+                pair_count: 2
+            })
+        ));
+
+        let mut invalid_alias_row = make_bytes();
+        research_set_payload_u16(&mut invalid_alias_row, u32::from_le_bytes(*b"TRFB"), 2, 7);
+        let document = ResearchTrfDocument::decode(Arc::from(invalid_alias_row.into_boxed_slice()))
+            .expect("alias row is checked when selected");
+        assert!(matches!(
+            document.find_key(b"A"),
+            Err(ResearchError::InvalidResearchIndex {
+                type_id,
+                index: 7,
+                row_count: 2
+            }) if type_id == u32::from_le_bytes(*b"TRFB")
+        ));
+
+        let non_ascii_aliases = [(b"\xC4".as_slice(), 0), (b"A".as_slice(), 1)];
+        let non_ascii = research_fixture(ResearchFixtureSpec {
+            trf0_attr2: 3,
+            flags: &[0; 2],
+            costs: &costs,
+            aliases: &non_ascii_aliases,
+            row_alias_links: &row_alias_links,
+            relations_23: &no_groups,
+            relations_45: &no_groups,
+            include_trf3: true,
+            include_trf5: true,
+            omitted_chunks: &[],
+        });
+        let document = ResearchTrfDocument::decode(Arc::from(non_ascii.into_boxed_slice()))
+            .expect("non-ASCII names are preserved");
+        assert!(matches!(
+            document.find_key(b"A"),
+            Err(ResearchError::UnsupportedNonAsciiLookup { .. })
+        ));
+        assert!(matches!(
+            document.find_key(b"\xE4"),
+            Err(ResearchError::UnsupportedNonAsciiLookup { .. })
+        ));
+    }
+
+    #[test]
+    fn research_trf_reader_checks_optional_streams_group_bounds_and_relation_ids() {
+        let costs = [(1.0, 10.0), (2.0, 20.0)];
+        let aliases = [(b"A".as_slice(), 0), (b"B".as_slice(), 1)];
+        let row_alias_links = [0, 1];
+        let no_groups = [&[][..], &[][..]];
+        let missing_zero_streams = research_fixture(ResearchFixtureSpec {
+            trf0_attr2: 3,
+            flags: &[0; 2],
+            costs: &costs,
+            aliases: &aliases,
+            row_alias_links: &row_alias_links,
+            relations_23: &no_groups,
+            relations_45: &no_groups,
+            include_trf3: false,
+            include_trf5: false,
+            omitted_chunks: &[],
+        });
+        let document =
+            ResearchTrfDocument::decode(Arc::from(missing_zero_streams.into_boxed_slice()))
+                .expect("missing optional streams with zero IDs are empty");
+        assert_eq!(
+            document.relation_2_3(0).expect("empty optional stream"),
+            &[]
+        );
+        assert_eq!(
+            document.relation_4_5(0).expect("empty optional stream"),
+            &[]
+        );
+
+        let positive_group = [&[1_u32][..], &[][..]];
+        let missing_trf3 = research_fixture(ResearchFixtureSpec {
+            trf0_attr2: 3,
+            flags: &[0; 2],
+            costs: &costs,
+            aliases: &aliases,
+            row_alias_links: &row_alias_links,
+            relations_23: &positive_group,
+            relations_45: &no_groups,
+            include_trf3: false,
+            include_trf5: true,
+            omitted_chunks: &[],
+        });
+        assert!(matches!(
+            ResearchTrfDocument::decode(Arc::from(missing_trf3.into_boxed_slice())),
+            Err(ResearchError::MissingRelationStream { type_id, required_ids: 1 })
+                if type_id == u32::from_le_bytes(*b"TRF3")
+        ));
+
+        let out_of_range_23 = [&[7_u32][..], &[][..]];
+        let out_of_range_45 = [&[][..], &[9_u32][..]];
+        let invalid_ids = research_fixture(ResearchFixtureSpec {
+            trf0_attr2: 3,
+            flags: &[0; 2],
+            costs: &costs,
+            aliases: &aliases,
+            row_alias_links: &row_alias_links,
+            relations_23: &out_of_range_23,
+            relations_45: &out_of_range_45,
+            include_trf3: true,
+            include_trf5: true,
+            omitted_chunks: &[],
+        });
+        let document = ResearchTrfDocument::decode(Arc::from(invalid_ids.into_boxed_slice()))
+            .expect("indices are checked when a group is accessed");
+        assert!(matches!(
+            document.relation_2_3(0),
+            Err(ResearchError::InvalidResearchIndex { type_id, index: 7, row_count: 2 })
+                if type_id == u32::from_le_bytes(*b"TRF3")
+        ));
+        assert!(matches!(
+            document.relation_4_5(1),
+            Err(ResearchError::InvalidResearchIndex { type_id, index: 9, row_count: 2 })
+                if type_id == u32::from_le_bytes(*b"TRF5")
+        ));
+        assert!(matches!(
+            document.relation_2_3(usize::MAX),
+            Err(ResearchError::MissingRelationGroup { type_id, .. })
+                if type_id == u32::from_le_bytes(*b"TRF2")
+        ));
+
+        let one_group = [&[][..]];
+        let short_table = research_fixture(ResearchFixtureSpec {
+            trf0_attr2: 3,
+            flags: &[0; 2],
+            costs: &costs,
+            aliases: &aliases,
+            row_alias_links: &row_alias_links,
+            relations_23: &one_group,
+            relations_45: &one_group,
+            include_trf3: true,
+            include_trf5: true,
+            omitted_chunks: &[],
+        });
+        let document = ResearchTrfDocument::decode(Arc::from(short_table.into_boxed_slice()))
+            .expect("relation tables have their own counts");
+        assert!(matches!(
+            document.relation_2_3(1),
+            Err(ResearchError::MissingRelationGroup { type_id, index: 1, group_count: 1 })
+                if type_id == u32::from_le_bytes(*b"TRF2")
+        ));
+        assert!(matches!(
+            document.relation_4_5(1),
+            Err(ResearchError::MissingRelationGroup { type_id, index: 1, group_count: 1 })
+                if type_id == u32::from_le_bytes(*b"TRF4")
+        ));
+    }
+
+    #[test]
+    fn research_trf_reader_checks_count_prefixes_without_large_allocations() {
+        let costs = [(1.0, 10.0), (2.0, 20.0)];
+        let aliases = [(b"A".as_slice(), 0), (b"B".as_slice(), 1)];
+        let row_alias_links = [0, 1];
+        let no_groups = [&[][..], &[][..]];
+        let mut bytes = research_fixture(ResearchFixtureSpec {
+            trf0_attr2: 3,
+            flags: &[0; 2],
+            costs: &costs,
+            aliases: &aliases,
+            row_alias_links: &row_alias_links,
+            relations_23: &no_groups,
+            relations_45: &no_groups,
+            include_trf3: true,
+            include_trf5: true,
+            omitted_chunks: &[],
+        });
+        research_set_nres_attr1(&mut bytes, u32::from_le_bytes(*b"TRF2"), 3);
+        assert!(matches!(
+            ResearchTrfDocument::decode(Arc::from(bytes.into_boxed_slice())),
+            Err(ResearchError::Binary(
+                fparkan_binary::DecodeError::UnexpectedEof { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn research_cost_preserves_native_tree_order_and_f32_rounding() {
+        let costs = [(16_777_216.0, 20.0), (-16_777_216.0, 30.0), (1.0, 10.0)];
+        let aliases_forward = [
+            (b"A".as_slice(), 2),
+            (b"B".as_slice(), 0),
+            (b"C".as_slice(), 1),
+        ];
+        let aliases_reversed = [
+            (b"A".as_slice(), 0),
+            (b"B".as_slice(), 1),
+            (b"C".as_slice(), 2),
+        ];
+        let row_alias_links = [0, 1, 2];
+        let no_groups = [&[][..], &[][..], &[][..]];
+        let make_research = |aliases: &[(&[u8], u16)]| {
+            let bytes = research_fixture(ResearchFixtureSpec {
+                trf0_attr2: 3,
+                flags: &[0x05; 3],
+                costs: &costs,
+                aliases,
+                row_alias_links: &row_alias_links,
+                relations_23: &no_groups,
+                relations_45: &no_groups,
+                include_trf3: true,
+                include_trf5: true,
+                omitted_chunks: &[],
+            });
+            ResearchTrfDocument::decode(Arc::from(bytes.into_boxed_slice())).expect("f32 order TRF")
+        };
+        let candidate = research_unit_dat(&[b"A", b"B", b"C", b"B"], &[3, 0, 0, 0], &[1; 4]);
+
+        let forward = calc_full_research_cost(&candidate, &make_research(&aliases_forward))
+            .expect("forward order cost");
+        assert_eq!(forward.ore.to_bits(), 0.0_f32.to_bits());
+        assert_eq!(forward.power.to_bits(), 60.0_f32.to_bits());
+
+        let reversed = calc_full_research_cost(&candidate, &make_research(&aliases_reversed))
+            .expect("reversed order cost");
+        assert_eq!(reversed.ore.to_bits(), 1.0_f32.to_bits());
+        assert_eq!(reversed.power.to_bits(), 60.0_f32.to_bits());
+    }
+
+    #[test]
+    fn research_cost_obeys_subtree_and_record_gates() {
+        let costs = [
+            (1.0, 10.0),
+            (2.0, 20.0),
+            (3.0, 30.0),
+            (4.0, 40.0),
+            (5.0, 50.0),
+        ];
+        let names: [&[u8]; 5] = [b"A", b"B", b"C", b"D", b"E"];
+        let aliases: Vec<_> = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (*name, u16::try_from(index).expect("row id")))
+            .collect();
+        let row_alias_links = [0, 1, 2, 3, 4];
+        let relations_45 = [&[][..]; 5];
+        let candidate = research_unit_dat(&[b"A", b"B", b"C", b"B"], &[3, 0, 0, 0], &[1; 4]);
+
+        let recursion_gate = research_cycle_fixture(3, &[0x05, 0x05, 0x05, 0x04, 0x04]);
+        let research = ResearchTrfDocument::decode(Arc::from(recursion_gate.into_boxed_slice()))
+            .expect("recursion-gate TRF");
+        assert_eq!(
+            calc_full_research_cost(&candidate, &research).expect("cost"),
+            ResearchCost {
+                ore: 6.0,
+                power: 60.0
+            }
+        );
+
+        let include_gate = research_cycle_fixture(3, &[0x04, 0x05, 0x05, 0x06, 0x04]);
+        let research = ResearchTrfDocument::decode(Arc::from(include_gate.into_boxed_slice()))
+            .expect("include-gate TRF");
+        assert_eq!(
+            calc_full_research_cost(&candidate, &research).expect("cost"),
+            ResearchCost {
+                ore: 6.0,
+                power: 60.0
+            }
+        );
+
+        let no_groups = [&[][..]; 5];
+        let isolated = research_fixture(ResearchFixtureSpec {
+            trf0_attr2: 3,
+            flags: &[0x04; 5],
+            costs: &costs,
+            aliases: &aliases,
+            row_alias_links: &row_alias_links,
+            relations_23: &no_groups,
+            relations_45: &relations_45,
+            include_trf3: true,
+            include_trf5: true,
+            omitted_chunks: &[],
+        });
+        let research = ResearchTrfDocument::decode(Arc::from(isolated.into_boxed_slice()))
+            .expect("isolated TRF");
+        let child_pruned = research_unit_dat(&[b"A", b"B", b"C"], &[1, 1, 0], &[1, 0, 1]);
+        assert_eq!(
+            calc_full_research_cost(&child_pruned, &research).expect("pruned child cost"),
+            ResearchCost {
+                ore: 1.0,
+                power: 10.0
+            }
+        );
+        let root_pruned = research_unit_dat(&[b"A", b"B"], &[1, 0], &[0, 1]);
+        assert_eq!(
+            calc_full_research_cost(&root_pruned, &research).expect("pruned root cost"),
+            ResearchCost {
+                ore: 0.0,
+                power: 0.0
+            }
+        );
+    }
+
+    #[test]
+    fn research_cost_rejects_unknown_keys_unterminated_keys_and_missing_groups() {
+        let costs = [(1.0, 10.0), (2.0, 20.0)];
+        let aliases = [(b"A".as_slice(), 0), (b"B".as_slice(), 1)];
+        let row_alias_links = [0, 1];
+        let no_groups = [&[][..], &[][..]];
+        let make_document = |groups: &[&[u32]]| {
+            let bytes = research_fixture(ResearchFixtureSpec {
+                trf0_attr2: 3,
+                flags: &[0x04; 2],
+                costs: &costs,
+                aliases: &aliases,
+                row_alias_links: &row_alias_links,
+                relations_23: groups,
+                relations_45: &no_groups,
+                include_trf3: true,
+                include_trf5: true,
+                omitted_chunks: &[],
+            });
+            ResearchTrfDocument::decode(Arc::from(bytes.into_boxed_slice()))
+                .expect("research table")
+        };
+
+        let no_group_document = make_document(&[]);
+        let candidate = research_unit_dat(&[b"A"], &[0], &[1]);
+        assert!(matches!(
+            calc_full_research_cost(&candidate, &no_group_document),
+            Err(ResearchError::MissingRelationGroup {
+                type_id,
+                index: 0,
+                group_count: 0
+            }) if type_id == u32::from_le_bytes(*b"TRF2")
+        ));
+
+        let valid_groups = [&[][..], &[][..]];
+        let document = make_document(&valid_groups);
+        let unknown = research_unit_dat(&[b"Z"], &[0], &[1]);
+        assert!(matches!(
+            calc_full_research_cost(&unknown, &document),
+            Err(ResearchError::UnknownResearchKey {
+                component_index: 0,
+                ..
+            })
+        ));
+        let unterminated = research_unit_dat(&[&[b'A'; 32]], &[0], &[1]);
+        assert!(matches!(
+            calc_full_research_cost(&unterminated, &document),
+            Err(ResearchError::MissingCandidateKeyTerminator { component_index: 0 })
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires licensed Part 1 corpus"]
+    fn licensed_scream_trf_and_12hel1_dat_exercise_research_cost() {
+        let root = fixture_root("IS");
+        let trf =
+            std::fs::read(root.join("MISSIONS/SCRIPTS/scream.trf")).expect("licensed scream.trf");
+        let research = ResearchTrfDocument::decode(Arc::from(trf.into_boxed_slice()))
+            .expect("decode licensed research table");
+        assert_eq!(research.row_count(), 368);
+        assert_eq!(research.find_key(b"R_T_02").expect("R_T_02"), Some(205));
+        assert_eq!(research.row_name(205).expect("row 205 name"), b"R_T_02");
+        assert_eq!(
+            &research.row_words(205).expect("row 205 words")[..4],
+            &[0, 0, 0x40A0_0000, 0x4140_0000]
+        );
+        assert_eq!(research.flag_byte(205), Some(0x07));
+        assert!(research
+            .relation_2_3(205)
+            .expect("row 205 TRF2/TRF3 group")
+            .is_empty());
+        assert_eq!(
+            research.relation_4_5(205).expect("row 205 second group"),
+            &[196]
+        );
+
+        let bytes =
+            std::fs::read(root.join("UNITS/UNITS/AI/12hel1.dat")).expect("licensed 12hel1.dat");
+        let candidate = fparkan_prototype::decode_unit_dat(&bytes).expect("decode Unit DAT");
+        calc_full_research_cost(&candidate, &research).expect("calculate candidate research cost");
+    }
+
+    #[test]
+    #[ignore = "requires licensed Part 1 corpus"]
+    fn licensed_part1_research_trf_files_all_decode() {
+        fn collect_trf_files(directory: &std::path::Path, files: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(directory).expect("read licensed directory") {
+                let entry = entry.expect("read directory entry");
+                let path = entry.path();
+                let kind = entry.file_type().expect("read entry type");
+                if kind.is_dir() {
+                    collect_trf_files(&path, files);
+                } else if !kind.is_symlink()
+                    && path
+                        .extension()
+                        .map(|extension| extension.to_string_lossy().eq_ignore_ascii_case("trf"))
+                        .unwrap_or(false)
+                {
+                    files.push(path);
+                }
+            }
+        }
+
+        let root = fixture_root("IS");
+        let mut files = Vec::new();
+        collect_trf_files(&root, &mut files);
+        files.sort();
+        assert!(!files.is_empty(), "licensed corpus contains no .trf files");
+        for path in files {
+            let bytes = std::fs::read(&path).expect("read TRF resource");
+            ResearchTrfDocument::decode(Arc::from(bytes.into_boxed_slice()))
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        }
+    }
+
+    const RESEARCH_TEST_TAIL: &[u8] = &[0xA5, 0x5A];
+
+    struct ResearchFixtureSpec<'a> {
+        trf0_attr2: u32,
+        flags: &'a [u8],
+        costs: &'a [(f32, f32)],
+        aliases: &'a [(&'a [u8], u16)],
+        row_alias_links: &'a [u16],
+        relations_23: &'a [&'a [u32]],
+        relations_45: &'a [&'a [u32]],
+        include_trf3: bool,
+        include_trf5: bool,
+        omitted_chunks: &'a [u32],
+    }
+
+    fn research_fixture(spec: ResearchFixtureSpec<'_>) -> Vec<u8> {
+        assert_eq!(spec.costs.len(), spec.row_alias_links.len());
+
+        let mut rows = Vec::with_capacity(spec.costs.len());
+        for ((ore, power), pair_index) in spec.costs.iter().zip(spec.row_alias_links) {
+            let mut row = [0_u32; 10];
+            row[0] = power.to_bits();
+            row[1] = ore.to_bits();
+            row[8] = 0x09FF_0000 | u32::from(*pair_index);
+            rows.push(row);
+        }
+        let rows_payload = research_words_payload(
+            &rows
+                .iter()
+                .flat_map(|row| row.iter().copied())
+                .collect::<Vec<_>>(),
+        );
+
+        let mut name_pool = Vec::new();
+        let mut pairs = Vec::with_capacity(spec.aliases.len());
+        for (name, row_index) in spec.aliases {
+            let name_offset = u16::try_from(name_pool.len()).expect("test pool offset");
+            name_pool.extend_from_slice(name);
+            name_pool.push(0);
+            pairs.push((name_offset, *row_index));
+        }
+        let pairs_payload = research_pairs_payload(&pairs);
+        let (counts_23, ids_23) = research_relation_payload(spec.relations_23);
+        let (counts_45, ids_45) = research_relation_payload(spec.relations_45);
+        let with_tail = |mut payload: Vec<u8>| {
+            payload.extend_from_slice(RESEARCH_TEST_TAIL);
+            payload
+        };
+
+        let mut payloads = vec![
+            (
+                u32::from_le_bytes(*b"TRF0"),
+                with_tail(rows_payload),
+                spec.trf0_attr2,
+            ),
+            (u32::from_le_bytes(*b"TRF1"), spec.flags.to_vec(), 0),
+            (u32::from_le_bytes(*b"TRFB"), with_tail(pairs_payload), 0),
+            (u32::from_le_bytes(*b"TRF6"), name_pool, 0),
+            (u32::from_le_bytes(*b"TRF7"), Vec::new(), 0),
+            (u32::from_le_bytes(*b"TRF8"), Vec::new(), 0),
+            (u32::from_le_bytes(*b"TRF9"), Vec::new(), 0),
+            (u32::from_le_bytes(*b"TRFA"), Vec::new(), 0),
+            (u32::from_le_bytes(*b"TRF2"), with_tail(counts_23), 0),
+            (u32::from_le_bytes(*b"TRF4"), with_tail(counts_45), 0),
+        ];
+        if spec.include_trf3 {
+            payloads.push((u32::from_le_bytes(*b"TRF3"), with_tail(ids_23), 0));
+        }
+        if spec.include_trf5 {
+            payloads.push((u32::from_le_bytes(*b"TRF5"), with_tail(ids_45), 0));
+        }
+
+        let entries: Vec<_> = payloads
+            .iter()
+            .filter(|(type_id, _, _)| !spec.omitted_chunks.contains(type_id))
+            .map(|(type_id, payload, attr2)| TestNresEntry {
+                name: b"ResTree",
+                payload,
+                type_id: *type_id,
+                attr2: *attr2,
+            })
+            .collect();
+        let mut archive = build_nres_with_meta(&entries);
+        for (type_id, count) in [
+            (u32::from_le_bytes(*b"TRF0"), spec.costs.len()),
+            (u32::from_le_bytes(*b"TRF1"), spec.flags.len()),
+            (u32::from_le_bytes(*b"TRFB"), spec.aliases.len()),
+            (u32::from_le_bytes(*b"TRF2"), spec.relations_23.len()),
+            (u32::from_le_bytes(*b"TRF4"), spec.relations_45.len()),
+        ] {
+            if !spec.omitted_chunks.contains(&type_id) {
+                research_set_nres_attr1(
+                    &mut archive,
+                    type_id,
+                    u32::try_from(count).expect("test count"),
+                );
+            }
+        }
+        if spec.include_trf3 && !spec.omitted_chunks.contains(&u32::from_le_bytes(*b"TRF3")) {
+            let count: usize = spec.relations_23.iter().map(|group| group.len()).sum();
+            research_set_nres_attr1(
+                &mut archive,
+                u32::from_le_bytes(*b"TRF3"),
+                u32::try_from(count).expect("test dependency count"),
+            );
+        }
+        if spec.include_trf5 && !spec.omitted_chunks.contains(&u32::from_le_bytes(*b"TRF5")) {
+            let count: usize = spec.relations_45.iter().map(|group| group.len()).sum();
+            research_set_nres_attr1(
+                &mut archive,
+                u32::from_le_bytes(*b"TRF5"),
+                u32::try_from(count).expect("test dependency count"),
+            );
+        }
+        archive
+    }
+
+    fn research_relation_payload(groups: &[&[u32]]) -> (Vec<u8>, Vec<u8>) {
+        let counts: Vec<_> = groups
+            .iter()
+            .map(|group| u32::try_from(group.len()).expect("test dependency group count"))
+            .collect();
+        let ids: Vec<_> = groups
+            .iter()
+            .flat_map(|group| group.iter().copied())
+            .collect();
+        (
+            research_words_payload(&counts),
+            research_words_payload(&ids),
+        )
+    }
+
+    fn research_set_payload_bytes(bytes: &mut [u8], type_id: u32, offset: usize, value: &[u8]) {
+        let entry_count = u32::from_le_bytes(bytes[8..12].try_into().expect("entry count"));
+        let total_size = u32::from_le_bytes(bytes[12..16].try_into().expect("total size"));
+        let directory_start = usize::try_from(total_size - entry_count * 64).expect("directory");
+        for entry in bytes[directory_start..].chunks_exact(64) {
+            if u32::from_le_bytes(entry[..4].try_into().expect("type id")) != type_id {
+                continue;
+            }
+            let payload_start = usize::try_from(u32::from_le_bytes(
+                entry[56..60].try_into().expect("payload offset"),
+            ))
+            .expect("payload offset");
+            let payload_len = usize::try_from(u32::from_le_bytes(
+                entry[12..16].try_into().expect("payload size"),
+            ))
+            .expect("payload size");
+            let end = offset.checked_add(value.len()).expect("payload end");
+            assert!(end <= payload_len, "test mutation stays within payload");
+            bytes[payload_start + offset..payload_start + end].copy_from_slice(value);
+            return;
+        }
+        panic!("NRes entry type {type_id:#010x} was not built");
+    }
+
+    fn research_set_payload_byte(bytes: &mut [u8], type_id: u32, offset: usize, value: u8) {
+        research_set_payload_bytes(bytes, type_id, offset, &[value]);
+    }
+
+    fn research_set_payload_u16(bytes: &mut [u8], type_id: u32, offset: usize, value: u16) {
+        research_set_payload_bytes(bytes, type_id, offset, &value.to_le_bytes());
+    }
+
+    fn research_set_payload_u32(bytes: &mut [u8], type_id: u32, offset: usize, value: u32) {
+        research_set_payload_bytes(bytes, type_id, offset, &value.to_le_bytes());
+    }
+
+    fn research_cycle_fixture(trf0_attr2: u32, flags: &[u8]) -> Vec<u8> {
+        let costs = [
+            (1.0_f32, 10.0_f32),
+            (2.0_f32, 20.0_f32),
+            (3.0_f32, 30.0_f32),
+            (4.0_f32, 40.0_f32),
+            (5.0_f32, 50.0_f32),
+        ];
+        let mut pool = Vec::new();
+        let mut pairs = Vec::new();
+        let mut rows = Vec::new();
+        for (index, ((ore, power), name)) in costs
+            .iter()
+            .zip([b"A".as_slice(), b"B", b"C", b"D", b"E"])
+            .enumerate()
+        {
+            let offset = u16::try_from(pool.len()).expect("pool offset");
+            pool.extend_from_slice(name);
+            pool.push(0);
+            pairs.push((offset, u16::try_from(index).expect("row index")));
+            rows.push([
+                power.to_bits(),
+                ore.to_bits(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0x09FF_0000 | u32::try_from(index).expect("pair index"),
+                0,
+            ]);
+        }
+
+        let rows_payload = research_words_payload(
+            &rows
+                .iter()
+                .flat_map(|row| row.iter().copied())
+                .collect::<Vec<_>>(),
+        );
+        let pairs_payload = research_pairs_payload(&pairs);
+        let count_23 = [2_u32, 0, 0, 1, 1];
+        let ids_23 = [3_u32, 1, 4, 0];
+        let count_45 = [0_u32; 5];
+        let count_23_payload = research_words_payload(&count_23);
+        let ids_23_payload = research_words_payload(&ids_23);
+        let count_45_payload = research_words_payload(&count_45);
+        let payloads: [(u32, &[u8], u32); 11] = [
+            (
+                u32::from_le_bytes(*b"TRF0"),
+                rows_payload.as_slice(),
+                trf0_attr2,
+            ),
+            (u32::from_le_bytes(*b"TRF1"), flags, 0),
+            (u32::from_le_bytes(*b"TRFB"), pairs_payload.as_slice(), 0),
+            (u32::from_le_bytes(*b"TRF6"), pool.as_slice(), 0),
+            (u32::from_le_bytes(*b"TRF7"), &[][..], 0),
+            (u32::from_le_bytes(*b"TRF8"), &[][..], 0),
+            (u32::from_le_bytes(*b"TRF9"), &[][..], 0),
+            (u32::from_le_bytes(*b"TRFA"), &[][..], 0),
+            (u32::from_le_bytes(*b"TRF2"), &count_23_payload, 0),
+            (u32::from_le_bytes(*b"TRF3"), &ids_23_payload, 0),
+            (u32::from_le_bytes(*b"TRF4"), &count_45_payload, 0),
+        ];
+        let entries: Vec<_> = payloads
+            .iter()
+            .map(|(type_id, payload, attr2)| TestNresEntry {
+                name: b"ResTree",
+                payload,
+                type_id: *type_id,
+                attr2: *attr2,
+            })
+            .collect();
+        let mut archive = build_nres_with_meta(&entries);
+        for (type_id, count) in [
+            (u32::from_le_bytes(*b"TRF0"), 5),
+            (u32::from_le_bytes(*b"TRF1"), 5),
+            (u32::from_le_bytes(*b"TRFB"), 5),
+            (u32::from_le_bytes(*b"TRF2"), 5),
+            (u32::from_le_bytes(*b"TRF3"), 3),
+            (u32::from_le_bytes(*b"TRF4"), 5),
+        ] {
+            research_set_nres_attr1(&mut archive, type_id, count);
+        }
+        archive
+    }
+
+    fn research_words_payload(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|word| word.to_le_bytes()).collect()
+    }
+
+    fn research_pairs_payload(pairs: &[(u16, u16)]) -> Vec<u8> {
+        pairs
+            .iter()
+            .flat_map(|(offset, index)| offset.to_le_bytes().into_iter().chain(index.to_le_bytes()))
+            .collect()
+    }
+
+    fn research_set_nres_attr1(bytes: &mut [u8], type_id: u32, count: u32) {
+        let entry_count = u32::from_le_bytes(bytes[8..12].try_into().expect("entry count"));
+        let total_size = u32::from_le_bytes(bytes[12..16].try_into().expect("total size"));
+        let directory_start = usize::try_from(total_size - entry_count * 64).expect("directory");
+        for entry in bytes[directory_start..].chunks_exact_mut(64) {
+            if u32::from_le_bytes(entry[..4].try_into().expect("type id")) == type_id {
+                entry[4..8].copy_from_slice(&count.to_le_bytes());
+                return;
+            }
+        }
+        panic!("NRes entry type {type_id:#010x} was not built");
+    }
+
+    fn research_unit_dat(
+        keys: &[&[u8]],
+        child_counts: &[u32],
+        kinds: &[u32],
+    ) -> fparkan_prototype::UnitDat {
+        assert_eq!(keys.len(), child_counts.len());
+        assert_eq!(keys.len(), kinds.len());
+        let mut bytes = vec![0; 8 + keys.len() * 112];
+        bytes[..4].copy_from_slice(&0x0000_F0F1_u32.to_le_bytes());
+        for (index, key) in keys.iter().enumerate() {
+            let offset = 8 + index * 112;
+            bytes[offset + 32..offset + 32 + key.len()].copy_from_slice(key);
+            bytes[offset + 64..offset + 68].copy_from_slice(&kinds[index].to_le_bytes());
+            bytes[offset + 108..offset + 112].copy_from_slice(&child_counts[index].to_le_bytes());
+        }
+        fparkan_prototype::decode_unit_dat(&bytes).expect("candidate Unit DAT")
     }
 
     fn resource_device_record(tag: u32, key: u32, base_bits: u32) -> PreparedControlTypedRecord {

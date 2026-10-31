@@ -177,7 +177,11 @@ token и типизированную `float`/`DWORD` ячейку. Неизве
 всей цепочки кампании. Обычная `Single.01` доходит до следующего blocker-а:
 `Handler(43)` в clan 1, `Init` instruction 10. Rust не перескакивает его;
 preview оставляет varset этого клана на defaults, а полный load завершает ошибкой
-с rollback. Это ещё не загрузка/запуск игры и не общий dispatcher.
+с rollback. Для самого расчёта уже есть отдельный bounded reader research-таблицы
+и pure ore/power core в `fparkan-assets`. Они принимают один Unit DAT и не
+исполняют script instruction: runtime по-прежнему не создаёт владельца живого
+контекста, не перечисляет AI candidates и не выбирает результат Handler(43).
+Это ещё не загрузка/запуск игры и не общий dispatcher.
 
 Для GOG-сборки также найден статический host call path в `Init`. В
 `iron3d.dll!FUN_1005ff40` (RVA `0x5ff40`) одна ветвь сначала проходит записи
@@ -752,15 +756,36 @@ command/event captures для меню, HUD, briefing и диалогов.
 
 ## Research, economy and properties
 
-Экспорты `LoadResearch`, `CalcFullResearchCost`, TRF/preload resources и TMA
-properties доказывают отдельный слой исследований, стоимости, добычи и
-производственных параметров. Формулы стоимости, dependency graph технологий,
-inventory/economy transitions и точная типизация всех 16-byte property values
-не закрыты.
+Для GOG `ArealMap.dll` SHA-256
+`a25f9254ebb339d70e2e07c8121950191e9584ca0858d8e9c2e2b6c671edf6ea`
+`CalcFullResearchCost` по RVA `0x16280` имеет подтверждённый ABI
+stdcall `[context, candidate, out1, out2]`, `RET 0x10`, и восстановленный
+алгоритм для одного candidate tree: zero-kind subtree pruning, direct preorder,
+общая дедупликация, ordered DFS по `TRF2`/`TRF3`, raw gates из `TRF1` и
+последовательное `f32` сложение. Принятый набор из 23 synthetic native cases
+включал Calc и два AI predicate; для контролируемых сравнений x87 word был
+установлен в `0x007f`. У набора synthetic context, поэтому он не измеряет
+реальную миссионную стоимость.
 
-Закрывающий эксперимент: сопоставить research functions с ресурсами и UI,
-снять изменения state на контролируемых покупках/исследованиях и построить
-typed schema свойств по consumers, а не по одному имени.
+`fparkan-assets` декодирует используемые NRes chunks, сохраняя сырые TRF0 words
+и непрозрачные данные. Native cost outputs сопоставлены только с двумя raw
+words: out1 складывает TRF0 word 1 и подписан как ore, out2 складывает word 0
+и подписан как power. Смыслы остальных полей полного 32-byte callback record
+не установлены. Non-ASCII case folding research keys также остаётся открытым;
+Rust явно возвращает unsupported для таких сравнений.
+
+Открыты host binding полного Handler(43), factory/ownership/lifetime реального
+исследовательского context при запуске миссии, AI candidate enumeration и tie
+selection, live x87 policy, inventory/economy transitions и точная типизация
+всех 16-byte TMA property values. Контролируемый тест с настоящими
+`scream.trf` и `12hel1.dat` проверяет разбор и API одного candidate, но не
+сравнивает результат с native вызовом реального миссионного context.
+
+Закрывающий эксперимент для оставшихся границ: связать startup owner, research
+context и AI candidate selection в реальном `Init`; затем сравнить контекст,
+порядок кандидатов и cost outputs оригинала с Rust на одной миссии. Покупки,
+inventory transitions и typed property schema требуют отдельных контролируемых
+исследований.
 
 ## Rare branches
 
