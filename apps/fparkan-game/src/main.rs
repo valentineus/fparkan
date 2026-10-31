@@ -9454,6 +9454,7 @@ impl StaticVulkanApp {
             })
             .count();
         eprintln!("render_coverage control_op1_jitter_unsupported={randomized_lights} (using authored color and radius; native RNG sampling pending)");
+        eprintln!("render_coverage fog_pass_eligibility_approx={} (global world fog and horizon RGB; native shade-state/color verification pending)", self.world_range_indices.len());
         for &range_index in &self.world_range_indices {
             let range = self
                 .mesh
@@ -14499,7 +14500,7 @@ mod tests {
     }
 
     #[test]
-    fn captured_native_camera_uses_view_dependent_sky_fog_color() {
+    fn captured_native_camera_selects_view_dependent_screen_horizon_color() {
         use fparkan_fx::atmosphere::{PackedColor, SkySample, SKY_COLOR_COUNT};
 
         // Compact camera fields from the native 1493.337-second AutoDemo capture.
@@ -14521,12 +14522,12 @@ mod tests {
             values: [0.0; 2],
             packed: [PackedColor(0); 2],
         };
-        let fog_color =
+        let horizon_color =
             fparkan_fx::sky::screen_gradient_frame(&sample, camera.native_sky_heading(), [0.0; 3])
                 .color;
 
         assert_eq!(capture.atmosphere_seconds, Some(1493.337));
-        assert_eq!(fog_color, PackedColor(0xFF3E_3E64));
+        assert_eq!(horizon_color, PackedColor(0xFF3E_3E64));
     }
 
     #[test]

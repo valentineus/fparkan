@@ -284,6 +284,9 @@ impl VulkanFrameUniforms {
             .chain([self.fog_start, self.fog_end])
             .chain(self.camera_position)
             .all(f32::is_finite)
+            && (self.fog_end <= self.fog_start
+                || ((self.fog_start * self.fog_start).is_finite()
+                    && (self.fog_end * self.fog_end).is_finite()))
     }
 
     /// Serializes one frame slot in the exact `std140` member order.
@@ -344,7 +347,17 @@ impl VulkanFrameUniforms {
             self.fog_color[2],
             0.0,
         ]);
-        values[84..88].copy_from_slice(&[self.fog_start, self.fog_end, 0.0, 0.0]);
+        let squared_fog_range = if self.fog_end > self.fog_start {
+            [self.fog_start * self.fog_start, self.fog_end * self.fog_end]
+        } else {
+            [0.0; 2]
+        };
+        values[84..88].copy_from_slice(&[
+            self.fog_start,
+            self.fog_end,
+            squared_fog_range[0],
+            squared_fog_range[1],
+        ]);
         values[88..92].copy_from_slice(&[
             self.camera_position[0],
             self.camera_position[1],
@@ -872,6 +885,31 @@ mod static_mesh_tests {
 
         assert_eq!(mesh.indices, vec![0, 1, 2]);
         assert_eq!(mesh.validate(), Ok(()));
+    }
+
+    #[test]
+    fn fog_uniforms_match_live_native_squared_distance_range() {
+        // Terrain ShadeIndexedStrided: far=0x442389e6, far²=0x48d0f1ca;
+        // distance²=0x47707b04 gives visibility=0x3f5b2b94.
+        let frame = VulkanFrameUniforms {
+            fog_start: 0.0,
+            fog_end: f32::from_bits(0x4423_89e6),
+            ..Default::default()
+        };
+        assert!(frame.is_finite());
+        let bytes = frame.to_ne_bytes();
+        let read = |offset| f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        assert_eq!(read(344), 0.0);
+        assert_eq!(read(348).to_bits(), 0x48d0_f1ca);
+        let visibility = 1.0 - (f32::from_bits(0x4770_7b04) - read(344)) / (read(348) - read(344));
+        assert!((visibility - f32::from_bits(0x3f5b_2b94)).abs() < 1.0e-6);
+        assert!(VulkanFrameUniforms::default().is_finite());
+        assert!(!VulkanFrameUniforms {
+            fog_start: 0.0,
+            fog_end: f32::MAX,
+            ..frame
+        }
+        .is_finite());
     }
 
     #[test]

@@ -130,12 +130,13 @@ float native_specular_power(float cosine, float power) {
 }
 
 float native_fog_factor(vec3 world_position) {
-    float fog_span = frame.fog_distances.y - frame.fog_distances.x;
-    float distance_to_camera = distance(world_position, frame.camera_position.xyz);
-    if (fog_span <= 0.000001 || distance_to_camera <= frame.fog_distances.x) {
+    float fog_span_squared = frame.fog_distances.w - frame.fog_distances.z;
+    vec3 to_camera = world_position - frame.camera_position.xyz;
+    float distance_squared = dot(to_camera, to_camera);
+    if (fog_span_squared <= 0.000001 || distance_squared <= frame.fog_distances.z) {
         return 0.0;
     }
-    return clamp((distance_to_camera - frame.fog_distances.x) / fog_span, 0.0, 1.0);
+    return clamp((distance_squared - frame.fog_distances.z) / fog_span_squared, 0.0, 1.0);
 }
 
 vec3 normalized_or(vec3 value, vec3 fallback) {
