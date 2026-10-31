@@ -1333,6 +1333,12 @@ pub struct VulkanSmokeRendererReport {
     pub readback_byte_count: u64,
     /// Stable FNV-1a hash of the final completed readback artifact.
     pub readback_fnv1a64: u64,
+    /// Vertex bytes written by dynamic geometry uploads, excluding initialization.
+    pub mesh_vertex_upload_bytes: u64,
+    /// Index bytes written by dynamic geometry uploads, excluding initialization.
+    pub mesh_index_upload_bytes: u64,
+    /// Bytes the same updates would write without retaining unchanged prefixes.
+    pub mesh_full_upload_bytes: u64,
 }
 
 /// Measured validation counters from the live smoke loop.

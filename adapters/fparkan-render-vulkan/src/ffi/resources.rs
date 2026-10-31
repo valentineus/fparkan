@@ -243,18 +243,25 @@ pub(super) fn create_vertex_buffer(
 
 /// Replaces the bytes of a host-visible static vertex allocation.
 ///
-/// The live renderer waits for the device before calling this helper, so a
+/// The live renderer waits for submitted readers before calling this helper, so a
 /// single shared allocation can safely carry camera-relative sky and weather
 /// geometry between frames.
 pub(super) fn write_static_mesh_vertex_buffer(
     device: &VulkanLogicalDeviceProbe,
     buffer: &VulkanAllocatedBuffer,
+    first_vertex: usize,
     vertices: &[super::VulkanStaticVertex],
 ) -> Result<(), VulkanSmokeRendererError> {
     let bytes = encode_static_vertices(vertices)?;
+    let offset = first_vertex
+        .checked_mul(14 * std::mem::size_of::<f32>())
+        .ok_or(VulkanSmokeRendererError::InvalidStaticMesh {
+            context: "static mesh vertex upload offset overflows address space",
+        })?;
     write_mapped_buffer(
         device,
         buffer,
+        offset,
         &bytes,
         "vkMapMemory(static mesh vertex update)",
     )
@@ -295,29 +302,28 @@ fn encode_static_vertices(
 fn write_mapped_buffer(
     device: &VulkanLogicalDeviceProbe,
     buffer: &VulkanAllocatedBuffer,
+    offset: usize,
     bytes: &[u8],
     context: &'static str,
 ) -> Result<(), VulkanSmokeRendererError> {
-    let byte_len =
-        u64::try_from(bytes.len()).map_err(|_| VulkanSmokeRendererError::InvalidStaticMesh {
-            context: "static mesh upload exceeds address space",
-        })?;
-    if byte_len == 0 {
-        return Err(VulkanSmokeRendererError::InvalidStaticMesh {
-            context: "static mesh upload cannot be empty",
-        });
+    if bytes.is_empty() {
+        return Ok(());
     }
     // SAFETY: The caller validates that the allocation is large enough and
     // waits for all queue work that could read it before this write.
     let mapped = unsafe {
-        device
-            .device()
-            .map_memory(buffer.memory, 0, byte_len, vk::MemoryMapFlags::empty())
+        device.device().map_memory(
+            buffer.memory,
+            0,
+            vk::WHOLE_SIZE,
+            vk::MemoryMapFlags::empty(),
+        )
     }
     .map_err(|result| VulkanSmokeRendererError::VulkanOperation { context, result })?;
-    // SAFETY: `mapped` covers exactly the byte slice copied below.
+    // SAFETY: The caller bounds the upload against the allocation. Mapping
+    // from zero also meets minMemoryMapAlignment for arbitrary vertex offsets.
     unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>(), bytes.len());
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.cast::<u8>().add(offset), bytes.len());
         device.device().unmap_memory(buffer.memory);
     }
     Ok(())
@@ -351,12 +357,19 @@ pub(super) fn create_index_buffer(
 pub(super) fn write_static_mesh_index_buffer(
     device: &VulkanLogicalDeviceProbe,
     buffer: &VulkanAllocatedBuffer,
+    first_index: usize,
     indices: &[u32],
 ) -> Result<(), VulkanSmokeRendererError> {
     let bytes = encode_static_indices(indices)?;
+    let offset = first_index.checked_mul(std::mem::size_of::<u32>()).ok_or(
+        VulkanSmokeRendererError::InvalidStaticMesh {
+            context: "static mesh index upload offset overflows address space",
+        },
+    )?;
     write_mapped_buffer(
         device,
         buffer,
+        offset,
         &bytes,
         "vkMapMemory(static mesh index update)",
     )

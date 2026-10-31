@@ -4638,6 +4638,7 @@ fn multiply_row_major(left: [f32; 16], right: [f32; 16]) -> [f32; 16] {
 
 struct StaticPreviewScene {
     mesh: VulkanStaticMesh,
+    dynamic_vertex_start: usize,
     terrain_lod: Option<terrain_lod::TerrainLodDraws>,
     native_handedness_by_range: HashMap<usize, i8>,
     type16_present_ranges: HashSet<usize>,
@@ -8052,6 +8053,7 @@ fn static_preview_mesh_and_materials(
         &terrain_materials,
         Some(&mut material_animations),
     )?;
+    let dynamic_vertex_start = mesh.vertices.len();
     let mut mesh_components = 0;
     for (object_index, mission_root) in roots.iter().enumerate() {
         let visual_ids = assets.visuals_for_object(object_index);
@@ -8539,6 +8541,7 @@ fn static_preview_mesh_and_materials(
     let shadow_material_index = append_shadow_material(&mut materials)?;
     Ok(StaticPreviewScene {
         mesh,
+        dynamic_vertex_start,
         terrain_lod,
         native_handedness_by_range,
         type16_present_ranges,
@@ -9352,6 +9355,7 @@ fn run_static_vulkan_mode(
 
 struct StaticVulkanApp {
     mesh: VulkanStaticMesh,
+    dynamic_vertex_start: usize,
     terrain_lod: Option<terrain_lod::TerrainLodDraws>,
     native_handedness_by_range: HashMap<usize, i8>,
     type16_present_ranges: HashSet<usize>,
@@ -9459,6 +9463,7 @@ impl StaticVulkanApp {
             .collect();
         Self {
             mesh: preview.mesh,
+            dynamic_vertex_start: preview.dynamic_vertex_start,
             terrain_lod: preview.terrain_lod,
             native_handedness_by_range: preview.native_handedness_by_range,
             type16_present_ranges: preview.type16_present_ranges,
@@ -9849,6 +9854,7 @@ impl StaticVulkanApp {
 
     fn update_shadow(
         mesh: &mut VulkanStaticMesh,
+        dynamic_vertex_start: usize,
         shadow_cache: &mut ShadowPageCache,
         shadow_casters: &[ShadowCaster],
         shadow_receivers: &[ShadowTriangle],
@@ -9894,7 +9900,13 @@ impl StaticVulkanApp {
             *uploaded_shadow_atlas = atlas;
         }
         renderer
-            .update_mesh_geometry(&mesh.vertices, &mesh.indices, &[geometry])
+            .update_mesh_geometry(
+                &mesh.vertices,
+                &mesh.indices,
+                &[geometry],
+                dynamic_vertex_start,
+                shadow_base_index,
+            )
             .map_err(|error| format!("upload environment and shadow geometry: {error}"))?;
         Ok(ShadowFrameEvidence {
             visible_casters: visible_casters.len(),
@@ -10444,6 +10456,7 @@ impl StaticVulkanApp {
                 .ok_or_else(|| "projected shadow material is out of bounds".to_string())?;
             self.shadow_last_evidence = Self::update_shadow(
                 &mut self.mesh,
+                self.dynamic_vertex_start,
                 &mut self.shadow_cache,
                 &self.shadow_casters,
                 &self.shadow_receivers,
@@ -10468,6 +10481,7 @@ impl StaticVulkanApp {
                 .ok_or_else(|| "projected shadow material is out of bounds".to_string())?;
             self.shadow_last_evidence = Self::update_shadow(
                 &mut self.mesh,
+                self.dynamic_vertex_start,
                 &mut self.shadow_cache,
                 &self.shadow_casters,
                 &self.shadow_receivers,
@@ -10596,6 +10610,12 @@ impl StaticVulkanApp {
                     viewport.rect, viewport.extent[0], viewport.extent[1]
                 )
             },
+        );
+        eprintln!(
+            "render_geometry_upload vertex_bytes={} index_bytes={} full_upload_bytes={}",
+            report.renderer_report.mesh_vertex_upload_bytes,
+            report.renderer_report.mesh_index_upload_bytes,
+            report.renderer_report.mesh_full_upload_bytes,
         );
         self.output = Some(format!(
             "rendered mission {}: {} frames, {} objects, {} mesh components, {} terrain components, camera={}, captured_viewport_crop={}, control_clock_ms={}, control_clock_mode={}, materials={}, environment_primitives={}, shadow_casters={}, shadow_indices={}, swapchain_recreates={}, validation={}, swapchain_format={}, readback_format={}, readback={}, readback_sequence={}, startup_ms={{mission_assets:{:.1},terrain_materials:{:.1},sky:{:.1},gpu_initialization:{:.1}}}",
@@ -13616,6 +13636,7 @@ mod tests {
         let view_camera = free_camera.preview_frame(16.0 / 9.0);
         let preview = StaticPreviewScene {
             terrain_lod: None,
+            dynamic_vertex_start: 3,
             mesh: VulkanStaticMesh {
                 vertices: [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
                     .into_iter()

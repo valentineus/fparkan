@@ -464,6 +464,9 @@ impl VulkanSmokeRenderer {
                 readback_copy_count: 0,
                 readback_byte_count: 0,
                 readback_fnv1a64: 0,
+                mesh_vertex_upload_bytes: 0,
+                mesh_index_upload_bytes: 0,
+                mesh_full_upload_bytes: 0,
             },
         };
         renderer.rebuild_swapchain_resources(false)?;
@@ -495,6 +498,9 @@ impl VulkanSmokeRenderer {
             readback_copy_count: 0,
             readback_byte_count: 0,
             readback_fnv1a64: 0,
+            mesh_vertex_upload_bytes: 0,
+            mesh_index_upload_bytes: 0,
+            mesh_full_upload_bytes: 0,
         };
         Ok(renderer)
     }
@@ -628,7 +634,7 @@ impl VulkanSmokeRenderer {
     ///
     /// The initial mesh owns enough vertices for the scene's dynamic slots;
     /// callers update those slots in place as camera-relative environment
-    /// geometry moves.  The device is idled before the host-visible write so
+    /// geometry moves. Submitted readers finish before the host-visible write so
     /// no submitted command can observe a partial update.
     pub fn update_vertices(
         &mut self,
@@ -639,15 +645,8 @@ impl VulkanSmokeRenderer {
                 context: "updated static mesh vertex count differs from allocation",
             });
         }
-        // SAFETY: The renderer owns the queue and all submitted work; waiting
-        // for idle makes the shared vertex allocation quiescent.
-        unsafe { self.device_ref()?.device().device_wait_idle() }.map_err(|result| {
-            VulkanSmokeRendererError::VulkanOperation {
-                context: "vkDeviceWaitIdle(static mesh vertex update)",
-                result,
-            }
-        })?;
-        write_static_mesh_vertex_buffer(self.device_ref()?, self.vertex_buffer_ref()?, vertices)
+        self.wait_for_submitted_frames()?;
+        write_static_mesh_vertex_buffer(self.device_ref()?, self.vertex_buffer_ref()?, 0, vertices)
     }
 
     /// Uploads the current shared mesh while retaining dynamic draw state.
@@ -658,6 +657,9 @@ impl VulkanSmokeRenderer {
     /// transparency classification, and active counts owned by other setters
     /// remain untouched. The allocations grow to the largest submitted frame
     /// and never grow for a frame that fits the retained capacity.
+    /// `unchanged_vertices` and `unchanged_indices` retain prefixes already
+    /// uploaded by the caller; only the remaining suffixes are written. A
+    /// growing allocation receives the full slice, including its prefix.
     ///
     /// A range with `index_count == 0` is valid and disables that range for the
     /// frame. The mesh itself still needs at least one vertex and one index so
@@ -667,6 +669,8 @@ impl VulkanSmokeRenderer {
         vertices: &[super::VulkanStaticVertex],
         indices: &[u32],
         geometry_ranges: &[super::VulkanDynamicDrawRange],
+        unchanged_vertices: usize,
+        unchanged_indices: usize,
     ) -> Result<(), VulkanSmokeRendererError> {
         validate_geometry_upload(
             vertices,
@@ -676,19 +680,17 @@ impl VulkanSmokeRenderer {
             self.vertex_count,
             self.index_capacity,
         )?;
+        let vertex_upload =
+            geometry_upload_range(vertices.len(), unchanged_vertices, self.vertex_count)?;
+        let index_upload =
+            geometry_upload_range(indices.len(), unchanged_indices, self.index_capacity)?;
 
         let vertex_grew = vertices.len() > self.vertex_count;
         let index_grew = indices.len() > self.index_capacity;
 
-        // SAFETY: The renderer owns the queue and all submitted work. Waiting
-        // before either writing or replacing a shared allocation keeps old
-        // command buffers from observing a partial upload.
-        unsafe { self.device_ref()?.device().device_wait_idle() }.map_err(|result| {
-            VulkanSmokeRendererError::VulkanOperation {
-                context: "vkDeviceWaitIdle(dynamic mesh update)",
-                result,
-            }
-        })?;
+        if !vertex_upload.is_empty() || !index_upload.is_empty() {
+            self.wait_for_submitted_frames()?;
+        }
 
         let (new_vertex_buffer, new_index_buffer) = if vertex_grew || index_grew {
             let instance = self.instance_ref()?;
@@ -712,9 +714,12 @@ impl VulkanSmokeRenderer {
                 None
             };
             if !vertex_grew {
-                if let Err(error) =
-                    write_static_mesh_vertex_buffer(device, self.vertex_buffer_ref()?, vertices)
-                {
+                if let Err(error) = write_static_mesh_vertex_buffer(
+                    device,
+                    self.vertex_buffer_ref()?,
+                    vertex_upload.start,
+                    &vertices[vertex_upload.clone()],
+                ) {
                     if let Some(buffer) = new_vertex_buffer.as_ref() {
                         destroy_allocated_buffer(device, buffer);
                     }
@@ -725,9 +730,12 @@ impl VulkanSmokeRenderer {
                 }
             }
             if !index_grew {
-                if let Err(error) =
-                    write_static_mesh_index_buffer(device, self.index_buffer_ref()?, indices)
-                {
+                if let Err(error) = write_static_mesh_index_buffer(
+                    device,
+                    self.index_buffer_ref()?,
+                    index_upload.start,
+                    &indices[index_upload.clone()],
+                ) {
                     if let Some(buffer) = new_vertex_buffer.as_ref() {
                         destroy_allocated_buffer(device, buffer);
                     }
@@ -740,8 +748,18 @@ impl VulkanSmokeRenderer {
             (new_vertex_buffer, new_index_buffer)
         } else {
             let device = self.device_ref()?;
-            write_static_mesh_vertex_buffer(device, self.vertex_buffer_ref()?, vertices)?;
-            write_static_mesh_index_buffer(device, self.index_buffer_ref()?, indices)?;
+            write_static_mesh_vertex_buffer(
+                device,
+                self.vertex_buffer_ref()?,
+                vertex_upload.start,
+                &vertices[vertex_upload.clone()],
+            )?;
+            write_static_mesh_index_buffer(
+                device,
+                self.index_buffer_ref()?,
+                index_upload.start,
+                &indices[index_upload.clone()],
+            )?;
             (None, None)
         };
 
@@ -767,6 +785,19 @@ impl VulkanSmokeRenderer {
             geometry_ranges,
             &mut self.draw_order_dirty,
         );
+        self.report.mesh_vertex_upload_bytes = self
+            .report
+            .mesh_vertex_upload_bytes
+            .saturating_add((vertex_upload.len() as u64).saturating_mul(56));
+        self.report.mesh_index_upload_bytes = self
+            .report
+            .mesh_index_upload_bytes
+            .saturating_add((index_upload.len() as u64).saturating_mul(4));
+        self.report.mesh_full_upload_bytes = self
+            .report
+            .mesh_full_upload_bytes
+            .saturating_add((vertices.len() as u64).saturating_mul(56))
+            .saturating_add((indices.len() as u64).saturating_mul(4));
         Ok(())
     }
 
@@ -776,7 +807,7 @@ impl VulkanSmokeRenderer {
     ///
     /// The updated image must have the same dimensions and generated/authored
     /// mip count as the texture allocated during renderer creation.  The
-    /// renderer idles its device before the transfer, so callers may invoke
+    /// renderer waits for submitted readers before the transfer, so callers may invoke
     /// this between frame updates without taking ownership of Vulkan handles.
     pub fn update_material_texture(
         &mut self,
@@ -807,17 +838,7 @@ impl VulkanSmokeRenderer {
                 context: "dynamic material texture index is out of bounds",
             });
         }
-        {
-            let device = self.device_ref()?;
-            // SAFETY: every submission made by this renderer uses this device; the
-            // idle wait makes all descriptor image reads quiescent before upload.
-            unsafe { device.device().device_wait_idle() }.map_err(|result| {
-                VulkanSmokeRendererError::VulkanOperation {
-                    context: "vkDeviceWaitIdle(dynamic texture update)",
-                    result,
-                }
-            })?;
-        }
+        self.wait_for_submitted_frames()?;
         let shared_texture = self
             .texture_slot_indices
             .iter()
@@ -1388,6 +1409,24 @@ impl VulkanSmokeRenderer {
             })
     }
 
+    fn wait_for_submitted_frames(&self) -> Result<(), VulkanSmokeRendererError> {
+        let fences: Vec<_> = self.frame_sync.iter().map(|sync| sync.fence).collect();
+        if fences.is_empty() {
+            return Ok(());
+        }
+        // SAFETY: Every graphics submission signals one of these owned fences.
+        // Presentation does not read mesh buffers, textures or descriptor sets.
+        unsafe {
+            self.device_ref()?
+                .device()
+                .wait_for_fences(&fences, true, u64::MAX)
+        }
+        .map_err(|result| VulkanSmokeRendererError::VulkanOperation {
+            context: "vkWaitForFences(shared resource update)",
+            result,
+        })
+    }
+
     /// Draws and presents one indexed-triangle frame.
     ///
     /// # Errors
@@ -1433,14 +1472,7 @@ impl VulkanSmokeRenderer {
         if needs_point_light_growth {
             // Updating every material's binding 6 and replacing the shared
             // SSBO requires all prior command buffers to finish.
-            // SAFETY: The renderer owns the logical device and no submission
-            // can observe the replacement after this idle point.
-            unsafe { self.device_ref()?.device().device_wait_idle() }.map_err(|result| {
-                VulkanSmokeRendererError::VulkanOperation {
-                    context: "vkDeviceWaitIdle(point-light buffer growth)",
-                    result,
-                }
-            })?;
+            self.wait_for_submitted_frames()?;
             let instance =
                 self.instance
                     .as_ref()
@@ -1464,14 +1496,7 @@ impl VulkanSmokeRenderer {
             // The storage buffer is shared by all in-flight frames.  Wait for
             // every prior use before replacing the records so a setter cannot
             // race a vertex shader from the previous frame.
-            // SAFETY: The renderer owns the logical device and no submission
-            // can observe the host write after this idle point.
-            unsafe { self.device_ref()?.device().device_wait_idle() }.map_err(|result| {
-                VulkanSmokeRendererError::VulkanOperation {
-                    context: "vkDeviceWaitIdle(material specular update)",
-                    result,
-                }
-            })?;
+            self.wait_for_submitted_frames()?;
             let resources = self.resources_ref()?;
             write_material_specular_buffer(
                 self.device_ref()?,
@@ -2231,6 +2256,23 @@ impl Drop for VulkanSmokeRenderer {
     }
 }
 
+fn geometry_upload_range(
+    count: usize,
+    unchanged: usize,
+    capacity: usize,
+) -> Result<std::ops::Range<usize>, VulkanSmokeRendererError> {
+    if unchanged > count || unchanged > capacity {
+        return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+            context: "unchanged mesh prefix exceeds uploaded or retained geometry",
+        });
+    }
+    Ok(if count > capacity {
+        0..count
+    } else {
+        unchanged..count
+    })
+}
+
 fn validate_geometry_upload(
     vertices: &[super::VulkanStaticVertex],
     indices: &[u32],
@@ -2572,7 +2614,7 @@ mod tests {
     use super::super::{VulkanDynamicDrawRange, VulkanStaticDrawRange, VulkanStaticMesh};
     use super::{
         apply_geometry_range_updates, apply_world_transparency, completed_readback_buffer_index,
-        draw_material_alphas, mark_draw_order_dirty_on_activity_change,
+        draw_material_alphas, geometry_upload_range, mark_draw_order_dirty_on_activity_change,
         set_and_mark_dirty_if_changed, sorted_world_draw_order,
         take_runtime_children_with_validation_snapshot, take_runtime_owners_in_dependency_order,
         validate_geometry_upload, world_material_pipeline_states, RollbackOnDrop,
@@ -2730,6 +2772,15 @@ mod tests {
         assert_eq!(ranges[0], original);
         assert_eq!(capacities, vec![3, 3]);
         assert_eq!(ranges[1].index_count, 3);
+    }
+
+    #[test]
+    fn geometry_upload_preserves_prefix_until_allocation_grows() {
+        assert_eq!(geometry_upload_range(12, 8, 16), Ok(8..12));
+        assert_eq!(geometry_upload_range(8, 8, 16), Ok(8..8));
+        assert_eq!(geometry_upload_range(20, 8, 16), Ok(0..20));
+        assert!(geometry_upload_range(8, 9, 16).is_err());
+        assert!(geometry_upload_range(20, 17, 16).is_err());
     }
 
     #[test]
