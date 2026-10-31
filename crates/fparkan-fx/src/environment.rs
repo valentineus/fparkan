@@ -590,7 +590,7 @@ impl LightningBounds {
 /// Effect.dll's opcode 1 handler (`1000F6E0`) updates a LightManager record.
 /// The A and B groups are the submitted position and direction, C is the
 /// four-component HDR light color, the scalar pair at body offsets 108 and
-/// 112 is the light range, and body offsets 120, 124, and 128 are the native
+/// 112 is the local light radius, and body offsets 120, 124, and 128 are the native
 /// attenuation coefficients. These values do not describe lightning mesh
 /// geometry or texture coordinates.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -615,8 +615,7 @@ pub struct PointLightFrame {
     pub range: f32,
     /// Native attenuation coefficients `(a0, a1, a2)`.
     pub attenuation: [f32; 3],
-    /// The scalar at body offset 116. Its native role is an effect factor,
-    /// not alpha or a UV parameter, so it is preserved without reinterpretation.
+    /// Radius jitter amplitude at body offset 116; retained but not sampled yet.
     pub effect_factor: f32,
     /// Whether the opcode 1 command is active at `command_time`.
     pub active: bool,
@@ -626,8 +625,8 @@ pub struct PointLightFrame {
 /// applies a parent basis to its local position and direction. `basis` stores
 /// the world-space vectors corresponding to local +X, +Y, and +Z.
 /// `command_time` is resolved by the caller; FX header duration and lifecycle
-/// remain with that caller. The interpolated range is retained as authored;
-/// native Op1 does not clamp it to zero.
+/// remain with that caller. Native Op1 scales the radius by the transformed
+/// direction length and replaces a non-positive result with 0.01.
 #[must_use]
 pub fn evaluate_op1_point_light_with_basis(
     command: &FxCommand,
@@ -677,7 +676,22 @@ pub fn evaluate_op1_point_light_with_basis(
     {
         return None;
     }
-    let direction = normalize_op1_direction(transformed_direction);
+    let direction_length = transformed_direction
+        .into_iter()
+        .map(|component| component * component)
+        .sum::<f32>()
+        .sqrt();
+    // shortcut: Op1 color/radius jitter is omitted; add native RNG sampling
+    // when the reported randomized Control lights are handled in phase R4.
+    let scaled_range = sample.range * direction_length;
+    if !direction_length.is_finite() || !scaled_range.is_finite() {
+        return None;
+    }
+    let direction = if direction_length > 0.0 {
+        transformed_direction.map(|component| component / direction_length)
+    } else {
+        [0.0; 3]
+    };
 
     Some(PointLightFrame {
         effect_type: sample.effect_type,
@@ -688,7 +702,11 @@ pub fn evaluate_op1_point_light_with_basis(
         position,
         direction,
         color: sample.color,
-        range: sample.range,
+        range: if scaled_range <= 0.0 {
+            0.01
+        } else {
+            scaled_range
+        },
         attenuation: sample.attenuation,
         effect_factor: sample.effect_factor,
         active: true,
@@ -720,19 +738,6 @@ fn sample_op1_point_light(body: &[u8], normalized_time: f32) -> Option<Op1PointL
         ],
         effect_factor: read_f32(body, 116)?,
     })
-}
-
-fn normalize_op1_direction(direction: [f32; 3]) -> [f32; 3] {
-    // Native FastProc normalization preserves a degenerate vector as zero;
-    // this path must not invent a fallback axis.
-    let length =
-        (direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2])
-            .sqrt();
-    if length.is_finite() && length > 0.0 {
-        direction.map(|component| component / length)
-    } else {
-        [0.0; 3]
-    }
 }
 
 fn lightning_point_light_direction(local_direction: [f32; 3], basis: [[f32; 3]; 3]) -> [f32; 3] {
@@ -2964,7 +2969,7 @@ mod tests {
     }
 
     #[test]
-    fn generic_opcode1_preserves_negative_native_range() {
+    fn generic_opcode1_clamps_non_positive_scaled_range() {
         let mut command = op1_test_command(5, 0.0, 1.0);
         let mut body = command.raw_body.to_vec();
         body[108..112].copy_from_slice(&(-2.0_f32).to_le_bytes());
@@ -2973,7 +2978,7 @@ mod tests {
 
         let sample = evaluate_op1_point_light_identity(&command, 0.5, [0.0; 3])
             .expect("native Op1 sample with a negative range");
-        assert_eq!(sample.range, -3.0);
+        assert_eq!(sample.range, 0.01);
     }
 
     #[test]
@@ -2986,6 +2991,31 @@ mod tests {
         let sample = evaluate_op1_point_light_identity(&command, 0.5, [0.0; 3])
             .expect("native Op1 sample with a zero direction");
         assert_eq!(sample.direction, [0.0; 3]);
+        assert_eq!(sample.range, 0.01);
+    }
+
+    #[test]
+    fn generic_opcode1_scales_radius_like_live_factory_light() {
+        // Live Effect.dll Op1: authored radius 7, FastProc direction length
+        // 0x409b1f91, submitted LightManager radius 0x4207bb9f.
+        let mut command = op1_test_command(7, 0.75, 1.0);
+        let mut body = command.raw_body.to_vec();
+        body[48..60].copy_from_slice(&[1.0_f32, 0.0, 0.0].map(f32::to_le_bytes).concat());
+        body[112..116].copy_from_slice(&7.0_f32.to_le_bytes());
+        command.raw_body = Arc::from(body.into_boxed_slice());
+        let sample = evaluate_op1_point_light_with_basis(
+            &command,
+            1.0,
+            [0.0; 3],
+            [
+                [f32::from_bits(0x409b_1f91), 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+        )
+        .expect("live factory radius");
+        assert_eq!(sample.range.to_bits(), 0x4207_bb9f);
+        assert_eq!(sample.direction, [1.0, 0.0, 0.0]);
     }
 
     #[test]

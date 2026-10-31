@@ -9440,6 +9440,20 @@ impl StaticVulkanApp {
             })
             .count();
         eprintln!("render_coverage portal_fade_packet_selection_approx={approximate_portals} (first indexed vertex; native CPU clipping selection pending)");
+        let randomized_lights = self
+            .control_point_light_slots
+            .iter()
+            .filter(|slot| {
+                [92..108, 116..120].into_iter().any(|range| {
+                    slot.command.raw_body.get(range).is_some_and(|bytes| {
+                        bytes
+                            .chunks_exact(4)
+                            .any(|word| f32::from_le_bytes(word.try_into().unwrap()) != 0.0)
+                    })
+                })
+            })
+            .count();
+        eprintln!("render_coverage control_op1_jitter_unsupported={randomized_lights} (using authored color and radius; native RNG sampling pending)");
         for &range_index in &self.world_range_indices {
             let range = self
                 .mesh

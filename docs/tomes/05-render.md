@@ -839,7 +839,13 @@ node poses входят в transform до локальной FX basis. Реал�
 охватывают Op3 modes 0–2, Op4, Op7/8 particle pools и Op9 generated mesh. Op1
 selector 1 добавляет point lights без native flag `0x80000000` в общий diffuse
 список; остальные active records сохраняют flags для специальных путей и
-projected shadows. Effect renderer подавляет header bit `0x800` только при
+projected shadows. Радиус источника масштабируется длиной его преобразованного
+направления до нормализации. Например, локальный радиус 7 при масштабе узла
+около 4,85 освещает область радиусом около 34. Потеря этого множителя оставляла
+синий свет завода почти незаметным. Неположительный итог заменяется на 0,01.
+Случайные добавки к цвету и радиусу пока явно считаются в
+`render_coverage control_op1_jitter_unsupported`.
+Effect renderer подавляет header bit `0x800` только при
 render selector 0. Native AniMesh component path захвачен с selector 1, а в
 его 53-entry manager присутствуют FX entries с header `0xD00`; preview
 использует selector 1 и пропускает такие visual commands. Изменения manager
