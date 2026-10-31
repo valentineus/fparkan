@@ -639,6 +639,7 @@ version = "0.1.0"
 dependencies = [
  "fparkan-animation",
  "fparkan-assets",
+ "fparkan-fx",
  "fparkan-msh",
  "fparkan-path",
  "fparkan-platform",

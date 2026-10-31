@@ -2,26 +2,28 @@
 //! Runtime orchestration for mission loading and world stepping.
 
 use fparkan_assets::ClanBody;
-#[cfg(test)]
-use fparkan_assets::PreparedControlResourcePair;
 use fparkan_assets::{
     decode_mission_land_path, decode_mission_payload, decode_nres_payload,
     derive_mission_land_paths, extend_graph_report_with_visual_dependencies,
     mission_script_bundle_bases, prepare_terrain_world, AssetError as AssetPreparationError,
     AssetId, AssetManager, BehaviorProfileRates, BehaviorProfileVarError, BuildCategory,
     MissionAssetPlan, MissionDocument, MissionError, MissionTerrainPaths, NresError,
-    PreparedComponentControl, PreparedControlEffectSection, PreparedControlNodeDataRow,
-    PreparedControlNodeDataTable, PreparedControlTypedRecord, PreparedVisual, ResearchError,
-    ResearchTrfDocument, TerrainFormatError, TerrainPreparationError, TerrainWorld, TmaProfile,
+    PreparedComponentControl, PreparedControlEffectRow, PreparedControlEffectSection,
+    PreparedControlNodeDataRow, PreparedControlNodeDataTable, PreparedControlResourcePair,
+    PreparedControlTypedRecord, PreparedVisual, ResearchError, ResearchTrfDocument,
+    TerrainFormatError, TerrainPreparationError, TerrainWorld, TmaProfile,
 };
+use fparkan_fx::{decode_fxid, FxOpcode, FXID_KIND};
 use fparkan_msh::{node38_metadata, selected_slot, Group, Lod, NodeId};
 use fparkan_path::{normalize_relative, NormalizedPath, PathError, PathPolicy};
 use fparkan_prototype::{
-    build_prototype_graph_report, unit_component_tree, PrototypeGraph, PrototypeGraphFailure,
-    PrototypeGraphReport, UnitComponentRecord, UnitComponentTreeNode, PROTOTYPE_TYPE_EXTO,
-    UNIT_DAT_BAS_PLACEMENT_FLAG,
+    build_prototype_graph_report, resolve_prototype_all, unit_component_tree, PrototypeGraph,
+    PrototypeGraphFailure, PrototypeGraphReport, PrototypeSource, UnitComponentRecord,
+    UnitComponentTreeNode, PROTOTYPE_TYPE_EXTO, UNIT_DAT_BAS_PLACEMENT_FLAG,
 };
-use fparkan_resource::{resource_name, CachedResourceRepository, ResourceKey, ResourceRepository};
+use fparkan_resource::{
+    resource_name, CachedResourceRepository, ResourceError, ResourceKey, ResourceRepository,
+};
 use fparkan_script::{
     FormulaTable, Handler19InitInput, ScriptInitResolution, ScriptInitResolveError,
     ScriptInitWrite, ScriptInstruction, ScriptPackage, VarSet, VarSetDefault,
@@ -205,6 +207,251 @@ pub struct ControlDeviceRecordProvenance {
     pub source: ResourceKey,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct Factory2StringPair {
+    archive: String,
+    name: String,
+}
+
+impl Factory2StringPair {
+    fn empty() -> Self {
+        Self {
+            archive: String::new(),
+            name: String::new(),
+        }
+    }
+
+    fn matches_ascii_case(&self, other: &Self) -> bool {
+        self.archive.eq_ignore_ascii_case(&other.archive)
+            && self.name.eq_ignore_ascii_case(&other.name)
+    }
+
+    fn cache_key(&self) -> Self {
+        Self {
+            archive: self.archive.to_ascii_lowercase(),
+            name: self.name.to_ascii_lowercase(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Factory2PairOutcome {
+    Value(u32),
+    NativeMiss,
+    Unrepresentable,
+}
+
+fn resolve_factory2_pair_from_assets<R: ResourceRepository>(
+    asset_manager: &AssetManager<R>,
+    vfs: &dyn Vfs,
+    pair: &Factory2StringPair,
+) -> Result<Factory2PairOutcome, AssetPreparationError> {
+    if !pair.archive.eq_ignore_ascii_case("objects.rlb")
+        || pair.name.is_empty()
+        || pair
+            .name
+            .bytes()
+            .any(|byte| matches!(byte, b'/' | b'\\' | b'.'))
+        || normalize_relative(pair.name.as_bytes(), PathPolicy::StrictLegacy).is_err()
+    {
+        return Ok(Factory2PairOutcome::Unrepresentable);
+    }
+
+    let root_name = resource_name(pair.name.as_bytes());
+    let prototypes =
+        resolve_prototype_all(asset_manager.repository(), vfs, &root_name).map_err(|source| {
+            AssetPreparationError::InvalidPrototype(format!(
+                "factory-2 pair {}:{}: {source}",
+                pair.archive, pair.name
+            ))
+        })?;
+    let [prototype] = prototypes.as_slice() else {
+        return Ok(Factory2PairOutcome::Unrepresentable);
+    };
+    if prototype.source != PrototypeSource::ObjectsRegistry
+        || prototype.source_type != Some(CONTROL_CLASS_SOURCE_BULL)
+        || !matches!(
+            prototype.geometry,
+            fparkan_prototype::PrototypeGeometry::Mesh(_)
+        )
+    {
+        return Ok(Factory2PairOutcome::Unrepresentable);
+    }
+
+    let assets = asset_manager.prepare_mission_assets(&[0..1], &prototypes)?;
+    let Some(controls) = assets.object_component_controls.first() else {
+        return Ok(Factory2PairOutcome::Unrepresentable);
+    };
+    let [Some(control)] = controls.as_slice() else {
+        return Ok(Factory2PairOutcome::Unrepresentable);
+    };
+    if !control.timeline_rows.is_empty()
+        || !control.typed_records.iter().all(|record| record.tag == 17)
+        || !matches!(
+            &control.effect_section,
+            PreparedControlEffectSection::Absent | PreparedControlEffectSection::Parsed(_)
+        )
+    {
+        return Ok(Factory2PairOutcome::Unrepresentable);
+    }
+    let Some(node_data) = control.node_data.as_ref() else {
+        return Ok(Factory2PairOutcome::Unrepresentable);
+    };
+    let Some(opcodes) = asset_manager.initial_control_effect_opcodes(
+        &control.source,
+        control.model_node_count,
+        0,
+    )?
+    else {
+        return Ok(Factory2PairOutcome::Unrepresentable);
+    };
+    if !opcodes.iter().all(|opcode| matches!(opcode, 1 | 4 | 12)) {
+        return Ok(Factory2PairOutcome::Unrepresentable);
+    }
+    if !factory2_selected_fx_resources_are_representable(asset_manager, control, &opcodes)? {
+        return Ok(Factory2PairOutcome::Unrepresentable);
+    }
+    match factory2_node_data_maximum_bits(&node_data.rows) {
+        Ok(bits) => Ok(Factory2PairOutcome::Value(bits)),
+        Err(_) => Ok(Factory2PairOutcome::Unrepresentable),
+    }
+}
+
+fn factory2_selected_fx_resources_are_representable<R: ResourceRepository>(
+    asset_manager: &AssetManager<R>,
+    control: &PreparedComponentControl,
+    selected_opcodes: &[u32],
+) -> Result<bool, AssetPreparationError> {
+    let selected_opcode4_count = selected_opcodes
+        .iter()
+        .filter(|opcode| **opcode == 4)
+        .count();
+    let PreparedControlEffectSection::Parsed(rows) = &control.effect_section else {
+        return Ok(selected_opcode4_count == 0);
+    };
+    let selected_rows = rows
+        .iter()
+        .filter(|row| Some(row.table_index) == control.initial_effect_group)
+        .collect::<Vec<_>>();
+    if selected_rows.len() != selected_opcode4_count {
+        return Ok(false);
+    }
+    if selected_rows.is_empty() {
+        return Ok(true);
+    }
+    let Some(points) = control.point_list.as_ref() else {
+        return Ok(false);
+    };
+
+    for row in selected_rows {
+        if !row.point_offsets.iter().all(|offset| {
+            *offset != u32::MAX
+                && usize::try_from(*offset).is_ok_and(|index| index < points.points.len())
+        }) {
+            return Ok(false);
+        }
+        let Some(key) = factory2_fx_resource_key(&row.resource) else {
+            return Ok(false);
+        };
+        if !factory2_fx_resource_is_representable(asset_manager.repository(), &key, row)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn factory2_fx_resource_key(resource: &PreparedControlResourcePair) -> Option<ResourceKey> {
+    let archive = bounded_ascii_c_string(&resource.archive)?;
+    let name = bounded_ascii_c_string(&resource.name)?;
+    if archive.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some(ResourceKey {
+        archive: normalize_relative(archive.as_bytes(), PathPolicy::StrictLegacy).ok()?,
+        name: resource_name(name.as_bytes()),
+        type_id: Some(FXID_KIND),
+    })
+}
+
+fn factory2_fx_resource_is_representable<R: ResourceRepository>(
+    repository: &R,
+    key: &ResourceKey,
+    row: &PreparedControlEffectRow,
+) -> Result<bool, AssetPreparationError> {
+    let context = format!(
+        "factory-2 selected Control effect group {} row {} FX {}:{}",
+        row.table_index,
+        row.row_index,
+        key.archive.as_str(),
+        String::from_utf8_lossy(&key.name.0)
+    );
+    let archive = match repository.open_archive_unchanged(&key.archive) {
+        Ok(archive) => archive,
+        Err(ResourceError::MissingArchive { .. } | ResourceError::MissingEntry) => {
+            return Ok(false);
+        }
+        Err(source) => {
+            return Err(AssetPreparationError::Resource {
+                context,
+                source: Box::new(source),
+            });
+        }
+    };
+    let entry =
+        repository
+            .find(archive, &key.name)
+            .map_err(|source| AssetPreparationError::Resource {
+                context: context.clone(),
+                source: Box::new(source),
+            })?;
+    let Some(entry) = entry else {
+        return Ok(false);
+    };
+    let info = repository
+        .entry_info(entry)
+        .map_err(|source| AssetPreparationError::Resource {
+            context: context.clone(),
+            source: Box::new(source),
+        })?;
+    if info.key.type_id != Some(FXID_KIND) {
+        return Ok(false);
+    }
+    let bytes = repository
+        .read(entry)
+        .map_err(|source| AssetPreparationError::Resource {
+            context: context.clone(),
+            source: Box::new(source),
+        })?;
+    let document = decode_fxid(Arc::from(bytes.into_owned())).map_err(|source| {
+        AssetPreparationError::InvalidPrototype(format!("{context}: {source}"))
+    })?;
+    Ok(document.commands().iter().all(|command| {
+        matches!(
+            command.opcode,
+            FxOpcode::Op2
+                | FxOpcode::Op3
+                | FxOpcode::Op4
+                | FxOpcode::Op5
+                | FxOpcode::Op7
+                | FxOpcode::Op8
+                | FxOpcode::Op9
+        )
+    }))
+}
+
+fn factory2_node_data_maximum_bits(
+    rows: &[PreparedControlNodeDataRow],
+) -> Result<u32, &'static str> {
+    let mut maximum = 0.0_f32;
+    for row in rows {
+        let value = checked_control_float(2, "factory-2 NDP Max", row.max_volume)
+            .map_err(|_| "NDP Max float")?;
+        maximum = checked_control_sum(2, "factory-2 NDP Max sum", maximum, value)
+            .map_err(|_| "NDP Max sum")?;
+    }
+    Ok(maximum.to_bits())
+}
+
 /// Common fields known for one row in a host object's Control device table.
 ///
 /// The row index is its position in the containing `Vec`. This stores the
@@ -225,6 +472,8 @@ pub struct EffectiveControlDevice {
     pub class9_selector0_scale_bits: Option<u32>,
     /// Factory-26 mutable resource-rate addition at native `+0xa4`.
     pub tag26_extra_rate_bits: Option<u32>,
+    /// Factory-2 value read by selector 6 at native `+0x174`.
+    pub device174_bits: Option<u32>,
     /// Six class-9 budget values at native `+0x98..+0xac`.
     pub class9_values_bits: Option<[u32; 6]>,
     /// Six accumulated class-9 changes at native `+0xb0..+0xc4`.
@@ -1722,7 +1971,9 @@ fn load_mission_with_options(
         Vec::new()
     };
 
+    let mut first_factory2_asset_error = None;
     let control_device_tables = if options.asset_scope == MissionAssetScope::Full {
+        let mut factory2_pair_cache = HashMap::new();
         object_drafts
             .iter()
             .zip(&handles)
@@ -1736,6 +1987,29 @@ fn load_mission_with_options(
                     prototype_span,
                     &resolved_prototypes,
                 );
+                let mut resolve_factory2_pair = |pair: &Factory2StringPair| {
+                    if first_factory2_asset_error.is_some() {
+                        return Factory2PairOutcome::Unrepresentable;
+                    }
+                    let cache_key = pair.cache_key();
+                    if let Some(outcome) = factory2_pair_cache.get(&cache_key) {
+                        return *outcome;
+                    }
+                    match resolve_factory2_pair_from_assets(
+                        &asset_manager,
+                        vfs.as_ref(),
+                        pair,
+                    ) {
+                        Ok(outcome) => {
+                            factory2_pair_cache.insert(cache_key, outcome);
+                            outcome
+                        }
+                        Err(error) => {
+                            first_factory2_asset_error = Some(error);
+                            Factory2PairOutcome::Unrepresentable
+                        }
+                    }
+                };
                 let projection = build_control_device_projection_with_class(
                     object_index,
                     draft,
@@ -1743,6 +2017,7 @@ fn load_mission_with_options(
                     prototype_span,
                     &resolved_prototypes,
                     native_control_class,
+                    &mut resolve_factory2_pair,
                 );
                 match projection {
                     Ok(projection) => MissionControlDeviceTableState {
@@ -1786,6 +2061,13 @@ fn load_mission_with_options(
     } else {
         Vec::new()
     };
+    if let Some(source) = first_factory2_asset_error {
+        let _ = fparkan_world::shutdown(new_runtime_world);
+        return Err(EngineError::AssetPreparation {
+            mission: request.key.clone(),
+            source,
+        });
+    }
     let behavior_control_groupings = if options.asset_scope == MissionAssetScope::Full {
         control_device_tables
             .iter()
@@ -2309,12 +2591,17 @@ pub fn query_loaded_mission_control_resource(
 /// it by coefficient 0. Only current tag 26 also multiplies by `M`; current
 /// tag 5 ignores `M` and descriptor word 8 for this selector. Explicit Control
 /// update calls can change current provider or multiplier values; the mission
-/// clock does not advance them automatically.
+/// clock does not advance them automatically. Selector `6` first checks the
+/// current descriptor tag: a non-2 tag returns `Ok(None)`. For the represented
+/// factory-2 layout it reads `+0x174`, subject to the normal-or-zero float
+/// range checks; an unsupported field or layout returns a typed error. This is
+/// a query of the loaded CPU projection, not an FX execution or game tick.
 ///
 /// # Errors
 /// Returns an error for an invalid handle, unavailable mission/table/provider,
 /// an out-of-range device/provider key, an unsupported float range, or an
-/// unsupported current/factory tag on selector `0xe00`.
+/// unsupported current/factory tag on selector `0xe00`, or an unsupported
+/// selector-6 factory field/layout.
 pub fn query_loaded_mission_control_device_selector(
     engine: &Engine,
     handle: ObjectHandle,
@@ -4416,7 +4703,7 @@ fn query_control_device_table_selector(
     device_index: usize,
     selector: u32,
 ) -> Result<Option<f32>, ControlResourceAccessError> {
-    if !matches!(selector, 0x400 | 0xe00) {
+    if !matches!(selector, 6 | 0x400 | 0xe00) {
         return Err(ControlResourceAccessError::UnsupportedSelector(selector));
     }
     let devices = match &table.status {
@@ -4435,6 +4722,17 @@ fn query_control_device_table_selector(
     if selector == 0x400 {
         return control_device_provider_value_from_status(&table.node_provider_status, device)
             .map(Some);
+    }
+    if selector == 6 {
+        if device.descriptor.tag != 2 {
+            return Ok(None);
+        }
+        if device.factory_tag != 2 {
+            return Err(ControlResourceAccessError::UnsupportedFactoryTag {
+                factory_tag: device.factory_tag,
+            });
+        }
+        return control_device_float(device, device.device174_bits, "+0x174").map(Some);
     }
     query_control_device_selector(device, &table.node_provider_status)
 }
@@ -5794,7 +6092,7 @@ fn append_effective_control_device(
     } else {
         Some(descriptor.fixed_words[6])
     };
-    devices.push(EffectiveControlDevice {
+    let device = EffectiveControlDevice {
         factory_tag: descriptor.tag,
         component_id,
         key,
@@ -5802,6 +6100,7 @@ fn append_effective_control_device(
         multiplier_bits,
         class9_selector0_scale_bits: (descriptor.tag == 9).then_some(0x3f80_0000),
         tag26_extra_rate_bits: (descriptor.tag == 26).then_some(0),
+        device174_bits: (descriptor.tag == 2).then_some(0),
         class9_values_bits: (descriptor.tag == 9).then_some([0x3f80_0000; 6]),
         class9_deltas_bits: (descriptor.tag == 9).then_some([0; 6]),
         native_word_50_bits,
@@ -5809,7 +6108,65 @@ fn append_effective_control_device(
         descriptor: descriptor.clone(),
         factory_provenance: provenance.clone(),
         descriptor_provenance: provenance,
-    });
+    };
+    devices.push(device);
+}
+
+fn bounded_ascii_c_string(raw: &[u8]) -> Option<String> {
+    let end = raw.iter().position(|byte| *byte == 0)?;
+    let bytes = &raw[..end];
+    if !bytes.is_ascii() {
+        return None;
+    }
+    std::str::from_utf8(bytes).ok().map(str::to_owned)
+}
+
+fn fixed_words_ascii_c_string(words: &[u32]) -> Option<String> {
+    let bytes = words
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    bounded_ascii_c_string(&bytes)
+}
+
+fn factory2_pair_from_record(
+    descriptor: &PreparedControlTypedRecord,
+) -> Option<Factory2StringPair> {
+    Some(Factory2StringPair {
+        archive: fixed_words_ascii_c_string(&descriptor.fixed_words[27..35])?,
+        name: fixed_words_ascii_c_string(&descriptor.fixed_words[35..43])?,
+    })
+}
+
+fn apply_factory2_pair_update(
+    device: &mut EffectiveControlDevice,
+    previous_pair: Option<Factory2StringPair>,
+    descriptor: &PreparedControlTypedRecord,
+    resolve_factory2_pair: &mut dyn FnMut(&Factory2StringPair) -> Factory2PairOutcome,
+) {
+    if device.factory_tag != 2 {
+        return;
+    }
+    let Some(pair) = factory2_pair_from_record(descriptor) else {
+        device.device174_bits = None;
+        return;
+    };
+    if previous_pair
+        .as_ref()
+        .is_some_and(|previous| previous.matches_ascii_case(&pair))
+    {
+        return;
+    }
+    let outcome = if pair.archive.is_empty() || pair.name.is_empty() {
+        Factory2PairOutcome::NativeMiss
+    } else {
+        resolve_factory2_pair(&pair)
+    };
+    match outcome {
+        Factory2PairOutcome::Value(bits) => device.device174_bits = Some(bits),
+        Factory2PairOutcome::NativeMiss => {}
+        Factory2PairOutcome::Unrepresentable => device.device174_bits = None,
+    }
 }
 
 fn apply_effective_control_override(
@@ -5902,6 +6259,7 @@ fn build_control_device_projection(
 ) -> Result<ControlDeviceProjection, MissionControlDeviceTableUnavailableReason> {
     let native_class =
         native_control_class_for_root(draft.unit_dat_header_flags, prototype_span, prototypes);
+    let mut resolve_factory2_pair = |_: &Factory2StringPair| Factory2PairOutcome::Unrepresentable;
     build_control_device_projection_with_class(
         object_index,
         draft,
@@ -5909,6 +6267,7 @@ fn build_control_device_projection(
         prototype_span,
         prototypes,
         native_class,
+        &mut resolve_factory2_pair,
     )
 }
 
@@ -5919,6 +6278,7 @@ fn build_control_device_projection_with_class(
     prototype_span: Option<&std::ops::Range<usize>>,
     prototypes: &[fparkan_prototype::EffectivePrototype],
     native_control_class: Option<MissionControlClassProjection>,
+    resolve_factory2_pair: &mut dyn FnMut(&Factory2StringPair) -> Factory2PairOutcome,
 ) -> Result<ControlDeviceProjection, MissionControlDeviceTableUnavailableReason> {
     use MissionControlDeviceTableUnavailableReason as Unavailable;
 
@@ -6227,6 +6587,12 @@ fn build_control_device_projection_with_class(
                     control,
                     descriptor,
                 );
+                apply_factory2_pair_update(
+                    devices.last_mut().expect("append inserted one device"),
+                    Some(Factory2StringPair::empty()),
+                    descriptor,
+                    resolve_factory2_pair,
+                );
                 initialize_control_profile_cache27(&mut profile_cache27_bits, descriptor);
             }
             continue;
@@ -6267,6 +6633,12 @@ fn build_control_device_projection_with_class(
                         control,
                         descriptor,
                     );
+                    apply_factory2_pair_update(
+                        devices.last_mut().expect("append inserted one device"),
+                        Some(Factory2StringPair::empty()),
+                        descriptor,
+                        resolve_factory2_pair,
+                    );
                     initialize_control_profile_cache27(&mut profile_cache27_bits, descriptor);
                 }
             }
@@ -6295,6 +6667,13 @@ fn build_control_device_projection_with_class(
                         factory_tag: device.factory_tag,
                     });
                 }
+                let previous_pair = factory2_pair_from_record(&device.descriptor);
+                apply_factory2_pair_update(
+                    device,
+                    previous_pair,
+                    descriptor,
+                    resolve_factory2_pair,
+                );
                 apply_effective_control_override(device, descriptor, component_index, 0, control);
                 update_control_profile_cache27_on_into(&mut profile_cache27_bits, descriptor);
             }
@@ -7014,8 +7393,983 @@ fn read_vfs(vfs: &Arc<dyn Vfs>, path: &NormalizedPath) -> Result<Arc<[u8]>, Engi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fparkan_assets::PreparedControlPointList;
     use fparkan_vfs::{DirectoryVfs, MemoryVfs, OverlayVfs, VfsEntry, VfsMetadata};
     use std::path::{Path, PathBuf};
+    #[test]
+    fn factory2_selector6_reads_fresh_constructor_zero() {
+        let device = synthetic_effective_control_device(2, 2, 0, None, None);
+        assert!(device.descriptor.fixed_words[27..43]
+            .iter()
+            .all(|word| *word == 0));
+        let table =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                device,
+            ]));
+
+        assert_eq!(
+            query_control_device_table_selector(&table, 0, 6),
+            Ok(Some(0.0))
+        );
+    }
+
+    #[test]
+    fn factory2_selector6_returns_the_stored_float_word() {
+        let mut device = synthetic_effective_control_device(2, 2, 0, None, None);
+        device.device174_bits = Some(6.25_f32.to_bits());
+        let table =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                device,
+            ]));
+
+        assert_eq!(
+            query_control_device_table_selector(&table, 0, 6),
+            Ok(Some(6.25))
+        );
+    }
+
+    #[test]
+    fn factory2_selector6_preserves_stored_negative_zero() {
+        let mut device = synthetic_effective_control_device(2, 2, 0, None, None);
+        device.device174_bits = Some((-0.0_f32).to_bits());
+        let table =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                device,
+            ]));
+
+        assert_eq!(
+            query_control_device_table_selector(&table, 0, 6)
+                .expect("negative zero is a valid native float")
+                .expect("tag 2 has a selector-6 value")
+                .to_bits(),
+            (-0.0_f32).to_bits()
+        );
+    }
+
+    #[test]
+    fn factory2_selector6_reports_missing_wrong_factory_nonfinite_and_subnormal_values() {
+        let table_for = |device| {
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![device]))
+        };
+
+        let mut missing = synthetic_effective_control_device(2, 2, 0, None, None);
+        missing.device174_bits = None;
+        assert_eq!(
+            query_control_device_table_selector(&table_for(missing), 0, 6),
+            Err(ControlResourceAccessError::UnsupportedField {
+                factory_tag: 2,
+                field: "+0x174",
+            })
+        );
+
+        let mut wrong_factory = synthetic_effective_control_device(5, 2, 0, None, None);
+        wrong_factory.device174_bits = Some(1.0_f32.to_bits());
+        assert_eq!(
+            query_control_device_table_selector(&table_for(wrong_factory), 0, 6),
+            Err(ControlResourceAccessError::UnsupportedFactoryTag { factory_tag: 5 })
+        );
+
+        let mut nonfinite = synthetic_effective_control_device(2, 2, 0, None, None);
+        nonfinite.device174_bits = Some(f32::INFINITY.to_bits());
+        assert_eq!(
+            query_control_device_table_selector(&table_for(nonfinite), 0, 6),
+            Err(ControlResourceAccessError::NonFiniteValue {
+                factory_tag: 2,
+                field: "+0x174",
+            })
+        );
+
+        let mut subnormal = synthetic_effective_control_device(2, 2, 0, None, None);
+        subnormal.device174_bits = Some(1);
+        assert_eq!(
+            query_control_device_table_selector(&table_for(subnormal), 0, 6),
+            Err(ControlResourceAccessError::SubnormalValue {
+                factory_tag: 2,
+                field: "+0x174",
+            })
+        );
+    }
+
+    #[test]
+    fn factory2_selector6_returns_no_result_for_a_non_two_current_tag() {
+        let mut device = synthetic_effective_control_device(5, 5, 0, None, None);
+        device.device174_bits = None;
+        let table =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                device,
+            ]));
+
+        assert_eq!(query_control_device_table_selector(&table, 0, 6), Ok(None));
+    }
+
+    #[test]
+    fn factory2_pair_updates_keep_append_and_into_order_and_native_miss_bits() {
+        let mut root_record = synthetic_control_record(2, 0, 0, None);
+        set_factory2_pair(&mut root_record, b"objects.rlb", b"root");
+        let mut same_record = synthetic_control_record(2, 0, 0, None);
+        set_factory2_pair(&mut same_record, b"OBJECTS.RLB", b"ROOT");
+        let mut changed_record = synthetic_control_record(2, 0, 0, None);
+        set_factory2_pair(&mut changed_record, b"objects.rlb", b"second");
+        let mut empty_record = synthetic_control_record(2, 0, 0, None);
+        set_factory2_pair(&mut empty_record, b"objects.rlb", b"");
+        let controls = [root_record, same_record, changed_record, empty_record]
+            .into_iter()
+            .enumerate()
+            .map(|(index, record)| {
+                Some(synthetic_component_control(
+                    index,
+                    vec![record],
+                    PreparedControlEffectSection::Parsed(Vec::new()),
+                ))
+            })
+            .collect();
+        let (draft, assets, prototypes) = synthetic_control_fixture(
+            &[
+                None,
+                Some(PROTOTYPE_TYPE_INTO),
+                Some(PROTOTYPE_TYPE_INTO),
+                Some(PROTOTYPE_TYPE_INTO),
+            ],
+            &[1, 1, 1, 1],
+            &[3, 0, 0, 0],
+            &[0, 0, 0, 0],
+            &[1, 0, 0, 0],
+            controls,
+        );
+        let mut resolved = Vec::new();
+        let mut resolver = |pair: &Factory2StringPair| {
+            resolved.push((pair.archive.clone(), pair.name.clone()));
+            match pair.name.as_str() {
+                "root" => Factory2PairOutcome::Value(6.25_f32.to_bits()),
+                "second" => Factory2PairOutcome::Value(9.5_f32.to_bits()),
+                _ => Factory2PairOutcome::Unrepresentable,
+            }
+        };
+
+        let projection = build_control_device_projection_with_class(
+            0,
+            &draft,
+            &assets,
+            Some(&(0..prototypes.len())),
+            &prototypes,
+            None,
+            &mut resolver,
+        )
+        .expect("factory-2 append plus three INTO updates");
+
+        assert_eq!(
+            resolved,
+            [
+                ("objects.rlb".to_string(), "root".to_string()),
+                ("objects.rlb".to_string(), "second".to_string())
+            ],
+            "same pair skips recalculation and an empty name is a native miss"
+        );
+        assert_eq!(projection.devices.len(), 1);
+        assert_eq!(projection.devices[0].factory_tag, 2);
+        assert_eq!(
+            projection.devices[0].device174_bits,
+            Some(9.5_f32.to_bits())
+        );
+        assert_eq!(
+            projection.devices[0]
+                .descriptor_provenance
+                .unit_component_index,
+            3,
+            "INTO retains the last raw descriptor even when selector state is preserved"
+        );
+    }
+
+    #[test]
+    fn factory2_pair_parser_validates_nul_and_ascii_before_it() {
+        let mut record = synthetic_control_record(2, 0, 0, None);
+        set_factory2_pair(&mut record, b"objects.rlb", b"name");
+        assert_eq!(
+            factory2_pair_from_record(&record).map(|pair| (pair.archive, pair.name)),
+            Some(("objects.rlb".to_string(), "name".to_string()))
+        );
+
+        record.fixed_words[27..35].fill(u32::from_le_bytes(*b"ABCD"));
+        assert!(factory2_pair_from_record(&record).is_none(), "missing NUL");
+
+        record.fixed_words[27] = u32::from_le_bytes([0xff, 0, 0, 0]);
+        assert!(
+            factory2_pair_from_record(&record).is_none(),
+            "non-ASCII byte"
+        );
+
+        record.fixed_words[27] = u32::from_le_bytes([b'a', 0, b'b', 0]);
+        let first = factory2_pair_from_record(&record).expect("NUL ends the archive string");
+        assert_eq!(first.archive, "a");
+        let mut different_padding = record.clone();
+        different_padding.fixed_words[27] = u32::from_le_bytes([b'A', 0, b'c', 0]);
+        let second = factory2_pair_from_record(&different_padding)
+            .expect("native C-string comparison ignores bytes after NUL");
+        assert!(first.matches_ascii_case(&second));
+    }
+
+    #[test]
+    fn factory2_unrepresentable_pair_clears_only_the_available_projection() {
+        let mut device = synthetic_effective_control_device(2, 2, 0, None, None);
+        device.device174_bits = Some(6.25_f32.to_bits());
+        let mut replacement = synthetic_control_record(2, 0, 0, None);
+        set_factory2_pair(&mut device.descriptor, b"objects.rlb", b"known");
+        set_factory2_pair(&mut replacement, b"objects.rlb", b"unknown");
+        let previous_pair = factory2_pair_from_record(&device.descriptor);
+        let mut resolver = |_: &Factory2StringPair| Factory2PairOutcome::Unrepresentable;
+        apply_factory2_pair_update(&mut device, previous_pair, &replacement, &mut resolver);
+
+        assert_eq!(device.device174_bits, None);
+        assert_eq!(
+            control_device_float(&device, device.device174_bits, "+0x174"),
+            Err(ControlResourceAccessError::UnsupportedField {
+                factory_tag: 2,
+                field: "+0x174",
+            })
+        );
+    }
+
+    #[test]
+    fn factory2_pair_cache_key_folds_ascii_case() {
+        let upper = Factory2StringPair {
+            archive: "OBJECTS.RLB".to_string(),
+            name: "FOREIGN".to_string(),
+        };
+        let lower = Factory2StringPair {
+            archive: "objects.rlb".to_string(),
+            name: "foreign".to_string(),
+        };
+
+        assert_eq!(upper.cache_key(), lower.cache_key());
+    }
+
+    #[test]
+    fn factory2_ndp_maximum_uses_ordered_f32_sum_and_accepts_empty_tables() {
+        let mut rows = [0.0_f32; 3].map(|max_volume| PreparedControlNodeDataRow {
+            raw_flags: 0,
+            max_volume,
+            mobility_per_volume: 0.0,
+            effect: PreparedControlResourcePair {
+                archive: [0; 32],
+                name: [0; 32],
+            },
+        });
+        rows[0].max_volume = 16_777_216.0;
+        rows[1].max_volume = 1.0;
+        rows[2].max_volume = -16_777_216.0;
+
+        assert_eq!(
+            factory2_node_data_maximum_bits(&rows),
+            Ok(0.0_f32.to_bits())
+        );
+        assert_eq!(factory2_node_data_maximum_bits(&[]), Ok(0.0_f32.to_bits()));
+        assert_eq!(
+            factory2_node_data_maximum_bits(&[PreparedControlNodeDataRow {
+                max_volume: f32::from_bits(1),
+                ..rows[0].clone()
+            }]),
+            Err("NDP Max float")
+        );
+    }
+
+    fn factory2_test_nres(entries: &[(&[u8], u32, u32, &[u8])]) -> Vec<u8> {
+        let mut bytes = vec![0; 16];
+        let mut offsets = Vec::with_capacity(entries.len());
+        for (_, _, _, payload) in entries {
+            offsets.push(u32::try_from(bytes.len()).expect("payload offset fits u32"));
+            bytes.extend_from_slice(payload);
+            bytes.resize(bytes.len() + (8 - bytes.len() % 8) % 8, 0);
+        }
+        let mut sorted_indices = (0..entries.len()).collect::<Vec<_>>();
+        sorted_indices.sort_by(|left, right| entries[*left].0.cmp(entries[*right].0));
+        let mut order = vec![0_u32; entries.len()];
+        for (rank, index) in sorted_indices.into_iter().enumerate() {
+            order[index] = u32::try_from(rank).expect("entry rank fits u32");
+        }
+        for (index, (name, type_id, attr3, payload)) in entries.iter().enumerate() {
+            assert!(name.len() < 36, "NRes fixture name needs a bounded NUL");
+            for word in [
+                *type_id,
+                0,
+                0,
+                u32::try_from(payload.len()).expect("payload length fits u32"),
+                *attr3,
+            ] {
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+            let mut name_raw = [0; 36];
+            name_raw[..name.len()].copy_from_slice(name);
+            bytes.extend_from_slice(&name_raw);
+            bytes.extend_from_slice(&offsets[index].to_le_bytes());
+            bytes.extend_from_slice(&order[index].to_le_bytes());
+        }
+        bytes[0..4].copy_from_slice(b"NRes");
+        bytes[4..8].copy_from_slice(&0x100_u32.to_le_bytes());
+        bytes[8..12].copy_from_slice(
+            &u32::try_from(entries.len())
+                .expect("entry count fits u32")
+                .to_le_bytes(),
+        );
+        let total_size = u32::try_from(bytes.len()).expect("archive size fits u32");
+        bytes[12..16].copy_from_slice(&total_size.to_le_bytes());
+        bytes
+    }
+
+    fn factory2_test_object_refs(items: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(items.len() * 64);
+        for (archive, name) in items {
+            assert!(archive.len() < 32 && name.len() < 32);
+            let mut record = [0; 64];
+            record[..archive.len()].copy_from_slice(archive);
+            record[32..32 + name.len()].copy_from_slice(name);
+            bytes.extend_from_slice(&record);
+        }
+        bytes
+    }
+
+    fn factory2_test_control_payload(
+        pair: Option<(&[u8], &[u8])>,
+        effect_opcode: Option<u32>,
+    ) -> Vec<u8> {
+        let mut payload = vec![0; 5 * 4 + 108];
+        if let Some((archive, name)) = pair {
+            payload[12..16].copy_from_slice(&1_u32.to_le_bytes());
+            let record_start = payload.len();
+            payload.resize(record_start + 0xb0 + 8, 0);
+            payload[record_start..record_start + 4].copy_from_slice(&2_u32.to_le_bytes());
+            let archive_start = record_start + 27 * 4;
+            payload[archive_start..archive_start + archive.len()].copy_from_slice(archive);
+            let name_start = record_start + 35 * 4;
+            payload[name_start..name_start + name.len()].copy_from_slice(name);
+        }
+        if let Some(opcode) = effect_opcode {
+            payload[16..20].copy_from_slice(&1_u32.to_le_bytes());
+            let group_start = payload.len();
+            payload.resize(group_start + 0x54 + 4 + 0x64, 0);
+            payload[group_start + 0x54..group_start + 0x58].copy_from_slice(&1_u32.to_le_bytes());
+            payload[group_start + 0x58 + 0x0c..group_start + 0x58 + 0x10]
+                .copy_from_slice(&opcode.to_le_bytes());
+        }
+        payload
+    }
+
+    fn factory2_test_mesh_payload() -> Vec<u8> {
+        let res2 = vec![0; 0x8c];
+        factory2_test_nres(&[
+            (b"Res1", 1, 38, &[]),
+            (b"Res13", 13, 0, &[]),
+            (b"Res2", 2, 0, &res2),
+            (b"Res3", 3, 0, &[]),
+            (b"Res6", 6, 0, &[]),
+        ])
+    }
+
+    fn factory2_test_mat0() -> Vec<u8> {
+        let mut bytes = vec![0; 4 + 34];
+        bytes[0..2].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[22..27].copy_from_slice(b"TEX_A");
+        bytes
+    }
+
+    fn factory2_test_texm() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for word in [0x6d78_6554_u32, 1, 1, 1, 0, 0, 0, 565] {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0xffff_u16.to_le_bytes());
+        bytes
+    }
+
+    fn factory2_test_resolver_archives(
+        foreign_control: &[u8],
+        ndp_maxima: &[f32],
+    ) -> Vec<(&'static str, Vec<u8>)> {
+        let host_refs = factory2_test_object_refs(&[
+            (b"static.rlb", b"model.msh"),
+            (b"controls.rlb", b"host.ctl"),
+        ]);
+        let foreign_refs = factory2_test_object_refs(&[
+            (b"static.rlb", b"model.msh"),
+            (b"controls.rlb", b"foreign.ctl"),
+            (b"providers.rlb", b"foreign.ndp"),
+        ]);
+        let objects = factory2_test_nres(&[
+            (b"foreign", CONTROL_CLASS_SOURCE_BULL, 0, &foreign_refs),
+            (b"host", CONTROL_CLASS_SOURCE_BULL, 0, &host_refs),
+        ]);
+        let mesh = factory2_test_mesh_payload();
+        let static_archive = factory2_test_nres(&[
+            (b"model.msh", 0, 0, &mesh),
+            (b"model.wea", 0x5241_4557, 0, b"1\n0 MAT_A\n"),
+        ]);
+        let host_control = factory2_test_control_payload(Some((b"objects.rlb", b"foreign")), None);
+        let control_archive = factory2_test_nres(&[
+            (b"foreign.ctl", 0, 0, foreign_control),
+            (b"host.ctl", 0, 0, &host_control),
+        ]);
+        let mut node_data = vec![0; 4 + ndp_maxima.len() * 76];
+        node_data[..4].copy_from_slice(
+            &u32::try_from(ndp_maxima.len())
+                .expect("NDP count fits u32")
+                .to_le_bytes(),
+        );
+        for (index, maximum) in ndp_maxima.iter().enumerate() {
+            let start = 4 + index * 76;
+            node_data[start + 4..start + 8].copy_from_slice(&maximum.to_bits().to_le_bytes());
+        }
+        let node_data_archive = factory2_test_nres(&[(b"foreign.ndp", 0, 0, &node_data)]);
+        let mat0 = factory2_test_mat0();
+        let material_archive = factory2_test_nres(&[(b"MAT_A", 0x3054_414D, 0, &mat0)]);
+        let texm = factory2_test_texm();
+        let texture_archive = factory2_test_nres(&[(b"TEX_A", 0, 0, &texm)]);
+        vec![
+            ("objects.rlb", objects),
+            ("static.rlb", static_archive),
+            ("controls.rlb", control_archive),
+            ("providers.rlb", node_data_archive),
+            ("material.lib", material_archive),
+            ("textures.lib", texture_archive),
+        ]
+    }
+
+    fn factory2_test_resolver_vfs(foreign_control: &[u8]) -> Arc<dyn Vfs> {
+        factory2_test_resolver_vfs_with_maxima(foreign_control, &[])
+    }
+
+    fn factory2_test_resolver_vfs_with_maxima(
+        foreign_control: &[u8],
+        ndp_maxima: &[f32],
+    ) -> Arc<dyn Vfs> {
+        let mut files = MemoryVfs::default();
+        for (path, bytes) in factory2_test_resolver_archives(foreign_control, ndp_maxima) {
+            files.insert(
+                normalize_engine_path("factory-2 resolver fixture", path).expect("archive path"),
+                Arc::from(bytes.into_boxed_slice()),
+            );
+        }
+        Arc::new(files)
+    }
+
+    fn factory2_test_fxid_payload(opcodes: &[u32]) -> Vec<u8> {
+        let command_size = |opcode| match opcode {
+            1 => 224,
+            2 => 148,
+            3 => 200,
+            4 => 204,
+            5 => 112,
+            6 => 4,
+            7 | 9 | 10 => 208,
+            8 => 248,
+            _ => panic!("fixture opcode {opcode} is not framed"),
+        };
+        let mut payload = vec![0; 60];
+        payload[..4].copy_from_slice(
+            &u32::try_from(opcodes.len())
+                .expect("FX command count fits u32")
+                .to_le_bytes(),
+        );
+        for opcode in opcodes {
+            let start = payload.len();
+            payload.resize(start + command_size(*opcode), 0);
+            payload[start..start + 4].copy_from_slice(&opcode.to_le_bytes());
+        }
+        payload
+    }
+
+    fn factory2_test_fxid_manager(
+        entries: &[(&[u8], u32, &[u8])],
+    ) -> AssetManager<CachedResourceRepository> {
+        let archive_entries = entries
+            .iter()
+            .map(|(name, type_id, payload)| (*name, *type_id, 0, *payload))
+            .collect::<Vec<_>>();
+        let archive = factory2_test_nres(&archive_entries);
+        let mut files = MemoryVfs::default();
+        files.insert(
+            normalize_engine_path("factory-2 FX fixture", "effects.rlb").expect("FX archive path"),
+            Arc::from(archive.into_boxed_slice()),
+        );
+        let vfs: Arc<dyn Vfs> = Arc::new(files);
+        AssetManager::new(CachedResourceRepository::new(vfs))
+    }
+
+    fn factory2_test_effect_resource_pair(
+        archive: &[u8],
+        name: &[u8],
+    ) -> PreparedControlResourcePair {
+        fn fixed_string(raw: &[u8]) -> [u8; 32] {
+            assert!(raw.len() <= 32);
+            let mut bytes = [0; 32];
+            bytes[..raw.len()].copy_from_slice(raw);
+            bytes
+        }
+
+        PreparedControlResourcePair {
+            archive: fixed_string(archive),
+            name: fixed_string(name),
+        }
+    }
+
+    fn factory2_test_effect_row(
+        table_index: usize,
+        row_index: usize,
+        archive: &[u8],
+        name: &[u8],
+        point_offsets: [u32; 3],
+    ) -> PreparedControlEffectRow {
+        PreparedControlEffectRow {
+            table_index,
+            row_index,
+            raw_condition: [0; 3],
+            point_offsets,
+            selector: 0,
+            resource: factory2_test_effect_resource_pair(archive, name),
+        }
+    }
+
+    fn factory2_test_control_effects(
+        rows: Vec<PreparedControlEffectRow>,
+        initial_effect_group: Option<usize>,
+        point_count: Option<usize>,
+    ) -> PreparedComponentControl {
+        PreparedComponentControl {
+            source: synthetic_resource_key(940),
+            native_profile_words: [0; 27],
+            model_node_count: 3,
+            bindings: Vec::new(),
+            timeline_rows: Vec::new(),
+            typed_records: Vec::new(),
+            node_data: None,
+            effect_section: PreparedControlEffectSection::Parsed(rows),
+            initial_effect_group,
+            point_list: point_count.map(|count| PreparedControlPointList {
+                source: synthetic_resource_key(941),
+                points: (0..count)
+                    .map(|_| fparkan_assets::PreparedControlPoint {
+                        raw_flags: 0,
+                        raw_signed_field_04: 0,
+                        raw_signed_field_08: 0,
+                        position: [0.0; 3],
+                        direction: [0.0; 3],
+                        name: [0; 32],
+                    })
+                    .collect(),
+            }),
+        }
+    }
+
+    fn factory2_test_full_load_vfs(foreign_control: &[u8]) -> Arc<dyn Vfs> {
+        factory2_test_full_load_vfs_with_maxima(foreign_control, &[])
+    }
+
+    fn factory2_test_full_load_vfs_with_maxima(
+        foreign_control: &[u8],
+        ndp_maxima: &[f32],
+    ) -> Arc<dyn Vfs> {
+        fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fn push_lp(bytes: &mut Vec<u8>, value: &[u8]) {
+            push_u32(bytes, u32::try_from(value.len()).expect("length fits u32"));
+            bytes.extend_from_slice(value);
+        }
+        fn push_f32(bytes: &mut Vec<u8>, value: f32) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
+        let mut mission = Vec::new();
+        push_u32(&mut mission, 1);
+        push_u32(&mut mission, 0);
+        push_u32(&mut mission, 6);
+        push_u32(&mut mission, 1);
+        push_lp(&mut mission, b"Synthetic clan");
+        push_u32(&mut mission, u32::MAX);
+        push_f32(&mut mission, 0.0);
+        push_f32(&mut mission, 0.0);
+        push_u32(&mut mission, 1);
+        push_lp(&mut mission, b"MISSIONS/SCRIPTS/shared");
+        push_u32(&mut mission, 0);
+        push_lp(&mut mission, b"");
+        push_u32(&mut mission, 0);
+        push_u32(&mut mission, 0);
+        push_u32(&mut mission, 10);
+        push_u32(&mut mission, 1);
+        push_u32(&mut mission, 1);
+        push_u32(&mut mission, 0x8000_0002);
+        push_lp(&mut mission, b"UNITS/FACTORY2/host.dat");
+        push_u32(&mut mission, 0);
+        push_u32(&mut mission, 0);
+        for value in [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0] {
+            push_f32(&mut mission, value);
+        }
+        push_lp(&mut mission, b"host");
+        push_u32(&mut mission, 0);
+        push_u32(&mut mission, 0);
+        push_u32(&mut mission, 0);
+        push_u32(&mut mission, 1);
+        push_u32(&mut mission, 0);
+        push_lp(&mut mission, b"DATA\\MAPS\\SYNTHETIC\\land");
+        push_u32(&mut mission, 0);
+        push_lp(&mut mission, b"");
+        push_u32(&mut mission, 1);
+        push_u32(&mut mission, 0);
+
+        let mut unit_dat = vec![0; 8 + 112];
+        unit_dat[4..8].copy_from_slice(&0_u32.to_le_bytes());
+        unit_dat[8..19].copy_from_slice(b"objects.rlb");
+        unit_dat[40..44].copy_from_slice(b"host");
+        unit_dat[76..80].copy_from_slice(&0_i32.to_le_bytes());
+
+        let mut files = MemoryVfs::default();
+        for (path, bytes) in [
+            ("MISSIONS/TEST/data.tma", mission),
+            ("UNITS/FACTORY2/host.dat", unit_dat),
+            ("DATA/MAPS/SYNTHETIC/Land.msh", empty_land_mesh()),
+            ("DATA/MAPS/SYNTHETIC/Land.map", minimal_land_map()),
+            (
+                "MISSIONS/SCRIPTS/shared.scr",
+                encode_script_package(&ScriptPackage {
+                    opcode_handler_count: 73,
+                    events: Vec::new(),
+                    trailing_bytes: Vec::new(),
+                    raw: Arc::from(&b""[..]),
+                }),
+            ),
+            (
+                "MISSIONS/SCRIPTS/shared.var",
+                b"VAR(DWORD, value, 0)\n".to_vec(),
+            ),
+        ] {
+            files.insert(
+                normalize_engine_path("factory-2 full-load fixture", path).expect("test path"),
+                Arc::from(bytes.into_boxed_slice()),
+            );
+        }
+        for (path, bytes) in factory2_test_resolver_archives(foreign_control, ndp_maxima) {
+            files.insert(
+                normalize_engine_path("factory-2 full-load archive", path).expect("archive path"),
+                Arc::from(bytes.into_boxed_slice()),
+            );
+        }
+        files.insert(
+            normalize_engine_path("factory-2 full-load BuildDat", "BuildDat.lst")
+                .expect("BuildDat path"),
+            Arc::from(&b""[..]),
+        );
+        Arc::new(files)
+    }
+
+    #[test]
+    fn factory2_resolver_accepts_empty_effects_bull_and_ordered_ndp_rows() {
+        let control = factory2_test_control_payload(None, None);
+        let vfs =
+            factory2_test_resolver_vfs_with_maxima(&control, &[16_777_216.0, 1.0, -16_777_216.0]);
+        let manager = AssetManager::new(CachedResourceRepository::new(vfs.clone()));
+        let pair = Factory2StringPair {
+            archive: "OBJECTS.RLB".to_string(),
+            name: "FOREIGN".to_string(),
+        };
+        assert_eq!(
+            resolve_factory2_pair_from_assets(&manager, vfs.as_ref(), &pair)
+                .expect("valid foreign BULL projection"),
+            Factory2PairOutcome::Value(0.0_f32.to_bits())
+        );
+    }
+
+    #[test]
+    fn factory2_fx_guard_accepts_supported_commands_only_from_selected_group() {
+        let fxid = factory2_test_fxid_payload(&[2, 3, 4, 5, 7, 8, 9]);
+        let manager = factory2_test_fxid_manager(&[(b"selected", FXID_KIND, &fxid)]);
+        let mut selected = factory2_test_effect_row(0, 0, b"effects.rlb", b"selected", [0, 1, 2]);
+        selected.resource.archive[12] = 0xff;
+        selected.resource.name[9] = 0xfe;
+        let unselected = factory2_test_effect_row(1, 0, b"missing.rlb", b"missing", [0, 1, 2]);
+        let control = factory2_test_control_effects(vec![selected, unselected], Some(0), Some(3));
+
+        assert!(
+            factory2_selected_fx_resources_are_representable(&manager, &control, &[4])
+                .expect("valid selected FX resource")
+        );
+    }
+
+    #[test]
+    fn factory2_fx_guard_rejects_unknown_types_missing_inputs_and_bad_points() {
+        for opcode in [1, 6, 10] {
+            let fxid = factory2_test_fxid_payload(&[opcode]);
+            let manager = factory2_test_fxid_manager(&[(b"effect", FXID_KIND, &fxid)]);
+            let row = factory2_test_effect_row(0, 0, b"effects.rlb", b"effect", [0, 0, 0]);
+            let control = factory2_test_control_effects(vec![row], Some(0), Some(1));
+            assert!(
+                !factory2_selected_fx_resources_are_representable(&manager, &control, &[4])
+                    .expect("framed unknown FX command remains unsupported")
+            );
+        }
+
+        let fxid = factory2_test_fxid_payload(&[2]);
+        let manager = factory2_test_fxid_manager(&[(b"effect", FXID_KIND, &fxid)]);
+        for (point_offsets, point_count) in [
+            ([0, 1, 0], Some(1)),
+            ([0, u32::MAX, 0], Some(1)),
+            ([0, 0, 0], None),
+        ] {
+            let row = factory2_test_effect_row(0, 0, b"effects.rlb", b"effect", point_offsets);
+            let control = factory2_test_control_effects(vec![row], Some(0), point_count);
+            assert!(
+                !factory2_selected_fx_resources_are_representable(&manager, &control, &[4])
+                    .expect("unsupported CPT selector remains unknown")
+            );
+        }
+
+        let missing_entry = factory2_test_fxid_manager(&[]);
+        let row = factory2_test_effect_row(0, 0, b"effects.rlb", b"absent", [0, 0, 0]);
+        let control = factory2_test_control_effects(vec![row], Some(0), Some(1));
+        assert!(
+            !factory2_selected_fx_resources_are_representable(&missing_entry, &control, &[4])
+                .expect("missing FX entry is not a decode error")
+        );
+
+        let row = factory2_test_effect_row(0, 0, b"absent.rlb", b"effect", [0, 0, 0]);
+        let control = factory2_test_control_effects(vec![row], Some(0), Some(1));
+        assert!(
+            !factory2_selected_fx_resources_are_representable(&manager, &control, &[4])
+                .expect("missing FX archive is unsupported input")
+        );
+
+        let wrong_type = factory2_test_fxid_manager(&[(b"effect", 0, &fxid)]);
+        let row = factory2_test_effect_row(0, 0, b"effects.rlb", b"effect", [0, 0, 0]);
+        let control = factory2_test_control_effects(vec![row], Some(0), Some(1));
+        assert!(
+            !factory2_selected_fx_resources_are_representable(&wrong_type, &control, &[4])
+                .expect("wrong NRes type is unsupported, not malformed FXID")
+        );
+
+        for archive in [
+            [b'x'; 32],
+            {
+                let mut raw = [0; 32];
+                raw[0] = 0xff;
+                raw[1] = 0;
+                raw
+            },
+            factory2_test_effect_resource_pair(b"../effects.rlb", b"effect").archive,
+        ] {
+            let mut row = factory2_test_effect_row(0, 0, b"effects.rlb", b"effect", [0, 0, 0]);
+            row.resource.archive = archive;
+            let control = factory2_test_control_effects(vec![row], Some(0), Some(1));
+            assert!(
+                !factory2_selected_fx_resources_are_representable(&manager, &control, &[4])
+                    .expect("invalid FX path or string remains unsupported")
+            );
+        }
+
+        let mut row = factory2_test_effect_row(0, 0, b"effects.rlb", b"effect", [0, 0, 0]);
+        row.resource.name = [b'x'; 32];
+        let control = factory2_test_control_effects(vec![row], Some(0), Some(1));
+        assert!(
+            !factory2_selected_fx_resources_are_representable(&manager, &control, &[4])
+                .expect("unterminated resource name is unsupported input")
+        );
+    }
+
+    #[test]
+    fn factory2_fx_guard_fails_on_malformed_recognized_fxid() {
+        let mut malformed_fxid = vec![0; 64];
+        malformed_fxid[..4].copy_from_slice(&1_u32.to_le_bytes());
+        malformed_fxid[60..64].copy_from_slice(&2_u32.to_le_bytes());
+        let manager = factory2_test_fxid_manager(&[(b"effect", FXID_KIND, &malformed_fxid)]);
+        let row = factory2_test_effect_row(0, 0, b"effects.rlb", b"effect", [0, 0, 0]);
+        let control = factory2_test_control_effects(vec![row], Some(0), Some(1));
+
+        assert!(matches!(
+            factory2_selected_fx_resources_are_representable(&manager, &control, &[4]),
+            Err(AssetPreparationError::InvalidPrototype(_))
+        ));
+    }
+
+    #[test]
+    fn factory2_unsupported_ndp_numeric_projection_keeps_valid_mission_loaded() {
+        let control = factory2_test_control_payload(None, None);
+        let request = || MissionRequest {
+            key: "MISSIONS/TEST/data.tma".to_string(),
+            mode: MissionMode::SingleMission,
+        };
+        let unsupported_maxima = [
+            ("subnormal", vec![f32::from_bits(1)]),
+            ("nonfinite", vec![f32::NAN]),
+            ("ordered sum overflow", vec![f32::MAX, f32::MAX]),
+        ];
+
+        for (case, maxima) in unsupported_maxima {
+            let vfs = factory2_test_full_load_vfs_with_maxima(&control, &maxima);
+            let mut engine = create(EngineServices::new(vfs)).expect("factory-2 test engine");
+            load_mission(
+                &mut engine,
+                request(),
+                MissionStartupInput {
+                    queue_time_ms: 100_000,
+                    research_creation_gate: false,
+                },
+            )
+            .unwrap_or_else(|error| {
+                panic!("{case} resolver input aborted a structurally valid load: {error:?}")
+            });
+
+            let table = loaded_mission_control_device_tables(&engine)
+                .expect("loaded Control tables")
+                .first()
+                .expect("synthetic host Control table");
+            let devices = match &table.status {
+                MissionControlDeviceTableStatus::Available(devices) => devices,
+                MissionControlDeviceTableStatus::Unavailable(reason) => {
+                    panic!("synthetic Control table unavailable for {case}: {reason:?}");
+                }
+            };
+            assert_eq!(devices.len(), 1, "{case}");
+            assert_eq!(
+                devices[0].device174_bits, None,
+                "unsupported {case} must stay unknown rather than become zero or NativeMiss"
+            );
+            assert_eq!(
+                query_loaded_mission_control_device_selector(&engine, table.handle, 0, 6),
+                Err(ControlResourceAccessError::UnsupportedField {
+                    factory_tag: 2,
+                    field: "+0x174",
+                }),
+                "unsupported {case} remains visible as an unavailable native value"
+            );
+        }
+    }
+
+    #[test]
+    fn factory2_resolver_accepts_only_known_initial_effect_opcodes() {
+        for opcode in [1, 12] {
+            let control = factory2_test_control_payload(None, Some(opcode));
+            let vfs = factory2_test_resolver_vfs(&control);
+            let manager = AssetManager::new(CachedResourceRepository::new(vfs.clone()));
+            let pair = Factory2StringPair {
+                archive: "objects.rlb".to_string(),
+                name: "foreign".to_string(),
+            };
+
+            assert_eq!(
+                resolve_factory2_pair_from_assets(&manager, vfs.as_ref(), &pair)
+                    .expect("complete known opcode group"),
+                Factory2PairOutcome::Value(0.0_f32.to_bits()),
+                "initial opcode {opcode} is covered"
+            );
+        }
+
+        let control = factory2_test_control_payload(None, Some(4));
+        let vfs = factory2_test_resolver_vfs(&control);
+        let manager = AssetManager::new(CachedResourceRepository::new(vfs.clone()));
+        let pair = Factory2StringPair {
+            archive: "objects.rlb".to_string(),
+            name: "foreign".to_string(),
+        };
+        assert_eq!(
+            resolve_factory2_pair_from_assets(&manager, vfs.as_ref(), &pair)
+                .expect("opcode 4 remains representable as an unknown shape"),
+            Factory2PairOutcome::Unrepresentable
+        );
+    }
+
+    #[test]
+    fn factory2_resolver_keeps_unknown_and_nonbare_pairs_unrepresentable() {
+        let vfs = factory2_test_resolver_vfs(&factory2_test_control_payload(None, None));
+        let manager = AssetManager::new(CachedResourceRepository::new(vfs.clone()));
+        for pair in [
+            Factory2StringPair {
+                archive: "static.rlb".to_string(),
+                name: "foreign".to_string(),
+            },
+            Factory2StringPair {
+                archive: "objects.rlb".to_string(),
+                name: "foreign.msh".to_string(),
+            },
+            Factory2StringPair {
+                archive: "objects.rlb".to_string(),
+                name: "nested/foreign".to_string(),
+            },
+            Factory2StringPair {
+                archive: "objects.rlb".to_string(),
+                name: "missing".to_string(),
+            },
+        ] {
+            assert_eq!(
+                resolve_factory2_pair_from_assets(&manager, vfs.as_ref(), &pair)
+                    .expect("unknown mapping does not become a native miss"),
+                Factory2PairOutcome::Unrepresentable
+            );
+        }
+    }
+
+    #[test]
+    fn factory2_foreign_asset_error_keeps_loaded_world_and_rng() {
+        let valid_vfs = factory2_test_full_load_vfs_with_maxima(
+            &factory2_test_control_payload(None, None),
+            &[6.25],
+        );
+        let mut engine = create(EngineServices::new(valid_vfs)).expect("factory-2 test engine");
+        let request = || MissionRequest {
+            key: "MISSIONS/TEST/data.tma".to_string(),
+            mode: MissionMode::SingleMission,
+        };
+        load_mission(
+            &mut engine,
+            request(),
+            MissionStartupInput {
+                queue_time_ms: 100_000,
+                research_creation_gate: false,
+            },
+        )
+        .expect("initial valid full load");
+        let previous_summary = loaded_mission(&engine).expect("loaded mission").clone();
+        assert_ne!(engine.behavior_rng_state, INITIAL_BEHAVIOR_RNG_STATE);
+        let control_table =
+            &loaded_mission_control_device_tables(&engine).expect("Control table")[0];
+        let MissionControlDeviceTableStatus::Available(devices) = &control_table.status else {
+            panic!("synthetic host Control table should be available");
+        };
+        assert_eq!(devices.len(), 1);
+        assert_eq!(
+            devices[0].device174_bits,
+            Some(6.25_f32.to_bits()),
+            "full-load builder resolves the foreign pair lazily"
+        );
+        let handle = control_table.handle;
+        let retained_transform = TransformState {
+            position: [17.0_f32.to_bits(), 29.0_f32.to_bits(), 41.0_f32.to_bits()],
+            orientation: [0x3f00_0000; 3],
+            scale: [0x3f80_0000; 3],
+        };
+        set_transform(&mut engine.world, handle, retained_transform).expect("set sentinel pose");
+        let previous_rng = engine.behavior_rng_state;
+        engine.services.vfs = Some(factory2_test_full_load_vfs(&[0, 0, 0]));
+
+        let error = load_mission(
+            &mut engine,
+            request(),
+            MissionStartupInput {
+                queue_time_ms: 100_200,
+                research_creation_gate: false,
+            },
+        )
+        .expect_err("malformed foreign CTLD aborts staged loading");
+
+        assert!(matches!(
+            error,
+            EngineError::AssetPreparation {
+                mission,
+                source: AssetPreparationError::InvalidPrototype(_),
+            } if mission == "MISSIONS/TEST/data.tma"
+        ));
+        assert_eq!(loaded_mission(&engine), Some(&previous_summary));
+        assert_eq!(engine.behavior_rng_state, previous_rng);
+        assert_eq!(
+            transform_state(&engine.world, handle),
+            Ok(retained_transform)
+        );
+    }
 
     fn basement_draft(header_flags: Option<u32>, raw_after_name: u32) -> MissionObjectDraft {
         MissionObjectDraft {
@@ -7060,6 +8414,21 @@ mod tests {
             string_bytes: Vec::new(),
             gate_provider: fparkan_assets::PreparedControlGateProvider::NotApplicable,
         }
+    }
+
+    fn set_factory2_pair(record: &mut PreparedControlTypedRecord, archive: &[u8], name: &[u8]) {
+        fn write_words(words: &mut [u32], value: &[u8]) {
+            assert!(value.len() < words.len() * 4, "fixed name needs a NUL");
+            assert!(value.is_ascii(), "synthetic pair must be ASCII");
+            let mut bytes = [0; 32];
+            bytes[..value.len()].copy_from_slice(value);
+            for (word, bytes) in words.iter_mut().zip(bytes.chunks_exact(4)) {
+                *word = u32::from_le_bytes(bytes.try_into().expect("four-byte word"));
+            }
+        }
+
+        write_words(&mut record.fixed_words[27..35], archive);
+        write_words(&mut record.fixed_words[35..43], name);
     }
 
     fn synthetic_component_control(
@@ -7426,6 +8795,7 @@ mod tests {
             multiplier_bits,
             class9_selector0_scale_bits: class9_scale_bits,
             tag26_extra_rate_bits: (factory_tag == 26).then_some(0),
+            device174_bits: (factory_tag == 2).then_some(0),
             class9_values_bits: (factory_tag == 9).then_some([0x3f80_0000; 6]),
             class9_deltas_bits: (factory_tag == 9).then_some([0; 6]),
             native_word_50_bits,
@@ -10942,6 +12312,8 @@ mod tests {
                 [7.0_f32.to_bits(), 11.0_f32.to_bits(), 0, 0, 0];
             draft.scale = [2.0, 3.0, 5.0];
 
+            let mut resolve_factory2_pair =
+                |_: &Factory2StringPair| Factory2PairOutcome::Unrepresentable;
             let projection = build_control_device_projection_with_class(
                 0,
                 &draft,
@@ -10949,6 +12321,7 @@ mod tests {
                 Some(&(0..prototypes.len())),
                 &prototypes,
                 Some(native_class),
+                &mut resolve_factory2_pair,
             )
             .expect("base device and FAC0 projections");
             let profile = projection
@@ -14461,6 +15834,144 @@ mod tests {
             }
         }
         assert_eq!(queried_devices, 100);
+    }
+
+    #[test]
+    #[ignore = "requires licensed AutoDemo corpus"]
+    fn licensed_autodemo_queries_selector_6_for_all_effective_factory2_pairs() {
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(
+            licensed_root("IS"),
+        ))))
+        .expect("engine");
+        load_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Autodemo.00/data.tma".into(),
+                mode: MissionMode::AutoDemo,
+            },
+            MissionStartupInput {
+                queue_time_ms: 100_000,
+                research_creation_gate: false,
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!("full AutoDemo load failed before selector-6 queries: {error:?}")
+        });
+
+        let expected_vectors = [
+            ("bb_m_01", 0x43f9_8000),
+            ("bm_m_01", 0x4422_8000),
+            ("bl_l_01", 0x436a_0000),
+            ("br_b_01", 0x44c8_0000),
+            ("bf_b_01", 0x443b_8000),
+            ("bl_m_01", 0x443b_4000),
+            ("bm_l_01", 0x4334_0000),
+        ];
+        let tables = loaded_mission_control_device_tables(&engine).expect("Control tables");
+        let mut observed = Vec::new();
+        for table in tables {
+            let devices = match &table.status {
+                MissionControlDeviceTableStatus::Available(devices) => devices,
+                MissionControlDeviceTableStatus::Unavailable(reason) => {
+                    panic!(
+                        "Control table for object {:?} is unavailable before selector-6 census: {reason:?}",
+                        table.original_id
+                    );
+                }
+            };
+            for (device_index, device) in devices.iter().enumerate() {
+                if device.descriptor.tag != 2 || device.factory_tag != 2 {
+                    continue;
+                }
+                let pair = factory2_pair_from_record(&device.descriptor);
+                let result = query_loaded_mission_control_device_selector(
+                    &engine,
+                    table.handle,
+                    device_index,
+                    6,
+                );
+                observed.push((table.original_id, device_index, pair, result));
+            }
+        }
+
+        let mut observed_pairs = Vec::new();
+        let mut mismatches = Vec::new();
+        for (original_id, device_index, pair, result) in &observed {
+            let pair_label = pair
+                .as_ref()
+                .map(|pair| format!("{}:{}", pair.archive, pair.name))
+                .unwrap_or_else(|| "<unparsed>".to_string());
+            match result {
+                Ok(Some(value)) => println!(
+                    "selector6 object={original_id:?} device={device_index} pair={pair_label} result=Some({:08x})",
+                    value.to_bits()
+                ),
+                Ok(None) => println!(
+                    "selector6 object={original_id:?} device={device_index} pair={pair_label} result=None"
+                ),
+                Err(error) => println!(
+                    "selector6 object={original_id:?} device={device_index} pair={pair_label} error={error:?}"
+                ),
+            }
+
+            let Some(pair) = pair else {
+                mismatches.push(format!(
+                    "object {original_id:?} device {device_index}: malformed factory-2 pair"
+                ));
+                continue;
+            };
+            if !pair.archive.eq_ignore_ascii_case("objects.rlb") {
+                mismatches.push(format!(
+                    "object {original_id:?} device {device_index}: unexpected archive {}",
+                    pair.archive
+                ));
+                continue;
+            }
+            let name = pair.name.to_ascii_lowercase();
+            if !observed_pairs.contains(&name) {
+                observed_pairs.push(name.clone());
+            }
+            let expected = expected_vectors
+                .iter()
+                .find(|(expected_name, _)| name.as_str() == *expected_name)
+                .map(|(_, bits)| *bits);
+            match (result, expected) {
+                (Ok(Some(value)), Some(expected_bits)) if value.to_bits() == expected_bits => {}
+                (Ok(Some(value)), Some(expected_bits)) => mismatches.push(format!(
+                    "object {original_id:?} device {device_index} pair {name}: expected {expected_bits:08x}, got {:08x}",
+                    value.to_bits()
+                )),
+                (Ok(None), Some(_)) => mismatches.push(format!(
+                    "object {original_id:?} device {device_index} pair {name}: native selector returned None"
+                )),
+                (Err(error), Some(_)) => mismatches.push(format!(
+                    "object {original_id:?} device {device_index} pair {name}: {error:?}"
+                )),
+                (_, None) => mismatches.push(format!(
+                    "object {original_id:?} device {device_index}: pair {name} is not in the frozen native vectors"
+                )),
+            }
+        }
+
+        observed_pairs.sort();
+        let mut expected_pairs = expected_vectors
+            .iter()
+            .map(|(name, _)| (*name).to_string())
+            .collect::<Vec<_>>();
+        expected_pairs.sort();
+        println!(
+            "selector6 census: effective_devices={}, distinct_pairs={}, pairs={observed_pairs:?}",
+            observed.len(),
+            observed_pairs.len()
+        );
+        assert_eq!(
+            observed_pairs, expected_pairs,
+            "actual effective AutoDemo factory-2 pair census differs from the frozen vector set"
+        );
+        assert!(
+            mismatches.is_empty(),
+            "selector-6 mismatches: {mismatches:#?}"
+        );
     }
 
     #[test]

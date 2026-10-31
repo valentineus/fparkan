@@ -2112,6 +2112,33 @@ impl<R: ResourceRepository> AssetManager<R> {
     ) -> Result<MissionAssetPlan, AssetError> {
         build_mission_asset_plan_with_repository(&self.repository, prototypes)
     }
+
+    /// Reads raw opcodes from the validated initial Control effect group.
+    ///
+    /// A complete no-effect section or an out-of-range raw initial-group
+    /// selector returns `Some(Vec::new())`; unsupported shapes return `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssetError`] when the Control resource is malformed.
+    pub fn initial_control_effect_opcodes(
+        &self,
+        source: &ResourceKey,
+        model_node_count: usize,
+        prototype_index: usize,
+    ) -> Result<Option<Vec<u32>>, AssetError> {
+        let Some(payload) = read_optional_key(&self.repository, source, Some("component control"))?
+        else {
+            return Ok(None);
+        };
+        let (_, opcodes) = decode_component_control_payload_with_opcodes(
+            &payload,
+            source.clone(),
+            model_node_count,
+            prototype_index,
+        )?;
+        Ok(opcodes)
+    }
 }
 
 /// Produces a count-only plan from a prototype graph.
@@ -3881,6 +3908,7 @@ const CONTROL_EFFECT_ROW_BYTES: usize = 100;
 struct DecodedComponentEffectSection {
     section: PreparedControlEffectSection,
     initial_effect_group: Option<usize>,
+    initial_group_opcodes: Option<Vec<u32>>,
     typed_records: Vec<PreparedControlTypedRecord>,
 }
 
@@ -3905,6 +3933,7 @@ where
                 }
             },
             initial_effect_group: None,
+            initial_group_opcodes: (cursor == payload.len()).then(Vec::new),
             typed_records: Vec::new(),
         });
     }
@@ -3926,6 +3955,7 @@ where
                     typed_record_tag: Some(tag),
                 },
                 initial_effect_group: None,
+                initial_group_opcodes: None,
                 typed_records,
             });
         }
@@ -4015,8 +4045,9 @@ where
     }
 
     if effect_group_count == 0 {
+        let complete = cursor == payload.len();
         return Ok(DecodedComponentEffectSection {
-            section: if cursor == payload.len() {
+            section: if complete {
                 PreparedControlEffectSection::Parsed(Vec::new())
             } else {
                 PreparedControlEffectSection::Unsupported {
@@ -4025,6 +4056,7 @@ where
                 }
             },
             initial_effect_group: None,
+            initial_group_opcodes: complete.then(Vec::new),
             typed_records,
         });
     }
@@ -4043,6 +4075,7 @@ where
     .filter(|group| *group < effect_group_count);
     cursor = group_header_end;
 
+    let mut initial_group_opcodes = Some(Vec::new());
     let mut effect_rows = Vec::new();
     for table_index in 0..effect_group_count {
         let row_count = usize::try_from(
@@ -4069,7 +4102,14 @@ where
         for row_index in 0..row_count {
             let row_start = rows_start + row_index * CONTROL_EFFECT_ROW_BYTES;
             let row = &payload[row_start..row_start + CONTROL_EFFECT_ROW_BYTES];
-            if control_u32_at(row, 0x0C) != Some(4) {
+            let opcode = control_u32_at(row, 0x0C).expect("fixed effect row has opcode");
+            if initial_effect_group == Some(table_index) {
+                initial_group_opcodes
+                    .as_mut()
+                    .expect("valid initial group has an opcode list")
+                    .push(opcode);
+            }
+            if opcode != 4 {
                 continue;
             }
             let raw_condition = [
@@ -4108,12 +4148,14 @@ where
                 typed_record_tag: None,
             },
             initial_effect_group: None,
+            initial_group_opcodes: None,
             typed_records,
         });
     }
     Ok(DecodedComponentEffectSection {
         section: PreparedControlEffectSection::Parsed(effect_rows),
         initial_effect_group,
+        initial_group_opcodes,
         typed_records,
     })
 }
@@ -4130,6 +4172,21 @@ fn decode_component_control_payload(
     model_node_count: usize,
     prototype_index: usize,
 ) -> Result<PreparedComponentControl, AssetError> {
+    decode_component_control_payload_with_opcodes(
+        payload,
+        source,
+        model_node_count,
+        prototype_index,
+    )
+    .map(|(control, _)| control)
+}
+
+fn decode_component_control_payload_with_opcodes(
+    payload: &[u8],
+    source: ResourceKey,
+    model_node_count: usize,
+    prototype_index: usize,
+) -> Result<(PreparedComponentControl, Option<Vec<u32>>), AssetError> {
     const HEADER_BYTES: usize = 5 * 4;
     const FIXED_SECTION_BYTES: usize = 108;
     const SECTION_FIXED_BYTES: usize = 156;
@@ -4267,18 +4324,22 @@ fn decode_component_control_payload(
         &invalid,
     )?;
 
-    Ok(PreparedComponentControl {
-        source,
-        native_profile_words,
-        model_node_count,
-        bindings,
-        timeline_rows,
-        typed_records: decoded_effect.typed_records,
-        node_data: None,
-        effect_section: decoded_effect.section,
-        initial_effect_group: decoded_effect.initial_effect_group,
-        point_list: None,
-    })
+    let initial_group_opcodes = decoded_effect.initial_group_opcodes;
+    Ok((
+        PreparedComponentControl {
+            source,
+            native_profile_words,
+            model_node_count,
+            bindings,
+            timeline_rows,
+            typed_records: decoded_effect.typed_records,
+            node_data: None,
+            effect_section: decoded_effect.section,
+            initial_effect_group: decoded_effect.initial_effect_group,
+            point_list: None,
+        },
+        initial_group_opcodes,
+    ))
 }
 
 fn sibling_name(key: &ResourceKey, extension: &str) -> Result<ResourceName, AssetError> {
@@ -6801,6 +6862,138 @@ mod tests {
         let out_of_range = decode_component_control_payload(&payload, source, 2, 3)
             .expect("out-of-range selector does not invalidate tables");
         assert_eq!(out_of_range.initial_effect_group, None);
+    }
+
+    #[test]
+    fn initial_control_effect_opcodes_keep_raw_selected_rows_in_order() {
+        let source = ResourceKey {
+            archive: parse_path("controls.rlb").expect("archive"),
+            name: resource_name(b"parts.ctl"),
+            type_id: None,
+        };
+        let mut payload = component_control_payload(&[]);
+        payload[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        let group_header = payload.len();
+        payload.resize(group_header + CONTROL_EFFECT_GROUP_HEADER_BYTES, 0);
+        let opcodes = [1, 4, 4, 12];
+        append_effect_table(
+            &mut payload,
+            &opcodes.map(|opcode| effect_row(opcode, [0; 3], [0; 3], 0, "", "")),
+        );
+
+        let (control, decoded_opcodes) =
+            decode_component_control_payload_with_opcodes(&payload, source.clone(), 2, 0)
+                .expect("complete selected group");
+        assert_eq!(decoded_opcodes, Some(opcodes.to_vec()));
+        let PreparedControlEffectSection::Parsed(rows) = control.effect_section else {
+            panic!("opcode-4 projection should remain parsed");
+        };
+        assert_eq!(
+            rows.iter().map(|row| row.row_index).collect::<Vec<_>>(),
+            [1, 2]
+        );
+
+        let repository = repository_with_archives(&[("controls.rlb", &[(b"parts.ctl", &payload)])]);
+        let manager = AssetManager::new(repository);
+        assert_eq!(
+            manager
+                .initial_control_effect_opcodes(&source, 2, 0)
+                .expect("public raw-opcode scanner"),
+            Some(opcodes.to_vec())
+        );
+    }
+
+    #[test]
+    fn initial_control_effect_opcodes_distinguish_complete_empty_from_unknown_shapes() {
+        let source = |name: &[u8]| ResourceKey {
+            archive: parse_path("controls.rlb").expect("archive"),
+            name: resource_name(name),
+            type_id: None,
+        };
+        let empty = component_control_payload(&[]);
+
+        let mut selected_noop = component_control_payload(&[]);
+        selected_noop[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        let noop_header = selected_noop.len();
+        selected_noop.resize(noop_header + CONTROL_EFFECT_GROUP_HEADER_BYTES, 0);
+        append_effect_table(&mut selected_noop, &[]);
+
+        let mut unsupported = component_control_payload(&[]);
+        unsupported[12..16].copy_from_slice(&1_u32.to_le_bytes());
+        append_typed_record(&mut unsupported, 99, 0);
+
+        let mut trailing_data = component_control_payload(&[]);
+        trailing_data.push(0xAA);
+        let repository = repository_with_archives(&[(
+            "controls.rlb",
+            &[
+                (b"empty.ctl", &empty),
+                (b"noop.ctl", &selected_noop),
+                (b"unsupported.ctl", &unsupported),
+                (b"trailing.ctl", &trailing_data),
+            ],
+        )]);
+        let manager = AssetManager::new(repository);
+
+        assert_eq!(
+            manager
+                .initial_control_effect_opcodes(&source(b"empty.ctl"), 2, 0)
+                .expect("complete empty CTLD"),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            manager
+                .initial_control_effect_opcodes(&source(b"noop.ctl"), 2, 0)
+                .expect("complete no-op selected group"),
+            Some(Vec::new())
+        );
+        for name in [b"unsupported.ctl".as_slice(), b"trailing.ctl".as_slice()] {
+            assert_eq!(
+                manager
+                    .initial_control_effect_opcodes(&source(name), 2, 0)
+                    .expect("unsupported but bounded shape"),
+                None,
+                "{} remains unavailable",
+                String::from_utf8_lossy(name)
+            );
+        }
+    }
+
+    #[test]
+    fn initial_control_effect_opcodes_treat_out_of_range_initial_indices_as_known_empty() {
+        let make_payload = |raw_initial_group: u32| {
+            let mut payload = component_control_payload(&[]);
+            payload[16..20].copy_from_slice(&1_u32.to_le_bytes());
+            let group_header = payload.len();
+            payload.resize(group_header + CONTROL_EFFECT_GROUP_HEADER_BYTES, 0);
+            payload[group_header..group_header + 4]
+                .copy_from_slice(&raw_initial_group.to_le_bytes());
+            append_effect_table(&mut payload, &[effect_row(1, [0; 3], [0; 3], 0, "", "")]);
+            payload
+        };
+        let sentinel = make_payload(u32::MAX);
+        let exact_count = make_payload(1);
+        let repository = repository_with_archives(&[(
+            "controls.rlb",
+            &[
+                (b"sentinel.ctl", &sentinel),
+                (b"exact-count.ctl", &exact_count),
+            ],
+        )]);
+        let manager = AssetManager::new(repository);
+        let sources =
+            [b"sentinel.ctl".as_slice(), b"exact-count.ctl".as_slice()].map(|name| ResourceKey {
+                archive: parse_path("controls.rlb").expect("archive"),
+                name: resource_name(name),
+                type_id: None,
+            });
+        let results = sources.map(|source| {
+            manager
+                .initial_control_effect_opcodes(&source, 2, 0)
+                .expect("complete CTLD frames")
+        });
+
+        assert_eq!(results, [Some(Vec::new()), Some(Vec::new())]);
     }
 
     #[test]
