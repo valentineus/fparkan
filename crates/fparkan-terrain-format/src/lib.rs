@@ -58,7 +58,7 @@ pub struct TerrainMaterialLayers {
     pub overlay_selector: Option<u8>,
 }
 
-/// One `World3D` material-manager lookup key.
+/// One `World3D` material-manager phase query.
 ///
 /// The original manager selects a WEAR table in the upper 16 bits and its
 /// positional material row in the lower 16 bits.
@@ -68,6 +68,9 @@ pub struct TerrainMaterialSelection {
     pub table_index: u16,
     /// Positional material row in that WEAR table.
     pub material_index: u16,
+    /// Animation block passed separately to GetMaterialPhase. The multitexture
+    /// path uses block 1 for Land2, with the material sampler's block-0 fallback.
+    pub animation_block_index: usize,
 }
 
 impl TerrainMaterialSelection {
@@ -99,6 +102,7 @@ impl TerrainMaterialLayers {
         TerrainMaterialSelection {
             table_index: 0,
             material_index: u16::from(self.base_selector),
+            animation_block_index: 0,
         }
     }
 
@@ -109,27 +113,30 @@ impl TerrainMaterialLayers {
             .map(|material_index| TerrainMaterialSelection {
                 table_index: 0,
                 material_index: u16::from(material_index),
+                animation_block_index: 0,
             })
     }
 
-    /// Returns the detail selection corresponding to the base row in
-    /// `Land2.wea`.
+    /// Returns the multitexture detail selection corresponding to the base
+    /// row in `Land2.wea`.
     #[must_use]
     pub fn detail_base_selection(self) -> TerrainMaterialSelection {
         TerrainMaterialSelection {
             table_index: 1,
             material_index: u16::from(self.base_selector),
+            animation_block_index: 1,
         }
     }
 
-    /// Returns the optional detail selection corresponding to the overlay row
-    /// in `Land2.wea`.
+    /// Returns the optional multitexture detail selection corresponding to
+    /// the overlay row in `Land2.wea`.
     #[must_use]
     pub fn detail_overlay_selection(self) -> Option<TerrainMaterialSelection> {
         self.overlay_selector
             .map(|material_index| TerrainMaterialSelection {
                 table_index: 1,
                 material_index: u16::from(material_index),
+                animation_block_index: 1,
             })
     }
 }
@@ -1948,6 +1955,7 @@ mod tests {
             TerrainMaterialSelection {
                 table_index: 0,
                 material_index: 2,
+                animation_block_index: 0,
             }
         );
         assert_eq!(
@@ -1968,10 +1976,25 @@ mod tests {
         assert_eq!(
             document.faces[0]
                 .material_layers()
+                .detail_base_selection()
+                .animation_block_index,
+            1
+        );
+        assert_eq!(
+            document.faces[0]
+                .material_layers()
                 .detail_overlay_selection()
                 .expect("detail overlay")
                 .phase_key(),
             0x0001_0001
+        );
+        assert_eq!(
+            document.faces[0]
+                .material_layers()
+                .detail_overlay_selection()
+                .unwrap()
+                .animation_block_index,
+            1
         );
 
         raw_face[4..6].copy_from_slice(&0xff03_u16.to_le_bytes());
@@ -1989,6 +2012,7 @@ mod tests {
             TerrainMaterialSelection {
                 table_index: 0,
                 material_index: 3,
+                animation_block_index: 0,
             }
         );
         assert_eq!(

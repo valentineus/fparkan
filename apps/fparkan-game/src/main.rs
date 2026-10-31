@@ -8639,14 +8639,38 @@ fn static_preview_terrain_base_materials(
             }
             let initial_phase_index =
                 usize::from(static_material_phase.unwrap_or(0)).min(phase_count.saturating_sub(1));
-            let initial_detail_phase_index = usize::from(static_material_phase.unwrap_or(0))
-                .min(detail_phases.len().saturating_sub(1));
+            let initial_detail_phase_index = if let Some(phase) = static_material_phase {
+                usize::from(phase).min(detail_phases.len().saturating_sub(1))
+            } else {
+                sample_material_phase(
+                    &detail_document,
+                    layers.detail_base_selection().animation_block_index,
+                    0,
+                    0,
+                    0,
+                )
+                .map_err(|error| format!("sample terrain detail material: {error}"))?
+                .phase_index
+            };
             let initial_overlay_phase_index = overlay_phases.as_ref().map(|phases| {
                 usize::from(static_material_phase.unwrap_or(0)).min(phases.len().saturating_sub(1))
             });
-            let initial_overlay_detail_phase_index = overlay_detail_phases.as_ref().map(|phases| {
-                usize::from(static_material_phase.unwrap_or(0)).min(phases.len().saturating_sub(1))
-            });
+            let initial_overlay_detail_phase_index = overlay_detail_phases
+                .as_ref()
+                .zip(overlay_detail_document.as_ref())
+                .zip(overlay_detail_selection)
+                .map(|((phases, document), selection)| {
+                    if let Some(phase) = static_material_phase {
+                        Ok(usize::from(phase).min(phases.len().saturating_sub(1)))
+                    } else {
+                        sample_material_phase(document, selection.animation_block_index, 0, 0, 0)
+                            .map(|sample| sample.phase_index)
+                            .map_err(|error| {
+                                format!("sample terrain overlay detail material: {error}")
+                            })
+                    }
+                })
+                .transpose()?;
             let mut phase_material_indices = Vec::with_capacity(phase_count);
             for phase_index in 0..phase_count {
                 let (base, base_phase) = &base_phases[phase_index];
@@ -8776,7 +8800,7 @@ fn static_preview_terrain_base_materials(
                 },
                 detail: Some(MaterialPhaseBinding {
                     document: detail_document,
-                    animation_block_index: 0,
+                    animation_block_index: layers.detail_base_selection().animation_block_index,
                     wear_row_start_ms: 0,
                     random_state: packed_tag as u32 ^ 0x5A5A_A5A5,
                     frozen_phase_index: static_material_phase.map(usize::from),
@@ -8792,7 +8816,9 @@ fn static_preview_terrain_base_materials(
                 }),
                 overlay_detail: overlay_detail_document.map(|document| MaterialPhaseBinding {
                     document,
-                    animation_block_index: 0,
+                    animation_block_index: overlay_detail_selection
+                        .expect("overlay detail selection")
+                        .animation_block_index,
                     wear_row_start_ms: 0,
                     random_state: packed_tag as u32 ^ 0xC3C3_3C3C,
                     frozen_phase_index: static_material_phase.map(usize::from),
@@ -13133,6 +13159,53 @@ mod tests {
 
         assert_eq!(prepared, expected_missions);
         assert_eq!(environment_missions, expected_missions);
+    }
+
+    #[test]
+    #[ignore = "requires installed GOG resources; set FPARKAN_GAME_ROOT"]
+    fn gog_terrain_detail_uses_multitexture_animation_block() {
+        let root = std::env::var_os("FPARKAN_GAME_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\GOG Games\Parkan - Iron Strategy"));
+        let mut loader = StandaloneWearMaterialLoader::new(&root);
+        let mut mesh = VulkanStaticMesh::smoke_triangle();
+        mesh.draw_ranges[0].material_index = 0x0102;
+        let mut materials = Vec::new();
+        let mut animations = Vec::new();
+        let selections = static_preview_terrain_base_materials(
+            &mut loader,
+            &root,
+            "DATA/MAPS/Tut_2/Land.msh",
+            &mesh,
+            &mut materials,
+            &mut animations,
+            None,
+        )
+        .expect("prepare real terrain material layers");
+        let binding = &mut animations[0];
+        let sample = binding.detail.as_mut().unwrap().sample(0, 2000).unwrap();
+        assert_eq!(
+            sample.texture_raw.split(|&byte| byte == 0).next().unwrap(),
+            b"L09M.0"
+        );
+        let selected = &materials[usize::from(selections[0].1)];
+        let path = root.join("DATA/MAPS/Tut_2/Land2.wea");
+        let (detail, _) = load_standalone_vulkan_texture(&mut loader, &path, 2, 1).unwrap();
+        let (overlay_detail, _) = load_standalone_vulkan_texture(&mut loader, &path, 1, 1).unwrap();
+        assert!(
+            selected.detail_texture.as_ref() == Some(&detail),
+            "initial detail descriptor must use the multitexture phase"
+        );
+        assert!(
+            selected.overlay_detail_texture.as_ref() == Some(&overlay_detail),
+            "initial overlay-detail descriptor must use the multitexture phase"
+        );
+        assert!(
+            sample_material_animations(&mut animations, &materials, 2000)
+                .unwrap()
+                .stage_phases
+                .is_empty()
+        );
     }
 
     #[test]
