@@ -2,6 +2,13 @@
 
 //! `FParkan` render-planning composition root.
 
+mod camera_capture;
+
+#[cfg(test)]
+use camera_capture::parse_legacy_camera_capture;
+use camera_capture::{
+    load_legacy_camera_capture, selected_atmosphere_seconds, LegacyCameraCapture,
+};
 use fparkan_animation::{AnimationTime, NodePoseBuffer};
 use fparkan_assets::{
     load_material_archive_name_texture_rgba8_and_phase_with_document_from_root,
@@ -79,7 +86,6 @@ use fparkan_terrain::{
     FullSurfaceMask, SurfaceQuery, TerrainLod, TerrainMaterialLayers, TerrainWorld,
 };
 use fparkan_vfs::DirectoryVfs;
-use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::num::NonZeroUsize;
@@ -11097,163 +11103,6 @@ impl Args {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-struct LegacyCameraCapture {
-    schema: String,
-    render_input_usable: Option<bool>,
-    selector0_words: [u32; 16],
-    parented_camera: Option<bool>,
-    effective_world_matrix_space: Option<String>,
-    effective_world_matrix_words: Option<[u32; 16]>,
-    viewport: [i32; 4],
-    near_plane: f32,
-    far_plane: f32,
-    field_of_view_radians: f32,
-    atmosphere_seconds: Option<f32>,
-}
-
-fn selected_atmosphere_seconds(
-    command_line: Option<f32>,
-    capture: Option<&LegacyCameraCapture>,
-) -> Option<f32> {
-    command_line.or_else(|| capture.and_then(|capture| capture.atmosphere_seconds))
-}
-
-impl LegacyCameraCapture {
-    fn preview_matrix_words(&self) -> Result<[u32; 16], String> {
-        match (
-            self.effective_world_matrix_space.as_deref(),
-            self.effective_world_matrix_words,
-        ) {
-            (Some("world"), Some(words)) => Ok(words),
-            (Some(_), _) => Err(
-                "legacy camera effective_world_matrix_space must be 'world'".to_string(),
-            ),
-            (None, Some(_)) => Err(
-                "legacy camera effective_world_matrix_words requires an explicit world-space marker"
-                    .to_string(),
-            ),
-            (None, None) if self.parented_camera == Some(true) => Err(
-                "parented legacy camera requires an effective world-space matrix".to_string(),
-            ),
-            (None, None) => Ok(self.selector0_words),
-        }
-    }
-
-    fn captured_viewport(&self) -> Result<CapturedViewport, String> {
-        let width = self.viewport[2]
-            .checked_sub(self.viewport[0])
-            .filter(|width| *width > 0)
-            .ok_or_else(|| "legacy camera capture has an invalid viewport width".to_string())?;
-        let height = self.viewport[3]
-            .checked_sub(self.viewport[1])
-            .filter(|height| *height > 0)
-            .ok_or_else(|| "legacy camera capture has an invalid viewport height".to_string())?;
-        Ok(CapturedViewport {
-            rect: self.viewport,
-            extent: [
-                u32::try_from(width)
-                    .map_err(|_| "legacy camera viewport width exceeds u32".to_string())?,
-                u32::try_from(height)
-                    .map_err(|_| "legacy camera viewport height exceeds u32".to_string())?,
-            ],
-        })
-    }
-
-    fn preview_camera_frame(&self) -> Result<PreviewCameraFrame, String> {
-        let frame = PreviewCameraFrame::from_legacy_d3d7(
-            RawCameraTransform {
-                words: self.preview_matrix_words()?,
-            },
-            LegacyD3d7Projection {
-                viewport: self.viewport,
-                near_plane: self.near_plane,
-                far_plane: self.far_plane,
-                field_of_view_radians: self.field_of_view_radians,
-            },
-        )
-        .ok_or_else(|| "legacy camera capture contains an invalid D3D7 camera".to_string())?;
-        self.captured_viewport()?;
-        Ok(frame)
-    }
-}
-
-fn load_legacy_camera_capture(path: &std::path::Path) -> Result<LegacyCameraCapture, String> {
-    let bytes = std::fs::read(path).map_err(|err| format!("{}: {err}", path.display()))?;
-    parse_legacy_camera_capture(&bytes).map_err(|err| format!("{}: {err}", path.display()))
-}
-
-fn parse_legacy_camera_capture(bytes: &[u8]) -> Result<LegacyCameraCapture, String> {
-    // Windows PowerShell 5.1 writes redirected text as UTF-16LE with a BOM.
-    // `capture-original-camera.ps1` intentionally emits plain JSON, so accept
-    // that normal hand-off format as well as UTF-8 without making the caller
-    // re-encode a read-only capture file.
-    let json = decode_legacy_camera_capture_json(bytes)?;
-    let capture: LegacyCameraCapture =
-        serde_json::from_str(&json).map_err(|err| format!("invalid legacy camera JSON: {err}"))?;
-    if capture.schema != "fparkan-legacy-camera-v1" {
-        return Err("unsupported legacy camera capture schema".to_string());
-    }
-    if capture.effective_world_matrix_space.is_some()
-        != capture.effective_world_matrix_words.is_some()
-    {
-        return Err(
-            "effective_world_matrix_space and effective_world_matrix_words must be supplied together"
-                .to_string(),
-        );
-    }
-    if capture.render_input_usable == Some(false) {
-        return Err("legacy camera capture is marked render_input_usable=false".to_string());
-    }
-    if capture
-        .atmosphere_seconds
-        .is_some_and(|seconds| !seconds.is_finite() || seconds < 0.0)
-    {
-        return Err(
-            "legacy camera capture atmosphere_seconds must be finite and non-negative".to_string(),
-        );
-    }
-    capture.preview_camera_frame()?;
-    Ok(capture)
-}
-
-fn decode_legacy_camera_capture_json(bytes: &[u8]) -> Result<String, String> {
-    let decode_utf16 = |words: Vec<u16>| {
-        String::from_utf16(&words)
-            .map_err(|err| format!("invalid UTF-16 legacy camera JSON: {err}"))
-    };
-    match bytes {
-        [0xff, 0xfe, rest @ ..] => {
-            let chunks = rest.chunks_exact(2);
-            if !chunks.remainder().is_empty() {
-                return Err("invalid UTF-16LE legacy camera JSON length".to_string());
-            }
-            decode_utf16(
-                chunks
-                    .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-                    .collect(),
-            )
-        }
-        [0xfe, 0xff, rest @ ..] => {
-            let chunks = rest.chunks_exact(2);
-            if !chunks.remainder().is_empty() {
-                return Err("invalid UTF-16BE legacy camera JSON length".to_string());
-            }
-            decode_utf16(
-                chunks
-                    .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
-                    .collect(),
-            )
-        }
-        [0xef, 0xbb, 0xbf, rest @ ..] => std::str::from_utf8(rest)
-            .map(str::to_owned)
-            .map_err(|err| format!("invalid UTF-8 legacy camera JSON: {err}")),
-        _ => std::str::from_utf8(bytes)
-            .map(str::to_owned)
-            .map_err(|err| format!("invalid UTF-8 legacy camera JSON: {err}")),
-    }
-}
-
 fn usage() -> String {
     "usage: fparkan-game --root <path> --mission <path> [--frames <n>] [--atmosphere-seconds <seconds>] [--control-clock-ms <u32>] [--validation] [--preview-roots <non-zero n>] [--legacy-camera-capture <path>] [--static-animation-frame <u16>] [--static-material-phase <u16>] [--readback-out <path>] [--readback-sequence-out <directory>]\nstatic preview uses saved per-component CTLD defaults, with uncontrolled nodes at frame 0; --static-animation-frame overrides all components globally. --control-clock-ms replays one shared MSH/FX clock from zero to the selected time over the requested frames; --readback-sequence-out captures each submitted frame and requires that clock.".to_string()
 }
@@ -15766,6 +15615,7 @@ mod tests {
             far_plane: 1.0,
             field_of_view_radians: 1.0,
             atmosphere_seconds: Some(56.227),
+            geometry_projection: None,
         };
 
         assert_eq!(

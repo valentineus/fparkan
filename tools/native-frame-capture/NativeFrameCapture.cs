@@ -49,6 +49,7 @@ internal static partial class NativeFrameCapture
     private const string Iron3dName = "iron3d.dll";
     private const uint RenderGameRva = 0x13BD0;
     private const uint ProjectionSnapshotRva = 0x13CE4;
+    private const uint GeometryProjectionRva = 0x1D110;
     private const uint RenderReturnRva = 0x13D7B;
     private const uint AtmospherePhaseRva = 0x421DC;
     private const uint FogConsumerRva = 0x2F230;
@@ -101,6 +102,9 @@ internal static partial class NativeFrameCapture
         public uint ProjectionGeneration;
         public uint ProjectionThreadId;
         public ProjectionReadback Projection;
+        public ProjectionReadback GeometryProjection;
+        public uint GeometryProjectionGeneration;
+        public uint GeometryProjectionThreadId;
         public uint CameraWorldGameTimeWord;
         public bool CameraWorldGameTimeWordReadable;
         public uint WorldGameTimeWord;
@@ -736,6 +740,44 @@ internal static partial class NativeFrameCapture
         evidence = "base=0x" + world3dBase.ToString("X8") + " RVA=0x13CE4 bytes="
             + BitConverter.ToString(code) + " global=0x" + relocatedGlobal.ToString("X8");
         return match;
+    }
+
+    private static bool GeometryProjectionMatchesFrame(FrameSnapshot frame)
+    {
+        ProjectionReadback geometry = frame.GeometryProjection;
+        ProjectionReadback boundary = frame.Projection;
+        if (geometry == null || boundary == null || !geometry.Verified || !boundary.Verified || geometry.Mode == 0
+            || frame.GeometryProjectionGeneration == 0
+            || frame.GeometryProjectionGeneration != frame.CameraGeneration
+            || frame.GeometryProjectionGeneration != frame.ProjectionGeneration
+            || frame.GeometryProjectionThreadId != frame.CameraThreadId
+            || frame.GeometryProjectionThreadId != frame.ProjectionThreadId
+            || geometry.Renderer != boundary.Renderer || geometry.Far != boundary.Far
+            || geometry.Fov != boundary.Fov) return false;
+        for (int i = 0; i < 4; i++)
+            if (geometry.Viewport[i] != boundary.Viewport[i]) return false;
+        return true;
+    }
+
+    private static void AppendGeometryProjectionJson(StringBuilder json, FrameSnapshot frame)
+    {
+        if (!GeometryProjectionMatchesFrame(frame))
+        {
+            json.AppendLine("  \"geometry_projection\": null,");
+            return;
+        }
+        ProjectionReadback p = frame.GeometryProjection;
+        json.AppendLine("  \"geometry_projection\": {");
+        json.AppendLine("    \"verified\": true,");
+        json.AppendLine("    \"sample_boundary\": \"Terrain+0x1D110, before indexed geometry draw\",");
+        json.AppendLine("    \"terrain_module_sha256\": " + JsonString(ExpectedSha256[TerrainName]) + ",");
+        json.AppendLine("    \"frame_generation\": " + frame.GeometryProjectionGeneration + ",");
+        json.AppendLine("    \"thread_id\": " + frame.GeometryProjectionThreadId + ",");
+        json.AppendLine("    \"viewport\": [" + String.Join(", ", p.Viewport) + "],");
+        json.AppendLine("    \"near_plane\": " + p.Near.ToString("R", CultureInfo.InvariantCulture) + ",");
+        json.AppendLine("    \"far_plane\": " + p.Far.ToString("R", CultureInfo.InvariantCulture) + ",");
+        json.AppendLine("    \"field_of_view_radians\": " + p.Fov.ToString("R", CultureInfo.InvariantCulture));
+        json.AppendLine("  },");
     }
 
     private static bool VerifyAtmospherePhaseBoundary(IntPtr process, uint terrainBase,
@@ -1888,6 +1930,7 @@ internal static partial class NativeFrameCapture
         json.AppendLine("  \"far_plane\": " + projection.Far.ToString("R", CultureInfo.InvariantCulture) + ",");
         json.AppendLine("  \"field_of_view_radians\": " + projection.Fov.ToString("R", CultureInfo.InvariantCulture) + ",");
         json.AppendLine("  \"projection_mode_byte\": " + projection.Mode.ToString(CultureInfo.InvariantCulture) + ",");
+        AppendGeometryProjectionJson(json, frame);
         if (frame.SelectedCamera == null) json.AppendLine("  \"selected_camera\": null,");
         else
         {
@@ -1996,6 +2039,7 @@ internal static partial class NativeFrameCapture
         if (IntPtr.Size != 4) throw new InvalidOperationException("This helper must be compiled and run as x86.");
         SelfCheckCameraInput();
         SelfCheckSelectedCameraWarmup();
+        SelfCheckGeometryProjection();
         SelfCheckNativeFogPairing();
         SelfCheckRenderInvocationGates();
         SelfCheckDebugEventHandleOwnership();
@@ -2304,6 +2348,34 @@ internal static partial class NativeFrameCapture
         Console.WriteLine("self-check: selected EndScene readback requires same-thread/generation/renderer, idle scene state and successful HRESULT; Present confirms staged pixels without intervening render OK");
         Console.WriteLine("self-check: boundary trace requires matching BeginScene/projection/EndScene/Present/World3D-return order, successful probes, and verified cleanup; probe failure, process exit, fatal state, and invalid event sequences cannot report success");
         return SelfCheckReadback();
+    }
+
+    private static void SelfCheckGeometryProjection()
+    {
+        FrameSnapshot frame = new FrameSnapshot {
+            CameraGeneration = 7, ProjectionGeneration = 7, GeometryProjectionGeneration = 7,
+            CameraThreadId = 11, ProjectionThreadId = 11, GeometryProjectionThreadId = 11,
+            Projection = new ProjectionReadback { Renderer = 100, Viewport = new int[] { 0, 0, 1280, 1024 },
+                Near = 5, Far = 700, Fov = 1.3f, Mode = 1, Verified = true },
+            GeometryProjection = new ProjectionReadback { Renderer = 100, Viewport = new int[] { 0, 0, 1280, 1024 },
+                Near = 0.5f, Far = 700, Fov = 1.3f, Mode = 1, Verified = true }
+        };
+        StringBuilder json = new StringBuilder("{\n");
+        AppendGeometryProjectionJson(json, frame);
+        json.Append("\"end\":true}");
+        Dictionary<string, object> parsed = new System.Web.Script.Serialization.JavaScriptSerializer()
+            .Deserialize<Dictionary<string, object>>(json.ToString());
+        Dictionary<string, object> projection = (Dictionary<string, object>)parsed["geometry_projection"];
+        if (Convert.ToSingle(projection["near_plane"]) != 0.5f)
+            throw new InvalidOperationException("Geometry projection must preserve draw near, not restored camera near.");
+        frame.GeometryProjectionThreadId++;
+        if (GeometryProjectionMatchesFrame(frame)) throw new InvalidOperationException("Geometry projection thread mismatch accepted.");
+        frame.GeometryProjectionThreadId--;
+        frame.GeometryProjectionGeneration--;
+        if (GeometryProjectionMatchesFrame(frame)) throw new InvalidOperationException("Geometry projection generation mismatch accepted.");
+        frame.GeometryProjectionGeneration++;
+        frame.GeometryProjection.Viewport[2]--;
+        if (GeometryProjectionMatchesFrame(frame)) throw new InvalidOperationException("Geometry projection viewport mismatch accepted.");
     }
 
     private static void SelfCheckNativeFogPairing()
@@ -2945,6 +3017,7 @@ internal static partial class NativeFrameCapture
         string terrainModuleSha256 = null;
         BreakpointInfo cameraBreakpoint = null;
         BreakpointInfo projectionBreakpoint = null;
+        BreakpointInfo geometryProjectionBreakpoint = null;
         BreakpointInfo returnBreakpoint = null;
         BreakpointInfo atmosphereBreakpoint = null;
         BreakpointInfo beginSceneBreakpoint = null;
@@ -3128,6 +3201,13 @@ internal static partial class NativeFrameCapture
                                 throw new InvalidOperationException("Loaded Terrain hash mismatch: " + hash);
                             terrainBase = imageBase;
                             terrainModuleSha256 = hash;
+                            byte[] geometryPrefix = new byte[] { 0x81, 0xEC, 0xBC, 0, 0, 0, 0x53, 0x55, 0x8B, 0xE9 };
+                            byte[] geometryCode = new byte[geometryPrefix.Length];
+                            if (!ReadExact(process, unchecked(terrainBase + GeometryProjectionRva), geometryCode)
+                                || !ByteArraysEqual(geometryCode, geometryPrefix))
+                                throw new InvalidOperationException("Terrain geometry projection boundary signature failed.");
+                            geometryProjectionBreakpoint = ArmBreakpoint(process, "Terrain.geometry-projection",
+                                unchecked(terrainBase + GeometryProjectionRva), geometryPrefix[0]);
                             byte atmosphereByte;
                             string atmosphereEvidence;
                             if (!VerifyAtmospherePhaseBoundary(process, terrainBase, out atmosphereByte, out atmosphereEvidence))
@@ -3593,6 +3673,9 @@ internal static partial class NativeFrameCapture
                                 hitBreakpoint = cameraBreakpoint;
                             else if (projectionBreakpoint != null && projectionBreakpoint.Armed && exceptionAddress == projectionBreakpoint.Address)
                                 hitBreakpoint = projectionBreakpoint;
+                            else if (geometryProjectionBreakpoint != null && geometryProjectionBreakpoint.Armed
+                                && exceptionAddress == geometryProjectionBreakpoint.Address)
+                                hitBreakpoint = geometryProjectionBreakpoint;
                             else if (returnBreakpoint != null && returnBreakpoint.Armed && exceptionAddress == returnBreakpoint.Address)
                                 hitBreakpoint = returnBreakpoint;
                             else if (atmosphereBreakpoint != null && atmosphereBreakpoint.Armed && exceptionAddress == atmosphereBreakpoint.Address)
@@ -3666,6 +3749,12 @@ internal static partial class NativeFrameCapture
                                             && !RestoreBreakpointWhileStopped(process, fogConsumerBreakpoint))
                                             throw new InvalidOperationException("Could not disarm the previous generation's native fog boundary.");
                                         frame.CameraGeneration++;
+                                        frame.GeometryProjection = null;
+                                        frame.GeometryProjectionGeneration = 0;
+                                        frame.GeometryProjectionThreadId = 0;
+                                        if (geometryProjectionBreakpoint != null && !geometryProjectionBreakpoint.Armed)
+                                            geometryProjectionBreakpoint = ArmBreakpoint(process, "Terrain.geometry-projection",
+                                                geometryProjectionBreakpoint.Address, geometryProjectionBreakpoint.OriginalByte);
                                         ResetNativeFogForGeneration(frame);
                                         frame.CameraThreadId = eventTid;
                                         frame.CameraWorldGameTimeWordReadable = false;
@@ -3752,6 +3841,25 @@ internal static partial class NativeFrameCapture
                                         if (fogConsumerBoundaryVerified && frame.Camera != null && frame.Camera.LayoutVerified)
                                             EnsureFogConsumerBreakpoint(process, terrainBase, fogConsumerOriginalByte,
                                                 frame, eventTid, ref fogConsumerBreakpoint);
+                                    }
+                                }
+                                else if (hitBreakpoint == geometryProjectionBreakpoint)
+                                {
+                                    uint esp = BitConverter.ToUInt32(stoppedContext, ContextEspOffset);
+                                    if (frame.Camera != null && frame.CameraThreadId == eventTid && ngiBase != 0
+                                        && ReadU32Exact(process, esp + 8) == frame.Camera.Camera + 0x60
+                                        && ReadU32Exact(process, esp + 4) == ReadU32Exact(process, ngiBase + NgiRendererGlobalRva))
+                                    {
+                                        ProjectionReadback p = ReadProjection(process, ngiBase);
+                                        if (p.Verified && p.Mode != 0)
+                                        {
+                                            frame.GeometryProjection = p;
+                                            frame.GeometryProjectionGeneration = frame.CameraGeneration;
+                                            frame.GeometryProjectionThreadId = eventTid;
+                                            Log("GEOMETRY_PROJECTION generation=" + frame.CameraGeneration + " tid=" + eventTid
+                                                + " near=" + p.Near.ToString("R", CultureInfo.InvariantCulture)
+                                                + " far=" + p.Far.ToString("R", CultureInfo.InvariantCulture));
+                                        }
                                     }
                                 }
                                 else if (hitBreakpoint == projectionBreakpoint)
@@ -3978,7 +4086,7 @@ internal static partial class NativeFrameCapture
                                             {
                                                 remote = StartRemoteSurfaceProbe(process, eventTid, ngiBase,
                                                     returnBreakpoint, frame,
-                                                    new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint,
+                                                    new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint, geometryProjectionBreakpoint,
                                                         returnBreakpoint, atmosphereBreakpoint, beginSceneBreakpoint,
                                                         fogConsumerBreakpoint,
                                                         endSceneBreakpoint, presentBreakpoint,
@@ -4126,7 +4234,7 @@ internal static partial class NativeFrameCapture
                                             {
                                                 remote = StartRemoteSurfaceProbe(process, eventTid, ngiBase,
                                                     endSceneBreakpoint, frame,
-                                                    new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint,
+                                                    new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint, geometryProjectionBreakpoint,
                                                         returnBreakpoint, atmosphereBreakpoint, beginSceneBreakpoint,
                                                         endSceneBreakpoint,
                                                         fogConsumerBreakpoint, presentBreakpoint,
@@ -4174,7 +4282,7 @@ internal static partial class NativeFrameCapture
                                             {
                                                 remote = StartRemoteBoundaryReadback(process, eventTid, ngiBase,
                                                     endSceneBreakpoint, frame, outputPath,
-                                                    new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint,
+                                                    new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint, geometryProjectionBreakpoint,
                                                         returnBreakpoint, atmosphereBreakpoint, beginSceneBreakpoint,
                                                         endSceneBreakpoint,
                                                         fogConsumerBreakpoint, presentBreakpoint,
@@ -4392,6 +4500,8 @@ internal static partial class NativeFrameCapture
                                     if (hitBreakpoint == fogConsumerBreakpoint)
                                         rearmAfterStep = !frame.NativeFogSamplingStopped
                                             && !frame.NativeFogSampleLimitExceeded;
+                                    if (hitBreakpoint == geometryProjectionBreakpoint)
+                                        rearmAfterStep = frame.GeometryProjection == null;
                                     BeginSingleStep(process, eventTid, hitBreakpoint, stoppedContext,
                                         out pendingStep, rearmAfterStep);
                                     Log("SINGLE_STEP_STARTED boundary=" + hitBreakpoint.Name + " tid=" + eventTid);
@@ -4464,7 +4574,7 @@ internal static partial class NativeFrameCapture
                     captureFailure = captureFailure ?? "No matching native camera/projection/present frame completed before the bounded timeout.";
                     Log("NO_FRAME_CAPTURE bounded timeout at stopped debug event");
                     if (!RestoreArmedBreakpointsWhileStopped(process,
-                        cameraBreakpoint, projectionBreakpoint, returnBreakpoint, atmosphereBreakpoint,
+                        cameraBreakpoint, projectionBreakpoint, geometryProjectionBreakpoint, returnBreakpoint, atmosphereBreakpoint,
                         beginSceneBreakpoint,
                         endSceneBreakpoint, fogConsumerBreakpoint, presentBreakpoint,
                         presentCompletionBreakpoint, missionBreakpoint))
@@ -4484,6 +4594,7 @@ internal static partial class NativeFrameCapture
                     && !fatal && !processExited
                     && (cameraBreakpoint != null && cameraBreakpoint.Armed
                         || projectionBreakpoint != null && projectionBreakpoint.Armed
+                        || geometryProjectionBreakpoint != null && geometryProjectionBreakpoint.Armed
                         || returnBreakpoint != null && returnBreakpoint.Armed
                         || atmosphereBreakpoint != null && atmosphereBreakpoint.Armed
                         || beginSceneBreakpoint != null && beginSceneBreakpoint.Armed
@@ -4494,7 +4605,7 @@ internal static partial class NativeFrameCapture
                         || missionBreakpoint != null && missionBreakpoint.Armed))
                 {
                     if (!RestoreArmedBreakpointsWhileStopped(process,
-                        cameraBreakpoint, projectionBreakpoint, returnBreakpoint, atmosphereBreakpoint,
+                        cameraBreakpoint, projectionBreakpoint, geometryProjectionBreakpoint, returnBreakpoint, atmosphereBreakpoint,
                         beginSceneBreakpoint,
                         endSceneBreakpoint, fogConsumerBreakpoint, presentBreakpoint,
                         presentCompletionBreakpoint, missionBreakpoint))
@@ -4543,6 +4654,7 @@ internal static partial class NativeFrameCapture
                 || cameraMutationUnrestored || eventOutstanding
                 || cameraBreakpoint != null && cameraBreakpoint.Armed
                 || projectionBreakpoint != null && projectionBreakpoint.Armed
+                || geometryProjectionBreakpoint != null && geometryProjectionBreakpoint.Armed
                 || returnBreakpoint != null && returnBreakpoint.Armed
                 || atmosphereBreakpoint != null && atmosphereBreakpoint.Armed
                 || beginSceneBreakpoint != null && beginSceneBreakpoint.Armed
@@ -4572,7 +4684,7 @@ internal static partial class NativeFrameCapture
                     if (DrainFrameTerminationEvents(process, eventBuffer, processId,
                         ref eventOutstanding, ref outstandingPid, ref outstandingTid, ref outstandingCode,
                         ref outstandingContinueStatus, ref outstandingFileHandleClosed,
-                        new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint, returnBreakpoint,
+                        new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint, geometryProjectionBreakpoint, returnBreakpoint,
                             atmosphereBreakpoint, beginSceneBreakpoint, endSceneBreakpoint, fogConsumerBreakpoint,
                             presentBreakpoint, presentCompletionBreakpoint, missionBreakpoint },
                         out drainEvidence))
@@ -4641,7 +4753,7 @@ internal static partial class NativeFrameCapture
                                 if (DrainFrameTerminationEvents(process, eventBuffer, processId,
                                     ref eventOutstanding, ref outstandingPid, ref outstandingTid, ref outstandingCode,
                                     ref outstandingContinueStatus, ref outstandingFileHandleClosed,
-                                    new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint, returnBreakpoint,
+                                    new BreakpointInfo[] { cameraBreakpoint, projectionBreakpoint, geometryProjectionBreakpoint, returnBreakpoint,
                                         atmosphereBreakpoint, beginSceneBreakpoint, endSceneBreakpoint, fogConsumerBreakpoint,
                                         presentBreakpoint, presentCompletionBreakpoint, missionBreakpoint },
                                     out drainEvidence))
@@ -4679,7 +4791,7 @@ internal static partial class NativeFrameCapture
                 else Log("PROCESS_STATE_AFTER_DETACH unreadable error=" + Marshal.GetLastWin32Error());
             }
             breakpointsRestored = processExited || AreBreakpointsRestored(cameraBreakpoint,
-                projectionBreakpoint, returnBreakpoint, atmosphereBreakpoint, beginSceneBreakpoint,
+                projectionBreakpoint, geometryProjectionBreakpoint, returnBreakpoint, atmosphereBreakpoint, beginSceneBreakpoint,
                 endSceneBreakpoint, fogConsumerBreakpoint, presentBreakpoint,
                 presentCompletionBreakpoint, missionBreakpoint);
             Log("FINAL_BREAKPOINT_STATE restored=" + breakpointsRestored + " processExited=" + processExited);
@@ -4811,7 +4923,7 @@ internal static partial class NativeFrameCapture
     }
 
     private static bool RestoreArmedBreakpointsWhileStopped(IntPtr process,
-        BreakpointInfo cameraBreakpoint, BreakpointInfo projectionBreakpoint, BreakpointInfo returnBreakpoint,
+        BreakpointInfo cameraBreakpoint, BreakpointInfo projectionBreakpoint, BreakpointInfo geometryProjectionBreakpoint, BreakpointInfo returnBreakpoint,
         BreakpointInfo atmosphereBreakpoint, BreakpointInfo beginSceneBreakpoint, BreakpointInfo endSceneBreakpoint,
         BreakpointInfo fogConsumerBreakpoint,
         BreakpointInfo presentBreakpoint, BreakpointInfo presentCompletionBreakpoint,
@@ -4819,6 +4931,7 @@ internal static partial class NativeFrameCapture
     {
         return RestoreBreakpointWhileStopped(process, cameraBreakpoint)
             && RestoreBreakpointWhileStopped(process, projectionBreakpoint)
+            && RestoreBreakpointWhileStopped(process, geometryProjectionBreakpoint)
             && RestoreBreakpointWhileStopped(process, returnBreakpoint)
             && RestoreBreakpointWhileStopped(process, atmosphereBreakpoint)
             && RestoreBreakpointWhileStopped(process, beginSceneBreakpoint)
@@ -4830,7 +4943,7 @@ internal static partial class NativeFrameCapture
     }
 
     private static bool AreBreakpointsRestored(BreakpointInfo cameraBreakpoint,
-        BreakpointInfo projectionBreakpoint, BreakpointInfo returnBreakpoint,
+        BreakpointInfo projectionBreakpoint, BreakpointInfo geometryProjectionBreakpoint, BreakpointInfo returnBreakpoint,
         BreakpointInfo atmosphereBreakpoint, BreakpointInfo beginSceneBreakpoint, BreakpointInfo endSceneBreakpoint,
         BreakpointInfo fogConsumerBreakpoint,
         BreakpointInfo presentBreakpoint, BreakpointInfo presentCompletionBreakpoint,
@@ -4838,6 +4951,7 @@ internal static partial class NativeFrameCapture
     {
         return (cameraBreakpoint == null || !cameraBreakpoint.Armed)
             && (projectionBreakpoint == null || !projectionBreakpoint.Armed)
+            && (geometryProjectionBreakpoint == null || !geometryProjectionBreakpoint.Armed)
             && (returnBreakpoint == null || !returnBreakpoint.Armed)
             && (atmosphereBreakpoint == null || !atmosphereBreakpoint.Armed)
             && (beginSceneBreakpoint == null || !beginSceneBreakpoint.Armed)
