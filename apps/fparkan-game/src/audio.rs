@@ -629,6 +629,7 @@ pub(crate) struct GameAudio {
     music: Player,
     variations: Player,
     weather_loop: NativeSpatialPlayer,
+    control_sounds: BTreeMap<usize, NativeSpatialPlayer>,
     one_shots: Vec<SpatialOneShot>,
     library: AudioLibrary,
     ambience: AmbienceScheduler,
@@ -672,6 +673,7 @@ impl GameAudio {
             music,
             variations,
             weather_loop,
+            control_sounds: BTreeMap::new(),
             one_shots: Vec::new(),
             library,
             ambience: AmbienceScheduler::new(random_seed(), random_seed()),
@@ -705,6 +707,11 @@ impl GameAudio {
         self.weather_loop
             .set_emitter_position(self.weather_position);
         self.retain_active_one_shots();
+        self.control_sounds.retain(|_, player| !player.empty());
+        for player in self.control_sounds.values() {
+            player.set_left_ear_position(left);
+            player.set_right_ear_position(right);
+        }
         for one_shot in &self.one_shots {
             one_shot.player.set_left_ear_position(left);
             one_shot.player.set_right_ear_position(right);
@@ -825,17 +832,72 @@ impl GameAudio {
             SoundAction::OneShot => {
                 self.retain_active_one_shots();
                 let asset = self.dynamic_sound(&event.archive, &event.name)?;
-                self.one_shots.push(self.new_spatial_one_shot(
+                self.one_shots.push(self.new_spatial_voice(
                     &asset,
                     event.position,
                     volume,
                     min_distance,
                     max_distance,
                     frequency_ratio,
+                    false,
                 )?);
             }
         }
         Ok(())
+    }
+
+    /// Each Control command owns its source; it must not replace the rain
+    /// loop or another instance using the same sample.
+    pub(crate) fn handle_control_sound(
+        &mut self,
+        id: usize,
+        event: &SoundEvent,
+    ) -> Result<(), AudioError> {
+        validate_point(event.position, "Control emitter")?;
+        let frequency_ratio = if event.frequency_ratio.is_finite() && event.frequency_ratio > 0.0 {
+            event.frequency_ratio
+        } else {
+            1.0
+        };
+        match event.action {
+            SoundAction::StartLoop | SoundAction::OneShot => {
+                let asset = self.dynamic_sound(&event.archive, &event.name)?;
+                let voice = self.new_spatial_voice(
+                    &asset,
+                    event.position,
+                    event.volume,
+                    event.min_distance,
+                    event.max_distance,
+                    frequency_ratio,
+                    event.action == SoundAction::StartLoop,
+                )?;
+                if let Some(previous) = self.control_sounds.insert(id, voice.player) {
+                    previous.stop();
+                }
+                eprintln!("control_sound_start id={id} resource={}:{} loop={} position={:?} range={}/{} frequency={}", event.archive, event.name, event.action == SoundAction::StartLoop, event.position, event.min_distance, event.max_distance, event.frequency_ratio);
+            }
+            SoundAction::SetLoopVolume => {
+                if let Some(player) = self.control_sounds.get(&id) {
+                    player.set_emitter_position(event.position);
+                    player.set_sound_parameters(event.min_distance, event.max_distance);
+                    player.set_volume(event.volume);
+                    player.set_speed(frequency_ratio);
+                }
+            }
+            SoundAction::StopLoop => {
+                if let Some(player) = self.control_sounds.remove(&id) {
+                    player.stop();
+                    eprintln!("control_sound_stop id={id}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn control_sound_is_playing(&self, id: usize) -> bool {
+        self.control_sounds
+            .get(&id)
+            .is_some_and(|player| !player.empty())
     }
 
     /// Selects one of the original MUSIC/Track02..10.ogg files and loops it.
@@ -875,6 +937,13 @@ impl GameAudio {
                 one_shot.player.play();
             }
         }
+        for player in self.control_sounds.values() {
+            if paused {
+                player.pause();
+            } else {
+                player.play();
+            }
+        }
     }
 
     /// Focus callback used by the window event loop.
@@ -888,6 +957,9 @@ impl GameAudio {
         self.music.stop();
         self.variations.stop();
         self.weather_loop.stop();
+        for player in self.control_sounds.values() {
+            player.stop();
+        }
         for one_shot in &self.one_shots {
             one_shot.player.stop();
         }
@@ -904,7 +976,7 @@ impl GameAudio {
         Ok(())
     }
 
-    fn new_spatial_one_shot(
+    fn new_spatial_voice(
         &self,
         asset: &SoundAsset,
         emitter: [f32; 3],
@@ -912,6 +984,7 @@ impl GameAudio {
         min_distance: f32,
         max_distance: f32,
         frequency_ratio: f32,
+        looping: bool,
     ) -> Result<SpatialOneShot, AudioError> {
         validate_point(emitter, "emitter")?;
         let (left, right) = ear_positions(self.listener)?;
@@ -919,7 +992,12 @@ impl GameAudio {
         player.set_sound_parameters(min_distance, max_distance);
         player.set_volume(volume);
         player.set_speed(frequency_ratio);
-        player.append(decoder_for(asset)?);
+        let source = decoder_for(asset)?;
+        if looping {
+            player.append(source.repeat_infinite());
+        } else {
+            player.append(source);
+        }
         if self.paused {
             player.pause();
         } else {
@@ -1695,6 +1773,42 @@ mod tests {
             })
             .expect("update original rain loop volume");
         assert_eq!(audio.weather_loop.volume(), 0.5);
+        let mut machine = SoundEvent {
+            archive: "sounds.lib".to_string(),
+            name: "f_gener.wav".to_string(),
+            position: [1.0, 2.0, 3.0],
+            volume: 0.0,
+            min_distance: 15.0,
+            max_distance: 100.0,
+            frequency_ratio: 1.0,
+            action: SoundAction::StartLoop,
+        };
+        audio
+            .handle_control_sound(0, &machine)
+            .expect("first machine");
+        audio
+            .handle_control_sound(1, &machine)
+            .expect("second machine");
+        assert!(audio.control_sound_is_playing(0));
+        assert!(audio.control_sound_is_playing(1));
+        assert!(!audio.weather_loop.empty());
+        audio.set_paused(true);
+        assert!(audio
+            .control_sounds
+            .values()
+            .all(|player| player.is_paused()));
+        audio.set_paused(false);
+        assert!(audio
+            .control_sounds
+            .values()
+            .all(|player| !player.is_paused()));
+        machine.action = SoundAction::StopLoop;
+        audio
+            .handle_control_sound(0, &machine)
+            .expect("stop one machine");
+        assert!(!audio.control_sound_is_playing(0));
+        assert!(audio.control_sound_is_playing(1));
+        assert!(!audio.weather_loop.empty());
         audio
             .update_listener([10.0, 20.0, 30.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0])
             .expect("move listener");

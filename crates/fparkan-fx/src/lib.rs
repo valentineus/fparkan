@@ -7,6 +7,7 @@
 //! are backed by runtime-captured evidence.
 
 pub mod ambient_op3;
+pub mod ambient_sound;
 pub mod atmosphere;
 pub mod environment;
 pub mod fx_visual;

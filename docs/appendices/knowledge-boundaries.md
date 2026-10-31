@@ -70,6 +70,10 @@ Control Op1 пока использует цвет и радиус без слу
 это явное приближение считается в `render_coverage control_op1_jitter_unsupported`.
 Масштаб радиуса длиной преобразованного направления и нижняя замена 0,01 восстановлены.
 
+Control Op2 воспроизводит modes 0/2; modes 1/3, body+76 и неподдержанные
+time modes/привязки считаются как `render_coverage control_op2_unsupported`.
+Управление фазой экземпляра командами Control остаётся до его подключения в runtime.
+
 Размеры команд, resource references, lifecycle, flags families и используемые
 time modes известны. Не закрыто значение каждого поля body opcodes 1--10,
 отсутствующий во всех проверенных каталогах opcode 6 и точные формулы редких

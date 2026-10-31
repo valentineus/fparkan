@@ -18,6 +18,7 @@ use fparkan_assets::{
 use fparkan_fx::ambient_op3::{
     evaluate_op3_type0_command, evaluate_op3_type1_command, evaluate_op3_type2_command,
 };
+use fparkan_fx::ambient_sound::{Op2SoundCommand, Op2SoundState};
 use fparkan_fx::atmosphere::{AtmosphereFrame, TypedAtmosphere};
 use fparkan_fx::environment::{
     decode_env_lightning_fxid, evaluate_op1_point_light_with_basis, Camera as FxCamera,
@@ -707,7 +708,7 @@ struct AmbientEffectMeshPrimitive {
 }
 
 #[derive(Clone, Debug)]
-struct ControlPointLightSlot {
+struct ControlEffectSlot {
     time_mode: u32,
     header_flags: u32,
     random_instance_key: ControlEffectInstanceKey,
@@ -726,6 +727,13 @@ struct ControlPointLightSlot {
     world_from_effect: [[f32; 4]; 4],
     command_index: usize,
     command: FxCommand,
+}
+
+#[derive(Clone, Debug)]
+struct ControlSoundSlot {
+    effect: ControlEffectSlot,
+    command: Op2SoundCommand,
+    state: Op2SoundState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -4617,7 +4625,9 @@ struct StaticPreviewScene {
     materials: Vec<VulkanStaticMaterial>,
     material_animations: Vec<MaterialAnimationBinding>,
     ambient_effect_slots: Vec<AmbientEffectGpuSlot>,
-    control_point_light_slots: Vec<ControlPointLightSlot>,
+    control_point_light_slots: Vec<ControlEffectSlot>,
+    control_sound_slots: Vec<ControlSoundSlot>,
+    unsupported_control_sounds: usize,
     component_pose_buffers: Vec<Vec<Option<NodePoseBuffer>>>,
     component_mount_poses: Vec<Vec<Option<VulkanNodePose>>>,
     dynamic_component_geometry: Vec<Vec<Option<DynamicComponentGeometry>>>,
@@ -5253,8 +5263,8 @@ fn ambient_effect_world_from_component_pose_with_random_shift(
     )
 }
 
-fn control_point_light_world_from_component_pose_with_random_shift(
-    slot: &ControlPointLightSlot,
+fn control_effect_world_from_component_pose_with_random_shift(
+    slot: &ControlEffectSlot,
     component_pose_buffers: &[Vec<Option<NodePoseBuffer>>],
     random_shift: [f32; 3],
 ) -> Option<[[f32; 4]; 4]> {
@@ -5278,7 +5288,7 @@ fn control_point_light_world_from_component_pose_with_random_shift(
 }
 
 fn update_control_point_lights(
-    slots: &mut [ControlPointLightSlot],
+    slots: &mut [ControlEffectSlot],
     component_pose_buffers: &[Vec<Option<NodePoseBuffer>>],
     component_mount_poses: &[Vec<Option<VulkanNodePose>>],
     elapsed_seconds: f32,
@@ -5298,13 +5308,11 @@ fn update_control_point_lights(
             .get(&slot.random_instance_key)
             .copied()
             .unwrap_or_default();
-        let Some(world_from_effect) =
-            control_point_light_world_from_component_pose_with_random_shift(
-                slot,
-                component_pose_buffers,
-                random_sample.accumulated_shift,
-            )
-        else {
+        let Some(world_from_effect) = control_effect_world_from_component_pose_with_random_shift(
+            slot,
+            component_pose_buffers,
+            random_sample.accumulated_shift,
+        ) else {
             continue;
         };
         slot.world_from_effect = world_from_effect;
@@ -5461,7 +5469,9 @@ fn append_initial_control_effect_slots(
     effect_documents: &mut HashMap<String, FxDocument>,
     effect_materials: &mut HashMap<String, PreparedEffectMaterial>,
     slots: &mut Vec<AmbientEffectGpuSlot>,
-    point_light_slots: &mut Vec<ControlPointLightSlot>,
+    point_light_slots: &mut Vec<ControlEffectSlot>,
+    sound_slots: &mut Vec<ControlSoundSlot>,
+    unsupported_sounds: &mut usize,
 ) -> Result<(), String> {
     let Some(point_list) = control.point_list.as_ref() else {
         return Ok(());
@@ -5491,6 +5501,11 @@ fn append_initial_control_effect_slots(
             .get(&key)
             .ok_or_else(|| format!("Control FX {key} was not cached"))?;
         let header = document.header();
+        let sound_commands = document
+            .commands()
+            .iter()
+            .filter(|command| command.opcode == FxOpcode::Op2)
+            .count();
         let duration_seconds = header.duration_seconds;
         if !duration_seconds.is_finite()
             || duration_seconds < 0.0
@@ -5504,6 +5519,7 @@ fn append_initial_control_effect_slots(
             // scale conventions are outside this ambient subset. Leave them
             // unexpanded until their lifetime and transform contract are
             // understood rather than failing the whole mission preview.
+            *unsupported_sounds += sound_commands;
             continue;
         }
         let owner_node_index =
@@ -5515,6 +5531,7 @@ fn append_initial_control_effect_slots(
                         || (*owner_node == 0 && component_pose_buffer.is_none())
                 });
         let Some(owner_node_index) = owner_node_index else {
+            *unsupported_sounds += sound_commands;
             continue;
         };
         let owner_node_pose = control_effect_owner_node_pose(
@@ -5523,6 +5540,7 @@ fn append_initial_control_effect_slots(
             owner_node_index,
         );
         let Some(owner_node_pose) = owner_node_pose else {
+            *unsupported_sounds += sound_commands;
             continue;
         };
         let root_transform = LegacyIron3dEulerTransform {
@@ -5559,8 +5577,8 @@ fn append_initial_control_effect_slots(
         );
 
         for (command_index, command) in document.commands().iter().enumerate() {
-            if ambient_effect_op1_supported(command) {
-                point_light_slots.push(ControlPointLightSlot {
+            if ambient_effect_op1_supported(command) || command.opcode == FxOpcode::Op2 {
+                let slot = ControlEffectSlot {
                     time_mode: header.time_mode,
                     header_flags: header.flags,
                     random_instance_key,
@@ -5579,7 +5597,21 @@ fn append_initial_control_effect_slots(
                     world_from_effect,
                     command_index,
                     command: command.clone(),
-                });
+                };
+                if command.opcode == FxOpcode::Op2 {
+                    if let Some(sound) = Op2SoundCommand::from_command(command) {
+                        sound_slots.push(ControlSoundSlot {
+                            effect: slot,
+                            command: sound,
+                            state: Op2SoundState::default(),
+                        });
+                    } else {
+                        *unsupported_sounds += 1;
+                        eprintln!("unsupported Control Op2 object={object_index} component={component_index} effect={key} command={command_index} (mode, backend parameter or malformed body)");
+                    }
+                } else {
+                    point_light_slots.push(slot);
+                }
                 continue;
             }
             let Some(kind) = ambient_effect_command_kind(command) else {
@@ -5935,7 +5967,8 @@ fn control_effect_instance_seed(
 fn advance_control_effect_random_states(
     states: &mut HashMap<ControlEffectInstanceKey, ControlEffectRandomState>,
     ambient_slots: &[AmbientEffectGpuSlot],
-    point_light_slots: &[ControlPointLightSlot],
+    point_light_slots: &[ControlEffectSlot],
+    sound_slots: &[ControlSoundSlot],
     sample_id: SceneSampleId,
     control_clock_ms: u32,
     elapsed_seconds: f32,
@@ -5958,7 +5991,10 @@ fn advance_control_effect_random_states(
             initial_phase,
         ));
     }
-    for slot in point_light_slots {
+    for slot in point_light_slots
+        .iter()
+        .chain(sound_slots.iter().map(|slot| &slot.effect))
+    {
         let initial_phase = ambient_effect_phase(
             slot.time_mode,
             slot.header_flags,
@@ -7928,6 +7964,8 @@ fn static_preview_mesh_and_materials(
     let mut material_animations = Vec::new();
     let mut ambient_effect_slots = Vec::new();
     let mut control_point_light_slots = Vec::new();
+    let mut control_sound_slots = Vec::new();
+    let mut unsupported_control_sounds = 0;
     let mut effect_documents = HashMap::new();
     let mut effect_materials = HashMap::new();
     let mut component_pose_buffers_by_object = Vec::with_capacity(roots.len());
@@ -8085,6 +8123,8 @@ fn static_preview_mesh_and_materials(
                             &mut effect_materials,
                             &mut ambient_effect_slots,
                             &mut control_point_light_slots,
+                            &mut control_sound_slots,
+                            &mut unsupported_control_sounds,
                         )?;
                     }
                 }
@@ -8231,6 +8271,8 @@ fn static_preview_mesh_and_materials(
                         &mut effect_materials,
                         &mut ambient_effect_slots,
                         &mut control_point_light_slots,
+                        &mut control_sound_slots,
+                        &mut unsupported_control_sounds,
                     )?;
                 }
             }
@@ -8479,6 +8521,8 @@ fn static_preview_mesh_and_materials(
         material_animations,
         ambient_effect_slots,
         control_point_light_slots,
+        control_sound_slots,
+        unsupported_control_sounds,
         component_pose_buffers: component_pose_buffers_by_object,
         component_mount_poses: component_mount_poses_by_object,
         dynamic_component_geometry: dynamic_component_geometry_by_object,
@@ -9262,7 +9306,9 @@ struct StaticVulkanApp {
     materials: Vec<VulkanStaticMaterial>,
     material_animations: Vec<MaterialAnimationBinding>,
     ambient_effect_slots: Vec<AmbientEffectGpuSlot>,
-    control_point_light_slots: Vec<ControlPointLightSlot>,
+    control_point_light_slots: Vec<ControlEffectSlot>,
+    control_sound_slots: Vec<ControlSoundSlot>,
+    unsupported_control_sounds: usize,
     control_effect_random_states: HashMap<ControlEffectInstanceKey, ControlEffectRandomState>,
     component_pose_buffers: Vec<Vec<Option<NodePoseBuffer>>>,
     component_mount_poses: Vec<Vec<Option<VulkanNodePose>>>,
@@ -9367,6 +9413,8 @@ impl StaticVulkanApp {
             material_animations: preview.material_animations,
             ambient_effect_slots: preview.ambient_effect_slots,
             control_point_light_slots: preview.control_point_light_slots,
+            control_sound_slots: preview.control_sound_slots,
+            unsupported_control_sounds: preview.unsupported_control_sounds,
             control_effect_random_states: HashMap::new(),
             component_pose_buffers: preview.component_pose_buffers,
             component_mount_poses: preview.component_mount_poses,
@@ -9454,6 +9502,7 @@ impl StaticVulkanApp {
             })
             .count();
         eprintln!("render_coverage control_op1_jitter_unsupported={randomized_lights} (using authored color and radius; native RNG sampling pending)");
+        eprintln!("render_coverage control_op2_supported={} control_op2_unsupported={} (unsupported timing, backend mode or parameters are skipped)", self.control_sound_slots.len(), self.unsupported_control_sounds);
         eprintln!("render_coverage fog_pass_eligibility_approx={} (global world fog and horizon RGB; native shade-state/color verification pending)", self.world_range_indices.len());
         for &range_index in &self.world_range_indices {
             let range = self
@@ -9840,6 +9889,7 @@ impl StaticVulkanApp {
             &mut self.control_effect_random_states,
             &self.ambient_effect_slots,
             &self.control_point_light_slots,
+            &self.control_sound_slots,
             clock.id,
             control_clock_ms,
             effect_elapsed_seconds,
@@ -10030,6 +10080,47 @@ impl StaticVulkanApp {
             audio
                 .update_listener(camera.position, camera.forward, camera.up)
                 .map_err(|error| format!("update audio listener: {error}"))?;
+            for (id, sound) in self.control_sound_slots.iter_mut().enumerate() {
+                let slot = &mut sound.effect;
+                if slot.owner_component_is_mounted {
+                    slot.mount_pose = self
+                        .component_mount_poses
+                        .get(slot.owner_object_index)
+                        .and_then(|components| components.get(slot.owner_component_index))
+                        .copied()
+                        .flatten();
+                }
+                let random = control_effect_random_samples
+                    .get(&slot.random_instance_key)
+                    .copied()
+                    .unwrap_or_default();
+                let Some(matrix) = control_effect_world_from_component_pose_with_random_shift(
+                    slot,
+                    &self.component_pose_buffers,
+                    random.accumulated_shift,
+                ) else {
+                    continue;
+                };
+                let Some(phase) = ambient_effect_phase(
+                    slot.time_mode,
+                    slot.header_flags,
+                    effect_elapsed_seconds,
+                    slot.duration_seconds,
+                )
+                .map(|phase| native_command_phase(slot.header_flags, phase, random.phase_jitter)) else {
+                    continue;
+                };
+                if let Some(event) = sound.command.update(
+                    &mut sound.state,
+                    phase,
+                    matrix,
+                    audio.control_sound_is_playing(id),
+                ) {
+                    audio
+                        .handle_control_sound(id, &event)
+                        .map_err(|error| format!("play Control sound {id}: {error}"))?;
+                }
+            }
         }
         let environment = if let Some(environment) = self.environment.as_mut() {
             Some(environment.update_cpu(
@@ -13471,7 +13562,7 @@ mod tests {
             table_index: 0,
             row_index: 0,
         };
-        let control_slot = ControlPointLightSlot {
+        let control_slot = ControlEffectSlot {
             time_mode: 1,
             header_flags: 9,
             random_instance_key: key,
@@ -13591,6 +13682,8 @@ mod tests {
             material_animations: vec![material_animation],
             ambient_effect_slots: Vec::new(),
             control_point_light_slots: vec![control_slot],
+            control_sound_slots: Vec::new(),
+            unsupported_control_sounds: 0,
             component_pose_buffers: vec![vec![None]],
             component_mount_poses: vec![vec![None]],
             dynamic_component_geometry: Vec::new(),
@@ -16379,7 +16472,7 @@ mod tests {
 
     #[test]
     fn op1_control_lights_use_native_phase_owner_transform_and_flags() {
-        let mut slot = ControlPointLightSlot {
+        let mut slot = ControlEffectSlot {
             time_mode: 1,
             header_flags: 0,
             random_instance_key: ControlEffectInstanceKey {
@@ -16460,6 +16553,7 @@ mod tests {
             &mut states,
             &[],
             &sibling_slots,
+            &[],
             SceneSampleId::Replay(7),
             150,
             1.5,
@@ -16484,6 +16578,7 @@ mod tests {
                 &mut states,
                 &[],
                 &sibling_slots,
+                &[],
                 SceneSampleId::Replay(7),
                 150,
                 1.5,
@@ -16495,6 +16590,7 @@ mod tests {
             &mut states,
             &[],
             &sibling_slots,
+            &[],
             SceneSampleId::Replay(8),
             200,
             0.5,
