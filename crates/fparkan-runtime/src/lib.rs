@@ -44,6 +44,7 @@ pub use fparkan_assets::MissionAssets;
 pub use mesh_collision::{query_building_segment_world, BuildingMeshHit, BuildingMeshNode};
 
 const MISSION_DECODED_PAYLOAD_CACHE_ENTRIES: usize = 256;
+const MAX_MISSION_AI_RECORD_SLOTS: usize = 1_000_000;
 const FALLBACK_SCRIPT_VARSET_PATH: &str = "MISSIONS/SCRIPTS/varset.var";
 const INITIAL_BEHAVIOR_RNG_STATE: u32 = 1;
 const UNIT_DAT_CONTROL_CLASS_HIGH_BIT: u32 = 0x8000_0000;
@@ -712,6 +713,15 @@ pub struct MissionScriptBundle {
     pub behavior_warm_start: Option<BehaviorWarmStartState>,
 }
 
+/// Initial native record-slot words owned by one mission clan's AI instance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissionAiStartupState {
+    /// TMA clan index that owns this AI instance.
+    pub clan_index: usize,
+    /// Sentinel words appended during AI startup, in native insertion order.
+    pub record_slots: Vec<u32>,
+}
+
 /// One decoded research table associated with its TMA clan owner and source path.
 #[derive(Debug)]
 pub struct MissionResearchTrfTable {
@@ -879,6 +889,7 @@ struct MissionLoadOptions {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct LoadedMissionScripts {
     bundles: Vec<MissionScriptBundle>,
+    ai_startup_states: Vec<MissionAiStartupState>,
     varset: Option<MissionScriptVarSet>,
     init_states: Vec<MissionScriptInitState>,
     varset_states: Vec<MissionScriptVarSetState>,
@@ -1008,6 +1019,7 @@ struct LoadedMissionState {
     control_device_tables: Vec<MissionControlDeviceTableState>,
     behavior_control_groupings: Vec<MissionBehaviorControlGroupingState>,
     research_trf_tables: Vec<MissionResearchTrfTable>,
+    ai_startup_states: Vec<MissionAiStartupState>,
     script_bundles: Vec<MissionScriptBundle>,
     script_varset: Option<MissionScriptVarSet>,
     script_init_states: Vec<MissionScriptInitState>,
@@ -1077,6 +1089,17 @@ pub enum EngineError {
         /// Owning TMA clan index.
         clan_index: usize,
         /// Handler-specific diagnostic.
+        message: String,
+    },
+    /// A clan's initial AI record slots exceeded the Rust allocation budget or could not be reserved.
+    MissionAiRecordSlots {
+        /// Owning TMA clan index.
+        clan_index: usize,
+        /// Raw second-resource tag interpreted as unsigned bits.
+        raw_count: u32,
+        /// Slots already reserved for earlier clans in this mission.
+        allocated_slots: usize,
+        /// Budget or allocation diagnostic.
         message: String,
     },
     /// `NRes` decode error.
@@ -1258,6 +1281,15 @@ impl std::fmt::Display for EngineError {
                 clan_index,
                 message,
             } => write!(f, "clan {clan_index}: script runtime failed: {message}"),
+            Self::MissionAiRecordSlots {
+                clan_index,
+                raw_count,
+                allocated_slots,
+                message,
+            } => write!(
+                f,
+                "clan {clan_index} AI initial slots (unsigned raw count {raw_count}, after {allocated_slots} mission slots): {message}"
+            ),
             Self::Nres { path, source } => write!(f, "{path}: {source}"),
             Self::ResearchTrf {
                 clan_index,
@@ -1318,6 +1350,7 @@ impl std::error::Error for EngineError {
             | Self::VarSet { .. }
             | Self::ScriptInit { .. }
             | Self::ScriptRuntime { .. }
+            | Self::MissionAiRecordSlots { .. }
             | Self::Movement(_)
             | Self::ResearchTrfPath { .. }
             | Self::PrototypeGraph { .. }
@@ -1844,6 +1877,7 @@ fn load_mission_with_options(
         control_device_tables,
         behavior_control_groupings,
         research_trf_tables,
+        ai_startup_states: loaded_scripts.ai_startup_states,
         script_bundles: loaded_scripts.bundles,
         script_varset: loaded_scripts.varset,
         script_init_states: loaded_scripts.init_states,
@@ -1923,6 +1957,15 @@ pub fn loaded_mission_script_bundles(engine: &Engine) -> Option<&[MissionScriptB
         .loaded
         .as_ref()
         .map(|state| state.script_bundles.as_slice())
+}
+
+/// Returns the per-clan AI record slots initialized during full mission startup.
+#[must_use]
+pub fn loaded_mission_ai_startup_states(engine: &Engine) -> Option<&[MissionAiStartupState]> {
+    engine
+        .loaded
+        .as_ref()
+        .map(|state| state.ai_startup_states.as_slice())
 }
 
 /// Returns the per-clan TRF tables loaded during full mission startup.
@@ -6629,6 +6672,54 @@ fn load_mission_scripts(
     let script_bases = mission_script_bundle_bases(mission);
     let mut bundles = Vec::with_capacity(script_bases.len());
     let mut first_base_path = None;
+    let mut ai_startup_states = Vec::new();
+    if asset_scope == MissionAssetScope::Full {
+        let mut allocated_slots = 0usize;
+        for (clan_index, clan) in mission.clans.iter().enumerate() {
+            let second_resource = match &clan.body {
+                ClanBody::Standard {
+                    second_resource, ..
+                }
+                | ClanBody::Spatial {
+                    second_resource, ..
+                } => second_resource,
+            };
+            let raw_count = second_resource.tag as u32;
+            let count =
+                usize::try_from(raw_count).map_err(|_| EngineError::MissionAiRecordSlots {
+                    clan_index,
+                    raw_count,
+                    allocated_slots,
+                    message: "count does not fit this platform's address space".to_string(),
+                })?;
+            let requested_total = allocated_slots.checked_add(count);
+            if requested_total.is_none_or(|total| total > MAX_MISSION_AI_RECORD_SLOTS) {
+                return Err(EngineError::MissionAiRecordSlots {
+                    clan_index,
+                    raw_count,
+                    allocated_slots,
+                    message: format!(
+                        "cumulative mission count exceeds the Rust allocation budget of {MAX_MISSION_AI_RECORD_SLOTS} u32 slots"
+                    ),
+                });
+            }
+            let mut record_slots = Vec::new();
+            record_slots.try_reserve_exact(count).map_err(|source| {
+                EngineError::MissionAiRecordSlots {
+                    clan_index,
+                    raw_count,
+                    allocated_slots,
+                    message: format!("could not reserve {count} u32 slots: {source}"),
+                }
+            })?;
+            record_slots.resize(count, u32::MAX);
+            allocated_slots = requested_total.expect("checked cumulative AI slot count");
+            ai_startup_states.push(MissionAiStartupState {
+                clan_index,
+                record_slots,
+            });
+        }
+    }
     for script_base in script_bases {
         let base_path = String::from_utf8_lossy(&script_base.path_raw).into_owned();
         let script_path = if base_path.to_ascii_lowercase().ends_with(".scr") {
@@ -6680,6 +6771,7 @@ fn load_mission_scripts(
     };
     Ok(LoadedMissionScripts {
         bundles,
+        ai_startup_states,
         varset,
         init_states,
         varset_states,
@@ -10254,6 +10346,7 @@ mod tests {
         };
         let mut scripts = LoadedMissionScripts {
             bundles: vec![bundle(0, 18, Vec::new()), bundle(1, 19, vec![0, 1, 2])],
+            ai_startup_states: Vec::new(),
             varset: Some(varset),
             ..LoadedMissionScripts::default()
         };
@@ -10281,6 +10374,193 @@ mod tests {
         );
         assert!(scripts.bundles[1].behavior_warm_start.is_none());
         assert_eq!(rng_state, 0x0029_e2c0);
+    }
+
+    fn script_slots_test_mission(clans: &[(bool, bool, i32)]) -> MissionDocument {
+        fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fn push_lp(bytes: &mut Vec<u8>, value: &[u8]) {
+            push_u32(bytes, u32::try_from(value.len()).expect("length fits u32"));
+            bytes.extend_from_slice(value);
+        }
+
+        let mut tma = Vec::new();
+        push_u32(&mut tma, 1);
+        push_u32(&mut tma, 0);
+        push_u32(&mut tma, 6);
+        push_u32(
+            &mut tma,
+            u32::try_from(clans.len()).expect("clan count fits u32"),
+        );
+        for (clan_index, (spatial, scripted, tag)) in clans.iter().enumerate() {
+            push_lp(&mut tma, b"synthetic");
+            push_u32(&mut tma, u32::MAX);
+            tma.extend_from_slice(&(clan_index as f32).to_le_bytes());
+            tma.extend_from_slice(&0.0_f32.to_le_bytes());
+            let script_path: &[u8] = if *scripted {
+                b"MISSIONS/SCRIPTS/shared"
+            } else {
+                b""
+            };
+            if *spatial {
+                push_u32(&mut tma, 0);
+                push_lp(&mut tma, script_path);
+                push_u32(&mut tma, 0);
+            } else {
+                push_u32(&mut tma, 1);
+                push_lp(&mut tma, script_path);
+                push_u32(&mut tma, 0);
+            }
+            push_lp(&mut tma, b"unused.trf");
+            push_u32(&mut tma, *tag as u32);
+            push_u32(&mut tma, 0);
+        }
+        push_u32(&mut tma, 10);
+        push_u32(&mut tma, 0);
+        push_lp(&mut tma, b"");
+        push_u32(&mut tma, 0);
+        push_lp(&mut tma, b"");
+        push_u32(&mut tma, 1);
+        push_u32(&mut tma, 0);
+        decode_mission_payload(Arc::from(tma), TmaProfile::Strict).expect("synthetic mission TMA")
+    }
+
+    fn script_slots_test_tags(mission: &MissionDocument) -> Vec<i32> {
+        mission
+            .clans
+            .iter()
+            .map(|clan| match &clan.body {
+                ClanBody::Standard {
+                    second_resource, ..
+                }
+                | ClanBody::Spatial {
+                    second_resource, ..
+                } => second_resource.tag,
+            })
+            .collect()
+    }
+
+    fn script_slots_test_vfs() -> Arc<dyn Vfs> {
+        let package = encode_script_package(&ScriptPackage {
+            opcode_handler_count: 73,
+            events: Vec::new(),
+            trailing_bytes: Vec::new(),
+            raw: Arc::from(&b""[..]),
+        });
+        let mut files = MemoryVfs::default();
+        files.insert(
+            normalize_engine_path("script slots test", "MISSIONS/SCRIPTS/shared.scr")
+                .expect("script path"),
+            Arc::from(package.into_boxed_slice()),
+        );
+        files.insert(
+            normalize_engine_path("script slots test", "MISSIONS/SCRIPTS/shared.var")
+                .expect("varset path"),
+            Arc::from(&b"VAR(DWORD, value, 0)\n"[..]),
+        );
+        Arc::new(files)
+    }
+
+    #[test]
+    fn full_mission_script_loader_builds_independent_unsigned_ai_slots_per_clan() {
+        let mission = script_slots_test_mission(&[
+            (false, true, 2),
+            (true, true, 3),
+            (false, false, 4),
+            (false, true, 0),
+        ]);
+        let raw_tags = script_slots_test_tags(&mission);
+        let vfs = script_slots_test_vfs();
+
+        let full = load_mission_scripts(&vfs, &mission, MissionAssetScope::Full)
+            .expect("Full script bundle load");
+        assert_eq!(
+            full.bundles
+                .iter()
+                .map(|bundle| bundle.clan_index)
+                .collect::<Vec<_>>(),
+            [0, 1, 3],
+            "empty-script clans do not produce fake script bundles"
+        );
+        assert_eq!(
+            full.ai_startup_states
+                .iter()
+                .map(|state| state.clan_index)
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3],
+            "Full startup retains a state for every TMA clan"
+        );
+        assert_eq!(
+            full.ai_startup_states
+                .iter()
+                .map(|state| state.record_slots.clone())
+                .collect::<Vec<_>>(),
+            [
+                vec![u32::MAX; 2],
+                vec![u32::MAX; 3],
+                vec![u32::MAX; 4],
+                Vec::new(),
+            ]
+        );
+        assert_ne!(
+            full.ai_startup_states[0].record_slots.as_ptr(),
+            full.ai_startup_states[1].record_slots.as_ptr(),
+            "each clan AI owns a separate vector"
+        );
+        assert_ne!(
+            full.ai_startup_states[1].record_slots.as_ptr(),
+            full.ai_startup_states[2].record_slots.as_ptr(),
+            "empty-script AI also owns a separate vector"
+        );
+        assert!(full
+            .bundles
+            .iter()
+            .all(|bundle| bundle.init_execution == MissionScriptInitExecution::Missing));
+
+        let preview = load_mission_scripts(&vfs, &mission, MissionAssetScope::FirstMeshPreview)
+            .expect("preview script bundle load");
+        assert!(preview.ai_startup_states.is_empty());
+        assert_eq!(
+            preview
+                .bundles
+                .iter()
+                .map(|bundle| bundle.clan_index)
+                .collect::<Vec<_>>(),
+            [0, 1, 3]
+        );
+        assert_eq!(
+            script_slots_test_tags(&mission),
+            raw_tags,
+            "loading leaves the signed TMA tag bits unchanged"
+        );
+    }
+
+    #[test]
+    fn full_mission_script_loader_rejects_unsigned_and_cumulative_ai_slot_overflow() {
+        let vfs = script_slots_test_vfs();
+
+        let negative_tag = script_slots_test_mission(&[(false, false, -1)]);
+        assert!(matches!(
+            load_mission_scripts(&vfs, &negative_tag, MissionAssetScope::Full),
+            Err(EngineError::MissionAiRecordSlots {
+                clan_index: 0,
+                raw_count: u32::MAX,
+                ..
+            })
+        ));
+
+        let over_budget =
+            script_slots_test_mission(&[(false, true, 600_000), (true, false, 400_001)]);
+        assert!(matches!(
+            load_mission_scripts(&vfs, &over_budget, MissionAssetScope::Full),
+            Err(EngineError::MissionAiRecordSlots {
+                clan_index: 1,
+                raw_count: 400_001,
+                allocated_slots: 600_000,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -15043,6 +15323,50 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
+    fn licensed_single_script_bundle_load_initializes_ai_slots_before_later_init_work() {
+        let root = licensed_root("IS");
+        let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(root));
+        let path = normalize_engine_path("mission", "MISSIONS/Single.01/data.tma")
+            .expect("Single.01 path");
+        let mission = decode_mission_payload(
+            read_vfs(&vfs, &path).expect("Single.01 TMA"),
+            TmaProfile::Strict,
+        )
+        .expect("decode Single.01 TMA");
+        assert_eq!(script_slots_test_tags(&mission), [9, 9]);
+
+        let full = load_mission_scripts(&vfs, &mission, MissionAssetScope::Full)
+            .expect("Full script bundle load");
+        assert_eq!(
+            full.ai_startup_states
+                .iter()
+                .map(|state| state.record_slots.len())
+                .collect::<Vec<_>>(),
+            [9, 9]
+        );
+        assert_eq!(
+            full.ai_startup_states
+                .iter()
+                .map(|state| state.clan_index)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert!(full
+            .ai_startup_states
+            .iter()
+            .all(|state| { state.record_slots == [u32::MAX; 9] }));
+        assert!(full
+            .bundles
+            .iter()
+            .all(|bundle| bundle.init_execution == MissionScriptInitExecution::Missing));
+
+        let preview = load_mission_scripts(&vfs, &mission, MissionAssetScope::FirstMeshPreview)
+            .expect("preview script bundle load");
+        assert!(preview.ai_startup_states.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_single_preview_loads_each_formula_table_and_stops_at_handler43() {
         let root = licensed_root("IS");
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(root));
@@ -15917,6 +16241,15 @@ mod tests {
         research_paths: &[&[u8]],
         trf: Option<&[u8]>,
     ) -> Arc<dyn Vfs> {
+        research_startup_test_vfs_with_raw_tag(script_bases, research_paths, 9, trf)
+    }
+
+    fn research_startup_test_vfs_with_raw_tag(
+        script_bases: &[Option<&[u8]>],
+        research_paths: &[&[u8]],
+        raw_tag: i32,
+        trf: Option<&[u8]>,
+    ) -> Arc<dyn Vfs> {
         fn push_u32(bytes: &mut Vec<u8>, value: u32) {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
@@ -15944,7 +16277,7 @@ mod tests {
             push_lp(&mut mission, script_base.unwrap_or_default());
             push_u32(&mut mission, 0);
             push_lp(&mut mission, research_path);
-            push_u32(&mut mission, 9);
+            push_u32(&mut mission, raw_tag as u32);
             push_u32(&mut mission, 0);
         }
         push_u32(&mut mission, 10);
@@ -15998,6 +16331,100 @@ mod tests {
             );
         }
         Arc::new(files)
+    }
+
+    #[test]
+    fn ai_record_slot_budget_error_keeps_loaded_mission_clock_and_rng() {
+        let valid_vfs = research_startup_test_vfs_with_raw_tag(
+            &[Some(b"MISSIONS/SCRIPTS/shared"), None],
+            &[b"", b""],
+            9,
+            None,
+        );
+        let mut engine = create(EngineServices::new(valid_vfs)).expect("startup test engine");
+        let request = || MissionRequest {
+            key: "MISSIONS/TEST/data.tma".to_string(),
+            mode: MissionMode::SingleMission,
+        };
+        load_mission(
+            &mut engine,
+            request(),
+            MissionStartupInput {
+                queue_time_ms: 100_000,
+                research_creation_gate: false,
+            },
+        )
+        .expect("initial valid full load");
+        let previous_mission = loaded_mission(&engine).expect("loaded mission").clone();
+        let previous_bundles = loaded_mission_script_bundles(&engine)
+            .expect("loaded script bundles")
+            .to_vec();
+        let previous_ai_startup_states = loaded_mission_ai_startup_states(&engine)
+            .expect("loaded AI startup states")
+            .to_vec();
+        assert_eq!(previous_ai_startup_states.len(), 2);
+        assert_eq!(
+            previous_ai_startup_states
+                .iter()
+                .map(|state| state.clan_index)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert!(previous_ai_startup_states
+            .iter()
+            .all(|state| state.record_slots == [u32::MAX; 9]));
+        assert_eq!(previous_bundles.len(), 1);
+        assert_eq!(previous_bundles[0].clan_index, 0);
+        assert_eq!(
+            previous_bundles[0].behavior_warm_start,
+            Some(BehaviorWarmStartState {
+                first_time_ms: 100_000,
+                next_deadline_ms: 100_202,
+                cleared_words: [0; 5],
+            })
+        );
+        let previous_rng = engine.behavior_rng_state;
+        assert_ne!(previous_rng, INITIAL_BEHAVIOR_RNG_STATE);
+        let previous_world = fparkan_world::canonical_state_hash(&engine.world);
+
+        engine.services.vfs = Some(research_startup_test_vfs_with_raw_tag(
+            &[None, None],
+            &[b"", b""],
+            -1,
+            None,
+        ));
+        let error = load_mission(
+            &mut engine,
+            request(),
+            MissionStartupInput {
+                queue_time_ms: 100_500,
+                research_creation_gate: false,
+            },
+        )
+        .expect_err("negative raw tag is unsigned u32::MAX and exceeds the budget");
+
+        assert!(matches!(
+            error,
+            EngineError::MissionAiRecordSlots {
+                clan_index: 0,
+                raw_count: u32::MAX,
+                ..
+            }
+        ));
+        assert_eq!(loaded_mission(&engine), Some(&previous_mission));
+        assert_eq!(
+            loaded_mission_script_bundles(&engine),
+            Some(previous_bundles.as_slice())
+        );
+        assert_eq!(
+            loaded_mission_ai_startup_states(&engine),
+            Some(previous_ai_startup_states.as_slice())
+        );
+        assert_eq!(engine.behavior_rng_state, previous_rng);
+        assert_eq!(
+            fparkan_world::canonical_state_hash(&engine.world),
+            previous_world
+        );
     }
 
     #[test]
