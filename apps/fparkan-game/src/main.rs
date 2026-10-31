@@ -4,19 +4,28 @@
 
 use fparkan_animation::{AnimationTime, NodePoseBuffer};
 use fparkan_assets::{
+    load_material_archive_name_texture_rgba8_and_phase_with_document_from_root,
     load_material_name_texture_rgba8_and_phase_with_document_from_root,
     load_resource_entry_bytes_from_root,
     load_standalone_wear_named_material_textures_rgba8_and_phases_with_documents_from_root,
-    page_uv_transform, sample_control_node_times, sample_material_phase, ControlInstanceState,
-    ControlSamplingError, Mat0Document, MaterialPhase, MaterialPhaseSample,
-    PreparedComponentControl, PreparedControlGateProvider, PreparedControlNodeBinding,
-    PreparedMaterialPhase, PreparedModel, PreparedTexture, PreparedTextureUsage, PreparedVisual,
-    RgbaImage, StandaloneWearMaterialLoader,
+    page_uv_transform, sample_control_node_times, sample_material_normalized_phase,
+    sample_material_phase, ControlInstanceState, ControlSamplingError, Mat0Document, MaterialPhase,
+    MaterialPhaseSample, PreparedComponentControl, PreparedControlEffectRow,
+    PreparedControlEffectSection, PreparedControlGateProvider, PreparedControlNodeBinding,
+    PreparedControlPoint, PreparedControlPointList, PreparedMaterialPhase, PreparedModel,
+    PreparedTexture, PreparedTextureUsage, PreparedVisual, RgbaImage, StandaloneWearMaterialLoader,
 };
-use fparkan_fx::atmosphere::TypedAtmosphere;
+use fparkan_fx::ambient_op3::{
+    evaluate_op3_type0_command, evaluate_op3_type1_command, evaluate_op3_type2_command,
+};
+use fparkan_fx::atmosphere::{AtmosphereFrame, TypedAtmosphere};
 use fparkan_fx::environment::{
-    decode_env_lightning_fxid, Camera as FxCamera, EnvironmentFrame, EnvironmentPrimitive,
-    EnvironmentSystem, PrecipitationKind, ScreenBillboard,
+    decode_env_lightning_fxid, evaluate_op1_point_light_with_basis, Camera as FxCamera,
+    EnvironmentFrame, EnvironmentPrimitive, EnvironmentSystem, PrecipitationKind, ScreenBillboard,
+};
+use fparkan_fx::fx_visual::{evaluate_f_gener_ball, evaluate_f_gener_ball_mesh};
+use fparkan_fx::op7::{
+    evaluate_op7_emitter, Op7EmitterState, Op7RenderContext, Op7VisibilityProfile,
 };
 use fparkan_fx::shadow::{
     ShadowCamera, ShadowCaster, ShadowFrame, ShadowLight, ShadowLodSettings, ShadowPageCache,
@@ -26,15 +35,19 @@ use fparkan_fx::sky::{
     sprite_half_size_pixels, SkyFrame, SkyMaterials, SkyMesh, SkyPassKind, SkySpriteFrame,
     SkySystem, SunVisibility, SKY_FLARE_ROWS,
 };
+use fparkan_fx::smoke::{evaluate_op8_emitter, Op8DetailThresholdRange, SmokeEmitterState};
+use fparkan_fx::{advance_native_fx_random_state, decode_fxid, FxCommand, FxDocument, FxOpcode};
+#[cfg(test)]
+use fparkan_material::{MaterialAnimationBlock, MaterialKey};
 use fparkan_msh::{
     node38_fallback_hierarchy, node38_sampled_hierarchy, node38_sampled_hierarchy_at_times,
     selected_slot, Group, Lod, ModelAsset, NodeId, SlotId,
 };
 use fparkan_path::ResourceName;
 use fparkan_platform_winit::{window_native_handles, WinitWindow, WinitWindowPlan};
-use fparkan_prototype::{unit_component_tree, UnitComponentTreeNode, PROTOTYPE_TYPE_EXTO};
+use fparkan_prototype::{unit_component_tree, PROTOTYPE_TYPE_EXTO};
 use fparkan_render::{
-    LegacyBlendMode, LegacyCullMode, LegacyD3d7Projection, LegacyDepthMode,
+    LegacyBlendMode, LegacyCullMode, LegacyD3d7Projection, LegacyDepthBias, LegacyDepthMode,
     LegacyIron3dEulerTransform, LegacyPipelineState, RawCameraTransform,
 };
 use fparkan_render_vulkan::{
@@ -46,22 +59,27 @@ use fparkan_render_vulkan::{
     project_msh_to_static_mesh_in_world_space_with_node_pose_buffer_and_mount,
     project_msh_to_static_mesh_in_world_space_with_node_sampled_poses,
     project_msh_to_static_mesh_in_world_space_with_node_sampled_poses_and_mount,
-    VulkanDynamicDrawRange, VulkanNodePose, VulkanPointLight, VulkanSmokeFrameOutcome,
-    VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo, VulkanStaticCamera, VulkanStaticDrawRange,
-    VulkanStaticMaterial, VulkanStaticMesh, VulkanStaticTexture, VulkanStaticTextureMip,
-    VulkanStaticVertex,
+    VulkanDynamicDrawRange, VulkanNodePose, VulkanPointLight, VulkanReadbackArtifact,
+    VulkanSmokeFrameOutcome, VulkanSmokeRenderer, VulkanSmokeRendererCreateInfo,
+    VulkanStaticCamera, VulkanStaticDrawRange, VulkanStaticMaterial, VulkanStaticMesh,
+    VulkanStaticTexture, VulkanStaticTextureMip, VulkanStaticVertex,
 };
 use fparkan_runtime::{
     create, load_mission_static_preview, load_mission_static_preview_roots, loaded_mission_assets,
-    loaded_mission_object_drafts, loaded_terrain, query_building_segment_world, BuildingMeshNode,
-    EngineServices, MissionAssets, MissionMode, MissionObjectDraft, MissionRequest,
+    loaded_mission_object_drafts, loaded_terrain, query_building_segment_world,
+    BasementPlacementMode, BuildingMeshNode, EngineServices, MissionAssets, MissionMode,
+    MissionObjectDraft, MissionRequest,
 };
+#[cfg(test)]
+use fparkan_terrain::BasementFoundationFragment;
 use fparkan_terrain::{
+    build_basement_foundations, BasementFootprint, BasementFoundation, BasementPlacement,
     FullSurfaceMask, SurfaceQuery, TerrainLod, TerrainMaterialLayers, TerrainWorld,
 };
 use fparkan_vfs::DirectoryVfs;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -153,11 +171,12 @@ fn run(args: &[String]) -> Result<String, String> {
         environment,
         audio,
         args.frames,
-        args.control_clock_ms,
         &args.mission,
         loaded.object_count,
         args.readback_out.as_deref(),
+        args.readback_sequence_out.as_deref(),
         args.validation,
+        args.control_clock_ms,
         StartupTimings {
             mission_assets: mission_assets_duration,
             terrain_materials: terrain_materials_duration,
@@ -353,7 +372,6 @@ impl FreeFlightCamera {
         self.position[2] = self.position[2].max(minimum_z);
         Ok(())
     }
-
     fn forward(self) -> [f32; 3] {
         let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
         let (sin_pitch, cos_pitch) = self.pitch.sin_cos();
@@ -622,6 +640,10 @@ impl PreviewCameraFrame {
 const ENVIRONMENT_SPRITE_ROWS: [usize; 2] = [3, 4];
 const ENVIRONMENT_FLARE_SLOTS: usize = 12;
 const ENVIRONMENT_PARTICLE_SLOTS: usize = 1_000;
+// shortcut: Effect.dll derives this from projected sphere size and a render-context
+// quality table. Category 0 supplies a highest-detail mesh until that exact
+// world category is available; this does not reproduce native LOD selection.
+const AMBIENT_EFFECT_NATIVE_CATEGORY: u8 = 0;
 
 #[derive(Clone, Copy, Debug)]
 struct EnvironmentGpuRange {
@@ -629,6 +651,200 @@ struct EnvironmentGpuRange {
     vertex_start: usize,
     vertex_capacity: usize,
     material_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AmbientEffectKind {
+    Op3Type0,
+    Op3Type1,
+    Op3Type2,
+    GenerBall,
+    SmokePool,
+    Op7ParticlePool,
+}
+
+#[derive(Clone, Debug)]
+struct AmbientEffectGpuSlot {
+    kind: AmbientEffectKind,
+    time_mode: u32,
+    header_flags: u32,
+    random_instance_key: ControlEffectInstanceKey,
+    random_seed: u32,
+    phase_jitter: f32,
+    random_shift: [f32; 3],
+    owner_object_index: usize,
+    owner_component_index: usize,
+    owner_node_index: usize,
+    owner_component_is_mounted: bool,
+    root_transform: LegacyIron3dEulerTransform,
+    owner_scale: [f32; 3],
+    mount_pose: Option<VulkanNodePose>,
+    local_from_effect: [[f32; 4]; 4],
+    control_source: String,
+    control_table_index: usize,
+    control_row_index: usize,
+    control_point_indices: [u32; 3],
+    control_point_owners: [i32; 3],
+    command: FxCommand,
+    command_index: usize,
+    duration_seconds: f32,
+    world_from_effect: [[f32; 4]; 4],
+    range: EnvironmentGpuRange,
+    additional_particle_ranges: Vec<EnvironmentGpuRange>,
+    material_animation_index: usize,
+    additional_particle_material_animation_indices: Vec<usize>,
+    smoke_emitter_state: Option<SmokeEmitterState>,
+    op7_emitter_state: Option<Op7EmitterState>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AmbientEffectMeshPrimitive {
+    vertex_start: usize,
+    vertex_count: usize,
+    index_start: usize,
+    index_count: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ControlPointLightSlot {
+    time_mode: u32,
+    header_flags: u32,
+    random_instance_key: ControlEffectInstanceKey,
+    random_seed: u32,
+    phase_jitter: f32,
+    random_shift: [f32; 3],
+    duration_seconds: f32,
+    owner_object_index: usize,
+    owner_component_index: usize,
+    owner_node_index: usize,
+    owner_component_is_mounted: bool,
+    root_transform: LegacyIron3dEulerTransform,
+    owner_scale: [f32; 3],
+    mount_pose: Option<VulkanNodePose>,
+    local_from_effect: [[f32; 4]; 4],
+    world_from_effect: [[f32; 4]; 4],
+    command_index: usize,
+    command: FxCommand,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ControlEffectInstanceKey {
+    object_index: usize,
+    component_index: usize,
+    table_index: usize,
+    row_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ControlEffectRandomSample {
+    phase_jitter: f32,
+    accumulated_shift: [f32; 3],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SceneSampleId {
+    Live(u64),
+    Replay(u64),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FrameClockSample {
+    id: SceneSampleId,
+    time_ms: u32,
+    delta_seconds: f32,
+}
+
+#[derive(Clone, Debug)]
+struct NativeFxRandom16 {
+    state: u32,
+}
+
+impl NativeFxRandom16 {
+    fn new(seed: u32) -> Self {
+        Self {
+            state: if seed == 0 { 0xA341_316C } else { seed },
+        }
+    }
+
+    fn next_u16(&mut self) -> u16 {
+        advance_native_fx_random_state(&mut self.state)
+    }
+
+    fn symmetric_sample(&mut self, amplitude: f32) -> f32 {
+        (f32::from(self.next_u16()) / 65_536.0 - 0.5) * amplitude
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ControlEffectRandomState {
+    header_flags: u32,
+    phase_jitter_amplitude: f32,
+    random_shift_amplitude: [f32; 3],
+    phase_and_z_rng: NativeFxRandom16,
+    xy_rng: NativeFxRandom16,
+    sample: ControlEffectRandomSample,
+    last_update_id: Option<SceneSampleId>,
+    last_update_clock_ms: Option<u32>,
+}
+
+impl ControlEffectRandomState {
+    fn new(seed: u32, header_flags: u32, phase_jitter: f32, random_shift: [f32; 3]) -> Self {
+        Self {
+            header_flags,
+            phase_jitter_amplitude: phase_jitter,
+            random_shift_amplitude: random_shift,
+            phase_and_z_rng: NativeFxRandom16::new(seed ^ 0xA511_E9B3),
+            xy_rng: NativeFxRandom16::new(seed ^ 0x63D8_3595),
+            sample: ControlEffectRandomSample::default(),
+            last_update_id: None,
+            last_update_clock_ms: None,
+        }
+    }
+
+    fn advance(
+        &mut self,
+        sample_id: SceneSampleId,
+        control_clock_ms: u32,
+        initial_phase: f32,
+    ) -> ControlEffectRandomSample {
+        // Native updates consume process-global RNG streams. The preview uses
+        // a deterministic per-Control-row stream; sibling slots share one
+        // sample and cadence, but native cross-row RNG ordering remains open.
+        if self.last_update_id == Some(sample_id) {
+            return self.sample;
+        }
+        if self.header_flags & 1 != 0 && initial_phase != -1.0 {
+            self.sample.phase_jitter = self
+                .phase_and_z_rng
+                .symmetric_sample(self.phase_jitter_amplitude);
+        } else {
+            self.sample.phase_jitter = 0.0;
+        }
+        if self.header_flags & 8 != 0 {
+            let shift_z = self
+                .phase_and_z_rng
+                .symmetric_sample(self.random_shift_amplitude[2]);
+            let shift_y = self.xy_rng.symmetric_sample(self.random_shift_amplitude[1]);
+            let shift_x = self.xy_rng.symmetric_sample(self.random_shift_amplitude[0]);
+            self.sample.accumulated_shift[0] += shift_x;
+            self.sample.accumulated_shift[1] += shift_y;
+            self.sample.accumulated_shift[2] += shift_z;
+        }
+        self.last_update_id = Some(sample_id);
+        self.last_update_clock_ms = Some(control_clock_ms);
+        self.sample
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PreparedEffectMaterial {
+    document: Mat0Document,
+    phase_material_indices: Vec<usize>,
+    phase_uv_transforms: Vec<[f32; 4]>,
+    phase_native_flag_40: Vec<bool>,
+    phase_directional_rgb: Vec<[f32; 3]>,
+    phase_additive_rgb: Vec<[f32; 3]>,
+    initial_pipeline_category: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -720,6 +936,23 @@ impl MaterialPhaseBinding {
         })
     }
 
+    fn sample_normalized(
+        &self,
+        material_index: usize,
+        normalized_phase: f32,
+    ) -> Result<MaterialPhaseSample, String> {
+        sample_material_normalized_phase(
+            &self.document,
+            self.animation_block_index,
+            normalized_phase,
+        )
+        .map_err(|error| {
+            format!(
+                "sample MAT0 material {material_index} at normalized phase {normalized_phase}: {error}"
+            )
+        })
+    }
+
     fn page_uv_transform(&self, phase_index: usize) -> [f32; 4] {
         self.phase_uv_transforms
             .get(phase_index)
@@ -745,11 +978,14 @@ impl MaterialPhaseBinding {
 struct MaterialVariantSet {
     phase_material_indices: Vec<usize>,
     range_indices: Vec<usize>,
+    pipeline_category: u8,
 }
 
 #[derive(Clone, Debug)]
 struct MaterialAnimationBinding {
     initial_phase_index: usize,
+    normalized_phase_override: Option<f32>,
+    ambient_fx_material_alpha: bool,
     variants: Vec<MaterialVariantSet>,
     base: MaterialPhaseBinding,
     detail: Option<MaterialPhaseBinding>,
@@ -758,10 +994,39 @@ struct MaterialAnimationBinding {
     stage_textures: Option<MaterialStageTextures>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 struct ActiveMaterialState {
     material_index: usize,
+    phase_index: usize,
     diffuse_alpha: f32,
+    additive_rgb: [f32; 3],
+}
+
+fn ambient_effect_material_alpha(is_ambient_effect: bool, sampled_opacity: f32) -> f32 {
+    if is_ambient_effect {
+        1.0
+    } else {
+        sampled_opacity
+    }
+}
+
+fn sample_material_animation_base(
+    binding: &mut MaterialAnimationBinding,
+    clock_ms: u32,
+) -> Result<MaterialPhaseSample, String> {
+    match binding.normalized_phase_override {
+        Some(normalized_phase) => binding
+            .base
+            .sample_normalized(binding.initial_phase_index, normalized_phase),
+        None => binding.base.sample(binding.initial_phase_index, clock_ms),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AmbientEffectGeometryUpdate {
+    range_index: usize,
+    index_count: u32,
+    command_rgb: [f32; 3],
 }
 
 fn selected_material_phase(
@@ -777,14 +1042,14 @@ fn selected_material_phase(
     Ok((material_index, pipeline_category))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 struct MaterialRangeSelection {
     range_index: usize,
     material_index: usize,
     pipeline_category: u8,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 struct MaterialPropertiesUpdate {
     material_index: usize,
     diffuse_alpha: f32,
@@ -800,14 +1065,14 @@ struct MaterialPropertiesUpdate {
     uv_transforms: [[f32; 4]; 4],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 struct MaterialStagePhaseUpdate {
     binding_index: usize,
     material_index: usize,
     phases: [usize; 3],
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default)]
 struct MaterialFrameUpdate {
     active_materials: HashMap<usize, ActiveMaterialState>,
     range_selections: Vec<MaterialRangeSelection>,
@@ -822,7 +1087,11 @@ fn sample_material_animations(
 ) -> Result<MaterialFrameUpdate, String> {
     let mut update = MaterialFrameUpdate::default();
     for (binding_index, binding) in bindings.iter_mut().enumerate() {
-        let base_sample = binding.base.sample(binding.initial_phase_index, clock_ms)?;
+        let base_sample = sample_material_animation_base(binding, clock_ms)?;
+        let material_alpha = ambient_effect_material_alpha(
+            binding.ambient_fx_material_alpha,
+            base_sample.coefficients.opacity,
+        );
         let detail_sample = binding
             .detail
             .as_mut()
@@ -839,7 +1108,7 @@ fn sample_material_animations(
             .map(|overlay_detail| overlay_detail.sample(binding.initial_phase_index, clock_ms))
             .transpose()?;
         let mut updated_materials = HashSet::new();
-        for variant in &binding.variants {
+        for variant in &mut binding.variants {
             let (material_index, pipeline_category) =
                 selected_material_phase(variant, base_sample.phase_index, |index| {
                     materials
@@ -851,7 +1120,9 @@ fn sample_material_animations(
                     range_index,
                     ActiveMaterialState {
                         material_index,
-                        diffuse_alpha: base_sample.coefficients.opacity,
+                        phase_index: base_sample.phase_index,
+                        diffuse_alpha: material_alpha,
+                        additive_rgb: base_sample.coefficients.additive_rgb,
                     },
                 );
                 update.range_selections.push(MaterialRangeSelection {
@@ -860,6 +1131,7 @@ fn sample_material_animations(
                     pipeline_category,
                 });
             }
+            variant.pipeline_category = pipeline_category;
             if !updated_materials.insert(material_index) {
                 continue;
             }
@@ -871,9 +1143,7 @@ fn sample_material_animations(
             let (base_directional, base_additive, overlay_directional, overlay_additive) =
                 if material.lightmap_mode {
                     // Terrain mode 3 samples the lightmap in the secondary
-                    // stage and uses the authored directional RGB as its
-                    // multiplicative lightmap coefficient. It has no normal
-                    // lighting or overlay stage.
+                    // stage and uses the authored directional RGB as additive.
                     ([0.0; 3], base_coefficients.directional_rgb, None, None)
                 } else {
                     (
@@ -883,16 +1153,27 @@ fn sample_material_animations(
                         overlay_coefficients.map(|coefficients| coefficients.additive_rgb),
                     )
                 };
-            if !material.lightmap_mode && binding.stage_textures.is_some() {
-                update.stage_phases.push(MaterialStagePhaseUpdate {
-                    binding_index,
-                    material_index,
-                    phases: [
+
+            if !material.lightmap_mode {
+                if let Some(stage_textures) = binding.stage_textures.as_ref() {
+                    let stage_phases = [
                         detail_sample.map_or(0, |sample| sample.phase_index),
                         overlay_sample.map_or(0, |sample| sample.phase_index),
                         overlay_detail_sample.map_or(0, |sample| sample.phase_index),
-                    ],
-                });
+                    ];
+                    if stage_textures
+                        .applied_material_phases
+                        .get(&material_index)
+                        .copied()
+                        != Some(stage_phases)
+                    {
+                        update.stage_phases.push(MaterialStagePhaseUpdate {
+                            binding_index,
+                            material_index,
+                            phases: stage_phases,
+                        });
+                    }
+                }
             }
             let overlay_uv = overlay_sample
                 .map(|sample| {
@@ -942,7 +1223,7 @@ fn sample_material_animations(
                 .checked_page_uv_transform(base_sample.phase_index)?;
             update.properties.push(MaterialPropertiesUpdate {
                 material_index,
-                diffuse_alpha: base_coefficients.opacity.clamp(0.0, 1.0),
+                diffuse_alpha: material_alpha.clamp(0.0, 1.0),
                 overlay_alpha: overlay_coefficients
                     .map_or(0.0, |coefficients| coefficients.opacity.clamp(0.0, 1.0)),
                 base_directional,
@@ -1370,6 +1651,15 @@ fn world_pipeline_state(blend: LegacyBlendMode, depth: LegacyDepthMode) -> Legac
     }
 }
 
+fn projected_shadow_pipeline_state() -> LegacyPipelineState {
+    LegacyPipelineState {
+        blend: LegacyBlendMode::SourceAlpha,
+        depth: LegacyDepthMode::TestReadOnly,
+        depth_bias: LegacyDepthBias::ProjectedDecal,
+        ..LegacyPipelineState::default()
+    }
+}
+
 fn environment_vertex(position: [f32; 3], color: [f32; 3], uv: [f32; 2]) -> VulkanStaticVertex {
     environment_vertex_with_alpha(position, color, 1.0, uv)
 }
@@ -1511,9 +1801,12 @@ fn append_environment_material(
     let document = asset.document.clone();
     material_animations.push(MaterialAnimationBinding {
         initial_phase_index: 0,
+        normalized_phase_override: None,
+        ambient_fx_material_alpha: false,
         variants: vec![MaterialVariantSet {
             phase_material_indices,
             range_indices: Vec::new(),
+            pipeline_category: phases[0].pipeline_category,
         }],
         base: MaterialPhaseBinding {
             document,
@@ -1530,6 +1823,132 @@ fn append_environment_material(
     });
     material_names.insert(name.to_owned(), first_material_index);
     Ok(first_material_index)
+}
+
+fn prepare_effect_material(
+    root: &Path,
+    archive: &str,
+    name: &str,
+    materials: &mut Vec<VulkanStaticMaterial>,
+    cache: &mut HashMap<String, PreparedEffectMaterial>,
+) -> Result<PreparedEffectMaterial, String> {
+    let key = format!("{archive}/{name}");
+    if let Some(prepared) = cache.get(&key) {
+        return Ok(prepared.clone());
+    }
+    let (first_mips, first_phase, document) =
+        load_material_archive_name_texture_rgba8_and_phase_with_document_from_root(
+            root, archive, name, 0,
+        )
+        .map_err(|error| format!("resolve FX MAT0 {key}: {error}"))?;
+    if document.phases.is_empty() {
+        return Err(format!("FX MAT0 {key} has no phases"));
+    }
+
+    let mut phase_material_indices = Vec::with_capacity(document.phases.len());
+    let mut phase_uv_transforms = Vec::with_capacity(document.phases.len());
+    let mut phase_native_flag_40 = Vec::with_capacity(document.phases.len());
+    let mut phase_directional_rgb = Vec::with_capacity(document.phases.len());
+    let mut phase_additive_rgb = Vec::with_capacity(document.phases.len());
+    for phase_index in 0..document.phases.len() {
+        let (mips, phase) = if phase_index == 0 {
+            (first_mips.clone(), first_phase)
+        } else {
+            let phase_index_u16 = u16::try_from(phase_index)
+                .map_err(|_| format!("FX MAT0 {key} phase index exceeds u16"))?;
+            let (mips, phase, _document) =
+                load_material_archive_name_texture_rgba8_and_phase_with_document_from_root(
+                    root,
+                    archive,
+                    name,
+                    phase_index_u16,
+                )
+                .map_err(|error| format!("resolve FX MAT0 {key} phase {phase_index}: {error}"))?;
+            (mips, phase)
+        };
+        let texture = vulkan_texture_from_rgba_mips(mips, "FX material")?;
+        let index = materials.len();
+        let material_index = u16::try_from(index).map_err(|_| {
+            "FX effects exceed the available 16-bit material selector space".to_string()
+        })?;
+        materials.push(VulkanStaticMaterial {
+            material_index,
+            pipeline_category: phase.pipeline_category,
+            texture,
+            directional_rgb: phase.directional_rgb,
+            additive_rgb: phase.additive_rgb,
+            uv_transform: phase.page_uv_transform,
+            detail_texture: Some(solid_environment_texture([128, 128, 128, 255])),
+            overlay_texture: None,
+            overlay_detail_texture: None,
+            // FX descriptor opacity is carried by each frame's vertex alpha.
+            // Keep MAT0 alpha at one so it does not multiply the opacity a
+            // second time.
+            diffuse_alpha: 1.0,
+            overlay_diffuse_alpha: None,
+            overlay_directional_rgb: None,
+            overlay_additive_rgb: None,
+            specular_rgb: phase.specular_rgb,
+            specular_power: phase.power,
+            overlay_specular_rgb: None,
+            overlay_specular_power: None,
+            detail_uv_transform: [0.0, 0.0, 1.0, 1.0],
+            overlay_uv_transform: None,
+            overlay_detail_uv_transform: None,
+            unlit: true,
+            sky_nebula_stars: false,
+            lightmap_mode: false,
+            sky_far_depth: false,
+            screen_tl: false,
+        });
+        phase_material_indices.push(index);
+        phase_uv_transforms.push(phase.page_uv_transform);
+        phase_native_flag_40.push(phase.native_flag_40);
+        phase_directional_rgb.push(phase.directional_rgb);
+        phase_additive_rgb.push(phase.additive_rgb);
+    }
+    let prepared = PreparedEffectMaterial {
+        initial_pipeline_category: materials[phase_material_indices[0]].pipeline_category,
+        document,
+        phase_material_indices,
+        phase_uv_transforms,
+        phase_native_flag_40,
+        phase_directional_rgb,
+        phase_additive_rgb,
+    };
+    cache.insert(key, prepared.clone());
+    Ok(prepared)
+}
+
+fn append_effect_material_animation(
+    prepared: &PreparedEffectMaterial,
+    range_index: usize,
+    bindings: &mut Vec<MaterialAnimationBinding>,
+) -> usize {
+    let binding_index = bindings.len();
+    bindings.push(MaterialAnimationBinding {
+        initial_phase_index: 0,
+        normalized_phase_override: None,
+        ambient_fx_material_alpha: true,
+        variants: vec![MaterialVariantSet {
+            phase_material_indices: prepared.phase_material_indices.clone(),
+            range_indices: vec![range_index],
+            pipeline_category: prepared.initial_pipeline_category,
+        }],
+        base: MaterialPhaseBinding {
+            document: prepared.document.clone(),
+            animation_block_index: 0,
+            wear_row_start_ms: 0,
+            random_state: u32::try_from(binding_index).unwrap_or(u32::MAX),
+            frozen_phase_index: None,
+            phase_uv_transforms: prepared.phase_uv_transforms.clone(),
+        },
+        detail: None,
+        overlay: None,
+        overlay_detail: None,
+        stage_textures: None,
+    });
+    binding_index
 }
 
 fn append_environment_gradient_material(
@@ -1648,53 +2067,58 @@ fn terrain_shadow_receivers(
 ) -> Result<Vec<ShadowTriangle>, String> {
     let assignments = terrain
         .face_lod_assignments()
-        .map_err(|error| error.to_string())?;
-    let mut receivers = Vec::with_capacity(
-        assignments
-            .iter()
-            .filter(|assignment| assignment.lod == TerrainLod::Lod0)
-            .count(),
-    );
-    for assignment in assignments {
-        if assignment.lod != TerrainLod::Lod0 {
-            continue;
-        }
-        let face = terrain.faces.get(assignment.face_index).ok_or_else(|| {
-            format!(
-                "terrain LOD0 references unknown face {}",
-                assignment.face_index
-            )
-        })?;
-        let positions = [
-            terrain_shadow_vertex_position(terrain, assignment.face_index, face.vertices[0])?,
-            terrain_shadow_vertex_position(terrain, assignment.face_index, face.vertices[1])?,
-            terrain_shadow_vertex_position(terrain, assignment.face_index, face.vertices[2])?,
-        ];
-        receivers.push(shadow_triangle(positions, face.flags.0));
-    }
-    Ok(receivers)
+        .map_err(|error| format!("select terrain LOD0 shadow receivers: {error}"))?;
+    assignments
+        .into_iter()
+        .filter(|assignment| assignment.lod == TerrainLod::Lod0)
+        .map(|assignment| {
+            let face = terrain.faces.get(assignment.face_index).ok_or_else(|| {
+                format!(
+                    "terrain LOD assignment references missing face {}",
+                    assignment.face_index
+                )
+            })?;
+            let positions = source_terrain_face_positions(terrain, assignment.face_index)?;
+            if !positions.iter().flatten().all(|value| value.is_finite()) {
+                return Err("terrain shadow receiver contains a non-finite position".to_string());
+            }
+            Ok(shadow_triangle(positions, face.flags.0))
+        })
+        .collect()
 }
 
-fn terrain_shadow_vertex_position(
+fn source_terrain_face_positions(
     terrain: &fparkan_terrain_format::LandMeshDocument,
     face_index: usize,
-    vertex_index: u16,
-) -> Result<[f32; 3], String> {
-    let position = terrain
-        .positions
-        .get(usize::from(vertex_index))
-        .copied()
-        .ok_or_else(|| {
-            format!(
-                "terrain LOD0 shadow face {face_index} references unknown vertex {vertex_index}"
-            )
-        })?;
-    if !position.iter().all(|value| value.is_finite()) {
-        return Err(format!(
-            "terrain LOD0 shadow face {face_index} has a non-finite vertex {vertex_index}"
-        ));
-    }
-    Ok(position)
+) -> Result<[[f32; 3]; 3], String> {
+    let face = terrain
+        .faces
+        .get(face_index)
+        .ok_or_else(|| format!("terrain LOD assignment references missing face {face_index}"))?;
+    let [first, second, third] = face.vertices;
+    Ok([
+        terrain
+            .positions
+            .get(usize::from(first))
+            .copied()
+            .ok_or_else(|| {
+                format!("terrain face {face_index} references missing vertex {first}")
+            })?,
+        terrain
+            .positions
+            .get(usize::from(second))
+            .copied()
+            .ok_or_else(|| {
+                format!("terrain face {face_index} references missing vertex {second}")
+            })?,
+        terrain
+            .positions
+            .get(usize::from(third))
+            .copied()
+            .ok_or_else(|| {
+                format!("terrain face {face_index} references missing vertex {third}")
+            })?,
+    ])
 }
 
 fn static_mesh_shadow_triangles(mesh: &VulkanStaticMesh) -> Vec<ShadowTriangle> {
@@ -1721,46 +2145,205 @@ fn static_mesh_shadow_triangles(mesh: &VulkanStaticMesh) -> Vec<ShadowTriangle> 
         .collect()
 }
 
-fn expand_shadow_sphere_to_triangles(
-    sphere: &mut ShadowSphere,
+fn static_mesh_shadow_triangles_in_index_range(
+    mesh: &VulkanStaticMesh,
+    first_index: usize,
+    index_count: usize,
+) -> Result<Vec<ShadowTriangle>, String> {
+    if index_count % 3 != 0 {
+        return Err(format!(
+            "dynamic shadow index range {first_index}..{} is not triangle-aligned",
+            first_index.saturating_add(index_count)
+        ));
+    }
+    let end = first_index
+        .checked_add(index_count)
+        .filter(|end| *end <= mesh.indices.len())
+        .ok_or_else(|| {
+            format!(
+                "dynamic shadow index range {first_index}..{} is out of bounds",
+                first_index.saturating_add(index_count)
+            )
+        })?;
+    mesh.indices[first_index..end]
+        .chunks_exact(3)
+        .map(|triangle| {
+            let positions =
+                triangle
+                    .iter()
+                    .map(|index| {
+                        mesh.vertices
+                            .get(usize::try_from(*index).map_err(|_| {
+                                "dynamic shadow vertex index exceeds usize".to_string()
+                            })?)
+                            .map(|vertex| vertex.position)
+                            .ok_or_else(|| {
+                                format!("dynamic shadow vertex index {index} is out of bounds")
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+            let positions: [[f32; 3]; 3] = positions
+                .try_into()
+                .map_err(|_| "dynamic shadow triangle did not have three vertices".to_string())?;
+            if !positions.iter().flatten().all(|value| value.is_finite()) {
+                return Err("dynamic shadow triangle contains a non-finite position".to_string());
+            }
+            Ok(shadow_triangle(positions, 0))
+        })
+        .collect()
+}
+
+fn refresh_dynamic_shadow_casters(
+    casters: &mut [ShadowCaster],
+    dynamic_casters: &[DynamicShadowCaster],
+    mesh: &VulkanStaticMesh,
+    pose_buffers: &[Vec<Option<NodePoseBuffer>>],
+    mount_poses: &[Vec<Option<VulkanNodePose>>],
+) -> Result<(), String> {
+    for dynamic in dynamic_casters {
+        let caster = casters.get_mut(dynamic.caster_index).ok_or_else(|| {
+            format!(
+                "dynamic shadow caster {} is outside the aggregate caster table",
+                dynamic.caster_index
+            )
+        })?;
+        let mut triangles = Vec::new();
+        for &range_index in &dynamic.component_draw_range_indices {
+            let range = mesh.draw_ranges.get(range_index).ok_or_else(|| {
+                format!(
+                    "dynamic shadow caster {} references missing draw range {range_index}",
+                    dynamic.caster_index
+                )
+            })?;
+            triangles.extend(static_mesh_shadow_triangles_in_index_range(
+                mesh,
+                usize::try_from(range.first_index)
+                    .map_err(|_| "dynamic shadow draw range index exceeds usize".to_string())?,
+                usize::try_from(range.index_count)
+                    .map_err(|_| "dynamic shadow draw range count exceeds usize".to_string())?,
+            )?);
+        }
+        if triangles.is_empty() {
+            return Err(format!(
+                "dynamic shadow caster {} lost its component triangles",
+                dynamic.caster_index
+            ));
+        }
+        let component_spheres = dynamic
+            .component_spheres
+            .iter()
+            .filter_map(|source| {
+                let mount_pose = if source.mounted {
+                    mount_poses
+                        .get(dynamic.object_index)
+                        .and_then(|items| items.get(source.component_index))
+                        .copied()
+                        .flatten()
+                } else {
+                    None
+                };
+                if source.mounted && mount_pose.is_none() {
+                    return None;
+                }
+                let node1_pose = if source.mounted {
+                    pose_buffers
+                        .get(dynamic.object_index)
+                        .and_then(|items| items.get(source.component_index))
+                        .and_then(Option::as_ref)
+                        .and_then(|hierarchy| {
+                            node38_pose_relative_to_root_from_hierarchy(hierarchy, 1)
+                        })
+                } else {
+                    None
+                };
+                mounted_shadow_sphere(source.center, source.radius, mount_pose, node1_pose)
+            })
+            .collect::<Vec<_>>();
+        if component_spheres.len() != dynamic.component_spheres.len() {
+            return Err(format!(
+                "dynamic shadow caster {} lost one or more component sphere poses",
+                dynamic.caster_index
+            ));
+        }
+        let mut refreshed = aggregate_shadow_caster(
+            caster.id,
+            caster.native_kind,
+            dynamic.root_transform,
+            dynamic.owner_scale,
+            triangles,
+            &component_spheres,
+        )
+        .ok_or_else(|| {
+            format!(
+                "dynamic shadow caster {} could not be rebuilt from current component poses",
+                dynamic.caster_index
+            )
+        })?;
+        // shortcut: animated native sphere parity is unverified. Rebuild from
+        // the startup native bound, the current native bound, and current
+        // triangles so the result is conservative and independent of history.
+        refreshed.sphere = shadow_sphere_enclosing_current_geometry(
+            dynamic.initial_sphere,
+            refreshed.sphere,
+            &refreshed.triangles,
+        )?;
+        *caster = refreshed;
+    }
+    Ok(())
+}
+
+fn shadow_sphere_enclosing_current_geometry(
+    baseline: ShadowSphere,
+    current_native: ShadowSphere,
     triangles: &[ShadowTriangle],
-) -> Result<bool, String> {
+) -> Result<ShadowSphere, String> {
+    let mut sphere = baseline;
     if !sphere.radius.is_finite()
         || sphere.radius < 0.0
         || !sphere.center.iter().all(|value| value.is_finite())
+        || !current_native.radius.is_finite()
+        || current_native.radius < 0.0
+        || !current_native.center.iter().all(|value| value.is_finite())
     {
         return Err("animated shadow caster has an invalid bounding sphere".to_string());
     }
-    let mut changed = false;
+
+    let offset = sub3(current_native.center, sphere.center);
+    let distance = offset[0].hypot(offset[1]).hypot(offset[2]);
+    if !distance.is_finite() {
+        return Err("animated shadow sphere distance is non-finite".to_string());
+    }
+    let required = distance + current_native.radius;
+    if !required.is_finite() {
+        return Err("animated shadow sphere radius is non-finite".to_string());
+    }
+    if current_native.radius >= distance + sphere.radius {
+        sphere = current_native;
+    } else if required > sphere.radius {
+        let next_radius = sphere.radius + 0.5 * (required - sphere.radius);
+        let shift = scale3(offset, (next_radius - sphere.radius) / distance);
+        sphere.center = add3(sphere.center, shift);
+        sphere.radius = next_radius;
+    }
+
     for point in triangles.iter().flat_map(|triangle| triangle.positions) {
         if !point.iter().all(|value| value.is_finite()) {
             return Err("animated shadow triangle has a non-finite position".to_string());
         }
         let offset = sub3(point, sphere.center);
-        let distance = length3(offset)
-            .ok_or_else(|| "animated shadow point distance is non-finite".to_string())?;
+        let distance = offset[0].hypot(offset[1]).hypot(offset[2]);
+        if !distance.is_finite() {
+            return Err("animated shadow point distance is non-finite".to_string());
+        }
         if distance <= sphere.radius {
             continue;
         }
-        let next_radius = 0.5 * (sphere.radius + distance);
-        let center_shift = if distance > f32::EPSILON {
-            scale3(offset, (next_radius - sphere.radius) / distance)
-        } else {
-            [0.0; 3]
-        };
+        let next_radius = sphere.radius + 0.5 * (distance - sphere.radius);
+        let center_shift = scale3(offset, (next_radius - sphere.radius) / distance);
         sphere.center = add3(sphere.center, center_shift);
         sphere.radius = next_radius;
-        changed = true;
     }
-    Ok(changed)
-}
 
-fn shadow_sphere_enclosing_triangles(
-    baseline: ShadowSphere,
-    triangles: &[ShadowTriangle],
-) -> Result<ShadowSphere, String> {
-    let mut sphere = baseline;
-    expand_shadow_sphere_to_triangles(&mut sphere, triangles)?;
     Ok(sphere)
 }
 
@@ -1870,6 +2453,7 @@ fn shadow_lights(
     sky_frame: Option<&SkyFrame<'_>>,
     environment_frame: Option<&EnvironmentFrame>,
     renderer: &VulkanSmokeRenderer,
+    control_point_lights: &[(VulkanPointLight, u32)],
 ) -> Vec<ShadowLight> {
     let mut lights = Vec::new();
     if let Some(sky_frame) = sky_frame {
@@ -1931,6 +2515,18 @@ fn shadow_lights(
             flags: 0,
         });
     }
+    lights.extend(
+        control_point_lights
+            .iter()
+            .map(|(light, flags)| ShadowLight::Point {
+                position: light.position,
+                rgb: light.rgb,
+                range: light.range,
+                coefficients: light.coefficients,
+                active: light.active,
+                flags: *flags,
+            }),
+    );
     lights
 }
 
@@ -2184,6 +2780,33 @@ fn reorder_draw_ranges(
     Ok(remap)
 }
 
+fn remap_dynamic_shadow_caster_draw_ranges(
+    dynamic_casters: &mut [DynamicShadowCaster],
+    range_remap: &[usize],
+) -> Result<(), String> {
+    let remapped = dynamic_casters
+        .iter()
+        .map(|dynamic| {
+            dynamic
+                .component_draw_range_indices
+                .iter()
+                .map(|&range_index| {
+                    range_remap.get(range_index).copied().ok_or_else(|| {
+                        format!(
+                            "dynamic shadow caster {} references missing pre-reorder draw range {range_index}",
+                            dynamic.caster_index
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for (dynamic, ranges) in dynamic_casters.iter_mut().zip(remapped) {
+        dynamic.component_draw_range_indices = ranges;
+    }
+    Ok(())
+}
+
 fn quad_indices(slot_count: usize) -> Result<Vec<u32>, String> {
     let mut indices = Vec::with_capacity(
         slot_count
@@ -2283,6 +2906,8 @@ impl EnvironmentGpuScene {
         type16_present_ranges: &mut HashSet<usize>,
         materials: &mut Vec<VulkanStaticMaterial>,
         preview_material_animations: &mut Vec<MaterialAnimationBinding>,
+        ambient_effect_slots: &mut [AmbientEffectGpuSlot],
+        dynamic_shadow_casters: &mut [DynamicShadowCaster],
         sun_occlusion_range_indices: &mut Vec<usize>,
         environment_materials: &SkyMaterials,
         material_assets: &HashMap<String, EnvironmentMaterialAsset>,
@@ -2717,6 +3342,7 @@ impl EnvironmentGpuScene {
             remapped_type16_present_ranges.insert(new_range_index);
         }
         *type16_present_ranges = remapped_type16_present_ranges;
+        remap_dynamic_shadow_caster_draw_ranges(dynamic_shadow_casters, &remap)?;
         for layer in &mut scene.sky_layers {
             layer.range.range_index = *remap
                 .get(layer.range.range_index)
@@ -2738,6 +3364,16 @@ impl EnvironmentGpuScene {
             .ok_or_else(|| "lightning draw range remap is out of bounds".to_string())?;
         remap_material_animation_ranges(&mut scene.material_animations, &remap)?;
         remap_material_animation_ranges(preview_material_animations, &remap)?;
+        for slot in ambient_effect_slots {
+            slot.range.range_index = *remap
+                .get(slot.range.range_index)
+                .ok_or_else(|| "ambient FX draw range remap is out of bounds".to_string())?;
+            for range in &mut slot.additional_particle_ranges {
+                range.range_index = *remap.get(range.range_index).ok_or_else(|| {
+                    "ambient FX particle draw range remap is out of bounds".to_string()
+                })?;
+            }
+        }
         for range_index in sun_occlusion_range_indices {
             *range_index = *remap
                 .get(*range_index)
@@ -3278,8 +3914,8 @@ fn segment_intersects_triangle(
     distance.is_finite() && (0.0..=1.0).contains(&distance)
 }
 
-/// Replays the native draw-item callback: one whole indexed batch is keyed by
-/// the camera distance to its first indexed vertex.
+/// Replays Terrain's native packet callback: a draw range is keyed by the
+/// camera distance to its first indexed vertex.
 fn first_indexed_vertex_distance(
     mesh: &VulkanStaticMesh,
     range_index: usize,
@@ -3508,9 +4144,20 @@ fn lightning_quad_vertices(
 /// per-frame light/fog block.  The sky mesh and weather primitives stay on the
 /// same update clock, so camera movement cannot leave environment audio or
 /// lighting one frame behind.
-#[derive(Clone, Debug, PartialEq)]
+struct DynamicEnvironment {
+    schedule: TypedAtmosphere,
+    sky: SkySystem,
+    environment: EnvironmentSystem,
+    materials: SkyMaterials,
+    material_assets: HashMap<String, EnvironmentMaterialAsset>,
+    schedule_offset_seconds: f32,
+    time_seconds: f32,
+    fixed_schedule_seconds: Option<f32>,
+    fixed_phase_reported: bool,
+}
+
 struct DynamicEnvironmentFrame {
-    atmosphere: fparkan_fx::atmosphere::AtmosphereFrame,
+    atmosphere: AtmosphereFrame,
     sky_mesh: SkyMesh,
     environment_frame: EnvironmentFrame,
     absolute_time_seconds: f32,
@@ -3532,26 +4179,28 @@ fn environment_camera_for_preview(
     .with_viewport(viewport)
 }
 
-struct DynamicEnvironment {
-    schedule: TypedAtmosphere,
-    sky: SkySystem,
-    environment: EnvironmentSystem,
-    materials: SkyMaterials,
-    material_assets: HashMap<String, EnvironmentMaterialAsset>,
-    schedule_offset_seconds: f32,
-    time_seconds: f32,
-    fixed_schedule_seconds: Option<f32>,
-    fixed_phase_reported: bool,
+struct SceneFrameUpdate {
+    clock: FrameClockSample,
+    camera: PreviewCameraFrame,
+    viewport: [f32; 2],
+    aspect: f32,
+    control_point_lights: Vec<(VulkanPointLight, u32)>,
+    control_vulkan_lights: Vec<VulkanPointLight>,
+    effect_updates: Vec<AmbientEffectGeometryUpdate>,
+    world_sort_keys: Vec<(usize, f32)>,
+    ambient_sort_keys: Vec<(usize, f32)>,
+    material_update: MaterialFrameUpdate,
+    environment_material_update: Option<MaterialFrameUpdate>,
+    environment: Option<DynamicEnvironmentFrame>,
 }
 
 impl DynamicEnvironment {
-    fn update(
+    fn update_cpu(
         &mut self,
         dt_seconds: f32,
         camera: &PreviewCameraFrame,
         aspect: f32,
         viewport: [f32; 2],
-        renderer: &mut VulkanSmokeRenderer,
         mut audio: Option<&mut audio::GameAudio>,
     ) -> Result<DynamicEnvironmentFrame, String> {
         let dt_seconds = if dt_seconds.is_finite() {
@@ -3592,31 +4241,6 @@ impl DynamicEnvironment {
                 .map_err(|error| format!("update ambient variation: {error}"))?;
         }
 
-        let mut uniforms = renderer.frame_uniforms();
-        uniforms.clip_from_world = camera.clip_from_world;
-        for (target, source) in uniforms
-            .directional_lights
-            .iter_mut()
-            .zip(sky_frame.directional_lights)
-        {
-            target.direction = source.direction;
-            target.rgb = source.color;
-            target.coefficients = [0.0, 0.0, 1.0];
-            target.active = source.active;
-        }
-        uniforms.lighting_floor = sky_frame.lighting_floor;
-        let fog_rgb = sky_frame
-            .screen_gradient(camera.native_sky_heading(), [0.0; 3])
-            .color
-            .rgba();
-        uniforms.fog_color = [fog_rgb[0], fog_rgb[1], fog_rgb[2]];
-        uniforms.fog_start = sky_frame.fog.start.max(0.0);
-        uniforms.fog_end = sky_frame.fog.end.max(uniforms.fog_start);
-        uniforms.camera_position = camera.position;
-        renderer
-            .set_frame_uniforms(uniforms)
-            .map_err(|error| format!("update sky frame uniforms: {error}"))?;
-
         let fx_camera = environment_camera_for_preview(camera, aspect, viewport);
         let environment_frame = self.environment.update_atmosphere_with_materials(
             dt_seconds,
@@ -3624,22 +4248,6 @@ impl DynamicEnvironment {
             &self.materials,
             fx_camera,
         );
-        let mut uniforms = renderer.frame_uniforms();
-        uniforms.point_light = environment_frame
-            .point_lights
-            .iter()
-            .find(|light| light.active)
-            .map(|light| VulkanPointLight {
-                position: light.position,
-                rgb: [light.color[0], light.color[1], light.color[2]],
-                range: light.range,
-                coefficients: light.attenuation,
-                active: true,
-            })
-            .unwrap_or_default();
-        renderer
-            .set_frame_uniforms(uniforms)
-            .map_err(|error| format!("update environment point-light uniforms: {error}"))?;
         if let Some(audio) = audio.as_mut() {
             for sound in &environment_frame.sounds {
                 audio
@@ -3942,6 +4550,10 @@ fn scale3(value: [f32; 3], factor: f32) -> [f32; 3] {
     [value[0] * factor, value[1] * factor, value[2] * factor]
 }
 
+fn multiply3(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
+    [left[0] * right[0], left[1] * right[1], left[2] * right[2]]
+}
+
 fn dot3(left: [f32; 3], right: [f32; 3]) -> f32 {
     left[0].mul_add(right[0], left[1].mul_add(right[1], left[2] * right[2]))
 }
@@ -3985,19 +4597,19 @@ struct StaticPreviewScene {
     type16_present_ranges: HashSet<usize>,
     materials: Vec<VulkanStaticMaterial>,
     material_animations: Vec<MaterialAnimationBinding>,
+    ambient_effect_slots: Vec<AmbientEffectGpuSlot>,
+    control_point_light_slots: Vec<ControlPointLightSlot>,
+    component_pose_buffers: Vec<Vec<Option<NodePoseBuffer>>>,
+    component_mount_poses: Vec<Vec<Option<VulkanNodePose>>>,
+    dynamic_component_geometry: Vec<Vec<Option<DynamicComponentGeometry>>>,
+    building_collision_bindings: Vec<BuildingCollisionBinding>,
+    control_animation_instances: Vec<Vec<Option<ControlAnimationInstance>>>,
+    dynamic_shadow_casters: Vec<DynamicShadowCaster>,
     sun_occlusion_range_indices: Vec<usize>,
     shadow_casters: Vec<ShadowCaster>,
-    shadow_sphere_baselines: Vec<ShadowSphere>,
     shadow_receivers: Vec<ShadowTriangle>,
     shadow_material_index: usize,
     terrain: Arc<TerrainWorld>,
-    component_pose_buffers: Vec<Vec<Option<NodePoseBuffer>>>,
-    component_mount_poses: Vec<Vec<Option<VulkanNodePose>>>,
-    control_animation_instances: Vec<ControlAnimationInstance>,
-    dynamic_component_geometry: Vec<DynamicComponentGeometry>,
-    building_collision_bindings: Vec<BuildingCollisionBinding>,
-    dynamic_component_mounts: Vec<DynamicComponentMount>,
-    shadow_caster_indices_by_object: Vec<Option<usize>>,
     camera: VulkanStaticCamera,
     view_camera: PreviewCameraFrame,
     captured_viewport: Option<CapturedViewport>,
@@ -4007,25 +4619,24 @@ struct StaticPreviewScene {
     terrain_components: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct ControlAnimationInstance {
-    object_index: usize,
-    component_index: usize,
-    model: Arc<ModelAsset>,
     control: PreparedComponentControl,
+    model: ModelAsset,
+    gate_values: Vec<Option<f32>>,
     state: ControlInstanceState,
+    last_sampled_node_times: Vec<Option<f32>>,
+    reported_unsupported_fallback: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct DynamicComponentGeometry {
-    object_index: usize,
-    component_index: usize,
-    model: Arc<ModelAsset>,
-    transform: LegacyIron3dEulerTransform,
-    scale: [f32; 3],
+    model: ModelAsset,
+    root_transform: LegacyIron3dEulerTransform,
+    owner_scale: [f32; 3],
+    parent_mount: Option<(usize, usize)>,
     vertex_start: usize,
     vertex_count: usize,
-    shadow_triangle_range: Option<std::ops::Range<usize>>,
 }
 
 #[derive(Clone)]
@@ -4230,12 +4841,23 @@ fn component_node_world_matrix(
     world.iter().all(|value| value.is_finite()).then_some(world)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DynamicComponentMount {
+#[derive(Clone, Debug)]
+struct DynamicShadowCaster {
+    caster_index: usize,
     object_index: usize,
+    root_transform: LegacyIron3dEulerTransform,
+    owner_scale: [f32; 3],
+    initial_sphere: ShadowSphere,
+    component_draw_range_indices: Vec<usize>,
+    component_spheres: Vec<DynamicShadowSphereSource>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DynamicShadowSphereSource {
     component_index: usize,
-    parent_index: usize,
-    socket: usize,
+    center: [f32; 3],
+    radius: f32,
+    mounted: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -4324,6 +4946,1939 @@ fn compose_unit_pose(parent: VulkanNodePose, child: VulkanNodePose) -> VulkanNod
         ],
         rotation: multiply_unit_quaternions(parent.rotation, child.rotation),
     }
+}
+
+fn control_type4_local_matrix(
+    points: [&PreparedControlPoint; 3],
+    owner_scale: [f32; 3],
+) -> Option<[[f32; 4]; 4]> {
+    if !owner_scale.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    let positions = points.map(|point| multiply3(point.position, owner_scale));
+    let directions = points.map(|point| multiply3(point.direction, owner_scale));
+    if !positions
+        .iter()
+        .flatten()
+        .chain(directions.iter().flatten())
+        .all(|value| value.is_finite())
+    {
+        return None;
+    }
+    let reciprocal_three = f32::from_bits(0x3EAA_AAAB);
+    let translation = std::array::from_fn(|axis| {
+        (positions[0][axis] + positions[1][axis] + positions[2][axis]) * reciprocal_three
+    });
+    if !translation.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+
+    let [d0, d1, d2] = directions;
+    if d0 == d1 && d1 == d2 {
+        let magnitude = finite_length3(d0)?;
+        if magnitude <= 0.0 {
+            return None;
+        }
+        let basis = control_3ef0_basis(scale3(d0, magnitude.recip()), translation)?;
+        let scaled = std::array::from_fn(|row| {
+            let mut result = basis[row];
+            for column in 0..3 {
+                result[column] *= magnitude;
+            }
+            result
+        });
+        return scaled
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite())
+            .then_some(scaled);
+    }
+    let (s, a) = if d0 == d2 || d1 == d2 {
+        (d0, d1)
+    } else if d0 == d1 {
+        (d0, d2)
+    } else {
+        let matrix = control_matrix_from_columns(d0, d1, d2, translation);
+        return matrix
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite())
+            .then_some(matrix);
+    };
+
+    // In a repeated-direction row d0 is always the native S vector; the
+    // other vector selected above is A for helper 0x4070.
+    let cross = cross3(a, s);
+    let cross_length = finite_length3(cross)?;
+    if cross_length <= 0.0 {
+        return control_3ef0_basis(s, translation);
+    }
+    let u = scale3(cross, cross_length.recip());
+    let v = cross3(s, u);
+    let matrix = control_matrix_from_columns(s, u, v, translation);
+    matrix
+        .iter()
+        .flatten()
+        .all(|value| value.is_finite())
+        .then_some(matrix)
+}
+
+fn control_3ef0_basis(axis: [f32; 3], translation: [f32; 3]) -> Option<[[f32; 4]; 4]> {
+    if !axis
+        .iter()
+        .chain(translation.iter())
+        .all(|value| value.is_finite())
+    {
+        return None;
+    }
+    let mut u = if axis[0] == 0.0 {
+        [1.0, 0.0, 0.0]
+    } else if axis[1] == 0.0 {
+        [0.0, 1.0, 0.0]
+    } else {
+        [-axis[1], axis[0], 0.0]
+    };
+    if axis[2] != 0.0 {
+        let u_length = finite_length3(u)?;
+        if u_length <= 0.0 {
+            return None;
+        }
+        u = scale3(u, u_length.recip());
+    }
+    let v = cross3(axis, u);
+    let matrix = control_matrix_from_columns(axis, u, v, translation);
+    matrix
+        .iter()
+        .flatten()
+        .all(|value| value.is_finite())
+        .then_some(matrix)
+}
+
+fn control_matrix_from_columns(
+    first: [f32; 3],
+    second: [f32; 3],
+    third: [f32; 3],
+    translation: [f32; 3],
+) -> [[f32; 4]; 4] {
+    [
+        [first[0], second[0], third[0], translation[0]],
+        [first[1], second[1], third[1], translation[1]],
+        [first[2], second[2], third[2], translation[2]],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+}
+
+fn finite_length3(value: [f32; 3]) -> Option<f32> {
+    let length = dot3(value, value).sqrt();
+    length.is_finite().then_some(length)
+}
+
+fn control_type4_effect_local_matrix(
+    points: [&PreparedControlPoint; 3],
+    effect_scale: [f32; 3],
+) -> Option<[[f32; 4]; 4]> {
+    if !effect_scale.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    let mut local = control_type4_local_matrix(points, [1.0; 3])?;
+    for (column, scale) in effect_scale.into_iter().enumerate() {
+        for row in &mut local[..3] {
+            row[column] *= scale;
+        }
+    }
+    local
+        .iter()
+        .flatten()
+        .all(|value| value.is_finite())
+        .then_some(local)
+}
+
+fn control_effect_owner_node_pose(
+    hierarchy: Option<&NodePoseBuffer>,
+    component_is_mounted: bool,
+    owner_node_index: usize,
+) -> Option<VulkanNodePose> {
+    match hierarchy {
+        Some(hierarchy) if component_is_mounted => {
+            node38_pose_relative_to_root_from_hierarchy(hierarchy, owner_node_index)
+        }
+        Some(hierarchy) => node38_pose_from_hierarchy(hierarchy, owner_node_index),
+        None if owner_node_index == 0 => Some(VulkanNodePose {
+            translation: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+        }),
+        None => None,
+    }
+}
+
+fn node_pose_row_major(pose: VulkanNodePose) -> [[f32; 4]; 4] {
+    let basis = [
+        rotate_unit_vector([1.0, 0.0, 0.0], pose.rotation),
+        rotate_unit_vector([0.0, 1.0, 0.0], pose.rotation),
+        rotate_unit_vector([0.0, 0.0, 1.0], pose.rotation),
+    ];
+    control_matrix_from_columns(basis[0], basis[1], basis[2], pose.translation)
+}
+
+fn component_mount_matrix(mount_pose: VulkanNodePose) -> [[f32; 4]; 4] {
+    node_pose_row_major(mount_pose)
+}
+
+fn component_scale_matrix(scale: [f32; 3]) -> [[f32; 4]; 4] {
+    [
+        [scale[0], 0.0, 0.0, 0.0],
+        [0.0, scale[1], 0.0, 0.0],
+        [0.0, 0.0, scale[2], 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+}
+
+fn matrix_to_row_major(matrix: [[f32; 4]; 4]) -> [f32; 16] {
+    std::array::from_fn(|index| matrix[index / 4][index % 4])
+}
+
+fn control_type4_world_from_effect(
+    local_from_effect: [[f32; 4]; 4],
+    owner_scale: [f32; 3],
+    root_transform: LegacyIron3dEulerTransform,
+    mount_pose: Option<VulkanNodePose>,
+    owner_node_pose: VulkanNodePose,
+) -> Option<[[f32; 4]; 4]> {
+    if !owner_scale
+        .iter()
+        .chain(local_from_effect.iter().flatten())
+        .chain(owner_node_pose.translation.iter())
+        .chain(owner_node_pose.rotation.iter())
+        .all(|value| value.is_finite())
+    {
+        return None;
+    }
+    let root = root_transform.try_row_major()?;
+    let mut world_flat = multiply_row_major(
+        root,
+        matrix_to_row_major(component_scale_matrix(owner_scale)),
+    );
+    if let Some(mount) = mount_pose {
+        world_flat = multiply_row_major(
+            world_flat,
+            matrix_to_row_major(component_mount_matrix(mount)),
+        );
+    }
+    world_flat = multiply_row_major(
+        world_flat,
+        matrix_to_row_major(node_pose_row_major(owner_node_pose)),
+    );
+    world_flat = multiply_row_major(world_flat, matrix_to_row_major(local_from_effect));
+    let world =
+        std::array::from_fn(|row| std::array::from_fn(|column| world_flat[row * 4 + column]));
+    world
+        .iter()
+        .flatten()
+        .all(|value| value.is_finite())
+        .then_some(world)
+}
+
+fn control_type4_world_from_effect_with_random_shift(
+    mut local_from_effect: [[f32; 4]; 4],
+    random_shift: [f32; 3],
+    owner_scale: [f32; 3],
+    root_transform: LegacyIron3dEulerTransform,
+    mount_pose: Option<VulkanNodePose>,
+    owner_node_pose: VulkanNodePose,
+) -> Option<[[f32; 4]; 4]> {
+    for (axis, value) in random_shift.into_iter().enumerate() {
+        local_from_effect[axis][3] += value;
+    }
+    control_type4_world_from_effect(
+        local_from_effect,
+        owner_scale,
+        root_transform,
+        mount_pose,
+        owner_node_pose,
+    )
+}
+
+#[cfg(test)]
+fn ambient_effect_world_from_component_pose(
+    slot: &AmbientEffectGpuSlot,
+    component_pose_buffers: &[Vec<Option<NodePoseBuffer>>],
+) -> Option<[[f32; 4]; 4]> {
+    ambient_effect_world_from_component_pose_with_random_shift(
+        slot,
+        component_pose_buffers,
+        [0.0; 3],
+    )
+}
+
+fn ambient_effect_world_from_component_pose_with_random_shift(
+    slot: &AmbientEffectGpuSlot,
+    component_pose_buffers: &[Vec<Option<NodePoseBuffer>>],
+    random_shift: [f32; 3],
+) -> Option<[[f32; 4]; 4]> {
+    let hierarchy = component_pose_buffers
+        .get(slot.owner_object_index)
+        .and_then(|components| components.get(slot.owner_component_index))
+        .and_then(Option::as_ref);
+    let owner_node_pose = control_effect_owner_node_pose(
+        hierarchy,
+        slot.owner_component_is_mounted,
+        slot.owner_node_index,
+    )?;
+    control_type4_world_from_effect_with_random_shift(
+        slot.local_from_effect,
+        random_shift,
+        slot.owner_scale,
+        slot.root_transform,
+        slot.mount_pose,
+        owner_node_pose,
+    )
+}
+
+fn control_point_light_world_from_component_pose_with_random_shift(
+    slot: &ControlPointLightSlot,
+    component_pose_buffers: &[Vec<Option<NodePoseBuffer>>],
+    random_shift: [f32; 3],
+) -> Option<[[f32; 4]; 4]> {
+    let hierarchy = component_pose_buffers
+        .get(slot.owner_object_index)
+        .and_then(|components| components.get(slot.owner_component_index))
+        .and_then(Option::as_ref);
+    let owner_node_pose = control_effect_owner_node_pose(
+        hierarchy,
+        slot.owner_component_is_mounted,
+        slot.owner_node_index,
+    )?;
+    control_type4_world_from_effect_with_random_shift(
+        slot.local_from_effect,
+        random_shift,
+        slot.owner_scale,
+        slot.root_transform,
+        slot.mount_pose,
+        owner_node_pose,
+    )
+}
+
+fn update_control_point_lights(
+    slots: &mut [ControlPointLightSlot],
+    component_pose_buffers: &[Vec<Option<NodePoseBuffer>>],
+    component_mount_poses: &[Vec<Option<VulkanNodePose>>],
+    elapsed_seconds: f32,
+    random_samples: &HashMap<ControlEffectInstanceKey, ControlEffectRandomSample>,
+    emit_diagnostic: bool,
+) -> Vec<(VulkanPointLight, u32)> {
+    let mut lights = Vec::new();
+    for slot in slots {
+        if slot.owner_component_is_mounted {
+            slot.mount_pose = component_mount_poses
+                .get(slot.owner_object_index)
+                .and_then(|components| components.get(slot.owner_component_index))
+                .copied()
+                .flatten();
+        }
+        let random_sample = random_samples
+            .get(&slot.random_instance_key)
+            .copied()
+            .unwrap_or_default();
+        let Some(world_from_effect) =
+            control_point_light_world_from_component_pose_with_random_shift(
+                slot,
+                component_pose_buffers,
+                random_sample.accumulated_shift,
+            )
+        else {
+            continue;
+        };
+        slot.world_from_effect = world_from_effect;
+        let Some(phase) = ambient_effect_phase(
+            slot.time_mode,
+            slot.header_flags,
+            elapsed_seconds,
+            slot.duration_seconds,
+        )
+        .map(|phase| native_command_phase(slot.header_flags, phase, random_sample.phase_jitter)) else {
+            continue;
+        };
+        let matrix = slot.world_from_effect;
+        let origin = [matrix[0][3], matrix[1][3], matrix[2][3]];
+        let basis = [
+            [matrix[0][0], matrix[1][0], matrix[2][0]],
+            [matrix[0][1], matrix[1][1], matrix[2][1]],
+            [matrix[0][2], matrix[1][2], matrix[2][2]],
+        ];
+        let Some(frame) = evaluate_op1_point_light_with_basis(&slot.command, phase, origin, basis)
+        else {
+            continue;
+        };
+        if !frame.active || frame.light_selector != 1 {
+            continue;
+        }
+        if emit_diagnostic {
+            eprintln!(
+                "control_point_light_detail object={} component={} table={} row={} command={} header_flags=0x{:08X} effect_type={} native_flags=0x{:08X} selector={} command_time={} phase={:.4} local_position_start={:?} local_position_end={:?} world_origin={:?} output_position={:?} rgb={:?} alpha={:.3} range={} attenuation={:?} effect_factor={}",
+                slot.owner_object_index,
+                slot.owner_component_index,
+                slot.random_instance_key.table_index,
+                slot.random_instance_key.row_index,
+                slot.command_index,
+                slot.header_flags,
+                frame.effect_type,
+                frame.native_flags,
+                frame.light_selector,
+                frame.command_time,
+                phase,
+                fx_command_vec3(&slot.command, 12),
+                fx_command_vec3(&slot.command, 24),
+                [matrix[0][3], matrix[1][3], matrix[2][3]],
+                frame.position,
+                frame.color,
+                frame.color[3],
+                frame.range,
+                frame.attenuation,
+                frame.effect_factor,
+            );
+        }
+        lights.push((
+            VulkanPointLight {
+                position: frame.position,
+                rgb: [frame.color[0], frame.color[1], frame.color[2]],
+                range: frame.range,
+                coefficients: frame.attenuation,
+                active: true,
+            },
+            frame.native_flags,
+        ));
+    }
+    lights
+}
+
+fn fx_command_vec3(command: &FxCommand, offset: usize) -> Option<[f32; 3]> {
+    let mut result = [0.0; 3];
+    for (axis, value) in result.iter_mut().enumerate() {
+        let start = offset.checked_add(axis.checked_mul(4)?)?;
+        let bytes = command.raw_body.get(start..start.checked_add(4)?)?;
+        *value = f32::from_le_bytes(bytes.try_into().ok()?);
+    }
+    Some(result)
+}
+
+fn report_control_point_lights_once(
+    reported: &mut bool,
+    control_clock_ms: u32,
+    target_clock_ms: Option<u32>,
+    environment_count: usize,
+    raw_control_lights: &[(VulkanPointLight, u32)],
+    ordinary_control_lights: &[VulkanPointLight],
+) {
+    if *reported || std::env::var_os("FPARKAN_CONTROL_POINT_LIGHT_DIAGNOSTIC").is_none() {
+        return;
+    }
+    if target_clock_ms.is_some_and(|target| control_clock_ms < target) {
+        return;
+    }
+    eprintln!(
+        "control_point_lights clock_ms={control_clock_ms} environment_count={environment_count} control_raw_count={} control_ordinary_count={} raw_flags={:?}",
+        raw_control_lights.len(),
+        ordinary_control_lights.len(),
+        raw_control_lights.iter().map(|(_, flags)| *flags).collect::<Vec<_>>(),
+    );
+    *reported = true;
+}
+
+fn ordinary_control_point_lights(
+    raw_control_lights: &[(VulkanPointLight, u32)],
+) -> Vec<VulkanPointLight> {
+    raw_control_lights
+        .iter()
+        .filter(|(light, flags)| light.active && flags & 0x8000_0000 == 0)
+        .map(|(light, _)| *light)
+        .collect()
+}
+
+fn initial_native_effect_phase(header_flags: u32, phase: f32) -> f32 {
+    if header_flags & 0x80 != 0 {
+        0.0
+    } else {
+        phase
+    }
+}
+
+fn native_command_phase(header_flags: u32, phase: f32, random_phase_jitter: f32) -> f32 {
+    let initial_phase = initial_native_effect_phase(header_flags, phase);
+    if initial_phase == -1.0 {
+        -1.0
+    } else {
+        (initial_phase
+            + if header_flags & 1 != 0 {
+                random_phase_jitter
+            } else {
+                0.0
+            })
+        .clamp(0.0, 1.0)
+    }
+}
+
+fn control_row_points<'a>(
+    point_list: &'a PreparedControlPointList,
+    row: &PreparedControlEffectRow,
+) -> Option<[&'a PreparedControlPoint; 3]> {
+    let mut result = Vec::with_capacity(3);
+    for offset in row.point_offsets {
+        result.push(point_list.points.get(usize::try_from(offset).ok()?)?);
+    }
+    result.try_into().ok()
+}
+
+fn append_initial_control_effect_slots(
+    root: &Path,
+    mission_root: &MissionObjectDraft,
+    object_index: usize,
+    component_index: usize,
+    control: &PreparedComponentControl,
+    component_pose_buffer: Option<&NodePoseBuffer>,
+    mount_pose: Option<VulkanNodePose>,
+    mesh: &mut VulkanStaticMesh,
+    materials: &mut Vec<VulkanStaticMaterial>,
+    material_animations: &mut Vec<MaterialAnimationBinding>,
+    effect_documents: &mut HashMap<String, FxDocument>,
+    effect_materials: &mut HashMap<String, PreparedEffectMaterial>,
+    slots: &mut Vec<AmbientEffectGpuSlot>,
+    point_light_slots: &mut Vec<ControlPointLightSlot>,
+) -> Result<(), String> {
+    let Some(point_list) = control.point_list.as_ref() else {
+        return Ok(());
+    };
+    for row in
+        selected_initial_control_effect_rows(control.initial_effect_group, &control.effect_section)
+    {
+        let group_index = row.table_index;
+        let archive = fixed_effect_field(&row.resource.archive);
+        let name = fixed_effect_field(&row.resource.name);
+        let points = control_row_points(point_list, row).ok_or_else(|| {
+            format!(
+                "Control group {group_index} row {} references a missing CPT point {:?}",
+                row.row_index, row.point_offsets
+            )
+        })?;
+        let key = format!("{archive}/{name}");
+        if !effect_documents.contains_key(&key) {
+            let bytes = load_resource_entry_bytes_from_root(root, &archive, &name)
+                .map_err(|error| format!("load Control FX {key}: {error}"))?;
+            let Ok(document) = decode_fxid(bytes) else {
+                continue;
+            };
+            effect_documents.insert(key.clone(), document);
+        }
+        let document = effect_documents
+            .get(&key)
+            .ok_or_else(|| format!("Control FX {key} was not cached"))?;
+        let header = document.header();
+        let duration_seconds = header.duration_seconds;
+        if !duration_seconds.is_finite()
+            || duration_seconds < 0.0
+            || !matches!(header.time_mode, 0 | 1 | 2)
+            || (header.time_mode != 0 && duration_seconds <= 0.0)
+            || !header.phase_jitter.is_finite()
+            || !header.random_shift.iter().all(|value| value.is_finite())
+            || !header.scale.iter().all(|value| value.is_finite())
+        {
+            // Control can reference action effects whose header timing and
+            // scale conventions are outside this ambient subset. Leave them
+            // unexpanded until their lifetime and transform contract are
+            // understood rather than failing the whole mission preview.
+            continue;
+        }
+        let owner_node_index =
+            usize::try_from(points[0].raw_signed_field_04)
+                .ok()
+                .filter(|owner_node| {
+                    component_pose_buffer
+                        .is_some_and(|hierarchy| *owner_node < hierarchy.poses.len())
+                        || (*owner_node == 0 && component_pose_buffer.is_none())
+                });
+        let Some(owner_node_index) = owner_node_index else {
+            continue;
+        };
+        let owner_node_pose = control_effect_owner_node_pose(
+            component_pose_buffer,
+            mount_pose.is_some(),
+            owner_node_index,
+        );
+        let Some(owner_node_pose) = owner_node_pose else {
+            continue;
+        };
+        let root_transform = LegacyIron3dEulerTransform {
+            translation: mission_root.position,
+            orientation_radians: mission_root.orientation_raw,
+        };
+        let local_from_effect = control_type4_effect_local_matrix(points, header.scale)
+            .ok_or_else(|| format!("Control FX {key} has an invalid type-4 transform"))?;
+        let world_from_effect = control_type4_world_from_effect(
+            local_from_effect,
+            mission_root.scale,
+            root_transform,
+            mount_pose,
+            owner_node_pose,
+        )
+        .ok_or_else(|| format!("Control FX {key} has an invalid owner transform"))?;
+        let control_source = format!(
+            "{}/{}",
+            control.source.archive.as_str(),
+            String::from_utf8_lossy(&control.source.name.0)
+        );
+        let random_instance_key = ControlEffectInstanceKey {
+            object_index,
+            component_index,
+            table_index: row.table_index,
+            row_index: row.row_index,
+        };
+        let random_seed = control_effect_instance_seed(
+            object_index,
+            component_index,
+            row.table_index,
+            row.row_index,
+            &control_source,
+        );
+
+        for (command_index, command) in document.commands().iter().enumerate() {
+            if ambient_effect_op1_supported(command) {
+                point_light_slots.push(ControlPointLightSlot {
+                    time_mode: header.time_mode,
+                    header_flags: header.flags,
+                    random_instance_key,
+                    random_seed,
+                    phase_jitter: header.phase_jitter,
+                    random_shift: header.random_shift,
+                    duration_seconds,
+                    owner_object_index: object_index,
+                    owner_component_index: component_index,
+                    owner_node_index,
+                    owner_component_is_mounted: mount_pose.is_some(),
+                    root_transform,
+                    owner_scale: mission_root.scale,
+                    mount_pose,
+                    local_from_effect,
+                    world_from_effect,
+                    command_index,
+                    command: command.clone(),
+                });
+                continue;
+            }
+            let Some(kind) = ambient_effect_command_kind(command) else {
+                continue;
+            };
+            if !ambient_effect_render_selector_allows_header(
+                header.flags,
+                CONTROL_COMPONENT_RENDER_SELECTOR,
+            ) {
+                continue;
+            }
+            let Some(reference) = command.resource_refs.first() else {
+                continue;
+            };
+            let material_archive = String::from_utf8_lossy(reference.archive_name()).into_owned();
+            let material_name = String::from_utf8_lossy(reference.resource_name()).into_owned();
+            if material_archive.is_empty() || material_name.is_empty() {
+                continue;
+            }
+            let cache_key = format!("{material_archive}/{material_name}");
+            if !effect_materials.contains_key(&cache_key) {
+                let _prepared = prepare_effect_material(
+                    root,
+                    &material_archive,
+                    &material_name,
+                    materials,
+                    effect_materials,
+                )?;
+            }
+            let prepared = effect_materials
+                .get(&cache_key)
+                .ok_or_else(|| format!("FX MAT0 {cache_key} was not cached"))?;
+            if !ambient_effect_tint_supported(
+                &prepared.phase_native_flag_40,
+                &prepared.phase_directional_rgb,
+                &prepared.phase_additive_rgb,
+            ) {
+                continue;
+            }
+            let first_material = *prepared
+                .phase_material_indices
+                .first()
+                .ok_or_else(|| format!("FX MAT0 {cache_key} has no phase variants"))?;
+            let op9_mesh_template =
+                if kind == AmbientEffectKind::GenerBall && command.opcode == FxOpcode::Op9 {
+                    let Some(template) = evaluate_f_gener_ball_mesh(
+                        command,
+                        command_index,
+                        &world_from_effect,
+                        0.0,
+                        0.0,
+                        [0.0; 3],
+                        AMBIENT_EFFECT_NATIVE_CATEGORY,
+                    ) else {
+                        continue;
+                    };
+                    Some(template)
+                } else {
+                    None
+                };
+            let op9_primitive_layout = op9_mesh_template
+                .as_ref()
+                .map(ambient_effect_mesh_primitive_layout)
+                .transpose()?;
+            let placeholder: [VulkanStaticVertex; 4] = std::array::from_fn(|index| {
+                environment_vertex_with_alpha(
+                    [0.0; 3],
+                    [1.0; 3],
+                    0.0,
+                    [[0.0, 0.99], [0.0, 0.0], [0.99, 0.0], [0.99, 0.99]][index],
+                )
+            });
+            let pipeline_state = ambient_effect_pipeline_state(prepared.initial_pipeline_category)
+                .ok_or_else(|| {
+                    format!(
+                        "FX MAT0 {cache_key} has unsupported pipeline category {}",
+                        prepared.initial_pipeline_category
+                    )
+                })?;
+            let pool_capacity = match kind {
+                AmbientEffectKind::SmokePool => ambient_effect_pool_capacity(command)
+                    .ok_or_else(|| format!("FX Op8 {cache_key} has an invalid pool size"))?,
+                AmbientEffectKind::Op7ParticlePool => ambient_effect_op7_range_capacity(command)
+                    .ok_or_else(|| format!("FX Op7 {cache_key} has an invalid particle pool"))?,
+                _ => 1,
+            };
+            let range_capacity = op9_primitive_layout
+                .as_ref()
+                .map_or(pool_capacity, Vec::len);
+            let mut particle_ranges = Vec::with_capacity(range_capacity);
+            let mut particle_material_animation_indices = Vec::with_capacity(range_capacity);
+            for _ in 0..pool_capacity {
+                if let (Some(template), Some(primitives)) =
+                    (&op9_mesh_template, &op9_primitive_layout)
+                {
+                    for primitive in primitives {
+                        let vertices = ambient_effect_mesh_primitive_vertices(template, *primitive);
+                        let indices = ambient_effect_mesh_primitive_indices(template, *primitive)?;
+                        let range = append_environment_range(
+                            mesh,
+                            first_material,
+                            vertices,
+                            indices,
+                            pipeline_state,
+                        )?;
+                        let material_animation_index = append_effect_material_animation(
+                            prepared,
+                            range.range_index,
+                            material_animations,
+                        );
+                        particle_ranges.push(range);
+                        particle_material_animation_indices.push(material_animation_index);
+                    }
+                } else {
+                    let range = append_environment_range(
+                        mesh,
+                        first_material,
+                        placeholder.to_vec(),
+                        vec![0, 1, 2, 2, 3, 0],
+                        pipeline_state,
+                    )?;
+                    let material_animation_index = append_effect_material_animation(
+                        prepared,
+                        range.range_index,
+                        material_animations,
+                    );
+                    particle_ranges.push(range);
+                    particle_material_animation_indices.push(material_animation_index);
+                }
+            }
+            let range = particle_ranges.remove(0);
+            let material_animation_index = particle_material_animation_indices.remove(0);
+            let smoke_emitter_state = (kind == AmbientEffectKind::SmokePool).then(|| {
+                let seed = ambient_effect_seed(
+                    object_index,
+                    component_index,
+                    row.table_index,
+                    row.row_index,
+                    command_index,
+                    &control_source,
+                );
+                SmokeEmitterState::new(seed, seed, seed)
+            });
+            let op7_emitter_state = (kind == AmbientEffectKind::Op7ParticlePool).then(|| {
+                let seed = ambient_effect_seed(
+                    object_index,
+                    component_index,
+                    row.table_index,
+                    row.row_index,
+                    command_index,
+                    &control_source,
+                );
+                Op7EmitterState::new(seed, seed)
+            });
+            slots.push(AmbientEffectGpuSlot {
+                kind,
+                time_mode: header.time_mode,
+                header_flags: header.flags,
+                random_instance_key,
+                random_seed,
+                phase_jitter: header.phase_jitter,
+                random_shift: header.random_shift,
+                owner_object_index: object_index,
+                owner_component_index: component_index,
+                owner_node_index,
+                owner_component_is_mounted: mount_pose.is_some(),
+                root_transform,
+                owner_scale: mission_root.scale,
+                mount_pose,
+                local_from_effect,
+                control_source: control_source.clone(),
+                control_table_index: row.table_index,
+                control_row_index: row.row_index,
+                control_point_indices: row.point_offsets,
+                control_point_owners: points.map(|point| point.raw_signed_field_04),
+                command: command.clone(),
+                command_index,
+                duration_seconds,
+                world_from_effect,
+                range,
+                additional_particle_ranges: particle_ranges,
+                material_animation_index,
+                additional_particle_material_animation_indices: particle_material_animation_indices,
+                smoke_emitter_state,
+                op7_emitter_state,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn selected_initial_control_effect_rows<'a>(
+    group_index: Option<usize>,
+    section: &'a PreparedControlEffectSection,
+) -> Vec<&'a PreparedControlEffectRow> {
+    let (Some(group_index), PreparedControlEffectSection::Parsed(rows)) = (group_index, section)
+    else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter(|row| {
+            row.table_index == group_index && ambient_effect_row_unconditionally_active(row)
+        })
+        .collect()
+}
+
+fn ambient_effect_row_unconditionally_active(row: &PreparedControlEffectRow) -> bool {
+    // Control22C0 returns true when none of the predicate bits are set. The
+    // two row-chain bits have separate dispatch semantics and stay excluded.
+    row.raw_condition[0] & 0xF000_0000 == 0
+}
+
+fn ambient_effect_command_kind(command: &FxCommand) -> Option<AmbientEffectKind> {
+    let body = command.raw_body.as_ref();
+    let mode = body
+        .get(..4)
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four byte FX body mode")));
+    let body_c4 = body
+        .get(0xc4..0xc8)
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four byte FX C4 field")));
+    match (command.opcode, mode, body_c4) {
+        (FxOpcode::Op3, Some(0), _) if command.raw_body.len() >= 0xC4 => {
+            Some(AmbientEffectKind::Op3Type0)
+        }
+        (FxOpcode::Op3, Some(1), _) if command.raw_body.len() >= 0xC4 => {
+            Some(AmbientEffectKind::Op3Type1)
+        }
+        (FxOpcode::Op3, Some(2), _) => Some(AmbientEffectKind::Op3Type2),
+        (FxOpcode::Op9, Some(2), Some(0..=2)) => Some(AmbientEffectKind::GenerBall),
+        (FxOpcode::Op7, _, _) if ambient_effect_op7_range_capacity(command).is_some() => {
+            Some(AmbientEffectKind::Op7ParticlePool)
+        }
+        (FxOpcode::Op8, _, _) if ambient_effect_pool_capacity(command).is_some() => {
+            Some(AmbientEffectKind::SmokePool)
+        }
+        (FxOpcode::Op4, Some(0), Some(denominator_bits))
+            if f32::from_bits(denominator_bits).is_finite()
+                && f32::from_bits(denominator_bits) > 0.0 =>
+        {
+            Some(AmbientEffectKind::GenerBall)
+        }
+        _ => None,
+    }
+}
+
+const CONTROL_COMPONENT_RENDER_SELECTOR: u32 = 1;
+
+fn ambient_effect_render_selector_allows_header(header_flags: u32, render_selector: u32) -> bool {
+    // Effect.dll 0x7D10 suppresses header flag 0x800 only for selector zero.
+    // The native AniMesh component path was observed calling the manager with
+    // selector one while its 0xD00 f_smalllight_y entries were present.
+    render_selector != 0 || header_flags & 0x800 == 0
+}
+
+fn ambient_effect_op1_supported(command: &FxCommand) -> bool {
+    if command.opcode != FxOpcode::Op1 {
+        return false;
+    }
+    let Some(effect_type) = command
+        .raw_body
+        .get(..4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_le_bytes)
+    else {
+        return false;
+    };
+    command.raw_body.len() >= 132 && matches!(effect_type, 1 | 2 | 5 | 6 | 7)
+}
+
+fn ambient_effect_pool_capacity(command: &FxCommand) -> Option<usize> {
+    if command.opcode != FxOpcode::Op8 {
+        return None;
+    }
+    let pool_count = usize::try_from(u32::from_le_bytes(
+        command.raw_body.get(0x20..0x24)?.try_into().ok()?,
+    ))
+    .ok()?;
+    (1..=4096).contains(&pool_count).then_some(pool_count)
+}
+
+fn ambient_effect_op7_range_capacity(command: &FxCommand) -> Option<usize> {
+    if command.opcode != FxOpcode::Op7 || command.raw_body.len() < 0xCC {
+        return None;
+    }
+    let read_u32 = |offset: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(
+            command.raw_body.get(offset..offset + 4)?.try_into().ok()?,
+        ))
+    };
+    let read_f32 = |offset| read_u32(offset).map(f32::from_bits);
+    // The evaluator uses the traced default world scalar of 10 for this
+    // Control path; the command's acceleration is supported when finite.
+    let material_phase_factor = read_f32(0x1C)?;
+    if !matches!(read_u32(0x00)?, 0 | 1)
+        || !material_phase_factor.is_finite()
+        || material_phase_factor == 0.0
+        || !read_f32(0x88)?.is_finite()
+    {
+        return None;
+    }
+    let pool_count = usize::try_from(read_u32(0x20)?).ok()?;
+    let copies_per_group = usize::try_from(read_u32(0x24)?).ok()?;
+    let capacity = pool_count.checked_mul(copies_per_group)?;
+    (1..=4096).contains(&capacity).then_some(capacity)
+}
+
+fn ambient_effect_seed(
+    object_index: usize,
+    component_index: usize,
+    table_index: usize,
+    row_index: usize,
+    command_index: usize,
+    source: &str,
+) -> u32 {
+    let mut hash = 0x811C_9DC5_u32;
+    for byte in source.bytes().chain(
+        [
+            object_index,
+            component_index,
+            table_index,
+            row_index,
+            command_index,
+        ]
+        .into_iter()
+        .flat_map(|value| (value as u64).to_le_bytes()),
+    ) {
+        hash = (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193);
+    }
+    if hash == 0 {
+        1
+    } else {
+        hash
+    }
+}
+
+fn control_effect_instance_seed(
+    object_index: usize,
+    component_index: usize,
+    table_index: usize,
+    row_index: usize,
+    source: &str,
+) -> u32 {
+    ambient_effect_seed(
+        object_index,
+        component_index,
+        table_index,
+        row_index,
+        0,
+        source,
+    )
+}
+
+fn advance_control_effect_random_states(
+    states: &mut HashMap<ControlEffectInstanceKey, ControlEffectRandomState>,
+    ambient_slots: &[AmbientEffectGpuSlot],
+    point_light_slots: &[ControlPointLightSlot],
+    sample_id: SceneSampleId,
+    control_clock_ms: u32,
+    elapsed_seconds: f32,
+) -> HashMap<ControlEffectInstanceKey, ControlEffectRandomSample> {
+    let mut specifications = HashMap::new();
+    for slot in ambient_slots {
+        let initial_phase = ambient_effect_phase(
+            slot.time_mode,
+            slot.header_flags,
+            elapsed_seconds,
+            slot.duration_seconds,
+        )
+        .map(|phase| initial_native_effect_phase(slot.header_flags, phase))
+        .unwrap_or(-1.0);
+        specifications.entry(slot.random_instance_key).or_insert((
+            slot.random_seed,
+            slot.header_flags,
+            slot.phase_jitter,
+            slot.random_shift,
+            initial_phase,
+        ));
+    }
+    for slot in point_light_slots {
+        let initial_phase = ambient_effect_phase(
+            slot.time_mode,
+            slot.header_flags,
+            elapsed_seconds,
+            slot.duration_seconds,
+        )
+        .map(|phase| initial_native_effect_phase(slot.header_flags, phase))
+        .unwrap_or(-1.0);
+        specifications.entry(slot.random_instance_key).or_insert((
+            slot.random_seed,
+            slot.header_flags,
+            slot.phase_jitter,
+            slot.random_shift,
+            initial_phase,
+        ));
+    }
+
+    specifications
+        .into_iter()
+        .map(
+            |(key, (seed, flags, phase_jitter, random_shift, initial_phase))| {
+                let state = states.entry(key).or_insert_with(|| {
+                    ControlEffectRandomState::new(seed, flags, phase_jitter, random_shift)
+                });
+                (
+                    key,
+                    state.advance(sample_id, control_clock_ms, initial_phase),
+                )
+            },
+        )
+        .collect()
+}
+
+fn ambient_effect_ranges(slot: &AmbientEffectGpuSlot) -> Vec<(&EnvironmentGpuRange, usize)> {
+    std::iter::once((&slot.range, slot.material_animation_index))
+        .chain(
+            slot.additional_particle_ranges
+                .iter()
+                .zip(&slot.additional_particle_material_animation_indices)
+                .map(|(range, &binding)| (range, binding)),
+        )
+        .collect()
+}
+
+fn ambient_effect_quad_center(vertices: &[[f32; 3]; 4]) -> [f32; 3] {
+    std::array::from_fn(|axis| vertices.iter().map(|vertex| vertex[axis]).sum::<f32>() / 4.0)
+}
+
+fn ambient_effect_quad_size(vertices: &[[f32; 3]; 4]) -> [f32; 2] {
+    let edge_length = |a: [f32; 3], b: [f32; 3]| {
+        ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+    };
+    [
+        edge_length(vertices[0], vertices[1]),
+        edge_length(vertices[1], vertices[2]),
+    ]
+}
+
+fn ambient_effect_projected_bounds(
+    vertices: &[[f32; 3]; 4],
+    clip_from_world: [f32; 16],
+    viewport: [u32; 2],
+) -> Option<[f32; 4]> {
+    let mut points = [[0.0; 2]; 4];
+    for (index, vertex) in vertices.iter().enumerate() {
+        let clip = [
+            vertex[0] * clip_from_world[0]
+                + vertex[1] * clip_from_world[4]
+                + vertex[2] * clip_from_world[8]
+                + clip_from_world[12],
+            vertex[0] * clip_from_world[1]
+                + vertex[1] * clip_from_world[5]
+                + vertex[2] * clip_from_world[9]
+                + clip_from_world[13],
+            vertex[0] * clip_from_world[2]
+                + vertex[1] * clip_from_world[6]
+                + vertex[2] * clip_from_world[10]
+                + clip_from_world[14],
+            vertex[0] * clip_from_world[3]
+                + vertex[1] * clip_from_world[7]
+                + vertex[2] * clip_from_world[11]
+                + clip_from_world[15],
+        ];
+        if !clip.iter().all(|value| value.is_finite()) || clip[3] <= f32::EPSILON {
+            return None;
+        }
+        points[index] = [
+            (clip[0] / clip[3] + 1.0) * 0.5 * viewport[0] as f32,
+            (clip[1] / clip[3] + 1.0) * 0.5 * viewport[1] as f32,
+        ];
+    }
+    Some([
+        points
+            .iter()
+            .map(|point| point[0])
+            .fold(f32::INFINITY, f32::min),
+        points
+            .iter()
+            .map(|point| point[1])
+            .fold(f32::INFINITY, f32::min),
+        points
+            .iter()
+            .map(|point| point[0])
+            .fold(f32::NEG_INFINITY, f32::max),
+        points
+            .iter()
+            .map(|point| point[1])
+            .fold(f32::NEG_INFINITY, f32::max),
+    ])
+}
+
+fn ambient_effect_range_for(
+    slot: &AmbientEffectGpuSlot,
+    range_index: usize,
+) -> Option<&EnvironmentGpuRange> {
+    std::iter::once(&slot.range)
+        .chain(slot.additional_particle_ranges.iter())
+        .find(|range| range.range_index == range_index)
+}
+
+fn ambient_effect_pipeline_state(category: u8) -> Option<LegacyPipelineState> {
+    world_pipeline_state(LegacyBlendMode::SourceAlpha, LegacyDepthMode::TestReadOnly)
+        .with_material_category(category)
+}
+
+fn ambient_effect_tint_supported(
+    phase_native_flag_40: &[bool],
+    phase_directional_rgb: &[[f32; 3]],
+    phase_additive_rgb: &[[f32; 3]],
+) -> bool {
+    !phase_native_flag_40.is_empty()
+        && phase_native_flag_40.len() == phase_directional_rgb.len()
+        && phase_native_flag_40.len() == phase_additive_rgb.len()
+        && phase_native_flag_40.iter().all(|flag| !flag)
+        && phase_directional_rgb
+            .iter()
+            .zip(phase_additive_rgb)
+            .all(|(directional, additive)| {
+                directional
+                    .iter()
+                    .chain(additive)
+                    .all(|channel| channel.is_finite() && (0.0..=1.0).contains(channel))
+                    && (0..3).all(|channel| additive[channel] > 0.0 || directional[channel] == 0.0)
+            })
+}
+
+fn fixed_effect_field(field: &[u8; 32]) -> String {
+    let length = field
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(field.len());
+    String::from_utf8_lossy(&field[..length]).trim().to_owned()
+}
+
+fn update_ambient_effect_geometry(
+    slots: &mut [AmbientEffectGpuSlot],
+    component_pose_buffers: &[Vec<Option<NodePoseBuffer>>],
+    mesh: &mut VulkanStaticMesh,
+    material_animations: &mut [MaterialAnimationBinding],
+    elapsed_seconds: f32,
+    random_samples: &HashMap<ControlEffectInstanceKey, ControlEffectRandomSample>,
+    camera_world: [f32; 3],
+) -> Result<Vec<AmbientEffectGeometryUpdate>, String> {
+    let mut updates = Vec::with_capacity(slots.len());
+    for slot in slots {
+        let random_sample = random_samples
+            .get(&slot.random_instance_key)
+            .copied()
+            .unwrap_or_default();
+        let Some(world_from_effect) = ambient_effect_world_from_component_pose_with_random_shift(
+            slot,
+            component_pose_buffers,
+            random_sample.accumulated_shift,
+        ) else {
+            deactivate_ambient_effect_slot(slot, material_animations, &mut updates)?;
+            continue;
+        };
+        slot.world_from_effect = world_from_effect;
+        let Some(phase) = ambient_effect_phase(
+            slot.time_mode,
+            slot.header_flags,
+            elapsed_seconds,
+            slot.duration_seconds,
+        )
+        .map(|phase| native_command_phase(slot.header_flags, phase, random_sample.phase_jitter)) else {
+            deactivate_ambient_effect_slot(slot, material_animations, &mut updates)?;
+            continue;
+        };
+        if slot.kind == AmbientEffectKind::GenerBall && slot.command.opcode == FxOpcode::Op9 {
+            let Some(frame) = evaluate_f_gener_ball_mesh(
+                &slot.command,
+                slot.command_index,
+                &slot.world_from_effect,
+                phase,
+                elapsed_seconds,
+                camera_world,
+                AMBIENT_EFFECT_NATIVE_CATEGORY,
+            ) else {
+                deactivate_ambient_effect_slot(slot, material_animations, &mut updates)?;
+                continue;
+            };
+            let primitives = ambient_effect_mesh_primitive_layout(&frame)?;
+            let ranges = ambient_effect_ranges(slot);
+            if ranges.len() != primitives.len() {
+                return Err(format!(
+                    "ambient Op9 draw range count changed ({} != {})",
+                    ranges.len(),
+                    primitives.len()
+                ));
+            }
+            for (primitive, (range, material_animation_index)) in primitives.into_iter().zip(ranges)
+            {
+                let binding = material_animations
+                    .get_mut(material_animation_index)
+                    .ok_or_else(|| "ambient FX material binding is out of bounds".to_string())?;
+                binding.normalized_phase_override = Some(frame.material_phase);
+                write_ambient_effect_mesh_primitive(mesh, range, &frame, primitive)?;
+                updates.push(AmbientEffectGeometryUpdate {
+                    range_index: range.range_index,
+                    index_count: if frame.active && frame.color[3] > 0.0 {
+                        u32::try_from(primitive.index_count)
+                            .map_err(|_| "ambient Op9 index count exceeds u32".to_string())?
+                    } else {
+                        0
+                    },
+                    command_rgb: [frame.color[0], frame.color[1], frame.color[2]],
+                });
+            }
+            continue;
+        }
+        let frames = match (slot.kind, slot.command.opcode) {
+            (AmbientEffectKind::Op3Type0, FxOpcode::Op3) => evaluate_op3_type0_command(
+                &slot.command,
+                slot.command_index,
+                &slot.world_from_effect,
+                elapsed_seconds,
+                phase,
+                camera_world,
+            )
+            .into_iter()
+            .collect(),
+            (AmbientEffectKind::Op7ParticlePool, FxOpcode::Op7) => {
+                let Some(state) = slot.op7_emitter_state.as_mut() else {
+                    deactivate_ambient_effect_slot(slot, material_animations, &mut updates)?;
+                    continue;
+                };
+                let Some(frames) = evaluate_op7_emitter(
+                    &slot.command,
+                    slot.command_index,
+                    &slot.world_from_effect,
+                    camera_world,
+                    phase,
+                    elapsed_seconds,
+                    Op7RenderContext {
+                        detail_level: 0,
+                        // At detail level zero, [0,1) cutoffs with zero bias
+                        // are all visible. The native quality preset remains
+                        // unresolved, but no particle is culled here.
+                        visibility: Op7VisibilityProfile {
+                            width: 1.0,
+                            bias: 0.0,
+                        },
+                        // Terrain.dll initializes the native world's world
+                        // scalar to 10.0. An engine integration can supply the
+                        // live value after it exposes the world setting.
+                        world_scalar: 10.0,
+                    },
+                    state,
+                ) else {
+                    deactivate_ambient_effect_slot(slot, material_animations, &mut updates)?;
+                    continue;
+                };
+                fx_material_speed_diagnostic(slot, 0xAC, elapsed_seconds, phase, &frames);
+                frames
+            }
+            (AmbientEffectKind::SmokePool, FxOpcode::Op8) => {
+                let Some(state) = slot.smoke_emitter_state.as_mut() else {
+                    deactivate_ambient_effect_slot(slot, material_animations, &mut updates)?;
+                    continue;
+                };
+                let frames = evaluate_op8_emitter(
+                    &slot.command,
+                    slot.command_index,
+                    &slot.world_from_effect,
+                    camera_world,
+                    elapsed_seconds,
+                    phase,
+                    0,
+                    Op8DetailThresholdRange::new(1.0, 1.0)
+                        .expect("ordered finite Op8 material threshold"),
+                    state,
+                )
+                .unwrap_or_default();
+                smoke_fr_02_diagnostic(slot, elapsed_seconds, phase, &frames);
+                fx_material_speed_diagnostic(slot, 0xD4, elapsed_seconds, phase, &frames);
+                frames
+            }
+            (AmbientEffectKind::Op3Type1, FxOpcode::Op3) => evaluate_op3_type1_command(
+                &slot.command,
+                slot.command_index,
+                &slot.world_from_effect,
+                elapsed_seconds,
+                phase,
+                camera_world,
+            )
+            .into_iter()
+            .collect(),
+            (AmbientEffectKind::Op3Type2, FxOpcode::Op3) => evaluate_op3_type2_command(
+                &slot.command,
+                slot.command_index,
+                &slot.world_from_effect,
+                elapsed_seconds,
+                phase,
+                0,
+            )
+            .into_iter()
+            .collect(),
+            (AmbientEffectKind::GenerBall, FxOpcode::Op4) => evaluate_f_gener_ball(
+                &slot.command,
+                slot.command_index,
+                &slot.world_from_effect,
+                phase,
+                elapsed_seconds,
+                camera_world,
+            )
+            .into_iter()
+            .collect(),
+            _ => Vec::new(),
+        };
+        let ranges = ambient_effect_ranges(slot);
+        if frames.is_empty() {
+            deactivate_ambient_effect_slot(slot, material_animations, &mut updates)?;
+            continue;
+        }
+        let variable_pool = slot.kind == AmbientEffectKind::Op7ParticlePool;
+        let aligned_frames = align_ambient_effect_frames(frames, ranges.len(), variable_pool)?;
+        for ((range, material_animation_index), frame) in ranges.into_iter().zip(aligned_frames) {
+            if let Some(frame) = frame {
+                let binding = material_animations
+                    .get_mut(material_animation_index)
+                    .ok_or_else(|| "ambient FX material binding is out of bounds".to_string())?;
+                binding.normalized_phase_override = Some(frame.material_phase);
+                write_ambient_effect_frame(mesh, range, &frame)?;
+                updates.push(AmbientEffectGeometryUpdate {
+                    range_index: range.range_index,
+                    index_count: if frame.active && frame.color[3] > 0.0 {
+                        6
+                    } else {
+                        0
+                    },
+                    command_rgb: [frame.color[0], frame.color[1], frame.color[2]],
+                });
+            } else {
+                deactivate_ambient_effect_range(
+                    range,
+                    material_animation_index,
+                    material_animations,
+                    &mut updates,
+                )?;
+            }
+        }
+    }
+    Ok(updates)
+}
+
+fn align_ambient_effect_frames(
+    frames: Vec<fparkan_fx::fx_visual::EffectQuadFrame>,
+    range_count: usize,
+    variable_pool: bool,
+) -> Result<Vec<Option<fparkan_fx::fx_visual::EffectQuadFrame>>, String> {
+    if (variable_pool && frames.len() > range_count)
+        || (!variable_pool && frames.len() != range_count)
+    {
+        return Err(format!(
+            "ambient FX frame pool has {} particles but {range_count} draw ranges",
+            frames.len()
+        ));
+    }
+    let active_count = frames.len();
+    let mut aligned: Vec<_> = frames.into_iter().map(Some).collect();
+    aligned.extend(std::iter::repeat_with(|| None).take(range_count - active_count));
+    Ok(aligned)
+}
+
+fn deactivate_ambient_effect_slot(
+    slot: &AmbientEffectGpuSlot,
+    material_animations: &mut [MaterialAnimationBinding],
+    updates: &mut Vec<AmbientEffectGeometryUpdate>,
+) -> Result<(), String> {
+    for (range, material_animation_index) in ambient_effect_ranges(slot) {
+        deactivate_ambient_effect_range(
+            range,
+            material_animation_index,
+            material_animations,
+            updates,
+        )?;
+    }
+    Ok(())
+}
+
+fn deactivate_ambient_effect_range(
+    range: &EnvironmentGpuRange,
+    material_animation_index: usize,
+    material_animations: &mut [MaterialAnimationBinding],
+    updates: &mut Vec<AmbientEffectGeometryUpdate>,
+) -> Result<(), String> {
+    let binding = material_animations
+        .get_mut(material_animation_index)
+        .ok_or_else(|| "ambient FX material binding is out of bounds".to_string())?;
+    binding.normalized_phase_override = Some(0.0);
+    updates.push(AmbientEffectGeometryUpdate {
+        range_index: range.range_index,
+        index_count: 0,
+        command_rgb: [0.0; 3],
+    });
+    Ok(())
+}
+
+fn write_ambient_effect_frame(
+    mesh: &mut VulkanStaticMesh,
+    range: &EnvironmentGpuRange,
+    frame: &fparkan_fx::fx_visual::EffectQuadFrame,
+) -> Result<(), String> {
+    let end = range
+        .vertex_start
+        .checked_add(range.vertex_capacity)
+        .ok_or_else(|| "ambient FX vertex range overflows".to_string())?;
+    let destination = mesh
+        .vertices
+        .get_mut(range.vertex_start..end)
+        .ok_or_else(|| "ambient FX vertex allocation is out of bounds".to_string())?;
+    if destination.len() != 4 {
+        return Err("ambient FX quad allocation changed after GPU preparation".to_string());
+    }
+    for (index, target) in destination.iter_mut().enumerate() {
+        *target = environment_vertex_with_alpha(
+            frame.vertices[index],
+            [frame.color[0], frame.color[1], frame.color[2]],
+            frame.color[3].clamp(0.0, 1.0),
+            frame.uv[index],
+        );
+    }
+    Ok(())
+}
+
+fn ambient_effect_mesh_primitive_layout(
+    frame: &fparkan_fx::fx_visual::EffectMeshFrame,
+) -> Result<Vec<AmbientEffectMeshPrimitive>, String> {
+    if frame.vertices.len() != frame.uv.len() || frame.indices.is_empty() {
+        return Err("ambient Op9 mesh has mismatched vertices/UVs or no indices".to_string());
+    }
+    let quad_count = frame
+        .indices
+        .len()
+        .checked_sub(frame.vertices.len())
+        .filter(|difference| difference.is_multiple_of(2))
+        .map(|difference| difference / 2)
+        .ok_or_else(|| "ambient Op9 mesh is not a native quad/cap layout".to_string())?;
+    let quad_vertex_count = quad_count
+        .checked_mul(4)
+        .ok_or_else(|| "ambient Op9 quad vertex count overflows".to_string())?;
+    let quad_index_count = quad_count
+        .checked_mul(6)
+        .ok_or_else(|| "ambient Op9 quad index count overflows".to_string())?;
+    let cap_vertex_count = frame
+        .vertices
+        .len()
+        .checked_sub(quad_vertex_count)
+        .filter(|count| count.is_multiple_of(3))
+        .ok_or_else(|| "ambient Op9 mesh has an invalid cap vertex count".to_string())?;
+    let cap_count = cap_vertex_count / 3;
+    let cap_index_count = cap_count
+        .checked_mul(3)
+        .ok_or_else(|| "ambient Op9 cap index count overflows".to_string())?;
+    if quad_index_count + cap_index_count != frame.indices.len() {
+        return Err("ambient Op9 quad and cap index counts do not match the frame".to_string());
+    }
+
+    // The native generator appends all quads first, then its triangle cap fan.
+    let mut primitives = Vec::with_capacity(quad_count + cap_count);
+    for quad in 0..quad_count {
+        let vertex_start = quad * 4;
+        let index_start = quad * 6;
+        let base = u16::try_from(vertex_start)
+            .map_err(|_| "ambient Op9 quad vertex exceeds u16".to_string())?;
+        let expected = [base, base + 1, base + 2, base + 2, base + 3, base];
+        if frame.indices.get(index_start..index_start + expected.len()) != Some(&expected) {
+            return Err("ambient Op9 quad topology changed from native ordering".to_string());
+        }
+        primitives.push(AmbientEffectMeshPrimitive {
+            vertex_start,
+            vertex_count: 4,
+            index_start,
+            index_count: 6,
+        });
+    }
+    for cap in 0..cap_count {
+        let vertex_start = quad_vertex_count + cap * 3;
+        let index_start = quad_index_count + cap * 3;
+        let base = u16::try_from(vertex_start)
+            .map_err(|_| "ambient Op9 cap vertex exceeds u16".to_string())?;
+        let expected = [base, base + 1, base + 2];
+        if frame.indices.get(index_start..index_start + expected.len()) != Some(&expected) {
+            return Err("ambient Op9 cap topology changed from native ordering".to_string());
+        }
+        primitives.push(AmbientEffectMeshPrimitive {
+            vertex_start,
+            vertex_count: 3,
+            index_start,
+            index_count: 3,
+        });
+    }
+    if primitives.is_empty() {
+        return Err("ambient Op9 mesh contains no native draw primitives".to_string());
+    }
+    Ok(primitives)
+}
+
+fn ambient_effect_mesh_primitive_vertices(
+    frame: &fparkan_fx::fx_visual::EffectMeshFrame,
+    primitive: AmbientEffectMeshPrimitive,
+) -> Vec<VulkanStaticVertex> {
+    let end = primitive.vertex_start + primitive.vertex_count;
+    frame.vertices[primitive.vertex_start..end]
+        .iter()
+        .zip(&frame.uv[primitive.vertex_start..end])
+        .map(|(position, uv)| {
+            environment_vertex_with_alpha(
+                *position,
+                [frame.color[0], frame.color[1], frame.color[2]],
+                frame.color[3].clamp(0.0, 1.0),
+                *uv,
+            )
+        })
+        .collect()
+}
+
+fn ambient_effect_mesh_primitive_indices(
+    frame: &fparkan_fx::fx_visual::EffectMeshFrame,
+    primitive: AmbientEffectMeshPrimitive,
+) -> Result<Vec<u32>, String> {
+    let index_end = primitive.index_start + primitive.index_count;
+    frame.indices[primitive.index_start..index_end]
+        .iter()
+        .map(|index| {
+            usize::from(*index)
+                .checked_sub(primitive.vertex_start)
+                .and_then(|local| u32::try_from(local).ok())
+                .ok_or_else(|| {
+                    "ambient Op9 primitive index is outside its vertex block".to_string()
+                })
+        })
+        .collect()
+}
+
+fn write_ambient_effect_mesh_primitive(
+    mesh: &mut VulkanStaticMesh,
+    range: &EnvironmentGpuRange,
+    frame: &fparkan_fx::fx_visual::EffectMeshFrame,
+    primitive: AmbientEffectMeshPrimitive,
+) -> Result<(), String> {
+    if range.vertex_capacity != primitive.vertex_count {
+        return Err("ambient Op9 primitive vertex allocation changed".to_string());
+    }
+    let vertex_end = range
+        .vertex_start
+        .checked_add(range.vertex_capacity)
+        .ok_or_else(|| "ambient Op9 vertex range overflows".to_string())?;
+    let destination = mesh
+        .vertices
+        .get_mut(range.vertex_start..vertex_end)
+        .ok_or_else(|| "ambient Op9 vertex allocation is out of bounds".to_string())?;
+    let draw_range = mesh
+        .draw_ranges
+        .get(range.range_index)
+        .ok_or_else(|| "ambient Op9 draw range is out of bounds".to_string())?;
+    let index_start = usize::try_from(draw_range.first_index)
+        .map_err(|_| "ambient Op9 first index exceeds usize".to_string())?;
+    let index_end = index_start
+        .checked_add(primitive.index_count)
+        .ok_or_else(|| "ambient Op9 index range overflows".to_string())?;
+    let current_indices = mesh
+        .indices
+        .get(index_start..index_end)
+        .ok_or_else(|| "ambient Op9 index allocation is out of bounds".to_string())?;
+    let frame_indices = frame
+        .indices
+        .get(primitive.index_start..primitive.index_start + primitive.index_count)
+        .ok_or_else(|| "ambient Op9 source primitive index range is out of bounds".to_string())?;
+    for (current, local) in current_indices.iter().zip(frame_indices) {
+        let primitive_local = usize::from(*local)
+            .checked_sub(primitive.vertex_start)
+            .ok_or_else(|| "ambient Op9 source index leaves its primitive".to_string())?;
+        let expected = u32::try_from(range.vertex_start)
+            .ok()
+            .and_then(|base| base.checked_add(u32::try_from(primitive_local).ok()?))
+            .ok_or_else(|| "ambient Op9 primitive index exceeds u32".to_string())?;
+        if *current != expected {
+            return Err("ambient Op9 primitive topology changed after GPU preparation".to_string());
+        }
+    }
+    let frame_vertex_end = primitive
+        .vertex_start
+        .checked_add(primitive.vertex_count)
+        .ok_or_else(|| "ambient Op9 source primitive vertex range overflows".to_string())?;
+    let frame_vertices = frame
+        .vertices
+        .get(primitive.vertex_start..frame_vertex_end)
+        .ok_or_else(|| "ambient Op9 source primitive vertex range is out of bounds".to_string())?;
+    let frame_uvs = frame
+        .uv
+        .get(primitive.vertex_start..frame_vertex_end)
+        .ok_or_else(|| "ambient Op9 source primitive UV range is out of bounds".to_string())?;
+    for ((target, position), uv) in destination.iter_mut().zip(frame_vertices).zip(frame_uvs) {
+        *target = environment_vertex_with_alpha(
+            *position,
+            [frame.color[0], frame.color[1], frame.color[2]],
+            frame.color[3].clamp(0.0, 1.0),
+            *uv,
+        );
+    }
+    Ok(())
+}
+
+fn ambient_effect_vertex_rgb(command_rgb: [f32; 3], material_additive_rgb: [f32; 3]) -> [f32; 3] {
+    std::array::from_fn(|channel| command_rgb[channel] * material_additive_rgb[channel])
+}
+
+fn apply_ambient_effect_material_tints(
+    slots: &[AmbientEffectGpuSlot],
+    mesh: &mut VulkanStaticMesh,
+    updates: &[AmbientEffectGeometryUpdate],
+    active_materials: &HashMap<usize, ActiveMaterialState>,
+) -> Result<(), String> {
+    for update in updates.iter().filter(|update| update.index_count > 0) {
+        let range = slots
+            .iter()
+            .find_map(|slot| ambient_effect_range_for(slot, update.range_index))
+            .ok_or_else(|| "ambient FX draw range has no owning slot".to_string())?;
+        let material = active_materials
+            .get(&update.range_index)
+            .ok_or_else(|| "ambient FX draw range has no active MAT0 phase".to_string())?;
+        let vertex_rgb = ambient_effect_vertex_rgb(update.command_rgb, material.additive_rgb);
+        let end = range
+            .vertex_start
+            .checked_add(range.vertex_capacity)
+            .ok_or_else(|| "ambient FX vertex range overflows".to_string())?;
+        let vertices = mesh
+            .vertices
+            .get_mut(range.vertex_start..end)
+            .ok_or_else(|| "ambient FX vertex allocation is out of bounds".to_string())?;
+        for vertex in vertices {
+            vertex.color = vertex_rgb;
+        }
+    }
+    Ok(())
+}
+
+fn ambient_effect_draw_sort_keys(
+    mesh: &VulkanStaticMesh,
+    slots: &[AmbientEffectGpuSlot],
+    camera_world: [f32; 3],
+) -> Result<Vec<(usize, f32)>, String> {
+    slots.iter().try_fold(Vec::new(), |mut keys, slot| {
+        for (range, _) in ambient_effect_ranges(slot) {
+            keys.push((
+                range.range_index,
+                first_indexed_vertex_distance(mesh, range.range_index, camera_world)?,
+            ));
+        }
+        Ok(keys)
+    })
+}
+
+fn world_draw_range_indices(
+    draw_range_count: usize,
+    fixed_range_indices: &HashSet<usize>,
+) -> Vec<usize> {
+    (0..draw_range_count)
+        .filter(|range_index| !fixed_range_indices.contains(range_index))
+        .collect()
+}
+
+// TEMPORARY diagnostic for ROADMAP.md A.4 (smoke_fr_02 speed). Enabled by
+// FPARKAN_DIAG_SMOKE; identifies the emitter by its Op8 body (pool 30,
+// interval 0.08) and reports spawn rate, particle lifetime and rise speed
+// once per two seconds of effect clock. Remove after the investigation.
+#[derive(Default)]
+struct SmokeDiagnosticTrack {
+    window_start: Option<f32>,
+    last_born: f32,
+    spawns: usize,
+    calls: usize,
+    max_age: f32,
+    sum_age: f64,
+    sum_z: f64,
+    sum_age_z: f64,
+    sum_age_age: f64,
+    samples: usize,
+}
+
+fn smoke_fr_02_diagnostic(
+    slot: &AmbientEffectGpuSlot,
+    clock: f32,
+    phase: f32,
+    frames: &[fparkan_fx::fx_visual::EffectQuadFrame],
+) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static TRACKS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<(usize, usize, usize, usize, usize), SmokeDiagnosticTrack>>,
+    > = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("FPARKAN_DIAG_SMOKE").is_some()) {
+        return;
+    }
+    let body = slot.command.raw_body.as_ref();
+    let read_u32 = |offset: usize| {
+        body.get(offset..offset + 4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().expect("four bytes")))
+    };
+    if read_u32(0x20) != Some(30) || read_u32(0x14).map(f32::from_bits) != Some(0.08) {
+        return;
+    }
+    let key = (
+        slot.owner_object_index,
+        slot.owner_component_index,
+        slot.control_table_index,
+        slot.control_row_index,
+        slot.command_index,
+    );
+    let mut tracks = TRACKS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .expect("smoke diagnostic lock");
+    let slot_count = tracks.len() + usize::from(!tracks.contains_key(&key));
+    let track = tracks.entry(key).or_default();
+    let window_start = *track.window_start.get_or_insert(clock);
+    track.calls += 1;
+    for frame in frames.iter().filter(|frame| frame.active) {
+        let born = clock - frame.elapsed_seconds;
+        if born > track.last_born + 1e-4 {
+            track.spawns += 1;
+            track.last_born = track.last_born.max(born);
+        }
+        let z = frame.vertices.iter().map(|vertex| vertex[2]).sum::<f32>() * 0.25;
+        let age = f64::from(frame.elapsed_seconds);
+        track.max_age = track.max_age.max(frame.elapsed_seconds);
+        track.sum_age += age;
+        track.sum_z += f64::from(z);
+        track.sum_age_z += age * f64::from(z);
+        track.sum_age_age += age * age;
+        track.samples += 1;
+    }
+    let window = clock - window_start;
+    if window < 2.0 {
+        return;
+    }
+    let n = track.samples as f64;
+    let rise_per_second = if n > 1.0 {
+        (n * track.sum_age_z - track.sum_age * track.sum_z)
+            / (n * track.sum_age_age - track.sum_age * track.sum_age)
+    } else {
+        0.0
+    };
+    let axis_lengths: [f32; 3] = std::array::from_fn(|column| {
+        (0..3)
+            .map(|row| slot.world_from_effect[row][column].powi(2))
+            .sum::<f32>()
+            .sqrt()
+    });
+    eprintln!(
+        "smoke_diag slots={slot_count} key={key:?} clock={clock:.3} window={window:.3}s calls={} calls_per_s={:.1} spawns={} spawns_per_s={:.2} active_now={} max_age={:.3}s rise_per_s={rise_per_second:.2} rise_per_life_2_4s={:.1} phase={phase:.3} emitter=[{:.2},{:.2},{:.2}] effect_axes={axis_lengths:.3?}",
+        track.calls,
+        track.calls as f32 / window,
+        track.spawns,
+        track.spawns as f32 / window,
+        frames.iter().filter(|frame| frame.active).count(),
+        track.max_age,
+        rise_per_second * 2.4,
+        slot.world_from_effect[0][3],
+        slot.world_from_effect[1][3],
+        slot.world_from_effect[2][3],
+    );
+    *track = SmokeDiagnosticTrack {
+        window_start: Some(clock),
+        last_born: track.last_born,
+        ..SmokeDiagnosticTrack::default()
+    };
+}
+
+// TEMPORARY diagnostic for ROADMAP.md A.4 (animal "aura" speed). Enabled by
+// FPARKAN_DIAG_FX_MATERIAL=<material name>, for example smoke_yg. Reports the
+// effect-phase rate, call rate, particle lifetime and rise per particle life
+// for every Op7/Op8 slot whose command uses that MAT0. Remove after the
+// investigation.
+#[derive(Default)]
+struct FxSpeedDiagnosticTrack {
+    window_start: Option<f32>,
+    calls: usize,
+    phase_travel: f32,
+    last_phase: Option<f32>,
+    max_age: f32,
+    sum_t: f64,
+    sum_z: f64,
+    sum_tz: f64,
+    sum_tt: f64,
+    samples: usize,
+}
+
+fn fx_material_speed_diagnostic(
+    slot: &AmbientEffectGpuSlot,
+    material_name_offset: usize,
+    clock: f32,
+    phase: f32,
+    frames: &[fparkan_fx::fx_visual::EffectQuadFrame],
+) {
+    static WANTED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    static TRACKS: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<(usize, usize, usize, usize, usize), FxSpeedDiagnosticTrack>>,
+    > = std::sync::OnceLock::new();
+    let Some(wanted) = WANTED
+        .get_or_init(|| {
+            std::env::var("FPARKAN_DIAG_FX_MATERIAL")
+                .ok()
+                .map(|name| name.to_ascii_lowercase())
+        })
+        .as_deref()
+    else {
+        return;
+    };
+    let body = slot.command.raw_body.as_ref();
+    let Some(name) = body.get(material_name_offset..material_name_offset + 32) else {
+        return;
+    };
+    let name = name.split(|byte| *byte == 0).next().unwrap_or_default();
+    if !name.eq_ignore_ascii_case(wanted.as_bytes()) {
+        return;
+    }
+    let key = (
+        slot.owner_object_index,
+        slot.owner_component_index,
+        slot.control_table_index,
+        slot.control_row_index,
+        slot.command_index,
+    );
+    let mut tracks = TRACKS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .expect("fx diagnostic lock");
+    let slot_count = tracks.len() + usize::from(!tracks.contains_key(&key));
+    let track = tracks.entry(key).or_default();
+    let window_start = *track.window_start.get_or_insert(clock);
+    track.calls += 1;
+    if let Some(last_phase) = track.last_phase {
+        let delta = phase - last_phase;
+        track.phase_travel += if delta < -0.5 { delta + 1.0 } else { delta };
+    }
+    track.last_phase = Some(phase);
+    for frame in frames.iter().filter(|frame| frame.active) {
+        // Op8 reports the particle age in seconds; Op7 reports its normalized
+        // particle age, so the regression is per second or per life.
+        let t = if slot.command.opcode == FxOpcode::Op8 {
+            frame.elapsed_seconds
+        } else {
+            frame.normalized_time
+        };
+        let z = frame.vertices.iter().map(|vertex| vertex[2]).sum::<f32>() * 0.25;
+        track.max_age = track.max_age.max(t);
+        track.sum_t += f64::from(t);
+        track.sum_z += f64::from(z);
+        track.sum_tz += f64::from(t) * f64::from(z);
+        track.sum_tt += f64::from(t) * f64::from(t);
+        track.samples += 1;
+    }
+    let window = clock - window_start;
+    if window < 3.0 {
+        return;
+    }
+    let n = track.samples as f64;
+    let slope = if n > 1.0 {
+        (n * track.sum_tz - track.sum_t * track.sum_z)
+            / (n * track.sum_tt - track.sum_t * track.sum_t)
+    } else {
+        0.0
+    };
+    eprintln!(
+        "fx_diag material={wanted} op={:?} slots={slot_count} key={key:?} clock={clock:.3} window={window:.3}s calls_per_s={:.1} phase_rate_per_s={:.4} active_now={} max_age={:.3} rise_slope={slope:.2} ({}) duration={:.2} mode={} owner=[{:.1},{:.1},{:.1}]",
+        slot.command.opcode,
+        track.calls as f32 / window,
+        track.phase_travel / window,
+        frames.iter().filter(|frame| frame.active).count(),
+        track.max_age,
+        if slot.command.opcode == FxOpcode::Op8 { "units/s, age in s" } else { "units/life, age normalized" },
+        slot.duration_seconds,
+        slot.time_mode,
+        slot.world_from_effect[0][3],
+        slot.world_from_effect[1][3],
+        slot.world_from_effect[2][3],
+    );
+    *track = FxSpeedDiagnosticTrack {
+        window_start: Some(clock),
+        last_phase: track.last_phase,
+        ..FxSpeedDiagnosticTrack::default()
+    };
+}
+
+fn ambient_effect_phase(
+    time_mode: u32,
+    header_flags: u32,
+    elapsed_seconds: f32,
+    duration_seconds: f32,
+) -> Option<f32> {
+    if !elapsed_seconds.is_finite()
+        || elapsed_seconds < 0.0
+        || !duration_seconds.is_finite()
+        || duration_seconds < 0.0
+    {
+        return None;
+    }
+    let mut phase = match time_mode {
+        0 => 0.0,
+        // The native phase stays raw through the optional 0x200/0x20
+        // transforms; the command-level 0x8120 path clamps only afterward.
+        1 if duration_seconds > 0.0 => elapsed_seconds / duration_seconds,
+        2 if duration_seconds > 0.0 => {
+            elapsed_seconds.rem_euclid(duration_seconds) / duration_seconds
+        }
+        _ => return None,
+    };
+    if header_flags & 0x200 != 0 && duration_seconds > 0.0 {
+        phase *= elapsed_seconds / duration_seconds;
+    }
+    if header_flags & 0x20 != 0 {
+        phase = if phase >= 0.5 {
+            (1.0 - phase) * 2.0
+        } else {
+            phase * 2.0
+        };
+    }
+    Some(phase)
 }
 
 fn rotate_unit_vector(value: [f32; 3], rotation: [f32; 4]) -> [f32; 3] {
@@ -4443,163 +6998,890 @@ fn initial_control_gate_values(control: &PreparedComponentControl) -> Vec<Option
         .collect()
 }
 
-fn control_has_tag21(control: &PreparedComponentControl) -> bool {
-    control.typed_records.iter().any(|record| record.tag == 21)
+fn control_clock_ms_for_frame(target_ms: u32, frame_index: u64, target_frames: u64) -> u32 {
+    if target_frames <= 1 {
+        return target_ms;
+    }
+    let last_frame = u128::from(target_frames - 1);
+    let frame = u128::from(frame_index).min(last_frame);
+    ((u128::from(target_ms) * frame) / last_frame) as u32
 }
 
-fn component_chain_has_tag21(
-    tree: Option<&[UnitComponentTreeNode]>,
-    controls: &[Option<PreparedComponentControl>],
-    component_index: usize,
-) -> bool {
-    let Some(tree) = tree else {
-        return false;
-    };
-    let mut current = Some(component_index);
-    for _ in 0..=tree.len() {
-        let Some(index) = current else {
-            return false;
+fn replay_environment_delta_seconds(last_applied_ms: u32, current_ms: u32) -> f32 {
+    current_ms.saturating_sub(last_applied_ms) as f32 / 1_000.0
+}
+
+fn control_clock_mode_label(target_ms: Option<u32>) -> String {
+    match target_ms {
+        None => "realtime".to_string(),
+        Some(0) => "fixed-0ms".to_string(),
+        Some(target_ms) => format!("ramp-0-to-{target_ms}ms"),
+    }
+}
+
+fn write_readback_sequence_frame(
+    directory: &Path,
+    frame_index: u64,
+    control_clock_ms: u32,
+    artifact: &VulkanReadbackArtifact,
+) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(directory).map_err(|error| {
+        format!(
+            "create readback sequence directory {}: {error}",
+            directory.display()
+        )
+    })?;
+    let path = directory.join(format!(
+        "frame-{frame_index:06}-clock-{control_clock_ms:010}ms-{}x{}.rgba",
+        artifact.width, artifact.height,
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|error| format!("create readback frame {}: {error}", path.display()))?;
+    file.write_all(&artifact.bytes)
+        .map_err(|error| format!("write readback frame {}: {error}", path.display()))?;
+    Ok(path)
+}
+
+fn quaternion_yaw_z_degrees(rotation: [f32; 4]) -> Option<f32> {
+    if !rotation.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    let [x, y, z, w] = rotation;
+    let radians = (2.0 * (w * z + x * y)).atan2(1.0 - 2.0 * (y * y + z * z));
+    radians.is_finite().then_some(radians.to_degrees())
+}
+
+fn emit_control_animation_capture_diagnostics(
+    instances: &[Vec<Option<ControlAnimationInstance>>],
+    pose_buffers: &[Vec<Option<NodePoseBuffer>>],
+    control_clock_ms: u32,
+) {
+    for (object_index, components) in instances.iter().enumerate() {
+        for (component_index, instance) in components.iter().enumerate() {
+            let Some(instance) = instance.as_ref() else {
+                continue;
+            };
+            let mut gate_index = 0;
+            for record in instance
+                .control
+                .typed_records
+                .iter()
+                .filter(|record| record.tag == 21)
+            {
+                let mapped_row = record
+                    .values
+                    .first()
+                    .and_then(|row| usize::try_from(*row).ok());
+                let timeline = mapped_row.and_then(|row| instance.control.timeline_rows.get(row));
+                let node_index = timeline.map(|row| row.node_index);
+                let sampled_time = node_index
+                    .and_then(|node| instance.last_sampled_node_times.get(node))
+                    .copied()
+                    .flatten();
+                let pose = pose_buffers
+                    .get(object_index)
+                    .and_then(|items| items.get(component_index))
+                    .and_then(Option::as_ref)
+                    .and_then(|hierarchy| node_index.and_then(|node| hierarchy.poses.get(node)));
+                let rotation = pose.map(|pose| pose.rotation);
+                let yaw_z_degrees = rotation.and_then(quaternion_yaw_z_degrees);
+                let gate_value = instance.gate_values.get(gate_index).copied().flatten();
+                eprintln!(
+                    "control_animation_capture object={object_index} component={component_index} clock_ms={control_clock_ms} gate_value={gate_value:?} gate_provider={:?} row={mapped_row:?} node={node_index:?} sampled_time={sampled_time:?} rotation={rotation:?} yaw_z_degrees={yaw_z_degrees:?}",
+                    record.gate_provider,
+                );
+                gate_index += 1;
+            }
+        }
+    }
+}
+
+fn update_control_animation_pose_buffers(
+    instances: &mut [Vec<Option<ControlAnimationInstance>>],
+    pose_buffers: &mut [Vec<Option<NodePoseBuffer>>],
+    native_clock_ms: u32,
+) -> Result<(), String> {
+    for (object_index, components) in instances.iter_mut().enumerate() {
+        let Some(object_pose_buffers) = pose_buffers.get_mut(object_index) else {
+            continue;
         };
+        for (component_index, instance) in components.iter_mut().enumerate() {
+            let Some(instance) = instance.as_mut() else {
+                continue;
+            };
+            let node_times: Vec<Option<AnimationTime>> = match sample_control_node_times(
+                &instance.control,
+                native_clock_ms,
+                &instance.gate_values,
+                &mut instance.state,
+            ) {
+                Ok(times) => {
+                    instance.last_sampled_node_times = times.clone();
+                    times
+                        .into_iter()
+                        .map(|time| time.map(AnimationTime))
+                        .collect()
+                }
+                Err(
+                    error @ (ControlSamplingError::UnsupportedTag21Mode { .. }
+                    | ControlSamplingError::UnsupportedVariableMapping { .. }
+                    | ControlSamplingError::MissingGateProvider { .. }
+                    | ControlSamplingError::GateProviderKeyOutOfRange { .. }
+                    | ControlSamplingError::MissingGateProviderValue { .. }
+                    | ControlSamplingError::GateProviderCountMismatch { .. }),
+                ) => {
+                    if !instance.reported_unsupported_fallback {
+                        eprintln!(
+                            "control_animation_fallback object={object_index} component={component_index} error={error:?}"
+                        );
+                        instance.reported_unsupported_fallback = true;
+                    }
+                    let fallback_times = static_preview_node_times(
+                        instance.control.model_node_count,
+                        &instance.control.bindings,
+                    )
+                    .map_err(|fallback| {
+                        format!(
+                            "control animation fallback for object {object_index} component {component_index}: {fallback}"
+                        )
+                    })?;
+                    instance.last_sampled_node_times = fallback_times
+                        .iter()
+                        .map(|time| time.map(|time| time.0))
+                        .collect();
+                    fallback_times
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "control animation sample for object {object_index} component {component_index}: {error:?}"
+                    ));
+                }
+            };
+            let hierarchy = node38_sampled_hierarchy_at_times(&instance.model, &node_times)
+                .or_else(|| node38_fallback_hierarchy(&instance.model));
+            if let Some(hierarchy) = hierarchy {
+                if let Some(pose_buffer) = object_pose_buffers.get_mut(component_index) {
+                    *pose_buffer = Some(hierarchy);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn control_tree_chain_has_tag21(
+    component_index: usize,
+    tree: Option<&[fparkan_prototype::UnitComponentTreeNode]>,
+    controls: &[Option<PreparedComponentControl>],
+) -> bool {
+    let mut current = Some(component_index);
+    let mut remaining = controls.len();
+    while let Some(index) = current {
         if controls
             .get(index)
             .and_then(Option::as_ref)
-            .is_some_and(control_has_tag21)
+            .is_some_and(|control| control.typed_records.iter().any(|record| record.tag == 21))
         {
             return true;
         }
-        current = tree.get(index).and_then(|node| node.parent_index);
+        if remaining == 0 {
+            return false;
+        }
+        remaining -= 1;
+        current = tree
+            .and_then(|nodes| nodes.get(index))
+            .and_then(|node| node.parent_index);
     }
     false
 }
 
-fn refresh_dynamic_component_mounts(
-    mounts: &[DynamicComponentMount],
+fn update_dynamic_component_geometry(
+    geometry: &[Vec<Option<DynamicComponentGeometry>>],
     pose_buffers: &[Vec<Option<NodePoseBuffer>>],
     mount_poses: &mut [Vec<Option<VulkanNodePose>>],
-) -> Result<bool, String> {
-    let mut changed = false;
-    for mount in mounts {
-        let parent_mounted = mount_poses
-            .get(mount.object_index)
-            .and_then(|poses| poses.get(mount.parent_index))
-            .copied()
-            .flatten();
-        let parent_hierarchy = pose_buffers
-            .get(mount.object_index)
-            .and_then(|buffers| buffers.get(mount.parent_index))
-            .and_then(Option::as_ref)
-            .ok_or_else(|| {
-                format!(
-                    "dynamic component {} parent {} has no sampled Node38 hierarchy",
-                    mount.component_index, mount.parent_index
-                )
+    mesh: &mut VulkanStaticMesh,
+) -> Result<(), String> {
+    let identity_pose = VulkanNodePose {
+        translation: [0.0; 3],
+        rotation: [0.0, 0.0, 0.0, 1.0],
+    };
+    for (object_index, components) in geometry.iter().enumerate() {
+        for (component_index, component) in components.iter().enumerate() {
+            let Some(component) = component else {
+                continue;
+            };
+            if let Some((parent_index, socket)) = component.parent_mount {
+                let parent_mounted = mount_poses
+                    .get(object_index)
+                    .and_then(|items| items.get(parent_index))
+                    .ok_or_else(|| {
+                        format!("dynamic component {object_index}:{component_index} has no parent mount slot")
+                    })?
+                    .is_some();
+                let parent_hierarchy = pose_buffers
+                    .get(object_index)
+                    .and_then(|items| items.get(parent_index))
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| {
+                        format!(
+                            "dynamic component {object_index}:{component_index} has no parent pose"
+                        )
+                    })?;
+                let parent_socket = if parent_mounted {
+                    node38_pose_relative_to_root_from_hierarchy(parent_hierarchy, socket)
+                } else {
+                    node38_pose_from_hierarchy(parent_hierarchy, socket)
+                }
+                .ok_or_else(|| {
+                    format!("dynamic component {object_index}:{component_index} parent socket {socket} is unavailable")
+                })?;
+                let parent_root = mount_poses
+                    .get(object_index)
+                    .and_then(|items| items.get(parent_index))
+                    .copied()
+                    .flatten()
+                    .unwrap_or(identity_pose);
+                let mount = mount_poses
+                    .get_mut(object_index)
+                    .and_then(|items| items.get_mut(component_index))
+                    .ok_or_else(|| {
+                        format!(
+                            "dynamic component {object_index}:{component_index} has no mount slot"
+                        )
+                    })?;
+                *mount = Some(compose_unit_pose(parent_root, parent_socket));
+            }
+            let hierarchy = pose_buffers
+                .get(object_index)
+                .and_then(|items| items.get(component_index))
+                .and_then(Option::as_ref)
+                .ok_or_else(|| {
+                    format!(
+                        "dynamic component {object_index}:{component_index} has no sampled pose"
+                    )
+                })?;
+            let mount = mount_poses
+                .get(object_index)
+                .and_then(|items| items.get(component_index))
+                .copied()
+                .flatten();
+            let projected = match mount {
+                Some(mount) => {
+                    project_msh_to_static_mesh_in_world_space_with_node_pose_buffer_and_mount(
+                        &component.model,
+                        component.root_transform,
+                        component.owner_scale,
+                        hierarchy,
+                        mount,
+                    )
+                }
+                None => project_msh_to_static_mesh_in_world_space_with_node_pose_buffer(
+                    &component.model,
+                    component.root_transform,
+                    component.owner_scale,
+                    hierarchy,
+                ),
+            }
+            .map_err(|error| {
+                format!("reproject dynamic component {object_index}:{component_index}: {error}")
             })?;
-        let socket_pose = if parent_mounted.is_some() {
-            node38_pose_relative_to_root_from_hierarchy(parent_hierarchy, mount.socket)
-        } else {
-            node38_pose_from_hierarchy(parent_hierarchy, mount.socket)
-        }
-        .ok_or_else(|| {
-            format!(
-                "dynamic component {} mount socket {} is absent from parent {}",
-                mount.component_index, mount.socket, mount.parent_index
-            )
-        })?;
-        let root_pose = parent_mounted.unwrap_or(VulkanNodePose {
-            translation: [0.0; 3],
-            rotation: [0.0, 0.0, 0.0, 1.0],
-        });
-        let next_pose = compose_unit_pose(root_pose, socket_pose);
-        let slot = mount_poses
-            .get_mut(mount.object_index)
-            .and_then(|poses| poses.get_mut(mount.component_index))
-            .ok_or_else(|| {
-                format!(
-                    "dynamic component {} mount slot is outside object {}",
-                    mount.component_index, mount.object_index
-                )
-            })?;
-        if *slot != Some(next_pose) {
-            *slot = Some(next_pose);
-            changed = true;
+            if projected.vertices.len() != component.vertex_count {
+                return Err(format!(
+                    "dynamic component {object_index}:{component_index} changed vertex count from {} to {}",
+                    component.vertex_count,
+                    projected.vertices.len()
+                ));
+            }
+            let end = component
+                .vertex_start
+                .checked_add(component.vertex_count)
+                .filter(|end| *end <= mesh.vertices.len())
+                .ok_or_else(|| {
+                    format!(
+                        "dynamic component {object_index}:{component_index} vertex span is invalid"
+                    )
+                })?;
+            mesh.vertices[component.vertex_start..end].copy_from_slice(&projected.vertices);
         }
     }
-    Ok(changed)
+    Ok(())
 }
 
-fn static_preview_control_pose_buffer(
-    model: &ModelAsset,
-    control: &PreparedComponentControl,
-    native_clock_ms: u32,
-    state: &mut ControlInstanceState,
-) -> Result<Option<NodePoseBuffer>, String> {
-    if control.model_node_count != model.node_count {
+struct MissionBasementFootprint {
+    object_index: usize,
+    outer: Vec<[f32; 2]>,
+    inner: Vec<[f32; 3]>,
+    flatten_inner_to_mean_outer_z: bool,
+}
+
+fn apply_basement_placement_deltas(
+    roots: &[MissionObjectDraft],
+    footprints: &[MissionBasementFootprint],
+    placements: &[BasementPlacement],
+) -> Result<Vec<MissionObjectDraft>, String> {
+    if footprints.len() != placements.len() {
+        return Err("basement placement results are not aligned with mission roots".to_string());
+    }
+    let mut adjusted_roots = roots.to_vec();
+    for (footprint, placement) in footprints.iter().zip(placements) {
+        let root = adjusted_roots
+            .get_mut(footprint.object_index)
+            .ok_or_else(|| "basement footprint references an unknown mission root".to_string())?;
+        root.position = root.root_position_with_basement_delta(placement.placement_delta);
+    }
+    Ok(adjusted_roots)
+}
+
+fn mission_basement_footprints(
+    assets: &MissionAssets,
+    roots: &[MissionObjectDraft],
+) -> Result<Vec<MissionBasementFootprint>, String> {
+    let mut footprints = Vec::new();
+    for (object_index, mission_root) in roots.iter().enumerate() {
+        let Some(mode) = mission_root.basement_placement_mode() else {
+            continue;
+        };
+        let Some(component_bas) = assets
+            .object_component_bas
+            .get(object_index)
+            .and_then(|components| components.first())
+            .and_then(Option::as_ref)
+        else {
+            continue;
+        };
+        let geometry = &component_bas.geometry;
+        let bas_label = format!(
+            "{}:{}",
+            component_bas.source.archive.as_str(),
+            String::from_utf8_lossy(&component_bas.source.name.0)
+        );
+        // shortcut: the installed Iron Strategy corpus has one inner and one
+        // outer ring per eligible DAT. Native iterates both arrays, so reject
+        // unsupported multiplicity until the multi-ring semantics are ported.
+        if geometry.first.len() != 1 || geometry.second.len() != 1 {
+            return Err(format!(
+                "eligible mission object {object_index} from {bas_label} has {} inner and {} outer BAS rings; one of each is supported",
+                geometry.first.len(),
+                geometry.second.len()
+            ));
+        }
+        let transform = LegacyIron3dEulerTransform {
+            translation: mission_root.position,
+            orientation_radians: mission_root.orientation_raw,
+        };
+        let transform_points = |points: &[[f32; 3]], ring_name: &str| {
+            let mut transformed_points = Vec::with_capacity(points.len());
+            for &point in points {
+                let transformed = transform
+                    .try_transform_scaled_point(point, mission_root.scale)
+                    .ok_or_else(|| {
+                        format!(
+                            "building BAS {ring_name} ring on mission object {object_index} from {bas_label} has a non-finite transformed point"
+                        )
+                    })?;
+                transformed_points.push(transformed);
+            }
+            Ok::<_, String>(transformed_points)
+        };
+        let inner_record = &geometry.first[0];
+        let outer_record = &geometry.second[0];
+        for (ring_name, declared_count, points) in [
+            ("inner", inner_record.declared_count, &inner_record.points),
+            ("outer", outer_record.declared_count, &outer_record.points),
+        ] {
+            let expected_point_count = usize::try_from(declared_count)
+                .ok()
+                .and_then(|count| count.checked_add(1))
+                .ok_or_else(|| format!("building BAS {ring_name} count overflows: {bas_label}"))?;
+            if usize::try_from(declared_count).unwrap_or(0) < 3
+                || points.len() != expected_point_count
+            {
+                return Err(format!(
+                    "building BAS {ring_name} ring on mission object {object_index} from {bas_label} has count {declared_count} and {} points",
+                    points.len()
+                ));
+            }
+        }
+        let inner = transform_points(&inner_record.points, "inner")?;
+        let outer_3d = transform_points(&outer_record.points, "outer")?;
+        footprints.push(MissionBasementFootprint {
+            object_index,
+            outer: outer_3d.iter().map(|point| [point[0], point[1]]).collect(),
+            inner,
+            flatten_inner_to_mean_outer_z: mode == BasementPlacementMode::FlattenInnerAndAdjustRoot,
+        });
+    }
+    Ok(footprints)
+}
+
+fn interpolate_static_terrain_vertex(
+    position: [f32; 3],
+    source: [VulkanStaticVertex; 3],
+) -> Result<VulkanStaticVertex, String> {
+    let point = [f64::from(position[0]), f64::from(position[1])];
+    let a = [
+        f64::from(source[0].position[0]),
+        f64::from(source[0].position[1]),
+    ];
+    let b = [
+        f64::from(source[1].position[0]),
+        f64::from(source[1].position[1]),
+    ];
+    let c = [
+        f64::from(source[2].position[0]),
+        f64::from(source[2].position[1]),
+    ];
+    let denominator = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+    if !denominator.is_finite() || denominator.abs() <= 1.0e-10 {
+        return Err("terrain source triangle has no stable XY barycentric coordinates".to_string());
+    }
+    let second_weight =
+        ((point[0] - a[0]) * (c[1] - a[1]) - (point[1] - a[1]) * (c[0] - a[0])) / denominator;
+    let third_weight =
+        ((b[0] - a[0]) * (point[1] - a[1]) - (b[1] - a[1]) * (point[0] - a[0])) / denominator;
+    let weights = [
+        1.0 - second_weight - third_weight,
+        second_weight,
+        third_weight,
+    ];
+    if !weights.iter().all(|weight| weight.is_finite()) {
+        return Err("terrain split vertex has invalid barycentric coordinates".to_string());
+    }
+    let blend2 = |values: [[f32; 2]; 3]| {
+        [
+            (0..3)
+                .map(|index| values[index][0] * weights[index] as f32)
+                .sum(),
+            (0..3)
+                .map(|index| values[index][1] * weights[index] as f32)
+                .sum(),
+        ]
+    };
+    let blend3 = |values: [[f32; 3]; 3]| {
+        std::array::from_fn(|axis| {
+            (0..3)
+                .map(|index| values[index][axis] * weights[index] as f32)
+                .sum()
+        })
+    };
+    let overlay_alpha = (0..3)
+        .map(|index| source[index].overlay_alpha * weights[index] as f32)
+        .sum::<f32>();
+    if !overlay_alpha.is_finite() {
         return Err(format!(
-            "control model node count {} does not match MSH node count {}",
-            control.model_node_count, model.node_count
+            "terrain split vertex overlay alpha is non-finite: position={position:?}, weights={weights:?}, source_position={:?}, source_alpha={:?}, result={overlay_alpha}",
+            source.map(|vertex| vertex.position),
+            source.map(|vertex| vertex.overlay_alpha)
         ));
     }
-    let gate_values = initial_control_gate_values(control);
-    let sampled_times = match sample_control_node_times(
-        control,
-        native_clock_ms,
-        &gate_values,
-        state,
-    ) {
-        Ok(times) => times,
-        Err(
-            error @ (ControlSamplingError::UnsupportedTag21Mode { .. }
-            | ControlSamplingError::UnsupportedVariableMapping { .. }
-            | ControlSamplingError::MissingGateProvider { .. }
-            | ControlSamplingError::GateProviderKeyOutOfRange { .. }
-            | ControlSamplingError::MissingGateProviderValue { .. }
-            | ControlSamplingError::GateProviderCountMismatch { .. }),
-        ) => {
-            return static_preview_component_pose_buffer(model, &control.bindings, None)
-                .map_err(|fallback| {
-                    format!(
-                        "control timeline sample failed ({error:?}) and static CTLD fallback failed: {fallback}"
-                    )
-                });
-        }
-        Err(error) => {
-            return Err(format!("control timeline sample failed: {error:?}"));
-        }
+    const OVERLAY_ALPHA_ROUNDING_TOLERANCE: f32 = 1.0e-5;
+    if overlay_alpha < -OVERLAY_ALPHA_ROUNDING_TOLERANCE
+        || overlay_alpha > 1.0 + OVERLAY_ALPHA_ROUNDING_TOLERANCE
+    {
+        return Err(format!(
+            "terrain split vertex overlay alpha exceeds barycentric rounding tolerance: position={position:?}, weights={weights:?}, source_position={:?}, source_alpha={:?}, result={overlay_alpha}",
+            source.map(|vertex| vertex.position),
+            source.map(|vertex| vertex.overlay_alpha)
+        ));
+    }
+    let vertex = VulkanStaticVertex {
+        position,
+        color: blend3(source.map(|vertex| vertex.color)),
+        normal: blend3(source.map(|vertex| vertex.normal)),
+        uv: blend2(source.map(|vertex| vertex.uv)),
+        detail_uv: blend2(source.map(|vertex| vertex.detail_uv)),
+        overlay_alpha: overlay_alpha.clamp(0.0, 1.0),
     };
-    let node_times = sampled_times
-        .into_iter()
-        .map(|time| time.map(AnimationTime))
-        .collect::<Vec<_>>();
-    Ok(node38_sampled_hierarchy_at_times(model, &node_times)
-        .or_else(|| node38_fallback_hierarchy(model)))
+    if !vertex
+        .position
+        .iter()
+        .chain(vertex.color.iter())
+        .chain(vertex.normal.iter())
+        .chain(vertex.uv.iter())
+        .chain(vertex.detail_uv.iter())
+        .chain(std::iter::once(&vertex.overlay_alpha))
+        .all(|value| value.is_finite())
+    {
+        return Err(
+            "terrain split vertex contains a non-finite interpolated attribute".to_string(),
+        );
+    }
+    Ok(vertex)
 }
 
-fn project_dynamic_component_geometry(
-    dynamic: &DynamicComponentGeometry,
-    pose: &NodePoseBuffer,
-    mount: Option<VulkanNodePose>,
-) -> Result<VulkanStaticMesh, String> {
-    let projected = if let Some(mount) = mount {
-        project_msh_to_static_mesh_in_world_space_with_node_pose_buffer_and_mount(
-            &dynamic.model,
-            dynamic.transform,
-            dynamic.scale,
-            pose,
-            mount,
-        )
-    } else {
-        project_msh_to_static_mesh_in_world_space_with_node_pose_buffer(
-            &dynamic.model,
-            dynamic.transform,
-            dynamic.scale,
-            pose,
-        )
+fn project_basement_foundation(
+    terrain: &fparkan_terrain_format::LandMeshDocument,
+    source_mesh: &VulkanStaticMesh,
+    foundation: &mut BasementFoundation,
+) -> Result<(VulkanStaticMesh, Vec<ShadowTriangle>), String> {
+    let pipeline_state = source_mesh
+        .draw_ranges
+        .first()
+        .map(|range| range.pipeline_state)
+        .ok_or_else(|| "terrain source mesh has no LOD0 draw ranges".to_string())?;
+    let (normals, uv0_words) = canonicalize_basement_band_vertices(foundation)?;
+    let mut mesh = VulkanStaticMesh {
+        vertices: Vec::new(),
+        indices: Vec::new(),
+        draw_ranges: Vec::new(),
     };
-    projected.map_err(|error| {
-        format!(
-            "update mission object {} component {} geometry: {error}",
-            dynamic.object_index, dynamic.component_index
-        )
+    let mut shadow_receivers = Vec::with_capacity(foundation.fragments.len());
+
+    for (fragment_index, fragment) in foundation.fragments.iter().enumerate() {
+        let (material_index, base_only, vertices) = match fragment.source_face {
+            Some(face_index) => {
+                let face = terrain.faces.get(face_index).ok_or_else(|| {
+                    format!("foundation fragment references unknown terrain face {face_index}")
+                })?;
+                if face.flags != fragment.surface_mask {
+                    return Err(format!(
+                        "foundation fragment for terrain face {face_index} changed its surface mask"
+                    ));
+                }
+                let source_vertices: [VulkanStaticVertex; 3] = face
+                    .vertices
+                    .map(|vertex| {
+                        source_mesh
+                            .vertices
+                            .get(usize::from(vertex))
+                            .copied()
+                            .ok_or_else(|| {
+                                format!(
+                                    "terrain face {face_index} references an unknown projected vertex"
+                                )
+                            })
+                    })
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()?
+                    .try_into()
+                    .map_err(|_| "terrain face did not have three vertices".to_string())?;
+                let vertices = fragment
+                    .positions
+                    .map(|position| {
+                        source_vertices
+                            .iter()
+                            .find(|vertex| vertex.position == position)
+                            .copied()
+                            .map(Ok)
+                            .unwrap_or_else(|| {
+                                interpolate_static_terrain_vertex(position, source_vertices)
+                            })
+                    })
+                    .into_iter()
+                    .collect::<Result<Vec<_>, _>>()?
+                    .try_into()
+                    .map_err(|_| {
+                        "foundation source fragment did not have three vertices".to_string()
+                    })?;
+                (
+                    face.material_tag,
+                    fragment.surface_mask.0 & 0x400 == 0,
+                    vertices,
+                )
+            }
+            None => {
+                let fragment_normals = normals
+                    .get(fragment_index)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| "basement band face has no native vertex normals".to_string())?;
+                let fragment_uv0_words = uv0_words
+                    .get(fragment_index)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| "basement band face lost its original UV words".to_string())?;
+                let vertices = basement_band_vertices(
+                    fragment.positions,
+                    fragment_uv0_words,
+                    fragment_normals,
+                );
+                (0xff00, true, vertices)
+            }
+        };
+
+        let first_index = u32::try_from(mesh.indices.len())
+            .map_err(|_| "basement terrain index buffer exceeds u32".to_string())?;
+        for vertex in vertices {
+            let index = u32::try_from(mesh.vertices.len())
+                .map_err(|_| "basement terrain vertex buffer exceeds u32".to_string())?;
+            mesh.vertices.push(vertex);
+            mesh.indices.push(index);
+        }
+        if let Some(range) = mesh.draw_ranges.last_mut().filter(|range| {
+            range.material_index == material_index && range.terrain_base_only == base_only
+        }) {
+            range.index_count = range
+                .index_count
+                .checked_add(3)
+                .ok_or_else(|| "basement terrain draw range exceeds u32".to_string())?;
+        } else {
+            mesh.draw_ranges.push(VulkanStaticDrawRange {
+                first_index,
+                index_count: 3,
+                material_index,
+                lightmap_index: u8::MAX,
+                batch_flags: 0,
+                pipeline_state,
+                terrain_base_only: base_only,
+                alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
+            });
+        }
+        shadow_receivers.push(shadow_triangle(fragment.positions, fragment.surface_mask.0));
+    }
+
+    Ok((mesh, shadow_receivers))
+}
+
+fn prepare_static_terrain_geometry(
+    terrain: &fparkan_terrain_format::LandMeshDocument,
+    source_mesh: VulkanStaticMesh,
+    terrain_world: &TerrainWorld,
+    foundation: Option<BasementFoundation>,
+) -> Result<(VulkanStaticMesh, Vec<ShadowTriangle>, TerrainWorld), String> {
+    let Some(mut foundation) = foundation else {
+        return Ok((
+            source_mesh,
+            terrain_shadow_receivers(terrain)?,
+            terrain_world.clone(),
+        ));
+    };
+    let (mesh, shadow_receivers) =
+        project_basement_foundation(terrain, &source_mesh, &mut foundation)?;
+    let terrain_query = terrain_world
+        .clone()
+        .with_basement_foundation(foundation)
+        .map_err(|error| format!("install canonical terrain query surfaces: {error}"))?;
+    Ok((mesh, shadow_receivers, terrain_query))
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BasementBandVertex {
+    position: [f32; 3],
+    uv0: [i16; 2],
+    // The native callback leaves UV1 unwritten; zero is a deterministic
+    // assumption for matching generated vertices and is not native parity.
+    detail_uv: [i16; 2],
+    alpha: f32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BasementBandVertexGroup {
+    position: [f32; 3],
+    uv0: [i16; 2],
+    detail_uv: [i16; 2],
+    alpha: f32,
+    face_normal_sum: [i64; 3],
+}
+
+fn canonicalize_basement_band_vertices(
+    foundation: &mut BasementFoundation,
+) -> Result<(Vec<Option<[[f32; 3]; 3]>>, Vec<Option<[[i16; 2]; 3]>>), String> {
+    let mut group_ids_by_fragment = vec![None; foundation.fragments.len()];
+    let mut uv0_words_by_fragment = vec![None; foundation.fragments.len()];
+    let mut groups = Vec::<BasementBandVertexGroup>::new();
+    let mut buckets = HashMap::<(i32, i32, i16, i16), Vec<usize>>::new();
+
+    // shortcut: installed-corpus probing found no exact UV0 weld key between
+    // generated bands and clipped source fragments. Extend the index to source
+    // vertices if a future corpus reaches that key.
+    for (fragment_index, fragment) in foundation.fragments.iter_mut().enumerate() {
+        if fragment.source_face.is_some() {
+            continue;
+        }
+        // Preserve the input UV words: canonicalizing a welded position can
+        // otherwise change this triangle's per-face UV origin.
+        let vertices = basement_band_uv_vertices(fragment.positions)?;
+        let mut group_ids = [0_usize; 3];
+        let mut uv0_words = [[0_i16; 2]; 3];
+        for (corner, vertex) in vertices.into_iter().enumerate() {
+            uv0_words[corner] = vertex.uv0;
+            let cell = basement_vertex_cell(vertex.position)?;
+            let mut candidates = Vec::new();
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    let (Some(x), Some(y)) = (cell.0.checked_add(dx), cell.1.checked_add(dy))
+                    else {
+                        continue;
+                    };
+                    if let Some(bucket) = buckets.get(&(x, y, vertex.uv0[0], vertex.uv0[1])) {
+                        candidates.extend(bucket.iter().copied());
+                    }
+                }
+            }
+            candidates.sort_unstable();
+            let group_index = candidates
+                .into_iter()
+                .find(|&index| {
+                    let existing = groups[index];
+                    existing.uv0 == vertex.uv0
+                        && existing.detail_uv == vertex.detail_uv
+                        && existing.alpha.to_bits() == vertex.alpha.to_bits()
+                        && basement_vertex_xy_distance(existing.position, vertex.position) < 0.01
+                })
+                .unwrap_or_else(|| {
+                    let index = groups.len();
+                    groups.push(BasementBandVertexGroup {
+                        position: vertex.position,
+                        uv0: vertex.uv0,
+                        detail_uv: vertex.detail_uv,
+                        alpha: vertex.alpha,
+                        face_normal_sum: [0; 3],
+                    });
+                    buckets
+                        .entry((cell.0, cell.1, vertex.uv0[0], vertex.uv0[1]))
+                        .or_default()
+                        .push(index);
+                    index
+                });
+            fragment.positions[corner] = groups[group_index].position;
+            group_ids[corner] = group_index;
+        }
+        group_ids_by_fragment[fragment_index] = Some(group_ids);
+        uv0_words_by_fragment[fragment_index] = Some(uv0_words);
+    }
+
+    for (fragment_index, fragment) in foundation.fragments.iter().enumerate() {
+        if fragment.source_face.is_some() {
+            continue;
+        }
+        let Some(face_normal) = packed_basement_face_normal(fragment.positions)? else {
+            continue;
+        };
+        let group_ids = group_ids_by_fragment[fragment_index]
+            .ok_or_else(|| "basement band face has no welded vertex groups".to_string())?;
+        // The native normal postpass visits each indexed face once per vertex,
+        // even if malformed geometry gives two corners the same vertex index.
+        for group_index in group_ids.into_iter().collect::<HashSet<_>>() {
+            for axis in 0..3 {
+                groups[group_index].face_normal_sum[axis] += i64::from(face_normal[axis]);
+            }
+        }
+    }
+
+    let normalized = groups
+        .iter()
+        .map(|group| normalized_native_vertex_normal(group.face_normal_sum))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((
+        group_ids_by_fragment
+            .into_iter()
+            .map(|group_ids| group_ids.map(|ids| ids.map(|group| normalized[group])))
+            .collect(),
+        uv0_words_by_fragment,
+    ))
+}
+
+fn basement_vertex_cell(position: [f32; 3]) -> Result<(i32, i32), String> {
+    let x = (position[0] / 0.01).floor();
+    let y = (position[1] / 0.01).floor();
+    if !x.is_finite()
+        || !y.is_finite()
+        || x < i32::MIN as f32
+        || x > i32::MAX as f32
+        || y < i32::MIN as f32
+        || y > i32::MAX as f32
+    {
+        return Err("basement band vertex is outside the native weld grid".to_string());
+    }
+    Ok((x as i32, y as i32))
+}
+
+fn basement_vertex_xy_distance(left: [f32; 3], right: [f32; 3]) -> f32 {
+    ((left[0] - right[0]).powi(2) + (left[1] - right[1]).powi(2)).sqrt()
+}
+
+fn basement_band_uv_vertices(positions: [[f32; 3]; 3]) -> Result<[BasementBandVertex; 3], String> {
+    let raw_uv = positions.map(|point| [point[0] * 0.066_f32, point[1] * 0.066_f32]);
+    if !raw_uv.iter().flatten().all(|value| value.is_finite()) {
+        return Err("basement band UV is non-finite".to_string());
+    }
+    let origin = std::array::from_fn::<_, 2, _>(|axis| {
+        raw_uv
+            .iter()
+            .map(|uv| uv[axis])
+            .fold(f32::INFINITY, f32::min)
+            .floor()
+    });
+    let mut result = [BasementBandVertex {
+        position: [0.0; 3],
+        uv0: [0; 2],
+        detail_uv: [0; 2],
+        alpha: 1.0,
+    }; 3];
+    for index in 0..3 {
+        let mut uv0 = [0_i16; 2];
+        for axis in 0..2 {
+            let scaled = ((raw_uv[index][axis] - origin[axis]) * 1024.0_f32).round_ties_even();
+            if !scaled.is_finite() || scaled < i64::MIN as f32 || scaled > i64::MAX as f32 {
+                return Err("basement band UV exceeds the native conversion range".to_string());
+            }
+            // Native FISTP stores the low signed 16-bit word from its integer result.
+            uv0[axis] = (scaled as i64) as i16;
+        }
+        result[index] = BasementBandVertex {
+            position: positions[index],
+            uv0,
+            detail_uv: [0; 2],
+            alpha: 1.0,
+        };
+    }
+    Ok(result)
+}
+
+fn packed_basement_face_normal(positions: [[f32; 3]; 3]) -> Result<Option<[i16; 3]>, String> {
+    let [a, b, c] = positions.map(|point| point.map(f64::from));
+    let first = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let second = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let cross = [
+        first[1] * second[2] - first[2] * second[1],
+        first[2] * second[0] - first[0] * second[2],
+        first[0] * second[1] - first[1] * second[0],
+    ];
+    let length = cross.iter().map(|value| value * value).sum::<f64>().sqrt();
+    if !length.is_finite() {
+        return Err("basement band face normal is non-finite".to_string());
+    }
+    if length == 0.0 {
+        return Ok(None);
+    }
+    Ok(Some(cross.map(|value| {
+        ((value / length * 32767.0).round_ties_even()) as i16
+    })))
+}
+
+fn normalized_native_vertex_normal(face_normal_sum: [i64; 3]) -> Result<[f32; 3], String> {
+    let normal = face_normal_sum.map(|value| value as f64);
+    let length = normal.iter().map(|value| value * value).sum::<f64>().sqrt();
+    if !length.is_finite() {
+        return Err("basement band vertex has a non-finite native face-normal sum".to_string());
+    }
+    if length == 0.0 {
+        return Ok([0.0; 3]);
+    }
+    Ok(normal.map(|value| {
+        let packed = (value / length * 127.0)
+            .round_ties_even()
+            .clamp(-127.0, 127.0) as i8;
+        f32::from(packed) / 128.0
+    }))
+}
+
+fn basement_band_vertices(
+    positions: [[f32; 3]; 3],
+    uv0_words: &[[i16; 2]; 3],
+    normals: &[[f32; 3]; 3],
+) -> [VulkanStaticVertex; 3] {
+    std::array::from_fn(|index| VulkanStaticVertex {
+        position: positions[index],
+        color: [1.0; 3],
+        normal: normals[index],
+        uv: uv0_words[index].map(|value| f32::from(value) / 1024.0),
+        // The native callback leaves the secondary UV words unwritten. The
+        // renderer uses zero here as a deterministic assumption; generated
+        // faces take the base-only path, so the detail coordinate is not sampled.
+        detail_uv: [0.0; 2],
+        overlay_alpha: 1.0,
     })
 }
 
@@ -4625,22 +7907,55 @@ fn static_preview_mesh_and_materials(
     let mut type16_present_ranges = HashSet::new();
     let mut materials = Vec::new();
     let mut material_animations = Vec::new();
-    let mut sun_occlusion_range_indices = Vec::new();
-    let mut shadow_casters = Vec::new();
-    let mut shadow_sphere_baselines = Vec::new();
-    let mut shadow_caster_indices_by_object = Vec::with_capacity(roots.len());
+    let mut ambient_effect_slots = Vec::new();
+    let mut control_point_light_slots = Vec::new();
+    let mut effect_documents = HashMap::new();
+    let mut effect_materials = HashMap::new();
     let mut component_pose_buffers_by_object = Vec::with_capacity(roots.len());
     let mut component_mount_poses_by_object = Vec::with_capacity(roots.len());
-    let mut control_animation_instances = Vec::new();
-    let mut dynamic_component_geometry = Vec::new();
-    let mut dynamic_component_mounts = Vec::new();
+    let mut dynamic_component_geometry_by_object = Vec::with_capacity(roots.len());
     let mut building_collision_bindings = Vec::new();
     let mut collision_models =
         HashMap::<fparkan_assets::AssetId<PreparedModel>, Arc<ModelAsset>>::new();
-    let shadow_receivers = terrain_shadow_receivers(terrain_mesh)?;
+    let mut control_animation_instances_by_object = Vec::with_capacity(roots.len());
+    let mut dynamic_shadow_casters = Vec::new();
+    let mut sun_occlusion_range_indices = Vec::new();
+    let mut shadow_casters = Vec::new();
     let mut terrain_material_loader = StandaloneWearMaterialLoader::new(root);
-    let terrain_component = project_land_msh_to_static_mesh_in_world_space(terrain_mesh)
+    let source_terrain_component = project_land_msh_to_static_mesh_in_world_space(terrain_mesh)
         .map_err(|err| format!("project mission terrain for Vulkan: {err}"))?;
+    let footprint_sources = mission_basement_footprints(assets, roots)?;
+    let foundation = if footprint_sources.is_empty() {
+        None
+    } else {
+        let footprints = footprint_sources
+            .iter()
+            .map(|footprint| BasementFootprint {
+                outer: &footprint.outer,
+                inner: &footprint.inner,
+                flatten_inner_to_mean_outer_z: footprint.flatten_inner_to_mean_outer_z,
+            })
+            .collect::<Vec<_>>();
+        Some(
+            build_basement_foundations(terrain_mesh, &footprints)
+                .map_err(|error| format!("prepare mission basement foundations: {error}"))?,
+        )
+    };
+    let effective_roots = foundation
+        .as_ref()
+        .map(|foundation| {
+            apply_basement_placement_deltas(roots, &footprint_sources, &foundation.placements)
+        })
+        .transpose()?;
+    // Every visual, mounted component, effect, and shadow caster below uses this
+    // same root transform, so the native delta is applied once to the hierarchy.
+    let roots = effective_roots.as_deref().unwrap_or(roots);
+    let (terrain_component, shadow_receivers, terrain_query) = prepare_static_terrain_geometry(
+        terrain_mesh,
+        source_terrain_component,
+        terrain,
+        foundation,
+    )?;
     let terrain_materials = static_preview_terrain_base_materials(
         &mut terrain_material_loader,
         root,
@@ -4705,7 +8020,6 @@ fn static_preview_mesh_and_materials(
                 component_controls.map_or(0, Vec::len)
             ));
         }
-        let component_controls = component_controls.map_or(&[][..], Vec::as_slice);
         let root_native_kind = component_refs
             .first()
             .and_then(|(visual, _)| native_shadow_kind(visual.source_type));
@@ -4716,61 +8030,74 @@ fn static_preview_mesh_and_materials(
         );
         let mut root_shadow_triangles = Vec::new();
         let mut root_shadow_spheres = Vec::new();
+        let mut root_shadow_sphere_sources = Vec::new();
+        let mut root_shadow_draw_range_indices = Vec::new();
         let mut component_mount_poses = vec![None; component_refs.len()];
         let mut component_pose_buffers = vec![None; component_refs.len()];
+        let mut dynamic_component_geometry = vec![None; component_refs.len()];
+        let mut control_animation_instances = vec![None; component_refs.len()];
         for (component_index, (visual, model)) in component_refs.iter().enumerate() {
             let should_render = tree.as_ref().map_or(true, |_| {
                 unit_component_is_visible(component_index, visual.source_type)
             });
+            let control = component_controls
+                .and_then(|controls| controls.get(component_index))
+                .and_then(Option::as_ref);
             let Some(model) = *model else {
                 if legacy_camera.is_none() && root_native_kind == Some(3) && should_render {
                     return Err(format!(
                         "building collision object {object_index} component {component_index} has no model"
                     ));
                 }
+                if component_index == 0 {
+                    if let Some(control) = control {
+                        append_initial_control_effect_slots(
+                            root,
+                            mission_root,
+                            object_index,
+                            component_index,
+                            control,
+                            None,
+                            None,
+                            &mut mesh,
+                            &mut materials,
+                            &mut material_animations,
+                            &mut effect_documents,
+                            &mut effect_materials,
+                            &mut ambient_effect_slots,
+                            &mut control_point_light_slots,
+                        )?;
+                    }
+                }
                 continue;
             };
-            let component_control = component_controls
-                .get(component_index)
-                .and_then(Option::as_ref);
-            let control_animates_component = component_control.is_some_and(control_has_tag21);
-            let timeline_moves_component = static_animation_frame.is_none()
-                && (control_animates_component
-                    || component_chain_has_tag21(
-                        tree.as_deref(),
-                        component_controls,
-                        component_index,
-                    ));
-            let runtime_model = timeline_moves_component.then(|| Arc::new(model.validated.clone()));
-            let mut control_state = ControlInstanceState::default();
-            component_pose_buffers[component_index] =
-                match (static_animation_frame, component_control) {
-                    (None, Some(control)) => static_preview_control_pose_buffer(
-                        &model.validated,
-                        control,
-                        0,
-                        &mut control_state,
-                    )?,
-                    (animation_frame, control) => static_preview_component_pose_buffer(
-                        &model.validated,
-                        control.map_or(&[][..], |control| control.bindings.as_slice()),
-                        animation_frame,
-                    )?,
-                };
-            if control_animates_component && static_animation_frame.is_none() {
-                control_animation_instances.push(ControlAnimationInstance {
-                    object_index,
-                    component_index,
-                    model: runtime_model
-                        .as_ref()
-                        .map(Arc::clone)
-                        .ok_or_else(|| "animated component model was not retained".to_string())?,
-                    control: component_control
-                        .ok_or_else(|| "tag-21 component control disappeared".to_string())?
-                        .clone(),
-                    state: control_state,
-                });
+            let component_bindings = component_controls
+                .and_then(|controls| controls.get(component_index))
+                .and_then(Option::as_ref)
+                .map_or(&[][..], |control| control.bindings.as_slice());
+            if static_animation_frame.is_none() {
+                if let Some(control) = control {
+                    control_animation_instances[component_index] = Some(ControlAnimationInstance {
+                        control: control.clone(),
+                        model: model.validated.clone(),
+                        gate_values: initial_control_gate_values(control),
+                        state: ControlInstanceState::default(),
+                        last_sampled_node_times: Vec::new(),
+                        reported_unsupported_fallback: false,
+                    });
+                }
             }
+            component_pose_buffers[component_index] = static_preview_component_pose_buffer(
+                &model.validated,
+                component_bindings,
+                static_animation_frame,
+            )?;
+            let timeline_moves_component = static_animation_frame.is_none()
+                && control_tree_chain_has_tag21(
+                    component_index,
+                    tree.as_deref(),
+                    component_controls.map_or(&[][..], |controls| controls.as_slice()),
+                );
             // Native AniMesh only resolves global MSH node sockets for EXTO
             // geometry. Internal INTO components use controller/equipment
             // slots, whose `parent_or_link` values are not MSH node indices.
@@ -4862,30 +8189,31 @@ fn static_preview_mesh_and_materials(
             if let Some(mount_pose) = mount_pose {
                 component_mount_poses[component_index] = Some(mount_pose);
             }
-            if timeline_moves_component && mount_pose.is_some() {
-                let parent_index = tree
-                    .as_ref()
-                    .and_then(|tree| tree[component_index].parent_index)
-                    .ok_or_else(|| {
-                        format!("mounted dynamic component {component_index} has no parent")
-                    })?;
-                let socket = usize::try_from(
-                    records
-                        .get(component_index)
-                        .ok_or_else(|| {
-                            format!("unit component {component_index} is outside decoded records")
-                        })?
-                        .parent_or_link,
-                )
-                .map_err(|_| {
-                    format!("unit component {component_index} has a negative mount socket")
-                })?;
-                dynamic_component_mounts.push(DynamicComponentMount {
-                    object_index,
-                    component_index,
-                    parent_index,
-                    socket,
-                });
+            // External tree components have a recovered mount pose; flat
+            // mission components and the root use the mission pose. Hidden
+            // INTO slots use controller links rather than MSH sockets, so
+            // their Control owner transform remains unresolved here.
+            let owner_pose_available =
+                component_index == 0 || tree.is_none() || mount_pose.is_some();
+            if owner_pose_available {
+                if let Some(control) = control {
+                    append_initial_control_effect_slots(
+                        root,
+                        mission_root,
+                        object_index,
+                        component_index,
+                        control,
+                        component_pose_buffers[component_index].as_ref(),
+                        mount_pose,
+                        &mut mesh,
+                        &mut materials,
+                        &mut material_animations,
+                        &mut effect_documents,
+                        &mut effect_materials,
+                        &mut ambient_effect_slots,
+                        &mut control_point_light_slots,
+                    )?;
+                }
             }
 
             let transform = LegacyIron3dEulerTransform {
@@ -4967,11 +8295,6 @@ fn static_preview_mesh_and_materials(
                         native_msh_cull_mode(range.batch_flags, component_handedness);
                 }
                 let component_shadow_triangles = static_mesh_shadow_triangles(&component);
-                let shadow_triangle_range = root_native_kind.map(|_| {
-                    let start = root_shadow_triangles.len();
-                    let end = start.saturating_add(component_shadow_triangles.len());
-                    start..end
-                });
                 if root_native_kind.is_some() {
                     root_shadow_triangles.extend(component_shadow_triangles);
                     let node1_pose = mount_pose.and_then(|_| match pose_buffer {
@@ -4989,6 +8312,12 @@ fn static_preview_mesh_and_materials(
                         node1_pose,
                     ) {
                         root_shadow_spheres.push(sphere);
+                        root_shadow_sphere_sources.push(DynamicShadowSphereSource {
+                            component_index,
+                            center: model.validated.bounding_sphere_center,
+                            radius: model.validated.bounding_sphere_radius,
+                            mounted: mount_pose.is_some(),
+                        });
                     }
                 }
                 let selector_remap = static_preview_component_materials(
@@ -5000,9 +8329,9 @@ fn static_preview_mesh_and_materials(
                     &mut material_animations,
                 )?;
                 let lightmap_textures = static_preview_lightmap_textures(assets, visual)?;
+                let range_start = mesh.draw_ranges.len();
                 let vertex_start = mesh.vertices.len();
                 let vertex_count = component.vertices.len();
-                let range_start = mesh.draw_ranges.len();
                 append_static_preview_component_with_lightmaps(
                     &mut mesh,
                     component,
@@ -5017,54 +8346,90 @@ fn static_preview_mesh_and_materials(
                         type16_present_ranges.insert(range_index);
                     }
                 }
-                if root_sun_eligible {
-                    sun_occlusion_range_indices.extend(range_start..mesh.draw_ranges.len());
+                if root_native_kind.is_some() {
+                    root_shadow_draw_range_indices.extend(range_start..mesh.draw_ranges.len());
                 }
-                if timeline_moves_component && vertex_count != 0 {
-                    dynamic_component_geometry.push(DynamicComponentGeometry {
-                        object_index,
-                        component_index,
-                        model: runtime_model.as_ref().map(Arc::clone).ok_or_else(|| {
-                            "animated component model was not retained".to_string()
-                        })?,
-                        transform,
-                        scale: mission_root.scale,
+                if timeline_moves_component {
+                    let parent_mount = tree
+                        .as_ref()
+                        .and_then(|nodes| nodes.get(component_index))
+                        .and_then(|node| node.parent_index)
+                        .filter(|parent_index| {
+                            component_mount_poses[*parent_index].is_some()
+                                || component_refs.get(*parent_index).is_some_and(
+                                    |(parent_visual, _)| {
+                                        unit_component_is_visible(
+                                            *parent_index,
+                                            parent_visual.source_type,
+                                        )
+                                    },
+                                )
+                        })
+                        .map(|parent_index| {
+                            let socket = usize::try_from(records[component_index].parent_or_link)
+                                .expect("mount socket was validated above");
+                            (parent_index, socket)
+                        });
+                    dynamic_component_geometry[component_index] = Some(DynamicComponentGeometry {
+                        model: model.validated.clone(),
+                        root_transform: transform,
+                        owner_scale: mission_root.scale,
+                        parent_mount,
                         vertex_start,
                         vertex_count,
-                        shadow_triangle_range,
                     });
+                }
+                if root_sun_eligible {
+                    sun_occlusion_range_indices.extend(range_start..mesh.draw_ranges.len());
                 }
                 mesh_components += 1;
             }
         }
-        component_pose_buffers_by_object.push(component_pose_buffers);
-        component_mount_poses_by_object.push(component_mount_poses);
-        let shadow_caster_index = if let Some(native_kind) =
+        if let Some(native_kind) =
             root_native_kind.filter(|kind| native_shadow_caster_enabled(*kind))
         {
             let caster_id = u32::try_from(shadow_casters.len())
                 .map_err(|_| "shadow caster id exceeds u32".to_string())?;
-            aggregate_shadow_caster(
+            let root_transform = LegacyIron3dEulerTransform {
+                translation: mission_root.position,
+                orientation_radians: mission_root.orientation_raw,
+            };
+            if let Some(caster) = aggregate_shadow_caster(
                 caster_id,
                 native_kind,
-                LegacyIron3dEulerTransform {
-                    translation: mission_root.position,
-                    orientation_radians: mission_root.orientation_raw,
-                },
+                root_transform,
                 mission_root.scale,
                 root_shadow_triangles,
                 &root_shadow_spheres,
-            )
-            .map(|caster| {
-                let index = shadow_casters.len();
-                shadow_sphere_baselines.push(caster.sphere);
+            ) {
+                if dynamic_component_geometry.iter().any(Option::is_some) {
+                    let component_draw_range_indices = root_shadow_draw_range_indices
+                        .into_iter()
+                        .filter(|range_index| {
+                            mesh.draw_ranges
+                                .get(*range_index)
+                                .is_some_and(|range| range.index_count != 0)
+                        })
+                        .collect::<Vec<_>>();
+                    if !component_draw_range_indices.is_empty() {
+                        dynamic_shadow_casters.push(DynamicShadowCaster {
+                            caster_index: shadow_casters.len(),
+                            object_index,
+                            root_transform,
+                            owner_scale: mission_root.scale,
+                            initial_sphere: caster.sphere,
+                            component_draw_range_indices,
+                            component_spheres: root_shadow_sphere_sources.clone(),
+                        });
+                    }
+                }
                 shadow_casters.push(caster);
-                index
-            })
-        } else {
-            None
-        };
-        shadow_caster_indices_by_object.push(shadow_caster_index);
+            }
+        }
+        component_pose_buffers_by_object.push(component_pose_buffers);
+        component_mount_poses_by_object.push(component_mount_poses);
+        dynamic_component_geometry_by_object.push(dynamic_component_geometry);
+        control_animation_instances_by_object.push(control_animation_instances);
     }
     if mesh_components == 0 {
         return Err("selected static preview roots have no mesh-backed visual".to_string());
@@ -5093,19 +8458,19 @@ fn static_preview_mesh_and_materials(
         type16_present_ranges,
         materials,
         material_animations,
-        sun_occlusion_range_indices,
-        shadow_casters,
-        shadow_sphere_baselines,
-        shadow_receivers,
-        shadow_material_index,
-        terrain: Arc::new(terrain.clone()),
+        ambient_effect_slots,
+        control_point_light_slots,
         component_pose_buffers: component_pose_buffers_by_object,
         component_mount_poses: component_mount_poses_by_object,
-        control_animation_instances,
-        dynamic_component_geometry,
+        dynamic_component_geometry: dynamic_component_geometry_by_object,
         building_collision_bindings,
-        dynamic_component_mounts,
-        shadow_caster_indices_by_object,
+        control_animation_instances: control_animation_instances_by_object,
+        dynamic_shadow_casters,
+        sun_occlusion_range_indices,
+        shadow_casters,
+        shadow_receivers,
+        shadow_material_index,
+        terrain: Arc::new(terrain_query),
         camera,
         view_camera,
         captured_viewport,
@@ -5331,9 +8696,12 @@ fn static_preview_terrain_base_materials(
                 initial_phase_index: static_material_phase
                     .map_or(0, usize::from)
                     .min(base_document.phases.len().saturating_sub(1)),
+                normalized_phase_override: None,
+                ambient_fx_material_alpha: false,
                 variants: vec![MaterialVariantSet {
                     phase_material_indices,
                     range_indices: Vec::new(),
+                    pipeline_category: base_phases[initial_phase_index].1.pipeline_category,
                 }],
                 base: MaterialPhaseBinding {
                     document: base_document,
@@ -5481,9 +8849,12 @@ fn static_preview_component_materials(
             .map_err(|_| "MAT0 phase variant selector exceeds u16".to_string())?;
             material_animations.push(MaterialAnimationBinding {
                 initial_phase_index,
+                normalized_phase_override: None,
+                ambient_fx_material_alpha: false,
                 variants: vec![MaterialVariantSet {
                     phase_material_indices,
                     range_indices: Vec::new(),
+                    pipeline_category: material.pipeline_category,
                 }],
                 base: MaterialPhaseBinding {
                     document: material.mat0.clone(),
@@ -5598,7 +8969,7 @@ fn append_static_preview_component_with_lightmaps(
     // advances to another phase.  The range's original selector identifies
     // the base binding, while the lightmap selector identifies the secondary
     // texture.  Keep the generated phase family and the binding/variant it
-    // belongs to so the pending MAT0 packet can rebind every frame.
+    // belongs to so update_material_animations can rebind every frame.
     let mut lightmap_materials: HashMap<(usize, u8), (Vec<usize>, usize, usize)> = HashMap::new();
     for range in component.draw_ranges {
         let source_material_index = selector_remap
@@ -5630,6 +9001,7 @@ fn append_static_preview_component_with_lightmaps(
                                 "static preview material selector {source_material_index} has no MAT0 animation binding"
                             )
                         })?;
+                let initial_phase_index = bindings[binding_index].initial_phase_index;
                 let lightmap = lightmap_textures
                     .get(usize::from(range.lightmap_index))
                     .expect("lightmap presence checked above");
@@ -5669,6 +9041,16 @@ fn append_static_preview_component_with_lightmaps(
                     materials.push(lightmap_material);
                     phase_material_indices.push(usize::from(index));
                 }
+                let initial_selector = phase_material_indices
+                    .get(initial_phase_index)
+                    .copied()
+                    .ok_or_else(|| "static preview lightmap phase table is empty".to_string())?;
+                let pipeline_category = materials
+                    .get(initial_selector)
+                    .map(|material| material.pipeline_category)
+                    .ok_or_else(|| {
+                        "static preview lightmap material selector is unavailable".to_string()
+                    })?;
                 let bindings = material_animations.as_deref_mut().ok_or_else(|| {
                     "static preview lightmap animation storage is unavailable".to_string()
                 })?;
@@ -5676,6 +9058,7 @@ fn append_static_preview_component_with_lightmaps(
                 bindings[binding_index].variants.push(MaterialVariantSet {
                     phase_material_indices: phase_material_indices.clone(),
                     range_indices: Vec::new(),
+                    pipeline_category,
                 });
                 let value = (phase_material_indices, binding_index, variant_index);
                 lightmap_materials.insert(key, value.clone());
@@ -5782,11 +9165,12 @@ fn run_static_vulkan_mode(
     environment: Option<DynamicEnvironment>,
     audio: Option<audio::GameAudio>,
     target_frames: u64,
-    control_clock_target_ms: Option<u32>,
     mission: &str,
     object_count: usize,
     readback_out: Option<&std::path::Path>,
+    readback_sequence_out: Option<&std::path::Path>,
     enable_validation: bool,
+    control_clock_target_ms: Option<u32>,
     startup_timings: StartupTimings,
 ) -> Result<String, String> {
     let event_loop = EventLoop::new().map_err(|err| format!("winit event loop: {err}"))?;
@@ -5801,7 +9185,7 @@ fn run_static_vulkan_mode(
         preview.shadow_material_index,
         shadow_placeholder_vertices(),
         quad_indices(1)?,
-        world_pipeline_state(LegacyBlendMode::SourceAlpha, LegacyDepthMode::TestReadOnly),
+        projected_shadow_pipeline_state(),
     )?;
     let environment_gpu = match environment.as_mut() {
         Some(environment) => {
@@ -5815,6 +9199,8 @@ fn run_static_vulkan_mode(
                 &mut preview.type16_present_ranges,
                 &mut preview.materials,
                 &mut preview.material_animations,
+                &mut preview.ambient_effect_slots,
+                &mut preview.dynamic_shadow_casters,
                 &mut preview.sun_occlusion_range_indices,
                 &environment_materials,
                 &material_assets,
@@ -5836,11 +9222,12 @@ fn run_static_vulkan_mode(
         shadow_base_index,
         audio,
         target_frames,
-        control_clock_target_ms,
         mission,
         object_count,
         readback_out.map(std::path::Path::to_path_buf),
+        readback_sequence_out.map(std::path::Path::to_path_buf),
         enable_validation,
+        control_clock_target_ms,
         startup_timings,
     );
     if let Err(err) = event_loop.run_app(&mut app) {
@@ -5849,98 +9236,23 @@ fn run_static_vulkan_mode(
     app.finish()
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SceneSampleId {
-    Live(u64),
-    Replay(u64),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct FrameClockSample {
-    id: SceneSampleId,
-    time_ms: u32,
-    delta_seconds: f32,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct SceneFrameUpdate {
-    sample: FrameClockSample,
-    camera: PreviewCameraFrame,
-    viewport: [f32; 2],
-    aspect: f32,
-    material_update: MaterialFrameUpdate,
-    environment_material_update: Option<MaterialFrameUpdate>,
-    environment: Option<DynamicEnvironmentFrame>,
-}
-
-#[derive(Debug, Default)]
-struct SceneFrameLifecycle {
-    pending: Option<SceneFrameUpdate>,
-    frames_presented: u64,
-    last_replay_time_ms: u32,
-}
-
-impl SceneFrameLifecycle {
-    fn sample_replay(&self, target_ms: u32, target_frames: u64) -> FrameClockSample {
-        if let Some(pending) = self.pending.as_ref() {
-            return pending.sample;
-        }
-        let time_ms = control_clock_ms_for_frame(target_ms, self.frames_presented, target_frames);
-        FrameClockSample {
-            id: SceneSampleId::Replay(self.frames_presented),
-            time_ms,
-            delta_seconds: replay_environment_delta_seconds(self.last_replay_time_ms, time_ms),
-        }
-    }
-
-    fn prepare(&mut self, update: SceneFrameUpdate) -> bool {
-        if self.pending.is_some() {
-            return false;
-        }
-        self.pending = Some(update);
-        true
-    }
-
-    fn record_presented(&mut self) -> Option<u64> {
-        let sample = self.pending.take()?.sample;
-        let frame_index = self.frames_presented;
-        self.frames_presented = self.frames_presented.saturating_add(1);
-        if matches!(sample.id, SceneSampleId::Replay(_)) {
-            self.last_replay_time_ms = sample.time_ms;
-        }
-        Some(frame_index)
-    }
-}
-
-fn control_clock_ms_for_frame(target_ms: u32, frame_index: u64, target_frames: u64) -> u32 {
-    if target_frames <= 1 {
-        return target_ms;
-    }
-    let last_frame = u128::from(target_frames - 1);
-    let frame = u128::from(frame_index).min(last_frame);
-    ((u128::from(target_ms) * frame) / last_frame) as u32
-}
-
-fn replay_environment_delta_seconds(last_applied_ms: u32, current_ms: u32) -> f32 {
-    current_ms.saturating_sub(last_applied_ms) as f32 / 1_000.0
-}
-
 struct StaticVulkanApp {
     mesh: VulkanStaticMesh,
     native_handedness_by_range: HashMap<usize, i8>,
     type16_present_ranges: HashSet<usize>,
     materials: Vec<VulkanStaticMaterial>,
     material_animations: Vec<MaterialAnimationBinding>,
-    sun_occlusion_range_indices: Vec<usize>,
-    terrain: Arc<TerrainWorld>,
+    ambient_effect_slots: Vec<AmbientEffectGpuSlot>,
+    control_point_light_slots: Vec<ControlPointLightSlot>,
+    control_effect_random_states: HashMap<ControlEffectInstanceKey, ControlEffectRandomState>,
     component_pose_buffers: Vec<Vec<Option<NodePoseBuffer>>>,
     component_mount_poses: Vec<Vec<Option<VulkanNodePose>>>,
-    control_animation_instances: Vec<ControlAnimationInstance>,
-    dynamic_component_geometry: Vec<DynamicComponentGeometry>,
+    dynamic_component_geometry: Vec<Vec<Option<DynamicComponentGeometry>>>,
     building_collision_bindings: Vec<BuildingCollisionBinding>,
-    dynamic_component_mounts: Vec<DynamicComponentMount>,
-    shadow_caster_indices_by_object: Vec<Option<usize>>,
-    shadow_sphere_baselines: Vec<ShadowSphere>,
+    control_animation_instances: Vec<Vec<Option<ControlAnimationInstance>>>,
+    dynamic_shadow_casters: Vec<DynamicShadowCaster>,
+    sun_occlusion_range_indices: Vec<usize>,
+    terrain: Arc<TerrainWorld>,
     world_range_indices: Vec<usize>,
     world_range_index_counts: HashMap<usize, u32>,
     camera: VulkanStaticCamera,
@@ -5957,11 +9269,16 @@ struct StaticVulkanApp {
     shadow_receivers: Vec<ShadowTriangle>,
     shadow_cache: ShadowPageCache,
     shadow_last_evidence: ShadowFrameEvidence,
-    material_time_ms: u32,
+    last_environment_control_clock_ms: u32,
+    control_point_lights_diagnostic_reported: bool,
+    simulation_last_tick: Instant,
+    live_clock_paused_for_zero_extent: bool,
+    simulation_elapsed: Duration,
+    simulation_time_ms: u32,
+    simulation_update_generation: u64,
+    pending_scene_update: Option<SceneFrameUpdate>,
     environment_primitive_count: usize,
     pressed_keys: HashSet<KeyCode>,
-    last_tick: Instant,
-    simulation_elapsed: Duration,
     mouse_look: bool,
     audio: Option<audio::GameAudio>,
     camera_mode: &'static str,
@@ -5972,12 +9289,13 @@ struct StaticVulkanApp {
     mission: String,
     object_count: usize,
     readback_out: Option<PathBuf>,
+    readback_sequence_out: Option<PathBuf>,
     enable_validation: bool,
     startup_timings: StartupTimings,
     window_id: Option<WindowId>,
     window: Option<Window>,
     renderer: Option<VulkanSmokeRenderer>,
-    lifecycle: SceneFrameLifecycle,
+    frames_presented: u64,
     output: Option<String>,
     error: Option<String>,
 }
@@ -5992,21 +9310,28 @@ impl StaticVulkanApp {
         shadow_base_index: usize,
         audio: Option<audio::GameAudio>,
         target_frames: u64,
-        control_clock_target_ms: Option<u32>,
         mission: &str,
         object_count: usize,
         readback_out: Option<PathBuf>,
+        readback_sequence_out: Option<PathBuf>,
         enable_validation: bool,
+        control_clock_target_ms: Option<u32>,
         startup_timings: StartupTimings,
     ) -> Self {
         let mut fixed_range_indices = environment_gpu
             .as_ref()
             .map(EnvironmentGpuScene::fixed_range_indices)
             .unwrap_or_default();
+        fixed_range_indices.extend(preview.ambient_effect_slots.iter().flat_map(|slot| {
+            std::iter::once(slot.range.range_index).chain(
+                slot.additional_particle_ranges
+                    .iter()
+                    .map(|range| range.range_index),
+            )
+        }));
         fixed_range_indices.insert(shadow_range.range_index);
-        let world_range_indices = (0..preview.mesh.draw_ranges.len())
-            .filter(|range_index| !fixed_range_indices.contains(range_index))
-            .collect();
+        let world_range_indices =
+            world_draw_range_indices(preview.mesh.draw_ranges.len(), &fixed_range_indices);
         let world_range_index_counts = preview
             .mesh
             .draw_ranges
@@ -6021,16 +9346,17 @@ impl StaticVulkanApp {
             type16_present_ranges: preview.type16_present_ranges,
             materials: preview.materials,
             material_animations: preview.material_animations,
-            sun_occlusion_range_indices: preview.sun_occlusion_range_indices,
-            terrain: preview.terrain,
+            ambient_effect_slots: preview.ambient_effect_slots,
+            control_point_light_slots: preview.control_point_light_slots,
+            control_effect_random_states: HashMap::new(),
             component_pose_buffers: preview.component_pose_buffers,
             component_mount_poses: preview.component_mount_poses,
-            control_animation_instances: preview.control_animation_instances,
             dynamic_component_geometry: preview.dynamic_component_geometry,
             building_collision_bindings: preview.building_collision_bindings,
-            dynamic_component_mounts: preview.dynamic_component_mounts,
-            shadow_caster_indices_by_object: preview.shadow_caster_indices_by_object,
-            shadow_sphere_baselines: preview.shadow_sphere_baselines,
+            control_animation_instances: preview.control_animation_instances,
+            dynamic_shadow_casters: preview.dynamic_shadow_casters,
+            sun_occlusion_range_indices: preview.sun_occlusion_range_indices,
+            terrain: preview.terrain,
             world_range_indices,
             world_range_index_counts,
             camera: preview.camera,
@@ -6047,11 +9373,16 @@ impl StaticVulkanApp {
             shadow_receivers: preview.shadow_receivers,
             shadow_cache: ShadowPageCache::default(),
             shadow_last_evidence: ShadowFrameEvidence::default(),
-            material_time_ms: 0,
+            last_environment_control_clock_ms: 0,
+            control_point_lights_diagnostic_reported: false,
+            simulation_last_tick: Instant::now(),
+            live_clock_paused_for_zero_extent: false,
+            simulation_elapsed: Duration::ZERO,
+            simulation_time_ms: 0,
+            simulation_update_generation: 0,
+            pending_scene_update: None,
             environment_primitive_count: 0,
             pressed_keys: HashSet::new(),
-            last_tick: Instant::now(),
-            simulation_elapsed: Duration::ZERO,
             mouse_look: false,
             audio,
             camera_mode: preview.camera_mode,
@@ -6062,12 +9393,13 @@ impl StaticVulkanApp {
             mission: mission.to_string(),
             object_count,
             readback_out,
+            readback_sequence_out,
             enable_validation,
             startup_timings,
             window_id: None,
             window: None,
             renderer: None,
-            lifecycle: SceneFrameLifecycle::default(),
+            frames_presented: 0,
             output: None,
             error: None,
         }
@@ -6125,6 +9457,49 @@ impl StaticVulkanApp {
                 )
                 .map_err(|error| {
                     format!("configure world draw range {range_index} count: {error}")
+                })?;
+        }
+        Ok(())
+    }
+
+    fn configure_ambient_effect_draw_ranges(
+        &self,
+        renderer: &mut VulkanSmokeRenderer,
+    ) -> Result<(), String> {
+        for slot in &self.ambient_effect_slots {
+            for (effect_range, _) in ambient_effect_ranges(slot) {
+                let range = self
+                    .mesh
+                    .draw_ranges
+                    .get(effect_range.range_index)
+                    .ok_or_else(|| "ambient FX draw range index is out of bounds".to_string())?;
+                let category = self
+                    .materials
+                    .get(usize::from(range.material_index))
+                    .ok_or_else(|| "ambient FX draw range has no MAT0 selector".to_string())?
+                    .pipeline_category;
+                renderer
+                    .set_draw_range_transparency(effect_range.range_index, true)
+                    .map_err(|error| {
+                        format!(
+                            "configure ambient FX draw range {}: {error}",
+                            effect_range.range_index
+                        )
+                    })?;
+                renderer
+                    .set_draw_range_material_category(effect_range.range_index, category)
+                    .map_err(|error| format!("configure ambient FX material category: {error}"))?;
+            }
+        }
+        for (range_index, sort_key) in ambient_effect_draw_sort_keys(
+            &self.mesh,
+            &self.ambient_effect_slots,
+            self.view_camera.position,
+        )? {
+            renderer
+                .set_draw_range_sort_key(range_index, sort_key)
+                .map_err(|error| {
+                    format!("configure ambient FX draw range {range_index} sort key: {error}")
                 })?;
         }
         Ok(())
@@ -6207,23 +9582,10 @@ impl StaticVulkanApp {
             free_camera.position = safe_position;
         }
         let view_camera = free_camera.preview_frame(aspect);
-        self.free_camera = Some(free_camera);
         let camera = view_camera.vulkan_camera();
+        self.free_camera = Some(free_camera);
         self.view_camera = view_camera;
         self.camera = camera;
-        let sort_keys = self.world_draw_sort_keys(view_camera.position)?;
-        if let Some(renderer) = self.renderer.as_mut() {
-            renderer
-                .set_camera(camera)
-                .map_err(|error| format!("update free-flight camera: {error}"))?;
-            for (range_index, sort_key) in sort_keys {
-                renderer
-                    .set_draw_range_sort_key(range_index, sort_key)
-                    .map_err(|error| {
-                        format!("update world draw range {range_index} sort key: {error}")
-                    })?;
-            }
-        }
         Ok(())
     }
 
@@ -6259,156 +9621,55 @@ impl StaticVulkanApp {
         Ok(false)
     }
 
-    fn update_material_clock(&mut self, sample: FrameClockSample) {
-        self.material_time_ms = sample.time_ms;
+    fn sample_frame_clock(&mut self) -> FrameClockSample {
+        if let Some(target_ms) = self.control_clock_target_ms {
+            let time_ms =
+                control_clock_ms_for_frame(target_ms, self.frames_presented, self.target_frames);
+            self.simulation_elapsed = Duration::from_millis(u64::from(time_ms));
+            self.simulation_time_ms = time_ms;
+            return FrameClockSample {
+                id: SceneSampleId::Replay(self.frames_presented),
+                time_ms,
+                delta_seconds: replay_environment_delta_seconds(
+                    self.last_environment_control_clock_ms,
+                    time_ms,
+                ),
+            };
+        }
+        self.sample_live_frame_clock_at(Instant::now())
     }
 
-    fn update_controlled_component_geometry(
-        &mut self,
-        sample: FrameClockSample,
-    ) -> Result<(), String> {
-        let mut pose_changed = false;
-        for instance in &mut self.control_animation_instances {
-            let pose = static_preview_control_pose_buffer(
-                &instance.model,
-                &instance.control,
-                sample.time_ms,
-                &mut instance.state,
-            )?;
-            let slot = self
-                .component_pose_buffers
-                .get_mut(instance.object_index)
-                .and_then(|buffers| buffers.get_mut(instance.component_index))
-                .ok_or_else(|| {
-                    format!(
-                        "animated component {} pose slot is outside object {}",
-                        instance.component_index, instance.object_index
-                    )
-                })?;
-            if *slot != pose {
-                *slot = pose;
-                pose_changed = true;
-            }
+    fn pending_or_sample_frame_clock(&mut self) -> FrameClockSample {
+        match self.pending_scene_update.as_ref() {
+            Some(pending) => pending.clock,
+            None => self.sample_frame_clock(),
         }
-        if !pose_changed {
-            return Ok(());
-        }
+    }
 
-        // Mounts are recalculated from the sampled hierarchy even when the
-        // parent has no visible draw geometry of its own.
-        let mounts_changed = refresh_dynamic_component_mounts(
-            &self.dynamic_component_mounts,
-            &self.component_pose_buffers,
-            &mut self.component_mount_poses,
-        )?;
-        let mut geometry_changed = false;
-        let mut shadow_updates = Vec::new();
-        let mut updated_shadow_casters = HashSet::new();
-        for dynamic in &self.dynamic_component_geometry {
-            let pose = self
-                .component_pose_buffers
-                .get(dynamic.object_index)
-                .and_then(|buffers| buffers.get(dynamic.component_index))
-                .and_then(Option::as_ref)
-                .ok_or_else(|| {
-                    format!(
-                        "animated component {} has no current Node38 hierarchy",
-                        dynamic.component_index
-                    )
-                })?;
-            let mount = self
-                .component_mount_poses
-                .get(dynamic.object_index)
-                .and_then(|poses| poses.get(dynamic.component_index))
-                .copied()
-                .flatten();
-            let projected = project_dynamic_component_geometry(dynamic, pose, mount)?;
-            if projected.vertices.len() != dynamic.vertex_count {
-                return Err(format!(
-                    "animated component {} changed projected vertex count from {} to {}",
-                    dynamic.component_index,
-                    dynamic.vertex_count,
-                    projected.vertices.len()
-                ));
-            }
-            let end = dynamic
-                .vertex_start
-                .checked_add(dynamic.vertex_count)
-                .ok_or_else(|| "animated component vertex range overflowed".to_string())?;
-            let destination = self
-                .mesh
-                .vertices
-                .get_mut(dynamic.vertex_start..end)
-                .ok_or_else(|| {
-                    format!(
-                        "animated component {} vertex range is outside the shared mesh",
-                        dynamic.component_index
-                    )
-                })?;
-            if destination != projected.vertices.as_slice() {
-                destination.copy_from_slice(&projected.vertices);
-                geometry_changed = true;
-            }
-            if let Some(range) = dynamic.shadow_triangle_range.clone() {
-                let triangles = static_mesh_shadow_triangles(&projected);
-                if triangles.len() != range.len() {
-                    return Err(format!(
-                        "animated component {} changed shadow triangle count from {} to {}",
-                        dynamic.component_index,
-                        range.len(),
-                        triangles.len()
-                    ));
-                }
-                shadow_updates.push((dynamic.object_index, range, triangles));
-            }
+    fn sample_live_frame_clock_at(&mut self, now: Instant) -> FrameClockSample {
+        let elapsed = now.saturating_duration_since(self.simulation_last_tick);
+        self.simulation_last_tick = now;
+        self.simulation_elapsed = self.simulation_elapsed.saturating_add(elapsed);
+        self.simulation_time_ms = self.simulation_elapsed.as_millis() as u32;
+        let sample_id = SceneSampleId::Live(self.simulation_update_generation);
+        self.simulation_update_generation = self.simulation_update_generation.saturating_add(1);
+        FrameClockSample {
+            id: sample_id,
+            time_ms: self.simulation_time_ms,
+            delta_seconds: elapsed.as_secs_f32(),
         }
-        for (object_index, range, triangles) in shadow_updates {
-            let Some(caster_index) = self
-                .shadow_caster_indices_by_object
-                .get(object_index)
-                .copied()
-                .flatten()
-            else {
-                continue;
-            };
-            let caster = self
-                .shadow_casters
-                .get_mut(caster_index)
-                .ok_or_else(|| format!("shadow caster {caster_index} is unavailable"))?;
-            let destination = caster.triangles.get_mut(range).ok_or_else(|| {
-                format!("animated component shadow range is outside caster {caster_index}")
-            })?;
-            destination.clone_from_slice(&triangles);
-            updated_shadow_casters.insert(caster_index);
+    }
+
+    fn pause_live_clock_at(&mut self, now: Instant) {
+        self.live_clock_paused_for_zero_extent = true;
+        self.simulation_last_tick = now;
+    }
+
+    fn resume_live_clock_at(&mut self, now: Instant) {
+        if self.live_clock_paused_for_zero_extent {
+            self.simulation_last_tick = now;
+            self.live_clock_paused_for_zero_extent = false;
         }
-        for caster_index in updated_shadow_casters {
-            let baseline = self
-                .shadow_sphere_baselines
-                .get(caster_index)
-                .copied()
-                .ok_or_else(|| format!("shadow sphere baseline {caster_index} is unavailable"))?;
-            let caster = self
-                .shadow_casters
-                .get_mut(caster_index)
-                .ok_or_else(|| format!("shadow caster {caster_index} is unavailable"))?;
-            // shortcut: native animated sphere updates are unverified; derive
-            // a conservative envelope from the native startup sphere and all
-            // current triangles, never from a prior frame's expanded bounds.
-            caster.sphere = shadow_sphere_enclosing_triangles(baseline, &caster.triangles)?;
-        }
-        if geometry_changed || mounts_changed {
-            let sort_keys = self.world_draw_sort_keys(self.view_camera.position)?;
-            if let Some(renderer) = self.renderer.as_mut() {
-                for (range_index, sort_key) in sort_keys {
-                    renderer
-                        .set_draw_range_sort_key(range_index, sort_key)
-                        .map_err(|error| {
-                            format!("update animated component sort key {range_index}: {error}")
-                        })?;
-                }
-            }
-        }
-        Ok(())
     }
 
     fn update_shadow(
@@ -6420,12 +9681,14 @@ impl StaticVulkanApp {
         shadow_base_vertex: usize,
         shadow_base_index: usize,
         shadow_material_index: usize,
+        uploaded_shadow_atlas: &mut VulkanStaticTexture,
         renderer: &mut VulkanSmokeRenderer,
+        control_point_lights: &[(VulkanPointLight, u32)],
         sky_frame: Option<&SkyFrame<'_>>,
         environment_frame: Option<&EnvironmentFrame>,
         shadow_camera: Option<ShadowCamera>,
     ) -> Result<ShadowFrameEvidence, String> {
-        let lights = shadow_lights(sky_frame, environment_frame, renderer);
+        let lights = shadow_lights(sky_frame, environment_frame, renderer, control_point_lights);
         let visible_casters = native_visible_shadow_casters(
             shadow_casters,
             renderer.frame_uniforms().clip_from_world,
@@ -6449,9 +9712,12 @@ impl StaticVulkanApp {
             &frame,
         )?;
         let atlas = shadow_atlas_texture_from_frame(&frame);
-        renderer
-            .update_material_texture(shadow_material_index, 0, &atlas)
-            .map_err(|error| format!("upload projected shadow atlas: {error}"))?;
+        if atlas != *uploaded_shadow_atlas {
+            renderer
+                .update_material_texture(shadow_material_index, 0, &atlas)
+                .map_err(|error| format!("upload projected shadow atlas: {error}"))?;
+            *uploaded_shadow_atlas = atlas;
+        }
         renderer
             .update_mesh_geometry(&mesh.vertices, &mesh.indices, &[geometry])
             .map_err(|error| format!("upload environment and shadow geometry: {error}"))?;
@@ -6461,88 +9727,501 @@ impl StaticVulkanApp {
         })
     }
 
-    fn update_environment(
+    fn prepare_scene_update(
         &mut self,
-        sample: FrameClockSample,
-        viewport: [f32; 2],
-    ) -> Result<Option<DynamicEnvironmentFrame>, String> {
-        if self.renderer.is_none() {
-            return Ok(None);
+        clock: FrameClockSample,
+        drawable_viewport: [f32; 2],
+    ) -> Result<(), String> {
+        let viewport = self.captured_viewport.map_or_else(
+            || [drawable_viewport[0].max(1.0), drawable_viewport[1].max(1.0)],
+            |viewport| [viewport.extent[0] as f32, viewport.extent[1] as f32],
+        );
+        let aspect = viewport[0] / viewport[1].max(1.0);
+        if let Some((pending_id, pending_viewport)) = self
+            .pending_scene_update
+            .as_ref()
+            .map(|pending| (pending.clock.id, pending.viewport))
+        {
+            if pending_id == clock.id {
+                if pending_viewport != viewport {
+                    self.refresh_pending_scene_viewport(viewport, aspect)?;
+                }
+                return Ok(());
+            }
         }
+        let control_clock_ms = clock.time_ms;
+        let effect_elapsed_seconds = control_clock_ms as f32 / 1000.0;
+        // CTLD's validated NDP defaults seed the native query gate. This
+        // preview does not process mission Action1 updates, so it retains that
+        // initial provider value for the capture.
+        update_control_animation_pose_buffers(
+            &mut self.control_animation_instances,
+            &mut self.component_pose_buffers,
+            control_clock_ms,
+        )?;
+        update_dynamic_component_geometry(
+            &self.dynamic_component_geometry,
+            &self.component_pose_buffers,
+            &mut self.component_mount_poses,
+            &mut self.mesh,
+        )?;
+        self.update_free_camera(clock.delta_seconds, viewport)?;
+        refresh_dynamic_shadow_casters(
+            &mut self.shadow_casters,
+            &self.dynamic_shadow_casters,
+            &self.mesh,
+            &self.component_pose_buffers,
+            &self.component_mount_poses,
+        )?;
+        for slot in &mut self.ambient_effect_slots {
+            if slot.owner_component_is_mounted {
+                slot.mount_pose = self
+                    .component_mount_poses
+                    .get(slot.owner_object_index)
+                    .and_then(|components| components.get(slot.owner_component_index))
+                    .copied()
+                    .flatten();
+            }
+        }
+        let control_effect_random_samples = advance_control_effect_random_states(
+            &mut self.control_effect_random_states,
+            &self.ambient_effect_slots,
+            &self.control_point_light_slots,
+            clock.id,
+            control_clock_ms,
+            effect_elapsed_seconds,
+        );
+        let control_point_lights = update_control_point_lights(
+            &mut self.control_point_light_slots,
+            &self.component_pose_buffers,
+            &self.component_mount_poses,
+            effect_elapsed_seconds,
+            &control_effect_random_samples,
+            std::env::var_os("FPARKAN_CONTROL_POINT_LIGHT_DIAGNOSTIC").is_some()
+                && !self.control_point_lights_diagnostic_reported
+                && self
+                    .control_clock_target_ms
+                    .is_none_or(|target_ms| control_clock_ms >= target_ms),
+        );
+        let control_vulkan_lights = ordinary_control_point_lights(&control_point_lights);
+        let effect_updates = update_ambient_effect_geometry(
+            &mut self.ambient_effect_slots,
+            &self.component_pose_buffers,
+            &mut self.mesh,
+            &mut self.material_animations,
+            effect_elapsed_seconds,
+            &control_effect_random_samples,
+            self.view_camera.position,
+        )?;
+        let world_sort_keys = self.world_draw_sort_keys(self.view_camera.position)?;
+        let ambient_sort_keys = ambient_effect_draw_sort_keys(
+            &self.mesh,
+            &self.ambient_effect_slots,
+            self.view_camera.position,
+        )?;
         let camera = self.view_camera;
+        let material_update = sample_material_animations(
+            &mut self.material_animations,
+            &self.materials,
+            clock.time_ms,
+        )?;
+        let active_materials = &material_update.active_materials;
+        apply_ambient_effect_material_tints(
+            &self.ambient_effect_slots,
+            &mut self.mesh,
+            &effect_updates,
+            &material_update.active_materials,
+        )?;
+        let diagnostic_mode = std::env::var("FPARKAN_AMBIENT_FX_DIAGNOSTIC").ok();
+        if diagnostic_mode.is_some() {
+            let generator_capture_is_final = diagnostic_mode.as_deref() == Some("generator")
+                && self
+                    .control_clock_target_ms
+                    .is_none_or(|target_ms| control_clock_ms >= target_ms);
+            for update in &effect_updates {
+                let Some((slot, range)) = self.ambient_effect_slots.iter().find_map(|slot| {
+                    ambient_effect_range_for(slot, update.range_index).map(|range| (slot, range))
+                }) else {
+                    continue;
+                };
+                if generator_capture_is_final
+                    && slot.kind == AmbientEffectKind::GenerBall
+                    && slot.control_source == "fortif.rlb/fr_l_gener.ctl"
+                {
+                    let random_sample = control_effect_random_samples
+                        .get(&slot.random_instance_key)
+                        .copied()
+                        .unwrap_or_default();
+                    let phase = ambient_effect_phase(
+                        slot.time_mode,
+                        slot.header_flags,
+                        effect_elapsed_seconds,
+                        slot.duration_seconds,
+                    )
+                    .map(|phase| {
+                        native_command_phase(slot.header_flags, phase, random_sample.phase_jitter)
+                    });
+                    let evaluated = phase.and_then(|phase| {
+                        evaluate_f_gener_ball(
+                            &slot.command,
+                            slot.command_index,
+                            &slot.world_from_effect,
+                            phase,
+                            effect_elapsed_seconds,
+                            self.view_camera.position,
+                        )
+                    });
+                    let expected_vertices = evaluated.as_ref().map(|frame| frame.vertices);
+                    let expected_center =
+                        expected_vertices.map(|vertices| ambient_effect_quad_center(&vertices));
+                    let expected_size =
+                        expected_vertices.map(|vertices| ambient_effect_quad_size(&vertices));
+                    let expected_screen = expected_vertices.and_then(|vertices| {
+                        ambient_effect_projected_bounds(
+                            &vertices,
+                            self.view_camera.clip_from_world,
+                            self.captured_viewport
+                                .map_or([1280, 1024], |viewport| viewport.extent),
+                        )
+                    });
+                    let actual_vertices = self
+                        .mesh
+                        .vertices
+                        .get(range.vertex_start..range.vertex_start.saturating_add(4));
+                    let actual_center: Option<[f32; 3]> = actual_vertices.map(|vertices| {
+                        std::array::from_fn(|axis| {
+                            vertices
+                                .iter()
+                                .map(|vertex| vertex.position[axis])
+                                .sum::<f32>()
+                                / 4.0
+                        })
+                    });
+                    let actual_rgb = actual_vertices
+                        .and_then(|vertices| vertices.first())
+                        .map(|vertex| vertex.color);
+                    let actual_alpha = actual_vertices
+                        .and_then(|vertices| vertices.first())
+                        .map(|vertex| vertex.overlay_alpha);
+                    let material = active_materials.get(&update.range_index);
+                    eprintln!(
+                        "ambient_fx_generator_diagnostic elapsed={effect_elapsed_seconds:.3} clock_ms={control_clock_ms} owner_object={} owner_component={} source={} table={} row={} points={:?} opcode={:?} command={} range={} submitted_indices={} effect_phase={phase:?} evaluator_active={:?} fx_mat_phase={:?} fx_alpha={:?} expected_center={expected_center:?} expected_size={expected_size:?} expected_screen={expected_screen:?} actual_center={actual_center:?} actual_rgb={actual_rgb:?} actual_alpha={actual_alpha:?} mat_selector={:?} mat_phase_index={:?} sampled_mat_rgb={:?}",
+                        slot.owner_object_index,
+                        slot.owner_component_index,
+                        slot.control_source,
+                        slot.control_table_index,
+                        slot.control_row_index,
+                        slot.control_point_indices,
+                        slot.command.opcode,
+                        slot.command_index,
+                        update.range_index,
+                        update.index_count,
+                        evaluated.as_ref().map(|frame| frame.active),
+                        evaluated.as_ref().map(|frame| frame.material_phase),
+                        evaluated.as_ref().map(|frame| frame.color[3]),
+                        material.map(|material| material.material_index),
+                        material.map(|material| material.phase_index),
+                        material.map(|material| material.additive_rgb),
+                    );
+                    continue;
+                }
+                if diagnostic_mode.as_deref() == Some("generator")
+                    || slot.control_source != "animals.rlb/a_a_l3.ctl"
+                    || update.index_count == 0
+                {
+                    continue;
+                }
+                let start = range.vertex_start;
+                let vertices = self
+                    .mesh
+                    .vertices
+                    .get(start..start.saturating_add(range.vertex_capacity))
+                    .unwrap_or_default();
+                let center = if vertices.is_empty() {
+                    [0.0; 3]
+                } else {
+                    std::array::from_fn(|axis| {
+                        vertices
+                            .iter()
+                            .map(|vertex| vertex.position[axis])
+                            .sum::<f32>()
+                            / vertices.len() as f32
+                    })
+                };
+                let color = vertices
+                    .first()
+                    .map(|vertex| vertex.color)
+                    .unwrap_or([0.0; 3]);
+                let alpha = vertices
+                    .first()
+                    .map(|vertex| vertex.overlay_alpha)
+                    .unwrap_or(0.0);
+                eprintln!(
+                    "ambient_fx_diagnostic elapsed={effect_elapsed_seconds:.3} source={} table={} row={} points={:?} owners={:?} parent_translation={:?} opcode={:?} command={} range={} active_indices={} center={center:?} command_rgb={:?} sampled_mat_rgb={color:?} alpha={alpha:.3}",
+                    slot.control_source,
+                    slot.control_table_index,
+                    slot.control_row_index,
+                    slot.control_point_indices,
+                    slot.control_point_owners,
+                    [slot.world_from_effect[0][3], slot.world_from_effect[1][3], slot.world_from_effect[2][3]],
+                    slot.command.opcode,
+                    slot.command_index,
+                    update.range_index,
+                    update.index_count,
+                    update.command_rgb,
+                );
+            }
+        }
+
         if let Some(audio) = self.audio.as_mut() {
             audio
                 .update_listener(camera.position, camera.forward, camera.up)
                 .map_err(|error| format!("update audio listener: {error}"))?;
         }
-        let environment_frame = if self.environment.is_some() {
-            let renderer = self
-                .renderer
-                .as_mut()
-                .ok_or_else(|| "native Vulkan renderer was not initialized".to_string())?;
-            let environment = self
-                .environment
-                .as_mut()
-                .ok_or_else(|| "dynamic environment disappeared".to_string())?;
-            Some(environment.update(
-                sample.delta_seconds,
+        let environment = if let Some(environment) = self.environment.as_mut() {
+            Some(environment.update_cpu(
+                clock.delta_seconds,
                 &camera,
-                viewport[0] / viewport[1].max(1.0),
+                aspect,
                 viewport,
-                renderer,
                 self.audio.as_mut(),
             )?)
         } else {
             None
         };
-        if let Some(frame) = environment_frame.as_ref() {
-            self.environment_primitive_count = frame.environment_frame.primitives.len();
+        self.environment_primitive_count = environment
+            .as_ref()
+            .map_or(0, |frame| frame.environment_frame.primitives.len());
+        if matches!(clock.id, SceneSampleId::Replay(_)) {
+            self.last_environment_control_clock_ms = control_clock_ms;
         }
-        Ok(environment_frame)
+        let environment_material_update =
+            if let Some(environment_gpu) = self.environment_gpu.as_mut() {
+                Some(sample_material_animations(
+                    &mut environment_gpu.material_animations,
+                    &self.materials,
+                    clock.time_ms,
+                )?)
+            } else {
+                None
+            };
+        let environment_point_light_count = environment.as_ref().map_or(0, |frame| {
+            frame
+                .environment_frame
+                .point_lights
+                .iter()
+                .filter(|light| light.active)
+                .count()
+        });
+        report_control_point_lights_once(
+            &mut self.control_point_lights_diagnostic_reported,
+            control_clock_ms,
+            self.control_clock_target_ms,
+            environment_point_light_count,
+            &control_point_lights,
+            &control_vulkan_lights,
+        );
+        self.pending_scene_update = Some(SceneFrameUpdate {
+            clock,
+            camera,
+            viewport,
+            aspect,
+            control_point_lights,
+            control_vulkan_lights,
+            effect_updates,
+            world_sort_keys,
+            ambient_sort_keys,
+            material_update,
+            environment_material_update,
+            environment,
+        });
+        Ok(())
     }
 
-    fn apply_environment_view(
+    fn refresh_pending_scene_viewport(
         &mut self,
-        frame: Option<&DynamicEnvironmentFrame>,
-        environment_material_update: Option<&MaterialFrameUpdate>,
-        camera: PreviewCameraFrame,
         viewport: [f32; 2],
+        aspect: f32,
     ) -> Result<(), String> {
+        let Some((previous_camera, previous_aspect)) = self
+            .pending_scene_update
+            .as_ref()
+            .map(|pending| (pending.camera, pending.aspect))
+        else {
+            return Ok(());
+        };
+        let camera = previous_camera.with_aspect(previous_aspect, aspect);
+        self.view_camera = camera;
+        self.camera = camera.vulkan_camera();
+        let environment_camera = environment_camera_for_preview(&camera, aspect, viewport);
+        if let Some(environment) = self
+            .pending_scene_update
+            .as_mut()
+            .and_then(|pending| pending.environment.as_mut())
+        {
+            environment
+                .environment_frame
+                .reproject_for_camera(environment_camera);
+        }
+        let pending = self
+            .pending_scene_update
+            .as_mut()
+            .expect("pending scene update was checked above");
+        pending.camera = camera;
+        pending.viewport = viewport;
+        pending.aspect = aspect;
+        Ok(())
+    }
+
+    fn render_scene_update(&mut self) -> Result<(), String> {
+        let Some(frame) = self.pending_scene_update.as_ref() else {
+            return Ok(());
+        };
         let Some(renderer) = self.renderer.as_mut() else {
             return Ok(());
         };
-        let aspect = viewport[0] / viewport[1].max(1.0);
-        if let Some(frame) = frame {
+        renderer
+            .set_camera(frame.camera.vulkan_camera())
+            .map_err(|error| format!("apply sampled scene camera: {error}"))?;
+        apply_material_frame_update(
+            &frame.material_update,
+            &mut self.material_animations,
+            renderer,
+        )?;
+        for update in &frame.effect_updates {
+            renderer
+                .set_draw_range_index_count(update.range_index, update.index_count)
+                .map_err(|error| {
+                    format!(
+                        "update ambient FX draw range {}: {error}",
+                        update.range_index
+                    )
+                })?;
+        }
+        for &(range_index, sort_key) in &frame.world_sort_keys {
+            renderer
+                .set_draw_range_sort_key(range_index, sort_key)
+                .map_err(|error| {
+                    format!("update dynamic world draw range {range_index} sort key: {error}")
+                })?;
+        }
+        for &(range_index, sort_key) in &frame.ambient_sort_keys {
+            renderer
+                .set_draw_range_sort_key(range_index, sort_key)
+                .map_err(|error| {
+                    format!("update ambient FX draw range {range_index} sort key: {error}")
+                })?;
+        }
+        Self::update_world_transparency(
+            &self.mesh,
+            &self.materials,
+            &self.world_range_indices,
+            &self.type16_present_ranges,
+            &self.world_range_index_counts,
+            &self.native_handedness_by_range,
+            frame.camera.position,
+            &frame.material_update.active_materials,
+            renderer,
+        )?;
+        let shadow_camera = ShadowCamera {
+            position: frame.camera.position,
+            viewport_width: frame.viewport[0],
+            horizontal_fov: horizontal_fov(&frame.camera, frame.aspect),
+        };
+        if let Some(sampled_environment) = frame.environment.as_ref() {
             let environment = self
                 .environment
                 .as_ref()
-                .ok_or_else(|| "dynamic environment disappeared".to_string())?;
+                .ok_or_else(|| "sampled atmosphere lost its owner".to_string())?;
             let sky_frame = SkyFrame::from_atmosphere(
-                &frame.atmosphere,
+                &sampled_environment.atmosphere,
                 &environment.materials,
-                frame.absolute_time_seconds,
+                sampled_environment.absolute_time_seconds,
             );
+            let environment_frame = &sampled_environment.environment_frame;
+            let mut uniforms = renderer.frame_uniforms();
+            uniforms.clip_from_world = frame.camera.clip_from_world;
+            for (target, source) in uniforms
+                .directional_lights
+                .iter_mut()
+                .zip(sky_frame.directional_lights)
+            {
+                target.direction = source.direction;
+                target.rgb = source.color;
+                target.coefficients = [0.0, 0.0, 1.0];
+                target.active = source.active;
+            }
+            uniforms.lighting_floor = sky_frame.lighting_floor;
+            let fog_rgb = sky_frame
+                .screen_gradient(frame.camera.native_sky_heading(), [0.0; 3])
+                .color
+                .rgba();
+            uniforms.fog_color = [fog_rgb[0], fog_rgb[1], fog_rgb[2]];
+            uniforms.fog_start = sky_frame.fog.start.max(0.0);
+            uniforms.fog_end = sky_frame.fog.end.max(uniforms.fog_start);
+            uniforms.camera_position = frame.camera.position;
+            renderer
+                .set_frame_uniforms(uniforms)
+                .map_err(|error| format!("update sky frame uniforms: {error}"))?;
+            let mut uniforms = renderer.frame_uniforms();
+            uniforms.point_light = environment_frame
+                .point_lights
+                .iter()
+                .find(|light| light.active)
+                .map(|light| VulkanPointLight {
+                    position: light.position,
+                    rgb: [light.color[0], light.color[1], light.color[2]],
+                    range: light.range,
+                    coefficients: light.attenuation,
+                    active: true,
+                })
+                .unwrap_or_default();
+            renderer
+                .set_frame_uniforms(uniforms)
+                .map_err(|error| format!("update environment point-light uniforms: {error}"))?;
+            let mut point_lights = environment_frame
+                .point_lights
+                .iter()
+                .filter(|light| light.active)
+                .map(|light| VulkanPointLight {
+                    position: light.position,
+                    rgb: [light.color[0], light.color[1], light.color[2]],
+                    range: light.range,
+                    coefficients: light.attenuation,
+                    active: true,
+                })
+                .collect::<Vec<_>>();
+            point_lights.extend(frame.control_vulkan_lights.iter().copied());
+            renderer
+                .set_point_lights(&point_lights)
+                .map_err(|error| format!("update complete scene point-light set: {error}"))?;
             if let Some(environment_gpu) = self.environment_gpu.as_mut() {
-                let material_update = environment_material_update
+                let material_update = frame
+                    .environment_material_update
+                    .as_ref()
                     .ok_or_else(|| "sampled environment material state is missing".to_string())?;
+                apply_material_frame_update(
+                    material_update,
+                    &mut environment_gpu.material_animations,
+                    renderer,
+                )?;
                 environment_gpu.update(
                     &mut self.mesh,
                     renderer,
                     material_update,
                     &sky_frame,
-                    &frame.sky_mesh,
-                    &frame.environment_frame,
-                    &camera,
-                    viewport,
+                    &sampled_environment.sky_mesh,
+                    environment_frame,
+                    &frame.camera,
+                    frame.viewport,
                     &self.terrain,
                     &self.sun_occlusion_range_indices,
                 )?;
             }
-            let shadow_camera = ShadowCamera {
-                position: camera.position,
-                viewport_width: viewport[0],
-                horizontal_fov: horizontal_fov(&camera, aspect),
-            };
+            let shadow_material = self
+                .materials
+                .get_mut(self.shadow_material_index)
+                .ok_or_else(|| "projected shadow material is out of bounds".to_string())?;
             self.shadow_last_evidence = Self::update_shadow(
                 &mut self.mesh,
                 &mut self.shadow_cache,
@@ -6552,17 +10231,21 @@ impl StaticVulkanApp {
                 self.shadow_base_vertex,
                 self.shadow_base_index,
                 self.shadow_material_index,
+                &mut shadow_material.texture,
                 renderer,
+                &frame.control_point_lights,
                 Some(&sky_frame),
-                Some(&frame.environment_frame),
+                Some(environment_frame),
                 Some(shadow_camera),
             )?;
         } else {
-            let shadow_camera = Some(ShadowCamera {
-                position: camera.position,
-                viewport_width: viewport[0],
-                horizontal_fov: horizontal_fov(&camera, aspect),
-            });
+            renderer
+                .set_point_lights(&frame.control_vulkan_lights)
+                .map_err(|error| format!("update complete scene point-light set: {error}"))?;
+            let shadow_material = self
+                .materials
+                .get_mut(self.shadow_material_index)
+                .ok_or_else(|| "projected shadow material is out of bounds".to_string())?;
             self.shadow_last_evidence = Self::update_shadow(
                 &mut self.mesh,
                 &mut self.shadow_cache,
@@ -6572,149 +10255,22 @@ impl StaticVulkanApp {
                 self.shadow_base_vertex,
                 self.shadow_base_index,
                 self.shadow_material_index,
+                &mut shadow_material.texture,
                 renderer,
+                &frame.control_point_lights,
                 None,
                 None,
-                shadow_camera,
+                Some(shadow_camera),
             )?;
         }
         Ok(())
     }
 
-    fn refresh_pending_viewport(&mut self, viewport: [f32; 2]) -> Result<(), String> {
-        if self.captured_viewport.is_some() {
-            return Ok(());
-        }
-        let Some(mut update) = self.lifecycle.pending.clone() else {
-            return Ok(());
-        };
-        let viewport = [viewport[0].max(1.0), viewport[1].max(1.0)];
-        let aspect = viewport[0] / viewport[1];
-        let camera = update.camera.with_aspect(update.aspect, aspect);
-        self.view_camera = camera;
-        self.camera = camera.vulkan_camera();
-        if let Some(renderer) = self.renderer.as_mut() {
-            renderer
-                .set_camera(self.camera)
-                .map_err(|error| format!("refresh free-flight camera viewport: {error}"))?;
-        }
-        let environment_camera = environment_camera_for_preview(&camera, aspect, viewport);
-        if let Some(environment) = update.environment.as_mut() {
-            environment
-                .environment_frame
-                .reproject_for_camera(environment_camera);
-        }
-        update.camera = camera;
-        update.viewport = viewport;
-        update.aspect = aspect;
-        self.lifecycle.pending = Some(update);
-        Ok(())
-    }
-
-    fn apply_pending_scene_update(&mut self) -> Result<(), String> {
-        let Some(frame) = self.lifecycle.pending.take() else {
-            return Ok(());
-        };
-        let result = (|| {
-            {
-                let Some(renderer) = self.renderer.as_mut() else {
-                    return Err("native Vulkan renderer was not initialized".to_string());
-                };
-                apply_material_frame_update(
-                    &frame.material_update,
-                    &mut self.material_animations,
-                    renderer,
-                )?;
-                Self::update_world_transparency(
-                    &self.mesh,
-                    &self.materials,
-                    &self.world_range_indices,
-                    &self.type16_present_ranges,
-                    &self.world_range_index_counts,
-                    &self.native_handedness_by_range,
-                    frame.camera.position,
-                    &frame.material_update.active_materials,
-                    renderer,
-                )?;
-                if let Some(material_update) = frame.environment_material_update.as_ref() {
-                    let environment_gpu = self.environment_gpu.as_mut().ok_or_else(|| {
-                        "sampled environment material state lost its owner".to_string()
-                    })?;
-                    apply_material_frame_update(
-                        material_update,
-                        &mut environment_gpu.material_animations,
-                        renderer,
-                    )?;
-                }
-            }
-            self.apply_environment_view(
-                frame.environment.as_ref(),
-                frame.environment_material_update.as_ref(),
-                frame.camera,
-                frame.viewport,
-            )
-        })();
-        self.lifecycle.pending = Some(frame);
-        result
-    }
-
-    fn sample_frame_clock(&mut self) -> FrameClockSample {
-        if let Some(target_ms) = self.control_clock_target_ms {
-            return self.lifecycle.sample_replay(target_ms, self.target_frames);
-        }
-        self.sample_live_frame_clock_at(Instant::now())
-    }
-
-    fn sample_live_frame_clock_at(&mut self, now: Instant) -> FrameClockSample {
-        if let Some(pending) = self.lifecycle.pending.as_ref() {
-            return pending.sample;
-        }
-        let elapsed = now.saturating_duration_since(self.last_tick);
-        self.last_tick = now;
-        self.simulation_elapsed = self.simulation_elapsed.saturating_add(elapsed);
-        FrameClockSample {
-            id: SceneSampleId::Live(self.lifecycle.frames_presented),
-            time_ms: self.simulation_elapsed.as_millis() as u32,
-            delta_seconds: elapsed.as_secs_f32(),
-        }
-    }
-
-    fn prepare_scene_update(
-        &mut self,
-        sample: FrameClockSample,
-        viewport: [f32; 2],
-    ) -> Result<SceneFrameUpdate, String> {
-        let viewport = [viewport[0].max(1.0), viewport[1].max(1.0)];
-        let aspect = viewport[0] / viewport[1];
-        self.update_material_clock(sample);
-        self.update_controlled_component_geometry(sample)?;
-        self.update_free_camera(sample.delta_seconds, viewport)?;
-        let material_update = sample_material_animations(
-            &mut self.material_animations,
-            &self.materials,
-            self.material_time_ms,
-        )?;
-        let environment_material_update = self
-            .environment_gpu
-            .as_mut()
-            .map(|environment_gpu| {
-                sample_material_animations(
-                    &mut environment_gpu.material_animations,
-                    &self.materials,
-                    self.material_time_ms,
-                )
-            })
-            .transpose()?;
-        let environment = self.update_environment(sample, viewport)?;
-        Ok(SceneFrameUpdate {
-            sample,
-            camera: self.view_camera,
-            viewport,
-            aspect,
-            material_update,
-            environment_material_update,
-            environment,
-        })
+    fn record_presented_scene_frame(&mut self) -> u64 {
+        let frame_index = self.frames_presented;
+        self.frames_presented = self.frames_presented.saturating_add(1);
+        self.pending_scene_update = None;
+        frame_index
     }
 
     fn set_mouse_look(&mut self, active: bool) {
@@ -6805,6 +10361,13 @@ impl StaticVulkanApp {
             .map_or(report.renderer_report.swapchain_image_format, |artifact| {
                 artifact.format
             });
+        if let Some(control_clock_ms) = self.control_clock_target_ms {
+            emit_control_animation_capture_diagnostics(
+                &self.control_animation_instances,
+                &self.component_pose_buffers,
+                control_clock_ms,
+            );
+        }
         let captured_crop = self.captured_viewport.map_or_else(
             || "none".to_string(),
             |viewport| {
@@ -6815,14 +10378,17 @@ impl StaticVulkanApp {
             },
         );
         self.output = Some(format!(
-            "rendered mission {}: {} frames, {} objects, {} mesh components, {} terrain components, camera={}, captured_viewport_crop={}, materials={}, environment_primitives={}, shadow_casters={}, shadow_indices={}, swapchain_recreates={}, validation={}, swapchain_format={}, readback_format={}, readback={}, startup_ms={{mission_assets:{:.1},terrain_materials:{:.1},sky:{:.1},gpu_initialization:{:.1}}}",
+            "rendered mission {}: {} frames, {} objects, {} mesh components, {} terrain components, camera={}, captured_viewport_crop={}, control_clock_ms={}, control_clock_mode={}, materials={}, environment_primitives={}, shadow_casters={}, shadow_indices={}, swapchain_recreates={}, validation={}, swapchain_format={}, readback_format={}, readback={}, readback_sequence={}, startup_ms={{mission_assets:{:.1},terrain_materials:{:.1},sky:{:.1},gpu_initialization:{:.1}}}",
             self.mission,
-            self.lifecycle.frames_presented,
+            self.frames_presented,
             self.object_count,
             self.mesh_components,
             self.terrain_components,
             self.camera_mode,
             captured_crop,
+            self.control_clock_target_ms
+                .map_or_else(|| "realtime".to_string(), |clock| clock.to_string()),
+            control_clock_mode_label(self.control_clock_target_ms),
             self.materials.len(),
             self.environment_primitive_count,
             self.shadow_last_evidence.visible_casters,
@@ -6832,6 +10398,9 @@ impl StaticVulkanApp {
             report.renderer_report.swapchain_image_format,
             readback_format,
             readback_path.as_deref().unwrap_or("none"),
+            self.readback_sequence_out
+                .as_deref()
+                .map_or_else(|| "none".to_string(), |path| path.display().to_string()),
             elapsed_ms(self.startup_timings.mission_assets),
             elapsed_ms(self.startup_timings.terrain_materials),
             elapsed_ms(self.startup_timings.sky),
@@ -6953,6 +10522,11 @@ impl ApplicationHandler for StaticVulkanApp {
             event_loop.exit();
             return;
         }
+        if let Err(error) = self.configure_ambient_effect_draw_ranges(&mut renderer) {
+            self.error = Some(error);
+            event_loop.exit();
+            return;
+        }
         match self.world_draw_sort_keys(self.view_camera.position) {
             Ok(sort_keys) => {
                 for (range_index, sort_key) in sort_keys {
@@ -6972,13 +10546,28 @@ impl ApplicationHandler for StaticVulkanApp {
             }
         }
         self.startup_timings.gpu_initialization = gpu_initialization_started.elapsed();
-        renderer.set_readback_enabled(self.readback_out.is_some());
+        renderer.set_readback_enabled(
+            self.readback_out.is_some() || self.readback_sequence_out.is_some(),
+        );
         self.window_id = Some(window.id());
         self.window = Some(window);
         self.renderer = Some(renderer);
-        self.last_tick = Instant::now();
-        self.simulation_elapsed = Duration::ZERO;
-        self.material_time_ms = 0;
+        self.simulation_last_tick = Instant::now();
+        self.live_clock_paused_for_zero_extent = false;
+        self.pending_scene_update = None;
+        let drawable_size = self
+            .window
+            .as_ref()
+            .map(Window::inner_size)
+            .unwrap_or_default();
+        if let Err(error) = self.update_free_camera(
+            0.0,
+            [drawable_size.width as f32, drawable_size.height as f32],
+        ) {
+            self.error = Some(error);
+            event_loop.exit();
+            return;
+        }
         self.schedule_next_redraw();
     }
 
@@ -7049,25 +10638,27 @@ impl ApplicationHandler for StaticVulkanApp {
                 }
                 if drawable_size.width == 0 || drawable_size.height == 0 {
                     event_loop.set_control_flow(ControlFlow::Wait);
+                    self.pause_live_clock_at(Instant::now());
                 } else {
                     event_loop.set_control_flow(ControlFlow::Poll);
+                    self.resume_live_clock_at(Instant::now());
+                    // The pending simulation sample is reused; its view and
+                    // viewport-dependent geometry refresh before the retry.
                 }
             }
             WindowEvent::RedrawRequested => {
-                if self.lifecycle.pending.is_none() {
+                if self.pending_scene_update.is_none() {
                     return;
                 }
-                let drawable_available = self.window.as_ref().is_some_and(|window| {
-                    let size = window.inner_size();
-                    size.width != 0 && size.height != 0
-                });
-                if drawable_available {
-                    if let Err(error) = self.apply_pending_scene_update() {
-                        self.error = Some(error);
-                        event_loop.exit();
-                        return;
-                    }
+                if let Err(error) = self.render_scene_update() {
+                    self.error = Some(error);
+                    event_loop.exit();
+                    return;
                 }
+                let diagnostic_clock_ms = self
+                    .pending_scene_update
+                    .as_ref()
+                    .map_or(self.simulation_time_ms, |frame| frame.clock.time_ms);
                 let outcome = {
                     let Some(renderer) = self.renderer.as_mut() else {
                         self.error = Some("native Vulkan renderer was not initialized".to_string());
@@ -7078,28 +10669,50 @@ impl ApplicationHandler for StaticVulkanApp {
                 };
                 match outcome {
                     Ok(VulkanSmokeFrameOutcome::Presented) => {
-                        self.lifecycle.record_presented();
-                    }
-                    Ok(VulkanSmokeFrameOutcome::Recreated) => {
-                        if let Some((width, height)) = self
-                            .renderer
-                            .as_ref()
-                            .map(|renderer| renderer.report().swapchain_extent)
-                        {
-                            if width != 0 && height != 0 {
-                                if let Err(error) =
-                                    self.refresh_pending_viewport([width as f32, height as f32])
-                                {
-                                    self.error = Some(error);
+                        let frame_index = self.record_presented_scene_frame();
+                        if let Some(directory) = self.readback_sequence_out.as_deref() {
+                            let artifact = match self
+                                .renderer
+                                .as_mut()
+                                .expect("renderer presented a frame")
+                                .readback_last_submitted_frame()
+                            {
+                                Ok(Some(artifact)) => artifact,
+                                Ok(None) => {
+                                    self.error = Some(
+                                        "native Vulkan renderer produced no synchronized sequence readback"
+                                            .to_string(),
+                                    );
                                     event_loop.exit();
                                     return;
                                 }
+                                Err(error) => {
+                                    self.error =
+                                        Some(format!("read back frame {frame_index}: {error}"));
+                                    event_loop.exit();
+                                    return;
+                                }
+                            };
+                            if let Err(error) = write_readback_sequence_frame(
+                                directory,
+                                frame_index,
+                                diagnostic_clock_ms,
+                                &artifact,
+                            ) {
+                                self.error = Some(error);
+                                event_loop.exit();
+                                return;
                             }
                         }
                     }
+                    Ok(VulkanSmokeFrameOutcome::Recreated) => {}
                     Ok(VulkanSmokeFrameOutcome::ZeroExtent) => {
-                        if !drawable_available {
+                        if self.window.as_ref().is_some_and(|window| {
+                            let size = window.inner_size();
+                            size.width == 0 || size.height == 0
+                        }) {
                             event_loop.set_control_flow(ControlFlow::Wait);
+                            self.pause_live_clock_at(Instant::now());
                         }
                     }
                     Err(err) => {
@@ -7108,11 +10721,8 @@ impl ApplicationHandler for StaticVulkanApp {
                         return;
                     }
                 }
-                if self.target_frames != 0 && self.lifecycle.frames_presented >= self.target_frames
-                {
+                if self.target_frames != 0 && self.frames_presented >= self.target_frames {
                     self.complete(event_loop);
-                } else if drawable_available {
-                    self.schedule_next_redraw();
                 }
             }
             _ => {}
@@ -7128,28 +10738,21 @@ impl ApplicationHandler for StaticVulkanApp {
         };
         let size = window.inner_size();
         if size.width == 0 || size.height == 0 {
+            // Wait for a resize instead of spinning simulation updates while
+            // the window has no drawable surface.
             event_loop.set_control_flow(ControlFlow::Wait);
+            self.pause_live_clock_at(Instant::now());
             return;
         }
         event_loop.set_control_flow(ControlFlow::Poll);
-        if self.lifecycle.pending.is_none() {
-            let viewport = self
-                .captured_viewport
-                .map_or([size.width as f32, size.height as f32], |captured| {
-                    [captured.extent[0] as f32, captured.extent[1] as f32]
-                });
-            let sample = self.sample_frame_clock();
-            let update = match self.prepare_scene_update(sample, viewport) {
-                Ok(update) => update,
-                Err(error) => {
-                    self.error = Some(error);
-                    event_loop.exit();
-                    return;
-                }
-            };
-            if !self.lifecycle.prepare(update) {
-                return;
-            }
+        self.resume_live_clock_at(Instant::now());
+        let clock = self.pending_or_sample_frame_clock();
+        if let Err(error) =
+            self.prepare_scene_update(clock, [size.width as f32, size.height as f32])
+        {
+            self.error = Some(error);
+            event_loop.exit();
+            return;
         }
         self.schedule_next_redraw();
     }
@@ -7164,6 +10767,7 @@ struct Args {
     control_clock_ms: Option<u32>,
     validation: bool,
     readback_out: Option<PathBuf>,
+    readback_sequence_out: Option<PathBuf>,
     preview_roots: NonZeroUsize,
     legacy_camera_capture: Option<PathBuf>,
     static_animation_frame: Option<u16>,
@@ -7182,6 +10786,7 @@ impl Args {
         let mut control_clock_ms = None;
         let mut validation = false;
         let mut readback_out = None;
+        let mut readback_sequence_out = None;
         // A native static-Vulkan invocation is the usable mission preview, so
         // its default scope covers every root. `PreviewRoots` is clamped by the
         // runtime to the decoded mission length; an explicit --preview-roots N
@@ -7245,6 +10850,12 @@ impl Args {
                             .ok_or_else(|| "--readback-out requires a path".to_string())?,
                     );
                 }
+                "--readback-sequence-out" => {
+                    readback_sequence_out =
+                        Some(iter.next().map(PathBuf::from).ok_or_else(|| {
+                            "--readback-sequence-out requires a path".to_string()
+                        })?);
+                }
                 "--preview-roots" => {
                     preview_roots = iter
                         .next()
@@ -7289,6 +10900,12 @@ impl Args {
                     .to_string(),
             );
         }
+        if readback_sequence_out.is_some() && control_clock_ms.is_none() {
+            return Err(
+                "--readback-sequence-out requires --control-clock-ms for a reproducible sequence"
+                    .to_string(),
+            );
+        }
         Ok(Self {
             root,
             mission,
@@ -7297,6 +10914,7 @@ impl Args {
             control_clock_ms,
             validation,
             readback_out,
+            readback_sequence_out,
             preview_roots,
             legacy_camera_capture,
             static_animation_frame,
@@ -7463,300 +11081,283 @@ fn decode_legacy_camera_capture_json(bytes: &[u8]) -> Result<String, String> {
 }
 
 fn usage() -> String {
-    "usage: fparkan-game --root <path> --mission <path> [--frames <n>] [--atmosphere-seconds <seconds>] [--control-clock-ms <u32>] [--validation] [--preview-roots <non-zero n>] [--legacy-camera-capture <path>] [--static-animation-frame <u16>] [--static-material-phase <u16>] [--readback-out <path>]\nstatic preview uses saved per-component CTLD defaults, with uncontrolled nodes at frame 0; --static-animation-frame overrides all components globally. --control-clock-ms replays one shared MSH/material/environment clock from zero to the selected time over --frames frames.".to_string()
+    "usage: fparkan-game --root <path> --mission <path> [--frames <n>] [--atmosphere-seconds <seconds>] [--control-clock-ms <u32>] [--validation] [--preview-roots <non-zero n>] [--legacy-camera-capture <path>] [--static-animation-frame <u16>] [--static-material-phase <u16>] [--readback-out <path>] [--readback-sequence-out <directory>]\nstatic preview uses saved per-component CTLD defaults, with uncontrolled nodes at frame 0; --static-animation-frame overrides all components globally. --control-clock-ms replays one shared MSH/FX clock from zero to the selected time over the requested frames; --readback-sequence-out captures each submitted frame and requires that clock.".to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fparkan_animation::{AnimKey24, Pose};
+    use fparkan_assets::{PreparedControlTimelineRow, PreparedControlTypedRecord};
     use fparkan_fx::environment::{WeatherInput, WeatherState};
-    use fparkan_material::{MaterialAnimationBlock, MaterialKey};
+    use fparkan_msh::{Batch, ModelAnimation, Slot};
+    use fparkan_path::{normalize_relative, PathPolicy};
+    use fparkan_resource::{resource_name, ResourceKey};
 
-    fn material_test_phase(parameters: [u8; 18]) -> MaterialPhase {
-        MaterialPhase {
-            parameters,
-            texture_raw: [0; 16],
-        }
+    fn facing_mesh(
+        batch_flags: u16,
+        positions: &[[f32; 3]],
+    ) -> (VulkanStaticMesh, VulkanStaticDrawRange) {
+        let range = VulkanStaticDrawRange {
+            first_index: 0,
+            index_count: u32::try_from(positions.len()).expect("fixture length fits u32"),
+            material_index: 0,
+            lightmap_index: 0,
+            batch_flags,
+            pipeline_state: LegacyPipelineState::default(),
+            terrain_base_only: false,
+            alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
+        };
+        let mesh = VulkanStaticMesh {
+            vertices: positions
+                .iter()
+                .copied()
+                .map(|position| VulkanStaticVertex {
+                    position,
+                    color: [1.0; 3],
+                    normal: [0.0, 0.0, 1.0],
+                    uv: [0.0; 2],
+                    detail_uv: [0.0; 2],
+                    overlay_alpha: 0.0,
+                })
+                .collect(),
+            indices: (0..positions.len())
+                .map(|index| u32::try_from(index).expect("fixture index fits u32"))
+                .collect(),
+            draw_ranges: vec![range],
+        };
+        (mesh, range)
     }
 
-    fn random_material_binding(range_index: usize) -> MaterialAnimationBinding {
-        let mut overlay_phase = [0; 18];
-        overlay_phase[..3].copy_from_slice(&[100, 50, 25]);
-        overlay_phase[3] = 25;
-        overlay_phase[4..7].copy_from_slice(&[30, 60, 90]);
-        overlay_phase[8..11].copy_from_slice(&[40, 80, 120]);
-        overlay_phase[16] = 5;
-        let mut active_phase = [0; 18];
-        active_phase[..3].copy_from_slice(&[25, 50, 75]);
-        active_phase[3] = 75;
-        active_phase[4..7].copy_from_slice(&[64, 128, 192]);
-        active_phase[8..11].copy_from_slice(&[100, 150, 200]);
-        active_phase[16] = 9;
-        active_phase[17] = 1;
-        let document = Mat0Document {
-            version: 0,
-            animation_block_count: 1,
-            phases: vec![
-                material_test_phase(overlay_phase),
-                material_test_phase(active_phase),
-            ],
-            prefix: Vec::new(),
-            header_opaque: [0; 2],
-            animation_blocks: vec![MaterialAnimationBlock {
-                header_raw: 3,
-                keys: vec![
-                    MaterialKey {
-                        k0: 0,
-                        k1: 20,
-                        k2: 0,
-                    },
-                    MaterialKey {
-                        k0: 1,
-                        k1: 40,
-                        k2: 0,
-                    },
-                ],
-                bytes: Vec::new(),
-            }],
-        };
-        let frozen_binding = |phase_index: usize, uv_transform: [f32; 4]| MaterialPhaseBinding {
-            document: document.clone(),
-            animation_block_index: 0,
-            wear_row_start_ms: 0,
-            random_state: 0,
-            frozen_phase_index: Some(phase_index),
-            phase_uv_transforms: vec![uv_transform; 2],
-        };
-        let texture = solid_environment_texture([255; 4]);
-        MaterialAnimationBinding {
-            initial_phase_index: 0,
-            variants: vec![MaterialVariantSet {
-                phase_material_indices: vec![4, 5],
-                range_indices: vec![range_index],
-            }],
-            base: MaterialPhaseBinding {
-                document: document.clone(),
-                animation_block_index: 0,
-                wear_row_start_ms: 0,
-                random_state: 0,
-                frozen_phase_index: None,
-                phase_uv_transforms: vec![[0.0, 0.0, 0.5, 0.5], [0.5, 0.25, 0.25, 0.5]],
-            },
-            detail: Some(frozen_binding(1, [0.1, 0.2, 0.3, 0.4])),
-            overlay: Some(frozen_binding(0, [0.3, 0.4, 0.5, 0.6])),
-            overlay_detail: Some(frozen_binding(1, [0.6, 0.7, 0.8, 0.9])),
-            stage_textures: Some(MaterialStageTextures {
-                detail: Some(vec![texture.clone(), texture.clone()]),
-                overlay: Some(vec![texture.clone()]),
-                overlay_detail: Some(vec![texture.clone(), texture]),
-                applied_material_phases: HashMap::from([(5, [1, 0, 1])]),
-            }),
-        }
+    fn native_front_triangle() -> [[f32; 3]; 3] {
+        [[-0.2, -0.2, -1.0], [0.2, -0.2, -1.0], [0.0, 0.2, -1.0]]
     }
 
-    fn packet_test_materials() -> Vec<VulkanStaticMaterial> {
-        let mut materials = Vec::new();
-        for _ in 0..6 {
-            append_environment_gradient_material(&mut materials).expect("test material");
-        }
-        materials[4].pipeline_category = 1;
-        materials[5].pipeline_category = 3;
-        materials
+    fn camera_face_triangle(camera: PreviewCameraFrame, mirror: bool) -> [[f32; 3]; 3] {
+        let center = add3(camera.position, scale3(camera.forward, 10.0));
+        let mirror = if mirror { -1.0 } else { 1.0 };
+        [
+            add3(
+                add3(center, scale3(camera.right, -2.0 * mirror)),
+                scale3(camera.up, -2.0),
+            ),
+            add3(
+                add3(center, scale3(camera.right, 2.0 * mirror)),
+                scale3(camera.up, -2.0),
+            ),
+            add3(center, scale3(camera.up, 2.0)),
+        ]
+    }
+
+    fn projected_vulkan_area(camera: PreviewCameraFrame, triangle: [[f32; 3]; 3]) -> f32 {
+        let screen = triangle.map(|point| {
+            let clip =
+                row_vector_transform([point[0], point[1], point[2], 1.0], camera.clip_from_world);
+            assert!(clip[3] > 0.0 && clip.iter().all(|value| value.is_finite()));
+            // This is the positive-height viewport transform used by the Vulkan renderer.
+            [
+                (clip[0] / clip[3] + 1.0) * 0.5,
+                (clip[1] / clip[3] + 1.0) * 0.5,
+            ]
+        });
+        let shoelace = (0..3)
+            .map(|index| {
+                let next = (index + 1) % 3;
+                screen[index][0] * screen[next][1] - screen[next][0] * screen[index][1]
+            })
+            .sum::<f32>()
+            * 0.5;
+        // Vulkan's framebuffer signed-area definition is the negative shoelace area.
+        -shoelace
     }
 
     #[test]
-    fn sampled_material_packet_keeps_native_selector_properties_and_stage_phases() {
-        let materials = packet_test_materials();
-        let mut bindings = vec![random_material_binding(7)];
-        let packet = sample_material_animations(&mut bindings, &materials, 500)
-            .expect("sample random MAT0 state");
-
-        assert_eq!(
-            packet.range_selections,
-            vec![MaterialRangeSelection {
-                range_index: 7,
-                material_index: 5,
-                pipeline_category: 3,
-            }]
-        );
-        assert_eq!(
-            packet.active_materials.get(&7),
-            Some(&ActiveMaterialState {
-                material_index: 5,
-                diffuse_alpha: 0.75,
-            })
-        );
-        let properties = packet.properties[0];
-        assert_eq!(
-            (properties.diffuse_alpha, properties.overlay_alpha),
-            (0.75, 0.25)
-        );
-        assert_eq!(
-            (properties.base_directional, properties.base_additive),
-            (
-                [64.0 / 255.0, 128.0 / 255.0, 192.0 / 255.0],
-                [25.0 / 255.0, 50.0 / 255.0, 75.0 / 255.0],
-            )
-        );
-        assert_eq!(
-            (properties.overlay_directional, properties.overlay_additive),
-            (
-                Some([30.0 / 255.0, 60.0 / 255.0, 90.0 / 255.0]),
-                Some([100.0 / 255.0, 50.0 / 255.0, 25.0 / 255.0]),
-            )
-        );
-        assert_eq!(
-            (properties.specular_rgb, properties.specular_power),
-            ([100.0 / 255.0, 150.0 / 255.0, 200.0 / 255.0], 9)
-        );
-        assert_eq!(
-            (properties.overlay_specular_rgb, properties.overlay_power),
-            (Some([40.0 / 255.0, 80.0 / 255.0, 120.0 / 255.0]), Some(5))
-        );
-        assert_eq!(
-            properties.uv_transforms,
-            [
-                [0.5, 0.25, 0.25, 0.5],
-                [0.1, 0.2, 0.3, 0.4],
-                [0.3, 0.4, 0.5, 0.6],
-                [0.6, 0.7, 0.8, 0.9],
-            ]
-        );
-        assert_eq!(
-            packet.stage_phases,
-            vec![MaterialStagePhaseUpdate {
-                binding_index: 0,
-                material_index: 5,
-                phases: [1, 0, 1],
-            }]
-        );
-        assert_eq!(bindings[0].base.random_state, 2_531_011);
-    }
-
-    fn control_pose_test_model() -> ModelAsset {
-        let mut nodes = vec![u8::MAX; 38];
-        nodes[..2].copy_from_slice(&[0, 0]);
-        nodes[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
-        nodes[4..6].copy_from_slice(&0_u16.to_le_bytes());
-        nodes[6..8].copy_from_slice(&1_u16.to_le_bytes());
-        ModelAsset {
-            node_stride: 38,
-            node_count: 1,
-            nodes_raw: nodes,
-            bounding_sphere_center: [0.0; 3],
-            bounding_sphere_radius: 1.0,
-            slots: vec![],
-            positions: vec![],
-            normals: None,
-            uv0: None,
-            uv1: None,
-            type16_present: false,
-            indices: vec![],
-            batches: vec![],
-            triangle_descriptors: None,
-            node_names: None,
-            animation: Some(fparkan_msh::ModelAnimation {
-                keys: vec![
-                    fparkan_animation::AnimKey24 {
-                        time: AnimationTime(0.0),
-                        pose: fparkan_animation::Pose::default(),
-                    },
-                    fparkan_animation::AnimKey24 {
-                        time: AnimationTime(1.0),
-                        pose: fparkan_animation::Pose {
-                            translation: [0.0, 2.0, 0.0],
-                            rotation: [0.0, 0.0, 0.0, 1.0],
-                        },
-                    },
-                ],
-                frame_map: vec![0, 1],
-                frame_count: 2,
-            }),
-        }
-    }
-
-    fn control_pose_drawable_test_model() -> ModelAsset {
-        let mut model = control_pose_test_model();
-        model.nodes_raw[8..10].copy_from_slice(&0_u16.to_le_bytes());
-        model.slots = vec![fparkan_msh::Slot {
-            tri_start: 0,
-            tri_count: 1,
-            batch_start: 0,
-            batch_count: 1,
-            aabb_min: [0.0; 3],
-            aabb_max: [1.0; 3],
-            sphere_center: [0.0; 3],
-            sphere_radius: 1.0,
-            opaque: [0; 5],
-        }];
-        model.positions = vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        model.normals = Some(vec![[0, 0, 127, 0]; 3]);
-        model.uv0 = Some(vec![[0, 0]; 3]);
-        model.uv1 = None;
-        model.indices = vec![0, 1, 2];
-        model.batches = vec![fparkan_msh::Batch {
-            batch_flags: 0,
-            material_index_hi: 0,
-            material_index: 0,
-            lightmap_index: u8::MAX,
-            local_batch_index: 0,
-            index_count: 3,
-            index_start: 0,
-            vertex_count: 3,
-            base_vertex: 0,
-        }];
-        model
-    }
-
-    fn control_pose_test_control() -> PreparedComponentControl {
-        let mut fixed_words = [0; 44];
-        fixed_words[2] = 0;
-        fixed_words[6] = u32::MAX;
-        fixed_words[9] = 1.0_f32.to_bits();
-        fixed_words[10] = 1.0_f32.to_bits();
-        let archive = || {
-            fparkan_path::normalize_relative(b"test.rlb", fparkan_path::PathPolicy::HostCompatible)
-                .expect("test archive path")
+    fn native_msh_cull_mode_matches_legacy_and_free_flight_camera_projection() {
+        let identity = RawCameraTransform {
+            words: [
+                1.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                1.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                1.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                0.0_f32.to_bits(),
+                1.0_f32.to_bits(),
+            ],
         };
-        PreparedComponentControl {
-            source: fparkan_resource::ResourceKey {
-                archive: archive(),
-                name: ResourceName(b"animated.ctl".to_vec()),
-                type_id: None,
-            },
-            model_node_count: 1,
-            native_profile_words: [0; 27],
-            bindings: vec![],
-            timeline_rows: vec![fparkan_assets::PreparedControlTimelineRow {
-                row_index: 0,
-                node_index: 0,
-                frame_a: 0.0,
-                frame_b: 1.0,
-                initial_blend: 0.0,
-                raw_parameters: [u32::MAX, u32::MAX, 1.0_f32.to_bits(), 0],
-                flags: 0,
-            }],
-            typed_records: vec![fparkan_assets::PreparedControlTypedRecord {
-                tag: 21,
-                fixed_words,
-                values: vec![0],
-                string_bytes: vec![],
-                gate_provider: PreparedControlGateProvider::Resolved {
-                    key: 0,
-                    ndp_source: fparkan_resource::ResourceKey {
-                        archive: archive(),
-                        name: ResourceName(b"animated.ndp".to_vec()),
-                        type_id: None,
-                    },
-                    row_count: 1,
-                    initial_type1_value: 1.0,
-                },
-            }],
-            node_data: None,
-            effect_section: fparkan_assets::PreparedControlEffectSection::Absent,
-            initial_effect_group: None,
-            point_list: None,
+        let projection = LegacyD3d7Projection {
+            viewport: [0, 0, 1280, 1024],
+            near_plane: 0.5,
+            far_plane: 700.0,
+            field_of_view_radians: 1.3,
+        };
+        let legacy = PreviewCameraFrame::from_legacy_d3d7(identity, projection)
+            .expect("valid legacy camera projection");
+        let free_flight = FreeFlightCamera {
+            position: legacy.position,
+            yaw: 0.0,
+            pitch: 0.0,
+            horizontal_fov: 1.3,
+            near_plane: 0.5,
+            far_plane: 700.0,
+            move_speed: 1.0,
+            ground_clearance: 0.0,
         }
+        .preview_frame(1280.0 / 1024.0);
+
+        for camera in [legacy, free_flight] {
+            let front = camera_face_triangle(camera, false);
+            let back = [front[0], front[2], front[1]];
+            let front_d = dot3(
+                sub3(camera.position, front[0]),
+                cross3(sub3(front[1], front[0]), sub3(front[2], front[0])),
+            );
+            let back_d = dot3(
+                sub3(camera.position, back[0]),
+                cross3(sub3(back[1], back[0]), sub3(back[2], back[0])),
+            );
+            assert!(front_d > 0.0);
+            assert!(back_d < 0.0);
+
+            let front_vk_area = projected_vulkan_area(camera, front);
+            let back_vk_area = projected_vulkan_area(camera, back);
+            // Vulkan CLOCKWISE front faces have negative framebuffer area.
+            // The native-visible d>0 face is therefore a Vulkan back face.
+            assert!(front_vk_area > 0.0, "front area: {front_vk_area}");
+            assert!(back_vk_area < 0.0, "back area: {back_vk_area}");
+            assert_eq!(native_msh_cull_mode(0, 1), LegacyCullMode::FrontFace);
+
+            let mirrored_front = camera_face_triangle(camera, true);
+            let mirrored_d = dot3(
+                sub3(camera.position, mirrored_front[0]),
+                cross3(
+                    sub3(mirrored_front[1], mirrored_front[0]),
+                    sub3(mirrored_front[2], mirrored_front[0]),
+                ),
+            );
+            assert!(mirrored_d < 0.0);
+            assert!(projected_vulkan_area(camera, mirrored_front) < 0.0);
+            assert_eq!(native_msh_cull_mode(0, -1), LegacyCullMode::BackFace);
+        }
+    }
+
+    #[test]
+    fn native_msh_handedness_uses_full_placement_transform_and_handles_singular_scale() {
+        let rotated = LegacyIron3dEulerTransform {
+            translation: [8.0, -4.0, 3.0],
+            orientation_radians: [0.4, -0.7, 1.2],
+        };
+        assert_eq!(native_msh_handedness(rotated, [2.0, 3.0, 4.0]), 1);
+        assert_eq!(native_msh_handedness(rotated, [-2.0, 3.0, 4.0]), -1);
+        assert_eq!(native_msh_handedness(rotated, [0.0, 3.0, 4.0]), 0);
+        assert_eq!(native_msh_cull_mode(0, 0), LegacyCullMode::Disabled);
+    }
+
+    #[test]
+    fn native_msh_4000_samples_only_first_triangle_and_raw_two_sided_bypasses_it() {
+        let front = native_front_triangle();
+        let back = front.map(|point| [-point[0], point[1], point[2]]);
+        let front_then_back = [front[0], front[1], front[2], back[0], back[1], back[2]];
+        let (mesh, range) = facing_mesh(0x4000, &front_then_back);
+        assert!(native_msh_first_triangle_visible(
+            &mesh, &range, [0.0; 3], 1
+        ));
+
+        let back_then_front = [back[0], back[1], back[2], front[0], front[1], front[2]];
+        let (mesh, range) = facing_mesh(0x4000, &back_then_front);
+        assert!(!native_msh_first_triangle_visible(
+            &mesh, &range, [0.0; 3], 1
+        ));
+
+        let (mesh, range) = facing_mesh(0x4002, &back_then_front);
+        assert!(native_msh_first_triangle_visible(
+            &mesh, &range, [0.0; 3], 1
+        ));
+        assert_eq!(
+            native_msh_cull_mode(range.batch_flags, 1),
+            LegacyCullMode::Disabled
+        );
+    }
+
+    #[test]
+    fn world_draw_range_count_restores_after_alpha_and_msh_facing_changes() {
+        let triangle = native_front_triangle();
+        let (mesh, range) = facing_mesh(0x4000, &triangle);
+        let original_count = range.index_count;
+
+        assert_eq!(
+            world_draw_range_index_count(&mesh, &range, original_count, 0.0, [0.0; 3], Some(1)),
+            0
+        );
+        assert_eq!(
+            world_draw_range_index_count(
+                &mesh,
+                &range,
+                original_count,
+                1.0,
+                [0.0, 0.0, -2.0],
+                Some(1),
+            ),
+            0
+        );
+        assert_eq!(
+            world_draw_range_index_count(&mesh, &range, original_count, 1.0, [0.0; 3], Some(1)),
+            original_count
+        );
+        assert_eq!(
+            world_draw_range_index_count(
+                &mesh,
+                &range,
+                original_count,
+                1.0,
+                [0.0, 0.0, -2.0],
+                None,
+            ),
+            original_count
+        );
+    }
+
+    #[test]
+    fn world_draw_range_count_clears_and_reapplies_constant_alpha_override() {
+        let triangle = native_front_triangle();
+        let (mesh, mut range) = facing_mesh(0x0148, &triangle);
+        let original_count = range.index_count;
+        let mut alpha_override = None;
+        let update = |range: &VulkanStaticDrawRange, alpha_override: &mut Option<f32>| {
+            *alpha_override = native_msh_diffuse_alpha_override(range.batch_flags, false);
+            world_draw_range_index_count(
+                &mesh,
+                range,
+                original_count,
+                alpha_override.unwrap_or(1.0),
+                [0.0; 3],
+                None,
+            )
+        };
+
+        assert_eq!(update(&range, &mut alpha_override), 0);
+        range.batch_flags = 0x0108;
+        assert_eq!(update(&range, &mut alpha_override), original_count);
+        range.batch_flags = 0x0148;
+        assert_eq!(update(&range, &mut alpha_override), 0);
+        assert_eq!(original_count, 3);
+    }
+
+    fn identity_matrix() -> [[f32; 4]; 4] {
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
     }
 
     fn node38_fixture(parent: u16, map_start: u16, fallback: u16, drawable: bool) -> Vec<u8> {
@@ -7772,6 +11373,127 @@ mod tests {
         node
     }
 
+    fn animated_socket_model() -> ModelAsset {
+        let mut nodes = node38_fixture(u16::MAX, 0, 1, true);
+        nodes.extend(node38_fixture(0, u16::MAX, 2, false));
+        ModelAsset {
+            node_stride: 38,
+            node_count: 2,
+            nodes_raw: nodes,
+            bounding_sphere_center: [0.0; 3],
+            bounding_sphere_radius: 2.0,
+            slots: vec![Slot {
+                tri_start: 0,
+                tri_count: 1,
+                batch_start: 0,
+                batch_count: 1,
+                aabb_min: [-1.0; 3],
+                aabb_max: [1.0; 3],
+                sphere_center: [0.0; 3],
+                sphere_radius: 1.0,
+                opaque: [0; 5],
+            }],
+            positions: vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            normals: Some(vec![[127, 0, 0, 0]; 3]),
+            uv0: None,
+            uv1: None,
+            type16_present: false,
+            indices: vec![0, 1, 2],
+            batches: vec![Batch {
+                batch_flags: 0,
+                material_index_hi: 0,
+                material_index: 0,
+                lightmap_index: 0,
+                local_batch_index: 0,
+                index_count: 3,
+                index_start: 0,
+                vertex_count: 3,
+                base_vertex: 0,
+            }],
+            triangle_descriptors: None,
+            node_names: None,
+            animation: Some(ModelAnimation {
+                keys: vec![
+                    AnimKey24 {
+                        time: AnimationTime(0.0),
+                        pose: Pose::default(),
+                    },
+                    AnimKey24 {
+                        time: AnimationTime(1.0),
+                        pose: Pose {
+                            translation: [0.0; 3],
+                            rotation: [
+                                0.0,
+                                0.0,
+                                std::f32::consts::FRAC_1_SQRT_2,
+                                std::f32::consts::FRAC_1_SQRT_2,
+                            ],
+                        },
+                    },
+                    AnimKey24 {
+                        time: AnimationTime(0.0),
+                        pose: Pose {
+                            translation: [0.0, 2.0, 0.0],
+                            rotation: [0.0, 0.0, 0.0, 1.0],
+                        },
+                    },
+                ],
+                frame_map: vec![0, 1],
+                frame_count: 2,
+            }),
+        }
+    }
+
+    fn static_child_model() -> ModelAsset {
+        let mut nodes = node38_fixture(u16::MAX, u16::MAX, 0, false);
+        nodes.extend(node38_fixture(0, u16::MAX, 0, true));
+        ModelAsset {
+            node_stride: 38,
+            node_count: 2,
+            nodes_raw: nodes,
+            bounding_sphere_center: [0.0; 3],
+            bounding_sphere_radius: 1.0,
+            slots: vec![Slot {
+                tri_start: 0,
+                tri_count: 1,
+                batch_start: 0,
+                batch_count: 1,
+                aabb_min: [-1.0; 3],
+                aabb_max: [1.0; 3],
+                sphere_center: [0.0; 3],
+                sphere_radius: 1.0,
+                opaque: [0; 5],
+            }],
+            positions: vec![[0.0, 0.0, 0.0]; 3],
+            normals: Some(vec![[0, 0, 127, 0]; 3]),
+            uv0: None,
+            uv1: None,
+            type16_present: false,
+            indices: vec![0, 1, 2],
+            batches: vec![Batch {
+                batch_flags: 0,
+                material_index_hi: 0,
+                material_index: 0,
+                lightmap_index: 0,
+                local_batch_index: 0,
+                index_count: 3,
+                index_start: 0,
+                vertex_count: 3,
+                base_vertex: 0,
+            }],
+            triangle_descriptors: None,
+            node_names: None,
+            animation: Some(ModelAnimation {
+                keys: vec![AnimKey24 {
+                    time: AnimationTime(0.0),
+                    pose: Pose::default(),
+                }],
+                frame_map: vec![],
+                frame_count: 0,
+            }),
+        }
+    }
+
     fn collision_fixture_model(root_drawable: bool) -> ModelAsset {
         let mut nodes = node38_fixture(u16::MAX, u16::MAX, 0, root_drawable);
         nodes.extend(node38_fixture(0, 0, 1, true));
@@ -7781,7 +11503,7 @@ mod tests {
             nodes_raw: nodes,
             bounding_sphere_center: [0.0; 3],
             bounding_sphere_radius: 3.0,
-            slots: vec![fparkan_msh::Slot {
+            slots: vec![Slot {
                 tri_start: 0,
                 tri_count: 1,
                 batch_start: 0,
@@ -7798,7 +11520,7 @@ mod tests {
             uv1: None,
             type16_present: false,
             indices: vec![0, 1, 2],
-            batches: vec![fparkan_msh::Batch {
+            batches: vec![Batch {
                 batch_flags: 0,
                 material_index_hi: 0,
                 material_index: 0,
@@ -7815,15 +11537,15 @@ mod tests {
                 normal: [0, 32767, 0],
             }]),
             node_names: None,
-            animation: Some(fparkan_msh::ModelAnimation {
+            animation: Some(ModelAnimation {
                 keys: vec![
-                    fparkan_animation::AnimKey24 {
+                    AnimKey24 {
                         time: AnimationTime(0.0),
-                        pose: fparkan_animation::Pose::default(),
+                        pose: Pose::default(),
                     },
-                    fparkan_animation::AnimKey24 {
+                    AnimKey24 {
                         time: AnimationTime(1.0),
-                        pose: fparkan_animation::Pose {
+                        pose: Pose {
                             translation: [20.0, 0.0, 0.0],
                             rotation: [0.0, 0.0, 0.0, 1.0],
                         },
@@ -7832,6 +11554,78 @@ mod tests {
                 frame_map: vec![0, 1],
                 frame_count: 2,
             }),
+        }
+    }
+
+    #[test]
+    fn mounted_static_building_binding_matches_renderer_and_hides_root_node() {
+        let model = collision_fixture_model(true);
+        let binding = building_collision_binding(
+            4,
+            5,
+            "static fixture model".to_string(),
+            Arc::new(model.clone()),
+            LegacyIron3dEulerTransform {
+                translation: [13.0, -4.0, 9.0],
+                orientation_radians: [0.4, -0.3, 0.7],
+            },
+            [2.0, 3.0, 0.5],
+            true,
+        )
+        .expect("static building geometry still creates a collision binding");
+        assert_eq!(
+            binding.selected_nodes,
+            vec![(fparkan_msh::NodeId(1), fparkan_msh::SlotId(0))]
+        );
+
+        let root = VulkanNodePose {
+            translation: [1.0, 2.0, 3.0],
+            rotation: [0.0, 0.0, 0.29552022, 0.9553365],
+        };
+        let moving_node = compose_unit_pose(
+            root,
+            VulkanNodePose {
+                translation: [2.0, -1.0, 0.5],
+                rotation: [0.0, 0.19866933, 0.0, 0.9800666],
+            },
+        );
+        let hierarchy = NodePoseBuffer {
+            poses: [root, moving_node]
+                .into_iter()
+                .map(|pose| Pose {
+                    translation: pose.translation,
+                    rotation: pose.rotation,
+                })
+                .collect(),
+        };
+        let mount = VulkanNodePose {
+            translation: [5.0, 7.0, 11.0],
+            rotation: [0.0, 0.0, 0.38268343, 0.9238795],
+        };
+        let nodes = building_collision_nodes(&binding, Some(&hierarchy), Some(mount))
+            .expect("mounted collision matrices");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].node, fparkan_msh::NodeId(1));
+
+        let projected = project_msh_to_static_mesh_in_world_space_with_node_pose_buffer_and_mount(
+            &model,
+            binding.root_transform,
+            binding.owner_scale,
+            &hierarchy,
+            mount,
+        )
+        .expect("mounted renderer projection");
+        assert_eq!(projected.vertices.len(), 3);
+        for (actual, source) in projected.vertices.iter().zip(&model.positions) {
+            let matrix = nodes[0].world_from_node;
+            let expected = [
+                matrix[0] * source[0] + matrix[1] * source[1] + matrix[2] * source[2] + matrix[3],
+                matrix[4] * source[0] + matrix[5] * source[1] + matrix[6] * source[2] + matrix[7],
+                matrix[8] * source[0] + matrix[9] * source[1] + matrix[10] * source[2] + matrix[11],
+            ];
+            for axis in 0..3 {
+                assert!((actual.position[axis] - expected[axis]).abs() < 1.0e-4);
+            }
         }
     }
 
@@ -7844,7 +11638,7 @@ mod tests {
             nodes_raw: nodes,
             bounding_sphere_center: [0.0; 3],
             bounding_sphere_radius: 5.0,
-            slots: vec![fparkan_msh::Slot {
+            slots: vec![Slot {
                 tri_start: 0,
                 tri_count: 4,
                 batch_start: 0,
@@ -7870,7 +11664,7 @@ mod tests {
             uv1: None,
             type16_present: false,
             indices: vec![0, 3, 2, 0, 2, 1, 4, 7, 6, 4, 6, 5],
-            batches: vec![fparkan_msh::Batch {
+            batches: vec![Batch {
                 batch_flags: 0,
                 material_index_hi: 0,
                 material_index: 0,
@@ -7891,10 +11685,10 @@ mod tests {
                     .collect(),
             ),
             node_names: None,
-            animation: Some(fparkan_msh::ModelAnimation {
-                keys: vec![fparkan_animation::AnimKey24 {
+            animation: Some(ModelAnimation {
+                keys: vec![AnimKey24 {
                     time: AnimationTime(0.0),
-                    pose: fparkan_animation::Pose::default(),
+                    pose: Pose::default(),
                 }],
                 frame_map: Vec::new(),
                 frame_count: 0,
@@ -7902,47 +11696,30 @@ mod tests {
         }
     }
 
-    fn collision_test_terrain() -> Arc<TerrainWorld> {
-        let mut land = fparkan_terrain_format::LandMeshDocument {
-            streams: Vec::new(),
-            nodes_raw: Vec::new(),
-            slots: fparkan_terrain_format::TerrainSlotTable {
-                header_raw: Vec::new(),
-                slots_raw: Vec::new(),
-            },
-            positions: vec![
-                [-100.0, -100.0, 0.0],
-                [100.0, -100.0, 0.0],
-                [0.0, 100.0, 0.0],
-            ],
-            normals: Vec::new(),
-            uv0: Vec::new(),
-            accelerator: Vec::new(),
-            aux14: Vec::new(),
-            aux18: Vec::new(),
-            faces: vec![fparkan_terrain_format::TerrainFace28 {
-                flags: FullSurfaceMask(1),
-                material_tag: 0,
-                aux_tag: 0,
-                vertices: [0, 1, 2],
-                neighbors: [None, None, None],
-                tail_raw: [0; 8],
-                raw: [0; 28],
-            }],
-        };
-        set_test_terrain_lod0_range(&mut land);
-        Arc::new(TerrainWorld::from_land_msh(&land).expect("collision test terrain"))
-    }
-
     fn collision_test_app(
         model: Arc<ModelAsset>,
         root_transform: LegacyIron3dEulerTransform,
         position: [f32; 3],
     ) -> StaticVulkanApp {
+        let (mut app, _) = clock_test_app(None);
         let hierarchy = static_preview_component_pose_buffer(&model, &[], None)
             .expect("fixture static preview pose")
             .expect("fixture Node38 pose");
-        let camera = FreeFlightCamera {
+        app.component_pose_buffers = vec![vec![Some(hierarchy)]];
+        app.component_mount_poses = vec![vec![None]];
+        app.dynamic_component_geometry = vec![vec![None]];
+        app.control_animation_instances = vec![vec![None]];
+        app.building_collision_bindings = vec![building_collision_binding(
+            0,
+            0,
+            "collision fixture".to_string(),
+            Arc::clone(&model),
+            root_transform,
+            [1.0; 3],
+            false,
+        )
+        .expect("fixture building collision binding")];
+        app.free_camera = Some(FreeFlightCamera {
             position,
             yaw: -std::f32::consts::FRAC_PI_2,
             pitch: 0.0,
@@ -7951,140 +11728,9 @@ mod tests {
             far_plane: 700.0,
             move_speed: 60.0,
             ground_clearance: 0.0,
-        };
-        let view_camera = camera.preview_frame(16.0 / 9.0);
-        let preview = StaticPreviewScene {
-            mesh: VulkanStaticMesh {
-                vertices: Vec::new(),
-                indices: Vec::new(),
-                draw_ranges: Vec::new(),
-            },
-            native_handedness_by_range: HashMap::new(),
-            type16_present_ranges: HashSet::new(),
-            materials: Vec::new(),
-            material_animations: Vec::new(),
-            sun_occlusion_range_indices: Vec::new(),
-            shadow_casters: Vec::new(),
-            shadow_sphere_baselines: Vec::new(),
-            shadow_receivers: Vec::new(),
-            shadow_material_index: 0,
-            terrain: collision_test_terrain(),
-            component_pose_buffers: vec![vec![Some(hierarchy)]],
-            component_mount_poses: vec![vec![None]],
-            control_animation_instances: Vec::new(),
-            dynamic_component_geometry: Vec::new(),
-            building_collision_bindings: vec![building_collision_binding(
-                0,
-                0,
-                "collision fixture".to_string(),
-                Arc::clone(&model),
-                root_transform,
-                [1.0; 3],
-                false,
-            )
-            .expect("fixture building collision binding")],
-            dynamic_component_mounts: Vec::new(),
-            shadow_caster_indices_by_object: vec![None],
-            camera: view_camera.vulkan_camera(),
-            view_camera,
-            captured_viewport: None,
-            free_camera: Some(camera),
-            camera_mode: "test",
-            mesh_components: 0,
-            terrain_components: 0,
-        };
-        let mut app = StaticVulkanApp::new(
-            preview,
-            None,
-            None,
-            EnvironmentGpuRange {
-                range_index: usize::MAX,
-                vertex_start: 0,
-                vertex_capacity: 0,
-                material_index: 0,
-            },
-            0,
-            0,
-            None,
-            0,
-            None,
-            "collision-test",
-            1,
-            None,
-            false,
-            StartupTimings::default(),
-        );
+        });
         app.pressed_keys.insert(KeyCode::KeyW);
         app
-    }
-
-    #[test]
-    fn mounted_static_building_binding_matches_renderer_and_hides_root_node() {
-        let model = collision_fixture_model(true);
-        let binding = building_collision_binding(
-            4,
-            5,
-            "static fixture model".to_string(),
-            Arc::new(model.clone()),
-            LegacyIron3dEulerTransform {
-                translation: [13.0, -4.0, 9.0],
-                orientation_radians: [0.4, -0.3, 0.7],
-            },
-            [2.0, 3.0, 0.5],
-            true,
-        )
-        .expect("static building collision binding");
-        assert_eq!(binding.selected_nodes, vec![(NodeId(1), SlotId(0))]);
-
-        let root = VulkanNodePose {
-            translation: [1.0, 2.0, 3.0],
-            rotation: [0.0, 0.0, 0.29552022, 0.9553365],
-        };
-        let child = compose_unit_pose(
-            root,
-            VulkanNodePose {
-                translation: [2.0, -1.0, 0.5],
-                rotation: [0.0, 0.19866933, 0.0, 0.9800666],
-            },
-        );
-        let hierarchy = NodePoseBuffer {
-            poses: [root, child]
-                .into_iter()
-                .map(|pose| fparkan_animation::Pose {
-                    translation: pose.translation,
-                    rotation: pose.rotation,
-                })
-                .collect(),
-        };
-        let mount = VulkanNodePose {
-            translation: [5.0, 7.0, 11.0],
-            rotation: [0.0, 0.0, 0.38268343, 0.9238795],
-        };
-        let nodes = building_collision_nodes(&binding, Some(&hierarchy), Some(mount))
-            .expect("mounted collision matrices");
-        assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0].node, NodeId(1));
-
-        let projected = project_msh_to_static_mesh_in_world_space_with_node_pose_buffer_and_mount(
-            &model,
-            binding.root_transform,
-            binding.owner_scale,
-            &hierarchy,
-            mount,
-        )
-        .expect("mounted renderer projection");
-        assert_eq!(projected.vertices.len(), 3);
-        for (actual, source) in projected.vertices.iter().zip(&model.positions) {
-            let matrix = nodes[0].world_from_node;
-            let expected = [
-                matrix[0] * source[0] + matrix[1] * source[1] + matrix[2] * source[2] + matrix[3],
-                matrix[4] * source[0] + matrix[5] * source[1] + matrix[6] * source[2] + matrix[7],
-                matrix[8] * source[0] + matrix[9] * source[1] + matrix[10] * source[2] + matrix[11],
-            ];
-            for axis in 0..3 {
-                assert!((actual.position[axis] - expected[axis]).abs() < 1.0e-4);
-            }
-        }
     }
 
     #[test]
@@ -8179,27 +11825,25 @@ mod tests {
         .expect("second placed building");
         assert!(Arc::ptr_eq(&far.model, &near.model));
 
-        let mut app = collision_test_app(
-            Arc::clone(&model),
-            LegacyIron3dEulerTransform {
-                translation: [0.0, 100.0, 0.0],
-                orientation_radians: [0.0; 3],
-            },
-            [0.0, 8.0, 0.0],
-        );
+        let (mut app, _) = clock_test_app(None);
         let hierarchy = static_preview_component_pose_buffer(&model, &[], None)
-            .expect("fixture static pose")
-            .expect("fixture Node38 pose");
+            .expect("shared fixture static pose")
+            .expect("shared fixture Node38 pose");
         app.component_pose_buffers = vec![vec![Some(hierarchy.clone())], vec![Some(hierarchy)]];
         app.component_mount_poses = vec![vec![None], vec![None]];
         app.building_collision_bindings = vec![far, near];
+        app.free_camera.as_mut().unwrap().position = [0.0, 8.0, 0.0];
+        app.free_camera.as_mut().unwrap().yaw = -std::f32::consts::FRAC_PI_2;
+        app.free_camera.as_mut().unwrap().pitch = 0.0;
+        app.free_camera.as_mut().unwrap().move_speed = 60.0;
+        app.pressed_keys.insert(KeyCode::KeyW);
         app.update_free_camera(0.1, [1280.0, 720.0])
             .expect("both placed buildings are queried independently");
         assert_eq!(app.free_camera.unwrap().position, [0.0, 8.0, 0.0]);
     }
 
     #[test]
-    fn collision_uses_updated_control_pose_and_pending_retry_does_not_move_again() {
+    fn collision_uses_updated_control_pose_and_retries_do_not_move_again() {
         let model = Arc::new(collision_fixture_model(false));
         let mut app = collision_test_app(
             Arc::clone(&model),
@@ -8209,54 +11853,39 @@ mod tests {
             },
             [0.0, 8.0, 0.0],
         );
-        let mut control = control_pose_test_control();
-        control.model_node_count = 2;
+        let mut control = socket_timeline_control();
         control.timeline_rows[0].node_index = 1;
-        if let PreparedControlGateProvider::Resolved {
-            initial_type1_value,
-            ..
-        } = &mut control.typed_records[0].gate_provider
-        {
-            *initial_type1_value = 0.0;
-        } else {
-            panic!("fixture has a resolved NDP gate");
-        }
-        app.control_animation_instances = vec![ControlAnimationInstance {
-            object_index: 0,
-            component_index: 0,
-            model: Arc::clone(&model),
+        app.control_animation_instances[0][0] = Some(ControlAnimationInstance {
             control,
+            model: (*model).clone(),
+            gate_values: vec![Some(0.0)],
             state: ControlInstanceState::default(),
-        }];
+            last_sampled_node_times: Vec::new(),
+            reported_unsupported_fallback: false,
+        });
 
         let first = FrameClockSample {
             id: SceneSampleId::Replay(0),
             time_ms: 0,
             delta_seconds: 0.1,
         };
-        let update = app
-            .prepare_scene_update(first, [1280.0, 720.0])
+        app.prepare_scene_update(first, [1280.0, 720.0])
             .expect("closed moving wall blocks the first frame");
-        assert!(app.lifecycle.prepare(update));
         let safe_position = app.free_camera.unwrap().position;
         let closed_pose = app.component_pose_buffers[0][0].as_ref().unwrap().poses[1].translation;
         assert_eq!(safe_position, [0.0, 8.0, 0.0]);
 
-        if let PreparedControlGateProvider::Resolved {
-            initial_type1_value,
-            ..
-        } = &mut app.control_animation_instances[0].control.typed_records[0].gate_provider
-        {
-            *initial_type1_value = 1.0;
-        }
-        app.refresh_pending_viewport([1024.0, 768.0])
+        app.control_animation_instances[0][0]
+            .as_mut()
+            .unwrap()
+            .gate_values[0] = Some(1.0);
+        app.prepare_scene_update(first, [1024.0, 768.0])
             .expect("pending retry only refreshes its viewport");
         assert_eq!(app.free_camera.unwrap().position, safe_position);
         assert_eq!(
             app.component_pose_buffers[0][0].as_ref().unwrap().poses[1].translation,
             closed_pose
         );
-        assert_eq!(app.lifecycle.record_presented(), Some(0));
 
         app.prepare_scene_update(
             FrameClockSample {
@@ -8274,14 +11903,7 @@ mod tests {
 
     #[test]
     fn missing_free_camera_keeps_legacy_view_without_querying_buildings() {
-        let mut app = collision_test_app(
-            Arc::new(collision_fixture_model(false)),
-            LegacyIron3dEulerTransform {
-                translation: [0.0, 5.0, 0.0],
-                orientation_radians: [0.0; 3],
-            },
-            [0.0, 8.0, 0.0],
-        );
+        let (mut app, _) = clock_test_app(None);
         app.free_camera = None;
         app.building_collision_bindings
             .push(BuildingCollisionBinding {
@@ -8306,569 +11928,9 @@ mod tests {
     }
 
     #[test]
-    fn control_timeline_and_ndp_gate_change_component_pose_at_sampled_time() {
-        let model = control_pose_test_model();
-        let control = control_pose_test_control();
-        let gate_values = initial_control_gate_values(&control);
-        let mut raw_state = ControlInstanceState::default();
-        let raw_initial = sample_control_node_times(&control, 0, &gate_values, &mut raw_state)
-            .expect("initial raw control timeline");
-        let raw_later = sample_control_node_times(&control, 225, &gate_values, &mut raw_state)
-            .expect("later raw control timeline");
-        assert_eq!(raw_initial, vec![Some(0.0)]);
-        assert!((raw_later[0].expect("node 0 time") - 0.225).abs() < 1.0e-5);
-
-        let mut state = ControlInstanceState::default();
-        let initial = static_preview_control_pose_buffer(&model, &control, 0, &mut state)
-            .expect("initial control pose")
-            .expect("sampled initial hierarchy");
-        let later = static_preview_control_pose_buffer(&model, &control, 225, &mut state)
-            .expect("later control pose")
-            .expect("sampled later hierarchy");
-
-        assert_eq!(initial.poses[0].translation, [0.0; 3]);
-        assert!(
-            (later.poses[0].translation[1] - 0.45).abs() < 1.0e-4,
-            "later sampled pose: {:?}",
-            later.poses[0]
-        );
-
-        let mut closed_gate = control.clone();
-        let ndp_source = match &control.typed_records[0].gate_provider {
-            PreparedControlGateProvider::Resolved { ndp_source, .. } => ndp_source.clone(),
-            _ => panic!("fixture has a resolved NDP source"),
-        };
-        closed_gate.typed_records[0].gate_provider = PreparedControlGateProvider::Resolved {
-            key: 0,
-            ndp_source,
-            row_count: 1,
-            initial_type1_value: 0.0,
-        };
-        let mut closed_state = ControlInstanceState::default();
-        let closed_initial =
-            static_preview_control_pose_buffer(&model, &closed_gate, 0, &mut closed_state)
-                .expect("closed-gate initial pose")
-                .expect("closed-gate initial hierarchy");
-        let closed_later =
-            static_preview_control_pose_buffer(&model, &closed_gate, 225, &mut closed_state)
-                .expect("closed-gate control pose")
-                .expect("closed-gate hierarchy");
-        assert_eq!(initial.poses[0], closed_initial.poses[0]);
-        assert_eq!(closed_initial.poses[0], closed_later.poses[0]);
-        assert_ne!(later.poses[0], closed_later.poses[0]);
-
-        let mut mismatched_control = control.clone();
-        mismatched_control.model_node_count += 1;
-        let mismatch = static_preview_control_pose_buffer(
-            &model,
-            &mismatched_control,
-            225,
-            &mut ControlInstanceState::default(),
-        )
-        .expect_err("control/mesh node-count mismatch is rejected");
-        assert!(mismatch.contains("does not match MSH node count"));
-    }
-
-    #[test]
-    fn exto_parent_control_updates_visible_child_mount_without_draw_geometry() {
-        let mut model = control_pose_test_model();
-        let mut socket_node = vec![u8::MAX; model.node_stride];
-        socket_node[..2].copy_from_slice(&[0, 0]);
-        socket_node[2..4].copy_from_slice(&0_u16.to_le_bytes());
-        socket_node[4..6].copy_from_slice(&u16::MAX.to_le_bytes());
-        socket_node[6..8].copy_from_slice(&1_u16.to_le_bytes());
-        model.nodes_raw.extend(socket_node);
-        model.node_count = 2;
-        let mut control = control_pose_test_control();
-        control.model_node_count = 2;
-        let unit_record = |immediate_child_count| fparkan_prototype::UnitComponentRecord {
-            archive_raw: [0; 32],
-            resource_raw: [0; 32],
-            kind: 0,
-            parent_or_link: 1,
-            description_raw: [0; 32],
-            tail0: 0,
-            immediate_child_count,
-        };
-        let unit_tree = unit_component_tree(&[unit_record(1), unit_record(1), unit_record(0)])
-            .expect("preorder Unit DAT tree");
-        let controls = vec![None, Some(control.clone()), None];
-        assert!(unit_component_is_visible(1, Some(PROTOTYPE_TYPE_EXTO)));
-        assert!(unit_component_is_visible(2, Some(PROTOTYPE_TYPE_EXTO)));
-        assert!(component_chain_has_tag21(Some(&unit_tree), &controls, 2));
-        assert_eq!(unit_tree[1].parent_index, Some(0));
-        assert_eq!(unit_tree[2].parent_index, Some(1));
-        assert!(
-            unit_tree[2]
-                .parent_index
-                .is_some_and(|parent_index| parent_index < 2),
-            "Unit DAT preorder places a parent before its child"
-        );
-        let mut state = ControlInstanceState::default();
-        let initial_hierarchy = static_preview_control_pose_buffer(&model, &control, 0, &mut state)
-            .expect("initial EXTO parent pose")
-            .expect("initial parent hierarchy");
-        let later_hierarchy = static_preview_control_pose_buffer(&model, &control, 225, &mut state)
-            .expect("animated EXTO parent pose")
-            .expect("animated parent hierarchy");
-        let mut pose_buffers = vec![vec![None, Some(initial_hierarchy), None]];
-        let mounts = [DynamicComponentMount {
-            object_index: 0,
-            component_index: 2,
-            parent_index: 1,
-            socket: 1,
-        }];
-        let initial = node38_pose_from_hierarchy(
-            pose_buffers[0][1].as_ref().expect("EXTO parent hierarchy"),
-            1,
-        )
-        .expect("parent socket");
-        let mut mount_poses = vec![vec![None, None, Some(initial)]];
-        pose_buffers[0][1] = Some(later_hierarchy);
-        let parent_geometry = DynamicComponentGeometry {
-            object_index: 0,
-            component_index: 1,
-            model: Arc::new(model.clone()),
-            transform: LegacyIron3dEulerTransform {
-                translation: [0.0; 3],
-                orientation_radians: [0.0; 3],
-            },
-            scale: [1.0; 3],
-            vertex_start: 0,
-            vertex_count: 0,
-            shadow_triangle_range: None,
-        };
-        let empty_parent_mesh = project_dynamic_component_geometry(
-            &parent_geometry,
-            pose_buffers[0][1].as_ref().expect("EXTO parent hierarchy"),
-            None,
-        )
-        .expect("zero-geometry EXTO parent");
-        assert!(empty_parent_mesh.vertices.is_empty());
-        assert!(empty_parent_mesh.indices.is_empty());
-
-        assert!(
-            refresh_dynamic_component_mounts(&mounts, &pose_buffers, &mut mount_poses)
-                .expect("refresh child mount")
-        );
-        assert_eq!(
-            mount_poses[0][2].expect("child mount").translation,
-            [0.0, 2.45, 0.0]
-        );
-        // The EXTO parent has a sampled Node38 hierarchy but no projected draw
-        // vertices. Its hierarchy still drives the visible child's mount.
-    }
-
-    #[test]
-    fn live_tick_and_pending_resize_keep_the_scene_sample_while_refreshing_projection() {
-        let model = Arc::new(control_pose_drawable_test_model());
-        let control = control_pose_test_control();
-        let dynamic = DynamicComponentGeometry {
-            object_index: 0,
-            component_index: 0,
-            model: Arc::clone(&model),
-            transform: LegacyIron3dEulerTransform {
-                translation: [0.0; 3],
-                orientation_radians: [0.0; 3],
-            },
-            scale: [1.0; 3],
-            vertex_start: 0,
-            vertex_count: 3,
-            shadow_triangle_range: Some(0..1),
-        };
-        let mut state = ControlInstanceState::default();
-        let initial_pose = static_preview_control_pose_buffer(&model, &control, 0, &mut state)
-            .expect("initial hierarchy")
-            .expect("initial Node38 pose");
-        let initial_mesh = project_dynamic_component_geometry(&dynamic, &initial_pose, None)
-            .expect("initial projected component");
-        let initial_triangles = static_mesh_shadow_triangles(&initial_mesh);
-        let baseline = ShadowSphere {
-            center: [0.0; 3],
-            radius: 1.0,
-        };
-        let mut land = fparkan_terrain_format::LandMeshDocument {
-            streams: Vec::new(),
-            nodes_raw: Vec::new(),
-            slots: fparkan_terrain_format::TerrainSlotTable {
-                header_raw: Vec::new(),
-                slots_raw: Vec::new(),
-            },
-            positions: vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
-            normals: Vec::new(),
-            uv0: Vec::new(),
-            accelerator: Vec::new(),
-            aux14: Vec::new(),
-            aux18: Vec::new(),
-            faces: vec![fparkan_terrain_format::TerrainFace28 {
-                flags: FullSurfaceMask(1),
-                material_tag: 0,
-                aux_tag: 0,
-                vertices: [0, 1, 2],
-                neighbors: [None, None, None],
-                tail_raw: [0; 8],
-                raw: [0; 28],
-            }],
-        };
-        set_test_terrain_lod0_range(&mut land);
-        let terrain = Arc::new(TerrainWorld::from_land_msh(&land).expect("test terrain"));
-        let free_camera = FreeFlightCamera {
-            position: [0.25, 0.25, 0.0],
-            yaw: 0.0,
-            pitch: 0.0,
-            horizontal_fov: 1.0,
-            near_plane: 0.1,
-            far_plane: 100.0,
-            move_speed: 1.0,
-            ground_clearance: 0.0,
-        };
-        let view_camera = free_camera.preview_frame(16.0 / 9.0);
-        let preview = StaticPreviewScene {
-            mesh: initial_mesh.clone(),
-            native_handedness_by_range: HashMap::new(),
-            type16_present_ranges: HashSet::new(),
-            materials: Vec::new(),
-            material_animations: Vec::new(),
-            sun_occlusion_range_indices: Vec::new(),
-            shadow_casters: vec![ShadowCaster {
-                id: 0,
-                world_axes: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-                sphere: baseline,
-                native_kind: 4,
-                triangles: initial_triangles.clone(),
-            }],
-            shadow_sphere_baselines: vec![baseline],
-            shadow_receivers: Vec::new(),
-            shadow_material_index: 0,
-            terrain,
-            component_pose_buffers: vec![vec![Some(initial_pose)]],
-            component_mount_poses: vec![vec![None]],
-            control_animation_instances: vec![ControlAnimationInstance {
-                object_index: 0,
-                component_index: 0,
-                model: Arc::clone(&model),
-                control,
-                state,
-            }],
-            dynamic_component_geometry: vec![dynamic],
-            building_collision_bindings: Vec::new(),
-            dynamic_component_mounts: Vec::new(),
-            shadow_caster_indices_by_object: vec![Some(0)],
-            camera: view_camera.vulkan_camera(),
-            view_camera,
-            captured_viewport: None,
-            free_camera: None,
-            camera_mode: "test",
-            mesh_components: 1,
-            terrain_components: 0,
-        };
-        let mut app = StaticVulkanApp::new(
-            preview,
-            None,
-            None,
-            EnvironmentGpuRange {
-                range_index: usize::MAX,
-                vertex_start: initial_mesh.vertices.len(),
-                vertex_capacity: 0,
-                material_index: 0,
-            },
-            initial_mesh.vertices.len(),
-            initial_mesh.indices.len(),
-            None,
-            0,
-            None,
-            "control-test",
-            1,
-            None,
-            false,
-            StartupTimings::default(),
-        );
-        app.free_camera = Some(free_camera);
-        app.pressed_keys.insert(KeyCode::KeyW);
-        app.materials = packet_test_materials();
-        app.material_animations = vec![random_material_binding(0)];
-        let empty_range = app.shadow_range;
-        app.environment_gpu = Some(EnvironmentGpuScene {
-            material_animations: vec![random_material_binding(1)],
-            sky_layers: Vec::new(),
-            sprites: Vec::new(),
-            rain: empty_range,
-            snow: empty_range,
-            lightning: empty_range,
-            lightning_material_index: 0,
-        });
-        let start = app.last_tick;
-        let sample = app.sample_live_frame_clock_at(start + Duration::from_millis(225));
-        assert_eq!(sample.time_ms, 225);
-        assert!((sample.delta_seconds - 0.225).abs() < f32::EPSILON);
-        let mut update = app
-            .prepare_scene_update(sample, [1280.0, 720.0])
-            .expect("apply one full live tick to the scene");
-        assert!(update.environment.is_none());
-        assert!(update.environment_material_update.is_some());
-        let world_material_packet = update.material_update.clone();
-        let sky_material_packet = update.environment_material_update.clone();
-        assert_eq!(app.material_animations[0].base.random_state, 2_531_011);
-        assert_eq!(
-            app.environment_gpu.as_ref().unwrap().material_animations[0]
-                .base
-                .random_state,
-            2_531_011
-        );
-        let expected_resized_camera = app
-            .free_camera
-            .expect("free-flight input controller")
-            .preview_frame(4.0 / 3.0);
-        let camera_after_tick = app.free_camera.expect("free-flight camera").position;
-        assert!((camera_after_tick[0] - 0.35).abs() < 1.0e-5);
-        assert!((camera_after_tick[1] - 0.25).abs() < 1.0e-5);
-        assert_eq!(app.material_time_ms, sample.time_ms);
-        let weather = WeatherInput {
-            rain: WeatherState::new(true, 0.03, [0.7, 0.8, 1.0, 0.6]),
-            snow: WeatherState::new(true, 0.03, [0.9, 0.95, 1.0, 0.8]),
-            ..WeatherInput::clear()
-        };
-        let mut weather_system = EnvironmentSystem::new(0xC1_225);
-        let first_environment_frame = weather_system.update(
-            0.225,
-            weather,
-            environment_camera_for_preview(&update.camera, update.aspect, update.viewport),
-        );
-        let mut precipitation_counts = [0usize; 2];
-        for primitive in &first_environment_frame.primitives {
-            if let EnvironmentPrimitive::Particle { kind, .. } = primitive {
-                let slot = match kind {
-                    PrecipitationKind::Rain => 0,
-                    PrecipitationKind::Snow => 1,
-                };
-                precipitation_counts[slot] += 1;
-            }
-        }
-        assert!(precipitation_counts.iter().all(|count| *count > 0));
-        update.environment = Some(DynamicEnvironmentFrame {
-            atmosphere: TypedAtmosphere {
-                marker: 0,
-                version: 0,
-                tracks: Vec::new(),
-                trailer: Default::default(),
-            }
-            .sample(0.225),
-            sky_mesh: SkySystem::new(Default::default(), SkyMaterials::default())
-                .expect("test sky topology")
-                .mesh()
-                .clone(),
-            environment_frame: first_environment_frame.clone(),
-            absolute_time_seconds: 0.225,
-        });
-        assert!(app.lifecycle.prepare(update.clone()));
-        let control_state_after_tick = app.control_animation_instances[0].state.clone();
-        assert_eq!(
-            app.sample_live_frame_clock_at(start + Duration::from_millis(500)),
-            sample
-        );
-        assert_eq!(app.simulation_elapsed, Duration::from_millis(225));
-        assert_eq!(app.lifecycle.pending.as_ref(), Some(&update));
-
-        assert_eq!(app.mesh.indices, initial_mesh.indices);
-        assert_eq!(app.mesh.vertices.len(), initial_mesh.vertices.len());
-        assert_ne!(
-            initial_mesh.vertices[0].position,
-            app.mesh.vertices[0].position
-        );
-        assert!((app.mesh.vertices[0].position[1] - 0.45).abs() < 1.0e-4);
-        let b_vertices = app.mesh.vertices.clone();
-        let b_triangles = app.shadow_casters[0].triangles.clone();
-        let b_sphere = app.shadow_casters[0].sphere;
-        assert_ne!(b_triangles, initial_triangles);
-        assert!(b_sphere.radius > baseline.radius);
-
-        app.free_camera.as_mut().unwrap().look_delta(64.0, -24.0);
-        let controller_after_input = app.free_camera.unwrap();
-        app.refresh_pending_viewport([800.0, 600.0])
-            .expect("refresh only viewport-dependent state after recreation");
-        let refreshed = app
-            .lifecycle
-            .pending
-            .as_ref()
-            .expect("pending sample")
-            .clone();
-        assert_eq!(refreshed.sample, sample);
-        assert_eq!(refreshed.material_update, world_material_packet);
-        assert_eq!(refreshed.environment_material_update, sky_material_packet);
-        assert_eq!(app.material_animations[0].base.random_state, 2_531_011);
-        assert_eq!(
-            app.environment_gpu.as_ref().unwrap().material_animations[0]
-                .base
-                .random_state,
-            2_531_011
-        );
-        app.refresh_pending_viewport([1024.0, 768.0])
-            .expect("refresh the same pending sample a second time");
-        let repeated = app.lifecycle.pending.as_ref().expect("pending sample");
-        assert_eq!(repeated.sample, sample);
-        assert_eq!(repeated.material_update, world_material_packet);
-        assert_eq!(repeated.environment_material_update, sky_material_packet);
-        assert_eq!(repeated.viewport, [1024.0, 768.0]);
-        assert_eq!(repeated.aspect, 4.0 / 3.0);
-        assert_eq!(app.material_animations[0].base.random_state, 2_531_011);
-        assert_eq!(
-            app.environment_gpu.as_ref().unwrap().material_animations[0]
-                .base
-                .random_state,
-            2_531_011
-        );
-        assert_eq!(refreshed.viewport, [800.0, 600.0]);
-        assert_eq!(refreshed.aspect, 4.0 / 3.0);
-        assert_eq!(refreshed.camera.position, update.camera.position);
-        assert_eq!(refreshed.camera.forward, update.camera.forward);
-        assert_eq!(refreshed.camera.right, update.camera.right);
-        assert_eq!(refreshed.camera.up, update.camera.up);
-        assert_eq!(refreshed.camera.position, expected_resized_camera.position);
-        assert_eq!(refreshed.camera.forward, expected_resized_camera.forward);
-        assert_eq!(refreshed.camera.right, expected_resized_camera.right);
-        assert_eq!(refreshed.camera.up, expected_resized_camera.up);
-        assert!(
-            (refreshed.camera.vertical_fov - expected_resized_camera.vertical_fov).abs() < 1.0e-6
-        );
-        assert!(refreshed
-            .camera
-            .clip_from_world
-            .iter()
-            .zip(expected_resized_camera.clip_from_world)
-            .all(|(actual, expected)| (actual - expected).abs() < 1.0e-5));
-        assert_ne!(
-            refreshed.camera.clip_from_world,
-            update.camera.clip_from_world
-        );
-        assert_eq!(app.free_camera, Some(controller_after_input));
-        let refreshed_environment_frame =
-            &refreshed.environment.as_ref().unwrap().environment_frame;
-        assert_eq!(
-            refreshed_environment_frame.point_lights,
-            first_environment_frame.point_lights
-        );
-        assert_eq!(
-            refreshed_environment_frame.sounds,
-            first_environment_frame.sounds
-        );
-        let mut reprojected_counts = [0usize; 2];
-        for (sampled, refreshed) in first_environment_frame
-            .primitives
-            .iter()
-            .zip(&refreshed_environment_frame.primitives)
-        {
-            let (
-                EnvironmentPrimitive::Particle {
-                    kind: sampled_kind,
-                    position: sampled_position,
-                    velocity: sampled_velocity,
-                    size: sampled_size,
-                    screen: sampled_screen,
-                    ..
-                },
-                EnvironmentPrimitive::Particle {
-                    kind,
-                    position,
-                    velocity,
-                    size,
-                    screen,
-                    ..
-                },
-            ) = (sampled, refreshed)
-            else {
-                panic!("rain and snow fixture contains only precipitation particles");
-            };
-            assert_eq!(kind, sampled_kind);
-            assert_eq!(position, sampled_position);
-            assert_eq!(velocity, sampled_velocity);
-            assert_ne!(screen, sampled_screen);
-            assert_ne!(size, sampled_size);
-            let slot = match kind {
-                PrecipitationKind::Rain => 0,
-                PrecipitationKind::Snow => 1,
-            };
-            reprojected_counts[slot] += 1;
-        }
-        assert!(reprojected_counts.iter().all(|count| *count > 0));
-        assert_eq!(
-            app.apply_pending_scene_update().unwrap_err(),
-            "native Vulkan renderer was not initialized"
-        );
-        let restored = app
-            .lifecycle
-            .pending
-            .as_ref()
-            .expect("restored pending sample");
-        assert_eq!(restored.sample, sample);
-        assert_eq!(restored.material_update, world_material_packet);
-        assert_eq!(restored.environment_material_update, sky_material_packet);
-        assert_eq!(app.material_animations[0].base.random_state, 2_531_011);
-        assert_eq!(
-            app.environment_gpu.as_ref().unwrap().material_animations[0]
-                .base
-                .random_state,
-            2_531_011
-        );
-        assert_eq!(app.mesh.vertices, b_vertices);
-        assert_eq!(app.shadow_casters[0].triangles, b_triangles);
-        assert_eq!(
-            app.control_animation_instances[0].state,
-            control_state_after_tick
-        );
-        assert_eq!(app.material_time_ms, sample.time_ms);
-        assert_eq!(app.simulation_elapsed, Duration::from_millis(225));
-        assert_eq!(app.lifecycle.frames_presented, 0);
-        assert_eq!(app.lifecycle.record_presented(), Some(0));
-
-        app.update_controlled_component_geometry(sample)
-            .expect("repeat the same control timestamp");
-        assert_eq!(app.mesh.vertices, b_vertices);
-        assert_eq!(app.shadow_casters[0].triangles, b_triangles);
-        assert_eq!(app.shadow_casters[0].sphere, b_sphere);
-
-        let first_sample = FrameClockSample {
-            id: SceneSampleId::Live(0),
-            time_ms: 0,
-            delta_seconds: 0.0,
-        };
-        app.update_material_clock(first_sample);
-        app.update_controlled_component_geometry(first_sample)
-            .expect("return to first control pose");
-        assert_eq!(app.mesh.vertices, initial_mesh.vertices);
-        assert_eq!(app.shadow_casters[0].triangles, initial_triangles);
-        assert_eq!(app.shadow_casters[0].sphere, baseline);
-
-        let next_sample = app.sample_live_frame_clock_at(start + Duration::from_millis(241));
-        assert_eq!(next_sample.id, SceneSampleId::Live(1));
-        assert_eq!(next_sample.time_ms, 241);
-        let next_update = app
-            .prepare_scene_update(next_sample, [800.0, 600.0])
-            .expect("the next sampled frame adopts mouse input received during retry");
-        assert_ne!(next_update.camera.forward, update.camera.forward);
-        assert_eq!(next_update.camera.forward, controller_after_input.forward());
-    }
-
-    #[test]
     #[ignore = "requires licensed corpus"]
     fn licensed_plant_wall_and_door_use_the_app_camera_bridge() {
         use std::path::PathBuf;
-
-        fn set_segment(app: &mut StaticVulkanApp, segment: [[f32; 3]; 2]) {
-            let delta = sub3(segment[1], segment[0]);
-            let horizontal_distance = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
-            app.free_camera = Some(FreeFlightCamera {
-                position: segment[0],
-                yaw: delta[1].atan2(delta[0]),
-                pitch: delta[2].atan2(horizontal_distance),
-                horizontal_fov: 1.3,
-                near_plane: 0.5,
-                far_plane: 700.0,
-                move_speed: length3(delta).expect("nonzero native test segment") / 0.1,
-                ground_clearance: 0.0,
-            });
-            app.pressed_keys.clear();
-            app.pressed_keys.insert(KeyCode::KeyW);
-        }
 
         const BODY_WALL: [[f32; 3]; 2] = [[-10.5, 22.16, 2.5], [-10.5, 19.16, 2.5]];
         const BODY_DOOR: [[f32; 3]; 2] = [[0.5, 22.16, 2.5], [0.5, 19.16, 2.5]];
@@ -8927,11 +11989,12 @@ mod tests {
             0,
             None,
             2,
-            None,
             mission,
             loaded.object_count,
             None,
+            None,
             false,
+            None,
             StartupTimings::default(),
         );
         let plant = app
@@ -8972,7 +12035,6 @@ mod tests {
         assert_eq!(closed_door_hit.node, NodeId(3));
         assert_eq!(closed_door_hit.batch_index, 100);
         assert_eq!(closed_door_hit.triangle_descriptor_index, 855);
-
         let terrain_bounds = app
             .terrain
             .surface_bounds()
@@ -9024,48 +12086,44 @@ mod tests {
             assert_eq!(constrained.position, point);
         }
 
-        set_segment(&mut app, world_wall);
+        set_collision_test_segment(&mut app, world_wall);
         let zero_delta = FrameClockSample {
             id: SceneSampleId::Replay(0),
             time_ms: 0,
             delta_seconds: 0.0,
         };
-        let update = app
-            .prepare_scene_update(zero_delta, [1280.0, 720.0])
+        app.prepare_scene_update(zero_delta, [1280.0, 720.0])
             .expect("zero-delta resume initialization");
-        assert!(app.lifecycle.prepare(update));
         assert_eq!(app.free_camera.unwrap().position, world_wall[0]);
-        assert_eq!(app.lifecycle.record_presented(), Some(0));
+        assert_eq!(app.record_presented_scene_frame(), 0);
 
         let wall_frame = FrameClockSample {
             id: SceneSampleId::Replay(1),
             time_ms: 0,
             delta_seconds: 0.1,
         };
-        let update = app
-            .prepare_scene_update(wall_frame, [1280.0, 720.0])
+        app.prepare_scene_update(wall_frame, [1280.0, 720.0])
             .expect("high-speed wall movement through the app update path");
-        assert!(app.lifecycle.prepare(update));
         assert_eq!(app.free_camera.unwrap().position, world_wall[0]);
         app.pressed_keys.clear();
         app.pressed_keys.insert(KeyCode::KeyD);
-        app.refresh_pending_viewport([1024.0, 768.0])
+        app.prepare_scene_update(wall_frame, [1024.0, 768.0])
             .expect("retry of the pending wall frame");
         assert_eq!(app.free_camera.unwrap().position, world_wall[0]);
-        assert_eq!(app.lifecycle.record_presented(), Some(1));
+        assert_eq!(app.record_presented_scene_frame(), 1);
 
-        set_segment(&mut app, world_door);
-        let closed_frame = FrameClockSample {
-            id: SceneSampleId::Replay(2),
-            time_ms: 0,
-            delta_seconds: 0.1,
-        };
-        let update = app
-            .prepare_scene_update(closed_frame, [1024.0, 768.0])
-            .expect("the closed Node3 door blocks through the app update path");
-        assert!(app.lifecycle.prepare(update));
+        set_collision_test_segment(&mut app, world_door);
+        app.prepare_scene_update(
+            FrameClockSample {
+                id: SceneSampleId::Replay(2),
+                time_ms: 0,
+                delta_seconds: 0.1,
+            },
+            [1024.0, 768.0],
+        )
+        .expect("the closed Node3 door blocks through the app update path");
         assert_eq!(app.free_camera.unwrap().position, world_door[0]);
-        assert_eq!(app.lifecycle.record_presented(), Some(2));
+        assert_eq!(app.record_presented_scene_frame(), 2);
 
         let control = assets
             .object_component_controls
@@ -9096,16 +12154,16 @@ mod tests {
         assert_eq!(open_node_times[3], Some(AnimationTime(0.0)));
         // This samples the door's authored frame B directly; it does not simulate a mission gate.
         open_node_times[3] = Some(AnimationTime(1.0));
-        app.component_pose_buffers[4][0] = Some(
-            node38_sampled_hierarchy_at_times(&plant.model, &open_node_times)
-                .expect("sample the actual PLANT model at its authored Node3 frame B"),
-        );
-        refresh_dynamic_component_mounts(
-            &app.dynamic_component_mounts,
+        let open_hierarchy = node38_sampled_hierarchy_at_times(&plant.model, &open_node_times)
+            .expect("sample the actual PLANT model at its authored Node3 frame B");
+        app.component_pose_buffers[4][0] = Some(open_hierarchy);
+        update_dynamic_component_geometry(
+            &app.dynamic_component_geometry,
             &app.component_pose_buffers,
             &mut app.component_mount_poses,
+            &mut app.mesh,
         )
-        .expect("refresh mounts from the authored open-door hierarchy");
+        .expect("update the scene hierarchy for the authored door pose");
         let open_hierarchy = app.component_pose_buffers[4][0]
             .as_ref()
             .expect("sampled PLANT root pose");
@@ -9122,7 +12180,7 @@ mod tests {
             "the authored Node3 time-1 pose leaves the doorway ray clear"
         );
 
-        set_segment(&mut app, world_door);
+        set_collision_test_segment(&mut app, world_door);
         app.update_free_camera(0.1, [1024.0, 768.0])
             .expect("open doorway movement through the app camera update");
         let position = app.free_camera.unwrap().position;
@@ -9131,46 +12189,680 @@ mod tests {
         }
     }
 
-    fn set_test_terrain_lod0_range(terrain: &mut fparkan_terrain_format::LandMeshDocument) {
-        const NODE_STRIDE: usize = 38;
-        const SLOT_STRIDE: usize = 68;
-        let mut node = vec![u8::MAX; NODE_STRIDE];
-        node[8..10].copy_from_slice(&0_u16.to_le_bytes());
-        node[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
-        let mut slot = [0_u8; SLOT_STRIDE];
-        slot[..2].copy_from_slice(&0_u16.to_le_bytes());
-        let face_count = u16::try_from(terrain.faces.len()).expect("test face count fits");
-        slot[2..4].copy_from_slice(&face_count.to_le_bytes());
-        terrain.nodes_raw = node;
-        terrain.slots.slots_raw = vec![slot];
+    fn set_collision_test_segment(app: &mut StaticVulkanApp, segment: [[f32; 3]; 2]) {
+        let delta = sub3(segment[1], segment[0]);
+        let horizontal_distance = (delta[0] * delta[0] + delta[1] * delta[1]).sqrt();
+        app.free_camera = Some(FreeFlightCamera {
+            position: segment[0],
+            yaw: delta[1].atan2(delta[0]),
+            pitch: delta[2].atan2(horizontal_distance),
+            horizontal_fov: 1.3,
+            near_plane: 0.5,
+            far_plane: 700.0,
+            move_speed: length3(delta).expect("nonzero native test segment") / 0.1,
+            ground_clearance: 0.0,
+        });
+        app.pressed_keys.clear();
+        app.pressed_keys.insert(KeyCode::KeyW);
+    }
+
+    fn socket_timeline_control() -> PreparedComponentControl {
+        let mut fixed_words = [0; 44];
+        fixed_words[2] = 0;
+        fixed_words[6] = u32::MAX;
+        fixed_words[9] = 1.0_f32.to_bits();
+        fixed_words[10] = 1.0_f32.to_bits();
+        PreparedComponentControl {
+            source: ResourceKey {
+                archive: normalize_relative(b"test.rlb", PathPolicy::HostCompatible)
+                    .expect("archive path"),
+                name: resource_name(b"animated.ctl"),
+                type_id: None,
+            },
+            native_profile_words: [0; 27],
+            model_node_count: 2,
+            bindings: vec![],
+            timeline_rows: vec![PreparedControlTimelineRow {
+                row_index: 0,
+                node_index: 0,
+                frame_a: 0.0,
+                frame_b: 1.0,
+                initial_blend: 0.0,
+                raw_parameters: [u32::MAX, u32::MAX, 1.0_f32.to_bits(), 0],
+                flags: 0,
+            }],
+            typed_records: vec![PreparedControlTypedRecord {
+                tag: 21,
+                fixed_words,
+                values: vec![0],
+                string_bytes: vec![],
+                gate_provider: PreparedControlGateProvider::Resolved {
+                    key: 0,
+                    ndp_source: ResourceKey {
+                        archive: normalize_relative(b"test.rlb", PathPolicy::HostCompatible)
+                            .expect("NDP archive path"),
+                        name: resource_name(b"animated.ndp"),
+                        type_id: None,
+                    },
+                    row_count: 1,
+                    initial_type1_value: 1.0,
+                },
+            }],
+            node_data: None,
+            effect_section: PreparedControlEffectSection::Absent,
+            initial_effect_group: None,
+            point_list: None,
+        }
+    }
+
+    fn control_point(position: [f32; 3], direction: [f32; 3]) -> PreparedControlPoint {
+        PreparedControlPoint {
+            raw_flags: 0,
+            raw_signed_field_04: 0,
+            raw_signed_field_08: 0,
+            position,
+            direction,
+            name: [0; 32],
+        }
+    }
+
+    fn assert_matrix_columns(matrix: [[f32; 4]; 4], expected: [[f32; 3]; 3]) {
+        for (column, expected) in expected.into_iter().enumerate() {
+            for row in 0..3 {
+                assert!(
+                    (matrix[row][column] - expected[row]).abs() < 1.0e-5,
+                    "column {column} row {row}: {} != {}",
+                    matrix[row][column],
+                    expected[row]
+                );
+            }
+        }
+    }
+
+    fn write_effect_u32(body: &mut [u8], offset: usize, value: u32) {
+        body[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_effect_f32(body: &mut [u8], offset: usize, value: f32) {
+        body[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_effect_vec3(body: &mut [u8], offset: usize, value: [f32; 3]) {
+        for (axis, component) in value.into_iter().enumerate() {
+            write_effect_f32(body, offset + axis * 4, component);
+        }
+    }
+
+    #[test]
+    fn tag21_clock_moves_msh_vertices_normals_child_socket_and_fx_anchor() {
+        let parent_model = animated_socket_model();
+        let child_model = static_child_model();
+        let identity_transform = LegacyIron3dEulerTransform {
+            translation: [0.0; 3],
+            orientation_radians: [0.0; 3],
+        };
+        let initial_parent_pose =
+            node38_sampled_hierarchy_at_times(&parent_model, &[Some(AnimationTime(0.0)), None])
+                .expect("initial parent pose");
+        let initial_child_pose =
+            node38_fallback_hierarchy(&child_model).expect("static child pose");
+        let initial_mount =
+            node38_pose_from_hierarchy(&initial_parent_pose, 1).expect("parent socket pose");
+        let parent_mesh = project_msh_to_static_mesh_in_world_space_with_node_pose_buffer(
+            &parent_model,
+            identity_transform,
+            [1.0; 3],
+            &initial_parent_pose,
+        )
+        .expect("initial parent mesh");
+        let child_mesh = project_msh_to_static_mesh_in_world_space_with_node_pose_buffer_and_mount(
+            &child_model,
+            identity_transform,
+            [1.0; 3],
+            &initial_child_pose,
+            initial_mount,
+        )
+        .expect("initial mounted child mesh");
+        let parent_vertex_count = parent_mesh.vertices.len();
+        assert_eq!(parent_vertex_count, 3);
+        assert_eq!(child_mesh.vertices.len(), 3);
+        let mut vertices = parent_mesh
+            .vertices
+            .into_iter()
+            .chain(child_mesh.vertices)
+            .collect::<Vec<_>>();
+        let environment_vertex_start =
+            u32::try_from(vertices.len()).expect("environment vertex base fits u32");
+        let mut environment_vertices = shadow_placeholder_vertices();
+        for vertex in &mut environment_vertices {
+            vertex.position[0] += 1000.0;
+        }
+        vertices.extend(environment_vertices);
+        let mut indices = vec![0, 1, 2, 3, 4, 5];
+        indices.extend(
+            quad_indices(1)
+                .expect("environment quad indices")
+                .into_iter()
+                .map(|index| index + environment_vertex_start),
+        );
+        let draw_range = |first_index, index_count| VulkanStaticDrawRange {
+            first_index,
+            index_count,
+            material_index: 0,
+            lightmap_index: u8::MAX,
+            batch_flags: 0,
+            pipeline_state: world_pipeline_state(
+                LegacyBlendMode::Opaque,
+                LegacyDepthMode::TestReadOnly,
+            ),
+            terrain_base_only: false,
+            alpha_test_reference: 0,
+        };
+        let mut mesh = VulkanStaticMesh {
+            vertices,
+            indices,
+            draw_ranges: vec![draw_range(0, 3), draw_range(3, 3), draw_range(6, 6)],
+        };
+        let control = socket_timeline_control();
+        let gate_values = initial_control_gate_values(&control);
+        let mut shadow_casters = vec![test_shadow_caster(0, [0.0; 3])];
+        shadow_casters[0].triangles = static_mesh_shadow_triangles_in_index_range(&mesh, 0, 6)
+            .expect("initial caster triangle geometry");
+        let dynamic_shadow_casters = [DynamicShadowCaster {
+            caster_index: 0,
+            object_index: 0,
+            root_transform: identity_transform,
+            owner_scale: [1.0; 3],
+            initial_sphere: shadow_casters[0].sphere,
+            component_draw_range_indices: vec![0, 1],
+            component_spheres: vec![
+                DynamicShadowSphereSource {
+                    component_index: 0,
+                    center: [0.0; 3],
+                    radius: 1.0,
+                    mounted: false,
+                },
+                DynamicShadowSphereSource {
+                    component_index: 1,
+                    center: [0.0; 3],
+                    radius: 1.0,
+                    mounted: true,
+                },
+            ],
+        }];
+        let mut instances = vec![vec![
+            Some(ControlAnimationInstance {
+                control,
+                model: parent_model.clone(),
+                gate_values,
+                state: ControlInstanceState::default(),
+                last_sampled_node_times: Vec::new(),
+                reported_unsupported_fallback: false,
+            }),
+            None,
+        ]];
+        let mut poses = vec![vec![Some(initial_parent_pose), Some(initial_child_pose)]];
+        let mut mounts = vec![vec![None, Some(initial_mount)]];
+        let geometry = vec![vec![
+            Some(DynamicComponentGeometry {
+                model: parent_model,
+                root_transform: identity_transform,
+                owner_scale: [1.0; 3],
+                parent_mount: None,
+                vertex_start: 0,
+                vertex_count: parent_vertex_count,
+            }),
+            Some(DynamicComponentGeometry {
+                model: child_model,
+                root_transform: identity_transform,
+                owner_scale: [1.0; 3],
+                parent_mount: Some((0, 1)),
+                vertex_start: parent_vertex_count,
+                vertex_count: 3,
+            }),
+        ]];
+
+        // The fixture's resolved NDP row supplies the native initial value 1.0.
+        update_control_animation_pose_buffers(&mut instances, &mut poses, 0)
+            .expect("initial active timeline sample");
+        let first_root_pose = poses[0][0].as_ref().expect("first root pose").poses[0];
+        update_dynamic_component_geometry(&geometry, &poses, &mut mounts, &mut mesh)
+            .expect("initial geometry update");
+        let range_remap = reorder_draw_ranges(&mut mesh, &[2, 0, 1]).expect("environment reorder");
+        let mut dynamic_shadow_casters = dynamic_shadow_casters;
+        remap_dynamic_shadow_caster_draw_ranges(&mut dynamic_shadow_casters, &range_remap)
+            .expect("dynamic shadow draw-range remap");
+        refresh_dynamic_shadow_casters(
+            &mut shadow_casters,
+            &dynamic_shadow_casters,
+            &mesh,
+            &poses,
+            &mounts,
+        )
+        .expect("initial caster geometry refresh");
+        let encloses_triangles = |sphere: ShadowSphere, triangles: &[ShadowTriangle]| {
+            triangles
+                .iter()
+                .flat_map(|triangle| triangle.positions)
+                .all(|point| {
+                    let offset = sub3(point, sphere.center);
+                    let distance = offset[0].hypot(offset[1]).hypot(offset[2]);
+                    distance.is_finite() && distance <= sphere.radius + 1.0e-4
+                })
+        };
+        let first_shadow_sphere = shadow_casters[0].sphere;
+        assert!(encloses_triangles(
+            first_shadow_sphere,
+            &shadow_casters[0].triangles
+        ));
+        assert_eq!(
+            dynamic_shadow_casters[0].component_draw_range_indices,
+            [1, 2]
+        );
+        assert_eq!(shadow_casters[0].triangles.len(), 2);
+        assert_eq!(
+            shadow_casters[0].triangles[0].positions[0],
+            mesh.vertices[0].position
+        );
+        assert_eq!(
+            shadow_casters[0].triangles[1].positions[0],
+            mesh.vertices[parent_vertex_count].position
+        );
+        let first_shadow_triangles = shadow_casters[0].triangles.clone();
+        let first_parent_vertex = mesh.vertices[0];
+        let first_child_vertex = mesh.vertices[parent_vertex_count];
+        let first_mount = mounts[0][1].expect("initial child mount");
+        let first_fx_anchor = control_type4_world_from_effect(
+            identity_matrix(),
+            [1.0; 3],
+            identity_transform,
+            Some(first_mount),
+            control_effect_owner_node_pose(poses[0][1].as_ref(), true, 0)
+                .expect("mounted FX owner pose"),
+        )
+        .expect("initial FX anchor");
+
+        update_control_animation_pose_buffers(&mut instances, &mut poses, 225)
+            .expect("later active timeline sample");
+        let later_root_pose = poses[0][0].as_ref().expect("later root pose").poses[0];
+        assert_ne!(first_root_pose, later_root_pose);
+        update_dynamic_component_geometry(&geometry, &poses, &mut mounts, &mut mesh)
+            .expect("later geometry update");
+        refresh_dynamic_shadow_casters(
+            &mut shadow_casters,
+            &dynamic_shadow_casters,
+            &mesh,
+            &poses,
+            &mounts,
+        )
+        .expect("later caster geometry refresh");
+        let later_shadow_sphere = shadow_casters[0].sphere;
+        let later_shadow_triangles = shadow_casters[0].triangles.clone();
+        assert!(encloses_triangles(
+            later_shadow_sphere,
+            &later_shadow_triangles
+        ));
+        assert_ne!(first_shadow_triangles, shadow_casters[0].triangles);
+        assert_eq!(
+            shadow_casters[0].triangles[0].positions[0],
+            mesh.vertices[0].position
+        );
+        let later_parent_vertex = mesh.vertices[0];
+        let later_child_vertex = mesh.vertices[parent_vertex_count];
+        let later_mount = mounts[0][1].expect("later child mount");
+        let later_fx_anchor = control_type4_world_from_effect(
+            identity_matrix(),
+            [1.0; 3],
+            identity_transform,
+            Some(later_mount),
+            control_effect_owner_node_pose(poses[0][1].as_ref(), true, 0)
+                .expect("mounted FX owner pose"),
+        )
+        .expect("later FX anchor");
+
+        assert_ne!(first_parent_vertex.position, later_parent_vertex.position);
+        assert_ne!(first_parent_vertex.normal, later_parent_vertex.normal);
+        assert_ne!(first_mount.translation, later_mount.translation);
+        assert_eq!(first_child_vertex.position, first_mount.translation);
+        assert_eq!(later_child_vertex.position, later_mount.translation);
+        assert_ne!(first_fx_anchor[0][3], later_fx_anchor[0][3]);
+        assert_ne!(first_fx_anchor[1][3], later_fx_anchor[1][3]);
+
+        update_control_animation_pose_buffers(&mut instances, &mut poses, 225)
+            .expect("repeat the same timeline sample");
+        update_dynamic_component_geometry(&geometry, &poses, &mut mounts, &mut mesh)
+            .expect("repeat the same geometry update");
+        refresh_dynamic_shadow_casters(
+            &mut shadow_casters,
+            &dynamic_shadow_casters,
+            &mesh,
+            &poses,
+            &mounts,
+        )
+        .expect("repeat the same caster refresh");
+        assert_eq!(shadow_casters[0].sphere, later_shadow_sphere);
+        assert_eq!(shadow_casters[0].triangles, later_shadow_triangles);
+
+        update_control_animation_pose_buffers(&mut instances, &mut poses, 0)
+            .expect("return to the initial timeline sample");
+        update_dynamic_component_geometry(&geometry, &poses, &mut mounts, &mut mesh)
+            .expect("return to the initial geometry");
+        refresh_dynamic_shadow_casters(
+            &mut shadow_casters,
+            &dynamic_shadow_casters,
+            &mesh,
+            &poses,
+            &mounts,
+        )
+        .expect("rebuild the initial caster after a later pose");
+        assert_eq!(shadow_casters[0].sphere, first_shadow_sphere);
+        assert_eq!(shadow_casters[0].triangles, first_shadow_triangles);
+    }
+
+    #[test]
+    fn visible_exto_parent_refreshes_child_mount_without_parent_geometry() {
+        let make_record = |kind, immediate_child_count| fparkan_prototype::UnitComponentRecord {
+            archive_raw: [0; 32],
+            resource_raw: [0; 32],
+            kind,
+            parent_or_link: 1,
+            description_raw: [0; 32],
+            tail0: 0,
+            immediate_child_count,
+        };
+        let records = vec![
+            make_record(0, 1),
+            make_record(PROTOTYPE_TYPE_EXTO, 1),
+            make_record(PROTOTYPE_TYPE_EXTO, 0),
+        ];
+        let tree = unit_component_tree(&records).expect("valid three-record component tree");
+        assert_eq!(tree[2].parent_index, Some(1));
+        assert!(tree[1].parent_index.expect("parent has root") < 2);
+        assert!(unit_component_is_visible(1, Some(records[1].kind)));
+
+        let identity_transform = LegacyIron3dEulerTransform {
+            translation: [0.0; 3],
+            orientation_radians: [0.0; 3],
+        };
+        let mut parent_model = animated_socket_model();
+        parent_model.slots.clear();
+        parent_model.positions.clear();
+        parent_model.normals = None;
+        parent_model.uv0 = None;
+        parent_model.uv1 = None;
+        parent_model.indices.clear();
+        parent_model.batches.clear();
+        let initial_parent_pose =
+            node38_sampled_hierarchy_at_times(&parent_model, &[Some(AnimationTime(0.0)), None])
+                .expect("animated parent hierarchy without mesh geometry");
+        let parent_mesh = project_msh_to_static_mesh_in_world_space_with_node_pose_buffer(
+            &parent_model,
+            identity_transform,
+            [1.0; 3],
+            &initial_parent_pose,
+        )
+        .expect("parent with no geometry projects successfully");
+        assert!(parent_mesh.vertices.is_empty());
+
+        let child_model = static_child_model();
+        let child_pose = node38_fallback_hierarchy(&child_model).expect("static child pose");
+        let initial_mount =
+            node38_pose_from_hierarchy(&initial_parent_pose, 1).expect("visible parent socket");
+        let mut mounts = vec![vec![None, None, Some(initial_mount)]];
+        let parent_mount = tree[2]
+            .parent_index
+            .filter(|parent_index| {
+                mounts[0][*parent_index].is_some()
+                    || unit_component_is_visible(*parent_index, Some(records[*parent_index].kind))
+            })
+            .map(|parent_index| {
+                (
+                    parent_index,
+                    usize::try_from(records[2].parent_or_link).expect("valid EXTO parent socket"),
+                )
+            });
+        assert_eq!(parent_mount, Some((1, 1)));
+
+        let child_mesh = project_msh_to_static_mesh_in_world_space_with_node_pose_buffer_and_mount(
+            &child_model,
+            identity_transform,
+            [1.0; 3],
+            &child_pose,
+            initial_mount,
+        )
+        .expect("initial child mesh");
+        let mut mesh = VulkanStaticMesh {
+            vertices: child_mesh.vertices,
+            indices: child_mesh.indices,
+            draw_ranges: Vec::new(),
+        };
+        let control = socket_timeline_control();
+        let controls = vec![None, Some(control.clone()), None];
+        assert!(control_tree_chain_has_tag21(2, Some(&tree), &controls));
+        let mut instances = vec![vec![
+            None,
+            Some(ControlAnimationInstance {
+                gate_values: initial_control_gate_values(&control),
+                control,
+                model: parent_model,
+                state: ControlInstanceState::default(),
+                last_sampled_node_times: Vec::new(),
+                reported_unsupported_fallback: false,
+            }),
+            None,
+        ]];
+        let mut poses = vec![vec![None, Some(initial_parent_pose), Some(child_pose)]];
+        let geometry = vec![vec![
+            None,
+            None,
+            Some(DynamicComponentGeometry {
+                model: child_model,
+                root_transform: identity_transform,
+                owner_scale: [1.0; 3],
+                parent_mount,
+                vertex_start: 0,
+                vertex_count: mesh.vertices.len(),
+            }),
+        ]];
+
+        update_control_animation_pose_buffers(&mut instances, &mut poses, 0)
+            .expect("initial visible parent timeline sample");
+        update_dynamic_component_geometry(&geometry, &poses, &mut mounts, &mut mesh)
+            .expect("initial child mount refresh");
+        let initial_child_vertex = mesh.vertices[0].position;
+        let initial_child_mount = mounts[0][2].expect("initial child mount");
+        assert_eq!(initial_child_vertex, initial_child_mount.translation);
+
+        update_control_animation_pose_buffers(&mut instances, &mut poses, 225)
+            .expect("later visible parent timeline sample");
+        update_dynamic_component_geometry(&geometry, &poses, &mut mounts, &mut mesh)
+            .expect("child mount refresh without parent geometry descriptor");
+        let later_child_mount = mounts[0][2].expect("later child mount");
+        assert_ne!(
+            initial_child_mount.translation,
+            later_child_mount.translation
+        );
+        assert_eq!(mesh.vertices[0].position, later_child_mount.translation);
+    }
+
+    #[test]
+    fn dynamic_shadow_sphere_union_keeps_the_containing_input_sphere() {
+        let small = ShadowSphere {
+            center: [0.0; 3],
+            radius: 1.0,
+        };
+        let large = ShadowSphere {
+            center: [1.0, 0.0, 0.0],
+            radius: 10.0,
+        };
+
+        assert_eq!(
+            shadow_sphere_enclosing_current_geometry(small, large, &[])
+                .expect("large current native sphere contains baseline"),
+            large
+        );
+        assert_eq!(
+            shadow_sphere_enclosing_current_geometry(large, small, &[])
+                .expect("large baseline sphere contains current native sphere"),
+            large
+        );
+    }
+
+    fn endpoint_op3_command() -> FxCommand {
+        let mut body = vec![0; 0xc4];
+        write_effect_u32(&mut body, 0, 2);
+        write_effect_f32(&mut body, 0x04, 0.0);
+        write_effect_f32(&mut body, 0x08, 1.0);
+        write_effect_f32(&mut body, 0x0c, 1.0);
+        write_effect_f32(&mut body, 0x10, 0.0);
+        write_effect_f32(&mut body, 0x14, 1.0);
+        write_effect_f32(&mut body, 0x18, 1.0);
+        write_effect_f32(&mut body, 0x1c, 0.0);
+        write_effect_f32(&mut body, 0x20, 1.0);
+        write_effect_vec3(&mut body, 0x24, [0.0; 3]);
+        write_effect_vec3(&mut body, 0x30, [0.0; 3]);
+        write_effect_vec3(&mut body, 0x3c, [1.0; 3]);
+        write_effect_vec3(&mut body, 0x48, [0.0, 0.0, 1.0]);
+        write_effect_vec3(&mut body, 0x54, [0.0, 0.0, 1.0]);
+        write_effect_vec3(&mut body, 0x60, [1.0; 3]);
+        write_effect_vec3(&mut body, 0x6c, [1.0; 3]);
+        write_effect_vec3(&mut body, 0x78, [1.0; 3]);
+        body[0x84..0x84 + 11].copy_from_slice(b"effects.rlb");
+        let name = b"f_smalllight_y";
+        body[0xa4..0xa4 + name.len()].copy_from_slice(name);
+        FxCommand {
+            word: 3,
+            opcode: FxOpcode::Op3,
+            native_flag: false,
+            raw_body: Arc::from(body),
+            resource_refs: Vec::new(),
+        }
+    }
+
+    fn endpoint_op1_command(effect_type: u32, start: f32, end: f32) -> FxCommand {
+        let mut body = vec![0; 132];
+        write_effect_u32(&mut body, 0, effect_type);
+        write_effect_f32(&mut body, 4, start);
+        write_effect_f32(&mut body, 8, end);
+        write_effect_vec3(&mut body, 12, [1.0, 0.0, 0.0]);
+        write_effect_vec3(&mut body, 24, [3.0, 0.0, 0.0]);
+        write_effect_vec3(&mut body, 36, [0.0, 1.0, 0.0]);
+        write_effect_vec3(&mut body, 48, [0.0, 1.0, 0.0]);
+        for (index, value) in [0.0, 1.0, 0.5, 1.0].into_iter().enumerate() {
+            write_effect_f32(&mut body, 60 + index * 4, value);
+        }
+        for (index, value) in [0.5, 0.0, 1.0, 1.0].into_iter().enumerate() {
+            write_effect_f32(&mut body, 76 + index * 4, value);
+        }
+        write_effect_f32(&mut body, 108, 10.0);
+        write_effect_f32(&mut body, 112, 20.0);
+        write_effect_f32(&mut body, 116, 1.0);
+        write_effect_vec3(&mut body, 120, [1.0, 0.5, 0.25]);
+        FxCommand {
+            word: 1,
+            opcode: FxOpcode::Op1,
+            native_flag: false,
+            raw_body: Arc::from(body),
+            resource_refs: Vec::new(),
+        }
+    }
+
+    fn endpoint_gener_ball_command(opcode: FxOpcode) -> FxCommand {
+        let is_op9 = opcode == FxOpcode::Op9;
+        let mut body = vec![0; if is_op9 { 0xcc } else { 0xc8 }];
+        write_effect_u32(&mut body, 0, if is_op9 { 2 } else { 0 });
+        write_effect_f32(&mut body, 0x04, 0.0);
+        write_effect_f32(&mut body, 0x08, 1.0);
+        write_effect_f32(&mut body, 0x0c, 1.0);
+        write_effect_f32(&mut body, 0x10, 0.0);
+        write_effect_f32(&mut body, 0x14, 1.0);
+        write_effect_f32(&mut body, 0x18, 1.0);
+        write_effect_f32(&mut body, 0x1c, 0.75);
+        write_effect_f32(&mut body, 0x20, 1.0);
+        write_effect_vec3(&mut body, 0x24, [0.0; 3]);
+        write_effect_vec3(&mut body, 0x30, [0.0; 3]);
+        write_effect_vec3(&mut body, 0x3c, [1.0; 3]);
+        write_effect_vec3(&mut body, 0x48, [0.0, 1.0, 0.0]);
+        write_effect_vec3(&mut body, 0x54, [0.0, 1.0, 0.0]);
+        write_effect_vec3(&mut body, 0x60, [1.0; 3]);
+        write_effect_vec3(&mut body, 0x6c, [1.0; 3]);
+        write_effect_vec3(&mut body, 0x78, [1.0; 3]);
+        body[0x84..0x84 + 12].copy_from_slice(b"material.lib");
+        let name = if is_op9 {
+            b"laser_y_hit".as_slice()
+        } else {
+            b"glow_y"
+        };
+        body[0xa4..0xa4 + name.len()].copy_from_slice(name);
+        if is_op9 {
+            write_effect_u32(&mut body, 0xc4, 0);
+        } else {
+            write_effect_f32(&mut body, 0xc4, 500.0);
+        }
+        FxCommand {
+            word: if is_op9 { 9 } else { 4 },
+            opcode,
+            native_flag: false,
+            raw_body: Arc::from(body),
+            resource_refs: Vec::new(),
+        }
+    }
+
+    fn endpoint_op8_command(pool_count: u32) -> FxCommand {
+        let mut body = vec![0; 0xf4];
+        write_effect_u32(&mut body, 0x20, pool_count);
+        FxCommand {
+            word: 8,
+            opcode: FxOpcode::Op8,
+            native_flag: false,
+            raw_body: Arc::from(body),
+            resource_refs: Vec::new(),
+        }
+    }
+
+    fn endpoint_op7_command(
+        mode: u32,
+        material_phase_factor: f32,
+        acceleration: f32,
+        pool_count: u32,
+        copies_per_group: u32,
+    ) -> FxCommand {
+        let mut body = vec![0; 0xCC];
+        write_effect_u32(&mut body, 0x00, mode);
+        write_effect_f32(&mut body, 0x1C, material_phase_factor);
+        write_effect_u32(&mut body, 0x20, pool_count);
+        write_effect_u32(&mut body, 0x24, copies_per_group);
+        write_effect_f32(&mut body, 0x88, acceleration);
+        FxCommand {
+            word: 7,
+            opcode: FxOpcode::Op7,
+            native_flag: false,
+            raw_body: Arc::from(body),
+            resource_refs: Vec::new(),
+        }
+    }
+
+    fn endpoint_effect_frame(command_index: usize) -> fparkan_fx::fx_visual::EffectQuadFrame {
+        fparkan_fx::fx_visual::EffectQuadFrame {
+            command_index,
+            opcode: FxOpcode::Op7,
+            material: fparkan_fx::environment::EffectResource {
+                archive: "material.lib".to_owned(),
+                name: "smoke_yg".to_owned(),
+            },
+            vertices: [[0.0; 3]; 4],
+            uv: [[0.0; 2]; 4],
+            color: [1.0; 4],
+            material_phase: 0.25,
+            elapsed_seconds: 0.5,
+            normalized_time: 0.5,
+            active: true,
+            native_flag_base: None,
+        }
     }
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
-    }
-
-    fn scene_frame_update(sample: FrameClockSample, viewport: [f32; 2]) -> SceneFrameUpdate {
-        let aspect = viewport[0] / viewport[1];
-        let camera = FreeFlightCamera {
-            position: [0.0; 3],
-            yaw: 0.0,
-            pitch: 0.0,
-            horizontal_fov: 1.0,
-            near_plane: 0.1,
-            far_plane: 100.0,
-            move_speed: 1.0,
-            ground_clearance: 0.0,
-        }
-        .preview_frame(aspect);
-        SceneFrameUpdate {
-            sample,
-            camera,
-            viewport,
-            aspect,
-            material_update: MaterialFrameUpdate::default(),
-            environment_material_update: None,
-            environment: None,
-        }
     }
 
     #[test]
@@ -9323,9 +13015,12 @@ mod tests {
         };
         let mut bindings = vec![MaterialAnimationBinding {
             initial_phase_index: 0,
+            normalized_phase_override: None,
+            ambient_fx_material_alpha: false,
             variants: vec![MaterialVariantSet {
                 phase_material_indices: vec![10],
                 range_indices: vec![0, 2],
+                pipeline_category: 0,
             }],
             base: empty_binding(),
             detail: None,
@@ -9397,6 +13092,7 @@ mod tests {
         let variant = MaterialVariantSet {
             phase_material_indices: vec![10, 11],
             range_indices: vec![3],
+            pipeline_category: 1,
         };
         let category_for = |material_index| match material_index {
             10 => Some(1),
@@ -9471,36 +13167,33 @@ mod tests {
     }
 
     #[test]
-    fn animated_shadow_bounds_rebuild_from_native_baseline() {
-        let baseline = ShadowSphere {
-            center: [0.0; 3],
-            radius: 1.0,
-        };
-        let pose_a = [shadow_triangle(
-            [[0.5, 0.0, 0.0], [0.0, 0.5, 0.0], [0.0, 0.0, 0.5]],
-            0,
-        )];
-        let pose_b = [shadow_triangle(
-            [[3.0, 0.0, 0.0], [4.0, 0.0, 0.0], [3.0, 1.0, 0.0]],
-            0,
-        )];
+    fn projected_shadow_alone_uses_decal_depth_bias() {
+        let shadow = projected_shadow_pipeline_state();
+        assert_eq!(shadow.blend, LegacyBlendMode::SourceAlpha);
+        assert_eq!(shadow.depth, LegacyDepthMode::TestReadOnly);
+        assert_eq!(shadow.depth_bias, LegacyDepthBias::ProjectedDecal);
+        assert_eq!(
+            world_pipeline_state(LegacyBlendMode::Opaque, LegacyDepthMode::TestWrite).depth_bias,
+            LegacyDepthBias::Disabled
+        );
+    }
 
-        let first_a =
-            shadow_sphere_enclosing_triangles(baseline, &pose_a).expect("initial animated bounds");
-        assert_eq!(first_a, baseline);
-        let at_b =
-            shadow_sphere_enclosing_triangles(baseline, &pose_b).expect("expanded animated bounds");
-        assert!((at_b.center[0] - 1.5).abs() < 1.0e-5);
-        assert!((at_b.radius - 2.5).abs() < 1.0e-5);
-        assert!(length3(at_b.center).expect("finite sphere center") + 1.0 <= at_b.radius);
-        for point in pose_b.iter().flat_map(|triangle| triangle.positions) {
-            assert!(
-                length3(sub3(point, at_b.center)).expect("finite point distance") <= at_b.radius
-            );
-        }
-        let second_a = shadow_sphere_enclosing_triangles(baseline, &pose_a)
-            .expect("return to first animated pose");
-        assert_eq!(second_a, first_a);
+    #[test]
+    fn shadow_atlas_texture_equality_includes_pixels_and_mip_layout() {
+        let uploaded = shadow_atlas_texture();
+        assert_eq!(shadow_atlas_texture(), uploaded);
+
+        let mut changed_rgba = uploaded.clone();
+        changed_rgba.rgba8[0] ^= 1;
+        assert_ne!(changed_rgba, uploaded);
+
+        let mut changed_mip_pixels = uploaded.clone();
+        changed_mip_pixels.mip_levels[0].rgba8[0] ^= 1;
+        assert_ne!(changed_mip_pixels, uploaded);
+
+        let mut changed_mip = uploaded.clone();
+        changed_mip.mip_levels[0].width -= 1;
+        assert_ne!(changed_mip, uploaded);
     }
 
     #[test]
@@ -9573,6 +13266,7 @@ mod tests {
                 control_clock_ms: None,
                 validation: false,
                 readback_out: None,
+                readback_sequence_out: None,
                 preview_roots: NonZeroUsize::MAX,
                 legacy_camera_capture: None,
                 static_animation_frame: None,
@@ -9597,44 +13291,810 @@ mod tests {
     }
 
     #[test]
-    fn replay_clock_stays_on_one_sample_until_presented() {
-        let mut lifecycle = SceneFrameLifecycle::default();
-        let first = lifecycle.sample_replay(500, 101);
-        assert_eq!(first.id, SceneSampleId::Replay(0));
-        assert_eq!(first.time_ms, 0);
-        assert_eq!(first.delta_seconds, 0.0);
-        let update = scene_frame_update(first, [1280.0, 720.0]);
-        assert!(lifecycle.prepare(update.clone()));
+    fn control_clock_replays_one_shared_clock_from_zero_to_target() {
+        assert_eq!(control_clock_ms_for_frame(500, 0, 101), 0);
+        assert_eq!(control_clock_ms_for_frame(500, 50, 101), 250);
+        assert_eq!(control_clock_ms_for_frame(500, 100, 101), 500);
+        assert_eq!(control_clock_ms_for_frame(500, 1000, 101), 500);
+        assert_eq!(control_clock_ms_for_frame(500, 0, 1), 500);
+        assert_eq!(control_clock_mode_label(Some(0)), "fixed-0ms");
+        assert_eq!(control_clock_mode_label(Some(500)), "ramp-0-to-500ms");
+        assert_eq!(control_clock_mode_label(None), "realtime");
+    }
 
-        // A swapchain recreation retries the same packet and does not count a frame.
-        assert_eq!(lifecycle.sample_replay(500, 101), first);
-        assert_eq!(lifecycle.frames_presented, 0);
-        assert_eq!(lifecycle.pending.as_ref(), Some(&update));
-        assert_eq!(lifecycle.record_presented(), Some(0));
+    fn clock_test_app(
+        control_clock_target_ms: Option<u32>,
+    ) -> (StaticVulkanApp, ControlEffectInstanceKey) {
+        let phase = |additive_red| MaterialPhase {
+            parameters: [
+                additive_red,
+                0,
+                0,
+                100,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+            texture_raw: [0; 16],
+        };
+        let document = Mat0Document {
+            version: 0,
+            animation_block_count: 1,
+            phases: vec![phase(0), phase(255)],
+            prefix: Vec::new(),
+            header_opaque: [0; 2],
+            animation_blocks: vec![MaterialAnimationBlock {
+                header_raw: 0,
+                keys: vec![
+                    MaterialKey {
+                        k0: 0,
+                        k1: 500,
+                        k2: 0,
+                    },
+                    MaterialKey {
+                        k0: 1,
+                        k1: 1000,
+                        k2: 0,
+                    },
+                ],
+                bytes: Vec::new(),
+            }],
+        };
+        let material_animation = MaterialAnimationBinding {
+            initial_phase_index: 0,
+            normalized_phase_override: None,
+            ambient_fx_material_alpha: false,
+            variants: vec![MaterialVariantSet {
+                phase_material_indices: vec![0, 1],
+                range_indices: vec![0],
+                pipeline_category: 0,
+            }],
+            base: MaterialPhaseBinding {
+                document,
+                animation_block_index: 0,
+                wear_row_start_ms: 0,
+                random_state: 0,
+                frozen_phase_index: None,
+                phase_uv_transforms: vec![[0.0, 0.0, 1.0, 1.0]; 2],
+            },
+            detail: None,
+            overlay: None,
+            overlay_detail: None,
+            stage_textures: None,
+        };
+        let mut materials = Vec::new();
+        append_environment_gradient_material(&mut materials)
+            .expect("first animated material variant");
+        append_environment_gradient_material(&mut materials)
+            .expect("second animated material variant");
 
-        let second = lifecycle.sample_replay(500, 101);
-        assert_eq!(second.id, SceneSampleId::Replay(1));
-        assert_eq!(second.time_ms, 5);
-        assert!((second.delta_seconds - 0.005).abs() < f32::EPSILON);
+        let key = ControlEffectInstanceKey {
+            object_index: 0,
+            component_index: 0,
+            table_index: 0,
+            row_index: 0,
+        };
+        let control_slot = ControlPointLightSlot {
+            time_mode: 1,
+            header_flags: 9,
+            random_instance_key: key,
+            random_seed: 0x1234_5678,
+            phase_jitter: 0.25,
+            random_shift: [2.0, 3.0, 4.0],
+            duration_seconds: 1.0,
+            owner_object_index: 0,
+            owner_component_index: 0,
+            owner_node_index: 0,
+            owner_component_is_mounted: false,
+            root_transform: LegacyIron3dEulerTransform {
+                translation: [10.0, 20.0, 30.0],
+                orientation_radians: [0.0; 3],
+            },
+            owner_scale: [1.0; 3],
+            mount_pose: None,
+            local_from_effect: [
+                [1.0, 0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0, 2.0],
+                [0.0, 0.0, 1.0, 3.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            world_from_effect: [[0.0; 4]; 4],
+            command_index: 0,
+            command: endpoint_op1_command(6, 0.5, 1.0),
+        };
+
+        let sky_materials = SkyMaterials::default();
+        let sky =
+            SkySystem::new(Default::default(), sky_materials.clone()).expect("test sky topology");
+        let environment = DynamicEnvironment {
+            schedule: TypedAtmosphere {
+                marker: 0,
+                version: 0,
+                tracks: Vec::new(),
+                trailer: Default::default(),
+            },
+            sky,
+            environment: EnvironmentSystem::new(0x4650_4152_4B41_4E),
+            materials: sky_materials,
+            material_assets: HashMap::new(),
+            schedule_offset_seconds: 0.0,
+            time_seconds: 0.0,
+            fixed_schedule_seconds: None,
+            fixed_phase_reported: false,
+        };
+
+        let mut land = fparkan_terrain_format::LandMeshDocument {
+            streams: Vec::new(),
+            nodes_raw: Vec::new(),
+            slots: fparkan_terrain_format::TerrainSlotTable {
+                header_raw: Vec::new(),
+                slots_raw: Vec::new(),
+            },
+            positions: vec![[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0]],
+            normals: Vec::new(),
+            uv0: Vec::new(),
+            accelerator: Vec::new(),
+            aux14: Vec::new(),
+            aux18: Vec::new(),
+            faces: vec![fparkan_terrain_format::TerrainFace28 {
+                flags: FullSurfaceMask(1),
+                material_tag: 0,
+                aux_tag: 0,
+                vertices: [0, 1, 2],
+                neighbors: [None, None, None],
+                tail_raw: [0; 8],
+                raw: [0; 28],
+            }],
+        };
+        set_test_terrain_lod_slots(&mut land, &[[0, u16::MAX]], &[[0, 1]]);
+        let terrain =
+            Arc::new(TerrainWorld::from_land_msh(&land).expect("clock test LOD0 terrain"));
+        let free_camera = FreeFlightCamera {
+            position: [2.0, 2.0, 5.0],
+            yaw: 0.25,
+            pitch: -0.1,
+            horizontal_fov: 1.3,
+            near_plane: 0.5,
+            far_plane: 700.0,
+            move_speed: 4.0,
+            ground_clearance: 0.0,
+        };
+        let view_camera = free_camera.preview_frame(16.0 / 9.0);
+        let preview = StaticPreviewScene {
+            mesh: VulkanStaticMesh {
+                vertices: [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
+                    .into_iter()
+                    .map(|position| VulkanStaticVertex {
+                        position,
+                        color: [1.0; 3],
+                        normal: [0.0, 0.0, 1.0],
+                        uv: [0.0; 2],
+                        detail_uv: [0.0; 2],
+                        overlay_alpha: 0.0,
+                    })
+                    .collect(),
+                indices: vec![0, 1, 2],
+                draw_ranges: vec![VulkanStaticDrawRange {
+                    first_index: 0,
+                    index_count: 3,
+                    material_index: 0,
+                    lightmap_index: u8::MAX,
+                    batch_flags: 0,
+                    terrain_base_only: false,
+                    pipeline_state: world_pipeline_state(
+                        LegacyBlendMode::Opaque,
+                        LegacyDepthMode::TestReadOnly,
+                    ),
+                    alpha_test_reference: 0,
+                }],
+            },
+            native_handedness_by_range: HashMap::new(),
+            type16_present_ranges: HashSet::new(),
+            materials,
+            material_animations: vec![material_animation],
+            ambient_effect_slots: Vec::new(),
+            control_point_light_slots: vec![control_slot],
+            component_pose_buffers: vec![vec![None]],
+            component_mount_poses: vec![vec![None]],
+            dynamic_component_geometry: Vec::new(),
+            building_collision_bindings: Vec::new(),
+            control_animation_instances: Vec::new(),
+            dynamic_shadow_casters: Vec::new(),
+            sun_occlusion_range_indices: Vec::new(),
+            shadow_casters: Vec::new(),
+            shadow_receivers: Vec::new(),
+            shadow_material_index: 0,
+            terrain: terrain.clone(),
+            camera: view_camera.vulkan_camera(),
+            view_camera,
+            captured_viewport: None,
+            free_camera: Some(free_camera),
+            camera_mode: "test",
+            mesh_components: 0,
+            terrain_components: 0,
+        };
+        let app = StaticVulkanApp::new(
+            preview,
+            Some(environment),
+            None,
+            EnvironmentGpuRange {
+                range_index: 1,
+                vertex_start: 3,
+                vertex_capacity: 0,
+                material_index: 0,
+            },
+            3,
+            3,
+            None,
+            2,
+            "clock-test",
+            1,
+            None,
+            None,
+            false,
+            control_clock_target_ms,
+            StartupTimings::default(),
+        );
+        (app, key)
+    }
+
+    fn control_random_snapshot(
+        state: &ControlEffectRandomState,
+    ) -> (
+        u32,
+        u32,
+        ControlEffectRandomSample,
+        Option<SceneSampleId>,
+        Option<u32>,
+    ) {
+        (
+            state.phase_and_z_rng.state,
+            state.xy_rng.state,
+            state.sample,
+            state.last_update_id,
+            state.last_update_clock_ms,
+        )
     }
 
     #[test]
-    fn replay_clock_requires_at_least_two_requested_frames() {
-        for frame_count in ["0", "1"] {
-            assert!(Args::parse(&strings(&[
-                "--root",
-                "testdata/IS",
-                "--mission",
-                "MISSIONS/Autodemo.00/data.tma",
-                "--frames",
-                frame_count,
-                "--control-clock-ms",
-                "500",
-            ]))
-            .unwrap_err()
-            .contains("--frames of at least 2"));
-        }
+    fn live_clock_samples_have_increasing_ids_and_monotonic_time() {
+        let (mut app, _) = clock_test_app(None);
+        let first = app.sample_frame_clock();
+        let second = app.sample_frame_clock();
+        assert_eq!(first.id, SceneSampleId::Live(0));
+        assert_eq!(second.id, SceneSampleId::Live(1));
+        assert!(second.time_ms >= first.time_ms);
+        assert!(second.delta_seconds >= 0.0);
+    }
 
+    #[test]
+    fn zero_extent_resume_does_not_add_minimized_time_to_live_clock() {
+        let (mut app, _) = clock_test_app(None);
+        let started = Instant::now();
+        app.simulation_last_tick = started;
+        app.pause_live_clock_at(started);
+        assert!(app.live_clock_paused_for_zero_extent);
+
+        let restored = started + Duration::from_secs(600);
+        app.resume_live_clock_at(restored);
+        assert!(!app.live_clock_paused_for_zero_extent);
+        assert_eq!(app.simulation_last_tick, restored);
+
+        let resumed = app.sample_live_frame_clock_at(restored + Duration::from_millis(16));
+        assert_eq!(resumed.id, SceneSampleId::Live(0));
+        assert_eq!(resumed.time_ms, 16);
+        assert!((resumed.delta_seconds - 0.016).abs() < 1.0e-6);
+        assert_eq!(app.simulation_elapsed, Duration::from_millis(16));
+    }
+
+    #[test]
+    fn live_cpu_updates_sample_materials_effect_rng_and_environment_without_renderer() {
+        let (mut app, key) = clock_test_app(None);
+        app.render_scene_update()
+            .expect("an early redraw without a packet is a no-op");
+        assert!(app.pending_scene_update.is_none());
+        assert_eq!(app.frames_presented, 0);
+        assert_eq!(app.simulation_update_generation, 0);
+
+        let mut first = app.sample_frame_clock();
+        assert_eq!(first.id, SceneSampleId::Live(0));
+        first.time_ms = 0;
+        first.delta_seconds = 0.1;
+        app.prepare_scene_update(first, [1280.0, 720.0])
+            .expect("prepare a live CPU frame without a renderer");
+        assert!(app.renderer.is_none());
+        let first_frame = app.pending_scene_update.as_ref().expect("sampled frame");
+        assert_eq!(
+            first_frame.material_update.active_materials[&0].phase_index,
+            0
+        );
+        assert!(!first_frame
+            .environment
+            .as_ref()
+            .unwrap()
+            .sky_mesh
+            .vertices
+            .is_empty());
+        let first_random = control_random_snapshot(&app.control_effect_random_states[&key]);
+        assert_eq!(first_random.3, Some(SceneSampleId::Live(0)));
+        assert_ne!(first_random.0, 0);
+        assert_ne!(first_random.1, 0);
+        let first_environment_time = app.environment.as_ref().unwrap().time_seconds;
+        assert!(first_environment_time > 0.0);
+        let first_vertices = app.mesh.vertices.clone();
+
+        for _ in 0..2 {
+            app.render_scene_update()
+                .expect("renderer-free redraw does not sample simulation state");
+        }
+        assert_eq!(
+            control_random_snapshot(&app.control_effect_random_states[&key]),
+            first_random
+        );
+        assert_eq!(
+            app.environment.as_ref().unwrap().time_seconds,
+            first_environment_time
+        );
+        assert_eq!(app.mesh.vertices, first_vertices);
+        assert_eq!(app.simulation_update_generation, 1);
+
+        let mut next = app.sample_frame_clock();
+        assert_eq!(next.id, SceneSampleId::Live(1));
+        next.time_ms = 500;
+        next.delta_seconds = 0.5;
+        app.prepare_scene_update(next, [1280.0, 720.0])
+            .expect("replace the latest live packet");
+        assert_eq!(app.simulation_update_generation, 2);
+        assert_eq!(
+            app.pending_scene_update.as_ref().unwrap().clock.id,
+            SceneSampleId::Live(1)
+        );
+        assert_ne!(
+            control_random_snapshot(&app.control_effect_random_states[&key]),
+            first_random
+        );
+        assert!(app.environment.as_ref().unwrap().time_seconds > first_environment_time);
+        assert_eq!(
+            app.pending_scene_update
+                .as_ref()
+                .unwrap()
+                .material_update
+                .active_materials[&0]
+                .phase_index,
+            1
+        );
+        assert_eq!(
+            app.pending_scene_update.as_ref().unwrap().clock.time_ms,
+            500
+        );
+    }
+
+    #[test]
+    fn live_pending_resize_reuses_225ms_packet_across_zero_extent_pause() {
+        let (mut app, key) = clock_test_app(None);
+        let started = Instant::now();
+        app.simulation_last_tick = started;
+        app.pressed_keys.insert(KeyCode::KeyE);
+
+        let first = app.sample_live_frame_clock_at(started + Duration::from_millis(225));
+        assert_eq!(first.id, SceneSampleId::Live(0));
+        assert_eq!(first.time_ms, 225);
+        assert!((first.delta_seconds - 0.225).abs() < 1.0e-6);
+        app.prepare_scene_update(first, [1280.0, 720.0])
+            .expect("sample one 225 ms live packet");
+        let first_frame = app.pending_scene_update.as_ref().unwrap();
+        let first_camera = first_frame.camera;
+        let expected_resized_camera = app
+            .free_camera
+            .expect("free-flight input controller")
+            .preview_frame(4.0 / 3.0);
+        let first_effect_updates = first_frame.effect_updates.clone();
+        let first_material_phase = first_frame.material_update.active_materials[&0].phase_index;
+        let weather = WeatherInput {
+            rain: WeatherState::new(true, 0.03, [0.7, 0.8, 1.0, 0.6]),
+            snow: WeatherState::new(true, 0.03, [0.9, 0.95, 1.0, 0.8]),
+            ..WeatherInput::clear()
+        };
+        let mut weather_system = EnvironmentSystem::new(0xC1_225);
+        let first_environment_frame = weather_system.update(
+            0.225,
+            weather,
+            environment_camera_for_preview(&first_camera, 16.0 / 9.0, [1280.0, 720.0]),
+        );
+        let mut precipitation_counts = [0usize; 2];
+        for primitive in &first_environment_frame.primitives {
+            if let EnvironmentPrimitive::Particle { kind, .. } = primitive {
+                let slot = match kind {
+                    PrecipitationKind::Rain => 0,
+                    PrecipitationKind::Snow => 1,
+                };
+                precipitation_counts[slot] += 1;
+            }
+        }
+        assert!(precipitation_counts.iter().all(|count| *count >= 17));
+        app.pending_scene_update
+            .as_mut()
+            .unwrap()
+            .environment
+            .as_mut()
+            .unwrap()
+            .environment_frame = first_environment_frame.clone();
+        let first_random = control_random_snapshot(&app.control_effect_random_states[&key]);
+        let first_environment_time = app.environment.as_ref().unwrap().time_seconds;
+        let first_environment_system_time =
+            app.environment.as_ref().unwrap().environment.time_seconds();
+        let first_vertices = app.mesh.vertices.clone();
+        assert!((first_camera.position[2] - 5.4).abs() < 1.0e-5);
+        assert_eq!(app.simulation_elapsed, Duration::from_millis(225));
+        assert_eq!(app.simulation_update_generation, 1);
+
+        app.pause_live_clock_at(started + Duration::from_millis(250));
+        let restored = started + Duration::from_secs(10);
+        app.resume_live_clock_at(restored);
+        app.free_camera.as_mut().unwrap().look_delta(64.0, -24.0);
+        let controller_after_input = app.free_camera.unwrap();
+        let retry = app.pending_or_sample_frame_clock();
+        assert_eq!(retry, first);
+        assert_eq!(app.simulation_update_generation, 1);
+        assert_eq!(app.simulation_elapsed, Duration::from_millis(225));
+        assert_eq!(app.simulation_last_tick, restored);
+
+        app.prepare_scene_update(retry, [1024.0, 768.0])
+            .expect("refresh only the pending packet's viewport");
+        let retry_frame = app.pending_scene_update.as_ref().unwrap();
+        assert_eq!(retry_frame.clock, first);
+        assert_eq!(retry_frame.viewport, [1024.0, 768.0]);
+        assert_eq!(retry_frame.aspect, 4.0 / 3.0);
+        assert_eq!(retry_frame.camera.position, first_camera.position);
+        assert_eq!(retry_frame.camera.forward, first_camera.forward);
+        assert_eq!(retry_frame.camera.right, first_camera.right);
+        assert_eq!(retry_frame.camera.up, first_camera.up);
+        assert_eq!(
+            retry_frame.camera.position,
+            expected_resized_camera.position
+        );
+        assert_eq!(retry_frame.camera.forward, expected_resized_camera.forward);
+        assert_eq!(retry_frame.camera.right, expected_resized_camera.right);
+        assert_eq!(retry_frame.camera.up, expected_resized_camera.up);
+        assert!(
+            (retry_frame.camera.vertical_fov - expected_resized_camera.vertical_fov).abs() < 1.0e-6
+        );
+        assert!(retry_frame
+            .camera
+            .clip_from_world
+            .iter()
+            .zip(expected_resized_camera.clip_from_world)
+            .all(|(actual, expected)| (actual - expected).abs() < 1.0e-5));
+        assert_ne!(
+            retry_frame.camera.clip_from_world,
+            first_camera.clip_from_world
+        );
+        assert_eq!(app.free_camera, Some(controller_after_input));
+        assert_eq!(retry_frame.effect_updates, first_effect_updates);
+        assert_eq!(
+            retry_frame.material_update.active_materials[&0].phase_index,
+            first_material_phase
+        );
+        let retry_environment_frame = &retry_frame.environment.as_ref().unwrap().environment_frame;
+        assert_eq!(
+            retry_environment_frame.point_lights,
+            first_environment_frame.point_lights
+        );
+        assert_eq!(
+            retry_environment_frame.sounds,
+            first_environment_frame.sounds
+        );
+        let mut reprojected_counts = [0usize; 2];
+        for (sampled, refreshed) in first_environment_frame
+            .primitives
+            .iter()
+            .zip(&retry_environment_frame.primitives)
+        {
+            let (
+                EnvironmentPrimitive::Particle {
+                    kind: sampled_kind,
+                    position: sampled_position,
+                    velocity: sampled_velocity,
+                    size: sampled_size,
+                    screen: sampled_screen,
+                    ..
+                },
+                EnvironmentPrimitive::Particle {
+                    kind,
+                    position,
+                    velocity,
+                    size,
+                    screen,
+                    ..
+                },
+            ) = (sampled, refreshed)
+            else {
+                panic!("rain and snow fixture contains only precipitation particles");
+            };
+            assert_eq!(kind, sampled_kind);
+            assert_eq!(position, sampled_position);
+            assert_eq!(velocity, sampled_velocity);
+            assert_ne!(screen, sampled_screen);
+            let slot = match kind {
+                PrecipitationKind::Rain => 0,
+                PrecipitationKind::Snow => 1,
+            };
+            reprojected_counts[slot] += 1;
+            assert_ne!(size, sampled_size);
+        }
+        assert!(reprojected_counts.iter().all(|count| *count >= 17));
+        assert_eq!(
+            control_random_snapshot(&app.control_effect_random_states[&key]),
+            first_random
+        );
+        assert_eq!(
+            app.environment.as_ref().unwrap().time_seconds,
+            first_environment_time
+        );
+        assert_eq!(
+            app.environment.as_ref().unwrap().environment.time_seconds(),
+            first_environment_system_time
+        );
+        assert_eq!(app.mesh.vertices, first_vertices);
+
+        assert_eq!(app.record_presented_scene_frame(), 0);
+        let next = app.sample_live_frame_clock_at(restored + Duration::from_millis(16));
+        assert_eq!(next.id, SceneSampleId::Live(1));
+        assert_eq!(next.time_ms, 241);
+        assert!((next.delta_seconds - 0.016).abs() < 1.0e-6);
+        assert_eq!(app.simulation_elapsed, Duration::from_millis(241));
+        app.prepare_scene_update(next, [1024.0, 768.0])
+            .expect("the next sample adopts mouse input accumulated during retry");
+        let next_camera = app.pending_scene_update.as_ref().unwrap().camera;
+        assert_ne!(next_camera.forward, first_camera.forward);
+        assert_eq!(next_camera.forward, controller_after_input.forward());
+    }
+
+    #[test]
+    fn replay_retries_keep_one_packet_until_presented_then_advance_with_new_viewport() {
+        let (mut app, key) = clock_test_app(Some(500));
+        app.render_scene_update()
+            .expect("redraw without a pending packet does nothing");
+        assert_eq!(app.simulation_update_generation, 0);
+
+        let first = app.sample_frame_clock();
+        assert_eq!(
+            first,
+            FrameClockSample {
+                id: SceneSampleId::Replay(0),
+                time_ms: 0,
+                delta_seconds: 0.0,
+            }
+        );
+        app.prepare_scene_update(first, [1280.0, 720.0])
+            .expect("prepare the first replay frame");
+        let first_frame = app.pending_scene_update.as_ref().unwrap();
+        let first_camera = first_frame.camera;
+        let first_viewport = first_frame.viewport;
+        let first_aspect = first_frame.aspect;
+        let first_effect_updates = first_frame.effect_updates.clone();
+        let first_environment_mesh = first_frame.environment.as_ref().unwrap().sky_mesh.clone();
+        let first_environment_frame = first_frame
+            .environment
+            .as_ref()
+            .unwrap()
+            .environment_frame
+            .clone();
+        let first_material_phase = first_frame.material_update.active_materials[&0].phase_index;
+        let first_environment_time = app.environment.as_ref().unwrap().time_seconds;
+        let first_random = control_random_snapshot(&app.control_effect_random_states[&key]);
+        let first_vertices = app.mesh.vertices.clone();
+        assert_eq!(first_material_phase, 0);
+        assert_eq!(first_random.3, Some(SceneSampleId::Replay(0)));
+        assert_eq!(first_random.4, Some(0));
+        assert!(!first_environment_mesh.vertices.is_empty());
+
+        for _ in 0..2 {
+            app.render_scene_update()
+                .expect("renderer-free replay redraw is a retry");
+            let retry = app.sample_frame_clock();
+            assert_eq!(retry.id, SceneSampleId::Replay(0));
+            app.prepare_scene_update(retry, [1024.0, 768.0])
+                .expect("a resize retry reuses the current replay packet");
+        }
+        let retry_frame = app.pending_scene_update.as_ref().unwrap();
+        assert_eq!(retry_frame.camera.position, first_camera.position);
+        assert_eq!(retry_frame.camera.forward, first_camera.forward);
+        assert_eq!(retry_frame.camera.up, first_camera.up);
+        assert_eq!(retry_frame.viewport, [1024.0, 768.0]);
+        assert_eq!(retry_frame.aspect, 4.0 / 3.0);
+        assert_ne!(
+            retry_frame.camera.clip_from_world,
+            first_camera.clip_from_world
+        );
+        assert_ne!(retry_frame.viewport, first_viewport);
+        assert_ne!(retry_frame.aspect, first_aspect);
+        assert_eq!(retry_frame.effect_updates, first_effect_updates);
+        assert_eq!(
+            retry_frame.environment.as_ref().unwrap().sky_mesh,
+            first_environment_mesh
+        );
+        assert_eq!(
+            retry_frame.environment.as_ref().unwrap().environment_frame,
+            first_environment_frame
+        );
+        assert_eq!(
+            retry_frame.material_update.active_materials[&0].phase_index,
+            0
+        );
+        assert_eq!(
+            control_random_snapshot(&app.control_effect_random_states[&key]),
+            first_random
+        );
+        assert_eq!(
+            app.environment.as_ref().unwrap().time_seconds,
+            first_environment_time
+        );
+        assert_eq!(app.mesh.vertices, first_vertices);
+        assert_eq!(app.frames_presented, 0);
+
+        assert_eq!(app.record_presented_scene_frame(), 0);
+        assert_eq!(app.frames_presented, 1);
+        assert!(app.pending_scene_update.is_none());
+        let next = app.sample_frame_clock();
+        assert_eq!(next.id, SceneSampleId::Replay(1));
+        assert_eq!(next.time_ms, 500);
+        assert_eq!(next.delta_seconds, 0.5);
+        app.prepare_scene_update(next, [1024.0, 768.0])
+            .expect("the next presented replay frame samples the resized view");
+        let next_frame = app.pending_scene_update.as_ref().unwrap();
+        assert_eq!(next_frame.viewport, [1024.0, 768.0]);
+        assert_eq!(next_frame.aspect, 4.0 / 3.0);
+        assert_ne!(
+            next_frame.camera.clip_from_world,
+            first_camera.clip_from_world
+        );
+        assert_eq!(
+            next_frame.material_update.active_materials[&0].phase_index,
+            1
+        );
+        assert!(
+            (app.environment.as_ref().unwrap().time_seconds - first_environment_time - 0.5).abs()
+                < 1.0e-6
+        );
+        let next_random = control_random_snapshot(&app.control_effect_random_states[&key]);
+        assert_eq!(next_random.3, Some(SceneSampleId::Replay(1)));
+        assert_eq!(next_random.4, Some(500));
+        assert_ne!(next_random, first_random);
+        let next_camera = next_frame.camera;
+        let next_environment_mesh = next_frame.environment.as_ref().unwrap().sky_mesh.clone();
+        let next_environment_frame = next_frame
+            .environment
+            .as_ref()
+            .unwrap()
+            .environment_frame
+            .clone();
+
+        app.render_scene_update()
+            .expect("renderer-free draw does not advance the replay packet");
+        let repeated = app.sample_frame_clock();
+        assert_eq!(repeated.id, SceneSampleId::Replay(1));
+        app.prepare_scene_update(repeated, [800.0, 600.0])
+            .expect("duplicate replay frame is idempotent");
+        let repeated_frame = app.pending_scene_update.as_ref().unwrap();
+        assert_eq!(repeated_frame.viewport, [800.0, 600.0]);
+        assert_eq!(repeated_frame.aspect, 4.0 / 3.0);
+        assert_eq!(repeated_frame.camera, next_camera);
+        assert_eq!(
+            repeated_frame.environment.as_ref().unwrap().sky_mesh,
+            next_environment_mesh
+        );
+        assert_eq!(
+            repeated_frame
+                .environment
+                .as_ref()
+                .unwrap()
+                .environment_frame,
+            next_environment_frame
+        );
+        assert_eq!(
+            control_random_snapshot(&app.control_effect_random_states[&key]),
+            next_random
+        );
+        assert_eq!(
+            app.environment.as_ref().unwrap().time_seconds,
+            first_environment_time + 0.5
+        );
+        assert_eq!(app.frames_presented, 1);
+    }
+
+    #[test]
+    fn replay_environment_delta_uses_last_applied_clock_and_keeps_duplicates_at_zero() {
+        let initial = control_clock_ms_for_frame(500, 0, 101);
+        assert_eq!(initial, 0);
+        assert_eq!(replay_environment_delta_seconds(0, initial), 0.0);
+
+        let first = control_clock_ms_for_frame(500, 1, 101);
+        let repeated = control_clock_ms_for_frame(500, 1, 101);
+        assert_eq!(replay_environment_delta_seconds(initial, first), 0.005);
+        assert_eq!(replay_environment_delta_seconds(first, repeated), 0.0);
+        let next = control_clock_ms_for_frame(500, 2, 101);
+        assert_eq!(replay_environment_delta_seconds(first, next), 0.005);
+        assert_eq!(
+            replay_environment_delta_seconds(0, control_clock_ms_for_frame(500, 0, 1)),
+            0.5
+        );
+        assert_eq!(replay_environment_delta_seconds(next, 0), 0.0);
+    }
+
+    #[test]
+    fn ambient_effect_screen_bounds_follow_vulkan_viewport_y_direction() {
+        let vertices = [
+            [-0.5, 0.25, 0.5],
+            [-0.5, 0.75, 0.5],
+            [0.5, 0.75, 0.5],
+            [0.5, 0.25, 0.5],
+        ];
+        let bounds = ambient_effect_projected_bounds(
+            &vertices,
+            [
+                1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ],
+            [100, 100],
+        )
+        .expect("visible clip-space quad");
+        assert_eq!(bounds, [25.0, 62.5, 75.0, 87.5]);
+    }
+
+    #[test]
+    fn native_tl_sprite_pixels_map_to_current_vulkan_viewport_at_z_999() {
+        let uv = [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]];
+        let small = screen_tl_quad_vertices_pixels(
+            [160.0, 120.0],
+            40.0,
+            30.0,
+            [640.0, 480.0],
+            [1.0; 3],
+            1.0,
+            uv,
+        );
+        let resized = screen_tl_quad_vertices_pixels(
+            [320.0, 240.0],
+            80.0,
+            60.0,
+            [1280.0, 960.0],
+            [1.0; 3],
+            1.0,
+            uv,
+        );
+
+        for (small, resized) in small.iter().zip(resized) {
+            for axis in 0..2 {
+                assert!((small.position[axis] - resized.position[axis]).abs() < 1.0e-6);
+            }
+            assert_eq!(small.position[2], 0.999);
+            assert_eq!(resized.position[2], 0.999);
+        }
+        for (actual, expected) in [
+            (small[0].position, [-0.625, -0.375, 0.999]),
+            (small[2].position, [-0.625, -0.625, 0.999]),
+        ] {
+            for axis in 0..3 {
+                assert!((actual[axis] - expected[axis]).abs() < 1.0e-6);
+            }
+        }
+        assert_eq!(small[0].uv, [0.0, 1.0]);
+        assert_eq!(small[2].uv, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn parses_control_clock_capture() {
         let parsed = Args::parse(&strings(&[
             "--root",
             "testdata/IS",
@@ -9645,8 +14105,18 @@ mod tests {
             "--control-clock-ms",
             "500",
         ]))
-        .expect("valid bounded replay arguments");
+        .expect("controlled clock capture arguments");
         assert_eq!(parsed.control_clock_ms, Some(500));
+        assert!(Args::parse(&strings(&[
+            "--root",
+            "testdata/IS",
+            "--mission",
+            "MISSIONS/Autodemo.00/data.tma",
+            "--control-clock-ms",
+            "500",
+        ]))
+        .expect_err("replay needs multiple frames")
+        .contains("at least 2"));
     }
 
     #[test]
@@ -9661,9 +14131,12 @@ mod tests {
         };
         let mut bindings = vec![MaterialAnimationBinding {
             initial_phase_index: 0,
+            normalized_phase_override: None,
+            ambient_fx_material_alpha: false,
             variants: vec![MaterialVariantSet {
                 phase_material_indices: vec![10, 11],
                 range_indices: Vec::new(),
+                pipeline_category: 0,
             }],
             base: MaterialPhaseBinding {
                 document: empty_mat0,
@@ -9684,6 +14157,7 @@ mod tests {
         bindings[binding_index].variants.push(MaterialVariantSet {
             phase_material_indices: vec![20, 21],
             range_indices: vec![7],
+            pipeline_category: 0,
         });
 
         let lightmap_variant = &bindings[binding_index].variants[1];
@@ -9975,6 +14449,322 @@ mod tests {
         assert_eq!(sky_normal([-128, 127, -64]), [-1.0, 127.0 / 128.0, -0.5]);
     }
 
+    fn set_test_terrain_lod_slots(
+        terrain: &mut fparkan_terrain_format::LandMeshDocument,
+        node_slots: &[[u16; 2]],
+        face_ranges: &[[u16; 2]],
+    ) {
+        const NODE_STRIDE: usize = 38;
+        let mut nodes = vec![u8::MAX; node_slots.len() * NODE_STRIDE];
+        for (node_index, [lod0_slot, lod1_slot]) in node_slots.iter().copied().enumerate() {
+            let offset = node_index * NODE_STRIDE + 8;
+            nodes[offset..offset + 2].copy_from_slice(&lod0_slot.to_le_bytes());
+            nodes[offset + 2..offset + 4].copy_from_slice(&lod1_slot.to_le_bytes());
+        }
+        let mut slots = vec![[0_u8; 68]; face_ranges.len()];
+        for (slot, [start, count]) in slots.iter_mut().zip(face_ranges.iter().copied()) {
+            slot[..2].copy_from_slice(&start.to_le_bytes());
+            slot[2..4].copy_from_slice(&count.to_le_bytes());
+        }
+        terrain.nodes_raw = nodes;
+        terrain.slots.slots_raw = slots;
+    }
+
+    fn mission_root_for_basement(position: [f32; 3], raw_after_name: u32) -> MissionObjectDraft {
+        MissionObjectDraft {
+            original_id: None,
+            resource_name_raw: b"BUILDS/example.dat".to_vec(),
+            raw_after_resource: 0,
+            identity_or_clan_raw: 0,
+            raw_after_name,
+            unit_dat_header_flags: Some(0x8000_0000),
+            position,
+            orientation_raw: [0.0; 3],
+            scale: [1.0; 3],
+            visual_ids: Vec::new(),
+            properties: Vec::new(),
+            unit_components: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn basement_delta_updates_one_common_root_for_mesh_and_attached_component() {
+        let roots = [
+            mission_root_for_basement([1.0, 2.0, 100.0], 0),
+            mission_root_for_basement([3.0, 4.0, 200.0], 1),
+        ];
+        let footprints = [
+            MissionBasementFootprint {
+                object_index: 0,
+                outer: Vec::new(),
+                inner: Vec::new(),
+                flatten_inner_to_mean_outer_z: true,
+            },
+            MissionBasementFootprint {
+                object_index: 1,
+                outer: Vec::new(),
+                inner: Vec::new(),
+                flatten_inner_to_mean_outer_z: false,
+            },
+        ];
+        let placements = [
+            BasementPlacement {
+                placement_delta: 12.5,
+            },
+            BasementPlacement {
+                placement_delta: 25.0,
+            },
+        ];
+        let adjusted = apply_basement_placement_deltas(&roots, &footprints, &placements)
+            .expect("aligned native placements");
+        assert_eq!(adjusted[0].position, [1.0, 2.0, 87.5]);
+        assert_eq!(adjusted[1].position, roots[1].position);
+
+        let transform = LegacyIron3dEulerTransform {
+            translation: adjusted[0].position,
+            orientation_radians: adjusted[0].orientation_raw,
+        };
+        assert_eq!(
+            transform.try_transform_scaled_point([0.0, 0.0, 0.0], adjusted[0].scale),
+            Some([1.0, 2.0, 87.5])
+        );
+        assert_eq!(
+            transform.try_transform_scaled_point([0.0, 0.0, 4.0], adjusted[0].scale),
+            Some([1.0, 2.0, 91.5]),
+            "the attached component inherits the root shift once"
+        );
+    }
+
+    #[test]
+    fn basement_projection_shadows_and_queries_share_generated_base_only_faces() {
+        let mut land = fparkan_terrain_format::LandMeshDocument {
+            streams: Vec::new(),
+            nodes_raw: Vec::new(),
+            slots: fparkan_terrain_format::TerrainSlotTable {
+                header_raw: Vec::new(),
+                slots_raw: Vec::new(),
+            },
+            positions: vec![[0.0, 0.0, 5.0], [20.0, 0.0, 5.0], [0.0, 20.0, 5.0]],
+            normals: vec![[127, 0, 0, 0], [0, 127, 0, 0], [0, 0, 127, 0]],
+            uv0: vec![[256, 128], [1024, 256], [512, 1536]],
+            accelerator: Vec::new(),
+            aux14: Vec::new(),
+            aux18: Vec::new(),
+            faces: vec![fparkan_terrain_format::TerrainFace28 {
+                flags: FullSurfaceMask(0x400),
+                material_tag: 0xff00,
+                aux_tag: 0,
+                vertices: [0, 1, 2],
+                neighbors: [None, None, None],
+                tail_raw: [0; 8],
+                raw: [0; 28],
+            }],
+        };
+        set_test_terrain_lod_slots(&mut land, &[[0, u16::MAX]], &[[0, 1]]);
+        let source_mesh = project_land_msh_to_static_mesh_in_world_space(&land)
+            .expect("project one LOD0 terrain face");
+        let source_world = TerrainWorld::from_land_msh(&land).expect("source terrain");
+        let (empty_mesh, empty_shadows, empty_query) =
+            prepare_static_terrain_geometry(&land, source_mesh.clone(), &source_world, None)
+                .expect("keep unmodified terrain when there are no foundations");
+        assert_eq!(empty_mesh, source_mesh);
+        assert_eq!(empty_query.surface_count(), source_world.surface_count());
+        assert_eq!(empty_shadows.len(), 1);
+        assert!(empty_mesh
+            .vertices
+            .iter()
+            .any(|vertex| vertex.normal != [0.0; 3]));
+        assert!(empty_mesh
+            .vertices
+            .iter()
+            .any(|vertex| vertex.uv != [0.0; 2]));
+        let band_positions = [
+            [-18.25, -18.25, 5.0],
+            [-2.25, -18.25, 5.0],
+            [-18.25, -2.25, 5.0],
+        ];
+        let mut foundation = BasementFoundation {
+            fragments: vec![
+                BasementFoundationFragment {
+                    source_face: Some(0),
+                    surface_mask: FullSurfaceMask(0x400),
+                    positions: [[0.0, 0.0, 5.0], [20.0, 0.0, 5.0], [0.0, 20.0, 5.0]],
+                },
+                BasementFoundationFragment {
+                    source_face: None,
+                    surface_mask: FullSurfaceMask(0x8300),
+                    positions: band_positions,
+                },
+            ],
+            placements: Vec::new(),
+        };
+        let (render_mesh, shadow_receivers) =
+            project_basement_foundation(&land, &source_mesh, &mut foundation)
+                .expect("project canonical basement faces");
+        let expected = foundation.fragments.clone();
+        assert_eq!(render_mesh.draw_ranges.len(), 2);
+        assert!(render_mesh
+            .draw_ranges
+            .iter()
+            .all(|range| range.material_index == 0xff00));
+        assert!(!render_mesh.draw_ranges[0].terrain_base_only);
+        assert!(render_mesh.draw_ranges[1].terrain_base_only);
+        assert_eq!(render_mesh.draw_ranges[1].first_index, 3);
+        assert_eq!(shadow_receivers.len(), expected.len());
+
+        for (triangle_index, fragment) in expected.iter().enumerate() {
+            let indices: [u32; 3] = render_mesh.indices[triangle_index * 3..triangle_index * 3 + 3]
+                .try_into()
+                .expect("projected foundation triangle");
+            let positions = indices.map(|index| render_mesh.vertices[index as usize].position);
+            assert_eq!(positions, fragment.positions);
+            assert_eq!(
+                shadow_receivers[triangle_index].positions,
+                fragment.positions
+            );
+            assert_eq!(
+                shadow_receivers[triangle_index].mask,
+                fragment.surface_mask.0
+            );
+        }
+        assert_eq!(
+            basement_band_uv_vertices(band_positions)
+                .expect("native per-face UVs")
+                .map(|vertex| vertex.uv0),
+            [[815, 815], [1896, 815], [815, 1896]],
+            "negative coordinates use one native floor origin per triangle"
+        );
+        assert!(render_mesh.vertices[3..6]
+            .iter()
+            .flat_map(|vertex| vertex.uv)
+            .all(|value| (value * 1024.0).fract() == 0.0));
+
+        let query_world = source_world
+            .with_basement_foundation(foundation)
+            .expect("install canonical geometry");
+        assert_eq!(query_world.surface_count(), expected.len());
+        assert_eq!(
+            query_world
+                .basement_foundation()
+                .expect("installed foundation")
+                .fragments,
+            expected
+        );
+        assert_eq!(query_world.height_at([-14.0, -14.0]).unwrap(), Some(5.0));
+    }
+
+    #[test]
+    fn basement_band_normals_sum_packed_faces_for_native_welded_vertices() {
+        let mut foundation = BasementFoundation {
+            fragments: vec![
+                BasementFoundationFragment {
+                    source_face: None,
+                    surface_mask: FullSurfaceMask(0x8300),
+                    positions: [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+                },
+                BasementFoundationFragment {
+                    source_face: None,
+                    surface_mask: FullSurfaceMask(0x8300),
+                    positions: [[0.005, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 1.0]],
+                },
+            ],
+            placements: Vec::new(),
+        };
+        let (normals, uv0_words) = canonicalize_basement_band_vertices(&mut foundation)
+            .expect("native packed normal pass");
+        let first = normals[0].expect("first synthetic face");
+        let second = normals[1].expect("second synthetic face");
+        assert_eq!(first[0], second[0], "sub-centimeter XY vertices are welded");
+        assert_eq!(foundation.fragments[1].positions[0], [0.0, 0.0, 0.0]);
+        assert_eq!(
+            first[2], second[1],
+            "shared vertices use both packed face normals"
+        );
+        assert_eq!(uv0_words[1].expect("second face UV words")[0], [0, 0]);
+        assert_eq!(first[0][1], 0.0);
+        assert_ne!(first[0], [0.0, 0.0, 127.0 / 128.0]);
+    }
+
+    #[test]
+    fn basement_face_normal_distinguishes_degenerate_from_non_finite() {
+        assert_eq!(
+            packed_basement_face_normal([[0.0; 3], [1.0; 3], [2.0; 3]])
+                .expect("zero normal is a native zero contribution"),
+            None
+        );
+        assert!(packed_basement_face_normal([
+            [f32::NAN, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0]
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn c00_m02_world_terrain_edge_rounding_keeps_overlay_alpha_in_range() {
+        // DATA/MAPS/Tut_2/Land.msh face 2525: this split point lands about
+        // 1.35e-6 outside one source edge after the contour kernel's f32
+        // world-coordinate output is converted back to f64 barycentrics.
+        let source = [
+            VulkanStaticVertex {
+                position: [815.20465, 281.67642, 320.0],
+                color: [1.0; 3],
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.0; 2],
+                detail_uv: [0.0; 2],
+                overlay_alpha: 1.0,
+            },
+            VulkanStaticVertex {
+                position: [775.4386, 308.18713, 360.00003],
+                color: [1.0; 3],
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.0; 2],
+                detail_uv: [0.0; 2],
+                overlay_alpha: 1.0,
+            },
+            VulkanStaticVertex {
+                position: [775.4386, 288.3041, 361.6667],
+                color: [1.0; 3],
+                normal: [0.0, 0.0, 1.0],
+                uv: [0.0; 2],
+                detail_uv: [0.0; 2],
+                overlay_alpha: 1.0,
+            },
+        ];
+        let split_position = [800.6648, 291.3697, 334.62543];
+        let point = [f64::from(split_position[0]), f64::from(split_position[1])];
+        let a = [
+            f64::from(source[0].position[0]),
+            f64::from(source[0].position[1]),
+        ];
+        let b = [
+            f64::from(source[1].position[0]),
+            f64::from(source[1].position[1]),
+        ];
+        let c = [
+            f64::from(source[2].position[0]),
+            f64::from(source[2].position[1]),
+        ];
+        let denominator = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+        let second_weight =
+            ((point[0] - a[0]) * (c[1] - a[1]) - (point[1] - a[1]) * (c[0] - a[0])) / denominator;
+        let third_weight =
+            ((b[0] - a[0]) * (point[1] - a[1]) - (b[1] - a[1]) * (point[0] - a[0])) / denominator;
+        let raw_overlay_alpha = [
+            1.0 - second_weight - third_weight,
+            second_weight,
+            third_weight,
+        ]
+        .map(|weight| weight as f32)
+        .into_iter()
+        .sum::<f32>();
+        assert!(raw_overlay_alpha > 1.0 && raw_overlay_alpha <= 1.0 + 1.0e-5);
+        let vertex = interpolate_static_terrain_vertex(split_position, source)
+            .expect("bounded alpha rounding at a contour split");
+        assert_eq!(vertex.overlay_alpha, 1.0);
+        assert!((0.0..=1.0).contains(&vertex.overlay_alpha));
+    }
+
     #[test]
     fn sun_visibility_uses_a_valid_ray_and_fails_open_without_surfaces() {
         let camera = FreeFlightCamera {
@@ -10016,14 +14806,9 @@ mod tests {
                 raw: [0; 28],
             }],
         };
-        set_test_terrain_lod0_range(&mut land);
+        set_test_terrain_lod_slots(&mut land, &[[0, u16::MAX]], &[[0, 1]]);
         let shadow_receivers = terrain_shadow_receivers(&land).expect("raw-height receivers");
         assert_eq!(shadow_receivers[0].positions[0], [0.0, 0.0, 32.0]);
-        let mut invalid_shadow_face = land.clone();
-        invalid_shadow_face.faces[0].vertices[2] = u16::MAX;
-        assert!(terrain_shadow_receivers(&invalid_shadow_face)
-            .expect_err("bad terrain indices must fail instead of inventing vertices")
-            .contains("unknown vertex 65535"));
         let terrain = TerrainWorld::from_land_msh(&land).expect("synthetic terrain");
         assert_eq!(terrain.height_at([0.25, 0.25]).unwrap(), Some(32.0));
         let floor_camera =
@@ -10099,7 +14884,7 @@ mod tests {
                 raw: [0; 28],
             }],
         };
-        set_test_terrain_lod0_range(&mut excluded_land);
+        set_test_terrain_lod_slots(&mut excluded_land, &[[0, u16::MAX]], &[[0, 1]]);
         let excluded_terrain =
             TerrainWorld::from_land_msh(&excluded_land).expect("excluded terrain");
         assert!(native_sun_unoccluded_with_world(
@@ -10146,7 +14931,7 @@ mod tests {
                 raw: [0; 28],
             }],
         };
-        set_test_terrain_lod0_range(&mut land);
+        set_test_terrain_lod_slots(&mut land, &[[0, u16::MAX]], &[[0, 1]]);
         let terrain = TerrainWorld::from_land_msh(&land).expect("sloped terrain");
         assert_eq!(terrain.height_at([0.25, 0.25]).unwrap(), Some(33.5));
         assert_eq!(terrain.height_at([0.75, 0.25]).unwrap(), Some(34.5));
@@ -10361,6 +15146,71 @@ mod tests {
     }
 
     #[test]
+    fn controlled_readback_sequence_requires_and_parses_replay_clock() {
+        let parsed = Args::parse(&strings(&[
+            "--root",
+            "testdata/IS",
+            "--mission",
+            "MISSIONS/Autodemo.00/data.tma",
+            "--frames",
+            "11",
+            "--control-clock-ms",
+            "0",
+            "--readback-sequence-out",
+            "target/frames",
+        ]))
+        .expect("valid fixed-clock readback sequence");
+        assert_eq!(
+            parsed.readback_sequence_out,
+            Some(PathBuf::from("target/frames"))
+        );
+        assert_eq!(parsed.control_clock_ms, Some(0));
+
+        let error = Args::parse(&strings(&[
+            "--root",
+            "testdata/IS",
+            "--mission",
+            "MISSIONS/Autodemo.00/data.tma",
+            "--frames",
+            "11",
+            "--readback-sequence-out",
+            "target/frames",
+        ]))
+        .expect_err("sequence captures need deterministic clock input");
+        assert!(error.contains("requires --control-clock-ms"));
+    }
+
+    #[test]
+    fn readback_sequence_writes_clock_named_frame_without_overwrite() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "fparkan-readback-sequence-{}-{nonce}",
+            std::process::id()
+        ));
+        let artifact = VulkanReadbackArtifact {
+            format: 37,
+            width: 2,
+            height: 1,
+            bytes: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        };
+        let path = write_readback_sequence_frame(&directory, 3, 50, &artifact)
+            .expect("write frame artifact");
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("frame-000003-clock-0000000050ms-2x1.rgba")
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read frame artifact"),
+            artifact.bytes
+        );
+        assert!(write_readback_sequence_frame(&directory, 3, 50, &artifact).is_err());
+        std::fs::remove_dir_all(directory).expect("remove frame artifact directory");
+    }
+
+    #[test]
     fn parses_static_animation_frame() {
         let parsed = Args::parse(&strings(&[
             "--root",
@@ -10533,6 +15383,59 @@ mod tests {
             parse_legacy_camera_capture(br#"{"schema":"unknown","selector0_words":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"viewport":[0,0,1,1],"near_plane":0.1,"far_plane":1.0,"field_of_view_radians":1.0}"#),
             Err("unsupported legacy camera capture schema".to_string())
         );
+    }
+
+    #[test]
+    fn parented_camera_preview_uses_effective_world_matrix_and_legacy_uses_local() {
+        let local_words = [
+            1065353216, 0, 0, 1065353216, 0, 1065353216, 0, 1073741824, 0, 0, 1065353216,
+            1077936128, 0, 0, 0, 1065353216,
+        ];
+        let world_words = [
+            1065353216, 0, 0, 1092616192, 0, 1065353216, 0, 1101004800, 0, 0, 1065353216,
+            1106247680, 0, 0, 0, 1065353216,
+        ];
+        let make_json = |extra: &str| {
+            format!(
+                "{{\"schema\":\"fparkan-legacy-camera-v1\",\"render_input_usable\":true,\"selector0_words\":{:?},{}\"viewport\":[0,0,1280,1024],\"near_plane\":0.5,\"far_plane\":700.0,\"field_of_view_radians\":1.04}}",
+                local_words, extra
+            )
+        };
+        let legacy = parse_legacy_camera_capture(make_json("").as_bytes())
+            .expect("legacy camera without parent metadata");
+        assert_eq!(legacy.preview_matrix_words().unwrap(), local_words);
+        assert_eq!(
+            legacy.preview_camera_frame().unwrap().position,
+            [1.0, 2.0, 3.0]
+        );
+
+        let parented = parse_legacy_camera_capture(
+            make_json(&format!(
+                "\"parented_camera\":true,\"effective_world_matrix_space\":\"world\",\"effective_world_matrix_words\":{:?},",
+                world_words
+            ))
+            .as_bytes(),
+        )
+        .expect("parented camera with effective world matrix");
+        assert_eq!(parented.preview_matrix_words().unwrap(), world_words);
+        let preview = parented.preview_camera_frame().unwrap();
+        assert_eq!(preview.position, [10.0, 20.0, 30.0]);
+        assert_ne!(
+            preview.position,
+            legacy.preview_camera_frame().unwrap().position
+        );
+
+        let missing_world = make_json("\"parented_camera\":true,");
+        assert!(parse_legacy_camera_capture(missing_world.as_bytes())
+            .expect_err("parented local-only input must be rejected")
+            .contains("parented legacy camera requires an effective world-space matrix"));
+        let missing_marker = make_json(&format!(
+            "\"parented_camera\":true,\"effective_world_matrix_words\":{:?},",
+            world_words
+        ));
+        assert!(parse_legacy_camera_capture(missing_marker.as_bytes())
+            .expect_err("world matrix requires space marker")
+            .contains("effective_world_matrix_space and effective_world_matrix_words"));
     }
 
     #[test]
@@ -10861,328 +15764,1064 @@ mod tests {
     }
 
     #[test]
-    fn native_tl_sprite_pixels_use_current_viewport_and_preserve_depth_999() {
-        let uv = [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]];
-        let small = screen_tl_quad_vertices_pixels(
-            [160.0, 120.0],
-            40.0,
-            30.0,
-            [640.0, 480.0],
-            [1.0; 3],
-            1.0,
-            uv,
-        );
-        let resized = screen_tl_quad_vertices_pixels(
-            [320.0, 240.0],
-            80.0,
-            60.0,
-            [1280.0, 960.0],
-            [1.0; 3],
-            1.0,
-            uv,
-        );
-        let wide = screen_tl_quad_vertices_pixels(
-            [640.0, 360.0],
-            100.0,
-            45.0,
-            [1280.0, 720.0],
-            [1.0; 3],
-            1.0,
-            uv,
-        );
-
-        for (small, resized) in small.iter().zip(resized) {
-            for axis in 0..2 {
-                assert!((small.position[axis] - resized.position[axis]).abs() < 1.0e-6);
-            }
-            assert_eq!(small.position[2], 0.999);
-            assert_eq!(resized.position[2], 0.999);
-        }
-        assert_eq!(small[0].uv, [0.0, 1.0]);
-        assert_eq!(small[2].uv, [0.0, 0.0]);
-        for (actual, expected) in [
-            (wide[0].position, [-0.15625, 0.125, 0.999]),
-            (wide[2].position, [-0.15625, -0.125, 0.999]),
-        ] {
-            for axis in 0..3 {
-                assert!((actual[axis] - expected[axis]).abs() < 1.0e-6);
-            }
-        }
-    }
-
-    #[test]
-    fn native_tl_depth_999_is_nearer_than_opaque_geometry_at_320_units() {
-        let camera = FreeFlightCamera {
-            position: [0.0; 3],
-            yaw: 0.0,
-            pitch: 0.0,
-            horizontal_fov: 1.3,
-            near_plane: 0.5,
-            far_plane: 700.0,
-            move_speed: 1.0,
-            ground_clearance: 0.0,
-        };
-        let frame = camera.preview_frame(16.0 / 9.0);
-        let opaque_clip = row_vector_transform([320.0, 0.0, 0.0, 1.0], frame.clip_from_world);
-        let opaque_depth = opaque_clip[2] / opaque_clip[3];
-
-        assert!((opaque_depth - 0.999151_18).abs() < 1.0e-6);
-        assert!(0.999 < opaque_depth);
-    }
-
-    fn facing_mesh(
-        batch_flags: u16,
-        positions: &[[f32; 3]],
-    ) -> (VulkanStaticMesh, VulkanStaticDrawRange) {
-        let range = VulkanStaticDrawRange {
-            first_index: 0,
-            index_count: u32::try_from(positions.len()).expect("fixture index count fits u32"),
-            material_index: 0,
-            lightmap_index: 0,
-            batch_flags,
-            pipeline_state: LegacyPipelineState::default(),
-            terrain_base_only: false,
-            alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
-        };
-        let mesh = VulkanStaticMesh {
-            vertices: positions
-                .iter()
-                .copied()
-                .map(|position| VulkanStaticVertex {
-                    position,
-                    color: [1.0; 3],
-                    normal: [0.0, 0.0, 1.0],
-                    uv: [0.0; 2],
-                    detail_uv: [0.0; 2],
-                    overlay_alpha: 0.0,
-                })
-                .collect(),
-            indices: (0..positions.len())
-                .map(|index| u32::try_from(index).expect("fixture index fits u32"))
-                .collect(),
-            draw_ranges: vec![range],
-        };
-        (mesh, range)
-    }
-
-    fn native_front_triangle() -> [[f32; 3]; 3] {
-        [[-0.2, -0.2, -1.0], [0.2, -0.2, -1.0], [0.0, 0.2, -1.0]]
-    }
-
-    fn camera_face_triangle(camera: PreviewCameraFrame, mirror: bool) -> [[f32; 3]; 3] {
-        let center = add3(camera.position, scale3(camera.forward, 10.0));
-        let mirror = if mirror { -1.0 } else { 1.0 };
-        [
-            add3(
-                add3(center, scale3(camera.right, -2.0 * mirror)),
-                scale3(camera.up, -2.0),
-            ),
-            add3(
-                add3(center, scale3(camera.right, 2.0 * mirror)),
-                scale3(camera.up, -2.0),
-            ),
-            add3(center, scale3(camera.up, 2.0)),
-        ]
-    }
-
-    fn projected_vulkan_area(camera: PreviewCameraFrame, triangle: [[f32; 3]; 3]) -> f32 {
-        let screen = triangle.map(|point| {
-            let clip =
-                row_vector_transform([point[0], point[1], point[2], 1.0], camera.clip_from_world);
-            assert!(clip[3] > 0.0 && clip.iter().all(|value| value.is_finite()));
-            // This is the positive-height viewport transform used by the Vulkan renderer.
+    fn control_type4_basis_branches_preserve_anisotropic_owner_scale() {
+        let owner_scale = [2.0, 3.0, 4.0];
+        let equal = [
+            control_point([0.0; 3], [1.0, 1.0, 0.0]),
+            control_point([0.0; 3], [1.0, 1.0, 0.0]),
+            control_point([0.0; 3], [1.0, 1.0, 0.0]),
+        ];
+        let equal_matrix =
+            control_type4_local_matrix([&equal[0], &equal[1], &equal[2]], owner_scale).unwrap();
+        assert_matrix_columns(
+            equal_matrix,
             [
-                (clip[0] / clip[3] + 1.0) * 0.5,
-                (clip[1] / clip[3] + 1.0) * 0.5,
-            ]
-        });
-        let shoelace = (0..3)
-            .map(|index| {
-                let next = (index + 1) % 3;
-                screen[index][0] * screen[next][1] - screen[next][0] * screen[index][1]
-            })
-            .sum::<f32>()
-            * 0.5;
-        // Vulkan's framebuffer signed-area definition is the negative shoelace area.
-        -shoelace
+                [2.0, 3.0, 0.0],
+                [-3.0, 2.0, 0.0],
+                [0.0, 0.0, 13.0_f32.sqrt()],
+            ],
+        );
+
+        let unique = [
+            control_point([1.0; 3], [1.0, 2.0, 3.0]),
+            control_point([2.0; 3], [4.0, 5.0, 6.0]),
+            control_point([3.0; 3], [-1.0, 1.0, 2.0]),
+        ];
+        let unique_matrix =
+            control_type4_local_matrix([&unique[0], &unique[1], &unique[2]], owner_scale).unwrap();
+        assert_matrix_columns(
+            unique_matrix,
+            [[2.0, 6.0, 12.0], [8.0, 15.0, 24.0], [-2.0, 3.0, 8.0]],
+        );
+        assert_eq!(
+            [
+                unique_matrix[0][3],
+                unique_matrix[1][3],
+                unique_matrix[2][3]
+            ],
+            [4.0, 6.0, 8.0]
+        );
+
+        for (directions, expected) in [
+            (
+                [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+                [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 2.0]],
+            ),
+            (
+                [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+                [[0.0, 0.0, 4.0], [0.0, -1.0, 0.0], [4.0, 0.0, 0.0]],
+            ),
+            (
+                [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]],
+                [[0.0, 3.0, 0.0], [-1.0, 0.0, 0.0], [0.0, 0.0, 3.0]],
+            ),
+            (
+                [[1.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+                [[2.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 2.0]],
+            ),
+        ] {
+            let repeated = directions.map(|direction| control_point([0.0; 3], direction));
+            let matrix =
+                control_type4_local_matrix([&repeated[0], &repeated[1], &repeated[2]], owner_scale)
+                    .unwrap();
+            assert_matrix_columns(matrix, expected);
+        }
     }
 
     #[test]
-    fn native_msh_cull_mode_matches_legacy_and_free_flight_camera_projection() {
-        let identity = RawCameraTransform {
-            words: [
-                1.0_f32.to_bits(),
-                0.0_f32.to_bits(),
-                0.0_f32.to_bits(),
-                0.0_f32.to_bits(),
-                0.0_f32.to_bits(),
-                1.0_f32.to_bits(),
-                0.0_f32.to_bits(),
-                0.0_f32.to_bits(),
-                0.0_f32.to_bits(),
-                0.0_f32.to_bits(),
-                1.0_f32.to_bits(),
-                0.0_f32.to_bits(),
-                0.0_f32.to_bits(),
-                0.0_f32.to_bits(),
-                0.0_f32.to_bits(),
-                1.0_f32.to_bits(),
+    fn control_type4_world_matrix_rotates_basis_and_keeps_scale_off_translation() {
+        let point = control_point([1.0, 0.0, 0.0], [1.0, 0.0, 0.0]);
+        let local =
+            control_type4_effect_local_matrix([&point, &point, &point], [2.0, 3.0, 4.0]).unwrap();
+        let matrix = control_type4_world_from_effect(
+            local,
+            [2.0, 3.0, 4.0],
+            LegacyIron3dEulerTransform {
+                translation: [10.0, 20.0, 30.0],
+                orientation_radians: [0.0, 0.0, std::f32::consts::FRAC_PI_2],
+            },
+            None,
+            VulkanNodePose {
+                translation: [0.0; 3],
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            },
+        )
+        .unwrap();
+
+        assert_matrix_columns(
+            matrix,
+            [[0.0, 4.0, 0.0], [-9.0, 0.0, 0.0], [0.0, 0.0, 16.0]],
+        );
+        for (actual, expected) in [matrix[0][3], matrix[1][3], matrix[2][3]]
+            .into_iter()
+            .zip([10.0, 22.0, 30.0])
+        {
+            assert!((actual - expected).abs() < 1.0e-5);
+        }
+    }
+
+    #[test]
+    fn mounted_control_effect_uses_component_pose_before_owner_world_transform() {
+        let point = control_point([1.0, 0.0, 0.0], [1.0, 0.0, 0.0]);
+        let mount_pose = VulkanNodePose {
+            translation: [1.0, 2.0, 3.0],
+            rotation: [
+                0.0,
+                0.0,
+                std::f32::consts::FRAC_1_SQRT_2,
+                std::f32::consts::FRAC_1_SQRT_2,
             ],
         };
-        let projection = LegacyD3d7Projection {
-            viewport: [0, 0, 1280, 1024],
-            near_plane: 0.5,
-            far_plane: 700.0,
-            field_of_view_radians: 1.3,
+        let owner_node_pose = VulkanNodePose {
+            translation: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
         };
-        let legacy = PreviewCameraFrame::from_legacy_d3d7(identity, projection)
-            .expect("valid legacy camera projection");
-        let free_flight = FreeFlightCamera {
-            position: legacy.position,
-            yaw: 0.0,
-            pitch: 0.0,
-            horizontal_fov: 1.3,
-            near_plane: 0.5,
-            far_plane: 700.0,
-            move_speed: 1.0,
-            ground_clearance: 0.0,
-        }
-        .preview_frame(1280.0 / 1024.0);
+        let local = control_type4_effect_local_matrix([&point, &point, &point], [1.0; 3]).unwrap();
+        let matrix = control_type4_world_from_effect(
+            local,
+            [2.0, 3.0, 4.0],
+            LegacyIron3dEulerTransform {
+                translation: [10.0, 20.0, 30.0],
+                orientation_radians: [0.0; 3],
+            },
+            Some(mount_pose),
+            owner_node_pose,
+        )
+        .unwrap();
 
-        for camera in [legacy, free_flight] {
-            let front = camera_face_triangle(camera, false);
-            let back = [front[0], front[2], front[1]];
-            let front_d = dot3(
-                sub3(camera.position, front[0]),
-                cross3(sub3(front[1], front[0]), sub3(front[2], front[0])),
-            );
-            let back_d = dot3(
-                sub3(camera.position, back[0]),
-                cross3(sub3(back[1], back[0]), sub3(back[2], back[0])),
-            );
-            assert!(front_d > 0.0);
-            assert!(back_d < 0.0);
-
-            let front_vk_area = projected_vulkan_area(camera, front);
-            let back_vk_area = projected_vulkan_area(camera, back);
-            // Vulkan CLOCKWISE front faces have negative framebuffer area.
-            // The native-visible d>0 face is therefore a Vulkan back face.
-            assert!(front_vk_area > 0.0, "front area: {front_vk_area}");
-            assert!(back_vk_area < 0.0, "back area: {back_vk_area}");
-            assert_eq!(native_msh_cull_mode(0, 1), LegacyCullMode::FrontFace);
-
-            let mirrored_front = camera_face_triangle(camera, true);
-            let mirrored_d = dot3(
-                sub3(camera.position, mirrored_front[0]),
-                cross3(
-                    sub3(mirrored_front[1], mirrored_front[0]),
-                    sub3(mirrored_front[2], mirrored_front[0]),
-                ),
-            );
-            assert!(mirrored_d < 0.0);
-            assert!(projected_vulkan_area(camera, mirrored_front) < 0.0);
-            assert_eq!(native_msh_cull_mode(0, -1), LegacyCullMode::BackFace);
+        for (actual, expected) in [matrix[0][3], matrix[1][3], matrix[2][3]]
+            .into_iter()
+            .zip([12.0, 29.0, 42.0])
+        {
+            assert!((actual - expected).abs() < 1.0e-5);
         }
     }
 
     #[test]
-    fn native_msh_handedness_uses_full_placement_transform_and_handles_singular_scale() {
-        let rotated = LegacyIron3dEulerTransform {
-            translation: [8.0, -4.0, 3.0],
-            orientation_radians: [0.4, -0.7, 1.2],
+    fn plant_node23_control_points_match_captured_native_world_positions() {
+        let root_transform = LegacyIron3dEulerTransform {
+            translation: [323.55048, 806.97266, 0.36829287],
+            orientation_radians: [0.0, 0.0, 1.6262363],
         };
-        assert_eq!(native_msh_handedness(rotated, [2.0, 3.0, 4.0]), 1);
-        assert_eq!(native_msh_handedness(rotated, [-2.0, 3.0, 4.0]), -1);
-        assert_eq!(native_msh_handedness(rotated, [0.0, 3.0, 4.0]), 0);
-        assert_eq!(native_msh_cull_mode(0, 0), LegacyCullMode::Disabled);
-    }
-
-    #[test]
-    fn native_msh_4000_samples_only_first_triangle_and_raw_two_sided_bypasses_it() {
-        let front = native_front_triangle();
-        let back = front.map(|point| [-point[0], point[1], point[2]]);
-        let front_then_back = [front[0], front[1], front[2], back[0], back[1], back[2]];
-        let (mesh, range) = facing_mesh(0x4000, &front_then_back);
-        assert!(native_msh_first_triangle_visible(
-            &mesh, &range, [0.0; 3], 1
-        ));
-
-        let back_then_front = [back[0], back[1], back[2], front[0], front[1], front[2]];
-        let (mesh, range) = facing_mesh(0x4000, &back_then_front);
-        assert!(!native_msh_first_triangle_visible(
-            &mesh, &range, [0.0; 3], 1
-        ));
-
-        let (mesh, range) = facing_mesh(0x4002, &back_then_front);
-        assert!(native_msh_first_triangle_visible(
-            &mesh, &range, [0.0; 3], 1
-        ));
-        assert_eq!(
-            native_msh_cull_mode(range.batch_flags, 1),
-            LegacyCullMode::Disabled
-        );
-    }
-
-    #[test]
-    fn world_draw_range_count_restores_after_alpha_and_msh_facing_changes() {
-        let triangle = native_front_triangle();
-        let (mesh, range) = facing_mesh(0x4000, &triangle);
-        let original_count = range.index_count;
-
-        assert_eq!(
-            world_draw_range_index_count(&mesh, &range, original_count, 0.0, [0.0; 3], Some(1)),
-            0
-        );
-        assert_eq!(
-            world_draw_range_index_count(
-                &mesh,
-                &range,
-                original_count,
-                1.0,
-                [0.0, 0.0, -2.0],
-                Some(1),
+        let owner_node_pose = VulkanNodePose {
+            translation: [0.0, -68.15999, 21.12],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+        };
+        let points = [
+            (
+                [-12.964036, 12.991658, -21.119995],
+                [379.35242, 797.0855, 0.3682986],
             ),
-            0
-        );
-        assert_eq!(
-            world_draw_range_index_count(&mesh, &range, original_count, 1.0, [0.0; 3], Some(1)),
-            original_count
-        );
-        assert_eq!(
-            world_draw_range_index_count(
-                &mesh,
-                &range,
-                original_count,
-                1.0,
-                [0.0, 0.0, -2.0],
-                None,
+            (
+                [13.49774, 12.991658, -21.119995],
+                [377.8861, 823.5066, 0.3682986],
             ),
-            original_count
-        );
-    }
-    #[test]
-    fn world_draw_range_count_clears_and_reapplies_constant_alpha_override() {
-        let triangle = native_front_triangle();
-        let (mesh, mut range) = facing_mesh(0x0148, &triangle);
-        let original_count = range.index_count;
-        let mut alpha_override = None;
-        let update = |range: &VulkanStaticDrawRange, alpha_override: &mut Option<f32>| {
-            *alpha_override = native_msh_diffuse_alpha_override(range.batch_flags, false);
-            world_draw_range_index_count(
-                &mesh,
-                range,
-                original_count,
-                alpha_override.unwrap_or(1.0),
-                [0.0; 3],
+            (
+                [9.507235, -3.006884, -21.119993],
+                [394.08118, 820.40875, 0.3683005],
+            ),
+            (
+                [-9.080112, -3.2843084, -21.119991],
+                [395.38815, 801.86536, 0.3683024],
+            ),
+        ];
+
+        for (local_position, expected_world) in points {
+            let point = control_point(local_position, [1.0, 0.0, 0.0]);
+            let local = control_type4_effect_local_matrix([&point, &point, &point], [1.0; 3])
+                .expect("CPT descriptor local matrix");
+            let world = control_type4_world_from_effect(
+                local,
+                [1.0; 3],
+                root_transform,
                 None,
+                owner_node_pose,
             )
+            .expect("attached Control owner matrix");
+            for axis in 0..3 {
+                assert!(
+                    (world[axis][3] - expected_world[axis]).abs() < 0.1,
+                    "axis {axis}: actual {} expected {}",
+                    world[axis][3],
+                    expected_world[axis]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ambient_effect_world_refreshes_from_each_component_pose_buffer() {
+        let mut poses = vec![fparkan_animation::Pose::default(); 24];
+        poses[23].translation = [0.0, -68.15999, 21.12];
+        let mut slot = AmbientEffectGpuSlot {
+            kind: AmbientEffectKind::Op3Type2,
+            time_mode: 1,
+            header_flags: 0,
+            random_instance_key: ControlEffectInstanceKey {
+                object_index: 0,
+                component_index: 0,
+                table_index: 8,
+                row_index: 6,
+            },
+            random_seed: 1,
+            phase_jitter: 0.0,
+            random_shift: [0.0; 3],
+            owner_object_index: 0,
+            owner_component_index: 0,
+            owner_node_index: 23,
+            owner_component_is_mounted: false,
+            root_transform: LegacyIron3dEulerTransform {
+                translation: [323.55048, 806.97266, 0.36829287],
+                orientation_radians: [0.0, 0.0, 1.6262363],
+            },
+            owner_scale: [1.0; 3],
+            mount_pose: None,
+            local_from_effect: [
+                [1.0, 0.0, 0.0, -12.964036],
+                [0.0, 1.0, 0.0, 12.991658],
+                [0.0, 0.0, 1.0, -21.119995],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            control_source: String::new(),
+            control_table_index: 8,
+            control_row_index: 6,
+            control_point_indices: [104; 3],
+            control_point_owners: [23; 3],
+            command: endpoint_op3_command(),
+            command_index: 0,
+            duration_seconds: 1.0,
+            world_from_effect: [[0.0; 4]; 4],
+            range: EnvironmentGpuRange {
+                range_index: 0,
+                vertex_start: 0,
+                vertex_capacity: 4,
+                material_index: 0,
+            },
+            additional_particle_ranges: Vec::new(),
+            material_animation_index: 0,
+            additional_particle_material_animation_indices: Vec::new(),
+            smoke_emitter_state: None,
+            op7_emitter_state: None,
+        };
+        let mut component_pose_buffers = vec![vec![Some(NodePoseBuffer { poses })]];
+        let first = ambient_effect_world_from_component_pose(&slot, &component_pose_buffers)
+            .expect("first sampled owner pose");
+        assert!((first[0][3] - 379.35242).abs() < 0.1 && (first[1][3] - 797.0855).abs() < 0.1);
+
+        let pose = &mut component_pose_buffers[0][0].as_mut().unwrap().poses[23];
+        pose.translation = [
+            pose.translation[0] + 1.0,
+            pose.translation[1] + 2.0,
+            pose.translation[2] + 3.0,
+        ];
+        let second = ambient_effect_world_from_component_pose(&slot, &component_pose_buffers)
+            .expect("next sampled owner pose");
+        slot.world_from_effect = second;
+        assert_ne!(first, slot.world_from_effect);
+        let expected_delta = rotate_unit_vector(
+            [1.0, 2.0, 3.0],
+            [
+                0.0,
+                0.0,
+                (1.6262363_f32 * 0.5).sin(),
+                (1.6262363_f32 * 0.5).cos(),
+            ],
+        );
+        for (axis, expected) in expected_delta.into_iter().enumerate() {
+            let delta = slot.world_from_effect[axis][3] - first[axis][3];
+            assert!((delta - expected).abs() < 0.1, "axis {axis}: {delta}");
+        }
+    }
+
+    #[test]
+    fn mode1_control_effects_hold_active_with_full_opacity_after_duration() {
+        let phase = native_command_phase(
+            0,
+            ambient_effect_phase(1, 0, 1.25, 1.0).expect("mode 1 phase"),
+            0.0,
+        );
+        assert_eq!(phase, 1.0);
+        let identity = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+
+        let lamp =
+            evaluate_op3_type2_command(&endpoint_op3_command(), 0, &identity, 1.25, phase, 0)
+                .expect("lamp endpoint");
+        assert!(lamp.active);
+        assert_eq!(lamp.color[3], 1.0);
+
+        let op9 = endpoint_gener_ball_command(FxOpcode::Op9);
+        let generated = evaluate_f_gener_ball_mesh(
+            &op9,
+            0,
+            &identity,
+            phase,
+            1.25,
+            [0.0, 0.0, 500.0],
+            AMBIENT_EFFECT_NATIVE_CATEGORY,
+        )
+        .expect("generator sphere endpoint");
+        assert!(generated.active);
+        assert_eq!(generated.color[3], 1.0);
+        assert_eq!(generated.vertices.len(), 88);
+        assert_eq!(generated.indices.len(), 120);
+        assert_eq!(generated.native_category, 0);
+
+        let op4 = endpoint_gener_ball_command(FxOpcode::Op4);
+        let orb = evaluate_f_gener_ball(&op4, 0, &identity, phase, 1.25, [0.0, 0.0, 500.0])
+            .expect("opcode 4 billboard endpoint");
+        assert!(orb.active);
+        assert_eq!(orb.color[3], 1.0);
+    }
+
+    #[test]
+    fn op9_mesh_bridge_allocates_one_range_per_quad_and_cap() {
+        let command = endpoint_gener_ball_command(FxOpcode::Op9);
+        let identity = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let frame = evaluate_f_gener_ball_mesh(
+            &command,
+            0,
+            &identity,
+            0.5,
+            0.5,
+            [0.0, 0.0, 500.0],
+            AMBIENT_EFFECT_NATIVE_CATEGORY,
+        )
+        .expect("category-zero Op9 mesh");
+        let primitives = ambient_effect_mesh_primitive_layout(&frame)
+            .expect("native Op9 quad/cap primitive layout");
+        assert_eq!(primitives.len(), 24);
+        assert_eq!(
+            primitives
+                .iter()
+                .filter(|item| item.vertex_count == 4)
+                .count(),
+            16
+        );
+        assert_eq!(
+            primitives
+                .iter()
+                .filter(|item| item.vertex_count == 3)
+                .count(),
+            8
+        );
+
+        let mut mesh = VulkanStaticMesh {
+            vertices: Vec::new(),
+            indices: Vec::new(),
+            draw_ranges: Vec::new(),
+        };
+        let ranges = primitives
+            .iter()
+            .copied()
+            .map(|primitive| {
+                let range = append_environment_range(
+                    &mut mesh,
+                    0,
+                    ambient_effect_mesh_primitive_vertices(&frame, primitive),
+                    ambient_effect_mesh_primitive_indices(&frame, primitive)
+                        .expect("primitive-local indices"),
+                    LegacyPipelineState::default(),
+                )
+                .expect("allocate one native primitive range");
+                write_ambient_effect_mesh_primitive(&mut mesh, &range, &frame, primitive)
+                    .expect("write native primitive frame");
+                range
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(ranges.len(), 24);
+        assert_eq!(mesh.draw_ranges.len(), 24);
+        assert_eq!(mesh.indices.len(), 120);
+        assert!(mesh.draw_ranges.iter().all(|range| {
+            range.alpha_test_reference == VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE
+        }));
+        assert_eq!(
+            mesh.draw_ranges
+                .iter()
+                .map(|range| range.index_count)
+                .sum::<u32>(),
+            120
+        );
+        for (range, primitive) in ranges.iter().zip(primitives) {
+            let vertices =
+                &mesh.vertices[range.vertex_start..range.vertex_start + range.vertex_capacity];
+            assert_eq!(range.vertex_capacity, primitive.vertex_count);
+            for (offset, vertex) in vertices.iter().enumerate() {
+                assert_eq!(
+                    vertex.position,
+                    frame.vertices[primitive.vertex_start + offset]
+                );
+                assert_eq!(vertex.uv, frame.uv[primitive.vertex_start + offset]);
+                assert_eq!(vertex.overlay_alpha, frame.color[3]);
+            }
+            let range_indices = &mesh.draw_ranges[range.range_index];
+            assert_eq!(range_indices.index_count as usize, primitive.index_count);
+            let first_index = range_indices.first_index as usize;
+            assert_eq!(
+                mesh.indices[first_index],
+                u32::try_from(range.vertex_start).unwrap()
+            );
+            let camera = [10.0, -5.0, 2.0];
+            let expected = sub3(frame.vertices[primitive.vertex_start], camera);
+            let expected = dot3(expected, expected).sqrt();
+            let actual = first_indexed_vertex_distance(&mesh, range.range_index, camera)
+                .expect("native Op9 primitive distance key");
+            assert!((actual - expected).abs() < 1e-5);
+        }
+
+        for selector in [1, 2] {
+            let mut command = command.clone();
+            write_effect_u32(Arc::make_mut(&mut command.raw_body), 0xC4, selector);
+            let frame = evaluate_f_gener_ball_mesh(
+                &command,
+                0,
+                &identity,
+                0.5,
+                0.5,
+                [0.0, 0.0, 500.0],
+                AMBIENT_EFFECT_NATIVE_CATEGORY,
+            )
+            .expect("Op9 selector frame");
+            assert!(!ambient_effect_mesh_primitive_layout(&frame)
+                .expect("selector native quad/cap layout")
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn mode2_control_effects_repeat_and_reset_at_header_duration() {
+        assert_eq!(ambient_effect_phase(2, 0, 1.0, 2.0), Some(0.5));
+        assert_eq!(ambient_effect_phase(2, 0, 2.0, 2.0), Some(0.0));
+        assert_eq!(ambient_effect_phase(2, 0, 2.25, 2.0), Some(0.125));
+        assert_eq!(ambient_effect_phase(1, 0, 2.0, 2.0), Some(1.0));
+        assert_eq!(ambient_effect_phase(0, 0, 0.5, 0.0), Some(0.0));
+        assert_eq!(ambient_effect_phase(3, 0, 0.5, 2.0), None);
+        assert_eq!(ambient_effect_phase(2, 0x20, 0.5, 1.0), Some(1.0));
+        assert_eq!(ambient_effect_phase(2, 0x20, 0.75, 1.0), Some(0.5));
+        assert_eq!(ambient_effect_phase(1, 0x200, 0.5, 1.0), Some(0.25));
+        assert_eq!(ambient_effect_phase(1, 0x220, 0.5, 1.0), Some(0.5));
+        assert_eq!(ambient_effect_phase(1, 0x220, 1.5, 1.0), Some(-2.5));
+        assert_eq!(ambient_effect_phase(1, 0x20, 1.5, 1.0), Some(-1.0));
+    }
+
+    #[test]
+    fn control_lamp_accepts_only_supported_bodies_and_keeps_mat0_state() {
+        assert_eq!(
+            ambient_effect_command_kind(&endpoint_op3_command()),
+            Some(AmbientEffectKind::Op3Type2)
+        );
+        let mut type0 = endpoint_op3_command();
+        write_effect_u32(Arc::make_mut(&mut type0.raw_body), 0, 0);
+        assert_eq!(
+            ambient_effect_command_kind(&type0),
+            Some(AmbientEffectKind::Op3Type0)
+        );
+        assert!(ambient_effect_render_selector_allows_header(0x10, 0));
+        assert!(!ambient_effect_render_selector_allows_header(0x800, 0));
+        assert!(!ambient_effect_render_selector_allows_header(0xD00, 0));
+        assert!(ambient_effect_render_selector_allows_header(0xD00, 1));
+        assert!(ambient_effect_render_selector_allows_header(0xD00, 2));
+        for opcode in [FxOpcode::Op9, FxOpcode::Op4] {
+            assert_eq!(
+                ambient_effect_command_kind(&endpoint_gener_ball_command(opcode)),
+                Some(AmbientEffectKind::GenerBall),
+                "{opcode:?}"
+            );
+        }
+        for selector in [1, 2] {
+            let mut op9 = endpoint_gener_ball_command(FxOpcode::Op9);
+            write_effect_u32(Arc::make_mut(&mut op9.raw_body), 0xC4, selector);
+            assert_eq!(
+                ambient_effect_command_kind(&op9),
+                Some(AmbientEffectKind::GenerBall),
+                "Op9 selector {selector}"
+            );
+        }
+        let mut invalid_op9 = endpoint_gener_ball_command(FxOpcode::Op9);
+        write_effect_u32(Arc::make_mut(&mut invalid_op9.raw_body), 0xC4, 3);
+        assert_eq!(ambient_effect_command_kind(&invalid_op9), None);
+        assert_eq!(
+            ambient_effect_command_kind(&endpoint_op8_command(6)),
+            Some(AmbientEffectKind::SmokePool)
+        );
+        for pool_count in [0, 4097] {
+            assert_eq!(
+                ambient_effect_command_kind(&endpoint_op8_command(pool_count)),
+                None
+            );
+        }
+        for raw_mode in [0, 1] {
+            let op7 = endpoint_op7_command(raw_mode, 1.5, 0.0, 3, 2);
+            assert_eq!(
+                ambient_effect_command_kind(&op7),
+                Some(AmbientEffectKind::Op7ParticlePool),
+                "raw mode {raw_mode}"
+            );
+            assert_eq!(ambient_effect_op7_range_capacity(&op7), Some(6));
+        }
+        let accelerated_op7 = endpoint_op7_command(1, 1.5, 0.25, 3, 2);
+        assert_eq!(
+            ambient_effect_command_kind(&accelerated_op7),
+            Some(AmbientEffectKind::Op7ParticlePool)
+        );
+        assert_eq!(ambient_effect_op7_range_capacity(&accelerated_op7), Some(6));
+        for unsupported in [
+            endpoint_op7_command(2, 1.5, 0.0, 3, 2),
+            endpoint_op7_command(0, 1.5, f32::NAN, 3, 2),
+            endpoint_op7_command(0, 0.0, 0.0, 3, 2),
+            endpoint_op7_command(0, f32::NAN, 0.0, 3, 2),
+            endpoint_op7_command(0, 1.5, 0.0, u32::MAX, 2),
+        ] {
+            assert_eq!(ambient_effect_command_kind(&unsupported), None);
+        }
+
+        let state = ambient_effect_pipeline_state(2).expect("native additive MAT0 category");
+        assert_eq!(state.blend, LegacyBlendMode::Additive);
+        assert!(state.alpha_test);
+        assert_eq!(state.depth, LegacyDepthMode::TestReadOnly);
+    }
+
+    #[test]
+    fn op1_control_lights_use_native_phase_owner_transform_and_flags() {
+        let mut slot = ControlPointLightSlot {
+            time_mode: 1,
+            header_flags: 0,
+            random_instance_key: ControlEffectInstanceKey {
+                object_index: 0,
+                component_index: 0,
+                table_index: 0,
+                row_index: 0,
+            },
+            random_seed: 1,
+            phase_jitter: 0.0,
+            random_shift: [0.0; 3],
+            duration_seconds: 1.0,
+            owner_object_index: 0,
+            owner_component_index: 0,
+            owner_node_index: 0,
+            owner_component_is_mounted: false,
+            root_transform: LegacyIron3dEulerTransform {
+                translation: [10.0, 20.0, 30.0],
+                orientation_radians: [0.0; 3],
+            },
+            owner_scale: [1.0; 3],
+            mount_pose: None,
+            local_from_effect: [
+                [1.0, 0.0, 0.0, 1.0],
+                [0.0, 1.0, 0.0, 2.0],
+                [0.0, 0.0, 1.0, 3.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            world_from_effect: [[0.0; 4]; 4],
+            command_index: 0,
+            command: endpoint_op1_command(6, 0.5, 1.0),
+        };
+        let poses = vec![vec![None]];
+        let mounts = vec![vec![None]];
+
+        let inactive = slot.clone();
+        let random_samples = HashMap::new();
+        assert!(update_control_point_lights(
+            &mut [inactive],
+            &poses,
+            &mounts,
+            0.25,
+            &random_samples,
+            false,
+        )
+        .is_empty());
+        let lights = update_control_point_lights(
+            std::slice::from_mut(&mut slot),
+            &poses,
+            &mounts,
+            0.75,
+            &random_samples,
+            false,
+        );
+        assert_eq!(lights.len(), 1);
+        let (light, flags) = lights[0];
+        assert_eq!(light.position, [13.0, 22.0, 33.0]);
+        assert_eq!(light.rgb, [0.25, 0.5, 0.75]);
+        assert_eq!(light.range, 15.0);
+        assert_eq!(light.coefficients, [1.0, 0.5, 0.25]);
+        assert_eq!(flags, 0xA000_0000);
+        assert_eq!(
+            [
+                slot.world_from_effect[0][3],
+                slot.world_from_effect[1][3],
+                slot.world_from_effect[2][3]
+            ],
+            [11.0, 22.0, 33.0]
+        );
+
+        slot.header_flags = 0x29;
+        slot.random_seed = 0x1234_5678;
+        slot.phase_jitter = 0.4;
+        slot.random_shift = [2.0, 4.0, 6.0];
+        let sibling_slots = [slot.clone(), slot.clone()];
+        let mut states = HashMap::new();
+        let first = advance_control_effect_random_states(
+            &mut states,
+            &[],
+            &sibling_slots,
+            SceneSampleId::Replay(7),
+            150,
+            1.5,
+        );
+        assert_eq!(first.len(), 1);
+        let key = slot.random_instance_key;
+        let first_sample = first[&key];
+        assert_eq!(first_sample.phase_jitter, 0.0, "the -1 phase skips jitter");
+        assert_ne!(first_sample.accumulated_shift, [0.0; 3]);
+        let mut expected_state = ControlEffectRandomState::new(
+            slot.random_seed,
+            slot.header_flags,
+            slot.phase_jitter,
+            slot.random_shift,
+        );
+        assert_eq!(
+            first_sample,
+            expected_state.advance(SceneSampleId::Replay(7), 150, -1.0)
+        );
+        assert_eq!(
+            advance_control_effect_random_states(
+                &mut states,
+                &[],
+                &sibling_slots,
+                SceneSampleId::Replay(7),
+                150,
+                1.5,
+            )[&key],
+            first_sample,
+            "a repeated read of the same captured update reuses the shared sample"
+        );
+        let second = advance_control_effect_random_states(
+            &mut states,
+            &[],
+            &sibling_slots,
+            SceneSampleId::Replay(8),
+            200,
+            0.5,
+        );
+        assert_eq!(
+            second[&key],
+            expected_state.advance(SceneSampleId::Replay(8), 200, 1.0)
+        );
+        assert_ne!(second[&key].phase_jitter, first_sample.phase_jitter);
+        assert_ne!(
+            second[&key].accumulated_shift,
+            first_sample.accumulated_shift
+        );
+        assert_eq!(states[&key].last_update_clock_ms, Some(200));
+
+        let negative_non_sentinel =
+            ambient_effect_phase(1, 0x220, 1.5, 1.0).expect("post-duration transformed phase");
+        assert_eq!(negative_non_sentinel, -2.5);
+        let mut negative_state = ControlEffectRandomState::new(
+            slot.random_seed,
+            0x229,
+            slot.phase_jitter,
+            slot.random_shift,
+        );
+        assert_eq!(
+            native_command_phase(0x229, negative_non_sentinel, 0.4),
+            0.0,
+            "a phase below -1 clamps to zero rather than using the -1 sentinel"
+        );
+        assert_ne!(
+            negative_state
+                .advance(SceneSampleId::Live(1), 150, negative_non_sentinel)
+                .phase_jitter,
+            0.0,
+            "a non-sentinel negative phase still consumes the jitter sample"
+        );
+    }
+
+    #[test]
+    fn op1_generic_diffuse_list_excludes_bit31_and_clears_inactive_lights() {
+        let light = |position, active| VulkanPointLight {
+            position,
+            rgb: [0.25, 0.5, 0.75],
+            range: 15.0,
+            coefficients: [1.0, 0.5, 0.25],
+            active,
+        };
+        let raw_records = vec![
+            (light([1.0, 2.0, 3.0], true), 0xA000_0000),
+            (light([4.0, 5.0, 6.0], true), 0x2000_0000),
+            (light([7.0, 8.0, 9.0], true), 0x8000_0000),
+            (light([10.0, 11.0, 12.0], false), 0x0000_0000),
+        ];
+
+        let ordinary = ordinary_control_point_lights(&raw_records);
+        assert_eq!(ordinary.len(), 1);
+        assert_eq!(ordinary[0].position, [4.0, 5.0, 6.0]);
+        assert_eq!(raw_records.len(), 4);
+        assert_eq!(
+            raw_records
+                .iter()
+                .map(|(_, flags)| *flags)
+                .collect::<Vec<_>>(),
+            vec![0xA000_0000, 0x2000_0000, 0x8000_0000, 0]
+        );
+
+        assert!(ordinary_control_point_lights(&[]).is_empty());
+        assert!(
+            ordinary_control_point_lights(&[(light([13.0, 14.0, 15.0], false), 0x2000_0000)])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn op1_control_slot_accepts_supported_bodies_with_instance_random_flags() {
+        let command = endpoint_op1_command(6, 0.0, 1.0);
+        assert!(ambient_effect_op1_supported(&command));
+        assert!(!ambient_effect_op1_supported(&endpoint_op1_command(
+            4, 0.0, 1.0
+        )));
+    }
+
+    #[test]
+    fn op1_phase_preserves_native_sentinel_and_initial_manager_gate() {
+        assert_eq!(native_command_phase(0, -1.0, 0.4), -1.0);
+        assert_eq!(native_command_phase(0x100, 0.625, 0.0), 0.625);
+        assert_eq!(native_command_phase(0x80, 0.625, 0.4), 0.0);
+        assert_eq!(native_command_phase(0x81, -1.0, 0.4), 0.4);
+        assert_eq!(native_command_phase(0, -0.25, 0.0), 0.0);
+        assert_eq!(native_command_phase(0, 1.25, 0.0), 1.0);
+        assert_eq!(native_command_phase(1, 0.5, 0.25), 0.75);
+        assert_eq!(native_command_phase(1, 0.9, 0.25), 1.0);
+        let flags_200_20 =
+            ambient_effect_phase(1, 0x220, 1.5, 1.0).expect("triangular post-duration phase");
+        assert_eq!(flags_200_20, -2.5);
+        assert_eq!(native_command_phase(0x220, flags_200_20, 0.4), 0.0);
+        let raw_minus_one =
+            ambient_effect_phase(1, 0x20, 1.5, 1.0).expect("triangular sentinel phase");
+        assert_eq!(raw_minus_one, -1.0);
+        assert_eq!(native_command_phase(0x21, raw_minus_one, 0.4), -1.0);
+        assert_eq!(native_command_phase(0xA1, raw_minus_one, 0.4), 0.4);
+    }
+
+    #[test]
+    fn op7_variable_frames_clear_inactive_draw_ranges() {
+        let aligned = align_ambient_effect_frames(
+            vec![endpoint_effect_frame(3), endpoint_effect_frame(7)],
+            4,
+            true,
+        )
+        .expect("variable Op7 output fits its fixed range allocation");
+        assert_eq!(aligned.len(), 4);
+        assert_eq!(
+            aligned[0].as_ref().map(|frame| frame.command_index),
+            Some(3)
+        );
+        assert_eq!(
+            aligned[1].as_ref().map(|frame| frame.command_index),
+            Some(7)
+        );
+        assert!(aligned[2].is_none() && aligned[3].is_none());
+
+        assert!(align_ambient_effect_frames(vec![endpoint_effect_frame(0)], 4, false,).is_err());
+        assert!(align_ambient_effect_frames(vec![endpoint_effect_frame(0); 5], 4, true,).is_err());
+    }
+
+    #[test]
+    fn active_control_fx_vertex_color_uses_sampled_mat0_additive_rgb() {
+        let mut slot = AmbientEffectGpuSlot {
+            kind: AmbientEffectKind::Op3Type2,
+            time_mode: 1,
+            header_flags: 0,
+            random_instance_key: ControlEffectInstanceKey {
+                object_index: 0,
+                component_index: 0,
+                table_index: 0,
+                row_index: 0,
+            },
+            random_seed: 1,
+            phase_jitter: 0.0,
+            random_shift: [0.0; 3],
+            owner_object_index: 0,
+            owner_component_index: 0,
+            owner_node_index: 0,
+            owner_component_is_mounted: false,
+            root_transform: LegacyIron3dEulerTransform {
+                translation: [0.0; 3],
+                orientation_radians: [0.0; 3],
+            },
+            owner_scale: [1.0; 3],
+            mount_pose: None,
+            local_from_effect: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            control_source: String::new(),
+            control_table_index: 0,
+            control_row_index: 0,
+            control_point_indices: [0; 3],
+            control_point_owners: [0; 3],
+            command: endpoint_op3_command(),
+            command_index: 0,
+            duration_seconds: 1.0,
+            world_from_effect: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+            range: EnvironmentGpuRange {
+                range_index: 0,
+                vertex_start: 0,
+                vertex_capacity: 4,
+                material_index: 0,
+            },
+            additional_particle_ranges: vec![EnvironmentGpuRange {
+                range_index: 1,
+                vertex_start: 4,
+                vertex_capacity: 4,
+                material_index: 1,
+            }],
+            material_animation_index: 0,
+            additional_particle_material_animation_indices: vec![1],
+            smoke_emitter_state: None,
+            op7_emitter_state: None,
+        };
+        assert_eq!(
+            ambient_effect_ranges(&slot)
+                .iter()
+                .map(|(range, binding)| (range.range_index, *binding))
+                .collect::<Vec<_>>(),
+            vec![(0, 0), (1, 1)]
+        );
+        let mut mesh = VulkanStaticMesh {
+            vertices: vec![environment_vertex([0.0; 3], [1.0; 3], [0.0; 2]); 8],
+            indices: Vec::new(),
+            draw_ranges: Vec::new(),
+        };
+        let updates = [
+            AmbientEffectGeometryUpdate {
+                range_index: 0,
+                index_count: 6,
+                command_rgb: [1.0; 3],
+            },
+            AmbientEffectGeometryUpdate {
+                range_index: 1,
+                index_count: 6,
+                command_rgb: [1.0; 3],
+            },
+        ];
+        let mut active_materials = HashMap::from([
+            (
+                0,
+                ActiveMaterialState {
+                    material_index: 0,
+                    phase_index: 0,
+                    diffuse_alpha: 1.0,
+                    additive_rgb: [0.9882353, 1.0, 0.16862746],
+                },
+            ),
+            (
+                1,
+                ActiveMaterialState {
+                    material_index: 1,
+                    phase_index: 0,
+                    diffuse_alpha: 1.0,
+                    additive_rgb: [0.9882353, 1.0, 0.16862746],
+                },
+            ),
+        ]);
+
+        apply_ambient_effect_material_tints(
+            &[slot.clone()],
+            &mut mesh,
+            &updates,
+            &active_materials,
+        )
+        .expect("apply sampled yellow MAT0 color");
+        assert!(mesh
+            .vertices
+            .iter()
+            .all(|vertex| vertex.color == [0.9882353, 1.0, 0.16862746]));
+
+        for material in active_materials.values_mut() {
+            material.additive_rgb = [0.1, 0.7, 0.2];
+        }
+        slot.kind = AmbientEffectKind::SmokePool;
+        apply_ambient_effect_material_tints(&[slot], &mut mesh, &updates, &active_materials)
+            .expect("apply next sampled MAT0 color");
+        assert!(mesh
+            .vertices
+            .iter()
+            .all(|vertex| vertex.color == [0.1, 0.7, 0.2]));
+    }
+
+    #[test]
+    fn ambient_fx_uses_vertex_opacity_without_multiplying_mat0_opacity() {
+        let mat0_opacity = ambient_effect_material_alpha(true, 0.4);
+        let effect_opacity = 0.5;
+        let texture_alpha = 0.25;
+        assert_eq!(mat0_opacity, 1.0);
+        assert_eq!(mat0_opacity * effect_opacity, 0.5);
+        assert_eq!(texture_alpha * mat0_opacity * effect_opacity, 0.125);
+        assert_eq!(ambient_effect_material_alpha(false, 0.4), 0.4);
+    }
+
+    #[test]
+    fn material_animation_cpu_packet_uses_sampled_phase_without_renderer() {
+        let phase = |additive_red| MaterialPhase {
+            parameters: [
+                additive_red,
+                0,
+                0,
+                100,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+            texture_raw: [0; 16],
+        };
+        let document = Mat0Document {
+            version: 0,
+            animation_block_count: 1,
+            phases: vec![phase(0), phase(255)],
+            prefix: Vec::new(),
+            header_opaque: [0; 2],
+            animation_blocks: vec![MaterialAnimationBlock {
+                header_raw: 0,
+                keys: vec![
+                    MaterialKey {
+                        k0: 0,
+                        k1: 500,
+                        k2: 0,
+                    },
+                    MaterialKey {
+                        k0: 1,
+                        k1: 1000,
+                        k2: 0,
+                    },
+                ],
+                bytes: Vec::new(),
+            }],
+        };
+        let mut binding = MaterialAnimationBinding {
+            initial_phase_index: 0,
+            normalized_phase_override: Some(0.75),
+            ambient_fx_material_alpha: true,
+            variants: Vec::new(),
+            base: MaterialPhaseBinding {
+                document,
+                animation_block_index: 0,
+                wear_row_start_ms: 0,
+                random_state: 0,
+                frozen_phase_index: None,
+                phase_uv_transforms: vec![[0.0, 0.0, 1.0, 1.0]; 2],
+            },
+            detail: None,
+            overlay: None,
+            overlay_detail: None,
+            stage_textures: None,
         };
 
-        assert_eq!(update(&range, &mut alpha_override), 0);
-        range.batch_flags = 0x0108;
-        assert_eq!(update(&range, &mut alpha_override), original_count);
-        range.batch_flags = 0x0148;
-        assert_eq!(update(&range, &mut alpha_override), 0);
-        assert_eq!(original_count, 3);
+        let effect_sample = sample_material_animation_base(&mut binding, 0)
+            .expect("sample the effect's native normalized MAT0 phase");
+        assert_eq!(effect_sample.phase_index, 1);
+        assert_eq!(effect_sample.coefficients.additive_rgb, [1.0, 0.0, 0.0]);
+
+        binding.normalized_phase_override = None;
+        let world_sample = sample_material_animation_base(&mut binding, 0)
+            .expect("sample ordinary clock-driven material phase");
+        assert_eq!(world_sample.phase_index, 0);
+        assert_eq!(world_sample.coefficients.additive_rgb, [0.0, 0.0, 0.0]);
+
+        binding.variants.push(MaterialVariantSet {
+            phase_material_indices: vec![0, 0],
+            range_indices: vec![7],
+            pipeline_category: 0,
+        });
+        let mut materials = Vec::new();
+        append_environment_gradient_material(&mut materials)
+            .expect("prepare test material without a renderer");
+        let update =
+            sample_material_animations(std::slice::from_mut(&mut binding), &materials, 500)
+                .expect("produce a CPU material-frame packet without a renderer");
+        assert_eq!(update.active_materials[&7].material_index, 0);
+        assert_eq!(update.active_materials[&7].phase_index, 1);
+        assert_eq!(update.range_selections[0].range_index, 7);
+    }
+
+    #[test]
+    fn ambient_fx_tint_requires_a_proven_ambient_mat0_phase() {
+        assert!(ambient_effect_tint_supported(
+            &[false, false],
+            &[[0.0; 3], [0.2; 3]],
+            &[[1.0, 1.0, 1.0], [0.2, 0.4, 0.8]],
+        ));
+        assert!(!ambient_effect_tint_supported(&[], &[], &[]));
+        assert!(!ambient_effect_tint_supported(&[false], &[], &[]));
+        assert!(!ambient_effect_tint_supported(
+            &[true],
+            &[[0.0; 3]],
+            &[[1.0; 3]]
+        ));
+        assert!(!ambient_effect_tint_supported(
+            &[false],
+            &[[0.1, 0.0, 0.0]],
+            &[[0.0; 3]],
+        ));
+        assert!(!ambient_effect_tint_supported(
+            &[false],
+            &[[0.0; 3]],
+            &[[f32::NAN, 1.0, 1.0]]
+        ));
+    }
+
+    #[test]
+    fn ambient_fx_ranges_are_excluded_from_world_alpha_and_count_updates() {
+        let fixed_ranges = HashSet::from([1, 4, 7]);
+        let world_ranges = world_draw_range_indices(9, &fixed_ranges);
+        assert_eq!(world_ranges, vec![0, 2, 3, 5, 6, 8]);
+        assert!(!world_ranges.contains(&7));
+    }
+
+    #[test]
+    fn ambient_control_rows_accept_unconditional_low_words_but_skip_state_gates_and_chains() {
+        let mut row = PreparedControlEffectRow {
+            table_index: 2,
+            row_index: 0,
+            raw_condition: [0, 7, 9],
+            point_offsets: [0, 1, 2],
+            selector: 0,
+            resource: fparkan_assets::PreparedControlResourcePair {
+                archive: [0; 32],
+                name: [0; 32],
+            },
+        };
+        assert!(ambient_effect_row_unconditionally_active(&row));
+        for condition_flag in [0x1000_0000, 0x2000_0000, 0x4000_0000, 0x8000_0000] {
+            row.raw_condition[0] = condition_flag;
+            assert!(!ambient_effect_row_unconditionally_active(&row));
+        }
     }
 }

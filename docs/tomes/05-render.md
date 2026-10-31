@@ -362,30 +362,14 @@ local.set_translation(pose.position);
 world[n] = world[parent(n)] * local;
 ```
 
-Статический Vulkan preview берёт CTLD `.ctl` из явной ссылки прототипа.
-Поддерживаемые Control timeline с tag 21 сэмплируются при запуске на native
-clock `0`; разрешённые NDP providers передают конечные type-1 значения.
-Неподдерживаемый режим или variable mapping, а также отсутствующее или
-неразрешённое gate value оставляют компонент на статических CTLD bindings. В
-timeline участвуют только включённые строки; при повторном node ID поздняя
-строка заменяет раннюю.
+Статический Vulkan preview сначала строит начальную позу по CTLD `.ctl`.
+В ней участвуют только включённые строки; при повторе node ID поздняя строка
+заменяет раннюю, а узлы без настройки остаются на кадре `0`. Без
+`--static-animation-frame` preview сэмплирует поддержанные Control timelines
+при каждом новом сэмпле сцены. Флаг `--static-animation-frame N` задаёт `N`
+всем узлам и пропускает runtime Control sample. Это визуальный preview позы,
+а не полный Control/AI runtime.
 
-Без `--static-animation-frame` preview сохраняет экземпляр Control и при
-каждом redraw сэмплирует поддерживаемый timeline на текущем native clock.
-Обновлённая Node38-поза перепроецирует видимую геометрию в заранее выделенный
-vertex span, оставляя индексы и draw ranges неизменными. Если в пути Unit DAT
-компонента есть такой Control, заново вычисляется его EXTO mount socket и
-перепроецируется дочерняя геометрия; дочерний mount использует preorder-порядок
-Unit DAT. Внутренние INTO-компоненты здесь не считаются глобальными MSH
-socket mounts. Обновлённые вершины и shadow-треугольники попадают в общий
-mesh upload перед следующим кадром. Culling sphere восстанавливается от
-начальной native sphere и расширяется до текущих shadow-треугольников; это
-`shortcut:`, потому что native обновление bounding sphere для анимированной
-геометрии пока не установлено. Это путь сэмплирования Control-позы, не AI или
-анимация эффектов.
-
-Явный `--static-animation-frame N` переопределяет timeline и задаёт `N` всем
-узлам, пропуская runtime Control-сэмпл.
 MSH sampler выбирает type 19 frame округлением `(time - 0.5)` к ближайшему
 целому с ties-to-even, затем интерполирует выбранный type 8 key и следующий
 key в исходном `time`; это portable-вариант native x87 conversion в default
@@ -646,15 +630,15 @@ diffuse texture ломает LOD, atlas coordinates и динамическую 
 Vulkan preview строит проецируемые тени для объектов, отбрасывающих тени,
 отбрасывает сферы вне шести clip-плоскостей с радиусом `sphere + 100` и
 сохраняет порядок видимых кандидатов; frame builder обрабатывает не более 20
-объектов. Текущая реализация выделяет страницы в atlas `256 x 256` с 28 page
-slots и использует одно сглаживание. Preview применяет native defaults
-`RobShadowsOn = true` и `BldShadowsOn = false`: объект kind `4` проверяет
-первый флаг, остальные kinds — второй. Поэтому роботы BTLU остаются объектами,
-отбрасывающими тени, а объекты FORT и STAT их не создают. Preview пока не
-загружает `shade.cfg`, поэтому значения из пользовательского файла не меняют
-список объектов, отбрасывающих тени. Проверка действует только на проецируемые
-тени: отдельный список объектов для затенения солнца по-прежнему включает
-FORT, BTLU и STAT. Вызов preview передаёт `fade = 1.0` и LOD defaults:
+объектов, отбрасывающих тени. Текущая реализация выделяет страницы в atlas
+`256 x 256` с 28 page slots и использует одно сглаживание. Preview применяет
+native defaults `RobShadowsOn = true` и `BldShadowsOn = false`: объект kind `4`
+проверяет первый флаг, остальные kinds — второй. Поэтому роботы BTLU остаются
+объектами, отбрасывающими тени, а объекты FORT и STAT их не создают. Preview
+пока не загружает `shade.cfg`, поэтому значения из пользовательского файла не
+меняют список объектов, отбрасывающих тени. Проверка действует только на
+проецируемые тени: отдельный список объектов для затенения солнца по-прежнему
+включает FORT, BTLU и STAT. Вызов preview передаёт `fade = 1.0` и LOD defaults:
 minimum LOD `1` и detail multiplier `1.0` отдельно для зданий и роботов.
 Проекция учитывает вклад directional и point lights.
 
@@ -822,6 +806,39 @@ Update и emit разделяются. Simulation может продолжат�
 emit не должен повторно менять игровое состояние. Для authoring безопасно
 типизировать header и resource references, а body редких commands сохранять raw
 до подтверждения field-level semantics.
+
+В `fparkan-game` выбранные Control FX проходят отдельный transparent path.
+Начальная CTL group запускает только строки без predicates, chain или state
+gate. Type 4 point list задаёт локальную матрицу; текущие MSH owner и mounted
+node poses входят в transform до локальной FX basis. Реализованные visuals
+охватывают Op3 modes 0–2, Op4, Op7/8 particle pools и Op9 generated mesh. Op1
+selector 1 добавляет point lights без native flag `0x80000000` в общий diffuse
+список; остальные active records сохраняют flags для специальных путей и
+projected shadows. Effect renderer подавляет header bit `0x800` только при
+render selector 0. Native AniMesh component path захвачен с selector 1, а в
+его 53-entry manager присутствуют FX entries с header `0xD00`; preview
+использует selector 1 и пропускает такие visual commands. Изменения manager
+`A8`, которые задают runtime phase/header gate, пока не моделируются. Header
+bit `0x10` относится к activation lifecycle и не выключает draw.
+
+Для visual effect renderer использует MAT0, указанный самой командой. Его
+phase выбирается по normalized FX phase, а не по wall-clock clock материала
+мира. FX opacity остаётся в vertex alpha, MAT0 alpha для этой FX binding
+фиксируется на единице, texture alpha остаётся в shader. Preview передаёт FX
+через SourceAlpha/read-only-depth state. MAT0 phases проходят локальный
+eligibility predicate additive-RGB approximation; native `flag40` и
+directional-light branch остаются неразрешёнными.
+
+Op9 генерирует индексированную полусферу с отдельными vertex и UV данными и
+отправляет каждый quad и cap как отдельный draw range. Native packet distance
+callback берёт первую индексированную вершину (`Terrain.dll:0x246A0` через
+`0x247B0`), преобразует её согласно режиму packet и использует евклидово
+расстояние до камеры. Queue размещает большие расстояния раньше меньших;
+равный ключ вставляется в найденный binary-search midpoint, поэтому порядок
+равных packets не стабилен по времени поступления. Preview повторяет этот ключ
+и insertion order. Renderer category 0 остаётся highest-detail mesh; native
+category вычисляется из projected sphere size и quality table, поэтому
+фиксированная категория не является native LOD parity.
 
 ## Полный кадр
 
@@ -1035,54 +1052,48 @@ WEAR и MAT0 до объединения геометрии. Индексы GPU 
 animation phase; object batches сохраняют их legacy blend/depth/alpha state.
 
 После загрузки world path создаёт интерактивную free-flight камеру (`WASD`,
-`E/Q`, `Shift`, `Ctrl`, RMB relative-look), обновляет listener и собирает
-environment frame для каждого подготовленного кадра. Event loop один раз
-сэмплирует камеру, общий animation clock, геометрию и окружение перед запросом
-redraw; redraw потребляет это состояние. Если surface требует пересоздать
-swapchain, тот же sample времени и состояние мира отправляются повторно.
-Перед повторной отправкой projection камеры и viewport-зависимые environment
-и shadow geometry обновляются для нового размера без продвижения сцены.
-Счётчик и replay clock продвигаются только после результата `Presented`.
-После шага движения камера проверяет высоту
-`TerrainWorld`: над конечной поверхностью сохраняется начальный просвет, а вне
-поверхности высота не ограничивается.
-
-Для каждого отрисовываемого строения (корневого объекта класса `FORT`) и для
-каждого его отрисовываемого компонента создаётся отдельная запись проверки. Она
-использует те же текущие матрицы узлов и присоединённых компонентов, что и
-геометрия.
-После ограничения целевой позиции по TerrainWorld камера проверяет непрерывный
-отрезок от прежней позиции до цели; при пересечении она остаётся в прежней
-позиции, сохраняя новый поворот. Повторная отправка ожидающего кадра не
-применяет движение второй раз. Это ограничение диагностической свободной
-камеры, а не правило игрового или следящего режима оригинала.
-
+`E/Q`, `Shift`, `Ctrl`, RMB relative-look), обновляет listener и на каждом
+кадре собирает environment frame. Для каждого отрисовываемого строения
+(корневого объекта класса `FORT`) и для каждого его отрисовываемого компонента
+создаётся отдельная запись проверки. Она использует те же текущие матрицы узлов
+и присоединённых компонентов, что и геометрия. После ограничения целевой
+позиции по TerrainWorld камера проверяет непрерывный отрезок от прежней позиции
+до цели; при пересечении
+она остаётся в прежней позиции, сохраняя новый поворот. Повторная отправка
+ожидающего кадра не применяет движение второй раз. Это ограничение
+диагностической свободной камеры, а не правило игрового или следящего режима
+оригинала.
 Mission-local `sky.ske`/`sky.wea` выбирают
 атмосферное расписание и sky materials, `effects.rlb/env_lightning` даёт
 lightning visual; weather particles, flares, sun/moon, point lights,
 projected shadows и audio events обновляются вместе с камерой и временем.
 `--atmosphere-seconds` задаёт старт времени, `--frames 0` оставляет цикл
-бесконечным, `--control-clock-ms N` воспроизводит общий clock анимации MSH и
-материалов вместе с окружением от нуля до `N` за заданное число кадров и требует
-как минимум два кадра.
-`--preview-roots` служит только диагностическим ограничителем.
+бесконечным, а `--preview-roots` служит только диагностическим ограничителем.
 `--legacy-camera-capture` выбирает воспроизводимую камеру без free-flight
-управления: запись selector 0 задаёт D3D7 transform, clip параметры и native
-viewport RECT `[left, top, right, bottom]`. Путь сохраняет оси basis из view
-matrix вместе с roll, переносит полученный `clip_from_world` в preview camera,
-переводит RECT в физический drawable размер `(right - left) × (bottom - top)`
-и отклоняет несовпадение размера при
-создании или resize вместо растягивания кадра. Результат нужно сравнивать с
-тем же crop исходного PNG `[left, top, right, bottom]`. Контроллер
-`FreeFlightCamera` в этом режиме не создаётся. Подготовка кадра обновляет
+управления. `selector0_words` содержит локальную матрицу камеры. Если запись
+содержит `effective_world_matrix_words` с маркером
+`effective_world_matrix_space="world"`, preview использует эту мировую
+матрицу. При `parented_camera=true` отсутствие мировой матрицы — ошибка;
+локальный selector 0 остаётся legacy fallback только для записей без признака
+parented и без мировой матрицы.
+Если native helper явно применяет выбранную мировую камеру, setter работает в
+mode 2, а restore возвращает исходную локальную матрицу в mode 1. Clip
+параметры и native viewport RECT `[left, top, right, bottom]` идут из той же
+записи. Путь сохраняет оси basis из view matrix вместе с roll, переносит
+полученный `clip_from_world` в preview camera, переводит RECT в физический
+drawable размер `(right - left) × (bottom - top)` и отклоняет несовпадение
+размера при создании или resize вместо растягивания кадра. Результат нужно
+сравнивать с тем же crop исходного PNG `[left, top, right, bottom]`. Контроллер
+`FreeFlightCamera` в этом режиме не создаётся, но redraw продолжает обновлять
 environment и projected shadows от captured camera. Перед environment update и
 его audio events listener получает position, forward и up captured camera;
 начальная сортировка world draw использует её же position. Phase capture может
 содержать наблюдаемый mission path и проверенный `atmosphere_seconds`; viewer
 использует эту абсолютную фазу по умолчанию, если не указан явный CLI override,
-и удерживает sample атмосферы на ней через readback frames. Без
-`--control-clock-ms` FX получает реальный frame time; с параметром environment
-и материалы используют replay clock. Это не полное simulation time: `weather`, RNG и
+и удерживает sample атмосферы на ней через readback frames. Фазы FX следуют
+выбранному control clock: без `--control-clock-ms` он обновляется по elapsed
+time, а с явным значением readback frames переигрывают заданный clock. Это не
+полное simulation time: `weather`, RNG и
 остальное mission state остаются неизвестными, поэтому совпадение камеры и
 фазы не доказывает visual parity с native frame.
 

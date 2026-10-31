@@ -95,6 +95,51 @@ translation суммируется, а rotations умножаются; посл�
 запускает игровой Control/AI и не обещает полного совпадения с runtime или
 всеми x87 rounding modes.
 
+## Control clock и pose компонентов
+
+Статический Vulkan preview начинает с позы, вычисленной из сохранённых `.ctl`
+bindings. Пока не задан `--static-animation-frame`, при каждом новом сэмпле
+сцены приложение сэмплирует поддержанные tag 21 записи для каждого экземпляра
+компонента и заново строит его MSH node hierarchy; time и transition используют
+общий runtime clock. Динамический sampler принимает tag 21 mode `0`,
+controller flags `5` (raw value `0xFFFFFFFF` трактуется как `5`),
+разрешённый gate provider и static row mapping: оба
+variable index равны `0xFFFFFFFF`, previous-row flag не установлен, transition
+rate конечен и положителен.
+
+Fallback к статической CTLD-позе всего экземпляра компонента срабатывает только
+при следующих ошибках sampler: `UnsupportedTag21Mode`,
+`UnsupportedVariableMapping`, `MissingGateProvider`,
+`GateProviderKeyOutOfRange`, `MissingGateProviderValue` и
+`GateProviderCountMismatch`. Он заменяет весь динамический результат экземпляра,
+а не одну запись. Остальные sampling errors завершают обновление сцены; например,
+`UnsupportedPreviousRowMapping` и `InvalidTransitionRate` не включают fallback.
+
+`--control-clock-ms <u32>` воспроизводит общий MSH/FX clock линейно: первый из
+`--frames` успешно представленных кадров получает `0`, последний — заданное
+время. Replay clock привязан к числу представленных кадров: повторная подготовка
+того же кадра, включая swapchain recreation, использует прежний sample.
+`--static-animation-frame <u16>` отключает динамическую MSH выборку и задаёт один
+frame всем компонентам. Этот override не включает AI и не превращает preview
+в полный игровой Control runtime.
+
+## Control FX и owner transform
+
+Для выбранной Control effect group runtime берёт строки без predicate, chain и
+state gate. Type 4 row offsets выбирают три точки из CTL point list; позиции
+точек задают локальное начало, а их направления — локальную basis. К basis
+применяются FX header scale и локальные random shifts. Затем матрица проходит
+через mission rotation/translation и object scale, optional mounted-component
+pose, owner-node pose и локальную матрицу эффекта. Поэтому FX mounted-компонента
+следует её текущему MSH owner pose, а не остаётся привязанным к mission root.
+
+Когда point record задаёт допустимый owner node, его pose разрешается из MSH
+hierarchy. Для mounted external components node pose вычисляется относительно
+component root и применяется вместе с уже рассчитанным mount pose. Internal
+`INTO` child controller/equipment links пока не интерпретируются как MSH socket;
+если owner pose нельзя разрешить, его FX пропускается. Нативное сочетание child
+component scale, equipment attachment и CPT basis остаётся неустановленным.
+
 ## Vertex streams
 
 Основные vertex streams имеют фиксированный source index. У type 3 `attr1`
