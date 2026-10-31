@@ -495,6 +495,38 @@ pub struct MissionControlDeviceTableState {
     pub current_output_rate_5e0_bits: u32,
 }
 
+/// One initial outer row prepared from the current Control descriptor table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissionBehaviorControlGroup {
+    /// Table ordinal of the descriptor whose current tag starts this group.
+    pub header_device_ordinal: usize,
+    /// Table ordinals of current-tag-2 descriptors following this header.
+    pub candidate_device_ordinals: Vec<usize>,
+    /// Table ordinals of current-tag-30 descriptors following this header.
+    pub tag30_device_ordinals: Vec<usize>,
+}
+
+/// Initial grouping of a prepared Control table, before live Behavior refreshes.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MissionBehaviorControlGrouping {
+    /// Groups in the order their current-tag-1 headers appeared.
+    pub groups: Vec<MissionBehaviorControlGroup>,
+    /// Current-tag-2 entries before the first header.
+    pub ungrouped_candidate_device_ordinals: Vec<usize>,
+}
+
+/// Initial Behavior grouping projection for one full-load mission object.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MissionBehaviorControlGroupingState {
+    /// Stable identity from the source TMA object order.
+    pub original_id: Option<OriginalObjectId>,
+    /// Corresponding live Rust world object.
+    pub handle: ObjectHandle,
+    /// Initial grouping, or the reason its prepared Control table is unavailable.
+    pub grouping:
+        Result<MissionBehaviorControlGrouping, MissionControlDeviceTableUnavailableReason>,
+}
+
 /// Provenance for the class passed to Control's constructor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MissionControlClassSource {
@@ -974,6 +1006,7 @@ struct LoadedMissionState {
     behavior_ore_states: Vec<BehaviorOreState>,
     behavior_profiles: Vec<BehaviorProfileState>,
     control_device_tables: Vec<MissionControlDeviceTableState>,
+    behavior_control_groupings: Vec<MissionBehaviorControlGroupingState>,
     research_trf_tables: Vec<MissionResearchTrfTable>,
     script_bundles: Vec<MissionScriptBundle>,
     script_varset: Option<MissionScriptVarSet>,
@@ -1720,6 +1753,14 @@ fn load_mission_with_options(
     } else {
         Vec::new()
     };
+    let behavior_control_groupings = if options.asset_scope == MissionAssetScope::Full {
+        control_device_tables
+            .iter()
+            .map(project_mission_behavior_control_grouping)
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let mut next_behavior_rng_state = engine.behavior_rng_state;
     if options.asset_scope == MissionAssetScope::Full {
@@ -1801,6 +1842,7 @@ fn load_mission_with_options(
         behavior_ore_states,
         behavior_profiles,
         control_device_tables,
+        behavior_control_groupings,
         research_trf_tables,
         script_bundles: loaded_scripts.bundles,
         script_varset: loaded_scripts.varset,
@@ -2130,6 +2172,61 @@ pub fn loaded_mission_control_device_tables(
         .loaded
         .as_ref()
         .map(|state| state.control_device_tables.as_slice())
+}
+
+/// Returns the initial prepared Control grouping for full-load mission objects.
+#[must_use]
+pub fn loaded_mission_behavior_control_groupings(
+    engine: &Engine,
+) -> Option<&[MissionBehaviorControlGroupingState]> {
+    engine
+        .loaded
+        .as_ref()
+        .map(|state| state.behavior_control_groupings.as_slice())
+}
+
+fn project_mission_behavior_control_grouping(
+    table: &MissionControlDeviceTableState,
+) -> MissionBehaviorControlGroupingState {
+    let grouping = match &table.status {
+        MissionControlDeviceTableStatus::Available(devices) => {
+            Ok(build_mission_behavior_control_grouping(devices))
+        }
+        MissionControlDeviceTableStatus::Unavailable(reason) => Err(reason.clone()),
+    };
+    MissionBehaviorControlGroupingState {
+        original_id: table.original_id,
+        handle: table.handle,
+        grouping,
+    }
+}
+
+fn build_mission_behavior_control_grouping(
+    devices: &[EffectiveControlDevice],
+) -> MissionBehaviorControlGrouping {
+    let mut grouping = MissionBehaviorControlGrouping::default();
+    for (ordinal, device) in devices.iter().enumerate() {
+        match device.descriptor.tag {
+            1 => {
+                grouping.groups.push(MissionBehaviorControlGroup {
+                    header_device_ordinal: ordinal,
+                    candidate_device_ordinals: Vec::new(),
+                    tag30_device_ordinals: Vec::new(),
+                });
+            }
+            2 => match grouping.groups.last_mut() {
+                Some(group) => group.candidate_device_ordinals.push(ordinal),
+                None => grouping.ungrouped_candidate_device_ordinals.push(ordinal),
+            },
+            30 => {
+                if let Some(group) = grouping.groups.last_mut() {
+                    group.tag30_device_ordinals.push(ordinal);
+                }
+            }
+            _ => {}
+        }
+    }
+    grouping
 }
 
 /// Queries native Control global-table selector 1 (weighted ratio), 2 (sum), or 15.
@@ -7274,6 +7371,95 @@ mod tests {
             current_output_rate_5e0_bits: 0,
             node_provider_status,
         }
+    }
+
+    #[test]
+    fn behavior_control_grouping_uses_current_tags_and_table_ordinals() {
+        let tags = [2, 30, 1, 30, 2, 99, 1, 2, 30, 2, 1];
+        let devices = tags
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, current_tag)| {
+                let mut device = synthetic_effective_control_device(
+                    5,
+                    current_tag,
+                    1.0_f32.to_bits(),
+                    None,
+                    None,
+                );
+                device.key = 100 + ordinal as u32;
+                device.descriptor.fixed_words[1] = 200 + ordinal as u32;
+                device
+            })
+            .collect();
+        let table =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(devices));
+        let state = project_mission_behavior_control_grouping(&table);
+        assert_eq!(state.original_id, Some(OriginalObjectId(7)));
+        assert_eq!(
+            state.handle,
+            ObjectHandle {
+                generation: 5,
+                slot: 7
+            }
+        );
+        assert_eq!(
+            state.grouping,
+            Ok(MissionBehaviorControlGrouping {
+                ungrouped_candidate_device_ordinals: vec![0],
+                groups: vec![
+                    MissionBehaviorControlGroup {
+                        header_device_ordinal: 2,
+                        candidate_device_ordinals: vec![4],
+                        tag30_device_ordinals: vec![3],
+                    },
+                    MissionBehaviorControlGroup {
+                        header_device_ordinal: 6,
+                        candidate_device_ordinals: vec![7, 9],
+                        tag30_device_ordinals: vec![8],
+                    },
+                    MissionBehaviorControlGroup {
+                        header_device_ordinal: 10,
+                        candidate_device_ordinals: Vec::new(),
+                        tag30_device_ordinals: Vec::new(),
+                    },
+                ],
+            }),
+            "group membership uses current descriptor tags and table ordinals, not factory tags or keys"
+        );
+
+        let empty =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(Vec::new()));
+        assert_eq!(
+            project_mission_behavior_control_grouping(&empty).grouping,
+            Ok(MissionBehaviorControlGrouping::default())
+        );
+
+        let headerless_devices = [2, 30, 2]
+            .into_iter()
+            .map(|current_tag| {
+                synthetic_effective_control_device(5, current_tag, 1.0_f32.to_bits(), None, None)
+            })
+            .collect();
+        let headerless = synthetic_control_device_table(
+            MissionControlDeviceTableStatus::Available(headerless_devices),
+        );
+        assert_eq!(
+            project_mission_behavior_control_grouping(&headerless).grouping,
+            Ok(MissionBehaviorControlGrouping {
+                groups: Vec::new(),
+                ungrouped_candidate_device_ordinals: vec![0, 2],
+            })
+        );
+
+        let reason = MissionControlDeviceTableUnavailableReason::NoControlResource;
+        let unavailable = synthetic_control_device_table(
+            MissionControlDeviceTableStatus::Unavailable(reason.clone()),
+        );
+        assert_eq!(
+            project_mission_behavior_control_grouping(&unavailable).grouping,
+            Err(reason)
+        );
     }
 
     fn control_budget_test_table(generator_coefficient: f32) -> MissionControlDeviceTableState {
@@ -13550,6 +13736,62 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
+    fn full_load_builds_initial_behavior_control_groupings_for_autodemo() {
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(
+            licensed_root("IS"),
+        ))))
+        .expect("engine");
+        load_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Autodemo.00/data.tma".into(),
+                mode: MissionMode::AutoDemo,
+            },
+            MissionStartupInput {
+                queue_time_ms: 100_000,
+                research_creation_gate: false,
+            },
+        )
+        .expect("load licensed AutoDemo with explicit startup inputs");
+
+        let groupings =
+            loaded_mission_behavior_control_groupings(&engine).expect("initial Behavior groupings");
+        let group = |header_device_ordinal, candidate_device_ordinals: &[usize]| {
+            MissionBehaviorControlGroup {
+                header_device_ordinal,
+                candidate_device_ordinals: candidate_device_ordinals.to_vec(),
+                tag30_device_ordinals: Vec::new(),
+            }
+        };
+        let expected = [
+            (0, vec![group(6, &[10, 11, 12, 13])]),
+            (1, vec![group(6, &[10, 11])]),
+            (2, vec![group(8, &[12, 13, 14])]),
+            (3, vec![group(6, &[10, 11, 12])]),
+            (4, Vec::new()),
+            (5, Vec::new()),
+            (6, Vec::new()),
+            (7, Vec::new()),
+        ];
+        assert_eq!(groupings.len(), expected.len());
+        for (original_id, expected_groups) in expected {
+            let state = groupings
+                .iter()
+                .find(|state| state.original_id == Some(OriginalObjectId(original_id)))
+                .expect("grouping for AutoDemo Control object");
+            assert_eq!(
+                state.grouping,
+                Ok(MissionBehaviorControlGrouping {
+                    groups: expected_groups,
+                    ungrouped_candidate_device_ordinals: Vec::new(),
+                }),
+                "original object {original_id}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
     fn full_load_queries_control_selector_15_against_frozen_native_inputs() {
         let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(
             licensed_root("IS"),
@@ -14653,6 +14895,10 @@ mod tests {
             NonZeroUsize::new(1).expect("non-zero root count"),
         )
         .expect("load licensed Single.01 preview");
+
+        assert!(loaded_mission_behavior_control_groupings(&engine)
+            .expect("preview grouping projection")
+            .is_empty());
 
         let bundles = loaded_mission_script_bundles(&engine).expect("script bundles");
         assert_eq!(bundles.len(), 2);
