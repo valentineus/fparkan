@@ -226,6 +226,8 @@ pub enum TerrainLodError {
     DuplicateFaceAssignment { face: usize },
     /// A source face is absent from every supported terrain slot.
     MissingFaceAssignment { face: usize },
+    /// Slot bounds do not form the regular XY cell grid used by terrain rendering.
+    InvalidCellGrid,
     /// A checked index calculation overflowed.
     IntegerOverflow,
 }
@@ -276,6 +278,7 @@ impl std::fmt::Display for TerrainLodError {
             Self::MissingFaceAssignment { face } => {
                 write!(f, "terrain face {face} is not assigned to a supported slot")
             }
+            Self::InvalidCellGrid => write!(f, "terrain slots do not form a regular XY cell grid"),
             Self::IntegerOverflow => write!(f, "terrain slot index overflow"),
         }
     }

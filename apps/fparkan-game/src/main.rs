@@ -3,6 +3,7 @@
 //! `FParkan` render-planning composition root.
 
 mod camera_capture;
+mod terrain_lod;
 
 #[cfg(test)]
 use camera_capture::parse_legacy_camera_capture;
@@ -4626,6 +4627,7 @@ fn multiply_row_major(left: [f32; 16], right: [f32; 16]) -> [f32; 16] {
 
 struct StaticPreviewScene {
     mesh: VulkanStaticMesh,
+    terrain_lod: Option<terrain_lod::TerrainLodDraws>,
     native_handedness_by_range: HashMap<usize, i8>,
     type16_present_ranges: HashSet<usize>,
     materials: Vec<VulkanStaticMaterial>,
@@ -8019,6 +8021,11 @@ fn static_preview_mesh_and_materials(
         terrain,
         foundation,
     )?;
+    let (terrain_component, terrain_lod) = terrain_lod::prepare(
+        terrain_mesh,
+        terrain_component,
+        terrain_query.basement_foundation(),
+    )?;
     let terrain_materials = static_preview_terrain_base_materials(
         &mut terrain_material_loader,
         root,
@@ -8521,6 +8528,7 @@ fn static_preview_mesh_and_materials(
     let shadow_material_index = append_shadow_material(&mut materials)?;
     Ok(StaticPreviewScene {
         mesh,
+        terrain_lod,
         native_handedness_by_range,
         type16_present_ranges,
         materials,
@@ -9333,6 +9341,7 @@ fn run_static_vulkan_mode(
 
 struct StaticVulkanApp {
     mesh: VulkanStaticMesh,
+    terrain_lod: Option<terrain_lod::TerrainLodDraws>,
     native_handedness_by_range: HashMap<usize, i8>,
     type16_present_ranges: HashSet<usize>,
     materials: Vec<VulkanStaticMaterial>,
@@ -9439,6 +9448,7 @@ impl StaticVulkanApp {
             .collect();
         Self {
             mesh: preview.mesh,
+            terrain_lod: preview.terrain_lod,
             native_handedness_by_range: preview.native_handedness_by_range,
             type16_present_ranges: preview.type16_present_ranges,
             materials: preview.materials,
@@ -9509,6 +9519,12 @@ impl StaticVulkanApp {
         renderer: &mut VulkanSmokeRenderer,
         aspect: f32,
     ) -> Result<(), String> {
+        if let Some(lod) = &self.terrain_lod {
+            lod.report(
+                self.view_camera.position,
+                horizontal_fov(&self.view_camera, aspect),
+            )?;
+        }
         let approximate_portals = self
             .world_range_indices
             .iter()
@@ -9573,18 +9589,26 @@ impl StaticVulkanApp {
                 .map_err(|error| {
                     format!("configure world material category {range_index}: {error}")
                 })?;
-            renderer
-                .set_draw_range_index_count(
+            let count = world_draw_range_index_count(
+                &self.mesh,
+                range,
+                range.index_count,
+                effective_alpha,
+                self.view_camera.position,
+                self.native_handedness_by_range.get(&range_index).copied(),
+            );
+            let count = if let Some(lod) = &self.terrain_lod {
+                lod.index_count(
                     range_index,
-                    world_draw_range_index_count(
-                        &self.mesh,
-                        range,
-                        range.index_count,
-                        effective_alpha,
-                        self.view_camera.position,
-                        self.native_handedness_by_range.get(&range_index).copied(),
-                    ),
-                )
+                    count,
+                    self.view_camera.position,
+                    horizontal_fov(&self.view_camera, aspect),
+                )?
+            } else {
+                count
+            };
+            renderer
+                .set_draw_range_index_count(range_index, count)
                 .map_err(|error| {
                     format!("configure world draw range {range_index} count: {error}")
                 })?;
@@ -9642,6 +9666,7 @@ impl StaticVulkanApp {
         type16_present_ranges: &HashSet<usize>,
         world_range_index_counts: &HashMap<usize, u32>,
         native_handedness_by_range: &HashMap<usize, i8>,
+        terrain_lod: Option<&terrain_lod::TerrainLodDraws>,
         eye_world: [f32; 3],
         horizontal_fov: f32,
         active_materials: &HashMap<usize, ActiveMaterialState>,
@@ -9686,6 +9711,11 @@ impl StaticVulkanApp {
                 eye_world,
                 native_handedness_by_range.get(&range_index).copied(),
             );
+            let count = if let Some(lod) = terrain_lod {
+                lod.index_count(range_index, count, eye_world, horizontal_fov)?
+            } else {
+                count
+            };
             renderer
                 .set_draw_range_index_count(range_index, count)
                 .map_err(|error| format!("update world draw range {range_index} count: {error}"))?;
@@ -10295,6 +10325,7 @@ impl StaticVulkanApp {
             &self.type16_present_ranges,
             &self.world_range_index_counts,
             &self.native_handedness_by_range,
+            self.terrain_lod.as_ref(),
             frame.camera.position,
             horizontal_fov(&frame.camera, frame.aspect),
             &frame.material_update.active_materials,
@@ -13571,6 +13602,7 @@ mod tests {
         };
         let view_camera = free_camera.preview_frame(16.0 / 9.0);
         let preview = StaticPreviewScene {
+            terrain_lod: None,
             mesh: VulkanStaticMesh {
                 vertices: [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]
                     .into_iter()

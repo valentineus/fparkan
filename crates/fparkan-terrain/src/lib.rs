@@ -6,6 +6,9 @@ use std::collections::VecDeque;
 
 mod contour;
 mod foundation;
+mod lod;
+
+pub use lod::TerrainLodPlan;
 
 use foundation::basement_surface_mask;
 pub use foundation::{
@@ -1630,6 +1633,83 @@ mod tests {
                 "{corpus} located center coverage"
             );
         }
+    }
+
+    #[test]
+    fn lod_grid_uses_authored_face_ownership_and_pins_changed_foundation_cells() {
+        use fparkan_terrain_format::{TerrainStream, TerrainStreamAttributes};
+        let mut mesh = synthetic_land_mesh();
+        mesh.faces.extend(mesh.faces.clone());
+        assign_terrain_lod_slots(&mut mesh, &[[0, 1]], &[[0, 2], [2, 2]]);
+        mesh.slots.header_raw = vec![0; 0x8c];
+        mesh.streams.push(TerrainStream {
+            type_id: 1,
+            attributes: TerrainStreamAttributes {
+                attr1: 1,
+                attr2: 1,
+                attr3: 0,
+            },
+            size: 38,
+        });
+        for slot in &mut mesh.slots.slots_raw {
+            slot[20..24].copy_from_slice(&1.0_f32.to_le_bytes());
+            slot[24..28].copy_from_slice(&1.0_f32.to_le_bytes());
+        }
+        let mut foundation = BasementFoundation {
+            placements: Vec::new(),
+            fragments: (0..2)
+                .map(|face| BasementFoundationFragment {
+                    source_face: Some(face),
+                    surface_mask: mesh.faces[face].flags,
+                    positions: mesh.faces[face]
+                        .vertices
+                        .map(|v| mesh.positions[usize::from(v)]),
+                })
+                .collect(),
+        };
+        foundation.fragments[0].positions.rotate_left(1);
+        let plan = TerrainLodPlan::new(&mesh, Some(&foundation)).unwrap();
+        assert_eq!(plan.source_face_node(3), Some(0));
+        assert_eq!(plan.source_face_node(4), None);
+        assert_eq!(
+            plan.selected_lod(0, [4.0, 4.0], 1.3),
+            Some(TerrainLod::Lod1)
+        );
+        foundation.fragments.pop();
+        let patched = TerrainLodPlan::new(&mesh, Some(&foundation)).unwrap();
+        assert_eq!(
+            patched.selected_lod(0, [4.0, 4.0], 1.3),
+            Some(TerrainLod::Lod0)
+        );
+        mesh.slots.slots_raw[0][24..28].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert!(matches!(
+            TerrainLodPlan::new(&mesh, None),
+            Err(TerrainLodError::InvalidCellGrid)
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_corpus_land_meshes_build_native_lod_grids() {
+        let mut files = 0;
+        for path in files_under(&corpus_root("IS")) {
+            if !path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("Land.msh"))
+            {
+                continue;
+            }
+            let bytes = std::fs::read(&path).unwrap();
+            let nres =
+                fparkan_nres::decode(Arc::from(bytes.into_boxed_slice()), ReadProfile::Compatible)
+                    .unwrap();
+            let mesh = fparkan_terrain_format::decode_land_msh(&nres).unwrap();
+            let plan = TerrainLodPlan::new(&mesh, None).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+            assert!(plan.has_far_geometry(), "{path:?}: no far slots");
+            files += 1;
+        }
+        assert_eq!(files, 33, "original game LOD grid count");
     }
 
     #[test]

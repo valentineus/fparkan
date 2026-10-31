@@ -1105,7 +1105,21 @@ fn project_land_msh_to_static_mesh_with_lod0(
 pub fn project_land_msh_to_static_mesh_in_world_space(
     terrain: &LandMeshDocument,
 ) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
-    let lod0 = static_terrain_lod0_assignments(terrain)?;
+    project_land_msh_lod_to_static_mesh_in_world_space(terrain, TerrainLod::Lod0)
+}
+
+/// Projects one authored terrain LOD without changing source positions or attributes.
+///
+/// # Errors
+/// Returns an error for invalid slot assignments or an empty selected LOD.
+pub fn project_land_msh_lod_to_static_mesh_in_world_space(
+    terrain: &LandMeshDocument,
+    lod: TerrainLod,
+) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
+    let mut lod0 = terrain
+        .face_lod_assignments()
+        .map_err(VulkanAssetMeshError::InvalidTerrainLodMapping)?;
+    lod0.retain(|assignment| assignment.lod == lod);
     let indices = static_terrain_indices(terrain, &lod0)?;
     let vertices = terrain
         .positions
@@ -2117,6 +2131,13 @@ mod tests {
         assert_eq!(mesh.draw_ranges[0].first_index, 0);
         assert_eq!(mesh.draw_ranges[0].index_count, 6);
         assert_eq!(mesh.draw_ranges[0].material_index, 0x0101);
+
+        let far = project_land_msh_lod_to_static_mesh_in_world_space(&terrain, TerrainLod::Lod1)
+            .expect("LOD1 terrain projection");
+        assert_eq!(far.indices, [3, 4, 5, 3, 4, 5]);
+        assert_eq!(far.draw_ranges.len(), 1);
+        assert_eq!(far.draw_ranges[0].material_index, 0x0202);
+        assert_eq!(far.vertices[3].position, [10.0, 10.0, 10.0]);
 
         terrain.nodes_raw.clear();
         assert!(matches!(
