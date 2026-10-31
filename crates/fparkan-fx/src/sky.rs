@@ -1143,12 +1143,11 @@ impl SunFrame {
 /// Converts an interpolated atmosphere sun sample to a renderer-facing frame.
 ///
 /// The original update computes `orbit_direction = [cos(theta), 0,
-/// -sin(theta)]`, then applies the row-vector product of the two birth-angle
+/// -sin(theta)]`, then applies the column-vector product of the two birth-angle
 /// matrices.  With `A` and `B` in radians, the resulting direction is:
 ///
 /// ```text
-/// [x*cos(A), -x*sin(A)*cos(B) + z*sin(B),
-///  x*sin(A)*sin(B) + z*cos(B)]
+/// [x*cos(A) + z*sin(A)*sin(B), x*sin(A) - z*cos(A)*sin(B), z*cos(B)]
 /// ```
 ///
 /// where `x` and `z` are the two non-zero orbit components.
@@ -1178,9 +1177,9 @@ pub fn sun_frame(sample: &SunSample, now_seconds: f32, config: SunConfig) -> Sun
     let x = orbit_direction[0];
     let z = orbit_direction[2];
     let direction = normalize3([
-        x * cos_a,
-        -x * sin_a * cos_b + z * sin_b,
-        x * sin_a * sin_b + z * cos_b,
+        x * cos_a + z * sin_a * sin_b,
+        x * sin_a - z * cos_a * sin_b,
+        z * cos_b,
     ]);
     SunFrame {
         active: true,
@@ -1892,13 +1891,27 @@ mod tests {
         let sample = sun(true);
         let at_start = sun_frame(&sample, 0.0, SunConfig::new(0.0, 1.0, [90.0, 0.0]));
         assert!((at_start.direction[0]).abs() < 1.0e-5);
-        assert!((at_start.direction[1] + at_start.orbit_direction[0]).abs() < 1.0e-5);
+        assert!((at_start.direction[1] - at_start.orbit_direction[0]).abs() < 1.0e-5);
         assert!((at_start.direction[2] - at_start.orbit_direction[2]).abs() < 1.0e-5);
 
         let side = sun_frame(&sample, 0.0, SunConfig::new(0.0, 1.0, [0.0, 90.0]));
         assert!((side.direction[0] - side.orbit_direction[0]).abs() < 1.0e-5);
-        assert!((side.direction[1] - side.orbit_direction[2]).abs() < 1.0e-5);
+        assert!((side.direction[1] + side.orbit_direction[2]).abs() < 1.0e-5);
         assert!(side.direction[2].abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn sun_direction_matches_live_native_birth_matrix() {
+        // Terrain CSun::Update, elapsed 282184 ms, lifetime 525000 ms.
+        let frame = sun_frame(
+            &sun(true),
+            282.184,
+            SunConfig::new(0.0, 525.0, [90.0, 30.0]),
+        );
+        let expected = [0xbefd_7269, 0xbe10_4168, 0xbf5b_7dda].map(f32::from_bits);
+        for (actual, expected) in frame.direction.into_iter().zip(expected) {
+            assert!((actual - expected).abs() < 3.0e-6, "{actual} != {expected}");
+        }
     }
 
     #[test]
