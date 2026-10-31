@@ -2132,9 +2132,10 @@ pub fn loaded_mission_control_device_tables(
         .map(|state| state.control_device_tables.as_slice())
 }
 
-/// Queries native Control global-table selector 1 (weighted ratio) or 2 (sum).
+/// Queries native Control global-table selector 1 (weighted ratio), 2 (sum), or 15.
 /// `Ok(None)` preserves the original false/no-result behavior for an empty or
-/// zero-denominator table. Other unsupported native paths are reported as errors.
+/// zero-denominator table or selector 15 without both cached factory rows. Other
+/// unsupported native paths are reported as errors.
 /// Inputs and intermediates must be finite and normal, or exact zero.
 ///
 /// # Errors
@@ -4201,7 +4202,7 @@ fn query_control_device_table_resource(
     table: &MissionControlDeviceTableState,
     selector: u32,
 ) -> Result<Option<f32>, ControlResourceAccessError> {
-    if !matches!(selector, 1 | 2) {
+    if !matches!(selector, 1 | 2 | 15) {
         return Err(ControlResourceAccessError::UnsupportedSelector(selector));
     }
     let entries = match &table.status {
@@ -4210,6 +4211,32 @@ fn query_control_device_table_resource(
             return Err(ControlResourceAccessError::TableUnavailable(reason.clone()));
         }
     };
+
+    if selector == 15 {
+        let Some(class9) = entries.iter().rev().find(|entry| entry.factory_tag == 9) else {
+            return Ok(None);
+        };
+        let Some(class21) = entries.iter().rev().find(|entry| entry.factory_tag == 21) else {
+            return Ok(None);
+        };
+
+        let mut sum = control_device_budget_coefficient(class21, 5)?;
+        for index in (0..5).rev() {
+            sum = checked_control_sum(
+                21,
+                "sum",
+                sum,
+                control_device_budget_coefficient(class21, index)?,
+            )?;
+        }
+        return checked_control_product(
+            9,
+            "selector-15 value",
+            control_device_selector_zero(class9)?,
+            sum,
+        )
+        .map(Some);
+    }
 
     let mut numerator = 0.0_f32;
     let mut denominator = 0.0_f32;
@@ -8145,6 +8172,251 @@ mod tests {
         assert_eq!(
             query_control_device_table_resource(&table, 3),
             Err(ControlResourceAccessError::UnsupportedSelector(3))
+        );
+    }
+
+    #[test]
+    fn control_resource_selector_15_uses_last_cached_factories_and_current_fields() {
+        let mut first_class9 = synthetic_effective_control_device(
+            9,
+            19,
+            90.0_f32.to_bits(),
+            Some(f32::INFINITY.to_bits()),
+            Some(9.0_f32.to_bits()),
+        );
+        let mut first_class21 = synthetic_effective_control_device(
+            21,
+            19,
+            90.0_f32.to_bits(),
+            Some(f32::INFINITY.to_bits()),
+            None,
+        );
+        let mut class9 = synthetic_effective_control_device(
+            9,
+            5,
+            99.0_f32.to_bits(),
+            Some(f32::NAN.to_bits()),
+            Some(99.0_f32.to_bits()),
+        );
+        let mut class21 = synthetic_effective_control_device(
+            21,
+            26,
+            90.0_f32.to_bits(),
+            Some(f32::INFINITY.to_bits()),
+            None,
+        );
+        first_class9.native_word_50_bits = Some(0);
+        first_class21.native_word_50_bits = Some(0);
+        class9.native_word_50_bits = Some(0);
+        class21.native_word_50_bits = Some(0);
+        class9.key = u32::MAX;
+        class21.key = u32::MAX;
+        class9.coefficient_bits.as_mut().unwrap()[0] = 3.0_f32.to_bits();
+        class9.class9_selector0_scale_bits = Some(4.0_f32.to_bits());
+        class21.coefficient_bits.as_mut().unwrap()[..6].copy_from_slice(&[
+            1.0_f32.to_bits(),
+            2.0_f32.to_bits(),
+            3.0_f32.to_bits(),
+            4.0_f32.to_bits(),
+            5.0_f32.to_bits(),
+            6.0_f32.to_bits(),
+        ]);
+
+        let table = synthetic_control_device_table_with_providers(
+            MissionControlDeviceTableStatus::Available(vec![
+                first_class9,
+                first_class21,
+                class9,
+                class21,
+            ]),
+            MissionControlNodeProviderTableStatus::Unavailable(
+                MissionControlNodeProviderTableUnavailableReason::MissingNodeData {
+                    unit_component_index: 0,
+                    source: None,
+                },
+            ),
+        );
+
+        assert_eq!(
+            query_control_device_table_resource(&table, 15)
+                .expect("selector 15 uses current cached getter values")
+                .map(f32::to_bits),
+            Some(252.0_f32.to_bits())
+        );
+    }
+
+    #[test]
+    fn control_resource_selector_15_preserves_descending_binary32_accumulation() {
+        let mut class9 = synthetic_effective_control_device(
+            9,
+            19,
+            1.0_f32.to_bits(),
+            None,
+            Some(1.0_f32.to_bits()),
+        );
+        let mut class21 = synthetic_effective_control_device(21, 19, 0, None, None);
+        class9.coefficient_bits.as_mut().unwrap()[0] = 1.0_f32.to_bits();
+        class21.coefficient_bits.as_mut().unwrap()[..6].copy_from_slice(&[
+            0.0_f32.to_bits(),
+            0.0_f32.to_bits(),
+            0.0_f32.to_bits(),
+            (-16_777_216.0_f32).to_bits(),
+            16_777_216.0_f32.to_bits(),
+            1.0_f32.to_bits(),
+        ]);
+        let forward = class21.coefficient_bits.unwrap()[..6]
+            .iter()
+            .map(|bits| f32::from_bits(*bits))
+            .fold(0.0_f32, |sum, value| sum + value);
+        assert_eq!(forward.to_bits(), 1.0_f32.to_bits());
+
+        let table =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                class9.clone(),
+                class21.clone(),
+            ]));
+        assert_eq!(
+            query_control_device_table_resource(&table, 15)
+                .expect("descending native order")
+                .map(f32::to_bits),
+            Some(0.0_f32.to_bits())
+        );
+
+        class21.coefficient_bits.as_mut().unwrap()[..6].fill((-0.0_f32).to_bits());
+        let negative_zero =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                class9, class21,
+            ]));
+        assert_eq!(
+            query_control_device_table_resource(&negative_zero, 15)
+                .expect("negative zero is retained")
+                .map(f32::to_bits),
+            Some((-0.0_f32).to_bits())
+        );
+    }
+
+    #[test]
+    fn control_resource_selector_15_returns_no_result_without_both_cached_factories() {
+        let empty =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(Vec::new()));
+        assert_eq!(query_control_device_table_resource(&empty, 15), Ok(None));
+
+        let class9_only =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                synthetic_effective_control_device(9, 35, 1, None, None),
+            ]));
+        assert_eq!(
+            query_control_device_table_resource(&class9_only, 15),
+            Ok(None)
+        );
+
+        let mut class21 = synthetic_effective_control_device(21, 35, 1, None, None);
+        class21.coefficient_bits = None;
+        let class21_only =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                class21,
+            ]));
+        assert_eq!(
+            query_control_device_table_resource(&class21_only, 15),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn control_resource_selector_15_reports_missing_and_unsupported_inputs() {
+        let mut class9 = synthetic_effective_control_device(
+            9,
+            19,
+            1.0_f32.to_bits(),
+            None,
+            Some(1.0_f32.to_bits()),
+        );
+        let mut class21 = synthetic_effective_control_device(21, 19, 1.0_f32.to_bits(), None, None);
+        class21.coefficient_bits = None;
+        let missing_coefficients =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                class9.clone(),
+                class21.clone(),
+            ]));
+        assert_eq!(
+            query_control_device_table_resource(&missing_coefficients, 15),
+            Err(ControlResourceAccessError::UnsupportedField {
+                factory_tag: 21,
+                field: "coefficient table",
+            })
+        );
+
+        class21.coefficient_bits = Some([1.0_f32.to_bits(); 16]);
+        class9.coefficient_bits = None;
+        let missing_class9_coefficient =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                class9.clone(),
+                class21.clone(),
+            ]));
+        assert_eq!(
+            query_control_device_table_resource(&missing_class9_coefficient, 15),
+            Err(ControlResourceAccessError::UnsupportedField {
+                factory_tag: 9,
+                field: "coefficient",
+            })
+        );
+
+        class9.coefficient_bits = Some([1.0_f32.to_bits(); 16]);
+        class9.class9_selector0_scale_bits = None;
+        let missing_scale =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                class9.clone(),
+                class21.clone(),
+            ]));
+        assert_eq!(
+            query_control_device_table_resource(&missing_scale, 15),
+            Err(ControlResourceAccessError::UnsupportedField {
+                factory_tag: 9,
+                field: "class-9 selector-0 scale",
+            })
+        );
+
+        class9.class9_selector0_scale_bits = Some(1.0_f32.to_bits());
+        class21.coefficient_bits.as_mut().unwrap()[5] = f32::INFINITY.to_bits();
+        let nonfinite =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                class9.clone(),
+                class21.clone(),
+            ]));
+        assert_eq!(
+            query_control_device_table_resource(&nonfinite, 15),
+            Err(ControlResourceAccessError::NonFiniteValue {
+                factory_tag: 21,
+                field: "coefficient",
+            })
+        );
+
+        class21.coefficient_bits.as_mut().unwrap()[5] = 1;
+        let subnormal =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                class9.clone(),
+                class21.clone(),
+            ]));
+        assert_eq!(
+            query_control_device_table_resource(&subnormal, 15),
+            Err(ControlResourceAccessError::SubnormalValue {
+                factory_tag: 21,
+                field: "coefficient",
+            })
+        );
+
+        class21.coefficient_bits.as_mut().unwrap()[5] = f32::MAX.to_bits();
+        class21.coefficient_bits.as_mut().unwrap()[4] = f32::MAX.to_bits();
+        let overflowing_sum =
+            synthetic_control_device_table(MissionControlDeviceTableStatus::Available(vec![
+                class9, class21,
+            ]));
+        assert_eq!(
+            query_control_device_table_resource(&overflowing_sum, 15),
+            Err(ControlResourceAccessError::UnsupportedFloatRange {
+                factory_tag: Some(21),
+                field: "sum",
+            })
         );
     }
 
@@ -13273,6 +13545,50 @@ mod tests {
                 "object {:?}",
                 table.original_id
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn full_load_queries_control_selector_15_against_frozen_native_inputs() {
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(
+            licensed_root("IS"),
+        ))))
+        .expect("engine");
+        load_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Autodemo.00/data.tma".into(),
+                mode: MissionMode::AutoDemo,
+            },
+            MissionStartupInput {
+                queue_time_ms: 100_000,
+                research_creation_gate: false,
+            },
+        )
+        .expect("load licensed AutoDemo with explicit startup inputs");
+
+        let tables = loaded_mission_control_device_tables(&engine).expect("Control tables");
+        let expected = [
+            (0, Some(0x4657_2800)),
+            (1, Some(0x4636_d000)),
+            (2, Some(0x467b_4001)),
+            (3, Some(0x468c_a000)),
+            (4, Some(0x46ec_4001)),
+            (5, Some(0x46ec_4001)),
+            (6, None),
+            (7, None),
+        ];
+        assert_eq!(tables.len(), expected.len());
+        for (original_id, expected_bits) in expected {
+            let table = tables
+                .iter()
+                .find(|table| table.original_id == Some(OriginalObjectId(original_id)))
+                .expect("AutoDemo Control table for original object");
+            let actual = query_loaded_mission_control_resource(&engine, table.handle, 15)
+                .expect("selector 15 query")
+                .map(f32::to_bits);
+            assert_eq!(actual, expected_bits, "original object {original_id}");
         }
     }
 
