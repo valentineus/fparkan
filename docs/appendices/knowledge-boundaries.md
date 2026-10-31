@@ -73,6 +73,10 @@ MSH-запрос со свободной preview-камерой; это не п�
 среде, перехватить DirectDraw/Direct3D calls и surface flips, сохранить state
 log на минимальных сценах с одним типом материала.
 
+Полигоны Land.msh с флагом `0x8` пока используют обычный terrain shader; их исходные записи во всех LOD считает `terrain_face8_pipeline_unverified`.
+На водоёме «Конструктора» берег близок к оригиналу, а поверхность воды слишком светлая; точные special-pass, UV и combiner остаются открытыми.
+В GOG Terrain.dll подтверждена отдельная камера `REFLECTION`/`REFLECTION_SHIFTED` (инициализация RVA `0x13CF0`, render RVA `0x4EFF0`); Vulkan-проход отражения пока отсутствует.
+
 ## FXID field-level semantics
 
 Control Op1 пока использует цвет и радиус без случайных добавок команды;

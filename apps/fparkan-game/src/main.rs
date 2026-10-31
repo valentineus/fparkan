@@ -8001,6 +8001,12 @@ fn static_preview_mesh_and_materials(
     let mut terrain_material_loader = StandaloneWearMaterialLoader::new(root);
     let source_terrain_component = project_land_msh_to_static_mesh_in_world_space(terrain_mesh)
         .map_err(|err| format!("project mission terrain for Vulkan: {err}"))?;
+    let unverified_special_faces = terrain_mesh
+        .faces
+        .iter()
+        .filter(|face| face.flags.0 & 8 != 0)
+        .count();
+    eprintln!("render_coverage terrain_face8_pipeline_unverified={unverified_special_faces} (source faces across LODs use the ordinary terrain shader; native special pass and reflection/EMBM mapping pending)");
     let footprint_sources = mission_basement_footprints(assets, roots)?;
     let foundation = if footprint_sources.is_empty() {
         None
