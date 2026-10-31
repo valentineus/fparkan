@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Runtime orchestration for mission loading and world stepping.
 
+use fparkan_assets::ClanBody;
 #[cfg(test)]
 use fparkan_assets::PreparedControlResourcePair;
 use fparkan_assets::{
@@ -10,8 +11,8 @@ use fparkan_assets::{
     AssetId, AssetManager, BehaviorProfileRates, BehaviorProfileVarError, BuildCategory,
     MissionAssetPlan, MissionDocument, MissionError, MissionTerrainPaths, NresError,
     PreparedComponentControl, PreparedControlEffectSection, PreparedControlNodeDataRow,
-    PreparedControlNodeDataTable, PreparedControlTypedRecord, PreparedVisual, TerrainFormatError,
-    TerrainPreparationError, TerrainWorld, TmaProfile,
+    PreparedControlNodeDataTable, PreparedControlTypedRecord, PreparedVisual, ResearchError,
+    ResearchTrfDocument, TerrainFormatError, TerrainPreparationError, TerrainWorld, TmaProfile,
 };
 use fparkan_msh::{node38_metadata, selected_slot, Group, Lod, NodeId};
 use fparkan_path::{normalize_relative, NormalizedPath, PathError, PathPolicy};
@@ -84,6 +85,15 @@ pub struct MissionRequest {
     pub key: String,
     /// Explicit host mode; this is not inferred from the mission path.
     pub mode: MissionMode,
+}
+
+/// Explicit inputs supplied by the startup caller to the full mission loader.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MissionStartupInput {
+    /// Caller-supplied queue clock used for the initial Behavior deadline.
+    pub queue_time_ms: u32,
+    /// Whether this startup creates the per-clan research tables.
+    pub research_creation_gate: bool,
 }
 
 const INITIAL_SCRIPT_HOST_STATUS: u32 = 5;
@@ -670,6 +680,17 @@ pub struct MissionScriptBundle {
     pub behavior_warm_start: Option<BehaviorWarmStartState>,
 }
 
+/// One decoded research table associated with its TMA clan owner and source path.
+#[derive(Debug)]
+pub struct MissionResearchTrfTable {
+    /// TMA clan index that owns this table.
+    pub clan_index: usize,
+    /// Resolved TMA second-resource path used to load this table.
+    pub path: String,
+    /// Independently decoded TRF document.
+    pub document: ResearchTrfDocument,
+}
+
 /// Behavior distributor clock and totals tracked from warm start through resource ticks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BehaviorWarmStartState {
@@ -953,6 +974,7 @@ struct LoadedMissionState {
     behavior_ore_states: Vec<BehaviorOreState>,
     behavior_profiles: Vec<BehaviorProfileState>,
     control_device_tables: Vec<MissionControlDeviceTableState>,
+    research_trf_tables: Vec<MissionResearchTrfTable>,
     script_bundles: Vec<MissionScriptBundle>,
     script_varset: Option<MissionScriptVarSet>,
     script_init_states: Vec<MissionScriptInitState>,
@@ -1030,6 +1052,22 @@ pub enum EngineError {
         path: String,
         /// Source error.
         source: NresError,
+    },
+    /// A loaded clan's second TMA resource could not be decoded as a TRF table.
+    ResearchTrf {
+        /// Owning TMA clan index.
+        clan_index: usize,
+        /// Resolved resource path.
+        path: String,
+        /// TRF decode diagnostic.
+        source: ResearchError,
+    },
+    /// A clan's research path is not representable by the supported ASCII path layer.
+    ResearchTrfPath {
+        /// Owning TMA clan index.
+        clan_index: usize,
+        /// Raw C-string bytes before path normalization.
+        path: Vec<u8>,
     },
     /// Mission decode error.
     Mission {
@@ -1188,6 +1226,15 @@ impl std::fmt::Display for EngineError {
                 message,
             } => write!(f, "clan {clan_index}: script runtime failed: {message}"),
             Self::Nres { path, source } => write!(f, "{path}: {source}"),
+            Self::ResearchTrf {
+                clan_index,
+                path,
+                source,
+            } => write!(f, "clan {clan_index} research TRF {path}: {source}"),
+            Self::ResearchTrfPath { clan_index, path } => write!(
+                f,
+                "clan {clan_index} research TRF path contains non-ASCII bytes: {path:?}"
+            ),
             Self::Mission { path, source } => write!(f, "{path}: {source}"),
             Self::TerrainFormat { path, source } => write!(f, "{path}: {source}"),
             Self::Terrain(source) => write!(f, "{source}"),
@@ -1226,6 +1273,7 @@ impl std::error::Error for EngineError {
             Self::Path { source, .. } => Some(source),
             Self::Vfs { source, .. } => Some(source),
             Self::Nres { source, .. } => Some(source),
+            Self::ResearchTrf { source, .. } => Some(source),
             Self::Mission { source, .. } => Some(source),
             Self::TerrainFormat { source, .. } => Some(source),
             Self::ScriptInitUnsupported { source, .. } => Some(source),
@@ -1238,6 +1286,7 @@ impl std::error::Error for EngineError {
             | Self::ScriptInit { .. }
             | Self::ScriptRuntime { .. }
             | Self::Movement(_)
+            | Self::ResearchTrfPath { .. }
             | Self::PrototypeGraph { .. }
             | Self::BehaviorProfile { .. }
             | Self::BehaviorDistributorTick { .. }
@@ -1258,10 +1307,12 @@ pub fn create(services: EngineServices) -> Result<Engine, EngineError> {
 
 /// Loads a mission transactionally and runs the recovered initial script subset.
 ///
-/// `queue_time_ms` is the caller-supplied 32-bit queue-clock sample used to
-/// initialize the first Behavior deadline for each script bundle. This runtime
-/// entry point does not acquire the native queue clock or reproduce the full
-/// SuperAI host lifecycle.
+/// `startup_input.queue_time_ms` is the caller-supplied 32-bit queue-clock
+/// sample used to initialize the first Behavior deadline for each script bundle.
+/// `startup_input.research_creation_gate` explicitly controls whether full
+/// startup loads per-clan research tables; it is not inferred from mission mode
+/// or path. This runtime entry point does not acquire the native queue clock or
+/// reproduce the full SuperAI host lifecycle.
 ///
 /// # Errors
 ///
@@ -1273,13 +1324,13 @@ pub fn create(services: EngineServices) -> Result<Engine, EngineError> {
 pub fn load_mission(
     engine: &mut Engine,
     request: MissionRequest,
-    queue_time_ms: u32,
+    startup_input: MissionStartupInput,
 ) -> Result<LoadedMission, EngineError> {
     load_mission_with_options(
         engine,
         request,
         MissionLoadOptions::default(),
-        Some(queue_time_ms),
+        Some(startup_input),
     )
 }
 
@@ -1338,7 +1389,7 @@ fn load_mission_with_options(
     engine: &mut Engine,
     request: MissionRequest,
     options: MissionLoadOptions,
-    queue_time_ms: Option<u32>,
+    startup_input: Option<MissionStartupInput>,
 ) -> Result<LoadedMission, EngineError> {
     let vfs = engine.services.vfs.clone().ok_or(EngineError::MissingVfs)?;
     let mission_path = normalize_engine_path("mission", &request.key)?;
@@ -1390,6 +1441,13 @@ fn load_mission_with_options(
         }
     })?;
     let mut loaded_scripts = load_mission_scripts(&vfs, &mission, options.asset_scope)?;
+    let research_trf_tables = if options.asset_scope == MissionAssetScope::Full
+        && startup_input.is_some_and(|input| input.research_creation_gate)
+    {
+        load_mission_research_trf_tables(&vfs, &mission, &loaded_scripts.bundles)?
+    } else {
+        Vec::new()
+    };
     let repository = CachedResourceRepository::with_payload_cache_budget(
         vfs.clone(),
         MISSION_DECODED_PAYLOAD_CACHE_ENTRIES,
@@ -1665,7 +1723,9 @@ fn load_mission_with_options(
 
     let mut next_behavior_rng_state = engine.behavior_rng_state;
     if options.asset_scope == MissionAssetScope::Full {
-        let queue_time_ms = queue_time_ms.expect("full mission loading requires a queue time");
+        let queue_time_ms = startup_input
+            .expect("full mission loading requires startup inputs")
+            .queue_time_ms;
         if let Err(error) = start_mission_scripts(
             &mission,
             &mut loaded_scripts,
@@ -1741,6 +1801,7 @@ fn load_mission_with_options(
         behavior_ore_states,
         behavior_profiles,
         control_device_tables,
+        research_trf_tables,
         script_bundles: loaded_scripts.bundles,
         script_varset: loaded_scripts.varset,
         script_init_states: loaded_scripts.init_states,
@@ -1820,6 +1881,15 @@ pub fn loaded_mission_script_bundles(engine: &Engine) -> Option<&[MissionScriptB
         .loaded
         .as_ref()
         .map(|state| state.script_bundles.as_slice())
+}
+
+/// Returns the per-clan TRF tables loaded during full mission startup.
+#[must_use]
+pub fn loaded_mission_research_trf_tables(engine: &Engine) -> Option<&[MissionResearchTrfTable]> {
+    engine
+        .loaded
+        .as_ref()
+        .map(|state| state.research_trf_tables.as_slice())
 }
 
 /// Returns the numeric script defaults selected by the original `.var` fallback rule.
@@ -6367,6 +6437,60 @@ fn load_script_formula_table(
     }
 }
 
+fn load_mission_research_trf_tables(
+    vfs: &Arc<dyn Vfs>,
+    mission: &MissionDocument,
+    bundles: &[MissionScriptBundle],
+) -> Result<Vec<MissionResearchTrfTable>, EngineError> {
+    let mut tables = Vec::with_capacity(bundles.len());
+    for bundle in bundles {
+        let Some(clan) = mission.clans.get(bundle.clan_index) else {
+            return Err(EngineError::ScriptRuntime {
+                clan_index: bundle.clan_index,
+                message: "script bundle clan index is outside the decoded mission".to_string(),
+            });
+        };
+        let second_resource = match &clan.body {
+            ClanBody::Standard {
+                second_resource, ..
+            }
+            | ClanBody::Spatial {
+                second_resource, ..
+            } => second_resource,
+        };
+        let raw_path = second_resource
+            .path
+            .raw
+            .split(|byte| *byte == 0)
+            .next()
+            .unwrap_or_default();
+        if raw_path.is_empty() {
+            continue;
+        }
+        if !raw_path.is_ascii() {
+            return Err(EngineError::ResearchTrfPath {
+                clan_index: bundle.clan_index,
+                path: raw_path.to_vec(),
+            });
+        }
+        let value = std::str::from_utf8(raw_path).expect("ASCII paths are valid UTF-8");
+        let path = normalize_engine_path("mission research TRF", value)?;
+        let bytes = read_vfs(vfs, &path)?;
+        let document =
+            ResearchTrfDocument::decode(bytes).map_err(|source| EngineError::ResearchTrf {
+                clan_index: bundle.clan_index,
+                path: path.as_str().to_string(),
+                source,
+            })?;
+        tables.push(MissionResearchTrfTable {
+            clan_index: bundle.clan_index,
+            path: path.as_str().to_string(),
+            document,
+        });
+    }
+    Ok(tables)
+}
+
 fn load_mission_scripts(
     vfs: &Arc<dyn Vfs>,
     mission: &MissionDocument,
@@ -9705,7 +9829,10 @@ mod tests {
                 key: "MISSIONS/Autodemo.00/data.tma".to_string(),
                 mode: MissionMode::SingleMission,
             },
-            0,
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
         )
         .expect_err("missing VFS");
         assert!(matches!(err, EngineError::MissingVfs));
@@ -11551,7 +11678,10 @@ mod tests {
                     key: "MISSIONS/TEST/MINE/data.tma".to_string(),
                     mode: MissionMode::SingleMission,
                 },
-                0,
+                MissionStartupInput {
+                    queue_time_ms: 0,
+                    research_creation_gate: false,
+                },
             )
             .expect("full normal mission load");
             assert_eq!(loaded.object_count, 1);
@@ -12247,6 +12377,83 @@ mod tests {
         assert_eq!(rows[stage_key as usize].initial_amount_bits, stage_initial);
     }
 
+    fn test_push_u32(bytes: &mut Vec<u8>, value: u32) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn test_push_i32(bytes: &mut Vec<u8>, value: i32) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn build_nres(entries: &[(u32, u32, u32, u32, Vec<u8>)]) -> Vec<u8> {
+        let mut bytes = vec![0; 16];
+        let mut offsets = Vec::with_capacity(entries.len());
+        for (_, _, _, _, payload) in entries {
+            offsets.push(u32::try_from(bytes.len()).expect("offset fits u32"));
+            bytes.extend_from_slice(payload);
+            let padding = (8 - bytes.len() % 8) % 8;
+            bytes.resize(bytes.len() + padding, 0);
+        }
+        for (index, (type_id, attr1, attr2, attr3, payload)) in entries.iter().enumerate() {
+            test_push_u32(&mut bytes, *type_id);
+            test_push_u32(&mut bytes, *attr1);
+            test_push_u32(&mut bytes, *attr2);
+            test_push_u32(
+                &mut bytes,
+                u32::try_from(payload.len()).expect("payload fits u32"),
+            );
+            test_push_u32(&mut bytes, *attr3);
+            let mut name = [0; 36];
+            name[..4].copy_from_slice(b"Test");
+            bytes.extend_from_slice(&name);
+            test_push_u32(&mut bytes, offsets[index]);
+            test_push_u32(&mut bytes, u32::try_from(index).expect("index fits u32"));
+        }
+        bytes[..4].copy_from_slice(b"NRes");
+        bytes[4..8].copy_from_slice(&0x100_u32.to_le_bytes());
+        let count = u32::try_from(entries.len()).expect("count fits u32");
+        bytes[8..12].copy_from_slice(&count.to_le_bytes());
+        let size = u32::try_from(bytes.len()).expect("size fits u32");
+        bytes[12..16].copy_from_slice(&size.to_le_bytes());
+        bytes
+    }
+
+    fn empty_land_mesh() -> Vec<u8> {
+        build_nres(&[
+            (1, 0, 0, 38, Vec::new()),
+            (2, 0, 0, 0, vec![0; 0x8c]),
+            (3, 0, 0, 12, Vec::new()),
+            (4, 0, 0, 4, Vec::new()),
+            (5, 0, 0, 4, Vec::new()),
+            (18, 0, 0, 4, Vec::new()),
+            (14, 0, 0, 4, Vec::new()),
+            (11, 0, 0, 4, Vec::new()),
+            (21, 0, 0, 28, Vec::new()),
+        ])
+    }
+
+    fn minimal_land_map() -> Vec<u8> {
+        let mut payload = Vec::new();
+        for value in [0.0_f32, 0.0, 0.0, 0.0, 2.0, 0.0, 1.0, 0.0] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in [0, 0, 7, 0, 2, 0] {
+            test_push_u32(&mut payload, value);
+        }
+        for value in [0.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0] {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        for _ in 0..2 {
+            test_push_i32(&mut payload, -1);
+            test_push_i32(&mut payload, -1);
+        }
+        test_push_u32(&mut payload, 1);
+        test_push_u32(&mut payload, 1);
+        payload.extend_from_slice(&1_u16.to_le_bytes());
+        payload.extend_from_slice(&0_u16.to_le_bytes());
+        build_nres(&[(12, 1, 0, 0, payload)])
+    }
+
     #[test]
     fn full_load_applies_a_synthetic_numeric_formula_in_init() {
         fn push_u32(bytes: &mut Vec<u8>, value: u32) {
@@ -12264,79 +12471,6 @@ mod tests {
         fn push_lp(bytes: &mut Vec<u8>, value: &[u8]) {
             push_u32(bytes, u32::try_from(value.len()).expect("length fits u32"));
             bytes.extend_from_slice(value);
-        }
-
-        fn build_nres(entries: &[(u32, u32, u32, Vec<u8>)]) -> Vec<u8> {
-            let mut bytes = vec![0; 16];
-            let mut offsets = Vec::with_capacity(entries.len());
-            for (_, _, _, payload) in entries {
-                offsets.push(u32::try_from(bytes.len()).expect("offset fits u32"));
-                bytes.extend_from_slice(payload);
-                let padding = (8 - bytes.len() % 8) % 8;
-                bytes.resize(bytes.len() + padding, 0);
-            }
-            for (index, (type_id, attr1, attr3, payload)) in entries.iter().enumerate() {
-                push_u32(&mut bytes, *type_id);
-                push_u32(&mut bytes, *attr1);
-                push_u32(&mut bytes, 0);
-                push_u32(
-                    &mut bytes,
-                    u32::try_from(payload.len()).expect("payload fits u32"),
-                );
-                push_u32(&mut bytes, *attr3);
-                let mut name = [0; 36];
-                name[..4].copy_from_slice(b"Test");
-                bytes.extend_from_slice(&name);
-                push_u32(&mut bytes, offsets[index]);
-                push_u32(&mut bytes, u32::try_from(index).expect("index fits u32"));
-            }
-            bytes[..4].copy_from_slice(b"NRes");
-            bytes[4..8].copy_from_slice(&0x100_u32.to_le_bytes());
-            bytes[8..12].copy_from_slice(
-                &u32::try_from(entries.len())
-                    .expect("count fits u32")
-                    .to_le_bytes(),
-            );
-            let size = u32::try_from(bytes.len()).expect("size fits u32");
-            bytes[12..16].copy_from_slice(&size.to_le_bytes());
-            bytes
-        }
-
-        fn empty_land_mesh() -> Vec<u8> {
-            let streams = [
-                (1, 0, 38, Vec::new()),
-                (2, 0, 0, vec![0; 0x8c]),
-                (3, 0, 12, Vec::new()),
-                (4, 0, 4, Vec::new()),
-                (5, 0, 4, Vec::new()),
-                (18, 0, 4, Vec::new()),
-                (14, 0, 4, Vec::new()),
-                (11, 0, 4, Vec::new()),
-                (21, 0, 28, Vec::new()),
-            ];
-            build_nres(&streams)
-        }
-
-        fn minimal_land_map() -> Vec<u8> {
-            let mut payload = Vec::new();
-            for value in [0.0_f32, 0.0, 0.0, 0.0, 2.0, 0.0, 1.0, 0.0] {
-                push_f32(&mut payload, value);
-            }
-            for value in [0, 0, 7, 0, 2, 0] {
-                push_u32(&mut payload, value);
-            }
-            for value in [0.0_f32, 0.0, 0.0, 1.0, 0.0, 0.0] {
-                push_f32(&mut payload, value);
-            }
-            for _ in 0..2 {
-                push_i32(&mut payload, -1);
-                push_i32(&mut payload, -1);
-            }
-            push_u32(&mut payload, 1);
-            push_u32(&mut payload, 1);
-            payload.extend_from_slice(&1_u16.to_le_bytes());
-            payload.extend_from_slice(&0_u16.to_le_bytes());
-            build_nres(&[(12, 1, 0, payload)])
         }
 
         fn synthetic_mission() -> Vec<u8> {
@@ -12428,7 +12562,10 @@ mod tests {
                 key: "MISSIONS/TEST/data.tma".to_string(),
                 mode: MissionMode::SingleMission,
             },
-            0,
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
         )
         .expect("full load applies the authored numeric literal");
 
@@ -12903,7 +13040,10 @@ mod tests {
                 key: "MISSIONS/Autodemo.00/data.tma".to_string(),
                 mode: MissionMode::AutoDemo,
             },
-            100_000,
+            MissionStartupInput {
+                queue_time_ms: 100_000,
+                research_creation_gate: false,
+            },
         )
         .expect("load licensed AutoDemo");
 
@@ -13114,7 +13254,10 @@ mod tests {
                 key: "MISSIONS/Autodemo.00/data.tma".into(),
                 mode: MissionMode::AutoDemo,
             },
-            100_000,
+            MissionStartupInput {
+                queue_time_ms: 100_000,
+                research_creation_gate: false,
+            },
         )
         .unwrap();
         let tables = loaded_mission_control_device_tables(&engine).unwrap();
@@ -13146,7 +13289,10 @@ mod tests {
                 key: "MISSIONS/Autodemo.00/data.tma".into(),
                 mode: MissionMode::AutoDemo,
             },
-            100_000,
+            MissionStartupInput {
+                queue_time_ms: 100_000,
+                research_creation_gate: false,
+            },
         )
         .expect("licensed mission");
         let schedules = |engine: &Engine| {
@@ -13255,7 +13401,10 @@ mod tests {
                 key: "MISSIONS/Autodemo.00/data.tma".to_string(),
                 mode: MissionMode::AutoDemo,
             },
-            100_000,
+            MissionStartupInput {
+                queue_time_ms: 100_000,
+                research_creation_gate: false,
+            },
         )
         .expect("load licensed AutoDemo");
 
@@ -14079,8 +14228,15 @@ mod tests {
         );
         assert!(loaded.script_bundle_count >= 1);
 
-        let full = load_mission(&mut engine, campaign_request(), 100_000)
-            .expect("full load licensed campaign mission");
+        let full = load_mission(
+            &mut engine,
+            campaign_request(),
+            MissionStartupInput {
+                queue_time_ms: 100_000,
+                research_creation_gate: false,
+            },
+        )
+        .expect("full load licensed campaign mission");
         assert_eq!(full.script_bundle_count, 4);
         assert_eq!(full.script_init_state_count, 4);
         assert_eq!(full.script_varset_state_count, 4);
@@ -14127,7 +14283,10 @@ mod tests {
                 key: "MISSIONS/Single.01/data.tma".to_string(),
                 mode: MissionMode::SingleMission,
             },
-            100_500,
+            MissionStartupInput {
+                queue_time_ms: 100_500,
+                research_creation_gate: false,
+            },
         )
         .expect_err("Single.01 reaches the later Handler(43) boundary");
         assert!(matches!(
@@ -14298,8 +14457,15 @@ mod tests {
             .snapshot
             .objects;
 
-        let error = load_mission(&mut engine, request(), 0)
-            .expect_err("malformed profile archive prevents full mission load");
+        let error = load_mission(
+            &mut engine,
+            request(),
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+        )
+        .expect_err("malformed profile archive prevents full mission load");
         assert!(matches!(
             error,
             EngineError::Nres { ref path, .. } if path == "behpsp.res"
@@ -14428,7 +14594,10 @@ mod tests {
                 key: "MISSIONS/Autodemo.00/data.tma".to_string(),
                 mode: MissionMode::SingleMission,
             },
-            0,
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
         )
         .expect("load mission");
 
@@ -14501,7 +14670,15 @@ mod tests {
             });
             let mut engine = create(EngineServices::new(vfs)).expect("engine");
             let before = step_headless(&mut engine, InputSnapshot, 0).expect("before");
-            let err = load_mission(&mut engine, mission, 0).expect_err("load error");
+            let err = load_mission(
+                &mut engine,
+                mission,
+                MissionStartupInput {
+                    queue_time_ms: 0,
+                    research_creation_gate: false,
+                },
+            )
+            .expect_err("load error");
             match denied {
                 DenyRule::Suffix("Land.map") => assert!(matches!(err, EngineError::Vfs { .. })),
                 DenyRule::Suffix("objects.rlb") => {
@@ -14533,7 +14710,10 @@ mod tests {
                 fail_after_registered_objects: Some(1),
                 ..MissionLoadOptions::default()
             },
-            Some(0),
+            Some(MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            }),
         )
         .expect_err("forced registration failure");
 
@@ -14580,7 +14760,15 @@ mod tests {
             key: "MISSIONS/Autodemo.00/data.tma".to_string(),
             mode: MissionMode::AutoDemo,
         };
-        load_mission(&mut engine, mission(), 100_000).expect("initial full startup");
+        load_mission(
+            &mut engine,
+            mission(),
+            MissionStartupInput {
+                queue_time_ms: 100_000,
+                research_creation_gate: false,
+            },
+        )
+        .expect("initial full startup");
 
         let previous_loaded = loaded_mission(&engine).expect("previous mission").clone();
         let previous_bundles = loaded_mission_script_bundles(&engine)
@@ -14596,8 +14784,15 @@ mod tests {
             .objects;
 
         vfs.enabled.store(true, std::sync::atomic::Ordering::SeqCst);
-        let error = load_mission(&mut engine, mission(), 100_500)
-            .expect_err("unsupported Init must fail after new-world registration");
+        let error = load_mission(
+            &mut engine,
+            mission(),
+            MissionStartupInput {
+                queue_time_ms: 100_500,
+                research_creation_gate: false,
+            },
+        )
+        .expect_err("unsupported Init must fail after new-world registration");
         assert!(matches!(
             error,
             EngineError::ScriptInitUnsupported {
@@ -14674,7 +14869,10 @@ mod tests {
                     key: case.1.to_string(),
                     mode: MissionMode::SingleMission,
                 },
-                0,
+                MissionStartupInput {
+                    queue_time_ms: 0,
+                    research_creation_gate: false,
+                },
             )
             .expect("load mission");
             let drafts = loaded_mission_object_drafts(&engine).expect("object drafts");
@@ -14788,7 +14986,10 @@ mod tests {
                 key: case.mission.to_string(),
                 mode: MissionMode::SingleMission,
             },
-            0,
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
         )
         .expect("load selected mission");
         assert_eq!(loaded.object_count, case.object_count);
@@ -14818,7 +15019,10 @@ mod tests {
                     key: mission,
                     mode: MissionMode::SingleMission,
                 },
-                0,
+                MissionStartupInput {
+                    queue_time_ms: 0,
+                    research_creation_gate: false,
+                },
             )
             .expect("load mission foundation");
             assert_eq!(loaded.object_count, loaded.registered_objects);
@@ -14956,6 +15160,388 @@ mod tests {
         }
         bytes.extend_from_slice(&package.trailing_bytes);
         bytes
+    }
+
+    fn research_test_trf() -> Vec<u8> {
+        let mut row = [0_u32; 10];
+        row[0] = 0x1122_3344;
+        row[1] = 0x5566_7788;
+        row[8] = 0x09ff_0000;
+        let mut row_bytes = Vec::with_capacity(40);
+        for word in row {
+            row_bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        let mut alias = Vec::new();
+        alias.extend_from_slice(&0_u16.to_le_bytes());
+        alias.extend_from_slice(&0_u16.to_le_bytes());
+        let zero_group = 0_u32.to_le_bytes().to_vec();
+        build_nres(&[
+            (u32::from_le_bytes(*b"TRF0"), 1, 3, 0, row_bytes),
+            (u32::from_le_bytes(*b"TRF1"), 1, 0, 0, vec![0x5a]),
+            (u32::from_le_bytes(*b"TRF2"), 1, 0, 0, zero_group.clone()),
+            (u32::from_le_bytes(*b"TRF4"), 1, 0, 0, zero_group),
+            (u32::from_le_bytes(*b"TRF6"), 0, 0, 0, b"test\0".to_vec()),
+            (u32::from_le_bytes(*b"TRF7"), 0, 0, 0, Vec::new()),
+            (u32::from_le_bytes(*b"TRF8"), 0, 0, 0, Vec::new()),
+            (u32::from_le_bytes(*b"TRF9"), 0, 0, 0, Vec::new()),
+            (u32::from_le_bytes(*b"TRFA"), 0, 0, 0, Vec::new()),
+            (u32::from_le_bytes(*b"TRFB"), 1, 0, 0, alias),
+        ])
+    }
+
+    fn research_startup_test_vfs(
+        script_bases: &[Option<&[u8]>],
+        research_paths: &[&[u8]],
+        trf: Option<&[u8]>,
+    ) -> Arc<dyn Vfs> {
+        fn push_u32(bytes: &mut Vec<u8>, value: u32) {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        fn push_lp(bytes: &mut Vec<u8>, value: &[u8]) {
+            push_u32(
+                bytes,
+                u32::try_from(value.len()).expect("string length fits u32"),
+            );
+            bytes.extend_from_slice(value);
+        }
+        assert_eq!(script_bases.len(), research_paths.len());
+        let mut mission = Vec::new();
+        push_u32(&mut mission, 1);
+        push_u32(&mut mission, 0);
+        push_u32(&mut mission, 6);
+        push_u32(&mut mission, script_bases.len() as u32);
+        for (index, (script_base, research_path)) in
+            script_bases.iter().zip(research_paths).enumerate()
+        {
+            push_lp(&mut mission, b"Synthetic clan");
+            push_u32(&mut mission, u32::MAX);
+            mission.extend_from_slice(&(index as f32).to_le_bytes());
+            mission.extend_from_slice(&0.0_f32.to_le_bytes());
+            push_u32(&mut mission, 1);
+            push_lp(&mut mission, script_base.unwrap_or_default());
+            push_u32(&mut mission, 0);
+            push_lp(&mut mission, research_path);
+            push_u32(&mut mission, 9);
+            push_u32(&mut mission, 0);
+        }
+        push_u32(&mut mission, 10);
+        push_u32(&mut mission, 0);
+        push_lp(&mut mission, b"DATA\\MAPS\\SYNTHETIC\\land");
+        push_u32(&mut mission, 0);
+        push_lp(&mut mission, b"");
+        push_u32(&mut mission, 1);
+        push_u32(&mut mission, 0);
+
+        let land_mesh = empty_land_mesh();
+        let land_map = minimal_land_map();
+
+        let script_package = encode_script_package(&ScriptPackage {
+            opcode_handler_count: 73,
+            events: Vec::new(),
+            trailing_bytes: Vec::new(),
+            raw: Arc::from(&b""[..]),
+        });
+        let mut files = MemoryVfs::default();
+        for (path, bytes) in [
+            ("MISSIONS/TEST/data.tma", mission),
+            ("DATA/MAPS/SYNTHETIC/Land.msh", land_mesh),
+            ("DATA/MAPS/SYNTHETIC/Land.map", land_map),
+        ] {
+            files.insert(
+                normalize_engine_path("research startup test", path).expect("test path"),
+                Arc::from(bytes.into_boxed_slice()),
+            );
+        }
+        files.insert(
+            normalize_engine_path("test BuildDat", "BuildDat.lst").expect("BuildDat path"),
+            Arc::from(&b""[..]),
+        );
+        if script_bases.iter().any(Option::is_some) {
+            files.insert(
+                normalize_engine_path("test script", "MISSIONS/SCRIPTS/shared.scr")
+                    .expect("script path"),
+                Arc::from(script_package.into_boxed_slice()),
+            );
+            files.insert(
+                normalize_engine_path("test varset", "MISSIONS/SCRIPTS/shared.var")
+                    .expect("varset path"),
+                Arc::from(&b"VAR(DWORD, value, 0)\n"[..]),
+            );
+        }
+        if let Some(trf) = trf {
+            files.insert(
+                normalize_engine_path("test TRF", "DATA/Research/shared.trf").expect("TRF path"),
+                Arc::from(trf),
+            );
+        }
+        Arc::new(files)
+    }
+
+    #[test]
+    fn full_load_keeps_independent_trf_tables_for_each_script_bundle_clan() {
+        let vfs = research_startup_test_vfs(
+            &[
+                Some(b"MISSIONS/SCRIPTS/shared"),
+                Some(b"MISSIONS/SCRIPTS/shared"),
+            ],
+            &[
+                b"DATA/Research/shared.trf\0ignored.trf",
+                b"DATA/Research/shared.trf",
+            ],
+            Some(&research_test_trf()),
+        );
+        let mut engine = create(EngineServices::new(vfs)).expect("research startup test engine");
+
+        load_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/TEST/data.tma".to_string(),
+                mode: MissionMode::AutoDemo,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: true,
+            },
+        )
+        .expect("full load with explicit research gate");
+
+        let tables = loaded_mission_research_trf_tables(&engine).expect("TRF tables");
+        assert_eq!(tables.len(), 2, "each loaded script clan owns a table");
+        assert_eq!(
+            loaded_mission_script_bundles(&engine)
+                .expect("script bundles")
+                .len(),
+            2
+        );
+        assert_eq!(tables[0].clan_index, 0);
+        assert_eq!(tables[0].path, "DATA/Research/shared.trf");
+        assert_eq!(tables[1].clan_index, 1);
+        assert_eq!(tables[1].path, "DATA/Research/shared.trf");
+        assert_eq!(
+            tables[0].document.row_words(0),
+            tables[1].document.row_words(0)
+        );
+        assert_eq!(tables[0].document.flag_byte(0), Some(0x5a));
+        assert_ne!(
+            tables[0].document.row_words(0).unwrap().as_ptr(),
+            tables[1].document.row_words(0).unwrap().as_ptr(),
+            "each clan owns an independently decoded row buffer"
+        );
+    }
+
+    #[test]
+    fn full_load_skips_research_trf_when_gate_bundle_or_c_string_is_missing() {
+        for (script_bases, research_paths, gate, mode) in [
+            (
+                vec![Some(&b"MISSIONS/SCRIPTS/shared"[..])],
+                vec![&b"DATA/Research/missing.trf"[..]],
+                false,
+                MissionMode::AutoDemo,
+            ),
+            (
+                vec![Some(&b"MISSIONS/SCRIPTS/shared"[..])],
+                vec![&b""[..]],
+                true,
+                MissionMode::SingleMission,
+            ),
+            (
+                vec![Some(&b"MISSIONS/SCRIPTS/shared"[..])],
+                vec![&b"\0ignored.trf"[..]],
+                true,
+                MissionMode::SingleMission,
+            ),
+            (
+                vec![None],
+                vec![&b"DATA/Research/missing.trf"[..]],
+                true,
+                MissionMode::SingleMission,
+            ),
+        ] {
+            let vfs = research_startup_test_vfs(&script_bases, &research_paths, None);
+            let mut engine =
+                create(EngineServices::new(vfs)).expect("research startup test engine");
+            load_mission(
+                &mut engine,
+                MissionRequest {
+                    key: "MISSIONS/TEST/data.tma".to_string(),
+                    mode,
+                },
+                MissionStartupInput {
+                    queue_time_ms: 0,
+                    research_creation_gate: gate,
+                },
+            )
+            .expect("skipped TRF input must not be read");
+            assert!(loaded_mission_research_trf_tables(&engine)
+                .expect("TRF state")
+                .is_empty());
+        }
+    }
+
+    #[test]
+    fn research_trf_read_and_decode_errors_keep_the_loaded_world_and_rng() {
+        let initial_vfs = research_startup_test_vfs(
+            &[Some(b"MISSIONS/SCRIPTS/shared")],
+            &[b"DATA/Research/shared.trf"],
+            Some(&research_test_trf()),
+        );
+        let mut engine = create(EngineServices::new(initial_vfs)).expect("research startup engine");
+        let request = || MissionRequest {
+            key: "MISSIONS/TEST/data.tma".to_string(),
+            mode: MissionMode::SingleMission,
+        };
+        load_mission(
+            &mut engine,
+            request(),
+            MissionStartupInput {
+                queue_time_ms: 100_000,
+                research_creation_gate: true,
+            },
+        )
+        .expect("initial valid TRF table load");
+        let previous_summary = loaded_mission(&engine).expect("loaded mission").clone();
+        let previous_table =
+            &loaded_mission_research_trf_tables(&engine).expect("initial TRF table")[0];
+        let previous_owner = previous_table.clan_index;
+        let previous_path = previous_table.path.clone();
+        let previous_row = *previous_table.document.row_words(0).expect("initial row");
+        let previous_row_ptr = previous_table.document.row_words(0).unwrap().as_ptr();
+        let before = step_headless(&mut engine, InputSnapshot, 100_000)
+            .expect("step initial mission")
+            .snapshot
+            .objects;
+        let previous_rng = engine.behavior_rng_state;
+
+        for trf in [None, Some(&b"malformed"[..])] {
+            let vfs = research_startup_test_vfs(
+                &[Some(b"MISSIONS/SCRIPTS/shared")],
+                &[b"DATA/Research/shared.trf"],
+                trf,
+            );
+            engine.services.vfs = Some(vfs);
+
+            let error = load_mission(
+                &mut engine,
+                request(),
+                MissionStartupInput {
+                    queue_time_ms: 100_100,
+                    research_creation_gate: true,
+                },
+            )
+            .expect_err("gate true must report a missing or malformed TRF");
+            assert_eq!(loaded_mission(&engine), Some(&previous_summary));
+            assert_eq!(engine.behavior_rng_state, previous_rng);
+            let retained_tables =
+                loaded_mission_research_trf_tables(&engine).expect("retained TRF tables");
+            assert_eq!(retained_tables.len(), 1);
+            assert_eq!(retained_tables[0].clan_index, previous_owner);
+            assert_eq!(retained_tables[0].path, previous_path);
+            assert_eq!(
+                retained_tables[0].document.row_words(0),
+                Some(&previous_row)
+            );
+            assert_eq!(
+                retained_tables[0].document.row_words(0).unwrap().as_ptr(),
+                previous_row_ptr
+            );
+            let after = step_headless(&mut engine, InputSnapshot, 100_000)
+                .expect("step retained mission")
+                .snapshot
+                .objects;
+            assert_eq!(before, after);
+            match (trf, error) {
+                (None, EngineError::Vfs { path, .. }) => {
+                    assert_eq!(path, "DATA/Research/shared.trf");
+                }
+                (
+                    Some(_),
+                    EngineError::ResearchTrf {
+                        clan_index, path, ..
+                    },
+                ) => {
+                    assert_eq!(clan_index, 0);
+                    assert_eq!(path, "DATA/Research/shared.trf");
+                }
+                (_, error) => panic!("unexpected TRF failure: {error:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn research_trf_c_string_paths_reject_non_ascii_bytes() {
+        let vfs = research_startup_test_vfs(
+            &[Some(b"MISSIONS/SCRIPTS/shared")],
+            &[b"DATA/Research/\xe9.trf"],
+            None,
+        );
+        let mut engine = create(EngineServices::new(vfs)).expect("research startup test engine");
+        let error = load_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/TEST/data.tma".to_string(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: true,
+            },
+        )
+        .expect_err("non-ASCII TRF path must fail explicitly");
+        assert!(matches!(
+            error,
+            EngineError::ResearchTrfPath { clan_index: 0, path }
+                if path == b"DATA/Research/\xe9.trf"
+        ));
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_campaign_full_load_creates_trf_tables_for_script_clan_owners() {
+        let root = licensed_root("IS");
+        let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(root));
+        let mut engine = create(EngineServices::new(vfs)).expect("engine");
+        load_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.01/data.tma".to_string(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 100_000,
+                research_creation_gate: true,
+            },
+        )
+        .expect("full campaign load with explicit research gate");
+
+        let tables = loaded_mission_research_trf_tables(&engine).expect("TRF tables");
+        assert_eq!(
+            tables
+                .iter()
+                .map(|table| (table.clan_index, table.path.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (0, "MISSIONS/SCRIPTS/data.trf"),
+                (1, "MISSIONS/SCRIPTS/data.trf"),
+                (2, "MISSIONS/SCRIPTS/data.trf"),
+            ]
+        );
+        assert!(tables.iter().all(|table| table.document.row_count() > 0));
+        assert_eq!(
+            tables[0].document.row_words(0),
+            tables[1].document.row_words(0)
+        );
+        assert_eq!(
+            tables[0].document.row_words(0),
+            tables[2].document.row_words(0)
+        );
+        assert_ne!(
+            tables[0].document.row_words(0).unwrap().as_ptr(),
+            tables[1].document.row_words(0).unwrap().as_ptr()
+        );
+        assert_ne!(
+            tables[1].document.row_words(0).unwrap().as_ptr(),
+            tables[2].document.row_words(0).unwrap().as_ptr()
+        );
     }
 
     #[derive(Clone, Copy)]
