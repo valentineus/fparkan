@@ -2105,7 +2105,7 @@ impl VulkanSmokeRenderer {
                         1,
                         range.first_index,
                         0,
-                        0,
+                        range.owner_scope,
                     );
                 }
                 device.device().cmd_end_render_pass(command_buffer);
@@ -2898,6 +2898,7 @@ mod tests {
         };
         let mut ranges = vec![
             VulkanStaticDrawRange {
+                owner_scope: 0,
                 first_index: 0,
                 index_count: 3,
                 material_index: 7,
@@ -2909,6 +2910,7 @@ mod tests {
                 alpha_test_reference: 17,
             },
             VulkanStaticDrawRange {
+                owner_scope: 0,
                 first_index: 3,
                 index_count: 3,
                 material_index: 9,
@@ -3066,6 +3068,7 @@ mod tests {
     #[test]
     fn geometry_updates_dirty_world_order_on_activation_and_deactivation() {
         let mut ranges = [VulkanStaticDrawRange {
+            owner_scope: 0,
             first_index: 0,
             index_count: 0,
             material_index: 0,
@@ -3253,6 +3256,7 @@ mod tests {
     fn native_transparent_order_is_descending_and_keeps_fixed_pass_slots() {
         let ranges = (0..5)
             .map(|_| super::super::VulkanStaticDrawRange {
+                owner_scope: 0,
                 first_index: 0,
                 index_count: 3,
                 material_index: 0,
@@ -3278,6 +3282,7 @@ mod tests {
     fn inactive_world_range_is_not_reused_as_a_sort_slot() {
         let ranges = vec![
             super::super::VulkanStaticDrawRange {
+                owner_scope: 0,
                 first_index: 0,
                 index_count: 3,
                 material_index: 0,
@@ -3289,6 +3294,7 @@ mod tests {
                 alpha_test_reference: 0,
             },
             super::super::VulkanStaticDrawRange {
+                owner_scope: 0,
                 first_index: 3,
                 index_count: 0,
                 material_index: 0,
@@ -3300,6 +3306,7 @@ mod tests {
                 alpha_test_reference: 0,
             },
             super::super::VulkanStaticDrawRange {
+                owner_scope: 0,
                 first_index: 3,
                 index_count: 3,
                 material_index: 0,
@@ -3325,6 +3332,7 @@ mod tests {
     fn native_equal_key_insertion_uses_inclusive_midpoint() {
         let ranges = (0..4)
             .map(|index| super::super::VulkanStaticDrawRange {
+                owner_scope: 0,
                 first_index: index * 3,
                 index_count: 3,
                 material_index: 0,
@@ -3419,6 +3427,7 @@ mod tests {
         const WEATHER: usize = 10;
         let ranges = (0..11)
             .map(|index| VulkanStaticDrawRange {
+                owner_scope: 0,
                 first_index: index * 3,
                 index_count: 3,
                 material_index: 0,
@@ -3478,6 +3487,7 @@ mod tests {
         const WEATHER: usize = 10;
         let mut ranges = (0..11)
             .map(|index| VulkanStaticDrawRange {
+                owner_scope: 0,
                 first_index: index * 3,
                 index_count: 3,
                 material_index: 0,

@@ -233,6 +233,7 @@ mod tests {
     #[test]
     fn cell_ranges_keep_material_state_and_separate_generated_bands() {
         let range = VulkanStaticDrawRange {
+            owner_scope: 0,
             first_index: 0,
             index_count: 12,
             material_index: 7,

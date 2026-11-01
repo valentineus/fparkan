@@ -406,6 +406,7 @@ mod tests {
             ],
             indices: vec![0, 1, 2],
             draw_ranges: vec![VulkanStaticDrawRange {
+                owner_scope: 0,
                 first_index: 0,
                 index_count: 3,
                 material_index: 0,

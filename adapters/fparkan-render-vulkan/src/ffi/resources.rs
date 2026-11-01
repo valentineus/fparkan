@@ -687,12 +687,13 @@ pub(super) fn encode_point_lights(
             .chain(light.rgb)
             .chain([if light.active { 1.0 } else { 0.0 }])
             .chain(light.coefficients)
-            .chain([if light.active { 1.0 } else { 0.0 }])
         {
             bytes[offset..offset + std::mem::size_of::<f32>()]
                 .copy_from_slice(&value.to_ne_bytes());
             offset += std::mem::size_of::<f32>();
         }
+        bytes[offset..offset + 4].copy_from_slice(&light.owner_scope.to_ne_bytes());
+        offset += 4;
     }
     debug_assert_eq!(offset, total);
     Ok(bytes)

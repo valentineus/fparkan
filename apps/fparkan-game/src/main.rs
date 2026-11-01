@@ -723,6 +723,7 @@ struct AmbientEffectMeshPrimitive {
 
 #[derive(Clone, Debug)]
 struct ControlEffectSlot {
+    light_owner_scope: u32,
     time_mode: u32,
     header_flags: u32,
     random_instance_key: ControlEffectInstanceKey,
@@ -2757,6 +2758,7 @@ fn append_environment_range(
     let range_index = mesh.draw_ranges.len();
     mesh.draw_ranges
         .push(fparkan_render_vulkan::VulkanStaticDrawRange {
+            owner_scope: 0,
             first_index,
             index_count,
             material_index,
@@ -5384,6 +5386,11 @@ fn update_control_point_lights(
         }
         lights.push((
             VulkanPointLight {
+                owner_scope: if frame.native_flags & 0x8000_0000 != 0 {
+                    slot.light_owner_scope
+                } else {
+                    0
+                },
                 position: frame.position,
                 rgb: [frame.color[0], frame.color[1], frame.color[2]],
                 range: frame.range,
@@ -5429,12 +5436,12 @@ fn report_control_point_lights_once(
     *reported = true;
 }
 
-fn ordinary_control_point_lights(
+fn active_control_point_lights(
     raw_control_lights: &[(VulkanPointLight, u32)],
 ) -> Vec<VulkanPointLight> {
     raw_control_lights
         .iter()
-        .filter(|(light, flags)| light.active && flags & 0x8000_0000 == 0)
+        .filter(|(light, _)| light.active)
         .map(|(light, _)| *light)
         .collect()
 }
@@ -5494,6 +5501,11 @@ fn append_initial_control_effect_slots(
     let Some(point_list) = control.point_list.as_ref() else {
         return Ok(());
     };
+    let light_owner_scope = u32::try_from(object_index)
+        .ok()
+        .and_then(|index| index.checked_add(1))
+        .ok_or_else(|| "Control light owner exceeds GPU scope range".to_string())?;
+    let initial_range_count = mesh.draw_ranges.len();
     let mut unsupported_commands = 0;
     let mut state_dependent_commands = 0;
     for row in
@@ -5620,6 +5632,7 @@ fn append_initial_control_effect_slots(
         for (command_index, command) in document.commands().iter().enumerate() {
             if ambient_effect_op1_supported(command) || command.opcode == FxOpcode::Op2 {
                 let slot = ControlEffectSlot {
+                    light_owner_scope,
                     time_mode: header.time_mode,
                     header_flags: header.flags,
                     random_instance_key,
@@ -5846,6 +5859,9 @@ fn append_initial_control_effect_slots(
                 op7_emitter_state,
             });
         }
+    }
+    for range in &mut mesh.draw_ranges[initial_range_count..] {
+        range.owner_scope = light_owner_scope;
     }
     eprintln!("render_coverage control_fx_unsupported={unsupported_commands} control_fx_requires_game_state={state_dependent_commands}");
     Ok(())
@@ -7710,6 +7726,7 @@ fn project_basement_foundation(
                 .ok_or_else(|| "basement terrain draw range exceeds u32".to_string())?;
         } else {
             mesh.draw_ranges.push(VulkanStaticDrawRange {
+                owner_scope: 0,
                 first_index,
                 index_count: 3,
                 material_index,
@@ -8403,6 +8420,10 @@ fn static_preview_mesh_and_materials(
                 .map_err(|err| format!("project mission MSH for Vulkan: {err}"))?;
                 let component_handedness = native_msh_handedness(transform, mission_root.scale);
                 for range in &mut component.draw_ranges {
+                    range.owner_scope = u32::try_from(object_index)
+                        .ok()
+                        .and_then(|index| index.checked_add(1))
+                        .ok_or_else(|| "MSH light owner exceeds GPU scope range".to_string())?;
                     range.pipeline_state.cull =
                         native_msh_cull_mode(range.batch_flags, component_handedness);
                 }
@@ -10019,7 +10040,7 @@ impl StaticVulkanApp {
                     .control_clock_target_ms
                     .is_none_or(|target_ms| control_clock_ms >= target_ms),
         );
-        let control_vulkan_lights = ordinary_control_point_lights(&control_point_lights);
+        let control_vulkan_lights = active_control_point_lights(&control_point_lights);
         let effect_updates = update_ambient_effect_geometry(
             &mut self.ambient_effect_slots,
             &self.component_pose_buffers,
@@ -10433,6 +10454,7 @@ impl StaticVulkanApp {
                 .iter()
                 .find(|light| light.active)
                 .map(|light| VulkanPointLight {
+                    owner_scope: 0,
                     position: light.position,
                     rgb: [light.color[0], light.color[1], light.color[2]],
                     range: light.range,
@@ -10448,6 +10470,7 @@ impl StaticVulkanApp {
                 .iter()
                 .filter(|light| light.active)
                 .map(|light| VulkanPointLight {
+                    owner_scope: 0,
                     position: light.position,
                     rgb: [light.color[0], light.color[1], light.color[2]],
                     range: light.range,
@@ -11227,6 +11250,7 @@ mod tests {
         positions: &[[f32; 3]],
     ) -> (VulkanStaticMesh, VulkanStaticDrawRange) {
         let range = VulkanStaticDrawRange {
+            owner_scope: 0,
             first_index: 0,
             index_count: u32::try_from(positions.len()).expect("fixture length fits u32"),
             material_index: 0,
@@ -12484,6 +12508,7 @@ mod tests {
                 .map(|index| index + environment_vertex_start),
         );
         let draw_range = |first_index, index_count| VulkanStaticDrawRange {
+            owner_scope: 0,
             first_index,
             index_count,
             material_index: 0,
@@ -13196,6 +13221,7 @@ mod tests {
     #[test]
     fn draw_range_reorder_remaps_all_material_animation_bindings() {
         let range = |first_index, material_index| VulkanStaticDrawRange {
+            owner_scope: 0,
             first_index,
             index_count: 3,
             material_index,
@@ -13261,6 +13287,7 @@ mod tests {
     #[test]
     fn native_world_transparency_uses_sampled_alpha_and_native_batch_flags() {
         let range = |blend, batch_flags| VulkanStaticDrawRange {
+            owner_scope: 0,
             first_index: 0,
             index_count: 3,
             material_index: 0,
@@ -13624,6 +13651,7 @@ mod tests {
             row_index: 0,
         };
         let control_slot = ControlEffectSlot {
+            light_owner_scope: 1,
             time_mode: 1,
             header_flags: 9,
             random_instance_key: key,
@@ -13728,6 +13756,7 @@ mod tests {
                     .collect(),
                 indices: vec![0, 1, 2],
                 draw_ranges: vec![VulkanStaticDrawRange {
+                    owner_scope: 0,
                     first_index: 0,
                     index_count: 3,
                     material_index: 0,
@@ -16680,6 +16709,7 @@ mod tests {
     #[test]
     fn op1_control_lights_use_native_phase_owner_transform_and_flags() {
         let mut slot = ControlEffectSlot {
+            light_owner_scope: 1,
             time_mode: 1,
             header_flags: 0,
             random_instance_key: ControlEffectInstanceKey {
@@ -16754,6 +16784,10 @@ mod tests {
         assert_eq!(light.rgb, [0.25, 0.5, 0.75]);
         assert_eq!(light.range, 15.0);
         assert_eq!(light.coefficients, [1.0, 0.5, 0.25]);
+        assert_eq!(
+            light.owner_scope, 1,
+            "native local light reaches its owning root"
+        );
         assert_eq!(flags, 0xA000_0000);
         assert_eq!(
             [
@@ -16874,8 +16908,9 @@ mod tests {
     }
 
     #[test]
-    fn op1_generic_diffuse_list_excludes_bit31_and_clears_inactive_lights() {
-        let light = |position, active| VulkanPointLight {
+    fn op1_diffuse_list_retains_owner_lights_and_clears_inactive_lights() {
+        let light = |position, owner_scope, active| VulkanPointLight {
+            owner_scope,
             position,
             rgb: [0.25, 0.5, 0.75],
             range: 15.0,
@@ -16883,15 +16918,21 @@ mod tests {
             active,
         };
         let raw_records = vec![
-            (light([1.0, 2.0, 3.0], true), 0xA000_0000),
-            (light([4.0, 5.0, 6.0], true), 0x2000_0000),
-            (light([7.0, 8.0, 9.0], true), 0x8000_0000),
-            (light([10.0, 11.0, 12.0], false), 0x0000_0000),
+            (light([1.0, 2.0, 3.0], 5, true), 0xA000_0000),
+            (light([4.0, 5.0, 6.0], 0, true), 0x2000_0000),
+            (light([7.0, 8.0, 9.0], 2, true), 0x8000_0000),
+            (light([10.0, 11.0, 12.0], 0, false), 0x0000_0000),
         ];
 
-        let ordinary = ordinary_control_point_lights(&raw_records);
-        assert_eq!(ordinary.len(), 1);
-        assert_eq!(ordinary[0].position, [4.0, 5.0, 6.0]);
+        let active = active_control_point_lights(&raw_records);
+        assert_eq!(active.len(), 3);
+        assert_eq!(
+            active
+                .iter()
+                .map(|light| light.owner_scope)
+                .collect::<Vec<_>>(),
+            [5, 0, 2]
+        );
         assert_eq!(raw_records.len(), 4);
         assert_eq!(
             raw_records
@@ -16901,9 +16942,9 @@ mod tests {
             vec![0xA000_0000, 0x2000_0000, 0x8000_0000, 0]
         );
 
-        assert!(ordinary_control_point_lights(&[]).is_empty());
+        assert!(active_control_point_lights(&[]).is_empty());
         assert!(
-            ordinary_control_point_lights(&[(light([13.0, 14.0, 15.0], false), 0x2000_0000)])
+            active_control_point_lights(&[(light([13.0, 14.0, 15.0], 0, false), 0x2000_0000)])
                 .is_empty()
         );
     }

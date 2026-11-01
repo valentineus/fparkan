@@ -158,6 +158,8 @@ impl Default for VulkanDirectionalLight {
 /// One point light in the frame lighting contract.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VulkanPointLight {
+    /// Zero lights the world; a nonzero scope lights only matching object ranges.
+    pub owner_scope: u32,
     /// World-space position.
     pub position: [f32; 3],
     /// Light RGB multiplier.
@@ -173,6 +175,7 @@ pub struct VulkanPointLight {
 impl Default for VulkanPointLight {
     fn default() -> Self {
         Self {
+            owner_scope: 0,
             position: [0.0; 3],
             rgb: [0.0; 3],
             range: 0.0,
@@ -201,7 +204,7 @@ pub const VULKAN_FRAME_SLOT_COUNT: usize = 2;
 /// `uvec4` header bytes for the dynamic point-light storage buffer.
 pub const VULKAN_POINT_LIGHT_HEADER_BYTES: usize = 16;
 
-/// Three `vec4` records per dynamically uploaded point light.
+/// Two vec4 records, three attenuation floats and one u32 owner scope.
 pub const VULKAN_POINT_LIGHT_RECORD_BYTES: usize = 3 * 4 * std::mem::size_of::<f32>();
 
 /// Bytes occupied by one material's base and overlay specular records.
@@ -444,6 +447,8 @@ pub struct VulkanDynamicDrawRange {
 /// One indexed triangle-list draw retained from an original mesh batch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VulkanStaticDrawRange {
+    /// Root-object lighting scope; zero denotes terrain or unowned geometry.
+    pub owner_scope: u32,
     /// First index in the shared index buffer.
     pub first_index: u32,
     /// Number of indices in this draw.
@@ -787,6 +792,7 @@ impl VulkanStaticMesh {
             ],
             indices: vec![0, 1, 2],
             draw_ranges: vec![VulkanStaticDrawRange {
+                owner_scope: 0,
                 first_index: 0,
                 index_count: 3,
                 material_index: 0,
@@ -872,6 +878,7 @@ mod static_mesh_tests {
                 VulkanDirectionalLight::default(),
             ],
             point_light: VulkanPointLight {
+                owner_scope: 0,
                 position: [28.0, 29.0, 30.0],
                 rgb: [31.0, 32.0, 33.0],
                 range: 34.0,
@@ -1073,6 +1080,7 @@ mod static_mesh_tests {
             vertices: VulkanStaticMesh::smoke_triangle().vertices,
             indices: vec![0, 1],
             draw_ranges: vec![VulkanStaticDrawRange {
+                owner_scope: 0,
                 first_index: 0,
                 index_count: 2,
                 material_index: 0,
@@ -1105,6 +1113,7 @@ mod static_mesh_tests {
     fn material_descriptors_follow_source_batch_selectors() {
         let ranges = [
             VulkanStaticDrawRange {
+                owner_scope: 0,
                 first_index: 0,
                 index_count: 3,
                 material_index: 7,
@@ -1116,6 +1125,7 @@ mod static_mesh_tests {
                 alpha_test_reference: 0,
             },
             VulkanStaticDrawRange {
+                owner_scope: 0,
                 first_index: 3,
                 index_count: 3,
                 material_index: 2,

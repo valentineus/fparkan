@@ -45,7 +45,8 @@ layout(std430, set = 0, binding = 5) readonly buffer MaterialSpecular {
 struct PointLightRecord {
     vec4 position_range;
     vec4 rgb_active;
-    vec4 coefficients_active;
+    vec3 coefficients;
+    uint owner_scope;
 };
 
 layout(std430, set = 0, binding = 6) readonly buffer PointLightBuffer {
@@ -197,6 +198,9 @@ LightingTerms native_material_lighting(
     }
     for (uint index = 0u; index < point_light_buffer.header.x; ++index) {
         PointLightRecord point_light = point_light_buffer.records[index];
+        if (point_light.owner_scope != 0u && point_light.owner_scope != uint(gl_InstanceIndex)) {
+            continue;
+        }
         vec3 to_light = point_light.position_range.xyz - world_position;
         float distance_squared = dot(to_light, to_light);
         float range = point_light.position_range.w;
@@ -209,9 +213,9 @@ LightingTerms native_material_lighting(
             float ndotl = dot(normal, light_direction);
             if (ndotl > 0.0) {
                 float t = (range - distance_to_light) / range;
-                float attenuation = point_light.coefficients_active.x
-                    + point_light.coefficients_active.y * t
-                    + point_light.coefficients_active.z * t * t;
+                float attenuation = point_light.coefficients.x
+                    + point_light.coefficients.y * t
+                    + point_light.coefficients.z * t * t;
                 attenuation = max(attenuation, 0.0);
                 accumulated += ndotl * directional_rgb * point_light.rgb_active.rgb * attenuation;
                 specular += specular_from_light(

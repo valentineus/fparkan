@@ -859,6 +859,7 @@ fn append_node_fallback_batch(
         indices.push(vertex_index);
     }
     draw_ranges.push(VulkanStaticDrawRange {
+        owner_scope: 0,
         first_index,
         index_count: u32::from(batch.index_count),
         material_index: u16::from(batch.material_index),
@@ -1246,6 +1247,7 @@ fn static_terrain_draw_ranges(
             end_face += 1;
         }
         ranges.push(VulkanStaticDrawRange {
+            owner_scope: 0,
             first_index: u32::try_from(start_face)
                 .map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?
                 .checked_mul(3)
@@ -1299,6 +1301,7 @@ fn static_model_indices_and_ranges(
             indices.push(index);
         }
         draw_ranges.push(VulkanStaticDrawRange {
+            owner_scope: 0,
             first_index,
             index_count: u32::from(batch.index_count),
             material_index: u16::from(batch.material_index),
@@ -1507,6 +1510,7 @@ mod tests {
         assert_eq!(
             mesh.draw_ranges,
             vec![VulkanStaticDrawRange {
+                owner_scope: 0,
                 first_index: 0,
                 index_count: 3,
                 material_index: 0,
@@ -2038,6 +2042,7 @@ mod tests {
             mesh.draw_ranges,
             vec![
                 VulkanStaticDrawRange {
+                    owner_scope: 0,
                     first_index: 0,
                     index_count: 3,
                     material_index: 0,
@@ -2050,6 +2055,7 @@ mod tests {
                         VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
                 },
                 VulkanStaticDrawRange {
+                    owner_scope: 0,
                     first_index: 3,
                     index_count: 3,
                     material_index: 7,
