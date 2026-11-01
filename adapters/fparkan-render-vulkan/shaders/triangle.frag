@@ -82,12 +82,15 @@ void main() {
         vec2 bump_uv = plane_uv * frame.embm_wave.y + frame.embm_wave.x;
         vec2 duv = max(vec2(-1.0), (texture(embm_bump, bump_uv).rg * 255.0 - 128.0) / 127.0);
         vec2 displacement = duv * frame.embm_wave.zw;
-        // shortcut: convert native map-UV displacement to the current mirror projection;
-        // replace this projection when accepting the original shifted reflection camera.
-        vec3 displaced_world = in_world_position - vec3(displacement.yx * span, 0.0);
-        vec4 displaced_clip = frame.clip_from_world * vec4(displaced_world, 1.0);
-        if (displaced_clip.w > 0.000001) {
-            reflection_uv = displaced_clip.xy / displaced_clip.w * 0.5 + 0.5;
+        if ((mode & 128) != 0) {
+            reflection_uv = plane_uv + displacement;
+        } else {
+            // shortcut: non-perspective API cameras retain the projective mirror fallback.
+            vec3 displaced_world = in_world_position - vec3(displacement.yx * span, 0.0);
+            vec4 displaced_clip = frame.clip_from_world * vec4(displaced_world, 1.0);
+            if (displaced_clip.w > 0.000001) {
+                reflection_uv = displaced_clip.xy / displaced_clip.w * 0.5 + 0.5;
+            }
         }
         vec3 rgb = texture(reflection_color, reflection_uv).rgb * in_base_diffuse + in_base_specular;
         out_color = vec4(mix(rgb * in_color, frame.fog_color.rgb, in_fog_factor), material.diffuse_alpha);

@@ -373,7 +373,7 @@ impl VulkanSmokeRenderer {
         plane_heights.sort_unstable();
         plane_heights.dedup();
         if !plane_heights.is_empty() {
-            eprintln!("render_coverage planar_reflection_shifted_camera_unsupported={} (native bump map and clock; using a projective mirror until shifted-camera mapping is implemented)", plane_heights.len());
+            eprintln!("render_coverage planar_reflection_render_context_approx={} (native shifted window and bump UV; main-view depth range, sky/fog/FX and swapchain-sized target remain approximations; non-perspective cameras use mirror fallback)", plane_heights.len());
             eprintln!("render_coverage planar_reflection_other_planes_unsupported={} (nearest active plane is reflected)", plane_heights.len().saturating_sub(1));
         }
         if unsupported_nonplanar != 0 {
@@ -1564,11 +1564,18 @@ impl VulkanSmokeRenderer {
             .active_reflection_plane()
             .map(|height| {
                 let mut frame = self.frame_uniforms;
-                frame.clip_from_world =
+                frame.clip_from_world = fparkan_render::water::legacy_embm_reflection_clip(
+                    frame.clip_from_world,
+                    frame.camera_position,
+                    height,
+                    frame.embm_bounds,
+                )
+                .or_else(|| {
                     fparkan_render::reflect_clip_from_world_about_z(frame.clip_from_world, height)
-                        .ok_or(VulkanSmokeRendererError::InvalidStaticCamera {
-                            context: "non-finite reflected clip transform",
-                        })?;
+                })
+                .ok_or(VulkanSmokeRendererError::InvalidStaticCamera {
+                    context: "non-finite reflected clip transform",
+                })?;
                 frame.camera_position[2] = 2.0 * height - frame.camera_position[2];
                 if !frame.is_finite() {
                     return Err(VulkanSmokeRendererError::InvalidStaticCamera {
@@ -1819,6 +1826,15 @@ impl VulkanSmokeRenderer {
             self.draw_order_dirty = false;
         }
         let reflection_plane = self.active_reflection_plane();
+        let shifted_reflection = reflection_plane.is_some_and(|height| {
+            fparkan_render::water::legacy_embm_reflection_clip(
+                self.frame_uniforms.clip_from_world,
+                self.frame_uniforms.camera_position,
+                height,
+                self.frame_uniforms.embm_bounds,
+            )
+            .is_some()
+        });
         let device = self.device_ref()?;
         let swapchain = self.swapchain_ref()?;
         let resources = self.resources_ref()?;
@@ -2053,7 +2069,7 @@ impl VulkanSmokeRenderer {
                             && reflection_plane.is_some()
                             && self.reflection_planes[range_index] == reflection_plane
                         {
-                            64
+                            64 | if shifted_reflection { 128 } else { 0 }
                         } else {
                             0
                         }) as f32;

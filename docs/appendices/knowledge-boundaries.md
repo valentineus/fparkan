@@ -76,7 +76,7 @@ MSH-запрос со свободной preview-камерой; это не п�
 среде, перехватить DirectDraw/Direct3D calls и surface flips, сохранить state
 log на минимальных сценах с одним типом материала.
 
-Горизонтальные грани Land.msh с флагом `0x20000` используют Vulkan-отражение и исходную карту волн Du/Dv; перенос её смещений в обычное зеркало приближённый: `planar_reflection_shifted_camera_unsupported`.
+Горизонтальные грани Land.msh с флагом `0x20000` используют исходную карту Du/Dv и окно shifted-камеры, проверенное исполнением Terrain.dll. Диапазон глубины, небо/туман/FX основного вида и размер target остаются приближениями: `planar_reflection_render_context_approx`; неперспективная камера API использует обычное зеркало.
 Raw queue clock задаёт фазу волн отдельно от времени суток и sky elapsed; старые захваты без него считаются в `captured_water_phase_unverified`.
 Один target отражает ближайшую активную высоту воды; остальные высоты и неплоские грани считаются в `planar_reflection_other_planes_unsupported` и `planar_reflection_nonplanar_unsupported` и сохраняют обычный terrain shader.
 `terrain_face8_pipeline_unverified` теперь считает только исходные грани с `0x8` без `0x20000`; сама семантика оставшихся специальных проходов ещё не установлена.
