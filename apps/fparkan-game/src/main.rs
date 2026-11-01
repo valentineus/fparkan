@@ -5498,6 +5498,8 @@ fn append_initial_control_effect_slots(
     let Some(point_list) = control.point_list.as_ref() else {
         return Ok(());
     };
+    let mut unsupported_commands = 0;
+    let mut state_dependent_commands = 0;
     for row in
         selected_initial_control_effect_rows(control.initial_effect_group, &control.effect_section)
     {
@@ -5511,10 +5513,22 @@ fn append_initial_control_effect_slots(
             )
         })?;
         let key = format!("{archive}/{name}");
+        let mut record_skip = |reason: &str,
+                               count: usize,
+                               needs_state: bool,
+                               command: Option<usize>| {
+            if needs_state {
+                state_dependent_commands += count;
+            } else {
+                unsupported_commands += count;
+            }
+            eprintln!("unexpanded Control FX reason:{reason} count:{count} needs_game_state:{needs_state} object:{object_index} component:{component_index} source:{key} table:{} row:{} command:{command:?}", row.table_index, row.row_index);
+        };
         if !effect_documents.contains_key(&key) {
             let bytes = load_resource_entry_bytes_from_root(root, &archive, &name)
                 .map_err(|error| format!("load Control FX {key}: {error}"))?;
             let Ok(document) = decode_fxid(bytes) else {
+                eprintln!("render_coverage control_fx_invalid_documents=1 (object:{object_index} component:{component_index} source:{key})");
                 continue;
             };
             effect_documents.insert(key.clone(), document);
@@ -5531,17 +5545,24 @@ fn append_initial_control_effect_slots(
         let duration_seconds = header.duration_seconds;
         if !duration_seconds.is_finite()
             || duration_seconds < 0.0
-            || !matches!(header.time_mode, 0 | 1 | 2)
-            || (header.time_mode != 0 && duration_seconds <= 0.0)
             || !header.phase_jitter.is_finite()
             || !header.random_shift.iter().all(|value| value.is_finite())
             || !header.scale.iter().all(|value| value.is_finite())
         {
-            // Control can reference action effects whose header timing and
-            // scale conventions are outside this ambient subset. Leave them
-            // unexpanded until their lifetime and transform contract are
-            // understood rather than failing the whole mission preview.
             *unsupported_sounds += sound_commands;
+            record_skip("header_values", document.commands().len(), false, None);
+            continue;
+        }
+        if !matches!(header.time_mode, 0 | 1 | 2)
+            || (header.time_mode != 0 && duration_seconds <= 0.0)
+        {
+            *unsupported_sounds += sound_commands;
+            record_skip(
+                "time_mode",
+                document.commands().len(),
+                fparkan_fx::fx_time_mode_requires_owner_state(header.time_mode),
+                None,
+            );
             continue;
         }
         let owner_node_index =
@@ -5554,6 +5575,7 @@ fn append_initial_control_effect_slots(
                 });
         let Some(owner_node_index) = owner_node_index else {
             *unsupported_sounds += sound_commands;
+            record_skip("owner_node", document.commands().len(), false, None);
             continue;
         };
         let owner_node_pose = control_effect_owner_node_pose(
@@ -5563,6 +5585,7 @@ fn append_initial_control_effect_slots(
         );
         let Some(owner_node_pose) = owner_node_pose else {
             *unsupported_sounds += sound_commands;
+            record_skip("owner_pose", document.commands().len(), false, None);
             continue;
         };
         let root_transform = LegacyIron3dEulerTransform {
@@ -5629,6 +5652,7 @@ fn append_initial_control_effect_slots(
                         });
                     } else {
                         *unsupported_sounds += 1;
+                        record_skip("sound_body", 1, false, Some(command_index));
                         eprintln!("unsupported Control Op2 object={object_index} component={component_index} effect={key} command={command_index} (mode, backend parameter or malformed body)");
                     }
                 } else {
@@ -5637,6 +5661,7 @@ fn append_initial_control_effect_slots(
                 continue;
             }
             let Some(kind) = ambient_effect_command_kind(command) else {
+                record_skip("opcode_or_body", 1, false, Some(command_index));
                 continue;
             };
             if !ambient_effect_render_selector_allows_header(
@@ -5646,11 +5671,13 @@ fn append_initial_control_effect_slots(
                 continue;
             }
             let Some(reference) = command.resource_refs.first() else {
+                record_skip("material_reference", 1, false, Some(command_index));
                 continue;
             };
             let material_archive = String::from_utf8_lossy(reference.archive_name()).into_owned();
             let material_name = String::from_utf8_lossy(reference.resource_name()).into_owned();
             if material_archive.is_empty() || material_name.is_empty() {
+                record_skip("empty_material_reference", 1, false, Some(command_index));
                 continue;
             }
             let cache_key = format!("{material_archive}/{material_name}");
@@ -5671,6 +5698,7 @@ fn append_initial_control_effect_slots(
                 &prepared.phase_directional_rgb,
                 &prepared.phase_additive_rgb,
             ) {
+                record_skip("material_tint", 1, false, Some(command_index));
                 continue;
             }
             let first_material = *prepared
@@ -5688,6 +5716,7 @@ fn append_initial_control_effect_slots(
                         [0.0; 3],
                         AMBIENT_EFFECT_NATIVE_CATEGORY,
                     ) else {
+                        record_skip("mesh_template", 1, false, Some(command_index));
                         continue;
                     };
                     Some(template)
@@ -5822,6 +5851,7 @@ fn append_initial_control_effect_slots(
             });
         }
     }
+    eprintln!("render_coverage control_fx_unsupported={unsupported_commands} control_fx_requires_game_state={state_dependent_commands}");
     Ok(())
 }
 

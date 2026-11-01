@@ -67,6 +67,12 @@ pub struct FxHeader {
     pub scale: [f32; 3],
 }
 
+/// Effect.dll RVA 0x5C60 reads an owner/provider for modes 4 through 17, including mode 14.
+#[must_use]
+pub const fn fx_time_mode_requires_owner_state(mode: u32) -> bool {
+    matches!(mode, 4..=17)
+}
+
 /// FX opcode.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum FxOpcode {
@@ -622,6 +628,16 @@ mod tests {
     use fparkan_nres::ReadProfile;
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn phase_sources_distinguish_elapsed_damage_and_progress_modes() {
+        for mode in [0, 1, 2, 3, 18, u32::MAX] {
+            assert!(!fx_time_mode_requires_owner_state(mode));
+        }
+        for mode in [4, 5, 9, 13, 14, 15, 16, 17] {
+            assert!(fx_time_mode_requires_owner_state(mode));
+        }
+    }
 
     #[test]
     fn decodes_synthetic_opcodes_and_refs() {
