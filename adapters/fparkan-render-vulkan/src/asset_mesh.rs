@@ -866,6 +866,7 @@ fn append_node_fallback_batch(
         batch_flags: batch.batch_flags,
         pipeline_state: world_pipeline_state(),
         terrain_base_only: false,
+        terrain_reflection: false,
         alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
     });
     Ok(())
@@ -1226,6 +1227,7 @@ fn static_terrain_draw_ranges(
             .ok_or(VulkanAssetMeshError::IndexOutOfRange)?;
         let material_index = first_face.material_tag;
         let terrain_base_only = first_face.flags.0 & 0x400 == 0;
+        let terrain_reflection = first_face.flags.0 & 0x20000 != 0;
         let mut end_face = start_face + 1;
         while end_face < lod0.len() {
             let next_face = terrain
@@ -1234,6 +1236,10 @@ fn static_terrain_draw_ranges(
                 .ok_or(VulkanAssetMeshError::IndexOutOfRange)?;
             if next_face.material_tag != material_index
                 || (next_face.flags.0 & 0x400 == 0) != terrain_base_only
+                || (next_face.flags.0 & 0x20000 != 0) != terrain_reflection
+                || (terrain_reflection
+                    && terrain.positions[usize::from(first_face.vertices[0])][2]
+                        != terrain.positions[usize::from(next_face.vertices[0])][2])
             {
                 break;
             }
@@ -1253,6 +1259,7 @@ fn static_terrain_draw_ranges(
             batch_flags: 0,
             pipeline_state: world_pipeline_state(),
             terrain_base_only,
+            terrain_reflection,
             alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
         });
         start_face = end_face;
@@ -1299,6 +1306,7 @@ fn static_model_indices_and_ranges(
             batch_flags: batch.batch_flags,
             pipeline_state: world_pipeline_state(),
             terrain_base_only: false,
+            terrain_reflection: false,
             alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
         });
     }
@@ -1506,6 +1514,7 @@ mod tests {
                 batch_flags: 0,
                 pipeline_state: world_pipeline_state(),
                 terrain_base_only: false,
+                terrain_reflection: false,
                 alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
             }]
         );
@@ -2036,6 +2045,7 @@ mod tests {
                     batch_flags: 0,
                     pipeline_state: world_pipeline_state(),
                     terrain_base_only: false,
+                    terrain_reflection: false,
                     alpha_test_reference:
                         VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
                 },
@@ -2047,6 +2057,7 @@ mod tests {
                     batch_flags: 0,
                     pipeline_state: world_pipeline_state(),
                     terrain_base_only: false,
+                    terrain_reflection: false,
                     alpha_test_reference:
                         VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
                 },
@@ -2298,5 +2309,21 @@ mod tests {
         assert!(ranges.iter().all(|range| {
             range.alpha_test_reference == VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE
         }));
+        terrain.faces = vec![
+            terrain_face_with_tag_and_flags(0xff04, 0x400, [0, 1, 2]),
+            terrain_face_with_tag_and_flags(0xff04, 0x20400, [0, 1, 2]),
+            terrain_face_with_tag_and_flags(0xff04, 0x20400, [0, 1, 2]),
+            terrain_face_with_tag_and_flags(0xff04, 0x20400, [3, 4, 5]),
+        ];
+        terrain.positions.extend([[0.0, 0.0, 10.0]; 3]);
+        set_terrain_lod_slots(&mut terrain, &[[0, u16::MAX]], &[[0, 4]]);
+        let assignments = static_terrain_lod0_assignments(&terrain).unwrap();
+        let ranges = static_terrain_draw_ranges(&terrain, &assignments).unwrap();
+        assert_eq!(ranges.len(), 3);
+        assert!(!ranges[0].terrain_reflection);
+        assert!(ranges[1].terrain_reflection);
+        assert_eq!(ranges[1].index_count, 6);
+        assert!(ranges[2].terrain_reflection);
+        assert_eq!(ranges[2].index_count, 3);
     }
 }

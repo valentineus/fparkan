@@ -9,12 +9,14 @@ layout(location = 5) in vec3 in_base_diffuse;
 layout(location = 6) in vec3 in_base_specular;
 layout(location = 7) in vec3 in_overlay_diffuse;
 layout(location = 8) in vec3 in_overlay_specular;
+layout(location = 9) in float in_world_z;
 layout(location = 0) out vec4 out_color;
 
 layout(set = 0, binding = 0) uniform sampler2D base_color;
 layout(set = 0, binding = 1) uniform sampler2D base_detail;
 layout(set = 0, binding = 2) uniform sampler2D overlay_color;
 layout(set = 0, binding = 3) uniform sampler2D overlay_detail;
+layout(set = 1, binding = 0) uniform sampler2D reflection_color;
 
 layout(std140, set = 0, binding = 4) uniform FrameConstants {
     mat4 clip_from_world;
@@ -66,6 +68,19 @@ layout(push_constant) uniform MaterialConstants {
 } material;
 
 void main() {
+    int mode = int(round(material.material_mode));
+    if ((mode & 32) != 0 && (mode & 4) == 0 && in_world_z < frame.camera_position.w) {
+        discard;
+    }
+    if ((mode & 64) != 0) {
+        vec2 reflection_uv = gl_FragCoord.xy / vec2(textureSize(reflection_color, 0));
+        vec3 rgb = texture(reflection_color, reflection_uv).rgb * in_base_diffuse + in_base_specular;
+        out_color = vec4(mix(rgb * in_color, frame.fog_color.rgb, in_fog_factor), material.diffuse_alpha);
+        if (out_color.a < material.alpha_cutoff) {
+            discard;
+        }
+        return;
+    }
     vec2 base_uv = vec2(material.base_page_x, material.base_page_y)
         + in_uv * vec2(material.base_page_w, material.base_page_h);
     vec2 detail_uv = vec2(material.detail_page_x, material.detail_page_y)
@@ -78,7 +93,6 @@ void main() {
     vec4 detail = texture(base_detail, detail_uv);
     vec4 overlay = texture(overlay_color, overlay_uv);
     vec4 overlay_detail_sample = texture(overlay_detail, overlay_detail_uv);
-    int mode = int(round(material.material_mode));
     int combiner_mode = mode & 3;
 
     // Native sky mode 4 combines nebula and stars as

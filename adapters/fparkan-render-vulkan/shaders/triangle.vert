@@ -19,6 +19,7 @@ layout(location = 5) out vec3 out_base_diffuse;
 layout(location = 6) out vec3 out_base_specular;
 layout(location = 7) out vec3 out_overlay_diffuse;
 layout(location = 8) out vec3 out_overlay_specular;
+layout(location = 9) out float out_world_z;
 
 layout(std140, set = 0, binding = 4) uniform FrameConstants {
     mat4 clip_from_world;
@@ -241,6 +242,7 @@ LightingTerms native_material_lighting(
 }
 
 void main() {
+    out_world_z = in_position.z;
     out_color = in_color;
     out_uv = in_uv;
     out_detail_uv = in_detail_uv;

@@ -357,6 +357,28 @@ impl VulkanSmokeRenderer {
                 .map(|material| material.material_index)
                 .collect()
         };
+        let reflection_planes = super::reflection::mesh_reflection_planes(&create_info.mesh);
+        let unsupported_nonplanar = create_info
+            .mesh
+            .draw_ranges
+            .iter()
+            .zip(&reflection_planes)
+            .filter(|(range, plane)| range.terrain_reflection && plane.is_none())
+            .count();
+        let mut plane_heights = reflection_planes
+            .iter()
+            .flatten()
+            .map(|z| z.to_bits())
+            .collect::<Vec<_>>();
+        plane_heights.sort_unstable();
+        plane_heights.dedup();
+        if !plane_heights.is_empty() {
+            eprintln!("render_coverage planar_reflection_embm_unsupported={} (flat reflection; native shifted camera and wave distortion pending)", plane_heights.len());
+            eprintln!("render_coverage planar_reflection_other_planes_unsupported={} (nearest active plane is reflected)", plane_heights.len().saturating_sub(1));
+        }
+        if unsupported_nonplanar != 0 {
+            eprintln!("render_coverage planar_reflection_nonplanar_unsupported={unsupported_nonplanar} (ordinary terrain fallback)");
+        }
         let mut renderer = Self {
             instance: Some(instance),
             validation,
@@ -379,6 +401,7 @@ impl VulkanSmokeRenderer {
                 .map(|range| range.index_count)
                 .collect(),
             draw_ranges: create_info.mesh.draw_ranges.clone(),
+            reflection_planes,
             draw_texture_indices,
             draw_order: (0..create_info.mesh.draw_ranges.len()).collect(),
             draw_range_sort_keys: vec![None; create_info.mesh.draw_ranges.len()],
@@ -519,6 +542,22 @@ impl VulkanSmokeRenderer {
     #[must_use]
     pub const fn frame_uniforms(&self) -> super::VulkanFrameUniforms {
         self.frame_uniforms
+    }
+
+    fn active_reflection_plane(&self) -> Option<f32> {
+        // shortcut: one target serves the nearest active water height; add per-plane targets
+        // when accepting maps whose visible water surfaces have different heights.
+        self.draw_ranges
+            .iter()
+            .zip(&self.reflection_planes)
+            .filter(|(range, _)| range.index_count != 0)
+            .filter_map(|(_, plane)| *plane)
+            .filter(|&z| z < self.frame_uniforms.camera_position[2])
+            .min_by(|a, b| {
+                (self.frame_uniforms.camera_position[2] - a)
+                    .abs()
+                    .total_cmp(&(self.frame_uniforms.camera_position[2] - b).abs())
+            })
     }
 
     /// Replaces the camera for subsequent frames without recreating GPU resources.
@@ -1516,6 +1555,27 @@ impl VulkanSmokeRenderer {
         }
         self.images_in_flight[image_index_usize] = in_flight_fence;
         let frame_bytes = self.frame_uniforms.to_ne_bytes();
+        let reflection_bytes = self
+            .active_reflection_plane()
+            .map(|height| {
+                let mut frame = self.frame_uniforms;
+                frame.clip_from_world =
+                    fparkan_render::reflect_clip_from_world_about_z(frame.clip_from_world, height)
+                        .ok_or(VulkanSmokeRendererError::InvalidStaticCamera {
+                            context: "non-finite reflected clip transform",
+                        })?;
+                frame.camera_position[2] = 2.0 * height - frame.camera_position[2];
+                if !frame.is_finite() {
+                    return Err(VulkanSmokeRendererError::InvalidStaticCamera {
+                        context: "non-finite reflected camera position",
+                    });
+                }
+                let mut bytes = frame.to_ne_bytes();
+                let length = bytes.len();
+                bytes[length - 4..].copy_from_slice(&height.to_ne_bytes());
+                Ok(bytes)
+            })
+            .transpose()?;
         {
             let explicit_point_lights = self.point_lights_explicit;
             let legacy_point_light = self.frame_uniforms.point_light;
@@ -1541,9 +1601,18 @@ impl VulkanSmokeRenderer {
                 device,
                 &resources.frame_uniform_buffer,
                 resources.frame_uniform_stride,
-                self.current_frame,
+                self.current_frame * 2,
                 &frame_bytes,
             )?;
+            if let Some(bytes) = &reflection_bytes {
+                write_frame_uniform(
+                    device,
+                    &resources.frame_uniform_buffer,
+                    resources.frame_uniform_stride,
+                    self.current_frame * 2 + 1,
+                    bytes,
+                )?;
+            }
             write_point_light_buffer(
                 device,
                 &resources.point_light_buffer,
@@ -1686,6 +1755,9 @@ impl VulkanSmokeRenderer {
                 self.textures_ref()?,
                 &self.texture_slot_indices,
                 &self.draw_range_base_pipeline_states,
+                self.draw_ranges
+                    .iter()
+                    .any(|range| range.terrain_reflection),
                 self.depth_request,
                 reuse_command_pool,
             )?,
@@ -1741,6 +1813,7 @@ impl VulkanSmokeRenderer {
             self.rebuild_draw_order();
             self.draw_order_dirty = false;
         }
+        let reflection_plane = self.active_reflection_plane();
         let device = self.device_ref()?;
         let swapchain = self.swapchain_ref()?;
         let resources = self.resources_ref()?;
@@ -1787,185 +1860,269 @@ impl VulkanSmokeRenderer {
                 height: swapchain.report.plan.extent.1,
             },
         };
-        let render_pass_info = vk::RenderPassBeginInfo::default()
-            .render_pass(resources.render_pass)
-            .framebuffer(resources.framebuffers[image_index])
-            .render_area(render_area)
-            .clear_values(&clear_values);
-        // SAFETY: All commands target live frame resources owned by this renderer.
-        unsafe {
-            device.device().cmd_begin_render_pass(
-                command_buffer,
-                &render_pass_info,
-                vk::SubpassContents::INLINE,
-            );
-            let vertex_buffers = [self.vertex_buffer_ref()?.buffer];
-            let offsets = [0_u64];
-            device
-                .device()
-                .cmd_bind_vertex_buffers(command_buffer, 0, &vertex_buffers, &offsets);
-            device.device().cmd_bind_index_buffer(
-                command_buffer,
-                self.index_buffer_ref()?.buffer,
-                0,
-                vk::IndexType::UINT32,
-            );
-            let mut viewport_depth = None;
-            for &range_index in &self.draw_order {
-                let range = self.draw_ranges.get(range_index).ok_or(
-                    VulkanSmokeRendererError::InvariantViolation {
-                        context: "stable draw order range handle",
-                    },
-                )?;
-                let texture_index = *self.draw_texture_indices.get(range_index).ok_or(
-                    VulkanSmokeRendererError::InvariantViolation {
-                        context: "stable draw texture range handle",
-                    },
-                )?;
-                let pipeline = resources.pipelines.get(&range.pipeline_key()).ok_or(
-                    VulkanSmokeRendererError::InvariantViolation {
-                        context: "static draw pipeline variant",
-                    },
-                )?;
-                device.device().cmd_bind_pipeline(
+        for reflected in [true, false] {
+            if reflected && reflection_plane.is_none() {
+                continue;
+            }
+            let framebuffer = if reflected {
+                resources.reflection.framebuffer
+            } else {
+                resources.framebuffers[image_index]
+            };
+            let render_pass_info = vk::RenderPassBeginInfo::default()
+                .render_pass(resources.render_pass)
+                .framebuffer(framebuffer)
+                .render_area(render_area)
+                .clear_values(&clear_values);
+            // SAFETY: All commands target live frame resources owned by this renderer.
+            unsafe {
+                device.device().cmd_begin_render_pass(
                     command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    *pipeline,
+                    &render_pass_info,
+                    vk::SubpassContents::INLINE,
                 );
-                let frame_offset = u32::try_from(
-                    resources
-                        .frame_uniform_stride
-                        .saturating_mul(u64::try_from(self.current_frame).unwrap_or(u64::MAX)),
-                )
-                .unwrap_or(u32::MAX);
-                let material_offset = u32::try_from(
-                    resources
-                        .material_specular_stride
-                        .saturating_mul(u64::try_from(texture_index).unwrap_or(u64::MAX)),
-                )
-                .unwrap_or(u32::MAX);
-                let point_light_offset = u32::try_from(
-                    resources
-                        .point_light_stride
-                        .saturating_mul(u64::try_from(self.current_frame).unwrap_or(u64::MAX)),
-                )
-                .unwrap_or(u32::MAX);
-                let descriptor_set = resources.descriptor_sets.get(texture_index).ok_or(
-                    VulkanSmokeRendererError::InvariantViolation {
-                        context: "static material descriptor set",
-                    },
-                )?;
+                let vertex_buffers = [self.vertex_buffer_ref()?.buffer];
+                let offsets = [0_u64];
+                device.device().cmd_bind_vertex_buffers(
+                    command_buffer,
+                    0,
+                    &vertex_buffers,
+                    &offsets,
+                );
+                device.device().cmd_bind_index_buffer(
+                    command_buffer,
+                    self.index_buffer_ref()?.buffer,
+                    0,
+                    vk::IndexType::UINT32,
+                );
                 device.device().cmd_bind_descriptor_sets(
                     command_buffer,
                     vk::PipelineBindPoint::GRAPHICS,
                     resources.pipeline_layout,
-                    0,
-                    std::slice::from_ref(descriptor_set),
-                    &[frame_offset, material_offset, point_light_offset],
-                );
-                let alpha_cutoff = range.alpha_test_cutoff().to_ne_bytes();
-                device.device().cmd_push_constants(
-                    command_buffer,
-                    resources.pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                    0,
-                    &alpha_cutoff,
-                );
-                let material_alpha = self.material_alphas.get(texture_index).ok_or(
-                    VulkanSmokeRendererError::InvariantViolation {
-                        context: "static material alpha",
-                    },
-                )?;
-                let diffuse_alpha_override = self
-                    .draw_range_diffuse_alpha_overrides
-                    .get(range_index)
-                    .ok_or(VulkanSmokeRendererError::InvariantViolation {
-                        context: "draw-range diffuse-alpha override",
-                    })?;
-                let material_alphas =
-                    draw_material_alphas(*material_alpha, *diffuse_alpha_override)
-                        .map(f32::to_ne_bytes)
-                        .concat();
-                device.device().cmd_push_constants(
-                    command_buffer,
-                    resources.pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                    4,
-                    &material_alphas,
-                );
-                let material_lighting = self.material_lighting.get(texture_index).ok_or(
-                    VulkanSmokeRendererError::InvariantViolation {
-                        context: "static material lighting",
-                    },
-                )?;
-                let material_lighting = material_lighting
-                    .iter()
-                    .flatten()
-                    .flat_map(|value| value.to_ne_bytes())
-                    .collect::<Vec<_>>();
-                device.device().cmd_push_constants(
-                    command_buffer,
-                    resources.pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                    12,
-                    &material_lighting,
-                );
-                let material_uv_transforms = self.material_uv_transforms.get(texture_index).ok_or(
-                    VulkanSmokeRendererError::InvariantViolation {
-                        context: "static material UV transforms",
-                    },
-                )?;
-                let material_uv_transforms = material_uv_transforms
-                    .iter()
-                    .flatten()
-                    .flat_map(|value| value.to_ne_bytes())
-                    .collect::<Vec<_>>();
-                device.device().cmd_push_constants(
-                    command_buffer,
-                    resources.pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                    60,
-                    &material_uv_transforms,
-                );
-                let material_mode = self.material_unlit.get(texture_index).ok_or(
-                    VulkanSmokeRendererError::InvariantViolation {
-                        context: "static material unlit flag",
-                    },
-                )?;
-                let material_mode = if range.terrain_base_only {
-                    ((*material_mode).round() as i32 | 16) as f32
-                } else {
-                    *material_mode
-                };
-                let viewport = super::swapchain_resources::draw_viewport(
-                    swapchain.report.plan.extent,
-                    material_mode,
-                );
-                let next_viewport_depth = [viewport.min_depth, viewport.max_depth];
-                if viewport_depth != Some(next_viewport_depth) {
-                    device
-                        .device()
-                        .cmd_set_viewport(command_buffer, 0, &[viewport]);
-                    viewport_depth = Some(next_viewport_depth);
-                }
-                let material_mode = [material_mode.to_ne_bytes()];
-                device.device().cmd_push_constants(
-                    command_buffer,
-                    resources.pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                    124,
-                    &material_mode.concat(),
-                );
-                device.device().cmd_draw_indexed(
-                    command_buffer,
-                    range.index_count,
                     1,
-                    range.first_index,
-                    0,
-                    0,
+                    &[resources.reflection.sets
+                        [usize::from(!reflected && reflection_plane.is_some())]],
+                    &[],
                 );
+                let mut viewport_depth = None;
+                for &range_index in &self.draw_order {
+                    let range = self.draw_ranges.get(range_index).ok_or(
+                        VulkanSmokeRendererError::InvariantViolation {
+                            context: "stable draw order range handle",
+                        },
+                    )?;
+                    let texture_index = *self.draw_texture_indices.get(range_index).ok_or(
+                        VulkanSmokeRendererError::InvariantViolation {
+                            context: "stable draw texture range handle",
+                        },
+                    )?;
+                    let mode = self.material_unlit[texture_index].round() as i32;
+                    if reflected && (range.terrain_reflection || mode & 8 != 0) {
+                        continue;
+                    }
+                    let state = if reflected {
+                        super::reflection::reflected_pipeline_state(range.pipeline_state)
+                    } else {
+                        range.pipeline_state
+                    };
+                    let pipeline = resources.pipelines.get(&state.into()).ok_or(
+                        VulkanSmokeRendererError::InvariantViolation {
+                            context: "static draw pipeline variant",
+                        },
+                    )?;
+                    device.device().cmd_bind_pipeline(
+                        command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        *pipeline,
+                    );
+                    let frame_offset = u32::try_from(
+                        resources.frame_uniform_stride.saturating_mul(
+                            u64::try_from(self.current_frame * 2 + usize::from(reflected))
+                                .unwrap_or(u64::MAX),
+                        ),
+                    )
+                    .unwrap_or(u32::MAX);
+                    let material_offset = u32::try_from(
+                        resources
+                            .material_specular_stride
+                            .saturating_mul(u64::try_from(texture_index).unwrap_or(u64::MAX)),
+                    )
+                    .unwrap_or(u32::MAX);
+                    let point_light_offset = u32::try_from(
+                        resources
+                            .point_light_stride
+                            .saturating_mul(u64::try_from(self.current_frame).unwrap_or(u64::MAX)),
+                    )
+                    .unwrap_or(u32::MAX);
+                    let descriptor_set = resources.descriptor_sets.get(texture_index).ok_or(
+                        VulkanSmokeRendererError::InvariantViolation {
+                            context: "static material descriptor set",
+                        },
+                    )?;
+                    device.device().cmd_bind_descriptor_sets(
+                        command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        resources.pipeline_layout,
+                        0,
+                        std::slice::from_ref(descriptor_set),
+                        &[frame_offset, material_offset, point_light_offset],
+                    );
+                    let alpha_cutoff = range.alpha_test_cutoff().to_ne_bytes();
+                    device.device().cmd_push_constants(
+                        command_buffer,
+                        resources.pipeline_layout,
+                        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                        0,
+                        &alpha_cutoff,
+                    );
+                    let material_alpha = self.material_alphas.get(texture_index).ok_or(
+                        VulkanSmokeRendererError::InvariantViolation {
+                            context: "static material alpha",
+                        },
+                    )?;
+                    let diffuse_alpha_override = self
+                        .draw_range_diffuse_alpha_overrides
+                        .get(range_index)
+                        .ok_or(VulkanSmokeRendererError::InvariantViolation {
+                            context: "draw-range diffuse-alpha override",
+                        })?;
+                    let material_alphas =
+                        draw_material_alphas(*material_alpha, *diffuse_alpha_override)
+                            .map(f32::to_ne_bytes)
+                            .concat();
+                    device.device().cmd_push_constants(
+                        command_buffer,
+                        resources.pipeline_layout,
+                        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                        4,
+                        &material_alphas,
+                    );
+                    let material_lighting = self.material_lighting.get(texture_index).ok_or(
+                        VulkanSmokeRendererError::InvariantViolation {
+                            context: "static material lighting",
+                        },
+                    )?;
+                    let material_lighting = material_lighting
+                        .iter()
+                        .flatten()
+                        .flat_map(|value| value.to_ne_bytes())
+                        .collect::<Vec<_>>();
+                    device.device().cmd_push_constants(
+                        command_buffer,
+                        resources.pipeline_layout,
+                        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                        12,
+                        &material_lighting,
+                    );
+                    let material_uv_transforms = self
+                        .material_uv_transforms
+                        .get(texture_index)
+                        .ok_or(VulkanSmokeRendererError::InvariantViolation {
+                            context: "static material UV transforms",
+                        })?;
+                    let material_uv_transforms = material_uv_transforms
+                        .iter()
+                        .flatten()
+                        .flat_map(|value| value.to_ne_bytes())
+                        .collect::<Vec<_>>();
+                    device.device().cmd_push_constants(
+                        command_buffer,
+                        resources.pipeline_layout,
+                        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                        60,
+                        &material_uv_transforms,
+                    );
+                    let material_mode = self.material_unlit.get(texture_index).ok_or(
+                        VulkanSmokeRendererError::InvariantViolation {
+                            context: "static material unlit flag",
+                        },
+                    )?;
+                    let material_mode = if range.terrain_base_only {
+                        ((*material_mode).round() as i32 | 16) as f32
+                    } else {
+                        *material_mode
+                    };
+                    let material_mode = (material_mode.round() as i32
+                        | if reflected { 32 } else { 0 }
+                        | if !reflected
+                            && reflection_plane.is_some()
+                            && self.reflection_planes[range_index] == reflection_plane
+                        {
+                            64
+                        } else {
+                            0
+                        }) as f32;
+                    let viewport = super::swapchain_resources::draw_viewport(
+                        swapchain.report.plan.extent,
+                        material_mode,
+                    );
+                    let next_viewport_depth = [viewport.min_depth, viewport.max_depth];
+                    if viewport_depth != Some(next_viewport_depth) {
+                        device
+                            .device()
+                            .cmd_set_viewport(command_buffer, 0, &[viewport]);
+                        viewport_depth = Some(next_viewport_depth);
+                    }
+                    let material_mode = [material_mode.to_ne_bytes()];
+                    device.device().cmd_push_constants(
+                        command_buffer,
+                        resources.pipeline_layout,
+                        vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                        124,
+                        &material_mode.concat(),
+                    );
+                    device.device().cmd_draw_indexed(
+                        command_buffer,
+                        range.index_count,
+                        1,
+                        range.first_index,
+                        0,
+                        0,
+                    );
+                }
+                device.device().cmd_end_render_pass(command_buffer);
+                if reflected {
+                    let image = resources.reflection.color.as_ref().ok_or(
+                        VulkanSmokeRendererError::InvariantViolation {
+                            context: "reflection target",
+                        },
+                    )?;
+                    let barrier = vk::ImageMemoryBarrier::default()
+                        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                        .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                        .image(image.image)
+                        .subresource_range(super::color_subresource_range(1));
+                    device.device().cmd_pipeline_barrier(
+                        command_buffer,
+                        vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                        vk::PipelineStageFlags::FRAGMENT_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[barrier],
+                    );
+                }
             }
-            device.device().cmd_end_render_pass(command_buffer);
+        }
+        // SAFETY: The main pass has completed its writes to this acquired swapchain image.
+        unsafe {
+            let barrier = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .image(resources.images[image_index])
+                .subresource_range(super::color_subresource_range(1));
+            device.device().cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
             if self.readback_enabled {
                 if let (Some(image), Some(readback)) = (
                     resources.images.get(image_index),
@@ -2028,7 +2185,7 @@ impl VulkanSmokeRenderer {
             }
         }
 
-        // SAFETY: The render pass owns the attachment layout transitions for this clear-and-present path.
+        // SAFETY: Every render pass and attachment transition has been recorded in this buffer.
         unsafe { device.device().end_command_buffer(command_buffer) }.map_err(|error| {
             VulkanSmokeRendererError::VulkanOperation {
                 context: "vkEndCommandBuffer",
@@ -2720,6 +2877,7 @@ mod tests {
                 batch_flags: 0x108,
                 pipeline_state: base_state,
                 terrain_base_only: false,
+                terrain_reflection: false,
                 alpha_test_reference: 17,
             },
             VulkanStaticDrawRange {
@@ -2730,6 +2888,7 @@ mod tests {
                 batch_flags: 0,
                 pipeline_state: LegacyPipelineState::default(),
                 terrain_base_only: false,
+                terrain_reflection: false,
                 alpha_test_reference: 0,
             },
         ];
@@ -2886,6 +3045,7 @@ mod tests {
             batch_flags: 0,
             pipeline_state: LegacyPipelineState::default(),
             terrain_base_only: false,
+            terrain_reflection: false,
             alpha_test_reference: 0,
         }];
         let mut capacities = [6];
@@ -3072,6 +3232,7 @@ mod tests {
                 batch_flags: 0,
                 pipeline_state: fparkan_render::LegacyPipelineState::default(),
                 terrain_base_only: false,
+                terrain_reflection: false,
                 alpha_test_reference: 0,
             })
             .collect::<Vec<_>>();
@@ -3096,6 +3257,7 @@ mod tests {
                 batch_flags: 0,
                 pipeline_state: fparkan_render::LegacyPipelineState::default(),
                 terrain_base_only: false,
+                terrain_reflection: false,
                 alpha_test_reference: 0,
             },
             super::super::VulkanStaticDrawRange {
@@ -3106,6 +3268,7 @@ mod tests {
                 batch_flags: 0,
                 pipeline_state: fparkan_render::LegacyPipelineState::default(),
                 terrain_base_only: false,
+                terrain_reflection: false,
                 alpha_test_reference: 0,
             },
             super::super::VulkanStaticDrawRange {
@@ -3116,6 +3279,7 @@ mod tests {
                 batch_flags: 0,
                 pipeline_state: fparkan_render::LegacyPipelineState::default(),
                 terrain_base_only: false,
+                terrain_reflection: false,
                 alpha_test_reference: 0,
             },
         ];
@@ -3140,6 +3304,7 @@ mod tests {
                 batch_flags: 0,
                 pipeline_state: fparkan_render::LegacyPipelineState::default(),
                 terrain_base_only: false,
+                terrain_reflection: false,
                 alpha_test_reference: 0,
             })
             .collect::<Vec<_>>();
@@ -3233,6 +3398,7 @@ mod tests {
                 batch_flags: 0,
                 pipeline_state: LegacyPipelineState::default(),
                 terrain_base_only: false,
+                terrain_reflection: false,
                 alpha_test_reference: 0,
             })
             .collect::<Vec<_>>();
@@ -3291,6 +3457,7 @@ mod tests {
                 batch_flags: 0,
                 pipeline_state: LegacyPipelineState::default(),
                 terrain_base_only: false,
+                terrain_reflection: false,
                 alpha_test_reference: 0,
             })
             .collect::<Vec<_>>();

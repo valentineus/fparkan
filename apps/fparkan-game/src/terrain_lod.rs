@@ -239,6 +239,7 @@ mod tests {
             lightmap_index: u8::MAX,
             batch_flags: 0,
             terrain_base_only: true,
+            terrain_reflection: false,
             pipeline_state: super::super::world_pipeline_state(
                 fparkan_render::LegacyBlendMode::Opaque,
                 fparkan_render::LegacyDepthMode::TestWrite,

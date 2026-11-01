@@ -18,6 +18,7 @@ use super::{
 };
 
 pub(super) struct VulkanSwapchainResources {
+    pub(super) reflection: super::reflection::ReflectionResources,
     pub(super) image_views: Vec<vk::ImageView>,
     pub(super) images: Vec<vk::Image>,
     pub(super) readback_buffers: Vec<VulkanAllocatedBuffer>,
@@ -146,6 +147,7 @@ pub(super) fn ensure_point_light_capacity(
 }
 
 struct PartialSwapchainResources {
+    reflection: Option<super::reflection::ReflectionResources>,
     image_views: Vec<vk::ImageView>,
     readback_buffers: Vec<VulkanAllocatedBuffer>,
     depth_attachments: Vec<VulkanDepthAttachment>,
@@ -180,6 +182,7 @@ pub(super) fn create_swapchain_resources(
     textures: &[VulkanAllocatedImage],
     texture_slot_indices: &[usize],
     base_pipeline_states: &[LegacyPipelineState],
+    reflection_enabled: bool,
     depth_request: DepthStencilSupport,
     reuse_command_pool: bool,
 ) -> Result<VulkanSwapchainResources, VulkanSmokeRendererError> {
@@ -194,6 +197,7 @@ pub(super) fn create_swapchain_resources(
         result: error,
     })?;
     let mut partial = PartialSwapchainResources {
+        reflection: None,
         image_views: create_swapchain_image_views(
             device,
             &images,
@@ -245,6 +249,14 @@ pub(super) fn create_swapchain_resources(
         };
     partial.frame_uniform_stride = frame_uniform_stride;
     partial.frame_uniform_buffer = Some(frame_uniform_buffer);
+    partial.reflection =
+        match super::reflection::ReflectionResources::new(instance, device, command_pool) {
+            Ok(reflection) => Some(reflection),
+            Err(error) => {
+                destroy_partial_swapchain_resources(device, command_pool, partial);
+                return Err(error);
+            }
+        };
     let material_count = texture_slot_indices.len() / 4;
     let (material_specular_buffer, material_specular_stride) =
         match create_material_specular_buffer(instance, device, material_count) {
@@ -288,6 +300,12 @@ pub(super) fn create_swapchain_resources(
         textures,
         texture_slot_indices,
         base_pipeline_states,
+        partial
+            .reflection
+            .as_ref()
+            .expect("reflection descriptors exist")
+            .layout,
+        reflection_enabled,
         depth_request,
         partial
             .frame_uniform_buffer
@@ -319,6 +337,24 @@ pub(super) fn create_swapchain_resources(
     partial.descriptor_pool = Some(descriptor_pool);
     partial.sampler = Some(sampler);
     partial.pipelines = pipelines;
+    if reflection_enabled {
+        if let Err(error) = partial
+            .reflection
+            .as_mut()
+            .expect("reflection descriptors exist")
+            .create_target(
+                instance,
+                device,
+                swapchain.report.plan.extent,
+                swapchain.report.plan.format.format,
+                depth_request,
+                render_pass,
+            )
+        {
+            destroy_partial_swapchain_resources(device, command_pool, partial);
+            return Err(error);
+        }
+    }
     for _ in 1..images.len() {
         match create_depth_attachment(
             instance,
@@ -394,6 +430,10 @@ pub(super) fn create_swapchain_resources(
         });
     }
     Ok(VulkanSwapchainResources {
+        reflection: partial
+            .reflection
+            .take()
+            .expect("reflection descriptors exist"),
         image_views: partial.image_views,
         images,
         readback_buffers: partial.readback_buffers,
@@ -457,6 +497,8 @@ fn create_swapchain_pipeline_bundle(
     textures: &[VulkanAllocatedImage],
     texture_slot_indices: &[usize],
     base_pipeline_states: &[LegacyPipelineState],
+    reflection_layout: vk::DescriptorSetLayout,
+    reflection_enabled: bool,
     depth_request: DepthStencilSupport,
     frame_uniform_buffer: &VulkanAllocatedBuffer,
     material_specular_buffer: &VulkanAllocatedBuffer,
@@ -498,8 +540,8 @@ fn create_swapchain_pipeline_bundle(
             unsafe { device.device().destroy_render_pass(render_pass, None) };
             destroy_depth_attachment(device, &depth_attachment);
         })?;
-    let pipeline_layout =
-        create_pipeline_layout(device, descriptor_set_layout).inspect_err(|_| {
+    let pipeline_layout = create_pipeline_layout(device, descriptor_set_layout, reflection_layout)
+        .inspect_err(|_| {
             // SAFETY: The descriptor resources and render pass were created above and are rolled back on this device.
             unsafe {
                 device.device().destroy_sampler(sampler, None);
@@ -520,6 +562,7 @@ fn create_swapchain_pipeline_bundle(
         pipeline_layout,
         extent,
         base_pipeline_states,
+        reflection_enabled,
     )
     .inspect_err(|_| {
         // SAFETY: These objects were created above on this live logical device and are destroyed on setup failure.
@@ -636,7 +679,7 @@ fn create_render_pass(
         .load_op(vk::AttachmentLoadOp::CLEAR)
         .store_op(vk::AttachmentStoreOp::STORE)
         .initial_layout(vk::ImageLayout::UNDEFINED)
-        .final_layout(vk::ImageLayout::PRESENT_SRC_KHR);
+        .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
     let color_attachment_ref = vk::AttachmentReference::default()
         .attachment(0)
         .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
@@ -661,7 +704,8 @@ fn create_render_pass(
         .src_subpass(vk::SUBPASS_EXTERNAL)
         .dst_subpass(0)
         .src_stage_mask(
-            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+            vk::PipelineStageFlags::FRAGMENT_SHADER
+                | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
                 | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
                 | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
         )
@@ -670,7 +714,11 @@ fn create_render_pass(
                 | vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
                 | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
         )
-        .src_access_mask(vk::AccessFlags::empty())
+        .src_access_mask(
+            vk::AccessFlags::SHADER_READ
+                | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        )
         .dst_access_mask(
             vk::AccessFlags::COLOR_ATTACHMENT_WRITE
                 | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
@@ -694,8 +742,9 @@ fn create_render_pass(
 fn create_pipeline_layout(
     device: &VulkanLogicalDeviceProbe,
     descriptor_set_layout: vk::DescriptorSetLayout,
+    reflection_layout: vk::DescriptorSetLayout,
 ) -> Result<vk::PipelineLayout, VulkanSmokeRendererError> {
-    let set_layouts = [descriptor_set_layout];
+    let set_layouts = [descriptor_set_layout, reflection_layout];
     // Material data occupies one 128-byte push-constant allocation shared by
     // both stages; the vertex stage also reads its specular pair from the
     // dynamic storage buffer at descriptor binding 5.  Camera data is supplied
@@ -960,12 +1009,18 @@ fn create_graphics_pipeline_cache(
     pipeline_layout: vk::PipelineLayout,
     extent: (u32, u32),
     base_pipeline_states: &[LegacyPipelineState],
+    reflection_enabled: bool,
 ) -> Result<BTreeMap<PipelineKey, vk::Pipeline>, VulkanSmokeRendererError> {
     let mut pipelines = BTreeMap::new();
     for state in base_pipeline_states
         .iter()
         .copied()
         .flat_map(super::smoke::pipeline_variants)
+        .flat_map(|state| {
+            std::iter::once(state).chain(
+                reflection_enabled.then_some(super::reflection::reflected_pipeline_state(state)),
+            )
+        })
     {
         let key = PipelineKey::from(state);
         if pipelines.contains_key(&key) {
@@ -1238,6 +1293,7 @@ pub(super) fn destroy_swapchain_resources(
     command_pool: vk::CommandPool,
     resources: VulkanSwapchainResources,
 ) {
+    drop(resources.reflection);
     // SAFETY: All handles belong to this live logical device and are destroyed during renderer teardown/recreation.
     unsafe {
         if !resources.command_buffers.is_empty() {
@@ -1303,6 +1359,7 @@ fn destroy_partial_swapchain_resources(
     command_pool: vk::CommandPool,
     partial: PartialSwapchainResources,
 ) {
+    drop(partial.reflection);
     // SAFETY: All handles in the partial bundle belong to this live logical device and are destroyed on setup failure.
     unsafe {
         if !partial.command_buffers.is_empty() {

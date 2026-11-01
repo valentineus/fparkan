@@ -437,6 +437,8 @@ pub struct VulkanStaticDrawRange {
     pub batch_flags: u16,
     /// Terrain ranges that use the native lit base-only path (face flag 0x400 clear).
     pub terrain_base_only: bool,
+    /// Terrain face flag 0x20000 requests a water reflection surface.
+    pub terrain_reflection: bool,
     /// Backend-neutral fixed-function state for this source range.
     pub pipeline_state: LegacyPipelineState,
     /// Alpha-test reference in legacy 0..=255 units; dynamic material data.
@@ -771,6 +773,7 @@ impl VulkanStaticMesh {
                 batch_flags: 0,
                 pipeline_state: LegacyPipelineState::default(),
                 terrain_base_only: false,
+                terrain_reflection: false,
                 alpha_test_reference: 0,
             }],
         }
@@ -1032,6 +1035,7 @@ mod static_mesh_tests {
                 batch_flags: 0,
                 pipeline_state: LegacyPipelineState::default(),
                 terrain_base_only: false,
+                terrain_reflection: false,
                 alpha_test_reference: 0,
             }],
         };
@@ -1063,6 +1067,7 @@ mod static_mesh_tests {
                 batch_flags: 0,
                 pipeline_state: LegacyPipelineState::default(),
                 terrain_base_only: false,
+                terrain_reflection: false,
                 alpha_test_reference: 0,
             },
             VulkanStaticDrawRange {
@@ -1073,6 +1078,7 @@ mod static_mesh_tests {
                 batch_flags: 0,
                 pipeline_state: LegacyPipelineState::default(),
                 terrain_base_only: false,
+                terrain_reflection: false,
                 alpha_test_reference: 0,
             },
         ];
@@ -1191,6 +1197,7 @@ mod static_mesh_tests {
         let base = VulkanStaticMesh::smoke_triangle().draw_ranges[0];
         let disabled = VulkanStaticDrawRange {
             terrain_base_only: false,
+            terrain_reflection: false,
             alpha_test_reference: 200,
             ..base
         };
@@ -1200,6 +1207,7 @@ mod static_mesh_tests {
                 ..LegacyPipelineState::default()
             },
             terrain_base_only: false,
+            terrain_reflection: false,
             alpha_test_reference: 128,
             ..base
         };
@@ -1211,6 +1219,7 @@ mod static_mesh_tests {
                 ..LegacyPipelineState::default()
             },
             terrain_base_only: false,
+            terrain_reflection: false,
             alpha_test_reference: 0,
             ..base
         };
@@ -1221,6 +1230,7 @@ mod static_mesh_tests {
                 ..LegacyPipelineState::default()
             },
             terrain_base_only: false,
+            terrain_reflection: false,
             alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
             ..base
         };
@@ -1501,6 +1511,7 @@ pub struct VulkanSmokeRenderer {
     pub(super) index_capacity: usize,
     pub(super) draw_range_capacities: Vec<u32>,
     pub(super) draw_ranges: Vec<VulkanStaticDrawRange>,
+    pub(super) reflection_planes: Vec<Option<f32>>,
     pub(super) draw_texture_indices: Vec<usize>,
     /// Stable range handles used when recording the native pass order.
     pub(super) draw_order: Vec<usize>,

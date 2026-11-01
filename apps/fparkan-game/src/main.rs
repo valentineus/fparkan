@@ -2760,6 +2760,7 @@ fn append_environment_range(
             batch_flags: 0,
             pipeline_state,
             terrain_base_only: false,
+            terrain_reflection: false,
             alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
         });
     Ok(EnvironmentGpuRange {
@@ -7606,7 +7607,7 @@ fn project_basement_foundation(
     let mut shadow_receivers = Vec::with_capacity(foundation.fragments.len());
 
     for (fragment_index, fragment) in foundation.fragments.iter().enumerate() {
-        let (material_index, base_only, vertices) = match fragment.source_face {
+        let (material_index, base_only, reflection, vertices) = match fragment.source_face {
             Some(face_index) => {
                 let face = terrain.faces.get(face_index).ok_or_else(|| {
                     format!("foundation fragment references unknown terrain face {face_index}")
@@ -7654,6 +7655,7 @@ fn project_basement_foundation(
                 (
                     face.material_tag,
                     fragment.surface_mask.0 & 0x400 == 0,
+                    fragment.surface_mask.0 & 0x20000 != 0,
                     vertices,
                 )
             }
@@ -7671,7 +7673,7 @@ fn project_basement_foundation(
                     fragment_uv0_words,
                     fragment_normals,
                 );
-                (0xff00, true, vertices)
+                (0xff00, true, false, vertices)
             }
         };
 
@@ -7684,7 +7686,13 @@ fn project_basement_foundation(
             mesh.indices.push(index);
         }
         if let Some(range) = mesh.draw_ranges.last_mut().filter(|range| {
-            range.material_index == material_index && range.terrain_base_only == base_only
+            range.material_index == material_index
+                && range.terrain_base_only == base_only
+                && range.terrain_reflection == reflection
+                && (!reflection
+                    || vertices[0].position[2]
+                        == mesh.vertices[mesh.indices[range.first_index as usize] as usize]
+                            .position[2])
         }) {
             range.index_count = range
                 .index_count
@@ -7699,6 +7707,7 @@ fn project_basement_foundation(
                 batch_flags: 0,
                 pipeline_state,
                 terrain_base_only: base_only,
+                terrain_reflection: reflection,
                 alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
             });
         }
@@ -8004,9 +8013,9 @@ fn static_preview_mesh_and_materials(
     let unverified_special_faces = terrain_mesh
         .faces
         .iter()
-        .filter(|face| face.flags.0 & 8 != 0)
+        .filter(|face| face.flags.0 & 8 != 0 && face.flags.0 & 0x20000 == 0)
         .count();
-    eprintln!("render_coverage terrain_face8_pipeline_unverified={unverified_special_faces} (source faces across LODs use the ordinary terrain shader; native special pass and reflection/EMBM mapping pending)");
+    eprintln!("render_coverage terrain_face8_pipeline_unverified={unverified_special_faces} (non-reflective source faces across LODs; native special-pass mapping pending)");
     let footprint_sources = mission_basement_footprints(assets, roots)?;
     let foundation = if footprint_sources.is_empty() {
         None
@@ -11208,6 +11217,7 @@ mod tests {
             batch_flags,
             pipeline_state: LegacyPipelineState::default(),
             terrain_base_only: false,
+            terrain_reflection: false,
             alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
         };
         let mesh = VulkanStaticMesh {
@@ -12467,6 +12477,7 @@ mod tests {
                 LegacyDepthMode::TestReadOnly,
             ),
             terrain_base_only: false,
+            terrain_reflection: false,
             alpha_test_reference: 0,
         };
         let mut mesh = VulkanStaticMesh {
@@ -13149,6 +13160,7 @@ mod tests {
                 LegacyDepthMode::TestReadOnly,
             ),
             terrain_base_only: false,
+            terrain_reflection: false,
             alpha_test_reference: 0,
         };
         let mut mesh = VulkanStaticMesh {
@@ -13210,6 +13222,7 @@ mod tests {
             batch_flags,
             pipeline_state: world_pipeline_state(blend, LegacyDepthMode::TestReadOnly),
             terrain_base_only: false,
+            terrain_reflection: false,
             alpha_test_reference: 0,
         };
 
@@ -13673,6 +13686,7 @@ mod tests {
                     lightmap_index: u8::MAX,
                     batch_flags: 0,
                     terrain_base_only: false,
+                    terrain_reflection: false,
                     pipeline_state: world_pipeline_state(
                         LegacyBlendMode::Opaque,
                         LegacyDepthMode::TestReadOnly,

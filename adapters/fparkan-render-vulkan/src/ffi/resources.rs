@@ -528,7 +528,7 @@ pub(super) fn create_static_texture_image(
     })
 }
 
-/// Allocates two aligned camera slots used by the dynamic frame UBO.
+/// Allocates a main and reflected view slot for each in-flight frame.
 pub(super) fn create_frame_uniform_buffer(
     instance: &VulkanInstanceProbe,
     device: &VulkanLogicalDeviceProbe,
@@ -545,7 +545,7 @@ pub(super) fn create_frame_uniform_buffer(
     )? / alignment
         * alignment;
     let size = stride
-        .checked_mul(super::VULKAN_FRAME_SLOT_COUNT as u64)
+        .checked_mul(2 * super::VULKAN_FRAME_SLOT_COUNT as u64)
         .ok_or(VulkanSmokeRendererError::InvalidStaticMesh {
             context: "frame uniform buffer size overflow",
         })?;
@@ -888,7 +888,7 @@ pub(super) fn write_frame_uniform(
         .ok_or(VulkanSmokeRendererError::InvariantViolation {
             context: "frame uniform slot offset",
         })?;
-    // SAFETY: The offset is one of the two allocated aligned slots and the
+    // SAFETY: The caller supplies an allocated, fence-safe main or reflection slot; the
     // mapped range is exactly one complete frame block.
     let mapped = unsafe {
         device.device().map_memory(
@@ -1385,7 +1385,7 @@ fn create_host_visible_buffer(
     Ok(VulkanAllocatedBuffer { buffer, memory })
 }
 
-fn find_memory_type(
+pub(super) fn find_memory_type(
     instance: &VulkanInstanceProbe,
     physical_device: vk::PhysicalDevice,
     type_bits: u32,

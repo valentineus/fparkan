@@ -11,6 +11,7 @@
 mod asset_mesh;
 mod capabilities;
 mod instance;
+mod reflection;
 mod resources;
 mod runtime;
 mod smoke;

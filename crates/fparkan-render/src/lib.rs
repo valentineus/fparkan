@@ -349,6 +349,23 @@ pub enum LegacyDepthMode {
     TestReadOnly,
 }
 
+/// Reflects world Z before a row-vector clip transform, preserving points on the plane.
+#[must_use]
+pub fn reflect_clip_from_world_about_z(matrix: [f32; 16], height: f32) -> Option<[f32; 16]> {
+    if !height.is_finite() || !matrix.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    let mut reflected = matrix;
+    for column in 0..4 {
+        reflected[8 + column] = -matrix[8 + column];
+        reflected[12 + column] = matrix[12 + column] + 2.0 * height * matrix[8 + column];
+    }
+    reflected
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(reflected)
+}
+
 /// Triangle culling behaviour represented without a graphics API type.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum LegacyCullMode {
@@ -554,6 +571,29 @@ mod tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn water_reflection_preserves_the_plane_and_reverses_height_before_projection() {
+        let matrix = [
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+        ];
+        let reflected = reflect_clip_from_world_about_z(matrix, 150.0).unwrap();
+        let project = |m: [f32; 16], p: [f32; 4]| -> [f32; 4] {
+            std::array::from_fn(|column| (0..4).map(|row| p[row] * m[row * 4 + column]).sum())
+        };
+        for z in [125.0, 150.0, 185.0] {
+            assert_eq!(
+                project(reflected, [7.0, 11.0, z, 1.0]),
+                project(matrix, [7.0, 11.0, 300.0 - z, 1.0])
+            );
+        }
+        assert_eq!(
+            reflect_clip_from_world_about_z(reflected, 150.0),
+            Some(matrix)
+        );
+        assert!(reflect_clip_from_world_about_z(matrix, f32::NAN).is_none());
+        assert!(reflect_clip_from_world_about_z([f32::MAX; 16], f32::MAX).is_none());
     }
 
     fn assert_matrix_approximately_identity(matrix: [f32; 16]) {
