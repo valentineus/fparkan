@@ -131,7 +131,6 @@ fn run(args: &[String]) -> Result<String, String> {
         .ok_or_else(|| "mission terrain is unavailable after loading".to_string())?;
     let roots = loaded_mission_object_drafts(&engine)
         .map(|drafts| &drafts[..args.preview_roots.get().min(drafts.len())])
-        .filter(|roots| !roots.is_empty())
         .ok_or_else(|| {
             "selected mission object drafts are unavailable after loading".to_string()
         })?;
@@ -8564,9 +8563,6 @@ fn static_preview_mesh_and_materials(
         dynamic_component_geometry_by_object.push(dynamic_component_geometry);
         control_animation_instances_by_object.push(control_animation_instances);
     }
-    if mesh_components == 0 {
-        return Err("selected static preview roots have no mesh-backed visual".to_string());
-    }
     let free_camera = if legacy_camera.is_none() {
         Some(FreeFlightCamera::from_mesh_and_terrain(&mesh, terrain)?)
     } else {
@@ -13163,6 +13159,35 @@ mod tests {
 
         assert_eq!(prepared, expected_missions);
         assert_eq!(environment_missions, expected_missions);
+    }
+
+    #[test]
+    #[ignore = "requires installed GOG resources; set FPARKAN_GAME_ROOT"]
+    fn gog_static_preview_accepts_terrain_without_placed_objects() {
+        let root = std::env::var_os("FPARKAN_GAME_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\GOG Games\Parkan - Iron Strategy"));
+        let path = "DATA/MAPS/41/Land.msh";
+        let bytes = std::fs::read(root.join(path)).expect("original map mesh");
+        let document = fparkan_assets::decode_nres_payload(Arc::from(bytes)).unwrap();
+        let land = fparkan_terrain_format::decode_land_msh(&document).unwrap();
+        let terrain = TerrainWorld::from_land_msh(&land).unwrap();
+        let preview = static_preview_mesh_and_materials(
+            &MissionAssets::default(),
+            &terrain,
+            &[],
+            None,
+            None,
+            None,
+            &root,
+            path,
+        )
+        .expect("terrain is a complete scene without object meshes");
+        assert_eq!(preview.mesh_components, 0);
+        assert_eq!(preview.terrain_components, 1);
+        assert!(!preview.mesh.vertices.is_empty());
+        assert!(!preview.mesh.indices.is_empty());
+        assert!(!preview.materials.is_empty());
     }
 
     #[test]
