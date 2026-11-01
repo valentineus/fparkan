@@ -373,7 +373,7 @@ impl VulkanSmokeRenderer {
         plane_heights.sort_unstable();
         plane_heights.dedup();
         if !plane_heights.is_empty() {
-            eprintln!("render_coverage planar_reflection_render_context_approx={} (native shifted window and bump UV; main-view depth range, sky/fog/FX and swapchain-sized target remain approximations; non-perspective cameras use mirror fallback)", plane_heights.len());
+            eprintln!("render_coverage planar_reflection_render_context_approx={} (native shifted window, target size and bump UV; main-view depth range and sky/fog/FX remain approximations; non-perspective cameras use mirror fallback)", plane_heights.len());
             eprintln!("render_coverage planar_reflection_other_planes_unsupported={} (nearest active plane is reflected)", plane_heights.len().saturating_sub(1));
         }
         if unsupported_nonplanar != 0 {
@@ -1874,17 +1874,27 @@ impl VulkanSmokeRenderer {
                 },
             },
         ];
-        let render_area = vk::Rect2D {
-            offset: vk::Offset2D { x: 0, y: 0 },
-            extent: vk::Extent2D {
-                width: swapchain.report.plan.extent.0,
-                height: swapchain.report.plan.extent.1,
-            },
-        };
         for reflected in [true, false] {
             if reflected && reflection_plane.is_none() {
                 continue;
             }
+            let extent = if reflected {
+                let target = resources.reflection.color.as_ref().ok_or(
+                    VulkanSmokeRendererError::InvariantViolation {
+                        context: "active reflection without a color target",
+                    },
+                )?;
+                (target.width, target.height)
+            } else {
+                swapchain.report.plan.extent
+            };
+            let render_area = vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D {
+                    width: extent.0,
+                    height: extent.1,
+                },
+            };
             let framebuffer = if reflected {
                 resources.reflection.framebuffer
             } else {
@@ -2073,10 +2083,7 @@ impl VulkanSmokeRenderer {
                         } else {
                             0
                         }) as f32;
-                    let viewport = super::swapchain_resources::draw_viewport(
-                        swapchain.report.plan.extent,
-                        material_mode,
-                    );
+                    let viewport = super::swapchain_resources::draw_viewport(extent, material_mode);
                     let next_viewport_depth = [viewport.min_depth, viewport.max_depth];
                     if viewport_depth != Some(next_viewport_depth) {
                         device

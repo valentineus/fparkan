@@ -7,6 +7,17 @@ pub const EMBM_BUMP_TILE: f32 = 100.0;
 /// Native diagonal bump matrix, without luminance modulation.
 pub const EMBM_COEFFICIENTS: [f32; 2] = [0.01, 0.01];
 
+/// Square reflection size chosen by Terrain.dll RVA 0x27FC7 from renderer dimensions.
+#[must_use]
+pub fn legacy_embm_reflection_size(extent: [u32; 2]) -> u32 {
+    let limit = extent[0].min(extent[1]).min(1024);
+    let mut side = 2;
+    while side * 2 <= limit {
+        side *= 2;
+    }
+    side
+}
+
 /// Generates the signed bytes written by Terrain.dll RVA 0x2BF50 with CW 0x007F.
 #[must_use]
 pub fn legacy_embm_bump_map() -> Vec<[i8; 2]> {
@@ -115,6 +126,24 @@ pub fn legacy_embm_reflection_clip(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reflection_size_matches_native_renderer_dimension_vectors() {
+        for (extent, expected) in [
+            ([1280, 1024], 1024),
+            ([1280, 720], 512),
+            ([800, 600], 512),
+            ([640, 480], 256),
+            ([1920, 1080], 1024),
+            ([2048, 2048], 1024),
+            ([4, 7], 4),
+            ([3, 300], 2),
+            ([1, 1], 2),
+            ([700, 700], 512),
+        ] {
+            assert_eq!(legacy_embm_reflection_size(extent), expected, "{extent:?}");
+        }
+    }
 
     #[test]
     fn shifted_camera_maps_native_water_corners_and_retains_perspective_depth() {

@@ -221,6 +221,9 @@ impl ReflectionResources {
         depth_request: fparkan_platform::DepthStencilSupport,
         render_pass: vk::RenderPass,
     ) -> Result<(), VulkanSmokeRendererError> {
+        let side = fparkan_render::water::legacy_embm_reflection_size([extent.0, extent.1]);
+        let extent = (side, side);
+        eprintln!("render_reflection target_extent={side}x{side}");
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk::Format::from_raw(format))
@@ -236,7 +239,7 @@ impl ReflectionResources {
             .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
-        // SAFETY: This target uses the validated non-zero swapchain extent and format.
+        // SAFETY: The validated swapchain format is retained; the square side is in 2..=1024.
         let image = unsafe { self.device.create_image(&info, None) }.map_err(|result| {
             VulkanSmokeRendererError::VulkanOperation {
                 context: "vkCreateImage(reflection)",
