@@ -29,8 +29,9 @@ use fparkan_fx::ambient_op3::{
 use fparkan_fx::ambient_sound::{Op2SoundCommand, Op2SoundState};
 use fparkan_fx::atmosphere::{AtmosphereFrame, TypedAtmosphere};
 use fparkan_fx::environment::{
-    decode_env_lightning_fxid, evaluate_op1_point_light_with_basis, Camera as FxCamera,
-    EnvironmentFrame, EnvironmentPrimitive, EnvironmentSystem, PrecipitationKind, ScreenBillboard,
+    decode_env_lightning_fxid, evaluate_op1_point_light_with_basis_and_jitter, Camera as FxCamera,
+    EnvironmentFrame, EnvironmentPrimitive, EnvironmentSystem, Op1JitterState, PrecipitationKind,
+    ScreenBillboard,
 };
 use fparkan_fx::fx_visual::{evaluate_f_gener_ball, evaluate_f_gener_ball_mesh};
 use fparkan_fx::op7::{
@@ -5314,6 +5315,7 @@ fn control_effect_world_from_component_pose_with_random_shift(
 
 fn update_control_point_lights(
     slots: &mut [ControlEffectSlot],
+    jitter: &mut Op1JitterState,
     component_pose_buffers: &[Vec<Option<NodePoseBuffer>>],
     component_mount_poses: &[Vec<Option<VulkanNodePose>>],
     random_samples: &HashMap<ControlEffectInstanceKey, ControlEffectFrameSample>,
@@ -5352,8 +5354,13 @@ fn update_control_point_lights(
             [matrix[0][1], matrix[1][1], matrix[2][1]],
             [matrix[0][2], matrix[1][2], matrix[2][2]],
         ];
-        let Some(frame) = evaluate_op1_point_light_with_basis(&slot.command, phase, origin, basis)
-        else {
+        let Some(frame) = evaluate_op1_point_light_with_basis_and_jitter(
+            &slot.command,
+            phase,
+            origin,
+            basis,
+            jitter,
+        ) else {
             continue;
         };
         if !frame.active || frame.light_selector != 1 {
@@ -5942,7 +5949,12 @@ fn ambient_effect_op1_supported(command: &FxCommand) -> bool {
     else {
         return false;
     };
-    command.raw_body.len() >= 132 && matches!(effect_type, 1 | 2 | 5 | 6 | 7)
+    matches!(effect_type, 1 | 2 | 5 | 6 | 7)
+        && command.raw_body.get(4..132).is_some_and(|bytes| {
+            bytes.chunks_exact(4).all(|word| {
+                f32::from_le_bytes(word.try_into().expect("four-byte Op1 field")).is_finite()
+            })
+        })
 }
 
 fn ambient_effect_pool_capacity(command: &FxCommand) -> Option<usize> {
@@ -9413,6 +9425,7 @@ fn run_static_vulkan_mode(
 }
 
 struct StaticVulkanApp {
+    op1_jitter: Op1JitterState,
     fixed_water_clock_ms: Option<u32>,
     mesh: VulkanStaticMesh,
     dynamic_vertex_start: usize,
@@ -9561,6 +9574,8 @@ impl StaticVulkanApp {
             shadow_last_evidence: ShadowFrameEvidence::default(),
             last_environment_control_clock_ms: 0,
             control_point_lights_diagnostic_reported: false,
+            // shortcut: native initialization and cross-effect RNG ordering remain for G.
+            op1_jitter: Op1JitterState::new(1, 1),
             simulation_last_tick: Instant::now(),
             live_clock_paused_for_zero_extent: false,
             simulation_elapsed: Duration::ZERO,
@@ -9616,7 +9631,7 @@ impl StaticVulkanApp {
                 })
             })
             .count();
-        eprintln!("render_coverage control_op1_jitter_unsupported={randomized_lights} (using authored color and radius; native RNG sampling pending)");
+        eprintln!("render_coverage control_op1_rng_schedule_approx={randomized_lights} (native color/radius jitter; fixed preview seeds and cross-effect RNG ordering unverified)");
         eprintln!("render_coverage control_op2_supported={} control_op2_unsupported={} (unsupported timing, backend mode or parameters are skipped)", self.control_sound_slots.len(), self.unsupported_control_sounds);
         eprintln!("render_coverage fog_pass_eligibility_approx={} (global world fog and horizon RGB; native shade-state/color verification pending)", self.world_range_indices.len());
         for &range_index in &self.world_range_indices {
@@ -10031,6 +10046,7 @@ impl StaticVulkanApp {
         );
         let control_point_lights = update_control_point_lights(
             &mut self.control_point_light_slots,
+            &mut self.op1_jitter,
             &self.component_pose_buffers,
             &self.component_mount_poses,
             &control_effect_random_samples,
@@ -13875,6 +13891,7 @@ mod tests {
     #[test]
     fn live_cpu_updates_sample_materials_effect_rng_and_environment_without_renderer() {
         let (mut app, key) = clock_test_app(None);
+        let initial_op1_jitter = app.op1_jitter;
         app.render_scene_update()
             .expect("an early redraw without a packet is a no-op");
         assert!(app.pending_scene_update.is_none());
@@ -13901,6 +13918,8 @@ mod tests {
             .vertices
             .is_empty());
         let first_random = control_random_snapshot(&app.control_effect_instance_states[&key]);
+        let first_op1_jitter = app.op1_jitter;
+        assert_ne!(first_op1_jitter, initial_op1_jitter);
         assert_eq!(first_random.3, Some(SceneSampleId::Live(0)));
         assert_ne!(first_random.0, 0);
         assert_ne!(first_random.1, 0);
@@ -13921,6 +13940,10 @@ mod tests {
             first_environment_time
         );
         assert_eq!(app.mesh.vertices, first_vertices);
+        assert_eq!(
+            app.op1_jitter, first_op1_jitter,
+            "redraw must not resample light jitter"
+        );
         assert_eq!(app.simulation_update_generation, 1);
 
         let mut next = app.sample_frame_clock();
@@ -13939,6 +13962,7 @@ mod tests {
             first_random
         );
         assert!(app.environment.as_ref().unwrap().time_seconds > first_environment_time);
+        assert_ne!(app.op1_jitter, first_op1_jitter);
         assert_eq!(
             app.pending_scene_update
                 .as_ref()
@@ -16757,6 +16781,7 @@ mod tests {
         );
         assert!(update_control_point_lights(
             &mut [inactive],
+            &mut Op1JitterState::new(1, 1),
             &poses,
             &mounts,
             &random_samples,
@@ -16773,6 +16798,7 @@ mod tests {
         );
         let lights = update_control_point_lights(
             std::slice::from_mut(&mut slot),
+            &mut Op1JitterState::new(1, 1),
             &poses,
             &mounts,
             &random_samples,
@@ -16782,7 +16808,7 @@ mod tests {
         let (light, flags) = lights[0];
         assert_eq!(light.position, [13.0, 22.0, 33.0]);
         assert_eq!(light.rgb, [0.25, 0.5, 0.75]);
-        assert_eq!(light.range, 15.0);
+        assert_eq!(light.range, 14.500397);
         assert_eq!(light.coefficients, [1.0, 0.5, 0.25]);
         assert_eq!(
             light.owner_scope, 1,

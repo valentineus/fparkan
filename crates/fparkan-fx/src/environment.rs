@@ -615,7 +615,7 @@ pub struct PointLightFrame {
     pub range: f32,
     /// Native attenuation coefficients `(a0, a1, a2)`.
     pub attenuation: [f32; 3],
-    /// Radius jitter amplitude at body offset 116; retained but not sampled yet.
+    /// Radius jitter amplitude at body offset 116 (legacy field name).
     pub effect_factor: f32,
     /// Whether the opcode 1 command is active at `command_time`.
     pub active: bool,
@@ -627,12 +627,59 @@ pub struct PointLightFrame {
 /// `command_time` is resolved by the caller; FX header duration and lifecycle
 /// remain with that caller. Native Op1 scales the radius by the transformed
 /// direction length and replaces a non-positive result with 0.01.
+/// This samples the authored curves; Control FX use
+/// [`evaluate_op1_point_light_with_basis_and_jitter`] for stochastic additions.
 #[must_use]
 pub fn evaluate_op1_point_light_with_basis(
     command: &FxCommand,
     command_time: f32,
     origin: [f32; 3],
     basis: [[f32; 3]; 3],
+) -> Option<PointLightFrame> {
+    evaluate_op1_point_light(command, command_time, origin, basis, None)
+}
+
+/// The two native streams used by Op1 color and radius jitter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Op1JitterState {
+    general: u32,
+    light: u32,
+}
+
+impl Op1JitterState {
+    #[must_use]
+    pub const fn new(general: u32, light: u32) -> Self {
+        Self { general, light }
+    }
+
+    fn sample(&mut self) -> ([u16; 4], u16) {
+        let alpha = crate::advance_native_fx_random_state(&mut self.light);
+        let blue = crate::advance_native_fx_random_state(&mut self.light);
+        let green = crate::advance_native_fx_random_state(&mut self.light);
+        let red = crate::advance_native_fx_random_state(&mut self.general);
+        let radius = crate::advance_native_fx_random_state(&mut self.light);
+        ([red, green, blue, alpha], radius)
+    }
+}
+
+/// Adds the native signed uniform jitter before transforming the light radius.
+/// Streams advance even outside the command interval and with zero amplitudes.
+pub fn evaluate_op1_point_light_with_basis_and_jitter(
+    command: &FxCommand,
+    command_time: f32,
+    origin: [f32; 3],
+    basis: [[f32; 3]; 3],
+    jitter: &mut Op1JitterState,
+) -> Option<PointLightFrame> {
+    evaluate_op1_point_light(command, command_time, origin, basis, Some(jitter))
+}
+
+fn evaluate_op1_point_light(
+    command: &FxCommand,
+    command_time: f32,
+    origin: [f32; 3],
+    basis: [[f32; 3]; 3],
+    jitter: Option<&mut Op1JitterState>,
 ) -> Option<PointLightFrame> {
     if command.opcode != FxOpcode::Op1
         || !command_time.is_finite()
@@ -653,14 +700,27 @@ pub fn evaluate_op1_point_light_with_basis(
         || FLOAT_OFFSETS
             .iter()
             .any(|&offset| read_f32(body, offset).is_none_or(|value| !value.is_finite()))
+        || (jitter.is_some()
+            && (92..108)
+                .step_by(4)
+                .any(|offset| read_f32(body, offset).is_none_or(|value| !value.is_finite())))
     {
         return None;
     }
+    let jitter = jitter.map(Op1JitterState::sample);
     let normalized_time = native_opcode1_interval(body, command_time)?;
     if !normalized_time.is_finite() {
         return None;
     }
-    let sample = sample_op1_point_light(body, normalized_time)?;
+    let mut sample = sample_op1_point_light(body, normalized_time)?;
+    if let Some((color, radius)) = jitter {
+        let centered =
+            |word, amplitude| f32::from(word) * (amplitude * (1.0 / 65_536.0)) - amplitude * 0.5;
+        for (axis, word) in color.into_iter().enumerate() {
+            sample.color[axis] += centered(word, read_f32(body, 92 + axis * 4)?);
+        }
+        sample.range += centered(radius, read_f32(body, 116)?);
+    }
     let (light_selector, native_flags) = opcode1_light_manager_mapping(sample.effect_type)?;
     if light_selector != 1 {
         return None;
@@ -681,8 +741,6 @@ pub fn evaluate_op1_point_light_with_basis(
         .map(|component| component * component)
         .sum::<f32>()
         .sqrt();
-    // shortcut: Op1 color/radius jitter is omitted; add native RNG sampling
-    // when the reported randomized Control lights are handled in phase R4.
     let scaled_range = sample.range * direction_length;
     if !direction_length.is_finite() || !scaled_range.is_finite() {
         return None;
@@ -2979,6 +3037,94 @@ mod tests {
         let sample = evaluate_op1_point_light_identity(&command, 0.5, [0.0; 3])
             .expect("native Op1 sample with a negative range");
         assert_eq!(sample.range, 0.01);
+    }
+
+    #[test]
+    fn opcode1_jitter_matches_native_color_words_and_advances_outside_the_interval() {
+        let mut command = op1_test_command(7, 0.0, 1.0);
+        let mut body = command.raw_body.to_vec();
+        for (start, values) in [
+            (60, [0.25_f32, 0.5, 0.75, 1.0]),
+            (76, [0.75, 1.0, 1.25, 1.5]),
+            (92, [0.5, 1.0, 2.0, 4.0]),
+        ] {
+            body[start..start + 16].copy_from_slice(&values.map(f32::to_le_bytes).concat());
+        }
+        body[48..60].copy_from_slice(&[1.0_f32, 0.0, 0.0].map(f32::to_le_bytes).concat());
+        body[116..120].copy_from_slice(&4.0_f32.to_le_bytes());
+        command.raw_body = Arc::from(body);
+        let mut state = super::Op1JitterState::new(0x12345678, 0x89abcdef);
+        // Effect.dll+F6E0, CW007F, identity owner; native FastProc length is approximate.
+        let native = [
+            (
+                [0x3ef7de00, 0x3f310300, 0x3f123400, 0x3ef50000],
+                0x4150a0fb,
+                0xb7debec4,
+                0xa29eea1f,
+            ),
+            (
+                [0x3f08dc80, 0x3ec15400, 0x3fd95800, 0xbe011000],
+                0x417a34ee,
+                0x91b9ca56,
+                0xa8f3b8a6,
+            ),
+            (
+                [0x3f06e480, 0x3f190600, 0x3f885b00, 0x3fcb8c00],
+                0x4181f650,
+                0x4dc90515,
+                0x2fd33350,
+            ),
+            (
+                [0x3f508380, 0x3f2a5100, 0x40099880, 0x3f8d3400],
+                0x41c31747,
+                0x610747e3,
+                0xf8ebfdc3,
+            ),
+            (
+                [0x3f2f2100, 0x3f56ed00, 0x3f0c9c00, 0x3f9e3000],
+                0x417d7bd4,
+                0xde42eec1,
+                0xb60ffd79,
+            ),
+        ];
+        for (phase, (color, radius, general, light)) in
+            [0.25, 0.5, 0.75, 1.25, 0.5].into_iter().zip(native)
+        {
+            let frame = super::evaluate_op1_point_light_with_basis_and_jitter(
+                &command,
+                phase,
+                [0.0; 3],
+                identity_basis(),
+                &mut state,
+            );
+            if phase > 1.0 {
+                assert!(frame.is_none());
+            } else {
+                let frame = frame.unwrap();
+                assert_eq!(frame.color.map(f32::to_bits), color);
+                let native_radius = f32::from_bits(radius);
+                assert!((frame.range - native_radius).abs() < native_radius * 0.00013);
+            }
+            assert_eq!((state.general, state.light), (general, light));
+        }
+    }
+
+    #[test]
+    fn opcode1_jitter_rejects_nonfinite_amplitudes_without_consuming_random_state() {
+        let mut command = op1_test_command(7, 0.0, 1.0);
+        let mut body = command.raw_body.to_vec();
+        body[92..96].copy_from_slice(&f32::NAN.to_le_bytes());
+        command.raw_body = Arc::from(body);
+        let mut state = super::Op1JitterState::new(123, 456);
+        assert!(super::evaluate_op1_point_light_with_basis_and_jitter(
+            &command,
+            0.5,
+            [0.0; 3],
+            identity_basis(),
+            &mut state
+        )
+        .is_none());
+        assert_eq!((state.general, state.light), (123, 456));
     }
 
     #[test]
