@@ -9586,6 +9586,7 @@ impl StaticVulkanApp {
             })
             .count();
         eprintln!("render_coverage portal_fade_packet_selection_approx={approximate_portals} (first indexed vertex; native CPU clipping selection pending)");
+        eprintln!("render_coverage msh_type16_colors_unsupported={} (authored vertex colors are not decoded; using white)", self.type16_present_ranges.len());
         let randomized_lights = self
             .control_point_light_slots
             .iter()
