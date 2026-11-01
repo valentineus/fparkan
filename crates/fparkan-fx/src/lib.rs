@@ -9,6 +9,7 @@
 pub mod ambient_op3;
 pub mod ambient_sound;
 pub mod atmosphere;
+pub mod clock;
 pub mod environment;
 pub mod fx_visual;
 pub mod op7;

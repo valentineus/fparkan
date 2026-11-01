@@ -91,6 +91,9 @@ Control Op1 пока использует цвет и радиус без слу
 Control Op2 воспроизводит modes 0/2; modes 1/3, body+76 и неподдержанные
 time modes/привязки считаются как `render_coverage control_op2_unsupported`.
 Управление фазой экземпляра командами Control остаётся до его подключения в runtime.
+Часы экземпляра поддерживают modes 0–3, смену режима и отложенный перезапуск;
+preview создаёт их в момент ноль. Динамический manager A8 заменён нулём
+(`control_fx_manager_flag_stub`); очередь update с шагом 50 ms ещё не подключена.
 При расширении выбранных начальных строк все пропущенные команды считаются
 в `control_fx_unsupported`, а time modes 4–17 — в `control_fx_requires_game_state`;
 причина и владелец выводятся в лог. Неразобранные FXID считаются отдельно в `control_fx_invalid_documents`.

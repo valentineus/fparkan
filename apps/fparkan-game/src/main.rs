@@ -759,9 +759,11 @@ struct ControlEffectInstanceKey {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-struct ControlEffectRandomSample {
+struct ControlEffectFrameSample {
     phase_jitter: f32,
     accumulated_shift: [f32; 3],
+    phase: Option<f32>,
+    elapsed_seconds: f32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -799,18 +801,19 @@ impl NativeFxRandom16 {
 }
 
 #[derive(Clone, Debug)]
-struct ControlEffectRandomState {
+struct ControlEffectInstanceState {
     header_flags: u32,
     phase_jitter_amplitude: f32,
     random_shift_amplitude: [f32; 3],
     phase_and_z_rng: NativeFxRandom16,
     xy_rng: NativeFxRandom16,
-    sample: ControlEffectRandomSample,
+    sample: ControlEffectFrameSample,
     last_update_id: Option<SceneSampleId>,
     last_update_clock_ms: Option<u32>,
+    clock: Option<fparkan_fx::clock::FxInstanceClock>,
 }
 
-impl ControlEffectRandomState {
+impl ControlEffectInstanceState {
     fn new(seed: u32, header_flags: u32, phase_jitter: f32, random_shift: [f32; 3]) -> Self {
         Self {
             header_flags,
@@ -818,9 +821,10 @@ impl ControlEffectRandomState {
             random_shift_amplitude: random_shift,
             phase_and_z_rng: NativeFxRandom16::new(seed ^ 0xA511_E9B3),
             xy_rng: NativeFxRandom16::new(seed ^ 0x63D8_3595),
-            sample: ControlEffectRandomSample::default(),
+            sample: ControlEffectFrameSample::default(),
             last_update_id: None,
             last_update_clock_ms: None,
+            clock: None,
         }
     }
 
@@ -829,7 +833,7 @@ impl ControlEffectRandomState {
         sample_id: SceneSampleId,
         control_clock_ms: u32,
         initial_phase: f32,
-    ) -> ControlEffectRandomSample {
+    ) -> ControlEffectFrameSample {
         // Native updates consume process-global RNG streams. The preview uses
         // a deterministic per-Control-row stream; sibling slots share one
         // sample and cadence, but native cross-row RNG ordering remains open.
@@ -5310,8 +5314,7 @@ fn update_control_point_lights(
     slots: &mut [ControlEffectSlot],
     component_pose_buffers: &[Vec<Option<NodePoseBuffer>>],
     component_mount_poses: &[Vec<Option<VulkanNodePose>>],
-    elapsed_seconds: f32,
-    random_samples: &HashMap<ControlEffectInstanceKey, ControlEffectRandomSample>,
+    random_samples: &HashMap<ControlEffectInstanceKey, ControlEffectFrameSample>,
     emit_diagnostic: bool,
 ) -> Vec<(VulkanPointLight, u32)> {
     let mut lights = Vec::new();
@@ -5323,10 +5326,10 @@ fn update_control_point_lights(
                 .copied()
                 .flatten();
         }
-        let random_sample = random_samples
-            .get(&slot.random_instance_key)
-            .copied()
-            .unwrap_or_default();
+        let Some(random_sample) = random_samples.get(&slot.random_instance_key).copied() else {
+            eprintln!("render_coverage control_fx_instance_sample_missing=1 (point light)");
+            continue;
+        };
         let Some(world_from_effect) = control_effect_world_from_component_pose_with_random_shift(
             slot,
             component_pose_buffers,
@@ -5335,13 +5338,9 @@ fn update_control_point_lights(
             continue;
         };
         slot.world_from_effect = world_from_effect;
-        let Some(phase) = ambient_effect_phase(
-            slot.time_mode,
-            slot.header_flags,
-            elapsed_seconds,
-            slot.duration_seconds,
-        )
-        .map(|phase| native_command_phase(slot.header_flags, phase, random_sample.phase_jitter)) else {
+        let Some(phase) = random_sample.phase.map(|phase| {
+            native_command_phase(slot.header_flags, phase, random_sample.phase_jitter)
+        }) else {
             continue;
         };
         let matrix = slot.world_from_effect;
@@ -5542,6 +5541,7 @@ fn append_initial_control_effect_slots(
         let duration_seconds = header.duration_seconds;
         if !duration_seconds.is_finite()
             || duration_seconds < 0.0
+            || !(duration_seconds * 1000.0).is_finite()
             || !header.phase_jitter.is_finite()
             || !header.random_shift.iter().all(|value| value.is_finite())
             || !header.scale.iter().all(|value| value.is_finite())
@@ -5550,8 +5550,7 @@ fn append_initial_control_effect_slots(
             record_skip("header_values", document.commands().len(), false, None);
             continue;
         }
-        if !matches!(header.time_mode, 0 | 1 | 2)
-            || (header.time_mode != 0 && duration_seconds <= 0.0)
+        if !matches!(header.time_mode, 0..=3) || (header.time_mode != 0 && duration_seconds <= 0.0)
         {
             *unsupported_sounds += sound_commands;
             record_skip(
@@ -6013,65 +6012,70 @@ fn control_effect_instance_seed(
     )
 }
 
-fn advance_control_effect_random_states(
-    states: &mut HashMap<ControlEffectInstanceKey, ControlEffectRandomState>,
+fn advance_control_effect_instances(
+    states: &mut HashMap<ControlEffectInstanceKey, ControlEffectInstanceState>,
     ambient_slots: &[AmbientEffectGpuSlot],
     point_light_slots: &[ControlEffectSlot],
     sound_slots: &[ControlSoundSlot],
     sample_id: SceneSampleId,
     control_clock_ms: u32,
-    elapsed_seconds: f32,
-) -> HashMap<ControlEffectInstanceKey, ControlEffectRandomSample> {
+) -> HashMap<ControlEffectInstanceKey, ControlEffectFrameSample> {
     let mut specifications = HashMap::new();
     for slot in ambient_slots {
-        let initial_phase = ambient_effect_phase(
-            slot.time_mode,
-            slot.header_flags,
-            elapsed_seconds,
-            slot.duration_seconds,
-        )
-        .map(|phase| initial_native_effect_phase(slot.header_flags, phase))
-        .unwrap_or(-1.0);
         specifications.entry(slot.random_instance_key).or_insert((
             slot.random_seed,
             slot.header_flags,
             slot.phase_jitter,
             slot.random_shift,
-            initial_phase,
+            slot.time_mode,
+            slot.duration_seconds,
         ));
     }
     for slot in point_light_slots
         .iter()
         .chain(sound_slots.iter().map(|slot| &slot.effect))
     {
-        let initial_phase = ambient_effect_phase(
-            slot.time_mode,
-            slot.header_flags,
-            elapsed_seconds,
-            slot.duration_seconds,
-        )
-        .map(|phase| initial_native_effect_phase(slot.header_flags, phase))
-        .unwrap_or(-1.0);
         specifications.entry(slot.random_instance_key).or_insert((
             slot.random_seed,
             slot.header_flags,
             slot.phase_jitter,
             slot.random_shift,
-            initial_phase,
+            slot.time_mode,
+            slot.duration_seconds,
         ));
     }
 
     specifications
         .into_iter()
         .map(
-            |(key, (seed, flags, phase_jitter, random_shift, initial_phase))| {
+            |(key, (seed, flags, phase_jitter, random_shift, mode, duration))| {
                 let state = states.entry(key).or_insert_with(|| {
-                    ControlEffectRandomState::new(seed, flags, phase_jitter, random_shift)
+                    ControlEffectInstanceState::new(seed, flags, phase_jitter, random_shift)
                 });
-                (
-                    key,
-                    state.advance(sample_id, control_clock_ms, initial_phase),
-                )
+                if state.last_update_id == Some(sample_id) {
+                    return (key, state.sample);
+                }
+                let clock = state.clock.get_or_insert_with(|| {
+                    if flags & 0x180 != 0 {
+                        eprintln!("render_coverage control_fx_manager_flag_stub=1 (preview manager A8=0; instance={key:?})");
+                    }
+                    // All static-preview instances are created at scene time zero.
+                    fparkan_fx::clock::FxInstanceClock::new(mode, flags, duration, 0.0)
+                        .expect("prepared FX clock metadata")
+                });
+                let now_ms = control_clock_ms as f32;
+                let phase = clock.update(now_ms).and_then(|()| clock.phase(now_ms, false));
+                let instance_elapsed = clock.elapsed_seconds(now_ms).unwrap_or(0.0);
+                if phase.is_none() && state.last_update_id.is_none() {
+                    eprintln!("render_coverage control_fx_clock_unsupported=1 (instance={key:?} mode={mode})");
+                }
+                let initial_phase = phase
+                    .map(|phase| initial_native_effect_phase(flags, phase))
+                    .unwrap_or(-1.0);
+                state.advance(sample_id, control_clock_ms, initial_phase);
+                state.sample.phase = phase;
+                state.sample.elapsed_seconds = instance_elapsed;
+                (key, state.sample)
             },
         )
         .collect()
@@ -6203,8 +6207,7 @@ fn update_ambient_effect_geometry(
     component_pose_buffers: &[Vec<Option<NodePoseBuffer>>],
     mesh: &mut VulkanStaticMesh,
     material_animations: &mut [MaterialAnimationBinding],
-    elapsed_seconds: f32,
-    random_samples: &HashMap<ControlEffectInstanceKey, ControlEffectRandomSample>,
+    random_samples: &HashMap<ControlEffectInstanceKey, ControlEffectFrameSample>,
     camera_world: [f32; 3],
 ) -> Result<Vec<AmbientEffectGeometryUpdate>, String> {
     let mut updates = Vec::with_capacity(slots.len());
@@ -6212,7 +6215,13 @@ fn update_ambient_effect_geometry(
         let random_sample = random_samples
             .get(&slot.random_instance_key)
             .copied()
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                format!(
+                    "Control FX instance sample missing: {:?}",
+                    slot.random_instance_key
+                )
+            })?;
+        let elapsed_seconds = random_sample.elapsed_seconds;
         let Some(world_from_effect) = ambient_effect_world_from_component_pose_with_random_shift(
             slot,
             component_pose_buffers,
@@ -6222,13 +6231,9 @@ fn update_ambient_effect_geometry(
             continue;
         };
         slot.world_from_effect = world_from_effect;
-        let Some(phase) = ambient_effect_phase(
-            slot.time_mode,
-            slot.header_flags,
-            elapsed_seconds,
-            slot.duration_seconds,
-        )
-        .map(|phase| native_command_phase(slot.header_flags, phase, random_sample.phase_jitter)) else {
+        let Some(phase) = random_sample.phase.map(|phase| {
+            native_command_phase(slot.header_flags, phase, random_sample.phase_jitter)
+        }) else {
             deactivate_ambient_effect_slot(slot, material_animations, &mut updates)?;
             continue;
         };
@@ -6949,42 +6954,19 @@ fn fx_material_speed_diagnostic(
     };
 }
 
+#[cfg(test)]
 fn ambient_effect_phase(
     time_mode: u32,
     header_flags: u32,
     elapsed_seconds: f32,
     duration_seconds: f32,
 ) -> Option<f32> {
-    if !elapsed_seconds.is_finite()
-        || elapsed_seconds < 0.0
-        || !duration_seconds.is_finite()
-        || duration_seconds < 0.0
-    {
+    if !elapsed_seconds.is_finite() || elapsed_seconds < 0.0 {
         return None;
     }
-    let mut phase = match time_mode {
-        0 => 0.0,
-        // The native phase stays raw through the optional 0x200/0x20
-        // transforms; the command-level 0x8120 path clamps only afterward.
-        1 if duration_seconds > 0.0 => elapsed_seconds / duration_seconds,
-        2 if duration_seconds > 0.0 => {
-            elapsed_seconds.rem_euclid(duration_seconds) / duration_seconds
-        }
-        _ => return None,
-    };
-    if header_flags & 0x200 != 0 && duration_seconds > 0.0 {
-        phase *= elapsed_seconds / duration_seconds;
-    }
-    if header_flags & 0x20 != 0 {
-        phase = if phase >= 0.5 {
-            (1.0 - phase) * 2.0
-        } else {
-            phase * 2.0
-        };
-    }
-    Some(phase)
+    fparkan_fx::clock::FxInstanceClock::new(time_mode, header_flags, duration_seconds, 0.0)?
+        .phase(elapsed_seconds * 1000.0, false)
 }
-
 fn rotate_unit_vector(value: [f32; 3], rotation: [f32; 4]) -> [f32; 3] {
     let [x, y, z, w] = rotation;
     let tx = 2.0 * (y * value[2] - z * value[1]);
@@ -9422,7 +9404,7 @@ struct StaticVulkanApp {
     control_point_light_slots: Vec<ControlEffectSlot>,
     control_sound_slots: Vec<ControlSoundSlot>,
     unsupported_control_sounds: usize,
-    control_effect_random_states: HashMap<ControlEffectInstanceKey, ControlEffectRandomState>,
+    control_effect_instance_states: HashMap<ControlEffectInstanceKey, ControlEffectInstanceState>,
     component_pose_buffers: Vec<Vec<Option<NodePoseBuffer>>>,
     component_mount_poses: Vec<Vec<Option<VulkanNodePose>>>,
     dynamic_component_geometry: Vec<Vec<Option<DynamicComponentGeometry>>>,
@@ -9530,7 +9512,7 @@ impl StaticVulkanApp {
             control_point_light_slots: preview.control_point_light_slots,
             control_sound_slots: preview.control_sound_slots,
             unsupported_control_sounds: preview.unsupported_control_sounds,
-            control_effect_random_states: HashMap::new(),
+            control_effect_instance_states: HashMap::new(),
             component_pose_buffers: preview.component_pose_buffers,
             component_mount_poses: preview.component_mount_poses,
             dynamic_component_geometry: preview.dynamic_component_geometry,
@@ -10018,20 +10000,18 @@ impl StaticVulkanApp {
                     .flatten();
             }
         }
-        let control_effect_random_samples = advance_control_effect_random_states(
-            &mut self.control_effect_random_states,
+        let control_effect_random_samples = advance_control_effect_instances(
+            &mut self.control_effect_instance_states,
             &self.ambient_effect_slots,
             &self.control_point_light_slots,
             &self.control_sound_slots,
             clock.id,
             control_clock_ms,
-            effect_elapsed_seconds,
         );
         let control_point_lights = update_control_point_lights(
             &mut self.control_point_light_slots,
             &self.component_pose_buffers,
             &self.component_mount_poses,
-            effect_elapsed_seconds,
             &control_effect_random_samples,
             std::env::var_os("FPARKAN_CONTROL_POINT_LIGHT_DIAGNOSTIC").is_some()
                 && !self.control_point_lights_diagnostic_reported
@@ -10045,7 +10025,6 @@ impl StaticVulkanApp {
             &self.component_pose_buffers,
             &mut self.mesh,
             &mut self.material_animations,
-            effect_elapsed_seconds,
             &control_effect_random_samples,
             self.view_camera.position,
         )?;
@@ -10088,13 +10067,7 @@ impl StaticVulkanApp {
                         .get(&slot.random_instance_key)
                         .copied()
                         .unwrap_or_default();
-                    let phase = ambient_effect_phase(
-                        slot.time_mode,
-                        slot.header_flags,
-                        effect_elapsed_seconds,
-                        slot.duration_seconds,
-                    )
-                    .map(|phase| {
+                    let phase = random_sample.phase.map(|phase| {
                         native_command_phase(slot.header_flags, phase, random_sample.phase_jitter)
                     });
                     let evaluated = phase.and_then(|phase| {
@@ -10103,7 +10076,7 @@ impl StaticVulkanApp {
                             slot.command_index,
                             &slot.world_from_effect,
                             phase,
-                            effect_elapsed_seconds,
+                            random_sample.elapsed_seconds,
                             self.view_camera.position,
                         )
                     });
@@ -10234,13 +10207,9 @@ impl StaticVulkanApp {
                 ) else {
                     continue;
                 };
-                let Some(phase) = ambient_effect_phase(
-                    slot.time_mode,
-                    slot.header_flags,
-                    effect_elapsed_seconds,
-                    slot.duration_seconds,
-                )
-                .map(|phase| native_command_phase(slot.header_flags, phase, random.phase_jitter)) else {
+                let Some(phase) = random.phase.map(|phase| {
+                    native_command_phase(slot.header_flags, phase, random.phase_jitter)
+                }) else {
                     continue;
                 };
                 if let Some(event) = sound.command.update(
@@ -13826,11 +13795,11 @@ mod tests {
     }
 
     fn control_random_snapshot(
-        state: &ControlEffectRandomState,
+        state: &ControlEffectInstanceState,
     ) -> (
         u32,
         u32,
-        ControlEffectRandomSample,
+        ControlEffectFrameSample,
         Option<SceneSampleId>,
         Option<u32>,
     ) {
@@ -13902,7 +13871,7 @@ mod tests {
             .sky_mesh
             .vertices
             .is_empty());
-        let first_random = control_random_snapshot(&app.control_effect_random_states[&key]);
+        let first_random = control_random_snapshot(&app.control_effect_instance_states[&key]);
         assert_eq!(first_random.3, Some(SceneSampleId::Live(0)));
         assert_ne!(first_random.0, 0);
         assert_ne!(first_random.1, 0);
@@ -13915,7 +13884,7 @@ mod tests {
                 .expect("renderer-free redraw does not sample simulation state");
         }
         assert_eq!(
-            control_random_snapshot(&app.control_effect_random_states[&key]),
+            control_random_snapshot(&app.control_effect_instance_states[&key]),
             first_random
         );
         assert_eq!(
@@ -13937,7 +13906,7 @@ mod tests {
             SceneSampleId::Live(1)
         );
         assert_ne!(
-            control_random_snapshot(&app.control_effect_random_states[&key]),
+            control_random_snapshot(&app.control_effect_instance_states[&key]),
             first_random
         );
         assert!(app.environment.as_ref().unwrap().time_seconds > first_environment_time);
@@ -14034,7 +14003,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .environment_frame = first_environment_frame.clone();
-        let first_random = control_random_snapshot(&app.control_effect_random_states[&key]);
+        let first_random = control_random_snapshot(&app.control_effect_instance_states[&key]);
         let first_environment_time = app.environment.as_ref().unwrap().time_seconds;
         let first_environment_system_time =
             app.environment.as_ref().unwrap().environment.time_seconds();
@@ -14139,7 +14108,7 @@ mod tests {
         }
         assert!(reprojected_counts.iter().all(|count| *count >= 17));
         assert_eq!(
-            control_random_snapshot(&app.control_effect_random_states[&key]),
+            control_random_snapshot(&app.control_effect_instance_states[&key]),
             first_random
         );
         assert_eq!(
@@ -14197,7 +14166,7 @@ mod tests {
             .clone();
         let first_material_phase = first_frame.material_update.active_materials[&0].phase_index;
         let first_environment_time = app.environment.as_ref().unwrap().time_seconds;
-        let first_random = control_random_snapshot(&app.control_effect_random_states[&key]);
+        let first_random = control_random_snapshot(&app.control_effect_instance_states[&key]);
         let first_vertices = app.mesh.vertices.clone();
         assert_eq!(first_material_phase, 0);
         assert_eq!(first_random.3, Some(SceneSampleId::Replay(0)));
@@ -14238,7 +14207,7 @@ mod tests {
             0
         );
         assert_eq!(
-            control_random_snapshot(&app.control_effect_random_states[&key]),
+            control_random_snapshot(&app.control_effect_instance_states[&key]),
             first_random
         );
         assert_eq!(
@@ -14272,7 +14241,7 @@ mod tests {
             (app.environment.as_ref().unwrap().time_seconds - first_environment_time - 0.5).abs()
                 < 1.0e-6
         );
-        let next_random = control_random_snapshot(&app.control_effect_random_states[&key]);
+        let next_random = control_random_snapshot(&app.control_effect_instance_states[&key]);
         assert_eq!(next_random.3, Some(SceneSampleId::Replay(1)));
         assert_eq!(next_random.4, Some(500));
         assert_ne!(next_random, first_random);
@@ -14308,7 +14277,7 @@ mod tests {
             next_environment_frame
         );
         assert_eq!(
-            control_random_snapshot(&app.control_effect_random_states[&key]),
+            control_random_snapshot(&app.control_effect_instance_states[&key]),
             next_random
         );
         assert_eq!(
@@ -16622,7 +16591,7 @@ mod tests {
         assert_eq!(ambient_effect_phase(2, 0, 2.25, 2.0), Some(0.125));
         assert_eq!(ambient_effect_phase(1, 0, 2.0, 2.0), Some(1.0));
         assert_eq!(ambient_effect_phase(0, 0, 0.5, 0.0), Some(0.0));
-        assert_eq!(ambient_effect_phase(3, 0, 0.5, 2.0), None);
+        assert_eq!(ambient_effect_phase(3, 0, 0.5, 2.0), Some(0.75));
         assert_eq!(ambient_effect_phase(2, 0x20, 0.5, 1.0), Some(1.0));
         assert_eq!(ambient_effect_phase(2, 0x20, 0.75, 1.0), Some(0.5));
         assert_eq!(ambient_effect_phase(1, 0x200, 0.5, 1.0), Some(0.25));
@@ -16747,21 +16716,35 @@ mod tests {
         let mounts = vec![vec![None]];
 
         let inactive = slot.clone();
-        let random_samples = HashMap::new();
+        let mut instance_states = HashMap::new();
+        let random_samples = advance_control_effect_instances(
+            &mut instance_states,
+            &[],
+            std::slice::from_ref(&slot),
+            &[],
+            SceneSampleId::Replay(1),
+            250,
+        );
         assert!(update_control_point_lights(
             &mut [inactive],
             &poses,
             &mounts,
-            0.25,
             &random_samples,
             false,
         )
         .is_empty());
+        let random_samples = advance_control_effect_instances(
+            &mut instance_states,
+            &[],
+            std::slice::from_ref(&slot),
+            &[],
+            SceneSampleId::Replay(2),
+            750,
+        );
         let lights = update_control_point_lights(
             std::slice::from_mut(&mut slot),
             &poses,
             &mounts,
-            0.75,
             &random_samples,
             false,
         );
@@ -16787,67 +16770,90 @@ mod tests {
         slot.random_shift = [2.0, 4.0, 6.0];
         let sibling_slots = [slot.clone(), slot.clone()];
         let mut states = HashMap::new();
-        let first = advance_control_effect_random_states(
+        let first = advance_control_effect_instances(
             &mut states,
             &[],
             &sibling_slots,
             &[],
             SceneSampleId::Replay(7),
-            150,
-            1.5,
+            1500,
         );
         assert_eq!(first.len(), 1);
         let key = slot.random_instance_key;
         let first_sample = first[&key];
         assert_eq!(first_sample.phase_jitter, 0.0, "the -1 phase skips jitter");
         assert_ne!(first_sample.accumulated_shift, [0.0; 3]);
-        let mut expected_state = ControlEffectRandomState::new(
+        let mut expected_state = ControlEffectInstanceState::new(
             slot.random_seed,
             slot.header_flags,
             slot.phase_jitter,
             slot.random_shift,
         );
+        let expected = expected_state.advance(SceneSampleId::Replay(7), 1500, -1.0);
+        assert_eq!(first_sample.phase_jitter, expected.phase_jitter);
+        assert_eq!(first_sample.accumulated_shift, expected.accumulated_shift);
+        assert_eq!(first_sample.phase, Some(-1.0));
+        assert!((first_sample.elapsed_seconds - 1.5).abs() < 1e-6);
         assert_eq!(
-            first_sample,
-            expected_state.advance(SceneSampleId::Replay(7), 150, -1.0)
-        );
-        assert_eq!(
-            advance_control_effect_random_states(
+            advance_control_effect_instances(
                 &mut states,
                 &[],
                 &sibling_slots,
                 &[],
                 SceneSampleId::Replay(7),
-                150,
-                1.5,
+                1500,
             )[&key],
             first_sample,
             "a repeated read of the same captured update reuses the shared sample"
         );
-        let second = advance_control_effect_random_states(
+        let second = advance_control_effect_instances(
             &mut states,
             &[],
             &sibling_slots,
             &[],
             SceneSampleId::Replay(8),
-            200,
-            0.5,
+            500,
         );
-        assert_eq!(
-            second[&key],
-            expected_state.advance(SceneSampleId::Replay(8), 200, 1.0)
-        );
+        let expected = expected_state.advance(SceneSampleId::Replay(8), 500, 1.0);
+        assert_eq!(second[&key].phase_jitter, expected.phase_jitter);
+        assert_eq!(second[&key].accumulated_shift, expected.accumulated_shift);
+        assert_eq!(second[&key].phase, Some(1.0));
+        assert_eq!(second[&key].elapsed_seconds, 0.5);
         assert_ne!(second[&key].phase_jitter, first_sample.phase_jitter);
         assert_ne!(
             second[&key].accumulated_shift,
             first_sample.accumulated_shift
         );
-        assert_eq!(states[&key].last_update_clock_ms, Some(200));
+        assert_eq!(states[&key].last_update_clock_ms, Some(500));
+
+        let clock = states.get_mut(&key).unwrap().clock.as_mut().unwrap();
+        clock.set_time(4000.0, 1).unwrap();
+        clock.request_restart();
+        let later = advance_control_effect_instances(
+            &mut states,
+            &[],
+            &sibling_slots,
+            &[],
+            SceneSampleId::Replay(9),
+            4500,
+        );
+        assert_eq!(later[&key].phase, Some(1.0));
+        assert_eq!(later[&key].elapsed_seconds, 0.5);
+        let restarted = advance_control_effect_instances(
+            &mut states,
+            &[],
+            &sibling_slots,
+            &[],
+            SceneSampleId::Replay(10),
+            6500,
+        );
+        assert_eq!(restarted[&key].phase, Some(0.0));
+        assert_eq!(restarted[&key].elapsed_seconds, 0.0);
 
         let negative_non_sentinel =
             ambient_effect_phase(1, 0x220, 1.5, 1.0).expect("post-duration transformed phase");
         assert_eq!(negative_non_sentinel, -2.5);
-        let mut negative_state = ControlEffectRandomState::new(
+        let mut negative_state = ControlEffectInstanceState::new(
             slot.random_seed,
             0x229,
             slot.phase_jitter,
