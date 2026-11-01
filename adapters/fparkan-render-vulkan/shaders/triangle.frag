@@ -75,7 +75,9 @@ void main() {
     if ((mode & 32) != 0 && (mode & 4) == 0 && in_world_position.z < frame.camera_position.w) {
         discard;
     }
-    if ((mode & 64) != 0) {
+    vec2 base_uv = vec2(material.base_page_x, material.base_page_y)
+        + in_uv * vec2(material.base_page_w, material.base_page_h);
+    if ((mode & (64 | 256)) != 0) {
         vec2 reflection_uv = gl_FragCoord.xy / vec2(textureSize(reflection_color, 0));
         vec2 span = frame.embm_bounds.zw - frame.embm_bounds.xy;
         vec2 plane_uv = vec2(1.0) - (in_world_position.yx - frame.embm_bounds.yx) / span.yx;
@@ -92,15 +94,16 @@ void main() {
                 reflection_uv = displaced_clip.xy / displaced_clip.w * 0.5 + 0.5;
             }
         }
-        vec3 rgb = texture(reflection_color, reflection_uv).rgb * in_base_diffuse + in_base_specular;
+        vec3 water_color = (mode & 256) != 0
+            ? texture(base_color, base_uv).rgb
+            : texture(reflection_color, reflection_uv).rgb;
+        vec3 rgb = water_color * in_base_diffuse + in_base_specular;
         out_color = vec4(mix(rgb * in_color, frame.fog_color.rgb, in_fog_factor), material.diffuse_alpha);
         if (out_color.a < material.alpha_cutoff) {
             discard;
         }
         return;
     }
-    vec2 base_uv = vec2(material.base_page_x, material.base_page_y)
-        + in_uv * vec2(material.base_page_w, material.base_page_h);
     vec2 detail_uv = vec2(material.detail_page_x, material.detail_page_y)
         + in_detail_uv * vec2(material.detail_page_w, material.detail_page_h);
     vec2 overlay_uv = vec2(material.overlay_page_x, material.overlay_page_y)

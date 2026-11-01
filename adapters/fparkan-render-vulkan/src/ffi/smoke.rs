@@ -1936,7 +1936,16 @@ impl VulkanSmokeRenderer {
                     &[],
                 );
                 let mut viewport_depth = None;
-                for &range_index in &self.draw_order {
+                // Native reflection queues the translucent water after the reflected world.
+                let draw_order =
+                    self.draw_order
+                        .iter()
+                        .copied()
+                        .filter(|&index| !reflected || !self.draw_ranges[index].terrain_reflection)
+                        .chain(self.draw_order.iter().copied().filter(|&index| {
+                            reflected && self.draw_ranges[index].terrain_reflection
+                        }));
+                for range_index in draw_order {
                     let range = self.draw_ranges.get(range_index).ok_or(
                         VulkanSmokeRendererError::InvariantViolation {
                             context: "stable draw order range handle",
@@ -1948,11 +1957,17 @@ impl VulkanSmokeRenderer {
                         },
                     )?;
                     let mode = self.material_unlit[texture_index].round() as i32;
-                    if reflected && (range.terrain_reflection || mode & 8 != 0) {
+                    if reflected && mode & 8 != 0 {
                         continue;
                     }
                     let state = if reflected {
-                        super::reflection::reflected_pipeline_state(range.pipeline_state)
+                        let state =
+                            super::reflection::reflected_pipeline_state(range.pipeline_state);
+                        if range.terrain_reflection {
+                            fparkan_render::water::legacy_reflected_water_pipeline(state)
+                        } else {
+                            state
+                        }
                     } else {
                         range.pipeline_state
                     };
@@ -1998,7 +2013,12 @@ impl VulkanSmokeRenderer {
                         std::slice::from_ref(descriptor_set),
                         &[frame_offset, material_offset, point_light_offset],
                     );
-                    let alpha_cutoff = range.alpha_test_cutoff().to_ne_bytes();
+                    let alpha_cutoff = if state.alpha_test {
+                        f32::from(range.alpha_test_reference) / 255.0
+                    } else {
+                        0.0
+                    }
+                    .to_ne_bytes();
                     device.device().cmd_push_constants(
                         command_buffer,
                         resources.pipeline_layout,
@@ -2017,8 +2037,13 @@ impl VulkanSmokeRenderer {
                         .ok_or(VulkanSmokeRendererError::InvariantViolation {
                             context: "draw-range diffuse-alpha override",
                         })?;
+                    let diffuse_alpha_override = if reflected && range.terrain_reflection {
+                        Some(fparkan_render::water::REFLECTED_WATER_ALPHA)
+                    } else {
+                        *diffuse_alpha_override
+                    };
                     let material_alphas =
-                        draw_material_alphas(*material_alpha, *diffuse_alpha_override)
+                        draw_material_alphas(*material_alpha, diffuse_alpha_override)
                             .map(f32::to_ne_bytes)
                             .concat();
                     device.device().cmd_push_constants(
@@ -2075,6 +2100,11 @@ impl VulkanSmokeRenderer {
                     };
                     let material_mode = (material_mode.round() as i32
                         | if reflected { 32 } else { 0 }
+                        | if reflected && range.terrain_reflection {
+                            256
+                        } else {
+                            0
+                        }
                         | if !reflected
                             && reflection_plane.is_some()
                             && self.reflection_planes[range_index] == reflection_plane

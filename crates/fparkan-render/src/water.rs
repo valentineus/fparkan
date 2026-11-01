@@ -7,6 +7,21 @@ pub const EMBM_BUMP_TILE: f32 = 100.0;
 /// Native diagonal bump matrix, without luminance modulation.
 pub const EMBM_COEFFICIENTS: [f32; 2] = [0.01, 0.01];
 
+/// Terrain draws ordinary textured water into its reflection with this alpha.
+pub const REFLECTED_WATER_ALPHA: f32 = 0.1;
+
+/// Native packet category 4 enables source-alpha blending without changing depth.
+#[must_use]
+pub fn legacy_reflected_water_pipeline(
+    state: crate::LegacyPipelineState,
+) -> crate::LegacyPipelineState {
+    crate::LegacyPipelineState {
+        blend: crate::LegacyBlendMode::SourceAlpha,
+        alpha_test: true,
+        ..state
+    }
+}
+
 /// Square reflection size chosen by Terrain.dll RVA 0x27FC7 from renderer dimensions.
 #[must_use]
 pub fn legacy_embm_reflection_size(extent: [u32; 2]) -> u32 {
@@ -126,6 +141,28 @@ pub fn legacy_embm_reflection_clip(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reflected_water_blends_material_alpha_and_preserves_depth_and_cull() {
+        use crate::{LegacyBlendMode, LegacyCullMode, LegacyDepthMode, LegacyPipelineState};
+        for depth in [
+            LegacyDepthMode::Disabled,
+            LegacyDepthMode::TestWrite,
+            LegacyDepthMode::TestReadOnly,
+        ] {
+            let original = LegacyPipelineState {
+                depth,
+                cull: LegacyCullMode::FrontFace,
+                ..LegacyPipelineState::default()
+            };
+            let fallback = legacy_reflected_water_pipeline(original);
+            assert_eq!(fallback.blend, LegacyBlendMode::SourceAlpha);
+            assert!(fallback.alpha_test);
+            assert_eq!(fallback.depth, original.depth);
+            assert_eq!(fallback.cull, original.cull);
+        }
+        assert_eq!(REFLECTED_WATER_ALPHA.to_bits(), 0x3dcc_cccd);
+    }
 
     #[test]
     fn reflection_size_matches_native_renderer_dimension_vectors() {
