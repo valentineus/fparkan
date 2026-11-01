@@ -118,7 +118,7 @@ function Save-BgraPngToStream {
     $bitmap = New-Object System.Drawing.Bitmap(
         $Width,
         $Height,
-        [System.Drawing.Imaging.PixelFormat]::Format32bppArgb
+        [System.Drawing.Imaging.PixelFormat]::Format32bppRgb
     )
     $rectangle = New-Object System.Drawing.Rectangle(0, 0, $Width, $Height)
     $bitmapData = $null
@@ -126,7 +126,7 @@ function Save-BgraPngToStream {
         $bitmapData = $bitmap.LockBits(
             $rectangle,
             [System.Drawing.Imaging.ImageLockMode]::WriteOnly,
-            [System.Drawing.Imaging.PixelFormat]::Format32bppArgb
+            [System.Drawing.Imaging.PixelFormat]::Format32bppRgb
         )
 
         $rowBytes = $Width * 4
@@ -201,12 +201,12 @@ function Get-CameraExtent {
 
 function Invoke-SelfTest {
     $rgba = [byte[]]@(
-        255, 0, 0, 255,  0, 255, 0, 255,
-        0, 0, 255, 255,  255, 255, 255, 255
+        255, 0, 0, 0,  0, 255, 0, 64,
+        0, 0, 255, 128,  255, 255, 255, 255
     )
     $expectedBgra = [byte[]]@(
-        0, 0, 255, 255,  0, 255, 0, 255,
-        255, 0, 0, 255,  255, 255, 255, 255
+        0, 0, 255, 0,  0, 255, 0, 64,
+        255, 0, 0, 128,  255, 255, 255, 255
     )
 
     $rgbaResult = Convert-ReadbackToBgra -Source $rgba -Format 37 -Width 2 -Height 2
@@ -303,7 +303,7 @@ function Invoke-SelfTest {
         $stream.Dispose()
     }
 
-    'Self-check passed (2x2 RGBA/BGRA PNG, byte-length/64 MiB limits, viewport-coordinate bounds, and cropped pixel_capture bounds).'
+    'Self-check passed (opaque 2x2 RGBA/BGRA PNG, byte-length/64 MiB limits, viewport-coordinate bounds, and cropped pixel_capture bounds).'
 }
 
 if ($SelfTest) {

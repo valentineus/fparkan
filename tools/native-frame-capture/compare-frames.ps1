@@ -41,7 +41,21 @@ if ($SelfTest) {
         try { Get-MeanRgb $test ([System.Drawing.Rectangle]::new(1, 0, 2, 1)) | Out-Null }
         catch { $rejected = $true }
         if (-not $rejected) { throw 'Out-of-bounds region was accepted.' }
-        Write-Output 'self-test: exact region RGB means and bounds rejection OK'
+        $test.SetPixel(0, 0, [System.Drawing.Color]::FromArgb(0, 31, 16, 24))
+        $test.SetPixel(1, 0, [System.Drawing.Color]::FromArgb(64, 31, 16, 24))
+        $opaque = $test.Clone([System.Drawing.Rectangle]::new(0, 0, 2, 1), [System.Drawing.Imaging.PixelFormat]::Format32bppRgb)
+        $pair = [System.Drawing.Bitmap]::new(2, 1)
+        $graphics = [System.Drawing.Graphics]::FromImage($pair)
+        try {
+            $graphics.Clear([System.Drawing.Color]::Black)
+            $graphics.DrawImageUnscaled($opaque, 0, 0)
+            foreach ($x in @(0, 1)) {
+                if ($pair.GetPixel($x, 0).ToArgb() -ne [System.Drawing.Color]::FromArgb(31, 16, 24).ToArgb()) {
+                    throw 'Comparison applied framebuffer alpha to stored RGB.'
+                }
+            }
+        } finally { $graphics.Dispose(); $pair.Dispose(); $opaque.Dispose() }
+        Write-Output 'self-test: exact region RGB means, opaque presentation and bounds rejection OK'
     } finally { $test.Dispose() }
     return
 }
@@ -63,19 +77,21 @@ foreach ($value in $viewport) {
 }
 $crop = [System.Drawing.Rectangle]::new($viewport[0], $viewport[1], $viewport[2] - $viewport[0], $viewport[3] - $viewport[1])
 $native = [System.Drawing.Bitmap]::new((Resolve-Path -LiteralPath $NativePng).Path)
-$viewer = $nativeCrop = $pair = $graphics = $null
+$viewer = $viewerOpaque = $nativeCrop = $pair = $graphics = $null
 try {
     $viewer = [System.Drawing.Bitmap]::new((Resolve-Path -LiteralPath $ViewerPng).Path)
     if ($crop.Width -le 0 -or $crop.Height -le 0 -or $crop.Right -gt $native.Width -or $crop.Bottom -gt $native.Height -or
         $viewer.Width -ne $crop.Width -or $viewer.Height -ne $crop.Height) {
         throw 'Native crop and viewer dimensions must match without scaling.'
     }
-    $nativeCrop = $native.Clone($crop, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    # Captured frames are opaque presentations; framebuffer alpha is not PNG opacity.
+    $nativeCrop = $native.Clone($crop, [System.Drawing.Imaging.PixelFormat]::Format32bppRgb)
+    $viewerOpaque = $viewer.Clone([System.Drawing.Rectangle]::new(0, 0, $viewer.Width, $viewer.Height), [System.Drawing.Imaging.PixelFormat]::Format32bppRgb)
     $pair = [System.Drawing.Bitmap]::new($viewer.Width * 2, $viewer.Height + 24)
     $graphics = [System.Drawing.Graphics]::FromImage($pair)
     $graphics.Clear([System.Drawing.Color]::Black)
     $graphics.DrawImageUnscaled($nativeCrop, 0, 24)
-    $graphics.DrawImageUnscaled($viewer, $viewer.Width, 24)
+    $graphics.DrawImageUnscaled($viewerOpaque, $viewer.Width, 24)
     $font = [System.Drawing.SystemFonts]::DefaultFont
     $graphics.DrawString('Original', $font, [System.Drawing.Brushes]::White, 4, 4)
     $graphics.DrawString('FParkan', $font, [System.Drawing.Brushes]::White, $viewer.Width + 4, 4)
@@ -100,7 +116,7 @@ try {
         ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
     Write-Output "Wrote $pngPath and $jsonPath"
 } finally {
-    foreach ($resource in @($graphics, $pair, $nativeCrop, $viewer, $native)) {
+    foreach ($resource in @($graphics, $pair, $nativeCrop, $viewerOpaque, $viewer, $native)) {
         if ($null -ne $resource) { $resource.Dispose() }
     }
 }

@@ -117,6 +117,12 @@ the verified value for the run above, not a universal surface format. The
 converter uses the installed `System.Drawing` PNG encoder and adds no package
 dependency.
 
+PNG exports treat the captured frame as opaque and preserve its stored RGB.
+Framebuffer alpha is a rendering result, not image transparency; applying it
+again when displaying the PNG would darken surfaces a second time. Raw files
+retain all four original channels. The comparison script also ignores alpha
+in older PNG exports, without changing the measured RGB values.
+
 ## Сравнение областей кадра
 
 `compare-frames.ps1` собирает пару «оригинал / FParkan» без масштабирования и
