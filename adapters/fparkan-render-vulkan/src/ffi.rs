@@ -11,6 +11,7 @@
 mod asset_mesh;
 mod capabilities;
 mod instance;
+mod packet_distance;
 mod reflection;
 mod resources;
 mod runtime;
@@ -50,6 +51,7 @@ pub use self::instance::{
 };
 #[cfg(test)]
 use self::instance::{cstring_vec, ensure_instance_extensions_available};
+pub use self::packet_distance::legacy_packet_distance_squared;
 use self::resources::{
     color_subresource_range, create_command_pool, create_depth_attachment, create_frame_sync,
     create_frame_uniform_buffer, create_index_buffer, create_material_specular_buffer,

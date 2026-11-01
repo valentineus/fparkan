@@ -50,9 +50,10 @@ MSH-запрос со свободной preview-камерой; это не п�
 стратегической и следящей камерами не подтверждено
 ([MSH](../reference/msh.md)).
 
-Кривые alpha и метрика расстояния порталов реализованы для MSH без type 16
-([описание кадра](../reference/render-frame.md#прозрачность-порталов-msh)). Native CPU clipping может выбрать другую первую вершину;
-это приближение явно считается как `portal_fade_packet_selection_approx`.
+Кривые alpha и опорная вершина порталов сверены для MSH без type 16
+([описание кадра](../reference/render-frame.md#прозрачность-порталов-msh)). Native `RSQRTSS`
+воспроизводится на x86-64; другие архитектуры и нулевая дистанция используют
+явные `packet_distance_native_rsqrt_unsupported` / `packet_zero_distance_fallback`.
 
 Данные type 16 ещё не декодированы и считаются в `msh_type16_colors_unsupported`;
 в статических сценах 29 миссий GOG (1736 загрузок моделей) этот поток отсутствует.

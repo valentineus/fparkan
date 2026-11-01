@@ -61,8 +61,9 @@ use fparkan_render::{
     RawCameraTransform,
 };
 use fparkan_render_vulkan::{
-    node38_pose, node38_pose_from_hierarchy, node38_pose_relative_to_root,
-    node38_pose_relative_to_root_from_hierarchy, project_land_msh_to_static_mesh_in_world_space,
+    legacy_packet_distance_squared, node38_pose, node38_pose_from_hierarchy,
+    node38_pose_relative_to_root, node38_pose_relative_to_root_from_hierarchy,
+    project_land_msh_to_static_mesh_in_world_space,
     project_msh_to_static_mesh_in_world_space_with_node_fallback_poses,
     project_msh_to_static_mesh_in_world_space_with_node_fallback_poses_and_mount,
     project_msh_to_static_mesh_in_world_space_with_node_pose_buffer,
@@ -1373,7 +1374,7 @@ fn native_msh_diffuse_alpha_override(
     let distance = if range.batch_flags & 0x0050 == 0x0040 {
         0.0
     } else {
-        // shortcut: use the first indexed vertex; replace with native CPU clipping selection when clipped-portal captures are available.
+        // The native alpha callback reads the input packet before renderer clipping.
         first_indexed_vertex_distance(mesh, range_index, eye_world)?
     };
     legacy_msh_portal_alpha(range.batch_flags, distance, horizontal_fov)
@@ -3978,10 +3979,7 @@ fn first_indexed_vertex_distance(
         .get(vertex_index)
         .ok_or_else(|| "world draw range vertex index is outside the vertex buffer".to_string())?;
     let delta = sub3(vertex.position, camera_position);
-    let distance = dot3(delta, delta).sqrt();
-    distance
-        .is_finite()
-        .then_some(distance)
+    legacy_packet_distance_squared(dot3(delta, delta))
         .ok_or_else(|| "world draw range sort distance is non-finite".to_string())
 }
 
@@ -9601,17 +9599,6 @@ impl StaticVulkanApp {
                 horizontal_fov(&self.view_camera, aspect),
             )?;
         }
-        let approximate_portals = self
-            .world_range_indices
-            .iter()
-            .filter(|&&index| {
-                let flags = self.mesh.draw_ranges[index].batch_flags;
-                flags & 8 != 0
-                    && flags & 0x50 != 0x40
-                    && !self.type16_present_ranges.contains(&index)
-            })
-            .count();
-        eprintln!("render_coverage portal_fade_packet_selection_approx={approximate_portals} (first indexed vertex; native CPU clipping selection pending)");
         eprintln!("render_coverage msh_type16_colors_unsupported={} (authored vertex colors are not decoded; using white)", self.type16_present_ranges.len());
         let randomized_lights = self
             .control_point_light_slots
@@ -13355,7 +13342,8 @@ mod tests {
         let alpha = native_msh_diffuse_alpha_override(&mesh, 0, false, [0.0, -0.55, -25.0], 1.04)
             .unwrap()
             .unwrap();
-        assert!((alpha - 0.5).abs() < 0.000_001);
+        // Native RSQRTSS perturbs the distance before the extra square root.
+        assert!((alpha - 0.5).abs() < 0.000_3);
         assert_eq!(
             native_msh_diffuse_alpha_override(&mesh, 0, false, [0.0, -0.55, -60.0], 1.04),
             Ok(Some(1.0))
@@ -15360,7 +15348,97 @@ mod tests {
         let mesh = VulkanStaticMesh::smoke_triangle();
         let distance = first_indexed_vertex_distance(&mesh, 0, [0.0, -0.55, -3.0])
             .expect("first indexed vertex distance");
-        assert!((distance - 3.0).abs() < 1.0e-6);
+        assert!((distance - 3.0).abs() < 1.0e-3);
+    }
+
+    #[test]
+    #[ignore = "requires the original GOG installation and native SSE reference"]
+    fn gog_portal_alpha_keeps_the_reference_vertex_outside_the_viewport() {
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT")
+            .expect("set FPARKAN_CORPUS_PART1_ROOT to the original GOG installation");
+        let mut engine =
+            create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).expect("engine");
+        load_mission_static_preview_roots(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Autodemo.00/data.tma".to_string(),
+                mode: MissionMode::SingleMission,
+            },
+            NonZeroUsize::new(usize::MAX).unwrap(),
+        )
+        .expect("original AutoDemo");
+        let assets = loaded_mission_assets(&engine).expect("mission assets");
+        let root = &loaded_mission_object_drafts(&engine).expect("mission objects")[4];
+        let visual = assets
+            .visual_by_id(assets.object_visuals[4][0])
+            .expect("factory visual");
+        let model = assets.model_by_id(visual.model_id.unwrap()).unwrap();
+        let mesh = project_msh_to_static_mesh_in_world_space_with_node_sampled_poses(
+            &model.validated,
+            LegacyIron3dEulerTransform {
+                translation: root.position,
+                orientation_radians: root.orientation_raw,
+            },
+            root.scale,
+            0,
+        )
+        .expect("factory mesh");
+        // GOG capture: yaw/roll expose only part of the window; alpha was read
+        // after Terrain's callback stored it, before the renderer consumed it.
+        let transform = RawCameraTransform {
+            words: [
+                3_204_541_090,
+                3_209_392_467,
+                1_051_461_443,
+                1_135_728_591,
+                1_063_051_501,
+                3_203_294_891,
+                1_045_010_100,
+                1_143_538_729,
+                0,
+                1_053_254_103,
+                1_064_028_839,
+                1_093_589_271,
+                0,
+                0,
+                0,
+                1_065_353_216,
+            ],
+        };
+        let camera = VulkanStaticCamera::from_legacy_d3d7(
+            transform,
+            LegacyD3d7Projection {
+                viewport: [0, 0, 800, 600],
+                near_plane: 0.5,
+                far_plane: 700.0,
+                field_of_view_radians: 1.04,
+            },
+        )
+        .expect("native edge camera");
+        let range = mesh.draw_ranges[33];
+        assert_eq!(range.batch_flags, 0x0108);
+        let clip_vertex = |offset: usize| -> [f32; 4] {
+            let index = mesh.indices[range.first_index as usize + offset] as usize;
+            let [x, y, z] = mesh.vertices[index].position;
+            let point = [x, y, z, 1.0];
+            std::array::from_fn(|column| {
+                (0..4)
+                    .map(|row| point[row] * camera.clip_from_world[row * 4 + column])
+                    .sum()
+            })
+        };
+        let outside = clip_vertex(0);
+        let inside = clip_vertex(1);
+        assert!(outside[0] > outside[3]);
+        assert!(inside[0].abs() < inside[3]);
+        let distance = first_indexed_vertex_distance(&mesh, 33, transform.translation())
+            .expect("portal reference distance");
+        assert!((distance - f32::from_bits(0x42D5_7EE4)).abs() < 2.0e-5);
+        let alpha =
+            native_msh_diffuse_alpha_override(&mesh, 33, false, transform.translation(), 1.04)
+                .expect("portal alpha")
+                .expect("portal override");
+        assert!((alpha - f32::from_bits(0x3F05_190C)).abs() < 1.0e-6);
     }
 
     #[test]
@@ -16515,7 +16593,7 @@ mod tests {
             let expected = dot3(expected, expected).sqrt();
             let actual = first_indexed_vertex_distance(&mesh, range.range_index, camera)
                 .expect("native Op9 primitive distance key");
-            assert!((actual - expected).abs() < 1e-5);
+            assert!((actual - expected).abs() < expected * 0.000_3 + 1e-5);
         }
 
         for selector in [1, 2] {

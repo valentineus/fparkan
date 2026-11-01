@@ -382,8 +382,9 @@ pub enum LegacyCullMode {
 
 /// CPU diffuse alpha for a colourless MSH batch carrying flag `0x0008`.
 ///
-/// `packet_distance` is the distance to the packet's first accepted vertex,
-/// after its object transform. Flag `0x0010` takes precedence over `0x0040`.
+/// `packet_distance` is the native distance to the input packet's first indexed
+/// vertex after its object transform, even when that vertex is outside the
+/// viewport. Flag `0x0010` takes precedence over `0x0040`.
 /// Returns `None` for invalid distance or projection inputs. Callers must keep
 /// the material alpha for batches with a type-16 colour stream or without `0x0008`.
 #[must_use]
