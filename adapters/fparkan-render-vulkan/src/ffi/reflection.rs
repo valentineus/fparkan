@@ -36,14 +36,42 @@ pub(super) fn mesh_reflection_planes(mesh: &super::VulkanStaticMesh) -> Vec<Opti
         .collect()
 }
 
+pub(super) fn mesh_reflection_bounds(mesh: &super::VulkanStaticMesh) -> Option<[f32; 4]> {
+    let mut bounds = [
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    ];
+    for range in mesh
+        .draw_ranges
+        .iter()
+        .filter(|range| range.terrain_reflection)
+    {
+        for &index in &mesh.indices
+            [range.first_index as usize..range.first_index as usize + range.index_count as usize]
+        {
+            let position = mesh.vertices[index as usize].position;
+            bounds[0] = bounds[0].min(position[0]);
+            bounds[1] = bounds[1].min(position[1]);
+            bounds[2] = bounds[2].max(position[0]);
+            bounds[3] = bounds[3].max(position[1]);
+        }
+    }
+    (bounds.iter().all(|v| v.is_finite()) && bounds[2] > bounds[0] && bounds[3] > bounds[1])
+        .then_some(bounds)
+}
+
 /// Owned before pipeline creation; a dummy set prevents attachment feedback in the mirror pass.
 pub(super) struct ReflectionResources {
     device: ash::Device,
     pub layout: vk::DescriptorSetLayout,
     pool: vk::DescriptorPool,
     sampler: vk::Sampler,
+    bump_sampler: vk::Sampler,
     pub sets: [vk::DescriptorSet; 2],
     dummy: Option<VulkanAllocatedImage>,
+    bump: Option<VulkanAllocatedImage>,
     pub color: Option<VulkanAllocatedImage>,
     depth: Option<VulkanDepthAttachment>,
     pub framebuffer: vk::Framebuffer,
@@ -54,25 +82,31 @@ impl ReflectionResources {
         instance: &VulkanInstanceProbe,
         device: &VulkanLogicalDeviceProbe,
         command_pool: vk::CommandPool,
+        enabled: bool,
     ) -> Result<Self, VulkanSmokeRendererError> {
         let mut owned = Self {
             device: device.device().clone(),
             layout: vk::DescriptorSetLayout::null(),
             pool: vk::DescriptorPool::null(),
             sampler: vk::Sampler::null(),
+            bump_sampler: vk::Sampler::null(),
             sets: [vk::DescriptorSet::null(); 2],
             dummy: None,
+            bump: None,
             color: None,
             depth: None,
             framebuffer: vk::Framebuffer::null(),
         };
-        let binding = vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT);
-        let layout_info =
-            vk::DescriptorSetLayoutCreateInfo::default().bindings(std::slice::from_ref(&binding));
+        let bindings: Vec<_> = (0..2)
+            .map(|binding| {
+                vk::DescriptorSetLayoutBinding::default()
+                    .binding(binding)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(1)
+                    .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            })
+            .collect();
+        let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
         // SAFETY: The device is live; owned rolls back every handle on later failure.
         owned.layout = unsafe {
             owned
@@ -85,7 +119,7 @@ impl ReflectionResources {
         })?;
         let size = vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(2);
+            .descriptor_count(4);
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(2)
             .pool_sizes(std::slice::from_ref(&size));
@@ -136,6 +170,42 @@ impl ReflectionResources {
                 mip_levels: Vec::new(),
             },
         )?);
+        if enabled {
+            let sampler = sampler
+                .address_mode_u(vk::SamplerAddressMode::REPEAT)
+                .address_mode_v(vk::SamplerAddressMode::REPEAT)
+                .address_mode_w(vk::SamplerAddressMode::REPEAT);
+            // SAFETY: The immutable bump map uses supported linear filtering and a single mip level.
+            owned.bump_sampler =
+                unsafe { owned.device.create_sampler(&sampler, None) }.map_err(|result| {
+                    VulkanSmokeRendererError::VulkanOperation {
+                        context: "vkCreateSampler(EMBM)",
+                        result,
+                    }
+                })?;
+            let rgba8 = fparkan_render::water::legacy_embm_bump_map()
+                .into_iter()
+                .flat_map(|duv| {
+                    [
+                        (i16::from(duv[0]) + 128) as u8,
+                        (i16::from(duv[1]) + 128) as u8,
+                        0,
+                        255,
+                    ]
+                })
+                .collect();
+            owned.bump = Some(super::create_static_texture_image(
+                instance,
+                device,
+                command_pool,
+                &super::VulkanStaticTexture {
+                    width: fparkan_render::water::EMBM_BUMP_SIZE,
+                    height: fparkan_render::water::EMBM_BUMP_SIZE,
+                    rgba8,
+                    mip_levels: Vec::new(),
+                },
+            )?);
+        }
         for set in owned.sets {
             owned.write_image(set, owned.dummy.as_ref().expect("dummy image exists").view);
         }
@@ -255,13 +325,35 @@ impl ReflectionResources {
             .sampler(self.sampler)
             .image_view(view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-        let write = vk::WriteDescriptorSet::default()
-            .dst_set(set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(std::slice::from_ref(&image));
+        let bump = self
+            .bump
+            .as_ref()
+            .or(self.dummy.as_ref())
+            .expect("dummy image exists");
+        let images = [
+            image,
+            vk::DescriptorImageInfo::default()
+                .sampler(if self.bump.is_some() {
+                    self.bump_sampler
+                } else {
+                    self.sampler
+                })
+                .image_view(bump.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+        ];
+        let writes: Vec<_> = images
+            .iter()
+            .enumerate()
+            .map(|(binding, image)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(set)
+                    .dst_binding(binding as u32)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .image_info(std::slice::from_ref(image))
+            })
+            .collect();
         // SAFETY: Sets are initialized before submission; the dummy remains valid for every pass.
-        unsafe { self.device.update_descriptor_sets(&[write], &[]) };
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
     }
 }
 
@@ -273,12 +365,14 @@ impl Drop for ReflectionResources {
             self.device.destroy_framebuffer(self.framebuffer, None);
             self.device.destroy_descriptor_pool(self.pool, None);
             self.device.destroy_sampler(self.sampler, None);
+            self.device.destroy_sampler(self.bump_sampler, None);
             self.device.destroy_descriptor_set_layout(self.layout, None);
             for image in self
                 .color
                 .iter()
                 .chain(self.depth.iter().map(|depth| &depth.image))
                 .chain(self.dummy.iter())
+                .chain(self.bump.iter())
             {
                 self.device.destroy_image_view(image.view, None);
                 self.device.destroy_image(image.image, None);
@@ -320,12 +414,19 @@ mod tests {
                 alpha_test_reference: 1,
             }],
         };
+        mesh.vertices[1].position = [10.0, 0.0, 150.0];
+        mesh.vertices[2].position = [5.0, 20.0, 150.0];
+        let mut unused = mesh.vertices[0];
+        unused.position = [-10_000.0, -10_000.0, 150.0];
+        mesh.vertices.push(unused);
+        assert_eq!(mesh_reflection_bounds(&mesh), Some([0.0, 0.0, 10.0, 20.0]));
         assert_eq!(mesh_reflection_planes(&mesh), vec![Some(150.0)]);
         mesh.vertices[2].position[2] = 151.0;
         assert_eq!(mesh_reflection_planes(&mesh), vec![None]);
         mesh.vertices[2].position[2] = 150.0;
         mesh.draw_ranges[0].terrain_reflection = false;
         assert_eq!(mesh_reflection_planes(&mesh), vec![None]);
+        assert_eq!(mesh_reflection_bounds(&mesh), None);
         for cull in [
             fparkan_render::LegacyCullMode::Disabled,
             fparkan_render::LegacyCullMode::BackFace,

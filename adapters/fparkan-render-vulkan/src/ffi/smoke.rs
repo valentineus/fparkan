@@ -373,11 +373,16 @@ impl VulkanSmokeRenderer {
         plane_heights.sort_unstable();
         plane_heights.dedup();
         if !plane_heights.is_empty() {
-            eprintln!("render_coverage planar_reflection_embm_unsupported={} (flat reflection; native shifted camera and wave distortion pending)", plane_heights.len());
+            eprintln!("render_coverage planar_reflection_shifted_camera_unsupported={} (native bump map and clock; using a projective mirror until shifted-camera mapping is implemented)", plane_heights.len());
             eprintln!("render_coverage planar_reflection_other_planes_unsupported={} (nearest active plane is reflected)", plane_heights.len().saturating_sub(1));
         }
         if unsupported_nonplanar != 0 {
             eprintln!("render_coverage planar_reflection_nonplanar_unsupported={unsupported_nonplanar} (ordinary terrain fallback)");
+        }
+        let mut frame_uniforms = super::VulkanFrameUniforms::from_camera(create_info.camera);
+        if let Some(bounds) = super::reflection::mesh_reflection_bounds(&create_info.mesh) {
+            frame_uniforms.embm_bounds = bounds;
+            eprintln!("render_reflection embm_bounds={bounds:?}");
         }
         let mut renderer = Self {
             instance: Some(instance),
@@ -424,7 +429,7 @@ impl VulkanSmokeRenderer {
             material_specular_dirty: true,
             readback_enabled: false,
             camera: create_info.camera,
-            frame_uniforms: super::VulkanFrameUniforms::from_camera(create_info.camera),
+            frame_uniforms,
             point_lights: Vec::new(),
             point_lights_explicit: false,
             frame_sync: Vec::new(),
@@ -1571,8 +1576,8 @@ impl VulkanSmokeRenderer {
                     });
                 }
                 let mut bytes = frame.to_ne_bytes();
-                let length = bytes.len();
-                bytes[length - 4..].copy_from_slice(&height.to_ne_bytes());
+                let offset = super::smoke_types::REFLECTION_CLIP_HEIGHT_OFFSET;
+                bytes[offset..offset + 4].copy_from_slice(&height.to_ne_bytes());
                 Ok(bytes)
             })
             .transpose()?;

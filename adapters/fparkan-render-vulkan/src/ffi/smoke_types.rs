@@ -192,7 +192,8 @@ impl Default for VulkanPointLight {
 /// every device.  Four directional lights and one point light fit in a small
 /// dynamic UBO while the push-constant range remains available for material
 /// state.
-pub const VULKAN_FRAME_UNIFORM_BYTES: usize = 368;
+pub const VULKAN_FRAME_UNIFORM_BYTES: usize = 400;
+pub(super) const REFLECTION_CLIP_HEIGHT_OFFSET: usize = 364;
 
 /// Number of CPU/GPU frame slots shared by the swapchain renderer.
 pub const VULKAN_FRAME_SLOT_COUNT: usize = 2;
@@ -235,6 +236,10 @@ pub struct VulkanFrameUniforms {
     pub fog_end: f32,
     /// World-space camera position used for fog distance.
     pub camera_position: [f32; 3],
+    /// XY bounds of the original reflective faces: min X/Y, max X/Y.
+    pub embm_bounds: [f32; 4],
+    /// Native wave scroll fraction in the ten-second cycle.
+    pub embm_phase: f32,
 }
 
 impl VulkanFrameUniforms {
@@ -258,6 +263,8 @@ impl VulkanFrameUniforms {
             fog_start: f32::MAX,
             fog_end: f32::MAX,
             camera_position: [0.0; 3],
+            embm_bounds: [0.0, 0.0, 1.0, 1.0],
+            embm_phase: 0.0,
         }
     }
 
@@ -283,7 +290,14 @@ impl VulkanFrameUniforms {
             .chain(self.fog_color)
             .chain([self.fog_start, self.fog_end])
             .chain(self.camera_position)
+            .chain(self.embm_bounds)
+            .chain([self.embm_phase])
             .all(f32::is_finite)
+            && self.embm_bounds[2] > self.embm_bounds[0]
+            && self.embm_bounds[3] > self.embm_bounds[1]
+            && (self.embm_bounds[2] - self.embm_bounds[0]).is_finite()
+            && (self.embm_bounds[3] - self.embm_bounds[1]).is_finite()
+            && (0.0..1.0).contains(&self.embm_phase)
             && (self.fog_end <= self.fog_start
                 || ((self.fog_start * self.fog_start).is_finite()
                     && (self.fog_end * self.fog_end).is_finite()))
@@ -363,6 +377,13 @@ impl VulkanFrameUniforms {
             self.camera_position[1],
             self.camera_position[2],
             0.0,
+        ]);
+        values[92..96].copy_from_slice(&self.embm_bounds);
+        values[96..100].copy_from_slice(&[
+            self.embm_phase,
+            fparkan_render::water::EMBM_BUMP_TILE,
+            fparkan_render::water::EMBM_COEFFICIENTS[0],
+            fparkan_render::water::EMBM_COEFFICIENTS[1],
         ]);
         let mut bytes = [0_u8; VULKAN_FRAME_UNIFORM_BYTES];
         for (index, value) in values.into_iter().enumerate() {
@@ -862,6 +883,8 @@ mod static_mesh_tests {
             fog_start: 13.0,
             fog_end: 14.0,
             camera_position: [15.0, 16.0, 17.0],
+            embm_bounds: [100.0, 200.0, 300.0, 600.0],
+            embm_phase: 0.25,
         };
         let bytes = frame.to_ne_bytes();
         assert_eq!(bytes.len(), VULKAN_FRAME_UNIFORM_BYTES);
@@ -880,6 +903,28 @@ mod static_mesh_tests {
         assert_eq!(read(320), 10.0);
         assert_eq!(read(336), 13.0);
         assert_eq!(read(352), 15.0);
+        assert_eq!(read(368), 100.0);
+        assert_eq!(read(380), 600.0);
+        assert_eq!(read(384), 0.25);
+        assert_eq!(read(388), 100.0);
+        assert_eq!(read(392), 0.01);
+    }
+
+    #[test]
+    fn embm_uniforms_reject_invalid_bounds_and_phase() {
+        for (bounds, phase) in [
+            ([0.0; 4], 0.0),
+            ([-f32::MAX, 0.0, f32::MAX, 1.0], 0.0),
+            ([0.0, 0.0, 1.0, 1.0], f32::NAN),
+            ([0.0, 0.0, 1.0, 1.0], 1.0),
+        ] {
+            assert!(!VulkanFrameUniforms {
+                embm_bounds: bounds,
+                embm_phase: phase,
+                ..Default::default()
+            }
+            .is_finite());
+        }
     }
 
     #[test]

@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 //! Camera mathematics and graphics pipeline state.
 
+pub mod water;
+
 /// A 64-byte transform block returned by the original Terrain camera ABI.
 ///
 /// The original uses two selector-dependent transform pointers.  Their exact

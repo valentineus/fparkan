@@ -4638,6 +4638,7 @@ fn multiply_row_major(left: [f32; 16], right: [f32; 16]) -> [f32; 16] {
 }
 
 struct StaticPreviewScene {
+    fixed_water_clock_ms: Option<u32>,
     mesh: VulkanStaticMesh,
     dynamic_vertex_start: usize,
     terrain_lod: Option<terrain_lod::TerrainLodDraws>,
@@ -8554,7 +8555,23 @@ fn static_preview_mesh_and_materials(
     };
     let camera = view_camera.vulkan_camera();
     let shadow_material_index = append_shadow_material(&mut materials)?;
+    let fixed_water_clock_ms = legacy_camera.as_ref().and_then(|capture| {
+        capture
+            .sky_uv_clock
+            .as_ref()
+            .and_then(|clock| clock.raw_clock)
+    });
+    if legacy_camera.is_some()
+        && fixed_water_clock_ms.is_none()
+        && mesh
+            .draw_ranges
+            .iter()
+            .any(|range| range.terrain_reflection)
+    {
+        eprintln!("render_coverage captured_water_phase_unverified=1 (capture has no verified raw queue clock; using replay elapsed time)");
+    }
     Ok(StaticPreviewScene {
+        fixed_water_clock_ms,
         mesh,
         dynamic_vertex_start,
         terrain_lod,
@@ -9369,6 +9386,7 @@ fn run_static_vulkan_mode(
 }
 
 struct StaticVulkanApp {
+    fixed_water_clock_ms: Option<u32>,
     mesh: VulkanStaticMesh,
     dynamic_vertex_start: usize,
     terrain_lod: Option<terrain_lod::TerrainLodDraws>,
@@ -9497,6 +9515,7 @@ impl StaticVulkanApp {
             dynamic_shadow_casters: preview.dynamic_shadow_casters,
             sun_occlusion_range_indices: preview.sun_occlusion_range_indices,
             terrain: preview.terrain,
+            fixed_water_clock_ms: preview.fixed_water_clock_ms,
             world_range_indices,
             world_range_index_counts,
             camera: preview.camera,
@@ -10333,6 +10352,21 @@ impl StaticVulkanApp {
             &mut self.material_animations,
             renderer,
         )?;
+        let water_clock_ms = self
+            .fixed_water_clock_ms
+            .map_or(frame.clock.time_ms, |captured| {
+                if self.target_frames == 0 {
+                    captured.wrapping_add(frame.clock.time_ms)
+                } else {
+                    captured
+                }
+            });
+        let mut uniforms = renderer.frame_uniforms();
+        uniforms.camera_position = frame.camera.position;
+        uniforms.embm_phase = fparkan_render::water::legacy_embm_phase(water_clock_ms);
+        renderer
+            .set_frame_uniforms(uniforms)
+            .map_err(|error| format!("update water clock uniforms: {error}"))?;
         for update in &frame.effect_updates {
             renderer
                 .set_draw_range_index_count(update.range_index, update.index_count)
@@ -13664,6 +13698,7 @@ mod tests {
         };
         let view_camera = free_camera.preview_frame(16.0 / 9.0);
         let preview = StaticPreviewScene {
+            fixed_water_clock_ms: None,
             terrain_lod: None,
             dynamic_vertex_start: 3,
             mesh: VulkanStaticMesh {
@@ -15730,13 +15765,18 @@ mod tests {
         let mut value: serde_json::Value =
             serde_json::from_slice(include_bytes!("../testdata/legacy-camera-parented.json"))
                 .unwrap();
-        value["sky_uv_clock"] =
-            serde_json::json!({"verified": true, "elapsed_milliseconds": 4051271258_u32});
+        value["sky_uv_clock"] = serde_json::json!({"verified": true, "elapsed_milliseconds": 4051271258_u32, "raw_clock": 272342176_u32});
         let capture = parse_legacy_camera_capture(&serde_json::to_vec(&value).unwrap()).unwrap();
-        assert_eq!(
-            capture.sky_uv_clock.unwrap().elapsed_milliseconds,
-            4051271258
-        );
+        let clock = capture.sky_uv_clock.unwrap();
+        assert_eq!(clock.elapsed_milliseconds, 4051271258);
+        assert_eq!(clock.raw_clock, Some(272342176));
+        value["sky_uv_clock"]
+            .as_object_mut()
+            .unwrap()
+            .remove("raw_clock");
+        let old_capture =
+            parse_legacy_camera_capture(&serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(old_capture.sky_uv_clock.unwrap().raw_clock, None);
         value["sky_uv_clock"]["verified"] = serde_json::json!(false);
         assert!(parse_legacy_camera_capture(&serde_json::to_vec(&value).unwrap()).is_err());
     }

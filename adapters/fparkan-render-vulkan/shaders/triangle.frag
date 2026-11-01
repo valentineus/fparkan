@@ -9,7 +9,7 @@ layout(location = 5) in vec3 in_base_diffuse;
 layout(location = 6) in vec3 in_base_specular;
 layout(location = 7) in vec3 in_overlay_diffuse;
 layout(location = 8) in vec3 in_overlay_specular;
-layout(location = 9) in float in_world_z;
+layout(location = 9) in vec3 in_world_position;
 layout(location = 0) out vec4 out_color;
 
 layout(set = 0, binding = 0) uniform sampler2D base_color;
@@ -17,6 +17,7 @@ layout(set = 0, binding = 1) uniform sampler2D base_detail;
 layout(set = 0, binding = 2) uniform sampler2D overlay_color;
 layout(set = 0, binding = 3) uniform sampler2D overlay_detail;
 layout(set = 1, binding = 0) uniform sampler2D reflection_color;
+layout(set = 1, binding = 1) uniform sampler2D embm_bump;
 
 layout(std140, set = 0, binding = 4) uniform FrameConstants {
     mat4 clip_from_world;
@@ -30,6 +31,8 @@ layout(std140, set = 0, binding = 4) uniform FrameConstants {
     vec4 fog_color;
     vec4 fog_distances;
     vec4 camera_position;
+    vec4 embm_bounds;
+    vec4 embm_wave;
 } frame;
 
 layout(push_constant) uniform MaterialConstants {
@@ -69,11 +72,23 @@ layout(push_constant) uniform MaterialConstants {
 
 void main() {
     int mode = int(round(material.material_mode));
-    if ((mode & 32) != 0 && (mode & 4) == 0 && in_world_z < frame.camera_position.w) {
+    if ((mode & 32) != 0 && (mode & 4) == 0 && in_world_position.z < frame.camera_position.w) {
         discard;
     }
     if ((mode & 64) != 0) {
         vec2 reflection_uv = gl_FragCoord.xy / vec2(textureSize(reflection_color, 0));
+        vec2 span = frame.embm_bounds.zw - frame.embm_bounds.xy;
+        vec2 plane_uv = vec2(1.0) - (in_world_position.yx - frame.embm_bounds.yx) / span.yx;
+        vec2 bump_uv = plane_uv * frame.embm_wave.y + frame.embm_wave.x;
+        vec2 duv = max(vec2(-1.0), (texture(embm_bump, bump_uv).rg * 255.0 - 128.0) / 127.0);
+        vec2 displacement = duv * frame.embm_wave.zw;
+        // shortcut: convert native map-UV displacement to the current mirror projection;
+        // replace this projection when accepting the original shifted reflection camera.
+        vec3 displaced_world = in_world_position - vec3(displacement.yx * span, 0.0);
+        vec4 displaced_clip = frame.clip_from_world * vec4(displaced_world, 1.0);
+        if (displaced_clip.w > 0.000001) {
+            reflection_uv = displaced_clip.xy / displaced_clip.w * 0.5 + 0.5;
+        }
         vec3 rgb = texture(reflection_color, reflection_uv).rgb * in_base_diffuse + in_base_specular;
         out_color = vec4(mix(rgb * in_color, frame.fog_color.rgb, in_fog_factor), material.diffuse_alpha);
         if (out_color.a < material.alpha_cutoff) {

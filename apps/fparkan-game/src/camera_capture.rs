@@ -23,6 +23,7 @@ pub(super) struct LegacyCameraCapture {
 pub(super) struct SkyUvClock {
     pub(super) verified: bool,
     pub(super) elapsed_milliseconds: u32,
+    pub(super) raw_clock: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]

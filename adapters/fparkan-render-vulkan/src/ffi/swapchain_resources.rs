@@ -249,14 +249,18 @@ pub(super) fn create_swapchain_resources(
         };
     partial.frame_uniform_stride = frame_uniform_stride;
     partial.frame_uniform_buffer = Some(frame_uniform_buffer);
-    partial.reflection =
-        match super::reflection::ReflectionResources::new(instance, device, command_pool) {
-            Ok(reflection) => Some(reflection),
-            Err(error) => {
-                destroy_partial_swapchain_resources(device, command_pool, partial);
-                return Err(error);
-            }
-        };
+    partial.reflection = match super::reflection::ReflectionResources::new(
+        instance,
+        device,
+        command_pool,
+        reflection_enabled,
+    ) {
+        Ok(reflection) => Some(reflection),
+        Err(error) => {
+            destroy_partial_swapchain_resources(device, command_pool, partial);
+            return Err(error);
+        }
+    };
     let material_count = texture_slot_indices.len() / 4;
     let (material_specular_buffer, material_specular_stride) =
         match create_material_specular_buffer(instance, device, material_count) {
