@@ -419,6 +419,32 @@ fn swapchain_plan_enables_transfer_source_when_surface_supports_it() {
 }
 
 #[test]
+fn swapchain_plan_falls_back_to_immediate_without_overriding_supported_preference() {
+    let mut request = swapchain_request();
+    request.present_modes = vec![
+        vk::PresentModeKHR::IMMEDIATE.as_raw(),
+        vk::PresentModeKHR::FIFO.as_raw(),
+    ];
+    assert_eq!(
+        plan_vulkan_swapchain(&request).unwrap().present_mode,
+        vk::PresentModeKHR::IMMEDIATE.as_raw()
+    );
+    request.preferred_present_mode = vk::PresentModeKHR::FIFO.as_raw();
+    assert_eq!(
+        plan_vulkan_swapchain(&request).unwrap().present_mode,
+        vk::PresentModeKHR::FIFO.as_raw()
+    );
+    request
+        .present_modes
+        .push(vk::PresentModeKHR::MAILBOX.as_raw());
+    request.preferred_present_mode = vk::PresentModeKHR::MAILBOX.as_raw();
+    assert_eq!(
+        plan_vulkan_swapchain(&request).unwrap().present_mode,
+        vk::PresentModeKHR::MAILBOX.as_raw()
+    );
+}
+
+#[test]
 fn swapchain_plan_uses_fifo_and_current_extent_fallbacks() {
     let mut request = swapchain_request();
     request.preferred_present_mode = vk::PresentModeKHR::IMMEDIATE.as_raw();

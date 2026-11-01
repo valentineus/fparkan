@@ -495,6 +495,8 @@ fn undefined_surface_format_override(
 fn select_present_mode(present_modes: &[i32], preferred: i32) -> Result<i32, VulkanSwapchainError> {
     if present_modes.contains(&preferred) {
         Ok(preferred)
+    } else if present_modes.contains(&vk::PresentModeKHR::IMMEDIATE.as_raw()) {
+        Ok(vk::PresentModeKHR::IMMEDIATE.as_raw())
     } else if present_modes.contains(&vk::PresentModeKHR::FIFO.as_raw()) {
         Ok(vk::PresentModeKHR::FIFO.as_raw())
     } else {
