@@ -98,17 +98,17 @@ Seeds просмотра `1/1` и общий порядок других FX ещ
 Control Op2 воспроизводит modes 0/2; modes 1/3, body+76 и неподдержанные
 time modes/привязки считаются как `render_coverage control_op2_unsupported`.
 Управление фазой экземпляра командами Control остаётся до его подключения в runtime.
-Часы экземпляра поддерживают modes 0–3, смену режима и отложенный перезапуск;
+Часы экземпляра поддерживают modes 0–17, смену режима и отложенный перезапуск;
 preview создаёт их в момент ноль. Динамический manager A8 заменён нулём
-(`control_fx_manager_flag_stub`); очередь update с шагом 50 ms ещё не подключена.
+(`control_fx_manager_flag_stub`); планирование очереди update ещё не подключено.
+Owner modes 4–17 получают явный покой (`control_fx_owner_state_stub`): скорости и параметр эффекта 0, здоровье и complementary Control value 1, пределы скоростей 1. Живые данные владельца и Control остаются до G; нулевые реальные пределы пока дают учитываемый отказ вычисления.
 При расширении выбранных начальных строк все пропущенные команды считаются
-в `control_fx_unsupported`, а time modes 4–17 — в `control_fx_requires_game_state`;
+в `control_fx_unsupported`, а условные строки состояния — в `control_fx_requires_game_state`;
 причина и владелец выводятся в лог. Неразобранные FXID считаются отдельно в `control_fx_invalid_documents`.
 
 Размеры команд, resource references, lifecycle, flags families и используемые
 time modes известны. Не закрыто значение каждого поля body opcodes 1--10,
-отсутствующий во всех проверенных каталогах opcode 6 и точные формулы редких
-time modes.
+и отсутствующий во всех проверенных каталогах opcode 6.
 
 Закрывающий эксперимент: изменять по одному полю копии эффекта, воспроизводить
 его в контролируемой сцене и логировать runtime command object, emitted

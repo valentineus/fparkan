@@ -5569,7 +5569,8 @@ fn append_initial_control_effect_slots(
             record_skip("header_values", document.commands().len(), false, None);
             continue;
         }
-        if !matches!(header.time_mode, 0..=3) || (header.time_mode != 0 && duration_seconds <= 0.0)
+        if !matches!(header.time_mode, 0..=17)
+            || (matches!(header.time_mode, 1..=3) && duration_seconds <= 0.0)
         {
             *unsupported_sounds += sound_commands;
             record_skip(
@@ -6087,12 +6088,22 @@ fn advance_control_effect_instances(
                     if flags & 0x180 != 0 {
                         eprintln!("render_coverage control_fx_manager_flag_stub=1 (preview manager A8=0; instance={key:?})");
                     }
+                    if fparkan_fx::fx_time_mode_requires_owner_state(mode) {
+                        // shortcut: Idle provider values until live Control owners are connected in G.
+                        eprintln!("render_coverage control_fx_owner_state_stub=1 (idle provider: speed=0, health=1, effect value=0, complementary control value=1, velocity limits=1; instance={key:?} mode={mode})");
+                    }
                     // All static-preview instances are created at scene time zero.
                     fparkan_fx::clock::FxInstanceClock::new(mode, flags, duration, 0.0)
                         .expect("prepared FX clock metadata")
                 });
                 let now_ms = control_clock_ms as f32;
-                let phase = clock.update(now_ms).and_then(|()| clock.phase(now_ms, false));
+                let phase = clock.update(now_ms).and_then(|()| {
+                    clock.phase(
+                        now_ms,
+                        false,
+                        Some(&fparkan_fx::clock::FxPhaseProvider::idle()),
+                    )
+                });
                 let instance_elapsed = clock.elapsed_seconds(now_ms).unwrap_or(0.0);
                 if phase.is_none() && state.last_update_id.is_none() {
                     eprintln!("render_coverage control_fx_clock_unsupported=1 (instance={key:?} mode={mode})");
@@ -6992,8 +7003,11 @@ fn ambient_effect_phase(
     if !elapsed_seconds.is_finite() || elapsed_seconds < 0.0 {
         return None;
     }
-    fparkan_fx::clock::FxInstanceClock::new(time_mode, header_flags, duration_seconds, 0.0)?
-        .phase(elapsed_seconds * 1000.0, false)
+    fparkan_fx::clock::FxInstanceClock::new(time_mode, header_flags, duration_seconds, 0.0)?.phase(
+        elapsed_seconds * 1000.0,
+        false,
+        None,
+    )
 }
 fn rotate_unit_vector(value: [f32; 3], rotation: [f32; 4]) -> [f32; 3] {
     let [x, y, z, w] = rotation;
@@ -16931,6 +16945,20 @@ mod tests {
             0.0,
             "a non-sentinel negative phase still consumes the jitter sample"
         );
+        slot.header_flags = 0;
+        slot.duration_seconds = 0.0;
+        for mode in 4..=17 {
+            slot.time_mode = mode;
+            let samples = advance_control_effect_instances(
+                &mut HashMap::new(),
+                &[],
+                std::slice::from_ref(&slot),
+                &[],
+                SceneSampleId::Replay(11),
+                5_000,
+            );
+            assert_eq!(samples[&key].phase, Some(0.0), "idle owner mode {mode}");
+        }
     }
 
     #[test]
