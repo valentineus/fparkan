@@ -6,6 +6,21 @@ use super::{
 };
 use ash::vk;
 
+fn reflection_color_format(features: [vk::FormatFeatureFlags; 2]) -> Option<vk::Format> {
+    let required = vk::FormatFeatureFlags::COLOR_ATTACHMENT
+        | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
+        | vk::FormatFeatureFlags::SAMPLED_IMAGE
+        | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+    [
+        vk::Format::R5G6B5_UNORM_PACK16,
+        vk::Format::A1R5G5B5_UNORM_PACK16,
+    ]
+    .into_iter()
+    .zip(features)
+    .find(|(_, available)| available.contains(required))
+    .map(|(format, _)| format)
+}
+
 pub(super) fn reflected_pipeline_state(
     mut state: fparkan_render::LegacyPipelineState,
 ) -> fparkan_render::LegacyPipelineState {
@@ -73,6 +88,7 @@ pub(super) struct ReflectionResources {
     dummy: Option<VulkanAllocatedImage>,
     bump: Option<VulkanAllocatedImage>,
     pub color: Option<VulkanAllocatedImage>,
+    pub render_pass: vk::RenderPass,
     depth: Option<VulkanDepthAttachment>,
     pub framebuffer: vk::Framebuffer,
 }
@@ -94,6 +110,7 @@ impl ReflectionResources {
             dummy: None,
             bump: None,
             color: None,
+            render_pass: vk::RenderPass::null(),
             depth: None,
             framebuffer: vk::Framebuffer::null(),
         };
@@ -219,14 +236,33 @@ impl ReflectionResources {
         extent: (u32, u32),
         format: i32,
         depth_request: fparkan_platform::DepthStencilSupport,
-        render_pass: vk::RenderPass,
     ) -> Result<(), VulkanSmokeRendererError> {
         let side = fparkan_render::water::legacy_embm_reflection_size([extent.0, extent.1]);
         let extent = (side, side);
+        let formats = [
+            vk::Format::R5G6B5_UNORM_PACK16,
+            vk::Format::A1R5G5B5_UNORM_PACK16,
+        ];
+        let features = formats.map(|format| {
+            // SAFETY: This physical device belongs to the instance; the query returns a value copy.
+            unsafe {
+                instance
+                    .instance
+                    .get_physical_device_format_properties(device.physical_device(), format)
+            }
+            .optimal_tiling_features
+        });
+        let native_format = reflection_color_format(features);
+        if native_format.is_none() {
+            eprintln!("render_coverage reflection_16bit_color_unsupported=1 (RGB565 and RGB555 lack required attachment/blend/sample/filter support; main color format fallback)");
+        }
+        let format = native_format.unwrap_or(vk::Format::from_raw(format));
+        eprintln!("render_coverage reflection_dither_approx=1 (native cached DITHERENABLE=1; Vulkan attachment conversion has no matching legacy dither pattern)");
+        eprintln!("render_reflection color_format={}", format.as_raw());
         eprintln!("render_reflection target_extent={side}x{side}");
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
-            .format(vk::Format::from_raw(format))
+            .format(format)
             .extent(vk::Extent3D {
                 width: extent.0,
                 height: extent.1,
@@ -287,7 +323,7 @@ impl ReflectionResources {
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk::Format::from_raw(format))
+            .format(format)
             .subresource_range(super::color_subresource_range(1));
         // SAFETY: The image is bound and the view covers its single color subresource.
         let view =
@@ -304,14 +340,19 @@ impl ReflectionResources {
             extent,
             depth_request,
         )?);
+        self.render_pass = super::swapchain_resources::create_render_pass(
+            device,
+            format.as_raw(),
+            self.depth.as_ref().expect("depth exists").format,
+        )?;
         let attachments = [view, self.depth.as_ref().expect("depth exists").image.view];
         let info = vk::FramebufferCreateInfo::default()
-            .render_pass(render_pass)
+            .render_pass(self.render_pass)
             .attachments(&attachments)
             .width(extent.0)
             .height(extent.1)
             .layers(1);
-        // SAFETY: The target formats and extent match the shared render pass.
+        // SAFETY: The target formats and extent match the owned reflection render pass.
         self.framebuffer =
             unsafe { self.device.create_framebuffer(&info, None) }.map_err(|result| {
                 VulkanSmokeRendererError::VulkanOperation {
@@ -366,6 +407,7 @@ impl Drop for ReflectionResources {
         // Null handles also cover partial construction, including failures before memory binding.
         unsafe {
             self.device.destroy_framebuffer(self.framebuffer, None);
+            self.device.destroy_render_pass(self.render_pass, None);
             self.device.destroy_descriptor_pool(self.pool, None);
             self.device.destroy_sampler(self.sampler, None);
             self.device.destroy_sampler(self.bump_sampler, None);
@@ -389,6 +431,30 @@ impl Drop for ReflectionResources {
 mod tests {
     use super::*;
     use crate::{VulkanStaticDrawRange, VulkanStaticMesh, VulkanStaticVertex};
+
+    #[test]
+    fn reflection_prefers_native_565_then_555_and_requires_filterable_blending() {
+        let required = vk::FormatFeatureFlags::COLOR_ATTACHMENT
+            | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+        assert_eq!(
+            reflection_color_format([required; 2]),
+            Some(vk::Format::R5G6B5_UNORM_PACK16)
+        );
+        for missing in [
+            vk::FormatFeatureFlags::COLOR_ATTACHMENT,
+            vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND,
+            vk::FormatFeatureFlags::SAMPLED_IMAGE,
+            vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
+        ] {
+            assert_eq!(
+                reflection_color_format([required & !missing, required]),
+                Some(vk::Format::A1R5G5B5_UNORM_PACK16)
+            );
+            assert_eq!(reflection_color_format([required & !missing; 2]), None);
+        }
+    }
 
     #[test]
     fn reflection_requires_a_flat_flagged_surface_and_reverses_only_culling() {

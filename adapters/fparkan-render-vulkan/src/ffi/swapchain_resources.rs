@@ -42,7 +42,7 @@ pub(super) struct VulkanSwapchainResources {
     pub(super) point_light_capacity: usize,
     pub(super) max_point_light_count: usize,
     /// Live graphics pipelines indexed by canonical backend-neutral state.
-    pub(super) pipelines: BTreeMap<PipelineKey, vk::Pipeline>,
+    pub(super) pipelines: BTreeMap<(PipelineKey, bool), vk::Pipeline>,
     pub(super) framebuffers: Vec<vk::Framebuffer>,
     pub(super) command_buffers: Vec<vk::CommandBuffer>,
 }
@@ -166,7 +166,7 @@ struct PartialSwapchainResources {
     point_light_stride: u64,
     point_light_capacity: usize,
     max_point_light_count: usize,
-    pipelines: BTreeMap<PipelineKey, vk::Pipeline>,
+    pipelines: BTreeMap<(PipelineKey, bool), vk::Pipeline>,
     framebuffers: Vec<vk::Framebuffer>,
     command_buffers: Vec<vk::CommandBuffer>,
 }
@@ -261,6 +261,23 @@ pub(super) fn create_swapchain_resources(
             return Err(error);
         }
     };
+    if reflection_enabled {
+        if let Err(error) = partial
+            .reflection
+            .as_mut()
+            .expect("reflection descriptors exist")
+            .create_target(
+                instance,
+                device,
+                swapchain.report.plan.extent,
+                swapchain.report.plan.format.format,
+                depth_request,
+            )
+        {
+            destroy_partial_swapchain_resources(device, command_pool, partial);
+            return Err(error);
+        }
+    }
     let material_count = texture_slot_indices.len() / 4;
     let (material_specular_buffer, material_specular_stride) =
         match create_material_specular_buffer(instance, device, material_count) {
@@ -309,7 +326,13 @@ pub(super) fn create_swapchain_resources(
             .as_ref()
             .expect("reflection descriptors exist")
             .layout,
-        reflection_enabled,
+        reflection_enabled.then_some(
+            partial
+                .reflection
+                .as_ref()
+                .expect("reflection descriptors exist")
+                .render_pass,
+        ),
         depth_request,
         partial
             .frame_uniform_buffer
@@ -341,24 +364,6 @@ pub(super) fn create_swapchain_resources(
     partial.descriptor_pool = Some(descriptor_pool);
     partial.sampler = Some(sampler);
     partial.pipelines = pipelines;
-    if reflection_enabled {
-        if let Err(error) = partial
-            .reflection
-            .as_mut()
-            .expect("reflection descriptors exist")
-            .create_target(
-                instance,
-                device,
-                swapchain.report.plan.extent,
-                swapchain.report.plan.format.format,
-                depth_request,
-                render_pass,
-            )
-        {
-            destroy_partial_swapchain_resources(device, command_pool, partial);
-            return Err(error);
-        }
-    }
     for _ in 1..images.len() {
         match create_depth_attachment(
             instance,
@@ -502,7 +507,7 @@ fn create_swapchain_pipeline_bundle(
     texture_slot_indices: &[usize],
     base_pipeline_states: &[LegacyPipelineState],
     reflection_layout: vk::DescriptorSetLayout,
-    reflection_enabled: bool,
+    reflection_render_pass: Option<vk::RenderPass>,
     depth_request: DepthStencilSupport,
     frame_uniform_buffer: &VulkanAllocatedBuffer,
     material_specular_buffer: &VulkanAllocatedBuffer,
@@ -513,7 +518,7 @@ fn create_swapchain_pipeline_bundle(
         VulkanDepthAttachment,
         vk::RenderPass,
         vk::PipelineLayout,
-        BTreeMap<PipelineKey, vk::Pipeline>,
+        BTreeMap<(PipelineKey, bool), vk::Pipeline>,
         vk::DescriptorSetLayout,
         vk::DescriptorPool,
         Vec<vk::DescriptorSet>,
@@ -566,7 +571,7 @@ fn create_swapchain_pipeline_bundle(
         pipeline_layout,
         extent,
         base_pipeline_states,
-        reflection_enabled,
+        reflection_render_pass,
     )
     .inspect_err(|_| {
         // SAFETY: These objects were created above on this live logical device and are destroyed on setup failure.
@@ -672,7 +677,7 @@ fn create_image_view(
     })
 }
 
-fn create_render_pass(
+pub(super) fn create_render_pass(
     device: &VulkanLogicalDeviceProbe,
     format: i32,
     depth_format: vk::Format,
@@ -1013,27 +1018,31 @@ fn create_graphics_pipeline_cache(
     pipeline_layout: vk::PipelineLayout,
     extent: (u32, u32),
     base_pipeline_states: &[LegacyPipelineState],
-    reflection_enabled: bool,
-) -> Result<BTreeMap<PipelineKey, vk::Pipeline>, VulkanSmokeRendererError> {
+    reflection_render_pass: Option<vk::RenderPass>,
+) -> Result<BTreeMap<(PipelineKey, bool), vk::Pipeline>, VulkanSmokeRendererError> {
     let mut pipelines = BTreeMap::new();
-    for state in base_pipeline_states
+    for (state, reflected, target_render_pass) in base_pipeline_states
         .iter()
         .copied()
         .flat_map(super::smoke::pipeline_variants)
         .flat_map(|state| {
-            std::iter::once(state).chain(
-                reflection_enabled.then_some(super::reflection::reflected_pipeline_state(state)),
-            )
+            std::iter::once((state, false, render_pass)).chain(reflection_render_pass.map(|pass| {
+                (
+                    super::reflection::reflected_pipeline_state(state),
+                    true,
+                    pass,
+                )
+            }))
         })
     {
-        let key = PipelineKey::from(state);
+        let key = (PipelineKey::from(state), reflected);
         if pipelines.contains_key(&key) {
             continue;
         }
         let pipeline = match create_graphics_pipeline(
             device,
             pipeline_cache,
-            render_pass,
+            target_render_pass,
             pipeline_layout,
             extent,
             state,

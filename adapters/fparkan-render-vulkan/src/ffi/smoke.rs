@@ -374,6 +374,8 @@ impl VulkanSmokeRenderer {
         plane_heights.dedup();
         if !plane_heights.is_empty() {
             eprintln!("render_coverage planar_reflection_render_context_approx={} (native shifted window, target size and bump UV; main-view depth range and sky/fog/FX remain approximations; non-perspective cameras use mirror fallback)", plane_heights.len());
+            // shortcut: Reuse main-view geometry until native reflected terrain selection is matched.
+            eprintln!("render_coverage planar_reflection_geometry_approx={} (main-view terrain primitives reused; native reflected geometry selection not matched)", plane_heights.len());
             eprintln!("render_coverage planar_reflection_other_planes_unsupported={} (nearest active plane is reflected)", plane_heights.len().saturating_sub(1));
         }
         if unsupported_nonplanar != 0 {
@@ -1901,7 +1903,11 @@ impl VulkanSmokeRenderer {
                 resources.framebuffers[image_index]
             };
             let render_pass_info = vk::RenderPassBeginInfo::default()
-                .render_pass(resources.render_pass)
+                .render_pass(if reflected {
+                    resources.reflection.render_pass
+                } else {
+                    resources.render_pass
+                })
                 .framebuffer(framebuffer)
                 .render_area(render_area)
                 .clear_values(&clear_values);
@@ -1971,7 +1977,7 @@ impl VulkanSmokeRenderer {
                     } else {
                         range.pipeline_state
                     };
-                    let pipeline = resources.pipelines.get(&state.into()).ok_or(
+                    let pipeline = resources.pipelines.get(&(state.into(), reflected)).ok_or(
                         VulkanSmokeRendererError::InvariantViolation {
                             context: "static draw pipeline variant",
                         },
