@@ -158,7 +158,8 @@ pub fn evaluate_f_gener_ball(
 ///
 /// `native_category` is `(renderer_flags >> 30)`, the native category index
 /// consumed by Terrain's geometry selector. The three C4 selectors map to
-/// generated-mesh modes 0, 1, and 2. Body+0xC8 selects the native UV path:
+/// generated-mesh modes 0, 1, and 2. Body mode 0 faces the camera; body mode 2
+/// uses the animated axis. Body+0xC8 selects the native UV path:
 /// zero uses per-vertex projected XY coordinates; nonzero uses Terrain's
 /// static quad/triangle UV layouts. Op4 remains a billboard quad and is not
 /// accepted here.
@@ -231,7 +232,7 @@ fn evaluate_f_gener_ball_sample(
     let body = &command.raw_body;
     let mode = read_u32(body, 0x00)?;
     let (billboard, distance_denominator, native_flag_base) = match command.opcode {
-        FxOpcode::Op9 if mode == 2 => {
+        FxOpcode::Op9 if matches!(mode, 0 | 2) => {
             let selector = read_u32(body, 0xC4)?;
             let flag_base = match selector {
                 0 => 3,
@@ -239,7 +240,7 @@ fn evaluate_f_gener_ball_sample(
                 2 => 6,
                 _ => return None,
             };
-            (false, None, Some(flag_base))
+            (mode == 0, None, Some(flag_base))
         }
         FxOpcode::Op4 if mode == 0 => {
             let denominator = read_f32(body, 0xC4)?;
@@ -1037,6 +1038,84 @@ mod tests {
     }
 
     #[test]
+    fn op9_mode0_faces_the_camera_with_native_helper_matrices() {
+        // Effect.dll +93D0 reached from Op9 +138C0/+106C0; x87 CW 007F.
+        let mut command = f_gener_ball_command(FxOpcode::Op9);
+        let body = Arc::make_mut(&mut command.raw_body);
+        put_u32(body, 0, 0);
+        for offset in [0x24, 0x30] {
+            put_vec3(body, offset, [3.0, 4.0, 5.0]);
+        }
+        for offset in [0x60, 0x6C] {
+            put_vec3(body, offset, [2.0, 3.0, 4.0]);
+        }
+        let cases = [
+            (
+                [3.0, 4.0, 505.0],
+                [
+                    2.0, 0.0, 0.0, 3.0, 0.0, 2.99978256, 0.0, 4.0, 0.0, 0.0, 3.99971, 5.0, 0.0,
+                    0.0, 0.0, 1.0,
+                ],
+            ),
+            (
+                [503.0, 4.0, 5.0],
+                [
+                    0.0, 0.0, 1.999855, 3.0, 3.0, 0.0, 0.0, 4.0, 0.0, 3.99971, 0.0, 5.0, 0.0, 0.0,
+                    0.0, 1.0,
+                ],
+            ),
+            (
+                [3.0, 504.0, 5.0],
+                [
+                    2.0, 0.0, 0.0, 3.0, 0.0, 0.0, 2.99978256, 4.0, 0.0, -3.99971, 0.0, 5.0, 0.0,
+                    0.0, 0.0, 1.0,
+                ],
+            ),
+            (
+                [5.0, 5.0, 5.0],
+                [
+                    -0.8942871, 0.0, 1.78857422, 3.0, 2.68286133, 0.0, 1.34143066, 4.0, 0.0,
+                    3.998747, 0.0, 5.0, 0.0, 0.0, 0.0, 1.0,
+                ],
+            ),
+            (
+                [5.0, 5.0, 8.0],
+                [
+                    -0.89440316,
+                    -1.433971,
+                    1.06884766,
+                    3.0,
+                    2.68320942,
+                    -1.07547832,
+                    0.801635742,
+                    4.0,
+                    0.0,
+                    2.38995171,
+                    3.206543,
+                    5.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                ],
+            ),
+        ];
+        for (camera, native) in cases {
+            let sample =
+                evaluate_f_gener_ball_sample(&command, &identity_matrix(), 0.5, 0.0, camera)
+                    .expect("Op9 mode 0 uses a camera-facing helper");
+            for (actual, expected) in sample.matrix.into_iter().flatten().zip(native) {
+                assert!((actual - expected).abs() < 0.002, "{actual} != {expected}");
+            }
+            let frame =
+                evaluate_f_gener_ball_mesh(&command, 0, &identity_matrix(), 0.5, 0.0, camera, 0)
+                    .expect("Op9 mode 0 keeps its generated mesh");
+            assert_eq!(frame.vertices.len(), 88);
+            assert_eq!(frame.indices.len(), 120);
+        }
+    }
+
+    #[test]
     fn f_gener_ball_rejects_unverified_modes_and_non_finite_state() {
         let mut command = f_gener_ball_command(FxOpcode::Op9);
         let identity = identity_matrix();
@@ -1235,7 +1314,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires the original GOG installation"]
-    fn original_gog_recharge_and_tree_plate_op9_modes_evaluate() {
+    fn original_gog_op9_modes_evaluate() {
         let root = std::env::var_os("PARKAN_GOG_ROOT")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| std::path::PathBuf::from(r"C:\GOG Games\Parkan - Iron Strategy"));
@@ -1246,7 +1325,11 @@ mod tests {
             .expect("decode effects.rlb");
         let identity = identity_matrix();
 
-        for name in ["f_recharge_r", "tree_plate_58"] {
+        for (name, mode) in [
+            ("f_recharge_r", 2),
+            ("tree_plate_58", 2),
+            ("B_Sphere_Start", 0),
+        ] {
             let entry_id = archive
                 .find(name)
                 .unwrap_or_else(|| panic!("missing {name}"));
@@ -1258,12 +1341,13 @@ mod tests {
                     .into_boxed_slice(),
             ))
             .unwrap_or_else(|error| panic!("decode {name}: {error}"));
+            eprintln!("Op9 resource {name}: {:?}", document.header());
             let mut seen = false;
             for (index, command) in document.commands().iter().enumerate() {
                 if command.opcode != FxOpcode::Op9
                     || read_u32(&command.raw_body, 0)
                         .unwrap_or_else(|| panic!("{name} malformed Op9 mode"))
-                        != 2
+                        != mode
                 {
                     continue;
                 }

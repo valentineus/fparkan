@@ -5912,7 +5912,7 @@ fn ambient_effect_command_kind(command: &FxCommand) -> Option<AmbientEffectKind>
             Some(AmbientEffectKind::Op3Type1)
         }
         (FxOpcode::Op3, Some(2), _) => Some(AmbientEffectKind::Op3Type2),
-        (FxOpcode::Op9, Some(2), Some(0..=2)) => Some(AmbientEffectKind::GenerBall),
+        (FxOpcode::Op9, Some(0 | 2), Some(0..=2)) => Some(AmbientEffectKind::GenerBall),
         (FxOpcode::Op7, _, _) if ambient_effect_op7_range_capacity(command).is_some() => {
             Some(AmbientEffectKind::Op7ParticlePool)
         }
@@ -16691,14 +16691,18 @@ mod tests {
                 "{opcode:?}"
             );
         }
-        for selector in [1, 2] {
-            let mut op9 = endpoint_gener_ball_command(FxOpcode::Op9);
-            write_effect_u32(Arc::make_mut(&mut op9.raw_body), 0xC4, selector);
-            assert_eq!(
-                ambient_effect_command_kind(&op9),
-                Some(AmbientEffectKind::GenerBall),
-                "Op9 selector {selector}"
-            );
+        for mode in [0, 2] {
+            for selector in 0..=2 {
+                let mut op9 = endpoint_gener_ball_command(FxOpcode::Op9);
+                let body = Arc::make_mut(&mut op9.raw_body);
+                write_effect_u32(body, 0, mode);
+                write_effect_u32(body, 0xC4, selector);
+                assert_eq!(
+                    ambient_effect_command_kind(&op9),
+                    Some(AmbientEffectKind::GenerBall),
+                    "Op9 mode {mode} selector {selector}"
+                );
+            }
         }
         let mut invalid_op9 = endpoint_gener_ball_command(FxOpcode::Op9);
         write_effect_u32(Arc::make_mut(&mut invalid_op9.raw_body), 0xC4, 3);
