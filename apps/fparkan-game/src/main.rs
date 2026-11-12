@@ -146,6 +146,11 @@ fn run(args: &[String]) -> Result<String, String> {
         .as_ref()
         .and_then(|c| c.sky_uv_clock.as_ref())
         .map(|c| c.elapsed_milliseconds);
+    let captured_celestial_births = camera
+        .as_ref()
+        .filter(|_| args.atmosphere_seconds.is_none())
+        .and_then(|c| c.sky_uv_clock.as_ref())
+        .and_then(|c| c.celestial_births.clone());
     let hold_schedule_phase = camera.is_some() && atmosphere_seconds.is_some();
     let terrain_materials_duration_started = Instant::now();
     let preview = static_preview_mesh_and_materials(
@@ -172,6 +177,7 @@ fn run(args: &[String]) -> Result<String, String> {
     )?;
     if let Some(environment) = &mut environment {
         environment.fixed_sky_uv_ms = captured_sky_uv_ms;
+        environment.captured_celestial_births = captured_celestial_births;
     }
     let sky_duration = sky_started.elapsed();
     let audio = match audio::GameAudio::new(Arc::new(DirectoryVfs::new(&args.root)), &args.mission)
@@ -4208,6 +4214,7 @@ struct DynamicEnvironment {
     fixed_schedule_seconds: Option<f32>,
     fixed_phase_reported: bool,
     fixed_sky_uv_ms: Option<u32>,
+    captured_celestial_births: Option<camera_capture::CelestialBirthClocks>,
 }
 
 struct DynamicEnvironmentFrame {
@@ -4278,7 +4285,10 @@ impl DynamicEnvironment {
                 self.fixed_phase_reported = true;
             }
         }
-        let atmosphere = self.schedule.sample(absolute_time_seconds);
+        let mut atmosphere = self.schedule.sample(absolute_time_seconds);
+        if let Some(births) = &self.captured_celestial_births {
+            births.apply(&mut atmosphere);
+        }
         let mut sky_mesh = self.sky.mesh().clone();
         sky_mesh.update_uvs(self.fixed_sky_uv_ms.unwrap_or(clock_ms));
         let sky_frame =
@@ -4490,6 +4500,7 @@ fn load_environment(
         fixed_schedule_seconds,
         fixed_phase_reported: false,
         fixed_sky_uv_ms: None,
+        captured_celestial_births: None,
     }))
 }
 
@@ -13791,6 +13802,7 @@ mod tests {
             fixed_schedule_seconds: None,
             fixed_phase_reported: false,
             fixed_sky_uv_ms: None,
+            captured_celestial_births: None,
         };
 
         let mut land = fparkan_terrain_format::LandMeshDocument {

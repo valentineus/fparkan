@@ -138,6 +138,13 @@ internal static partial class NativeFrameCapture
     private sealed class SkyUvReadback
     {
         public uint Object, Origin, RawClock, ElapsedMilliseconds, Generation, ThreadId;
+        public CelestialBirthReadback[] Births;
+    }
+
+    private sealed class CelestialBirthReadback
+    {
+        public bool Moon;
+        public uint ElapsedMilliseconds, LifetimeMilliseconds;
     }
 
     private sealed class AtmosphereReadback
@@ -818,7 +825,60 @@ internal static partial class NativeFrameCapture
         Log("SKY_UV_CLOCK generation=" + frame.CameraGeneration + " tid=" + threadId
             + " raw=" + rawClock + " origin=" + origin + " elapsed_ms=" + elapsed);
         return new SkyUvReadback { Object = obj, Origin = origin, RawClock = rawClock,
-            ElapsedMilliseconds = elapsed, Generation = frame.CameraGeneration, ThreadId = threadId };
+            ElapsedMilliseconds = elapsed, Generation = frame.CameraGeneration, ThreadId = threadId,
+            Births = CaptureCelestialBirths(process, terrainBase, rawClock, obj, frame) };
+    }
+
+    private static CelestialBirthReadback[] CaptureCelestialBirths(IntPtr process, uint terrainBase,
+        uint rawClock, uint skyObject, FrameSnapshot frame)
+    {
+        AtmosphereReadback sample;
+        if (frame.AtmosphereByThread == null
+            || !frame.AtmosphereByThread.TryGetValue(frame.CameraThreadId, out sample)
+            || !sample.ArithmeticVerified || !sample.TerrainModuleHashVerified
+            || !sample.WorldTimeMatchesRawClock || sample.RawClock != rawClock) return null;
+        uint atmosphere = sample.AtmosphereObject;
+        uint array = ReadU32Exact(process, checked(atmosphere + 0x1A0));
+        uint count = ReadU32Exact(process, checked(atmosphere + 0x1A4));
+        uint capacity = ReadU32Exact(process, checked(atmosphere + 0x1A8));
+        if (count > capacity || capacity > 64 || (count != 0 && array == 0))
+            throw new InvalidOperationException("Atmosphere object array bounds changed.");
+        List<CelestialBirthReadback> births = new List<CelestialBirthReadback>();
+        bool skyFound = false;
+        for (uint i = 0; i < count; i++) {
+            uint obj = ReadU32Exact(process, checked(array + i * 4));
+            skyFound |= obj == skyObject;
+            if (ReadU32Exact(process, obj) != checked(terrainBase + 0x6610C)) continue;
+            byte[] state = new byte[0x38];
+            if (!ReadExact(process, obj, state)) throw new InvalidOperationException("Celestial birth unreadable.");
+            float angleA = BitConverter.ToSingle(state, 0x30), angleB = BitConverter.ToSingle(state, 0x34);
+            bool sun = Math.Abs(angleA - Math.PI / 2) < 1e-4 && Math.Abs(angleB - Math.PI / 6) < 1e-4;
+            bool moon = Math.Abs(angleA) < 1e-4 && Math.Abs(angleB - 50 * Math.PI / 180) < 1e-4;
+            uint lifetime = BitConverter.ToUInt32(state, 0x2C);
+            if ((!sun && !moon) || lifetime == 0 || lifetime > Int32.MaxValue
+                || births.Exists(delegate(CelestialBirthReadback b) { return b.Moon == moon; }))
+                throw new InvalidOperationException("Celestial birth layout or role changed.");
+            births.Add(new CelestialBirthReadback { Moon = moon,
+                ElapsedMilliseconds = unchecked(rawClock - BitConverter.ToUInt32(state, 0x28)),
+                LifetimeMilliseconds = lifetime });
+        }
+        if (!skyFound) throw new InvalidOperationException("Captured sky is absent from its atmosphere object array.");
+        return births.ToArray();
+    }
+
+    private static void AppendCelestialBirthJson(StringBuilder json, CelestialBirthReadback[] births)
+    {
+        if (births == null) { json.Append("null"); return; }
+        json.Append("{");
+        for (int role = 0; role < 2; role++) {
+            if (role != 0) json.Append(", ");
+            json.Append(role == 0 ? "\"sun\": " : "\"moon\": ");
+            CelestialBirthReadback found = Array.Find(births, delegate(CelestialBirthReadback b) { return b.Moon == (role == 1); });
+            if (found == null) json.Append("null");
+            else json.Append("{\"elapsed_milliseconds\": " + found.ElapsedMilliseconds
+                + ", \"lifetime_milliseconds\": " + found.LifetimeMilliseconds + "}");
+        }
+        json.Append("}");
     }
 
     private static bool SkyUvMatchesFrame(FrameSnapshot frame)
@@ -843,7 +903,10 @@ internal static partial class NativeFrameCapture
         json.AppendLine("    \"origin_raw_clock\": " + sky.Origin + ",");
         json.AppendLine("    \"frame_generation\": " + sky.Generation + ",");
         json.AppendLine("    \"thread_id\": " + sky.ThreadId + ",");
-        json.AppendLine("    \"elapsed_milliseconds\": " + sky.ElapsedMilliseconds);
+        json.AppendLine("    \"elapsed_milliseconds\": " + sky.ElapsedMilliseconds + ",");
+        json.Append("    \"celestial_births\": ");
+        AppendCelestialBirthJson(json, sky.Births);
+        json.AppendLine();
         json.AppendLine("  },");
     }
 
@@ -2426,11 +2489,18 @@ internal static partial class NativeFrameCapture
             CameraWorldGameTimeWordReadable = true, CameraWorldGameTimeWord = 265584022,
             WorldGameTimeWord = 265584022,
             SkyUv = new SkyUvReadback { Generation = 7, ThreadId = 11, RawClock = 265584022,
-                Origin = 509280060, ElapsedMilliseconds = unchecked(265584022U - 509280060U) } };
+                Origin = 509280060, ElapsedMilliseconds = unchecked(265584022U - 509280060U),
+                Births = new CelestialBirthReadback[] { new CelestialBirthReadback {
+                    ElapsedMilliseconds = 378466, LifetimeMilliseconds = 525000 } } } };
         StringBuilder json = new StringBuilder();
         AppendSkyUvJson(json, frame);
         if (!SkyUvMatchesFrame(frame) || json.ToString().IndexOf("4051271258", StringComparison.Ordinal) < 0)
             throw new InvalidOperationException("Verified sky UV wrapping clock was rejected.");
+        if (json.ToString().IndexOf("\"elapsed_milliseconds\": 378466", StringComparison.Ordinal) < 0
+            || json.ToString().IndexOf("\"moon\": null", StringComparison.Ordinal) < 0)
+            throw new InvalidOperationException("Celestial age or inactive role was lost.");
+        if (CaptureCelestialBirths(IntPtr.Zero, 0, 0, 0, new FrameSnapshot()) != null)
+            throw new InvalidOperationException("Unpaired celestial clock accepted.");
         frame.SkyUv.ThreadId++;
         if (SkyUvMatchesFrame(frame)) throw new InvalidOperationException("Sky UV thread mismatch accepted.");
         frame.SkyUv.ThreadId--;

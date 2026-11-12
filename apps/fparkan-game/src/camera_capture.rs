@@ -1,4 +1,5 @@
 use super::{CapturedViewport, PreviewCameraFrame};
+use fparkan_fx::atmosphere::{AtmosphereFrame, SunBirth};
 use fparkan_render::{LegacyD3d7Projection, RawCameraTransform};
 use serde::Deserialize;
 
@@ -24,6 +25,36 @@ pub(super) struct SkyUvClock {
     pub(super) verified: bool,
     pub(super) elapsed_milliseconds: u32,
     pub(super) raw_clock: Option<u32>,
+    pub(super) celestial_births: Option<CelestialBirthClocks>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub(super) struct CelestialBirthClocks {
+    sun: Option<CelestialClock>,
+    moon: Option<CelestialClock>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct CelestialClock {
+    elapsed_milliseconds: u32,
+    lifetime_milliseconds: u32,
+}
+
+impl CelestialBirthClocks {
+    pub(super) fn apply(&self, atmosphere: &mut AtmosphereFrame) {
+        for (sample, clock, angles, row) in [
+            (&mut atmosphere.sun, &self.sun, [90.0, 30.0], 3),
+            (&mut atmosphere.moon, &self.moon, [0.0, 50.0], 4),
+        ] {
+            sample.active = clock.is_some();
+            sample.birth = clock.as_ref().map(|clock| SunBirth {
+                start_seconds: atmosphere.real_seconds - clock.elapsed_milliseconds as f32 / 1000.0,
+                lifetime_seconds: clock.lifetime_milliseconds as f32 / 1000.0,
+                initial_angles_degrees: angles,
+                material_row: row,
+            });
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -129,6 +160,14 @@ pub(super) fn load_legacy_camera_capture(
     if capture.sky_uv_clock.is_none() {
         eprintln!("render_coverage captured_sky_phase_unverified=1 (capture has no sky UV clock; using replay elapsed time)");
     }
+    if capture
+        .sky_uv_clock
+        .as_ref()
+        .and_then(|c| c.celestial_births.as_ref())
+        .is_none()
+    {
+        eprintln!("render_coverage captured_celestial_clock_unverified=1 (capture has no celestial birth clocks; using nominal schedule births)");
+    }
     Ok(capture)
 }
 
@@ -160,6 +199,22 @@ pub(super) fn parse_legacy_camera_capture(bytes: &[u8]) -> Result<LegacyCameraCa
         .is_some_and(|clock| !clock.verified)
     {
         return Err("legacy camera sky UV clock is unverified".to_string());
+    }
+    if let Some(births) = capture
+        .sky_uv_clock
+        .as_ref()
+        .and_then(|c| c.celestial_births.as_ref())
+    {
+        if capture.atmosphere_seconds.is_none() {
+            return Err("legacy camera celestial clocks require an atmosphere phase".to_string());
+        }
+        for clock in [&births.sun, &births.moon].into_iter().flatten() {
+            if clock.lifetime_milliseconds == 0 || clock.lifetime_milliseconds > i32::MAX as u32 {
+                return Err(
+                    "legacy camera celestial clock has an invalid lifetime or age".to_string(),
+                );
+            }
+        }
     }
     if capture
         .atmosphere_seconds
@@ -228,6 +283,66 @@ mod tests {
                 "near_plane": 0.5, "far_plane": 700.0, "field_of_view_radians": 1.3,
             }
         })
+    }
+
+    #[test]
+    fn celestial_capture_rejects_invalid_lifetime() {
+        for lifetime in [0, i32::MAX as u32 + 1] {
+            let mut json = json();
+            json["atmosphere_seconds"] = serde_json::json!(395.471);
+            json["sky_uv_clock"] = serde_json::json!({
+                "verified": true, "elapsed_milliseconds": 123,
+                "celestial_births": {"sun": {"elapsed_milliseconds": 1000,
+                    "lifetime_milliseconds": lifetime}, "moon": null}
+            });
+            assert!(parse_legacy_camera_capture(&serde_json::to_vec(&json).unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn celestial_capture_preserves_executed_sun_age_and_inactive_moon() {
+        use fparkan_fx::{
+            atmosphere::TypedAtmosphere,
+            sky::{SkyFrame, SkyMaterials},
+        };
+        let mut json = json();
+        json["atmosphere_seconds"] = serde_json::json!(395.471);
+        json["sky_uv_clock"] = serde_json::json!({
+            "verified": true, "elapsed_milliseconds": 123,
+            "celestial_births": {"sun": {"elapsed_milliseconds": 378466,
+                "lifetime_milliseconds": 525000}, "moon": null}
+        });
+        let capture = parse_legacy_camera_capture(&serde_json::to_vec(&json).unwrap()).unwrap();
+        let mut missing_phase = json.clone();
+        missing_phase
+            .as_object_mut()
+            .unwrap()
+            .remove("atmosphere_seconds");
+        assert!(parse_legacy_camera_capture(&serde_json::to_vec(&missing_phase).unwrap()).is_err());
+        let births = capture.sky_uv_clock.unwrap().celestial_births.unwrap();
+        let mut atmosphere = TypedAtmosphere {
+            marker: 0,
+            version: 0,
+            tracks: Vec::new(),
+            trailer: Default::default(),
+        }
+        .sample(395.471);
+        births.apply(&mut atmosphere);
+        let materials = SkyMaterials::default();
+        let sky = SkyFrame::from_atmosphere(&atmosphere, &materials, atmosphere.real_seconds);
+        // Executed GOG CSun state; its actual birth was at phase 17.005, not nominal 18.
+        for (actual, native) in
+            sky.sun
+                .direction
+                .into_iter()
+                .zip([-0.33643198, -0.7397671, -0.5827162])
+        {
+            assert!((actual - native).abs() < 3e-6);
+        }
+        assert!(sky.sun.active);
+        assert!(!sky.moon.active);
+        assert_eq!(atmosphere.sun.birth.unwrap().lifetime_seconds, 525.0);
+        assert!(atmosphere.moon.birth.is_none());
     }
 
     #[test]
