@@ -70,6 +70,30 @@ layout(push_constant) uniform MaterialConstants {
     layout(offset = 124) float material_mode;
 } material;
 
+vec3 native_reflection_texel(ivec2 pixel, int mode) {
+    ivec2 last = textureSize(reflection_color, 0) - ivec2(1);
+    uvec3 rgb8 = uvec3(round(texelFetch(reflection_color, clamp(pixel, ivec2(0), last), 0).rgb * 255.0));
+    bool rgb555 = (mode & 1024) != 0;
+    uvec3 shift = rgb555 ? uvec3(3) : uvec3(3, 2, 3);
+    vec3 maximum = rgb555 ? vec3(31.0) : vec3(31.0, 63.0, 31.0);
+    return vec3(rgb8 >> shift) / maximum;
+}
+
+vec3 native_reflection_sample(vec2 uv, int mode) {
+    if ((mode & 1536) == 0) {
+        return texture(reflection_color, uv).rgb;
+    }
+    // GDI drops bits after all RGB8 blending, before the water sampler filters texels.
+    vec2 point = uv * vec2(textureSize(reflection_color, 0)) - vec2(0.5);
+    ivec2 pixel = ivec2(floor(point));
+    vec2 weight = fract(point);
+    return mix(
+        mix(native_reflection_texel(pixel, mode), native_reflection_texel(pixel + ivec2(1, 0), mode), weight.x),
+        mix(native_reflection_texel(pixel + ivec2(0, 1), mode), native_reflection_texel(pixel + ivec2(1), mode), weight.x),
+        weight.y
+    );
+}
+
 void main() {
     int mode = int(round(material.material_mode));
     if ((mode & 32) != 0 && (mode & 4) == 0 && in_world_position.z < frame.camera_position.w) {
@@ -96,7 +120,7 @@ void main() {
         }
         vec3 water_color = (mode & 256) != 0
             ? texture(base_color, base_uv).rgb
-            : texture(reflection_color, reflection_uv).rgb;
+            : native_reflection_sample(reflection_uv, mode);
         vec3 rgb = water_color * in_base_diffuse + in_base_specular;
         out_color = vec4(mix(rgb * in_color, frame.fog_color.rgb, in_fog_factor), material.diffuse_alpha);
         if (out_color.a < material.alpha_cutoff) {

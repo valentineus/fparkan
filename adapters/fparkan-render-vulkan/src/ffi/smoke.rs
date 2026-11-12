@@ -2110,6 +2110,7 @@ impl VulkanSmokeRenderer {
                             && self.reflection_planes[range_index] == reflection_plane
                         {
                             64 | if shifted_reflection { 128 } else { 0 }
+                                | resources.reflection.copy_material_mode
                         } else {
                             0
                         }) as f32;

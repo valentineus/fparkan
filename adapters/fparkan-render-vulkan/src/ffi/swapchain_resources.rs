@@ -270,7 +270,6 @@ pub(super) fn create_swapchain_resources(
                 instance,
                 device,
                 swapchain.report.plan.extent,
-                swapchain.report.plan.format.format,
                 depth_request,
             )
         {

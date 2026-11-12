@@ -6,11 +6,9 @@ use super::{
 };
 use ash::vk;
 
-fn reflection_color_format(features: [vk::FormatFeatureFlags; 2]) -> Option<vk::Format> {
-    let required = vk::FormatFeatureFlags::COLOR_ATTACHMENT
-        | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
-        | vk::FormatFeatureFlags::SAMPLED_IMAGE
-        | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
+fn reflection_copy_format(features: [vk::FormatFeatureFlags; 2]) -> Option<vk::Format> {
+    let required =
+        vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
     [
         vk::Format::R5G6B5_UNORM_PACK16,
         vk::Format::A1R5G5B5_UNORM_PACK16,
@@ -115,6 +113,7 @@ pub(super) struct ReflectionResources {
     pub render_pass: vk::RenderPass,
     depth: Option<VulkanDepthAttachment>,
     pub framebuffer: vk::Framebuffer,
+    pub copy_material_mode: i32,
 }
 
 impl ReflectionResources {
@@ -137,6 +136,7 @@ impl ReflectionResources {
             render_pass: vk::RenderPass::null(),
             depth: None,
             framebuffer: vk::Framebuffer::null(),
+            copy_material_mode: 0,
         };
         let bindings: Vec<_> = (0..2)
             .map(|binding| {
@@ -258,7 +258,6 @@ impl ReflectionResources {
         instance: &VulkanInstanceProbe,
         device: &VulkanLogicalDeviceProbe,
         extent: (u32, u32),
-        format: i32,
         depth_request: fparkan_platform::DepthStencilSupport,
     ) -> Result<(), VulkanSmokeRendererError> {
         let side = fparkan_render::water::legacy_embm_reflection_size([extent.0, extent.1]);
@@ -276,13 +275,22 @@ impl ReflectionResources {
             }
             .optimal_tiling_features
         });
-        let native_format = reflection_color_format(features);
+        let native_format = reflection_copy_format(features);
         if native_format.is_none() {
-            eprintln!("render_coverage reflection_16bit_color_unsupported=1 (RGB565 and RGB555 lack required attachment/blend/sample/filter support; main color format fallback)");
+            eprintln!("render_coverage reflection_16bit_color_unsupported=1 (RGB565 and RGB555 lack texture/filter support; unquantized RGB8 copy fallback)");
         }
-        let format = native_format.unwrap_or(vk::Format::from_raw(format));
-        eprintln!("render_coverage reflection_dither_approx=1 (native cached DITHERENABLE=1; Vulkan attachment conversion has no matching legacy dither pattern)");
-        eprintln!("render_reflection color_format={}", format.as_raw());
+        self.copy_material_mode = match native_format {
+            Some(vk::Format::R5G6B5_UNORM_PACK16) => 512,
+            Some(vk::Format::A1R5G5B5_UNORM_PACK16) => 1024,
+            _ => 0,
+        };
+        // Native's 32-bit path blends RGB8 before GDI copies the finished image into the 16-bit texture.
+        let format = vk::Format::R8G8B8A8_UNORM;
+        eprintln!(
+            "render_reflection color_format={} copy_format={}",
+            format.as_raw(),
+            native_format.unwrap_or(format).as_raw()
+        );
         eprintln!("render_reflection target_extent={side}x{side}");
         let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
@@ -299,7 +307,7 @@ impl ReflectionResources {
             .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
-        // SAFETY: The validated swapchain format is retained; the square side is in 2..=1024.
+        // SAFETY: The device is live; this single-mip RGB8 target has a nonzero side in 2..=1024.
         let image = unsafe { self.device.create_image(&info, None) }.map_err(|result| {
             VulkanSmokeRendererError::VulkanOperation {
                 context: "vkCreateImage(reflection)",
@@ -499,26 +507,22 @@ mod tests {
     }
 
     #[test]
-    fn reflection_prefers_native_565_then_555_and_requires_filterable_blending() {
-        let required = vk::FormatFeatureFlags::COLOR_ATTACHMENT
-            | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
-            | vk::FormatFeatureFlags::SAMPLED_IMAGE
+    fn reflection_copy_prefers_filterable_565_then_555_without_attachment_support() {
+        let required = vk::FormatFeatureFlags::SAMPLED_IMAGE
             | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR;
         assert_eq!(
-            reflection_color_format([required; 2]),
+            reflection_copy_format([required; 2]),
             Some(vk::Format::R5G6B5_UNORM_PACK16)
         );
         for missing in [
-            vk::FormatFeatureFlags::COLOR_ATTACHMENT,
-            vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND,
             vk::FormatFeatureFlags::SAMPLED_IMAGE,
             vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR,
         ] {
             assert_eq!(
-                reflection_color_format([required & !missing, required]),
+                reflection_copy_format([required & !missing, required]),
                 Some(vk::Format::A1R5G5B5_UNORM_PACK16)
             );
-            assert_eq!(reflection_color_format([required & !missing; 2]), None);
+            assert_eq!(reflection_copy_format([required & !missing; 2]), None);
         }
     }
 
