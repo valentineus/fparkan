@@ -107,7 +107,7 @@ pub fn legacy_embm_reflection_clip(
         return None;
     }
     let depth_a = (main_clip[2] * w[0] + main_clip[6] * w[1] + main_clip[10] * w[2]) / squared;
-    // shortcut: retain the main depth range until the native shifted depth matrix is verified.
+    // Ngi32+7030 mode 0 uses the same near/far, without mode 1's common sin(FOV/2) scale.
     let depth_b = (main_clip[14] - depth_a * main_clip[15]) / squared.sqrt();
     if !depth_a.is_finite() || !depth_b.is_finite() || depth_a < 1.0 || depth_b >= 0.0 {
         return None;
@@ -227,6 +227,41 @@ mod tests {
         assert!(legacy_embm_reflection_clip([0.0; 16], eye, 150.0, bounds).is_none());
         assert!(legacy_embm_reflection_clip(main, eye, 185.0, bounds).is_none());
         assert!(legacy_embm_reflection_clip(main, eye, 150.0, [1.0; 4]).is_none());
+    }
+
+    #[test]
+    fn shifted_depth_matches_executed_native_projection_builder() {
+        use crate::LegacyD3d7Projection;
+        // Ngi32+7030, x87 CW=007F: mode 0 output, including the separate sky range.
+        for (near, far, native_a, native_b) in [
+            (0.5, 700.0, 1.000_714_8, -0.500_357_4),
+            (700.0, 50_000.0, 1.014_198_8, -709.939_15),
+            (5.0, 1000.0, 1.005_025_1, -5.025_125_5),
+        ] {
+            let projection = LegacyD3d7Projection {
+                viewport: [0, 0, 800, 600],
+                near_plane: near,
+                far_plane: far,
+                field_of_view_radians: 1.3,
+            }
+            .try_direct3d7_projection_row_major()
+            .unwrap();
+            let mut main = [0.0; 16];
+            main[2] = projection[10];
+            main[3] = projection[11];
+            main[14] = projection[14];
+            let shifted = legacy_embm_reflection_clip(
+                main,
+                [0.0, 0.0, 185.0],
+                150.0,
+                [-200.0, -300.0, 300.0, 400.0],
+            )
+            .unwrap();
+            assert!((shifted[10] - native_a).abs() < 2e-6);
+            assert!((shifted[14] + shifted[10] * 115.0 - native_b).abs() < 0.0002);
+            assert_eq!(shifted[11], 1.0);
+            assert_eq!(shifted[15], -115.0);
+        }
     }
 
     #[test]

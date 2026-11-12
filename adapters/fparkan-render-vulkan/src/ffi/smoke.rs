@@ -373,7 +373,7 @@ impl VulkanSmokeRenderer {
         plane_heights.sort_unstable();
         plane_heights.dedup();
         if !plane_heights.is_empty() {
-            eprintln!("render_coverage planar_reflection_render_context_approx={} (native shifted window, target size and bump UV; main-view depth range and sky/fog/FX remain approximations; non-perspective cameras use mirror fallback)", plane_heights.len());
+            eprintln!("render_coverage planar_reflection_render_context_approx={} (native shifted window, depth range, sky center, target size and bump UV; remaining sky/fog/FX context is not matched; non-perspective cameras use mirror fallback)", plane_heights.len());
             // shortcut: Reuse main-view geometry until native reflected terrain selection is matched.
             eprintln!("render_coverage planar_reflection_geometry_approx={} (main-view terrain primitives reused; native reflected geometry selection not matched)", plane_heights.len());
             eprintln!("render_coverage planar_reflection_other_planes_unsupported={} (nearest active plane is reflected)", plane_heights.len().saturating_sub(1));

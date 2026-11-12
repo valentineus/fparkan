@@ -252,7 +252,6 @@ LightingTerms native_material_lighting(
 }
 
 void main() {
-    out_world_position = in_position;
     out_color = in_color;
     out_uv = in_uv;
     out_detail_uv = in_detail_uv;
@@ -261,10 +260,16 @@ void main() {
     int combiner_mode = mode & 3;
     bool screen_tl = (mode & 8) != 0;
     bool cloud_pass = (mode & 4) != 0 && combiner_mode == 0;
-    out_fog_factor = screen_tl ? 0.0 : native_fog_factor(in_position, cloud_pass);
+    vec3 world_position = in_position;
+    // CSky centers every dome pass on the camera used by that render.
+    if ((mode & 36) == 36 && !screen_tl) {
+        world_position.z += 2.0 * (frame.camera_position.z - frame.camera_position.w);
+    }
+    out_world_position = world_position;
+    out_fog_factor = screen_tl ? 0.0 : native_fog_factor(world_position, cloud_pass);
     if (combiner_mode == 0) {
         LightingTerms base_terms = native_material_lighting(
-            in_position,
+            world_position,
             in_normal,
             vec3(material.directional_r, material.directional_g, material.directional_b),
             vec3(material.additive_r, material.additive_g, material.additive_b),
@@ -272,7 +277,7 @@ void main() {
             material_specular.base.w
         );
         LightingTerms overlay_terms = native_material_lighting(
-            in_position,
+            world_position,
             in_normal,
             vec3(material.overlay_directional_r, material.overlay_directional_g, material.overlay_directional_b),
             vec3(material.overlay_additive_r, material.overlay_additive_g, material.overlay_additive_b),
@@ -290,10 +295,10 @@ void main() {
         out_overlay_specular = vec3(0.0);
     }
     vec4 clip_position = screen_tl
-        ? vec4(in_position, 1.0)
-        : frame.clip_from_world * vec4(in_position, 1.0);
+        ? vec4(world_position, 1.0)
+        : frame.clip_from_world * vec4(world_position, 1.0);
     // Sky far-depth is a Vulkan projection choice for layers authored around
-    // the camera. Keep world positions, normals, and UVs intact while placing
+    // the camera. Keep normals and UVs intact while placing
     // the resulting primitive at the far depth; this does not assert native
     // D3D depth-bit equivalence.
     if ((mode & 4) != 0 && !screen_tl) {
