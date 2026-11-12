@@ -6,6 +6,10 @@ authoring API без динамического подтверждения.
 
 ## Render state
 
+CRT-последовательность погоды сверена исполнением Terrain.dll; seed просмотра
+и порядок расхода с остальным миром пока не выровнены (`weather_rng_schedule_approx`).
+Точное совпадение дождя, снега и вспышек по кадрам этим не подтверждено.
+
 Доказаны frame boundaries, world traversal, material resolve и крупные проходы.
 Не доказаны символами точные имена renderer vtable slots, полный набор CShade
 state transitions и окончательный порядок части transparent/FX/shadow subpasses.

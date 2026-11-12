@@ -187,10 +187,8 @@ pub const LIGHTNING_QUAD_DIMENSIONS: [f32; 3] = [
 ];
 const NATIVE_RANDOM_SCALE: f32 = 1.0 / 32_768.0;
 
-/// The CRT linear congruential generator used by Terrain.dll and Effect.dll.
-/// Both modules read and update the same process-wide state, so the
-/// environment system intentionally owns one stream and passes it through
-/// each emitter in update order.
+/// The CRT linear congruential sequence used by Terrain.dll's weather.
+/// The environment system passes one stream through each emitter in update order.
 #[derive(Clone, Copy, Debug)]
 struct NativeRng {
     state: u32,
@@ -202,7 +200,10 @@ impl NativeRng {
     }
 
     fn next_u15(&mut self) -> u16 {
-        self.state = self.state.wrapping_mul(0x343F_D).wrapping_add(0x269E_C);
+        self.state = self
+            .state
+            .wrapping_mul(0x0003_43FD)
+            .wrapping_add(0x0026_9EC3);
         ((self.state >> 16) & 0x7FFF) as u16
     }
 
@@ -1483,9 +1484,8 @@ pub struct EnvironmentSystem {
     time_seconds: f32,
     time_millis: u64,
     time_millis_fraction: f64,
-    /// Terrain and Effect share the CRT `rand` state. Keep one stream for
-    /// particle respawns, lightning scheduling, and lightning placement so
-    /// the native call order remains observable across subsystems.
+    /// One stream for particle respawns, lightning scheduling and placement.
+    /// Native initialization and the other world consumers remain unaligned.
     rng: NativeRng,
     rain: PrecipitationEmitter,
     snow: PrecipitationEmitter,
@@ -2531,6 +2531,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn weather_rng_matches_executed_gog_crt_vectors() {
+        // GOG Terrain.dll +0x5884F, including zero and wrapping initial states.
+        for (seed, expected, final_state) in [
+            (
+                0,
+                [38, 7719, 21238, 2437, 8855, 11797, 8365, 32285],
+                2115878600,
+            ),
+            (
+                1,
+                [41, 18467, 6334, 26500, 19169, 15724, 11478, 29358],
+                1924036713,
+            ),
+            (
+                0x12345678,
+                [13289, 23359, 19469, 24737, 23446, 14229, 6193, 18180],
+                3338983488,
+            ),
+            (
+                u32::MAX,
+                [35, 29739, 3374, 11141, 31308, 7870, 5253, 2445],
+                2307720487,
+            ),
+        ] {
+            let mut rng = NativeRng::new(u64::from(seed));
+            for value in expected {
+                assert_eq!(rng.next_u15(), value, "seed {seed}");
+            }
+            assert_eq!(rng.state, final_state);
+        }
+    }
+
+    #[test]
     fn active_rain_is_camera_local_and_uses_sky_material() {
         let mut system = EnvironmentSystem::new(7);
         let weather = WeatherInput {
@@ -2627,21 +2660,22 @@ mod tests {
             rain: WeatherState::new(true, 0.01, [1.0; 4]),
             ..WeatherInput::clear()
         };
-        let initial = system.update(0.0, weather.clone(), camera);
-        let initial_position = initial
-            .primitives
-            .iter()
-            .find_map(|primitive| match primitive {
-                EnvironmentPrimitive::Particle { position, .. } => Some(*position),
-                _ => None,
-            })
-            .expect("initial rain particle");
+        let _initial = system.update(0.0, weather.clone(), camera);
+        // Keep this particle inside both volumes so turning does not respawn it.
+        let initial_position = [20.0, 30.0, 35.0];
+        system.rain.particles[0].position = initial_position;
         let turned_camera = Camera::with_basis(
             [10.0, 20.0, 30.0],
             [0.0, 1.0, 0.0],
             [-1.0, 0.0, 0.0],
             [0.0, 0.0, 1.0],
         );
+        assert!(system.rain.volume.bounds(camera).contains(initial_position));
+        assert!(system
+            .rain
+            .volume
+            .bounds(turned_camera)
+            .contains(initial_position));
         let turned = system.update(0.0, weather.clone(), turned_camera);
         let turned_position = turned
             .primitives

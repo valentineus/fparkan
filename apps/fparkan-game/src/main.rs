@@ -4475,7 +4475,9 @@ fn load_environment(
     } else {
         None
     };
+    // shortcut: fixed preview seed until native world RNG state/order is connected in G.
     let mut environment = EnvironmentSystem::new(0x4650_4152_4B41_4E_u64);
+    eprintln!("render_coverage weather_rng_schedule_approx=1 (native CRT sequence; fixed preview seed and cross-system draw order unverified)");
     environment.set_lightning_effect(lightning_effect);
     Ok(Some(DynamicEnvironment {
         schedule,
