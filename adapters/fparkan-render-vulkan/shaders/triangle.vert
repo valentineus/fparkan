@@ -133,14 +133,18 @@ float native_specular_power(float cosine, float power) {
     return result;
 }
 
-float native_fog_factor(vec3 world_position) {
-    float fog_span_squared = frame.fog_distances.w - frame.fog_distances.z;
+float native_fog_factor(vec3 world_position, bool cloud_pass) {
+    // CSky supplies its own CShade range: height - 5000 and default dome radius / 3.
+    vec2 fog_range = cloud_pass ? vec2(5000.0, 11380.7295) : frame.fog_distances.xy;
+    vec2 fog_squared = cloud_pass ? fog_range * fog_range : frame.fog_distances.zw;
+    float fog_span_squared = fog_squared.y - fog_squared.x;
     vec3 to_camera = world_position - frame.camera_position.xyz;
     float distance_squared = dot(to_camera, to_camera);
-    if (fog_span_squared <= 0.000001 || distance_squared <= frame.fog_distances.z) {
+    if (fog_span_squared <= 0.000001 || distance_squared <= fog_squared.x) {
         return 0.0;
     }
-    return clamp((distance_squared - frame.fog_distances.z) / fog_span_squared, 0.0, 1.0);
+    float fog_factor = clamp((distance_squared - fog_squared.x) / fog_span_squared, 0.0, 1.0);
+    return cloud_pass ? 1.0 - roundEven((1.0 - fog_factor) * 255.0) / 255.0 : fog_factor;
 }
 
 vec3 normalized_or(vec3 value, vec3 fallback) {
@@ -256,7 +260,8 @@ void main() {
     int mode = int(round(material.material_mode));
     int combiner_mode = mode & 3;
     bool screen_tl = (mode & 8) != 0;
-    out_fog_factor = screen_tl ? 0.0 : native_fog_factor(in_position);
+    bool cloud_pass = (mode & 4) != 0 && combiner_mode == 0;
+    out_fog_factor = screen_tl ? 0.0 : native_fog_factor(in_position, cloud_pass);
     if (combiner_mode == 0) {
         LightingTerms base_terms = native_material_lighting(
             in_position,

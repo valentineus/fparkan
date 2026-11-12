@@ -609,10 +609,35 @@ fn native_specular_reference_uses_squared_power_and_total_overflow_curve() {
 fn shader_computes_radial_fog_per_vertex_and_interpolates_it() {
     let vertex = include_str!("../../shaders/triangle.vert");
     let fragment = include_str!("../../shaders/triangle.frag");
-    assert!(vertex.contains("out_fog_factor = screen_tl ? 0.0 : native_fog_factor(in_position);"));
+    assert!(vertex.contains(
+        "out_fog_factor = screen_tl ? 0.0 : native_fog_factor(in_position, cloud_pass);"
+    ));
     assert!(fragment.contains("layout(location = 4) in float in_fog_factor;"));
     assert!(!fragment.contains("distance(in_world_position"));
     assert!(!fragment.contains("float fog_factor()"));
+}
+
+#[test]
+fn cloud_fog_matches_native_vertex_packet() {
+    // Constructor's actual XYZ + DIFFUSE + SPECULAR VBO, after the -5000 Z shift.
+    let start = 5000.0_f32;
+    let end = 11380.7295_f32;
+    for (position, expected_alpha) in [
+        ([0.0_f32, 0.0, 5000.0], 255),
+        ([0.0, 5341.0107, 4579.652], 195),
+        ([2043.9148, 4934.451, 4579.652], 195),
+        ([0.0, 10550.507, 3328.965], 17),
+        ([0.0, 15500.217, 1278.7305], 0),
+    ] {
+        let distance_squared = position.iter().map(|value| value * value).sum::<f32>();
+        let visibility =
+            ((end * end - distance_squared) / (end * end - start * start)).clamp(0.0, 1.0);
+        assert_eq!((visibility * 255.0).round_ties_even() as u8, expected_alpha);
+    }
+    let vertex = include_str!("../../shaders/triangle.vert");
+    assert!(vertex.contains("vec2(5000.0, 11380.7295)"));
+    assert!(vertex.contains("bool cloud_pass = (mode & 4) != 0 && combiner_mode == 0;"));
+    assert!(vertex.contains("roundEven((1.0 - fog_factor) * 255.0) / 255.0"));
 }
 
 #[test]

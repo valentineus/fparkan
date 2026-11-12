@@ -1819,7 +1819,12 @@ fn append_environment_material(
                 .cloned()
                 .unwrap_or_else(|| asset.texture.clone()),
             directional_rgb: phase.directional_rgb,
-            additive_rgb: phase.additive_rgb,
+            // CSky clears the cloud material's additive RGB before shading each frame.
+            additive_rgb: if fallback_row == 2 {
+                [0.0; 3]
+            } else {
+                phase.additive_rgb
+            },
             uv_transform: phase.page_uv_transform,
             detail_texture: Some(solid_environment_texture([128, 128, 128, 255])),
             overlay_texture: None,
@@ -3180,6 +3185,7 @@ impl EnvironmentGpuScene {
 
         let clouds_material_index = material_indices[2]
             .ok_or_else(|| "cloud material selector is unavailable".to_string())?;
+        eprintln!("render_coverage sky_cloud_lighting_approx=1 (native cloud fog range and zero additive RGB; transient light composition is not matched)");
         let clouds_material = materials
             .get(clouds_material_index)
             .ok_or_else(|| "cloud material descriptor is unavailable".to_string())?;
@@ -13199,6 +13205,53 @@ mod tests {
         assert!(!preview.mesh.vertices.is_empty());
         assert!(!preview.mesh.indices.is_empty());
         assert!(!preview.materials.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires installed GOG resources; set FPARKAN_GAME_ROOT"]
+    fn gog_cloud_material_clears_additive_light_without_changing_other_coefficients() {
+        let root = std::env::var_os("FPARKAN_GAME_ROOT")
+            .map(PathBuf::from)
+            .expect("FPARKAN_GAME_ROOT");
+        let environment = load_environment(
+            &root,
+            "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.02/data.tma",
+            Some(145.756),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        let name = environment.materials.material_name(2).unwrap();
+        let asset = &environment.material_assets[name];
+        assert!(asset
+            .phases
+            .iter()
+            .any(|phase| phase.additive_rgb != [0.0; 3]));
+        for row in [2, 3] {
+            let mut materials = Vec::new();
+            append_environment_material(
+                &mut materials,
+                &mut HashMap::new(),
+                &environment.material_assets,
+                &mut Vec::new(),
+                name,
+                row,
+            )
+            .unwrap();
+            for (material, phase) in materials.iter().zip(&asset.phases) {
+                assert_eq!(
+                    material.additive_rgb,
+                    if row == 2 {
+                        [0.0; 3]
+                    } else {
+                        phase.additive_rgb
+                    }
+                );
+                assert_eq!(material.directional_rgb, phase.directional_rgb);
+                assert_eq!(material.specular_rgb, phase.specular_rgb);
+                assert_eq!(material.diffuse_alpha, phase.diffuse_alpha);
+            }
+        }
     }
 
     #[test]
