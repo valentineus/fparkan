@@ -45,11 +45,12 @@ pub(super) fn reflected_terrain_pipeline_state(
 
 pub(super) fn reflected_draw_pipeline_state(
     range: &super::VulkanStaticDrawRange,
+    shifted_reflection: bool,
 ) -> fparkan_render::LegacyPipelineState {
     let state = reflected_pipeline_state(range.pipeline_state);
     if range.terrain_reflection {
         fparkan_render::water::legacy_reflected_water_pipeline(state)
-    } else if range.terrain_surface {
+    } else if range.terrain_surface && shifted_reflection {
         reflected_terrain_pipeline_state(range.pipeline_state)
     } else {
         state
@@ -477,18 +478,22 @@ mod tests {
         let mut range = VulkanStaticMesh::smoke_triangle().draw_ranges[0];
         range.terrain_surface = true;
         assert_eq!(
-            reflected_draw_pipeline_state(&range).cull,
+            reflected_draw_pipeline_state(&range, true).cull,
             LegacyCullMode::BackFace
+        );
+        assert_eq!(
+            reflected_draw_pipeline_state(&range, false),
+            reflected_pipeline_state(range.pipeline_state)
         );
         range.terrain_reflection = true;
         assert_eq!(
-            reflected_draw_pipeline_state(&range).cull,
+            reflected_draw_pipeline_state(&range, true).cull,
             LegacyCullMode::Disabled
         );
         range.terrain_surface = false;
         range.terrain_reflection = false;
         assert_eq!(
-            reflected_draw_pipeline_state(&range),
+            reflected_draw_pipeline_state(&range, true),
             reflected_pipeline_state(range.pipeline_state)
         );
     }

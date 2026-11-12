@@ -1967,7 +1967,7 @@ impl VulkanSmokeRenderer {
                         continue;
                     }
                     let state = if reflected {
-                        super::reflection::reflected_draw_pipeline_state(range)
+                        super::reflection::reflected_draw_pipeline_state(range, shifted_reflection)
                     } else {
                         range.pipeline_state
                     };
