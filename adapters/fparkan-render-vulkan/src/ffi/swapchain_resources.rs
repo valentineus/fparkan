@@ -993,8 +993,9 @@ pub(super) fn draw_viewport(extent: (u32, u32), material_mode: f32) -> vk::Viewp
     // Ngi32 RVA 0x7170 maps world depth to 0.1..0.99; TL and sky depth bypass it.
     let explicit_depth = material_mode.round() as u32 & 12 != 0;
     vk::Viewport {
-        x: 0.0,
-        y: 0.0,
+        // D3D7 samples integer pixel centers; Vulkan samples at (x + 0.5, y + 0.5).
+        x: 0.5,
+        y: 0.5,
         width: extent.0 as f32,
         height: extent.1 as f32,
         min_depth: if explicit_depth { 0.0 } else { 0.1 },
@@ -1472,6 +1473,7 @@ mod tests {
         .expect("native projection");
         for mode in [0.0, 1.0, 2.0, 3.0, 16.0, 17.0] {
             let viewport = draw_viewport((1280, 1024), mode);
+            assert_eq!([viewport.x, viewport.y], [0.5, 0.5]);
             assert_eq!([viewport.width, viewport.height], [1280.0, 1024.0]);
             assert_eq!([viewport.min_depth, viewport.max_depth], [0.1, 0.99]);
             for distance in [0.5, 100.0, 350.0, 600.0, 700.0] {
@@ -1487,6 +1489,7 @@ mod tests {
         }
         for mode in [4.0, 5.0, 6.0, 7.0, 9.0] {
             let viewport = draw_viewport((640, 480), mode);
+            assert_eq!([viewport.x, viewport.y], [0.5, 0.5]);
             assert_eq!([viewport.min_depth, viewport.max_depth], [0.0, 1.0]);
         }
     }
