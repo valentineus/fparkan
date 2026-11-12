@@ -9558,6 +9558,7 @@ impl StaticVulkanApp {
             .filter(|(range_index, _)| !fixed_range_indices.contains(range_index))
             .map(|(range_index, range)| (range_index, range.index_count))
             .collect();
+        eprintln!("render_coverage shadow_refresh_phase_approx={} (RobShdwRefreshMask=1; local CRT seed 1, native process allocation order unverified)", preview.shadow_casters.len());
         Self {
             mesh: preview.mesh,
             dynamic_vertex_start: preview.dynamic_vertex_start,

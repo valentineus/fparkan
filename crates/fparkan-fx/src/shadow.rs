@@ -8,6 +8,8 @@
 use std::error::Error;
 use std::fmt;
 
+use crate::environment::NativeRng;
+
 /// Native shadow atlas width in texels.
 pub const SHADOW_ATLAS_WIDTH: usize = 256;
 /// Native shadow atlas height in texels.
@@ -113,6 +115,8 @@ impl Default for ShadowLodSettings {
 struct ShadowCacheSlot {
     caster: u32,
     age: u32,
+    refresh_phase: u32,
+    projection: Option<ShadowProjection>,
 }
 
 /// Reusable native page ownership state.
@@ -124,6 +128,9 @@ struct ShadowCacheSlot {
 #[derive(Clone, Debug)]
 pub struct ShadowPageCache {
     slots: [Option<ShadowCacheSlot>; SHADOW_PAGE_COUNT],
+    atlas_rgba8: Vec<u8>,
+    frame_index: u32,
+    rng: NativeRng,
     /// Slots claimed while building the current frame.  A slot already used
     /// by an earlier candidate must not be evicted again by a later one.
     frame_used: [bool; SHADOW_PAGE_COUNT],
@@ -133,6 +140,10 @@ impl Default for ShadowPageCache {
     fn default() -> Self {
         Self {
             slots: [None; SHADOW_PAGE_COUNT],
+            atlas_rgba8: vec![0; SHADOW_ATLAS_WIDTH * SHADOW_ATLAS_HEIGHT * 4],
+            frame_index: 0,
+            // shortcut: native process-wide allocation order is not connected in preview.
+            rng: NativeRng::new(1),
             frame_used: [false; SHADOW_PAGE_COUNT],
         }
     }
@@ -150,6 +161,7 @@ impl ShadowPageCache {
     pub fn clear(&mut self) {
         self.slots = [None; SHADOW_PAGE_COUNT];
         self.frame_used = [false; SHADOW_PAGE_COUNT];
+        self.atlas_rgba8.fill(0);
     }
 
     /// Returns the cached page slot for a caster, if it currently owns one.
@@ -167,6 +179,7 @@ impl ShadowPageCache {
     }
 
     fn begin_frame(&mut self) {
+        self.frame_index = self.frame_index.wrapping_add(1);
         self.frame_used = [false; SHADOW_PAGE_COUNT];
         for slot in &mut self.slots {
             if let Some(slot) = slot {
@@ -233,8 +246,24 @@ impl ShadowPageCache {
             return None;
         }
         self.frame_used[index] = true;
-        self.slots[index] = Some(ShadowCacheSlot { caster, age: 0 });
+        self.slots[index] = Some(match self.slots[index] {
+            Some(slot) if slot.caster == caster => ShadowCacheSlot { age: 0, ..slot },
+            _ => ShadowCacheSlot {
+                caster,
+                age: 0,
+                refresh_phase: u32::from(self.rng.next_u15()),
+                projection: None,
+            },
+        });
         Some(index)
+    }
+
+    fn reused_projection(&self, index: usize, native_kind: u32) -> Option<ShadowProjection> {
+        let slot = self.slots[index]?;
+        // RobShdwRefreshMask=1: retain the assigned phase until the page is evicted.
+        (native_kind == 4 && (slot.refresh_phase & 1) != (self.frame_index & 1))
+            .then_some(slot.projection)
+            .flatten()
     }
 }
 
@@ -448,15 +477,53 @@ fn build_shadow_frame_inner(
             continue;
         };
         let (origin, size) = native_page_layout(slot);
-        let projection = make_projection(caster, contribution, scene.fade)?;
-        rasterize_page(
-            &mut frame.atlas_rgba8,
-            origin,
-            size,
-            caster,
-            projection,
-            scene.smooth_passes,
-        );
+        let mut projection = make_projection(caster, contribution, scene.fade)?;
+        let reused = cache
+            .as_deref()
+            .and_then(|cache| cache.reused_projection(slot, caster.native_kind));
+        if let Some(previous) = reused {
+            for row in 0..3 {
+                for column in 0..3 {
+                    projection.world_from_shadow[row * 4 + column] =
+                        previous.world_from_shadow[row * 4 + column];
+                    projection.shadow_from_world[row * 4 + column] =
+                        previous.shadow_from_world[row * 4 + column];
+                }
+                let inverse_axis = [
+                    projection.shadow_from_world[row * 4],
+                    projection.shadow_from_world[row * 4 + 1],
+                    projection.shadow_from_world[row * 4 + 2],
+                ];
+                projection.shadow_from_world[row * 4 + 3] =
+                    -dot(inverse_axis, caster.sphere.center);
+            }
+            projection.shadow_axis = previous.shadow_axis;
+            copy_shadow_page(
+                &cache
+                    .as_deref()
+                    .expect("reused page belongs to cache")
+                    .atlas_rgba8,
+                &mut frame.atlas_rgba8,
+                origin,
+                size,
+            );
+        } else {
+            rasterize_page(
+                &mut frame.atlas_rgba8,
+                origin,
+                size,
+                caster,
+                projection,
+                scene.smooth_passes,
+            );
+            if let Some(cache) = cache.as_deref_mut() {
+                cache.slots[slot]
+                    .as_mut()
+                    .expect("assigned page")
+                    .projection = Some(projection);
+                copy_shadow_page(&frame.atlas_rgba8, &mut cache.atlas_rgba8, origin, size);
+            }
+        }
         pages.push(ShadowPage {
             origin: [origin[0] as u32, origin[1] as u32],
             size: size as u32,
@@ -744,6 +811,13 @@ fn native_round(value: f32) -> isize {
         lower + 1.0
     };
     rounded as isize
+}
+
+fn copy_shadow_page(source: &[u8], destination: &mut [u8], origin: [usize; 2], size: usize) {
+    for y in origin[1]..origin[1] + size {
+        let start = (y * SHADOW_ATLAS_WIDTH + origin[0]) * 4;
+        destination[start..start + size * 4].copy_from_slice(&source[start..start + size * 4]);
+    }
 }
 
 fn rasterize_page(
@@ -1598,6 +1672,110 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn robot_refresh_gate_matches_live_native_frame_parities() {
+        let mut cache = ShadowPageCache::default();
+        let slot = cache.assign(7, 1).unwrap();
+        assert!(
+            cache.reused_projection(slot, 4).is_none(),
+            "new page must be drawn"
+        );
+        let robot = caster(7, 2.0, 4, Vec::new());
+        let projection = make_projection(
+            &robot,
+            LightContribution {
+                direction: [0.0, 0.0, 1.0],
+                strength: 1.0,
+            },
+            1.0,
+        )
+        .unwrap();
+        let entry = cache.slots[slot].as_mut().unwrap();
+        // GOG CShade +0x30869, one retained page with phase 17356.
+        entry.refresh_phase = 17356;
+        entry.projection = Some(projection);
+        for (frame, reused) in [
+            (16735810, false),
+            (16735811, true),
+            (16735812, false),
+            (16735813, true),
+        ] {
+            cache.frame_index = frame;
+            assert_eq!(cache.reused_projection(slot, 4).is_some(), reused);
+        }
+    }
+
+    #[test]
+    fn robot_page_holds_shape_and_basis_between_refreshes_but_tracks_translation() {
+        let mut robot = caster(
+            7,
+            2.0,
+            4,
+            vec![triangle(
+                [[-0.8, -0.8, 0.0], [0.0, 0.8, 0.0], [0.8, -0.8, 0.0]],
+                0,
+            )],
+        );
+        let mut receivers = vec![triangle(
+            [[-20.0, -20.0, 1.0], [0.0, 20.0, 1.0], [20.0, -20.0, 1.0]],
+            0,
+        )];
+        let mut light = ShadowLight::Directional {
+            direction: [0.0, 0.0, 1.0],
+            rgb: [1.0; 3],
+            active: true,
+            flags: SHADOW_PRIMARY_DIRECTIONAL_FLAG,
+        };
+        let render = |cache: &mut ShadowPageCache,
+                      robot: &ShadowCaster,
+                      light,
+                      receivers: &[ShadowTriangle]| {
+            cache
+                .build(ShadowScene {
+                    lights: &[light],
+                    casters: std::slice::from_ref(robot),
+                    receivers,
+                    fade: 1.0,
+                    smooth_passes: 1,
+                    camera: None,
+                    lod: ShadowLodSettings::default(),
+                })
+                .unwrap()
+        };
+        let mut cache = ShadowPageCache::default();
+        let first = render(&mut cache, &robot, light, &receivers);
+        assert!(first.atlas_rgba8.iter().any(|&value| value != 0));
+        assert!(!first.vertices.is_empty());
+        robot.sphere.center[0] = 2.0;
+        for vertex in &mut robot.triangles[0].positions {
+            vertex[0] = vertex[0] * 0.25 + 2.0;
+            vertex[1] *= 0.25;
+        }
+        for vertex in &mut receivers[0].positions {
+            vertex[0] += 2.0;
+        }
+        if let ShadowLight::Directional { direction, .. } = &mut light {
+            *direction = [0.4, 0.0, 1.0];
+        }
+        let held = render(&mut cache, &robot, light, &receivers);
+        assert!(
+            held.atlas_rgba8 == first.atlas_rgba8,
+            "intermediate frame must reuse the raster"
+        );
+        assert_eq!(held.vertices.len(), first.vertices.len());
+        for (a, b) in first.vertices.iter().zip(&held.vertices) {
+            assert!((b.position[0] - a.position[0] - 2.0).abs() < 1.0e-5);
+            assert!((b.position[1] - a.position[1]).abs() < 1.0e-5);
+            assert!((b.position[2] - a.position[2]).abs() < 1.0e-5);
+            assert_eq!(b.uv, a.uv);
+        }
+        let refreshed = render(&mut cache, &robot, light, &receivers);
+        assert!(
+            refreshed.atlas_rgba8 != first.atlas_rgba8,
+            "next refresh must use the changed pose"
+        );
     }
 
     #[test]

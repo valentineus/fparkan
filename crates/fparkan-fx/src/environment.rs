@@ -187,19 +187,19 @@ pub const LIGHTNING_QUAD_DIMENSIONS: [f32; 3] = [
 ];
 const NATIVE_RANDOM_SCALE: f32 = 1.0 / 32_768.0;
 
-/// The CRT linear congruential sequence used by Terrain.dll's weather.
+/// The CRT linear congruential sequence used by Terrain.dll.
 /// The environment system passes one stream through each emitter in update order.
 #[derive(Clone, Copy, Debug)]
-struct NativeRng {
+pub(crate) struct NativeRng {
     state: u32,
 }
 
 impl NativeRng {
-    fn new(seed: u64) -> Self {
+    pub(crate) fn new(seed: u64) -> Self {
         Self { state: seed as u32 }
     }
 
-    fn next_u15(&mut self) -> u16 {
+    pub(crate) fn next_u15(&mut self) -> u16 {
         self.state = self
             .state
             .wrapping_mul(0x0003_43FD)
