@@ -33,6 +33,29 @@ pub(super) fn reflected_pipeline_state(
     state
 }
 
+pub(super) fn reflected_terrain_pipeline_state(
+    state: fparkan_render::LegacyPipelineState,
+) -> fparkan_render::LegacyPipelineState {
+    // Native reflected Land packets retain clockwise faces; water keeps its underside.
+    fparkan_render::LegacyPipelineState {
+        cull: fparkan_render::LegacyCullMode::BackFace,
+        ..state
+    }
+}
+
+pub(super) fn reflected_draw_pipeline_state(
+    range: &super::VulkanStaticDrawRange,
+) -> fparkan_render::LegacyPipelineState {
+    let state = reflected_pipeline_state(range.pipeline_state);
+    if range.terrain_reflection {
+        fparkan_render::water::legacy_reflected_water_pipeline(state)
+    } else if range.terrain_surface {
+        reflected_terrain_pipeline_state(range.pipeline_state)
+    } else {
+        state
+    }
+}
+
 pub(super) fn mesh_reflection_planes(mesh: &super::VulkanStaticMesh) -> Vec<Option<f32>> {
     mesh.draw_ranges
         .iter()
@@ -433,6 +456,44 @@ mod tests {
     use crate::{VulkanStaticDrawRange, VulkanStaticMesh, VulkanStaticVertex};
 
     #[test]
+    fn reflected_land_keeps_native_clockwise_faces_without_culling_water_undersides() {
+        use fparkan_render::LegacyCullMode;
+        // Actual reflected Land packet and shifted projection; all 984 non-water
+        // triangles in the native frame have this clockwise viewport winding.
+        let points = [
+            [912.06555_f32, 286.18677, 334.75375],
+            [920.8868, 295.9891, 329.7298],
+            [914.6643, 300.5556, 325.31824],
+        ];
+        let projected = points.map(|[x, y, z]| {
+            let w = z - 115.0;
+            [
+                (-70.0 / 457.30994 * (y - 965.28656) + (1.0 - 2.0 * 312.45984 / 457.30994) * w) / w,
+                (-70.0 / 281.6764 * (x - 1270.1804) + (1.0 - 2.0 * 126.905396 / 281.6764) * w) / w,
+            ]
+        });
+        let [a, b, c] = projected;
+        assert!((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]) > 0.0);
+        let mut range = VulkanStaticMesh::smoke_triangle().draw_ranges[0];
+        range.terrain_surface = true;
+        assert_eq!(
+            reflected_draw_pipeline_state(&range).cull,
+            LegacyCullMode::BackFace
+        );
+        range.terrain_reflection = true;
+        assert_eq!(
+            reflected_draw_pipeline_state(&range).cull,
+            LegacyCullMode::Disabled
+        );
+        range.terrain_surface = false;
+        range.terrain_reflection = false;
+        assert_eq!(
+            reflected_draw_pipeline_state(&range),
+            reflected_pipeline_state(range.pipeline_state)
+        );
+    }
+
+    #[test]
     fn reflection_prefers_native_565_then_555_and_requires_filterable_blending() {
         let required = vk::FormatFeatureFlags::COLOR_ATTACHMENT
             | vk::FormatFeatureFlags::COLOR_ATTACHMENT_BLEND
@@ -478,6 +539,7 @@ mod tests {
                 material_index: 0,
                 lightmap_index: 255,
                 batch_flags: 0,
+                terrain_surface: false,
                 terrain_base_only: false,
                 terrain_reflection: true,
                 pipeline_state: fparkan_render::LegacyPipelineState::default(),

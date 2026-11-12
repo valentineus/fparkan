@@ -1026,13 +1026,22 @@ fn create_graphics_pipeline_cache(
         .copied()
         .flat_map(super::smoke::pipeline_variants)
         .flat_map(|state| {
-            std::iter::once((state, false, render_pass)).chain(reflection_render_pass.map(|pass| {
-                (
-                    super::reflection::reflected_pipeline_state(state),
-                    true,
-                    pass,
-                )
-            }))
+            std::iter::once((state, false, render_pass)).chain(
+                reflection_render_pass.into_iter().flat_map(move |pass| {
+                    [
+                        (
+                            super::reflection::reflected_pipeline_state(state),
+                            true,
+                            pass,
+                        ),
+                        (
+                            super::reflection::reflected_terrain_pipeline_state(state),
+                            true,
+                            pass,
+                        ),
+                    ]
+                }),
+            )
         })
     {
         let key = (PipelineKey::from(state), reflected);

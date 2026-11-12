@@ -239,6 +239,7 @@ mod tests {
             material_index: 7,
             lightmap_index: u8::MAX,
             batch_flags: 0,
+            terrain_surface: true,
             terrain_base_only: true,
             terrain_reflection: false,
             pipeline_state: super::super::world_pipeline_state(
@@ -281,6 +282,7 @@ mod tests {
         for split in &mesh.draw_ranges {
             assert_eq!(split.material_index, 7);
             assert_eq!(split.pipeline_state, range.pipeline_state);
+            assert!(split.terrain_surface);
             assert!(split.terrain_base_only);
         }
         assert!(split_ranges(&mut mesh, &nodes[..3], TerrainLod::Lod0).is_err());

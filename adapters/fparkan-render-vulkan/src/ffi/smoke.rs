@@ -1967,13 +1967,7 @@ impl VulkanSmokeRenderer {
                         continue;
                     }
                     let state = if reflected {
-                        let state =
-                            super::reflection::reflected_pipeline_state(range.pipeline_state);
-                        if range.terrain_reflection {
-                            fparkan_render::water::legacy_reflected_water_pipeline(state)
-                        } else {
-                            state
-                        }
+                        super::reflection::reflected_draw_pipeline_state(range)
                     } else {
                         range.pipeline_state
                     };
@@ -2941,6 +2935,7 @@ mod tests {
                 lightmap_index: 4,
                 batch_flags: 0x108,
                 pipeline_state: base_state,
+                terrain_surface: false,
                 terrain_base_only: false,
                 terrain_reflection: false,
                 alpha_test_reference: 17,
@@ -2953,6 +2948,7 @@ mod tests {
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
                 pipeline_state: LegacyPipelineState::default(),
+                terrain_surface: false,
                 terrain_base_only: false,
                 terrain_reflection: false,
                 alpha_test_reference: 0,
@@ -3111,6 +3107,7 @@ mod tests {
             lightmap_index: u8::MAX,
             batch_flags: 0,
             pipeline_state: LegacyPipelineState::default(),
+            terrain_surface: false,
             terrain_base_only: false,
             terrain_reflection: false,
             alpha_test_reference: 0,
@@ -3299,6 +3296,7 @@ mod tests {
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
                 pipeline_state: fparkan_render::LegacyPipelineState::default(),
+                terrain_surface: false,
                 terrain_base_only: false,
                 terrain_reflection: false,
                 alpha_test_reference: 0,
@@ -3325,6 +3323,7 @@ mod tests {
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
                 pipeline_state: fparkan_render::LegacyPipelineState::default(),
+                terrain_surface: false,
                 terrain_base_only: false,
                 terrain_reflection: false,
                 alpha_test_reference: 0,
@@ -3337,6 +3336,7 @@ mod tests {
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
                 pipeline_state: fparkan_render::LegacyPipelineState::default(),
+                terrain_surface: false,
                 terrain_base_only: false,
                 terrain_reflection: false,
                 alpha_test_reference: 0,
@@ -3349,6 +3349,7 @@ mod tests {
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
                 pipeline_state: fparkan_render::LegacyPipelineState::default(),
+                terrain_surface: false,
                 terrain_base_only: false,
                 terrain_reflection: false,
                 alpha_test_reference: 0,
@@ -3375,6 +3376,7 @@ mod tests {
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
                 pipeline_state: fparkan_render::LegacyPipelineState::default(),
+                terrain_surface: false,
                 terrain_base_only: false,
                 terrain_reflection: false,
                 alpha_test_reference: 0,
@@ -3470,6 +3472,7 @@ mod tests {
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
                 pipeline_state: LegacyPipelineState::default(),
+                terrain_surface: false,
                 terrain_base_only: false,
                 terrain_reflection: false,
                 alpha_test_reference: 0,
@@ -3530,6 +3533,7 @@ mod tests {
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
                 pipeline_state: LegacyPipelineState::default(),
+                terrain_surface: false,
                 terrain_base_only: false,
                 terrain_reflection: false,
                 alpha_test_reference: 0,

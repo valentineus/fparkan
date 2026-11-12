@@ -461,6 +461,8 @@ pub struct VulkanStaticDrawRange {
     /// Bits `0x100` and `0x008` opt a range into that queue independently of
     /// the material blend category.
     pub batch_flags: u16,
+    /// Land geometry, including terrain fragments cut around building foundations.
+    pub terrain_surface: bool,
     /// Terrain ranges that use the native lit base-only path (face flag 0x400 clear).
     pub terrain_base_only: bool,
     /// Terrain face flag 0x20000 requests a water reflection surface.
@@ -799,6 +801,7 @@ impl VulkanStaticMesh {
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
                 pipeline_state: LegacyPipelineState::default(),
+                terrain_surface: false,
                 terrain_base_only: false,
                 terrain_reflection: false,
                 alpha_test_reference: 0,
@@ -1087,6 +1090,7 @@ mod static_mesh_tests {
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
                 pipeline_state: LegacyPipelineState::default(),
+                terrain_surface: false,
                 terrain_base_only: false,
                 terrain_reflection: false,
                 alpha_test_reference: 0,
@@ -1120,6 +1124,7 @@ mod static_mesh_tests {
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
                 pipeline_state: LegacyPipelineState::default(),
+                terrain_surface: false,
                 terrain_base_only: false,
                 terrain_reflection: false,
                 alpha_test_reference: 0,
@@ -1132,6 +1137,7 @@ mod static_mesh_tests {
                 lightmap_index: u8::MAX,
                 batch_flags: 0,
                 pipeline_state: LegacyPipelineState::default(),
+                terrain_surface: false,
                 terrain_base_only: false,
                 terrain_reflection: false,
                 alpha_test_reference: 0,
@@ -1251,6 +1257,7 @@ mod static_mesh_tests {
     fn alpha_cutoff_is_dynamic_and_disabled_outside_alpha_test_pipeline() {
         let base = VulkanStaticMesh::smoke_triangle().draw_ranges[0];
         let disabled = VulkanStaticDrawRange {
+            terrain_surface: false,
             terrain_base_only: false,
             terrain_reflection: false,
             alpha_test_reference: 200,
@@ -1261,6 +1268,7 @@ mod static_mesh_tests {
                 alpha_test: true,
                 ..LegacyPipelineState::default()
             },
+            terrain_surface: false,
             terrain_base_only: false,
             terrain_reflection: false,
             alpha_test_reference: 128,
@@ -1273,6 +1281,7 @@ mod static_mesh_tests {
                 alpha_test: true,
                 ..LegacyPipelineState::default()
             },
+            terrain_surface: false,
             terrain_base_only: false,
             terrain_reflection: false,
             alpha_test_reference: 0,
@@ -1284,6 +1293,7 @@ mod static_mesh_tests {
                 alpha_test: true,
                 ..LegacyPipelineState::default()
             },
+            terrain_surface: false,
             terrain_base_only: false,
             terrain_reflection: false,
             alpha_test_reference: VulkanStaticDrawRange::NATIVE_DEFAULT_ALPHA_TEST_REFERENCE,
