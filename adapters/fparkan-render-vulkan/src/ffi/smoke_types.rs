@@ -142,6 +142,8 @@ pub struct VulkanDirectionalLight {
     pub coefficients: [f32; 3],
     /// Whether the light participates in this frame.
     pub active: bool,
+    /// Whether this light contributes a material specular highlight.
+    pub specular_enabled: bool,
 }
 
 impl Default for VulkanDirectionalLight {
@@ -151,6 +153,7 @@ impl Default for VulkanDirectionalLight {
             rgb: [0.0; 3],
             coefficients: [0.0, 0.0, 1.0],
             active: false,
+            specular_enabled: true,
         }
     }
 }
@@ -256,6 +259,7 @@ impl VulkanFrameUniforms {
             rgb: [1.0; 3],
             coefficients: [0.0, 0.0, 1.0],
             active: true,
+            specular_enabled: true,
         };
         Self {
             clip_from_world: camera.clip_from_world,
@@ -324,7 +328,7 @@ impl VulkanFrameUniforms {
                 light.rgb[0],
                 light.rgb[1],
                 light.rgb[2],
-                if light.active { 1.0 } else { 0.0 },
+                if light.specular_enabled { 1.0 } else { 0.0 },
             ]);
             let coefficient_offset = 48 + index * 4;
             values[coefficient_offset..coefficient_offset + 4].copy_from_slice(&[
@@ -875,6 +879,7 @@ mod static_mesh_tests {
                     rgb: [4.0, 5.0, 6.0],
                     coefficients: [7.0, 8.0, 9.0],
                     active: true,
+                    specular_enabled: true,
                 },
                 VulkanDirectionalLight::default(),
                 VulkanDirectionalLight::default(),
@@ -918,6 +923,13 @@ mod static_mesh_tests {
         assert_eq!(read(384), 0.25);
         assert_eq!(read(388), 100.0);
         assert_eq!(read(392), 0.01);
+        let mut diffuse_only = frame;
+        diffuse_only.directional_lights[0].specular_enabled = false;
+        let bytes = diffuse_only.to_ne_bytes();
+        let read = |offset| f32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        assert_eq!(read(76), 1.0);
+        assert_eq!(read(128), 4.0);
+        assert_eq!(read(140), 0.0);
     }
 
     #[test]

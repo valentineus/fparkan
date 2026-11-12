@@ -10487,6 +10487,7 @@ impl StaticVulkanApp {
                 target.rgb = source.color;
                 target.coefficients = [0.0, 0.0, 1.0];
                 target.active = source.active;
+                target.specular_enabled = source.specular_enabled;
             }
             uniforms.lighting_floor = sky_frame.lighting_floor;
             let fog_rgb = sky_frame

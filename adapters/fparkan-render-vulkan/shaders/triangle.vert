@@ -184,21 +184,24 @@ LightingTerms native_material_lighting(
     for (int index = 0; index < 4; ++index) {
         vec4 direction_record = frame.directional_direction[index];
         vec4 rgb_record = frame.directional_rgb[index];
-        if (direction_record.w <= 0.5 || rgb_record.w <= 0.5) {
+        if (direction_record.w <= 0.5) {
             continue;
         }
         vec3 light_direction = normalized_or(-direction_record.xyz, vec3(0.0, 0.0, 1.0));
         float ndotl = max(dot(normal, light_direction), 0.0);
         accumulated += ndotl * directional_rgb * rgb_record.rgb;
-        specular += specular_from_light(
-            normal,
-            view_direction,
-            light_direction,
-            rgb_record.rgb,
-            specular_rgb,
-            specular_power,
-            1.0
-        );
+        // CShade light flags bit 1 suppresses only the specular contribution.
+        if (rgb_record.w > 0.5) {
+            specular += specular_from_light(
+                normal,
+                view_direction,
+                light_direction,
+                rgb_record.rgb,
+                specular_rgb,
+                specular_power,
+                1.0
+            );
+        }
     }
     for (uint index = 0u; index < point_light_buffer.header.x; ++index) {
         PointLightRecord point_light = point_light_buffer.records[index];

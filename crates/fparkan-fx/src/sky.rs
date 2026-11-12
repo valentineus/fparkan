@@ -870,6 +870,8 @@ pub struct SkySpriteFrame<'a> {
 pub struct DirectionalLightFrame {
     /// False means the light slot must be removed from the light manager.
     pub active: bool,
+    /// False for the opposite light, whose native flags disable specular.
+    pub specular_enabled: bool,
     /// Direction used by the native light manager.
     pub direction: [f32; 3],
     /// RGB value passed to the native light manager without another intensity
@@ -880,6 +882,7 @@ pub struct DirectionalLightFrame {
 impl DirectionalLightFrame {
     const INACTIVE: Self = Self {
         active: false,
+        specular_enabled: false,
         direction: [0.0; 3],
         color: [0.0; 3],
     };
@@ -1146,11 +1149,13 @@ impl SunFrame {
         [
             DirectionalLightFrame {
                 active: true,
+                specular_enabled: true,
                 direction: self.direction,
                 color: self.color,
             },
             DirectionalLightFrame {
                 active: true,
+                specular_enabled: false,
                 direction: self.direction.map(|component| -component),
                 color: self.secondary_color,
             },
@@ -2040,6 +2045,8 @@ mod tests {
             ]
         );
         let lights = frame.directional_lights();
+        assert!(lights[0].specular_enabled);
+        assert!(!lights[1].specular_enabled);
         assert_eq!(lights[0].color, frame.color);
         assert_eq!(lights[1].direction, frame.direction.map(|value| -value));
         assert_eq!(
