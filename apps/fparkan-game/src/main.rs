@@ -9972,6 +9972,7 @@ impl StaticVulkanApp {
         mesh: &mut VulkanStaticMesh,
         dynamic_vertex_start: usize,
         shadow_cache: &mut ShadowPageCache,
+        shadow_frame_index: u64,
         shadow_casters: &[ShadowCaster],
         shadow_receivers: &[ShadowTriangle],
         shadow_range: EnvironmentGpuRange,
@@ -9991,15 +9992,18 @@ impl StaticVulkanApp {
             renderer.frame_uniforms().clip_from_world,
         );
         let frame = shadow_cache
-            .build(ShadowScene {
-                lights: &lights,
-                casters: &visible_casters,
-                receivers: shadow_receivers,
-                fade: 1.0,
-                smooth_passes: 1,
-                camera: shadow_camera,
-                lod: ShadowLodSettings::default(),
-            })
+            .build(
+                shadow_frame_index,
+                ShadowScene {
+                    lights: &lights,
+                    casters: &visible_casters,
+                    receivers: shadow_receivers,
+                    fade: 1.0,
+                    smooth_passes: 1,
+                    camera: shadow_camera,
+                    lod: ShadowLodSettings::default(),
+                },
+            )
             .map_err(|error| format!("build projected shadow frame: {error}"))?;
         let geometry = append_shadow_frame_geometry(
             mesh,
@@ -10583,6 +10587,7 @@ impl StaticVulkanApp {
                 &mut self.mesh,
                 self.dynamic_vertex_start,
                 &mut self.shadow_cache,
+                self.frames_presented.saturating_add(1),
                 &self.shadow_casters,
                 &self.shadow_receivers,
                 self.shadow_range,
@@ -10608,6 +10613,7 @@ impl StaticVulkanApp {
                 &mut self.mesh,
                 self.dynamic_vertex_start,
                 &mut self.shadow_cache,
+                self.frames_presented.saturating_add(1),
                 &self.shadow_casters,
                 &self.shadow_receivers,
                 self.shadow_range,

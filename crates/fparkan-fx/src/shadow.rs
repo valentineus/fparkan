@@ -129,7 +129,7 @@ struct ShadowCacheSlot {
 pub struct ShadowPageCache {
     slots: [Option<ShadowCacheSlot>; SHADOW_PAGE_COUNT],
     atlas_rgba8: Vec<u8>,
-    frame_index: u32,
+    frame_index: Option<u64>,
     rng: NativeRng,
     /// Slots claimed while building the current frame.  A slot already used
     /// by an earlier candidate must not be evicted again by a later one.
@@ -141,7 +141,7 @@ impl Default for ShadowPageCache {
         Self {
             slots: [None; SHADOW_PAGE_COUNT],
             atlas_rgba8: vec![0; SHADOW_ATLAS_WIDTH * SHADOW_ATLAS_HEIGHT * 4],
-            frame_index: 0,
+            frame_index: None,
             // shortcut: native process-wide allocation order is not connected in preview.
             rng: NativeRng::new(1),
             frame_used: [false; SHADOW_PAGE_COUNT],
@@ -151,8 +151,13 @@ impl Default for ShadowPageCache {
 
 impl ShadowPageCache {
     /// Builds a frame while preserving page ownership across calls.
-    pub fn build(&mut self, scene: ShadowScene<'_>) -> Result<ShadowFrame, ShadowError> {
-        self.begin_frame();
+    /// Use the same index to redraw the current frame after a resize.
+    pub fn build(
+        &mut self,
+        frame_index: u64,
+        scene: ShadowScene<'_>,
+    ) -> Result<ShadowFrame, ShadowError> {
+        self.begin_frame(frame_index);
         build_shadow_frame_inner(scene, Some(self))
     }
 
@@ -160,6 +165,7 @@ impl ShadowPageCache {
     /// native preferred page groups again.
     pub fn clear(&mut self) {
         self.slots = [None; SHADOW_PAGE_COUNT];
+        self.frame_index = None;
         self.frame_used = [false; SHADOW_PAGE_COUNT];
         self.atlas_rgba8.fill(0);
     }
@@ -178,9 +184,12 @@ impl ShadowPageCache {
             .map(|(index, _)| index)
     }
 
-    fn begin_frame(&mut self) {
-        self.frame_index = self.frame_index.wrapping_add(1);
+    fn begin_frame(&mut self, frame_index: u64) {
         self.frame_used = [false; SHADOW_PAGE_COUNT];
+        if self.frame_index == Some(frame_index) {
+            return;
+        }
+        self.frame_index = Some(frame_index);
         for slot in &mut self.slots {
             if let Some(slot) = slot {
                 slot.age = slot.age.saturating_add(1);
@@ -261,7 +270,7 @@ impl ShadowPageCache {
     fn reused_projection(&self, index: usize, native_kind: u32) -> Option<ShadowProjection> {
         let slot = self.slots[index]?;
         // RobShdwRefreshMask=1: retain the assigned phase until the page is evicted.
-        (native_kind == 4 && (slot.refresh_phase & 1) != (self.frame_index & 1))
+        (native_kind == 4 && u64::from(slot.refresh_phase & 1) != (self.frame_index? & 1))
             .then_some(slot.projection)
             .flatten()
     }
@@ -1702,7 +1711,7 @@ mod tests {
             (16735812, false),
             (16735813, true),
         ] {
-            cache.frame_index = frame;
+            cache.frame_index = Some(frame);
             assert_eq!(cache.reused_projection(slot, 4).is_some(), reused);
         }
     }
@@ -1729,23 +1738,27 @@ mod tests {
             flags: SHADOW_PRIMARY_DIRECTIONAL_FLAG,
         };
         let render = |cache: &mut ShadowPageCache,
+                      frame_index: u64,
                       robot: &ShadowCaster,
                       light,
                       receivers: &[ShadowTriangle]| {
             cache
-                .build(ShadowScene {
-                    lights: &[light],
-                    casters: std::slice::from_ref(robot),
-                    receivers,
-                    fade: 1.0,
-                    smooth_passes: 1,
-                    camera: None,
-                    lod: ShadowLodSettings::default(),
-                })
+                .build(
+                    frame_index,
+                    ShadowScene {
+                        lights: &[light],
+                        casters: std::slice::from_ref(robot),
+                        receivers,
+                        fade: 1.0,
+                        smooth_passes: 1,
+                        camera: None,
+                        lod: ShadowLodSettings::default(),
+                    },
+                )
                 .unwrap()
         };
         let mut cache = ShadowPageCache::default();
-        let first = render(&mut cache, &robot, light, &receivers);
+        let first = render(&mut cache, 1, &robot, light, &receivers);
         assert!(first.atlas_rgba8.iter().any(|&value| value != 0));
         assert!(!first.vertices.is_empty());
         robot.sphere.center[0] = 2.0;
@@ -1759,7 +1772,7 @@ mod tests {
         if let ShadowLight::Directional { direction, .. } = &mut light {
             *direction = [0.4, 0.0, 1.0];
         }
-        let held = render(&mut cache, &robot, light, &receivers);
+        let held = render(&mut cache, 2, &robot, light, &receivers);
         assert!(
             held.atlas_rgba8 == first.atlas_rgba8,
             "intermediate frame must reuse the raster"
@@ -1771,7 +1784,13 @@ mod tests {
             assert!((b.position[2] - a.position[2]).abs() < 1.0e-5);
             assert_eq!(b.uv, a.uv);
         }
-        let refreshed = render(&mut cache, &robot, light, &receivers);
+        let retried = render(&mut cache, 2, &robot, light, &receivers);
+        assert!(
+            retried.atlas_rgba8 == held.atlas_rgba8,
+            "a retry must hold the same raster"
+        );
+        assert_eq!(retried.vertices, held.vertices);
+        let refreshed = render(&mut cache, 3, &robot, light, &receivers);
         assert!(
             refreshed.atlas_rgba8 != first.atlas_rgba8,
             "next refresh must use the changed pose"
@@ -1798,15 +1817,18 @@ mod tests {
             flags: SHADOW_PRIMARY_DIRECTIONAL_FLAG,
         };
         let first = cache
-            .build(ShadowScene {
-                lights: &[light],
-                casters: &[building.clone()],
-                receivers: &[],
-                fade: 1.0,
-                smooth_passes: 0,
-                camera: Some(camera),
-                lod: ShadowLodSettings::default(),
-            })
+            .build(
+                1,
+                ShadowScene {
+                    lights: &[light],
+                    casters: &[building.clone()],
+                    receivers: &[],
+                    fade: 1.0,
+                    smooth_passes: 0,
+                    camera: Some(camera),
+                    lod: ShadowLodSettings::default(),
+                },
+            )
             .expect("first cached frame");
         assert_eq!(
             first.atlas_rgba8.len(),
@@ -1814,15 +1836,18 @@ mod tests {
         );
         let slot = cache.page_slot(building.id).expect("cached page");
         let second = cache
-            .build(ShadowScene {
-                lights: &[light],
-                casters: &[building],
-                receivers: &[],
-                fade: 1.0,
-                smooth_passes: 0,
-                camera: Some(camera),
-                lod: ShadowLodSettings::default(),
-            })
+            .build(
+                2,
+                ShadowScene {
+                    lights: &[light],
+                    casters: &[building],
+                    receivers: &[],
+                    fade: 1.0,
+                    smooth_passes: 0,
+                    camera: Some(camera),
+                    lod: ShadowLodSettings::default(),
+                },
+            )
             .expect("reused cached frame");
         assert_eq!(cache.page_slot(41), Some(slot));
         assert_eq!(second.atlas_rgba8.len(), first.atlas_rgba8.len());
@@ -1861,18 +1886,22 @@ mod tests {
             .collect::<Vec<_>>();
         let mut cache = ShadowPageCache::default();
 
-        for (start, expected_used) in [(0, 20), (20, 16), (20, 16)] {
+        for (frame, (start, expected_used)) in [(0, 20), (20, 16), (20, 16)].into_iter().enumerate()
+        {
             let selected = casters[start..start + 20].to_vec();
             let _frame = cache
-                .build(ShadowScene {
-                    lights: &[light],
-                    casters: &selected,
-                    receivers: &[],
-                    fade: 1.0,
-                    smooth_passes: 0,
-                    camera: None,
-                    lod: ShadowLodSettings::default(),
-                })
+                .build(
+                    frame as u64,
+                    ShadowScene {
+                        lights: &[light],
+                        casters: &selected,
+                        receivers: &[],
+                        fade: 1.0,
+                        smooth_passes: 0,
+                        camera: None,
+                        lod: ShadowLodSettings::default(),
+                    },
+                )
                 .expect("cached multi-frame shadow build");
 
             let used = cache
