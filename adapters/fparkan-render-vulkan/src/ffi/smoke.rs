@@ -1,7 +1,7 @@
 #![allow(unsafe_code)]
 
 use ash::vk;
-use fparkan_render::{LegacyDepthMode, LegacyPipelineState};
+use fparkan_render::{LegacyBlendMode, LegacyDepthMode, LegacyPipelineState};
 
 use super::smoke_types::{resolve_draw_texture_indices, VulkanStaticMaterial};
 use super::update_material_texture_descriptor;
@@ -2099,6 +2099,12 @@ impl VulkanSmokeRenderer {
                         *material_mode
                     };
                     let material_mode = (material_mode.round() as i32
+                        // Native world alpha FX carry fog even without material lighting.
+                        | if mode & 15 == 1 && state.blend == LegacyBlendMode::SourceAlpha {
+                            512
+                        } else {
+                            0
+                        }
                         | if reflected { 32 } else { 0 }
                         | if reflected && range.terrain_reflection {
                             256

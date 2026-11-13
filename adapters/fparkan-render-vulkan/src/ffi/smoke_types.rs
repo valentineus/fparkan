@@ -549,8 +549,8 @@ pub struct VulkanStaticMaterial {
     pub overlay_uv_transform: Option<[f32; 4]>,
     /// Normalized atlas transform for the optional overlay detail texture.
     pub overlay_detail_uv_transform: Option<[f32; 4]>,
-    /// Environment layers bypass terrain lighting and fog while retaining the
-    /// same descriptor/pipeline path.
+    /// Environment layers bypass material lighting. World alpha FX still
+    /// receive distance fog; screen-space and sky passes retain their own rules.
     pub unlit: bool,
     /// Native sky mode 4: blend base and secondary textures by the secondary
     /// texture alpha before multiplying by the vertex diffuse color.
