@@ -77,10 +77,11 @@ use fparkan_render_vulkan::{
     VulkanStaticTexture, VulkanStaticTextureMip, VulkanStaticVertex,
 };
 use fparkan_runtime::{
-    create, load_mission_static_preview, load_mission_static_preview_roots, loaded_mission_assets,
-    loaded_mission_object_drafts, loaded_terrain, query_building_segment_world,
-    BasementPlacementMode, BuildingMeshNode, EngineServices, MissionAssets, MissionMode,
-    MissionObjectDraft, MissionRequest,
+    create, frame as step_mission_frame, load_mission, load_mission_static_preview,
+    load_mission_static_preview_roots, loaded_mission_assets, loaded_mission_object_drafts,
+    loaded_terrain, query_building_segment_world, BasementPlacementMode, BuildingMeshNode, Engine,
+    EngineServices, FrameResult, MissionAssets, MissionMode, MissionObjectDraft, MissionRequest,
+    MissionStartupInput,
 };
 #[cfg(test)]
 use fparkan_terrain::BasementFoundationFragment;
@@ -193,6 +194,7 @@ fn run(args: &[String]) -> Result<String, String> {
         preview,
         environment,
         audio,
+        (!args.viewer).then_some(engine),
         args.frames,
         &args.mission,
         loaded.object_count,
@@ -210,14 +212,33 @@ fn run(args: &[String]) -> Result<String, String> {
 }
 
 fn load_requested_mission(
-    engine: &mut fparkan_runtime::Engine,
+    engine: &mut Engine,
     args: &Args,
 ) -> Result<fparkan_runtime::LoadedMission, String> {
     let request = MissionRequest {
         key: args.mission.clone(),
-        mode: MissionMode::SingleMission,
+        mode: if !args.viewer
+            && args
+                .mission
+                .replace('\\', "/")
+                .eq_ignore_ascii_case("MISSIONS/Autodemo.00/data.tma")
+        {
+            MissionMode::AutoDemo
+        } else {
+            MissionMode::SingleMission
+        },
     };
-    if args.preview_roots.get() == 1 {
+    if !args.viewer {
+        load_mission(
+            engine,
+            request,
+            MissionStartupInput {
+                queue_time_ms: 0,
+                // shortcut: the CLI does not yet reproduce the native research startup gate.
+                research_creation_gate: false,
+            },
+        )
+    } else if args.preview_roots.get() == 1 {
         load_mission_static_preview(engine, request)
     } else {
         load_mission_static_preview_roots(engine, request, args.preview_roots)
@@ -9401,6 +9422,7 @@ fn run_static_vulkan_mode(
     preview: StaticPreviewScene,
     environment: Option<DynamicEnvironment>,
     audio: Option<audio::GameAudio>,
+    mission_engine: Option<Engine>,
     target_frames: u64,
     mission: &str,
     object_count: usize,
@@ -9467,6 +9489,10 @@ fn run_static_vulkan_mode(
         control_clock_target_ms,
         startup_timings,
     );
+    app.mission_engine = mission_engine;
+    if app.mission_engine.is_some() {
+        eprintln!("sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 live_render_state_stub=1 (full mission Init and world/resource ticks enabled)");
+    }
     if let Err(err) = event_loop.run_app(&mut app) {
         app.error = Some(format!("winit event loop: {err}"));
     }
@@ -9474,6 +9500,8 @@ fn run_static_vulkan_mode(
 }
 
 struct StaticVulkanApp {
+    mission_engine: Option<Engine>,
+    mission_frame: Option<FrameResult>,
     op1_jitter: Op1JitterState,
     fixed_water_clock_ms: Option<u32>,
     mesh: VulkanStaticMesh,
@@ -9585,6 +9613,8 @@ impl StaticVulkanApp {
             .collect();
         eprintln!("render_coverage shadow_refresh_phase_approx={} (RobShdwRefreshMask=1; local CRT seed 1, native process allocation order unverified)", preview.shadow_casters.len());
         Self {
+            mission_engine: None,
+            mission_frame: None,
             mesh: preview.mesh,
             dynamic_vertex_start: preview.dynamic_vertex_start,
             terrain_lod: preview.terrain_lod,
@@ -10057,6 +10087,12 @@ impl StaticVulkanApp {
             }
         }
         let control_clock_ms = clock.time_ms;
+        if let Some(engine) = self.mission_engine.as_mut() {
+            self.mission_frame = Some(
+                step_mission_frame(engine, control_clock_ms)
+                    .map_err(|err| format!("step mission at {control_clock_ms} ms: {err}"))?,
+            );
+        }
         let effect_elapsed_seconds = control_clock_ms as f32 / 1000.0;
         // CTLD's validated NDP defaults seed the native query gate. This
         // preview does not process mission Action1 updates, so it retains that
@@ -10758,6 +10794,14 @@ impl StaticVulkanApp {
             "render_pipeline_cache pipelines_created={}",
             report.renderer_report.pipeline_creation_count
         );
+        if let Some(frame) = &self.mission_frame {
+            eprintln!(
+                "mission_runtime ticks={} queue_time_ms={} live_objects={}",
+                frame.snapshot.tick.0,
+                self.simulation_time_ms,
+                frame.snapshot.objects.len(),
+            );
+        }
         self.output = Some(format!(
             "rendered mission {}: {} frames, {} objects, {} mesh components, {} terrain components, camera={}, captured_viewport_crop={}, control_clock_ms={}, control_clock_mode={}, materials={}, environment_primitives={}, shadow_casters={}, shadow_indices={}, swapchain_recreates={}, validation={}, swapchain_format={}, readback_format={}, readback={}, readback_sequence={}, startup_ms={{mission_assets:{:.1},terrain_materials:{:.1},sky:{:.1},gpu_initialization:{:.1}}}",
             self.mission,
@@ -11146,6 +11190,7 @@ impl ApplicationHandler for StaticVulkanApp {
 struct Args {
     root: PathBuf,
     mission: String,
+    viewer: bool,
     frames: u64,
     atmosphere_seconds: Option<f32>,
     control_clock_ms: Option<u32>,
@@ -11162,6 +11207,7 @@ impl Args {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut root = None;
         let mut mission = None;
+        let mut viewer = false;
         // Zero means keep the interactive preview open until the user closes
         // it. A bounded `--frames N` remains available for smoke/readback
         // runs and validation scripts.
@@ -11182,6 +11228,7 @@ impl Args {
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
+                "--viewer" => viewer = true,
                 "--root" => {
                     root = Some(
                         iter.next()
@@ -11241,6 +11288,7 @@ impl Args {
                         })?);
                 }
                 "--preview-roots" => {
+                    viewer = true;
                     preview_roots = iter
                         .next()
                         .ok_or_else(|| "--preview-roots requires a value".to_string())?
@@ -11248,12 +11296,14 @@ impl Args {
                         .map_err(|_| "--preview-roots must be a non-zero integer".to_string())?;
                 }
                 "--legacy-camera-capture" => {
+                    viewer = true;
                     legacy_camera_capture =
                         Some(iter.next().map(PathBuf::from).ok_or_else(|| {
                             "--legacy-camera-capture requires a path".to_string()
                         })?);
                 }
                 "--static-animation-frame" => {
+                    viewer = true;
                     static_animation_frame = Some(
                         iter.next()
                             .ok_or_else(|| "--static-animation-frame requires a value".to_string())?
@@ -11264,6 +11314,7 @@ impl Args {
                     );
                 }
                 "--static-material-phase" => {
+                    viewer = true;
                     static_material_phase = Some(
                         iter.next()
                             .ok_or_else(|| "--static-material-phase requires a value".to_string())?
@@ -11293,6 +11344,7 @@ impl Args {
         Ok(Self {
             root,
             mission,
+            viewer,
             frames,
             atmosphere_seconds,
             control_clock_ms,
@@ -11308,7 +11360,7 @@ impl Args {
 }
 
 fn usage() -> String {
-    "usage: fparkan-game --root <path> --mission <path> [--frames <n>] [--atmosphere-seconds <seconds>] [--control-clock-ms <u32>] [--validation] [--preview-roots <non-zero n>] [--legacy-camera-capture <path>] [--static-animation-frame <u16>] [--static-material-phase <u16>] [--readback-out <path>] [--readback-sequence-out <directory>]\nstatic preview uses saved per-component CTLD defaults, with uncontrolled nodes at frame 0; --static-animation-frame overrides all components globally. --control-clock-ms replays one shared MSH/FX clock from zero to the selected time over the requested frames; --readback-sequence-out captures each submitted frame and requires that clock.".to_string()
+    "usage: fparkan-game --root <path> --mission <path> [--viewer] [--frames <n>] [--atmosphere-seconds <seconds>] [--control-clock-ms <u32>] [--validation] [--preview-roots <non-zero n>] [--legacy-camera-capture <path>] [--static-animation-frame <u16>] [--static-material-phase <u16>] [--readback-out <path>] [--readback-sequence-out <directory>]\n--viewer skips mission simulation. Capture, static pose/material and root-limit options select viewer mode. --control-clock-ms replays the scene clock from zero to the selected time over the requested frames; --readback-sequence-out captures each submitted frame and requires that clock.".to_string()
 }
 
 #[cfg(test)]
@@ -12183,6 +12235,7 @@ mod tests {
             root.to_string_lossy().into_owned(),
             "--mission".to_string(),
             mission.to_string(),
+            "--viewer".to_string(),
         ])
         .expect("licensed AutoDemo app arguments");
         let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(&args.root))))
@@ -13653,6 +13706,7 @@ mod tests {
             Ok(Args {
                 root: PathBuf::from("testdata/IS"),
                 mission: "MISSIONS/Autodemo.00/data.tma".to_string(),
+                viewer: false,
                 frames: 3,
                 atmosphere_seconds: None,
                 control_clock_ms: None,
@@ -13668,7 +13722,7 @@ mod tests {
     }
 
     #[test]
-    fn defaults_to_interactive_frame_loop() {
+    fn defaults_to_interactive_mission() {
         let parsed = Args::parse(&strings(&[
             "--root",
             "testdata/IS",
@@ -13676,10 +13730,28 @@ mod tests {
             "MISSIONS/Autodemo.00/data.tma",
         ]))
         .expect("default interactive arguments");
+        assert!(!parsed.viewer);
         assert_eq!(parsed.frames, 0);
         assert_eq!(parsed.preview_roots, NonZeroUsize::MAX);
         assert_eq!(parsed.static_animation_frame, None);
         assert_eq!(parsed.control_clock_ms, None);
+    }
+
+    #[test]
+    fn mission_ticks_once_per_pending_scene_sample() {
+        let (mut app, _) = clock_test_app(Some(2000));
+        let services = EngineServices::new(Arc::new(DirectoryVfs::new(".")));
+        app.mission_engine = Some(create(services).expect("create mission engine"));
+
+        let clock = app.sample_frame_clock();
+        app.prepare_scene_update(clock, [1280.0, 720.0]).unwrap();
+        app.prepare_scene_update(clock, [960.0, 540.0]).unwrap();
+        assert_eq!(app.mission_frame.as_ref().unwrap().snapshot.tick.0, 1);
+
+        app.record_presented_scene_frame();
+        let clock = app.sample_frame_clock();
+        app.prepare_scene_update(clock, [960.0, 540.0]).unwrap();
+        assert_eq!(app.mission_frame.as_ref().unwrap().snapshot.tick.0, 2);
     }
 
     #[test]
