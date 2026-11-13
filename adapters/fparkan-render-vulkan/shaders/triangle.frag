@@ -181,8 +181,9 @@ void main() {
     vec3 lit_rgb = mix(base_lit_rgb, overlay_lit_rgb, overlay_alpha);
     vec3 vertex_rgb = lit_rgb * in_color;
     // Fixed-function color saturates before fog; framebuffer clamping is too late.
-    vec3 final_rgb = combiner_mode == 0 || (mode & 512) != 0
-        ? mix(clamp(vertex_rgb, vec3(0.0), vec3(1.0)), frame.fog_color.rgb, in_fog_factor)
+    vec3 fog_rgb = (mode & 2048) != 0 ? vec3(0.0) : frame.fog_color.rgb;
+    vec3 final_rgb = combiner_mode == 0 || (mode & (512 | 2048)) != 0
+        ? mix(clamp(vertex_rgb, vec3(0.0), vec3(1.0)), fog_rgb, in_fog_factor)
         : vertex_rgb;
     float final_alpha = combiner_mode == 1
         ? base.a * material.diffuse_alpha * in_overlay_alpha

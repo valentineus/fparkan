@@ -14,7 +14,7 @@ use winit::window::Window;
 #[test]
 #[ignore = "requires a Windows display, Vulkan GPU and validation layers"]
 #[allow(deprecated)]
-fn alpha_blended_world_effect_receives_fog_but_screen_effect_does_not() {
+fn world_effect_uses_blend_specific_fog_but_screen_effect_does_not() {
     let event_loop = EventLoop::builder().with_any_thread(true).build().unwrap();
     let window = event_loop
         .create_window(
@@ -26,7 +26,7 @@ fn alpha_blended_world_effect_receives_fog_but_screen_effect_does_not() {
         .unwrap();
     let size = window.inner_size();
     let camera = VulkanStaticCamera::default();
-    for screen_tl in [false, true] {
+    for (category, screen_tl) in [(1, false), (1, true), (2, false), (2, true)] {
         let mut mesh = VulkanStaticMesh::smoke_triangle();
         let mut vertex = mesh.vertices[0];
         vertex.color = [1.0; 3];
@@ -46,15 +46,19 @@ fn alpha_blended_world_effect_receives_fog_but_screen_effect_does_not() {
         mesh.draw_ranges[0].index_count = 6;
         mesh.draw_ranges[0].pipeline_state = mesh.draw_ranges[0]
             .pipeline_state
-            .with_material_category(1)
+            .with_material_category(category)
             .unwrap();
         let material = VulkanStaticMaterial {
             material_index: 0,
-            pipeline_category: 1,
+            pipeline_category: category,
             texture: VulkanStaticTexture {
                 width: 1,
                 height: 1,
-                rgba8: vec![0, 0, 0, 255],
+                rgba8: if category == 2 {
+                    vec![128, 128, 128, 255]
+                } else {
+                    vec![0, 0, 0, 255]
+                },
                 mip_levels: Vec::new(),
             },
             directional_rgb: [0.0; 3],
@@ -116,14 +120,21 @@ fn alpha_blended_world_effect_receives_fog_but_screen_effect_does_not() {
             44 => [2, 1, 0],
             format => panic!("fog regression requires an UNORM surface, got {format}"),
         };
-        let expected = if screen_tl { [0_u8; 3] } else { [26, 51, 77] };
+        let expected = match (category, screen_tl) {
+            (1, false) => [26_u8, 51, 77],
+            (1, true) => [0; 3],
+            // Additive light fades toward zero above the unchanged clear color.
+            (2, false) => [77, 84, 92],
+            (2, true) => [141, 148, 156],
+            _ => unreachable!(),
+        };
         let report = renderer.shutdown().unwrap();
         assert_eq!(report.validation.error_count, 0);
         assert_eq!(report.validation.warning_count, 0);
         for (channel, expected) in channels.into_iter().zip(expected) {
             assert!(
                 image.bytes[offset + channel].abs_diff(expected) <= 1,
-                "screen_tl={screen_tl}: {:?}",
+                "category={category} screen_tl={screen_tl}: {:?}",
                 &image.bytes[offset..offset + 4]
             );
         }

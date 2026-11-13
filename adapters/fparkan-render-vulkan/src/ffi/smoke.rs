@@ -2099,9 +2099,13 @@ impl VulkanSmokeRenderer {
                         *material_mode
                     };
                     let material_mode = (material_mode.round() as i32
-                        // Native world alpha FX carry fog even without material lighting.
-                        | if mode & 15 == 1 && state.blend == LegacyBlendMode::SourceAlpha {
-                            512
+                        // Native world FX use the fog color appropriate to their blend.
+                        | if mode & 15 == 1 {
+                            match state.blend {
+                                LegacyBlendMode::SourceAlpha => 512,
+                                LegacyBlendMode::Additive => 2048,
+                                _ => 0,
+                            }
                         } else {
                             0
                         }
