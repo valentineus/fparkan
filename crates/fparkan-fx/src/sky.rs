@@ -1234,6 +1234,20 @@ pub fn celestial_frame(sample: &SunSample, now_seconds: f32) -> SunFrame {
         .unwrap_or_else(|| SunFrame::inactive(sample))
 }
 
+/// Samples the celestial broadcast to the FX manager (Terrain +0x4B1A4).
+/// No live celestial object leaves the previous flag intact; simultaneous
+/// objects require their native message order and return `None`.
+#[must_use]
+pub fn celestial_effect_manager_flag(atmosphere: &AtmosphereFrame, previous: bool) -> Option<bool> {
+    let sample = match (atmosphere.sun.active, atmosphere.moon.active) {
+        (true, false) => &atmosphere.sun,
+        (false, true) => &atmosphere.moon,
+        (false, false) => return Some(previous),
+        (true, true) => return None,
+    };
+    Some(length3(sample.rgb) > 1.1)
+}
+
 /// Computes the native half-size of a sun or moon screen quad in pixels.
 ///
 /// The SKE tail values are the first two fields of `SunSample::values`; they
@@ -1984,6 +1998,26 @@ mod tests {
         assert_eq!(frame.layers[8].material, None);
         assert_eq!(frame.moon.direction, [0.0; 3]);
         assert_eq!(frame.sprites[0].material, Some("sun"));
+    }
+
+    #[test]
+    fn celestial_effect_gate_tracks_light_strength_and_preserves_inactive_state() {
+        let mut frame = atmosphere(true);
+        frame.sun.rgb = [0.50196081, 0.50710744, 0.67771822];
+        assert_eq!(celestial_effect_manager_flag(&frame, true), Some(false));
+        frame.sun.rgb = [1.8070368, 1.6653084, 1.5590122];
+        assert_eq!(celestial_effect_manager_flag(&frame, false), Some(true));
+        frame.sun.rgb = [1.1, 0.0, 0.0];
+        assert_eq!(celestial_effect_manager_flag(&frame, true), Some(false));
+        frame.sun.rgb[0] = f32::from_bits(1.1_f32.to_bits() + 1);
+        assert_eq!(celestial_effect_manager_flag(&frame, false), Some(true));
+        frame.sun.active = false;
+        assert_eq!(celestial_effect_manager_flag(&frame, true), Some(true));
+        frame.moon.active = true;
+        frame.moon.rgb = [0.5; 3];
+        assert_eq!(celestial_effect_manager_flag(&frame, true), Some(false));
+        frame.sun.active = true;
+        assert_eq!(celestial_effect_manager_flag(&frame, false), None);
     }
 
     #[test]

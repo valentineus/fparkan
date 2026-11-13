@@ -4215,6 +4215,8 @@ struct DynamicEnvironment {
     fixed_phase_reported: bool,
     fixed_sky_uv_ms: Option<u32>,
     captured_celestial_births: Option<camera_capture::CelestialBirthClocks>,
+    control_effect_manager_flag: bool,
+    control_effect_manager_order_reported: bool,
 }
 
 struct DynamicEnvironmentFrame {
@@ -4222,6 +4224,7 @@ struct DynamicEnvironmentFrame {
     sky_mesh: SkyMesh,
     environment_frame: EnvironmentFrame,
     absolute_time_seconds: f32,
+    control_effect_manager_flag: bool,
 }
 
 fn environment_camera_for_preview(
@@ -4289,6 +4292,16 @@ impl DynamicEnvironment {
         if let Some(births) = &self.captured_celestial_births {
             births.apply(&mut atmosphere);
         }
+        if let Some(flag) = fparkan_fx::sky::celestial_effect_manager_flag(
+            &atmosphere,
+            self.control_effect_manager_flag,
+        ) {
+            self.control_effect_manager_flag = flag;
+        } else if !self.control_effect_manager_order_reported {
+            // shortcut: Retain the flag until simultaneous celestial message order is witnessed.
+            eprintln!("render_coverage control_fx_manager_order_unsupported=1 (simultaneous sun/moon; retaining previous flag)");
+            self.control_effect_manager_order_reported = true;
+        }
         let mut sky_mesh = self.sky.mesh().clone();
         sky_mesh.update_uvs(self.fixed_sky_uv_ms.unwrap_or(clock_ms));
         let sky_frame =
@@ -4326,6 +4339,7 @@ impl DynamicEnvironment {
             sky_mesh,
             environment_frame,
             absolute_time_seconds,
+            control_effect_manager_flag: self.control_effect_manager_flag,
         })
     }
 }
@@ -4501,6 +4515,8 @@ fn load_environment(
         fixed_phase_reported: false,
         fixed_sky_uv_ms: None,
         captured_celestial_births: None,
+        control_effect_manager_flag: false,
+        control_effect_manager_order_reported: false,
     }))
 }
 
@@ -6068,6 +6084,7 @@ fn advance_control_effect_instances(
     sound_slots: &[ControlSoundSlot],
     sample_id: SceneSampleId,
     control_clock_ms: u32,
+    manager_flag: bool,
 ) -> HashMap<ControlEffectInstanceKey, ControlEffectFrameSample> {
     let mut specifications = HashMap::new();
     for slot in ambient_slots {
@@ -6105,9 +6122,6 @@ fn advance_control_effect_instances(
                     return (key, state.sample);
                 }
                 let clock = state.clock.get_or_insert_with(|| {
-                    if flags & 0x180 != 0 {
-                        eprintln!("render_coverage control_fx_manager_flag_stub=1 (preview manager A8=0; instance={key:?})");
-                    }
                     if fparkan_fx::fx_time_mode_requires_owner_state(mode) {
                         // shortcut: Idle provider values until live Control owners are connected in G.
                         eprintln!("render_coverage control_fx_owner_state_stub=1 (idle provider: speed=0, health=1, effect value=0, complementary control value=1, velocity limits=1; instance={key:?} mode={mode})");
@@ -6120,7 +6134,7 @@ fn advance_control_effect_instances(
                 let phase = clock.update(now_ms).and_then(|()| {
                     clock.phase(
                         now_ms,
-                        false,
+                        manager_flag,
                         Some(&fparkan_fx::clock::FxPhaseProvider::idle()),
                     )
                 });
@@ -10072,6 +10086,19 @@ impl StaticVulkanApp {
                     .flatten();
             }
         }
+        let camera = self.view_camera;
+        let environment = if let Some(environment) = self.environment.as_mut() {
+            Some(environment.update_cpu(
+                clock.delta_seconds,
+                clock.time_ms,
+                &camera,
+                aspect,
+                viewport,
+                self.audio.as_mut(),
+            )?)
+        } else {
+            None
+        };
         let control_effect_random_samples = advance_control_effect_instances(
             &mut self.control_effect_instance_states,
             &self.ambient_effect_slots,
@@ -10079,6 +10106,9 @@ impl StaticVulkanApp {
             &self.control_sound_slots,
             clock.id,
             control_clock_ms,
+            environment
+                .as_ref()
+                .is_some_and(|frame| frame.control_effect_manager_flag),
         );
         let control_point_lights = update_control_point_lights(
             &mut self.control_point_light_slots,
@@ -10107,7 +10137,6 @@ impl StaticVulkanApp {
             &self.ambient_effect_slots,
             self.view_camera.position,
         )?;
-        let camera = self.view_camera;
         let material_update = sample_material_animations(
             &mut self.material_animations,
             &self.materials,
@@ -10297,18 +10326,6 @@ impl StaticVulkanApp {
                 }
             }
         }
-        let environment = if let Some(environment) = self.environment.as_mut() {
-            Some(environment.update_cpu(
-                clock.delta_seconds,
-                clock.time_ms,
-                &camera,
-                aspect,
-                viewport,
-                self.audio.as_mut(),
-            )?)
-        } else {
-            None
-        };
         self.environment_primitive_count = environment
             .as_ref()
             .map_or(0, |frame| frame.environment_frame.primitives.len());
@@ -13804,6 +13821,8 @@ mod tests {
             fixed_phase_reported: false,
             fixed_sky_uv_ms: None,
             captured_celestial_births: None,
+            control_effect_manager_flag: false,
+            control_effect_manager_order_reported: false,
         };
 
         let mut land = fparkan_terrain_format::LandMeshDocument {
@@ -16872,6 +16891,7 @@ mod tests {
             &[],
             SceneSampleId::Replay(1),
             250,
+            false,
         );
         assert!(update_control_point_lights(
             &mut [inactive],
@@ -16889,6 +16909,7 @@ mod tests {
             &[],
             SceneSampleId::Replay(2),
             750,
+            false,
         );
         let lights = update_control_point_lights(
             std::slice::from_mut(&mut slot),
@@ -16931,6 +16952,7 @@ mod tests {
             &[],
             SceneSampleId::Replay(7),
             1500,
+            false,
         );
         assert_eq!(first.len(), 1);
         let key = slot.random_instance_key;
@@ -16956,6 +16978,7 @@ mod tests {
                 &[],
                 SceneSampleId::Replay(7),
                 1500,
+                false,
             )[&key],
             first_sample,
             "a repeated read of the same captured update reuses the shared sample"
@@ -16967,6 +16990,7 @@ mod tests {
             &[],
             SceneSampleId::Replay(8),
             500,
+            false,
         );
         let expected = expected_state.advance(SceneSampleId::Replay(8), 500, 1.0);
         assert_eq!(second[&key].phase_jitter, expected.phase_jitter);
@@ -16990,6 +17014,7 @@ mod tests {
             &[],
             SceneSampleId::Replay(9),
             4500,
+            false,
         );
         assert_eq!(later[&key].phase, Some(1.0));
         assert_eq!(later[&key].elapsed_seconds, 0.5);
@@ -17000,6 +17025,7 @@ mod tests {
             &[],
             SceneSampleId::Replay(10),
             6500,
+            false,
         );
         assert_eq!(restarted[&key].phase, Some(0.0));
         assert_eq!(restarted[&key].elapsed_seconds, 0.0);
@@ -17025,6 +17051,21 @@ mod tests {
             0.0,
             "a non-sentinel negative phase still consumes the jitter sample"
         );
+        slot.header_flags = 0x100;
+        slot.time_mode = 1;
+        let mut gated_states = HashMap::new();
+        for (frame, daylight, expected) in [(20, false, 0.5), (21, true, 0.0), (22, false, 0.5)] {
+            let samples = advance_control_effect_instances(
+                &mut gated_states,
+                &[],
+                std::slice::from_ref(&slot),
+                &[],
+                SceneSampleId::Replay(frame),
+                500,
+                daylight,
+            );
+            assert_eq!(samples[&key].phase, Some(expected));
+        }
         slot.header_flags = 0;
         slot.duration_seconds = 0.0;
         for mode in 4..=17 {
@@ -17036,6 +17077,7 @@ mod tests {
                 &[],
                 SceneSampleId::Replay(11),
                 5_000,
+                false,
             );
             assert_eq!(samples[&key].phase, Some(0.0), "idle owner mode {mode}");
         }

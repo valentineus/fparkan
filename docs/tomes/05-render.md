@@ -918,10 +918,13 @@ loop. Обычная строка Control создаёт экземпляр с �
 Effect renderer подавляет header bit `0x800` только при
 render selector 0. Native AniMesh component path захвачен с selector 1, а в
 его 53-entry manager присутствуют FX entries с header `0xD00`; preview
-использует selector 1 и пропускает такие visual commands. Изменения manager
-`A8`, которые задают runtime phase/header gate, пока заменены нулём с явным
-счётчиком `control_fx_manager_flag_stub`. Header
-bit `0x10` относится к activation lifecycle и не выключает draw.
+использует selector 1 и пропускает такие visual commands. Дневные и ночные
+огни переключает сам небесный источник. Движок измеряет длину его RGB-вектора:
+при значении больше `1,1` включается дневная группа эффектов, при меньшем —
+ночная. Поэтому огни зависят от освещённости, а не от заданного часа или
+того, попало ли солнце в кадр. Внутри тёмного завода это особенно заметно:
+лишний дневной зелёный свет над окном исчезает, а сумеречная подсветка остаётся.
+Header bit `0x10` относится к activation lifecycle и не выключает draw.
 
 Для visual effect renderer использует MAT0, указанный самой командой. Его
 phase выбирается по normalized FX phase, а не по wall-clock clock материала
