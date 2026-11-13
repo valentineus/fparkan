@@ -366,6 +366,23 @@ mod tests {
     }
 
     #[test]
+    fn geometry_projection_survives_later_sky_depth_range() {
+        let mut json = json();
+        let world = parse_legacy_camera_capture(&serde_json::to_vec(&json).unwrap())
+            .unwrap()
+            .preview_camera_frame()
+            .unwrap();
+        json["near_plane"] = serde_json::json!(700.0);
+        json["far_plane"] = serde_json::json!(50000.0);
+        let after_sky = parse_legacy_camera_capture(&serde_json::to_vec(&json).unwrap())
+            .unwrap()
+            .preview_camera_frame()
+            .unwrap();
+        assert_eq!(after_sky.clip_from_world, world.clip_from_world);
+        assert_eq!(after_sky.near_plane, 0.5);
+    }
+
+    #[test]
     fn geometry_projection_rejects_unverified_mismatched_or_invalid_input() {
         for (field, value) in [
             ("verified", serde_json::json!(false)),

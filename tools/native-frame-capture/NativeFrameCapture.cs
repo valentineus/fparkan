@@ -104,6 +104,7 @@ internal static partial class NativeFrameCapture
         public uint ProjectionThreadId;
         public ProjectionReadback Projection;
         public ProjectionReadback GeometryProjection;
+        public byte[] GeometryEffectiveWorldMatrixBytes;
         public uint GeometryProjectionGeneration;
         public uint GeometryProjectionThreadId;
         public SkyUvReadback SkyUv;
@@ -766,11 +767,24 @@ internal static partial class NativeFrameCapture
             || frame.GeometryProjectionGeneration != frame.ProjectionGeneration
             || frame.GeometryProjectionThreadId != frame.CameraThreadId
             || frame.GeometryProjectionThreadId != frame.ProjectionThreadId
-            || geometry.Renderer != boundary.Renderer || geometry.Far != boundary.Far
-            || geometry.Fov != boundary.Fov) return false;
+            || geometry.Renderer != boundary.Renderer || geometry.Mode != boundary.Mode
+            || geometry.Fov != boundary.Fov
+            || frame.Camera == null || !frame.Camera.CurrentAtProjectionVerified
+            || !frame.Camera.EffectiveWorldAtProjectionVerified
+            || frame.GeometryEffectiveWorldMatrixBytes == null
+            || !ByteArraysEqual(frame.GeometryEffectiveWorldMatrixBytes,
+                frame.Camera.ProjectionEffectiveWorldMatrixBytes)) return false;
         for (int i = 0; i < 4; i++)
             if (geometry.Viewport[i] != boundary.Viewport[i]) return false;
         return true;
+    }
+
+    private static bool SelectedProjectionMatchesInput(FrameSnapshot frame, SelectedCameraInput input)
+    {
+        // A later sky pass may leave its depth range at the World3D return boundary.
+        return ProjectionMatchesCameraInput(frame.Projection, input)
+            || GeometryProjectionMatchesFrame(frame)
+                && ProjectionMatchesCameraInput(frame.GeometryProjection, input);
     }
 
     private static void AppendGeometryProjectionJson(StringBuilder json, FrameSnapshot frame)
@@ -2520,6 +2534,9 @@ internal static partial class NativeFrameCapture
         FrameSnapshot frame = new FrameSnapshot {
             CameraGeneration = 7, ProjectionGeneration = 7, GeometryProjectionGeneration = 7,
             CameraThreadId = 11, ProjectionThreadId = 11, GeometryProjectionThreadId = 11,
+            Camera = new CameraReadback { CurrentAtProjectionVerified = true,
+                EffectiveWorldAtProjectionVerified = true, ProjectionEffectiveWorldMatrixBytes = new byte[64] },
+            GeometryEffectiveWorldMatrixBytes = new byte[64],
             Projection = new ProjectionReadback { Renderer = 100, Viewport = new int[] { 0, 0, 1280, 1024 },
                 Near = 5, Far = 700, Fov = 1.3f, Mode = 1, Verified = true },
             GeometryProjection = new ProjectionReadback { Renderer = 100, Viewport = new int[] { 0, 0, 1280, 1024 },
@@ -2533,6 +2550,28 @@ internal static partial class NativeFrameCapture
         Dictionary<string, object> projection = (Dictionary<string, object>)parsed["geometry_projection"];
         if (Convert.ToSingle(projection["near_plane"]) != 0.5f)
             throw new InvalidOperationException("Geometry projection must preserve draw near, not restored camera near.");
+        frame.Projection.Near = 700;
+        frame.Projection.Far = 50000;
+        if (!GeometryProjectionMatchesFrame(frame))
+            throw new InvalidOperationException("Same-frame geometry projection was lost when the sky left a different depth range.");
+        SelectedCameraInput input = new SelectedCameraInput { Viewport = new int[] { 0, 0, 1280, 1024 },
+            Near = 0.5f, Far = 700, FieldOfView = 1.3f, ProjectionMode = 1 };
+        if (!SelectedProjectionMatchesInput(frame, input))
+            throw new InvalidOperationException("Selected camera rejected its verified geometry projection.");
+        frame.GeometryEffectiveWorldMatrixBytes[0] = 1;
+        if (GeometryProjectionMatchesFrame(frame) || SelectedProjectionMatchesInput(frame, input))
+            throw new InvalidOperationException("Geometry projection accepted a different draw camera matrix.");
+        frame.GeometryEffectiveWorldMatrixBytes[0] = 0;
+        input.Far = 701;
+        if (SelectedProjectionMatchesInput(frame, input))
+            throw new InvalidOperationException("Selected camera accepted a different geometry depth range.");
+        input.Far = 700;
+        frame.GeometryProjection.Renderer++;
+        if (GeometryProjectionMatchesFrame(frame)) throw new InvalidOperationException("Geometry projection renderer mismatch accepted.");
+        frame.GeometryProjection.Renderer--;
+        frame.GeometryProjection.Fov = 1.04f;
+        if (GeometryProjectionMatchesFrame(frame)) throw new InvalidOperationException("Geometry projection FOV mismatch accepted.");
+        frame.GeometryProjection.Fov = 1.3f;
         frame.GeometryProjectionThreadId++;
         if (GeometryProjectionMatchesFrame(frame)) throw new InvalidOperationException("Geometry projection thread mismatch accepted.");
         frame.GeometryProjectionThreadId--;
@@ -3927,6 +3966,7 @@ internal static partial class NativeFrameCapture
                                             throw new InvalidOperationException("Could not disarm the previous generation's native fog boundary.");
                                         frame.CameraGeneration++;
                                         frame.GeometryProjection = null;
+                                        frame.GeometryEffectiveWorldMatrixBytes = null;
                                         frame.SkyUv = null;
                                         if (skyUvBreakpoint != null && !skyUvBreakpoint.Armed)
                                             skyUvBreakpoint = ArmBreakpoint(process, "Terrain.sky-uv-clock",
@@ -4038,9 +4078,12 @@ internal static partial class NativeFrameCapture
                                         && ReadU32Exact(process, esp + 4) == ReadU32Exact(process, ngiBase + NgiRendererGlobalRva))
                                     {
                                         ProjectionReadback p = ReadProjection(process, ngiBase);
-                                        if (p.Verified && p.Mode != 0)
+                                        byte[] drawMatrix = new byte[64];
+                                        if (p.Verified && p.Mode != 0
+                                            && ReadExact(process, frame.Camera.Camera + 0x60, drawMatrix))
                                         {
                                             frame.GeometryProjection = p;
+                                            frame.GeometryEffectiveWorldMatrixBytes = drawMatrix;
                                             frame.GeometryProjectionGeneration = frame.CameraGeneration;
                                             frame.GeometryProjectionThreadId = eventTid;
                                             Log("GEOMETRY_PROJECTION generation=" + frame.CameraGeneration + " tid=" + eventTid
@@ -4130,7 +4173,7 @@ internal static partial class NativeFrameCapture
                                             bool cameraMatrixMatchesInput = selectedCamera == null || !selectedCamera.Applied
                                                 || SelectedMatrixMatchesProjection(frame);
                                             bool projectionMatchesInput = selectedCamera == null
-                                                || ProjectionMatchesCameraInput(frame.Projection, selectedCamera.Input)
+                                                || SelectedProjectionMatchesInput(frame, selectedCamera.Input)
                                                     && cameraMatrixMatchesInput;
                                             bool traceProjectionMatchesInput = projectionSelectorMode && traceCameraInput != null
                                                 && ProjectionMatchesCameraInput(frame.Projection, traceCameraInput);
@@ -4205,6 +4248,8 @@ internal static partial class NativeFrameCapture
                                                 }
                                                 Log("SELECTED_CAMERA_PROJECTION_MATCH " + projectionMatchesInput
                                                     + " cameraMatrixMatchesInput=" + cameraMatrixMatchesInput
+                                                    + " verifiedGeometryMatch=" + (GeometryProjectionMatchesFrame(frame)
+                                                        && ProjectionMatchesCameraInput(frame.GeometryProjection, selectedCamera.Input))
                                                     + " inputViewport=" + String.Join(",", selectedCamera.Input.Viewport)
                                                     + " actualViewport=" + (frame.Projection.Viewport == null ? "unreadable" : String.Join(",", frame.Projection.Viewport))
                                                     + " inputNear=" + selectedCamera.Input.Near.ToString("R", CultureInfo.InvariantCulture)
