@@ -52,7 +52,9 @@ pub use autodemo::{autodemo_camera, AutoDemoCamera, AutoDemoView};
 pub use fparkan_assets::MissionAssets;
 pub use mesh_collision::{query_building_segment_world, BuildingMeshHit, BuildingMeshNode};
 use mission_events::MissionEvents;
-pub use mission_events::{MissionEventStop, MissionEventTick, MissionNotice};
+pub use mission_events::{
+    capture_neutral_warbot, MissionEventStop, MissionEventTick, MissionNotice,
+};
 pub use player_motion::{plan_player_motion, PlayerMotion, PlayerMotionStep};
 pub use player_weapon::{starting_player_weapons, PlayerWeapons};
 pub use projectile::{
@@ -2214,7 +2216,13 @@ fn load_mission_with_options(
                 })
             }
         };
-        MissionEvents::with_placed_objects(&object_drafts, &handles, summary.clan_count, &config)
+        MissionEvents::with_placed_objects(
+            &mut new_runtime_world,
+            &object_drafts,
+            &handles,
+            summary.clan_count,
+            &config,
+        )?
     } else {
         MissionEvents::default()
     };
@@ -17302,17 +17310,7 @@ mod tests {
             Some(MissionScriptOutcome::Active)
         );
 
-        // Objective 1 also requires at least two player robots. The hero is
-        // the only one at spawn, so model one allied robot joining the roster.
-        let allied =
-            construct_object(&mut engine.world, ObjectDraft { original_id: None }).unwrap();
-        register_object(&mut engine.world, allied).unwrap();
-        engine
-            .loaded
-            .as_mut()
-            .unwrap()
-            .mission_events
-            .add_test_robot(0, allied);
+        assert_eq!(capture_neutral_warbot(&mut engine, cockpit).unwrap(), None);
         for (time, clan, expected) in [
             (
                 6_005,
@@ -17340,23 +17338,38 @@ mod tests {
                 ],
             ),
         ] {
-            let handles = engine
-                .loaded
-                .as_ref()
-                .unwrap()
-                .object_drafts
-                .iter()
-                .filter(|draft| {
-                    draft.raw_after_resource == clan
-                        && draft
-                            .unit_dat_header_flags
-                            .is_some_and(|class| class & 0x0100_0000 != 0)
-                })
-                .filter_map(|draft| mission_object_handle(&engine, draft.original_id?))
-                .collect::<Vec<_>>();
-            assert!(!handles.is_empty());
-            for handle in handles {
-                fparkan_world::request_delete(&mut engine.world, handle).unwrap();
+            if clan == 3 {
+                let mut pose = transform_state(&engine.world, cockpit.handle).unwrap();
+                for id in [OriginalObjectId(11), OriginalObjectId(28)] {
+                    let handle = mission_object_handle(&engine, id).unwrap();
+                    pose.position = transform_state(&engine.world, handle).unwrap().position;
+                    set_transform(&mut engine.world, cockpit.handle, pose).unwrap();
+                    assert_eq!(
+                        capture_neutral_warbot(&mut engine, cockpit).unwrap(),
+                        Some(id)
+                    );
+                    assert_eq!(capture_neutral_warbot(&mut engine, cockpit).unwrap(), None);
+                    assert_eq!(mission_object_handle(&engine, id), Some(handle));
+                }
+            } else {
+                let handles = engine
+                    .loaded
+                    .as_ref()
+                    .unwrap()
+                    .object_drafts
+                    .iter()
+                    .filter(|draft| {
+                        draft.raw_after_resource == clan
+                            && draft
+                                .unit_dat_header_flags
+                                .is_some_and(|class| class & 0x0100_0000 != 0)
+                    })
+                    .filter_map(|draft| mission_object_handle(&engine, draft.original_id?))
+                    .collect::<Vec<_>>();
+                assert!(!handles.is_empty());
+                for handle in handles {
+                    fparkan_world::request_delete(&mut engine.world, handle).unwrap();
+                }
             }
             let tick = frame(&mut engine, time).unwrap().mission_event.unwrap();
             assert!(tick.stop.is_none(), "{:?}", tick.stop);

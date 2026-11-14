@@ -1,12 +1,13 @@
 use super::{
-    apply_recovered_script_host_callback, LoadedMissionState, MissionObjectDraft,
-    MissionScriptHostEffect, LAST_SUPER_AI_TABLE_INDEX,
+    apply_recovered_script_host_callback, Engine, EngineError, LoadedMissionState,
+    MissionObjectDraft, MissionScriptHostEffect, StartingCockpit, LAST_SUPER_AI_TABLE_INDEX,
 };
 use fparkan_script::{
     ScriptDispatchSelector, ScriptInstruction, VarSetDefault, VmHostCallbackCommand,
 };
 use fparkan_world::{
-    handle_by_original_id, transform_state, ObjectHandle, OriginalObjectId, World,
+    handle_by_original_id, identity_metadata, registration_sequence, set_owner, transform_state,
+    ObjectHandle, OriginalObjectId, OwnerId, World,
 };
 use std::collections::HashSet;
 
@@ -134,36 +135,33 @@ pub(super) struct MissionEvents {
     next_ms: u32,
     reported_stops: HashSet<usize>,
     voiced_messages: HashSet<u32>,
-    placed_clan_objects: Vec<Vec<(ObjectHandle, u32)>>,
+    placed_clan_objects: Vec<(ObjectHandle, u32)>,
     objectives: MissionObjectives,
 }
 
 impl MissionEvents {
-    #[cfg(test)]
-    pub(super) fn add_test_robot(&mut self, clan: usize, handle: ObjectHandle) {
-        self.placed_clan_objects[clan].push((handle, 0x0100_8000));
-    }
-
     pub(super) fn with_placed_objects(
+        world: &mut World,
         drafts: &[MissionObjectDraft],
         handles: &[ObjectHandle],
         clan_count: usize,
         mission_config: &[u8],
-    ) -> Self {
-        let mut rosters = vec![Vec::new(); clan_count.min(LAST_SUPER_AI_TABLE_INDEX as usize + 1)];
+    ) -> Result<Self, EngineError> {
+        let mut roster = Vec::new();
         for (draft, &handle) in drafts.iter().zip(handles) {
-            if let (Some(roster), Some(class)) = (
-                rosters.get_mut(draft.raw_after_resource as usize),
-                draft.unit_dat_header_flags,
-            ) {
-                roster.push((handle, class));
+            if let Some(class) = draft.unit_dat_header_flags {
+                let selector = draft.raw_after_resource;
+                if selector <= LAST_SUPER_AI_TABLE_INDEX && (selector as usize) < clan_count {
+                    set_owner(world, handle, Some(OwnerId(selector as u16)))?;
+                    roster.push((handle, class));
+                }
             }
         }
-        Self {
-            placed_clan_objects: rosters,
+        Ok(Self {
+            placed_clan_objects: roster,
             objectives: MissionObjectives::from_config(mission_config),
             ..Self::default()
-        }
+        })
     }
 
     fn due(&mut self, now_ms: u32) -> bool {
@@ -173,6 +171,76 @@ impl MissionEvents {
         self.next_ms = now_ms.wrapping_add(2_000);
         true
     }
+}
+
+/// Transfers the nearest available neutral warbot to the player's clan.
+///
+/// The provisional interaction uses a 12-unit radius around the player's body.
+/// Returns the original object ID of a successful transfer.
+///
+/// # Errors
+///
+/// Returns an error if the player's world handle or the ownership update fails.
+pub fn capture_neutral_warbot(
+    engine: &mut Engine,
+    cockpit: StartingCockpit,
+) -> Result<Option<OriginalObjectId>, EngineError> {
+    let Some(mission) = &engine.loaded else {
+        return Ok(None);
+    };
+    let Some(player_owner) = identity_metadata(&engine.world, cockpit.handle)?.owner_id else {
+        return Ok(None);
+    };
+    if !mission
+        .mission
+        .clans
+        .get(usize::from(player_owner.0))
+        .is_some_and(|clan| clan.mode == 1)
+    {
+        return Ok(None);
+    }
+    let position = transform_state(&engine.world, cockpit.handle)?
+        .position
+        .map(f32::from_bits);
+    let candidate = mission
+        .mission_events
+        .placed_clan_objects
+        .iter()
+        .filter_map(|&(handle, class)| {
+            if class != 0x0100_8000 {
+                return None;
+            }
+            registration_sequence(&engine.world, handle).ok()??;
+            let identity = identity_metadata(&engine.world, handle).ok()?;
+            let clan = mission
+                .mission
+                .clans
+                .get(usize::from(identity.owner_id?.0))?;
+            if clan.mode != 3 {
+                return None;
+            }
+            let target = transform_state(&engine.world, handle)
+                .ok()?
+                .position
+                .map(f32::from_bits);
+            let distance_squared: f32 = position
+                .iter()
+                .zip(target)
+                .map(|(p, q)| (p - q).powi(2))
+                .sum();
+            // shortcut: radius only, until native aim and range checks are measured.
+            (distance_squared <= 12.0_f32.powi(2)).then_some((
+                distance_squared,
+                handle,
+                identity.original_id?,
+            ))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0));
+    if let Some((_, handle, original_id)) = candidate {
+        set_owner(&mut engine.world, handle, Some(player_owner))?;
+        return Ok(Some(original_id));
+    }
+    Ok(None)
 }
 
 impl LoadedMissionState {
@@ -220,8 +288,14 @@ impl LoadedMissionState {
                             .behavior_distributors
                             .get(clan as usize)
                             .filter(|distributor| distributor.super_ai_visible)
-                            .and_then(|_| mission_events.placed_clan_objects.get(clan as usize))
-                            .map_or(0, |objects| count_clan_objects(objects, world, mask));
+                            .map_or(0, |_| {
+                                count_clan_objects(
+                                    &mission_events.placed_clan_objects,
+                                    world,
+                                    OwnerId(clan as u16),
+                                    mask,
+                                )
+                            });
                         Ok(Some(count))
                     }
                     ScriptDispatchSelector::Handler(32) => {
@@ -302,15 +376,20 @@ fn dword_pair(instruction: &ScriptInstruction, values: &[VarSetDefault]) -> Opti
     }
 }
 
-fn count_clan_objects(objects: &[(ObjectHandle, u32)], world: &World, mask: u32) -> u32 {
-    // shortcut: placed units retain their starting clan until capture and
-    // production update the roster.
+fn count_clan_objects(
+    objects: &[(ObjectHandle, u32)],
+    world: &World,
+    owner: OwnerId,
+    mask: u32,
+) -> u32 {
+    // shortcut: count placed units until production registers new objects here.
     objects
         .iter()
         .filter(|&&(handle, class)| {
             class & mask != 0
-                && fparkan_world::registration_sequence(world, handle)
-                    .is_ok_and(|seq| seq.is_some())
+                && registration_sequence(world, handle).is_ok_and(|seq| seq.is_some())
+                && identity_metadata(world, handle)
+                    .is_ok_and(|identity| identity.owner_id == Some(owner))
         })
         .count() as u32
 }
@@ -368,7 +447,8 @@ mod tests {
         count_clan_objects, in_tactical_polygon, MissionEvents, MissionNotice, MissionObjectives,
     };
     use fparkan_world::{
-        construct_object, new, register_object, request_delete, ObjectDraft, WorldConfig,
+        construct_object, new, register_object, request_delete, set_owner, ObjectDraft, OwnerId,
+        WorldConfig,
     };
 
     #[test]
@@ -395,16 +475,25 @@ mod tests {
     #[test]
     fn clan_count_uses_overlapping_bits_and_skips_removed_objects() {
         let mut world = new(WorldConfig);
+        let player = OwnerId(0);
+        let neutral = OwnerId(3);
         let objects = [0x0102_0000, 0x0100_8000, 0x2000_0000, 0x8000_0010].map(|class| {
             let handle = construct_object(&mut world, ObjectDraft { original_id: None }).unwrap();
             register_object(&mut world, handle).unwrap();
+            set_owner(&mut world, handle, Some(player)).unwrap();
             (handle, class)
         });
-        assert_eq!(count_clan_objects(&objects, &world, 0x0100_8000), 2);
-        assert_eq!(count_clan_objects(&objects, &world, 0x2100_0000), 3);
-        assert_eq!(count_clan_objects(&objects, &world, 0x8000_0000), 1);
+        assert_eq!(count_clan_objects(&objects, &world, player, 0x0100_8000), 2);
+        assert_eq!(count_clan_objects(&objects, &world, player, 0x2100_0000), 3);
+        assert_eq!(count_clan_objects(&objects, &world, player, 0x8000_0000), 1);
+        set_owner(&mut world, objects[1].0, Some(neutral)).unwrap();
+        assert_eq!(count_clan_objects(&objects, &world, player, 0x0100_0000), 1);
+        assert_eq!(
+            count_clan_objects(&objects, &world, neutral, 0x0100_0000),
+            1
+        );
         request_delete(&mut world, objects[0].0).unwrap();
-        assert_eq!(count_clan_objects(&objects, &world, 0x0100_0000), 1);
+        assert_eq!(count_clan_objects(&objects, &world, player, 0x0100_0000), 0);
     }
 
     #[test]

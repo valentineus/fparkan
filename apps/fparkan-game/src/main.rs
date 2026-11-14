@@ -78,12 +78,12 @@ use fparkan_render_vulkan::{
     VulkanStaticTexture, VulkanStaticTextureMip, VulkanStaticVertex,
 };
 use fparkan_runtime::{
-    apply_projectile_hit, autodemo_camera, create, frame as step_mission_frame,
-    frame_with_player_motion, load_mission_static_preview, load_mission_static_preview_roots,
-    load_mission_with_init_stubs, load_player_projectile, loaded_mission_assets,
-    loaded_mission_object_drafts, loaded_mission_script_bundles, loaded_terrain,
-    mission_object_handle, plan_player_motion, projectile_terrain_hit, projectile_unit_hit,
-    query_building_segment_world, simulate_mission_report, starting_cockpit,
+    apply_projectile_hit, autodemo_camera, capture_neutral_warbot, create,
+    frame as step_mission_frame, frame_with_player_motion, load_mission_static_preview,
+    load_mission_static_preview_roots, load_mission_with_init_stubs, load_player_projectile,
+    loaded_mission_assets, loaded_mission_object_drafts, loaded_mission_script_bundles,
+    loaded_terrain, mission_object_handle, plan_player_motion, projectile_terrain_hit,
+    projectile_unit_hit, query_building_segment_world, simulate_mission_report, starting_cockpit,
     starting_player_weapons, AutoDemoCamera, AutoDemoView, BasementPlacementMode, BuildingMeshNode,
     Engine, EngineError, EngineServices, FrameResult, LoadedMission, MissionAssets,
     MissionEventStop, MissionMode, MissionNotice, MissionObjectDraft, MissionRequest,
@@ -9911,7 +9911,7 @@ fn mission_camera_coverage(cockpit: Option<StartingCockpit>, demo: bool) -> &'st
     if demo {
         "autodemo_camera_follow_approx=1 autodemo_camera_target_approx=1 cockpit_pose_approx=1"
     } else if cockpit.is_some() {
-        "player_motion_approx=1 cockpit_aim_approx=1 cockpit_pose_approx=1 player_weapon_cycle_approx=1 player_projectile_flight_approx=1 player_projectile_damage_approx=1 player_projectile_hull_stub=1 player_weapon_fx_stub=1"
+        "player_motion_approx=1 cockpit_aim_approx=1 cockpit_pose_approx=1 player_weapon_cycle_approx=1 player_projectile_flight_approx=1 player_projectile_damage_approx=1 player_projectile_hull_stub=1 player_weapon_fx_stub=1 player_capture_approx=1"
     } else {
         "mission_camera_stub=1"
     }
@@ -10001,6 +10001,7 @@ struct StaticVulkanApp {
     projectile_draws: Vec<Option<ProjectileDraw>>,
     player_fire_held: bool,
     player_fire_pressed: bool,
+    player_capture_pressed: bool,
     audio: Option<audio::GameAudio>,
     camera_mode: &'static str,
     mesh_components: usize,
@@ -10129,6 +10130,7 @@ impl StaticVulkanApp {
             projectile_draws: Vec::new(),
             player_fire_held: false,
             player_fire_pressed: false,
+            player_capture_pressed: false,
             audio,
             camera_mode: preview.camera_mode,
             mesh_components: preview.mesh_components,
@@ -10758,6 +10760,7 @@ impl StaticVulkanApp {
         self.mission_paused = paused;
         self.player_mouse = [0.0; 2];
         self.player_move_pressed = [false; 4];
+        self.player_capture_pressed = false;
         if self.cockpit.is_some() && self.demo_camera.is_none() {
             self.set_mouse_look(self.window_focused && !paused);
         }
@@ -10917,6 +10920,19 @@ impl StaticVulkanApp {
             }
         }
         if let Some(engine) = self.mission_engine.as_mut() {
+            if let (true, Some(cockpit)) = (
+                std::mem::take(&mut self.player_capture_pressed),
+                self.cockpit,
+            ) {
+                if let Some(target) =
+                    capture_neutral_warbot(engine, cockpit).map_err(|error| error.to_string())?
+                {
+                    eprintln!(
+                        "player_capture object={} queue_time_ms={control_clock_ms}",
+                        target.0
+                    );
+                }
+            }
             let frame = match player_step {
                 Some((cockpit, step, blocked)) => {
                     frame_with_player_motion(engine, control_clock_ms, cockpit, step, blocked)
@@ -12020,6 +12036,7 @@ impl ApplicationHandler for StaticVulkanApp {
                 if !focused {
                     self.pressed_keys.clear();
                     self.player_move_pressed = [false; 4];
+                    self.player_capture_pressed = false;
                     self.player_mouse = [0.0; 2];
                     self.set_mouse_look(false);
                 } else if self.cockpit.is_some()
@@ -12063,6 +12080,11 @@ impl ApplicationHandler for StaticVulkanApp {
                     } else if event.state == ElementState::Pressed {
                         self.pressed_keys.insert(code);
                         if self.cockpit.is_some() && !self.mission_paused && !event.repeat {
+                            if self.demo_camera.is_none()
+                                && matches!(code, KeyCode::Enter | KeyCode::NumpadEnter)
+                            {
+                                self.player_capture_pressed = true;
+                            }
                             if let Some(slot) = [
                                 KeyCode::Digit0,
                                 KeyCode::Digit1,
