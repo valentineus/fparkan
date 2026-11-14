@@ -38,6 +38,15 @@ impl Default for Pose {
     }
 }
 
+impl Pose {
+    /// Transforms a local point by this pose's unit quaternion and translation.
+    #[must_use]
+    pub fn transform_point(self, point: [f32; 3]) -> [f32; 3] {
+        let rotated = rotate_point(self.rotation, point);
+        std::array::from_fn(|axis| rotated[axis] + self.translation[axis])
+    }
+}
+
 /// Scalar animation key.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScalarKey {
@@ -767,13 +776,8 @@ fn write_f32_bits(out: &mut Vec<u8>, value: f32) {
 }
 
 fn compose_pose(parent: Pose, child: Pose) -> Result<Pose, AnimationError> {
-    let translated = rotate_point(parent.rotation, child.translation);
     Ok(Pose {
-        translation: [
-            parent.translation[0] + translated[0],
-            parent.translation[1] + translated[1],
-            parent.translation[2] + translated[2],
-        ],
+        translation: parent.transform_point(child.translation),
         rotation: normalize_quat(mul_quat(parent.rotation, child.rotation))?,
     })
 }

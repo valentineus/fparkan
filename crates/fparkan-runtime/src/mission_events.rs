@@ -2,6 +2,8 @@ use super::{
     apply_recovered_script_host_callback, Engine, EngineError, LoadedMissionState,
     MissionObjectDraft, MissionScriptHostEffect, StartingCockpit, LAST_SUPER_AI_TABLE_INDEX,
 };
+use fparkan_msh::{draw_batches, node38_sampled_hierarchy, selected_slot, Group, Lod, NodeId};
+use fparkan_render::LegacyIron3dEulerTransform;
 use fparkan_script::{
     ScriptDispatchSelector, ScriptInstruction, VarSetDefault, VmHostCallbackCommand,
 };
@@ -247,6 +249,131 @@ pub fn capture_neutral_warbot(
         return Ok(Some(original_id));
     }
     Ok(None)
+}
+
+/// Transfers the neutral building whose communicator the player is standing on.
+///
+/// # Errors
+///
+/// Returns an error if the player's world handle or the ownership update fails.
+pub fn capture_neutral_building(
+    engine: &mut Engine,
+    cockpit: StartingCockpit,
+) -> Result<Option<OriginalObjectId>, EngineError> {
+    let Some(mission) = &engine.loaded else {
+        return Ok(None);
+    };
+    let Some(player_owner) = identity_metadata(&engine.world, cockpit.handle)?.owner_id else {
+        return Ok(None);
+    };
+    if !mission
+        .mission
+        .clans
+        .get(usize::from(player_owner.0))
+        .is_some_and(|clan| clan.mode == 1)
+    {
+        return Ok(None);
+    }
+    let position = transform_state(&engine.world, cockpit.handle)?
+        .position
+        .map(f32::from_bits);
+    let candidate = mission
+        .mission_events
+        .placed_clan_objects
+        .iter()
+        .filter_map(|&(handle, _)| {
+            registration_sequence(&engine.world, handle).ok()??;
+            let identity = identity_metadata(&engine.world, handle).ok()?;
+            let clan = mission
+                .mission
+                .clans
+                .get(usize::from(identity.owner_id?.0))?;
+            (clan.mode == 3).then_some((handle, identity.original_id?))
+        })
+        .find(|&(handle, id)| {
+            transform_state(&engine.world, handle).is_ok_and(|pose| {
+                on_communicator(&mission.mission_assets, id.0 as usize, pose, position)
+            })
+        });
+    if let Some((handle, id)) = candidate {
+        set_owner(&mut engine.world, handle, Some(player_owner))?;
+        Ok(Some(id))
+    } else {
+        Ok(None)
+    }
+}
+
+fn on_communicator(
+    assets: &super::MissionAssets,
+    object_index: usize,
+    pose: super::TransformState,
+    [x, y, z]: [f32; 3],
+) -> bool {
+    let Some(visual) = assets
+        .visual_for_object(object_index)
+        .and_then(|id| assets.visual_by_id(id))
+    else {
+        return false;
+    };
+    if visual.source_type != Some(u32::from_le_bytes(*b"FORT")) {
+        return false;
+    }
+    let Some(wear) = assets
+        .wears
+        .iter()
+        .find(|wear| Some(wear.id) == visual.wear_id)
+    else {
+        return false;
+    };
+    let Some(model) = visual
+        .model_id
+        .and_then(|id| assets.model_by_id(id))
+        .map(|model| &model.validated)
+    else {
+        return false;
+    };
+    let Some(hierarchy) = node38_sampled_hierarchy(model, 0) else {
+        return false;
+    };
+    let transform = LegacyIron3dEulerTransform {
+        translation: pose.position.map(f32::from_bits),
+        orientation_radians: pose.orientation.map(f32::from_bits),
+    };
+    let scale = pose.scale.map(f32::from_bits);
+    // shortcut: use the green platform mesh with clearance for the player's
+    // feet until the original communicator volume is measured.
+    let platform_height = hierarchy
+        .poses
+        .iter()
+        .enumerate()
+        .filter_map(|(index, pose)| {
+            let slot = selected_slot(model, NodeId(index as u32), Lod(0), Group(0))?;
+            Some((*pose, draw_batches(model, slot).ok()?))
+        })
+        .flat_map(|(pose, batches)| batches.iter().map(move |batch| (pose, batch)))
+        .filter(|(_, batch)| {
+            wear.table
+                .entries
+                .get(usize::from(batch.material_index))
+                .is_some_and(|entry| entry.material.0.eq_ignore_ascii_case(b"B_COMP_4G"))
+        })
+        .flat_map(|(pose, batch)| {
+            let first = batch.index_start as usize;
+            let end = first + usize::from(batch.index_count);
+            model.indices[first..end]
+                .chunks_exact(3)
+                .filter_map(move |indices| {
+                    let [a, b, c] = [indices[0], indices[1], indices[2]].map(|index| {
+                        let local =
+                            model.positions[batch.base_vertex as usize + usize::from(index)];
+                        transform.try_transform_scaled_point(pose.transform_point(local), scale)
+                    });
+                    let (a, b, c) = (a?, b?, c?);
+                    in_tactical_polygon(&[a, b, c], x, y).then_some(a[2].max(b[2]).max(c[2]))
+                })
+        })
+        .max_by(f32::total_cmp);
+    platform_height.is_some_and(|height| (z - height).abs() <= 2.0)
 }
 
 impl LoadedMissionState {

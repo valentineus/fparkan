@@ -56,7 +56,8 @@ pub use fparkan_assets::MissionAssets;
 pub use mesh_collision::{query_building_segment_world, BuildingMeshHit, BuildingMeshNode};
 use mission_events::MissionEvents;
 pub use mission_events::{
-    capture_neutral_warbot, MissionEventStop, MissionEventTick, MissionNotice,
+    capture_neutral_building, capture_neutral_warbot, MissionEventStop, MissionEventTick,
+    MissionNotice,
 };
 pub use player_motion::{plan_player_motion, PlayerMotion, PlayerMotionStep};
 pub use player_weapon::{starting_player_weapons, PlayerWeapons};
@@ -17630,8 +17631,8 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
-    fn licensed_constructor_checks_current_factory_and_hangar_owners() {
-        use fparkan_world::{identity_metadata, set_owner, OwnerId};
+    fn licensed_constructor_captures_factory_and_hangar_at_communicators() {
+        use fparkan_world::{identity_metadata, OwnerId};
 
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(licensed_root("IS")));
         let mut engine = create(EngineServices::new(vfs)).unwrap();
@@ -17653,7 +17654,16 @@ mod tests {
             .notices
             .iter()
             .any(|notice| matches!(notice, MissionNotice::ObjectiveComplete(0 | 2))));
-        for (time, logic_id, objective_index) in [(2001, 0x8000_0001, 0), (4001, 0x8000_0003, 2)] {
+        let cockpit = starting_cockpit(&engine).unwrap();
+        assert_eq!(
+            capture_neutral_building(&mut engine, cockpit).unwrap(),
+            None
+        );
+        let mut player_pose = transform_state(&engine.world, cockpit.handle).unwrap();
+        for (time, logic_id, objective_index, plate) in [
+            (2001, 0x8000_0001, 0, [391.3_f32, 740.1, 145.12]),
+            (4001, 0x8000_0003, 2, [1268.1, 790.6, 160.77]),
+        ] {
             let slot = engine
                 .loaded
                 .as_ref()
@@ -17668,7 +17678,28 @@ mod tests {
                 identity_metadata(&engine.world, handle).unwrap().owner_id,
                 Some(OwnerId(2))
             );
-            set_owner(&mut engine.world, handle, Some(OwnerId(0))).unwrap();
+            for z in [plate[2] + 12.0, plate[2] - 6.0] {
+                player_pose.position = [plate[0], plate[1], z].map(f32::to_bits);
+                set_transform(&mut engine.world, cockpit.handle, player_pose).unwrap();
+                assert_eq!(
+                    capture_neutral_building(&mut engine, cockpit).unwrap(),
+                    None
+                );
+            }
+            player_pose.position = plate.map(f32::to_bits);
+            set_transform(&mut engine.world, cockpit.handle, player_pose).unwrap();
+            assert_eq!(
+                capture_neutral_building(&mut engine, cockpit).unwrap(),
+                Some(OriginalObjectId(slot as u32))
+            );
+            assert_eq!(
+                capture_neutral_building(&mut engine, cockpit).unwrap(),
+                None
+            );
+            assert_eq!(
+                identity_metadata(&engine.world, handle).unwrap().owner_id,
+                Some(OwnerId(0))
+            );
             let event = frame(&mut engine, time).unwrap().mission_event.unwrap();
             assert!(event.stop.is_none(), "{:?}", event.stop);
             assert!(

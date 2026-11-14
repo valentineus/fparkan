@@ -78,8 +78,8 @@ use fparkan_render_vulkan::{
     VulkanStaticTexture, VulkanStaticTextureMip, VulkanStaticVertex,
 };
 use fparkan_runtime::{
-    apply_projectile_hit, autodemo_camera, capture_neutral_warbot, create,
-    frame as step_mission_frame, frame_with_player_motion, load_mission_static_preview,
+    apply_projectile_hit, autodemo_camera, capture_neutral_building, capture_neutral_warbot,
+    create, frame as step_mission_frame, frame_with_player_motion, load_mission_static_preview,
     load_mission_static_preview_roots, load_mission_with_init_stubs, load_player_projectile,
     loaded_mission_assets, loaded_mission_object_drafts, loaded_mission_script_bundles,
     loaded_terrain, mission_object_handle, plan_player_motion, projectile_terrain_hit,
@@ -9949,7 +9949,7 @@ fn mission_camera_coverage(cockpit: Option<StartingCockpit>, demo: bool) -> &'st
     if demo {
         "autodemo_camera_follow_approx=1 autodemo_camera_target_approx=1 cockpit_pose_approx=1"
     } else if cockpit.is_some() {
-        "player_motion_approx=1 cockpit_aim_approx=1 cockpit_pose_approx=1 player_weapon_cycle_approx=1 player_projectile_flight_approx=1 player_projectile_damage_approx=1 player_projectile_hull_stub=1 player_weapon_fx_stub=1 player_capture_approx=1"
+        "player_motion_approx=1 cockpit_aim_approx=1 cockpit_pose_approx=1 player_weapon_cycle_approx=1 player_projectile_flight_approx=1 player_projectile_damage_approx=1 player_projectile_hull_stub=1 player_weapon_fx_stub=1 player_capture_approx=1 player_communicator_approx=1 player_building_floor_approx=1"
     } else {
         "mission_camera_stub=1"
     }
@@ -10754,6 +10754,15 @@ impl StaticVulkanApp {
     }
 
     fn building_segment_blocked(&self, world_segment: [[f32; 3]; 2]) -> Result<bool, String> {
+        Ok(self.building_segment_hit(world_segment, false)?.is_some())
+    }
+
+    fn building_segment_hit(
+        &self,
+        world_segment: [[f32; 3]; 2],
+        nearest: bool,
+    ) -> Result<Option<[f32; 3]>, String> {
+        let mut best = None;
         for binding in &self.building_collision_bindings {
             if binding.selected_nodes.is_empty()
                 || self.removed_mission_roots.contains(&binding.object_index)
@@ -10772,19 +10781,22 @@ impl StaticVulkanApp {
                 .copied()
                 .flatten();
             let nodes = building_collision_nodes(binding, pose_buffer, mount_pose)?;
-            if query_building_segment_world(&binding.model, &nodes, world_segment)
+            if let Some(hit) = query_building_segment_world(&binding.model, &nodes, world_segment)
                 .map_err(|error| {
-                    format!(
-                        "query building collision object {} component {} model {}: {error}",
-                        binding.object_index, binding.component_index, binding.model_source
-                    )
-                })?
-                .is_some()
-            {
-                return Ok(true);
+                format!(
+                    "query building collision object {} component {} model {}: {error}",
+                    binding.object_index, binding.component_index, binding.model_source
+                )
+            })? {
+                if !nearest {
+                    return Ok(Some(hit.position));
+                }
+                if best.is_none_or(|(distance, _)| hit.distance_squared < distance) {
+                    best = Some((hit.distance_squared, hit.position));
+                }
             }
         }
-        Ok(false)
+        Ok(best.map(|(_, position)| position))
     }
 
     fn sample_frame_clock(&mut self) -> FrameClockSample {
@@ -10978,7 +10990,7 @@ impl StaticVulkanApp {
                 KeyCode::ArrowDown,
             ]
             .map(|key| self.pressed_keys.contains(&key));
-            if let Some(step) = plan_player_motion(
+            if let Some(mut step) = plan_player_motion(
                 engine,
                 cockpit,
                 PlayerMotion {
@@ -10993,6 +11005,11 @@ impl StaticVulkanApp {
             )
             .map_err(|error| error.to_string())?
             {
+                if let Some(segment) = step.floor_probe() {
+                    if let Some([_, _, height]) = self.building_segment_hit(segment, true)? {
+                        step = step.with_building_floor(height);
+                    }
+                }
                 let blocked = if let Some(sweep) = step.sweep {
                     self.building_segment_blocked(sweep)?
                 } else {
@@ -11011,6 +11028,13 @@ impl StaticVulkanApp {
                 {
                     eprintln!(
                         "player_capture object={} queue_time_ms={control_clock_ms}",
+                        target.0
+                    );
+                } else if let Some(target) =
+                    capture_neutral_building(engine, cockpit).map_err(|error| error.to_string())?
+                {
+                    eprintln!(
+                        "player_building_capture object={} queue_time_ms={control_clock_ms}",
                         target.0
                     );
                 }

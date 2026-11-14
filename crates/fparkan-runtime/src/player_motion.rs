@@ -23,6 +23,50 @@ pub struct PlayerMotionStep {
     pub sweep: Option<[[f32; 3]; 2]>,
 }
 
+impl PlayerMotionStep {
+    /// Vertical segment for finding a nearby building floor at the proposed XY.
+    #[must_use]
+    pub fn floor_probe(self) -> Option<[[f32; 3]; 2]> {
+        let [[_, _, start_z], [x, y, _]] = self.sweep?;
+        // shortcut: fixed step and drop limits, until the hero collider is wired.
+        Some([[x, y, start_z + 0.1], [x, y, start_z - 2.5]])
+    }
+
+    /// Places the player's feet just above a floor accepted by the scene query.
+    #[must_use]
+    pub fn with_building_floor(mut self, height: f32) -> Self {
+        if let Some(sweep) = &mut self.sweep {
+            self.pose.position[2] = (height + 0.02).to_bits();
+            sweep[1][2] = height + 0.52;
+        }
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PlayerMotionStep, TransformState};
+
+    #[test]
+    fn building_floor_probe_uses_proposed_xy_and_previous_height() {
+        let step = PlayerMotionStep {
+            pose: TransformState {
+                position: [4.0_f32, 6.0, 15.0].map(f32::to_bits),
+                ..TransformState::default()
+            },
+            pitch_bits: 0,
+            sweep: Some([[3.0, 6.0, 12.5], [4.0, 6.0, 15.5]]),
+        };
+        assert_eq!(
+            step.floor_probe(),
+            Some([[4.0, 6.0, 12.6], [4.0, 6.0, 10.0]])
+        );
+        let lowered = step.with_building_floor(11.5);
+        assert_eq!(lowered.pose.position.map(f32::from_bits), [4.0, 6.0, 11.52]);
+        assert_eq!(lowered.sweep.unwrap()[1], [4.0, 6.0, 12.02]);
+    }
+}
+
 /// Proposes a hero step from the world pose and the active terrain.
 ///
 /// # Errors
