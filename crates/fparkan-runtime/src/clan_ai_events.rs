@@ -21,6 +21,14 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) {
     let Some(loaded) = &mut engine.loaded else {
         return;
     };
+    loaded
+        .clan_ai_events
+        .capture_orders
+        .retain(|&(owner, _, unit, target)| {
+            identity_metadata(&engine.world, unit).is_ok_and(|unit| unit.owner_id == Some(owner))
+                && identity_metadata(&engine.world, target)
+                    .is_ok_and(|target| target.owner_id != Some(owner))
+        });
     let active = &mut loaded.clan_ai_events.factory_jobs;
     active.retain(|((clan, _), plant)| {
         engine
@@ -88,6 +96,9 @@ pub(super) struct ClanAiEvents {
     factory_rejections: BTreeMap<(u16, u32), u64>,
     strength_queries: BTreeMap<(usize, u16), u64>,
     capture_queries: BTreeMap<usize, u64>,
+    capturer_queries: BTreeMap<usize, u64>,
+    capture_orders: Vec<(OwnerId, Handler2RecordKey, ObjectHandle, ObjectHandle)>,
+    capture_approaches: BTreeMap<(u32, u32), u64>,
 }
 
 impl LoadedMissionState {
@@ -132,6 +143,7 @@ impl LoadedMissionState {
                 let mut solved = false;
                 let mut assignment = None;
                 let mut solving = false;
+                let mut capturer = None;
                 let result = varset.declarations.execute_event_prefix(
                     event,
                     bundle.formula_table.as_ref(),
@@ -259,6 +271,22 @@ impl LoadedMissionState {
                                 .declarations
                                 .resolve_handler15_with_values(instruction, values)
                                 .map_err(|error| error.to_string())?;
+                            if let (0x11, 3, Handler15TargetPayload::ByLogicId(target_id)) =
+                                (order.word_1, order.word_2, order.target)
+                            {
+                                let unit = capturer.filter(|unit: &crate::clan_targeting::Capturer| unit.id == order.word_0)
+                                    .ok_or("Handler(15) capture requires a selected capturer")?;
+                                let problem = problem.as_ref()
+                                    .ok_or("Handler(15) capture requires a current problem")?;
+                                let approach = crate::clan_targeting::send_capturer(
+                                    &mut self.unit_patrol, world, &self.object_drafts, unit, target_id,
+                                );
+                                if let Some((unit, target)) = approach {
+                                    self.clan_ai_events.capture_orders.push((OwnerId(clan as u16), problem.key, unit, target));
+                                    *self.clan_ai_events.capture_approaches.entry((unit.slot, target.slot)).or_default() += 1;
+                                }
+                                return Ok(Some(VarSetDefault::Dword(u32::from(approach.is_some()))));
+                            }
                             if order.word_1 == 0x0a
                                 && order.word_2 == 3
                                 && order.word_3 == 0
@@ -400,6 +428,28 @@ impl LoadedMissionState {
                             Ok(None)
                         }
                         ScriptDispatchSelector::Handler(14) if problem.is_some() => {
+                            if let &[mode, target_mode, target] = instruction.references.as_slice() {
+                                let word = |index: u32| values.get(index as usize)?.as_dword();
+                                let (Some(4), Some(0x201), Some(target)) =
+                                    (word(mode), word(target_mode), word(target))
+                                else {
+                                    return Err("Handler(14) requires a logical ID for nearest capturer selection".into());
+                                };
+                                capturer = crate::clan_targeting::nearest_capturer(
+                                    &self.mission, &self.object_drafts, &self.mission_events,
+                                    world, OwnerId(clan as u16), target, |handle| {
+                                        !self.clan_ai_events.capture_orders.iter().any(|&(_, _, unit, _)| unit == handle)
+                                            && self.unit_patrol.as_ref().is_none_or(|patrol| !patrol.is_shut_down(handle))
+                                    },
+                                );
+                                let id = capturer.map_or(u32::MAX, |unit| unit.id);
+                                let count = self.clan_ai_events.capturer_queries.entry(clan).or_default();
+                                *count += 1;
+                                if *count == 1 {
+                                    eprintln!("sim_coverage script_nearest_capturer_approx=1 clan={clan} target={target} unit={id}");
+                                }
+                                return Ok(Some(VarSetDefault::Dword(id)));
+                            }
                             let (mode, class) = instruction
                                 .dword_pair(values)
                                 .ok_or("Handler(14) requires a unit mode and class")?;
@@ -597,6 +647,13 @@ impl LoadedMissionState {
                         .factory_jobs
                         .iter()
                         .any(|&(key, _)| key == (clan as u16, problem.key))
+                        || self
+                            .clan_ai_events
+                            .capture_orders
+                            .iter()
+                            .any(|&(owner, key, _, _)| {
+                                owner == OwnerId(clan as u16) && key == problem.key
+                            })
                     {
                         continue;
                     }
@@ -726,8 +783,20 @@ fn storage_space(ores: &[BehaviorOreState], world: &World, clan: OwnerId) -> f32
 }
 
 impl ClanAiEvents {
+    pub(super) fn capture_approaches(&self) -> impl Iterator<Item = (u32, u32, u64)> + '_ {
+        self.capture_approaches
+            .iter()
+            .map(|(&(unit, target), &count)| (unit, target, count))
+    }
+
     pub(super) fn capture_queries(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
         self.capture_queries
+            .iter()
+            .map(|(&clan, &count)| (clan, count))
+    }
+
+    pub(super) fn capturer_queries(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
+        self.capturer_queries
             .iter()
             .map(|(&clan, &count)| (clan, count))
     }

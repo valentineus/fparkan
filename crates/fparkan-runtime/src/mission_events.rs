@@ -892,7 +892,7 @@ fn inside_exit_volume([x, y, z]: [f32; 3], [px, py, pz]: [f32; 3]) -> bool {
     (pz - z).abs() <= 3.0 && (px - x).powi(2) + (py - y).powi(2) <= 25.0
 }
 
-fn capturer_chassis(chassis: &[u8; 32]) -> bool {
+pub(super) fn capturer_chassis(chassis: &[u8; 32]) -> bool {
     // shortcut: stock robot keys map to native size classes 1 and 2;
     // query the effective Behavior controller when custom types are supported.
     matches!(
