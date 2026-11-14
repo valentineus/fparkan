@@ -125,12 +125,32 @@ impl LoadedMissionState {
                                 .map(|result| Some(VarSetDefault::Dword(result)))
                                 .ok_or_else(|| "script time requires one DWORD operand".into())
                         }
-                        ScriptDispatchSelector::Handler(11)
-                            if single_dword(&instruction.references, values)
-                                == Some(crate::boarding::WARBOT_CLASS) =>
-                        {
-                            // Behavior has no count cap for ordinary warbots in Handler(11).
-                            Ok(Some(VarSetDefault::Dword(0)))
+                        ScriptDispatchSelector::Handler(11) => {
+                            let class = single_dword(&instruction.references, values)
+                                .ok_or("Handler(11) requires one DWORD class")?;
+                            if matches!(class, 0x8000_0040 | 0x8000_0400) {
+                                return Err(
+                                    "Handler(11) requires the pending hangar or laboratory counter"
+                                        .into(),
+                                );
+                            }
+                            let Some(limit_var) = class_limit_variable(class) else {
+                                return Ok(Some(VarSetDefault::Dword(0)));
+                            };
+                            let limit = varset
+                                .declarations
+                                .declarations
+                                .iter()
+                                .position(|entry| entry.name == limit_var)
+                                .and_then(|index| values.get(index)?.as_dword())
+                                .ok_or("Handler(11) class limit is unavailable")?;
+                            let count = self.mission_events.count_clan_class(
+                                world,
+                                OwnerId(clan as u16),
+                                class,
+                            );
+                            // shortcut: include unfinished structures once construction registers with the roster.
+                            Ok(Some(VarSetDefault::Dword(u32::from(count >= limit))))
                         }
                         ScriptDispatchSelector::Handler(13)
                             if instruction.dword_pair(values)
@@ -462,6 +482,18 @@ impl LoadedMissionState {
             }
         }
         orders
+    }
+}
+
+fn class_limit_variable(class: u32) -> Option<&'static str> {
+    match class {
+        0x0100_2000 => Some("dMaxTransport"),
+        0x0100_4000 => Some("dMaxBuilder"),
+        crate::mining::MINE_CLASS => Some("dMaxMine"),
+        STORAGE_CLASS => Some("dMaxStorage"),
+        crate::autodemo::PLANT_CLASS => Some("dMaxPlant"),
+        0x8010_0000 | 0x8020_0000 => Some("dMaxTower"),
+        _ => None,
     }
 }
 
