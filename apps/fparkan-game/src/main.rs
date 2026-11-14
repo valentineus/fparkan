@@ -10110,6 +10110,8 @@ struct StaticVulkanApp {
     player_mine_pressed: bool,
     player_disembark_pressed: bool,
     boarded_hero_index: Option<usize>,
+    laboratory_status: Option<String>,
+    mission_title: String,
     audio: Option<audio::GameAudio>,
     camera_mode: &'static str,
     mesh_components: usize,
@@ -10245,6 +10247,8 @@ impl StaticVulkanApp {
             player_mine_pressed: false,
             player_disembark_pressed: false,
             boarded_hero_index: None,
+            laboratory_status: None,
+            mission_title: String::new(),
             audio,
             camera_mode: preview.camera_mode,
             mesh_components: preview.mesh_components,
@@ -10956,7 +10960,7 @@ impl StaticVulkanApp {
         }
     }
 
-    fn update_mission_title(&self) {
+    fn update_mission_title(&mut self) {
         let Some(window) = &self.window else {
             return;
         };
@@ -10965,19 +10969,46 @@ impl StaticVulkanApp {
             .as_ref()
             .and_then(fparkan_runtime::loaded_mission_script_outcome)
             .unwrap_or_default();
-        window.set_title(
-            match (
-                outcome,
-                self.mission_paused,
-                self.boarded_hero_index.is_some(),
-            ) {
-                (fparkan_runtime::MissionScriptOutcome::Completed, _, _) => "Миссия выполнена",
-                (fparkan_runtime::MissionScriptOutcome::Failed, _, _) => "Миссия провалена",
-                (_, true, _) => "FParkan mission — Пауза",
-                (_, _, true) => "FParkan mission — Варбот",
-                _ => "FParkan mission",
-            },
-        );
+        use fparkan_runtime::MissionScriptOutcome::{Completed, Failed};
+        let title = match (outcome, self.mission_paused) {
+            (Completed, _) => "Миссия выполнена".into(),
+            (Failed, _) => "Миссия провалена".into(),
+            (_, true) => "FParkan mission — Пауза".into(),
+            _ => {
+                let mut title = "FParkan mission".to_owned();
+                if let (Some(engine), Some(cockpit), None) =
+                    (&self.mission_engine, self.cockpit, &self.demo_camera)
+                {
+                    use std::fmt::Write as _;
+                    let unit = if self.boarded_hero_index.is_some() {
+                        "Варбот"
+                    } else {
+                        "Герой"
+                    };
+                    let _ = write!(title, " — {unit}");
+                    if let Some(status) = fparkan_runtime::player_status(engine, cockpit.handle) {
+                        if let Some(health) = status.health_percent {
+                            let _ = write!(title, " · Здоровье {health}%");
+                        }
+                        if let Some(ore) = status.ore_in_buffer {
+                            let _ = write!(title, " · Руда {ore:.0}");
+                        }
+                        if let Some((available, demand)) = status.power {
+                            let _ = write!(title, " · Энергия {available:.0}/{demand:.0}");
+                        }
+                    }
+                }
+                if let Some(status) = &self.laboratory_status {
+                    title.push_str(" — ");
+                    title.push_str(status);
+                }
+                title
+            }
+        };
+        if self.mission_title != title {
+            window.set_title(&title);
+            self.mission_title = title;
+        }
     }
 
     fn update_shadow(
@@ -11071,7 +11102,6 @@ impl StaticVulkanApp {
         let control_clock_ms = clock.time_ms;
         self.advance_player_projectiles(control_clock_ms)?;
         let mut player_step = None;
-        let boarded_before = self.boarded_hero_index;
         if let Some(engine) = self.mission_engine.as_mut() {
             let disembark = std::mem::take(&mut self.player_disembark_pressed);
             if let Some(vehicle) = player_vehicle(engine) {
@@ -11140,9 +11170,8 @@ impl StaticVulkanApp {
             ) {
                 match order_lab_research(engine, cockpit, control_clock_ms) {
                     Ok((component, duration)) => {
-                        if let Some(window) = &self.window {
-                            window.set_title(&format!("Лаборатория — исследуется {component}"));
-                        }
+                        self.laboratory_status =
+                            Some(format!("Лаборатория — исследуется {component}"));
                         eprintln!("laboratory_research_order component={component} duration_ms={duration} queue_time_ms={control_clock_ms}");
                     }
                     Err(error) => eprintln!("laboratory_research_rejected {error}"),
@@ -11273,9 +11302,7 @@ impl StaticVulkanApp {
                 eprintln!("sim_coverage factory_spawn_failed=1 reason={error}");
             }
             if let Some(component) = &frame.researched_component {
-                if let Some(window) = &self.window {
-                    window.set_title(&format!("Лаборатория — разработано {component}"));
-                }
+                self.laboratory_status = Some(format!("Лаборатория — разработано {component}"));
                 eprintln!("laboratory_research_complete component={component} queue_time_ms={control_clock_ms}");
             }
             if frame.autodemo_reinforcement_unavailable != 0 {
@@ -11325,15 +11352,10 @@ impl StaticVulkanApp {
                         }
                     }
                 }
-                if tick.notices.iter().any(|notice| {
-                    matches!(notice, MissionNotice::Completed | MissionNotice::Failed)
-                }) {
-                    self.update_mission_title();
-                }
             }
             self.mission_frame = Some(frame);
         }
-        if self.boarded_hero_index != boarded_before {
+        if self.mission_engine.is_some() {
             self.update_mission_title();
         }
         if let Some(frame) = &self.mission_frame {

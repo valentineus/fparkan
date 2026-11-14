@@ -48,6 +48,7 @@ mod mesh_collision;
 mod mining;
 mod mission_events;
 mod player_motion;
+mod player_status;
 mod player_weapon;
 mod production;
 mod projectile;
@@ -68,6 +69,7 @@ pub use mission_events::{
     MissionEventTick, MissionNotice,
 };
 pub use player_motion::{plan_player_motion, PlayerMotion, PlayerMotionStep};
+pub use player_status::{player_status, PlayerStatus};
 pub use player_weapon::{prepared_warbot_weapons, starting_player_weapons, PlayerWeapons};
 pub use production::order_factory_robot;
 pub use projectile::{
@@ -18125,6 +18127,23 @@ mod tests {
             .autodemo_combat_events
             .is_empty());
         let hero = starting_cockpit(&engine).unwrap();
+        let status = player_status(&engine, hero.handle).unwrap();
+        assert_eq!(status.health_percent, Some(100));
+        let table = loaded_mission_control_device_tables(&engine)
+            .unwrap()
+            .iter()
+            .find(|table| table.handle == hero.handle)
+            .unwrap();
+        let root = control_node_provider_row(table, 0).unwrap();
+        let quarter = f32::from_bits(root.initial_amount_bits) * 0.25;
+        let changed = apply_projectile_hit(&mut engine, hero.handle, quarter)
+            .unwrap()
+            .expect("hero damage provider");
+        assert!(!changed.1);
+        assert_eq!(
+            player_status(&engine, hero.handle).unwrap().health_percent,
+            Some(75)
+        );
         let enemy = mission_object_handle(&engine, OriginalObjectId(11)).unwrap();
         let enemy_pose = transform_state(&engine.world, enemy).unwrap();
         let [x, y, z] = enemy_pose.position.map(f32::from_bits);
@@ -18160,6 +18179,7 @@ mod tests {
             enemy_pose.position
         );
         assert!(transform_state(&engine.world, hero.handle).is_err());
+        assert_eq!(player_status(&engine, hero.handle), None);
         assert_eq!(failures, 1);
         assert_eq!(
             loaded_mission_script_outcome(&engine),
