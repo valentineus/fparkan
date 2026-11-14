@@ -811,6 +811,22 @@ impl VarSet {
         formulas: Option<&FormulaTable>,
         clan_count: impl Fn(u32, u32) -> Option<u32>,
     ) -> Result<Option<ScriptInitPrefix>, ScriptInitResolveError> {
+        self.resolve_init_prefix_with_host(package, input, formulas, clan_count, |_, _| false)
+    }
+
+    /// Allows the host to handle an unsupported instruction that has no variable writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [Self::resolve_init_prefix].
+    pub fn resolve_init_prefix_with_host(
+        &self,
+        package: &ScriptPackage,
+        input: Handler19InitInput,
+        formulas: Option<&FormulaTable>,
+        clan_count: impl Fn(u32, u32) -> Option<u32>,
+        mut handle: impl FnMut(usize, &ScriptInstruction) -> bool,
+    ) -> Result<Option<ScriptInitPrefix>, ScriptInitResolveError> {
         let Some((event_index, event)) = package.events.iter().enumerate().find(|(_, event)| {
             event.name_raw.split(|byte| *byte == 0).next() == Some(&b"Init"[..])
         }) else {
@@ -849,6 +865,9 @@ impl VarSet {
                     prefix.writes.extend(instruction_writes);
                 }
                 InitInstructionResolution::Unsupported(error) => {
+                    if handle(instruction_index, instruction) {
+                        continue;
+                    }
                     prefix.stopped_at = Some((instruction_index, error));
                     break;
                 }

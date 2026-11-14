@@ -45,6 +45,7 @@ mod autodemo;
 mod autodemo_combat;
 mod boarding;
 mod building_door;
+mod clan_script_init;
 mod mesh_collision;
 mod mining;
 mod mission_events;
@@ -998,6 +999,8 @@ pub struct MissionScriptBundle {
     pub formula_table: Option<FormulaTable>,
     /// Outcome of the restricted first-`Init` resolution for this bundle.
     pub init_execution: MissionScriptInitExecution,
+    /// Instructions acknowledged with an explicit gameplay stub, in execution order.
+    pub init_stubs: Vec<(usize, u8)>,
     /// Recovered per-AI Behavior scheduler and total state.
     /// Static previews leave this empty because they do not run script startup.
     pub behavior_warm_start: Option<BehaviorWarmStartState>,
@@ -2462,10 +2465,11 @@ fn load_mission_with_options(
                     clan.mode == 2
                         && loaded_scripts.bundles.iter().any(|bundle| {
                             bundle.clan_index == index
-                                && matches!(
-                                    bundle.init_execution,
-                                    MissionScriptInitExecution::Unsupported { .. }
-                                )
+                                && (!bundle.init_stubs.is_empty()
+                                    || matches!(
+                                        bundle.init_execution,
+                                        MissionScriptInitExecution::Unsupported { .. }
+                                    ))
                         })
                 })
                 .collect()
@@ -7935,6 +7939,7 @@ fn load_mission_scripts(
             package,
             formula_table,
             init_execution: MissionScriptInitExecution::Missing,
+            init_stubs: Vec::new(),
             behavior_warm_start: None,
         });
     }
@@ -8087,11 +8092,20 @@ fn resolve_init_states(
         };
         let prefix = varset
             .declarations
-            .resolve_init_prefix_with_clan_count(
+            .resolve_init_prefix_with_host(
                 &bundle.package,
                 input,
                 bundle.formula_table.as_ref(),
                 &clan_count,
+                |index, instruction| {
+                    if policy == InitPolicy::KeepPrefix {
+                        if let Some(handler) = clan_script_init::stubbed_handler(instruction) {
+                            bundle.init_stubs.push((index, handler));
+                            return true;
+                        }
+                    }
+                    false
+                },
             )
             .map_err(|source| EngineError::ScriptInit {
                 clan_index: bundle.clan_index,
@@ -12527,6 +12541,7 @@ mod tests {
             },
             formula_table: None,
             init_execution: MissionScriptInitExecution::Missing,
+            init_stubs: Vec::new(),
             behavior_warm_start: None,
         };
         let mut scripts = LoadedMissionScripts {
@@ -15868,6 +15883,7 @@ mod tests {
             },
             formula_table: None,
             init_execution: MissionScriptInitExecution::Missing,
+            init_stubs: Vec::new(),
             behavior_warm_start: None,
         }];
 
@@ -15976,6 +15992,7 @@ mod tests {
             package: package.clone(),
             formula_table: Some(formula_table.clone()),
             init_execution: MissionScriptInitExecution::Missing,
+            init_stubs: Vec::new(),
             behavior_warm_start: None,
         };
         let anchors = [[500.0, 752.0]];
@@ -16021,6 +16038,13 @@ mod tests {
                 ..bundle()
             },
         ];
+        partial_bundles[0].package.events[0].instructions.insert(
+            1,
+            fparkan_script::ScriptInstruction {
+                header_words: [43, u32::MAX, u32::MAX, u32::MAX, 6, 0, u32::MAX],
+                references: Vec::new(),
+            },
+        );
         partial_bundles[0].package.events[0]
             .instructions
             .push(fparkan_script::ScriptInstruction {
@@ -16038,10 +16062,14 @@ mod tests {
             |_, _| None,
         )
         .expect("partial Init keeps the prefix and continues with the next clan");
-        assert_eq!(
+        assert_eq!(partial_bundles[0].init_stubs, vec![(1, 43)]);
+        assert!(matches!(
             partial_bundles[0].init_execution,
-            preview_bundles[0].init_execution
-        );
+            MissionScriptInitExecution::Unsupported {
+                instruction_index: 3,
+                ..
+            }
+        ));
         assert_eq!(
             partial_bundles[1].init_execution,
             MissionScriptInitExecution::Executed { event_index: 0 }

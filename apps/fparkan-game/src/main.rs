@@ -7,6 +7,7 @@ mod camera_capture;
 mod control_effects;
 use control_effects::{advance_control_effect_instances, owner_control_capacity};
 mod mission_hints;
+mod script_coverage;
 mod terrain_lod;
 
 #[cfg(test)]
@@ -86,15 +87,14 @@ use fparkan_runtime::{
     capture_neutral_warbot, create, deploy_mine, disembark_warbot, frame as step_mission_frame,
     frame_with_player_motion, load_gameplay_mission, load_mission_static_preview,
     load_mission_static_preview_roots, load_player_projectile, loaded_mission_assets,
-    loaded_mission_object_drafts, loaded_mission_script_bundles, loaded_terrain,
-    mission_object_handle, order_lab_research, plan_player_motion_with_collision, player_vehicle,
-    prepared_warbot_weapons, projectile_terrain_hit, projectile_unit_hit,
-    query_building_segment_world, simulate_mission_report, starting_cockpit,
-    starting_player_weapons, AutoDemoCamera, AutoDemoView, BasementPlacementMode, BuildingMeshNode,
-    Engine, EngineError, EngineServices, FrameResult, LoadedMission, MissionAssets,
-    MissionEventStop, MissionMode, MissionNotice, MissionObjectDraft, MissionRequest,
-    MissionScriptInitExecution, MissionStartupInput, PlayerMotion, PlayerProjectile, PlayerWeapons,
-    StartingCockpit, SIMULATION_COVERAGE,
+    loaded_mission_object_drafts, loaded_terrain, mission_object_handle, order_lab_research,
+    plan_player_motion_with_collision, player_vehicle, prepared_warbot_weapons,
+    projectile_terrain_hit, projectile_unit_hit, query_building_segment_world,
+    simulate_mission_report, starting_cockpit, starting_player_weapons, AutoDemoCamera,
+    AutoDemoView, BasementPlacementMode, BuildingMeshNode, Engine, EngineError, EngineServices,
+    FrameResult, LoadedMission, MissionAssets, MissionEventStop, MissionMode, MissionNotice,
+    MissionObjectDraft, MissionRequest, MissionStartupInput, PlayerMotion, PlayerProjectile,
+    PlayerWeapons, StartingCockpit, SIMULATION_COVERAGE,
 };
 #[cfg(test)]
 use fparkan_runtime::{load_mission_with_init_stubs, plan_player_motion};
@@ -196,19 +196,7 @@ fn run(args: &[String]) -> Result<String, String> {
                 );
             }
         }
-        for bundle in loaded_mission_script_bundles(&engine).unwrap_or_default() {
-            if let MissionScriptInitExecution::Unsupported {
-                event_index,
-                instruction_index,
-                error,
-            } = &bundle.init_execution
-            {
-                eprintln!(
-                    "sim_coverage script_init_unsupported=1 mission={} clan={} script={} event={event_index} instruction={instruction_index} reason={error}",
-                    loaded.key, bundle.clan_index, bundle.script_path,
-                );
-            }
-        }
+        script_coverage::log_script_init(&engine, &loaded.key);
     }
     let demo_camera = match autodemo_camera(&engine) {
         Ok(camera) => camera,

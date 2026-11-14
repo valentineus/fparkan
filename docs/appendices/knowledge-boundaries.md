@@ -405,9 +405,11 @@ scratch-проход через публичный Rust parser/resolver совп
 Лицензированный test загружает одну первую кампанийную миссию
 `CAMPAIGN/CAMPAIGN.00/Mission.01/data.tma` после literal writes; это не проход
 всей цепочки кампании. Обычная `Single.01` доходит до следующего blocker-а:
-`Handler(43)` в clan 1, `Init` instruction 10. Rust не перескакивает его;
-preview оставляет varset этого клана на defaults, а полный load завершает ошибкой
-с rollback. В `fparkan-assets` теперь есть bounded TRF reader, pure ore/power
+`Handler(43)` в clan 1, `Init` instruction 10. В режиме предпросмотра varset
+этого клана остаётся на исходных значениях, строгая загрузка возвращает ошибку
+с откатом. Игровой режим продолжает сценарий после формы без аргументов и
+результата, регистрируя `script_init_handler_stub` с кланом и номером команды.
+Выбор исследования в этой точке пока открыт. В `fparkan-assets` есть bounded TRF reader, pure ore/power
 core и `ResearchCandidateSet::refresh_selection`: последний получает уже
 упорядоченные entries и отдельный TRF-контекст, затем читает Unit DAT через VFS.
 Он не строит AI-каталог и не исполняет script instruction. Runtime всё ещё не
