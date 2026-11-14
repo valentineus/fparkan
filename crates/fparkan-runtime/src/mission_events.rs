@@ -1,7 +1,8 @@
 use super::{
-    apply_recovered_script_host_callback, BehaviorDistributorState, Engine, EngineError,
-    LoadedMissionState, MissionObjectDraft, MissionScriptHostEffect, StartingCockpit,
-    LAST_SUPER_AI_TABLE_INDEX,
+    add_behavior_registered_object, apply_recovered_script_host_callback,
+    has_behavior_registration_key, normalize_behavior_distributor, BehaviorDistributorState,
+    BehaviorRegisteredObject, Engine, EngineError, LoadedMissionState, MissionObjectDraft,
+    MissionScriptHostEffect, StartingCockpit, LAST_SUPER_AI_TABLE_INDEX,
 };
 use fparkan_msh::{draw_batches, node38_sampled_hierarchy, selected_slot, Group, Lod, NodeId};
 use fparkan_render::LegacyIron3dEulerTransform;
@@ -279,7 +280,7 @@ pub fn capture_neutral_building(
     engine: &mut Engine,
     cockpit: StartingCockpit,
 ) -> Result<Option<OriginalObjectId>, EngineError> {
-    let Some(mission) = &engine.loaded else {
+    let Some(mission) = &mut engine.loaded else {
         return Ok(None);
     };
     let Some(player_owner) = identity_metadata(&engine.world, cockpit.handle)?.owner_id else {
@@ -300,22 +301,48 @@ pub fn capture_neutral_building(
         .mission_events
         .placed_clan_objects
         .iter()
-        .filter_map(|&(handle, _)| {
+        .filter_map(|&(handle, class)| {
             registration_sequence(&engine.world, handle).ok()??;
             let identity = identity_metadata(&engine.world, handle).ok()?;
-            let clan = mission
-                .mission
-                .clans
-                .get(usize::from(identity.owner_id?.0))?;
-            (clan.mode == 3).then_some((handle, identity.original_id?))
+            let owner = identity.owner_id?;
+            let clan = mission.mission.clans.get(usize::from(owner.0))?;
+            (clan.mode == 3).then_some((handle, identity.original_id?, owner, class))
         })
-        .find(|&(handle, id)| {
+        .find(|&(handle, id, _, _)| {
             transform_state(&engine.world, handle).is_ok_and(|pose| {
                 on_communicator(&mission.mission_assets, id.0 as usize, pose, position)
             })
         });
-    if let Some((handle, id)) = candidate {
+    if let Some((handle, id, former_owner, class)) = candidate {
         set_owner(&mut engine.world, handle, Some(player_owner))?;
+        if has_behavior_registration_key(class) {
+            let distributors = &mut mission.behavior_distributors;
+            if let Some(previous) = distributors.get_mut(usize::from(former_owner.0)) {
+                let count = previous.registered_objects.len();
+                previous
+                    .registered_objects
+                    .retain(|object| object.handle != handle);
+                if previous.registered_objects.len() != count {
+                    normalize_behavior_distributor(previous, None);
+                }
+            }
+            if let Some(next) = distributors
+                .get_mut(usize::from(player_owner.0))
+                .filter(|entry| entry.super_ai_visible)
+            {
+                add_behavior_registered_object(
+                    next,
+                    BehaviorRegisteredObject {
+                        original_id: id,
+                        handle,
+                        selector: u32::from(player_owner.0),
+                        class_flags: class,
+                        share: 0.0,
+                        native_tail: [0; 5],
+                    },
+                );
+            }
+        }
         Ok(Some(id))
     } else {
         Ok(None)

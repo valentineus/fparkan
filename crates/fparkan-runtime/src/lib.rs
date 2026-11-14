@@ -7520,19 +7520,19 @@ fn add_behavior_registered_object(
         distributor.registered_objects.push(object);
     }
 
-    normalize_behavior_distributor(distributor, handle);
+    normalize_behavior_distributor(distributor, Some(handle));
 }
 
 fn normalize_behavior_distributor(
     distributor: &mut BehaviorDistributorState,
-    fixed_handle: ObjectHandle,
+    fixed_handle: Option<ObjectHandle>,
 ) {
     let mut fixed_sum = 0.0_f32;
     let mut free_sum = 0.0_f32;
     let mut adjustable_count = 0_usize;
 
     for object in &distributor.registered_objects {
-        if object.handle == fixed_handle || object.native_tail[0] != 0 {
+        if Some(object.handle) == fixed_handle || object.native_tail[0] != 0 {
             fixed_sum = fixed_sum + object.share;
         } else {
             free_sum = free_sum + object.share;
@@ -7547,14 +7547,14 @@ fn normalize_behavior_distributor(
     if free_sum <= 0.0 {
         let share = (1.0_f32 - fixed_sum) / adjustable_count as f32;
         for object in &mut distributor.registered_objects {
-            if object.handle != fixed_handle && object.native_tail[0] == 0 {
+            if Some(object.handle) != fixed_handle && object.native_tail[0] == 0 {
                 object.share = share;
             }
         }
     } else {
         let factor = (1.0_f32 - fixed_sum) / free_sum;
         for object in &mut distributor.registered_objects {
-            if object.handle != fixed_handle && object.native_tail[0] == 0 {
+            if Some(object.handle) != fixed_handle && object.native_tail[0] == 0 {
                 object.share = object.share * factor;
             }
         }
@@ -17315,10 +17315,10 @@ mod tests {
         };
         normalize_behavior_distributor(
             &mut pinned,
-            ObjectHandle {
+            Some(ObjectHandle {
                 generation: 0,
                 slot: 0x11,
-            },
+            }),
         );
         assert_eq!(
             pinned
@@ -17340,10 +17340,10 @@ mod tests {
         };
         normalize_behavior_distributor(
             &mut zero_sum,
-            ObjectHandle {
+            Some(ObjectHandle {
                 generation: 0,
                 slot: 0x41,
-            },
+            }),
         );
         assert_eq!(
             zero_sum
@@ -17365,10 +17365,10 @@ mod tests {
         };
         normalize_behavior_distributor(
             &mut near_rounding,
-            ObjectHandle {
+            Some(ObjectHandle {
                 generation: 0,
                 slot: 0x51,
-            },
+            }),
         );
         assert_eq!(
             near_rounding
@@ -17927,6 +17927,19 @@ mod tests {
                 identity_metadata(&engine.world, handle).unwrap().owner_id,
                 Some(OwnerId(0))
             );
+            let distributors = loaded_mission_behavior_distributors(&engine).unwrap();
+            assert_eq!(
+                distributors[0]
+                    .registered_objects
+                    .iter()
+                    .filter(|row| row.handle == handle)
+                    .count(),
+                1
+            );
+            assert!(distributors[2]
+                .registered_objects
+                .iter()
+                .all(|row| row.handle != handle));
             let event = frame(&mut engine, time).unwrap().mission_event.unwrap();
             assert!(event.stop.is_none(), "{:?}", event.stop);
             assert!(
