@@ -77,11 +77,12 @@ use fparkan_render_vulkan::{
     VulkanStaticTexture, VulkanStaticTextureMip, VulkanStaticVertex,
 };
 use fparkan_runtime::{
-    create, frame as step_mission_frame, load_mission, load_mission_static_preview,
-    load_mission_static_preview_roots, loaded_mission_assets, loaded_mission_object_drafts,
-    loaded_terrain, query_building_segment_world, simulate_mission_report, BasementPlacementMode,
-    BuildingMeshNode, Engine, EngineError, EngineServices, FrameResult, LoadedMission,
-    MissionAssets, MissionMode, MissionObjectDraft, MissionRequest, MissionStartupInput,
+    create, frame as step_mission_frame, load_mission_static_preview,
+    load_mission_static_preview_roots, load_mission_with_init_stubs, loaded_mission_assets,
+    loaded_mission_object_drafts, loaded_mission_script_bundles, loaded_terrain,
+    query_building_segment_world, simulate_mission_report, BasementPlacementMode, BuildingMeshNode,
+    Engine, EngineError, EngineServices, FrameResult, LoadedMission, MissionAssets, MissionMode,
+    MissionObjectDraft, MissionRequest, MissionScriptInitExecution, MissionStartupInput,
     SIMULATION_COVERAGE,
 };
 #[cfg(test)]
@@ -151,18 +152,22 @@ fn run(args: &[String]) -> Result<String, String> {
     let services = EngineServices::new(vfs);
     let mut engine = create(services).map_err(|err| err.to_string())?;
     let mission_assets_started = Instant::now();
-    let loaded = match load_requested_mission(&mut engine, &args) {
-        Ok(loaded) => loaded,
-        Err(ref error @ EngineError::ScriptInitUnsupported { ref source, .. })
-            if args.sim_report_ms.is_some() =>
-        {
-            return Err(format!(
-                "sim_coverage script_init_unsupported=1 mission={} reason={source}\n{error}",
-                args.mission
-            ));
+    let loaded = load_requested_mission(&mut engine, &args).map_err(|error| error.to_string())?;
+    if !args.viewer {
+        for bundle in loaded_mission_script_bundles(&engine).unwrap_or_default() {
+            if let MissionScriptInitExecution::Unsupported {
+                event_index,
+                instruction_index,
+                error,
+            } = &bundle.init_execution
+            {
+                eprintln!(
+                    "sim_coverage script_init_unsupported=1 mission={} clan={} script={} event={event_index} instruction={instruction_index} reason={error}",
+                    loaded.key, bundle.clan_index, bundle.script_path,
+                );
+            }
         }
-        Err(error) => return Err(error.to_string()),
-    };
+    }
     if let Some(duration_ms) = args.sim_report_ms {
         let report = simulate_mission_report(&mut engine, duration_ms.get()).map_err(|error| {
             format!(
@@ -276,7 +281,7 @@ fn load_requested_mission(engine: &mut Engine, args: &Args) -> Result<LoadedMiss
         },
     };
     if !args.viewer {
-        load_mission(
+        load_mission_with_init_stubs(
             engine,
             request,
             MissionStartupInput {

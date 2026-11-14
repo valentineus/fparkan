@@ -185,6 +185,18 @@ pub enum ScriptInitResolution {
     },
 }
 
+/// Proven writes before the first unsupported instruction of a selected `Init`.
+pub struct ScriptInitPrefix {
+    /// Zero-based selected event index.
+    pub event_index: usize,
+    /// Opaque event word retained from the package.
+    pub event_word: u32,
+    /// Ordered writes from instructions that ran.
+    pub writes: Vec<ScriptInitWrite>,
+    /// Zero-based instruction index and reason, if execution stopped early.
+    pub stopped_at: Option<(usize, ScriptInitResolveError)>,
+}
+
 /// A typed failure or unsupported form in the recovered `Init` subset.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ScriptInitResolveError {
@@ -733,9 +745,8 @@ impl VarSet {
     /// Resolves the first case-sensitive `Init` event's recovered write subset.
     ///
     /// Handler(19) writes use the caller's original setter-boundary words. A
-    /// sentinel selector is accepted only for the proven formula assignment
-    /// with control and copy-source words both equal to `0xffffffff`; the
-    /// referenced row is evaluated only when that instruction is reached.
+    /// sentinel selector accepts immediate and formula assignments. A
+    /// referenced formula row is evaluated only when its instruction is reached.
     /// Formula atoms read defaults and earlier successful writes in this event.
     ///
     /// # Errors
@@ -748,10 +759,40 @@ impl VarSet {
         input: Handler19InitInput,
         formulas: Option<&FormulaTable>,
     ) -> Result<ScriptInitResolution, ScriptInitResolveError> {
+        Ok(match self.resolve_init_prefix(package, input, formulas)? {
+            None => ScriptInitResolution::Missing,
+            Some(ScriptInitPrefix {
+                event_index,
+                stopped_at: Some((instruction_index, error)),
+                ..
+            }) => ScriptInitResolution::Unsupported {
+                event_index,
+                instruction_index,
+                error,
+            },
+            Some(prefix) => ScriptInitResolution::Executed {
+                event_index: prefix.event_index,
+                event_word: prefix.event_word,
+                writes: prefix.writes,
+            },
+        })
+    }
+
+    /// Resolves the supported prefix for a caller that can report a partial `Init`.
+    ///
+    /// # Errors
+    ///
+    /// Malformed instructions still return an error without publishing writes.
+    pub fn resolve_init_prefix(
+        &self,
+        package: &ScriptPackage,
+        input: Handler19InitInput,
+        formulas: Option<&FormulaTable>,
+    ) -> Result<Option<ScriptInitPrefix>, ScriptInitResolveError> {
         let Some((event_index, event)) = package.events.iter().enumerate().find(|(_, event)| {
             event.name_raw.split(|byte| *byte == 0).next() == Some(&b"Init"[..])
         }) else {
-            return Ok(ScriptInitResolution::Missing);
+            return Ok(None);
         };
 
         let mut values = self
@@ -759,7 +800,12 @@ impl VarSet {
             .iter()
             .map(|declaration| declaration.default_value)
             .collect::<Vec<_>>();
-        let mut writes = Vec::new();
+        let mut prefix = ScriptInitPrefix {
+            event_index,
+            event_word: event.event_word,
+            writes: Vec::new(),
+            stopped_at: None,
+        };
         for (instruction_index, instruction) in event.instructions.iter().enumerate() {
             match self.resolve_init_instruction(instruction, input, formulas, &values)? {
                 InitInstructionResolution::Executed(instruction_writes) => {
@@ -772,23 +818,16 @@ impl VarSet {
                         };
                         *value = write.value;
                     }
-                    writes.extend(instruction_writes);
+                    prefix.writes.extend(instruction_writes);
                 }
                 InitInstructionResolution::Unsupported(error) => {
-                    return Ok(ScriptInitResolution::Unsupported {
-                        event_index,
-                        instruction_index,
-                        error,
-                    });
+                    prefix.stopped_at = Some((instruction_index, error));
+                    break;
                 }
             }
         }
 
-        Ok(ScriptInitResolution::Executed {
-            event_index,
-            event_word: event.event_word,
-            writes,
-        })
+        Ok(Some(prefix))
     }
 
     fn resolve_init_instruction(

@@ -24,10 +24,11 @@ use fparkan_prototype::{
 use fparkan_resource::{
     resource_name, CachedResourceRepository, ResourceError, ResourceKey, ResourceRepository,
 };
+#[cfg(test)]
+use fparkan_script::ScriptInitResolution;
 use fparkan_script::{
-    FormulaTable, Handler19InitInput, ScriptInitResolution, ScriptInitResolveError,
-    ScriptInitWrite, ScriptInstruction, ScriptPackage, VarSet, VarSetDefault,
-    VmHostCallbackCommand,
+    FormulaTable, Handler19InitInput, ScriptInitResolveError, ScriptInitWrite, ScriptInstruction,
+    ScriptPackage, VarSet, VarSetDefault, VmHostCallbackCommand,
 };
 use fparkan_terrain::SurfaceQuery;
 use fparkan_vfs::{Vfs, VfsError};
@@ -1079,7 +1080,7 @@ pub enum MissionScriptInitExecution {
         /// Zero-based event table index selected by native lookup.
         event_index: usize,
     },
-    /// A preview retained the decoded package but stopped before the first
+    /// The clan stopped before the first
     /// instruction outside the recovered numeric `Init` subset.
     Unsupported {
         /// Zero-based event table index selected by native lookup.
@@ -1133,6 +1134,14 @@ pub enum MissionScriptHostEffect {
 struct MissionLoadOptions {
     fail_after_registered_objects: Option<usize>,
     asset_scope: MissionAssetScope,
+    allow_partial_init: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InitPolicy {
+    Strict,
+    Preview,
+    KeepPrefix,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1649,6 +1658,28 @@ pub fn load_mission(
     )
 }
 
+/// Loads the mission world even when a clan reaches an unsupported `Init` instruction.
+/// Keeps the supported prefix and records the stop in the clan's execution status.
+///
+/// # Errors
+///
+/// Malformed data and other mission load errors still abort loading.
+pub fn load_mission_with_init_stubs(
+    engine: &mut Engine,
+    request: MissionRequest,
+    startup_input: MissionStartupInput,
+) -> Result<LoadedMission, EngineError> {
+    load_mission_with_options(
+        engine,
+        request,
+        MissionLoadOptions {
+            allow_partial_init: true,
+            ..MissionLoadOptions::default()
+        },
+        Some(startup_input),
+    )
+}
+
 /// Loads a mission using the bounded static-preview asset scope.
 ///
 /// This mode preserves map, TMA, graph, construction and registration work,
@@ -2087,6 +2118,11 @@ fn load_mission_with_options(
             &mut loaded_scripts,
             queue_time_ms,
             &mut next_behavior_rng_state,
+            if options.allow_partial_init {
+                InitPolicy::KeepPrefix
+            } else {
+                InitPolicy::Strict
+            },
         ) {
             let _ = fparkan_world::shutdown(new_runtime_world);
             return Err(error);
@@ -7183,7 +7219,7 @@ fn load_mission_scripts(
                 .collect::<Vec<_>>(),
             &mut bundles,
             varset,
-            asset_scope,
+            InitPolicy::Preview,
         )?;
         let varset_states = materialize_script_varset_states(&bundles, varset, &init_states)?;
         (init_states, varset_states)
@@ -7204,6 +7240,7 @@ fn start_mission_scripts(
     scripts: &mut LoadedMissionScripts,
     queue_time_ms: u32,
     behavior_rng_state: &mut u32,
+    init_policy: InitPolicy,
 ) -> Result<(), EngineError> {
     // The recovered slot refreshes one Behavior instance before dispatching
     // that same instance's Init event. The Rust loader waits until its new
@@ -7225,7 +7262,7 @@ fn start_mission_scripts(
                 &clan_anchors,
                 std::slice::from_mut(bundle),
                 varset,
-                MissionAssetScope::Full,
+                init_policy,
             )?);
         }
     }
@@ -7283,7 +7320,7 @@ fn resolve_init_states(
     clan_anchors: &[[f32; 2]],
     bundles: &mut [MissionScriptBundle],
     varset: &MissionScriptVarSet,
-    asset_scope: MissionAssetScope,
+    policy: InitPolicy,
 ) -> Result<Vec<MissionScriptInitState>, EngineError> {
     let mut states = Vec::new();
     for bundle in bundles {
@@ -7310,47 +7347,20 @@ fn resolve_init_states(
                 message: "clan index does not fit the recovered DWORD ClanID field".to_string(),
             })?,
         };
-        match varset
+        let prefix = varset
             .declarations
-            .resolve_init(&bundle.package, input, bundle.formula_table.as_ref())
+            .resolve_init_prefix(&bundle.package, input, bundle.formula_table.as_ref())
             .map_err(|source| EngineError::ScriptInit {
                 clan_index: bundle.clan_index,
                 message: source.to_string(),
-            })? {
-            ScriptInitResolution::Missing => {
-                bundle.init_execution = MissionScriptInitExecution::Missing;
-            }
-            ScriptInitResolution::Executed {
-                event_index,
-                event_word,
-                writes,
-            } => {
-                bundle.init_execution = MissionScriptInitExecution::Executed { event_index };
-                if !writes.is_empty() {
-                    states.push(MissionScriptInitState {
-                        clan_index: bundle.clan_index,
-                        event_index,
-                        event_word,
-                        writes,
-                    });
-                }
-            }
-            ScriptInitResolution::Unsupported {
-                event_index,
-                instruction_index,
-                error,
-            } if asset_scope != MissionAssetScope::Full => {
-                bundle.init_execution = MissionScriptInitExecution::Unsupported {
-                    event_index,
-                    instruction_index,
-                    error,
-                };
-            }
-            ScriptInitResolution::Unsupported {
-                event_index,
-                instruction_index,
-                error,
-            } => {
+            })?;
+        let Some(prefix) = prefix else {
+            bundle.init_execution = MissionScriptInitExecution::Missing;
+            continue;
+        };
+        let event_index = prefix.event_index;
+        if let Some((instruction_index, error)) = prefix.stopped_at {
+            if policy == InitPolicy::Strict {
                 return Err(EngineError::ScriptInitUnsupported {
                     clan_index: bundle.clan_index,
                     path: bundle.script_path.clone(),
@@ -7359,6 +7369,24 @@ fn resolve_init_states(
                     source: error,
                 });
             }
+            bundle.init_execution = MissionScriptInitExecution::Unsupported {
+                event_index,
+                instruction_index,
+                error,
+            };
+            if policy == InitPolicy::Preview {
+                continue;
+            }
+        } else {
+            bundle.init_execution = MissionScriptInitExecution::Executed { event_index };
+        }
+        if !prefix.writes.is_empty() {
+            states.push(MissionScriptInitState {
+                clan_index: bundle.clan_index,
+                event_index,
+                event_word: prefix.event_word,
+                writes: prefix.writes,
+            });
         }
     }
     Ok(states)
@@ -11763,8 +11791,14 @@ mod tests {
         };
         let mut rng_state = INITIAL_BEHAVIOR_RNG_STATE;
 
-        let error = start_mission_scripts(&mission, &mut scripts, 100_000, &mut rng_state)
-            .expect_err("unsupported first Init stops startup before the second bundle");
+        let error = start_mission_scripts(
+            &mission,
+            &mut scripts,
+            100_000,
+            &mut rng_state,
+            InitPolicy::Strict,
+        )
+        .expect_err("unsupported first Init stops startup before the second bundle");
 
         assert!(matches!(
             error,
@@ -15094,7 +15128,7 @@ mod tests {
             &[[500.0, 752.0], [728.0, 449.0]],
             &mut bundles,
             &varset,
-            MissionAssetScope::Full,
+            InitPolicy::Strict,
         )
         .expect("exact Init execution");
         assert_eq!(
@@ -15198,13 +15232,9 @@ mod tests {
         };
         let anchors = [[500.0, 752.0]];
         let mut preview_bundles = vec![bundle()];
-        let preview_states = resolve_init_states(
-            &anchors,
-            &mut preview_bundles,
-            &varset,
-            MissionAssetScope::FirstMeshPreview,
-        )
-        .expect("static preview retains unsupported script");
+        let preview_states =
+            resolve_init_states(&anchors, &mut preview_bundles, &varset, InitPolicy::Preview)
+                .expect("static preview retains unsupported script");
         assert!(preview_states.is_empty(), "no partial writes are retained");
         assert_eq!(
             preview_bundles[0].init_execution,
@@ -15231,13 +15261,63 @@ mod tests {
         );
         assert_eq!(preview_bundles[0].package, package);
 
+        let mut partial_bundles = vec![
+            bundle(),
+            MissionScriptBundle {
+                clan_index: 1,
+                ..bundle()
+            },
+        ];
+        partial_bundles[0].package.events[0]
+            .instructions
+            .push(fparkan_script::ScriptInstruction {
+                header_words: [u32::MAX, 0, 99, 6, 6, 0, u32::MAX],
+                references: Vec::new(),
+            });
+        partial_bundles[1].package.events[0]
+            .instructions
+            .truncate(1);
+        let partial_states = resolve_init_states(
+            &[anchors[0], [10.0, 20.0]],
+            &mut partial_bundles,
+            &varset,
+            InitPolicy::KeepPrefix,
+        )
+        .expect("partial Init keeps the prefix and continues with the next clan");
+        assert_eq!(
+            partial_bundles[0].init_execution,
+            preview_bundles[0].init_execution
+        );
+        assert_eq!(
+            partial_bundles[1].init_execution,
+            MissionScriptInitExecution::Executed { event_index: 0 }
+        );
+        let cells =
+            materialize_script_varset_states(&partial_bundles, &varset, &partial_states).unwrap();
+        assert_eq!(
+            cells[0].values,
+            [
+                VarSetDefault::Dword(502),
+                VarSetDefault::Dword(752),
+                VarSetDefault::Dword(0)
+            ]
+        );
+        assert_eq!(
+            cells[1].values,
+            [
+                VarSetDefault::Dword(10),
+                VarSetDefault::Dword(20),
+                VarSetDefault::Dword(1)
+            ]
+        );
+
         let mut full_bundles = vec![bundle()];
         assert!(matches!(
             resolve_init_states(
                 &anchors,
                 &mut full_bundles,
                 &varset,
-                MissionAssetScope::Full,
+                InitPolicy::Strict,
             ),
             Err(EngineError::ScriptInitUnsupported {
                 clan_index: 0,
@@ -15264,7 +15344,7 @@ mod tests {
                 &anchors,
                 &mut malformed_bundle,
                 &varset,
-                MissionAssetScope::FirstMeshPreview,
+                InitPolicy::Preview,
             ),
             Err(EngineError::ScriptInit { message, .. })
                 if message.contains("Handler(19) is missing reference 0")
