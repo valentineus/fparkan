@@ -7,7 +7,9 @@ use fparkan_prototype::{resolve_prototype_all, PrototypeSource};
 use fparkan_render::LegacyIron3dEulerTransform;
 use fparkan_resource::{resource_name, CachedResourceRepository};
 use fparkan_terrain::{FullSurfaceMask, SurfaceQuery, TerrainError};
+use fparkan_vfs::Vfs;
 use fparkan_world::{handle_by_original_id, request_delete, transform_state, ObjectHandle};
+use std::sync::Arc;
 
 /// Prepared visuals and travel parameters for one projectile prototype.
 pub struct ProjectileAssets {
@@ -27,13 +29,21 @@ pub fn load_player_projectile(
     archive: &str,
     name: &str,
 ) -> Result<ProjectileAssets, String> {
+    let vfs = engine.services.vfs.as_ref().ok_or("missing resource VFS")?;
+    load_projectile(vfs, archive, name)
+}
+
+pub(super) fn load_projectile(
+    vfs: &Arc<dyn Vfs>,
+    archive: &str,
+    name: &str,
+) -> Result<ProjectileAssets, String> {
     if !archive.eq_ignore_ascii_case("objects.rlb")
         || name.is_empty()
         || name.bytes().any(|byte| matches!(byte, b'/' | b'\\' | b'.'))
     {
         return Err(format!("unsupported projectile key {archive}:{name}"));
     }
-    let vfs = engine.services.vfs.as_ref().ok_or("missing resource VFS")?;
     let asset_manager = AssetManager::new(CachedResourceRepository::new(vfs.clone()));
     let prototypes = resolve_prototype_all(
         asset_manager.repository(),
@@ -183,22 +193,28 @@ pub fn projectile_unit_hit(
                 return None;
             }
             let state = transform_state(&engine.world, handle).ok()?;
-            let assets = &mission.mission_assets;
-            let visual = assets.visual_by_id(*assets.visuals_for_object(index).first()?)?;
-            let model = &assets.model_by_id(visual.model_id?)?.validated;
-            let scale = state.scale.map(f32::from_bits);
-            let transform = LegacyIron3dEulerTransform {
-                translation: state.position.map(f32::from_bits),
-                orientation_radians: state.orientation.map(f32::from_bits),
-            };
-            let center =
-                transform.try_transform_scaled_point(model.bounding_sphere_center, scale)?;
-            let radius =
-                model.bounding_sphere_radius * scale.into_iter().map(f32::abs).fold(0.0, f32::max);
+            let (center, radius) = unit_sphere(&mission.mission_assets, index, state)?;
             let fraction = segment_sphere_fraction(segment, center, radius)?;
             Some(ProjectileContact { handle, fraction })
         })
         .min_by(|a, b| a.fraction.total_cmp(&b.fraction))
+}
+
+pub(super) fn unit_sphere(
+    assets: &MissionAssets,
+    index: usize,
+    state: fparkan_world::TransformState,
+) -> Option<([f32; 3], f32)> {
+    let visual = assets.visual_by_id(*assets.visuals_for_object(index).first()?)?;
+    let model = &assets.model_by_id(visual.model_id?)?.validated;
+    let scale = state.scale.map(f32::from_bits);
+    let transform = LegacyIron3dEulerTransform {
+        translation: state.position.map(f32::from_bits),
+        orientation_radians: state.orientation.map(f32::from_bits),
+    };
+    let center = transform.try_transform_scaled_point(model.bounding_sphere_center, scale)?;
+    let radius = model.bounding_sphere_radius * scale.into_iter().map(f32::abs).fold(0.0, f32::max);
+    Some((center, radius))
 }
 
 fn segment_sphere_fraction(

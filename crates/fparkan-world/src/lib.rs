@@ -456,13 +456,7 @@ where
         }
         world.tick.0 = world.tick.0.saturating_add(1);
         world.phase = WorldPhase::PublishingSnapshot;
-        let snapshot = WorldSnapshot {
-            tick: world.tick,
-            objects: live_registered(world),
-            transforms: live_registered_with_transforms(world),
-            events,
-            hash: canonical_state_hash(world),
-        };
+        let snapshot = world_snapshot(world, events);
         world.phase = WorldPhase::Idle;
         Ok(snapshot)
     })();
@@ -472,6 +466,18 @@ where
         return Err(err);
     }
     result
+}
+
+/// Publishes the current live objects, transforms and hash with the given step events.
+#[must_use]
+pub fn world_snapshot(world: &World, events: Vec<WorldEvent>) -> WorldSnapshot {
+    WorldSnapshot {
+        tick: world.tick,
+        objects: live_registered(world),
+        transforms: live_registered_with_transforms(world),
+        events,
+        hash: canonical_state_hash(world),
+    }
 }
 
 /// Computes canonical state hash.

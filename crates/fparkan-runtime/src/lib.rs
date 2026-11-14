@@ -42,6 +42,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 mod autodemo;
+mod autodemo_combat;
 mod mesh_collision;
 mod mission_events;
 mod player_motion;
@@ -50,6 +51,7 @@ mod projectile;
 mod unit_patrol;
 
 pub use autodemo::{autodemo_camera, AutoDemoCamera, AutoDemoView};
+pub use autodemo_combat::{AutoDemoCombatEvent, AutoDemoProjectileType};
 pub use fparkan_assets::MissionAssets;
 pub use mesh_collision::{query_building_segment_world, BuildingMeshHit, BuildingMeshNode};
 use mission_events::MissionEvents;
@@ -1278,6 +1280,10 @@ pub struct FrameResult {
     pub mission_event: Option<MissionEventTick>,
     /// Vertical aim of the controlled hero as an IEEE-754 radian value.
     pub player_pitch_bits: u32,
+    /// Autonomous combat events during the step.
+    pub autodemo_combat_events: Vec<AutoDemoCombatEvent>,
+    /// Autonomous impact or flight operations that could not execute.
+    pub autodemo_combat_unavailable: usize,
 }
 
 /// Engine.
@@ -1286,6 +1292,7 @@ pub struct Engine {
     world: World,
     loaded: Option<LoadedMissionState>,
     behavior_rng_state: u32,
+    autodemo_combat: Option<autodemo_combat::AutoDemoCombat>,
 }
 
 struct LoadedMissionState {
@@ -1656,6 +1663,7 @@ pub fn create(services: EngineServices) -> Result<Engine, EngineError> {
         world: new_world(WorldConfig),
         loaded: None,
         behavior_rng_state: INITIAL_BEHAVIOR_RNG_STATE,
+        autodemo_combat: None,
     })
 }
 
@@ -2279,8 +2287,18 @@ fn load_mission_with_options(
     let unit_patrol = (request.mode == MissionMode::AutoDemo && options.start_autodemo)
         .then(|| unit_patrol::UnitPatrol::new(&mission, &object_drafts, &handles))
         .flatten();
+    let autodemo_combat = unit_patrol.as_ref().map(|_| {
+        autodemo_combat::AutoDemoCombat::new(
+            &vfs,
+            &mission,
+            &object_drafts,
+            &handles,
+            &mission_assets,
+        )
+    });
     engine.world = new_runtime_world;
     engine.behavior_rng_state = next_behavior_rng_state;
+    engine.autodemo_combat = autodemo_combat;
     engine.loaded = Some(LoadedMissionState {
         summary: summary.clone(),
         mission,
@@ -2349,16 +2367,20 @@ pub fn step_headless(
         .loaded
         .as_ref()
         .and_then(|mission| {
-            mission
-                .unit_patrol
+            let patrol = mission.unit_patrol.as_ref()?;
+            let targets = engine
+                .autodemo_combat
                 .as_ref()
-                .map(|patrol| patrol.prepare(&engine.world, &mission.terrain, queue_time_ms))
+                .map_or_else(Vec::new, |combat| {
+                    combat.targets(&engine.world, &mission.mission_assets)
+                });
+            Some(patrol.prepare(&engine.world, &mission.terrain, queue_time_ms, &targets))
         })
         .transpose()?;
     if let Some(patrol) = &patrol {
         patrol.apply_poses(&mut engine.world)?;
     }
-    let snapshot = match step(&mut engine.world, &input) {
+    let mut snapshot = match step(&mut engine.world, &input) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             if let Some(patrol) = patrol {
@@ -2373,6 +2395,21 @@ pub fn step_headless(
     if let Some(resources) = resources {
         resources.apply(engine);
     }
+    let (autodemo_combat_events, autodemo_combat_unavailable) =
+        if let Some(mut combat) = engine.autodemo_combat.take() {
+            let result = combat.tick(engine, queue_time_ms);
+            engine.autodemo_combat = Some(combat);
+            if result
+                .0
+                .iter()
+                .any(|event| matches!(event, AutoDemoCombatEvent::Destroyed { .. }))
+            {
+                snapshot = fparkan_world::world_snapshot(&engine.world, snapshot.events);
+            }
+            result
+        } else {
+            (Vec::new(), 0)
+        };
     let mission_event = engine
         .loaded
         .as_mut()
@@ -2380,6 +2417,8 @@ pub fn step_headless(
     Ok(FrameResult {
         snapshot,
         mission_event,
+        autodemo_combat_events,
+        autodemo_combat_unavailable,
         player_pitch_bits: engine
             .loaded
             .as_ref()
@@ -2449,6 +2488,12 @@ pub struct SimulationReport {
     pub mission_event_stops: Vec<MissionEventStop>,
     /// Total requests for mission information messages.
     pub mission_messages: u64,
+    /// Clock of the first autonomous shot, in milliseconds.
+    pub autodemo_first_shot_ms: Option<u32>,
+    /// Clock of the first autonomous kill, in milliseconds.
+    pub autodemo_first_destroyed_ms: Option<u32>,
+    /// Count of autonomous combat operations that could not execute.
+    pub autodemo_combat_unavailable: usize,
 }
 
 /// Steps a freshly loaded mission from queue time zero at 60 Hz for coverage.
@@ -2469,6 +2514,9 @@ pub fn simulate_mission_report(
         mission_events: 0,
         mission_event_stops: Vec::new(),
         mission_messages: 0,
+        autodemo_first_shot_ms: None,
+        autodemo_first_destroyed_ms: None,
+        autodemo_combat_unavailable: 0,
     };
     let steps = (u64::from(duration_ms) * 60).div_ceil(1000);
     for tick in 1..=steps {
@@ -2477,6 +2525,17 @@ pub fn simulate_mission_report(
         report.ticks = tick;
         report.live_objects = frame.snapshot.objects.len();
         report.world_events += frame.snapshot.events.len() as u64;
+        report.autodemo_combat_unavailable += frame.autodemo_combat_unavailable;
+        for event in frame.autodemo_combat_events {
+            match event {
+                AutoDemoCombatEvent::Shot { .. } => {
+                    report.autodemo_first_shot_ms.get_or_insert(clock_ms)
+                }
+                AutoDemoCombatEvent::Destroyed { .. } => {
+                    report.autodemo_first_destroyed_ms.get_or_insert(clock_ms)
+                }
+            };
+        }
         if let Some(event) = frame.mission_event {
             report.mission_events += 1;
             report.mission_event_stops.extend(event.stop);
@@ -2488,6 +2547,34 @@ pub fn simulate_mission_report(
         }
     }
     Ok(report)
+}
+
+/// Prepared autonomous projectile types and their render-pool capacity.
+#[must_use]
+pub fn autodemo_projectile_types(engine: &Engine) -> &[AutoDemoProjectileType] {
+    engine
+        .autodemo_combat
+        .as_ref()
+        .map_or(&[], autodemo_combat::AutoDemoCombat::types)
+}
+
+/// Active autonomous flights in the current world.
+pub fn autodemo_projectiles(
+    engine: &Engine,
+) -> impl Iterator<Item = (usize, PlayerProjectile)> + '_ {
+    engine
+        .autodemo_combat
+        .iter()
+        .flat_map(autodemo_combat::AutoDemoCombat::flights)
+}
+
+/// Counts autonomous weapons or projectile profiles that could not be prepared.
+#[must_use]
+pub fn autodemo_combat_unavailable(engine: &Engine) -> usize {
+    engine
+        .autodemo_combat
+        .as_ref()
+        .map_or(0, |combat| combat.unavailable)
 }
 
 /// Returns the loaded mission summary.
@@ -16063,6 +16150,37 @@ mod tests {
                 .all(|distance| (10.0..=45.01).contains(distance)),
             "{moved:?}"
         );
+        let mut first_shot = None;
+        let mut first_destroyed = None;
+        for tick in 301..=3_600 {
+            let now = tick * 1_000 / 60;
+            let result = frame(&mut engine, now).unwrap();
+            for event in result.autodemo_combat_events {
+                match event {
+                    AutoDemoCombatEvent::Shot {
+                        shooter,
+                        target,
+                        projectile,
+                    } => {
+                        assert_ne!(shooter, target);
+                        assert!(projectile < autodemo_projectile_types(&engine).len());
+                        first_shot.get_or_insert(now);
+                    }
+                    AutoDemoCombatEvent::Destroyed { target, .. } => {
+                        assert!(!result.snapshot.objects.contains(&target));
+                        assert!(!result
+                            .snapshot
+                            .transforms
+                            .iter()
+                            .any(|(handle, _)| *handle == target));
+                        first_destroyed.get_or_insert(now);
+                    }
+                }
+            }
+        }
+        let first_shot = first_shot.expect("AutoDemo units should fire");
+        let first_destroyed = first_destroyed.expect("Autonomous projectiles should remove a unit");
+        assert!(first_shot < first_destroyed);
     }
 
     #[test]

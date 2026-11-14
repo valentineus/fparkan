@@ -163,8 +163,9 @@ fn run(args: &[String]) -> Result<String, String> {
         if args.mission_mode() == MissionMode::AutoDemo {
             let roots = loaded_mission_object_drafts(&engine).unwrap_or_default();
             eprintln!(
-                "sim_coverage autodemo_spawn_position_approx={} autodemo_replenishment_stub=1 autodemo_patrol_approx=1",
-                roots.len().saturating_sub(loaded.object_count)
+                "sim_coverage autodemo_spawn_position_approx={} autodemo_replenishment_stub=1 autodemo_patrol_approx=1 autodemo_combat_approx=1 autodemo_weapon_unavailable={}",
+                roots.len().saturating_sub(loaded.object_count),
+                fparkan_runtime::autodemo_combat_unavailable(&engine),
             );
             for root in roots.iter().skip(loaded.object_count) {
                 eprintln!(
@@ -210,6 +211,12 @@ fn run(args: &[String]) -> Result<String, String> {
         })?;
         for stop in &report.mission_event_stops {
             log_mission_event_stop(stop);
+        }
+        if args.mission_mode() == MissionMode::AutoDemo {
+            eprintln!(
+                "autodemo_combat first_shot_ms={:?} first_destroyed_ms={:?}\nsim_coverage autodemo_combat_unavailable={}",
+                report.autodemo_first_shot_ms, report.autodemo_first_destroyed_ms, report.autodemo_combat_unavailable,
+            );
         }
         return Ok(format!(
             "simulation mission={} ticks={} queue_time_ms={} live_objects={} world_events={} init_states={} mission_events={} mission_messages={} outcome={:?}\n{SIMULATION_COVERAGE} {camera_coverage}",
@@ -9459,7 +9466,7 @@ fn prepare_projectile_draw(
     engine: &Engine,
     archive: &str,
     name: &str,
-    interval_ms: u32,
+    capacity: impl FnOnce(u32) -> u32,
     preview: &mut StaticPreviewScene,
 ) -> Result<Option<ProjectileDraw>, String> {
     let projectile = load_player_projectile(engine, archive, name)?;
@@ -9494,7 +9501,7 @@ fn prepare_projectile_draw(
         &mut preview.materials,
         &mut preview.material_animations,
     )?;
-    let capacity = projectile.lifetime_ms.div_ceil(interval_ms).min(128);
+    let capacity = capacity(projectile.lifetime_ms).min(128);
     let mut instances = Vec::new();
     for _ in 0..capacity {
         let vertex_start = preview.mesh.vertices.len();
@@ -9808,7 +9815,7 @@ fn run_static_vulkan_mode(
                 engine,
                 &weapon.projectile_archive,
                 &weapon.projectile,
-                weapon.interval_ms(),
+                |lifetime| lifetime.div_ceil(weapon.interval_ms()),
                 &mut preview,
             ) {
                 Ok(Some(draw)) => Some(draw),
@@ -9827,6 +9834,18 @@ fn run_static_vulkan_mode(
             projectile_draws.push(draw);
         }
     }
+    let autodemo_draws = mission_engine.as_ref().map_or_else(Vec::new, |engine| {
+        fparkan_runtime::autodemo_projectile_types(engine).iter().map(|kind| {
+            match prepare_projectile_draw(engine, &kind.archive, &kind.name, |_| kind.capacity, &mut preview) {
+                Ok(Some(draw)) => Some(draw),
+                result => {
+                    let reason = result.err().unwrap_or_else(|| "effect-only body".into());
+                    eprintln!("sim_coverage autodemo_projectile_visual_stub=1 projectile={} reason={reason}", kind.name);
+                    None
+                }
+            }
+        }).collect()
+    });
     let shadow_base_vertex = preview.mesh.vertices.len();
     let shadow_base_index = preview.mesh.indices.len();
     let mut app = StaticVulkanApp::new(
@@ -9851,6 +9870,7 @@ fn run_static_vulkan_mode(
     app.cockpit = cockpit;
     app.player_weapons = player_weapons;
     app.projectile_draws = projectile_draws;
+    app.autodemo_draws = autodemo_draws;
     if let Some(engine) = &app.mission_engine {
         app.mission_render_roots = loaded_mission_object_drafts(engine)
             .unwrap_or_default()
@@ -10005,6 +10025,7 @@ struct StaticVulkanApp {
     player_weapons: PlayerWeapons,
     player_weapon_sounds: Vec<Option<Op2SoundCommand>>,
     projectile_draws: Vec<Option<ProjectileDraw>>,
+    autodemo_draws: Vec<Option<ProjectileDraw>>,
     player_fire_held: bool,
     player_fire_pressed: bool,
     player_capture_pressed: bool,
@@ -10134,6 +10155,7 @@ impl StaticVulkanApp {
             player_weapons: PlayerWeapons::default(),
             player_weapon_sounds: Vec::new(),
             projectile_draws: Vec::new(),
+            autodemo_draws: Vec::new(),
             player_fire_held: false,
             player_fire_pressed: false,
             player_capture_pressed: false,
@@ -10653,7 +10675,12 @@ impl StaticVulkanApp {
     }
 
     fn update_projectile_geometry(&mut self) {
-        for draw in self.projectile_draws.iter().flatten() {
+        for draw in self
+            .projectile_draws
+            .iter()
+            .chain(&self.autodemo_draws)
+            .flatten()
+        {
             for instance in &draw.instances {
                 let Some(flight) = instance.flight else {
                     continue;
@@ -10670,6 +10697,45 @@ impl StaticVulkanApp {
                 {
                     vertex.position = add3(flight.position, rotate(local.position));
                     vertex.normal = rotate(local.normal);
+                }
+            }
+        }
+    }
+
+    fn update_autodemo_projectiles(&mut self, clock_ms: u32) {
+        let (Some(engine), Some(frame)) = (&self.mission_engine, &self.mission_frame) else {
+            return;
+        };
+        for event in &frame.autodemo_combat_events {
+            use fparkan_runtime::AutoDemoCombatEvent::{Destroyed, Shot};
+            match *event {
+                Shot { shooter, target, projectile } => eprintln!(
+                    "autodemo_shot shooter={} target={} projectile={projectile} queue_time_ms={clock_ms}", shooter.slot, target.slot
+                ),
+                Destroyed { shooter, target } => eprintln!(
+                    "autodemo_destroyed shooter={} target={} queue_time_ms={clock_ms}", shooter.slot, target.slot
+                ),
+            }
+        }
+        if frame.autodemo_combat_unavailable != 0 {
+            eprintln!(
+                "sim_coverage autodemo_combat_unavailable={}",
+                frame.autodemo_combat_unavailable
+            );
+        }
+        for draw in self.autodemo_draws.iter_mut().flatten() {
+            for instance in &mut draw.instances {
+                instance.flight = None;
+            }
+        }
+        for (slot, flight) in fparkan_runtime::autodemo_projectiles(engine) {
+            if let Some(draw) = self.autodemo_draws.get_mut(slot).and_then(Option::as_mut) {
+                if let Some(instance) = draw
+                    .instances
+                    .iter_mut()
+                    .find(|instance| instance.flight.is_none())
+                {
+                    instance.flight = Some(flight);
                 }
             }
         }
@@ -11039,6 +11105,7 @@ impl StaticVulkanApp {
         }
         self.update_mission_camera(clock.delta_seconds, viewport)?;
         self.update_player_fire(control_clock_ms);
+        self.update_autodemo_projectiles(control_clock_ms);
         self.update_projectile_geometry();
         refresh_dynamic_shadow_casters(
             &mut self.shadow_casters,
@@ -11473,7 +11540,12 @@ impl StaticVulkanApp {
             &frame.material_update.active_materials,
             renderer,
         )?;
-        for draw in self.projectile_draws.iter().flatten() {
+        for draw in self
+            .projectile_draws
+            .iter()
+            .chain(&self.autodemo_draws)
+            .flatten()
+        {
             for instance in draw
                 .instances
                 .iter()

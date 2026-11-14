@@ -270,6 +270,17 @@ fn prepare_weapons(control: &PreparedComponentControl) -> Vec<PlayerWeapon> {
         .collect()
 }
 
+pub(super) fn prepare_unit_weapons(controls: &[Option<PreparedComponentControl>]) -> PlayerWeapons {
+    PlayerWeapons {
+        weapons: controls
+            .iter()
+            .flatten()
+            .flat_map(prepare_weapons)
+            .collect(),
+        ..PlayerWeapons::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

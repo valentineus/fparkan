@@ -1,6 +1,6 @@
 use super::{
-    autodemo::MOBILE_UNIT, next_crt_rand, EngineError, MissionDocument, MissionObjectDraft,
-    ObjectHandle, TerrainWorld, TransformState, World,
+    autodemo::MOBILE_UNIT, autodemo_combat::CombatTarget, next_crt_rand, EngineError,
+    MissionDocument, MissionObjectDraft, ObjectHandle, TerrainWorld, TransformState, World,
 };
 use fparkan_terrain::{NavigationQuery, RouteRequest, SurfaceQuery};
 use fparkan_world::{set_transform, transform_state};
@@ -19,6 +19,7 @@ struct PatrollingUnit {
     handle: ObjectHandle,
     points: VecDeque<[f32; 2]>,
     retry_ms: u32,
+    attack: Option<ObjectHandle>,
 }
 
 pub(super) struct PreparedPatrol {
@@ -48,6 +49,7 @@ impl UnitPatrol {
                 handle,
                 points: VecDeque::new(),
                 retry_ms: 0,
+                attack: None,
             })
             .collect();
         Some(Self {
@@ -63,6 +65,7 @@ impl UnitPatrol {
         world: &World,
         terrain: &TerrainWorld,
         now_ms: u32,
+        targets: &[(ObjectHandle, CombatTarget)],
     ) -> Result<PreparedPatrol, EngineError> {
         let mut state = self.clone();
         let seconds = now_ms.saturating_sub(state.clock_ms) as f32 * 0.001;
@@ -76,8 +79,34 @@ impl UnitPatrol {
                 continue;
             };
             let from = before.position.map(f32::from_bits);
-            if unit.points.is_empty() && now_ms >= unit.retry_ms {
-                unit.points = choose_route(terrain, from, state.center, &mut state.rng)?;
+            let enemy = targets
+                .iter()
+                .find(|(handle, _)| *handle == unit.handle)
+                .map(|(_, target)| *target);
+            if unit.attack != enemy.map(|target| target.handle) {
+                unit.points.clear();
+                unit.retry_ms = 0;
+                unit.attack = enemy.map(|target| target.handle);
+            }
+            if let Some(enemy) = enemy.filter(|enemy| enemy.in_range) {
+                let mut after = before;
+                let (yaw, _) = turn_toward(
+                    before,
+                    [enemy.center[0] - from[0], enemy.center[1] - from[1]],
+                    seconds,
+                );
+                after.orientation[2] = yaw.to_bits();
+                if after != before {
+                    poses.push((unit.handle, before, after));
+                }
+                continue;
+            }
+            if (unit.points.is_empty() || enemy.is_some()) && now_ms >= unit.retry_ms {
+                unit.points = if let Some(enemy) = enemy {
+                    route_points(terrain, from, enemy.center)?.unwrap_or_default()
+                } else {
+                    choose_route(terrain, from, state.center, &mut state.rng)?
+                };
                 unit.retry_ms = now_ms.saturating_add(1_000);
             }
             let Some(&target) = unit.points.front() else {
@@ -92,13 +121,9 @@ impl UnitPatrol {
             }
             let mut after = before;
             // shortcut: fixed turn rate and patrol speed until the per-chassis Control step is available.
-            let yaw = f32::from_bits(before.orientation[2]);
-            let goal_yaw = (-dx).atan2(dy);
-            let turn = (goal_yaw - yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
-                - std::f32::consts::PI;
-            let turn_budget = 2.0 * seconds;
-            after.orientation[2] = (yaw + turn.clamp(-turn_budget, turn_budget)).to_bits();
-            let travel = 9.0 * (seconds - turn.abs() * 0.5).max(0.0);
+            let (yaw, turn_seconds) = turn_toward(before, [dx, dy], seconds);
+            after.orientation[2] = yaw.to_bits();
+            let travel = 9.0 * (seconds - turn_seconds);
             if travel > 0.0 {
                 let fraction = (travel / distance).min(1.0);
                 let xy = [from[0] + dx * fraction, from[1] + dy * fraction];
@@ -123,6 +148,18 @@ impl UnitPatrol {
     }
 }
 
+fn turn_toward(pose: TransformState, [dx, dy]: [f32; 2], seconds: f32) -> (f32, f32) {
+    let yaw = f32::from_bits(pose.orientation[2]);
+    let goal_yaw = (-dx).atan2(dy);
+    let turn = (goal_yaw - yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
+        - std::f32::consts::PI;
+    let turn_budget = 2.0 * seconds;
+    (
+        yaw + turn.clamp(-turn_budget, turn_budget),
+        seconds.min(turn.abs() * 0.5),
+    )
+}
+
 fn choose_route(
     terrain: &TerrainWorld,
     from: [f32; 3],
@@ -136,26 +173,30 @@ fn choose_route(
         let Some(z) = terrain.height_at([x, y]).map_err(EngineError::Terrain)? else {
             continue;
         };
-        let Some(route) = terrain
-            .route(RouteRequest {
-                start: from,
-                goal: [x, y, z],
-            })
-            .map_err(EngineError::Terrain)?
-        else {
-            continue;
-        };
-        let crossings: Option<VecDeque<_>> = route
-            .areas
-            .windows(2)
-            .map(|pair| terrain.route_crossing(pair[0], pair[1]))
-            .collect();
-        if let Some(mut points) = crossings {
-            points.push_back([x, y]);
+        if let Some(points) = route_points(terrain, from, [x, y, z])? {
             return Ok(points);
         }
     }
     Ok(VecDeque::new())
+}
+
+fn route_points(
+    terrain: &TerrainWorld,
+    from: [f32; 3],
+    goal: [f32; 3],
+) -> Result<Option<VecDeque<[f32; 2]>>, EngineError> {
+    let route = terrain
+        .route(RouteRequest { start: from, goal })
+        .map_err(EngineError::Terrain)?;
+    Ok(route.and_then(|route| {
+        let mut points = route
+            .areas
+            .windows(2)
+            .map(|pair| terrain.route_crossing(pair[0], pair[1]))
+            .collect::<Option<VecDeque<_>>>()?;
+        points.push_back([goal[0], goal[1]]);
+        Some(points)
+    }))
 }
 
 impl PreparedPatrol {
