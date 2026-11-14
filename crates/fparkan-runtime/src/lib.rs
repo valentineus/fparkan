@@ -1345,6 +1345,7 @@ struct LoadedMissionState {
     unit_patrol: Option<unit_patrol::UnitPatrol>,
     player_pitch_bits: u32,
     boarding: Option<boarding::Boarding>,
+    local_hero: Option<ObjectHandle>,
     script_host_mode: MissionMode,
     script_host_status: u32,
     script_outcome: MissionScriptOutcome,
@@ -2505,6 +2506,20 @@ fn load_mission_with_options(
             None,
         )
     };
+    let local_hero = (request.mode == MissionMode::SingleMission)
+        .then(|| {
+            let mut heroes =
+                object_drafts[..reserve_start]
+                    .iter()
+                    .zip(&handles)
+                    .filter(|(draft, _)| {
+                        draft.unit_dat_header_flags == Some(HERO_UNIT_CLASS)
+                            && draft.raw_after_resource == 0
+                    });
+            let (_, &hero) = heroes.next()?;
+            heroes.next().is_none().then_some(hero)
+        })
+        .flatten();
     engine.world = new_runtime_world;
     engine.behavior_rng_state = next_behavior_rng_state;
     engine.autodemo_combat = autodemo_combat;
@@ -2538,6 +2553,7 @@ fn load_mission_with_options(
         unit_patrol,
         player_pitch_bits: 0,
         boarding: None,
+        local_hero,
         script_host_mode: request.mode,
         // Fresh IGame construction seeds this field with 5; this is not the
         // later status-4 transition performed after native game initialization.
@@ -18061,10 +18077,19 @@ mod tests {
         let mut pose = transform_state(&engine.world, hero.handle).unwrap();
         pose.position = [x - 10.0, y, z + 18.0].map(f32::to_bits);
         set_transform(&mut engine.world, hero.handle, pose).unwrap();
-        let shots = (100..=6_000)
-            .step_by(50)
-            .flat_map(|now| frame(&mut engine, now).unwrap().autodemo_combat_events)
-            .collect::<Vec<_>>();
+        let mut shots = Vec::new();
+        let mut failures = 0;
+        for now in (100..=6_000).step_by(50) {
+            let step = frame(&mut engine, now).unwrap();
+            shots.extend(step.autodemo_combat_events);
+            failures += step.mission_event.map_or(0, |event| {
+                event
+                    .notices
+                    .iter()
+                    .filter(|&&notice| notice == MissionNotice::Failed)
+                    .count()
+            });
+        }
         let assets = loaded_mission_assets(&engine).unwrap();
         let weapons = player_weapon::prepare_unit_weapons(&assets.object_component_controls[11]);
         assert!(
@@ -18079,6 +18104,12 @@ mod tests {
         assert_eq!(
             transform_state(&engine.world, enemy).unwrap().position,
             enemy_pose.position
+        );
+        assert!(transform_state(&engine.world, hero.handle).is_err());
+        assert_eq!(failures, 1);
+        assert_eq!(
+            loaded_mission_script_outcome(&engine),
+            Some(MissionScriptOutcome::Failed)
         );
     }
 

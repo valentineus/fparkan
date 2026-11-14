@@ -508,6 +508,29 @@ impl LoadedMissionState {
     ) -> Option<MissionEventTick> {
         // shortcut: use the local clan (0 in the observed standalone modes),
         // until runtime has the original active-clan selector.
+        if self
+            .local_hero
+            .is_some_and(|hero| transform_state(world, hero).is_err())
+        {
+            if self.script_outcome != super::MissionScriptOutcome::Active {
+                return None;
+            }
+            let effect = apply_recovered_script_host_callback(
+                self.script_host_mode,
+                &mut self.script_host_status,
+                &mut self.script_outcome,
+                VmHostCallbackCommand {
+                    mode: 0,
+                    first: 0,
+                    second: 0,
+                },
+            );
+            return (effect == MissionScriptHostEffect::MissionFailed).then(|| MissionEventTick {
+                stop: None,
+                notices: vec![MissionNotice::Failed],
+                patrol_orders: Vec::new(),
+            });
+        }
         let bundle = self
             .script_bundles
             .iter()
