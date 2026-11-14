@@ -146,11 +146,39 @@ pub(super) struct MissionEvents {
     reported_stops: HashSet<(usize, usize)>,
     inside_hero_exit: bool,
     voiced_messages: HashSet<u32>,
+    reserved_units: HashSet<(usize, ObjectHandle)>,
     placed_clan_objects: Vec<(ObjectHandle, u32)>,
     objectives: MissionObjectives,
 }
 
 impl MissionEvents {
+    pub(super) fn set_reservation(
+        &mut self,
+        mission: &super::MissionDocument,
+        world: &World,
+        clan: usize,
+        id: u32,
+        reserved: bool,
+    ) {
+        let Some(handle) = placed_logic_objects(mission, world, id).find(|&handle| {
+            identity_metadata(world, handle)
+                .is_ok_and(|identity| identity.owner_id == Some(OwnerId(clan as u16)))
+        }) else {
+            return;
+        };
+        let key = (clan, handle);
+        if if reserved {
+            self.reserved_units.insert(key)
+        } else {
+            self.reserved_units.remove(&key)
+        } {
+            eprintln!(
+                "script_unit_reservation clan={clan} unit={} id={id} reserved={reserved}",
+                handle.slot
+            );
+        }
+    }
+
     pub(super) fn count_clan_mask(
         &self,
         world: &World,
@@ -173,6 +201,12 @@ impl MissionEvents {
         self.placed_clan_objects
             .retain(|(handle, _)| registration_sequence(world, *handle).is_ok());
         self.placed_clan_objects.push((handle, class));
+        self.reserved_units.retain(|(_, handle)| {
+            registration_sequence(world, *handle)
+                .ok()
+                .flatten()
+                .is_some()
+        });
     }
 
     pub(super) fn with_placed_objects(
@@ -612,6 +646,9 @@ impl LoadedMissionState {
                     let owner = OwnerId(bundle.clan_index as u16);
                     for &(handle, class) in &mission_events.placed_clan_objects {
                         if class != super::boarding::WARBOT_CLASS
+                            || mission_events
+                                .reserved_units
+                                .contains(&(bundle.clan_index, handle))
                             || registration_sequence(world, handle)
                                 .ok()
                                 .flatten()
@@ -693,6 +730,18 @@ impl LoadedMissionState {
                     let clan = placed_logic_objects(&self.mission, world, id)
                         .find_map(|handle| identity_metadata(world, handle).ok()?.owner_id);
                     Ok(Some(clan.map_or(u32::MAX, |owner| u32::from(owner.0))))
+                }
+                ScriptDispatchSelector::Handler(51) => {
+                    let (id, reserved) = crate::clan_script_init::reservation(instruction, values)
+                        .ok_or("Handler(51) requires a logical ID and a DWORD flag")?;
+                    mission_events.set_reservation(
+                        &self.mission,
+                        world,
+                        bundle.clan_index,
+                        id,
+                        reserved,
+                    );
+                    Ok(None)
                 }
                 ScriptDispatchSelector::Handler(59 | 60) => {
                     crate::script_time::result(instruction, values, clock_seconds)

@@ -2356,7 +2356,7 @@ fn load_mission_with_options(
         MissionEvents::default()
     };
     let mut next_behavior_rng_state = engine.behavior_rng_state;
-    let mut init_patrols = Vec::new();
+    let mut init_orders = Vec::new();
     if options.asset_scope == MissionAssetScope::Full {
         let queue_time_ms = startup_input
             .expect("full mission loading requires startup inputs")
@@ -2380,7 +2380,7 @@ fn load_mission_with_options(
                     mask,
                 ))
             },
-            &mut init_patrols,
+            &mut init_orders,
         ) {
             let _ = fparkan_world::shutdown(new_runtime_world);
             return Err(error);
@@ -2442,7 +2442,9 @@ fn load_mission_with_options(
                 &object_drafts[..reserve_start],
                 &handles[..reserve_start],
             ),
-            MissionMode::SingleMission => (!init_patrols.is_empty()
+            MissionMode::SingleMission => (init_orders
+                .iter()
+                .any(|order| matches!(order, clan_script_init::InitOrder::Patrol(_)))
                 || loaded_scripts
                     .bundles
                     .iter()
@@ -2517,14 +2519,23 @@ fn load_mission_with_options(
             unit_patrol = Some(patrol);
         }
     }
-    if let Some(patrol) = &mut unit_patrol {
-        for order in init_patrols {
-            if let Some(handle) = order.apply(patrol, &mission, &object_drafts, &new_runtime_world)
-            {
-                eprintln!(
-                    "script_init_patrol unit={} id={} target={:?}",
-                    handle.slot, order.actor_id, order.center
-                );
+    for order in init_orders {
+        match order {
+            clan_script_init::InitOrder::Patrol(order) => {
+                let Some(patrol) = &mut unit_patrol else {
+                    continue;
+                };
+                if let Some(handle) =
+                    order.apply(patrol, &mission, &object_drafts, &new_runtime_world)
+                {
+                    eprintln!(
+                        "script_init_patrol unit={} id={} target={:?}",
+                        handle.slot, order.actor_id, order.center
+                    );
+                }
+            }
+            clan_script_init::InitOrder::Reserve { clan, id, reserved } => {
+                mission_events.set_reservation(&mission, &new_runtime_world, clan, id, reserved);
             }
         }
     }
@@ -8000,7 +8011,7 @@ fn start_mission_scripts(
     behavior_rng_state: &mut u32,
     init_policy: InitPolicy,
     clan_count: impl Fn(u32, u32) -> Option<u32>,
-    init_patrols: &mut Vec<script_patrol::ScriptPatrol>,
+    init_orders: &mut Vec<clan_script_init::InitOrder>,
 ) -> Result<(), EngineError> {
     // The recovered slot refreshes one Behavior instance before dispatching
     // that same instance's Init event. The Rust loader waits until its new
@@ -8024,7 +8035,7 @@ fn start_mission_scripts(
                 varset,
                 init_policy,
                 &clan_count,
-                init_patrols,
+                init_orders,
             )?);
         }
     }
@@ -8084,7 +8095,7 @@ fn resolve_init_states(
     varset: &MissionScriptVarSet,
     policy: InitPolicy,
     clan_count: impl Fn(u32, u32) -> Option<u32>,
-    init_patrols: &mut Vec<script_patrol::ScriptPatrol>,
+    init_orders: &mut Vec<clan_script_init::InitOrder>,
 ) -> Result<Vec<MissionScriptInitState>, EngineError> {
     let mut states = Vec::new();
     for bundle in bundles {
@@ -8111,6 +8122,7 @@ fn resolve_init_states(
                 message: "clan index does not fit the recovered DWORD ClanID field".to_string(),
             })?,
         };
+        let clan = bundle.clan_index;
         let prefix = varset
             .declarations
             .resolve_init_prefix_with_host(
@@ -8128,7 +8140,16 @@ fn resolve_init_states(
                     if let Some(order) =
                         clan_script_init::patrol_order(&varset.declarations, instruction, values)
                     {
-                        init_patrols.push(order);
+                        init_orders.push(clan_script_init::InitOrder::Patrol(order));
+                        return Some(None);
+                    }
+                    if let Some((id, reserved)) = clan_script_init::reservation(instruction, values)
+                    {
+                        init_orders.push(clan_script_init::InitOrder::Reserve {
+                            clan,
+                            id,
+                            reserved,
+                        });
                         return Some(None);
                     }
                     if let Some(handler) = clan_script_init::stubbed_handler(instruction) {

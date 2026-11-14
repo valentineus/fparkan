@@ -1,6 +1,29 @@
 use crate::script_patrol::ScriptPatrol;
 use fparkan_script::{ScriptDispatchSelector, ScriptInstruction, VarSet, VarSetDefault};
 
+pub(super) enum InitOrder {
+    Patrol(ScriptPatrol),
+    Reserve {
+        clan: usize,
+        id: u32,
+        reserved: bool,
+    },
+}
+
+pub(super) fn reservation(
+    instruction: &ScriptInstruction,
+    values: &[VarSetDefault],
+) -> Option<(u32, bool)> {
+    if instruction.dispatch_selector() != ScriptDispatchSelector::Handler(51)
+        || instruction.header_words[1] != u32::MAX
+        || instruction.header_words[3] != u32::MAX
+    {
+        return None;
+    }
+    let (id, flag) = instruction.dword_pair(values)?;
+    Some((id, flag != 0))
+}
+
 pub(super) fn patrol_order(
     declarations: &VarSet,
     instruction: &ScriptInstruction,
@@ -39,5 +62,34 @@ mod tests {
         assert_eq!(stubbed_handler(&instruction), Some(43));
         instruction.header_words[1] = 0;
         assert_eq!(stubbed_handler(&instruction), None);
+    }
+
+    #[test]
+    fn reservation_reads_logical_id_and_treats_every_nonzero_flag_as_set() {
+        let instruction = ScriptInstruction {
+            header_words: [51, u32::MAX, u32::MAX, u32::MAX, 6, 2, u32::MAX],
+            references: vec![1, 0],
+        };
+        assert_eq!(
+            reservation(
+                &instruction,
+                &[VarSetDefault::Dword(2), VarSetDefault::Dword(12)]
+            ),
+            Some((12, true))
+        );
+        assert_eq!(
+            reservation(
+                &instruction,
+                &[VarSetDefault::Dword(0), VarSetDefault::Dword(13)]
+            ),
+            Some((13, false))
+        );
+        assert_eq!(
+            reservation(
+                &instruction,
+                &[VarSetDefault::FloatBits(0), VarSetDefault::Dword(13)]
+            ),
+            None
+        );
     }
 }
