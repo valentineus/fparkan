@@ -277,7 +277,7 @@ impl std::fmt::Display for ScriptInitResolveError {
             ),
             Self::UnsupportedFormulaExpression { index, expression } => write!(
                 formatter,
-                "formula {index} expression {:?} is outside the supported atom and binary +/− subset",
+                "formula {index} expression {:?} is outside the supported arithmetic subset",
                 String::from_utf8_lossy(expression)
             ),
             Self::DwordConversionOutOfRange { index, value_bits } => write!(
@@ -1643,7 +1643,7 @@ fn parse_init_formula_expression(
         }
         expression = &expression[start + 1..close];
     }
-    let (left, left_end) = parse_init_formula_atom(expression, 0, declarations, values)?;
+    let (left, left_end) = parse_init_formula_product(expression, 0, declarations, values)?;
     let operator_index = skip_native_formula_space(expression, left_end);
     let Some(&operator @ (b'+' | b'-')) = expression.get(operator_index) else {
         return expression[left_end..]
@@ -1652,7 +1652,7 @@ fn parse_init_formula_expression(
             .then_some(left);
     };
     let (right, right_end) =
-        parse_init_formula_atom(expression, operator_index + 1, declarations, values)?;
+        parse_init_formula_product(expression, operator_index + 1, declarations, values)?;
     if !expression[right_end..]
         .iter()
         .all(|byte| *byte == 0 || *byte <= 32)
@@ -1664,6 +1664,21 @@ fn parse_init_formula_expression(
         b'-' => left - right,
         _ => unreachable!(),
     })
+}
+
+fn parse_init_formula_product(
+    expression: &[u8],
+    start: usize,
+    declarations: &[VarSetDeclaration],
+    values: &[VarSetDefault],
+) -> Option<(f32, usize)> {
+    let (left, end) = parse_init_formula_atom(expression, start, declarations, values)?;
+    let index = skip_native_formula_space(expression, end);
+    if expression.get(index) != Some(&b'*') {
+        return Some((left, end));
+    }
+    let (right, end) = parse_init_formula_atom(expression, index + 1, declarations, values)?;
+    Some((left * right, end))
 }
 
 fn parse_init_formula_atom(
@@ -3320,13 +3335,40 @@ STRING( 8, ignored, ignored, ignored)\r\n";
     }
 
     #[test]
+    fn script_init_multiplies_before_addition_and_subtraction() {
+        let varset =
+            parse_varset(b"VAR(float, fDifficulty, 0.75)\nVAR(float, target, 0)\n").unwrap();
+        for (expression, expected) in [
+            (&b"20 + 55*fDifficulty"[..], 61.25_f32),
+            (b"100 - 40*fDifficulty", 70.0),
+            (b"700 - 100*fDifficulty", 625.0),
+            (b"2*fDifficulty + 4*fDifficulty", 4.5),
+        ] {
+            let formulas = one_formula(expression);
+            let package = init_package(vec![init_formula_assignment(1, 0)]);
+            let prefix = varset
+                .resolve_init_prefix(&package, init_input(), Some(&formulas))
+                .unwrap()
+                .unwrap();
+            assert_eq!(prefix.stopped_at, None);
+            assert_eq!(
+                prefix.writes,
+                [ScriptInitWrite {
+                    index: 1,
+                    value: VarSetDefault::FloatBits(expected.to_bits()),
+                }]
+            );
+        }
+    }
+
+    #[test]
     fn script_init_rejects_unsupported_formula_variable_forms() {
         let varset = parse_varset(
             b"VAR(float, target, 1)\nVAR(float, A, 2)\nVAR(float, A1, 3)\nVAR(float, ^name, 4)\n",
         )
         .expect("numeric declarations");
         for expression in [
-            &b"target * 2"[..],
+            &b"target / 2"[..],
             b"-1",
             b"target + 1 + 2",
             b"missing + 1",
@@ -3441,7 +3483,7 @@ STRING( 8, ignored, ignored, ignored)\r\n";
         let varset = parse_varset(b"VAR(DWORD, target, 0)\nVAR(DWORD, integer, 0)\n")
             .expect("numeric declaration");
         let formulas =
-            FormulaTable::parse(b"FUNCTION(unsupported, target * 2, )\nFUNCTION(literal, 7.5, )\n");
+            FormulaTable::parse(b"FUNCTION(unsupported, target / 2, )\nFUNCTION(literal, 7.5, )\n");
         let action = |formula_index| ScriptInstruction {
             header_words: [u32::MAX, 1, u32::MAX, u32::MAX, 6, 0, formula_index],
             references: Vec::new(),
@@ -3481,7 +3523,7 @@ STRING( 8, ignored, ignored, ignored)\r\n";
                 instruction_index: 0,
                 error: ScriptInitResolveError::UnsupportedFormulaExpression {
                     index: 0,
-                    expression: b" target * 2".to_vec(),
+                    expression: b" target / 2".to_vec(),
                 },
             })
         );
@@ -3495,7 +3537,7 @@ STRING( 8, ignored, ignored, ignored)\r\n";
                 instruction_index: 1,
                 error: ScriptInitResolveError::UnsupportedFormulaExpression {
                     index: 0,
-                    expression: b" target * 2".to_vec(),
+                    expression: b" target / 2".to_vec(),
                 },
             })
         );

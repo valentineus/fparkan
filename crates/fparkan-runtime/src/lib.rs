@@ -16006,7 +16006,7 @@ mod tests {
     #[test]
     fn handler_nineteen_preview_keeps_unsupported_package_without_partial_writes() {
         let formula_table =
-            FormulaTable::parse(b"FUNCTION(add, x + 2, )\nFUNCTION(unsupported, x * 2, )\n");
+            FormulaTable::parse(b"FUNCTION(add, x + 2, )\nFUNCTION(unsupported, x / 2, )\n");
         let varset = MissionScriptVarSet {
             path: FALLBACK_SCRIPT_VARSET_PATH.to_string(),
             used_fallback: true,
@@ -16068,7 +16068,7 @@ mod tests {
                 instruction_index: 2,
                 error: ScriptInitResolveError::UnsupportedFormulaExpression {
                     index: 1,
-                    expression: b" x * 2".to_vec(),
+                    expression: b" x / 2".to_vec(),
                 },
             }
         );
@@ -16168,7 +16168,7 @@ mod tests {
                     expression,
                 },
                 ..
-            }) if expression == b" x * 2"
+            }) if expression == b" x / 2"
         ));
 
         let mut malformed_package = package.clone();
