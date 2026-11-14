@@ -80,10 +80,10 @@ use fparkan_runtime::{
     create, frame as step_mission_frame, load_mission_static_preview,
     load_mission_static_preview_roots, load_mission_with_init_stubs, loaded_mission_assets,
     loaded_mission_object_drafts, loaded_mission_script_bundles, loaded_terrain,
-    query_building_segment_world, simulate_mission_report, starting_cockpit, BasementPlacementMode,
-    BuildingMeshNode, Engine, EngineError, EngineServices, FrameResult, LoadedMission,
-    MissionAssets, MissionMode, MissionObjectDraft, MissionRequest, MissionScriptInitExecution,
-    MissionStartupInput, StartingCockpit, SIMULATION_COVERAGE,
+    mission_object_handle, query_building_segment_world, simulate_mission_report, starting_cockpit,
+    BasementPlacementMode, BuildingMeshNode, Engine, EngineError, EngineServices, FrameResult,
+    LoadedMission, MissionAssets, MissionMode, MissionObjectDraft, MissionRequest,
+    MissionScriptInitExecution, MissionStartupInput, StartingCockpit, SIMULATION_COVERAGE,
 };
 #[cfg(test)]
 use fparkan_terrain::BasementFoundationFragment;
@@ -92,6 +92,7 @@ use fparkan_terrain::{
     FullSurfaceMask, SurfaceQuery, TerrainLod, TerrainMaterialLayers, TerrainWorld,
 };
 use fparkan_vfs::{DirectoryVfs, Vfs};
+use fparkan_world::{ObjectHandle, WorldSnapshot};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -219,6 +220,7 @@ fn run(args: &[String]) -> Result<String, String> {
         args.static_material_phase,
         &args.root,
         &loaded.land_msh_path,
+        !args.viewer,
     )?;
     let terrain_materials_duration = terrain_materials_duration_started.elapsed();
     // Atmosphere files are mission-local assets.  Resolving them from the
@@ -2358,8 +2360,13 @@ fn refresh_dynamic_shadow_casters(
     mesh: &VulkanStaticMesh,
     pose_buffers: &[Vec<Option<NodePoseBuffer>>],
     mount_poses: &[Vec<Option<VulkanNodePose>>],
+    live_placements: &HashMap<usize, SampledPlacement>,
 ) -> Result<(), String> {
     for dynamic in dynamic_casters {
+        let placement = live_placements.get(&dynamic.object_index);
+        if !dynamic.animated && !placement.is_some_and(|sample| sample.changed) {
+            continue;
+        }
         let caster = casters.get_mut(dynamic.caster_index).ok_or_else(|| {
             format!(
                 "dynamic shadow caster {} is outside the aggregate caster table",
@@ -2424,11 +2431,15 @@ fn refresh_dynamic_shadow_casters(
                 dynamic.caster_index
             ));
         }
+        let (transform, scale) = placement
+            .map_or((dynamic.root_transform, dynamic.owner_scale), |sample| {
+                (sample.pose.transform, sample.pose.scale)
+            });
         let mut refreshed = aggregate_shadow_caster(
             caster.id,
             caster.native_kind,
-            dynamic.root_transform,
-            dynamic.owner_scale,
+            transform,
+            scale,
             triangles,
             &component_spheres,
         )
@@ -2442,7 +2453,11 @@ fn refresh_dynamic_shadow_casters(
         // the startup native bound, the current native bound, and current
         // triangles so the result is conservative and independent of history.
         refreshed.sphere = shadow_sphere_enclosing_current_geometry(
-            dynamic.initial_sphere,
+            if transform == dynamic.root_transform && scale == dynamic.owner_scale {
+                dynamic.initial_sphere
+            } else {
+                refreshed.sphere
+            },
             refreshed.sphere,
             &refreshed.triangles,
         )?;
@@ -4823,12 +4838,74 @@ struct ControlAnimationInstance {
 
 #[derive(Clone)]
 struct DynamicComponentGeometry {
-    model: ModelAsset,
+    model: Arc<ModelAsset>,
+    animated: bool,
     root_transform: LegacyIron3dEulerTransform,
     owner_scale: [f32; 3],
     parent_mount: Option<(usize, usize)>,
     vertex_start: usize,
     vertex_count: usize,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct LivePlacement {
+    transform: LegacyIron3dEulerTransform,
+    scale: [f32; 3],
+}
+
+#[derive(Clone, Copy)]
+struct SampledPlacement {
+    pose: LivePlacement,
+    changed: bool,
+}
+
+struct MissionRenderRoot {
+    handle: ObjectHandle,
+    initial: LivePlacement,
+    rendered: LivePlacement,
+}
+
+fn live_placements(
+    roots: &mut [Option<MissionRenderRoot>],
+    snapshot: &WorldSnapshot,
+) -> HashMap<usize, SampledPlacement> {
+    let mut placements = HashMap::new();
+    for (index, root) in roots.iter_mut().enumerate() {
+        let Some(root) = root else { continue };
+        let state = snapshot
+            .transforms
+            .binary_search_by_key(&root.handle.slot, |(handle, _)| handle.slot)
+            .ok()
+            .map(|offset| snapshot.transforms[offset])
+            .and_then(|(handle, state)| (handle == root.handle).then_some(state));
+        // shortcut: retain the last pose until draw slots follow object lifecycle.
+        let mut placement = state.map_or(root.rendered, |state| LivePlacement {
+            transform: LegacyIron3dEulerTransform {
+                translation: state.position.map(f32::from_bits),
+                orientation_radians: state.orientation.map(f32::from_bits),
+            },
+            scale: state.scale.map(f32::from_bits),
+        });
+        // shortcut: changing the winding requires a Vulkan pipeline update.
+        if placement.scale != root.initial.scale
+            && native_msh_handedness(placement.transform, placement.scale)
+                != native_msh_handedness(root.initial.transform, root.initial.scale)
+        {
+            placement.scale = root.initial.scale;
+        }
+        let changed = placement != root.rendered;
+        if changed || placement != root.initial {
+            placements.insert(
+                index,
+                SampledPlacement {
+                    pose: placement,
+                    changed,
+                },
+            );
+        }
+        root.rendered = placement;
+    }
+    placements
 }
 
 #[derive(Clone)]
@@ -5037,6 +5114,7 @@ fn component_node_world_matrix(
 struct DynamicShadowCaster {
     caster_index: usize,
     object_index: usize,
+    animated: bool,
     root_transform: LegacyIron3dEulerTransform,
     owner_scale: [f32; 3],
     initial_sphere: ShadowSphere,
@@ -7466,17 +7544,24 @@ fn update_dynamic_component_geometry(
     pose_buffers: &[Vec<Option<NodePoseBuffer>>],
     mount_poses: &mut [Vec<Option<VulkanNodePose>>],
     mesh: &mut VulkanStaticMesh,
+    live_placements: &HashMap<usize, SampledPlacement>,
 ) -> Result<(), String> {
     let identity_pose = VulkanNodePose {
         translation: [0.0; 3],
         rotation: [0.0, 0.0, 0.0, 1.0],
     };
     for (object_index, components) in geometry.iter().enumerate() {
+        let live = live_placements.get(&object_index).copied();
         for (component_index, component) in components.iter().enumerate() {
-            let Some(component) = component else {
+            let Some(component) = component
+                .as_ref()
+                .filter(|c| c.animated || live.is_some_and(|sample| sample.changed))
+            else {
                 continue;
             };
-            if let Some((parent_index, socket)) = component.parent_mount {
+            if let Some((parent_index, socket)) =
+                component.parent_mount.filter(|_| component.animated)
+            {
                 let parent_mounted = mount_poses
                     .get(object_index)
                     .and_then(|items| items.get(parent_index))
@@ -7520,32 +7605,51 @@ fn update_dynamic_component_geometry(
             let hierarchy = pose_buffers
                 .get(object_index)
                 .and_then(|items| items.get(component_index))
-                .and_then(Option::as_ref)
-                .ok_or_else(|| {
-                    format!(
-                        "dynamic component {object_index}:{component_index} has no sampled pose"
-                    )
-                })?;
+                .and_then(Option::as_ref);
+            if component.animated && hierarchy.is_none() {
+                return Err(format!(
+                    "dynamic component {object_index}:{component_index} has no sampled pose"
+                ));
+            }
             let mount = mount_poses
                 .get(object_index)
                 .and_then(|items| items.get(component_index))
                 .copied()
                 .flatten();
-            let projected = match mount {
-                Some(mount) => {
+            let (transform, scale) = live.map_or(
+                (component.root_transform, component.owner_scale),
+                |sample| (sample.pose.transform, sample.pose.scale),
+            );
+            let projected = match (hierarchy, mount) {
+                (Some(hierarchy), Some(mount)) => {
                     project_msh_to_static_mesh_in_world_space_with_node_pose_buffer_and_mount(
                         &component.model,
-                        component.root_transform,
-                        component.owner_scale,
+                        transform,
+                        scale,
                         hierarchy,
                         mount,
                     )
                 }
-                None => project_msh_to_static_mesh_in_world_space_with_node_pose_buffer(
+                (Some(hierarchy), None) => {
+                    project_msh_to_static_mesh_in_world_space_with_node_pose_buffer(
+                        &component.model,
+                        transform,
+                        scale,
+                        hierarchy,
+                    )
+                }
+                (None, Some(mount)) => {
+                    project_msh_to_static_mesh_in_world_space_with_node_fallback_poses_and_mount(
+                        &component.model,
+                        transform,
+                        scale,
+                        mount,
+                    )
+                }
+                (None, None) => project_msh_to_static_mesh_in_world_space_with_node_fallback_poses(
                     &component.model,
-                    component.root_transform,
-                    component.owner_scale,
-                    hierarchy,
+                    transform,
+                    scale,
                 ),
             }
             .map_err(|error| {
@@ -8167,6 +8271,7 @@ fn static_preview_mesh_and_materials(
     static_material_phase: Option<u16>,
     root: &std::path::Path,
     land_msh_path: &str,
+    live_roots: bool,
 ) -> Result<StaticPreviewScene, String> {
     let terrain_mesh = terrain
         .source_mesh()
@@ -8190,7 +8295,7 @@ fn static_preview_mesh_and_materials(
     let mut component_mount_poses_by_object = Vec::with_capacity(roots.len());
     let mut dynamic_component_geometry_by_object = Vec::with_capacity(roots.len());
     let mut building_collision_bindings = Vec::new();
-    let mut collision_models =
+    let mut shared_models =
         HashMap::<fparkan_assets::AssetId<PreparedModel>, Arc<ModelAsset>>::new();
     let mut control_animation_instances_by_object = Vec::with_capacity(roots.len());
     let mut dynamic_shadow_casters = Vec::new();
@@ -8512,7 +8617,7 @@ fn static_preview_mesh_and_materials(
                 orientation_radians: mission_root.orientation_raw,
             };
             if legacy_camera.is_none() && root_native_kind == Some(3) && should_render {
-                let shared_model = collision_models
+                let shared_model = shared_models
                     .entry(model.id)
                     .or_insert_with(|| Arc::new(model.validated.clone()))
                     .clone();
@@ -8644,9 +8749,10 @@ fn static_preview_mesh_and_materials(
                 if root_native_kind.is_some() {
                     root_shadow_draw_range_indices.extend(range_start..mesh.draw_ranges.len());
                 }
-                if timeline_moves_component {
+                if live_roots || timeline_moves_component {
                     let parent_mount = tree
                         .as_ref()
+                        .filter(|_| mount_pose.is_some())
                         .and_then(|nodes| nodes.get(component_index))
                         .and_then(|node| node.parent_index)
                         .filter(|parent_index| {
@@ -8666,7 +8772,11 @@ fn static_preview_mesh_and_materials(
                             (parent_index, socket)
                         });
                     dynamic_component_geometry[component_index] = Some(DynamicComponentGeometry {
-                        model: model.validated.clone(),
+                        model: shared_models
+                            .entry(model.id)
+                            .or_insert_with(|| Arc::new(model.validated.clone()))
+                            .clone(),
+                        animated: timeline_moves_component,
                         root_transform: transform,
                         owner_scale: mission_root.scale,
                         parent_mount,
@@ -8697,7 +8807,11 @@ fn static_preview_mesh_and_materials(
                 root_shadow_triangles,
                 &root_shadow_spheres,
             ) {
-                if dynamic_component_geometry.iter().any(Option::is_some) {
+                let animated = dynamic_component_geometry
+                    .iter()
+                    .flatten()
+                    .any(|c| c.animated);
+                if live_roots || animated {
                     let component_draw_range_indices = root_shadow_draw_range_indices
                         .into_iter()
                         .filter(|range_index| {
@@ -8710,6 +8824,7 @@ fn static_preview_mesh_and_materials(
                         dynamic_shadow_casters.push(DynamicShadowCaster {
                             caster_index: shadow_casters.len(),
                             object_index,
+                            animated,
                             root_transform,
                             owner_scale: mission_root.scale,
                             initial_sphere: caster.sphere,
@@ -9572,11 +9687,30 @@ fn run_static_vulkan_mode(
     app.mission_engine = mission_engine;
     if let Some(engine) = &app.mission_engine {
         app.cockpit = starting_cockpit(engine);
+        app.mission_render_roots = loaded_mission_object_drafts(engine)
+            .unwrap_or_default()
+            .iter()
+            .map(|draft| {
+                let handle = mission_object_handle(engine, draft.original_id?)?;
+                let initial = LivePlacement {
+                    transform: LegacyIron3dEulerTransform {
+                        translation: draft.position,
+                        orientation_radians: draft.orientation_raw,
+                    },
+                    scale: draft.scale,
+                };
+                Some(MissionRenderRoot {
+                    handle,
+                    initial,
+                    rendered: initial,
+                })
+            })
+            .collect();
         if app.cockpit.is_some() {
             app.camera_mode = "starting-cockpit";
         }
         eprintln!(
-            "{SIMULATION_COVERAGE} live_render_state_stub=1 {}",
+            "{SIMULATION_COVERAGE} {}",
             mission_camera_coverage(app.cockpit),
         );
     }
@@ -9597,6 +9731,7 @@ fn mission_camera_coverage(cockpit: Option<StartingCockpit>) -> &'static str {
 struct StaticVulkanApp {
     mission_engine: Option<Engine>,
     mission_frame: Option<FrameResult>,
+    mission_render_roots: Vec<Option<MissionRenderRoot>>,
     cockpit: Option<StartingCockpit>,
     op1_jitter: Op1JitterState,
     fixed_water_clock_ms: Option<u32>,
@@ -9714,6 +9849,7 @@ impl StaticVulkanApp {
         Self {
             mission_engine: None,
             mission_frame: None,
+            mission_render_roots: Vec::new(),
             cockpit: None,
             mesh: preview.mesh,
             dynamic_vertex_start: preview.dynamic_vertex_start,
@@ -10294,12 +10430,26 @@ impl StaticVulkanApp {
             &mut self.component_pose_buffers,
             control_clock_ms,
         )?;
+        let placements = self
+            .mission_frame
+            .as_ref()
+            .map_or_else(HashMap::new, |frame| {
+                live_placements(&mut self.mission_render_roots, &frame.snapshot)
+            });
         update_dynamic_component_geometry(
             &self.dynamic_component_geometry,
             &self.component_pose_buffers,
             &mut self.component_mount_poses,
             &mut self.mesh,
+            &placements,
         )?;
+        for binding in &mut self.building_collision_bindings {
+            if let Some(sample) = placements.get(&binding.object_index) {
+                let pose = sample.pose;
+                binding.root_transform = pose.transform;
+                binding.owner_scale = pose.scale;
+            }
+        }
         self.update_mission_camera(clock.delta_seconds, viewport)?;
         refresh_dynamic_shadow_casters(
             &mut self.shadow_casters,
@@ -10307,8 +10457,14 @@ impl StaticVulkanApp {
             &self.mesh,
             &self.component_pose_buffers,
             &self.component_mount_poses,
+            &placements,
         )?;
         for slot in &mut self.ambient_effect_slots {
+            if let Some(sample) = placements.get(&slot.owner_object_index) {
+                let pose = sample.pose;
+                slot.root_transform = pose.transform;
+                slot.owner_scale = pose.scale;
+            }
             if slot.owner_component_is_mounted {
                 slot.mount_pose = self
                     .component_mount_poses
@@ -10316,6 +10472,17 @@ impl StaticVulkanApp {
                     .and_then(|components| components.get(slot.owner_component_index))
                     .copied()
                     .flatten();
+            }
+        }
+        for slot in self.control_point_light_slots.iter_mut().chain(
+            self.control_sound_slots
+                .iter_mut()
+                .map(|sound| &mut sound.effect),
+        ) {
+            if let Some(sample) = placements.get(&slot.owner_object_index) {
+                let pose = sample.pose;
+                slot.root_transform = pose.transform;
+                slot.owner_scale = pose.scale;
             }
         }
         let camera = self.view_camera;
@@ -12549,6 +12716,7 @@ mod tests {
             None,
             &args.root,
             &loaded.land_msh_path,
+            false,
         )
         .expect("build AutoDemo static preview");
         let mut component_bindings = preview
@@ -12750,6 +12918,7 @@ mod tests {
             &app.component_pose_buffers,
             &mut app.component_mount_poses,
             &mut app.mesh,
+            &HashMap::new(),
         )
         .expect("update the scene hierarchy for the authored door pose");
         let open_hierarchy = app.component_pose_buffers[4][0]
@@ -12960,6 +13129,7 @@ mod tests {
         shadow_casters[0].triangles = static_mesh_shadow_triangles_in_index_range(&mesh, 0, 6)
             .expect("initial caster triangle geometry");
         let dynamic_shadow_casters = [DynamicShadowCaster {
+            animated: true,
             caster_index: 0,
             object_index: 0,
             root_transform: identity_transform,
@@ -12996,7 +13166,8 @@ mod tests {
         let mut mounts = vec![vec![None, Some(initial_mount)]];
         let geometry = vec![vec![
             Some(DynamicComponentGeometry {
-                model: parent_model,
+                animated: true,
+                model: Arc::new(parent_model),
                 root_transform: identity_transform,
                 owner_scale: [1.0; 3],
                 parent_mount: None,
@@ -13004,7 +13175,8 @@ mod tests {
                 vertex_count: parent_vertex_count,
             }),
             Some(DynamicComponentGeometry {
-                model: child_model,
+                animated: true,
+                model: Arc::new(child_model),
                 root_transform: identity_transform,
                 owner_scale: [1.0; 3],
                 parent_mount: Some((0, 1)),
@@ -13017,8 +13189,14 @@ mod tests {
         update_control_animation_pose_buffers(&mut instances, &mut poses, 0)
             .expect("initial active timeline sample");
         let first_root_pose = poses[0][0].as_ref().expect("first root pose").poses[0];
-        update_dynamic_component_geometry(&geometry, &poses, &mut mounts, &mut mesh)
-            .expect("initial geometry update");
+        update_dynamic_component_geometry(
+            &geometry,
+            &poses,
+            &mut mounts,
+            &mut mesh,
+            &HashMap::new(),
+        )
+        .expect("initial geometry update");
         let range_remap = reorder_draw_ranges(&mut mesh, &[2, 0, 1]).expect("environment reorder");
         let mut dynamic_shadow_casters = dynamic_shadow_casters;
         remap_dynamic_shadow_caster_draw_ranges(&mut dynamic_shadow_casters, &range_remap)
@@ -13029,6 +13207,7 @@ mod tests {
             &mesh,
             &poses,
             &mounts,
+            &HashMap::new(),
         )
         .expect("initial caster geometry refresh");
         let encloses_triangles = |sphere: ShadowSphere, triangles: &[ShadowTriangle]| {
@@ -13077,14 +13256,21 @@ mod tests {
             .expect("later active timeline sample");
         let later_root_pose = poses[0][0].as_ref().expect("later root pose").poses[0];
         assert_ne!(first_root_pose, later_root_pose);
-        update_dynamic_component_geometry(&geometry, &poses, &mut mounts, &mut mesh)
-            .expect("later geometry update");
+        update_dynamic_component_geometry(
+            &geometry,
+            &poses,
+            &mut mounts,
+            &mut mesh,
+            &HashMap::new(),
+        )
+        .expect("later geometry update");
         refresh_dynamic_shadow_casters(
             &mut shadow_casters,
             &dynamic_shadow_casters,
             &mesh,
             &poses,
             &mounts,
+            &HashMap::new(),
         )
         .expect("later caster geometry refresh");
         let later_shadow_sphere = shadow_casters[0].sphere;
@@ -13121,14 +13307,21 @@ mod tests {
 
         update_control_animation_pose_buffers(&mut instances, &mut poses, 225)
             .expect("repeat the same timeline sample");
-        update_dynamic_component_geometry(&geometry, &poses, &mut mounts, &mut mesh)
-            .expect("repeat the same geometry update");
+        update_dynamic_component_geometry(
+            &geometry,
+            &poses,
+            &mut mounts,
+            &mut mesh,
+            &HashMap::new(),
+        )
+        .expect("repeat the same geometry update");
         refresh_dynamic_shadow_casters(
             &mut shadow_casters,
             &dynamic_shadow_casters,
             &mesh,
             &poses,
             &mounts,
+            &HashMap::new(),
         )
         .expect("repeat the same caster refresh");
         assert_eq!(shadow_casters[0].sphere, later_shadow_sphere);
@@ -13136,18 +13329,86 @@ mod tests {
 
         update_control_animation_pose_buffers(&mut instances, &mut poses, 0)
             .expect("return to the initial timeline sample");
-        update_dynamic_component_geometry(&geometry, &poses, &mut mounts, &mut mesh)
-            .expect("return to the initial geometry");
+        update_dynamic_component_geometry(
+            &geometry,
+            &poses,
+            &mut mounts,
+            &mut mesh,
+            &HashMap::new(),
+        )
+        .expect("return to the initial geometry");
         refresh_dynamic_shadow_casters(
             &mut shadow_casters,
             &dynamic_shadow_casters,
             &mesh,
             &poses,
             &mounts,
+            &HashMap::new(),
         )
         .expect("rebuild the initial caster after a later pose");
         assert_eq!(shadow_casters[0].sphere, first_shadow_sphere);
         assert_eq!(shadow_casters[0].triangles, first_shadow_triangles);
+
+        // A live world root moves both parts and their bound, independent of
+        // the unchanged local Control sample.
+        let offset = [25.0, 0.0, 0.0];
+        use fparkan_world::{construct_object, new, register_object, set_transform, step};
+        use fparkan_world::{InputSnapshot, ObjectDraft, TransformState, WorldConfig};
+        let mut world = new(WorldConfig);
+        let handle = construct_object(&mut world, ObjectDraft { original_id: None }).unwrap();
+        register_object(&mut world, handle).unwrap();
+        let initial = LivePlacement {
+            transform: identity_transform,
+            scale: [1.0; 3],
+        };
+        let mut roots = [Some(MissionRenderRoot {
+            handle,
+            initial,
+            rendered: initial,
+        })];
+        let mut state = TransformState {
+            position: offset.map(f32::to_bits),
+            orientation: [0; 3],
+            scale: [1.0_f32.to_bits(); 3],
+        };
+        set_transform(&mut world, handle, state).unwrap();
+        let snapshot = step(&mut world, &InputSnapshot).unwrap();
+        let placements = live_placements(&mut roots, &snapshot);
+        update_dynamic_component_geometry(&geometry, &poses, &mut mounts, &mut mesh, &placements)
+            .unwrap();
+        refresh_dynamic_shadow_casters(
+            &mut shadow_casters,
+            &dynamic_shadow_casters,
+            &mesh,
+            &poses,
+            &mounts,
+            &placements,
+        )
+        .unwrap();
+        assert_eq!(
+            mesh.vertices[0].position,
+            add3(first_parent_vertex.position, offset)
+        );
+        assert_eq!(
+            mesh.vertices[parent_vertex_count].position,
+            add3(first_child_vertex.position, offset)
+        );
+        assert_eq!(
+            shadow_casters[0].triangles[0].positions[0],
+            mesh.vertices[0].position
+        );
+        assert!(shadow_casters[0].sphere.center[0] > 20.0);
+        assert!(shadow_casters[0].sphere.radius < 10.0);
+        assert!(!live_placements(&mut roots, &snapshot)[&0].changed);
+        state.position = [0; 3];
+        set_transform(&mut world, handle, state).unwrap();
+        let restored = step(&mut world, &InputSnapshot).unwrap();
+        let placements = live_placements(&mut roots, &restored);
+        assert!(placements[&0].changed);
+        update_dynamic_component_geometry(&geometry, &poses, &mut mounts, &mut mesh, &placements)
+            .unwrap();
+        assert_eq!(mesh.vertices[parent_vertex_count], first_child_vertex);
+        assert!(live_placements(&mut roots, &restored).is_empty());
     }
 
     #[test]
@@ -13247,7 +13508,8 @@ mod tests {
             None,
             None,
             Some(DynamicComponentGeometry {
-                model: child_model,
+                animated: true,
+                model: Arc::new(child_model),
                 root_transform: identity_transform,
                 owner_scale: [1.0; 3],
                 parent_mount,
@@ -13258,16 +13520,28 @@ mod tests {
 
         update_control_animation_pose_buffers(&mut instances, &mut poses, 0)
             .expect("initial visible parent timeline sample");
-        update_dynamic_component_geometry(&geometry, &poses, &mut mounts, &mut mesh)
-            .expect("initial child mount refresh");
+        update_dynamic_component_geometry(
+            &geometry,
+            &poses,
+            &mut mounts,
+            &mut mesh,
+            &HashMap::new(),
+        )
+        .expect("initial child mount refresh");
         let initial_child_vertex = mesh.vertices[0].position;
         let initial_child_mount = mounts[0][2].expect("initial child mount");
         assert_eq!(initial_child_vertex, initial_child_mount.translation);
 
         update_control_animation_pose_buffers(&mut instances, &mut poses, 225)
             .expect("later visible parent timeline sample");
-        update_dynamic_component_geometry(&geometry, &poses, &mut mounts, &mut mesh)
-            .expect("child mount refresh without parent geometry descriptor");
+        update_dynamic_component_geometry(
+            &geometry,
+            &poses,
+            &mut mounts,
+            &mut mesh,
+            &HashMap::new(),
+        )
+        .expect("child mount refresh without parent geometry descriptor");
         let later_child_mount = mounts[0][2].expect("later child mount");
         assert_ne!(
             initial_child_mount.translation,
@@ -13538,6 +13812,7 @@ mod tests {
                 None,
                 &root,
                 &loaded.land_msh_path,
+                false,
             )
             .unwrap_or_else(|error| panic!("prepare renderer mission {mission}: {error}"));
             assert!(!preview.mesh.vertices.is_empty(), "{mission}: empty mesh");
@@ -13589,6 +13864,7 @@ mod tests {
             None,
             &root,
             path,
+            false,
         )
         .expect("terrain is a complete scene without object meshes");
         assert_eq!(preview.mesh_components, 0);

@@ -2259,7 +2259,7 @@ pub fn frame(engine: &mut Engine, queue_time_ms: u32) -> Result<FrameResult, Eng
 
 /// Coverage entries for the subsystems still absent from the mission loop.
 pub const SIMULATION_COVERAGE: &str =
-    "sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 unit_behavior_stub=1";
+    "sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 unit_behavior_stub=1 render_object_lifecycle_stub=1 render_winding_change_stub=1";
 
 /// Totals from a headless mission coverage run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2538,6 +2538,12 @@ pub fn loaded_mission_object_drafts(engine: &Engine) -> Option<&[MissionObjectDr
         .map(|state| state.object_drafts.as_slice())
 }
 
+/// Finds the live handle of an object placed by the mission.
+#[must_use]
+pub fn mission_object_handle(engine: &Engine, id: OriginalObjectId) -> Option<ObjectHandle> {
+    handle_by_original_id(&engine.world, id)
+}
+
 /// Camera point of the single unambiguous starting hero in a mission.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StartingCockpit {
@@ -2570,7 +2576,7 @@ pub fn starting_cockpit(engine: &Engine) -> Option<StartingCockpit> {
     if heroes.next().is_some() {
         return None;
     }
-    let handle = handle_by_original_id(&engine.world, hero.original_id?)?;
+    let handle = mission_object_handle(engine, hero.original_id?)?;
     let mut points = mission
         .mission_assets
         .object_component_controls

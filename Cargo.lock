@@ -522,6 +522,7 @@ dependencies = [
  "fparkan-terrain",
  "fparkan-terrain-format",
  "fparkan-vfs",
+ "fparkan-world",
  "rodio",
  "serde",
  "serde_json",
