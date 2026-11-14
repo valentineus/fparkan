@@ -422,12 +422,13 @@ impl LoadedMissionState {
                             .get(clan as usize)
                             .filter(|distributor| distributor.super_ai_visible)
                             .map_or(0, |_| {
-                                count_clan_objects(
+                                clan_object_classes(
                                     &mission_events.placed_clan_objects,
                                     world,
                                     OwnerId(clan as u16),
-                                    mask,
                                 )
+                                .filter(|class| class & mask != 0)
+                                .count() as u32
                             });
                         Ok(Some(count))
                     }
@@ -437,13 +438,21 @@ impl LoadedMissionState {
                         let inside = tactical_area_contains(&self.mission, world, area, id);
                         Ok(Some(u32::from(inside)))
                     }
+                    ScriptDispatchSelector::Handler(34) => {
+                        let class = single_dword(instruction, values)
+                            .ok_or("Handler(34) requires one DWORD operand")?;
+                        let count = clan_object_classes(
+                            &mission_events.placed_clan_objects,
+                            world,
+                            OwnerId(bundle.clan_index as u16),
+                        )
+                        .filter(|&candidate| candidate == class)
+                        .count() as u32;
+                        Ok(Some(count))
+                    }
                     ScriptDispatchSelector::Handler(52) => {
-                        let [id] = *instruction.references.as_slice() else {
-                            return Err("Handler(52) requires one DWORD operand".into());
-                        };
-                        let Some(&VarSetDefault::Dword(id)) = values.get(id as usize) else {
-                            return Err("Handler(52) requires one DWORD operand".into());
-                        };
+                        let id = single_dword(instruction, values)
+                            .ok_or("Handler(52) requires one DWORD operand")?;
                         let clan = placed_logic_objects(&self.mission, world, id)
                             .find_map(|handle| identity_metadata(world, handle).ok()?.owner_id);
                         Ok(Some(clan.map_or(u32::MAX, |owner| u32::from(owner.0))))
@@ -520,22 +529,25 @@ fn dword_pair(instruction: &ScriptInstruction, values: &[VarSetDefault]) -> Opti
     }
 }
 
-fn count_clan_objects(
-    objects: &[(ObjectHandle, u32)],
-    world: &World,
+fn single_dword(instruction: &ScriptInstruction, values: &[VarSetDefault]) -> Option<u32> {
+    let [index] = *instruction.references.as_slice() else {
+        return None;
+    };
+    match *values.get(index as usize)? {
+        VarSetDefault::Dword(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn clan_object_classes<'a>(
+    objects: &'a [(ObjectHandle, u32)],
+    world: &'a World,
     owner: OwnerId,
-    mask: u32,
-) -> u32 {
-    // All registered handles, including replacements, are checked against live ownership.
-    objects
-        .iter()
-        .filter(|&&(handle, class)| {
-            class & mask != 0
-                && registration_sequence(world, handle).is_ok_and(|seq| seq.is_some())
-                && identity_metadata(world, handle)
-                    .is_ok_and(|identity| identity.owner_id == Some(owner))
-        })
-        .count() as u32
+) -> impl Iterator<Item = u32> + 'a {
+    objects.iter().filter_map(move |&(handle, class)| {
+        registration_sequence(world, handle).ok()??;
+        (identity_metadata(world, handle).ok()?.owner_id == Some(owner)).then_some(class)
+    })
 }
 
 fn tactical_area_contains(
@@ -597,7 +609,7 @@ fn in_tactical_polygon(vertices: &[[f32; 3]], x: f32, y: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        count_clan_objects, in_tactical_polygon, MissionEvents, MissionNotice, MissionObjectives,
+        clan_object_classes, in_tactical_polygon, MissionEvents, MissionNotice, MissionObjectives,
     };
     use fparkan_world::{
         construct_object, new, register_object, request_delete, set_owner, ObjectDraft, OwnerId,
@@ -636,6 +648,11 @@ mod tests {
             set_owner(&mut world, handle, Some(player)).unwrap();
             (handle, class)
         });
+        let count_clan_objects = |objects: &[_], world: &_, owner, mask| {
+            clan_object_classes(objects, world, owner)
+                .filter(|class| class & mask != 0)
+                .count()
+        };
         assert_eq!(count_clan_objects(&objects, &world, player, 0x0100_8000), 2);
         assert_eq!(count_clan_objects(&objects, &world, player, 0x2100_0000), 3);
         assert_eq!(count_clan_objects(&objects, &world, player, 0x8000_0000), 1);
@@ -647,6 +664,32 @@ mod tests {
         );
         request_delete(&mut world, objects[0].0).unwrap();
         assert_eq!(count_clan_objects(&objects, &world, player, 0x0100_0000), 0);
+    }
+
+    #[test]
+    fn live_exact_class_count_uses_owner_and_full_class_word() {
+        let mut world = new(WorldConfig);
+        let player = OwnerId(0);
+        let other = OwnerId(1);
+        let mine = 0x8000_0004;
+        let objects =
+            [(mine, player), (0x8000_0008, player), (mine, other)].map(|(class, owner)| {
+                let handle =
+                    construct_object(&mut world, ObjectDraft { original_id: None }).unwrap();
+                set_owner(&mut world, handle, Some(owner)).unwrap();
+                register_object(&mut world, handle).unwrap();
+                (handle, class)
+            });
+        let count = |world: &_| {
+            clan_object_classes(&objects, world, player)
+                .filter(|&class| class == mine)
+                .count()
+        };
+        assert_eq!(count(&world), 1);
+        set_owner(&mut world, objects[2].0, Some(player)).unwrap();
+        assert_eq!(count(&world), 2);
+        request_delete(&mut world, objects[0].0).unwrap();
+        assert_eq!(count(&world), 1);
     }
 
     #[test]

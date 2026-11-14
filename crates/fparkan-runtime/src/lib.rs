@@ -17715,6 +17715,53 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
+    fn licensed_field_camp_script_counts_player_mines() {
+        let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(licensed_root("IS")));
+        let mut engine = create(EngineServices::new(vfs)).unwrap();
+        load_mission_with_init_stubs(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.03/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+        )
+        .unwrap();
+        let before = frame(&mut engine, 1).unwrap().mission_event.unwrap();
+        assert!(
+            before
+                .stop
+                .as_ref()
+                .is_none_or(|stop| stop.instruction_index > 91),
+            "{:?}",
+            before.stop
+        );
+        assert!(!before
+            .notices
+            .contains(&MissionNotice::ObjectiveComplete(2)));
+        // The tutorial starts before a mine has been deployed.
+        let mine = construct_object(&mut engine.world, ObjectDraft { original_id: None }).unwrap();
+        fparkan_world::set_owner(&mut engine.world, mine, Some(fparkan_world::OwnerId(0))).unwrap();
+        register_object(&mut engine.world, mine).unwrap();
+        engine
+            .loaded
+            .as_mut()
+            .unwrap()
+            .mission_events
+            .register_unit(&engine.world, mine, 0x8000_0004);
+        let after = frame(&mut engine, 2001).unwrap().mission_event.unwrap();
+        assert!(after.stop.is_none(), "{:?}", after.stop);
+        assert!(
+            after.notices.contains(&MissionNotice::ObjectiveComplete(2)),
+            "{after:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_constructor_captures_factory_and_hangar_at_communicators() {
         use fparkan_world::{identity_metadata, OwnerId};
 
