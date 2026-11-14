@@ -1,6 +1,7 @@
 use super::{
-    apply_recovered_script_host_callback, Engine, EngineError, LoadedMissionState,
-    MissionObjectDraft, MissionScriptHostEffect, StartingCockpit, LAST_SUPER_AI_TABLE_INDEX,
+    apply_recovered_script_host_callback, BehaviorDistributorState, Engine, EngineError,
+    LoadedMissionState, MissionObjectDraft, MissionScriptHostEffect, StartingCockpit,
+    LAST_SUPER_AI_TABLE_INDEX,
 };
 use fparkan_msh::{draw_batches, node38_sampled_hierarchy, selected_slot, Group, Lod, NodeId};
 use fparkan_render::LegacyIron3dEulerTransform;
@@ -142,6 +143,24 @@ pub(super) struct MissionEvents {
 }
 
 impl MissionEvents {
+    pub(super) fn count_clan_mask(
+        &self,
+        world: &World,
+        distributors: &[BehaviorDistributorState],
+        clan: u32,
+        mask: u32,
+    ) -> u32 {
+        if !distributors
+            .get(clan as usize)
+            .is_some_and(|entry| entry.super_ai_visible)
+        {
+            return 0;
+        }
+        clan_object_classes(&self.placed_clan_objects, world, OwnerId(clan as u16))
+            .filter(|class| class & mask != 0)
+            .count() as u32
+    }
+
     pub(super) fn register_unit(&mut self, world: &World, handle: ObjectHandle, class: u32) {
         self.placed_clan_objects
             .retain(|(handle, _)| registration_sequence(world, *handle).is_ok());
@@ -415,25 +434,20 @@ impl LoadedMissionState {
                 &mut state.values,
                 |instruction, values| match instruction.dispatch_selector() {
                     ScriptDispatchSelector::Handler(31) => {
-                        let (clan, mask) = dword_pair(instruction, values)
+                        let (clan, mask) = instruction
+                            .dword_pair(values)
                             .ok_or("Handler(31) requires two DWORD operands")?;
-                        let count = self
-                            .behavior_distributors
-                            .get(clan as usize)
-                            .filter(|distributor| distributor.super_ai_visible)
-                            .map_or(0, |_| {
-                                clan_object_classes(
-                                    &mission_events.placed_clan_objects,
-                                    world,
-                                    OwnerId(clan as u16),
-                                )
-                                .filter(|class| class & mask != 0)
-                                .count() as u32
-                            });
+                        let count = mission_events.count_clan_mask(
+                            world,
+                            &self.behavior_distributors,
+                            clan,
+                            mask,
+                        );
                         Ok(Some(count))
                     }
                     ScriptDispatchSelector::Handler(32) => {
-                        let (area, id) = dword_pair(instruction, values)
+                        let (area, id) = instruction
+                            .dword_pair(values)
                             .ok_or("Handler(32) requires two DWORD operands")?;
                         let inside = tactical_area_contains(&self.mission, world, area, id);
                         Ok(Some(u32::from(inside)))
@@ -516,16 +530,6 @@ impl LoadedMissionState {
                 reason,
             });
         Some(MissionEventTick { stop, notices })
-    }
-}
-
-fn dword_pair(instruction: &ScriptInstruction, values: &[VarSetDefault]) -> Option<(u32, u32)> {
-    let [first, second] = *instruction.references.as_slice() else {
-        return None;
-    };
-    match (values.get(first as usize)?, values.get(second as usize)?) {
-        (&VarSetDefault::Dword(first), &VarSetDefault::Dword(second)) => Some((first, second)),
-        _ => None,
     }
 }
 

@@ -2265,6 +2265,32 @@ fn load_mission_with_options(
         Vec::new()
     };
 
+    let mission_events = if options.asset_scope == MissionAssetScope::Full {
+        let config_path = mission_path.as_str().rsplit_once('/').map_or_else(
+            || "mission.cfg".to_owned(),
+            |(directory, _)| format!("{directory}/mission.cfg"),
+        );
+        let config_path = normalize_engine_path("mission config", &config_path)?;
+        let config = match vfs.read(&config_path) {
+            Ok(bytes) => bytes,
+            Err(VfsError::NotFound(_)) => Arc::from(&[][..]),
+            Err(source) => {
+                return Err(EngineError::Vfs {
+                    path: config_path.as_str().into(),
+                    source,
+                })
+            }
+        };
+        MissionEvents::with_placed_objects(
+            &mut new_runtime_world,
+            &object_drafts,
+            &handles,
+            mission.clans.len(),
+            &config,
+        )?
+    } else {
+        MissionEvents::default()
+    };
     let mut next_behavior_rng_state = engine.behavior_rng_state;
     if options.asset_scope == MissionAssetScope::Full {
         let queue_time_ms = startup_input
@@ -2279,6 +2305,14 @@ fn load_mission_with_options(
                 InitPolicy::KeepPrefix
             } else {
                 InitPolicy::Strict
+            },
+            |clan, mask| {
+                Some(mission_events.count_clan_mask(
+                    &new_runtime_world,
+                    &behavior_distributors,
+                    clan,
+                    mask,
+                ))
             },
         ) {
             let _ = fparkan_world::shutdown(new_runtime_world);
@@ -2334,32 +2368,6 @@ fn load_mission_with_options(
         script_varset_state_count: loaded_scripts.varset_states.len(),
     };
 
-    let mission_events = if options.asset_scope == MissionAssetScope::Full {
-        let config_path = mission_path.as_str().rsplit_once('/').map_or_else(
-            || "mission.cfg".to_owned(),
-            |(directory, _)| format!("{directory}/mission.cfg"),
-        );
-        let config_path = normalize_engine_path("mission config", &config_path)?;
-        let config = match vfs.read(&config_path) {
-            Ok(bytes) => bytes,
-            Err(VfsError::NotFound(_)) => Arc::from(&[][..]),
-            Err(source) => {
-                return Err(EngineError::Vfs {
-                    path: config_path.as_str().into(),
-                    source,
-                })
-            }
-        };
-        MissionEvents::with_placed_objects(
-            &mut new_runtime_world,
-            &object_drafts,
-            &handles,
-            summary.clan_count,
-            &config,
-        )?
-    } else {
-        MissionEvents::default()
-    };
     let unit_patrol = (request.mode == MissionMode::AutoDemo && options.start_autodemo)
         .then(|| {
             unit_patrol::UnitPatrol::new(
@@ -7745,6 +7753,7 @@ fn load_mission_scripts(
             &mut bundles,
             varset,
             InitPolicy::Preview,
+            |_, _| None,
         )?;
         let varset_states = materialize_script_varset_states(&bundles, varset, &init_states)?;
         (init_states, varset_states)
@@ -7766,6 +7775,7 @@ fn start_mission_scripts(
     queue_time_ms: u32,
     behavior_rng_state: &mut u32,
     init_policy: InitPolicy,
+    clan_count: impl Fn(u32, u32) -> Option<u32>,
 ) -> Result<(), EngineError> {
     // The recovered slot refreshes one Behavior instance before dispatching
     // that same instance's Init event. The Rust loader waits until its new
@@ -7788,6 +7798,7 @@ fn start_mission_scripts(
                 std::slice::from_mut(bundle),
                 varset,
                 init_policy,
+                &clan_count,
             )?);
         }
     }
@@ -7846,6 +7857,7 @@ fn resolve_init_states(
     bundles: &mut [MissionScriptBundle],
     varset: &MissionScriptVarSet,
     policy: InitPolicy,
+    clan_count: impl Fn(u32, u32) -> Option<u32>,
 ) -> Result<Vec<MissionScriptInitState>, EngineError> {
     let mut states = Vec::new();
     for bundle in bundles {
@@ -7874,7 +7886,12 @@ fn resolve_init_states(
         };
         let prefix = varset
             .declarations
-            .resolve_init_prefix(&bundle.package, input, bundle.formula_table.as_ref())
+            .resolve_init_prefix_with_clan_count(
+                &bundle.package,
+                input,
+                bundle.formula_table.as_ref(),
+                &clan_count,
+            )
             .map_err(|source| EngineError::ScriptInit {
                 clan_index: bundle.clan_index,
                 message: source.to_string(),
@@ -12324,6 +12341,7 @@ mod tests {
             100_000,
             &mut rng_state,
             InitPolicy::Strict,
+            |_, _| None,
         )
         .expect_err("unsupported first Init stops startup before the second bundle");
 
@@ -15656,6 +15674,7 @@ mod tests {
             &mut bundles,
             &varset,
             InitPolicy::Strict,
+            |_, _| None,
         )
         .expect("exact Init execution");
         assert_eq!(
@@ -15759,9 +15778,14 @@ mod tests {
         };
         let anchors = [[500.0, 752.0]];
         let mut preview_bundles = vec![bundle()];
-        let preview_states =
-            resolve_init_states(&anchors, &mut preview_bundles, &varset, InitPolicy::Preview)
-                .expect("static preview retains unsupported script");
+        let preview_states = resolve_init_states(
+            &anchors,
+            &mut preview_bundles,
+            &varset,
+            InitPolicy::Preview,
+            |_, _| None,
+        )
+        .expect("static preview retains unsupported script");
         assert!(preview_states.is_empty(), "no partial writes are retained");
         assert_eq!(
             preview_bundles[0].init_execution,
@@ -15809,6 +15833,7 @@ mod tests {
             &mut partial_bundles,
             &varset,
             InitPolicy::KeepPrefix,
+            |_, _| None,
         )
         .expect("partial Init keeps the prefix and continues with the next clan");
         assert_eq!(
@@ -15845,6 +15870,7 @@ mod tests {
                 &mut full_bundles,
                 &varset,
                 InitPolicy::Strict,
+            |_, _| None,
             ),
             Err(EngineError::ScriptInitUnsupported {
                 clan_index: 0,
@@ -15872,6 +15898,7 @@ mod tests {
                 &mut malformed_bundle,
                 &varset,
                 InitPolicy::Preview,
+            |_, _| None,
             ),
             Err(EngineError::ScriptInit { message, .. })
                 if message.contains("Handler(19) is missing reference 0")
@@ -17730,6 +17757,46 @@ mod tests {
             },
         )
         .unwrap();
+        let mission = engine.loaded.as_ref().unwrap();
+        let player_bundle = mission
+            .script_bundles
+            .iter()
+            .find(|bundle| bundle.clan_index == 0)
+            .unwrap();
+        assert!(matches!(
+            player_bundle.init_execution,
+            MissionScriptInitExecution::Executed { .. }
+        ));
+        let player_clan = mission
+            .script_varset_states
+            .iter()
+            .find(|clan| clan.clan_index == 0)
+            .unwrap();
+        let declarations = &mission
+            .script_varset
+            .as_ref()
+            .unwrap()
+            .declarations
+            .declarations;
+        let cell = |name: &str| {
+            let index = declarations
+                .iter()
+                .position(|declaration| declaration.name == name)
+                .unwrap();
+            player_clan.values[index]
+        };
+        let initial_count = mission
+            .object_drafts
+            .iter()
+            .filter(|draft| {
+                draft.raw_after_resource == 0
+                    && draft
+                        .unit_dat_header_flags
+                        .is_some_and(|class| class & 0x0100_0000 != 0)
+            })
+            .count() as u32;
+        assert_eq!(cell("df5"), VarSetDefault::Dword(initial_count + 4));
+        assert_eq!(cell("df6"), VarSetDefault::Dword(initial_count + 1));
         let before = frame(&mut engine, 1).unwrap().mission_event.unwrap();
         assert!(
             before
@@ -17741,7 +17808,8 @@ mod tests {
         );
         assert!(!before
             .notices
-            .contains(&MissionNotice::ObjectiveComplete(2)));
+            .iter()
+            .any(|notice| matches!(notice, MissionNotice::ObjectiveComplete(2 | 3))));
         // The tutorial starts before a mine has been deployed.
         let mine = construct_object(&mut engine.world, ObjectDraft { original_id: None }).unwrap();
         fparkan_world::set_owner(&mut engine.world, mine, Some(fparkan_world::OwnerId(0))).unwrap();
@@ -17758,6 +17826,29 @@ mod tests {
             after.notices.contains(&MissionNotice::ObjectiveComplete(2)),
             "{after:?}"
         );
+        assert!(!after.notices.contains(&MissionNotice::ObjectiveComplete(3)));
+        for built in 1..=4 {
+            let robot =
+                construct_object(&mut engine.world, ObjectDraft { original_id: None }).unwrap();
+            fparkan_world::set_owner(&mut engine.world, robot, Some(fparkan_world::OwnerId(0)))
+                .unwrap();
+            register_object(&mut engine.world, robot).unwrap();
+            engine
+                .loaded
+                .as_mut()
+                .unwrap()
+                .mission_events
+                .register_unit(&engine.world, robot, boarding::WARBOT_CLASS);
+            let tick = frame(&mut engine, 2001 + 2000 * built)
+                .unwrap()
+                .mission_event
+                .unwrap();
+            assert_eq!(
+                tick.notices.contains(&MissionNotice::ObjectiveComplete(3)),
+                built == 4,
+                "{tick:?}"
+            );
+        }
     }
 
     #[test]

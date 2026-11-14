@@ -200,13 +200,15 @@ pub struct ScriptInitPrefix {
 /// A typed failure or unsupported form in the recovered `Init` subset.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ScriptInitResolveError {
-    /// The selector is outside the recovered `Handler(19)` and formula assignment paths.
+    /// The selector is outside the recovered `Init` paths available to this caller.
     UnsupportedSelector {
         /// Observed selector.
         found: ScriptDispatchSelector,
     },
     /// A `Handler(19)` reference or declaration did not match its recovered contract.
     Handler19(Handler19ResolveError),
+    /// The clan-count query has unsupported operands, control, or result type.
+    UnsupportedClanCount,
     /// A formula record has an unsupported control word.
     UnsupportedFormulaControlWord {
         /// Raw disk word at index 3.
@@ -256,6 +258,10 @@ impl std::fmt::Display for ScriptInitResolveError {
                 write!(formatter, "unsupported script selector {found:?} in Init")
             }
             Self::Handler19(source) => write!(formatter, "Handler(19): {source}"),
+            Self::UnsupportedClanCount => write!(
+                formatter,
+                "Handler(31) requires an unconditional query with DWORD operands and result"
+            ),
             Self::UnsupportedFormulaControlWord { found } => write!(
                 formatter,
                 "unsupported formula control word 0x{found:08x}; expected 0x6 or 0xffffffff"
@@ -789,6 +795,22 @@ impl VarSet {
         input: Handler19InitInput,
         formulas: Option<&FormulaTable>,
     ) -> Result<Option<ScriptInitPrefix>, ScriptInitResolveError> {
+        self.resolve_init_prefix_with_clan_count(package, input, formulas, |_, _| None)
+    }
+
+    /// Resolves the supported prefix with access to a clan roster supplied by the host.
+    /// The query returns `None` when the roster is unavailable.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [Self::resolve_init_prefix].
+    pub fn resolve_init_prefix_with_clan_count(
+        &self,
+        package: &ScriptPackage,
+        input: Handler19InitInput,
+        formulas: Option<&FormulaTable>,
+        clan_count: impl Fn(u32, u32) -> Option<u32>,
+    ) -> Result<Option<ScriptInitPrefix>, ScriptInitResolveError> {
         let Some((event_index, event)) = package.events.iter().enumerate().find(|(_, event)| {
             event.name_raw.split(|byte| *byte == 0).next() == Some(&b"Init"[..])
         }) else {
@@ -807,7 +829,13 @@ impl VarSet {
             stopped_at: None,
         };
         for (instruction_index, instruction) in event.instructions.iter().enumerate() {
-            match self.resolve_init_instruction(instruction, input, formulas, &values)? {
+            match self.resolve_init_instruction(
+                instruction,
+                input,
+                formulas,
+                &values,
+                &clan_count,
+            )? {
                 InitInstructionResolution::Executed(instruction_writes) => {
                     for write in &instruction_writes {
                         let Some(value) = values.get_mut(write.index as usize) else {
@@ -830,12 +858,44 @@ impl VarSet {
         Ok(Some(prefix))
     }
 
+    fn resolve_init_clan_count(
+        instruction: &ScriptInstruction,
+        values: &[VarSetDefault],
+        clan_count: impl Fn(u32, u32) -> Option<u32>,
+    ) -> InitInstructionResolution {
+        let Some((clan, mask)) = instruction.dword_pair(values) else {
+            return InitInstructionResolution::Unsupported(
+                ScriptInitResolveError::UnsupportedClanCount,
+            );
+        };
+        let index = instruction.header_words[1];
+        if instruction.header_words[3] != u32::MAX
+            || !matches!(values.get(index as usize), Some(VarSetDefault::Dword(_)))
+        {
+            return InitInstructionResolution::Unsupported(
+                ScriptInitResolveError::UnsupportedClanCount,
+            );
+        }
+        let Some(count) = clan_count(clan, mask) else {
+            return InitInstructionResolution::Unsupported(
+                ScriptInitResolveError::UnsupportedSelector {
+                    found: ScriptDispatchSelector::Handler(31),
+                },
+            );
+        };
+        InitInstructionResolution::Executed(vec![ScriptInitWrite {
+            index,
+            value: VarSetDefault::Dword(count),
+        }])
+    }
+
     fn resolve_init_instruction(
         &self,
         instruction: &ScriptInstruction,
         input: Handler19InitInput,
         formulas: Option<&FormulaTable>,
         values: &[VarSetDefault],
+        clan_count: impl Fn(u32, u32) -> Option<u32>,
     ) -> Result<InitInstructionResolution, ScriptInitResolveError> {
         match instruction.dispatch_selector() {
             ScriptDispatchSelector::Handler(19) => {
@@ -879,6 +939,11 @@ impl VarSet {
             ScriptDispatchSelector::Sentinel => {
                 self.resolve_assignment(instruction, formulas, values)
             }
+            ScriptDispatchSelector::Handler(31) => Ok(Self::resolve_init_clan_count(
+                instruction,
+                values,
+                clan_count,
+            )),
             found => Ok(InitInstructionResolution::Unsupported(
                 ScriptInitResolveError::UnsupportedSelector { found },
             )),
@@ -1536,10 +1601,18 @@ fn native_decimal_prefix_len(token: &[u8]) -> Option<usize> {
 }
 
 fn parse_init_formula_expression(
-    expression: &[u8],
+    mut expression: &[u8],
     declarations: &[VarSetDeclaration],
     values: &[VarSetDefault],
 ) -> Option<f32> {
+    let start = skip_native_formula_space(expression, 0);
+    if expression.get(start) == Some(&b'(') {
+        let close = expression.iter().rposition(|byte| *byte > 32)?;
+        if expression[close] != b')' {
+            return None;
+        }
+        expression = &expression[start + 1..close];
+    }
     let (left, left_end) = parse_init_formula_atom(expression, 0, declarations, values)?;
     let operator_index = skip_native_formula_space(expression, left_end);
     let Some(&operator @ (b'+' | b'-')) = expression.get(operator_index) else {
@@ -1635,14 +1708,7 @@ fn varset_value_as_f32(type_name: VarSetType, value: VarSetDefault) -> Option<f3
 }
 
 fn mission_condition(instruction: &ScriptInstruction, values: &[VarSetDefault]) -> Option<bool> {
-    let [lhs, rhs] = *instruction.references.as_slice() else {
-        return None;
-    };
-    let (&VarSetDefault::Dword(lhs), &VarSetDefault::Dword(rhs)) =
-        (values.get(lhs as usize)?, values.get(rhs as usize)?)
-    else {
-        return None;
-    };
+    let (lhs, rhs) = instruction.dword_pair(values)?;
     match instruction.header_words[4] {
         0 => Some(lhs < rhs),
         1 => Some(lhs == rhs),
@@ -1982,6 +2048,17 @@ fn parse_varset_dword(value: &str, line: usize) -> Result<u32, VarSetError> {
 }
 
 impl ScriptInstruction {
+    /// Reads the two DWORD operands of a binary query or comparison.
+    #[must_use]
+    pub fn dword_pair(&self, values: &[VarSetDefault]) -> Option<(u32, u32)> {
+        let [first, second] = *self.references.as_slice() else {
+            return None;
+        };
+        match (values.get(first as usize)?, values.get(second as usize)?) {
+            (&VarSetDefault::Dword(first), &VarSetDefault::Dword(second)) => Some((first, second)),
+            _ => None,
+        }
+    }
     /// Returns the recovered dispatch selector from the first disk word.
     #[must_use]
     pub fn dispatch_selector(&self) -> ScriptDispatchSelector {
@@ -3292,6 +3369,41 @@ STRING( 8, ignored, ignored, ignored)\r\n";
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn init_clan_count_feeds_parenthesized_formula() {
+        let varset =
+            parse_varset(b"VAR(DWORD, clan, 2)\nVAR(DWORD, mask, 8)\nVAR(DWORD, count, 0)\n")
+                .unwrap();
+        let formulas = FormulaTable::parse(b"FUNCTION( , ( count + 4 ), )\n");
+        let package = init_package(vec![
+            ScriptInstruction {
+                header_words: [31, 2, u32::MAX, u32::MAX, 6, 2, u32::MAX],
+                references: vec![0, 1],
+            },
+            init_formula_assignment(2, 0),
+        ]);
+        let prefix = varset
+            .resolve_init_prefix_with_clan_count(
+                &package,
+                init_input(),
+                Some(&formulas),
+                |clan, mask| {
+                    assert_eq!((clan, mask), (2, 8));
+                    Some(3)
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(prefix.stopped_at, None);
+        assert_eq!(
+            prefix.writes,
+            [3, 7].map(|value| ScriptInitWrite {
+                index: 2,
+                value: VarSetDefault::Dword(value)
+            })
+        );
     }
 
     #[test]
