@@ -11465,7 +11465,10 @@ impl StaticVulkanApp {
                 self.factory_status = Some("Завод — сборка прервана".into());
                 eprintln!("sim_coverage factory_spawn_failed=1 reason={error}");
             }
-            if frame.produced_unit.is_some() {
+            if frame
+                .produced_unit
+                .is_some_and(|unit| fparkan_runtime::is_player_clan(engine, unit.clan))
+            {
                 self.factory_status = Some("Завод — робот готов".into());
             }
             if let Some(component) = &frame.researched_component {

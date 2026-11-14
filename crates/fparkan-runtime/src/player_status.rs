@@ -1,6 +1,16 @@
 use crate::{Engine, MissionControlNodeProviderTableStatus};
 use fparkan_world::{handle_by_original_id, identity_metadata, ObjectHandle};
 
+/// Reports whether this clan is controlled by the player.
+#[must_use]
+pub fn is_player_clan(engine: &Engine, clan: u16) -> bool {
+    engine
+        .loaded
+        .as_ref()
+        .and_then(|mission| mission.mission.clans.get(usize::from(clan)))
+        .is_some_and(|clan| clan.mode == 1)
+}
+
 /// Current values for the player's controlled unit and clan.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PlayerStatus {

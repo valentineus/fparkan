@@ -76,7 +76,7 @@ pub use mission_events::{
 pub use player_motion::{
     plan_player_motion, plan_player_motion_with_collision, PlayerMotion, PlayerMotionStep,
 };
-pub use player_status::{player_status, PlayerStatus};
+pub use player_status::{is_player_clan, player_status, PlayerStatus};
 pub use player_weapon::{prepared_warbot_weapons, starting_player_weapons, PlayerWeapons};
 pub use production::{
     clan_factory_schemes, factory_schemes, order_clan_factory_scheme, order_factory_robot,

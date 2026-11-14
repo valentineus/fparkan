@@ -16,6 +16,7 @@ use fparkan_prototype::{unit_component_tree, UnitComponentRecord};
 use fparkan_world::{
     handle_by_original_id, identity_metadata, transform_state, ObjectHandle, OwnerId,
 };
+use std::collections::VecDeque;
 
 // shortcut: GPU geometry is prepared for a bounded number of live builds.
 // Lift the cap when the renderer can instantiate new roots during a mission.
@@ -68,7 +69,7 @@ pub(super) struct Production {
     schemes: Vec<NormalizedPath>,
     controls: Vec<MissionControlDeviceTableState>,
     plants: Vec<(usize, u32)>,
-    pending: Option<Order>,
+    pending: VecDeque<Order>,
     rng: u32,
 }
 
@@ -177,7 +178,7 @@ impl Production {
             schemes,
             controls,
             plants,
-            pending: None,
+            pending: VecDeque::new(),
             rng: 1,
         })
     }
@@ -188,9 +189,29 @@ impl Production {
         mission: &mut LoadedMissionState,
         now_ms: u32,
     ) -> Result<Option<SpawnedUnit>, EngineError> {
-        let Some(mut order) = self.pending.take() else {
-            return Ok(None);
-        };
+        for _ in 0..self.pending.len() {
+            let Some(mut order) = self.pending.pop_front() else {
+                break;
+            };
+            if let Some(unit) = self.advance_order(world, mission, now_ms, &mut order)? {
+                return Ok(Some(unit));
+            }
+            if identity_metadata(world, order.plant)
+                .is_ok_and(|identity| identity.owner_id == Some(order.owner))
+            {
+                self.pending.push_back(order);
+            }
+        }
+        Ok(None)
+    }
+
+    fn advance_order(
+        &mut self,
+        world: &mut World,
+        mission: &mut LoadedMissionState,
+        now_ms: u32,
+        order: &mut Order,
+    ) -> Result<Option<SpawnedUnit>, EngineError> {
         if !identity_metadata(world, order.plant)
             .is_ok_and(|identity| identity.owner_id == Some(order.owner))
         {
@@ -221,7 +242,6 @@ impl Production {
             ready &= paid.ready();
         }
         if !ready {
-            self.pending = Some(order);
             return Ok(None);
         }
         let pose = transform_state(world, order.plant)?;
@@ -362,7 +382,7 @@ fn order_owned_factory(
                 "selected factory no longer belongs to the ordering clan".into(),
             )
         })?;
-    if production.pending.is_some() {
+    if production.pending.iter().any(|order| order.plant == plant) {
         return Err(EngineError::Production(
             "factory order already in progress".into(),
         ));
@@ -375,6 +395,7 @@ fn order_owned_factory(
         mission.object_drafts[index]
             .original_id
             .is_some_and(|id| handle_by_original_id(&engine.world, id).is_none())
+            && !production.pending.iter().any(|order| order.slot == index)
     };
     let live = (production.reserve_start..production.reserve_start + production.controls.len())
         .filter(|&index| !free_slot(index))
@@ -440,7 +461,7 @@ fn order_owned_factory(
             }),
         )
     };
-    production.pending = Some(Order {
+    let order = Order {
         slot,
         plant,
         plant_index,
@@ -448,7 +469,8 @@ fn order_owned_factory(
         start_ms: now_ms,
         duration_ms,
         paid,
-    });
+    };
+    production.pending.push_back(order);
     Ok(duration_ms)
 }
 
@@ -708,6 +730,24 @@ mod tests {
             "{report:?}"
         );
         assert!(!report.first_factory_completion_ms.contains_key(&0));
+        let cockpit = super::super::starting_cockpit(&engine).unwrap();
+        let factory = handle_by_original_id(&engine.world, OriginalObjectId(5)).unwrap();
+        let duration = order_clan_factory_scheme(&mut engine, cockpit, factory, 0, 40_000).unwrap();
+        assert!(duration > 0);
+        let production = engine.production.as_ref().unwrap();
+        assert_eq!(production.pending.len(), 2);
+        assert_ne!(production.pending[0].slot, production.pending[1].slot);
+        let mut completed = Vec::new();
+        for time in (40_016..=40_000 + duration + 2000).step_by(16) {
+            if let Some(unit) = step_headless(&mut engine, InputSnapshot::default(), time)
+                .unwrap()
+                .produced_unit
+            {
+                completed.push(unit.clan);
+            }
+        }
+        assert!(completed.contains(&0), "{completed:?}");
+        assert!(completed.contains(&1), "{completed:?}");
     }
 
     #[test]
@@ -746,13 +786,7 @@ mod tests {
             order_factory_robot(&mut engine, cockpit, 100).unwrap(),
             PAID_MINIMUM_MS
         );
-        let order = engine
-            .production
-            .as_ref()
-            .unwrap()
-            .pending
-            .as_ref()
-            .unwrap();
+        let order = engine.production.as_ref().unwrap().pending.front().unwrap();
         let cost = &order.paid.as_ref().unwrap().cost;
         assert!((cost.ore - 25.12).abs() < 0.001);
         assert!((cost.power - 72.7).abs() < 0.001);
