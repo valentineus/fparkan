@@ -11109,7 +11109,7 @@ impl StaticVulkanApp {
             ) {
                 match order_factory_robot(engine, cockpit, control_clock_ms) {
                     Ok(duration) => eprintln!(
-                        "factory_order duration_ms={duration} queue_time_ms={control_clock_ms}"
+                        "factory_order minimum_ms={duration} queue_time_ms={control_clock_ms}"
                     ),
                     Err(error) => eprintln!("factory_order_rejected {error}"),
                 }
