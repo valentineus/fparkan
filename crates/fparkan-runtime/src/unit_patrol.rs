@@ -28,6 +28,17 @@ pub(super) struct PreparedPatrol {
 }
 
 impl UnitPatrol {
+    pub(super) fn activate(&mut self, world: &World, handle: ObjectHandle) {
+        self.units
+            .retain(|unit| transform_state(world, unit.handle).is_ok());
+        self.units.push(PatrollingUnit {
+            handle,
+            points: VecDeque::new(),
+            retry_ms: 0,
+            attack: None,
+        });
+    }
+
     pub(super) fn new(
         mission: &MissionDocument,
         drafts: &[MissionObjectDraft],

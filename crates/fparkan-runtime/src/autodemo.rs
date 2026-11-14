@@ -1,12 +1,16 @@
 use super::{
-    component_cockpit, mission_object_handle, normalize_engine_path, read_vfs, Engine, MissionMode,
-    StartingCockpit, WorldSnapshot,
+    component_cockpit, mission_object_handle, normalize_engine_path, read_vfs, Engine, EngineError,
+    MissionControlDeviceTableState, MissionMode, StartingCockpit, World, WorldSnapshot,
 };
 use fparkan_path::{normalize_relative, NormalizedPath, PathPolicy};
 use fparkan_prototype::decode_unit_dat;
 use fparkan_render::{LegacyIron3dEulerTransform, RawCameraTransform};
 use fparkan_terrain::{SurfaceQuery, TerrainWorld};
 use fparkan_vfs::{Vfs, VfsError};
+use fparkan_world::{
+    construct_replacement, handle_by_original_id, identity_metadata, register_object, set_owner,
+    set_transform, transform_state, ObjectDraft, ObjectHandle, OwnerId, TransformState,
+};
 use std::sync::Arc;
 
 const PITCH: f32 = 1.25;
@@ -26,24 +30,194 @@ pub(super) fn read_config(
     read_vfs(vfs, &normalize_engine_path("AutoDemo config", &cfg)?)
 }
 
-pub(super) fn startup_reinforcements(
+pub(super) struct Reinforcements {
+    pub(super) minimum: usize,
+    pub(super) deck: Vec<NormalizedPath>,
+    pub(super) initial: Vec<(NormalizedPath, usize)>,
+    pub(super) reserve_per_scheme: usize,
+}
+
+pub(super) struct LiveReinforcements {
+    minimum: usize,
+    reserve_start: usize,
+    reserve_per_scheme: usize,
+    next_scheme: usize,
+    scheme_count: usize,
+    rng: u32,
+    controls: Vec<MissionControlDeviceTableState>,
+}
+
+/// A reserve model activated with a newly registered world object.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AutoDemoReinforcement {
+    /// Prepared scene object index.
+    pub object_index: usize,
+    /// New world handle.
+    pub handle: ObjectHandle,
+    /// Clan receiving the replacement.
+    pub clan: u16,
+}
+
+impl LiveReinforcements {
+    pub(super) fn new(
+        plan: Reinforcements,
+        reserve_start: usize,
+        rng: u32,
+        controls: Vec<MissionControlDeviceTableState>,
+    ) -> Self {
+        Self {
+            minimum: plan.minimum,
+            reserve_start,
+            reserve_per_scheme: plan.reserve_per_scheme,
+            next_scheme: plan.initial.len() % plan.deck.len(),
+            scheme_count: plan.deck.len(),
+            rng,
+            controls,
+        }
+    }
+
+    pub(super) fn update(
+        &mut self,
+        world: &mut World,
+        mission: &mut super::LoadedMissionState,
+    ) -> (Vec<AutoDemoReinforcement>, usize) {
+        let mut events = Vec::new();
+        let mut failures = 0;
+        let live = mission
+            .object_drafts
+            .iter()
+            .enumerate()
+            .filter_map(|(index, draft)| {
+                let class = draft.unit_dat_header_flags?;
+                let handle = handle_by_original_id(world, draft.original_id?)?;
+                let owner = identity_metadata(world, handle).ok()?.owner_id?;
+                Some((index, class, handle, owner))
+            })
+            .collect::<Vec<_>>();
+        for clan in 0..mission.mission.clans.len() {
+            let Ok(clan) = u16::try_from(clan) else { break };
+            let members = live
+                .iter()
+                .filter(|(_, _, _, owner)| *owner == OwnerId(clan));
+            let count = members
+                .clone()
+                .filter(|(_, class, _, _)| class & MOBILE_UNIT != 0)
+                .count();
+            if count >= self.minimum {
+                continue;
+            }
+            let Some(&(plant_index, _, plant, _)) =
+                members.rev().find(|(_, class, _, _)| *class == PLANT_CLASS)
+            else {
+                continue;
+            };
+            let start = self.reserve_start + self.next_scheme * self.reserve_per_scheme;
+            let slot = (start..start + self.reserve_per_scheme).find(|&index| {
+                let draft = &mission.object_drafts[index];
+                draft
+                    .unit_dat_header_flags
+                    .is_some_and(|class| class & MOBILE_UNIT != 0)
+                    && draft
+                        .original_id
+                        .is_some_and(|id| handle_by_original_id(world, id).is_none())
+            });
+            if let Some(index) = slot {
+                match self.spawn(world, mission, plant_index, plant, index, clan) {
+                    Ok(handle) => events.push(AutoDemoReinforcement {
+                        object_index: index,
+                        handle,
+                        clan,
+                    }),
+                    Err(_) => failures += 1,
+                }
+            } else {
+                failures += 1;
+            }
+            self.next_scheme = (self.next_scheme + 1) % self.scheme_count;
+        }
+        (events, failures)
+    }
+
+    fn spawn(
+        &mut self,
+        world: &mut World,
+        mission: &mut super::LoadedMissionState,
+        plant_index: usize,
+        plant: ObjectHandle,
+        index: usize,
+        clan: u16,
+    ) -> Result<ObjectHandle, EngineError> {
+        let plant_pose = transform_state(world, plant)?;
+        let position = reinforcement_position(
+            plant_pose.position.map(f32::from_bits),
+            plant_pose.orientation.map(f32::from_bits),
+            plant_pose.scale.map(f32::from_bits),
+            plant_index,
+            &mission.mission_assets,
+            &mission.terrain,
+            &mut self.rng,
+        )?;
+        let draft = &mission.object_drafts[index];
+        let handle = construct_replacement(
+            world,
+            ObjectDraft {
+                original_id: draft.original_id,
+            },
+        )?;
+        let pose = TransformState {
+            position: position.map(f32::to_bits),
+            orientation: draft.orientation_raw.map(f32::to_bits),
+            scale: draft.scale.map(f32::to_bits),
+        };
+        if let Err(error) = set_transform(world, handle, pose)
+            .and_then(|()| set_owner(world, handle, Some(OwnerId(clan))))
+            .and_then(|()| register_object(world, handle))
+        {
+            fparkan_world::request_delete(world, handle)?;
+            return Err(error.into());
+        }
+        mission
+            .control_device_tables
+            .retain(|table| transform_state(world, table.handle).is_ok());
+        mission
+            .behavior_control_groupings
+            .retain(|group| transform_state(world, group.handle).is_ok());
+        let mut table = self.controls[index - self.reserve_start].clone();
+        table.handle = handle;
+        mission
+            .behavior_control_groupings
+            .push(super::project_mission_behavior_control_grouping(&table));
+        mission.control_device_tables.push(table);
+        mission.mission_events.register_unit(
+            world,
+            handle,
+            draft.unit_dat_header_flags.expect("mobile reserve"),
+        );
+        if let Some(patrol) = &mut mission.unit_patrol {
+            patrol.activate(world, handle);
+        }
+        Ok(handle)
+    }
+}
+
+pub(super) fn plan_reinforcements(
     vfs: &Arc<dyn Vfs>,
     mission: &super::MissionDocument,
     mission_path: &str,
-) -> Result<Vec<(NormalizedPath, usize)>, super::EngineError> {
+) -> Result<Option<Reinforcements>, super::EngineError> {
     let config = match read_config(vfs, mission_path) {
         Ok(config) => config,
         Err(super::EngineError::Vfs {
             source: VfsError::NotFound(_),
             ..
-        }) => return Ok(Vec::new()),
+        }) => return Ok(None),
         Err(error) => return Err(error),
     };
     let Some(minimum) = read_setting(&config, "MinBotsNum") else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     if minimum == 0 {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let classes = mission
         .objects
@@ -77,7 +251,7 @@ pub(super) fn startup_reinforcements(
     let prefix = normalize_engine_path("AutoDemo robot catalog", "units/units/autodemo")?;
     let deck = match vfs.list(&prefix) {
         Ok(deck) => deck,
-        Err(VfsError::NotFound(_)) => return Ok(Vec::new()),
+        Err(VfsError::NotFound(_)) => return Ok(None),
         Err(source) => {
             return Err(super::EngineError::Vfs {
                 path: prefix.as_str().into(),
@@ -101,11 +275,11 @@ pub(super) fn startup_reinforcements(
         .collect();
     deck.sort_by_cached_key(|path| path.lookup_key().0);
     if deck.is_empty() {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let mut resources = deck.iter().cycle();
-    let mut reinforcements = Vec::new();
-    // shortcut: run only the first replenishment pass until the scene supports spawning after load.
+    let mut initial = Vec::new();
+    let mut plant_clans = 0;
     for (clan, _) in mission.clans.iter().enumerate() {
         let clan = clan as u32;
         let mut members = mission
@@ -118,21 +292,30 @@ pub(super) fn startup_reinforcements(
             .clone()
             .filter(|(_, (_, class))| class.is_some_and(|class| class & MOBILE_UNIT != 0))
             .count();
-        if robots >= minimum as usize {
-            continue;
-        }
         if let Some((plant_index, _)) =
             members.rfind(|(_, (_, class))| **class == Some(PLANT_CLASS))
         {
-            let resource = resources.next().expect("non-empty repeating catalog");
-            reinforcements.push((resource.clone(), plant_index));
+            plant_clans += 1;
+            if robots < minimum as usize {
+                let resource = resources.next().expect("non-empty repeating catalog");
+                initial.push((resource.clone(), plant_index));
+            }
         }
     }
-    Ok(reinforcements)
+    // shortcut: reserve bounded concurrent model copies until the renderer can add draw slots.
+    let reserve_per_scheme = plant_clans.min(2);
+    Ok((reserve_per_scheme != 0).then_some(Reinforcements {
+        minimum: minimum as usize,
+        deck,
+        initial,
+        reserve_per_scheme,
+    }))
 }
 
 pub(super) fn reinforcement_position(
-    plant: &super::MissionObjectDraft,
+    position: [f32; 3],
+    orientation_radians: [f32; 3],
+    scale: [f32; 3],
     plant_index: usize,
     assets: &super::MissionAssets,
     terrain: &TerrainWorld,
@@ -146,14 +329,14 @@ pub(super) fn reinforcement_position(
         .map(|model| &model.validated)
         .ok_or_else(|| super::EngineError::Movement("missing AutoDemo plant bounds".into()))?;
     let place = LegacyIron3dEulerTransform {
-        translation: plant.position,
-        orientation_radians: plant.orientation_raw,
+        translation: position,
+        orientation_radians,
     };
     let [x, y, _] = place
-        .try_transform_scaled_point(bounds.bounding_sphere_center, plant.scale)
+        .try_transform_scaled_point(bounds.bounding_sphere_center, scale)
         .ok_or_else(|| super::EngineError::Movement("invalid AutoDemo plant center".into()))?;
     // shortcut: the root MSH sphere supplies the plant bounds until the assembled collider is available.
-    let scale = plant.scale.into_iter().map(f32::abs).fold(0.0, f32::max);
+    let scale = scale.into_iter().map(f32::abs).fold(0.0, f32::max);
     let radius = bounds.bounding_sphere_radius * scale;
     // shortcut: isolated CRT state until AutoDemo shares the host's complete RNG call order.
     let angle = (super::next_crt_rand(rng) % 360) as f32;
@@ -284,6 +467,19 @@ fn read_setting(bytes: &[u8], key: &str) -> Option<u32> {
 }
 
 impl AutoDemoCamera {
+    /// Replaces the camera target for a reused model slot, or adds a new target.
+    pub fn register_target(&mut self, cockpit: StartingCockpit) {
+        if let Some(target) = self
+            .targets
+            .iter_mut()
+            .find(|target| target.object_index == cockpit.object_index)
+        {
+            *target = cockpit;
+        } else {
+            self.targets.push(cockpit);
+        }
+    }
+
     /// Advances at most one interval per sampled frame. Returns an exterior
     /// pose while waiting for a usable cockpit target.
     ///

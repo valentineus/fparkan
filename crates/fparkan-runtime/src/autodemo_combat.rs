@@ -50,6 +50,7 @@ pub enum AutoDemoCombatEvent {
 
 pub(super) struct AutoDemoCombat {
     units: Vec<Unit>,
+    reserve: Vec<Unit>,
     hostile: Vec<Vec<bool>>,
     projectiles: Vec<AutoDemoProjectileType>,
     flights: Vec<Flight>,
@@ -63,6 +64,7 @@ pub(super) struct CombatTarget {
     pub(super) in_range: bool,
 }
 
+#[derive(Clone)]
 struct Unit {
     handle: ObjectHandle,
     index: usize,
@@ -83,6 +85,7 @@ impl AutoDemoCombat {
         drafts: &[MissionObjectDraft],
         handles: &[ObjectHandle],
         assets: &MissionAssets,
+        reserve_start: usize,
     ) -> Self {
         let hostile = mission
             .clans
@@ -102,6 +105,7 @@ impl AutoDemoCombat {
             .collect();
         let mut battle = Self {
             units: Vec::new(),
+            reserve: Vec::new(),
             hostile,
             projectiles: Vec::new(),
             flights: Vec::new(),
@@ -156,7 +160,12 @@ impl AutoDemoCombat {
                 })
                 .collect();
             battle.unavailable += usize::from(weapons.weapons().is_empty());
-            battle.units.push(Unit {
+            let units = if index < reserve_start {
+                &mut battle.units
+            } else {
+                &mut battle.reserve
+            };
+            units.push(Unit {
                 handle,
                 index,
                 weapons,
@@ -164,6 +173,22 @@ impl AutoDemoCombat {
             });
         }
         battle
+    }
+
+    pub(super) fn activate(
+        &mut self,
+        world: &fparkan_world::World,
+        index: usize,
+        handle: ObjectHandle,
+    ) {
+        self.units
+            .retain(|unit| transform_state(world, unit.handle).is_ok());
+        if let Some(template) = self.reserve.iter().find(|unit| unit.index == index) {
+            self.units.push(Unit {
+                handle,
+                ..template.clone()
+            });
+        }
     }
 
     pub(super) fn types(&self) -> &[AutoDemoProjectileType] {

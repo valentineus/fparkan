@@ -50,7 +50,7 @@ mod player_weapon;
 mod projectile;
 mod unit_patrol;
 
-pub use autodemo::{autodemo_camera, AutoDemoCamera, AutoDemoView};
+pub use autodemo::{autodemo_camera, AutoDemoCamera, AutoDemoReinforcement, AutoDemoView};
 pub use autodemo_combat::{AutoDemoCombatEvent, AutoDemoProjectileType};
 pub use fparkan_assets::MissionAssets;
 pub use mesh_collision::{query_building_segment_world, BuildingMeshHit, BuildingMeshNode};
@@ -1284,6 +1284,10 @@ pub struct FrameResult {
     pub autodemo_combat_events: Vec<AutoDemoCombatEvent>,
     /// Autonomous impact or flight operations that could not execute.
     pub autodemo_combat_unavailable: usize,
+    /// Newly registered replacements and their prepared scene model.
+    pub autodemo_reinforcements: Vec<AutoDemoReinforcement>,
+    /// Failed replacement attempts.
+    pub autodemo_reinforcement_unavailable: usize,
 }
 
 /// Engine.
@@ -1293,6 +1297,7 @@ pub struct Engine {
     loaded: Option<LoadedMissionState>,
     behavior_rng_state: u32,
     autodemo_combat: Option<autodemo_combat::AutoDemoCombat>,
+    autodemo_reinforcements: Option<autodemo::LiveReinforcements>,
 }
 
 struct LoadedMissionState {
@@ -1664,6 +1669,7 @@ pub fn create(services: EngineServices) -> Result<Engine, EngineError> {
         loaded: None,
         behavior_rng_state: INITIAL_BEHAVIOR_RNG_STATE,
         autodemo_combat: None,
+        autodemo_reinforcements: None,
     })
 }
 
@@ -1843,17 +1849,26 @@ fn load_mission_with_options(
         .iter()
         .map(|object| resource_name(&object.resource_name.raw))
         .collect();
-    let startup_reinforcements = if request.mode == MissionMode::AutoDemo && options.start_autodemo
-    {
-        autodemo::startup_reinforcements(&vfs, &mission, mission_path.as_str())?
+    let reinforcements = if request.mode == MissionMode::AutoDemo && options.start_autodemo {
+        autodemo::plan_reinforcements(&vfs, &mission, mission_path.as_str())?
     } else {
-        Vec::new()
+        None
     };
+    let startup_reinforcements = reinforcements
+        .as_ref()
+        .map_or(&[][..], |plan| plan.initial.as_slice());
     graph_roots.extend(
         startup_reinforcements
             .iter()
             .map(|(resource, _)| resource_name(resource.as_bytes())),
     );
+    let reserve_start = graph_roots.len();
+    if let Some(plan) = &reinforcements {
+        graph_roots.extend(plan.deck.iter().flat_map(|resource| {
+            std::iter::repeat_with(|| resource_name(resource.as_bytes()))
+                .take(plan.reserve_per_scheme)
+        }));
+    }
     let scoped_graph_roots = match options.asset_scope {
         MissionAssetScope::Full => graph_roots.as_slice(),
         MissionAssetScope::FirstMeshPreview => graph_roots.get(..1).unwrap_or_default(),
@@ -1932,21 +1947,36 @@ fn load_mission_with_options(
         })
         .collect();
     let mut spawn_rng = 1_u32;
-    for (offset, (resource, plant_index)) in startup_reinforcements.iter().enumerate() {
+    let reserve_roots = graph_roots[reserve_start..]
+        .iter()
+        .map(|resource| (resource.0.as_slice(), None));
+    let spawned_roots = startup_reinforcements
+        .iter()
+        .map(|(resource, plant)| (resource.as_bytes(), Some(*plant)));
+    for (offset, (resource, plant_index)) in spawned_roots.chain(reserve_roots).enumerate() {
         let index = mission.objects.len() + offset;
-        let plant = &object_drafts[*plant_index];
-        let position = autodemo::reinforcement_position(
-            plant,
-            *plant_index,
-            &mission_assets,
-            &terrain,
-            &mut spawn_rng,
-        )?;
+        let (position, clan) = if let Some(plant_index) = plant_index {
+            let plant = &object_drafts[plant_index];
+            (
+                autodemo::reinforcement_position(
+                    plant.position,
+                    plant.orientation_raw,
+                    plant.scale,
+                    plant_index,
+                    &mission_assets,
+                    &terrain,
+                    &mut spawn_rng,
+                )?,
+                plant.raw_after_resource,
+            )
+        } else {
+            ([0.0; 3], u32::MAX)
+        };
         object_drafts.push(MissionObjectDraft {
             original_id: Some(OriginalObjectId(index as u32)),
-            resource_name_raw: resource.as_bytes().to_vec(),
-            raw_after_resource: plant.raw_after_resource,
-            identity_or_clan_raw: plant.raw_after_resource,
+            resource_name_raw: resource.to_vec(),
+            raw_after_resource: clan,
+            identity_or_clan_raw: clan,
             raw_after_name: 0,
             unit_dat_header_flags: prototype_graph.root_unit_dat_header_flags[index],
             position,
@@ -1997,7 +2027,7 @@ fn load_mission_with_options(
         })
         .collect();
     let mut registered_objects = 0;
-    for handle in &handles {
+    for handle in &handles[..reserve_start] {
         if options.fail_after_registered_objects == Some(registered_objects) {
             let report = fparkan_world::shutdown(new_runtime_world);
             return Err(EngineError::RegistrationTeardown {
@@ -2084,7 +2114,7 @@ fn load_mission_with_options(
     };
 
     let mut first_factory2_asset_error = None;
-    let control_device_tables = if options.asset_scope == MissionAssetScope::Full {
+    let mut control_device_tables = if options.asset_scope == MissionAssetScope::Full {
         let mut factory2_pair_cache = HashMap::new();
         object_drafts
             .iter()
@@ -2180,7 +2210,7 @@ fn load_mission_with_options(
             source,
         });
     }
-    let behavior_control_groupings = if options.asset_scope == MissionAssetScope::Full {
+    let mut behavior_control_groupings = if options.asset_scope == MissionAssetScope::Full {
         control_device_tables
             .iter()
             .map(project_mission_behavior_control_grouping)
@@ -2221,7 +2251,7 @@ fn load_mission_with_options(
         build_category_count: build_categories.len(),
         areal_count: terrain.areal_count(),
         surface_count: terrain.surface_count(),
-        registered_objects: handles.len(),
+        registered_objects,
         graph_unit_reference_count: prototype_report.unit_reference_count,
         graph_direct_reference_count: prototype_report.direct_reference_count,
         graph_unit_component_count: prototype_report.unit_component_count,
@@ -2285,7 +2315,13 @@ fn load_mission_with_options(
         MissionEvents::default()
     };
     let unit_patrol = (request.mode == MissionMode::AutoDemo && options.start_autodemo)
-        .then(|| unit_patrol::UnitPatrol::new(&mission, &object_drafts, &handles))
+        .then(|| {
+            unit_patrol::UnitPatrol::new(
+                &mission,
+                &object_drafts[..reserve_start],
+                &handles[..reserve_start],
+            )
+        })
         .flatten();
     let autodemo_combat = unit_patrol.as_ref().map(|_| {
         autodemo_combat::AutoDemoCombat::new(
@@ -2294,11 +2330,21 @@ fn load_mission_with_options(
             &object_drafts,
             &handles,
             &mission_assets,
+            reserve_start,
         )
+    });
+    for &handle in &handles[reserve_start..] {
+        fparkan_world::request_delete(&mut new_runtime_world, handle)?;
+    }
+    let autodemo_reinforcements = reinforcements.map(|plan| {
+        let controls = control_device_tables.split_off(reserve_start);
+        behavior_control_groupings.truncate(reserve_start);
+        autodemo::LiveReinforcements::new(plan, reserve_start, spawn_rng, controls)
     });
     engine.world = new_runtime_world;
     engine.behavior_rng_state = next_behavior_rng_state;
     engine.autodemo_combat = autodemo_combat;
+    engine.autodemo_reinforcements = autodemo_reinforcements;
     engine.loaded = Some(LoadedMissionState {
         summary: summary.clone(),
         mission,
@@ -2399,17 +2445,30 @@ pub fn step_headless(
         if let Some(mut combat) = engine.autodemo_combat.take() {
             let result = combat.tick(engine, queue_time_ms);
             engine.autodemo_combat = Some(combat);
-            if result
-                .0
-                .iter()
-                .any(|event| matches!(event, AutoDemoCombatEvent::Destroyed { .. }))
-            {
-                snapshot = fparkan_world::world_snapshot(&engine.world, snapshot.events);
-            }
             result
         } else {
             (Vec::new(), 0)
         };
+    let (autodemo_reinforcements, autodemo_reinforcement_unavailable) =
+        if let (Some(reinforcements), Some(mission)) =
+            (&mut engine.autodemo_reinforcements, &mut engine.loaded)
+        {
+            reinforcements.update(&mut engine.world, mission)
+        } else {
+            (Vec::new(), 0)
+        };
+    if let Some(combat) = &mut engine.autodemo_combat {
+        for event in &autodemo_reinforcements {
+            combat.activate(&engine.world, event.object_index, event.handle);
+        }
+    }
+    if !autodemo_reinforcements.is_empty()
+        || autodemo_combat_events
+            .iter()
+            .any(|event| matches!(event, AutoDemoCombatEvent::Destroyed { .. }))
+    {
+        snapshot = fparkan_world::world_snapshot(&engine.world, snapshot.events);
+    }
     let mission_event = engine
         .loaded
         .as_mut()
@@ -2419,6 +2478,8 @@ pub fn step_headless(
         mission_event,
         autodemo_combat_events,
         autodemo_combat_unavailable,
+        autodemo_reinforcements,
+        autodemo_reinforcement_unavailable,
         player_pitch_bits: engine
             .loaded
             .as_ref()
@@ -2494,6 +2555,12 @@ pub struct SimulationReport {
     pub autodemo_first_destroyed_ms: Option<u32>,
     /// Count of autonomous combat operations that could not execute.
     pub autodemo_combat_unavailable: usize,
+    /// Clock of the first replacement after initial load.
+    pub autodemo_first_reinforcement_ms: Option<u32>,
+    /// Number of replacements registered during the run.
+    pub autodemo_reinforcement_count: usize,
+    /// Failed replacement attempts.
+    pub autodemo_reinforcement_unavailable: usize,
 }
 
 /// Steps a freshly loaded mission from queue time zero at 60 Hz for coverage.
@@ -2517,6 +2584,9 @@ pub fn simulate_mission_report(
         autodemo_first_shot_ms: None,
         autodemo_first_destroyed_ms: None,
         autodemo_combat_unavailable: 0,
+        autodemo_first_reinforcement_ms: None,
+        autodemo_reinforcement_count: 0,
+        autodemo_reinforcement_unavailable: 0,
     };
     let steps = (u64::from(duration_ms) * 60).div_ceil(1000);
     for tick in 1..=steps {
@@ -2526,6 +2596,13 @@ pub fn simulate_mission_report(
         report.live_objects = frame.snapshot.objects.len();
         report.world_events += frame.snapshot.events.len() as u64;
         report.autodemo_combat_unavailable += frame.autodemo_combat_unavailable;
+        report.autodemo_reinforcement_unavailable += frame.autodemo_reinforcement_unavailable;
+        if !frame.autodemo_reinforcements.is_empty() {
+            report
+                .autodemo_first_reinforcement_ms
+                .get_or_insert(clock_ms);
+            report.autodemo_reinforcement_count += frame.autodemo_reinforcements.len();
+        }
         for event in frame.autodemo_combat_events {
             match event {
                 AutoDemoCombatEvent::Shot { .. } => {
@@ -2885,6 +2962,19 @@ fn component_cockpit(
         node_index: usize::try_from(point.raw_signed_field_04).ok()?,
         node_point: point.position,
     })
+}
+
+/// Resolves the camera point for a newly registered AutoDemo reinforcement.
+#[must_use]
+pub fn autodemo_reinforcement_cockpit(
+    engine: &Engine,
+    reinforcement: AutoDemoReinforcement,
+) -> Option<StartingCockpit> {
+    component_cockpit(
+        engine.loaded.as_ref()?,
+        reinforcement.object_index,
+        reinforcement.handle,
+    )
 }
 
 /// Returns the clan-indexed Behavior distributors and their registered objects.
@@ -16105,7 +16195,7 @@ mod tests {
         assert_eq!(loaded.object_count, 8);
         assert_eq!(loaded.registered_objects, 10);
         let roots = loaded_mission_object_drafts(&engine).unwrap();
-        let extras = &roots[loaded.object_count..];
+        let extras = &roots[loaded.object_count..loaded.registered_objects];
         let mut newcomers = Vec::new();
         for (clan, (root, resource)) in extras
             .iter()
@@ -16152,9 +16242,12 @@ mod tests {
         );
         let mut first_shot = None;
         let mut first_destroyed = None;
+        let mut replacements = Vec::new();
         for tick in 301..=3_600 {
             let now = tick * 1_000 / 60;
             let result = frame(&mut engine, now).unwrap();
+            assert_eq!(result.snapshot.objects.len(), 10);
+            assert_eq!(result.autodemo_reinforcement_unavailable, 0);
             for event in result.autodemo_combat_events {
                 match event {
                     AutoDemoCombatEvent::Shot {
@@ -16177,10 +16270,31 @@ mod tests {
                     }
                 }
             }
+            for replacement in result.autodemo_reinforcements {
+                assert!(result.snapshot.objects.contains(&replacement.handle));
+                assert_eq!(
+                    fparkan_world::identity_metadata(&engine.world, replacement.handle)
+                        .unwrap()
+                        .owner_id,
+                    Some(fparkan_world::OwnerId(replacement.clan))
+                );
+                assert!(loaded_mission_control_device_tables(&engine)
+                    .unwrap()
+                    .iter()
+                    .any(|table| table.handle == replacement.handle));
+                replacements.push(replacement);
+            }
         }
         let first_shot = first_shot.expect("AutoDemo units should fire");
         let first_destroyed = first_destroyed.expect("Autonomous projectiles should remove a unit");
         assert!(first_shot < first_destroyed);
+        assert!(replacements.len() >= 2);
+        let first = replacements[0];
+        assert!(
+            loaded_mission_object_drafts(&engine).unwrap()[first.object_index]
+                .resource_name_raw
+                .ends_with(b"w_b_trk1.dat")
+        );
     }
 
     #[test]

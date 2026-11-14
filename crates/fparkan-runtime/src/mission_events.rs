@@ -140,6 +140,12 @@ pub(super) struct MissionEvents {
 }
 
 impl MissionEvents {
+    pub(super) fn register_unit(&mut self, world: &World, handle: ObjectHandle, class: u32) {
+        self.placed_clan_objects
+            .retain(|(handle, _)| registration_sequence(world, *handle).is_ok());
+        self.placed_clan_objects.push((handle, class));
+    }
+
     pub(super) fn with_placed_objects(
         world: &mut World,
         drafts: &[MissionObjectDraft],
@@ -382,7 +388,7 @@ fn count_clan_objects(
     owner: OwnerId,
     mask: u32,
 ) -> u32 {
-    // shortcut: count placed units until production registers new objects here.
+    // All registered handles, including replacements, are checked against live ownership.
     objects
         .iter()
         .filter(|&&(handle, class)| {

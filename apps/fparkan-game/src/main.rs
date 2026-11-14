@@ -163,11 +163,15 @@ fn run(args: &[String]) -> Result<String, String> {
         if args.mission_mode() == MissionMode::AutoDemo {
             let roots = loaded_mission_object_drafts(&engine).unwrap_or_default();
             eprintln!(
-                "sim_coverage autodemo_spawn_position_approx={} autodemo_replenishment_stub=1 autodemo_patrol_approx=1 autodemo_combat_approx=1 autodemo_weapon_unavailable={}",
-                roots.len().saturating_sub(loaded.object_count),
+                "sim_coverage autodemo_spawn_position_approx={} autodemo_replenishment_pool_approx=1 autodemo_patrol_approx=1 autodemo_combat_approx=1 autodemo_weapon_unavailable={}",
+                loaded.registered_objects.saturating_sub(loaded.object_count),
                 fparkan_runtime::autodemo_combat_unavailable(&engine),
             );
-            for root in roots.iter().skip(loaded.object_count) {
+            for root in roots
+                .iter()
+                .take(loaded.registered_objects)
+                .skip(loaded.object_count)
+            {
                 eprintln!(
                     "autodemo_reinforcement clan={} resource={} position={:?}",
                     root.raw_after_resource,
@@ -214,8 +218,9 @@ fn run(args: &[String]) -> Result<String, String> {
         }
         if args.mission_mode() == MissionMode::AutoDemo {
             eprintln!(
-                "autodemo_combat first_shot_ms={:?} first_destroyed_ms={:?}\nsim_coverage autodemo_combat_unavailable={}",
-                report.autodemo_first_shot_ms, report.autodemo_first_destroyed_ms, report.autodemo_combat_unavailable,
+                "autodemo_combat first_shot_ms={:?} first_destroyed_ms={:?}\nautodemo_reinforcements first_ms={:?} count={}\nsim_coverage autodemo_combat_unavailable={} autodemo_reinforcement_unavailable={}",
+                report.autodemo_first_shot_ms, report.autodemo_first_destroyed_ms, report.autodemo_first_reinforcement_ms,
+                report.autodemo_reinforcement_count, report.autodemo_combat_unavailable, report.autodemo_reinforcement_unavailable,
             );
         }
         return Ok(format!(
@@ -9875,8 +9880,15 @@ fn run_static_vulkan_mode(
         app.mission_render_roots = loaded_mission_object_drafts(engine)
             .unwrap_or_default()
             .iter()
-            .map(|draft| {
-                let handle = mission_object_handle(engine, draft.original_id?)?;
+            .enumerate()
+            .map(|(index, draft)| {
+                let handle = draft
+                    .original_id
+                    .and_then(|id| mission_object_handle(engine, id));
+                let Some(handle) = handle else {
+                    app.removed_mission_roots.insert(index);
+                    return None;
+                };
                 let initial = LivePlacement {
                     transform: LegacyIron3dEulerTransform {
                         translation: draft.position,
@@ -11010,6 +11022,45 @@ impl StaticVulkanApp {
                 None => step_mission_frame(engine, control_clock_ms),
             }
             .map_err(|err| format!("step mission at {control_clock_ms} ms: {err}"))?;
+            let roots = loaded_mission_object_drafts(engine).unwrap_or_default();
+            for &reinforcement in &frame.autodemo_reinforcements {
+                let index = reinforcement.object_index;
+                let draft = &roots[index];
+                let initial = LivePlacement {
+                    transform: LegacyIron3dEulerTransform {
+                        translation: draft.position,
+                        orientation_radians: draft.orientation_raw,
+                    },
+                    scale: draft.scale,
+                };
+                let rendered = self.mission_render_roots[index]
+                    .as_ref()
+                    .map_or(initial, |root| root.rendered);
+                self.mission_render_roots[index] = Some(MissionRenderRoot {
+                    handle: reinforcement.handle,
+                    initial,
+                    rendered,
+                });
+                self.removed_mission_roots.remove(&index);
+                if reinforcement.clan == 0 {
+                    if let (Some(camera), Some(cockpit)) = (
+                        &mut self.demo_camera,
+                        fparkan_runtime::autodemo_reinforcement_cockpit(engine, reinforcement),
+                    ) {
+                        camera.register_target(cockpit);
+                    }
+                }
+                eprintln!(
+                    "autodemo_reinforcement clan={} resource={} object={index} queue_time_ms={control_clock_ms}",
+                    reinforcement.clan, String::from_utf8_lossy(&draft.resource_name_raw),
+                );
+            }
+            if frame.autodemo_reinforcement_unavailable != 0 {
+                eprintln!(
+                    "sim_coverage autodemo_reinforcement_unavailable={}",
+                    frame.autodemo_reinforcement_unavailable
+                );
+            }
             if let Some(stop) = frame
                 .mission_event
                 .as_ref()

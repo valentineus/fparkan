@@ -251,6 +251,40 @@ pub fn construct_object(world: &mut World, draft: ObjectDraft) -> Result<ObjectH
     Ok(handle)
 }
 
+/// Creates a replacement in a vacant slot, or allocates a slot when none is reusable.
+///
+/// # Errors
+/// Returns the same allocation error as [`construct_object`].
+pub fn construct_replacement(
+    world: &mut World,
+    draft: ObjectDraft,
+) -> Result<ObjectHandle, WorldError> {
+    let Some((index, slot)) = world
+        .slots
+        .iter_mut()
+        .enumerate()
+        .find(|(_, slot)| !slot.live && slot.generation < u32::MAX)
+    else {
+        return construct_object(world, draft);
+    };
+    let slot_index = u32::try_from(index).map_err(|_| WorldError::InvalidHandle)?;
+    let generation = slot.generation;
+    *slot = Slot {
+        generation,
+        live: true,
+        registered: false,
+        original_id: draft.original_id,
+        owner_id: None,
+        mirror_id: None,
+        registration_sequence: None,
+        transform: TransformState::default(),
+    };
+    Ok(ObjectHandle {
+        generation,
+        slot: slot_index,
+    })
+}
+
 /// Registers a constructed object.
 ///
 /// # Errors
@@ -837,6 +871,21 @@ mod tests {
             register_object(&mut world, recycled),
             Err(WorldError::StaleHandle)
         );
+        let replacement = construct_replacement(
+            &mut world,
+            ObjectDraft {
+                original_id: Some(OriginalObjectId(7)),
+            },
+        )
+        .expect("replacement");
+        assert_eq!(replacement.slot, first.slot);
+        assert_ne!(replacement.generation, first.generation);
+        register_object(&mut world, replacement).expect("register replacement");
+        assert_eq!(
+            handle_by_original_id(&world, OriginalObjectId(7)),
+            Some(replacement)
+        );
+        assert_eq!(transform_state(&world, first), Err(WorldError::StaleHandle));
 
         let duplicate = construct_object(
             &mut world,

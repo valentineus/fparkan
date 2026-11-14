@@ -4,7 +4,7 @@ use fparkan_assets::{
 };
 
 /// The starting hero's selectable weapon devices, in resource order.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct PlayerWeapons {
     weapons: Vec<PlayerWeapon>,
     selected: Option<usize>,
@@ -13,6 +13,7 @@ pub struct PlayerWeapons {
 }
 
 /// A manual-fire device prepared from its CTLD record and effect rows.
+#[derive(Clone)]
 pub struct PlayerWeapon {
     /// Name of the projectile prototype.
     pub projectile: String,
@@ -30,13 +31,14 @@ pub struct PlayerWeapon {
     phase_end_ms: f64,
 }
 
+#[derive(Clone)]
 struct Barrel {
     muzzle: PreparedControlPoint,
     rate: f64,
     blend: f64,
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 enum FirePhase {
     Idle,
     Shot,
