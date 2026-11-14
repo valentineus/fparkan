@@ -7,6 +7,7 @@ mod camera_capture;
 mod control_effects;
 use control_effects::{advance_control_effect_instances, owner_control_capacity};
 mod mission_hints;
+mod player_collision;
 mod script_coverage;
 mod terrain_lod;
 
@@ -10885,45 +10886,6 @@ impl StaticVulkanApp {
         Ok(self.building_segment_hit(world_segment, false)?.is_some())
     }
 
-    fn resolve_player_building_step(
-        &self,
-        mut step: fparkan_runtime::PlayerMotionStep,
-    ) -> Result<(fparkan_runtime::PlayerMotionStep, bool), String> {
-        if let Some(probe) = step.floor_probe() {
-            let mesh_floor = self
-                .building_segment_hit(probe, true)?
-                .map(|point| point[2]);
-            let mut floor = mesh_floor;
-            if let Some((height, previous_floor)) = step.terrain_exit_floor() {
-                if floor.is_none_or(|mesh| mesh < height)
-                    && self.building_segment_hit(previous_floor, true)?.is_some()
-                    && !self.building_segment_blocked([
-                        [probe[0][0], probe[0][1], height + 0.02],
-                        probe[0],
-                    ])?
-                {
-                    floor = Some(height);
-                }
-            }
-            if let Some(height) = floor {
-                step = step.with_building_floor(height);
-                if let Some(segments) = step.floor_sweeps() {
-                    for segment in segments.into_iter().filter(|[from, to]| from != to) {
-                        if self.building_segment_blocked(segment)? {
-                            return Ok((step, true));
-                        }
-                    }
-                }
-                return Ok((step, false));
-            }
-        }
-        let blocked = match step.sweep {
-            Some(segment) => self.building_segment_blocked(segment)?,
-            None => false,
-        };
-        Ok((step, blocked))
-    }
-
     fn building_segment_hit(
         &self,
         world_segment: [[f32; 3]; 2],
@@ -16090,7 +16052,7 @@ mod tests {
         assert_eq!(control_clock_mode_label(None), "realtime");
     }
 
-    fn clock_test_app(
+    pub(super) fn clock_test_app(
         control_clock_target_ms: Option<u32>,
     ) -> (StaticVulkanApp, ControlEffectInstanceKey) {
         let phase = |additive_red| MaterialPhase {

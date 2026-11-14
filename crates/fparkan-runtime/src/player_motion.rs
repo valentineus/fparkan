@@ -37,6 +37,7 @@ pub(super) fn warbot_can_fly(engine: &crate::Engine, object_index: usize) -> boo
 // shortcut: bound stair steps and drops until the native hero collider is wired.
 const STEP_UP: f32 = 0.85;
 const STEP_DOWN: f32 = 2.0;
+const FLOOR_CLEARANCE: f32 = 0.02;
 // shortcut: sample the temporary floor probe at most 0.16 units apart until native collision is wired.
 const WALK_COLLISION_INTERVAL: f32 = 0.02;
 
@@ -61,6 +62,8 @@ pub struct PlayerMotionStep {
     pub(super) pose: TransformState,
     pub(super) pitch_bits: u32,
     flying: bool,
+    max_floor_clearance: f32,
+    previous_terrain_height: Option<f32>,
     terrain_height: Option<f32>,
     /// Sweep segment when the step translates the hero.
     pub sweep: Option<[[f32; 3]; 2]>,
@@ -78,24 +81,44 @@ impl PlayerMotionStep {
         Some([[x, y, feet_z + STEP_UP], [x, y, feet_z - STEP_DOWN]])
     }
 
-    /// Terrain can take over at the end of a floor within the same step limits.
+    /// Looks below the previous position for the surface carrying the player.
     #[must_use]
-    pub fn terrain_exit_floor(self) -> Option<(f32, [[f32; 3]; 2])> {
-        let [top, bottom] = self.floor_probe()?;
-        let [start, end] = self.sweep?;
-        let height = self.terrain_height?;
-        let [x, y, body_z] = start;
-        ((bottom[2]..=top[2]).contains(&height) && (end[2] - (height + 0.52)).abs() > 0.05)
-            .then_some((height, [[x, y, body_z - 0.45], [x, y, body_z - 0.60]]))
+    pub fn previous_floor_probe(self) -> Option<[[f32; 3]; 2]> {
+        self.floor_probe()?;
+        let [[x, y, body_z], _] = self.sweep?;
+        let feet_z = body_z - 0.5;
+        Some([[x, y, feet_z + 0.05], [x, y, feet_z - STEP_DOWN]])
     }
 
-    /// Places the player's feet just above a floor accepted by the scene query.
+    /// Terrain can take over at the end of a floor within the same step limits.
     #[must_use]
-    pub fn with_building_floor(mut self, height: f32) -> Self {
-        if let Some(sweep) = &mut self.sweep {
-            self.pose.position[2] = (height + 0.02).to_bits();
-            sweep[1][2] = height + 0.52;
-        }
+    pub fn terrain_exit_floor(self) -> Option<f32> {
+        let [top, bottom] = self.floor_probe()?;
+        let [_, end] = self.sweep?;
+        let height = self.terrain_height?;
+        ((bottom[2]..=top[2]).contains(&height)
+            && (end[2] - (height + FLOOR_CLEARANCE + 0.5)).abs() > 0.05)
+            .then_some(height)
+    }
+
+    /// Replaces the terrain prediction with the accepted floor, preserving the
+    /// player's offset above the surface that carried them on the previous step.
+    #[must_use]
+    pub fn with_building_floor(mut self, height: f32, previous_mesh: Option<f32>) -> Self {
+        let Some([top, bottom]) = self.previous_floor_probe() else {
+            return self;
+        };
+        let previous_surface = previous_mesh
+            .into_iter()
+            .chain(self.previous_terrain_height)
+            .filter(|height| (bottom[2]..=top[2]).contains(height))
+            .max_by(f32::total_cmp);
+        let sweep = self.sweep.as_mut().expect("floor probe requires a sweep");
+        let clearance = previous_surface.map_or(FLOOR_CLEARANCE, |surface| {
+            (sweep[0][2] - 0.5 - surface).clamp(FLOOR_CLEARANCE, self.max_floor_clearance)
+        });
+        self.pose.position[2] = (height + clearance).to_bits();
+        sweep[1][2] = height + clearance + 0.5;
         self
     }
 
@@ -114,7 +137,7 @@ impl PlayerMotionStep {
 
 #[cfg(test)]
 mod tests {
-    use super::{PlayerMotionStep, TransformState};
+    use super::{PlayerMotionStep, TransformState, FLOOR_CLEARANCE};
 
     #[test]
     fn building_floor_probe_uses_proposed_xy_and_previous_height() {
@@ -125,6 +148,8 @@ mod tests {
             },
             pitch_bits: 0,
             flying: false,
+            max_floor_clearance: FLOOR_CLEARANCE,
+            previous_terrain_height: None,
             terrain_height: Some(11.5),
             sweep: Some([[3.0, 6.0, 12.5], [4.0, 6.0, 15.5]]),
         };
@@ -132,11 +157,8 @@ mod tests {
             step.floor_probe(),
             Some([[4.0, 6.0, 12.85], [4.0, 6.0, 10.0]])
         );
-        assert_eq!(
-            step.terrain_exit_floor().map(|(height, _)| height),
-            Some(11.5)
-        );
-        let lowered = step.with_building_floor(11.5);
+        assert_eq!(step.terrain_exit_floor(), Some(11.5));
+        let lowered = step.with_building_floor(11.5, Some(12.0));
         assert_eq!(lowered.pose.position.map(f32::from_bits), [4.0, 6.0, 11.52]);
         assert_eq!(lowered.sweep.unwrap()[1], [4.0, 6.0, 12.02]);
         assert_eq!(
@@ -147,8 +169,31 @@ mod tests {
             ]
         );
         assert_eq!(
-            step.with_building_floor(12.5).floor_sweeps().unwrap()[0],
+            step.with_building_floor(12.5, Some(12.0))
+                .floor_sweeps()
+                .unwrap()[0],
             [[3.0, 6.0, 12.5], [3.0, 6.0, 13.02]]
+        );
+    }
+
+    #[test]
+    fn floor_transition_preserves_offset_from_terrain_and_mesh() {
+        let step = PlayerMotionStep {
+            pose: TransformState::default(),
+            pitch_bits: 0,
+            flying: false,
+            max_floor_clearance: 1.25,
+            previous_terrain_height: Some(10.0),
+            terrain_height: Some(10.0),
+            sweep: Some([[3.0, 6.0, 11.75], [4.0, 6.0, 11.75]]),
+        };
+        assert_eq!(
+            f32::from_bits(step.with_building_floor(10.25, None).pose.position[2]),
+            11.5
+        );
+        assert_eq!(
+            f32::from_bits(step.with_building_floor(10.0, Some(10.25)).pose.position[2]),
+            11.0
         );
     }
 }
@@ -220,6 +265,20 @@ fn plan_player_steps(
     }
     .max(1);
     input.delta_seconds /= count as f32;
+    // shortcut: use the outdoor spawn clearance until the native walking collider is wired.
+    let mut max_floor_clearance = FLOOR_CLEARANCE;
+    if !flying && input.movement != [0.0; 2] {
+        if let Some(draft) = mission.object_drafts.get(cockpit.object_index) {
+            let [x, y, z] = draft.position;
+            if let Some(ground) = mission
+                .terrain
+                .height_at([x, y])
+                .map_err(|err| EngineError::Movement(err.to_string()))?
+            {
+                max_floor_clearance = (z - ground).clamp(FLOOR_CLEARANCE, STEP_DOWN);
+            }
+        }
+    }
     let mut step = plan_motion(&mission.terrain, pose, pitch, flying, input)?;
     let mut previous = pose;
     input.mouse_x = 0.0;
@@ -234,6 +293,7 @@ fn plan_player_steps(
                 input,
             )?;
         }
+        step.max_floor_clearance = max_floor_clearance;
         let (resolved, blocked) = resolve(step)?;
         step = resolved;
         if blocked {
@@ -303,6 +363,7 @@ fn plan_motion(
         ));
     }
     let mut sweep = None;
+    let mut previous_terrain_height = None;
     let mut terrain_height = None;
     if flying && (xy != [from[0], from[1]] || climb != 0.0) {
         let old_xy = [from[0], from[1]];
@@ -340,6 +401,7 @@ fn plan_motion(
                 .map_err(|err| EngineError::Movement(err.to_string()))?,
         ) {
             let to = [xy[0], xy[1], new_ground + (from[2] - old_ground)];
+            previous_terrain_height = Some(old_ground);
             terrain_height = Some(new_ground);
             pose.position = to.map(f32::to_bits);
             // shortcut: one sweep at body height until the physical collider
@@ -357,6 +419,8 @@ fn plan_motion(
         pose,
         pitch_bits: pitch.to_bits(),
         flying,
+        max_floor_clearance: FLOOR_CLEARANCE,
+        previous_terrain_height,
         terrain_height,
         sweep,
     })
