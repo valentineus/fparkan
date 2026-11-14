@@ -135,6 +135,21 @@ impl LoadedMissionState {
                     bundle.formula_table.as_ref(),
                     &mut state.values,
                     |instruction, values| match instruction.dispatch_selector() {
+                        ScriptDispatchSelector::Handler(9)
+                            if instruction.references.is_empty()
+                                && instruction.header_words[1] == u32::MAX =>
+                        {
+                            Ok(None)
+                        }
+                        ScriptDispatchSelector::Handler(12)
+                            if instruction.references.is_empty() =>
+                        {
+                            let priority = problem
+                                .as_ref()
+                                .ok_or("Handler(12) requires a current problem")?
+                                .scalar_1;
+                            Ok(Some(VarSetDefault::FloatBits(priority.to_bits())))
+                        }
                         ScriptDispatchSelector::Handler(59 | 60) => {
                             crate::script_time::result(instruction, values, clock)
                                 .map(|result| Some(VarSetDefault::Dword(result)))
