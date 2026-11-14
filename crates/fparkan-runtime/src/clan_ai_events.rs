@@ -1,4 +1,5 @@
 use crate::clan_problem_conditions::Condition;
+use crate::clan_transport_schemes::TRANSPORT_CLASS;
 use crate::{clan_combat_groups::CombatGroup, clan_targeting::CaptureApproach};
 use crate::{BehaviorOreState, LoadedMissionState, MissionEventStop};
 use fparkan_script::{
@@ -11,11 +12,13 @@ use std::collections::BTreeMap;
 const STORAGE_CLASS: u32 = 0x8000_0008;
 const RESOURCE_ORE: u32 = 0x0200_0100;
 const BUILDING_PROTECT: u32 = 8;
+const OPTIMAL_TRANSPORT: u32 = 4;
 
 pub(super) struct ScriptFactoryOrder {
     pub owner: OwnerId,
     pub plant: ObjectHandle,
     pub class: u32,
+    selection: u32,
     problem: Handler2RecordKey,
     wait_for_factory: bool,
 }
@@ -106,7 +109,13 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) {
             && !crate::mission_events::placed_logic_objects(&loaded.mission, &engine.world, key.argument_0)
                 .any(|target| identity_metadata(&engine.world, target)
                     .is_ok_and(|identity| identity.owner_id == Some(OwnerId(clan as u16))));
-        let ready = lost_building || conditions.iter().any(|&condition| {
+        // shortcut: recheck the request when a transport arrives until native problem aging is wired.
+        let transport_arrived = key.word_0 == OPTIMAL_TRANSPORT && conditions.is_empty()
+            && loaded.mission_events.clan_units(&engine.world, OwnerId(clan as u16), false)
+                .any(|unit| identity_metadata(&engine.world, unit).ok().and_then(|meta| meta.original_id)
+                    .and_then(|id| loaded.object_drafts.get(id.0 as usize))
+                    .is_some_and(|draft| draft.unit_dat_header_flags == Some(TRANSPORT_CLASS)));
+        let ready = lost_building || transport_arrived || conditions.iter().any(|&condition| {
             condition.met(
                 &engine.world,
                 OwnerId(clan as u16),
@@ -138,12 +147,13 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) {
             .as_ref()
             .is_some_and(|production| production.is_building_at(*plant, OwnerId(*clan)))
     });
-    for order in loaded.tick_clan_ai_events(&engine.world, now_ms) {
+    for order in loaded.tick_clan_ai_events(&engine.world, engine.production.as_ref(), now_ms) {
         match crate::production::order_script_factory(
             engine,
             order.owner,
             order.plant,
             order.class,
+            order.selection,
             now_ms,
         ) {
             Ok(duration) => {
@@ -216,6 +226,7 @@ impl LoadedMissionState {
     pub(super) fn tick_clan_ai_events(
         &mut self,
         world: &World,
+        production: Option<&crate::production::Production>,
         now_ms: u32,
     ) -> Vec<ScriptFactoryOrder> {
         let mut orders = Vec::new();
@@ -320,6 +331,7 @@ impl LoadedMissionState {
                     break;
                 };
                 let mut solved = false;
+                let mut transport_factory_busy = false;
                 let mut assignment = None;
                 let mut solving = false;
                 let mut capturer = None;
@@ -556,13 +568,15 @@ impl LoadedMissionState {
                             if problem.is_none() {
                                 return Err("Handler(15) order is unavailable in Problems0".into());
                             }
+                            let Handler15TargetPayload::ByName(selection) = order.target else {
+                                return Err("Handler(15) factory order requires design selection".into());
+                            };
                             if order.word_1 != 0x0c
                                 || order.word_2 != 1
-                                || order.word_3 != crate::boarding::WARBOT_CLASS
-                                || !matches!(order.target, Handler15TargetPayload::ByName(_))
+                                || !matches!(order.word_3, crate::boarding::WARBOT_CLASS | TRANSPORT_CLASS)
                             {
                                 return Err(
-                                    "Handler(15) only supports the scripted warbot factory order"
+                                    "Handler(15) factory order class or insertion mode is unsupported"
                                         .into(),
                                 );
                             }
@@ -579,10 +593,17 @@ impl LoadedMissionState {
                             let Some(plant) = plant else {
                                 return Ok(Some(VarSetDefault::Dword(5)));
                             };
+                            if production.is_some_and(|queue| queue.is_building_at(plant, owner))
+                                || orders.iter().any(|order: &ScriptFactoryOrder| order.plant == plant)
+                            {
+                                transport_factory_busy = order.word_3 == TRANSPORT_CLASS;
+                                return Ok(Some(VarSetDefault::Dword(0)));
+                            }
                             orders.push(ScriptFactoryOrder {
                                 owner,
                                 plant,
                                 class: order.word_3,
+                                selection,
                                 problem: problem
                                     .as_ref()
                                     .expect("factory order requires a current problem")
@@ -640,7 +661,7 @@ impl LoadedMissionState {
                                 Some(1)
                                     if problem
                                         .as_ref()
-                                        .is_some_and(|record| matches!(record.key.word_0, 6 | BUILDING_PROTECT))
+                                        .is_some_and(|record| matches!(record.key.word_0, OPTIMAL_TRANSPORT | 6 | BUILDING_PROTECT))
                                         || !conditions.is_empty() =>
                                 {
                                     solving = true
@@ -736,13 +757,14 @@ impl LoadedMissionState {
                             if mode != 2 {
                                 return Err("Handler(14) only supports UNIT_ANY_UNIT".into());
                             }
-                            // shortcut: only unassigned placed objects until PBM owns roster slots.
                             let id = self.mission_events.first_available_placed_unit(
-                                &self.mission,
-                                world,
-                                clan,
-                                class,
+                                &self.mission, world, clan, class,
                             );
+                            if class == TRANSPORT_CLASS && id.is_none()
+                                && self.mission_events.count_clan_class(world, OwnerId(clan as u16), class) != 0
+                            {
+                                return Err("Handler(14) needs a runtime logic ID for the produced transport".into());
+                            }
                             Ok(Some(VarSetDefault::Dword(id.unwrap_or(u32::MAX))))
                         }
                         ScriptDispatchSelector::Handler(29) => {
@@ -958,14 +980,16 @@ impl LoadedMissionState {
                     }
                 }
                 if let Some(problem) = problem {
-                    if solved {
+                    // shortcut: keep transport demand queued until the factory can accept it.
+                    if solved && !transport_factory_busy {
                         self.clan_ai_events
                             .problems
                             .entry(clan)
                             .or_default()
                             .remove(problem.key);
                     } else if solving
-                        && (!conditions.is_empty() || problem.key.word_0 == BUILDING_PROTECT)
+                        && (!conditions.is_empty()
+                            || matches!(problem.key.word_0, OPTIMAL_TRANSPORT | BUILDING_PROTECT))
                     {
                         let count = self
                             .clan_ai_events

@@ -50,6 +50,7 @@ mod clan_combat_strength;
 mod clan_problem_conditions;
 mod clan_script_init;
 mod clan_targeting;
+mod clan_transport_schemes;
 mod mesh_collision;
 mod mining;
 mod mission_events;
@@ -1879,7 +1880,7 @@ fn load_mission_with_options(
     } else {
         Arc::from(&[][..])
     };
-    let build_schemes = if let Some(scheme) = build_scheme {
+    let mut build_schemes = if let Some(scheme) = build_scheme {
         vec![scheme.clone()]
     } else if options.start_autodemo && request.mode == MissionMode::SingleMission {
         production::mission_prebuilds(&config)?
@@ -1933,6 +1934,18 @@ fn load_mission_with_options(
         }
     })?;
     let mut loaded_scripts = load_mission_scripts(&vfs, &mission, options.asset_scope)?;
+    let player_scheme_count = build_schemes.len();
+    let transport_schemes = if options.start_autodemo && request.mode == MissionMode::SingleMission
+    {
+        clan_transport_schemes::available(vfs.as_ref(), &mission, &loaded_scripts.bundles)
+    } else {
+        Vec::new()
+    };
+    for (_, path) in &transport_schemes {
+        if !build_schemes.contains(path) {
+            build_schemes.push(path.clone());
+        }
+    }
     let research_trf_tables = if options.asset_scope == MissionAssetScope::Full
         && startup_input.is_some_and(|input| input.research_creation_gate)
     {
@@ -2649,6 +2662,8 @@ fn load_mission_with_options(
             Some(production::Production::new(
                 reserve_start,
                 build_schemes,
+                player_scheme_count,
+                transport_schemes,
                 reserve_controls,
                 &object_drafts[..mine_reserve_start],
             )?),

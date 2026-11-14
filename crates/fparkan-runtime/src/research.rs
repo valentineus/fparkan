@@ -1,6 +1,6 @@
 use super::{
-    mission_events::on_communicator, normalize_engine_path, read_vfs, ClanBody, Engine,
-    EngineError, LoadedMissionState, MissionObjectDraft, StartingCockpit,
+    mission_events::on_communicator, normalize_engine_path, ClanBody, Engine, EngineError,
+    LoadedMissionState, MissionObjectDraft, StartingCockpit,
 };
 use fparkan_assets::ResearchTrfDocument;
 use fparkan_vfs::Vfs;
@@ -235,8 +235,15 @@ pub(super) fn load_clan_table(
     mission: &LoadedMissionState,
     owner: OwnerId,
 ) -> Result<ResearchTrfDocument, EngineError> {
+    load_technology_table(vfs.as_ref(), &mission.mission, owner)
+}
+
+pub(super) fn load_technology_table(
+    vfs: &dyn Vfs,
+    mission: &crate::MissionDocument,
+    owner: OwnerId,
+) -> Result<ResearchTrfDocument, EngineError> {
     let clan = mission
-        .mission
         .clans
         .get(usize::from(owner.0))
         .ok_or_else(|| research_error("clan is unavailable"))?;
@@ -254,7 +261,11 @@ pub(super) fn load_clan_table(
         return Err(research_error("clan has no technology table"));
     }
     let path = normalize_engine_path("clan technology table", path)?;
-    ResearchTrfDocument::decode(read_vfs(vfs, &path)?).map_err(research_error)
+    let bytes = vfs.read(&path).map_err(|source| EngineError::Vfs {
+        path: path.as_str().into(),
+        source,
+    })?;
+    ResearchTrfDocument::decode(bytes).map_err(research_error)
 }
 
 fn research_error(error: impl std::fmt::Display) -> EngineError {

@@ -67,6 +67,8 @@ pub(super) fn mission_prebuilds(config: &[u8]) -> Result<Vec<NormalizedPath>, En
 pub(super) struct Production {
     reserve_start: usize,
     schemes: Vec<NormalizedPath>,
+    player_scheme_count: usize,
+    transport_schemes: Vec<(OwnerId, NormalizedPath)>,
     controls: Vec<MissionControlDeviceTableState>,
     plants: Vec<(usize, u32)>,
     pending: VecDeque<Order>,
@@ -142,6 +144,8 @@ impl Production {
     pub(super) fn new(
         reserve_start: usize,
         schemes: Vec<NormalizedPath>,
+        player_scheme_count: usize,
+        transport_schemes: Vec<(OwnerId, NormalizedPath)>,
         controls: Vec<MissionControlDeviceTableState>,
         drafts: &[MissionObjectDraft],
     ) -> Result<Self, EngineError> {
@@ -182,6 +186,8 @@ impl Production {
         Ok(Self {
             reserve_start,
             schemes,
+            player_scheme_count,
+            transport_schemes,
             controls,
             plants,
             pending: VecDeque::new(),
@@ -310,7 +316,9 @@ pub fn factory_schemes(
 ) -> Result<Vec<(usize, &str)>, EngineError> {
     let (mission, production) = loaded_production(engine)?;
     let (plant, _) = factory_at_communicator(&engine.world, mission, production, cockpit)?;
-    Ok(schemes_for_plant(mission, production, plant).collect())
+    Ok(schemes_for_plant(mission, production, plant)
+        .filter(|&(scheme, _)| scheme < production.player_scheme_count)
+        .collect())
 }
 
 /// Lists the live factories of the player's clan and matching configured schemes.
@@ -323,6 +331,7 @@ pub fn clan_factory_schemes(
     Ok(owned_factories(&engine.world, mission, production, owner)
         .flat_map(|(index, factory, _)| {
             schemes_for_plant(mission, production, index)
+                .filter(|&(scheme, _)| scheme < production.player_scheme_count)
                 .map(move |(scheme, path)| (factory, scheme, path))
         })
         .collect())
@@ -366,6 +375,13 @@ pub fn order_clan_factory_scheme(
     now_ms: u32,
 ) -> Result<u32, EngineError> {
     let owner = player_owner(&engine.world, cockpit)?;
+    if engine
+        .production
+        .as_ref()
+        .is_some_and(|production| scheme >= production.player_scheme_count)
+    {
+        return Err(production_error("unknown factory scheme"));
+    }
     order_owned_factory(engine, owner, plant, scheme, now_ms)
 }
 
@@ -485,19 +501,33 @@ pub(super) fn order_script_factory(
     owner: OwnerId,
     plant: ObjectHandle,
     class: u32,
+    selection: u32,
     now_ms: u32,
 ) -> Result<u32, EngineError> {
     let (mission, production) = loaded_production(engine)?;
     let (index, _, _) = owned_factories(&engine.world, mission, production, owner)
         .find(|&(_, handle, _)| handle == plant)
         .ok_or_else(|| production_error("script factory is unavailable"))?;
-    // shortcut: use the mission's first compatible prebuild until AI design selection is linked.
+    let transport = class == crate::clan_transport_schemes::TRANSPORT_CLASS;
+    let transport_scheme =
+        if transport && selection == crate::clan_transport_schemes::SELECT_FASTEST {
+            production
+                .transport_schemes
+                .iter()
+                .find_map(|(clan, path)| (*clan == owner).then_some(path))
+        } else {
+            None
+        };
+    // shortcut: warbots use the first compatible prebuild until AI combat ranking is wired.
     let scheme = schemes_for_plant(mission, production, index)
-        .map(|(scheme, _)| scheme)
-        .find(|&scheme| {
+        .find(|&(scheme, path)| {
+            if transport {
+                return transport_scheme.is_some_and(|selected| selected.as_str() == path);
+            }
             let draft = &mission.object_drafts[production.reserve_start + scheme * RESERVE_SLOTS];
-            draft.unit_dat_header_flags == Some(class)
+            scheme < production.player_scheme_count && draft.unit_dat_header_flags == Some(class)
         })
+        .map(|(scheme, _)| scheme)
         .ok_or_else(|| production_error("script factory has no compatible prepared scheme"))?;
     order_owned_factory(engine, owner, plant, scheme, now_ms)
 }
@@ -739,22 +769,47 @@ mod tests {
         assert!(report.script_factory_rejections.is_empty(), "{report:?}");
         let cockpit = super::super::starting_cockpit(&engine).unwrap();
         let factory = handle_by_original_id(&engine.world, OriginalObjectId(5)).unwrap();
+        let production = engine.production.as_ref().unwrap();
+        let [(owner, transport)] = production.transport_schemes.as_slice() else {
+            panic!("expected one eligible AI transport");
+        };
+        assert_eq!(*owner, OwnerId(1));
+        assert!(transport.as_str().ends_with("/sml_cargo.dat"));
+        let transport_index = production
+            .schemes
+            .iter()
+            .position(|path| path == transport)
+            .unwrap();
+        assert_eq!(clan_factory_schemes(&engine, cockpit).unwrap().len(), 2);
+        assert!(
+            order_clan_factory_scheme(&mut engine, cockpit, factory, transport_index, 40_000)
+                .is_err()
+        );
         let duration = order_clan_factory_scheme(&mut engine, cockpit, factory, 0, 40_000).unwrap();
         assert!(duration > 0);
         let production = engine.production.as_ref().unwrap();
         assert_eq!(production.pending.len(), 2);
         assert_ne!(production.pending[0].slot, production.pending[1].slot);
+        let cargo_slots = production.reserve_start + transport_index * RESERVE_SLOTS;
+        assert!((cargo_slots..cargo_slots + RESERVE_SLOTS).contains(&production.pending[0].slot));
         let mut completed = Vec::new();
         for time in (40_016..=40_000 + duration + 2000).step_by(16) {
             if let Some(unit) = step_headless(&mut engine, InputSnapshot::default(), time)
                 .unwrap()
                 .produced_unit
             {
-                completed.push(unit.clan);
+                completed.push((unit.clan, unit.object_index));
             }
         }
-        assert!(completed.contains(&0), "{completed:?}");
-        assert!(completed.contains(&1), "{completed:?}");
+        assert!(
+            completed.iter().any(|&(clan, _)| clan == 0),
+            "{completed:?}"
+        );
+        assert!(
+            completed.iter().any(|&(clan, index)| clan == 1
+                && (cargo_slots..cargo_slots + RESERVE_SLOTS).contains(&index)),
+            "{completed:?}"
+        );
     }
 
     #[test]
