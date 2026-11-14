@@ -1,7 +1,8 @@
 use super::{
-    component_cockpit, control_device_provider_value, projectile::unit_sphere, starting_cockpit,
-    Engine, EngineError, MissionControlDeviceTableState, MissionControlDeviceTableStatus,
-    StartingCockpit, SurfaceQuery, TransformState,
+    component_cockpit, control_device_provider_value,
+    projectile::{projectile_terrain_hit, projectile_unit_hit, unit_sphere},
+    starting_cockpit, Engine, EngineError, MissionControlDeviceTableState,
+    MissionControlDeviceTableStatus, StartingCockpit, SurfaceQuery, TransformState,
 };
 use fparkan_world::{
     handle_by_original_id, identity_metadata, set_transform, transform_state, ObjectHandle,
@@ -22,12 +23,51 @@ pub fn player_vehicle(engine: &Engine) -> Option<StartingCockpit> {
     Some(engine.loaded.as_ref()?.boarding.as_ref()?.cockpit)
 }
 
-/// Boards the closest compatible allied warbot.
+/// Selects the friendly warbot under a line of sight supplied by the camera.
+pub fn select_boarding_target(
+    engine: &Engine,
+    hero: StartingCockpit,
+    segment: [[f32; 3]; 2],
+) -> Option<ObjectHandle> {
+    let target = projectile_unit_hit(engine, hero.handle, segment)?;
+    let owner = identity_metadata(&engine.world, hero.handle)
+        .ok()?
+        .owner_id?;
+    let mission = engine.loaded.as_ref()?;
+    // shortcut: use the cockpit sight ray until the original selection ranking is recovered.
+    if projectile_terrain_hit(&mission.terrain, segment)
+        .ok()?
+        .is_some_and(|ground| ground <= target.fraction)
+    {
+        return None;
+    }
+    let warbot = mission.object_drafts.iter().any(|draft| {
+        draft.unit_dat_header_flags == Some(WARBOT_CLASS)
+            && draft
+                .original_id
+                .and_then(|id| handle_by_original_id(&engine.world, id))
+                == Some(target.handle)
+    });
+    (warbot
+        && identity_metadata(&engine.world, target.handle)
+            .ok()?
+            .owner_id
+            == Some(owner))
+    .then_some(target.handle)
+}
+
+/// Boards the selected compatible allied warbot within 20 units in XY.
 ///
 /// # Errors
 ///
 /// Returns an error if the hero's world handle is stale.
-pub fn board_friendly_warbot(engine: &mut Engine) -> Result<Option<StartingCockpit>, EngineError> {
+pub fn board_friendly_warbot(
+    engine: &mut Engine,
+    target: Option<ObjectHandle>,
+) -> Result<Option<StartingCockpit>, EngineError> {
+    let Some(target) = target else {
+        return Ok(None);
+    };
     let Some(hero) = starting_cockpit(engine) else {
         return Ok(None);
     };
@@ -41,7 +81,7 @@ pub fn board_friendly_warbot(engine: &mut Engine) -> Result<Option<StartingCockp
         return Ok(None);
     };
     let hero_pose = transform_state(&engine.world, hero.handle)?;
-    let position = hero_pose.position.map(f32::from_bits);
+    let [hero_x, hero_y, _] = hero_pose.position.map(f32::from_bits);
     let candidate = mission
         .object_drafts
         .iter()
@@ -51,7 +91,9 @@ pub fn board_friendly_warbot(engine: &mut Engine) -> Result<Option<StartingCockp
                 return None;
             }
             let handle = handle_by_original_id(&engine.world, draft.original_id?)?;
-            if identity_metadata(&engine.world, handle).ok()?.owner_id != Some(owner) {
+            if handle != target
+                || identity_metadata(&engine.world, handle).ok()?.owner_id != Some(owner)
+            {
                 return None;
             }
             let table = mission
@@ -62,26 +104,14 @@ pub fn board_friendly_warbot(engine: &mut Engine) -> Result<Option<StartingCockp
                 return None;
             }
             let state = transform_state(&engine.world, handle).ok()?;
-            let (center, radius) = unit_sphere(&mission.mission_assets, index, state)?;
-            let distance = center
-                .into_iter()
-                .zip(position)
-                .map(|(center, player)| (center - player).powi(2))
-                .sum::<f32>()
-                .sqrt()
-                - radius;
-            // shortcut: same-clan proximity replaces native selection and boarding admission.
-            if !distance.is_finite() || distance > 6.0 {
+            let [x, y, _] = state.position.map(f32::from_bits);
+            if !within_boarding_range([hero_x, hero_y], [x, y]) {
                 return None;
             }
-            Some((
-                distance,
-                component_cockpit(mission, index, handle)?,
-                state.position,
-            ))
+            Some((component_cockpit(mission, index, handle)?, state.position))
         })
-        .min_by(|a, b| a.0.total_cmp(&b.0));
-    let Some((_, cockpit, position)) = candidate else {
+        .next();
+    let Some((cockpit, position)) = candidate else {
         return Ok(None);
     };
     let can_fly = crate::player_motion::warbot_can_fly(engine, cockpit.object_index);
@@ -102,6 +132,20 @@ pub fn board_friendly_warbot(engine: &mut Engine) -> Result<Option<StartingCockp
         mission.player_pitch_bits = 0;
     }
     Ok(Some(cockpit))
+}
+
+fn within_boarding_range([hero_x, hero_y]: [f32; 2], [x, y]: [f32; 2]) -> bool {
+    (x - hero_x).hypot(y - hero_y) < 20.0
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn boarding_reach_excludes_the_horizontal_boundary() {
+        assert!(super::within_boarding_range([0.0, 0.0], [12.0, 15.99]));
+        assert!(!super::within_boarding_range([0.0, 0.0], [12.0, 16.0]));
+        assert!(!super::within_boarding_range([0.0, 0.0], [f32::NAN, 0.0]));
+    }
 }
 
 fn has_working_pilot_control(table: &MissionControlDeviceTableState) -> bool {

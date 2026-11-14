@@ -10007,6 +10007,8 @@ struct StaticVulkanApp {
     player_fire_held: bool,
     player_fire_pressed: bool,
     player_capture_pressed: bool,
+    player_select_friend_pressed: bool,
+    boarding_target: Option<ObjectHandle>,
     player_build_pressed: bool,
     factory_menu: Option<FactoryMenu>,
     factory_status: Option<String>,
@@ -10148,6 +10150,8 @@ impl StaticVulkanApp {
             player_fire_held: false,
             player_fire_pressed: false,
             player_capture_pressed: false,
+            player_select_friend_pressed: false,
+            boarding_target: None,
             player_build_pressed: false,
             factory_menu: None,
             factory_status: None,
@@ -10878,6 +10882,7 @@ impl StaticVulkanApp {
         self.player_mouse = [0.0; 2];
         self.player_move_pressed = Default::default();
         self.player_capture_pressed = false;
+        self.player_select_friend_pressed = false;
         self.player_build_pressed = false;
         self.player_research_pressed = false;
         self.player_mine_pressed = false;
@@ -10923,6 +10928,9 @@ impl StaticVulkanApp {
                         "Герой"
                     };
                     let _ = write!(title, " — {unit}");
+                    if let (None, Some(target)) = (self.boarded_hero_index, self.boarding_target) {
+                        let _ = write!(title, " · Выбран варбот №{}", target.slot);
+                    }
                     if let Some(status) = fparkan_runtime::player_status(engine, cockpit.handle) {
                         if let Some(health) = status.health_percent {
                             let _ = write!(title, " · Здоровье {health}%");
@@ -11221,20 +11229,29 @@ impl StaticVulkanApp {
                     }
                 }
             }
+            if std::mem::take(&mut self.player_select_friend_pressed)
+                && self.boarded_hero_index.is_none()
+            {
+                if let Some(hero) = self.cockpit {
+                    let start = self.view_camera.position;
+                    let end = add3(
+                        start,
+                        scale3(self.view_camera.forward, self.view_camera.far_plane),
+                    );
+                    self.boarding_target =
+                        fparkan_runtime::select_boarding_target(engine, hero, [start, end]);
+                    if let Some(target) = self.boarding_target {
+                        eprintln!("player_select_boarding_target object={} queue_time_ms={control_clock_ms}", target.slot);
+                    }
+                }
+            }
             if let (true, Some(cockpit), false) = (
                 std::mem::take(&mut self.player_capture_pressed),
                 self.cockpit,
                 self.boarded_hero_index.is_some(),
             ) {
-                if let Some(target) =
-                    capture_neutral_warbot(engine, cockpit).map_err(|error| error.to_string())?
-                {
-                    eprintln!(
-                        "player_capture object={} queue_time_ms={control_clock_ms}",
-                        target.0
-                    );
-                } else if let Some(vehicle) =
-                    board_friendly_warbot(engine).map_err(|error| error.to_string())?
+                if let Some(vehicle) = board_friendly_warbot(engine, self.boarding_target)
+                    .map_err(|error| error.to_string())?
                 {
                     self.cockpit = Some(vehicle);
                     self.boarded_hero_index = Some(cockpit.object_index);
@@ -11258,6 +11275,14 @@ impl StaticVulkanApp {
                     eprintln!(
                         "player_board object={} queue_time_ms={control_clock_ms}",
                         vehicle.object_index
+                    );
+                } else if let Some(target) =
+                    capture_neutral_warbot(engine, cockpit).map_err(|error| error.to_string())?
+                {
+                    self.boarding_target = mission_object_handle(engine, target);
+                    eprintln!(
+                        "player_capture object={} queue_time_ms={control_clock_ms}",
+                        target.0
                     );
                 } else if let Some(target) =
                     capture_building(engine, cockpit).map_err(|error| error.to_string())?
@@ -12510,6 +12535,7 @@ impl ApplicationHandler for StaticVulkanApp {
                     self.pressed_keys.clear();
                     self.player_move_pressed = Default::default();
                     self.player_capture_pressed = false;
+                    self.player_select_friend_pressed = false;
                     self.player_build_pressed = false;
                     self.player_research_pressed = false;
                     self.player_mine_pressed = false;
@@ -12583,6 +12609,9 @@ impl ApplicationHandler for StaticVulkanApp {
                                 && matches!(code, KeyCode::Enter | KeyCode::NumpadEnter)
                             {
                                 self.player_capture_pressed = true;
+                            }
+                            if self.demo_camera.is_none() && code == KeyCode::KeyF {
+                                self.player_select_friend_pressed = true;
                             }
                             if self.demo_camera.is_none() && code == KeyCode::KeyB {
                                 self.player_build_pressed = true;

@@ -71,7 +71,9 @@ mod unit_patrol;
 pub use autodemo::{
     autodemo_camera, AutoDemoCamera, AutoDemoReinforcement, AutoDemoView, SpawnedUnit,
 };
-pub use boarding::{board_friendly_warbot, disembark_warbot, player_vehicle};
+pub use boarding::{
+    board_friendly_warbot, disembark_warbot, player_vehicle, select_boarding_target,
+};
 pub use building_door::{has_proximity_doors, sample_proximity_doors};
 pub use fparkan_assets::MissionAssets;
 pub use mesh_collision::{query_building_segment_world, BuildingMeshHit, BuildingMeshNode};
@@ -18775,7 +18777,10 @@ mod tests {
             panic!("helicopter Control nodes unavailable");
         };
         nodes[key].current_type1_value_bits = 0.0_f32.to_bits();
-        assert_eq!(board_friendly_warbot(&mut engine).unwrap(), None);
+        assert_eq!(
+            board_friendly_warbot(&mut engine, Some(helicopter)).unwrap(),
+            None
+        );
         let table = engine
             .loaded
             .as_mut()
@@ -18790,7 +18795,19 @@ mod tests {
             panic!("helicopter Control nodes unavailable");
         };
         nodes[key].current_type1_value_bits = 1.0_f32.to_bits();
-        let vehicle = board_friendly_warbot(&mut engine).unwrap().unwrap();
+        assert_eq!(board_friendly_warbot(&mut engine, None).unwrap(), None);
+        let [hx, hy, hz] = position(&engine, hero);
+        let [tx, ty, tz] = transform_state(&engine.world, helicopter)
+            .unwrap()
+            .position
+            .map(f32::from_bits);
+        assert_eq!(
+            select_boarding_target(&engine, hero, [[hx, hy, hz + 1.0], [tx, ty, tz + 0.5]]),
+            Some(helicopter),
+        );
+        let vehicle = board_friendly_warbot(&mut engine, Some(helicopter))
+            .unwrap()
+            .unwrap();
         assert_eq!(vehicle.handle, helicopter);
         let [x, y, z] = position(&engine, vehicle);
         let step = plan_player_motion(&engine, vehicle, up).unwrap().unwrap();
@@ -19055,11 +19072,14 @@ mod tests {
             loaded_mission_script_outcome(&engine),
             Some(MissionScriptOutcome::Completed)
         );
-        assert_eq!(board_friendly_warbot(&mut engine).unwrap(), None);
+        assert_eq!(
+            board_friendly_warbot(&mut engine, Some(robot.handle)).unwrap(),
+            None
+        );
         let robot_pose = transform_state(&engine.world, robot.handle).unwrap();
         player_pose.position = robot_pose.position;
         set_transform(&mut engine.world, cockpit.handle, player_pose).unwrap();
-        let vehicle = board_friendly_warbot(&mut engine)
+        let vehicle = board_friendly_warbot(&mut engine, Some(robot.handle))
             .unwrap()
             .expect("vehicle cockpit");
         assert_eq!(vehicle.handle, robot.handle);
@@ -19079,7 +19099,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(shots, [(1, "bf_b_01".into())]);
-        assert_eq!(board_friendly_warbot(&mut engine).unwrap(), None);
+        assert_eq!(
+            board_friendly_warbot(&mut engine, Some(robot.handle)).unwrap(),
+            None
+        );
         let motion = plan_player_motion(
             &engine,
             vehicle,
