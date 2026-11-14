@@ -10,7 +10,11 @@ mod mission_hints;
 mod player_collision;
 mod projectile_trail;
 mod script_coverage;
+mod sun_visibility;
 mod terrain_lod;
+#[cfg(test)]
+use sun_visibility::native_sun_unoccluded;
+use sun_visibility::{native_sun_unoccluded_with_world, SunOcclusionMaterials};
 
 #[cfg(test)]
 use camera_capture::parse_legacy_camera_capture;
@@ -100,12 +104,12 @@ use fparkan_runtime::{
 };
 #[cfg(test)]
 use fparkan_runtime::{load_mission_with_init_stubs, plan_player_motion};
-#[cfg(test)]
-use fparkan_terrain::BasementFoundationFragment;
 use fparkan_terrain::{
     build_basement_foundations, BasementFootprint, BasementFoundation, BasementPlacement,
-    FullSurfaceMask, SurfaceQuery, TerrainLod, TerrainMaterialLayers, TerrainWorld,
+    SurfaceQuery, TerrainLod, TerrainMaterialLayers, TerrainWorld,
 };
+#[cfg(test)]
+use fparkan_terrain::{BasementFoundationFragment, FullSurfaceMask};
 use fparkan_vfs::{DirectoryVfs, Vfs};
 use fparkan_world::{ObjectHandle, WorldSnapshot};
 use std::collections::{HashMap, HashSet};
@@ -3377,6 +3381,7 @@ impl EnvironmentGpuScene {
         let clouds_material_index = material_indices[2]
             .ok_or_else(|| "cloud material selector is unavailable".to_string())?;
         eprintln!("render_coverage sky_cloud_lighting_approx=1 (native cloud fog range and zero additive RGB; transient light composition is not matched)");
+        eprintln!("render_coverage sun_occlusion_approx=1 (center ray and base-mip foliage alpha)");
         let clouds_material = materials
             .get(clouds_material_index)
             .ok_or_else(|| "cloud material descriptor is unavailable".to_string())?;
@@ -3643,6 +3648,7 @@ impl EnvironmentGpuScene {
         viewport: [f32; 2],
         terrain: &TerrainWorld,
         sun_occlusion_range_indices: &[usize],
+        occlusion_materials: SunOcclusionMaterials<'_>,
     ) -> Result<(), String> {
         let active_materials = &material_update.active_materials;
         // Resolve the native glare once for the frame.  CSky feeds the
@@ -3660,13 +3666,17 @@ impl EnvironmentGpuScene {
                 // The glare samples world occlusion at the sun's center. The
                 // disk is behind the transparent world queue so foliage can
                 // cover it per fragment and leave its cutouts visible.
-                unoccluded: native_sun_unoccluded_with_world(
-                    terrain,
-                    mesh,
-                    sun_occlusion_range_indices,
-                    camera,
-                    sky_frame.sun.geometry_direction(),
-                ),
+                unoccluded: sky_frame.sun.active
+                    && (0.0..=viewport[0]).contains(&projected_sun[0])
+                    && (0.0..=viewport[1]).contains(&projected_sun[1])
+                    && native_sun_unoccluded_with_world(
+                        terrain,
+                        mesh,
+                        sun_occlusion_range_indices,
+                        camera,
+                        sky_frame.sun.geometry_direction(),
+                        Some(occlusion_materials),
+                    ),
             })
             .ok();
         let glare_rgb_delta = optics.map_or([0.0; 3], |optics| {
@@ -4008,159 +4018,7 @@ fn horizontal_fov(camera: &PreviewCameraFrame, aspect: f32) -> f32 {
     2.0 * ((camera.vertical_fov * 0.5).tan() * aspect).atan()
 }
 
-/// Tests the camera-to-sun segment against the validated mission terrain.
-///
-/// The native CSun caller starts a half-unit in front of the camera along the
-/// normalized geometry direction, then queries the finite segment ending at
-/// the sun center. Terrain source positions and captured-camera positions both
-/// use the `Land.msh` coordinate units, so the ray is queried without a Z
-/// conversion. Its parameter remains normalized to the finite segment and is
-/// therefore independent of world distance.
-#[cfg(test)]
-fn native_sun_unoccluded(
-    terrain: &TerrainWorld,
-    camera: &PreviewCameraFrame,
-    direction: [f32; 3],
-) -> bool {
-    let empty_mesh = VulkanStaticMesh {
-        vertices: Vec::new(),
-        indices: Vec::new(),
-        draw_ranges: Vec::new(),
-    };
-    native_sun_unoccluded_with_world(terrain, &empty_mesh, &[], camera, direction)
-}
-
-fn native_sun_unoccluded_with_world(
-    terrain: &TerrainWorld,
-    world_mesh: &VulkanStaticMesh,
-    sun_occlusion_range_indices: &[usize],
-    camera: &PreviewCameraFrame,
-    direction: [f32; 3],
-) -> bool {
-    // Native CSun requests object kinds 1, 3, 4, and 10 (the aggregate
-    // object mask is 0x41A) and excludes full surface flag 0x20. The preview
-    // range list is built from roots whose raw mission kind is one of those
-    // four eligible kinds; fixed atmosphere ranges are remapped out before
-    // this call.
-    let Some(direction) = normalize3(direction) else {
-        return false;
-    };
-    let sun_center = add3(
-        camera.position,
-        scale3(
-            direction,
-            (camera.far_plane * 0.5).max(camera.near_plane * 2.0),
-        ),
-    );
-    let start = add3(camera.position, scale3(direction, 0.5));
-    let segment = sub3(sun_center, start);
-    if !sun_center
-        .iter()
-        .chain(start.iter())
-        .chain(segment.iter())
-        .all(|value| value.is_finite())
-    {
-        return false;
-    }
-    if dot3(segment, segment) <= f32::EPSILON {
-        return true;
-    }
-    if let Ok(Some(hit)) = terrain.raycast_excluding(
-        start,
-        segment,
-        FullSurfaceMask(0),
-        FullSurfaceMask(0x0000_0020),
-    ) {
-        if hit.distance.is_finite() && hit.distance <= 1.0 {
-            return false;
-        }
-    }
-    !world_mesh_sun_occluded(world_mesh, sun_occlusion_range_indices, start, segment)
-}
-
-fn world_mesh_sun_occluded(
-    mesh: &VulkanStaticMesh,
-    range_indices: &[usize],
-    origin: [f32; 3],
-    direction: [f32; 3],
-) -> bool {
-    for &range_index in range_indices {
-        let Some(range) = mesh.draw_ranges.get(range_index).copied() else {
-            continue;
-        };
-        // The native world query receives the compact exclusion bit 0x8,
-        // which is the world-space representation of full surface flag 0x20.
-        if range.batch_flags & 0x0008 != 0 {
-            continue;
-        }
-        let Ok(first_index) = usize::try_from(range.first_index) else {
-            continue;
-        };
-        let Ok(index_count) = usize::try_from(range.index_count) else {
-            continue;
-        };
-        let Some(indices) = mesh
-            .indices
-            .get(first_index..first_index.saturating_add(index_count))
-        else {
-            continue;
-        };
-        for triangle in indices.chunks_exact(3) {
-            let Ok(a) = usize::try_from(triangle[0]) else {
-                continue;
-            };
-            let Ok(b) = usize::try_from(triangle[1]) else {
-                continue;
-            };
-            let Ok(c) = usize::try_from(triangle[2]) else {
-                continue;
-            };
-            let (Some(&a), Some(&b), Some(&c)) = (
-                mesh.vertices.get(a),
-                mesh.vertices.get(b),
-                mesh.vertices.get(c),
-            ) else {
-                continue;
-            };
-            if segment_intersects_triangle(origin, direction, a.position, b.position, c.position) {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn segment_intersects_triangle(
-    origin: [f32; 3],
-    direction: [f32; 3],
-    a: [f32; 3],
-    b: [f32; 3],
-    c: [f32; 3],
-) -> bool {
-    let edge1 = sub3(b, a);
-    let edge2 = sub3(c, a);
-    let pvec = cross3(direction, edge2);
-    let determinant = dot3(edge1, pvec);
-    if !determinant.is_finite() || determinant.abs() <= f32::EPSILON {
-        return false;
-    }
-    let inverse = determinant.recip();
-    let tvec = sub3(origin, a);
-    let u = dot3(tvec, pvec) * inverse;
-    if !u.is_finite() || !(0.0..=1.0).contains(&u) {
-        return false;
-    }
-    let qvec = cross3(tvec, edge1);
-    let v = dot3(direction, qvec) * inverse;
-    if !v.is_finite() || v < 0.0 || u + v > 1.0 {
-        return false;
-    }
-    let distance = dot3(edge2, qvec) * inverse;
-    distance.is_finite() && (0.0..=1.0).contains(&distance)
-}
-
-/// Replays Terrain's native packet callback: a draw range is keyed by the
-/// camera distance to its first indexed vertex.
+/// Replays Terrain's native packet callback using the first indexed vertex.
 fn first_indexed_vertex_distance(
     mesh: &VulkanStaticMesh,
     range_index: usize,
@@ -12220,6 +12078,12 @@ impl StaticVulkanApp {
                     frame.viewport,
                     &self.terrain,
                     &self.sun_occlusion_range_indices,
+                    SunOcclusionMaterials {
+                        materials: &self.materials,
+                        active: &frame.material_update.active_materials,
+                        hidden: &self.removed_mission_roots,
+                        boarded_hero: self.boarded_hero_index,
+                    },
                 )?;
             }
             let shadow_material = self
@@ -17675,10 +17539,20 @@ mod tests {
         assert!(!native_sun_unoccluded(
             &terrain,
             &blocked_camera,
-            [0.0, 0.0, -1.0]
+            [0.0, 0.0, -1.0],
         ));
 
-        // The same hit is beyond a short native sun segment, so it must not
+        let far_half_camera = PreviewCameraFrame {
+            far_plane: 3.0,
+            ..blocked_camera
+        };
+        assert!(!native_sun_unoccluded(
+            &terrain,
+            &far_half_camera,
+            [0.0, 0.0, -1.0],
+        ));
+
+        // The same hit is beyond a short sun segment, so it must not
         // occlude the light even though the terrain contains a surface.
         let short_segment_camera = PreviewCameraFrame {
             far_plane: 1.0,
@@ -17696,14 +17570,16 @@ mod tests {
             &world_mesh,
             &[0],
             &blocked_camera,
-            [0.0, 0.0, -1.0]
+            [0.0, 0.0, -1.0],
+            None,
         ));
         assert!(native_sun_unoccluded_with_world(
             &TerrainWorld::default(),
             &world_mesh,
             &[],
             &blocked_camera,
-            [0.0, 0.0, -1.0]
+            [0.0, 0.0, -1.0],
+            None,
         ));
 
         let mut excluded_land = fparkan_terrain_format::LandMeshDocument {
@@ -17737,7 +17613,8 @@ mod tests {
             &world_mesh,
             &[],
             &blocked_camera,
-            [0.0, 0.0, -1.0]
+            [0.0, 0.0, -1.0],
+            None,
         ));
 
         let mut excluded_world_mesh = world_mesh.clone();
@@ -17747,7 +17624,8 @@ mod tests {
             &excluded_world_mesh,
             &[0],
             &blocked_camera,
-            [0.0, 0.0, -1.0]
+            [0.0, 0.0, -1.0],
+            None,
         ));
     }
 
