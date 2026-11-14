@@ -1834,6 +1834,34 @@ fn load_mission_with_options(
     let vfs = engine.services.vfs.clone().ok_or(EngineError::MissingVfs)?;
     let mission_path = normalize_engine_path("mission", &request.key)?;
     let mission_bytes = read_vfs(&vfs, &mission_path)?;
+    let config: Arc<[u8]> = if options.asset_scope == MissionAssetScope::Full {
+        let config_path = mission_path.as_str().rsplit_once('/').map_or_else(
+            || "mission.cfg".to_owned(),
+            |(directory, _)| format!("{directory}/mission.cfg"),
+        );
+        let config_path = normalize_engine_path("mission config", &config_path)?;
+        match vfs.read(&config_path) {
+            Ok(bytes) => bytes,
+            Err(VfsError::NotFound(_)) => Arc::from(&[][..]),
+            Err(source) => {
+                return Err(EngineError::Vfs {
+                    path: config_path.as_str().into(),
+                    source,
+                })
+            }
+        }
+    } else {
+        Arc::from(&[][..])
+    };
+    let default_scheme = if build_scheme.is_none()
+        && options.start_autodemo
+        && request.mode == MissionMode::SingleMission
+    {
+        production::default_prebuild(&config)?
+    } else {
+        None
+    };
+    let build_scheme = build_scheme.or(default_scheme.as_ref());
 
     let land_path =
         decode_mission_land_path(&mission_bytes, TmaProfile::Strict).map_err(|source| {
@@ -2299,21 +2327,6 @@ fn load_mission_with_options(
     };
 
     let mission_events = if options.asset_scope == MissionAssetScope::Full {
-        let config_path = mission_path.as_str().rsplit_once('/').map_or_else(
-            || "mission.cfg".to_owned(),
-            |(directory, _)| format!("{directory}/mission.cfg"),
-        );
-        let config_path = normalize_engine_path("mission config", &config_path)?;
-        let config = match vfs.read(&config_path) {
-            Ok(bytes) => bytes,
-            Err(VfsError::NotFound(_)) => Arc::from(&[][..]),
-            Err(source) => {
-                return Err(EngineError::Vfs {
-                    path: config_path.as_str().into(),
-                    source,
-                })
-            }
-        };
         MissionEvents::with_placed_objects(
             &mut new_runtime_world,
             &object_drafts,

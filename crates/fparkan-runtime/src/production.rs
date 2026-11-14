@@ -10,6 +10,7 @@ use super::{
     MissionObjectDraft, StartingCockpit, World,
 };
 use fparkan_assets::ResearchTrfDocument;
+use fparkan_path::NormalizedPath;
 use fparkan_prototype::{unit_component_tree, UnitComponentRecord};
 use fparkan_world::{
     handle_by_original_id, identity_metadata, transform_state, ObjectHandle, OwnerId,
@@ -20,6 +21,42 @@ use fparkan_world::{
 pub(super) const RESERVE_SLOTS: usize = 8;
 const PAID_MINIMUM_MS: u32 = 5_000;
 const RESOURCE_EPSILON: f32 = 0.01;
+
+pub(super) fn default_prebuild(config: &[u8]) -> Result<Option<NormalizedPath>, EngineError> {
+    let mut in_prebuild = false;
+    for line in config.split(|&byte| byte == b'\n') {
+        let line = line.trim_ascii();
+        let mut words = line
+            .split(u8::is_ascii_whitespace)
+            .filter(|word| !word.is_empty());
+        match words.next() {
+            Some(word) if word.eq_ignore_ascii_case(b"object") => {
+                in_prebuild = words
+                    .next()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(b"prebuild"));
+            }
+            Some(word) if word.eq_ignore_ascii_case(b"end") => in_prebuild = false,
+            Some(word) if in_prebuild && !word.starts_with(b"#") && !word.starts_with(b"//") => {
+                let mut fields = line.splitn(3, |&byte| byte == b'"');
+                let key = fields.next().unwrap_or_default();
+                let name = fields.next().filter(|name| !name.is_empty());
+                if key.trim_ascii_end().ends_with(b"=") && fields.next().is_some() {
+                    if let Some(name) = name {
+                        let name = std::str::from_utf8(name).map_err(production_error)?;
+                        // shortcut: choose the first configured design until the factory menu can select one.
+                        let path = normalize_engine_path(
+                            "mission prebuild",
+                            &format!("UNITS/UNITS/PREBLD/{name}"),
+                        )?;
+                        return Ok(Some(path));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
 
 pub(super) struct Production {
     reserve_start: usize,
@@ -224,7 +261,7 @@ pub fn order_factory_robot(
 ) -> Result<u32, EngineError> {
     let (Some(mission), Some(production)) = (&mut engine.loaded, &mut engine.production) else {
         return Err(EngineError::Production(
-            "launch with --build-scheme to choose a robot".into(),
+            "mission has no prepared robot design; use --build-scheme to choose one".into(),
         ));
     };
     if production.pending.is_some() {
@@ -473,6 +510,22 @@ mod tests {
     use fparkan_world::{set_transform, InputSnapshot, OriginalObjectId};
 
     #[test]
+    fn first_mission_prebuild_supplies_the_default_design() {
+        let config = b"object other\n model1 = \"ignored.dat\"\nend\r\n\
+            OBJECT PreBuild\r\n # model1 = \"comment.dat\"\r\n\
+            model2=\"first.dat\"\r\n model1 = \"second.dat\"\r\nend\n";
+        assert_eq!(
+            default_prebuild(config).unwrap().unwrap().as_str(),
+            "UNITS/UNITS/PREBLD/first.dat"
+        );
+        assert!(default_prebuild(
+            b"object prebuild\nend\nobject other\nmodel1 = \"ignored.dat\"\nend"
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
     #[ignore = "requires licensed corpus"]
     fn licensed_field_camp_runs_paid_factory_order() {
         let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed corpus");
@@ -488,7 +541,7 @@ mod tests {
                 queue_time_ms: 0,
                 research_creation_gate: false,
             },
-            Some("UNITS/UNITS/PREBLD/tut3_p1.dat"),
+            None,
         )
         .unwrap();
         let cockpit = starting_cockpit(&engine).unwrap();
