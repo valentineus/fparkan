@@ -13,6 +13,7 @@ const STORAGE_CLASS: u32 = 0x8000_0008;
 const RESOURCE_ORE: u32 = 0x0200_0100;
 const BUILDING_PROTECT: u32 = 8;
 const OPTIMAL_TRANSPORT: u32 = 4;
+const BUILDING_NEEDED: u32 = 3;
 
 pub(super) struct ScriptFactoryOrder {
     pub owner: OwnerId,
@@ -232,6 +233,8 @@ pub(super) struct ClanAiEvents {
     groups: BTreeMap<(usize, Handler2RecordKey), CombatGroup>,
     waits: BTreeMap<(usize, Handler2RecordKey), Vec<Condition>>,
     wait_starts: BTreeMap<(usize, u32), u64>,
+    building_sites: crate::construction_site::SiteReservations,
+    building_site_queries: BTreeMap<(usize, u32), u64>,
     patrol_continues: BTreeMap<(usize, u32), u64>,
     group_orders: BTreeMap<(usize, u32), u64>,
 }
@@ -537,6 +540,13 @@ impl LoadedMissionState {
                                 .declarations
                                 .resolve_handler15_with_values(instruction, values)
                                 .map_err(|error| error.to_string())?;
+                            if matches!((order.word_1, order.word_2, order.target),
+                                (7, 3, Handler15TargetPayload::ByPlace { .. })) {
+                                return Err(format!(
+                                    "ORDER_ROBOT_BUILD needs prepared scheme and builder task (builder={} class={:#010x})",
+                                    order.word_0, order.word_3,
+                                ));
+                            }
                             if let (6, 3, Handler15TargetPayload::NotDefined(_), Some(problem)) =
                                 (order.word_1, order.word_2, order.target, problem.as_ref())
                             {
@@ -902,6 +912,30 @@ impl LoadedMissionState {
                                 crate::mining::remaining_for_clan(&self.mine_sites, world, owner);
                             Ok(Some(VarSetDefault::FloatBits(remaining.to_bits())))
                         }
+                        ScriptDispatchSelector::Handler(18)
+                            if problem.as_ref().is_some_and(|record| record.key.word_0 == BUILDING_NEEDED) =>
+                        {
+                            let &[x, y] = instruction.references.as_slice() else {
+                                return Err("Handler(18) requires two DWORD outputs".into());
+                            };
+                            if x == y || [x, y].into_iter().any(|index| !matches!(values.get(index as usize), Some(VarSetDefault::Dword(_)))) {
+                                return Err("Handler(18) requires two distinct DWORD outputs".into());
+                            }
+                            let base = self.mission.clans[clan].anchor.map(f32::round_ties_even);
+                            let position = self.clan_ai_events.building_sites.find(
+                                &self.terrain, world, &self.object_drafts, &self.mine_sites, base, now_ms,
+                            );
+                            let [px, py] = position.unwrap_or([0, 0]);
+                            values[x as usize] = VarSetDefault::Dword(px);
+                            values[y as usize] = VarSetDefault::Dword(py);
+                            let class = problem.as_ref().unwrap().key.argument_0;
+                            let count = self.clan_ai_events.building_site_queries.entry((clan, class)).or_default();
+                            *count += 1;
+                            if *count == 1 {
+                                eprintln!("sim_coverage script_building_site_approx=1 clan={clan} class={class:#010x} site={position:?}");
+                            }
+                            Ok(Some(VarSetDefault::Dword(1)))
+                        }
                         ScriptDispatchSelector::Handler(49)
                             if instruction.references.is_empty() =>
                         {
@@ -1193,6 +1227,12 @@ impl ClanAiEvents {
         self.transport_orders
             .iter()
             .map(|(&(clan, unit), &count)| (clan, unit, count))
+    }
+
+    pub(super) fn building_site_queries(&self) -> impl Iterator<Item = (usize, u32, u64)> + '_ {
+        self.building_site_queries
+            .iter()
+            .map(|(&(clan, class), &count)| (clan, class, count))
     }
 
     pub(super) fn set_base_radius(&mut self, clan: usize, limit: f32) {

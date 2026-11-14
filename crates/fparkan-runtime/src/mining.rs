@@ -70,7 +70,7 @@ impl MineSite {
         }
     }
 
-    fn live_mine(&self, world: &World) -> Option<ObjectHandle> {
+    pub(super) fn live_mine(&self, world: &World) -> Option<ObjectHandle> {
         self.placed_mine
             .and_then(|id| handle_by_original_id(world, id))
             .or_else(|| handle_by_original_id(world, self.control.as_ref()?.original_id?))
