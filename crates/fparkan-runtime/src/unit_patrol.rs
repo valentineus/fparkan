@@ -35,6 +35,24 @@ pub(super) struct PreparedPatrol {
     poses: Vec<(ObjectHandle, TransformState, TransformState)>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct PatrolAttackLimit {
+    center: [f32; 2],
+    radius: f32,
+    current_target: Option<ObjectHandle>,
+}
+
+impl PatrolAttackLimit {
+    pub(super) fn allows_attack(self, position: [f32; 3]) -> bool {
+        distance_to_patrol(self.center, position) <= self.radius + 60.0
+    }
+
+    pub(super) fn allows_target(self, target: ObjectHandle, position: [f32; 3]) -> bool {
+        self.current_target == Some(target)
+            || distance_to_patrol(self.center, position) < self.radius
+    }
+}
+
 impl UnitPatrol {
     pub(super) fn approximate_factory_raid(
         &mut self,
@@ -161,6 +179,19 @@ impl UnitPatrol {
             .iter()
             .find(|unit| unit.handle == handle)?
             .raid_factory
+    }
+
+    pub(super) fn attack_limit(&self, handle: ObjectHandle) -> Option<PatrolAttackLimit> {
+        // A raid starts with an explicit attack order. It never receives PatrolPlace limits.
+        let unit = self
+            .units
+            .iter()
+            .find(|unit| unit.handle == handle && unit.raid_factory.is_none())?;
+        Some(PatrolAttackLimit {
+            center: unit.center,
+            radius: unit.radius,
+            current_target: unit.attack,
+        })
     }
 
     pub(super) fn activate(&mut self, world: &World, handle: ObjectHandle) {
@@ -291,6 +322,35 @@ impl UnitPatrol {
         }
         Ok(PreparedPatrol { state, poses })
     }
+}
+
+fn distance_to_patrol([x, y]: [f32; 2], [px, py, _]: [f32; 3]) -> f32 {
+    // shortcut: use the horizontal distance until patrol orders carry their native Z.
+    (px - x).hypot(py - y)
+}
+
+#[cfg(test)]
+#[test]
+fn patrol_limits_new_targets_and_ends_pursuit_at_the_outer_boundary() {
+    let tracked = ObjectHandle {
+        slot: 1,
+        generation: 1,
+    };
+    let candidate = ObjectHandle {
+        slot: 2,
+        generation: 1,
+    };
+    let patrol = PatrolAttackLimit {
+        center: [500.0, 752.0],
+        radius: 150.0,
+        current_target: Some(tracked),
+    };
+    assert!(patrol.allows_target(candidate, [649.0, 752.0, 0.0]));
+    assert!(!patrol.allows_target(candidate, [650.0, 752.0, 0.0]));
+    assert!(patrol.allows_target(tracked, [650.0, 752.0, 0.0]));
+    assert!(patrol.allows_attack([710.0, 752.0, 0.0]));
+    assert!(!patrol.allows_attack([711.0, 752.0, 0.0]));
+    assert!(!patrol.allows_attack([650.0, 902.0, 0.0]));
 }
 
 fn turn_toward(pose: TransformState, [dx, dy]: [f32; 2], seconds: f32) -> (f32, f32) {

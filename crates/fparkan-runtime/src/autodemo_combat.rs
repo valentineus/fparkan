@@ -3,8 +3,10 @@ use super::{
     autodemo::MOBILE_UNIT,
     player_weapon::prepare_unit_weapons,
     projectile::{load_projectile, segment_sphere_fraction, unit_sphere},
-    projectile_terrain_hit, projectile_unit_hit, Engine, MissionAssets, MissionDocument,
-    MissionObjectDraft, ObjectHandle, PlayerProjectile, PlayerWeapons,
+    projectile_terrain_hit, projectile_unit_hit,
+    unit_patrol::UnitPatrol,
+    Engine, MissionAssets, MissionDocument, MissionObjectDraft, ObjectHandle, PlayerProjectile,
+    PlayerWeapons,
 };
 use fparkan_vfs::Vfs;
 use fparkan_world::{identity_metadata, transform_state};
@@ -224,6 +226,7 @@ impl AutoDemoCombat {
         &self,
         world: &fparkan_world::World,
         assets: &MissionAssets,
+        patrol: Option<&UnitPatrol>,
     ) -> Vec<(ObjectHandle, CombatTarget)> {
         let live: Vec<_> = self
             .units
@@ -232,17 +235,29 @@ impl AutoDemoCombat {
                 let owner = identity_metadata(world, unit.handle).ok()?.owner_id?;
                 let state = transform_state(world, unit.handle).ok()?;
                 let (center, radius) = unit_sphere(assets, unit.index, state)?;
-                Some((unit.handle, usize::from(owner.0), center, radius))
+                Some((
+                    unit.handle,
+                    usize::from(owner.0),
+                    center,
+                    radius,
+                    state.position.map(f32::from_bits),
+                ))
             })
             .collect();
         live.iter()
-            .filter_map(|&(handle, clan, from, _)| {
+            .filter_map(|&(handle, clan, from, _, position)| {
+                let limit = patrol.and_then(|patrol| patrol.attack_limit(handle));
+                if limit.is_some_and(|limit| !limit.allows_attack(position)) {
+                    return None;
+                }
                 let (enemy, center, radius, distance) = live
                     .iter()
-                    .filter_map(|&(enemy, other, to, radius)| {
+                    .filter_map(|&(enemy, other, to, radius, target_position)| {
                         let distance = (to[0] - from[0]).hypot(to[1] - from[1]);
                         (enemy != handle
                             && distance <= ATTACK_RANGE
+                            && limit
+                                .is_none_or(|limit| limit.allows_target(enemy, target_position))
                             && self.hostile.get(clan)?.get(other) == Some(&true))
                         .then_some((enemy, to, radius, distance))
                     })
@@ -312,7 +327,11 @@ impl AutoDemoCombat {
         let Some(mission) = &engine.loaded else {
             return (events, unavailable);
         };
-        let targets = self.targets(&engine.world, &mission.mission_assets);
+        let targets = self.targets(
+            &engine.world,
+            &mission.mission_assets,
+            mission.unit_patrol.as_ref(),
+        );
         for unit in &mut self.units {
             // shortcut: armed AI units defend their position while their Init is incomplete.
             let owner = identity_metadata(&engine.world, unit.handle)

@@ -2646,7 +2646,7 @@ pub fn step_headless(
                 .autodemo_combat
                 .as_ref()
                 .map_or_else(Vec::new, |combat| {
-                    combat.targets(&engine.world, &mission.mission_assets)
+                    combat.targets(&engine.world, &mission.mission_assets, Some(patrol))
                 });
             Some(patrol.prepare(&engine.world, &mission.terrain, queue_time_ms, &targets))
         })
