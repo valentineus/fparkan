@@ -209,6 +209,8 @@ pub enum ScriptInitResolveError {
     Handler19(Handler19ResolveError),
     /// The clan-count query has unsupported operands, control, or result type.
     UnsupportedClanCount,
+    /// A conditional scope cannot be evaluated with the current cells.
+    UnsupportedCondition,
     /// A formula record has an unsupported control word.
     UnsupportedFormulaControlWord {
         /// Raw disk word at index 3.
@@ -262,6 +264,9 @@ impl std::fmt::Display for ScriptInitResolveError {
                 formatter,
                 "Handler(31) requires an unconditional query with DWORD operands and result"
             ),
+            Self::UnsupportedCondition => {
+                write!(formatter, "unsupported comparison operands in Init")
+            }
             Self::UnsupportedFormulaControlWord { found } => write!(
                 formatter,
                 "unsupported formula control word 0x{found:08x}; expected 0x6 or 0xffffffff"
@@ -848,7 +853,20 @@ impl VarSet {
             writes: Vec::new(),
             stopped_at: None,
         };
+        let mut conditions = Vec::new();
         for (instruction_index, instruction) in event.instructions.iter().enumerate() {
+            match advance_condition(&mut conditions, instruction, &values) {
+                Ok(EventInstruction::Skip) => continue,
+                Ok(EventInstruction::Return) => break,
+                Ok(EventInstruction::Execute) => {}
+                Err(()) => {
+                    prefix.stopped_at = Some((
+                        instruction_index,
+                        ScriptInitResolveError::UnsupportedCondition,
+                    ));
+                    break;
+                }
+            }
             let writes = match self.resolve_init_instruction(
                 instruction,
                 input,
@@ -1097,34 +1115,14 @@ impl VarSet {
     ) -> Result<(), (usize, String)> {
         let mut conditions = Vec::new();
         for (index, instruction) in event.instructions.iter().enumerate() {
-            let active = conditions.last().copied().unwrap_or(true);
+            match advance_condition(&mut conditions, instruction, values)
+                .map_err(|()| (index, "unsupported comparison operands".into()))?
+            {
+                EventInstruction::Skip => continue,
+                EventInstruction::Return => break,
+                EventInstruction::Execute => {}
+            }
             let control = instruction.header_words[3];
-            match control {
-                0 => {
-                    let condition = if active {
-                        mission_condition(instruction, values)
-                            .ok_or_else(|| (index, "unsupported comparison operands".into()))?
-                    } else {
-                        false
-                    };
-                    conditions.push(condition);
-                    continue;
-                }
-                1 => {
-                    conditions.pop();
-                    continue;
-                }
-                2 => continue,
-                _ => {}
-            }
-            // The VM gates ordinary actions and branches. Immediate writes
-            // have their own switch case and still run inside a false branch.
-            if !active && matches!(control, u32::MAX | 3..=5) {
-                continue;
-            }
-            if control == 5 {
-                break;
-            }
             if instruction.dispatch_selector() != ScriptDispatchSelector::Sentinel {
                 if control != u32::MAX {
                     return Err((index, format!("unsupported handler control {control}")));
@@ -1752,9 +1750,61 @@ fn varset_value_as_f32(type_name: VarSetType, value: VarSetDefault) -> Option<f3
     }
 }
 
+enum EventInstruction {
+    Execute,
+    Skip,
+    Return,
+}
+
+fn advance_condition(
+    conditions: &mut Vec<bool>,
+    instruction: &ScriptInstruction,
+    values: &[VarSetDefault],
+) -> Result<EventInstruction, ()> {
+    let active = conditions.last().copied().unwrap_or(true);
+    Ok(match instruction.header_words[3] {
+        0 if instruction.dispatch_selector() == ScriptDispatchSelector::Sentinel => {
+            conditions.push(active && mission_condition(instruction, values).ok_or(())?);
+            EventInstruction::Skip
+        }
+        1 if instruction.dispatch_selector() == ScriptDispatchSelector::Sentinel => {
+            conditions.pop();
+            EventInstruction::Skip
+        }
+        2 if instruction.dispatch_selector() == ScriptDispatchSelector::Sentinel => {
+            EventInstruction::Skip
+        }
+        u32::MAX | 3..=5 if !active => EventInstruction::Skip,
+        5 if instruction.dispatch_selector() == ScriptDispatchSelector::Sentinel => {
+            EventInstruction::Return
+        }
+        // Immediate writes run even inside a false branch.
+        _ => EventInstruction::Execute,
+    })
+}
+
 fn mission_condition(instruction: &ScriptInstruction, values: &[VarSetDefault]) -> Option<bool> {
-    let (lhs, rhs) = instruction.dword_pair(values)?;
-    match instruction.header_words[4] {
+    let &[left, right] = instruction.references.as_slice() else {
+        return None;
+    };
+    let lhs = *values.get(left as usize)?;
+    let rhs = *values.get(right as usize)?;
+    let comparison = instruction.header_words[4];
+    match (lhs, rhs) {
+        (VarSetDefault::Dword(lhs), VarSetDefault::Dword(rhs)) => compare(comparison, lhs, rhs),
+        (VarSetDefault::FloatBits(lhs), rhs) => {
+            let rhs = match rhs {
+                VarSetDefault::Dword(rhs) => rhs as f32,
+                VarSetDefault::FloatBits(rhs) => f32::from_bits(rhs),
+            };
+            compare(comparison, f32::from_bits(lhs), rhs)
+        }
+        _ => None,
+    }
+}
+
+fn compare<T: PartialOrd>(comparison: u32, lhs: T, rhs: T) -> Option<bool> {
+    match comparison {
         0 => Some(lhs < rhs),
         1 => Some(lhs == rhs),
         2 => Some(lhs > rhs),
@@ -3332,6 +3382,54 @@ STRING( 8, ignored, ignored, ignored)\r\n";
             }
         );
         assert!(formulas.evaluate_numeric_literal(0).is_err());
+    }
+
+    #[test]
+    fn init_float_condition_only_gates_formula_write() {
+        let varset = parse_varset(
+            b"VAR(float, fDifficulty, 0.5)\nVAR(float, f0, 0)\nVAR(DWORD, target, 0)\n",
+        )
+        .unwrap();
+        let branch = ScriptInstruction {
+            header_words: [u32::MAX, u32::MAX, u32::MAX, 0, 3, 2, u32::MAX],
+            references: vec![0, 1],
+        };
+        let close = ScriptInstruction {
+            header_words: [u32::MAX, u32::MAX, u32::MAX, 1, 6, 0, u32::MAX],
+            references: Vec::new(),
+        };
+        let immediate = ScriptInstruction {
+            header_words: [u32::MAX, 2, 100, 6, 6, 0, u32::MAX],
+            references: Vec::new(),
+        };
+        let package = init_package(vec![
+            branch.clone(),
+            init_formula_assignment(2, 0),
+            immediate,
+            close,
+        ]);
+        let formulas = one_formula(b"50");
+        let prefix = varset
+            .resolve_init_prefix(&package, init_input(), Some(&formulas))
+            .unwrap()
+            .unwrap();
+        assert_eq!(prefix.stopped_at, None);
+        assert_eq!(
+            prefix.writes,
+            [ScriptInitWrite {
+                index: 2,
+                value: VarSetDefault::Dword(100)
+            }]
+        );
+        let mut package = package;
+        package.events[0].instructions[0].header_words[4] = 2;
+        let prefix = varset
+            .resolve_init_prefix(&package, init_input(), Some(&formulas))
+            .unwrap()
+            .unwrap();
+        assert_eq!(prefix.stopped_at, None);
+        assert_eq!(prefix.writes.len(), 2);
+        assert_eq!(prefix.writes[0].value, VarSetDefault::Dword(50));
     }
 
     #[test]
