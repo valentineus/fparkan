@@ -246,7 +246,9 @@ impl AutoDemoCombat {
             .collect();
         live.iter()
             .filter_map(|&(handle, clan, from, _, position)| {
-                if patrol.is_some_and(|patrol| patrol.is_shut_down(handle)) {
+                if patrol.is_some_and(|patrol| {
+                    patrol.is_shut_down(handle) || patrol.is_moving_to_destination(handle)
+                }) {
                     return None;
                 }
                 let limit = patrol.and_then(|patrol| patrol.attack_limit(world, handle));

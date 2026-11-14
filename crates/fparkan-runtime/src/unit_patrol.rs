@@ -26,6 +26,7 @@ struct PatrollingUnit {
     handle: ObjectHandle,
     center: [f32; 2],
     center_object: Option<ObjectHandle>,
+    destinations: Option<VecDeque<[f32; 2]>>,
     radius: f32,
     points: VecDeque<[f32; 2]>,
     retry_ms: u32,
@@ -154,7 +155,11 @@ impl UnitPatrol {
             .retain(|unit| transform_state(world, unit.handle).is_ok());
         if let Some(unit) = self.units.iter_mut().find(|unit| unit.handle == handle) {
             unit.raid_factory = None;
-            if unit.center_object.take().is_some() || unit.center != center || unit.radius != radius
+            let was_moving = unit.destinations.take().is_some();
+            if unit.center_object.take().is_some()
+                || was_moving
+                || unit.center != center
+                || unit.radius != radius
             {
                 unit.center = center;
                 unit.radius = radius;
@@ -168,6 +173,7 @@ impl UnitPatrol {
             handle,
             center,
             center_object: None,
+            destinations: None,
             radius,
             points: VecDeque::new(),
             retry_ms: 0,
@@ -175,6 +181,32 @@ impl UnitPatrol {
             raid_factory: None,
         });
         true
+    }
+
+    pub(super) fn move_to(
+        &mut self,
+        world: &World,
+        handle: ObjectHandle,
+        destination: [f32; 2],
+        append: bool,
+    ) {
+        if append {
+            if let Some(destinations) = self
+                .units
+                .iter_mut()
+                .find(|unit| unit.handle == handle)
+                .and_then(|unit| unit.destinations.as_mut())
+            {
+                destinations.push_back(destination);
+                return;
+            }
+        }
+        self.order(world, handle, destination, 60.0);
+        if let Some(unit) = self.units.iter_mut().find(|unit| unit.handle == handle) {
+            unit.destinations = Some(VecDeque::from([destination]));
+            unit.points.clear();
+            unit.retry_ms = 0;
+        }
     }
 
     pub(super) fn order_around_object(
@@ -211,6 +243,12 @@ impl UnitPatrol {
 
     pub(super) fn is_shut_down(&self, handle: ObjectHandle) -> bool {
         self.shut_down.contains(&handle)
+    }
+
+    pub(super) fn is_moving_to_destination(&self, handle: ObjectHandle) -> bool {
+        self.units
+            .iter()
+            .any(|unit| unit.handle == handle && unit.destinations.is_some())
     }
 
     pub(super) fn raid_factory(&self, handle: ObjectHandle) -> Option<(ObjectHandle, usize)> {
@@ -264,6 +302,7 @@ impl UnitPatrol {
                 handle,
                 center,
                 center_object: None,
+                destinations: None,
                 radius: 150.0,
                 points: VecDeque::new(),
                 retry_ms: 0,
@@ -289,7 +328,12 @@ impl UnitPatrol {
         targets: &[(ObjectHandle, CombatTarget)],
     ) -> Result<PreparedPatrol, EngineError> {
         let mut state = self.clone();
-        state.units.retain(|unit| unit.center(world).is_some());
+        state.units.retain(|unit| {
+            unit.destinations
+                .as_ref()
+                .is_none_or(|items| !items.is_empty())
+                && unit.center(world).is_some()
+        });
         let seconds = now_ms.saturating_sub(state.clock_ms) as f32 * 0.001;
         state.clock_ms = state.clock_ms.max(now_ms);
         let mut poses = Vec::new();
@@ -301,6 +345,19 @@ impl UnitPatrol {
                 continue;
             };
             let from = before.position.map(f32::from_bits);
+            if let Some(destinations) = &mut unit.destinations {
+                if destinations
+                    .front()
+                    .is_some_and(|[x, y]| (x - from[0]).hypot(y - from[1]) <= 0.05)
+                {
+                    destinations.pop_front();
+                    unit.points.clear();
+                    unit.retry_ms = 0;
+                }
+                if destinations.is_empty() {
+                    continue;
+                }
+            }
             let center = unit.center(world).expect("retained patrol center");
             if (center[0] - unit.center[0]).hypot(center[1] - unit.center[1]) >= unit.radius {
                 unit.center = center;
@@ -332,6 +389,17 @@ impl UnitPatrol {
             if (unit.points.is_empty() || enemy.is_some()) && now_ms >= unit.retry_ms {
                 unit.points = if let Some(enemy) = enemy {
                     route_points(terrain, from, enemy.center)?.unwrap_or_default()
+                } else if let Some(&[x, y]) =
+                    unit.destinations.as_ref().and_then(|items| items.front())
+                {
+                    // shortcut: route to the same XY using the terrain height until native Go arrival is wired.
+                    terrain
+                        .height_at([x, y])
+                        .map_err(EngineError::Terrain)?
+                        .map(|z| route_points(terrain, from, [x, y, z]))
+                        .transpose()?
+                        .flatten()
+                        .unwrap_or_default()
                 } else {
                     choose_route(terrain, from, center, unit.radius, &mut state.rng)?
                 };
@@ -439,6 +507,30 @@ fn object_patrol_tracks_its_center_and_ignores_repeated_orders() {
     );
     patrol.order(&world, actor, [0.0; 2], 60.0);
     assert_eq!(patrol.attack_limit(&world, actor).unwrap().center, [0.0; 2]);
+}
+
+#[cfg(test)]
+#[test]
+fn move_orders_append_and_replace_destinations() {
+    let mut world = fparkan_world::new(fparkan_world::WorldConfig::default());
+    let actor = fparkan_world::construct_object(
+        &mut world,
+        fparkan_world::ObjectDraft { original_id: None },
+    )
+    .unwrap();
+    fparkan_world::register_object(&mut world, actor).unwrap();
+    let mut patrol = UnitPatrol::scripted();
+    patrol.move_to(&world, actor, [10.0, 20.0], false);
+    patrol.move_to(&world, actor, [30.0, 40.0], true);
+    assert_eq!(
+        patrol.units[0].destinations,
+        Some(VecDeque::from([[10.0, 20.0], [30.0, 40.0]]))
+    );
+    patrol.move_to(&world, actor, [45.0, 50.0], false);
+    assert_eq!(
+        patrol.units[0].destinations,
+        Some(VecDeque::from([[45.0, 50.0]]))
+    );
 }
 
 fn distance_to_patrol([x, y]: [f32; 2], [px, py, _]: [f32; 3]) -> f32 {

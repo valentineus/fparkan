@@ -2446,6 +2446,7 @@ fn load_mission_with_options(
                 matches!(
                     order,
                     clan_script_init::InitOrder::Patrol(_)
+                        | clan_script_init::InitOrder::Move { .. }
                         | clan_script_init::InitOrder::Shutdown(_)
                 )
             }) || loaded_scripts
@@ -2539,6 +2540,30 @@ fn load_mission_with_options(
             }
             clan_script_init::InitOrder::Reserve { clan, id, reserved } => {
                 mission_events.set_reservation(&mission, &new_runtime_world, clan, id, reserved);
+            }
+            clan_script_init::InitOrder::Move {
+                id,
+                destination,
+                append,
+            } => {
+                let Some(patrol) = &mut unit_patrol else {
+                    continue;
+                };
+                if let Some(handle) = script_patrol::unit_by_logic_id(
+                    &mission,
+                    &object_drafts,
+                    &new_runtime_world,
+                    id,
+                    |class| class & autodemo::MOBILE_UNIT != 0 && class != HERO_UNIT_CLASS,
+                ) {
+                    patrol.move_to(
+                        &new_runtime_world,
+                        handle,
+                        destination.map(|axis| axis as f32),
+                        append,
+                    );
+                    eprintln!("sim_coverage script_move_approx=1 unit={} id={id} destination={destination:?} append={append}", handle.slot);
+                }
             }
             clan_script_init::InitOrder::Shutdown(id) => {
                 let Some(patrol) = &mut unit_patrol else {

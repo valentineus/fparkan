@@ -11,6 +11,18 @@ pub(super) fn warbot_by_logic_id(
     world: &World,
     id: u32,
 ) -> Option<ObjectHandle> {
+    unit_by_logic_id(mission, drafts, world, id, |class| {
+        class == crate::boarding::WARBOT_CLASS
+    })
+}
+
+pub(super) fn unit_by_logic_id(
+    mission: &MissionDocument,
+    drafts: &[MissionObjectDraft],
+    world: &World,
+    id: u32,
+    matches_class: impl Fn(u32) -> bool,
+) -> Option<ObjectHandle> {
     mission
         .objects
         .iter()
@@ -19,7 +31,7 @@ pub(super) fn warbot_by_logic_id(
         .find_map(|(index, (object, draft))| {
             (id != u32::MAX
                 && object.identity_or_clan_raw == id
-                && draft.unit_dat_header_flags == Some(crate::boarding::WARBOT_CLASS))
+                && draft.unit_dat_header_flags.is_some_and(&matches_class))
             .then(|| handle_by_original_id(world, OriginalObjectId(index as u32)))
             .flatten()
         })
