@@ -2220,6 +2220,48 @@ pub fn frame(engine: &mut Engine, queue_time_ms: u32) -> Result<FrameResult, Eng
     step_headless(engine, InputSnapshot, queue_time_ms)
 }
 
+/// Coverage entries for the subsystems still absent from the mission loop.
+pub const SIMULATION_COVERAGE: &str =
+    "sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 unit_behavior_stub=1";
+
+/// Totals from a headless mission coverage run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SimulationReport {
+    /// Number of completed steps.
+    pub ticks: u64,
+    /// Live objects after the last step.
+    pub live_objects: usize,
+    /// World events processed over the run.
+    pub world_events: u64,
+}
+
+/// Steps a freshly loaded mission from queue time zero at 60 Hz for coverage.
+///
+/// The sampling rate makes reports reproducible. The window uses elapsed time.
+///
+/// # Errors
+///
+/// Returns the first world or resource update error encountered during the run.
+pub fn simulate_mission_report(
+    engine: &mut Engine,
+    duration_ms: u32,
+) -> Result<SimulationReport, EngineError> {
+    let mut report = SimulationReport {
+        ticks: 0,
+        live_objects: loaded_mission(engine).map_or(0, |mission| mission.registered_objects),
+        world_events: 0,
+    };
+    let steps = (u64::from(duration_ms) * 60).div_ceil(1000);
+    for tick in 1..=steps {
+        let clock_ms = (tick * 1000 / 60).min(u64::from(duration_ms)) as u32;
+        let frame = frame(engine, clock_ms)?;
+        report.ticks = tick;
+        report.live_objects = frame.snapshot.objects.len();
+        report.world_events += frame.snapshot.events.len() as u64;
+    }
+    Ok(report)
+}
+
 /// Returns the loaded mission summary.
 #[must_use]
 pub fn loaded_mission(engine: &Engine) -> Option<&LoadedMission> {

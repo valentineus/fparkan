@@ -53,7 +53,7 @@ use fparkan_msh::{
     node38_fallback_hierarchy, node38_sampled_hierarchy, node38_sampled_hierarchy_at_times,
     selected_slot, Group, Lod, ModelAsset, NodeId, SlotId,
 };
-use fparkan_path::ResourceName;
+use fparkan_path::{normalize_relative, PathPolicy, ResourceName};
 use fparkan_platform_winit::{window_native_handles, WinitWindow, WinitWindowPlan};
 use fparkan_prototype::{unit_component_tree, PROTOTYPE_TYPE_EXTO};
 use fparkan_render::{
@@ -79,9 +79,10 @@ use fparkan_render_vulkan::{
 use fparkan_runtime::{
     create, frame as step_mission_frame, load_mission, load_mission_static_preview,
     load_mission_static_preview_roots, loaded_mission_assets, loaded_mission_object_drafts,
-    loaded_terrain, query_building_segment_world, BasementPlacementMode, BuildingMeshNode, Engine,
-    EngineServices, FrameResult, MissionAssets, MissionMode, MissionObjectDraft, MissionRequest,
-    MissionStartupInput,
+    loaded_terrain, query_building_segment_world, simulate_mission_report, BasementPlacementMode,
+    BuildingMeshNode, Engine, EngineError, EngineServices, FrameResult, LoadedMission,
+    MissionAssets, MissionMode, MissionObjectDraft, MissionRequest, MissionStartupInput,
+    SIMULATION_COVERAGE,
 };
 #[cfg(test)]
 use fparkan_terrain::BasementFoundationFragment;
@@ -89,10 +90,10 @@ use fparkan_terrain::{
     build_basement_foundations, BasementFootprint, BasementFoundation, BasementPlacement,
     FullSurfaceMask, SurfaceQuery, TerrainLod, TerrainMaterialLayers, TerrainWorld,
 };
-use fparkan_vfs::DirectoryVfs;
+use fparkan_vfs::{DirectoryVfs, Vfs};
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -121,11 +122,60 @@ fn main() {
 }
 
 fn run(args: &[String]) -> Result<String, String> {
-    let args = Args::parse(args)?;
-    let services = EngineServices::new(Arc::new(DirectoryVfs::new(&args.root)));
+    let mut args = Args::parse(args)?;
+    let vfs = Arc::new(DirectoryVfs::new(&args.root));
+    if args.list_missions {
+        return Ok(list_missions(vfs.as_ref())?
+            .iter()
+            .enumerate()
+            .map(|(index, path)| format!("{}\t{path}", index + 1))
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+    if args.mission.bytes().all(|byte| byte.is_ascii_digit()) {
+        let missions = list_missions(vfs.as_ref())?;
+        args.mission = args
+            .mission
+            .parse::<usize>()
+            .ok()
+            .and_then(|number| number.checked_sub(1))
+            .and_then(|index| missions.get(index))
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "mission number '{}' is out of range; use --list-missions",
+                    args.mission
+                )
+            })?;
+    }
+    let services = EngineServices::new(vfs);
     let mut engine = create(services).map_err(|err| err.to_string())?;
     let mission_assets_started = Instant::now();
-    let loaded = load_requested_mission(&mut engine, &args)?;
+    let loaded = match load_requested_mission(&mut engine, &args) {
+        Ok(loaded) => loaded,
+        Err(ref error @ EngineError::ScriptInitUnsupported { ref source, .. })
+            if args.sim_report_ms.is_some() =>
+        {
+            return Err(format!(
+                "sim_coverage script_init_unsupported=1 mission={} reason={source}\n{error}",
+                args.mission
+            ));
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    if let Some(duration_ms) = args.sim_report_ms {
+        let report = simulate_mission_report(&mut engine, duration_ms.get()).map_err(|error| {
+            format!(
+                "sim_coverage mission_step_failed=1 mission={}\n{error}",
+                loaded.key
+            )
+        })?;
+        return Ok(format!(
+            "simulation mission={} ticks={} queue_time_ms={} live_objects={} world_events={} init_states={}\n{SIMULATION_COVERAGE}",
+            loaded.key, report.ticks, duration_ms, report.live_objects, report.world_events,
+            loaded.script_init_state_count,
+        ));
+    }
     let mission_assets_duration = mission_assets_started.elapsed();
 
     let mission_assets = loaded_mission_assets(&engine)
@@ -211,10 +261,7 @@ fn run(args: &[String]) -> Result<String, String> {
     )
 }
 
-fn load_requested_mission(
-    engine: &mut Engine,
-    args: &Args,
-) -> Result<fparkan_runtime::LoadedMission, String> {
+fn load_requested_mission(engine: &mut Engine, args: &Args) -> Result<LoadedMission, EngineError> {
     let request = MissionRequest {
         key: args.mission.clone(),
         mode: if !args.viewer
@@ -243,7 +290,26 @@ fn load_requested_mission(
     } else {
         load_mission_static_preview_roots(engine, request, args.preview_roots)
     }
-    .map_err(|err| err.to_string())
+}
+
+fn list_missions(vfs: &dyn Vfs) -> Result<Vec<String>, String> {
+    let prefix = normalize_relative(b"MISSIONS", PathPolicy::StrictLegacy)
+        .expect("constant missions prefix");
+    let entries = vfs
+        .list(&prefix)
+        .map_err(|error| format!("list missions: {error}"))?;
+    Ok(entries
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .path
+                .as_bytes()
+                .rsplit(|byte| *byte == b'/')
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case(b"data.tma"))
+        })
+        .map(|entry| entry.path.as_str().to_string())
+        .collect())
 }
 
 /// Camera state used by the interactive world-space preview.
@@ -9491,7 +9557,7 @@ fn run_static_vulkan_mode(
     );
     app.mission_engine = mission_engine;
     if app.mission_engine.is_some() {
-        eprintln!("sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 live_render_state_stub=1 (full mission Init and world/resource ticks enabled)");
+        eprintln!("{SIMULATION_COVERAGE} live_render_state_stub=1");
     }
     if let Err(err) = event_loop.run_app(&mut app) {
         app.error = Some(format!("winit event loop: {err}"));
@@ -11190,6 +11256,8 @@ impl ApplicationHandler for StaticVulkanApp {
 struct Args {
     root: PathBuf,
     mission: String,
+    list_missions: bool,
+    sim_report_ms: Option<NonZeroU32>,
     viewer: bool,
     frames: u64,
     atmosphere_seconds: Option<f32>,
@@ -11207,6 +11275,8 @@ impl Args {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut root = None;
         let mut mission = None;
+        let mut list_missions = false;
+        let mut sim_report_ms = None;
         let mut viewer = false;
         // Zero means keep the interactive preview open until the user closes
         // it. A bounded `--frames N` remains available for smoke/readback
@@ -11228,6 +11298,22 @@ impl Args {
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             match arg.as_str() {
+                "--list-missions" => list_missions = true,
+                "--sim-report" => {
+                    let seconds = iter
+                        .next()
+                        .ok_or_else(|| "--sim-report requires seconds".to_string())?;
+                    sim_report_ms = Some(
+                        seconds
+                            .parse::<u32>()
+                            .ok()
+                            .and_then(|value| value.checked_mul(1000))
+                            .and_then(NonZeroU32::new)
+                            .ok_or_else(|| {
+                                "--sim-report requires 1..=4294967 whole seconds".to_string()
+                            })?,
+                    );
+                }
                 "--viewer" => viewer = true,
                 "--root" => {
                     root = Some(
@@ -11328,7 +11414,19 @@ impl Args {
             }
         }
         let root = root.ok_or_else(|| "missing --root".to_string())?;
-        let mission = mission.ok_or_else(|| "missing --mission".to_string())?;
+        let mission = match (list_missions, mission) {
+            (true, None) if sim_report_ms.is_none() => String::new(),
+            (true, _) => {
+                return Err(
+                    "--list-missions is separate from --mission and --sim-report".to_string(),
+                )
+            }
+            (false, Some(mission)) if !mission.is_empty() => mission,
+            (false, _) => return Err("missing --mission".to_string()),
+        };
+        if viewer && sim_report_ms.is_some() {
+            return Err("--sim-report requires mission runtime; remove viewer options".to_string());
+        }
         if control_clock_ms.is_some() && frames < 2 {
             return Err(
                 "--control-clock-ms requires --frames of at least 2 to replay the animation clock"
@@ -11344,6 +11442,8 @@ impl Args {
         Ok(Self {
             root,
             mission,
+            list_missions,
+            sim_report_ms,
             viewer,
             frames,
             atmosphere_seconds,
@@ -11360,7 +11460,7 @@ impl Args {
 }
 
 fn usage() -> String {
-    "usage: fparkan-game --root <path> --mission <path> [--viewer] [--frames <n>] [--atmosphere-seconds <seconds>] [--control-clock-ms <u32>] [--validation] [--preview-roots <non-zero n>] [--legacy-camera-capture <path>] [--static-animation-frame <u16>] [--static-material-phase <u16>] [--readback-out <path>] [--readback-sequence-out <directory>]\n--viewer skips mission simulation. Capture, static pose/material and root-limit options select viewer mode. --control-clock-ms replays the scene clock from zero to the selected time over the requested frames; --readback-sequence-out captures each submitted frame and requires that clock.".to_string()
+    "usage: fparkan-game --root <path> --list-missions\n       fparkan-game --root <path> --mission <number|path> --sim-report <seconds>\n       fparkan-game --root <path> --mission <number|path> [--viewer] [--frames <n>] [--atmosphere-seconds <seconds>] [--control-clock-ms <u32>] [--validation] [--preview-roots <non-zero n>] [--legacy-camera-capture <path>] [--static-animation-frame <u16>] [--static-material-phase <u16>] [--readback-out <path>] [--readback-sequence-out <directory>]\n--viewer skips mission simulation. Capture, static pose/material and root-limit options select viewer mode. --control-clock-ms replays the scene clock from zero to the selected time over the requested frames; --readback-sequence-out captures each submitted frame and requires that clock.".to_string()
 }
 
 #[cfg(test)]
@@ -13706,6 +13806,8 @@ mod tests {
             Ok(Args {
                 root: PathBuf::from("testdata/IS"),
                 mission: "MISSIONS/Autodemo.00/data.tma".to_string(),
+                list_missions: false,
+                sim_report_ms: None,
                 viewer: false,
                 frames: 3,
                 atmosphere_seconds: None,
@@ -13735,6 +13837,28 @@ mod tests {
         assert_eq!(parsed.preview_roots, NonZeroUsize::MAX);
         assert_eq!(parsed.static_animation_frame, None);
         assert_eq!(parsed.control_clock_ms, None);
+    }
+
+    #[test]
+    fn mission_listing_and_reports_parse_as_separate_modes() {
+        let list = Args::parse(&strings(&["--root", "testdata/IS", "--list-missions"])).unwrap();
+        assert!(list.list_missions);
+        let report = [
+            "--root",
+            "testdata/IS",
+            "--mission",
+            "2",
+            "--sim-report",
+            "1",
+        ];
+        let parsed = Args::parse(&strings(&report)).unwrap();
+        assert_eq!(parsed.sim_report_ms.map(NonZeroU32::get), Some(1000));
+        let mut conflicting = report.to_vec();
+        conflicting.push("--viewer");
+        assert!(Args::parse(&strings(&conflicting)).is_err());
+        conflicting[5] = "0";
+        conflicting.pop();
+        assert!(Args::parse(&strings(&conflicting)).is_err());
     }
 
     #[test]
