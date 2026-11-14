@@ -71,7 +71,10 @@ pub use mission_events::{
 pub use player_motion::{plan_player_motion, PlayerMotion, PlayerMotionStep};
 pub use player_status::{player_status, PlayerStatus};
 pub use player_weapon::{prepared_warbot_weapons, starting_player_weapons, PlayerWeapons};
-pub use production::{factory_schemes, order_factory_robot, order_factory_scheme};
+pub use production::{
+    clan_factory_schemes, factory_schemes, order_clan_factory_scheme, order_factory_robot,
+    order_factory_scheme,
+};
 pub use projectile::{
     apply_projectile_hit, load_player_projectile, projectile_terrain_hit, projectile_unit_hit,
     PlayerProjectile, ProjectileAssets, ProjectileContact,
@@ -18114,6 +18117,44 @@ mod tests {
             .unwrap();
         let draft = &loaded_mission_object_drafts(&engine).unwrap()[produced.object_index];
         assert!(draft.resource_name_raw.ends_with(b"scr_pre2.dat"));
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_two_fortresses_orders_remotely_from_the_starting_bunker() {
+        let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(licensed_root("IS")));
+        let mut engine = create(EngineServices::new(vfs)).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Single.01/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        let hero = starting_cockpit(&engine).unwrap();
+        let start = transform_state(&engine.world, hero.handle).unwrap();
+        let own = mission_object_handle(&engine, OriginalObjectId(5)).unwrap();
+        let enemy = mission_object_handle(&engine, OriginalObjectId(9)).unwrap();
+        assert!(factory_schemes(&engine, hero).is_err());
+        let choices = clan_factory_schemes(&engine, hero).unwrap();
+        assert_eq!(choices.len(), 2);
+        assert!(choices.iter().all(|(factory, _, _)| *factory == own));
+        assert!(order_clan_factory_scheme(&mut engine, hero, enemy, 0, 1).is_err());
+        let duration = order_clan_factory_scheme(&mut engine, hero, own, 1, 1).unwrap();
+        let result = frame(&mut engine, duration + 1)
+            .unwrap()
+            .produced_unit
+            .unwrap();
+        assert_eq!(result.clan, 0);
+        let draft = &loaded_mission_object_drafts(&engine).unwrap()[result.object_index];
+        assert!(draft.resource_name_raw.ends_with(b"scr_pre2.dat"));
+        assert_eq!(transform_state(&engine.world, hero.handle).unwrap(), start);
     }
 
     #[test]

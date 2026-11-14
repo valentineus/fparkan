@@ -283,9 +283,32 @@ pub fn factory_schemes(
     cockpit: StartingCockpit,
 ) -> Result<Vec<(usize, &str)>, EngineError> {
     let (mission, production) = loaded_production(engine)?;
-    let (plant, _, _, _) = factory_at_communicator(&engine.world, mission, production, cockpit)?;
+    let (plant, _) = factory_at_communicator(&engine.world, mission, production, cockpit)?;
+    Ok(schemes_for_plant(mission, production, plant).collect())
+}
+
+/// Lists the live factories of the player's clan and matching configured schemes.
+pub fn clan_factory_schemes(
+    engine: &Engine,
+    cockpit: StartingCockpit,
+) -> Result<Vec<(ObjectHandle, usize, &str)>, EngineError> {
+    let (mission, production) = loaded_production(engine)?;
+    let owner = player_owner(&engine.world, cockpit)?;
+    Ok(owned_factories(&engine.world, mission, production, owner)
+        .flat_map(|(index, factory, _)| {
+            schemes_for_plant(mission, production, index)
+                .map(move |(scheme, path)| (factory, scheme, path))
+        })
+        .collect())
+}
+
+fn schemes_for_plant<'a>(
+    mission: &'a LoadedMissionState,
+    production: &'a Production,
+    plant: usize,
+) -> impl Iterator<Item = (usize, &'a str)> + 'a {
     let plant_key = &mission.object_drafts[plant].unit_components[0].resource_raw;
-    Ok(production
+    production
         .schemes
         .iter()
         .enumerate()
@@ -294,7 +317,6 @@ pub fn factory_schemes(
             free_duration_ms(plant_key, &draft.unit_components[0].resource_raw)?;
             Some((index, path.as_str()))
         })
-        .collect())
 }
 
 /// Orders a particular configured scheme using the current friendly factory.
@@ -304,13 +326,30 @@ pub fn order_factory_scheme(
     scheme: usize,
     now_ms: u32,
 ) -> Result<u32, EngineError> {
+    let (mission, production) = loaded_production(engine)?;
+    let (_, plant) = factory_at_communicator(&engine.world, mission, production, cockpit)?;
+    order_clan_factory_scheme(engine, cockpit, plant, scheme, now_ms)
+}
+
+/// Places an order at a live factory owned by the player's clan.
+pub fn order_clan_factory_scheme(
+    engine: &mut Engine,
+    cockpit: StartingCockpit,
+    plant: ObjectHandle,
+    scheme: usize,
+    now_ms: u32,
+) -> Result<u32, EngineError> {
     let (Some(mission), Some(production)) = (&mut engine.loaded, &mut engine.production) else {
         return Err(EngineError::Production(
             "mission has no prepared robot design; use --build-scheme to choose one".into(),
         ));
     };
-    let (plant_index, plant, owner, is_free) =
-        factory_at_communicator(&engine.world, mission, production, cockpit)?;
+    let owner = player_owner(&engine.world, cockpit)?;
+    let (plant_index, _, is_free) = owned_factories(&engine.world, mission, production, owner)
+        .find(|&(_, handle, _)| handle == plant)
+        .ok_or_else(|| {
+            EngineError::Production("selected factory no longer belongs to the player".into())
+        })?;
     if production.pending.is_some() {
         return Err(EngineError::Production(
             "factory order already in progress".into(),
@@ -418,29 +457,45 @@ fn factory_at_communicator(
     mission: &LoadedMissionState,
     production: &Production,
     cockpit: StartingCockpit,
-) -> Result<(usize, ObjectHandle, OwnerId, bool), EngineError> {
-    let owner = identity_metadata(world, cockpit.handle)?
-        .owner_id
-        .ok_or_else(|| EngineError::Production("player clan is unavailable".into()))?;
+) -> Result<(usize, ObjectHandle), EngineError> {
+    let owner = player_owner(world, cockpit)?;
     let position = transform_state(world, cockpit.handle)?
         .position
         .map(f32::from_bits);
-    production
-        .plants
-        .iter()
-        .find_map(|&(index, slots)| {
-            let plant = handle_by_original_id(world, mission.object_drafts[index].original_id?)?;
-            (identity_metadata(world, plant).ok()?.owner_id == Some(owner)
-                && on_communicator(
-                    &mission.mission_assets,
-                    index,
-                    PLANT_CLASS,
-                    transform_state(world, plant).ok()?,
-                    position,
-                ))
-            .then_some((index, plant, owner, slots != 0))
+    owned_factories(world, mission, production, owner)
+        .find_map(|(index, plant, _)| {
+            on_communicator(
+                &mission.mission_assets,
+                index,
+                PLANT_CLASS,
+                transform_state(world, plant).ok()?,
+                position,
+            )
+            .then_some((index, plant))
         })
         .ok_or_else(|| EngineError::Production("stand on a friendly factory communicator".into()))
+}
+
+fn player_owner(world: &World, cockpit: StartingCockpit) -> Result<OwnerId, EngineError> {
+    identity_metadata(world, cockpit.handle)?
+        .owner_id
+        .ok_or_else(|| EngineError::Production("player clan is unavailable".into()))
+}
+
+fn owned_factories<'a>(
+    world: &'a World,
+    mission: &'a LoadedMissionState,
+    production: &'a Production,
+    owner: OwnerId,
+) -> impl Iterator<Item = (usize, ObjectHandle, bool)> + 'a {
+    production.plants.iter().filter_map(move |&(index, slots)| {
+        let plant = handle_by_original_id(world, mission.object_drafts[index].original_id?)?;
+        (identity_metadata(world, plant).ok()?.owner_id == Some(owner)).then_some((
+            index,
+            plant,
+            slots != 0,
+        ))
+    })
 }
 
 fn production_error(error: impl std::fmt::Display) -> EngineError {

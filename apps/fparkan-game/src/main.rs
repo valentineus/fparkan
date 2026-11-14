@@ -10044,8 +10044,15 @@ const PLAYER_MOVEMENT_KEYS: [KeyCode; 6] = [
 
 #[derive(Default)]
 struct FactoryMenu {
-    choices: Vec<(usize, String)>,
+    choices: Vec<FactoryChoice>,
     selected: usize,
+}
+
+#[derive(Clone)]
+struct FactoryChoice {
+    factory: Option<ObjectHandle>,
+    scheme: usize,
+    name: String,
 }
 
 impl FactoryMenu {
@@ -10056,11 +10063,16 @@ impl FactoryMenu {
     }
 
     fn title(&self) -> String {
+        let choice = &self.choices[self.selected];
+        let factory = choice.factory.map_or_else(
+            || "Завод".to_owned(),
+            |factory| format!("Завод №{}", factory.slot + 1),
+        );
         format!(
-            "Завод — {}/{} {} · ↑/↓ выбор · B или Enter заказ · Esc отмена",
+            "{factory} — {}/{} {} · ↑/↓ выбор · B или Enter заказ · Esc отмена",
             self.selected + 1,
             self.choices.len(),
-            self.choices[self.selected].1,
+            choice.name,
         )
     }
 }
@@ -11251,12 +11263,31 @@ impl StaticVulkanApp {
                 let selected = if let Some(menu) = self.factory_menu.take() {
                     Some(menu.choices[menu.selected].clone())
                 } else {
-                    match fparkan_runtime::factory_schemes(engine, cockpit) {
+                    let local = fparkan_runtime::factory_schemes(engine, cockpit);
+                    let remote = local.is_err();
+                    let choices = local
+                        .map(|choices| {
+                            choices
+                                .into_iter()
+                                .map(|(index, path)| (None, index, path))
+                                .collect()
+                        })
+                        .or_else(|_| {
+                            fparkan_runtime::clan_factory_schemes(engine, cockpit).map(|choices| {
+                                choices
+                                    .into_iter()
+                                    .map(|(factory, index, path)| (Some(factory), index, path))
+                                    .collect::<Vec<_>>()
+                            })
+                        });
+                    match choices {
                         Ok(choices) => {
                             let mut choices = choices
                                 .into_iter()
-                                .map(|(index, path)| {
-                                    (index, path.rsplit('/').next().unwrap_or(path).to_owned())
+                                .map(|(factory, scheme, path)| FactoryChoice {
+                                    factory,
+                                    scheme,
+                                    name: path.rsplit('/').next().unwrap_or(path).to_owned(),
                                 })
                                 .collect::<Vec<_>>();
                             match choices.len() {
@@ -11265,7 +11296,7 @@ impl StaticVulkanApp {
                                         Some("Завод — нет подходящих схем".into());
                                     None
                                 }
-                                1 => choices.pop(),
+                                1 if !remote => choices.pop(),
                                 _ => {
                                     self.factory_menu = Some(FactoryMenu {
                                         choices,
@@ -11284,16 +11315,31 @@ impl StaticVulkanApp {
                         }
                     }
                 };
-                if let Some((index, name)) = selected {
-                    match fparkan_runtime::order_factory_scheme(
-                        engine,
-                        cockpit,
-                        index,
-                        control_clock_ms,
-                    ) {
+                if let Some(FactoryChoice {
+                    factory,
+                    scheme,
+                    name,
+                }) = selected
+                {
+                    let order = match factory {
+                        Some(factory) => fparkan_runtime::order_clan_factory_scheme(
+                            engine,
+                            cockpit,
+                            factory,
+                            scheme,
+                            control_clock_ms,
+                        ),
+                        None => fparkan_runtime::order_factory_scheme(
+                            engine,
+                            cockpit,
+                            scheme,
+                            control_clock_ms,
+                        ),
+                    };
+                    match order {
                         Ok(duration) => {
                             self.factory_status = Some(format!("Завод — собирается {name}"));
-                            eprintln!("factory_order scheme={name} minimum_ms={duration} queue_time_ms={control_clock_ms}");
+                            eprintln!("factory_order scheme={name} remote={} minimum_ms={duration} queue_time_ms={control_clock_ms}", factory.is_some());
                         }
                         Err(error) => {
                             self.factory_status = Some("Завод — заказ отклонён".into());
