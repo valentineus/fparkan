@@ -662,7 +662,7 @@ fn choose_route(
     Ok(VecDeque::new())
 }
 
-fn route_points(
+pub(super) fn route_points(
     terrain: &TerrainWorld,
     from: [f32; 3],
     goal: [f32; 3],

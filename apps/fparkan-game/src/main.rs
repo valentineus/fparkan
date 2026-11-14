@@ -7769,10 +7769,13 @@ fn mission_basement_footprints(
 ) -> Result<Vec<MissionBasementFootprint>, String> {
     let mut footprints = Vec::new();
     for (object_index, mission_root) in roots.iter().enumerate() {
-        // shortcut: deployed mines lack a live BAS cut until terrain can
+        // shortcut: newly built structures lack a live BAS cut until terrain can
         // rebuild the affected cells when a building enters the world.
         if mission_root.raw_after_resource == u32::MAX
-            && mission_root.unit_dat_header_flags == Some(0x8000_0004)
+            && matches!(
+                mission_root.unit_dat_header_flags,
+                Some(0x8000_0004 | 0x8010_0000 | 0x8020_0000)
+            )
         {
             continue;
         }

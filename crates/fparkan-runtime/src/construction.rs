@@ -1,0 +1,420 @@
+use crate::autodemo::spawn_prepared_unit;
+use crate::{LoadedMissionState, MissionScriptBundle};
+use fparkan_path::ResourceName;
+use fparkan_script::ScriptDispatchSelector;
+use fparkan_terrain::SurfaceQuery;
+use fparkan_world::{
+    handle_by_original_id, identity_metadata, transform_state, ObjectHandle, OwnerId, World,
+};
+
+pub(super) const BUILDER_CLASS: u32 = 0x0100_4000;
+const SLOTS_PER_CLASS: usize = 3;
+const WAIT_MS: u32 = 1_000;
+const ARRIVAL_RADIUS: f32 = 1.0;
+
+pub(super) fn reserve_schemes(
+    categories: &[crate::BuildCategory],
+    bundles: &[MissionScriptBundle],
+) -> Vec<ResourceName> {
+    let enabled = bundles.iter().any(|bundle| {
+        bundle.package.events.iter().any(|event| {
+            event.name_raw == b"PBM_BUILDING_NEEDED_Start\0"
+                && event.instructions.iter().any(|instruction| {
+                    instruction.dispatch_selector() == ScriptDispatchSelector::Handler(18)
+                })
+        })
+    });
+    // shortcut: prepare the defensive tower schemes exercised by the site query.
+    categories
+        .iter()
+        .filter(move |category| enabled && matches!(category.mask, 0x8010_0000 | 0x8020_0000))
+        .filter_map(|category| category.unit_paths.first())
+        .flat_map(|path| (0..SLOTS_PER_CLASS).map(move |_| crate::resource_name(path.as_bytes())))
+        .collect()
+}
+
+#[derive(Default)]
+pub(super) struct Construction {
+    first_slot: usize,
+    controls: Vec<crate::MissionControlDeviceTableState>,
+    tasks: Vec<Task>,
+}
+
+struct Task {
+    builder: ObjectHandle,
+    owner: OwnerId,
+    slot: usize,
+    position: [f32; 3],
+    cost: f32,
+    arrived_at: Option<u32>,
+}
+
+impl Construction {
+    pub(super) fn new(
+        first_slot: usize,
+        controls: Vec<crate::MissionControlDeviceTableState>,
+    ) -> Self {
+        Self {
+            first_slot,
+            controls,
+            tasks: Vec::new(),
+        }
+    }
+
+    pub(super) fn active(&self, builder: ObjectHandle) -> bool {
+        self.tasks.iter().any(|task| task.builder == builder)
+    }
+
+    fn available_slot(
+        &self,
+        world: &World,
+        drafts: &[crate::MissionObjectDraft],
+        class: u32,
+    ) -> Option<usize> {
+        (self.first_slot..self.first_slot + self.controls.len()).find(|&index| {
+            let draft = &drafts[index];
+            draft.unit_dat_header_flags == Some(class)
+                && draft
+                    .original_id
+                    .is_some_and(|id| handle_by_original_id(world, id).is_none())
+                && !self.tasks.iter().any(|task| task.slot == index)
+        })
+    }
+
+    fn start(
+        &mut self,
+        builder: ObjectHandle,
+        owner: OwnerId,
+        slot: usize,
+        position: [f32; 3],
+        cost: f32,
+    ) {
+        self.tasks.push(Task {
+            builder,
+            owner,
+            slot,
+            position,
+            cost,
+            arrived_at: None,
+        });
+    }
+}
+
+pub(super) fn order(
+    construction: &mut Construction,
+    patrol: &mut Option<crate::unit_patrol::UnitPatrol>,
+    world: &World,
+    terrain: &fparkan_terrain::TerrainWorld,
+    mission: &crate::MissionDocument,
+    drafts: &[crate::MissionObjectDraft],
+    ores: &[crate::BehaviorOreState],
+    research: &crate::research::FreeResearch,
+    vfs: Option<&dyn fparkan_vfs::Vfs>,
+    builder: Option<ObjectHandle>,
+    owner: OwnerId,
+    class: u32,
+    xy: [u32; 2],
+) -> Result<(), String> {
+    let builder = builder.ok_or("builder is unavailable")?;
+    if construction.active(builder) {
+        return Err("builder is busy".into());
+    }
+    if patrol
+        .as_ref()
+        .is_some_and(|patrol| patrol.is_shut_down(builder))
+    {
+        return Err("builder is shut down".into());
+    }
+    let cargo = ores
+        .iter()
+        .find(|ore| ore.handle == builder && ore.class_flags == BUILDER_CLASS)
+        .ok_or("unit has no builder ore state")?;
+    let slot = construction
+        .available_slot(world, drafts, class)
+        .ok_or("no free prepared tower slot")?;
+    let table = crate::research::load_technology_table(
+        vfs.ok_or("no clan technology provider")?,
+        mission,
+        owner,
+    )
+    .map_err(|err| err.to_string())?;
+    let cost = crate::production::scheme_cost(&drafts[slot].unit_components, &table, |row| {
+        research.learned.contains(&(owner, row))
+    })
+    .map_err(|err| err.to_string())?
+    .ore;
+    let stock = f32::from_bits(cargo.current_ore_bits);
+    // shortcut: require ore onboard until the builder can fetch it from a warehouse.
+    if !stock.is_finite() || stock < cost {
+        return Err("builder has insufficient ore".into());
+    }
+    let from = transform_state(world, builder)
+        .map_err(|err| err.to_string())?
+        .position
+        .map(f32::from_bits);
+    let position = destination(terrain, from, xy).ok_or("no route to the building site")?;
+    patrol
+        .get_or_insert_with(crate::unit_patrol::UnitPatrol::scripted)
+        .move_to(world, builder, [position[0], position[1]], false);
+    construction.start(builder, owner, slot, position, cost);
+    Ok(())
+}
+
+pub(super) fn tick(mission: &mut LoadedMissionState, world: &mut World, now_ms: u32) {
+    let mut index = 0;
+    while let Some(task) = mission.construction.tasks.get_mut(index) {
+        let owned =
+            identity_metadata(world, task.builder).is_ok_and(|id| id.owner_id == Some(task.owner));
+        let running = !mission
+            .unit_patrol
+            .as_ref()
+            .is_some_and(|patrol| patrol.is_shut_down(task.builder));
+        let mut finish = false;
+        if let Some(pose) = transform_state(world, task.builder)
+            .ok()
+            .filter(|_| owned && running)
+        {
+            let [x, y, _] = pose.position.map(f32::from_bits);
+            let [a, b, _] = task.position;
+            if (x - a).hypot(y - b) > ARRIVAL_RADIUS {
+                task.arrived_at = None;
+                if mission
+                    .unit_patrol
+                    .as_ref()
+                    .is_some_and(|patrol| patrol.is_moving_to_destination(task.builder))
+                {
+                    index += 1;
+                    continue;
+                }
+            } else {
+                let arrived_at = *task.arrived_at.get_or_insert(now_ms);
+                if now_ms.wrapping_sub(arrived_at) < WAIT_MS {
+                    index += 1;
+                    continue;
+                }
+                finish = true;
+            }
+        }
+        let task = mission.construction.tasks.remove(index);
+        if let Some(patrol) = &mut mission.unit_patrol {
+            patrol.clear_move(task.builder);
+        }
+        if finish {
+            if let Err(error) = complete(mission, world, &task) {
+                eprintln!(
+                    "script_building_construction_failed clan={} builder={} reason={error}",
+                    task.owner.0, task.builder.slot
+                );
+            }
+        }
+    }
+}
+
+fn complete(
+    mission: &mut LoadedMissionState,
+    world: &mut World,
+    task: &Task,
+) -> Result<(), crate::EngineError> {
+    let index = crate::behavior_ore_index_for_handle(&mission.behavior_ore_states, task.builder)
+        .map_err(crate::EngineError::Production)?;
+    let stock = f32::from_bits(mission.behavior_ore_states[index].current_ore_bits);
+    if !stock.is_finite() || stock < task.cost {
+        return Err(crate::EngineError::Production(
+            "builder has insufficient ore".into(),
+        ));
+    }
+    let [x, y, _] = task.position;
+    if !crate::construction_site::building_centers(world, &mission.object_drafts)
+        .all(|other| crate::construction_site::separated([x, y], other))
+    {
+        return Err(crate::EngineError::Production(
+            "building site is occupied".into(),
+        ));
+    }
+    let draft = &mission.object_drafts[task.slot];
+    let id = draft.original_id.expect("prepared building has an ID");
+    let class = draft
+        .unit_dat_header_flags
+        .expect("prepared building has a class");
+    let profile = mission
+        .behavior_profiles
+        .iter()
+        .position(|profile| profile.original_id == id);
+    let control =
+        mission.construction.controls[task.slot - mission.construction.first_slot].clone();
+    let handle = spawn_prepared_unit(
+        world,
+        mission,
+        task.slot,
+        task.owner.0,
+        task.position,
+        control,
+    )?;
+    mission.behavior_ore_states[index].current_ore_bits = (stock - task.cost).to_bits();
+    mission
+        .behavior_ore_states
+        .retain(|ore| ore.original_id != id);
+    mission
+        .behavior_ore_states
+        .push(crate::initialize_behavior_ore_state(id, handle, class, &[]));
+    if let Some(profile) = profile {
+        mission.behavior_profiles[profile].handle = handle;
+    }
+    if let Some(distributor) = mission.behavior_distributors.get_mut(task.owner.0 as usize) {
+        distributor
+            .registered_objects
+            .retain(|entry| entry.original_id != id);
+        crate::add_behavior_registered_object(
+            distributor,
+            crate::BehaviorRegisteredObject {
+                original_id: id,
+                handle,
+                selector: u32::from(task.owner.0),
+                class_flags: class,
+                share: 0.0,
+                native_tail: [0; 5],
+            },
+        );
+    }
+    mission
+        .mission_events
+        .issue_logic_id(&mission.mission, world, handle);
+    eprintln!(
+        "script_building_constructed clan={} builder={} building={} class={class:#010x}",
+        task.owner.0, task.builder.slot, handle.slot
+    );
+    Ok(())
+}
+
+fn destination(
+    terrain: &fparkan_terrain::TerrainWorld,
+    from: [f32; 3],
+    xy: [u32; 2],
+) -> Option<[f32; 3]> {
+    let [x, y] = xy.map(|x| x as f32);
+    let position = [x, y, terrain.height_at([x, y]).ok()??];
+    crate::unit_patrol::route_points(terrain, from, position).ok()??;
+    Some(position)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        create, load_gameplay_mission, EngineServices, MissionMode, MissionRequest,
+        MissionStartupInput,
+    };
+    use fparkan_vfs::DirectoryVfs;
+    use std::sync::Arc;
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn tower_order_rejects_unresearched_parts_and_spawns_when_available() {
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").unwrap();
+        let vfs = Arc::new(DirectoryVfs::new(root));
+        let mut engine = create(EngineServices::new(vfs.clone())).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Single.01/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        let owner = OwnerId(1);
+        let class = 0x8010_0000;
+        let mission = engine.loaded.as_mut().unwrap();
+        let builder_ore = mission
+            .behavior_ore_states
+            .iter()
+            .position(|ore| {
+                ore.class_flags == BUILDER_CLASS
+                    && identity_metadata(&engine.world, ore.handle)
+                        .is_ok_and(|id| id.owner_id == Some(owner))
+            })
+            .unwrap();
+        let builder = mission.behavior_ore_states[builder_ore].handle;
+        let site = crate::construction_site::SiteReservations::default()
+            .find(
+                &mission.terrain,
+                &engine.world,
+                &mission.object_drafts,
+                &mission.mine_sites,
+                mission.mission.clans[1].anchor.map(f32::round_ties_even),
+                7_000,
+            )
+            .unwrap();
+        let slot = mission
+            .construction
+            .available_slot(&engine.world, &mission.object_drafts, class)
+            .unwrap();
+        let id = mission.object_drafts[slot].original_id.unwrap();
+        let order_for = |mission: &mut LoadedMissionState, world: &World| {
+            order(
+                &mut mission.construction,
+                &mut mission.unit_patrol,
+                world,
+                &mission.terrain,
+                &mission.mission,
+                &mission.object_drafts,
+                &mission.behavior_ore_states,
+                &mission.free_research,
+                Some(vfs.as_ref()),
+                Some(builder),
+                owner,
+                class,
+                site,
+            )
+        };
+        assert!(order_for(mission, &engine.world)
+            .unwrap_err()
+            .contains("unavailable for construction"));
+        let table =
+            crate::research::load_technology_table(vfs.as_ref(), &mission.mission, owner).unwrap();
+        // Set up a supplied builder after testing the unchanged mission's research gate.
+        for component in &mission.object_drafts[slot].unit_components {
+            if let Some(row) = table.find_key(&component.resource_raw).unwrap() {
+                mission.free_research.learned.insert((owner, row));
+            }
+        }
+        assert_eq!(
+            order_for(mission, &engine.world).unwrap_err(),
+            "builder has insufficient ore"
+        );
+        let stock_before = 2000.0_f32;
+        mission.behavior_ore_states[builder_ore].current_ore_bits = stock_before.to_bits();
+        order_for(mission, &engine.world).unwrap();
+        assert!(mission.construction.active(builder));
+        assert!(handle_by_original_id(&engine.world, id).is_none());
+        let cost = mission.construction.tasks[0].cost;
+        assert_eq!(cost, 1100.0);
+        let pose = transform_state(&engine.world, builder).unwrap();
+        fparkan_world::set_transform(
+            &mut engine.world,
+            builder,
+            fparkan_world::TransformState {
+                position: mission.construction.tasks[0].position.map(f32::to_bits),
+                ..pose
+            },
+        )
+        .unwrap();
+        tick(mission, &mut engine.world, 8_000);
+        assert!(handle_by_original_id(&engine.world, id).is_none());
+        tick(mission, &mut engine.world, 9_000);
+        let building = handle_by_original_id(&engine.world, id).unwrap();
+        assert_eq!(
+            identity_metadata(&engine.world, building).unwrap().owner_id,
+            Some(owner)
+        );
+        assert_eq!(
+            f32::from_bits(mission.behavior_ore_states[builder_ore].current_ore_bits),
+            stock_before - cost
+        );
+        assert!(!mission.construction.active(builder));
+    }
+}

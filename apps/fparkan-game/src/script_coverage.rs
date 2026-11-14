@@ -50,6 +50,14 @@ pub(super) fn log_clan_ai_stops(report: &SimulationReport) {
             "sim_coverage script_building_site_approx={count} clan={clan} class={class:#010x}"
         );
     }
+    for &(clan, builder, class, accepted, rejected) in &report.script_construction_orders {
+        if accepted != 0 {
+            eprintln!("sim_coverage script_building_order_approx={accepted} clan={clan} builder={builder} class={class:#010x}");
+        }
+        if rejected != 0 {
+            eprintln!("sim_coverage script_building_rejected={rejected} clan={clan} builder={builder} class={class:#010x}");
+        }
+    }
     for &(clan, count) in &report.script_capturer_queries {
         eprintln!("sim_coverage script_nearest_capturer_approx={count} clan={clan}");
     }

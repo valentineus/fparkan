@@ -51,6 +51,7 @@ mod clan_problem_conditions;
 mod clan_script_init;
 mod clan_targeting;
 mod clan_transport_schemes;
+mod construction;
 mod construction_site;
 mod mesh_collision;
 mod mining;
@@ -1365,6 +1366,7 @@ struct LoadedMissionState {
     mission_events: MissionEvents,
     clan_ai_events: clan_ai_events::ClanAiEvents,
     mine_sites: Vec<mining::MineSite>,
+    construction: construction::Construction,
     unit_patrol: Option<unit_patrol::UnitPatrol>,
     player_pitch_bits: u32,
     boarding: Option<boarding::Boarding>,
@@ -1989,6 +1991,13 @@ fn load_mission_with_options(
             std::iter::repeat_with(|| resource_name(scheme.as_str().as_bytes()))
                 .take(production::RESERVE_SLOTS),
         );
+    }
+    let construction_reserve_start = graph_roots.len();
+    if options.start_autodemo && request.mode == MissionMode::SingleMission {
+        graph_roots.extend(construction::reserve_schemes(
+            &build_categories,
+            &loaded_scripts.bundles,
+        ));
     }
     let mine_reserve_start = graph_roots.len();
     let mine_scheme = (options.start_autodemo && request.mode == MissionMode::SingleMission)
@@ -2654,6 +2663,10 @@ fn load_mission_with_options(
         Vec::new()
     };
     let mine_controls = reserve_controls.split_off(mine_reserve_start - reserve_start);
+    let construction_controls =
+        reserve_controls.split_off(construction_reserve_start - reserve_start);
+    let construction =
+        construction::Construction::new(construction_reserve_start, construction_controls);
     for (site, control) in mine_sites.iter_mut().zip(mine_controls) {
         site.control = Some(control);
     }
@@ -2667,7 +2680,7 @@ fn load_mission_with_options(
                 player_scheme_count,
                 transport_schemes,
                 reserve_controls,
-                &object_drafts[..mine_reserve_start],
+                &object_drafts[..construction_reserve_start],
             )?),
         )
     } else {
@@ -2723,6 +2736,7 @@ fn load_mission_with_options(
         mission_events,
         clan_ai_events,
         mine_sites,
+        construction,
         unit_patrol,
         player_pitch_bits: 0,
         boarding: None,
@@ -2955,6 +2969,7 @@ pub struct SimulationReport {
     pub script_factory_patrol_continues: Vec<(usize, u32, u64)>,
     pub script_ore_transport_orders: Vec<(usize, u32, u64)>,
     pub script_building_site_queries: Vec<(usize, u32, u64)>,
+    pub script_construction_orders: Vec<(usize, u32, u32, u64, u64)>,
     pub script_capturer_queries: Vec<(usize, u64)>,
     pub script_capture_approaches: Vec<(u32, u32, u64)>,
     /// First factory completion by clan, in milliseconds.
@@ -3008,6 +3023,7 @@ pub fn simulate_mission_report(
         script_factory_patrol_continues: Vec::new(),
         script_ore_transport_orders: Vec::new(),
         script_building_site_queries: Vec::new(),
+        script_construction_orders: Vec::new(),
         script_capturer_queries: Vec::new(),
         script_capture_approaches: Vec::new(),
         first_factory_completion_ms: Default::default(),
@@ -3116,6 +3132,9 @@ pub fn simulate_mission_report(
         report
             .script_building_site_queries
             .extend(loaded.clan_ai_events.building_site_queries());
+        report
+            .script_construction_orders
+            .extend(loaded.clan_ai_events.construction_orders());
         report
             .script_capturer_queries
             .extend(loaded.clan_ai_events.capturer_queries());

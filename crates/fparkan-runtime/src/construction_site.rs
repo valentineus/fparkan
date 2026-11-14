@@ -6,6 +6,28 @@ use crate::{mining::MineSite, MissionObjectDraft};
 #[derive(Default)]
 pub(super) struct SiteReservations(Vec<([u32; 2], u32)>);
 
+pub(super) fn building_centers<'a>(
+    world: &'a World,
+    drafts: &'a [MissionObjectDraft],
+) -> impl Iterator<Item = [f32; 2]> + 'a {
+    drafts.iter().filter_map(|draft| {
+        if draft.unit_dat_header_flags? & 0x8000_0000 == 0 {
+            return None;
+        }
+        let handle = handle_by_original_id(world, draft.original_id?)?;
+        registration_sequence(world, handle).ok()??;
+        let [x, y, _] = transform_state(world, handle)
+            .ok()?
+            .position
+            .map(f32::from_bits);
+        Some([x, y])
+    })
+}
+
+pub(super) fn separated([x, y]: [f32; 2], [a, b]: [f32; 2]) -> bool {
+    (x - a).trunc().hypot((y - b).trunc()) >= 250.0
+}
+
 impl SiteReservations {
     pub(super) fn find(
         &mut self,
@@ -18,18 +40,7 @@ impl SiteReservations {
     ) -> Option<[u32; 2]> {
         self.0
             .retain(|&(_, time)| now_ms.wrapping_sub(time) <= 60_000);
-        let occupied = drafts.iter().filter_map(|draft| {
-            if draft.unit_dat_header_flags? & 0x8000_0000 == 0 {
-                return None;
-            }
-            let handle = handle_by_original_id(world, draft.original_id?)?;
-            registration_sequence(world, handle).ok()??;
-            let [x, y, _] = transform_state(world, handle)
-                .ok()?
-                .position
-                .map(f32::from_bits);
-            Some([x, y])
-        });
+        let occupied = building_centers(world, drafts);
         let deposits = mines.iter().filter_map(|site| {
             let [x, y, _] = site.position;
             site.live_mine(world).is_none().then_some([x, y])
@@ -68,12 +79,7 @@ fn find_site(
             let (sin, cos) = f64::from(angle).sin_cos();
             let x = base_x + (radius * cos).trunc() as f32;
             let y = base_y + (radius * sin).trunc() as f32;
-            if x > 0.0
-                && y > 0.0
-                && occupied
-                    .iter()
-                    .all(|&[a, b]| (x - a).trunc().hypot((y - b).trunc()) >= 250.0)
-            {
+            if x > 0.0 && y > 0.0 && occupied.iter().all(|&other| separated([x, y], other)) {
                 let corners = [
                     [x + 75.0, y + 75.0],
                     [x - 75.0, y - 75.0],

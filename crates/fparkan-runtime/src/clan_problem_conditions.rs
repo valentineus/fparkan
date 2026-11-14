@@ -8,7 +8,7 @@ pub(super) enum Condition {
     BuildingCaptured(ObjectHandle),
     GroupDestroyed,
     GroupIdle,
-    TransportInactive(ObjectHandle),
+    TaskInactive(ObjectHandle),
 }
 
 impl Condition {
@@ -18,7 +18,7 @@ impl Condition {
         clan: OwnerId,
         patrol: Option<&UnitPatrol>,
         group: Option<&CombatGroup>,
-        transport_active: impl Fn(ObjectHandle) -> bool,
+        task_active: impl Fn(ObjectHandle) -> bool,
     ) -> bool {
         let live =
             |unit| registration_sequence(world, unit).is_ok_and(|sequence| sequence.is_some());
@@ -32,7 +32,7 @@ impl Condition {
             Self::GroupDestroyed => {
                 group.is_none_or(|group| group.members.iter().all(|&unit| !live(unit)))
             }
-            Self::TransportInactive(unit) => !live(unit) || !transport_active(unit),
+            Self::TaskInactive(unit) => !live(unit) || !task_active(unit),
             Self::GroupIdle => group.is_none_or(|group| {
                 group.members.iter().all(|&unit| {
                     !live(unit) || patrol.is_none_or(|patrol| !patrol.is_patrolling(unit))

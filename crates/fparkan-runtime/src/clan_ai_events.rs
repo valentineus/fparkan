@@ -82,6 +82,7 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) {
     let Some(loaded) = &mut engine.loaded else {
         return;
     };
+    crate::construction::tick(loaded, &mut engine.world, now_ms);
     loaded.clan_ai_events.groups.retain(|&(clan, _), group| {
         if !identity_metadata(&engine.world, group.target)
             .is_ok_and(|identity| identity.owner_id == group.target_owner)
@@ -130,7 +131,7 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) {
                 OwnerId(clan as u16),
                 loaded.unit_patrol.as_ref(),
                 group,
-                |unit| ai.transports.iter().any(|(job, task)| *job == (clan, key) && task.unit == unit),
+                |unit| loaded.construction.active(unit) || ai.transports.iter().any(|(job, task)| *job == (clan, key) && task.unit == unit),
             )
         });
         if ready {
@@ -157,7 +158,12 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) {
             .as_ref()
             .is_some_and(|production| production.is_building_at(*plant, OwnerId(*clan)))
     });
-    for order in loaded.tick_clan_ai_events(&engine.world, engine.production.as_ref(), now_ms) {
+    for order in loaded.tick_clan_ai_events(
+        &engine.world,
+        engine.production.as_ref(),
+        engine.services.vfs.as_deref(),
+        now_ms,
+    ) {
         match crate::production::order_script_factory(
             engine,
             order.owner,
@@ -235,6 +241,7 @@ pub(super) struct ClanAiEvents {
     wait_starts: BTreeMap<(usize, u32), u64>,
     building_sites: crate::construction_site::SiteReservations,
     building_site_queries: BTreeMap<(usize, u32), u64>,
+    construction_orders: BTreeMap<(usize, u32, u32), (u64, u64)>,
     patrol_continues: BTreeMap<(usize, u32), u64>,
     group_orders: BTreeMap<(usize, u32), u64>,
 }
@@ -244,6 +251,7 @@ impl LoadedMissionState {
         &mut self,
         world: &World,
         production: Option<&crate::production::Production>,
+        vfs: Option<&dyn fparkan_vfs::Vfs>,
         now_ms: u32,
     ) -> Vec<ScriptFactoryOrder> {
         let mut orders = Vec::new();
@@ -540,12 +548,36 @@ impl LoadedMissionState {
                                 .declarations
                                 .resolve_handler15_with_values(instruction, values)
                                 .map_err(|error| error.to_string())?;
-                            if matches!((order.word_1, order.word_2, order.target),
-                                (7, 3, Handler15TargetPayload::ByPlace { .. })) {
-                                return Err(format!(
-                                    "ORDER_ROBOT_BUILD needs prepared scheme and builder task (builder={} class={:#010x})",
-                                    order.word_0, order.word_3,
-                                ));
+                            if let (7, 3, Handler15TargetPayload::ByPlace { first, second }) =
+                                (order.word_1, order.word_2, order.target)
+                            {
+                                if !problem.as_ref().is_some_and(|p| p.key.word_0 == BUILDING_NEEDED)
+                                    || !matches!(order.word_3, 0x8010_0000 | 0x8020_0000)
+                                {
+                                    return Err("ORDER_ROBOT_BUILD requires a supported defensive tower scheme".into());
+                                }
+                                let owner = OwnerId(clan as u16);
+                                let builder = self.mission_events.logic_objects(&self.mission, world, order.word_0)
+                                    .find(|&handle| identity_metadata(world, handle).is_ok_and(|identity| identity.owner_id == Some(owner)));
+                                let result = crate::construction::order(
+                                    &mut self.construction, &mut self.unit_patrol, world, &self.terrain, &self.mission,
+                                    &self.object_drafts, &self.behavior_ore_states, &self.free_research,
+                                    vfs, builder, owner, order.word_3, [first, second],
+                                );
+                                let rates = self.clan_ai_events.construction_orders.entry((clan, order.word_0, order.word_3)).or_default();
+                                match result {
+                                    Ok(()) => {
+                                        rates.0 += 1;
+                                        eprintln!("sim_coverage script_building_order_approx=1 clan={clan} builder={} class={:#010x} site=[{first}, {second}]", order.word_0, order.word_3);
+                                    }
+                                    Err(ref reason) => {
+                                        rates.1 += 1;
+                                        if rates.1 == 1 {
+                                            eprintln!("sim_coverage script_building_rejected=1 clan={clan} builder={} class={:#010x} reason={reason}", order.word_0, order.word_3);
+                                        }
+                                    }
+                                }
+                                return Ok(Some(VarSetDefault::Dword(u32::from(result.is_ok()))));
                             }
                             if let (6, 3, Handler15TargetPayload::NotDefined(_), Some(problem)) =
                                 (order.word_1, order.word_2, order.target, problem.as_ref())
@@ -732,11 +764,11 @@ impl LoadedMissionState {
                             };
                             let key = problem.as_ref().expect("condition requires a problem").key;
                             let condition = match (action, mode) {
-                                (2, 0) if key.word_0 == OPTIMAL_TRANSPORT && solving => {
+                                (2, 0) if key.word_0 == BUILDING_NEEDED || (key.word_0 == OPTIMAL_TRANSPORT && solving) => {
                                     let unit = assignment.filter(|&unit| self.mission_events
                                         .logic_objects(&self.mission, world, id).any(|handle| handle == unit))
-                                        .ok_or("Handler(27) transport wait requires the assigned unit")?;
-                                    Some(Condition::TransportInactive(unit))
+                                        .ok_or("Handler(27) task wait requires the assigned unit")?;
+                                    Some(Condition::TaskInactive(unit))
                                 }
                                 (1 | 3, 0) if matches!(key.word_0, 7 | 9) || (action == 1 && key.word_0 == BUILDING_PROTECT) => {
                                     let target = crate::mission_events::placed_logic_objects(
@@ -1233,6 +1265,16 @@ impl ClanAiEvents {
         self.building_site_queries
             .iter()
             .map(|(&(clan, class), &count)| (clan, class, count))
+    }
+
+    pub(super) fn construction_orders(
+        &self,
+    ) -> impl Iterator<Item = (usize, u32, u32, u64, u64)> + '_ {
+        self.construction_orders
+            .iter()
+            .map(|(&(clan, unit, class), &(accepted, rejected))| {
+                (clan, unit, class, accepted, rejected)
+            })
     }
 
     pub(super) fn set_base_radius(&mut self, clan: usize, limit: f32) {

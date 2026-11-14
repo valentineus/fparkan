@@ -86,8 +86,8 @@ struct Order {
 }
 
 #[derive(Default)]
-struct Cost {
-    ore: f32,
+pub(super) struct Cost {
+    pub(super) ore: f32,
     power: f32,
 }
 
@@ -614,7 +614,7 @@ fn production_error(error: impl std::fmt::Display) -> EngineError {
     EngineError::Production(error.to_string())
 }
 
-fn scheme_cost(
+pub(super) fn scheme_cost(
     records: &[UnitComponentRecord],
     research: &ResearchTrfDocument,
     learned: impl Fn(usize) -> bool,
