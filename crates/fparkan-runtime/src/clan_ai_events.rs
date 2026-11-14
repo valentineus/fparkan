@@ -1,7 +1,7 @@
 use crate::{BehaviorOreState, LoadedMissionState, MissionEventStop};
 use fparkan_script::{
-    Handler15TargetPayload, Handler2Record, Handler2RecordInput, Handler2RecordScheduler,
-    ScriptDispatchSelector, VarSet, VarSetDefault,
+    Handler15TargetPayload, Handler2Record, Handler2RecordInput, Handler2RecordKey,
+    Handler2RecordScheduler, ScriptDispatchSelector, VarSet, VarSetDefault,
 };
 use fparkan_world::{identity_metadata, registration_sequence, ObjectHandle, OwnerId, World};
 use std::collections::BTreeMap;
@@ -13,12 +13,21 @@ pub(super) struct ScriptFactoryOrder {
     pub owner: OwnerId,
     pub plant: ObjectHandle,
     pub class: u32,
+    problem: Handler2RecordKey,
+    wait_for_factory: bool,
 }
 
 pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) {
     let Some(loaded) = &mut engine.loaded else {
         return;
     };
+    let active = &mut loaded.clan_ai_events.factory_jobs;
+    active.retain(|((clan, _), plant)| {
+        engine
+            .production
+            .as_ref()
+            .is_some_and(|production| production.is_building_at(*plant, OwnerId(*clan)))
+    });
     for order in loaded.tick_clan_ai_events(&engine.world, now_ms) {
         match crate::production::order_script_factory(
             engine,
@@ -36,6 +45,10 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) {
                 *ai.factory_orders
                     .entry((order.owner.0, order.plant.slot))
                     .or_default() += 1;
+                if order.wait_for_factory {
+                    ai.factory_jobs
+                        .push(((order.owner.0, order.problem), order.plant));
+                }
                 eprintln!(
                     "script_factory_order_approx clan={} plant={} duration_ms={duration} queue_time_ms={now_ms}",
                     order.owner.0, order.plant.slot,
@@ -71,6 +84,7 @@ pub(super) struct ClanAiEvents {
     problems: BTreeMap<usize, Handler2RecordScheduler>,
     started: BTreeMap<(usize, u32), u64>,
     factory_orders: BTreeMap<(u16, u32), u64>,
+    factory_jobs: Vec<((u16, Handler2RecordKey), ObjectHandle)>,
     factory_rejections: BTreeMap<(u16, u32), u64>,
 }
 
@@ -110,11 +124,12 @@ impl LoadedMissionState {
             else {
                 continue;
             };
-            let mut next = Some((event_index, event, None));
+            let mut next = Some((event_index, event, None::<Handler2Record>));
             let mut pending = Vec::new();
             while let Some((event_index, event, problem)) = next.take() {
                 let mut solved = false;
                 let mut assignment = None;
+                let mut solving = false;
                 let result = varset.declarations.execute_event_prefix(
                     event,
                     bundle.formula_table.as_ref(),
@@ -225,6 +240,11 @@ impl LoadedMissionState {
                                 owner,
                                 plant,
                                 class: order.word_3,
+                                problem: problem
+                                    .as_ref()
+                                    .expect("factory order requires a current problem")
+                                    .key,
+                                wait_for_factory: false,
                             });
                             // shortcut: queue the order for the host to apply after this script pass.
                             Ok(Some(VarSetDefault::Dword(1)))
@@ -252,10 +272,56 @@ impl LoadedMissionState {
                             Ok(None)
                         }
                         ScriptDispatchSelector::Handler(8) if problem.is_some() => {
-                            if single_dword(&instruction.references, values) != Some(2) {
-                                return Err("Handler(8) only supports ST_SOLVED".into());
+                            match single_dword(&instruction.references, values) {
+                                Some(1)
+                                    if problem
+                                        .as_ref()
+                                        .is_some_and(|record| record.key.word_0 == 6) =>
+                                {
+                                    solving = true
+                                }
+                                Some(2) => solved = true,
+                                _ => {
+                                    return Err(
+                                        "Handler(8) requires a supported problem transition".into(),
+                                    )
+                                }
                             }
-                            solved = true;
+                            Ok(None)
+                        }
+                        ScriptDispatchSelector::Handler(27) if solving => {
+                            let [action, mode, id] = instruction.references.as_slice() else {
+                                return Err("Handler(27) requires an action and target".into());
+                            };
+                            let word = |index: u32| {
+                                values.get(index as usize).and_then(|cell| cell.as_dword())
+                            };
+                            let (Some(2), Some(0), Some(id)) =
+                                (word(*action), word(*mode), word(*id))
+                            else {
+                                return Err(
+                                    "Handler(27) only supports waiting for a factory".into()
+                                );
+                            };
+                            let order = orders
+                                .last_mut()
+                                .filter(|order| {
+                                    order.owner == OwnerId(clan as u16)
+                                        && Some(order.problem)
+                                            == problem.as_ref().map(|record| record.key)
+                                })
+                                .ok_or("Handler(27) requires an active construction order")?;
+                            if assignment != Some(order.plant)
+                                || !crate::mission_events::placed_logic_objects(
+                                    &self.mission,
+                                    world,
+                                    id,
+                                )
+                                .any(|target| target == order.plant)
+                            {
+                                return Err("Handler(27) requires the assigned factory".into());
+                            }
+                            order.wait_for_factory = true;
                             Ok(None)
                         }
                         ScriptDispatchSelector::Handler(14) if problem.is_some() => {
@@ -449,6 +515,14 @@ impl LoadedMissionState {
                 }
                 // shortcut: retry unresolved Starts until decay and Continue are wired.
                 while let Some(problem) = pending.pop() {
+                    if self
+                        .clan_ai_events
+                        .factory_jobs
+                        .iter()
+                        .any(|&(key, _)| key == (clan as u16, problem.key))
+                    {
+                        continue;
+                    }
                     let problem_id = problem.key.word_0;
                     let Some(kind) = varset.declarations.declarations.iter().find(|entry| {
                         entry.name.starts_with("PBM_")

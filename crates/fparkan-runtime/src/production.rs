@@ -133,6 +133,12 @@ impl PaidOrder {
 }
 
 impl Production {
+    pub(super) fn is_building_at(&self, plant: ObjectHandle, owner: OwnerId) -> bool {
+        self.pending
+            .iter()
+            .any(|order| order.plant == plant && order.owner == owner)
+    }
+
     pub(super) fn new(
         reserve_start: usize,
         schemes: Vec<NormalizedPath>,
@@ -730,6 +736,7 @@ mod tests {
             "{report:?}"
         );
         assert!(!report.first_factory_completion_ms.contains_key(&0));
+        assert!(report.script_factory_rejections.is_empty(), "{report:?}");
         let cockpit = super::super::starting_cockpit(&engine).unwrap();
         let factory = handle_by_original_id(&engine.world, OriginalObjectId(5)).unwrap();
         let duration = order_clan_factory_scheme(&mut engine, cockpit, factory, 0, 40_000).unwrap();
