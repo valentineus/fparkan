@@ -9997,25 +9997,31 @@ fn mission_camera_coverage(cockpit: Option<StartingCockpit>, demo: bool) -> &'st
     if demo {
         "autodemo_camera_follow_approx=1 autodemo_camera_target_approx=1 cockpit_pose_approx=1"
     } else if cockpit.is_some() {
-        "player_motion_approx=1 cockpit_aim_approx=1 cockpit_pose_approx=1 player_weapon_cycle_approx=1 player_projectile_flight_approx=1 player_projectile_damage_approx=1 player_projectile_hull_stub=1 player_weapon_fx_stub=1 player_capture_approx=1 player_communicator_approx=1 player_building_floor_approx=1 player_boarding_approx=1"
+        "player_motion_approx=1 cockpit_aim_approx=1 cockpit_pose_approx=1 player_weapon_cycle_approx=1 player_projectile_flight_approx=1 player_projectile_damage_approx=1 player_projectile_hull_stub=1 player_weapon_fx_stub=1 player_capture_approx=1 player_communicator_approx=1 player_building_floor_approx=1 player_boarding_approx=1 player_vehicle_flight_approx=1"
     } else {
         "mission_camera_stub=1"
     }
 }
 
-fn player_arrow(physical: PhysicalKey, logical: &Key) -> Option<KeyCode> {
+const PLAYER_MOVEMENT_KEYS: [KeyCode; 6] = [
+    KeyCode::ArrowRight,
+    KeyCode::ArrowLeft,
+    KeyCode::ArrowUp,
+    KeyCode::ArrowDown,
+    KeyCode::PageUp,
+    KeyCode::PageDown,
+];
+
+fn player_movement_key(physical: PhysicalKey, logical: &Key) -> Option<KeyCode> {
     match logical {
         Key::Named(NamedKey::ArrowRight) => Some(KeyCode::ArrowRight),
         Key::Named(NamedKey::ArrowLeft) => Some(KeyCode::ArrowLeft),
         Key::Named(NamedKey::ArrowUp) => Some(KeyCode::ArrowUp),
         Key::Named(NamedKey::ArrowDown) => Some(KeyCode::ArrowDown),
+        Key::Named(NamedKey::PageUp) => Some(KeyCode::PageUp),
+        Key::Named(NamedKey::PageDown) => Some(KeyCode::PageDown),
         _ => match physical {
-            PhysicalKey::Code(
-                code @ (KeyCode::ArrowRight
-                | KeyCode::ArrowLeft
-                | KeyCode::ArrowUp
-                | KeyCode::ArrowDown),
-            ) => Some(code),
+            PhysicalKey::Code(code) if PLAYER_MOVEMENT_KEYS.contains(&code) => Some(code),
             _ => None,
         },
     }
@@ -10079,7 +10085,7 @@ struct StaticVulkanApp {
     pending_scene_update: Option<SceneFrameUpdate>,
     environment_primitive_count: usize,
     pressed_keys: HashSet<KeyCode>,
-    player_move_pressed: [bool; 4],
+    player_move_pressed: [bool; PLAYER_MOVEMENT_KEYS.len()],
     mouse_look: bool,
     player_mouse: [f32; 2],
     player_weapon_layouts: HashMap<usize, PlayerWeaponLayout>,
@@ -10213,7 +10219,7 @@ impl StaticVulkanApp {
             pending_scene_update: None,
             environment_primitive_count: 0,
             pressed_keys: HashSet::new(),
-            player_move_pressed: [false; 4],
+            player_move_pressed: Default::default(),
             mouse_look: false,
             player_mouse: [0.0; 2],
             player_weapon_layouts: HashMap::new(),
@@ -10913,7 +10919,7 @@ impl StaticVulkanApp {
     fn set_mission_paused_at(&mut self, paused: bool, now: Instant) {
         self.mission_paused = paused;
         self.player_mouse = [0.0; 2];
-        self.player_move_pressed = [false; 4];
+        self.player_move_pressed = Default::default();
         self.player_capture_pressed = false;
         self.player_build_pressed = false;
         self.player_mine_pressed = false;
@@ -11076,21 +11082,17 @@ impl StaticVulkanApp {
             (&self.mission_engine, self.cockpit, &self.demo_camera)
         {
             let pressed = std::mem::take(&mut self.player_move_pressed);
-            let [right, left, forward, back] = [
-                KeyCode::ArrowRight,
-                KeyCode::ArrowLeft,
-                KeyCode::ArrowUp,
-                KeyCode::ArrowDown,
-            ]
-            .map(|key| self.pressed_keys.contains(&key));
+            let [right, left, forward, back, climb, descend] = std::array::from_fn(|index| {
+                f32::from(
+                    pressed[index] || self.pressed_keys.contains(&PLAYER_MOVEMENT_KEYS[index]),
+                )
+            });
             if let Some(mut step) = plan_player_motion(
                 engine,
                 cockpit,
                 PlayerMotion {
-                    movement: [
-                        f32::from(right || pressed[0]) - f32::from(left || pressed[1]),
-                        f32::from(forward || pressed[2]) - f32::from(back || pressed[3]),
-                    ],
+                    movement: [right - left, forward - back],
+                    climb: climb - descend,
                     mouse_x,
                     mouse_y,
                     delta_seconds: clock.delta_seconds,
@@ -12350,7 +12352,7 @@ impl ApplicationHandler for StaticVulkanApp {
                 self.window_focused = focused;
                 if !focused {
                     self.pressed_keys.clear();
-                    self.player_move_pressed = [false; 4];
+                    self.player_move_pressed = Default::default();
                     self.player_capture_pressed = false;
                     self.player_build_pressed = false;
                     self.player_mine_pressed = false;
@@ -12383,7 +12385,7 @@ impl ApplicationHandler for StaticVulkanApp {
                     return;
                 }
                 let key = if self.cockpit.is_some() && self.demo_camera.is_none() {
-                    player_arrow(event.physical_key, &event.logical_key)
+                    player_movement_key(event.physical_key, &event.logical_key)
                         .map_or(event.physical_key, PhysicalKey::Code)
                 } else {
                     event.physical_key
@@ -12433,14 +12435,8 @@ impl ApplicationHandler for StaticVulkanApp {
                                     weapons.select(slot);
                                 }
                             }
-                            if let Some(index) = [
-                                KeyCode::ArrowRight,
-                                KeyCode::ArrowLeft,
-                                KeyCode::ArrowUp,
-                                KeyCode::ArrowDown,
-                            ]
-                            .iter()
-                            .position(|&key| key == code)
+                            if let Some(index) =
+                                PLAYER_MOVEMENT_KEYS.iter().position(|&key| key == code)
                             {
                                 self.player_move_pressed[index] = true;
                             }

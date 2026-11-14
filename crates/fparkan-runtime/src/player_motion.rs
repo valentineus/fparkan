@@ -6,6 +6,8 @@ use crate::TerrainWorld;
 pub struct PlayerMotion {
     /// Signed strafe and forward input in the range -1 to 1.
     pub movement: [f32; 2],
+    /// Signed climb input for a flying vehicle, in the range -1 to 1.
+    pub climb: f32,
     /// Relative horizontal mouse motion for this step.
     pub mouse_x: f32,
     /// Relative vertical mouse motion for this step, positive down.
@@ -19,6 +21,7 @@ pub struct PlayerMotion {
 pub struct PlayerMotionStep {
     pub(super) pose: TransformState,
     pub(super) pitch_bits: u32,
+    flying: bool,
     /// Sweep segment when the step translates the hero.
     pub sweep: Option<[[f32; 3]; 2]>,
 }
@@ -27,6 +30,9 @@ impl PlayerMotionStep {
     /// Vertical segment for finding a nearby building floor at the proposed XY.
     #[must_use]
     pub fn floor_probe(self) -> Option<[[f32; 3]; 2]> {
+        if self.flying {
+            return None;
+        }
         let [[_, _, start_z], [x, y, _]] = self.sweep?;
         // shortcut: fixed step and drop limits, until the hero collider is wired.
         Some([[x, y, start_z + 0.1], [x, y, start_z - 2.5]])
@@ -55,6 +61,7 @@ mod tests {
                 ..TransformState::default()
             },
             pitch_bits: 0,
+            flying: false,
             sweep: Some([[3.0, 6.0, 12.5], [4.0, 6.0, 15.5]]),
         };
         assert_eq!(
@@ -77,19 +84,48 @@ pub fn plan_player_motion(
     cockpit: StartingCockpit,
     input: PlayerMotion,
 ) -> Result<Option<PlayerMotionStep>, EngineError> {
-    if input.movement == [0.0; 2] && input.mouse_x == 0.0 && input.mouse_y == 0.0 {
-        return Ok(None);
-    }
     let (Some(mission), Ok(pose)) = (
         &engine.loaded,
         transform_state(&engine.world, cockpit.handle),
     ) else {
         return Ok(None);
     };
+    let flying = mission.boarding.is_some_and(|boarding| {
+        boarding.cockpit.handle == cockpit.handle
+            && mission
+                .object_drafts
+                .get(cockpit.object_index)
+                .and_then(|draft| draft.unit_components.first())
+                .is_some_and(|chassis| {
+                    let key = chassis.resource_raw.split(|&byte| byte == 0).next();
+                    // shortcut: use the stock flying chassis until Behavior's CanFly is wired.
+                    matches!(
+                        key,
+                        Some(
+                            b"R_T_02"
+                                | b"R_L_02"
+                                | b"R_L_05"
+                                | b"R_L_07"
+                                | b"R_M_02"
+                                | b"R_B_02"
+                                | b"R_B_07"
+                                | b"R_B_08"
+                        )
+                    )
+                })
+    });
+    if input.movement == [0.0; 2]
+        && (!flying || input.climb == 0.0)
+        && input.mouse_x == 0.0
+        && input.mouse_y == 0.0
+    {
+        return Ok(None);
+    }
     plan_motion(
         &mission.terrain,
         pose,
         f32::from_bits(mission.player_pitch_bits),
+        flying,
         input,
     )
     .map(Some)
@@ -99,6 +135,7 @@ fn plan_motion(
     terrain: &TerrainWorld,
     mut pose: TransformState,
     pitch: f32,
+    flying: bool,
     input: PlayerMotion,
 ) -> Result<PlayerMotionStep, EngineError> {
     let from = pose.position.map(f32::from_bits);
@@ -109,6 +146,7 @@ fn plan_motion(
         .chain([
             input.mouse_x,
             input.mouse_y,
+            input.climb,
             input.delta_seconds,
             yaw,
             pitch,
@@ -130,19 +168,53 @@ fn plan_motion(
         yaw
     };
     let [right, forward] = input.movement.map(|axis| axis.clamp(-1.0, 1.0));
-    let distance = 8.0 * input.delta_seconds / right.hypot(forward).max(1.0);
+    // shortcut: constant flight rates until thrust, clearance and inertia are measured.
+    let speed = if flying { 40.0 } else { 8.0 };
+    let distance = speed * input.delta_seconds / right.hypot(forward).max(1.0);
     let (sin, cos) = yaw.sin_cos();
     let xy = [
         from[0] + (cos * right - sin * forward) * distance,
         from[1] + (sin * right + cos * forward) * distance,
     ];
-    if !xy.iter().all(|axis| axis.is_finite()) {
+    let climb = if flying {
+        input.climb.clamp(-1.0, 1.0) * (16.0 * input.delta_seconds)
+    } else {
+        0.0
+    };
+    let altitude = from[2] + climb;
+    if !xy.iter().all(|axis| axis.is_finite()) || !altitude.is_finite() {
         return Err(EngineError::Movement(
             "player step exceeds finite coordinates".into(),
         ));
     }
     let mut sweep = None;
-    if xy != [from[0], from[1]] {
+    if flying && (xy != [from[0], from[1]] || climb != 0.0) {
+        let old_xy = [from[0], from[1]];
+        let floor = |xy| {
+            terrain
+                .height_at(xy)
+                .map_err(|err| EngineError::Movement(err.to_string()))
+        };
+        if let Some(old_height) = floor(old_xy)? {
+            let bottom = old_height + 0.02;
+            // A grounded machine can taxi. In the air, climb above an obstacle before crossing it.
+            let grounded = from[2] <= bottom && climb <= 0.0;
+            let floor_at_target = floor(xy)?.map(|height| height + 0.02);
+            let (accepted_xy, height) = match floor_at_target {
+                Some(floor) if grounded || floor <= altitude => (xy, floor),
+                _ => (old_xy, bottom),
+            };
+            let [x, y] = accepted_xy;
+            let to = [x, y, altitude.max(height)];
+            if to != from {
+                pose.position = to.map(f32::to_bits);
+                sweep = Some([
+                    [from[0], from[1], from[2] + 0.5],
+                    [to[0], to[1], to[2] + 0.5],
+                ]);
+            }
+        }
+    } else if xy != [from[0], from[1]] {
         if let (Some(old_ground), Some(new_ground)) = (
             terrain
                 .height_at([from[0], from[1]])
@@ -167,6 +239,7 @@ fn plan_motion(
     Ok(PlayerMotionStep {
         pose,
         pitch_bits: pitch.to_bits(),
+        flying,
         sweep,
     })
 }

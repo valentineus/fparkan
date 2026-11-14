@@ -17744,6 +17744,7 @@ mod tests {
         let original = transform_state(&engine.world, cockpit.handle).unwrap();
         let input = PlayerMotion {
             movement: [0.0, 1.0],
+            climb: 0.0,
             mouse_x: 100.0,
             mouse_y: -500.0,
             delta_seconds: 0.1,
@@ -17986,6 +17987,96 @@ mod tests {
                 "{tick:?}"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_teleport_helicopter_climbs_and_keeps_altitude() {
+        let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(licensed_root("IS")));
+        let mut engine = create(EngineServices::new(vfs)).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.04/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        let hero = starting_cockpit(&engine).unwrap();
+        let up = PlayerMotion {
+            climb: 1.0,
+            delta_seconds: 1.0,
+            ..PlayerMotion::default()
+        };
+        assert!(plan_player_motion(&engine, hero, up).unwrap().is_none());
+
+        let helicopter = mission_object_handle(&engine, OriginalObjectId(2)).unwrap();
+        let position = |engine: &Engine, cockpit: StartingCockpit| {
+            transform_state(&engine.world, cockpit.handle)
+                .unwrap()
+                .position
+                .map(f32::from_bits)
+        };
+        let mut pose = transform_state(&engine.world, hero.handle).unwrap();
+        let [hx, hy, _] = pose.position.map(f32::from_bits);
+        let [x, y, _] = transform_state(&engine.world, helicopter)
+            .unwrap()
+            .position
+            .map(f32::from_bits);
+        let yaw = (y - hy).atan2(x - hx) - std::f32::consts::FRAC_PI_2;
+        pose.orientation[2] = yaw.to_bits();
+        set_transform(&mut engine.world, hero.handle, pose).unwrap();
+        let walk = PlayerMotion {
+            movement: [0.0, 1.0],
+            delta_seconds: 0.1,
+            ..PlayerMotion::default()
+        };
+        for tick in 1..=45 {
+            let step = plan_player_motion(&engine, hero, walk).unwrap().unwrap();
+            frame_with_player_motion(&mut engine, tick * 100, hero, step, false).unwrap();
+        }
+        let vehicle = board_friendly_warbot(&mut engine).unwrap().unwrap();
+        assert_eq!(vehicle.handle, helicopter);
+        let [x, y, z] = position(&engine, vehicle);
+        let step = plan_player_motion(&engine, vehicle, up).unwrap().unwrap();
+        assert!(step.sweep.is_some());
+        assert!(step.floor_probe().is_none());
+        frame_with_player_motion(&mut engine, 5_500, vehicle, step, false).unwrap();
+        assert_eq!(position(&engine, vehicle), [x, y, z + 16.0]);
+        assert_eq!(position(&engine, hero), [x, y, z + 16.0]);
+
+        let forward = PlayerMotion {
+            climb: 0.0,
+            movement: [0.0, 1.0],
+            delta_seconds: 0.25,
+            ..up
+        };
+        let step = plan_player_motion(&engine, vehicle, forward)
+            .unwrap()
+            .unwrap();
+        frame_with_player_motion(&mut engine, 5_750, vehicle, step, false).unwrap();
+        let [fx, fy, fz] = position(&engine, vehicle);
+        assert!(((fx - x).hypot(fy - y) - 10.0).abs() < 0.0001);
+        assert_eq!(fz, z + 16.0);
+
+        let down = PlayerMotion {
+            climb: -1.0,
+            delta_seconds: 2.0,
+            ..up
+        };
+        let step = plan_player_motion(&engine, vehicle, down).unwrap().unwrap();
+        frame_with_player_motion(&mut engine, 7_750, vehicle, step, false).unwrap();
+        let ground = loaded_terrain(&engine)
+            .unwrap()
+            .height_at([fx, fy])
+            .unwrap()
+            .unwrap();
+        assert_eq!(position(&engine, vehicle), [fx, fy, ground + 0.02]);
     }
 
     #[test]
