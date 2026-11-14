@@ -84,6 +84,7 @@ impl LoadedMissionState {
         let Some(varset) = &self.script_varset else {
             return orders;
         };
+        let clock = crate::script_time::elapsed_seconds(self.mission_events.start_ms, now_ms);
         for bundle in self.script_bundles.iter().filter(|bundle| {
             bundle.behavior_warm_start.is_some() && self.mission.clans[bundle.clan_index].mode == 2
         }) {
@@ -119,6 +120,11 @@ impl LoadedMissionState {
                     bundle.formula_table.as_ref(),
                     &mut state.values,
                     |instruction, values| match instruction.dispatch_selector() {
+                        ScriptDispatchSelector::Handler(59 | 60) => {
+                            crate::script_time::result(instruction, values, clock)
+                                .map(|result| Some(VarSetDefault::Dword(result)))
+                                .ok_or_else(|| "script time requires one DWORD operand".into())
+                        }
                         ScriptDispatchSelector::Handler(11)
                             if single_dword(&instruction.references, values)
                                 == Some(crate::boarding::WARBOT_CLASS) =>
