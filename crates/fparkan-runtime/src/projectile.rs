@@ -1,8 +1,13 @@
-use crate::{Engine, MissionAssets, TerrainWorld, CONTROL_CLASS_SOURCE_BULL};
+use crate::{
+    apply_loaded_mission_control_node_delta, ControlResourceAccessError, Engine, MissionAssets,
+    MissionControlNodeProviderTableStatus, TerrainWorld, CONTROL_CLASS_SOURCE_BULL,
+};
 use fparkan_assets::AssetManager;
 use fparkan_prototype::{resolve_prototype_all, PrototypeSource};
+use fparkan_render::LegacyIron3dEulerTransform;
 use fparkan_resource::{resource_name, CachedResourceRepository};
 use fparkan_terrain::{FullSurfaceMask, SurfaceQuery, TerrainError};
+use fparkan_world::{handle_by_original_id, request_delete, transform_state, ObjectHandle};
 
 /// Prepared visuals and travel parameters for one projectile prototype.
 pub struct ProjectileAssets {
@@ -12,6 +17,8 @@ pub struct ProjectileAssets {
     pub speed: f32,
     /// Maximum age on the mission clock, in milliseconds.
     pub lifetime_ms: u32,
+    /// Initial provider volume of the projectile.
+    pub volume: Option<f32>,
 }
 
 /// Prepares the BULL prototype referenced by a manual weapon.
@@ -53,6 +60,10 @@ pub fn load_player_projectile(
     };
     let speed = f32::from_bits(control.native_profile_words[7]);
     let lifetime_ms = control.native_profile_words[18];
+    let volume = control.node_data.as_ref().and_then(|data| {
+        let amount = data.rows.first()?.max_volume;
+        (amount.is_finite() && amount > 0.0).then_some(amount)
+    });
     if !speed.is_finite() || speed <= 0.0 || lifetime_ms == 0 || lifetime_ms >= 0x8000_0000 {
         return Err("invalid projectile speed or lifetime".into());
     }
@@ -60,6 +71,7 @@ pub fn load_player_projectile(
         assets,
         speed,
         lifetime_ms,
+        volume,
     })
 }
 
@@ -130,15 +142,118 @@ impl PlayerProjectile {
 }
 
 /// Tests the projectile segment against the mission terrain triangles.
-pub fn projectile_crosses_terrain(
+pub fn projectile_terrain_hit(
     terrain: &TerrainWorld,
     [start, end]: [[f32; 3]; 2],
-) -> Result<bool, TerrainError> {
+) -> Result<Option<f32>, TerrainError> {
     let direction = std::array::from_fn(|axis| end[axis] - start[axis]);
     // The terrain query reports the ray parameter, so this segment ends at 1.
     Ok(terrain
         .raycast(start, direction, FullSurfaceMask(0))?
-        .is_some_and(|hit| hit.distance <= 1.0))
+        .filter(|hit| hit.distance <= 1.0)
+        .map(|hit| hit.distance))
+}
+
+/// A live unit reached by a projectile, with the fraction of its travel used.
+#[derive(Clone, Copy, Debug)]
+pub struct ProjectileContact {
+    pub handle: ObjectHandle,
+    pub fraction: f32,
+}
+
+/// Finds the first other unit intersected by this flight segment.
+pub fn projectile_unit_hit(
+    engine: &Engine,
+    shooter: ObjectHandle,
+    segment: [[f32; 3]; 2],
+) -> Option<ProjectileContact> {
+    let mission = engine.loaded.as_ref()?;
+    // shortcut: root MSH sphere until combat uses the per-node hull query.
+    mission
+        .object_drafts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, draft)| {
+            let class = draft.unit_dat_header_flags?;
+            if class & 0x0100_0000 == 0 {
+                return None;
+            }
+            let handle = handle_by_original_id(&engine.world, draft.original_id?)?;
+            if handle == shooter {
+                return None;
+            }
+            let state = transform_state(&engine.world, handle).ok()?;
+            let assets = &mission.mission_assets;
+            let visual = assets.visual_by_id(*assets.visuals_for_object(index).first()?)?;
+            let model = &assets.model_by_id(visual.model_id?)?.validated;
+            let scale = state.scale.map(f32::from_bits);
+            let transform = LegacyIron3dEulerTransform {
+                translation: state.position.map(f32::from_bits),
+                orientation_radians: state.orientation.map(f32::from_bits),
+            };
+            let center =
+                transform.try_transform_scaled_point(model.bounding_sphere_center, scale)?;
+            let radius =
+                model.bounding_sphere_radius * scale.into_iter().map(f32::abs).fold(0.0, f32::max);
+            let fraction = segment_sphere_fraction(segment, center, radius)?;
+            Some(ProjectileContact { handle, fraction })
+        })
+        .min_by(|a, b| a.fraction.total_cmp(&b.fraction))
+}
+
+fn segment_sphere_fraction(
+    [start, end]: [[f32; 3]; 2],
+    center: [f32; 3],
+    radius: f32,
+) -> Option<f32> {
+    if !radius.is_finite() || radius <= 0.0 {
+        return None;
+    }
+    let dir: [f32; 3] = std::array::from_fn(|i| end[i] - start[i]);
+    let rel: [f32; 3] = std::array::from_fn(|i| start[i] - center[i]);
+    let dot = |a: [f32; 3], b: [f32; 3]| a.into_iter().zip(b).map(|(a, b)| a * b).sum::<f32>();
+    let c = dot(rel, rel) - radius * radius;
+    if c <= 0.0 {
+        return Some(0.0);
+    }
+    let a = dot(dir, dir);
+    let b = dot(rel, dir);
+    let d = b * b - a * c;
+    let fraction = (-b - d.sqrt()) / a;
+    (0.0..=1.0).contains(&fraction).then_some(fraction)
+}
+
+/// Applies the first pass of combat damage to the root Control provider.
+/// Returns the remaining volume and whether the world removed the unit.
+pub fn apply_projectile_hit(
+    engine: &mut Engine,
+    handle: ObjectHandle,
+    volume: f32,
+) -> Result<Option<(f32, bool)>, ControlResourceAccessError> {
+    let Some(remaining) = engine.loaded.as_ref().and_then(|mission| {
+        let table = mission
+            .control_device_tables
+            .iter()
+            .find(|table| table.handle == handle)?;
+        let MissionControlNodeProviderTableStatus::Available(rows) = &table.node_provider_status
+        else {
+            return None;
+        };
+        Some(f32::from_bits(rows.first()?.current_amount_bits))
+    }) else {
+        return Ok(None);
+    };
+    if !volume.is_finite() || volume <= 0.0 || !remaining.is_finite() || remaining <= 0.0 {
+        return Ok(None);
+    }
+    // shortcut: use the projectile provider volume directly, with immediate
+    // removal on root depletion until native damage and death timing are wired.
+    if volume >= remaining {
+        request_delete(&mut engine.world, handle).map_err(ControlResourceAccessError::World)?;
+        return Ok(Some((0.0, true)));
+    }
+    apply_loaded_mission_control_node_delta(engine, handle, 0, -volume)?;
+    Ok(Some((remaining - volume, false)))
 }
 
 #[cfg(test)]

@@ -890,13 +890,17 @@ impl GameAudio {
                 }
             }
             SoundAction::StopLoop => {
-                if let Some(player) = self.control_sounds.remove(&id) {
-                    player.stop();
-                    eprintln!("control_sound_stop id={id}");
-                }
+                self.stop_control_sound(id);
             }
         }
         Ok(())
+    }
+
+    pub(crate) fn stop_control_sound(&mut self, id: usize) {
+        if let Some(player) = self.control_sounds.remove(&id) {
+            player.stop();
+            eprintln!("control_sound_stop id={id}");
+        }
     }
 
     pub(crate) fn control_sound_is_playing(&self, id: usize) -> bool {

@@ -56,7 +56,8 @@ pub use mission_events::{MissionEventStop, MissionEventTick, MissionNotice};
 pub use player_motion::{plan_player_motion, PlayerMotion, PlayerMotionStep};
 pub use player_weapon::{starting_player_weapons, PlayerWeapons};
 pub use projectile::{
-    load_player_projectile, projectile_crosses_terrain, PlayerProjectile, ProjectileAssets,
+    apply_projectile_hit, load_player_projectile, projectile_terrain_hit, projectile_unit_hit,
+    PlayerProjectile, ProjectileAssets, ProjectileContact,
 };
 
 const MISSION_DECODED_PAYLOAD_CACHE_ENTRIES: usize = 256;
@@ -17269,7 +17270,28 @@ mod tests {
         assert!(first.stop.is_none());
         assert!(frame(&mut engine, 2_004).unwrap().mission_event.is_none());
         let first_target = mission_object_handle(&engine, OriginalObjectId(1)).unwrap();
-        fparkan_world::request_delete(&mut engine.world, first_target).unwrap();
+        let target = &engine.loaded.as_ref().unwrap().object_drafts[1];
+        let [x, y, z] = target.position;
+        let segment = [[x - 10.0, y, z], [x + 10.0, y, z]];
+        assert_eq!(
+            projectile_unit_hit(&engine, cockpit.handle, segment)
+                .unwrap()
+                .handle,
+            first_target,
+        );
+        assert_eq!(
+            apply_projectile_hit(&mut engine, first_target, 249.0).unwrap(),
+            Some((251.0, false)),
+        );
+        assert_eq!(
+            apply_projectile_hit(&mut engine, first_target, 249.0).unwrap(),
+            Some((2.0, false)),
+        );
+        assert_eq!(
+            apply_projectile_hit(&mut engine, first_target, 249.0).unwrap(),
+            Some((0.0, true)),
+        );
+        assert!(projectile_unit_hit(&engine, cockpit.handle, segment).is_none());
         let next = frame(&mut engine, 2_005).unwrap().mission_event.unwrap();
         assert!(next.stop.is_none());
         assert_eq!(next.notices, [MissionNotice::Information(17)]);

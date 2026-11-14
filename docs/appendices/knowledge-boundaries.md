@@ -39,7 +39,8 @@ authoring API без динамического подтверждения.
 
 `player_weapon_cycle_approx` отмечает приближённый такт огня, фазы и расход боезапаса.
 `player_projectile_flight_approx` отмечает прямой полёт по взгляду без баллистики.
-`player_projectile_damage_stub` и `player_weapon_fx_stub` отмечают пробелы в уроне, контактах с объектами и эффектах выстрела.
+`player_projectile_damage_approx` отмечает урон по корневому NDP и немедленное удаление.
+`player_projectile_hull_stub` и `player_weapon_fx_stub` отмечают проверку по сфере вместо узлов, пробелы в контактах со строениями и эффектах выстрела.
 
 `autodemo_camera_follow_approx` и `autodemo_camera_target_approx` отмечают
 приближённое слежение и выбор размещённых юнитов с камерой через селектор AI.

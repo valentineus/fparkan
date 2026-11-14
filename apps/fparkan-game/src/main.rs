@@ -78,16 +78,17 @@ use fparkan_render_vulkan::{
     VulkanStaticTexture, VulkanStaticTextureMip, VulkanStaticVertex,
 };
 use fparkan_runtime::{
-    autodemo_camera, create, frame as step_mission_frame, frame_with_player_motion,
-    load_mission_static_preview, load_mission_static_preview_roots, load_mission_with_init_stubs,
-    load_player_projectile, loaded_mission_assets, loaded_mission_object_drafts,
-    loaded_mission_script_bundles, loaded_terrain, mission_object_handle, plan_player_motion,
-    projectile_crosses_terrain, query_building_segment_world, simulate_mission_report,
-    starting_cockpit, starting_player_weapons, AutoDemoCamera, AutoDemoView, BasementPlacementMode,
-    BuildingMeshNode, Engine, EngineError, EngineServices, FrameResult, LoadedMission,
-    MissionAssets, MissionEventStop, MissionMode, MissionNotice, MissionObjectDraft,
-    MissionRequest, MissionScriptInitExecution, MissionStartupInput, PlayerMotion,
-    PlayerProjectile, PlayerWeapons, StartingCockpit, SIMULATION_COVERAGE,
+    apply_projectile_hit, autodemo_camera, create, frame as step_mission_frame,
+    frame_with_player_motion, load_mission_static_preview, load_mission_static_preview_roots,
+    load_mission_with_init_stubs, load_player_projectile, loaded_mission_assets,
+    loaded_mission_object_drafts, loaded_mission_script_bundles, loaded_terrain,
+    mission_object_handle, plan_player_motion, projectile_terrain_hit, projectile_unit_hit,
+    query_building_segment_world, simulate_mission_report, starting_cockpit,
+    starting_player_weapons, AutoDemoCamera, AutoDemoView, BasementPlacementMode, BuildingMeshNode,
+    Engine, EngineError, EngineServices, FrameResult, LoadedMission, MissionAssets,
+    MissionEventStop, MissionMode, MissionNotice, MissionObjectDraft, MissionRequest,
+    MissionScriptInitExecution, MissionStartupInput, PlayerMotion, PlayerProjectile, PlayerWeapons,
+    StartingCockpit, SIMULATION_COVERAGE,
 };
 #[cfg(test)]
 use fparkan_terrain::BasementFoundationFragment;
@@ -4879,6 +4880,7 @@ struct DynamicComponentGeometry {
 struct ProjectileDraw {
     speed: f32,
     lifetime_ms: u32,
+    volume: Option<f32>,
     local_vertices: Vec<VulkanStaticVertex>,
     instances: Vec<ProjectileDrawSlot>,
 }
@@ -5577,9 +5579,13 @@ fn update_control_point_lights(
     component_mount_poses: &[Vec<Option<VulkanNodePose>>],
     random_samples: &HashMap<ControlEffectInstanceKey, ControlEffectFrameSample>,
     emit_diagnostic: bool,
+    removed_roots: &HashSet<usize>,
 ) -> Vec<(VulkanPointLight, u32)> {
     let mut lights = Vec::new();
     for slot in slots {
+        if removed_roots.contains(&slot.owner_object_index) {
+            continue;
+        }
         if slot.owner_component_is_mounted {
             slot.mount_pose = component_mount_poses
                 .get(slot.owner_object_index)
@@ -9502,6 +9508,7 @@ fn prepare_projectile_draw(
     Ok(Some(ProjectileDraw {
         speed: projectile.speed,
         lifetime_ms: projectile.lifetime_ms,
+        volume: projectile.volume,
         local_vertices: geometry.vertices,
         instances,
     }))
@@ -9904,7 +9911,7 @@ fn mission_camera_coverage(cockpit: Option<StartingCockpit>, demo: bool) -> &'st
     if demo {
         "autodemo_camera_follow_approx=1 autodemo_camera_target_approx=1 cockpit_pose_approx=1"
     } else if cockpit.is_some() {
-        "player_motion_approx=1 cockpit_aim_approx=1 cockpit_pose_approx=1 player_weapon_cycle_approx=1 player_projectile_flight_approx=1 player_projectile_damage_stub=1 player_weapon_fx_stub=1"
+        "player_motion_approx=1 cockpit_aim_approx=1 cockpit_pose_approx=1 player_weapon_cycle_approx=1 player_projectile_flight_approx=1 player_projectile_damage_approx=1 player_projectile_hull_stub=1 player_weapon_fx_stub=1"
     } else {
         "mission_camera_stub=1"
     }
@@ -9932,6 +9939,7 @@ struct StaticVulkanApp {
     mission_engine: Option<Engine>,
     mission_frame: Option<FrameResult>,
     mission_render_roots: Vec<Option<MissionRenderRoot>>,
+    removed_mission_roots: HashSet<usize>,
     cockpit: Option<StartingCockpit>,
     demo_camera: Option<AutoDemoCamera>,
     op1_jitter: Op1JitterState,
@@ -10058,6 +10066,7 @@ impl StaticVulkanApp {
             mission_engine: None,
             mission_frame: None,
             mission_render_roots: Vec::new(),
+            removed_mission_roots: HashSet::new(),
             cockpit: None,
             demo_camera: None,
             mesh: preview.mesh,
@@ -10589,21 +10598,39 @@ impl StaticVulkanApp {
     }
 
     fn advance_player_projectiles(&mut self, clock_ms: u32) -> Result<(), String> {
+        let (Some(engine), Some(cockpit)) = (self.mission_engine.as_mut(), self.cockpit) else {
+            return Ok(());
+        };
         for (slot, draw) in self.projectile_draws.iter_mut().enumerate() {
             let Some(draw) = draw else { continue };
             for instance in &mut draw.instances {
                 let Some(flight) = &mut instance.flight else {
                     continue;
                 };
-                let mut terrain_contact = false;
+                let mut terrain_contact = None;
+                let mut unit_contact = None;
                 let stays = flight
                     .advance(clock_ms, |segment| {
-                        terrain_contact = projectile_crosses_terrain(&self.terrain, segment)?;
-                        Ok(terrain_contact)
+                        terrain_contact = projectile_terrain_hit(&self.terrain, segment)?;
+                        unit_contact =
+                            projectile_unit_hit(engine, cockpit.handle, segment).filter(|hit| {
+                                terrain_contact.is_none_or(|ground| hit.fraction < ground)
+                            });
+                        Ok(terrain_contact.is_some() || unit_contact.is_some())
                     })
                     .map_err(|error| format!("query projectile terrain: {error}"))?;
                 if !stays {
-                    let reason = if terrain_contact {
+                    let reason = if let Some(hit) = unit_contact {
+                        match draw.volume.map(|volume| apply_projectile_hit(engine, hit.handle, volume)).transpose() {
+                            Ok(Some(Some((remaining, removed)))) => eprintln!(
+                                "player_projectile_hit slot={} target={} remaining={remaining} removed={removed} queue_time_ms={clock_ms}", slot + 1, hit.handle.slot,
+                            ),
+                            outcome => eprintln!(
+                                "sim_coverage player_projectile_target_stub=1 target={} result={outcome:?}", hit.handle.slot,
+                            ),
+                        }
+                        "unit"
+                    } else if terrain_contact.is_some() {
                         "terrain"
                     } else {
                         "expired"
@@ -10644,7 +10671,9 @@ impl StaticVulkanApp {
 
     fn building_segment_blocked(&self, world_segment: [[f32; 3]; 2]) -> Result<bool, String> {
         for binding in &self.building_collision_bindings {
-            if binding.selected_nodes.is_empty() {
+            if binding.selected_nodes.is_empty()
+                || self.removed_mission_roots.contains(&binding.object_index)
+            {
                 continue;
             }
             let pose_buffer = self
@@ -10849,6 +10878,7 @@ impl StaticVulkanApp {
             }
         }
         let control_clock_ms = clock.time_ms;
+        self.advance_player_projectiles(control_clock_ms)?;
         let mut player_step = None;
         // A held key and accumulated device motion belong to this simulation sample.
         let [mouse_x, mouse_y] = std::mem::take(&mut self.player_mouse);
@@ -10940,6 +10970,19 @@ impl StaticVulkanApp {
             }
             self.mission_frame = Some(frame);
         }
+        if let Some(frame) = &self.mission_frame {
+            let objects = &frame.snapshot.transforms;
+            for (index, root) in self.mission_render_roots.iter().enumerate() {
+                if let Some(root) = root {
+                    let live = objects
+                        .binary_search_by_key(&root.handle.slot, |(handle, _)| handle.slot)
+                        .is_ok_and(|offset| objects[offset].0 == root.handle);
+                    if !live && self.removed_mission_roots.insert(index) {
+                        eprintln!("mission_render_removed object={index} queue_time_ms={control_clock_ms}");
+                    }
+                }
+            }
+        }
         let effect_elapsed_seconds = control_clock_ms as f32 / 1000.0;
         // CTLD's validated NDP defaults seed the native query gate. This
         // preview does not process mission Action1 updates, so it retains that
@@ -10975,7 +11018,6 @@ impl StaticVulkanApp {
             }
         }
         self.update_mission_camera(clock.delta_seconds, viewport)?;
-        self.advance_player_projectiles(control_clock_ms)?;
         self.update_player_fire(control_clock_ms);
         self.update_projectile_geometry();
         refresh_dynamic_shadow_casters(
@@ -11047,6 +11089,7 @@ impl StaticVulkanApp {
                 && self
                     .control_clock_target_ms
                     .is_none_or(|target_ms| control_clock_ms >= target_ms),
+            &self.removed_mission_roots,
         );
         let control_vulkan_lights = active_control_point_lights(&control_point_lights);
         let effect_updates = update_ambient_effect_geometry(
@@ -11216,6 +11259,13 @@ impl StaticVulkanApp {
                 .map_err(|error| format!("update audio listener: {error}"))?;
             for (id, sound) in self.control_sound_slots.iter_mut().enumerate() {
                 let slot = &mut sound.effect;
+                if self
+                    .removed_mission_roots
+                    .contains(&slot.owner_object_index)
+                {
+                    audio.stop_control_sound(id);
+                    continue;
+                }
                 if slot.owner_component_is_mounted {
                     slot.mount_pose = self
                         .component_mount_poses
@@ -11418,6 +11468,37 @@ impl StaticVulkanApp {
                 }
             }
         }
+        if !self.removed_mission_roots.is_empty() {
+            for (index, range) in self.mesh.draw_ranges.iter().enumerate() {
+                if range
+                    .owner_scope
+                    .checked_sub(1)
+                    .is_some_and(|owner| self.removed_mission_roots.contains(&(owner as usize)))
+                {
+                    renderer
+                        .set_draw_range_index_count(index, 0)
+                        .map_err(|error| {
+                            format!("hide removed object draw range {index}: {error}")
+                        })?;
+                }
+            }
+        }
+        let mut shadow_casters = std::borrow::Cow::Borrowed(self.shadow_casters.as_slice());
+        if !self.removed_mission_roots.is_empty() {
+            shadow_casters = std::borrow::Cow::Owned(
+                self.shadow_casters
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, caster)| {
+                        (!self.dynamic_shadow_casters.iter().any(|binding| {
+                            binding.caster_index == index
+                                && self.removed_mission_roots.contains(&binding.object_index)
+                        }))
+                        .then(|| caster.clone())
+                    })
+                    .collect(),
+            );
+        }
         let shadow_camera = ShadowCamera {
             position: frame.camera.position,
             viewport_width: frame.viewport[0],
@@ -11525,7 +11606,7 @@ impl StaticVulkanApp {
                 self.dynamic_vertex_start,
                 &mut self.shadow_cache,
                 frame.clock.id.index().saturating_add(1),
-                &self.shadow_casters,
+                &shadow_casters,
                 &self.shadow_receivers,
                 self.shadow_range,
                 self.shadow_base_vertex,
@@ -11551,7 +11632,7 @@ impl StaticVulkanApp {
                 self.dynamic_vertex_start,
                 &mut self.shadow_cache,
                 frame.clock.id.index().saturating_add(1),
-                &self.shadow_casters,
+                &shadow_casters,
                 &self.shadow_receivers,
                 self.shadow_range,
                 self.shadow_base_vertex,
@@ -18394,6 +18475,7 @@ mod tests {
             &mounts,
             &random_samples,
             false,
+            &HashSet::new(),
         )
         .is_empty());
         let random_samples = advance_control_effect_instances(
@@ -18412,6 +18494,7 @@ mod tests {
             &mounts,
             &random_samples,
             false,
+            &HashSet::new(),
         );
         assert_eq!(lights.len(), 1);
         let (light, flags) = lights[0];
