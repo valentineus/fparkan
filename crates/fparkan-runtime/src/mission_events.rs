@@ -442,9 +442,33 @@ fn capture_building_at_communicator(
             })
         });
     if let Some((handle, id, former_owner, class)) = candidate {
-        set_owner(&mut engine.world, handle, Some(player_owner))?;
+        mission.transfer_building(
+            &mut engine.world,
+            handle,
+            id,
+            former_owner,
+            player_owner,
+            class,
+        )?;
+        Ok(Some(id))
+    } else {
+        Ok(None)
+    }
+}
+
+impl LoadedMissionState {
+    pub(super) fn transfer_building(
+        &mut self,
+        world: &mut World,
+        handle: ObjectHandle,
+        id: OriginalObjectId,
+        former_owner: OwnerId,
+        new_owner: OwnerId,
+        class: u32,
+    ) -> Result<(), EngineError> {
+        set_owner(world, handle, Some(new_owner))?;
         if has_behavior_registration_key(class) {
-            let distributors = &mut mission.behavior_distributors;
+            let distributors = &mut self.behavior_distributors;
             if let Some(previous) = distributors.get_mut(usize::from(former_owner.0)) {
                 let count = previous.registered_objects.len();
                 previous
@@ -455,7 +479,7 @@ fn capture_building_at_communicator(
                 }
             }
             if let Some(next) = distributors
-                .get_mut(usize::from(player_owner.0))
+                .get_mut(usize::from(new_owner.0))
                 .filter(|entry| entry.super_ai_visible)
             {
                 add_behavior_registered_object(
@@ -463,7 +487,7 @@ fn capture_building_at_communicator(
                     BehaviorRegisteredObject {
                         original_id: id,
                         handle,
-                        selector: u32::from(player_owner.0),
+                        selector: u32::from(new_owner.0),
                         class_flags: class,
                         share: 0.0,
                         native_tail: [0; 5],
@@ -471,9 +495,7 @@ fn capture_building_at_communicator(
                 );
             }
         }
-        Ok(Some(id))
-    } else {
-        Ok(None)
+        Ok(())
     }
 }
 
@@ -484,6 +506,21 @@ pub(super) fn on_communicator(
     pose: super::TransformState,
     [x, y, z]: [f32; 3],
 ) -> bool {
+    let platform_height = communicator_triangles(assets, object_index, class, pose)
+        .into_iter()
+        .flatten()
+        .filter(|triangle| in_tactical_polygon(triangle, x, y))
+        .map(|[a, b, c]| a[2].max(b[2]).max(c[2]))
+        .max_by(f32::total_cmp);
+    platform_height.is_some_and(|height| (z - height).abs() <= 2.0)
+}
+
+pub(super) fn communicator_triangles(
+    assets: &super::MissionAssets,
+    object_index: usize,
+    class: u32,
+    pose: super::TransformState,
+) -> Option<Vec<[[f32; 3]; 3]>> {
     let is_generator = class == 0x8000_0002;
     let floor_only = is_generator || class == MAIN_TELEPORT_CLASS;
     let material = if is_generator {
@@ -491,77 +528,68 @@ pub(super) fn on_communicator(
     } else {
         &b"B_COMP_4G"[..]
     };
-    let Some(visual) = assets
+    let visual = assets
         .visual_for_object(object_index)
-        .and_then(|id| assets.visual_by_id(id))
-    else {
-        return false;
-    };
+        .and_then(|id| assets.visual_by_id(id))?;
     if visual.source_type != Some(u32::from_le_bytes(*b"FORT")) {
-        return false;
+        return None;
     }
-    let Some(wear) = assets
+    let wear = assets
         .wears
         .iter()
-        .find(|wear| Some(wear.id) == visual.wear_id)
-    else {
-        return false;
-    };
-    let Some(model) = visual
+        .find(|wear| Some(wear.id) == visual.wear_id)?;
+    let model = visual
         .model_id
         .and_then(|id| assets.model_by_id(id))
-        .map(|model| &model.validated)
-    else {
-        return false;
-    };
-    let Some(hierarchy) = node38_sampled_hierarchy(model, 0) else {
-        return false;
-    };
+        .map(|model| &model.validated)?;
+    let hierarchy = node38_sampled_hierarchy(model, 0)?;
     let transform = LegacyIron3dEulerTransform {
         translation: pose.position.map(f32::from_bits),
         orientation_radians: pose.orientation.map(f32::from_bits),
     };
     let scale = pose.scale.map(f32::from_bits);
     // shortcut: use the green platform mesh until the native volume is known.
-    let platform_height = hierarchy
-        .poses
-        .iter()
-        .enumerate()
-        .filter_map(|(index, pose)| {
-            let slot = selected_slot(model, NodeId(index as u32), Lod(0), Group(0))?;
-            Some((*pose, draw_batches(model, slot).ok()?))
-        })
-        .flat_map(|(pose, batches)| batches.iter().map(move |batch| (pose, batch)))
-        .filter(|(_, batch)| {
-            wear.table
-                .entries
-                .get(usize::from(batch.material_index))
-                .is_some_and(|entry| entry.material.0.eq_ignore_ascii_case(material))
-        })
-        .flat_map(|(pose, batch)| {
-            let first = batch.index_start as usize;
-            let end = first + usize::from(batch.index_count);
-            model.indices[first..end]
-                .chunks_exact(3)
-                .filter_map(move |indices| {
-                    let [a, b, c] = [indices[0], indices[1], indices[2]].map(|index| {
-                        let local =
-                            model.positions[batch.base_vertex as usize + usize::from(index)];
-                        transform.try_transform_scaled_point(pose.transform_point(local), scale)
-                    });
-                    let (a, b, c) = (a?, b?, c?);
-                    if floor_only {
-                        // These models use the platform material on both the floor and the surface above it.
-                        let winding = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
-                        if winding <= 0.0 {
-                            return None;
+    Some(
+        hierarchy
+            .poses
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pose)| {
+                let slot = selected_slot(model, NodeId(index as u32), Lod(0), Group(0))?;
+                Some((*pose, draw_batches(model, slot).ok()?))
+            })
+            .flat_map(|(pose, batches)| batches.iter().map(move |batch| (pose, batch)))
+            .filter(|(_, batch)| {
+                wear.table
+                    .entries
+                    .get(usize::from(batch.material_index))
+                    .is_some_and(|entry| entry.material.0.eq_ignore_ascii_case(material))
+            })
+            .flat_map(|(pose, batch)| {
+                let first = batch.index_start as usize;
+                let end = first + usize::from(batch.index_count);
+                model.indices[first..end]
+                    .chunks_exact(3)
+                    .filter_map(move |indices| {
+                        let [a, b, c] = [indices[0], indices[1], indices[2]].map(|index| {
+                            let local =
+                                model.positions[batch.base_vertex as usize + usize::from(index)];
+                            transform.try_transform_scaled_point(pose.transform_point(local), scale)
+                        });
+                        let (a, b, c) = (a?, b?, c?);
+                        if floor_only {
+                            // These models use the platform material on both the floor and the surface above it.
+                            let winding =
+                                (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+                            if winding <= 0.0 {
+                                return None;
+                            }
                         }
-                    }
-                    in_tactical_polygon(&[a, b, c], x, y).then_some(a[2].max(b[2]).max(c[2]))
-                })
-        })
-        .max_by(f32::total_cmp);
-    platform_height.is_some_and(|height| (z - height).abs() <= 2.0)
+                        Some([a, b, c])
+                    })
+            })
+            .collect(),
+    )
 }
 
 impl LoadedMissionState {

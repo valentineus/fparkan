@@ -2800,7 +2800,9 @@ pub fn step_headless(
     if let (Some(combat), Some(unit)) = (&mut engine.autodemo_combat, produced_unit) {
         combat.activate(&engine.world, unit.object_index, unit.handle);
     }
-    if produced_unit.is_some()
+    let building_captured = clan_ai_events::resolve_captures(engine, queue_time_ms)?;
+    if building_captured
+        || produced_unit.is_some()
         || !autodemo_reinforcements.is_empty()
         || autodemo_combat_events
             .iter()

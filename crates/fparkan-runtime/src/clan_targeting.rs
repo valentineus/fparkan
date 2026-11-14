@@ -15,28 +15,42 @@ pub(super) struct Capturer {
     target_id: u32,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct CaptureApproach {
+    pub(super) unit: ObjectHandle,
+    pub(super) target: ObjectHandle,
+    point: [f32; 3],
+}
+
 pub(super) fn send_capturer(
     patrol: &mut Option<crate::unit_patrol::UnitPatrol>,
     world: &World,
     drafts: &[MissionObjectDraft],
+    assets: &crate::MissionAssets,
     unit: Capturer,
     target_id: u32,
-) -> Option<(ObjectHandle, ObjectHandle)> {
+) -> Option<CaptureApproach> {
     let pose = transform_state(world, unit.target).ok()?;
     let target = identity_metadata(world, unit.target).ok()?;
+    let index = target.original_id?.0 as usize;
+    let class = drafts.get(index)?.unit_dat_header_flags?;
     if unit.target_id != target_id
         || target_id & 0x8000_0000 == 0
         || target.owner_id == identity_metadata(world, unit.handle).ok()?.owner_id
-        || target
-            .original_id
-            .and_then(|id| drafts.get(id.0 as usize))
-            .and_then(|draft| draft.unit_dat_header_flags)
-            == Some(0x8000_0200)
+        || class == 0x8000_0200
     {
         return None;
     }
-    let [x, y, _] = pose.position.map(f32::from_bits);
-    // shortcut: route towards the building; native entrance selection and capture are still open.
+    let from = transform_state(world, unit.handle)
+        .ok()?
+        .position
+        .map(f32::from_bits);
+    // shortcut: use the communicator mesh until the native door and interior route are wired.
+    let point = nearest_platform_point(
+        crate::mission_events::communicator_triangles(assets, index, class, pose)?,
+        from,
+    )?;
+    let [x, y, _] = point;
     patrol
         .get_or_insert_with(crate::unit_patrol::UnitPatrol::scripted)
         .move_to(world, unit.handle, [x, y], false);
@@ -44,7 +58,36 @@ pub(super) fn send_capturer(
         "sim_coverage script_capture_approach_stub=1 unit={} target={} target_id={target_id}",
         unit.handle.slot, unit.target.slot
     );
-    Some((unit.handle, unit.target))
+    Some(CaptureApproach {
+        unit: unit.handle,
+        target: unit.target,
+        point,
+    })
+}
+
+fn nearest_platform_point(triangles: Vec<[[f32; 3]; 3]>, from: [f32; 3]) -> Option<[f32; 3]> {
+    triangles
+        .into_iter()
+        .map(|[a, b, c]| std::array::from_fn(|axis| (a[axis] + b[axis] + c[axis]) / 3.0))
+        .min_by(|a, b| distance_squared(from, *a).total_cmp(&distance_squared(from, *b)))
+}
+
+fn distance_squared(from: [f32; 3], to: [f32; 3]) -> f32 {
+    from.into_iter()
+        .zip(to)
+        .map(|(from, to)| (from - to).powi(2))
+        .sum()
+}
+
+impl CaptureApproach {
+    pub(super) fn reached(self, world: &World) -> bool {
+        transform_state(world, self.unit)
+            .is_ok_and(|pose| at_platform(pose.position.map(f32::from_bits), self.point))
+    }
+}
+
+fn at_platform([x, y, z]: [f32; 3], [tx, ty, tz]: [f32; 3]) -> bool {
+    (x - tx).hypot(y - ty) <= 0.05 && (z - tz).abs() <= 2.0
 }
 
 pub(super) fn nearest_capturer(
@@ -164,37 +207,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capture_order_replaces_patrol_and_rejects_a_friendly_target() {
-        use fparkan_world::{
-            construct_object, new, register_object, set_owner, ObjectDraft, WorldConfig,
-        };
+    fn approach_targets_the_nearest_platform_triangle() {
+        assert_eq!(
+            nearest_platform_point(
+                vec![
+                    [[12., 10., 0.], [15., 10., 0.], [12., 13., 0.]],
+                    [[0., 0., 2.], [3., 0., 2.], [0., 3., 2.]],
+                ],
+                [1., 1., 0.],
+            ),
+            Some([1., 1., 2.])
+        );
+    }
 
-        let mut world = new(WorldConfig);
-        let mut create = |owner| {
-            let handle = construct_object(&mut world, ObjectDraft { original_id: None }).unwrap();
-            register_object(&mut world, handle).unwrap();
-            set_owner(&mut world, handle, Some(OwnerId(owner))).unwrap();
-            handle
-        };
-        let handle = create(1);
-        let target = create(0);
-        let capturer = Capturer {
-            handle,
-            target,
-            id: 3,
-            target_id: 0x8000_0002,
-        };
-        let mut patrol = None;
-        assert_eq!(
-            send_capturer(&mut patrol, &world, &[], capturer, capturer.target_id),
-            Some((handle, target))
-        );
-        assert!(patrol.as_ref().unwrap().is_moving_to_destination(handle));
-        set_owner(&mut world, target, Some(OwnerId(1))).unwrap();
-        assert_eq!(
-            send_capturer(&mut patrol, &world, &[], capturer, capturer.target_id),
-            None
-        );
+    #[test]
+    fn capture_requires_the_platform_height_as_well_as_the_route_endpoint() {
+        let platform = [425.7, 326.9, 61.1];
+        assert!(!at_platform([425.7, 326.9, 76.6], platform));
+        assert!(!at_platform([425.8, 326.9, 61.1], platform));
+        assert!(at_platform([425.7, 326.9, 61.1], platform));
     }
 
     #[test]

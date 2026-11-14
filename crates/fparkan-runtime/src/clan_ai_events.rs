@@ -1,3 +1,4 @@
+use crate::clan_targeting::CaptureApproach;
 use crate::{BehaviorOreState, LoadedMissionState, MissionEventStop};
 use fparkan_script::{
     Handler15TargetPayload, Handler2Record, Handler2RecordInput, Handler2RecordKey,
@@ -17,18 +18,63 @@ pub(super) struct ScriptFactoryOrder {
     wait_for_factory: bool,
 }
 
+pub(super) fn resolve_captures(
+    engine: &mut crate::Engine,
+    now_ms: u32,
+) -> Result<bool, crate::EngineError> {
+    let Some(loaded) = &mut engine.loaded else {
+        return Ok(false);
+    };
+    let mut captured = false;
+    let mut index = 0;
+    while let Some(&(owner, key, approach)) = loaded.clan_ai_events.capture_orders.get(index) {
+        let valid_unit = identity_metadata(&engine.world, approach.unit)
+            .is_ok_and(|identity| identity.owner_id == Some(owner));
+        let target = identity_metadata(&engine.world, approach.target).ok();
+        let target = target
+            .and_then(|identity| identity.original_id.zip(identity.owner_id))
+            .filter(|&(_, former_owner)| valid_unit && former_owner != owner);
+        if let Some((id, former_owner)) = target {
+            if !approach.reached(&engine.world) {
+                index += 1;
+                continue;
+            }
+            if let Some(class) = loaded
+                .object_drafts
+                .get(id.0 as usize)
+                .and_then(|draft| draft.unit_dat_header_flags)
+            {
+                loaded.transfer_building(
+                    &mut engine.world,
+                    approach.target,
+                    id,
+                    former_owner,
+                    owner,
+                    class,
+                )?;
+                captured = true;
+                eprintln!(
+                    "script_building_captured clan={} unit={} target={} queue_time_ms={now_ms}",
+                    owner.0, approach.unit.slot, approach.target.slot
+                );
+            }
+        }
+        loaded.clan_ai_events.capture_orders.remove(index);
+        if let Some(queue) = loaded
+            .clan_ai_events
+            .problems
+            .get_mut(&usize::from(owner.0))
+        {
+            queue.remove(key);
+        }
+    }
+    Ok(captured)
+}
+
 pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) {
     let Some(loaded) = &mut engine.loaded else {
         return;
     };
-    loaded
-        .clan_ai_events
-        .capture_orders
-        .retain(|&(owner, _, unit, target)| {
-            identity_metadata(&engine.world, unit).is_ok_and(|unit| unit.owner_id == Some(owner))
-                && identity_metadata(&engine.world, target)
-                    .is_ok_and(|target| target.owner_id != Some(owner))
-        });
     let active = &mut loaded.clan_ai_events.factory_jobs;
     active.retain(|((clan, _), plant)| {
         engine
@@ -97,7 +143,7 @@ pub(super) struct ClanAiEvents {
     strength_queries: BTreeMap<(usize, u16), u64>,
     capture_queries: BTreeMap<usize, u64>,
     capturer_queries: BTreeMap<usize, u64>,
-    capture_orders: Vec<(OwnerId, Handler2RecordKey, ObjectHandle, ObjectHandle)>,
+    capture_orders: Vec<(OwnerId, Handler2RecordKey, CaptureApproach)>,
     capture_approaches: BTreeMap<(u32, u32), u64>,
 }
 
@@ -279,11 +325,11 @@ impl LoadedMissionState {
                                 let problem = problem.as_ref()
                                     .ok_or("Handler(15) capture requires a current problem")?;
                                 let approach = crate::clan_targeting::send_capturer(
-                                    &mut self.unit_patrol, world, &self.object_drafts, unit, target_id,
+                                    &mut self.unit_patrol, world, &self.object_drafts, &self.mission_assets, unit, target_id,
                                 );
-                                if let Some((unit, target)) = approach {
-                                    self.clan_ai_events.capture_orders.push((OwnerId(clan as u16), problem.key, unit, target));
-                                    *self.clan_ai_events.capture_approaches.entry((unit.slot, target.slot)).or_default() += 1;
+                                if let Some(approach) = approach {
+                                    self.clan_ai_events.capture_orders.push((OwnerId(clan as u16), problem.key, approach));
+                                    *self.clan_ai_events.capture_approaches.entry((approach.unit.slot, approach.target.slot)).or_default() += 1;
                                 }
                                 return Ok(Some(VarSetDefault::Dword(u32::from(approach.is_some()))));
                             }
@@ -438,7 +484,7 @@ impl LoadedMissionState {
                                 capturer = crate::clan_targeting::nearest_capturer(
                                     &self.mission, &self.object_drafts, &self.mission_events,
                                     world, OwnerId(clan as u16), target, |handle| {
-                                        !self.clan_ai_events.capture_orders.iter().any(|&(_, _, unit, _)| unit == handle)
+                                        !self.clan_ai_events.capture_orders.iter().any(|&(_, _, order)| order.unit == handle)
                                             && self.unit_patrol.as_ref().is_none_or(|patrol| !patrol.is_shut_down(handle))
                                     },
                                 );
@@ -651,7 +697,7 @@ impl LoadedMissionState {
                             .clan_ai_events
                             .capture_orders
                             .iter()
-                            .any(|&(owner, key, _, _)| {
+                            .any(|&(owner, key, _)| {
                                 owner == OwnerId(clan as u16) && key == problem.key
                             })
                     {
