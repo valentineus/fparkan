@@ -12,6 +12,7 @@ use camera_capture::{
 };
 use fparkan_animation::{AnimationTime, NodePoseBuffer};
 use fparkan_assets::{
+    apply_manual_turret_elevation,
     load_material_archive_name_texture_rgba8_and_phase_with_document_from_root,
     load_material_name_texture_rgba8_and_phase_with_document_from_root,
     load_resource_entry_bytes_from_root,
@@ -238,6 +239,7 @@ fn run(args: &[String]) -> Result<String, String> {
         &args.root,
         &loaded.land_msh_path,
         !args.viewer,
+        (!args.viewer).then(|| starting_cockpit(&engine)).flatten(),
     )?;
     let terrain_materials_duration = terrain_materials_duration_started.elapsed();
     // Atmosphere files are mission-local assets.  Resolving them from the
@@ -7469,6 +7471,7 @@ fn update_control_animation_pose_buffers(
     instances: &mut [Vec<Option<ControlAnimationInstance>>],
     pose_buffers: &mut [Vec<Option<NodePoseBuffer>>],
     native_clock_ms: u32,
+    aim: Option<(StartingCockpit, f32)>,
 ) -> Result<(), String> {
     for (object_index, components) in instances.iter_mut().enumerate() {
         let Some(object_pose_buffers) = pose_buffers.get_mut(object_index) else {
@@ -7478,19 +7481,13 @@ fn update_control_animation_pose_buffers(
             let Some(instance) = instance.as_mut() else {
                 continue;
             };
-            let node_times: Vec<Option<AnimationTime>> = match sample_control_node_times(
+            let mut node_times = match sample_control_node_times(
                 &instance.control,
                 native_clock_ms,
                 &instance.gate_values,
                 &mut instance.state,
             ) {
-                Ok(times) => {
-                    instance.last_sampled_node_times = times.clone();
-                    times
-                        .into_iter()
-                        .map(|time| time.map(AnimationTime))
-                        .collect()
-                }
+                Ok(times) => times,
                 Err(
                     error @ (ControlSamplingError::UnsupportedTag21Mode { .. }
                     | ControlSamplingError::UnsupportedVariableMapping { .. }
@@ -7514,11 +7511,10 @@ fn update_control_animation_pose_buffers(
                             "control animation fallback for object {object_index} component {component_index}: {fallback}"
                         )
                     })?;
-                    instance.last_sampled_node_times = fallback_times
-                        .iter()
-                        .map(|time| time.map(|time| time.0))
-                        .collect();
                     fallback_times
+                        .into_iter()
+                        .map(|time| time.map(|time| time.0))
+                        .collect()
                 }
                 Err(error) => {
                     return Err(format!(
@@ -7526,7 +7522,19 @@ fn update_control_animation_pose_buffers(
                     ));
                 }
             };
-            let hierarchy = node38_sampled_hierarchy_at_times(&instance.model, &node_times)
+            if let Some((cockpit, radians)) = aim {
+                if (object_index, component_index)
+                    == (cockpit.object_index, cockpit.component_index)
+                {
+                    apply_manual_turret_elevation(&instance.control, radians, &mut node_times);
+                }
+            }
+            instance.last_sampled_node_times.clone_from(&node_times);
+            let times = node_times
+                .into_iter()
+                .map(|time| time.map(AnimationTime))
+                .collect::<Vec<_>>();
+            let hierarchy = node38_sampled_hierarchy_at_times(&instance.model, &times)
                 .or_else(|| node38_fallback_hierarchy(&instance.model));
             if let Some(hierarchy) = hierarchy {
                 if let Some(pose_buffer) = object_pose_buffers.get_mut(component_index) {
@@ -7538,18 +7546,20 @@ fn update_control_animation_pose_buffers(
     Ok(())
 }
 
-fn control_tree_chain_has_tag21(
+fn control_tree_chain_animates(
     component_index: usize,
     tree: Option<&[fparkan_prototype::UnitComponentTreeNode]>,
     controls: &[Option<PreparedComponentControl>],
+    turret_component: Option<usize>,
 ) -> bool {
     let mut current = Some(component_index);
     let mut remaining = controls.len();
     while let Some(index) = current {
-        if controls
-            .get(index)
-            .and_then(Option::as_ref)
-            .is_some_and(|control| control.typed_records.iter().any(|record| record.tag == 21))
+        if Some(index) == turret_component
+            || controls
+                .get(index)
+                .and_then(Option::as_ref)
+                .is_some_and(|control| control.typed_records.iter().any(|record| record.tag == 21))
         {
             return true;
         }
@@ -8297,6 +8307,7 @@ fn static_preview_mesh_and_materials(
     root: &std::path::Path,
     land_msh_path: &str,
     live_roots: bool,
+    cockpit: Option<StartingCockpit>,
 ) -> Result<StaticPreviewScene, String> {
     let terrain_mesh = terrain
         .source_mesh()
@@ -8512,10 +8523,13 @@ fn static_preview_mesh_and_materials(
                 static_animation_frame,
             )?;
             let timeline_moves_component = static_animation_frame.is_none()
-                && control_tree_chain_has_tag21(
+                && control_tree_chain_animates(
                     component_index,
                     tree.as_deref(),
                     component_controls.map_or(&[][..], |controls| controls.as_slice()),
+                    cockpit
+                        .filter(|cockpit| cockpit.object_index == object_index)
+                        .map(|cockpit| cockpit.component_index),
                 );
             // Native AniMesh only resolves global MSH node sockets for EXTO
             // geometry. Internal INTO components use controller/equipment
@@ -10623,6 +10637,11 @@ impl StaticVulkanApp {
             &mut self.control_animation_instances,
             &mut self.component_pose_buffers,
             control_clock_ms,
+            self.cockpit.zip(
+                self.mission_frame
+                    .as_ref()
+                    .map(|frame| f32::from_bits(frame.player_pitch_bits)),
+            ),
         )?;
         let placements = self
             .mission_frame
@@ -12949,6 +12968,7 @@ mod tests {
             &args.root,
             &loaded.land_msh_path,
             false,
+            None,
         )
         .expect("build AutoDemo static preview");
         let mut component_bindings = preview
@@ -13418,7 +13438,7 @@ mod tests {
         ]];
 
         // The fixture's resolved NDP row supplies the native initial value 1.0.
-        update_control_animation_pose_buffers(&mut instances, &mut poses, 0)
+        update_control_animation_pose_buffers(&mut instances, &mut poses, 0, None)
             .expect("initial active timeline sample");
         let first_root_pose = poses[0][0].as_ref().expect("first root pose").poses[0];
         update_dynamic_component_geometry(
@@ -13484,7 +13504,7 @@ mod tests {
         )
         .expect("initial FX anchor");
 
-        update_control_animation_pose_buffers(&mut instances, &mut poses, 225)
+        update_control_animation_pose_buffers(&mut instances, &mut poses, 225, None)
             .expect("later active timeline sample");
         let later_root_pose = poses[0][0].as_ref().expect("later root pose").poses[0];
         assert_ne!(first_root_pose, later_root_pose);
@@ -13537,7 +13557,7 @@ mod tests {
         assert_ne!(first_fx_anchor[0][3], later_fx_anchor[0][3]);
         assert_ne!(first_fx_anchor[1][3], later_fx_anchor[1][3]);
 
-        update_control_animation_pose_buffers(&mut instances, &mut poses, 225)
+        update_control_animation_pose_buffers(&mut instances, &mut poses, 225, None)
             .expect("repeat the same timeline sample");
         update_dynamic_component_geometry(
             &geometry,
@@ -13559,7 +13579,7 @@ mod tests {
         assert_eq!(shadow_casters[0].sphere, later_shadow_sphere);
         assert_eq!(shadow_casters[0].triangles, later_shadow_triangles);
 
-        update_control_animation_pose_buffers(&mut instances, &mut poses, 0)
+        update_control_animation_pose_buffers(&mut instances, &mut poses, 0, None)
             .expect("return to the initial timeline sample");
         update_dynamic_component_geometry(
             &geometry,
@@ -13722,7 +13742,7 @@ mod tests {
         };
         let control = socket_timeline_control();
         let controls = vec![None, Some(control.clone()), None];
-        assert!(control_tree_chain_has_tag21(2, Some(&tree), &controls));
+        assert!(control_tree_chain_animates(2, Some(&tree), &controls, None));
         let mut instances = vec![vec![
             None,
             Some(ControlAnimationInstance {
@@ -13750,7 +13770,7 @@ mod tests {
             }),
         ]];
 
-        update_control_animation_pose_buffers(&mut instances, &mut poses, 0)
+        update_control_animation_pose_buffers(&mut instances, &mut poses, 0, None)
             .expect("initial visible parent timeline sample");
         update_dynamic_component_geometry(
             &geometry,
@@ -13764,7 +13784,7 @@ mod tests {
         let initial_child_mount = mounts[0][2].expect("initial child mount");
         assert_eq!(initial_child_vertex, initial_child_mount.translation);
 
-        update_control_animation_pose_buffers(&mut instances, &mut poses, 225)
+        update_control_animation_pose_buffers(&mut instances, &mut poses, 225, None)
             .expect("later visible parent timeline sample");
         update_dynamic_component_geometry(
             &geometry,
@@ -14045,6 +14065,7 @@ mod tests {
                 &root,
                 &loaded.land_msh_path,
                 false,
+                None,
             )
             .unwrap_or_else(|error| panic!("prepare renderer mission {mission}: {error}"));
             assert!(!preview.mesh.vertices.is_empty(), "{mission}: empty mesh");
@@ -14097,6 +14118,7 @@ mod tests {
             &root,
             path,
             false,
+            None,
         )
         .expect("terrain is a complete scene without object meshes");
         assert_eq!(preview.mesh_components, 0);
@@ -14638,6 +14660,8 @@ mod tests {
         .unwrap();
         let mut mounts = vec![None; models.len()];
         mounts[cockpit.component_index] = Some(socket);
+        let turret_model = models[cockpit.component_index].validated.clone();
+        let turret_control = controls[cockpit.component_index].clone().unwrap();
         let (mut app, _) = clock_test_app(None);
         app.component_pose_buffers
             .resize_with(cockpit.object_index, Vec::new);
@@ -14678,6 +14702,82 @@ mod tests {
         app.update_mission_camera(0.016, [800.0, 600.0]).unwrap();
         assert_eq!(app.view_camera.position, moved);
         assert!((app.view_camera.forward[2] - 0.5_f32.sin()).abs() < 1e-6);
+
+        let mut instances = vec![Vec::new(); cockpit.object_index + 1];
+        instances[cockpit.object_index].resize_with(cockpit.component_index + 1, || None);
+        instances[cockpit.object_index][cockpit.component_index] = Some(ControlAnimationInstance {
+            gate_values: initial_control_gate_values(&turret_control),
+            control: turret_control,
+            model: turret_model,
+            state: ControlInstanceState::default(),
+            last_sampled_node_times: Vec::new(),
+            reported_unsupported_fallback: false,
+        });
+        let turret_pose = |app: &StaticVulkanApp, node| {
+            let hierarchy = app.component_pose_buffers[cockpit.object_index]
+                [cockpit.component_index]
+                .as_ref()
+                .unwrap();
+            node38_pose_relative_to_root_from_hierarchy(hierarchy, node).unwrap()
+        };
+        let target = turret_pose(&app, 34);
+        let gun = turret_pose(&app, 12);
+        let base = turret_pose(&app, 1);
+        let target_elevation = |pose: VulkanNodePose| {
+            rotate_unit_vector([0.0, 1.0, 0.0], compose_unit_pose(socket, pose).rotation)[2]
+        };
+        let transform = LegacyIron3dEulerTransform {
+            translation: [0.0; 3],
+            orientation_radians: [0.0; 3],
+        };
+        let geometry_for_turret = |app: &StaticVulkanApp, model: &ModelAsset| {
+            project_msh_to_static_mesh_in_world_space_with_node_pose_buffer_and_mount(
+                model,
+                transform,
+                [1.0; 3],
+                app.component_pose_buffers[cockpit.object_index][cockpit.component_index]
+                    .as_ref()
+                    .unwrap(),
+                socket,
+            )
+            .unwrap()
+        };
+        let neutral_mesh = geometry_for_turret(
+            &app,
+            &instances[cockpit.object_index][cockpit.component_index]
+                .as_ref()
+                .unwrap()
+                .model,
+        );
+        update_control_animation_pose_buffers(
+            &mut instances,
+            &mut app.component_pose_buffers,
+            32,
+            Some((
+                cockpit,
+                f32::from_bits(app.mission_frame.as_ref().unwrap().player_pitch_bits),
+            )),
+        )
+        .unwrap();
+        assert_ne!(turret_pose(&app, 34).rotation, target.rotation);
+        assert!(target_elevation(turret_pose(&app, 34)) > target_elevation(target));
+        assert_ne!(turret_pose(&app, 12).translation, gun.translation);
+        assert_eq!(turret_pose(&app, 1), base);
+        let aimed_mesh = geometry_for_turret(
+            &app,
+            &instances[cockpit.object_index][cockpit.component_index]
+                .as_ref()
+                .unwrap()
+                .model,
+        );
+        assert_eq!(neutral_mesh.indices, aimed_mesh.indices);
+        assert!(neutral_mesh
+            .vertices
+            .iter()
+            .zip(&aimed_mesh.vertices)
+            .any(|(neutral, aimed)| neutral.position != aimed.position));
+        app.update_mission_camera(0.016, [800.0, 600.0]).unwrap();
+        assert_eq!(app.view_camera.position, moved);
     }
 
     #[test]

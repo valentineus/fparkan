@@ -1712,6 +1712,45 @@ pub fn sample_control_node_times(
     Ok(state.node_times.clone())
 }
 
+/// Samples the Control turret's vertical row and rows linked to its elevation.
+///
+/// The input is a signed angle from the authored neutral pose. The caller
+/// supplies the current component's sampled node times so unrelated tracks
+/// retain their state.
+pub fn apply_manual_turret_elevation(
+    control: &PreparedComponentControl,
+    radians: f32,
+    node_times: &mut [Option<f32>],
+) {
+    let Some(elevation) = control
+        .typed_records
+        .iter()
+        .find(|record| record.tag == 1)
+        .and_then(|record| record.values.get(1))
+        .and_then(|&index| control.timeline_rows.get(index as usize))
+    else {
+        return;
+    };
+    let span = f32::from_bits(elevation.raw_parameters[3]);
+    if radians == 0.0 || !radians.is_finite() || !span.is_finite() || span <= 0.0 {
+        return;
+    }
+    // shortcut: set the requested blend directly until manual slew timing
+    // and weapon-specific corrections are measured.
+    let blend = (elevation.initial_blend + radians / span).clamp(0.0, 1.0);
+    for row in &control.timeline_rows {
+        let linked = row.flags & (0x40 | 0x2000 | 0x08) == 0x08;
+        if row.flags & 4 != 0 || !(row.row_index == elevation.row_index || linked) {
+            continue;
+        }
+        let Some(sample) = node_times.get_mut(row.node_index) else {
+            continue;
+        };
+        let blend = native_control_blend(blend, row.flags);
+        *sample = Some((1.0 - blend) * row.frame_a + blend * row.frame_b);
+    }
+}
+
 fn shortest_wrapped_distance(previous: f32, next: f32) -> f32 {
     let direct = (next - previous).abs();
     direct.min((1.0 - direct).abs())
@@ -6255,6 +6294,60 @@ mod tests {
             initial_type1_value: 1.0,
         };
         control
+    }
+
+    #[test]
+    fn manual_turret_elevation_samples_linked_rows_and_keeps_other_tracks() {
+        let mut control = tag21_fullcycle_control();
+        let mut turret = control.typed_records[0].clone();
+        turret.tag = 1;
+        turret.values = vec![0, 1];
+        control.typed_records = vec![turret];
+        let make_row = |index, flags| PreparedControlTimelineRow {
+            row_index: index,
+            node_index: index,
+            frame_a: 2.0,
+            frame_b: 10.0,
+            initial_blend: 0.25,
+            raw_parameters: [u32::MAX, u32::MAX, 1.0_f32.to_bits(), 2.0_f32.to_bits()],
+            flags,
+        };
+        control.timeline_rows = vec![
+            make_row(0, 0),
+            make_row(1, 0),
+            make_row(2, 8 | 2),
+            make_row(3, 8 | 0x40),
+            make_row(4, 8 | 0x2000),
+            make_row(5, 8 | 4),
+        ];
+        let initial = [Some(9.0); 6];
+        let mut times = initial;
+        apply_manual_turret_elevation(&control, 0.0, &mut times);
+        assert_eq!(times, initial);
+        apply_manual_turret_elevation(&control, 0.5, &mut times);
+        assert_eq!(
+            times,
+            [
+                Some(9.0),
+                Some(6.0),
+                Some(6.0),
+                Some(9.0),
+                Some(9.0),
+                Some(9.0)
+            ]
+        );
+        apply_manual_turret_elevation(&control, -0.5, &mut times);
+        assert_eq!(
+            times,
+            [
+                Some(9.0),
+                Some(2.0),
+                Some(10.0),
+                Some(9.0),
+                Some(9.0),
+                Some(9.0)
+            ]
+        );
     }
 
     #[test]
