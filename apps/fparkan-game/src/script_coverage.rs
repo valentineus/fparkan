@@ -21,6 +21,9 @@ pub(super) fn log_script_init(engine: &Engine, mission: &str) {
 }
 
 pub(super) fn log_clan_ai_stops(report: &SimulationReport) {
+    for &(clan, target, count) in &report.script_strength_queries {
+        eprintln!("sim_coverage script_combat_strength_approx={count} clan={clan} target={target}");
+    }
     for &(clan, plant, count) in &report.script_factory_orders {
         eprintln!("sim_coverage script_factory_orders_approx={count} clan={clan} plant={plant}");
     }

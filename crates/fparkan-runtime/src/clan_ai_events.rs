@@ -86,6 +86,7 @@ pub(super) struct ClanAiEvents {
     factory_orders: BTreeMap<(u16, u32), u64>,
     factory_jobs: Vec<((u16, Handler2RecordKey), ObjectHandle)>,
     factory_rejections: BTreeMap<(u16, u32), u64>,
+    strength_queries: BTreeMap<(usize, u16), u64>,
 }
 
 impl LoadedMissionState {
@@ -149,6 +150,25 @@ impl LoadedMissionState {
                                 .ok_or("Handler(12) requires a current problem")?
                                 .scalar_1;
                             Ok(Some(VarSetDefault::FloatBits(priority.to_bits())))
+                        }
+                        ScriptDispatchSelector::Handler(38) => {
+                            let (target, mode) = instruction.dword_pair(values)
+                                .ok_or("Handler(38) requires a clan and unit-selection mode")?;
+                            if mode > 1 {
+                                return Err("Handler(38) requires FREE_UNITS or ALL_UNITS".into());
+                            }
+                            let Ok(target) = u16::try_from(target) else {
+                                return Ok(Some(VarSetDefault::Dword(0)));
+                            };
+                            let sum = self.mission_events.clan_units(world, OwnerId(target), mode == 0)
+                                .map(|handle| crate::clan_combat_strength::unit_strength(&self.control_device_tables, handle))
+                                .fold(0.0, |sum, contribution| sum + contribution);
+                            let count = self.clan_ai_events.strength_queries.entry((clan, target)).or_default();
+                            *count += 1;
+                            if *count == 1 {
+                                eprintln!("sim_coverage script_combat_strength_approx=1 clan={clan} target={target} strength={sum}");
+                            }
+                            Ok(Some(VarSetDefault::Dword(sum as u32)))
                         }
                         ScriptDispatchSelector::Handler(59 | 60) => {
                             crate::script_time::result(instruction, values, clock)
@@ -661,6 +681,11 @@ fn storage_space(ores: &[BehaviorOreState], world: &World, clan: OwnerId) -> f32
 }
 
 impl ClanAiEvents {
+    pub(super) fn strength_queries(&self) -> impl Iterator<Item = (usize, u16, u64)> + '_ {
+        self.strength_queries
+            .iter()
+            .map(|(&(clan, target), &count)| (clan, target, count))
+    }
     fn log_research_stub(&mut self, clan: usize, handler: u8, script: &str) {
         let count = self.research_stubs.entry((clan, handler)).or_default();
         *count += 1;

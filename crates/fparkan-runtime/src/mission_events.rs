@@ -152,6 +152,28 @@ pub(super) struct MissionEvents {
 }
 
 impl MissionEvents {
+    pub(super) fn clan_units<'a>(
+        &'a self,
+        world: &'a World,
+        owner: OwnerId,
+        free_only: bool,
+    ) -> impl Iterator<Item = ObjectHandle> + 'a {
+        self.placed_clan_objects
+            .iter()
+            .filter_map(move |&(handle, class)| {
+                if free_only
+                    && (class != super::boarding::WARBOT_CLASS
+                        || self
+                            .reserved_units
+                            .contains(&(usize::from(owner.0), handle)))
+                {
+                    return None;
+                }
+                registration_sequence(world, handle).ok()??;
+                (identity_metadata(world, handle).ok()?.owner_id == Some(owner)).then_some(handle)
+            })
+    }
+
     pub(super) fn count_clan_class(&self, world: &World, owner: OwnerId, class: u32) -> u32 {
         clan_object_classes(&self.placed_clan_objects, world, owner)
             .filter(|&candidate| candidate == class)
