@@ -169,6 +169,10 @@ fn run(args: &[String]) -> Result<String, String> {
     if guard_clans != 0 {
         eprintln!("sim_coverage mission_guard_fallback={guard_clans}");
     }
+    let factory_raids = fparkan_runtime::mission_factory_raid_count(&engine);
+    if factory_raids != 0 {
+        eprintln!("sim_coverage mission_factory_raid_approx={factory_raids}");
+    }
     if !args.viewer {
         if args.mission_mode() == MissionMode::AutoDemo {
             let roots = loaded_mission_object_drafts(&engine).unwrap_or_default();

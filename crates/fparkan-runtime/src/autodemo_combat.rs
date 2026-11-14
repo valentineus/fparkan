@@ -292,7 +292,7 @@ impl AutoDemoCombat {
         };
         let targets = self.targets(&engine.world, &mission.mission_assets);
         for unit in &mut self.units {
-            // shortcut: armed AI units hold position and defend it while their Init is incomplete.
+            // shortcut: armed AI units defend their position while their Init is incomplete.
             let guard = identity_metadata(&engine.world, unit.handle)
                 .ok()
                 .and_then(|identity| identity.owner_id)

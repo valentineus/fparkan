@@ -2423,7 +2423,7 @@ fn load_mission_with_options(
         script_varset_state_count: loaded_scripts.varset_states.len(),
     };
 
-    let unit_patrol = if options.start_autodemo {
+    let mut unit_patrol = if options.start_autodemo {
         match request.mode {
             MissionMode::AutoDemo => unit_patrol::UnitPatrol::new(
                 &mission,
@@ -2468,6 +2468,41 @@ fn load_mission_with_options(
         } else {
             Vec::new()
         };
+    let standalone_mission = mission_path
+        .as_str()
+        .split('/')
+        .nth(1)
+        .is_some_and(|directory| {
+            directory
+                .get(..7)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("Single."))
+        });
+    if let Some(varset) = loaded_scripts
+        .varset
+        .as_ref()
+        .filter(|_| standalone_mission)
+    {
+        let scripted_patrol = unit_patrol.is_some();
+        let mut patrol = unit_patrol
+            .take()
+            .unwrap_or_else(unit_patrol::UnitPatrol::scripted);
+        for bundle in &loaded_scripts.bundles {
+            if guard_clans.get(bundle.clan_index) != Some(&true) {
+                continue;
+            }
+            patrol.approximate_factory_raid(
+                &new_runtime_world,
+                &mission,
+                &object_drafts[..reserve_start],
+                &handles[..reserve_start],
+                bundle,
+                &varset.declarations,
+            );
+        }
+        if patrol.factory_raid_clans != 0 || scripted_patrol {
+            unit_patrol = Some(patrol);
+        }
+    }
     let autodemo_combat = (unit_patrol.is_some() || guard_clans.contains(&true)).then(|| {
         autodemo_combat::AutoDemoCombat::new(
             &vfs,
@@ -2867,13 +2902,23 @@ pub fn autodemo_combat_unavailable(engine: &Engine) -> usize {
         .map_or(0, |combat| combat.unavailable)
 }
 
-/// Counts AI clans using the stationary defense fallback in this mission.
+/// Counts AI clans using the defense fallback in this mission.
 #[must_use]
 pub fn mission_guard_fallback_count(engine: &Engine) -> usize {
     engine
         .autodemo_combat
         .as_ref()
         .map_or(0, autodemo_combat::AutoDemoCombat::guard_clan_count)
+}
+
+/// Counts AI clans approximating the scripted raid on a hostile factory.
+#[must_use]
+pub fn mission_factory_raid_count(engine: &Engine) -> usize {
+    engine
+        .loaded
+        .as_ref()
+        .and_then(|mission| mission.unit_patrol.as_ref())
+        .map_or(0, |patrol| patrol.factory_raid_clans)
 }
 
 /// Returns the loaded mission summary.
@@ -18159,6 +18204,62 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
+    fn licensed_two_fortresses_ai_reaches_the_player_side_from_stock_start() {
+        let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(licensed_root("IS")));
+        let mut engine = create(EngineServices::new(vfs)).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS\\Single.01\\data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(mission_factory_raid_count(&engine), 1);
+        let hero = starting_cockpit(&engine).unwrap();
+        let start = transform_state(&engine.world, hero.handle).unwrap();
+        let factory = mission_object_handle(&engine, OriginalObjectId(5)).unwrap();
+        let [x, y, _] = transform_state(&engine.world, factory)
+            .unwrap()
+            .position
+            .map(f32::from_bits);
+        let mut first_shot = None;
+        for now in (0..=300_000).step_by(100) {
+            let step = frame(&mut engine, now).unwrap();
+            for event in step.autodemo_combat_events {
+                if let AutoDemoCombatEvent::Shot { shooter, .. } = event {
+                    assert_eq!(
+                        fparkan_world::identity_metadata(&engine.world, shooter)
+                            .unwrap()
+                            .owner_id,
+                        Some(fparkan_world::OwnerId(1))
+                    );
+                    let [sx, sy, _] = transform_state(&engine.world, shooter)
+                        .unwrap()
+                        .position
+                        .map(f32::from_bits);
+                    if (sx - x).hypot(sy - y) < 400.0 {
+                        first_shot = Some(now);
+                        break;
+                    }
+                }
+            }
+            if first_shot.is_some() {
+                break;
+            }
+        }
+        assert!(first_shot.is_some(), "no shots on the player side");
+        println!("first raid shot in range of the player factory: {first_shot:?} ms");
+        assert_eq!(transform_state(&engine.world, hero.handle).unwrap(), start);
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_two_fortresses_ai_defends_when_the_player_approaches() {
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(licensed_root("IS")));
         let mut engine = create(EngineServices::new(vfs)).unwrap();
@@ -18228,10 +18329,6 @@ mod tests {
         );
         assert!(!shots.iter().any(|event| matches!(event,
             AutoDemoCombatEvent::Shot { shooter, .. } if *shooter == hero.handle)));
-        assert_eq!(
-            transform_state(&engine.world, enemy).unwrap().position,
-            enemy_pose.position
-        );
         assert!(transform_state(&engine.world, hero.handle).is_err());
         assert_eq!(player_status(&engine, hero.handle), None);
         assert_eq!(failures, 1);

@@ -1,7 +1,11 @@
 use super::{
-    autodemo::MOBILE_UNIT, autodemo_combat::CombatTarget, next_crt_rand, EngineError,
-    MissionDocument, MissionObjectDraft, ObjectHandle, TerrainWorld, TransformState, World,
+    autodemo::{MOBILE_UNIT, PLANT_CLASS},
+    autodemo_combat::CombatTarget,
+    boarding::WARBOT_CLASS,
+    next_crt_rand, EngineError, MissionDocument, MissionObjectDraft, MissionScriptBundle,
+    ObjectHandle, TerrainWorld, TransformState, World,
 };
+use fparkan_script::{Handler15TargetPayload, ScriptDispatchSelector, VarSet};
 use fparkan_terrain::{NavigationQuery, RouteRequest, SurfaceQuery};
 use fparkan_world::{set_transform, transform_state};
 use std::collections::VecDeque;
@@ -12,6 +16,7 @@ pub(super) struct UnitPatrol {
     units: Vec<PatrollingUnit>,
     clock_ms: u32,
     rng: u32,
+    pub(super) factory_raid_clans: usize,
 }
 
 #[derive(Clone)]
@@ -30,12 +35,84 @@ pub(super) struct PreparedPatrol {
 }
 
 impl UnitPatrol {
+    pub(super) fn approximate_factory_raid(
+        &mut self,
+        world: &World,
+        mission: &MissionDocument,
+        drafts: &[MissionObjectDraft],
+        handles: &[ObjectHandle],
+        bundle: &MissionScriptBundle,
+        declarations: &VarSet,
+    ) {
+        let attacks_factory = bundle
+            .package
+            .events
+            .iter()
+            .filter(|event| event.name_raw == b"PBM_BUILDING_ATTACK_Start\0")
+            .flat_map(|event| &event.instructions)
+            .filter(|instruction| {
+                instruction.dispatch_selector() == ScriptDispatchSelector::Handler(28)
+            })
+            .any(|instruction| {
+                declarations
+                    .resolve_handler15(instruction)
+                    .is_ok_and(|order| {
+                        order.word_1 == 3
+                            && order.word_2 == 3
+                            && order.word_3 == PLANT_CLASS
+                            && matches!(order.target, Handler15TargetPayload::ByLogicId(_))
+                    })
+            });
+        if !attacks_factory {
+            return;
+        }
+
+        let clan = &mission.clans[bundle.clan_index];
+        let factories = drafts.iter().filter(|draft| {
+            draft.unit_dat_header_flags == Some(PLANT_CLASS)
+                && mission
+                    .clans
+                    .get(draft.raw_after_resource as usize)
+                    .is_some_and(|owner| {
+                        clan.relations.iter().any(|relation| {
+                            relation.relation_value == 0
+                                && relation.other_clan_name.raw == owner.name.raw
+                        })
+                    })
+        });
+        // shortcut: route placed battle robots toward the nearest hostile factory until
+        // the problem scheduler can select and dispatch a native attack group.
+        let mut ordered = false;
+        for (draft, &handle) in drafts.iter().zip(handles).filter(|(draft, _)| {
+            draft.raw_after_resource as usize == bundle.clan_index
+                && draft.unit_dat_header_flags == Some(WARBOT_CLASS)
+        }) {
+            let distance = |target: &MissionObjectDraft| {
+                (draft.position[0] - target.position[0])
+                    .hypot(draft.position[1] - target.position[1])
+            };
+            if let Some(factory) = factories
+                .clone()
+                .min_by(|a, b| distance(a).total_cmp(&distance(b)))
+            {
+                ordered |= self.order(
+                    world,
+                    handle,
+                    [factory.position[0], factory.position[1]],
+                    60.0,
+                );
+            }
+        }
+        self.factory_raid_clans += usize::from(ordered);
+    }
+
     pub(super) fn scripted() -> Self {
         Self {
             center: None,
             units: Vec::new(),
             clock_ms: 0,
             rng: 1,
+            factory_raid_clans: 0,
         }
     }
 
@@ -110,6 +187,7 @@ impl UnitPatrol {
             units,
             clock_ms: 0,
             rng: 1,
+            factory_raid_clans: 0,
         })
     }
 
