@@ -3893,8 +3893,9 @@ fn control_i32_at(payload: &[u8], offset: usize) -> Option<i32> {
     ))
 }
 
-const CONTROL_TYPED_COMMON_PARSER_TAGS: &[u32] =
-    &[1, 2, 3, 4, 5, 8, 9, 10, 12, 13, 15, 17, 19, 21, 25, 26, 27];
+const CONTROL_TYPED_COMMON_PARSER_TAGS: &[u32] = &[
+    1, 2, 3, 4, 5, 8, 9, 10, 12, 13, 15, 17, 19, 21, 24, 25, 26, 27, 29, 30,
+];
 const CONTROL_TYPED_RECORD_FIXED_BYTES: usize = 0xB0;
 const CONTROL_TYPED_RECORD_COUNT_OFFSET: usize = 0xAC;
 const CONTROL_TYPED_RECORD_LIMIT: usize = 4096;
@@ -6510,9 +6511,12 @@ mod tests {
             type_id: None,
         };
         let mut payload = component_control_payload(&[(1, 0.0, 1.0, 0.25, 0)]);
-        payload[12..16].copy_from_slice(&1_u32.to_le_bytes());
+        payload[12..16].copy_from_slice(&4_u32.to_le_bytes());
         payload[16..20].copy_from_slice(&1_u32.to_le_bytes());
         append_typed_record(&mut payload, 21, 0);
+        append_typed_record(&mut payload, 24, 0);
+        append_typed_record(&mut payload, 29, 0);
+        append_typed_record(&mut payload, 30, 0);
         let group_header_start = payload.len();
         payload.resize(group_header_start + CONTROL_EFFECT_GROUP_HEADER_BYTES, 0);
         payload.extend_from_slice(&0_u32.to_le_bytes());
@@ -6521,6 +6525,14 @@ mod tests {
             .expect("zero-length record has no trailing string byte");
 
         assert_eq!(control.bindings.len(), 1);
+        assert_eq!(
+            control
+                .typed_records
+                .iter()
+                .map(|record| record.tag)
+                .collect::<Vec<_>>(),
+            [21, 24, 29, 30]
+        );
         assert_eq!(
             control.effect_section,
             PreparedControlEffectSection::Parsed(Vec::new())
