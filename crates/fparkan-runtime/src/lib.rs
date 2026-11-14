@@ -45,6 +45,7 @@ mod autodemo;
 mod mesh_collision;
 mod mission_events;
 mod player_motion;
+mod player_weapon;
 
 pub use autodemo::{autodemo_camera, AutoDemoCamera, AutoDemoView};
 pub use fparkan_assets::MissionAssets;
@@ -52,6 +53,7 @@ pub use mesh_collision::{query_building_segment_world, BuildingMeshHit, Building
 use mission_events::MissionEvents;
 pub use mission_events::{MissionEventStop, MissionEventTick, MissionNotice};
 pub use player_motion::{plan_player_motion, PlayerMotion, PlayerMotionStep};
+pub use player_weapon::{starting_player_weapons, PlayerWeapons};
 
 const MISSION_DECODED_PAYLOAD_CACHE_ENTRIES: usize = 256;
 const MAX_MISSION_AI_RECORD_SLOTS: usize = 1_000_000;
@@ -8182,6 +8184,7 @@ mod tests {
             node_data: None,
             effect_section: PreparedControlEffectSection::Parsed(rows),
             initial_effect_group,
+            node_effect_links: Vec::new(),
             point_list: point_count.map(|count| PreparedControlPointList {
                 source: synthetic_resource_key(941),
                 points: (0..count)
@@ -8686,6 +8689,7 @@ mod tests {
             node_data: None,
             effect_section,
             initial_effect_group: None,
+            node_effect_links: Vec::new(),
             point_list: None,
         }
     }
@@ -17213,6 +17217,28 @@ mod tests {
             },
         )
         .unwrap();
+        let cockpit = starting_cockpit(&engine).unwrap();
+        let weapons = starting_player_weapons(&engine, cockpit);
+        let projectiles = weapons
+            .weapons()
+            .iter()
+            .map(|weapon| weapon.projectile.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(projectiles, ["bb_h_01", "bp_h_01", "bl_h_01", "bm_h_01"]);
+        let effects = weapons
+            .weapons()
+            .iter()
+            .map(|weapon| weapon.effect.as_ref().map(|(_, name)| name.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            effects,
+            [
+                Some("hero_cannon"),
+                Some("hero_prifle"),
+                Some("hero_redlaser"),
+                None
+            ]
+        );
         let first = frame(&mut engine, 5).unwrap().mission_event.unwrap();
         assert_eq!(
             first.notices,

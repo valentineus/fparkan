@@ -82,11 +82,11 @@ use fparkan_runtime::{
     load_mission_static_preview, load_mission_static_preview_roots, load_mission_with_init_stubs,
     loaded_mission_assets, loaded_mission_object_drafts, loaded_mission_script_bundles,
     loaded_terrain, mission_object_handle, plan_player_motion, query_building_segment_world,
-    simulate_mission_report, starting_cockpit, AutoDemoCamera, AutoDemoView, BasementPlacementMode,
-    BuildingMeshNode, Engine, EngineError, EngineServices, FrameResult, LoadedMission,
-    MissionAssets, MissionEventStop, MissionMode, MissionNotice, MissionObjectDraft,
-    MissionRequest, MissionScriptInitExecution, MissionStartupInput, PlayerMotion, StartingCockpit,
-    SIMULATION_COVERAGE,
+    simulate_mission_report, starting_cockpit, starting_player_weapons, AutoDemoCamera,
+    AutoDemoView, BasementPlacementMode, BuildingMeshNode, Engine, EngineError, EngineServices,
+    FrameResult, LoadedMission, MissionAssets, MissionEventStop, MissionMode, MissionNotice,
+    MissionObjectDraft, MissionRequest, MissionScriptInitExecution, MissionStartupInput,
+    PlayerMotion, PlayerWeapons, StartingCockpit, SIMULATION_COVERAGE,
 };
 #[cfg(test)]
 use fparkan_terrain::BasementFoundationFragment;
@@ -271,6 +271,7 @@ fn run(args: &[String]) -> Result<String, String> {
         preview,
         environment,
         audio,
+        &args.root,
         (!args.viewer).then_some(engine),
         demo_camera,
         args.frames,
@@ -9656,6 +9657,7 @@ fn run_static_vulkan_mode(
     preview: StaticPreviewScene,
     environment: Option<DynamicEnvironment>,
     audio: Option<audio::GameAudio>,
+    root: &Path,
     mission_engine: Option<Engine>,
     demo_camera: Option<AutoDemoCamera>,
     target_frames: u64,
@@ -9750,6 +9752,35 @@ fn run_static_vulkan_mode(
         if app.cockpit.is_some() {
             app.camera_mode = "starting-cockpit";
         }
+        if let Some(cockpit) = app.cockpit {
+            app.player_weapons = starting_player_weapons(engine, cockpit);
+            if app.player_weapons.weapons().is_empty() {
+                eprintln!("sim_coverage player_weapon_layout_stub=1");
+            }
+            app.player_weapon_sounds = app
+                .player_weapons
+                .weapons()
+                .iter()
+                .map(|weapon| {
+                    let sound = weapon.effect.as_ref().and_then(|(archive, name)| {
+                        let bytes =
+                            load_resource_entry_bytes_from_root(root, archive, name).ok()?;
+                        let effect = decode_fxid(bytes).ok()?;
+                        effect
+                            .commands()
+                            .iter()
+                            .find_map(Op2SoundCommand::from_command)
+                    });
+                    if sound.is_none() {
+                        eprintln!(
+                            "sim_coverage player_weapon_sound_stub=1 projectile={}",
+                            weapon.projectile
+                        );
+                    }
+                    sound
+                })
+                .collect();
+        }
         eprintln!(
             "{SIMULATION_COVERAGE} {}",
             mission_camera_coverage(app.cockpit, app.demo_camera.is_some()),
@@ -9765,7 +9796,7 @@ fn mission_camera_coverage(cockpit: Option<StartingCockpit>, demo: bool) -> &'st
     if demo {
         "autodemo_camera_follow_approx=1 autodemo_camera_target_approx=1 cockpit_pose_approx=1"
     } else if cockpit.is_some() {
-        "player_motion_approx=1 cockpit_aim_approx=1 cockpit_pose_approx=1"
+        "player_motion_approx=1 cockpit_aim_approx=1 cockpit_pose_approx=1 player_weapon_cycle_approx=1 player_projectile_stub=1 player_weapon_fx_stub=1"
     } else {
         "mission_camera_stub=1"
     }
@@ -9849,6 +9880,10 @@ struct StaticVulkanApp {
     player_move_pressed: [bool; 4],
     mouse_look: bool,
     player_mouse: [f32; 2],
+    player_weapons: PlayerWeapons,
+    player_weapon_sounds: Vec<Option<Op2SoundCommand>>,
+    player_fire_held: bool,
+    player_fire_pressed: bool,
     audio: Option<audio::GameAudio>,
     camera_mode: &'static str,
     mesh_components: usize,
@@ -9971,6 +10006,10 @@ impl StaticVulkanApp {
             player_move_pressed: [false; 4],
             mouse_look: false,
             player_mouse: [0.0; 2],
+            player_weapons: PlayerWeapons::default(),
+            player_weapon_sounds: Vec::new(),
+            player_fire_held: false,
+            player_fire_pressed: false,
             audio,
             camera_mode: preview.camera_mode,
             mesh_components: preview.mesh_components,
@@ -10331,6 +10370,90 @@ impl StaticVulkanApp {
         )
     }
 
+    fn update_player_fire(&mut self, clock_ms: u32) {
+        let trigger = self.player_fire_held || self.player_fire_pressed;
+        self.player_fire_pressed = false;
+        let (Some(cockpit), Some(frame)) = (self.cockpit, &self.mission_frame) else {
+            return;
+        };
+        if !trigger {
+            return;
+        }
+        let Some((_, state)) = frame
+            .snapshot
+            .transforms
+            .iter()
+            .find(|(handle, _)| *handle == cockpit.handle)
+        else {
+            return;
+        };
+        let Some(hierarchy) = self
+            .component_pose_buffers
+            .get(cockpit.object_index)
+            .and_then(|components| components.get(cockpit.component_index))
+            .and_then(Option::as_ref)
+        else {
+            return;
+        };
+        let mount = self
+            .component_mount_poses
+            .get(cockpit.object_index)
+            .and_then(|components| components.get(cockpit.component_index))
+            .copied()
+            .flatten();
+        let transform = LegacyIron3dEulerTransform {
+            translation: state.position.map(f32::from_bits),
+            orientation_radians: state.orientation.map(f32::from_bits),
+        };
+        let scale = state.scale.map(f32::from_bits);
+        for (slot, weapon) in self.player_weapons.fire(trigger, clock_ms) {
+            let pose = control_effect_owner_node_pose(
+                Some(hierarchy),
+                mount.is_some(),
+                weapon.muzzle.raw_signed_field_04 as usize,
+            );
+            let muzzle = pose.and_then(|pose| {
+                let pose = mount.map_or(pose, |mount| compose_unit_pose(mount, pose));
+                transform.try_transform_scaled_point(
+                    add3(
+                        pose.translation,
+                        rotate_unit_vector(weapon.muzzle.position, pose.rotation),
+                    ),
+                    scale,
+                )
+            });
+            let Some(muzzle) = muzzle else {
+                eprintln!("sim_coverage player_weapon_pose_stub=1 slot={}", slot + 1);
+                continue;
+            };
+            eprintln!(
+                "player_shot slot={} projectile={}:{} queue_time_ms={clock_ms} muzzle={muzzle:?}",
+                slot + 1,
+                weapon.projectile_archive,
+                weapon.projectile
+            );
+            if let (Some(sound), Some(audio)) = (
+                self.player_weapon_sounds.get(slot).and_then(Option::as_ref),
+                self.audio.as_mut(),
+            ) {
+                if let Some(event) = sound.one_shot_at(muzzle) {
+                    match audio.handle_sound_event(&event) {
+                        Ok(()) => eprintln!(
+                            "player_shot_sound slot={} resource={}:{} queue_time_ms={clock_ms}",
+                            slot + 1,
+                            event.archive,
+                            event.name
+                        ),
+                        Err(error) => eprintln!(
+                            "sim_coverage player_weapon_sound_stub=1 slot={} reason={error}",
+                            slot + 1
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
     fn building_segment_blocked(&self, world_segment: [[f32; 3]; 2]) -> Result<bool, String> {
         for binding in &self.building_collision_bindings {
             if binding.selected_nodes.is_empty() {
@@ -10664,6 +10787,7 @@ impl StaticVulkanApp {
             }
         }
         self.update_mission_camera(clock.delta_seconds, viewport)?;
+        self.update_player_fire(control_clock_ms);
         refresh_dynamic_shadow_casters(
             &mut self.shadow_casters,
             &self.dynamic_shadow_casters,
@@ -11251,6 +11375,10 @@ impl StaticVulkanApp {
 
     fn set_mouse_look(&mut self, active: bool) {
         self.mouse_look = active;
+        if !active {
+            self.player_fire_held = false;
+            self.player_fire_pressed = false;
+        }
         if let Some(window) = self.window.as_ref() {
             if active {
                 // Relative device motion keeps the camera usable at the edge
@@ -11649,6 +11777,22 @@ impl ApplicationHandler for StaticVulkanApp {
                     } else if event.state == ElementState::Pressed {
                         self.pressed_keys.insert(code);
                         if self.cockpit.is_some() && !self.mission_paused && !event.repeat {
+                            if let Some(slot) = [
+                                KeyCode::Digit0,
+                                KeyCode::Digit1,
+                                KeyCode::Digit2,
+                                KeyCode::Digit3,
+                                KeyCode::Digit4,
+                                KeyCode::Digit5,
+                                KeyCode::Digit6,
+                                KeyCode::Digit7,
+                                KeyCode::Digit8,
+                            ]
+                            .iter()
+                            .position(|&key| key == code)
+                            {
+                                self.player_weapons.select(slot);
+                            }
                             if let Some(index) = [
                                 KeyCode::ArrowRight,
                                 KeyCode::ArrowLeft,
@@ -11667,6 +11811,15 @@ impl ApplicationHandler for StaticVulkanApp {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                if button == MouseButton::Left
+                    && self.cockpit.is_some()
+                    && self.demo_camera.is_none()
+                    && self.mouse_look
+                    && !self.mission_paused
+                {
+                    self.player_fire_held = state == ElementState::Pressed;
+                    self.player_fire_pressed |= self.player_fire_held;
+                }
                 if button == MouseButton::Right && self.demo_camera.is_none() {
                     if self.cockpit.is_none() {
                         self.set_mouse_look(state == ElementState::Pressed);
@@ -13260,6 +13413,7 @@ mod tests {
             node_data: None,
             effect_section: PreparedControlEffectSection::Absent,
             initial_effect_group: None,
+            node_effect_links: Vec::new(),
             point_list: None,
         }
     }

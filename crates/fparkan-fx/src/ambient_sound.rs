@@ -89,6 +89,24 @@ impl Op2SoundCommand {
         })
     }
 
+    /// Starts a prepared one-shot at its initial authored parameters.
+    #[must_use]
+    pub fn one_shot_at(&self, position: [f32; 3]) -> Option<SoundEvent> {
+        if self.looping || !position.iter().all(|axis| axis.is_finite()) {
+            return None;
+        }
+        Some(SoundEvent {
+            archive: self.archive.clone(),
+            name: self.name.clone(),
+            position,
+            volume: 1.0,
+            min_distance: self.min_distance,
+            max_distance: self.max_distance,
+            frequency_ratio: self.frequency,
+            action: SoundAction::OneShot,
+        })
+    }
+
     /// Evaluates Effect.dll's phase crossings and current source parameters.
     /// `playing` comes from the audio owner, since a one-shot can finish between
     /// updates. The matrix maps local command coordinates into world space.

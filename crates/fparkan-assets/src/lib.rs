@@ -1104,6 +1104,8 @@ pub struct PreparedComponentControl {
     /// Validated group selected by native Control's first effect-group
     /// header word; `None` is the native no-group sentinel or an invalid index.
     pub initial_effect_group: Option<usize>,
+    /// Node-to-effect links from Control opcode 14, resolved within each group.
+    pub node_effect_links: Vec<(usize, u32, u32)>,
     /// Component-local points selected for parsed effect rows, when present.
     pub point_list: Option<PreparedControlPointList>,
 }
@@ -3950,6 +3952,7 @@ struct DecodedComponentEffectSection {
     initial_effect_group: Option<usize>,
     initial_group_opcodes: Option<Vec<u32>>,
     typed_records: Vec<PreparedControlTypedRecord>,
+    node_effect_links: Vec<(usize, u32, u32)>,
 }
 
 fn decode_component_effect_section<F>(
@@ -3975,6 +3978,7 @@ where
             initial_effect_group: None,
             initial_group_opcodes: (cursor == payload.len()).then(Vec::new),
             typed_records: Vec::new(),
+            node_effect_links: Vec::new(),
         });
     }
     if typed_record_count > CONTROL_TYPED_RECORD_LIMIT {
@@ -3997,6 +4001,7 @@ where
                 initial_effect_group: None,
                 initial_group_opcodes: None,
                 typed_records,
+                node_effect_links: Vec::new(),
             });
         }
 
@@ -4098,6 +4103,7 @@ where
             initial_effect_group: None,
             initial_group_opcodes: complete.then(Vec::new),
             typed_records,
+            node_effect_links: Vec::new(),
         });
     }
 
@@ -4117,6 +4123,7 @@ where
 
     let mut initial_group_opcodes = Some(Vec::new());
     let mut effect_rows = Vec::new();
+    let mut node_effect_links = Vec::new();
     for table_index in 0..effect_group_count {
         let row_count = usize::try_from(
             control_u32_at(payload, cursor)
@@ -4143,6 +4150,11 @@ where
             let row_start = rows_start + row_index * CONTROL_EFFECT_ROW_BYTES;
             let row = &payload[row_start..row_start + CONTROL_EFFECT_ROW_BYTES];
             let opcode = control_u32_at(row, 0x0C).expect("fixed effect row has opcode");
+            if opcode == 14 {
+                let selector = control_u32_at(row, 0x10).expect("fixed row has a selector");
+                let node = control_u32_at(row, 0x14).expect("fixed row has a node");
+                node_effect_links.push((table_index, node, selector));
+            }
             if initial_effect_group == Some(table_index) {
                 initial_group_opcodes
                     .as_mut()
@@ -4190,6 +4202,7 @@ where
             initial_effect_group: None,
             initial_group_opcodes: None,
             typed_records,
+            node_effect_links: Vec::new(),
         });
     }
     Ok(DecodedComponentEffectSection {
@@ -4197,6 +4210,7 @@ where
         initial_effect_group,
         initial_group_opcodes,
         typed_records,
+        node_effect_links,
     })
 }
 
@@ -4376,6 +4390,7 @@ fn decode_component_control_payload_with_opcodes(
             node_data: None,
             effect_section: decoded_effect.section,
             initial_effect_group: decoded_effect.initial_effect_group,
+            node_effect_links: decoded_effect.node_effect_links,
             point_list: None,
         },
         initial_group_opcodes,
