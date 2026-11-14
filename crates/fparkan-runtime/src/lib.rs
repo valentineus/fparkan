@@ -18039,6 +18039,34 @@ mod tests {
             after.notices.contains(&MissionNotice::ObjectiveComplete(0)),
             "{after:?}"
         );
+        for (time, slot, objective, plate) in [
+            (4_001, 4, 1, [750.0_f32, 950.7, 45.88]),
+            (6_001, 5, 2, [950.7, 869.4, 69.98]),
+            (8_001, 3, 4, [1179.28, 1242.12, 101.60]),
+        ] {
+            if slot == 3 {
+                pose.position = [plate[0], plate[1], 110.28].map(f32::to_bits);
+                set_transform(&mut engine.world, cockpit.handle, pose).unwrap();
+                assert_eq!(
+                    capture_neutral_building(&mut engine, cockpit).unwrap(),
+                    None
+                );
+            }
+            pose.position = plate.map(f32::to_bits);
+            set_transform(&mut engine.world, cockpit.handle, pose).unwrap();
+            assert_eq!(
+                capture_neutral_building(&mut engine, cockpit).unwrap(),
+                Some(OriginalObjectId(slot)),
+            );
+            let event = frame(&mut engine, time).unwrap().mission_event.unwrap();
+            assert!(event.stop.is_none(), "{event:?}");
+            assert!(
+                event
+                    .notices
+                    .contains(&MissionNotice::ObjectiveComplete(objective)),
+                "{event:?}"
+            );
+        }
     }
 
     #[test]
