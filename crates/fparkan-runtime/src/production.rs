@@ -23,7 +23,8 @@ pub(super) const RESERVE_SLOTS: usize = 8;
 const PAID_MINIMUM_MS: u32 = 5_000;
 const RESOURCE_EPSILON: f32 = 0.01;
 
-pub(super) fn default_prebuild(config: &[u8]) -> Result<Option<NormalizedPath>, EngineError> {
+pub(super) fn mission_prebuilds(config: &[u8]) -> Result<Vec<NormalizedPath>, EngineError> {
+    let mut schemes = Vec::new();
     let mut in_prebuild = false;
     for line in config.split(|&byte| byte == b'\n') {
         let line = line.trim_ascii();
@@ -44,23 +45,27 @@ pub(super) fn default_prebuild(config: &[u8]) -> Result<Option<NormalizedPath>, 
                 if key.trim_ascii_end().ends_with(b"=") && fields.next().is_some() {
                     if let Some(name) = name {
                         let name = std::str::from_utf8(name).map_err(production_error)?;
-                        // shortcut: choose the first configured design until the factory menu can select one.
                         let path = normalize_engine_path(
                             "mission prebuild",
                             &format!("UNITS/UNITS/PREBLD/{name}"),
                         )?;
-                        return Ok(Some(path));
+                        if !schemes.iter().any(|entry: &NormalizedPath| {
+                            entry.as_bytes().eq_ignore_ascii_case(path.as_bytes())
+                        }) {
+                            schemes.push(path);
+                        }
                     }
                 }
             }
             _ => {}
         }
     }
-    Ok(None)
+    Ok(schemes)
 }
 
 pub(super) struct Production {
     reserve_start: usize,
+    schemes: Vec<NormalizedPath>,
     controls: Vec<MissionControlDeviceTableState>,
     plants: Vec<(usize, u32)>,
     pending: Option<Order>,
@@ -129,19 +134,26 @@ impl PaidOrder {
 impl Production {
     pub(super) fn new(
         reserve_start: usize,
+        schemes: Vec<NormalizedPath>,
         controls: Vec<MissionControlDeviceTableState>,
         drafts: &[MissionObjectDraft],
     ) -> Result<Self, EngineError> {
-        if controls.len() != RESERVE_SLOTS
+        if controls.len() / RESERVE_SLOTS != schemes.len()
+            || !controls.len().is_multiple_of(RESERVE_SLOTS)
             || drafts.len().checked_sub(reserve_start) != Some(controls.len())
         {
             return Err(EngineError::Production(
                 "missing prepared build scheme slots".into(),
             ));
         }
-        if !drafts[reserve_start]
-            .unit_dat_header_flags
-            .is_some_and(|class| class & MOBILE_UNIT != 0 && class != super::HERO_UNIT_CLASS)
+        if drafts[reserve_start..]
+            .iter()
+            .step_by(RESERVE_SLOTS)
+            .any(|draft| {
+                !draft.unit_dat_header_flags.is_some_and(|class| {
+                    class & MOBILE_UNIT != 0 && class != super::HERO_UNIT_CLASS
+                })
+            })
         {
             return Err(EngineError::Production(
                 "build scheme must be a mobile Unit DAT".into(),
@@ -162,6 +174,7 @@ impl Production {
             .collect();
         Ok(Self {
             reserve_start,
+            schemes,
             controls,
             plants,
             pending: None,
@@ -260,52 +273,73 @@ pub fn order_factory_robot(
     cockpit: StartingCockpit,
     now_ms: u32,
 ) -> Result<u32, EngineError> {
+    order_factory_scheme(engine, cockpit, 0, now_ms)
+}
+
+/// Returns factory schemes that fit the friendly factory at the current communicator.
+/// Each entry preserves its configured index for use with [`order_factory_scheme`].
+pub fn factory_schemes(
+    engine: &Engine,
+    cockpit: StartingCockpit,
+) -> Result<Vec<(usize, &str)>, EngineError> {
+    let (mission, production) = loaded_production(engine)?;
+    let (plant, _, _, _) = factory_at_communicator(&engine.world, mission, production, cockpit)?;
+    let plant_key = &mission.object_drafts[plant].unit_components[0].resource_raw;
+    Ok(production
+        .schemes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, path)| {
+            let draft = &mission.object_drafts[production.reserve_start + index * RESERVE_SLOTS];
+            free_duration_ms(plant_key, &draft.unit_components[0].resource_raw)?;
+            Some((index, path.as_str()))
+        })
+        .collect())
+}
+
+/// Orders a particular configured scheme using the current friendly factory.
+pub fn order_factory_scheme(
+    engine: &mut Engine,
+    cockpit: StartingCockpit,
+    scheme: usize,
+    now_ms: u32,
+) -> Result<u32, EngineError> {
     let (Some(mission), Some(production)) = (&mut engine.loaded, &mut engine.production) else {
         return Err(EngineError::Production(
             "mission has no prepared robot design; use --build-scheme to choose one".into(),
         ));
     };
+    let (plant_index, plant, owner, is_free) =
+        factory_at_communicator(&engine.world, mission, production, cockpit)?;
     if production.pending.is_some() {
         return Err(EngineError::Production(
             "factory order already in progress".into(),
         ));
     }
-    let slot = (production.reserve_start..production.reserve_start + production.controls.len())
-        .find(|&index| {
-            mission.object_drafts[index]
-                .original_id
-                .is_some_and(|id| handle_by_original_id(&engine.world, id).is_none())
-        })
+    if scheme >= production.schemes.len() {
+        return Err(EngineError::Production("unknown factory scheme".into()));
+    }
+    let slot_start = production.reserve_start + scheme * RESERVE_SLOTS;
+    let free_slot = |index: usize| {
+        mission.object_drafts[index]
+            .original_id
+            .is_some_and(|id| handle_by_original_id(&engine.world, id).is_none())
+    };
+    let live = (production.reserve_start..production.reserve_start + production.controls.len())
+        .filter(|&index| !free_slot(index))
+        .take(RESERVE_SLOTS)
+        .count();
+    if live >= RESERVE_SLOTS {
+        return Err(EngineError::Production(
+            "all prepared factory robot slots are occupied".into(),
+        ));
+    }
+    let slot = (slot_start..slot_start + RESERVE_SLOTS)
+        .find(|&index| free_slot(index))
         .ok_or_else(|| {
             EngineError::Production("all prepared factory robot slots are occupied".into())
         })?;
     let draft = &mission.object_drafts[slot];
-    let player = identity_metadata(&engine.world, cockpit.handle)?;
-    let owner = player
-        .owner_id
-        .ok_or_else(|| EngineError::Production("player clan is unavailable".into()))?;
-    let position = transform_state(&engine.world, cockpit.handle)?
-        .position
-        .map(f32::from_bits);
-    let (plant_index, plant, is_free) = production
-        .plants
-        .iter()
-        .find_map(|(index, slots)| {
-            let plant =
-                handle_by_original_id(&engine.world, mission.object_drafts[*index].original_id?)?;
-            (identity_metadata(&engine.world, plant).ok()?.owner_id == Some(owner)
-                && on_communicator(
-                    &mission.mission_assets,
-                    *index,
-                    PLANT_CLASS,
-                    transform_state(&engine.world, plant).ok()?,
-                    position,
-                ))
-            .then_some((*index, plant, *slots != 0))
-        })
-        .ok_or_else(|| {
-            EngineError::Production("stand on a friendly factory communicator".into())
-        })?;
     let plant_draft = &mission.object_drafts[plant_index];
     let plant_key = &plant_draft.unit_components[0].resource_raw;
     let robot_key = &draft.unit_components[0].resource_raw;
@@ -365,6 +399,48 @@ pub fn order_factory_robot(
         paid,
     });
     Ok(duration_ms)
+}
+
+fn loaded_production(engine: &Engine) -> Result<(&LoadedMissionState, &Production), EngineError> {
+    engine
+        .loaded
+        .as_ref()
+        .zip(engine.production.as_ref())
+        .ok_or_else(|| {
+            EngineError::Production(
+                "mission has no prepared robot design; use --build-scheme to choose one".into(),
+            )
+        })
+}
+
+fn factory_at_communicator(
+    world: &World,
+    mission: &LoadedMissionState,
+    production: &Production,
+    cockpit: StartingCockpit,
+) -> Result<(usize, ObjectHandle, OwnerId, bool), EngineError> {
+    let owner = identity_metadata(world, cockpit.handle)?
+        .owner_id
+        .ok_or_else(|| EngineError::Production("player clan is unavailable".into()))?;
+    let position = transform_state(world, cockpit.handle)?
+        .position
+        .map(f32::from_bits);
+    production
+        .plants
+        .iter()
+        .find_map(|&(index, slots)| {
+            let plant = handle_by_original_id(world, mission.object_drafts[index].original_id?)?;
+            (identity_metadata(world, plant).ok()?.owner_id == Some(owner)
+                && on_communicator(
+                    &mission.mission_assets,
+                    index,
+                    PLANT_CLASS,
+                    transform_state(world, plant).ok()?,
+                    position,
+                ))
+            .then_some((index, plant, owner, slots != 0))
+        })
+        .ok_or_else(|| EngineError::Production("stand on a friendly factory communicator".into()))
 }
 
 fn production_error(error: impl std::fmt::Display) -> EngineError {
@@ -496,19 +572,26 @@ mod tests {
     use fparkan_world::{set_transform, InputSnapshot, OriginalObjectId};
 
     #[test]
-    fn first_mission_prebuild_supplies_the_default_design() {
+    fn mission_prebuilds_preserve_order_and_skip_duplicates() {
         let config = b"object other\n model1 = \"ignored.dat\"\nend\r\n\
             OBJECT PreBuild\r\n # model1 = \"comment.dat\"\r\n\
-            model2=\"first.dat\"\r\n model1 = \"second.dat\"\r\nend\n";
+            model2=\"first.dat\"\r\n model1 = \"second.dat\"\r\n model3=\"FIRST.DAT\"\r\nend\n";
         assert_eq!(
-            default_prebuild(config).unwrap().unwrap().as_str(),
-            "UNITS/UNITS/PREBLD/first.dat"
+            mission_prebuilds(config)
+                .unwrap()
+                .iter()
+                .map(NormalizedPath::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "UNITS/UNITS/PREBLD/first.dat",
+                "UNITS/UNITS/PREBLD/second.dat"
+            ]
         );
-        assert!(default_prebuild(
+        assert!(mission_prebuilds(
             b"object prebuild\nend\nobject other\nmodel1 = \"ignored.dat\"\nend"
         )
         .unwrap()
-        .is_none());
+        .is_empty());
     }
 
     #[test]

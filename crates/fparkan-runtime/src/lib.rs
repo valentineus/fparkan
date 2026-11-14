@@ -71,7 +71,7 @@ pub use mission_events::{
 pub use player_motion::{plan_player_motion, PlayerMotion, PlayerMotionStep};
 pub use player_status::{player_status, PlayerStatus};
 pub use player_weapon::{prepared_warbot_weapons, starting_player_weapons, PlayerWeapons};
-pub use production::order_factory_robot;
+pub use production::{factory_schemes, order_factory_robot, order_factory_scheme};
 pub use projectile::{
     apply_projectile_hit, load_player_projectile, projectile_terrain_hit, projectile_unit_hit,
     PlayerProjectile, ProjectileAssets, ProjectileContact,
@@ -1861,15 +1861,13 @@ fn load_mission_with_options(
     } else {
         Arc::from(&[][..])
     };
-    let default_scheme = if build_scheme.is_none()
-        && options.start_autodemo
-        && request.mode == MissionMode::SingleMission
-    {
-        production::default_prebuild(&config)?
+    let build_schemes = if let Some(scheme) = build_scheme {
+        vec![scheme.clone()]
+    } else if options.start_autodemo && request.mode == MissionMode::SingleMission {
+        production::mission_prebuilds(&config)?
     } else {
-        None
+        Vec::new()
     };
-    let build_scheme = build_scheme.or(default_scheme.as_ref());
 
     let land_path =
         decode_mission_land_path(&mission_bytes, TmaProfile::Strict).map_err(|source| {
@@ -1953,7 +1951,7 @@ fn load_mission_with_options(
                 .take(plan.reserve_per_scheme)
         }));
     }
-    if let Some(scheme) = build_scheme {
+    for scheme in &build_schemes {
         graph_roots.extend(
             std::iter::repeat_with(|| resource_name(scheme.as_str().as_bytes()))
                 .take(production::RESERVE_SLOTS),
@@ -2491,11 +2489,12 @@ fn load_mission_with_options(
     for (site, control) in mine_sites.iter_mut().zip(mine_controls) {
         site.control = Some(control);
     }
-    let (autodemo_reinforcements, production) = if build_scheme.is_some() {
+    let (autodemo_reinforcements, production) = if !build_schemes.is_empty() {
         (
             None,
             Some(production::Production::new(
                 reserve_start,
+                build_schemes,
                 reserve_controls,
                 &object_drafts[..mine_reserve_start],
             )?),
@@ -18100,7 +18099,21 @@ mod tests {
         );
         assert_eq!(count(&engine), initial_count - 1);
         assert_eq!(capture_building(&mut engine, hero).unwrap(), None);
-        assert!(order_factory_robot(&mut engine, hero, 10).is_ok());
+        let choices = factory_schemes(&engine, hero).unwrap();
+        assert_eq!(
+            choices,
+            [
+                (0, "UNITS/UNITS/PREBLD/scr_pre1.dat"),
+                (1, "UNITS/UNITS/PREBLD/scr_pre2.dat"),
+            ],
+        );
+        let duration = order_factory_scheme(&mut engine, hero, 1, 10).unwrap();
+        let produced = frame(&mut engine, 10 + duration)
+            .unwrap()
+            .produced_unit
+            .unwrap();
+        let draft = &loaded_mission_object_drafts(&engine).unwrap()[produced.object_index];
+        assert!(draft.resource_name_raw.ends_with(b"scr_pre2.dat"));
     }
 
     #[test]

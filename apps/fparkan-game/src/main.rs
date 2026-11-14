@@ -87,8 +87,8 @@ use fparkan_runtime::{
     frame_with_player_motion, load_gameplay_mission, load_mission_static_preview,
     load_mission_static_preview_roots, load_player_projectile, loaded_mission_assets,
     loaded_mission_object_drafts, loaded_mission_script_bundles, loaded_terrain,
-    mission_object_handle, order_factory_robot, order_lab_research, plan_player_motion,
-    player_vehicle, prepared_warbot_weapons, projectile_terrain_hit, projectile_unit_hit,
+    mission_object_handle, order_lab_research, plan_player_motion, player_vehicle,
+    prepared_warbot_weapons, projectile_terrain_hit, projectile_unit_hit,
     query_building_segment_world, simulate_mission_report, starting_cockpit,
     starting_player_weapons, AutoDemoCamera, AutoDemoView, BasementPlacementMode, BuildingMeshNode,
     Engine, EngineError, EngineServices, FrameResult, LoadedMission, MissionAssets,
@@ -10042,6 +10042,29 @@ const PLAYER_MOVEMENT_KEYS: [KeyCode; 6] = [
     KeyCode::PageDown,
 ];
 
+#[derive(Default)]
+struct FactoryMenu {
+    choices: Vec<(usize, String)>,
+    selected: usize,
+}
+
+impl FactoryMenu {
+    fn navigate(&mut self, backwards: bool) {
+        let len = self.choices.len();
+        let offset = if backwards { len - 1 } else { 1 };
+        self.selected = (self.selected + offset) % len;
+    }
+
+    fn title(&self) -> String {
+        format!(
+            "Завод — {}/{} {} · ↑/↓ выбор · B или Enter заказ · Esc отмена",
+            self.selected + 1,
+            self.choices.len(),
+            self.choices[self.selected].1,
+        )
+    }
+}
+
 fn player_movement_key(physical: PhysicalKey, logical: &Key) -> Option<KeyCode> {
     match logical {
         Key::Named(NamedKey::ArrowRight) => Some(KeyCode::ArrowRight),
@@ -10126,6 +10149,8 @@ struct StaticVulkanApp {
     player_fire_pressed: bool,
     player_capture_pressed: bool,
     player_build_pressed: bool,
+    factory_menu: Option<FactoryMenu>,
+    factory_status: Option<String>,
     player_research_pressed: bool,
     player_mine_pressed: bool,
     player_disembark_pressed: bool,
@@ -10265,6 +10290,8 @@ impl StaticVulkanApp {
             player_fire_pressed: false,
             player_capture_pressed: false,
             player_build_pressed: false,
+            factory_menu: None,
+            factory_status: None,
             player_research_pressed: false,
             player_mine_pressed: false,
             player_disembark_pressed: false,
@@ -10998,6 +11025,7 @@ impl StaticVulkanApp {
             (Completed, _) => "Миссия выполнена".into(),
             (Failed, _) => "Миссия провалена".into(),
             (_, true) => "FParkan mission — Пауза".into(),
+            _ if self.factory_menu.is_some() => self.factory_menu.as_ref().unwrap().title(),
             _ => {
                 let mut title = "FParkan mission".to_owned();
                 if let (Some(engine), Some(cockpit), None) =
@@ -11023,6 +11051,10 @@ impl StaticVulkanApp {
                     }
                 }
                 if let Some(status) = &self.laboratory_status {
+                    title.push_str(" — ");
+                    title.push_str(status);
+                }
+                if let Some(status) = &self.factory_status {
                     title.push_str(" — ");
                     title.push_str(status);
                 }
@@ -11216,11 +11248,58 @@ impl StaticVulkanApp {
                 self.cockpit,
                 self.boarded_hero_index.is_some(),
             ) {
-                match order_factory_robot(engine, cockpit, control_clock_ms) {
-                    Ok(duration) => eprintln!(
-                        "factory_order minimum_ms={duration} queue_time_ms={control_clock_ms}"
-                    ),
-                    Err(error) => eprintln!("factory_order_rejected {error}"),
+                let selected = if let Some(menu) = self.factory_menu.take() {
+                    Some(menu.choices[menu.selected].clone())
+                } else {
+                    match fparkan_runtime::factory_schemes(engine, cockpit) {
+                        Ok(choices) => {
+                            let mut choices = choices
+                                .into_iter()
+                                .map(|(index, path)| {
+                                    (index, path.rsplit('/').next().unwrap_or(path).to_owned())
+                                })
+                                .collect::<Vec<_>>();
+                            match choices.len() {
+                                0 => {
+                                    self.factory_status =
+                                        Some("Завод — нет подходящих схем".into());
+                                    None
+                                }
+                                1 => choices.pop(),
+                                _ => {
+                                    self.factory_menu = Some(FactoryMenu {
+                                        choices,
+                                        selected: 0,
+                                    });
+                                    self.pressed_keys.clear();
+                                    self.player_fire_held = false;
+                                    self.player_fire_pressed = false;
+                                    None
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("factory_order_rejected {error}");
+                            None
+                        }
+                    }
+                };
+                if let Some((index, name)) = selected {
+                    match fparkan_runtime::order_factory_scheme(
+                        engine,
+                        cockpit,
+                        index,
+                        control_clock_ms,
+                    ) {
+                        Ok(duration) => {
+                            self.factory_status = Some(format!("Завод — собирается {name}"));
+                            eprintln!("factory_order scheme={name} minimum_ms={duration} queue_time_ms={control_clock_ms}");
+                        }
+                        Err(error) => {
+                            self.factory_status = Some("Завод — заказ отклонён".into());
+                            eprintln!("factory_order_rejected {error}");
+                        }
+                    }
                 }
             }
             if let (true, Some(cockpit), false) = (
@@ -11323,7 +11402,11 @@ impl StaticVulkanApp {
                 );
             }
             if let Some(error) = &frame.production_failure {
+                self.factory_status = Some("Завод — сборка прервана".into());
                 eprintln!("sim_coverage factory_spawn_failed=1 reason={error}");
+            }
+            if frame.produced_unit.is_some() {
+                self.factory_status = Some("Завод — робот готов".into());
             }
             if let Some(component) = &frame.researched_component {
                 self.laboratory_status = Some(format!("Лаборатория — разработано {component}"));
@@ -12498,6 +12581,24 @@ impl ApplicationHandler for StaticVulkanApp {
                     event.physical_key
                 };
                 if let PhysicalKey::Code(code) = key {
+                    if let Some(menu) = &mut self.factory_menu {
+                        if event.state == ElementState::Pressed
+                            && !event.repeat
+                            && !self.mission_paused
+                        {
+                            match code {
+                                KeyCode::ArrowUp => menu.navigate(true),
+                                KeyCode::ArrowDown => menu.navigate(false),
+                                KeyCode::KeyB | KeyCode::Enter | KeyCode::NumpadEnter => {
+                                    self.player_build_pressed = true
+                                }
+                                KeyCode::Escape => self.factory_menu = None,
+                                _ => {}
+                            }
+                            self.update_mission_title();
+                        }
+                        return;
+                    }
                     if code == KeyCode::Escape && event.state == ElementState::Pressed {
                         if self.boarded_hero_index.is_some() {
                             if !self.mission_paused && !event.repeat {
@@ -12558,6 +12659,7 @@ impl ApplicationHandler for StaticVulkanApp {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if button == MouseButton::Left
+                    && self.factory_menu.is_none()
                     && self.cockpit.is_some()
                     && self.demo_camera.is_none()
                     && self.mouse_look
