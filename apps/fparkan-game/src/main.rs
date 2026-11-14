@@ -82,9 +82,9 @@ use fparkan_runtime::{
     loaded_mission_object_drafts, loaded_mission_script_bundles, loaded_terrain,
     mission_object_handle, query_building_segment_world, simulate_mission_report, starting_cockpit,
     AutoDemoCamera, AutoDemoView, BasementPlacementMode, BuildingMeshNode, Engine, EngineError,
-    EngineServices, FrameResult, LoadedMission, MissionAssets, MissionMode, MissionObjectDraft,
-    MissionRequest, MissionScriptInitExecution, MissionStartupInput, StartingCockpit,
-    SIMULATION_COVERAGE,
+    EngineServices, FrameResult, LoadedMission, MissionAssets, MissionEventStop, MissionMode,
+    MissionObjectDraft, MissionRequest, MissionScriptInitExecution, MissionStartupInput,
+    StartingCockpit, SIMULATION_COVERAGE,
 };
 #[cfg(test)]
 use fparkan_terrain::BasementFoundationFragment;
@@ -189,10 +189,13 @@ fn run(args: &[String]) -> Result<String, String> {
                 loaded.key
             )
         })?;
+        for stop in &report.mission_event_stops {
+            log_mission_event_stop(stop);
+        }
         return Ok(format!(
-            "simulation mission={} ticks={} queue_time_ms={} live_objects={} world_events={} init_states={}\n{SIMULATION_COVERAGE} {camera_coverage}",
+            "simulation mission={} ticks={} queue_time_ms={} live_objects={} world_events={} init_states={} mission_events={}\n{SIMULATION_COVERAGE} {camera_coverage}",
             loaded.key, report.ticks, duration_ms, report.live_objects, report.world_events,
-            loaded.script_init_state_count,
+            loaded.script_init_state_count, report.mission_events,
         ));
     }
     let mission_assets_duration = mission_assets_started.elapsed();
@@ -280,6 +283,13 @@ fn run(args: &[String]) -> Result<String, String> {
             gpu_initialization: Duration::ZERO,
         },
     )
+}
+
+fn log_mission_event_stop(stop: &MissionEventStop) {
+    eprintln!(
+        "sim_coverage script_mission_unsupported=1 clan={} script={} event={} instruction={} reason={}",
+        stop.clan_index, stop.script_path, stop.event_index, stop.instruction_index, stop.reason,
+    );
 }
 
 fn load_requested_mission(engine: &mut Engine, args: &Args) -> Result<LoadedMission, EngineError> {
@@ -10474,10 +10484,16 @@ impl StaticVulkanApp {
         }
         let control_clock_ms = clock.time_ms;
         if let Some(engine) = self.mission_engine.as_mut() {
-            self.mission_frame = Some(
-                step_mission_frame(engine, control_clock_ms)
-                    .map_err(|err| format!("step mission at {control_clock_ms} ms: {err}"))?,
-            );
+            let frame = step_mission_frame(engine, control_clock_ms)
+                .map_err(|err| format!("step mission at {control_clock_ms} ms: {err}"))?;
+            if let Some(stop) = frame
+                .mission_event
+                .as_ref()
+                .and_then(|tick| tick.stop.as_ref())
+            {
+                log_mission_event_stop(stop);
+            }
+            self.mission_frame = Some(frame);
         }
         let effect_elapsed_seconds = control_clock_ms as f32 / 1000.0;
         // CTLD's validated NDP defaults seed the native query gate. This

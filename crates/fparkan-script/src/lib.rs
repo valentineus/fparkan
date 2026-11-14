@@ -3,7 +3,7 @@
 //!
 //! This module preserves the layout proven by the GOG `ai.dll` reader.  It
 //! deliberately does not implement a general bytecode VM. It contains a
-//! narrow resolver for confirmed `Init` handlers and bounded FML expressions.
+//! narrow executor for confirmed event instructions and bounded FML expressions.
 
 use fparkan_binary::{checked_allocation_len, Cursor, DecodeError, Limits};
 use std::sync::Arc;
@@ -876,7 +876,23 @@ impl VarSet {
                     Err(error) => Err(ScriptInitResolveError::Handler19(error)),
                 }
             }
-            ScriptDispatchSelector::Sentinel if instruction.header_words[3] == 6 => {
+            ScriptDispatchSelector::Sentinel => {
+                self.resolve_assignment(instruction, formulas, values)
+            }
+            found => Ok(InitInstructionResolution::Unsupported(
+                ScriptInitResolveError::UnsupportedSelector { found },
+            )),
+        }
+    }
+
+    fn resolve_assignment(
+        &self,
+        instruction: &ScriptInstruction,
+        formulas: Option<&FormulaTable>,
+        values: &[VarSetDefault],
+    ) -> Result<InitInstructionResolution, ScriptInitResolveError> {
+        match instruction.header_words[3] {
+            6 => {
                 let index = instruction.header_words[1];
                 let target = self.declarations.get(index as usize).ok_or(
                     ScriptInitResolveError::VarSetIndexOutOfBounds {
@@ -894,14 +910,7 @@ impl VarSet {
                     value,
                 }]))
             }
-            ScriptDispatchSelector::Sentinel => {
-                if instruction.header_words[3] != u32::MAX {
-                    return Ok(InitInstructionResolution::Unsupported(
-                        ScriptInitResolveError::UnsupportedFormulaControlWord {
-                            found: instruction.header_words[3],
-                        },
-                    ));
-                }
+            u32::MAX => {
                 if instruction.header_words[2] != u32::MAX {
                     return Ok(InitInstructionResolution::Unsupported(
                         ScriptInitResolveError::UnsupportedFormulaCopySource {
@@ -974,9 +983,76 @@ impl VarSet {
                 }]))
             }
             found => Ok(InitInstructionResolution::Unsupported(
-                ScriptInitResolveError::UnsupportedSelector { found },
+                ScriptInitResolveError::UnsupportedFormulaControlWord { found },
             )),
         }
+    }
+
+    /// Executes the numeric prefix of a periodic event against its live cells.
+    /// Returns the index and reason for the first unsupported instruction.
+    ///
+    /// # Errors
+    ///
+    /// Returns the stop location for an unsupported opcode, operand or expression.
+    pub fn execute_mission_prefix(
+        &self,
+        event: &ScriptEvent,
+        formulas: Option<&FormulaTable>,
+        values: &mut [VarSetDefault],
+    ) -> Result<(), (usize, String)> {
+        let mut conditions = Vec::new();
+        for (index, instruction) in event.instructions.iter().enumerate() {
+            let active = conditions.last().copied().unwrap_or(true);
+            let control = instruction.header_words[3];
+            match control {
+                0 => {
+                    let condition = if active {
+                        mission_condition(instruction, values)
+                            .ok_or_else(|| (index, "unsupported comparison operands".into()))?
+                    } else {
+                        false
+                    };
+                    conditions.push(condition);
+                    continue;
+                }
+                1 => {
+                    conditions.pop();
+                    continue;
+                }
+                2 => continue,
+                _ => {}
+            }
+            // The VM gates ordinary actions and branches. Immediate writes
+            // have their own switch case and still run inside a false branch.
+            if !active && matches!(control, u32::MAX | 3..=5) {
+                continue;
+            }
+            if control == 5 {
+                break;
+            }
+            if instruction.dispatch_selector() != ScriptDispatchSelector::Sentinel {
+                return Err((index, format!("{:?}", instruction.dispatch_selector())));
+            }
+            match self
+                .resolve_assignment(instruction, formulas, values)
+                .map_err(|error| (index, error.to_string()))?
+            {
+                InitInstructionResolution::Executed(writes) => {
+                    for write in writes {
+                        *values.get_mut(write.index as usize).ok_or_else(|| {
+                            (
+                                index,
+                                format!("varset index {} is out of bounds", write.index),
+                            )
+                        })? = write.value;
+                    }
+                }
+                InitInstructionResolution::Unsupported(error) => {
+                    return Err((index, error.to_string()))
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Resolves the fixed-width, corpus-proven operands of GOG `Handler(15)`.
@@ -1544,6 +1620,26 @@ fn varset_value_as_f32(type_name: VarSetType, value: VarSetDefault) -> Option<f3
     }
 }
 
+fn mission_condition(instruction: &ScriptInstruction, values: &[VarSetDefault]) -> Option<bool> {
+    let [lhs, rhs] = *instruction.references.as_slice() else {
+        return None;
+    };
+    let (&VarSetDefault::Dword(lhs), &VarSetDefault::Dword(rhs)) =
+        (values.get(lhs as usize)?, values.get(rhs as usize)?)
+    else {
+        return None;
+    };
+    match instruction.header_words[4] {
+        0 => Some(lhs < rhs),
+        1 => Some(lhs == rhs),
+        2 => Some(lhs > rhs),
+        3 => Some(lhs <= rhs),
+        4 => Some(lhs >= rhs),
+        5 => Some(lhs != rhs),
+        _ => None,
+    }
+}
+
 fn varset_value_matches_type(type_name: VarSetType, value: VarSetDefault) -> bool {
     matches!(
         (type_name, value),
@@ -2029,6 +2125,47 @@ mod tests {
             trailing_bytes: Vec::new(),
             raw: std::sync::Arc::from(&b""[..]),
         }
+    }
+
+    #[test]
+    fn mission_prefix_skips_false_actions_but_applies_an_immediate_write() {
+        let varset = parse_varset(b"VAR(DWORD, lhs, 0)\nVAR(DWORD, rhs, 1)\n").unwrap();
+        let instruction =
+            |handler, dest, source, control, comparison, references: Vec<u32>| ScriptInstruction {
+                header_words: [
+                    handler,
+                    dest,
+                    source,
+                    control,
+                    comparison,
+                    references.len() as u32,
+                    u32::MAX,
+                ],
+                references,
+            };
+        let compare = instruction(u32::MAX, u32::MAX, u32::MAX, 0, 1, vec![0, 1]);
+        let close = instruction(u32::MAX, u32::MAX, u32::MAX, 1, 6, vec![]);
+        let action = instruction(32, 0, u32::MAX, u32::MAX, 6, vec![0, 1]);
+        let event = ScriptEvent {
+            name_len: 7,
+            name_raw: b"Mission\0".to_vec(),
+            event_word: 0,
+            instructions: vec![
+                compare.clone(),
+                instruction(u32::MAX, 0, 1, 6, 6, vec![]),
+                compare,
+                action.clone(),
+                close.clone(),
+                close,
+                action,
+            ],
+        };
+        let mut values = [VarSetDefault::Dword(0), VarSetDefault::Dword(1)];
+        assert_eq!(
+            varset.execute_mission_prefix(&event, None, &mut values),
+            Err((6, "Handler(32)".into()))
+        );
+        assert_eq!(values, [VarSetDefault::Dword(1); 2]);
     }
 
     fn init_formula_assignment(target: u32, formula: u32) -> ScriptInstruction {

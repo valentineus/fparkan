@@ -43,10 +43,13 @@ use std::sync::Arc;
 
 mod autodemo;
 mod mesh_collision;
+mod mission_events;
 
 pub use autodemo::{autodemo_camera, AutoDemoCamera, AutoDemoView};
 pub use fparkan_assets::MissionAssets;
 pub use mesh_collision::{query_building_segment_world, BuildingMeshHit, BuildingMeshNode};
+use mission_events::MissionEvents;
+pub use mission_events::{MissionEventStop, MissionEventTick};
 
 const MISSION_DECODED_PAYLOAD_CACHE_ENTRIES: usize = 256;
 const MAX_MISSION_AI_RECORD_SLOTS: usize = 1_000_000;
@@ -1254,6 +1257,8 @@ pub struct LoadedMission {
 pub struct FrameResult {
     /// Snapshot.
     pub snapshot: WorldSnapshot,
+    /// Periodic script event attempted on this step, if due.
+    pub mission_event: Option<MissionEventTick>,
 }
 
 /// Engine.
@@ -1285,6 +1290,7 @@ struct LoadedMissionState {
     script_varset: Option<MissionScriptVarSet>,
     script_init_states: Vec<MissionScriptInitState>,
     script_varset_states: Vec<MissionScriptVarSetState>,
+    mission_events: MissionEvents,
     script_host_mode: MissionMode,
     script_host_status: u32,
     script_outcome: MissionScriptOutcome,
@@ -2203,6 +2209,7 @@ fn load_mission_with_options(
         script_varset: loaded_scripts.varset,
         script_init_states: loaded_scripts.init_states,
         script_varset_states: loaded_scripts.varset_states,
+        mission_events: MissionEvents::default(),
         script_host_mode: request.mode,
         // Fresh IGame construction seeds this field with 5; this is not the
         // later status-4 transition performed after native game initialization.
@@ -2230,8 +2237,8 @@ fn prepare_first_preview_assets<R: ResourceRepository>(
 /// Steps the world and due Behavior resource distributors at an explicit queue clock.
 ///
 /// Resource updates are prepared before queued world commands and deferred deletion,
-/// and published only after the world step succeeds. This does not yet execute the
-/// separate Control clock, movement, or general mission script handlers.
+/// and published only after the world step succeeds. The periodic script event
+/// then updates the active clan's varset through its supported numeric prefix.
 ///
 /// # Errors
 ///
@@ -2247,7 +2254,14 @@ pub fn step_headless(
     if let Some(resources) = resources {
         resources.apply(engine);
     }
-    Ok(FrameResult { snapshot })
+    let mission_event = engine
+        .loaded
+        .as_mut()
+        .and_then(|state| state.tick_mission_event(queue_time_ms));
+    Ok(FrameResult {
+        snapshot,
+        mission_event,
+    })
 }
 
 /// Steps rendered mode with the same queue-clock semantics as [`step_headless`].
@@ -2261,10 +2275,10 @@ pub fn frame(engine: &mut Engine, queue_time_ms: u32) -> Result<FrameResult, Eng
 
 /// Coverage entries for the subsystems still absent from the mission loop.
 pub const SIMULATION_COVERAGE: &str =
-    "sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 unit_behavior_stub=1 render_object_lifecycle_stub=1 render_winding_change_stub=1";
+    "sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 unit_behavior_stub=1 render_object_lifecycle_stub=1 render_winding_change_stub=1 mission_event_clock_approx=1";
 
 /// Totals from a headless mission coverage run.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SimulationReport {
     /// Number of completed steps.
     pub ticks: u64,
@@ -2272,6 +2286,10 @@ pub struct SimulationReport {
     pub live_objects: usize,
     /// World events processed over the run.
     pub world_events: u64,
+    /// Number of periodic event dispatches, including empty events.
+    pub mission_events: u64,
+    /// Distinct uncovered periodic event instructions.
+    pub mission_event_stops: Vec<MissionEventStop>,
 }
 
 /// Steps a freshly loaded mission from queue time zero at 60 Hz for coverage.
@@ -2289,6 +2307,8 @@ pub fn simulate_mission_report(
         ticks: 0,
         live_objects: loaded_mission(engine).map_or(0, |mission| mission.registered_objects),
         world_events: 0,
+        mission_events: 0,
+        mission_event_stops: Vec::new(),
     };
     let steps = (u64::from(duration_ms) * 60).div_ceil(1000);
     for tick in 1..=steps {
@@ -2297,6 +2317,10 @@ pub fn simulate_mission_report(
         report.ticks = tick;
         report.live_objects = frame.snapshot.objects.len();
         report.world_events += frame.snapshot.events.len() as u64;
+        if let Some(event) = frame.mission_event {
+            report.mission_events += 1;
+            report.mission_event_stops.extend(event.stop);
+        }
     }
     Ok(report)
 }
@@ -17029,6 +17053,35 @@ mod tests {
             let expected = if clamps { maximum } else { current };
             assert_eq!(ore_states[0].current_ore_bits, expected.to_bits());
         }
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_firing_range_reports_first_periodic_instruction() {
+        let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(licensed_root("IS")));
+        let mut engine = create(EngineServices::new(vfs)).unwrap();
+        load_mission_with_init_stubs(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.01/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+        )
+        .unwrap();
+        let first = frame(&mut engine, 5).unwrap().mission_event.unwrap();
+        let stop = first.stop.unwrap();
+        assert_eq!(
+            (stop.clan_index, stop.event_index, stop.instruction_index),
+            (0, 2, 0)
+        );
+        assert_eq!(stop.reason, "Handler(32)");
+        assert!(frame(&mut engine, 2_004).unwrap().mission_event.is_none());
+        let next = frame(&mut engine, 2_005).unwrap().mission_event.unwrap();
+        assert!(next.stop.is_none());
     }
 
     #[test]
