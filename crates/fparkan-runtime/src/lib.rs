@@ -17630,6 +17630,63 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
+    fn licensed_constructor_checks_current_factory_and_hangar_owners() {
+        use fparkan_world::{identity_metadata, set_owner, OwnerId};
+
+        let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(licensed_root("IS")));
+        let mut engine = create(EngineServices::new(vfs)).unwrap();
+        load_mission_with_init_stubs(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.02/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+        )
+        .unwrap();
+        let initial = frame(&mut engine, 1).unwrap().mission_event.unwrap();
+        assert!(initial.stop.is_none(), "{:?}", initial.stop);
+        assert!(!initial
+            .notices
+            .iter()
+            .any(|notice| matches!(notice, MissionNotice::ObjectiveComplete(0 | 2))));
+        for (time, logic_id, objective_index) in [(2001, 0x8000_0001, 0), (4001, 0x8000_0003, 2)] {
+            let slot = engine
+                .loaded
+                .as_ref()
+                .unwrap()
+                .mission
+                .objects
+                .iter()
+                .position(|object| object.identity_or_clan_raw == logic_id)
+                .unwrap();
+            let handle = mission_object_handle(&engine, OriginalObjectId(slot as u32)).unwrap();
+            assert_eq!(
+                identity_metadata(&engine.world, handle).unwrap().owner_id,
+                Some(OwnerId(2))
+            );
+            set_owner(&mut engine.world, handle, Some(OwnerId(0))).unwrap();
+            let event = frame(&mut engine, time).unwrap().mission_event.unwrap();
+            assert!(event.stop.is_none(), "{:?}", event.stop);
+            assert!(
+                event
+                    .notices
+                    .contains(&MissionNotice::ObjectiveComplete(objective_index)),
+                "{:?}",
+                event.notices
+            );
+        }
+        assert_eq!(
+            loaded_mission_script_outcome(&engine),
+            Some(MissionScriptOutcome::Active)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_firing_range_reports_target_loss_and_completes_all_objectives() {
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(licensed_root("IS")));
         let mut engine = create(EngineServices::new(vfs)).unwrap();

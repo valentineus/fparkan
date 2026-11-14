@@ -310,6 +310,17 @@ impl LoadedMissionState {
                         let inside = tactical_area_contains(&self.mission, world, area, id);
                         Ok(Some(u32::from(inside)))
                     }
+                    ScriptDispatchSelector::Handler(52) => {
+                        let [id] = *instruction.references.as_slice() else {
+                            return Err("Handler(52) requires one DWORD operand".into());
+                        };
+                        let Some(&VarSetDefault::Dword(id)) = values.get(id as usize) else {
+                            return Err("Handler(52) requires one DWORD operand".into());
+                        };
+                        let clan = placed_logic_objects(&self.mission, world, id)
+                            .find_map(|handle| identity_metadata(world, handle).ok()?.owner_id);
+                        Ok(Some(clan.map_or(u32::MAX, |owner| u32::from(owner.0))))
+                    }
                     ScriptDispatchSelector::Handler(30) => {
                         let command = declarations
                             .resolve_handler30_with_values(instruction, values)
@@ -408,23 +419,32 @@ fn tactical_area_contains(
 ) -> bool {
     // MisLoad allocates a slot per path and selects the first record matching
     // the slot ID. Out-of-range IDs and unfilled slots yield an empty list.
-    if area as usize >= mission.paths.len() || id == u32::MAX {
+    if area as usize >= mission.paths.len() {
         return false;
     }
     let Some(path) = mission.paths.iter().find(|path| path.id as u32 == area) else {
         return false;
     };
-    // shortcut: resolve placed objects through their TMA logic ID until the
-    // world assigns native logic IDs to units created during gameplay.
-    mission.objects.iter().enumerate().any(|(index, object)| {
-        object.identity_or_clan_raw == id
-            && handle_by_original_id(world, OriginalObjectId(index as u32))
-                .and_then(|handle| transform_state(world, handle).ok())
-                .is_some_and(|pose| {
-                    let [x, y, _] = pose.position.map(f32::from_bits);
-                    in_tactical_polygon(&path.points, x, y)
-                })
+    placed_logic_objects(mission, world, id).any(|handle| {
+        transform_state(world, handle).is_ok_and(|pose| {
+            let [x, y, _] = pose.position.map(f32::from_bits);
+            in_tactical_polygon(&path.points, x, y)
+        })
     })
+}
+
+fn placed_logic_objects<'a>(
+    mission: &'a super::MissionDocument,
+    world: &'a World,
+    id: u32,
+) -> impl Iterator<Item = ObjectHandle> + 'a {
+    // shortcut: only TMA IDs, until the world assigns native IDs at runtime.
+    mission
+        .objects
+        .iter()
+        .enumerate()
+        .filter(move |(_, object)| id != u32::MAX && object.identity_or_clan_raw == id)
+        .filter_map(|(index, _)| handle_by_original_id(world, OriginalObjectId(index as u32)))
 }
 
 fn in_tactical_polygon(vertices: &[[f32; 3]], x: f32, y: f32) -> bool {
