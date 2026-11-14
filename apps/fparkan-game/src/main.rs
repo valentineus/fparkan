@@ -220,6 +220,7 @@ fn run(args: &[String]) -> Result<String, String> {
         for stop in &report.mission_event_stops {
             log_mission_event_stop(stop);
         }
+        script_coverage::log_clan_ai_stops(&report);
         if guard_clans != 0 {
             eprintln!(
                 "mission_guard_combat first_shot_ms={:?} first_destroyed_ms={:?}",

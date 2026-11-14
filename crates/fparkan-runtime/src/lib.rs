@@ -44,6 +44,7 @@ use std::sync::Arc;
 mod autodemo;
 mod boarding;
 mod building_door;
+mod clan_ai_events;
 mod clan_script_init;
 mod mesh_collision;
 mod mining;
@@ -1355,6 +1356,7 @@ struct LoadedMissionState {
     script_init_states: Vec<MissionScriptInitState>,
     script_varset_states: Vec<MissionScriptVarSetState>,
     mission_events: MissionEvents,
+    clan_ai_events: clan_ai_events::ClanAiEvents,
     mine_sites: Vec<mining::MineSite>,
     unit_patrol: Option<unit_patrol::UnitPatrol>,
     player_pitch_bits: u32,
@@ -2684,6 +2686,7 @@ fn load_mission_with_options(
         script_init_states: loaded_scripts.init_states,
         script_varset_states: loaded_scripts.varset_states,
         mission_events,
+        clan_ai_events: clan_ai_events::ClanAiEvents::default(),
         mine_sites,
         unit_patrol,
         player_pitch_bits: 0,
@@ -2806,6 +2809,9 @@ pub fn step_headless(
         .loaded
         .as_mut()
         .and_then(|state| state.tick_mission_event(&engine.world, queue_time_ms));
+    if let Some(loaded) = &mut engine.loaded {
+        loaded.tick_clan_ai_events(queue_time_ms);
+    }
     let researched_component = engine
         .loaded
         .as_mut()
@@ -2891,6 +2897,8 @@ pub struct SimulationReport {
     pub mission_events: u64,
     /// Distinct uncovered periodic event instructions.
     pub mission_event_stops: Vec<MissionEventStop>,
+    /// Uncovered clan AI instructions and the number of invocations they stopped.
+    pub clan_ai_event_stops: Vec<(MissionEventStop, u64)>,
     /// Total requests for mission information messages.
     pub mission_messages: u64,
     /// Clock of the first autonomous shot, in milliseconds.
@@ -2924,6 +2932,7 @@ pub fn simulate_mission_report(
         world_events: 0,
         mission_events: 0,
         mission_event_stops: Vec::new(),
+        clan_ai_event_stops: Vec::new(),
         mission_messages: 0,
         autodemo_first_shot_ms: None,
         autodemo_first_destroyed_ms: None,
@@ -2967,6 +2976,14 @@ pub fn simulate_mission_report(
                 .filter(|notice| matches!(notice, MissionNotice::Information(_)))
                 .count() as u64;
         }
+    }
+    if let Some(loaded) = &engine.loaded {
+        report.clan_ai_event_stops.extend(
+            loaded
+                .clan_ai_events
+                .stops()
+                .map(|(stop, count)| (stop.clone(), count)),
+        );
     }
     Ok(report)
 }
