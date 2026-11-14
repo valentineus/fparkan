@@ -141,6 +141,7 @@ impl MissionObjectives {
 
 #[derive(Default)]
 pub(super) struct MissionEvents {
+    pub(super) start_ms: u32,
     next_ms: u32,
     reported_stops: HashSet<(usize, usize)>,
     inside_hero_exit: bool,
@@ -588,6 +589,7 @@ impl LoadedMissionState {
             .iter_mut()
             .find(|state| state.clan_index == bundle.clan_index)?;
         let mission_events = &mut self.mission_events;
+        let clock_seconds = crate::script_time::elapsed_seconds(mission_events.start_ms, now_ms);
         let mut notices = Vec::new();
         let mut patrol_orders = Vec::new();
         let execution = declarations.execute_mission_prefix(
@@ -691,6 +693,16 @@ impl LoadedMissionState {
                     let clan = placed_logic_objects(&self.mission, world, id)
                         .find_map(|handle| identity_metadata(world, handle).ok()?.owner_id);
                     Ok(Some(clan.map_or(u32::MAX, |owner| u32::from(owner.0))))
+                }
+                ScriptDispatchSelector::Handler(59 | 60) => {
+                    crate::script_time::result(instruction, values, clock_seconds)
+                        .map(Some)
+                        .ok_or_else(|| {
+                            format!(
+                                "{:?} requires one DWORD operand",
+                                instruction.dispatch_selector()
+                            )
+                        })
                 }
                 ScriptDispatchSelector::Handler(15) => {
                     let order = declarations

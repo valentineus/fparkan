@@ -56,6 +56,7 @@ mod production;
 mod projectile;
 mod research;
 mod script_patrol;
+mod script_time;
 mod unit_patrol;
 
 pub use autodemo::{
@@ -2343,7 +2344,7 @@ fn load_mission_with_options(
         Vec::new()
     };
 
-    let mission_events = if options.asset_scope == MissionAssetScope::Full {
+    let mut mission_events = if options.asset_scope == MissionAssetScope::Full {
         MissionEvents::with_placed_objects(
             &mut new_runtime_world,
             &object_drafts,
@@ -2360,6 +2361,7 @@ fn load_mission_with_options(
         let queue_time_ms = startup_input
             .expect("full mission loading requires startup inputs")
             .queue_time_ms;
+        mission_events.start_ms = queue_time_ms;
         if let Err(error) = start_mission_scripts(
             &mission,
             &mut loaded_scripts,
@@ -8118,19 +8120,22 @@ fn resolve_init_states(
                 &clan_count,
                 |index, instruction, values| {
                     if policy != InitPolicy::KeepPrefix {
-                        return false;
+                        return None;
+                    }
+                    if let Some(write) = script_time::deadline_write(instruction, values) {
+                        return Some(Some(write));
                     }
                     if let Some(order) =
                         clan_script_init::patrol_order(&varset.declarations, instruction, values)
                     {
                         init_patrols.push(order);
-                        return true;
+                        return Some(None);
                     }
                     if let Some(handler) = clan_script_init::stubbed_handler(instruction) {
                         bundle.init_stubs.push((index, handler));
-                        return true;
+                        return Some(None);
                     }
-                    false
+                    None
                 },
             )
             .map_err(|source| EngineError::ScriptInit {

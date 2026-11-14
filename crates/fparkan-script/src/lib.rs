@@ -811,10 +811,10 @@ impl VarSet {
         formulas: Option<&FormulaTable>,
         clan_count: impl Fn(u32, u32) -> Option<u32>,
     ) -> Result<Option<ScriptInitPrefix>, ScriptInitResolveError> {
-        self.resolve_init_prefix_with_host(package, input, formulas, clan_count, |_, _, _| false)
+        self.resolve_init_prefix_with_host(package, input, formulas, clan_count, |_, _, _| None)
     }
 
-    /// Allows the host to handle an unsupported instruction that has no variable writes.
+    /// Allows the host to handle an instruction and supply its optional variable write.
     ///
     /// # Errors
     ///
@@ -825,7 +825,11 @@ impl VarSet {
         input: Handler19InitInput,
         formulas: Option<&FormulaTable>,
         clan_count: impl Fn(u32, u32) -> Option<u32>,
-        mut handle: impl FnMut(usize, &ScriptInstruction, &[VarSetDefault]) -> bool,
+        mut handle: impl FnMut(
+            usize,
+            &ScriptInstruction,
+            &[VarSetDefault],
+        ) -> Option<Option<ScriptInitWrite>>,
     ) -> Result<Option<ScriptInitPrefix>, ScriptInitResolveError> {
         let Some((event_index, event)) = package.events.iter().enumerate().find(|(_, event)| {
             event.name_raw.split(|byte| *byte == 0).next() == Some(&b"Init"[..])
@@ -845,33 +849,32 @@ impl VarSet {
             stopped_at: None,
         };
         for (instruction_index, instruction) in event.instructions.iter().enumerate() {
-            match self.resolve_init_instruction(
+            let writes = match self.resolve_init_instruction(
                 instruction,
                 input,
                 formulas,
                 &values,
                 &clan_count,
             )? {
-                InitInstructionResolution::Executed(instruction_writes) => {
-                    for write in &instruction_writes {
-                        let Some(value) = values.get_mut(write.index as usize) else {
-                            return Err(ScriptInitResolveError::VarSetIndexOutOfBounds {
-                                index: write.index,
-                                declarations: self.declarations.len(),
-                            });
-                        };
-                        *value = write.value;
-                    }
-                    prefix.writes.extend(instruction_writes);
-                }
+                InitInstructionResolution::Executed(writes) => writes,
                 InitInstructionResolution::Unsupported(error) => {
-                    if handle(instruction_index, instruction, &values) {
-                        continue;
-                    }
-                    prefix.stopped_at = Some((instruction_index, error));
-                    break;
+                    let Some(write) = handle(instruction_index, instruction, &values) else {
+                        prefix.stopped_at = Some((instruction_index, error));
+                        break;
+                    };
+                    write.into_iter().collect()
                 }
+            };
+            for write in &writes {
+                let Some(value) = values.get_mut(write.index as usize) else {
+                    return Err(ScriptInitResolveError::VarSetIndexOutOfBounds {
+                        index: write.index,
+                        declarations: self.declarations.len(),
+                    });
+                };
+                *value = write.value;
             }
+            prefix.writes.extend(writes);
         }
 
         Ok(Some(prefix))
