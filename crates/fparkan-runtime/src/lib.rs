@@ -49,7 +49,7 @@ pub use autodemo::{autodemo_camera, AutoDemoCamera, AutoDemoView};
 pub use fparkan_assets::MissionAssets;
 pub use mesh_collision::{query_building_segment_world, BuildingMeshHit, BuildingMeshNode};
 use mission_events::MissionEvents;
-pub use mission_events::{MissionEventStop, MissionEventTick};
+pub use mission_events::{MissionEventStop, MissionEventTick, MissionNotice};
 
 const MISSION_DECODED_PAYLOAD_CACHE_ENTRIES: usize = 256;
 const MAX_MISSION_AI_RECORD_SLOTS: usize = 1_000_000;
@@ -2187,7 +2187,22 @@ fn load_mission_with_options(
     };
 
     let mission_events = if options.asset_scope == MissionAssetScope::Full {
-        MissionEvents::with_placed_objects(&object_drafts, &handles, summary.clan_count)
+        let config_path = mission_path.as_str().rsplit_once('/').map_or_else(
+            || "mission.cfg".to_owned(),
+            |(directory, _)| format!("{directory}/mission.cfg"),
+        );
+        let config_path = normalize_engine_path("mission config", &config_path)?;
+        let config = match vfs.read(&config_path) {
+            Ok(bytes) => bytes,
+            Err(VfsError::NotFound(_)) => Arc::from(&[][..]),
+            Err(source) => {
+                return Err(EngineError::Vfs {
+                    path: config_path.as_str().into(),
+                    source,
+                })
+            }
+        };
+        MissionEvents::with_placed_objects(&object_drafts, &handles, summary.clan_count, &config)
     } else {
         MissionEvents::default()
     };
@@ -2328,7 +2343,11 @@ pub fn simulate_mission_report(
         if let Some(event) = frame.mission_event {
             report.mission_events += 1;
             report.mission_event_stops.extend(event.stop);
-            report.mission_messages += event.messages.len() as u64;
+            report.mission_messages += event
+                .notices
+                .iter()
+                .filter(|notice| matches!(notice, MissionNotice::Information(_)))
+                .count() as u64;
         }
     }
     Ok(report)
@@ -17066,7 +17085,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
-    fn licensed_firing_range_voices_spawn_and_first_target_loss_once() {
+    fn licensed_firing_range_reports_target_loss_and_completes_all_objectives() {
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(licensed_root("IS")));
         let mut engine = create(EngineServices::new(vfs)).unwrap();
         load_mission_with_init_stubs(
@@ -17082,16 +17101,97 @@ mod tests {
         )
         .unwrap();
         let first = frame(&mut engine, 5).unwrap().mission_event.unwrap();
-        assert_eq!(first.messages, [11, 14]);
+        assert_eq!(
+            first.notices,
+            [
+                MissionNotice::Information(11),
+                MissionNotice::Information(14)
+            ]
+        );
         assert!(first.stop.is_none());
         assert!(frame(&mut engine, 2_004).unwrap().mission_event.is_none());
         let first_target = mission_object_handle(&engine, OriginalObjectId(1)).unwrap();
         fparkan_world::request_delete(&mut engine.world, first_target).unwrap();
         let next = frame(&mut engine, 2_005).unwrap().mission_event.unwrap();
         assert!(next.stop.is_none());
-        assert_eq!(next.messages, [17]);
+        assert_eq!(next.notices, [MissionNotice::Information(17)]);
         let later = frame(&mut engine, 4_005).unwrap().mission_event.unwrap();
-        assert!(later.messages.is_empty());
+        assert!(later.notices.is_empty());
+        assert_eq!(
+            loaded_mission_script_outcome(&engine),
+            Some(MissionScriptOutcome::Active)
+        );
+
+        // Objective 1 also requires at least two player robots. The hero is
+        // the only one at spawn, so model one allied robot joining the roster.
+        let allied =
+            construct_object(&mut engine.world, ObjectDraft { original_id: None }).unwrap();
+        register_object(&mut engine.world, allied).unwrap();
+        engine
+            .loaded
+            .as_mut()
+            .unwrap()
+            .mission_events
+            .add_test_robot(0, allied);
+        for (time, clan, expected) in [
+            (
+                6_005,
+                1,
+                vec![
+                    MissionNotice::ObjectiveComplete(0),
+                    MissionNotice::Information(12),
+                ],
+            ),
+            (
+                8_005,
+                3,
+                vec![
+                    MissionNotice::ObjectiveComplete(1),
+                    MissionNotice::Information(13),
+                    MissionNotice::Information(19),
+                ],
+            ),
+            (
+                10_005,
+                2,
+                vec![
+                    MissionNotice::ObjectiveComplete(2),
+                    MissionNotice::Completed,
+                ],
+            ),
+        ] {
+            let handles = engine
+                .loaded
+                .as_ref()
+                .unwrap()
+                .object_drafts
+                .iter()
+                .filter(|draft| {
+                    draft.raw_after_resource == clan
+                        && draft
+                            .unit_dat_header_flags
+                            .is_some_and(|class| class & 0x0100_0000 != 0)
+                })
+                .filter_map(|draft| mission_object_handle(&engine, draft.original_id?))
+                .collect::<Vec<_>>();
+            assert!(!handles.is_empty());
+            for handle in handles {
+                fparkan_world::request_delete(&mut engine.world, handle).unwrap();
+            }
+            let tick = frame(&mut engine, time).unwrap().mission_event.unwrap();
+            assert!(tick.stop.is_none(), "{:?}", tick.stop);
+            assert_eq!(tick.notices, expected);
+        }
+        assert_eq!(
+            loaded_mission_script_outcome(&engine),
+            Some(MissionScriptOutcome::Completed)
+        );
+        assert!(frame(&mut engine, 12_005)
+            .unwrap()
+            .mission_event
+            .unwrap()
+            .notices
+            .is_empty());
     }
 
     #[test]

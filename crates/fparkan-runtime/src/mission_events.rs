@@ -1,5 +1,10 @@
-use super::{LoadedMissionState, MissionObjectDraft, LAST_SUPER_AI_TABLE_INDEX};
-use fparkan_script::{ScriptDispatchSelector, ScriptInstruction, VarSetDefault};
+use super::{
+    apply_recovered_script_host_callback, LoadedMissionState, MissionObjectDraft,
+    MissionScriptHostEffect, LAST_SUPER_AI_TABLE_INDEX,
+};
+use fparkan_script::{
+    ScriptDispatchSelector, ScriptInstruction, VarSetDefault, VmHostCallbackCommand,
+};
 use fparkan_world::{
     handle_by_original_id, transform_state, ObjectHandle, OriginalObjectId, World,
 };
@@ -25,8 +30,103 @@ pub struct MissionEventStop {
 pub struct MissionEventTick {
     /// An uncovered instruction encountered for the first time, if any.
     pub stop: Option<MissionEventStop>,
-    /// IDs of messages requested by this invocation, in script order.
-    pub messages: Vec<u32>,
+    /// Notifications produced by this invocation, in script order.
+    pub notices: Vec<MissionNotice>,
+}
+
+/// A notification emitted by the scenario host.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MissionNotice {
+    /// First presentation of an information message by index.
+    Information(u32),
+    /// Objective changed from pending to complete.
+    ObjectiveComplete(u32),
+    /// Mission completed.
+    Completed,
+    /// Mission failed.
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum ObjectiveState {
+    #[default]
+    Pending,
+    Complete,
+    Failed,
+}
+
+#[derive(Default)]
+struct MissionObjectives {
+    primary_count: usize,
+    states: Vec<ObjectiveState>,
+}
+
+impl MissionObjectives {
+    fn from_config(bytes: &[u8]) -> Self {
+        let mut primary = 0;
+        let mut bonus = 0;
+        let mut group = None;
+        for line in bytes.split(|&byte| byte == b'\n') {
+            let mut words = line
+                .split(|byte| byte.is_ascii_whitespace())
+                .filter(|word| !word.is_empty());
+            match words.next() {
+                Some(word) if word.eq_ignore_ascii_case(b"object") => {
+                    group = match words.next() {
+                        Some(name) if name.eq_ignore_ascii_case(b"primary_objectives") => {
+                            Some(&mut primary)
+                        }
+                        Some(name) if name.eq_ignore_ascii_case(b"bonus_objectives") => {
+                            Some(&mut bonus)
+                        }
+                        _ => None,
+                    };
+                }
+                Some(word) if word.eq_ignore_ascii_case(b"end") => group = None,
+                Some(word)
+                    if !word.starts_with(b"#")
+                        && !word.starts_with(b"//")
+                        && line.contains(&b'=') =>
+                {
+                    if let Some(count) = group.as_deref_mut() {
+                        *count += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Self {
+            primary_count: primary,
+            states: vec![ObjectiveState::Pending; primary + bonus],
+        }
+    }
+
+    fn apply(
+        &mut self,
+        command: u32,
+        index: u32,
+        notices: &mut Vec<MissionNotice>,
+    ) -> Result<bool, String> {
+        let state = self
+            .states
+            .get_mut(index as usize)
+            .ok_or_else(|| format!("Handler(30) objective {index} is unavailable"))?;
+        match command {
+            3 => {
+                if *state == ObjectiveState::Pending {
+                    *state = ObjectiveState::Complete;
+                    notices.push(MissionNotice::ObjectiveComplete(index));
+                }
+                return Ok(self.states[..self.primary_count]
+                    .iter()
+                    .all(|state| *state == ObjectiveState::Complete));
+            }
+            4 => *state = ObjectiveState::Failed,
+            5 => *state = ObjectiveState::Pending,
+            _ => unreachable!(),
+        }
+        Ok(false)
+    }
 }
 
 #[derive(Default)]
@@ -35,13 +135,20 @@ pub(super) struct MissionEvents {
     reported_stops: HashSet<usize>,
     voiced_messages: HashSet<u32>,
     placed_clan_objects: Vec<Vec<(ObjectHandle, u32)>>,
+    objectives: MissionObjectives,
 }
 
 impl MissionEvents {
+    #[cfg(test)]
+    pub(super) fn add_test_robot(&mut self, clan: usize, handle: ObjectHandle) {
+        self.placed_clan_objects[clan].push((handle, 0x0100_8000));
+    }
+
     pub(super) fn with_placed_objects(
         drafts: &[MissionObjectDraft],
         handles: &[ObjectHandle],
         clan_count: usize,
+        mission_config: &[u8],
     ) -> Self {
         let mut rosters = vec![Vec::new(); clan_count.min(LAST_SUPER_AI_TABLE_INDEX as usize + 1)];
         for (draft, &handle) in drafts.iter().zip(handles) {
@@ -54,6 +161,7 @@ impl MissionEvents {
         }
         Self {
             placed_clan_objects: rosters,
+            objectives: MissionObjectives::from_config(mission_config),
             ..Self::default()
         }
     }
@@ -98,7 +206,7 @@ impl LoadedMissionState {
             .iter_mut()
             .find(|state| state.clan_index == bundle.clan_index)?;
         let mission_events = &mut self.mission_events;
-        let mut messages = Vec::new();
+        let mut notices = Vec::new();
         let stop = declarations
             .execute_mission_prefix(
                 event,
@@ -129,11 +237,42 @@ impl LoadedMissionState {
                         if self.script_host_mode == super::MissionMode::AutoDemo {
                             return Ok(None);
                         }
-                        if command.first != 1 {
-                            return Err(format!("Handler(30) command {}", command.first));
-                        }
-                        if mission_events.voiced_messages.insert(command.second) {
-                            messages.push(command.second);
+                        let outcome = match command.first {
+                            0 => Some(command),
+                            1 => {
+                                if mission_events.voiced_messages.insert(command.second) {
+                                    notices.push(MissionNotice::Information(command.second));
+                                }
+                                None
+                            }
+                            3..=5 => mission_events
+                                .objectives
+                                .apply(command.first, command.second, &mut notices)?
+                                .then_some(VmHostCallbackCommand {
+                                    mode: 0,
+                                    first: 0,
+                                    second: 1,
+                                }),
+                            _ => return Err(format!("Handler(30) command {}", command.first)),
+                        };
+                        if let Some(outcome) = outcome {
+                            match apply_recovered_script_host_callback(
+                                self.script_host_mode,
+                                &mut self.script_host_status,
+                                &mut self.script_outcome,
+                                outcome,
+                            ) {
+                                MissionScriptHostEffect::MissionCompleted => {
+                                    notices.push(MissionNotice::Completed)
+                                }
+                                MissionScriptHostEffect::MissionFailed => {
+                                    notices.push(MissionNotice::Failed)
+                                }
+                                MissionScriptHostEffect::NoChange => {}
+                                MissionScriptHostEffect::Unhandled => {
+                                    return Err(format!("Handler(30) outcome {}", outcome.second))
+                                }
+                            }
                         }
                         Ok(None)
                     }
@@ -149,7 +288,7 @@ impl LoadedMissionState {
                 instruction_index,
                 reason,
             });
-        Some(MissionEventTick { stop, messages })
+        Some(MissionEventTick { stop, notices })
     }
 }
 
@@ -225,10 +364,33 @@ fn in_tactical_polygon(vertices: &[[f32; 3]], x: f32, y: f32) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_clan_objects, in_tactical_polygon, MissionEvents};
+    use super::{
+        count_clan_objects, in_tactical_polygon, MissionEvents, MissionNotice, MissionObjectives,
+    };
     use fparkan_world::{
         construct_object, new, register_object, request_delete, ObjectDraft, WorldConfig,
     };
+
+    #[test]
+    fn victory_requires_primary_objectives_in_config_order_only() {
+        let config = b"object bonus_objectives\noptional = \"bonus\"\nend\nobject primary_objectives\na = \"one\"\na = \"two\"\nend\n";
+        let mut objectives = MissionObjectives::from_config(config);
+        let mut notices = Vec::new();
+        assert!(!objectives.apply(3, 0, &mut notices).unwrap());
+        assert!(!objectives.apply(3, 0, &mut notices).unwrap());
+        assert!(!objectives.apply(4, 1, &mut notices).unwrap());
+        assert!(!objectives.apply(3, 1, &mut notices).unwrap());
+        assert!(!objectives.apply(5, 1, &mut notices).unwrap());
+        assert!(objectives.apply(3, 1, &mut notices).unwrap());
+        assert!(objectives.apply(3, 3, &mut notices).is_err());
+        assert_eq!(
+            notices,
+            [
+                MissionNotice::ObjectiveComplete(0),
+                MissionNotice::ObjectiveComplete(1)
+            ]
+        );
+    }
 
     #[test]
     fn clan_count_uses_overlapping_bits_and_skips_removed_objects() {

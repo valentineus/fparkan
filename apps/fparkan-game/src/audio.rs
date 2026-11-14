@@ -998,8 +998,25 @@ impl GameAudio {
             .map_err(|error| error.to_string())?;
         let (archive, file) = voice_resource(&mission, &symbol)?
             .ok_or_else(|| format!("voice resource {symbol} is missing in {mission_cfg}"))?;
+        self.queue_voice_asset(&archive, &file)
+    }
+
+    pub(crate) fn queue_game_voice(&mut self, symbol: &str) -> Result<String, String> {
+        let path = normalize_relative(b"ui/game_resources.cfg", PathPolicy::StrictLegacy)
+            .expect("valid game resources path");
+        let bytes = self
+            .library
+            .vfs
+            .read(&path)
+            .map_err(|error| error.to_string())?;
+        let (archive, file) = voice_resource(&bytes, symbol)?
+            .ok_or_else(|| format!("voice resource {symbol} is missing in {}", path.as_str()))?;
+        self.queue_voice_asset(&archive, &file)
+    }
+
+    fn queue_voice_asset(&mut self, archive: &str, file: &str) -> Result<String, String> {
         let asset = self
-            .dynamic_sound(&archive, &file)
+            .dynamic_sound(archive, file)
             .map_err(|error| error.to_string())?;
         self.mission_voice
             .append(decoder_for(&asset).map_err(|error| error.to_string())?);

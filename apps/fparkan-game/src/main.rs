@@ -83,8 +83,8 @@ use fparkan_runtime::{
     mission_object_handle, query_building_segment_world, simulate_mission_report, starting_cockpit,
     AutoDemoCamera, AutoDemoView, BasementPlacementMode, BuildingMeshNode, Engine, EngineError,
     EngineServices, FrameResult, LoadedMission, MissionAssets, MissionEventStop, MissionMode,
-    MissionObjectDraft, MissionRequest, MissionScriptInitExecution, MissionStartupInput,
-    StartingCockpit, SIMULATION_COVERAGE,
+    MissionNotice, MissionObjectDraft, MissionRequest, MissionScriptInitExecution,
+    MissionStartupInput, StartingCockpit, SIMULATION_COVERAGE,
 };
 #[cfg(test)]
 use fparkan_terrain::BasementFoundationFragment;
@@ -193,9 +193,10 @@ fn run(args: &[String]) -> Result<String, String> {
             log_mission_event_stop(stop);
         }
         return Ok(format!(
-            "simulation mission={} ticks={} queue_time_ms={} live_objects={} world_events={} init_states={} mission_events={} mission_messages={}\n{SIMULATION_COVERAGE} {camera_coverage}",
+            "simulation mission={} ticks={} queue_time_ms={} live_objects={} world_events={} init_states={} mission_events={} mission_messages={} outcome={:?}\n{SIMULATION_COVERAGE} {camera_coverage}",
             loaded.key, report.ticks, duration_ms, report.live_objects, report.world_events,
             loaded.script_init_state_count, report.mission_events, report.mission_messages,
+            fparkan_runtime::loaded_mission_script_outcome(&engine).unwrap_or_default(),
         ));
     }
     let mission_assets_duration = mission_assets_started.elapsed();
@@ -10382,16 +10383,27 @@ impl StaticVulkanApp {
             "mission_pause paused={paused} queue_time_ms={}",
             self.simulation_time_ms
         );
-        if let Some(window) = self.window.as_ref() {
-            window.set_title(if paused {
-                "FParkan mission — Пауза"
-            } else {
-                "FParkan mission"
-            });
-        }
+        self.update_mission_title();
         if let Some(audio) = self.audio.as_mut() {
             audio.set_paused(paused || !self.window_focused);
         }
+    }
+
+    fn update_mission_title(&self) {
+        let Some(window) = &self.window else {
+            return;
+        };
+        let outcome = self
+            .mission_engine
+            .as_ref()
+            .and_then(fparkan_runtime::loaded_mission_script_outcome)
+            .unwrap_or_default();
+        window.set_title(match (outcome, self.mission_paused) {
+            (fparkan_runtime::MissionScriptOutcome::Completed, _) => "Миссия выполнена",
+            (fparkan_runtime::MissionScriptOutcome::Failed, _) => "Миссия провалена",
+            (_, true) => "FParkan mission — Пауза",
+            _ => "FParkan mission",
+        });
     }
 
     fn update_shadow(
@@ -10494,13 +10506,40 @@ impl StaticVulkanApp {
                 log_mission_event_stop(stop);
             }
             if let Some(tick) = &frame.mission_event {
-                for &index in &tick.messages {
+                for &notice in &tick.notices {
+                    match notice {
+                        MissionNotice::ObjectiveComplete(index) => eprintln!("mission_objective index={index} status=complete queue_time_ms={control_clock_ms}"),
+                        MissionNotice::Completed | MissionNotice::Failed => {
+                            let status = if notice == MissionNotice::Completed {
+                                "completed"
+                            } else {
+                                "failed"
+                            };
+                            eprintln!("mission_outcome status={status} queue_time_ms={control_clock_ms}");
+                        }
+                        MissionNotice::Information(_) => {}
+                    }
                     if let Some(audio) = &mut self.audio {
-                        match audio.queue_mission_voice(index) {
-                            Ok(resource) => eprintln!("mission_voice index={index} resource={resource} queue_time_ms={control_clock_ms}"),
-                            Err(error) => eprintln!("sim_coverage mission_voice_unavailable=1 index={index} reason={error}"),
+                        let voice = match notice {
+                            MissionNotice::Information(index) => audio.queue_mission_voice(index),
+                            MissionNotice::ObjectiveComplete(_) => {
+                                audio.queue_game_voice("VOICE_OBJ_COMPLETE")
+                            }
+                            MissionNotice::Completed => {
+                                audio.queue_game_voice("VOICE_MISSION_COMPLETE")
+                            }
+                            MissionNotice::Failed => audio.queue_game_voice("VOICE_MISSION_FAIL"),
+                        };
+                        match voice {
+                            Ok(resource) => eprintln!("mission_voice notice={notice:?} resource={resource} queue_time_ms={control_clock_ms}"),
+                            Err(error) => eprintln!("sim_coverage mission_voice_unavailable=1 notice={notice:?} reason={error}"),
                         }
                     }
+                }
+                if tick.notices.iter().any(|notice| {
+                    matches!(notice, MissionNotice::Completed | MissionNotice::Failed)
+                }) {
+                    self.update_mission_title();
                 }
             }
             self.mission_frame = Some(frame);
