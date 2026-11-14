@@ -1,13 +1,67 @@
 use crate::{BehaviorOreState, LoadedMissionState, MissionEventStop};
 use fparkan_script::{
-    Handler2Record, Handler2RecordInput, Handler2RecordScheduler, ScriptDispatchSelector, VarSet,
-    VarSetDefault,
+    Handler15TargetPayload, Handler2Record, Handler2RecordInput, Handler2RecordScheduler,
+    ScriptDispatchSelector, VarSet, VarSetDefault,
 };
-use fparkan_world::{identity_metadata, registration_sequence, OwnerId, World};
+use fparkan_world::{identity_metadata, registration_sequence, ObjectHandle, OwnerId, World};
 use std::collections::BTreeMap;
 
 const STORAGE_CLASS: u32 = 0x8000_0008;
 const RESOURCE_ORE: u32 = 0x0200_0100;
+
+pub(super) struct ScriptFactoryOrder {
+    pub owner: OwnerId,
+    pub plant: ObjectHandle,
+    pub class: u32,
+}
+
+pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) {
+    let Some(loaded) = &mut engine.loaded else {
+        return;
+    };
+    for order in loaded.tick_clan_ai_events(&engine.world, now_ms) {
+        match crate::production::order_script_factory(
+            engine,
+            order.owner,
+            order.plant,
+            order.class,
+            now_ms,
+        ) {
+            Ok(duration) => {
+                let ai = &mut engine
+                    .loaded
+                    .as_mut()
+                    .expect("tick requires a loaded mission")
+                    .clan_ai_events;
+                *ai.factory_orders
+                    .entry((order.owner.0, order.plant.slot))
+                    .or_default() += 1;
+                eprintln!(
+                    "script_factory_order_approx clan={} plant={} duration_ms={duration} queue_time_ms={now_ms}",
+                    order.owner.0, order.plant.slot,
+                );
+            }
+            Err(error) => {
+                let ai = &mut engine
+                    .loaded
+                    .as_mut()
+                    .expect("tick requires a loaded mission")
+                    .clan_ai_events;
+                let count = ai
+                    .factory_rejections
+                    .entry((order.owner.0, order.plant.slot))
+                    .or_default();
+                *count += 1;
+                if *count == 1 {
+                    eprintln!(
+                        "sim_coverage script_factory_rejected=1 clan={} plant={} reason={error}",
+                        order.owner.0, order.plant.slot
+                    );
+                }
+            }
+        }
+    }
+}
 
 #[derive(Default)]
 pub(super) struct ClanAiEvents {
@@ -16,12 +70,19 @@ pub(super) struct ClanAiEvents {
     research_stubs: BTreeMap<(usize, u8), u64>,
     problems: BTreeMap<usize, Handler2RecordScheduler>,
     started: BTreeMap<(usize, u32), u64>,
+    factory_orders: BTreeMap<(u16, u32), u64>,
+    factory_rejections: BTreeMap<(u16, u32), u64>,
 }
 
 impl LoadedMissionState {
-    pub(super) fn tick_clan_ai_events(&mut self, world: &World, now_ms: u32) {
+    pub(super) fn tick_clan_ai_events(
+        &mut self,
+        world: &World,
+        now_ms: u32,
+    ) -> Vec<ScriptFactoryOrder> {
+        let mut orders = Vec::new();
         let Some(varset) = &self.script_varset else {
-            return;
+            return orders;
         };
         for bundle in self.script_bundles.iter().filter(|bundle| {
             bundle.behavior_warm_start.is_some() && self.mission.clans[bundle.clan_index].mode == 2
@@ -58,6 +119,49 @@ impl LoadedMissionState {
                     bundle.formula_table.as_ref(),
                     &mut state.values,
                     |instruction, values| match instruction.dispatch_selector() {
+                        ScriptDispatchSelector::Handler(11)
+                            if single_dword(&instruction.references, values)
+                                == Some(crate::boarding::WARBOT_CLASS) =>
+                        {
+                            // Behavior has no count cap for ordinary warbots in Handler(11).
+                            Ok(Some(VarSetDefault::Dword(0)))
+                        }
+                        ScriptDispatchSelector::Handler(15) if problem.is_some() => {
+                            let order = varset
+                                .declarations
+                                .resolve_handler15_with_values(instruction, values)
+                                .map_err(|error| error.to_string())?;
+                            if order.word_1 != 0x0c
+                                || order.word_2 != 1
+                                || order.word_3 != crate::boarding::WARBOT_CLASS
+                                || !matches!(order.target, Handler15TargetPayload::ByName(_))
+                            {
+                                return Err(
+                                    "Handler(15) only supports the scripted warbot factory order"
+                                        .into(),
+                                );
+                            }
+                            let owner = OwnerId(clan as u16);
+                            let plant = crate::mission_events::placed_logic_objects(
+                                &self.mission,
+                                world,
+                                order.word_0,
+                            )
+                            .find(|&handle| {
+                                identity_metadata(world, handle)
+                                    .is_ok_and(|identity| identity.owner_id == Some(owner))
+                            });
+                            let Some(plant) = plant else {
+                                return Ok(Some(VarSetDefault::Dword(5)));
+                            };
+                            orders.push(ScriptFactoryOrder {
+                                owner,
+                                plant,
+                                class: order.word_3,
+                            });
+                            // shortcut: queue the order for the host to apply after this script pass.
+                            Ok(Some(VarSetDefault::Dword(1)))
+                        }
                         ScriptDispatchSelector::Handler(6) if problem.is_some() => {
                             let (id, critical) = instruction.dword_pair(values).ok_or(
                                 "Handler(6) requires a placed unit and its assignment mode",
@@ -310,6 +414,7 @@ impl LoadedMissionState {
                 }
             }
         }
+        orders
     }
 }
 
@@ -429,6 +534,18 @@ impl ClanAiEvents {
         self.started
             .iter()
             .map(|(&(clan, kind), &count)| (clan, kind, count))
+    }
+
+    pub(super) fn factory_orders(&self) -> impl Iterator<Item = (u16, u32, u64)> + '_ {
+        self.factory_orders
+            .iter()
+            .map(|(&(clan, plant), &count)| (clan, plant, count))
+    }
+
+    pub(super) fn factory_rejections(&self) -> impl Iterator<Item = (u16, u32, u64)> + '_ {
+        self.factory_rejections
+            .iter()
+            .map(|(&(clan, plant), &count)| (clan, plant, count))
     }
 }
 

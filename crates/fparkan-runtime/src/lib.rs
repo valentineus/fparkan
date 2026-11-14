@@ -2810,9 +2810,7 @@ pub fn step_headless(
         .loaded
         .as_mut()
         .and_then(|state| state.tick_mission_event(&engine.world, queue_time_ms));
-    if let Some(loaded) = &mut engine.loaded {
-        loaded.tick_clan_ai_events(&engine.world, queue_time_ms);
-    }
+    clan_ai_events::tick(engine, queue_time_ms);
     let researched_component = engine
         .loaded
         .as_mut()
@@ -2906,6 +2904,12 @@ pub struct SimulationReport {
     pub clan_problem_dispatch_stubs: std::collections::BTreeMap<(usize, u32), u64>,
     /// Starts under the approximate scheduler, grouped by clan and problem kind.
     pub clan_problem_starts: Vec<(usize, u32, u64)>,
+    /// Rejected script construction orders grouped by clan and factory slot.
+    pub script_factory_rejections: Vec<(u16, u32, u64)>,
+    /// Accepted approximate script construction orders by clan and factory slot.
+    pub script_factory_orders: Vec<(u16, u32, u64)>,
+    /// First factory completion by clan, in milliseconds.
+    pub first_factory_completion_ms: std::collections::BTreeMap<u16, u32>,
     /// Total requests for mission information messages.
     pub mission_messages: u64,
     /// Clock of the first autonomous shot, in milliseconds.
@@ -2943,6 +2947,9 @@ pub fn simulate_mission_report(
         clan_research_status_stubs: Vec::new(),
         clan_problem_dispatch_stubs: Default::default(),
         clan_problem_starts: Vec::new(),
+        script_factory_rejections: Vec::new(),
+        script_factory_orders: Vec::new(),
+        first_factory_completion_ms: Default::default(),
         mission_messages: 0,
         autodemo_first_shot_ms: None,
         autodemo_first_destroyed_ms: None,
@@ -2958,6 +2965,12 @@ pub fn simulate_mission_report(
         report.ticks = tick;
         report.live_objects = frame.snapshot.objects.len();
         report.world_events += frame.snapshot.events.len() as u64;
+        if let Some(unit) = frame.produced_unit {
+            report
+                .first_factory_completion_ms
+                .entry(unit.clan)
+                .or_insert(clock_ms);
+        }
         report.autodemo_combat_unavailable += frame.autodemo_combat_unavailable;
         report.autodemo_reinforcement_unavailable += frame.autodemo_reinforcement_unavailable;
         if !frame.autodemo_reinforcements.is_empty() {
@@ -3006,6 +3019,12 @@ pub fn simulate_mission_report(
         report
             .clan_problem_starts
             .extend(loaded.clan_ai_events.started_problems());
+        report
+            .script_factory_rejections
+            .extend(loaded.clan_ai_events.factory_rejections());
+        report
+            .script_factory_orders
+            .extend(loaded.clan_ai_events.factory_orders());
     }
     Ok(report)
 }

@@ -21,6 +21,15 @@ pub(super) fn log_script_init(engine: &Engine, mission: &str) {
 }
 
 pub(super) fn log_clan_ai_stops(report: &SimulationReport) {
+    for &(clan, plant, count) in &report.script_factory_orders {
+        eprintln!("sim_coverage script_factory_orders_approx={count} clan={clan} plant={plant}");
+    }
+    for &(clan, plant, count) in &report.script_factory_rejections {
+        eprintln!("sim_coverage script_factory_rejections={count} clan={clan} plant={plant}");
+    }
+    for (clan, first_ms) in &report.first_factory_completion_ms {
+        eprintln!("script_factory_completion clan={clan} first_ms={first_ms}");
+    }
     for &(clan, kind, count) in &report.clan_problem_starts {
         eprintln!("sim_coverage script_problem_starts_approx={count} clan={clan} problem={kind}");
     }

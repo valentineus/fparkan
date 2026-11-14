@@ -339,16 +339,28 @@ pub fn order_clan_factory_scheme(
     scheme: usize,
     now_ms: u32,
 ) -> Result<u32, EngineError> {
+    let owner = player_owner(&engine.world, cockpit)?;
+    order_owned_factory(engine, owner, plant, scheme, now_ms)
+}
+
+fn order_owned_factory(
+    engine: &mut Engine,
+    owner: OwnerId,
+    plant: ObjectHandle,
+    scheme: usize,
+    now_ms: u32,
+) -> Result<u32, EngineError> {
     let (Some(mission), Some(production)) = (&mut engine.loaded, &mut engine.production) else {
         return Err(EngineError::Production(
             "mission has no prepared robot design; use --build-scheme to choose one".into(),
         ));
     };
-    let owner = player_owner(&engine.world, cockpit)?;
     let (plant_index, _, is_free) = owned_factories(&engine.world, mission, production, owner)
         .find(|&(_, handle, _)| handle == plant)
         .ok_or_else(|| {
-            EngineError::Production("selected factory no longer belongs to the player".into())
+            EngineError::Production(
+                "selected factory no longer belongs to the ordering clan".into(),
+            )
         })?;
     if production.pending.is_some() {
         return Err(EngineError::Production(
@@ -438,6 +450,28 @@ pub fn order_clan_factory_scheme(
         paid,
     });
     Ok(duration_ms)
+}
+
+pub(super) fn order_script_factory(
+    engine: &mut Engine,
+    owner: OwnerId,
+    plant: ObjectHandle,
+    class: u32,
+    now_ms: u32,
+) -> Result<u32, EngineError> {
+    let (mission, production) = loaded_production(engine)?;
+    let (index, _, _) = owned_factories(&engine.world, mission, production, owner)
+        .find(|&(_, handle, _)| handle == plant)
+        .ok_or_else(|| production_error("script factory is unavailable"))?;
+    // shortcut: use the mission's first compatible prebuild until AI design selection is linked.
+    let scheme = schemes_for_plant(mission, production, index)
+        .map(|(scheme, _)| scheme)
+        .find(|&scheme| {
+            let draft = &mission.object_drafts[production.reserve_start + scheme * RESERVE_SLOTS];
+            draft.unit_dat_header_flags == Some(class)
+        })
+        .ok_or_else(|| production_error("script factory has no compatible prepared scheme"))?;
+    order_owned_factory(engine, owner, plant, scheme, now_ms)
 }
 
 fn loaded_production(engine: &Engine) -> Result<(&LoadedMissionState, &Production), EngineError> {
@@ -647,6 +681,33 @@ mod tests {
         )
         .unwrap()
         .is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_two_fortresses_builds_a_scripted_enemy_robot() {
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed corpus");
+        let vfs = std::sync::Arc::new(DirectoryVfs::new(std::path::PathBuf::from(root)));
+        let mut engine = create(EngineServices::new(vfs)).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Single.01/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        let report = super::super::simulate_mission_report(&mut engine, 40_000).unwrap();
+        assert!(
+            report.first_factory_completion_ms.contains_key(&1),
+            "{report:?}"
+        );
+        assert!(!report.first_factory_completion_ms.contains_key(&0));
     }
 
     #[test]
