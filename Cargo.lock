@@ -582,6 +582,7 @@ version = "0.1.0"
 dependencies = [
  "fparkan-platform",
  "raw-window-handle",
+ "windows-sys 0.52.0",
  "winit",
 ]
 

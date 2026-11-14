@@ -9,3 +9,6 @@ repository.workspace = true
 fparkan-platform = { path = "../../crates/fparkan-platform" }
 raw-window-handle = "0.6"
 winit = { version = "0.30", default-features = false, features = ["rwh_06"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }

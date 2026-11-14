@@ -989,7 +989,7 @@ impl GameAudio {
             .vfs
             .read(&messages)
             .map_err(|error| error.to_string())?;
-        let symbol = message_voice_symbol(&bytes, index)?.ok_or_else(|| {
+        let symbol = message_symbol(&bytes, index, "VOICE_RESOURCE")?.ok_or_else(|| {
             format!(
                 "voice for index {index} is missing in {}",
                 messages.as_str()
@@ -1464,7 +1464,7 @@ fn parse_mission_audio_config(bytes: &[u8]) -> Result<MissionAudioConfig, String
     })
 }
 
-fn config_objects(text: &str) -> impl Iterator<Item = BTreeMap<String, &str>> {
+pub(crate) fn config_objects(text: &str) -> impl Iterator<Item = BTreeMap<String, &str>> {
     text.lines()
         .map(|line| line.split('#').next().unwrap_or_default().trim())
         .scan(None, |object, line| {
@@ -1481,7 +1481,11 @@ fn config_objects(text: &str) -> impl Iterator<Item = BTreeMap<String, &str>> {
         .flatten()
 }
 
-fn message_voice_symbol(bytes: &[u8], index: u32) -> Result<Option<String>, String> {
+pub(crate) fn message_symbol(
+    bytes: &[u8],
+    index: u32,
+    field: &str,
+) -> Result<Option<String>, String> {
     for object in config_objects(&String::from_utf8_lossy(bytes)) {
         if object
             .get("MESSAGE_INDEX")
@@ -1490,7 +1494,7 @@ fn message_voice_symbol(bytes: &[u8], index: u32) -> Result<Option<String>, Stri
             == Some(index)
         {
             return object
-                .get("VOICE_RESOURCE")
+                .get(field)
                 .map(|value| parse_cfg_value(value))
                 .transpose();
         }
@@ -1508,7 +1512,7 @@ fn voice_resource(bytes: &[u8], symbol: &str) -> Result<Option<(String, String)>
     Ok(None)
 }
 
-fn parse_cfg_value(value: &str) -> Result<String, String> {
+pub(crate) fn parse_cfg_value(value: &str) -> Result<String, String> {
     if let Some(rest) = value.strip_prefix('"') {
         let end = rest
             .find('"')
@@ -1528,14 +1532,25 @@ mod tests {
 
     #[test]
     fn mission_voice_uses_the_index_and_preserves_the_declared_archive() {
-        let messages = b"object message\nmessage_index = 14\nvoice_resource = \"hint\"\nend\n";
+        let messages = b"object message\nmessage_index = 14\nvoice_resource = \"hint\"\ntext_resource = \"local_text\"\nend\n";
         let mission = b"object voices\nlibrary = \"custom.lib\"\nHINT = \"run.wav\"\nend\n# \xff";
-        let symbol = message_voice_symbol(messages, 14).unwrap().unwrap();
+        let symbol = message_symbol(messages, 14, "VOICE_RESOURCE")
+            .unwrap()
+            .unwrap();
         assert_eq!(
             voice_resource(mission, &symbol).unwrap(),
             Some(("custom.lib".into(), "run.wav".into()))
         );
-        assert_eq!(message_voice_symbol(messages, 15).unwrap(), None);
+        assert_eq!(
+            message_symbol(messages, 15, "VOICE_RESOURCE").unwrap(),
+            None
+        );
+        assert_eq!(
+            message_symbol(messages, 14, "TEXT_RESOURCE")
+                .unwrap()
+                .as_deref(),
+            Some("local_text")
+        );
     }
 
     #[test]

@@ -1,5 +1,9 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 //! Minimal `winit`-backed platform adapter shim.
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub mod text;
 
 use fparkan_platform::{
     EventSource, MonotonicClock, MonotonicInstant, NativeWindowHandles, PhysicalSize,

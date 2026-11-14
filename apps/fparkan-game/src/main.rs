@@ -3,6 +3,8 @@
 //! `FParkan` render-planning composition root.
 
 mod camera_capture;
+#[cfg(windows)]
+mod mission_hints;
 mod terrain_lod;
 
 #[cfg(test)]
@@ -9926,6 +9928,15 @@ fn run_static_vulkan_mode(
             }
         }).collect()
     });
+    #[cfg(windows)]
+    let mission_hints = if cockpit.is_some() {
+        mission_hints::MissionHints::load(root, mission, &mut preview).unwrap_or_else(|error| {
+            eprintln!("sim_coverage mission_text_unavailable=1 reason={error}");
+            None
+        })
+    } else {
+        None
+    };
     let shadow_base_vertex = preview.mesh.vertices.len();
     let shadow_base_index = preview.mesh.indices.len();
     let mut app = StaticVulkanApp::new(
@@ -9946,6 +9957,15 @@ fn run_static_vulkan_mode(
         startup_timings,
     );
     app.mission_engine = mission_engine;
+    #[cfg(windows)]
+    {
+        if let Some(hints) = &mission_hints {
+            let range = hints.range_index();
+            app.world_range_indices.retain(|&index| index != range);
+            app.world_range_index_counts.remove(&range);
+        }
+        app.mission_hints = mission_hints;
+    }
     app.demo_camera = demo_camera;
     app.cockpit = cockpit;
     app.player_weapon_layouts = player_weapon_layouts;
@@ -10112,6 +10132,8 @@ struct StaticVulkanApp {
     boarded_hero_index: Option<usize>,
     laboratory_status: Option<String>,
     mission_title: String,
+    #[cfg(windows)]
+    mission_hints: Option<mission_hints::MissionHints>,
     audio: Option<audio::GameAudio>,
     camera_mode: &'static str,
     mesh_components: usize,
@@ -10249,6 +10271,8 @@ impl StaticVulkanApp {
             boarded_hero_index: None,
             laboratory_status: None,
             mission_title: String::new(),
+            #[cfg(windows)]
+            mission_hints: None,
             audio,
             camera_mode: preview.camera_mode,
             mesh_components: preview.mesh_components,
@@ -11333,7 +11357,19 @@ impl StaticVulkanApp {
                             };
                             eprintln!("mission_outcome status={status} queue_time_ms={control_clock_ms}");
                         }
-                        MissionNotice::Information(_) => {}
+                        MissionNotice::Information(index) => {
+                            #[cfg(windows)]
+                            {
+                                let queued = self.mission_hints.as_mut()
+                                    .ok_or_else(|| "mission text resources unavailable".to_string())
+                                    .and_then(|hints| hints.enqueue(index));
+                                if let Err(error) = queued {
+                                    eprintln!("sim_coverage mission_text_unavailable=1 index={index} reason={error}");
+                                }
+                            }
+                            #[cfg(not(windows))]
+                            eprintln!("sim_coverage mission_text_unavailable=1 index={index} reason=platform");
+                        }
                     }
                     if let Some(audio) = &mut self.audio {
                         let voice = match notice {
@@ -11782,6 +11818,15 @@ impl StaticVulkanApp {
         let Some(renderer) = self.renderer.as_mut() else {
             return Ok(());
         };
+        #[cfg(windows)]
+        if let Some(hints) = &mut self.mission_hints {
+            hints.draw(
+                renderer,
+                &mut self.mesh,
+                frame.clock.time_ms,
+                frame.viewport,
+            )?;
+        }
         renderer
             .set_camera(frame.camera.vulkan_camera())
             .map_err(|error| format!("apply sampled scene camera: {error}"))?;
