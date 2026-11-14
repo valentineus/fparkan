@@ -50,6 +50,7 @@ const MISSION_DECODED_PAYLOAD_CACHE_ENTRIES: usize = 256;
 const MAX_MISSION_AI_RECORD_SLOTS: usize = 1_000_000;
 const FALLBACK_SCRIPT_VARSET_PATH: &str = "MISSIONS/SCRIPTS/varset.var";
 const INITIAL_BEHAVIOR_RNG_STATE: u32 = 1;
+const HERO_UNIT_CLASS: u32 = 0x0102_0000;
 const UNIT_DAT_CONTROL_CLASS_HIGH_BIT: u32 = 0x8000_0000;
 const CONTROL_CLASS_SOURCE_BTLU: u32 = u32::from_le_bytes(*b"BTLU");
 const CONTROL_CLASS_SOURCE_BULL: u32 = u32::from_le_bytes(*b"BULL");
@@ -2535,6 +2536,63 @@ pub fn loaded_mission_object_drafts(engine: &Engine) -> Option<&[MissionObjectDr
         .loaded
         .as_ref()
         .map(|state| state.object_drafts.as_slice())
+}
+
+/// Camera point of the single unambiguous starting hero in a mission.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StartingCockpit {
+    /// Live world object whose transform drives the viewpoint.
+    pub handle: ObjectHandle,
+    /// Mission object index used to address its prepared components.
+    pub object_index: usize,
+    /// Component that supplies the camera point.
+    pub component_index: usize,
+    /// MSH node containing the camera point.
+    pub node_index: usize,
+    /// Camera origin in the node's local coordinates.
+    pub node_point: [f32; 3],
+}
+
+/// Resolves the starting hero's CameraCenter in the prepared component data.
+#[must_use]
+pub fn starting_cockpit(engine: &Engine) -> Option<StartingCockpit> {
+    let mission = engine.loaded.as_ref()?;
+    if mission.script_host_mode != MissionMode::SingleMission {
+        return None;
+    }
+    // shortcut: pick only a unique hero until native local ownership is wired.
+    let mut heroes = mission
+        .object_drafts
+        .iter()
+        .enumerate()
+        .filter(|(_, object)| object.unit_dat_header_flags == Some(HERO_UNIT_CLASS));
+    let (object_index, hero) = heroes.next()?;
+    if heroes.next().is_some() {
+        return None;
+    }
+    let handle = handle_by_original_id(&engine.world, hero.original_id?)?;
+    let mut points = mission
+        .mission_assets
+        .object_component_controls
+        .get(object_index)?
+        .iter()
+        .enumerate()
+        .filter_map(|(index, control)| {
+            Some((index, &control.as_ref()?.point_list.as_ref()?.points))
+        })
+        .flat_map(|(index, points)| points.iter().map(move |point| (index, point)))
+        .filter(|(_, point)| point.name.split(|&byte| byte == 0).next() == Some(b"CameraCenter"));
+    let (component_index, point) = points.next()?;
+    if points.next().is_some() || point.raw_signed_field_04 != point.raw_signed_field_08 {
+        return None;
+    }
+    Some(StartingCockpit {
+        handle,
+        object_index,
+        component_index,
+        node_index: usize::try_from(point.raw_signed_field_04).ok()?,
+        node_point: point.position,
+    })
 }
 
 /// Returns the clan-indexed Behavior distributors and their registered objects.
@@ -5862,7 +5920,7 @@ fn behavior_profile_entry_for_class(class_flags: u32) -> Option<&'static str> {
         0x0100_4000 => Some("prof_bld.var"),
         0x0100_8000 => Some("prof_war.var"),
         0x0101_0000 => Some("prof_hq.var"),
-        0x0102_0000 => Some("prof_hero.var"),
+        HERO_UNIT_CLASS => Some("prof_hero.var"),
         0x2000_0000 => Some("prof_animal.var"),
         _ => None,
     }

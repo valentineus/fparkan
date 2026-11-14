@@ -80,10 +80,10 @@ use fparkan_runtime::{
     create, frame as step_mission_frame, load_mission_static_preview,
     load_mission_static_preview_roots, load_mission_with_init_stubs, loaded_mission_assets,
     loaded_mission_object_drafts, loaded_mission_script_bundles, loaded_terrain,
-    query_building_segment_world, simulate_mission_report, BasementPlacementMode, BuildingMeshNode,
-    Engine, EngineError, EngineServices, FrameResult, LoadedMission, MissionAssets, MissionMode,
-    MissionObjectDraft, MissionRequest, MissionScriptInitExecution, MissionStartupInput,
-    SIMULATION_COVERAGE,
+    query_building_segment_world, simulate_mission_report, starting_cockpit, BasementPlacementMode,
+    BuildingMeshNode, Engine, EngineError, EngineServices, FrameResult, LoadedMission,
+    MissionAssets, MissionMode, MissionObjectDraft, MissionRequest, MissionScriptInitExecution,
+    MissionStartupInput, StartingCockpit, SIMULATION_COVERAGE,
 };
 #[cfg(test)]
 use fparkan_terrain::BasementFoundationFragment;
@@ -169,6 +169,7 @@ fn run(args: &[String]) -> Result<String, String> {
         }
     }
     if let Some(duration_ms) = args.sim_report_ms {
+        let camera_coverage = mission_camera_coverage(starting_cockpit(&engine));
         let report = simulate_mission_report(&mut engine, duration_ms.get()).map_err(|error| {
             format!(
                 "sim_coverage mission_step_failed=1 mission={}\n{error}",
@@ -176,7 +177,7 @@ fn run(args: &[String]) -> Result<String, String> {
             )
         })?;
         return Ok(format!(
-            "simulation mission={} ticks={} queue_time_ms={} live_objects={} world_events={} init_states={}\n{SIMULATION_COVERAGE}",
+            "simulation mission={} ticks={} queue_time_ms={} live_objects={} world_events={} init_states={}\n{SIMULATION_COVERAGE} {camera_coverage}",
             loaded.key, report.ticks, duration_ms, report.live_objects, report.world_events,
             loaded.script_init_state_count,
         ));
@@ -9569,8 +9570,15 @@ fn run_static_vulkan_mode(
         startup_timings,
     );
     app.mission_engine = mission_engine;
-    if app.mission_engine.is_some() {
-        eprintln!("{SIMULATION_COVERAGE} live_render_state_stub=1");
+    if let Some(engine) = &app.mission_engine {
+        app.cockpit = starting_cockpit(engine);
+        if app.cockpit.is_some() {
+            app.camera_mode = "starting-cockpit";
+        }
+        eprintln!(
+            "{SIMULATION_COVERAGE} live_render_state_stub=1 {}",
+            mission_camera_coverage(app.cockpit),
+        );
     }
     if let Err(err) = event_loop.run_app(&mut app) {
         app.error = Some(format!("winit event loop: {err}"));
@@ -9578,9 +9586,18 @@ fn run_static_vulkan_mode(
     app.finish()
 }
 
+fn mission_camera_coverage(cockpit: Option<StartingCockpit>) -> &'static str {
+    if cockpit.is_some() {
+        "cockpit_look_stub=1 cockpit_pose_approx=1"
+    } else {
+        "mission_camera_stub=1"
+    }
+}
+
 struct StaticVulkanApp {
     mission_engine: Option<Engine>,
     mission_frame: Option<FrameResult>,
+    cockpit: Option<StartingCockpit>,
     op1_jitter: Op1JitterState,
     fixed_water_clock_ms: Option<u32>,
     mesh: VulkanStaticMesh,
@@ -9697,6 +9714,7 @@ impl StaticVulkanApp {
         Self {
             mission_engine: None,
             mission_frame: None,
+            cockpit: None,
             mesh: preview.mesh,
             dynamic_vertex_start: preview.dynamic_vertex_start,
             terrain_lod: preview.terrain_lod,
@@ -10000,6 +10018,76 @@ impl StaticVulkanApp {
         Ok(())
     }
 
+    fn update_mission_camera(
+        &mut self,
+        delta_seconds: f32,
+        viewport: [f32; 2],
+    ) -> Result<(), String> {
+        if let Some(camera) = self
+            .cockpit
+            .and_then(|cockpit| self.cockpit_frame(cockpit, viewport))
+        {
+            self.camera = camera.vulkan_camera();
+            self.view_camera = camera;
+            return Ok(());
+        }
+        if self.cockpit.take().is_some() {
+            self.camera_mode = "free-flight";
+            eprintln!("sim_coverage mission_camera_stub=1 (cockpit target or pose unavailable)");
+        }
+        self.update_free_camera(delta_seconds, viewport)
+    }
+
+    fn cockpit_frame(
+        &self,
+        cockpit: StartingCockpit,
+        viewport: [f32; 2],
+    ) -> Option<PreviewCameraFrame> {
+        let (_, state) = self
+            .mission_frame
+            .as_ref()?
+            .snapshot
+            .transforms
+            .iter()
+            .find(|(handle, _)| *handle == cockpit.handle)?;
+        let hierarchy = self
+            .component_pose_buffers
+            .get(cockpit.object_index)?
+            .get(cockpit.component_index)?
+            .as_ref()?;
+        let mount = self
+            .component_mount_poses
+            .get(cockpit.object_index)?
+            .get(cockpit.component_index)?
+            .as_ref()
+            .copied();
+        if cockpit.component_index != 0 && mount.is_none() {
+            return None;
+        }
+        let pose =
+            control_effect_owner_node_pose(Some(hierarchy), mount.is_some(), cockpit.node_index)?;
+        let pose = mount.map_or(pose, |mount| compose_unit_pose(mount, pose));
+        let offset = rotate_unit_vector(cockpit.node_point, pose.rotation);
+        let point = std::array::from_fn(|axis| pose.translation[axis] + offset[axis]);
+        let camera = fparkan_render::forward_cockpit_camera(
+            LegacyIron3dEulerTransform {
+                translation: state.position.map(f32::from_bits),
+                orientation_radians: state.orientation.map(f32::from_bits),
+            },
+            state.scale.map(f32::from_bits),
+            point,
+        )?;
+        PreviewCameraFrame::from_legacy_d3d7(
+            camera,
+            LegacyD3d7Projection {
+                viewport: [0, 0, viewport[0] as i32, viewport[1] as i32],
+                near_plane: 0.5,
+                far_plane: 700.0,
+                field_of_view_radians: 1.3,
+            },
+        )
+    }
+
     fn building_segment_blocked(&self, world_segment: [[f32; 3]; 2]) -> Result<bool, String> {
         for binding in &self.building_collision_bindings {
             if binding.selected_nodes.is_empty() {
@@ -10212,7 +10300,7 @@ impl StaticVulkanApp {
             &mut self.component_mount_poses,
             &mut self.mesh,
         )?;
-        self.update_free_camera(clock.delta_seconds, viewport)?;
+        self.update_mission_camera(clock.delta_seconds, viewport)?;
         refresh_dynamic_shadow_casters(
             &mut self.shadow_casters,
             &self.dynamic_shadow_casters,
@@ -10909,6 +10997,12 @@ impl StaticVulkanApp {
                 frame.snapshot.objects.len(),
             );
         }
+        if self.cockpit.is_some() {
+            eprintln!(
+                "mission_camera position={:?} forward={:?}",
+                self.view_camera.position, self.view_camera.forward,
+            );
+        }
         self.output = Some(format!(
             "rendered mission {}: {} frames, {} objects, {} mesh components, {} terrain components, camera={}, captured_viewport_crop={}, control_clock_ms={}, control_clock_mode={}, materials={}, environment_primitives={}, shadow_casters={}, shadow_indices={}, swapchain_recreates={}, validation={}, swapchain_format={}, readback_format={}, readback={}, readback_sequence={}, startup_ms={{mission_assets:{:.1},terrain_materials:{:.1},sky:{:.1},gpu_initialization:{:.1}}}",
             self.mission,
@@ -11159,7 +11253,7 @@ impl ApplicationHandler for StaticVulkanApp {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if button == MouseButton::Right {
+                if button == MouseButton::Right && self.cockpit.is_none() {
                     self.set_mouse_look(state == ElementState::Pressed);
                 }
             }
@@ -13978,6 +14072,88 @@ mod tests {
         let clock = app.sample_frame_clock();
         app.prepare_scene_update(clock, [960.0, 540.0]).unwrap();
         assert_eq!(app.mission_frame.as_ref().unwrap().snapshot.tick.0, 2);
+    }
+
+    #[test]
+    #[ignore = "requires installed GOG resources; set FPARKAN_GAME_ROOT"]
+    fn constructor_cockpit_follows_the_live_hero_snapshot() {
+        let root = std::env::var_os("FPARKAN_GAME_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\GOG Games\Parkan - Iron Strategy"));
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
+        load_mission_with_init_stubs(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.02/data.tma".to_owned(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+        )
+        .unwrap();
+        let cockpit = starting_cockpit(&engine).expect("the constructor has one hero camera point");
+        let hero_id = loaded_mission_object_drafts(&engine).unwrap()[cockpit.object_index]
+            .original_id
+            .unwrap();
+        let assets = loaded_mission_assets(&engine).unwrap();
+        let models = assets
+            .visuals_for_object(cockpit.object_index)
+            .iter()
+            .map(|id| {
+                assets
+                    .visual_by_id(*id)
+                    .and_then(|visual| visual.model_id)
+                    .and_then(|id| assets.model_by_id(id))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let controls = &assets.object_component_controls[cockpit.object_index];
+        let poses = models
+            .iter()
+            .zip(controls)
+            .map(|(model, control)| {
+                let bindings = control
+                    .as_ref()
+                    .map_or(&[][..], |control| control.bindings.as_slice());
+                static_preview_component_pose_buffer(&model.validated, bindings, None).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let socket_index = loaded_mission_object_drafts(&engine).unwrap()[cockpit.object_index]
+            .unit_components[cockpit.component_index]
+            .parent_or_link;
+        let socket = node38_pose_from_hierarchy(
+            poses[0].as_ref().unwrap(),
+            usize::try_from(socket_index).unwrap(),
+        )
+        .unwrap();
+        let mut mounts = vec![None; models.len()];
+        mounts[cockpit.component_index] = Some(socket);
+        let (mut app, _) = clock_test_app(None);
+        app.component_pose_buffers
+            .resize_with(cockpit.object_index, Vec::new);
+        app.component_pose_buffers.push(poses);
+        app.component_mount_poses
+            .resize_with(cockpit.object_index, Vec::new);
+        app.component_mount_poses.push(mounts);
+        app.cockpit = Some(cockpit);
+        app.mission_frame = Some(step_mission_frame(&mut engine, 0).unwrap());
+        app.update_mission_camera(0.0, [800.0, 600.0]).unwrap();
+        let before = app.view_camera.position;
+        let native = [300.34802, 556.322, 155.93156];
+        assert!(dot3(sub3(before, native), sub3(before, native)).sqrt() < 0.13);
+        assert!(fparkan_runtime::advance_reference_movement(
+            &mut engine,
+            hero_id,
+            [301.29538, 556.14124],
+            2.0,
+        )
+        .unwrap());
+        app.mission_frame = Some(step_mission_frame(&mut engine, 16).unwrap());
+        app.update_mission_camera(0.016, [800.0, 600.0]).unwrap();
+        assert!((app.view_camera.position[0] - before[0] - 1.0).abs() < 1e-4);
+        assert_eq!(app.view_camera.position[1], before[1]);
     }
 
     #[test]

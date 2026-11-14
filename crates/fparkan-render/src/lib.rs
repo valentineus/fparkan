@@ -319,6 +319,24 @@ impl LegacyIron3dEulerTransform {
     }
 }
 
+/// Places a forward-facing cockpit camera at a unit-local point.
+#[must_use]
+pub fn forward_cockpit_camera(
+    unit: LegacyIron3dEulerTransform,
+    scale: [f32; 3],
+    point: [f32; 3],
+) -> Option<RawCameraTransform> {
+    let [x, y, z] = unit.try_transform_scaled_point(point, scale)?;
+    let m = unit.try_row_major()?;
+    // shortcut: neutral view along unit +Y until the turret's look controller is wired.
+    Some(RawCameraTransform {
+        words: [
+            m[1], -m[0], m[2], x, m[5], -m[4], m[6], y, m[9], -m[8], m[10], z, 0.0, 0.0, 0.0, 1.0,
+        ]
+        .map(f32::to_bits),
+    })
+}
+
 /// Fixed-function blend behaviour represented without a graphics API type.
 ///
 /// This is the compatibility contract for the native MAT0 pipeline category.
@@ -574,6 +592,20 @@ mod tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn cockpit_point_follows_unit_translation_and_yaw() {
+        let unit = LegacyIron3dEulerTransform {
+            translation: [10.0, 20.0, 30.0],
+            orientation_radians: [0.0, 0.0, std::f32::consts::FRAC_PI_2],
+        };
+        let camera = forward_cockpit_camera(unit, [1.0, 2.0, 3.0], [0.0, 2.0, 1.0]).unwrap();
+        assert_eq!(camera.translation(), [6.0, 20.0, 33.0]);
+        let view = camera.try_direct3d7_view_row_major().unwrap();
+        assert_eq!(view[2], -1.0);
+        assert!(view[6].abs() < 1e-6);
+        assert_eq!(view[10], 0.0);
     }
 
     #[test]
