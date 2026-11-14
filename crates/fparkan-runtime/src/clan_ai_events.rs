@@ -170,7 +170,7 @@ impl LoadedMissionState {
                                     self.clan_ai_events.problems.get(&clan).is_some_and(|scheduler| {
                                         scheduler.records().iter().any(|record| {
                                             record.key.word_0 == 9
-                                                && problem_dword(record.key.scalar_4_bits) == Some(id)
+                                                && record.key.argument_0 == id
                                         })
                                     })
                                 },
@@ -419,19 +419,21 @@ impl LoadedMissionState {
                             let problem: &Handler2Record = problem
                                 .as_ref()
                                 .ok_or("Handler(29) requires a current problem")?;
-                            let bits =
+                            let argument =
                                 match single_dword(&instruction.references, values) {
-                                    Some(0) => problem.key.scalar_4_bits,
-                                    Some(1) => problem.key.scalar_5_bits,
-                                    Some(2) => problem.scalar_6.to_bits(),
+                                    Some(0) => problem.key.argument_0,
+                                    Some(1) => problem.key.argument_1,
+                                    Some(2) => problem.argument_2,
                                     _ => return Err(
                                         "Handler(29) requires a problem argument index from 0 to 2"
                                             .into(),
                                     ),
                                 };
-                            Ok(Some(VarSetDefault::Dword(problem_dword(bits).ok_or(
-                                "Handler(29) argument is outside the supported DWORD range",
-                            )?)))
+                            let result = match values.get(instruction.header_words[1] as usize) {
+                                Some(VarSetDefault::FloatBits(_)) => VarSetDefault::FloatBits(argument),
+                                _ => VarSetDefault::Dword(argument),
+                            };
+                            Ok(Some(result))
                         }
                         ScriptDispatchSelector::Handler(0)
                             if problem.is_some() && instruction.references.len() == 1 =>
@@ -689,6 +691,9 @@ fn problem_operands<'a>(
         VarSetDefault::Dword(value) => Some(value as f32),
         VarSetDefault::FloatBits(bits) => Some(f32::from_bits(bits)),
     };
+    let argument = |index| match value(index)? {
+        VarSetDefault::Dword(value) | VarSetDefault::FloatBits(value) => Some(value),
+    };
     Some((
         varset.declarations.get(kind as usize)?.name.as_str(),
         Handler2RecordInput {
@@ -696,9 +701,9 @@ fn problem_operands<'a>(
             scalar_1: scalar(priority)?,
             word_2: word(increment)?,
             word_3: word(sender)?,
-            scalar_4: scalar(first)?,
-            scalar_5: scalar(second)?,
-            scalar_6: scalar(third)?,
+            argument_0: argument(first)?,
+            argument_1: argument(second)?,
+            argument_2: argument(third)?,
         },
     ))
 }
@@ -818,7 +823,7 @@ mod tests {
         let values = [
             VarSetDefault::Dword(6),
             VarSetDefault::FloatBits(5.75_f32.to_bits()),
-            VarSetDefault::Dword(12),
+            VarSetDefault::Dword(0x8000_0002),
         ];
         let (name, problem) = problem_operands(&varset, &values, &[0, 1, 1, 2, 2, 1, 0]).unwrap();
         assert_eq!(name, "PBM_ROBOT_NEEDED");
@@ -828,10 +833,10 @@ mod tests {
                 word_0: 6,
                 scalar_1: 5.75,
                 word_2: 5,
-                word_3: 12,
-                scalar_4: 12.0,
-                scalar_5: 5.75,
-                scalar_6: 6.0,
+                word_3: 0x8000_0002,
+                argument_0: 0x8000_0002,
+                argument_1: 5.75_f32.to_bits(),
+                argument_2: 6,
             }
         );
     }
@@ -845,9 +850,9 @@ mod tests {
                 scalar_1,
                 word_2: 0,
                 word_3: 0,
-                scalar_4: 0.0,
-                scalar_5: 0.0,
-                scalar_6: 0.0,
+                argument_0: 0,
+                argument_1: 0,
+                argument_2: 0,
             });
         }
         let first = ranked_problems(queue.records()).pop().unwrap().key;
