@@ -331,7 +331,7 @@ pub fn apply_projectile_contact(
     Ok(updated.map(|_| ((remaining - volume).max(0.0), false)))
 }
 
-fn segment_sphere_fraction(
+pub(super) fn segment_sphere_fraction(
     [start, end]: [[f32; 3]; 2],
     center: [f32; 3],
     radius: f32,

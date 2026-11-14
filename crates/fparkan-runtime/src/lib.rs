@@ -18323,12 +18323,26 @@ mod tests {
             player_status(&engine, hero.handle).unwrap().health_percent,
             Some(75)
         );
-        let enemy = mission_object_handle(&engine, OriginalObjectId(11)).unwrap();
-        let enemy_pose = transform_state(&engine.world, enemy).unwrap();
-        let [x, y, z] = enemy_pose.position.map(f32::from_bits);
+        // Poses from the stock-start walk into the battle. The hero's hull
+        // meets the ray before terrain, even though its center is underground.
+        let enemy = mission_object_handle(&engine, OriginalObjectId(14)).unwrap();
+        let mut enemy_pose = transform_state(&engine.world, enemy).unwrap();
+        enemy_pose.position = [1504.2733_f32, 915.2701, 67.87986].map(f32::to_bits);
+        set_transform(&mut engine.world, enemy, enemy_pose).unwrap();
         let mut pose = transform_state(&engine.world, hero.handle).unwrap();
-        pose.position = [x - 10.0, y, z + 18.0].map(f32::to_bits);
+        pose.position = [1504.273_f32, 917.2702, 64.927925].map(f32::to_bits);
         set_transform(&mut engine.world, hero.handle, pose).unwrap();
+        let mission = engine.loaded.as_ref().unwrap();
+        let (from, _) = projectile::unit_sphere(&mission.mission_assets, 14, enemy_pose).unwrap();
+        let (to, _) =
+            projectile::unit_sphere(&mission.mission_assets, hero.object_index, pose).unwrap();
+        let ray = [from, to];
+        let ground = projectile_terrain_hit(&mission.terrain, ray)
+            .unwrap()
+            .unwrap();
+        let contact = projectile_unit_hit(&engine, enemy, ray).unwrap();
+        assert_eq!(contact.handle, hero.handle);
+        assert!(contact.fraction < ground);
         let mut shots = Vec::new();
         let mut failures = 0;
         for now in (100..=6_000).step_by(50) {
@@ -18343,7 +18357,7 @@ mod tests {
             });
         }
         let assets = loaded_mission_assets(&engine).unwrap();
-        let weapons = player_weapon::prepare_unit_weapons(&assets.object_component_controls[11]);
+        let weapons = player_weapon::prepare_unit_weapons(&assets.object_component_controls[14]);
         assert!(
             shots.iter().any(|event| matches!(event,
             AutoDemoCombatEvent::Shot { shooter, target, .. }

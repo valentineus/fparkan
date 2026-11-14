@@ -2,7 +2,7 @@ use super::{
     apply_projectile_contact,
     autodemo::MOBILE_UNIT,
     player_weapon::prepare_unit_weapons,
-    projectile::{load_projectile, unit_sphere},
+    projectile::{load_projectile, segment_sphere_fraction, unit_sphere},
     projectile_terrain_hit, projectile_unit_hit, Engine, MissionAssets, MissionDocument,
     MissionObjectDraft, ObjectHandle, PlayerProjectile, PlayerWeapons,
 };
@@ -73,6 +73,7 @@ pub(super) struct AutoDemoCombat {
 pub(super) struct CombatTarget {
     pub(super) handle: ObjectHandle,
     pub(super) center: [f32; 3],
+    radius: f32,
     pub(super) in_range: bool,
 }
 
@@ -230,27 +231,28 @@ impl AutoDemoCombat {
             .filter_map(|unit| {
                 let owner = identity_metadata(world, unit.handle).ok()?.owner_id?;
                 let state = transform_state(world, unit.handle).ok()?;
-                let (center, _) = unit_sphere(assets, unit.index, state)?;
-                Some((unit.handle, usize::from(owner.0), center))
+                let (center, radius) = unit_sphere(assets, unit.index, state)?;
+                Some((unit.handle, usize::from(owner.0), center, radius))
             })
             .collect();
         live.iter()
-            .filter_map(|&(handle, clan, from)| {
-                let (enemy, center, distance) = live
+            .filter_map(|&(handle, clan, from, _)| {
+                let (enemy, center, radius, distance) = live
                     .iter()
-                    .filter_map(|&(enemy, other, to)| {
+                    .filter_map(|&(enemy, other, to, radius)| {
                         let distance = (to[0] - from[0]).hypot(to[1] - from[1]);
                         (enemy != handle
                             && distance <= ATTACK_RANGE
                             && self.hostile.get(clan)?.get(other) == Some(&true))
-                        .then_some((enemy, to, distance))
+                        .then_some((enemy, to, radius, distance))
                     })
-                    .min_by(|a, b| a.2.total_cmp(&b.2))?;
+                    .min_by(|a, b| a.3.total_cmp(&b.3))?;
                 Some((
                     handle,
                     CombatTarget {
                         handle: enemy,
                         center,
+                        radius,
                         in_range: distance <= FIRE_RANGE,
                     },
                 ))
@@ -334,8 +336,16 @@ impl AutoDemoCombat {
                     let state = transform_state(&engine.world, unit.handle).ok()?;
                     let (from, _) = unit_sphere(&mission.mission_assets, unit.index, state)?;
                     match projectile_terrain_hit(&mission.terrain, [from, target.center]) {
-                        Ok(None) => Some((target.handle, from, target.center)),
-                        Ok(Some(_)) => None,
+                        Ok(ground) => {
+                            // shortcut: use the same hull sphere as the projectile until per-node aiming is wired.
+                            segment_sphere_fraction(
+                                [from, target.center],
+                                target.center,
+                                target.radius,
+                            )
+                            .filter(|&contact| ground.is_none_or(|ground| contact < ground))
+                            .map(|_| (target.handle, from, target.center))
+                        }
                         Err(_) => {
                             unavailable += 1;
                             None
