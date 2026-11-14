@@ -303,7 +303,7 @@ pub fn capture_neutral_building(
     }
 }
 
-fn on_communicator(
+pub(super) fn on_communicator(
     assets: &super::MissionAssets,
     object_index: usize,
     pose: super::TransformState,

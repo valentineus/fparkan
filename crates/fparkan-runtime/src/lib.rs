@@ -47,10 +47,13 @@ mod mesh_collision;
 mod mission_events;
 mod player_motion;
 mod player_weapon;
+mod production;
 mod projectile;
 mod unit_patrol;
 
-pub use autodemo::{autodemo_camera, AutoDemoCamera, AutoDemoReinforcement, AutoDemoView};
+pub use autodemo::{
+    autodemo_camera, AutoDemoCamera, AutoDemoReinforcement, AutoDemoView, SpawnedUnit,
+};
 pub use autodemo_combat::{AutoDemoCombatEvent, AutoDemoProjectileType};
 pub use fparkan_assets::MissionAssets;
 pub use mesh_collision::{query_building_segment_world, BuildingMeshHit, BuildingMeshNode};
@@ -61,6 +64,7 @@ pub use mission_events::{
 };
 pub use player_motion::{plan_player_motion, PlayerMotion, PlayerMotionStep};
 pub use player_weapon::{starting_player_weapons, PlayerWeapons};
+pub use production::order_factory_robot;
 pub use projectile::{
     apply_projectile_hit, load_player_projectile, projectile_terrain_hit, projectile_unit_hit,
     PlayerProjectile, ProjectileAssets, ProjectileContact,
@@ -1289,6 +1293,10 @@ pub struct FrameResult {
     pub autodemo_reinforcements: Vec<AutoDemoReinforcement>,
     /// Failed replacement attempts.
     pub autodemo_reinforcement_unavailable: usize,
+    /// Robot completed by a player factory order on this tick.
+    pub produced_unit: Option<SpawnedUnit>,
+    /// Diagnostic for a production order whose unit could not be created.
+    pub production_failure: Option<String>,
 }
 
 /// Engine.
@@ -1299,6 +1307,7 @@ pub struct Engine {
     behavior_rng_state: u32,
     autodemo_combat: Option<autodemo_combat::AutoDemoCombat>,
     autodemo_reinforcements: Option<autodemo::LiveReinforcements>,
+    production: Option<production::Production>,
 }
 
 struct LoadedMissionState {
@@ -1474,6 +1483,8 @@ pub enum EngineError {
     World(fparkan_world::WorldError),
     /// Reference movement input or terrain query failed.
     Movement(String),
+    /// Invalid or unavailable player construction order.
+    Production(String),
     /// Staged mission world was torn down after a registration-phase failure.
     RegistrationTeardown {
         /// Registered objects before the forced failure.
@@ -1621,6 +1632,7 @@ impl std::fmt::Display for EngineError {
             } => write!(f, "Behavior resource tick for clan {clan_index}: {message}"),
             Self::World(source) => write!(f, "{source}"),
             Self::Movement(message) => write!(f, "reference movement: {message}"),
+            Self::Production(message) => write!(f, "factory: {message}"),
             Self::RegistrationTeardown {
                 registered_objects,
                 released_objects,
@@ -1653,6 +1665,7 @@ impl std::error::Error for EngineError {
             | Self::ScriptRuntime { .. }
             | Self::MissionAiRecordSlots { .. }
             | Self::Movement(_)
+            | Self::Production(_)
             | Self::ResearchTrfPath { .. }
             | Self::PrototypeGraph { .. }
             | Self::BehaviorProfile { .. }
@@ -1671,6 +1684,7 @@ pub fn create(services: EngineServices) -> Result<Engine, EngineError> {
         behavior_rng_state: INITIAL_BEHAVIOR_RNG_STATE,
         autodemo_combat: None,
         autodemo_reinforcements: None,
+        production: None,
     })
 }
 
@@ -1700,6 +1714,7 @@ pub fn load_mission(
         request,
         MissionLoadOptions::default(),
         Some(startup_input),
+        None,
     )
 }
 
@@ -1715,6 +1730,28 @@ pub fn load_mission_with_init_stubs(
     request: MissionRequest,
     startup_input: MissionStartupInput,
 ) -> Result<LoadedMission, EngineError> {
+    load_gameplay_mission(engine, request, startup_input, None)
+}
+
+/// Loads the gameplay world and prepares the player's optional Unit DAT design.
+///
+/// # Errors
+///
+/// Returns an error if the mission or selected design cannot be loaded.
+pub fn load_gameplay_mission(
+    engine: &mut Engine,
+    request: MissionRequest,
+    startup_input: MissionStartupInput,
+    build_scheme: Option<&str>,
+) -> Result<LoadedMission, EngineError> {
+    if build_scheme.is_some() && request.mode != MissionMode::SingleMission {
+        return Err(EngineError::Production(
+            "build schemes require a player mission".into(),
+        ));
+    }
+    let build_scheme = build_scheme
+        .map(|path| normalize_engine_path("factory Unit DAT", path))
+        .transpose()?;
     load_mission_with_options(
         engine,
         request,
@@ -1724,6 +1761,7 @@ pub fn load_mission_with_init_stubs(
             ..MissionLoadOptions::default()
         },
         Some(startup_input),
+        build_scheme.as_ref(),
     )
 }
 
@@ -1751,6 +1789,7 @@ pub fn load_mission_static_preview(
             ..MissionLoadOptions::default()
         },
         None,
+        None,
     )
 }
 
@@ -1775,6 +1814,7 @@ pub fn load_mission_static_preview_roots(
             ..MissionLoadOptions::default()
         },
         None,
+        None,
     )
 }
 
@@ -1783,6 +1823,7 @@ fn load_mission_with_options(
     request: MissionRequest,
     options: MissionLoadOptions,
     startup_input: Option<MissionStartupInput>,
+    build_scheme: Option<&NormalizedPath>,
 ) -> Result<LoadedMission, EngineError> {
     let vfs = engine.services.vfs.clone().ok_or(EngineError::MissingVfs)?;
     let mission_path = normalize_engine_path("mission", &request.key)?;
@@ -1870,6 +1911,7 @@ fn load_mission_with_options(
                 .take(plan.reserve_per_scheme)
         }));
     }
+    graph_roots.extend(build_scheme.map(|scheme| resource_name(scheme.as_str().as_bytes())));
     let scoped_graph_roots = match options.asset_scope {
         MissionAssetScope::Full => graph_roots.as_slice(),
         MissionAssetScope::FirstMeshPreview => graph_roots.get(..1).unwrap_or_default(),
@@ -2337,15 +2379,37 @@ fn load_mission_with_options(
     for &handle in &handles[reserve_start..] {
         fparkan_world::request_delete(&mut new_runtime_world, handle)?;
     }
-    let autodemo_reinforcements = reinforcements.map(|plan| {
-        let controls = control_device_tables.split_off(reserve_start);
+    let reserve_controls = if graph_roots.len() > reserve_start {
         behavior_control_groupings.truncate(reserve_start);
-        autodemo::LiveReinforcements::new(plan, reserve_start, spawn_rng, controls)
-    });
+        control_device_tables.split_off(reserve_start)
+    } else {
+        Vec::new()
+    };
+    let (autodemo_reinforcements, production) = if build_scheme.is_some() {
+        let control = reserve_controls.into_iter().next().ok_or_else(|| {
+            EngineError::Production("missing Control table for build scheme".into())
+        })?;
+        (
+            None,
+            Some(production::Production::new(
+                reserve_start,
+                control,
+                &object_drafts,
+            )?),
+        )
+    } else {
+        (
+            reinforcements.map(|plan| {
+                autodemo::LiveReinforcements::new(plan, reserve_start, spawn_rng, reserve_controls)
+            }),
+            None,
+        )
+    };
     engine.world = new_runtime_world;
     engine.behavior_rng_state = next_behavior_rng_state;
     engine.autodemo_combat = autodemo_combat;
     engine.autodemo_reinforcements = autodemo_reinforcements;
+    engine.production = production;
     engine.loaded = Some(LoadedMissionState {
         summary: summary.clone(),
         mission,
@@ -2463,7 +2527,17 @@ pub fn step_headless(
             combat.activate(&engine.world, event.object_index, event.handle);
         }
     }
-    if !autodemo_reinforcements.is_empty()
+    let (produced_unit, production_failure) =
+        if let (Some(production), Some(mission)) = (&mut engine.production, &mut engine.loaded) {
+            match production.tick(&mut engine.world, mission, queue_time_ms) {
+                Ok(unit) => (unit, None),
+                Err(error) => (None, Some(error.to_string())),
+            }
+        } else {
+            (None, None)
+        };
+    if produced_unit.is_some()
+        || !autodemo_reinforcements.is_empty()
         || autodemo_combat_events
             .iter()
             .any(|event| matches!(event, AutoDemoCombatEvent::Destroyed { .. }))
@@ -2481,6 +2555,8 @@ pub fn step_headless(
         autodemo_combat_unavailable,
         autodemo_reinforcements,
         autodemo_reinforcement_unavailable,
+        produced_unit,
+        production_failure,
         player_pitch_bits: engine
             .loaded
             .as_ref()
@@ -2533,7 +2609,7 @@ pub fn frame_with_player_motion(
 
 /// Coverage entries for the subsystems still absent from the mission loop.
 pub const SIMULATION_COVERAGE: &str =
-    "sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 unit_behavior_stub=1 render_object_lifecycle_stub=1 render_winding_change_stub=1 mission_event_clock_approx=1 mission_tactical_ids_stub=1 mission_clan_roster_stub=1 mission_message_ui_stub=1";
+    "sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 unit_behavior_stub=1 render_object_lifecycle_stub=1 render_winding_change_stub=1 mission_event_clock_approx=1 mission_tactical_ids_stub=1 mission_clan_roster_stub=1 mission_message_ui_stub=1 factory_orders_approx=1";
 
 /// Totals from a headless mission coverage run.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -17636,7 +17712,7 @@ mod tests {
 
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(licensed_root("IS")));
         let mut engine = create(EngineServices::new(vfs)).unwrap();
-        load_mission_with_init_stubs(
+        load_gameplay_mission(
             &mut engine,
             MissionRequest {
                 key: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.02/data.tma".into(),
@@ -17646,6 +17722,7 @@ mod tests {
                 queue_time_ms: 0,
                 research_creation_gate: false,
             },
+            Some("UNITS/UNITS/PREBLD/tut2_f1.dat"),
         )
         .unwrap();
         let initial = frame(&mut engine, 1).unwrap().mission_event.unwrap();
@@ -17655,6 +17732,7 @@ mod tests {
             .iter()
             .any(|notice| matches!(notice, MissionNotice::ObjectiveComplete(0 | 2))));
         let cockpit = starting_cockpit(&engine).unwrap();
+        assert!(order_factory_robot(&mut engine, cockpit, 1).is_err());
         assert_eq!(
             capture_neutral_building(&mut engine, cockpit).unwrap(),
             None
@@ -17713,6 +17791,34 @@ mod tests {
         assert_eq!(
             loaded_mission_script_outcome(&engine),
             Some(MissionScriptOutcome::Active)
+        );
+        player_pose.position = [391.3_f32, 740.1, 145.12].map(f32::to_bits);
+        set_transform(&mut engine.world, cockpit.handle, player_pose).unwrap();
+        assert_eq!(
+            order_factory_robot(&mut engine, cockpit, 4001).unwrap(),
+            60_000
+        );
+        assert!(order_factory_robot(&mut engine, cockpit, 4002).is_err());
+        let early = frame(&mut engine, 64_000).unwrap();
+        assert!(early.produced_unit.is_none());
+        let complete = frame(&mut engine, 64_001).unwrap();
+        let robot = complete.produced_unit.expect("finished robot");
+        assert!(complete.snapshot.objects.contains(&robot.handle));
+        assert_eq!(
+            identity_metadata(&engine.world, robot.handle)
+                .unwrap()
+                .owner_id,
+            Some(OwnerId(0))
+        );
+        assert!(order_factory_robot(&mut engine, cockpit, 64_001).is_err());
+        let next = frame(&mut engine, 66_001).unwrap();
+        assert!(next.produced_unit.is_none());
+        let event = next.mission_event.unwrap();
+        assert!(event.stop.is_none(), "{:?}", event.stop);
+        assert!(event.notices.contains(&MissionNotice::ObjectiveComplete(1)));
+        assert_eq!(
+            loaded_mission_script_outcome(&engine),
+            Some(MissionScriptOutcome::Completed)
         );
     }
 
@@ -18568,6 +18674,7 @@ mod tests {
                 queue_time_ms: 0,
                 research_creation_gate: false,
             }),
+            None,
         )
         .expect_err("forced registration failure");
 

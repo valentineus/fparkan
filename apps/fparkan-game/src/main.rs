@@ -77,18 +77,20 @@ use fparkan_render_vulkan::{
     VulkanStaticCamera, VulkanStaticDrawRange, VulkanStaticMaterial, VulkanStaticMesh,
     VulkanStaticTexture, VulkanStaticTextureMip, VulkanStaticVertex,
 };
+#[cfg(test)]
+use fparkan_runtime::load_mission_with_init_stubs;
 use fparkan_runtime::{
     apply_projectile_hit, autodemo_camera, capture_neutral_building, capture_neutral_warbot,
-    create, frame as step_mission_frame, frame_with_player_motion, load_mission_static_preview,
-    load_mission_static_preview_roots, load_mission_with_init_stubs, load_player_projectile,
+    create, frame as step_mission_frame, frame_with_player_motion, load_gameplay_mission,
+    load_mission_static_preview, load_mission_static_preview_roots, load_player_projectile,
     loaded_mission_assets, loaded_mission_object_drafts, loaded_mission_script_bundles,
-    loaded_terrain, mission_object_handle, plan_player_motion, projectile_terrain_hit,
-    projectile_unit_hit, query_building_segment_world, simulate_mission_report, starting_cockpit,
-    starting_player_weapons, AutoDemoCamera, AutoDemoView, BasementPlacementMode, BuildingMeshNode,
-    Engine, EngineError, EngineServices, FrameResult, LoadedMission, MissionAssets,
-    MissionEventStop, MissionMode, MissionNotice, MissionObjectDraft, MissionRequest,
-    MissionScriptInitExecution, MissionStartupInput, PlayerMotion, PlayerProjectile, PlayerWeapons,
-    StartingCockpit, SIMULATION_COVERAGE,
+    loaded_terrain, mission_object_handle, order_factory_robot, plan_player_motion,
+    projectile_terrain_hit, projectile_unit_hit, query_building_segment_world,
+    simulate_mission_report, starting_cockpit, starting_player_weapons, AutoDemoCamera,
+    AutoDemoView, BasementPlacementMode, BuildingMeshNode, Engine, EngineError, EngineServices,
+    FrameResult, LoadedMission, MissionAssets, MissionEventStop, MissionMode, MissionNotice,
+    MissionObjectDraft, MissionRequest, MissionScriptInitExecution, MissionStartupInput,
+    PlayerMotion, PlayerProjectile, PlayerWeapons, StartingCockpit, SIMULATION_COVERAGE,
 };
 #[cfg(test)]
 use fparkan_terrain::BasementFoundationFragment;
@@ -332,7 +334,7 @@ fn load_requested_mission(engine: &mut Engine, args: &Args) -> Result<LoadedMiss
         mode: args.mission_mode(),
     };
     if !args.viewer {
-        load_mission_with_init_stubs(
+        load_gameplay_mission(
             engine,
             request,
             MissionStartupInput {
@@ -340,6 +342,7 @@ fn load_requested_mission(engine: &mut Engine, args: &Args) -> Result<LoadedMiss
                 // shortcut: the CLI does not yet reproduce the native research startup gate.
                 research_creation_gate: false,
             },
+            args.build_scheme.as_deref(),
         )
     } else if args.preview_roots.get() == 1 {
         load_mission_static_preview(engine, request)
@@ -10041,6 +10044,7 @@ struct StaticVulkanApp {
     player_fire_held: bool,
     player_fire_pressed: bool,
     player_capture_pressed: bool,
+    player_build_pressed: bool,
     audio: Option<audio::GameAudio>,
     camera_mode: &'static str,
     mesh_components: usize,
@@ -10171,6 +10175,7 @@ impl StaticVulkanApp {
             player_fire_held: false,
             player_fire_pressed: false,
             player_capture_pressed: false,
+            player_build_pressed: false,
             audio,
             camera_mode: preview.camera_mode,
             mesh_components: preview.mesh_components,
@@ -10855,6 +10860,7 @@ impl StaticVulkanApp {
         self.player_mouse = [0.0; 2];
         self.player_move_pressed = [false; 4];
         self.player_capture_pressed = false;
+        self.player_build_pressed = false;
         if self.cockpit.is_some() && self.demo_camera.is_none() {
             self.set_mouse_look(self.window_focused && !paused);
         }
@@ -11019,6 +11025,16 @@ impl StaticVulkanApp {
             }
         }
         if let Some(engine) = self.mission_engine.as_mut() {
+            if let (true, Some(cockpit)) =
+                (std::mem::take(&mut self.player_build_pressed), self.cockpit)
+            {
+                match order_factory_robot(engine, cockpit, control_clock_ms) {
+                    Ok(duration) => eprintln!(
+                        "factory_order duration_ms={duration} queue_time_ms={control_clock_ms}"
+                    ),
+                    Err(error) => eprintln!("factory_order_rejected {error}"),
+                }
+            }
             if let (true, Some(cockpit)) = (
                 std::mem::take(&mut self.player_capture_pressed),
                 self.cockpit,
@@ -11047,7 +11063,12 @@ impl StaticVulkanApp {
             }
             .map_err(|err| format!("step mission at {control_clock_ms} ms: {err}"))?;
             let roots = loaded_mission_object_drafts(engine).unwrap_or_default();
-            for &reinforcement in &frame.autodemo_reinforcements {
+            for (&reinforcement, from_factory) in frame
+                .autodemo_reinforcements
+                .iter()
+                .map(|unit| (unit, false))
+                .chain(frame.produced_unit.iter().map(|unit| (unit, true)))
+            {
                 let index = reinforcement.object_index;
                 let draft = &roots[index];
                 let initial = LivePlacement {
@@ -11074,10 +11095,19 @@ impl StaticVulkanApp {
                         camera.register_target(cockpit);
                     }
                 }
+                let event = if from_factory {
+                    "factory_robot_completed"
+                } else {
+                    "autodemo_reinforcement"
+                };
                 eprintln!(
-                    "autodemo_reinforcement clan={} resource={} object={index} queue_time_ms={control_clock_ms}",
-                    reinforcement.clan, String::from_utf8_lossy(&draft.resource_name_raw),
+                    "{event} clan={} resource={} object={index} queue_time_ms={control_clock_ms}",
+                    reinforcement.clan,
+                    String::from_utf8_lossy(&draft.resource_name_raw),
                 );
+            }
+            if let Some(error) = &frame.production_failure {
+                eprintln!("sim_coverage factory_spawn_failed=1 reason={error}");
             }
             if frame.autodemo_reinforcement_unavailable != 0 {
                 eprintln!(
@@ -12188,6 +12218,7 @@ impl ApplicationHandler for StaticVulkanApp {
                     self.pressed_keys.clear();
                     self.player_move_pressed = [false; 4];
                     self.player_capture_pressed = false;
+                    self.player_build_pressed = false;
                     self.player_mouse = [0.0; 2];
                     self.set_mouse_look(false);
                 } else if self.cockpit.is_some()
@@ -12235,6 +12266,9 @@ impl ApplicationHandler for StaticVulkanApp {
                                 && matches!(code, KeyCode::Enter | KeyCode::NumpadEnter)
                             {
                                 self.player_capture_pressed = true;
+                            }
+                            if self.demo_camera.is_none() && code == KeyCode::KeyB {
+                                self.player_build_pressed = true;
                             }
                             if let Some(slot) = [
                                 KeyCode::Digit0,
@@ -12482,6 +12516,7 @@ impl ApplicationHandler for StaticVulkanApp {
 struct Args {
     root: PathBuf,
     mission: String,
+    build_scheme: Option<String>,
     list_missions: bool,
     sim_report_ms: Option<NonZeroU32>,
     viewer: bool,
@@ -12514,6 +12549,7 @@ impl Args {
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut root = None;
         let mut mission = None;
+        let mut build_scheme = None;
         let mut list_missions = false;
         let mut sim_report_ms = None;
         let mut viewer = false;
@@ -12567,6 +12603,12 @@ impl Args {
                             .cloned()
                             .ok_or_else(|| "--mission requires a path".to_string())?,
                     );
+                }
+                "--build-scheme" => {
+                    build_scheme =
+                        Some(iter.next().cloned().ok_or_else(|| {
+                            "--build-scheme requires a Unit DAT path".to_string()
+                        })?);
                 }
                 "--frames" => {
                     frames = iter
@@ -12666,6 +12708,9 @@ impl Args {
         if viewer && sim_report_ms.is_some() {
             return Err("--sim-report requires mission runtime; remove viewer options".to_string());
         }
+        if build_scheme.is_some() && (viewer || list_missions || sim_report_ms.is_some()) {
+            return Err("--build-scheme requires a playable mission window".to_string());
+        }
         if control_clock_ms.is_some() && frames < 2 {
             return Err(
                 "--control-clock-ms requires --frames of at least 2 to replay the animation clock"
@@ -12681,6 +12726,7 @@ impl Args {
         Ok(Self {
             root,
             mission,
+            build_scheme,
             list_missions,
             sim_report_ms,
             viewer,
@@ -12699,7 +12745,7 @@ impl Args {
 }
 
 fn usage() -> String {
-    "usage: fparkan-game --root <path> --list-missions\n       fparkan-game --root <path> --mission <number|path> --sim-report <seconds>\n       fparkan-game --root <path> --mission <number|path> [--viewer] [--frames <n>] [--atmosphere-seconds <seconds>] [--control-clock-ms <u32>] [--validation] [--preview-roots <non-zero n>] [--legacy-camera-capture <path>] [--static-animation-frame <u16>] [--static-material-phase <u16>] [--readback-out <path>] [--readback-sequence-out <directory>]\n--viewer skips mission simulation. Capture, static pose/material and root-limit options select viewer mode. --control-clock-ms replays the scene clock from zero to the selected time over the requested frames; --readback-sequence-out captures each submitted frame and requires that clock.".to_string()
+    "usage: fparkan-game --root <path> --list-missions\n       fparkan-game --root <path> --mission <number|path> --sim-report <seconds>\n       fparkan-game --root <path> --mission <number|path> [--build-scheme <Unit DAT path>] [--viewer] [--frames <n>] [--atmosphere-seconds <seconds>] [--control-clock-ms <u32>] [--validation] [--preview-roots <non-zero n>] [--legacy-camera-capture <path>] [--static-animation-frame <u16>] [--static-material-phase <u16>] [--readback-out <path>] [--readback-sequence-out <directory>]\n--viewer skips mission simulation. Capture, static pose/material and root-limit options select viewer mode. --control-clock-ms replays the scene clock from zero to the selected time over the requested frames; --readback-sequence-out captures each submitted frame and requires that clock.".to_string()
 }
 
 #[cfg(test)]
@@ -15158,6 +15204,7 @@ mod tests {
             Ok(Args {
                 root: PathBuf::from("testdata/IS"),
                 mission: "MISSIONS/Autodemo.00/data.tma".to_string(),
+                build_scheme: None,
                 list_missions: false,
                 sim_report_ms: None,
                 viewer: false,
