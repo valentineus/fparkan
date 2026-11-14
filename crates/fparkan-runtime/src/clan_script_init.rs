@@ -66,6 +66,12 @@ pub(super) fn stubbed_handler(
         {
             Some(68)
         }
+        // shortcut: resume Init until the AI consumer of this setting is wired.
+        ([69, u32::MAX, u32::MAX, u32::MAX, 6, 1, u32::MAX], [index])
+            if matches!(values.get(*index as usize), Some(VarSetDefault::Dword(_))) =>
+        {
+            Some(69)
+        }
         _ => None,
     }
 }
@@ -95,6 +101,22 @@ mod tests {
         assert_eq!(stubbed_handler(&instruction, &values), Some(68));
         assert_eq!(
             stubbed_handler(&instruction, &[VarSetDefault::Dword(500)]),
+            None
+        );
+        instruction.header_words[1] = 0;
+        assert_eq!(stubbed_handler(&instruction, &values), None);
+    }
+
+    #[test]
+    fn ai_setting_stub_requires_a_dword_operand_and_no_result() {
+        let mut instruction = ScriptInstruction {
+            header_words: [69, u32::MAX, u32::MAX, u32::MAX, 6, 1, u32::MAX],
+            references: vec![0],
+        };
+        let values = [VarSetDefault::Dword(15)];
+        assert_eq!(stubbed_handler(&instruction, &values), Some(69));
+        assert_eq!(
+            stubbed_handler(&instruction, &[VarSetDefault::FloatBits(0)]),
             None
         );
         instruction.header_words[1] = 0;
