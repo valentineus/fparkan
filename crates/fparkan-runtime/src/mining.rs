@@ -2,21 +2,26 @@ use super::{
     add_behavior_registered_object,
     autodemo::{spawn_prepared_unit, SpawnedUnit},
     behavior_ore_index_for_handle, BehaviorOreState, BehaviorRegisteredObject, Engine, EngineError,
-    MissionControlDeviceTableState, StartingCockpit,
+    MissionControlDeviceTableState, MissionObjectDraft, StartingCockpit,
 };
 use fparkan_assets::ExtraRecord28;
-use fparkan_world::{handle_by_original_id, identity_metadata, transform_state, World};
+use fparkan_world::{
+    handle_by_original_id, identity_metadata, transform_state, ObjectHandle, OriginalObjectId,
+    OwnerId, World,
+};
 
 pub(super) const MINE_CLASS: u32 = 0x8000_0004;
 const BUILDER_CLASS: u32 = 0x0100_4000;
 const BUILD_DISTANCE: f32 = 150.0;
 const BUILD_ORE: f32 = 100.0;
 const MINE_ORE_PER_SECOND: f32 = 50.0;
+const MINE_COLLECTION_RADIUS: f32 = 250.0;
 
 pub(super) struct MineSite {
     pub position: [f32; 3],
     pub remaining: f32,
     pub control: Option<MissionControlDeviceTableState>,
+    placed_mine: Option<OriginalObjectId>,
 }
 
 impl MineSite {
@@ -32,6 +37,7 @@ impl MineSite {
                 position: record.position,
                 remaining,
                 control: None,
+                placed_mine: None,
             })
     }
 
@@ -43,6 +49,31 @@ impl MineSite {
             .min(*remaining);
         *remaining -= amount;
         ore.current_ore_bits = (current + amount).to_bits();
+    }
+
+    pub fn bind_placed_mines(sites: &mut [Self], drafts: &[MissionObjectDraft]) {
+        for draft in drafts
+            .iter()
+            .filter(|draft| draft.unit_dat_header_flags == Some(MINE_CLASS))
+        {
+            let Some(id) = draft.original_id else {
+                continue;
+            };
+            for site in sites.iter_mut() {
+                // shortcut: assign each deposit once until competing mine tasks are modeled.
+                if site.placed_mine.is_none()
+                    && distance_xy(draft.position, site.position) < MINE_COLLECTION_RADIUS
+                {
+                    site.placed_mine = Some(id);
+                }
+            }
+        }
+    }
+
+    fn live_mine(&self, world: &World) -> Option<ObjectHandle> {
+        self.placed_mine
+            .and_then(|id| handle_by_original_id(world, id))
+            .or_else(|| handle_by_original_id(world, self.control.as_ref()?.original_id?))
     }
 }
 
@@ -92,7 +123,8 @@ pub fn deploy_mine(
                     .control
                     .as_ref()
                     .and_then(|table| table.original_id)
-                    .is_some_and(|id| handle_by_original_id(&engine.world, id).is_none())
+                    .is_some()
+                && site.live_mine(&engine.world).is_none()
         })
         .map(|(offset, site)| (distance_xy(site.position, player), offset, site))
         .filter(|(distance, _, _)| *distance <= BUILD_DISTANCE)
@@ -199,12 +231,7 @@ pub(super) fn extract_for_clan(
     delta_seconds: f32,
 ) -> Result<(), String> {
     for (site, remaining) in sites.iter().zip(remaining) {
-        let Some(handle) = site
-            .control
-            .as_ref()
-            .and_then(|table| table.original_id)
-            .and_then(|id| handle_by_original_id(world, id))
-        else {
+        let Some(handle) = site.live_mine(world) else {
             continue;
         };
         if identity_metadata(world, handle)
@@ -219,6 +246,17 @@ pub(super) fn extract_for_clan(
     Ok(())
 }
 
+pub(super) fn remaining_for_clan(sites: &[MineSite], world: &World, owner: OwnerId) -> f32 {
+    sites
+        .iter()
+        .filter_map(|site| {
+            let handle = site.live_mine(world)?;
+            (identity_metadata(world, handle).ok()?.owner_id == Some(owner))
+                .then_some(site.remaining)
+        })
+        .fold(0.0, |sum, amount| sum + amount)
+}
+
 fn reject(message: &str) -> EngineError {
     EngineError::Production(message.into())
 }
@@ -226,7 +264,81 @@ fn reject(message: &str) -> EngineError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fparkan_world::{ObjectHandle, OriginalObjectId};
+    use fparkan_world::{
+        construct_object, register_object, request_delete, set_owner, ObjectDraft, WorldConfig,
+    };
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_two_fortresses_supplies_the_enemy_mine_from_its_deposit() {
+        use super::super::{
+            create, frame, load_gameplay_mission, EngineServices, MissionMode, MissionRequest,
+            MissionStartupInput,
+        };
+        use fparkan_vfs::DirectoryVfs;
+        use std::sync::Arc;
+
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").unwrap();
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Single.01/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        let reserve = |engine: &Engine| {
+            remaining_for_clan(
+                &engine.loaded.as_ref().unwrap().mine_sites,
+                &engine.world,
+                OwnerId(1),
+            )
+        };
+        assert_eq!(reserve(&engine), 9_999_999.0);
+        frame(&mut engine, 1000).unwrap();
+        frame(&mut engine, 2000).unwrap();
+        assert!(reserve(&engine) < 9_999_999.0);
+    }
+
+    #[test]
+    fn reserve_sum_uses_only_live_mines_of_the_selected_clan() {
+        let mut world = fparkan_world::new(WorldConfig);
+        let mut create = |id, owner, remaining| {
+            let id = OriginalObjectId(id);
+            let handle = construct_object(
+                &mut world,
+                ObjectDraft {
+                    original_id: Some(id),
+                },
+            )
+            .unwrap();
+            register_object(&mut world, handle).unwrap();
+            set_owner(&mut world, handle, Some(OwnerId(owner))).unwrap();
+            (
+                handle,
+                MineSite {
+                    position: [0.0; 3],
+                    remaining,
+                    control: None,
+                    placed_mine: Some(id),
+                },
+            )
+        };
+        let (a, first) = create(0, 1, 20.0);
+        let (_, second) = create(1, 0, 30.0);
+        let (_, third) = create(2, 1, 40.0);
+        let sites = [first, second, third];
+        assert_eq!(remaining_for_clan(&sites, &world, OwnerId(1)), 60.0);
+        request_delete(&mut world, a).unwrap();
+        fparkan_world::step(&mut world, &fparkan_world::InputSnapshot).unwrap();
+        assert_eq!(remaining_for_clan(&sites, &world, OwnerId(1)), 40.0);
+    }
 
     #[test]
     fn extraction_respects_both_the_buffer_and_deposit_limits() {

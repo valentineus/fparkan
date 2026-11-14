@@ -55,6 +55,15 @@ impl LoadedMissionState {
                             (available - demand).to_bits(),
                         )))
                     }
+                    ScriptDispatchSelector::Handler(17)
+                        if instruction.dword_pair(values)
+                            == Some((crate::mining::MINE_CLASS, 0x0afc_0900)) =>
+                    {
+                        let owner = OwnerId(clan as u16);
+                        let remaining =
+                            crate::mining::remaining_for_clan(&self.mine_sites, world, owner);
+                        Ok(Some(VarSetDefault::FloatBits(remaining.to_bits())))
+                    }
                     ScriptDispatchSelector::Handler(49) if instruction.references.is_empty() => {
                         let slots = self
                             .ai_startup_states

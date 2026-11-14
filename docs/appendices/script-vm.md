@@ -2504,6 +2504,12 @@ FParkan вызывает числовой префикс этой секции �
 отрицательным. В `Problems0` результат записывается как `float` и
 участвует в условии о нехватке энергии.
 
+`Handler(17)` по RVA `0x9e39` проходит живые объекты нужного класса.
+Для `RESOURCE_LEFT_ORE` он суммирует значения свойства `0x105`. В FParkan
+это текущий запас связанных месторождений. Шахта, уже размещённая на карте,
+получает запас из записей TMA в радиусе 250 единиц в плоскости XY
+(Behavior.dll, RVA `0x2cda2`). Шахта без связанной залежи даёт ноль.
+
 Все demo packages должны проходить package/version checks, offsets оставаться
 в bytecode, а confirmed disassembler — не терять синхронизацию. VM считается
 готовой после deterministic Init/basic mission events, stable object bindings,

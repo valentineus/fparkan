@@ -2625,6 +2625,7 @@ fn load_mission_with_options(
     for (site, control) in mine_sites.iter_mut().zip(mine_controls) {
         site.control = Some(control);
     }
+    mining::MineSite::bind_placed_mines(&mut mine_sites, &object_drafts[..reserve_start]);
     let (autodemo_reinforcements, production) = if !build_schemes.is_empty() {
         (
             None,
