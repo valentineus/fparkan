@@ -3132,6 +3132,12 @@ impl EnvironmentGpuScene {
                 )
             })
             .map(|layer| layer.range.range_index)
+            .chain(self.sprites.iter().filter_map(|sprite| {
+                sprite
+                    .flare_index
+                    .is_none()
+                    .then_some(sprite.range.range_index)
+            }))
             .collect()
     }
 
@@ -3516,8 +3522,8 @@ impl EnvironmentGpuScene {
         );
 
         // Preserve the native sky order while keeping the indexed mesh
-        // contiguous.  The screen gradient must be the first draw, and the
-        // cloud dome follows all directional sprites.  Reordering the range
+        // contiguous. The screen gradient comes first. Disks are drawn before
+        // the transparent world queue and flares follow it. Reordering the range
         // metadata alone would leave first_index values pointing into the old
         // segment order, so move each index segment together with its range.
         let range_for_kind = |kind: SkyPassKind| {
@@ -3660,10 +3666,9 @@ impl EnvironmentGpuScene {
                 projected_sun,
                 viewport,
                 view_forward: camera.forward(),
-                // Flares use the same terrain/object ray query as the native
-                // visibility gate. The sun sprite itself deliberately stays
-                // independent of this test, matching the native layer's
-                // `requires_occlusion` split.
+                // The glare samples world occlusion at the sun's center. The
+                // disk is behind the transparent world queue so foliage can
+                // cover it per fragment and leave its cutouts visible.
                 unoccluded: native_sun_unoccluded_with_world(
                     terrain,
                     mesh,

@@ -3321,6 +3321,16 @@ mod tests {
             &[],
         );
         assert_eq!(order, vec![0, 4, 2, 3, 1]);
+
+        let order = sorted_world_draw_order(
+            5,
+            &ranges,
+            &[Some(true), Some(false), None, None, None],
+            &[Some(2.0), None, None, None, None],
+            &[2, 3],
+        );
+        // Depth-writing world, sky, disk, transparent world, flare.
+        assert_eq!(order, vec![1, 2, 3, 0, 4]);
     }
 
     #[test]
