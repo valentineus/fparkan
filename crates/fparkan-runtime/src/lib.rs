@@ -2528,12 +2528,12 @@ fn load_mission_with_options(
                 let Some(patrol) = &mut unit_patrol else {
                     continue;
                 };
-                if let Some(handle) =
+                if let Some((handle, center)) =
                     order.apply(patrol, &mission, &object_drafts, &new_runtime_world)
                 {
                     eprintln!(
                         "script_init_patrol unit={} id={} target={:?}",
-                        handle.slot, order.actor_id, order.center
+                        handle.slot, order.actor_id, center
                     );
                 }
             }

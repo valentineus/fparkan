@@ -1,7 +1,9 @@
 use crate::unit_patrol::UnitPatrol;
 use crate::{MissionDocument, MissionObjectDraft};
 use fparkan_script::{Handler15Invocation, Handler15TargetPayload};
-use fparkan_world::{handle_by_original_id, ObjectHandle, OriginalObjectId, World};
+use fparkan_world::{
+    handle_by_original_id, transform_state, ObjectHandle, OriginalObjectId, World,
+};
 
 pub(super) fn warbot_by_logic_id(
     mission: &MissionDocument,
@@ -26,20 +28,25 @@ pub(super) fn warbot_by_logic_id(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ScriptPatrol {
     pub(super) actor_id: u32,
-    pub(super) center: [u32; 2],
+    target: Handler15TargetPayload,
     pub(super) radius: u32,
 }
 
 impl ScriptPatrol {
     pub(super) fn from_order(order: Handler15Invocation) -> Option<Self> {
-        let (4, 3, Handler15TargetPayload::ByPlace { first, second }) =
-            (order.word_1, order.word_2, order.target)
-        else {
+        if !matches!(
+            (order.word_1, order.word_2, order.target),
+            (
+                4,
+                3,
+                Handler15TargetPayload::ByPlace { .. } | Handler15TargetPayload::ByLogicId(_)
+            )
+        ) {
             return None;
-        };
+        }
         Some(Self {
             actor_id: order.word_0,
-            center: [first, second],
+            target: order.target,
             radius: order.word_3,
         })
     }
@@ -50,16 +57,34 @@ impl ScriptPatrol {
         mission: &MissionDocument,
         drafts: &[MissionObjectDraft],
         world: &World,
-    ) -> Option<ObjectHandle> {
+    ) -> Option<(ObjectHandle, [u32; 2])> {
         let handle = warbot_by_logic_id(mission, drafts, world, self.actor_id)?;
         // shortcut: use the verified default radius until per-unit patrol profiles are wired.
         let radius = match self.radius {
             0 | u32::MAX => 60.0,
             radius => radius as f32,
         };
-        patrol
-            .order(world, handle, self.center.map(|axis| axis as f32), radius)
-            .then_some(handle)
+        match self.target {
+            Handler15TargetPayload::ByPlace { first, second } => {
+                let center = [first, second];
+                patrol
+                    .order(world, handle, center.map(|axis| axis as f32), radius)
+                    .then_some((handle, center))
+            }
+            Handler15TargetPayload::ByLogicId(id) => {
+                let target =
+                    crate::mission_events::placed_logic_objects(mission, world, id).next()?;
+                let [x, y, _] = transform_state(world, target)
+                    .ok()?
+                    .position
+                    .map(f32::from_bits);
+                patrol.order_around_object(world, handle, target, [x, y], radius).then(|| {
+                    eprintln!("sim_coverage script_patrol_target_approx=1 unit={} target_id={id} target_unit={}", handle.slot, target.slot);
+                    (handle, [x as u32, y as u32])
+                })
+            }
+            _ => None,
+        }
     }
 }
 

@@ -765,10 +765,10 @@ impl LoadedMissionState {
                     let Some(patrol) = &mut self.unit_patrol else {
                         return Err("Handler(15) patrol runtime is unavailable".into());
                     };
-                    if let Some(handle) =
+                    if let Some(order) =
                         order.apply(patrol, &self.mission, &self.object_drafts, world)
                     {
-                        patrol_orders.push((handle, order.center));
+                        patrol_orders.push(order);
                     }
                     Ok(None)
                 }
@@ -895,7 +895,7 @@ fn tactical_area_contains(
     })
 }
 
-fn placed_logic_objects<'a>(
+pub(super) fn placed_logic_objects<'a>(
     mission: &'a super::MissionDocument,
     world: &'a World,
     id: u32,

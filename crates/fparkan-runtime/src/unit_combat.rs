@@ -249,7 +249,7 @@ impl AutoDemoCombat {
                 if patrol.is_some_and(|patrol| patrol.is_shut_down(handle)) {
                     return None;
                 }
-                let limit = patrol.and_then(|patrol| patrol.attack_limit(handle));
+                let limit = patrol.and_then(|patrol| patrol.attack_limit(world, handle));
                 if limit.is_some_and(|limit| !limit.allows_attack(position)) {
                     return None;
                 }

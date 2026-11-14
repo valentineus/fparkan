@@ -25,6 +25,7 @@ pub(super) struct UnitPatrol {
 struct PatrollingUnit {
     handle: ObjectHandle,
     center: [f32; 2],
+    center_object: Option<ObjectHandle>,
     radius: f32,
     points: VecDeque<[f32; 2]>,
     retry_ms: u32,
@@ -153,7 +154,8 @@ impl UnitPatrol {
             .retain(|unit| transform_state(world, unit.handle).is_ok());
         if let Some(unit) = self.units.iter_mut().find(|unit| unit.handle == handle) {
             unit.raid_factory = None;
-            if unit.center != center || unit.radius != radius {
+            if unit.center_object.take().is_some() || unit.center != center || unit.radius != radius
+            {
                 unit.center = center;
                 unit.radius = radius;
                 unit.points.clear();
@@ -165,12 +167,35 @@ impl UnitPatrol {
         self.units.push(PatrollingUnit {
             handle,
             center,
+            center_object: None,
             radius,
             points: VecDeque::new(),
             retry_ms: 0,
             attack: None,
             raid_factory: None,
         });
+        true
+    }
+
+    pub(super) fn order_around_object(
+        &mut self,
+        world: &World,
+        handle: ObjectHandle,
+        target: ObjectHandle,
+        center: [f32; 2],
+        radius: f32,
+    ) -> bool {
+        if self.units.iter().any(|unit| {
+            unit.handle == handle && unit.center_object == Some(target) && unit.radius == radius
+        }) {
+            return false;
+        }
+        self.order(world, handle, center, radius);
+        if let Some(unit) = self.units.iter_mut().find(|unit| unit.handle == handle) {
+            unit.center_object = Some(target);
+            unit.points.clear();
+            unit.retry_ms = 0;
+        }
         true
     }
 
@@ -195,14 +220,18 @@ impl UnitPatrol {
             .raid_factory
     }
 
-    pub(super) fn attack_limit(&self, handle: ObjectHandle) -> Option<PatrolAttackLimit> {
+    pub(super) fn attack_limit(
+        &self,
+        world: &World,
+        handle: ObjectHandle,
+    ) -> Option<PatrolAttackLimit> {
         // A raid starts with an explicit attack order. It never receives PatrolPlace limits.
         let unit = self
             .units
             .iter()
             .find(|unit| unit.handle == handle && unit.raid_factory.is_none())?;
         Some(PatrolAttackLimit {
-            center: unit.center,
+            center: unit.center(world)?,
             radius: unit.radius,
             current_target: unit.attack,
         })
@@ -234,6 +263,7 @@ impl UnitPatrol {
             .map(|(_, &handle)| PatrollingUnit {
                 handle,
                 center,
+                center_object: None,
                 radius: 150.0,
                 points: VecDeque::new(),
                 retry_ms: 0,
@@ -259,6 +289,7 @@ impl UnitPatrol {
         targets: &[(ObjectHandle, CombatTarget)],
     ) -> Result<PreparedPatrol, EngineError> {
         let mut state = self.clone();
+        state.units.retain(|unit| unit.center(world).is_some());
         let seconds = now_ms.saturating_sub(state.clock_ms) as f32 * 0.001;
         state.clock_ms = state.clock_ms.max(now_ms);
         let mut poses = Vec::new();
@@ -270,6 +301,12 @@ impl UnitPatrol {
                 continue;
             };
             let from = before.position.map(f32::from_bits);
+            let center = unit.center(world).expect("retained patrol center");
+            if (center[0] - unit.center[0]).hypot(center[1] - unit.center[1]) >= unit.radius {
+                unit.center = center;
+                unit.points.clear();
+                unit.retry_ms = 0;
+            }
             let enemy = targets
                 .iter()
                 .find(|(handle, _)| *handle == unit.handle)
@@ -296,7 +333,7 @@ impl UnitPatrol {
                 unit.points = if let Some(enemy) = enemy {
                     route_points(terrain, from, enemy.center)?.unwrap_or_default()
                 } else {
-                    choose_route(terrain, from, unit.center, unit.radius, &mut state.rng)?
+                    choose_route(terrain, from, center, unit.radius, &mut state.rng)?
                 };
                 unit.retry_ms = now_ms.saturating_add(1_000);
             }
@@ -339,6 +376,22 @@ impl UnitPatrol {
     }
 }
 
+impl PatrollingUnit {
+    fn center(&self, world: &World) -> Option<[f32; 2]> {
+        // shortcut: use the target's transform as the patrol center until native building approaches are wired.
+        match self.center_object {
+            None => Some(self.center),
+            Some(handle) => {
+                let [x, y, _] = transform_state(world, handle)
+                    .ok()?
+                    .position
+                    .map(f32::from_bits);
+                Some([x, y])
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 #[test]
 fn shutdown_clears_patrol_until_a_new_order_arrives() {
@@ -357,6 +410,35 @@ fn shutdown_clears_patrol_until_a_new_order_arrives() {
     assert!(patrol.order(&world, handle, [35.0, 45.0], 60.0));
     assert!(!patrol.is_shut_down(handle));
     assert!(patrol.is_patrolling(handle));
+}
+
+#[cfg(test)]
+#[test]
+fn object_patrol_tracks_its_center_and_ignores_repeated_orders() {
+    let mut world = fparkan_world::new(fparkan_world::WorldConfig::default());
+    let mut make_actor = || {
+        let actor = fparkan_world::construct_object(
+            &mut world,
+            fparkan_world::ObjectDraft { original_id: None },
+        )
+        .unwrap();
+        fparkan_world::register_object(&mut world, actor).unwrap();
+        actor
+    };
+    let actor = make_actor();
+    let target = make_actor();
+    let mut patrol = UnitPatrol::scripted();
+    assert!(patrol.order_around_object(&world, actor, target, [0.0; 2], 60.0));
+    assert!(!patrol.order_around_object(&world, actor, target, [0.0; 2], 60.0));
+    let mut position = transform_state(&world, target).unwrap();
+    position.position = [20.0_f32, 35.0, 0.0].map(f32::to_bits);
+    set_transform(&mut world, target, position).unwrap();
+    assert_eq!(
+        patrol.attack_limit(&world, actor).unwrap().center,
+        [20.0, 35.0]
+    );
+    patrol.order(&world, actor, [0.0; 2], 60.0);
+    assert_eq!(patrol.attack_limit(&world, actor).unwrap().center, [0.0; 2]);
 }
 
 fn distance_to_patrol([x, y]: [f32; 2], [px, py, _]: [f32; 3]) -> f32 {
