@@ -1,8 +1,11 @@
 use crate::script_patrol::ScriptPatrol;
-use fparkan_script::{ScriptDispatchSelector, ScriptInstruction, VarSet, VarSetDefault};
+use fparkan_script::{
+    Handler15TargetPayload, ScriptDispatchSelector, ScriptInstruction, VarSet, VarSetDefault,
+};
 
 pub(super) enum InitOrder {
     Patrol(ScriptPatrol),
+    Shutdown(u32),
     Reserve {
         clan: usize,
         id: u32,
@@ -24,22 +27,27 @@ pub(super) fn reservation(
     Some((id, flag != 0))
 }
 
-pub(super) fn patrol_order(
+pub(super) fn unit_order(
     declarations: &VarSet,
     instruction: &ScriptInstruction,
     values: &[VarSetDefault],
-) -> Option<ScriptPatrol> {
+) -> Option<InitOrder> {
     if instruction.dispatch_selector() != ScriptDispatchSelector::Handler(15)
         || instruction.header_words[1] != u32::MAX
         || instruction.header_words[3] != u32::MAX
     {
         return None;
     }
-    ScriptPatrol::from_order(
-        declarations
-            .resolve_handler15_with_values(instruction, values)
-            .ok()?,
-    )
+    let order = declarations
+        .resolve_handler15_with_values(instruction, values)
+        .ok()?;
+    if matches!(
+        (order.word_1, order.word_2, order.target),
+        (0x13, 3, Handler15TargetPayload::None)
+    ) {
+        return Some(InitOrder::Shutdown(order.word_0));
+    }
+    ScriptPatrol::from_order(order).map(InitOrder::Patrol)
 }
 
 pub(super) fn stubbed_handler(instruction: &ScriptInstruction) -> Option<u8> {

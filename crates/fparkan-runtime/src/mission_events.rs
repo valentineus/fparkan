@@ -653,10 +653,9 @@ impl LoadedMissionState {
                                 .ok()
                                 .flatten()
                                 .is_none()
-                            || self
-                                .unit_patrol
-                                .as_ref()
-                                .is_some_and(|patrol| patrol.is_patrolling(handle))
+                            || self.unit_patrol.as_ref().is_some_and(|patrol| {
+                                patrol.is_patrolling(handle) || patrol.is_shut_down(handle)
+                            })
                             || self
                                 .boarding
                                 .is_some_and(|boarding| boarding.cockpit.handle == handle)

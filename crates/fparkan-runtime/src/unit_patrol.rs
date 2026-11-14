@@ -1,19 +1,21 @@
 use super::{
     autodemo::{MOBILE_UNIT, PLANT_CLASS},
-    autodemo_combat::CombatTarget,
     boarding::WARBOT_CLASS,
-    next_crt_rand, EngineError, MissionDocument, MissionObjectDraft, MissionScriptBundle,
-    ObjectHandle, TerrainWorld, TransformState, World,
+    next_crt_rand,
+    unit_combat::CombatTarget,
+    EngineError, MissionDocument, MissionObjectDraft, MissionScriptBundle, ObjectHandle,
+    TerrainWorld, TransformState, World,
 };
 use fparkan_script::{Handler15TargetPayload, ScriptDispatchSelector, VarSet};
 use fparkan_terrain::{NavigationQuery, RouteRequest, SurfaceQuery};
 use fparkan_world::{set_transform, transform_state};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 #[derive(Clone)]
 pub(super) struct UnitPatrol {
     center: Option<[f32; 2]>,
     units: Vec<PatrollingUnit>,
+    shut_down: HashSet<ObjectHandle>,
     clock_ms: u32,
     rng: u32,
     pub(super) factory_raid_clans: usize,
@@ -132,6 +134,7 @@ impl UnitPatrol {
         Self {
             center: None,
             units: Vec::new(),
+            shut_down: HashSet::new(),
             clock_ms: 0,
             rng: 1,
             factory_raid_clans: 0,
@@ -145,6 +148,7 @@ impl UnitPatrol {
         center: [f32; 2],
         radius: f32,
     ) -> bool {
+        self.shut_down.remove(&handle);
         self.units
             .retain(|unit| transform_state(world, unit.handle).is_ok());
         if let Some(unit) = self.units.iter_mut().find(|unit| unit.handle == handle) {
@@ -172,6 +176,16 @@ impl UnitPatrol {
 
     pub(super) fn is_patrolling(&self, handle: ObjectHandle) -> bool {
         self.units.iter().any(|unit| unit.handle == handle)
+    }
+
+    pub(super) fn shut_down(&mut self, handle: ObjectHandle) -> bool {
+        // shortcut: stop autonomous movement and fire until the native shutdown task is modeled.
+        self.units.retain(|unit| unit.handle != handle);
+        self.shut_down.insert(handle)
+    }
+
+    pub(super) fn is_shut_down(&self, handle: ObjectHandle) -> bool {
+        self.shut_down.contains(&handle)
     }
 
     pub(super) fn raid_factory(&self, handle: ObjectHandle) -> Option<(ObjectHandle, usize)> {
@@ -230,6 +244,7 @@ impl UnitPatrol {
         Some(Self {
             center: Some(center),
             units,
+            shut_down: HashSet::new(),
             clock_ms: 0,
             rng: 1,
             factory_raid_clans: 0,
@@ -322,6 +337,26 @@ impl UnitPatrol {
         }
         Ok(PreparedPatrol { state, poses })
     }
+}
+
+#[cfg(test)]
+#[test]
+fn shutdown_clears_patrol_until_a_new_order_arrives() {
+    let mut world = fparkan_world::new(fparkan_world::WorldConfig::default());
+    let handle = fparkan_world::construct_object(
+        &mut world,
+        fparkan_world::ObjectDraft { original_id: None },
+    )
+    .unwrap();
+    fparkan_world::register_object(&mut world, handle).unwrap();
+    let mut patrol = UnitPatrol::scripted();
+    assert!(patrol.order(&world, handle, [20.0, 30.0], 60.0));
+    assert!(patrol.shut_down(handle));
+    assert!(patrol.is_shut_down(handle));
+    assert!(!patrol.is_patrolling(handle));
+    assert!(patrol.order(&world, handle, [35.0, 45.0], 60.0));
+    assert!(!patrol.is_shut_down(handle));
+    assert!(patrol.is_patrolling(handle));
 }
 
 fn distance_to_patrol([x, y]: [f32; 2], [px, py, _]: [f32; 3]) -> f32 {

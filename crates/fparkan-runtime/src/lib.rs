@@ -42,7 +42,6 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 mod autodemo;
-mod autodemo_combat;
 mod boarding;
 mod building_door;
 mod clan_script_init;
@@ -57,12 +56,12 @@ mod projectile;
 mod research;
 mod script_patrol;
 mod script_time;
+mod unit_combat;
 mod unit_patrol;
 
 pub use autodemo::{
     autodemo_camera, AutoDemoCamera, AutoDemoReinforcement, AutoDemoView, SpawnedUnit,
 };
-pub use autodemo_combat::{AutoDemoCombatEvent, AutoDemoProjectileType};
 pub use boarding::{board_friendly_warbot, disembark_warbot, player_vehicle};
 pub use building_door::{has_proximity_doors, sample_proximity_doors};
 pub use fparkan_assets::MissionAssets;
@@ -87,6 +86,7 @@ pub use projectile::{
     projectile_unit_hit, PlayerProjectile, ProjectileAssets, ProjectileContact,
 };
 pub use research::order_lab_research;
+pub use unit_combat::{AutoDemoCombatEvent, AutoDemoProjectileType};
 
 const MISSION_DECODED_PAYLOAD_CACHE_ENTRIES: usize = 256;
 const MAX_MISSION_AI_RECORD_SLOTS: usize = 1_000_000;
@@ -1327,7 +1327,7 @@ pub struct Engine {
     world: World,
     loaded: Option<LoadedMissionState>,
     behavior_rng_state: u32,
-    autodemo_combat: Option<autodemo_combat::AutoDemoCombat>,
+    autodemo_combat: Option<unit_combat::AutoDemoCombat>,
     autodemo_reinforcements: Option<autodemo::LiveReinforcements>,
     production: Option<production::Production>,
 }
@@ -2442,22 +2442,25 @@ fn load_mission_with_options(
                 &object_drafts[..reserve_start],
                 &handles[..reserve_start],
             ),
-            MissionMode::SingleMission => (init_orders
+            MissionMode::SingleMission => (init_orders.iter().any(|order| {
+                matches!(
+                    order,
+                    clan_script_init::InitOrder::Patrol(_)
+                        | clan_script_init::InitOrder::Shutdown(_)
+                )
+            }) || loaded_scripts
+                .bundles
                 .iter()
-                .any(|order| matches!(order, clan_script_init::InitOrder::Patrol(_)))
-                || loaded_scripts
-                    .bundles
-                    .iter()
-                    .find(|bundle| bundle.clan_index == 0)
-                    .is_some_and(|bundle| {
-                        bundle.package.events.iter().any(|event| {
-                            event.name_raw.as_slice() == b"Mission\0"
-                                && event.instructions.iter().any(|instruction| {
-                                    instruction.dispatch_selector()
-                                        == fparkan_script::ScriptDispatchSelector::Handler(15)
-                                })
-                        })
-                    }))
+                .find(|bundle| bundle.clan_index == 0)
+                .is_some_and(|bundle| {
+                    bundle.package.events.iter().any(|event| {
+                        event.name_raw.as_slice() == b"Mission\0"
+                            && event.instructions.iter().any(|instruction| {
+                                instruction.dispatch_selector()
+                                    == fparkan_script::ScriptDispatchSelector::Handler(15)
+                            })
+                    })
+                }))
             .then(unit_patrol::UnitPatrol::scripted),
         }
     } else {
@@ -2537,10 +2540,28 @@ fn load_mission_with_options(
             clan_script_init::InitOrder::Reserve { clan, id, reserved } => {
                 mission_events.set_reservation(&mission, &new_runtime_world, clan, id, reserved);
             }
+            clan_script_init::InitOrder::Shutdown(id) => {
+                let Some(patrol) = &mut unit_patrol else {
+                    continue;
+                };
+                if let Some(handle) = script_patrol::warbot_by_logic_id(
+                    &mission,
+                    &object_drafts,
+                    &new_runtime_world,
+                    id,
+                ) {
+                    if patrol.shut_down(handle) {
+                        eprintln!(
+                            "sim_coverage unit_shutdown_approx=1 unit={} id={id}",
+                            handle.slot
+                        );
+                    }
+                }
+            }
         }
     }
     let autodemo_combat = (unit_patrol.is_some() || guard_clans.contains(&true)).then(|| {
-        autodemo_combat::AutoDemoCombat::new(
+        unit_combat::AutoDemoCombat::new(
             &vfs,
             &mission,
             &object_drafts,
@@ -2917,7 +2938,7 @@ pub fn autodemo_projectile_types(engine: &Engine) -> &[AutoDemoProjectileType] {
     engine
         .autodemo_combat
         .as_ref()
-        .map_or(&[], autodemo_combat::AutoDemoCombat::types)
+        .map_or(&[], unit_combat::AutoDemoCombat::types)
 }
 
 /// Active autonomous flights in the current world.
@@ -2927,7 +2948,7 @@ pub fn autodemo_projectiles(
     engine
         .autodemo_combat
         .iter()
-        .flat_map(autodemo_combat::AutoDemoCombat::flights)
+        .flat_map(unit_combat::AutoDemoCombat::flights)
 }
 
 /// Counts autonomous weapons or projectile profiles that could not be prepared.
@@ -2945,7 +2966,7 @@ pub fn mission_guard_fallback_count(engine: &Engine) -> usize {
     engine
         .autodemo_combat
         .as_ref()
-        .map_or(0, autodemo_combat::AutoDemoCombat::guard_clan_count)
+        .map_or(0, unit_combat::AutoDemoCombat::guard_clan_count)
 }
 
 /// Counts AI clans approximating the scripted raid on a hostile factory.
@@ -8138,9 +8159,9 @@ fn resolve_init_states(
                         return Some(Some(write));
                     }
                     if let Some(order) =
-                        clan_script_init::patrol_order(&varset.declarations, instruction, values)
+                        clan_script_init::unit_order(&varset.declarations, instruction, values)
                     {
-                        init_orders.push(clan_script_init::InitOrder::Patrol(order));
+                        init_orders.push(order);
                         return Some(None);
                     }
                     if let Some((id, reserved)) = clan_script_init::reservation(instruction, values)

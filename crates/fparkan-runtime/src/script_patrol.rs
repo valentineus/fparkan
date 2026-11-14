@@ -3,6 +3,26 @@ use crate::{MissionDocument, MissionObjectDraft};
 use fparkan_script::{Handler15Invocation, Handler15TargetPayload};
 use fparkan_world::{handle_by_original_id, ObjectHandle, OriginalObjectId, World};
 
+pub(super) fn warbot_by_logic_id(
+    mission: &MissionDocument,
+    drafts: &[MissionObjectDraft],
+    world: &World,
+    id: u32,
+) -> Option<ObjectHandle> {
+    mission
+        .objects
+        .iter()
+        .zip(drafts)
+        .enumerate()
+        .find_map(|(index, (object, draft))| {
+            (id != u32::MAX
+                && object.identity_or_clan_raw == id
+                && draft.unit_dat_header_flags == Some(crate::boarding::WARBOT_CLASS))
+            .then(|| handle_by_original_id(world, OriginalObjectId(index as u32)))
+            .flatten()
+        })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ScriptPatrol {
     pub(super) actor_id: u32,
@@ -31,18 +51,7 @@ impl ScriptPatrol {
         drafts: &[MissionObjectDraft],
         world: &World,
     ) -> Option<ObjectHandle> {
-        let (index, _) =
-            mission
-                .objects
-                .iter()
-                .zip(drafts)
-                .enumerate()
-                .find(|(_, (object, draft))| {
-                    self.actor_id != u32::MAX
-                        && object.identity_or_clan_raw == self.actor_id
-                        && draft.unit_dat_header_flags == Some(crate::boarding::WARBOT_CLASS)
-                })?;
-        let handle = handle_by_original_id(world, OriginalObjectId(index as u32))?;
+        let handle = warbot_by_logic_id(mission, drafts, world, self.actor_id)?;
         // shortcut: use the verified default radius until per-unit patrol profiles are wired.
         let radius = match self.radius {
             0 | u32::MAX => 60.0,
