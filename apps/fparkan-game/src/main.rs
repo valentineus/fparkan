@@ -80,13 +80,14 @@ use fparkan_render_vulkan::{
 use fparkan_runtime::{
     autodemo_camera, create, frame as step_mission_frame, frame_with_player_motion,
     load_mission_static_preview, load_mission_static_preview_roots, load_mission_with_init_stubs,
-    loaded_mission_assets, loaded_mission_object_drafts, loaded_mission_script_bundles,
-    loaded_terrain, mission_object_handle, plan_player_motion, query_building_segment_world,
-    simulate_mission_report, starting_cockpit, starting_player_weapons, AutoDemoCamera,
-    AutoDemoView, BasementPlacementMode, BuildingMeshNode, Engine, EngineError, EngineServices,
-    FrameResult, LoadedMission, MissionAssets, MissionEventStop, MissionMode, MissionNotice,
-    MissionObjectDraft, MissionRequest, MissionScriptInitExecution, MissionStartupInput,
-    PlayerMotion, PlayerWeapons, StartingCockpit, SIMULATION_COVERAGE,
+    load_player_projectile, loaded_mission_assets, loaded_mission_object_drafts,
+    loaded_mission_script_bundles, loaded_terrain, mission_object_handle, plan_player_motion,
+    projectile_crosses_terrain, query_building_segment_world, simulate_mission_report,
+    starting_cockpit, starting_player_weapons, AutoDemoCamera, AutoDemoView, BasementPlacementMode,
+    BuildingMeshNode, Engine, EngineError, EngineServices, FrameResult, LoadedMission,
+    MissionAssets, MissionEventStop, MissionMode, MissionNotice, MissionObjectDraft,
+    MissionRequest, MissionScriptInitExecution, MissionStartupInput, PlayerMotion,
+    PlayerProjectile, PlayerWeapons, StartingCockpit, SIMULATION_COVERAGE,
 };
 #[cfg(test)]
 use fparkan_terrain::BasementFoundationFragment;
@@ -4875,6 +4876,19 @@ struct DynamicComponentGeometry {
     vertex_count: usize,
 }
 
+struct ProjectileDraw {
+    speed: f32,
+    lifetime_ms: u32,
+    local_vertices: Vec<VulkanStaticVertex>,
+    instances: Vec<ProjectileDrawSlot>,
+}
+
+struct ProjectileDrawSlot {
+    flight: Option<PlayerProjectile>,
+    vertex_start: usize,
+    draw_ranges: std::ops::Range<usize>,
+}
+
 #[derive(Clone, Copy, PartialEq)]
 struct LivePlacement {
     transform: LegacyIron3dEulerTransform,
@@ -9429,6 +9443,70 @@ fn append_static_preview_component(
     )
 }
 
+fn prepare_projectile_draw(
+    engine: &Engine,
+    archive: &str,
+    name: &str,
+    interval_ms: u32,
+    preview: &mut StaticPreviewScene,
+) -> Result<Option<ProjectileDraw>, String> {
+    let projectile = load_player_projectile(engine, archive, name)?;
+    let assets = &projectile.assets;
+    let [id] = assets.visuals_for_object(0) else {
+        return Err("projectile has no single visual".into());
+    };
+    let visual = assets
+        .visual_by_id(*id)
+        .ok_or("projectile visual unavailable")?;
+    let Some(model) = visual.model_id.and_then(|id| assets.model_by_id(id)) else {
+        // Some projectile prototypes use only FX for their visible body.
+        return Ok(None);
+    };
+    let geometry = project_msh_to_static_mesh_in_world_space_with_node_fallback_poses(
+        &model.validated,
+        LegacyIron3dEulerTransform {
+            translation: [0.0; 3],
+            orientation_radians: [0.0; 3],
+        },
+        [1.0; 3],
+    )
+    .map_err(|error| error.to_string())?;
+    if geometry.draw_ranges.is_empty() {
+        return Ok(None);
+    }
+    let selector_remap = static_preview_component_materials(
+        assets,
+        visual,
+        &geometry,
+        None,
+        &mut preview.materials,
+        &mut preview.material_animations,
+    )?;
+    let capacity = projectile.lifetime_ms.div_ceil(interval_ms).min(128);
+    let mut instances = Vec::new();
+    for _ in 0..capacity {
+        let vertex_start = preview.mesh.vertices.len();
+        let range_start = preview.mesh.draw_ranges.len();
+        append_static_preview_component(
+            &mut preview.mesh,
+            geometry.clone(),
+            &selector_remap,
+            Some(&mut preview.material_animations),
+        )?;
+        instances.push(ProjectileDrawSlot {
+            flight: None,
+            vertex_start,
+            draw_ranges: range_start..preview.mesh.draw_ranges.len(),
+        });
+    }
+    Ok(Some(ProjectileDraw {
+        speed: projectile.speed,
+        lifetime_ms: projectile.lifetime_ms,
+        local_vertices: geometry.vertices,
+        instances,
+    }))
+}
+
 fn append_static_preview_component_with_lightmaps(
     target: &mut VulkanStaticMesh,
     component: VulkanStaticMesh,
@@ -9707,6 +9785,35 @@ fn run_static_vulkan_mode(
         }
         None => None,
     };
+    let cockpit = mission_engine.as_ref().and_then(starting_cockpit);
+    let mut player_weapons = PlayerWeapons::default();
+    let mut projectile_draws = Vec::new();
+    if let (Some(engine), Some(cockpit)) = (&mission_engine, cockpit) {
+        player_weapons = starting_player_weapons(engine, cockpit);
+        for weapon in player_weapons.weapons() {
+            let draw = match prepare_projectile_draw(
+                engine,
+                &weapon.projectile_archive,
+                &weapon.projectile,
+                weapon.interval_ms(),
+                &mut preview,
+            ) {
+                Ok(Some(draw)) => Some(draw),
+                Ok(None) => {
+                    eprintln!("sim_coverage player_projectile_visual_stub=1 projectile={} (effect-only body)", weapon.projectile);
+                    None
+                }
+                Err(error) => {
+                    eprintln!(
+                        "sim_coverage player_projectile_layout_stub=1 projectile={} reason={error}",
+                        weapon.projectile
+                    );
+                    None
+                }
+            };
+            projectile_draws.push(draw);
+        }
+    }
     let shadow_base_vertex = preview.mesh.vertices.len();
     let shadow_base_index = preview.mesh.indices.len();
     let mut app = StaticVulkanApp::new(
@@ -9728,8 +9835,10 @@ fn run_static_vulkan_mode(
     );
     app.mission_engine = mission_engine;
     app.demo_camera = demo_camera;
+    app.cockpit = cockpit;
+    app.player_weapons = player_weapons;
+    app.projectile_draws = projectile_draws;
     if let Some(engine) = &app.mission_engine {
-        app.cockpit = starting_cockpit(engine);
         app.mission_render_roots = loaded_mission_object_drafts(engine)
             .unwrap_or_default()
             .iter()
@@ -9752,8 +9861,7 @@ fn run_static_vulkan_mode(
         if app.cockpit.is_some() {
             app.camera_mode = "starting-cockpit";
         }
-        if let Some(cockpit) = app.cockpit {
-            app.player_weapons = starting_player_weapons(engine, cockpit);
+        if app.cockpit.is_some() {
             if app.player_weapons.weapons().is_empty() {
                 eprintln!("sim_coverage player_weapon_layout_stub=1");
             }
@@ -9796,7 +9904,7 @@ fn mission_camera_coverage(cockpit: Option<StartingCockpit>, demo: bool) -> &'st
     if demo {
         "autodemo_camera_follow_approx=1 autodemo_camera_target_approx=1 cockpit_pose_approx=1"
     } else if cockpit.is_some() {
-        "player_motion_approx=1 cockpit_aim_approx=1 cockpit_pose_approx=1 player_weapon_cycle_approx=1 player_projectile_stub=1 player_weapon_fx_stub=1"
+        "player_motion_approx=1 cockpit_aim_approx=1 cockpit_pose_approx=1 player_weapon_cycle_approx=1 player_projectile_flight_approx=1 player_projectile_damage_stub=1 player_weapon_fx_stub=1"
     } else {
         "mission_camera_stub=1"
     }
@@ -9882,6 +9990,7 @@ struct StaticVulkanApp {
     player_mouse: [f32; 2],
     player_weapons: PlayerWeapons,
     player_weapon_sounds: Vec<Option<Op2SoundCommand>>,
+    projectile_draws: Vec<Option<ProjectileDraw>>,
     player_fire_held: bool,
     player_fire_pressed: bool,
     audio: Option<audio::GameAudio>,
@@ -10008,6 +10117,7 @@ impl StaticVulkanApp {
             player_mouse: [0.0; 2],
             player_weapons: PlayerWeapons::default(),
             player_weapon_sounds: Vec::new(),
+            projectile_draws: Vec::new(),
             player_fire_held: false,
             player_fire_pressed: false,
             audio,
@@ -10406,6 +10516,9 @@ impl StaticVulkanApp {
             orientation_radians: state.orientation.map(f32::from_bits),
         };
         let scale = state.scale.map(f32::from_bits);
+        // shortcut: the camera supplies a shared aim direction until native
+        // per-weapon CPT direction and turret alignment agree in world space.
+        let direction = self.view_camera.forward;
         for (slot, weapon) in self.player_weapons.fire(trigger, clock_ms) {
             let pose = control_effect_owner_node_pose(
                 Some(hierarchy),
@@ -10414,13 +10527,11 @@ impl StaticVulkanApp {
             );
             let muzzle = pose.and_then(|pose| {
                 let pose = mount.map_or(pose, |mount| compose_unit_pose(mount, pose));
-                transform.try_transform_scaled_point(
-                    add3(
-                        pose.translation,
-                        rotate_unit_vector(weapon.muzzle.position, pose.rotation),
-                    ),
-                    scale,
-                )
+                let point = add3(
+                    pose.translation,
+                    rotate_unit_vector(weapon.muzzle.position, pose.rotation),
+                );
+                transform.try_transform_scaled_point(point, scale)
             });
             let Some(muzzle) = muzzle else {
                 eprintln!("sim_coverage player_weapon_pose_stub=1 slot={}", slot + 1);
@@ -10432,6 +10543,29 @@ impl StaticVulkanApp {
                 weapon.projectile_archive,
                 weapon.projectile
             );
+            if let Some(draw) = self.projectile_draws.get_mut(slot).and_then(Option::as_mut) {
+                if let Some(instance) = draw
+                    .instances
+                    .iter_mut()
+                    .find(|instance| instance.flight.is_none())
+                {
+                    instance.flight = PlayerProjectile::new(
+                        muzzle,
+                        direction,
+                        draw.speed,
+                        draw.lifetime_ms,
+                        clock_ms,
+                    );
+                    if let Some(flight) = &instance.flight {
+                        eprintln!("player_projectile_spawn slot={} queue_time_ms={clock_ms} speed={} lifetime_ms={} position={muzzle:?} direction={:?}", slot + 1, draw.speed, draw.lifetime_ms, flight.direction);
+                    }
+                } else {
+                    eprintln!(
+                        "sim_coverage player_projectile_pool_full=1 slot={}",
+                        slot + 1
+                    );
+                }
+            }
             if let (Some(sound), Some(audio)) = (
                 self.player_weapon_sounds.get(slot).and_then(Option::as_ref),
                 self.audio.as_mut(),
@@ -10449,6 +10583,60 @@ impl StaticVulkanApp {
                             slot + 1
                         ),
                     }
+                }
+            }
+        }
+    }
+
+    fn advance_player_projectiles(&mut self, clock_ms: u32) -> Result<(), String> {
+        for (slot, draw) in self.projectile_draws.iter_mut().enumerate() {
+            let Some(draw) = draw else { continue };
+            for instance in &mut draw.instances {
+                let Some(flight) = &mut instance.flight else {
+                    continue;
+                };
+                let mut terrain_contact = false;
+                let stays = flight
+                    .advance(clock_ms, |segment| {
+                        terrain_contact = projectile_crosses_terrain(&self.terrain, segment)?;
+                        Ok(terrain_contact)
+                    })
+                    .map_err(|error| format!("query projectile terrain: {error}"))?;
+                if !stays {
+                    let reason = if terrain_contact {
+                        "terrain"
+                    } else {
+                        "expired"
+                    };
+                    eprintln!(
+                        "player_projectile_end slot={} reason={reason} queue_time_ms={clock_ms}",
+                        slot + 1
+                    );
+                    instance.flight = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn update_projectile_geometry(&mut self) {
+        for draw in self.projectile_draws.iter().flatten() {
+            for instance in &draw.instances {
+                let Some(flight) = instance.flight else {
+                    continue;
+                };
+                let forward = flight.direction;
+                let right = normalize3(cross3(forward, [0.0, 0.0, 1.0])).unwrap_or([1.0, 0.0, 0.0]);
+                let up = cross3(right, forward);
+                let rotate = |[x, y, z]: [f32; 3]| {
+                    add3(add3(scale3(right, x), scale3(forward, y)), scale3(up, z))
+                };
+                for (vertex, local) in self.mesh.vertices[instance.vertex_start..]
+                    .iter_mut()
+                    .zip(&draw.local_vertices)
+                {
+                    vertex.position = add3(flight.position, rotate(local.position));
+                    vertex.normal = rotate(local.normal);
                 }
             }
         }
@@ -10787,7 +10975,9 @@ impl StaticVulkanApp {
             }
         }
         self.update_mission_camera(clock.delta_seconds, viewport)?;
+        self.advance_player_projectiles(control_clock_ms)?;
         self.update_player_fire(control_clock_ms);
+        self.update_projectile_geometry();
         refresh_dynamic_shadow_casters(
             &mut self.shadow_casters,
             &self.dynamic_shadow_casters,
@@ -11213,6 +11403,21 @@ impl StaticVulkanApp {
             &frame.material_update.active_materials,
             renderer,
         )?;
+        for draw in self.projectile_draws.iter().flatten() {
+            for instance in draw
+                .instances
+                .iter()
+                .filter(|instance| instance.flight.is_none())
+            {
+                for range_index in instance.draw_ranges.clone() {
+                    renderer
+                        .set_draw_range_index_count(range_index, 0)
+                        .map_err(|error| {
+                            format!("hide inactive projectile range {range_index}: {error}")
+                        })?;
+                }
+            }
+        }
         let shadow_camera = ShadowCamera {
             position: frame.camera.position,
             viewport_width: frame.viewport[0],

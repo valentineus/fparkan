@@ -66,6 +66,13 @@ impl PlayerWeapons {
     }
 }
 
+impl PlayerWeapon {
+    /// Smallest separation between consecutive shots on the current queue clock.
+    pub fn interval_ms(&self) -> u32 {
+        self.interval_ms
+    }
+}
+
 /// Resolves starting weapons from the hero's mounted CTLD and CPT resources.
 pub fn starting_player_weapons(engine: &Engine, cockpit: StartingCockpit) -> PlayerWeapons {
     let control = engine

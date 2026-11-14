@@ -46,6 +46,7 @@ mod mesh_collision;
 mod mission_events;
 mod player_motion;
 mod player_weapon;
+mod projectile;
 
 pub use autodemo::{autodemo_camera, AutoDemoCamera, AutoDemoView};
 pub use fparkan_assets::MissionAssets;
@@ -54,6 +55,9 @@ use mission_events::MissionEvents;
 pub use mission_events::{MissionEventStop, MissionEventTick, MissionNotice};
 pub use player_motion::{plan_player_motion, PlayerMotion, PlayerMotionStep};
 pub use player_weapon::{starting_player_weapons, PlayerWeapons};
+pub use projectile::{
+    load_player_projectile, projectile_crosses_terrain, PlayerProjectile, ProjectileAssets,
+};
 
 const MISSION_DECODED_PAYLOAD_CACHE_ENTRIES: usize = 256;
 const MAX_MISSION_AI_RECORD_SLOTS: usize = 1_000_000;
@@ -17225,6 +17229,21 @@ mod tests {
             .map(|weapon| weapon.projectile.as_str())
             .collect::<Vec<_>>();
         assert_eq!(projectiles, ["bb_h_01", "bp_h_01", "bl_h_01", "bm_h_01"]);
+        for (weapon, (speed, lifetime_ms)) in weapons.weapons().iter().zip([
+            (350.0, 1000),
+            (150.0, 5000),
+            (10000.0, 3000),
+            (70.0, 5000),
+        ]) {
+            let projectile =
+                load_player_projectile(&engine, &weapon.projectile_archive, &weapon.projectile)
+                    .unwrap();
+            assert_eq!(
+                (projectile.speed, projectile.lifetime_ms),
+                (speed, lifetime_ms)
+            );
+            assert!(projectile.assets.visuals_for_object(0).len() == 1);
+        }
         let effects = weapons
             .weapons()
             .iter()
