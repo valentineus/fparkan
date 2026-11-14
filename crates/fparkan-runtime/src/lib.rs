@@ -18427,6 +18427,43 @@ mod tests {
             let step = plan_player_motion(&engine, hero, walk).unwrap().unwrap();
             frame_with_player_motion(&mut engine, tick * 100, hero, step, false).unwrap();
         }
+        let table = engine
+            .loaded
+            .as_mut()
+            .unwrap()
+            .control_device_tables
+            .iter_mut()
+            .find(|table| table.handle == helicopter)
+            .unwrap();
+        let MissionControlDeviceTableStatus::Available(devices) = &mut table.status else {
+            panic!("helicopter Control devices unavailable");
+        };
+        let pilot = devices
+            .iter_mut()
+            .find(|device| device.descriptor.tag == 1)
+            .unwrap();
+        let key = pilot.key as usize;
+        let MissionControlNodeProviderTableStatus::Available(nodes) =
+            &mut table.node_provider_status
+        else {
+            panic!("helicopter Control nodes unavailable");
+        };
+        nodes[key].current_type1_value_bits = 0.0_f32.to_bits();
+        assert_eq!(board_friendly_warbot(&mut engine).unwrap(), None);
+        let table = engine
+            .loaded
+            .as_mut()
+            .unwrap()
+            .control_device_tables
+            .iter_mut()
+            .find(|table| table.handle == helicopter)
+            .unwrap();
+        let MissionControlNodeProviderTableStatus::Available(nodes) =
+            &mut table.node_provider_status
+        else {
+            panic!("helicopter Control nodes unavailable");
+        };
+        nodes[key].current_type1_value_bits = 1.0_f32.to_bits();
         let vehicle = board_friendly_warbot(&mut engine).unwrap().unwrap();
         assert_eq!(vehicle.handle, helicopter);
         let [x, y, z] = position(&engine, vehicle);

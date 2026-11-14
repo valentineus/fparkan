@@ -1,5 +1,6 @@
 use super::{
-    component_cockpit, projectile::unit_sphere, starting_cockpit, Engine, EngineError,
+    component_cockpit, control_device_provider_value, projectile::unit_sphere, starting_cockpit,
+    Engine, EngineError, MissionControlDeviceTableState, MissionControlDeviceTableStatus,
     StartingCockpit, SurfaceQuery, TransformState,
 };
 use fparkan_world::{
@@ -52,6 +53,13 @@ pub fn board_friendly_warbot(engine: &mut Engine) -> Result<Option<StartingCockp
             if identity_metadata(&engine.world, handle).ok()?.owner_id != Some(owner) {
                 return None;
             }
+            let table = mission
+                .control_device_tables
+                .iter()
+                .find(|table| table.handle == handle)?;
+            if !has_working_pilot_control(table) {
+                return None;
+            }
             let state = transform_state(&engine.world, handle).ok()?;
             let (center, radius) = unit_sphere(&mission.mission_assets, index, state)?;
             let distance = center
@@ -88,6 +96,18 @@ pub fn board_friendly_warbot(engine: &mut Engine) -> Result<Option<StartingCockp
         mission.player_pitch_bits = 0;
     }
     Ok(Some(cockpit))
+}
+
+fn has_working_pilot_control(table: &MissionControlDeviceTableState) -> bool {
+    let MissionControlDeviceTableStatus::Available(devices) = &table.status else {
+        return false;
+    };
+    devices
+        .iter()
+        .find(|device| device.descriptor.tag == 1)
+        .is_some_and(|device| {
+            control_device_provider_value(table, device).is_ok_and(|value| value > 0.0)
+        })
 }
 
 /// Leaves the vehicle and restores the hero's cockpit.
