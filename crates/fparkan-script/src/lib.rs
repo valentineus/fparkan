@@ -1141,7 +1141,10 @@ impl VarSet {
         ) -> Result<Option<VarSetDefault>, String>,
     ) -> Result<(), (usize, String)> {
         let mut conditions = Vec::new();
-        for (index, instruction) in event.instructions.iter().enumerate() {
+        let mut pc = 0;
+        while let Some(instruction) = event.instructions.get(pc) {
+            let index = pc;
+            pc += 1;
             match advance_condition(&mut conditions, instruction, values)
                 .map_err(|()| (index, "unsupported comparison operands".into()))?
             {
@@ -1150,6 +1153,17 @@ impl VarSet {
                 EventInstruction::Execute => {}
             }
             let control = instruction.header_words[3];
+            if control == 3 && instruction.dispatch_selector() == ScriptDispatchSelector::Sentinel {
+                let &[target] = instruction.references.as_slice() else {
+                    return Err((index, "jump requires one instruction index".into()));
+                };
+                pc = target as usize;
+                if pc <= index || pc >= event.instructions.len() {
+                    return Err((index, format!("unsupported jump to instruction {target}")));
+                }
+                conditions.clear();
+                continue;
+            }
             if instruction.dispatch_selector() != ScriptDispatchSelector::Sentinel {
                 if control != u32::MAX {
                     return Err((index, format!("unsupported handler control {control}")));
@@ -2393,6 +2407,43 @@ mod tests {
         ScriptInstruction {
             header_words: [u32::MAX, target, u32::MAX, u32::MAX, 6, 0, formula],
             references: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn active_jump_skips_to_the_raw_instruction_index_and_leaves_conditions() {
+        let varset = parse_varset(b"VAR(DWORD, left, 0)\nVAR(DWORD, right, 0)\n").unwrap();
+        let event = ScriptEvent {
+            name_len: 9,
+            name_raw: b"Problems0\0".to_vec(),
+            event_word: 0,
+            instructions: [
+                (
+                    [u32::MAX, u32::MAX, u32::MAX, 0, 1, 2, u32::MAX],
+                    vec![0, 1],
+                ),
+                ([u32::MAX, u32::MAX, u32::MAX, 3, 6, 1, u32::MAX], vec![3]),
+                ([2, u32::MAX, u32::MAX, u32::MAX, 6, 0, u32::MAX], vec![]),
+                ([3, u32::MAX, u32::MAX, u32::MAX, 6, 0, u32::MAX], vec![]),
+            ]
+            .into_iter()
+            .map(|(header_words, references)| ScriptInstruction {
+                header_words,
+                references,
+            })
+            .collect(),
+        };
+        for (rhs, expected) in [(0, vec![3]), (1, vec![])] {
+            let mut values = [VarSetDefault::Dword(0), VarSetDefault::Dword(rhs)];
+            let mut calls = Vec::new();
+            varset
+                .execute_event_prefix(&event, None, &mut values, |instruction, _| {
+                    calls.push(instruction.header_words[0]);
+                    Ok(None)
+                })
+                .unwrap();
+            // A taken jump clears the conditions; an untaken one stays in the false branch.
+            assert_eq!(calls, expected);
         }
     }
 

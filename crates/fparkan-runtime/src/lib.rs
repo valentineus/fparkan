@@ -2900,8 +2900,8 @@ pub struct SimulationReport {
     pub mission_event_stops: Vec<MissionEventStop>,
     /// Uncovered clan AI instructions and the number of invocations they stopped.
     pub clan_ai_event_stops: Vec<(MissionEventStop, u64)>,
-    /// Research status calls handled with an unloaded catalog, grouped by clan.
-    pub clan_research_status_stubs: Vec<(usize, u64)>,
+    /// Calls to stubbed research policy or status, grouped by clan and handler.
+    pub clan_research_status_stubs: Vec<(usize, u8, u64)>,
     /// Total requests for mission information messages.
     pub mission_messages: u64,
     /// Clock of the first autonomous shot, in milliseconds.

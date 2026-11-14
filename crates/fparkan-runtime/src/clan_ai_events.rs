@@ -1,13 +1,16 @@
-use crate::{LoadedMissionState, MissionEventStop};
+use crate::{BehaviorOreState, LoadedMissionState, MissionEventStop};
 use fparkan_script::{ScriptDispatchSelector, VarSetDefault};
-use fparkan_world::{OwnerId, World};
+use fparkan_world::{identity_metadata, registration_sequence, OwnerId, World};
 use std::collections::BTreeMap;
+
+const STORAGE_CLASS: u32 = 0x8000_0008;
+const RESOURCE_ORE: u32 = 0x0200_0100;
 
 #[derive(Default)]
 pub(super) struct ClanAiEvents {
     next_ms: BTreeMap<usize, u32>,
     stops: BTreeMap<(usize, usize, usize), (MissionEventStop, u64)>,
-    research_status_stubs: BTreeMap<usize, u64>,
+    research_stubs: BTreeMap<(usize, u8), u64>,
 }
 
 impl LoadedMissionState {
@@ -55,6 +58,12 @@ impl LoadedMissionState {
                             (available - demand).to_bits(),
                         )))
                     }
+                    ScriptDispatchSelector::Handler(16)
+                        if instruction.dword_pair(values) == Some((STORAGE_CLASS, RESOURCE_ORE)) =>
+                    {
+                        let remaining = storage_space(&self.behavior_ore_states, world, OwnerId(clan as u16));
+                        Ok(Some(VarSetDefault::FloatBits(remaining.to_bits())))
+                    }
                     ScriptDispatchSelector::Handler(17)
                         if instruction.dword_pair(values)
                             == Some((crate::mining::MINE_CLASS, 0x0afc_0900)) =>
@@ -88,17 +97,17 @@ impl LoadedMissionState {
                             ),
                         )))
                     }
-                    ScriptDispatchSelector::Handler(65) if instruction.references.is_empty() => {
-                        // RVA 0x111d0 returns false while the research catalog is unloaded.
+                    ScriptDispatchSelector::Handler(handler @ (56 | 65)) if instruction.references.is_empty() => {
+                        // shortcut: keep research disabled until the native policy flag and catalog are wired.
                         let count = self
                             .clan_ai_events
-                            .research_status_stubs
-                            .entry(clan)
+                            .research_stubs
+                            .entry((clan, handler))
                             .or_default();
                         *count += 1;
                         if *count == 1 {
                             eprintln!(
-                                "sim_coverage script_research_status_stub=1 clan={clan} script={}",
+                                "sim_coverage script_research_status_stub=1 clan={clan} handler={handler} script={}",
                                 bundle.script_path
                             );
                         }
@@ -137,6 +146,19 @@ fn count_free_minds(slots: &[u32]) -> u32 {
     slots.iter().filter(|&&word| word == u32::MAX).count() as u32
 }
 
+fn storage_space(ores: &[BehaviorOreState], world: &World, clan: OwnerId) -> f32 {
+    ores.iter()
+        .filter(|ore| {
+            ore.class_flags == STORAGE_CLASS
+                && registration_sequence(world, ore.handle).is_ok_and(|sequence| sequence.is_some())
+                && identity_metadata(world, ore.handle)
+                    .is_ok_and(|identity| identity.owner_id == Some(clan))
+        })
+        .fold(0.0, |space, ore| {
+            space + (f32::from_bits(ore.maximum_ore_bits) - f32::from_bits(ore.current_ore_bits))
+        })
+}
+
 impl ClanAiEvents {
     fn due(&mut self, clan: usize, start_ms: u32, now_ms: u32) -> bool {
         let next = self.next_ms.entry(clan).or_insert(7_000);
@@ -152,10 +174,10 @@ impl ClanAiEvents {
         self.stops.values().map(|(stop, count)| (stop, *count))
     }
 
-    pub(super) fn research_status_stubs(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
-        self.research_status_stubs
+    pub(super) fn research_status_stubs(&self) -> impl Iterator<Item = (usize, u8, u64)> + '_ {
+        self.research_stubs
             .iter()
-            .map(|(&clan, &count)| (clan, count))
+            .map(|(&(clan, handler), &count)| (clan, handler, count))
     }
 }
 
@@ -178,5 +200,43 @@ mod tests {
     fn free_mind_count_uses_only_the_native_sentinel() {
         assert_eq!(count_free_minds(&[]), 0);
         assert_eq!(count_free_minds(&[u32::MAX, 0, u32::MAX, 1, 0xfffe]), 2);
+    }
+
+    #[test]
+    fn free_ore_space_follows_storage_ownership_and_lifecycle() {
+        use fparkan_world::{
+            construct_object, new, register_object, request_delete, set_owner, step, InputSnapshot,
+            ObjectDraft, OriginalObjectId, WorldConfig,
+        };
+        let mut world = new(WorldConfig);
+        let mut make = |id, class_flags, owner, ore: f32| {
+            let original_id = OriginalObjectId(id);
+            let handle = construct_object(
+                &mut world,
+                ObjectDraft {
+                    original_id: Some(original_id),
+                },
+            )
+            .unwrap();
+            set_owner(&mut world, handle, Some(OwnerId(owner))).unwrap();
+            register_object(&mut world, handle).unwrap();
+            BehaviorOreState {
+                original_id,
+                handle,
+                class_flags,
+                current_ore_bits: ore.to_bits(),
+                maximum_ore_bits: 100.0_f32.to_bits(),
+            }
+        };
+        let ores = [
+            make(1, STORAGE_CLASS, 1, 15.0),
+            make(2, STORAGE_CLASS, 1, 40.0),
+            make(3, STORAGE_CLASS, 0, 10.0),
+            make(4, crate::mining::MINE_CLASS, 1, 20.0),
+        ];
+        assert_eq!(storage_space(&ores, &world, OwnerId(1)), 145.0);
+        request_delete(&mut world, ores[0].handle).unwrap();
+        step(&mut world, &InputSnapshot).unwrap();
+        assert_eq!(storage_space(&ores, &world, OwnerId(1)), 60.0);
     }
 }
