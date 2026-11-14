@@ -2413,11 +2413,18 @@ virtual slot `+0x1c` on `this+0x3d8` using the first word. A missing target
 sets VM flag `+0x50=5`; otherwise the handler builds a temporary call record,
 applies the mode-specific tail, and invokes the target's `+0x0c` virtual slot
 with that record and the third word. Its zero/non-zero result becomes
-`+0x50=0/1`. The target type, the virtual method's semantic action, and its
-return value remain unproven. Accordingly `VarSet::resolve_handler15` only
-materializes a type-checked `Handler15Invocation` and `Handler15TargetPayload`;
-it never executes the opaque target call. Missing, out-of-range, wrong-type,
-and unobserved-mode inputs are explicit errors.
+`+0x50=0/1`. `VarSet::resolve_handler15_with_values` performs the typed reads
+against live cells so a preceding assignment changes the actor and target.
+
+«Полевой лагерь» использует ветвь `ORDER_ROBOT_PATROL = 4`,
+`INSERT_ORDER_REPLACE = 3`, `TARGET_BY_PLACE = 0x0202`. Клетки 9 и 10 задают
+центр в мировых координатах. В GOG Behavior.dll (SHA-256
+`ddfbdbde07832358fe6e35e01c8dba9b58e7313789498b6049ed51d4ed9baf99`)
+задача патруля по RVA `0x2d520` копирует координаты и использует радиус из
+профиля, если аргумент радиуса равен 0 или `0xffffffff`. Исполнение этой
+функции подтвердило стандартный радиус 60 и замену на явно переданный 90.
+FParkan исполняет эту ветвь для размещённых варботов. Остальные приказы
+и способы выбора цели дают явную остановку в отчёте покрытия.
 
 ## Готовность
 

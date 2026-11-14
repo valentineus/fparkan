@@ -11251,6 +11251,9 @@ impl StaticVulkanApp {
                 log_mission_event_stop(stop);
             }
             if let Some(tick) = &frame.mission_event {
+                for &(handle, [x, y]) in &tick.patrol_orders {
+                    eprintln!("mission_patrol_order unit={} target=[{x},{y}] queue_time_ms={control_clock_ms}", handle.slot);
+                }
                 for &notice in &tick.notices {
                     match notice {
                         MissionNotice::ObjectiveComplete(index) => eprintln!("mission_objective index={index} status=complete queue_time_ms={control_clock_ms}"),

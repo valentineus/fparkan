@@ -7,7 +7,8 @@ use super::{
 use fparkan_msh::{draw_batches, node38_sampled_hierarchy, selected_slot, Group, Lod, NodeId};
 use fparkan_render::LegacyIron3dEulerTransform;
 use fparkan_script::{
-    ScriptDispatchSelector, ScriptInstruction, VarSetDefault, VmHostCallbackCommand,
+    Handler15TargetPayload, ScriptDispatchSelector, ScriptInstruction, VarSetDefault,
+    VmHostCallbackCommand,
 };
 use fparkan_world::{
     handle_by_original_id, identity_metadata, registration_sequence, set_owner, transform_state,
@@ -37,6 +38,8 @@ pub struct MissionEventTick {
     pub stop: Option<MissionEventStop>,
     /// Notifications produced by this invocation, in script order.
     pub notices: Vec<MissionNotice>,
+    /// Newly assigned or changed place patrols in script order.
+    pub patrol_orders: Vec<(ObjectHandle, [u32; 2])>,
 }
 
 /// A notification emitted by the scenario host.
@@ -473,6 +476,7 @@ impl LoadedMissionState {
             .find(|state| state.clan_index == bundle.clan_index)?;
         let mission_events = &mut self.mission_events;
         let mut notices = Vec::new();
+        let mut patrol_orders = Vec::new();
         let stop = declarations
             .execute_mission_prefix(
                 event,
@@ -516,6 +520,54 @@ impl LoadedMissionState {
                         let clan = placed_logic_objects(&self.mission, world, id)
                             .find_map(|handle| identity_metadata(world, handle).ok()?.owner_id);
                         Ok(Some(clan.map_or(u32::MAX, |owner| u32::from(owner.0))))
+                    }
+                    ScriptDispatchSelector::Handler(15) => {
+                        let order = declarations
+                            .resolve_handler15_with_values(instruction, values)
+                            .map_err(|error| error.to_string())?;
+                        let (4, 3, Handler15TargetPayload::ByPlace { first, second }) =
+                            (order.word_1, order.word_2, order.target)
+                        else {
+                            return Err(format!(
+                                "Handler(15) order={} insertion={} target={:?}",
+                                order.word_1, order.word_2, order.target
+                            ));
+                        };
+                        let Some(handle) =
+                            self.mission
+                                .objects
+                                .iter()
+                                .enumerate()
+                                .find_map(|(index, object)| {
+                                    let class = self.object_drafts[index].unit_dat_header_flags?;
+                                    (class == super::boarding::WARBOT_CLASS
+                                        && object.identity_or_clan_raw == order.word_0)
+                                        .then(|| {
+                                            handle_by_original_id(
+                                                world,
+                                                OriginalObjectId(index as u32),
+                                            )
+                                        })
+                                        .flatten()
+                                })
+                        else {
+                            // The native handler sets its missing-target status and advances.
+                            return Ok(None);
+                        };
+                        let Some(patrol) = &mut self.unit_patrol else {
+                            return Err("Handler(15) patrol runtime is unavailable".into());
+                        };
+                        // shortcut: default place radius and a routed random point;
+                        // native patrol timing and profile overrides remain open.
+                        let radius = if matches!(order.word_3, 0 | u32::MAX) {
+                            60.0
+                        } else {
+                            order.word_3 as f32
+                        };
+                        if patrol.order(world, handle, [first as f32, second as f32], radius) {
+                            patrol_orders.push((handle, [first, second]));
+                        }
+                        Ok(None)
                     }
                     ScriptDispatchSelector::Handler(30) => {
                         let command = declarations
@@ -575,7 +627,11 @@ impl LoadedMissionState {
                 instruction_index,
                 reason,
             });
-        Some(MissionEventTick { stop, notices })
+        Some(MissionEventTick {
+            stop,
+            notices,
+            patrol_orders,
+        })
     }
 }
 

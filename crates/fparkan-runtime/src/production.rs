@@ -525,6 +525,12 @@ mod tests {
                 .is_none());
         }
         let factory_position = pose.position;
+        pose.position = [1288.99_f32, 807.4, 74.08].map(f32::to_bits);
+        set_transform(&mut engine.world, cockpit.handle, pose).unwrap();
+        assert_eq!(
+            capture_neutral_building(&mut engine, cockpit).unwrap(),
+            Some(OriginalObjectId(0))
+        );
         pose.position = [1026.08_f32, 902.706, 81.24426].map(f32::to_bits);
         set_transform(&mut engine.world, cockpit.handle, pose).unwrap();
         crate::deploy_mine(&mut engine, cockpit).unwrap();
@@ -546,9 +552,20 @@ mod tests {
         pose.position = factory_position;
         set_transform(&mut engine.world, cockpit.handle, pose).unwrap();
         let mut produced = 0;
-        let mut complete = false;
+        let mut dispatched_at = None;
+        let enemy = handle_by_original_id(&engine.world, OriginalObjectId(2)).unwrap();
+        let enemy_start = transform_state(&engine.world, enemy).unwrap().position;
         for now in (30_150..=190_100).step_by(50) {
             let frame = step_headless(&mut engine, InputSnapshot::default(), now).unwrap();
+            assert!(
+                frame
+                    .mission_event
+                    .as_ref()
+                    .and_then(|event| event.stop.as_ref())
+                    .is_none(),
+                "{:?}",
+                frame.mission_event
+            );
             assert!(
                 frame.production_failure.is_none(),
                 "{:?}",
@@ -563,15 +580,50 @@ mod tests {
                 }
             }
             if frame.mission_event.is_some_and(|event| {
-                event
+                if event
                     .notices
                     .contains(&crate::MissionNotice::ObjectiveComplete(3))
+                {
+                    assert_eq!(event.patrol_orders.len(), 3);
+                    assert_eq!(event.patrol_orders[0].1, [1124, 783]);
+                    assert_eq!(event.patrol_orders[1].1, [606, 993]);
+                    return true;
+                }
+                false
             }) {
-                complete = true;
+                dispatched_at = Some(now);
                 break;
             }
         }
         assert_eq!(produced, 4);
-        assert!(complete, "factory objective must follow the fourth robot");
+        let dispatched_at = dispatched_at.expect("factory objective must follow the fourth robot");
+        for now in (dispatched_at + 50..=dispatched_at + 5_000).step_by(50) {
+            step_headless(&mut engine, InputSnapshot::default(), now).unwrap();
+        }
+        assert_ne!(
+            transform_state(&engine.world, enemy).unwrap().position,
+            enemy_start
+        );
+        let enemies =
+            [2, 3, 4].map(|id| handle_by_original_id(&engine.world, OriginalObjectId(id)).unwrap());
+        for handle in enemies {
+            assert_eq!(
+                crate::apply_projectile_hit(&mut engine, handle, f32::MAX).unwrap(),
+                Some((0.0, true))
+            );
+        }
+        let tick = step_headless(&mut engine, InputSnapshot::default(), dispatched_at + 8_000)
+            .unwrap()
+            .mission_event
+            .unwrap();
+        assert!(
+            tick.notices
+                .contains(&crate::MissionNotice::ObjectiveComplete(4)),
+            "{tick:?}"
+        );
+        assert!(
+            tick.notices.contains(&crate::MissionNotice::Completed),
+            "{tick:?}"
+        );
     }
 }

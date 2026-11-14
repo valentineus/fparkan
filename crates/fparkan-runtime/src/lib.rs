@@ -2401,15 +2401,31 @@ fn load_mission_with_options(
         script_varset_state_count: loaded_scripts.varset_states.len(),
     };
 
-    let unit_patrol = (request.mode == MissionMode::AutoDemo && options.start_autodemo)
-        .then(|| {
-            unit_patrol::UnitPatrol::new(
+    let unit_patrol = if options.start_autodemo {
+        match request.mode {
+            MissionMode::AutoDemo => unit_patrol::UnitPatrol::new(
                 &mission,
                 &object_drafts[..reserve_start],
                 &handles[..reserve_start],
-            )
-        })
-        .flatten();
+            ),
+            MissionMode::SingleMission => loaded_scripts
+                .bundles
+                .iter()
+                .find(|bundle| bundle.clan_index == 0)
+                .is_some_and(|bundle| {
+                    bundle.package.events.iter().any(|event| {
+                        event.name_raw.as_slice() == b"Mission\0"
+                            && event.instructions.iter().any(|instruction| {
+                                instruction.dispatch_selector()
+                                    == fparkan_script::ScriptDispatchSelector::Handler(15)
+                            })
+                    })
+                })
+                .then(unit_patrol::UnitPatrol::scripted),
+        }
+    } else {
+        None
+    };
     let autodemo_combat = unit_patrol.as_ref().map(|_| {
         autodemo_combat::AutoDemoCombat::new(
             &vfs,
@@ -2583,6 +2599,9 @@ pub fn step_headless(
         } else {
             (None, None)
         };
+    if let (Some(combat), Some(unit)) = (&mut engine.autodemo_combat, produced_unit) {
+        combat.activate(&engine.world, unit.object_index, unit.handle);
+    }
     if produced_unit.is_some()
         || !autodemo_reinforcements.is_empty()
         || autodemo_combat_events
@@ -2660,7 +2679,7 @@ pub fn frame_with_player_motion(
 
 /// Coverage entries for the subsystems still absent from the mission loop.
 pub const SIMULATION_COVERAGE: &str =
-    "sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 unit_behavior_stub=1 render_object_lifecycle_stub=1 render_winding_change_stub=1 mission_event_clock_approx=1 mission_tactical_ids_stub=1 mission_clan_roster_stub=1 mission_message_ui_stub=1 factory_orders_approx=1 mine_orders_approx=1";
+    "sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 unit_behavior_stub=1 render_object_lifecycle_stub=1 render_winding_change_stub=1 mission_event_clock_approx=1 mission_tactical_ids_stub=1 mission_clan_roster_stub=1 mission_message_ui_stub=1 factory_orders_approx=1 mine_orders_approx=1 mission_patrol_approx=1";
 
 /// Totals from a headless mission coverage run.
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 
 #[derive(Clone)]
 pub(super) struct UnitPatrol {
-    center: [f32; 2],
+    center: Option<[f32; 2]>,
     units: Vec<PatrollingUnit>,
     clock_ms: u32,
     rng: u32,
@@ -17,6 +17,8 @@ pub(super) struct UnitPatrol {
 #[derive(Clone)]
 struct PatrollingUnit {
     handle: ObjectHandle,
+    center: [f32; 2],
+    radius: f32,
     points: VecDeque<[f32; 2]>,
     retry_ms: u32,
     attack: Option<ObjectHandle>,
@@ -28,15 +30,53 @@ pub(super) struct PreparedPatrol {
 }
 
 impl UnitPatrol {
-    pub(super) fn activate(&mut self, world: &World, handle: ObjectHandle) {
+    pub(super) fn scripted() -> Self {
+        Self {
+            center: None,
+            units: Vec::new(),
+            clock_ms: 0,
+            rng: 1,
+        }
+    }
+
+    pub(super) fn order(
+        &mut self,
+        world: &World,
+        handle: ObjectHandle,
+        center: [f32; 2],
+        radius: f32,
+    ) -> bool {
         self.units
             .retain(|unit| transform_state(world, unit.handle).is_ok());
+        if let Some(unit) = self.units.iter_mut().find(|unit| unit.handle == handle) {
+            if unit.center != center || unit.radius != radius {
+                unit.center = center;
+                unit.radius = radius;
+                unit.points.clear();
+                unit.retry_ms = 0;
+                return true;
+            }
+            return false;
+        }
         self.units.push(PatrollingUnit {
             handle,
+            center,
+            radius,
             points: VecDeque::new(),
             retry_ms: 0,
             attack: None,
         });
+        true
+    }
+
+    pub(super) fn is_patrolling(&self, handle: ObjectHandle) -> bool {
+        self.units.iter().any(|unit| unit.handle == handle)
+    }
+
+    pub(super) fn activate(&mut self, world: &World, handle: ObjectHandle) {
+        if let Some(center) = self.center {
+            self.order(world, handle, center, 150.0);
+        }
     }
 
     pub(super) fn new(
@@ -58,13 +98,15 @@ impl UnitPatrol {
             })
             .map(|(_, &handle)| PatrollingUnit {
                 handle,
+                center,
+                radius: 150.0,
                 points: VecDeque::new(),
                 retry_ms: 0,
                 attack: None,
             })
             .collect();
         Some(Self {
-            center,
+            center: Some(center),
             units,
             clock_ms: 0,
             rng: 1,
@@ -116,7 +158,7 @@ impl UnitPatrol {
                 unit.points = if let Some(enemy) = enemy {
                     route_points(terrain, from, enemy.center)?.unwrap_or_default()
                 } else {
-                    choose_route(terrain, from, state.center, &mut state.rng)?
+                    choose_route(terrain, from, unit.center, unit.radius, &mut state.rng)?
                 };
                 unit.retry_ms = now_ms.saturating_add(1_000);
             }
@@ -175,12 +217,13 @@ fn choose_route(
     terrain: &TerrainWorld,
     from: [f32; 3],
     center: [f32; 2],
+    radius: f32,
     rng: &mut u32,
 ) -> Result<VecDeque<[f32; 2]>, EngineError> {
     // shortcut: choose one routed patrol point at a time with separate RNG state.
     for _ in 0..16 {
         let [x, y] =
-            center.map(|axis| axis + (next_crt_rand(rng) as f32 / 32767.0 * 2.0 - 1.0) * 150.0);
+            center.map(|axis| axis + (next_crt_rand(rng) as f32 / 32767.0 * 2.0 - 1.0) * radius);
         let Some(z) = terrain.height_at([x, y]).map_err(EngineError::Terrain)? else {
             continue;
         };

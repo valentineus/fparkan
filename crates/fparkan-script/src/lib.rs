@@ -1150,28 +1150,61 @@ impl VarSet {
         &self,
         instruction: &ScriptInstruction,
     ) -> Result<Handler15Invocation, Handler15ResolveError> {
-        let word_0 = self.resolve_handler15_dword(instruction, 0)?;
-        let word_1 = self.resolve_handler15_dword(instruction, 1)?;
-        let word_2 = self.resolve_handler15_dword(instruction, 2)?;
-        let word_3 = self.resolve_handler15_dword(instruction, 3)?;
-        let scalar_4 = self.resolve_handler15_float(instruction, 4)?;
-        let scalar_5 = self.resolve_handler15_float(instruction, 5)?;
-        let scalar_6 = self.resolve_handler15_float(instruction, 6)?;
-        let scalar_7 = self.resolve_handler15_float(instruction, 7)?;
-        let target = match self.resolve_handler15_dword(instruction, 8)? {
+        self.resolve_handler15_with(instruction, None)
+    }
+
+    /// Resolves an order against live script cells, including prior assignments.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for missing or mistyped operands or an unknown target mode.
+    pub fn resolve_handler15_with_values(
+        &self,
+        instruction: &ScriptInstruction,
+        values: &[VarSetDefault],
+    ) -> Result<Handler15Invocation, Handler15ResolveError> {
+        self.resolve_handler15_with(instruction, Some(values))
+    }
+
+    fn resolve_handler15_with(
+        &self,
+        instruction: &ScriptInstruction,
+        values: Option<&[VarSetDefault]>,
+    ) -> Result<Handler15Invocation, Handler15ResolveError> {
+        let dword = |pos| match self.handler15_value(instruction, values, pos)? {
+            VarSetDefault::Dword(value) => Ok(value),
+            VarSetDefault::FloatBits(_) => Err(Handler15ResolveError::UnexpectedType {
+                position: pos,
+                expected: VarSetType::Dword,
+                found: VarSetType::Float,
+            }),
+        };
+        let scalar = |pos| match self.handler15_value(instruction, values, pos)? {
+            VarSetDefault::FloatBits(bits) => Ok(f32::from_bits(bits)),
+            VarSetDefault::Dword(_) => Err(Handler15ResolveError::UnexpectedType {
+                position: pos,
+                expected: VarSetType::Float,
+                found: VarSetType::Dword,
+            }),
+        };
+        let word_0 = dword(0)?;
+        let word_1 = dword(1)?;
+        let word_2 = dword(2)?;
+        let word_3 = dword(3)?;
+        let scalar_4 = scalar(4)?;
+        let scalar_5 = scalar(5)?;
+        let scalar_6 = scalar(6)?;
+        let scalar_7 = scalar(7)?;
+        let target = match dword(8)? {
             0 => Handler15TargetPayload::None,
-            0x0201 => {
-                Handler15TargetPayload::ByLogicId(self.resolve_handler15_dword(instruction, 9)?)
-            }
+            0x0201 => Handler15TargetPayload::ByLogicId(dword(9)?),
             0x0202 => Handler15TargetPayload::ByPlace {
-                first: self.resolve_handler15_dword(instruction, 9)?,
-                second: self.resolve_handler15_dword(instruction, 10)?,
+                first: dword(9)?,
+                second: dword(10)?,
             },
-            0x0203 => Handler15TargetPayload::ByType(self.resolve_handler15_dword(instruction, 9)?),
-            0x0204 => {
-                Handler15TargetPayload::NotDefined(self.resolve_handler15_dword(instruction, 9)?)
-            }
-            0x0205 => Handler15TargetPayload::ByName(self.resolve_handler15_dword(instruction, 9)?),
+            0x0203 => Handler15TargetPayload::ByType(dword(9)?),
+            0x0204 => Handler15TargetPayload::NotDefined(dword(9)?),
+            0x0205 => Handler15TargetPayload::ByName(dword(9)?),
             mode => return Err(Handler15ResolveError::UnsupportedTargetMode(mode)),
         };
         Ok(Handler15Invocation {
@@ -1187,59 +1220,27 @@ impl VarSet {
         })
     }
 
-    fn resolve_handler15_dword(
+    fn handler15_value(
         &self,
         instruction: &ScriptInstruction,
+        values: Option<&[VarSetDefault]>,
         position: usize,
-    ) -> Result<u32, Handler15ResolveError> {
-        match self.resolve_handler15_declaration(instruction, position)? {
-            VarSetDeclaration {
-                type_name: VarSetType::Dword,
-                default_value: VarSetDefault::Dword(value),
-                ..
-            } => Ok(*value),
-            declaration => Err(Handler15ResolveError::UnexpectedType {
-                position,
-                expected: VarSetType::Dword,
-                found: declaration.type_name,
-            }),
-        }
-    }
-
-    fn resolve_handler15_float(
-        &self,
-        instruction: &ScriptInstruction,
-        position: usize,
-    ) -> Result<f32, Handler15ResolveError> {
-        match self.resolve_handler15_declaration(instruction, position)? {
-            VarSetDeclaration {
-                type_name: VarSetType::Float,
-                default_value: VarSetDefault::FloatBits(bits),
-                ..
-            } => Ok(f32::from_bits(*bits)),
-            declaration => Err(Handler15ResolveError::UnexpectedType {
-                position,
-                expected: VarSetType::Float,
-                found: declaration.type_name,
-            }),
-        }
-    }
-
-    fn resolve_handler15_declaration(
-        &self,
-        instruction: &ScriptInstruction,
-        position: usize,
-    ) -> Result<&VarSetDeclaration, Handler15ResolveError> {
+    ) -> Result<VarSetDefault, Handler15ResolveError> {
         let index = *instruction
             .references
             .get(position)
             .ok_or(Handler15ResolveError::MissingReference { position })?;
-        self.declarations
+        let missing = Handler15ResolveError::VarSetIndexOutOfBounds {
+            index,
+            declarations: self.declarations.len(),
+        };
+        let declaration = self
+            .declarations
             .get(index as usize)
-            .ok_or(Handler15ResolveError::VarSetIndexOutOfBounds {
-                index,
-                declarations: self.declarations.len(),
-            })
+            .ok_or(missing.clone())?;
+        values.map_or(Ok(declaration.default_value), |cells| {
+            cells.get(index as usize).copied().ok_or(missing)
+        })
     }
 }
 

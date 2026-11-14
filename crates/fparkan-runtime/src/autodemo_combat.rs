@@ -285,6 +285,14 @@ impl AutoDemoCombat {
         };
         let targets = self.targets(&engine.world, &mission.mission_assets);
         for unit in &mut self.units {
+            if mission.script_host_mode == super::MissionMode::SingleMission
+                && !mission
+                    .unit_patrol
+                    .as_ref()
+                    .is_some_and(|patrol| patrol.is_patrolling(unit.handle))
+            {
+                continue;
+            }
             let aim = targets
                 .iter()
                 .find(|(handle, target)| *handle == unit.handle && target.in_range)
