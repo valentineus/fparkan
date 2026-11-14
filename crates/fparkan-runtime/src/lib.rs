@@ -17267,6 +17267,14 @@ mod tests {
                 None
             ]
         );
+        let laser = load_player_projectile(
+            &engine,
+            &weapons.weapons()[2].projectile_archive,
+            &weapons.weapons()[2].projectile,
+        )
+        .unwrap();
+        let damage = laser.volume.unwrap();
+        assert_eq!(damage, 249.0);
         let first = frame(&mut engine, 5).unwrap().mission_event.unwrap();
         assert_eq!(
             first.notices,
@@ -17288,15 +17296,15 @@ mod tests {
             first_target,
         );
         assert_eq!(
-            apply_projectile_hit(&mut engine, first_target, 249.0).unwrap(),
+            apply_projectile_hit(&mut engine, first_target, damage).unwrap(),
             Some((251.0, false)),
         );
         assert_eq!(
-            apply_projectile_hit(&mut engine, first_target, 249.0).unwrap(),
+            apply_projectile_hit(&mut engine, first_target, damage).unwrap(),
             Some((2.0, false)),
         );
         assert_eq!(
-            apply_projectile_hit(&mut engine, first_target, 249.0).unwrap(),
+            apply_projectile_hit(&mut engine, first_target, damage).unwrap(),
             Some((0.0, true)),
         );
         assert!(projectile_unit_hit(&engine, cockpit.handle, segment).is_none());
@@ -17364,11 +17372,29 @@ mod tests {
                                 .unit_dat_header_flags
                                 .is_some_and(|class| class & 0x0100_0000 != 0)
                     })
-                    .filter_map(|draft| mission_object_handle(&engine, draft.original_id?))
+                    .filter_map(|draft| {
+                        Some((
+                            mission_object_handle(&engine, draft.original_id?)?,
+                            draft.position,
+                        ))
+                    })
                     .collect::<Vec<_>>();
                 assert!(!handles.is_empty());
-                for handle in handles {
-                    fparkan_world::request_delete(&mut engine.world, handle).unwrap();
+                for (handle, [x, y, z]) in handles {
+                    let segment = [[x - 10.0, y, z], [x + 10.0, y, z]];
+                    for _ in 0..6 {
+                        let contact =
+                            projectile_unit_hit(&engine, cockpit.handle, segment).unwrap();
+                        assert_eq!(contact.handle, handle);
+                        let (_, removed) =
+                            apply_projectile_hit(&mut engine, contact.handle, damage)
+                                .unwrap()
+                                .unwrap();
+                        if removed {
+                            break;
+                        }
+                    }
+                    assert!(transform_state(&engine.world, handle).is_err());
                 }
             }
             let tick = frame(&mut engine, time).unwrap().mission_event.unwrap();
