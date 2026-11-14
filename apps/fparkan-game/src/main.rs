@@ -4,6 +4,8 @@
 
 mod camera_capture;
 #[cfg(windows)]
+mod control_effects;
+use control_effects::{advance_control_effect_instances, owner_control_capacity};
 mod mission_hints;
 mod terrain_lod;
 
@@ -6350,83 +6352,6 @@ fn control_effect_instance_seed(
     )
 }
 
-fn advance_control_effect_instances(
-    states: &mut HashMap<ControlEffectInstanceKey, ControlEffectInstanceState>,
-    ambient_slots: &[AmbientEffectGpuSlot],
-    point_light_slots: &[ControlEffectSlot],
-    sound_slots: &[ControlSoundSlot],
-    sample_id: SceneSampleId,
-    control_clock_ms: u32,
-    manager_flag: bool,
-) -> HashMap<ControlEffectInstanceKey, ControlEffectFrameSample> {
-    let mut specifications = HashMap::new();
-    for slot in ambient_slots {
-        specifications.entry(slot.random_instance_key).or_insert((
-            slot.random_seed,
-            slot.header_flags,
-            slot.phase_jitter,
-            slot.random_shift,
-            slot.time_mode,
-            slot.duration_seconds,
-        ));
-    }
-    for slot in point_light_slots
-        .iter()
-        .chain(sound_slots.iter().map(|slot| &slot.effect))
-    {
-        specifications.entry(slot.random_instance_key).or_insert((
-            slot.random_seed,
-            slot.header_flags,
-            slot.phase_jitter,
-            slot.random_shift,
-            slot.time_mode,
-            slot.duration_seconds,
-        ));
-    }
-
-    specifications
-        .into_iter()
-        .map(
-            |(key, (seed, flags, phase_jitter, random_shift, mode, duration))| {
-                let state = states.entry(key).or_insert_with(|| {
-                    ControlEffectInstanceState::new(seed, flags, phase_jitter, random_shift)
-                });
-                if state.last_update_id == Some(sample_id) {
-                    return (key, state.sample);
-                }
-                let clock = state.clock.get_or_insert_with(|| {
-                    if fparkan_fx::fx_time_mode_requires_owner_state(mode) {
-                        // shortcut: Idle provider values until live Control owners are connected in G.
-                        eprintln!("render_coverage control_fx_owner_state_stub=1 (idle provider: speed=0, health=1, effect value=0, complementary control value=1, velocity limits=1; instance={key:?} mode={mode})");
-                    }
-                    // All static-preview instances are created at scene time zero.
-                    fparkan_fx::clock::FxInstanceClock::new(mode, flags, duration, 0.0)
-                        .expect("prepared FX clock metadata")
-                });
-                let now_ms = control_clock_ms as f32;
-                let phase = clock.update(now_ms).and_then(|()| {
-                    clock.phase(
-                        now_ms,
-                        manager_flag,
-                        Some(&fparkan_fx::clock::FxPhaseProvider::idle()),
-                    )
-                });
-                let instance_elapsed = clock.elapsed_seconds(now_ms).unwrap_or(0.0);
-                if phase.is_none() && state.last_update_id.is_none() {
-                    eprintln!("render_coverage control_fx_clock_unsupported=1 (instance={key:?} mode={mode})");
-                }
-                let initial_phase = phase
-                    .map(|phase| initial_native_effect_phase(flags, phase))
-                    .unwrap_or(-1.0);
-                state.advance(sample_id, control_clock_ms, initial_phase);
-                state.sample.phase = phase;
-                state.sample.elapsed_seconds = instance_elapsed;
-                (key, state.sample)
-            },
-        )
-        .collect()
-}
-
 fn ambient_effect_ranges(slot: &AmbientEffectGpuSlot) -> Vec<(&EnvironmentGpuRange, usize)> {
     std::iter::once((&slot.range, slot.material_animation_index))
         .chain(
@@ -6580,6 +6505,9 @@ fn update_ambient_effect_geometry(
         let Some(phase) = random_sample.phase.map(|phase| {
             native_command_phase(slot.header_flags, phase, random_sample.phase_jitter)
         }) else {
+            if let Some(state) = slot.smoke_emitter_state.as_mut() {
+                state.reset();
+            }
             deactivate_ambient_effect_slot(slot, material_animations, &mut updates)?;
             continue;
         };
@@ -11739,6 +11667,13 @@ impl StaticVulkanApp {
             environment
                 .as_ref()
                 .is_some_and(|frame| frame.control_effect_manager_flag),
+            |index| {
+                owner_control_capacity(
+                    self.mission_engine.as_ref()?,
+                    &self.mission_render_roots,
+                    index,
+                )
+            },
         );
         let control_point_lights = update_control_point_lights(
             &mut self.control_point_light_slots,
@@ -11950,6 +11885,8 @@ impl StaticVulkanApp {
                 let Some(phase) = random.phase.map(|phase| {
                     native_command_phase(slot.header_flags, phase, random.phase_jitter)
                 }) else {
+                    audio.stop_control_sound(id);
+                    sound.state = Op2SoundState::default();
                     continue;
                 };
                 if let Some(event) = sound.command.update(
@@ -19357,6 +19294,7 @@ mod tests {
             SceneSampleId::Replay(1),
             250,
             false,
+            |_| None,
         );
         assert!(update_control_point_lights(
             &mut [inactive],
@@ -19376,6 +19314,7 @@ mod tests {
             SceneSampleId::Replay(2),
             750,
             false,
+            |_| None,
         );
         let lights = update_control_point_lights(
             std::slice::from_mut(&mut slot),
@@ -19420,6 +19359,7 @@ mod tests {
             SceneSampleId::Replay(7),
             1500,
             false,
+            |_| None,
         );
         assert_eq!(first.len(), 1);
         let key = slot.random_instance_key;
@@ -19446,6 +19386,7 @@ mod tests {
                 SceneSampleId::Replay(7),
                 1500,
                 false,
+                |_| None,
             )[&key],
             first_sample,
             "a repeated read of the same captured update reuses the shared sample"
@@ -19458,6 +19399,7 @@ mod tests {
             SceneSampleId::Replay(8),
             500,
             false,
+            |_| None,
         );
         let expected = expected_state.advance(SceneSampleId::Replay(8), 500, 1.0);
         assert_eq!(second[&key].phase_jitter, expected.phase_jitter);
@@ -19482,6 +19424,7 @@ mod tests {
             SceneSampleId::Replay(9),
             4500,
             false,
+            |_| None,
         );
         assert_eq!(later[&key].phase, Some(1.0));
         assert_eq!(later[&key].elapsed_seconds, 0.5);
@@ -19493,6 +19436,7 @@ mod tests {
             SceneSampleId::Replay(10),
             6500,
             false,
+            |_| None,
         );
         assert_eq!(restarted[&key].phase, Some(0.0));
         assert_eq!(restarted[&key].elapsed_seconds, 0.0);
@@ -19530,6 +19474,7 @@ mod tests {
                 SceneSampleId::Replay(frame),
                 500,
                 daylight,
+                |_| None,
             );
             assert_eq!(samples[&key].phase, Some(expected));
         }
@@ -19545,8 +19490,35 @@ mod tests {
                 SceneSampleId::Replay(11),
                 5_000,
                 false,
+                |_| None,
             );
-            assert_eq!(samples[&key].phase, Some(0.0), "idle owner mode {mode}");
+            assert_eq!(
+                samples[&key].phase,
+                (mode != 14).then_some(0.0),
+                "idle owner mode {mode}"
+            );
+        }
+        let mut damage_states = HashMap::new();
+        slot.time_mode = 14;
+        slot.header_flags = 1;
+        slot.phase_jitter = 0.1;
+        for (frame, remaining, expected) in
+            [(12, 100.0, None), (13, 75.0, Some(0.25)), (14, 100.0, None)]
+        {
+            let samples = advance_control_effect_instances(
+                &mut damage_states,
+                &[],
+                std::slice::from_ref(&slot),
+                &[],
+                SceneSampleId::Replay(frame),
+                5_000,
+                false,
+                |_| Some((remaining, 100.0)),
+            );
+            assert_eq!(samples[&key].phase, expected);
+            if expected.is_none() {
+                assert_eq!(samples[&key].phase_jitter, 0.0);
+            }
         }
     }
 

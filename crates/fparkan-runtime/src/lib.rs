@@ -2784,7 +2784,7 @@ pub fn frame_with_player_motion(
 
 /// Coverage entries for the subsystems still absent from the mission loop.
 pub const SIMULATION_COVERAGE: &str =
-    "sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 unit_behavior_stub=1 render_object_lifecycle_stub=1 render_winding_change_stub=1 mission_event_clock_approx=1 mission_tactical_ids_stub=1 mission_clan_roster_stub=1 mission_message_ui_stub=1 factory_orders_approx=1 mine_orders_approx=1 mission_patrol_approx=1 mission_hero_exit_approx=1 laboratory_research_approx=1 building_projectile_approx=1";
+    "sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 unit_behavior_stub=1 render_object_lifecycle_stub=1 render_winding_change_stub=1 control_damage_fx_activation_approx=1 mission_event_clock_approx=1 mission_tactical_ids_stub=1 mission_clan_roster_stub=1 mission_message_ui_stub=1 factory_orders_approx=1 mine_orders_approx=1 mission_patrol_approx=1 mission_hero_exit_approx=1 laboratory_research_approx=1 building_projectile_approx=1";
 
 /// Totals from a headless mission coverage run.
 #[derive(Clone, Debug, Eq, PartialEq)]

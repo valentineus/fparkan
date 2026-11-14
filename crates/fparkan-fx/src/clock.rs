@@ -20,6 +20,23 @@ pub struct FxPhaseProvider {
 }
 
 impl FxPhaseProvider {
+    /// Supplies Control selector 0x31 from the owner's total remaining capacity.
+    pub fn with_control_capacity(mut self, remaining: f32, capacity: f32) -> Option<Self> {
+        let health = remaining / capacity;
+        if !remaining.is_finite() || !capacity.is_finite() || capacity <= 0.0 || !health.is_finite()
+        {
+            return None;
+        }
+        self.health = health;
+        Some(self)
+    }
+
+    /// Applies the instance's damage activation approximation before command jitter.
+    pub fn control_effect_active(&self, time_mode: u32) -> bool {
+        // shortcut: activate mode 14 on aggregate damage until the native activation path is wired.
+        time_mode != 14 || self.health < 1.0
+    }
+
     /// Explicit preview stub: stationary, healthy, with complementary values at one.
     /// Unit limits are neutral denominators until live owner data is connected.
     pub const fn idle() -> Self {

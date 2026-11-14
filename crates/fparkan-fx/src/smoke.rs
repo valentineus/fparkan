@@ -115,7 +115,7 @@ impl SmokeEmitterState {
     }
 
     /// Resets the three streams and the native pool state.
-    fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.emitter_rng = self.initial_emitter_rng;
         self.signed_rng = self.initial_signed_rng;
         self.material_rng = self.initial_material_rng;
