@@ -287,20 +287,39 @@ pub fn capture_neutral_building(
     engine: &mut Engine,
     cockpit: StartingCockpit,
 ) -> Result<Option<OriginalObjectId>, EngineError> {
+    capture_building_at_communicator(engine, cockpit, false)
+}
+
+/// Transfers a neutral or hostile building at the player's communicator.
+///
+/// # Errors
+/// Returns an error if the player's world handle or the ownership update fails.
+pub fn capture_building(
+    engine: &mut Engine,
+    cockpit: StartingCockpit,
+) -> Result<Option<OriginalObjectId>, EngineError> {
+    capture_building_at_communicator(engine, cockpit, true)
+}
+
+fn capture_building_at_communicator(
+    engine: &mut Engine,
+    cockpit: StartingCockpit,
+    allow_hostile: bool,
+) -> Result<Option<OriginalObjectId>, EngineError> {
     let Some(mission) = &mut engine.loaded else {
         return Ok(None);
     };
     let Some(player_owner) = identity_metadata(&engine.world, cockpit.handle)?.owner_id else {
         return Ok(None);
     };
-    if !mission
+    let Some(player_clan) = mission
         .mission
         .clans
         .get(usize::from(player_owner.0))
-        .is_some_and(|clan| clan.mode == 1)
-    {
+        .filter(|clan| clan.mode == 1)
+    else {
         return Ok(None);
-    }
+    };
     let position = transform_state(&engine.world, cockpit.handle)?
         .position
         .map(f32::from_bits);
@@ -313,7 +332,18 @@ pub fn capture_neutral_building(
             let identity = identity_metadata(&engine.world, handle).ok()?;
             let owner = identity.owner_id?;
             let clan = mission.mission.clans.get(usize::from(owner.0))?;
-            (clan.mode == 3).then_some((handle, identity.original_id?, owner, class))
+            // shortcut: use TMA diplomacy and the same communicator as a neutral transfer.
+            let hostile = allow_hostile
+                && owner != player_owner
+                && player_clan.relations.iter().any(|relation| {
+                    relation.relation_value == 0 && relation.other_clan_name.raw == clan.name.raw
+                });
+            (class & 0x8000_0000 != 0 && (clan.mode == 3 || hostile)).then_some((
+                handle,
+                identity.original_id?,
+                owner,
+                class,
+            ))
         })
         .find(|&(handle, id, _, class)| {
             transform_state(&engine.world, handle).is_ok_and(|pose| {

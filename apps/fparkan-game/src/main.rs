@@ -80,7 +80,7 @@ use fparkan_render_vulkan::{
 #[cfg(test)]
 use fparkan_runtime::load_mission_with_init_stubs;
 use fparkan_runtime::{
-    apply_projectile_hit, autodemo_camera, board_friendly_warbot, capture_neutral_building,
+    apply_projectile_hit, autodemo_camera, board_friendly_warbot, capture_building,
     capture_neutral_warbot, create, deploy_mine, disembark_warbot, frame as step_mission_frame,
     frame_with_player_motion, load_gameplay_mission, load_mission_static_preview,
     load_mission_static_preview_roots, load_player_projectile, loaded_mission_assets,
@@ -11209,7 +11209,7 @@ impl StaticVulkanApp {
                         vehicle.object_index
                     );
                 } else if let Some(target) =
-                    capture_neutral_building(engine, cockpit).map_err(|error| error.to_string())?
+                    capture_building(engine, cockpit).map_err(|error| error.to_string())?
                 {
                     eprintln!(
                         "player_building_capture object={} queue_time_ms={control_clock_ms}",

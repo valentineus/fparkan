@@ -64,8 +64,8 @@ pub use mesh_collision::{query_building_segment_world, BuildingMeshHit, Building
 pub use mining::deploy_mine;
 use mission_events::MissionEvents;
 pub use mission_events::{
-    capture_neutral_building, capture_neutral_warbot, MissionEventStop, MissionEventTick,
-    MissionNotice,
+    capture_building, capture_neutral_building, capture_neutral_warbot, MissionEventStop,
+    MissionEventTick, MissionNotice,
 };
 pub use player_motion::{plan_player_motion, PlayerMotion, PlayerMotionStep};
 pub use player_weapon::{prepared_warbot_weapons, starting_player_weapons, PlayerWeapons};
@@ -18045,6 +18045,60 @@ mod tests {
                 "{tick:?}"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_two_fortresses_transfers_the_enemy_factory_at_its_communicator() {
+        use fparkan_world::{identity_metadata, OwnerId};
+        let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(licensed_root("IS")));
+        let mut engine = create(EngineServices::new(vfs)).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Single.01/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        let hero = starting_cockpit(&engine).unwrap();
+        let factory_id = OriginalObjectId(9);
+        let factory = mission_object_handle(&engine, factory_id).unwrap();
+        assert_eq!(
+            identity_metadata(&engine.world, factory).unwrap().owner_id,
+            Some(OwnerId(1))
+        );
+        assert_eq!(capture_building(&mut engine, hero).unwrap(), None);
+        let mut pose = transform_state(&engine.world, hero.handle).unwrap();
+        pose.position = [1871.4402_f32, 2020.2354, 61.34749].map(f32::to_bits);
+        set_transform(&mut engine.world, hero.handle, pose).unwrap();
+        assert_eq!(capture_neutral_building(&mut engine, hero).unwrap(), None);
+        let count = |engine: &Engine| {
+            let mission = engine.loaded.as_ref().unwrap();
+            mission.mission_events.count_clan_mask(
+                &engine.world,
+                &mission.behavior_distributors,
+                1,
+                0x8000_0000,
+            )
+        };
+        let initial_count = count(&engine);
+        assert_eq!(
+            capture_building(&mut engine, hero).unwrap(),
+            Some(factory_id)
+        );
+        assert_eq!(
+            identity_metadata(&engine.world, factory).unwrap().owner_id,
+            Some(OwnerId(0))
+        );
+        assert_eq!(count(&engine), initial_count - 1);
+        assert_eq!(capture_building(&mut engine, hero).unwrap(), None);
+        assert!(order_factory_robot(&mut engine, hero, 10).is_ok());
     }
 
     #[test]
