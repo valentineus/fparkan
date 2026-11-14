@@ -2186,6 +2186,11 @@ fn load_mission_with_options(
         script_varset_state_count: loaded_scripts.varset_states.len(),
     };
 
+    let mission_events = if options.asset_scope == MissionAssetScope::Full {
+        MissionEvents::with_placed_objects(&object_drafts, &handles, summary.clan_count)
+    } else {
+        MissionEvents::default()
+    };
     engine.world = new_runtime_world;
     engine.behavior_rng_state = next_behavior_rng_state;
     engine.loaded = Some(LoadedMissionState {
@@ -2209,7 +2214,7 @@ fn load_mission_with_options(
         script_varset: loaded_scripts.varset,
         script_init_states: loaded_scripts.init_states,
         script_varset_states: loaded_scripts.varset_states,
-        mission_events: MissionEvents::default(),
+        mission_events,
         script_host_mode: request.mode,
         // Fresh IGame construction seeds this field with 5; this is not the
         // later status-4 transition performed after native game initialization.
@@ -2275,7 +2280,7 @@ pub fn frame(engine: &mut Engine, queue_time_ms: u32) -> Result<FrameResult, Eng
 
 /// Coverage entries for the subsystems still absent from the mission loop.
 pub const SIMULATION_COVERAGE: &str =
-    "sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 unit_behavior_stub=1 render_object_lifecycle_stub=1 render_winding_change_stub=1 mission_event_clock_approx=1 mission_tactical_ids_stub=1 mission_message_ui_stub=1";
+    "sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 unit_behavior_stub=1 render_object_lifecycle_stub=1 render_winding_change_stub=1 mission_event_clock_approx=1 mission_tactical_ids_stub=1 mission_clan_roster_stub=1 mission_message_ui_stub=1";
 
 /// Totals from a headless mission coverage run.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -17061,7 +17066,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
-    fn licensed_firing_range_voices_spawn_area_messages_once() {
+    fn licensed_firing_range_voices_spawn_and_first_target_loss_once() {
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(licensed_root("IS")));
         let mut engine = create(EngineServices::new(vfs)).unwrap();
         load_mission_with_init_stubs(
@@ -17078,16 +17083,15 @@ mod tests {
         .unwrap();
         let first = frame(&mut engine, 5).unwrap().mission_event.unwrap();
         assert_eq!(first.messages, [11, 14]);
-        let stop = first.stop.unwrap();
-        assert_eq!(
-            (stop.clan_index, stop.event_index, stop.instruction_index),
-            (0, 2, 49)
-        );
-        assert_eq!(stop.reason, "Handler(31)");
+        assert!(first.stop.is_none());
         assert!(frame(&mut engine, 2_004).unwrap().mission_event.is_none());
+        let first_target = mission_object_handle(&engine, OriginalObjectId(1)).unwrap();
+        fparkan_world::request_delete(&mut engine.world, first_target).unwrap();
         let next = frame(&mut engine, 2_005).unwrap().mission_event.unwrap();
         assert!(next.stop.is_none());
-        assert!(next.messages.is_empty());
+        assert_eq!(next.messages, [17]);
+        let later = frame(&mut engine, 4_005).unwrap().mission_event.unwrap();
+        assert!(later.messages.is_empty());
     }
 
     #[test]
