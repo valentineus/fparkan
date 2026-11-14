@@ -1152,6 +1152,7 @@ struct MissionLoadOptions {
     fail_after_registered_objects: Option<usize>,
     asset_scope: MissionAssetScope,
     allow_partial_init: bool,
+    start_autodemo: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1683,6 +1684,7 @@ pub fn load_mission(
 
 /// Loads the mission world even when a clan reaches an unsupported `Init` instruction.
 /// Keeps the supported prefix and records the stop in the clan's execution status.
+/// Starts AutoDemo reinforcements in the gameplay loader.
 ///
 /// # Errors
 ///
@@ -1697,6 +1699,7 @@ pub fn load_mission_with_init_stubs(
         request,
         MissionLoadOptions {
             allow_partial_init: true,
+            start_autodemo: true,
             ..MissionLoadOptions::default()
         },
         Some(startup_input),
@@ -1821,11 +1824,22 @@ fn load_mission_with_options(
         vfs.clone(),
         MISSION_DECODED_PAYLOAD_CACHE_ENTRIES,
     );
-    let graph_roots: Vec<_> = mission
+    let mut graph_roots: Vec<_> = mission
         .objects
         .iter()
         .map(|object| resource_name(&object.resource_name.raw))
         .collect();
+    let startup_reinforcements = if request.mode == MissionMode::AutoDemo && options.start_autodemo
+    {
+        autodemo::startup_reinforcements(&vfs, &mission, mission_path.as_str())?
+    } else {
+        Vec::new()
+    };
+    graph_roots.extend(
+        startup_reinforcements
+            .iter()
+            .map(|(resource, _)| resource_name(resource.as_bytes())),
+    );
     let scoped_graph_roots = match options.asset_scope {
         MissionAssetScope::Full => graph_roots.as_slice(),
         MissionAssetScope::FirstMeshPreview => graph_roots.get(..1).unwrap_or_default(),
@@ -1869,7 +1883,7 @@ fn load_mission_with_options(
         source,
     })?;
     let mission_asset_plan = mission_assets.to_plan();
-    let object_drafts: Vec<_> = mission
+    let mut object_drafts: Vec<_> = mission
         .objects
         .iter()
         .enumerate()
@@ -1903,22 +1917,52 @@ fn load_mission_with_options(
                 .unwrap_or_default(),
         })
         .collect();
+    let mut spawn_rng = 1_u32;
+    for (offset, (resource, plant_index)) in startup_reinforcements.iter().enumerate() {
+        let index = mission.objects.len() + offset;
+        let plant = &object_drafts[*plant_index];
+        let position = autodemo::reinforcement_position(
+            plant,
+            *plant_index,
+            &mission_assets,
+            &terrain,
+            &mut spawn_rng,
+        )?;
+        object_drafts.push(MissionObjectDraft {
+            original_id: Some(OriginalObjectId(index as u32)),
+            resource_name_raw: resource.as_bytes().to_vec(),
+            raw_after_resource: plant.raw_after_resource,
+            identity_or_clan_raw: plant.raw_after_resource,
+            raw_after_name: 0,
+            unit_dat_header_flags: prototype_graph.root_unit_dat_header_flags[index],
+            position,
+            orientation_raw: [0.0; 3],
+            scale: [1.0; 3],
+            visual_ids: mission_assets.visuals_for_object(index).to_vec(),
+            properties: Vec::new(),
+            unit_components: prototype_graph.root_unit_components[index].clone(),
+        });
+    }
     let prepared_behavior_profiles = if options.asset_scope == MissionAssetScope::Full {
         prepare_behavior_profile_states(&vfs, &object_drafts)?
     } else {
         Vec::new()
     };
     let mut new_runtime_world = new_world(WorldConfig);
-    let mut handles = Vec::with_capacity(mission.objects.len());
-    for (index, object) in mission.objects.iter().enumerate() {
-        let original_id = u32::try_from(index).ok().map(OriginalObjectId);
-        let handle = construct_object(&mut new_runtime_world, ObjectDraft { original_id })?;
+    let mut handles = Vec::with_capacity(object_drafts.len());
+    for object in &object_drafts {
+        let handle = construct_object(
+            &mut new_runtime_world,
+            ObjectDraft {
+                original_id: object.original_id,
+            },
+        )?;
         set_transform(
             &mut new_runtime_world,
             handle,
             TransformState {
                 position: object.position.map(f32::to_bits),
-                orientation: object.orientation.map(f32::to_bits),
+                orientation: object.orientation_raw.map(f32::to_bits),
                 scale: object.scale.map(f32::to_bits),
             },
         )?;
@@ -15918,6 +15962,52 @@ mod tests {
                 VarSetDefault::Dword(1),
             ]
         );
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn autodemo_registers_one_starting_reinforcement_per_clan() {
+        let vfs = Arc::new(DirectoryVfs::new(licensed_root("IS")));
+        let mut engine = create(EngineServices::new(vfs)).unwrap();
+        let loaded = load_mission_with_init_stubs(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Autodemo.00/data.tma".into(),
+                mode: MissionMode::AutoDemo,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(loaded.object_count, 8);
+        assert_eq!(loaded.registered_objects, 10);
+        let roots = loaded_mission_object_drafts(&engine).unwrap();
+        let extras = &roots[loaded.object_count..];
+        let mut newcomers = Vec::new();
+        for (clan, (root, resource)) in extras
+            .iter()
+            .zip(["t_b_wlk1.dat", "w_b_fly1.dat"])
+            .enumerate()
+        {
+            assert_eq!(root.raw_after_resource, clan as u32);
+            assert!(root.resource_name_raw.ends_with(resource.as_bytes()));
+            assert!(!root.visual_ids.is_empty());
+            let handle = mission_object_handle(&engine, root.original_id.unwrap()).unwrap();
+            newcomers.push((handle, root.position.map(f32::to_bits)));
+        }
+        assert_eq!(extras.len(), 2);
+        for ms in [16, 1_000] {
+            let snapshot = frame(&mut engine, ms).unwrap().snapshot;
+            assert_eq!(snapshot.objects.len(), 10);
+            for (handle, position) in &newcomers {
+                assert!(snapshot
+                    .transforms
+                    .iter()
+                    .any(|(h, pose)| h == handle && &pose.position == position));
+            }
+        }
     }
 
     #[test]

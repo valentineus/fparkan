@@ -2,12 +2,169 @@ use super::{
     component_cockpit, mission_object_handle, normalize_engine_path, read_vfs, Engine, MissionMode,
     StartingCockpit, WorldSnapshot,
 };
+use fparkan_path::{normalize_relative, NormalizedPath, PathPolicy};
+use fparkan_prototype::decode_unit_dat;
 use fparkan_render::{LegacyIron3dEulerTransform, RawCameraTransform};
 use fparkan_terrain::{SurfaceQuery, TerrainWorld};
+use fparkan_vfs::{Vfs, VfsError};
+use std::sync::Arc;
 
 const PITCH: f32 = 1.25;
 const YAW: f32 = std::f32::consts::FRAC_PI_2;
 const FOLLOW_DISTANCE: f32 = 30.0;
+const PLANT_CLASS: u32 = 0x8000_0010;
+const MOBILE_UNIT: u32 = 0x0100_0000;
+
+pub(super) fn read_config(
+    vfs: &Arc<dyn Vfs>,
+    mission_path: &str,
+) -> Result<Arc<[u8]>, super::EngineError> {
+    let cfg = mission_path.rsplit_once(['/', '\\']).map_or_else(
+        || "mission.cfg".to_owned(),
+        |(parent, _)| format!("{parent}/mission.cfg"),
+    );
+    read_vfs(vfs, &normalize_engine_path("AutoDemo config", &cfg)?)
+}
+
+pub(super) fn startup_reinforcements(
+    vfs: &Arc<dyn Vfs>,
+    mission: &super::MissionDocument,
+    mission_path: &str,
+) -> Result<Vec<(NormalizedPath, usize)>, super::EngineError> {
+    let config = match read_config(vfs, mission_path) {
+        Ok(config) => config,
+        Err(super::EngineError::Vfs {
+            source: VfsError::NotFound(_),
+            ..
+        }) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let Some(minimum) = read_setting(&config, "MinBotsNum") else {
+        return Ok(Vec::new());
+    };
+    if minimum == 0 {
+        return Ok(Vec::new());
+    }
+    let classes = mission
+        .objects
+        .iter()
+        .map(|object| {
+            let raw = &object.resource_name.raw;
+            let path = raw.split(|byte| *byte == 0).next().unwrap_or_default();
+            if !path
+                .get(path.len().saturating_sub(4)..)
+                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".dat"))
+            {
+                return Ok(None);
+            }
+            let path = normalize_relative(path, PathPolicy::StrictLegacy).map_err(|source| {
+                super::EngineError::Path {
+                    role: "AutoDemo Unit DAT",
+                    value: String::from_utf8_lossy(path).into_owned(),
+                    source,
+                }
+            })?;
+            let bytes = read_vfs(vfs, &path)?;
+            Ok(decode_unit_dat(&bytes).ok().map(|unit| {
+                u32::from_le_bytes(
+                    unit.header_opaque[4..8]
+                        .try_into()
+                        .expect("fixed Unit DAT header slice"),
+                )
+            }))
+        })
+        .collect::<Result<Vec<_>, super::EngineError>>()?;
+    let prefix = normalize_engine_path("AutoDemo robot catalog", "units/units/autodemo")?;
+    let deck = match vfs.list(&prefix) {
+        Ok(deck) => deck,
+        Err(VfsError::NotFound(_)) => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(super::EngineError::Vfs {
+                path: prefix.as_str().into(),
+                source,
+            })
+        }
+    };
+    let mut deck: Vec<_> = deck
+        .into_iter()
+        .map(|entry| entry.path)
+        .filter(|path| {
+            path.as_str()
+                .rsplit_once('/')
+                .is_some_and(|(parent, name)| {
+                    parent.eq_ignore_ascii_case(prefix.as_str())
+                        && name
+                            .rsplit_once('.')
+                            .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("dat"))
+                })
+        })
+        .collect();
+    deck.sort_by_cached_key(|path| path.lookup_key().0);
+    if deck.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut resources = deck.iter().cycle();
+    let mut reinforcements = Vec::new();
+    // shortcut: run only the first replenishment pass until the scene supports spawning after load.
+    for (clan, _) in mission.clans.iter().enumerate() {
+        let clan = clan as u32;
+        let mut members = mission
+            .objects
+            .iter()
+            .zip(&classes)
+            .enumerate()
+            .filter(|(_, (object, _))| object.raw_after_resource == clan);
+        let robots = members
+            .clone()
+            .filter(|(_, (_, class))| class.is_some_and(|class| class & MOBILE_UNIT != 0))
+            .count();
+        if robots >= minimum as usize {
+            continue;
+        }
+        if let Some((plant_index, _)) =
+            members.rfind(|(_, (_, class))| **class == Some(PLANT_CLASS))
+        {
+            let resource = resources.next().expect("non-empty repeating catalog");
+            reinforcements.push((resource.clone(), plant_index));
+        }
+    }
+    Ok(reinforcements)
+}
+
+pub(super) fn reinforcement_position(
+    plant: &super::MissionObjectDraft,
+    plant_index: usize,
+    assets: &super::MissionAssets,
+    terrain: &TerrainWorld,
+    rng: &mut u32,
+) -> Result<[f32; 3], super::EngineError> {
+    let bounds = assets
+        .visuals_for_object(plant_index)
+        .first()
+        .and_then(|id| assets.visual_by_id(*id))
+        .and_then(|visual| assets.model_by_id(visual.model_id?))
+        .map(|model| &model.validated)
+        .ok_or_else(|| super::EngineError::Movement("missing AutoDemo plant bounds".into()))?;
+    let place = LegacyIron3dEulerTransform {
+        translation: plant.position,
+        orientation_radians: plant.orientation_raw,
+    };
+    let [x, y, _] = place
+        .try_transform_scaled_point(bounds.bounding_sphere_center, plant.scale)
+        .ok_or_else(|| super::EngineError::Movement("invalid AutoDemo plant center".into()))?;
+    // shortcut: the root MSH sphere supplies the plant bounds until the assembled collider is available.
+    let scale = plant.scale.into_iter().map(f32::abs).fold(0.0, f32::max);
+    let radius = bounds.bounding_sphere_radius * scale;
+    // shortcut: isolated CRT state until AutoDemo shares the host's complete RNG call order.
+    *rng = rng.wrapping_mul(0x343fd).wrapping_add(0x269ec3);
+    let angle = (((*rng >> 16) & 0x7fff) % 360) as f32;
+    let (sin, cos) = angle.to_radians().sin_cos();
+    let [x, y] = [x + sin * radius, y + cos * radius];
+    let z = terrain
+        .height_at([x, y])
+        .map_err(super::EngineError::Terrain)?;
+    Ok([x, y, z.unwrap_or(0.0) + 2.0])
+}
 
 /// View selected by the AutoDemo clock.
 pub enum AutoDemoView {
@@ -46,18 +203,8 @@ pub fn autodemo_camera(engine: &Engine) -> Result<Option<AutoDemoCamera>, String
     else {
         return Ok(None);
     };
-    let parent = mission
-        .summary
-        .key
-        .rsplit_once(['/', '\\'])
-        .map(|(parent, _)| parent);
-    let cfg = parent.map_or_else(
-        || "mission.cfg".to_owned(),
-        |parent| format!("{parent}/mission.cfg"),
-    );
-    let path = normalize_engine_path("AutoDemo config", &cfg).map_err(|err| err.to_string())?;
     let vfs = engine.services.vfs.as_ref().ok_or("missing mission VFS")?;
-    let config = read_vfs(vfs, &path).map_err(|err| err.to_string())?;
+    let config = read_config(vfs, &mission.summary.key).map_err(|err| err.to_string())?;
     let durations_ms =
         read_intervals(&config).ok_or("invalid autoplay_settings camera intervals")?;
     let clan = mission
@@ -73,7 +220,7 @@ pub fn autodemo_camera(engine: &Engine) -> Result<Option<AutoDemoCamera>, String
     if !position.iter().all(|axis| axis.is_finite()) {
         return Err("non-finite AutoDemo camera origin".to_owned());
     }
-    // shortcut: use placed clan-0 units with camera points until live ownership
+    // shortcut: use initial clan-0 units with camera points until live ownership
     // and native eligibility are available for all units.
     let targets = mission
         .object_drafts
@@ -97,9 +244,17 @@ pub fn autodemo_camera(engine: &Engine) -> Result<Option<AutoDemoCamera>, String
 }
 
 fn read_intervals(bytes: &[u8]) -> Option<[u32; 3]> {
+    Some([
+        read_setting(bytes, "StrategyModeTime")?.checked_mul(1_000)?,
+        read_setting(bytes, "BirdModeTime")?.checked_mul(1_000)?,
+        read_setting(bytes, "CockpitModeTime")?.checked_mul(1_000)?,
+    ])
+}
+
+fn read_setting(bytes: &[u8], key: &str) -> Option<u32> {
     let source = String::from_utf8_lossy(bytes);
     let mut inside = false;
-    let mut result = [None; 3];
+    let mut result = None;
     for line in source.lines() {
         let line = line.split('#').next()?.trim();
         let mut words = line.split_whitespace();
@@ -119,19 +274,14 @@ fn read_intervals(bytes: &[u8]) -> Option<[u32; 3]> {
         if !inside {
             continue;
         }
-        let Some((key, value)) = line.split_once('=') else {
+        let Some((name, value)) = line.split_once('=') else {
             continue;
         };
-        for (name, duration) in ["StrategyModeTime", "BirdModeTime", "CockpitModeTime"]
-            .into_iter()
-            .zip(&mut result)
-        {
-            if key.trim().eq_ignore_ascii_case(name) {
-                *duration = Some(value.trim().parse::<u32>().ok()?.checked_mul(1_000)?);
-            }
+        if name.trim().eq_ignore_ascii_case(key) {
+            result = Some(value.trim().parse().ok()?);
         }
     }
-    Some([result[0]?, result[1]?, result[2]?])
+    result
 }
 
 impl AutoDemoCamera {

@@ -160,6 +160,21 @@ fn run(args: &[String]) -> Result<String, String> {
     let mission_assets_started = Instant::now();
     let loaded = load_requested_mission(&mut engine, &args).map_err(|error| error.to_string())?;
     if !args.viewer {
+        if args.mission_mode() == MissionMode::AutoDemo {
+            let roots = loaded_mission_object_drafts(&engine).unwrap_or_default();
+            eprintln!(
+                "sim_coverage autodemo_spawn_position_approx={} autodemo_replenishment_stub=1",
+                roots.len().saturating_sub(loaded.object_count)
+            );
+            for root in roots.iter().skip(loaded.object_count) {
+                eprintln!(
+                    "autodemo_reinforcement clan={} resource={} position={:?}",
+                    root.raw_after_resource,
+                    String::from_utf8_lossy(&root.resource_name_raw),
+                    root.position,
+                );
+            }
+        }
         for bundle in loaded_mission_script_bundles(&engine).unwrap_or_default() {
             if let MissionScriptInitExecution::Unsupported {
                 event_index,
@@ -278,7 +293,7 @@ fn run(args: &[String]) -> Result<String, String> {
         demo_camera,
         args.frames,
         &args.mission,
-        loaded.object_count,
+        loaded.registered_objects,
         args.readback_out.as_deref(),
         args.readback_sequence_out.as_deref(),
         args.validation,
@@ -302,16 +317,7 @@ fn log_mission_event_stop(stop: &MissionEventStop) {
 fn load_requested_mission(engine: &mut Engine, args: &Args) -> Result<LoadedMission, EngineError> {
     let request = MissionRequest {
         key: args.mission.clone(),
-        mode: if !args.viewer
-            && args
-                .mission
-                .replace('\\', "/")
-                .eq_ignore_ascii_case("MISSIONS/Autodemo.00/data.tma")
-        {
-            MissionMode::AutoDemo
-        } else {
-            MissionMode::SingleMission
-        },
+        mode: args.mission_mode(),
     };
     if !args.viewer {
         load_mission_with_init_stubs(
@@ -12345,6 +12351,19 @@ struct Args {
 }
 
 impl Args {
+    fn mission_mode(&self) -> MissionMode {
+        if !self.viewer
+            && self
+                .mission
+                .replace('\\', "/")
+                .eq_ignore_ascii_case("MISSIONS/Autodemo.00/data.tma")
+        {
+            MissionMode::AutoDemo
+        } else {
+            MissionMode::SingleMission
+        }
+    }
+
     fn parse(args: &[String]) -> Result<Self, String> {
         let mut root = None;
         let mut mission = None;
