@@ -2810,7 +2810,7 @@ pub fn step_headless(
         .as_mut()
         .and_then(|state| state.tick_mission_event(&engine.world, queue_time_ms));
     if let Some(loaded) = &mut engine.loaded {
-        loaded.tick_clan_ai_events(queue_time_ms);
+        loaded.tick_clan_ai_events(&engine.world, queue_time_ms);
     }
     let researched_component = engine
         .loaded

@@ -1,4 +1,6 @@
 use crate::{LoadedMissionState, MissionEventStop};
+use fparkan_script::{ScriptDispatchSelector, VarSetDefault};
+use fparkan_world::{OwnerId, World};
 use std::collections::BTreeMap;
 
 #[derive(Default)]
@@ -8,7 +10,7 @@ pub(super) struct ClanAiEvents {
 }
 
 impl LoadedMissionState {
-    pub(super) fn tick_clan_ai_events(&mut self, now_ms: u32) {
+    pub(super) fn tick_clan_ai_events(&mut self, world: &World, now_ms: u32) {
         let Some(varset) = &self.script_varset else {
             return;
         };
@@ -41,7 +43,31 @@ impl LoadedMissionState {
                 event,
                 bundle.formula_table.as_ref(),
                 &mut state.values,
-                |instruction, _| Err(format!("{:?}", instruction.dispatch_selector())),
+                |instruction, values| match instruction.dispatch_selector() {
+                    ScriptDispatchSelector::Handler(49) if instruction.references.is_empty() => {
+                        let slots = self
+                            .ai_startup_states
+                            .iter()
+                            .find(|state| state.clan_index == clan);
+                        Ok(Some(
+                            slots.map_or(0, |state| count_free_minds(&state.record_slots)),
+                        ))
+                    }
+                    ScriptDispatchSelector::Handler(34) => {
+                        let &[index] = instruction.references.as_slice() else {
+                            return Err("Handler(34) requires one DWORD operand".to_owned());
+                        };
+                        let Some(&VarSetDefault::Dword(class)) = values.get(index as usize) else {
+                            return Err("Handler(34) requires one DWORD operand".to_owned());
+                        };
+                        Ok(Some(self.mission_events.count_clan_class(
+                            world,
+                            OwnerId(clan as u16),
+                            class,
+                        )))
+                    }
+                    selector => Err(format!("{selector:?}")),
+                },
             );
             if let Err((instruction_index, reason)) = result {
                 let (stop, count) = self
@@ -67,6 +93,10 @@ impl LoadedMissionState {
             }
         }
     }
+}
+
+fn count_free_minds(slots: &[u32]) -> u32 {
+    slots.iter().filter(|&&word| word == u32::MAX).count() as u32
 }
 
 impl ClanAiEvents {
@@ -98,5 +128,11 @@ mod tests {
         assert!(!ai.due(1, 100_000, 113_999));
         assert!(ai.due(1, 100_000, 120_000));
         assert!(!ai.due(1, 100_000, 120_000));
+    }
+
+    #[test]
+    fn free_mind_count_uses_only_the_native_sentinel() {
+        assert_eq!(count_free_minds(&[]), 0);
+        assert_eq!(count_free_minds(&[u32::MAX, 0, u32::MAX, 1, 0xfffe]), 2);
     }
 }

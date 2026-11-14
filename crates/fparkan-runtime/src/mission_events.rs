@@ -152,6 +152,12 @@ pub(super) struct MissionEvents {
 }
 
 impl MissionEvents {
+    pub(super) fn count_clan_class(&self, world: &World, owner: OwnerId, class: u32) -> u32 {
+        clan_object_classes(&self.placed_clan_objects, world, owner)
+            .filter(|&candidate| candidate == class)
+            .count() as u32
+    }
+
     pub(super) fn set_reservation(
         &mut self,
         mission: &super::MissionDocument,
@@ -714,13 +720,11 @@ impl LoadedMissionState {
                 ScriptDispatchSelector::Handler(34) => {
                     let class = single_dword(instruction, values)
                         .ok_or("Handler(34) requires one DWORD operand")?;
-                    let count = clan_object_classes(
-                        &mission_events.placed_clan_objects,
+                    let count = mission_events.count_clan_class(
                         world,
                         OwnerId(bundle.clan_index as u16),
-                    )
-                    .filter(|&candidate| candidate == class)
-                    .count() as u32;
+                        class,
+                    );
                     Ok(Some(count))
                 }
                 ScriptDispatchSelector::Handler(52) => {
