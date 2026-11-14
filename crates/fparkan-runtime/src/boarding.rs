@@ -13,6 +13,7 @@ pub(super) const WARBOT_CLASS: u32 = 0x0100_8000;
 pub(super) struct Boarding {
     pub(super) cockpit: StartingCockpit,
     pub(super) hero: StartingCockpit,
+    pub(super) can_fly: bool,
 }
 
 /// The vehicle cockpit while the player is aboard.
@@ -83,6 +84,7 @@ pub fn board_friendly_warbot(engine: &mut Engine) -> Result<Option<StartingCockp
     let Some((_, cockpit, position)) = candidate else {
         return Ok(None);
     };
+    let can_fly = crate::player_motion::warbot_can_fly(engine, cockpit.object_index);
     set_transform(
         &mut engine.world,
         hero.handle,
@@ -92,7 +94,11 @@ pub fn board_friendly_warbot(engine: &mut Engine) -> Result<Option<StartingCockp
         },
     )?;
     if let Some(mission) = &mut engine.loaded {
-        mission.boarding = Some(Boarding { cockpit, hero });
+        mission.boarding = Some(Boarding {
+            cockpit,
+            hero,
+            can_fly,
+        });
         mission.player_pitch_bits = 0;
     }
     Ok(Some(cockpit))
@@ -122,6 +128,7 @@ pub fn disembark_warbot(engine: &mut Engine) -> Result<Option<StartingCockpit>, 
     let Some(Boarding {
         cockpit: vehicle,
         hero,
+        ..
     }) = mission.boarding
     else {
         return Ok(None);

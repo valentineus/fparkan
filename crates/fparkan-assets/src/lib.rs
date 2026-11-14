@@ -30,6 +30,8 @@ pub use fparkan_terrain_format::{BuildCategory, TerrainFormatError};
 use fparkan_texm::{decode_mip_rgba8, decode_texm, TexmDocument, TexmError};
 pub use fparkan_texm::{PageRect, RgbaImage};
 use fparkan_vfs::DirectoryVfs;
+mod chassis_profile;
+pub use chassis_profile::decode_chassis_can_fly;
 mod research;
 pub use research::{
     calc_full_research_cost, ResearchCandidate, ResearchCandidateSet, ResearchCost, ResearchError,

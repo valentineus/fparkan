@@ -1,5 +1,38 @@
 use super::{transform_state, Engine, EngineError, StartingCockpit, SurfaceQuery, TransformState};
 use crate::TerrainWorld;
+use fparkan_resource::{resource_name, CachedResourceRepository, ResourceRepository};
+
+pub(super) fn warbot_can_fly(engine: &crate::Engine, object_index: usize) -> bool {
+    let profile = || {
+        let draft = engine.loaded.as_ref()?.object_drafts.get(object_index)?;
+        let chassis = draft.unit_components.first()?;
+        let archive = crate::bounded_ascii_c_string(&chassis.archive_raw)?;
+        let registry_path = crate::normalize_engine_path("chassis archive", &archive).ok()?;
+        let resources = CachedResourceRepository::new(engine.services.vfs.as_ref()?.clone());
+        let registry = resources.open_archive(&registry_path).ok()?;
+        let name = crate::bounded_ascii_c_string(&chassis.resource_raw)?;
+        let entry = resources
+            .find(registry, &resource_name(name.as_bytes()))
+            .ok()??;
+        let references =
+            fparkan_prototype::decode_registry_entry(resources.read(entry).ok()?.as_slice())
+                .ok()?;
+        // AniMesh supplies the sixth resource pair to CreateBehaviour.
+        let profile = references.get(5)?;
+        let archive = crate::bounded_ascii_c_string(&profile.archive_raw)?;
+        let path = crate::normalize_engine_path("chassis profile archive", &archive).ok()?;
+        let name = crate::bounded_ascii_c_string(&profile.resource_raw)?;
+        let archive = resources.open_archive(&path).ok()?;
+        let entry = resources
+            .find(archive, &resource_name(name.as_bytes()))
+            .ok()??;
+        fparkan_assets::decode_chassis_can_fly(resources.read(entry).ok()?.as_slice()).ok()?
+    };
+    profile().unwrap_or_else(|| {
+        eprintln!("sim_coverage player_chassis_profile_stub=1 object={object_index}");
+        false
+    })
+}
 
 // shortcut: bound stair steps and drops until the native hero collider is wired.
 const STEP_UP: f32 = 0.85;
@@ -161,30 +194,9 @@ fn plan_player_steps(
     ) else {
         return Ok(None);
     };
-    let flying = mission.boarding.is_some_and(|boarding| {
-        boarding.cockpit.handle == cockpit.handle
-            && mission
-                .object_drafts
-                .get(cockpit.object_index)
-                .and_then(|draft| draft.unit_components.first())
-                .is_some_and(|chassis| {
-                    let key = chassis.resource_raw.split(|&byte| byte == 0).next();
-                    // shortcut: use the stock flying chassis until Behavior's CanFly is wired.
-                    matches!(
-                        key,
-                        Some(
-                            b"R_T_02"
-                                | b"R_L_02"
-                                | b"R_L_05"
-                                | b"R_L_07"
-                                | b"R_M_02"
-                                | b"R_B_02"
-                                | b"R_B_07"
-                                | b"R_B_08"
-                        )
-                    )
-                })
-    });
+    let flying = mission
+        .boarding
+        .is_some_and(|boarding| boarding.cockpit.handle == cockpit.handle && boarding.can_fly);
     if input.movement == [0.0; 2]
         && (!flying || input.climb == 0.0)
         && input.mouse_x == 0.0
