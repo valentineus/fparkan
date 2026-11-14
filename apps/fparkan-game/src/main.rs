@@ -163,7 +163,7 @@ fn run(args: &[String]) -> Result<String, String> {
         if args.mission_mode() == MissionMode::AutoDemo {
             let roots = loaded_mission_object_drafts(&engine).unwrap_or_default();
             eprintln!(
-                "sim_coverage autodemo_spawn_position_approx={} autodemo_replenishment_stub=1",
+                "sim_coverage autodemo_spawn_position_approx={} autodemo_replenishment_stub=1 autodemo_patrol_approx=1",
                 roots.len().saturating_sub(loaded.object_count)
             );
             for root in roots.iter().skip(loaded.object_count) {

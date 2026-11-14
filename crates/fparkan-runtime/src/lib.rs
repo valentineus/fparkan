@@ -47,6 +47,7 @@ mod mission_events;
 mod player_motion;
 mod player_weapon;
 mod projectile;
+mod unit_patrol;
 
 pub use autodemo::{autodemo_camera, AutoDemoCamera, AutoDemoView};
 pub use fparkan_assets::MissionAssets;
@@ -1017,8 +1018,7 @@ impl BehaviorWarmStartState {
         const BASE_INTERVAL_MS: u32 = 3 * 64;
         const JITTER_RANGE_MS: u32 = 64;
 
-        *rng_state = (*rng_state).wrapping_mul(0x343fd).wrapping_add(0x269ec3);
-        let random = (*rng_state >> 16) & 0x7fff;
+        let random = next_crt_rand(rng_state);
         let jitter_ms = ((random & 0xff) * JITTER_RANGE_MS) >> 8;
 
         Self {
@@ -1027,6 +1027,11 @@ impl BehaviorWarmStartState {
             cleared_words: [0; 5],
         }
     }
+}
+
+fn next_crt_rand(state: &mut u32) -> u32 {
+    *state = state.wrapping_mul(0x343fd).wrapping_add(0x269ec3);
+    (*state >> 16) & 0x7fff
 }
 
 fn behavior_elapsed_seconds(elapsed_ms: u32) -> f32 {
@@ -1305,6 +1310,7 @@ struct LoadedMissionState {
     script_init_states: Vec<MissionScriptInitState>,
     script_varset_states: Vec<MissionScriptVarSetState>,
     mission_events: MissionEvents,
+    unit_patrol: Option<unit_patrol::UnitPatrol>,
     player_pitch_bits: u32,
     script_host_mode: MissionMode,
     script_host_status: u32,
@@ -2270,6 +2276,9 @@ fn load_mission_with_options(
     } else {
         MissionEvents::default()
     };
+    let unit_patrol = (request.mode == MissionMode::AutoDemo && options.start_autodemo)
+        .then(|| unit_patrol::UnitPatrol::new(&mission, &object_drafts, &handles))
+        .flatten();
     engine.world = new_runtime_world;
     engine.behavior_rng_state = next_behavior_rng_state;
     engine.loaded = Some(LoadedMissionState {
@@ -2294,6 +2303,7 @@ fn load_mission_with_options(
         script_init_states: loaded_scripts.init_states,
         script_varset_states: loaded_scripts.varset_states,
         mission_events,
+        unit_patrol,
         player_pitch_bits: 0,
         script_host_mode: request.mode,
         // Fresh IGame construction seeds this field with 5; this is not the
@@ -2335,7 +2345,31 @@ pub fn step_headless(
     queue_time_ms: u32,
 ) -> Result<FrameResult, EngineError> {
     let resources = prepare_loaded_mission_resources(engine, queue_time_ms)?;
-    let snapshot = step(&mut engine.world, &input)?;
+    let patrol = engine
+        .loaded
+        .as_ref()
+        .and_then(|mission| {
+            mission
+                .unit_patrol
+                .as_ref()
+                .map(|patrol| patrol.prepare(&engine.world, &mission.terrain, queue_time_ms))
+        })
+        .transpose()?;
+    if let Some(patrol) = &patrol {
+        patrol.apply_poses(&mut engine.world)?;
+    }
+    let snapshot = match step(&mut engine.world, &input) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            if let Some(patrol) = patrol {
+                patrol.restore_poses(&mut engine.world)?;
+            }
+            return Err(error.into());
+        }
+    };
+    if let (Some(patrol), Some(mission)) = (patrol, &mut engine.loaded) {
+        mission.unit_patrol = Some(patrol.state);
+    }
     if let Some(resources) = resources {
         resources.apply(engine);
     }
@@ -15966,7 +16000,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
-    fn autodemo_registers_one_starting_reinforcement_per_clan() {
+    fn autodemo_registers_reinforcements_and_moves_six_patrolling_robots() {
         let vfs = Arc::new(DirectoryVfs::new(licensed_root("IS")));
         let mut engine = create(EngineServices::new(vfs)).unwrap();
         let loaded = load_mission_with_init_stubs(
@@ -15998,16 +16032,37 @@ mod tests {
             newcomers.push((handle, root.position.map(f32::to_bits)));
         }
         assert_eq!(extras.len(), 2);
-        for ms in [16, 1_000] {
-            let snapshot = frame(&mut engine, ms).unwrap().snapshot;
-            assert_eq!(snapshot.objects.len(), 10);
-            for (handle, position) in &newcomers {
-                assert!(snapshot
-                    .transforms
-                    .iter()
-                    .any(|(h, pose)| h == handle && &pose.position == position));
-            }
+        let start = frame(&mut engine, 0).unwrap().snapshot;
+        assert_eq!(start.objects.len(), 10);
+        for (handle, position) in newcomers {
+            assert!(start
+                .transforms
+                .iter()
+                .any(|(h, pose)| *h == handle && pose.position == position));
         }
+        for tick in 1..=300 {
+            frame(&mut engine, tick * 1000 / 60).unwrap();
+        }
+        let later = frame(&mut engine, 5_000).unwrap().snapshot;
+        assert_eq!(later.objects.len(), 10);
+        let moved: Vec<_> = start
+            .transforms
+            .iter()
+            .filter_map(|(handle, before)| {
+                let after = later.transforms.iter().find(|(h, _)| h == handle)?.1;
+                let [x0, y0, _] = before.position.map(f32::from_bits);
+                let [x1, y1, _] = after.position.map(f32::from_bits);
+                let distance = (x1 - x0).hypot(y1 - y0);
+                (distance > 0.0).then_some(distance)
+            })
+            .collect();
+        assert_eq!(moved.len(), 6, "all six starting robots should patrol");
+        assert!(
+            moved
+                .iter()
+                .all(|distance| (10.0..=45.01).contains(distance)),
+            "{moved:?}"
+        );
     }
 
     #[test]

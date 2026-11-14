@@ -13,7 +13,7 @@ const PITCH: f32 = 1.25;
 const YAW: f32 = std::f32::consts::FRAC_PI_2;
 const FOLLOW_DISTANCE: f32 = 30.0;
 const PLANT_CLASS: u32 = 0x8000_0010;
-const MOBILE_UNIT: u32 = 0x0100_0000;
+pub(super) const MOBILE_UNIT: u32 = 0x0100_0000;
 
 pub(super) fn read_config(
     vfs: &Arc<dyn Vfs>,
@@ -156,8 +156,7 @@ pub(super) fn reinforcement_position(
     let scale = plant.scale.into_iter().map(f32::abs).fold(0.0, f32::max);
     let radius = bounds.bounding_sphere_radius * scale;
     // shortcut: isolated CRT state until AutoDemo shares the host's complete RNG call order.
-    *rng = rng.wrapping_mul(0x343fd).wrapping_add(0x269ec3);
-    let angle = (((*rng >> 16) & 0x7fff) % 360) as f32;
+    let angle = (super::next_crt_rand(rng) % 360) as f32;
     let (sin, cos) = angle.to_radians().sin_cos();
     let [x, y] = [x + sin * radius, y + cos * radius];
     let z = terrain

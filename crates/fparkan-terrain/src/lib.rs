@@ -244,6 +244,12 @@ impl TerrainWorld {
                     .iter()
                     .map(|vertex| [vertex[0], vertex[1]])
                     .collect(),
+                edge_neighbors: areal
+                    .links
+                    .iter()
+                    .take(areal.vertices.len())
+                    .map(|link| link.area_ref)
+                    .collect(),
             });
         }
 
@@ -404,6 +410,20 @@ impl TerrainWorld {
     #[must_use]
     pub fn areal_count(&self) -> usize {
         self.areals.len()
+    }
+
+    /// Returns the midpoint of the boundary edge linking two consecutive areas.
+    /// Links through polygon slots have no boundary midpoint.
+    #[must_use]
+    pub fn route_crossing(&self, from: ArealId, to: ArealId) -> Option<[f32; 2]> {
+        let area = self.areals.get(from.0 as usize)?;
+        let edge = area
+            .edge_neighbors
+            .iter()
+            .position(|neighbor| *neighbor == Some(to.0))?;
+        let a = area.polygon[edge];
+        let b = area.polygon[(edge + 1) % area.polygon.len()];
+        Some([(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5])
     }
 
     /// Returns the number of surface triangles.
@@ -889,6 +909,7 @@ impl RuntimeTriangle {
 struct RuntimeAreal {
     id: ArealId,
     polygon: Vec<[f32; 2]>,
+    edge_neighbors: Vec<Option<u32>>,
 }
 
 impl RuntimeAreal {
@@ -1188,6 +1209,10 @@ mod tests {
         let world = TerrainWorld::from_land_map(&map).expect("world");
 
         assert_eq!(world.areal_count(), 2);
+        assert_eq!(
+            world.route_crossing(ArealId(0), ArealId(1)),
+            Some([1.0, 0.5])
+        );
         assert_eq!(
             world.locate_areal([0.25, 0.25, 41.0]).expect("locate"),
             Some(ArealId(0))
