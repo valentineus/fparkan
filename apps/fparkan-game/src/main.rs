@@ -10549,10 +10549,11 @@ impl StaticVulkanApp {
                 continue;
             };
             eprintln!(
-                "player_shot slot={} projectile={}:{} queue_time_ms={clock_ms} muzzle={muzzle:?}",
+                "player_shot slot={} projectile={}:{} queue_time_ms={clock_ms} muzzle={muzzle:?} rounds_remaining={:?}",
                 slot + 1,
                 weapon.projectile_archive,
-                weapon.projectile
+                weapon.projectile,
+                weapon.rounds_remaining(),
             );
             if let Some(draw) = self.projectile_draws.get_mut(slot).and_then(Option::as_mut) {
                 if let Some(instance) = draw

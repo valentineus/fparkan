@@ -20,6 +20,7 @@ pub struct PlayerWeapon {
     pub muzzle: PreparedControlPoint,
     /// Optional type-4 effect started by this weapon.
     pub effect: Option<(String, String)>,
+    rounds_remaining: Option<u32>,
     interval_ms: u32,
     last_fire_ms: Option<u32>,
 }
@@ -51,7 +52,10 @@ impl PlayerWeapons {
             .iter_mut()
             .enumerate()
             .filter_map(move |(index, weapon)| {
-                if !trigger || selected.is_some_and(|selected| selected != index) {
+                if !trigger
+                    || selected.is_some_and(|selected| selected != index)
+                    || weapon.rounds_remaining == Some(0)
+                {
                     return None;
                 }
                 if weapon
@@ -61,12 +65,20 @@ impl PlayerWeapons {
                     return None;
                 }
                 weapon.last_fire_ms = Some(clock_ms);
+                if let Some(rounds) = &mut weapon.rounds_remaining {
+                    *rounds -= 1;
+                }
                 Some((index, &*weapon))
             })
     }
 }
 
 impl PlayerWeapon {
+    /// Remaining shots, or `None` for an unlimited weapon.
+    pub fn rounds_remaining(&self) -> Option<u32> {
+        self.rounds_remaining
+    }
+
     /// Smallest separation between consecutive shots on the current queue clock.
     pub fn interval_ms(&self) -> u32 {
         self.interval_ms
@@ -124,6 +136,14 @@ fn prepare_weapons(control: &PreparedComponentControl) -> Vec<PlayerWeapon> {
             if !interval_ms.is_finite() || interval_ms < 0.0 {
                 return None;
             }
+            let rounds = f32::from_bits(record.fixed_words[11]).round_ties_even();
+            let rounds_remaining = if rounds == -1.0 {
+                None
+            } else if (0.0..2_147_483_648.0).contains(&rounds) {
+                Some(rounds as u32)
+            } else {
+                return None;
+            };
             let effect = match &control.effect_section {
                 PreparedControlEffectSection::Parsed(rows) => control
                     .node_effect_links
@@ -149,6 +169,7 @@ fn prepare_weapons(control: &PreparedComponentControl) -> Vec<PlayerWeapon> {
                 projectile_archive,
                 muzzle: muzzle.clone(),
                 effect,
+                rounds_remaining,
                 // shortcut: begin the next cycle after the two configured
                 // waits and a 60 Hz step for each of the four native phases.
                 interval_ms: (interval_ms + 4.0 * (1000.0 / 60.0)).ceil() as u32,
@@ -166,8 +187,8 @@ mod tests {
     fn trigger_respects_selection_and_independent_weapon_waits() {
         let mut weapons = PlayerWeapons {
             selected: None,
-            weapons: [100, 250]
-                .map(|interval_ms| PlayerWeapon {
+            weapons: [(100, Some(2)), (250, None)]
+                .map(|(interval_ms, rounds_remaining)| PlayerWeapon {
                     projectile: String::from("test"),
                     projectile_archive: String::from("test.rlb"),
                     muzzle: PreparedControlPoint {
@@ -179,6 +200,7 @@ mod tests {
                         name: [0; 32],
                     },
                     effect: None,
+                    rounds_remaining,
                     interval_ms,
                     last_fire_ms: None,
                 })
@@ -194,10 +216,13 @@ mod tests {
         assert_eq!(fired(true, 0), [0, 1]);
         assert!(fired(true, 99).is_empty());
         assert_eq!(fired(true, 100), [0]);
+        assert_eq!(weapons.weapons()[0].rounds_remaining(), Some(0));
         weapons.select(2);
         assert!(weapons.fire(true, 249).next().is_none());
         assert_eq!(weapons.fire(true, 250).next().unwrap().0, 1);
         weapons.select(0);
-        assert_eq!(weapons.fire(true, 251).next().unwrap().0, 0);
+        assert!(weapons.fire(true, 251).next().is_none());
+        assert_eq!(weapons.fire(true, 500).next().unwrap().0, 1);
+        assert_eq!(weapons.weapons()[1].rounds_remaining(), None);
     }
 }

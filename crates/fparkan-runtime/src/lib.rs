@@ -17238,6 +17238,14 @@ mod tests {
             .map(|weapon| weapon.projectile.as_str())
             .collect::<Vec<_>>();
         assert_eq!(projectiles, ["bb_h_01", "bp_h_01", "bl_h_01", "bm_h_01"]);
+        assert_eq!(
+            weapons
+                .weapons()
+                .iter()
+                .map(player_weapon::PlayerWeapon::rounds_remaining)
+                .collect::<Vec<_>>(),
+            [Some(500), Some(150), None, Some(4)]
+        );
         for (weapon, (speed, lifetime_ms)) in weapons.weapons().iter().zip([
             (350.0, 1000),
             (150.0, 5000),
