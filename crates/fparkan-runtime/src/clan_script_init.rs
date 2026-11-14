@@ -67,6 +67,7 @@ pub(super) fn unit_order(
 pub(super) fn stubbed_handler(
     instruction: &ScriptInstruction,
     values: &[VarSetDefault],
+    declarations: &VarSet,
 ) -> Option<u8> {
     match (instruction.header_words, instruction.references.as_slice()) {
         // shortcut: resume Init until the live research context is wired.
@@ -86,6 +87,17 @@ pub(super) fn stubbed_handler(
         {
             Some(69)
         }
+        // shortcut: resume Init until the search and capture task is wired.
+        ([15, u32::MAX, u32::MAX, u32::MAX, 6, 10, u32::MAX], _) => {
+            let order = declarations
+                .resolve_handler15_with_values(instruction, values)
+                .ok()?;
+            matches!(
+                (order.word_1, order.word_2, order.target),
+                (5, 3, Handler15TargetPayload::ByType(0x8000_0002))
+            )
+            .then_some(15)
+        }
         _ => None,
     }
 }
@@ -100,9 +112,10 @@ mod tests {
             header_words: [43, u32::MAX, u32::MAX, u32::MAX, 6, 0, u32::MAX],
             references: Vec::new(),
         };
-        assert_eq!(stubbed_handler(&instruction, &[]), Some(43));
+        let declarations = fparkan_script::parse_varset(b"").unwrap();
+        assert_eq!(stubbed_handler(&instruction, &[], &declarations), Some(43));
         instruction.header_words[1] = 0;
-        assert_eq!(stubbed_handler(&instruction, &[]), None);
+        assert_eq!(stubbed_handler(&instruction, &[], &declarations), None);
     }
 
     #[test]
@@ -112,13 +125,17 @@ mod tests {
             references: vec![0],
         };
         let values = [VarSetDefault::FloatBits(500.0_f32.to_bits())];
-        assert_eq!(stubbed_handler(&instruction, &values), Some(68));
+        let declarations = fparkan_script::parse_varset(b"").unwrap();
         assert_eq!(
-            stubbed_handler(&instruction, &[VarSetDefault::Dword(500)]),
+            stubbed_handler(&instruction, &values, &declarations),
+            Some(68)
+        );
+        assert_eq!(
+            stubbed_handler(&instruction, &[VarSetDefault::Dword(500)], &declarations),
             None
         );
         instruction.header_words[1] = 0;
-        assert_eq!(stubbed_handler(&instruction, &values), None);
+        assert_eq!(stubbed_handler(&instruction, &values, &declarations), None);
     }
 
     #[test]
@@ -128,13 +145,17 @@ mod tests {
             references: vec![0],
         };
         let values = [VarSetDefault::Dword(15)];
-        assert_eq!(stubbed_handler(&instruction, &values), Some(69));
+        let declarations = fparkan_script::parse_varset(b"").unwrap();
         assert_eq!(
-            stubbed_handler(&instruction, &[VarSetDefault::FloatBits(0)]),
+            stubbed_handler(&instruction, &values, &declarations),
+            Some(69)
+        );
+        assert_eq!(
+            stubbed_handler(&instruction, &[VarSetDefault::FloatBits(0)], &declarations),
             None
         );
         instruction.header_words[1] = 0;
-        assert_eq!(stubbed_handler(&instruction, &values), None);
+        assert_eq!(stubbed_handler(&instruction, &values, &declarations), None);
     }
 
     #[test]

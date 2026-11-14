@@ -8198,7 +8198,9 @@ fn resolve_init_states(
                         });
                         return Some(None);
                     }
-                    if let Some(handler) = clan_script_init::stubbed_handler(instruction, values) {
+                    if let Some(handler) =
+                        clan_script_init::stubbed_handler(instruction, values, &varset.declarations)
+                    {
                         bundle.init_stubs.push((index, handler));
                         return Some(None);
                     }
