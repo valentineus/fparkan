@@ -13,7 +13,7 @@ use fparkan_world::{
     handle_by_original_id, identity_metadata, registration_sequence, set_owner, transform_state,
     ObjectHandle, OriginalObjectId, OwnerId, World,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 const MOBILE_HQ_CLASS: u32 = 0x0101_0000;
 const MAIN_TELEPORT_CLASS: u32 = 0x8000_0200;
@@ -148,6 +148,8 @@ pub(super) struct MissionEvents {
     voiced_messages: HashSet<u32>,
     reserved_units: HashSet<(usize, ObjectHandle)>,
     placed_clan_objects: Vec<(ObjectHandle, u32)>,
+    issued_logic_ids: HashMap<ObjectHandle, u32>,
+    next_logic_id: u32,
     objectives: MissionObjectives,
 }
 
@@ -198,9 +200,61 @@ impl MissionEvents {
                 if identity.owner_id != Some(OwnerId(clan as u16)) {
                     return None;
                 }
-                let object = mission.objects.get(identity.original_id?.0 as usize)?;
-                Some(object.identity_or_clan_raw)
+                self.issued_logic_ids.get(&handle).copied().or_else(|| {
+                    mission
+                        .objects
+                        .get(identity.original_id?.0 as usize)
+                        .map(|object| object.identity_or_clan_raw)
+                })
             })
+    }
+
+    pub(super) fn logic_objects<'a>(
+        &'a self,
+        mission: &'a super::MissionDocument,
+        world: &'a World,
+        id: u32,
+    ) -> impl Iterator<Item = ObjectHandle> + 'a {
+        placed_logic_objects(mission, world, id).chain(self.issued_logic_ids.iter().filter_map(
+            move |(&handle, &issued)| {
+                (issued == id
+                    && registration_sequence(world, handle)
+                        .ok()
+                        .flatten()
+                        .is_some())
+                .then_some(handle)
+            },
+        ))
+    }
+
+    pub(super) fn issue_logic_id(
+        &mut self,
+        mission: &super::MissionDocument,
+        world: &World,
+        handle: ObjectHandle,
+    ) -> u32 {
+        self.issued_logic_ids
+            .retain(|&unit, _| registration_sequence(world, unit).ok().flatten().is_some());
+        if let Some(&id) = self.issued_logic_ids.get(&handle) {
+            return id;
+        }
+        // shortcut: allocate an internal script ID until native registration numbers are recovered.
+        loop {
+            self.next_logic_id = self.next_logic_id.wrapping_add(1) & 0x7fff_ffff;
+            if self.next_logic_id != 0
+                && !mission
+                    .objects
+                    .iter()
+                    .any(|object| object.identity_or_clan_raw == self.next_logic_id)
+                && !self
+                    .issued_logic_ids
+                    .values()
+                    .any(|&id| id == self.next_logic_id)
+            {
+                self.issued_logic_ids.insert(handle, self.next_logic_id);
+                return self.next_logic_id;
+            }
+        }
     }
 
     pub(super) fn set_reservation(

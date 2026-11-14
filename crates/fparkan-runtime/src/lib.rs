@@ -54,6 +54,7 @@ mod clan_transport_schemes;
 mod mesh_collision;
 mod mining;
 mod mission_events;
+mod ore_transport;
 mod player_motion;
 mod player_status;
 mod player_weapon;
@@ -2951,6 +2952,7 @@ pub struct SimulationReport {
     pub script_group_orders: Vec<(usize, u32, u64)>,
     pub script_problem_waits: Vec<(usize, u32, u64)>,
     pub script_factory_patrol_continues: Vec<(usize, u32, u64)>,
+    pub script_ore_transport_orders: Vec<(usize, u32, u64)>,
     pub script_capturer_queries: Vec<(usize, u64)>,
     pub script_capture_approaches: Vec<(u32, u32, u64)>,
     /// First factory completion by clan, in milliseconds.
@@ -3002,6 +3004,7 @@ pub fn simulate_mission_report(
         script_group_orders: Vec::new(),
         script_problem_waits: Vec::new(),
         script_factory_patrol_continues: Vec::new(),
+        script_ore_transport_orders: Vec::new(),
         script_capturer_queries: Vec::new(),
         script_capture_approaches: Vec::new(),
         first_factory_completion_ms: Default::default(),
@@ -3104,6 +3107,9 @@ pub fn simulate_mission_report(
         report
             .script_factory_patrol_continues
             .extend(loaded.clan_ai_events.patrol_continues());
+        report
+            .script_ore_transport_orders
+            .extend(loaded.clan_ai_events.transport_orders());
         report
             .script_capturer_queries
             .extend(loaded.clan_ai_events.capturer_queries());

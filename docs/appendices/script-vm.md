@@ -2433,7 +2433,8 @@ through x87 scalar helper `0x10013190`, then reads the mode through
 
 The shipped `varset.var` names the only observed mode values: `NONE=0` uses
 9 total references; `TARGET_BY_LOGIC_ID=0x0201`, `TARGET_BY_TYPE=0x0203`,
-`TARGET_NOT_DEFINED=0x0204`, and `TARGET_BY_NAME=0x0205` use 10; and
+`TARGET_BY_NAME=0x0205` use 10; `TARGET_NOT_DEFINED=0x0204` allows 9
+or 10 (the transport order in `scream.scr` has 9); and
 `TARGET_BY_PLACE=0x0202` uses 11. The corpus contains 34/122/80 records in
 these three arities. The trailing references at positions 9 and, only for
 `TARGET_BY_PLACE`, 10 are all in-range DWORD declarations.

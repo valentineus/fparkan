@@ -103,6 +103,14 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) {
         !group.members.is_empty()
     });
     let ai = &mut loaded.clan_ai_events;
+    ai.transports.retain_mut(|(_, transport)| {
+        transport.tick(
+            &engine.world,
+            &mut loaded.behavior_ore_states,
+            &mut loaded.unit_patrol,
+            now_ms,
+        )
+    });
     ai.waits.retain(|&(clan, key), conditions| {
         let group = ai.groups.get(&(clan, key));
         let lost_building = key.word_0 == BUILDING_PROTECT
@@ -121,6 +129,7 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) {
                 OwnerId(clan as u16),
                 loaded.unit_patrol.as_ref(),
                 group,
+                |unit| ai.transports.iter().any(|(job, task)| *job == (clan, key) && task.unit == unit),
             )
         });
         if ready {
@@ -214,6 +223,11 @@ pub(super) struct ClanAiEvents {
     base_radius_limits: BTreeMap<usize, f32>,
     capturer_queries: BTreeMap<usize, u64>,
     capture_orders: Vec<(OwnerId, Handler2RecordKey, CaptureApproach)>,
+    transports: Vec<(
+        (usize, Handler2RecordKey),
+        crate::ore_transport::OreTransport,
+    )>,
+    transport_orders: BTreeMap<(usize, u32), u64>,
     capture_approaches: BTreeMap<(u32, u32), u64>,
     groups: BTreeMap<(usize, Handler2RecordKey), CombatGroup>,
     waits: BTreeMap<(usize, Handler2RecordKey), Vec<Condition>>,
@@ -523,6 +537,25 @@ impl LoadedMissionState {
                                 .declarations
                                 .resolve_handler15_with_values(instruction, values)
                                 .map_err(|error| error.to_string())?;
+                            if let (6, 3, Handler15TargetPayload::NotDefined(_), Some(problem)) =
+                                (order.word_1, order.word_2, order.target, problem.as_ref())
+                            {
+                                let owner = OwnerId(clan as u16);
+                                let Some(unit) = assignment.filter(|&unit| self.mission_events
+                                    .logic_objects(&self.mission, world, order.word_0)
+                                    .any(|handle| handle == unit)) else {
+                                    return Err("Handler(15) transport requires the assigned unit".into());
+                                };
+                                if problem.key.word_0 != OPTIMAL_TRANSPORT
+                                    || !self.behavior_ore_states.iter().any(|ore| ore.handle == unit && ore.class_flags == TRANSPORT_CLASS)
+                                {
+                                    return Err("Handler(15) transport requires an ore transport".into());
+                                }
+                                self.clan_ai_events.transports.push(((clan, problem.key), crate::ore_transport::OreTransport::new(unit, owner, now_ms)));
+                                *self.clan_ai_events.transport_orders.entry((clan, unit.slot)).or_default() += 1;
+                                eprintln!("sim_coverage script_ore_transport_approx=1 clan={clan} unit={} id={} queue_time_ms={now_ms}", unit.slot, order.word_0);
+                                return Ok(Some(VarSetDefault::Dword(1)));
+                            }
                             if let (0x11, 3, Handler15TargetPayload::ByLogicId(target_id)) =
                                 (order.word_1, order.word_2, order.target)
                             {
@@ -623,7 +656,7 @@ impl LoadedMissionState {
                                         .into(),
                                 );
                             }
-                            assignment = crate::mission_events::placed_logic_objects(
+                            assignment = self.mission_events.logic_objects(
                                 &self.mission,
                                 world,
                                 id,
@@ -689,6 +722,12 @@ impl LoadedMissionState {
                             };
                             let key = problem.as_ref().expect("condition requires a problem").key;
                             let condition = match (action, mode) {
+                                (2, 0) if key.word_0 == OPTIMAL_TRANSPORT && solving => {
+                                    let unit = assignment.filter(|&unit| self.mission_events
+                                        .logic_objects(&self.mission, world, id).any(|handle| handle == unit))
+                                        .ok_or("Handler(27) transport wait requires the assigned unit")?;
+                                    Some(Condition::TransportInactive(unit))
+                                }
                                 (1 | 3, 0) if matches!(key.word_0, 7 | 9) || (action == 1 && key.word_0 == BUILDING_PROTECT) => {
                                     let target = crate::mission_events::placed_logic_objects(
                                         &self.mission, world, id
@@ -760,11 +799,6 @@ impl LoadedMissionState {
                             let id = self.mission_events.first_available_placed_unit(
                                 &self.mission, world, clan, class,
                             );
-                            if class == TRANSPORT_CLASS && id.is_none()
-                                && self.mission_events.count_clan_class(world, OwnerId(clan as u16), class) != 0
-                            {
-                                return Err("Handler(14) needs a runtime logic ID for the produced transport".into());
-                            }
                             Ok(Some(VarSetDefault::Dword(id.unwrap_or(u32::MAX))))
                         }
                         ScriptDispatchSelector::Handler(29) => {
@@ -1153,6 +1187,12 @@ impl ClanAiEvents {
         self.group_orders
             .iter()
             .map(|(&(clan, target), &count)| (clan, target, count))
+    }
+
+    pub(super) fn transport_orders(&self) -> impl Iterator<Item = (usize, u32, u64)> + '_ {
+        self.transport_orders
+            .iter()
+            .map(|(&(clan, unit), &count)| (clan, unit, count))
     }
 
     pub(super) fn set_base_radius(&mut self, clan: usize, limit: f32) {

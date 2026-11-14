@@ -276,6 +276,26 @@ impl Production {
             position,
             self.controls[order.slot - self.reserve_start].clone(),
         )?;
+        let draft = &mission.object_drafts[order.slot];
+        if draft.unit_dat_header_flags == Some(crate::clan_transport_schemes::TRANSPORT_CLASS) {
+            let id = draft
+                .original_id
+                .expect("prepared factory object has an ID");
+            mission
+                .mission_events
+                .issue_logic_id(&mission.mission, world, handle);
+            mission
+                .behavior_ore_states
+                .retain(|ore| ore.original_id != id);
+            mission
+                .behavior_ore_states
+                .push(crate::initialize_behavior_ore_state(
+                    id,
+                    handle,
+                    crate::clan_transport_schemes::TRANSPORT_CLASS,
+                    &draft.properties,
+                ));
+        }
         if order.paid.is_none() {
             let (_, count) = self
                 .plants
@@ -810,6 +830,46 @@ mod tests {
                 && (cargo_slots..cargo_slots + RESERVE_SLOTS).contains(&index)),
             "{completed:?}"
         );
+        let transport = completed
+            .iter()
+            .find_map(|&(clan, index)| {
+                (clan == 1 && (cargo_slots..cargo_slots + RESERVE_SLOTS).contains(&index))
+                    .then_some(index)
+            })
+            .unwrap();
+        let draft = &engine.loaded.as_ref().unwrap().object_drafts[transport];
+        let id = draft.original_id.unwrap();
+        let handle = handle_by_original_id(&engine.world, id).unwrap();
+        let storage = engine
+            .loaded
+            .as_ref()
+            .unwrap()
+            .behavior_ore_states
+            .iter()
+            .find(|ore| {
+                ore.class_flags == 0x8000_0008
+                    && identity_metadata(&engine.world, ore.handle)
+                        .unwrap()
+                        .owner_id
+                        == Some(OwnerId(1))
+            })
+            .unwrap();
+        let storage_handle = storage.handle;
+        let initial_stock = f32::from_bits(storage.current_ore_bits);
+        for time in ((40_000 + duration + 2016)..=175_000).step_by(200) {
+            step_headless(&mut engine, InputSnapshot::default(), time).unwrap();
+            let loaded = engine.loaded.as_ref().unwrap();
+            if loaded.behavior_ore_states.iter().any(|ore| {
+                ore.handle == storage_handle && f32::from_bits(ore.current_ore_bits) > initial_stock
+            }) {
+                assert!(loaded
+                    .clan_ai_events
+                    .transport_orders()
+                    .any(|(clan, unit, _)| clan == 1 && unit == handle.slot));
+                return;
+            }
+        }
+        panic!("transport should unload ore into the enemy storage");
     }
 
     #[test]

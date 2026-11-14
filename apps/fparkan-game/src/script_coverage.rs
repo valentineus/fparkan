@@ -42,6 +42,9 @@ pub(super) fn log_clan_ai_stops(report: &SimulationReport) {
     for &(clan, target, count) in &report.script_factory_patrol_continues {
         eprintln!("sim_coverage script_factory_patrol_continue_approx={count} clan={clan} target={target}");
     }
+    for &(clan, unit, count) in &report.script_ore_transport_orders {
+        eprintln!("sim_coverage script_ore_transport_approx={count} clan={clan} unit={unit}");
+    }
     for &(clan, count) in &report.script_capturer_queries {
         eprintln!("sim_coverage script_nearest_capturer_approx={count} clan={clan}");
     }

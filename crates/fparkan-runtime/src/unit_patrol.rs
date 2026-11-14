@@ -269,6 +269,11 @@ impl UnitPatrol {
             .any(|unit| unit.handle == handle && unit.destinations.is_some())
     }
 
+    pub(super) fn clear_move(&mut self, handle: ObjectHandle) {
+        self.units
+            .retain(|unit| unit.handle != handle || unit.destinations.is_none());
+    }
+
     pub(super) fn raid_factory(&self, handle: ObjectHandle) -> Option<(ObjectHandle, usize)> {
         self.units
             .iter()

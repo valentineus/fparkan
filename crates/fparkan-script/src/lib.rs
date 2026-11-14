@@ -81,7 +81,7 @@ pub enum Handler15TargetPayload {
     },
     /// `TARGET_BY_TYPE` (`0x0203`): one DWORD payload.
     ByType(u32),
-    /// `TARGET_NOT_DEFINED` (`0x0204`): one DWORD payload.
+    /// `TARGET_NOT_DEFINED` (`0x0204`): optional legacy operand, zero when absent.
     NotDefined(u32),
     /// `TARGET_BY_NAME` (`0x0205`): one DWORD payload.
     ByName(u32),
@@ -1286,7 +1286,11 @@ impl VarSet {
                 second: dword(10)?,
             },
             0x0203 => Handler15TargetPayload::ByType(dword(9)?),
-            0x0204 => Handler15TargetPayload::NotDefined(dword(9)?),
+            0x0204 => Handler15TargetPayload::NotDefined(if instruction.references.len() == 9 {
+                0
+            } else {
+                dword(9)?
+            }),
             0x0205 => Handler15TargetPayload::ByName(dword(9)?),
             mode => return Err(Handler15ResolveError::UnsupportedTargetMode(mode)),
         };
