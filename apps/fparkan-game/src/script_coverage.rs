@@ -30,6 +30,9 @@ pub(super) fn log_clan_ai_stops(report: &SimulationReport) {
     for &(clan, target, count) in &report.script_group_orders {
         eprintln!("sim_coverage script_group_order_approx={count} clan={clan} target={target}");
     }
+    for &(clan, problem, count) in &report.script_problem_waits {
+        eprintln!("sim_coverage script_problem_wait_approx={count} clan={clan} problem={problem}");
+    }
     for &(clan, count) in &report.script_capturer_queries {
         eprintln!("sim_coverage script_nearest_capturer_approx={count} clan={clan}");
     }

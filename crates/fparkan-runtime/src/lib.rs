@@ -47,6 +47,7 @@ mod building_door;
 mod clan_ai_events;
 mod clan_combat_groups;
 mod clan_combat_strength;
+mod clan_problem_conditions;
 mod clan_script_init;
 mod clan_targeting;
 mod mesh_collision;
@@ -2931,6 +2932,7 @@ pub struct SimulationReport {
     pub script_capture_queries: Vec<(usize, u64)>,
     pub script_attack_queries: Vec<(usize, u64)>,
     pub script_group_orders: Vec<(usize, u32, u64)>,
+    pub script_problem_waits: Vec<(usize, u32, u64)>,
     pub script_capturer_queries: Vec<(usize, u64)>,
     pub script_capture_approaches: Vec<(u32, u32, u64)>,
     /// First factory completion by clan, in milliseconds.
@@ -2978,6 +2980,7 @@ pub fn simulate_mission_report(
         script_capture_queries: Vec::new(),
         script_attack_queries: Vec::new(),
         script_group_orders: Vec::new(),
+        script_problem_waits: Vec::new(),
         script_capturer_queries: Vec::new(),
         script_capture_approaches: Vec::new(),
         first_factory_completion_ms: Default::default(),
@@ -3068,6 +3071,9 @@ pub fn simulate_mission_report(
         report
             .script_group_orders
             .extend(loaded.clan_ai_events.group_orders());
+        report
+            .script_problem_waits
+            .extend(loaded.clan_ai_events.wait_starts());
         report
             .script_capturer_queries
             .extend(loaded.clan_ai_events.capturer_queries());

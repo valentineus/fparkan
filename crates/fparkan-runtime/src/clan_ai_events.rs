@@ -1,3 +1,4 @@
+use crate::clan_problem_conditions::Condition;
 use crate::{clan_combat_groups::CombatGroup, clan_targeting::CaptureApproach};
 use crate::{BehaviorOreState, LoadedMissionState, MissionEventStop};
 use fparkan_script::{
@@ -60,12 +61,13 @@ pub(super) fn resolve_captures(
             }
         }
         loaded.clan_ai_events.capture_orders.remove(index);
-        if let Some(queue) = loaded
-            .clan_ai_events
-            .problems
-            .get_mut(&usize::from(owner.0))
-        {
-            queue.remove(key);
+        let clan = usize::from(owner.0);
+        let ai = &mut loaded.clan_ai_events;
+        if !valid_unit || !ai.waits.contains_key(&(clan, key)) {
+            if let Some(queue) = ai.problems.get_mut(&clan) {
+                queue.remove(key);
+            }
+            ai.waits.remove(&(clan, key));
         }
     }
     Ok(captured)
@@ -95,6 +97,34 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) {
                     .is_some_and(|patrol| patrol.has_object_order(member, group.target))
         });
         !group.members.is_empty()
+    });
+    let ai = &mut loaded.clan_ai_events;
+    ai.waits.retain(|&(clan, key), conditions| {
+        let group = ai.groups.get(&(clan, key));
+        let ready = conditions.iter().any(|&condition| {
+            condition.met(
+                &engine.world,
+                OwnerId(clan as u16),
+                loaded.unit_patrol.as_ref(),
+                group,
+            )
+        });
+        if ready {
+            if let Some(queue) = ai.problems.get_mut(&clan) {
+                queue.remove(key);
+            }
+            if let Some(group) = ai.groups.remove(&(clan, key)) {
+                if let Some(patrol) = &mut loaded.unit_patrol {
+                    for member in group.members {
+                        patrol.clear_object_order(member, group.target);
+                    }
+                }
+            }
+            eprintln!("script_problem_condition_met clan={clan} problem={} target={} queue_time_ms={now_ms}", key.word_0, key.argument_0);
+            false
+        } else {
+            true
+        }
     });
     let active = &mut loaded.clan_ai_events.factory_jobs;
     active.retain(|((clan, _), plant)| {
@@ -169,6 +199,8 @@ pub(super) struct ClanAiEvents {
     capture_orders: Vec<(OwnerId, Handler2RecordKey, CaptureApproach)>,
     capture_approaches: BTreeMap<(u32, u32), u64>,
     groups: BTreeMap<(usize, Handler2RecordKey), CombatGroup>,
+    waits: BTreeMap<(usize, Handler2RecordKey), Vec<Condition>>,
+    wait_starts: BTreeMap<(usize, u32), u64>,
     group_orders: BTreeMap<(usize, u32), u64>,
 }
 
@@ -216,6 +248,7 @@ impl LoadedMissionState {
                 let mut solving = false;
                 let mut capturer = None;
                 let mut group = None;
+                let mut conditions = Vec::new();
                 let result = varset.declarations.execute_event_prefix(
                     event,
                     bundle.formula_table.as_ref(),
@@ -502,7 +535,8 @@ impl LoadedMissionState {
                                 Some(1)
                                     if problem
                                         .as_ref()
-                                        .is_some_and(|record| record.key.word_0 == 6) =>
+                                        .is_some_and(|record| record.key.word_0 == 6)
+                                        || !conditions.is_empty() =>
                                 {
                                     solving = true
                                 }
@@ -515,20 +549,38 @@ impl LoadedMissionState {
                             }
                             Ok(None)
                         }
-                        ScriptDispatchSelector::Handler(27) if solving => {
+                        ScriptDispatchSelector::Handler(27) if problem.is_some() => {
                             let [action, mode, id] = instruction.references.as_slice() else {
                                 return Err("Handler(27) requires an action and target".into());
                             };
                             let word = |index: u32| {
                                 values.get(index as usize).and_then(|cell| cell.as_dword())
                             };
-                            let (Some(2), Some(0), Some(id)) =
+                            let (Some(action), Some(mode), Some(id)) =
                                 (word(*action), word(*mode), word(*id))
                             else {
-                                return Err(
-                                    "Handler(27) only supports waiting for a factory".into()
-                                );
+                                return Err("Handler(27) requires three DWORD operands".into());
                             };
+                            let key = problem.as_ref().expect("condition requires a problem").key;
+                            let condition = match (action, mode) {
+                                (1 | 3, 0) if matches!(key.word_0, 7 | 9) => {
+                                    let target = crate::mission_events::placed_logic_objects(
+                                        &self.mission, world, id
+                                    ).next();
+                                    Some(if action == 1 { Condition::ObjectDestroyed(target) } else {
+                                        Condition::BuildingCaptured(target.ok_or("Handler(27) capture target is unavailable")?)
+                                    })
+                                }
+                                (4 | 5, 1) if id == 0 && self.clan_ai_events.groups.contains_key(&(clan, key)) => {
+                                    Some(if action == 4 { Condition::GroupDestroyed } else { Condition::GroupIdle })
+                                }
+                                (2, 0) if solving => None,
+                                _ => return Err("Handler(27) action or target mode is unsupported".into()),
+                            };
+                            if let Some(condition) = condition {
+                                conditions.push(condition);
+                                return Ok(None);
+                            }
                             let order = orders
                                 .last_mut()
                                 .filter(|order| {
@@ -759,6 +811,19 @@ impl LoadedMissionState {
                             .entry(clan)
                             .or_default()
                             .remove(problem.key);
+                    } else if solving && !conditions.is_empty() {
+                        let count = self
+                            .clan_ai_events
+                            .wait_starts
+                            .entry((clan, problem.key.word_0))
+                            .or_default();
+                        *count += 1;
+                        if *count == 1 {
+                            eprintln!("sim_coverage script_problem_wait_approx=1 clan={clan} problem={} target={} conditions={}", problem.key.word_0, problem.key.argument_0, conditions.len());
+                        }
+                        self.clan_ai_events
+                            .waits
+                            .insert((clan, problem.key), conditions);
                     }
                 } else if let Some(queue) = self.clan_ai_events.problems.get(&clan) {
                     pending = ranked_problems(queue.records());
@@ -781,6 +846,7 @@ impl LoadedMissionState {
                             .clan_ai_events
                             .groups
                             .contains_key(&(clan, problem.key))
+                        || self.clan_ai_events.waits.contains_key(&(clan, problem.key))
                     {
                         continue;
                     }
@@ -910,6 +976,12 @@ fn storage_space(ores: &[BehaviorOreState], world: &World, clan: OwnerId) -> f32
 }
 
 impl ClanAiEvents {
+    pub(super) fn wait_starts(&self) -> impl Iterator<Item = (usize, u32, u64)> + '_ {
+        self.wait_starts
+            .iter()
+            .map(|(&(clan, problem), &count)| (clan, problem, count))
+    }
+
     fn unit_assigned(&self, unit: ObjectHandle) -> bool {
         self.capture_orders
             .iter()
