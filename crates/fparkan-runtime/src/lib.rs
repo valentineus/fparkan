@@ -55,6 +55,7 @@ mod player_weapon;
 mod production;
 mod projectile;
 mod research;
+mod script_patrol;
 mod unit_patrol;
 
 pub use autodemo::{
@@ -2354,6 +2355,7 @@ fn load_mission_with_options(
         MissionEvents::default()
     };
     let mut next_behavior_rng_state = engine.behavior_rng_state;
+    let mut init_patrols = Vec::new();
     if options.asset_scope == MissionAssetScope::Full {
         let queue_time_ms = startup_input
             .expect("full mission loading requires startup inputs")
@@ -2376,6 +2378,7 @@ fn load_mission_with_options(
                     mask,
                 ))
             },
+            &mut init_patrols,
         ) {
             let _ = fparkan_world::shutdown(new_runtime_world);
             return Err(error);
@@ -2437,20 +2440,21 @@ fn load_mission_with_options(
                 &object_drafts[..reserve_start],
                 &handles[..reserve_start],
             ),
-            MissionMode::SingleMission => loaded_scripts
-                .bundles
-                .iter()
-                .find(|bundle| bundle.clan_index == 0)
-                .is_some_and(|bundle| {
-                    bundle.package.events.iter().any(|event| {
-                        event.name_raw.as_slice() == b"Mission\0"
-                            && event.instructions.iter().any(|instruction| {
-                                instruction.dispatch_selector()
-                                    == fparkan_script::ScriptDispatchSelector::Handler(15)
-                            })
-                    })
-                })
-                .then(unit_patrol::UnitPatrol::scripted),
+            MissionMode::SingleMission => (!init_patrols.is_empty()
+                || loaded_scripts
+                    .bundles
+                    .iter()
+                    .find(|bundle| bundle.clan_index == 0)
+                    .is_some_and(|bundle| {
+                        bundle.package.events.iter().any(|event| {
+                            event.name_raw.as_slice() == b"Mission\0"
+                                && event.instructions.iter().any(|instruction| {
+                                    instruction.dispatch_selector()
+                                        == fparkan_script::ScriptDispatchSelector::Handler(15)
+                                })
+                        })
+                    }))
+            .then(unit_patrol::UnitPatrol::scripted),
         }
     } else {
         None
@@ -2509,6 +2513,17 @@ fn load_mission_with_options(
         }
         if patrol.factory_raid_clans != 0 || scripted_patrol {
             unit_patrol = Some(patrol);
+        }
+    }
+    if let Some(patrol) = &mut unit_patrol {
+        for order in init_patrols {
+            if let Some(handle) = order.apply(patrol, &mission, &object_drafts, &new_runtime_world)
+            {
+                eprintln!(
+                    "script_init_patrol unit={} id={} target={:?}",
+                    handle.slot, order.actor_id, order.center
+                );
+            }
         }
     }
     let autodemo_combat = (unit_patrol.is_some() || guard_clans.contains(&true)).then(|| {
@@ -7960,6 +7975,7 @@ fn load_mission_scripts(
             varset,
             InitPolicy::Preview,
             |_, _| None,
+            &mut Vec::new(),
         )?;
         let varset_states = materialize_script_varset_states(&bundles, varset, &init_states)?;
         (init_states, varset_states)
@@ -7982,6 +7998,7 @@ fn start_mission_scripts(
     behavior_rng_state: &mut u32,
     init_policy: InitPolicy,
     clan_count: impl Fn(u32, u32) -> Option<u32>,
+    init_patrols: &mut Vec<script_patrol::ScriptPatrol>,
 ) -> Result<(), EngineError> {
     // The recovered slot refreshes one Behavior instance before dispatching
     // that same instance's Init event. The Rust loader waits until its new
@@ -8005,6 +8022,7 @@ fn start_mission_scripts(
                 varset,
                 init_policy,
                 &clan_count,
+                init_patrols,
             )?);
         }
     }
@@ -8064,6 +8082,7 @@ fn resolve_init_states(
     varset: &MissionScriptVarSet,
     policy: InitPolicy,
     clan_count: impl Fn(u32, u32) -> Option<u32>,
+    init_patrols: &mut Vec<script_patrol::ScriptPatrol>,
 ) -> Result<Vec<MissionScriptInitState>, EngineError> {
     let mut states = Vec::new();
     for bundle in bundles {
@@ -8097,12 +8116,19 @@ fn resolve_init_states(
                 input,
                 bundle.formula_table.as_ref(),
                 &clan_count,
-                |index, instruction| {
-                    if policy == InitPolicy::KeepPrefix {
-                        if let Some(handler) = clan_script_init::stubbed_handler(instruction) {
-                            bundle.init_stubs.push((index, handler));
-                            return true;
-                        }
+                |index, instruction, values| {
+                    if policy != InitPolicy::KeepPrefix {
+                        return false;
+                    }
+                    if let Some(order) =
+                        clan_script_init::patrol_order(&varset.declarations, instruction, values)
+                    {
+                        init_patrols.push(order);
+                        return true;
+                    }
+                    if let Some(handler) = clan_script_init::stubbed_handler(instruction) {
+                        bundle.init_stubs.push((index, handler));
+                        return true;
                     }
                     false
                 },
@@ -12559,6 +12585,7 @@ mod tests {
             &mut rng_state,
             InitPolicy::Strict,
             |_, _| None,
+            &mut Vec::new(),
         )
         .expect_err("unsupported first Init stops startup before the second bundle");
 
@@ -15893,6 +15920,7 @@ mod tests {
             &varset,
             InitPolicy::Strict,
             |_, _| None,
+            &mut Vec::new(),
         )
         .expect("exact Init execution");
         assert_eq!(
@@ -16003,6 +16031,7 @@ mod tests {
             &varset,
             InitPolicy::Preview,
             |_, _| None,
+            &mut Vec::new(),
         )
         .expect("static preview retains unsupported script");
         assert!(preview_states.is_empty(), "no partial writes are retained");
@@ -16060,6 +16089,7 @@ mod tests {
             &varset,
             InitPolicy::KeepPrefix,
             |_, _| None,
+            &mut Vec::new(),
         )
         .expect("partial Init keeps the prefix and continues with the next clan");
         assert_eq!(partial_bundles[0].init_stubs, vec![(1, 43)]);
@@ -16101,6 +16131,7 @@ mod tests {
                 &varset,
                 InitPolicy::Strict,
             |_, _| None,
+            &mut Vec::new(),
             ),
             Err(EngineError::ScriptInitUnsupported {
                 clan_index: 0,
@@ -16129,6 +16160,7 @@ mod tests {
                 &varset,
                 InitPolicy::Preview,
             |_, _| None,
+            &mut Vec::new(),
             ),
             Err(EngineError::ScriptInit { message, .. })
                 if message.contains("Handler(19) is missing reference 0")

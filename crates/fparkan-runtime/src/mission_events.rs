@@ -7,8 +7,7 @@ use super::{
 use fparkan_msh::{draw_batches, node38_sampled_hierarchy, selected_slot, Group, Lod, NodeId};
 use fparkan_render::LegacyIron3dEulerTransform;
 use fparkan_script::{
-    Handler15TargetPayload, ScriptDispatchSelector, ScriptInstruction, VarSetDefault,
-    VmHostCallbackCommand,
+    ScriptDispatchSelector, ScriptInstruction, VarSetDefault, VmHostCallbackCommand,
 };
 use fparkan_world::{
     handle_by_original_id, identity_metadata, registration_sequence, set_owner, transform_state,
@@ -697,44 +696,19 @@ impl LoadedMissionState {
                     let order = declarations
                         .resolve_handler15_with_values(instruction, values)
                         .map_err(|error| error.to_string())?;
-                    let (4, 3, Handler15TargetPayload::ByPlace { first, second }) =
-                        (order.word_1, order.word_2, order.target)
-                    else {
+                    let Some(order) = crate::script_patrol::ScriptPatrol::from_order(order) else {
                         return Err(format!(
                             "Handler(15) order={} insertion={} target={:?}",
                             order.word_1, order.word_2, order.target
                         ));
                     };
-                    let Some(handle) =
-                        self.mission
-                            .objects
-                            .iter()
-                            .enumerate()
-                            .find_map(|(index, object)| {
-                                let class = self.object_drafts[index].unit_dat_header_flags?;
-                                (class == super::boarding::WARBOT_CLASS
-                                    && object.identity_or_clan_raw == order.word_0)
-                                    .then(|| {
-                                        handle_by_original_id(world, OriginalObjectId(index as u32))
-                                    })
-                                    .flatten()
-                            })
-                    else {
-                        // The native handler sets its missing-target status and advances.
-                        return Ok(None);
-                    };
                     let Some(patrol) = &mut self.unit_patrol else {
                         return Err("Handler(15) patrol runtime is unavailable".into());
                     };
-                    // shortcut: default place radius and a routed random point;
-                    // native patrol timing and profile overrides remain open.
-                    let radius = if matches!(order.word_3, 0 | u32::MAX) {
-                        60.0
-                    } else {
-                        order.word_3 as f32
-                    };
-                    if patrol.order(world, handle, [first as f32, second as f32], radius) {
-                        patrol_orders.push((handle, [first, second]));
+                    if let Some(handle) =
+                        order.apply(patrol, &self.mission, &self.object_drafts, world)
+                    {
+                        patrol_orders.push((handle, order.center));
                     }
                     Ok(None)
                 }

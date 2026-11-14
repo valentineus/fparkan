@@ -1,4 +1,23 @@
-use fparkan_script::ScriptInstruction;
+use crate::script_patrol::ScriptPatrol;
+use fparkan_script::{ScriptDispatchSelector, ScriptInstruction, VarSet, VarSetDefault};
+
+pub(super) fn patrol_order(
+    declarations: &VarSet,
+    instruction: &ScriptInstruction,
+    values: &[VarSetDefault],
+) -> Option<ScriptPatrol> {
+    if instruction.dispatch_selector() != ScriptDispatchSelector::Handler(15)
+        || instruction.header_words[1] != u32::MAX
+        || instruction.header_words[3] != u32::MAX
+    {
+        return None;
+    }
+    ScriptPatrol::from_order(
+        declarations
+            .resolve_handler15_with_values(instruction, values)
+            .ok()?,
+    )
+}
 
 pub(super) fn stubbed_handler(instruction: &ScriptInstruction) -> Option<u8> {
     // shortcut: resume Init after the catalog refresh until the live research context is wired.
