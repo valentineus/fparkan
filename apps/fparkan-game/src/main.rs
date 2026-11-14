@@ -13235,6 +13235,7 @@ mod tests {
             }],
             triangle_descriptors: None,
             node_names: None,
+            hero_exit_points: Vec::new(),
             animation: Some(ModelAnimation {
                 keys: vec![
                     AnimKey24 {
@@ -13306,6 +13307,7 @@ mod tests {
             }],
             triangle_descriptors: None,
             node_names: None,
+            hero_exit_points: Vec::new(),
             animation: Some(ModelAnimation {
                 keys: vec![AnimKey24 {
                     time: AnimationTime(0.0),
@@ -13360,6 +13362,7 @@ mod tests {
                 normal: [0, 32767, 0],
             }]),
             node_names: None,
+            hero_exit_points: Vec::new(),
             animation: Some(ModelAnimation {
                 keys: vec![
                     AnimKey24 {
@@ -13508,6 +13511,7 @@ mod tests {
                     .collect(),
             ),
             node_names: None,
+            hero_exit_points: Vec::new(),
             animation: Some(ModelAnimation {
                 keys: vec![AnimKey24 {
                     time: AnimationTime(0.0),

@@ -451,6 +451,7 @@ mod tests {
             batches,
             triangle_descriptors: Some(triangle_descriptors),
             node_names: None,
+            hero_exit_points: Vec::new(),
             animation: None,
         }
     }

@@ -23,6 +23,8 @@ pub const STREAM_UV0: u32 = 5;
 pub const STREAM_UV1: u32 = 18;
 /// Optional type-16 stream. Its presence marks MSH vertex-colour data.
 pub const STREAM_TYPE_16: u32 = 16;
+/// Model-local gameplay points and auxiliary vectors.
+pub const STREAM_GAMEPLAY_POINTS: u32 = 17;
 /// Triangle index stream.
 pub const STREAM_INDICES: u32 = 6;
 /// Optional triangle-descriptor stream.
@@ -115,6 +117,8 @@ pub struct ModelAsset {
     pub triangle_descriptors: Option<Vec<TriangleDescriptor>>,
     /// Optional decoded node names.
     pub node_names: Option<Vec<Option<String>>>,
+    /// Node-local points whose flags mark a hero exit.
+    pub hero_exit_points: Vec<(NodeId, [f32; 3])>,
     /// Optional decoded node-animation streams.
     pub animation: Option<ModelAnimation>,
 }
@@ -1135,6 +1139,10 @@ fn parse_model_document(document: &NresDocument) -> Result<ModelAsset, MshError>
     let node_names = read_optional_stream(document, STREAM_NAMES)?
         .map(|raw| parse_res10_names(&raw.bytes, node_count))
         .transpose()?;
+    let hero_exit_points = read_optional_stream(document, STREAM_GAMEPLAY_POINTS)?
+        .map(|raw| parse_hero_exit_points(&raw, node_count))
+        .transpose()?
+        .unwrap_or_default();
     let animation = parse_optional_animation(document)?;
 
     Ok(ModelAsset {
@@ -1153,8 +1161,45 @@ fn parse_model_document(document: &NresDocument) -> Result<ModelAsset, MshError>
         batches,
         triangle_descriptors,
         node_names,
+        hero_exit_points,
         animation,
     })
+}
+
+fn parse_hero_exit_points(
+    stream: &RawStream,
+    node_count: usize,
+) -> Result<Vec<(NodeId, [f32; 3])>, MshError> {
+    const POINT_BYTES: usize = 20;
+    let point_count = stream.attributes.attr1 as usize;
+    let pairs = stream.attributes.attr2 as usize;
+    if !stream.bytes.len().is_multiple_of(POINT_BYTES)
+        || (point_count as u64 + 2 * pairs as u64) != (stream.bytes.len() / POINT_BYTES) as u64
+    {
+        return Err(MshError::InvalidGeometry(
+            "invalid Res17 point table length".into(),
+        ));
+    }
+    let mut exits = Vec::new();
+    for point in stream.bytes.chunks_exact(POINT_BYTES).take(point_count) {
+        let flags = read_u32(point, 12)?;
+        if flags & 0x1000_4000 != 0x4000 {
+            continue;
+        }
+        let node = NodeId(read_u32(point, 16)?);
+        let position = [
+            read_f32(point, 0)?,
+            read_f32(point, 4)?,
+            read_f32(point, 8)?,
+        ];
+        if node.0 as usize >= node_count || !position.iter().all(|axis| axis.is_finite()) {
+            return Err(MshError::InvalidGeometry(
+                "invalid Res17 hero exit point".into(),
+            ));
+        }
+        exits.push((node, position));
+    }
+    Ok(exits)
 }
 
 fn parse_optional_animation(document: &NresDocument) -> Result<Option<ModelAnimation>, MshError> {
@@ -2300,6 +2345,7 @@ mod tests {
             batches: Vec::new(),
             triangle_descriptors: None,
             node_names: None,
+            hero_exit_points: Vec::new(),
             animation: Some(ModelAnimation {
                 keys: vec![
                     AnimKey24 {
@@ -2363,6 +2409,7 @@ mod tests {
             batches: Vec::new(),
             triangle_descriptors: None,
             node_names: None,
+            hero_exit_points: Vec::new(),
             animation: Some(ModelAnimation {
                 keys: vec![
                     AnimKey24 {
@@ -2429,6 +2476,7 @@ mod tests {
             batches: Vec::new(),
             triangle_descriptors: None,
             node_names: None,
+            hero_exit_points: Vec::new(),
             animation: Some(ModelAnimation {
                 keys: vec![
                     AnimKey24 {
@@ -3322,6 +3370,7 @@ mod tests {
             indices,
             batches,
             node_names: None,
+            hero_exit_points: Vec::new(),
             animation: None,
             triangle_descriptors: Some(
                 tri_flags

@@ -2692,7 +2692,7 @@ pub fn frame_with_player_motion(
 
 /// Coverage entries for the subsystems still absent from the mission loop.
 pub const SIMULATION_COVERAGE: &str =
-    "sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 unit_behavior_stub=1 render_object_lifecycle_stub=1 render_winding_change_stub=1 mission_event_clock_approx=1 mission_tactical_ids_stub=1 mission_clan_roster_stub=1 mission_message_ui_stub=1 factory_orders_approx=1 mine_orders_approx=1 mission_patrol_approx=1";
+    "sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 unit_behavior_stub=1 render_object_lifecycle_stub=1 render_winding_change_stub=1 mission_event_clock_approx=1 mission_tactical_ids_stub=1 mission_clan_roster_stub=1 mission_message_ui_stub=1 factory_orders_approx=1 mine_orders_approx=1 mission_patrol_approx=1 mission_hero_exit_approx=1";
 
 /// Totals from a headless mission coverage run.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -9267,6 +9267,7 @@ mod tests {
             batches: Vec::new(),
             triangle_descriptors: None,
             node_names: None,
+            hero_exit_points: Vec::new(),
             animation: None,
         }
     }
@@ -18067,6 +18068,22 @@ mod tests {
                 "{event:?}"
             );
         }
+        let active = Some(MissionScriptOutcome::Active);
+        assert_eq!(loaded_mission_script_outcome(&engine), active);
+        pose.position = [1175.335_f32, 1242.098, 112.0].map(f32::to_bits);
+        set_transform(&mut engine.world, cockpit.handle, pose).unwrap();
+        assert!(frame(&mut engine, 8_002).unwrap().mission_event.is_none());
+        assert_eq!(loaded_mission_script_outcome(&engine), active);
+        pose.position = [1175.335_f32, 1242.098, 79.0].map(f32::to_bits);
+        set_transform(&mut engine.world, cockpit.handle, pose).unwrap();
+        let event = frame(&mut engine, 8_003).unwrap().mission_event.unwrap();
+        assert!(event.stop.is_none(), "{event:?}");
+        assert_eq!(event.notices, [MissionNotice::Completed]);
+        assert_eq!(
+            loaded_mission_script_outcome(&engine),
+            Some(MissionScriptOutcome::Completed)
+        );
+        assert!(frame(&mut engine, 8_004).unwrap().mission_event.is_none());
     }
 
     #[test]

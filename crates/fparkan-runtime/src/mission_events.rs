@@ -143,7 +143,8 @@ impl MissionObjectives {
 #[derive(Default)]
 pub(super) struct MissionEvents {
     next_ms: u32,
-    reported_stops: HashSet<usize>,
+    reported_stops: HashSet<(usize, usize)>,
+    inside_hero_exit: bool,
     voiced_messages: HashSet<u32>,
     placed_clan_objects: Vec<(ObjectHandle, u32)>,
     objectives: MissionObjectives,
@@ -449,6 +450,57 @@ pub(super) fn on_communicator(
 }
 
 impl LoadedMissionState {
+    fn hero_in_teleport_exit(&self, world: &World) -> bool {
+        if self.boarding.is_some() || self.script_host_mode != super::MissionMode::SingleMission {
+            return false;
+        }
+        let hero = self.object_drafts.iter().find(|draft| {
+            draft.unit_dat_header_flags == Some(super::HERO_UNIT_CLASS)
+                && draft.raw_after_resource == 0
+        });
+        let Some(hero_position) = hero
+            .and_then(|draft| handle_by_original_id(world, draft.original_id?))
+            .and_then(|hero| transform_state(world, hero).ok())
+            .map(|pose| pose.position.map(f32::from_bits))
+        else {
+            return false;
+        };
+        self.object_drafts.iter().enumerate().any(|(index, draft)| {
+            if draft.unit_dat_header_flags != Some(MAIN_TELEPORT_CLASS) {
+                return false;
+            }
+            let hit = || {
+                let handle = handle_by_original_id(world, draft.original_id?)?;
+                let pose = transform_state(world, handle).ok()?;
+                let visual = self
+                    .mission_assets
+                    .visual_by_id(self.mission_assets.visual_for_object(index)?)?;
+                let model = &self.mission_assets.model_by_id(visual.model_id?)?.validated;
+                if model.hero_exit_points.is_empty() {
+                    return Some(false);
+                }
+                let hierarchy = node38_sampled_hierarchy(model, 0)?;
+                let transform = LegacyIron3dEulerTransform {
+                    translation: pose.position.map(f32::from_bits),
+                    orientation_radians: pose.orientation.map(f32::from_bits),
+                };
+                Some(model.hero_exit_points.iter().any(|&(node, local)| {
+                    let Some(center) = hierarchy.poses.get(node.0 as usize).and_then(|node_pose| {
+                        transform.try_transform_scaled_point(
+                            node_pose.transform_point(local),
+                            pose.scale.map(f32::from_bits),
+                        )
+                    }) else {
+                        return false;
+                    };
+                    // shortcut: static node poses and the ordinary Res17 volume until animated triggers are wired.
+                    inside_exit_volume(center, hero_position)
+                }))
+            };
+            hit() == Some(true)
+        })
+    }
+
     pub(super) fn tick_mission_event(
         &mut self,
         world: &World,
@@ -460,19 +512,24 @@ impl LoadedMissionState {
             .script_bundles
             .iter()
             .find(|bundle| bundle.clan_index == 0 && bundle.behavior_warm_start.is_some())?;
+        let mut events = bundle.package.events.iter().enumerate();
+        let exit_event = events.clone().find(|(_, event)| {
+            event.name_raw == b"Hero_Teleported\0" && !event.instructions.is_empty()
+        });
+        let inside_exit = exit_event.is_some() && self.hero_in_teleport_exit(world);
+        let entered_exit = inside_exit && !self.mission_events.inside_hero_exit;
+        self.mission_events.inside_hero_exit = inside_exit;
         // shortcut: use the caller's queue clock until the AI wall clock is wired.
-        if !self.mission_events.due(now_ms) {
-            return None;
-        }
         let (event_index, event) =
-            bundle
-                .package
-                .events
-                .iter()
-                .enumerate()
-                .find(|(_, event)| {
+            if entered_exit && self.script_outcome == super::MissionScriptOutcome::Active {
+                exit_event?
+            } else if self.mission_events.due(now_ms) {
+                events.find(|(_, event)| {
                     event.name_raw.split(|byte| *byte == 0).next() == Some(b"Mission")
-                })?;
+                })?
+            } else {
+                return None;
+            };
         let declarations = &self.script_varset.as_ref()?.declarations;
         let state = self
             .script_varset_states
@@ -679,7 +736,7 @@ impl LoadedMissionState {
         );
         let stop = execution
             .err()
-            .filter(|(index, _)| mission_events.reported_stops.insert(*index))
+            .filter(|(index, _)| mission_events.reported_stops.insert((event_index, *index)))
             .map(|(instruction_index, reason)| MissionEventStop {
                 clan_index: bundle.clan_index,
                 script_path: bundle.script_path.clone(),
@@ -693,6 +750,10 @@ impl LoadedMissionState {
             patrol_orders,
         })
     }
+}
+
+fn inside_exit_volume([x, y, z]: [f32; 3], [px, py, pz]: [f32; 3]) -> bool {
+    (pz - z).abs() <= 3.0 && (px - x).powi(2) + (py - y).powi(2) <= 25.0
 }
 
 fn capturer_chassis(chassis: &[u8; 32]) -> bool {
@@ -784,13 +845,27 @@ fn in_tactical_polygon(vertices: &[[f32; 3]], x: f32, y: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        capturer_chassis, clan_object_classes, in_tactical_polygon, MissionEvents, MissionNotice,
-        MissionObjectives,
+        capturer_chassis, clan_object_classes, in_tactical_polygon, inside_exit_volume,
+        MissionEvents, MissionNotice, MissionObjectives,
     };
     use fparkan_world::{
         construct_object, new, register_object, request_delete, set_owner, ObjectDraft, OwnerId,
         WorldConfig,
     };
+
+    #[test]
+    fn exit_cylinder_includes_the_wall_and_caps() {
+        let center = [10., 20., 30.];
+        for (point, inside) in [
+            ([15., 20., 30.], true),
+            ([15.1, 20., 30.], false),
+            ([10., 20., 27.], true),
+            ([10., 20., 33.], true),
+            ([10., 20., 33.1], false),
+        ] {
+            assert_eq!(inside_exit_volume(center, point), inside);
+        }
+    }
 
     #[test]
     fn capturer_classes_are_tiny_and_light() {
