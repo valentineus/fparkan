@@ -45,6 +45,7 @@ mod autodemo;
 mod autodemo_combat;
 mod boarding;
 mod mesh_collision;
+mod mining;
 mod mission_events;
 mod player_motion;
 mod player_weapon;
@@ -59,6 +60,7 @@ pub use autodemo_combat::{AutoDemoCombatEvent, AutoDemoProjectileType};
 pub use boarding::{board_friendly_warbot, disembark_warbot, player_vehicle};
 pub use fparkan_assets::MissionAssets;
 pub use mesh_collision::{query_building_segment_world, BuildingMeshHit, BuildingMeshNode};
+pub use mining::deploy_mine;
 use mission_events::MissionEvents;
 pub use mission_events::{
     capture_neutral_building, capture_neutral_warbot, MissionEventStop, MissionEventTick,
@@ -1334,6 +1336,7 @@ struct LoadedMissionState {
     script_init_states: Vec<MissionScriptInitState>,
     script_varset_states: Vec<MissionScriptVarSetState>,
     mission_events: MissionEvents,
+    mine_sites: Vec<mining::MineSite>,
     unit_patrol: Option<unit_patrol::UnitPatrol>,
     player_pitch_bits: u32,
     boarding: Option<boarding::Boarding>,
@@ -1920,6 +1923,26 @@ fn load_mission_with_options(
                 .take(production::RESERVE_SLOTS),
         );
     }
+    let mine_reserve_start = graph_roots.len();
+    let mine_scheme = (options.start_autodemo && request.mode == MissionMode::SingleMission)
+        .then(|| {
+            build_categories
+                .iter()
+                .find(|category| category.mask == mining::MINE_CLASS)
+                .and_then(|category| category.unit_paths.first())
+        })
+        .flatten();
+    let mut mine_sites = Vec::new();
+    if let Some(scheme) = mine_scheme {
+        for site in mission
+            .extras
+            .iter()
+            .filter_map(mining::MineSite::from_extra)
+        {
+            graph_roots.push(resource_name(scheme.as_bytes()));
+            mine_sites.push(site);
+        }
+    }
     let scoped_graph_roots = match options.asset_scope {
         MissionAssetScope::Full => graph_roots.as_slice(),
         MissionAssetScope::FirstMeshPreview => graph_roots.get(..1).unwrap_or_default(),
@@ -2020,6 +2043,11 @@ fn load_mission_with_options(
                 )?,
                 plant.raw_after_resource,
             )
+        } else if let Some(site) = index
+            .checked_sub(mine_reserve_start)
+            .and_then(|offset| mine_sites.get(offset))
+        {
+            (site.position, u32::MAX)
         } else {
             ([0.0; 3], u32::MAX)
         };
@@ -2395,19 +2423,23 @@ fn load_mission_with_options(
     for &handle in &handles[reserve_start..] {
         fparkan_world::request_delete(&mut new_runtime_world, handle)?;
     }
-    let reserve_controls = if graph_roots.len() > reserve_start {
+    let mut reserve_controls = if graph_roots.len() > reserve_start {
         behavior_control_groupings.truncate(reserve_start);
         control_device_tables.split_off(reserve_start)
     } else {
         Vec::new()
     };
+    let mine_controls = reserve_controls.split_off(mine_reserve_start - reserve_start);
+    for (site, control) in mine_sites.iter_mut().zip(mine_controls) {
+        site.control = Some(control);
+    }
     let (autodemo_reinforcements, production) = if build_scheme.is_some() {
         (
             None,
             Some(production::Production::new(
                 reserve_start,
                 reserve_controls,
-                &object_drafts,
+                &object_drafts[..mine_reserve_start],
             )?),
         )
     } else {
@@ -2445,6 +2477,7 @@ fn load_mission_with_options(
         script_init_states: loaded_scripts.init_states,
         script_varset_states: loaded_scripts.varset_states,
         mission_events,
+        mine_sites,
         unit_patrol,
         player_pitch_bits: 0,
         boarding: None,
@@ -2627,7 +2660,7 @@ pub fn frame_with_player_motion(
 
 /// Coverage entries for the subsystems still absent from the mission loop.
 pub const SIMULATION_COVERAGE: &str =
-    "sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 unit_behavior_stub=1 render_object_lifecycle_stub=1 render_winding_change_stub=1 mission_event_clock_approx=1 mission_tactical_ids_stub=1 mission_clan_roster_stub=1 mission_message_ui_stub=1 factory_orders_approx=1";
+    "sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 unit_behavior_stub=1 render_object_lifecycle_stub=1 render_winding_change_stub=1 mission_event_clock_approx=1 mission_tactical_ids_stub=1 mission_clan_roster_stub=1 mission_message_ui_stub=1 factory_orders_approx=1 mine_orders_approx=1";
 
 /// Totals from a headless mission coverage run.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3343,6 +3376,7 @@ struct PreparedMissionResources {
     ore_states: Vec<BehaviorOreState>,
     control_tables: Vec<MissionControlDeviceTableState>,
     warm_starts: Vec<Option<BehaviorWarmStartState>>,
+    mine_remaining: Vec<f32>,
     rng_state: u32,
     scheduled_ticks: usize,
 }
@@ -3356,6 +3390,9 @@ impl PreparedMissionResources {
         loaded.behavior_distributors = self.distributors;
         loaded.behavior_ore_states = self.ore_states;
         loaded.control_device_tables = self.control_tables;
+        for (site, remaining) in loaded.mine_sites.iter_mut().zip(self.mine_remaining) {
+            site.remaining = remaining;
+        }
         for (bundle, warm_start) in loaded.script_bundles.iter_mut().zip(self.warm_starts) {
             bundle.behavior_warm_start = warm_start;
         }
@@ -3393,6 +3430,11 @@ fn prepare_loaded_mission_resources(
     let mut distributors = loaded.behavior_distributors.clone();
     let mut ore_states = loaded.behavior_ore_states.clone();
     let mut control_tables = loaded.control_device_tables.clone();
+    let mut mine_remaining = loaded
+        .mine_sites
+        .iter()
+        .map(|site| site.remaining)
+        .collect::<Vec<_>>();
     let mut warm_starts = loaded
         .script_bundles
         .iter()
@@ -3432,6 +3474,18 @@ fn prepare_loaded_mission_resources(
             continue;
         }
 
+        mining::extract_for_clan(
+            &loaded.mine_sites,
+            &mut mine_remaining,
+            world,
+            distributor.clan_index,
+            &mut ore_states,
+            delta_seconds,
+        )
+        .map_err(|message| EngineError::BehaviorDistributorTick {
+            clan_index: distributor.clan_index,
+            message,
+        })?;
         let totals = advance_behavior_distributor_tick(
             distributor,
             delta_seconds,
@@ -3452,6 +3506,7 @@ fn prepare_loaded_mission_resources(
         ore_states,
         control_tables,
         warm_starts,
+        mine_remaining,
         rng_state,
         scheduled_ticks,
     }))
@@ -17841,16 +17896,18 @@ mod tests {
             .iter()
             .any(|entry| entry.handle == handle));
         set_transform(&mut engine.world, cockpit.handle, start).unwrap();
-        // The tutorial starts before a mine has been deployed.
-        let mine = construct_object(&mut engine.world, ObjectDraft { original_id: None }).unwrap();
-        fparkan_world::set_owner(&mut engine.world, mine, Some(fparkan_world::OwnerId(0))).unwrap();
-        register_object(&mut engine.world, mine).unwrap();
-        engine
-            .loaded
-            .as_mut()
-            .unwrap()
-            .mission_events
-            .register_unit(&engine.world, mine, 0x8000_0004);
+        assert!(deploy_mine(&mut engine, cockpit).is_err());
+        let position = engine.loaded.as_ref().unwrap().mine_sites[0].position;
+        hero.position = [position[0], position[1] - 40.0, position[2]].map(f32::to_bits);
+        set_transform(&mut engine.world, cockpit.handle, hero).unwrap();
+        let mine = deploy_mine(&mut engine, cockpit).unwrap();
+        assert!(deploy_mine(&mut engine, cockpit).is_err());
+        assert_eq!(
+            fparkan_world::identity_metadata(&engine.world, mine.handle)
+                .unwrap()
+                .owner_id,
+            Some(fparkan_world::OwnerId(0))
+        );
         let after = frame(&mut engine, 2001).unwrap().mission_event.unwrap();
         assert!(after.stop.is_none(), "{:?}", after.stop);
         assert!(
@@ -17870,6 +17927,9 @@ mod tests {
             after.notices.contains(&MissionNotice::ObjectiveComplete(2)),
             "{after:?}"
         );
+        let ores = &engine.loaded.as_ref().unwrap().behavior_ore_states;
+        let ore = &ores[behavior_ore_index_for_handle(ores, mine.handle).unwrap()];
+        assert!(f32::from_bits(ore.current_ore_bits) > 0.0);
         assert!(!after.notices.contains(&MissionNotice::ObjectiveComplete(3)));
         for built in 1..=4 {
             let robot =

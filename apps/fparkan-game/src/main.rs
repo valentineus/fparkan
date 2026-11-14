@@ -81,7 +81,7 @@ use fparkan_render_vulkan::{
 use fparkan_runtime::load_mission_with_init_stubs;
 use fparkan_runtime::{
     apply_projectile_hit, autodemo_camera, board_friendly_warbot, capture_neutral_building,
-    capture_neutral_warbot, create, disembark_warbot, frame as step_mission_frame,
+    capture_neutral_warbot, create, deploy_mine, disembark_warbot, frame as step_mission_frame,
     frame_with_player_motion, load_gameplay_mission, load_mission_static_preview,
     load_mission_static_preview_roots, load_player_projectile, loaded_mission_assets,
     loaded_mission_object_drafts, loaded_mission_script_bundles, loaded_terrain,
@@ -7793,6 +7793,13 @@ fn mission_basement_footprints(
 ) -> Result<Vec<MissionBasementFootprint>, String> {
     let mut footprints = Vec::new();
     for (object_index, mission_root) in roots.iter().enumerate() {
+        // shortcut: deployed mines lack a live BAS cut until terrain can
+        // rebuild the affected cells when a building enters the world.
+        if mission_root.raw_after_resource == u32::MAX
+            && mission_root.unit_dat_header_flags == Some(0x8000_0004)
+        {
+            continue;
+        }
         let Some(mode) = mission_root.basement_placement_mode() else {
             continue;
         };
@@ -10083,6 +10090,7 @@ struct StaticVulkanApp {
     player_fire_pressed: bool,
     player_capture_pressed: bool,
     player_build_pressed: bool,
+    player_mine_pressed: bool,
     player_disembark_pressed: bool,
     boarded_hero_index: Option<usize>,
     audio: Option<audio::GameAudio>,
@@ -10216,6 +10224,7 @@ impl StaticVulkanApp {
             player_fire_pressed: false,
             player_capture_pressed: false,
             player_build_pressed: false,
+            player_mine_pressed: false,
             player_disembark_pressed: false,
             boarded_hero_index: None,
             audio,
@@ -10907,6 +10916,7 @@ impl StaticVulkanApp {
         self.player_move_pressed = [false; 4];
         self.player_capture_pressed = false;
         self.player_build_pressed = false;
+        self.player_mine_pressed = false;
         self.player_disembark_pressed = false;
         if self.cockpit.is_some() && self.demo_camera.is_none() {
             self.set_mouse_look(self.window_focused && !paused);
@@ -11102,6 +11112,17 @@ impl StaticVulkanApp {
             }
         }
         if let Some(engine) = self.mission_engine.as_mut() {
+            let mut deployed_mine = None;
+            if let (true, Some(cockpit), false) = (
+                std::mem::take(&mut self.player_mine_pressed),
+                self.cockpit,
+                self.boarded_hero_index.is_some(),
+            ) {
+                match deploy_mine(engine, cockpit) {
+                    Ok(unit) => deployed_mine = Some(unit),
+                    Err(error) => eprintln!("mine_order_rejected {error}"),
+                }
+            }
             if let (true, Some(cockpit), false) = (
                 std::mem::take(&mut self.player_build_pressed),
                 self.cockpit,
@@ -11169,11 +11190,17 @@ impl StaticVulkanApp {
             }
             .map_err(|err| format!("step mission at {control_clock_ms} ms: {err}"))?;
             let roots = loaded_mission_object_drafts(engine).unwrap_or_default();
-            for (&reinforcement, from_factory) in frame
+            for (&reinforcement, event) in frame
                 .autodemo_reinforcements
                 .iter()
-                .map(|unit| (unit, false))
-                .chain(frame.produced_unit.iter().map(|unit| (unit, true)))
+                .map(|unit| (unit, "autodemo_reinforcement"))
+                .chain(
+                    frame
+                        .produced_unit
+                        .iter()
+                        .map(|unit| (unit, "factory_robot_completed")),
+                )
+                .chain(deployed_mine.iter().map(|unit| (unit, "mine_deployed")))
             {
                 let index = reinforcement.object_index;
                 let draft = &roots[index];
@@ -11201,11 +11228,6 @@ impl StaticVulkanApp {
                         camera.register_target(cockpit);
                     }
                 }
-                let event = if from_factory {
-                    "factory_robot_completed"
-                } else {
-                    "autodemo_reinforcement"
-                };
                 eprintln!(
                     "{event} clan={} resource={} object={index} queue_time_ms={control_clock_ms}",
                     reinforcement.clan,
@@ -12328,6 +12350,7 @@ impl ApplicationHandler for StaticVulkanApp {
                     self.player_move_pressed = [false; 4];
                     self.player_capture_pressed = false;
                     self.player_build_pressed = false;
+                    self.player_mine_pressed = false;
                     self.player_disembark_pressed = false;
                     self.player_mouse = [0.0; 2];
                     self.set_mouse_look(false);
@@ -12383,6 +12406,9 @@ impl ApplicationHandler for StaticVulkanApp {
                             }
                             if self.demo_camera.is_none() && code == KeyCode::KeyB {
                                 self.player_build_pressed = true;
+                            }
+                            if self.demo_camera.is_none() && code == KeyCode::KeyM {
+                                self.player_mine_pressed = true;
                             }
                             if let Some(slot) = [
                                 KeyCode::Digit0,

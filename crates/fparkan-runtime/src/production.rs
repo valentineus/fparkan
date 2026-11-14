@@ -524,19 +524,10 @@ mod tests {
                 .produced_unit
                 .is_none());
         }
-        let store = handle_by_original_id(&engine.world, OriginalObjectId(8)).unwrap();
-        let starting_ore = |engine: &Engine| {
-            let ores = &engine.loaded.as_ref().unwrap().behavior_ore_states;
-            f32::from_bits(
-                ores[behavior_ore_index_for_handle(ores, store).unwrap()].current_ore_bits,
-            )
-        };
-        let before = starting_ore(&engine);
-        {
-            let ore = &mut engine.loaded.as_mut().unwrap().behavior_ore_states;
-            let stock = behavior_ore_index_for_handle(ore, store).unwrap();
-            ore[stock].current_ore_bits = 100.0_f32.to_bits();
-        }
+        let factory_position = pose.position;
+        pose.position = [1026.08_f32, 902.706, 81.24426].map(f32::to_bits);
+        set_transform(&mut engine.world, cockpit.handle, pose).unwrap();
+        crate::deploy_mine(&mut engine, cockpit).unwrap();
         for now in (6150..=30_100).step_by(50) {
             let frame = step_headless(&mut engine, InputSnapshot::default(), now).unwrap();
             assert!(
@@ -552,8 +543,11 @@ mod tests {
             capture_neutral_building(&mut engine, cockpit).unwrap(),
             Some(OriginalObjectId(9))
         );
-        let mut result = None;
-        for now in (30_150..=120_100).step_by(50) {
+        pose.position = factory_position;
+        set_transform(&mut engine.world, cockpit.handle, pose).unwrap();
+        let mut produced = 0;
+        let mut complete = false;
+        for now in (30_150..=190_100).step_by(50) {
             let frame = step_headless(&mut engine, InputSnapshot::default(), now).unwrap();
             assert!(
                 frame.production_failure.is_none(),
@@ -562,12 +556,22 @@ mod tests {
             );
             if let Some(unit) = frame.produced_unit {
                 println!("test paid order completed at {now} ms");
-                result = Some(unit);
+                assert_eq!(unit.clan, 0);
+                produced += 1;
+                if produced < 4 {
+                    order_factory_robot(&mut engine, cockpit, now).unwrap();
+                }
+            }
+            if frame.mission_event.is_some_and(|event| {
+                event
+                    .notices
+                    .contains(&crate::MissionNotice::ObjectiveComplete(3))
+            }) {
+                complete = true;
                 break;
             }
         }
-        assert!(result.is_some());
-        assert_eq!(before, 0.0);
-        assert!(starting_ore(&engine) < 100.0);
+        assert_eq!(produced, 4);
+        assert!(complete, "factory objective must follow the fourth robot");
     }
 }
