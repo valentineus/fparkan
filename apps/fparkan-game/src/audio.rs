@@ -946,11 +946,6 @@ impl GameAudio {
         }
     }
 
-    /// Focus callback used by the window event loop.
-    pub(crate) fn on_focus_changed(&mut self, focused: bool) {
-        self.set_paused(!focused);
-    }
-
     /// Stops all sources before the window/event loop exits.
     pub(crate) fn shutdown(&mut self) {
         self.ambient.stop();

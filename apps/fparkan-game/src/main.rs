@@ -102,7 +102,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize as WinitPhysicalSize;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, NamedKey, NativeKey, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
 mod audio;
@@ -870,6 +870,14 @@ struct ControlEffectFrameSample {
 enum SceneSampleId {
     Live(u64),
     Replay(u64),
+}
+
+impl SceneSampleId {
+    fn index(self) -> u64 {
+        match self {
+            Self::Live(index) | Self::Replay(index) => index,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -9615,6 +9623,9 @@ struct StaticVulkanApp {
     control_point_lights_diagnostic_reported: bool,
     simulation_last_tick: Instant,
     live_clock_paused_for_zero_extent: bool,
+    mission_paused: bool,
+    window_focused: bool,
+    last_presented_mission_scene: Option<SceneFrameUpdate>,
     simulation_elapsed: Duration,
     simulation_time_ms: u32,
     simulation_update_generation: u64,
@@ -9729,6 +9740,9 @@ impl StaticVulkanApp {
             op1_jitter: Op1JitterState::new(1, 1),
             simulation_last_tick: Instant::now(),
             live_clock_paused_for_zero_extent: false,
+            mission_paused: false,
+            window_focused: true,
+            last_presented_mission_scene: None,
             simulation_elapsed: Duration::ZERO,
             simulation_time_ms: 0,
             simulation_update_generation: 0,
@@ -10066,6 +10080,25 @@ impl StaticVulkanApp {
         if self.live_clock_paused_for_zero_extent {
             self.simulation_last_tick = now;
             self.live_clock_paused_for_zero_extent = false;
+        }
+    }
+
+    fn set_mission_paused_at(&mut self, paused: bool, now: Instant) {
+        self.mission_paused = paused;
+        self.simulation_last_tick = now;
+        eprintln!(
+            "mission_pause paused={paused} queue_time_ms={}",
+            self.simulation_time_ms
+        );
+        if let Some(window) = self.window.as_ref() {
+            window.set_title(if paused {
+                "FParkan mission — Пауза"
+            } else {
+                "FParkan mission"
+            });
+        }
+        if let Some(audio) = self.audio.as_mut() {
+            audio.set_paused(paused || !self.window_focused);
         }
     }
 
@@ -10694,7 +10727,7 @@ impl StaticVulkanApp {
                 &mut self.mesh,
                 self.dynamic_vertex_start,
                 &mut self.shadow_cache,
-                self.frames_presented.saturating_add(1),
+                frame.clock.id.index().saturating_add(1),
                 &self.shadow_casters,
                 &self.shadow_receivers,
                 self.shadow_range,
@@ -10720,7 +10753,7 @@ impl StaticVulkanApp {
                 &mut self.mesh,
                 self.dynamic_vertex_start,
                 &mut self.shadow_cache,
-                self.frames_presented.saturating_add(1),
+                frame.clock.id.index().saturating_add(1),
                 &self.shadow_casters,
                 &self.shadow_receivers,
                 self.shadow_range,
@@ -10741,7 +10774,10 @@ impl StaticVulkanApp {
     fn record_presented_scene_frame(&mut self) -> u64 {
         let frame_index = self.frames_presented;
         self.frames_presented = self.frames_presented.saturating_add(1);
-        self.pending_scene_update = None;
+        let scene = self.pending_scene_update.take();
+        if self.mission_engine.is_some() && self.control_clock_target_ms.is_none() {
+            self.last_presented_mission_scene = scene;
+        }
         frame_index
     }
 
@@ -11084,15 +11120,30 @@ impl ApplicationHandler for StaticVulkanApp {
                 self.complete(event_loop);
             }
             WindowEvent::Focused(focused) => {
+                self.window_focused = focused;
                 if !focused {
                     self.pressed_keys.clear();
                     self.set_mouse_look(false);
                 }
                 if let Some(audio) = self.audio.as_mut() {
-                    audio.on_focus_changed(focused);
+                    audio.set_paused(self.mission_paused || !focused);
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                let pause_key = matches!(event.physical_key, PhysicalKey::Code(KeyCode::Pause))
+                    || matches!(
+                        event.logical_key,
+                        Key::Named(NamedKey::Pause) | Key::Unidentified(NativeKey::Windows(0x13))
+                    );
+                if pause_key
+                    && self.mission_engine.is_some()
+                    && self.control_clock_target_ms.is_none()
+                {
+                    if event.state == ElementState::Pressed && !event.repeat {
+                        self.set_mission_paused_at(!self.mission_paused, Instant::now());
+                    }
+                    return;
+                }
                 if let PhysicalKey::Code(code) = event.physical_key {
                     if code == KeyCode::Escape && event.state == ElementState::Pressed {
                         if self.mouse_look {
@@ -11135,19 +11186,49 @@ impl ApplicationHandler for StaticVulkanApp {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.request_resize((drawable_size.width, drawable_size.height));
                 }
+                if self.mission_paused {
+                    self.schedule_next_redraw();
+                }
                 if drawable_size.width == 0 || drawable_size.height == 0 {
                     event_loop.set_control_flow(ControlFlow::Wait);
                     self.pause_live_clock_at(Instant::now());
                 } else {
-                    event_loop.set_control_flow(ControlFlow::Poll);
-                    self.resume_live_clock_at(Instant::now());
+                    if !self.mission_paused {
+                        event_loop.set_control_flow(ControlFlow::Poll);
+                        self.resume_live_clock_at(Instant::now());
+                    }
                     // The pending simulation sample is reused; its view and
                     // viewport-dependent geometry refresh before the retry.
                 }
             }
             WindowEvent::RedrawRequested => {
+                let paused_viewport = if self.mission_paused {
+                    let Some(window) = self.window.as_ref() else {
+                        return;
+                    };
+                    let size = window.inner_size();
+                    if size.width == 0 || size.height == 0 {
+                        return;
+                    }
+                    Some([size.width as f32, size.height as f32])
+                } else {
+                    None
+                };
+                let redraw_presented = self.mission_paused && self.pending_scene_update.is_none();
+                if redraw_presented {
+                    self.pending_scene_update = self.last_presented_mission_scene.take();
+                }
                 if self.pending_scene_update.is_none() {
                     return;
+                }
+                if let Some(viewport) = paused_viewport {
+                    if let Err(error) =
+                        self.refresh_pending_scene_viewport(viewport, viewport[0] / viewport[1])
+                    {
+                        self.error = Some(error);
+                        event_loop.exit();
+                        return;
+                    }
                 }
                 if let Err(error) = self.render_scene_update() {
                     self.error = Some(error);
@@ -11204,8 +11285,18 @@ impl ApplicationHandler for StaticVulkanApp {
                             }
                         }
                     }
-                    Ok(VulkanSmokeFrameOutcome::Recreated) => {}
+                    Ok(VulkanSmokeFrameOutcome::Recreated) => {
+                        if redraw_presented {
+                            self.last_presented_mission_scene = self.pending_scene_update.take();
+                        }
+                        if self.mission_paused {
+                            self.schedule_next_redraw();
+                        }
+                    }
                     Ok(VulkanSmokeFrameOutcome::ZeroExtent) => {
+                        if redraw_presented {
+                            self.last_presented_mission_scene = self.pending_scene_update.take();
+                        }
                         if self.window.as_ref().is_some_and(|window| {
                             let size = window.inner_size();
                             size.width == 0 || size.height == 0
@@ -11241,6 +11332,12 @@ impl ApplicationHandler for StaticVulkanApp {
             // the window has no drawable surface.
             event_loop.set_control_flow(ControlFlow::Wait);
             self.pause_live_clock_at(Instant::now());
+            return;
+        }
+        if self.mission_paused
+            && (self.pending_scene_update.is_some() || self.last_presented_mission_scene.is_some())
+        {
+            event_loop.set_control_flow(ControlFlow::Wait);
             return;
         }
         event_loop.set_control_flow(ControlFlow::Poll);
@@ -13880,6 +13977,37 @@ mod tests {
         app.record_presented_scene_frame();
         let clock = app.sample_frame_clock();
         app.prepare_scene_update(clock, [960.0, 540.0]).unwrap();
+        assert_eq!(app.mission_frame.as_ref().unwrap().snapshot.tick.0, 2);
+    }
+
+    #[test]
+    fn mission_pause_holds_presented_scene_and_excludes_paused_time() {
+        let (mut app, _) = clock_test_app(None);
+        let services = EngineServices::new(Arc::new(DirectoryVfs::new(".")));
+        app.mission_engine = Some(create(services).unwrap());
+        let start = Instant::now();
+        app.simulation_last_tick = start;
+        let clock = app.sample_live_frame_clock_at(start + Duration::from_millis(50));
+        app.prepare_scene_update(clock, [1280.0, 720.0]).unwrap();
+        app.record_presented_scene_frame();
+
+        app.set_mission_paused_at(true, start + Duration::from_millis(51));
+        app.pending_scene_update = app.last_presented_mission_scene.take();
+        app.refresh_pending_scene_viewport([1024.0, 768.0], 4.0 / 3.0)
+            .unwrap();
+        app.record_presented_scene_frame();
+        assert_eq!(
+            app.last_presented_mission_scene.as_ref().unwrap().clock,
+            clock
+        );
+        assert_eq!(app.mission_frame.as_ref().unwrap().snapshot.tick.0, 1);
+
+        let resume = start + Duration::from_secs(20);
+        app.set_mission_paused_at(false, resume);
+        let next = app.sample_live_frame_clock_at(resume + Duration::from_millis(16));
+        assert_eq!(next.time_ms, 66);
+        assert_eq!(next.id, SceneSampleId::Live(1));
+        app.prepare_scene_update(next, [1024.0, 768.0]).unwrap();
         assert_eq!(app.mission_frame.as_ref().unwrap().snapshot.tick.0, 2);
     }
 
