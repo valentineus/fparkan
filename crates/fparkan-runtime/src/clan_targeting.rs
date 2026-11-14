@@ -153,6 +153,84 @@ pub(super) fn capture_target(
     radius: f32,
     already_targeted: impl Fn(u32) -> bool,
 ) -> Option<(u32, f32)> {
+    building_target(
+        mission,
+        drafts,
+        controls,
+        world,
+        clan,
+        radius,
+        None,
+        |id, class, _| (!already_targeted(id)).then_some(f32::from(building_priority(class))),
+    )
+}
+
+pub(super) fn attack_target(
+    mission: &MissionDocument,
+    drafts: &[MissionObjectDraft],
+    controls: &[MissionControlDeviceTableState],
+    world: &World,
+    clan: usize,
+    radius: f32,
+    base_radius_limit: f32,
+) -> Option<(u32, f32)> {
+    let anchor = mission
+        .clans
+        .get(clan)?
+        .anchor
+        .map(|axis| (axis.round_ties_even() as i64 as u32) as f32);
+    let distance = |[x, y, _]: [f32; 3]| (x - anchor[0]).hypot(y - anchor[1]);
+    let base_radius = base_radius(
+        base_radius_limit,
+        drafts.iter().filter_map(|draft| {
+            (draft.unit_dat_header_flags? & 0x8000_0000 != 0).then_some(())?;
+            let handle = handle_by_original_id(world, draft.original_id?)?;
+            registration_sequence(world, handle).ok()??;
+            (usize::from(identity_metadata(world, handle).ok()?.owner_id?.0) == clan)
+                .then_some(())?;
+            Some(distance(
+                transform_state(world, handle)
+                    .ok()?
+                    .position
+                    .map(f32::from_bits),
+            ))
+        }),
+    );
+    building_target(
+        mission,
+        drafts,
+        controls,
+        world,
+        clan,
+        radius,
+        // shortcut: native Handler(64) uses a separate stack vector without
+        // initializing it here. Use the map origin for a stable estimate.
+        Some([0.0; 3]),
+        |_, _, position| {
+            let distance = distance(position);
+            (distance >= base_radius).then_some(distance)
+        },
+    )
+}
+
+fn base_radius(limit: f32, distances: impl IntoIterator<Item = f32>) -> f32 {
+    let furthest = distances
+        .into_iter()
+        .filter(|&distance| distance < limit)
+        .fold(0.0, f32::max);
+    (furthest + 100.0).min(limit)
+}
+
+fn building_target(
+    mission: &MissionDocument,
+    drafts: &[MissionObjectDraft],
+    controls: &[MissionControlDeviceTableState],
+    world: &World,
+    clan: usize,
+    radius: f32,
+    strength_center: Option<[f32; 3]>,
+    rank: impl Fn(u32, u32, [f32; 3]) -> Option<f32>,
+) -> Option<(u32, f32)> {
     let source = mission.clans.get(clan)?;
     // shortcut: use placed-object order until the native ArealMap roster is wired.
     let hostile_objects = || {
@@ -176,11 +254,13 @@ pub(super) fn capture_target(
             Some((draft.identity_or_clan_raw, class, handle, position))
         })
     };
-    let (id, _, _, position) = hostile_objects()
-        .filter(|&(id, class, _, _)| {
-            id != u32::MAX && class & 0x8000_0000 != 0 && !already_targeted(id)
+    let (id, position, _) = hostile_objects()
+        .filter_map(|(id, class, _, position)| {
+            (id != u32::MAX && class & 0x8000_0000 != 0).then_some(())?;
+            Some((id, position, rank(id, class, position)?))
         })
-        .min_by_key(|&(_, class, _, _)| building_priority(class))?;
+        .min_by(|(_, _, a), (_, _, b)| a.total_cmp(b))?;
+    let position = strength_center.unwrap_or(position);
     let strength = hostile_objects()
         .filter(|&(_, class, _, candidate)| {
             class & crate::autodemo::MOBILE_UNIT != 0
@@ -226,6 +306,13 @@ mod tests {
         assert!(!at_platform([425.7, 326.9, 76.6], platform));
         assert!(!at_platform([425.8, 326.9, 61.1], platform));
         assert!(at_platform([425.7, 326.9, 61.1], platform));
+    }
+
+    #[test]
+    fn base_radius_excludes_buildings_beyond_the_limit_and_caps_the_margin() {
+        assert_eq!(base_radius(700.0, [300.0, 700.0, 750.0]), 400.0);
+        assert_eq!(base_radius(700.0, [650.0]), 700.0);
+        assert_eq!(base_radius(40.0, []), 40.0);
     }
 
     #[test]

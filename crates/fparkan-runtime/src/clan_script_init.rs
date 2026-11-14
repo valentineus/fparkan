@@ -4,6 +4,10 @@ use fparkan_script::{
 };
 
 pub(super) enum InitOrder {
+    BaseRadius {
+        clan: usize,
+        limit: f32,
+    },
     Patrol(ScriptPatrol),
     Attack {
         id: u32,
@@ -20,6 +24,18 @@ pub(super) enum InitOrder {
         id: u32,
         reserved: bool,
     },
+}
+
+pub(super) fn base_radius(
+    instruction: &ScriptInstruction,
+    values: &[VarSetDefault],
+) -> Option<f32> {
+    let ([68, u32::MAX, u32::MAX, u32::MAX, 6, 1, u32::MAX], &[index]) =
+        (instruction.header_words, instruction.references.as_slice())
+    else {
+        return None;
+    };
+    values.get(index as usize)?.as_float()
 }
 
 pub(super) fn reservation(
@@ -84,15 +100,6 @@ pub(super) fn stubbed_handler(
     match (instruction.header_words, instruction.references.as_slice()) {
         // shortcut: resume Init until the live research context is wired.
         ([43, u32::MAX, u32::MAX, u32::MAX, 6, 0, u32::MAX], []) => Some(43),
-        // shortcut: resume Init until the native AI base-area state is wired.
-        ([68, u32::MAX, u32::MAX, u32::MAX, 6, 1, u32::MAX], [index])
-            if matches!(
-                values.get(*index as usize),
-                Some(VarSetDefault::FloatBits(_))
-            ) =>
-        {
-            Some(68)
-        }
         // shortcut: resume Init until the AI consumer of this setting is wired.
         ([69, u32::MAX, u32::MAX, u32::MAX, 6, 1, u32::MAX], [index])
             if matches!(values.get(*index as usize), Some(VarSetDefault::Dword(_))) =>
@@ -131,23 +138,19 @@ mod tests {
     }
 
     #[test]
-    fn base_area_stub_requires_a_float_operand_and_no_result() {
+    fn base_area_requires_a_float_operand_and_no_result() {
         let mut instruction = ScriptInstruction {
             header_words: [68, u32::MAX, u32::MAX, u32::MAX, 6, 1, u32::MAX],
             references: vec![0],
         };
         let values = [VarSetDefault::FloatBits(500.0_f32.to_bits())];
-        let declarations = fparkan_script::parse_varset(b"").unwrap();
+        assert_eq!(base_radius(&instruction, &values), Some(500.0));
         assert_eq!(
-            stubbed_handler(&instruction, &values, &declarations),
-            Some(68)
-        );
-        assert_eq!(
-            stubbed_handler(&instruction, &[VarSetDefault::Dword(500)], &declarations),
+            base_radius(&instruction, &[VarSetDefault::Dword(500)]),
             None
         );
         instruction.header_words[1] = 0;
-        assert_eq!(stubbed_handler(&instruction, &values, &declarations), None);
+        assert_eq!(base_radius(&instruction, &values), None);
     }
 
     #[test]

@@ -142,6 +142,8 @@ pub(super) struct ClanAiEvents {
     factory_rejections: BTreeMap<(u16, u32), u64>,
     strength_queries: BTreeMap<(usize, u16), u64>,
     capture_queries: BTreeMap<usize, u64>,
+    attack_queries: BTreeMap<usize, u64>,
+    base_radius_limits: BTreeMap<usize, f32>,
     capturer_queries: BTreeMap<usize, u64>,
     capture_orders: Vec<(OwnerId, Handler2RecordKey, CaptureApproach)>,
     capture_approaches: BTreeMap<(u32, u32), u64>,
@@ -210,19 +212,25 @@ impl LoadedMissionState {
                                 .scalar_1;
                             Ok(Some(VarSetDefault::FloatBits(priority.to_bits())))
                         }
-                        ScriptDispatchSelector::Handler(35) => {
+                        ScriptDispatchSelector::Handler(handler @ (35 | 64)) => {
                             let &[radius, estimate] = instruction.references.as_slice() else {
-                                return Err("Handler(35) requires a radius and strength output".into());
+                                return Err("target query requires a radius and strength output".into());
                             };
                             let radius = values.get(radius as usize).and_then(|cell| cell.as_float())
-                                .ok_or("Handler(35) requires a float radius")?;
+                                .ok_or("target query requires a float radius")?;
                             if !matches!(values.get(instruction.header_words[1] as usize),
                                 Some(VarSetDefault::Dword(_)) | None) {
-                                return Err("Handler(35) requires a DWORD result".into());
+                                return Err("target query requires a DWORD result".into());
                             }
                             let estimate = values.get_mut(estimate as usize)
-                                .ok_or("Handler(35) strength output is unavailable")?;
-                            let capture = crate::clan_targeting::capture_target(
+                                .ok_or("target query strength output is unavailable")?;
+                            let selection = if handler == 64 {
+                                crate::clan_targeting::attack_target(
+                                    &self.mission, &self.object_drafts, &self.control_device_tables,
+                                    world, clan, radius,
+                                    self.clan_ai_events.base_radius_limits.get(&clan).copied().unwrap_or(700.0),
+                                )
+                            } else { crate::clan_targeting::capture_target(
                                 &self.mission, &self.object_drafts, &self.control_device_tables,
                                 world, clan, radius, |id| {
                                     self.clan_ai_events.problems.get(&clan).is_some_and(|scheduler| {
@@ -232,20 +240,25 @@ impl LoadedMissionState {
                                         })
                                     })
                                 },
-                            );
-                            let (target, strength) = capture.unwrap_or((u32::MAX, 1e12_f32));
+                            ) };
+                            let (target, strength) = selection.unwrap_or((u32::MAX, 1e12_f32));
                             let strength = crate::clan_targeting::encode_strength(strength);
                             *estimate = match *estimate {
                                 VarSetDefault::Dword(_) => VarSetDefault::Dword(
                                     problem_dword(strength.to_bits())
-                                        .ok_or("Handler(35) strength is outside the DWORD range")?
+                                        .ok_or("target strength is outside the DWORD range")?
                                 ),
                                 VarSetDefault::FloatBits(_) => VarSetDefault::FloatBits(strength.to_bits()),
                             };
-                            let count = self.clan_ai_events.capture_queries.entry(clan).or_default();
+                            let (queries, name) = if handler == 64 {
+                                (&mut self.clan_ai_events.attack_queries, "script_attack_target_approx")
+                            } else {
+                                (&mut self.clan_ai_events.capture_queries, "script_capture_target_approx")
+                            };
+                            let count = queries.entry(clan).or_default();
                             *count += 1;
                             if *count == 1 {
-                                eprintln!("sim_coverage script_capture_target_approx=1 clan={clan} target={target} strength={strength}");
+                                eprintln!("sim_coverage {name}=1 clan={clan} target={target} strength={strength}");
                             }
                             Ok(Some(VarSetDefault::Dword(target)))
                         }
@@ -829,6 +842,18 @@ fn storage_space(ores: &[BehaviorOreState], world: &World, clan: OwnerId) -> f32
 }
 
 impl ClanAiEvents {
+    pub(super) fn set_base_radius(&mut self, clan: usize, limit: f32) {
+        if limit.is_finite() && limit > 0.0 {
+            self.base_radius_limits.insert(clan, limit);
+        }
+    }
+
+    pub(super) fn attack_queries(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
+        self.attack_queries
+            .iter()
+            .map(|(&clan, &count)| (clan, count))
+    }
+
     pub(super) fn capture_approaches(&self) -> impl Iterator<Item = (u32, u32, u64)> + '_ {
         self.capture_approaches
             .iter()

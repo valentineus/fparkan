@@ -2528,8 +2528,12 @@ fn load_mission_with_options(
             unit_patrol = Some(patrol);
         }
     }
+    let mut clan_ai_events = clan_ai_events::ClanAiEvents::default();
     for order in init_orders {
         match order {
+            clan_script_init::InitOrder::BaseRadius { clan, limit } => {
+                clan_ai_events.set_base_radius(clan, limit);
+            }
             clan_script_init::InitOrder::Patrol(order) => {
                 let Some(patrol) = &mut unit_patrol else {
                     continue;
@@ -2689,7 +2693,7 @@ fn load_mission_with_options(
         script_init_states: loaded_scripts.init_states,
         script_varset_states: loaded_scripts.varset_states,
         mission_events,
-        clan_ai_events: clan_ai_events::ClanAiEvents::default(),
+        clan_ai_events,
         mine_sites,
         unit_patrol,
         player_pitch_bits: 0,
@@ -2915,6 +2919,7 @@ pub struct SimulationReport {
     /// Approximate clan strength queries, grouped by caller and target clan.
     pub script_strength_queries: Vec<(usize, u16, u64)>,
     pub script_capture_queries: Vec<(usize, u64)>,
+    pub script_attack_queries: Vec<(usize, u64)>,
     pub script_capturer_queries: Vec<(usize, u64)>,
     pub script_capture_approaches: Vec<(u32, u32, u64)>,
     /// First factory completion by clan, in milliseconds.
@@ -2960,6 +2965,7 @@ pub fn simulate_mission_report(
         script_factory_orders: Vec::new(),
         script_strength_queries: Vec::new(),
         script_capture_queries: Vec::new(),
+        script_attack_queries: Vec::new(),
         script_capturer_queries: Vec::new(),
         script_capture_approaches: Vec::new(),
         first_factory_completion_ms: Default::default(),
@@ -3044,6 +3050,9 @@ pub fn simulate_mission_report(
         report
             .script_capture_queries
             .extend(loaded.clan_ai_events.capture_queries());
+        report
+            .script_attack_queries
+            .extend(loaded.clan_ai_events.attack_queries());
         report
             .script_capturer_queries
             .extend(loaded.clan_ai_events.capturer_queries());
@@ -8279,6 +8288,10 @@ fn resolve_init_states(
                     }
                     if let Some(write) = script_time::deadline_write(instruction, values) {
                         return Some(Some(write));
+                    }
+                    if let Some(limit) = clan_script_init::base_radius(instruction, values) {
+                        init_orders.push(clan_script_init::InitOrder::BaseRadius { clan, limit });
+                        return Some(None);
                     }
                     if let Some(order) =
                         clan_script_init::unit_order(&varset.declarations, instruction, values)
