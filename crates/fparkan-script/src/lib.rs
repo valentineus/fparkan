@@ -1113,6 +1113,33 @@ impl VarSet {
         values: &mut [VarSetDefault],
         mut host: impl FnMut(&ScriptInstruction, &[VarSetDefault]) -> Result<Option<u32>, String>,
     ) -> Result<(), (usize, String)> {
+        self.execute_event_prefix(event, formulas, values, |instruction, values| {
+            let target = instruction.header_words[1];
+            if matches!(
+                values.get(target as usize),
+                Some(VarSetDefault::FloatBits(_))
+            ) {
+                return Err(format!("unsupported result target {target}"));
+            }
+            host(instruction, values).map(|result| result.map(VarSetDefault::Dword))
+        })
+    }
+
+    /// Executes an event whose host can return DWORD and float values.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first unsupported instruction, including a result type mismatch.
+    pub fn execute_event_prefix(
+        &self,
+        event: &ScriptEvent,
+        formulas: Option<&FormulaTable>,
+        values: &mut [VarSetDefault],
+        mut host: impl FnMut(
+            &ScriptInstruction,
+            &[VarSetDefault],
+        ) -> Result<Option<VarSetDefault>, String>,
+    ) -> Result<(), (usize, String)> {
         let mut conditions = Vec::new();
         for (index, instruction) in event.instructions.iter().enumerate() {
             match advance_condition(&mut conditions, instruction, values)
@@ -1128,14 +1155,20 @@ impl VarSet {
                     return Err((index, format!("unsupported handler control {control}")));
                 }
                 let target = instruction.header_words[1];
-                if target != u32::MAX
-                    && !matches!(values.get(target as usize), Some(VarSetDefault::Dword(_)))
-                {
+                if target != u32::MAX && values.get(target as usize).is_none() {
                     return Err((index, format!("unsupported result target {target}")));
                 }
                 let result = host(instruction, values).map_err(|reason| (index, reason))?;
-                if let Some(VarSetDefault::Dword(cell)) = values.get_mut(target as usize) {
-                    *cell = result.unwrap_or_default();
+                if let Some(cell) = values.get_mut(target as usize) {
+                    *cell = match (*cell, result) {
+                        (VarSetDefault::Dword(_), Some(result @ VarSetDefault::Dword(_)))
+                        | (
+                            VarSetDefault::FloatBits(_),
+                            Some(result @ VarSetDefault::FloatBits(_)),
+                        ) => result,
+                        (VarSetDefault::Dword(_), None) => VarSetDefault::Dword(0),
+                        _ => return Err((index, format!("unsupported result target {target}"))),
+                    };
                 }
                 continue;
             }
@@ -2361,6 +2394,31 @@ mod tests {
             header_words: [u32::MAX, target, u32::MAX, u32::MAX, 6, 0, formula],
             references: Vec::new(),
         }
+    }
+
+    #[test]
+    fn periodic_event_accepts_a_float_result_from_a_typed_host() {
+        let varset = parse_varset(b"VAR(float, remaining, 0)\n").unwrap();
+        let event = ScriptEvent {
+            name_len: 9,
+            name_raw: b"Problems0\0".to_vec(),
+            event_word: 0,
+            instructions: vec![ScriptInstruction {
+                header_words: [3, 0, u32::MAX, u32::MAX, 6, 0, u32::MAX],
+                references: Vec::new(),
+            }],
+        };
+        let result = VarSetDefault::FloatBits((-2.5_f32).to_bits());
+        let mut values = [VarSetDefault::FloatBits(0)];
+        varset
+            .execute_event_prefix(&event, None, &mut values, |_, _| Ok(Some(result)))
+            .unwrap();
+        assert_eq!(values, [result]);
+        assert!(varset
+            .execute_mission_prefix(&event, None, &mut values, |_, _| panic!(
+                "legacy host must reject float targets before invocation"
+            ))
+            .is_err());
     }
 
     fn init_handler19() -> ScriptInstruction {

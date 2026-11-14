@@ -40,19 +40,29 @@ impl LoadedMissionState {
             else {
                 continue;
             };
-            let result = varset.declarations.execute_mission_prefix(
+            let result = varset.declarations.execute_event_prefix(
                 event,
                 bundle.formula_table.as_ref(),
                 &mut state.values,
                 |instruction, values| match instruction.dispatch_selector() {
+                    ScriptDispatchSelector::Handler(3) if instruction.references.is_empty() => {
+                        let [available, _, _, demand, _] = bundle
+                            .behavior_warm_start
+                            .ok_or("Handler(3) requires live Behavior totals")?
+                            .cleared_words
+                            .map(f32::from_bits);
+                        Ok(Some(VarSetDefault::FloatBits(
+                            (available - demand).to_bits(),
+                        )))
+                    }
                     ScriptDispatchSelector::Handler(49) if instruction.references.is_empty() => {
                         let slots = self
                             .ai_startup_states
                             .iter()
                             .find(|state| state.clan_index == clan);
-                        Ok(Some(
+                        Ok(Some(VarSetDefault::Dword(
                             slots.map_or(0, |state| count_free_minds(&state.record_slots)),
-                        ))
+                        )))
                     }
                     ScriptDispatchSelector::Handler(34) => {
                         let &[index] = instruction.references.as_slice() else {
@@ -61,10 +71,12 @@ impl LoadedMissionState {
                         let Some(&VarSetDefault::Dword(class)) = values.get(index as usize) else {
                             return Err("Handler(34) requires one DWORD operand".to_owned());
                         };
-                        Ok(Some(self.mission_events.count_clan_class(
-                            world,
-                            OwnerId(clan as u16),
-                            class,
+                        Ok(Some(VarSetDefault::Dword(
+                            self.mission_events.count_clan_class(
+                                world,
+                                OwnerId(clan as u16),
+                                class,
+                            ),
                         )))
                     }
                     ScriptDispatchSelector::Handler(65) if instruction.references.is_empty() => {
@@ -81,7 +93,7 @@ impl LoadedMissionState {
                                 bundle.script_path
                             );
                         }
-                        Ok(Some(0))
+                        Ok(Some(VarSetDefault::Dword(0)))
                     }
                     selector => Err(format!("{selector:?}")),
                 },
