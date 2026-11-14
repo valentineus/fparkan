@@ -17246,6 +17246,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             [Some(500), Some(150), None, Some(4)]
         );
+        let mut weapons = weapons;
+        let mut shots = [const { Vec::new() }; 4];
+        let mut missile_points = Vec::new();
+        for ms in (0..=9000).step_by(17) {
+            for (slot, _, muzzle) in weapons.fire(true, ms) {
+                shots[slot].push(ms);
+                if slot == 3 {
+                    missile_points.push(muzzle.position);
+                }
+            }
+        }
+        assert_eq!(&shots[0][..4], [136, 408, 680, 952]);
+        assert_eq!(&shots[1][..4], [255, 1020, 1785, 2550]);
+        assert_eq!(&shots[2][..4], [136, 595, 1054, 1513]);
+        assert_eq!(shots[3], [510, 2465, 4420, 6375]);
+        assert_ne!(missile_points[0], missile_points[1]);
+        assert_eq!(missile_points[0], missile_points[2]);
+        assert_eq!(missile_points[1], missile_points[3]);
+        assert_eq!(weapons.weapons()[3].rounds_remaining(), Some(0));
         for (weapon, (speed, lifetime_ms)) in weapons.weapons().iter().zip([
             (350.0, 1000),
             (150.0, 5000),

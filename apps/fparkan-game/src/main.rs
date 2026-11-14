@@ -10497,9 +10497,6 @@ impl StaticVulkanApp {
         let (Some(cockpit), Some(frame)) = (self.cockpit, &self.mission_frame) else {
             return;
         };
-        if !trigger {
-            return;
-        }
         let Some((_, state)) = frame
             .snapshot
             .transforms
@@ -10530,17 +10527,17 @@ impl StaticVulkanApp {
         // shortcut: the camera supplies a shared aim direction until native
         // per-weapon CPT direction and turret alignment agree in world space.
         let direction = self.view_camera.forward;
-        for (slot, weapon) in self.player_weapons.fire(trigger, clock_ms) {
+        for (slot, weapon, barrel) in self.player_weapons.fire(trigger, clock_ms) {
             let pose = control_effect_owner_node_pose(
                 Some(hierarchy),
                 mount.is_some(),
-                weapon.muzzle.raw_signed_field_04 as usize,
+                barrel.raw_signed_field_04 as usize,
             );
             let muzzle = pose.and_then(|pose| {
                 let pose = mount.map_or(pose, |mount| compose_unit_pose(mount, pose));
                 let point = add3(
                     pose.translation,
-                    rotate_unit_vector(weapon.muzzle.position, pose.rotation),
+                    rotate_unit_vector(barrel.position, pose.rotation),
                 );
                 transform.try_transform_scaled_point(point, scale)
             });
