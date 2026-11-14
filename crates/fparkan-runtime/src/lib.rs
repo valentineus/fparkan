@@ -2902,6 +2902,8 @@ pub struct SimulationReport {
     pub clan_ai_event_stops: Vec<(MissionEventStop, u64)>,
     /// Calls to stubbed research policy or status, grouped by clan and handler.
     pub clan_research_status_stubs: Vec<(usize, u8, u64)>,
+    /// Counts of pending script problems by clan and problem kind.
+    pub clan_problem_dispatch_stubs: std::collections::BTreeMap<(usize, u32), u64>,
     /// Total requests for mission information messages.
     pub mission_messages: u64,
     /// Clock of the first autonomous shot, in milliseconds.
@@ -2937,6 +2939,7 @@ pub fn simulate_mission_report(
         mission_event_stops: Vec::new(),
         clan_ai_event_stops: Vec::new(),
         clan_research_status_stubs: Vec::new(),
+        clan_problem_dispatch_stubs: Default::default(),
         mission_messages: 0,
         autodemo_first_shot_ms: None,
         autodemo_first_destroyed_ms: None,
@@ -2991,6 +2994,12 @@ pub fn simulate_mission_report(
         report
             .clan_research_status_stubs
             .extend(loaded.clan_ai_events.research_status_stubs());
+        for problem in loaded.clan_ai_events.pending_problems() {
+            *report
+                .clan_problem_dispatch_stubs
+                .entry(problem)
+                .or_default() += 1;
+        }
     }
     Ok(report)
 }

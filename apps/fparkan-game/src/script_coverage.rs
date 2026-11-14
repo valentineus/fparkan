@@ -21,6 +21,9 @@ pub(super) fn log_script_init(engine: &Engine, mission: &str) {
 }
 
 pub(super) fn log_clan_ai_stops(report: &SimulationReport) {
+    for (&(clan, kind), count) in &report.clan_problem_dispatch_stubs {
+        eprintln!("sim_coverage script_problem_dispatch_stubs={count} clan={clan} problem={kind}");
+    }
     for &(clan, handler, count) in &report.clan_research_status_stubs {
         eprintln!(
             "sim_coverage script_research_status_stubs={count} clan={clan} handler={handler}"

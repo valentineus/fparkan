@@ -313,8 +313,7 @@ ownership значения на FPU stack и следующий consumer, поэ
 ветка данного издания; её нельзя делать приоритетным execution path без
 отдельного dynamic/evidence route.
 
-`Handler(2)` (третья entry table, VA `0x10009610`) уже имеет статический
-contract, но ещё не Rust execution: он выбирает active event/instruction через
+`Handler(2)` (третья entry table, VA `0x10009610`) выбирает active event/instruction через
 runtime offsets `+0x48/+0x4c` и разрешает семь 32-bit slots через varset object
 `+0x18`. Их доказанный dataflow: slot 0 даёт один `u32` и base string, slot 1
 даёт numeric scalar, slots 2 и 3 — по `u32`, slots 4, 5 и 6 принимают только
@@ -327,10 +326,9 @@ record fields `+0x0c` и `+0x14`, затем вызывает его refresh pat
 При отсутствии record он лениво ищет в event table имена `<base>_Start` и
 `<base>_Continue`, сохраняет их IDs в indexed state и materializes новый
 internal record. В этой ветке не видно прямого World3D/Behavior call, поэтому
-это доказанная scheduler/event-record boundary, а не команда движения, атаки
-или строительства. Semantic names семи slots и consumer нового record остаются
-открытыми; до dynamic capture Rust возвращает явный
-unsupported result, а не «примерный» game command.
+это граница очереди заявок. FParkan проверяет наличие обеих секций в пакете
+и передаёт значения планировщику клана. Заявка учитывается в отчёте покрытия
+до подключения запуска секций при обновлении AI.
 
 У этой границы также нет скрытого immediate dispatch: после добавления новой
 записи `0x100059f0` вызывает `0x1000f920`, а Ghidra 12.1.2 декомпилирует эту
