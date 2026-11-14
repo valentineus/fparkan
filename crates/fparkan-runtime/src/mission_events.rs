@@ -227,6 +227,20 @@ impl MissionEvents {
         ))
     }
 
+    pub(super) fn has_live_logic_object(
+        &self,
+        mission: &super::MissionDocument,
+        world: &World,
+        id: u32,
+    ) -> bool {
+        self.logic_objects(mission, world, id).any(|handle| {
+            registration_sequence(world, handle)
+                .ok()
+                .flatten()
+                .is_some()
+        })
+    }
+
     pub(super) fn issue_logic_id(
         &mut self,
         mission: &super::MissionDocument,
@@ -854,6 +868,15 @@ impl LoadedMissionState {
                     );
                     Ok(Some(count))
                 }
+                ScriptDispatchSelector::Handler(39) => {
+                    let id = single_dword(instruction, values)
+                        .ok_or("Handler(39) requires one DWORD logical ID")?;
+                    Ok(Some(u32::from(mission_events.has_live_logic_object(
+                        &self.mission,
+                        world,
+                        id,
+                    ))))
+                }
                 ScriptDispatchSelector::Handler(52) => {
                     let id = single_dword(instruction, values)
                         .ok_or("Handler(52) requires one DWORD operand")?;
@@ -1070,6 +1093,74 @@ mod tests {
         construct_object, new, register_object, request_delete, set_owner, ObjectDraft, OwnerId,
         WorldConfig,
     };
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_clan_checks_for_live_unit_in_problems0() {
+        use crate::{EngineServices, MissionMode, MissionRequest, MissionStartupInput};
+        use fparkan_vfs::DirectoryVfs;
+        use std::sync::Arc;
+
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").unwrap();
+        let mut engine =
+            crate::create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
+        crate::load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/CAMPAIGN/CAMPAIGN.05/Mission.01/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+
+        let loaded = engine.loaded.as_ref().unwrap();
+        let unit = super::placed_logic_objects(&loaded.mission, &engine.world, 25)
+            .next()
+            .unwrap();
+        let attackers = [2, 3, 23, 27, 28, 30].map(|id| {
+            super::placed_logic_objects(&loaded.mission, &engine.world, id)
+                .next()
+                .unwrap()
+        });
+        let hero = super::placed_logic_objects(&loaded.mission, &engine.world, 12)
+            .next()
+            .unwrap();
+        assert!(loaded
+            .mission_events
+            .has_live_logic_object(&loaded.mission, &engine.world, 25));
+        crate::clan_ai_events::tick(&mut engine, 7_000);
+        let patrol = engine
+            .loaded
+            .as_ref()
+            .unwrap()
+            .unit_patrol
+            .as_ref()
+            .unwrap();
+        assert_eq!(patrol.attack_target(attackers[0]), None);
+        request_delete(&mut engine.world, unit).unwrap();
+        crate::clan_ai_events::tick(&mut engine, 14_000);
+        let loaded = engine.loaded.as_ref().unwrap();
+        assert!(!loaded
+            .mission_events
+            .has_live_logic_object(&loaded.mission, &engine.world, 25));
+        assert!(!loaded.mission_events.has_live_logic_object(
+            &loaded.mission,
+            &engine.world,
+            u32::MAX
+        ));
+        assert!(loaded.clan_ai_events.stops().next().is_none());
+        let patrol = loaded.unit_patrol.as_ref().unwrap();
+        assert!(attackers.into_iter().all(|handle| {
+            patrol
+                .attack_target(handle)
+                .is_some_and(|(target, _)| target == hero)
+        }));
+    }
 
     #[test]
     fn exit_cylinder_includes_the_wall_and_caps() {

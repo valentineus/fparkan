@@ -548,6 +548,16 @@ impl LoadedMissionState {
                                 .declarations
                                 .resolve_handler15_with_values(instruction, values)
                                 .map_err(|error| error.to_string())?;
+                            if let (3, 3, Handler15TargetPayload::ByLogicId(target)) =
+                                (order.word_1, order.word_2, order.target)
+                            {
+                                let patrol = self.unit_patrol.get_or_insert_with(crate::unit_patrol::UnitPatrol::scripted);
+                                let accepted = crate::script_patrol::apply_attack_order(
+                                    patrol, &self.mission, &self.object_drafts, world,
+                                    order.word_0, target,
+                                ).is_some();
+                                return Ok(Some(VarSetDefault::Dword(u32::from(accepted))));
+                            }
                             if let (7, 3, Handler15TargetPayload::ByPlace { first, second }) =
                                 (order.word_1, order.word_2, order.target)
                             {
@@ -967,6 +977,12 @@ impl LoadedMissionState {
                                 eprintln!("sim_coverage script_building_site_approx=1 clan={clan} class={class:#010x} site={position:?}");
                             }
                             Ok(Some(VarSetDefault::Dword(1)))
+                        }
+                        ScriptDispatchSelector::Handler(39) => {
+                            let id = single_dword(&instruction.references, values)
+                                .ok_or("Handler(39) requires one DWORD logical ID")?;
+                            let exists = self.mission_events.has_live_logic_object(&self.mission, world, id);
+                            Ok(Some(VarSetDefault::Dword(u32::from(exists))))
                         }
                         ScriptDispatchSelector::Handler(49)
                             if instruction.references.is_empty() =>
