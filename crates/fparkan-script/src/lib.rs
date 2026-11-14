@@ -2021,6 +2021,11 @@ impl Handler2RecordScheduler {
         &self.records
     }
 
+    /// Forgets a solved problem so a later submission can create it again.
+    pub fn remove(&mut self, key: Handler2RecordKey) {
+        self.records.retain(|record| record.key != key);
+    }
+
     /// Inserts or refreshes one resolved handler input.
     ///
     /// The original compares the three identity words bit-for-bit. On an

@@ -441,8 +441,9 @@ core и `ResearchCandidateSet::refresh_selection`: последний получ
 `script_research_status_stubs` считает вызовы `Handler(65)` без каталога
 и `Handler(56)` без подключённого флага автоматических исследований.
 `script_problem_dispatch_stubs` считает накопленные заявки по клану и типу.
-Очередь принимает заявки с секциями `_Start` и `_Continue`. Исполнение
-этих секций и порядок выбора заявок ещё открыты.
+Очередь принимает заявки с секциями `_Start` и `_Continue`.
+`script_problem_start_approx` отмечает выбор одной заявки с наибольшим весом
+за тик. Исполнение `_Continue`, равные приоритеты и старение заявок открыты.
 Оригинальный getter `ai.dll+0x111d0` возвращает ноль в этом состоянии.
 `Handler(15)` для `ORDER_ROBOT_SEARCH` генератора пока проходит как
 `script_init_handler_stub`. GOG Behavior.dll по RVA `0x30110` настраивает

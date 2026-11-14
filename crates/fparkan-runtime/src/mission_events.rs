@@ -158,6 +158,29 @@ impl MissionEvents {
             .count() as u32
     }
 
+    pub(super) fn first_available_placed_unit(
+        &self,
+        mission: &super::MissionDocument,
+        world: &World,
+        clan: usize,
+        class: u32,
+    ) -> Option<u32> {
+        self.placed_clan_objects
+            .iter()
+            .find_map(|&(handle, candidate)| {
+                if candidate != class || self.reserved_units.contains(&(clan, handle)) {
+                    return None;
+                }
+                registration_sequence(world, handle).ok()??;
+                let identity = identity_metadata(world, handle).ok()?;
+                if identity.owner_id != Some(OwnerId(clan as u16)) {
+                    return None;
+                }
+                let object = mission.objects.get(identity.original_id?.0 as usize)?;
+                Some(object.identity_or_clan_raw)
+            })
+    }
+
     pub(super) fn set_reservation(
         &mut self,
         mission: &super::MissionDocument,

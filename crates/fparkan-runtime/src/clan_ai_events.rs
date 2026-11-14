@@ -1,6 +1,7 @@
 use crate::{BehaviorOreState, LoadedMissionState, MissionEventStop};
 use fparkan_script::{
-    Handler2RecordInput, Handler2RecordScheduler, ScriptDispatchSelector, VarSet, VarSetDefault,
+    Handler2Record, Handler2RecordInput, Handler2RecordScheduler, ScriptDispatchSelector, VarSet,
+    VarSetDefault,
 };
 use fparkan_world::{identity_metadata, registration_sequence, OwnerId, World};
 use std::collections::BTreeMap;
@@ -14,6 +15,7 @@ pub(super) struct ClanAiEvents {
     stops: BTreeMap<(usize, usize, usize), (MissionEventStop, u64)>,
     research_stubs: BTreeMap<(usize, u8), u64>,
     problems: BTreeMap<usize, Handler2RecordScheduler>,
+    started: BTreeMap<(usize, u32), u64>,
 }
 
 impl LoadedMissionState {
@@ -46,11 +48,44 @@ impl LoadedMissionState {
             else {
                 continue;
             };
-            let result = varset.declarations.execute_event_prefix(
-                event,
-                bundle.formula_table.as_ref(),
-                &mut state.values,
-                |instruction, values| match instruction.dispatch_selector() {
+            let mut next = Some((event_index, event, None));
+            while let Some((event_index, event, problem)) = next.take() {
+                let mut solved = false;
+                let result = varset.declarations.execute_event_prefix(
+                    event,
+                    bundle.formula_table.as_ref(),
+                    &mut state.values,
+                    |instruction, values| match instruction.dispatch_selector() {
+                    ScriptDispatchSelector::Handler(8) if problem.is_some() => {
+                        if single_dword(&instruction.references, values) != Some(2) {
+                            return Err("Handler(8) only supports ST_SOLVED".into());
+                        }
+                        solved = true;
+                        Ok(None)
+                    }
+                    ScriptDispatchSelector::Handler(14) if problem.is_some() => {
+                        let (mode, class) = instruction.dword_pair(values)
+                            .ok_or("Handler(14) requires a unit mode and class")?;
+                        if mode != 2 {
+                            return Err("Handler(14) only supports UNIT_ANY_UNIT".into());
+                        }
+                        // shortcut: only unassigned placed objects until PBM owns roster slots.
+                        let id = self.mission_events.first_available_placed_unit(
+                            &self.mission, world, clan, class
+                        );
+                        Ok(Some(VarSetDefault::Dword(id.unwrap_or(u32::MAX))))
+                    }
+                    ScriptDispatchSelector::Handler(29) => {
+                        let problem: &Handler2Record = problem.as_ref().ok_or("Handler(29) requires a current problem")?;
+                        let bits = match single_dword(&instruction.references, values) {
+                            Some(0) => problem.key.scalar_4_bits,
+                            Some(1) => problem.key.scalar_5_bits,
+                            Some(2) => problem.scalar_6.to_bits(),
+                            _ => return Err("Handler(29) requires a problem argument index from 0 to 2".into()),
+                        };
+                        Ok(Some(VarSetDefault::Dword(problem_dword(bits).ok_or("Handler(29) argument is outside the supported DWORD range")?)))
+                    }
+                    ScriptDispatchSelector::Handler(0) if problem.is_some() && instruction.references.len() == 1 => Ok(Some(VarSetDefault::Dword(1))),
                     ScriptDispatchSelector::Handler(2) => {
                         let (name, input) = problem_operands(&varset.declarations, values, &instruction.references)
                             .ok_or("Handler(2) requires seven numeric problem operands")?;
@@ -133,31 +168,111 @@ impl LoadedMissionState {
                     }
                     selector => Err(format!("{selector:?}")),
                 },
-            );
-            if let Err((instruction_index, reason)) = result {
-                let (stop, count) = self
+                );
+                if let Err((instruction_index, reason)) = result {
+                    let (stop, count) = self
+                        .clan_ai_events
+                        .stops
+                        .entry((clan, event_index, instruction_index))
+                        .or_insert_with(|| {
+                            (
+                                MissionEventStop {
+                                    clan_index: clan,
+                                    script_path: bundle.script_path.clone(),
+                                    event_index,
+                                    instruction_index,
+                                    reason,
+                                },
+                                0,
+                            )
+                        });
+                    *count += 1;
+                    if *count == 1 {
+                        eprintln!("sim_coverage script_clan_ai_unsupported=1 clan={clan} script={} event={event_index} instruction={instruction_index} reason={}", stop.script_path, stop.reason);
+                    }
+                }
+                if let Some(problem) = problem {
+                    if solved {
+                        self.clan_ai_events
+                            .problems
+                            .entry(clan)
+                            .or_default()
+                            .remove(problem.key);
+                    }
+                    continue;
+                }
+                // shortcut: run one highest-priority Start per tick until ties, decay and Continue are wired.
+                let Some(problem) = self
                     .clan_ai_events
-                    .stops
-                    .entry((clan, event_index, instruction_index))
-                    .or_insert_with(|| {
-                        (
-                            MissionEventStop {
-                                clan_index: clan,
-                                script_path: bundle.script_path.clone(),
-                                event_index,
-                                instruction_index,
-                                reason,
-                            },
-                            0,
-                        )
-                    });
-                *count += 1;
-                if *count == 1 {
-                    eprintln!("sim_coverage script_clan_ai_unsupported=1 clan={clan} script={} event={event_index} instruction={instruction_index} reason={}", stop.script_path, stop.reason);
+                    .problems
+                    .get(&clan)
+                    .and_then(|queue| highest_problem(queue.records()))
+                    .cloned()
+                else {
+                    continue;
+                };
+                let Some(kind) = varset.declarations.declarations.iter().find(|entry| {
+                    entry.name.starts_with("PBM_")
+                        && entry.default_value == VarSetDefault::Dword(problem.key.word_0)
+                }) else {
+                    continue;
+                };
+                let problem_id = problem.key.word_0;
+                let start = format!("{}_Start\0", kind.name);
+                next = bundle
+                    .package
+                    .events
+                    .iter()
+                    .enumerate()
+                    .find(|(_, event)| {
+                        event.name_raw == start.as_bytes() && !event.instructions.is_empty()
+                    })
+                    .map(|(index, event)| (index, event, Some(problem)));
+                if next.is_some() {
+                    let count = self
+                        .clan_ai_events
+                        .started
+                        .entry((clan, problem_id))
+                        .or_default();
+                    *count += 1;
+                    if *count == 1 {
+                        eprintln!(
+                            "sim_coverage script_problem_start_approx=1 clan={clan} problem={}",
+                            kind.name
+                        );
+                    }
                 }
             }
         }
     }
+}
+
+fn highest_problem(problems: &[Handler2Record]) -> Option<&Handler2Record> {
+    problems
+        .iter()
+        .filter(|record| record.scalar_1 > 0.0)
+        .reduce(|best, record| {
+            if record.scalar_1 > best.scalar_1 {
+                record
+            } else {
+                best
+            }
+        })
+}
+
+fn single_dword(references: &[u32], values: &[VarSetDefault]) -> Option<u32> {
+    let &[index] = references else {
+        return None;
+    };
+    values.get(index as usize)?.as_dword()
+}
+
+fn problem_dword(bits: u32) -> Option<u32> {
+    let value = f64::from(f32::from_bits(bits));
+    let limit = 9_223_372_036_854_775_808.0;
+    (-limit..limit)
+        .contains(&value)
+        .then(|| value.trunc() as i64 as u32)
 }
 
 fn problem_operands<'a>(
@@ -171,13 +286,7 @@ fn problem_operands<'a>(
     let value = |index: u32| values.get(index as usize).copied();
     let word = |index| match value(index)? {
         VarSetDefault::Dword(value) => Some(value),
-        VarSetDefault::FloatBits(bits) => {
-            let value = f64::from(f32::from_bits(bits));
-            let limit = 9_223_372_036_854_775_808.0;
-            (-limit..limit)
-                .contains(&value)
-                .then(|| value.trunc() as i64 as u32)
-        }
+        VarSetDefault::FloatBits(bits) => problem_dword(bits),
     };
     let scalar = |index| match value(index)? {
         VarSetDefault::Dword(value) => Some(value as f32),
@@ -243,6 +352,12 @@ impl ClanAiEvents {
                 .map(move |record| (clan, record.key.word_0))
         })
     }
+
+    pub(super) fn started_problems(&self) -> impl Iterator<Item = (usize, u32, u64)> + '_ {
+        self.started
+            .iter()
+            .map(|(&(clan, kind), &count)| (clan, kind, count))
+    }
 }
 
 #[cfg(test)]
@@ -291,6 +406,26 @@ mod tests {
                 scalar_6: 6.0,
             }
         );
+    }
+
+    #[test]
+    fn problem_selection_requires_a_positive_priority_and_preserves_order_on_ties() {
+        let mut queue = Handler2RecordScheduler::default();
+        for (word_0, scalar_1) in [(1, 0.0), (2, -3.0), (3, 0.5), (4, 0.5)] {
+            queue.submit(Handler2RecordInput {
+                word_0,
+                scalar_1,
+                word_2: 0,
+                word_3: 0,
+                scalar_4: 0.0,
+                scalar_5: 0.0,
+                scalar_6: 0.0,
+            });
+        }
+        let first = highest_problem(queue.records()).unwrap().key;
+        assert_eq!(first.word_0, 3);
+        queue.remove(first);
+        assert_eq!(highest_problem(queue.records()).unwrap().key.word_0, 4);
     }
 
     #[test]
