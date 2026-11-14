@@ -999,6 +999,7 @@ impl VarSet {
         event: &ScriptEvent,
         formulas: Option<&FormulaTable>,
         values: &mut [VarSetDefault],
+        mut host: impl FnMut(&ScriptInstruction, &[VarSetDefault]) -> Result<Option<u32>, String>,
     ) -> Result<(), (usize, String)> {
         let mut conditions = Vec::new();
         for (index, instruction) in event.instructions.iter().enumerate() {
@@ -1031,7 +1032,20 @@ impl VarSet {
                 break;
             }
             if instruction.dispatch_selector() != ScriptDispatchSelector::Sentinel {
-                return Err((index, format!("{:?}", instruction.dispatch_selector())));
+                if control != u32::MAX {
+                    return Err((index, format!("unsupported handler control {control}")));
+                }
+                let target = instruction.header_words[1];
+                if target != u32::MAX
+                    && !matches!(values.get(target as usize), Some(VarSetDefault::Dword(_)))
+                {
+                    return Err((index, format!("unsupported result target {target}")));
+                }
+                let result = host(instruction, values).map_err(|reason| (index, reason))?;
+                if let Some(VarSetDefault::Dword(cell)) = values.get_mut(target as usize) {
+                    *cell = result.unwrap_or_default();
+                }
+                continue;
             }
             match self
                 .resolve_assignment(instruction, formulas, values)
@@ -2162,7 +2176,9 @@ mod tests {
         };
         let mut values = [VarSetDefault::Dword(0), VarSetDefault::Dword(1)];
         assert_eq!(
-            varset.execute_mission_prefix(&event, None, &mut values),
+            varset.execute_mission_prefix(&event, None, &mut values, |instruction, _| {
+                Err(format!("{:?}", instruction.dispatch_selector()))
+            }),
             Err((6, "Handler(32)".into()))
         );
         assert_eq!(values, [VarSetDefault::Dword(1); 2]);

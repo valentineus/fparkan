@@ -628,6 +628,8 @@ pub(crate) struct GameAudio {
     ambient: Player,
     music: Player,
     variations: Player,
+    mission_voice: Player,
+    mission_cfg: NormalizedPath,
     weather_loop: NativeSpatialPlayer,
     control_sounds: BTreeMap<usize, NativeSpatialPlayer>,
     one_shots: Vec<SpatialOneShot>,
@@ -663,6 +665,7 @@ impl GameAudio {
         let ambient = Player::connect_new(stream.mixer());
         let music = Player::connect_new(stream.mixer());
         let variations = Player::connect_new(stream.mixer());
+        let mission_voice = Player::connect_new(stream.mixer());
         let listener = Listener::default();
         let (left, right) = ear_positions(listener)?;
         let weather_loop =
@@ -672,6 +675,8 @@ impl GameAudio {
             ambient,
             music,
             variations,
+            mission_voice,
+            mission_cfg,
             weather_loop,
             control_sounds: BTreeMap::new(),
             one_shots: Vec::new(),
@@ -918,7 +923,12 @@ impl GameAudio {
     /// Pauses or resumes every live audio source without changing selection.
     pub(crate) fn set_paused(&mut self, paused: bool) {
         self.paused = paused;
-        for player in [&self.ambient, &self.music, &self.variations] {
+        for player in [
+            &self.ambient,
+            &self.music,
+            &self.variations,
+            &self.mission_voice,
+        ] {
             if paused {
                 player.pause();
             } else {
@@ -951,6 +961,7 @@ impl GameAudio {
         self.ambient.stop();
         self.music.stop();
         self.variations.stop();
+        self.mission_voice.stop();
         self.weather_loop.stop();
         for player in self.control_sounds.values() {
             player.stop();
@@ -958,6 +969,44 @@ impl GameAudio {
         for one_shot in &self.one_shots {
             one_shot.player.stop();
         }
+    }
+
+    /// Queues a mission voice by its index in the map's message definitions.
+    pub(crate) fn queue_mission_voice(&mut self, index: u32) -> Result<String, String> {
+        let mission_cfg = self.mission_cfg.as_str();
+        let messages = mission_cfg.rsplit_once('/').map_or_else(
+            || "messages.cfg".to_owned(),
+            |(directory, _)| format!("{directory}/messages.cfg"),
+        );
+        let messages = normalize_relative(messages.as_bytes(), PathPolicy::StrictLegacy)
+            .map_err(|error| error.to_string())?;
+        let bytes = self
+            .library
+            .vfs
+            .read(&messages)
+            .map_err(|error| error.to_string())?;
+        let symbol = message_voice_symbol(&bytes, index)?.ok_or_else(|| {
+            format!(
+                "voice for index {index} is missing in {}",
+                messages.as_str()
+            )
+        })?;
+        let mission = self
+            .library
+            .vfs
+            .read(&self.mission_cfg)
+            .map_err(|error| error.to_string())?;
+        let (archive, file) = voice_resource(&mission, &symbol)?
+            .ok_or_else(|| format!("voice resource {symbol} is missing in {mission_cfg}"))?;
+        let asset = self
+            .dynamic_sound(&archive, &file)
+            .map_err(|error| error.to_string())?;
+        self.mission_voice
+            .append(decoder_for(&asset).map_err(|error| error.to_string())?);
+        if !self.paused {
+            self.mission_voice.play();
+        }
+        Ok(asset.resource_name())
     }
 
     fn start_theme(&self) -> Result<(), AudioError> {
@@ -1394,6 +1443,50 @@ fn parse_mission_audio_config(bytes: &[u8]) -> Result<MissionAudioConfig, String
     })
 }
 
+fn config_objects(text: &str) -> impl Iterator<Item = BTreeMap<String, &str>> {
+    text.lines()
+        .map(|line| line.split('#').next().unwrap_or_default().trim())
+        .scan(None, |object, line| {
+            let kind = line.split_whitespace().next().unwrap_or_default();
+            if kind.eq_ignore_ascii_case("object") {
+                *object = Some(BTreeMap::new());
+            } else if kind.eq_ignore_ascii_case("end") {
+                return Some(object.take());
+            } else if let (Some(fields), Some((key, value))) = (object, line.split_once('=')) {
+                fields.insert(key.trim().to_ascii_uppercase(), value.trim());
+            }
+            Some(None)
+        })
+        .flatten()
+}
+
+fn message_voice_symbol(bytes: &[u8], index: u32) -> Result<Option<String>, String> {
+    for object in config_objects(&String::from_utf8_lossy(bytes)) {
+        if object
+            .get("MESSAGE_INDEX")
+            .and_then(|index| parse_cfg_value(index).ok())
+            .and_then(|value| value.parse::<u32>().ok())
+            == Some(index)
+        {
+            return object
+                .get("VOICE_RESOURCE")
+                .map(|value| parse_cfg_value(value))
+                .transpose();
+        }
+    }
+    Ok(None)
+}
+
+fn voice_resource(bytes: &[u8], symbol: &str) -> Result<Option<(String, String)>, String> {
+    let symbol = symbol.to_ascii_uppercase();
+    for object in config_objects(&String::from_utf8_lossy(bytes)) {
+        if let (Some(library), Some(file)) = (object.get("LIBRARY"), object.get(&symbol)) {
+            return Ok(Some((parse_cfg_value(library)?, parse_cfg_value(file)?)));
+        }
+    }
+    Ok(None)
+}
+
 fn parse_cfg_value(value: &str) -> Result<String, String> {
     if let Some(rest) = value.strip_prefix('"') {
         let end = rest
@@ -1411,6 +1504,18 @@ fn parse_cfg_value(value: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mission_voice_uses_the_index_and_preserves_the_declared_archive() {
+        let messages = b"object message\nmessage_index = 14\nvoice_resource = \"hint\"\nend\n";
+        let mission = b"object voices\nlibrary = \"custom.lib\"\nHINT = \"run.wav\"\nend\n# \xff";
+        let symbol = message_voice_symbol(messages, 14).unwrap().unwrap();
+        assert_eq!(
+            voice_resource(mission, &symbol).unwrap(),
+            Some(("custom.lib".into(), "run.wav".into()))
+        );
+        assert_eq!(message_voice_symbol(messages, 15).unwrap(), None);
+    }
 
     #[test]
     fn parses_original_ambient_names_in_numeric_order() {

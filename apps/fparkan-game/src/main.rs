@@ -193,9 +193,9 @@ fn run(args: &[String]) -> Result<String, String> {
             log_mission_event_stop(stop);
         }
         return Ok(format!(
-            "simulation mission={} ticks={} queue_time_ms={} live_objects={} world_events={} init_states={} mission_events={}\n{SIMULATION_COVERAGE} {camera_coverage}",
+            "simulation mission={} ticks={} queue_time_ms={} live_objects={} world_events={} init_states={} mission_events={} mission_messages={}\n{SIMULATION_COVERAGE} {camera_coverage}",
             loaded.key, report.ticks, duration_ms, report.live_objects, report.world_events,
-            loaded.script_init_state_count, report.mission_events,
+            loaded.script_init_state_count, report.mission_events, report.mission_messages,
         ));
     }
     let mission_assets_duration = mission_assets_started.elapsed();
@@ -10492,6 +10492,16 @@ impl StaticVulkanApp {
                 .and_then(|tick| tick.stop.as_ref())
             {
                 log_mission_event_stop(stop);
+            }
+            if let Some(tick) = &frame.mission_event {
+                for &index in &tick.messages {
+                    if let Some(audio) = &mut self.audio {
+                        match audio.queue_mission_voice(index) {
+                            Ok(resource) => eprintln!("mission_voice index={index} resource={resource} queue_time_ms={control_clock_ms}"),
+                            Err(error) => eprintln!("sim_coverage mission_voice_unavailable=1 index={index} reason={error}"),
+                        }
+                    }
+                }
             }
             self.mission_frame = Some(frame);
         }

@@ -2257,7 +2257,7 @@ pub fn step_headless(
     let mission_event = engine
         .loaded
         .as_mut()
-        .and_then(|state| state.tick_mission_event(queue_time_ms));
+        .and_then(|state| state.tick_mission_event(&engine.world, queue_time_ms));
     Ok(FrameResult {
         snapshot,
         mission_event,
@@ -2275,7 +2275,7 @@ pub fn frame(engine: &mut Engine, queue_time_ms: u32) -> Result<FrameResult, Eng
 
 /// Coverage entries for the subsystems still absent from the mission loop.
 pub const SIMULATION_COVERAGE: &str =
-    "sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 unit_behavior_stub=1 render_object_lifecycle_stub=1 render_winding_change_stub=1 mission_event_clock_approx=1";
+    "sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 unit_behavior_stub=1 render_object_lifecycle_stub=1 render_winding_change_stub=1 mission_event_clock_approx=1 mission_tactical_ids_stub=1 mission_message_ui_stub=1";
 
 /// Totals from a headless mission coverage run.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2290,6 +2290,8 @@ pub struct SimulationReport {
     pub mission_events: u64,
     /// Distinct uncovered periodic event instructions.
     pub mission_event_stops: Vec<MissionEventStop>,
+    /// Total requests for mission information messages.
+    pub mission_messages: u64,
 }
 
 /// Steps a freshly loaded mission from queue time zero at 60 Hz for coverage.
@@ -2309,6 +2311,7 @@ pub fn simulate_mission_report(
         world_events: 0,
         mission_events: 0,
         mission_event_stops: Vec::new(),
+        mission_messages: 0,
     };
     let steps = (u64::from(duration_ms) * 60).div_ceil(1000);
     for tick in 1..=steps {
@@ -2320,6 +2323,7 @@ pub fn simulate_mission_report(
         if let Some(event) = frame.mission_event {
             report.mission_events += 1;
             report.mission_event_stops.extend(event.stop);
+            report.mission_messages += event.messages.len() as u64;
         }
     }
     Ok(report)
@@ -17057,7 +17061,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
-    fn licensed_firing_range_reports_first_periodic_instruction() {
+    fn licensed_firing_range_voices_spawn_area_messages_once() {
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(licensed_root("IS")));
         let mut engine = create(EngineServices::new(vfs)).unwrap();
         load_mission_with_init_stubs(
@@ -17073,15 +17077,17 @@ mod tests {
         )
         .unwrap();
         let first = frame(&mut engine, 5).unwrap().mission_event.unwrap();
+        assert_eq!(first.messages, [11, 14]);
         let stop = first.stop.unwrap();
         assert_eq!(
             (stop.clan_index, stop.event_index, stop.instruction_index),
-            (0, 2, 0)
+            (0, 2, 49)
         );
-        assert_eq!(stop.reason, "Handler(32)");
+        assert_eq!(stop.reason, "Handler(31)");
         assert!(frame(&mut engine, 2_004).unwrap().mission_event.is_none());
         let next = frame(&mut engine, 2_005).unwrap().mission_event.unwrap();
         assert!(next.stop.is_none());
+        assert!(next.messages.is_empty());
     }
 
     #[test]
