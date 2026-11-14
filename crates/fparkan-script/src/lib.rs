@@ -246,7 +246,7 @@ impl std::fmt::Display for ScriptInitResolveError {
             Self::Handler19(source) => write!(formatter, "Handler(19): {source}"),
             Self::UnsupportedFormulaControlWord { found } => write!(
                 formatter,
-                "unsupported formula control word 0x{found:08x}; expected 0xffffffff"
+                "unsupported formula control word 0x{found:08x}; expected 0x6 or 0xffffffff"
             ),
             Self::UnsupportedFormulaCopySource { found } => write!(
                 formatter,
@@ -836,6 +836,24 @@ impl VarSet {
                     }
                     Err(error) => Err(ScriptInitResolveError::Handler19(error)),
                 }
+            }
+            ScriptDispatchSelector::Sentinel if instruction.header_words[3] == 6 => {
+                let index = instruction.header_words[1];
+                let target = self.declarations.get(index as usize).ok_or(
+                    ScriptInitResolveError::VarSetIndexOutOfBounds {
+                        index,
+                        declarations: self.declarations.len(),
+                    },
+                )?;
+                let immediate = instruction.header_words[2];
+                let value = match target.type_name {
+                    VarSetType::Dword => VarSetDefault::Dword(immediate),
+                    VarSetType::Float => VarSetDefault::FloatBits(immediate),
+                };
+                Ok(InitInstructionResolution::Executed(vec![ScriptInitWrite {
+                    index,
+                    value,
+                }]))
             }
             ScriptDispatchSelector::Sentinel => {
                 if instruction.header_words[3] != u32::MAX {
@@ -2802,6 +2820,33 @@ STRING( 8, ignored, ignored, ignored)\r\n";
                     },
                 ],
             })
+        );
+    }
+
+    #[test]
+    fn script_init_control_six_assigns_an_immediate_without_a_formula_table() {
+        let varset = parse_varset(b"VAR(DWORD, mask, 0)\nVAR(float, scalar, 0)\n").unwrap();
+        let immediate = |target, word| ScriptInstruction {
+            header_words: [u32::MAX, target, word, 6, 6, 0, u32::MAX],
+            references: Vec::new(),
+        };
+        let package = init_package(vec![immediate(0, 0xfffe), immediate(1, 0x3f4c_cccd)]);
+        assert_eq!(
+            varset.resolve_init(&package, init_input(), None).unwrap(),
+            ScriptInitResolution::Executed {
+                event_index: 0,
+                event_word: 0,
+                writes: vec![
+                    ScriptInitWrite {
+                        index: 0,
+                        value: VarSetDefault::Dword(0xfffe)
+                    },
+                    ScriptInitWrite {
+                        index: 1,
+                        value: VarSetDefault::FloatBits(0x3f4c_cccd)
+                    },
+                ],
+            },
         );
     }
 
