@@ -4,6 +4,8 @@ use crate::TerrainWorld;
 // shortcut: bound stair steps and drops until the native hero collider is wired.
 const STEP_UP: f32 = 0.85;
 const STEP_DOWN: f32 = 2.0;
+// shortcut: sample the temporary floor probe at most 0.16 units apart until native collision is wired.
+const WALK_COLLISION_INTERVAL: f32 = 0.02;
 
 /// Player controls sampled once for a simulation step.
 #[derive(Clone, Copy, Debug, Default)]
@@ -128,6 +130,31 @@ pub fn plan_player_motion(
     cockpit: StartingCockpit,
     input: PlayerMotion,
 ) -> Result<Option<PlayerMotionStep>, EngineError> {
+    plan_player_steps(engine, cockpit, input, None)
+}
+
+/// Resolves walking in short sweeps and returns the last reachable pose for this frame.
+///
+/// # Errors
+/// Returns an error if motion or the scene collision query fails.
+pub fn plan_player_motion_with_collision(
+    engine: &Engine,
+    cockpit: StartingCockpit,
+    input: PlayerMotion,
+    mut resolve: impl FnMut(PlayerMotionStep) -> Result<(PlayerMotionStep, bool), EngineError>,
+) -> Result<Option<PlayerMotionStep>, EngineError> {
+    plan_player_steps(engine, cockpit, input, Some(&mut resolve))
+}
+
+type ResolveMotion<'a> =
+    &'a mut dyn FnMut(PlayerMotionStep) -> Result<(PlayerMotionStep, bool), EngineError>;
+
+fn plan_player_steps(
+    engine: &Engine,
+    cockpit: StartingCockpit,
+    mut input: PlayerMotion,
+    resolve: Option<ResolveMotion<'_>>,
+) -> Result<Option<PlayerMotionStep>, EngineError> {
     let (Some(mission), Ok(pose)) = (
         &engine.loaded,
         transform_state(&engine.world, cockpit.handle),
@@ -165,14 +192,46 @@ pub fn plan_player_motion(
     {
         return Ok(None);
     }
-    plan_motion(
-        &mission.terrain,
-        pose,
-        f32::from_bits(mission.player_pitch_bits),
-        flying,
-        input,
-    )
-    .map(Some)
+    let pitch = f32::from_bits(mission.player_pitch_bits);
+    let Some(resolve) = resolve else {
+        return plan_motion(&mission.terrain, pose, pitch, flying, input).map(Some);
+    };
+    if !input.delta_seconds.is_finite() || input.delta_seconds < 0.0 {
+        return Err(EngineError::Movement("invalid player step".into()));
+    }
+    let count = if !flying && input.movement != [0.0; 2] {
+        // shortcut: bound movement after a long stall while the scene uses the render clock.
+        input.delta_seconds = input.delta_seconds.min(0.5);
+        (input.delta_seconds / WALK_COLLISION_INTERVAL).ceil() as u32
+    } else {
+        1
+    }
+    .max(1);
+    input.delta_seconds /= count as f32;
+    let mut step = plan_motion(&mission.terrain, pose, pitch, flying, input)?;
+    let mut previous = pose;
+    input.mouse_x = 0.0;
+    input.mouse_y = 0.0;
+    for index in 0..count {
+        if index != 0 {
+            step = plan_motion(
+                &mission.terrain,
+                previous,
+                f32::from_bits(step.pitch_bits),
+                flying,
+                input,
+            )?;
+        }
+        let (resolved, blocked) = resolve(step)?;
+        step = resolved;
+        if blocked {
+            step.pose.position = previous.position;
+            step.sweep = None;
+            break;
+        }
+        previous = step.pose;
+    }
+    Ok(Some(step))
 }
 
 fn plan_motion(

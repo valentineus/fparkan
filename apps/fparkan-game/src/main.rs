@@ -79,15 +79,13 @@ use fparkan_render_vulkan::{
     VulkanStaticCamera, VulkanStaticDrawRange, VulkanStaticMaterial, VulkanStaticMesh,
     VulkanStaticTexture, VulkanStaticTextureMip, VulkanStaticVertex,
 };
-#[cfg(test)]
-use fparkan_runtime::load_mission_with_init_stubs;
 use fparkan_runtime::{
     apply_projectile_contact, autodemo_camera, board_friendly_warbot, capture_building,
     capture_neutral_warbot, create, deploy_mine, disembark_warbot, frame as step_mission_frame,
     frame_with_player_motion, load_gameplay_mission, load_mission_static_preview,
     load_mission_static_preview_roots, load_player_projectile, loaded_mission_assets,
     loaded_mission_object_drafts, loaded_mission_script_bundles, loaded_terrain,
-    mission_object_handle, order_lab_research, plan_player_motion, player_vehicle,
+    mission_object_handle, order_lab_research, plan_player_motion_with_collision, player_vehicle,
     prepared_warbot_weapons, projectile_terrain_hit, projectile_unit_hit,
     query_building_segment_world, simulate_mission_report, starting_cockpit,
     starting_player_weapons, AutoDemoCamera, AutoDemoView, BasementPlacementMode, BuildingMeshNode,
@@ -96,6 +94,8 @@ use fparkan_runtime::{
     MissionScriptInitExecution, MissionStartupInput, PlayerMotion, PlayerProjectile, PlayerWeapons,
     StartingCockpit, SIMULATION_COVERAGE,
 };
+#[cfg(test)]
+use fparkan_runtime::{load_mission_with_init_stubs, plan_player_motion};
 #[cfg(test)]
 use fparkan_terrain::BasementFoundationFragment;
 use fparkan_terrain::{
@@ -11299,7 +11299,7 @@ impl StaticVulkanApp {
                     pressed[index] || self.pressed_keys.contains(&PLAYER_MOVEMENT_KEYS[index]),
                 )
             });
-            if let Some(step) = plan_player_motion(
+            if let Some(step) = plan_player_motion_with_collision(
                 engine,
                 cockpit,
                 PlayerMotion {
@@ -11309,11 +11309,14 @@ impl StaticVulkanApp {
                     mouse_y,
                     delta_seconds: clock.delta_seconds,
                 },
+                |step| {
+                    self.resolve_player_building_step(step)
+                        .map_err(EngineError::Movement)
+                },
             )
             .map_err(|error| error.to_string())?
             {
-                let (step, blocked) = self.resolve_player_building_step(step)?;
-                player_step = Some((cockpit, step, blocked));
+                player_step = Some((cockpit, step));
             }
         }
         if let Some(engine) = self.mission_engine.as_mut() {
@@ -11483,8 +11486,8 @@ impl StaticVulkanApp {
                 }
             }
             let frame = match player_step {
-                Some((cockpit, step, blocked)) => {
-                    frame_with_player_motion(engine, control_clock_ms, cockpit, step, blocked)
+                Some((cockpit, step)) => {
+                    frame_with_player_motion(engine, control_clock_ms, cockpit, step, false)
                 }
                 None => step_mission_frame(engine, control_clock_ms),
             }
@@ -14202,40 +14205,37 @@ mod tests {
                 if distance < 0.035 {
                     break;
                 }
-                now += 15;
+                now += 292;
                 assert!(
                     now < 30_000,
                     "stalled at {:?}",
                     hero.position.map(f32::from_bits)
                 );
-                let step = plan_player_motion(
+                let step = plan_player_motion_with_collision(
                     &engine,
                     cockpit,
                     PlayerMotion {
                         movement: [(x - hx) / distance, (y - hy) / distance],
-                        delta_seconds: distance.min(0.12) / 8.0,
+                        delta_seconds: distance.min(8.0 * 0.292) / 8.0,
                         ..PlayerMotion::default()
+                    },
+                    |step| {
+                        app.resolve_player_building_step(step)
+                            .map_err(EngineError::Movement)
                     },
                 )
                 .unwrap()
                 .unwrap();
-                let (step, blocked) = app.resolve_player_building_step(step).unwrap();
                 update_gameplay_animation_pose_buffers(
                     &mut animations,
                     &mut app.component_pose_buffers,
                     now,
                     None,
-                    Some(([hx, hy, hz], 0.015, &app.building_collision_bindings)),
+                    Some(([hx, hy, hz], 0.292, &app.building_collision_bindings)),
                 )
                 .unwrap();
-                assert!(
-                    !blocked,
-                    "blocked at {:?} on the way to {target:?}",
-                    hero.position.map(f32::from_bits)
-                );
-                hero = pose(
-                    frame_with_player_motion(&mut engine, now, cockpit, step, blocked).unwrap(),
-                );
+                hero =
+                    pose(frame_with_player_motion(&mut engine, now, cockpit, step, false).unwrap());
             }
         }
         let [x, y, z] = hero.position.map(f32::from_bits);

@@ -70,7 +70,9 @@ pub use mission_events::{
     capture_building, capture_neutral_building, capture_neutral_warbot, MissionEventStop,
     MissionEventTick, MissionNotice,
 };
-pub use player_motion::{plan_player_motion, PlayerMotion, PlayerMotionStep};
+pub use player_motion::{
+    plan_player_motion, plan_player_motion_with_collision, PlayerMotion, PlayerMotionStep,
+};
 pub use player_status::{player_status, PlayerStatus};
 pub use player_weapon::{prepared_warbot_weapons, starting_player_weapons, PlayerWeapons};
 pub use production::{
