@@ -1914,7 +1914,12 @@ fn load_mission_with_options(
                 .take(plan.reserve_per_scheme)
         }));
     }
-    graph_roots.extend(build_scheme.map(|scheme| resource_name(scheme.as_str().as_bytes())));
+    if let Some(scheme) = build_scheme {
+        graph_roots.extend(
+            std::iter::repeat_with(|| resource_name(scheme.as_str().as_bytes()))
+                .take(production::RESERVE_SLOTS),
+        );
+    }
     let scoped_graph_roots = match options.asset_scope {
         MissionAssetScope::Full => graph_roots.as_slice(),
         MissionAssetScope::FirstMeshPreview => graph_roots.get(..1).unwrap_or_default(),
@@ -2397,14 +2402,11 @@ fn load_mission_with_options(
         Vec::new()
     };
     let (autodemo_reinforcements, production) = if build_scheme.is_some() {
-        let control = reserve_controls.into_iter().next().ok_or_else(|| {
-            EngineError::Production("missing Control table for build scheme".into())
-        })?;
         (
             None,
             Some(production::Production::new(
                 reserve_start,
-                control,
+                reserve_controls,
                 &object_drafts,
             )?),
         )
@@ -17957,7 +17959,6 @@ mod tests {
                 .owner_id,
             Some(OwnerId(0))
         );
-        assert!(order_factory_robot(&mut engine, cockpit, 64_001).is_err());
         let next = frame(&mut engine, 66_001).unwrap();
         assert!(next.produced_unit.is_none());
         let event = next.mission_event.unwrap();
@@ -18020,6 +18021,29 @@ mod tests {
                 .position,
             driven.position
         );
+        player_pose.position = [391.3_f32, 740.1, 145.12].map(f32::to_bits);
+        set_transform(&mut engine.world, cockpit.handle, player_pose).unwrap();
+        let mut live = vec![robot];
+        let mut now = 68_001;
+        for _ in 1..production::RESERVE_SLOTS {
+            let duration = order_factory_robot(&mut engine, cockpit, now).unwrap();
+            now += duration;
+            let result = frame(&mut engine, now).unwrap();
+            let new = result.produced_unit.expect("another finished robot");
+            assert!(live.iter().all(|unit| unit.object_index != new.object_index
+                && result.snapshot.objects.contains(&unit.handle)));
+            live.push(new);
+        }
+        assert!(order_factory_robot(&mut engine, cockpit, now).is_err());
+        fparkan_world::request_delete(&mut engine.world, robot.handle).unwrap();
+        let duration = order_factory_robot(&mut engine, cockpit, now).unwrap();
+        let replaced = frame(&mut engine, now + duration).unwrap();
+        let replacement = replaced.produced_unit.expect("reused slot");
+        assert_eq!(replacement.object_index, robot.object_index);
+        assert_ne!(replacement.handle, robot.handle);
+        assert!(live[1..]
+            .iter()
+            .all(|unit| replaced.snapshot.objects.contains(&unit.handle)));
     }
 
     #[test]

@@ -10,15 +10,20 @@ use fparkan_world::{
     handle_by_original_id, identity_metadata, transform_state, ObjectHandle, OwnerId,
 };
 
+// shortcut: GPU geometry is prepared for a bounded number of live builds.
+// Lift the cap when the renderer can instantiate new roots during a mission.
+pub(super) const RESERVE_SLOTS: usize = 8;
+
 pub(super) struct Production {
-    reserve: usize,
-    control: MissionControlDeviceTableState,
+    reserve_start: usize,
+    controls: Vec<MissionControlDeviceTableState>,
     free_units: Vec<(usize, u32)>,
     pending: Option<Order>,
     rng: u32,
 }
 
 struct Order {
+    slot: usize,
     plant: ObjectHandle,
     plant_index: usize,
     owner: OwnerId,
@@ -28,11 +33,18 @@ struct Order {
 
 impl Production {
     pub(super) fn new(
-        reserve: usize,
-        control: MissionControlDeviceTableState,
+        reserve_start: usize,
+        controls: Vec<MissionControlDeviceTableState>,
         drafts: &[MissionObjectDraft],
     ) -> Result<Self, EngineError> {
-        if !drafts[reserve]
+        if controls.len() != RESERVE_SLOTS
+            || drafts.len().checked_sub(reserve_start) != Some(controls.len())
+        {
+            return Err(EngineError::Production(
+                "missing prepared build scheme slots".into(),
+            ));
+        }
+        if !drafts[reserve_start]
             .unit_dat_header_flags
             .is_some_and(|class| class & MOBILE_UNIT != 0 && class != super::HERO_UNIT_CLASS)
         {
@@ -40,7 +52,7 @@ impl Production {
                 "build scheme must be a mobile Unit DAT".into(),
             ));
         }
-        let free_units = drafts[..reserve]
+        let free_units = drafts[..reserve_start]
             .iter()
             .enumerate()
             .filter(|(_, draft)| draft.unit_dat_header_flags == Some(PLANT_CLASS))
@@ -54,8 +66,8 @@ impl Production {
             })
             .collect();
         Ok(Self {
-            reserve,
-            control,
+            reserve_start,
+            controls,
             free_units,
             pending: None,
             rng: 1,
@@ -96,10 +108,10 @@ impl Production {
         let handle = spawn_prepared_unit(
             world,
             mission,
-            self.reserve,
+            order.slot,
             order.owner.0,
             position,
-            self.control.clone(),
+            self.controls[order.slot - self.reserve_start].clone(),
         )?;
         if let Some((_, count)) = self
             .free_units
@@ -109,7 +121,7 @@ impl Production {
             *count -= 1;
         }
         Ok(Some(SpawnedUnit {
-            object_index: self.reserve,
+            object_index: order.slot,
             handle,
             clan: order.owner.0,
         }))
@@ -138,15 +150,16 @@ pub fn order_factory_robot(
             "factory order already in progress".into(),
         ));
     }
-    let draft = &mission.object_drafts[production.reserve];
-    if draft
-        .original_id
-        .is_some_and(|id| handle_by_original_id(&engine.world, id).is_some())
-    {
-        return Err(EngineError::Production(
-            "the previous robot is still active".into(),
-        ));
-    }
+    let slot = (production.reserve_start..production.reserve_start + production.controls.len())
+        .find(|&index| {
+            mission.object_drafts[index]
+                .original_id
+                .is_some_and(|id| handle_by_original_id(&engine.world, id).is_none())
+        })
+        .ok_or_else(|| {
+            EngineError::Production("all prepared factory robot slots are occupied".into())
+        })?;
+    let draft = &mission.object_drafts[slot];
     let player = identity_metadata(&engine.world, cockpit.handle)?;
     let owner = player
         .owner_id
@@ -182,6 +195,7 @@ pub fn order_factory_robot(
         EngineError::Production("scheme size is unsupported by this factory".into())
     })?;
     production.pending = Some(Order {
+        slot,
         plant,
         plant_index,
         owner,
