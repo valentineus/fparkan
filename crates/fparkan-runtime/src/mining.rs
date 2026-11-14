@@ -257,6 +257,33 @@ pub(super) fn remaining_for_clan(sites: &[MineSite], world: &World, owner: Owner
         .fold(0.0, |sum, amount| sum + amount)
 }
 
+pub(super) fn resume_mining(sites: &mut [MineSite], world: &World, mine: ObjectHandle) -> bool {
+    let Some(id) = identity_metadata(world, mine)
+        .ok()
+        .and_then(|identity| identity.original_id)
+    else {
+        return false;
+    };
+    let Ok(transform) = transform_state(world, mine) else {
+        return false;
+    };
+    let position = transform.position.map(f32::from_bits);
+    let mut available = false;
+    for site in sites.iter_mut().filter(|site| {
+        site.remaining > 0.0 && distance_xy(site.position, position) < MINE_COLLECTION_RADIUS
+    }) {
+        match site.live_mine(world) {
+            Some(handle) if handle == mine => available = true,
+            None => {
+                site.placed_mine = Some(id);
+                available = true;
+            }
+            _ => {}
+        }
+    }
+    available
+}
+
 fn reject(message: &str) -> EngineError {
     EngineError::Production(message.into())
 }
@@ -333,11 +360,15 @@ mod tests {
         let (a, first) = create(0, 1, 20.0);
         let (_, second) = create(1, 0, 30.0);
         let (_, third) = create(2, 1, 40.0);
-        let sites = [first, second, third];
+        let mut sites = [first, second, third];
         assert_eq!(remaining_for_clan(&sites, &world, OwnerId(1)), 60.0);
         request_delete(&mut world, a).unwrap();
         fparkan_world::step(&mut world, &fparkan_world::InputSnapshot).unwrap();
         assert_eq!(remaining_for_clan(&sites, &world, OwnerId(1)), 40.0);
+        let remaining_mine = sites[2].live_mine(&world).unwrap();
+        assert!(resume_mining(&mut sites, &world, remaining_mine));
+        assert_eq!(remaining_for_clan(&sites, &world, OwnerId(1)), 60.0);
+        assert_eq!(remaining_for_clan(&sites, &world, OwnerId(0)), 30.0);
     }
 
     #[test]

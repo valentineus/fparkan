@@ -132,11 +132,52 @@ impl LoadedMissionState {
                             // Behavior has no count cap for ordinary warbots in Handler(11).
                             Ok(Some(VarSetDefault::Dword(0)))
                         }
-                        ScriptDispatchSelector::Handler(15) if problem.is_some() => {
+                        ScriptDispatchSelector::Handler(13)
+                            if instruction.dword_pair(values)
+                                == Some((0, crate::mining::MINE_CLASS)) =>
+                        {
+                            let id = self.mission_events.first_available_placed_unit(
+                                &self.mission,
+                                world,
+                                clan,
+                                crate::mining::MINE_CLASS,
+                            );
+                            Ok(Some(VarSetDefault::Dword(id.unwrap_or(u32::MAX))))
+                        }
+                        ScriptDispatchSelector::Handler(15) => {
                             let order = varset
                                 .declarations
                                 .resolve_handler15_with_values(instruction, values)
                                 .map_err(|error| error.to_string())?;
+                            if order.word_1 == 0x0a
+                                && order.word_2 == 3
+                                && order.word_3 == 0
+                                && matches!(order.target, Handler15TargetPayload::NotDefined(_))
+                            {
+                                let mine = crate::script_patrol::unit_by_logic_id(
+                                    &self.mission,
+                                    &self.object_drafts,
+                                    world,
+                                    order.word_0,
+                                    |class| class == crate::mining::MINE_CLASS,
+                                )
+                                .filter(|&handle| {
+                                    identity_metadata(world, handle).is_ok_and(|identity| {
+                                        identity.owner_id == Some(OwnerId(clan as u16))
+                                    })
+                                });
+                                let available = mine.is_some_and(|handle| {
+                                    crate::mining::resume_mining(
+                                        &mut self.mine_sites,
+                                        world,
+                                        handle,
+                                    )
+                                });
+                                return Ok(Some(VarSetDefault::Dword(u32::from(available))));
+                            }
+                            if problem.is_none() {
+                                return Err("Handler(15) order is unavailable in Problems0".into());
+                            }
                             if order.word_1 != 0x0c
                                 || order.word_2 != 1
                                 || order.word_3 != crate::boarding::WARBOT_CLASS
