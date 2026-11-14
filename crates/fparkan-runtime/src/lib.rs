@@ -47,6 +47,7 @@ mod building_door;
 mod clan_ai_events;
 mod clan_combat_strength;
 mod clan_script_init;
+mod clan_targeting;
 mod mesh_collision;
 mod mining;
 mod mission_events;
@@ -2911,6 +2912,7 @@ pub struct SimulationReport {
     pub script_factory_orders: Vec<(u16, u32, u64)>,
     /// Approximate clan strength queries, grouped by caller and target clan.
     pub script_strength_queries: Vec<(usize, u16, u64)>,
+    pub script_capture_queries: Vec<(usize, u64)>,
     /// First factory completion by clan, in milliseconds.
     pub first_factory_completion_ms: std::collections::BTreeMap<u16, u32>,
     /// Total requests for mission information messages.
@@ -2953,6 +2955,7 @@ pub fn simulate_mission_report(
         script_factory_rejections: Vec::new(),
         script_factory_orders: Vec::new(),
         script_strength_queries: Vec::new(),
+        script_capture_queries: Vec::new(),
         first_factory_completion_ms: Default::default(),
         mission_messages: 0,
         autodemo_first_shot_ms: None,
@@ -3032,6 +3035,9 @@ pub fn simulate_mission_report(
         report
             .script_strength_queries
             .extend(loaded.clan_ai_events.strength_queries());
+        report
+            .script_capture_queries
+            .extend(loaded.clan_ai_events.capture_queries());
     }
     Ok(report)
 }

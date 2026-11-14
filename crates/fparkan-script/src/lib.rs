@@ -1133,7 +1133,8 @@ impl VarSet {
         })
     }
 
-    /// Executes an event whose host can return DWORD and float values.
+    /// Executes an event whose host can return DWORD and float values and update
+    /// variables passed as output operands.
     ///
     /// # Errors
     ///
@@ -1145,7 +1146,7 @@ impl VarSet {
         values: &mut [VarSetDefault],
         mut host: impl FnMut(
             &ScriptInstruction,
-            &[VarSetDefault],
+            &mut [VarSetDefault],
         ) -> Result<Option<VarSetDefault>, String>,
     ) -> Result<(), (usize, String)> {
         let mut conditions = Vec::new();
