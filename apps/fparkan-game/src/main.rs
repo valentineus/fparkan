@@ -4903,6 +4903,7 @@ struct ControlAnimationInstance {
     state: ControlInstanceState,
     last_sampled_node_times: Vec<Option<f32>>,
     reported_unsupported_fallback: bool,
+    door_blends: Vec<f32>,
 }
 
 #[derive(Clone)]
@@ -7533,11 +7534,22 @@ fn emit_control_animation_capture_diagnostics(
     }
 }
 
+#[cfg(test)]
 fn update_control_animation_pose_buffers(
     instances: &mut [Vec<Option<ControlAnimationInstance>>],
     pose_buffers: &mut [Vec<Option<NodePoseBuffer>>],
     native_clock_ms: u32,
     aim: Option<(StartingCockpit, f32)>,
+) -> Result<(), String> {
+    update_gameplay_animation_pose_buffers(instances, pose_buffers, native_clock_ms, aim, None)
+}
+
+fn update_gameplay_animation_pose_buffers(
+    instances: &mut [Vec<Option<ControlAnimationInstance>>],
+    pose_buffers: &mut [Vec<Option<NodePoseBuffer>>],
+    native_clock_ms: u32,
+    aim: Option<(StartingCockpit, f32)>,
+    player_doors: Option<([f32; 3], f32, &[BuildingCollisionBinding])>,
 ) -> Result<(), String> {
     for (object_index, components) in instances.iter_mut().enumerate() {
         let Some(object_pose_buffers) = pose_buffers.get_mut(object_index) else {
@@ -7595,6 +7607,29 @@ fn update_control_animation_pose_buffers(
                     apply_manual_turret_elevation(&instance.control, radians, &mut node_times);
                 }
             }
+            if let Some((player, delta_seconds, buildings)) = player_doors {
+                if fparkan_runtime::has_proximity_doors(&instance.control) {
+                    if let Some(binding) = buildings
+                        .iter()
+                        .find(|binding| {
+                            binding.object_index == object_index
+                                && binding.component_index == component_index
+                        })
+                        .filter(|binding| !binding.mounted)
+                    {
+                        fparkan_runtime::sample_proximity_doors(
+                            &instance.control,
+                            &instance.model,
+                            binding.root_transform,
+                            binding.owner_scale,
+                            player,
+                            delta_seconds,
+                            &mut instance.door_blends,
+                            &mut node_times,
+                        );
+                    }
+                }
+            }
             instance.last_sampled_node_times.clone_from(&node_times);
             let times = node_times
                 .into_iter()
@@ -7625,7 +7660,10 @@ fn control_tree_chain_animates(
             || controls
                 .get(index)
                 .and_then(Option::as_ref)
-                .is_some_and(|control| control.typed_records.iter().any(|record| record.tag == 21))
+                .is_some_and(|control| {
+                    fparkan_runtime::has_proximity_doors(control)
+                        || control.typed_records.iter().any(|record| record.tag == 21)
+                })
         {
             return true;
         }
@@ -8587,6 +8625,7 @@ fn static_preview_mesh_and_materials(
                         state: ControlInstanceState::default(),
                         last_sampled_node_times: Vec::new(),
                         reported_unsupported_fallback: false,
+                        door_blends: Vec::new(),
                     });
                 }
             }
@@ -10031,7 +10070,7 @@ fn mission_camera_coverage(cockpit: Option<StartingCockpit>, demo: bool) -> &'st
     if demo {
         "autodemo_camera_follow_approx=1 autodemo_camera_target_approx=1 cockpit_pose_approx=1"
     } else if cockpit.is_some() {
-        "player_motion_approx=1 cockpit_aim_approx=1 cockpit_pose_approx=1 player_weapon_cycle_approx=1 player_projectile_flight_approx=1 player_projectile_damage_approx=1 player_projectile_hull_stub=1 player_weapon_fx_stub=1 player_capture_approx=1 player_communicator_approx=1 player_building_floor_approx=1 player_boarding_approx=1 player_vehicle_flight_approx=1"
+        "player_motion_approx=1 cockpit_aim_approx=1 cockpit_pose_approx=1 player_weapon_cycle_approx=1 player_projectile_flight_approx=1 player_projectile_damage_approx=1 player_projectile_hull_stub=1 player_weapon_fx_stub=1 player_capture_approx=1 player_communicator_approx=1 player_building_floor_approx=1 player_building_door_approx=1 player_boarding_approx=1 player_vehicle_flight_approx=1"
     } else {
         "mission_camera_stub=1"
     }
@@ -10919,6 +10958,45 @@ impl StaticVulkanApp {
         Ok(self.building_segment_hit(world_segment, false)?.is_some())
     }
 
+    fn resolve_player_building_step(
+        &self,
+        mut step: fparkan_runtime::PlayerMotionStep,
+    ) -> Result<(fparkan_runtime::PlayerMotionStep, bool), String> {
+        if let Some(probe) = step.floor_probe() {
+            let mesh_floor = self
+                .building_segment_hit(probe, true)?
+                .map(|point| point[2]);
+            let mut floor = mesh_floor;
+            if let Some((height, previous_floor)) = step.terrain_exit_floor() {
+                if floor.is_none_or(|mesh| mesh < height)
+                    && self.building_segment_hit(previous_floor, true)?.is_some()
+                    && !self.building_segment_blocked([
+                        [probe[0][0], probe[0][1], height + 0.02],
+                        probe[0],
+                    ])?
+                {
+                    floor = Some(height);
+                }
+            }
+            if let Some(height) = floor {
+                step = step.with_building_floor(height);
+                if let Some(segments) = step.floor_sweeps() {
+                    for segment in segments.into_iter().filter(|[from, to]| from != to) {
+                        if self.building_segment_blocked(segment)? {
+                            return Ok((step, true));
+                        }
+                    }
+                }
+                return Ok((step, false));
+            }
+        }
+        let blocked = match step.sweep {
+            Some(segment) => self.building_segment_blocked(segment)?,
+            None => false,
+        };
+        Ok((step, blocked))
+    }
+
     fn building_segment_hit(
         &self,
         world_segment: [[f32; 3]; 2],
@@ -11221,7 +11299,7 @@ impl StaticVulkanApp {
                     pressed[index] || self.pressed_keys.contains(&PLAYER_MOVEMENT_KEYS[index]),
                 )
             });
-            if let Some(mut step) = plan_player_motion(
+            if let Some(step) = plan_player_motion(
                 engine,
                 cockpit,
                 PlayerMotion {
@@ -11234,16 +11312,7 @@ impl StaticVulkanApp {
             )
             .map_err(|error| error.to_string())?
             {
-                if let Some(segment) = step.floor_probe() {
-                    if let Some([_, _, height]) = self.building_segment_hit(segment, true)? {
-                        step = step.with_building_floor(height);
-                    }
-                }
-                let blocked = if let Some(sweep) = step.sweep {
-                    self.building_segment_blocked(sweep)?
-                } else {
-                    false
-                };
+                let (step, blocked) = self.resolve_player_building_step(step)?;
                 player_step = Some((cockpit, step, blocked));
             }
         }
@@ -11558,7 +11627,22 @@ impl StaticVulkanApp {
         // CTLD's validated NDP defaults seed the native query gate. This
         // preview does not process mission Action1 updates, so it retains that
         // initial provider value for the capture.
-        update_control_animation_pose_buffers(
+        let player_doors = self.cockpit.and_then(|cockpit| {
+            self.mission_frame
+                .as_ref()?
+                .snapshot
+                .transforms
+                .iter()
+                .find(|(handle, _)| *handle == cockpit.handle)
+                .map(|(_, pose)| {
+                    (
+                        pose.position.map(f32::from_bits),
+                        clock.delta_seconds,
+                        self.building_collision_bindings.as_slice(),
+                    )
+                })
+        });
+        update_gameplay_animation_pose_buffers(
             &mut self.control_animation_instances,
             &mut self.component_pose_buffers,
             control_clock_ms,
@@ -11567,6 +11651,7 @@ impl StaticVulkanApp {
                     .as_ref()
                     .map(|frame| f32::from_bits(frame.player_pitch_bits)),
             ),
+            player_doors,
         )?;
         let placements = self
             .mission_frame
@@ -13961,6 +14046,7 @@ mod tests {
             state: ControlInstanceState::default(),
             last_sampled_node_times: Vec::new(),
             reported_unsupported_fallback: false,
+            door_blends: Vec::new(),
         });
 
         let first = FrameClockSample {
@@ -14024,6 +14110,145 @@ mod tests {
             .expect("legacy camera skips free-flight collision");
         assert_eq!(app.camera, camera);
         assert_eq!(app.view_camera, view_camera);
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_two_fortresses_hero_walks_out_of_the_starting_bunker() {
+        let root = std::path::PathBuf::from(
+            std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed root"),
+        );
+        let args = Args::parse(&[
+            "--root".into(),
+            root.to_string_lossy().into_owned(),
+            "--mission".into(),
+            "MISSIONS/Single.01/data.tma".into(),
+        ])
+        .unwrap();
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(&root)))).unwrap();
+        load_requested_mission(&mut engine, &args).unwrap();
+        let cockpit = starting_cockpit(&engine).unwrap();
+        let bunker = &loaded_mission_object_drafts(&engine).unwrap()[0];
+        let assets = loaded_mission_assets(&engine).unwrap();
+        let visual = assets.visual_by_id(bunker.visual_ids[0]).unwrap();
+        let model = Arc::new(
+            assets
+                .model_by_id(visual.model_id.unwrap())
+                .unwrap()
+                .validated
+                .clone(),
+        );
+        let matrix = LegacyIron3dEulerTransform {
+            translation: bunker.position,
+            orientation_radians: bunker.orientation_raw,
+        };
+        let controls = assets.object_component_controls[0][0].as_ref().unwrap();
+        let mut animations = vec![vec![Some(ControlAnimationInstance {
+            control: controls.clone(),
+            model: (*model).clone(),
+            gate_values: initial_control_gate_values(controls),
+            state: ControlInstanceState::default(),
+            last_sampled_node_times: Vec::new(),
+            reported_unsupported_fallback: false,
+            door_blends: Vec::new(),
+        })]];
+        let hierarchy =
+            static_preview_component_pose_buffer(&model, &controls.bindings, None).unwrap();
+        let (mut app, _) = clock_test_app(None);
+        app.building_collision_bindings.push(
+            building_collision_binding(
+                0,
+                0,
+                "fr_m_bunker".into(),
+                model,
+                matrix,
+                bunker.scale,
+                false,
+            )
+            .unwrap(),
+        );
+        app.component_pose_buffers[0][0] = hierarchy;
+        let mut now = 0;
+        let pose = |frame: FrameResult| {
+            frame
+                .snapshot
+                .transforms
+                .into_iter()
+                .find(|(handle, _)| *handle == cockpit.handle)
+                .unwrap()
+                .1
+        };
+        let mut hero = pose(step_mission_frame(&mut engine, now).unwrap());
+        // XY waypoints follow the source bunker graph from the lower room to a terrain entrance.
+        for target in [
+            [11.562, 28.644, 0.0],
+            [26.370, 28.644, 0.0],
+            [26.556, 19.906, 0.0],
+            [26.543, 10.909, 0.0],
+            [26.366, 6.704, 0.0],
+            [20.792, 6.704, 0.0],
+            [7.297, 6.704, 0.0],
+            [6.417, -2.684, 0.0],
+            [14.417, -6.008, 0.0],
+            [24.0, -9.92, 0.0],
+            [35.2, -14.4, 0.0],
+            [48.32, -19.36, 0.0],
+            [60.48, -24.0, 0.0],
+        ] {
+            let [x, y, _] = matrix.try_transform_scaled_point(target, [1.0; 3]).unwrap();
+            loop {
+                let [hx, hy, hz] = hero.position.map(f32::from_bits);
+                let distance = (x - hx).hypot(y - hy);
+                if distance < 0.035 {
+                    break;
+                }
+                now += 15;
+                assert!(
+                    now < 30_000,
+                    "stalled at {:?}",
+                    hero.position.map(f32::from_bits)
+                );
+                let step = plan_player_motion(
+                    &engine,
+                    cockpit,
+                    PlayerMotion {
+                        movement: [(x - hx) / distance, (y - hy) / distance],
+                        delta_seconds: distance.min(0.12) / 8.0,
+                        ..PlayerMotion::default()
+                    },
+                )
+                .unwrap()
+                .unwrap();
+                let (step, blocked) = app.resolve_player_building_step(step).unwrap();
+                update_gameplay_animation_pose_buffers(
+                    &mut animations,
+                    &mut app.component_pose_buffers,
+                    now,
+                    None,
+                    Some(([hx, hy, hz], 0.015, &app.building_collision_bindings)),
+                )
+                .unwrap();
+                assert!(
+                    !blocked,
+                    "blocked at {:?} on the way to {target:?}",
+                    hero.position.map(f32::from_bits)
+                );
+                hero = pose(
+                    frame_with_player_motion(&mut engine, now, cockpit, step, blocked).unwrap(),
+                );
+            }
+        }
+        let [x, y, z] = hero.position.map(f32::from_bits);
+        let terrain_height = loaded_terrain(&engine)
+            .unwrap()
+            .height_at([x, y])
+            .unwrap()
+            .unwrap();
+        assert!(
+            (z - terrain_height - 0.02).abs() < 0.05,
+            "exit height {z}, ground {terrain_height}"
+        );
+        println!("bunker exit at {:?}", [x, y, z]);
     }
 
     #[test]
@@ -14506,6 +14731,7 @@ mod tests {
                 state: ControlInstanceState::default(),
                 last_sampled_node_times: Vec::new(),
                 reported_unsupported_fallback: false,
+                door_blends: Vec::new(),
             }),
             None,
         ]];
@@ -14847,6 +15073,7 @@ mod tests {
                 state: ControlInstanceState::default(),
                 last_sampled_node_times: Vec::new(),
                 reported_unsupported_fallback: false,
+                door_blends: Vec::new(),
             }),
             None,
         ]];
@@ -15808,6 +16035,7 @@ mod tests {
             state: ControlInstanceState::default(),
             last_sampled_node_times: Vec::new(),
             reported_unsupported_fallback: false,
+            door_blends: Vec::new(),
         });
         let turret_pose = |app: &StaticVulkanApp, node| {
             let hierarchy = app.component_pose_buffers[cockpit.object_index]

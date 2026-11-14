@@ -44,6 +44,7 @@ use std::sync::Arc;
 mod autodemo;
 mod autodemo_combat;
 mod boarding;
+mod building_door;
 mod mesh_collision;
 mod mining;
 mod mission_events;
@@ -60,6 +61,7 @@ pub use autodemo::{
 };
 pub use autodemo_combat::{AutoDemoCombatEvent, AutoDemoProjectileType};
 pub use boarding::{board_friendly_warbot, disembark_warbot, player_vehicle};
+pub use building_door::{has_proximity_doors, sample_proximity_doors};
 pub use fparkan_assets::MissionAssets;
 pub use mesh_collision::{query_building_segment_world, BuildingMeshHit, BuildingMeshNode};
 pub use mining::deploy_mine;

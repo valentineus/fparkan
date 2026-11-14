@@ -1,6 +1,10 @@
 use super::{transform_state, Engine, EngineError, StartingCockpit, SurfaceQuery, TransformState};
 use crate::TerrainWorld;
 
+// shortcut: bound stair steps and drops until the native hero collider is wired.
+const STEP_UP: f32 = 0.85;
+const STEP_DOWN: f32 = 2.0;
+
 /// Player controls sampled once for a simulation step.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PlayerMotion {
@@ -22,6 +26,7 @@ pub struct PlayerMotionStep {
     pub(super) pose: TransformState,
     pub(super) pitch_bits: u32,
     flying: bool,
+    terrain_height: Option<f32>,
     /// Sweep segment when the step translates the hero.
     pub sweep: Option<[[f32; 3]; 2]>,
 }
@@ -34,8 +39,19 @@ impl PlayerMotionStep {
             return None;
         }
         let [[_, _, start_z], [x, y, _]] = self.sweep?;
-        // shortcut: fixed step and drop limits, until the hero collider is wired.
-        Some([[x, y, start_z + 0.1], [x, y, start_z - 2.5]])
+        let feet_z = start_z - 0.5;
+        Some([[x, y, feet_z + STEP_UP], [x, y, feet_z - STEP_DOWN]])
+    }
+
+    /// Terrain can take over at the end of a floor within the same step limits.
+    #[must_use]
+    pub fn terrain_exit_floor(self) -> Option<(f32, [[f32; 3]; 2])> {
+        let [top, bottom] = self.floor_probe()?;
+        let [start, end] = self.sweep?;
+        let height = self.terrain_height?;
+        let [x, y, body_z] = start;
+        ((bottom[2]..=top[2]).contains(&height) && (end[2] - (height + 0.52)).abs() > 0.05)
+            .then_some((height, [[x, y, body_z - 0.45], [x, y, body_z - 0.60]]))
     }
 
     /// Places the player's feet just above a floor accepted by the scene query.
@@ -46,6 +62,18 @@ impl PlayerMotionStep {
             sweep[1][2] = height + 0.52;
         }
         self
+    }
+
+    /// Sweeps vertically before crossing a step up, and horizontally before a step down.
+    #[must_use]
+    pub fn floor_sweeps(self) -> Option<[[[f32; 3]; 2]; 2]> {
+        let [start, end] = self.sweep?;
+        let middle = if end[2] > start[2] {
+            [start[0], start[1], end[2]]
+        } else {
+            [end[0], end[1], start[2]]
+        };
+        Some([[start, middle], [middle, end]])
     }
 }
 
@@ -62,15 +90,31 @@ mod tests {
             },
             pitch_bits: 0,
             flying: false,
+            terrain_height: Some(11.5),
             sweep: Some([[3.0, 6.0, 12.5], [4.0, 6.0, 15.5]]),
         };
         assert_eq!(
             step.floor_probe(),
-            Some([[4.0, 6.0, 12.6], [4.0, 6.0, 10.0]])
+            Some([[4.0, 6.0, 12.85], [4.0, 6.0, 10.0]])
+        );
+        assert_eq!(
+            step.terrain_exit_floor().map(|(height, _)| height),
+            Some(11.5)
         );
         let lowered = step.with_building_floor(11.5);
         assert_eq!(lowered.pose.position.map(f32::from_bits), [4.0, 6.0, 11.52]);
         assert_eq!(lowered.sweep.unwrap()[1], [4.0, 6.0, 12.02]);
+        assert_eq!(
+            lowered.floor_sweeps().unwrap(),
+            [
+                [[3.0, 6.0, 12.5], [4.0, 6.0, 12.5]],
+                [[4.0, 6.0, 12.5], [4.0, 6.0, 12.02]],
+            ]
+        );
+        assert_eq!(
+            step.with_building_floor(12.5).floor_sweeps().unwrap()[0],
+            [[3.0, 6.0, 12.5], [3.0, 6.0, 13.02]]
+        );
     }
 }
 
@@ -188,6 +232,7 @@ fn plan_motion(
         ));
     }
     let mut sweep = None;
+    let mut terrain_height = None;
     if flying && (xy != [from[0], from[1]] || climb != 0.0) {
         let old_xy = [from[0], from[1]];
         let floor = |xy| {
@@ -224,6 +269,7 @@ fn plan_motion(
                 .map_err(|err| EngineError::Movement(err.to_string()))?,
         ) {
             let to = [xy[0], xy[1], new_ground + (from[2] - old_ground)];
+            terrain_height = Some(new_ground);
             pose.position = to.map(f32::to_bits);
             // shortcut: one sweep at body height until the physical collider
             // and floor transitions are recovered.
@@ -240,6 +286,7 @@ fn plan_motion(
         pose,
         pitch_bits: pitch.to_bits(),
         flying,
+        terrain_height,
         sweep,
     })
 }
