@@ -50,11 +50,24 @@ pub(super) fn unit_order(
     ScriptPatrol::from_order(order).map(InitOrder::Patrol)
 }
 
-pub(super) fn stubbed_handler(instruction: &ScriptInstruction) -> Option<u8> {
-    // shortcut: resume Init after the catalog refresh until the live research context is wired.
-    (instruction.header_words == [43, u32::MAX, u32::MAX, u32::MAX, 6, 0, u32::MAX]
-        && instruction.references.is_empty())
-    .then_some(43)
+pub(super) fn stubbed_handler(
+    instruction: &ScriptInstruction,
+    values: &[VarSetDefault],
+) -> Option<u8> {
+    match (instruction.header_words, instruction.references.as_slice()) {
+        // shortcut: resume Init until the live research context is wired.
+        ([43, u32::MAX, u32::MAX, u32::MAX, 6, 0, u32::MAX], []) => Some(43),
+        // shortcut: resume Init until the native AI base-area state is wired.
+        ([68, u32::MAX, u32::MAX, u32::MAX, 6, 1, u32::MAX], [index])
+            if matches!(
+                values.get(*index as usize),
+                Some(VarSetDefault::FloatBits(_))
+            ) =>
+        {
+            Some(68)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -67,9 +80,25 @@ mod tests {
             header_words: [43, u32::MAX, u32::MAX, u32::MAX, 6, 0, u32::MAX],
             references: Vec::new(),
         };
-        assert_eq!(stubbed_handler(&instruction), Some(43));
+        assert_eq!(stubbed_handler(&instruction, &[]), Some(43));
         instruction.header_words[1] = 0;
-        assert_eq!(stubbed_handler(&instruction), None);
+        assert_eq!(stubbed_handler(&instruction, &[]), None);
+    }
+
+    #[test]
+    fn base_area_stub_requires_a_float_operand_and_no_result() {
+        let mut instruction = ScriptInstruction {
+            header_words: [68, u32::MAX, u32::MAX, u32::MAX, 6, 1, u32::MAX],
+            references: vec![0],
+        };
+        let values = [VarSetDefault::FloatBits(500.0_f32.to_bits())];
+        assert_eq!(stubbed_handler(&instruction, &values), Some(68));
+        assert_eq!(
+            stubbed_handler(&instruction, &[VarSetDefault::Dword(500)]),
+            None
+        );
+        instruction.header_words[1] = 0;
+        assert_eq!(stubbed_handler(&instruction, &values), None);
     }
 
     #[test]
