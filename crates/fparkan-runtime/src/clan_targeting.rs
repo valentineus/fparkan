@@ -144,6 +144,48 @@ pub(super) fn encode_strength(strength: f32) -> f32 {
     (strength as i64 as u32) as f32
 }
 
+pub(super) fn factory_defence(
+    world: &World,
+    drafts: &[MissionObjectDraft],
+    controls: &[MissionControlDeviceTableState],
+    units: impl Iterator<Item = ObjectHandle> + Clone,
+) -> Option<(u32, f32)> {
+    let (id, position) = units.clone().find_map(|handle| {
+        let index = identity_metadata(world, handle).ok()?.original_id?.0 as usize;
+        let draft = drafts.get(index)?;
+        (draft.unit_dat_header_flags == Some(crate::autodemo::PLANT_CLASS)).then_some(())?;
+        Some((
+            draft.identity_or_clan_raw,
+            transform_state(world, handle)
+                .ok()?
+                .position
+                .map(f32::from_bits),
+        ))
+    })?;
+    // shortcut: sum from live Control tables until the ArealMap street records are available.
+    let guards = units.filter(|&handle| {
+        let mobile = identity_metadata(world, handle)
+            .ok()
+            .and_then(|identity| drafts.get(identity.original_id?.0 as usize))
+            .and_then(|draft| draft.unit_dat_header_flags)
+            .is_some_and(|class| class & crate::autodemo::MOBILE_UNIT != 0);
+        mobile
+            && transform_state(world, handle).is_ok_and(|pose| {
+                within_factory_radius(position, pose.position.map(f32::from_bits))
+            })
+    });
+    Some((
+        id,
+        guards
+            .map(|handle| unit_strength(controls, handle))
+            .fold(0.0, |sum, amount| sum + amount),
+    ))
+}
+
+fn within_factory_radius([x, y, _]: [f32; 3], [px, py, _]: [f32; 3]) -> bool {
+    (x - px).hypot(y - py) < 250.0
+}
+
 pub(super) fn capture_target(
     mission: &MissionDocument,
     drafts: &[MissionObjectDraft],
@@ -174,28 +216,7 @@ pub(super) fn attack_target(
     radius: f32,
     base_radius_limit: f32,
 ) -> Option<(u32, f32)> {
-    let anchor = mission
-        .clans
-        .get(clan)?
-        .anchor
-        .map(|axis| (axis.round_ties_even() as i64 as u32) as f32);
-    let distance = |[x, y, _]: [f32; 3]| (x - anchor[0]).hypot(y - anchor[1]);
-    let base_radius = base_radius(
-        base_radius_limit,
-        drafts.iter().filter_map(|draft| {
-            (draft.unit_dat_header_flags? & 0x8000_0000 != 0).then_some(())?;
-            let handle = handle_by_original_id(world, draft.original_id?)?;
-            registration_sequence(world, handle).ok()??;
-            (usize::from(identity_metadata(world, handle).ok()?.owner_id?.0) == clan)
-                .then_some(())?;
-            Some(distance(
-                transform_state(world, handle)
-                    .ok()?
-                    .position
-                    .map(f32::from_bits),
-            ))
-        }),
-    );
+    let (anchor, base_radius) = clan_area(mission, drafts, world, clan, base_radius_limit)?;
     building_target(
         mission,
         drafts,
@@ -207,10 +228,98 @@ pub(super) fn attack_target(
         // initializing it here. Use the map origin for a stable estimate.
         Some([0.0; 3]),
         |_, _, position| {
-            let distance = distance(position);
+            let distance = distance_from_anchor(anchor, position);
             (distance >= base_radius).then_some(distance)
         },
     )
+}
+
+pub(super) fn base_threat(
+    mission: &MissionDocument,
+    drafts: &[MissionObjectDraft],
+    controls: &[MissionControlDeviceTableState],
+    world: &World,
+    clan: usize,
+    extension: u32,
+    limit: f32,
+    already_targeted: impl Fn(u32) -> bool,
+) -> Option<(u32, f32)> {
+    let (anchor, radius) = clan_area(mission, drafts, world, clan, limit)?;
+    let source = mission.clans.get(clan)?;
+    // shortcut: use placed logical IDs and mission order until the ArealMap roster is wired.
+    let candidates = drafts
+        .iter()
+        .take(mission.objects.len())
+        .filter_map(|draft| {
+            let class = draft.unit_dat_header_flags?;
+            let id = draft.identity_or_clan_raw;
+            if class & crate::autodemo::MOBILE_UNIT == 0 || id == u32::MAX || already_targeted(id) {
+                return None;
+            }
+            let handle = handle_by_original_id(world, draft.original_id?)?;
+            registration_sequence(world, handle).ok()??;
+            let owner = usize::from(identity_metadata(world, handle).ok()?.owner_id?.0);
+            let other = mission.clans.get(owner)?;
+            if owner == clan
+                || !source.relations.iter().any(|relation| {
+                    relation.relation_value == 0 && relation.other_clan_name.raw == other.name.raw
+                })
+            {
+                return None;
+            }
+            let position = transform_state(world, handle)
+                .ok()?
+                .position
+                .map(f32::from_bits);
+            (distance_from_anchor(anchor, position).trunc() < radius + extension as f32)
+                .then(|| (id, class, unit_strength(controls, handle)))
+        });
+    strongest_threat(candidates)
+}
+
+fn strongest_threat(candidates: impl IntoIterator<Item = (u32, u32, f32)>) -> Option<(u32, f32)> {
+    let mut strongest = None;
+    for (id, class, strength) in candidates {
+        if class == crate::HERO_UNIT_CLASS {
+            return Some((id, strength));
+        }
+        if strength > strongest.map_or(0.0, |(_, power)| power) {
+            strongest = Some((id, strength));
+        }
+    }
+    strongest
+}
+
+fn clan_area(
+    mission: &MissionDocument,
+    drafts: &[MissionObjectDraft],
+    world: &World,
+    clan: usize,
+    limit: f32,
+) -> Option<([f32; 2], f32)> {
+    let anchor = mission
+        .clans
+        .get(clan)?
+        .anchor
+        .map(|axis| (axis.round_ties_even() as i64 as u32) as f32);
+    let distances = drafts.iter().filter_map(|draft| {
+        (draft.unit_dat_header_flags? & 0x8000_0000 != 0).then_some(())?;
+        let handle = handle_by_original_id(world, draft.original_id?)?;
+        registration_sequence(world, handle).ok()??;
+        (usize::from(identity_metadata(world, handle).ok()?.owner_id?.0) == clan).then_some(())?;
+        Some(distance_from_anchor(
+            anchor,
+            transform_state(world, handle)
+                .ok()?
+                .position
+                .map(f32::from_bits),
+        ))
+    });
+    Some((anchor, base_radius(limit, distances)))
+}
+
+fn distance_from_anchor([ax, ay]: [f32; 2], [x, y, _]: [f32; 3]) -> f32 {
+    (x - ax).hypot(y - ay)
 }
 
 fn base_radius(limit: f32, distances: impl IntoIterator<Item = f32>) -> f32 {
@@ -332,5 +441,24 @@ mod tests {
     fn strength_output_truncates_and_keeps_the_native_error_value() {
         assert_eq!(encode_strength(8.2), 8.0);
         assert_eq!(encode_strength(1e12), 3_567_583_232.0);
+    }
+
+    #[test]
+    fn factory_defence_uses_a_strict_horizontal_radius() {
+        assert!(within_factory_radius([100., 100., 75.], [249., 100., 0.]));
+        assert!(!within_factory_radius([100., 100., 75.], [250., 300., 75.]));
+    }
+
+    #[test]
+    fn threats_prioritize_the_hero_and_keep_the_first_equal_strength() {
+        let bots = [
+            (7, crate::boarding::WARBOT_CLASS, 40.),
+            (9, crate::boarding::WARBOT_CLASS, 40.),
+        ];
+        assert_eq!(strongest_threat(bots), Some((7, 40.)));
+        assert_eq!(
+            strongest_threat(bots.into_iter().chain([(3, crate::HERO_UNIT_CLASS, 0.)])),
+            Some((3, 0.))
+        );
     }
 }

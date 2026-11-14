@@ -194,6 +194,8 @@ pub(super) struct ClanAiEvents {
     strength_queries: BTreeMap<(usize, u16), u64>,
     capture_queries: BTreeMap<usize, u64>,
     attack_queries: BTreeMap<usize, u64>,
+    factory_defence_queries: BTreeMap<(usize, u32), u64>,
+    base_threat_queries: BTreeMap<(usize, u32), u64>,
     base_radius_limits: BTreeMap<usize, f32>,
     capturer_queries: BTreeMap<usize, u64>,
     capture_orders: Vec<(OwnerId, Handler2RecordKey, CaptureApproach)>,
@@ -768,6 +770,54 @@ impl LoadedMissionState {
                                 ),
                             )))
                         }
+                        ScriptDispatchSelector::Handler(58) => {
+                            single_dword(&instruction.references, values)
+                                .ok_or("Handler(58) requires a DWORD building index")?;
+                            // shortcut: an unavailable upgrade catalog exposes no eligible buildings.
+                            self.clan_ai_events.log_research_stub(clan, 58, &bundle.script_path);
+                            Ok(Some(VarSetDefault::Dword(u32::MAX)))
+                        }
+                        ScriptDispatchSelector::Handler(handler @ (47 | 67)) => {
+                            let (output, selection) = match (handler, instruction.references.as_slice()) {
+                                (47, &[extension, output]) => {
+                                    let extension = values.get(extension as usize).and_then(|cell| cell.as_dword())
+                                        .ok_or("Handler(47) requires a DWORD extension of the base radius")?;
+                                    let selection = crate::clan_targeting::base_threat(
+                                        &self.mission, &self.object_drafts, &self.control_device_tables,
+                                        world, clan, extension,
+                                        self.clan_ai_events.base_radius_limits.get(&clan).copied().unwrap_or(700.0),
+                                        |id| self.clan_ai_events.problems.get(&clan).is_some_and(|queue| {
+                                            queue.records().iter().any(|record| record.key.word_0 == 12 && record.key.argument_0 == id)
+                                        }),
+                                    );
+                                    (output, selection)
+                                }
+                                (67, &[output]) => {
+                                    let units = self.mission_events.clan_units(world, OwnerId(clan as u16), false);
+                                    (output, crate::clan_targeting::factory_defence(world, &self.object_drafts, &self.control_device_tables, units))
+                                }
+                                _ => return Err("defence query requires a strength output".into()),
+                            };
+                            let cell = values.get_mut(output as usize)
+                                .ok_or("defence query strength output is unavailable")?;
+                            let (id, power) = selection.unwrap_or((u32::MAX, 0.0));
+                            let power = crate::clan_targeting::encode_strength(power);
+                            *cell = match *cell {
+                                VarSetDefault::Dword(_) => VarSetDefault::Dword(power as u32),
+                                VarSetDefault::FloatBits(_) => VarSetDefault::FloatBits(power.to_bits()),
+                            };
+                            let (queries, name) = if handler == 47 {
+                                (&mut self.clan_ai_events.base_threat_queries, "script_base_threat_approx")
+                            } else {
+                                (&mut self.clan_ai_events.factory_defence_queries, "script_factory_defence_approx")
+                            };
+                            let count = queries.entry((clan, id)).or_default();
+                            *count += 1;
+                            if *count == 1 {
+                                eprintln!("sim_coverage {name}=1 clan={clan} target={id} strength={power}");
+                            }
+                            Ok(Some(VarSetDefault::Dword(id)))
+                        }
                         ScriptDispatchSelector::Handler(handler @ (56 | 65))
                             if instruction.references.is_empty() =>
                         {
@@ -976,6 +1026,18 @@ fn storage_space(ores: &[BehaviorOreState], world: &World, clan: OwnerId) -> f32
 }
 
 impl ClanAiEvents {
+    pub(super) fn base_threat_queries(&self) -> impl Iterator<Item = (usize, u32, u64)> + '_ {
+        self.base_threat_queries
+            .iter()
+            .map(|(&(clan, id), &count)| (clan, id, count))
+    }
+
+    pub(super) fn factory_defence_queries(&self) -> impl Iterator<Item = (usize, u32, u64)> + '_ {
+        self.factory_defence_queries
+            .iter()
+            .map(|(&(clan, id), &count)| (clan, id, count))
+    }
+
     pub(super) fn wait_starts(&self) -> impl Iterator<Item = (usize, u32, u64)> + '_ {
         self.wait_starts
             .iter()

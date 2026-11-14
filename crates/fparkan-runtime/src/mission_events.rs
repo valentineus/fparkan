@@ -157,7 +157,7 @@ impl MissionEvents {
         world: &'a World,
         owner: OwnerId,
         free_only: bool,
-    ) -> impl Iterator<Item = ObjectHandle> + 'a {
+    ) -> impl Iterator<Item = ObjectHandle> + Clone + 'a {
         self.placed_clan_objects
             .iter()
             .filter_map(move |&(handle, class)| {

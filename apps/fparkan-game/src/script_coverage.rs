@@ -27,6 +27,12 @@ pub(super) fn log_clan_ai_stops(report: &SimulationReport) {
     for &(clan, count) in &report.script_attack_queries {
         eprintln!("sim_coverage script_attack_target_approx={count} clan={clan}");
     }
+    for &(clan, target, count) in &report.script_factory_defence_queries {
+        eprintln!("sim_coverage script_factory_defence_approx={count} clan={clan} target={target}");
+    }
+    for &(clan, target, count) in &report.script_base_threat_queries {
+        eprintln!("sim_coverage script_base_threat_approx={count} clan={clan} target={target}");
+    }
     for &(clan, target, count) in &report.script_group_orders {
         eprintln!("sim_coverage script_group_order_approx={count} clan={clan} target={target}");
     }
