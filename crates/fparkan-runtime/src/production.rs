@@ -178,6 +178,7 @@ pub fn order_factory_robot(
                 && on_communicator(
                     &mission.mission_assets,
                     *index,
+                    PLANT_CLASS,
                     transform_state(&engine.world, plant).ok()?,
                     position,
                 ))

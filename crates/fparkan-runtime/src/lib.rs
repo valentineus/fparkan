@@ -17812,6 +17812,35 @@ mod tests {
             .notices
             .iter()
             .any(|notice| matches!(notice, MissionNotice::ObjectiveComplete(2 | 3))));
+        let cockpit = starting_cockpit(&engine).unwrap();
+        let generator = loaded_mission_object_drafts(&engine)
+            .unwrap()
+            .iter()
+            .find(|draft| draft.unit_dat_header_flags == Some(0x8000_0002))
+            .unwrap();
+        let id = generator.original_id.unwrap();
+        let handle = mission_object_handle(&engine, id).unwrap();
+        let mut hero = transform_state(&engine.world, cockpit.handle).unwrap();
+        let start = hero;
+        for z in [96.0_f32, 75.0] {
+            hero.position = [659.4, 1050.6, z].map(f32::to_bits);
+            set_transform(&mut engine.world, cockpit.handle, hero).unwrap();
+            assert_eq!(
+                capture_neutral_building(&mut engine, cockpit).unwrap(),
+                None
+            );
+        }
+        hero.position = [659.4_f32, 1050.6, 80.04].map(f32::to_bits);
+        set_transform(&mut engine.world, cockpit.handle, hero).unwrap();
+        assert_eq!(
+            capture_neutral_building(&mut engine, cockpit).unwrap(),
+            Some(id)
+        );
+        assert!(loaded_mission_behavior_distributors(&engine).unwrap()[0]
+            .registered_objects
+            .iter()
+            .any(|entry| entry.handle == handle));
+        set_transform(&mut engine.world, cockpit.handle, start).unwrap();
         // The tutorial starts before a mine has been deployed.
         let mine = construct_object(&mut engine.world, ObjectDraft { original_id: None }).unwrap();
         fparkan_world::set_owner(&mut engine.world, mine, Some(fparkan_world::OwnerId(0))).unwrap();
@@ -17824,6 +17853,19 @@ mod tests {
             .register_unit(&engine.world, mine, 0x8000_0004);
         let after = frame(&mut engine, 2001).unwrap().mission_event.unwrap();
         assert!(after.stop.is_none(), "{:?}", after.stop);
+        assert!(
+            after.notices.contains(&MissionNotice::ObjectiveComplete(0)),
+            "{after:?}"
+        );
+        let power = loaded_mission_script_bundles(&engine)
+            .unwrap()
+            .iter()
+            .find(|bundle| bundle.clan_index == 0)
+            .unwrap()
+            .behavior_warm_start
+            .unwrap()
+            .cleared_words[0];
+        assert!(f32::from_bits(power) > 0.0);
         assert!(
             after.notices.contains(&MissionNotice::ObjectiveComplete(2)),
             "{after:?}"

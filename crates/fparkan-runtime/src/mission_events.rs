@@ -308,9 +308,15 @@ pub fn capture_neutral_building(
             let clan = mission.mission.clans.get(usize::from(owner.0))?;
             (clan.mode == 3).then_some((handle, identity.original_id?, owner, class))
         })
-        .find(|&(handle, id, _, _)| {
+        .find(|&(handle, id, _, class)| {
             transform_state(&engine.world, handle).is_ok_and(|pose| {
-                on_communicator(&mission.mission_assets, id.0 as usize, pose, position)
+                on_communicator(
+                    &mission.mission_assets,
+                    id.0 as usize,
+                    class,
+                    pose,
+                    position,
+                )
             })
         });
     if let Some((handle, id, former_owner, class)) = candidate {
@@ -352,9 +358,16 @@ pub fn capture_neutral_building(
 pub(super) fn on_communicator(
     assets: &super::MissionAssets,
     object_index: usize,
+    class: u32,
     pose: super::TransformState,
     [x, y, z]: [f32; 3],
 ) -> bool {
+    let is_generator = class == 0x8000_0002;
+    let material = if is_generator {
+        &b"B_MTP_07G"[..]
+    } else {
+        &b"B_COMP_4G"[..]
+    };
     let Some(visual) = assets
         .visual_for_object(object_index)
         .and_then(|id| assets.visual_by_id(id))
@@ -386,8 +399,7 @@ pub(super) fn on_communicator(
         orientation_radians: pose.orientation.map(f32::from_bits),
     };
     let scale = pose.scale.map(f32::from_bits);
-    // shortcut: use the green platform mesh with clearance for the player's
-    // feet until the original communicator volume is measured.
+    // shortcut: use the green platform mesh until the native volume is known.
     let platform_height = hierarchy
         .poses
         .iter()
@@ -401,7 +413,7 @@ pub(super) fn on_communicator(
             wear.table
                 .entries
                 .get(usize::from(batch.material_index))
-                .is_some_and(|entry| entry.material.0.eq_ignore_ascii_case(b"B_COMP_4G"))
+                .is_some_and(|entry| entry.material.0.eq_ignore_ascii_case(material))
         })
         .flat_map(|(pose, batch)| {
             let first = batch.index_start as usize;
@@ -415,6 +427,13 @@ pub(super) fn on_communicator(
                         transform.try_transform_scaled_point(pose.transform_point(local), scale)
                     });
                     let (a, b, c) = (a?, b?, c?);
+                    if is_generator {
+                        // The generator also uses this material on the underside.
+                        let winding = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+                        if winding <= 0.0 {
+                            return None;
+                        }
+                    }
                     in_tactical_polygon(&[a, b, c], x, y).then_some(a[2].max(b[2]).max(c[2]))
                 })
         })
