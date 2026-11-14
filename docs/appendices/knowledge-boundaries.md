@@ -437,6 +437,8 @@ core и `ResearchCandidateSet::refresh_selection`: последний получ
 `Handler(69)` по RVA `0xf06c` записывает неотрицательный DWORD в поле AI
 `+0x41c`. Игровой `Init` учитывает эту форму как заглушку до подключения
 потребителя поля к логике AI.
+`script_research_status_stubs` считает вызовы `Handler(65)` без каталога.
+Оригинальный getter `ai.dll+0x111d0` возвращает ноль в этом состоянии.
 `Handler(15)` для `ORDER_ROBOT_SEARCH` генератора пока проходит как
 `script_init_handler_stub`. GOG Behavior.dll по RVA `0x30110` настраивает
 поиск строения, а задача по RVA `0x30300` обрабатывает в том числе захват.

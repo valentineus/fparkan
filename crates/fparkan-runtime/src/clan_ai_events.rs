@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 pub(super) struct ClanAiEvents {
     next_ms: BTreeMap<usize, u32>,
     stops: BTreeMap<(usize, usize, usize), (MissionEventStop, u64)>,
+    research_status_stubs: BTreeMap<usize, u64>,
 }
 
 impl LoadedMissionState {
@@ -66,6 +67,22 @@ impl LoadedMissionState {
                             class,
                         )))
                     }
+                    ScriptDispatchSelector::Handler(65) if instruction.references.is_empty() => {
+                        // RVA 0x111d0 returns false while the research catalog is unloaded.
+                        let count = self
+                            .clan_ai_events
+                            .research_status_stubs
+                            .entry(clan)
+                            .or_default();
+                        *count += 1;
+                        if *count == 1 {
+                            eprintln!(
+                                "sim_coverage script_research_status_stub=1 clan={clan} script={}",
+                                bundle.script_path
+                            );
+                        }
+                        Ok(Some(0))
+                    }
                     selector => Err(format!("{selector:?}")),
                 },
             );
@@ -112,6 +129,12 @@ impl ClanAiEvents {
 
     pub(super) fn stops(&self) -> impl Iterator<Item = (&MissionEventStop, u64)> {
         self.stops.values().map(|(stop, count)| (stop, *count))
+    }
+
+    pub(super) fn research_status_stubs(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
+        self.research_status_stubs
+            .iter()
+            .map(|(&clan, &count)| (clan, count))
     }
 }
 

@@ -2899,6 +2899,8 @@ pub struct SimulationReport {
     pub mission_event_stops: Vec<MissionEventStop>,
     /// Uncovered clan AI instructions and the number of invocations they stopped.
     pub clan_ai_event_stops: Vec<(MissionEventStop, u64)>,
+    /// Research status calls handled with an unloaded catalog, grouped by clan.
+    pub clan_research_status_stubs: Vec<(usize, u64)>,
     /// Total requests for mission information messages.
     pub mission_messages: u64,
     /// Clock of the first autonomous shot, in milliseconds.
@@ -2933,6 +2935,7 @@ pub fn simulate_mission_report(
         mission_events: 0,
         mission_event_stops: Vec::new(),
         clan_ai_event_stops: Vec::new(),
+        clan_research_status_stubs: Vec::new(),
         mission_messages: 0,
         autodemo_first_shot_ms: None,
         autodemo_first_destroyed_ms: None,
@@ -2984,6 +2987,9 @@ pub fn simulate_mission_report(
                 .stops()
                 .map(|(stop, count)| (stop.clone(), count)),
         );
+        report
+            .clan_research_status_stubs
+            .extend(loaded.clan_ai_events.research_status_stubs());
     }
     Ok(report)
 }
