@@ -9751,7 +9751,7 @@ fn mission_camera_coverage(cockpit: Option<StartingCockpit>, demo: bool) -> &'st
     if demo {
         "autodemo_camera_follow_approx=1 autodemo_camera_target_approx=1 cockpit_pose_approx=1"
     } else if cockpit.is_some() {
-        "player_motion_approx=1 cockpit_aim_stub=1 cockpit_pose_approx=1"
+        "player_motion_approx=1 cockpit_aim_approx=1 cockpit_pose_approx=1"
     } else {
         "mission_camera_stub=1"
     }
@@ -9834,7 +9834,7 @@ struct StaticVulkanApp {
     pressed_keys: HashSet<KeyCode>,
     player_move_pressed: [bool; 4],
     mouse_look: bool,
-    player_mouse_x: f32,
+    player_mouse: [f32; 2],
     audio: Option<audio::GameAudio>,
     camera_mode: &'static str,
     mesh_components: usize,
@@ -9956,7 +9956,7 @@ impl StaticVulkanApp {
             pressed_keys: HashSet::new(),
             player_move_pressed: [false; 4],
             mouse_look: false,
-            player_mouse_x: 0.0,
+            player_mouse: [0.0; 2],
             audio,
             camera_mode: preview.camera_mode,
             mesh_components: preview.mesh_components,
@@ -10272,9 +10272,8 @@ impl StaticVulkanApp {
         cockpit: StartingCockpit,
         viewport: [f32; 2],
     ) -> Option<PreviewCameraFrame> {
-        let (_, state) = self
-            .mission_frame
-            .as_ref()?
+        let frame = self.mission_frame.as_ref()?;
+        let (_, state) = frame
             .snapshot
             .transforms
             .iter()
@@ -10305,7 +10304,8 @@ impl StaticVulkanApp {
             },
             state.scale.map(f32::from_bits),
             point,
-        )?;
+        )?
+        .with_cockpit_pitch(f32::from_bits(frame.player_pitch_bits))?;
         PreviewCameraFrame::from_legacy_d3d7(
             camera,
             LegacyD3d7Projection {
@@ -10402,7 +10402,7 @@ impl StaticVulkanApp {
 
     fn set_mission_paused_at(&mut self, paused: bool, now: Instant) {
         self.mission_paused = paused;
-        self.player_mouse_x = 0.0;
+        self.player_mouse = [0.0; 2];
         self.player_move_pressed = [false; 4];
         if self.cockpit.is_some() && self.demo_camera.is_none() {
             self.set_mouse_look(self.window_focused && !paused);
@@ -10526,7 +10526,7 @@ impl StaticVulkanApp {
         let control_clock_ms = clock.time_ms;
         let mut player_step = None;
         // A held key and accumulated device motion belong to this simulation sample.
-        let mouse_x = std::mem::take(&mut self.player_mouse_x);
+        let [mouse_x, mouse_y] = std::mem::take(&mut self.player_mouse);
         if let (Some(engine), Some(cockpit), None) =
             (&self.mission_engine, self.cockpit, &self.demo_camera)
         {
@@ -10547,6 +10547,7 @@ impl StaticVulkanApp {
                         f32::from(forward || pressed[2]) - f32::from(back || pressed[3]),
                     ],
                     mouse_x,
+                    mouse_y,
                     delta_seconds: clock.delta_seconds,
                 },
             )
@@ -11414,7 +11415,8 @@ impl ApplicationHandler for StaticVulkanApp {
         if self.mouse_look {
             if let DeviceEvent::MouseMotion { delta } = event {
                 if self.cockpit.is_some() && self.demo_camera.is_none() && !self.mission_paused {
-                    self.player_mouse_x += delta.0 as f32;
+                    self.player_mouse[0] += delta.0 as f32;
+                    self.player_mouse[1] += delta.1 as f32;
                 } else if self.cockpit.is_none() {
                     if let Some(camera) = self.free_camera.as_mut() {
                         camera.look_delta(delta.0, delta.1);
@@ -11585,7 +11587,7 @@ impl ApplicationHandler for StaticVulkanApp {
                 if !focused {
                     self.pressed_keys.clear();
                     self.player_move_pressed = [false; 4];
-                    self.player_mouse_x = 0.0;
+                    self.player_mouse = [0.0; 2];
                     self.set_mouse_look(false);
                 } else if self.cockpit.is_some()
                     && self.demo_camera.is_none()
@@ -14660,6 +14662,22 @@ mod tests {
         app.update_mission_camera(0.016, [800.0, 600.0]).unwrap();
         assert!((app.view_camera.position[0] - before[0] - 1.0).abs() < 1e-4);
         assert_eq!(app.view_camera.position[1], before[1]);
+        let moved = app.view_camera.position;
+        let aimed = plan_player_motion(
+            &engine,
+            cockpit,
+            PlayerMotion {
+                mouse_y: -100.0,
+                ..PlayerMotion::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        app.mission_frame =
+            Some(frame_with_player_motion(&mut engine, 32, cockpit, aimed, false).unwrap());
+        app.update_mission_camera(0.016, [800.0, 600.0]).unwrap();
+        assert_eq!(app.view_camera.position, moved);
+        assert!((app.view_camera.forward[2] - 0.5_f32.sin()).abs() < 1e-6);
     }
 
     #[test]

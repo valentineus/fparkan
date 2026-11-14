@@ -1261,6 +1261,8 @@ pub struct FrameResult {
     pub snapshot: WorldSnapshot,
     /// Periodic script event attempted on this step, if due.
     pub mission_event: Option<MissionEventTick>,
+    /// Vertical aim of the controlled hero as an IEEE-754 radian value.
+    pub player_pitch_bits: u32,
 }
 
 /// Engine.
@@ -1293,6 +1295,7 @@ struct LoadedMissionState {
     script_init_states: Vec<MissionScriptInitState>,
     script_varset_states: Vec<MissionScriptVarSetState>,
     mission_events: MissionEvents,
+    player_pitch_bits: u32,
     script_host_mode: MissionMode,
     script_host_status: u32,
     script_outcome: MissionScriptOutcome,
@@ -2232,6 +2235,7 @@ fn load_mission_with_options(
         script_init_states: loaded_scripts.init_states,
         script_varset_states: loaded_scripts.varset_states,
         mission_events,
+        player_pitch_bits: 0,
         script_host_mode: request.mode,
         // Fresh IGame construction seeds this field with 5; this is not the
         // later status-4 transition performed after native game initialization.
@@ -2283,6 +2287,10 @@ pub fn step_headless(
     Ok(FrameResult {
         snapshot,
         mission_event,
+        player_pitch_bits: engine
+            .loaded
+            .as_ref()
+            .map_or(0, |mission| mission.player_pitch_bits),
     })
 }
 
@@ -2314,11 +2322,19 @@ pub fn frame_with_player_motion(
         pose.position = previous.position;
     }
     set_transform(&mut engine.world, cockpit.handle, pose)?;
-    let result = frame(engine, queue_time_ms);
-    if result.is_err() {
-        set_transform(&mut engine.world, cockpit.handle, previous)?;
+    match frame(engine, queue_time_ms) {
+        Ok(mut frame) => {
+            if let Some(mission) = &mut engine.loaded {
+                mission.player_pitch_bits = motion.pitch_bits;
+                frame.player_pitch_bits = motion.pitch_bits;
+            }
+            Ok(frame)
+        }
+        Err(error) => {
+            set_transform(&mut engine.world, cockpit.handle, previous)?;
+            Err(error)
+        }
     }
-    result
 }
 
 /// Coverage entries for the subsystems still absent from the mission loop.
@@ -17133,6 +17149,7 @@ mod tests {
         let input = PlayerMotion {
             movement: [0.0, 1.0],
             mouse_x: 100.0,
+            mouse_y: -500.0,
             delta_seconds: 0.1,
         };
         let proposed = plan_player_motion(&engine, cockpit, input)
@@ -17152,8 +17169,11 @@ mod tests {
         let turned = pose(&blocked);
         assert_eq!(turned.position, original.position);
         assert_ne!(turned.orientation[2], original.orientation[2]);
+        assert_eq!(turned.orientation[..2], original.orientation[..2]);
+        assert_eq!(f32::from_bits(blocked.player_pitch_bits), 1.0);
         let movement = PlayerMotion {
             mouse_x: 0.0,
+            mouse_y: 0.0,
             ..input
         };
         let proposed = plan_player_motion(&engine, cockpit, movement)
@@ -17172,6 +17192,8 @@ mod tests {
                 .unwrap()
         };
         assert!(((z1 - ground([x1, y1])) - (z0 - ground([x0, y0]))).abs() < 1e-5);
+        let idle = frame(&mut engine, 300).unwrap();
+        assert_eq!(idle.player_pitch_bits, blocked.player_pitch_bits);
     }
 
     #[test]

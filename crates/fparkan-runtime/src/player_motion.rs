@@ -8,6 +8,8 @@ pub struct PlayerMotion {
     pub movement: [f32; 2],
     /// Relative horizontal mouse motion for this step.
     pub mouse_x: f32,
+    /// Relative vertical mouse motion for this step, positive down.
+    pub mouse_y: f32,
     /// Time spent on this simulation step, excluding time spent paused.
     pub delta_seconds: f32,
 }
@@ -16,6 +18,7 @@ pub struct PlayerMotion {
 #[derive(Clone, Copy, Debug)]
 pub struct PlayerMotionStep {
     pub(super) pose: TransformState,
+    pub(super) pitch_bits: u32,
     /// Sweep segment when the step translates the hero.
     pub sweep: Option<[[f32; 3]; 2]>,
 }
@@ -30,7 +33,7 @@ pub fn plan_player_motion(
     cockpit: StartingCockpit,
     input: PlayerMotion,
 ) -> Result<Option<PlayerMotionStep>, EngineError> {
-    if input.movement == [0.0; 2] && input.mouse_x == 0.0 {
+    if input.movement == [0.0; 2] && input.mouse_x == 0.0 && input.mouse_y == 0.0 {
         return Ok(None);
     }
     let (Some(mission), Ok(pose)) = (
@@ -39,12 +42,19 @@ pub fn plan_player_motion(
     ) else {
         return Ok(None);
     };
-    plan_motion(&mission.terrain, pose, input).map(Some)
+    plan_motion(
+        &mission.terrain,
+        pose,
+        f32::from_bits(mission.player_pitch_bits),
+        input,
+    )
+    .map(Some)
 }
 
 fn plan_motion(
     terrain: &TerrainWorld,
     mut pose: TransformState,
+    pitch: f32,
     input: PlayerMotion,
 ) -> Result<PlayerMotionStep, EngineError> {
     let from = pose.position.map(f32::from_bits);
@@ -52,7 +62,13 @@ fn plan_motion(
     if !input
         .movement
         .into_iter()
-        .chain([input.mouse_x, input.delta_seconds, yaw])
+        .chain([
+            input.mouse_x,
+            input.mouse_y,
+            input.delta_seconds,
+            yaw,
+            pitch,
+        ])
         .chain(from)
         .all(f32::is_finite)
         || input.delta_seconds < 0.0
@@ -96,5 +112,12 @@ fn plan_motion(
             ]);
         }
     }
-    Ok(PlayerMotionStep { pose, sweep })
+    // shortcut: use a bounded camera aim until the native turret travel and
+    // sensitivity are recovered. The body remains aligned to the terrain.
+    let pitch = (pitch - input.mouse_y * 0.005).clamp(-1.0, 1.0);
+    Ok(PlayerMotionStep {
+        pose,
+        pitch_bits: pitch.to_bits(),
+        sweep,
+    })
 }

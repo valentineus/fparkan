@@ -25,6 +25,25 @@ impl RawCameraTransform {
         Self::TRANSLATION_WORD_INDICES.map(|index| f32::from_bits(self.words[index]))
     }
 
+    /// Rotates a cockpit's forward and up axes about its lateral axis,
+    /// preserving the camera point.
+    #[must_use]
+    pub fn with_cockpit_pitch(mut self, radians: f32) -> Option<Self> {
+        if !radians.is_finite() {
+            return None;
+        }
+        if radians != 0.0 {
+            let (sin, cos) = radians.sin_cos();
+            for row in self.words[..12].chunks_exact_mut(4) {
+                let forward = f32::from_bits(row[0]);
+                let up = f32::from_bits(row[2]);
+                row[0] = (forward * cos + up * sin).to_bits();
+                row[2] = (up * cos - forward * sin).to_bits();
+            }
+        }
+        Some(self)
+    }
+
     /// Inverts a finite row-major affine transform without assigning it a
     /// camera-space meaning.
     ///
@@ -606,6 +625,26 @@ mod tests {
         assert_eq!(view[2], -1.0);
         assert!(view[6].abs() < 1e-6);
         assert_eq!(view[10], 0.0);
+    }
+
+    #[test]
+    fn pitching_the_cockpit_preserves_its_origin_and_lateral_axis() {
+        let unit = LegacyIron3dEulerTransform {
+            translation: [12.0, 3.0, 4.0],
+            orientation_radians: [0.0, 0.0, 0.0],
+        };
+        let camera = forward_cockpit_camera(unit, [1.0; 3], [0.0; 3]).unwrap();
+        assert_eq!(camera.with_cockpit_pitch(0.0), Some(camera));
+        let tilted = camera
+            .with_cockpit_pitch(std::f32::consts::FRAC_PI_2)
+            .unwrap();
+        assert_eq!(camera.translation(), tilted.translation());
+        for axis in [1, 5, 9] {
+            assert_eq!(camera.words[axis], tilted.words[axis]);
+        }
+        let tilted = tilted.words.map(f32::from_bits);
+        assert_eq!(tilted[8], 1.0);
+        assert!((tilted[6] + 1.0).abs() < 1e-6);
     }
 
     #[test]
