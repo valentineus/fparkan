@@ -8,6 +8,7 @@ mod control_effects;
 use control_effects::{advance_control_effect_instances, owner_control_capacity};
 mod mission_hints;
 mod player_collision;
+mod projectile_trail;
 mod script_coverage;
 mod terrain_lod;
 
@@ -4927,6 +4928,8 @@ struct ProjectileDrawSlot {
     shooter: Option<ObjectHandle>,
     vertex_start: usize,
     draw_ranges: std::ops::Range<usize>,
+    trails: Vec<projectile_trail::ProjectileTrail>,
+    trail_segment: Option<[[f32; 3]; 2]>,
 }
 
 struct PlayerWeaponLayout {
@@ -9467,11 +9470,13 @@ fn append_static_preview_component(
 }
 
 fn prepare_projectile_draw(
+    root: &Path,
     engine: &Engine,
     archive: &str,
     name: &str,
     capacity: impl FnOnce(u32) -> u32,
     preview: &mut StaticPreviewScene,
+    trail_materials: Option<&mut HashMap<String, PreparedEffectMaterial>>,
 ) -> Result<Option<ProjectileDraw>, String> {
     let projectile = load_player_projectile(engine, archive, name)?;
     let assets = &projectile.assets;
@@ -9506,6 +9511,9 @@ fn prepare_projectile_draw(
         &mut preview.material_animations,
     )?;
     let capacity = capacity(projectile.lifetime_ms).min(128);
+    let layers = trail_materials.map_or_else(Vec::new, |materials| {
+        projectile_trail::prepare(root, &projectile, name, preview, materials)
+    });
     let mut instances = Vec::new();
     for _ in 0..capacity {
         let vertex_start = preview.mesh.vertices.len();
@@ -9516,11 +9524,18 @@ fn prepare_projectile_draw(
             &selector_remap,
             Some(&mut preview.material_animations),
         )?;
+        let draw_ranges = range_start..preview.mesh.draw_ranges.len();
+        let trails = layers
+            .iter()
+            .map(|&layer| projectile_trail::ProjectileTrail::allocate(&mut preview.mesh, layer))
+            .collect::<Result<_, _>>()?;
         instances.push(ProjectileDrawSlot {
             flight: None,
             shooter: None,
             vertex_start,
-            draw_ranges: range_start..preview.mesh.draw_ranges.len(),
+            draw_ranges,
+            trails,
+            trail_segment: None,
         });
     }
     Ok(Some(ProjectileDraw {
@@ -9813,6 +9828,7 @@ fn run_static_vulkan_mode(
     let cockpit = mission_engine.as_ref().and_then(starting_cockpit);
     let mut player_weapon_layouts = HashMap::new();
     let mut projectile_draws = Vec::new();
+    let mut projectile_effect_materials = HashMap::new();
     if let (Some(engine), Some(cockpit)) = (&mission_engine, cockpit) {
         let mut pools = Vec::<(String, String, Vec<u32>)>::new();
         let hero = (
@@ -9866,11 +9882,13 @@ fn run_static_vulkan_mode(
                 })
             };
             let draw = match prepare_projectile_draw(
+                root,
                 engine,
                 &archive,
                 &name,
                 capacity,
                 &mut preview,
+                Some(&mut projectile_effect_materials),
             ) {
                 Ok(draw @ Some(_)) => draw,
                 Ok(None) => {
@@ -9887,7 +9905,7 @@ fn run_static_vulkan_mode(
     }
     let autodemo_draws = mission_engine.as_ref().map_or_else(Vec::new, |engine| {
         fparkan_runtime::autodemo_projectile_types(engine).iter().map(|kind| {
-            match prepare_projectile_draw(engine, &kind.archive, &kind.name, |_| kind.capacity, &mut preview) {
+            match prepare_projectile_draw(root, engine, &kind.archive, &kind.name, |_| kind.capacity, &mut preview, None) {
                 Ok(Some(draw)) => Some(draw),
                 result => {
                     let reason = result.err().unwrap_or_else(|| "effect-only body".into());
@@ -10759,6 +10777,7 @@ impl StaticVulkanApp {
         for (pool, draw) in self.projectile_draws.iter_mut().enumerate() {
             let Some(draw) = draw else { continue };
             for instance in &mut draw.instances {
+                instance.trail_segment = None;
                 let (Some(flight), Some(shooter)) = (&mut instance.flight, instance.shooter) else {
                     continue;
                 };
@@ -10771,6 +10790,15 @@ impl StaticVulkanApp {
                             projectile_unit_hit(engine, shooter, segment).filter(|hit| {
                                 terrain_contact.is_none_or(|ground| hit.fraction < ground)
                             });
+                        if !instance.trails.is_empty() {
+                            let [from, to] = segment;
+                            let fraction = unit_contact
+                                .map(|hit| hit.fraction)
+                                .or(terrain_contact)
+                                .unwrap_or(1.0);
+                            instance.trail_segment =
+                                Some([from, add3(from, scale3(sub3(to, from), fraction))]);
+                        }
                         Ok(terrain_contact.is_some() || unit_contact.is_some())
                     })
                     .map_err(|error| format!("query projectile terrain: {error}"))?;
@@ -10809,11 +10837,19 @@ impl StaticVulkanApp {
     fn update_projectile_geometry(&mut self) {
         for draw in self
             .projectile_draws
-            .iter()
-            .chain(&self.autodemo_draws)
+            .iter_mut()
+            .chain(&mut self.autodemo_draws)
             .flatten()
         {
-            for instance in &draw.instances {
+            for instance in &mut draw.instances {
+                for trail in &mut instance.trails {
+                    trail.sample(
+                        &mut self.mesh.vertices,
+                        instance.trail_segment,
+                        self.view_camera.position,
+                        self.view_camera.forward,
+                    );
+                }
                 let Some(flight) = instance.flight else {
                     continue;
                 };
@@ -12033,6 +12069,16 @@ impl StaticVulkanApp {
             .chain(&self.autodemo_draws)
             .flatten()
         {
+            for trail in draw
+                .instances
+                .iter()
+                .flat_map(|instance| &instance.trails)
+                .filter(|trail| !trail.visible)
+            {
+                renderer
+                    .set_draw_range_index_count(trail.range.range_index, 0)
+                    .map_err(|error| format!("hide inactive projectile trail: {error}"))?;
+            }
             for instance in draw
                 .instances
                 .iter()

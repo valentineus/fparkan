@@ -12,6 +12,7 @@ pub mod atmosphere;
 pub mod clock;
 pub mod environment;
 pub mod fx_visual;
+pub mod op5;
 pub mod op7;
 pub mod shadow;
 pub mod sky;
