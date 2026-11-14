@@ -51,6 +51,7 @@ mod player_motion;
 mod player_weapon;
 mod production;
 mod projectile;
+mod research;
 mod unit_patrol;
 
 pub use autodemo::{
@@ -73,6 +74,7 @@ pub use projectile::{
     apply_projectile_hit, load_player_projectile, projectile_terrain_hit, projectile_unit_hit,
     PlayerProjectile, ProjectileAssets, ProjectileContact,
 };
+pub use research::order_lab_research;
 
 const MISSION_DECODED_PAYLOAD_CACHE_ENTRIES: usize = 256;
 const MAX_MISSION_AI_RECORD_SLOTS: usize = 1_000_000;
@@ -1301,6 +1303,8 @@ pub struct FrameResult {
     pub produced_unit: Option<SpawnedUnit>,
     /// Diagnostic for a production order whose unit could not be created.
     pub production_failure: Option<String>,
+    /// Technology completed by a player laboratory order on this tick.
+    pub researched_component: Option<String>,
 }
 
 /// Engine.
@@ -1330,6 +1334,7 @@ struct LoadedMissionState {
     control_device_tables: Vec<MissionControlDeviceTableState>,
     behavior_control_groupings: Vec<MissionBehaviorControlGroupingState>,
     research_trf_tables: Vec<MissionResearchTrfTable>,
+    free_research: research::FreeResearch,
     ai_startup_states: Vec<MissionAiStartupState>,
     script_bundles: Vec<MissionScriptBundle>,
     script_varset: Option<MissionScriptVarSet>,
@@ -2484,6 +2489,7 @@ fn load_mission_with_options(
     engine.autodemo_combat = autodemo_combat;
     engine.autodemo_reinforcements = autodemo_reinforcements;
     engine.production = production;
+    let free_research = research::FreeResearch::new(&object_drafts[..reserve_start]);
     engine.loaded = Some(LoadedMissionState {
         summary: summary.clone(),
         mission,
@@ -2500,6 +2506,7 @@ fn load_mission_with_options(
         control_device_tables,
         behavior_control_groupings,
         research_trf_tables,
+        free_research,
         ai_startup_states: loaded_scripts.ai_startup_states,
         script_bundles: loaded_scripts.bundles,
         script_varset: loaded_scripts.varset,
@@ -2627,6 +2634,10 @@ pub fn step_headless(
         .loaded
         .as_mut()
         .and_then(|state| state.tick_mission_event(&engine.world, queue_time_ms));
+    let researched_component = engine
+        .loaded
+        .as_mut()
+        .and_then(|mission| mission.free_research.tick(&engine.world, queue_time_ms));
     Ok(FrameResult {
         snapshot,
         mission_event,
@@ -2636,6 +2647,7 @@ pub fn step_headless(
         autodemo_reinforcement_unavailable,
         produced_unit,
         production_failure,
+        researched_component,
         player_pitch_bits: engine
             .loaded
             .as_ref()
@@ -2692,7 +2704,7 @@ pub fn frame_with_player_motion(
 
 /// Coverage entries for the subsystems still absent from the mission loop.
 pub const SIMULATION_COVERAGE: &str =
-    "sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 unit_behavior_stub=1 render_object_lifecycle_stub=1 render_winding_change_stub=1 mission_event_clock_approx=1 mission_tactical_ids_stub=1 mission_clan_roster_stub=1 mission_message_ui_stub=1 factory_orders_approx=1 mine_orders_approx=1 mission_patrol_approx=1 mission_hero_exit_approx=1";
+    "sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 unit_behavior_stub=1 render_object_lifecycle_stub=1 render_winding_change_stub=1 mission_event_clock_approx=1 mission_tactical_ids_stub=1 mission_clan_roster_stub=1 mission_message_ui_stub=1 factory_orders_approx=1 mine_orders_approx=1 mission_patrol_approx=1 mission_hero_exit_approx=1 laboratory_research_approx=1";
 
 /// Totals from a headless mission coverage run.
 #[derive(Clone, Debug, Eq, PartialEq)]

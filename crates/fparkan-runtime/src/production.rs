@@ -4,10 +4,11 @@ use super::{
     },
     behavior_ore_index_for_handle,
     mission_events::on_communicator,
-    normalize_engine_path, query_behavior_profile_ore_rate, read_vfs,
-    set_control_device_table_selector, BehaviorOreState, ClanBody, Engine, EngineError,
-    LoadedMissionState, MissionControlDeviceTableState, MissionControlDeviceTableStatus,
-    MissionObjectDraft, StartingCockpit, World,
+    normalize_engine_path, query_behavior_profile_ore_rate,
+    research::{load_clan_table, RESEARCHED},
+    set_control_device_table_selector, BehaviorOreState, Engine, EngineError, LoadedMissionState,
+    MissionControlDeviceTableState, MissionControlDeviceTableStatus, MissionObjectDraft,
+    StartingCockpit, World,
 };
 use fparkan_assets::ResearchTrfDocument;
 use fparkan_path::NormalizedPath;
@@ -322,37 +323,17 @@ pub fn order_factory_robot(
         let research = if let Some(table) = cached {
             &table.document
         } else {
-            let clan = mission
-                .mission
-                .clans
-                .get(usize::from(owner.0))
-                .ok_or_else(|| EngineError::Production("factory clan is unavailable".into()))?;
-            let raw = match &clan.body {
-                ClanBody::Standard {
-                    second_resource, ..
-                }
-                | ClanBody::Spatial {
-                    second_resource, ..
-                } => &second_resource.path.raw,
-            };
-            let path = raw.split(|&byte| byte == 0).next().unwrap_or_default();
-            let path = std::str::from_utf8(path).map_err(production_error)?;
-            if path.is_empty() {
-                return Err(EngineError::Production(
-                    "factory clan has no price table".into(),
-                ));
-            }
-            let path = normalize_engine_path("factory price table", path)?;
             let vfs = engine
                 .services
                 .vfs
                 .as_ref()
                 .ok_or(EngineError::MissingVfs)?;
-            document =
-                ResearchTrfDocument::decode(read_vfs(vfs, &path)?).map_err(production_error)?;
+            document = load_clan_table(vfs, mission, owner)?;
             &document
         };
-        let mut cost = scheme_cost(&draft.unit_components, research)?;
+        let mut cost = scheme_cost(&draft.unit_components, research, |row| {
+            mission.free_research.learned.contains(&(owner, row))
+        })?;
         let (table, ore) = factory_resources(mission, plant)?;
         let rate = factory_rate(table)?;
         if rate > RESOURCE_EPSILON {
@@ -393,6 +374,7 @@ fn production_error(error: impl std::fmt::Display) -> EngineError {
 fn scheme_cost(
     records: &[UnitComponentRecord],
     research: &ResearchTrfDocument,
+    learned: impl Fn(usize) -> bool,
 ) -> Result<Cost, EngineError> {
     let tree = unit_component_tree(records).map_err(production_error)?;
     if tree.is_empty() {
@@ -419,7 +401,11 @@ fn scheme_cost(
             .find_key(&component.resource_raw)
             .map_err(production_error)?
             .ok_or_else(unavailable)?;
-        if research.flag_byte(row).unwrap_or_default() & 0b110 != 0b110 {
+        let mut flags = research.flag_byte(row).unwrap_or_default();
+        if learned(row) {
+            flags |= RESEARCHED;
+        }
+        if flags & 0b110 != 0b110 {
             return Err(unavailable());
         }
         let words = research.row_words(row).ok_or_else(unavailable)?;

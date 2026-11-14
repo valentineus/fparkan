@@ -85,8 +85,8 @@ use fparkan_runtime::{
     frame_with_player_motion, load_gameplay_mission, load_mission_static_preview,
     load_mission_static_preview_roots, load_player_projectile, loaded_mission_assets,
     loaded_mission_object_drafts, loaded_mission_script_bundles, loaded_terrain,
-    mission_object_handle, order_factory_robot, plan_player_motion, player_vehicle,
-    prepared_warbot_weapons, projectile_terrain_hit, projectile_unit_hit,
+    mission_object_handle, order_factory_robot, order_lab_research, plan_player_motion,
+    player_vehicle, prepared_warbot_weapons, projectile_terrain_hit, projectile_unit_hit,
     query_building_segment_world, simulate_mission_report, starting_cockpit,
     starting_player_weapons, AutoDemoCamera, AutoDemoView, BasementPlacementMode, BuildingMeshNode,
     Engine, EngineError, EngineServices, FrameResult, LoadedMission, MissionAssets,
@@ -10096,6 +10096,7 @@ struct StaticVulkanApp {
     player_fire_pressed: bool,
     player_capture_pressed: bool,
     player_build_pressed: bool,
+    player_research_pressed: bool,
     player_mine_pressed: bool,
     player_disembark_pressed: bool,
     boarded_hero_index: Option<usize>,
@@ -10230,6 +10231,7 @@ impl StaticVulkanApp {
             player_fire_pressed: false,
             player_capture_pressed: false,
             player_build_pressed: false,
+            player_research_pressed: false,
             player_mine_pressed: false,
             player_disembark_pressed: false,
             boarded_hero_index: None,
@@ -10922,6 +10924,7 @@ impl StaticVulkanApp {
         self.player_move_pressed = Default::default();
         self.player_capture_pressed = false;
         self.player_build_pressed = false;
+        self.player_research_pressed = false;
         self.player_mine_pressed = false;
         self.player_disembark_pressed = false;
         if self.cockpit.is_some() && self.demo_camera.is_none() {
@@ -11116,6 +11119,21 @@ impl StaticVulkanApp {
         if let Some(engine) = self.mission_engine.as_mut() {
             let mut deployed_mine = None;
             if let (true, Some(cockpit), false) = (
+                std::mem::take(&mut self.player_research_pressed),
+                self.cockpit,
+                self.boarded_hero_index.is_some(),
+            ) {
+                match order_lab_research(engine, cockpit, control_clock_ms) {
+                    Ok((component, duration)) => {
+                        if let Some(window) = &self.window {
+                            window.set_title(&format!("Лаборатория — исследуется {component}"));
+                        }
+                        eprintln!("laboratory_research_order component={component} duration_ms={duration} queue_time_ms={control_clock_ms}");
+                    }
+                    Err(error) => eprintln!("laboratory_research_rejected {error}"),
+                }
+            }
+            if let (true, Some(cockpit), false) = (
                 std::mem::take(&mut self.player_mine_pressed),
                 self.cockpit,
                 self.boarded_hero_index.is_some(),
@@ -11238,6 +11256,12 @@ impl StaticVulkanApp {
             }
             if let Some(error) = &frame.production_failure {
                 eprintln!("sim_coverage factory_spawn_failed=1 reason={error}");
+            }
+            if let Some(component) = &frame.researched_component {
+                if let Some(window) = &self.window {
+                    window.set_title(&format!("Лаборатория — разработано {component}"));
+                }
+                eprintln!("laboratory_research_complete component={component} queue_time_ms={control_clock_ms}");
             }
             if frame.autodemo_reinforcement_unavailable != 0 {
                 eprintln!(
@@ -12355,6 +12379,7 @@ impl ApplicationHandler for StaticVulkanApp {
                     self.player_move_pressed = Default::default();
                     self.player_capture_pressed = false;
                     self.player_build_pressed = false;
+                    self.player_research_pressed = false;
                     self.player_mine_pressed = false;
                     self.player_disembark_pressed = false;
                     self.player_mouse = [0.0; 2];
@@ -12411,6 +12436,9 @@ impl ApplicationHandler for StaticVulkanApp {
                             }
                             if self.demo_camera.is_none() && code == KeyCode::KeyB {
                                 self.player_build_pressed = true;
+                            }
+                            if self.demo_camera.is_none() && code == KeyCode::KeyR {
+                                self.player_research_pressed = true;
                             }
                             if self.demo_camera.is_none() && code == KeyCode::KeyM {
                                 self.player_mine_pressed = true;
