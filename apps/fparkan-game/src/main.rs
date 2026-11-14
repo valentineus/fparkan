@@ -77,14 +77,15 @@ use fparkan_render_vulkan::{
     VulkanStaticTexture, VulkanStaticTextureMip, VulkanStaticVertex,
 };
 use fparkan_runtime::{
-    autodemo_camera, create, frame as step_mission_frame, load_mission_static_preview,
-    load_mission_static_preview_roots, load_mission_with_init_stubs, loaded_mission_assets,
-    loaded_mission_object_drafts, loaded_mission_script_bundles, loaded_terrain,
-    mission_object_handle, query_building_segment_world, simulate_mission_report, starting_cockpit,
-    AutoDemoCamera, AutoDemoView, BasementPlacementMode, BuildingMeshNode, Engine, EngineError,
-    EngineServices, FrameResult, LoadedMission, MissionAssets, MissionEventStop, MissionMode,
-    MissionNotice, MissionObjectDraft, MissionRequest, MissionScriptInitExecution,
-    MissionStartupInput, StartingCockpit, SIMULATION_COVERAGE,
+    autodemo_camera, create, frame as step_mission_frame, frame_with_player_motion,
+    load_mission_static_preview, load_mission_static_preview_roots, load_mission_with_init_stubs,
+    loaded_mission_assets, loaded_mission_object_drafts, loaded_mission_script_bundles,
+    loaded_terrain, mission_object_handle, plan_player_motion, query_building_segment_world,
+    simulate_mission_report, starting_cockpit, AutoDemoCamera, AutoDemoView, BasementPlacementMode,
+    BuildingMeshNode, Engine, EngineError, EngineServices, FrameResult, LoadedMission,
+    MissionAssets, MissionEventStop, MissionMode, MissionNotice, MissionObjectDraft,
+    MissionRequest, MissionScriptInitExecution, MissionStartupInput, PlayerMotion, StartingCockpit,
+    SIMULATION_COVERAGE,
 };
 #[cfg(test)]
 use fparkan_terrain::BasementFoundationFragment;
@@ -9750,9 +9751,27 @@ fn mission_camera_coverage(cockpit: Option<StartingCockpit>, demo: bool) -> &'st
     if demo {
         "autodemo_camera_follow_approx=1 autodemo_camera_target_approx=1 cockpit_pose_approx=1"
     } else if cockpit.is_some() {
-        "cockpit_look_stub=1 cockpit_pose_approx=1"
+        "player_motion_approx=1 cockpit_aim_stub=1 cockpit_pose_approx=1"
     } else {
         "mission_camera_stub=1"
+    }
+}
+
+fn player_arrow(physical: PhysicalKey, logical: &Key) -> Option<KeyCode> {
+    match logical {
+        Key::Named(NamedKey::ArrowRight) => Some(KeyCode::ArrowRight),
+        Key::Named(NamedKey::ArrowLeft) => Some(KeyCode::ArrowLeft),
+        Key::Named(NamedKey::ArrowUp) => Some(KeyCode::ArrowUp),
+        Key::Named(NamedKey::ArrowDown) => Some(KeyCode::ArrowDown),
+        _ => match physical {
+            PhysicalKey::Code(
+                code @ (KeyCode::ArrowRight
+                | KeyCode::ArrowLeft
+                | KeyCode::ArrowUp
+                | KeyCode::ArrowDown),
+            ) => Some(code),
+            _ => None,
+        },
     }
 }
 
@@ -9813,7 +9832,9 @@ struct StaticVulkanApp {
     pending_scene_update: Option<SceneFrameUpdate>,
     environment_primitive_count: usize,
     pressed_keys: HashSet<KeyCode>,
+    player_move_pressed: [bool; 4],
     mouse_look: bool,
+    player_mouse_x: f32,
     audio: Option<audio::GameAudio>,
     camera_mode: &'static str,
     mesh_components: usize,
@@ -9933,7 +9954,9 @@ impl StaticVulkanApp {
             pending_scene_update: None,
             environment_primitive_count: 0,
             pressed_keys: HashSet::new(),
+            player_move_pressed: [false; 4],
             mouse_look: false,
+            player_mouse_x: 0.0,
             audio,
             camera_mode: preview.camera_mode,
             mesh_components: preview.mesh_components,
@@ -10237,6 +10260,7 @@ impl StaticVulkanApp {
             return Ok(());
         }
         if self.cockpit.take().is_some() {
+            self.set_mouse_look(false);
             self.camera_mode = "free-flight";
             eprintln!("sim_coverage mission_camera_stub=1 (cockpit target or pose unavailable)");
         }
@@ -10378,6 +10402,11 @@ impl StaticVulkanApp {
 
     fn set_mission_paused_at(&mut self, paused: bool, now: Instant) {
         self.mission_paused = paused;
+        self.player_mouse_x = 0.0;
+        self.player_move_pressed = [false; 4];
+        if self.cockpit.is_some() && self.demo_camera.is_none() {
+            self.set_mouse_look(self.window_focused && !paused);
+        }
         self.simulation_last_tick = now;
         eprintln!(
             "mission_pause paused={paused} queue_time_ms={}",
@@ -10495,9 +10524,50 @@ impl StaticVulkanApp {
             }
         }
         let control_clock_ms = clock.time_ms;
+        let mut player_step = None;
+        // A held key and accumulated device motion belong to this simulation sample.
+        let mouse_x = std::mem::take(&mut self.player_mouse_x);
+        if let (Some(engine), Some(cockpit), None) =
+            (&self.mission_engine, self.cockpit, &self.demo_camera)
+        {
+            let pressed = std::mem::take(&mut self.player_move_pressed);
+            let [right, left, forward, back] = [
+                KeyCode::ArrowRight,
+                KeyCode::ArrowLeft,
+                KeyCode::ArrowUp,
+                KeyCode::ArrowDown,
+            ]
+            .map(|key| self.pressed_keys.contains(&key));
+            if let Some(step) = plan_player_motion(
+                engine,
+                cockpit,
+                PlayerMotion {
+                    movement: [
+                        f32::from(right || pressed[0]) - f32::from(left || pressed[1]),
+                        f32::from(forward || pressed[2]) - f32::from(back || pressed[3]),
+                    ],
+                    mouse_x,
+                    delta_seconds: clock.delta_seconds,
+                },
+            )
+            .map_err(|error| error.to_string())?
+            {
+                let blocked = if let Some(sweep) = step.sweep {
+                    self.building_segment_blocked(sweep)?
+                } else {
+                    false
+                };
+                player_step = Some((cockpit, step, blocked));
+            }
+        }
         if let Some(engine) = self.mission_engine.as_mut() {
-            let frame = step_mission_frame(engine, control_clock_ms)
-                .map_err(|err| format!("step mission at {control_clock_ms} ms: {err}"))?;
+            let frame = match player_step {
+                Some((cockpit, step, blocked)) => {
+                    frame_with_player_motion(engine, control_clock_ms, cockpit, step, blocked)
+                }
+                None => step_mission_frame(engine, control_clock_ms),
+            }
+            .map_err(|err| format!("step mission at {control_clock_ms} ms: {err}"))?;
             if let Some(stop) = frame
                 .mission_event
                 .as_ref()
@@ -11343,8 +11413,12 @@ impl ApplicationHandler for StaticVulkanApp {
     ) {
         if self.mouse_look {
             if let DeviceEvent::MouseMotion { delta } = event {
-                if let Some(camera) = self.free_camera.as_mut() {
-                    camera.look_delta(delta.0, delta.1);
+                if self.cockpit.is_some() && self.demo_camera.is_none() && !self.mission_paused {
+                    self.player_mouse_x += delta.0 as f32;
+                } else if self.cockpit.is_none() {
+                    if let Some(camera) = self.free_camera.as_mut() {
+                        camera.look_delta(delta.0, delta.1);
+                    }
                 }
             }
         }
@@ -11470,6 +11544,9 @@ impl ApplicationHandler for StaticVulkanApp {
         );
         self.window_id = Some(window.id());
         self.window = Some(window);
+        if self.cockpit.is_some() && self.demo_camera.is_none() && self.window_focused {
+            self.set_mouse_look(true);
+        }
         self.renderer = Some(renderer);
         self.simulation_last_tick = Instant::now();
         self.live_clock_paused_for_zero_extent = false;
@@ -11507,7 +11584,14 @@ impl ApplicationHandler for StaticVulkanApp {
                 self.window_focused = focused;
                 if !focused {
                     self.pressed_keys.clear();
+                    self.player_move_pressed = [false; 4];
+                    self.player_mouse_x = 0.0;
                     self.set_mouse_look(false);
+                } else if self.cockpit.is_some()
+                    && self.demo_camera.is_none()
+                    && !self.mission_paused
+                {
+                    self.set_mouse_look(true);
                 }
                 if let Some(audio) = self.audio.as_mut() {
                     audio.set_paused(self.mission_paused || !focused);
@@ -11528,7 +11612,13 @@ impl ApplicationHandler for StaticVulkanApp {
                     }
                     return;
                 }
-                if let PhysicalKey::Code(code) = event.physical_key {
+                let key = if self.cockpit.is_some() && self.demo_camera.is_none() {
+                    player_arrow(event.physical_key, &event.logical_key)
+                        .map_or(event.physical_key, PhysicalKey::Code)
+                } else {
+                    event.physical_key
+                };
+                if let PhysicalKey::Code(code) = key {
                     if code == KeyCode::Escape && event.state == ElementState::Pressed {
                         if self.mouse_look {
                             self.set_mouse_look(false);
@@ -11537,17 +11627,31 @@ impl ApplicationHandler for StaticVulkanApp {
                         }
                     } else if event.state == ElementState::Pressed {
                         self.pressed_keys.insert(code);
+                        if self.cockpit.is_some() && !self.mission_paused && !event.repeat {
+                            if let Some(index) = [
+                                KeyCode::ArrowRight,
+                                KeyCode::ArrowLeft,
+                                KeyCode::ArrowUp,
+                                KeyCode::ArrowDown,
+                            ]
+                            .iter()
+                            .position(|&key| key == code)
+                            {
+                                self.player_move_pressed[index] = true;
+                            }
+                        }
                     } else {
                         self.pressed_keys.remove(&code);
                     }
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if button == MouseButton::Right
-                    && self.cockpit.is_none()
-                    && self.demo_camera.is_none()
-                {
-                    self.set_mouse_look(state == ElementState::Pressed);
+                if button == MouseButton::Right && self.demo_camera.is_none() {
+                    if self.cockpit.is_none() {
+                        self.set_mouse_look(state == ElementState::Pressed);
+                    } else if state == ElementState::Pressed && !self.mission_paused {
+                        self.set_mouse_look(true);
+                    }
                 }
             }
             WindowEvent::CursorMoved { .. } => {}

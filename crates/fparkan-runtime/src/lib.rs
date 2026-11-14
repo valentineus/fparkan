@@ -44,12 +44,14 @@ use std::sync::Arc;
 mod autodemo;
 mod mesh_collision;
 mod mission_events;
+mod player_motion;
 
 pub use autodemo::{autodemo_camera, AutoDemoCamera, AutoDemoView};
 pub use fparkan_assets::MissionAssets;
 pub use mesh_collision::{query_building_segment_world, BuildingMeshHit, BuildingMeshNode};
 use mission_events::MissionEvents;
 pub use mission_events::{MissionEventStop, MissionEventTick, MissionNotice};
+pub use player_motion::{plan_player_motion, PlayerMotion, PlayerMotionStep};
 
 const MISSION_DECODED_PAYLOAD_CACHE_ENTRIES: usize = 256;
 const MAX_MISSION_AI_RECORD_SLOTS: usize = 1_000_000;
@@ -2291,6 +2293,32 @@ pub fn step_headless(
 /// Returns [`EngineError`] when the resource or world step fails.
 pub fn frame(engine: &mut Engine, queue_time_ms: u32) -> Result<FrameResult, EngineError> {
     step_headless(engine, InputSnapshot, queue_time_ms)
+}
+
+/// Applies a proposed hero step and publishes the resulting world snapshot.
+/// A blocked sweep keeps the previous position and still applies the turn.
+///
+/// # Errors
+///
+/// Returns an error for a stale hero handle or a failed world step.
+pub fn frame_with_player_motion(
+    engine: &mut Engine,
+    queue_time_ms: u32,
+    cockpit: StartingCockpit,
+    motion: PlayerMotionStep,
+    blocked: bool,
+) -> Result<FrameResult, EngineError> {
+    let previous = transform_state(&engine.world, cockpit.handle)?;
+    let mut pose = motion.pose;
+    if blocked {
+        pose.position = previous.position;
+    }
+    set_transform(&mut engine.world, cockpit.handle, pose)?;
+    let result = frame(engine, queue_time_ms);
+    if result.is_err() {
+        set_transform(&mut engine.world, cockpit.handle, previous)?;
+    }
+    result
 }
 
 /// Coverage entries for the subsystems still absent from the mission loop.
@@ -17081,6 +17109,69 @@ mod tests {
             let expected = if clamps { maximum } else { current };
             assert_eq!(ore_states[0].current_ore_bits, expected.to_bits());
         }
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_player_walk_and_blocked_turn_update_the_world_snapshot() {
+        let vfs = Arc::new(DirectoryVfs::new(licensed_root("IS")));
+        let mut engine = create(EngineServices::new(vfs)).unwrap();
+        load_mission_with_init_stubs(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.01/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+        )
+        .unwrap();
+        let cockpit = starting_cockpit(&engine).unwrap();
+        let original = transform_state(&engine.world, cockpit.handle).unwrap();
+        let input = PlayerMotion {
+            movement: [0.0, 1.0],
+            mouse_x: 100.0,
+            delta_seconds: 0.1,
+        };
+        let proposed = plan_player_motion(&engine, cockpit, input)
+            .unwrap()
+            .unwrap();
+        assert!(proposed.sweep.is_some());
+        let blocked = frame_with_player_motion(&mut engine, 100, cockpit, proposed, true).unwrap();
+        let pose = |frame: &FrameResult| {
+            frame
+                .snapshot
+                .transforms
+                .iter()
+                .find(|(handle, _)| *handle == cockpit.handle)
+                .unwrap()
+                .1
+        };
+        let turned = pose(&blocked);
+        assert_eq!(turned.position, original.position);
+        assert_ne!(turned.orientation[2], original.orientation[2]);
+        let movement = PlayerMotion {
+            mouse_x: 0.0,
+            ..input
+        };
+        let proposed = plan_player_motion(&engine, cockpit, movement)
+            .unwrap()
+            .unwrap();
+        let walked =
+            pose(&frame_with_player_motion(&mut engine, 200, cockpit, proposed, false).unwrap());
+        let [x0, y0, z0] = original.position.map(f32::from_bits);
+        let [x1, y1, z1] = walked.position.map(f32::from_bits);
+        assert!(((x1 - x0).hypot(y1 - y0) - 0.8).abs() < 1e-4);
+        let ground = |xy| {
+            loaded_terrain(&engine)
+                .unwrap()
+                .height_at(xy)
+                .unwrap()
+                .unwrap()
+        };
+        assert!(((z1 - ground([x1, y1])) - (z0 - ground([x0, y0]))).abs() < 1e-5);
     }
 
     #[test]
