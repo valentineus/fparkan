@@ -77,13 +77,14 @@ use fparkan_render_vulkan::{
     VulkanStaticTexture, VulkanStaticTextureMip, VulkanStaticVertex,
 };
 use fparkan_runtime::{
-    create, frame as step_mission_frame, load_mission_static_preview,
+    autodemo_camera, create, frame as step_mission_frame, load_mission_static_preview,
     load_mission_static_preview_roots, load_mission_with_init_stubs, loaded_mission_assets,
     loaded_mission_object_drafts, loaded_mission_script_bundles, loaded_terrain,
     mission_object_handle, query_building_segment_world, simulate_mission_report, starting_cockpit,
-    BasementPlacementMode, BuildingMeshNode, Engine, EngineError, EngineServices, FrameResult,
-    LoadedMission, MissionAssets, MissionMode, MissionObjectDraft, MissionRequest,
-    MissionScriptInitExecution, MissionStartupInput, StartingCockpit, SIMULATION_COVERAGE,
+    AutoDemoCamera, AutoDemoView, BasementPlacementMode, BuildingMeshNode, Engine, EngineError,
+    EngineServices, FrameResult, LoadedMission, MissionAssets, MissionMode, MissionObjectDraft,
+    MissionRequest, MissionScriptInitExecution, MissionStartupInput, StartingCockpit,
+    SIMULATION_COVERAGE,
 };
 #[cfg(test)]
 use fparkan_terrain::BasementFoundationFragment;
@@ -169,8 +170,19 @@ fn run(args: &[String]) -> Result<String, String> {
             }
         }
     }
+    let demo_camera = match autodemo_camera(&engine) {
+        Ok(camera) => camera,
+        Err(error) => {
+            eprintln!(
+                "sim_coverage mission_camera_stub=1 mission={} reason={error}",
+                loaded.key
+            );
+            None
+        }
+    };
     if let Some(duration_ms) = args.sim_report_ms {
-        let camera_coverage = mission_camera_coverage(starting_cockpit(&engine));
+        let camera_coverage =
+            mission_camera_coverage(starting_cockpit(&engine), demo_camera.is_some());
         let report = simulate_mission_report(&mut engine, duration_ms.get()).map_err(|error| {
             format!(
                 "sim_coverage mission_step_failed=1 mission={}\n{error}",
@@ -253,6 +265,7 @@ fn run(args: &[String]) -> Result<String, String> {
         environment,
         audio,
         (!args.viewer).then_some(engine),
+        demo_camera,
         args.frames,
         &args.mission,
         loaded.object_count,
@@ -9618,6 +9631,7 @@ fn run_static_vulkan_mode(
     environment: Option<DynamicEnvironment>,
     audio: Option<audio::GameAudio>,
     mission_engine: Option<Engine>,
+    demo_camera: Option<AutoDemoCamera>,
     target_frames: u64,
     mission: &str,
     object_count: usize,
@@ -9685,6 +9699,7 @@ fn run_static_vulkan_mode(
         startup_timings,
     );
     app.mission_engine = mission_engine;
+    app.demo_camera = demo_camera;
     if let Some(engine) = &app.mission_engine {
         app.cockpit = starting_cockpit(engine);
         app.mission_render_roots = loaded_mission_object_drafts(engine)
@@ -9711,7 +9726,7 @@ fn run_static_vulkan_mode(
         }
         eprintln!(
             "{SIMULATION_COVERAGE} {}",
-            mission_camera_coverage(app.cockpit),
+            mission_camera_coverage(app.cockpit, app.demo_camera.is_some()),
         );
     }
     if let Err(err) = event_loop.run_app(&mut app) {
@@ -9720,8 +9735,10 @@ fn run_static_vulkan_mode(
     app.finish()
 }
 
-fn mission_camera_coverage(cockpit: Option<StartingCockpit>) -> &'static str {
-    if cockpit.is_some() {
+fn mission_camera_coverage(cockpit: Option<StartingCockpit>, demo: bool) -> &'static str {
+    if demo {
+        "autodemo_camera_follow_approx=1 autodemo_camera_target_approx=1 cockpit_pose_approx=1"
+    } else if cockpit.is_some() {
         "cockpit_look_stub=1 cockpit_pose_approx=1"
     } else {
         "mission_camera_stub=1"
@@ -9733,6 +9750,7 @@ struct StaticVulkanApp {
     mission_frame: Option<FrameResult>,
     mission_render_roots: Vec<Option<MissionRenderRoot>>,
     cockpit: Option<StartingCockpit>,
+    demo_camera: Option<AutoDemoCamera>,
     op1_jitter: Op1JitterState,
     fixed_water_clock_ms: Option<u32>,
     mesh: VulkanStaticMesh,
@@ -9851,6 +9869,7 @@ impl StaticVulkanApp {
             mission_frame: None,
             mission_render_roots: Vec::new(),
             cockpit: None,
+            demo_camera: None,
             mesh: preview.mesh,
             dynamic_vertex_start: preview.dynamic_vertex_start,
             terrain_lod: preview.terrain_lod,
@@ -10159,6 +10178,45 @@ impl StaticVulkanApp {
         delta_seconds: f32,
         viewport: [f32; 2],
     ) -> Result<(), String> {
+        if let (Some(demo), Some(frame)) = (&mut self.demo_camera, &self.mission_frame) {
+            let mode_and_camera =
+                match demo.sample(self.simulation_time_ms, &frame.snapshot, &self.terrain)? {
+                    AutoDemoView::Exterior { transform, bird } => (
+                        if bird {
+                            "autodemo-bird"
+                        } else {
+                            "autodemo-strategy"
+                        },
+                        PreviewCameraFrame::from_legacy_d3d7(
+                            transform,
+                            LegacyD3d7Projection {
+                                viewport: [0, 0, viewport[0] as i32, viewport[1] as i32],
+                                near_plane: 0.5,
+                                far_plane: 700.0,
+                                field_of_view_radians: 1.04,
+                            },
+                        ),
+                    ),
+                    AutoDemoView::Cockpit(cockpit) => {
+                        ("autodemo-cockpit", self.cockpit_frame(cockpit, viewport))
+                    }
+                };
+            if let (mode, Some(camera)) = mode_and_camera {
+                if self.camera_mode != mode {
+                    eprintln!(
+                        "mission_camera mode={mode} clock_ms={} position={:?} forward={:?}",
+                        self.simulation_time_ms, camera.position, camera.forward
+                    );
+                    self.camera_mode = mode;
+                }
+                self.camera = camera.vulkan_camera();
+                self.view_camera = camera;
+            } else if self.camera_mode != "autodemo-hold" {
+                self.camera_mode = "autodemo-hold";
+                eprintln!("sim_coverage autodemo_camera_pose_stub=1 (holding last camera)");
+            }
+            return Ok(());
+        }
         if let Some(camera) = self
             .cockpit
             .and_then(|cockpit| self.cockpit_frame(cockpit, viewport))
@@ -11420,7 +11478,10 @@ impl ApplicationHandler for StaticVulkanApp {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if button == MouseButton::Right && self.cockpit.is_none() {
+                if button == MouseButton::Right
+                    && self.cockpit.is_none()
+                    && self.demo_camera.is_none()
+                {
                     self.set_mouse_look(state == ElementState::Pressed);
                 }
             }

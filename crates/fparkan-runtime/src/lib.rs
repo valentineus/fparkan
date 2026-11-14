@@ -41,8 +41,10 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+mod autodemo;
 mod mesh_collision;
 
+pub use autodemo::{autodemo_camera, AutoDemoCamera, AutoDemoView};
 pub use fparkan_assets::MissionAssets;
 pub use mesh_collision::{query_building_segment_world, BuildingMeshHit, BuildingMeshNode};
 
@@ -2577,6 +2579,14 @@ pub fn starting_cockpit(engine: &Engine) -> Option<StartingCockpit> {
         return None;
     }
     let handle = mission_object_handle(engine, hero.original_id?)?;
+    component_cockpit(mission, object_index, handle)
+}
+
+fn component_cockpit(
+    mission: &LoadedMissionState,
+    object_index: usize,
+    handle: ObjectHandle,
+) -> Option<StartingCockpit> {
     let mut points = mission
         .mission_assets
         .object_component_controls
