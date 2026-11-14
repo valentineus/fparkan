@@ -17193,6 +17193,17 @@ mod tests {
             mouse_y: 0.0,
             ..input
         };
+        assert!(matches!(
+            plan_player_motion(
+                &engine,
+                cockpit,
+                PlayerMotion {
+                    delta_seconds: f32::MAX,
+                    ..movement
+                }
+            ),
+            Err(EngineError::Movement(_))
+        ));
         let proposed = plan_player_motion(&engine, cockpit, movement)
             .unwrap()
             .unwrap();
@@ -17209,7 +17220,34 @@ mod tests {
                 .unwrap()
         };
         assert!(((z1 - ground([x1, y1])) - (z0 - ground([x0, y0]))).abs() < 1e-5);
-        let idle = frame(&mut engine, 300).unwrap();
+        let slow_frame = plan_player_motion(
+            &engine,
+            cockpit,
+            PlayerMotion {
+                delta_seconds: 0.2,
+                ..movement
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let [x2, y2, _] =
+            pose(&frame_with_player_motion(&mut engine, 400, cockpit, slow_frame, false).unwrap())
+                .position
+                .map(f32::from_bits);
+        assert!(((x2 - x1).hypot(y2 - y1) - 1.6).abs() < 1e-4);
+        set_transform(&mut engine.world, cockpit.handle, walked).unwrap();
+        let mut split = walked;
+        for clock_ms in [500, 600] {
+            let proposed = plan_player_motion(&engine, cockpit, movement)
+                .unwrap()
+                .unwrap();
+            split = pose(
+                &frame_with_player_motion(&mut engine, clock_ms, cockpit, proposed, false).unwrap(),
+            );
+        }
+        let [split_x, split_y, _] = split.position.map(f32::from_bits);
+        assert!((split_x - x2).hypot(split_y - y2) < 1e-4);
+        let idle = frame(&mut engine, 700).unwrap();
         assert_eq!(idle.player_pitch_bits, blocked.player_pitch_bits);
     }
 

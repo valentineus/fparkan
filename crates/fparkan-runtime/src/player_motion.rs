@@ -86,12 +86,17 @@ fn plan_motion(
         yaw
     };
     let [right, forward] = input.movement.map(|axis| axis.clamp(-1.0, 1.0));
-    let distance = 8.0 * input.delta_seconds.min(0.1) / right.hypot(forward).max(1.0);
+    let distance = 8.0 * input.delta_seconds / right.hypot(forward).max(1.0);
     let (sin, cos) = yaw.sin_cos();
     let xy = [
         from[0] + (cos * right - sin * forward) * distance,
         from[1] + (sin * right + cos * forward) * distance,
     ];
+    if !xy.iter().all(|axis| axis.is_finite()) {
+        return Err(EngineError::Movement(
+            "player step exceeds finite coordinates".into(),
+        ));
+    }
     let mut sweep = None;
     if xy != [from[0], from[1]] {
         if let (Some(old_ground), Some(new_ground)) = (
