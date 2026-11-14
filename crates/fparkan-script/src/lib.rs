@@ -216,7 +216,7 @@ pub enum ScriptInitResolveError {
         /// Raw disk word at index 3.
         found: u32,
     },
-    /// A formula record requests the separate whole-varset-record copy path.
+    /// A record requests an unsupported copy between variable cells.
     UnsupportedFormulaCopySource {
         /// Raw disk word at index 2.
         found: u32,
@@ -273,7 +273,7 @@ impl std::fmt::Display for ScriptInitResolveError {
             ),
             Self::UnsupportedFormulaCopySource { found } => write!(
                 formatter,
-                "unsupported formula source 0x{found:08x}; whole-varset copy is not modeled"
+                "unsupported variable copy from cell 0x{found:08x}; expected two DWORD cells"
             ),
             Self::MissingFormulaTable => write!(formatter, "formula assignment has no FML table"),
             Self::FormulaIndexOutOfBounds { index, rows } => write!(
@@ -1023,11 +1023,19 @@ impl VarSet {
                 }]))
             }
             u32::MAX => {
-                if instruction.header_words[2] != u32::MAX {
+                let source = instruction.header_words[2];
+                let target = instruction.header_words[1];
+                if source != u32::MAX {
+                    if let (Some(VarSetDefault::Dword(value)), Some(VarSetDefault::Dword(_))) =
+                        (values.get(source as usize), values.get(target as usize))
+                    {
+                        return Ok(InitInstructionResolution::Executed(vec![ScriptInitWrite {
+                            index: target,
+                            value: VarSetDefault::Dword(*value),
+                        }]));
+                    }
                     return Ok(InitInstructionResolution::Unsupported(
-                        ScriptInitResolveError::UnsupportedFormulaCopySource {
-                            found: instruction.header_words[2],
-                        },
+                        ScriptInitResolveError::UnsupportedFormulaCopySource { found: source },
                     ));
                 }
                 let Some(formulas) = formulas else {
@@ -2413,6 +2421,25 @@ mod tests {
             header_words: [u32::MAX, target, u32::MAX, u32::MAX, 6, 0, formula],
             references: Vec::new(),
         }
+    }
+
+    #[test]
+    fn periodic_assignment_copies_a_live_dword_cell() {
+        let varset = parse_varset(b"VAR(DWORD, destination, 0)\nVAR(DWORD, source, 0)\n").unwrap();
+        let event = ScriptEvent {
+            name_len: 4,
+            name_raw: b"Test\0".to_vec(),
+            event_word: 0,
+            instructions: vec![ScriptInstruction {
+                header_words: [u32::MAX, 0, 1, u32::MAX, 6, 0, u32::MAX],
+                references: Vec::new(),
+            }],
+        };
+        let mut values = [VarSetDefault::Dword(23), VarSetDefault::Dword(0x8000_000c)];
+        varset
+            .execute_event_prefix(&event, None, &mut values, |_, _| unreachable!())
+            .unwrap();
+        assert_eq!(values, [VarSetDefault::Dword(0x8000_000c); 2]);
     }
 
     #[test]
