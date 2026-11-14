@@ -80,11 +80,12 @@ use fparkan_render_vulkan::{
 #[cfg(test)]
 use fparkan_runtime::load_mission_with_init_stubs;
 use fparkan_runtime::{
-    apply_projectile_hit, autodemo_camera, capture_neutral_building, capture_neutral_warbot,
-    create, frame as step_mission_frame, frame_with_player_motion, load_gameplay_mission,
-    load_mission_static_preview, load_mission_static_preview_roots, load_player_projectile,
-    loaded_mission_assets, loaded_mission_object_drafts, loaded_mission_script_bundles,
-    loaded_terrain, mission_object_handle, order_factory_robot, plan_player_motion,
+    apply_projectile_hit, autodemo_camera, board_friendly_warbot, capture_neutral_building,
+    capture_neutral_warbot, create, disembark_warbot, frame as step_mission_frame,
+    frame_with_player_motion, load_gameplay_mission, load_mission_static_preview,
+    load_mission_static_preview_roots, load_player_projectile, loaded_mission_assets,
+    loaded_mission_object_drafts, loaded_mission_script_bundles, loaded_terrain,
+    mission_object_handle, order_factory_robot, plan_player_motion, player_vehicle,
     projectile_terrain_hit, projectile_unit_hit, query_building_segment_world,
     simulate_mission_report, starting_cockpit, starting_player_weapons, AutoDemoCamera,
     AutoDemoView, BasementPlacementMode, BuildingMeshNode, Engine, EngineError, EngineServices,
@@ -9952,7 +9953,7 @@ fn mission_camera_coverage(cockpit: Option<StartingCockpit>, demo: bool) -> &'st
     if demo {
         "autodemo_camera_follow_approx=1 autodemo_camera_target_approx=1 cockpit_pose_approx=1"
     } else if cockpit.is_some() {
-        "player_motion_approx=1 cockpit_aim_approx=1 cockpit_pose_approx=1 player_weapon_cycle_approx=1 player_projectile_flight_approx=1 player_projectile_damage_approx=1 player_projectile_hull_stub=1 player_weapon_fx_stub=1 player_capture_approx=1 player_communicator_approx=1 player_building_floor_approx=1"
+        "player_motion_approx=1 cockpit_aim_approx=1 cockpit_pose_approx=1 player_weapon_cycle_approx=1 player_projectile_flight_approx=1 player_projectile_damage_approx=1 player_projectile_hull_stub=1 player_weapon_fx_stub=1 player_capture_approx=1 player_communicator_approx=1 player_building_floor_approx=1 player_boarding_approx=1 vehicle_weapons_stub=1"
     } else {
         "mission_camera_stub=1"
     }
@@ -10045,6 +10046,8 @@ struct StaticVulkanApp {
     player_fire_pressed: bool,
     player_capture_pressed: bool,
     player_build_pressed: bool,
+    player_disembark_pressed: bool,
+    boarded_hero_index: Option<usize>,
     audio: Option<audio::GameAudio>,
     camera_mode: &'static str,
     mesh_components: usize,
@@ -10176,6 +10179,8 @@ impl StaticVulkanApp {
             player_fire_pressed: false,
             player_capture_pressed: false,
             player_build_pressed: false,
+            player_disembark_pressed: false,
+            boarded_hero_index: None,
             audio,
             camera_mode: preview.camera_mode,
             mesh_components: preview.mesh_components,
@@ -10539,6 +10544,11 @@ impl StaticVulkanApp {
     fn update_player_fire(&mut self, clock_ms: u32) {
         let trigger = self.player_fire_held || self.player_fire_pressed;
         self.player_fire_pressed = false;
+        // shortcut: the hero's weapon bank stays with the suit until mounted
+        // weapon assets can be selected and attached to the vehicle cockpit.
+        if self.boarded_hero_index.is_some() {
+            return;
+        }
         let (Some(cockpit), Some(frame)) = (self.cockpit, &self.mission_frame) else {
             return;
         };
@@ -10643,7 +10653,10 @@ impl StaticVulkanApp {
     }
 
     fn advance_player_projectiles(&mut self, clock_ms: u32) -> Result<(), String> {
-        let (Some(engine), Some(cockpit)) = (self.mission_engine.as_mut(), self.cockpit) else {
+        let Some(engine) = self.mission_engine.as_mut() else {
+            return Ok(());
+        };
+        let Some(hero) = starting_cockpit(engine) else {
             return Ok(());
         };
         for (slot, draw) in self.projectile_draws.iter_mut().enumerate() {
@@ -10658,7 +10671,7 @@ impl StaticVulkanApp {
                     .advance(clock_ms, |segment| {
                         terrain_contact = projectile_terrain_hit(&self.terrain, segment)?;
                         unit_contact =
-                            projectile_unit_hit(engine, cockpit.handle, segment).filter(|hit| {
+                            projectile_unit_hit(engine, hero.handle, segment).filter(|hit| {
                                 terrain_contact.is_none_or(|ground| hit.fraction < ground)
                             });
                         Ok(terrain_contact.is_some() || unit_contact.is_some())
@@ -10861,6 +10874,7 @@ impl StaticVulkanApp {
         self.player_move_pressed = [false; 4];
         self.player_capture_pressed = false;
         self.player_build_pressed = false;
+        self.player_disembark_pressed = false;
         if self.cockpit.is_some() && self.demo_camera.is_none() {
             self.set_mouse_look(self.window_focused && !paused);
         }
@@ -10884,12 +10898,19 @@ impl StaticVulkanApp {
             .as_ref()
             .and_then(fparkan_runtime::loaded_mission_script_outcome)
             .unwrap_or_default();
-        window.set_title(match (outcome, self.mission_paused) {
-            (fparkan_runtime::MissionScriptOutcome::Completed, _) => "Миссия выполнена",
-            (fparkan_runtime::MissionScriptOutcome::Failed, _) => "Миссия провалена",
-            (_, true) => "FParkan mission — Пауза",
-            _ => "FParkan mission",
-        });
+        window.set_title(
+            match (
+                outcome,
+                self.mission_paused,
+                self.boarded_hero_index.is_some(),
+            ) {
+                (fparkan_runtime::MissionScriptOutcome::Completed, _, _) => "Миссия выполнена",
+                (fparkan_runtime::MissionScriptOutcome::Failed, _, _) => "Миссия провалена",
+                (_, true, _) => "FParkan mission — Пауза",
+                (_, _, true) => "FParkan mission — Варбот",
+                _ => "FParkan mission",
+            },
+        );
     }
 
     fn update_shadow(
@@ -10983,6 +11004,29 @@ impl StaticVulkanApp {
         let control_clock_ms = clock.time_ms;
         self.advance_player_projectiles(control_clock_ms)?;
         let mut player_step = None;
+        let boarded_before = self.boarded_hero_index;
+        if let Some(engine) = self.mission_engine.as_mut() {
+            let disembark = std::mem::take(&mut self.player_disembark_pressed);
+            if let Some(vehicle) = player_vehicle(engine) {
+                let live = mission_object_handle(
+                    engine,
+                    fparkan_world::OriginalObjectId(vehicle.object_index as u32),
+                ) == Some(vehicle.handle);
+                if disembark || !live {
+                    if let Some(hero) =
+                        disembark_warbot(engine).map_err(|error| error.to_string())?
+                    {
+                        self.cockpit = Some(hero);
+                        self.boarded_hero_index = None;
+                        self.camera_mode = "starting-cockpit";
+                        eprintln!(
+                            "player_disembark object={} queue_time_ms={control_clock_ms}",
+                            vehicle.object_index
+                        );
+                    }
+                }
+            }
+        }
         // A held key and accumulated device motion belong to this simulation sample.
         let [mouse_x, mouse_y] = std::mem::take(&mut self.player_mouse);
         if let (Some(engine), Some(cockpit), None) =
@@ -11025,9 +11069,11 @@ impl StaticVulkanApp {
             }
         }
         if let Some(engine) = self.mission_engine.as_mut() {
-            if let (true, Some(cockpit)) =
-                (std::mem::take(&mut self.player_build_pressed), self.cockpit)
-            {
+            if let (true, Some(cockpit), false) = (
+                std::mem::take(&mut self.player_build_pressed),
+                self.cockpit,
+                self.boarded_hero_index.is_some(),
+            ) {
                 match order_factory_robot(engine, cockpit, control_clock_ms) {
                     Ok(duration) => eprintln!(
                         "factory_order duration_ms={duration} queue_time_ms={control_clock_ms}"
@@ -11035,9 +11081,10 @@ impl StaticVulkanApp {
                     Err(error) => eprintln!("factory_order_rejected {error}"),
                 }
             }
-            if let (true, Some(cockpit)) = (
+            if let (true, Some(cockpit), false) = (
                 std::mem::take(&mut self.player_capture_pressed),
                 self.cockpit,
+                self.boarded_hero_index.is_some(),
             ) {
                 if let Some(target) =
                     capture_neutral_warbot(engine, cockpit).map_err(|error| error.to_string())?
@@ -11045,6 +11092,17 @@ impl StaticVulkanApp {
                     eprintln!(
                         "player_capture object={} queue_time_ms={control_clock_ms}",
                         target.0
+                    );
+                } else if let Some(vehicle) =
+                    board_friendly_warbot(engine).map_err(|error| error.to_string())?
+                {
+                    self.cockpit = Some(vehicle);
+                    self.boarded_hero_index = Some(cockpit.object_index);
+                    self.camera_mode = "vehicle-cockpit";
+                    player_step = None;
+                    eprintln!(
+                        "player_board object={} queue_time_ms={control_clock_ms}",
+                        vehicle.object_index
                     );
                 } else if let Some(target) =
                     capture_neutral_building(engine, cockpit).map_err(|error| error.to_string())?
@@ -11160,6 +11218,9 @@ impl StaticVulkanApp {
                 }
             }
             self.mission_frame = Some(frame);
+        }
+        if self.boarded_hero_index != boarded_before {
+            self.update_mission_title();
         }
         if let Some(frame) = &self.mission_frame {
             let objects = &frame.snapshot.transforms;
@@ -11665,13 +11726,12 @@ impl StaticVulkanApp {
                 }
             }
         }
-        if !self.removed_mission_roots.is_empty() {
+        if !self.removed_mission_roots.is_empty() || self.boarded_hero_index.is_some() {
             for (index, range) in self.mesh.draw_ranges.iter().enumerate() {
-                if range
-                    .owner_scope
-                    .checked_sub(1)
-                    .is_some_and(|owner| self.removed_mission_roots.contains(&(owner as usize)))
-                {
+                if range.owner_scope.checked_sub(1).is_some_and(|owner| {
+                    self.removed_mission_roots.contains(&(owner as usize))
+                        || self.boarded_hero_index == Some(owner as usize)
+                }) {
                     renderer
                         .set_draw_range_index_count(index, 0)
                         .map_err(|error| {
@@ -11681,7 +11741,7 @@ impl StaticVulkanApp {
             }
         }
         let mut shadow_casters = std::borrow::Cow::Borrowed(self.shadow_casters.as_slice());
-        if !self.removed_mission_roots.is_empty() {
+        if !self.removed_mission_roots.is_empty() || self.boarded_hero_index.is_some() {
             shadow_casters = std::borrow::Cow::Owned(
                 self.shadow_casters
                     .iter()
@@ -11689,7 +11749,8 @@ impl StaticVulkanApp {
                     .filter_map(|(index, caster)| {
                         (!self.dynamic_shadow_casters.iter().any(|binding| {
                             binding.caster_index == index
-                                && self.removed_mission_roots.contains(&binding.object_index)
+                                && (self.removed_mission_roots.contains(&binding.object_index)
+                                    || self.boarded_hero_index == Some(binding.object_index))
                         }))
                         .then(|| caster.clone())
                     })
@@ -12219,6 +12280,7 @@ impl ApplicationHandler for StaticVulkanApp {
                     self.player_move_pressed = [false; 4];
                     self.player_capture_pressed = false;
                     self.player_build_pressed = false;
+                    self.player_disembark_pressed = false;
                     self.player_mouse = [0.0; 2];
                     self.set_mouse_look(false);
                 } else if self.cockpit.is_some()
@@ -12254,7 +12316,11 @@ impl ApplicationHandler for StaticVulkanApp {
                 };
                 if let PhysicalKey::Code(code) = key {
                     if code == KeyCode::Escape && event.state == ElementState::Pressed {
-                        if self.mouse_look {
+                        if self.boarded_hero_index.is_some() {
+                            if !self.mission_paused && !event.repeat {
+                                self.player_disembark_pressed = true;
+                            }
+                        } else if self.mouse_look {
                             self.set_mouse_look(false);
                         } else {
                             self.complete(event_loop);

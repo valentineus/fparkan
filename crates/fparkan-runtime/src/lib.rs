@@ -43,6 +43,7 @@ use std::sync::Arc;
 
 mod autodemo;
 mod autodemo_combat;
+mod boarding;
 mod mesh_collision;
 mod mission_events;
 mod player_motion;
@@ -55,6 +56,7 @@ pub use autodemo::{
     autodemo_camera, AutoDemoCamera, AutoDemoReinforcement, AutoDemoView, SpawnedUnit,
 };
 pub use autodemo_combat::{AutoDemoCombatEvent, AutoDemoProjectileType};
+pub use boarding::{board_friendly_warbot, disembark_warbot, player_vehicle};
 pub use fparkan_assets::MissionAssets;
 pub use mesh_collision::{query_building_segment_world, BuildingMeshHit, BuildingMeshNode};
 use mission_events::MissionEvents;
@@ -1334,6 +1336,7 @@ struct LoadedMissionState {
     mission_events: MissionEvents,
     unit_patrol: Option<unit_patrol::UnitPatrol>,
     player_pitch_bits: u32,
+    boarding: Option<boarding::Boarding>,
     script_host_mode: MissionMode,
     script_host_status: u32,
     script_outcome: MissionScriptOutcome,
@@ -2434,6 +2437,7 @@ fn load_mission_with_options(
         mission_events,
         unit_patrol,
         player_pitch_bits: 0,
+        boarding: None,
         script_host_mode: request.mode,
         // Fresh IGame construction seeds this field with 5; this is not the
         // later status-4 transition performed after native game initialization.
@@ -2592,6 +2596,7 @@ pub fn frame_with_player_motion(
         pose.position = previous.position;
     }
     set_transform(&mut engine.world, cockpit.handle, pose)?;
+    let passenger = boarding::move_passenger(engine, cockpit, pose);
     match frame(engine, queue_time_ms) {
         Ok(mut frame) => {
             if let Some(mission) = &mut engine.loaded {
@@ -2602,6 +2607,9 @@ pub fn frame_with_player_motion(
         }
         Err(error) => {
             set_transform(&mut engine.world, cockpit.handle, previous)?;
+            if let Some((handle, previous)) = passenger {
+                set_transform(&mut engine.world, handle, previous)?;
+            }
             Err(error)
         }
     }
@@ -17819,6 +17827,43 @@ mod tests {
         assert_eq!(
             loaded_mission_script_outcome(&engine),
             Some(MissionScriptOutcome::Completed)
+        );
+        assert_eq!(board_friendly_warbot(&mut engine).unwrap(), None);
+        let robot_pose = transform_state(&engine.world, robot.handle).unwrap();
+        player_pose.position = robot_pose.position;
+        set_transform(&mut engine.world, cockpit.handle, player_pose).unwrap();
+        let vehicle = board_friendly_warbot(&mut engine)
+            .unwrap()
+            .expect("vehicle cockpit");
+        assert_eq!(vehicle.handle, robot.handle);
+        assert_eq!(board_friendly_warbot(&mut engine).unwrap(), None);
+        let motion = plan_player_motion(
+            &engine,
+            vehicle,
+            PlayerMotion {
+                movement: [0.0, 1.0],
+                delta_seconds: 0.1,
+                ..PlayerMotion::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        frame_with_player_motion(&mut engine, 66_101, vehicle, motion, false).unwrap();
+        let driven = transform_state(&engine.world, vehicle.handle).unwrap();
+        assert_ne!(driven.position, robot_pose.position);
+        assert_eq!(
+            transform_state(&engine.world, cockpit.handle)
+                .unwrap()
+                .position,
+            driven.position
+        );
+        assert_eq!(disembark_warbot(&mut engine).unwrap(), Some(cockpit));
+        assert_eq!(player_vehicle(&engine), None);
+        assert_ne!(
+            transform_state(&engine.world, cockpit.handle)
+                .unwrap()
+                .position,
+            driven.position
         );
     }
 

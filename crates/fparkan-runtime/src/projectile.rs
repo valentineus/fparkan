@@ -178,6 +178,7 @@ pub fn projectile_unit_hit(
     segment: [[f32; 3]; 2],
 ) -> Option<ProjectileContact> {
     let mission = engine.loaded.as_ref()?;
+    let passenger = mission.boarding.map(|boarding| boarding.hero.handle);
     // shortcut: root MSH sphere until combat uses the per-node hull query.
     mission
         .object_drafts
@@ -189,7 +190,7 @@ pub fn projectile_unit_hit(
                 return None;
             }
             let handle = handle_by_original_id(&engine.world, draft.original_id?)?;
-            if handle == shooter {
+            if handle == shooter || passenger == Some(handle) {
                 return None;
             }
             let state = transform_state(&engine.world, handle).ok()?;
