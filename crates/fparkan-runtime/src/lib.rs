@@ -2444,7 +2444,27 @@ fn load_mission_with_options(
     } else {
         None
     };
-    let autodemo_combat = unit_patrol.as_ref().map(|_| {
+    let guard_clans: Vec<_> =
+        if options.start_autodemo && request.mode == MissionMode::SingleMission {
+            mission
+                .clans
+                .iter()
+                .enumerate()
+                .map(|(index, clan)| {
+                    clan.mode == 2
+                        && loaded_scripts.bundles.iter().any(|bundle| {
+                            bundle.clan_index == index
+                                && matches!(
+                                    bundle.init_execution,
+                                    MissionScriptInitExecution::Unsupported { .. }
+                                )
+                        })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+    let autodemo_combat = (unit_patrol.is_some() || guard_clans.contains(&true)).then(|| {
         autodemo_combat::AutoDemoCombat::new(
             &vfs,
             &mission,
@@ -2452,6 +2472,7 @@ fn load_mission_with_options(
             &handles,
             &mission_assets,
             reserve_start,
+            guard_clans,
         )
     });
     for &handle in &handles[reserve_start..] {
@@ -2824,6 +2845,15 @@ pub fn autodemo_combat_unavailable(engine: &Engine) -> usize {
         .autodemo_combat
         .as_ref()
         .map_or(0, |combat| combat.unavailable)
+}
+
+/// Counts AI clans using the stationary defense fallback in this mission.
+#[must_use]
+pub fn mission_guard_fallback_count(engine: &Engine) -> usize {
+    engine
+        .autodemo_combat
+        .as_ref()
+        .map_or(0, autodemo_combat::AutoDemoCombat::guard_clan_count)
 }
 
 /// Returns the loaded mission summary.
@@ -17999,6 +18029,57 @@ mod tests {
                 "{tick:?}"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_two_fortresses_ai_defends_when_the_player_approaches() {
+        let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(licensed_root("IS")));
+        let mut engine = create(EngineServices::new(vfs)).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Single.01/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(mission_guard_fallback_count(&engine), 1);
+        assert!(frame(&mut engine, 0)
+            .unwrap()
+            .autodemo_combat_events
+            .is_empty());
+        let hero = starting_cockpit(&engine).unwrap();
+        let enemy = mission_object_handle(&engine, OriginalObjectId(11)).unwrap();
+        let enemy_pose = transform_state(&engine.world, enemy).unwrap();
+        let [x, y, z] = enemy_pose.position.map(f32::from_bits);
+        let mut pose = transform_state(&engine.world, hero.handle).unwrap();
+        pose.position = [x - 10.0, y, z + 18.0].map(f32::to_bits);
+        set_transform(&mut engine.world, hero.handle, pose).unwrap();
+        let shots = (100..=6_000)
+            .step_by(50)
+            .flat_map(|now| frame(&mut engine, now).unwrap().autodemo_combat_events)
+            .collect::<Vec<_>>();
+        let assets = loaded_mission_assets(&engine).unwrap();
+        let weapons = player_weapon::prepare_unit_weapons(&assets.object_component_controls[11]);
+        assert!(
+            shots.iter().any(|event| matches!(event,
+            AutoDemoCombatEvent::Shot { shooter, target, .. }
+                if *shooter == enemy && *target == hero.handle)),
+            "{shots:?}, enemy weapons: {}",
+            weapons.weapons().len()
+        );
+        assert!(!shots.iter().any(|event| matches!(event,
+            AutoDemoCombatEvent::Shot { shooter, .. } if *shooter == hero.handle)));
+        assert_eq!(
+            transform_state(&engine.world, enemy).unwrap().position,
+            enemy_pose.position
+        );
     }
 
     #[test]

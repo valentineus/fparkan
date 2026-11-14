@@ -52,6 +52,7 @@ pub(super) struct AutoDemoCombat {
     units: Vec<Unit>,
     reserve: Vec<Unit>,
     hostile: Vec<Vec<bool>>,
+    guard_clans: Vec<bool>,
     projectiles: Vec<AutoDemoProjectileType>,
     flights: Vec<Flight>,
     pub(super) unavailable: usize,
@@ -86,6 +87,7 @@ impl AutoDemoCombat {
         handles: &[ObjectHandle],
         assets: &MissionAssets,
         reserve_start: usize,
+        guard_clans: Vec<bool>,
     ) -> Self {
         let hostile = mission
             .clans
@@ -107,6 +109,7 @@ impl AutoDemoCombat {
             units: Vec::new(),
             reserve: Vec::new(),
             hostile,
+            guard_clans,
             projectiles: Vec::new(),
             flights: Vec::new(),
             unavailable: 0,
@@ -193,6 +196,10 @@ impl AutoDemoCombat {
 
     pub(super) fn types(&self) -> &[AutoDemoProjectileType] {
         &self.projectiles
+    }
+
+    pub(super) fn guard_clan_count(&self) -> usize {
+        self.guard_clans.iter().filter(|&&enabled| enabled).count()
     }
 
     pub(super) fn flights(&self) -> impl Iterator<Item = (usize, PlayerProjectile)> + '_ {
@@ -285,7 +292,13 @@ impl AutoDemoCombat {
         };
         let targets = self.targets(&engine.world, &mission.mission_assets);
         for unit in &mut self.units {
+            // shortcut: armed AI units hold position and defend it while their Init is incomplete.
+            let guard = identity_metadata(&engine.world, unit.handle)
+                .ok()
+                .and_then(|identity| identity.owner_id)
+                .is_some_and(|owner| self.guard_clans.get(usize::from(owner.0)) == Some(&true));
             if mission.script_host_mode == super::MissionMode::SingleMission
+                && !guard
                 && !mission
                     .unit_patrol
                     .as_ref()

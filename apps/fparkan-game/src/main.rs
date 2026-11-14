@@ -163,6 +163,10 @@ fn run(args: &[String]) -> Result<String, String> {
     let mut engine = create(services).map_err(|err| err.to_string())?;
     let mission_assets_started = Instant::now();
     let loaded = load_requested_mission(&mut engine, &args).map_err(|error| error.to_string())?;
+    let guard_clans = fparkan_runtime::mission_guard_fallback_count(&engine);
+    if guard_clans != 0 {
+        eprintln!("sim_coverage mission_guard_fallback={guard_clans}");
+    }
     if !args.viewer {
         if args.mission_mode() == MissionMode::AutoDemo {
             let roots = loaded_mission_object_drafts(&engine).unwrap_or_default();
@@ -219,6 +223,12 @@ fn run(args: &[String]) -> Result<String, String> {
         })?;
         for stop in &report.mission_event_stops {
             log_mission_event_stop(stop);
+        }
+        if guard_clans != 0 {
+            eprintln!(
+                "mission_guard_combat first_shot_ms={:?} first_destroyed_ms={:?}",
+                report.autodemo_first_shot_ms, report.autodemo_first_destroyed_ms
+            );
         }
         if args.mission_mode() == MissionMode::AutoDemo {
             eprintln!(
@@ -10786,14 +10796,19 @@ impl StaticVulkanApp {
         let (Some(engine), Some(frame)) = (&self.mission_engine, &self.mission_frame) else {
             return;
         };
+        let combat = if self.demo_camera.is_some() {
+            "autodemo"
+        } else {
+            "mission_ai"
+        };
         for event in &frame.autodemo_combat_events {
             use fparkan_runtime::AutoDemoCombatEvent::{Destroyed, Shot};
             match *event {
                 Shot { shooter, target, projectile } => eprintln!(
-                    "autodemo_shot shooter={} target={} projectile={projectile} queue_time_ms={clock_ms}", shooter.slot, target.slot
+                    "{combat}_shot shooter={} target={} projectile={projectile} queue_time_ms={clock_ms}", shooter.slot, target.slot
                 ),
                 Destroyed { shooter, target } => eprintln!(
-                    "autodemo_destroyed shooter={} target={} queue_time_ms={clock_ms}", shooter.slot, target.slot
+                    "{combat}_destroyed shooter={} target={} queue_time_ms={clock_ms}", shooter.slot, target.slot
                 ),
             }
         }
