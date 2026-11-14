@@ -9972,11 +9972,13 @@ fn run_static_vulkan_mode(
         }).collect()
     });
     #[cfg(windows)]
-    let mission_hints = if cockpit.is_some() {
-        mission_hints::MissionHints::load(root, mission, &mut preview).unwrap_or_else(|error| {
-            eprintln!("sim_coverage mission_text_unavailable=1 reason={error}");
-            None
-        })
+    let mission_hints = if mission_engine.is_some() && demo_camera.is_none() {
+        mission_hints::MissionHints::load(root, mission, &mut preview)
+            .map(Some)
+            .unwrap_or_else(|error| {
+                eprintln!("sim_coverage mission_text_unavailable=1 reason={error}");
+                None
+            })
     } else {
         None
     };
@@ -12060,6 +12062,10 @@ impl StaticVulkanApp {
                 &mut self.mesh,
                 frame.clock.time_ms,
                 frame.viewport,
+                self.mission_engine
+                    .as_ref()
+                    .and_then(fparkan_runtime::loaded_mission_script_outcome)
+                    .unwrap_or_default(),
             )?;
         }
         renderer

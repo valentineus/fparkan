@@ -6,20 +6,26 @@ use super::{
 };
 use fparkan_path::{normalize_relative, PathPolicy};
 use fparkan_platform_winit::text::{caption, StringResources};
+use fparkan_runtime::MissionScriptOutcome;
 use fparkan_vfs::VfsError;
-use std::{collections::VecDeque, path::Path};
+use std::{collections::VecDeque, path::Path, sync::Arc};
 
 const WIDTH: u16 = 640;
 const HEIGHT: u16 = 384;
 const UV: [[f32; 2]; 4] = [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]];
 
 pub(super) struct MissionHints {
-    config: std::sync::Arc<[u8]>,
-    catalog: std::sync::Arc<[u8]>,
-    strings: StringResources,
+    messages: Option<MessageResources>,
     range: EnvironmentGpuRange,
     waiting: VecDeque<(u32, String)>,
     active: Option<(u32, u32, u32)>,
+    outcome: Option<(MissionScriptOutcome, u32)>,
+}
+
+struct MessageResources {
+    config: Arc<[u8]>,
+    catalog: Arc<[u8]>,
+    strings: StringResources,
 }
 
 impl MissionHints {
@@ -31,31 +37,12 @@ impl MissionHints {
         root: &Path,
         mission: &str,
         preview: &mut StaticPreviewScene,
-    ) -> Result<Option<Self>, String> {
-        let vfs = DirectoryVfs::new(root);
-        let path = mission.rsplit_once('/').map_or_else(
-            || "messages.cfg".into(),
-            |(dir, _)| format!("{dir}/messages.cfg"),
-        );
-        let config = match vfs.read(
-            &normalize_relative(path.as_bytes(), PathPolicy::StrictLegacy)
-                .map_err(|error| error.to_string())?,
-        ) {
-            Ok(bytes) => bytes,
-            Err(VfsError::NotFound(_)) => return Ok(None),
-            Err(error) => return Err(error.to_string()),
-        };
-        let catalog_path =
-            normalize_relative(b"DATA/TextRes.cfg", PathPolicy::StrictLegacy).unwrap();
-        let catalog = vfs.read(&catalog_path).map_err(|error| error.to_string())?;
-        let text = String::from_utf8_lossy(&catalog);
-        let library = audio::config_objects(&text)
-            .find_map(|object| object.get("LIBRARY").copied())
-            .ok_or_else(|| "missing text resource library".to_owned())?;
-        let library = audio::parse_cfg_value(library)?;
-        let library = normalize_relative(library.as_bytes(), PathPolicy::StrictLegacy)
-            .map_err(|error| error.to_string())?;
-        let strings = StringResources::open(&root.join(library.as_str()))?;
+    ) -> Result<Self, String> {
+        let messages = MessageResources::load(root, mission).unwrap_or_else(|error| {
+            eprintln!("sim_coverage mission_text_unavailable=1 reason={error}");
+            None
+        });
+        eprintln!("sim_coverage mission_outcome_display_approx=1");
         let material = append_environment_gradient_material(&mut preview.materials)?;
         preview.materials[material].screen_tl = true;
         preview.materials[material].sky_far_depth = false;
@@ -68,27 +55,29 @@ impl MissionHints {
             quad_indices(1)?,
             world_pipeline_state(LegacyBlendMode::SourceAlpha, LegacyDepthMode::Disabled),
         )?;
-        eprintln!("sim_coverage mission_text_display_approx=1");
         // Keep the degenerate reservation until the renderer receives live caption vertices.
-        Ok(Some(Self {
-            config,
-            catalog,
-            strings,
+        Ok(Self {
+            messages,
             range,
             waiting: VecDeque::new(),
             active: None,
-        }))
+            outcome: None,
+        })
     }
 
     pub(super) fn enqueue(&mut self, index: u32) -> Result<(), String> {
-        let symbol = audio::message_symbol(&self.config, index, "TEXT_RESOURCE")?
+        let messages = self
+            .messages
+            .as_ref()
+            .ok_or("missing mission message resources")?;
+        let symbol = audio::message_symbol(&messages.config, index, "TEXT_RESOURCE")?
             .ok_or_else(|| format!("missing TEXT_RESOURCE for message {index}"))?;
         let symbol = symbol.to_ascii_uppercase();
-        let text = String::from_utf8_lossy(&self.catalog);
+        let text = String::from_utf8_lossy(&messages.catalog);
         let id = audio::config_objects(&text)
             .find_map(|object| object.get(&symbol).and_then(|value| value.parse().ok()))
             .ok_or_else(|| format!("missing string ID for {symbol}"))?;
-        let body = self
+        let body = messages
             .strings
             .get(id)
             .filter(|text| !text.trim().is_empty())
@@ -103,7 +92,29 @@ impl MissionHints {
         mesh: &mut VulkanStaticMesh,
         clock: u32,
         viewport: [f32; 2],
+        outcome: MissionScriptOutcome,
     ) -> Result<(), String> {
+        if let Some(body) = outcome_text(outcome) {
+            let occupied =
+                if let Some((_, height)) = self.outcome.filter(|&(last, _)| last == outcome) {
+                    height
+                } else {
+                    let (height, rgba) = caption(body, WIDTH, HEIGHT)?;
+                    renderer
+                        .update_material_texture(self.range.material_index, 0, &texture(rgba))
+                        .map_err(|error| error.to_string())?;
+                    self.outcome = Some((outcome, height));
+                    self.active = None;
+                    self.waiting.clear();
+                    eprintln!("mission_outcome_text outcome={outcome:?} queue_time_ms={clock}");
+                    height
+                };
+            self.place_caption(mesh, viewport, occupied);
+            return renderer
+                .set_draw_range_index_count(self.range.range_index, 6)
+                .map_err(|error| error.to_string());
+        }
+        self.outcome = None;
         if self
             .active
             .is_some_and(|(start, duration, _)| clock.wrapping_sub(start) >= duration)
@@ -137,22 +148,7 @@ impl MissionHints {
             }
         }
         if let Some((_, _, occupied)) = self.active {
-            let scale = ((viewport[0] - 32.0) / f32::from(WIDTH)).clamp(0.01, 1.0);
-            let [width, height] = [f32::from(WIDTH) * scale, occupied as f32 * scale];
-            let mut uv = UV;
-            uv[1][1] = occupied as f32 / f32::from(HEIGHT);
-            uv[2][1] = uv[1][1];
-            let vertices = screen_tl_quad_vertices_pixels(
-                [viewport[0] * 0.5, 16.0 + height * 0.5],
-                width * 0.5,
-                height * 0.5,
-                viewport,
-                [1.0; 3],
-                1.0,
-                uv,
-            );
-            mesh.vertices[self.range.vertex_start..self.range.vertex_start + vertices.len()]
-                .copy_from_slice(&vertices);
+            self.place_caption(mesh, viewport, occupied);
         }
         renderer
             .set_draw_range_index_count(
@@ -160,6 +156,69 @@ impl MissionHints {
                 if self.active.is_some() { 6 } else { 0 },
             )
             .map_err(|error| error.to_string())
+    }
+
+    fn place_caption(&self, mesh: &mut VulkanStaticMesh, viewport: [f32; 2], occupied: u32) {
+        let scale = ((viewport[0] - 32.0) / f32::from(WIDTH)).clamp(0.01, 1.0);
+        let [width, height] = [f32::from(WIDTH) * scale, occupied as f32 * scale];
+        let mut uv = UV;
+        uv[1][1] = occupied as f32 / f32::from(HEIGHT);
+        uv[2][1] = uv[1][1];
+        let vertices = screen_tl_quad_vertices_pixels(
+            [viewport[0] * 0.5, 16.0 + height * 0.5],
+            width * 0.5,
+            height * 0.5,
+            viewport,
+            [1.0; 3],
+            1.0,
+            uv,
+        );
+        mesh.vertices[self.range.vertex_start..self.range.vertex_start + vertices.len()]
+            .copy_from_slice(&vertices);
+    }
+}
+
+impl MessageResources {
+    fn load(root: &Path, mission: &str) -> Result<Option<Self>, String> {
+        let vfs = DirectoryVfs::new(root);
+        let path = mission.rsplit_once('/').map_or_else(
+            || "messages.cfg".into(),
+            |(dir, _)| format!("{dir}/messages.cfg"),
+        );
+        let config = match vfs.read(
+            &normalize_relative(path.as_bytes(), PathPolicy::StrictLegacy)
+                .map_err(|error| error.to_string())?,
+        ) {
+            Ok(bytes) => bytes,
+            Err(VfsError::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+        let catalog_path =
+            normalize_relative(b"DATA/TextRes.cfg", PathPolicy::StrictLegacy).unwrap();
+        let catalog = vfs.read(&catalog_path).map_err(|error| error.to_string())?;
+        let text = String::from_utf8_lossy(&catalog);
+        let library = audio::config_objects(&text)
+            .find_map(|object| object.get("LIBRARY").copied())
+            .ok_or_else(|| "missing text resource library".to_owned())?;
+        let library = audio::parse_cfg_value(library)?;
+        let library = normalize_relative(library.as_bytes(), PathPolicy::StrictLegacy)
+            .map_err(|error| error.to_string())?;
+        let strings = StringResources::open(&root.join(library.as_str()))?;
+        eprintln!("sim_coverage mission_text_display_approx=1");
+        Ok(Some(Self {
+            config,
+            catalog,
+            strings,
+        }))
+    }
+}
+
+fn outcome_text(outcome: MissionScriptOutcome) -> Option<&'static str> {
+    // shortcut: use the caption panel until the native result dialog and its controls are reproduced.
+    match outcome {
+        MissionScriptOutcome::Active => None,
+        MissionScriptOutcome::Completed => Some("Миссия выполнена"),
+        MissionScriptOutcome::Failed => Some("Миссия не выполнена"),
     }
 }
 
@@ -169,5 +228,23 @@ fn texture(rgba8: Vec<u8>) -> VulkanStaticTexture {
         height: u32::from(HEIGHT),
         rgba8,
         mip_levels: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn outcome_captions_only_show_for_terminal_states() {
+        assert!(outcome_text(MissionScriptOutcome::Active).is_none());
+        let victory = outcome_text(MissionScriptOutcome::Completed).unwrap();
+        let defeat = outcome_text(MissionScriptOutcome::Failed).unwrap();
+        assert_ne!(victory, defeat);
+        for text in [victory, defeat] {
+            let (height, rgba) = caption(text, WIDTH, HEIGHT).unwrap();
+            assert!(height > 24);
+            assert!(rgba.chunks_exact(4).any(|pixel| pixel[0] != 0));
+        }
     }
 }
