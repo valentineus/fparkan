@@ -86,12 +86,13 @@ use fparkan_runtime::{
     load_mission_static_preview_roots, load_player_projectile, loaded_mission_assets,
     loaded_mission_object_drafts, loaded_mission_script_bundles, loaded_terrain,
     mission_object_handle, order_factory_robot, plan_player_motion, player_vehicle,
-    projectile_terrain_hit, projectile_unit_hit, query_building_segment_world,
-    simulate_mission_report, starting_cockpit, starting_player_weapons, AutoDemoCamera,
-    AutoDemoView, BasementPlacementMode, BuildingMeshNode, Engine, EngineError, EngineServices,
-    FrameResult, LoadedMission, MissionAssets, MissionEventStop, MissionMode, MissionNotice,
-    MissionObjectDraft, MissionRequest, MissionScriptInitExecution, MissionStartupInput,
-    PlayerMotion, PlayerProjectile, PlayerWeapons, StartingCockpit, SIMULATION_COVERAGE,
+    prepared_warbot_weapons, projectile_terrain_hit, projectile_unit_hit,
+    query_building_segment_world, simulate_mission_report, starting_cockpit,
+    starting_player_weapons, AutoDemoCamera, AutoDemoView, BasementPlacementMode, BuildingMeshNode,
+    Engine, EngineError, EngineServices, FrameResult, LoadedMission, MissionAssets,
+    MissionEventStop, MissionMode, MissionNotice, MissionObjectDraft, MissionRequest,
+    MissionScriptInitExecution, MissionStartupInput, PlayerMotion, PlayerProjectile, PlayerWeapons,
+    StartingCockpit, SIMULATION_COVERAGE,
 };
 #[cfg(test)]
 use fparkan_terrain::BasementFoundationFragment;
@@ -4909,8 +4910,14 @@ struct ProjectileDraw {
 
 struct ProjectileDrawSlot {
     flight: Option<PlayerProjectile>,
+    shooter: Option<ObjectHandle>,
     vertex_start: usize,
     draw_ranges: std::ops::Range<usize>,
+}
+
+struct PlayerWeaponLayout {
+    weapons: PlayerWeapons,
+    slots: Vec<(usize, Option<Op2SoundCommand>)>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -9523,6 +9530,7 @@ fn prepare_projectile_draw(
         )?;
         instances.push(ProjectileDrawSlot {
             flight: None,
+            shooter: None,
             vertex_start,
             draw_ranges: range_start..preview.mesh.draw_ranges.len(),
         });
@@ -9815,28 +9823,74 @@ fn run_static_vulkan_mode(
         None => None,
     };
     let cockpit = mission_engine.as_ref().and_then(starting_cockpit);
-    let mut player_weapons = PlayerWeapons::default();
+    let mut player_weapon_layouts = HashMap::new();
     let mut projectile_draws = Vec::new();
     if let (Some(engine), Some(cockpit)) = (&mission_engine, cockpit) {
-        player_weapons = starting_player_weapons(engine, cockpit);
-        for weapon in player_weapons.weapons() {
+        let mut pools = Vec::<(String, String, Vec<u32>)>::new();
+        let hero = (
+            cockpit.object_index,
+            starting_player_weapons(engine, cockpit),
+        );
+        for (index, weapons) in std::iter::once(hero).chain(prepared_warbot_weapons(engine)) {
+            let slots = weapons
+                .weapons()
+                .iter()
+                .map(|weapon| {
+                    let pool = pools
+                        .iter()
+                        .position(|(archive, name, _)| {
+                            archive.eq_ignore_ascii_case(&weapon.projectile_archive)
+                                && name.eq_ignore_ascii_case(&weapon.projectile)
+                        })
+                        .unwrap_or_else(|| {
+                            pools.push((
+                                weapon.projectile_archive.clone(),
+                                weapon.projectile.clone(),
+                                Vec::new(),
+                            ));
+                            pools.len() - 1
+                        });
+                    pools[pool].2.push(weapon.interval_ms());
+                    let sound = weapon.effect.as_ref().and_then(|(archive, name)| {
+                        let bytes =
+                            load_resource_entry_bytes_from_root(root, archive, name).ok()?;
+                        let effect = decode_fxid(bytes).ok()?;
+                        effect
+                            .commands()
+                            .iter()
+                            .find_map(Op2SoundCommand::from_command)
+                    });
+                    if sound.is_none() {
+                        eprintln!(
+                            "sim_coverage player_weapon_sound_stub=1 object={index} projectile={}",
+                            weapon.projectile
+                        );
+                    }
+                    (pool, sound)
+                })
+                .collect();
+            player_weapon_layouts.insert(index, PlayerWeaponLayout { weapons, slots });
+        }
+        for (archive, name, intervals) in pools {
+            let capacity = |lifetime: u32| {
+                intervals.iter().fold(0_u32, |total, &interval| {
+                    total.saturating_add(lifetime.div_ceil(interval))
+                })
+            };
             let draw = match prepare_projectile_draw(
                 engine,
-                &weapon.projectile_archive,
-                &weapon.projectile,
-                |lifetime| lifetime.div_ceil(weapon.interval_ms()),
+                &archive,
+                &name,
+                capacity,
                 &mut preview,
             ) {
-                Ok(Some(draw)) => Some(draw),
+                Ok(draw @ Some(_)) => draw,
                 Ok(None) => {
-                    eprintln!("sim_coverage player_projectile_visual_stub=1 projectile={} (effect-only body)", weapon.projectile);
+                    eprintln!("sim_coverage player_projectile_visual_stub=1 projectile={name} (effect-only body)");
                     None
                 }
                 Err(error) => {
-                    eprintln!(
-                        "sim_coverage player_projectile_layout_stub=1 projectile={} reason={error}",
-                        weapon.projectile
-                    );
+                    eprintln!("sim_coverage player_projectile_layout_stub=1 projectile={name} reason={error}");
                     None
                 }
             };
@@ -9877,7 +9931,18 @@ fn run_static_vulkan_mode(
     app.mission_engine = mission_engine;
     app.demo_camera = demo_camera;
     app.cockpit = cockpit;
-    app.player_weapons = player_weapons;
+    app.player_weapon_layouts = player_weapon_layouts;
+    if let Some(cockpit) = cockpit {
+        let layout = &app.player_weapon_layouts[&cockpit.object_index];
+        app.player_weapon_banks
+            .insert(cockpit.handle, layout.weapons.clone());
+        if layout.slots.is_empty() {
+            eprintln!(
+                "sim_coverage player_weapon_layout_stub=1 object={}",
+                cockpit.object_index
+            );
+        }
+    }
     app.projectile_draws = projectile_draws;
     app.autodemo_draws = autodemo_draws;
     if let Some(engine) = &app.mission_engine {
@@ -9910,34 +9975,6 @@ fn run_static_vulkan_mode(
         if app.cockpit.is_some() {
             app.camera_mode = "starting-cockpit";
         }
-        if app.cockpit.is_some() {
-            if app.player_weapons.weapons().is_empty() {
-                eprintln!("sim_coverage player_weapon_layout_stub=1");
-            }
-            app.player_weapon_sounds = app
-                .player_weapons
-                .weapons()
-                .iter()
-                .map(|weapon| {
-                    let sound = weapon.effect.as_ref().and_then(|(archive, name)| {
-                        let bytes =
-                            load_resource_entry_bytes_from_root(root, archive, name).ok()?;
-                        let effect = decode_fxid(bytes).ok()?;
-                        effect
-                            .commands()
-                            .iter()
-                            .find_map(Op2SoundCommand::from_command)
-                    });
-                    if sound.is_none() {
-                        eprintln!(
-                            "sim_coverage player_weapon_sound_stub=1 projectile={}",
-                            weapon.projectile
-                        );
-                    }
-                    sound
-                })
-                .collect();
-        }
         eprintln!(
             "{SIMULATION_COVERAGE} {}",
             mission_camera_coverage(app.cockpit, app.demo_camera.is_some()),
@@ -9953,7 +9990,7 @@ fn mission_camera_coverage(cockpit: Option<StartingCockpit>, demo: bool) -> &'st
     if demo {
         "autodemo_camera_follow_approx=1 autodemo_camera_target_approx=1 cockpit_pose_approx=1"
     } else if cockpit.is_some() {
-        "player_motion_approx=1 cockpit_aim_approx=1 cockpit_pose_approx=1 player_weapon_cycle_approx=1 player_projectile_flight_approx=1 player_projectile_damage_approx=1 player_projectile_hull_stub=1 player_weapon_fx_stub=1 player_capture_approx=1 player_communicator_approx=1 player_building_floor_approx=1 player_boarding_approx=1 vehicle_weapons_stub=1"
+        "player_motion_approx=1 cockpit_aim_approx=1 cockpit_pose_approx=1 player_weapon_cycle_approx=1 player_projectile_flight_approx=1 player_projectile_damage_approx=1 player_projectile_hull_stub=1 player_weapon_fx_stub=1 player_capture_approx=1 player_communicator_approx=1 player_building_floor_approx=1 player_boarding_approx=1"
     } else {
         "mission_camera_stub=1"
     }
@@ -10038,8 +10075,8 @@ struct StaticVulkanApp {
     player_move_pressed: [bool; 4],
     mouse_look: bool,
     player_mouse: [f32; 2],
-    player_weapons: PlayerWeapons,
-    player_weapon_sounds: Vec<Option<Op2SoundCommand>>,
+    player_weapon_layouts: HashMap<usize, PlayerWeaponLayout>,
+    player_weapon_banks: HashMap<ObjectHandle, PlayerWeapons>,
     projectile_draws: Vec<Option<ProjectileDraw>>,
     autodemo_draws: Vec<Option<ProjectileDraw>>,
     player_fire_held: bool,
@@ -10171,8 +10208,8 @@ impl StaticVulkanApp {
             player_move_pressed: [false; 4],
             mouse_look: false,
             player_mouse: [0.0; 2],
-            player_weapons: PlayerWeapons::default(),
-            player_weapon_sounds: Vec::new(),
+            player_weapon_layouts: HashMap::new(),
+            player_weapon_banks: HashMap::new(),
             projectile_draws: Vec::new(),
             autodemo_draws: Vec::new(),
             player_fire_held: false,
@@ -10544,12 +10581,13 @@ impl StaticVulkanApp {
     fn update_player_fire(&mut self, clock_ms: u32) {
         let trigger = self.player_fire_held || self.player_fire_pressed;
         self.player_fire_pressed = false;
-        // shortcut: the hero's weapon bank stays with the suit until mounted
-        // weapon assets can be selected and attached to the vehicle cockpit.
-        if self.boarded_hero_index.is_some() {
-            return;
-        }
         let (Some(cockpit), Some(frame)) = (self.cockpit, &self.mission_frame) else {
+            return;
+        };
+        let (Some(weapons), Some(layout)) = (
+            self.player_weapon_banks.get_mut(&cockpit.handle),
+            self.player_weapon_layouts.get(&cockpit.object_index),
+        ) else {
             return;
         };
         let Some((_, state)) = frame
@@ -10560,20 +10598,6 @@ impl StaticVulkanApp {
         else {
             return;
         };
-        let Some(hierarchy) = self
-            .component_pose_buffers
-            .get(cockpit.object_index)
-            .and_then(|components| components.get(cockpit.component_index))
-            .and_then(Option::as_ref)
-        else {
-            return;
-        };
-        let mount = self
-            .component_mount_poses
-            .get(cockpit.object_index)
-            .and_then(|components| components.get(cockpit.component_index))
-            .copied()
-            .flatten();
         let transform = LegacyIron3dEulerTransform {
             translation: state.position.map(f32::from_bits),
             orientation_radians: state.orientation.map(f32::from_bits),
@@ -10582,9 +10606,20 @@ impl StaticVulkanApp {
         // shortcut: the camera supplies a shared aim direction until native
         // per-weapon CPT direction and turret alignment agree in world space.
         let direction = self.view_camera.forward;
-        for (slot, weapon, barrel) in self.player_weapons.fire(trigger, clock_ms) {
+        for (slot, weapon, barrel) in weapons.fire(trigger, clock_ms) {
+            let hierarchy = self
+                .component_pose_buffers
+                .get(cockpit.object_index)
+                .and_then(|components| components.get(weapon.component_index))
+                .and_then(Option::as_ref);
+            let mount = self
+                .component_mount_poses
+                .get(cockpit.object_index)
+                .and_then(|components| components.get(weapon.component_index))
+                .copied()
+                .flatten();
             let pose = control_effect_owner_node_pose(
-                Some(hierarchy),
+                hierarchy,
                 mount.is_some(),
                 barrel.raw_signed_field_04 as usize,
             );
@@ -10601,13 +10636,15 @@ impl StaticVulkanApp {
                 continue;
             };
             eprintln!(
-                "player_shot slot={} projectile={}:{} queue_time_ms={clock_ms} muzzle={muzzle:?} rounds_remaining={:?}",
+                "player_shot shooter={} slot={} projectile={}:{} queue_time_ms={clock_ms} muzzle={muzzle:?} rounds_remaining={:?}",
+                cockpit.handle.slot,
                 slot + 1,
                 weapon.projectile_archive,
                 weapon.projectile,
                 weapon.rounds_remaining(),
             );
-            if let Some(draw) = self.projectile_draws.get_mut(slot).and_then(Option::as_mut) {
+            let (pool, sound) = &layout.slots[slot];
+            if let Some(draw) = self.projectile_draws[*pool].as_mut() {
                 if let Some(instance) = draw
                     .instances
                     .iter_mut()
@@ -10620,6 +10657,7 @@ impl StaticVulkanApp {
                         draw.lifetime_ms,
                         clock_ms,
                     );
+                    instance.shooter = Some(cockpit.handle);
                     if let Some(flight) = &instance.flight {
                         eprintln!("player_projectile_spawn slot={} queue_time_ms={clock_ms} speed={} lifetime_ms={} position={muzzle:?} direction={:?}", slot + 1, draw.speed, draw.lifetime_ms, flight.direction);
                     }
@@ -10630,10 +10668,7 @@ impl StaticVulkanApp {
                     );
                 }
             }
-            if let (Some(sound), Some(audio)) = (
-                self.player_weapon_sounds.get(slot).and_then(Option::as_ref),
-                self.audio.as_mut(),
-            ) {
+            if let (Some(sound), Some(audio)) = (sound, self.audio.as_mut()) {
                 if let Some(event) = sound.one_shot_at(muzzle) {
                     match audio.handle_sound_event(&event) {
                         Ok(()) => eprintln!(
@@ -10656,13 +10691,10 @@ impl StaticVulkanApp {
         let Some(engine) = self.mission_engine.as_mut() else {
             return Ok(());
         };
-        let Some(hero) = starting_cockpit(engine) else {
-            return Ok(());
-        };
-        for (slot, draw) in self.projectile_draws.iter_mut().enumerate() {
+        for (pool, draw) in self.projectile_draws.iter_mut().enumerate() {
             let Some(draw) = draw else { continue };
             for instance in &mut draw.instances {
-                let Some(flight) = &mut instance.flight else {
+                let (Some(flight), Some(shooter)) = (&mut instance.flight, instance.shooter) else {
                     continue;
                 };
                 let mut terrain_contact = None;
@@ -10671,7 +10703,7 @@ impl StaticVulkanApp {
                     .advance(clock_ms, |segment| {
                         terrain_contact = projectile_terrain_hit(&self.terrain, segment)?;
                         unit_contact =
-                            projectile_unit_hit(engine, hero.handle, segment).filter(|hit| {
+                            projectile_unit_hit(engine, shooter, segment).filter(|hit| {
                                 terrain_contact.is_none_or(|ground| hit.fraction < ground)
                             });
                         Ok(terrain_contact.is_some() || unit_contact.is_some())
@@ -10681,7 +10713,7 @@ impl StaticVulkanApp {
                     let reason = if let Some(hit) = unit_contact {
                         match draw.volume.map(|volume| apply_projectile_hit(engine, hit.handle, volume)).transpose() {
                             Ok(Some(Some((remaining, removed)))) => eprintln!(
-                                "player_projectile_hit slot={} target={} remaining={remaining} removed={removed} queue_time_ms={clock_ms}", slot + 1, hit.handle.slot,
+                                "player_projectile_hit shooter={} pool={pool} target={} remaining={remaining} removed={removed} queue_time_ms={clock_ms}", shooter.slot, hit.handle.slot,
                             ),
                             outcome => eprintln!(
                                 "sim_coverage player_projectile_target_stub=1 target={} result={outcome:?}", hit.handle.slot,
@@ -10694,10 +10726,11 @@ impl StaticVulkanApp {
                         "expired"
                     };
                     eprintln!(
-                        "player_projectile_end slot={} reason={reason} queue_time_ms={clock_ms}",
-                        slot + 1
+                        "player_projectile_end shooter={} pool={pool} reason={reason} queue_time_ms={clock_ms}",
+                        shooter.slot
                     );
                     instance.flight = None;
+                    instance.shooter = None;
                 }
             }
         }
@@ -11099,6 +11132,21 @@ impl StaticVulkanApp {
                     self.cockpit = Some(vehicle);
                     self.boarded_hero_index = Some(cockpit.object_index);
                     self.camera_mode = "vehicle-cockpit";
+                    if let Some(layout) = self.player_weapon_layouts.get(&vehicle.object_index) {
+                        self.player_weapon_banks
+                            .entry(vehicle.handle)
+                            .or_insert_with(|| layout.weapons.clone());
+                    }
+                    if self
+                        .player_weapon_layouts
+                        .get(&vehicle.object_index)
+                        .is_none_or(|layout| layout.slots.is_empty())
+                    {
+                        eprintln!(
+                            "sim_coverage player_weapon_layout_stub=1 object={}",
+                            vehicle.object_index
+                        );
+                    }
                     player_step = None;
                     eprintln!(
                         "player_board object={} queue_time_ms={control_clock_ms}",
@@ -12350,7 +12398,11 @@ impl ApplicationHandler for StaticVulkanApp {
                             .iter()
                             .position(|&key| key == code)
                             {
-                                self.player_weapons.select(slot);
+                                if let Some(weapons) = self.cockpit.and_then(|cockpit| {
+                                    self.player_weapon_banks.get_mut(&cockpit.handle)
+                                }) {
+                                    weapons.select(slot);
+                                }
                             }
                             if let Some(index) = [
                                 KeyCode::ArrowRight,

@@ -6,6 +6,8 @@ use fparkan_world::{
     handle_by_original_id, identity_metadata, set_transform, transform_state, ObjectHandle,
 };
 
+pub(super) const WARBOT_CLASS: u32 = 0x0100_8000;
+
 #[derive(Clone, Copy)]
 pub(super) struct Boarding {
     pub(super) cockpit: StartingCockpit,
@@ -43,7 +45,7 @@ pub fn board_friendly_warbot(engine: &mut Engine) -> Result<Option<StartingCockp
         .iter()
         .enumerate()
         .filter_map(|(index, draft)| {
-            if draft.unit_dat_header_flags != Some(0x0100_8000) {
+            if draft.unit_dat_header_flags != Some(WARBOT_CLASS) {
                 return None;
             }
             let handle = handle_by_original_id(&engine.world, draft.original_id?)?;

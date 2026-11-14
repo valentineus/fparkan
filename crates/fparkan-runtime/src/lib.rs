@@ -65,7 +65,7 @@ pub use mission_events::{
     MissionNotice,
 };
 pub use player_motion::{plan_player_motion, PlayerMotion, PlayerMotionStep};
-pub use player_weapon::{starting_player_weapons, PlayerWeapons};
+pub use player_weapon::{prepared_warbot_weapons, starting_player_weapons, PlayerWeapons};
 pub use production::order_factory_robot;
 pub use projectile::{
     apply_projectile_hit, load_player_projectile, projectile_terrain_hit, projectile_unit_hit,
@@ -17740,6 +17740,7 @@ mod tests {
             .iter()
             .any(|notice| matches!(notice, MissionNotice::ObjectiveComplete(0 | 2))));
         let cockpit = starting_cockpit(&engine).unwrap();
+        let prepared = prepared_warbot_weapons(&engine).collect::<Vec<_>>();
         assert!(order_factory_robot(&mut engine, cockpit, 1).is_err());
         assert_eq!(
             capture_neutral_building(&mut engine, cockpit).unwrap(),
@@ -17836,6 +17837,22 @@ mod tests {
             .unwrap()
             .expect("vehicle cockpit");
         assert_eq!(vehicle.handle, robot.handle);
+        let (_, mut weapons) = prepared
+            .into_iter()
+            .find(|(index, _)| *index == vehicle.object_index)
+            .expect("prepared weapons for built warbot");
+        assert_eq!(weapons.weapons().len(), 2);
+        weapons.select(2);
+        assert_eq!(weapons.fire(true, 66_001).count(), 0);
+        let shots = weapons
+            .fire(true, 67_001)
+            .map(|(slot, weapon, _)| {
+                load_player_projectile(&engine, &weapon.projectile_archive, &weapon.projectile)
+                    .unwrap();
+                (slot, weapon.projectile.clone())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(shots, [(1, "bf_b_01".into())]);
         assert_eq!(board_friendly_warbot(&mut engine).unwrap(), None);
         let motion = plan_player_motion(
             &engine,

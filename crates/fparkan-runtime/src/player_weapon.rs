@@ -3,7 +3,7 @@ use fparkan_assets::{
     PreparedComponentControl, PreparedControlEffectSection, PreparedControlPoint,
 };
 
-/// The starting hero's selectable weapon devices, in resource order.
+/// A unit's selectable weapon devices, in resource order.
 #[derive(Clone, Default)]
 pub struct PlayerWeapons {
     weapons: Vec<PlayerWeapon>,
@@ -15,6 +15,8 @@ pub struct PlayerWeapons {
 /// A manual-fire device prepared from its CTLD record and effect rows.
 #[derive(Clone)]
 pub struct PlayerWeapon {
+    /// Component containing the barrel's CPT point.
+    pub component_index: usize,
     /// Name of the projectile prototype.
     pub projectile: String,
     /// Archive named by the weapon's projectile descriptor.
@@ -172,12 +174,34 @@ pub fn starting_player_weapons(engine: &Engine, cockpit: StartingCockpit) -> Pla
         .and_then(|controls| controls.get(cockpit.component_index))
         .and_then(Option::as_ref);
     PlayerWeapons {
-        weapons: control.map_or_else(Vec::new, prepare_weapons),
+        weapons: control.map_or_else(Vec::new, |control| {
+            prepare_weapons(cockpit.component_index, control)
+        }),
         ..PlayerWeapons::default()
     }
 }
 
-fn prepare_weapons(control: &PreparedComponentControl) -> Vec<PlayerWeapon> {
+/// Resolves weapon devices for placed and prepared production warbots.
+pub fn prepared_warbot_weapons(
+    engine: &Engine,
+) -> impl Iterator<Item = (usize, PlayerWeapons)> + '_ {
+    engine.loaded.iter().flat_map(|mission| {
+        mission
+            .object_drafts
+            .iter()
+            .zip(&mission.mission_assets.object_component_controls)
+            .enumerate()
+            .filter(|(_, (draft, _))| {
+                draft.unit_dat_header_flags == Some(crate::boarding::WARBOT_CLASS)
+            })
+            .map(|(index, (_, controls))| (index, prepare_unit_weapons(controls)))
+    })
+}
+
+fn prepare_weapons(
+    component_index: usize,
+    control: &PreparedComponentControl,
+) -> Vec<PlayerWeapon> {
     let Some(points) = &control.point_list else {
         return Vec::new();
     };
@@ -256,6 +280,7 @@ fn prepare_weapons(control: &PreparedComponentControl) -> Vec<PlayerWeapon> {
                 _ => None,
             };
             Some(PlayerWeapon {
+                component_index,
                 projectile,
                 projectile_archive,
                 effect,
@@ -276,8 +301,9 @@ pub(super) fn prepare_unit_weapons(controls: &[Option<PreparedComponentControl>]
     PlayerWeapons {
         weapons: controls
             .iter()
-            .flatten()
-            .flat_map(prepare_weapons)
+            .enumerate()
+            .filter_map(|(index, control)| Some((index, control.as_ref()?)))
+            .flat_map(|(index, control)| prepare_weapons(index, control))
             .collect(),
         ..PlayerWeapons::default()
     }
@@ -291,6 +317,7 @@ mod tests {
     fn shot_finishes_after_trigger_release_and_then_spends_ammo() {
         let mut weapons = PlayerWeapons {
             weapons: vec![PlayerWeapon {
+                component_index: 0,
                 projectile: String::from("test"),
                 projectile_archive: String::from("test.rlb"),
                 effect: None,
