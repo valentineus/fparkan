@@ -1,8 +1,13 @@
 use crate::{
     apply_loaded_mission_control_node_delta, ControlResourceAccessError, Engine, MissionAssets,
     MissionControlNodeProviderTableStatus, TerrainWorld, CONTROL_CLASS_SOURCE_BULL,
+    UNIT_DAT_CONTROL_CLASS_HIGH_BIT,
 };
-use fparkan_assets::AssetManager;
+use fparkan_assets::{AssetManager, PreparedModel};
+use fparkan_msh::{
+    node38_fallback_hierarchy, query_slot_segment, selected_slot, Group, Lod, NodeId,
+    SegmentQueryMasks,
+};
 use fparkan_prototype::{resolve_prototype_all, PrototypeSource};
 use fparkan_render::LegacyIron3dEulerTransform;
 use fparkan_resource::{resource_name, CachedResourceRepository};
@@ -169,9 +174,11 @@ pub fn projectile_terrain_hit(
 pub struct ProjectileContact {
     pub handle: ObjectHandle,
     pub fraction: f32,
+    /// Provider row identified by a building triangle hit.
+    pub building_node: Option<u32>,
 }
 
-/// Finds the first other unit intersected by this flight segment.
+/// Finds the first unit or building intersected by this flight segment.
 pub fn projectile_unit_hit(
     engine: &Engine,
     shooter: ObjectHandle,
@@ -186,7 +193,8 @@ pub fn projectile_unit_hit(
         .enumerate()
         .filter_map(|(index, draft)| {
             let class = draft.unit_dat_header_flags?;
-            if class & 0x0100_0000 == 0 {
+            let building = class & UNIT_DAT_CONTROL_CLASS_HIGH_BIT != 0;
+            if !building && class & super::autodemo::MOBILE_UNIT == 0 {
                 return None;
             }
             let handle = handle_by_original_id(&engine.world, draft.original_id?)?;
@@ -195,8 +203,19 @@ pub fn projectile_unit_hit(
             }
             let state = transform_state(&engine.world, handle).ok()?;
             let (center, radius) = unit_sphere(&mission.mission_assets, index, state)?;
-            let fraction = segment_sphere_fraction(segment, center, radius)?;
-            Some(ProjectileContact { handle, fraction })
+            let sphere_fraction = segment_sphere_fraction(segment, center, radius)?;
+            let (fraction, building_node) = if building {
+                let (fraction, node) =
+                    building_triangle_hit(&mission.mission_assets, index, state, segment)?;
+                (fraction, Some(node))
+            } else {
+                (sphere_fraction, None)
+            };
+            Some(ProjectileContact {
+                handle,
+                fraction,
+                building_node,
+            })
         })
         .min_by(|a, b| a.fraction.total_cmp(&b.fraction))
 }
@@ -206,8 +225,7 @@ pub(super) fn unit_sphere(
     index: usize,
     state: fparkan_world::TransformState,
 ) -> Option<([f32; 3], f32)> {
-    let visual = assets.visual_by_id(*assets.visuals_for_object(index).first()?)?;
-    let model = &assets.model_by_id(visual.model_id?)?.validated;
+    let model = &root_model(assets, index)?.validated;
     let scale = state.scale.map(f32::from_bits);
     let transform = LegacyIron3dEulerTransform {
         translation: state.position.map(f32::from_bits),
@@ -216,6 +234,101 @@ pub(super) fn unit_sphere(
     let center = transform.try_transform_scaled_point(model.bounding_sphere_center, scale)?;
     let radius = model.bounding_sphere_radius * scale.into_iter().map(f32::abs).fold(0.0, f32::max);
     Some((center, radius))
+}
+
+fn root_model(assets: &MissionAssets, index: usize) -> Option<&PreparedModel> {
+    let visual = assets.visual_by_id(*assets.visuals_for_object(index).first()?)?;
+    assets.model_by_id(visual.model_id?)
+}
+
+fn building_triangle_hit(
+    assets: &MissionAssets,
+    index: usize,
+    state: fparkan_world::TransformState,
+    segment: [[f32; 3]; 2],
+) -> Option<(f32, u32)> {
+    let model = &root_model(assets, index)?.validated;
+    let root = LegacyIron3dEulerTransform {
+        translation: state.position.map(f32::from_bits),
+        orientation_radians: state.orientation.map(f32::from_bits),
+    }
+    .try_row_major()?;
+    let scale = state.scale.map(f32::from_bits);
+    let mut body_segment = segment;
+    for (local, point) in body_segment.iter_mut().zip(segment) {
+        let [x, y, z] = [point[0] - root[3], point[1] - root[7], point[2] - root[11]];
+        for i in 0..3 {
+            local[i] = (root[i] * x + root[i + 4] * y + root[i + 8] * z) / scale[i];
+        }
+    }
+    // shortcut: use root MSH fallback poses until combat shares live component transforms.
+    let poses = node38_fallback_hierarchy(model)?;
+    let squared_length: f32 = (0..3)
+        .map(|i| (segment[1][i] - segment[0][i]).powi(2))
+        .sum();
+    if squared_length == 0.0 {
+        return None;
+    }
+    poses
+        .poses
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, pose)| {
+            let node = NodeId(u32::try_from(i).ok()?);
+            let slot = selected_slot(model, node, Lod(0), Group(0))?;
+            let mut inverse = pose;
+            inverse.translation = [0.0; 3];
+            for component in &mut inverse.rotation[..3] {
+                *component = -*component;
+            }
+            let endpoints = body_segment.map(|point| {
+                inverse.transform_point(std::array::from_fn(|axis| {
+                    point[axis] - pose.translation[axis]
+                }))
+            });
+            let hit =
+                query_slot_segment(model, node, slot, endpoints, SegmentQueryMasks::default())
+                    .ok()??;
+            let body_hit = pose.transform_point(hit.position);
+            let distance: f32 = (0..3)
+                .map(|axis| ((body_hit[axis] - body_segment[0][axis]) * scale[axis]).powi(2))
+                .sum();
+            Some(((distance / squared_length).sqrt(), node.0))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+}
+
+/// Applies projectile damage to the contacted part of a building or unit.
+pub fn apply_projectile_contact(
+    engine: &mut Engine,
+    contact: ProjectileContact,
+    volume: f32,
+) -> Result<Option<(f32, bool)>, ControlResourceAccessError> {
+    let Some(key) = contact.building_node else {
+        return apply_projectile_hit(engine, contact.handle, volume);
+    };
+    let row = engine.loaded.as_ref().and_then(|mission| {
+        let table = mission
+            .control_device_tables
+            .iter()
+            .find(|table| table.handle == contact.handle)?;
+        super::control_node_provider_row(table, key).ok()
+    });
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let remaining = f32::from_bits(row.current_amount_bits);
+    if !volume.is_finite()
+        || volume <= 0.0
+        || !remaining.is_finite()
+        || remaining <= 0.0
+        || row.current_flags.is_some_and(|flags| flags & 0x10 != 0)
+    {
+        return Ok(None);
+    }
+    // shortcut: keep per-node damage using the projectile NDP volume while armor and splash are open.
+    let updated = apply_loaded_mission_control_node_delta(engine, contact.handle, key, -volume)?;
+    Ok(updated.map(|_| ((remaining - volume).max(0.0), false)))
 }
 
 fn segment_sphere_fraction(

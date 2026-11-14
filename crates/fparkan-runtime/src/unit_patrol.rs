@@ -27,6 +27,7 @@ struct PatrollingUnit {
     points: VecDeque<[f32; 2]>,
     retry_ms: u32,
     attack: Option<ObjectHandle>,
+    raid_factory: Option<(ObjectHandle, usize)>,
 }
 
 pub(super) struct PreparedPatrol {
@@ -68,7 +69,7 @@ impl UnitPatrol {
         }
 
         let clan = &mission.clans[bundle.clan_index];
-        let factories = drafts.iter().filter(|draft| {
+        let factories = drafts.iter().enumerate().filter(|(_, draft)| {
             draft.unit_dat_header_flags == Some(PLANT_CLASS)
                 && mission
                     .clans
@@ -91,9 +92,9 @@ impl UnitPatrol {
                 (draft.position[0] - target.position[0])
                     .hypot(draft.position[1] - target.position[1])
             };
-            if let Some(factory) = factories
+            if let Some((index, factory)) = factories
                 .clone()
-                .min_by(|a, b| distance(a).total_cmp(&distance(b)))
+                .min_by(|(_, a), (_, b)| distance(a).total_cmp(&distance(b)))
             {
                 ordered |= self.order(
                     world,
@@ -101,6 +102,9 @@ impl UnitPatrol {
                     [factory.position[0], factory.position[1]],
                     60.0,
                 );
+                if let Some(unit) = self.units.iter_mut().find(|unit| unit.handle == handle) {
+                    unit.raid_factory = Some((handles[index], index));
+                }
             }
         }
         self.factory_raid_clans += usize::from(ordered);
@@ -126,6 +130,7 @@ impl UnitPatrol {
         self.units
             .retain(|unit| transform_state(world, unit.handle).is_ok());
         if let Some(unit) = self.units.iter_mut().find(|unit| unit.handle == handle) {
+            unit.raid_factory = None;
             if unit.center != center || unit.radius != radius {
                 unit.center = center;
                 unit.radius = radius;
@@ -142,12 +147,20 @@ impl UnitPatrol {
             points: VecDeque::new(),
             retry_ms: 0,
             attack: None,
+            raid_factory: None,
         });
         true
     }
 
     pub(super) fn is_patrolling(&self, handle: ObjectHandle) -> bool {
         self.units.iter().any(|unit| unit.handle == handle)
+    }
+
+    pub(super) fn raid_factory(&self, handle: ObjectHandle) -> Option<(ObjectHandle, usize)> {
+        self.units
+            .iter()
+            .find(|unit| unit.handle == handle)?
+            .raid_factory
     }
 
     pub(super) fn activate(&mut self, world: &World, handle: ObjectHandle) {
@@ -180,6 +193,7 @@ impl UnitPatrol {
                 points: VecDeque::new(),
                 retry_ms: 0,
                 attack: None,
+                raid_factory: None,
             })
             .collect();
         Some(Self {

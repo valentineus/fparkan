@@ -1,5 +1,5 @@
 use super::{
-    apply_projectile_hit,
+    apply_projectile_contact,
     autodemo::MOBILE_UNIT,
     player_weapon::prepare_unit_weapons,
     projectile::{load_projectile, unit_sphere},
@@ -45,6 +45,17 @@ pub enum AutoDemoCombatEvent {
         shooter: ObjectHandle,
         /// Unit removed from the world.
         target: ObjectHandle,
+    },
+    /// An autonomous shot changed a building part's health.
+    BuildingHit {
+        /// Owner of the weapon.
+        shooter: ObjectHandle,
+        /// Building struck by the projectile.
+        target: ObjectHandle,
+        /// Provider row associated with the struck part.
+        node: u32,
+        /// Remaining health of the part as raw f32 bits.
+        remaining_bits: u32,
     },
 }
 
@@ -269,13 +280,22 @@ impl AutoDemoCombat {
                 let data = &self.projectiles[flight.projectile];
                 match data
                     .volume
-                    .map(|volume| apply_projectile_hit(engine, hit.handle, volume))
+                    .map(|volume| apply_projectile_contact(engine, hit, volume))
                 {
                     Some(Ok(Some((_, true)))) => events.push(AutoDemoCombatEvent::Destroyed {
                         shooter: flight.shooter,
                         target: hit.handle,
                     }),
-                    Some(Ok(Some((_, false)))) => {}
+                    Some(Ok(Some((remaining, false)))) => {
+                        if let Some(node) = hit.building_node {
+                            events.push(AutoDemoCombatEvent::BuildingHit {
+                                shooter: flight.shooter,
+                                target: hit.handle,
+                                node,
+                                remaining_bits: remaining.to_bits(),
+                            });
+                        }
+                    }
                     _ => unavailable += 1,
                 }
             }
@@ -293,9 +313,10 @@ impl AutoDemoCombat {
         let targets = self.targets(&engine.world, &mission.mission_assets);
         for unit in &mut self.units {
             // shortcut: armed AI units defend their position while their Init is incomplete.
-            let guard = identity_metadata(&engine.world, unit.handle)
+            let owner = identity_metadata(&engine.world, unit.handle)
                 .ok()
-                .and_then(|identity| identity.owner_id)
+                .and_then(|identity| identity.owner_id);
+            let guard = owner
                 .is_some_and(|owner| self.guard_clans.get(usize::from(owner.0)) == Some(&true));
             if mission.script_host_mode == super::MissionMode::SingleMission
                 && !guard
@@ -320,6 +341,30 @@ impl AutoDemoCombat {
                             None
                         }
                     }
+                })
+                .or_else(|| {
+                    let (factory, index) =
+                        mission.unit_patrol.as_ref()?.raid_factory(unit.handle)?;
+                    let target_owner = identity_metadata(&engine.world, factory).ok()?.owner_id?;
+                    if self
+                        .hostile
+                        .get(usize::from(owner?.0))?
+                        .get(usize::from(target_owner.0))
+                        != Some(&true)
+                    {
+                        return None;
+                    }
+                    let state = transform_state(&engine.world, unit.handle).ok()?;
+                    let (from, _) = unit_sphere(&mission.mission_assets, unit.index, state)?;
+                    let target = transform_state(&engine.world, factory).ok()?;
+                    let (to, _) = unit_sphere(&mission.mission_assets, index, target)?;
+                    if (to[0] - from[0]).hypot(to[1] - from[1]) > FIRE_RANGE {
+                        return None;
+                    }
+                    // shortcut: aim at the root bounds center until the native attack task selects a node.
+                    projectile_terrain_hit(&mission.terrain, [from, to])
+                        .is_ok_and(|ground| ground.is_none())
+                        .then_some((factory, from, to))
                 });
             for (slot, _, _) in unit.weapons.fire(aim.is_some(), now) {
                 let (Some((target, from, to)), Some(projectile)) = (aim, unit.slots[slot]) else {

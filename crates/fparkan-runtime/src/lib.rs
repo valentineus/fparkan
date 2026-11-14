@@ -76,8 +76,8 @@ pub use production::{
     order_factory_scheme,
 };
 pub use projectile::{
-    apply_projectile_hit, load_player_projectile, projectile_terrain_hit, projectile_unit_hit,
-    PlayerProjectile, ProjectileAssets, ProjectileContact,
+    apply_projectile_contact, apply_projectile_hit, load_player_projectile, projectile_terrain_hit,
+    projectile_unit_hit, PlayerProjectile, ProjectileAssets, ProjectileContact,
 };
 pub use research::order_lab_research;
 
@@ -2780,7 +2780,7 @@ pub fn frame_with_player_motion(
 
 /// Coverage entries for the subsystems still absent from the mission loop.
 pub const SIMULATION_COVERAGE: &str =
-    "sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 unit_behavior_stub=1 render_object_lifecycle_stub=1 render_winding_change_stub=1 mission_event_clock_approx=1 mission_tactical_ids_stub=1 mission_clan_roster_stub=1 mission_message_ui_stub=1 factory_orders_approx=1 mine_orders_approx=1 mission_patrol_approx=1 mission_hero_exit_approx=1 laboratory_research_approx=1";
+    "sim_coverage research_startup_gate_stub=1 mission_handlers_stub=1 unit_behavior_stub=1 render_object_lifecycle_stub=1 render_winding_change_stub=1 mission_event_clock_approx=1 mission_tactical_ids_stub=1 mission_clan_roster_stub=1 mission_message_ui_stub=1 factory_orders_approx=1 mine_orders_approx=1 mission_patrol_approx=1 mission_hero_exit_approx=1 laboratory_research_approx=1 building_projectile_approx=1";
 
 /// Totals from a headless mission coverage run.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2859,6 +2859,7 @@ pub fn simulate_mission_report(
                 AutoDemoCombatEvent::Destroyed { .. } => {
                     report.autodemo_first_destroyed_ms.get_or_insert(clock_ms)
                 }
+                AutoDemoCombatEvent::BuildingHit { .. } => continue,
             };
         }
         if let Some(event) = frame.mission_event {
@@ -16577,6 +16578,7 @@ mod tests {
                             .any(|(handle, _)| *handle == target));
                         first_destroyed.get_or_insert(now);
                     }
+                    AutoDemoCombatEvent::BuildingHit { .. } => {}
                 }
             }
             for replacement in result.autodemo_reinforcements {
@@ -18229,10 +18231,21 @@ mod tests {
             .position
             .map(f32::from_bits);
         let mut first_shot = None;
+        let mut first_building_hit = None;
         for now in (0..=300_000).step_by(100) {
             let step = frame(&mut engine, now).unwrap();
             for event in step.autodemo_combat_events {
-                if let AutoDemoCombatEvent::Shot { shooter, .. } = event {
+                if let AutoDemoCombatEvent::BuildingHit {
+                    target,
+                    node,
+                    remaining_bits,
+                    ..
+                } = event
+                {
+                    if target == factory {
+                        first_building_hit.get_or_insert((now, node, remaining_bits));
+                    }
+                } else if let AutoDemoCombatEvent::Shot { shooter, .. } = event {
                     assert_eq!(
                         fparkan_world::identity_metadata(&engine.world, shooter)
                             .unwrap()
@@ -18244,17 +18257,24 @@ mod tests {
                         .position
                         .map(f32::from_bits);
                     if (sx - x).hypot(sy - y) < 400.0 {
-                        first_shot = Some(now);
-                        break;
+                        first_shot.get_or_insert(now);
                     }
                 }
             }
-            if first_shot.is_some() {
+            if first_building_hit.is_some() {
                 break;
             }
         }
         assert!(first_shot.is_some(), "no shots on the player side");
-        println!("first raid shot in range of the player factory: {first_shot:?} ms");
+        let (now, node, _) = first_building_hit.expect("raid damages the factory");
+        assert_ne!(node, 0);
+        assert!(transform_state(&engine.world, factory).is_ok());
+        let (current, maximum) = player_status(&engine, hero.handle)
+            .unwrap()
+            .factory_health
+            .unwrap();
+        assert!(current < maximum);
+        println!("raid first shot {first_shot:?} ms, factory damage at {now} ms on node {node}");
         assert_eq!(transform_state(&engine.world, hero.handle).unwrap(), start);
     }
 

@@ -82,7 +82,7 @@ use fparkan_render_vulkan::{
 #[cfg(test)]
 use fparkan_runtime::load_mission_with_init_stubs;
 use fparkan_runtime::{
-    apply_projectile_hit, autodemo_camera, board_friendly_warbot, capture_building,
+    apply_projectile_contact, autodemo_camera, board_friendly_warbot, capture_building,
     capture_neutral_warbot, create, deploy_mine, disembark_warbot, frame as step_mission_frame,
     frame_with_player_motion, load_gameplay_mission, load_mission_static_preview,
     load_mission_static_preview_roots, load_player_projectile, loaded_mission_assets,
@@ -10809,7 +10809,7 @@ impl StaticVulkanApp {
                     .map_err(|error| format!("query projectile terrain: {error}"))?;
                 if !stays {
                     let reason = if let Some(hit) = unit_contact {
-                        match draw.volume.map(|volume| apply_projectile_hit(engine, hit.handle, volume)).transpose() {
+                        match draw.volume.map(|volume| apply_projectile_contact(engine, hit, volume)).transpose() {
                             Ok(Some(Some((remaining, removed)))) => eprintln!(
                                 "player_projectile_hit shooter={} pool={pool} target={} remaining={remaining} removed={removed} queue_time_ms={clock_ms}", shooter.slot, hit.handle.slot,
                             ),
@@ -10817,7 +10817,11 @@ impl StaticVulkanApp {
                                 "sim_coverage player_projectile_target_stub=1 target={} result={outcome:?}", hit.handle.slot,
                             ),
                         }
-                        "unit"
+                        if hit.building_node.is_some() {
+                            "building"
+                        } else {
+                            "unit"
+                        }
                     } else if terrain_contact.is_some() {
                         "terrain"
                     } else {
@@ -10873,13 +10877,17 @@ impl StaticVulkanApp {
             "mission_ai"
         };
         for event in &frame.autodemo_combat_events {
-            use fparkan_runtime::AutoDemoCombatEvent::{Destroyed, Shot};
+            use fparkan_runtime::AutoDemoCombatEvent::{BuildingHit, Destroyed, Shot};
             match *event {
                 Shot { shooter, target, projectile } => eprintln!(
                     "{combat}_shot shooter={} target={} projectile={projectile} queue_time_ms={clock_ms}", shooter.slot, target.slot
                 ),
                 Destroyed { shooter, target } => eprintln!(
                     "{combat}_destroyed shooter={} target={} queue_time_ms={clock_ms}", shooter.slot, target.slot
+                ),
+                BuildingHit { shooter, target, node, remaining_bits } => eprintln!(
+                    "{combat}_building_hit shooter={} target={} node={node} remaining={} queue_time_ms={clock_ms}",
+                    shooter.slot, target.slot, f32::from_bits(remaining_bits)
                 ),
             }
         }
@@ -11063,6 +11071,12 @@ impl StaticVulkanApp {
                         }
                         if let Some((available, demand)) = status.power {
                             let _ = write!(title, " · Энергия {available:.0}/{demand:.0}");
+                        }
+                        if let Some((current, maximum)) = status.factory_health {
+                            if current < maximum {
+                                let _ =
+                                    write!(title, " · Заводы {:.1}%", 100.0 * current / maximum);
+                            }
                         }
                     }
                 }

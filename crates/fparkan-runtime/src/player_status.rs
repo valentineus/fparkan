@@ -1,5 +1,5 @@
 use crate::{Engine, MissionControlNodeProviderTableStatus};
-use fparkan_world::{identity_metadata, ObjectHandle};
+use fparkan_world::{handle_by_original_id, identity_metadata, ObjectHandle};
 
 /// Current values for the player's controlled unit and clan.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -10,6 +10,8 @@ pub struct PlayerStatus {
     pub ore_in_buffer: Option<f32>,
     /// Available power and total power demand.
     pub power: Option<(f32, f32)>,
+    /// Combined current and initial health of the clan's live factories.
+    pub factory_health: Option<(f32, f32)>,
 }
 
 /// Reads the values used by combat and the clan's current distributor.
@@ -40,6 +42,26 @@ pub fn player_status(engine: &Engine, controlled: ObjectHandle) -> Option<Player
         .iter()
         .find(|bundle| bundle.clan_index == usize::from(owner.0))
         .and_then(|bundle| bundle.behavior_warm_start);
+    let mut factory_health = (0.0, 0.0);
+    for (current, maximum) in mission.object_drafts.iter().filter_map(|draft| {
+        if draft.unit_dat_header_flags != Some(super::autodemo::PLANT_CLASS) {
+            return None;
+        }
+        let handle = handle_by_original_id(&engine.world, draft.original_id?)?;
+        if identity_metadata(&engine.world, handle).ok()?.owner_id != Some(owner) {
+            return None;
+        }
+        let table = mission
+            .control_device_tables
+            .iter()
+            .find(|table| table.handle == handle)?;
+        table
+            .node_provider_amount_bits
+            .zip(table.node_provider_maximum_amount_bits)
+    }) {
+        factory_health.0 += f32::from_bits(current);
+        factory_health.1 += f32::from_bits(maximum);
+    }
     Some(PlayerStatus {
         health_percent,
         ore_in_buffer: resources.map(|state| f32::from_bits(state.cleared_words[2])),
@@ -47,6 +69,7 @@ pub fn player_status(engine: &Engine, controlled: ObjectHandle) -> Option<Player
             let [available, _, _, demand, _] = state.cleared_words.map(f32::from_bits);
             (available, demand)
         }),
+        factory_health: (factory_health.1 > 0.0).then_some(factory_health),
     })
 }
 
