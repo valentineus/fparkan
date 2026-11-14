@@ -16,6 +16,8 @@ use fparkan_world::{
 };
 use std::collections::HashSet;
 
+const MOBILE_HQ_CLASS: u32 = 0x0101_0000;
+
 /// First encounter with an uncovered periodic script instruction.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MissionEventStop {
@@ -204,7 +206,7 @@ impl MissionEvents {
     }
 }
 
-/// Transfers the nearest available neutral warbot to the player's clan.
+/// Transfers the nearest available neutral warbot or mobile HQ to the player's clan.
 ///
 /// The provisional interaction uses a 12-unit radius around the player's body.
 /// Returns the original object ID of a successful transfer.
@@ -238,7 +240,7 @@ pub fn capture_neutral_warbot(
         .placed_clan_objects
         .iter()
         .filter_map(|&(handle, class)| {
-            if class != 0x0100_8000 {
+            if !matches!(class, super::boarding::WARBOT_CLASS | MOBILE_HQ_CLASS) {
                 return None;
             }
             registration_sequence(&engine.world, handle).ok()??;
@@ -477,147 +479,203 @@ impl LoadedMissionState {
         let mission_events = &mut self.mission_events;
         let mut notices = Vec::new();
         let mut patrol_orders = Vec::new();
-        let stop = declarations
-            .execute_mission_prefix(
-                event,
-                bundle.formula_table.as_ref(),
-                &mut state.values,
-                |instruction, values| match instruction.dispatch_selector() {
-                    ScriptDispatchSelector::Handler(31) => {
-                        let (clan, mask) = instruction
-                            .dword_pair(values)
-                            .ok_or("Handler(31) requires two DWORD operands")?;
-                        let count = mission_events.count_clan_mask(
-                            world,
-                            &self.behavior_distributors,
-                            clan,
-                            mask,
-                        );
-                        Ok(Some(count))
+        let execution = declarations.execute_mission_prefix(
+            event,
+            bundle.formula_table.as_ref(),
+            &mut state.values,
+            |instruction, values| match instruction.dispatch_selector() {
+                // The host is already bound to this clan's AI context.
+                ScriptDispatchSelector::Handler(0) => Ok(Some(1)),
+                ScriptDispatchSelector::Handler(9)
+                    if instruction.references.is_empty()
+                        && instruction.header_words[1] == u32::MAX =>
+                {
+                    Ok(None)
+                }
+                ScriptDispatchSelector::Handler(13) => {
+                    if single_dword(instruction, values) != Some(1) {
+                        return Err("Handler(13) only supports UNIT_FREE_CAPTURER".into());
                     }
-                    ScriptDispatchSelector::Handler(32) => {
-                        let (area, id) = instruction
-                            .dword_pair(values)
-                            .ok_or("Handler(32) requires two DWORD operands")?;
-                        let inside = tactical_area_contains(&self.mission, world, area, id);
-                        Ok(Some(u32::from(inside)))
-                    }
-                    ScriptDispatchSelector::Handler(34) => {
-                        let class = single_dword(instruction, values)
-                            .ok_or("Handler(34) requires one DWORD operand")?;
-                        let count = clan_object_classes(
-                            &mission_events.placed_clan_objects,
-                            world,
-                            OwnerId(bundle.clan_index as u16),
-                        )
-                        .filter(|&candidate| candidate == class)
-                        .count() as u32;
-                        Ok(Some(count))
-                    }
-                    ScriptDispatchSelector::Handler(52) => {
-                        let id = single_dword(instruction, values)
-                            .ok_or("Handler(52) requires one DWORD operand")?;
-                        let clan = placed_logic_objects(&self.mission, world, id)
-                            .find_map(|handle| identity_metadata(world, handle).ok()?.owner_id);
-                        Ok(Some(clan.map_or(u32::MAX, |owner| u32::from(owner.0))))
-                    }
-                    ScriptDispatchSelector::Handler(15) => {
-                        let order = declarations
-                            .resolve_handler15_with_values(instruction, values)
-                            .map_err(|error| error.to_string())?;
-                        let (4, 3, Handler15TargetPayload::ByPlace { first, second }) =
-                            (order.word_1, order.word_2, order.target)
+                    let owner = OwnerId(bundle.clan_index as u16);
+                    for &(handle, class) in &mission_events.placed_clan_objects {
+                        if class != super::boarding::WARBOT_CLASS
+                            || registration_sequence(world, handle)
+                                .ok()
+                                .flatten()
+                                .is_none()
+                            || self
+                                .unit_patrol
+                                .as_ref()
+                                .is_some_and(|patrol| patrol.is_patrolling(handle))
+                            || self
+                                .boarding
+                                .is_some_and(|boarding| boarding.cockpit.handle == handle)
+                        {
+                            continue;
+                        }
+                        let Ok(identity) = identity_metadata(world, handle) else {
+                            continue;
+                        };
+                        let Some(id) = identity
+                            .original_id
+                            .filter(|_| identity.owner_id == Some(owner))
                         else {
-                            return Err(format!(
-                                "Handler(15) order={} insertion={} target={:?}",
-                                order.word_1, order.word_2, order.target
-                            ));
+                            continue;
                         };
-                        let Some(handle) =
-                            self.mission
-                                .objects
-                                .iter()
-                                .enumerate()
-                                .find_map(|(index, object)| {
-                                    let class = self.object_drafts[index].unit_dat_header_flags?;
-                                    (class == super::boarding::WARBOT_CLASS
-                                        && object.identity_or_clan_raw == order.word_0)
-                                        .then(|| {
-                                            handle_by_original_id(
-                                                world,
-                                                OriginalObjectId(index as u32),
-                                            )
-                                        })
-                                        .flatten()
-                                })
+                        let index = id.0 as usize;
+                        let Some(chassis) = self
+                            .object_drafts
+                            .get(index)
+                            .and_then(|draft| draft.unit_components.first())
                         else {
-                            // The native handler sets its missing-target status and advances.
-                            return Ok(None);
+                            continue;
                         };
-                        let Some(patrol) = &mut self.unit_patrol else {
-                            return Err("Handler(15) patrol runtime is unavailable".into());
-                        };
-                        // shortcut: default place radius and a routed random point;
-                        // native patrol timing and profile overrides remain open.
-                        let radius = if matches!(order.word_3, 0 | u32::MAX) {
-                            60.0
-                        } else {
-                            order.word_3 as f32
-                        };
-                        if patrol.order(world, handle, [first as f32, second as f32], radius) {
-                            patrol_orders.push((handle, [first, second]));
+                        if !capturer_chassis(&chassis.resource_raw) {
+                            continue;
                         }
-                        Ok(None)
+                        // shortcut: native logical IDs for newly produced robots are still open.
+                        let object = self
+                            .mission
+                            .objects
+                            .get(index)
+                            .ok_or("Handler(13) dynamic capturer logical ID is unavailable")?;
+                        return Ok(Some(object.identity_or_clan_raw));
                     }
-                    ScriptDispatchSelector::Handler(30) => {
-                        let command = declarations
-                            .resolve_handler30_with_values(instruction, values)
-                            .map_err(|error| error.to_string())?;
-                        if self.script_host_mode == super::MissionMode::AutoDemo {
-                            return Ok(None);
-                        }
-                        let outcome = match command.first {
-                            0 => Some(command),
-                            1 => {
-                                if mission_events.voiced_messages.insert(command.second) {
-                                    notices.push(MissionNotice::Information(command.second));
-                                }
-                                None
-                            }
-                            3..=5 => mission_events
-                                .objectives
-                                .apply(command.first, command.second, &mut notices)?
-                                .then_some(VmHostCallbackCommand {
-                                    mode: 0,
-                                    first: 0,
-                                    second: 1,
-                                }),
-                            _ => return Err(format!("Handler(30) command {}", command.first)),
-                        };
-                        if let Some(outcome) = outcome {
-                            match apply_recovered_script_host_callback(
-                                self.script_host_mode,
-                                &mut self.script_host_status,
-                                &mut self.script_outcome,
-                                outcome,
-                            ) {
-                                MissionScriptHostEffect::MissionCompleted => {
-                                    notices.push(MissionNotice::Completed)
-                                }
-                                MissionScriptHostEffect::MissionFailed => {
-                                    notices.push(MissionNotice::Failed)
-                                }
-                                MissionScriptHostEffect::NoChange => {}
-                                MissionScriptHostEffect::Unhandled => {
-                                    return Err(format!("Handler(30) outcome {}", outcome.second))
-                                }
-                            }
-                        }
-                        Ok(None)
+                    Ok(Some(u32::MAX))
+                }
+                ScriptDispatchSelector::Handler(31) => {
+                    let (clan, mask) = instruction
+                        .dword_pair(values)
+                        .ok_or("Handler(31) requires two DWORD operands")?;
+                    let count = mission_events.count_clan_mask(
+                        world,
+                        &self.behavior_distributors,
+                        clan,
+                        mask,
+                    );
+                    Ok(Some(count))
+                }
+                ScriptDispatchSelector::Handler(32) => {
+                    let (area, id) = instruction
+                        .dword_pair(values)
+                        .ok_or("Handler(32) requires two DWORD operands")?;
+                    let inside = tactical_area_contains(&self.mission, world, area, id);
+                    Ok(Some(u32::from(inside)))
+                }
+                ScriptDispatchSelector::Handler(34) => {
+                    let class = single_dword(instruction, values)
+                        .ok_or("Handler(34) requires one DWORD operand")?;
+                    let count = clan_object_classes(
+                        &mission_events.placed_clan_objects,
+                        world,
+                        OwnerId(bundle.clan_index as u16),
+                    )
+                    .filter(|&candidate| candidate == class)
+                    .count() as u32;
+                    Ok(Some(count))
+                }
+                ScriptDispatchSelector::Handler(52) => {
+                    let id = single_dword(instruction, values)
+                        .ok_or("Handler(52) requires one DWORD operand")?;
+                    let clan = placed_logic_objects(&self.mission, world, id)
+                        .find_map(|handle| identity_metadata(world, handle).ok()?.owner_id);
+                    Ok(Some(clan.map_or(u32::MAX, |owner| u32::from(owner.0))))
+                }
+                ScriptDispatchSelector::Handler(15) => {
+                    let order = declarations
+                        .resolve_handler15_with_values(instruction, values)
+                        .map_err(|error| error.to_string())?;
+                    let (4, 3, Handler15TargetPayload::ByPlace { first, second }) =
+                        (order.word_1, order.word_2, order.target)
+                    else {
+                        return Err(format!(
+                            "Handler(15) order={} insertion={} target={:?}",
+                            order.word_1, order.word_2, order.target
+                        ));
+                    };
+                    let Some(handle) =
+                        self.mission
+                            .objects
+                            .iter()
+                            .enumerate()
+                            .find_map(|(index, object)| {
+                                let class = self.object_drafts[index].unit_dat_header_flags?;
+                                (class == super::boarding::WARBOT_CLASS
+                                    && object.identity_or_clan_raw == order.word_0)
+                                    .then(|| {
+                                        handle_by_original_id(world, OriginalObjectId(index as u32))
+                                    })
+                                    .flatten()
+                            })
+                    else {
+                        // The native handler sets its missing-target status and advances.
+                        return Ok(None);
+                    };
+                    let Some(patrol) = &mut self.unit_patrol else {
+                        return Err("Handler(15) patrol runtime is unavailable".into());
+                    };
+                    // shortcut: default place radius and a routed random point;
+                    // native patrol timing and profile overrides remain open.
+                    let radius = if matches!(order.word_3, 0 | u32::MAX) {
+                        60.0
+                    } else {
+                        order.word_3 as f32
+                    };
+                    if patrol.order(world, handle, [first as f32, second as f32], radius) {
+                        patrol_orders.push((handle, [first, second]));
                     }
-                    selector => Err(format!("{selector:?}")),
-                },
-            )
+                    Ok(None)
+                }
+                ScriptDispatchSelector::Handler(30) => {
+                    let command = declarations
+                        .resolve_handler30_with_values(instruction, values)
+                        .map_err(|error| error.to_string())?;
+                    if self.script_host_mode == super::MissionMode::AutoDemo {
+                        return Ok(None);
+                    }
+                    let outcome = match command.first {
+                        0 => Some(command),
+                        1 => {
+                            if mission_events.voiced_messages.insert(command.second) {
+                                notices.push(MissionNotice::Information(command.second));
+                            }
+                            None
+                        }
+                        3..=5 => mission_events
+                            .objectives
+                            .apply(command.first, command.second, &mut notices)?
+                            .then_some(VmHostCallbackCommand {
+                                mode: 0,
+                                first: 0,
+                                second: 1,
+                            }),
+                        _ => return Err(format!("Handler(30) command {}", command.first)),
+                    };
+                    if let Some(outcome) = outcome {
+                        match apply_recovered_script_host_callback(
+                            self.script_host_mode,
+                            &mut self.script_host_status,
+                            &mut self.script_outcome,
+                            outcome,
+                        ) {
+                            MissionScriptHostEffect::MissionCompleted => {
+                                notices.push(MissionNotice::Completed)
+                            }
+                            MissionScriptHostEffect::MissionFailed => {
+                                notices.push(MissionNotice::Failed)
+                            }
+                            MissionScriptHostEffect::NoChange => {}
+                            MissionScriptHostEffect::Unhandled => {
+                                return Err(format!("Handler(30) outcome {}", outcome.second))
+                            }
+                        }
+                    }
+                    Ok(None)
+                }
+                selector => Err(format!("{selector:?}")),
+            },
+        );
+        let stop = execution
             .err()
             .filter(|(index, _)| mission_events.reported_stops.insert(*index))
             .map(|(instruction_index, reason)| MissionEventStop {
@@ -633,6 +691,15 @@ impl LoadedMissionState {
             patrol_orders,
         })
     }
+}
+
+fn capturer_chassis(chassis: &[u8; 32]) -> bool {
+    // shortcut: stock robot keys map to native size classes 1 and 2;
+    // query the effective Behavior controller when custom types are supported.
+    matches!(
+        &chassis[..3],
+        [b'R' | b'r', b'_', b'T' | b't' | b'L' | b'l' | b'H' | b'h']
+    )
 }
 
 fn single_dword(instruction: &ScriptInstruction, values: &[VarSetDefault]) -> Option<u32> {
@@ -715,12 +782,28 @@ fn in_tactical_polygon(vertices: &[[f32; 3]], x: f32, y: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        clan_object_classes, in_tactical_polygon, MissionEvents, MissionNotice, MissionObjectives,
+        capturer_chassis, clan_object_classes, in_tactical_polygon, MissionEvents, MissionNotice,
+        MissionObjectives,
     };
     use fparkan_world::{
         construct_object, new, register_object, request_delete, set_owner, ObjectDraft, OwnerId,
         WorldConfig,
     };
+
+    #[test]
+    fn capturer_classes_are_tiny_and_light() {
+        for (key, expected) in [
+            (b"R_T_02", true),
+            (b"r_l_01", true),
+            (b"R_H_03", true),
+            (b"R_M_02", false),
+            (b"R_B_02", false),
+        ] {
+            let mut chassis = [0; 32];
+            chassis[..key.len()].copy_from_slice(key);
+            assert_eq!(capturer_chassis(&chassis), expected);
+        }
+    }
 
     #[test]
     fn victory_requires_primary_objectives_in_config_order_only() {

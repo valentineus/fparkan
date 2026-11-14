@@ -898,6 +898,13 @@ impl VarSet {
         clan_count: impl Fn(u32, u32) -> Option<u32>,
     ) -> Result<InitInstructionResolution, ScriptInitResolveError> {
         match instruction.dispatch_selector() {
+            ScriptDispatchSelector::Handler(0)
+                if instruction.header_words[3] == u32::MAX
+                    && instruction.header_words[1] == u32::MAX =>
+            {
+                // Init already runs against the current clan's context; no result is saved.
+                Ok(InitInstructionResolution::Executed(Vec::new()))
+            }
             ScriptDispatchSelector::Handler(19) => {
                 if instruction.header_words[3] != u32::MAX {
                     return Ok(InitInstructionResolution::Unsupported(

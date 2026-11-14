@@ -17989,6 +17989,60 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
+    fn licensed_teleport_checks_free_capturer_and_counts_captured_mobile_hq() {
+        let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(licensed_root("IS")));
+        let mut engine = create(EngineServices::new(vfs)).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.04/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        let first = frame(&mut engine, 1).unwrap().mission_event.unwrap();
+        assert!(first.stop.is_none(), "{first:?}");
+        let script = loaded_mission_script_varset(&engine).unwrap();
+        let cell = |name| {
+            script
+                .declarations
+                .declarations
+                .iter()
+                .position(|entry| entry.name == name)
+                .unwrap()
+        };
+        let temp = cell("dTemp");
+        let live = &loaded_mission_script_varset_states(&engine).unwrap()[0].values;
+        assert_eq!(live[temp], fparkan_script::VarSetDefault::Dword(3));
+        let cockpit = starting_cockpit(&engine).unwrap();
+        assert_eq!(capture_neutral_warbot(&mut engine, cockpit).unwrap(), None);
+        let hq = mission_object_handle(&engine, OriginalObjectId(0)).unwrap();
+        let mut pose = transform_state(&engine.world, cockpit.handle).unwrap();
+        pose.position = transform_state(&engine.world, hq).unwrap().position;
+        set_transform(&mut engine.world, cockpit.handle, pose).unwrap();
+        assert_eq!(
+            capture_neutral_warbot(&mut engine, cockpit).unwrap(),
+            Some(OriginalObjectId(0))
+        );
+        assert_eq!(
+            mission_object_handle(&engine, OriginalObjectId(0)),
+            Some(hq)
+        );
+        let after = frame(&mut engine, 2_001).unwrap().mission_event.unwrap();
+        assert!(after.stop.is_none(), "{after:?}");
+        assert!(
+            after.notices.contains(&MissionNotice::ObjectiveComplete(0)),
+            "{after:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_constructor_captures_factory_and_hangar_at_communicators() {
         use fparkan_world::{identity_metadata, OwnerId};
 
