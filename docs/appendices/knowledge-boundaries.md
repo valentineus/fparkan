@@ -469,7 +469,9 @@ core и `ResearchCandidateSet::refresh_selection`: последний получ
 `script_group_order_approx` считает приказы группе по клану и цели.
 Набор использует свободных варботов. Переназначение с менее важных заявок открыто.
 `script_problem_wait_approx` отмечает ожидание гибели, захвата или простоя
-при `OR_TASK`. `AND_TASK`, старение и секции `_Continue` открыты.
+при `OR_TASK`. `AND_TASK` и старение заявок открыты.
+`script_factory_patrol_continue_approx` считает вызовы действующей охраны
+по клану и заводу. Интервал без добавки RNG. Остальные секции `_Continue` открыты.
 `Handler(15)` для `ORDER_ROBOT_SEARCH` генератора пока проходит как
 `script_init_handler_stub`. GOG Behavior.dll по RVA `0x30110` настраивает
 поиск строения, а задача по RVA `0x30300` обрабатывает в том числе захват.

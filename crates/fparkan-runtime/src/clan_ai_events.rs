@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 const STORAGE_CLASS: u32 = 0x8000_0008;
 const RESOURCE_ORE: u32 = 0x0200_0100;
+const BUILDING_PROTECT: u32 = 8;
 
 pub(super) struct ScriptFactoryOrder {
     pub owner: OwnerId,
@@ -101,7 +102,11 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) {
     let ai = &mut loaded.clan_ai_events;
     ai.waits.retain(|&(clan, key), conditions| {
         let group = ai.groups.get(&(clan, key));
-        let ready = conditions.iter().any(|&condition| {
+        let lost_building = key.word_0 == BUILDING_PROTECT
+            && !crate::mission_events::placed_logic_objects(&loaded.mission, &engine.world, key.argument_0)
+                .any(|target| identity_metadata(&engine.world, target)
+                    .is_ok_and(|identity| identity.owner_id == Some(OwnerId(clan as u16))));
+        let ready = lost_building || conditions.iter().any(|&condition| {
             condition.met(
                 &engine.world,
                 OwnerId(clan as u16),
@@ -203,6 +208,7 @@ pub(super) struct ClanAiEvents {
     groups: BTreeMap<(usize, Handler2RecordKey), CombatGroup>,
     waits: BTreeMap<(usize, Handler2RecordKey), Vec<Condition>>,
     wait_starts: BTreeMap<(usize, u32), u64>,
+    patrol_continues: BTreeMap<(usize, u32), u64>,
     group_orders: BTreeMap<(usize, u32), u64>,
 }
 
@@ -242,9 +248,77 @@ impl LoadedMissionState {
             else {
                 continue;
             };
-            let mut next = Some((event_index, event, None::<Handler2Record>));
-            let mut pending = Vec::new();
-            while let Some((event_index, event, problem)) = next.take() {
+            let mut problems_event = Some((event_index, event, None::<Handler2Record>));
+            // shortcut: only factory protection resumes, on the shared clan interval without native RNG.
+            let mut pending = self
+                .clan_ai_events
+                .problems
+                .get(&clan)
+                .into_iter()
+                .flat_map(|queue| queue.records())
+                .rev()
+                .filter(|record| {
+                    record.key.word_0 == BUILDING_PROTECT
+                        && self.clan_ai_events.waits.contains_key(&(clan, record.key))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            loop {
+                let mut next = None;
+                while let Some(problem) = pending.pop() {
+                    let resume = problems_event.is_some();
+                    if !resume && self.clan_ai_events.problem_in_progress(clan, problem.key) {
+                        continue;
+                    }
+                    let problem_id = problem.key.word_0;
+                    let Some(kind) = varset.declarations.declarations.iter().find(|entry| {
+                        entry.name.starts_with("PBM_")
+                            && entry.default_value == VarSetDefault::Dword(problem_id)
+                    }) else {
+                        continue;
+                    };
+                    let suffix = if resume { "Continue" } else { "Start" };
+                    let event_name = format!("{}_{suffix}\0", kind.name);
+                    let Some((index, event)) =
+                        bundle.package.events.iter().enumerate().find(|(_, event)| {
+                            event.name_raw == event_name.as_bytes()
+                                && !event.instructions.is_empty()
+                        })
+                    else {
+                        continue;
+                    };
+                    if resume {
+                        let target = problem.key.argument_0;
+                        let count = self
+                            .clan_ai_events
+                            .patrol_continues
+                            .entry((clan, target))
+                            .or_default();
+                        *count += 1;
+                        if *count == 1 {
+                            eprintln!("sim_coverage script_factory_patrol_continue_approx=1 clan={clan} target={target}");
+                        }
+                    } else {
+                        let count = self
+                            .clan_ai_events
+                            .started
+                            .entry((clan, problem_id))
+                            .or_default();
+                        *count += 1;
+                        if *count == 1 {
+                            eprintln!(
+                                "sim_coverage script_problem_start_approx=1 clan={clan} problem={}",
+                                kind.name
+                            );
+                        }
+                    }
+                    next = Some((index, event, Some(problem)));
+                    break;
+                }
+                let Some((event_index, event, problem)) = next.or_else(|| problems_event.take())
+                else {
+                    break;
+                };
                 let mut solved = false;
                 let mut assignment = None;
                 let mut solving = false;
@@ -357,7 +431,15 @@ impl LoadedMissionState {
                             let count = self.clan_ai_events.group_orders.entry((clan, target)).or_default();
                             *count += 1;
                             eprintln!("sim_coverage script_group_order_approx=1 clan={clan} target={target} order={} units={:?}", order.word_1, group.members.iter().map(|unit| unit.slot).collect::<Vec<_>>());
-                            self.clan_ai_events.groups.insert((clan, key), group);
+                            let groups = &mut self.clan_ai_events.groups;
+                            if let Some(assigned) = groups.get_mut(&(clan, key))
+                                .filter(|assigned| key.word_0 == BUILDING_PROTECT
+                                    && assigned.target == group.target)
+                            {
+                                assigned.members.extend(group.members);
+                            } else {
+                                groups.insert((clan, key), group);
+                            }
                             Ok(Some(VarSetDefault::Dword(1)))
                         }
                         ScriptDispatchSelector::Handler(38) => {
@@ -532,12 +614,33 @@ impl LoadedMissionState {
                             });
                             Ok(None)
                         }
+                        ScriptDispatchSelector::Handler(handler @ (7 | 45))
+                            if instruction.references.is_empty()
+                                && problem.as_ref().is_some_and(|record| record.key.word_0 == BUILDING_PROTECT) =>
+                        {
+                            let key = problem.as_ref().expect("factory protection problem").key;
+                            if handler == 7 {
+                                if let Some(assigned) = self.clan_ai_events.groups.remove(&(clan, key)) {
+                                    if let Some(patrol) = &mut self.unit_patrol {
+                                        for unit in assigned.members {
+                                            patrol.clear_object_order(unit, assigned.target);
+                                        }
+                                    }
+                                }
+                                return Ok(None);
+                            }
+                            let strength = self.clan_ai_events.groups.get(&(clan, key))
+                                .into_iter().flat_map(|assigned| &assigned.members)
+                                .map(|&unit| crate::clan_combat_strength::unit_strength(&self.control_device_tables, unit))
+                                .fold(0.0, |sum, power| sum + power);
+                            Ok(Some(VarSetDefault::Dword(strength as i64 as u32)))
+                        }
                         ScriptDispatchSelector::Handler(8) if problem.is_some() => {
                             match single_dword(&instruction.references, values) {
                                 Some(1)
                                     if problem
                                         .as_ref()
-                                        .is_some_and(|record| record.key.word_0 == 6)
+                                        .is_some_and(|record| matches!(record.key.word_0, 6 | BUILDING_PROTECT))
                                         || !conditions.is_empty() =>
                                 {
                                     solving = true
@@ -565,7 +668,7 @@ impl LoadedMissionState {
                             };
                             let key = problem.as_ref().expect("condition requires a problem").key;
                             let condition = match (action, mode) {
-                                (1 | 3, 0) if matches!(key.word_0, 7 | 9) => {
+                                (1 | 3, 0) if matches!(key.word_0, 7 | 9) || (action == 1 && key.word_0 == BUILDING_PROTECT) => {
                                     let target = crate::mission_events::placed_logic_objects(
                                         &self.mission, world, id
                                     ).next();
@@ -861,7 +964,9 @@ impl LoadedMissionState {
                             .entry(clan)
                             .or_default()
                             .remove(problem.key);
-                    } else if solving && !conditions.is_empty() {
+                    } else if solving
+                        && (!conditions.is_empty() || problem.key.word_0 == BUILDING_PROTECT)
+                    {
                         let count = self
                             .clan_ai_events
                             .wait_starts
@@ -877,58 +982,6 @@ impl LoadedMissionState {
                     }
                 } else if let Some(queue) = self.clan_ai_events.problems.get(&clan) {
                     pending = ranked_problems(queue.records());
-                }
-                // shortcut: retry unresolved Starts until decay and Continue are wired.
-                while let Some(problem) = pending.pop() {
-                    if self
-                        .clan_ai_events
-                        .factory_jobs
-                        .iter()
-                        .any(|&(key, _)| key == (clan as u16, problem.key))
-                        || self
-                            .clan_ai_events
-                            .capture_orders
-                            .iter()
-                            .any(|&(owner, key, _)| {
-                                owner == OwnerId(clan as u16) && key == problem.key
-                            })
-                        || self
-                            .clan_ai_events
-                            .groups
-                            .contains_key(&(clan, problem.key))
-                        || self.clan_ai_events.waits.contains_key(&(clan, problem.key))
-                    {
-                        continue;
-                    }
-                    let problem_id = problem.key.word_0;
-                    let Some(kind) = varset.declarations.declarations.iter().find(|entry| {
-                        entry.name.starts_with("PBM_")
-                            && entry.default_value == VarSetDefault::Dword(problem_id)
-                    }) else {
-                        continue;
-                    };
-                    let start = format!("{}_Start\0", kind.name);
-                    let Some((index, event)) =
-                        bundle.package.events.iter().enumerate().find(|(_, event)| {
-                            event.name_raw == start.as_bytes() && !event.instructions.is_empty()
-                        })
-                    else {
-                        continue;
-                    };
-                    let count = self
-                        .clan_ai_events
-                        .started
-                        .entry((clan, problem_id))
-                        .or_default();
-                    *count += 1;
-                    if *count == 1 {
-                        eprintln!(
-                            "sim_coverage script_problem_start_approx=1 clan={clan} problem={}",
-                            kind.name
-                        );
-                    }
-                    next = Some((index, event, Some(problem)));
-                    break;
                 }
             }
         }
@@ -1044,6 +1097,24 @@ impl ClanAiEvents {
             .map(|(&(clan, problem), &count)| (clan, problem, count))
     }
 
+    pub(super) fn patrol_continues(&self) -> impl Iterator<Item = (usize, u32, u64)> + '_ {
+        self.patrol_continues
+            .iter()
+            .map(|(&(clan, target), &count)| (clan, target, count))
+    }
+
+    fn problem_in_progress(&self, clan: usize, key: Handler2RecordKey) -> bool {
+        self.factory_jobs
+            .iter()
+            .any(|&(job, _)| job == (clan as u16, key))
+            || self
+                .capture_orders
+                .iter()
+                .any(|&(owner, assigned, _)| owner == OwnerId(clan as u16) && assigned == key)
+            || self.groups.contains_key(&(clan, key))
+            || self.waits.contains_key(&(clan, key))
+    }
+
     fn unit_assigned(&self, unit: ObjectHandle) -> bool {
         self.capture_orders
             .iter()
@@ -1154,6 +1225,65 @@ impl ClanAiEvents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_factory_protection_resumes_and_assigns_a_patrol_from_stock_start() {
+        use crate::{
+            create, load_gameplay_mission, simulate_mission_report, EngineServices, MissionMode,
+            MissionRequest, MissionStartupInput,
+        };
+        use fparkan_vfs::DirectoryVfs;
+        use std::sync::Arc;
+
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed corpus root");
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Single.01/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+
+        let report = simulate_mission_report(&mut engine, 25_000).unwrap();
+        let [(clan, factory_id, count)] = report.script_factory_patrol_continues.as_slice() else {
+            panic!("expected one active factory protection problem");
+        };
+        assert_eq!(*clan, 1);
+        assert!(*count > 1);
+        let loaded = engine.loaded.as_ref().unwrap();
+        let factory = crate::mission_events::placed_logic_objects(
+            &loaded.mission,
+            &engine.world,
+            *factory_id,
+        )
+        .next()
+        .unwrap();
+        let (key, group) = loaded
+            .clan_ai_events
+            .groups
+            .iter()
+            .find(|(&(owner, key), _)| {
+                owner == *clan && key.word_0 == BUILDING_PROTECT && key.argument_0 == *factory_id
+            })
+            .unwrap();
+        assert_eq!(group.target, factory);
+        assert_eq!(group.target_owner, Some(OwnerId(1)));
+        assert!(!group.members.is_empty());
+        let patrol = loaded.unit_patrol.as_ref().unwrap();
+        assert!(group
+            .members
+            .iter()
+            .all(|&unit| patrol.has_object_order(unit, factory)));
+        assert!(loaded.clan_ai_events.waits.contains_key(key));
+    }
 
     #[test]
     fn clans_have_independent_due_times_and_no_replay_after_a_late_tick() {
