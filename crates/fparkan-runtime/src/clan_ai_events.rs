@@ -1,4 +1,4 @@
-use crate::clan_targeting::CaptureApproach;
+use crate::{clan_combat_groups::CombatGroup, clan_targeting::CaptureApproach};
 use crate::{BehaviorOreState, LoadedMissionState, MissionEventStop};
 use fparkan_script::{
     Handler15TargetPayload, Handler2Record, Handler2RecordInput, Handler2RecordKey,
@@ -75,6 +75,27 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) {
     let Some(loaded) = &mut engine.loaded else {
         return;
     };
+    loaded.clan_ai_events.groups.retain(|&(clan, _), group| {
+        if !identity_metadata(&engine.world, group.target)
+            .is_ok_and(|identity| identity.owner_id == group.target_owner)
+        {
+            if let Some(patrol) = &mut loaded.unit_patrol {
+                for &member in &group.members {
+                    patrol.clear_object_order(member, group.target);
+                }
+            }
+            return false;
+        }
+        group.members.retain(|&member| {
+            identity_metadata(&engine.world, member)
+                .is_ok_and(|identity| identity.owner_id == Some(OwnerId(clan as u16)))
+                && loaded
+                    .unit_patrol
+                    .as_ref()
+                    .is_some_and(|patrol| patrol.has_object_order(member, group.target))
+        });
+        !group.members.is_empty()
+    });
     let active = &mut loaded.clan_ai_events.factory_jobs;
     active.retain(|((clan, _), plant)| {
         engine
@@ -147,6 +168,8 @@ pub(super) struct ClanAiEvents {
     capturer_queries: BTreeMap<usize, u64>,
     capture_orders: Vec<(OwnerId, Handler2RecordKey, CaptureApproach)>,
     capture_approaches: BTreeMap<(u32, u32), u64>,
+    groups: BTreeMap<(usize, Handler2RecordKey), CombatGroup>,
+    group_orders: BTreeMap<(usize, u32), u64>,
 }
 
 impl LoadedMissionState {
@@ -192,6 +215,7 @@ impl LoadedMissionState {
                 let mut assignment = None;
                 let mut solving = false;
                 let mut capturer = None;
+                let mut group = None;
                 let result = varset.declarations.execute_event_prefix(
                     event,
                     bundle.formula_table.as_ref(),
@@ -262,6 +286,45 @@ impl LoadedMissionState {
                             }
                             Ok(Some(VarSetDefault::Dword(target)))
                         }
+                        ScriptDispatchSelector::Handler(25) if problem.is_some() => {
+                            let &[mode, hits, target_mode, target] = instruction.references.as_slice() else {
+                                return Err("Handler(25) requires TAKE_BY_HITS and a logical ID".into());
+                            };
+                            let word = |index: u32| values.get(index as usize)?.as_dword();
+                            let (Some(2), Some(requested), Some(0x201), Some(target)) =
+                                (word(mode), word(hits), word(target_mode), word(target))
+                            else {
+                                return Err("Handler(25) requires TAKE_BY_HITS and a logical ID".into());
+                            };
+                            // shortcut: use free warbots until lower-priority orders can be preempted.
+                            let units = self.mission_events.clan_units(world, OwnerId(clan as u16), true)
+                                .filter(|&unit| !self.clan_ai_events.unit_assigned(unit))
+                                .filter(|&unit| self.unit_patrol.as_ref().is_none_or(|patrol| !patrol.is_shut_down(unit)));
+                            let (recruited, strength) = crate::clan_combat_groups::recruit(
+                                world, units, &self.control_device_tables, &self.mission, target, requested,
+                            );
+                            if strength < requested as f32 || strength == 0.0 {
+                                values[hits as usize] = VarSetDefault::Dword(strength as u32);
+                            }
+                            group = recruited;
+                            // shortcut: group IDs stay local until groups are script-visible across events.
+                            Ok(Some(VarSetDefault::Dword(if group.is_some() { 0 } else { u32::MAX })))
+                        }
+                        ScriptDispatchSelector::Handler(28) if problem.is_some() => {
+                            let order = varset.declarations.resolve_handler15_with_values(instruction, values)
+                                .map_err(|error| error.to_string())?;
+                            let group = group.take().ok_or("Handler(28) requires an active combat group")?;
+                            let patrol = self.unit_patrol.get_or_insert_with(crate::unit_patrol::UnitPatrol::scripted);
+                            group.dispatch(patrol, world, &self.mission, order)
+                                .ok_or("Handler(28) requires a patrol or attack on the group's target")?;
+                            let key = problem.as_ref().expect("group order requires a problem").key;
+                            let target = group.target.slot;
+                            let count = self.clan_ai_events.group_orders.entry((clan, target)).or_default();
+                            *count += 1;
+                            eprintln!("sim_coverage script_group_order_approx=1 clan={clan} target={target} order={} units={:?}", order.word_1, group.members.iter().map(|unit| unit.slot).collect::<Vec<_>>());
+                            self.clan_ai_events.groups.insert((clan, key), group);
+                            Ok(Some(VarSetDefault::Dword(1)))
+                        }
                         ScriptDispatchSelector::Handler(38) => {
                             let (target, mode) = instruction.dword_pair(values)
                                 .ok_or("Handler(38) requires a clan and unit-selection mode")?;
@@ -272,6 +335,7 @@ impl LoadedMissionState {
                                 return Ok(Some(VarSetDefault::Dword(0)));
                             };
                             let sum = self.mission_events.clan_units(world, OwnerId(target), mode == 0)
+                                .filter(|&handle| mode != 0 || !self.clan_ai_events.unit_assigned(handle))
                                 .map(|handle| crate::clan_combat_strength::unit_strength(&self.control_device_tables, handle))
                                 .fold(0.0, |sum, contribution| sum + contribution);
                             let count = self.clan_ai_events.strength_queries.entry((clan, target)).or_default();
@@ -497,7 +561,7 @@ impl LoadedMissionState {
                                 capturer = crate::clan_targeting::nearest_capturer(
                                     &self.mission, &self.object_drafts, &self.mission_events,
                                     world, OwnerId(clan as u16), target, |handle| {
-                                        !self.clan_ai_events.capture_orders.iter().any(|&(_, _, order)| order.unit == handle)
+                                        !self.clan_ai_events.unit_assigned(handle)
                                             && self.unit_patrol.as_ref().is_none_or(|patrol| !patrol.is_shut_down(handle))
                                     },
                                 );
@@ -713,6 +777,10 @@ impl LoadedMissionState {
                             .any(|&(owner, key, _)| {
                                 owner == OwnerId(clan as u16) && key == problem.key
                             })
+                        || self
+                            .clan_ai_events
+                            .groups
+                            .contains_key(&(clan, problem.key))
                     {
                         continue;
                     }
@@ -842,6 +910,22 @@ fn storage_space(ores: &[BehaviorOreState], world: &World, clan: OwnerId) -> f32
 }
 
 impl ClanAiEvents {
+    fn unit_assigned(&self, unit: ObjectHandle) -> bool {
+        self.capture_orders
+            .iter()
+            .any(|&(_, _, order)| order.unit == unit)
+            || self
+                .groups
+                .values()
+                .any(|group| group.members.contains(&unit))
+    }
+
+    pub(super) fn group_orders(&self) -> impl Iterator<Item = (usize, u32, u64)> + '_ {
+        self.group_orders
+            .iter()
+            .map(|(&(clan, target), &count)| (clan, target, count))
+    }
+
     pub(super) fn set_base_radius(&mut self, clan: usize, limit: f32) {
         if limit.is_finite() && limit > 0.0 {
             self.base_radius_limits.insert(clan, limit);

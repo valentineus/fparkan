@@ -45,6 +45,7 @@ mod autodemo;
 mod boarding;
 mod building_door;
 mod clan_ai_events;
+mod clan_combat_groups;
 mod clan_combat_strength;
 mod clan_script_init;
 mod clan_targeting;
@@ -2607,17 +2608,26 @@ fn load_mission_with_options(
             }
         }
     }
-    let autodemo_combat = (unit_patrol.is_some() || guard_clans.contains(&true)).then(|| {
-        unit_combat::AutoDemoCombat::new(
-            &vfs,
-            &mission,
-            &object_drafts,
-            &handles,
-            &mission_assets,
-            reserve_start,
-            guard_clans,
-        )
-    });
+    let periodic_ai =
+        options.start_autodemo
+            && loaded_scripts.bundles.iter().any(|bundle| {
+                mission.clans[bundle.clan_index].mode == 2
+                    && bundle.package.events.iter().any(|event| {
+                        event.name_raw == b"Problems0\0" && !event.instructions.is_empty()
+                    })
+            });
+    let autodemo_combat = (unit_patrol.is_some() || guard_clans.contains(&true) || periodic_ai)
+        .then(|| {
+            unit_combat::AutoDemoCombat::new(
+                &vfs,
+                &mission,
+                &object_drafts,
+                &handles,
+                &mission_assets,
+                reserve_start,
+                guard_clans,
+            )
+        });
     for &handle in &handles[reserve_start..] {
         fparkan_world::request_delete(&mut new_runtime_world, handle)?;
     }
@@ -2920,6 +2930,7 @@ pub struct SimulationReport {
     pub script_strength_queries: Vec<(usize, u16, u64)>,
     pub script_capture_queries: Vec<(usize, u64)>,
     pub script_attack_queries: Vec<(usize, u64)>,
+    pub script_group_orders: Vec<(usize, u32, u64)>,
     pub script_capturer_queries: Vec<(usize, u64)>,
     pub script_capture_approaches: Vec<(u32, u32, u64)>,
     /// First factory completion by clan, in milliseconds.
@@ -2966,6 +2977,7 @@ pub fn simulate_mission_report(
         script_strength_queries: Vec::new(),
         script_capture_queries: Vec::new(),
         script_attack_queries: Vec::new(),
+        script_group_orders: Vec::new(),
         script_capturer_queries: Vec::new(),
         script_capture_approaches: Vec::new(),
         first_factory_completion_ms: Default::default(),
@@ -3053,6 +3065,9 @@ pub fn simulate_mission_report(
         report
             .script_attack_queries
             .extend(loaded.clan_ai_events.attack_queries());
+        report
+            .script_group_orders
+            .extend(loaded.clan_ai_events.group_orders());
         report
             .script_capturer_queries
             .extend(loaded.clan_ai_events.capturer_queries());

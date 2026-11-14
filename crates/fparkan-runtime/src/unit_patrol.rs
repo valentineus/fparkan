@@ -242,6 +242,17 @@ impl UnitPatrol {
         self.units.iter().any(|unit| unit.handle == handle)
     }
 
+    pub(super) fn has_object_order(&self, handle: ObjectHandle, target: ObjectHandle) -> bool {
+        self.units
+            .iter()
+            .any(|unit| unit.handle == handle && unit.center_object == Some(target))
+    }
+
+    pub(super) fn clear_object_order(&mut self, handle: ObjectHandle, target: ObjectHandle) {
+        self.units
+            .retain(|unit| unit.handle != handle || unit.center_object != Some(target));
+    }
+
     pub(super) fn shut_down(&mut self, handle: ObjectHandle) -> bool {
         // shortcut: stop autonomous movement and fire until the native shutdown task is modeled.
         self.units.retain(|unit| unit.handle != handle);

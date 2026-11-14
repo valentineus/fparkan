@@ -1965,7 +1965,7 @@ pub struct Handler2RecordInput {
 }
 
 /// The exact three-word identity used by the original `Handler(2)` scheduler.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Handler2RecordKey {
     /// First identity word from resolved slot 0.
     pub word_0: u32,
