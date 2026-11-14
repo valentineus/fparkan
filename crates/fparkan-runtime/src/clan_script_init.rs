@@ -5,6 +5,10 @@ use fparkan_script::{
 
 pub(super) enum InitOrder {
     Patrol(ScriptPatrol),
+    Attack {
+        id: u32,
+        target: u32,
+    },
     Move {
         id: u32,
         destination: [u32; 2],
@@ -46,6 +50,14 @@ pub(super) fn unit_order(
     let order = declarations
         .resolve_handler15_with_values(instruction, values)
         .ok()?;
+    if let (3, 3, Handler15TargetPayload::ByLogicId(target)) =
+        (order.word_1, order.word_2, order.target)
+    {
+        return Some(InitOrder::Attack {
+            id: order.word_0,
+            target,
+        });
+    }
     if let (2, insertion @ (1 | 3), Handler15TargetPayload::ByPlace { first, second }) =
         (order.word_1, order.word_2, order.target)
     {

@@ -2446,6 +2446,7 @@ fn load_mission_with_options(
                 matches!(
                     order,
                     clan_script_init::InitOrder::Patrol(_)
+                        | clan_script_init::InitOrder::Attack { .. }
                         | clan_script_init::InitOrder::Move { .. }
                         | clan_script_init::InitOrder::Shutdown(_)
                 )
@@ -2540,6 +2541,19 @@ fn load_mission_with_options(
             }
             clan_script_init::InitOrder::Reserve { clan, id, reserved } => {
                 mission_events.set_reservation(&mission, &new_runtime_world, clan, id, reserved);
+            }
+            clan_script_init::InitOrder::Attack { id, target } => {
+                let Some(patrol) = &mut unit_patrol else {
+                    continue;
+                };
+                script_patrol::apply_attack_order(
+                    patrol,
+                    &mission,
+                    &object_drafts,
+                    &new_runtime_world,
+                    id,
+                    target,
+                );
             }
             clan_script_init::InitOrder::Move {
                 id,

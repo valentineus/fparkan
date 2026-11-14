@@ -31,6 +31,7 @@ struct PatrollingUnit {
     points: VecDeque<[f32; 2]>,
     retry_ms: u32,
     attack: Option<ObjectHandle>,
+    attack_target: Option<(ObjectHandle, usize)>,
     raid_factory: Option<(ObjectHandle, usize)>,
 }
 
@@ -155,9 +156,11 @@ impl UnitPatrol {
             .retain(|unit| transform_state(world, unit.handle).is_ok());
         if let Some(unit) = self.units.iter_mut().find(|unit| unit.handle == handle) {
             unit.raid_factory = None;
+            let was_attacking = unit.attack_target.take().is_some();
             let was_moving = unit.destinations.take().is_some();
             if unit.center_object.take().is_some()
                 || was_moving
+                || was_attacking
                 || unit.center != center
                 || unit.radius != radius
             {
@@ -178,6 +181,7 @@ impl UnitPatrol {
             points: VecDeque::new(),
             retry_ms: 0,
             attack: None,
+            attack_target: None,
             raid_factory: None,
         });
         true
@@ -218,7 +222,10 @@ impl UnitPatrol {
         radius: f32,
     ) -> bool {
         if self.units.iter().any(|unit| {
-            unit.handle == handle && unit.center_object == Some(target) && unit.radius == radius
+            unit.handle == handle
+                && unit.attack_target.is_none()
+                && unit.center_object == Some(target)
+                && unit.radius == radius
         }) {
             return false;
         }
@@ -256,6 +263,28 @@ impl UnitPatrol {
             .iter()
             .find(|unit| unit.handle == handle)?
             .raid_factory
+    }
+
+    pub(super) fn set_attack_target(
+        &mut self,
+        world: &World,
+        handle: ObjectHandle,
+        target: ObjectHandle,
+        target_index: usize,
+        center: [f32; 2],
+    ) {
+        self.order(world, handle, center, 60.0);
+        if let Some(unit) = self.units.iter_mut().find(|unit| unit.handle == handle) {
+            unit.center_object = Some(target);
+            unit.attack_target = Some((target, target_index));
+        }
+    }
+
+    pub(super) fn attack_target(&self, handle: ObjectHandle) -> Option<(ObjectHandle, usize)> {
+        self.units
+            .iter()
+            .find(|unit| unit.handle == handle)?
+            .attack_target
     }
 
     pub(super) fn attack_limit(
@@ -307,6 +336,7 @@ impl UnitPatrol {
                 points: VecDeque::new(),
                 retry_ms: 0,
                 attack: None,
+                attack_target: None,
                 raid_factory: None,
             })
             .collect();
@@ -400,6 +430,8 @@ impl UnitPatrol {
                         .transpose()?
                         .flatten()
                         .unwrap_or_default()
+                } else if unit.attack_target.is_some() {
+                    VecDeque::new()
                 } else {
                     choose_route(terrain, from, center, unit.radius, &mut state.rng)?
                 };
@@ -442,6 +474,25 @@ impl UnitPatrol {
         }
         Ok(PreparedPatrol { state, poses })
     }
+}
+
+#[cfg(test)]
+#[test]
+fn new_patrol_replaces_a_script_attack_order() {
+    let world = fparkan_world::new(fparkan_world::WorldConfig::default());
+    let actor = ObjectHandle {
+        slot: 0,
+        generation: 1,
+    };
+    let target = ObjectHandle {
+        slot: 1,
+        generation: 1,
+    };
+    let mut patrol = UnitPatrol::scripted();
+    patrol.set_attack_target(&world, actor, target, 1, [50.0, 60.0]);
+    assert_eq!(patrol.attack_target(actor), Some((target, 1)));
+    assert!(patrol.order_around_object(&world, actor, target, [50.0, 60.0], 60.0));
+    assert_eq!(patrol.attack_target(actor), None);
 }
 
 impl PatrollingUnit {

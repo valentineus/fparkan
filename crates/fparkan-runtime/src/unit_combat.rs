@@ -251,6 +251,23 @@ impl AutoDemoCombat {
                 }) {
                     return None;
                 }
+                if let Some((target, index)) =
+                    patrol.and_then(|patrol| patrol.attack_target(handle))
+                {
+                    // shortcut: aim at the target bounds until the original Attack task is wired.
+                    let state = transform_state(world, target).ok()?;
+                    let (center, radius) = unit_sphere(assets, index, state)?;
+                    let distance = (center[0] - from[0]).hypot(center[1] - from[1]);
+                    return Some((
+                        handle,
+                        CombatTarget {
+                            handle: target,
+                            center,
+                            radius,
+                            in_range: distance <= FIRE_RANGE,
+                        },
+                    ));
+                }
                 let limit = patrol.and_then(|patrol| patrol.attack_limit(world, handle));
                 if limit.is_some_and(|limit| !limit.allows_attack(position)) {
                     return None;
