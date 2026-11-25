@@ -25,11 +25,11 @@ impl StringResources {
         let handle = unsafe {
             LoadLibraryExW(
                 path.as_ptr(),
-                0,
+                ptr::null_mut(),
                 LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE,
             )
         };
-        if handle == 0 {
+        if handle.is_null() {
             Err(std::io::Error::last_os_error().to_string())
         } else {
             Ok(Self(handle))
@@ -82,8 +82,8 @@ pub fn caption(text: &str, width: u16, height: u16) -> Result<(u32, Vec<u8>), St
     // SAFETY: We own the memory DC and bitmap. GDI writes only within the
     // described DIB. The pixel slice is copied before either handle is freed.
     unsafe {
-        let dc = CreateCompatibleDC(0);
-        if dc == 0 {
+        let dc = CreateCompatibleDC(ptr::null_mut());
+        if dc.is_null() {
             return Err("create caption DC".into());
         }
         SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
@@ -105,16 +105,23 @@ pub fn caption(text: &str, width: u16, height: u16) -> Result<(u32, Vec<u8>), St
             bmiColors: [std::mem::zeroed()],
         };
         let mut pixels: *mut c_void = ptr::null_mut();
-        let bitmap = CreateDIBSection(dc, &bitmap_info, DIB_RGB_COLORS, &mut pixels, 0, 0);
-        if bitmap == 0 || pixels.is_null() {
-            if bitmap != 0 {
+        let bitmap = CreateDIBSection(
+            dc,
+            &bitmap_info,
+            DIB_RGB_COLORS,
+            &mut pixels,
+            ptr::null_mut(),
+            0,
+        );
+        if bitmap.is_null() || pixels.is_null() {
+            if !bitmap.is_null() {
                 DeleteObject(bitmap);
             }
             DeleteDC(dc);
             return Err("create caption bitmap".into());
         }
         let previous = SelectObject(dc, bitmap);
-        if previous == 0 || previous == -1 {
+        if previous.is_null() || previous == (-1_isize) as HGDIOBJ {
             DeleteObject(bitmap);
             DeleteDC(dc);
             return Err("select caption bitmap".into());
