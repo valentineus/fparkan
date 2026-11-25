@@ -97,6 +97,9 @@ pub(super) fn log_clan_ai_stops(report: &SimulationReport) {
             eprintln!("sim_coverage script_building_rejected={rejected} clan={clan} builder={builder} class={class:#010x}");
         }
     }
+    for &(clan, builder, source, count) in &report.script_builder_supplies {
+        eprintln!("sim_coverage script_builder_supply_approx={count} clan={clan} builder={builder} source={source}");
+    }
     for &(clan, count) in &report.script_capturer_queries {
         eprintln!("sim_coverage script_nearest_capturer_approx={count} clan={clan}");
     }

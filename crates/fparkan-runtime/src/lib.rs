@@ -43,6 +43,7 @@ use std::sync::Arc;
 
 mod autodemo;
 mod boarding;
+mod builder_supply;
 mod building_door;
 mod clan_ai_events;
 mod clan_area_strength;
@@ -2939,6 +2940,7 @@ pub struct SimulationReport {
     pub script_class_limit_queries: Vec<(usize, u32, bool, u64)>,
     pub script_mine_queries: Vec<(usize, u32, u32, u32, u64)>,
     pub script_construction_orders: Vec<(usize, u32, u32, u64, u64)>,
+    pub script_builder_supplies: Vec<(u16, u32, u32, u64)>,
     pub script_capturer_queries: Vec<(usize, u64)>,
     pub script_capture_approaches: Vec<(u32, u32, u64)>,
     /// First factory completion by clan, in milliseconds.
@@ -3004,6 +3006,7 @@ pub fn simulate_mission_report(
         script_class_limit_queries: Vec::new(),
         script_mine_queries: Vec::new(),
         script_construction_orders: Vec::new(),
+        script_builder_supplies: Vec::new(),
         script_capturer_queries: Vec::new(),
         script_capture_approaches: Vec::new(),
         first_factory_completion_ms: Default::default(),
@@ -3155,6 +3158,13 @@ pub fn simulate_mission_report(
         report
             .script_construction_orders
             .extend(loaded.clan_ai_events.construction_orders());
+        report.script_builder_supplies.extend(
+            loaded
+                .construction
+                .supply_orders
+                .iter()
+                .map(|(&(clan, builder, source), &count)| (clan, builder, source, count)),
+        );
         report
             .script_capturer_queries
             .extend(loaded.clan_ai_events.capturer_queries());

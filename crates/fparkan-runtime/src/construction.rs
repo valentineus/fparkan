@@ -45,6 +45,7 @@ pub(super) struct Construction {
     first_slot: usize,
     controls: Vec<crate::MissionControlDeviceTableState>,
     tasks: Vec<Task>,
+    pub(super) supply_orders: std::collections::BTreeMap<(u16, u32, u32), u64>,
 }
 
 struct Task {
@@ -55,6 +56,7 @@ struct Task {
     position: [f32; 3],
     cost: f32,
     arrived_at: Option<u32>,
+    supply: Option<crate::builder_supply::BuilderSupply>,
 }
 
 impl Construction {
@@ -66,6 +68,7 @@ impl Construction {
             first_slot,
             controls,
             tasks: Vec::new(),
+            supply_orders: Default::default(),
         }
     }
 
@@ -104,7 +107,18 @@ impl Construction {
         class: u32,
         position: [f32; 3],
         cost: f32,
+        supply: Option<crate::builder_supply::BuilderSupply>,
     ) {
+        if let Some(supply) = &supply {
+            *self
+                .supply_orders
+                .entry((owner.0, builder.slot, supply.source.slot))
+                .or_default() += 1;
+            eprintln!(
+                "sim_coverage script_builder_supply_approx=1 clan={} builder={} source={}",
+                owner.0, builder.slot, supply.source.slot
+            );
+        }
         self.tasks.push(Task {
             builder,
             owner,
@@ -113,6 +127,7 @@ impl Construction {
             position,
             cost,
             arrived_at: None,
+            supply,
         });
     }
 }
@@ -170,19 +185,22 @@ pub(super) fn order(
     .map_err(|err| err.to_string())?
     .ore;
     let stock = f32::from_bits(cargo.current_ore_bits);
-    // shortcut: require ore onboard until the builder can fetch it from a warehouse.
-    if !stock.is_finite() || stock < cost {
-        return Err("builder has insufficient ore".into());
+    if !stock.is_finite() {
+        return Err("builder has non-finite ore".into());
     }
+    let supply =
+        crate::builder_supply::BuilderSupply::plan(world, ores, builder, owner, class, stock)?;
     let from = transform_state(world, builder)
         .map_err(|err| err.to_string())?
         .position
         .map(f32::from_bits);
     let position = destination(terrain, from, xy).ok_or("no route to the building site")?;
-    patrol
-        .get_or_insert_with(crate::unit_patrol::UnitPatrol::scripted)
-        .move_to(world, builder, [position[0], position[1]], false);
-    construction.start(builder, owner, slot, class, position, cost);
+    if supply.is_none() {
+        patrol
+            .get_or_insert_with(crate::unit_patrol::UnitPatrol::scripted)
+            .move_to(world, builder, [position[0], position[1]], false);
+    }
+    construction.start(builder, owner, slot, class, position, cost, supply);
     Ok(())
 }
 
@@ -205,25 +223,62 @@ pub(super) fn tick(
             .ok()
             .filter(|_| owned && running)
         {
-            let [x, y, _] = pose.position.map(f32::from_bits);
-            let [a, b, _] = task.position;
-            if (x - a).hypot(y - b) > ARRIVAL_RADIUS {
-                task.arrived_at = None;
-                if mission
-                    .unit_patrol
-                    .as_ref()
-                    .is_some_and(|patrol| patrol.is_moving_to_destination(task.builder))
-                {
-                    index += 1;
-                    continue;
+            if let Some(supply) = &mut task.supply {
+                match supply.tick(
+                    world,
+                    &mut mission.behavior_ore_states,
+                    &mut mission.unit_patrol,
+                    task.builder,
+                    task.owner,
+                    task.cost,
+                    now_ms,
+                ) {
+                    Ok(ready) => {
+                        if ready {
+                            task.supply = None;
+                            mission
+                                .unit_patrol
+                                .get_or_insert_with(crate::unit_patrol::UnitPatrol::scripted)
+                                .move_to(
+                                    world,
+                                    task.builder,
+                                    [task.position[0], task.position[1]],
+                                    false,
+                                );
+                            eprintln!(
+                                "script_builder_supplied clan={} builder={} queue_time_ms={now_ms}",
+                                task.owner.0, task.builder.slot
+                            );
+                        }
+                        index += 1;
+                        continue;
+                    }
+                    Err(reason) => eprintln!(
+                        "script_builder_supply_failed clan={} builder={} reason={reason}",
+                        task.owner.0, task.builder.slot
+                    ),
                 }
             } else {
-                let arrived_at = *task.arrived_at.get_or_insert(now_ms);
-                if now_ms.wrapping_sub(arrived_at) < WAIT_MS {
-                    index += 1;
-                    continue;
+                let [x, y, _] = pose.position.map(f32::from_bits);
+                let [a, b, _] = task.position;
+                if (x - a).hypot(y - b) > ARRIVAL_RADIUS {
+                    task.arrived_at = None;
+                    if mission
+                        .unit_patrol
+                        .as_ref()
+                        .is_some_and(|patrol| patrol.is_moving_to_destination(task.builder))
+                    {
+                        index += 1;
+                        continue;
+                    }
+                } else {
+                    let arrived_at = *task.arrived_at.get_or_insert(now_ms);
+                    if now_ms.wrapping_sub(arrived_at) < WAIT_MS {
+                        index += 1;
+                        continue;
+                    }
+                    finish = true;
                 }
-                finish = true;
             }
         }
         let task = mission.construction.tasks.remove(index);
@@ -250,9 +305,9 @@ fn complete(
     let index = crate::behavior_ore_index_for_handle(&mission.behavior_ore_states, task.builder)
         .map_err(crate::EngineError::Production)?;
     let stock = f32::from_bits(mission.behavior_ore_states[index].current_ore_bits);
-    if !stock.is_finite() || stock < task.cost {
+    if !stock.is_finite() {
         return Err(crate::EngineError::Production(
-            "builder has insufficient ore".into(),
+            "builder has non-finite ore".into(),
         ));
     }
     let [x, y, _] = task.position;
@@ -353,6 +408,75 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
+    fn licensed_stock_builder_resupplies_and_finishes_another_building() {
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").unwrap();
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Single.02/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        let mut supplied = None;
+        for now in (0..=900_000).step_by(100) {
+            crate::frame(&mut engine, now).unwrap();
+            let loaded = engine.loaded.as_ref().unwrap();
+            assert!(loaded.clan_ai_events.stops().next().is_none());
+            if supplied.is_none() {
+                if let Some(task) = loaded
+                    .construction
+                    .tasks
+                    .iter()
+                    .find(|task| task.supply.is_some())
+                {
+                    let source = task.supply.as_ref().unwrap().source;
+                    assert_eq!(
+                        identity_metadata(&engine.world, source).unwrap().owner_id,
+                        Some(task.owner)
+                    );
+                    let ore = loaded
+                        .behavior_ore_states
+                        .iter()
+                        .find(|ore| ore.handle == task.builder)
+                        .unwrap();
+                    assert!(f32::from_bits(ore.current_ore_bits) < 100.0);
+                    supplied = Some((
+                        loaded.object_drafts[task.slot].original_id.unwrap(),
+                        task.builder,
+                    ));
+                }
+            }
+            if let Some((id, builder)) = supplied {
+                if let Some(building) = handle_by_original_id(&engine.world, id) {
+                    assert_eq!(
+                        identity_metadata(&engine.world, building).unwrap().owner_id,
+                        identity_metadata(&engine.world, builder).unwrap().owner_id
+                    );
+                    assert!(loaded
+                        .construction
+                        .supply_orders
+                        .keys()
+                        .any(|&(_, slot, _)| slot == builder.slot));
+                    println!(
+                        "stock builder {} resupplied and completed {} at {now} ms",
+                        builder.slot, building.slot
+                    );
+                    return;
+                }
+            }
+        }
+        panic!("stock builders did not resupply and complete another building");
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_stock_clan_builds_a_working_factory() {
         let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").unwrap();
         let vfs = Arc::new(DirectoryVfs::new(root));
@@ -426,7 +550,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
-    fn tower_order_rejects_unresearched_parts_and_spawns_when_available() {
+    fn tower_order_rejects_unresearched_parts_and_preserves_native_ore_debt() {
         let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").unwrap();
         let vfs = Arc::new(DirectoryVfs::new(root));
         let mut engine = create(EngineServices::new(vfs.clone())).unwrap();
@@ -494,17 +618,13 @@ mod tests {
             .contains("unavailable for construction"));
         let table =
             crate::research::load_technology_table(vfs.as_ref(), &mission.mission, owner).unwrap();
-        // Set up a supplied builder after testing the unchanged mission's research gate.
+        // Debug setup isolates the native payment rule after the stock research gate.
         for component in &mission.object_drafts[slot].unit_components {
             if let Some(row) = table.find_key(&component.resource_raw).unwrap() {
                 mission.free_research.learned.insert((owner, row));
             }
         }
-        assert_eq!(
-            order_for(mission, &engine.world).unwrap_err(),
-            "builder has insufficient ore"
-        );
-        let stock_before = 2000.0_f32;
+        let stock_before = 500.0_f32;
         mission.behavior_ore_states[builder_ore].current_ore_bits = stock_before.to_bits();
         order_for(mission, &engine.world).unwrap();
         assert!(mission.construction.active(builder));
