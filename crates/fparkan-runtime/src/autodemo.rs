@@ -2,14 +2,14 @@ use super::{
     component_cockpit, mission_object_handle, normalize_engine_path, read_vfs, Engine, EngineError,
     MissionControlDeviceTableState, MissionMode, StartingCockpit, World, WorldSnapshot,
 };
+use crate::unit_spawn::{spawn_prepared_unit, SpawnedUnit};
 use fparkan_path::{normalize_relative, NormalizedPath, PathPolicy};
 use fparkan_prototype::decode_unit_dat;
 use fparkan_render::{LegacyIron3dEulerTransform, RawCameraTransform};
 use fparkan_terrain::{SurfaceQuery, TerrainWorld};
 use fparkan_vfs::{Vfs, VfsError};
 use fparkan_world::{
-    construct_replacement, handle_by_original_id, identity_metadata, register_object, set_owner,
-    set_transform, transform_state, ObjectDraft, ObjectHandle, OwnerId, TransformState,
+    handle_by_original_id, identity_metadata, transform_state, ObjectHandle, OwnerId,
 };
 use std::sync::Arc;
 
@@ -45,17 +45,6 @@ pub(super) struct LiveReinforcements {
     scheme_count: usize,
     rng: u32,
     controls: Vec<MissionControlDeviceTableState>,
-}
-
-/// A reserve model activated with a newly registered world object.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SpawnedUnit {
-    /// Prepared scene object index.
-    pub object_index: usize,
-    /// New world handle.
-    pub handle: ObjectHandle,
-    /// Clan receiving the replacement.
-    pub clan: u16,
 }
 
 /// A unit created by AutoDemo's replacement policy.
@@ -173,52 +162,6 @@ impl LiveReinforcements {
         }
         Ok(handle)
     }
-}
-
-pub(super) fn spawn_prepared_unit(
-    world: &mut World,
-    mission: &mut super::LoadedMissionState,
-    index: usize,
-    clan: u16,
-    position: [f32; 3],
-    mut table: MissionControlDeviceTableState,
-) -> Result<ObjectHandle, EngineError> {
-    let draft = &mission.object_drafts[index];
-    let handle = construct_replacement(
-        world,
-        ObjectDraft {
-            original_id: draft.original_id,
-        },
-    )?;
-    let pose = TransformState {
-        position: position.map(f32::to_bits),
-        orientation: draft.orientation_raw.map(f32::to_bits),
-        scale: draft.scale.map(f32::to_bits),
-    };
-    if let Err(error) = set_transform(world, handle, pose)
-        .and_then(|()| set_owner(world, handle, Some(OwnerId(clan))))
-        .and_then(|()| register_object(world, handle))
-    {
-        fparkan_world::request_delete(world, handle)?;
-        return Err(error.into());
-    }
-    mission
-        .control_device_tables
-        .retain(|table| transform_state(world, table.handle).is_ok());
-    mission
-        .behavior_control_groupings
-        .retain(|group| transform_state(world, group.handle).is_ok());
-    table.handle = handle;
-    mission
-        .behavior_control_groupings
-        .push(super::project_mission_behavior_control_grouping(&table));
-    mission.control_device_tables.push(table);
-    mission.mission_events.register_unit(
-        world,
-        handle,
-        draft.unit_dat_header_flags.expect("mobile reserve"),
-    );
-    Ok(handle)
 }
 
 pub(super) fn plan_reinforcements(

@@ -1,4 +1,4 @@
-use crate::autodemo::spawn_prepared_unit;
+use crate::unit_spawn::spawn_prepared_unit;
 use crate::{LoadedMissionState, MissionScriptBundle};
 use fparkan_path::ResourceName;
 use fparkan_script::ScriptDispatchSelector;

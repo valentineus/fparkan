@@ -1,7 +1,7 @@
 use super::{
-    add_behavior_registered_object,
-    autodemo::{spawn_prepared_unit, SpawnedUnit},
-    behavior_ore_index_for_handle, BehaviorOreState, BehaviorRegisteredObject, Engine, EngineError,
+    add_behavior_registered_object, behavior_ore_index_for_handle,
+    unit_spawn::{spawn_prepared_unit, SpawnedUnit},
+    BehaviorOreState, BehaviorRegisteredObject, Engine, EngineError,
     MissionControlDeviceTableState, MissionObjectDraft, StartingCockpit,
 };
 use fparkan_assets::ExtraRecord28;

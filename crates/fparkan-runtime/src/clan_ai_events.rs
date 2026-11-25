@@ -1575,7 +1575,11 @@ impl ClanAiEvents {
         }
     }
 
-    pub(super) fn clock_ticks(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
+    pub(super) fn advance_for_registration(&mut self, clan: usize) -> u64 {
+        self.clocks.advance_for_registration(clan)
+    }
+
+    pub(super) fn clock_ticks(&self) -> impl Iterator<Item = (usize, u64, u64)> + '_ {
         self.clocks.ticks()
     }
 

@@ -444,6 +444,11 @@ pub fn capture_neutral_warbot(
         .min_by(|a, b| a.0.total_cmp(&b.0));
     if let Some((_, handle, original_id)) = candidate {
         set_owner(&mut engine.world, handle, Some(player_owner))?;
+        engine
+            .loaded
+            .as_mut()
+            .expect("loaded mission")
+            .note_clan_registration(player_owner, handle);
         return Ok(Some(original_id));
     }
     Ok(None)
@@ -553,6 +558,9 @@ impl LoadedMissionState {
         class: u32,
     ) -> Result<(), EngineError> {
         set_owner(world, handle, Some(new_owner))?;
+        if former_owner != new_owner {
+            self.note_clan_registration(new_owner, handle);
+        }
         if has_behavior_registration_key(class) {
             let distributors = &mut self.behavior_distributors;
             if let Some(previous) = distributors.get_mut(usize::from(former_owner.0)) {

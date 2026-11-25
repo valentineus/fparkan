@@ -80,10 +80,9 @@ mod script_time;
 mod unit_combat;
 mod unit_patrol;
 mod unit_size_class;
+mod unit_spawn;
 
-pub use autodemo::{
-    autodemo_camera, AutoDemoCamera, AutoDemoReinforcement, AutoDemoView, SpawnedUnit,
-};
+pub use autodemo::{autodemo_camera, AutoDemoCamera, AutoDemoReinforcement, AutoDemoView};
 pub use boarding::{
     board_friendly_warbot, disembark_warbot, player_vehicle, select_boarding_target,
 };
@@ -111,6 +110,7 @@ pub use projectile::{
 };
 pub use research::order_lab_research;
 pub use unit_combat::{AutoDemoCombatEvent, AutoDemoProjectileType};
+pub use unit_spawn::SpawnedUnit;
 
 const MISSION_DECODED_PAYLOAD_CACHE_ENTRIES: usize = 256;
 const MAX_MISSION_AI_RECORD_SLOTS: usize = 1_000_000;
@@ -2917,8 +2917,8 @@ pub struct SimulationReport {
     pub mission_event_stops: Vec<MissionEventStop>,
     /// Uncovered clan AI instructions and the number of invocations they stopped.
     pub clan_ai_event_stops: Vec<(MissionEventStop, u64)>,
-    /// Executed AI clock cycles by clan; initial phase and full RNG ordering remain approximate.
-    pub clan_ai_clock_ticks: Vec<(usize, u64)>,
+    /// Clan index, executed AI cycles and new registrations; initial phase and RNG order remain approximate.
+    pub clan_ai_clock_ticks: Vec<(usize, u64, u64)>,
     /// Calls to stubbed research policy or status, grouped by clan and handler.
     pub clan_research_status_stubs: Vec<(usize, u8, u64)>,
     pub clan_research_catalogs: Vec<(usize, usize, u32, u64)>,

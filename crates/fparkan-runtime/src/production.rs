@@ -1,14 +1,13 @@
 use super::{
-    autodemo::{
-        reinforcement_position, spawn_prepared_unit, SpawnedUnit, MOBILE_UNIT, PLANT_CLASS,
-    },
+    autodemo::{reinforcement_position, MOBILE_UNIT, PLANT_CLASS},
     behavior_ore_index_for_handle,
     mission_events::on_communicator,
     normalize_engine_path, query_behavior_profile_ore_rate,
     research::{load_clan_table, RESEARCHED},
-    set_control_device_table_selector, BehaviorOreState, Engine, EngineError, LoadedMissionState,
-    MissionControlDeviceTableState, MissionControlDeviceTableStatus, MissionObjectDraft,
-    StartingCockpit, World,
+    set_control_device_table_selector,
+    unit_spawn::{spawn_prepared_unit, SpawnedUnit},
+    BehaviorOreState, Engine, EngineError, LoadedMissionState, MissionControlDeviceTableState,
+    MissionControlDeviceTableStatus, MissionObjectDraft, StartingCockpit, World,
 };
 use fparkan_assets::ResearchTrfDocument;
 use fparkan_path::NormalizedPath;
