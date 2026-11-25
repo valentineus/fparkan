@@ -162,6 +162,50 @@ pub(super) fn factory_defence(
                 .map(f32::from_bits),
         ))
     })?;
+    Some((id, guard_strength(world, drafts, controls, units, position)))
+}
+
+pub(super) fn building_defence(
+    world: &World,
+    drafts: &[MissionObjectDraft],
+    controls: &[MissionControlDeviceTableState],
+    units: impl Iterator<Item = ObjectHandle> + Clone,
+) -> Option<(u32, f32)> {
+    let candidates = units.clone().filter_map(|handle| {
+        let index = identity_metadata(world, handle).ok()?.original_id?.0 as usize;
+        let id = drafts.get(index)?.identity_or_clan_raw;
+        (id & 0x8000_0000 != 0 && id != u32::MAX).then_some(())?;
+        let position = transform_state(world, handle)
+            .ok()?
+            .position
+            .map(f32::from_bits);
+        Some((
+            id,
+            guard_strength(world, drafts, controls, units.clone(), position),
+        ))
+    });
+    least_defended(candidates)
+}
+
+fn least_defended(candidates: impl Iterator<Item = (u32, f32)>) -> Option<(u32, f32)> {
+    let mut selected = None;
+    let mut minimum = 1e12_f32;
+    for (id, strength) in candidates {
+        if strength < minimum {
+            selected = Some((id, strength));
+            minimum = strength;
+        }
+    }
+    selected
+}
+
+fn guard_strength(
+    world: &World,
+    drafts: &[MissionObjectDraft],
+    controls: &[MissionControlDeviceTableState],
+    units: impl Iterator<Item = ObjectHandle>,
+    position: [f32; 3],
+) -> f32 {
     // shortcut: sum from live Control tables until the ArealMap street records are available.
     let guards = units.filter(|&handle| {
         let mobile = identity_metadata(world, handle)
@@ -174,12 +218,9 @@ pub(super) fn factory_defence(
                 within_factory_radius(position, pose.position.map(f32::from_bits))
             })
     });
-    Some((
-        id,
-        guards
-            .map(|handle| unit_strength(controls, handle))
-            .fold(0.0, |sum, amount| sum + amount),
-    ))
+    guards
+        .map(|handle| unit_strength(controls, handle))
+        .fold(0.0, |sum, amount| sum + amount)
 }
 
 fn within_factory_radius([x, y, _]: [f32; 3], [px, py, _]: [f32; 3]) -> bool {
@@ -394,6 +435,20 @@ fn building_priority(class: u32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn defence_selects_the_smallest_strength_and_keeps_the_first_tie() {
+        assert_eq!(
+            least_defended([(1, 8.0), (2, 4.0), (3, 4.0)].into_iter()),
+            Some((2, 4.0))
+        );
+        assert_eq!(
+            least_defended([(1, 0.0), (2, 0.0)].into_iter()),
+            Some((1, 0.0))
+        );
+        assert_eq!(least_defended(std::iter::empty()), None);
+        assert_eq!(least_defended([(1, f32::NAN), (2, 1e12)].into_iter()), None);
+    }
 
     #[test]
     fn approach_targets_the_nearest_platform_triangle() {

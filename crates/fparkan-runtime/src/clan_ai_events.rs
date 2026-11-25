@@ -226,6 +226,7 @@ pub(super) struct ClanAiEvents {
     capture_queries: BTreeMap<usize, u64>,
     attack_queries: BTreeMap<usize, u64>,
     factory_defence_queries: BTreeMap<(usize, u32), u64>,
+    building_defence_queries: BTreeMap<(usize, u32), u64>,
     base_threat_queries: BTreeMap<(usize, u32), u64>,
     base_radius_limits: BTreeMap<usize, f32>,
     capturer_queries: BTreeMap<usize, u64>,
@@ -1018,7 +1019,7 @@ impl LoadedMissionState {
                             self.clan_ai_events.log_research_stub(clan, 58, &bundle.script_path);
                             Ok(Some(VarSetDefault::Dword(u32::MAX)))
                         }
-                        ScriptDispatchSelector::Handler(handler @ (47 | 67)) => {
+                        ScriptDispatchSelector::Handler(handler @ (37 | 47 | 67)) => {
                             let (output, selection) = match (handler, instruction.references.as_slice()) {
                                 (47, &[extension, output]) => {
                                     let extension = values.get(extension as usize).and_then(|cell| cell.as_dword())
@@ -1033,24 +1034,29 @@ impl LoadedMissionState {
                                     );
                                     (output, selection)
                                 }
-                                (67, &[output]) => {
+                                (37 | 67, &[output]) => {
                                     let units = self.mission_events.clan_units(world, OwnerId(clan as u16), false);
-                                    (output, crate::clan_targeting::factory_defence(world, &self.object_drafts, &self.control_device_tables, units))
+                                    let selection = if handler == 37 {
+                                        crate::clan_targeting::building_defence(world, &self.object_drafts, &self.control_device_tables, units)
+                                    } else {
+                                        crate::clan_targeting::factory_defence(world, &self.object_drafts, &self.control_device_tables, units)
+                                    };
+                                    (output, selection)
                                 }
                                 _ => return Err("defence query requires a strength output".into()),
                             };
                             let cell = values.get_mut(output as usize)
                                 .ok_or("defence query strength output is unavailable")?;
-                            let (id, power) = selection.unwrap_or((u32::MAX, 0.0));
+                            let (id, power) = selection.unwrap_or((u32::MAX, if handler == 37 { 1e12_f32 } else { 0.0 }));
                             let power = crate::clan_targeting::encode_strength(power);
                             *cell = match *cell {
                                 VarSetDefault::Dword(_) => VarSetDefault::Dword(power as u32),
                                 VarSetDefault::FloatBits(_) => VarSetDefault::FloatBits(power.to_bits()),
                             };
-                            let (queries, name) = if handler == 47 {
-                                (&mut self.clan_ai_events.base_threat_queries, "script_base_threat_approx")
-                            } else {
-                                (&mut self.clan_ai_events.factory_defence_queries, "script_factory_defence_approx")
+                            let (queries, name) = match handler {
+                                37 => (&mut self.clan_ai_events.building_defence_queries, "script_building_defence_approx"),
+                                47 => (&mut self.clan_ai_events.base_threat_queries, "script_base_threat_approx"),
+                                _ => (&mut self.clan_ai_events.factory_defence_queries, "script_factory_defence_approx"),
                             };
                             let count = queries.entry((clan, id)).or_default();
                             *count += 1;
@@ -1231,6 +1237,12 @@ impl ClanAiEvents {
             .map(|(&(clan, id), &count)| (clan, id, count))
     }
 
+    pub(super) fn building_defence_queries(&self) -> impl Iterator<Item = (usize, u32, u64)> + '_ {
+        self.building_defence_queries
+            .iter()
+            .map(|(&(clan, target), &count)| (clan, target, count))
+    }
+
     pub(super) fn wait_starts(&self) -> impl Iterator<Item = (usize, u32, u64)> + '_ {
         self.wait_starts
             .iter()
@@ -1387,6 +1399,70 @@ impl ClanAiEvents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_weak_building_gets_scripted_guards_from_stock_start() {
+        use crate::{EngineServices, MissionMode, MissionRequest, MissionStartupInput};
+        use fparkan_vfs::DirectoryVfs;
+        use std::sync::Arc;
+
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed corpus root");
+        let mut engine =
+            crate::create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
+        crate::load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/CAMPAIGN/CAMPAIGN.01/Mission.03/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+
+        for now in (0..=7_000).step_by(100) {
+            crate::frame(&mut engine, now).unwrap();
+        }
+        let loaded = engine.loaded.as_ref().unwrap();
+        assert!(loaded
+            .clan_ai_events
+            .stops()
+            .all(|(stop, _)| stop.reason != "Handler(37)"));
+        let target = crate::mission_events::placed_logic_objects(
+            &loaded.mission,
+            &engine.world,
+            0x8000_0001,
+        )
+        .next()
+        .unwrap();
+        let group = loaded
+            .clan_ai_events
+            .groups
+            .iter()
+            .find_map(|(&(clan, key), group)| {
+                (clan == 1 && key.word_0 == BUILDING_PROTECT && key.argument_0 == 0x8000_0001)
+                    .then_some(group)
+            })
+            .expect("weak building receives a guard group");
+        assert_eq!(group.target, target);
+        assert!(!group.members.is_empty());
+        let patrol = loaded.unit_patrol.as_ref().unwrap();
+        assert!(group
+            .members
+            .iter()
+            .all(|&unit| patrol.has_object_order(unit, target)));
+        assert_eq!(
+            loaded
+                .clan_ai_events
+                .building_defence_queries()
+                .collect::<Vec<_>>(),
+            vec![(1, 0x8000_0001, 1)]
+        );
+    }
 
     #[test]
     #[ignore = "requires licensed corpus"]

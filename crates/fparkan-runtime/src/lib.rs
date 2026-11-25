@@ -2965,6 +2965,7 @@ pub struct SimulationReport {
     pub script_capture_queries: Vec<(usize, u64)>,
     pub script_attack_queries: Vec<(usize, u64)>,
     pub script_factory_defence_queries: Vec<(usize, u32, u64)>,
+    pub script_building_defence_queries: Vec<(usize, u32, u64)>,
     pub script_base_threat_queries: Vec<(usize, u32, u64)>,
     pub script_group_orders: Vec<(usize, u32, u64)>,
     pub script_problem_waits: Vec<(usize, u32, u64)>,
@@ -3019,6 +3020,7 @@ pub fn simulate_mission_report(
         script_capture_queries: Vec::new(),
         script_attack_queries: Vec::new(),
         script_factory_defence_queries: Vec::new(),
+        script_building_defence_queries: Vec::new(),
         script_base_threat_queries: Vec::new(),
         script_group_orders: Vec::new(),
         script_problem_waits: Vec::new(),
@@ -3116,6 +3118,9 @@ pub fn simulate_mission_report(
         report
             .script_factory_defence_queries
             .extend(loaded.clan_ai_events.factory_defence_queries());
+        report
+            .script_building_defence_queries
+            .extend(loaded.clan_ai_events.building_defence_queries());
         report
             .script_base_threat_queries
             .extend(loaded.clan_ai_events.base_threat_queries());
