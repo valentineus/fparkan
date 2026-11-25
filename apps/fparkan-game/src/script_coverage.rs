@@ -21,6 +21,9 @@ pub(super) fn log_script_init(engine: &Engine, mission: &str) {
 }
 
 pub(super) fn log_clan_ai_stops(report: &SimulationReport) {
+    for &(clan, result, count) in &report.clan_research_scan_queries {
+        eprintln!("sim_coverage script_research_scan_status={count} clan={clan} result={result}");
+    }
     for &(clan, count, registered) in &report.clan_ai_clock_ticks {
         eprintln!("sim_coverage script_clan_clock_approx={count} script_clan_registration={registered} clan={clan}");
     }

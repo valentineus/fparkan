@@ -2923,6 +2923,8 @@ pub struct SimulationReport {
     pub clan_ai_clock_ticks: Vec<(usize, u64, u64)>,
     /// Calls to stubbed research policy or status, grouped by clan and handler.
     pub clan_research_status_stubs: Vec<(usize, u8, u64)>,
+    /// Cached catalog scan queries, grouped by clan and normalized result.
+    pub clan_research_scan_queries: Vec<(usize, u32, u64)>,
     pub clan_research_catalogs: Vec<(usize, usize, u32, u64)>,
     pub laboratory: LaboratoryReport,
     /// Counts of pending script problems by clan and problem kind.
@@ -2999,6 +3001,7 @@ pub fn simulate_mission_report(
         clan_ai_event_stops: Vec::new(),
         clan_ai_clock_ticks: Vec::new(),
         clan_research_status_stubs: Vec::new(),
+        clan_research_scan_queries: Vec::new(),
         clan_research_catalogs: Vec::new(),
         laboratory: Default::default(),
         clan_problem_dispatch_stubs: Default::default(),
@@ -3102,6 +3105,9 @@ pub fn simulate_mission_report(
         report
             .clan_research_status_stubs
             .extend(loaded.clan_ai_events.research_status_stubs());
+        report
+            .clan_research_scan_queries
+            .extend(loaded.clan_ai_events.research_scan_queries());
         report
             .clan_ai_clock_ticks
             .extend(loaded.clan_ai_events.clock_ticks());

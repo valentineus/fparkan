@@ -238,6 +238,7 @@ pub(super) struct ClanAiEvents {
     clocks: crate::clan_clock::ClanClocks,
     stops: BTreeMap<(usize, usize, usize), (MissionEventStop, u64)>,
     research_stubs: BTreeMap<(usize, u8), u64>,
+    research_scan_queries: BTreeMap<(usize, u32), u64>,
     pub(super) research_catalogs: BTreeMap<usize, crate::clan_research::ClanResearch>,
     problems: BTreeMap<usize, Handler2RecordScheduler>,
     started: BTreeMap<(usize, u32), u64>,
@@ -1261,10 +1262,23 @@ impl LoadedMissionState {
                             }
                             Ok(Some(VarSetDefault::Dword(id)))
                         }
-                        ScriptDispatchSelector::Handler(handler @ (56 | 65))
+                        ScriptDispatchSelector::Handler(56)
                             if instruction.references.is_empty() =>
                         {
-                            // shortcut: keep research disabled until the native policy flag and catalog are wired.
+                            let result = crate::clan_research::scan_status(
+                                self.clan_ai_events.research_catalogs.get(&clan).map(|catalog| &catalog.candidates),
+                            );
+                            let count = self.clan_ai_events.research_scan_queries.entry((clan, result)).or_default();
+                            *count += 1;
+                            if *count == 1 {
+                                eprintln!("sim_coverage script_research_scan_status=1 clan={clan} result={result}");
+                            }
+                            Ok(Some(VarSetDefault::Dword(result)))
+                        }
+                        ScriptDispatchSelector::Handler(handler @ 65)
+                            if instruction.references.is_empty() =>
+                        {
+                            // shortcut: large-warbot eligibility needs the native candidate power property.
                             self.clan_ai_events.log_research_stub(
                                 clan,
                                 handler,
@@ -1408,6 +1422,12 @@ fn storage_space(ores: &[BehaviorOreState], world: &World, clan: OwnerId) -> f32
 }
 
 impl ClanAiEvents {
+    pub(super) fn research_scan_queries(&self) -> impl Iterator<Item = (usize, u32, u64)> + '_ {
+        self.research_scan_queries
+            .iter()
+            .map(|(&(clan, result), &count)| (clan, result, count))
+    }
+
     pub(super) fn free_mind_queries(
         &self,
     ) -> impl Iterator<Item = (usize, u32, u32, u32, u64)> + '_ {

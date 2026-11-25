@@ -10,6 +10,10 @@ pub(super) struct ClanResearch {
     pub(super) refreshes: u64,
 }
 
+pub(super) fn scan_status(candidates: Option<&ResearchCandidateSet>) -> u32 {
+    u32::from(candidates.is_some_and(|candidates| candidates.status != 0))
+}
+
 impl ClanResearch {
     pub(super) fn load(
         vfs: &dyn Vfs,
@@ -111,6 +115,99 @@ mod tests {
     };
     use fparkan_vfs::{DirectoryVfs, MemoryVfs};
     use std::sync::Arc;
+
+    #[test]
+    fn status_query_reads_the_cached_scan_without_reexamining_candidates() {
+        use fparkan_assets::{ResearchCandidate, ResearchCandidateSet};
+        let mut candidates = ResearchCandidateSet {
+            entries: vec![ResearchCandidate {
+                path: crate::normalize_engine_path("test", "UNITS/finished.dat").unwrap(),
+                status: 1,
+            }],
+            loaded: true,
+            ..Default::default()
+        };
+        // Finishing the last candidate does not change the preceding scan's flag.
+        assert_eq!(super::scan_status(Some(&candidates)), 0);
+        candidates.status = 255;
+        assert_eq!(super::scan_status(Some(&candidates)), 1);
+        // The native query neither rescans entries nor checks the loaded flag.
+        candidates.entries[0].status = 0;
+        candidates.loaded = false;
+        assert_eq!(super::scan_status(Some(&candidates)), 1);
+        assert_eq!(super::scan_status(None), 0);
+    }
+
+    #[test]
+    #[ignore = "requires licensed scenario resources"]
+    fn licensed_scream_scan_flag_gates_the_laboratory_request() {
+        use fparkan_assets::ResearchCandidateSet;
+        use fparkan_script::{parse_varset, ScriptDispatchSelector, VarSetDefault};
+        let root = std::path::PathBuf::from(std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").unwrap());
+        let scripts = root.join("MISSIONS/SCRIPTS");
+        let varset = parse_varset(&std::fs::read(scripts.join("varset.var")).unwrap()).unwrap();
+        let package =
+            fparkan_script::decode(&std::fs::read(scripts.join("scream.scr")).unwrap()).unwrap();
+        let mut branch = package
+            .events
+            .into_iter()
+            .find(|event| event.name_raw == b"Problems0\0")
+            .unwrap();
+        let query = branch
+            .instructions
+            .iter()
+            .position(|instruction| {
+                instruction.dispatch_selector() == ScriptDispatchSelector::Handler(56)
+            })
+            .unwrap();
+        let request = branch.instructions[query + 1..]
+            .iter()
+            .find(|instruction| {
+                instruction.dispatch_selector() == ScriptDispatchSelector::Handler(2)
+            })
+            .unwrap()
+            .clone();
+        assert_eq!(
+            varset.declarations[request.references[4] as usize].name,
+            "BUILDING_INSTITUTE"
+        );
+        // Isolate the shipped scan condition and request from unrelated formula assignments.
+        branch.instructions = vec![
+            branch.instructions[query].clone(),
+            branch.instructions[query + 1].clone(),
+            request,
+        ];
+        for (status, expected_requests) in [(0, 1), (1, 0), (255, 0)] {
+            let candidates = ResearchCandidateSet {
+                status,
+                ..Default::default()
+            };
+            let mut values = varset
+                .declarations
+                .iter()
+                .map(|cell| cell.default_value)
+                .collect::<Vec<_>>();
+            let mut requests = 0;
+            varset
+                .execute_event_prefix(
+                    &branch,
+                    None,
+                    &mut values,
+                    |instruction, _| match instruction.dispatch_selector() {
+                        ScriptDispatchSelector::Handler(56) => Ok(Some(VarSetDefault::Dword(
+                            super::scan_status(Some(&candidates)),
+                        ))),
+                        ScriptDispatchSelector::Handler(2) => {
+                            requests += 1;
+                            Ok(None)
+                        }
+                        other => Err(format!("unexpected callback {other:?}")),
+                    },
+                )
+                .unwrap();
+            assert_eq!(requests, expected_requests, "cached scan status {status}");
+        }
+    }
 
     #[test]
     fn catalog_uses_direct_dat_files_and_the_observed_ntfs_name_order() {
