@@ -134,6 +134,17 @@ impl PaidOrder {
 }
 
 impl Production {
+    pub(super) fn reserved_minds(&self, world: &World, owner: OwnerId) -> usize {
+        self.pending
+            .iter()
+            .filter(|order| {
+                order.owner == owner
+                    && identity_metadata(world, order.plant)
+                        .is_ok_and(|identity| identity.owner_id == Some(owner))
+            })
+            .count()
+    }
+
     pub(super) fn is_building_at(&self, plant: ObjectHandle, owner: OwnerId) -> bool {
         self.pending
             .iter()

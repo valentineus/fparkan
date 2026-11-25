@@ -206,8 +206,8 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) -> Vec<MissionNotice
                         .push(((order.owner.0, order.problem), order.plant));
                 }
                 eprintln!(
-                    "script_factory_order_approx clan={} plant={} duration_ms={duration} queue_time_ms={now_ms}",
-                    order.owner.0, order.plant.slot,
+                    "script_factory_order_approx clan={} plant={} class={:#010x} selection={} duration_ms={duration} queue_time_ms={now_ms}",
+                    order.owner.0, order.plant.slot, order.class, order.selection,
                 );
             }
             Err(error) => {
@@ -271,6 +271,7 @@ pub(super) struct ClanAiEvents {
     point_group_orders: BTreeMap<(usize, u32, u32), u64>,
     point_patrol_continues: BTreeMap<(usize, u32, u32), u64>,
     free_unit_queries: BTreeMap<(usize, u32, u32), u64>,
+    free_mind_queries: BTreeMap<usize, (u32, u32, u32, u64)>,
     group_recruitments: BTreeMap<(usize, u32), u64>,
     class_target_queries: BTreeMap<(usize, u32, u32), u64>,
     size_class_queries: BTreeMap<(usize, u32), u64>,
@@ -1173,13 +1174,23 @@ impl LoadedMissionState {
                         ScriptDispatchSelector::Handler(49)
                             if instruction.references.is_empty() =>
                         {
-                            let slots = self
+                            let capacity = self
                                 .ai_startup_states
                                 .iter()
-                                .find(|state| state.clan_index == clan);
-                            Ok(Some(VarSetDefault::Dword(
-                                slots.map_or(0, |state| count_free_minds(&state.record_slots)),
-                            )))
+                                .find(|state| state.clan_index == clan)
+                                .map_or(0, |state| state.record_slots.len());
+                            let owner = OwnerId(clan as u16);
+                            let reserved = production.map_or(0, |production| production.reserved_minds(world, owner))
+                                + orders.iter().filter(|order| order.owner == owner).count();
+                            let free = crate::clan_minds::free_slots(
+                                capacity, self.mission_events.clan_classes(world, owner), reserved,
+                            );
+                            let query = self.clan_ai_events.free_mind_queries.entry(clan).or_default();
+                            *query = (capacity as u32, free, reserved as u32, query.3 + 1);
+                            if query.3 == 1 {
+                                eprintln!("sim_coverage script_free_minds_approx=1 clan={clan} capacity={capacity} free={free} reserved={reserved}");
+                            }
+                            Ok(Some(VarSetDefault::Dword(free)))
                         }
                         ScriptDispatchSelector::Handler(34) => {
                             let &[index] = instruction.references.as_slice() else {
@@ -1383,10 +1394,6 @@ fn problem_operands<'a>(
     ))
 }
 
-fn count_free_minds(slots: &[u32]) -> u32 {
-    slots.iter().filter(|&&word| word == u32::MAX).count() as u32
-}
-
 fn storage_space(ores: &[BehaviorOreState], world: &World, clan: OwnerId) -> f32 {
     ores.iter()
         .filter(|ore| {
@@ -1401,6 +1408,16 @@ fn storage_space(ores: &[BehaviorOreState], world: &World, clan: OwnerId) -> f32
 }
 
 impl ClanAiEvents {
+    pub(super) fn free_mind_queries(
+        &self,
+    ) -> impl Iterator<Item = (usize, u32, u32, u32, u64)> + '_ {
+        self.free_mind_queries
+            .iter()
+            .map(|(&clan, &(capacity, free, reserved, count))| {
+                (clan, capacity, free, reserved, count)
+            })
+    }
+
     pub(super) fn base_threat_queries(&self) -> impl Iterator<Item = (usize, u32, u64)> + '_ {
         self.base_threat_queries
             .iter()
@@ -1967,12 +1984,6 @@ mod tests {
             .iter()
             .all(|&unit| patrol.has_object_order(unit, factory)));
         assert!(loaded.clan_ai_events.waits.contains_key(key));
-    }
-
-    #[test]
-    fn free_mind_count_uses_only_the_native_sentinel() {
-        assert_eq!(count_free_minds(&[]), 0);
-        assert_eq!(count_free_minds(&[u32::MAX, 0, u32::MAX, 1, 0xfffe]), 2);
     }
 
     #[test]

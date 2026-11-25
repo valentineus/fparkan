@@ -181,9 +181,17 @@ impl MissionEvents {
     }
 
     pub(super) fn count_clan_class(&self, world: &World, owner: OwnerId, class: u32) -> u32 {
-        clan_object_classes(&self.placed_clan_objects, world, owner)
+        self.clan_classes(world, owner)
             .filter(|&candidate| candidate == class)
             .count() as u32
+    }
+
+    pub(super) fn clan_classes<'a>(
+        &'a self,
+        world: &'a World,
+        owner: OwnerId,
+    ) -> impl Iterator<Item = u32> + 'a {
+        clan_object_classes(&self.placed_clan_objects, world, owner)
     }
 
     pub(super) fn first_available_placed_unit(

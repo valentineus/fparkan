@@ -92,6 +92,9 @@ pub(super) fn log_clan_ai_stops(report: &SimulationReport) {
     for &(clan, mode, count) in &report.script_group_recruitments {
         eprintln!("sim_coverage script_group_recruitment_approx={count} clan={clan} mode={mode}");
     }
+    for &(clan, capacity, free, reserved, count) in &report.script_free_mind_queries {
+        eprintln!("sim_coverage script_free_minds_approx={count} clan={clan} capacity={capacity} free={free} reserved={reserved}");
+    }
     for &(clan, class, target, count) in &report.script_class_target_queries {
         eprintln!("sim_coverage script_class_target_approx={count} clan={clan} class={class} target={target}");
     }

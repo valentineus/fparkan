@@ -54,6 +54,7 @@ mod clan_clock;
 pub use clan_clock::note_mission_pause_elapsed;
 mod clan_combat_groups;
 mod clan_combat_strength;
+mod clan_minds;
 mod clan_mining;
 mod clan_problem_conditions;
 mod clan_research;
@@ -2944,6 +2945,8 @@ pub struct SimulationReport {
     pub script_point_group_orders: Vec<(usize, u32, u32, u64)>,
     pub script_point_patrol_continues: Vec<(usize, u32, u32, u64)>,
     pub script_free_unit_queries: Vec<(usize, u32, u32, u64)>,
+    /// Clan, capacity, latest free/reserved mind counts, and approximate query count.
+    pub script_free_mind_queries: Vec<(usize, u32, u32, u32, u64)>,
     pub script_group_recruitments: Vec<(usize, u32, u64)>,
     pub script_unit_order_counts: Vec<(u32, u32, u64)>,
     pub script_class_target_queries: Vec<(usize, u32, u32, u64)>,
@@ -3013,6 +3016,7 @@ pub fn simulate_mission_report(
         script_point_group_orders: Vec::new(),
         script_point_patrol_continues: Vec::new(),
         script_free_unit_queries: Vec::new(),
+        script_free_mind_queries: Vec::new(),
         script_group_recruitments: Vec::new(),
         script_unit_order_counts: Vec::new(),
         script_class_target_queries: Vec::new(),
@@ -3153,6 +3157,9 @@ pub fn simulate_mission_report(
         report
             .script_free_unit_queries
             .extend(loaded.clan_ai_events.free_unit_queries());
+        report
+            .script_free_mind_queries
+            .extend(loaded.clan_ai_events.free_mind_queries());
         report
             .script_group_recruitments
             .extend(loaded.clan_ai_events.group_recruitments());
