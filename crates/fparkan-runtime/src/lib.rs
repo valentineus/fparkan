@@ -2972,6 +2972,7 @@ pub struct SimulationReport {
     pub script_group_orders: Vec<(usize, u32, u64)>,
     pub script_point_group_orders: Vec<(usize, u32, u32, u64)>,
     pub script_point_patrol_continues: Vec<(usize, u32, u32, u64)>,
+    pub script_free_unit_queries: Vec<(usize, u32, u32, u64)>,
     pub script_problem_waits: Vec<(usize, u32, u64)>,
     pub script_factory_patrol_continues: Vec<(usize, u32, u64)>,
     pub script_ore_transport_orders: Vec<(usize, u32, u64)>,
@@ -3030,6 +3031,7 @@ pub fn simulate_mission_report(
         script_group_orders: Vec::new(),
         script_point_group_orders: Vec::new(),
         script_point_patrol_continues: Vec::new(),
+        script_free_unit_queries: Vec::new(),
         script_problem_waits: Vec::new(),
         script_factory_patrol_continues: Vec::new(),
         script_ore_transport_orders: Vec::new(),
@@ -3143,6 +3145,9 @@ pub fn simulate_mission_report(
         report
             .script_point_patrol_continues
             .extend(loaded.clan_ai_events.point_patrol_continues());
+        report
+            .script_free_unit_queries
+            .extend(loaded.clan_ai_events.free_unit_queries());
         report
             .script_problem_waits
             .extend(loaded.clan_ai_events.wait_starts());

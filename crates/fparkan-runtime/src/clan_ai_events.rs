@@ -250,6 +250,7 @@ pub(super) struct ClanAiEvents {
     group_orders: BTreeMap<(usize, u32), u64>,
     point_group_orders: BTreeMap<(usize, u32, u32), u64>,
     point_patrol_continues: BTreeMap<(usize, u32, u32), u64>,
+    free_unit_queries: BTreeMap<(usize, u32, u32), u64>,
 }
 
 impl LoadedMissionState {
@@ -573,17 +574,30 @@ impl LoadedMissionState {
                             // shortcut: include unfinished structures once construction registers with the roster.
                             Ok(Some(VarSetDefault::Dword(u32::from(count >= limit))))
                         }
-                        ScriptDispatchSelector::Handler(13)
-                            if instruction.dword_pair(values)
-                                == Some((0, crate::mining::MINE_CLASS)) =>
-                        {
+                        ScriptDispatchSelector::Handler(13) => {
+                            let (mode, class) = instruction.dword_pair(values)
+                                .ok_or("Handler(13) requires a unit mode and class")?;
+                            if mode != 0 {
+                                return Err("Handler(13) only supports UNIT_FREE_UNIT".into());
+                            }
+                            let owner = OwnerId(clan as u16);
+                            // shortcut: infer roster occupancy from runtime jobs until native problem-slot ownership is wired.
                             let id = self.mission_events.first_available_placed_unit(
                                 &self.mission,
                                 world,
                                 clan,
-                                crate::mining::MINE_CLASS,
-                            );
-                            Ok(Some(VarSetDefault::Dword(id.unwrap_or(u32::MAX))))
+                                class,
+                                |unit| !self.clan_ai_events.unit_assigned(unit)
+                                    && !self.construction.active(unit)
+                                    && !production.is_some_and(|queue| queue.is_building_at(unit, owner))
+                                    && !orders.iter().any(|order: &ScriptFactoryOrder| order.plant == unit),
+                            ).unwrap_or(u32::MAX);
+                            let count = self.clan_ai_events.free_unit_queries.entry((clan, class, id)).or_default();
+                            *count += 1;
+                            if *count == 1 {
+                                eprintln!("sim_coverage script_free_unit_approx=1 clan={clan} class={class} unit={id}");
+                            }
+                            Ok(Some(VarSetDefault::Dword(id)))
                         }
                         ScriptDispatchSelector::Handler(15) => {
                             let order = varset
@@ -891,7 +905,7 @@ impl LoadedMissionState {
                                 return Err("Handler(14) only supports UNIT_ANY_UNIT".into());
                             }
                             let id = self.mission_events.first_available_placed_unit(
-                                &self.mission, world, clan, class,
+                                &self.mission, world, clan, class, |_| true,
                             );
                             Ok(Some(VarSetDefault::Dword(id.unwrap_or(u32::MAX))))
                         }
@@ -1320,9 +1334,15 @@ impl ClanAiEvents {
     }
 
     fn unit_assigned(&self, unit: ObjectHandle) -> bool {
-        self.capture_orders
-            .iter()
-            .any(|&(_, _, order)| order.unit == unit)
+        self.factory_jobs.iter().any(|&(_, plant)| plant == unit)
+            || self
+                .transports
+                .iter()
+                .any(|(_, transport)| transport.unit == unit)
+            || self
+                .capture_orders
+                .iter()
+                .any(|&(_, _, order)| order.unit == unit)
             || self
                 .groups
                 .values()
@@ -1333,6 +1353,12 @@ impl ClanAiEvents {
         self.group_orders
             .iter()
             .map(|(&(clan, target), &count)| (clan, target, count))
+    }
+
+    pub(super) fn free_unit_queries(&self) -> impl Iterator<Item = (usize, u32, u32, u64)> + '_ {
+        self.free_unit_queries
+            .iter()
+            .map(|(&(clan, class, unit), &count)| (clan, class, unit, count))
     }
 
     pub(super) fn point_group_orders(&self) -> impl Iterator<Item = (usize, u32, u32, u64)> + '_ {
@@ -1465,6 +1491,51 @@ impl ClanAiEvents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_free_factory_query_dispatches_robot_production_from_stock_start() {
+        use crate::{EngineServices, MissionMode, MissionRequest, MissionStartupInput};
+        use fparkan_vfs::DirectoryVfs;
+        use std::sync::Arc;
+
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed corpus root");
+        let mut engine =
+            crate::create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
+        crate::load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/CAMPAIGN/CAMPAIGN.01/Mission.03/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+
+        for now in (0..=90_000).step_by(100) {
+            crate::frame(&mut engine, now).unwrap();
+        }
+        let loaded = engine.loaded.as_ref().unwrap();
+        assert!(loaded
+            .clan_ai_events
+            .free_unit_queries()
+            .any(|(clan, class, id, count)| {
+                clan == 1 && class == 0x8000_0010 && id != u32::MAX && count > 0
+            }));
+        assert!(loaded
+            .clan_ai_events
+            .factory_orders
+            .iter()
+            .any(|(&(owner, _), &count)| owner == 1 && count > 0));
+        assert!(loaded
+            .clan_ai_events
+            .stops()
+            .all(|(stop, _)| !stop.reason.starts_with("Handler(13)")));
+    }
 
     #[test]
     #[ignore = "requires licensed corpus"]

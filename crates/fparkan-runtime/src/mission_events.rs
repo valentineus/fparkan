@@ -188,11 +188,15 @@ impl MissionEvents {
         world: &World,
         clan: usize,
         class: u32,
+        available: impl Fn(ObjectHandle) -> bool,
     ) -> Option<u32> {
         self.placed_clan_objects
             .iter()
             .find_map(|&(handle, candidate)| {
-                if candidate != class || self.reserved_units.contains(&(clan, handle)) {
+                if candidate != class
+                    || self.reserved_units.contains(&(clan, handle))
+                    || !available(handle)
+                {
                     return None;
                 }
                 registration_sequence(world, handle).ok()??;
@@ -1093,6 +1097,73 @@ mod tests {
         construct_object, new, register_object, request_delete, set_owner, ObjectDraft, OwnerId,
         WorldConfig,
     };
+
+    #[test]
+    fn free_unit_selection_skips_busy_reserved_foreign_and_removed_entries() {
+        let mission = crate::MissionDocument {
+            format_version: 1,
+            clan_section_version: 6,
+            object_section_version: 10,
+            extra_section_version: 1,
+            versions: vec![],
+            paths: vec![],
+            clans: vec![],
+            objects: vec![],
+            land_path: Default::default(),
+            mission_flag: 0,
+            description_raw: Default::default(),
+            extras: vec![],
+            raw: std::sync::Arc::from([]),
+        };
+        let mut world = new(WorldConfig);
+        let factory = 0x8000_0010;
+        let mut events = MissionEvents::default();
+        let entries = [
+            (91, 0x0100_8000, 1),
+            (12345, factory, 1),
+            (45678, factory, 1),
+            (45679, factory, 2),
+        ]
+        .map(|(id, class, owner)| {
+            let unit = construct_object(&mut world, ObjectDraft { original_id: None }).unwrap();
+            set_owner(&mut world, unit, Some(OwnerId(owner))).unwrap();
+            register_object(&mut world, unit).unwrap();
+            events.placed_clan_objects.push((unit, class));
+            events.issued_logic_ids.insert(unit, id);
+            unit
+        });
+        assert_eq!(
+            events.first_available_placed_unit(&mission, &world, 1, factory, |_| true),
+            Some(12345)
+        );
+        assert_eq!(
+            events.first_available_placed_unit(&mission, &world, 1, factory, |unit| unit
+                != entries[1]),
+            Some(45678)
+        );
+        events.reserved_units.insert((1, entries[1]));
+        assert_eq!(
+            events.first_available_placed_unit(&mission, &world, 1, factory, |_| true),
+            Some(45678)
+        );
+        events.reserved_units.insert((1, entries[2]));
+        assert_eq!(
+            events.first_available_placed_unit(&mission, &world, 1, factory, |_| true),
+            None
+        );
+        events.reserved_units.remove(&(1, entries[2]));
+        request_delete(&mut world, entries[2]).unwrap();
+        assert_eq!(
+            events.first_available_placed_unit(&mission, &world, 1, factory, |_| true),
+            None
+        );
+        events.reserved_units.clear();
+        set_owner(&mut world, entries[1], Some(OwnerId(2))).unwrap();
+        assert_eq!(
+            events.first_available_placed_unit(&mission, &world, 1, factory, |_| true),
+            None
+        );
+    }
 
     #[test]
     #[ignore = "requires licensed corpus"]
