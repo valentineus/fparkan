@@ -127,7 +127,7 @@ impl Laboratories {
 
 pub(super) fn order(
     state: &mut Laboratories,
-    catalogs: &BTreeMap<usize, crate::clan_research::ClanResearch>,
+    catalogs: &mut BTreeMap<usize, crate::clan_research::ClanResearch>,
     drafts: &[crate::MissionObjectDraft],
     free: &crate::research::FreeResearch,
     world: &World,
@@ -136,9 +136,6 @@ pub(super) fn order(
     lab: ObjectHandle,
     now_ms: u32,
 ) -> Result<(), String> {
-    if state.active(lab) || free.active(lab) {
-        return Err("laboratory is busy".into());
-    }
     let owner = OwnerId(u16::try_from(clan).map_err(|_| "invalid research clan")?);
     let identity = identity_metadata(world, lab).map_err(|error| error.to_string())?;
     if identity.owner_id != Some(owner) {
@@ -154,8 +151,12 @@ pub(super) fn order(
     }
     let vfs = vfs.ok_or("research VFS is unavailable")?;
     let catalog = catalogs
-        .get(&clan)
+        .get_mut(&clan)
         .ok_or("research catalog is unavailable")?;
+    catalog.refresh(vfs)?;
+    if state.active(lab) || free.active(lab) {
+        return Err("laboratory is busy".into());
+    }
     let selected = catalog
         .candidates
         .entries
@@ -419,7 +420,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
-    fn licensed_stock_ai_laboratories_finish_a_technology_and_release_the_lab() {
+    fn licensed_stock_ai_laboratories_continue_research_and_keep_the_request_pending() {
         use crate::{
             create, frame, load_gameplay_mission, EngineServices, MissionMode, MissionRequest,
             MissionStartupInput,
@@ -465,11 +466,27 @@ mod tests {
         );
         assert!(!loaded.free_research.learned.is_empty());
         assert!(loaded.laboratories.stopped.is_empty());
+        for clan in [1, 2] {
+            assert!(
+                loaded
+                    .laboratories
+                    .completed
+                    .keys()
+                    .filter(|&&(owner, _, _)| owner == clan)
+                    .count()
+                    >= 2,
+                "clan {clan} did not continue research after its first project"
+            );
+        }
         assert!(
-            loaded.laboratories.tasks.is_empty(),
-            "laboratory remained busy"
+            !loaded.laboratories.available.is_empty(),
+            "later projects did not unlock technologies"
         );
         for &(clan, _, row, _) in &loaded.laboratories.report().completed {
+            assert!(loaded
+                .free_research
+                .learned
+                .contains(&(OwnerId(clan as u16), row)));
             assert_eq!(
                 loaded.clan_ai_events.research_catalogs[&clan]
                     .table

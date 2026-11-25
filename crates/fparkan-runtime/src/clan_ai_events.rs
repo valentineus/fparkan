@@ -1055,7 +1055,7 @@ impl LoadedMissionState {
                             )
                             .find(|handle| Some(*handle) == assignment);
                             let Some(lab) = lab else { return Ok(Some(VarSetDefault::Dword(u32::MAX))); };
-                            let result = crate::laboratory::order(&mut self.laboratories, &self.clan_ai_events.research_catalogs,
+                            let result = crate::laboratory::order(&mut self.laboratories, &mut self.clan_ai_events.research_catalogs,
                                 &self.object_drafts, &self.free_research, world, vfs, clan, lab, now_ms);
                             if let Err(reason) = &result { self.laboratories.rejected(clan, lab, reason); }
                             Ok(Some(VarSetDefault::Dword(u32::from(result.is_ok()))))
