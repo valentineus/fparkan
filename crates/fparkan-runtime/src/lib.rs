@@ -51,6 +51,8 @@ mod clan_area_strength;
 mod clan_build_limits;
 mod clan_building_queries;
 mod clan_clock;
+mod combat_report;
+pub use combat_report::{CombatObject, CombatOccurrences, CombatReport};
 mod control_profile;
 mod control_resources;
 mod mobile_budget;
@@ -2993,6 +2995,7 @@ pub struct SimulationReport {
     pub patrol_speeds: PatrolSpeedReport,
     pub control_profiles: ControlProfileReport,
     pub mobile_budget: MobileBudgetReport,
+    pub combat: CombatReport,
     /// Approximate clan strength queries, grouped by caller and target clan.
     pub script_strength_queries: Vec<(usize, u16, u64)>,
     pub script_capture_queries: Vec<(usize, u64)>,
@@ -3074,6 +3077,7 @@ pub fn simulate_mission_report(
         patrol_speeds: PatrolSpeedReport::default(),
         control_profiles: ControlProfileReport::default(),
         mobile_budget: MobileBudgetReport::default(),
+        combat: CombatReport::default(),
         script_strength_queries: Vec::new(),
         script_capture_queries: Vec::new(),
         script_attack_queries: Vec::new(),
@@ -3201,6 +3205,7 @@ pub fn simulate_mission_report(
         }
         if let Some(combat) = &engine.autodemo_combat {
             report.weapon_poses = combat.pose_report().clone();
+            report.combat = combat.report.clone();
         }
         for problem in loaded.clan_ai_events.pending_problems() {
             *report

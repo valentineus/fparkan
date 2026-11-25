@@ -1,6 +1,7 @@
 use super::{
     apply_projectile_contact,
     autodemo::MOBILE_UNIT,
+    combat_report::{CombatObject, CombatReport},
     player_weapon::prepare_unit_weapons,
     projectile::{load_projectile, segment_sphere_fraction, unit_sphere},
     projectile_terrain_hit, projectile_unit_hit,
@@ -70,6 +71,7 @@ pub(super) struct AutoDemoCombat {
     projectiles: Vec<AutoDemoProjectileType>,
     flights: Vec<Flight>,
     pose_failures: super::WeaponPoseReport,
+    pub(super) report: CombatReport,
     pub(super) unavailable: usize,
 }
 
@@ -93,6 +95,7 @@ struct Unit {
 
 struct Flight {
     shooter: ObjectHandle,
+    shooter_identity: CombatObject,
     projectile: usize,
     pose: PlayerProjectile,
 }
@@ -131,6 +134,7 @@ impl AutoDemoCombat {
             projectiles: Vec::new(),
             flights: Vec::new(),
             pose_failures: super::WeaponPoseReport::default(),
+            report: CombatReport::default(),
             unavailable: 0,
         };
         for (index, (draft, &handle)) in drafts.iter().zip(handles).enumerate() {
@@ -140,6 +144,11 @@ impl AutoDemoCombat {
             {
                 continue;
             }
+            let object = CombatObject {
+                slot: handle.slot,
+                generation: handle.generation,
+                original_id: draft.original_id.map(|id| id.0),
+            };
             let weapons = prepare_unit_weapons(
                 assets
                     .object_component_controls
@@ -162,6 +171,7 @@ impl AutoDemoCombat {
                         .or_else(|| {
                             let Ok(data) = load_projectile(vfs, archive, name) else {
                                 battle.unavailable += 1;
+                                battle.report.unavailable(object, "projectile_load", 0, 1);
                                 return None;
                             };
                             battle.projectiles.push(AutoDemoProjectileType {
@@ -182,6 +192,9 @@ impl AutoDemoCombat {
                 })
                 .collect();
             battle.unavailable += usize::from(weapons.weapons().is_empty());
+            if weapons.weapons().is_empty() {
+                battle.report.unavailable(object, "empty_weapon_bank", 0, 1);
+            }
             let units = if index < reserve_start {
                 &mut battle.units
             } else {
@@ -332,14 +345,19 @@ impl AutoDemoCombat {
             });
             if let Some(hit) = contact {
                 let data = &self.projectiles[flight.projectile];
+                // Capture the target before applying damage, which may remove it.
+                let target = CombatObject::read(&engine.world, hit.handle);
                 match data
                     .volume
                     .map(|volume| apply_projectile_contact(engine, hit, volume))
                 {
-                    Some(Ok(Some((_, true)))) => events.push(AutoDemoCombatEvent::Destroyed {
-                        shooter: flight.shooter,
-                        target: hit.handle,
-                    }),
+                    Some(Ok(Some((_, true)))) => {
+                        self.report.destroyed(flight.shooter_identity, target, now);
+                        events.push(AutoDemoCombatEvent::Destroyed {
+                            shooter: flight.shooter,
+                            target: hit.handle,
+                        });
+                    }
                     Some(Ok(Some((remaining, false)))) => {
                         if let Some(node) = hit.building_node {
                             events.push(AutoDemoCombatEvent::BuildingHit {
@@ -350,13 +368,25 @@ impl AutoDemoCombat {
                             });
                         }
                     }
-                    _ => unavailable += 1,
+                    result => {
+                        unavailable += 1;
+                        let reason = match &result {
+                            None => "projectile_volume",
+                            Some(Ok(_)) => "damage_unavailable",
+                            Some(Err(_)) => "damage_error",
+                        };
+                        if self.report.unavailable(flight.shooter_identity, reason, now, 1) {
+                            eprintln!("unit_combat_contact object={} target={target} target_id={:?} node={:?} result={result:?}", flight.shooter_identity, target.original_id, hit.building_node);
+                        }
+                    }
                 }
             }
             match stays {
                 Ok(stays) => stays,
                 Err(_) => {
                     unavailable += 1;
+                    self.report
+                        .unavailable(flight.shooter_identity, "projectile_advance", now, 1);
                     false
                 }
             }
@@ -374,6 +404,7 @@ impl AutoDemoCombat {
             let Ok(state) = transform_state(&engine.world, unit.handle) else {
                 continue;
             };
+            let shooter = CombatObject::read(&engine.world, unit.handle);
             if unit.weapons.weapons().is_empty() {
                 continue;
             }
@@ -447,7 +478,12 @@ impl AutoDemoCombat {
                 };
                 clear(from, to, radius)
             }) {
-                let (Some((target, to, radius)), Some(projectile)) = (aim, unit.slots[slot]) else {
+                let Some((target, to, radius)) = aim else {
+                    continue;
+                };
+                let Some(projectile) = unit.slots[slot] else {
+                    unavailable += 1;
+                    self.report.unavailable(shooter, "projectile_slot", now, 1);
                     continue;
                 };
                 let Some(from) = poses.muzzle(state, weapon.component_index, barrel) else {
@@ -464,14 +500,21 @@ impl AutoDemoCombat {
                 {
                     self.flights.push(Flight {
                         shooter: unit.handle,
+                        shooter_identity: shooter,
                         projectile,
                         pose,
                     });
+                    self.report
+                        .shot(shooter, CombatObject::read(&engine.world, target), now);
                     events.push(AutoDemoCombatEvent::Shot {
                         shooter: unit.handle,
                         target,
                         projectile,
                     });
+                } else {
+                    unavailable += 1;
+                    self.report
+                        .unavailable(shooter, "projectile_launch", now, 1);
                 }
             }
             missing += due_missing;
@@ -488,6 +531,8 @@ impl AutoDemoCombat {
                     );
                 }
                 *count += missing;
+                self.report
+                    .unavailable(shooter, "weapon_pose", now, missing);
                 unavailable += missing as usize;
             }
         }
@@ -532,7 +577,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
-    fn licensed_autodemo_shots_start_outside_the_hull_center() {
+    fn licensed_autodemo_combat_preserves_muzzles_and_event_identities() {
         let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed corpus");
         let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
         load_gameplay_mission(
@@ -548,17 +593,36 @@ mod tests {
             None,
         )
         .unwrap();
+        let mut observed_shots = 0;
+        let mut observed_unavailable = engine.autodemo_combat.as_ref().unwrap().unavailable as u64;
         for now in (0..=120_000).step_by(50) {
             let frame = frame(&mut engine, now).unwrap();
+            observed_unavailable += frame.autodemo_combat_unavailable as u64;
             let shots = frame
                 .autodemo_combat_events
                 .iter()
                 .filter(|event| matches!(event, AutoDemoCombatEvent::Shot { .. }))
                 .count();
-            if shots == 0 {
-                continue;
-            }
+            observed_shots += shots as u64;
             let combat = engine.autodemo_combat.as_ref().unwrap();
+            assert_eq!(
+                combat
+                    .report
+                    .shots
+                    .values()
+                    .map(|total| total.count)
+                    .sum::<u64>(),
+                observed_shots
+            );
+            assert_eq!(
+                combat
+                    .report
+                    .unavailable
+                    .values()
+                    .map(|total| total.count)
+                    .sum::<u64>(),
+                observed_unavailable
+            );
             assert!(combat.flights.len() >= shots);
             for flight in combat.flights.iter().rev().take(shots) {
                 let shooter = combat
@@ -583,9 +647,28 @@ mod tests {
                 assert!(separation > 0.01, "projectile still starts at hull center");
             }
             assert!(combat.pose_report().missing.is_empty());
-            return;
+            if let Some(AutoDemoCombatEvent::Destroyed { target, .. }) = frame
+                .autodemo_combat_events
+                .iter()
+                .find(|event| matches!(event, AutoDemoCombatEvent::Destroyed { .. }))
+            {
+                assert!(identity_metadata(&engine.world, *target).is_err());
+                let ((_, retired), total) = combat
+                    .report
+                    .destroyed
+                    .iter()
+                    .find(|((_, object), _)| {
+                        object.slot == target.slot && object.generation == target.generation
+                    })
+                    .expect("removed target is still reported");
+                assert!(retired.original_id.is_some());
+                assert_eq!(total.first_ms, now);
+                assert_eq!(total.count, 1);
+                assert!(observed_shots > 0);
+                return;
+            }
         }
-        panic!("stock AutoDemo did not fire");
+        panic!("stock AutoDemo did not destroy a unit");
     }
 
     #[test]

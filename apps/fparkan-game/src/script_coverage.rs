@@ -21,6 +21,15 @@ pub(super) fn log_script_init(engine: &Engine, mission: &str) {
 }
 
 pub(super) fn log_clan_ai_stops(report: &SimulationReport) {
+    for ((shooter, target), total) in &report.combat.shots {
+        eprintln!("sim_combat shots={} shooter={shooter} target={target} shooter_id={:?} target_id={:?} first_ms={} last_ms={}", total.count, shooter.original_id, target.original_id, total.first_ms, total.last_ms);
+    }
+    for ((shooter, target), total) in &report.combat.destroyed {
+        eprintln!("sim_combat destroyed={} shooter={shooter} target={target} shooter_id={:?} target_id={:?} first_ms={} last_ms={}", total.count, shooter.original_id, target.original_id, total.first_ms, total.last_ms);
+    }
+    for ((object, reason), total) in &report.combat.unavailable {
+        eprintln!("sim_coverage unit_combat_unavailable={} object={object} original_id={:?} reason={reason} first_ms={} last_ms={}", total.count, object.original_id, total.first_ms, total.last_ms);
+    }
     for (object, count) in &report.mobile_budget.ticks {
         eprintln!("sim_coverage control_mobile_budget_approx={count} object={object}");
     }
