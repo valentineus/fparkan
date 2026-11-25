@@ -4,6 +4,10 @@ use fparkan_script::{
 };
 
 pub(super) enum InitOrder {
+    ResearchCatalog {
+        clan: usize,
+        instruction_index: usize,
+    },
     BaseRadius {
         clan: usize,
         limit: f32,
@@ -15,6 +19,13 @@ pub(super) enum InitOrder {
         id: u32,
         reserved: bool,
     },
+}
+
+pub(super) fn research_catalog(instruction: &ScriptInstruction) -> bool {
+    matches!(
+        (instruction.header_words, instruction.references.as_slice()),
+        ([43, u32::MAX, u32::MAX, u32::MAX, 6, 0, u32::MAX], [])
+    )
 }
 
 pub(super) fn base_radius(
@@ -69,8 +80,6 @@ pub(super) fn stubbed_handler(
     declarations: &VarSet,
 ) -> Option<u8> {
     match (instruction.header_words, instruction.references.as_slice()) {
-        // shortcut: resume Init until the live research context is wired.
-        ([43, u32::MAX, u32::MAX, u32::MAX, 6, 0, u32::MAX], []) => Some(43),
         // shortcut: resume Init until the AI consumer of this setting is wired.
         ([69, u32::MAX, u32::MAX, u32::MAX, 6, 1, u32::MAX], [index])
             if matches!(values.get(*index as usize), Some(VarSetDefault::Dword(_))) =>
@@ -97,14 +106,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_no_result_research_refresh_is_stubbed() {
+    fn research_catalog_requires_the_no_result_refresh_form() {
         let mut instruction = ScriptInstruction {
             header_words: [43, u32::MAX, u32::MAX, u32::MAX, 6, 0, u32::MAX],
             references: Vec::new(),
         };
         let declarations = fparkan_script::parse_varset(b"").unwrap();
-        assert_eq!(stubbed_handler(&instruction, &[], &declarations), Some(43));
+        assert!(research_catalog(&instruction));
+        assert_eq!(stubbed_handler(&instruction, &[], &declarations), None);
         instruction.header_words[1] = 0;
+        assert!(!research_catalog(&instruction));
         assert_eq!(stubbed_handler(&instruction, &[], &declarations), None);
     }
 

@@ -172,7 +172,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
-    fn licensed_new_lab_rejects_an_unloaded_catalog_without_stopping_the_script() {
+    fn licensed_new_lab_rejects_an_unwired_research_task_without_stopping_the_script() {
         let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").unwrap();
         let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
         load_gameplay_mission(

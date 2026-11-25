@@ -53,6 +53,7 @@ mod clan_combat_groups;
 mod clan_combat_strength;
 mod clan_mining;
 mod clan_problem_conditions;
+mod clan_research;
 mod clan_script_init;
 mod clan_targeting;
 mod clan_transport_schemes;
@@ -2564,6 +2565,17 @@ fn load_mission_with_options(
     let mut clan_ai_events = clan_ai_events::ClanAiEvents::default();
     for order in init_orders {
         match order {
+            clan_script_init::InitOrder::ResearchCatalog {
+                clan,
+                instruction_index,
+            } => clan_research::initialize(
+                vfs.as_ref(),
+                &mission,
+                &mut clan_ai_events,
+                &mut loaded_scripts.bundles,
+                clan,
+                instruction_index,
+            ),
             clan_script_init::InitOrder::BaseRadius { clan, limit } => {
                 clan_ai_events.set_base_radius(clan, limit);
             }
@@ -2909,6 +2921,7 @@ pub struct SimulationReport {
     pub clan_ai_event_stops: Vec<(MissionEventStop, u64)>,
     /// Calls to stubbed research policy or status, grouped by clan and handler.
     pub clan_research_status_stubs: Vec<(usize, u8, u64)>,
+    pub clan_research_catalogs: Vec<(usize, usize, u32)>,
     /// Counts of pending script problems by clan and problem kind.
     pub clan_problem_dispatch_stubs: std::collections::BTreeMap<(usize, u32), u64>,
     /// Starts under the approximate scheduler, grouped by clan and problem kind.
@@ -2980,6 +2993,7 @@ pub fn simulate_mission_report(
         mission_event_stops: Vec::new(),
         clan_ai_event_stops: Vec::new(),
         clan_research_status_stubs: Vec::new(),
+        clan_research_catalogs: Vec::new(),
         clan_problem_dispatch_stubs: Default::default(),
         clan_problem_starts: Vec::new(),
         script_factory_rejections: Vec::new(),
@@ -3080,6 +3094,9 @@ pub fn simulate_mission_report(
         report
             .clan_research_status_stubs
             .extend(loaded.clan_ai_events.research_status_stubs());
+        report
+            .clan_research_catalogs
+            .extend(loaded.clan_ai_events.research_catalogs());
         for problem in loaded.clan_ai_events.pending_problems() {
             *report
                 .clan_problem_dispatch_stubs
@@ -8403,6 +8420,13 @@ fn resolve_init_states(
                     }
                     if let Some(limit) = clan_script_init::base_radius(instruction, values) {
                         init_orders.push(clan_script_init::InitOrder::BaseRadius { clan, limit });
+                        return Some(None);
+                    }
+                    if clan_script_init::research_catalog(instruction) {
+                        init_orders.push(clan_script_init::InitOrder::ResearchCatalog {
+                            clan,
+                            instruction_index: index,
+                        });
                         return Some(None);
                     }
                     if let Some(order) =
@@ -16388,7 +16412,7 @@ mod tests {
             &mut Vec::new(),
         )
         .expect("partial Init keeps the prefix and continues with the next clan");
-        assert_eq!(partial_bundles[0].init_stubs, vec![(1, 43)]);
+        assert!(partial_bundles[0].init_stubs.is_empty());
         assert!(matches!(
             partial_bundles[0].init_execution,
             MissionScriptInitExecution::Unsupported {

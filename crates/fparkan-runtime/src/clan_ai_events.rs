@@ -229,6 +229,7 @@ pub(super) struct ClanAiEvents {
     next_ms: BTreeMap<usize, u32>,
     stops: BTreeMap<(usize, usize, usize), (MissionEventStop, u64)>,
     research_stubs: BTreeMap<(usize, u8), u64>,
+    pub(super) research_catalogs: BTreeMap<usize, crate::clan_research::ClanResearch>,
     problems: BTreeMap<usize, Handler2RecordScheduler>,
     started: BTreeMap<(usize, u32), u64>,
     factory_orders: BTreeMap<(u16, u32), u64>,
@@ -1048,7 +1049,7 @@ impl LoadedMissionState {
                                 id,
                             )
                             .any(|handle| Some(handle) == assignment);
-                            // shortcut: an unloaded candidate catalog rejects the order; wire lab dispatch with Handler(43).
+                            // shortcut: reject the order until the native laboratory research task is wired.
                             self.clan_ai_events
                                 .log_research_stub(clan, 41, &bundle.script_path);
                             Ok(Some(VarSetDefault::Dword(if exists {

@@ -23,27 +23,16 @@ pub(super) fn available(
     if clans.peek().is_none() {
         return Vec::new();
     }
-    let directory = crate::normalize_engine_path("AI transport", "UNITS/UNITS/AI")
-        .expect("static AI catalog path");
-    let paths = vfs.list(&directory).unwrap_or_default();
+    let paths = crate::clan_research::paths(vfs).unwrap_or_default();
     let entries: Vec<_> = paths
         .into_iter()
-        .filter_map(|entry| {
-            let relative = entry.path.as_str().rsplit_once('/')?;
-            if !relative.0.eq_ignore_ascii_case(directory.as_str())
-                || !relative.1.to_ascii_lowercase().ends_with(".dat")
-            {
-                return None;
-            }
-            let bytes = vfs.read(&entry.path).ok()?;
+        .filter_map(|path| {
+            let bytes = vfs.read(&path).ok()?;
             let header = fparkan_prototype::decode_unit_dat(&bytes)
                 .ok()?
                 .header_opaque;
             let class = u32::from_le_bytes(header[4..].try_into().unwrap());
-            (class == TRANSPORT_CLASS).then_some(ResearchCandidate {
-                path: entry.path,
-                status: 0,
-            })
+            (class == TRANSPORT_CLASS).then_some(ResearchCandidate { path, status: 0 })
         })
         .collect();
     clans
