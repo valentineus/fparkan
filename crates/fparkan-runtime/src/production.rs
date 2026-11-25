@@ -1113,11 +1113,11 @@ mod tests {
         }
         let loaded = engine.loaded.as_ref().unwrap();
         assert!(loaded
-            .factory_resources
+            .control_resources
             .ticks()
             .any(|(unit, count)| unit == plant.slot && count > 0));
         assert!(!loaded
-            .factory_resources
+            .control_resources
             .stops()
             .any(|(unit, _, _)| unit == plant.slot));
         let table = loaded

@@ -1369,7 +1369,7 @@ struct LoadedMissionState {
     research_trf_tables: Vec<MissionResearchTrfTable>,
     free_research: research::FreeResearch,
     laboratories: laboratory::Laboratories,
-    factory_resources: control_resources::FactoryResources,
+    control_resources: control_resources::Resources,
     ai_startup_states: Vec<MissionAiStartupState>,
     script_bundles: Vec<MissionScriptBundle>,
     script_varset: Option<MissionScriptVarSet>,
@@ -2699,7 +2699,7 @@ fn load_mission_with_options(
         research_trf_tables,
         free_research,
         laboratories: Default::default(),
-        factory_resources: Default::default(),
+        control_resources: Default::default(),
         ai_startup_states: loaded_scripts.ai_startup_states,
         script_bundles: loaded_scripts.bundles,
         script_varset: loaded_scripts.varset,
@@ -2947,8 +2947,8 @@ pub struct SimulationReport {
     pub script_factory_orders: Vec<(u16, u32, u64)>,
     /// Active factory task updates; idle owner phases and global RNG order remain approximate.
     pub factory_clock_ticks: Vec<(u16, u32, u64)>,
-    pub factory_control_ticks: Vec<(u32, u64)>,
-    pub factory_control_stops: Vec<(u32, u64, String)>,
+    pub control_resource_ticks: Vec<(u32, u64)>,
+    pub control_resource_stops: Vec<(u32, u64, String)>,
     /// Approximate clan strength queries, grouped by caller and target clan.
     pub script_strength_queries: Vec<(usize, u16, u64)>,
     pub script_capture_queries: Vec<(usize, u64)>,
@@ -3023,8 +3023,8 @@ pub fn simulate_mission_report(
         script_factory_rejections: Vec::new(),
         script_factory_orders: Vec::new(),
         factory_clock_ticks: Vec::new(),
-        factory_control_ticks: Vec::new(),
-        factory_control_stops: Vec::new(),
+        control_resource_ticks: Vec::new(),
+        control_resource_stops: Vec::new(),
         script_strength_queries: Vec::new(),
         script_capture_queries: Vec::new(),
         script_attack_queries: Vec::new(),
@@ -3133,11 +3133,11 @@ pub fn simulate_mission_report(
             .extend(loaded.clan_ai_events.research_catalogs());
         report.laboratory = loaded.laboratories.report();
         report
-            .factory_control_ticks
-            .extend(loaded.factory_resources.ticks());
-        report.factory_control_stops.extend(
+            .control_resource_ticks
+            .extend(loaded.control_resources.ticks());
+        report.control_resource_stops.extend(
             loaded
-                .factory_resources
+                .control_resources
                 .stops()
                 .map(|(unit, count, reason)| (unit, count, reason.to_owned())),
         );
@@ -3743,7 +3743,7 @@ pub fn query_loaded_mission_control_resource(
 /// readers use the device key to read the current provider value and multiply
 /// it by coefficient 0. Only current tag 26 also multiplies by `M`; current
 /// tag 5 ignores `M` and descriptor word 8 for this selector. Explicit Control
-/// update calls can change current provider or multiplier values; factory
+/// update calls can change current provider or multiplier values; factory and laboratory
 /// resource budgets also advance during mission steps. Selector `6` first checks the
 /// current descriptor tag: a non-2 tag returns `Ok(None)`. For the represented
 /// factory-2 layout it reads `+0x174`, subject to the normal-or-zero float
@@ -3812,7 +3812,7 @@ pub fn set_loaded_mission_control_device_selector(
 /// `Transfer_Ore_OffBoard` value. Unsupported table/query paths return an error.
 /// Profile values come from full mission loading, while `0xe00` reads the
 /// current CPU-projected provider and device state. Explicit Control updates
-/// can therefore change `0x1002`; factory Control resource budgets also run
+/// can therefore change `0x1002`; factory and laboratory Control resource budgets also run
 /// during mission steps.
 ///
 /// # Errors
@@ -4114,7 +4114,7 @@ pub fn distribute_loaded_mission_control_provider_amount(
 /// The pass supports the original factory callbacks for tags 9, 15, 19, and 26,
 /// plus the generic default callback pair. Current descriptor category tags are
 /// supported for the native map prefix `0..=34`. This is an explicit CPU update;
-/// factories also run this pass on their resource clock. Rate outputs at `+0x5dc/+0x5e0` are
+/// factories and laboratories also run it on their resource clock. Rate outputs at `+0x5dc/+0x5e0` are
 /// stored on the table after a successful pass.
 ///
 /// # Errors

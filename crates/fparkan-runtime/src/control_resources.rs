@@ -2,15 +2,15 @@ use crate::{control_resource_budget_pass, LoadedMissionState};
 use fparkan_world::{transform_state, ObjectHandle, World};
 use std::collections::BTreeMap;
 
-/// Factory Control updates; other owners and global Control ordering remain open.
-pub(super) struct FactoryResources {
+/// Factory and laboratory Control budgets; other owners and global RNG ordering remain open.
+pub(super) struct Resources {
     clocks: Vec<(ObjectHandle, ResourceClock)>,
     rng: u32,
     ticks: BTreeMap<u32, u64>,
     stops: BTreeMap<u32, (u64, String)>,
 }
 
-impl Default for FactoryResources {
+impl Default for Resources {
     fn default() -> Self {
         Self {
             clocks: Vec::new(),
@@ -22,7 +22,7 @@ impl Default for FactoryResources {
     }
 }
 
-impl FactoryResources {
+impl Resources {
     pub(super) fn ticks(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
         self.ticks.iter().map(|(&unit, &count)| (unit, count))
     }
@@ -35,7 +35,7 @@ impl FactoryResources {
 }
 
 pub(super) fn tick(mission: &mut LoadedMissionState, world: &World, now_ms: u32) {
-    let state = &mut mission.factory_resources;
+    let state = &mut mission.control_resources;
     state
         .clocks
         .retain(|(handle, _)| transform_state(world, *handle).is_ok());
@@ -43,7 +43,12 @@ pub(super) fn tick(mission: &mut LoadedMissionState, world: &World, now_ms: u32)
         if !table
             .original_id
             .and_then(|id| mission.object_drafts.get(id.0 as usize))
-            .is_some_and(|draft| draft.unit_dat_header_flags == Some(crate::autodemo::PLANT_CLASS))
+            .is_some_and(|draft| {
+                matches!(
+                    draft.unit_dat_header_flags,
+                    Some(crate::autodemo::PLANT_CLASS | crate::laboratory::LAB_CLASS)
+                )
+            })
             || transform_state(world, table.handle).is_err()
         {
             continue;
@@ -63,7 +68,11 @@ pub(super) fn tick(mission: &mut LoadedMissionState, world: &World, now_ms: u32)
                     forced: 0,
                 },
             ));
-            &mut state.clocks.last_mut().expect("new factory clock").1
+            &mut state
+                .clocks
+                .last_mut()
+                .expect("new Control resource clock")
+                .1
         };
         // Control.dll+0x42480: default resource period; this is a separate RNG from Behavior.
         let Some(seconds) = clock.step(now_ms as f32, true, 250.0, &mut state.rng) else {
@@ -74,7 +83,7 @@ pub(super) fn tick(mission: &mut LoadedMissionState, world: &World, now_ms: u32)
                 let count = state.ticks.entry(table.handle.slot).or_default();
                 *count += 1;
                 if *count == 1 {
-                    eprintln!("sim_coverage factory_control_clock_approx=1 unit={} (factory owners; Control RNG seed and global order remain open)", table.handle.slot);
+                    eprintln!("sim_coverage control_resource_clock_approx=1 unit={} (factory and laboratory owners; Control RNG seed and global order remain open)", table.handle.slot);
                 }
             }
             Err(reason) => {
@@ -85,7 +94,7 @@ pub(super) fn tick(mission: &mut LoadedMissionState, world: &World, now_ms: u32)
                 stop.0 += 1;
                 if stop.0 == 1 {
                     eprintln!(
-                        "sim_coverage factory_control_budget_stub=1 unit={} reason={}",
+                        "sim_coverage control_resource_budget_stub=1 unit={} reason={}",
                         table.handle.slot, stop.1
                     );
                 }

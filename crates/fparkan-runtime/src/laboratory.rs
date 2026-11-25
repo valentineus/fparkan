@@ -4,7 +4,7 @@ use fparkan_vfs::Vfs;
 use fparkan_world::{identity_metadata, ObjectHandle, OwnerId, World};
 use std::collections::BTreeMap;
 
-const LAB_CLASS: u32 = 0x8000_0400;
+pub(super) const LAB_CLASS: u32 = 0x8000_0400;
 
 /// Executed laboratory orders and technology state changes.
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
@@ -439,6 +439,130 @@ mod tests {
         let progress = work.advance(1.0, 0.0, [3.0, 1.0], &mut ore, 0.0);
         assert_eq!(progress, 0.2);
         assert_eq!(work.advance(4.0, 0.0, [3.0, 1.0], &mut ore, progress), 1.0);
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_paid_research_waits_for_control_power_and_resumes_after_supply() {
+        use crate::{
+            create, frame, load_gameplay_mission, EngineServices, MissionMode, MissionRequest,
+            MissionStartupInput,
+        };
+        use fparkan_vfs::DirectoryVfs;
+        use std::sync::Arc;
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").unwrap();
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Single.01/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        let loaded = engine.loaded.as_mut().unwrap();
+        let lab = loaded
+            .control_device_tables
+            .iter()
+            .find(|table| {
+                table.original_id.is_some_and(|id| {
+                    loaded.object_drafts[id.0 as usize].unit_dat_header_flags == Some(LAB_CLASS)
+                }) && identity_metadata(&engine.world, table.handle)
+                    .unwrap()
+                    .owner_id
+                    == Some(OwnerId(1))
+            })
+            .unwrap()
+            .handle;
+        let slot = identity_metadata(&engine.world, lab)
+            .unwrap()
+            .original_id
+            .unwrap()
+            .0 as usize;
+        // Debug outage: consume free jobs, empty the local reserve and stop external generation.
+        while loaded.free_research.take_free(slot) {}
+        let supply = loaded
+            .behavior_profiles
+            .iter()
+            .map(|profile| profile.transfer_power_out_bits)
+            .collect::<Vec<_>>();
+        for profile in &mut loaded.behavior_profiles {
+            profile.transfer_power_out_bits = 0;
+        }
+        crate::set_control_device_table_multiplier(
+            loaded
+                .control_device_tables
+                .iter_mut()
+                .find(|table| table.handle == lab)
+                .unwrap(),
+            0.0,
+        )
+        .unwrap();
+        for now in (0..=1_000).step_by(50) {
+            frame(&mut engine, now).unwrap();
+        }
+        let loaded = engine.loaded.as_ref().unwrap();
+        assert!(
+            loaded
+                .control_resources
+                .ticks()
+                .any(|(unit, count)| unit == lab.slot && count > 0),
+            "laboratory Control clock must run"
+        );
+        assert!(!loaded
+            .control_resources
+            .stops()
+            .any(|(unit, _, _)| unit == lab.slot));
+        let task = loaded
+            .laboratories
+            .tasks
+            .iter()
+            .find(|task| task.lab == lab)
+            .unwrap();
+        let (row, work) = task.current.as_ref().expect("active paid research");
+        assert!(work.power_cost > 0.0);
+        let (row, before, elapsed) = (*row, work.power, work.time);
+        for now in (1_050..=2_000).step_by(50) {
+            frame(&mut engine, now).unwrap();
+        }
+        let loaded = engine.loaded.as_ref().unwrap();
+        let task = loaded
+            .laboratories
+            .tasks
+            .iter()
+            .find(|task| task.lab == lab)
+            .unwrap();
+        let (current, work) = task.current.as_ref().unwrap();
+        assert_eq!(*current, row);
+        assert_eq!(
+            work.power, before,
+            "no power work while the reserve and supply are empty"
+        );
+        assert!(work.time > elapsed);
+        let loaded = engine.loaded.as_mut().unwrap();
+        for (profile, bits) in loaded.behavior_profiles.iter_mut().zip(supply) {
+            profile.transfer_power_out_bits = bits;
+        }
+        for now in (2_050..=10_000).step_by(50) {
+            frame(&mut engine, now).unwrap();
+            let state = &engine.loaded.as_ref().unwrap().laboratories;
+            if state.completed.contains_key(&(1, lab.slot, row))
+                || state
+                    .tasks
+                    .iter()
+                    .find(|task| task.lab == lab)
+                    .and_then(|task| task.current.as_ref())
+                    .is_some_and(|(current, work)| *current == row && work.power > before)
+            {
+                return;
+            }
+        }
+        panic!("research power work must resume after restoring the original generation");
     }
 
     #[test]
