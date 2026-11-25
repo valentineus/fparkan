@@ -37,7 +37,7 @@ pub(super) fn place_speed(
         Ok((limit, speed)) => {
             let sample = report.samples.entry(object).or_default();
             if sample.0 == 0 {
-                eprintln!("patrol_speed_profile_approx object={object} limit={} requested={speed} (mobile Control budgets and owner activation remain open)", f32::from_bits(limit));
+                eprintln!("patrol_speed_profile_approx object={object} limit={} requested={speed} (motion energy and owner activation remain open)", f32::from_bits(limit));
             }
             *sample = (sample.0 + 1, limit, speed.to_bits());
             speed

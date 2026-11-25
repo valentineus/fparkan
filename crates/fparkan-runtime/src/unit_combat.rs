@@ -370,6 +370,7 @@ impl AutoDemoCombat {
             mission.unit_patrol.as_ref(),
         );
         for unit in &mut self.units {
+            unit.weapons.read_control_energy(engine, unit.handle);
             let Ok(state) = transform_state(&engine.world, unit.handle) else {
                 continue;
             };
@@ -489,6 +490,9 @@ impl AutoDemoCombat {
                 *count += missing;
                 unavailable += missing as usize;
             }
+        }
+        for unit in &mut self.units {
+            unit.weapons.publish_control_energy(engine, unit.handle);
         }
         (events, unavailable)
     }

@@ -1,16 +1,19 @@
 use crate::{
     control_profile, control_resource_budget_pass, ControlProfileReport, LoadedMissionState,
+    MissionControlDeviceTableStatus, MobileBudgetReport,
 };
 use fparkan_world::{transform_state, ObjectHandle, World};
 use std::collections::BTreeMap;
 
-/// Factory and laboratory Control budgets; other owners and global RNG ordering remain open.
+/// Supported Control budgets; motion callbacks and global RNG ordering remain open.
 pub(super) struct Resources {
     clocks: Vec<(ObjectHandle, ResourceClock)>,
     rng: u32,
     ticks: BTreeMap<u32, u64>,
     stops: BTreeMap<u32, (u64, String)>,
     pub(super) profiles: ControlProfileReport,
+    pub(super) mobile: MobileBudgetReport,
+    blocked_budgets: Vec<ObjectHandle>,
 }
 
 impl Default for Resources {
@@ -22,11 +25,17 @@ impl Default for Resources {
             ticks: BTreeMap::new(),
             stops: BTreeMap::new(),
             profiles: ControlProfileReport::default(),
+            mobile: MobileBudgetReport::default(),
+            blocked_budgets: Vec::new(),
         }
     }
 }
 
 impl Resources {
+    pub(super) fn energy_available(&self, handle: ObjectHandle) -> bool {
+        !self.blocked_budgets.contains(&handle)
+    }
+
     pub(super) fn ticks(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
         self.ticks.iter().map(|(&unit, &count)| (unit, count))
     }
@@ -43,6 +52,9 @@ pub(super) fn tick(mission: &mut LoadedMissionState, world: &World, now_ms: u32)
     state
         .clocks
         .retain(|(handle, _)| transform_state(world, *handle).is_ok());
+    state
+        .blocked_budgets
+        .retain(|handle| transform_state(world, *handle).is_ok());
     for table in &mut mission.control_device_tables {
         let flags = table
             .original_id
@@ -121,18 +133,42 @@ pub(super) fn tick(mission: &mut LoadedMissionState, world: &World, now_ms: u32)
                 }
             }
         }
-        if !budget_owner {
-            continue;
-        }
         match control_resource_budget_pass(table, seconds) {
             Ok(()) => {
+                state
+                    .blocked_budgets
+                    .retain(|handle| *handle != table.handle);
+                if mobile_owner {
+                    *state.mobile.ticks.entry(object).or_default() += 1;
+                    if let MissionControlDeviceTableStatus::Available(devices) = &table.status {
+                        for device in devices {
+                            if device.factory_tag == 5 && device.native_word_50_bits != Some(0) {
+                                state
+                                    .mobile
+                                    .stub(object, format!("motion_factory_{}", device.factory_tag));
+                            }
+                            if matches!(device.factory_tag, 2 | 30)
+                                && f32::from_bits(device.descriptor.fixed_words[8]) != 0.0
+                            {
+                                state.mobile.stub(object, "weapon_command_mode".into());
+                            }
+                        }
+                    }
+                }
                 let count = state.ticks.entry(table.handle.slot).or_default();
                 *count += 1;
                 if *count == 1 {
-                    eprintln!("sim_coverage control_resource_clock_approx=1 unit={} (factory and laboratory owners; Control RNG seed and global order remain open)", table.handle.slot);
+                    eprintln!("sim_coverage control_resource_clock_approx=1 unit={} (supported owners; Control RNG seed, activation and global order remain open)", table.handle.slot);
                 }
             }
             Err(reason) => {
+                if !state.blocked_budgets.contains(&table.handle) {
+                    state.blocked_budgets.push(table.handle);
+                }
+                if mobile_owner {
+                    state.mobile.stub(object, format!("budget_{reason:?}"));
+                    continue;
+                }
                 let stop = state
                     .stops
                     .entry(table.handle.slot)

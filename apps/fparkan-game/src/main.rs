@@ -10494,6 +10494,9 @@ impl StaticVulkanApp {
         // shortcut: the camera supplies a shared aim direction until native
         // per-weapon CPT direction and turret alignment agree in world space.
         let direction = self.view_camera.forward;
+        if let Some(engine) = &self.mission_engine {
+            weapons.read_control_energy(engine, cockpit.handle);
+        }
         for (slot, weapon, barrel) in weapons.fire(trigger, clock_ms) {
             let hierarchy = self
                 .component_pose_buffers
@@ -10572,6 +10575,9 @@ impl StaticVulkanApp {
                     }
                 }
             }
+        }
+        if let Some(engine) = &mut self.mission_engine {
+            weapons.publish_control_energy(engine, cockpit.handle);
         }
     }
 

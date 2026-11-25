@@ -21,6 +21,19 @@ pub(super) fn log_script_init(engine: &Engine, mission: &str) {
 }
 
 pub(super) fn log_clan_ai_stops(report: &SimulationReport) {
+    for (object, count) in &report.mobile_budget.ticks {
+        eprintln!("sim_coverage control_mobile_budget_approx={count} object={object}");
+    }
+    for ((object, reason), count) in &report.mobile_budget.stubs {
+        eprintln!(
+            "sim_coverage control_mobile_budget_stub={count} object={object} reason={reason}"
+        );
+    }
+    for (object, count) in &report.mobile_budget.weapon_waits {
+        if *count > 0 {
+            eprintln!("sim_coverage weapon_energy_wait={count} object={object}");
+        }
+    }
     for (object, count) in &report.control_profiles.ticks {
         eprintln!("sim_coverage control_profile_clock_approx={count} object={object}");
     }

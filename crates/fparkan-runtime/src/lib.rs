@@ -53,9 +53,11 @@ mod clan_building_queries;
 mod clan_clock;
 mod control_profile;
 mod control_resources;
+mod mobile_budget;
 pub use clan_clock::note_mission_pause_elapsed;
 use control_profile::project_initial as project_control_owner_profile_fca0;
 pub use control_profile::{ControlProfileReport, ControlProfileScalars};
+pub use mobile_budget::MobileBudgetReport;
 mod clan_combat_groups;
 mod clan_combat_strength;
 mod clan_factory_schemes;
@@ -555,6 +557,8 @@ pub struct EffectiveControlDevice {
     pub tag26_extra_rate_bits: Option<u32>,
     /// Factory-2 value read by selector 6 at native `+0x174`.
     pub device174_bits: Option<u32>,
+    /// Factory-2 charge at native +0x120, initialized by the weapon reader.
+    pub weapon_charge_bits: Option<u32>,
     /// Six class-9 budget values at native `+0x98..+0xac`.
     pub class9_values_bits: Option<[u32; 6]>,
     /// Six accumulated class-9 changes at native `+0xb0..+0xc4`.
@@ -2988,6 +2992,7 @@ pub struct SimulationReport {
     pub patrol_points: PatrolPointReport,
     pub patrol_speeds: PatrolSpeedReport,
     pub control_profiles: ControlProfileReport,
+    pub mobile_budget: MobileBudgetReport,
     /// Approximate clan strength queries, grouped by caller and target clan.
     pub script_strength_queries: Vec<(usize, u16, u64)>,
     pub script_capture_queries: Vec<(usize, u64)>,
@@ -3068,6 +3073,7 @@ pub fn simulate_mission_report(
         patrol_points: PatrolPointReport::default(),
         patrol_speeds: PatrolSpeedReport::default(),
         control_profiles: ControlProfileReport::default(),
+        mobile_budget: MobileBudgetReport::default(),
         script_strength_queries: Vec::new(),
         script_capture_queries: Vec::new(),
         script_attack_queries: Vec::new(),
@@ -3176,6 +3182,7 @@ pub fn simulate_mission_report(
             .extend(loaded.clan_ai_events.research_catalogs());
         report.laboratory = loaded.laboratories.report();
         report.control_profiles = loaded.control_resources.profiles.clone();
+        report.mobile_budget = loaded.control_resources.mobile.clone();
         if let Some(patrol) = &loaded.unit_patrol {
             report.patrol_points = patrol.point_report.clone();
             report.patrol_speeds = patrol.speed_report.clone();
@@ -4816,7 +4823,7 @@ fn control_resource_budget_pass_inner(
     for index in 0..device_count {
         let device = control_budget_device(table, index)?;
         control_budget_category(device.descriptor.tag)?;
-        if !matches!(device.factory_tag, 9 | 15 | 19 | 26)
+        if !matches!(device.factory_tag, 1 | 2 | 5 | 9 | 10 | 15 | 19 | 26 | 30)
             && !control_factory_uses_generic_budget_callbacks(device.factory_tag)
         {
             return Err(ControlResourceAccessError::UnsupportedFactoryTag {
@@ -5093,6 +5100,9 @@ fn control_device_resource_rate(
     device: &EffectiveControlDevice,
     delta_time_seconds: f32,
 ) -> Result<f32, ControlResourceAccessError> {
+    if matches!(device.factory_tag, 2 | 30) {
+        return mobile_budget::weapon_rate(table, device, delta_time_seconds);
+    }
     let Some(provider_value) = control_device_budget_active_provider_value(table, device)? else {
         return Ok(0.0);
     };
@@ -5100,6 +5110,8 @@ fn control_device_resource_rate(
         control_device_budget_descriptor_float(device, 8, "descriptor resource rate +0x20")?;
 
     match device.factory_tag {
+        5 => Ok(mobile_budget::unmodeled_motion_rate()),
+        10 => mobile_budget::passive_device_rate(device, delta_time_seconds),
         9 => {
             let coefficient_0 = control_device_budget_coefficient(device, 0)?;
             let coefficient_1 = control_device_budget_coefficient(device, 1)?;
@@ -5362,6 +5374,12 @@ fn control_device_resource_update(
     delta_time_seconds: f32,
     allocation: f32,
 ) -> Result<(), ControlResourceAccessError> {
+    if matches!(
+        control_budget_device(table, device_index)?.factory_tag,
+        2 | 30
+    ) {
+        return mobile_budget::weapon_update(table, device_index, delta_time_seconds, allocation);
+    }
     let device = control_budget_device(table, device_index)?;
     let Some(provider_value) = control_device_budget_active_provider_value(table, &device)? else {
         return Ok(());
@@ -5573,7 +5591,7 @@ fn control_device_resource_update(
                 )?;
             }
         }
-        26 => set_control_device_multiplier(table, device_index, allocation)?,
+        5 | 10 | 26 => set_control_device_multiplier(table, device_index, allocation)?,
         factory_tag if control_factory_uses_generic_budget_callbacks(factory_tag) => {
             set_control_device_multiplier(table, device_index, allocation)?;
         }
@@ -7232,6 +7250,7 @@ fn append_effective_control_device(
         class9_selector0_scale_bits: (descriptor.tag == 9).then_some(0x3f80_0000),
         tag26_extra_rate_bits: (descriptor.tag == 26).then_some(0),
         device174_bits: (descriptor.tag == 2).then_some(0),
+        weapon_charge_bits: matches!(descriptor.tag, 2 | 30).then_some(coefficient_words[1]),
         class9_values_bits: (descriptor.tag == 9).then_some([0x3f80_0000; 6]),
         class9_deltas_bits: (descriptor.tag == 9).then_some([0; 6]),
         native_word_50_bits,
@@ -7310,6 +7329,9 @@ fn apply_effective_control_override(
     let mut coefficient_words = [0; 16];
     coefficient_words.copy_from_slice(&descriptor.fixed_words[11..27]);
     device.coefficient_bits = Some(coefficient_words);
+    if matches!(device.factory_tag, 2 | 30) {
+        device.weapon_charge_bits = Some(coefficient_words[1]);
+    }
     if descriptor.fixed_words[6] != u32::MAX {
         device.native_word_50_bits = Some(descriptor.fixed_words[6]);
     }
@@ -7319,7 +7341,7 @@ fn apply_effective_control_override(
 }
 
 fn control_factory_uses_generic_budget_callbacks(factory_tag: u32) -> bool {
-    !matches!(factory_tag, 1 | 2 | 5 | 9 | 10 | 15 | 17 | 19 | 26 | 30)
+    !matches!(factory_tag, 2 | 5 | 9 | 10 | 15 | 17 | 19 | 26 | 30)
 }
 
 fn control_factory_override_is_supported(factory_tag: u32) -> bool {
@@ -7332,7 +7354,7 @@ fn native_control_factory_defaults(factory_tag: u32) -> (Option<u32>, Option<u32
         3 | 5 | 8 | 21 | 25 | 26 => (Some(0x3f80_0000), Some(0x5)),
         10 => (Some(0x3f80_0000), Some(0x2000)),
         17 | 19 => (Some(0x3f80_0000), Some(0x20)),
-        2 | 27 => (Some(0x3f80_0000), Some(0)),
+        2 | 27 | 30 => (Some(0x3f80_0000), Some(0)),
         9 => (Some(0x3f80_0000), Some(0x20)),
         15 => (Some(0x3f80_0000), Some(0)),
         _ => (Some(0x3f80_0000), Some(0x5)),
@@ -9979,6 +10001,7 @@ mod tests {
             class9_selector0_scale_bits: class9_scale_bits,
             tag26_extra_rate_bits: (factory_tag == 26).then_some(0),
             device174_bits: (factory_tag == 2).then_some(0),
+            weapon_charge_bits: matches!(factory_tag, 2 | 30).then_some(coefficients[1]),
             class9_values_bits: (factory_tag == 9).then_some([0x3f80_0000; 6]),
             class9_deltas_bits: (factory_tag == 9).then_some([0; 6]),
             native_word_50_bits,
@@ -10452,7 +10475,7 @@ mod tests {
 
     #[test]
     fn control_budget_generic_default_callbacks_match_native_rate_and_update() {
-        for factory_tag in [3, 4, 6, 8, 12, 13, 21, 25, 27, 34] {
+        for factory_tag in [1, 3, 4, 6, 8, 12, 13, 21, 25, 27, 34] {
             let mut device = synthetic_effective_control_device(
                 factory_tag,
                 factory_tag,

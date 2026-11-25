@@ -17,6 +17,9 @@ pub struct PlayerWeapons {
 pub struct PlayerWeapon {
     /// Component containing the barrel's CPT point.
     pub component_index: usize,
+    pub(super) control_record_index: usize,
+    pub(super) charge: Option<crate::mobile_budget::Charge>,
+    pub(super) energy_waits: u64,
     /// Name of the projectile prototype.
     pub projectile: String,
     /// Archive named by the weapon's projectile descriptor.
@@ -50,6 +53,20 @@ enum FirePhase {
 }
 
 impl PlayerWeapons {
+    /// Reads the authoritative Control charge before sampling this weapon bank.
+    pub fn read_control_energy(&mut self, engine: &Engine, handle: crate::ObjectHandle) {
+        if let Some(mission) = &engine.loaded {
+            crate::mobile_budget::read(mission, handle, &mut self.weapons);
+        }
+    }
+
+    /// Publishes completed shots to Control before its next resource budget.
+    pub fn publish_control_energy(&mut self, engine: &mut Engine, handle: crate::ObjectHandle) {
+        if let Some(mission) = &mut engine.loaded {
+            crate::mobile_budget::publish(mission, handle, &mut self.weapons);
+        }
+    }
+
     /// Returns the prepared devices in selection order.
     pub fn weapons(&self) -> &[PlayerWeapon] {
         &self.weapons
@@ -118,6 +135,17 @@ impl PlayerWeapon {
                         self.phase = FirePhase::Idle;
                         break;
                     }
+                    if self
+                        .charge
+                        .as_ref()
+                        .is_some_and(|charge| !charge.can_start())
+                    {
+                        self.energy_waits += 1;
+                        self.phase = FirePhase::Idle;
+                        self.phase_start_ms = now;
+                        self.phase_end_ms = now;
+                        break;
+                    }
                     self.phase = FirePhase::Shot;
                     barrel.travel_to(0.5)
                 }
@@ -136,6 +164,9 @@ impl PlayerWeapon {
                     self.barrel_index = (self.barrel_index + 1) % self.barrels.len();
                     if let Some(rounds) = &mut self.rounds_remaining {
                         *rounds -= 1;
+                    }
+                    if let Some(charge) = &mut self.charge {
+                        charge.finish_shot();
                     }
                     self.reload_ms
                 }
@@ -217,8 +248,9 @@ fn prepare_weapons(
     control
         .typed_records
         .iter()
-        .filter(|record| record.tag == 2)
-        .filter_map(|record| {
+        .enumerate()
+        .filter(|(_, record)| record.tag == 2)
+        .filter_map(|(control_record_index, record)| {
             let projectile_archive =
                 crate::fixed_words_ascii_c_string(&record.fixed_words[27..35])?;
             let projectile = crate::fixed_words_ascii_c_string(&record.fixed_words[35..43])?;
@@ -290,6 +322,9 @@ fn prepare_weapons(
             };
             Some(PlayerWeapon {
                 component_index,
+                control_record_index,
+                charge: None,
+                energy_waits: 0,
                 projectile,
                 projectile_archive,
                 effect,
@@ -323,10 +358,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shot_finishes_after_trigger_release_and_then_spends_ammo() {
+    fn shot_finishes_after_trigger_release_and_spends_ammo_and_charge() {
         let mut weapons = PlayerWeapons {
             weapons: vec![PlayerWeapon {
                 component_index: 0,
+                control_record_index: 0,
+                charge: None,
+                energy_waits: 0,
                 projectile: String::from("test"),
                 projectile_archive: String::from("test.rlb"),
                 effect: None,
@@ -352,12 +390,26 @@ mod tests {
             }],
             ..PlayerWeapons::default()
         };
+        weapons.weapons[0].charge = Some(crate::mobile_budget::Charge {
+            capacity: 10.0,
+            cost: 4.0,
+            amount: 8.0,
+        });
         assert!(weapons.fire(true, 0).next().is_none());
         assert!(weapons.fire(false, 10).next().is_none());
         assert_eq!(weapons.fire(false, 11).next().unwrap().0, 0);
         assert_eq!(weapons.weapons()[0].rounds_remaining(), Some(1));
+        assert_eq!(weapons.weapons[0].charge.as_ref().unwrap().amount, 8.0);
         assert!(weapons.fire(false, 22).next().is_none());
         assert_eq!(weapons.weapons()[0].rounds_remaining(), Some(0));
+        assert_eq!(weapons.weapons[0].charge.as_ref().unwrap().amount, 4.0);
         assert!(weapons.fire(true, 100).next().is_none());
+        weapons.weapons[0].rounds_remaining = None;
+        weapons.weapons[0].charge.as_mut().unwrap().amount = 0.0;
+        assert!(weapons.fire(true, 150).next().is_none());
+        assert!(weapons.weapons[0].energy_waits > 0);
+        weapons.weapons[0].charge.as_mut().unwrap().amount = 4.0;
+        assert!(weapons.fire(true, 10_000).next().is_none());
+        assert!(weapons.fire(true, 10_011).next().is_some());
     }
 }
