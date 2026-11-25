@@ -85,6 +85,11 @@ pub(super) fn recruit_all(units: impl Iterator<Item = ObjectHandle>) -> Option<C
     })
 }
 
+pub(super) fn battle_assignment_available(assigned_kind: Option<u32>, current_kind: u32) -> bool {
+    // ai.dll+0xac36: TAKE_ALL_BATTLE_UNITS keeps units already assigned to this problem kind.
+    assigned_kind != Some(current_kind)
+}
+
 pub(super) fn recruit(
     world: &World,
     units: impl Iterator<Item = ObjectHandle>,
@@ -206,6 +211,34 @@ impl CombatGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn battle_group_takes_other_problem_kinds_but_keeps_matching_assignments() {
+        // ai.dll+0xab85 oracle: roster classes [warbot, transport, building, warbot].
+        // Reserved 0xfffe is excluded before recruitment, as in MissionEvents::clan_units.
+        for (jobs, expected) in [
+            ([None, None], vec![0, 3]),
+            ([Some(12), Some(12)], vec![]),
+            ([Some(8), Some(8)], vec![0, 3]),
+        ] {
+            let recruited = recruit_all([0, 3].into_iter().zip(jobs).filter_map(|(slot, job)| {
+                battle_assignment_available(job, 12).then_some(ObjectHandle {
+                    slot,
+                    generation: 1,
+                })
+            }));
+            assert_eq!(
+                recruited
+                    .map(|group| group
+                        .members
+                        .into_iter()
+                        .map(|unit| unit.slot)
+                        .collect::<Vec<_>>())
+                    .unwrap_or_default(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn recruits_by_distance_until_the_threshold_and_keeps_partial_groups() {

@@ -2917,7 +2917,7 @@ pub struct SimulationReport {
     pub mission_event_stops: Vec<MissionEventStop>,
     /// Uncovered clan AI instructions and the number of invocations they stopped.
     pub clan_ai_event_stops: Vec<(MissionEventStop, u64)>,
-    /// Clan index, executed AI cycles and new registrations; initial phase and RNG order remain approximate.
+    /// Clan index, executed AI cycles and new registrations; full RNG ordering remains approximate.
     pub clan_ai_clock_ticks: Vec<(usize, u64, u64)>,
     /// Calls to stubbed research policy or status, grouped by clan and handler.
     pub clan_research_status_stubs: Vec<(usize, u8, u64)>,

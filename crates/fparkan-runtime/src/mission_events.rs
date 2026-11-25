@@ -779,7 +779,7 @@ impl LoadedMissionState {
         let inside_exit = exit_event.is_some() && self.hero_in_teleport_exit(world);
         let entered_exit = inside_exit && !self.mission_events.inside_hero_exit;
         self.mission_events.inside_hero_exit = inside_exit;
-        // shortcut: use the caller's queue clock until the AI wall clock is wired.
+        // shortcut: dispatch Mission on the shared 2 s queue timer until its native cadence is wired.
         let (event_index, event) =
             if entered_exit && self.script_outcome == super::MissionScriptOutcome::Active {
                 exit_event?
@@ -796,7 +796,7 @@ impl LoadedMissionState {
             .iter_mut()
             .find(|state| state.clan_index == bundle.clan_index)?;
         let mission_events = &mut self.mission_events;
-        let clock_seconds = crate::script_time::elapsed_seconds(mission_events.start_ms, now_ms);
+        let clock_seconds = self.clan_ai_events.clock_seconds(bundle.clan_index);
         let mut notices = Vec::new();
         let mut patrol_orders = Vec::new();
         let execution = declarations.execute_mission_prefix(

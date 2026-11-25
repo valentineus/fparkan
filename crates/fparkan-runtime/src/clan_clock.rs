@@ -10,8 +10,8 @@ struct Clock {
 impl Default for Clock {
     fn default() -> Self {
         Self {
-            // shortcut: keep the initial phase until a stock-start native comparison establishes it.
-            deadline_ms: 7_000,
+            // A fresh native context is already due; do not reproduce its uninitialized heap bytes.
+            deadline_ms: -1,
             seconds: 0,
             ticks: 0,
             registrations: 0,
@@ -51,6 +51,10 @@ impl ClanClocks {
             .iter()
             .map(|(&clan, clock)| (clan, clock.ticks, clock.registrations))
     }
+
+    pub(super) fn seconds(&self, clan: usize) -> u32 {
+        self.0.get(&clan).map_or(0, |clock| clock.seconds)
+    }
 }
 
 impl crate::LoadedMissionState {
@@ -61,17 +65,9 @@ impl crate::LoadedMissionState {
     ) {
         let clan = usize::from(owner.0);
         if !self
-            .mission
-            .clans
-            .get(clan)
-            .is_some_and(|entry| entry.mode == 2)
-            || !self.script_bundles.iter().any(|bundle| {
-                bundle.clan_index == clan
-                    && bundle.behavior_warm_start.is_some()
-                    && bundle.package.events.iter().any(|event| {
-                        event.name_raw == b"Problems0\0" && !event.instructions.is_empty()
-                    })
-            })
+            .script_bundles
+            .iter()
+            .any(|bundle| bundle.clan_index == clan && bundle.behavior_warm_start.is_some())
         {
             return;
         }
@@ -91,16 +87,16 @@ mod tests {
     fn native_rng_jitter_is_shared_between_clans_and_equality_does_not_consume_it() {
         let mut clocks = ClanClocks::default();
         let mut rng = 1;
-        assert_eq!(clocks.tick(1, 7_000, &mut rng), None);
-        assert_eq!(rng, 1);
-        assert_eq!(clocks.tick(1, 7_001, &mut rng), Some(7));
-        assert_eq!((clocks.0[&1].deadline_ms, rng), (14_042, 2_745_024));
-        assert_eq!(clocks.tick(2, 7_001, &mut rng), Some(7));
-        assert_eq!((clocks.0[&2].deadline_ms, rng), (14_468, 3_357_800_067));
-        assert_eq!(clocks.tick(1, 14_042, &mut rng), None);
+        assert_eq!(clocks.seconds(0), 0);
+        assert_eq!(clocks.tick(0, 0, &mut rng), Some(7));
+        assert_eq!((clocks.0[&0].deadline_ms, rng), (7_041, 2_745_024));
+        assert_eq!(clocks.tick(1, 0, &mut rng), Some(7));
+        assert_eq!((clocks.0[&1].deadline_ms, rng), (7_467, 3_357_800_067));
+        assert_eq!(clocks.tick(0, 7_041, &mut rng), None);
         assert_eq!(rng, 3_357_800_067);
-        assert_eq!(clocks.tick(1, 14_043, &mut rng), Some(14));
-        assert_eq!((clocks.0[&1].deadline_ms, rng), (21_377, 415_139_642));
+        assert_eq!(clocks.tick(0, 7_042, &mut rng), Some(14));
+        assert_eq!((clocks.0[&0].deadline_ms, rng), (14_376, 415_139_642));
+        assert_eq!((clocks.seconds(0), clocks.seconds(1)), (14, 7));
     }
 
     #[test]
@@ -133,7 +129,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed mission resources"]
-    fn licensed_stock_factory_registration_brings_the_next_ai_cycle_forward() {
+    fn licensed_stock_clocks_start_immediately_and_include_the_player_context() {
         use crate::{
             create, frame, load_gameplay_mission, EngineServices, MissionMode, MissionRequest,
             MissionStartupInput,
@@ -155,13 +151,24 @@ mod tests {
             None,
         )
         .unwrap();
-        for now_ms in (0..=28_000).step_by(100) {
+        frame(&mut engine, 0).unwrap();
+        assert_eq!(
+            engine
+                .loaded
+                .as_ref()
+                .unwrap()
+                .clan_ai_events
+                .clock_ticks()
+                .collect::<Vec<_>>(),
+            [(0, 1, 0), (1, 1, 0)]
+        );
+        for now_ms in (100..=28_000).step_by(100) {
             frame(&mut engine, now_ms).unwrap();
         }
         let loaded = engine.loaded.as_ref().unwrap();
         assert_eq!(
             loaded.clan_ai_events.clock_ticks().collect::<Vec<_>>(),
-            [(1, 4, 1)]
+            [(0, 4, 0), (1, 4, 1)]
         );
         assert!(loaded.clan_ai_events.stops().next().is_none());
     }

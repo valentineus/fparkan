@@ -293,18 +293,20 @@ impl LoadedMissionState {
             return orders;
         };
         let elapsed_ms = now_ms.wrapping_sub(self.mission_events.start_ms);
-        for bundle in self.script_bundles.iter().filter(|bundle| {
-            bundle.behavior_warm_start.is_some() && self.mission.clans[bundle.clan_index].mode == 2
-        }) {
+        for bundle in self
+            .script_bundles
+            .iter()
+            .filter(|bundle| bundle.behavior_warm_start.is_some())
+        {
+            let clan = bundle.clan_index;
+            let Some(clock) = self.clan_ai_events.clocks.tick(clan, elapsed_ms, rng) else {
+                continue;
+            };
             let Some((event_index, event)) =
                 bundle.package.events.iter().enumerate().find(|(_, event)| {
                     event.name_raw == b"Problems0\0" && !event.instructions.is_empty()
                 })
             else {
-                continue;
-            };
-            let clan = bundle.clan_index;
-            let Some(clock) = self.clan_ai_events.clocks.tick(clan, elapsed_ms, rng) else {
                 continue;
             };
             let Some(state) = self
@@ -563,8 +565,9 @@ impl LoadedMissionState {
                             let word = |index: u32| values.get(index as usize)?.as_dword();
                             let (&mode, rest) = instruction.references.split_first()
                                 .ok_or("Handler(25) requires a recruitment mode")?;
-                            let mode = word(mode).filter(|mode| matches!(mode, 1 | 2))
-                                .ok_or("Handler(25) requires TAKE_ALL_FREE or TAKE_BY_HITS")?;
+                            let mode = word(mode).filter(|mode| matches!(mode, 1..=3))
+                                .ok_or("Handler(25) requires a supported recruitment mode")?;
+                            let problem_kind = problem.as_ref().expect("recruitment requires a problem").key.word_0;
                             let count = self.clan_ai_events.group_recruitments.entry((clan, mode)).or_default();
                             *count += 1;
                             let first_recruitment = *count == 1;
@@ -572,17 +575,27 @@ impl LoadedMissionState {
                             // shortcut: infer roster occupancy from runtime jobs until native problem-slot ownership is wired.
                             let units = self.mission_events.clan_units(world, owner, mode != 1)
                                 .filter(|&unit| !self.mission_events.is_reserved(owner, unit)
-                                    && !self.clan_ai_events.unit_assigned(unit)
+                                    && (!self.clan_ai_events.unit_assigned(unit)
+                                        || mode == 3 && self.clan_ai_events.combat_assignment(unit)
+                                            .is_some_and(|kind| crate::clan_combat_groups::battle_assignment_available(Some(kind), problem_kind)))
                                     && !self.construction.active(unit)
                                     && !self.laboratories.active(unit)
                                     && !production.is_some_and(|queue| queue.is_building_at(unit, owner))
                                     && !orders.iter().any(|order: &ScriptFactoryOrder| order.plant == unit))
-                                .filter(|&unit| mode == 1 || self.unit_patrol.as_ref().is_none_or(|patrol| !patrol.is_shut_down(unit)));
-                            if mode == 1 {
+                                .filter(|&unit| mode != 2 || self.unit_patrol.as_ref().is_none_or(|patrol| !patrol.is_shut_down(unit)));
+                            if mode != 2 {
                                 if !rest.is_empty() {
-                                    return Err("Handler(25) TAKE_ALL_FREE takes one operand".into());
+                                    return Err("Handler(25) all-unit recruitment takes one operand".into());
                                 }
                                 group = crate::clan_combat_groups::recruit_all(units);
+                                if mode == 3 {
+                                    if let Some(recruited) = &group {
+                                        for previous in self.clan_ai_events.groups.values_mut() {
+                                            previous.members.retain(|unit| !recruited.members.contains(unit));
+                                        }
+                                        self.clan_ai_events.capture_orders.retain(|(_, _, order)| !recruited.members.contains(&order.unit));
+                                    }
+                                }
                                 if first_recruitment {
                                     eprintln!("sim_coverage script_group_recruitment_approx=1 clan={clan} mode={mode} units={:?}", group.as_ref().map(|group| group.members.iter().map(|unit| unit.slot).collect::<Vec<_>>()).unwrap_or_default());
                                 }
@@ -1454,6 +1467,17 @@ impl ClanAiEvents {
                 .any(|group| group.members.contains(&unit))
     }
 
+    fn combat_assignment(&self, unit: ObjectHandle) -> Option<u32> {
+        self.groups
+            .iter()
+            .find_map(|((_, key), group)| group.members.contains(&unit).then_some(key.word_0))
+            .or_else(|| {
+                self.capture_orders
+                    .iter()
+                    .find_map(|(_, key, order)| (order.unit == unit).then_some(key.word_0))
+            })
+    }
+
     pub(super) fn group_orders(&self) -> impl Iterator<Item = (usize, u32, u64)> + '_ {
         self.group_orders
             .iter()
@@ -1577,6 +1601,10 @@ impl ClanAiEvents {
 
     pub(super) fn advance_for_registration(&mut self, clan: usize) -> u64 {
         self.clocks.advance_for_registration(clan)
+    }
+
+    pub(super) fn clock_seconds(&self, clan: usize) -> u32 {
+        self.clocks.seconds(clan)
     }
 
     pub(super) fn clock_ticks(&self) -> impl Iterator<Item = (usize, u64, u64)> + '_ {

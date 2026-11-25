@@ -35,11 +35,6 @@ pub(super) fn result(
     }
 }
 
-// shortcut: approximate the native AI scheduler's logical seconds by mission elapsed seconds.
-pub(super) fn elapsed_seconds(start_ms: u32, now_ms: u32) -> u32 {
-    now_ms.wrapping_sub(start_ms) / 1_000
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
