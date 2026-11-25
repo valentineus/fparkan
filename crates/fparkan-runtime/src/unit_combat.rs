@@ -443,3 +443,153 @@ impl AutoDemoCombat {
         (events, unavailable)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        apply_projectile_hit, control_node_provider_row, create, frame, load_gameplay_mission,
+        loaded_mission_assets, loaded_mission_control_device_tables, loaded_mission_script_outcome,
+        mission_factory_raid_count, mission_guard_fallback_count, mission_object_handle,
+        player_status, projectile, starting_cockpit, EngineServices, MissionMode, MissionNotice,
+        MissionRequest, MissionScriptOutcome, MissionStartupInput,
+    };
+    use fparkan_vfs::DirectoryVfs;
+    use fparkan_world::{set_transform, OriginalObjectId, OwnerId};
+
+    fn stock_two_fortresses() -> Engine {
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed corpus");
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Single.01/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        engine
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_stock_clan_uses_script_orders_without_a_startup_raid() {
+        let mut engine = stock_two_fortresses();
+        assert_eq!(mission_guard_fallback_count(&engine), 0);
+        assert_eq!(mission_factory_raid_count(&engine), 0);
+        let waiting = mission_object_handle(&engine, OriginalObjectId(13)).unwrap();
+        assert_eq!(
+            identity_metadata(&engine.world, waiting).unwrap().owner_id,
+            Some(OwnerId(1))
+        );
+        let before = transform_state(&engine.world, waiting).unwrap();
+        frame(&mut engine, 0).unwrap();
+        assert_eq!(transform_state(&engine.world, waiting).unwrap(), before);
+        let mut produced = false;
+        for now in (100..=90_000).step_by(100) {
+            let result = frame(&mut engine, now).unwrap();
+            produced |= result.produced_unit.is_some_and(|unit| unit.clan == 1);
+        }
+        let loaded = engine.loaded.as_ref().unwrap();
+        assert!(loaded.clan_ai_events.stops().next().is_none());
+        assert!(loaded
+            .clan_ai_events
+            .group_orders()
+            .any(|(clan, _, count)| clan == 1 && count > 0));
+        assert!(loaded.unit_patrol.as_ref().is_some_and(|patrol| patrol
+            .is_patrolling(mission_object_handle(&engine, OriginalObjectId(14)).unwrap())));
+        assert!(produced, "scripted AI factory did not produce a robot");
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_scripted_patrol_fires_without_a_guard_fallback() {
+        let mut engine = stock_two_fortresses();
+        assert_eq!(mission_guard_fallback_count(&engine), 0);
+        assert!(frame(&mut engine, 0)
+            .unwrap()
+            .autodemo_combat_events
+            .is_empty());
+        let hero = starting_cockpit(&engine).unwrap();
+        let status = player_status(&engine, hero.handle).unwrap();
+        assert_eq!(status.health_percent, Some(100));
+        let table = loaded_mission_control_device_tables(&engine)
+            .unwrap()
+            .iter()
+            .find(|table| table.handle == hero.handle)
+            .unwrap();
+        let root = control_node_provider_row(table, 0).unwrap();
+        let quarter = f32::from_bits(root.initial_amount_bits) * 0.25;
+        let changed = apply_projectile_hit(&mut engine, hero.handle, quarter)
+            .unwrap()
+            .expect("hero damage provider");
+        assert!(!changed.1);
+        assert_eq!(
+            player_status(&engine, hero.handle).unwrap().health_percent,
+            Some(75)
+        );
+        // Debug poses isolate the projectile/terrain regression. Stock-start
+        // movement and script assignment are checked by the companion test.
+        let enemy = mission_object_handle(&engine, OriginalObjectId(14)).unwrap();
+        let mut enemy_pose = transform_state(&engine.world, enemy).unwrap();
+        enemy_pose.position = [1504.2733_f32, 915.2701, 67.87986].map(f32::to_bits);
+        set_transform(&mut engine.world, enemy, enemy_pose).unwrap();
+        let mut pose = transform_state(&engine.world, hero.handle).unwrap();
+        pose.position = [1504.273_f32, 917.2702, 64.927925].map(f32::to_bits);
+        set_transform(&mut engine.world, hero.handle, pose).unwrap();
+        engine
+            .loaded
+            .as_mut()
+            .unwrap()
+            .unit_patrol
+            .get_or_insert_with(UnitPatrol::scripted)
+            .order(&engine.world, enemy, [1504.2733, 915.2701], 60.0);
+        let mission = engine.loaded.as_ref().unwrap();
+        let (from, _) = projectile::unit_sphere(&mission.mission_assets, 14, enemy_pose).unwrap();
+        let (to, _) =
+            projectile::unit_sphere(&mission.mission_assets, hero.object_index, pose).unwrap();
+        let ray = [from, to];
+        let ground = projectile_terrain_hit(&mission.terrain, ray)
+            .unwrap()
+            .unwrap();
+        let contact = projectile_unit_hit(&engine, enemy, ray).unwrap();
+        assert_eq!(contact.handle, hero.handle);
+        assert!(contact.fraction < ground);
+        let mut shots = Vec::new();
+        let mut failures = 0;
+        for now in (100..=6_000).step_by(50) {
+            let step = frame(&mut engine, now).unwrap();
+            shots.extend(step.autodemo_combat_events);
+            failures += step.mission_event.map_or(0, |event| {
+                event
+                    .notices
+                    .iter()
+                    .filter(|&&notice| notice == MissionNotice::Failed)
+                    .count()
+            });
+        }
+        let assets = loaded_mission_assets(&engine).unwrap();
+        let weapons = prepare_unit_weapons(&assets.object_component_controls[14]);
+        assert!(
+            shots.iter().any(|event| matches!(event,
+            AutoDemoCombatEvent::Shot { shooter, target, .. }
+                if *shooter == enemy && *target == hero.handle)),
+            "{shots:?}, enemy weapons: {}",
+            weapons.weapons().len()
+        );
+        assert!(!shots.iter().any(|event| matches!(event,
+            AutoDemoCombatEvent::Shot { shooter, .. } if *shooter == hero.handle)));
+        assert!(transform_state(&engine.world, hero.handle).is_err());
+        assert_eq!(player_status(&engine, hero.handle), None);
+        assert_eq!(failures, 1);
+        assert_eq!(
+            loaded_mission_script_outcome(&engine),
+            Some(MissionScriptOutcome::Failed)
+        );
+    }
+}
