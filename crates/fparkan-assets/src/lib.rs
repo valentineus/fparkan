@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! Asset manager ports and transactional preparation models.
 
-use fparkan_binary::{checked_count_bytes, read_lp_bytes, Cursor, DecodeError};
+use fparkan_binary::DecodeError;
 use fparkan_material::{
     decode_mat0, decode_wear, resolve_material, MaterialFallback, ResolvedMaterial, WearTable,
     MAT0_KIND, WEAR_KIND,
@@ -30,12 +30,14 @@ pub use fparkan_terrain_format::{BuildCategory, TerrainFormatError};
 use fparkan_texm::{decode_mip_rgba8, decode_texm, TexmDocument, TexmError};
 pub use fparkan_texm::{PageRect, RgbaImage};
 use fparkan_vfs::DirectoryVfs;
+mod behavior_profile_values;
 mod chassis_profile;
+pub use behavior_profile_values::{decode_behavior_work_rates, BehaviorWorkRates};
 pub use chassis_profile::decode_chassis_can_fly;
 mod research;
 pub use research::{
-    calc_full_research_cost, ResearchCandidate, ResearchCandidateSet, ResearchCost, ResearchError,
-    ResearchTrfDocument,
+    calc_full_research_cost, research_project_rows, ResearchCandidate, ResearchCandidateSet,
+    ResearchCost, ResearchError, ResearchTrfDocument,
 };
 use std::collections::{hash_map::Entry, HashMap};
 use std::fmt;
@@ -144,75 +146,14 @@ impl From<DecodeError> for BehaviorProfileVarError {
 pub fn decode_behavior_profile_rates(
     bytes: &[u8],
 ) -> Result<BehaviorProfileRates, BehaviorProfileVarError> {
-    let mut cursor = Cursor::new(bytes);
-    let count = cursor.read_u32_le()?;
-    checked_count_bytes(u64::from(count), 28, cursor.remaining() as u64)?;
-
-    let mut transfer_ore_off_board_bits = None;
-    let mut transfer_power_out_bits = None;
-    for _ in 0..count {
-        let size = cursor.read_u32_le()?;
-        let type_index = cursor.read_u32_le()?;
-        let _flags = cursor.read_u32_le()?;
-        let field_name = read_lp_bytes(&mut cursor, 64 * 1024)?;
-        let c_string_name = field_name
-            .split(|byte| *byte == 0)
-            .next()
-            .unwrap_or_default();
-        let target_name = match c_string_name {
-            b"Transfer_Ore_OffBoard" => Some("Transfer_Ore_OffBoard"),
-            b"Transfer_Power_Out" => Some("Transfer_Power_Out"),
-            _ => None,
-        };
-        let _type_name = read_lp_bytes(&mut cursor, 64 * 1024)?;
-        let value_size = usize::try_from(size).map_err(|_| DecodeError::IntegerOverflow)?;
-        cursor.read_exact(value_size)?;
-        let capture_target = target_name.is_some_and(|name| {
-            if name == "Transfer_Ore_OffBoard" {
-                transfer_ore_off_board_bits.is_none()
-            } else {
-                transfer_power_out_bits.is_none()
-            }
-        });
-        let second_value_bits = if capture_target {
-            let name = target_name.expect("capture requires a target field");
-            if size != 4 || type_index != 3 {
-                return Err(BehaviorProfileVarError::InvalidFloatField {
-                    name,
-                    size,
-                    type_index,
-                });
-            }
-            let value = cursor.read_exact(value_size)?;
-            Some(u32::from_le_bytes(
-                value.try_into().expect("validated four-byte float row"),
-            ))
-        } else {
-            cursor.read_exact(value_size)?;
-            None
-        };
-        cursor.read_exact(8)?;
-
-        if let (Some(name), Some(value_bits)) = (target_name, second_value_bits) {
-            if name == "Transfer_Ore_OffBoard" {
-                transfer_ore_off_board_bits = Some(value_bits);
-            } else {
-                transfer_power_out_bits = Some(value_bits);
-            }
-        }
-    }
-    cursor.require_eof()?;
+    let [transfer_ore_off_board_bits, transfer_power_out_bits] =
+        behavior_profile_values::decode_pair(
+            bytes,
+            ["Transfer_Ore_OffBoard", "Transfer_Power_Out"],
+        )?;
     Ok(BehaviorProfileRates {
-        transfer_ore_off_board_bits: transfer_ore_off_board_bits.ok_or(
-            BehaviorProfileVarError::MissingField {
-                name: "Transfer_Ore_OffBoard",
-            },
-        )?,
-        transfer_power_out_bits: transfer_power_out_bits.ok_or(
-            BehaviorProfileVarError::MissingField {
-                name: "Transfer_Power_Out",
-            },
-        )?,
+        transfer_ore_off_board_bits,
+        transfer_power_out_bits,
     })
 }
 

@@ -59,8 +59,10 @@ mod clan_targeting;
 mod clan_transport_schemes;
 mod construction;
 mod construction_site;
+mod laboratory;
 mod mesh_collision;
 mod mining;
+pub use laboratory::LaboratoryReport;
 mod mission_events;
 mod ore_transport;
 mod player_motion;
@@ -1370,6 +1372,7 @@ struct LoadedMissionState {
     behavior_control_groupings: Vec<MissionBehaviorControlGroupingState>,
     research_trf_tables: Vec<MissionResearchTrfTable>,
     free_research: research::FreeResearch,
+    laboratories: laboratory::Laboratories,
     ai_startup_states: Vec<MissionAiStartupState>,
     script_bundles: Vec<MissionScriptBundle>,
     script_varset: Option<MissionScriptVarSet>,
@@ -2698,6 +2701,7 @@ fn load_mission_with_options(
         behavior_control_groupings,
         research_trf_tables,
         free_research,
+        laboratories: Default::default(),
         ai_startup_states: loaded_scripts.ai_startup_states,
         script_bundles: loaded_scripts.bundles,
         script_varset: loaded_scripts.varset,
@@ -2921,7 +2925,8 @@ pub struct SimulationReport {
     pub clan_ai_event_stops: Vec<(MissionEventStop, u64)>,
     /// Calls to stubbed research policy or status, grouped by clan and handler.
     pub clan_research_status_stubs: Vec<(usize, u8, u64)>,
-    pub clan_research_catalogs: Vec<(usize, usize, u32)>,
+    pub clan_research_catalogs: Vec<(usize, usize, u32, u64)>,
+    pub laboratory: LaboratoryReport,
     /// Counts of pending script problems by clan and problem kind.
     pub clan_problem_dispatch_stubs: std::collections::BTreeMap<(usize, u32), u64>,
     /// Starts under the approximate scheduler, grouped by clan and problem kind.
@@ -2994,6 +2999,7 @@ pub fn simulate_mission_report(
         clan_ai_event_stops: Vec::new(),
         clan_research_status_stubs: Vec::new(),
         clan_research_catalogs: Vec::new(),
+        laboratory: Default::default(),
         clan_problem_dispatch_stubs: Default::default(),
         clan_problem_starts: Vec::new(),
         script_factory_rejections: Vec::new(),
@@ -3097,6 +3103,7 @@ pub fn simulate_mission_report(
         report
             .clan_research_catalogs
             .extend(loaded.clan_ai_events.research_catalogs());
+        report.laboratory = loaded.laboratories.report();
         for problem in loaded.clan_ai_events.pending_problems() {
             *report
                 .clan_problem_dispatch_stubs

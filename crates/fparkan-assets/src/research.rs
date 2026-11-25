@@ -492,6 +492,24 @@ impl ResearchTrfDocument {
         self.flags.get(index).copied()
     }
 
+    /// Sets the researched bit without propagating availability to related rows.
+    ///
+    /// # Errors
+    /// Rejects a row outside the decoded table.
+    pub fn mark_researched_flag(&mut self, index: usize) -> Result<(), ResearchError> {
+        let count = self.flags.len();
+        let flag = self
+            .flags
+            .get_mut(index)
+            .ok_or(ResearchError::InvalidResearchIndex {
+                type_id: TRF1,
+                index: u32::try_from(index).unwrap_or(u32::MAX),
+                row_count: count,
+            })?;
+        *flag |= 2;
+        Ok(())
+    }
+
     /// Returns the raw name bytes selected by a row's low-16-bit TRFB link.
     ///
     /// # Errors
@@ -747,6 +765,28 @@ pub fn calc_full_research_cost(
     candidate: &UnitDat,
     research: &ResearchTrfDocument,
 ) -> Result<ResearchCost, ResearchError> {
+    let closure = research_project_rows(candidate, research)?;
+    let mut ore = 0.0_f32;
+    let mut power = 0.0_f32;
+    for index in closure {
+        let (included, _, _) = research.gates(index)?;
+        if included == 0 {
+            let row = &research.records[index];
+            ore = ore + f32::from_bits(row[1]);
+            power = power + f32::from_bits(row[0]);
+        }
+    }
+    Ok(ResearchCost { ore, power })
+}
+
+/// Collects unresearched project rows and their ordered prerequisite closure.
+///
+/// # Errors
+/// Rejects the same malformed candidates and table links as the cost calculation.
+pub fn research_project_rows(
+    candidate: &UnitDat,
+    research: &ResearchTrfDocument,
+) -> Result<Vec<usize>, ResearchError> {
     if research.records.is_empty() {
         return Err(ResearchError::EmptyResearchTable);
     }
@@ -766,25 +806,7 @@ pub fn calc_full_research_cost(
         }
     }
 
-    let mut ore = 0.0_f32;
-    let mut power = 0.0_f32;
-    for index in closure {
-        let (included, _, _) = research.gates(index)?;
-        if included == 0 {
-            let row = research
-                .records
-                .get(index)
-                .ok_or(ResearchError::InvalidResearchIndex {
-                    type_id: TRF0,
-                    index: u32::try_from(index).unwrap_or(u32::MAX),
-                    row_count: research.records.len(),
-                })?;
-            ore = ore + f32::from_bits(row[1]);
-            power = power + f32::from_bits(row[0]);
-        }
-    }
-
-    Ok(ResearchCost { ore, power })
+    Ok(closure)
 }
 
 fn collect_direct_indices(

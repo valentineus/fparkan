@@ -20,6 +20,7 @@ const ATTACK_UNIT: u32 = 13;
 const OPTIMAL_TRANSPORT: u32 = 4;
 const BUILDING_NEEDED: u32 = 3;
 const MINE_NEEDED: u32 = 1;
+const MAKE_RESEARCH: u32 = 10;
 
 pub(super) struct ScriptFactoryOrder {
     pub owner: OwnerId,
@@ -89,6 +90,7 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) -> Vec<MissionNotice
     let Some(loaded) = &mut engine.loaded else {
         return notices;
     };
+    crate::laboratory::tick(loaded, &engine.world, now_ms);
     crate::construction::tick(
         loaded,
         &mut engine.world,
@@ -141,7 +143,8 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) -> Vec<MissionNotice
                 OwnerId(clan as u16),
                 loaded.unit_patrol.as_ref(),
                 group,
-                |unit| loaded.construction.active(unit) || ai.transports.iter().any(|(job, task)| *job == (clan, key) && task.unit == unit),
+                |unit| loaded.construction.active(unit) || loaded.laboratories.active(unit)
+                    || ai.transports.iter().any(|(job, task)| *job == (clan, key) && task.unit == unit),
             )
         });
         if ready {
@@ -568,6 +571,7 @@ impl LoadedMissionState {
                                 .filter(|&unit| !self.mission_events.is_reserved(owner, unit)
                                     && !self.clan_ai_events.unit_assigned(unit)
                                     && !self.construction.active(unit)
+                                    && !self.laboratories.active(unit)
                                     && !production.is_some_and(|queue| queue.is_building_at(unit, owner))
                                     && !orders.iter().any(|order: &ScriptFactoryOrder| order.plant == unit))
                                 .filter(|&unit| mode == 1 || self.unit_patrol.as_ref().is_none_or(|patrol| !patrol.is_shut_down(unit)));
@@ -696,6 +700,7 @@ impl LoadedMissionState {
                                 class,
                                 |unit| !self.clan_ai_events.unit_assigned(unit)
                                     && !self.construction.active(unit)
+                                    && !self.laboratories.active(unit)
                                     && !production.is_some_and(|queue| queue.is_building_at(unit, owner))
                                     && !orders.iter().any(|order: &ScriptFactoryOrder| order.plant == unit),
                             ).unwrap_or(u32::MAX);
@@ -908,7 +913,7 @@ impl LoadedMissionState {
                                 Some(1)
                                     if problem
                                         .as_ref()
-                                        .is_some_and(|record| matches!(record.key.word_0, OPTIMAL_TRANSPORT | MINE_NEEDED | 6 | BUILDING_PROTECT | PLACE_PROTECT))
+                                        .is_some_and(|record| matches!(record.key.word_0, OPTIMAL_TRANSPORT | MINE_NEEDED | MAKE_RESEARCH | 6 | BUILDING_PROTECT | PLACE_PROTECT))
                                         || !conditions.is_empty() =>
                                 {
                                     solving = true
@@ -936,14 +941,14 @@ impl LoadedMissionState {
                             };
                             let key = problem.as_ref().expect("condition requires a problem").key;
                             let condition = match (action, mode) {
-                                (2, 0) if matches!(key.word_0, BUILDING_NEEDED | MINE_NEEDED) || (key.word_0 == OPTIMAL_TRANSPORT && solving) => {
+                                (2, 0) if matches!(key.word_0, BUILDING_NEEDED | MINE_NEEDED | MAKE_RESEARCH) || (key.word_0 == OPTIMAL_TRANSPORT && solving) => {
                                     let unit = assignment.filter(|&unit| self.mission_events
                                         .logic_objects(&self.mission, world, id).any(|handle| handle == unit))
                                         .ok_or("Handler(27) task wait requires the assigned unit")?;
                                     Some(Condition::TaskInactive(unit))
                                 }
-                                (1 | 3, 0) if matches!(key.word_0, 7 | 9) || (action == 1 && matches!(key.word_0, BUILDING_PROTECT | ATTACK_UNIT)) => {
-                                    let target = crate::mission_events::placed_logic_objects(
+                                (1 | 3, 0) if matches!(key.word_0, 7 | 9) || (action == 1 && matches!(key.word_0, BUILDING_PROTECT | ATTACK_UNIT | MAKE_RESEARCH)) => {
+                                    let target = self.mission_events.logic_objects(
                                         &self.mission, world, id
                                     ).next();
                                     Some(if action == 1 { Condition::ObjectDestroyed(target) } else {
@@ -1043,20 +1048,23 @@ impl LoadedMissionState {
                         ScriptDispatchSelector::Handler(41) if problem.is_some() => {
                             let id = single_dword(&instruction.references, values)
                                 .ok_or("Handler(41) requires a laboratory logical ID")?;
-                            let exists = self.mission_events.logic_objects(
+                            let lab = self.mission_events.logic_objects(
                                 &self.mission,
                                 world,
                                 id,
                             )
-                            .any(|handle| Some(handle) == assignment);
-                            // shortcut: reject the order until the native laboratory research task is wired.
-                            self.clan_ai_events
-                                .log_research_stub(clan, 41, &bundle.script_path);
-                            Ok(Some(VarSetDefault::Dword(if exists {
-                                0
-                            } else {
-                                u32::MAX
-                            })))
+                            .find(|handle| Some(*handle) == assignment);
+                            let Some(lab) = lab else { return Ok(Some(VarSetDefault::Dword(u32::MAX))); };
+                            let result = crate::laboratory::order(&mut self.laboratories, &self.clan_ai_events.research_catalogs,
+                                &self.object_drafts, &self.free_research, world, vfs, clan, lab, now_ms);
+                            if let Err(reason) = &result { self.laboratories.rejected(clan, lab, reason); }
+                            Ok(Some(VarSetDefault::Dword(u32::from(result.is_ok()))))
+                        }
+                        ScriptDispatchSelector::Handler(43) if crate::clan_script_init::research_catalog(instruction) => {
+                            let vfs = vfs.ok_or("research VFS is unavailable")?;
+                            let catalog = self.clan_ai_events.research_catalogs.get_mut(&clan).ok_or("research catalog is unavailable")?;
+                            catalog.refresh(vfs)?;
+                            Ok(None)
                         }
                         ScriptDispatchSelector::Handler(2) => {
                             let (name, input) = problem_operands(

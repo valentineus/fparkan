@@ -7,6 +7,7 @@ use fparkan_world::OwnerId;
 pub(super) struct ClanResearch {
     pub(super) candidates: ResearchCandidateSet,
     pub(super) table: ResearchTrfDocument,
+    pub(super) refreshes: u64,
 }
 
 impl ClanResearch {
@@ -26,12 +27,20 @@ impl ClanResearch {
             loaded: true,
             ..Default::default()
         };
-        let mut catalog = Self { candidates, table };
-        catalog
-            .candidates
-            .refresh_selection(vfs, Some(&catalog.table))
-            .map_err(|error| error.to_string())?;
+        let mut catalog = Self {
+            candidates,
+            table,
+            refreshes: 0,
+        };
+        catalog.refresh(vfs)?;
         Ok(catalog)
+    }
+
+    pub(super) fn refresh(&mut self, vfs: &dyn Vfs) -> Result<(), String> {
+        self.refreshes += 1;
+        self.candidates
+            .refresh_selection(vfs, Some(&self.table))
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -62,12 +71,13 @@ pub(super) fn initialize(
 }
 
 impl crate::clan_ai_events::ClanAiEvents {
-    pub(super) fn research_catalogs(&self) -> impl Iterator<Item = (usize, usize, u32)> + '_ {
+    pub(super) fn research_catalogs(&self) -> impl Iterator<Item = (usize, usize, u32, u64)> + '_ {
         self.research_catalogs.iter().map(|(&clan, catalog)| {
             (
                 clan,
                 catalog.candidates.entries.len(),
                 catalog.candidates.selected_index,
+                catalog.refreshes,
             )
         })
     }
