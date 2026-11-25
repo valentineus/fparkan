@@ -21,6 +21,14 @@ pub(super) fn log_script_init(engine: &Engine, mission: &str) {
 }
 
 pub(super) fn log_clan_ai_stops(report: &SimulationReport) {
+    for (object, (batches, points, checks)) in &report.patrol_points.batches {
+        eprintln!("sim_coverage mission_patrol_points_approx={points} object={object} batches={batches} walkability_queries={checks}");
+    }
+    for ((object, reason), count) in &report.patrol_points.stubs {
+        eprintln!(
+            "sim_coverage mission_patrol_points_stub={count} object={object} reason={reason}"
+        );
+    }
     for ((object, component), (count, reason)) in &report.weapon_poses.fallbacks {
         eprintln!("sim_coverage unit_weapon_pose_fallback={count} object={object} component={component} reason={reason}");
     }

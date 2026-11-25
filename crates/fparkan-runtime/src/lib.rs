@@ -71,7 +71,9 @@ mod mining;
 pub use laboratory::LaboratoryReport;
 mod mission_events;
 mod ore_transport;
+mod patrol_points;
 mod player_motion;
+pub use patrol_points::PatrolPointReport;
 mod player_status;
 mod player_weapon;
 mod production;
@@ -80,6 +82,7 @@ mod research;
 mod script_host;
 mod script_patrol;
 mod script_time;
+mod unit_chassis;
 mod unit_combat;
 mod unit_patrol;
 mod unit_size_class;
@@ -1347,6 +1350,7 @@ pub struct Engine {
     world: World,
     loaded: Option<LoadedMissionState>,
     behavior_rng_state: u32,
+    behavior_point_rng_state: u32,
     ai_rng_state: u32,
     autodemo_combat: Option<unit_combat::AutoDemoCombat>,
     autodemo_reinforcements: Option<autodemo::LiveReinforcements>,
@@ -1363,6 +1367,7 @@ struct LoadedMissionState {
     mission_assets: MissionAssets,
     asset_plan: MissionAssetPlan,
     object_drafts: Vec<MissionObjectDraft>,
+    unit_can_fly: std::collections::BTreeMap<u32, Option<bool>>,
     behavior_distributors: Vec<BehaviorDistributorState>,
     behavior_ore_states: Vec<BehaviorOreState>,
     behavior_profiles: Vec<BehaviorProfileState>,
@@ -1733,6 +1738,7 @@ pub fn create(services: EngineServices) -> Result<Engine, EngineError> {
         world: new_world(WorldConfig),
         loaded: None,
         behavior_rng_state: INITIAL_BEHAVIOR_RNG_STATE,
+        behavior_point_rng_state: 1,
         ai_rng_state: 1,
         autodemo_combat: None,
         autodemo_reinforcements: None,
@@ -2683,6 +2689,8 @@ fn load_mission_with_options(
     engine.autodemo_reinforcements = autodemo_reinforcements;
     engine.production = production;
     let free_research = research::FreeResearch::new(&object_drafts[..reserve_start]);
+    let chassis_resources = CachedResourceRepository::new(vfs.clone());
+    let unit_can_fly = unit_chassis::load_flags(&chassis_resources, &object_drafts);
     engine.loaded = Some(LoadedMissionState {
         summary: summary.clone(),
         mission,
@@ -2693,6 +2701,7 @@ fn load_mission_with_options(
         mission_assets,
         asset_plan: mission_asset_plan,
         object_drafts,
+        unit_can_fly,
         behavior_distributors,
         behavior_ore_states,
         behavior_profiles,
@@ -2754,7 +2763,11 @@ pub fn step_headless(
     input: InputSnapshot,
     queue_time_ms: u32,
 ) -> Result<FrameResult, EngineError> {
-    let resources = prepare_loaded_mission_resources(engine, queue_time_ms)?;
+    let mut resources = prepare_loaded_mission_resources(engine, queue_time_ms)?;
+    let mut crt = resources
+        .as_ref()
+        .map_or(engine.behavior_rng_state, |resources| resources.rng_state);
+    let mut point_rng = engine.behavior_point_rng_state;
     let patrol = engine
         .loaded
         .as_ref()
@@ -2766,7 +2779,15 @@ pub fn step_headless(
                 .map_or_else(Vec::new, |combat| {
                     combat.targets(&engine.world, &mission.mission_assets, Some(patrol))
                 });
-            Some(patrol.prepare(&engine.world, &mission.terrain, queue_time_ms, &targets))
+            Some(patrol.prepare(
+                &engine.world,
+                &mission.terrain,
+                queue_time_ms,
+                &targets,
+                &mission.unit_can_fly,
+                &mut crt,
+                &mut point_rng,
+            ))
         })
         .transpose()?;
     if let Some(patrol) = &patrol {
@@ -2784,8 +2805,14 @@ pub fn step_headless(
     if let (Some(patrol), Some(mission)) = (patrol, &mut engine.loaded) {
         mission.unit_patrol = Some(patrol.state);
     }
+    if let Some(resources) = &mut resources {
+        resources.rng_state = crt;
+    }
+    engine.behavior_point_rng_state = point_rng;
     if let Some(resources) = resources {
         resources.apply(engine);
+    } else {
+        engine.behavior_rng_state = crt;
     }
     if let Some(mission) = &mut engine.loaded {
         control_resources::tick(mission, &engine.world, queue_time_ms);
@@ -2952,6 +2979,7 @@ pub struct SimulationReport {
     pub control_resource_ticks: Vec<(u32, u64)>,
     pub control_resource_stops: Vec<(u32, u64, String)>,
     pub weapon_poses: WeaponPoseReport,
+    pub patrol_points: PatrolPointReport,
     /// Approximate clan strength queries, grouped by caller and target clan.
     pub script_strength_queries: Vec<(usize, u16, u64)>,
     pub script_capture_queries: Vec<(usize, u64)>,
@@ -3029,6 +3057,7 @@ pub fn simulate_mission_report(
         control_resource_ticks: Vec::new(),
         control_resource_stops: Vec::new(),
         weapon_poses: WeaponPoseReport::default(),
+        patrol_points: PatrolPointReport::default(),
         script_strength_queries: Vec::new(),
         script_capture_queries: Vec::new(),
         script_attack_queries: Vec::new(),
@@ -3136,6 +3165,9 @@ pub fn simulate_mission_report(
             .clan_research_catalogs
             .extend(loaded.clan_ai_events.research_catalogs());
         report.laboratory = loaded.laboratories.report();
+        if let Some(patrol) = &loaded.unit_patrol {
+            report.patrol_points = patrol.point_report.clone();
+        }
         report
             .control_resource_ticks
             .extend(loaded.control_resources.ticks());

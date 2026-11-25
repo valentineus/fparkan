@@ -1,32 +1,12 @@
 use super::{transform_state, Engine, EngineError, StartingCockpit, SurfaceQuery, TransformState};
 use crate::TerrainWorld;
-use fparkan_resource::{resource_name, CachedResourceRepository, ResourceRepository};
+use fparkan_resource::CachedResourceRepository;
 
 pub(super) fn warbot_can_fly(engine: &crate::Engine, object_index: usize) -> bool {
     let profile = || {
         let draft = engine.loaded.as_ref()?.object_drafts.get(object_index)?;
-        let chassis = draft.unit_components.first()?;
-        let archive = crate::bounded_ascii_c_string(&chassis.archive_raw)?;
-        let registry_path = crate::normalize_engine_path("chassis archive", &archive).ok()?;
         let resources = CachedResourceRepository::new(engine.services.vfs.as_ref()?.clone());
-        let registry = resources.open_archive(&registry_path).ok()?;
-        let name = crate::bounded_ascii_c_string(&chassis.resource_raw)?;
-        let entry = resources
-            .find(registry, &resource_name(name.as_bytes()))
-            .ok()??;
-        let references =
-            fparkan_prototype::decode_registry_entry(resources.read(entry).ok()?.as_slice())
-                .ok()?;
-        // AniMesh supplies the sixth resource pair to CreateBehaviour.
-        let profile = references.get(5)?;
-        let archive = crate::bounded_ascii_c_string(&profile.archive_raw)?;
-        let path = crate::normalize_engine_path("chassis profile archive", &archive).ok()?;
-        let name = crate::bounded_ascii_c_string(&profile.resource_raw)?;
-        let archive = resources.open_archive(&path).ok()?;
-        let entry = resources
-            .find(archive, &resource_name(name.as_bytes()))
-            .ok()??;
-        fparkan_assets::decode_chassis_can_fly(resources.read(entry).ok()?.as_slice()).ok()?
+        crate::unit_chassis::can_fly(&resources, draft)
     };
     profile().unwrap_or_else(|| {
         eprintln!("sim_coverage player_chassis_profile_stub=1 object={object_index}");

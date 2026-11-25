@@ -2,13 +2,14 @@ use super::{
     autodemo::{MOBILE_UNIT, PLANT_CLASS},
     boarding::WARBOT_CLASS,
     next_crt_rand,
+    patrol_points::{PatrolPointReport, PatrolPoints},
     unit_combat::CombatTarget,
     EngineError, MissionDocument, MissionObjectDraft, MissionScriptBundle, ObjectHandle,
     TerrainWorld, TransformState, World,
 };
 use fparkan_script::{Handler15TargetPayload, ScriptDispatchSelector, VarSet};
 use fparkan_terrain::{NavigationQuery, RouteRequest, SurfaceQuery};
-use fparkan_world::{set_transform, transform_state};
+use fparkan_world::{identity_metadata, set_transform, transform_state};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
 mod orders;
@@ -23,6 +24,7 @@ pub(super) struct UnitPatrol {
     script_order_counts: BTreeMap<(u32, u32), u64>,
     clock_ms: u32,
     rng: u32,
+    pub(super) point_report: PatrolPointReport,
     pub(super) factory_raid_clans: usize,
 }
 
@@ -34,6 +36,7 @@ struct PatrollingUnit {
     destinations: Option<VecDeque<[f32; 2]>>,
     radius: f32,
     points: VecDeque<[f32; 2]>,
+    place_points: PatrolPoints,
     retry_ms: u32,
     attack: Option<ObjectHandle>,
     attack_target: Option<(ObjectHandle, usize)>,
@@ -147,6 +150,7 @@ impl UnitPatrol {
             script_order_counts: BTreeMap::new(),
             clock_ms: 0,
             rng: 1,
+            point_report: PatrolPointReport::default(),
             factory_raid_clans: 0,
         }
     }
@@ -175,6 +179,7 @@ impl UnitPatrol {
                 unit.center = center;
                 unit.radius = radius;
                 unit.points.clear();
+                unit.place_points = PatrolPoints::default();
                 unit.retry_ms = 0;
                 return true;
             }
@@ -187,6 +192,7 @@ impl UnitPatrol {
             destinations: None,
             radius,
             points: VecDeque::new(),
+            place_points: PatrolPoints::default(),
             retry_ms: 0,
             attack: None,
             attack_target: None,
@@ -370,6 +376,7 @@ impl UnitPatrol {
                 destinations: None,
                 radius: 150.0,
                 points: VecDeque::new(),
+                place_points: PatrolPoints::default(),
                 retry_ms: 0,
                 attack: None,
                 attack_target: None,
@@ -384,6 +391,7 @@ impl UnitPatrol {
             script_order_counts: BTreeMap::new(),
             clock_ms: 0,
             rng: 1,
+            point_report: PatrolPointReport::default(),
             factory_raid_clans: 0,
         })
     }
@@ -394,6 +402,9 @@ impl UnitPatrol {
         terrain: &TerrainWorld,
         now_ms: u32,
         targets: &[(ObjectHandle, CombatTarget)],
+        chassis: &BTreeMap<u32, Option<bool>>,
+        crt: &mut u32,
+        count_rng: &mut u32,
     ) -> Result<PreparedPatrol, EngineError> {
         let mut state = self.clone();
         state.advance_script_orders(world);
@@ -406,9 +417,6 @@ impl UnitPatrol {
         let seconds = now_ms.saturating_sub(state.clock_ms) as f32 * 0.001;
         state.clock_ms = state.clock_ms.max(now_ms);
         let mut poses = Vec::new();
-        if seconds == 0.0 {
-            return Ok(PreparedPatrol { state, poses });
-        }
         for unit in &mut state.units {
             let Ok(before) = transform_state(world, unit.handle) else {
                 continue;
@@ -442,6 +450,86 @@ impl UnitPatrol {
                 unit.retry_ms = 0;
                 unit.attack = enemy.map(|target| target.handle);
             }
+            let place_patrol = unit.center_object.is_none()
+                && unit.destinations.is_none()
+                && unit.attack_target.is_none()
+                && unit.raid_factory.is_none();
+            if place_patrol && (enemy.is_none() || unit.place_points.current().is_none()) {
+                let original_id = identity_metadata(world, unit.handle)
+                    .ok()
+                    .and_then(|identity| identity.original_id)
+                    .map_or(unit.handle.slot, |id| id.0);
+                let can_fly = chassis.get(&original_id).copied().flatten();
+                if let Some(bounds) = terrain.surface_bounds() {
+                    let mut checks = 0;
+                    let refreshed = unit.place_points.refresh(
+                        center,
+                        unit.radius,
+                        bounds,
+                        now_ms,
+                        crt,
+                        count_rng,
+                        |[x, y]| {
+                            if can_fly == Some(true) {
+                                return Ok(true);
+                            }
+                            checks += 1;
+                            // shortcut: area presence substitutes for native area walkability
+                            // until the native ArealMap flags are projected.
+                            Ok(terrain
+                                .locate_areal([x, y, 0.0])
+                                .map_err(EngineError::Terrain)?
+                                .is_some())
+                        },
+                    )?;
+                    if refreshed {
+                        let totals = state.point_report.batches.entry(original_id).or_default();
+                        if totals.0 == 0 {
+                            eprintln!("mission_patrol_points_approx object={original_id} (seed, global owner order and ground walkability remain open)");
+                        }
+                        totals.0 += 1;
+                        totals.1 += unit.place_points.len() as u64;
+                        totals.2 += checks;
+                        if can_fly.is_none() {
+                            let count = state
+                                .point_report
+                                .stubs
+                                .entry((original_id, "chassis_can_fly"))
+                                .or_default();
+                            if *count == 0 {
+                                eprintln!("mission_patrol_points_stub object={original_id} reason=chassis_can_fly");
+                            }
+                            *count += 1;
+                        }
+                        unit.points.clear();
+                        unit.retry_ms = 0;
+                    }
+                    if unit
+                        .place_points
+                        .current()
+                        .is_some_and(|[x, y]| (x - from[0]).hypot(y - from[1]) <= 0.05)
+                    {
+                        unit.place_points.advance();
+                        unit.points.clear();
+                        unit.retry_ms = 0;
+                    }
+                } else {
+                    let count = state
+                        .point_report
+                        .stubs
+                        .entry((original_id, "terrain_bounds"))
+                        .or_default();
+                    if *count == 0 {
+                        eprintln!(
+                            "mission_patrol_points_stub object={original_id} reason=terrain_bounds"
+                        );
+                    }
+                    *count += 1;
+                }
+            }
+            if seconds == 0.0 {
+                continue;
+            }
             if let Some(enemy) = enemy.filter(|enemy| enemy.in_range) {
                 let mut after = before;
                 let (yaw, _) = turn_toward(
@@ -471,6 +559,17 @@ impl UnitPatrol {
                         .unwrap_or_default()
                 } else if unit.attack_target.is_some() {
                     VecDeque::new()
+                } else if let Some([x, y]) = unit.place_points.current().filter(|_| place_patrol) {
+                    let route = terrain
+                        .height_at([x, y])
+                        .map_err(EngineError::Terrain)?
+                        .map(|z| route_points(terrain, from, [x, y, z]))
+                        .transpose()?
+                        .flatten();
+                    if route.is_none() {
+                        unit.place_points.advance();
+                    }
+                    route.unwrap_or_default()
                 } else {
                     choose_route(terrain, from, center, unit.radius, &mut state.rng)?
                 };
