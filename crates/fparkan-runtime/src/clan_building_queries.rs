@@ -83,8 +83,9 @@ mod tests {
             None,
         )
         .unwrap();
+        let mut heard = Vec::new();
         for now in (0..=900_000).step_by(100) {
-            crate::frame(&mut engine, now).unwrap();
+            heard.extend(crate::frame(&mut engine, now).unwrap().clan_notices);
             if engine
                 .loaded
                 .as_ref()
@@ -96,6 +97,13 @@ mod tests {
                 break;
             }
         }
+        assert_eq!(
+            heard
+                .iter()
+                .filter(|&&notice| notice == crate::MissionNotice::Information(0))
+                .count(),
+            1
+        );
         let loaded = engine.loaded.as_ref().unwrap();
         let actor = loaded
             .mission_events
@@ -126,12 +134,13 @@ mod tests {
             .clan_ai_events
             .size_class_queries()
             .any(|(clan, id, count)| clan == 1 && id == 0x8000_0003 && count > 0));
-        assert!(loaded
-            .clan_ai_events
-            .stops()
-            .all(|(stop, _)| !["Handler(71)", "Handler(72)"]
-                .iter()
-                .any(|handler| stop.reason.starts_with(handler))));
+        assert!(loaded.clan_ai_events.stops().all(|(stop, _)| ![
+            "Handler(30)",
+            "Handler(71)",
+            "Handler(72)"
+        ]
+        .iter()
+        .any(|handler| stop.reason.starts_with(handler))));
 
         let classified = loaded
             .mission_events

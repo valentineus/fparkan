@@ -4,7 +4,7 @@ use crate::{
     clan_combat_groups::{CombatGroup, GroupTarget},
     clan_targeting::CaptureApproach,
 };
-use crate::{BehaviorOreState, LoadedMissionState, MissionEventStop};
+use crate::{BehaviorOreState, LoadedMissionState, MissionEventStop, MissionNotice};
 use fparkan_script::{
     Handler15TargetPayload, Handler2Record, Handler2RecordInput, Handler2RecordKey,
     Handler2RecordScheduler, ScriptDispatchSelector, VarSet, VarSetDefault,
@@ -83,9 +83,10 @@ pub(super) fn resolve_captures(
     Ok(captured)
 }
 
-pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) {
+pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) -> Vec<MissionNotice> {
+    let mut notices = Vec::new();
     let Some(loaded) = &mut engine.loaded else {
-        return;
+        return notices;
     };
     crate::construction::tick(loaded, &mut engine.world, now_ms);
     loaded.clan_ai_events.groups.retain(|&(clan, _), group| {
@@ -166,6 +167,7 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) {
         engine.production.as_ref(),
         engine.services.vfs.as_deref(),
         now_ms,
+        &mut notices,
     ) {
         match crate::production::order_script_factory(
             engine,
@@ -213,6 +215,7 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) {
             }
         }
     }
+    notices
 }
 
 #[derive(Default)]
@@ -264,6 +267,7 @@ impl LoadedMissionState {
         production: Option<&crate::production::Production>,
         vfs: Option<&dyn fparkan_vfs::Vfs>,
         now_ms: u32,
+        notices: &mut Vec<MissionNotice>,
     ) -> Vec<ScriptFactoryOrder> {
         let mut orders = Vec::new();
         let Some(varset) = &self.script_varset else {
@@ -419,6 +423,16 @@ impl LoadedMissionState {
                                 .ok_or("Handler(12) requires a current problem")?
                                 .scalar_1;
                             Ok(Some(VarSetDefault::FloatBits(priority.to_bits())))
+                        }
+                        ScriptDispatchSelector::Handler(30) => {
+                            let command = varset.declarations
+                                .resolve_handler30_with_values(instruction, values)
+                                .map_err(|error| error.to_string())?;
+                            crate::script_host::apply(
+                                self.script_host_mode, &mut self.script_host_status,
+                                &mut self.script_outcome, &mut self.mission_events, command, notices,
+                            )?;
+                            Ok(None)
                         }
                         ScriptDispatchSelector::Handler(71) => {
                             let &[radius, class, estimate] = instruction.references.as_slice() else {

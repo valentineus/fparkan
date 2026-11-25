@@ -66,7 +66,7 @@ enum ObjectiveState {
 }
 
 #[derive(Default)]
-struct MissionObjectives {
+pub(super) struct MissionObjectives {
     primary_count: usize,
     states: Vec<ObjectiveState>,
 }
@@ -111,7 +111,7 @@ impl MissionObjectives {
         }
     }
 
-    fn apply(
+    pub(super) fn apply(
         &mut self,
         command: u32,
         index: u32,
@@ -145,12 +145,12 @@ pub(super) struct MissionEvents {
     next_ms: u32,
     reported_stops: HashSet<(usize, usize)>,
     inside_hero_exit: bool,
-    voiced_messages: HashSet<u32>,
+    pub(super) voiced_messages: HashSet<u32>,
     reserved_units: HashSet<(usize, ObjectHandle)>,
     placed_clan_objects: Vec<(ObjectHandle, u32)>,
     issued_logic_ids: HashMap<ObjectHandle, u32>,
     next_logic_id: u32,
-    objectives: MissionObjectives,
+    pub(super) objectives: MissionObjectives,
 }
 
 impl MissionEvents {
@@ -938,46 +938,14 @@ impl LoadedMissionState {
                     let command = declarations
                         .resolve_handler30_with_values(instruction, values)
                         .map_err(|error| error.to_string())?;
-                    if self.script_host_mode == super::MissionMode::AutoDemo {
-                        return Ok(None);
-                    }
-                    let outcome = match command.first {
-                        0 => Some(command),
-                        1 => {
-                            if mission_events.voiced_messages.insert(command.second) {
-                                notices.push(MissionNotice::Information(command.second));
-                            }
-                            None
-                        }
-                        3..=5 => mission_events
-                            .objectives
-                            .apply(command.first, command.second, &mut notices)?
-                            .then_some(VmHostCallbackCommand {
-                                mode: 0,
-                                first: 0,
-                                second: 1,
-                            }),
-                        _ => return Err(format!("Handler(30) command {}", command.first)),
-                    };
-                    if let Some(outcome) = outcome {
-                        match apply_recovered_script_host_callback(
-                            self.script_host_mode,
-                            &mut self.script_host_status,
-                            &mut self.script_outcome,
-                            outcome,
-                        ) {
-                            MissionScriptHostEffect::MissionCompleted => {
-                                notices.push(MissionNotice::Completed)
-                            }
-                            MissionScriptHostEffect::MissionFailed => {
-                                notices.push(MissionNotice::Failed)
-                            }
-                            MissionScriptHostEffect::NoChange => {}
-                            MissionScriptHostEffect::Unhandled => {
-                                return Err(format!("Handler(30) outcome {}", outcome.second))
-                            }
-                        }
-                    }
+                    crate::script_host::apply(
+                        self.script_host_mode,
+                        &mut self.script_host_status,
+                        &mut self.script_outcome,
+                        mission_events,
+                        command,
+                        &mut notices,
+                    )?;
                     Ok(None)
                 }
                 selector => Err(format!("{selector:?}")),

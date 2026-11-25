@@ -7,6 +7,7 @@ mod camera_capture;
 mod control_effects;
 use control_effects::{advance_control_effect_instances, owner_control_capacity};
 mod mission_hints;
+mod mission_notices;
 mod player_collision;
 mod projectile_trail;
 mod script_coverage;
@@ -98,9 +99,9 @@ use fparkan_runtime::{
     projectile_terrain_hit, projectile_unit_hit, query_building_segment_world,
     simulate_mission_report, starting_cockpit, starting_player_weapons, AutoDemoCamera,
     AutoDemoView, BasementPlacementMode, BuildingMeshNode, Engine, EngineError, EngineServices,
-    FrameResult, LoadedMission, MissionAssets, MissionEventStop, MissionMode, MissionNotice,
-    MissionObjectDraft, MissionRequest, MissionStartupInput, PlayerMotion, PlayerProjectile,
-    PlayerWeapons, StartingCockpit, SIMULATION_COVERAGE,
+    FrameResult, LoadedMission, MissionAssets, MissionEventStop, MissionMode, MissionObjectDraft,
+    MissionRequest, MissionStartupInput, PlayerMotion, PlayerProjectile, PlayerWeapons,
+    StartingCockpit, SIMULATION_COVERAGE,
 };
 #[cfg(test)]
 use fparkan_runtime::{load_mission_with_init_stubs, plan_player_motion};
@@ -11376,48 +11377,14 @@ impl StaticVulkanApp {
                 for &(handle, [x, y]) in &tick.patrol_orders {
                     eprintln!("mission_patrol_order unit={} target=[{x},{y}] queue_time_ms={control_clock_ms}", handle.slot);
                 }
-                for &notice in &tick.notices {
-                    match notice {
-                        MissionNotice::ObjectiveComplete(index) => eprintln!("mission_objective index={index} status=complete queue_time_ms={control_clock_ms}"),
-                        MissionNotice::Completed | MissionNotice::Failed => {
-                            let status = if notice == MissionNotice::Completed {
-                                "completed"
-                            } else {
-                                "failed"
-                            };
-                            eprintln!("mission_outcome status={status} queue_time_ms={control_clock_ms}");
-                        }
-                        MissionNotice::Information(index) => {
-                            #[cfg(windows)]
-                            {
-                                let queued = self.mission_hints.as_mut()
-                                    .ok_or_else(|| "mission text resources unavailable".to_string())
-                                    .and_then(|hints| hints.enqueue(index));
-                                if let Err(error) = queued {
-                                    eprintln!("sim_coverage mission_text_unavailable=1 index={index} reason={error}");
-                                }
-                            }
-                            #[cfg(not(windows))]
-                            eprintln!("sim_coverage mission_text_unavailable=1 index={index} reason=platform");
-                        }
-                    }
-                    if let Some(audio) = &mut self.audio {
-                        let voice = match notice {
-                            MissionNotice::Information(index) => audio.queue_mission_voice(index),
-                            MissionNotice::ObjectiveComplete(_) => {
-                                audio.queue_game_voice("VOICE_OBJ_COMPLETE")
-                            }
-                            MissionNotice::Completed => {
-                                audio.queue_game_voice("VOICE_MISSION_COMPLETE")
-                            }
-                            MissionNotice::Failed => audio.queue_game_voice("VOICE_MISSION_FAIL"),
-                        };
-                        match voice {
-                            Ok(resource) => eprintln!("mission_voice notice={notice:?} resource={resource} queue_time_ms={control_clock_ms}"),
-                            Err(error) => eprintln!("sim_coverage mission_voice_unavailable=1 notice={notice:?} reason={error}"),
-                        }
-                    }
-                }
+            }
+            for &notice in frame
+                .mission_event
+                .iter()
+                .flat_map(|tick| &tick.notices)
+                .chain(&frame.clan_notices)
+            {
+                self.present_mission_notice(notice, control_clock_ms);
             }
             self.mission_frame = Some(frame);
         }

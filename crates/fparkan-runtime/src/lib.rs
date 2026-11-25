@@ -65,6 +65,7 @@ mod player_weapon;
 mod production;
 mod projectile;
 mod research;
+mod script_host;
 mod script_patrol;
 mod script_time;
 mod unit_combat;
@@ -1317,6 +1318,8 @@ pub struct FrameResult {
     pub snapshot: WorldSnapshot,
     /// Periodic script event attempted on this step, if due.
     pub mission_event: Option<MissionEventTick>,
+    /// Notifications emitted by clan AI scripts on this step.
+    pub clan_notices: Vec<MissionNotice>,
     /// Vertical aim of the controlled hero as an IEEE-754 radian value.
     pub player_pitch_bits: u32,
     /// Autonomous combat events during the step.
@@ -2865,7 +2868,7 @@ pub fn step_headless(
         .loaded
         .as_mut()
         .and_then(|state| state.tick_mission_event(&engine.world, queue_time_ms));
-    clan_ai_events::tick(engine, queue_time_ms);
+    let clan_notices = clan_ai_events::tick(engine, queue_time_ms);
     let researched_component = engine
         .loaded
         .as_mut()
@@ -2873,6 +2876,7 @@ pub fn step_headless(
     Ok(FrameResult {
         snapshot,
         mission_event,
+        clan_notices,
         autodemo_combat_events,
         autodemo_combat_unavailable,
         autodemo_reinforcements,
@@ -3088,6 +3092,11 @@ pub fn simulate_mission_report(
                 AutoDemoCombatEvent::BuildingHit { .. } => continue,
             };
         }
+        report.mission_messages += frame
+            .clan_notices
+            .iter()
+            .filter(|notice| matches!(notice, MissionNotice::Information(_)))
+            .count() as u64;
         if let Some(event) = frame.mission_event {
             report.mission_events += 1;
             report.mission_event_stops.extend(event.stop);
