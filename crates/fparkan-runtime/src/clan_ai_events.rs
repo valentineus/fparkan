@@ -687,15 +687,10 @@ impl LoadedMissionState {
                                 .declarations
                                 .resolve_handler15_with_values(instruction, values)
                                 .map_err(|error| error.to_string())?;
-                            if let (3, 3, Handler15TargetPayload::ByLogicId(target)) =
-                                (order.word_1, order.word_2, order.target)
-                            {
+                            if crate::unit_patrol::supports_order(&order) {
                                 let patrol = self.unit_patrol.get_or_insert_with(crate::unit_patrol::UnitPatrol::scripted);
-                                let accepted = crate::script_patrol::apply_attack_order(
-                                    patrol, &self.mission, &self.object_drafts, world,
-                                    order.word_0, target,
-                                ).is_some();
-                                return Ok(Some(VarSetDefault::Dword(u32::from(accepted))));
+                                return Ok(patrol.script_order(world, &self.mission, &self.object_drafts, order)
+                                    .map(VarSetDefault::Dword));
                             }
                             if let (7, 3, Handler15TargetPayload::ByPlace { first, second }) =
                                 (order.word_1, order.word_2, order.target)

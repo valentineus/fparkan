@@ -9,13 +9,18 @@ use super::{
 use fparkan_script::{Handler15TargetPayload, ScriptDispatchSelector, VarSet};
 use fparkan_terrain::{NavigationQuery, RouteRequest, SurfaceQuery};
 use fparkan_world::{set_transform, transform_state};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
+
+mod orders;
+pub(super) use orders::supports_order;
 
 #[derive(Clone)]
 pub(super) struct UnitPatrol {
     center: Option<[f32; 2]>,
     units: Vec<PatrollingUnit>,
     shut_down: HashSet<ObjectHandle>,
+    script_orders: Vec<(ObjectHandle, VecDeque<orders::UnitOrder>)>,
+    script_order_counts: BTreeMap<(u32, u32), u64>,
     clock_ms: u32,
     rng: u32,
     pub(super) factory_raid_clans: usize,
@@ -138,6 +143,8 @@ impl UnitPatrol {
             center: None,
             units: Vec::new(),
             shut_down: HashSet::new(),
+            script_orders: Vec::new(),
+            script_order_counts: BTreeMap::new(),
             clock_ms: 0,
             rng: 1,
             factory_raid_clans: 0,
@@ -151,6 +158,7 @@ impl UnitPatrol {
         center: [f32; 2],
         radius: f32,
     ) -> bool {
+        self.script_orders.retain(|(unit, _)| *unit != handle);
         self.shut_down.remove(&handle);
         self.units
             .retain(|unit| transform_state(world, unit.handle).is_ok());
@@ -265,6 +273,7 @@ impl UnitPatrol {
     }
 
     pub(super) fn shut_down(&mut self, handle: ObjectHandle) -> bool {
+        self.script_orders.retain(|(unit, _)| *unit != handle);
         // shortcut: stop autonomous movement and fire until the native shutdown task is modeled.
         self.units.retain(|unit| unit.handle != handle);
         self.shut_down.insert(handle)
@@ -371,6 +380,8 @@ impl UnitPatrol {
             center: Some(center),
             units,
             shut_down: HashSet::new(),
+            script_orders: Vec::new(),
+            script_order_counts: BTreeMap::new(),
             clock_ms: 0,
             rng: 1,
             factory_raid_clans: 0,
@@ -385,6 +396,7 @@ impl UnitPatrol {
         targets: &[(ObjectHandle, CombatTarget)],
     ) -> Result<PreparedPatrol, EngineError> {
         let mut state = self.clone();
+        state.advance_script_orders(world);
         state.units.retain(|unit| {
             unit.destinations
                 .as_ref()

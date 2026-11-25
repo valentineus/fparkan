@@ -918,6 +918,17 @@ impl LoadedMissionState {
                     let order = declarations
                         .resolve_handler15_with_values(instruction, values)
                         .map_err(|error| error.to_string())?;
+                    if crate::unit_patrol::supports_order(&order) {
+                        let patrol = self
+                            .unit_patrol
+                            .get_or_insert_with(crate::unit_patrol::UnitPatrol::scripted);
+                        return Ok(patrol.script_order(
+                            world,
+                            &self.mission,
+                            &self.object_drafts,
+                            order,
+                        ));
+                    }
                     let Some(order) = crate::script_patrol::ScriptPatrol::from_order(order) else {
                         return Err(format!(
                             "Handler(15) order={} insertion={} target={:?}",

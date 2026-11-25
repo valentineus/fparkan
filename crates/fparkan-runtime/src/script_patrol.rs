@@ -5,32 +5,6 @@ use fparkan_world::{
     handle_by_original_id, transform_state, ObjectHandle, OriginalObjectId, World,
 };
 
-pub(super) fn apply_attack_order(
-    patrol: &mut UnitPatrol,
-    mission: &MissionDocument,
-    drafts: &[MissionObjectDraft],
-    world: &World,
-    id: u32,
-    target_id: u32,
-) -> Option<()> {
-    let actor = warbot_by_logic_id(mission, drafts, world, id)?;
-    let target = crate::mission_events::placed_logic_objects(mission, world, target_id).next()?;
-    let index = fparkan_world::identity_metadata(world, target)
-        .ok()?
-        .original_id?
-        .0 as usize;
-    let [x, y, _] = transform_state(world, target)
-        .ok()?
-        .position
-        .map(f32::from_bits);
-    patrol.set_attack_target(world, actor, target, index, [x, y]);
-    eprintln!(
-        "sim_coverage script_attack_approx=1 unit={} id={id} target_id={target_id} target_unit={}",
-        actor.slot, target.slot
-    );
-    Some(())
-}
-
 pub(super) fn warbot_by_logic_id(
     mission: &MissionDocument,
     drafts: &[MissionObjectDraft],

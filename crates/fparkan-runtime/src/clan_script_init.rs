@@ -9,16 +9,7 @@ pub(super) enum InitOrder {
         limit: f32,
     },
     Patrol(ScriptPatrol),
-    Attack {
-        id: u32,
-        target: u32,
-    },
-    Move {
-        id: u32,
-        destination: [u32; 2],
-        append: bool,
-    },
-    Shutdown(u32),
+    Unit(fparkan_script::Handler15Invocation),
     Reserve {
         clan: usize,
         id: u32,
@@ -66,28 +57,8 @@ pub(super) fn unit_order(
     let order = declarations
         .resolve_handler15_with_values(instruction, values)
         .ok()?;
-    if let (3, 3, Handler15TargetPayload::ByLogicId(target)) =
-        (order.word_1, order.word_2, order.target)
-    {
-        return Some(InitOrder::Attack {
-            id: order.word_0,
-            target,
-        });
-    }
-    if let (2, insertion @ (1 | 3), Handler15TargetPayload::ByPlace { first, second }) =
-        (order.word_1, order.word_2, order.target)
-    {
-        return Some(InitOrder::Move {
-            id: order.word_0,
-            destination: [first, second],
-            append: insertion == 1,
-        });
-    }
-    if matches!(
-        (order.word_1, order.word_2, order.target),
-        (0x13, 3, Handler15TargetPayload::None)
-    ) {
-        return Some(InitOrder::Shutdown(order.word_0));
+    if crate::unit_patrol::supports_order(&order) {
+        return Some(InitOrder::Unit(order));
     }
     ScriptPatrol::from_order(order).map(InitOrder::Patrol)
 }

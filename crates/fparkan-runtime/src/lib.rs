@@ -2483,10 +2483,7 @@ fn load_mission_with_options(
             MissionMode::SingleMission => (init_orders.iter().any(|order| {
                 matches!(
                     order,
-                    clan_script_init::InitOrder::Patrol(_)
-                        | clan_script_init::InitOrder::Attack { .. }
-                        | clan_script_init::InitOrder::Move { .. }
-                        | clan_script_init::InitOrder::Shutdown(_)
+                    clan_script_init::InitOrder::Patrol(_) | clan_script_init::InitOrder::Unit(_)
                 )
             }) || loaded_scripts
                 .bundles
@@ -2584,60 +2581,11 @@ fn load_mission_with_options(
             clan_script_init::InitOrder::Reserve { clan, id, reserved } => {
                 mission_events.set_reservation(&mission, &new_runtime_world, clan, id, reserved);
             }
-            clan_script_init::InitOrder::Attack { id, target } => {
+            clan_script_init::InitOrder::Unit(order) => {
                 let Some(patrol) = &mut unit_patrol else {
                     continue;
                 };
-                script_patrol::apply_attack_order(
-                    patrol,
-                    &mission,
-                    &object_drafts,
-                    &new_runtime_world,
-                    id,
-                    target,
-                );
-            }
-            clan_script_init::InitOrder::Move {
-                id,
-                destination,
-                append,
-            } => {
-                let Some(patrol) = &mut unit_patrol else {
-                    continue;
-                };
-                if let Some(handle) = script_patrol::unit_by_logic_id(
-                    &mission,
-                    &object_drafts,
-                    &new_runtime_world,
-                    id,
-                    |class| class & autodemo::MOBILE_UNIT != 0 && class != HERO_UNIT_CLASS,
-                ) {
-                    patrol.move_to(
-                        &new_runtime_world,
-                        handle,
-                        destination.map(|axis| axis as f32),
-                        append,
-                    );
-                    eprintln!("sim_coverage script_move_approx=1 unit={} id={id} destination={destination:?} append={append}", handle.slot);
-                }
-            }
-            clan_script_init::InitOrder::Shutdown(id) => {
-                let Some(patrol) = &mut unit_patrol else {
-                    continue;
-                };
-                if let Some(handle) = script_patrol::warbot_by_logic_id(
-                    &mission,
-                    &object_drafts,
-                    &new_runtime_world,
-                    id,
-                ) {
-                    if patrol.shut_down(handle) {
-                        eprintln!(
-                            "sim_coverage unit_shutdown_approx=1 unit={} id={id}",
-                            handle.slot
-                        );
-                    }
-                }
+                patrol.script_order(&new_runtime_world, &mission, &object_drafts, order);
             }
         }
     }
@@ -2980,6 +2928,7 @@ pub struct SimulationReport {
     pub script_point_patrol_continues: Vec<(usize, u32, u32, u64)>,
     pub script_free_unit_queries: Vec<(usize, u32, u32, u64)>,
     pub script_group_recruitments: Vec<(usize, u32, u64)>,
+    pub script_unit_order_counts: Vec<(u32, u32, u64)>,
     pub script_class_target_queries: Vec<(usize, u32, u32, u64)>,
     pub script_size_class_queries: Vec<(usize, u32, u64)>,
     pub script_problem_waits: Vec<(usize, u32, u64)>,
@@ -3042,6 +2991,7 @@ pub fn simulate_mission_report(
         script_point_patrol_continues: Vec::new(),
         script_free_unit_queries: Vec::new(),
         script_group_recruitments: Vec::new(),
+        script_unit_order_counts: Vec::new(),
         script_class_target_queries: Vec::new(),
         script_size_class_queries: Vec::new(),
         script_problem_waits: Vec::new(),
@@ -3108,6 +3058,11 @@ pub fn simulate_mission_report(
         }
     }
     if let Some(loaded) = &engine.loaded {
+        if let Some(patrol) = &loaded.unit_patrol {
+            report
+                .script_unit_order_counts
+                .extend(patrol.script_order_counts());
+        }
         report.clan_ai_event_stops.extend(
             loaded
                 .clan_ai_events
