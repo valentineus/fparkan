@@ -6,15 +6,15 @@ use std::collections::BTreeMap;
 
 const LAB_CLASS: u32 = 0x8000_0400;
 
-/// Executed laboratory orders and the remaining native completion boundary.
+/// Executed laboratory orders and technology state changes.
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct LaboratoryReport {
     /// Accepted/rejected orders by clan and laboratory.
     pub orders: Vec<(usize, u32, u64, u64)>,
     /// Completed technologies by clan, laboratory and TRF row.
     pub completed: Vec<(usize, u32, usize, u64)>,
-    /// Native availability propagation still omitted after each completed row.
-    pub unlock_stubs: Vec<(usize, usize, u64)>,
+    /// Newly available technologies by clan and TRF row.
+    pub available: Vec<(usize, usize, u64)>,
     /// Orders stopped by unavailable runtime state, by clan and laboratory.
     pub stopped: Vec<(usize, u32, u64)>,
 }
@@ -26,7 +26,7 @@ pub(super) struct Laboratories {
     progress: BTreeMap<(usize, usize), f32>,
     orders: BTreeMap<(usize, u32), (u64, u64)>,
     completed: BTreeMap<(usize, u32, usize), u64>,
-    unlock_stubs: BTreeMap<(usize, usize), u64>,
+    available: BTreeMap<(usize, usize), u64>,
     stopped: BTreeMap<(usize, u32), u64>,
 }
 
@@ -111,8 +111,8 @@ impl Laboratories {
                 .iter()
                 .map(|(&(clan, lab, row), &count)| (clan, lab, row, count))
                 .collect(),
-            unlock_stubs: self
-                .unlock_stubs
+            available: self
+                .available
                 .iter()
                 .map(|(&(clan, row), &count)| (clan, row, count))
                 .collect(),
@@ -318,25 +318,28 @@ fn advance(
     *progress = work.advance(seconds, rate, uses, ore, *progress);
     if *progress + 0.001 >= 1.0 {
         *progress = 1.0;
-        catalog
+        let changes = catalog
             .table
-            .mark_researched_flag(*row)
+            .complete_research(*row)
             .map_err(|error| error.to_string())?;
-        mission.free_research.learned.insert((owner, *row));
-        *state
-            .completed
-            .entry((order.clan, order.lab.slot, *row))
-            .or_default() += 1;
-        // shortcut: mark the learned row until native dependent-availability propagation is wired.
-        *state.unlock_stubs.entry((order.clan, *row)).or_default() += 1;
-        eprintln!(
-            "sim_coverage script_research_unlock_stub=1 clan={} row={row}",
-            order.clan
-        );
-        eprintln!(
-            "script_lab_technology_researched clan={} lab={} row={row} queue_time_ms={now_ms}",
-            order.clan, order.lab.slot
-        );
+        for row in changes.available {
+            *state.available.entry((order.clan, row)).or_default() += 1;
+            eprintln!(
+                "script_lab_technology_available clan={} row={row} queue_time_ms={now_ms}",
+                order.clan
+            );
+        }
+        for row in changes.learned {
+            mission.free_research.learned.insert((owner, row));
+            *state
+                .completed
+                .entry((order.clan, order.lab.slot, row))
+                .or_default() += 1;
+            eprintln!(
+                "script_lab_technology_researched clan={} lab={} row={row} queue_time_ms={now_ms}",
+                order.clan, order.lab.slot
+            );
+        }
         order.current = None;
     }
     Ok(true)

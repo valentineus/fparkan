@@ -10,6 +10,9 @@ use fparkan_vfs::Vfs;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+#[path = "research_completion.rs"]
+mod completion;
+pub use completion::ResearchCompletion;
 
 const TRF0: u32 = u32::from_le_bytes(*b"TRF0");
 const TRF1: u32 = u32::from_le_bytes(*b"TRF1");
@@ -193,6 +196,8 @@ pub enum ResearchError {
     },
     /// A required non-empty relation stream is absent.
     MissingRelationStream { type_id: u32, required_ids: u64 },
+    /// An unfinished free descendant leads back to an active completion.
+    CyclicResearchCompletion { index: usize },
     /// A candidate Unit DAT resource field is not NUL-terminated.
     MissingCandidateKeyTerminator { component_index: usize },
     /// No TRFB key matches an enabled candidate component.
@@ -216,6 +221,7 @@ pub enum ResearchError {
 impl fmt::Display for ResearchError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CyclicResearchCompletion { index } => write!(formatter, "cyclic free research completion at row {index}"),
             Self::Nres(source) => write!(formatter, "{source}"),
             Self::Binary(source) => write!(formatter, "{source}"),
             Self::MissingChunk { type_id } => {
@@ -326,6 +332,7 @@ impl std::error::Error for ResearchError {
             | Self::UnsupportedNonAsciiLookup { .. }
             | Self::EmptyResearchTable
             | Self::EmptyCandidateTree => None,
+            Self::CyclicResearchCompletion { .. } => None,
         }
     }
 }
@@ -490,24 +497,6 @@ impl ResearchTrfDocument {
     #[must_use]
     pub fn flag_byte(&self, index: usize) -> Option<u8> {
         self.flags.get(index).copied()
-    }
-
-    /// Sets the researched bit without propagating availability to related rows.
-    ///
-    /// # Errors
-    /// Rejects a row outside the decoded table.
-    pub fn mark_researched_flag(&mut self, index: usize) -> Result<(), ResearchError> {
-        let count = self.flags.len();
-        let flag = self
-            .flags
-            .get_mut(index)
-            .ok_or(ResearchError::InvalidResearchIndex {
-                type_id: TRF1,
-                index: u32::try_from(index).unwrap_or(u32::MAX),
-                row_count: count,
-            })?;
-        *flag |= 2;
-        Ok(())
     }
 
     /// Returns the raw name bytes selected by a row's low-16-bit TRFB link.

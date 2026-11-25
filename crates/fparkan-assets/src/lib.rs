@@ -37,7 +37,7 @@ pub use chassis_profile::decode_chassis_can_fly;
 mod research;
 pub use research::{
     calc_full_research_cost, research_project_rows, ResearchCandidate, ResearchCandidateSet,
-    ResearchCost, ResearchError, ResearchTrfDocument,
+    ResearchCompletion, ResearchCost, ResearchError, ResearchTrfDocument,
 };
 use std::collections::{hash_map::Entry, HashMap};
 use std::fmt;

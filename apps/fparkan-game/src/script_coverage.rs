@@ -32,8 +32,8 @@ pub(super) fn log_clan_ai_stops(report: &SimulationReport) {
             "sim_coverage script_lab_technology_researched={count} clan={clan} lab={lab} row={row}"
         );
     }
-    for &(clan, row, count) in &report.laboratory.unlock_stubs {
-        eprintln!("sim_coverage script_research_unlock_stub={count} clan={clan} row={row}");
+    for &(clan, row, count) in &report.laboratory.available {
+        eprintln!("sim_coverage script_research_available={count} clan={clan} row={row}");
     }
     for &(clan, lab, count) in &report.laboratory.stopped {
         eprintln!("sim_coverage script_lab_research_stopped={count} clan={clan} lab={lab}");
