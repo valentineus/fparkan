@@ -278,16 +278,8 @@ impl Production {
         }
         let mut ready = now_ms.wrapping_sub(order.start_ms) >= order.duration_ms;
         if let Some(paid) = &mut order.paid {
-            // shortcut: gate the factory rate on clan power until Control
-            // propagates the delivered power to the production device.
-            let powered = mission.script_bundles.iter().any(|bundle| {
-                bundle.clan_index == usize::from(order.owner.0)
-                    && bundle
-                        .behavior_warm_start
-                        .is_some_and(|state| f32::from_bits(state.cleared_words[0]) > 0.0)
-            });
             let (table, ore) = factory_resources(mission, order.plant)?;
-            let rate = if powered { factory_rate(table)? } else { 0.0 };
+            let rate = factory_rate(table)?;
             if paid.advance(now_ms, rate, ore)
                 && paid.collected.power + RESOURCE_EPSILON >= paid.cost.power
             {
@@ -1014,6 +1006,18 @@ mod tests {
             .unwrap()
             .1
             .current_ore_bits = 100.0_f32.to_bits();
+        // No Control budget runs in this isolated clock test: set the work multiplier explicitly.
+        let table = factory_resources(engine.loaded.as_mut().unwrap(), plant)
+            .unwrap()
+            .0;
+        let MissionControlDeviceTableStatus::Available(devices) = &mut table.status else {
+            panic!("factory devices");
+        };
+        devices
+            .iter_mut()
+            .find(|device| device.descriptor.tag == 26)
+            .unwrap()
+            .multiplier_bits = Some(0);
         // Isolate the factory's owner timer from unrelated clan updates.
         let mut rng = 1;
         for now in [100, 174] {
@@ -1093,12 +1097,38 @@ mod tests {
         let cost = &order.paid.as_ref().unwrap().cost;
         assert!((cost.ore - 25.12).abs() < 0.001);
         assert!((cost.power - 72.7).abs() < 0.001);
+        // Debug fixture: empty the factory's local energy reserve as well as leaving it without a generator.
+        crate::set_control_device_table_multiplier(
+            factory_resources(engine.loaded.as_mut().unwrap(), plant)
+                .unwrap()
+                .0,
+            0.0,
+        )
+        .unwrap();
         for now in (100..=6100).step_by(50) {
             assert!(step_headless(&mut engine, InputSnapshot::default(), now)
                 .unwrap()
                 .produced_unit
                 .is_none());
         }
+        let loaded = engine.loaded.as_ref().unwrap();
+        assert!(loaded
+            .factory_resources
+            .ticks()
+            .any(|(unit, count)| unit == plant.slot && count > 0));
+        assert!(!loaded
+            .factory_resources
+            .stops()
+            .any(|(unit, _, _)| unit == plant.slot));
+        let table = loaded
+            .control_device_tables
+            .iter()
+            .find(|table| table.handle == plant)
+            .unwrap();
+        assert!(
+            factory_rate(table).unwrap() < 5.0,
+            "unpowered production device must lose its full work rate"
+        );
         let factory_position = pose.position;
         pose.position = [1288.99_f32, 807.4, 74.08].map(f32::to_bits);
         set_transform(&mut engine.world, cockpit.handle, pose).unwrap();
