@@ -1,6 +1,9 @@
 use crate::clan_problem_conditions::Condition;
 use crate::clan_transport_schemes::TRANSPORT_CLASS;
-use crate::{clan_combat_groups::CombatGroup, clan_targeting::CaptureApproach};
+use crate::{
+    clan_combat_groups::{CombatGroup, GroupTarget},
+    clan_targeting::CaptureApproach,
+};
 use crate::{BehaviorOreState, LoadedMissionState, MissionEventStop};
 use fparkan_script::{
     Handler15TargetPayload, Handler2Record, Handler2RecordInput, Handler2RecordKey,
@@ -12,6 +15,7 @@ use std::collections::BTreeMap;
 const STORAGE_CLASS: u32 = 0x8000_0008;
 const RESOURCE_ORE: u32 = 0x0200_0100;
 const BUILDING_PROTECT: u32 = 8;
+const PLACE_PROTECT: u32 = 11;
 const OPTIMAL_TRANSPORT: u32 = 4;
 const BUILDING_NEEDED: u32 = 3;
 
@@ -84,12 +88,10 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) {
     };
     crate::construction::tick(loaded, &mut engine.world, now_ms);
     loaded.clan_ai_events.groups.retain(|&(clan, _), group| {
-        if !identity_metadata(&engine.world, group.target)
-            .is_ok_and(|identity| identity.owner_id == group.target_owner)
-        {
+        if !group.target.valid(&engine.world) {
             if let Some(patrol) = &mut loaded.unit_patrol {
                 for &member in &group.members {
-                    patrol.clear_object_order(member, group.target);
+                    group.target.clear_order(patrol, member);
                 }
             }
             return false;
@@ -100,7 +102,7 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) {
                 && loaded
                     .unit_patrol
                     .as_ref()
-                    .is_some_and(|patrol| patrol.has_object_order(member, group.target))
+                    .is_some_and(|patrol| group.target.has_order(patrol, member))
         });
         !group.members.is_empty()
     });
@@ -141,7 +143,7 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) {
             if let Some(group) = ai.groups.remove(&(clan, key)) {
                 if let Some(patrol) = &mut loaded.unit_patrol {
                     for member in group.members {
-                        patrol.clear_object_order(member, group.target);
+                        group.target.clear_order(patrol, member);
                     }
                 }
             }
@@ -246,6 +248,8 @@ pub(super) struct ClanAiEvents {
     construction_orders: BTreeMap<(usize, u32, u32), (u64, u64)>,
     patrol_continues: BTreeMap<(usize, u32), u64>,
     group_orders: BTreeMap<(usize, u32), u64>,
+    point_group_orders: BTreeMap<(usize, u32, u32), u64>,
+    point_patrol_continues: BTreeMap<(usize, u32, u32), u64>,
 }
 
 impl LoadedMissionState {
@@ -287,7 +291,7 @@ impl LoadedMissionState {
                 continue;
             };
             let mut problems_event = Some((event_index, event, None::<Handler2Record>));
-            // shortcut: only factory protection resumes, on the shared clan interval without native RNG.
+            // shortcut: protection resumes on the shared clan interval without native RNG.
             let mut pending = self
                 .clan_ai_events
                 .problems
@@ -296,7 +300,7 @@ impl LoadedMissionState {
                 .flat_map(|queue| queue.records())
                 .rev()
                 .filter(|record| {
-                    record.key.word_0 == BUILDING_PROTECT
+                    matches!(record.key.word_0, BUILDING_PROTECT | PLACE_PROTECT)
                         && self.clan_ai_events.waits.contains_key(&(clan, record.key))
                 })
                 .cloned()
@@ -326,15 +330,28 @@ impl LoadedMissionState {
                         continue;
                     };
                     if resume {
-                        let target = problem.key.argument_0;
-                        let count = self
-                            .clan_ai_events
-                            .patrol_continues
-                            .entry((clan, target))
-                            .or_default();
-                        *count += 1;
-                        if *count == 1 {
-                            eprintln!("sim_coverage script_factory_patrol_continue_approx=1 clan={clan} target={target}");
+                        if problem_id == PLACE_PROTECT {
+                            let [x, y] = [problem.key.argument_0, problem.key.argument_1];
+                            let count = self
+                                .clan_ai_events
+                                .point_patrol_continues
+                                .entry((clan, x, y))
+                                .or_default();
+                            *count += 1;
+                            if *count == 1 {
+                                eprintln!("sim_coverage script_point_patrol_continue_approx=1 clan={clan} x={x} y={y}");
+                            }
+                        } else {
+                            let target = problem.key.argument_0;
+                            let count = self
+                                .clan_ai_events
+                                .patrol_continues
+                                .entry((clan, target))
+                                .or_default();
+                            *count += 1;
+                            if *count == 1 {
+                                eprintln!("sim_coverage script_factory_patrol_continue_approx=1 clan={clan} target={target}");
+                            }
                         }
                     } else {
                         let count = self
@@ -449,14 +466,21 @@ impl LoadedMissionState {
                             Ok(Some(VarSetDefault::Dword(target)))
                         }
                         ScriptDispatchSelector::Handler(25) if problem.is_some() => {
-                            let &[mode, hits, target_mode, target] = instruction.references.as_slice() else {
-                                return Err("Handler(25) requires TAKE_BY_HITS and a logical ID".into());
+                            let &[mode, hits, target_mode, ref target @ ..] = instruction.references.as_slice() else {
+                                return Err("Handler(25) requires TAKE_BY_HITS and a target".into());
                             };
                             let word = |index: u32| values.get(index as usize)?.as_dword();
-                            let (Some(2), Some(requested), Some(0x201), Some(target)) =
-                                (word(mode), word(hits), word(target_mode), word(target))
+                            let (Some(2), Some(requested)) = (word(mode), word(hits))
                             else {
-                                return Err("Handler(25) requires TAKE_BY_HITS and a logical ID".into());
+                                return Err("Handler(25) requires TAKE_BY_HITS".into());
+                            };
+                            let target = match (word(target_mode), target) {
+                                (Some(0x201), &[id]) => Handler15TargetPayload::ByLogicId(word(id).ok_or("Handler(25) logical ID must be a DWORD")?),
+                                (Some(0x202), &[x, y]) => Handler15TargetPayload::ByPlace {
+                                    first: word(x).ok_or("Handler(25) X must be a DWORD")?,
+                                    second: word(y).ok_or("Handler(25) Y must be a DWORD")?,
+                                },
+                                _ => return Err("Handler(25) requires a logical ID or XY point".into()),
                             };
                             // shortcut: use free warbots until lower-priority orders can be preempted.
                             let units = self.mission_events.clan_units(world, OwnerId(clan as u16), true)
@@ -480,13 +504,15 @@ impl LoadedMissionState {
                             group.dispatch(patrol, world, &self.mission, order)
                                 .ok_or("Handler(28) requires a patrol or attack on the group's target")?;
                             let key = problem.as_ref().expect("group order requires a problem").key;
-                            let target = group.target.slot;
-                            let count = self.clan_ai_events.group_orders.entry((clan, target)).or_default();
+                            let (name, count) = match group.target {
+                                GroupTarget::Object(target, _) => ("script_group_order_approx", self.clan_ai_events.group_orders.entry((clan, target.slot)).or_default()),
+                                GroupTarget::Point([x, y]) => ("script_point_group_order_approx", self.clan_ai_events.point_group_orders.entry((clan, x, y)).or_default()),
+                            };
                             *count += 1;
-                            eprintln!("sim_coverage script_group_order_approx=1 clan={clan} target={target} order={} units={:?}", order.word_1, group.members.iter().map(|unit| unit.slot).collect::<Vec<_>>());
+                            eprintln!("sim_coverage {name}=1 clan={clan} target={:?} order={} units={:?}", group.target, order.word_1, group.members.iter().map(|unit| unit.slot).collect::<Vec<_>>());
                             let groups = &mut self.clan_ai_events.groups;
                             if let Some(assigned) = groups.get_mut(&(clan, key))
-                                .filter(|assigned| key.word_0 == BUILDING_PROTECT
+                                .filter(|assigned| matches!(key.word_0, BUILDING_PROTECT | PLACE_PROTECT)
                                     && assigned.target == group.target)
                             {
                                 assigned.members.extend(group.members);
@@ -738,14 +764,14 @@ impl LoadedMissionState {
                         }
                         ScriptDispatchSelector::Handler(handler @ (7 | 45))
                             if instruction.references.is_empty()
-                                && problem.as_ref().is_some_and(|record| record.key.word_0 == BUILDING_PROTECT) =>
+                                && problem.as_ref().is_some_and(|record| matches!(record.key.word_0, BUILDING_PROTECT | PLACE_PROTECT)) =>
                         {
-                            let key = problem.as_ref().expect("factory protection problem").key;
+                            let key = problem.as_ref().expect("protection problem").key;
                             if handler == 7 {
                                 if let Some(assigned) = self.clan_ai_events.groups.remove(&(clan, key)) {
                                     if let Some(patrol) = &mut self.unit_patrol {
                                         for unit in assigned.members {
-                                            patrol.clear_object_order(unit, assigned.target);
+                                            assigned.target.clear_order(patrol, unit);
                                         }
                                     }
                                 }
@@ -762,7 +788,7 @@ impl LoadedMissionState {
                                 Some(1)
                                     if problem
                                         .as_ref()
-                                        .is_some_and(|record| matches!(record.key.word_0, OPTIMAL_TRANSPORT | 6 | BUILDING_PROTECT))
+                                        .is_some_and(|record| matches!(record.key.word_0, OPTIMAL_TRANSPORT | 6 | BUILDING_PROTECT | PLACE_PROTECT))
                                         || !conditions.is_empty() =>
                                 {
                                     solving = true
@@ -1126,7 +1152,10 @@ impl LoadedMissionState {
                             .remove(problem.key);
                     } else if solving
                         && (!conditions.is_empty()
-                            || matches!(problem.key.word_0, OPTIMAL_TRANSPORT | BUILDING_PROTECT))
+                            || matches!(
+                                problem.key.word_0,
+                                OPTIMAL_TRANSPORT | BUILDING_PROTECT | PLACE_PROTECT
+                            ))
                     {
                         let count = self
                             .clan_ai_events
@@ -1306,6 +1335,20 @@ impl ClanAiEvents {
             .map(|(&(clan, target), &count)| (clan, target, count))
     }
 
+    pub(super) fn point_group_orders(&self) -> impl Iterator<Item = (usize, u32, u32, u64)> + '_ {
+        self.point_group_orders
+            .iter()
+            .map(|(&(clan, x, y), &count)| (clan, x, y, count))
+    }
+
+    pub(super) fn point_patrol_continues(
+        &self,
+    ) -> impl Iterator<Item = (usize, u32, u32, u64)> + '_ {
+        self.point_patrol_continues
+            .iter()
+            .map(|(&(clan, x, y), &count)| (clan, x, y, count))
+    }
+
     pub(super) fn transport_orders(&self) -> impl Iterator<Item = (usize, u32, u64)> + '_ {
         self.transport_orders
             .iter()
@@ -1425,6 +1468,62 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
+    fn licensed_point_protection_patrols_and_resumes_from_stock_start() {
+        use crate::{EngineServices, MissionMode, MissionRequest, MissionStartupInput};
+        use fparkan_vfs::DirectoryVfs;
+        use std::sync::Arc;
+
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed corpus root");
+        let mut engine =
+            crate::create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
+        crate::load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/CAMPAIGN/CAMPAIGN.02/Mission.01/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+
+        for now in (0..=150_000).step_by(100) {
+            crate::frame(&mut engine, now).unwrap();
+        }
+        let loaded = engine.loaded.as_ref().unwrap();
+        assert!(loaded
+            .clan_ai_events
+            .point_group_orders()
+            .any(|(_, _, _, count)| count > 0));
+        assert!(loaded
+            .clan_ai_events
+            .point_patrol_continues()
+            .any(|(_, _, _, count)| count > 1));
+        let patrol = loaded.unit_patrol.as_ref().unwrap();
+        let group = loaded
+            .clan_ai_events
+            .groups
+            .iter()
+            .find_map(|(&(_, key), group)| {
+                (key.word_0 == PLACE_PROTECT && matches!(group.target, GroupTarget::Point(_)))
+                    .then_some(group)
+            })
+            .expect("point protection keeps its group between script invocations");
+        assert!(!group.members.is_empty());
+        assert!(group
+            .members
+            .iter()
+            .all(|&unit| group.target.has_order(patrol, unit)));
+        assert!(loaded.clan_ai_events.stops().all(|(stop, _)| {
+            !stop.reason.starts_with("Handler(25)") && !stop.reason.starts_with("Handler(28)")
+        }));
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_weak_building_gets_scripted_guards_from_stock_start() {
         use crate::{EngineServices, MissionMode, MissionRequest, MissionStartupInput};
         use fparkan_vfs::DirectoryVfs;
@@ -1471,7 +1570,7 @@ mod tests {
                     .then_some(group)
             })
             .expect("weak building receives a guard group");
-        assert_eq!(group.target, target);
+        assert_eq!(group.target, GroupTarget::Object(target, Some(OwnerId(1))));
         assert!(!group.members.is_empty());
         let patrol = loaded.unit_patrol.as_ref().unwrap();
         assert!(group
@@ -1535,8 +1634,7 @@ mod tests {
                 owner == *clan && key.word_0 == BUILDING_PROTECT && key.argument_0 == *factory_id
             })
             .unwrap();
-        assert_eq!(group.target, factory);
-        assert_eq!(group.target_owner, Some(OwnerId(1)));
+        assert_eq!(group.target, GroupTarget::Object(factory, Some(OwnerId(1))));
         assert!(!group.members.is_empty());
         let patrol = loaded.unit_patrol.as_ref().unwrap();
         assert!(group

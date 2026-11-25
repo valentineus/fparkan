@@ -253,6 +253,17 @@ impl UnitPatrol {
             .retain(|unit| unit.handle != handle || unit.center_object != Some(target));
     }
 
+    pub(super) fn has_point_order(&self, handle: ObjectHandle, point: [f32; 2]) -> bool {
+        self.units
+            .iter()
+            .any(|unit| unit.handle == handle && unit.patrols_point(point))
+    }
+
+    pub(super) fn clear_point_order(&mut self, handle: ObjectHandle, point: [f32; 2]) {
+        self.units
+            .retain(|unit| unit.handle != handle || !unit.patrols_point(point));
+    }
+
     pub(super) fn shut_down(&mut self, handle: ObjectHandle) -> bool {
         // shortcut: stop autonomous movement and fire until the native shutdown task is modeled.
         self.units.retain(|unit| unit.handle != handle);
@@ -512,6 +523,13 @@ fn new_patrol_replaces_a_script_attack_order() {
 }
 
 impl PatrollingUnit {
+    fn patrols_point(&self, point: [f32; 2]) -> bool {
+        self.center_object.is_none()
+            && self.attack_target.is_none()
+            && self.destinations.is_none()
+            && self.center == point
+    }
+
     fn center(&self, world: &World) -> Option<[f32; 2]> {
         // shortcut: use the target's transform as the patrol center until native building approaches are wired.
         match self.center_object {
@@ -525,6 +543,31 @@ impl PatrollingUnit {
             }
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn point_patrol_cleanup_preserves_reassigned_orders() {
+    let mut world = fparkan_world::new(fparkan_world::WorldConfig::default());
+    let actor = fparkan_world::construct_object(
+        &mut world,
+        fparkan_world::ObjectDraft { original_id: None },
+    )
+    .unwrap();
+    fparkan_world::register_object(&mut world, actor).unwrap();
+    let mut patrol = UnitPatrol::scripted();
+    let point = [1124.0, 783.0];
+    patrol.order(&world, actor, point, 60.0);
+    assert!(patrol.has_point_order(actor, point));
+    patrol.clear_point_order(actor, [1125.0, 783.0]);
+    assert!(patrol.has_point_order(actor, point));
+    patrol.move_to(&world, actor, point, false);
+    assert!(!patrol.has_point_order(actor, point));
+    patrol.clear_point_order(actor, point);
+    assert!(patrol.is_patrolling(actor));
+    patrol.order(&world, actor, point, 90.0);
+    patrol.clear_point_order(actor, point);
+    assert!(!patrol.is_patrolling(actor));
 }
 
 #[cfg(test)]

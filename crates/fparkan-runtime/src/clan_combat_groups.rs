@@ -6,8 +6,70 @@ use fparkan_world::{identity_metadata, transform_state, ObjectHandle, OwnerId, W
 
 pub(super) struct CombatGroup {
     pub(super) members: Vec<ObjectHandle>,
-    pub(super) target: ObjectHandle,
-    pub(super) target_owner: Option<OwnerId>,
+    pub(super) target: GroupTarget,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum GroupTarget {
+    Object(ObjectHandle, Option<OwnerId>),
+    Point([u32; 2]),
+}
+
+impl GroupTarget {
+    fn resolve(
+        world: &World,
+        mission: &MissionDocument,
+        target: Handler15TargetPayload,
+    ) -> Option<Self> {
+        match target {
+            Handler15TargetPayload::ByLogicId(id) => {
+                let handle =
+                    crate::mission_events::placed_logic_objects(mission, world, id).next()?;
+                Some(Self::Object(
+                    handle,
+                    identity_metadata(world, handle).ok()?.owner_id,
+                ))
+            }
+            Handler15TargetPayload::ByPlace { first, second } => Some(Self::Point([first, second])),
+            _ => None,
+        }
+    }
+
+    fn position(self, world: &World) -> Option<[f32; 2]> {
+        match self {
+            Self::Object(handle, _) => {
+                let [x, y, _] = transform_state(world, handle)
+                    .ok()?
+                    .position
+                    .map(f32::from_bits);
+                Some([x, y])
+            }
+            Self::Point(point) => Some(point.map(|value| value as f32)),
+        }
+    }
+
+    pub(super) fn valid(self, world: &World) -> bool {
+        match self {
+            Self::Object(handle, owner) => {
+                identity_metadata(world, handle).is_ok_and(|identity| identity.owner_id == owner)
+            }
+            Self::Point(_) => true,
+        }
+    }
+
+    pub(super) fn has_order(self, patrol: &UnitPatrol, unit: ObjectHandle) -> bool {
+        match self {
+            Self::Object(target, _) => patrol.has_object_order(unit, target),
+            Self::Point(point) => patrol.has_point_order(unit, point.map(|value| value as f32)),
+        }
+    }
+
+    pub(super) fn clear_order(self, patrol: &mut UnitPatrol, unit: ObjectHandle) {
+        match self {
+            Self::Object(target, _) => patrol.clear_object_order(unit, target),
+            Self::Point(point) => patrol.clear_point_order(unit, point.map(|value| value as f32)),
+        }
+    }
 }
 
 pub(super) fn recruit(
@@ -15,18 +77,15 @@ pub(super) fn recruit(
     units: impl Iterator<Item = ObjectHandle>,
     controls: &[MissionControlDeviceTableState],
     mission: &MissionDocument,
-    target_id: u32,
+    target: Handler15TargetPayload,
     requested: u32,
 ) -> (Option<CombatGroup>, f32) {
-    let Some(target) =
-        crate::mission_events::placed_logic_objects(mission, world, target_id).next()
-    else {
+    let Some(target) = GroupTarget::resolve(world, mission, target) else {
         return (None, 0.0);
     };
-    let Ok(pose) = transform_state(world, target) else {
+    let Some([x, y]) = target.position(world) else {
         return (None, 0.0);
     };
-    let [x, y, _] = pose.position.map(f32::from_bits);
     let mut candidates: Vec<_> = units
         .filter_map(|unit| {
             let [ux, uy, _] = transform_state(world, unit)
@@ -37,13 +96,7 @@ pub(super) fn recruit(
         })
         .collect();
     let (members, strength) = take_by_hits(&mut candidates, requested);
-    let group = (strength > 0.0).then(|| CombatGroup {
-        members,
-        target,
-        target_owner: identity_metadata(world, target)
-            .ok()
-            .and_then(|identity| identity.owner_id),
-    });
+    let group = (strength > 0.0).then(|| CombatGroup { members, target });
     (group, strength)
 }
 
@@ -72,30 +125,38 @@ impl CombatGroup {
         mission: &MissionDocument,
         order: Handler15Invocation,
     ) -> Option<()> {
-        let (0, kind @ (3 | 4), 3, Handler15TargetPayload::ByLogicId(target_id)) =
-            (order.word_0, order.word_1, order.word_2, order.target)
-        else {
+        let (0, kind @ (3 | 4), 3) = (order.word_0, order.word_1, order.word_2) else {
             return None;
         };
-        let target =
-            crate::mission_events::placed_logic_objects(mission, world, target_id).next()?;
+        let target = GroupTarget::resolve(world, mission, order.target)?;
         if target != self.target {
             return None;
         }
-        let index = identity_metadata(world, target).ok()?.original_id?.0 as usize;
-        let [x, y, _] = transform_state(world, target)
-            .ok()?
-            .position
-            .map(f32::from_bits);
+        let point = target.position(world)?;
+        let attack = match (kind, target) {
+            (3, GroupTarget::Object(handle, _)) => Some((
+                handle,
+                identity_metadata(world, handle).ok()?.original_id?.0 as usize,
+            )),
+            (3, GroupTarget::Point(_)) => return None,
+            _ => None,
+        };
         for &unit in &self.members {
-            if kind == 3 {
-                patrol.set_attack_target(world, unit, target, index, [x, y]);
+            if let Some((handle, index)) = attack {
+                patrol.set_attack_target(world, unit, handle, index, point);
             } else {
                 let radius = match order.word_3 {
                     0 | u32::MAX => 60.0,
                     radius => radius as f32,
                 };
-                patrol.order_around_object(world, unit, target, [x, y], radius);
+                match target {
+                    GroupTarget::Object(handle, _) => {
+                        patrol.order_around_object(world, unit, handle, point, radius);
+                    }
+                    GroupTarget::Point(_) => {
+                        patrol.order(world, unit, point, radius);
+                    }
+                }
             }
         }
         Some(())
