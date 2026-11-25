@@ -253,6 +253,8 @@ pub(super) struct ClanAiEvents {
     point_patrol_continues: BTreeMap<(usize, u32, u32), u64>,
     free_unit_queries: BTreeMap<(usize, u32, u32), u64>,
     group_recruitments: BTreeMap<(usize, u32), u64>,
+    class_target_queries: BTreeMap<(usize, u32, u32), u64>,
+    size_class_queries: BTreeMap<(usize, u32), u64>,
 }
 
 impl LoadedMissionState {
@@ -417,6 +419,48 @@ impl LoadedMissionState {
                                 .ok_or("Handler(12) requires a current problem")?
                                 .scalar_1;
                             Ok(Some(VarSetDefault::FloatBits(priority.to_bits())))
+                        }
+                        ScriptDispatchSelector::Handler(71) => {
+                            let &[radius, class, estimate] = instruction.references.as_slice() else {
+                                return Err("Handler(71) requires radius, class and strength output".into());
+                            };
+                            let radius = match values.get(radius as usize) {
+                                Some(VarSetDefault::Dword(value)) => *value as f32,
+                                Some(VarSetDefault::FloatBits(bits)) => f32::from_bits(*bits),
+                                None => return Err("Handler(71) radius is unavailable".into()),
+                            };
+                            let class = values.get(class as usize).and_then(|value| value.as_dword())
+                                .ok_or("Handler(71) class must be a DWORD")?;
+                            let (target, strength) = crate::clan_building_queries::weakest_enemy_of_class(
+                                &self.mission, &self.mission_events, &self.object_drafts,
+                                &self.control_device_tables, world, clan, class, radius,
+                            ).unwrap_or((u32::MAX, 1e12_f32));
+                            let strength = strength as i64 as u32;
+                            let output = values.get_mut(estimate as usize)
+                                .ok_or("Handler(71) strength output is unavailable")?;
+                            *output = match *output {
+                                VarSetDefault::Dword(_) => VarSetDefault::Dword(strength),
+                                VarSetDefault::FloatBits(_) => VarSetDefault::FloatBits((strength as f32).to_bits()),
+                            };
+                            let count = self.clan_ai_events.class_target_queries.entry((clan, class, target)).or_default();
+                            *count += 1;
+                            if *count == 1 {
+                                eprintln!("sim_coverage script_class_target_approx=1 clan={clan} class={class} target={target} strength={strength}");
+                            }
+                            Ok(Some(VarSetDefault::Dword(target)))
+                        }
+                        ScriptDispatchSelector::Handler(72) => {
+                            let id = single_dword(&instruction.references, values)
+                                .ok_or("Handler(72) requires a logical ID")?;
+                            let size = crate::unit_size_class::query(
+                                &self.mission, &self.mission_events, &self.object_drafts, world, id,
+                            )?;
+                            let count = self.clan_ai_events.size_class_queries.entry((clan, id)).or_default();
+                            *count += 1;
+                            if *count == 1 {
+                                eprintln!("sim_coverage script_size_class_approx=1 clan={clan} unit={id} class={size}");
+                            }
+                            Ok(Some(VarSetDefault::Dword(size)))
                         }
                         ScriptDispatchSelector::Handler(handler @ (35 | 64)) => {
                             let &[radius, estimate] = instruction.references.as_slice() else {
@@ -1390,6 +1434,18 @@ impl ClanAiEvents {
         self.group_recruitments
             .iter()
             .map(|(&(clan, mode), &count)| (clan, mode, count))
+    }
+
+    pub(super) fn class_target_queries(&self) -> impl Iterator<Item = (usize, u32, u32, u64)> + '_ {
+        self.class_target_queries
+            .iter()
+            .map(|(&(clan, class, target), &count)| (clan, class, target, count))
+    }
+
+    pub(super) fn size_class_queries(&self) -> impl Iterator<Item = (usize, u32, u64)> + '_ {
+        self.size_class_queries
+            .iter()
+            .map(|(&(clan, id), &count)| (clan, id, count))
     }
 
     pub(super) fn point_group_orders(&self) -> impl Iterator<Item = (usize, u32, u32, u64)> + '_ {

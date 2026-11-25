@@ -190,7 +190,7 @@ pub(super) fn building_defence(
     least_defended(candidates)
 }
 
-fn least_defended(candidates: impl Iterator<Item = (u32, f32)>) -> Option<(u32, f32)> {
+pub(super) fn least_defended(candidates: impl Iterator<Item = (u32, f32)>) -> Option<(u32, f32)> {
     let mut selected = None;
     let mut minimum = 1e12_f32;
     for (id, strength) in candidates {

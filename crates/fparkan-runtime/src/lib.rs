@@ -46,6 +46,7 @@ mod boarding;
 mod building_door;
 mod clan_ai_events;
 mod clan_area_strength;
+mod clan_building_queries;
 mod clan_combat_groups;
 mod clan_combat_strength;
 mod clan_problem_conditions;
@@ -68,6 +69,7 @@ mod script_patrol;
 mod script_time;
 mod unit_combat;
 mod unit_patrol;
+mod unit_size_class;
 
 pub use autodemo::{
     autodemo_camera, AutoDemoCamera, AutoDemoReinforcement, AutoDemoView, SpawnedUnit,
@@ -2974,6 +2976,8 @@ pub struct SimulationReport {
     pub script_point_patrol_continues: Vec<(usize, u32, u32, u64)>,
     pub script_free_unit_queries: Vec<(usize, u32, u32, u64)>,
     pub script_group_recruitments: Vec<(usize, u32, u64)>,
+    pub script_class_target_queries: Vec<(usize, u32, u32, u64)>,
+    pub script_size_class_queries: Vec<(usize, u32, u64)>,
     pub script_problem_waits: Vec<(usize, u32, u64)>,
     pub script_factory_patrol_continues: Vec<(usize, u32, u64)>,
     pub script_ore_transport_orders: Vec<(usize, u32, u64)>,
@@ -3034,6 +3038,8 @@ pub fn simulate_mission_report(
         script_point_patrol_continues: Vec::new(),
         script_free_unit_queries: Vec::new(),
         script_group_recruitments: Vec::new(),
+        script_class_target_queries: Vec::new(),
+        script_size_class_queries: Vec::new(),
         script_problem_waits: Vec::new(),
         script_factory_patrol_continues: Vec::new(),
         script_ore_transport_orders: Vec::new(),
@@ -3153,6 +3159,12 @@ pub fn simulate_mission_report(
         report
             .script_group_recruitments
             .extend(loaded.clan_ai_events.group_recruitments());
+        report
+            .script_class_target_queries
+            .extend(loaded.clan_ai_events.class_target_queries());
+        report
+            .script_size_class_queries
+            .extend(loaded.clan_ai_events.size_class_queries());
         report
             .script_problem_waits
             .extend(loaded.clan_ai_events.wait_starts());
