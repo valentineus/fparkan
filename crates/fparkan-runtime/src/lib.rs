@@ -41,6 +41,7 @@ use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+mod attack_target;
 mod autodemo;
 mod behavior_clock;
 mod boarding;
@@ -2796,7 +2797,12 @@ pub fn step_headless(
                 .autodemo_combat
                 .as_ref()
                 .map_or_else(Vec::new, |combat| {
-                    combat.targets(&engine.world, &mission.mission_assets, Some(patrol))
+                    combat.targets(
+                        &engine.world,
+                        &mission.mission_assets,
+                        Some(patrol),
+                        &mission.control_device_tables,
+                    )
                 });
             Some(patrol.prepare(
                 &engine.world,

@@ -1,5 +1,5 @@
 use super::UnitPatrol;
-use crate::{MissionDocument, MissionObjectDraft};
+use crate::{MissionControlDeviceTableState, MissionDocument, MissionObjectDraft};
 use fparkan_script::{Handler15Invocation, Handler15TargetPayload};
 use fparkan_world::{identity_metadata, transform_state, ObjectHandle, World};
 use std::collections::VecDeque;
@@ -163,12 +163,29 @@ impl UnitPatrol {
         true
     }
 
-    pub(super) fn advance_script_orders(&mut self, world: &World) {
+    pub(super) fn advance_script_orders(
+        &mut self,
+        world: &World,
+        controls: &[MissionControlDeviceTableState],
+    ) {
+        self.units.retain(|unit| {
+            let Some((target, _)) = unit.attack_target else {
+                return true;
+            };
+            if !crate::attack_target::complete(world, controls, target) {
+                return true;
+            }
+            eprintln!(
+                "script_attack_finished unit={} target={}",
+                unit.handle.slot, target.slot
+            );
+            false
+        });
         for (actor, mut queue) in std::mem::take(&mut self.script_orders) {
             let Ok(pose) = transform_state(world, actor) else {
                 continue;
             };
-            // shortcut: use current Go arrival and target removal until native task completion is wired.
+            // shortcut: Go still uses the temporary arrival tolerance.
             let complete = !self.is_shut_down(actor)
                 && self
                     .units
@@ -183,8 +200,7 @@ impl UnitPatrol {
                                         (point[0] - x).hypot(point[1] - y) <= 0.05
                                     }));
                         }
-                        unit.attack_target
-                            .is_some_and(|(target, _)| transform_state(world, target).is_err())
+                        false
                     });
             if complete {
                 while let Some(order) = queue.pop_front() {
@@ -230,13 +246,14 @@ mod tests {
         let mut world = fparkan_world::new(Default::default());
         let actor = object(&mut world);
         let target = object(&mut world);
+        place(&mut world, target, 50.0);
         let mut patrol = UnitPatrol::scripted();
         patrol.shut_down(actor);
         patrol.enqueue_script_order(&world, actor, UnitOrder::Move([10.0, 0.0]), false);
         patrol.enqueue_script_order(&world, actor, UnitOrder::Move([20.0, 0.0]), true);
         patrol.enqueue_script_order(&world, actor, UnitOrder::Attack(target, 1), true);
         patrol.enqueue_script_order(&world, actor, UnitOrder::Shutdown, true);
-        patrol.advance_script_orders(&world);
+        patrol.advance_script_orders(&world, &[]);
         assert!(!patrol.is_shut_down(actor));
         assert!(patrol.attack_target(actor).is_none());
         assert_eq!(
@@ -244,18 +261,18 @@ mod tests {
             [10.0, 0.0]
         );
         place(&mut world, actor, 10.0);
-        patrol.advance_script_orders(&world);
+        patrol.advance_script_orders(&world, &[]);
         assert_eq!(
             patrol.units[0].destinations.as_ref().unwrap()[0],
             [20.0, 0.0]
         );
         place(&mut world, actor, 20.0);
-        patrol.advance_script_orders(&world);
+        patrol.advance_script_orders(&world, &[]);
         assert_eq!(patrol.attack_target(actor), Some((target, 1)));
         assert!(!patrol.is_shut_down(actor));
         request_delete(&mut world, target).unwrap();
         fparkan_world::step(&mut world, &Default::default()).unwrap();
-        patrol.advance_script_orders(&world);
+        patrol.advance_script_orders(&world, &[]);
         assert!(patrol.is_shut_down(actor));
         assert!(!patrol.is_patrolling(actor));
     }
@@ -269,7 +286,7 @@ mod tests {
         patrol.enqueue_script_order(&world, actor, UnitOrder::Shutdown, true);
         patrol.enqueue_script_order(&world, actor, UnitOrder::Move([20.0, 0.0]), false);
         place(&mut world, actor, 10.0);
-        patrol.advance_script_orders(&world);
+        patrol.advance_script_orders(&world, &[]);
         assert!(!patrol.is_shut_down(actor));
         assert_eq!(
             patrol.units[0].destinations.as_ref().unwrap()[0],
@@ -283,16 +300,136 @@ mod tests {
         let mut world = fparkan_world::new(Default::default());
         let actor = object(&mut world);
         let target = object(&mut world);
+        place(&mut world, target, 50.0);
         let mut patrol = UnitPatrol::scripted();
         patrol.enqueue_script_order(&world, actor, UnitOrder::Attack(target, 1), false);
         patrol.enqueue_script_order(&world, actor, UnitOrder::Patrol([20.0, 30.0], 60.0), true);
-        patrol.advance_script_orders(&world);
+        patrol.advance_script_orders(&world, &[]);
         assert_eq!(patrol.attack_target(actor), Some((target, 1)));
         request_delete(&mut world, target).unwrap();
         fparkan_world::step(&mut world, &Default::default()).unwrap();
-        patrol.advance_script_orders(&world);
+        patrol.advance_script_orders(&world, &[]);
         assert!(patrol.has_point_order(actor, [20.0, 30.0]));
         assert!(patrol.attack_target(actor).is_none());
+    }
+
+    #[test]
+    fn depleted_target_finishes_with_or_without_a_queued_successor() {
+        use crate::{
+            tests::synthetic_control_device_table_with_providers, MissionControlDeviceTableStatus,
+            MissionControlNodeProviderTableStatus,
+        };
+        for queued in [false, true] {
+            let mut world = fparkan_world::new(Default::default());
+            let actor = object(&mut world);
+            let target = object(&mut world);
+            place(&mut world, target, 50.0);
+            let mut patrol = UnitPatrol::scripted();
+            patrol.enqueue_script_order(&world, actor, UnitOrder::Attack(target, 1), false);
+            if queued {
+                patrol.enqueue_script_order(&world, actor, UnitOrder::Shutdown, true);
+            }
+            let mut control = synthetic_control_device_table_with_providers(
+                MissionControlDeviceTableStatus::Available(Vec::new()),
+                MissionControlNodeProviderTableStatus::Available(Vec::new()),
+            );
+            control.handle = ObjectHandle {
+                generation: target.generation + 1,
+                ..target
+            };
+            control.node_provider_depletion_marked = true;
+            patrol.advance_script_orders(&world, std::slice::from_ref(&control));
+            assert_eq!(
+                patrol.attack_target(actor),
+                Some((target, 1)),
+                "another generation must not finish this target"
+            );
+            control.handle = target;
+            patrol.advance_script_orders(&world, &[control]);
+            assert!(transform_state(&world, target).is_ok());
+            assert!(patrol.attack_target(actor).is_none());
+            assert!(!patrol.is_patrolling(actor));
+            assert_eq!(patrol.is_shut_down(actor), queued);
+        }
+    }
+
+    #[test]
+    fn native_zero_position_sentinel_finishes_an_otherwise_live_target() {
+        let mut world = fparkan_world::new(Default::default());
+        let actor = object(&mut world);
+        let target = object(&mut world);
+        let mut patrol = UnitPatrol::scripted();
+        place(&mut world, target, 50.0);
+        patrol.enqueue_script_order(&world, actor, UnitOrder::Attack(target, 1), false);
+        patrol.advance_script_orders(&world, &[]);
+        assert!(patrol.attack_target(actor).is_some());
+        place(&mut world, target, -0.0);
+        patrol.advance_script_orders(&world, &[]);
+        assert!(patrol.attack_target(actor).is_none());
+        assert!(transform_state(&world, target).is_ok());
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_stock_raid_stops_firing_and_reaches_shutdown_after_bunker_depletion() {
+        use crate::{
+            create, frame, load_gameplay_mission, AutoDemoCombatEvent, EngineServices, MissionMode,
+            MissionRequest, MissionStartupInput,
+        };
+        use fparkan_vfs::DirectoryVfs;
+        use std::sync::Arc;
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed root");
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/CAMPAIGN/CAMPAIGN.04/Mission.02/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        let loaded = engine.loaded.as_ref().unwrap();
+        let actor = crate::script_patrol::warbot_by_logic_id(
+            &loaded.mission,
+            &loaded.object_drafts,
+            &engine.world,
+            15,
+        )
+        .unwrap();
+        let bunker = loaded.control_device_tables[0].handle;
+        let mut depleted = false;
+        for now in (0..=900_000).step_by(50) {
+            let result = frame(&mut engine, now).unwrap();
+            if depleted {
+                assert!(!result.autodemo_combat_events.iter().any(|event| matches!(event, AutoDemoCombatEvent::Shot { shooter, target, .. } if *shooter == actor && *target == bunker)), "a completed Attack released another shot at {now}");
+            }
+            let loaded = engine.loaded.as_ref().unwrap();
+            depleted |= loaded.control_device_tables[0].node_provider_depletion_marked;
+            if depleted {
+                let targets = engine.autodemo_combat.as_ref().unwrap().targets(
+                    &engine.world,
+                    &loaded.mission_assets,
+                    loaded.unit_patrol.as_ref(),
+                    &loaded.control_device_tables,
+                );
+                assert!(
+                    !targets
+                        .iter()
+                        .any(|(shooter, target)| *shooter == actor && target.handle == bunker),
+                    "depleted bunker was reacquired for firing"
+                );
+            }
+            if depleted && loaded.unit_patrol.as_ref().unwrap().is_shut_down(actor) {
+                assert!(transform_state(&engine.world, bunker).is_ok());
+                return;
+            }
+        }
+        panic!("stock raid never completed Attack and its queued retreat");
     }
 
     #[test]

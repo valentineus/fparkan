@@ -255,6 +255,7 @@ impl AutoDemoCombat {
         world: &fparkan_world::World,
         assets: &MissionAssets,
         patrol: Option<&UnitPatrol>,
+        controls: &[super::MissionControlDeviceTableState],
     ) -> Vec<(ObjectHandle, CombatTarget)> {
         let live: Vec<_> = self
             .units
@@ -282,6 +283,9 @@ impl AutoDemoCombat {
                 if let Some((target, index)) =
                     patrol.and_then(|patrol| patrol.attack_target(handle))
                 {
+                    if super::attack_target::complete(world, controls, target) {
+                        return None;
+                    }
                     // shortcut: aim at the target bounds until the original Attack task is wired.
                     let state = transform_state(world, target).ok()?;
                     let (center, radius) = unit_sphere(assets, index, state)?;
@@ -398,6 +402,7 @@ impl AutoDemoCombat {
             &engine.world,
             &mission.mission_assets,
             mission.unit_patrol.as_ref(),
+            &mission.control_device_tables,
         );
         for unit in &mut self.units {
             unit.weapons.read_control_energy(engine, unit.handle);

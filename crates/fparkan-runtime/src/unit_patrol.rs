@@ -412,7 +412,7 @@ impl UnitPatrol {
         let terrain = &mission.terrain;
         let chassis = &mission.unit_can_fly;
         let mut state = self.clone();
-        state.advance_script_orders(world);
+        state.advance_script_orders(world, &mission.control_device_tables);
         state.units.retain(|unit| {
             unit.destinations
                 .as_ref()
