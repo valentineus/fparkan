@@ -32,7 +32,9 @@ pub use fparkan_texm::{PageRect, RgbaImage};
 use fparkan_vfs::DirectoryVfs;
 mod behavior_profile_values;
 mod chassis_profile;
-pub use behavior_profile_values::{decode_behavior_work_rates, BehaviorWorkRates};
+pub use behavior_profile_values::{
+    decode_behavior_go_speed_percent, decode_behavior_work_rates, BehaviorWorkRates,
+};
 pub use chassis_profile::decode_chassis_can_fly;
 mod research;
 pub use research::{
@@ -88,7 +90,7 @@ pub struct BehaviorProfileRates {
 pub enum BehaviorProfileVarError {
     /// The binary record framing is malformed.
     Decode(DecodeError),
-    /// A bound for one of the two fields used here is not a 32-bit float.
+    /// A selected registered field is not a 32-bit float.
     InvalidFloatField {
         name: &'static str,
         size: u32,

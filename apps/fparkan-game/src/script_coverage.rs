@@ -56,11 +56,11 @@ pub(super) fn log_clan_ai_stops(report: &SimulationReport) {
             "sim_coverage control_profile_update_stub={count} object={object} reason={reason}"
         );
     }
-    for (object, (count, limit, speed)) in &report.patrol_speeds.samples {
-        eprintln!("sim_coverage patrol_speed_profile_approx={count} object={object} forward_limit={} requested_speed={}", f32::from_bits(*limit), f32::from_bits(*speed));
+    for ((object, kind), (count, limit, percent, speed)) in &report.unit_speeds.samples {
+        eprintln!("sim_coverage {kind}_speed_profile_approx={count} object={object} forward_limit={} speed_percent={} requested_speed={}", f32::from_bits(*limit), f32::from_bits(*percent), f32::from_bits(*speed));
     }
-    for ((object, reason), count) in &report.patrol_speeds.stubs {
-        eprintln!("sim_coverage patrol_speed_stub={count} object={object} reason={reason}");
+    for ((object, kind, reason), count) in &report.unit_speeds.stubs {
+        eprintln!("sim_coverage {kind}_speed_stub={count} object={object} reason={reason}");
     }
     for (object, (batches, points, checks)) in &report.patrol_points.batches {
         eprintln!("sim_coverage mission_patrol_points_approx={points} object={object} batches={batches} walkability_queries={checks}");

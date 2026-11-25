@@ -49,6 +49,13 @@ pub(super) fn spawn_prepared_unit(
         .behavior_control_groupings
         .retain(|group| transform_state(world, group.handle).is_ok());
     table.handle = handle;
+    if let Some(profile) = mission
+        .behavior_profiles
+        .iter_mut()
+        .find(|profile| Some(profile.original_id) == draft.original_id)
+    {
+        profile.handle = handle;
+    }
     mission
         .behavior_control_groupings
         .push(crate::project_mission_behavior_control_grouping(&table));

@@ -6,12 +6,11 @@ use fparkan_assets::{
     decode_mission_land_path, decode_mission_payload, decode_nres_payload,
     derive_mission_land_paths, extend_graph_report_with_visual_dependencies,
     mission_script_bundle_bases, prepare_terrain_world, AssetError as AssetPreparationError,
-    AssetId, AssetManager, BehaviorProfileRates, BehaviorProfileVarError, BuildCategory,
-    MissionAssetPlan, MissionDocument, MissionError, MissionTerrainPaths, NresError,
-    PreparedComponentControl, PreparedControlEffectRow, PreparedControlEffectSection,
-    PreparedControlNodeDataRow, PreparedControlNodeDataTable, PreparedControlResourcePair,
-    PreparedControlTypedRecord, PreparedVisual, ResearchError, ResearchTrfDocument,
-    TerrainFormatError, TerrainPreparationError, TerrainWorld, TmaProfile,
+    AssetId, AssetManager, BuildCategory, MissionAssetPlan, MissionDocument, MissionError,
+    MissionTerrainPaths, NresError, PreparedComponentControl, PreparedControlEffectRow,
+    PreparedControlEffectSection, PreparedControlNodeDataRow, PreparedControlNodeDataTable,
+    PreparedControlResourcePair, PreparedControlTypedRecord, PreparedVisual, ResearchError,
+    ResearchTrfDocument, TerrainFormatError, TerrainPreparationError, TerrainWorld, TmaProfile,
 };
 use fparkan_fx::{decode_fxid, FxOpcode, FXID_KIND};
 use fparkan_msh::{node38_metadata, selected_slot, Group, Lod, NodeId};
@@ -44,6 +43,8 @@ use std::sync::Arc;
 mod attack_target;
 mod autodemo;
 mod behavior_clock;
+mod behavior_profile;
+use behavior_profile::prepare_behavior_profile_states;
 mod boarding;
 mod builder_supply;
 mod building_door;
@@ -82,10 +83,10 @@ pub use laboratory::LaboratoryReport;
 mod mission_events;
 mod ore_transport;
 mod patrol_points;
-mod patrol_speed;
 mod player_motion;
+mod unit_speed;
 pub use patrol_points::PatrolPointReport;
-pub use patrol_speed::PatrolSpeedReport;
+pub use unit_speed::{UnitSpeedKind, UnitSpeedReport};
 mod player_status;
 mod player_weapon;
 mod production;
@@ -271,7 +272,7 @@ pub struct BehaviorOreState {
     pub maximum_ore_bits: u32,
 }
 
-/// Initial Behavior rates loaded for one full Unit DAT mission object.
+/// Behavior profile values loaded for one full Unit DAT mission object.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BehaviorProfileState {
     /// Stable identity from the source TMA object order.
@@ -286,6 +287,8 @@ pub struct BehaviorProfileState {
     pub transfer_ore_off_board_bits: u32,
     /// Raw bits of `Transfer_Power_Out` after applying the profile.
     pub transfer_power_out_bits: u32,
+    /// Applied `Go_SpeedPercent`, or the native constructor default of one.
+    pub go_speed_percent_bits: u32,
 }
 
 /// Origin of a Control descriptor retained in the effective table projection.
@@ -977,6 +980,7 @@ struct PreparedBehaviorProfileState {
     profile_entry: Option<&'static str>,
     transfer_ore_off_board_bits: u32,
     transfer_power_out_bits: u32,
+    go_speed_percent_bits: u32,
 }
 
 /// Resource distributor state associated with one TMA clan's constructed AI.
@@ -2220,6 +2224,7 @@ fn load_mission_with_options(
                 profile_entry: profile.profile_entry,
                 transfer_ore_off_board_bits: profile.transfer_ore_off_board_bits,
                 transfer_power_out_bits: profile.transfer_power_out_bits,
+                go_speed_percent_bits: profile.go_speed_percent_bits,
             })
         })
         .collect();
@@ -3008,7 +3013,7 @@ pub struct SimulationReport {
     pub control_resource_stops: Vec<(u32, u64, String)>,
     pub weapon_poses: WeaponPoseReport,
     pub patrol_points: PatrolPointReport,
-    pub patrol_speeds: PatrolSpeedReport,
+    pub unit_speeds: UnitSpeedReport,
     pub control_profiles: ControlProfileReport,
     pub mobile_budget: MobileBudgetReport,
     pub combat: CombatReport,
@@ -3091,7 +3096,7 @@ pub fn simulate_mission_report(
         control_resource_stops: Vec::new(),
         weapon_poses: WeaponPoseReport::default(),
         patrol_points: PatrolPointReport::default(),
-        patrol_speeds: PatrolSpeedReport::default(),
+        unit_speeds: UnitSpeedReport::default(),
         control_profiles: ControlProfileReport::default(),
         mobile_budget: MobileBudgetReport::default(),
         combat: CombatReport::default(),
@@ -3207,7 +3212,7 @@ pub fn simulate_mission_report(
         report.mobile_budget = loaded.control_resources.mobile.clone();
         if let Some(patrol) = &loaded.unit_patrol {
             report.patrol_points = patrol.point_report.clone();
-            report.patrol_speeds = patrol.speed_report.clone();
+            report.unit_speeds = patrol.speed_report.clone();
             report.unit_motion = patrol.motion_report.clone();
         }
         report
@@ -6599,123 +6604,6 @@ fn native_behavior_ore_defaults(class_flags: u32) -> (u32, u32) {
         0x0100_4000 => (0x44fa_0000, 0x44fa_0000),
         _ => (0, 0),
     }
-}
-
-fn behavior_profile_entry_for_class(class_flags: u32) -> Option<&'static str> {
-    match class_flags {
-        0x8000_0004 => Some("prof_mine.var"),
-        0x8000_0008 => Some("prof_storage.var"),
-        0x8000_0002 => Some("prof_generator.var"),
-        0x8000_0010 => Some("prof_plant.var"),
-        0x8000_0040 => Some("prof_angar.var"),
-        0x8000_0200 => Some("prof_mtp.var"),
-        0x8000_0400 => Some("prof_institute.var"),
-        0x8001_0000 | 0x8002_0000 | 0x8004_0000 => Some("prof_bunker.var"),
-        0x8010_0000 | 0x8020_0000 => Some("prof_tower.var"),
-        0x0100_2000 => Some("prof_trn.var"),
-        0x0100_4000 => Some("prof_bld.var"),
-        0x0100_8000 => Some("prof_war.var"),
-        0x0101_0000 => Some("prof_hq.var"),
-        HERO_UNIT_CLASS => Some("prof_hero.var"),
-        0x2000_0000 => Some("prof_animal.var"),
-        _ => None,
-    }
-}
-
-fn prepare_behavior_profile_states(
-    vfs: &Arc<dyn Vfs>,
-    object_drafts: &[MissionObjectDraft],
-) -> Result<Vec<Option<PreparedBehaviorProfileState>>, EngineError> {
-    const DEFAULT_TRANSFER_ORE_OFF_BOARD_BITS: u32 = 0x40a0_0000;
-    const DEFAULT_TRANSFER_POWER_OUT_BITS: u32 = 0x42c8_0000;
-
-    let has_known_profile = object_drafts.iter().any(|draft| {
-        draft
-            .unit_dat_header_flags
-            .and_then(behavior_profile_entry_for_class)
-            .is_some()
-    });
-    let archive_path = has_known_profile
-        .then(|| normalize_engine_path("Behavior profile archive", "behpsp.res"))
-        .transpose()?;
-    let profile_archive = archive_path
-        .as_ref()
-        .map(|path| {
-            let bytes = read_vfs(vfs, path)?;
-            decode_nres_payload(bytes).map_err(|source| EngineError::Nres {
-                path: path.as_str().to_string(),
-                source,
-            })
-        })
-        .transpose()?;
-    let mut rates_by_entry = HashMap::<&'static str, BehaviorProfileRates>::new();
-    let mut states = Vec::with_capacity(object_drafts.len());
-
-    for draft in object_drafts {
-        let Some(class_flags) = draft.unit_dat_header_flags else {
-            states.push(None);
-            continue;
-        };
-        let Some(original_id) = draft.original_id else {
-            states.push(None);
-            continue;
-        };
-        let profile_entry = behavior_profile_entry_for_class(class_flags);
-        let (transfer_ore_off_board_bits, transfer_power_out_bits) = if let Some(entry_name) =
-            profile_entry
-        {
-            let rates = if let Some(rates) = rates_by_entry.get(entry_name) {
-                *rates
-            } else {
-                let path = archive_path
-                    .as_ref()
-                    .expect("known profiles require the profile archive path");
-                let archive = profile_archive
-                    .as_ref()
-                    .expect("known profiles require the decoded profile archive");
-                let entry_id =
-                    archive
-                        .find(entry_name)
-                        .ok_or_else(|| EngineError::BehaviorProfile {
-                            path: path.as_str().to_string(),
-                            entry: entry_name.to_string(),
-                            message: "entry was not found".to_string(),
-                        })?;
-                let payload = archive
-                    .payload(entry_id)
-                    .map_err(|source| EngineError::Nres {
-                        path: path.as_str().to_string(),
-                        source,
-                    })?;
-                let rates = fparkan_assets::decode_behavior_profile_rates(payload).map_err(
-                    |source: BehaviorProfileVarError| EngineError::BehaviorProfile {
-                        path: path.as_str().to_string(),
-                        entry: entry_name.to_string(),
-                        message: source.to_string(),
-                    },
-                )?;
-                rates_by_entry.insert(entry_name, rates);
-                rates
-            };
-            (
-                rates.transfer_ore_off_board_bits,
-                rates.transfer_power_out_bits,
-            )
-        } else {
-            (
-                DEFAULT_TRANSFER_ORE_OFF_BOARD_BITS,
-                DEFAULT_TRANSFER_POWER_OUT_BITS,
-            )
-        };
-        states.push(Some(PreparedBehaviorProfileState {
-            original_id,
-            class_flags,
-            profile_entry,
-            transfer_ore_off_board_bits,
-            transfer_power_out_bits,
-        }));
-    }
-    Ok(states)
 }
 
 fn initialize_behavior_ore_state(
@@ -17578,9 +17466,15 @@ mod tests {
             (0x2000_0000, "prof_animal.var"),
         ];
         for (class_flags, entry) in mapped {
-            assert_eq!(behavior_profile_entry_for_class(class_flags), Some(entry));
+            assert_eq!(
+                behavior_profile::behavior_profile_entry_for_class(class_flags),
+                Some(entry)
+            );
         }
-        assert_eq!(behavior_profile_entry_for_class(0xdead_beef), None);
+        assert_eq!(
+            behavior_profile::behavior_profile_entry_for_class(0xdead_beef),
+            None
+        );
 
         let vfs: Arc<dyn Vfs> = Arc::new(MemoryVfs::default());
         let drafts = [basement_draft(Some(0xdead_beef), 0)];
@@ -17778,6 +17672,7 @@ mod tests {
             profile_entry: None,
             transfer_ore_off_board_bits: 0x40a0_0000,
             transfer_power_out_bits: 4.0_f32.to_bits(),
+            go_speed_percent_bits: 1.0_f32.to_bits(),
         }];
         let mut control_tables = vec![
             behavior_tick_test_control_table(1, producer.handle),
@@ -17827,6 +17722,7 @@ mod tests {
             profile_entry: None,
             transfer_ore_off_board_bits: 4.0_f32.to_bits(),
             transfer_power_out_bits: 0.0_f32.to_bits(),
+            go_speed_percent_bits: 1.0_f32.to_bits(),
         }];
         let mut ore_device = synthetic_effective_control_device(
             26,

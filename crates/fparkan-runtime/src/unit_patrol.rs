@@ -3,8 +3,8 @@ use super::{
     boarding::WARBOT_CLASS,
     next_crt_rand,
     patrol_points::{PatrolPointReport, PatrolPoints},
-    patrol_speed::{place_speed, PatrolSpeedReport},
     unit_combat::CombatTarget,
+    unit_speed::{order_speed, UnitSpeedKind, UnitSpeedReport},
     EngineError, LoadedMissionState, MissionDocument, MissionObjectDraft, MissionScriptBundle,
     ObjectHandle, TerrainWorld, TransformState, World,
 };
@@ -26,7 +26,7 @@ pub(super) struct UnitPatrol {
     clock_ms: u32,
     rng: u32,
     pub(super) point_report: PatrolPointReport,
-    pub(super) speed_report: PatrolSpeedReport,
+    pub(super) speed_report: UnitSpeedReport,
     pub(super) motion_report: crate::UnitMotionReport,
     pub(super) factory_raid_clans: usize,
 }
@@ -154,7 +154,7 @@ impl UnitPatrol {
             clock_ms: 0,
             rng: 1,
             point_report: PatrolPointReport::default(),
-            speed_report: PatrolSpeedReport::default(),
+            speed_report: UnitSpeedReport::default(),
             motion_report: crate::UnitMotionReport::default(),
             factory_raid_clans: 0,
         }
@@ -397,7 +397,7 @@ impl UnitPatrol {
             clock_ms: 0,
             rng: 1,
             point_report: PatrolPointReport::default(),
-            speed_report: PatrolSpeedReport::default(),
+            speed_report: UnitSpeedReport::default(),
             motion_report: crate::UnitMotionReport::default(),
             factory_raid_clans: 0,
         })
@@ -602,7 +602,12 @@ impl UnitPatrol {
             // shortcut: turn and non-place orders still use the temporary controller.
             let (yaw, turn_seconds) = turn_toward(before, [dx, dy], seconds);
             after.orientation[2] = yaw.to_bits();
-            let speed = if place_patrol && enemy.is_none() {
+            let speed = if (place_patrol && enemy.is_none()) || unit.destinations.is_some() {
+                let kind = if place_patrol {
+                    UnitSpeedKind::PatrolPlace
+                } else {
+                    UnitSpeedKind::Go
+                };
                 let object = identity_metadata(world, unit.handle)
                     .ok()
                     .and_then(|identity| identity.original_id)
@@ -611,7 +616,11 @@ impl UnitPatrol {
                     .control_device_tables
                     .iter()
                     .find(|table| table.handle == unit.handle);
-                place_speed(table, object, &mut state.speed_report)
+                let behavior = mission
+                    .behavior_profiles
+                    .iter()
+                    .find(|profile| profile.handle == unit.handle);
+                order_speed(table, behavior, object, kind, &mut state.speed_report)
             } else {
                 9.0
             };

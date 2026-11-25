@@ -387,6 +387,9 @@ mod tests {
         assert_eq!(report.updates[&0].0, 1);
         assert!(report.stubs.is_empty(), "{:?}", report.stubs);
         let patrol = mission.unit_patrol.as_ref().unwrap();
-        assert_eq!(patrol.speed_report.samples[&0].2, (after * 0.8).to_bits());
+        assert_eq!(
+            patrol.speed_report.samples[&(0, crate::UnitSpeedKind::PatrolPlace)].3,
+            (after * 0.8).to_bits()
+        );
     }
 }
