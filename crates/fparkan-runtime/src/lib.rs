@@ -91,6 +91,8 @@ mod player_weapon;
 mod production;
 mod projectile;
 mod research;
+mod resource_distribution;
+use resource_distribution::advance_behavior_distributor_tick;
 mod script_host;
 mod script_patrol;
 mod script_time;
@@ -6151,230 +6153,6 @@ fn behavior_query_control(
     query_control_device_table_resource(&control_tables[table_index], selector)
         .map(|value| value.unwrap_or(0.0))
         .map_err(|error| format!("{error:?}"))
-}
-
-fn advance_behavior_distributor_tick(
-    distributor: &mut BehaviorDistributorState,
-    delta_seconds: f32,
-    world: &World,
-    ore_states: &mut [BehaviorOreState],
-    profiles: &[BehaviorProfileState],
-    control_tables: &mut [MissionControlDeviceTableState],
-) -> Result<[u32; 5], String> {
-    let mut totals = BehaviorTickTotals::default();
-
-    // Native pass one measures supply and demand, then records per-row demand.
-    for object in &mut distributor.registered_objects {
-        let Some(live_handle) = handle_by_original_id(world, object.original_id) else {
-            object.native_tail[1] = 0;
-            object.native_tail[3] = 0;
-            continue;
-        };
-        if live_handle != object.handle {
-            return Err(format!(
-                "live original object {} maps to {live_handle:?}, expected {:?}",
-                object.original_id.0, object.handle
-            ));
-        }
-        let share = checked_control_float(object.class_flags, "Behavior share", object.share)
-            .map_err(|error| format!("{error:?}"))?;
-
-        let power_source = matches!(
-            object.class_flags,
-            0x8000_0002 | 0x8001_0000 | 0x8002_0000 | 0x8004_0000
-        );
-        let power_demand = if power_source {
-            let rate = behavior_tick_resource_rate(
-                object.class_flags,
-                live_handle,
-                0x1005,
-                profiles,
-                control_tables,
-            )?;
-            let production = behavior_product(delta_seconds, rate, "power production")?;
-            behavior_add_total(&mut totals.power_available, production, "power available")?;
-            0.0
-        } else {
-            let total_power = behavior_query_control(control_tables, live_handle, 2)?;
-            let power_ratio = behavior_query_control(control_tables, live_handle, 1)?;
-            if total_power > 0.0 {
-                let used_power = behavior_product(power_ratio, total_power, "used power")?;
-                behavior_difference(total_power, used_power, "power demand")?
-            } else {
-                0.0
-            }
-        };
-        object.native_tail[1] = power_demand.to_bits();
-        behavior_add_total(&mut totals.power_demand, power_demand, "power demand")?;
-        behavior_add_total(
-            &mut totals.power_weighted_demand,
-            behavior_product(power_demand, share, "weighted power demand")?,
-            "weighted power demand",
-        )?;
-
-        let ore_source = matches!(object.class_flags, 0x8000_0004 | 0x8000_0008);
-        let ore_index = behavior_ore_index_for_handle(ore_states, live_handle)?;
-        let current = behavior_checked_property(&ore_states[ore_index], false)?;
-        let ore_demand = if ore_source {
-            let rate = behavior_tick_resource_rate(
-                object.class_flags,
-                live_handle,
-                0x1002,
-                profiles,
-                control_tables,
-            )?;
-            let production = behavior_product(delta_seconds, rate, "ore production")?;
-            let available = if current < production {
-                current
-            } else {
-                production
-            };
-            behavior_add_total(&mut totals.ore_available, available, "ore available")?;
-            behavior_add_total(&mut totals.ore_in_buffer, current, "ore in buffer")?;
-            0.0
-        } else {
-            let maximum = behavior_checked_property(&ore_states[ore_index], true)?;
-            let deficit = behavior_difference(maximum, current, "ore deficit")?;
-            if deficit >= f32::from_bits(0x3c23_d70a) {
-                deficit
-            } else {
-                ore_states[ore_index].current_ore_bits = maximum.to_bits();
-                0.0
-            }
-        };
-        object.native_tail[3] = ore_demand.to_bits();
-        behavior_add_total(&mut totals.ore_demand, ore_demand, "ore demand")?;
-        behavior_add_total(
-            &mut totals.ore_weighted_demand,
-            behavior_product(ore_demand, share, "weighted ore demand")?,
-            "weighted ore demand",
-        )?;
-    }
-
-    let power_allocation = behavior_allocation(
-        totals.power_available,
-        totals.power_demand,
-        totals.power_weighted_demand,
-    )?;
-    let ore_allocation = behavior_allocation(
-        totals.ore_available,
-        totals.ore_demand,
-        totals.ore_weighted_demand,
-    )?;
-
-    // Native pass two re-reads callbacks before applying each row in order.
-    for object in &mut distributor.registered_objects {
-        let Some(live_handle) = handle_by_original_id(world, object.original_id) else {
-            object.native_tail[2] = 0;
-            object.native_tail[4] = 0;
-            continue;
-        };
-        if live_handle != object.handle {
-            return Err(format!(
-                "live original object {} maps to {live_handle:?}, expected {:?}",
-                object.original_id.0, object.handle
-            ));
-        }
-        object.native_tail[2] = 0;
-        object.native_tail[4] = 0;
-
-        let power_source = matches!(
-            object.class_flags,
-            0x8000_0002 | 0x8001_0000 | 0x8002_0000 | 0x8004_0000
-        );
-        if power_source {
-            let table_index = behavior_control_index_for_handle(control_tables, live_handle)?;
-            set_control_device_table_multiplier(&mut control_tables[table_index], 1.0)
-                .map_err(|error| format!("{error:?}"))?;
-        } else {
-            let table_index = behavior_control_index_for_handle(control_tables, live_handle)?;
-            let total_power = behavior_query_control(control_tables, live_handle, 2)?;
-            if total_power > 0.0 {
-                let power_ratio = behavior_query_control(control_tables, live_handle, 1)?;
-                let used_power = behavior_product(power_ratio, total_power, "used power")?;
-                let demand = behavior_difference(total_power, used_power, "power demand")?;
-                let share = object.share;
-                let priority_share =
-                    behavior_product(share, power_allocation.priority, "priority power share")?;
-                let residual_share = behavior_product(
-                    behavior_difference(1.0, share, "remaining share")?,
-                    power_allocation.residual,
-                    "residual power share",
-                )?;
-                let fraction = checked_control_sum(
-                    0,
-                    "power allocation fraction",
-                    residual_share,
-                    priority_share,
-                )
-                .map_err(|error| format!("{error:?}"))?;
-                let allocated = behavior_product(demand, fraction, "power allocation")?;
-                let updated =
-                    checked_control_sum(0, "used plus allocated power", used_power, allocated)
-                        .map_err(|error| format!("{error:?}"))?;
-                let new_ratio =
-                    checked_control_ratio("new Control selector 1", updated, total_power)
-                        .map_err(|error| format!("{error:?}"))?;
-                set_control_device_table_multiplier(&mut control_tables[table_index], new_ratio)
-                    .map_err(|error| format!("{error:?}"))?;
-                object.native_tail[2] = allocated.to_bits();
-            }
-        }
-
-        let ore_source = matches!(object.class_flags, 0x8000_0004 | 0x8000_0008);
-        let ore_index = behavior_ore_index_for_handle(ore_states, live_handle)?;
-        let current = behavior_checked_property(&ore_states[ore_index], false)?;
-        if ore_source {
-            let rate = behavior_tick_resource_rate(
-                object.class_flags,
-                live_handle,
-                0x1002,
-                profiles,
-                control_tables,
-            )?;
-            let production = behavior_product(delta_seconds, rate, "ore withdrawal rate")?;
-            let bounded_production = if current < production {
-                current
-            } else {
-                production
-            };
-            let taken = behavior_product(
-                bounded_production,
-                ore_allocation.consumption,
-                "ore withdrawal",
-            )?;
-            ore_states[ore_index].current_ore_bits =
-                behavior_difference(current, taken, "remaining ore")?.to_bits();
-        } else {
-            let maximum = behavior_checked_property(&ore_states[ore_index], true)?;
-            let capacity = behavior_difference(maximum, current, "ore capacity")?;
-            let share = object.share;
-            let priority_share =
-                behavior_product(share, ore_allocation.priority, "priority ore share")?;
-            let residual_share = behavior_product(
-                behavior_difference(1.0, share, "remaining share")?,
-                ore_allocation.residual,
-                "residual ore share",
-            )?;
-            let fraction =
-                checked_control_sum(0, "ore allocation fraction", residual_share, priority_share)
-                    .map_err(|error| format!("{error:?}"))?;
-            let allocated = behavior_product(capacity, fraction, "ore allocation")?;
-            ore_states[ore_index].current_ore_bits =
-                checked_control_sum(0, "current plus allocated ore", current, allocated)
-                    .map_err(|error| format!("{error:?}"))?
-                    .to_bits();
-            object.native_tail[4] = allocated.to_bits();
-        }
-    }
-
-    Ok([
-        totals.power_available.to_bits(),
-        totals.ore_available.to_bits(),
-        totals.ore_in_buffer.to_bits(),
-        totals.power_demand.to_bits(),
-        totals.ore_demand.to_bits(),
-    ])
 }
 
 fn set_control_device_table_multiplier(
@@ -17915,7 +17693,7 @@ mod tests {
         assert_eq!(exact.consumption.to_bits(), 1.0_f32.to_bits());
     }
 
-    fn behavior_tick_test_object(
+    pub(super) fn behavior_tick_test_object(
         world: &mut World,
         original_id: u32,
         class_flags: u32,
@@ -17940,7 +17718,7 @@ mod tests {
         }
     }
 
-    fn behavior_tick_test_control_table(
+    pub(super) fn behavior_tick_test_control_table(
         original_id: u32,
         handle: ObjectHandle,
     ) -> MissionControlDeviceTableState {
