@@ -180,6 +180,7 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) -> Vec<MissionNotice
         &engine.world,
         engine.production.as_ref(),
         engine.services.vfs.as_deref(),
+        &mut engine.ai_rng_state,
         now_ms,
         &mut notices,
     ) {
@@ -234,7 +235,7 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) -> Vec<MissionNotice
 
 #[derive(Default)]
 pub(super) struct ClanAiEvents {
-    next_ms: BTreeMap<usize, u32>,
+    clocks: crate::clan_clock::ClanClocks,
     stops: BTreeMap<(usize, usize, usize), (MissionEventStop, u64)>,
     research_stubs: BTreeMap<(usize, u8), u64>,
     pub(super) research_catalogs: BTreeMap<usize, crate::clan_research::ClanResearch>,
@@ -283,6 +284,7 @@ impl LoadedMissionState {
         world: &World,
         production: Option<&crate::production::Production>,
         vfs: Option<&dyn fparkan_vfs::Vfs>,
+        rng: &mut u32,
         now_ms: u32,
         notices: &mut Vec<MissionNotice>,
     ) -> Vec<ScriptFactoryOrder> {
@@ -290,7 +292,7 @@ impl LoadedMissionState {
         let Some(varset) = &self.script_varset else {
             return orders;
         };
-        let clock = crate::script_time::elapsed_seconds(self.mission_events.start_ms, now_ms);
+        let elapsed_ms = now_ms.wrapping_sub(self.mission_events.start_ms);
         for bundle in self.script_bundles.iter().filter(|bundle| {
             bundle.behavior_warm_start.is_some() && self.mission.clans[bundle.clan_index].mode == 2
         }) {
@@ -302,13 +304,9 @@ impl LoadedMissionState {
                 continue;
             };
             let clan = bundle.clan_index;
-            // shortcut: use the base interval until the separate native AI clock and RNG are wired.
-            if !self
-                .clan_ai_events
-                .due(clan, self.mission_events.start_ms, now_ms)
-            {
+            let Some(clock) = self.clan_ai_events.clocks.tick(clan, elapsed_ms, rng) else {
                 continue;
-            }
+            };
             let Some(state) = self
                 .script_varset_states
                 .iter_mut()
@@ -317,7 +315,7 @@ impl LoadedMissionState {
                 continue;
             };
             let mut problems_event = Some((event_index, event, None::<Handler2Record>));
-            // shortcut: protection resumes on the shared clan interval without native RNG.
+            // shortcut: task continuations still share the clan cycle rather than per-task scheduling.
             let mut pending = self
                 .clan_ai_events
                 .problems
@@ -1577,14 +1575,8 @@ impl ClanAiEvents {
         }
     }
 
-    fn due(&mut self, clan: usize, start_ms: u32, now_ms: u32) -> bool {
-        let next = self.next_ms.entry(clan).or_insert(7_000);
-        let elapsed = now_ms.wrapping_sub(start_ms);
-        if elapsed < *next {
-            return false;
-        }
-        *next = elapsed.saturating_add(7_000);
-        true
+    pub(super) fn clock_ticks(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
+        self.clocks.ticks()
     }
 
     pub(super) fn stops(&self) -> impl Iterator<Item = (&MissionEventStop, u64)> {
@@ -1935,17 +1927,6 @@ mod tests {
             .iter()
             .all(|&unit| patrol.has_object_order(unit, factory)));
         assert!(loaded.clan_ai_events.waits.contains_key(key));
-    }
-
-    #[test]
-    fn clans_have_independent_due_times_and_no_replay_after_a_late_tick() {
-        let mut ai = ClanAiEvents::default();
-        assert!(!ai.due(1, 100_000, 106_999));
-        assert!(ai.due(1, 100_000, 107_000));
-        assert!(ai.due(2, 100_000, 107_000));
-        assert!(!ai.due(1, 100_000, 113_999));
-        assert!(ai.due(1, 100_000, 120_000));
-        assert!(!ai.due(1, 100_000, 120_000));
     }
 
     #[test]

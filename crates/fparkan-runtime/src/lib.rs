@@ -50,6 +50,7 @@ mod clan_ai_events;
 mod clan_area_strength;
 mod clan_build_limits;
 mod clan_building_queries;
+mod clan_clock;
 mod clan_combat_groups;
 mod clan_combat_strength;
 mod clan_mining;
@@ -1341,6 +1342,7 @@ pub struct Engine {
     world: World,
     loaded: Option<LoadedMissionState>,
     behavior_rng_state: u32,
+    ai_rng_state: u32,
     autodemo_combat: Option<unit_combat::AutoDemoCombat>,
     autodemo_reinforcements: Option<autodemo::LiveReinforcements>,
     production: Option<production::Production>,
@@ -1725,6 +1727,7 @@ pub fn create(services: EngineServices) -> Result<Engine, EngineError> {
         world: new_world(WorldConfig),
         loaded: None,
         behavior_rng_state: INITIAL_BEHAVIOR_RNG_STATE,
+        ai_rng_state: 1,
         autodemo_combat: None,
         autodemo_reinforcements: None,
         production: None,
@@ -2914,6 +2917,8 @@ pub struct SimulationReport {
     pub mission_event_stops: Vec<MissionEventStop>,
     /// Uncovered clan AI instructions and the number of invocations they stopped.
     pub clan_ai_event_stops: Vec<(MissionEventStop, u64)>,
+    /// Executed AI clock cycles by clan; initial phase and full RNG ordering remain approximate.
+    pub clan_ai_clock_ticks: Vec<(usize, u64)>,
     /// Calls to stubbed research policy or status, grouped by clan and handler.
     pub clan_research_status_stubs: Vec<(usize, u8, u64)>,
     pub clan_research_catalogs: Vec<(usize, usize, u32, u64)>,
@@ -2988,6 +2993,7 @@ pub fn simulate_mission_report(
         mission_events: 0,
         mission_event_stops: Vec::new(),
         clan_ai_event_stops: Vec::new(),
+        clan_ai_clock_ticks: Vec::new(),
         clan_research_status_stubs: Vec::new(),
         clan_research_catalogs: Vec::new(),
         laboratory: Default::default(),
@@ -3091,6 +3097,9 @@ pub fn simulate_mission_report(
         report
             .clan_research_status_stubs
             .extend(loaded.clan_ai_events.research_status_stubs());
+        report
+            .clan_ai_clock_ticks
+            .extend(loaded.clan_ai_events.clock_ticks());
         report
             .clan_research_catalogs
             .extend(loaded.clan_ai_events.research_catalogs());
