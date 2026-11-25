@@ -67,7 +67,7 @@ pub(super) struct Production {
     reserve_start: usize,
     schemes: Vec<NormalizedPath>,
     player_scheme_count: usize,
-    transport_schemes: Vec<(OwnerId, NormalizedPath)>,
+    ai_schemes: Vec<(OwnerId, u32, NormalizedPath)>,
     controls: Vec<MissionControlDeviceTableState>,
     plants: Vec<(usize, u32)>,
     pending: VecDeque<Order>,
@@ -155,7 +155,7 @@ impl Production {
         reserve_start: usize,
         schemes: Vec<NormalizedPath>,
         player_scheme_count: usize,
-        transport_schemes: Vec<(OwnerId, NormalizedPath)>,
+        ai_schemes: Vec<(OwnerId, u32, NormalizedPath)>,
         controls: Vec<MissionControlDeviceTableState>,
         drafts: &[MissionObjectDraft],
     ) -> Result<Self, EngineError> {
@@ -184,7 +184,7 @@ impl Production {
             reserve_start,
             schemes,
             player_scheme_count,
-            transport_schemes,
+            ai_schemes,
             controls,
             plants: Vec::new(),
             pending: VecDeque::new(),
@@ -295,7 +295,10 @@ impl Production {
             self.controls[order.slot - self.reserve_start].clone(),
         )?;
         let draft = &mission.object_drafts[order.slot];
-        if draft.unit_dat_header_flags == Some(crate::clan_transport_schemes::TRANSPORT_CLASS) {
+        let class = draft
+            .unit_dat_header_flags
+            .expect("prepared factory object has a class");
+        if crate::clan_factory_schemes::AUXILIARY_CLASSES.contains(&class) {
             let id = draft
                 .original_id
                 .expect("prepared factory object has an ID");
@@ -310,7 +313,7 @@ impl Production {
                 .push(crate::initialize_behavior_ore_state(
                     id,
                     handle,
-                    crate::clan_transport_schemes::TRANSPORT_CLASS,
+                    class,
                     &draft.properties,
                 ));
         }
@@ -546,21 +549,20 @@ pub(super) fn order_script_factory(
     let (index, _, _) = owned_factories(&engine.world, mission, production, owner)
         .find(|&(_, handle, _)| handle == plant)
         .ok_or_else(|| production_error("script factory is unavailable"))?;
-    let transport = class == crate::clan_transport_schemes::TRANSPORT_CLASS;
-    let transport_scheme =
-        if transport && selection == crate::clan_transport_schemes::SELECT_FASTEST {
-            production
-                .transport_schemes
-                .iter()
-                .find_map(|(clan, path)| (*clan == owner).then_some(path))
-        } else {
-            None
-        };
+    let auxiliary = crate::clan_factory_schemes::AUXILIARY_CLASSES.contains(&class);
+    let ai_scheme = if auxiliary && selection == crate::clan_factory_schemes::SELECT_FASTEST {
+        production
+            .ai_schemes
+            .iter()
+            .find_map(|(clan, kind, path)| (*clan == owner && *kind == class).then_some(path))
+    } else {
+        None
+    };
     // shortcut: warbots use the first compatible prebuild until AI combat ranking is wired.
     let scheme = schemes_for_plant(mission, production, index)
         .find(|&(scheme, path)| {
-            if transport {
-                return transport_scheme.is_some_and(|selected| selected.as_str() == path);
+            if auxiliary {
+                return ai_scheme.is_some_and(|selected| selected.as_str() == path);
             }
             let draft = &mission.object_drafts[production.reserve_start + scheme * RESERVE_SLOTS];
             scheme < production.player_scheme_count && draft.unit_dat_header_flags == Some(class)
@@ -781,6 +783,74 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
+    fn licensed_scripted_factory_builds_a_usable_builder() {
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed corpus");
+        let mut engine = create(EngineServices::new(std::sync::Arc::new(DirectoryVfs::new(
+            root,
+        ))))
+        .unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Single.01/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        let owner = OwnerId(1);
+        let loaded = engine.loaded.as_ref().unwrap();
+        let former_builder = loaded
+            .mission_events
+            .clan_units(&engine.world, owner, false)
+            .find(|&unit| {
+                let identity = identity_metadata(&engine.world, unit).unwrap();
+                loaded.object_drafts[identity.original_id.unwrap().0 as usize].unit_dat_header_flags
+                    == Some(crate::construction::BUILDER_CLASS)
+            })
+            .unwrap();
+        // Debug casualty exercises the real script's replacement request, not mission acceptance.
+        fparkan_world::request_delete(&mut engine.world, former_builder).unwrap();
+        fparkan_world::step(&mut engine.world, &InputSnapshot).unwrap();
+        let mut builder = None;
+        for time in (0..=180_000).step_by(100) {
+            if let Some(unit) = step_headless(&mut engine, InputSnapshot::default(), time)
+                .unwrap()
+                .produced_unit
+            {
+                if engine.loaded.as_ref().unwrap().object_drafts[unit.object_index]
+                    .unit_dat_header_flags
+                    == Some(crate::construction::BUILDER_CLASS)
+                {
+                    builder = Some(unit.handle);
+                    break;
+                }
+            }
+        }
+        let builder = builder.expect("scripted builder birth");
+        assert_eq!(
+            identity_metadata(&engine.world, builder).unwrap().owner_id,
+            Some(owner)
+        );
+        let loaded = engine.loaded.as_ref().unwrap();
+        assert!(loaded.clan_ai_events.stops().next().is_none());
+        assert!(loaded
+            .behavior_ore_states
+            .iter()
+            .any(|ore| ore.handle == builder
+                && ore.class_flags == crate::construction::BUILDER_CLASS));
+        assert!(loaded
+            .mission_events
+            .clan_units(&engine.world, owner, false)
+            .any(|unit| unit == builder));
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_two_fortresses_builds_a_scripted_enemy_robot() {
         let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed corpus");
         let vfs = std::sync::Arc::new(DirectoryVfs::new(std::path::PathBuf::from(root)));
@@ -808,9 +878,11 @@ mod tests {
         let cockpit = super::super::starting_cockpit(&engine).unwrap();
         let factory = handle_by_original_id(&engine.world, OriginalObjectId(5)).unwrap();
         let production = engine.production.as_ref().unwrap();
-        let [(owner, transport)] = production.transport_schemes.as_slice() else {
-            panic!("expected one eligible AI transport");
-        };
+        let (owner, _, transport) = production
+            .ai_schemes
+            .iter()
+            .find(|(_, class, _)| *class == crate::clan_factory_schemes::TRANSPORT_CLASS)
+            .expect("eligible AI transport");
         assert_eq!(*owner, OwnerId(1));
         assert!(transport.as_str().ends_with("/sml_cargo.dat"));
         let transport_index = production

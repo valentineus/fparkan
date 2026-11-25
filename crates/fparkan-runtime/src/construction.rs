@@ -537,8 +537,8 @@ mod tests {
                     &mut engine,
                     OwnerId(1),
                     handle,
-                    crate::clan_transport_schemes::TRANSPORT_CLASS,
-                    crate::clan_transport_schemes::SELECT_FASTEST,
+                    crate::clan_factory_schemes::TRANSPORT_CLASS,
+                    crate::clan_factory_schemes::SELECT_FASTEST,
                     now,
                 );
                 assert_eq!(result.unwrap(), 60_000);

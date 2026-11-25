@@ -1,5 +1,5 @@
+use crate::clan_factory_schemes::TRANSPORT_CLASS;
 use crate::clan_problem_conditions::Condition;
-use crate::clan_transport_schemes::TRANSPORT_CLASS;
 use crate::{
     clan_combat_groups::{CombatGroup, GroupTarget},
     clan_targeting::CaptureApproach,
@@ -843,7 +843,7 @@ impl LoadedMissionState {
                             };
                             if order.word_1 != 0x0c
                                 || order.word_2 != 1
-                                || !matches!(order.word_3, crate::boarding::WARBOT_CLASS | TRANSPORT_CLASS)
+                                || !matches!(order.word_3, crate::boarding::WARBOT_CLASS | TRANSPORT_CLASS | crate::construction::BUILDER_CLASS)
                             {
                                 return Err(
                                     "Handler(15) factory order class or insertion mode is unsupported"

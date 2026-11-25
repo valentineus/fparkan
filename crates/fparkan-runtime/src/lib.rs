@@ -54,13 +54,13 @@ mod clan_clock;
 pub use clan_clock::note_mission_pause_elapsed;
 mod clan_combat_groups;
 mod clan_combat_strength;
+mod clan_factory_schemes;
 mod clan_minds;
 mod clan_mining;
 mod clan_problem_conditions;
 mod clan_research;
 mod clan_script_init;
 mod clan_targeting;
-mod clan_transport_schemes;
 mod construction;
 mod construction_site;
 mod laboratory;
@@ -1950,13 +1950,12 @@ fn load_mission_with_options(
     })?;
     let mut loaded_scripts = load_mission_scripts(&vfs, &mission, options.asset_scope)?;
     let player_scheme_count = build_schemes.len();
-    let transport_schemes = if options.start_autodemo && request.mode == MissionMode::SingleMission
-    {
-        clan_transport_schemes::available(vfs.as_ref(), &mission, &loaded_scripts.bundles)
+    let ai_schemes = if options.start_autodemo && request.mode == MissionMode::SingleMission {
+        clan_factory_schemes::available(vfs.as_ref(), &mission, &loaded_scripts.bundles)
     } else {
         Vec::new()
     };
-    for (_, path) in &transport_schemes {
+    for (_, _, path) in &ai_schemes {
         if !build_schemes.contains(path) {
             build_schemes.push(path.clone());
         }
@@ -2647,7 +2646,7 @@ fn load_mission_with_options(
                 reserve_start,
                 build_schemes,
                 player_scheme_count,
-                transport_schemes,
+                ai_schemes,
                 reserve_controls,
                 &object_drafts[..construction_reserve_start],
             )?),
