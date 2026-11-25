@@ -170,29 +170,37 @@ impl Production {
                 "build scheme must be a mobile Unit DAT".into(),
             ));
         }
-        let plants = drafts[..reserve_start]
-            .iter()
-            .enumerate()
-            .filter(|(_, draft)| draft.unit_dat_header_flags == Some(PLANT_CLASS))
-            .map(|(index, draft)| {
-                let count = draft
-                    .properties
-                    .iter()
-                    .find(|property| property.name_raw == b"FreeBotNum")
-                    .map_or(1, |property| property.raw_value[1] as i32);
-                (index, count.max(0) as u32)
-            })
-            .collect();
-        Ok(Self {
+        let mut production = Self {
             reserve_start,
             schemes,
             player_scheme_count,
             transport_schemes,
             controls,
-            plants,
+            plants: Vec::new(),
             pending: VecDeque::new(),
             rng: 1,
-        })
+        };
+        production.register_factories(0, &drafts[..reserve_start]);
+        Ok(production)
+    }
+
+    pub(super) fn register_factories(&mut self, first_slot: usize, drafts: &[MissionObjectDraft]) {
+        self.plants
+            .retain(|&(index, _)| !(first_slot..first_slot + drafts.len()).contains(&index));
+        self.plants.extend(
+            drafts
+                .iter()
+                .enumerate()
+                .filter(|(_, draft)| draft.unit_dat_header_flags == Some(PLANT_CLASS))
+                .map(|(index, draft)| {
+                    let count = draft
+                        .properties
+                        .iter()
+                        .find(|property| property.name_raw == b"FreeBotNum")
+                        .map_or(1, |property| property.raw_value[1] as i32);
+                    (first_slot + index, count.max(0) as u32)
+                }),
+        );
     }
 
     pub(super) fn tick(

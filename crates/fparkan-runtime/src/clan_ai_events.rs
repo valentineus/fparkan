@@ -88,7 +88,12 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) -> Vec<MissionNotice
     let Some(loaded) = &mut engine.loaded else {
         return notices;
     };
-    crate::construction::tick(loaded, &mut engine.world, now_ms);
+    crate::construction::tick(
+        loaded,
+        &mut engine.world,
+        engine.production.as_mut(),
+        now_ms,
+    );
     loaded.clan_ai_events.groups.retain(|&(clan, _), group| {
         if !group.target.valid(&engine.world) {
             if let Some(patrol) = &mut loaded.unit_patrol {
@@ -694,9 +699,9 @@ impl LoadedMissionState {
                                 (order.word_1, order.word_2, order.target)
                             {
                                 if !problem.as_ref().is_some_and(|p| p.key.word_0 == BUILDING_NEEDED)
-                                    || !matches!(order.word_3, 0x8010_0000 | 0x8020_0000)
+                                    || !crate::construction::supports_class(order.word_3)
                                 {
-                                    return Err("ORDER_ROBOT_BUILD requires a supported defensive tower scheme".into());
+                                    return Err("ORDER_ROBOT_BUILD requires a supported building scheme".into());
                                 }
                                 let owner = OwnerId(clan as u16);
                                 let builder = self.mission_events.logic_objects(&self.mission, world, order.word_0)

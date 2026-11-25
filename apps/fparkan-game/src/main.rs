@@ -280,6 +280,7 @@ fn run(args: &[String]) -> Result<String, String> {
         mission_assets,
         terrain,
         roots,
+        loaded.object_count,
         camera,
         args.static_animation_frame,
         args.static_material_phase,
@@ -7632,16 +7633,6 @@ fn mission_basement_footprints(
 ) -> Result<Vec<MissionBasementFootprint>, String> {
     let mut footprints = Vec::new();
     for (object_index, mission_root) in roots.iter().enumerate() {
-        // shortcut: newly built structures lack a live BAS cut until terrain can
-        // rebuild the affected cells when a building enters the world.
-        if mission_root.raw_after_resource == u32::MAX
-            && matches!(
-                mission_root.unit_dat_header_flags,
-                Some(0x8000_0004 | 0x8010_0000 | 0x8020_0000)
-            )
-        {
-            continue;
-        }
         let Some(mode) = mission_root.basement_placement_mode() else {
             continue;
         };
@@ -8200,6 +8191,7 @@ fn static_preview_mesh_and_materials(
     assets: &MissionAssets,
     terrain: &TerrainWorld,
     roots: &[MissionObjectDraft],
+    placed_root_count: usize,
     legacy_camera: Option<LegacyCameraCapture>,
     static_animation_frame: Option<u16>,
     static_material_phase: Option<u16>,
@@ -8245,7 +8237,9 @@ fn static_preview_mesh_and_materials(
         .filter(|face| face.flags.0 & 8 != 0 && face.flags.0 & 0x20000 == 0)
         .count();
     eprintln!("render_coverage terrain_face8_pipeline_unverified={unverified_special_faces} (non-reflective source faces across LODs; native special-pass mapping pending)");
-    let footprint_sources = mission_basement_footprints(assets, roots)?;
+    // shortcut: live construction needs terrain-cell rebuilding before it can cut BAS.
+    let footprint_sources =
+        mission_basement_footprints(assets, &roots[..placed_root_count.min(roots.len())])?;
     let foundation = if footprint_sources.is_empty() {
         None
     } else {
@@ -14092,6 +14086,7 @@ mod tests {
             assets,
             terrain,
             roots,
+            loaded.object_count,
             None,
             None,
             None,
@@ -15192,6 +15187,7 @@ mod tests {
                 assets,
                 terrain,
                 roots,
+                loaded.object_count,
                 None,
                 None,
                 None,
@@ -15245,6 +15241,7 @@ mod tests {
             &MissionAssets::default(),
             &terrain,
             &[],
+            0,
             None,
             None,
             None,

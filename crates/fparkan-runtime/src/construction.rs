@@ -24,13 +24,20 @@ pub(super) fn reserve_schemes(
                 })
         })
     });
-    // shortcut: prepare the defensive tower schemes exercised by the site query.
+    // shortcut: prepare a bounded number of buildings until runtime GPU instancing exists.
     categories
         .iter()
-        .filter(move |category| enabled && matches!(category.mask, 0x8010_0000 | 0x8020_0000))
+        .filter(move |category| enabled && supports_class(category.mask))
         .filter_map(|category| category.unit_paths.first())
         .flat_map(|path| (0..SLOTS_PER_CLASS).map(move |_| crate::resource_name(path.as_bytes())))
         .collect()
+}
+
+pub(super) fn supports_class(class: u32) -> bool {
+    matches!(
+        class,
+        0x8000_0008 | 0x8000_0010 | 0x8000_0400 | 0x8010_0000 | 0x8020_0000
+    )
 }
 
 #[derive(Default)]
@@ -141,7 +148,7 @@ pub(super) fn order(
         .ok_or("unit has no builder ore state")?;
     let slot = construction
         .available_slot(world, drafts, class)
-        .ok_or("no free prepared tower slot")?;
+        .ok_or("no free prepared building slot")?;
     let table = crate::research::load_technology_table(
         vfs.ok_or("no clan technology provider")?,
         mission,
@@ -170,7 +177,12 @@ pub(super) fn order(
     Ok(())
 }
 
-pub(super) fn tick(mission: &mut LoadedMissionState, world: &mut World, now_ms: u32) {
+pub(super) fn tick(
+    mission: &mut LoadedMissionState,
+    world: &mut World,
+    mut production: Option<&mut crate::production::Production>,
+    now_ms: u32,
+) {
     let mut index = 0;
     while let Some(task) = mission.construction.tasks.get_mut(index) {
         let owned =
@@ -210,7 +222,7 @@ pub(super) fn tick(mission: &mut LoadedMissionState, world: &mut World, now_ms: 
             patrol.clear_move(task.builder);
         }
         if finish {
-            if let Err(error) = complete(mission, world, &task) {
+            if let Err(error) = complete(mission, world, &task, production.as_deref_mut()) {
                 eprintln!(
                     "script_building_construction_failed clan={} builder={} reason={error}",
                     task.owner.0, task.builder.slot
@@ -224,6 +236,7 @@ fn complete(
     mission: &mut LoadedMissionState,
     world: &mut World,
     task: &Task,
+    production: Option<&mut crate::production::Production>,
 ) -> Result<(), crate::EngineError> {
     let index = crate::behavior_ore_index_for_handle(&mission.behavior_ore_states, task.builder)
         .map_err(crate::EngineError::Production)?;
@@ -289,6 +302,9 @@ fn complete(
     mission
         .mission_events
         .issue_logic_id(&mission.mission, world, handle);
+    if let Some(production) = production {
+        production.register_factories(task.slot, &mission.object_drafts[task.slot..=task.slot]);
+    }
     eprintln!(
         "script_building_constructed clan={} builder={} building={} class={class:#010x}",
         task.owner.0, task.builder.slot, handle.slot
@@ -316,6 +332,79 @@ mod tests {
     };
     use fparkan_vfs::DirectoryVfs;
     use std::sync::Arc;
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_stock_clan_builds_a_working_factory() {
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").unwrap();
+        let vfs = Arc::new(DirectoryVfs::new(root));
+        let mut engine = create(EngineServices::new(vfs.clone())).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Single.02/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        let loaded = engine.loaded.as_ref().unwrap();
+        let start = loaded.construction.first_slot;
+        let end = start + loaded.construction.controls.len();
+        for owner in [OwnerId(1), OwnerId(2)] {
+            let table =
+                crate::research::load_technology_table(vfs.as_ref(), &loaded.mission, owner)
+                    .unwrap();
+            for slot in (start..end).step_by(SLOTS_PER_CLASS) {
+                let draft = &loaded.object_drafts[slot];
+                let cost =
+                    crate::production::scheme_cost(&draft.unit_components, &table, |_| false);
+                match draft.unit_dat_header_flags.unwrap() {
+                    0x8000_0008 => assert_eq!(cost.unwrap().ore, 670.0),
+                    0x8000_0010 => assert_eq!(cost.unwrap().ore, 770.0),
+                    0x8000_0400 => assert_eq!(cost.unwrap().ore, 560.0),
+                    _ => assert!(cost.is_err()),
+                }
+            }
+        }
+        for now in (0..=900_000).step_by(100) {
+            crate::frame(&mut engine, now).unwrap();
+            let loaded = engine.loaded.as_ref().unwrap();
+            if let Some(handle) = loaded.object_drafts[start..end].iter().find_map(|draft| {
+                (draft.unit_dat_header_flags == Some(0x8000_0010))
+                    .then(|| handle_by_original_id(&engine.world, draft.original_id.unwrap()))
+                    .flatten()
+            }) {
+                assert_eq!(
+                    identity_metadata(&engine.world, handle).unwrap().owner_id,
+                    Some(OwnerId(1))
+                );
+                assert!(loaded
+                    .control_device_tables
+                    .iter()
+                    .any(|table| table.handle == handle));
+                assert!(loaded
+                    .behavior_ore_states
+                    .iter()
+                    .any(|ore| ore.handle == handle && ore.class_flags == 0x8000_0010));
+                let result = crate::production::order_script_factory(
+                    &mut engine,
+                    OwnerId(1),
+                    handle,
+                    crate::clan_transport_schemes::TRANSPORT_CLASS,
+                    crate::clan_transport_schemes::SELECT_FASTEST,
+                    now,
+                );
+                assert_eq!(result.unwrap(), 60_000);
+                return;
+            }
+        }
+        panic!("clans did not complete any building from the stock start");
+    }
 
     #[test]
     #[ignore = "requires licensed corpus"]
@@ -415,9 +504,9 @@ mod tests {
             },
         )
         .unwrap();
-        tick(mission, &mut engine.world, 8_000);
+        tick(mission, &mut engine.world, None, 8_000);
         assert!(handle_by_original_id(&engine.world, id).is_none());
-        tick(mission, &mut engine.world, 9_000);
+        tick(mission, &mut engine.world, None, 9_000);
         let building = handle_by_original_id(&engine.world, id).unwrap();
         assert_eq!(
             identity_metadata(&engine.world, building).unwrap().owner_id,
