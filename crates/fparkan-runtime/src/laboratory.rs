@@ -17,6 +17,8 @@ pub struct LaboratoryReport {
     pub available: Vec<(usize, usize, u64)>,
     /// Orders stopped by unavailable runtime state, by clan and laboratory.
     pub stopped: Vec<(usize, u32, u64)>,
+    /// Due task updates; the idle owner phase is still approximate.
+    pub clock_ticks: Vec<(usize, u32, u64)>,
 }
 
 #[derive(Default)]
@@ -28,6 +30,7 @@ pub(super) struct Laboratories {
     completed: BTreeMap<(usize, u32, usize), u64>,
     available: BTreeMap<(usize, usize), u64>,
     stopped: BTreeMap<(usize, u32), u64>,
+    clock_ticks: BTreeMap<(usize, u32), u64>,
 }
 
 struct Order {
@@ -38,6 +41,7 @@ struct Order {
     current: Option<(usize, Work)>,
     duration: f32,
     last_ms: u32,
+    clock: crate::behavior_clock::TaskClock,
 }
 
 #[derive(Default)]
@@ -121,6 +125,11 @@ impl Laboratories {
                 .iter()
                 .map(|(&(clan, lab), &count)| (clan, lab, count))
                 .collect(),
+            clock_ticks: self
+                .clock_ticks
+                .iter()
+                .map(|(&(clan, lab), &count)| (clan, lab, count))
+                .collect(),
         }
     }
 }
@@ -191,6 +200,7 @@ pub(super) fn order(
         current: None,
         duration,
         last_ms: now_ms,
+        clock: Default::default(),
     });
     eprintln!(
         "sim_coverage script_lab_research_approx=1 clan={clan} lab={} project={}",
@@ -200,10 +210,23 @@ pub(super) fn order(
     Ok(())
 }
 
-pub(super) fn tick(mission: &mut LoadedMissionState, world: &World, now_ms: u32) {
+pub(super) fn tick(mission: &mut LoadedMissionState, world: &World, now_ms: u32, rng: &mut u32) {
     let mut state = std::mem::take(&mut mission.laboratories);
     let mut index = 0;
     while index < state.tasks.len() {
+        let task = &mut state.tasks[index];
+        if !task.clock.due(now_ms, rng) {
+            index += 1;
+            continue;
+        }
+        let count = state
+            .clock_ticks
+            .entry((task.clan, task.lab.slot))
+            .or_default();
+        *count += 1;
+        if *count == 1 {
+            eprintln!("sim_coverage script_lab_clock_approx=1 clan={} lab={} (active task timer; idle owner phases remain open)", task.clan, task.lab.slot);
+        }
         let result = advance(&mut state, index, mission, world, now_ms);
         if matches!(result, Ok(true)) {
             index += 1;

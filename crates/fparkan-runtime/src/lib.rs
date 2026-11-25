@@ -42,6 +42,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 mod autodemo;
+mod behavior_clock;
 mod boarding;
 mod builder_supply;
 mod building_door;
@@ -60,6 +61,7 @@ mod clan_transport_schemes;
 mod construction;
 mod construction_site;
 mod laboratory;
+use behavior_clock::next_crt_rand;
 mod mesh_collision;
 mod mining;
 pub use laboratory::LaboratoryReport;
@@ -1063,23 +1065,12 @@ pub struct BehaviorWarmStartState {
 
 impl BehaviorWarmStartState {
     fn start(queue_time_ms: u32, rng_state: &mut u32) -> Self {
-        const BASE_INTERVAL_MS: u32 = 3 * 64;
-        const JITTER_RANGE_MS: u32 = 64;
-
-        let random = next_crt_rand(rng_state);
-        let jitter_ms = ((random & 0xff) * JITTER_RANGE_MS) >> 8;
-
         Self {
             first_time_ms: queue_time_ms,
-            next_deadline_ms: queue_time_ms.wrapping_add(BASE_INTERVAL_MS + jitter_ms),
+            next_deadline_ms: behavior_clock::next_deadline(queue_time_ms, 3, 1, rng_state),
             cleared_words: [0; 5],
         }
     }
-}
-
-fn next_crt_rand(state: &mut u32) -> u32 {
-    *state = state.wrapping_mul(0x343fd).wrapping_add(0x269ec3);
-    (*state >> 16) & 0x7fff
 }
 
 fn behavior_elapsed_seconds(elapsed_ms: u32) -> f32 {

@@ -90,7 +90,12 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) -> Vec<MissionNotice
     let Some(loaded) = &mut engine.loaded else {
         return notices;
     };
-    crate::laboratory::tick(loaded, &engine.world, now_ms);
+    crate::laboratory::tick(
+        loaded,
+        &engine.world,
+        now_ms,
+        &mut engine.behavior_rng_state,
+    );
     crate::construction::tick(
         loaded,
         &mut engine.world,
