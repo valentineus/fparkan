@@ -46,6 +46,7 @@ mod boarding;
 mod building_door;
 mod clan_ai_events;
 mod clan_area_strength;
+mod clan_build_limits;
 mod clan_building_queries;
 mod clan_combat_groups;
 mod clan_combat_strength;
@@ -2935,6 +2936,7 @@ pub struct SimulationReport {
     pub script_factory_patrol_continues: Vec<(usize, u32, u64)>,
     pub script_ore_transport_orders: Vec<(usize, u32, u64)>,
     pub script_building_site_queries: Vec<(usize, u32, u64)>,
+    pub script_class_limit_queries: Vec<(usize, u32, bool, u64)>,
     pub script_construction_orders: Vec<(usize, u32, u32, u64, u64)>,
     pub script_capturer_queries: Vec<(usize, u64)>,
     pub script_capture_approaches: Vec<(u32, u32, u64)>,
@@ -2998,6 +3000,7 @@ pub fn simulate_mission_report(
         script_factory_patrol_continues: Vec::new(),
         script_ore_transport_orders: Vec::new(),
         script_building_site_queries: Vec::new(),
+        script_class_limit_queries: Vec::new(),
         script_construction_orders: Vec::new(),
         script_capturer_queries: Vec::new(),
         script_capture_approaches: Vec::new(),
@@ -3141,6 +3144,9 @@ pub fn simulate_mission_report(
         report
             .script_building_site_queries
             .extend(loaded.clan_ai_events.building_site_queries());
+        report
+            .script_class_limit_queries
+            .extend(loaded.clan_ai_events.class_limit_queries());
         report
             .script_construction_orders
             .extend(loaded.clan_ai_events.construction_orders());

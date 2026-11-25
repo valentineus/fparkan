@@ -21,6 +21,9 @@ pub(super) fn log_script_init(engine: &Engine, mission: &str) {
 }
 
 pub(super) fn log_clan_ai_stops(report: &SimulationReport) {
+    for &(clan, class, blocked, count) in &report.script_class_limit_queries {
+        eprintln!("sim_coverage script_class_limit_approx={count} clan={clan} class={class:#010x} blocked={blocked}");
+    }
     for &(unit, order, count) in &report.script_unit_order_counts {
         eprintln!("sim_coverage script_unit_queue_approx={count} unit={unit} order={order}");
     }

@@ -258,6 +258,7 @@ pub(super) struct ClanAiEvents {
     group_recruitments: BTreeMap<(usize, u32), u64>,
     class_target_queries: BTreeMap<(usize, u32, u32), u64>,
     size_class_queries: BTreeMap<(usize, u32), u64>,
+    class_limit_queries: BTreeMap<(usize, u32, bool), u64>,
 }
 
 impl LoadedMissionState {
@@ -633,29 +634,26 @@ impl LoadedMissionState {
                         ScriptDispatchSelector::Handler(11) => {
                             let class = single_dword(&instruction.references, values)
                                 .ok_or("Handler(11) requires one DWORD class")?;
-                            if matches!(class, 0x8000_0040 | 0x8000_0400) {
-                                return Err(
-                                    "Handler(11) requires the pending hangar or laboratory counter"
-                                        .into(),
-                                );
-                            }
-                            let Some(limit_var) = class_limit_variable(class) else {
-                                return Ok(Some(VarSetDefault::Dword(0)));
-                            };
-                            let limit = varset
-                                .declarations
-                                .declarations
-                                .iter()
-                                .position(|entry| entry.name == limit_var)
-                                .and_then(|index| values.get(index)?.as_dword())
-                                .ok_or("Handler(11) class limit is unavailable")?;
+                            let limit = crate::clan_build_limits::maximum_variable(class).map(|name| {
+                                varset.declarations.declarations.iter()
+                                    .position(|entry| entry.name == name)
+                                    .and_then(|index| values.get(index)?.as_dword())
+                                    .ok_or("Handler(11) class limit is unavailable")
+                            }).transpose()?;
                             let count = self.mission_events.count_clan_class(
                                 world,
                                 OwnerId(clan as u16),
                                 class,
                             );
-                            // shortcut: include unfinished structures once construction registers with the roster.
-                            Ok(Some(VarSetDefault::Dword(u32::from(count >= limit))))
+                            // shortcut: bind pending counters to active runtime construction until native task accounting is wired.
+                            let pending = self.construction.pending_count(OwnerId(clan as u16), class);
+                            let blocked = crate::clan_build_limits::at_limit(class, count, limit, pending);
+                            let queries = self.clan_ai_events.class_limit_queries.entry((clan, class, blocked)).or_default();
+                            *queries += 1;
+                            if *queries == 1 {
+                                eprintln!("sim_coverage script_class_limit_approx=1 clan={clan} class={class:#010x} blocked={blocked} owned={count} pending={pending}");
+                            }
+                            Ok(Some(VarSetDefault::Dword(u32::from(blocked))))
                         }
                         ScriptDispatchSelector::Handler(13) => {
                             let (mode, class) = instruction.dword_pair(values)
@@ -1271,18 +1269,6 @@ impl LoadedMissionState {
     }
 }
 
-fn class_limit_variable(class: u32) -> Option<&'static str> {
-    match class {
-        0x0100_2000 => Some("dMaxTransport"),
-        0x0100_4000 => Some("dMaxBuilder"),
-        crate::mining::MINE_CLASS => Some("dMaxMine"),
-        STORAGE_CLASS => Some("dMaxStorage"),
-        crate::autodemo::PLANT_CLASS => Some("dMaxPlant"),
-        0x8010_0000 | 0x8020_0000 => Some("dMaxTower"),
-        _ => None,
-    }
-}
-
 fn ranked_problems(problems: &[Handler2Record]) -> Vec<Handler2Record> {
     let mut pending: Vec<_> = problems
         .iter()
@@ -1481,6 +1467,12 @@ impl ClanAiEvents {
         self.building_site_queries
             .iter()
             .map(|(&(clan, class), &count)| (clan, class, count))
+    }
+
+    pub(super) fn class_limit_queries(&self) -> impl Iterator<Item = (usize, u32, bool, u64)> + '_ {
+        self.class_limit_queries
+            .iter()
+            .map(|(&(clan, class, blocked), &count)| (clan, class, blocked, count))
     }
 
     pub(super) fn construction_orders(

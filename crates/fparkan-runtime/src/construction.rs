@@ -44,6 +44,7 @@ struct Task {
     builder: ObjectHandle,
     owner: OwnerId,
     slot: usize,
+    class: u32,
     position: [f32; 3],
     cost: f32,
     arrived_at: Option<u32>,
@@ -63,6 +64,13 @@ impl Construction {
 
     pub(super) fn active(&self, builder: ObjectHandle) -> bool {
         self.tasks.iter().any(|task| task.builder == builder)
+    }
+
+    pub(super) fn pending_count(&self, owner: OwnerId, class: u32) -> usize {
+        self.tasks
+            .iter()
+            .filter(|task| task.owner == owner && task.class == class)
+            .count()
     }
 
     fn available_slot(
@@ -86,6 +94,7 @@ impl Construction {
         builder: ObjectHandle,
         owner: OwnerId,
         slot: usize,
+        class: u32,
         position: [f32; 3],
         cost: f32,
     ) {
@@ -93,6 +102,7 @@ impl Construction {
             builder,
             owner,
             slot,
+            class,
             position,
             cost,
             arrived_at: None,
@@ -156,7 +166,7 @@ pub(super) fn order(
     patrol
         .get_or_insert_with(crate::unit_patrol::UnitPatrol::scripted)
         .move_to(world, builder, [position[0], position[1]], false);
-    construction.start(builder, owner, slot, position, cost);
+    construction.start(builder, owner, slot, class, position, cost);
     Ok(())
 }
 
@@ -390,6 +400,8 @@ mod tests {
         mission.behavior_ore_states[builder_ore].current_ore_bits = stock_before.to_bits();
         order_for(mission, &engine.world).unwrap();
         assert!(mission.construction.active(builder));
+        assert_eq!(mission.construction.pending_count(owner, class), 1);
+        assert_eq!(mission.construction.pending_count(OwnerId(0), class), 0);
         assert!(handle_by_original_id(&engine.world, id).is_none());
         let cost = mission.construction.tasks[0].cost;
         assert_eq!(cost, 1100.0);
@@ -416,5 +428,6 @@ mod tests {
             stock_before - cost
         );
         assert!(!mission.construction.active(builder));
+        assert_eq!(mission.construction.pending_count(owner, class), 0);
     }
 }
