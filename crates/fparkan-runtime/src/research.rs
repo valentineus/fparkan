@@ -172,6 +172,52 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
+    fn licensed_new_lab_rejects_an_unloaded_catalog_without_stopping_the_script() {
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").unwrap();
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Single.02/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        for now in (0..=900_000).step_by(100) {
+            frame(&mut engine, now).unwrap();
+        }
+        let loaded = engine.loaded.as_ref().unwrap();
+        let lab = loaded
+            .object_drafts
+            .iter()
+            .skip(loaded.mission.objects.len())
+            .filter(|draft| draft.unit_dat_header_flags == Some(LAB_CLASS))
+            .find_map(|draft| handle_by_original_id(&engine.world, draft.original_id?))
+            .unwrap();
+        let id = loaded
+            .mission_events
+            .logic_id(&loaded.mission, &engine.world, lab)
+            .unwrap();
+        assert!(loaded
+            .mission_events
+            .logic_objects(&loaded.mission, &engine.world, id)
+            .any(|handle| handle == lab));
+        assert!(loaded
+            .clan_ai_events
+            .research_status_stubs()
+            .any(|(clan, handler, count)| clan == 1 && handler == 41 && count > 0));
+        assert!(loaded.clan_ai_events.stops().next().is_none());
+        assert!(loaded.free_research.pending.is_none());
+        assert!(loaded.free_research.learned.is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_teleport_lab_researches_the_available_turret() {
         let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").unwrap();
         let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(std::path::PathBuf::from(root)));

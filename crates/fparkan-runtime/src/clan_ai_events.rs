@@ -1042,7 +1042,7 @@ impl LoadedMissionState {
                         ScriptDispatchSelector::Handler(41) if problem.is_some() => {
                             let id = single_dword(&instruction.references, values)
                                 .ok_or("Handler(41) requires a laboratory logical ID")?;
-                            let exists = crate::mission_events::placed_logic_objects(
+                            let exists = self.mission_events.logic_objects(
                                 &self.mission,
                                 world,
                                 id,
