@@ -16,6 +16,7 @@ const STORAGE_CLASS: u32 = 0x8000_0008;
 const RESOURCE_ORE: u32 = 0x0200_0100;
 const BUILDING_PROTECT: u32 = 8;
 const PLACE_PROTECT: u32 = 11;
+const ATTACK_UNIT: u32 = 13;
 const OPTIMAL_TRANSPORT: u32 = 4;
 const BUILDING_NEEDED: u32 = 3;
 
@@ -251,6 +252,7 @@ pub(super) struct ClanAiEvents {
     point_group_orders: BTreeMap<(usize, u32, u32), u64>,
     point_patrol_continues: BTreeMap<(usize, u32, u32), u64>,
     free_unit_queries: BTreeMap<(usize, u32, u32), u64>,
+    group_recruitments: BTreeMap<(usize, u32), u64>,
 }
 
 impl LoadedMissionState {
@@ -467,14 +469,37 @@ impl LoadedMissionState {
                             Ok(Some(VarSetDefault::Dword(target)))
                         }
                         ScriptDispatchSelector::Handler(25) if problem.is_some() => {
-                            let &[mode, hits, target_mode, ref target @ ..] = instruction.references.as_slice() else {
-                                return Err("Handler(25) requires TAKE_BY_HITS and a target".into());
-                            };
                             let word = |index: u32| values.get(index as usize)?.as_dword();
-                            let (Some(2), Some(requested)) = (word(mode), word(hits))
-                            else {
-                                return Err("Handler(25) requires TAKE_BY_HITS".into());
+                            let (&mode, rest) = instruction.references.split_first()
+                                .ok_or("Handler(25) requires a recruitment mode")?;
+                            let mode = word(mode).filter(|mode| matches!(mode, 1 | 2))
+                                .ok_or("Handler(25) requires TAKE_ALL_FREE or TAKE_BY_HITS")?;
+                            let count = self.clan_ai_events.group_recruitments.entry((clan, mode)).or_default();
+                            *count += 1;
+                            let first_recruitment = *count == 1;
+                            let owner = OwnerId(clan as u16);
+                            // shortcut: infer roster occupancy from runtime jobs until native problem-slot ownership is wired.
+                            let units = self.mission_events.clan_units(world, owner, mode != 1)
+                                .filter(|&unit| !self.mission_events.is_reserved(owner, unit)
+                                    && !self.clan_ai_events.unit_assigned(unit)
+                                    && !self.construction.active(unit)
+                                    && !production.is_some_and(|queue| queue.is_building_at(unit, owner))
+                                    && !orders.iter().any(|order: &ScriptFactoryOrder| order.plant == unit))
+                                .filter(|&unit| mode == 1 || self.unit_patrol.as_ref().is_none_or(|patrol| !patrol.is_shut_down(unit)));
+                            if mode == 1 {
+                                if !rest.is_empty() {
+                                    return Err("Handler(25) TAKE_ALL_FREE takes one operand".into());
+                                }
+                                group = crate::clan_combat_groups::recruit_all(units);
+                                if first_recruitment {
+                                    eprintln!("sim_coverage script_group_recruitment_approx=1 clan={clan} mode={mode} units={:?}", group.as_ref().map(|group| group.members.iter().map(|unit| unit.slot).collect::<Vec<_>>()).unwrap_or_default());
+                                }
+                                return Ok(Some(VarSetDefault::Dword(if group.is_some() { 0 } else { u32::MAX })));
+                            }
+                            let &[hits, target_mode, ref target @ ..] = rest else {
+                                return Err("Handler(25) TAKE_BY_HITS requires strength and a target".into());
                             };
+                            let requested = word(hits).ok_or("Handler(25) strength must be a DWORD")?;
                             let target = match (word(target_mode), target) {
                                 (Some(0x201), &[id]) => Handler15TargetPayload::ByLogicId(word(id).ok_or("Handler(25) logical ID must be a DWORD")?),
                                 (Some(0x202), &[x, y]) => Handler15TargetPayload::ByPlace {
@@ -484,9 +509,6 @@ impl LoadedMissionState {
                                 _ => return Err("Handler(25) requires a logical ID or XY point".into()),
                             };
                             // shortcut: use free warbots until lower-priority orders can be preempted.
-                            let units = self.mission_events.clan_units(world, OwnerId(clan as u16), true)
-                                .filter(|&unit| !self.clan_ai_events.unit_assigned(unit))
-                                .filter(|&unit| self.unit_patrol.as_ref().is_none_or(|patrol| !patrol.is_shut_down(unit)));
                             let (recruited, strength) = crate::clan_combat_groups::recruit(
                                 world, units, &self.control_device_tables, &self.mission, target, requested,
                             );
@@ -494,18 +516,21 @@ impl LoadedMissionState {
                                 values[hits as usize] = VarSetDefault::Dword(strength as u32);
                             }
                             group = recruited;
+                            if first_recruitment {
+                                eprintln!("sim_coverage script_group_recruitment_approx=1 clan={clan} mode={mode} units={:?}", group.as_ref().map(|group| group.members.iter().map(|unit| unit.slot).collect::<Vec<_>>()).unwrap_or_default());
+                            }
                             // shortcut: group IDs stay local until groups are script-visible across events.
                             Ok(Some(VarSetDefault::Dword(if group.is_some() { 0 } else { u32::MAX })))
                         }
                         ScriptDispatchSelector::Handler(28) if problem.is_some() => {
                             let order = varset.declarations.resolve_handler15_with_values(instruction, values)
                                 .map_err(|error| error.to_string())?;
-                            let group = group.take().ok_or("Handler(28) requires an active combat group")?;
+                            let mut group = group.take().ok_or("Handler(28) requires an active combat group")?;
                             let patrol = self.unit_patrol.get_or_insert_with(crate::unit_patrol::UnitPatrol::scripted);
-                            group.dispatch(patrol, world, &self.mission, order)
-                                .ok_or("Handler(28) requires a patrol or attack on the group's target")?;
+                            group.dispatch(patrol, world, &self.mission, &self.object_drafts, order)?;
                             let key = problem.as_ref().expect("group order requires a problem").key;
                             let (name, count) = match group.target {
+                                GroupTarget::Unassigned => return Err("Handler(28) group has no assigned order".into()),
                                 GroupTarget::Object(target, _) => ("script_group_order_approx", self.clan_ai_events.group_orders.entry((clan, target.slot)).or_default()),
                                 GroupTarget::Point([x, y]) => ("script_point_group_order_approx", self.clan_ai_events.point_group_orders.entry((clan, x, y)).or_default()),
                             };
@@ -836,7 +861,7 @@ impl LoadedMissionState {
                                         .ok_or("Handler(27) task wait requires the assigned unit")?;
                                     Some(Condition::TaskInactive(unit))
                                 }
-                                (1 | 3, 0) if matches!(key.word_0, 7 | 9) || (action == 1 && key.word_0 == BUILDING_PROTECT) => {
+                                (1 | 3, 0) if matches!(key.word_0, 7 | 9) || (action == 1 && matches!(key.word_0, BUILDING_PROTECT | ATTACK_UNIT)) => {
                                     let target = crate::mission_events::placed_logic_objects(
                                         &self.mission, world, id
                                     ).next();
@@ -1361,6 +1386,12 @@ impl ClanAiEvents {
             .map(|(&(clan, class, unit), &count)| (clan, class, unit, count))
     }
 
+    pub(super) fn group_recruitments(&self) -> impl Iterator<Item = (usize, u32, u64)> + '_ {
+        self.group_recruitments
+            .iter()
+            .map(|(&(clan, mode), &count)| (clan, mode, count))
+    }
+
     pub(super) fn point_group_orders(&self) -> impl Iterator<Item = (usize, u32, u32, u64)> + '_ {
         self.point_group_orders
             .iter()
@@ -1491,6 +1522,91 @@ impl ClanAiEvents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_free_group_waits_empty_then_attacks_after_a_debug_roster_transfer() {
+        use crate::{EngineServices, MissionMode, MissionRequest, MissionStartupInput};
+        use fparkan_vfs::DirectoryVfs;
+        use std::sync::Arc;
+
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed corpus root");
+        let mut engine =
+            crate::create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
+        crate::load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/CAMPAIGN/CAMPAIGN.02/Mission.03/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        for now in (0..=7_000).step_by(100) {
+            crate::frame(&mut engine, now).unwrap();
+        }
+        let loaded = engine.loaded.as_ref().unwrap();
+        assert_eq!(
+            loaded
+                .mission_events
+                .clan_units(&engine.world, OwnerId(5), false)
+                .count(),
+            0
+        );
+        assert!(loaded
+            .clan_ai_events
+            .stops()
+            .all(|(stop, _)| stop.clan_index != 5));
+        assert!(!loaded
+            .clan_ai_events
+            .groups
+            .keys()
+            .any(|&(clan, _)| clan == 5));
+        let transferred = loaded
+            .mission_events
+            .clan_units(&engine.world, OwnerId(1), true)
+            .next()
+            .expect("stock enemy has a warbot for the debug transfer");
+        // Debug setup exercises the attack path; this is not a stock mission playthrough.
+        fparkan_world::set_owner(&mut engine.world, transferred, Some(OwnerId(5))).unwrap();
+        for now in (7_100..=14_000).step_by(100) {
+            crate::frame(&mut engine, now).unwrap();
+        }
+        let loaded = engine.loaded.as_ref().unwrap();
+        let (&key, group) = loaded
+            .clan_ai_events
+            .groups
+            .iter()
+            .find(|(&(clan, key), _)| clan == 5 && key.word_0 == ATTACK_UNIT)
+            .expect("script selects all free units and dispatches its attack");
+        let GroupTarget::Object(target, _) = group.target else {
+            panic!("attack requires an object")
+        };
+        assert_eq!(group.members, [transferred]);
+        let patrol = loaded.unit_patrol.as_ref().unwrap();
+        assert!(group.members.iter().all(|&unit| patrol
+            .attack_target(unit)
+            .is_some_and(|(object, _)| object == target)));
+        assert!(loaded.clan_ai_events.waits.contains_key(&key));
+        assert!(loaded.clan_ai_events.stops().all(|(stop, _)| {
+            stop.clan_index != 5
+                || !["Handler(25)", "Handler(28)", "Handler(27)"]
+                    .iter()
+                    .any(|handler| stop.reason.starts_with(handler))
+        }));
+        crate::frame(&mut engine, 14_100).unwrap();
+        assert!(engine
+            .loaded
+            .as_ref()
+            .unwrap()
+            .clan_ai_events
+            .groups
+            .contains_key(&key));
+    }
 
     #[test]
     #[ignore = "requires licensed corpus"]

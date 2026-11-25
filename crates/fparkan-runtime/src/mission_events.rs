@@ -154,6 +154,10 @@ pub(super) struct MissionEvents {
 }
 
 impl MissionEvents {
+    pub(super) fn is_reserved(&self, owner: OwnerId, unit: ObjectHandle) -> bool {
+        self.reserved_units.contains(&(usize::from(owner.0), unit))
+    }
+
     pub(super) fn clan_units<'a>(
         &'a self,
         world: &'a World,

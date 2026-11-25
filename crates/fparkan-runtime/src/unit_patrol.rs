@@ -245,12 +245,12 @@ impl UnitPatrol {
     pub(super) fn has_object_order(&self, handle: ObjectHandle, target: ObjectHandle) -> bool {
         self.units
             .iter()
-            .any(|unit| unit.handle == handle && unit.center_object == Some(target))
+            .any(|unit| unit.handle == handle && unit.has_object_order(target))
     }
 
     pub(super) fn clear_object_order(&mut self, handle: ObjectHandle, target: ObjectHandle) {
         self.units
-            .retain(|unit| unit.handle != handle || unit.center_object != Some(target));
+            .retain(|unit| unit.handle != handle || !unit.has_object_order(target));
     }
 
     pub(super) fn has_point_order(&self, handle: ObjectHandle, point: [f32; 2]) -> bool {
@@ -523,6 +523,13 @@ fn new_patrol_replaces_a_script_attack_order() {
 }
 
 impl PatrollingUnit {
+    fn has_object_order(&self, target: ObjectHandle) -> bool {
+        self.center_object == Some(target)
+            || self
+                .attack_target
+                .is_some_and(|(handle, _)| handle == target)
+    }
+
     fn patrols_point(&self, point: [f32; 2]) -> bool {
         self.center_object.is_none()
             && self.attack_target.is_none()
@@ -543,6 +550,31 @@ impl PatrollingUnit {
             }
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn attack_order_remains_assigned_and_cleanup_preserves_a_new_target() {
+    let mut world = fparkan_world::new(fparkan_world::WorldConfig::default());
+    let [actor, first, second] = [0; 3].map(|_| {
+        let unit = fparkan_world::construct_object(
+            &mut world,
+            fparkan_world::ObjectDraft { original_id: None },
+        )
+        .unwrap();
+        fparkan_world::register_object(&mut world, unit).unwrap();
+        unit
+    });
+    let mut patrol = UnitPatrol::scripted();
+    patrol.set_attack_target(&world, actor, first, 1, [50.0, 60.0]);
+    assert!(patrol.has_object_order(actor, first));
+    patrol.clear_object_order(actor, second);
+    assert_eq!(patrol.attack_target(actor), Some((first, 1)));
+    patrol.set_attack_target(&world, actor, second, 2, [70.0, 80.0]);
+    patrol.clear_object_order(actor, first);
+    assert_eq!(patrol.attack_target(actor), Some((second, 2)));
+    patrol.clear_object_order(actor, second);
+    assert!(!patrol.is_patrolling(actor));
 }
 
 #[cfg(test)]
