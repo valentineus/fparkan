@@ -1607,6 +1607,14 @@ impl ClanAiEvents {
         self.clocks.seconds(clan)
     }
 
+    pub(super) fn wall_time_ms(&self, queue_ms: u32) -> u32 {
+        self.clocks.wall_time_ms(queue_ms)
+    }
+
+    pub(super) fn add_paused_time(&mut self, paused_ms: u32) {
+        self.clocks.add_paused_time(paused_ms);
+    }
+
     pub(super) fn clock_ticks(&self) -> impl Iterator<Item = (usize, u64, u64)> + '_ {
         self.clocks.ticks()
     }

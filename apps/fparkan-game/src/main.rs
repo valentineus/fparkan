@@ -8,6 +8,7 @@ mod control_effects;
 use control_effects::{advance_control_effect_instances, owner_control_capacity};
 mod mission_hints;
 mod mission_notices;
+mod mission_pause;
 mod player_collision;
 mod projectile_trail;
 mod script_coverage;
@@ -9984,6 +9985,7 @@ struct StaticVulkanApp {
     simulation_last_tick: Instant,
     live_clock_paused_for_zero_extent: bool,
     mission_paused: bool,
+    mission_pause_started: Option<Instant>,
     window_focused: bool,
     last_presented_mission_scene: Option<SceneFrameUpdate>,
     simulation_elapsed: Duration,
@@ -10127,6 +10129,7 @@ impl StaticVulkanApp {
             simulation_last_tick: Instant::now(),
             live_clock_paused_for_zero_extent: false,
             mission_paused: false,
+            mission_pause_started: None,
             window_focused: true,
             last_presented_mission_scene: None,
             simulation_elapsed: Duration::ZERO,
@@ -10869,30 +10872,6 @@ impl StaticVulkanApp {
         if self.live_clock_paused_for_zero_extent {
             self.simulation_last_tick = now;
             self.live_clock_paused_for_zero_extent = false;
-        }
-    }
-
-    fn set_mission_paused_at(&mut self, paused: bool, now: Instant) {
-        self.mission_paused = paused;
-        self.player_mouse = [0.0; 2];
-        self.player_move_pressed = Default::default();
-        self.player_capture_pressed = false;
-        self.player_select_friend_pressed = false;
-        self.player_build_pressed = false;
-        self.player_research_pressed = false;
-        self.player_mine_pressed = false;
-        self.player_disembark_pressed = false;
-        if self.cockpit.is_some() && self.demo_camera.is_none() {
-            self.set_mouse_look(self.window_focused && !paused);
-        }
-        self.simulation_last_tick = now;
-        eprintln!(
-            "mission_pause paused={paused} queue_time_ms={}",
-            self.simulation_time_ms
-        );
-        self.update_mission_title();
-        if let Some(audio) = self.audio.as_mut() {
-            audio.set_paused(paused || !self.window_focused);
         }
     }
 

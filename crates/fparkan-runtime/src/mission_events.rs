@@ -779,11 +779,13 @@ impl LoadedMissionState {
         let inside_exit = exit_event.is_some() && self.hero_in_teleport_exit(world);
         let entered_exit = inside_exit && !self.mission_events.inside_hero_exit;
         self.mission_events.inside_hero_exit = inside_exit;
-        // shortcut: dispatch Mission on the shared 2 s queue timer until its native cadence is wired.
         let (event_index, event) =
             if entered_exit && self.script_outcome == super::MissionScriptOutcome::Active {
                 exit_event?
-            } else if self.mission_events.due(now_ms) {
+            } else if self
+                .mission_events
+                .due(self.clan_ai_events.wall_time_ms(now_ms))
+            {
                 events.find(|(_, event)| {
                     event.name_raw.split(|byte| *byte == 0).next() == Some(b"Mission")
                 })?
@@ -1363,5 +1365,18 @@ mod tests {
         assert!(events.due(10_123));
         assert!(!events.due(12_122));
         assert!(events.due(12_123));
+    }
+
+    #[test]
+    fn mission_timer_is_due_after_a_long_pause_without_advancing_the_world_clock() {
+        let mut events = MissionEvents::default();
+        let mut clocks = crate::clan_ai_events::ClanAiEvents::default();
+        assert!(events.due(clocks.wall_time_ms(0)));
+        assert!(!events.due(clocks.wall_time_ms(500)));
+        clocks.add_paused_time(22_300);
+        assert!(events.due(clocks.wall_time_ms(500)));
+        assert!(!events.due(clocks.wall_time_ms(500)));
+        assert!(!events.due(clocks.wall_time_ms(2_499)));
+        assert!(events.due(clocks.wall_time_ms(2_500)));
     }
 }

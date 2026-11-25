@@ -51,6 +51,7 @@ mod clan_area_strength;
 mod clan_build_limits;
 mod clan_building_queries;
 mod clan_clock;
+pub use clan_clock::note_mission_pause_elapsed;
 mod clan_combat_groups;
 mod clan_combat_strength;
 mod clan_mining;
