@@ -35,6 +35,9 @@ pub(super) fn log_clan_ai_stops(report: &SimulationReport) {
             "sim_coverage script_building_defence_approx={count} clan={clan} target={target}"
         );
     }
+    for &(clan, event, instruction, count) in &report.script_area_strength_queries {
+        eprintln!("sim_coverage script_area_strength_approx={count} clan={clan} event={event} instruction={instruction}");
+    }
     for &(clan, target, count) in &report.script_base_threat_queries {
         eprintln!("sim_coverage script_base_threat_approx={count} clan={clan} target={target}");
     }

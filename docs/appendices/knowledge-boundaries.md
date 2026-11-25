@@ -452,6 +452,9 @@ core и `ResearchCandidateSet::refresh_selection`: последний получ
 `script_building_defence_approx` считает выбор наименее охраняемого своего
 строения через `Handler(37)`. Сила и порядок кандидатов пока берутся из
 реестра мира и Control вместо записей ArealMap.
+`script_area_strength_approx` считает запросы `Handler(44)` по клану,
+событию и инструкции. Используются живой реестр мира и оценка Control,
+пока записи областей и агрегаты силы ArealMap остаются открытыми.
 `script_base_threat_approx` отмечает поиск угрозы у базы по клану и
 цели. В выборе пока участвуют машины с логическими ID карты.
 `script_problem_dispatch_stubs` считает накопленные заявки по клану и типу.

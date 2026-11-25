@@ -45,6 +45,7 @@ mod autodemo;
 mod boarding;
 mod building_door;
 mod clan_ai_events;
+mod clan_area_strength;
 mod clan_combat_groups;
 mod clan_combat_strength;
 mod clan_problem_conditions;
@@ -2966,6 +2967,7 @@ pub struct SimulationReport {
     pub script_attack_queries: Vec<(usize, u64)>,
     pub script_factory_defence_queries: Vec<(usize, u32, u64)>,
     pub script_building_defence_queries: Vec<(usize, u32, u64)>,
+    pub script_area_strength_queries: Vec<(usize, usize, usize, u64)>,
     pub script_base_threat_queries: Vec<(usize, u32, u64)>,
     pub script_group_orders: Vec<(usize, u32, u64)>,
     pub script_problem_waits: Vec<(usize, u32, u64)>,
@@ -3021,6 +3023,7 @@ pub fn simulate_mission_report(
         script_attack_queries: Vec::new(),
         script_factory_defence_queries: Vec::new(),
         script_building_defence_queries: Vec::new(),
+        script_area_strength_queries: Vec::new(),
         script_base_threat_queries: Vec::new(),
         script_group_orders: Vec::new(),
         script_problem_waits: Vec::new(),
@@ -3121,6 +3124,9 @@ pub fn simulate_mission_report(
         report
             .script_building_defence_queries
             .extend(loaded.clan_ai_events.building_defence_queries());
+        report
+            .script_area_strength_queries
+            .extend(loaded.clan_ai_events.area_strength_queries());
         report
             .script_base_threat_queries
             .extend(loaded.clan_ai_events.base_threat_queries());

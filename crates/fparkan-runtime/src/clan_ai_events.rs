@@ -227,6 +227,7 @@ pub(super) struct ClanAiEvents {
     attack_queries: BTreeMap<usize, u64>,
     factory_defence_queries: BTreeMap<(usize, u32), u64>,
     building_defence_queries: BTreeMap<(usize, u32), u64>,
+    area_strength_queries: BTreeMap<(usize, usize, usize), u64>,
     base_threat_queries: BTreeMap<(usize, u32), u64>,
     base_radius_limits: BTreeMap<usize, f32>,
     capturer_queries: BTreeMap<usize, u64>,
@@ -368,6 +369,20 @@ impl LoadedMissionState {
                     bundle.formula_table.as_ref(),
                     &mut state.values,
                     |instruction, values| match instruction.dispatch_selector() {
+                        ScriptDispatchSelector::Handler(44) => {
+                            let strength = crate::clan_area_strength::query(
+                                &self.mission, &self.mission_events, world, &self.object_drafts,
+                                &self.control_device_tables, clan, instruction, values,
+                            )?;
+                            let index = event.instructions.iter().position(|item| std::ptr::eq(item, instruction))
+                                .expect("instruction belongs to the executing event");
+                            let count = self.clan_ai_events.area_strength_queries.entry((clan, event_index, index)).or_default();
+                            *count += 1;
+                            if *count == 1 {
+                                eprintln!("sim_coverage script_area_strength_approx=1 clan={clan} event={event_index} instruction={index} strength={strength}");
+                            }
+                            Ok(Some(VarSetDefault::Dword(strength)))
+                        }
                         ScriptDispatchSelector::Handler(9)
                             if instruction.references.is_empty()
                                 && instruction.header_words[1] == u32::MAX =>
@@ -1241,6 +1256,14 @@ impl ClanAiEvents {
         self.building_defence_queries
             .iter()
             .map(|(&(clan, target), &count)| (clan, target, count))
+    }
+
+    pub(super) fn area_strength_queries(
+        &self,
+    ) -> impl Iterator<Item = (usize, usize, usize, u64)> + '_ {
+        self.area_strength_queries
+            .iter()
+            .map(|(&(clan, event, instruction), &count)| (clan, event, instruction, count))
     }
 
     pub(super) fn wait_starts(&self) -> impl Iterator<Item = (usize, u32, u64)> + '_ {

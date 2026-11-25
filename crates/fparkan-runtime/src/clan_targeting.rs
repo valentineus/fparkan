@@ -162,7 +162,10 @@ pub(super) fn factory_defence(
                 .map(f32::from_bits),
         ))
     })?;
-    Some((id, guard_strength(world, drafts, controls, units, position)))
+    Some((
+        id,
+        area_strength(world, drafts, controls, units, position, 250.0),
+    ))
 }
 
 pub(super) fn building_defence(
@@ -181,7 +184,7 @@ pub(super) fn building_defence(
             .map(f32::from_bits);
         Some((
             id,
-            guard_strength(world, drafts, controls, units.clone(), position),
+            area_strength(world, drafts, controls, units.clone(), position, 250.0),
         ))
     });
     least_defended(candidates)
@@ -199,12 +202,13 @@ fn least_defended(candidates: impl Iterator<Item = (u32, f32)>) -> Option<(u32, 
     selected
 }
 
-fn guard_strength(
+pub(super) fn area_strength(
     world: &World,
     drafts: &[MissionObjectDraft],
     controls: &[MissionControlDeviceTableState],
     units: impl Iterator<Item = ObjectHandle>,
     position: [f32; 3],
+    radius: f32,
 ) -> f32 {
     // shortcut: sum from live Control tables until the ArealMap street records are available.
     let guards = units.filter(|&handle| {
@@ -215,7 +219,7 @@ fn guard_strength(
             .is_some_and(|class| class & crate::autodemo::MOBILE_UNIT != 0);
         mobile
             && transform_state(world, handle).is_ok_and(|pose| {
-                within_factory_radius(position, pose.position.map(f32::from_bits))
+                within_radius(position, pose.position.map(f32::from_bits), radius)
             })
     });
     guards
@@ -223,8 +227,8 @@ fn guard_strength(
         .fold(0.0, |sum, amount| sum + amount)
 }
 
-fn within_factory_radius([x, y, _]: [f32; 3], [px, py, _]: [f32; 3]) -> bool {
-    (x - px).hypot(y - py) < 250.0
+fn within_radius([x, y, _]: [f32; 3], [px, py, _]: [f32; 3], radius: f32) -> bool {
+    (x - px).hypot(y - py) < radius
 }
 
 pub(super) fn capture_target(
@@ -500,8 +504,16 @@ mod tests {
 
     #[test]
     fn factory_defence_uses_a_strict_horizontal_radius() {
-        assert!(within_factory_radius([100., 100., 75.], [249., 100., 0.]));
-        assert!(!within_factory_radius([100., 100., 75.], [250., 300., 75.]));
+        assert!(within_radius([100., 100., 75.], [249., 100., 0.], 250.0));
+        assert!(!within_radius([100., 100., 75.], [250., 300., 75.], 250.0));
+        assert!(within_radius([100., 100., 75.], [149., 100., 500.], 50.0));
+        assert!(!within_radius([100., 100., 75.], [150., 100., 75.], 50.0));
+        assert!(!within_radius([100., 100., 75.], [100., 100., 75.], 0.0));
+        assert!(!within_radius(
+            [100., 100., 75.],
+            [100., 100., 75.],
+            f32::NAN
+        ));
     }
 
     #[test]
