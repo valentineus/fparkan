@@ -51,8 +51,11 @@ mod clan_area_strength;
 mod clan_build_limits;
 mod clan_building_queries;
 mod clan_clock;
+mod control_profile;
 mod control_resources;
 pub use clan_clock::note_mission_pause_elapsed;
+use control_profile::project_initial as project_control_owner_profile_fca0;
+pub use control_profile::{ControlProfileReport, ControlProfileScalars};
 mod clan_combat_groups;
 mod clan_combat_strength;
 mod clan_factory_schemes;
@@ -884,8 +887,10 @@ pub struct MissionControlOwnerProfile {
     pub native_component_id: u32,
     /// Original profile words held by the Control resource cache.
     pub original_words: [u32; 27],
-    /// Initial per-owner copy; this is mutated independently from `original_words`.
+    /// Per-owner copy, mutated independently from `original_words`.
     pub current_words: [u32; 27],
+    /// Mutable owner scalar and node-group means used by FCA0.
+    pub scalars: ControlProfileScalars,
     /// Initial FAC0 projection, separate from base device-table availability.
     pub load_projection: Result<
         MissionControlOwnerProfileLoadProjection,
@@ -2982,6 +2987,7 @@ pub struct SimulationReport {
     pub weapon_poses: WeaponPoseReport,
     pub patrol_points: PatrolPointReport,
     pub patrol_speeds: PatrolSpeedReport,
+    pub control_profiles: ControlProfileReport,
     /// Approximate clan strength queries, grouped by caller and target clan.
     pub script_strength_queries: Vec<(usize, u16, u64)>,
     pub script_capture_queries: Vec<(usize, u64)>,
@@ -3061,6 +3067,7 @@ pub fn simulate_mission_report(
         weapon_poses: WeaponPoseReport::default(),
         patrol_points: PatrolPointReport::default(),
         patrol_speeds: PatrolSpeedReport::default(),
+        control_profiles: ControlProfileReport::default(),
         script_strength_queries: Vec::new(),
         script_capture_queries: Vec::new(),
         script_attack_queries: Vec::new(),
@@ -3168,6 +3175,7 @@ pub fn simulate_mission_report(
             .clan_research_catalogs
             .extend(loaded.clan_ai_events.research_catalogs());
         report.laboratory = loaded.laboratories.report();
+        report.control_profiles = loaded.control_resources.profiles.clone();
         if let Some(patrol) = &loaded.unit_patrol {
             report.patrol_points = patrol.point_report.clone();
             report.patrol_speeds = patrol.speed_report.clone();
@@ -6866,101 +6874,6 @@ fn control_fca0_clamp_to_profile_cap(
     })
 }
 
-fn project_control_owner_profile_fca0(
-    native_class: Option<MissionControlClassProjection>,
-    original_words: &[u32; 27],
-    current_words: &[u32; 27],
-    fac0_projection: &Result<
-        MissionControlOwnerProfileLoadProjection,
-        MissionControlOwnerProfileLoadProjectionUnavailableReason,
-    >,
-    devices: &[EffectiveControlDevice],
-    provider_status: &MissionControlNodeProviderTableStatus,
-) -> Result<[u32; 27], MissionControlOwnerProfileFca0UnavailableReason> {
-    use MissionControlOwnerProfileFca0UnavailableReason as Unavailable;
-
-    if native_class.is_some_and(|class| class.class_id == 9) {
-        return Ok(*current_words);
-    }
-    if native_class.is_none() {
-        return Err(Unavailable::MissingNativeControlClass);
-    }
-    if let Err(reason) = fac0_projection {
-        return Err(Unavailable::Fac0Unavailable(reason.clone()));
-    }
-
-    let mut e00_sum = 0.0_f32;
-    for device_index in (0..devices.len()).rev() {
-        if devices[device_index].descriptor.tag != 5 {
-            continue;
-        }
-        if let Some(value) = query_control_device_selector(&devices[device_index], provider_status)
-            .map_err(|error| Unavailable::QueryUnavailable(Arc::new(error)))?
-        {
-            e00_sum = control_fca0_sum(e00_sum, value, "FCA0 reverse E00 sum")?;
-        }
-    }
-
-    // The canonical owner constructor initializes +0x1a8, +0x354, and +0x358
-    // to 1.0; the traced event-4 loader does not overwrite these fields.
-    let owner_scalar = 1.0_f32;
-    let owner_mean = control_fca0_sum(1.0, 1.0, "FCA0 owner scalar mean")?;
-    let owner_mean = control_fca0_product(owner_mean, 0.5, "FCA0 owner scalar mean")?;
-    let weight = control_fca0_product(owner_mean, e00_sum, "FCA0 weighted E00 sum")?;
-    let ratio = control_fca0_ratio(
-        control_fca0_float(f32::from_bits(current_words[26]), "current profile word 26")?,
-        control_fca0_float(
-            f32::from_bits(original_words[26]),
-            "original profile word 26",
-        )?,
-        "FCA0 profile word 26 ratio",
-    )?;
-    let factor_a = control_fca0_product(
-        control_fca0_sum(ratio, 1.0, "FCA0 factor A")?,
-        0.5,
-        "FCA0 factor A",
-    )?;
-    let factor_b = control_fca0_sum(
-        control_fca0_product(ratio, 0.75, "FCA0 factor B")?,
-        0.25,
-        "FCA0 factor B",
-    )?;
-
-    let mut current_words = *current_words;
-    for index in 6..9 {
-        let original = control_fca0_float(
-            f32::from_bits(original_words[index]),
-            "original profile words 6..8",
-        )?;
-        let owner_scaled =
-            control_fca0_product(owner_scalar, original, "FCA0 first profile triple")?;
-        let weighted = control_fca0_product(owner_scaled, weight, "FCA0 first profile triple")?;
-        let factored = control_fca0_product(weighted, factor_a, "FCA0 first profile triple")?;
-        current_words[index] =
-            control_fca0_clamp_to_profile_cap(factored, original, "FCA0 first profile triple")?
-                .to_bits();
-    }
-    for index in 9..12 {
-        let original = control_fca0_float(
-            f32::from_bits(original_words[index]),
-            "original profile words 9..11",
-        )?;
-        let weighted = control_fca0_product(weight, original, "FCA0 second profile triple")?;
-        let factored = control_fca0_product(weighted, factor_b, "FCA0 second profile triple")?;
-        current_words[index] =
-            control_fca0_sum(factored, factored, "FCA0 doubled second profile triple")?.to_bits();
-    }
-    for index in 0..3 {
-        let original = control_fca0_float(
-            f32::from_bits(original_words[index]),
-            "original profile words 0..2",
-        )?;
-        current_words[index] =
-            control_fca0_sum(original, original, "FCA0 doubled profile words")?.to_bits();
-    }
-    Ok(current_words)
-}
-
 fn behavior_clan_for_selector(
     selector: u32,
     clan_count: usize,
@@ -7946,6 +7859,7 @@ fn build_control_device_projection_with_class(
                 native_component_id,
                 original_words,
                 current_words,
+                scalars: ControlProfileScalars::default(),
                 load_projection,
                 fca0_projection,
             }

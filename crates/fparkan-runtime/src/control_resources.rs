@@ -1,4 +1,6 @@
-use crate::{control_resource_budget_pass, LoadedMissionState};
+use crate::{
+    control_profile, control_resource_budget_pass, ControlProfileReport, LoadedMissionState,
+};
 use fparkan_world::{transform_state, ObjectHandle, World};
 use std::collections::BTreeMap;
 
@@ -8,6 +10,7 @@ pub(super) struct Resources {
     rng: u32,
     ticks: BTreeMap<u32, u64>,
     stops: BTreeMap<u32, (u64, String)>,
+    pub(super) profiles: ControlProfileReport,
 }
 
 impl Default for Resources {
@@ -18,6 +21,7 @@ impl Default for Resources {
             rng: 1,
             ticks: BTreeMap::new(),
             stops: BTreeMap::new(),
+            profiles: ControlProfileReport::default(),
         }
     }
 }
@@ -40,17 +44,16 @@ pub(super) fn tick(mission: &mut LoadedMissionState, world: &World, now_ms: u32)
         .clocks
         .retain(|(handle, _)| transform_state(world, *handle).is_ok());
     for table in &mut mission.control_device_tables {
-        if !table
+        let flags = table
             .original_id
             .and_then(|id| mission.object_drafts.get(id.0 as usize))
-            .is_some_and(|draft| {
-                matches!(
-                    draft.unit_dat_header_flags,
-                    Some(crate::autodemo::PLANT_CLASS | crate::laboratory::LAB_CLASS)
-                )
-            })
-            || transform_state(world, table.handle).is_err()
-        {
+            .and_then(|draft| draft.unit_dat_header_flags);
+        let budget_owner = matches!(
+            flags,
+            Some(crate::autodemo::PLANT_CLASS | crate::laboratory::LAB_CLASS)
+        );
+        let mobile_owner = flags.is_some_and(|flags| flags & crate::autodemo::MOBILE_UNIT != 0);
+        if (!budget_owner && !mobile_owner) || transform_state(world, table.handle).is_err() {
             continue;
         }
         let clock = if let Some(index) = state
@@ -78,6 +81,49 @@ pub(super) fn tick(mission: &mut LoadedMissionState, world: &World, now_ms: u32)
         let Some(seconds) = clock.step(now_ms as f32, true, 250.0, &mut state.rng) else {
             continue;
         };
+        let object = table.original_id.map_or(table.handle.slot, |id| id.0);
+        let ticks = state.profiles.ticks.entry(object).or_default();
+        *ticks += 1;
+        if *ticks == 1 {
+            eprintln!("control_profile_clock_approx object={object} (Control RNG seed, owner order and activation remain open)");
+        }
+        let before = table
+            .owner_profile
+            .as_ref()
+            .map_or(0, |profile| profile.current_words[7]);
+        match control_profile::refresh(table) {
+            Ok(true) => {
+                let after = table
+                    .owner_profile
+                    .as_ref()
+                    .expect("refreshed profile")
+                    .current_words[7];
+                let update = state.profiles.updates.entry(object).or_default();
+                *update = (update.0 + 1, before, after);
+                if before != after {
+                    eprintln!(
+                        "control_profile_updated object={object} forward_limit={} -> {}",
+                        f32::from_bits(before),
+                        f32::from_bits(after)
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(reason) => {
+                let count = state
+                    .profiles
+                    .stubs
+                    .entry((object, reason.clone()))
+                    .or_default();
+                *count += 1;
+                if *count == 1 {
+                    eprintln!("control_profile_update_stub object={object} reason={reason}");
+                }
+            }
+        }
+        if !budget_owner {
+            continue;
+        }
         match control_resource_budget_pass(table, seconds) {
             Ok(()) => {
                 let count = state.ticks.entry(table.handle.slot).or_default();
