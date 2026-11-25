@@ -5,6 +5,8 @@
 //! deliberately does not implement a general bytecode VM. It contains a
 //! narrow executor for confirmed event instructions and bounded FML expressions.
 
+mod event_execution;
+
 use fparkan_binary::{checked_allocation_len, Cursor, DecodeError, Limits};
 use std::sync::Arc;
 
@@ -1131,90 +1133,6 @@ impl VarSet {
             }
             host(instruction, values).map(|result| result.map(VarSetDefault::Dword))
         })
-    }
-
-    /// Executes an event whose host can return DWORD and float values and update
-    /// variables passed as output operands.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first unsupported instruction, including a result type mismatch.
-    pub fn execute_event_prefix(
-        &self,
-        event: &ScriptEvent,
-        formulas: Option<&FormulaTable>,
-        values: &mut [VarSetDefault],
-        mut host: impl FnMut(
-            &ScriptInstruction,
-            &mut [VarSetDefault],
-        ) -> Result<Option<VarSetDefault>, String>,
-    ) -> Result<(), (usize, String)> {
-        let mut conditions = Vec::new();
-        let mut pc = 0;
-        while let Some(instruction) = event.instructions.get(pc) {
-            let index = pc;
-            pc += 1;
-            match advance_condition(&mut conditions, instruction, values)
-                .map_err(|()| (index, "unsupported comparison operands".into()))?
-            {
-                EventInstruction::Skip => continue,
-                EventInstruction::Return => break,
-                EventInstruction::Execute => {}
-            }
-            let control = instruction.header_words[3];
-            if control == 3 && instruction.dispatch_selector() == ScriptDispatchSelector::Sentinel {
-                let &[target] = instruction.references.as_slice() else {
-                    return Err((index, "jump requires one instruction index".into()));
-                };
-                pc = target as usize;
-                if pc <= index || pc >= event.instructions.len() {
-                    return Err((index, format!("unsupported jump to instruction {target}")));
-                }
-                conditions.clear();
-                continue;
-            }
-            if instruction.dispatch_selector() != ScriptDispatchSelector::Sentinel {
-                if control != u32::MAX {
-                    return Err((index, format!("unsupported handler control {control}")));
-                }
-                let target = instruction.header_words[1];
-                if target != u32::MAX && values.get(target as usize).is_none() {
-                    return Err((index, format!("unsupported result target {target}")));
-                }
-                let result = host(instruction, values).map_err(|reason| (index, reason))?;
-                if let Some(cell) = values.get_mut(target as usize) {
-                    *cell = match (*cell, result) {
-                        (VarSetDefault::Dword(_), Some(result @ VarSetDefault::Dword(_)))
-                        | (
-                            VarSetDefault::FloatBits(_),
-                            Some(result @ VarSetDefault::FloatBits(_)),
-                        ) => result,
-                        (VarSetDefault::Dword(_), None) => VarSetDefault::Dword(0),
-                        _ => return Err((index, format!("unsupported result target {target}"))),
-                    };
-                }
-                continue;
-            }
-            match self
-                .resolve_assignment(instruction, formulas, values)
-                .map_err(|error| (index, error.to_string()))?
-            {
-                InitInstructionResolution::Executed(writes) => {
-                    for write in writes {
-                        *values.get_mut(write.index as usize).ok_or_else(|| {
-                            (
-                                index,
-                                format!("varset index {} is out of bounds", write.index),
-                            )
-                        })? = write.value;
-                    }
-                }
-                InitInstructionResolution::Unsupported(error) => {
-                    return Err((index, error.to_string()))
-                }
-            }
-        }
-        Ok(())
     }
 
     /// Resolves the fixed-width, corpus-proven operands of GOG `Handler(15)`.

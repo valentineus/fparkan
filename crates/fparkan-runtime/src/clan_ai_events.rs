@@ -19,6 +19,7 @@ const PLACE_PROTECT: u32 = 11;
 const ATTACK_UNIT: u32 = 13;
 const OPTIMAL_TRANSPORT: u32 = 4;
 const BUILDING_NEEDED: u32 = 3;
+const MINE_NEEDED: u32 = 1;
 
 pub(super) struct ScriptFactoryOrder {
     pub owner: OwnerId,
@@ -264,6 +265,7 @@ pub(super) struct ClanAiEvents {
     class_target_queries: BTreeMap<(usize, u32, u32), u64>,
     size_class_queries: BTreeMap<(usize, u32), u64>,
     class_limit_queries: BTreeMap<(usize, u32, bool), u64>,
+    mine_queries: BTreeMap<(usize, u32, u32, u32), u64>,
 }
 
 impl LoadedMissionState {
@@ -385,7 +387,7 @@ impl LoadedMissionState {
                     next = Some((index, event, Some(problem)));
                     break;
                 }
-                let Some((event_index, event, problem)) = next.or_else(|| problems_event.take())
+                let Some((event_index, _event, problem)) = next.or_else(|| problems_event.take())
                 else {
                     break;
                 };
@@ -396,22 +398,40 @@ impl LoadedMissionState {
                 let mut capturer = None;
                 let mut group = None;
                 let mut conditions = Vec::new();
-                let result = varset.declarations.execute_event_prefix(
-                    event,
+                let result = varset.declarations.execute_package_event_prefix(
+                    &bundle.package,
+                    event_index,
                     bundle.formula_table.as_ref(),
                     &mut state.values,
-                    |instruction, values| match instruction.dispatch_selector() {
+                    |active_event_index, instruction, values| match instruction.dispatch_selector() {
+                        ScriptDispatchSelector::Handler(40) => {
+                            let selected = crate::clan_mining::query(
+                                &self.mission, &self.mission_events, world, &self.object_drafts,
+                                &self.control_device_tables, &self.mine_sites, clan,
+                            );
+                            let result = selected.write(&instruction.references, values)?;
+                            if let Some(position) = selected.reservation() {
+                                self.clan_ai_events.building_sites.reserve(position, now_ms);
+                            }
+                            let (target, [x, y]) = selected.report_key();
+                            let count = self.clan_ai_events.mine_queries.entry((clan, target, x, y)).or_default();
+                            *count += 1;
+                            if *count == 1 {
+                                eprintln!("sim_coverage script_mine_target_approx=1 clan={clan} target={target} x={x} y={y}");
+                            }
+                            Ok(Some(VarSetDefault::Dword(result)))
+                        }
                         ScriptDispatchSelector::Handler(44) => {
                             let strength = crate::clan_area_strength::query(
                                 &self.mission, &self.mission_events, world, &self.object_drafts,
                                 &self.control_device_tables, clan, instruction, values,
                             )?;
-                            let index = event.instructions.iter().position(|item| std::ptr::eq(item, instruction))
+                            let index = bundle.package.events[active_event_index].instructions.iter().position(|item| std::ptr::eq(item, instruction))
                                 .expect("instruction belongs to the executing event");
-                            let count = self.clan_ai_events.area_strength_queries.entry((clan, event_index, index)).or_default();
+                            let count = self.clan_ai_events.area_strength_queries.entry((clan, active_event_index, index)).or_default();
                             *count += 1;
                             if *count == 1 {
-                                eprintln!("sim_coverage script_area_strength_approx=1 clan={clan} event={event_index} instruction={index} strength={strength}");
+                                eprintln!("sim_coverage script_area_strength_approx=1 clan={clan} event={active_event_index} instruction={index} strength={strength}");
                             }
                             Ok(Some(VarSetDefault::Dword(strength)))
                         }
@@ -698,8 +718,12 @@ impl LoadedMissionState {
                             if let (7, 3, Handler15TargetPayload::ByPlace { first, second }) =
                                 (order.word_1, order.word_2, order.target)
                             {
-                                if !problem.as_ref().is_some_and(|p| p.key.word_0 == BUILDING_NEEDED)
-                                    || !crate::construction::supports_class(order.word_3)
+                                let supported = problem.as_ref().is_some_and(|p| match p.key.word_0 {
+                                    MINE_NEEDED => order.word_3 == crate::mining::MINE_CLASS,
+                                    BUILDING_NEEDED => crate::construction::supports_class(order.word_3),
+                                    _ => false,
+                                });
+                                if !supported
                                 {
                                     return Err("ORDER_ROBOT_BUILD requires a supported building scheme".into());
                                 }
@@ -708,7 +732,7 @@ impl LoadedMissionState {
                                     .find(|&handle| identity_metadata(world, handle).is_ok_and(|identity| identity.owner_id == Some(owner)));
                                 let result = crate::construction::order(
                                     &mut self.construction, &mut self.unit_patrol, world, &self.terrain, &self.mission,
-                                    &self.object_drafts, &self.behavior_ore_states, &self.free_research,
+                                    &self.object_drafts, &self.mine_sites, &self.behavior_ore_states, &self.free_research,
                                     vfs, builder, owner, order.word_3, [first, second],
                                 );
                                 let rates = self.clan_ai_events.construction_orders.entry((clan, order.word_0, order.word_3)).or_default();
@@ -883,7 +907,7 @@ impl LoadedMissionState {
                                 Some(1)
                                     if problem
                                         .as_ref()
-                                        .is_some_and(|record| matches!(record.key.word_0, OPTIMAL_TRANSPORT | 6 | BUILDING_PROTECT | PLACE_PROTECT))
+                                        .is_some_and(|record| matches!(record.key.word_0, OPTIMAL_TRANSPORT | MINE_NEEDED | 6 | BUILDING_PROTECT | PLACE_PROTECT))
                                         || !conditions.is_empty() =>
                                 {
                                     solving = true
@@ -911,7 +935,7 @@ impl LoadedMissionState {
                             };
                             let key = problem.as_ref().expect("condition requires a problem").key;
                             let condition = match (action, mode) {
-                                (2, 0) if key.word_0 == BUILDING_NEEDED || (key.word_0 == OPTIMAL_TRANSPORT && solving) => {
+                                (2, 0) if matches!(key.word_0, BUILDING_NEEDED | MINE_NEEDED) || (key.word_0 == OPTIMAL_TRANSPORT && solving) => {
                                     let unit = assignment.filter(|&unit| self.mission_events
                                         .logic_objects(&self.mission, world, id).any(|handle| handle == unit))
                                         .ok_or("Handler(27) task wait requires the assigned unit")?;
@@ -1215,17 +1239,17 @@ impl LoadedMissionState {
                         selector => Err(format!("{selector:?}")),
                     },
                 );
-                if let Err((instruction_index, reason)) = result {
+                if let Err((stopped_event, instruction_index, reason)) = result {
                     let (stop, count) = self
                         .clan_ai_events
                         .stops
-                        .entry((clan, event_index, instruction_index))
+                        .entry((clan, stopped_event, instruction_index))
                         .or_insert_with(|| {
                             (
                                 MissionEventStop {
                                     clan_index: clan,
                                     script_path: bundle.script_path.clone(),
-                                    event_index,
+                                    event_index: stopped_event,
                                     instruction_index,
                                     reason,
                                 },
@@ -1234,7 +1258,7 @@ impl LoadedMissionState {
                         });
                     *count += 1;
                     if *count == 1 {
-                        eprintln!("sim_coverage script_clan_ai_unsupported=1 clan={clan} script={} event={event_index} instruction={instruction_index} reason={}", stop.script_path, stop.reason);
+                        eprintln!("sim_coverage script_clan_ai_unsupported=1 clan={clan} script={} event={stopped_event} instruction={instruction_index} reason={}", stop.script_path, stop.reason);
                     }
                 }
                 if let Some(problem) = problem {
@@ -1478,6 +1502,12 @@ impl ClanAiEvents {
         self.class_limit_queries
             .iter()
             .map(|(&(clan, class, blocked), &count)| (clan, class, blocked, count))
+    }
+
+    pub(super) fn mine_queries(&self) -> impl Iterator<Item = (usize, u32, u32, u32, u64)> + '_ {
+        self.mine_queries
+            .iter()
+            .map(|(&(clan, target, x, y), &count)| (clan, target, x, y, count))
     }
 
     pub(super) fn construction_orders(

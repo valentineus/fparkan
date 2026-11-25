@@ -4,7 +4,7 @@ use fparkan_world::{handle_by_original_id, registration_sequence, transform_stat
 use crate::{mining::MineSite, MissionObjectDraft};
 
 #[derive(Default)]
-pub(super) struct SiteReservations(Vec<([u32; 2], u32)>);
+pub(super) struct SiteReservations(Vec<([f32; 2], u32)>);
 
 pub(super) fn building_centers<'a>(
     world: &'a World,
@@ -29,6 +29,14 @@ pub(super) fn separated([x, y]: [f32; 2], [a, b]: [f32; 2]) -> bool {
 }
 
 impl SiteReservations {
+    pub(super) fn reserve(&mut self, position: [f32; 2], now_ms: u32) {
+        self.0
+            .retain(|&(_, time)| now_ms.wrapping_sub(time) <= 60_000);
+        if position != [0.0; 2] && self.0.len() < 20 {
+            self.0.push((position, now_ms));
+        }
+    }
+
     pub(super) fn find(
         &mut self,
         terrain: &TerrainWorld,
@@ -47,20 +55,14 @@ impl SiteReservations {
         });
         let occupied = occupied
             .chain(deposits)
-            .chain(
-                self.0
-                    .iter()
-                    .map(|&(position, _)| position.map(|axis| axis as f32)),
-            )
+            .chain(self.0.iter().map(|&(position, _)| position))
             .collect::<Vec<_>>();
         let position = find_site(base, &occupied, |[x, y]| {
             // shortcut: use navigable terrain polygons until the ArealMap placement bit is mapped.
             terrain.locate_areal([x, y, 0.0]).ok()??;
             terrain.height_at([x, y]).ok()?
         })?;
-        if self.0.len() < 20 {
-            self.0.push((position, now_ms));
-        }
+        self.reserve(position.map(|axis| axis as f32), now_ms);
         Some(position)
     }
 }
@@ -109,6 +111,21 @@ fn find_site(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reservations_keep_fractional_coordinates_and_expire_after_one_minute() {
+        let mut sites = super::SiteReservations::default();
+        sites.reserve([0.0; 2], 1);
+        assert!(sites.0.is_empty());
+        for _ in 0..25 {
+            sites.reserve([10.25, 20.75], 1);
+        }
+        assert_eq!(sites.0.len(), 20);
+        sites.reserve([30.5, 40.5], 60_001);
+        assert_eq!(sites.0[0], ([10.25, 20.75], 1));
+        sites.reserve([30.5, 40.5], 60_002);
+        assert_eq!(sites.0, vec![([30.5, 40.5], 60_002)]);
+    }
+
     use super::*;
 
     #[test]

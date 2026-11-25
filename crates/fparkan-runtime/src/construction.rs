@@ -124,6 +124,7 @@ pub(super) fn order(
     terrain: &fparkan_terrain::TerrainWorld,
     mission: &crate::MissionDocument,
     drafts: &[crate::MissionObjectDraft],
+    mine_sites: &[crate::mining::MineSite],
     ores: &[crate::BehaviorOreState],
     research: &crate::research::FreeResearch,
     vfs: Option<&dyn fparkan_vfs::Vfs>,
@@ -146,9 +147,17 @@ pub(super) fn order(
         .iter()
         .find(|ore| ore.handle == builder && ore.class_flags == BUILDER_CLASS)
         .ok_or("unit has no builder ore state")?;
-    let slot = construction
-        .available_slot(world, drafts, class)
-        .ok_or("no free prepared building slot")?;
+    let slot = if class == crate::mining::MINE_CLASS {
+        mine_sites.iter().find_map(|site| {
+            let point = [site.position[0], site.position[1]].map(|axis| axis.trunc() as i64 as u32);
+            let id = site.control.as_ref()?.original_id?;
+            (point == xy && site.live_mine(world).is_none()).then_some(id.0 as usize)
+        })
+    } else {
+        construction.available_slot(world, drafts, class)
+    }
+    .filter(|&slot| !construction.tasks.iter().any(|task| task.slot == slot))
+    .ok_or("no free prepared building slot")?;
     let table = crate::research::load_technology_table(
         vfs.ok_or("no clan technology provider")?,
         mission,
@@ -263,8 +272,17 @@ fn complete(
         .behavior_profiles
         .iter()
         .position(|profile| profile.original_id == id);
-    let control =
-        mission.construction.controls[task.slot - mission.construction.first_slot].clone();
+    let control = if class == crate::mining::MINE_CLASS {
+        mission
+            .mine_sites
+            .iter()
+            .filter_map(|site| site.control.as_ref())
+            .find(|control| control.original_id == Some(id))
+            .cloned()
+            .ok_or_else(|| crate::EngineError::Production("mine control is unavailable".into()))?
+    } else {
+        mission.construction.controls[task.slot - mission.construction.first_slot].clone()
+    };
     let handle = spawn_prepared_unit(
         world,
         mission,
@@ -461,6 +479,7 @@ mod tests {
                 &mission.terrain,
                 &mission.mission,
                 &mission.object_drafts,
+                &mission.mine_sites,
                 &mission.behavior_ore_states,
                 &mission.free_research,
                 Some(vfs.as_ref()),

@@ -208,13 +208,23 @@ impl MissionEvents {
                 if identity.owner_id != Some(OwnerId(clan as u16)) {
                     return None;
                 }
-                self.issued_logic_ids.get(&handle).copied().or_else(|| {
-                    mission
-                        .objects
-                        .get(identity.original_id?.0 as usize)
-                        .map(|object| object.identity_or_clan_raw)
-                })
+                self.logic_id(mission, world, handle)
             })
+    }
+
+    pub(super) fn logic_id(
+        &self,
+        mission: &super::MissionDocument,
+        world: &World,
+        handle: ObjectHandle,
+    ) -> Option<u32> {
+        self.issued_logic_ids.get(&handle).copied().or_else(|| {
+            let identity = identity_metadata(world, handle).ok()?;
+            mission
+                .objects
+                .get(identity.original_id?.0 as usize)
+                .map(|object| object.identity_or_clan_raw)
+        })
     }
 
     pub(super) fn logic_objects<'a>(
