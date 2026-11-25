@@ -98,6 +98,8 @@ mod script_patrol;
 mod script_time;
 mod unit_chassis;
 mod unit_combat;
+mod unit_motion;
+pub use unit_motion::{loaded_mission_unit_motion_report, UnitMotionReport, UnitMotionSample};
 mod unit_patrol;
 mod unit_size_class;
 mod unit_spawn;
@@ -3010,6 +3012,7 @@ pub struct SimulationReport {
     pub control_profiles: ControlProfileReport,
     pub mobile_budget: MobileBudgetReport,
     pub combat: CombatReport,
+    pub unit_motion: UnitMotionReport,
     /// Approximate clan strength queries, grouped by caller and target clan.
     pub script_strength_queries: Vec<(usize, u16, u64)>,
     pub script_capture_queries: Vec<(usize, u64)>,
@@ -3092,6 +3095,7 @@ pub fn simulate_mission_report(
         control_profiles: ControlProfileReport::default(),
         mobile_budget: MobileBudgetReport::default(),
         combat: CombatReport::default(),
+        unit_motion: UnitMotionReport::default(),
         script_strength_queries: Vec::new(),
         script_capture_queries: Vec::new(),
         script_attack_queries: Vec::new(),
@@ -3204,6 +3208,7 @@ pub fn simulate_mission_report(
         if let Some(patrol) = &loaded.unit_patrol {
             report.patrol_points = patrol.point_report.clone();
             report.patrol_speeds = patrol.speed_report.clone();
+            report.unit_motion = patrol.motion_report.clone();
         }
         report
             .control_resource_ticks

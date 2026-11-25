@@ -12235,6 +12235,13 @@ impl StaticVulkanApp {
     }
 
     fn finish(self) -> Result<String, String> {
+        if let Some(report) = self
+            .mission_engine
+            .as_ref()
+            .and_then(fparkan_runtime::loaded_mission_unit_motion_report)
+        {
+            script_coverage::log_unit_motion(report);
+        }
         self.output.ok_or_else(|| {
             self.error.unwrap_or_else(|| {
                 "native Vulkan mode exited before producing a report".to_string()

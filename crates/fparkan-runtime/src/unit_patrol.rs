@@ -27,6 +27,7 @@ pub(super) struct UnitPatrol {
     rng: u32,
     pub(super) point_report: PatrolPointReport,
     pub(super) speed_report: PatrolSpeedReport,
+    pub(super) motion_report: crate::UnitMotionReport,
     pub(super) factory_raid_clans: usize,
 }
 
@@ -154,6 +155,7 @@ impl UnitPatrol {
             rng: 1,
             point_report: PatrolPointReport::default(),
             speed_report: PatrolSpeedReport::default(),
+            motion_report: crate::UnitMotionReport::default(),
             factory_raid_clans: 0,
         }
     }
@@ -396,6 +398,7 @@ impl UnitPatrol {
             rng: 1,
             point_report: PatrolPointReport::default(),
             speed_report: PatrolSpeedReport::default(),
+            motion_report: crate::UnitMotionReport::default(),
             factory_raid_clans: 0,
         })
     }
@@ -535,6 +538,8 @@ impl UnitPatrol {
             if seconds == 0.0 {
                 continue;
             }
+            let motion_object = crate::CombatObject::read(world, unit.handle);
+            state.motion_report.update(motion_object, now_ms);
             if let Some(enemy) = enemy.filter(|enemy| enemy.in_range) {
                 let mut after = before;
                 let (yaw, _) = turn_toward(
@@ -588,6 +593,9 @@ impl UnitPatrol {
             let distance = dx.hypot(dy);
             if distance <= 0.05 {
                 unit.points.pop_front();
+                state
+                    .motion_report
+                    .discard_waypoint_time(motion_object, seconds);
                 continue;
             }
             let mut after = before;
@@ -619,6 +627,10 @@ impl UnitPatrol {
                     after.position = [xy[0], xy[1], z].map(f32::to_bits);
                     if fraction == 1.0 {
                         unit.points.pop_front();
+                        state.motion_report.discard_waypoint_time(
+                            motion_object,
+                            seconds - turn_seconds - distance / speed,
+                        );
                     }
                 } else {
                     unit.points.clear();

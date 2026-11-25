@@ -1,5 +1,6 @@
 use fparkan_runtime::{
     loaded_mission_script_bundles, Engine, MissionScriptInitExecution, SimulationReport,
+    UnitMotionReport,
 };
 
 pub(super) fn log_script_init(engine: &Engine, mission: &str) {
@@ -21,6 +22,7 @@ pub(super) fn log_script_init(engine: &Engine, mission: &str) {
 }
 
 pub(super) fn log_clan_ai_stops(report: &SimulationReport) {
+    log_unit_motion(&report.unit_motion);
     for ((shooter, target), total) in &report.combat.shots {
         eprintln!("sim_combat shots={} shooter={shooter} target={target} shooter_id={:?} target_id={:?} first_ms={} last_ms={}", total.count, shooter.original_id, target.original_id, total.first_ms, total.last_ms);
     }
@@ -225,5 +227,14 @@ pub(super) fn log_clan_ai_stops(report: &SimulationReport) {
             "sim_coverage script_clan_ai_stops={count} clan={} script={} event={} instruction={} reason={}",
             stop.clan_index, stop.script_path, stop.event_index, stop.instruction_index, stop.reason,
         );
+    }
+}
+
+pub(super) fn log_unit_motion(report: &UnitMotionReport) {
+    for (object, sample) in &report.objects {
+        eprintln!("sim_coverage unit_motion_controller_stub={} object={object} original_id={:?} first_ms={} last_ms={}", sample.updates, object.original_id, sample.first_ms, sample.last_ms);
+        if sample.discarded_waypoints > 0 {
+            eprintln!("sim_coverage unit_waypoint_time_discarded={} object={object} original_id={:?} unused_us={}", sample.discarded_waypoints, object.original_id, sample.discarded_time_us);
+        }
     }
 }

@@ -22,6 +22,7 @@ Part 1/Part 2 builds remain listed separately above.
 | Binary | Size (bytes) | SHA-256 |
 | --- | ---: | --- |
 | `AniMesh.dll` | 172032 | `65659bf67f20e5be77d67a5b2f59968f61b94293143807fa59ca451c560c4f7e` |
+| `Behavior.dll` | 446464 | `ddfbdbde07832358fe6e35e01c8dba9b58e7313789498b6049ed51d4ed9baf99` |
 | `Effect.dll` | 163840 | `386a3e8db1ce23f61957825d633c7dae1ed40c25cab0cf10a534385fd7cee789` |
 | `iron3d.dll` | 1175552 | `d1dc4ea8535e2069b0a05c9e8be2724dd438ba44cca7a83007d8b2e50f9e35fa` |
 | `Terrain.dll` | 499712 | `af87d1b2e728a0be73c52be3b44cc196ab46da7799f25a15d40f8c9b0b425ead` |
