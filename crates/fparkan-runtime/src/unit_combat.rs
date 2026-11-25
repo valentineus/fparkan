@@ -5,6 +5,7 @@ use super::{
     projectile::{load_projectile, segment_sphere_fraction, unit_sphere},
     projectile_terrain_hit, projectile_unit_hit,
     unit_patrol::UnitPatrol,
+    weapon_pose::WeaponPoses,
     Engine, MissionAssets, MissionDocument, MissionObjectDraft, ObjectHandle, PlayerProjectile,
     PlayerWeapons,
 };
@@ -68,6 +69,7 @@ pub(super) struct AutoDemoCombat {
     guard_clans: Vec<bool>,
     projectiles: Vec<AutoDemoProjectileType>,
     flights: Vec<Flight>,
+    pose_failures: super::WeaponPoseReport,
     pub(super) unavailable: usize,
 }
 
@@ -83,8 +85,10 @@ pub(super) struct CombatTarget {
 struct Unit {
     handle: ObjectHandle,
     index: usize,
+    original_id: u32,
     weapons: PlayerWeapons,
     slots: Vec<Option<usize>>,
+    poses: WeaponPoses,
 }
 
 struct Flight {
@@ -126,6 +130,7 @@ impl AutoDemoCombat {
             guard_clans,
             projectiles: Vec::new(),
             flights: Vec::new(),
+            pose_failures: super::WeaponPoseReport::default(),
             unavailable: 0,
         };
         for (index, (draft, &handle)) in drafts.iter().zip(handles).enumerate() {
@@ -187,6 +192,8 @@ impl AutoDemoCombat {
                 index,
                 weapons,
                 slots,
+                poses: WeaponPoses::new(draft, assets, index),
+                original_id: draft.original_id.map_or(handle.slot, |id| id.0),
             });
         }
         battle
@@ -203,6 +210,10 @@ impl AutoDemoCombat {
         if let Some(template) = self.reserve.iter().find(|unit| unit.index == index) {
             self.units.push(Unit {
                 handle,
+                original_id: identity_metadata(world, handle)
+                    .ok()
+                    .and_then(|identity| identity.original_id)
+                    .map_or(handle.slot, |id| id.0),
                 ..template.clone()
             });
         }
@@ -214,6 +225,10 @@ impl AutoDemoCombat {
 
     pub(super) fn guard_clan_count(&self) -> usize {
         self.guard_clans.iter().filter(|&&enabled| enabled).count()
+    }
+
+    pub(super) fn pose_report(&self) -> &super::WeaponPoseReport {
+        &self.pose_failures
     }
 
     pub(super) fn flights(&self) -> impl Iterator<Item = (usize, PlayerProjectile)> + '_ {
@@ -355,6 +370,19 @@ impl AutoDemoCombat {
             mission.unit_patrol.as_ref(),
         );
         for unit in &mut self.units {
+            let Ok(state) = transform_state(&engine.world, unit.handle) else {
+                continue;
+            };
+            if unit.weapons.weapons().is_empty() {
+                continue;
+            }
+            unit.poses.sample(
+                &mission.mission_assets,
+                unit.index,
+                unit.original_id,
+                now,
+                &mut self.pose_failures,
+            );
             // shortcut: armed AI units defend their position while their Init is incomplete.
             let owner = identity_metadata(&engine.world, unit.handle)
                 .ok()
@@ -373,26 +401,7 @@ impl AutoDemoCombat {
             let aim = targets
                 .iter()
                 .find(|(handle, target)| *handle == unit.handle && target.in_range)
-                .and_then(|(_, target)| {
-                    let state = transform_state(&engine.world, unit.handle).ok()?;
-                    let (from, _) = unit_sphere(&mission.mission_assets, unit.index, state)?;
-                    match projectile_terrain_hit(&mission.terrain, [from, target.center]) {
-                        Ok(ground) => {
-                            // shortcut: use the same hull sphere as the projectile until per-node aiming is wired.
-                            segment_sphere_fraction(
-                                [from, target.center],
-                                target.center,
-                                target.radius,
-                            )
-                            .filter(|&contact| ground.is_none_or(|ground| contact < ground))
-                            .map(|_| (target.handle, from, target.center))
-                        }
-                        Err(_) => {
-                            unavailable += 1;
-                            None
-                        }
-                    }
-                })
+                .map(|(_, target)| (target.handle, target.center, target.radius))
                 .or_else(|| {
                     let (factory, index) =
                         mission.unit_patrol.as_ref()?.raid_factory(unit.handle)?;
@@ -412,17 +421,42 @@ impl AutoDemoCombat {
                     if (to[0] - from[0]).hypot(to[1] - from[1]) > FIRE_RANGE {
                         return None;
                     }
-                    // shortcut: aim at the root bounds center until the native attack task selects a node.
-                    projectile_terrain_hit(&mission.terrain, [from, to])
-                        .is_ok_and(|ground| ground.is_none())
-                        .then_some((factory, from, to))
+                    // shortcut: the native attack task's selected building node is unresolved.
+                    Some((factory, to, 0.0))
                 });
-            for (slot, _, _) in unit.weapons.fire(aim.is_some(), now) {
-                let (Some((target, from, to)), Some(projectile)) = (aim, unit.slots[slot]) else {
+            let mut missing = 0;
+            let mut due_missing = 0;
+            let poses = &unit.poses;
+            let clear = |from, to, radius| {
+                projectile_terrain_hit(&mission.terrain, [from, to]).is_ok_and(|ground| {
+                    if radius == 0.0 {
+                        return ground.is_none();
+                    }
+                    segment_sphere_fraction([from, to], to, radius)
+                        .is_some_and(|contact| ground.is_none_or(|ground| contact < ground))
+                })
+            };
+            for (slot, weapon, barrel) in unit.weapons.fire_where(now, |weapon, barrel| {
+                let Some((_, to, radius)) = aim else {
+                    return false;
+                };
+                let Some(from) = poses.muzzle(state, weapon.component_index, barrel) else {
+                    missing += 1;
+                    return false;
+                };
+                clear(from, to, radius)
+            }) {
+                let (Some((target, to, radius)), Some(projectile)) = (aim, unit.slots[slot]) else {
                     continue;
                 };
+                let Some(from) = poses.muzzle(state, weapon.component_index, barrel) else {
+                    due_missing += 1;
+                    continue;
+                };
+                if !clear(from, to, radius) {
+                    continue;
+                }
                 let data = &self.projectiles[projectile];
-                // shortcut: aim from the root hull center until animated AI barrel poses are sampled.
                 let direction = std::array::from_fn(|axis| to[axis] - from[axis]);
                 if let Some(pose) =
                     PlayerProjectile::new(from, direction, data.speed, data.lifetime_ms, now)
@@ -438,6 +472,22 @@ impl AutoDemoCombat {
                         projectile,
                     });
                 }
+            }
+            missing += due_missing;
+            if missing > 0 {
+                let count = self
+                    .pose_failures
+                    .missing
+                    .entry(unit.original_id)
+                    .or_default();
+                if *count == 0 {
+                    eprintln!(
+                        "unit_weapon_pose_stub object={} count={missing}",
+                        unit.original_id
+                    );
+                }
+                *count += missing;
+                unavailable += missing as usize;
             }
         }
         (events, unavailable)
@@ -478,6 +528,64 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
+    fn licensed_autodemo_shots_start_outside_the_hull_center() {
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed corpus");
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Autodemo.00/data.tma".into(),
+                mode: MissionMode::AutoDemo,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        for now in (0..=120_000).step_by(50) {
+            let frame = frame(&mut engine, now).unwrap();
+            let shots = frame
+                .autodemo_combat_events
+                .iter()
+                .filter(|event| matches!(event, AutoDemoCombatEvent::Shot { .. }))
+                .count();
+            if shots == 0 {
+                continue;
+            }
+            let combat = engine.autodemo_combat.as_ref().unwrap();
+            assert!(combat.flights.len() >= shots);
+            for flight in combat.flights.iter().rev().take(shots) {
+                let shooter = combat
+                    .units
+                    .iter()
+                    .find(|unit| unit.handle == flight.shooter)
+                    .unwrap();
+                let state = transform_state(&engine.world, shooter.handle).unwrap();
+                let (center, _) = unit_sphere(
+                    &engine.loaded.as_ref().unwrap().mission_assets,
+                    shooter.index,
+                    state,
+                )
+                .unwrap();
+                let separation: f32 = flight
+                    .pose
+                    .position
+                    .into_iter()
+                    .zip(center)
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum();
+                assert!(separation > 0.01, "projectile still starts at hull center");
+            }
+            assert!(combat.pose_report().missing.is_empty());
+            return;
+        }
+        panic!("stock AutoDemo did not fire");
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
     fn licensed_stock_clan_uses_script_orders_without_a_startup_raid() {
         let mut engine = stock_two_fortresses();
         assert_eq!(mission_guard_fallback_count(&engine), 0);
@@ -491,9 +599,33 @@ mod tests {
         frame(&mut engine, 0).unwrap();
         assert_eq!(transform_state(&engine.world, waiting).unwrap(), before);
         let mut produced = false;
+        let mut scripted_patrol_seen = false;
         for now in (100..=90_000).step_by(100) {
             let result = frame(&mut engine, now).unwrap();
             produced |= result.produced_unit.is_some_and(|unit| unit.clan == 1);
+            scripted_patrol_seen |=
+                engine
+                    .autodemo_combat
+                    .as_ref()
+                    .unwrap()
+                    .units
+                    .iter()
+                    .any(|unit| {
+                        if identity_metadata(&engine.world, unit.handle)
+                            .ok()
+                            .and_then(|identity| identity.owner_id)
+                            != Some(OwnerId(1))
+                        {
+                            return false;
+                        }
+                        engine
+                            .loaded
+                            .as_ref()
+                            .unwrap()
+                            .unit_patrol
+                            .as_ref()
+                            .is_some_and(|patrol| patrol.is_patrolling(unit.handle))
+                    });
         }
         let loaded = engine.loaded.as_ref().unwrap();
         assert!(loaded.clan_ai_events.stops().next().is_none());
@@ -501,8 +633,10 @@ mod tests {
             .clan_ai_events
             .group_orders()
             .any(|(clan, _, count)| clan == 1 && count > 0));
-        assert!(loaded.unit_patrol.as_ref().is_some_and(|patrol| patrol
-            .is_patrolling(mission_object_handle(&engine, OriginalObjectId(14)).unwrap())));
+        assert!(
+            scripted_patrol_seen,
+            "AI clan never received a scripted patrol"
+        );
         assert!(produced, "scripted AI factory did not produce a robot");
     }
 

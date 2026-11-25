@@ -84,6 +84,8 @@ mod unit_combat;
 mod unit_patrol;
 mod unit_size_class;
 mod unit_spawn;
+mod weapon_pose;
+pub use weapon_pose::{initial_component_node_times, WeaponPoseReport};
 
 pub use autodemo::{autodemo_camera, AutoDemoCamera, AutoDemoReinforcement, AutoDemoView};
 pub use boarding::{
@@ -2949,6 +2951,7 @@ pub struct SimulationReport {
     pub factory_clock_ticks: Vec<(u16, u32, u64)>,
     pub control_resource_ticks: Vec<(u32, u64)>,
     pub control_resource_stops: Vec<(u32, u64, String)>,
+    pub weapon_poses: WeaponPoseReport,
     /// Approximate clan strength queries, grouped by caller and target clan.
     pub script_strength_queries: Vec<(usize, u16, u64)>,
     pub script_capture_queries: Vec<(usize, u64)>,
@@ -3025,6 +3028,7 @@ pub fn simulate_mission_report(
         factory_clock_ticks: Vec::new(),
         control_resource_ticks: Vec::new(),
         control_resource_stops: Vec::new(),
+        weapon_poses: WeaponPoseReport::default(),
         script_strength_queries: Vec::new(),
         script_capture_queries: Vec::new(),
         script_attack_queries: Vec::new(),
@@ -3143,6 +3147,9 @@ pub fn simulate_mission_report(
         );
         if let Some(production) = &engine.production {
             report.factory_clock_ticks.extend(production.clock_ticks());
+        }
+        if let Some(combat) = &engine.autodemo_combat {
+            report.weapon_poses = combat.pose_report().clone();
         }
         for problem in loaded.clan_ai_events.pending_problems() {
             *report

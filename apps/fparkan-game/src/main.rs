@@ -2,6 +2,8 @@
 
 //! `FParkan` render-planning composition root.
 
+use fparkan_runtime::initial_component_node_times as static_preview_node_times;
+
 mod camera_capture;
 #[cfg(windows)]
 mod control_effects;
@@ -7134,63 +7136,6 @@ fn multiply_unit_quaternions(left: [f32; 4], right: [f32; 4]) -> [f32; 4] {
 /// microtexture and type-18 UV stream. Type-14 alpha remains a continuous
 /// interpolated overlay mask. MSH component hierarchy, animation sampling,
 /// lightmaps, and gameplay visibility are handled by the preview bridge below.
-
-fn static_preview_node_times(
-    node_count: usize,
-    bindings: &[PreparedControlNodeBinding],
-) -> Result<Vec<Option<AnimationTime>>, String> {
-    let mut node_times = vec![Some(AnimationTime(0.0)); node_count];
-    for binding in bindings {
-        // Disabled rows are filtered while loading CTLD, but preserve the
-        // native guard here in case a caller constructs MissionAssets itself.
-        if binding.flags & 4 != 0 {
-            continue;
-        }
-        if binding.node_index >= node_count {
-            return Err(format!(
-                "control binding node {} is outside model node count {node_count}",
-                binding.node_index
-            ));
-        }
-        if !binding.frame_a.is_finite()
-            || !binding.frame_b.is_finite()
-            || !binding.initial_blend.is_finite()
-            || binding.frame_a < 0.0
-            || binding.frame_b < 0.0
-        {
-            return Err(format!(
-                "control binding for node {} contains an invalid frame or blend",
-                binding.node_index
-            ));
-        }
-
-        let mut blend = binding.initial_blend;
-        if binding.flags & 1 != 0 {
-            if blend > 1.0 {
-                blend -= 1.0;
-            }
-            if blend < 0.0 {
-                blend += 1.0;
-            }
-        } else {
-            blend = blend.clamp(0.0, 1.0);
-        }
-        if binding.flags & 2 != 0 {
-            blend = 1.0 - blend;
-        }
-        let sample_time = (1.0 - blend) * binding.frame_a + blend * binding.frame_b;
-        if !sample_time.is_finite() || sample_time < 0.0 {
-            return Err(format!(
-                "control binding for node {} produced a negative or non-finite sample time unsupported by the static sampler",
-                binding.node_index
-            ));
-        }
-        // Source order is significant: native initialization writes each
-        // enabled row in turn, so a later row for the same node wins.
-        node_times[binding.node_index] = Some(AnimationTime(sample_time));
-    }
-    Ok(node_times)
-}
 
 fn static_preview_component_pose_buffer(
     model: &ModelAsset,

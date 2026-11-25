@@ -71,6 +71,14 @@ impl PlayerWeapons {
         trigger: bool,
         clock_ms: u32,
     ) -> impl Iterator<Item = (usize, &PlayerWeapon, &PreparedControlPoint)> {
+        self.fire_where(clock_ms, move |_, _| trigger)
+    }
+
+    pub(super) fn fire_where(
+        &mut self,
+        clock_ms: u32,
+        mut trigger: impl FnMut(&PlayerWeapon, &PreparedControlPoint) -> bool,
+    ) -> impl Iterator<Item = (usize, &PlayerWeapon, &PreparedControlPoint)> {
         if let Some(last) = self.last_sample_ms.replace(clock_ms) {
             self.clock_ms += f64::from(clock_ms.wrapping_sub(last));
         }
@@ -80,7 +88,8 @@ impl PlayerWeapons {
             .iter_mut()
             .enumerate()
             .filter_map(move |(index, weapon)| {
-                let start = trigger && selected.is_none_or(|selected| selected == index);
+                let start = selected.is_none_or(|selected| selected == index)
+                    && trigger(weapon, &weapon.barrels[weapon.barrel_index].muzzle);
                 let barrel = weapon.sample_fire(start, now)?;
                 Some((index, &*weapon, &weapon.barrels[barrel].muzzle))
             })
