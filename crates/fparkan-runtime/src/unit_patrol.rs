@@ -3,9 +3,10 @@ use super::{
     boarding::WARBOT_CLASS,
     next_crt_rand,
     patrol_points::{PatrolPointReport, PatrolPoints},
+    patrol_speed::{place_speed, PatrolSpeedReport},
     unit_combat::CombatTarget,
-    EngineError, MissionDocument, MissionObjectDraft, MissionScriptBundle, ObjectHandle,
-    TerrainWorld, TransformState, World,
+    EngineError, LoadedMissionState, MissionDocument, MissionObjectDraft, MissionScriptBundle,
+    ObjectHandle, TerrainWorld, TransformState, World,
 };
 use fparkan_script::{Handler15TargetPayload, ScriptDispatchSelector, VarSet};
 use fparkan_terrain::{NavigationQuery, RouteRequest, SurfaceQuery};
@@ -25,6 +26,7 @@ pub(super) struct UnitPatrol {
     clock_ms: u32,
     rng: u32,
     pub(super) point_report: PatrolPointReport,
+    pub(super) speed_report: PatrolSpeedReport,
     pub(super) factory_raid_clans: usize,
 }
 
@@ -151,6 +153,7 @@ impl UnitPatrol {
             clock_ms: 0,
             rng: 1,
             point_report: PatrolPointReport::default(),
+            speed_report: PatrolSpeedReport::default(),
             factory_raid_clans: 0,
         }
     }
@@ -392,6 +395,7 @@ impl UnitPatrol {
             clock_ms: 0,
             rng: 1,
             point_report: PatrolPointReport::default(),
+            speed_report: PatrolSpeedReport::default(),
             factory_raid_clans: 0,
         })
     }
@@ -399,13 +403,14 @@ impl UnitPatrol {
     pub(super) fn prepare(
         &self,
         world: &World,
-        terrain: &TerrainWorld,
+        mission: &LoadedMissionState,
         now_ms: u32,
         targets: &[(ObjectHandle, CombatTarget)],
-        chassis: &BTreeMap<u32, Option<bool>>,
         crt: &mut u32,
         count_rng: &mut u32,
     ) -> Result<PreparedPatrol, EngineError> {
+        let terrain = &mission.terrain;
+        let chassis = &mission.unit_can_fly;
         let mut state = self.clone();
         state.advance_script_orders(world);
         state.units.retain(|unit| {
@@ -586,10 +591,23 @@ impl UnitPatrol {
                 continue;
             }
             let mut after = before;
-            // shortcut: fixed turn rate and patrol speed until the per-chassis Control step is available.
+            // shortcut: turn and non-place orders still use the temporary controller.
             let (yaw, turn_seconds) = turn_toward(before, [dx, dy], seconds);
             after.orientation[2] = yaw.to_bits();
-            let travel = 9.0 * (seconds - turn_seconds);
+            let speed = if place_patrol && enemy.is_none() {
+                let object = identity_metadata(world, unit.handle)
+                    .ok()
+                    .and_then(|identity| identity.original_id)
+                    .map_or(unit.handle.slot, |id| id.0);
+                let table = mission
+                    .control_device_tables
+                    .iter()
+                    .find(|table| table.handle == unit.handle);
+                place_speed(table, object, &mut state.speed_report)
+            } else {
+                9.0
+            };
+            let travel = speed * (seconds - turn_seconds);
             if travel > 0.0 {
                 let fraction = (travel / distance).min(1.0);
                 let xy = [from[0] + dx * fraction, from[1] + dy * fraction];

@@ -21,6 +21,12 @@ pub(super) fn log_script_init(engine: &Engine, mission: &str) {
 }
 
 pub(super) fn log_clan_ai_stops(report: &SimulationReport) {
+    for (object, (count, limit, speed)) in &report.patrol_speeds.samples {
+        eprintln!("sim_coverage patrol_speed_profile_approx={count} object={object} forward_limit={} requested_speed={}", f32::from_bits(*limit), f32::from_bits(*speed));
+    }
+    for ((object, reason), count) in &report.patrol_speeds.stubs {
+        eprintln!("sim_coverage patrol_speed_stub={count} object={object} reason={reason}");
+    }
     for (object, (batches, points, checks)) in &report.patrol_points.batches {
         eprintln!("sim_coverage mission_patrol_points_approx={points} object={object} batches={batches} walkability_queries={checks}");
     }

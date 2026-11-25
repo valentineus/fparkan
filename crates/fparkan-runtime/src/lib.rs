@@ -72,8 +72,10 @@ pub use laboratory::LaboratoryReport;
 mod mission_events;
 mod ore_transport;
 mod patrol_points;
+mod patrol_speed;
 mod player_motion;
 pub use patrol_points::PatrolPointReport;
+pub use patrol_speed::PatrolSpeedReport;
 mod player_status;
 mod player_weapon;
 mod production;
@@ -2781,10 +2783,9 @@ pub fn step_headless(
                 });
             Some(patrol.prepare(
                 &engine.world,
-                &mission.terrain,
+                mission,
                 queue_time_ms,
                 &targets,
-                &mission.unit_can_fly,
                 &mut crt,
                 &mut point_rng,
             ))
@@ -2980,6 +2981,7 @@ pub struct SimulationReport {
     pub control_resource_stops: Vec<(u32, u64, String)>,
     pub weapon_poses: WeaponPoseReport,
     pub patrol_points: PatrolPointReport,
+    pub patrol_speeds: PatrolSpeedReport,
     /// Approximate clan strength queries, grouped by caller and target clan.
     pub script_strength_queries: Vec<(usize, u16, u64)>,
     pub script_capture_queries: Vec<(usize, u64)>,
@@ -3058,6 +3060,7 @@ pub fn simulate_mission_report(
         control_resource_stops: Vec::new(),
         weapon_poses: WeaponPoseReport::default(),
         patrol_points: PatrolPointReport::default(),
+        patrol_speeds: PatrolSpeedReport::default(),
         script_strength_queries: Vec::new(),
         script_capture_queries: Vec::new(),
         script_attack_queries: Vec::new(),
@@ -3167,6 +3170,7 @@ pub fn simulate_mission_report(
         report.laboratory = loaded.laboratories.report();
         if let Some(patrol) = &loaded.unit_patrol {
             report.patrol_points = patrol.point_report.clone();
+            report.patrol_speeds = patrol.speed_report.clone();
         }
         report
             .control_resource_ticks
