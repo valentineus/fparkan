@@ -56,10 +56,12 @@ pub use combat_report::{CombatObject, CombatOccurrences, CombatReport};
 mod control_profile;
 mod control_resources;
 mod mobile_budget;
+mod node_amount;
 pub use clan_clock::note_mission_pause_elapsed;
 use control_profile::project_initial as project_control_owner_profile_fca0;
 pub use control_profile::{ControlProfileReport, ControlProfileScalars};
 pub use mobile_budget::MobileBudgetReport;
+use node_amount::{apply_control_node_delta, apply_control_node_distribution_delta};
 mod clan_combat_groups;
 mod clan_combat_strength;
 mod clan_factory_schemes;
@@ -824,6 +826,8 @@ pub struct MissionControlDeviceTableState {
     pub node_provider_amount_bits: Option<u32>,
     /// Native `+0x598`: amount changed since the last aggregate/contact update.
     pub node_provider_dirty: bool,
+    /// Native `+0x550 == 0xfffe`: root or critical-node depletion has been marked.
+    pub node_provider_depletion_marked: bool,
     /// Native `+0x618`: distribution returns without changing rows while set.
     pub node_provider_distribution_suspended: bool,
     /// Native `+0x5dc`, last output rate written by the Control budget pass.
@@ -2361,7 +2365,8 @@ fn load_mission_with_options(
                         ),
                         node_provider_amount_bits: initial_node_provider_amount(&projection.node_provider_status),
                         node_provider_dirty: true,
-                        node_provider_distribution_suspended: false,
+                        node_provider_depletion_marked: false,
+node_provider_distribution_suspended: false,
                         current_output_rate_5dc_bits: 0,
                         current_output_rate_5e0_bits: 0,
                         node_provider_status: projection.node_provider_status,
@@ -2375,7 +2380,8 @@ fn load_mission_with_options(
                         node_provider_maximum_amount_bits: None,
                         node_provider_amount_bits: None,
                         node_provider_dirty: false,
-                        node_provider_distribution_suspended: false,
+                        node_provider_depletion_marked: false,
+node_provider_distribution_suspended: false,
                         current_output_rate_5dc_bits: 0,
                         current_output_rate_5e0_bits: 0,
                         node_provider_status:
@@ -4113,6 +4119,7 @@ pub fn set_loaded_mission_control_multiplier(
 /// It does not run stage propagation,
 /// visibility, or the separate Control clock; the processed amount stays unchanged.
 /// The loaded Unit DAT path has unity maximum multipliers.
+/// Static class-3 root/critical depletion also retains the native exhaustion marker.
 ///
 /// # Errors
 /// Rejects invalid handles, unavailable state, unsupported numeric ranges, or
@@ -5756,124 +5763,6 @@ fn adjust_control_class9_values(
         }
     }
     Ok(())
-}
-
-fn apply_control_node_delta(
-    table: &mut MissionControlDeviceTableState,
-    key: u32,
-    delta: f32,
-) -> Result<Option<ControlNodeProviderPublication>, ControlResourceAccessError> {
-    apply_control_node_delta_inner(table, key, delta, false)
-}
-
-fn apply_control_node_distribution_delta(
-    table: &mut MissionControlDeviceTableState,
-    key: u32,
-    delta: f32,
-) -> Result<Option<ControlNodeProviderPublication>, ControlResourceAccessError> {
-    apply_control_node_delta_inner(table, key, delta, true)
-}
-
-fn apply_control_node_delta_inner(
-    table: &mut MissionControlDeviceTableState,
-    key: u32,
-    delta: f32,
-    accumulate_delta: bool,
-) -> Result<Option<ControlNodeProviderPublication>, ControlResourceAccessError> {
-    let rows = match &mut table.node_provider_status {
-        MissionControlNodeProviderTableStatus::Available(rows) => rows,
-        MissionControlNodeProviderTableStatus::Unavailable(reason) => {
-            return Err(ControlResourceAccessError::NodeProviderTableUnavailable(
-                reason.clone(),
-            ))
-        }
-    };
-    let row_count = rows.len();
-    let row = usize::try_from(key)
-        .ok()
-        .and_then(|index| rows.get_mut(index))
-        .ok_or(ControlResourceAccessError::NodeProviderKeyOutOfRange { key, row_count })?;
-    checked_control_float(0, "provider delta", delta)?;
-    if delta == 0.0 {
-        return Ok(None);
-    }
-    let previous = checked_control_float(
-        0,
-        "provider amount",
-        f32::from_bits(row.current_amount_bits),
-    )?;
-    let maximum = checked_control_float(0, "provider maximum", row.source_row.max_volume)?;
-    if maximum < 0.0 || previous < 0.0 || previous > maximum {
-        return Err(ControlResourceAccessError::InvalidNodeProviderAmount { key });
-    }
-    let amount =
-        checked_control_sum(0, "provider amount plus delta", previous, delta)?.clamp(0.0, maximum);
-    if amount == previous {
-        row.current_amount_bits = amount.to_bits();
-        return Ok(None);
-    }
-    let flags = row
-        .current_flags
-        .ok_or(ControlResourceAccessError::UnsupportedField {
-            factory_tag: 0,
-            field: "provider flags",
-        })?;
-    if amount == 0.0 && (key == 0 || flags & 1 != 0) {
-        return Err(ControlResourceAccessError::UnsupportedNodeLifecycle { key });
-    }
-    let total_bits =
-        table
-            .node_provider_amount_bits
-            .ok_or(ControlResourceAccessError::UnsupportedField {
-                factory_tag: 0,
-                field: "provider aggregate",
-            })?;
-    let total = checked_control_float(0, "provider aggregate", f32::from_bits(total_bits))?;
-    if total < 0.0 {
-        return Err(ControlResourceAccessError::InvalidNodeProviderAmount { key });
-    }
-    let change = checked_control_sum(0, "provider amount change", amount, -previous)?;
-    let total = checked_control_sum(0, "provider aggregate", total, change)?.max(0.0);
-    let ratio = checked_control_ratio("provider ratio", amount, maximum)?;
-    let accumulated_delta = if accumulate_delta {
-        let previous = checked_control_float(
-            0,
-            "provider accumulated delta",
-            f32::from_bits(row.current_accumulated_delta_bits),
-        )?;
-        Some(checked_control_sum(
-            0,
-            "provider accumulated delta",
-            change,
-            previous,
-        )?)
-    } else {
-        None
-    };
-    let mesh = row
-        .mesh_state
-        .as_mut()
-        .ok_or(ControlResourceAccessError::UnsupportedField {
-            factory_tag: 0,
-            field: "model node state",
-        })?;
-    row.current_amount_bits = amount.to_bits();
-    if let Some(accumulated_delta) = accumulated_delta {
-        row.current_accumulated_delta_bits = accumulated_delta.to_bits();
-    }
-    row.current_type1_value_bits = ratio.to_bits();
-    mesh.type1_value_bits = ratio.to_bits();
-    row.current_flags = Some(if amount == 0.0 {
-        flags | 0x10
-    } else {
-        flags & !0x10
-    });
-    table.node_provider_amount_bits = Some(total.to_bits());
-    table.node_provider_dirty = true;
-    Ok(Some(ControlNodeProviderPublication {
-        key,
-        type1_value_bits: ratio.to_bits(),
-    }))
 }
 
 fn query_control_device_table_resource(
@@ -9693,7 +9582,7 @@ mod tests {
         control
     }
 
-    fn synthetic_node_provider_row(
+    pub(super) fn synthetic_node_provider_row(
         component_index: usize,
         source_row_index: usize,
         initial_type1_value_bits: u32,
@@ -10026,7 +9915,7 @@ mod tests {
         )
     }
 
-    fn synthetic_control_device_table_with_providers(
+    pub(super) fn synthetic_control_device_table_with_providers(
         status: MissionControlDeviceTableStatus,
         node_provider_status: MissionControlNodeProviderTableStatus,
     ) -> MissionControlDeviceTableState {
@@ -10044,6 +9933,7 @@ mod tests {
             ),
             node_provider_amount_bits: initial_node_provider_amount(&node_provider_status),
             node_provider_dirty: false,
+            node_provider_depletion_marked: false,
             node_provider_distribution_suspended: false,
             current_output_rate_5dc_bits: 0,
             current_output_rate_5e0_bits: 0,
@@ -18065,6 +17955,7 @@ mod tests {
             node_provider_maximum_amount_bits: Some(0),
             node_provider_amount_bits: Some(0),
             node_provider_dirty: false,
+            node_provider_depletion_marked: false,
             node_provider_distribution_suspended: false,
             current_output_rate_5dc_bits: 0,
             current_output_rate_5e0_bits: 0,
@@ -18177,6 +18068,7 @@ mod tests {
             node_provider_maximum_amount_bits: Some(100.0_f32.to_bits()),
             node_provider_amount_bits: Some(100.0_f32.to_bits()),
             node_provider_dirty: false,
+            node_provider_depletion_marked: false,
             node_provider_distribution_suspended: false,
             current_output_rate_5dc_bits: 0,
             current_output_rate_5e0_bits: 0,
@@ -18231,6 +18123,7 @@ mod tests {
                 node_provider_maximum_amount_bits: Some(0),
                 node_provider_amount_bits: Some(0),
                 node_provider_dirty: false,
+                node_provider_depletion_marked: false,
                 node_provider_distribution_suspended: false,
                 current_output_rate_5dc_bits: 0,
                 current_output_rate_5e0_bits: 0,
