@@ -141,6 +141,9 @@ pub(super) fn log_clan_ai_stops(report: &SimulationReport) {
     for &(clan, plant, count) in &report.script_factory_orders {
         eprintln!("sim_coverage script_factory_orders_approx={count} clan={clan} plant={plant}");
     }
+    for &(clan, plant, count) in &report.factory_clock_ticks {
+        eprintln!("sim_coverage script_factory_clock_approx={count} clan={clan} plant={plant}");
+    }
     for &(clan, plant, count) in &report.script_factory_rejections {
         eprintln!("sim_coverage script_factory_rejections={count} clan={clan} plant={plant}");
     }

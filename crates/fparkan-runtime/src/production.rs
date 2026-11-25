@@ -71,6 +71,7 @@ pub(super) struct Production {
     controls: Vec<MissionControlDeviceTableState>,
     plants: Vec<(usize, u32)>,
     pending: VecDeque<Order>,
+    clock_ticks: std::collections::BTreeMap<(u16, u32), u64>,
     rng: u32,
 }
 
@@ -82,6 +83,7 @@ struct Order {
     start_ms: u32,
     duration_ms: u32,
     paid: Option<PaidOrder>,
+    clock: crate::behavior_clock::TaskClock,
 }
 
 #[derive(Default)]
@@ -134,6 +136,12 @@ impl PaidOrder {
 }
 
 impl Production {
+    pub(super) fn clock_ticks(&self) -> impl Iterator<Item = (u16, u32, u64)> + '_ {
+        self.clock_ticks
+            .iter()
+            .map(|(&(clan, plant), &count)| (clan, plant, count))
+    }
+
     pub(super) fn reserved_minds(&self, world: &World, owner: OwnerId) -> usize {
         self.pending
             .iter()
@@ -188,6 +196,7 @@ impl Production {
             controls,
             plants: Vec::new(),
             pending: VecDeque::new(),
+            clock_ticks: Default::default(),
             rng: 1,
         };
         production.register_factories(0, &drafts[..reserve_start]);
@@ -218,17 +227,32 @@ impl Production {
         world: &mut World,
         mission: &mut LoadedMissionState,
         now_ms: u32,
+        behavior_rng: &mut u32,
     ) -> Result<Option<SpawnedUnit>, EngineError> {
         for _ in 0..self.pending.len() {
             let Some(mut order) = self.pending.pop_front() else {
                 break;
             };
+            let owned = identity_metadata(world, order.plant)
+                .is_ok_and(|identity| identity.owner_id == Some(order.owner));
+            if owned {
+                if !order.clock.due(now_ms, behavior_rng) {
+                    self.pending.push_back(order);
+                    continue;
+                }
+                let count = self
+                    .clock_ticks
+                    .entry((order.owner.0, order.plant.slot))
+                    .or_default();
+                *count += 1;
+                if *count == 1 {
+                    eprintln!("sim_coverage script_factory_clock_approx=1 clan={} plant={} (active task timer; idle owner phases remain open)", order.owner.0, order.plant.slot);
+                }
+            }
             if let Some(unit) = self.advance_order(world, mission, now_ms, &mut order)? {
                 return Ok(Some(unit));
             }
-            if identity_metadata(world, order.plant)
-                .is_ok_and(|identity| identity.owner_id == Some(order.owner))
-            {
+            if owned {
                 self.pending.push_back(order);
             }
         }
@@ -532,6 +556,7 @@ fn order_owned_factory(
         start_ms: now_ms,
         duration_ms,
         paid,
+        clock: Default::default(),
     };
     production.pending.push_back(order);
     Ok(duration_ms)
@@ -960,6 +985,72 @@ mod tests {
             }
         }
         panic!("transport should unload ore into the enemy storage");
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_factory_payment_waits_for_behavior_task_deadline() {
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed corpus");
+        let mut engine = create(EngineServices::new(std::sync::Arc::new(DirectoryVfs::new(
+            root,
+        ))))
+        .unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.03/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        let plant = handle_by_original_id(&engine.world, OriginalObjectId(7)).unwrap();
+        order_owned_factory(&mut engine, OwnerId(0), plant, 0, 100).unwrap();
+        factory_resources(engine.loaded.as_mut().unwrap(), plant)
+            .unwrap()
+            .1
+            .current_ore_bits = 100.0_f32.to_bits();
+        // Isolate the factory's owner timer from unrelated clan updates.
+        let mut rng = 1;
+        for now in [100, 174] {
+            let production = engine.production.as_mut().unwrap();
+            production
+                .tick(
+                    &mut engine.world,
+                    engine.loaded.as_mut().unwrap(),
+                    now,
+                    &mut rng,
+                )
+                .unwrap();
+        }
+        let production = engine.production.as_ref().unwrap();
+        let paid = production.pending.front().unwrap().paid.as_ref().unwrap();
+        assert_eq!(
+            paid.collected.ore, 0.0,
+            "no resource pull before the deadline"
+        );
+        assert_eq!(paid.last_ms, 100);
+        assert_eq!(rng, 2_745_024);
+        let production = engine.production.as_mut().unwrap();
+        production
+            .tick(
+                &mut engine.world,
+                engine.loaded.as_mut().unwrap(),
+                175,
+                &mut rng,
+            )
+            .unwrap();
+        let paid = production.pending.front().unwrap().paid.as_ref().unwrap();
+        assert_eq!(paid.last_ms, 175);
+        assert_eq!(paid.collected.ore, 0.07);
+        assert_eq!(
+            production.clock_ticks().collect::<Vec<_>>(),
+            [(0, plant.slot, 2)]
+        );
     }
 
     #[test]

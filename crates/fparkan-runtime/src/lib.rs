@@ -2805,7 +2805,12 @@ pub fn step_headless(
     }
     let (produced_unit, production_failure) =
         if let (Some(production), Some(mission)) = (&mut engine.production, &mut engine.loaded) {
-            match production.tick(&mut engine.world, mission, queue_time_ms) {
+            match production.tick(
+                &mut engine.world,
+                mission,
+                queue_time_ms,
+                &mut engine.behavior_rng_state,
+            ) {
                 Ok(unit) => (unit, None),
                 Err(error) => (None, Some(error.to_string())),
             }
@@ -2934,6 +2939,8 @@ pub struct SimulationReport {
     pub script_factory_rejections: Vec<(u16, u32, u64)>,
     /// Accepted approximate script construction orders by clan and factory slot.
     pub script_factory_orders: Vec<(u16, u32, u64)>,
+    /// Active factory task updates; idle owner phases and global RNG order remain approximate.
+    pub factory_clock_ticks: Vec<(u16, u32, u64)>,
     /// Approximate clan strength queries, grouped by caller and target clan.
     pub script_strength_queries: Vec<(usize, u16, u64)>,
     pub script_capture_queries: Vec<(usize, u64)>,
@@ -3007,6 +3014,7 @@ pub fn simulate_mission_report(
         clan_problem_starts: Vec::new(),
         script_factory_rejections: Vec::new(),
         script_factory_orders: Vec::new(),
+        factory_clock_ticks: Vec::new(),
         script_strength_queries: Vec::new(),
         script_capture_queries: Vec::new(),
         script_attack_queries: Vec::new(),
@@ -3114,6 +3122,9 @@ pub fn simulate_mission_report(
             .clan_research_catalogs
             .extend(loaded.clan_ai_events.research_catalogs());
         report.laboratory = loaded.laboratories.report();
+        if let Some(production) = &engine.production {
+            report.factory_clock_ticks.extend(production.clock_ticks());
+        }
         for problem in loaded.clan_ai_events.pending_problems() {
             *report
                 .clan_problem_dispatch_stubs
