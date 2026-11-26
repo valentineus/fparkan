@@ -113,6 +113,11 @@ impl Op2SoundCommand {
         !self.looping && self.start == 0.0
     }
 
+    /// Whether the command sustains a source throughout its phase window.
+    pub fn is_looping(&self) -> bool {
+        self.looping
+    }
+
     /// Evaluates Effect.dll's phase crossings and current source parameters.
     /// `playing` comes from the audio owner, since a one-shot can finish between
     /// updates. The matrix maps local command coordinates into world space.

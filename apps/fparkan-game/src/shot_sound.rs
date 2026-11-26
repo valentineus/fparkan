@@ -109,7 +109,7 @@ mod tests {
         let engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(&root)))).unwrap();
         let missile = load_player_projectile(&engine, "objects.rlb", "bm_h_01").unwrap();
         let effects = crate::projectile_render::initial_effects(&root, &missile, "bm_h_01");
-        let sounds = projectile_launch(effects.iter().map(|(_, effect)| effect));
+        let sounds = projectile_launch(effects.iter().map(|effect| &effect.document));
         let [sound] = sounds.as_slice() else {
             panic!("expected the single launch sound, got {sounds:?}");
         };

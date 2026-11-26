@@ -22,6 +22,7 @@ mod player_collision;
 mod player_fire;
 mod player_footsteps;
 mod projectile_render;
+mod projectile_sound;
 mod projectile_trail;
 mod shield_effects;
 mod shot_sound;
@@ -10598,9 +10599,7 @@ impl StaticVulkanApp {
                 let Some(flight) = instance.flight else {
                     continue;
                 };
-                let forward = flight.direction;
-                let right = normalize3(cross3(forward, [0.0, 0.0, 1.0])).unwrap_or([1.0, 0.0, 0.0]);
-                let up = cross3(right, forward);
+                let [right, forward, up] = projectile_render::flight_basis(flight.direction);
                 let rotate = |[x, y, z]: [f32; 3]| {
                     add3(add3(scale3(right, x), scale3(forward, y)), scale3(up, z))
                 };
@@ -11669,6 +11668,11 @@ impl StaticVulkanApp {
             audio
                 .update_listener(camera.position, camera.forward, camera.up)
                 .map_err(|error| format!("update audio listener: {error}"))?;
+            projectile_sound::update(
+                audio,
+                &mut self.projectile_draws,
+                self.control_sound_slots.len(),
+            )?;
             for (id, sound) in self.control_sound_slots.iter_mut().enumerate() {
                 let slot = &mut sound.effect;
                 if self

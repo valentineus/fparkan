@@ -134,6 +134,11 @@ impl PlayerProjectile {
         })
     }
 
+    /// Queue time at launch, retained when the projectile's pose changes.
+    pub fn born_ms(&self) -> u32 {
+        self.born_ms
+    }
+
     /// Advances this projectile and returns whether it remains in flight.
     /// The callback identifies contacts with the world along the traveled segment.
     pub fn advance(

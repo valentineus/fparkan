@@ -1,9 +1,9 @@
 use super::{
     ambient_effect_pipeline_state, append_environment_range, environment_vertex,
-    prepare_effect_material, quad_indices, EnvironmentGpuRange, PreparedEffectMaterial,
-    StaticPreviewScene,
+    prepare_effect_material, projectile_render::ProjectileEffect, quad_indices,
+    EnvironmentGpuRange, PreparedEffectMaterial, StaticPreviewScene,
 };
-use fparkan_fx::{op5::TrailLayer, FxDocument, FxOpcode};
+use fparkan_fx::{op5::TrailLayer, FxOpcode};
 use std::{collections::HashMap, path::Path};
 
 pub(super) struct ProjectileTrail {
@@ -14,13 +14,18 @@ pub(super) struct ProjectileTrail {
 
 pub(super) fn prepare(
     root: &Path,
-    effects: &[(String, FxDocument)],
+    effects: &[ProjectileEffect<'_>],
     name: &str,
     preview: &mut StaticPreviewScene,
     cache: &mut HashMap<String, PreparedEffectMaterial>,
 ) -> Vec<(TrailLayer, usize, fparkan_render::LegacyPipelineState)> {
     let mut layers = Vec::new();
-    for (effect, document) in effects {
+    for ProjectileEffect {
+        resource: effect,
+        document,
+        ..
+    } in effects
+    {
         let header = document.header();
         let [scale, sy, sz] = header.scale;
         for command in document
