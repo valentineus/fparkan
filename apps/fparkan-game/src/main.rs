@@ -295,6 +295,7 @@ fn run(args: &[String]) -> Result<String, String> {
     )?;
     if !args.viewer {
         chassis_animation::connect_walkers(&engine, &mut preview);
+        chassis_animation::connect_treads(&engine, &mut preview);
     }
     let terrain_materials_duration = terrain_materials_duration_started.elapsed();
     // Atmosphere files are mission-local assets.  Resolving them from the
@@ -4736,6 +4737,7 @@ struct StaticPreviewScene {
     type16_present_ranges: HashSet<usize>,
     materials: Vec<VulkanStaticMaterial>,
     material_animations: Vec<MaterialAnimationBinding>,
+    tread_animations: Vec<chassis_animation::TreadMaterials>,
     ambient_effect_slots: Vec<AmbientEffectGpuSlot>,
     control_point_light_slots: Vec<ControlEffectSlot>,
     control_sound_slots: Vec<ControlSoundSlot>,
@@ -8829,6 +8831,7 @@ fn static_preview_mesh_and_materials(
         type16_present_ranges,
         materials,
         material_animations,
+        tread_animations: Vec::new(),
         ambient_effect_slots,
         control_point_light_slots,
         control_sound_slots,
@@ -9963,6 +9966,7 @@ struct StaticVulkanApp {
     type16_present_ranges: HashSet<usize>,
     materials: Vec<VulkanStaticMaterial>,
     material_animations: Vec<MaterialAnimationBinding>,
+    tread_animations: Vec<chassis_animation::TreadMaterials>,
     ambient_effect_slots: Vec<AmbientEffectGpuSlot>,
     control_point_light_slots: Vec<ControlEffectSlot>,
     control_sound_slots: Vec<ControlSoundSlot>,
@@ -10104,6 +10108,7 @@ impl StaticVulkanApp {
             type16_present_ranges: preview.type16_present_ranges,
             materials: preview.materials,
             material_animations: preview.material_animations,
+            tread_animations: preview.tread_animations,
             ambient_effect_slots: preview.ambient_effect_slots,
             control_point_light_slots: preview.control_point_light_slots,
             control_sound_slots: preview.control_sound_slots,
@@ -11552,6 +11557,14 @@ impl StaticVulkanApp {
             &self.ambient_effect_slots,
             self.view_camera.position,
         )?;
+        if let Some(frame) = &self.mission_frame {
+            chassis_animation::update_treads(
+                &mut self.tread_animations,
+                &mut self.material_animations,
+                &self.mission_render_roots,
+                &frame.snapshot,
+            );
+        }
         let material_update = sample_material_animations(
             &mut self.material_animations,
             &self.materials,
@@ -16198,6 +16211,7 @@ mod tests {
             type16_present_ranges: HashSet::new(),
             materials,
             material_animations: vec![material_animation],
+            tread_animations: Vec::new(),
             ambient_effect_slots: Vec::new(),
             control_point_light_slots: vec![control_slot],
             control_sound_slots: Vec::new(),

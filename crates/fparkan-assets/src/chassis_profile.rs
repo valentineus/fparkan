@@ -7,6 +7,8 @@ pub struct ChassisFlags {
     pub can_fly: Option<bool>,
     /// The chassis uses legs to move.
     pub walk_chassis: Option<bool>,
+    /// The movement class declared by the chassis profile.
+    pub chassis_type: Option<u32>,
 }
 
 /// Reads the bound `CanFly` boolean from a native chassis VAR profile.
@@ -33,14 +35,18 @@ pub fn decode_chassis_flags(bytes: &[u8]) -> Result<ChassisFlags, DecodeError> {
         let name = read_lp_bytes(&mut cursor, 64 * 1024)?;
         read_lp_bytes(&mut cursor, 64 * 1024)?;
         cursor.read_exact(size as usize)?;
-        if size == 4 && kind == 2 {
-            let value = cursor.read_u32_le()? == 1;
-            match name.split(|byte| *byte == 0).next().unwrap_or_default() {
-                b"CanFly" => {
-                    flags.can_fly.get_or_insert(value);
+        if size == 4 {
+            let value = cursor.read_u32_le()?;
+            let name = name.split(|byte| *byte == 0).next().unwrap_or_default();
+            match (kind, name) {
+                (2, b"CanFly") => {
+                    flags.can_fly.get_or_insert(value == 1);
                 }
-                b"WalkChassis" => {
-                    flags.walk_chassis.get_or_insert(value);
+                (2, b"WalkChassis") => {
+                    flags.walk_chassis.get_or_insert(value == 1);
+                }
+                (5, b"ChassisType") => {
+                    flags.chassis_type.get_or_insert(value);
                 }
                 _ => {}
             }
@@ -59,13 +65,17 @@ mod tests {
 
     #[test]
     fn uses_the_bound_boolean_instead_of_its_default() {
-        let mut profile = 2_u32.to_le_bytes().to_vec();
-        for (name, value) in [("CanFly", 1), ("WalkChassis\0", 0)] {
-            for word in [4_u32, 2, 0, name.len() as u32] {
+        let mut profile = 3_u32.to_le_bytes().to_vec();
+        for (name, kind, default, value) in [
+            ("CanFly", 2, 0, 1),
+            ("WalkChassis\0", 2, 1, 0),
+            ("ChassisType", 5, 2, 4),
+        ] {
+            for word in [4_u32, kind, 0, name.len() as u32] {
                 profile.extend(word.to_le_bytes());
             }
             profile.extend(name.as_bytes());
-            for word in [0_u32, 1 - value, value, 0, 1] {
+            for word in [0_u32, default, value, 0, 1] {
                 profile.extend(word.to_le_bytes());
             }
         }
@@ -75,6 +85,7 @@ mod tests {
             Ok(ChassisFlags {
                 can_fly: Some(true),
                 walk_chassis: Some(false),
+                chassis_type: Some(4),
             })
         );
         profile.truncate(profile.len() - 1);

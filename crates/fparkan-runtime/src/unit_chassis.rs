@@ -32,14 +32,20 @@ pub(super) fn can_fly(
 
 /// Returns whether a loaded draft has an explicit walking chassis profile.
 pub fn loaded_walk_chassis(engine: &Engine, object_index: usize) -> bool {
-    engine.loaded.as_ref().is_some_and(|mission| {
-        mission
-            .object_drafts
-            .get(object_index)
-            .and_then(|draft| draft.original_id)
-            .and_then(|id| mission.unit_chassis_flags.get(&id.0))
-            .is_some_and(|flags| flags.walk_chassis == Some(true))
-    })
+    loaded_flags(engine, object_index).is_some_and(|flags| flags.walk_chassis == Some(true))
+}
+
+/// Returns whether a loaded draft has a tracked chassis profile.
+pub fn loaded_tracked_chassis(engine: &Engine, object_index: usize) -> bool {
+    const TRACKED_CHASSIS: u32 = 4;
+    loaded_flags(engine, object_index)
+        .is_some_and(|flags| flags.chassis_type == Some(TRACKED_CHASSIS))
+}
+
+fn loaded_flags(engine: &Engine, object_index: usize) -> Option<&ChassisFlags> {
+    let mission = engine.loaded.as_ref()?;
+    let id = mission.object_drafts.get(object_index)?.original_id?;
+    mission.unit_chassis_flags.get(&id.0)
 }
 
 fn load_profile(

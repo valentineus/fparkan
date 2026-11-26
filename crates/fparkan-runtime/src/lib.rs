@@ -102,12 +102,14 @@ use resource_distribution::advance_behavior_distributor_tick;
 mod script_host;
 mod script_patrol;
 mod script_time;
+mod tread_animation;
+pub use tread_animation::TreadAnimation;
 mod turret_aim;
 pub use turret_aim::{
     apply_autonomous_turret_pose, autonomous_turret_aim, has_turret_aim, TurretAim,
 };
 mod unit_chassis;
-pub use unit_chassis::loaded_walk_chassis;
+pub use unit_chassis::{loaded_tracked_chassis, loaded_walk_chassis};
 mod unit_combat;
 mod unit_motion;
 pub use unit_motion::{loaded_mission_unit_motion_report, UnitMotionReport, UnitMotionSample};
