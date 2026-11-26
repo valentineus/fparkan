@@ -1,4 +1,4 @@
-//! First-person motion of the walking hero's camera.
+//! Camera motion and footfalls of the walking hero.
 
 use crate::{Engine, LoadedMissionState, StartingCockpit};
 use fparkan_world::{transform_state, World};
@@ -11,17 +11,19 @@ pub(super) struct PlayerGait {
     previous: Option<(u32, [u32; 2])>,
     phase: f32,
     lift: f32,
+    pub(super) footfall: bool,
 }
 
 impl PlayerGait {
     fn advance(&mut self, clock_ms: u32, xy: [u32; 2]) {
+        self.footfall = false;
         let Some((previous_ms, previous_xy)) = self.previous.replace((clock_ms, xy)) else {
             return;
         };
         let elapsed_ms = clock_ms.wrapping_sub(previous_ms).min(500) as f32;
         if previous_xy == xy {
-            let decay = (1.0 - elapsed_ms / (WALK_CYCLE_MS / 4.0)).clamp(0.0, 1.0);
-            self.lift *= decay;
+            let decay = CAMERA_LIFT * elapsed_ms / (WALK_CYCLE_MS / 4.0);
+            self.lift = self.lift.signum() * (self.lift.abs() - decay).max(0.0);
             if self.lift == 0.0 {
                 self.phase = 0.0;
             }
@@ -29,9 +31,20 @@ impl PlayerGait {
         }
         // shortcut: a sine matches the observed main component of the walk;
         // the native camera track and its response to movement speed are open.
-        self.phase = (self.phase + elapsed_ms / WALK_CYCLE_MS).fract();
+        let next = self.phase + elapsed_ms / WALK_CYCLE_MS;
+        self.footfall = (next - 0.75).floor() > (self.phase - 0.75).floor();
+        self.phase = next.fract();
         self.lift = CAMERA_LIFT * (self.phase * std::f32::consts::TAU).sin();
     }
+}
+
+/// A foot contacting the accepted surface during the latest walking step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PlayerFootstep {
+    /// Position of the walker at ground contact, as IEEE-754 words.
+    pub position_bits: [u32; 3],
+    /// Whether building geometry supports the walker.
+    pub building_floor: bool,
 }
 
 pub(super) fn advance(mission: &mut LoadedMissionState, world: &World, now: u32) {
@@ -68,10 +81,13 @@ mod tests {
         assert_eq!(gait.lift, 0.0);
         gait.advance(224, [1, 0]);
         assert_eq!(gait.lift, CAMERA_LIFT);
+        assert!(!gait.footfall);
         gait.advance(448, [3, 0]);
         assert_eq!(gait.lift, -CAMERA_LIFT);
+        assert!(gait.footfall);
         gait.advance(504, [3, 0]);
         assert_eq!(gait.lift, -CAMERA_LIFT * 0.5);
+        assert!(!gait.footfall);
         gait.advance(616, [3, 0]);
         assert_eq!(gait.lift, 0.0);
     }

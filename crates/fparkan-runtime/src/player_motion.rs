@@ -54,9 +54,26 @@ pub struct PlayerMotionStep {
     max_floor_clearance: f32,
     previous_terrain_height: Option<f32>,
     terrain_height: Option<f32>,
-    wet_floor: bool,
+    surface: WalkingSurface,
     /// Sweep segment when the step translates the hero.
     pub sweep: Option<[[f32; 3]; 2]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WalkingSurface {
+    Ground,
+    Building,
+    Water,
+}
+
+impl WalkingSurface {
+    fn terrain(mask: FullSurfaceMask) -> Self {
+        if mask.0 & WATER_SURFACE != 0 {
+            Self::Water
+        } else {
+            Self::Ground
+        }
+    }
 }
 
 impl PlayerMotionStep {
@@ -69,7 +86,9 @@ impl PlayerMotionStep {
     ) -> Self {
         self.previous_terrain_height = previous;
         self.terrain_height = next.map(|(height, _)| height);
-        self.wet_floor = next.is_some_and(|(_, mask)| mask.0 & WATER_SURFACE != 0);
+        self.surface = next.map_or(WalkingSurface::Ground, |(_, mask)| {
+            WalkingSurface::terrain(mask)
+        });
         if let Some([from, to]) = self.sweep.as_mut() {
             to[2] = previous
                 .zip(self.terrain_height)
@@ -128,7 +147,7 @@ impl PlayerMotionStep {
         });
         self.pose.position[2] = (height + clearance).to_bits();
         sweep[1][2] = height + clearance + 0.5;
-        self.wet_floor = false;
+        self.surface = WalkingSurface::Building;
         self
     }
 
@@ -136,16 +155,20 @@ impl PlayerMotionStep {
     #[must_use]
     pub fn with_terrain_floor(self, height: f32, previous_mesh: Option<f32>) -> Self {
         Self {
-            wet_floor: self.wet_floor,
+            surface: self.surface,
             ..self.with_building_floor(height, previous_mesh)
         }
     }
 
     pub(super) fn touches_water(self) -> bool {
-        self.wet_floor
+        self.surface == WalkingSurface::Water
             && self.terrain_height.is_some_and(|height| {
                 f32::from_bits(self.pose.position[2]) <= height + self.max_floor_clearance + 0.05
             })
+    }
+
+    pub(super) fn on_building_floor(self) -> bool {
+        self.surface == WalkingSurface::Building
     }
 
     /// Sweeps vertically before crossing a step up, and horizontally before a step down.
@@ -177,7 +200,7 @@ mod tests {
             max_floor_clearance: FLOOR_CLEARANCE,
             previous_terrain_height: None,
             terrain_height: Some(11.5),
-            wet_floor: false,
+            surface: super::WalkingSurface::Ground,
             sweep: Some([[3.0, 6.0, 12.5], [4.0, 6.0, 15.5]]),
         };
         assert_eq!(
@@ -212,7 +235,7 @@ mod tests {
             max_floor_clearance: 1.25,
             previous_terrain_height: Some(10.0),
             terrain_height: Some(10.0),
-            wet_floor: false,
+            surface: super::WalkingSurface::Ground,
             sweep: Some([[3.0, 6.0, 11.75], [4.0, 6.0, 11.75]]),
         };
         assert_eq!(
@@ -234,7 +257,7 @@ mod tests {
             max_floor_clearance: FLOOR_CLEARANCE,
             previous_terrain_height: None,
             terrain_height: None,
-            wet_floor: false,
+            surface: super::WalkingSurface::Ground,
             sweep: Some([[3.0, 6.0, 10.52], [4.0, 6.0, 10.52]]),
         }
         .with_scene_terrain(
@@ -403,6 +426,7 @@ fn plan_player_steps(
     input.delta_seconds /= count as f32;
     let mut step = plan_motion(&mission.terrain, pose, pitch, flying, input)?;
     let mut previous = pose;
+    let mut previous_surface = WalkingSurface::Ground;
     input.mouse_x = 0.0;
     input.mouse_y = 0.0;
     for index in 0..count {
@@ -421,13 +445,14 @@ fn plan_player_steps(
         if blocked {
             step.pose.position = previous.position;
             step.sweep = None;
-            step.wet_floor = false;
+            step.surface = previous_surface;
             break;
         }
         if drowns(engine, cockpit, step) {
             break;
         }
         previous = step.pose;
+        previous_surface = step.surface;
     }
     Ok(Some(step))
 }
@@ -491,7 +516,7 @@ fn plan_motion(
     let mut sweep = None;
     let mut previous_terrain_height = None;
     let mut terrain_height = None;
-    let mut wet_floor = false;
+    let mut surface = WalkingSurface::Ground;
     if flying && (xy != [from[0], from[1]] || climb != 0.0) {
         let old_xy = [from[0], from[1]];
         let floor = |xy| {
@@ -530,7 +555,7 @@ fn plan_motion(
             let to = [xy[0], xy[1], new_ground + (from[2] - old_ground)];
             previous_terrain_height = Some(old_ground);
             terrain_height = Some(new_ground);
-            wet_floor = mask.0 & WATER_SURFACE != 0;
+            surface = WalkingSurface::terrain(mask);
             pose.position = to.map(f32::to_bits);
             // shortcut: one sweep at body height until the physical collider
             // and floor transitions are recovered.
@@ -550,7 +575,7 @@ fn plan_motion(
         max_floor_clearance: FLOOR_CLEARANCE,
         previous_terrain_height,
         terrain_height,
-        wet_floor,
+        surface,
         sweep,
     })
 }

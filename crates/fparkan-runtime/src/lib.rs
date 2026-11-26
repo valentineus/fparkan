@@ -155,7 +155,7 @@ pub use mission_events::{
     capture_building, capture_building_with_notice, capture_neutral_building,
     capture_neutral_warbot, MissionEventStop, MissionEventTick, MissionNotice,
 };
-pub use player_gait::player_walk_camera_lift;
+pub use player_gait::{player_walk_camera_lift, PlayerFootstep};
 pub use player_motion::{
     plan_player_motion, plan_player_motion_with_collision, PlayerMotion, PlayerMotionStep,
 };
@@ -1394,6 +1394,8 @@ pub struct FrameResult {
     pub clan_notices: Vec<MissionNotice>,
     /// Vertical aim of the controlled hero as an IEEE-754 radian value.
     pub player_pitch_bits: u32,
+    /// Footstep from the accepted player motion, if this tick reached a footfall.
+    pub player_footstep: Option<PlayerFootstep>,
     /// Autonomous combat events during the step.
     pub autodemo_combat_events: Vec<AutoDemoCombatEvent>,
     /// Autonomous impact or flight operations that could not execute.
@@ -2984,6 +2986,7 @@ pub fn step_headless(
         produced_unit,
         production_failure,
         researched_component,
+        player_footstep: None,
         player_pitch_bits: engine
             .loaded
             .as_ref()
@@ -3029,6 +3032,16 @@ pub fn frame_with_player_motion(
             if let Some(mission) = &mut engine.loaded {
                 mission.player_pitch_bits = motion.pitch_bits;
                 frame.player_pitch_bits = motion.pitch_bits;
+                if !blocked
+                    && !drowned
+                    && mission.player_gait.footfall
+                    && mission.local_hero == Some(cockpit.handle)
+                {
+                    frame.player_footstep = Some(PlayerFootstep {
+                        position_bits: pose.position,
+                        building_floor: motion.on_building_floor(),
+                    });
+                }
             }
             Ok(frame)
         }

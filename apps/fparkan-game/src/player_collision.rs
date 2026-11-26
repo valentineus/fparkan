@@ -174,6 +174,7 @@ mod tests {
         let mut now = 0;
         let mut hero = pose(step_mission_frame(&mut engine, now).unwrap());
         let mut door_blends = Vec::new();
+        let mut footstep_surfaces = [false; 2];
         for (index, [x, y]) in route
             .iter()
             .chain(route.iter().rev().skip(1))
@@ -238,9 +239,12 @@ mod tests {
                 .unwrap()
                 .unwrap();
                 now += 100;
-                let moved = pose(
-                    frame_with_player_motion(&mut engine, now, cockpit, motion, false).unwrap(),
-                );
+                let frame =
+                    frame_with_player_motion(&mut engine, now, cockpit, motion, false).unwrap();
+                if let Some(footstep) = frame.player_footstep {
+                    footstep_surfaces[usize::from(footstep.building_floor)] = true;
+                }
+                let moved = pose(frame);
                 stalled = if moved.position == hero.position {
                     stalled + 1
                 } else {
@@ -271,6 +275,7 @@ mod tests {
             }
         }
         let [x, y, z] = hero.position.map(f32::from_bits);
+        assert_eq!(footstep_surfaces, [true, true]);
         let ground = app.terrain.height_at([x, y]).unwrap().unwrap();
         assert!(
             (ground..ground + 1.0).contains(&z),

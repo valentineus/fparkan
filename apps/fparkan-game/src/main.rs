@@ -20,6 +20,7 @@ mod mission_notices;
 mod mission_pause;
 mod player_collision;
 mod player_fire;
+mod player_footsteps;
 mod projectile_render;
 mod projectile_trail;
 mod shield_effects;
@@ -9822,6 +9823,10 @@ fn run_static_vulkan_mode(
     }
     app.demo_camera = demo_camera;
     app.cockpit = cockpit;
+    if let Some((engine, cockpit)) = app.mission_engine.as_ref().zip(cockpit) {
+        app.player_footsteps =
+            player_footsteps::PlayerFootsteps::load(root, engine, cockpit).unwrap_or_default();
+    }
     app.player_weapon_layouts = player_weapon_layouts;
     if let Some(cockpit) = cockpit {
         let layout = &app.player_weapon_layouts[&cockpit.object_index];
@@ -10016,6 +10021,7 @@ struct StaticVulkanApp {
     projectile_draws: Vec<Option<ProjectileDraw>>,
     autodemo_draws: Vec<Option<ProjectileDraw>>,
     autonomous_shot_sounds: Vec<Option<Op2SoundCommand>>,
+    player_footsteps: player_footsteps::PlayerFootsteps,
     destruction_effects: Option<destruction_effects::DestructionEffects>,
     shield_effects: Option<shield_effects::ShieldEffects>,
     player_fire_held: bool,
@@ -10165,6 +10171,7 @@ impl StaticVulkanApp {
             projectile_draws: Vec::new(),
             autodemo_draws: Vec::new(),
             autonomous_shot_sounds: Vec::new(),
+            player_footsteps: Default::default(),
             destruction_effects: None,
             shield_effects: None,
             player_fire_held: false,
@@ -11276,6 +11283,9 @@ impl StaticVulkanApp {
                 self.present_mission_notice(notice, control_clock_ms);
             }
             if let Some(audio) = self.audio.as_mut() {
+                if let Some(footstep) = frame.player_footstep {
+                    self.player_footsteps.play(audio, footstep);
+                }
                 shot_sound::play_autonomous(
                     &self.autonomous_shot_sounds,
                     &frame.autodemo_combat_events,
