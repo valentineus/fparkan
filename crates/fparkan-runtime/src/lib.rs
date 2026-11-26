@@ -18372,8 +18372,8 @@ mod tests {
             "{after:?}"
         );
         for (time, slot, objective, plate) in [
-            (4_001, 4, 1, [750.0_f32, 950.7, 45.88]),
-            (6_001, 5, 2, [950.7, 869.4, 69.98]),
+            (4_001, 4, 1, [750.0_f32, 950.7, 40.11]),
+            (6_001, 5, 2, [950.7, 869.4, 63.98]),
             (8_001, 3, 4, [1179.28, 1242.12, 101.60]),
         ] {
             if slot == 3 {
@@ -18405,7 +18405,8 @@ mod tests {
         set_transform(&mut engine.world, cockpit.handle, pose).unwrap();
         assert!(frame(&mut engine, 8_002).unwrap().mission_event.is_none());
         assert_eq!(loaded_mission_script_outcome(&engine), active);
-        pose.position = [1175.335_f32, 1242.098, 79.0].map(f32::to_bits);
+        // Walking toward the portal on the stock lower tunnel's floor.
+        pose.position = [1173.7439_f32, 1243.9574, 74.78949].map(f32::to_bits);
         set_transform(&mut engine.world, cockpit.handle, pose).unwrap();
         let event = frame(&mut engine, 8_003).unwrap().mission_event.unwrap();
         assert!(event.stop.is_none(), "{event:?}");

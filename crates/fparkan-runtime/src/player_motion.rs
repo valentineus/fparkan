@@ -32,6 +32,18 @@ const WATER_SURFACE: u32 = 0x0002_0000;
 const WALK_COLLISION_DISTANCE: f32 = 0.16;
 const WALK_SPEED_FALLBACK: f32 = 8.0;
 
+pub(super) fn spawn_floor_clearance(
+    terrain: &TerrainWorld,
+    [x, y, z]: [f32; 3],
+) -> Result<f32, EngineError> {
+    let floor = terrain
+        .height_at([x, y])
+        .map_err(|error| EngineError::Movement(error.to_string()))?;
+    Ok(floor.map_or(FLOOR_CLEARANCE, |floor| {
+        (z - floor).clamp(FLOOR_CLEARANCE, STEP_DOWN)
+    }))
+}
+
 /// Player controls sampled once for a simulation step.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PlayerMotion {
@@ -433,14 +445,7 @@ fn plan_player_steps(
     let mut max_floor_clearance = FLOOR_CLEARANCE;
     if !flying && input.movement != [0.0; 2] {
         if let Some(draft) = mission.object_drafts.get(cockpit.object_index) {
-            let [x, y, z] = draft.position;
-            if let Some(ground) = mission
-                .terrain
-                .height_at([x, y])
-                .map_err(|err| EngineError::Movement(err.to_string()))?
-            {
-                max_floor_clearance = (z - ground).clamp(FLOOR_CLEARANCE, STEP_DOWN);
-            }
+            max_floor_clearance = spawn_floor_clearance(&mission.terrain, draft.position)?;
         }
     }
     let Some(resolve) = resolve else {

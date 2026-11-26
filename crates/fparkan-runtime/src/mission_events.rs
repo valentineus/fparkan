@@ -716,17 +716,22 @@ impl LoadedMissionState {
         if self.boarding.is_some() || self.script_host_mode != super::MissionMode::SingleMission {
             return false;
         }
-        let hero = self.object_drafts.iter().find(|draft| {
+        let Some(hero) = self.object_drafts.iter().find(|draft| {
             draft.unit_dat_header_flags == Some(super::HERO_UNIT_CLASS)
                 && draft.raw_after_resource == 0
-        });
+        }) else {
+            return false;
+        };
         let Some(hero_position) = hero
-            .and_then(|draft| handle_by_original_id(world, draft.original_id?))
+            .original_id
+            .and_then(|id| handle_by_original_id(world, id))
             .and_then(|hero| transform_state(world, hero).ok())
             .map(|pose| pose.position.map(f32::from_bits))
         else {
             return false;
         };
+        let clearance = crate::player_motion::spawn_floor_clearance(&self.terrain, hero.position)
+            .unwrap_or_default();
         self.object_drafts.iter().enumerate().any(|(index, draft)| {
             if draft.unit_dat_header_flags != Some(MAIN_TELEPORT_CLASS) {
                 return false;
@@ -755,8 +760,11 @@ impl LoadedMissionState {
                     }) else {
                         return false;
                     };
-                    // shortcut: static node poses and the ordinary Res17 volume until animated triggers are wired.
+                    // shortcut: use the authored spawn clearance to project a
+                    // floor-level walking pose into the native contact volume.
+                    let [x, y, z] = hero_position;
                     inside_exit_volume(center, hero_position)
+                        || inside_exit_volume(center, [x, y, z + clearance])
                 }))
             };
             hit() == Some(true)
