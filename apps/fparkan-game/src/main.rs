@@ -9930,6 +9930,7 @@ struct StaticVulkanApp {
     world_range_index_counts: HashMap<usize, u32>,
     camera: VulkanStaticCamera,
     view_camera: PreviewCameraFrame,
+    player_aim_direction: Option<[f32; 3]>,
     captured_viewport: Option<CapturedViewport>,
     free_camera: Option<FreeFlightCamera>,
     environment: Option<DynamicEnvironment>,
@@ -10096,6 +10097,7 @@ impl StaticVulkanApp {
             world_range_index_counts,
             camera: preview.camera,
             view_camera: preview.view_camera,
+            player_aim_direction: None,
             captured_viewport: preview.captured_viewport,
             free_camera: preview.free_camera,
             environment,
@@ -10408,6 +10410,7 @@ impl StaticVulkanApp {
         viewport: [f32; 2],
     ) -> Result<(), String> {
         self.cockpit_geometry.clear();
+        self.player_aim_direction = None;
         if let (Some(demo), Some(frame)) = (&mut self.demo_camera, &self.mission_frame) {
             let mode_and_camera =
                 match demo.sample(self.simulation_time_ms, &frame.snapshot, &self.terrain)? {
@@ -10499,7 +10502,7 @@ impl StaticVulkanApp {
             translation[2] += fparkan_runtime::player_walk_camera_lift(engine, cockpit);
         }
         let [view_yaw, view_pitch] = frame.player_view_offset_bits.map(f32::from_bits);
-        let camera = fparkan_render::forward_cockpit_camera(
+        let sights = fparkan_render::forward_cockpit_camera(
             LegacyIron3dEulerTransform {
                 translation,
                 orientation_radians: state.orientation.map(f32::from_bits),
@@ -10507,9 +10510,11 @@ impl StaticVulkanApp {
             state.scale.map(f32::from_bits),
             point,
         )?
-        .with_cockpit_pitch(f32::from_bits(frame.player_pitch_bits))?
-        .with_cockpit_yaw(view_yaw)?
-        .with_cockpit_pitch(view_pitch)?;
+        .with_cockpit_pitch(f32::from_bits(frame.player_pitch_bits))?;
+        let sights_view = sights.try_direct3d7_view_row_major()?;
+        let camera = sights
+            .with_cockpit_yaw(view_yaw)?
+            .with_cockpit_pitch(view_pitch)?;
         let viewport = [0, 0, viewport[0] as i32, viewport[1] as i32];
         let frame = PreviewCameraFrame::from_legacy_d3d7(
             camera,
@@ -10521,6 +10526,7 @@ impl StaticVulkanApp {
             },
         )?;
         self.cockpit_geometry.select(cockpit, camera);
+        self.player_aim_direction = Some([sights_view[2], sights_view[6], sights_view[10]]);
         Some(frame)
     }
 
@@ -15992,6 +15998,7 @@ mod tests {
         app.update_mission_camera(0.016, [800.0, 600.0]).unwrap();
         assert_eq!(app.view_camera.position, moved);
         let sights_forward = app.view_camera.forward;
+        assert_eq!(app.player_aim_direction, Some(sights_forward));
         let turned = plan_player_motion(
             &engine,
             cockpit,
@@ -16009,6 +16016,7 @@ mod tests {
         app.update_mission_camera(0.016, [800.0, 600.0]).unwrap();
         assert_eq!(app.view_camera.position, moved);
         assert_ne!(app.view_camera.forward, sights_forward);
+        assert_eq!(app.player_aim_direction, Some(sights_forward));
 
         let released = plan_player_motion(&engine, cockpit, PlayerMotion::default())
             .unwrap()

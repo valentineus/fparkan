@@ -73,9 +73,10 @@ impl StaticVulkanApp {
             orientation_radians: state.orientation.map(f32::from_bits),
         };
         let scale = state.scale.map(f32::from_bits);
-        // shortcut: the camera supplies a shared aim direction until native
-        // per-weapon CPT direction and turret alignment agree in world space.
-        let direction = self.view_camera.forward;
+        // shortcut: use the turret sights until the native barrel matrix is resolved.
+        let Some(direction) = self.player_aim_direction else {
+            return;
+        };
         for (slot, barrel) in shots {
             let weapon = &weapons.weapons()[slot];
             let hierarchy = self
