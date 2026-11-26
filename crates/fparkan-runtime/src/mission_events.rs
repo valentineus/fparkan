@@ -16,7 +16,7 @@ use fparkan_world::{
 use std::collections::{HashMap, HashSet};
 
 const MOBILE_HQ_CLASS: u32 = 0x0101_0000;
-const MAIN_TELEPORT_CLASS: u32 = 0x8000_0200;
+pub(super) const MAIN_TELEPORT_CLASS: u32 = 0x8000_0200;
 
 /// First encounter with an uncovered periodic script instruction.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1025,7 +1025,7 @@ impl LoadedMissionState {
     }
 }
 
-fn inside_exit_volume([x, y, z]: [f32; 3], [px, py, pz]: [f32; 3]) -> bool {
+pub(super) fn inside_exit_volume([x, y, z]: [f32; 3], [px, py, pz]: [f32; 3]) -> bool {
     (pz - z).abs() <= 3.0 && (px - x).powi(2) + (py - y).powi(2) <= 25.0
 }
 

@@ -91,6 +91,7 @@ use behavior_clock::next_crt_rand;
 mod mesh_collision;
 mod mining;
 pub use laboratory::LaboratoryReport;
+mod main_teleport;
 mod manual_chassis;
 mod manual_flight;
 mod mission_events;
@@ -2999,8 +3000,16 @@ pub fn frame_with_player_motion(
     if blocked {
         pose.position = previous.position;
     }
-    set_transform(&mut engine.world, cockpit.handle, pose)?;
     let drowned = !blocked && player_motion::drowns(engine, cockpit, motion);
+    let landing = motion.sweep.and_then(|[_, body]| {
+        (!blocked && !drowned)
+            .then(|| main_teleport::landing_position(engine, cockpit, body))
+            .flatten()
+    });
+    if let Some(position) = landing {
+        pose.position = position;
+    }
+    set_transform(&mut engine.world, cockpit.handle, pose)?;
     if drowned {
         fparkan_world::request_delete(&mut engine.world, cockpit.handle)?;
     }
@@ -3013,6 +3022,7 @@ pub fn frame_with_player_motion(
                 player_motion::commit_flight(mission, cockpit, motion, blocked);
                 if !blocked
                     && !drowned
+                    && landing.is_none()
                     && mission.player_gait.footfall
                     && mission.local_hero == Some(cockpit.handle)
                 {
