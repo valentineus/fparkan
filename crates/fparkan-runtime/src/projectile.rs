@@ -176,6 +176,8 @@ pub fn projectile_terrain_hit(
 pub struct ProjectileContact {
     pub handle: ObjectHandle,
     pub fraction: f32,
+    /// World point on the segment at the detected contact.
+    pub position: [f32; 3],
     /// Provider row identified by a building triangle hit.
     pub building_node: Option<u32>,
 }
@@ -217,6 +219,9 @@ pub fn projectile_unit_hit(
             Some(ProjectileContact {
                 handle,
                 fraction,
+                position: std::array::from_fn(|axis| {
+                    segment[0][axis] + (segment[1][axis] - segment[0][axis]) * fraction
+                }),
                 building_node,
             })
         })
@@ -330,7 +335,15 @@ pub fn apply_projectile_contact(
         return Ok(None);
     }
     // shortcut: keep per-node damage using the projectile NDP volume while armor and splash are open.
+    let effect = (volume >= remaining && engine.destruction_effects.is_some())
+        .then(|| super::destruction::building_part_effect(row, contact.position))
+        .flatten();
     let updated = apply_loaded_mission_control_node_delta(engine, contact.handle, key, -volume)?;
+    if updated.is_some() {
+        if let (Some(effect), Some(events)) = (effect, engine.destruction_effects.as_mut()) {
+            events.push(effect);
+        }
+    }
     Ok(updated.map(|_| ((remaining - volume).max(0.0), false)))
 }
 
@@ -396,6 +409,65 @@ pub fn apply_projectile_hit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_factory_part_explodes_once_on_depletion() {
+        use crate::{
+            collect_unit_destruction_effects, create, load_gameplay_mission,
+            take_unit_destruction_effects, unit_destruction_effect_sources, EngineServices,
+            MissionMode, MissionRequest, MissionStartupInput,
+        };
+        use fparkan_vfs::DirectoryVfs;
+        use fparkan_world::OriginalObjectId;
+
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed corpus");
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Single.01/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        let plant = handle_by_original_id(&engine.world, OriginalObjectId(5)).unwrap();
+        let contact = ProjectileContact {
+            handle: plant,
+            fraction: 0.5,
+            position: [1300.0, 627.0, 84.0],
+            building_node: Some(3),
+        };
+        collect_unit_destruction_effects(&mut engine);
+        assert_eq!(
+            apply_projectile_contact(&mut engine, contact, 5_000.0).unwrap(),
+            Some((5_000.0, false))
+        );
+        assert!(take_unit_destruction_effects(&mut engine).is_empty());
+        assert_eq!(
+            apply_projectile_contact(&mut engine, contact, 5_000.0).unwrap(),
+            Some((0.0, false))
+        );
+        let events = take_unit_destruction_effects(&mut engine);
+        let [effect] = events.as_slice() else {
+            panic!("expected one EXPL at the failed part");
+        };
+        assert_eq!(effect.position, contact.position);
+        assert_eq!(effect.object_index, None);
+        assert_eq!(effect.name, "explode_frt_b.exp");
+        assert!(unit_destruction_effect_sources(&engine)
+            .any(|source| source == (effect.archive.clone(), effect.name.clone())));
+        assert!(apply_projectile_contact(&mut engine, contact, 5_000.0)
+            .unwrap()
+            .is_none());
+        assert!(take_unit_destruction_effects(&mut engine).is_empty());
+        assert!(transform_state(&engine.world, plant).is_ok());
+    }
 
     #[test]
     #[ignore = "requires licensed corpus"]

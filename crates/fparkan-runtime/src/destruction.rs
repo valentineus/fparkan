@@ -1,13 +1,16 @@
 //! Presentation events for projectile damage that destroys a unit.
 
-use crate::{autodemo::MOBILE_UNIT, Engine, MissionControlDeviceTableState, ObjectHandle};
+use crate::{
+    autodemo::MOBILE_UNIT, Engine, MissionControlDeviceTableState, MissionControlNodeProviderRow,
+    MissionControlNodeProviderTableStatus, ObjectHandle, UNIT_DAT_CONTROL_CLASS_HIGH_BIT,
+};
 use fparkan_world::{identity_metadata, transform_state};
 
-/// Position and attached EXPL resource of a chassis at lethal contact.
+/// Position and attached EXPL resource of a destroyed chassis or building part.
 pub struct UnitDestructionEffect {
     /// Prepared draft index for the destroyed actor when it has an authored layout.
     pub object_index: Option<usize>,
-    /// World-space origin of the destroyed chassis.
+    /// World-space origin of the effect.
     pub position: [f32; 3],
     /// Archive containing the explosion description.
     pub archive: String,
@@ -29,25 +32,48 @@ pub fn take_unit_destruction_effects(engine: &mut Engine) -> Vec<UnitDestruction
         .unwrap_or_default()
 }
 
-/// One explosion descriptor per prepared mobile chassis, including reserves.
+/// Explosion descriptors for prepared mobile chassis and damageable building parts.
 pub fn unit_destruction_effect_sources(
     engine: &Engine,
 ) -> impl Iterator<Item = (String, String)> + '_ {
     engine.loaded.iter().flat_map(|mission| {
-        mission.object_drafts.iter().filter_map(|draft| {
-            if !draft
-                .unit_dat_header_flags
-                .is_some_and(|class| class & MOBILE_UNIT != 0)
-            {
-                return None;
-            }
-            let id = draft.original_id?;
-            let table = mission
-                .control_device_tables
-                .iter()
-                .find(|table| table.original_id == Some(id))?;
-            root_effect(table)
-        })
+        mission
+            .object_drafts
+            .iter()
+            .filter_map(|draft| {
+                let class = draft.unit_dat_header_flags?;
+                let id = draft.original_id?;
+                let table = mission
+                    .control_device_tables
+                    .iter()
+                    .find(|table| table.original_id == Some(id))?;
+                let MissionControlNodeProviderTableStatus::Available(rows) =
+                    &table.node_provider_status
+                else {
+                    return None;
+                };
+                Some(if class & UNIT_DAT_CONTROL_CLASS_HIGH_BIT != 0 {
+                    rows.as_slice()
+                } else if class & MOBILE_UNIT != 0 {
+                    rows.get(..1).unwrap_or_default()
+                } else {
+                    &[]
+                })
+            })
+            .flat_map(|rows| rows.iter().filter_map(node_effect))
+    })
+}
+
+pub(super) fn building_part_effect(
+    row: &MissionControlNodeProviderRow,
+    position: [f32; 3],
+) -> Option<UnitDestructionEffect> {
+    let (archive, name) = node_effect(row)?;
+    Some(UnitDestructionEffect {
+        object_index: None,
+        position,
+        archive,
+        name,
     })
 }
 
@@ -85,6 +111,13 @@ pub(super) fn pending_effect(
 
 fn root_effect(table: &MissionControlDeviceTableState) -> Option<(String, String)> {
     let row = crate::control_node_provider_row(table, 0).ok()?;
+    node_effect(row)
+}
+
+fn node_effect(row: &MissionControlNodeProviderRow) -> Option<(String, String)> {
+    if f32::from_bits(row.initial_amount_bits) <= 0.0 {
+        return None;
+    }
     let effect = &row.source_row.effect;
     let archive = crate::bounded_ascii_c_string(&effect.archive)?;
     let name = crate::bounded_ascii_c_string(&effect.name)?;
