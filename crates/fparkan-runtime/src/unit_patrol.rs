@@ -1,6 +1,7 @@
 use super::{
     autodemo::{MOBILE_UNIT, PLANT_CLASS},
     boarding::WARBOT_CLASS,
+    building_passage::CapturePassage,
     factory_release::FactoryDeparture,
     flight_altitude::FlightClearance,
     ground_support::GroundSupport,
@@ -53,6 +54,7 @@ struct PatrollingUnit {
     attack_target: Option<(ObjectHandle, usize)>,
     raid_factory: Option<(ObjectHandle, usize)>,
     ground_support: Option<Option<GroundSupport>>,
+    capture_passage: Option<CapturePassage>,
 }
 
 pub(super) struct PreparedPatrol {
@@ -214,6 +216,7 @@ impl UnitPatrol {
             attack_target: None,
             raid_factory: None,
             ground_support: None,
+            capture_passage: None,
         });
         true
     }
@@ -242,6 +245,40 @@ impl UnitPatrol {
             unit.points.clear();
             unit.retry_ms = 0;
         }
+    }
+
+    pub(super) fn move_to_capture(
+        &mut self,
+        world: &World,
+        handle: ObjectHandle,
+        destination: [f32; 2],
+        passage: Option<CapturePassage>,
+    ) {
+        self.move_to(world, handle, destination, false);
+        if let Some(unit) = self.units.iter_mut().find(|unit| unit.handle == handle) {
+            unit.capture_passage = passage;
+        }
+    }
+
+    pub(super) fn hallway_doors(
+        &self,
+        building: ObjectHandle,
+    ) -> impl Iterator<Item = (usize, f32)> + '_ {
+        self.units
+            .iter()
+            .filter_map(|unit| unit.capture_passage.as_ref())
+            .filter(move |route| route.building == building)
+            .filter_map(|route| route.opening)
+    }
+
+    pub(super) fn clear_capture_passage(&mut self, unit: ObjectHandle, building: ObjectHandle) {
+        self.units.retain(|patrol| {
+            patrol.handle != unit
+                || patrol
+                    .capture_passage
+                    .as_ref()
+                    .is_none_or(|route| route.building != building)
+        });
     }
 
     pub(super) fn order_around_object(
@@ -418,6 +455,7 @@ impl UnitPatrol {
                 attack_target: None,
                 raid_factory: None,
                 ground_support: None,
+                capture_passage: None,
             })
             .collect();
         Some(Self {
@@ -451,9 +489,14 @@ impl UnitPatrol {
         let mut state = self.clone();
         state.advance_script_orders(world, &mission.control_device_tables);
         state.units.retain(|unit| {
-            unit.destinations
+            (unit
+                .destinations
                 .as_ref()
                 .is_none_or(|items| !items.is_empty())
+                || unit
+                    .capture_passage
+                    .as_ref()
+                    .is_some_and(|route| !route.legs.is_empty()))
                 && unit.center(world).is_some()
         });
         let seconds = now_ms.saturating_sub(state.clock_ms) as f32 * 0.001;
@@ -503,6 +546,30 @@ impl UnitPatrol {
                     unit.retry_ms = 0;
                 }
                 if destinations.is_empty() {
+                    if let Some(route) = &mut unit.capture_passage {
+                        if transform_state(world, route.building).is_err() {
+                            route.legs.clear();
+                            continue;
+                        }
+                        let radius = traffic.radius(unit.handle);
+                        let Some(neighbors) =
+                            traffic.blockers(unit.handle, [from[0], from[1]], radius)
+                        else {
+                            continue;
+                        };
+                        let speed = movement_speed(
+                            mission,
+                            unit.handle,
+                            original_id,
+                            UnitSpeedKind::Go,
+                            &mut state.speed_report,
+                        );
+                        let (after, swept) = route.advance(before, speed, seconds, &neighbors);
+                        traffic.reserve(unit.handle, swept);
+                        if after != before {
+                            poses.push((unit.handle, before, after));
+                        }
+                    }
                     continue;
                 }
             }
@@ -681,15 +748,13 @@ impl UnitPatrol {
                 } else {
                     UnitSpeedKind::Go
                 };
-                let table = mission
-                    .control_device_tables
-                    .iter()
-                    .find(|table| table.handle == unit.handle);
-                let behavior = mission
-                    .behavior_profiles
-                    .iter()
-                    .find(|profile| profile.handle == unit.handle);
-                order_speed(table, behavior, original_id, kind, &mut state.speed_report)
+                movement_speed(
+                    mission,
+                    unit.handle,
+                    original_id,
+                    kind,
+                    &mut state.speed_report,
+                )
             } else {
                 9.0
             };
@@ -717,6 +782,24 @@ impl UnitPatrol {
         }
         Ok(PreparedPatrol { state, poses })
     }
+}
+
+fn movement_speed(
+    mission: &LoadedMissionState,
+    handle: ObjectHandle,
+    original_id: u32,
+    kind: UnitSpeedKind,
+    report: &mut UnitSpeedReport,
+) -> f32 {
+    let table = mission
+        .control_device_tables
+        .iter()
+        .find(|table| table.handle == handle);
+    let behavior = mission
+        .behavior_profiles
+        .iter()
+        .find(|profile| profile.handle == handle);
+    order_speed(table, behavior, original_id, kind, report)
 }
 
 #[cfg(test)]

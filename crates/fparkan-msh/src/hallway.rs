@@ -5,8 +5,17 @@ use crate::{read_f32, read_u32, MshError, NodeId, RawStream};
 pub struct Hallway {
     /// Points in native selection order.
     pub points: Vec<HallwayPoint>,
-    /// Start and end point indexes for each authored link.
-    pub links: Vec<[u32; 2]>,
+    /// Authored links between passage points.
+    pub links: Vec<HallwayLink>,
+}
+
+/// A passage connection and its four directional access pairs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HallwayLink {
+    /// Start and end point indexes.
+    pub endpoints: [u32; 2],
+    /// Raw pairs of device key and state mask.
+    pub access: [[u32; 2]; 4],
 }
 
 /// A navigation point attached to a mesh node.
@@ -48,7 +57,16 @@ pub(super) fn parse(stream: &RawStream) -> Result<Hallway, MshError> {
         .collect::<Result<_, MshError>>()?;
     let links = link_bytes
         .chunks_exact(LINK_BYTES)
-        .map(|link| Ok([read_u32(link, 0)?, read_u32(link, 4)?]))
+        .map(|link| {
+            let mut access = [[0; 2]; 4];
+            for (i, pair) in access.iter_mut().enumerate() {
+                *pair = [read_u32(link, 8 + i * 8)?, read_u32(link, 12 + i * 8)?];
+            }
+            Ok(HallwayLink {
+                endpoints: [read_u32(link, 0)?, read_u32(link, 4)?],
+                access,
+            })
+        })
         .collect::<Result<_, MshError>>()?;
     Ok(Hallway { points, links })
 }
@@ -124,7 +142,8 @@ mod tests {
                 node: NodeId(4),
             }
         );
-        assert_eq!(hallway.links, [[1, 0]]);
+        assert_eq!(hallway.links[0].endpoints, [1, 0]);
+        assert_eq!(hallway.links[0].access, [[0; 2]; 4]);
         assert_eq!(hallway.hero_exits(5).unwrap(), [(NodeId(2), [0.0; 3])]);
     }
 }

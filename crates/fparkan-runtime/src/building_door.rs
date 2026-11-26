@@ -2,6 +2,8 @@ use fparkan_assets::PreparedComponentControl;
 use fparkan_msh::{selected_slot, Group, Lod, ModelAsset, NodeId};
 use fparkan_render::LegacyIron3dEulerTransform;
 
+pub(super) const DOOR_BLEND_PER_SECOND: f32 = 2.0;
+
 /// Whether this controller has a door record with a supported node binding.
 pub fn has_proximity_doors(control: &PreparedComponentControl) -> bool {
     door_bindings(control).next().is_some()
@@ -23,6 +25,38 @@ fn door_bindings(
                 .find(|binding| binding.node_index == index)
                 .filter(|binding| binding.flags == 0)
         })
+}
+
+pub(super) fn is_bound_door(control: &PreparedComponentControl, key: u32) -> bool {
+    door_bindings(control).any(|binding| binding.node_index == key as usize)
+}
+
+/// Mixes the active hallway door request into the capture target's pose.
+pub fn sample_capture_doors(
+    engine: &crate::Engine,
+    handle: crate::ObjectHandle,
+    control: &PreparedComponentControl,
+    blends: &mut Vec<f32>,
+    times: &mut [Option<f32>],
+) {
+    let Some(patrol) = engine
+        .loaded
+        .as_ref()
+        .and_then(|mission| mission.unit_patrol.as_ref())
+    else {
+        return;
+    };
+    for (node, requested) in patrol.hallway_doors(handle) {
+        let Some(binding) = door_bindings(control).find(|binding| binding.node_index == node)
+        else {
+            continue;
+        };
+        blends.resize(control.model_node_count, 0.0);
+        if let (Some(blend), Some(time)) = (blends.get_mut(node), times.get_mut(node)) {
+            *blend = blend.max(requested);
+            *time = Some(binding.frame_a + (binding.frame_b - binding.frame_a) * *blend);
+        }
+    }
 }
 
 /// Updates the authored door tracks next to the player.
@@ -72,7 +106,7 @@ pub fn sample_proximity_doors(
         } else {
             -1.0
         };
-        *blend = (*blend + direction * delta_seconds * 2.0).clamp(0.0, 1.0);
+        *blend = (*blend + direction * delta_seconds * DOOR_BLEND_PER_SECOND).clamp(0.0, 1.0);
         if let Some(time) = times.get_mut(index) {
             *time = Some(binding.frame_a + (binding.frame_b - binding.frame_a) * *blend);
         }

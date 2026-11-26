@@ -143,7 +143,7 @@ pub use autodemo::{autodemo_camera, AutoDemoCamera, AutoDemoReinforcement, AutoD
 pub use boarding::{
     board_friendly_warbot, disembark_warbot, player_vehicle, select_boarding_target,
 };
-pub use building_door::{has_proximity_doors, sample_proximity_doors};
+pub use building_door::{has_proximity_doors, sample_capture_doors, sample_proximity_doors};
 pub use fparkan_assets::MissionAssets;
 pub use mesh_collision::{query_building_segment_world, BuildingMeshHit, BuildingMeshNode};
 pub use mining::deploy_mine;

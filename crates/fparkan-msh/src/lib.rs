@@ -9,7 +9,7 @@ use fparkan_animation::{
 use fparkan_nres::{EntryMeta, NresDocument, NresError};
 
 mod hallway;
-pub use hallway::{Hallway, HallwayPoint};
+pub use hallway::{Hallway, HallwayLink, HallwayPoint};
 
 /// Node table stream.
 pub const STREAM_NODE_TABLE: u32 = 1;

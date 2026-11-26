@@ -1,7 +1,8 @@
 use crate::{
-    building_passage::capture_entrance, clan_combat_strength::unit_strength,
-    projectile::unit_sphere, MissionControlDeviceTableState, MissionDocument, MissionObjectDraft,
-    TerrainWorld,
+    building_passage::{capture_entrance, CapturePassage},
+    clan_combat_strength::unit_strength,
+    projectile::unit_sphere,
+    MissionControlDeviceTableState, MissionDocument, MissionObjectDraft, TerrainWorld,
 };
 use fparkan_world::{
     handle_by_original_id, identity_metadata, registration_sequence, transform_state, ObjectHandle,
@@ -20,6 +21,7 @@ pub(super) struct Capturer {
 pub(super) struct CaptureApproach {
     pub(super) unit: ObjectHandle,
     pub(super) target: ObjectHandle,
+    pub(super) fallback: bool,
     point: [f32; 3],
 }
 
@@ -47,28 +49,35 @@ pub(super) fn send_capturer(
     let from = unit_pose.position.map(f32::from_bits);
     let unit_id = identity_metadata(world, unit.handle).ok()?.original_id?;
     let clearance = unit_sphere(assets, unit_id.0 as usize, unit_pose).map_or(0.0, |(_, r)| r);
-    let (destination, point) =
+    let (destination, point, passage) =
         if let Some(entrance) = capture_entrance(assets, terrain, index, pose, from, clearance) {
-            // shortcut: stop outside the connected door until movement on the
-            // indoor links and their gate messages are supported.
-            (entrance.staging, entrance.capture)
+            let passage = entrance.legs.map(|legs| CapturePassage {
+                building: unit.target,
+                legs,
+                opening: None,
+            });
+            (entrance.staging, entrance.capture, passage)
         } else {
             let point = nearest_platform_point(
                 crate::mission_events::communicator_triangles(assets, index, class, pose)?,
                 from,
             )?;
-            ([point[0], point[1]], point)
+            ([point[0], point[1]], point, None)
         };
+    let indoor_route = passage.is_some();
     patrol
         .get_or_insert_with(crate::unit_patrol::UnitPatrol::scripted)
-        .move_to(world, unit.handle, destination, false);
-    eprintln!(
-        "sim_coverage script_capture_approach_stub=1 unit={} target={} target_id={target_id} destination={destination:?}",
-        unit.handle.slot, unit.target.slot
-    );
+        .move_to_capture(world, unit.handle, destination, passage);
+    if !indoor_route {
+        eprintln!(
+            "sim_coverage script_capture_approach_stub=1 unit={} target={} target_id={target_id} destination={destination:?}",
+            unit.handle.slot, unit.target.slot
+        );
+    }
     Some(CaptureApproach {
         unit: unit.handle,
         target: unit.target,
+        fallback: !indoor_route,
         point,
     })
 }

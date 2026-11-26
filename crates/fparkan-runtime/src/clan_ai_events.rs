@@ -72,6 +72,9 @@ pub(super) fn resolve_captures(
                 );
             }
         }
+        if let Some(patrol) = &mut loaded.unit_patrol {
+            patrol.clear_capture_passage(approach.unit, approach.target);
+        }
         loaded.clan_ai_events.capture_orders.remove(index);
         let clan = usize::from(owner.0);
         let ai = &mut loaded.clan_ai_events;
@@ -810,7 +813,9 @@ impl LoadedMissionState {
                                 );
                                 if let Some(approach) = approach {
                                     self.clan_ai_events.capture_orders.push((OwnerId(clan as u16), problem.key, approach));
-                                    *self.clan_ai_events.capture_approaches.entry((approach.unit.slot, approach.target.slot)).or_default() += 1;
+                                    if approach.fallback {
+                                        *self.clan_ai_events.capture_approaches.entry((approach.unit.slot, approach.target.slot)).or_default() += 1;
+                                    }
                                 }
                                 return Ok(Some(VarSetDefault::Dword(u32::from(approach.is_some()))));
                             }

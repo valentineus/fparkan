@@ -1106,10 +1106,15 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
-    fn licensed_stock_capturer_and_defender_exchange_fire() {
+    fn licensed_stock_capturer_presses_through_defender_fire_and_takes_generator() {
         let mut engine = stock_two_fortresses();
         let defender = mission_object_handle(&engine, OriginalObjectId(17)).unwrap();
         let capturer = mission_object_handle(&engine, OriginalObjectId(11)).unwrap();
+        let generator = mission_object_handle(&engine, OriginalObjectId(1)).unwrap();
+        let original_owner = identity_metadata(&engine.world, generator)
+            .unwrap()
+            .owner_id;
+        assert_ne!(original_owner, Some(OwnerId(1)));
         let before = transform_state(&engine.world, defender).unwrap();
         assert_eq!(mission_guard_fallback_count(&engine), 0);
         assert!(frame(&mut engine, 0)
@@ -1119,7 +1124,7 @@ mod tests {
 
         let mut capturer_fired_while_moving = false;
         let mut defender_fired = false;
-        for tick in 1..=60 * 190 {
+        for tick in 1..=60 * 210 {
             let before_capturer = transform_state(&engine.world, capturer).ok();
             let result = frame(&mut engine, tick * 1000 / 60).unwrap();
             for event in result.autodemo_combat_events {
@@ -1150,11 +1155,19 @@ mod tests {
                     }
                 }
             }
-            if capturer_fired_while_moving && defender_fired {
+            if identity_metadata(&engine.world, generator)
+                .unwrap()
+                .owner_id
+                == Some(OwnerId(1))
+            {
+                assert!(capturer_fired_while_moving && defender_fired);
+                let position = transform_state(&engine.world, capturer).unwrap().position;
+                let roof = transform_state(&engine.world, generator).unwrap().position;
+                assert!(f32::from_bits(position[2]) < f32::from_bits(roof[2]));
                 return;
             }
         }
-        panic!("expected both sides to fire (moving={capturer_fired_while_moving}, defender={defender_fired})");
+        panic!("the first capturer did not take the generator (moving={capturer_fired_while_moving}, defender={defender_fired})");
     }
 
     #[test]

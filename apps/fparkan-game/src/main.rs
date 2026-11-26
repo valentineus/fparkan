@@ -7411,6 +7411,19 @@ fn update_gameplay_animation_pose_buffers(
                     }
                 }
             }
+            if component_index == 0 && fparkan_runtime::has_proximity_doors(&instance.control) {
+                if let Some((root, engine)) = motion.and_then(|(roots, _, engine)| {
+                    Some((roots.get(object_index)?.as_ref()?, engine))
+                }) {
+                    fparkan_runtime::sample_capture_doors(
+                        engine,
+                        root.handle,
+                        &instance.control,
+                        &mut instance.door_blends,
+                        &mut node_times,
+                    );
+                }
+            }
             let walking = motion.is_some_and(|(roots, snapshot, engine)| {
                 roots
                     .get(object_index)
