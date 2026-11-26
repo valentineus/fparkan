@@ -28,7 +28,9 @@ const STEP_DOWN: f32 = 2.0;
 const FLOOR_CLEARANCE: f32 = 0.02;
 const WATER_SURFACE: u32 = 0x0002_0000;
 // shortcut: sample the temporary floor probe at most 0.16 units apart until native collision is wired.
-const WALK_COLLISION_INTERVAL: f32 = 0.02;
+const WALK_COLLISION_DISTANCE: f32 = 0.16;
+const WALK_SPEED_FALLBACK: f32 = 8.0;
+const FLIGHT_SPEED_FALLBACK: f32 = 40.0;
 
 /// Player controls sampled once for a simulation step.
 #[derive(Clone, Copy, Debug, Default)]
@@ -396,6 +398,21 @@ fn plan_player_steps(
     if !input.delta_seconds.is_finite() || input.delta_seconds < 0.0 {
         return Err(EngineError::Movement("invalid player step".into()));
     }
+    let speeds = if flying {
+        [FLIGHT_SPEED_FALLBACK; 2]
+    } else if mission.local_hero == Some(cockpit.handle) {
+        let forward = mission
+            .control_device_tables
+            .iter()
+            .find(|table| table.handle == cockpit.handle)
+            .and_then(|table| table.owner_profile.as_ref())
+            .map(|profile| f32::from_bits(profile.current_words[7]))
+            .filter(|speed| speed.is_finite() && *speed >= 0.0)
+            .unwrap_or(WALK_SPEED_FALLBACK);
+        [WALK_SPEED_FALLBACK, forward]
+    } else {
+        [WALK_SPEED_FALLBACK; 2]
+    };
     // shortcut: use the outdoor spawn clearance until the native walking collider is wired.
     let mut max_floor_clearance = FLOOR_CLEARANCE;
     if !flying && input.movement != [0.0; 2] {
@@ -411,20 +428,21 @@ fn plan_player_steps(
         }
     }
     let Some(resolve) = resolve else {
-        let mut step = plan_motion(&mission.terrain, pose, pitch, flying, input)?;
+        let mut step = plan_motion(&mission.terrain, pose, pitch, flying, speeds, input)?;
         step.max_floor_clearance = max_floor_clearance;
         return Ok(Some(step));
     };
     let count = if !flying && input.movement != [0.0; 2] {
         // shortcut: bound movement after a long stall while the scene uses the render clock.
         input.delta_seconds = input.delta_seconds.min(0.5);
-        (input.delta_seconds / WALK_COLLISION_INTERVAL).ceil() as u32
+        let [across, along] = body_velocity(input.movement, speeds);
+        (input.delta_seconds * across.hypot(along) / WALK_COLLISION_DISTANCE).ceil() as u32
     } else {
         1
     }
     .max(1);
     input.delta_seconds /= count as f32;
-    let mut step = plan_motion(&mission.terrain, pose, pitch, flying, input)?;
+    let mut step = plan_motion(&mission.terrain, pose, pitch, flying, speeds, input)?;
     let mut previous = pose;
     let mut previous_surface = WalkingSurface::Ground;
     input.mouse_x = 0.0;
@@ -436,6 +454,7 @@ fn plan_player_steps(
                 previous,
                 f32::from_bits(step.pitch_bits),
                 flying,
+                speeds,
                 input,
             )?;
         }
@@ -457,11 +476,21 @@ fn plan_player_steps(
     Ok(Some(step))
 }
 
+fn body_velocity(movement: [f32; 2], [side_speed, forward_speed]: [f32; 2]) -> [f32; 2] {
+    let [right, forward] = movement.map(|axis| axis.clamp(-1.0, 1.0));
+    let length = right.hypot(forward).max(1.0);
+    [
+        right * side_speed / length,
+        forward * forward_speed / length,
+    ]
+}
+
 fn plan_motion(
     terrain: &TerrainWorld,
     mut pose: TransformState,
     pitch: f32,
     flying: bool,
+    speeds: [f32; 2],
     input: PlayerMotion,
 ) -> Result<PlayerMotionStep, EngineError> {
     let from = pose.position.map(f32::from_bits);
@@ -483,8 +512,7 @@ fn plan_motion(
     {
         return Err(EngineError::Movement("invalid player step".into()));
     }
-    // shortcut: use constant walk speed and mouse gain until native Control
-    // acceleration and mouse sensitivity are measured.
+    // shortcut: use constant mouse gain until native sensitivity is measured.
     let yaw = if input.mouse_x != 0.0 {
         let yaw = (yaw - input.mouse_x.clamp(-1_000.0, 1_000.0) * 0.003)
             .rem_euclid(std::f32::consts::TAU);
@@ -493,14 +521,13 @@ fn plan_motion(
     } else {
         yaw
     };
-    let [right, forward] = input.movement.map(|axis| axis.clamp(-1.0, 1.0));
-    // shortcut: constant flight rates until thrust, clearance and inertia are measured.
-    let speed = if flying { 40.0 } else { 8.0 };
-    let distance = speed * input.delta_seconds / right.hypot(forward).max(1.0);
+    // shortcut: apply the requested velocity immediately until native acceleration is known.
+    let [across, along] =
+        body_velocity(input.movement, speeds).map(|speed| speed * input.delta_seconds);
     let (sin, cos) = yaw.sin_cos();
     let xy = [
-        from[0] + (cos * right - sin * forward) * distance,
-        from[1] + (sin * right + cos * forward) * distance,
+        from[0] + cos * across - sin * along,
+        from[1] + sin * across + cos * along,
     ];
     let climb = if flying {
         input.climb.clamp(-1.0, 1.0) * (16.0 * input.delta_seconds)

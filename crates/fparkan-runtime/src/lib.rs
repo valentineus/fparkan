@@ -18011,7 +18011,19 @@ mod tests {
             pose(&frame_with_player_motion(&mut engine, 200, cockpit, proposed, false).unwrap());
         let [x0, y0, z0] = original.position.map(f32::from_bits);
         let [x1, y1, z1] = walked.position.map(f32::from_bits);
-        assert!(((x1 - x0).hypot(y1 - y0) - 0.8).abs() < 1e-4);
+        let runtime_speed = f32::from_bits(
+            loaded_mission_control_device_tables(&engine)
+                .unwrap()
+                .iter()
+                .find(|table| table.handle == cockpit.handle)
+                .unwrap()
+                .owner_profile
+                .as_ref()
+                .unwrap()
+                .current_words[7],
+        );
+        assert!((runtime_speed - 14.0).abs() < 0.01);
+        assert!(((x1 - x0).hypot(y1 - y0) - runtime_speed * 0.1).abs() < 1e-4);
         let ground = |xy| {
             loaded_terrain(&engine)
                 .unwrap()
@@ -18034,7 +18046,7 @@ mod tests {
             pose(&frame_with_player_motion(&mut engine, 400, cockpit, slow_frame, false).unwrap())
                 .position
                 .map(f32::from_bits);
-        assert!(((x2 - x1).hypot(y2 - y1) - 1.6).abs() < 1e-4);
+        assert!(((x2 - x1).hypot(y2 - y1) - runtime_speed * 0.2).abs() < 1e-4);
         set_transform(&mut engine.world, cockpit.handle, walked).unwrap();
         let mut split = walked;
         for clock_ms in [500, 600] {

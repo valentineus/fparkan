@@ -14070,7 +14070,7 @@ mod tests {
                     &engine,
                     cockpit,
                     PlayerMotion {
-                        movement: [(x - hx) / distance, (y - hy) / distance],
+                        movement: [(x - hx) / distance, (y - hy) / distance * (8.0 / 14.0)],
                         delta_seconds: distance.min(8.0 * 0.292) / 8.0,
                         ..PlayerMotion::default()
                     },

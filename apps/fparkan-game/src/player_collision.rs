@@ -227,7 +227,7 @@ mod tests {
                     &engine,
                     cockpit,
                     PlayerMotion {
-                        movement: [dx * cos + dy * sin, dy * cos - dx * sin],
+                        movement: [dx * cos + dy * sin, (dy * cos - dx * sin) * (8.0 / 14.0)],
                         delta_seconds: distance.min(0.8) / 8.0,
                         ..Default::default()
                     },
@@ -386,7 +386,7 @@ mod tests {
                     &engine,
                     cockpit,
                     PlayerMotion {
-                        movement: [dx * cos + dy * sin, dy * cos - dx * sin],
+                        movement: [dx * cos + dy * sin, (dy * cos - dx * sin) * (8.0 / 14.0)],
                         delta_seconds: distance.min(0.8) / 8.0,
                         ..Default::default()
                     },
