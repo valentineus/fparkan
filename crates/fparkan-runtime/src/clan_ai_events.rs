@@ -1223,10 +1223,18 @@ impl LoadedMissionState {
                             )))
                         }
                         ScriptDispatchSelector::Handler(58) => {
-                            single_dword(&instruction.references, values)
+                            let index = single_dword(&instruction.references, values)
                                 .ok_or("Handler(58) requires a DWORD building index")?;
-                            // shortcut: an unavailable upgrade catalog exposes no eligible buildings.
-                            self.clan_ai_events.log_research_stub(clan, 58, &bundle.script_path);
+                            let owner = OwnerId(clan as u16);
+                            let units = self.mission_events.clan_units(world, owner, false);
+                            let research = vfs.zip(self.clan_ai_events.research_catalogs.get(&clan).map(|catalog| &catalog.table));
+                            if crate::building_upgrade::needs_upgrade_selection(
+                                world, units, &self.object_drafts, &self.build_categories, research, index,
+                                |row| self.free_research.learned.contains(&(owner, row)),
+                            ) {
+                                // shortcut: eligible upgrades still need selection and a builder order.
+                                self.clan_ai_events.log_research_stub(clan, 58, &bundle.script_path);
+                            }
                             Ok(Some(VarSetDefault::Dword(u32::MAX)))
                         }
                         ScriptDispatchSelector::Handler(handler @ (37 | 47 | 67)) => {

@@ -54,6 +54,7 @@ pub use basement_geometry::{
     MissionBasementFootprint,
 };
 mod building_passage;
+mod building_upgrade;
 mod capture_barrier;
 mod clan_ai_events;
 mod clan_area_strength;
