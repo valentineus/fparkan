@@ -358,7 +358,7 @@ impl AutoDemoCombat {
                 let handle = unit.handle;
                 if patrol.is_some_and(|patrol| {
                     patrol.is_shut_down(handle)
-                        || patrol.is_moving_to_destination(handle)
+                        || (!use_weapon_range && patrol.is_moving_to_destination(handle))
                         || patrol.is_leaving_factory(handle)
                 }) {
                     return None;
@@ -1106,9 +1106,10 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
-    fn licensed_stock_defender_fires_at_an_approaching_capturer() {
+    fn licensed_stock_capturer_and_defender_exchange_fire() {
         let mut engine = stock_two_fortresses();
         let defender = mission_object_handle(&engine, OriginalObjectId(17)).unwrap();
+        let capturer = mission_object_handle(&engine, OriginalObjectId(11)).unwrap();
         let before = transform_state(&engine.world, defender).unwrap();
         assert_eq!(mission_guard_fallback_count(&engine), 0);
         assert!(frame(&mut engine, 0)
@@ -1116,25 +1117,44 @@ mod tests {
             .autodemo_combat_events
             .is_empty());
 
+        let mut capturer_fired_while_moving = false;
+        let mut defender_fired = false;
         for tick in 1..=60 * 190 {
+            let before_capturer = transform_state(&engine.world, capturer).ok();
             let result = frame(&mut engine, tick * 1000 / 60).unwrap();
             for event in result.autodemo_combat_events {
                 if let AutoDemoCombatEvent::Shot {
                     shooter, target, ..
                 } = event
                 {
+                    if shooter == capturer {
+                        let patrol = engine
+                            .loaded
+                            .as_ref()
+                            .unwrap()
+                            .unit_patrol
+                            .as_ref()
+                            .unwrap();
+                        let after = transform_state(&engine.world, capturer).unwrap();
+                        capturer_fired_while_moving |= patrol.is_moving_to_destination(capturer)
+                            && before_capturer
+                                .is_some_and(|before| before.position != after.position);
+                    }
                     if shooter == defender {
                         assert_eq!(
                             identity_metadata(&engine.world, target).unwrap().owner_id,
                             Some(OwnerId(1))
                         );
                         assert_eq!(transform_state(&engine.world, defender).unwrap(), before);
-                        return;
+                        defender_fired = true;
                     }
                 }
             }
+            if capturer_fired_while_moving && defender_fired {
+                return;
+            }
         }
-        panic!("the stock defender never fired at the enemy approach");
+        panic!("expected both sides to fire (moving={capturer_fired_while_moving}, defender={defender_fired})");
     }
 
     #[test]
