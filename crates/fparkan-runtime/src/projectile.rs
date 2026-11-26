@@ -1,13 +1,10 @@
 use crate::{
-    apply_loaded_mission_control_node_delta, ControlResourceAccessError, Engine, MissionAssets,
-    MissionControlNodeProviderTableStatus, TerrainWorld, CONTROL_CLASS_SOURCE_BULL,
-    UNIT_DAT_CONTROL_CLASS_HIGH_BIT,
+    apply_loaded_mission_control_node_delta,
+    projectile_parts::{chassis_part_contact, root_model, root_triangle_hit},
+    ControlResourceAccessError, Engine, MissionAssets, MissionControlNodeProviderTableStatus,
+    TerrainWorld, CONTROL_CLASS_SOURCE_BULL, UNIT_DAT_CONTROL_CLASS_HIGH_BIT,
 };
-use fparkan_assets::{AssetManager, PreparedModel};
-use fparkan_msh::{
-    node38_fallback_hierarchy, query_slot_segment, selected_slot, Group, Lod, NodeId,
-    SegmentQueryMasks,
-};
+use fparkan_assets::AssetManager;
 use fparkan_prototype::{resolve_prototype_all, PrototypeSource};
 use fparkan_render::LegacyIron3dEulerTransform;
 use fparkan_resource::{resource_name, CachedResourceRepository};
@@ -178,8 +175,28 @@ pub struct ProjectileContact {
     pub fraction: f32,
     /// World point on the segment at the detected contact.
     pub position: [f32; 3],
-    /// Provider row identified by a building triangle hit.
-    pub building_node: Option<u32>,
+    /// Provider row identified by a triangle hit, if its geometry was projected.
+    pub node: Option<ProjectileNode>,
+}
+
+/// Control node hit by a projectile's segment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProjectileNode {
+    /// A node of the building model.
+    Building(u32),
+    /// A node of the warbot's chassis model.
+    Chassis(u32),
+}
+
+impl ProjectileContact {
+    /// Provider key for a building hit, for callers that only track structures.
+    pub fn building_node(self) -> Option<u32> {
+        if let Some(ProjectileNode::Building(key)) = self.node {
+            Some(key)
+        } else {
+            None
+        }
+    }
 }
 
 /// Finds the first unit or building intersected by this flight segment.
@@ -190,7 +207,6 @@ pub fn projectile_unit_hit(
 ) -> Option<ProjectileContact> {
     let mission = engine.loaded.as_ref()?;
     let passenger = mission.boarding.map(|boarding| boarding.hero.handle);
-    // shortcut: root MSH sphere until combat uses the per-node hull query.
     mission
         .object_drafts
         .iter()
@@ -209,10 +225,20 @@ pub fn projectile_unit_hit(
             let state = transform_state(&engine.world, handle).ok()?;
             let (center, radius) = unit_sphere(&mission.mission_assets, index, state)?;
             let sphere_fraction = segment_sphere_fraction(segment, center, radius)?;
-            let (fraction, building_node) = if building {
+            let (fraction, node) = if building {
                 let (fraction, node) =
-                    building_triangle_hit(&mission.mission_assets, index, state, segment)?;
-                (fraction, Some(node))
+                    root_triangle_hit(&mission.mission_assets, index, state, segment, |_| true)?;
+                (fraction, Some(ProjectileNode::Building(node)))
+            } else if class == super::boarding::WARBOT_CLASS {
+                chassis_part_contact(
+                    mission,
+                    index,
+                    handle,
+                    state,
+                    segment,
+                    (center, radius),
+                    sphere_fraction,
+                )?
             } else {
                 (sphere_fraction, None)
             };
@@ -222,7 +248,7 @@ pub fn projectile_unit_hit(
                 position: std::array::from_fn(|axis| {
                     segment[0][axis] + (segment[1][axis] - segment[0][axis]) * fraction
                 }),
-                building_node,
+                node,
             })
         })
         .min_by(|a, b| a.fraction.total_cmp(&b.fraction))
@@ -244,68 +270,6 @@ pub(super) fn unit_sphere(
     Some((center, radius))
 }
 
-fn root_model(assets: &MissionAssets, index: usize) -> Option<&PreparedModel> {
-    let visual = assets.visual_by_id(*assets.visuals_for_object(index).first()?)?;
-    assets.model_by_id(visual.model_id?)
-}
-
-fn building_triangle_hit(
-    assets: &MissionAssets,
-    index: usize,
-    state: fparkan_world::TransformState,
-    segment: [[f32; 3]; 2],
-) -> Option<(f32, u32)> {
-    let model = &root_model(assets, index)?.validated;
-    let root = LegacyIron3dEulerTransform {
-        translation: state.position.map(f32::from_bits),
-        orientation_radians: state.orientation.map(f32::from_bits),
-    }
-    .try_row_major()?;
-    let scale = state.scale.map(f32::from_bits);
-    let mut body_segment = segment;
-    for (local, point) in body_segment.iter_mut().zip(segment) {
-        let [x, y, z] = [point[0] - root[3], point[1] - root[7], point[2] - root[11]];
-        for i in 0..3 {
-            local[i] = (root[i] * x + root[i + 4] * y + root[i + 8] * z) / scale[i];
-        }
-    }
-    // shortcut: use root MSH fallback poses until combat shares live component transforms.
-    let poses = node38_fallback_hierarchy(model)?;
-    let squared_length: f32 = (0..3)
-        .map(|i| (segment[1][i] - segment[0][i]).powi(2))
-        .sum();
-    if squared_length == 0.0 {
-        return None;
-    }
-    poses
-        .poses
-        .into_iter()
-        .enumerate()
-        .filter_map(|(i, pose)| {
-            let node = NodeId(u32::try_from(i).ok()?);
-            let slot = selected_slot(model, node, Lod(0), Group(0))?;
-            let mut inverse = pose;
-            inverse.translation = [0.0; 3];
-            for component in &mut inverse.rotation[..3] {
-                *component = -*component;
-            }
-            let endpoints = body_segment.map(|point| {
-                inverse.transform_point(std::array::from_fn(|axis| {
-                    point[axis] - pose.translation[axis]
-                }))
-            });
-            let hit =
-                query_slot_segment(model, node, slot, endpoints, SegmentQueryMasks::default())
-                    .ok()??;
-            let body_hit = pose.transform_point(hit.position);
-            let distance: f32 = (0..3)
-                .map(|axis| ((body_hit[axis] - body_segment[0][axis]) * scale[axis]).powi(2))
-                .sum();
-            Some(((distance / squared_length).sqrt(), node.0))
-        })
-        .min_by(|a, b| a.0.total_cmp(&b.0))
-}
-
 /// Applies projectile damage to the contacted part of a building or unit.
 pub fn apply_projectile_contact(
     engine: &mut Engine,
@@ -322,8 +286,11 @@ pub fn apply_projectile_contact(
         volume,
         table.and_then(|table| table.projectile_resistance_bits),
     );
-    let Some(key) = contact.building_node else {
-        return apply_projectile_hit(engine, contact.handle, volume);
+    let key = match contact.node {
+        None | Some(ProjectileNode::Chassis(0)) => {
+            return apply_projectile_hit(engine, contact.handle, volume);
+        }
+        Some(ProjectileNode::Chassis(key) | ProjectileNode::Building(key)) => key,
     };
     let row = table.and_then(|table| super::control_node_provider_row(table, key).ok());
     let Some(row) = row else {
@@ -338,9 +305,15 @@ pub fn apply_projectile_contact(
     {
         return Ok(None);
     }
+    if volume >= remaining
+        && matches!(contact.node, Some(ProjectileNode::Chassis(_)))
+        && row.current_flags.is_some_and(|flags| flags & 1 != 0)
+    {
+        return destroy_projectile_target(engine, contact.handle).map(Some);
+    }
     // shortcut: feed the projectile NDP volume into the native reduction while impact falloff is open.
     let effect = (volume >= remaining && engine.destruction_effects.is_some())
-        .then(|| super::destruction::building_part_effect(row, contact.position))
+        .then(|| super::destruction::part_effect(row, contact.position))
         .flatten();
     let updated = apply_loaded_mission_control_node_delta(engine, contact.handle, key, -volume)?;
     if updated.is_some() {
@@ -399,20 +372,99 @@ pub fn apply_projectile_hit(
     // shortcut: use the projectile provider volume directly, with immediate
     // removal on root depletion until native damage and death timing are wired.
     if volume >= remaining {
-        let effect = super::destruction::pending_effect(engine, handle);
-        request_delete(&mut engine.world, handle).map_err(ControlResourceAccessError::World)?;
-        if let (Some(effect), Some(events)) = (effect, engine.destruction_effects.as_mut()) {
-            events.push(effect);
-        }
-        return Ok(Some((0.0, true)));
+        return destroy_projectile_target(engine, handle).map(Some);
     }
     apply_loaded_mission_control_node_delta(engine, handle, 0, -volume)?;
     Ok(Some((remaining - volume, false)))
 }
 
+fn destroy_projectile_target(
+    engine: &mut Engine,
+    handle: ObjectHandle,
+) -> Result<(f32, bool), ControlResourceAccessError> {
+    let effect = super::destruction::pending_effect(engine, handle);
+    request_delete(&mut engine.world, handle).map_err(ControlResourceAccessError::World)?;
+    if let (Some(effect), Some(events)) = (effect, engine.destruction_effects.as_mut()) {
+        events.push(effect);
+    }
+    Ok((0.0, true))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_chassis_node_takes_damage_without_destroying_the_warbot() {
+        use crate::{
+            collect_unit_destruction_effects, create, load_gameplay_mission, starting_cockpit,
+            take_unit_destruction_effects, EngineServices, MissionMode, MissionRequest,
+            MissionStartupInput,
+        };
+        use fparkan_vfs::DirectoryVfs;
+        use fparkan_world::OriginalObjectId;
+
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed corpus");
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Single.01/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        let shooter = starting_cockpit(&engine).unwrap().handle;
+        let target = handle_by_original_id(&engine.world, OriginalObjectId(14)).unwrap();
+        let mission = engine.loaded.as_ref().unwrap();
+        let pose = transform_state(&engine.world, target).unwrap();
+        let ([x, y, z], radius) = unit_sphere(&mission.mission_assets, 14, pose).unwrap();
+        let (contact, node) = (-4..=4)
+            .flat_map(|y_offset| (-4..=4).map(move |z_offset| (y_offset, z_offset)))
+            .find_map(|(y_offset, z_offset)| {
+                let y = y + y_offset as f32 * radius / 5.0;
+                let z = z + z_offset as f32 * radius / 5.0;
+                let segment = [[x - 2.0 * radius, y, z], [x + 2.0 * radius, y, z]];
+                let hit = projectile_unit_hit(&engine, shooter, segment)?;
+                let Some(ProjectileNode::Chassis(node @ 2..=9)) = hit.node else {
+                    return None;
+                };
+                (hit.handle == target).then_some((hit, node))
+            })
+            .expect("a side shot intersects a chassis part of the stock heavy warbot");
+        let amount = |engine: &Engine, key| {
+            let table = engine
+                .loaded
+                .as_ref()
+                .unwrap()
+                .control_device_tables
+                .iter()
+                .find(|table| table.handle == target)
+                .unwrap();
+            crate::control_node_provider_row(table, key)
+                .unwrap()
+                .current_amount_bits
+        };
+        let root_before = amount(&engine, 0);
+        assert!(f32::from_bits(amount(&engine, node)) > 0.0);
+        collect_unit_destruction_effects(&mut engine);
+        assert_eq!(
+            apply_projectile_contact(&mut engine, contact, f32::MAX).unwrap(),
+            Some((0.0, false))
+        );
+        assert_eq!(amount(&engine, node), 0.0_f32.to_bits());
+        assert_eq!(amount(&engine, 0), root_before);
+        assert!(transform_state(&engine.world, target).is_ok());
+        let effects = take_unit_destruction_effects(&mut engine);
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].position, contact.position);
+    }
 
     #[test]
     #[ignore = "requires licensed corpus"]
@@ -445,7 +497,7 @@ mod tests {
             handle: plant,
             fraction: 0.5,
             position: [1300.0, 627.0, 84.0],
-            building_node: Some(3),
+            node: Some(ProjectileNode::Building(3)),
         };
         collect_unit_destruction_effects(&mut engine);
         assert_eq!(

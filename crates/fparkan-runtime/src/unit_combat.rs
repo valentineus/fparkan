@@ -436,7 +436,7 @@ impl AutoDemoCombat {
                         });
                     }
                     Some(Ok(Some((remaining, false)))) => {
-                        if let Some(node) = hit.building_node {
+                        if let Some(node) = hit.building_node() {
                             events.push(AutoDemoCombatEvent::BuildingHit {
                                 shooter: flight.shooter,
                                 target: hit.handle,
@@ -453,7 +453,7 @@ impl AutoDemoCombat {
                             Some(Err(_)) => "damage_error",
                         };
                         if self.report.unavailable(flight.shooter_identity, reason, now, 1) {
-                            eprintln!("unit_combat_contact object={} target={target} target_id={:?} node={:?} result={result:?}", flight.shooter_identity, target.original_id, hit.building_node);
+                            eprintln!("unit_combat_contact object={} target={target} target_id={:?} node={:?} result={result:?}", flight.shooter_identity, target.original_id, hit.node);
                         }
                     }
                 }

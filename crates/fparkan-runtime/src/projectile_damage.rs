@@ -73,7 +73,7 @@ mod tests {
                 .unwrap()
                 .position
                 .map(f32::from_bits),
-            building_node: None,
+            node: None,
         };
         assert_eq!(
             apply_projectile_contact(&mut engine, contact, 235.0).unwrap(),

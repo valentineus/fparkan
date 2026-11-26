@@ -32,7 +32,7 @@ pub fn take_unit_destruction_effects(engine: &mut Engine) -> Vec<UnitDestruction
         .unwrap_or_default()
 }
 
-/// Explosion descriptors for prepared mobile chassis and damageable building parts.
+/// Explosion descriptors for prepared chassis roots and damageable model parts.
 pub fn unit_destruction_effect_sources(
     engine: &Engine,
 ) -> impl Iterator<Item = (String, String)> + '_ {
@@ -54,6 +54,8 @@ pub fn unit_destruction_effect_sources(
                 };
                 Some(if class & UNIT_DAT_CONTROL_CLASS_HIGH_BIT != 0 {
                     rows.as_slice()
+                } else if class == super::boarding::WARBOT_CLASS {
+                    &rows[..rows.partition_point(|row| row.unit_component_index == 0)]
                 } else if class & MOBILE_UNIT != 0 {
                     rows.get(..1).unwrap_or_default()
                 } else {
@@ -64,7 +66,7 @@ pub fn unit_destruction_effect_sources(
     })
 }
 
-pub(super) fn building_part_effect(
+pub(super) fn part_effect(
     row: &MissionControlNodeProviderRow,
     position: [f32; 3],
 ) -> Option<UnitDestructionEffect> {

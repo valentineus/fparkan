@@ -102,6 +102,7 @@ mod player_weapon;
 mod production;
 mod projectile;
 mod projectile_damage;
+mod projectile_parts;
 mod repair_zone;
 mod research;
 mod resource_distribution;
@@ -157,7 +158,7 @@ pub use production::{
 };
 pub use projectile::{
     apply_projectile_contact, apply_projectile_hit, load_player_projectile, projectile_terrain_hit,
-    projectile_unit_hit, PlayerProjectile, ProjectileAssets, ProjectileContact,
+    projectile_unit_hit, PlayerProjectile, ProjectileAssets, ProjectileContact, ProjectileNode,
 };
 pub use research::order_lab_research;
 pub use unit_combat::{AutoDemoCombatEvent, AutoDemoProjectileType, FiringEffectInstance};

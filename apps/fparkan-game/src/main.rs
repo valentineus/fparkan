@@ -10644,7 +10644,7 @@ impl StaticVulkanApp {
                                 "sim_coverage player_projectile_target_stub=1 target={} result={outcome:?}", hit.handle.slot,
                             ),
                         }
-                        if hit.building_node.is_some() {
+                        if hit.building_node().is_some() {
                             "building"
                         } else {
                             "unit"
