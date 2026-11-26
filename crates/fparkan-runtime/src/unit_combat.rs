@@ -3,7 +3,7 @@ use super::{
     autodemo::MOBILE_UNIT,
     combat_report::{CombatObject, CombatReport},
     player_weapon::prepare_unit_weapons,
-    projectile::{load_projectile, segment_sphere_fraction, unit_sphere},
+    projectile::{load_projectile, segment_sphere_fraction, unit_sphere, ANIMAL_UNIT_CLASS},
     projectile_terrain_hit, projectile_unit_hit,
     turret_aim::{hull_local_point, TurretAim},
     unit_patrol::UnitPatrol,
@@ -164,10 +164,8 @@ impl AutoDemoCombat {
             unavailable: 0,
         };
         for (index, (draft, &handle)) in drafts.iter().zip(handles).enumerate() {
-            if !draft
-                .unit_dat_header_flags
-                .is_some_and(|class| class & MOBILE_UNIT != 0)
-            {
+            let class = draft.unit_dat_header_flags.unwrap_or(0);
+            if class & MOBILE_UNIT == 0 && class != ANIMAL_UNIT_CLASS {
                 continue;
             }
             let object = CombatObject {
@@ -181,6 +179,9 @@ impl AutoDemoCombat {
                     .get(index)
                     .map_or(&[], Vec::as_slice),
             );
+            if class == ANIMAL_UNIT_CLASS && weapons.weapons().is_empty() {
+                continue;
+            }
             let slots = weapons
                 .weapons()
                 .iter()
@@ -505,12 +506,14 @@ impl AutoDemoCombat {
                 .is_some_and(|boarding| boarding.cockpit.handle == unit.handle);
             // shortcut: free warbots defend from their current position until the
             // default Behavior task and its pursuit rules are wired.
-            let warbot = mission.object_drafts[unit.index].unit_dat_header_flags
-                == Some(super::boarding::WARBOT_CLASS);
+            let defends_from_position = matches!(
+                mission.object_drafts[unit.index].unit_dat_header_flags,
+                Some(super::boarding::WARBOT_CLASS | ANIMAL_UNIT_CLASS)
+            );
             let eligible = !manually_controlled
                 && (mission.script_host_mode != super::MissionMode::SingleMission
                     || guard
-                    || warbot
+                    || defends_from_position
                     || mission
                         .unit_patrol
                         .as_ref()
@@ -707,6 +710,65 @@ mod tests {
         )
         .unwrap();
         engine
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_constructor_animal_fires_at_a_nearby_hero() {
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed corpus");
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.02/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(frame(&mut engine, 0)
+            .unwrap()
+            .autodemo_combat_events
+            .is_empty());
+
+        let hero = starting_cockpit(&engine).unwrap().handle;
+        let animal = mission_object_handle(&engine, OriginalObjectId(2)).unwrap();
+        let [x, y, z] = transform_state(&engine.world, animal)
+            .unwrap()
+            .position
+            .map(f32::from_bits);
+        let mut pose = transform_state(&engine.world, hero).unwrap();
+        pose.position = [x + 24.0, y, z + 6.0].map(f32::to_bits);
+        set_transform(&mut engine.world, hero, pose).unwrap();
+        let mut fired = false;
+        for now in (50..=1_500).step_by(50) {
+            let result = frame(&mut engine, now).unwrap();
+            fired |= result.autodemo_combat_events.iter().any(|event| {
+                let AutoDemoCombatEvent::Shot {
+                    shooter,
+                    target,
+                    projectile,
+                    ..
+                } = *event
+                else {
+                    return false;
+                };
+                shooter == animal
+                    && target == hero
+                    && engine.autodemo_combat.as_ref().unwrap().projectiles[projectile].name
+                        == "ba_a_03"
+            });
+            if fired
+                && player_status(&engine, hero).and_then(|status| status.health_percent) == Some(30)
+            {
+                return;
+            }
+        }
+        panic!("the stock animal must fire its projectile and damage the hero (fired={fired})");
     }
 
     #[test]

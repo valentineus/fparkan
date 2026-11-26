@@ -2681,18 +2681,24 @@ node_provider_distribution_suspended: false,
                         event.name_raw == b"Problems0\0" && !event.instructions.is_empty()
                     })
             });
-    let autodemo_combat = (unit_patrol.is_some() || guard_clans.contains(&true) || periodic_ai)
-        .then(|| {
-            unit_combat::AutoDemoCombat::new(
-                &vfs,
-                &mission,
-                &object_drafts,
-                &handles,
-                &mission_assets,
-                reserve_start,
-                guard_clans,
-            )
-        });
+    let animals = options.start_autodemo
+        && object_drafts[..reserve_start]
+            .iter()
+            .any(|draft| draft.unit_dat_header_flags == Some(projectile::ANIMAL_UNIT_CLASS));
+    let autodemo_combat =
+        (unit_patrol.is_some() || guard_clans.contains(&true) || periodic_ai || animals).then(
+            || {
+                unit_combat::AutoDemoCombat::new(
+                    &vfs,
+                    &mission,
+                    &object_drafts,
+                    &handles,
+                    &mission_assets,
+                    reserve_start,
+                    guard_clans,
+                )
+            },
+        );
     for &handle in &handles[reserve_start..] {
         fparkan_world::request_delete(&mut new_runtime_world, handle)?;
     }

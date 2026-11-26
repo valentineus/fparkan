@@ -271,7 +271,8 @@ fn prepare_weapons(
                     let muzzle = points.points.get(row.raw_parameters[1] as usize)?;
                     let rate = f32::from_bits(row.raw_parameters[2]);
                     if muzzle.raw_signed_field_04 < 0
-                        || muzzle.raw_signed_field_04 != muzzle.raw_signed_field_08
+                        || (muzzle.raw_signed_field_08 != -1
+                            && muzzle.raw_signed_field_04 != muzzle.raw_signed_field_08)
                         || !rate.is_finite()
                         || rate <= 0.0
                         || row.flags & 1 != 0

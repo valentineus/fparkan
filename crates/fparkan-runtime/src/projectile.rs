@@ -16,7 +16,7 @@ use fparkan_vfs::Vfs;
 use fparkan_world::{handle_by_original_id, request_delete, transform_state, ObjectHandle};
 use std::sync::Arc;
 
-const ANIMAL_UNIT_CLASS: u32 = 0x2000_0000;
+pub(super) const ANIMAL_UNIT_CLASS: u32 = 0x2000_0000;
 
 /// Prepared visuals and travel parameters for one projectile prototype.
 pub struct ProjectileAssets {
