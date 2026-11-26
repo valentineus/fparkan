@@ -1028,8 +1028,12 @@ impl LoadedMissionState {
                                 capturer = crate::clan_targeting::nearest_capturer(
                                     &self.mission, &self.object_drafts, &self.mission_events,
                                     world, OwnerId(clan as u16), target, |handle| {
-                                        !self.clan_ai_events.unit_assigned(handle)
-                                            && self.unit_patrol.as_ref().is_none_or(|patrol| !patrol.is_shut_down(handle))
+                                        if self.clan_ai_events.unit_assigned(handle)
+                                            || self.unit_patrol.as_ref().is_some_and(|patrol| patrol.is_shut_down(handle))
+                                        {
+                                            return None;
+                                        }
+                                        self.control_device_tables.iter().find(|table| table.handle == handle)
                                     },
                                 );
                                 let id = capturer.map_or(u32::MAX, |unit| unit.id);

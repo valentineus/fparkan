@@ -107,25 +107,24 @@ fn at_platform([x, y, z]: [f32; 3], [tx, ty, tz]: [f32; 3]) -> bool {
     (x - tx).hypot(y - ty) <= 0.05 && (z - tz).abs() <= 2.0
 }
 
-pub(super) fn nearest_capturer(
+pub(super) fn nearest_capturer<'a>(
     mission: &MissionDocument,
     drafts: &[MissionObjectDraft],
     roster: &crate::mission_events::MissionEvents,
     world: &World,
     owner: OwnerId,
     target_id: u32,
-    available: impl Fn(ObjectHandle) -> bool,
+    available_control: impl Fn(ObjectHandle) -> Option<&'a MissionControlDeviceTableState>,
 ) -> Option<Capturer> {
     let target = crate::mission_events::placed_logic_objects(mission, world, target_id).next()?;
     let point = transform_state(world, target)
         .ok()?
         .position
         .map(f32::from_bits);
-    // shortcut: all routed robots currently share one speed, so travel time ranks by XY distance.
     roster
         .clan_units(world, owner, true)
-        .filter(|&handle| available(handle))
         .filter_map(|handle| {
+            let profile = available_control(handle)?.owner_profile.as_ref()?;
             let original_id = identity_metadata(world, handle).ok()?.original_id?.0;
             let index = original_id as usize;
             let chassis = drafts.get(index)?.unit_components.first()?;
@@ -136,7 +135,8 @@ pub(super) fn nearest_capturer(
                 .ok()?
                 .position
                 .map(f32::from_bits);
-            let distance = (point[0] - position[0]).hypot(point[1] - position[1]);
+            let score =
+                capture_arrival_score(position, point, f32::from_bits(profile.current_words[7]))?;
             // shortcut: generated ID is local to this script section until native robot IDs are allocated.
             let id = mission
                 .objects
@@ -149,11 +149,24 @@ pub(super) fn nearest_capturer(
                     id,
                     target_id,
                 },
-                distance,
+                score,
             ))
         })
         .min_by(|(_, a), (_, b)| a.total_cmp(b))
         .map(|(unit, _)| unit)
+}
+
+fn capture_arrival_score([x, y, _]: [f32; 3], [tx, ty, _]: [f32; 3], speed: f32) -> Option<f32> {
+    if !speed.is_finite() || speed <= 1.0 {
+        return None;
+    }
+    let distance = (tx - x).hypot(ty - y);
+    let score = if distance <= speed {
+        0.0
+    } else {
+        distance / speed
+    };
+    (score < 1e9).then_some(score)
 }
 
 pub(super) fn encode_strength(strength: f32) -> f32 {
@@ -456,6 +469,18 @@ fn building_priority(class: u32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_arrival_uses_the_live_speed_and_scores_a_one_second_approach_as_zero() {
+        let score = |x, speed| capture_arrival_score([x, 0.0, 800.0], [0.0; 3], speed);
+        assert_eq!(score(20.0, 2.0), Some(10.0));
+        assert_eq!(score(30.0, 10.0), Some(3.0));
+        assert_eq!(score(7.0, 9.0), Some(0.0));
+        assert_eq!(score(2.0, 3.0), Some(0.0));
+        assert_eq!(score(3.0, 3.0), Some(0.0));
+        assert_eq!(score(0.0, 1.0), None);
+        assert_eq!(score(0.0, 0.5), None);
+    }
 
     #[test]
     fn defence_selects_the_smallest_strength_and_keeps_the_first_tie() {
