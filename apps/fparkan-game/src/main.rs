@@ -22,6 +22,7 @@ mod player_collision;
 mod player_fire;
 mod projectile_render;
 mod projectile_trail;
+mod shield_effects;
 mod shot_sound;
 use projectile_render::{prepare_projectile_draw, ProjectileDraw};
 mod script_coverage;
@@ -6851,21 +6852,31 @@ fn apply_ambient_effect_material_tints(
             .iter()
             .find_map(|slot| ambient_effect_range_for(slot, update.range_index))
             .ok_or_else(|| "ambient FX draw range has no owning slot".to_string())?;
-        let material = active_materials
-            .get(&update.range_index)
-            .ok_or_else(|| "ambient FX draw range has no active MAT0 phase".to_string())?;
-        let vertex_rgb = ambient_effect_vertex_rgb(update.command_rgb, material.additive_rgb);
-        let end = range
-            .vertex_start
-            .checked_add(range.vertex_capacity)
-            .ok_or_else(|| "ambient FX vertex range overflows".to_string())?;
-        let vertices = mesh
-            .vertices
-            .get_mut(range.vertex_start..end)
-            .ok_or_else(|| "ambient FX vertex allocation is out of bounds".to_string())?;
-        for vertex in vertices {
-            vertex.color = vertex_rgb;
-        }
+        apply_effect_range_tint(mesh, range, update, active_materials)?;
+    }
+    Ok(())
+}
+
+fn apply_effect_range_tint(
+    mesh: &mut VulkanStaticMesh,
+    range: &EnvironmentGpuRange,
+    update: &AmbientEffectGeometryUpdate,
+    active_materials: &HashMap<usize, ActiveMaterialState>,
+) -> Result<(), String> {
+    let material = active_materials
+        .get(&update.range_index)
+        .ok_or_else(|| "FX draw range has no active MAT0 phase".to_string())?;
+    let vertex_rgb = ambient_effect_vertex_rgb(update.command_rgb, material.additive_rgb);
+    let end = range
+        .vertex_start
+        .checked_add(range.vertex_capacity)
+        .ok_or_else(|| "FX vertex range overflows".to_string())?;
+    let vertices = mesh
+        .vertices
+        .get_mut(range.vertex_start..end)
+        .ok_or_else(|| "FX vertex allocation is out of bounds".to_string())?;
+    for vertex in vertices {
+        vertex.color = vertex_rgb;
     }
     Ok(())
 }
@@ -9731,6 +9742,10 @@ fn run_static_vulkan_mode(
         .as_ref()
         .map(|engine| destruction_effects::DestructionEffects::prepare(root, engine, &mut preview))
         .transpose()?;
+    let shield_effects = mission_engine
+        .as_ref()
+        .map(|engine| shield_effects::ShieldEffects::prepare(root, engine, &mut preview))
+        .transpose()?;
     #[cfg(windows)]
     let mission_hints = if mission_engine.is_some() && demo_camera.is_none() {
         mission_hints::MissionHints::load(root, mission, &mut preview)
@@ -9764,8 +9779,17 @@ fn run_static_vulkan_mode(
     app.mission_engine = mission_engine;
     if let Some(engine) = app.mission_engine.as_mut() {
         fparkan_runtime::collect_unit_destruction_effects(engine);
+        fparkan_runtime::collect_shield_impacts(engine);
     }
     app.destruction_effects = destruction_effects;
+    if let Some(effects) = &shield_effects {
+        for index in effects.ranges() {
+            app.world_range_index_counts.remove(&index);
+        }
+        app.world_range_indices
+            .retain(|index| app.world_range_index_counts.contains_key(index));
+    }
+    app.shield_effects = shield_effects;
     #[cfg(windows)]
     {
         if let Some(hints) = &mission_hints {
@@ -9972,6 +9996,7 @@ struct StaticVulkanApp {
     autodemo_draws: Vec<Option<ProjectileDraw>>,
     autonomous_shot_sounds: Vec<Option<Op2SoundCommand>>,
     destruction_effects: Option<destruction_effects::DestructionEffects>,
+    shield_effects: Option<shield_effects::ShieldEffects>,
     player_fire_held: bool,
     player_fire_pressed: bool,
     player_capture_pressed: bool,
@@ -10120,6 +10145,7 @@ impl StaticVulkanApp {
             autodemo_draws: Vec::new(),
             autonomous_shot_sounds: Vec::new(),
             destruction_effects: None,
+            shield_effects: None,
             player_fire_held: false,
             player_fire_pressed: false,
             player_capture_pressed: false,
@@ -11434,7 +11460,7 @@ impl StaticVulkanApp {
             );
             effects.draw_fragments(control_clock_ms, &mut self.mesh, &self.terrain);
         }
-        let effect_updates = update_ambient_effect_geometry(
+        let mut effect_updates = update_ambient_effect_geometry(
             &mut self.ambient_effect_slots,
             &self.component_pose_buffers,
             &mut self.mesh,
@@ -11443,11 +11469,36 @@ impl StaticVulkanApp {
             self.view_camera.position,
         )?;
         let world_sort_keys = self.world_draw_sort_keys(self.view_camera.position)?;
-        let ambient_sort_keys = ambient_effect_draw_sort_keys(
+        let mut ambient_sort_keys = ambient_effect_draw_sort_keys(
             &self.mesh,
             &self.ambient_effect_slots,
             self.view_camera.position,
         )?;
+        let mut shield_updates = Vec::new();
+        if let (Some(engine), Some(effects)) = (&mut self.mission_engine, &mut self.shield_effects)
+        {
+            effects.start(
+                fparkan_runtime::take_shield_impacts(engine),
+                control_clock_ms,
+                self.audio.as_mut(),
+            );
+            shield_updates = effects.sample(
+                control_clock_ms,
+                self.view_camera.position,
+                &mut self.mesh,
+                &mut self.material_animations,
+            )?;
+            for update in shield_updates
+                .iter()
+                .filter(|update| update.index_count > 0)
+            {
+                let range = update.range_index;
+                ambient_sort_keys.push((
+                    range,
+                    first_indexed_vertex_distance(&self.mesh, range, self.view_camera.position)?,
+                ));
+            }
+        }
         if let Some(frame) = &self.mission_frame {
             chassis_animation::update_treads(
                 &mut self.tread_animations,
@@ -11468,6 +11519,10 @@ impl StaticVulkanApp {
             &effect_updates,
             &material_update.active_materials,
         )?;
+        if let Some(effects) = &self.shield_effects {
+            effects.tint(&mut self.mesh, &shield_updates, active_materials)?;
+        }
+        effect_updates.extend(shield_updates);
         let diagnostic_mode = std::env::var("FPARKAN_AMBIENT_FX_DIAGNOSTIC").ok();
         if diagnostic_mode.is_some() {
             let generator_capture_is_final = diagnostic_mode.as_deref() == Some("generator")

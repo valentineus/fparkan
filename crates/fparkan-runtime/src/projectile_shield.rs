@@ -1,11 +1,64 @@
 //! Apply the directional Control field before hull resistance.
 
 use crate::{
-    control_device_budget_coefficient, control_device_selector_zero, projectile::unit_sphere,
-    Engine, MissionControlDeviceTableStatus, ProjectileContact,
+    control_device_budget_coefficient, control_device_selector_zero, fixed_words_ascii_c_string,
+    projectile::unit_sphere, Engine, MissionControlDeviceTableStatus, ProjectileContact,
 };
 use fparkan_render::LegacyIron3dEulerTransform;
 use fparkan_world::transform_state;
+
+/// One shield pulse triggered on the side that intercepted a projectile.
+pub struct ShieldImpact {
+    /// The owning object draft, which determines the effect instance pool.
+    pub object_index: usize,
+    /// Authored archive and resource name of the protection device.
+    pub source: (String, String),
+    /// World matrix centered on the shield and directed toward the contact.
+    pub world_from_effect: [[f32; 4]; 4],
+}
+
+/// Enables collection of transient shield pulses for the presentation layer.
+pub fn collect_shield_impacts(engine: &mut Engine) {
+    engine.shield_impacts = Some(Vec::new());
+}
+
+/// Drains shield pulses accumulated since the last presentation update.
+pub fn take_shield_impacts(engine: &mut Engine) -> Vec<ShieldImpact> {
+    engine
+        .shield_impacts
+        .as_mut()
+        .map_or_else(Vec::new, std::mem::take)
+}
+
+/// Finds authored shield effects for placed units and prepared spawn slots.
+pub fn shield_effect_sources(
+    engine: &Engine,
+) -> impl Iterator<Item = (usize, (String, String))> + '_ {
+    engine.loaded.iter().flat_map(|mission| {
+        mission
+            .mission_assets
+            .object_component_controls
+            .iter()
+            .enumerate()
+            .flat_map(|(object, controls)| {
+                controls.iter().flatten().flat_map(move |control| {
+                    control
+                        .typed_records
+                        .iter()
+                        .filter(|record| record.tag == 9)
+                        .filter_map(move |record| {
+                            Some((object, shield_effect_source(&record.fixed_words)?))
+                        })
+                })
+            })
+    })
+}
+
+fn shield_effect_source(words: &[u32; 44]) -> Option<(String, String)> {
+    let archive = fixed_words_ascii_c_string(&words[27..35])?;
+    let name = fixed_words_ascii_c_string(&words[35..43])?;
+    (!archive.is_empty() && !name.is_empty()).then_some((archive, name))
+}
 
 pub(super) fn absorb(engine: &mut Engine, hit: ProjectileContact, volume: f32) -> f32 {
     if !volume.is_finite() || volume <= 0.0 {
@@ -33,7 +86,7 @@ pub(super) fn absorb(engine: &mut Engine, hit: ProjectileContact, volume: f32) -
     let Ok(pose) = transform_state(&engine.world, hit.handle) else {
         return volume;
     };
-    let Some((center, _)) = unit_sphere(&mission.mission_assets, index, pose) else {
+    let Some((center, radius)) = unit_sphere(&mission.mission_assets, index, pose) else {
         return volume;
     };
     let Some(basis) = (LegacyIron3dEulerTransform {
@@ -76,7 +129,35 @@ pub(super) fn absorb(engine: &mut Engine, hit: ProjectileContact, volume: f32) -
     let updated = (fraction + delta).clamp(0.0, 1.0);
     values[sector] = updated.to_bits();
     deltas[sector] = (f32::from_bits(deltas[sector]) + (updated - fraction)).to_bits();
+    if let Some(impacts) = engine.shield_impacts.as_mut() {
+        if let Some(source) = shield_effect_source(&shield.descriptor.fixed_words) {
+            impacts.push(ShieldImpact {
+                object_index: index,
+                source,
+                world_from_effect: effect_transform(center, offset, radius),
+            });
+        }
+    }
     remaining
+}
+
+fn effect_transform(center: [f32; 3], [x, y, z]: [f32; 3], radius: f32) -> [[f32; 4]; 4] {
+    // Control+0x2c844 builds X from the incident side of the sphere, Y in the
+    // horizontal plane, and Z as their cross product.
+    let horizontal = x.hypot(y);
+    let length = horizontal.hypot(z);
+    let [nx, ny, nz] = [x / length, y / length, z / length];
+    let [tx, ty] = if horizontal > 0.0 {
+        [-y / horizontal, x / horizontal]
+    } else {
+        [1.0, 0.0]
+    };
+    [
+        [radius * nx, radius * tx, -radius * nz * ty, center[0]],
+        [radius * ny, radius * ty, radius * nz * tx, center[1]],
+        [radius * nz, 0.0, radius * (nx * ty - ny * tx), center[2]],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
 }
 
 fn contact_sector([x, y, z]: [f32; 3]) -> Option<usize> {
@@ -171,11 +252,23 @@ mod tests {
                 Some((hit, capacity, table.node_provider_amount_bits?))
             })
             .expect("stock shield with a charged front sector");
+        collect_shield_impacts(&mut engine);
         assert!(
             apply_projectile_contact(&mut engine, contact, capacity * 0.5)
                 .unwrap()
                 .is_none()
         );
+        let impacts = take_shield_impacts(&mut engine);
+        let [impact] = impacts.as_slice() else {
+            panic!("charged sector starts one shield effect");
+        };
+        assert!(shield_effect_sources(&engine)
+            .any(|(object, source)| object == impact.object_index && source == impact.source));
+        assert!(impact
+            .world_from_effect
+            .into_iter()
+            .flatten()
+            .all(f32::is_finite));
         let table = engine
             .loaded
             .as_ref()
@@ -186,6 +279,8 @@ mod tests {
             .unwrap();
         assert_eq!(table.node_provider_amount_bits, Some(health));
         assert!((absorb(&mut engine, contact, capacity * 0.5 + 20.0) - 20.0).abs() < 0.001);
+        assert_eq!(take_shield_impacts(&mut engine).len(), 1);
         assert_eq!(absorb(&mut engine, contact, capacity * 0.5), capacity * 0.5);
+        assert!(take_shield_impacts(&mut engine).is_empty());
     }
 }

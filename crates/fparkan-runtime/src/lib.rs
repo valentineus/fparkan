@@ -104,6 +104,9 @@ mod projectile;
 mod projectile_damage;
 mod projectile_parts;
 mod projectile_shield;
+pub use projectile_shield::{
+    collect_shield_impacts, shield_effect_sources, take_shield_impacts, ShieldImpact,
+};
 mod repair_zone;
 mod research;
 mod resource_distribution;
@@ -1414,6 +1417,7 @@ pub struct Engine {
     autodemo_reinforcements: Option<autodemo::LiveReinforcements>,
     production: Option<production::Production>,
     destruction_effects: Option<Vec<UnitDestructionEffect>>,
+    shield_impacts: Option<Vec<ShieldImpact>>,
 }
 
 struct LoadedMissionState {
@@ -1803,6 +1807,7 @@ pub fn create(services: EngineServices) -> Result<Engine, EngineError> {
         autodemo_reinforcements: None,
         production: None,
         destruction_effects: None,
+        shield_impacts: None,
     })
 }
 
