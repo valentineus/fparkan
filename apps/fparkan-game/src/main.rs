@@ -9951,6 +9951,7 @@ struct StaticVulkanApp {
     player_move_pressed: [bool; PLAYER_MOVEMENT_KEYS.len()],
     mouse_look: bool,
     player_mouse: [f32; 2],
+    player_center_view: bool,
     player_weapon_layouts: HashMap<usize, PlayerWeaponLayout>,
     player_weapon_banks: HashMap<ObjectHandle, PlayerWeapons>,
     projectile_draws: Vec<Option<ProjectileDraw>>,
@@ -10117,6 +10118,7 @@ impl StaticVulkanApp {
             player_move_pressed: Default::default(),
             mouse_look: false,
             player_mouse: [0.0; 2],
+            player_center_view: false,
             player_weapon_layouts: HashMap::new(),
             player_weapon_banks: HashMap::new(),
             projectile_draws: Vec::new(),
@@ -10485,6 +10487,7 @@ impl StaticVulkanApp {
         if let Some(engine) = &self.mission_engine {
             translation[2] += fparkan_runtime::player_walk_camera_lift(engine, cockpit);
         }
+        let [view_yaw, view_pitch] = frame.player_view_offset_bits.map(f32::from_bits);
         let camera = fparkan_render::forward_cockpit_camera(
             LegacyIron3dEulerTransform {
                 translation,
@@ -10493,7 +10496,9 @@ impl StaticVulkanApp {
             state.scale.map(f32::from_bits),
             point,
         )?
-        .with_cockpit_pitch(f32::from_bits(frame.player_pitch_bits))?;
+        .with_cockpit_pitch(f32::from_bits(frame.player_pitch_bits))?
+        .with_cockpit_yaw(view_yaw)?
+        .with_cockpit_pitch(view_pitch)?;
         PreviewCameraFrame::from_legacy_d3d7(
             camera,
             LegacyD3d7Projection {
@@ -10925,6 +10930,7 @@ impl StaticVulkanApp {
         }
         // A held key and accumulated device motion belong to this simulation sample.
         let [mouse_x, mouse_y] = std::mem::take(&mut self.player_mouse);
+        let center_view = std::mem::take(&mut self.player_center_view);
         if let (Some(engine), Some(cockpit), None) =
             (&self.mission_engine, self.cockpit, &self.demo_camera)
         {
@@ -10942,6 +10948,8 @@ impl StaticVulkanApp {
                     climb: climb - descend,
                     mouse_x,
                     mouse_y,
+                    look_around: self.pressed_keys.contains(&KeyCode::ShiftLeft),
+                    center_view,
                     delta_seconds: clock.delta_seconds,
                 },
                 |step| {
@@ -12516,6 +12524,7 @@ impl ApplicationHandler for StaticVulkanApp {
                     self.player_mine_pressed = false;
                     self.player_disembark_pressed = false;
                     self.player_mouse = [0.0; 2];
+                    self.player_center_view = false;
                     self.set_mouse_look(false);
                 } else if self.cockpit.is_some()
                     && self.demo_camera.is_none()
@@ -12625,6 +12634,7 @@ impl ApplicationHandler for StaticVulkanApp {
                         }
                     } else {
                         self.pressed_keys.remove(&code);
+                        self.player_center_view |= code == KeyCode::ShiftLeft;
                     }
                 }
             }
@@ -12643,6 +12653,7 @@ impl ApplicationHandler for StaticVulkanApp {
                     if self.cockpit.is_none() {
                         self.set_mouse_look(state == ElementState::Pressed);
                     } else if state == ElementState::Pressed && !self.mission_paused {
+                        self.player_center_view |= self.pressed_keys.contains(&KeyCode::ShiftLeft);
                         self.set_mouse_look(true);
                     }
                 }
@@ -15958,6 +15969,33 @@ mod tests {
             .any(|(neutral, aimed)| neutral.position != aimed.position));
         app.update_mission_camera(0.016, [800.0, 600.0]).unwrap();
         assert_eq!(app.view_camera.position, moved);
+        let sights_forward = app.view_camera.forward;
+        let turned = plan_player_motion(
+            &engine,
+            cockpit,
+            PlayerMotion {
+                mouse_x: 100.0,
+                look_around: true,
+                ..PlayerMotion::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let frame = frame_with_player_motion(&mut engine, 48, cockpit, turned, false).unwrap();
+        assert_eq!(frame.player_pitch_bits, pitch.to_bits());
+        app.mission_frame = Some(frame);
+        app.update_mission_camera(0.016, [800.0, 600.0]).unwrap();
+        assert_eq!(app.view_camera.position, moved);
+        assert_ne!(app.view_camera.forward, sights_forward);
+
+        let released = plan_player_motion(&engine, cockpit, PlayerMotion::default())
+            .unwrap()
+            .unwrap();
+        let frame = frame_with_player_motion(&mut engine, 64, cockpit, released, false).unwrap();
+        assert_eq!(frame.player_pitch_bits, pitch.to_bits());
+        app.mission_frame = Some(frame);
+        app.update_mission_camera(0.016, [800.0, 600.0]).unwrap();
+        assert_eq!(app.view_camera.forward, sights_forward);
     }
 
     #[test]

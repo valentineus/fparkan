@@ -56,6 +56,10 @@ pub struct PlayerMotion {
     pub mouse_x: f32,
     /// Relative vertical mouse motion for this step, positive down.
     pub mouse_y: f32,
+    /// While held, mouse input turns the cockpit view independently of the weapons.
+    pub look_around: bool,
+    /// Return the cockpit view to the sights, even if free look remains held.
+    pub center_view: bool,
     /// Time spent on this simulation step, excluding time spent paused.
     pub delta_seconds: f32,
 }
@@ -459,7 +463,7 @@ fn plan_player_steps(
         && flight.is_none_or(|drive| input.climb == 0.0 && drive.velocity == [0.0; 3])
         && input.mouse_x == 0.0
         && input.mouse_y == 0.0
-        && (!hero_control || !mission.hero_look.has_state())
+        && !mission.hero_look.has_state()
     {
         return Ok(None);
     }
@@ -471,15 +475,20 @@ fn plan_player_steps(
     {
         return Err(EngineError::Movement("invalid player step".into()));
     }
-    let mut hero_look = hero_control.then_some(mission.hero_look);
+    let mut look = mission.hero_look;
+    let max_angle = hero_profile
+        .map(|words| f32::from_bits(words[11]))
+        .filter(|speed| speed.is_finite() && *speed >= 0.0)
+        .map_or(f32::INFINITY, |speed| speed * input.delta_seconds);
+    let [yaw, blend_delta] = look.advance(
+        [input.mouse_x, input.mouse_y],
+        max_angle,
+        input.look_around,
+        input.center_view,
+    );
     // shortcut: mounted chassis use fixed gains until their bindings are wired.
     let fallback_pitch = || (pitch - input.mouse_y * 0.005).clamp(-1.0, 1.0);
-    let (mut yaw_delta, pitch) = if let Some(look) = hero_look.as_mut() {
-        let max_angle = hero_profile
-            .map(|words| f32::from_bits(words[11]))
-            .filter(|speed| speed.is_finite() && *speed >= 0.0)
-            .map_or(f32::INFINITY, |speed| speed * input.delta_seconds);
-        let [yaw, blend_delta] = look.advance([input.mouse_x, input.mouse_y], max_angle);
+    let (mut yaw_delta, pitch) = if hero_control {
         let next_pitch = || {
             let control = mission
                 .mission_assets
@@ -496,6 +505,8 @@ fn plan_player_steps(
             pitch
         };
         (yaw, pitch)
+    } else if input.look_around {
+        (0.0, pitch)
     } else {
         (
             -input.mouse_x.clamp(-1_000.0, 1_000.0) * 0.003,
@@ -551,7 +562,7 @@ fn plan_player_steps(
             )?;
             step.max_floor_clearance = max_floor_clearance;
             step.hero_walk_velocity = walk.map(|(velocity, _)| velocity);
-            step.hero_look = hero_look;
+            step.hero_look = Some(look);
             match resolve.as_mut() {
                 Some(resolve) => resolve(step),
                 None => Ok((step, false)),
@@ -599,10 +610,14 @@ pub(super) fn commit_motion_state(
         if let Some(velocity) = step.hero_walk_velocity {
             mission.hero_walk_velocity = if blocked { [0.0; 2] } else { velocity };
         }
-        if mission.boarding.is_none() {
-            if let Some(look) = step.hero_look {
-                mission.hero_look = look;
-            }
+    }
+    let active_cockpit = mission.boarding.map_or_else(
+        || mission.local_hero == Some(cockpit.handle),
+        |boarding| boarding.cockpit.handle == cockpit.handle,
+    );
+    if active_cockpit {
+        if let Some(look) = step.hero_look {
+            mission.hero_look = look;
         }
     }
     if let (Some(boarding), Some(velocity)) = (&mut mission.boarding, step.flight_velocity) {

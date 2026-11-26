@@ -25,6 +25,24 @@ impl RawCameraTransform {
         Self::TRANSLATION_WORD_INDICES.map(|index| f32::from_bits(self.words[index]))
     }
 
+    /// Rotates the cockpit view about its up axis, preserving the camera point.
+    #[must_use]
+    pub fn with_cockpit_yaw(mut self, radians: f32) -> Option<Self> {
+        if !radians.is_finite() {
+            return None;
+        }
+        if radians != 0.0 {
+            let (sin, cos) = radians.sin_cos();
+            for row in self.words[..12].chunks_exact_mut(4) {
+                let forward = f32::from_bits(row[0]);
+                let lateral = f32::from_bits(row[1]);
+                row[0] = (forward * cos + lateral * sin).to_bits();
+                row[1] = (lateral * cos - forward * sin).to_bits();
+            }
+        }
+        Some(self)
+    }
+
     /// Rotates a cockpit's forward and up axes about its lateral axis,
     /// preserving the camera point.
     #[must_use]
@@ -645,6 +663,30 @@ mod tests {
         let tilted = tilted.words.map(f32::from_bits);
         assert_eq!(tilted[8], 1.0);
         assert!((tilted[6] + 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn cockpit_offsets_follow_control_camera_axes_in_yaw_then_pitch_order() {
+        use std::f32::consts::{FRAC_1_SQRT_2, FRAC_PI_2, FRAC_PI_4};
+
+        let unit = LegacyIron3dEulerTransform {
+            translation: [20.0, 30.0, 40.0],
+            orientation_radians: [0.0; 3],
+        };
+        let neutral = forward_cockpit_camera(unit, [1.0; 3], [0.0; 3]).unwrap();
+        let looked = neutral
+            .with_cockpit_yaw(-FRAC_PI_2)
+            .unwrap()
+            .with_cockpit_pitch(-FRAC_PI_4)
+            .unwrap();
+        assert_eq!(looked.translation(), neutral.translation());
+        let forward = [0, 4, 8].map(|word| f32::from_bits(looked.words[word]));
+        for (actual, expected) in forward
+            .into_iter()
+            .zip([FRAC_1_SQRT_2, 0.0, -FRAC_1_SQRT_2])
+        {
+            assert!((actual - expected).abs() < 1e-6);
+        }
     }
 
     #[test]

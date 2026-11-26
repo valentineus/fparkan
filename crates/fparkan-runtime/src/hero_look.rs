@@ -1,15 +1,17 @@
 use fparkan_path::{normalize_relative, PathPolicy};
 use fparkan_vfs::Vfs;
-use std::f32::consts::TAU;
+use std::f32::consts::{PI, TAU};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct HeroLook {
     yaw_turns: f32,
     pitch_blend: f32,
+    camera_gain: [f32; 2],
     reverse_y: bool,
     sensitivity: f32,
     filtered: [f32; 2],
     phase: f32,
+    camera_phase: [f32; 2],
 }
 
 impl HeroLook {
@@ -25,6 +27,7 @@ impl HeroLook {
         Self {
             yaw_turns: mouse_binding(
                 &table,
+                "SCAN_NULL",
                 "SCAN_MOUSE_X",
                 "CICLS_UNKNOWN",
                 "MCMD_ANGLE_Z",
@@ -33,31 +36,66 @@ impl HeroLook {
             .unwrap_or(0.15),
             pitch_blend: mouse_binding(
                 &table,
+                "SCAN_NULL",
                 "SCAN_MOUSE_Y",
                 "CICLS_TURRET",
                 "MCMD_ANGLE_Y",
                 "MAN_NOTWRAP",
             )
             .unwrap_or(0.25),
+            camera_gain: [
+                mouse_binding(
+                    &table,
+                    "SCAN_LSHIFT",
+                    "SCAN_MOUSE_X",
+                    "CICLS_CAMERA",
+                    "MCMD_ANGLE_X",
+                    "MAN_WRAP",
+                )
+                .unwrap_or(0.1),
+                mouse_binding(
+                    &table,
+                    "SCAN_LSHIFT",
+                    "SCAN_MOUSE_Y",
+                    "CICLS_CAMERA",
+                    "MCMD_ANGLE_Y",
+                    "MAN_NOTWRAP",
+                )
+                .unwrap_or(0.15),
+            ],
             reverse_y: control_setting(&settings, "MOUSE_REV_Y").unwrap_or(0) != 0,
             sensitivity: control_setting(&settings, "MOUSE_SENS")
                 .map_or(1.0, |value| value as f32 * 0.01),
             filtered: [0.0; 2],
             phase: 0.5,
+            camera_phase: [0.5; 2],
         }
     }
 
     pub(super) fn reset(&mut self) {
         self.filtered = [0.0; 2];
         self.phase = 0.5;
+        self.camera_phase = [0.5; 2];
     }
 
     pub(super) fn has_state(self) -> bool {
-        self.filtered != [0.0; 2] || self.phase != 0.5
+        self.filtered != [0.0; 2] || self.phase != 0.5 || self.camera_phase != [0.5; 2]
+    }
+
+    /// Local yaw and pitch relative to the direction of the sights.
+    pub(super) fn camera_offset(self) -> [f32; 2] {
+        let [x, y] = self.camera_phase;
+        [(0.5 - x) * TAU, (0.5 - y) * PI]
     }
 
     /// Returns delivered yaw in radians and the requested change in turret blend.
-    pub(super) fn advance(&mut self, raw: [f32; 2], max_angle: f32) -> [f32; 2] {
+    pub(super) fn advance(
+        &mut self,
+        raw: [f32; 2],
+        max_angle: f32,
+        look_around: bool,
+        center_view: bool,
+    ) -> [f32; 2] {
         self.filtered = if raw == [0.0; 2] {
             [0.0; 2]
         } else {
@@ -77,15 +115,16 @@ impl HeroLook {
                 scaled
             }
         });
-        if x != 0.0 {
-            let phase = self.phase + x * self.yaw_turns;
-            self.phase = if phase >= 1.0 {
-                phase - 1.0
-            } else if phase <= 0.0 {
-                phase + 1.0
-            } else {
-                phase
-            };
+        let y = if self.reverse_y { -y } else { y };
+        if !look_around || center_view {
+            self.camera_phase = [0.5; 2];
+        } else {
+            let [horizontal, vertical] = self.camera_gain;
+            self.camera_phase[0] = wrap_angle(self.camera_phase[0] + x * horizontal);
+            self.camera_phase[1] = (self.camera_phase[1] + y * vertical).clamp(0.0, 1.0);
+        }
+        if x != 0.0 && !look_around {
+            self.phase = wrap_angle(self.phase + x * self.yaw_turns);
         }
 
         let requested = -(self.phase - 0.5) * TAU;
@@ -95,8 +134,24 @@ impl HeroLook {
         } else {
             (self.phase + delivered * (1.0 / TAU)).rem_euclid(1.0)
         };
-        let pitch = y * self.pitch_blend;
-        [delivered, if self.reverse_y { -pitch } else { pitch }]
+        [
+            delivered,
+            if look_around {
+                0.0
+            } else {
+                y * self.pitch_blend
+            },
+        ]
+    }
+}
+
+fn wrap_angle(phase: f32) -> f32 {
+    if phase >= 1.0 {
+        phase - 1.0
+    } else if phase <= 0.0 {
+        phase + 1.0
+    } else {
+        phase
     }
 }
 
@@ -114,11 +169,18 @@ pub(super) fn turret_pitch(
     Some((target - neutral) * span)
 }
 
-fn mouse_binding(table: &str, axis: &str, class: &str, command: &str, wrap: &str) -> Option<f32> {
+fn mouse_binding(
+    table: &str,
+    modifier: &str,
+    axis: &str,
+    class: &str,
+    command: &str,
+    wrap: &str,
+) -> Option<f32> {
     table.lines().find_map(|line| {
         let line = line.split_once("//").map_or(line, |(binding, _)| binding);
         let mut words = line.split_ascii_whitespace();
-        for name in ["MOUSE", "SCAN_NULL", axis, "1", class, command] {
+        for name in ["MOUSE", modifier, axis, "1", class, command] {
             if !words.next()?.eq_ignore_ascii_case(name) {
                 return None;
             }
@@ -153,10 +215,12 @@ mod tests {
         HeroLook {
             yaw_turns: 0.15,
             pitch_blend: 0.25,
+            camera_gain: [0.1, 0.15],
             reverse_y: true,
             sensitivity: 1.0,
             filtered: [0.0; 2],
             phase: 0.5,
+            camera_phase: [0.5; 2],
         }
     }
 
@@ -171,6 +235,7 @@ MOUSE SCAN_NULL SCAN_MOUSE_Y 1 CICLS_TURRET MCMD_ANGLE_Y 0.30 1 MAN_NOTWRAP 0.0 
         assert_eq!(
             mouse_binding(
                 bindings,
+                "SCAN_NULL",
                 "SCAN_MOUSE_X",
                 "CICLS_UNKNOWN",
                 "MCMD_ANGLE_Z",
@@ -181,6 +246,7 @@ MOUSE SCAN_NULL SCAN_MOUSE_Y 1 CICLS_TURRET MCMD_ANGLE_Y 0.30 1 MAN_NOTWRAP 0.0 
         assert_eq!(
             mouse_binding(
                 bindings,
+                "SCAN_NULL",
                 "SCAN_MOUSE_Y",
                 "CICLS_TURRET",
                 "MCMD_ANGLE_Y",
@@ -198,13 +264,13 @@ MOUSE SCAN_NULL SCAN_MOUSE_Y 1 CICLS_TURRET MCMD_ANGLE_Y 0.30 1 MAN_NOTWRAP 0.0 
         let mut look = stock_look();
         for (dx, expected) in [(100.0, 0.0855), (-100.0, -0.0855), (250.0, 0.15)] {
             look.reset();
-            assert!((look.advance([dx, 0.0], TAU)[0] / -TAU - expected).abs() < 1e-6);
+            assert!((look.advance([dx, 0.0], TAU, false, false)[0] / -TAU - expected).abs() < 1e-6);
         }
         look.reset();
-        look.advance([100.0, 0.0], TAU);
-        assert!((look.advance([0.0, 1.0], TAU)[0] / -TAU - 0.004275).abs() < 1e-6);
+        look.advance([100.0, 0.0], TAU, false, false);
+        assert!((look.advance([0.0, 1.0], TAU, false, false)[0] / -TAU - 0.004275).abs() < 1e-6);
         assert_eq!(look.filtered[0], 4.75);
-        assert_eq!(look.advance([0.0; 2], TAU), [0.0; 2]);
+        assert_eq!(look.advance([0.0; 2], TAU, false, false), [0.0; 2]);
         assert!(!look.has_state());
     }
 
@@ -212,9 +278,9 @@ MOUSE SCAN_NULL SCAN_MOUSE_Y 1 CICLS_TURRET MCMD_ANGLE_Y 0.30 1 MAN_NOTWRAP 0.0 
     fn hero_finishes_a_capped_turn_on_the_next_tick_without_mouse_input() {
         let mut look = stock_look();
         let max_angle = 50.22849 * 0.01;
-        assert!((look.advance([250.0, 0.0], max_angle)[0] + 0.5022847).abs() < 1e-6);
+        assert!((look.advance([250.0, 0.0], max_angle, false, false)[0] + 0.5022847).abs() < 1e-6);
         assert!((look.phase - 0.5700589).abs() < 1e-6);
-        assert!((look.advance([0.0; 2], max_angle)[0] + 0.44019294).abs() < 1e-6);
+        assert!((look.advance([0.0; 2], max_angle, false, false)[0] + 0.44019294).abs() < 1e-6);
         assert!(!look.has_state());
     }
 
@@ -231,20 +297,41 @@ MOUSE SCAN_NULL SCAN_MOUSE_Y 1 CICLS_TURRET MCMD_ANGLE_Y 0.30 1 MAN_NOTWRAP 0.0 
             flags: 0,
         };
         let pitch = |previous, blend| turret_pitch(&row, previous, blend).unwrap().to_degrees();
-        let upward = look.advance([0.0, -100.0], TAU)[1];
+        let upward = look.advance([0.0, -100.0], TAU, false, false)[1];
         assert!((upward - 0.171).abs() < 1e-6);
         assert!((pitch(0.0, upward) - 18.81).abs() < 1e-5);
-        let tail = look.advance([1.0, 0.0], TAU)[1];
+        let tail = look.advance([1.0, 0.0], TAU, false, false)[1];
         assert!((tail - 0.00855).abs() < 1e-6);
 
         look.reset();
-        let downward = look.advance([0.0, 300.0], TAU)[1];
+        let downward = look.advance([0.0, 300.0], TAU, false, false)[1];
         assert_eq!(downward, -0.25);
         assert!((pitch(-25.0_f32.to_radians(), downward) + 30.0).abs() < 1e-5);
         assert!((pitch(70.0_f32.to_radians(), upward) - 80.0).abs() < 1e-5);
 
         look.reset();
         look.reverse_y = false;
-        assert!((look.advance([0.0, 100.0], TAU)[1] - upward).abs() < 1e-6);
+        assert!((look.advance([0.0, 100.0], TAU, false, false)[1] - upward).abs() < 1e-6);
+    }
+
+    #[test]
+    fn shift_routes_motion_to_camera_and_release_or_center_restores_sights() {
+        let mut look = stock_look();
+        assert_eq!(look.advance([100.0, -100.0], TAU, true, false), [0.0; 2]);
+        let [yaw, pitch] = look.camera_offset();
+        assert!((yaw + 0.057 * TAU).abs() < 1e-6);
+        assert!((pitch + 0.1026 * PI).abs() < 1e-6);
+        look.advance([0.0; 2], TAU, true, false);
+        assert_eq!(look.camera_offset(), [yaw, pitch]);
+        look.advance([0.0; 2], TAU, false, false);
+        assert_eq!(look.camera_offset(), [0.0; 2]);
+        assert!(!look.has_state());
+
+        look.camera_phase = [0.99; 2];
+        look.advance([100.0, -100.0], TAU, true, false);
+        assert!((look.camera_phase[0] - 0.047).abs() < 1e-6);
+        assert_eq!(look.camera_phase[1], 1.0);
+        look.advance([100.0, -100.0], TAU, true, true);
+        assert_eq!(look.camera_offset(), [0.0; 2]);
     }
 }

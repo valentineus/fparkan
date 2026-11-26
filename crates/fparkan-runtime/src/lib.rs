@@ -1408,6 +1408,8 @@ pub struct FrameResult {
     pub clan_notices: Vec<MissionNotice>,
     /// Vertical aim of the controlled hero as an IEEE-754 radian value.
     pub player_pitch_bits: u32,
+    /// View-only yaw and pitch relative to the sights, encoded as radians.
+    pub player_view_offset_bits: [u32; 2],
     /// Footstep from the accepted player motion, if this tick reached a footfall.
     pub player_footstep: Option<PlayerFootstep>,
     /// Autonomous combat events during the step.
@@ -2990,6 +2992,9 @@ pub fn step_headless(
             .loaded
             .as_ref()
             .map_or(0, |mission| mission.player_pitch_bits),
+        player_view_offset_bits: engine.loaded.as_ref().map_or([0; 2], |mission| {
+            mission.hero_look.camera_offset().map(f32::to_bits)
+        }),
     })
 }
 
@@ -3045,6 +3050,7 @@ pub fn frame_with_player_motion(
                     motion,
                     blocked || drowned || landing.is_some(),
                 );
+                frame.player_view_offset_bits = mission.hero_look.camera_offset().map(f32::to_bits);
                 if !blocked
                     && !drowned
                     && landing.is_none()
@@ -17987,6 +17993,7 @@ mod tests {
             mouse_x: 100.0,
             mouse_y: -500.0,
             delta_seconds: 0.1,
+            ..Default::default()
         };
         let proposed = plan_player_motion(&engine, cockpit, input)
             .unwrap()
