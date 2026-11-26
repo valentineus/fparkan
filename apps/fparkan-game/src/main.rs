@@ -15879,7 +15879,9 @@ mod tests {
             Some(frame_with_player_motion(&mut engine, 32, cockpit, aimed, false).unwrap());
         app.update_mission_camera(0.016, [800.0, 600.0]).unwrap();
         assert_eq!(app.view_camera.position, moved);
-        assert!((app.view_camera.forward[2] - 0.5_f32.sin()).abs() < 1e-6);
+        let pitch = f32::from_bits(app.mission_frame.as_ref().unwrap().player_pitch_bits);
+        assert!((pitch.abs().to_degrees() - 18.81).abs() < 1e-4);
+        assert!((app.view_camera.forward[2] - pitch.sin()).abs() < 1e-6);
 
         let mut instances = vec![Vec::new(); cockpit.object_index + 1];
         instances[cockpit.object_index].resize_with(cockpit.component_index + 1, || None);
@@ -15934,14 +15936,11 @@ mod tests {
             &mut instances,
             &mut app.component_pose_buffers,
             32,
-            Some((
-                cockpit,
-                f32::from_bits(app.mission_frame.as_ref().unwrap().player_pitch_bits),
-            )),
+            Some((cockpit, pitch)),
         )
         .unwrap();
         assert_ne!(turret_pose(&app, 34).rotation, target.rotation);
-        assert!(target_elevation(turret_pose(&app, 34)) > target_elevation(target));
+        assert!((target_elevation(turret_pose(&app, 34)) - target_elevation(target)) * pitch > 0.0);
         assert_ne!(turret_pose(&app, 12).translation, gun.translation);
         assert_eq!(turret_pose(&app, 1), base);
         let aimed_mesh = geometry_for_turret(

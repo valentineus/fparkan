@@ -1,5 +1,5 @@
 use super::{transform_state, Engine, EngineError, StartingCockpit, SurfaceQuery, TransformState};
-use crate::hero_look::HeroLook;
+use crate::hero_look::{turret_pitch, HeroLook};
 use crate::manual_flight::{FlightDrive, FlightProfile};
 use crate::{hero_walk::WalkingDrive, TerrainWorld};
 use fparkan_resource::CachedResourceRepository;
@@ -472,15 +472,35 @@ fn plan_player_steps(
         return Err(EngineError::Movement("invalid player step".into()));
     }
     let mut hero_look = hero_control.then_some(mission.hero_look);
-    let mut yaw_delta = if let Some(look) = hero_look.as_mut() {
+    // shortcut: mounted chassis use fixed gains until their bindings are wired.
+    let fallback_pitch = || (pitch - input.mouse_y * 0.005).clamp(-1.0, 1.0);
+    let (mut yaw_delta, pitch) = if let Some(look) = hero_look.as_mut() {
         let max_angle = hero_profile
             .map(|words| f32::from_bits(words[11]))
             .filter(|speed| speed.is_finite() && *speed >= 0.0)
             .map_or(f32::INFINITY, |speed| speed * input.delta_seconds);
-        look.advance(input.mouse_x, input.mouse_y, max_angle)
+        let [yaw, blend_delta] = look.advance([input.mouse_x, input.mouse_y], max_angle);
+        let next_pitch = || {
+            let control = mission
+                .mission_assets
+                .object_component_controls
+                .get(cockpit.object_index)?
+                .get(cockpit.component_index)?
+                .as_ref()?;
+            let row = fparkan_assets::turret_elevation_row(control)?;
+            turret_pitch(row, pitch, blend_delta)
+        };
+        let pitch = if blend_delta != 0.0 {
+            next_pitch().unwrap_or_else(fallback_pitch)
+        } else {
+            pitch
+        };
+        (yaw, pitch)
     } else {
-        // shortcut: mounted chassis still use a constant mouse gain.
-        -input.mouse_x.clamp(-1_000.0, 1_000.0) * 0.003
+        (
+            -input.mouse_x.clamp(-1_000.0, 1_000.0) * 0.003,
+            fallback_pitch(),
+        )
     };
     let speeds = if boarded.is_some() && !flying {
         crate::manual_chassis::speed_limits(mission, cockpit.handle)
@@ -514,7 +534,6 @@ fn plan_player_steps(
     input.delta_seconds /= count as f32;
     let mut previous = pose;
     let mut previous_surface = WalkingSurface::Ground;
-    let mut pitch = pitch;
     for index in 0..count {
         let mut propose = |walk: Option<([f32; 2], [f32; 2])>| {
             let ground_displacement = walk.map_or_else(
@@ -561,8 +580,6 @@ fn plan_player_steps(
             return Ok(Some(step));
         }
         yaw_delta = 0.0;
-        input.mouse_y = 0.0;
-        pitch = f32::from_bits(step.pitch_bits);
         previous = step.pose;
         previous_surface = step.surface;
         if let (Some(drive), Some(velocity)) = (walking.as_mut(), step.hero_walk_velocity) {
@@ -618,14 +635,7 @@ fn plan_motion(
     if !input
         .movement
         .into_iter()
-        .chain([
-            input.mouse_y,
-            input.climb,
-            input.delta_seconds,
-            yaw,
-            yaw_delta,
-            pitch,
-        ])
+        .chain([input.climb, input.delta_seconds, yaw, yaw_delta, pitch])
         .chain(from)
         .all(f32::is_finite)
         || input.delta_seconds < 0.0
@@ -698,9 +708,6 @@ fn plan_motion(
             }
         }
     }
-    // shortcut: use a bounded camera aim until the native turret travel and
-    // sensitivity are recovered. The body remains aligned to the terrain.
-    let pitch = (pitch - input.mouse_y * 0.005).clamp(-1.0, 1.0);
     Ok(PlayerMotionStep {
         pose,
         pitch_bits: pitch.to_bits(),

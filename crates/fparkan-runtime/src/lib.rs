@@ -18006,7 +18006,8 @@ mod tests {
         assert_eq!(turned.position, original.position);
         assert_ne!(turned.orientation[2], original.orientation[2]);
         assert_eq!(turned.orientation[..2], original.orientation[..2]);
-        assert_eq!(f32::from_bits(blocked.player_pitch_bits), 1.0);
+        let pitch = f32::from_bits(blocked.player_pitch_bits);
+        assert!((pitch.abs().to_degrees() - 27.5).abs() < 1e-4);
         let movement = PlayerMotion {
             mouse_x: 0.0,
             mouse_y: 0.0,
