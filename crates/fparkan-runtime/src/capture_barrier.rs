@@ -12,6 +12,7 @@ pub(super) struct CaptureBarrier {
     operator: ObjectHandle,
     previous: Option<(u32, [u32; 2])>,
     blend: f32,
+    blend_per_second: f32,
     opening: bool,
 }
 
@@ -33,6 +34,29 @@ fn control(assets: &MissionAssets, index: usize) -> Option<&PreparedComponentCon
         .as_ref()
 }
 
+fn authored_rate(control: &PreparedComponentControl) -> Option<f32> {
+    let mut fields = control
+        .typed_records
+        .iter()
+        .filter(|record| record.tag == 13);
+    let field = fields.next()?;
+    let factor = f32::from_bits(field.fixed_words[9]);
+    // Constant inputs with a phase step small enough for either kind of track.
+    if fields.next().is_some()
+        || field.fixed_words[2] != 0
+        || !factor.is_finite()
+        || factor <= 0.0
+        || 0.45 * factor > 0.5
+    {
+        return None;
+    }
+    let rate = rows(control).try_fold(f32::INFINITY, |slowest, row| {
+        let rate = factor * f32::from_bits(row.raw_parameters[2]);
+        (rate.is_finite() && rate > 0.0).then_some(slowest.min(rate))
+    })?;
+    rate.is_finite().then_some(rate)
+}
+
 impl CaptureBarrier {
     pub(super) fn start(
         assets: &MissionAssets,
@@ -40,12 +64,16 @@ impl CaptureBarrier {
         index: usize,
         operator: ObjectHandle,
     ) -> Option<Self> {
-        rows(control(assets, index)?).next()?;
+        let control = control(assets, index)?;
+        rows(control).next()?;
         Some(Self {
             building,
             operator,
             previous: None,
             blend: 0.0,
+            // shortcut: keep the door rate for unsupported controller inputs.
+            blend_per_second: authored_rate(control)
+                .unwrap_or(crate::building_door::DOOR_BLEND_PER_SECOND),
             opening: false,
         })
     }
@@ -68,8 +96,7 @@ pub(super) fn advance(mission: &mut LoadedMissionState, world: &World, now: u32)
     barrier.opening |= previous_xy != [x, y];
     let direction = if barrier.opening { -1.0 } else { 1.0 };
     let dt = now.wrapping_sub(last) as f32 / 1_000.0;
-    barrier.blend = (barrier.blend + direction * dt * crate::building_door::DOOR_BLEND_PER_SECOND)
-        .clamp(0.0, 1.0);
+    barrier.blend = (barrier.blend + direction * dt * barrier.blend_per_second).clamp(0.0, 1.0);
     if barrier.opening && barrier.blend == 0.0 {
         mission.capture_barrier = None;
     }
@@ -151,6 +178,7 @@ pub(super) fn projectile_contact(
 
 #[cfg(test)]
 mod tests {
+    use super::authored_rate;
     use crate::{
         apply_projectile_contact, capture_building, create, frame, load_gameplay_mission,
         projectile_unit_hit, starting_cockpit, EngineServices, MissionMode, MissionRequest,
@@ -195,8 +223,23 @@ mod tests {
             capture_building(&mut engine, hero).unwrap(),
             Some(OriginalObjectId(0))
         );
+        let control = super::control(&engine.loaded.as_ref().unwrap().mission_assets, 0).unwrap();
+        assert_eq!(authored_rate(control), Some(0.2));
         frame(&mut engine, 1).unwrap();
         frame(&mut engine, 501).unwrap();
+        let blend = |engine: &crate::Engine| {
+            engine
+                .loaded
+                .as_ref()
+                .unwrap()
+                .capture_barrier
+                .as_ref()
+                .unwrap()
+                .blend
+        };
+        assert_eq!(blend(&engine), 0.1);
+        frame(&mut engine, 5001).unwrap();
+        assert_eq!(blend(&engine), 1.0);
         for segment in [forward, backward] {
             let hit = projectile_unit_hit(&engine, hero.handle, segment).expect("field contact");
             assert_eq!(hit.node, Some(ProjectileNode::CaptureBarrier));
@@ -207,7 +250,9 @@ mod tests {
         }
         pose.position[1] = (center[1] + 0.2).to_bits();
         set_transform(&mut engine.world, hero.handle, pose).unwrap();
-        frame(&mut engine, 1001).unwrap();
+        frame(&mut engine, 5501).unwrap();
+        assert_eq!(blend(&engine), 0.9);
+        frame(&mut engine, 10001).unwrap();
         for segment in [forward, backward] {
             assert!(projectile_unit_hit(&engine, hero.handle, segment).is_none());
         }
