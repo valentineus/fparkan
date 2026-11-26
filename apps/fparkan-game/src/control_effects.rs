@@ -9,7 +9,7 @@ use fparkan_runtime::{
 };
 use std::collections::{HashMap, HashSet};
 
-pub(super) fn owner_control_capacity(
+fn owner_control_capacity(
     engine: &Engine,
     roots: &[Option<MissionRenderRoot>],
     index: usize,
@@ -36,6 +36,62 @@ impl From<FiringEffectInstance> for ControlEffectInstanceKey {
 }
 
 impl StaticVulkanApp {
+    pub(super) fn sample_control_effects(
+        &mut self,
+        sample_id: SceneSampleId,
+        clock_ms: u32,
+        manager_flag: bool,
+        player_shots: Vec<FiringEffectInstance>,
+    ) -> (
+        HashMap<ControlEffectInstanceKey, ControlEffectFrameSample>,
+        HashSet<ControlEffectInstanceKey>,
+    ) {
+        let weapon_phases: HashMap<_, _> = self
+            .cockpit
+            .and_then(|cockpit| {
+                let weapons = self.player_weapon_banks.get(&cockpit.handle)?;
+                Some(weapons.firing_effect_phases(cockpit.object_index))
+            })
+            .into_iter()
+            .flatten()
+            .map(|(effect, phase)| (effect.into(), phase))
+            .collect();
+        let mut samples = advance_control_effect_instances(
+            &mut self.control_effect_instance_states,
+            &self.ambient_effect_slots,
+            &self.control_point_light_slots,
+            &self.control_sound_slots,
+            sample_id,
+            clock_ms,
+            manager_flag,
+            |index| {
+                owner_control_capacity(
+                    self.mission_engine.as_ref()?,
+                    &self.mission_render_roots,
+                    index,
+                )
+            },
+            |index| self.motion_effects.provider(index),
+            |key| weapon_phases.get(&key).copied(),
+        );
+        let mut direct_shot_sounds = activate_firing_flashes(
+            &mut samples,
+            &self.ambient_effect_slots,
+            &self.control_point_light_slots,
+            self.mission_frame
+                .as_ref()
+                .map_or(&[][..], |frame| &frame.autodemo_combat_events),
+            player_shots,
+            &weapon_phases,
+        );
+        // Manual weapon audio is already emitted with the projectile.
+        direct_shot_sounds.extend(self.control_sound_slots.iter().filter_map(|sound| {
+            let key = sound.effect.random_instance_key;
+            (sound.effect.time_mode == 4 && weapon_phases.contains_key(&key)).then_some(key)
+        }));
+        (samples, direct_shot_sounds)
+    }
+
     pub(super) fn start_windup_sounds(
         &mut self,
         control_clock_ms: u32,
@@ -103,6 +159,7 @@ pub(super) fn advance_control_effect_instances(
     manager_flag: bool,
     owner_capacity: impl Fn(usize) -> Option<(f32, f32)>,
     owner_motion: impl Fn(usize) -> Option<FxPhaseProvider>,
+    owner_effect_phase: impl Fn(ControlEffectInstanceKey) -> Option<f32>,
 ) -> HashMap<ControlEffectInstanceKey, ControlEffectFrameSample> {
     let mut specifications = HashMap::new();
     for slot in ambient_slots {
@@ -155,6 +212,11 @@ pub(super) fn advance_control_effect_instances(
                             eprintln!("render_coverage control_fx_owner_state_stub=1 (missing Control capacity; instance={key:?} mode={mode})");
                         }
                     }
+                } else if mode == 4 {
+                    if let Some(phase) = owner_effect_phase(key) {
+                        provider.effect_value = phase;
+                        resolved = true;
+                    }
                 } else if matches!(mode, 5 | 15) {
                     if let Some(motion) = owner_motion(key.object_index) {
                         provider = motion;
@@ -191,12 +253,13 @@ pub(super) fn advance_control_effect_instances(
         .collect()
 }
 
-pub(super) fn activate_firing_flashes(
+fn activate_firing_flashes(
     samples: &mut HashMap<ControlEffectInstanceKey, ControlEffectFrameSample>,
     ambient_slots: &[AmbientEffectGpuSlot],
     point_light_slots: &[ControlEffectSlot],
     events: &[AutoDemoCombatEvent],
     player_effects: Vec<FiringEffectInstance>,
+    weapon_phases: &HashMap<ControlEffectInstanceKey, f32>,
 ) -> HashSet<ControlEffectInstanceKey> {
     let autonomous_effects = events.iter().filter_map(|event| match *event {
         AutoDemoCombatEvent::Shot {
@@ -219,10 +282,11 @@ pub(super) fn activate_firing_flashes(
                 return None;
             }
             let sample = samples.get_mut(&key)?;
-            // shortcut: the release occurs at the midpoint of the weapon cycle.
-            // Keep the flash to this snapshot until the full effect phase is wired.
-            sample.phase = Some(0.5);
-            sample.elapsed_seconds = 0.0;
+            if !weapon_phases.contains_key(&key) {
+                // shortcut: a shot supplies one visual sample when the bound node is unavailable.
+                sample.phase = Some(0.5);
+                sample.elapsed_seconds = 0.0;
+            }
             Some(key)
         })
         .collect()

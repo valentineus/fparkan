@@ -9,16 +9,15 @@ mod chassis_animation;
 mod cockpit_geometry;
 #[cfg(windows)]
 mod control_effects;
+#[cfg(test)]
+use control_effects::advance_control_effect_instances;
 mod damage_visibility;
 mod debris;
 mod destruction_effects;
-mod motion_effects;
-use control_effects::{
-    activate_firing_flashes, advance_control_effect_instances, owner_control_capacity,
-};
 mod mission_hints;
 mod mission_notices;
 mod mission_pause;
+mod motion_effects;
 mod player_collision;
 mod player_fire;
 mod player_footsteps;
@@ -11446,32 +11445,12 @@ impl StaticVulkanApp {
             None
         };
         self.start_windup_sounds(control_clock_ms, weapon_windup_sounds);
-        let mut control_effect_random_samples = advance_control_effect_instances(
-            &mut self.control_effect_instance_states,
-            &self.ambient_effect_slots,
-            &self.control_point_light_slots,
-            &self.control_sound_slots,
+        let (control_effect_random_samples, direct_shot_sounds) = self.sample_control_effects(
             clock.id,
             control_clock_ms,
             environment
                 .as_ref()
                 .is_some_and(|frame| frame.control_effect_manager_flag),
-            |index| {
-                owner_control_capacity(
-                    self.mission_engine.as_ref()?,
-                    &self.mission_render_roots,
-                    index,
-                )
-            },
-            |index| self.motion_effects.provider(index),
-        );
-        let firing_flashes = activate_firing_flashes(
-            &mut control_effect_random_samples,
-            &self.ambient_effect_slots,
-            &self.control_point_light_slots,
-            self.mission_frame
-                .as_ref()
-                .map_or(&[][..], |frame| &frame.autodemo_combat_events),
             player_firing_effects,
         );
         let control_point_lights = update_control_point_lights(
@@ -11715,7 +11694,7 @@ impl StaticVulkanApp {
                     continue;
                 }
                 // The same firing event starts its one-shot directly.
-                if firing_flashes.contains(&slot.random_instance_key) {
+                if direct_shot_sounds.contains(&slot.random_instance_key) {
                     continue;
                 }
                 if slot.owner_component_is_mounted {
@@ -19290,6 +19269,7 @@ mod tests {
             false,
             |_| None,
             |_| None,
+            |_| None,
         );
         assert!(update_control_point_lights(
             &mut [inactive],
@@ -19309,6 +19289,7 @@ mod tests {
             SceneSampleId::Replay(2),
             750,
             false,
+            |_| None,
             |_| None,
             |_| None,
         );
@@ -19357,6 +19338,7 @@ mod tests {
             false,
             |_| None,
             |_| None,
+            |_| None,
         );
         assert_eq!(first.len(), 1);
         let key = slot.random_instance_key;
@@ -19385,6 +19367,7 @@ mod tests {
                 false,
                 |_| None,
                 |_| None,
+                |_| None,
             )[&key],
             first_sample,
             "a repeated read of the same captured update reuses the shared sample"
@@ -19397,6 +19380,7 @@ mod tests {
             SceneSampleId::Replay(8),
             500,
             false,
+            |_| None,
             |_| None,
             |_| None,
         );
@@ -19425,6 +19409,7 @@ mod tests {
             false,
             |_| None,
             |_| None,
+            |_| None,
         );
         assert_eq!(later[&key].phase, Some(1.0));
         assert_eq!(later[&key].elapsed_seconds, 0.5);
@@ -19436,6 +19421,7 @@ mod tests {
             SceneSampleId::Replay(10),
             6500,
             false,
+            |_| None,
             |_| None,
             |_| None,
         );
@@ -19477,6 +19463,7 @@ mod tests {
                 daylight,
                 |_| None,
                 |_| None,
+                |_| None,
             );
             assert_eq!(samples[&key].phase, Some(expected));
         }
@@ -19492,6 +19479,7 @@ mod tests {
                 SceneSampleId::Replay(11),
                 5_000,
                 false,
+                |_| None,
                 |_| None,
                 |_| None,
             );
@@ -19517,6 +19505,7 @@ mod tests {
                 5_000,
                 false,
                 |_| Some((remaining, 100.0)),
+                |_| None,
                 |_| None,
             );
             assert_eq!(samples[&key].phase, expected);

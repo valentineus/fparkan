@@ -29,6 +29,7 @@ pub struct PlayerWeapon {
     /// Optional type-4 effect started by this weapon.
     pub effect: Option<(String, String)>,
     effect_row: Option<(usize, usize)>,
+    effect_node: Option<usize>,
     windup_sound_rows: Vec<(usize, usize)>,
     windup_started: bool,
     barrels: Vec<Barrel>,
@@ -90,6 +91,28 @@ impl PlayerWeapons {
             .flat_map(move |weapon| weapon.windup_sounds(object_index))
     }
 
+    /// Current blends of the model nodes explicitly linked to firing effects.
+    pub fn firing_effect_phases(
+        &self,
+        object_index: usize,
+    ) -> impl Iterator<Item = (FiringEffectInstance, f32)> + '_ {
+        self.weapons.iter().filter_map(move |weapon| {
+            let node = weapon.effect_node?;
+            let blend = self
+                .weapons
+                .iter()
+                .rev()
+                .filter(|track| track.component_index == weapon.component_index)
+                .find_map(|track| {
+                    let index = track.barrels.iter().rposition(|barrel| {
+                        barrel.row.node_index == node && barrel.row.flags & 4 == 0
+                    })?;
+                    Some(track.barrel_blend(index, self.clock_ms))
+                })?;
+            Some((weapon.firing_effect(object_index)?, blend))
+        })
+    }
+
     /// Samples the barrel tracks after advancing the weapon bank on this frame.
     pub fn apply_firing_pose(&self, component: usize, node_times: &mut [Option<f32>]) {
         for weapon in self
@@ -104,21 +127,7 @@ impl PlayerWeapons {
                 let Some(time) = node_times.get_mut(barrel.row.node_index) else {
                     continue;
                 };
-                let mut blend = barrel.blend;
-                if index == weapon.barrel_index
-                    && matches!(weapon.phase, FirePhase::Shot | FirePhase::Finish)
-                {
-                    let duration = weapon.phase_end_ms - weapon.phase_start_ms;
-                    if duration > 0.0 {
-                        let progress =
-                            ((self.clock_ms - weapon.phase_start_ms) / duration).clamp(0.0, 1.0);
-                        blend = barrel.from_blend + progress * (blend - barrel.from_blend);
-                    }
-                }
-                let mut blend = blend as f32;
-                if barrel.row.flags & 2 != 0 {
-                    blend = 1.0 - blend;
-                }
+                let blend = weapon.barrel_blend(index, self.clock_ms);
                 *time = Some((1.0 - blend) * barrel.row.frame_a + blend * barrel.row.frame_b);
             }
         }
@@ -166,6 +175,24 @@ impl PlayerWeapons {
 }
 
 impl PlayerWeapon {
+    fn barrel_blend(&self, index: usize, now: f64) -> f32 {
+        let barrel = &self.barrels[index];
+        let mut blend = barrel.blend;
+        if index == self.barrel_index && matches!(self.phase, FirePhase::Shot | FirePhase::Finish) {
+            let duration = self.phase_end_ms - self.phase_start_ms;
+            if duration > 0.0 {
+                let progress = ((now - self.phase_start_ms) / duration).clamp(0.0, 1.0);
+                blend = barrel.from_blend + progress * (blend - barrel.from_blend);
+            }
+        }
+        let blend = blend as f32;
+        if barrel.row.flags & 2 != 0 {
+            1.0 - blend
+        } else {
+            blend
+        }
+    }
+
     fn sample_fire(&mut self, trigger: bool, now: f64) -> Option<usize> {
         let mut shot = None;
         self.windup_started = false;
@@ -385,6 +412,15 @@ fn prepare_weapons(
                 return None;
             };
             let effect_row = firing_effect_row(control, row);
+            let effect_node = effect_row
+                .filter(|effect| {
+                    control.node_effect_links.contains(&(
+                        effect.table_index,
+                        row.node_index as u32,
+                        effect.selector,
+                    ))
+                })
+                .map(|_| row.node_index);
             let effect = effect_row.and_then(|row| {
                 Some((
                     crate::bounded_ascii_c_string(&row.resource.archive)?,
@@ -401,6 +437,7 @@ fn prepare_weapons(
                 projectile_archive,
                 effect,
                 effect_row: effect_row.map(|row| (row.table_index, row.row_index)),
+                effect_node,
                 windup_sound_rows: control
                     .weapon_windup_sound_rows(record)
                     .map(|row| (row.table_index, row.row_index))
@@ -477,6 +514,60 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_constructor_cannon_effect_reads_its_barrel_node() {
+        use crate::{
+            create, load_gameplay_mission, starting_cockpit, EngineServices, MissionMode,
+            MissionRequest, MissionStartupInput,
+        };
+        use fparkan_vfs::DirectoryVfs;
+        use std::sync::Arc;
+
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed root");
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.02/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        let hero = starting_cockpit(&engine).unwrap();
+        let mut weapons = starting_player_weapons(&engine, hero);
+        let slot = weapons
+            .weapons()
+            .iter()
+            .position(|weapon| weapon.projectile == "bb_h_01")
+            .unwrap();
+        let effect = weapons.weapons()[slot]
+            .firing_effect(hero.object_index)
+            .unwrap();
+        weapons.select(slot + 1);
+        assert!(weapons.fire(true, 0).next().is_none());
+        for (now, expected) in [
+            (0, 0.0),
+            (63, 0.252),
+            (125, 0.5),
+            (126, 0.5),
+            (188, 0.748),
+            (252, 0.0),
+        ] {
+            weapons.fire(false, now).for_each(|_| {});
+            let phase = weapons
+                .firing_effect_phases(hero.object_index)
+                .find_map(|(key, phase)| (key == effect).then_some(phase))
+                .expect("the authored effect is linked to the cannon node");
+            assert!((phase - expected).abs() < 0.001, "{now} ms: {phase}");
+        }
+    }
+
+    #[test]
     fn shot_finishes_after_trigger_release_and_spends_ammo_and_charge() {
         let mut weapons = PlayerWeapons {
             weapons: vec![PlayerWeapon {
@@ -489,6 +580,7 @@ mod tests {
                 projectile_archive: String::from("test.rlb"),
                 effect: None,
                 effect_row: Some((2, 3)),
+                effect_node: Some(0),
                 windup_sound_rows: vec![(0, 1)],
                 windup_started: false,
                 barrels: vec![Barrel {
@@ -543,9 +635,12 @@ mod tests {
         assert!(weapons.started_windup_sounds(7).next().is_none());
         weapons.apply_firing_pose(0, &mut node_times);
         assert_eq!(node_times, [Some(5.0)]);
+        let effect = weapons.weapons()[0].firing_effect(7).unwrap();
+        assert_eq!(weapons.firing_effect_phases(7).next(), Some((effect, 0.25)));
         assert!(weapons.fire(false, 10).next().is_none());
         weapons.apply_firing_pose(0, &mut node_times);
         assert_eq!(node_times, [Some(6.0)]);
+        assert_eq!(weapons.firing_effect_phases(7).next(), Some((effect, 0.5)));
         let (slot, weapon, _) = weapons.fire(false, 11).next().unwrap();
         assert_eq!(slot, 0);
         assert_eq!(
@@ -560,11 +655,13 @@ mod tests {
         assert!(weapons.fire(false, 16).next().is_none());
         weapons.apply_firing_pose(0, &mut node_times);
         assert_eq!(node_times, [Some(7.0)]);
+        assert_eq!(weapons.firing_effect_phases(7).next(), Some((effect, 0.75)));
         assert_eq!(weapons.weapons()[0].rounds_remaining(), Some(1));
         assert_eq!(weapons.weapons[0].charge.as_ref().unwrap().amount, 8.0);
         assert!(weapons.fire(false, 22).next().is_none());
         weapons.apply_firing_pose(0, &mut node_times);
         assert_eq!(node_times, [Some(4.0)]);
+        assert_eq!(weapons.firing_effect_phases(7).next(), Some((effect, 0.0)));
         assert_eq!(weapons.weapons()[0].rounds_remaining(), Some(0));
         assert_eq!(weapons.weapons[0].charge.as_ref().unwrap().amount, 4.0);
         assert!(weapons.fire(true, 100).next().is_none());
