@@ -75,6 +75,7 @@ mod clan_script_init;
 mod clan_targeting;
 mod construction;
 mod construction_site;
+mod flight_altitude;
 mod laboratory;
 use behavior_clock::next_crt_rand;
 mod mesh_collision;

@@ -85,7 +85,7 @@ impl FrameTraffic {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::route_motion::follow_route;
+    use crate::route_motion::{follow_route, RouteClearance};
     use std::{collections::VecDeque, f32::consts::FRAC_PI_2};
 
     fn pose(xy: [f32; 2], yaw: f32) -> TransformState {
@@ -132,11 +132,18 @@ mod tests {
                 let Some(blockers) = traffic.blockers(handles[i], xy(poses[i]), 0.5) else {
                     continue;
                 };
-                let (after, sweep) =
-                    follow_route(poses[i], &mut routes[i], 3.0, 0.1, &[], &blockers, |_| {
-                        Ok(Some(0.0))
-                    })
-                    .unwrap();
+                let (after, sweep) = follow_route(
+                    poses[i],
+                    &mut routes[i],
+                    3.0,
+                    0.1,
+                    RouteClearance {
+                        traffic: &blockers,
+                        ..Default::default()
+                    },
+                    |_| Ok(Some(0.0)),
+                )
+                .unwrap();
                 poses[i] = after;
                 traffic.reserve(handles[i], sweep);
             }
@@ -178,8 +185,10 @@ mod tests {
             &mut VecDeque::from([[4.0, 0.0]]),
             10.0,
             1.0,
-            &[],
-            &first_blockers,
+            RouteClearance {
+                traffic: &first_blockers,
+                ..Default::default()
+            },
             flat,
         )
         .unwrap();
@@ -187,8 +196,18 @@ mod tests {
         traffic.reserve(first, swept);
         let second_blockers = traffic.blockers(second, xy(start[1]), 0.5).unwrap();
         let mut route = VecDeque::from([[0.0, 4.0]]);
-        let (after, _) =
-            follow_route(start[1], &mut route, 10.0, 1.0, &[], &second_blockers, flat).unwrap();
+        let (after, _) = follow_route(
+            start[1],
+            &mut route,
+            10.0,
+            1.0,
+            RouteClearance {
+                traffic: &second_blockers,
+                ..Default::default()
+            },
+            flat,
+        )
+        .unwrap();
         assert!(xy(after)[1] < -1.0);
         assert_eq!(route.back(), Some(&[0.0, 4.0]));
     }
@@ -201,12 +220,30 @@ mod tests {
         let start = pose(position, 0.0);
         let bounds = Footprint::point(target).expanded(1.0);
         let flat = |_| Ok(Some(0.0));
-        let (waiting, _) =
-            follow_route(start, &mut route, 10.0, 2.0, &[], &[bounds], flat).unwrap();
+        let (waiting, _) = follow_route(
+            start,
+            &mut route,
+            10.0,
+            2.0,
+            RouteClearance {
+                traffic: &[bounds],
+                ..Default::default()
+            },
+            flat,
+        )
+        .unwrap();
         assert!(xy(waiting)[1] > 3.0);
         assert!(!bounds.contains(xy(waiting)));
         assert_eq!(route, [target]);
-        let (arrived, _) = follow_route(waiting, &mut route, 10.0, 2.0, &[], &[], flat).unwrap();
+        let (arrived, _) = follow_route(
+            waiting,
+            &mut route,
+            10.0,
+            2.0,
+            RouteClearance::default(),
+            flat,
+        )
+        .unwrap();
         assert_eq!(xy(arrived), target);
         assert!(route.is_empty());
     }

@@ -1,9 +1,10 @@
 use super::{
     autodemo::{MOBILE_UNIT, PLANT_CLASS},
     boarding::WARBOT_CLASS,
+    flight_altitude::FlightClearance,
     next_crt_rand,
     patrol_points::{PatrolPointReport, PatrolPoints},
-    route_motion::{follow_route, route_points, turn_toward},
+    route_motion::{follow_route, route_points, turn_toward, RouteClearance},
     route_obstacles::BuildingFootprints,
     route_traffic::FrameTraffic,
     unit_combat::CombatTarget,
@@ -13,7 +14,7 @@ use super::{
 };
 use fparkan_script::{Handler15TargetPayload, ScriptDispatchSelector, VarSet};
 use fparkan_terrain::{NavigationQuery, SurfaceQuery};
-use fparkan_world::{identity_metadata, set_transform, transform_state};
+use fparkan_world::{set_transform, transform_state};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
 mod orders;
@@ -442,6 +443,9 @@ impl UnitPatrol {
                 continue;
             };
             let from = before.position.map(f32::from_bits);
+            let motion_object = crate::CombatObject::read(world, unit.handle);
+            let original_id = motion_object.original_id.unwrap_or(unit.handle.slot);
+            let can_fly = chassis.get(&original_id).copied().flatten();
             if let Some(destinations) = &mut unit.destinations {
                 if destinations
                     .front()
@@ -475,11 +479,6 @@ impl UnitPatrol {
                 && unit.attack_target.is_none()
                 && unit.raid_factory.is_none();
             if place_patrol && (enemy.is_none() || unit.place_points.current().is_none()) {
-                let original_id = identity_metadata(world, unit.handle)
-                    .ok()
-                    .and_then(|identity| identity.original_id)
-                    .map_or(unit.handle.slot, |id| id.0);
-                let can_fly = chassis.get(&original_id).copied().flatten();
                 if let Some(bounds) = terrain.surface_bounds() {
                     let mut checks = 0;
                     let refreshed = unit.place_points.refresh(
@@ -550,8 +549,11 @@ impl UnitPatrol {
             if seconds == 0.0 {
                 continue;
             }
-            let motion_object = crate::CombatObject::read(world, unit.handle);
             state.motion_report.update(motion_object, now_ms);
+            let radius = traffic.radius(unit.handle);
+            let flight = (can_fly == Some(true) && radius > 0.0).then_some(FlightClearance {
+                body_radius: radius,
+            });
             if let Some(enemy) = enemy.filter(|enemy| enemy.in_range) {
                 let mut after = before;
                 let (yaw, _) = turn_toward(
@@ -560,6 +562,14 @@ impl UnitPatrol {
                     seconds,
                 );
                 after.orientation[2] = yaw.to_bits();
+                if let Some(flight) = flight {
+                    if let Some(floor) = terrain
+                        .height_at([from[0], from[1]])
+                        .map_err(EngineError::Terrain)?
+                    {
+                        after.position[2] = flight.raised(from[2], floor, 9.0, seconds).0.to_bits();
+                    }
+                }
                 if after != before {
                     poses.push((unit.handle, before, after));
                 }
@@ -597,7 +607,7 @@ impl UnitPatrol {
                 };
                 unit.retry_ms = now_ms.saturating_add(1_000);
             }
-            if unit.points.is_empty() {
+            if unit.points.is_empty() && flight.is_none() {
                 continue;
             }
             let speed = if (place_patrol && enemy.is_none()) || unit.destinations.is_some() {
@@ -606,10 +616,6 @@ impl UnitPatrol {
                 } else {
                     UnitSpeedKind::Go
                 };
-                let object = identity_metadata(world, unit.handle)
-                    .ok()
-                    .and_then(|identity| identity.original_id)
-                    .map_or(unit.handle.slot, |id| id.0);
                 let table = mission
                     .control_device_tables
                     .iter()
@@ -618,23 +624,24 @@ impl UnitPatrol {
                     .behavior_profiles
                     .iter()
                     .find(|profile| profile.handle == unit.handle);
-                order_speed(table, behavior, object, kind, &mut state.speed_report)
+                order_speed(table, behavior, original_id, kind, &mut state.speed_report)
             } else {
                 9.0
             };
-            let clearance = traffic.radius(unit.handle);
-            let Some(neighbors) = traffic.blockers(unit.handle, [from[0], from[1]], clearance)
-            else {
+            let Some(neighbors) = traffic.blockers(unit.handle, [from[0], from[1]], radius) else {
                 continue;
             };
-            let buildings = state.buildings.with_clearance(clearance);
+            let buildings = state.buildings.with_clearance(radius);
             let (after, swept) = follow_route(
                 before,
                 &mut unit.points,
                 speed,
                 seconds,
-                &buildings,
-                &neighbors,
+                RouteClearance {
+                    buildings: &buildings,
+                    traffic: &neighbors,
+                    flight,
+                },
                 |xy| terrain.height_at(xy).map_err(EngineError::Terrain),
             )?;
             traffic.reserve(unit.handle, swept);

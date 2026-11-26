@@ -1,6 +1,7 @@
 //! Follow a terrain route with a shared time budget for turning and travel.
 
 use crate::{
+    flight_altitude::FlightClearance,
     route_obstacles::{open_leg, Footprint},
     EngineError, TerrainWorld, TransformState,
 };
@@ -8,6 +9,13 @@ use fparkan_terrain::{NavigationQuery, RouteRequest};
 use std::collections::VecDeque;
 
 pub(super) const WAYPOINT_TOLERANCE: f32 = 0.05;
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct RouteClearance<'a> {
+    pub(super) buildings: &'a [Footprint],
+    pub(super) traffic: &'a [Footprint],
+    pub(super) flight: Option<FlightClearance>,
+}
 
 pub(super) fn route_points(
     terrain: &TerrainWorld,
@@ -44,17 +52,26 @@ pub(super) fn follow_route(
     points: &mut VecDeque<[f32; 2]>,
     speed: f32,
     mut seconds: f32,
-    buildings: &[Footprint],
-    traffic: &[Footprint],
+    clearance: RouteClearance<'_>,
     mut height_at: impl FnMut([f32; 2]) -> Result<Option<f32>, EngineError>,
 ) -> Result<(TransformState, Footprint), EngineError> {
     let [mut x, mut y, mut z] = pose.position.map(f32::from_bits);
     let mut swept = Footprint::point([x, y]);
+    if let Some(flight) = clearance.flight {
+        if let Some(floor) = height_at([x, y])? {
+            (z, seconds) = flight.raised(z, floor, speed, seconds);
+            pose.position[2] = z.to_bits();
+        }
+    }
     while seconds > 0.0 && !points.is_empty() {
-        if !open_leg([x, y], points, buildings, traffic, |point| {
-            height_at(point).map(|z| z.is_some())
-        })? {
-            if traffic.is_empty() {
+        if !open_leg(
+            [x, y],
+            points,
+            clearance.buildings,
+            clearance.traffic,
+            |point| height_at(point).map(|z| z.is_some()),
+        )? {
+            if clearance.traffic.is_empty() {
                 points.clear();
             }
             break;
@@ -84,10 +101,21 @@ pub(super) fn follow_route(
             points.clear();
             break;
         };
-        let offset = height_at([x, y])?.map_or(0.0, |height| z - height);
+        if let Some(flight) = clearance.flight {
+            let floor = flight.corridor_floor([x, y], xy, ground, &mut height_at)?;
+            let (new_z, remaining) = flight.raised(z, floor, speed, seconds);
+            if new_z != z || remaining != seconds {
+                z = new_z;
+                pose.position[2] = z.to_bits();
+                seconds = remaining;
+                continue;
+            }
+        } else {
+            let offset = height_at([x, y])?.map_or(0.0, |height| z - height);
+            z = ground + offset;
+        }
         [x, y] = xy;
         swept.include(xy);
-        z = ground + offset;
         pose.position = [x, y, z].map(f32::to_bits);
         if !reached {
             break;
@@ -109,9 +137,14 @@ mod tests {
             ..Default::default()
         };
         let mut route = VecDeque::from([[0.0, 0.0], [0.0, 1.0], [4.0, 1.0]]);
-        let (end, _) = follow_route(start, &mut route, 2.0, 2.0, &[], &[], |[x, y]| {
-            Ok(Some(x + y))
-        })
+        let (end, _) = follow_route(
+            start,
+            &mut route,
+            2.0,
+            2.0,
+            RouteClearance::default(),
+            |[x, y]| Ok(Some(x + y)),
+        )
         .unwrap();
         let [x, y, z] = end.position.map(f32::from_bits);
         let expected_x = 3.0 - std::f32::consts::FRAC_PI_2;
@@ -119,5 +152,39 @@ mod tests {
         assert_eq!(y, 1.0);
         assert!((z - (x + y + 2.0)).abs() < 0.000_01);
         assert_eq!(route, [[4.0, 1.0]]);
+    }
+
+    #[test]
+    fn airborne_route_spends_travel_time_to_take_off() {
+        let start = TransformState::default();
+        let mut route = VecDeque::from([[0.0, 8.0]]);
+        let clearance = RouteClearance {
+            flight: Some(FlightClearance { body_radius: 1.0 }),
+            ..Default::default()
+        };
+        let flat = |_| Ok(Some(0.0));
+        let (rising, _) = follow_route(start, &mut route, 2.0, 0.5, clearance, flat).unwrap();
+        assert_eq!(rising.position.map(f32::from_bits), [0.0, 0.0, 1.0]);
+        let (moving, _) = follow_route(rising, &mut route, 2.0, 2.5, clearance, flat).unwrap();
+        assert_eq!(moving.position.map(f32::from_bits), [0.0, 4.0, 2.0]);
+    }
+
+    #[test]
+    fn airborne_route_climbs_for_an_intermediate_ridge_and_stays_above_the_valley() {
+        let start = TransformState {
+            position: [0.0_f32, 0.0, 2.0].map(f32::to_bits),
+            ..Default::default()
+        };
+        let mut route = VecDeque::from([[0.0, 10.0]]);
+        let clearance = RouteClearance {
+            flight: Some(FlightClearance { body_radius: 1.0 }),
+            ..Default::default()
+        };
+        let ground = |[_, y]: [f32; 2]| Ok(Some(if (3.0..5.0).contains(&y) { 4.0 } else { 0.0 }));
+        let (crossed, _) = follow_route(start, &mut route, 4.0, 3.0, clearance, ground).unwrap();
+        assert_eq!(crossed.position.map(f32::from_bits), [0.0, 8.0, 6.0]);
+        let (arrived, _) = follow_route(crossed, &mut route, 4.0, 1.0, clearance, ground).unwrap();
+        assert_eq!(arrived.position.map(f32::from_bits), [0.0, 10.0, 6.0]);
+        assert!(route.is_empty());
     }
 }
