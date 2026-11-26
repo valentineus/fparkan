@@ -119,6 +119,7 @@ mod projectile;
 mod projectile_damage;
 mod projectile_parts;
 mod projectile_shield;
+mod weapon_deployment;
 pub use projectile_shield::{
     collect_shield_impacts, shield_effect_sources, take_shield_impacts, ShieldImpact,
 };

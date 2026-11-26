@@ -1,4 +1,4 @@
-use crate::{Engine, FiringEffectInstance, StartingCockpit};
+use crate::{weapon_deployment::WeaponDeployment, Engine, FiringEffectInstance, StartingCockpit};
 use fparkan_assets::{
     PreparedComponentControl, PreparedControlEffectRow, PreparedControlEffectSection,
     PreparedControlPoint, PreparedControlTimelineRow,
@@ -32,6 +32,7 @@ pub struct PlayerWeapon {
     effect_node: Option<usize>,
     windup_sound_rows: Vec<(usize, usize)>,
     windup_started: bool,
+    deployment: Option<WeaponDeployment>,
     barrels: Vec<Barrel>,
     barrel_index: usize,
     rounds_remaining: Option<u32>,
@@ -113,13 +114,16 @@ impl PlayerWeapons {
         })
     }
 
-    /// Samples the barrel tracks after advancing the weapon bank on this frame.
+    /// Samples the weapon mount and barrel tracks after advancing the bank.
     pub fn apply_firing_pose(&self, component: usize, node_times: &mut [Option<f32>]) {
         for weapon in self
             .weapons
             .iter()
             .filter(|weapon| weapon.component_index == component)
         {
+            if let Some(deployment) = &weapon.deployment {
+                deployment.apply(node_times);
+            }
             for (index, barrel) in weapon.barrels.iter().enumerate() {
                 if barrel.row.flags & 4 != 0 {
                     continue;
@@ -157,17 +161,27 @@ impl PlayerWeapons {
         clock_ms: u32,
         mut trigger: impl FnMut(usize, &PlayerWeapon, &PreparedControlPoint) -> bool,
     ) -> impl Iterator<Item = (usize, &PlayerWeapon, &PreparedControlPoint)> {
-        if let Some(last) = self.last_sample_ms.replace(clock_ms) {
-            self.clock_ms += f64::from(clock_ms.wrapping_sub(last));
-        }
+        let elapsed_ms = self
+            .last_sample_ms
+            .replace(clock_ms)
+            .map_or(0, |last| clock_ms.wrapping_sub(last));
+        self.clock_ms += f64::from(elapsed_ms);
         let now = self.clock_ms;
         let selected = self.selected;
         self.weapons
             .iter_mut()
             .enumerate()
             .filter_map(move |(index, weapon)| {
-                let start = selected.is_none_or(|selected| selected == index)
-                    && trigger(index, weapon, &weapon.barrels[weapon.barrel_index].muzzle);
+                let selected = selected.is_none_or(|selected| selected == index);
+                let mut start =
+                    selected && trigger(index, weapon, &weapon.barrels[weapon.barrel_index].muzzle);
+                if let Some(deployment) = &mut weapon.deployment {
+                    let cycling = matches!(
+                        weapon.phase,
+                        FirePhase::Shot | FirePhase::Recover | FirePhase::Finish
+                    );
+                    start = deployment.sample(elapsed_ms, selected, start, cycling);
+                }
                 let barrel = weapon.sample_fire(start, now)?;
                 Some((index, &*weapon, &weapon.barrels[barrel].muzzle))
             })
@@ -201,8 +215,10 @@ impl PlayerWeapon {
             if self.phase == FirePhase::Shot && shot.is_some() {
                 break;
             }
-            // Control rebases a zero-length phase to the current sample.
-            let start = if self.phase_start_ms == self.phase_end_ms {
+            // An idle device has no scheduled start. Control also rebases
+            // zero-length phases to the current sample.
+            let start = if self.phase == FirePhase::Idle || self.phase_start_ms == self.phase_end_ms
+            {
                 now
             } else {
                 self.phase_end_ms
@@ -310,21 +326,38 @@ impl Barrel {
 
 /// Resolves starting weapons from the hero's mounted CTLD and CPT resources.
 pub fn starting_player_weapons(engine: &Engine, cockpit: StartingCockpit) -> PlayerWeapons {
-    let control = engine
-        .loaded
-        .as_ref()
-        .and_then(|mission| {
-            mission
-                .mission_assets
-                .object_component_controls
-                .get(cockpit.object_index)
-        })
+    let Some(mission) = &engine.loaded else {
+        return PlayerWeapons::default();
+    };
+    let assets = &mission.mission_assets;
+    let Some(control) = assets
+        .object_component_controls
+        .get(cockpit.object_index)
         .and_then(|controls| controls.get(cockpit.component_index))
-        .and_then(Option::as_ref);
+        .and_then(Option::as_ref)
+    else {
+        return PlayerWeapons::default();
+    };
+    let mut weapons = prepare_weapons(cockpit.component_index, control);
+    let model = assets
+        .visuals_for_object(cockpit.object_index)
+        .get(cockpit.component_index)
+        .and_then(|id| assets.visual_by_id(*id))
+        .and_then(|visual| assets.model_by_id(visual.model_id?));
+    if let Some(model) = model {
+        for weapon in &mut weapons {
+            weapon.deployment = WeaponDeployment::prepare(
+                control,
+                &model.validated,
+                weapon
+                    .barrels
+                    .iter()
+                    .map(|barrel| barrel.muzzle.raw_signed_field_04 as u32),
+            );
+        }
+    }
     PlayerWeapons {
-        weapons: control.map_or_else(Vec::new, |control| {
-            prepare_weapons(cockpit.component_index, control)
-        }),
+        weapons,
         ..PlayerWeapons::default()
     }
 }
@@ -443,6 +476,7 @@ fn prepare_weapons(
                     .map(|row| (row.table_index, row.row_index))
                     .collect(),
                 windup_started: false,
+                deployment: None,
                 barrels,
                 barrel_index: 0,
                 rounds_remaining,
@@ -515,11 +549,13 @@ mod tests {
 
     #[test]
     #[ignore = "requires licensed corpus"]
-    fn licensed_constructor_cannon_effect_reads_its_barrel_node() {
+    fn licensed_constructor_deploys_cannon_before_firing() {
         use crate::{
-            create, load_gameplay_mission, starting_cockpit, EngineServices, MissionMode,
-            MissionRequest, MissionStartupInput,
+            create, initial_component_node_times, load_gameplay_mission, loaded_mission_assets,
+            starting_cockpit, EngineServices, MissionMode, MissionRequest, MissionStartupInput,
         };
+        use fparkan_animation::AnimationTime;
+        use fparkan_msh::node38_sampled_hierarchy_at_times;
         use fparkan_vfs::DirectoryVfs;
         use std::sync::Arc;
 
@@ -540,6 +576,10 @@ mod tests {
         .unwrap();
         let hero = starting_cockpit(&engine).unwrap();
         let mut weapons = starting_player_weapons(&engine, hero);
+        assert!(weapons
+            .weapons()
+            .iter()
+            .all(|weapon| weapon.deployment.is_some()));
         let slot = weapons
             .weapons()
             .iter()
@@ -549,22 +589,73 @@ mod tests {
             .firing_effect(hero.object_index)
             .unwrap();
         weapons.select(slot + 1);
+        let assets = loaded_mission_assets(&engine).unwrap();
+        let visual = assets
+            .visual_by_id(assets.visuals_for_object(hero.object_index)[hero.component_index])
+            .unwrap();
+        let model = &assets
+            .model_by_id(visual.model_id.unwrap())
+            .unwrap()
+            .validated;
+        let control = assets.object_component_controls[hero.object_index][hero.component_index]
+            .as_ref()
+            .unwrap();
+        let mut times: Vec<_> = initial_component_node_times(model.node_count, &control.bindings)
+            .unwrap()
+            .into_iter()
+            .map(|time| time.map(|time| time.0))
+            .collect();
         assert!(weapons.fire(true, 0).next().is_none());
+        assert!(weapons.fire(false, 225).next().is_none());
+        weapons.apply_firing_pose(hero.component_index, &mut times);
+        assert_eq!(times[11], Some(44.7));
+        assert_eq!(times[7], Some(42.0));
+        assert!(weapons.fire(false, 450).next().is_none());
+        assert!(weapons.fire(false, 499).next().is_none());
+        assert!(weapons
+            .started_windup_sounds(hero.object_index)
+            .next()
+            .is_none());
         for (now, expected) in [
-            (0, 0.0),
-            (63, 0.252),
-            (125, 0.5),
-            (126, 0.5),
-            (188, 0.748),
-            (252, 0.0),
+            (500, 0.0),
+            (563, 0.252),
+            (625, 0.5),
+            (626, 0.5),
+            (688, 0.748),
+            (752, 0.0),
         ] {
-            weapons.fire(false, now).for_each(|_| {});
+            let shot = weapons
+                .fire(false, now)
+                .next()
+                .map(|(slot, _, muzzle)| (slot, muzzle.clone()));
+            assert_eq!(shot.is_some(), now == 626);
+            if let Some((fired_slot, muzzle)) = shot {
+                assert_eq!(fired_slot, slot);
+                weapons.apply_firing_pose(hero.component_index, &mut times);
+                assert_eq!(times[11], Some(48.0));
+                let sampled: Vec<_> = times.iter().map(|time| time.map(AnimationTime)).collect();
+                let hierarchy = node38_sampled_hierarchy_at_times(model, &sampled).unwrap();
+                let barrel = hierarchy.poses[muzzle.raw_signed_field_04 as usize];
+                let origin = barrel.transform_point(muzzle.position);
+                let forward = barrel.transform_point(std::array::from_fn(|axis| {
+                    muzzle.position[axis] + muzzle.direction[axis]
+                }));
+                assert!(origin[1] > 1.0 && origin[2] > 0.1, "{origin:?}");
+                assert!(forward[1] - origin[1] > 0.99, "{origin:?} -> {forward:?}");
+            }
             let phase = weapons
                 .firing_effect_phases(hero.object_index)
                 .find_map(|(key, phase)| (key == effect).then_some(phase))
                 .expect("the authored effect is linked to the cannon node");
             assert!((phase - expected).abs() < 0.001, "{now} ms: {phase}");
         }
+        assert!(weapons.fire(false, 753).next().is_none());
+        assert!(weapons.fire(false, 978).next().is_none());
+        weapons.apply_firing_pose(hero.component_index, &mut times);
+        assert_eq!(times[11], Some(45.3));
+        assert!(weapons.fire(false, 1253).next().is_none());
+        weapons.apply_firing_pose(hero.component_index, &mut times);
+        assert_eq!(times[11], Some(42.0));
     }
 
     #[test]
@@ -583,6 +674,7 @@ mod tests {
                 effect_node: Some(0),
                 windup_sound_rows: vec![(0, 1)],
                 windup_started: false,
+                deployment: None,
                 barrels: vec![Barrel {
                     muzzle: PreparedControlPoint {
                         raw_flags: 0,
