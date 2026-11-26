@@ -276,6 +276,7 @@ pub fn apply_projectile_contact(
     contact: ProjectileContact,
     volume: f32,
 ) -> Result<Option<(f32, bool)>, ControlResourceAccessError> {
+    let volume = super::projectile_shield::absorb(engine, contact, volume);
     let table = engine.loaded.as_ref().and_then(|mission| {
         mission
             .control_device_tables
@@ -497,6 +498,19 @@ mod tests {
         )
         .unwrap();
         let plant = handle_by_original_id(&engine.world, OriginalObjectId(5)).unwrap();
+        let table = engine
+            .loaded
+            .as_mut()
+            .unwrap()
+            .control_device_tables
+            .iter_mut()
+            .find(|table| table.handle == plant)
+            .unwrap();
+        if let crate::MissionControlDeviceTableStatus::Available(devices) = &mut table.status {
+            for device in devices.iter_mut().filter(|device| device.factory_tag == 9) {
+                device.class9_values_bits = Some([0; 6]);
+            }
+        }
         let contact = ProjectileContact {
             handle: plant,
             fraction: 0.5,

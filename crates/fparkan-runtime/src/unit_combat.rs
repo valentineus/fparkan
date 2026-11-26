@@ -744,6 +744,23 @@ mod tests {
         let mut pose = transform_state(&engine.world, hero).unwrap();
         pose.position = [x + 24.0, y, z + 6.0].map(f32::to_bits);
         set_transform(&mut engine.world, hero, pose).unwrap();
+        let shield_charge = |engine: &Engine| {
+            let table = engine
+                .loaded
+                .as_ref()?
+                .control_device_tables
+                .iter()
+                .find(|table| table.handle == hero)?;
+            let crate::MissionControlDeviceTableStatus::Available(devices) = &table.status else {
+                return None;
+            };
+            let charge = devices
+                .iter()
+                .rfind(|device| device.factory_tag == 9)?
+                .class9_values_bits?;
+            Some(charge.map(f32::from_bits))
+        };
+        let before_shield = shield_charge(&engine);
         let mut fired = false;
         for now in (50..=1_500).step_by(50) {
             let result = frame(&mut engine, now).unwrap();
@@ -762,13 +779,23 @@ mod tests {
                     && engine.autodemo_combat.as_ref().unwrap().projectiles[projectile].name
                         == "ba_a_03"
             });
-            if fired
-                && player_status(&engine, hero).and_then(|status| status.health_percent) == Some(30)
-            {
+            let shield_was_hit =
+                shield_charge(&engine)
+                    .zip(before_shield)
+                    .is_some_and(|(after, before)| {
+                        after
+                            .into_iter()
+                            .zip(before)
+                            .any(|(after, before)| after < before)
+                    });
+            let hull_was_hit = player_status(&engine, hero)
+                .and_then(|status| status.health_percent)
+                .is_some_and(|percent| percent < 100);
+            if fired && (shield_was_hit || hull_was_hit) {
                 return;
             }
         }
-        panic!("the stock animal must fire its projectile and damage the hero (fired={fired})");
+        panic!("the stock animal must hit the nearby hero (fired={fired})");
     }
 
     #[test]

@@ -103,6 +103,7 @@ mod production;
 mod projectile;
 mod projectile_damage;
 mod projectile_parts;
+mod projectile_shield;
 mod repair_zone;
 mod research;
 mod resource_distribution;

@@ -66,13 +66,18 @@ mod tests {
             .expect("the stock warbot with the protection measured in Control");
         let root = control_node_provider_row(table, 0).unwrap();
         let remaining = f32::from_bits(root.current_amount_bits) - f32::from_bits(0x42b5_e63f);
+        let pose = transform_state(&engine.world, table.handle).unwrap();
+        let index = table.original_id.unwrap().0 as usize;
+        let (center, _) = crate::projectile::unit_sphere(
+            &engine.loaded.as_ref().unwrap().mission_assets,
+            index,
+            pose,
+        )
+        .unwrap();
         let contact = ProjectileContact {
             handle: table.handle,
             fraction: 0.5,
-            position: transform_state(&engine.world, table.handle)
-                .unwrap()
-                .position
-                .map(f32::from_bits),
+            position: center,
             node: None,
         };
         assert_eq!(
