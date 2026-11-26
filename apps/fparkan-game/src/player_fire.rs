@@ -50,15 +50,18 @@ impl StaticVulkanApp {
         &mut self,
         clock_ms: u32,
         shots: Vec<(usize, PreparedControlPoint)>,
-    ) {
+    ) -> Vec<FiringEffectInstance> {
+        if shots.is_empty() {
+            return Vec::new();
+        }
         let (Some(cockpit), Some(frame)) = (self.cockpit, &self.mission_frame) else {
-            return;
+            return Vec::new();
         };
         let (Some(weapons), Some(layout)) = (
             self.player_weapon_banks.get(&cockpit.handle),
             self.player_weapon_layouts.get(&cockpit.object_index),
         ) else {
-            return;
+            return Vec::new();
         };
         let Some((_, state)) = frame
             .snapshot
@@ -66,7 +69,7 @@ impl StaticVulkanApp {
             .iter()
             .find(|(handle, _)| *handle == cockpit.handle)
         else {
-            return;
+            return Vec::new();
         };
         let transform = LegacyIron3dEulerTransform {
             translation: state.position.map(f32::from_bits),
@@ -75,8 +78,9 @@ impl StaticVulkanApp {
         let scale = state.scale.map(f32::from_bits);
         // shortcut: use the turret sights until the native barrel matrix is resolved.
         let Some(direction) = self.player_aim_direction else {
-            return;
+            return Vec::new();
         };
+        let mut firing_effects = Vec::new();
         for (slot, barrel) in shots {
             let weapon = &weapons.weapons()[slot];
             let hierarchy = self
@@ -107,6 +111,7 @@ impl StaticVulkanApp {
                 eprintln!("sim_coverage player_weapon_pose_stub=1 slot={}", slot + 1);
                 continue;
             };
+            firing_effects.extend(weapon.firing_effect(cockpit.object_index));
             eprintln!(
                 "player_shot shooter={} slot={} projectile={}:{} queue_time_ms={clock_ms} muzzle={muzzle:?} rounds_remaining={:?}",
                 cockpit.handle.slot,
@@ -163,5 +168,6 @@ impl StaticVulkanApp {
                 }
             }
         }
+        firing_effects
     }
 }

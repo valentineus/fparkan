@@ -11395,7 +11395,7 @@ impl StaticVulkanApp {
             &mut self.mesh.vertices,
             &placements,
         )?;
-        self.emit_player_shots(control_clock_ms, player_shots);
+        let player_firing_effects = self.emit_player_shots(control_clock_ms, player_shots);
         self.update_autodemo_projectiles(control_clock_ms);
         self.update_projectile_geometry();
         refresh_dynamic_shadow_casters(
@@ -11465,18 +11465,15 @@ impl StaticVulkanApp {
             },
             |index| self.motion_effects.provider(index),
         );
-        let firing_flashes = self
-            .mission_frame
-            .as_ref()
-            .map(|frame| {
-                activate_firing_flashes(
-                    &mut control_effect_random_samples,
-                    &self.ambient_effect_slots,
-                    &self.control_point_light_slots,
-                    &frame.autodemo_combat_events,
-                )
-            })
-            .unwrap_or_default();
+        let firing_flashes = activate_firing_flashes(
+            &mut control_effect_random_samples,
+            &self.ambient_effect_slots,
+            &self.control_point_light_slots,
+            self.mission_frame
+                .as_ref()
+                .map_or(&[][..], |frame| &frame.autodemo_combat_events),
+            player_firing_effects,
+        );
         let control_point_lights = update_control_point_lights(
             &mut self.control_point_light_slots,
             &mut self.op1_jitter,

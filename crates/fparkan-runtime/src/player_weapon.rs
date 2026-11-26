@@ -28,7 +28,7 @@ pub struct PlayerWeapon {
     pub projectile_archive: String,
     /// Optional type-4 effect started by this weapon.
     pub effect: Option<(String, String)>,
-    pub(super) effect_row: Option<(usize, usize)>,
+    effect_row: Option<(usize, usize)>,
     windup_sound_rows: Vec<(usize, usize)>,
     windup_started: bool,
     barrels: Vec<Barrel>,
@@ -228,6 +228,17 @@ impl PlayerWeapon {
             self.phase_end_ms = start + delay;
         }
         shot
+    }
+
+    /// The Control effect instance bound to this weapon's release.
+    pub fn firing_effect(&self, object_index: usize) -> Option<FiringEffectInstance> {
+        self.effect_row
+            .map(|(table_index, row_index)| FiringEffectInstance {
+                object_index,
+                component_index: self.component_index,
+                table_index,
+                row_index,
+            })
     }
 
     /// Prepared node-attached sound rows belonging to this device.
@@ -477,7 +488,7 @@ mod tests {
                 projectile: String::from("test"),
                 projectile_archive: String::from("test.rlb"),
                 effect: None,
-                effect_row: None,
+                effect_row: Some((2, 3)),
                 windup_sound_rows: vec![(0, 1)],
                 windup_started: false,
                 barrels: vec![Barrel {
@@ -535,7 +546,17 @@ mod tests {
         assert!(weapons.fire(false, 10).next().is_none());
         weapons.apply_firing_pose(0, &mut node_times);
         assert_eq!(node_times, [Some(6.0)]);
-        assert_eq!(weapons.fire(false, 11).next().unwrap().0, 0);
+        let (slot, weapon, _) = weapons.fire(false, 11).next().unwrap();
+        assert_eq!(slot, 0);
+        assert_eq!(
+            weapon.firing_effect(7),
+            Some(FiringEffectInstance {
+                object_index: 7,
+                component_index: 0,
+                table_index: 2,
+                row_index: 3,
+            })
+        );
         assert!(weapons.fire(false, 16).next().is_none());
         weapons.apply_firing_pose(0, &mut node_times);
         assert_eq!(node_times, [Some(7.0)]);

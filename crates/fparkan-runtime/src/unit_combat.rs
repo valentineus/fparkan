@@ -671,14 +671,7 @@ impl AutoDemoCombat {
                         target,
                         projectile,
                         effect: unit.effects[slot],
-                        effect_instance: weapon.effect_row.map(|(table_index, row_index)| {
-                            FiringEffectInstance {
-                                object_index: unit.index,
-                                component_index: weapon.component_index,
-                                table_index,
-                                row_index,
-                            }
-                        }),
+                        effect_instance: weapon.firing_effect(unit.index),
                         muzzle_bits: from.map(f32::to_bits),
                     });
                 } else {

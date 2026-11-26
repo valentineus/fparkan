@@ -196,17 +196,18 @@ pub(super) fn activate_firing_flashes(
     ambient_slots: &[AmbientEffectGpuSlot],
     point_light_slots: &[ControlEffectSlot],
     events: &[AutoDemoCombatEvent],
+    player_effects: Vec<FiringEffectInstance>,
 ) -> HashSet<ControlEffectInstanceKey> {
-    events
-        .iter()
-        .filter_map(|event| {
-            let AutoDemoCombatEvent::Shot {
-                effect_instance: Some(effect),
-                ..
-            } = *event
-            else {
-                return None;
-            };
+    let autonomous_effects = events.iter().filter_map(|event| match *event {
+        AutoDemoCombatEvent::Shot {
+            effect_instance, ..
+        } => effect_instance,
+        _ => None,
+    });
+    player_effects
+        .into_iter()
+        .chain(autonomous_effects)
+        .filter_map(|effect| {
             let key = ControlEffectInstanceKey::from(effect);
             let has_external_flash = ambient_slots
                 .iter()
