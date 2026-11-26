@@ -418,6 +418,7 @@ pub fn project_msh_to_static_mesh_in_world_space_with_node_fallback_poses(
         node38_fallback_hierarchy(model),
         None,
         false,
+        Group(0),
     )
 }
 
@@ -445,6 +446,7 @@ pub fn project_msh_to_static_mesh_in_world_space_with_node_sampled_poses(
         node38_sampled_hierarchy(model, animation_frame),
         None,
         false,
+        Group(0),
     )
 }
 
@@ -470,6 +472,7 @@ pub fn project_msh_to_static_mesh_in_world_space_with_node_pose_buffer(
         Some(node_poses.clone()),
         None,
         false,
+        Group(0),
     )
 }
 
@@ -497,6 +500,29 @@ pub fn project_msh_to_static_mesh_in_world_space_with_node_pose_buffer_and_mount
             rotation: mount_pose.rotation,
         }),
         true,
+        Group(0),
+    )
+}
+
+/// Projects the detail group authored for an in-cockpit view.
+pub fn project_cockpit_msh(
+    model: &ModelAsset,
+    transform: LegacyIron3dEulerTransform,
+    scale: [f32; 3],
+    node_poses: &NodePoseBuffer,
+    mount_pose: Option<VulkanNodePose>,
+) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
+    project_msh_to_static_mesh_in_world_space_with_node_poses(
+        model,
+        transform,
+        scale,
+        Some(node_poses.clone()),
+        mount_pose.map(|mount| Pose {
+            translation: mount.translation,
+            rotation: mount.rotation,
+        }),
+        mount_pose.is_some(),
+        Group(4),
     )
 }
 
@@ -615,6 +641,7 @@ pub fn project_msh_to_static_mesh_in_world_space_with_node_sampled_poses_and_mou
             rotation: mount_pose.rotation,
         }),
         true,
+        Group(0),
     )
 }
 
@@ -640,6 +667,7 @@ pub fn project_msh_to_static_mesh_in_world_space_with_node_fallback_poses_and_mo
             rotation: mount_pose.rotation,
         }),
         true,
+        Group(0),
     )
 }
 
@@ -650,7 +678,13 @@ fn project_msh_to_static_mesh_in_world_space_with_node_poses(
     hierarchy: Option<fparkan_animation::NodePoseBuffer>,
     mount_pose: Option<Pose>,
     hide_root_node: bool,
+    group: Group,
 ) -> Result<VulkanStaticMesh, VulkanAssetMeshError> {
+    let empty = || VulkanStaticMesh {
+        vertices: Vec::new(),
+        indices: Vec::new(),
+        draw_ranges: Vec::new(),
+    };
     if let Some(hierarchy) = hierarchy.as_ref() {
         if hierarchy.poses.len() != model.node_count {
             return Err(VulkanAssetMeshError::NodePoseCountMismatch {
@@ -669,6 +703,9 @@ fn project_msh_to_static_mesh_in_world_space_with_node_poses(
         return Err(VulkanAssetMeshError::NonFinitePosition);
     }
     if model.node_stride != 38 || model.node_count == 0 || model.animation.is_none() {
+        if group != Group(0) {
+            return Ok(empty());
+        }
         return project_msh_to_static_mesh_in_world_space_with_transform_and_root_pose(
             model, transform, scale, mount_pose,
         );
@@ -679,6 +716,9 @@ fn project_msh_to_static_mesh_in_world_space_with_node_poses(
         hierarchy
     };
     let Some(hierarchy) = hierarchy else {
+        if group != Group(0) {
+            return Ok(empty());
+        }
         return project_msh_to_static_mesh_in_world_space_with_transform_and_root_pose(
             model, transform, scale, mount_pose,
         );
@@ -690,7 +730,7 @@ fn project_msh_to_static_mesh_in_world_space_with_node_poses(
     for node_index in 0..model.node_count {
         let node =
             NodeId(u32::try_from(node_index).map_err(|_| VulkanAssetMeshError::IndexOutOfRange)?);
-        let Some(slot) = selected_slot(model, node, Lod(0), Group(0)) else {
+        let Some(slot) = selected_slot(model, node, Lod(0), group) else {
             continue;
         };
         if hide_root_node && node_index == 0 {
@@ -1489,6 +1529,64 @@ mod tests {
         let selected = static_model_preview_batches(&model).expect("valid selected slot");
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].material_index, 1);
+    }
+
+    #[test]
+    fn cockpit_projection_does_not_include_the_exterior_slot() {
+        let mut source = model(
+            vec![[0.0; 3], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            vec![0, 1, 2, 2, 1, 0],
+            vec![
+                batch(0, 3, 0),
+                Batch {
+                    material_index: 7,
+                    ..batch(3, 3, 0)
+                },
+            ],
+        );
+        source.node_stride = 38;
+        source.node_count = 1;
+        source.nodes_raw = vec![0xff; 38];
+        source.nodes_raw[0..8].fill(0);
+        source.nodes_raw[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
+        source.nodes_raw[8..10].copy_from_slice(&0_u16.to_le_bytes());
+        source.nodes_raw[16..18].copy_from_slice(&1_u16.to_le_bytes());
+        source.slots = [0, 1]
+            .map(|batch_start| Slot {
+                tri_start: batch_start,
+                tri_count: 1,
+                batch_start,
+                batch_count: 1,
+                aabb_min: [0.0; 3],
+                aabb_max: [1.0; 3],
+                sphere_center: [0.0; 3],
+                sphere_radius: 1.0,
+                opaque: [0; 5],
+            })
+            .into();
+        source.animation = Some(ModelAnimation {
+            keys: vec![AnimKey24 {
+                time: AnimationTime(0.0),
+                pose: Pose::default(),
+            }],
+            frame_map: Vec::new(),
+            frame_count: 0,
+        });
+        let poses = node38_fallback_hierarchy(&source).expect("node pose");
+        let transform = LegacyIron3dEulerTransform {
+            translation: [10.0, 20.0, 30.0],
+            orientation_radians: [0.0; 3],
+        };
+        let exterior = project_msh_to_static_mesh_in_world_space_with_node_pose_buffer(
+            &source, transform, [1.0; 3], &poses,
+        )
+        .expect("exterior");
+        let cockpit =
+            project_cockpit_msh(&source, transform, [1.0; 3], &poses, None).expect("cockpit");
+        assert_eq!(exterior.draw_ranges.len(), 1);
+        assert_eq!(exterior.draw_ranges[0].material_index, 0);
+        assert_eq!(cockpit.draw_ranges.len(), 1);
+        assert_eq!(cockpit.draw_ranges[0].material_index, 7);
     }
 
     #[test]

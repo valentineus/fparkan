@@ -22,9 +22,11 @@ mod swapchain;
 mod swapchain_resources;
 mod validation;
 
+const FRAME_VIEWS_PER_SLOT: usize = 3;
+
 pub use self::asset_mesh::{
     node38_pose, node38_pose_from_hierarchy, node38_pose_relative_to_root,
-    node38_pose_relative_to_root_from_hierarchy,
+    node38_pose_relative_to_root_from_hierarchy, project_cockpit_msh,
     project_land_msh_lod_to_static_mesh_in_world_space, project_land_msh_to_static_mesh,
     project_land_msh_to_static_mesh_in_world_space, project_land_msh_to_static_mesh_in_xy_frame,
     project_msh_to_static_mesh, project_msh_to_static_mesh_in_world_space,

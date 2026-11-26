@@ -6,6 +6,7 @@ use fparkan_runtime::initial_component_node_times as static_preview_node_times;
 
 mod camera_capture;
 mod chassis_animation;
+mod cockpit_geometry;
 #[cfg(windows)]
 mod control_effects;
 mod damage_visibility;
@@ -9713,6 +9714,11 @@ fn run_static_vulkan_mode(
     } else {
         None
     };
+    let cockpit_geometry = mission_engine
+        .as_ref()
+        .map(|engine| cockpit_geometry::CockpitGeometry::prepare(engine, &mut preview))
+        .transpose()?
+        .unwrap_or_default();
     let shadow_base_vertex = preview.mesh.vertices.len();
     let shadow_base_index = preview.mesh.indices.len();
     let mut app = StaticVulkanApp::new(
@@ -9757,6 +9763,7 @@ fn run_static_vulkan_mode(
     }
     app.demo_camera = demo_camera;
     app.cockpit = cockpit;
+    app.cockpit_geometry = cockpit_geometry;
     if let Some((engine, cockpit)) = app.mission_engine.as_ref().zip(cockpit) {
         app.player_footsteps =
             player_footsteps::PlayerFootsteps::load(root, engine, cockpit).unwrap_or_default();
@@ -9892,6 +9899,7 @@ struct StaticVulkanApp {
     mission_render_roots: Vec<Option<MissionRenderRoot>>,
     removed_mission_roots: HashSet<usize>,
     cockpit: Option<StartingCockpit>,
+    cockpit_geometry: cockpit_geometry::CockpitGeometry,
     demo_camera: Option<AutoDemoCamera>,
     op1_jitter: Op1JitterState,
     fixed_water_clock_ms: Option<u32>,
@@ -10058,6 +10066,7 @@ impl StaticVulkanApp {
             mission_render_roots: Vec::new(),
             removed_mission_roots: HashSet::new(),
             cockpit: None,
+            cockpit_geometry: cockpit_geometry::CockpitGeometry::default(),
             demo_camera: None,
             mesh: preview.mesh,
             dynamic_vertex_start: preview.dynamic_vertex_start,
@@ -10398,6 +10407,7 @@ impl StaticVulkanApp {
         delta_seconds: f32,
         viewport: [f32; 2],
     ) -> Result<(), String> {
+        self.cockpit_geometry.clear();
         if let (Some(demo), Some(frame)) = (&mut self.demo_camera, &self.mission_frame) {
             let mode_and_camera =
                 match demo.sample(self.simulation_time_ms, &frame.snapshot, &self.terrain)? {
@@ -10417,9 +10427,10 @@ impl StaticVulkanApp {
                             },
                         ),
                     ),
-                    AutoDemoView::Cockpit(cockpit) => {
-                        ("autodemo-cockpit", self.cockpit_frame(cockpit, viewport))
-                    }
+                    AutoDemoView::Cockpit(cockpit) => (
+                        "autodemo-cockpit",
+                        self.select_cockpit_frame(cockpit, viewport),
+                    ),
                 };
             if let (mode, Some(camera)) = mode_and_camera {
                 if self.camera_mode != mode {
@@ -10439,7 +10450,7 @@ impl StaticVulkanApp {
         }
         if let Some(camera) = self
             .cockpit
-            .and_then(|cockpit| self.cockpit_frame(cockpit, viewport))
+            .and_then(|cockpit| self.select_cockpit_frame(cockpit, viewport))
         {
             self.camera = camera.vulkan_camera();
             self.view_camera = camera;
@@ -10453,8 +10464,8 @@ impl StaticVulkanApp {
         self.update_free_camera(delta_seconds, viewport)
     }
 
-    fn cockpit_frame(
-        &self,
+    fn select_cockpit_frame(
+        &mut self,
         cockpit: StartingCockpit,
         viewport: [f32; 2],
     ) -> Option<PreviewCameraFrame> {
@@ -10499,15 +10510,18 @@ impl StaticVulkanApp {
         .with_cockpit_pitch(f32::from_bits(frame.player_pitch_bits))?
         .with_cockpit_yaw(view_yaw)?
         .with_cockpit_pitch(view_pitch)?;
-        PreviewCameraFrame::from_legacy_d3d7(
+        let viewport = [0, 0, viewport[0] as i32, viewport[1] as i32];
+        let frame = PreviewCameraFrame::from_legacy_d3d7(
             camera,
             LegacyD3d7Projection {
-                viewport: [0, 0, viewport[0] as i32, viewport[1] as i32],
+                viewport,
                 near_plane: 0.5,
                 far_plane: 700.0,
                 field_of_view_radians: 1.3,
             },
-        )
+        )?;
+        self.cockpit_geometry.select(cockpit, camera);
+        Some(frame)
     }
 
     fn advance_player_projectiles(&mut self, clock_ms: u32) -> Result<(), String> {
@@ -11368,6 +11382,13 @@ impl StaticVulkanApp {
             }
         }
         self.update_mission_camera(clock.delta_seconds, viewport)?;
+        self.cockpit_geometry.update(
+            &self.dynamic_component_geometry,
+            &self.component_pose_buffers,
+            &self.component_mount_poses,
+            &mut self.mesh.vertices,
+            &placements,
+        )?;
         self.emit_player_shots(control_clock_ms, player_shots);
         self.update_autodemo_projectiles(control_clock_ms);
         self.update_projectile_geometry();
@@ -11897,6 +11918,7 @@ impl StaticVulkanApp {
             &frame.material_update.active_materials,
             renderer,
         )?;
+        self.cockpit_geometry.apply(renderer, frame.viewport)?;
         for draw in self
             .projectile_draws
             .iter()

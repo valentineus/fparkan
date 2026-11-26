@@ -1623,6 +1623,7 @@ pub struct VulkanSmokeRenderer {
     pub(super) readback_enabled: bool,
     pub(super) camera: VulkanStaticCamera,
     pub(super) frame_uniforms: VulkanFrameUniforms,
+    pub(super) cockpit_camera: Option<(std::ops::Range<usize>, VulkanStaticCamera)>,
     /// Dynamically sized point-light records submitted by the client.
     pub(super) point_lights: Vec<VulkanPointLight>,
     /// Whether `set_point_lights` has replaced legacy `frame_uniforms.point_light`.

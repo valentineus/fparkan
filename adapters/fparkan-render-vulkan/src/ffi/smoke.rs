@@ -432,6 +432,7 @@ impl VulkanSmokeRenderer {
             readback_enabled: false,
             camera: create_info.camera,
             frame_uniforms,
+            cockpit_camera: None,
             point_lights: Vec::new(),
             point_lights_explicit: false,
             frame_sync: Vec::new(),
@@ -585,6 +586,28 @@ impl VulkanSmokeRenderer {
         }
         self.camera = camera;
         self.frame_uniforms.clip_from_world = camera.clip_from_world;
+        Ok(())
+    }
+
+    /// Uses a separate projection for the active cockpit's model. The cockpit
+    /// is visible in the main view and excluded from planar reflections.
+    pub fn set_cockpit_camera(
+        &mut self,
+        camera: Option<(std::ops::Range<usize>, super::VulkanStaticCamera)>,
+    ) -> Result<(), VulkanSmokeRendererError> {
+        if let Some((ranges, camera)) = &camera {
+            if !camera.is_finite() {
+                return Err(VulkanSmokeRendererError::InvalidStaticCamera {
+                    context: "non-finite cockpit clip_from_world matrix",
+                });
+            }
+            if ranges.is_empty() || ranges.end > self.draw_ranges.len() {
+                return Err(VulkanSmokeRendererError::InvalidStaticMesh {
+                    context: "invalid cockpit draw ranges",
+                });
+            }
+        }
+        self.cockpit_camera = camera;
         Ok(())
     }
 
@@ -1611,11 +1634,12 @@ impl VulkanSmokeRenderer {
                     context: "swapchain resources during frame upload",
                 },
             )?;
+            let main_slot = self.current_frame * super::FRAME_VIEWS_PER_SLOT;
             write_frame_uniform(
                 device,
                 &resources.frame_uniform_buffer,
                 resources.frame_uniform_stride,
-                self.current_frame * 2,
+                main_slot,
                 &frame_bytes,
             )?;
             if let Some(bytes) = &reflection_bytes {
@@ -1623,8 +1647,19 @@ impl VulkanSmokeRenderer {
                     device,
                     &resources.frame_uniform_buffer,
                     resources.frame_uniform_stride,
-                    self.current_frame * 2 + 1,
+                    main_slot + 1,
                     bytes,
+                )?;
+            }
+            if let Some((_, camera)) = &self.cockpit_camera {
+                let mut uniforms = self.frame_uniforms;
+                uniforms.clip_from_world = camera.clip_from_world;
+                write_frame_uniform(
+                    device,
+                    &resources.frame_uniform_buffer,
+                    resources.frame_uniform_stride,
+                    main_slot + 2,
+                    &uniforms.to_ne_bytes(),
                 )?;
             }
             write_point_light_buffer(
@@ -1952,6 +1987,13 @@ impl VulkanSmokeRenderer {
                             reflected && self.draw_ranges[index].terrain_reflection
                         }));
                 for range_index in draw_order {
+                    let cockpit = self
+                        .cockpit_camera
+                        .as_ref()
+                        .is_some_and(|(ranges, _)| ranges.contains(&range_index));
+                    if reflected && cockpit {
+                        continue;
+                    }
                     let range = self.draw_ranges.get(range_index).ok_or(
                         VulkanSmokeRendererError::InvariantViolation {
                             context: "stable draw order range handle",
@@ -1981,10 +2023,13 @@ impl VulkanSmokeRenderer {
                         vk::PipelineBindPoint::GRAPHICS,
                         *pipeline,
                     );
+                    let view_slot = if cockpit { 2 } else { usize::from(reflected) };
                     let frame_offset = u32::try_from(
                         resources.frame_uniform_stride.saturating_mul(
-                            u64::try_from(self.current_frame * 2 + usize::from(reflected))
-                                .unwrap_or(u64::MAX),
+                            u64::try_from(
+                                self.current_frame * super::FRAME_VIEWS_PER_SLOT + view_slot,
+                            )
+                            .unwrap_or(u64::MAX),
                         ),
                     )
                     .unwrap_or(u32::MAX);

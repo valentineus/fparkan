@@ -545,7 +545,7 @@ pub(super) fn create_frame_uniform_buffer(
     )? / alignment
         * alignment;
     let size = stride
-        .checked_mul(2 * super::VULKAN_FRAME_SLOT_COUNT as u64)
+        .checked_mul((super::FRAME_VIEWS_PER_SLOT * super::VULKAN_FRAME_SLOT_COUNT) as u64)
         .ok_or(VulkanSmokeRendererError::InvalidStaticMesh {
             context: "frame uniform buffer size overflow",
         })?;
