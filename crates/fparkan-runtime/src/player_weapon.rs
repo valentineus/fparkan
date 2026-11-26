@@ -304,6 +304,11 @@ impl PlayerWeapon {
         self.rounds_remaining
     }
 
+    /// Whether the device uses the prepared mount tracks of the hero's weapons.
+    pub fn has_deployment_tracks(&self) -> bool {
+        self.deployment.is_some()
+    }
+
     /// Conservative lower bound used to size the projectile draw pool.
     pub fn interval_ms(&self) -> u32 {
         let fastest = self
@@ -633,15 +638,24 @@ mod tests {
                 assert_eq!(fired_slot, slot);
                 weapons.apply_firing_pose(hero.component_index, &mut times);
                 assert_eq!(times[11], Some(48.0));
-                let sampled: Vec<_> = times.iter().map(|time| time.map(AnimationTime)).collect();
-                let hierarchy = node38_sampled_hierarchy_at_times(model, &sampled).unwrap();
-                let barrel = hierarchy.poses[muzzle.raw_signed_field_04 as usize];
-                let origin = barrel.transform_point(muzzle.position);
-                let forward = barrel.transform_point(std::array::from_fn(|axis| {
-                    muzzle.position[axis] + muzzle.direction[axis]
-                }));
+                let muzzle_points = |times: &[Option<f32>]| {
+                    let sampled: Vec<_> =
+                        times.iter().map(|time| time.map(AnimationTime)).collect();
+                    let hierarchy = node38_sampled_hierarchy_at_times(model, &sampled).unwrap();
+                    let barrel = hierarchy.poses[muzzle.raw_signed_field_04 as usize];
+                    let origin = barrel.transform_point(muzzle.position);
+                    let forward = barrel.transform_point(std::array::from_fn(|axis| {
+                        muzzle.position[axis] + muzzle.direction[axis]
+                    }));
+                    (origin, forward)
+                };
+                let (origin, forward) = muzzle_points(&times);
                 assert!(origin[1] > 1.0 && origin[2] > 0.1, "{origin:?}");
                 assert!(forward[1] - origin[1] > 0.99, "{origin:?} -> {forward:?}");
+                fparkan_assets::apply_manual_turret_elevation(control, 0.5, &mut times);
+                let (origin, forward) = muzzle_points(&times);
+                let elevation = (forward[2] - origin[2]).atan2(forward[1] - origin[1]);
+                assert!((elevation - 0.5).abs() < 0.003, "{elevation}");
             }
             let phase = weapons
                 .firing_effect_phases(hero.object_index)

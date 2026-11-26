@@ -76,9 +76,9 @@ impl StaticVulkanApp {
             orientation_radians: state.orientation.map(f32::from_bits),
         };
         let scale = state.scale.map(f32::from_bits);
-        // shortcut: use the turret sights until the native barrel matrix is resolved.
-        let Some(direction) = self.player_aim_direction else {
-            return Vec::new();
+        let orientation = LegacyIron3dEulerTransform {
+            translation: [0.0; 3],
+            ..transform
         };
         let mut firing_effects = Vec::new();
         for (slot, barrel) in shots {
@@ -99,15 +99,24 @@ impl StaticVulkanApp {
                 mount.is_some(),
                 barrel.raw_signed_field_04 as usize,
             );
-            let muzzle = pose.and_then(|pose| {
+            let launch = pose.and_then(|pose| {
                 let pose = mount.map_or(pose, |mount| compose_unit_pose(mount, pose));
                 let point = add3(
                     pose.translation,
                     rotate_unit_vector(barrel.position, pose.rotation),
                 );
-                transform.try_transform_scaled_point(point, scale)
+                let muzzle = transform.try_transform_scaled_point(point, scale)?;
+                let direction = if weapon.has_deployment_tracks() {
+                    let axis = rotate_unit_vector(barrel.direction, pose.rotation);
+                    orientation.try_transform_scaled_point(axis, scale)?
+                } else {
+                    // shortcut: use the sights for boarded warbots until
+                    // their muzzle axes are compared with the original.
+                    self.player_aim_direction?
+                };
+                Some((muzzle, direction))
             });
-            let Some(muzzle) = muzzle else {
+            let Some((muzzle, direction)) = launch else {
                 eprintln!("sim_coverage player_weapon_pose_stub=1 slot={}", slot + 1);
                 continue;
             };
