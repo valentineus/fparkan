@@ -8,6 +8,7 @@ mod camera_capture;
 mod chassis_animation;
 #[cfg(windows)]
 mod control_effects;
+mod debris;
 mod destruction_effects;
 use control_effects::{
     activate_firing_flashes, advance_control_effect_instances, owner_control_capacity,
@@ -11362,6 +11363,24 @@ impl StaticVulkanApp {
             .map_or_else(HashMap::new, |frame| {
                 live_placements(&mut self.mission_render_roots, &frame.snapshot)
             });
+        if let (Some(engine), Some(effects)) =
+            (&mut self.mission_engine, &mut self.destruction_effects)
+        {
+            effects.start(
+                fparkan_runtime::take_unit_destruction_effects(engine),
+                control_clock_ms,
+                self.audio.as_mut(),
+                |index, origin| {
+                    debris::capture(
+                        index,
+                        origin,
+                        &self.dynamic_component_geometry,
+                        &self.mesh,
+                        &self.terrain,
+                    )
+                },
+            );
+        }
         update_dynamic_component_geometry(
             &self.dynamic_component_geometry,
             &self.component_pose_buffers,
@@ -11471,14 +11490,7 @@ impl StaticVulkanApp {
             &self.removed_mission_roots,
         );
         let mut control_vulkan_lights = active_control_point_lights(&control_point_lights);
-        if let (Some(engine), Some(effects)) =
-            (&mut self.mission_engine, &mut self.destruction_effects)
-        {
-            effects.start(
-                fparkan_runtime::take_unit_destruction_effects(engine),
-                control_clock_ms,
-                self.audio.as_mut(),
-            );
+        if let Some(effects) = &mut self.destruction_effects {
             effects.sample(
                 control_clock_ms,
                 &mut control_vulkan_lights,
@@ -11486,6 +11498,7 @@ impl StaticVulkanApp {
                 &mut self.material_animations,
                 self.view_camera.position,
             );
+            effects.draw_fragments(control_clock_ms, &mut self.mesh, &self.terrain);
         }
         let effect_updates = update_ambient_effect_geometry(
             &mut self.ambient_effect_slots,
@@ -11915,8 +11928,12 @@ impl StaticVulkanApp {
         if !self.removed_mission_roots.is_empty() || self.boarded_hero_index.is_some() {
             for (index, range) in self.mesh.draw_ranges.iter().enumerate() {
                 if range.owner_scope.checked_sub(1).is_some_and(|owner| {
-                    self.removed_mission_roots.contains(&(owner as usize))
-                        || self.boarded_hero_index == Some(owner as usize)
+                    self.boarded_hero_index == Some(owner as usize)
+                        || (self.removed_mission_roots.contains(&(owner as usize))
+                            && !self
+                                .destruction_effects
+                                .as_ref()
+                                .is_some_and(|effects| effects.keeps_range(index)))
                 }) {
                     renderer
                         .set_draw_range_index_count(index, 0)

@@ -2,11 +2,11 @@
 
 use super::{
     ambient_effect_pipeline_state, ambient_effect_vertex_rgb, append_effect_material_animation,
-    append_environment_range, audio::GameAudio, environment_vertex_with_alpha,
-    native_command_phase, prepare_effect_material, quad_indices, EnvironmentGpuRange,
-    MaterialAnimationBinding, PreparedEffectMaterial, StaticPreviewScene,
+    append_environment_range, audio::GameAudio, debris::MeshFragment,
+    environment_vertex_with_alpha, native_command_phase, prepare_effect_material, quad_indices,
+    EnvironmentGpuRange, MaterialAnimationBinding, PreparedEffectMaterial, StaticPreviewScene,
 };
-use fparkan_assets::{decode_explosion_effect, load_resource_entry_bytes_from_root};
+use fparkan_assets::{decode_explosion_effect, load_resource_entry_bytes_from_root, TerrainWorld};
 use fparkan_fx::{
     ambient_op3::evaluate_op3_type0_command, ambient_sound::Op2SoundCommand,
     clock::FxInstanceClock, decode_fxid, environment::evaluate_op1_point_light_with_basis,
@@ -15,7 +15,7 @@ use fparkan_fx::{
 use fparkan_render_vulkan::{VulkanPointLight, VulkanStaticMesh};
 use fparkan_runtime::{unit_destruction_effect_sources, Engine, UnitDestructionEffect};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -27,6 +27,7 @@ struct Explosion {
     lights: Vec<FxCommand>,
     sound: Option<Op2SoundCommand>,
     sprite_pool: Option<usize>,
+    fragments: bool,
 }
 
 #[cfg(test)]
@@ -43,12 +44,14 @@ mod tests {
         let position = [23.0, 45.0, 10.0];
         effects.start(
             vec![UnitDestructionEffect {
+                object_index: None,
                 position,
                 archive: "system.rlb".into(),
                 name: "explode_rbr_b.exp".into(),
             }],
             100,
             None,
+            |_, _| Vec::new(),
         );
         let mut lights = Vec::new();
         let mut mesh = VulkanStaticMesh {
@@ -61,6 +64,7 @@ mod tests {
         assert_eq!(lights[0].position, position);
         assert_eq!(lights[0].range, 15.0);
         assert!(effects.active[0].effect.sound.is_some());
+        assert!(effects.active[0].effect.fragments);
         lights.clear();
         effects.sample(1_300, &mut lights, &mut mesh, &mut [], [0.0; 3]);
         assert!((lights[0].range - 10.0).abs() < 0.0001);
@@ -102,7 +106,13 @@ impl Explosion {
                 command.opcode == FxOpcode::Op3 && command.raw_body.starts_with(&[0; 4])
             })
             .map(|(index, command)| (index, command.clone()));
-        (!lights.is_empty() || sound.is_some() || sprite.is_some()).then_some((
+        let fragments = fx.commands().iter().any(|command| {
+            command.opcode == FxOpcode::Op10
+                && command.resource_refs.first().is_some_and(|reference| {
+                    reference.archive_name().is_empty() && reference.resource_name().is_empty()
+                })
+        });
+        (!lights.is_empty() || sound.is_some() || sprite.is_some() || fragments).then_some((
             Self {
                 duration: header.duration_seconds,
                 flags: header.flags,
@@ -110,6 +120,7 @@ impl Explosion {
                 lights,
                 sound,
                 sprite_pool: None,
+                fragments,
             },
             sprite,
         ))
@@ -120,6 +131,7 @@ struct ActiveExplosion {
     effect: Arc<Explosion>,
     clock: FxInstanceClock,
     position: [f32; 3],
+    fragments: Vec<MeshFragment>,
 }
 
 struct BlastSpritePool {
@@ -139,6 +151,7 @@ pub(super) struct DestructionEffects {
     cache: HashMap<(String, String), Option<Arc<Explosion>>>,
     active: Vec<ActiveExplosion>,
     sprites: Vec<BlastSpritePool>,
+    visible_fragments: HashSet<usize>,
 }
 
 impl DestructionEffects {
@@ -148,6 +161,7 @@ impl DestructionEffects {
             cache: HashMap::new(),
             active: Vec::new(),
             sprites: Vec::new(),
+            visible_fragments: HashSet::new(),
         }
     }
 
@@ -230,8 +244,10 @@ impl DestructionEffects {
         events: Vec<UnitDestructionEffect>,
         now: u32,
         mut audio: Option<&mut GameAudio>,
+        mut capture_fragments: impl FnMut(usize, [f32; 3]) -> Vec<MeshFragment>,
     ) {
         for UnitDestructionEffect {
+            object_index,
             position,
             archive,
             name,
@@ -275,6 +291,9 @@ impl DestructionEffects {
                 effect: Arc::clone(effect),
                 clock,
                 position,
+                fragments: object_index
+                    .filter(|_| effect.fragments)
+                    .map_or_else(Vec::new, |index| capture_fragments(index, position)),
             });
         }
     }
@@ -323,6 +342,27 @@ impl DestructionEffects {
             }
             true
         });
+    }
+
+    pub(super) fn draw_fragments(
+        &mut self,
+        now: u32,
+        mesh: &mut VulkanStaticMesh,
+        terrain: &TerrainWorld,
+    ) {
+        self.visible_fragments.clear();
+        for active in &self.active {
+            if let Some(elapsed) = active.clock.elapsed_seconds(now as f32) {
+                for fragment in &active.fragments {
+                    fragment.draw(elapsed, mesh, terrain);
+                    self.visible_fragments.extend(&fragment.ranges);
+                }
+            }
+        }
+    }
+
+    pub(super) fn keeps_range(&self, index: usize) -> bool {
+        self.visible_fragments.contains(&index)
     }
 
     pub(super) fn inactive_ranges(&self) -> impl Iterator<Item = usize> + '_ {

@@ -75,6 +75,8 @@ mod clan_script_init;
 mod clan_targeting;
 mod construction;
 mod construction_site;
+mod debris_motion;
+pub use debris_motion::DebrisMotion;
 mod destruction;
 pub use destruction::{
     collect_unit_destruction_effects, take_unit_destruction_effects,

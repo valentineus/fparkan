@@ -825,14 +825,6 @@ mod tests {
                 .iter()
                 .find(|event| matches!(event, AutoDemoCombatEvent::Destroyed { .. }))
             {
-                assert!(destruction_effects.iter().any(|event| {
-                    event.archive == "system.rlb"
-                        && event.name == "explode_rbr_b.exp"
-                        && event
-                            .position
-                            .iter()
-                            .all(|coordinate| coordinate.is_finite())
-                }));
                 assert!(identity_metadata(&engine.world, *target).is_err());
                 let ((_, retired), total) = combat
                     .report
@@ -842,7 +834,18 @@ mod tests {
                         object.slot == target.slot && object.generation == target.generation
                     })
                     .expect("removed target is still reported");
-                assert!(retired.original_id.is_some());
+                let drafts = &engine.loaded.as_ref().unwrap().object_drafts;
+                assert!(destruction_effects.iter().any(|event| {
+                    event.archive == "system.rlb"
+                        && event.name == "explode_rbr_b.exp"
+                        && event.object_index.is_some_and(|index| {
+                            drafts[index].original_id.map(|id| id.0) == retired.original_id
+                        })
+                        && event
+                            .position
+                            .iter()
+                            .all(|coordinate| coordinate.is_finite())
+                }));
                 assert_eq!(total.first_ms, now);
                 assert_eq!(total.count, 1);
                 assert!(observed_shots > 0);

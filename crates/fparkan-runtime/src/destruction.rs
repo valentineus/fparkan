@@ -1,10 +1,12 @@
 //! Presentation events for projectile damage that destroys a unit.
 
 use crate::{autodemo::MOBILE_UNIT, Engine, MissionControlDeviceTableState, ObjectHandle};
-use fparkan_world::transform_state;
+use fparkan_world::{identity_metadata, transform_state};
 
 /// Position and attached EXPL resource of a chassis at lethal contact.
 pub struct UnitDestructionEffect {
+    /// Prepared draft index for the destroyed actor when it has an authored layout.
+    pub object_index: Option<usize>,
     /// World-space origin of the destroyed chassis.
     pub position: [f32; 3],
     /// Archive containing the explosion description.
@@ -60,11 +62,21 @@ pub(super) fn pending_effect(
         .iter()
         .find(|table| table.handle == handle)?;
     let (archive, name) = root_effect(table)?;
+    let object_index = identity_metadata(&engine.world, handle)
+        .ok()
+        .and_then(|identity| identity.original_id)
+        .and_then(|id| {
+            mission
+                .object_drafts
+                .iter()
+                .position(|draft| draft.original_id == Some(id))
+        });
     let position = transform_state(&engine.world, handle)
         .ok()?
         .position
         .map(f32::from_bits);
     Some(UnitDestructionEffect {
+        object_index,
         position,
         archive,
         name,
