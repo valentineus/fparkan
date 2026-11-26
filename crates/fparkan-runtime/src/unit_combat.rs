@@ -500,12 +500,21 @@ impl AutoDemoCombat {
                 .and_then(|identity| identity.owner_id);
             let guard = owner
                 .is_some_and(|owner| self.guard_clans.get(usize::from(owner.0)) == Some(&true));
-            let eligible = mission.script_host_mode != super::MissionMode::SingleMission
-                || guard
-                || mission
-                    .unit_patrol
-                    .as_ref()
-                    .is_some_and(|patrol| patrol.is_patrolling(unit.handle));
+            let manually_controlled = mission
+                .boarding
+                .is_some_and(|boarding| boarding.cockpit.handle == unit.handle);
+            // shortcut: free warbots defend from their current position until the
+            // default Behavior task and its pursuit rules are wired.
+            let warbot = mission.object_drafts[unit.index].unit_dat_header_flags
+                == Some(super::boarding::WARBOT_CLASS);
+            let eligible = !manually_controlled
+                && (mission.script_host_mode != super::MissionMode::SingleMission
+                    || guard
+                    || warbot
+                    || mission
+                        .unit_patrol
+                        .as_ref()
+                        .is_some_and(|patrol| patrol.is_patrolling(unit.handle)));
             let aim = eligible
                 .then(|| {
                     targets
@@ -917,6 +926,39 @@ mod tests {
             "AI clan never received a scripted patrol"
         );
         assert!(produced, "scripted AI factory did not produce a robot");
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_stock_defender_fires_at_an_approaching_capturer() {
+        let mut engine = stock_two_fortresses();
+        let defender = mission_object_handle(&engine, OriginalObjectId(17)).unwrap();
+        let before = transform_state(&engine.world, defender).unwrap();
+        assert_eq!(mission_guard_fallback_count(&engine), 0);
+        assert!(frame(&mut engine, 0)
+            .unwrap()
+            .autodemo_combat_events
+            .is_empty());
+
+        for tick in 1..=60 * 190 {
+            let result = frame(&mut engine, tick * 1000 / 60).unwrap();
+            for event in result.autodemo_combat_events {
+                if let AutoDemoCombatEvent::Shot {
+                    shooter, target, ..
+                } = event
+                {
+                    if shooter == defender {
+                        assert_eq!(
+                            identity_metadata(&engine.world, target).unwrap().owner_id,
+                            Some(OwnerId(1))
+                        );
+                        assert_eq!(transform_state(&engine.world, defender).unwrap(), before);
+                        return;
+                    }
+                }
+            }
+        }
+        panic!("the stock defender never fired at the enemy approach");
     }
 
     #[test]
