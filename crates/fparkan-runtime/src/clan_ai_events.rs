@@ -127,6 +127,11 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) -> Vec<MissionNotice
             &engine.world,
             &mut loaded.behavior_ore_states,
             &mut loaded.unit_patrol,
+            crate::ore_transport::TransportGeometry {
+                assets: &loaded.mission_assets,
+                drafts: &loaded.object_drafts,
+                terrain: &loaded.terrain,
+            },
             now_ms,
         )
     });

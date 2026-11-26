@@ -1,6 +1,6 @@
 //! Ground route clearance against the projected bounds of live buildings.
 
-use crate::{EngineError, LoadedMissionState, ObjectHandle, TransformState, World};
+use crate::{EngineError, LoadedMissionState, MissionAssets, ObjectHandle, TransformState, World};
 use fparkan_msh::{node38_fallback_hierarchy, selected_slot, Group, Lod, NodeId};
 use fparkan_render::LegacyIron3dEulerTransform;
 use fparkan_world::{handle_by_original_id, registration_sequence, transform_state};
@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 // Keep detour nodes far enough from the boundary that arrival tolerance can
 // skip a node without putting the next leg back inside the obstacle.
-const CORNER_GAP: f32 = 0.1;
+pub(super) const CORNER_GAP: f32 = 0.1;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Footprint {
@@ -57,8 +57,8 @@ impl BuildingFootprints {
                 .get(&id.0)
                 .is_none_or(|&(old_handle, old_pose, _)| (old_handle, old_pose) != (handle, pose))
             {
-                self.entries
-                    .insert(id.0, (handle, pose, model_footprint(mission, index, pose)));
+                let footprint = model_footprint(&mission.mission_assets, index, pose);
+                self.entries.insert(id.0, (handle, pose, footprint));
             }
         }
     }
@@ -77,12 +77,11 @@ impl BuildingFootprints {
     }
 }
 
-fn model_footprint(
-    mission: &LoadedMissionState,
+pub(super) fn model_footprint(
+    assets: &MissionAssets,
     index: usize,
     pose: TransformState,
 ) -> Option<Footprint> {
-    let assets = &mission.mission_assets;
     let visual = assets.visual_by_id(assets.visual_for_object(index)?)?;
     let model = &assets.model_by_id(visual.model_id?)?.validated;
     let hierarchy = node38_fallback_hierarchy(model)?;
@@ -176,15 +175,20 @@ impl Footprint {
     }
 
     pub(super) fn exits(self, p: [f32; 2]) -> [[f32; 2]; 4] {
+        let [x, y] = self.closest_point(p);
         let Self {
             min: [x0, y0],
             max: [x1, y1],
         } = self.expanded(CORNER_GAP);
-        [[x0, p[1]], [x1, p[1]], [p[0], y0], [p[0], y1]]
+        [[x0, y], [x1, y], [x, y0], [x, y1]]
     }
 
     pub(super) fn center(self) -> [f32; 2] {
         std::array::from_fn(|axis| self.min[axis].midpoint(self.max[axis]))
+    }
+
+    pub(super) fn closest_point(self, point: [f32; 2]) -> [f32; 2] {
+        std::array::from_fn(|axis| point[axis].clamp(self.min[axis], self.max[axis]))
     }
 }
 
