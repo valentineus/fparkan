@@ -2,6 +2,7 @@
 
 use crate::{
     flight_altitude::FlightClearance,
+    ground_support::GroundSupport,
     route_obstacles::{open_leg, Footprint},
     EngineError, TerrainWorld, TransformState,
 };
@@ -15,6 +16,7 @@ pub(super) struct RouteClearance<'a> {
     pub(super) buildings: &'a [Footprint],
     pub(super) traffic: &'a [Footprint],
     pub(super) flight: Option<FlightClearance>,
+    pub(super) ground: Option<GroundSupport>,
 }
 
 pub(super) fn route_points(
@@ -55,6 +57,7 @@ pub(super) fn follow_route(
     clearance: RouteClearance<'_>,
     mut height_at: impl FnMut([f32; 2]) -> Result<Option<f32>, EngineError>,
 ) -> Result<(TransformState, Footprint), EngineError> {
+    let before = pose;
     let [mut x, mut y, mut z] = pose.position.map(f32::from_bits);
     let mut swept = Footprint::point([x, y]);
     if let Some(flight) = clearance.flight {
@@ -122,6 +125,9 @@ pub(super) fn follow_route(
         }
         points.pop_front();
         seconds -= travel_time;
+    }
+    if let Some(ground) = clearance.ground {
+        ground.reanchor(before, &mut pose, height_at)?;
     }
     Ok((pose, swept))
 }

@@ -2,6 +2,7 @@ use super::{
     autodemo::{MOBILE_UNIT, PLANT_CLASS},
     boarding::WARBOT_CLASS,
     flight_altitude::FlightClearance,
+    ground_support::GroundSupport,
     next_crt_rand,
     patrol_points::{PatrolPointReport, PatrolPoints},
     route_motion::{follow_route, route_points, turn_toward, RouteClearance},
@@ -49,6 +50,7 @@ struct PatrollingUnit {
     attack: Option<ObjectHandle>,
     attack_target: Option<(ObjectHandle, usize)>,
     raid_factory: Option<(ObjectHandle, usize)>,
+    ground_support: Option<Option<GroundSupport>>,
 }
 
 pub(super) struct PreparedPatrol {
@@ -208,6 +210,7 @@ impl UnitPatrol {
             attack: None,
             attack_target: None,
             raid_factory: None,
+            ground_support: None,
         });
         true
     }
@@ -392,6 +395,7 @@ impl UnitPatrol {
                 attack: None,
                 attack_target: None,
                 raid_factory: None,
+                ground_support: None,
             })
             .collect();
         Some(Self {
@@ -554,6 +558,14 @@ impl UnitPatrol {
             let flight = (can_fly == Some(true) && radius > 0.0).then_some(FlightClearance {
                 body_radius: radius,
             });
+            let ground = if can_fly == Some(false) {
+                *unit.ground_support.get_or_insert_with(|| {
+                    GroundSupport::prepare(&mission.mission_assets, original_id as usize)
+                })
+            } else {
+                None
+            };
+            let height_at = |xy| terrain.height_at(xy).map_err(EngineError::Terrain);
             if let Some(enemy) = enemy.filter(|enemy| enemy.in_range) {
                 let mut after = before;
                 let (yaw, _) = turn_toward(
@@ -569,6 +581,9 @@ impl UnitPatrol {
                     {
                         after.position[2] = flight.raised(from[2], floor, 9.0, seconds).0.to_bits();
                     }
+                }
+                if let Some(ground) = ground {
+                    ground.reanchor(before, &mut after, height_at)?;
                 }
                 if after != before {
                     poses.push((unit.handle, before, after));
@@ -608,6 +623,13 @@ impl UnitPatrol {
                 unit.retry_ms = now_ms.saturating_add(1_000);
             }
             if unit.points.is_empty() && flight.is_none() {
+                if let Some(ground) = ground {
+                    let mut after = before;
+                    ground.reanchor(before, &mut after, height_at)?;
+                    if after != before {
+                        poses.push((unit.handle, before, after));
+                    }
+                }
                 continue;
             }
             let speed = if (place_patrol && enemy.is_none()) || unit.destinations.is_some() {
@@ -641,8 +663,9 @@ impl UnitPatrol {
                     buildings: &buildings,
                     traffic: &neighbors,
                     flight,
+                    ground,
                 },
-                |xy| terrain.height_at(xy).map_err(EngineError::Terrain),
+                height_at,
             )?;
             traffic.reserve(unit.handle, swept);
             if after != before {
