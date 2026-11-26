@@ -97,6 +97,7 @@ use behavior_clock::next_crt_rand;
 mod mesh_collision;
 mod mining;
 pub use laboratory::LaboratoryReport;
+mod hero_look;
 mod hero_walk;
 mod main_teleport;
 mod manual_chassis;
@@ -1476,6 +1477,7 @@ struct LoadedMissionState {
     player_pitch_bits: u32,
     player_gait: player_gait::PlayerGait,
     hero_walk_velocity: [f32; 2],
+    hero_look: hero_look::HeroLook,
     boarding: Option<boarding::Boarding>,
     local_hero: Option<ObjectHandle>,
     script_host_mode: MissionMode,
@@ -2809,6 +2811,7 @@ node_provider_distribution_suspended: false,
         player_pitch_bits: 0,
         player_gait: Default::default(),
         hero_walk_velocity: [0.0; 2],
+        hero_look: hero_look::HeroLook::load(vfs.as_ref()),
         boarding: None,
         local_hero,
         script_host_mode: request.mode,
@@ -3036,7 +3039,7 @@ pub fn frame_with_player_motion(
             if let Some(mission) = &mut engine.loaded {
                 mission.player_pitch_bits = motion.pitch_bits;
                 frame.player_pitch_bits = motion.pitch_bits;
-                player_motion::commit_velocity(
+                player_motion::commit_motion_state(
                     mission,
                     cockpit,
                     motion,

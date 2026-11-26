@@ -66,6 +66,7 @@ pub struct PlayerMotionStep {
     pub(super) pitch_bits: u32,
     flight_velocity: Option<[f32; 3]>,
     hero_walk_velocity: Option<[f32; 2]>,
+    hero_filtered_x: Option<f32>,
     max_floor_clearance: f32,
     previous_terrain_height: Option<f32>,
     terrain_height: Option<f32>,
@@ -221,6 +222,7 @@ mod tests {
             pitch_bits: 0,
             flight_velocity: None,
             hero_walk_velocity: None,
+            hero_filtered_x: None,
             max_floor_clearance: FLOOR_CLEARANCE,
             previous_terrain_height: None,
             terrain_height: Some(11.5),
@@ -260,6 +262,7 @@ mod tests {
             pitch_bits: 0,
             flight_velocity: None,
             hero_walk_velocity: None,
+            hero_filtered_x: None,
             max_floor_clearance: 1.25,
             previous_terrain_height: Some(10.0),
             terrain_height: Some(10.0),
@@ -284,6 +287,7 @@ mod tests {
             pitch_bits: 0,
             flight_velocity: None,
             hero_walk_velocity: None,
+            hero_filtered_x: None,
             max_floor_clearance: FLOOR_CLEARANCE,
             previous_terrain_height: None,
             terrain_height: None,
@@ -449,17 +453,29 @@ fn plan_player_steps(
         .and_then(|profile| WalkingDrive::from_profile(profile, mission.hero_walk_velocity));
     let walking_motion =
         input.movement != [0.0; 2] || (walking.is_some() && mission.hero_walk_velocity != [0.0; 2]);
+    let hero_control = boarded.is_none() && mission.local_hero == Some(cockpit.handle);
     if !walking_motion
         && flight.is_none_or(|drive| input.climb == 0.0 && drive.velocity == [0.0; 3])
         && input.mouse_x == 0.0
         && input.mouse_y == 0.0
+        && (!hero_control || mission.hero_look.filtered_x == 0.0)
     {
         return Ok(None);
     }
     let pitch = f32::from_bits(mission.player_pitch_bits);
-    if !input.delta_seconds.is_finite() || input.delta_seconds < 0.0 {
+    if ![input.delta_seconds, input.mouse_x, input.mouse_y]
+        .into_iter()
+        .all(f32::is_finite)
+        || input.delta_seconds < 0.0
+    {
         return Err(EngineError::Movement("invalid player step".into()));
     }
+    let hero_look = hero_control.then(|| mission.hero_look.sample(input.mouse_x, input.mouse_y));
+    // shortcut: mounted chassis still use a constant mouse gain.
+    let mut yaw_delta = hero_look.map_or_else(
+        || -input.mouse_x.clamp(-1_000.0, 1_000.0) * 0.003,
+        |(_, yaw)| yaw,
+    );
     let speeds = if boarded.is_some() && !flying {
         crate::manual_chassis::speed_limits(mission, cockpit.handle)
             .unwrap_or([WALK_SPEED_FALLBACK; 2])
@@ -503,12 +519,14 @@ fn plan_player_steps(
                 &mission.terrain,
                 previous,
                 pitch,
+                yaw_delta,
                 flight,
                 ground_displacement,
                 input,
             )?;
             step.max_floor_clearance = max_floor_clearance;
             step.hero_walk_velocity = walk.map(|(velocity, _)| velocity);
+            step.hero_filtered_x = hero_look.map(|(filtered_x, _)| filtered_x);
             match resolve.as_mut() {
                 Some(resolve) => resolve(step),
                 None => Ok((step, false)),
@@ -536,6 +554,7 @@ fn plan_player_steps(
         if index + 1 == count || drowns(engine, cockpit, step) {
             return Ok(Some(step));
         }
+        yaw_delta = 0.0;
         input.mouse_x = 0.0;
         input.mouse_y = 0.0;
         pitch = f32::from_bits(step.pitch_bits);
@@ -548,15 +567,20 @@ fn plan_player_steps(
     unreachable!("a movement sample always has at least one step")
 }
 
-pub(super) fn commit_velocity(
+pub(super) fn commit_motion_state(
     mission: &mut crate::LoadedMissionState,
     cockpit: StartingCockpit,
     step: PlayerMotionStep,
     blocked: bool,
 ) {
-    if let Some(velocity) = step.hero_walk_velocity {
-        if mission.local_hero == Some(cockpit.handle) {
+    if mission.local_hero == Some(cockpit.handle) {
+        if let Some(velocity) = step.hero_walk_velocity {
             mission.hero_walk_velocity = if blocked { [0.0; 2] } else { velocity };
+        }
+        if mission.boarding.is_none() {
+            if let Some(filtered_x) = step.hero_filtered_x {
+                mission.hero_look.filtered_x = filtered_x;
+            }
         }
     }
     if let (Some(boarding), Some(velocity)) = (&mut mission.boarding, step.flight_velocity) {
@@ -579,6 +603,7 @@ fn plan_motion(
     terrain: &TerrainWorld,
     mut pose: TransformState,
     pitch: f32,
+    yaw_delta: f32,
     flight: Option<FlightDrive>,
     ground_displacement: [f32; 2],
     input: PlayerMotion,
@@ -594,6 +619,7 @@ fn plan_motion(
             input.climb,
             input.delta_seconds,
             yaw,
+            yaw_delta,
             pitch,
         ])
         .chain(from)
@@ -602,10 +628,8 @@ fn plan_motion(
     {
         return Err(EngineError::Movement("invalid player step".into()));
     }
-    // shortcut: use constant mouse gain until native sensitivity is measured.
-    let yaw = if input.mouse_x != 0.0 {
-        let yaw = (yaw - input.mouse_x.clamp(-1_000.0, 1_000.0) * 0.003)
-            .rem_euclid(std::f32::consts::TAU);
+    let yaw = if yaw_delta != 0.0 {
+        let yaw = (yaw + yaw_delta).rem_euclid(std::f32::consts::TAU);
         pose.orientation[2] = yaw.to_bits();
         yaw
     } else {
@@ -678,6 +702,7 @@ fn plan_motion(
         pitch_bits: pitch.to_bits(),
         flight_velocity,
         hero_walk_velocity: None,
+        hero_filtered_x: None,
         max_floor_clearance: FLOOR_CLEARANCE,
         previous_terrain_height,
         terrain_height,

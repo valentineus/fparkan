@@ -71,29 +71,46 @@ impl StaticVulkanApp {
 }
 
 #[cfg(test)]
-pub(crate) fn walk_toward(
-    pose: fparkan_world::TransformState,
-    target: [f32; 2],
-    max_step: f32,
-) -> fparkan_runtime::PlayerMotion {
-    let [x, y, _] = pose.position.map(f32::from_bits);
-    let [dx, dy] = [target[0] - x, target[1] - y];
-    let yaw = f32::from_bits(pose.orientation[2]);
-    let wanted = (-dx).atan2(dy);
-    let turn = (yaw - wanted + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
-        - std::f32::consts::PI;
-    // Use normal mouse and forward input. An about-face may use a second sample
-    // because the game clamps mouse deltas.
-    let can_walk = turn.abs() <= 3.0;
-    fparkan_runtime::PlayerMotion {
-        mouse_x: turn / 0.003,
-        movement: [0.0, f32::from(can_walk)],
-        delta_seconds: if can_walk {
-            dx.hypot(dy).min(max_step) / 14.0
-        } else {
+#[derive(Default)]
+pub(crate) struct WalkRoute {
+    filtered_x: f32,
+}
+
+#[cfg(test)]
+impl WalkRoute {
+    pub(crate) fn toward(
+        &mut self,
+        pose: fparkan_world::TransformState,
+        target: [f32; 2],
+        max_step: f32,
+    ) -> fparkan_runtime::PlayerMotion {
+        use std::f32::consts::{PI, TAU};
+
+        let [x, y, _] = pose.position.map(f32::from_bits);
+        let [dx, dy] = [target[0] - x, target[1] - y];
+        let yaw = f32::from_bits(pose.orientation[2]);
+        let wanted = (-dx).atan2(dy);
+        let turn = (yaw - wanted + PI).rem_euclid(TAU) - PI;
+        // Convert the desired heading to ordinary mouse input at 100% sensitivity.
+        let axis = (turn / (TAU * 0.15)).clamp(-1.0, 1.0);
+        let previous = self.filtered_x * 0.05;
+        let mouse_x = (axis / 0.006 - previous) / 0.95;
+        self.filtered_x = if mouse_x == 0.0 {
             0.0
-        },
-        ..Default::default()
+        } else {
+            mouse_x * 0.95 + previous
+        };
+        let can_walk = turn.abs() <= TAU * 0.15;
+        fparkan_runtime::PlayerMotion {
+            mouse_x,
+            movement: [0.0, f32::from(can_walk)],
+            delta_seconds: if can_walk {
+                dx.hypot(dy).min(max_step) / 14.0
+            } else {
+                0.0
+            },
+            ..Default::default()
+        }
     }
 }
 
@@ -196,6 +213,7 @@ mod tests {
         };
         let mut now = 0;
         let mut hero = pose(step_mission_frame(&mut engine, now).unwrap());
+        let mut input = super::WalkRoute::default();
         let [spawn_x, spawn_y, spawn_z] = hero.position.map(f32::from_bits);
         let spawn_clearance = spawn_z - app.terrain.height_at([spawn_x, spawn_y]).unwrap().unwrap();
         let mut door_blends = Vec::new();
@@ -248,7 +266,7 @@ mod tests {
                 let motion = plan_player_motion_with_collision(
                     &engine,
                     cockpit,
-                    super::walk_toward(hero, [x, y], 0.8),
+                    input.toward(hero, [x, y], 0.8),
                     |step| {
                         app.resolve_player_building_step(step)
                             .map_err(EngineError::Movement)
@@ -371,6 +389,7 @@ mod tests {
                 .1
         };
         let mut hero = pose(step_mission_frame(&mut engine, now).unwrap());
+        let mut input = super::WalkRoute::default();
         let [x, y, z] = hero.position.map(f32::from_bits);
         let clearance = z - terrain.height_at([x, y]).unwrap().unwrap();
         let waypoints = [-42.0, -34.0, 36.0, 115.0, 198.0];
@@ -400,7 +419,7 @@ mod tests {
                 let step = plan_player_motion_with_collision(
                     &engine,
                     cockpit,
-                    super::walk_toward(hero, [x, y], 0.8),
+                    input.toward(hero, [x, y], 0.8),
                     |step| {
                         app.resolve_player_building_step(step)
                             .map_err(EngineError::Movement)

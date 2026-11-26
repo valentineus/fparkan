@@ -14024,6 +14024,7 @@ mod tests {
         };
         let mut hero = pose(step_mission_frame(&mut engine, now).unwrap());
         // XY waypoints follow the source bunker graph from the lower room to a terrain entrance.
+        let mut input = player_collision::WalkRoute::default();
         for target in [
             [11.562, 28.644, 0.0],
             [26.370, 28.644, 0.0],
@@ -14055,7 +14056,7 @@ mod tests {
                 let step = plan_player_motion_with_collision(
                     &engine,
                     cockpit,
-                    player_collision::walk_toward(hero, [x, y], 2.0),
+                    input.toward(hero, [x, y], 2.0),
                     |step| {
                         app.resolve_player_building_step(step)
                             .map_err(EngineError::Movement)
