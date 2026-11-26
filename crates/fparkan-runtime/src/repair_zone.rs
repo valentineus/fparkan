@@ -1,9 +1,9 @@
 //! Health service inside the repair volumes authored on facilities.
 
 use crate::{
-    autodemo::PLANT_CLASS, initial_component_node_times, node_amount::apply_control_node_delta,
-    MissionAssets, MissionControlDeviceTableState, MissionControlNodeProviderTableStatus,
-    MissionObjectDraft, ObjectHandle, TransformState, World,
+    initial_component_node_times, node_amount::apply_control_node_delta, MissionAssets,
+    MissionControlDeviceTableState, MissionControlNodeProviderTableStatus, MissionObjectDraft,
+    ObjectHandle, TransformState, World,
 };
 use fparkan_assets::PreparedControlPoint;
 use fparkan_msh::{node38_fallback_hierarchy, node38_sampled_hierarchy_at_times};
@@ -13,7 +13,6 @@ use fparkan_world::{
     OriginalObjectId, OwnerId,
 };
 
-const HANGAR_CLASS: u32 = 0x8000_0040;
 // shortcut: interpolate hull recovery until the facility's supply and repair rate are wired.
 const HULL_FRACTION_PER_SECOND: f32 = 0.1;
 
@@ -68,10 +67,10 @@ impl RepairZones {
             self.prepared_count = 0;
         }
         for (index, draft) in drafts.iter().enumerate().skip(self.prepared_count) {
-            if !matches!(
-                draft.unit_dat_header_flags,
-                Some(PLANT_CLASS | HANGAR_CLASS)
-            ) {
+            if !draft
+                .unit_dat_header_flags
+                .is_some_and(|class| class & 0x8000_0000 != 0)
+            {
                 continue;
             }
             if let Some(id) = draft.original_id {
@@ -243,12 +242,25 @@ mod tests {
     #[test]
     #[ignore = "requires licensed corpus"]
     fn licensed_constructor_repairs_the_hero_at_friendly_authored_pads() {
+        licensed_repair_pads(
+            "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.02/data.tma",
+            &[0x8000_0010, 0x8000_0040],
+        );
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_fortresses_repairs_the_hero_at_fort_and_generator_pads() {
+        licensed_repair_pads("MISSIONS/Single.01/data.tma", &[0x8002_0000, 0x8000_0002]);
+    }
+
+    fn licensed_repair_pads(key: &str, classes: &[u32]) {
         let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed corpus");
         let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
         load_gameplay_mission(
             &mut engine,
             MissionRequest {
-                key: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.02/data.tma".into(),
+                key: key.into(),
                 mode: MissionMode::SingleMission,
             },
             MissionStartupInput {
@@ -275,7 +287,8 @@ mod tests {
                 row.source_row.max_volume,
             )
         };
-        for (start, class) in [(0, PLANT_CLASS), (3000, HANGAR_CLASS)] {
+        for (case, &class) in classes.iter().enumerate() {
+            let start = case as u32 * 3000;
             let mission = engine.loaded.as_ref().unwrap();
             let (index, draft) = mission
                 .object_drafts
@@ -302,21 +315,16 @@ mod tests {
                 .unwrap();
             let damaged = read_hull(&engine).0;
             set_transform(&mut engine.world, hero, actor).unwrap();
-            // The stock facility belongs to a different clan until capture.
-            for now in (start..start + 1000).step_by(50) {
-                frame(&mut engine, now).unwrap();
-            }
+            set_owner(&mut engine.world, facility, Some(OwnerId(1))).unwrap();
+            frame(&mut engine, start).unwrap();
+            frame(&mut engine, start + 1000).unwrap();
             assert_eq!(read_hull(&engine).0, damaged);
             set_owner(&mut engine.world, facility, Some(OwnerId(0))).unwrap();
-            for now in (start + 1000..start + 2000).step_by(50) {
-                frame(&mut engine, now).unwrap();
-            }
+            frame(&mut engine, start + 2000).unwrap();
             let repaired = read_hull(&engine).0;
             assert!(repaired > damaged && repaired <= max);
             set_transform(&mut engine.world, hero, initial_pose).unwrap();
-            for now in (start + 2000..start + 3000).step_by(50) {
-                frame(&mut engine, now).unwrap();
-            }
+            frame(&mut engine, start + 3000).unwrap();
             assert_eq!(read_hull(&engine).0, repaired);
         }
     }
