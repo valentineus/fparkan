@@ -101,6 +101,7 @@ mod player_status;
 mod player_weapon;
 mod production;
 mod projectile;
+mod projectile_damage;
 mod repair_zone;
 mod research;
 mod resource_distribution;
@@ -851,6 +852,8 @@ pub struct MissionControlDeviceTableState {
     pub native_control_class: Option<MissionControlClassProjection>,
     /// Raw CTLD profile retained by native component ID zero and its per-owner copy.
     pub owner_profile: Option<MissionControlOwnerProfile>,
+    /// Linear and quadratic damage coefficients from the owner's tag 27 cache.
+    pub projectile_resistance_bits: Option<[u32; 2]>,
     /// Global NDP provider rows used by indexed Control selectors.
     pub node_provider_status: MissionControlNodeProviderTableStatus,
     /// Native `+0x58c`: total provider capacity in the supported unit-scale domain.
@@ -989,6 +992,7 @@ pub enum MissionControlOwnerProfileFca0UnavailableReason {
 struct ControlDeviceProjection {
     devices: Vec<EffectiveControlDevice>,
     owner_profile: Option<MissionControlOwnerProfile>,
+    projectile_resistance_bits: Option<[u32; 2]>,
     node_provider_status: MissionControlNodeProviderTableStatus,
 }
 
@@ -2397,6 +2401,7 @@ fn load_mission_with_options(
                         status: MissionControlDeviceTableStatus::Available(projection.devices),
                         native_control_class,
                         owner_profile: projection.owner_profile,
+                        projectile_resistance_bits: projection.projectile_resistance_bits,
                         node_provider_maximum_amount_bits: initial_node_provider_maximum_amount(
                             &projection.node_provider_status,
                         ),
@@ -2414,6 +2419,7 @@ node_provider_distribution_suspended: false,
                         status: MissionControlDeviceTableStatus::Unavailable(reason.clone()),
                         native_control_class,
                         owner_profile: None,
+                        projectile_resistance_bits: None,
                         node_provider_maximum_amount_bits: None,
                         node_provider_amount_bits: None,
                         node_provider_dirty: false,
@@ -6984,24 +6990,27 @@ fn native_control_factory_byte_94(factory_tag: u32) -> Option<u8> {
     (factory_tag == 15).then_some(0)
 }
 
+type ControlProfileCache27 =
+    Result<Option<[u32; 3]>, MissionControlOwnerProfileLoadProjectionUnavailableReason>;
+
 fn initialize_control_profile_cache27(
-    cache: &mut Result<Option<u32>, MissionControlOwnerProfileLoadProjectionUnavailableReason>,
+    cache: &mut ControlProfileCache27,
     descriptor: &PreparedControlTypedRecord,
 ) {
     if descriptor.tag == 27 && cache.is_ok() {
-        *cache = Ok(Some(descriptor.fixed_words[11]));
+        *cache = Ok(Some([11, 12, 13].map(|word| descriptor.fixed_words[word])));
     }
 }
 
 fn update_control_profile_cache27_on_into(
-    cache: &mut Result<Option<u32>, MissionControlOwnerProfileLoadProjectionUnavailableReason>,
+    cache: &mut ControlProfileCache27,
     descriptor: &PreparedControlTypedRecord,
 ) {
     if descriptor.tag != 27 {
         return;
     }
     match cache {
-        Ok(Some(value)) => *value = descriptor.fixed_words[11],
+        Ok(Some(words)) => *words = [11, 12, 13].map(|word| descriptor.fixed_words[word]),
         Ok(None) => *cache = Err(
             MissionControlOwnerProfileLoadProjectionUnavailableReason::MissingProfileCacheOnInto,
         ),
@@ -7471,7 +7480,7 @@ fn build_control_device_projection_with_class(
                             .then_some(global_control_profile_slots.as_slice()),
                         &global_mesh_component_ids,
                         CONTROL_LOAD_FAC0_SCALE_BITS,
-                        profile_cache27_bits,
+                        profile_cache27_bits.clone().map(|cache| cache.map(|words| words[0])),
                     )
                 }
                 MissionControlNodeProviderTableStatus::Unavailable(reason) => Err(
@@ -7509,6 +7518,7 @@ fn build_control_device_projection_with_class(
     Ok(ControlDeviceProjection {
         devices,
         owner_profile,
+        projectile_resistance_bits: profile_cache27_bits.ok().flatten().map(|[_, a, b]| [a, b]),
         node_provider_status,
     })
 }
@@ -9654,6 +9664,7 @@ mod tests {
             status,
             native_control_class: None,
             owner_profile: None,
+            projectile_resistance_bits: None,
             node_provider_maximum_amount_bits: initial_node_provider_maximum_amount(
                 &node_provider_status,
             ),
@@ -17684,6 +17695,7 @@ mod tests {
             status: MissionControlDeviceTableStatus::Available(vec![device]),
             native_control_class: None,
             owner_profile: None,
+            projectile_resistance_bits: None,
             node_provider_status: MissionControlNodeProviderTableStatus::Available(Vec::new()),
             node_provider_maximum_amount_bits: Some(0),
             node_provider_amount_bits: Some(0),
@@ -17797,6 +17809,7 @@ mod tests {
             ]),
             native_control_class: None,
             owner_profile: None,
+            projectile_resistance_bits: None,
             node_provider_status: MissionControlNodeProviderTableStatus::Available(vec![
                 synthetic_node_provider_row(0, 0, 1.0_f32.to_bits()),
             ]),
@@ -17854,6 +17867,7 @@ mod tests {
                 status: MissionControlDeviceTableStatus::Available(Vec::new()),
                 native_control_class: None,
                 owner_profile: None,
+                projectile_resistance_bits: None,
                 node_provider_status: MissionControlNodeProviderTableStatus::Available(Vec::new()),
                 node_provider_maximum_amount_bits: Some(0),
                 node_provider_amount_bits: Some(0),

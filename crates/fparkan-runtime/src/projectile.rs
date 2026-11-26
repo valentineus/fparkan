@@ -312,16 +312,20 @@ pub fn apply_projectile_contact(
     contact: ProjectileContact,
     volume: f32,
 ) -> Result<Option<(f32, bool)>, ControlResourceAccessError> {
+    let table = engine.loaded.as_ref().and_then(|mission| {
+        mission
+            .control_device_tables
+            .iter()
+            .find(|table| table.handle == contact.handle)
+    });
+    let volume = super::projectile_damage::resisted_volume(
+        volume,
+        table.and_then(|table| table.projectile_resistance_bits),
+    );
     let Some(key) = contact.building_node else {
         return apply_projectile_hit(engine, contact.handle, volume);
     };
-    let row = engine.loaded.as_ref().and_then(|mission| {
-        let table = mission
-            .control_device_tables
-            .iter()
-            .find(|table| table.handle == contact.handle)?;
-        super::control_node_provider_row(table, key).ok()
-    });
+    let row = table.and_then(|table| super::control_node_provider_row(table, key).ok());
     let Some(row) = row else {
         return Ok(None);
     };
@@ -334,7 +338,7 @@ pub fn apply_projectile_contact(
     {
         return Ok(None);
     }
-    // shortcut: keep per-node damage using the projectile NDP volume while armor and splash are open.
+    // shortcut: feed the projectile NDP volume into the native reduction while impact falloff is open.
     let effect = (volume >= remaining && engine.destruction_effects.is_some())
         .then(|| super::destruction::building_part_effect(row, contact.position))
         .flatten();
