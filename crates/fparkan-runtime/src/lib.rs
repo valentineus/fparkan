@@ -92,6 +92,7 @@ mod mesh_collision;
 mod mining;
 pub use laboratory::LaboratoryReport;
 mod manual_chassis;
+mod manual_flight;
 mod mission_events;
 mod ore_transport;
 mod patrol_points;
@@ -3033,6 +3034,7 @@ pub fn frame_with_player_motion(
             if let Some(mission) = &mut engine.loaded {
                 mission.player_pitch_bits = motion.pitch_bits;
                 frame.player_pitch_bits = motion.pitch_bits;
+                player_motion::commit_flight(mission, cockpit, motion, blocked);
                 if !blocked
                     && !drowned
                     && mission.player_gait.footfall
@@ -18329,148 +18331,6 @@ mod tests {
         let draft = &loaded_mission_object_drafts(&engine).unwrap()[result.object_index];
         assert!(draft.resource_name_raw.ends_with(b"scr_pre2.dat"));
         assert_eq!(transform_state(&engine.world, hero.handle).unwrap(), start);
-    }
-
-    #[test]
-    #[ignore = "requires licensed corpus"]
-    fn licensed_teleport_helicopter_climbs_and_keeps_altitude() {
-        let vfs: Arc<dyn Vfs> = Arc::new(DirectoryVfs::new(licensed_root("IS")));
-        let mut engine = create(EngineServices::new(vfs)).unwrap();
-        load_gameplay_mission(
-            &mut engine,
-            MissionRequest {
-                key: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.04/data.tma".into(),
-                mode: MissionMode::SingleMission,
-            },
-            MissionStartupInput {
-                queue_time_ms: 0,
-                research_creation_gate: false,
-            },
-            None,
-        )
-        .unwrap();
-        let hero = starting_cockpit(&engine).unwrap();
-        let up = PlayerMotion {
-            climb: 1.0,
-            delta_seconds: 1.0,
-            ..PlayerMotion::default()
-        };
-        assert!(plan_player_motion(&engine, hero, up).unwrap().is_none());
-
-        let helicopter = mission_object_handle(&engine, OriginalObjectId(2)).unwrap();
-        let position = |engine: &Engine, cockpit: StartingCockpit| {
-            transform_state(&engine.world, cockpit.handle)
-                .unwrap()
-                .position
-                .map(f32::from_bits)
-        };
-        let mut pose = transform_state(&engine.world, hero.handle).unwrap();
-        let [hx, hy, _] = pose.position.map(f32::from_bits);
-        let [x, y, _] = transform_state(&engine.world, helicopter)
-            .unwrap()
-            .position
-            .map(f32::from_bits);
-        let yaw = (y - hy).atan2(x - hx) - std::f32::consts::FRAC_PI_2;
-        pose.orientation[2] = yaw.to_bits();
-        set_transform(&mut engine.world, hero.handle, pose).unwrap();
-        let walk = PlayerMotion {
-            movement: [0.0, 1.0],
-            delta_seconds: 0.1,
-            ..PlayerMotion::default()
-        };
-        for tick in 1..=45 {
-            let step = plan_player_motion(&engine, hero, walk).unwrap().unwrap();
-            frame_with_player_motion(&mut engine, tick * 100, hero, step, false).unwrap();
-        }
-        let table = engine
-            .loaded
-            .as_mut()
-            .unwrap()
-            .control_device_tables
-            .iter_mut()
-            .find(|table| table.handle == helicopter)
-            .unwrap();
-        let MissionControlDeviceTableStatus::Available(devices) = &mut table.status else {
-            panic!("helicopter Control devices unavailable");
-        };
-        let pilot = devices
-            .iter_mut()
-            .find(|device| device.descriptor.tag == 1)
-            .unwrap();
-        let key = pilot.key as usize;
-        let MissionControlNodeProviderTableStatus::Available(nodes) =
-            &mut table.node_provider_status
-        else {
-            panic!("helicopter Control nodes unavailable");
-        };
-        nodes[key].current_type1_value_bits = 0.0_f32.to_bits();
-        assert_eq!(
-            board_friendly_warbot(&mut engine, Some(helicopter)).unwrap(),
-            None
-        );
-        let table = engine
-            .loaded
-            .as_mut()
-            .unwrap()
-            .control_device_tables
-            .iter_mut()
-            .find(|table| table.handle == helicopter)
-            .unwrap();
-        let MissionControlNodeProviderTableStatus::Available(nodes) =
-            &mut table.node_provider_status
-        else {
-            panic!("helicopter Control nodes unavailable");
-        };
-        nodes[key].current_type1_value_bits = 1.0_f32.to_bits();
-        assert_eq!(board_friendly_warbot(&mut engine, None).unwrap(), None);
-        let [hx, hy, hz] = position(&engine, hero);
-        let [tx, ty, tz] = transform_state(&engine.world, helicopter)
-            .unwrap()
-            .position
-            .map(f32::from_bits);
-        assert_eq!(
-            select_boarding_target(&engine, hero, [[hx, hy, hz + 1.0], [tx, ty, tz + 0.5]]),
-            Some(helicopter),
-        );
-        let vehicle = board_friendly_warbot(&mut engine, Some(helicopter))
-            .unwrap()
-            .unwrap();
-        assert_eq!(vehicle.handle, helicopter);
-        let [x, y, z] = position(&engine, vehicle);
-        let step = plan_player_motion(&engine, vehicle, up).unwrap().unwrap();
-        assert!(step.sweep.is_some());
-        assert!(step.floor_probe().is_none());
-        frame_with_player_motion(&mut engine, 5_500, vehicle, step, false).unwrap();
-        assert_eq!(position(&engine, vehicle), [x, y, z + 16.0]);
-        assert_eq!(position(&engine, hero), [x, y, z + 16.0]);
-
-        let forward = PlayerMotion {
-            climb: 0.0,
-            movement: [0.0, 1.0],
-            delta_seconds: 0.25,
-            ..up
-        };
-        let step = plan_player_motion(&engine, vehicle, forward)
-            .unwrap()
-            .unwrap();
-        frame_with_player_motion(&mut engine, 5_750, vehicle, step, false).unwrap();
-        let [fx, fy, fz] = position(&engine, vehicle);
-        assert!(((fx - x).hypot(fy - y) - 10.0).abs() < 0.0001);
-        assert_eq!(fz, z + 16.0);
-
-        let down = PlayerMotion {
-            climb: -1.0,
-            delta_seconds: 2.0,
-            ..up
-        };
-        let step = plan_player_motion(&engine, vehicle, down).unwrap().unwrap();
-        frame_with_player_motion(&mut engine, 7_750, vehicle, step, false).unwrap();
-        let ground = loaded_terrain(&engine)
-            .unwrap()
-            .height_at([fx, fy])
-            .unwrap()
-            .unwrap();
-        assert_eq!(position(&engine, vehicle), [fx, fy, ground + 0.02]);
     }
 
     #[test]

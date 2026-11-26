@@ -1,4 +1,5 @@
 use super::{transform_state, Engine, EngineError, StartingCockpit, SurfaceQuery, TransformState};
+use crate::manual_flight::{FlightDrive, FlightProfile};
 use crate::TerrainWorld;
 use fparkan_resource::CachedResourceRepository;
 use fparkan_terrain::FullSurfaceMask;
@@ -30,7 +31,6 @@ const WATER_SURFACE: u32 = 0x0002_0000;
 // shortcut: sample the temporary floor probe at most 0.16 units apart until native collision is wired.
 const WALK_COLLISION_DISTANCE: f32 = 0.16;
 const WALK_SPEED_FALLBACK: f32 = 8.0;
-const FLIGHT_SPEED_FALLBACK: f32 = 40.0;
 
 /// Player controls sampled once for a simulation step.
 #[derive(Clone, Copy, Debug, Default)]
@@ -52,7 +52,7 @@ pub struct PlayerMotion {
 pub struct PlayerMotionStep {
     pub(super) pose: TransformState,
     pub(super) pitch_bits: u32,
-    flying: bool,
+    flight_velocity: Option<[f32; 3]>,
     max_floor_clearance: f32,
     previous_terrain_height: Option<f32>,
     terrain_height: Option<f32>,
@@ -103,7 +103,7 @@ impl PlayerMotionStep {
     /// Vertical segment for finding a nearby building floor at the proposed XY.
     #[must_use]
     pub fn floor_probe(self) -> Option<[[f32; 3]; 2]> {
-        if self.flying {
+        if self.flight_velocity.is_some() {
             return None;
         }
         let [[_, _, start_z], [x, y, _]] = self.sweep?;
@@ -198,7 +198,7 @@ mod tests {
                 ..TransformState::default()
             },
             pitch_bits: 0,
-            flying: false,
+            flight_velocity: None,
             max_floor_clearance: FLOOR_CLEARANCE,
             previous_terrain_height: None,
             terrain_height: Some(11.5),
@@ -233,7 +233,7 @@ mod tests {
         let step = PlayerMotionStep {
             pose: TransformState::default(),
             pitch_bits: 0,
-            flying: false,
+            flight_velocity: None,
             max_floor_clearance: 1.25,
             previous_terrain_height: Some(10.0),
             terrain_height: Some(10.0),
@@ -255,7 +255,7 @@ mod tests {
         let step = PlayerMotionStep {
             pose: TransformState::default(),
             pitch_bits: 0,
-            flying: false,
+            flight_velocity: None,
             max_floor_clearance: FLOOR_CLEARANCE,
             previous_terrain_height: None,
             terrain_height: None,
@@ -387,10 +387,23 @@ fn plan_player_steps(
     let boarded = mission
         .boarding
         .filter(|boarding| boarding.cockpit.handle == cockpit.handle);
-    let flying = boarded.is_some_and(|boarding| boarding.can_fly);
+    let flight = boarded.filter(|boarding| boarding.can_fly).map(|boarding| {
+        let profile = mission
+            .control_device_tables
+            .iter()
+            .find(|table| table.handle == cockpit.handle)
+            .and_then(|table| table.owner_profile.as_ref())
+            .and_then(|profile| FlightProfile::from_control(&profile.current_words))
+            .unwrap_or(FlightProfile::FALLBACK);
+        FlightDrive {
+            profile,
+            velocity: boarding.flight_velocity,
+        }
+    });
+    let flying = flight.is_some();
     let chassis_ground = boarded.and_then(|boarding| boarding.ground);
     if input.movement == [0.0; 2]
-        && (!flying || input.climb == 0.0)
+        && flight.is_none_or(|drive| input.climb == 0.0 && drive.velocity == [0.0; 3])
         && input.mouse_x == 0.0
         && input.mouse_y == 0.0
     {
@@ -400,9 +413,7 @@ fn plan_player_steps(
     if !input.delta_seconds.is_finite() || input.delta_seconds < 0.0 {
         return Err(EngineError::Movement("invalid player step".into()));
     }
-    let speeds = if flying {
-        [FLIGHT_SPEED_FALLBACK; 2]
-    } else if boarded.is_some() {
+    let speeds = if boarded.is_some() && !flying {
         crate::manual_chassis::speed_limits(mission, cockpit.handle)
             .unwrap_or([WALK_SPEED_FALLBACK; 2])
     } else if mission.local_hero == Some(cockpit.handle) {
@@ -433,7 +444,7 @@ fn plan_player_steps(
         }
     }
     let Some(resolve) = resolve else {
-        let mut step = plan_motion(&mission.terrain, pose, pitch, flying, speeds, input)?;
+        let mut step = plan_motion(&mission.terrain, pose, pitch, flight, speeds, input)?;
         step.max_floor_clearance = max_floor_clearance;
         crate::manual_chassis::support_step(chassis_ground, &mission.terrain, pose, &mut step)?;
         return Ok(Some(step));
@@ -448,7 +459,7 @@ fn plan_player_steps(
     }
     .max(1);
     input.delta_seconds /= count as f32;
-    let mut step = plan_motion(&mission.terrain, pose, pitch, flying, speeds, input)?;
+    let mut step = plan_motion(&mission.terrain, pose, pitch, flight, speeds, input)?;
     let mut previous = pose;
     let mut previous_surface = WalkingSurface::Ground;
     input.mouse_x = 0.0;
@@ -459,7 +470,7 @@ fn plan_player_steps(
                 &mission.terrain,
                 previous,
                 f32::from_bits(step.pitch_bits),
-                flying,
+                flight,
                 speeds,
                 input,
             )?;
@@ -471,6 +482,7 @@ fn plan_player_steps(
             step.pose.position = previous.position;
             step.sweep = None;
             step.surface = previous_surface;
+            step.flight_velocity = step.flight_velocity.map(|_| [0.0; 3]);
             break;
         }
         crate::manual_chassis::support_step(chassis_ground, &mission.terrain, previous, &mut step)?;
@@ -481,6 +493,19 @@ fn plan_player_steps(
         previous_surface = step.surface;
     }
     Ok(Some(step))
+}
+
+pub(super) fn commit_flight(
+    mission: &mut crate::LoadedMissionState,
+    cockpit: StartingCockpit,
+    step: PlayerMotionStep,
+    blocked: bool,
+) {
+    if let (Some(boarding), Some(velocity)) = (&mut mission.boarding, step.flight_velocity) {
+        if boarding.cockpit.handle == cockpit.handle {
+            boarding.flight_velocity = if blocked { [0.0; 3] } else { velocity };
+        }
+    }
 }
 
 fn body_velocity(movement: [f32; 2], [side_speed, forward_speed]: [f32; 2]) -> [f32; 2] {
@@ -496,7 +521,7 @@ fn plan_motion(
     terrain: &TerrainWorld,
     mut pose: TransformState,
     pitch: f32,
-    flying: bool,
+    flight: Option<FlightDrive>,
     speeds: [f32; 2],
     input: PlayerMotion,
 ) -> Result<PlayerMotionStep, EngineError> {
@@ -528,75 +553,63 @@ fn plan_motion(
     } else {
         yaw
     };
-    // shortcut: apply the requested velocity immediately until native acceleration is known.
-    let [across, along] =
-        body_velocity(input.movement, speeds).map(|speed| speed * input.delta_seconds);
-    let (sin, cos) = yaw.sin_cos();
-    let xy = [
-        from[0] + cos * across - sin * along,
-        from[1] + sin * across + cos * along,
-    ];
-    let climb = if flying {
-        input.climb.clamp(-1.0, 1.0) * (16.0 * input.delta_seconds)
-    } else {
-        0.0
-    };
-    let altitude = from[2] + climb;
-    if !xy.iter().all(|axis| axis.is_finite()) || !altitude.is_finite() {
-        return Err(EngineError::Movement(
-            "player step exceeds finite coordinates".into(),
-        ));
-    }
     let mut sweep = None;
+    let mut flight_velocity = None;
     let mut previous_terrain_height = None;
     let mut terrain_height = None;
     let mut surface = WalkingSurface::Ground;
-    if flying && (xy != [from[0], from[1]] || climb != 0.0) {
-        let old_xy = [from[0], from[1]];
-        let floor = |xy| {
-            terrain
-                .height_at(xy)
-                .map_err(|err| EngineError::Movement(err.to_string()))
-        };
-        if let Some(old_height) = floor(old_xy)? {
-            let bottom = old_height + 0.02;
-            // A grounded machine can taxi. In the air, climb above an obstacle before crossing it.
-            let grounded = from[2] <= bottom && climb <= 0.0;
-            let floor_at_target = floor(xy)?.map(|height| height + 0.02);
-            let (accepted_xy, height) = match floor_at_target {
-                Some(floor) if grounded || floor <= altitude => (xy, floor),
-                _ => (old_xy, bottom),
-            };
-            let [x, y] = accepted_xy;
-            let to = [x, y, altitude.max(height)];
-            if to != from {
+    if let Some(flight) = flight {
+        let [across, along] = input.movement;
+        let (to, velocity) = flight.step(
+            terrain,
+            from,
+            yaw,
+            [across, along, input.climb],
+            input.delta_seconds,
+        )?;
+        flight_velocity = Some(velocity);
+        if to != from {
+            pose.position = to.map(f32::to_bits);
+            sweep = Some([
+                [from[0], from[1], from[2] + 0.5],
+                [to[0], to[1], to[2] + 0.5],
+            ]);
+        }
+    } else {
+        // shortcut: apply the requested ground velocity immediately.
+        let [across, along] =
+            body_velocity(input.movement, speeds).map(|speed| speed * input.delta_seconds);
+        let (sin, cos) = yaw.sin_cos();
+        let xy = [
+            from[0] + cos * across - sin * along,
+            from[1] + sin * across + cos * along,
+        ];
+        if !xy.iter().all(|axis| axis.is_finite()) {
+            return Err(EngineError::Movement(
+                "player step exceeds finite coordinates".into(),
+            ));
+        }
+        if xy != [from[0], from[1]] {
+            if let (Some(old_ground), Some((new_ground, mask))) = (
+                terrain
+                    .height_at([from[0], from[1]])
+                    .map_err(|err| EngineError::Movement(err.to_string()))?,
+                terrain
+                    .support_at(xy)
+                    .map_err(|err| EngineError::Movement(err.to_string()))?,
+            ) {
+                let to = [xy[0], xy[1], new_ground + (from[2] - old_ground)];
+                previous_terrain_height = Some(old_ground);
+                terrain_height = Some(new_ground);
+                surface = WalkingSurface::terrain(mask);
                 pose.position = to.map(f32::to_bits);
+                // shortcut: one sweep at body height until the physical collider
+                // and floor transitions are recovered.
                 sweep = Some([
                     [from[0], from[1], from[2] + 0.5],
                     [to[0], to[1], to[2] + 0.5],
                 ]);
             }
-        }
-    } else if xy != [from[0], from[1]] {
-        if let (Some(old_ground), Some((new_ground, mask))) = (
-            terrain
-                .height_at([from[0], from[1]])
-                .map_err(|err| EngineError::Movement(err.to_string()))?,
-            terrain
-                .support_at(xy)
-                .map_err(|err| EngineError::Movement(err.to_string()))?,
-        ) {
-            let to = [xy[0], xy[1], new_ground + (from[2] - old_ground)];
-            previous_terrain_height = Some(old_ground);
-            terrain_height = Some(new_ground);
-            surface = WalkingSurface::terrain(mask);
-            pose.position = to.map(f32::to_bits);
-            // shortcut: one sweep at body height until the physical collider
-            // and floor transitions are recovered.
-            sweep = Some([
-                [from[0], from[1], from[2] + 0.5],
-                [to[0], to[1], to[2] + 0.5],
-            ]);
         }
     }
     // shortcut: use a bounded camera aim until the native turret travel and
@@ -605,7 +618,7 @@ fn plan_motion(
     Ok(PlayerMotionStep {
         pose,
         pitch_bits: pitch.to_bits(),
-        flying,
+        flight_velocity,
         max_floor_clearance: FLOOR_CLEARANCE,
         previous_terrain_height,
         terrain_height,

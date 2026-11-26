@@ -16,6 +16,7 @@ pub(super) struct Boarding {
     pub(super) hero: StartingCockpit,
     pub(super) can_fly: bool,
     pub(super) ground: Option<crate::ground_support::GroundSupport>,
+    pub(super) flight_velocity: [f32; 3],
 }
 
 /// The vehicle cockpit while the player is aboard.
@@ -138,6 +139,7 @@ pub fn board_friendly_warbot(
             hero,
             can_fly,
             ground,
+            flight_velocity: [0.0; 3],
         });
         mission.player_pitch_bits = 0;
     }
