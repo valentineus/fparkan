@@ -50,6 +50,20 @@ pub struct PlayerMotionStep {
 }
 
 impl PlayerMotionStep {
+    /// Uses the scene's terrain after foundation cuts and fills.
+    #[must_use]
+    pub fn with_scene_terrain(mut self, previous: Option<f32>, next: Option<f32>) -> Self {
+        self.previous_terrain_height = previous;
+        self.terrain_height = next;
+        if let Some([from, to]) = self.sweep.as_mut() {
+            to[2] = previous
+                .zip(next)
+                .map_or(from[2], |(previous, next)| next + (from[2] - previous));
+            self.pose.position[2] = (to[2] - 0.5).to_bits();
+        }
+        self
+    }
+
     /// Vertical segment for finding a nearby building floor at the proposed XY.
     #[must_use]
     pub fn floor_probe(self) -> Option<[[f32; 3]; 2]> {
