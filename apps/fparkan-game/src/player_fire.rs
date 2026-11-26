@@ -105,6 +105,7 @@ impl StaticVulkanApp {
                 weapon.rounds_remaining(),
             );
             let (pool, sound) = &layout.slots[slot];
+            let mut launch_sounds = &[][..];
             if let Some(draw) = self.projectile_draws[*pool].as_mut() {
                 if let Some(instance) = draw
                     .instances
@@ -120,6 +121,7 @@ impl StaticVulkanApp {
                     );
                     instance.shooter = Some(cockpit.handle);
                     if let Some(flight) = &instance.flight {
+                        launch_sounds = &draw.launch_sounds;
                         eprintln!("player_projectile_spawn slot={} queue_time_ms={clock_ms} speed={} lifetime_ms={} position={muzzle:?} direction={:?}", slot + 1, draw.speed, draw.lifetime_ms, flight.direction);
                     }
                 } else {
@@ -129,8 +131,12 @@ impl StaticVulkanApp {
                     );
                 }
             }
-            if let (Some(sound), Some(audio)) = (sound, self.audio.as_mut()) {
-                if let Some(event) = sound.one_shot_at(muzzle) {
+            if let Some(audio) = self.audio.as_mut() {
+                for event in sound
+                    .iter()
+                    .chain(launch_sounds)
+                    .filter_map(|sound| sound.one_shot_at(muzzle))
+                {
                     match audio.handle_sound_event(&event) {
                         Ok(()) => eprintln!(
                             "player_shot_sound slot={} resource={}:{} queue_time_ms={clock_ms}",

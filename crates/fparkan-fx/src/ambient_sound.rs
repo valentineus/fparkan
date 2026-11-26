@@ -107,6 +107,12 @@ impl Op2SoundCommand {
         })
     }
 
+    /// Tests whether a non-looping sound starts at the first phase crossing.
+    #[must_use]
+    pub fn starts_at_spawn(&self) -> bool {
+        !self.looping && self.start == 0.0
+    }
+
     /// Evaluates Effect.dll's phase crossings and current source parameters.
     /// `playing` comes from the audio owner, since a one-shot can finish between
     /// updates. The matrix maps local command coordinates into world space.

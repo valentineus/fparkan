@@ -9627,12 +9627,6 @@ fn run_static_vulkan_mode(
                         .effect
                         .as_ref()
                         .and_then(|(archive, name)| shot_sound::load(root, archive, name));
-                    if sound.is_none() {
-                        eprintln!(
-                            "sim_coverage player_weapon_sound_stub=1 object={index} projectile={}",
-                            weapon.projectile
-                        );
-                    }
                     (pool, sound)
                 })
                 .collect();
@@ -9665,6 +9659,7 @@ fn run_static_vulkan_mode(
             };
             projectile_draws.push(draw);
         }
+        shot_sound::report_missing_player_sounds(&player_weapon_layouts, &projectile_draws);
     }
     let autodemo_draws = mission_engine.as_ref().map_or_else(Vec::new, |engine| {
         fparkan_runtime::autodemo_projectile_types(engine).iter().map(|kind| {
@@ -11242,6 +11237,7 @@ impl StaticVulkanApp {
                 }
                 shot_sound::play_autonomous(
                     &self.autonomous_shot_sounds,
+                    &self.autodemo_draws,
                     &frame.autodemo_combat_events,
                     audio,
                 );

@@ -1,11 +1,9 @@
 use super::{
     ambient_effect_pipeline_state, append_environment_range, environment_vertex,
-    fixed_effect_field, prepare_effect_material, quad_indices, EnvironmentGpuRange,
-    PreparedEffectMaterial, StaticPreviewScene,
+    prepare_effect_material, quad_indices, EnvironmentGpuRange, PreparedEffectMaterial,
+    StaticPreviewScene,
 };
-use fparkan_assets::{load_resource_entry_bytes_from_root, PreparedControlEffectSection};
-use fparkan_fx::{decode_fxid, op5::TrailLayer, FxOpcode};
-use fparkan_runtime::ProjectileAssets;
+use fparkan_fx::{op5::TrailLayer, FxDocument, FxOpcode};
 use std::{collections::HashMap, path::Path};
 
 pub(super) struct ProjectileTrail {
@@ -16,32 +14,13 @@ pub(super) struct ProjectileTrail {
 
 pub(super) fn prepare(
     root: &Path,
-    projectile: &ProjectileAssets,
+    effects: &[(String, FxDocument)],
     name: &str,
     preview: &mut StaticPreviewScene,
     cache: &mut HashMap<String, PreparedEffectMaterial>,
 ) -> Vec<(TrailLayer, usize, fparkan_render::LegacyPipelineState)> {
-    let Some(control) = projectile.assets.object_component_controls[0][0].as_ref() else {
-        return Vec::new();
-    };
-    let PreparedControlEffectSection::Parsed(rows) = &control.effect_section else {
-        return Vec::new();
-    };
     let mut layers = Vec::new();
-    for row in rows.iter().filter(|row| {
-        row.opcode == 4
-            && Some(row.table_index) == control.initial_effect_group
-            && row.raw_condition == [0; 3]
-    }) {
-        let archive = fixed_effect_field(&row.resource.archive);
-        let fx = fixed_effect_field(&row.resource.name);
-        let Ok(document) = load_resource_entry_bytes_from_root(root, &archive, &fx)
-            .map_err(|e| e.to_string())
-            .and_then(|bytes| decode_fxid(bytes).map_err(|e| e.to_string()))
-        else {
-            eprintln!("sim_coverage projectile_trail_resource_stub=1 projectile={name} effect={archive}/{fx}");
-            continue;
-        };
+    for (effect, document) in effects {
         let header = document.header();
         let [scale, sy, sz] = header.scale;
         for command in document
@@ -72,7 +51,7 @@ pub(super) fn prepare(
             if let Some(prepared) = prepared {
                 layers.push(prepared);
             } else {
-                eprintln!("sim_coverage projectile_trail_command_stub=1 projectile={name} effect={archive}/{fx}");
+                eprintln!("sim_coverage projectile_trail_command_stub=1 projectile={name} effect={effect}");
             }
         }
     }

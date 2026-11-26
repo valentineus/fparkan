@@ -1,9 +1,11 @@
 //! Prepare and populate the shared projectile body and trail draw pools.
 
 use super::{
-    append_static_preview_component, projectile_trail, static_preview_component_materials,
-    PreparedEffectMaterial, StaticPreviewScene,
+    append_static_preview_component, fixed_effect_field, projectile_trail, shot_sound,
+    static_preview_component_materials, PreparedEffectMaterial, StaticPreviewScene,
 };
+use fparkan_assets::{load_resource_entry_bytes_from_root, PreparedControlEffectSection};
+use fparkan_fx::{ambient_sound::Op2SoundCommand, decode_fxid, FxDocument};
 use fparkan_render::LegacyIron3dEulerTransform;
 use fparkan_render_vulkan::{
     project_msh_to_static_mesh_in_world_space_with_node_fallback_poses, VulkanStaticMesh,
@@ -11,7 +13,7 @@ use fparkan_render_vulkan::{
 };
 use fparkan_runtime::{
     autodemo_projectiles, autonomous_projectile_segments, load_player_projectile, Engine,
-    PlayerProjectile,
+    PlayerProjectile, ProjectileAssets,
 };
 use fparkan_world::ObjectHandle;
 use std::{collections::HashMap, ops::Range, path::Path};
@@ -20,6 +22,7 @@ pub(super) struct ProjectileDraw {
     pub(super) speed: f32,
     pub(super) lifetime_ms: u32,
     pub(super) volume: Option<f32>,
+    pub(super) launch_sounds: Vec<Op2SoundCommand>,
     pub(super) local_vertices: Vec<VulkanStaticVertex>,
     pub(super) instances: Vec<ProjectileDrawSlot>,
 }
@@ -67,7 +70,8 @@ pub(super) fn prepare_projectile_draw(
             draw_ranges: Vec::new(),
         }
     };
-    let layers = projectile_trail::prepare(root, &projectile, name, preview, trail_materials);
+    let effects = initial_effects(root, &projectile, name);
+    let layers = projectile_trail::prepare(root, &effects, name, preview, trail_materials);
     if geometry.draw_ranges.is_empty() && layers.is_empty() {
         return Ok(None);
     }
@@ -108,9 +112,44 @@ pub(super) fn prepare_projectile_draw(
         speed: projectile.speed,
         lifetime_ms: projectile.lifetime_ms,
         volume: projectile.volume,
+        launch_sounds: shot_sound::projectile_launch(effects.iter().map(|(_, effect)| effect)),
         local_vertices: geometry.vertices,
         instances,
     }))
+}
+
+pub(super) fn initial_effects(
+    root: &Path,
+    projectile: &ProjectileAssets,
+    name: &str,
+) -> Vec<(String, FxDocument)> {
+    let Some(control) = projectile.assets.object_component_controls[0][0].as_ref() else {
+        return Vec::new();
+    };
+    let PreparedControlEffectSection::Parsed(rows) = &control.effect_section else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter(|row| {
+            row.opcode == 4
+                && Some(row.table_index) == control.initial_effect_group
+                && row.raw_condition == [0; 3]
+        })
+        .filter_map(|row| {
+            let archive = fixed_effect_field(&row.resource.archive);
+            let fx = fixed_effect_field(&row.resource.name);
+            let effect = load_resource_entry_bytes_from_root(root, &archive, &fx)
+                .map_err(|error| error.to_string())
+                .and_then(|bytes| decode_fxid(bytes).map_err(|error| error.to_string()));
+            match effect {
+                Ok(effect) => Some((format!("{archive}/{fx}"), effect)),
+                Err(_) => {
+                    eprintln!("sim_coverage projectile_trail_resource_stub=1 projectile={name} effect={archive}/{fx}");
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 pub(super) fn sample_autonomous(draws: &mut [Option<ProjectileDraw>], engine: &Engine) {

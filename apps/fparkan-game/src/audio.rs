@@ -1917,6 +1917,7 @@ mod tests {
                 audio.set_paused(true);
                 crate::shot_sound::play_autonomous(
                     &sounds,
+                    &[],
                     std::slice::from_ref(event),
                     &mut audio,
                 );
