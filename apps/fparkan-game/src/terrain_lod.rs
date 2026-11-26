@@ -7,9 +7,18 @@ use fparkan_terrain_format::LandMeshDocument;
 pub(super) struct TerrainLodDraws {
     plan: TerrainLodPlan,
     ranges: Vec<(Option<usize>, TerrainLod)>,
+    first_scene_range: usize,
 }
 
 impl TerrainLodDraws {
+    pub(super) fn set_first_scene_range(&mut self, index: usize) {
+        self.first_scene_range = index;
+    }
+
+    pub(super) fn replace_plan(&mut self, plan: TerrainLodPlan) {
+        self.plan = plan;
+    }
+
     pub(super) fn index_count(
         &self,
         range: usize,
@@ -17,7 +26,10 @@ impl TerrainLodDraws {
         eye: [f32; 3],
         fov: f32,
     ) -> Result<u32, String> {
-        let Some(&(Some(node), lod)) = self.ranges.get(range) else {
+        let Some(&(Some(node), lod)) = range
+            .checked_sub(self.first_scene_range)
+            .and_then(|index| self.ranges.get(index))
+        else {
             return Ok(count);
         };
         let selected = self
@@ -30,7 +42,7 @@ impl TerrainLodDraws {
     pub(super) fn report(&self, eye: [f32; 3], fov: f32) -> Result<(), String> {
         let mut counts = [0; 2];
         for (range, &(_, lod)) in self.ranges.iter().enumerate() {
-            if self.index_count(range, 1, eye, fov)? != 0 {
+            if self.index_count(range + self.first_scene_range, 1, eye, fov)? != 0 {
                 counts[usize::from(lod == TerrainLod::Lod1)] += 1;
             }
         }
@@ -104,7 +116,14 @@ pub(super) fn prepare(
         near_mesh.indices.extend(far_mesh.indices);
         near_mesh.draw_ranges.extend(far_mesh.draw_ranges);
     }
-    Ok((near_mesh, Some(TerrainLodDraws { plan, ranges })))
+    Ok((
+        near_mesh,
+        Some(TerrainLodDraws {
+            plan,
+            ranges,
+            first_scene_range: 0,
+        }),
+    ))
 }
 
 fn split_ranges(

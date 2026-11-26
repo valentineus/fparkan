@@ -1,6 +1,33 @@
 use crate::{BasementPlacementMode, MissionAssets, MissionObjectDraft};
 use fparkan_render::LegacyIron3dEulerTransform;
 use fparkan_terrain::BasementFootprint;
+use fparkan_world::{set_transform, transform_state, world_snapshot};
+
+/// Places a newly completed building at its absolute foundation elevation.
+///
+/// The construction frame is refreshed so draw, collision, and script
+/// consumers use a single root position.
+///
+/// # Errors
+///
+/// Rejects a missing building or an invalid elevation.
+pub fn place_constructed_basement(
+    engine: &mut crate::Engine,
+    frame: &mut crate::FrameResult,
+    building: crate::SpawnedUnit,
+    elevation: f32,
+) -> Result<(), crate::EngineError> {
+    if !frame.constructed_buildings.contains(&building) || !elevation.is_finite() {
+        return Err(crate::EngineError::Movement(
+            "invalid placement for constructed basement".into(),
+        ));
+    }
+    let mut pose = transform_state(&engine.world, building.handle)?;
+    pose.position[2] = elevation.to_bits();
+    set_transform(&mut engine.world, building.handle, pose)?;
+    frame.snapshot = world_snapshot(&engine.world, std::mem::take(&mut frame.snapshot.events));
+    Ok(())
+}
 
 /// One eligible building's authored contours projected into the mission.
 pub struct MissionBasementFootprint {

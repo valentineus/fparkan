@@ -26,6 +26,7 @@ mod projectile_trail;
 mod shield_effects;
 mod shot_sound;
 use projectile_render::{prepare_projectile_draw, ProjectileDraw};
+mod live_basements;
 mod script_coverage;
 mod sun_visibility;
 mod terrain_lod;
@@ -4746,6 +4747,7 @@ struct StaticPreviewScene {
     mesh: VulkanStaticMesh,
     dynamic_vertex_start: usize,
     terrain_lod: Option<terrain_lod::TerrainLodDraws>,
+    live_basements: Option<live_basements::LiveBasements>,
     native_handedness_by_range: HashMap<usize, i8>,
     type16_present_ranges: HashSet<usize>,
     materials: Vec<VulkanStaticMaterial>,
@@ -8200,9 +8202,8 @@ fn static_preview_mesh_and_materials(
         .filter(|face| face.flags.0 & 8 != 0 && face.flags.0 & 0x20000 == 0)
         .count();
     eprintln!("render_coverage terrain_face8_pipeline_unverified={unverified_special_faces} (non-reflective source faces across LODs; native special-pass mapping pending)");
-    // shortcut: live construction needs terrain-cell rebuilding before it can cut BAS.
-    let footprint_sources =
-        mission_basement_footprints(assets, &roots[..placed_root_count.min(roots.len())])?;
+    let placed_root_count = placed_root_count.min(roots.len());
+    let footprint_sources = mission_basement_footprints(assets, &roots[..placed_root_count])?;
     let foundation = if footprint_sources.is_empty() {
         None
     } else {
@@ -8230,11 +8231,24 @@ fn static_preview_mesh_and_materials(
         terrain,
         foundation,
     )?;
-    let (terrain_component, terrain_lod) = terrain_lod::prepare(
+    let (mut terrain_component, terrain_lod) = terrain_lod::prepare(
         terrain_mesh,
         terrain_component,
         terrain_query.basement_foundation(),
     )?;
+    let live_basements = (live_roots
+        && roots[placed_root_count..]
+            .iter()
+            .any(|root| root.basement_placement_mode().is_some()))
+    .then(|| {
+        live_basements::LiveBasements::prepare(
+            terrain_mesh,
+            &terrain_query,
+            &mut terrain_component,
+            footprint_sources,
+        )
+    })
+    .transpose()?;
     let terrain_materials = static_preview_terrain_base_materials(
         &mut terrain_material_loader,
         root,
@@ -8789,6 +8803,7 @@ fn static_preview_mesh_and_materials(
         mesh,
         dynamic_vertex_start,
         terrain_lod,
+        live_basements,
         native_handedness_by_range,
         type16_present_ranges,
         materials,
@@ -9873,6 +9888,7 @@ struct StaticVulkanApp {
     mesh: VulkanStaticMesh,
     dynamic_vertex_start: usize,
     terrain_lod: Option<terrain_lod::TerrainLodDraws>,
+    live_basements: Option<live_basements::LiveBasements>,
     native_handedness_by_range: HashMap<usize, i8>,
     type16_present_ranges: HashSet<usize>,
     materials: Vec<VulkanStaticMaterial>,
@@ -10001,6 +10017,21 @@ impl StaticVulkanApp {
         fixed_range_indices.insert(shadow_range.range_index);
         let world_range_indices =
             world_draw_range_indices(preview.mesh.draw_ranges.len(), &fixed_range_indices);
+        let mut live_basements = preview.live_basements;
+        if let Some(basements) = &mut live_basements {
+            basements.bind_scene(&preview.mesh);
+        }
+        let mut terrain_lod = preview.terrain_lod;
+        if let (Some(lod), Some(first)) = (
+            &mut terrain_lod,
+            preview
+                .mesh
+                .draw_ranges
+                .iter()
+                .position(|range| range.terrain_surface),
+        ) {
+            lod.set_first_scene_range(first);
+        }
         let world_range_index_counts = preview
             .mesh
             .draw_ranges
@@ -10019,7 +10050,8 @@ impl StaticVulkanApp {
             demo_camera: None,
             mesh: preview.mesh,
             dynamic_vertex_start: preview.dynamic_vertex_start,
-            terrain_lod: preview.terrain_lod,
+            terrain_lod,
+            live_basements,
             native_handedness_by_range: preview.native_handedness_by_range,
             type16_present_ranges: preview.type16_present_ranges,
             materials: preview.materials,
@@ -11209,6 +11241,7 @@ impl StaticVulkanApp {
             }
             self.mission_frame = Some(frame);
         }
+        self.cut_constructed_basements();
         if self.mission_engine.is_some() {
             self.update_mission_title();
         }
@@ -11753,6 +11786,7 @@ impl StaticVulkanApp {
     }
 
     fn render_scene_update(&mut self) -> Result<(), String> {
+        self.upload_live_basements()?;
         let Some(frame) = self.pending_scene_update.as_ref() else {
             return Ok(());
         };
@@ -16126,6 +16160,7 @@ mod tests {
         let preview = StaticPreviewScene {
             fixed_water_clock_ms: None,
             terrain_lod: None,
+            live_basements: None,
             dynamic_vertex_start: 3,
             mesh: VulkanStaticMesh {
                 vertices: [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]

@@ -50,7 +50,8 @@ mod boarding;
 mod builder_supply;
 mod building_door;
 pub use basement_geometry::{
-    mission_basement_footprint, mission_basement_footprints, MissionBasementFootprint,
+    mission_basement_footprint, mission_basement_footprints, place_constructed_basement,
+    MissionBasementFootprint,
 };
 mod building_passage;
 mod capture_barrier;
