@@ -71,6 +71,7 @@ pub(super) struct AutoDemoCombat {
     guard_clans: Vec<bool>,
     projectiles: Vec<AutoDemoProjectileType>,
     flights: Vec<Flight>,
+    finished_segments: Vec<(usize, [[f32; 3]; 2])>,
     pose_failures: super::WeaponPoseReport,
     pub(super) report: CombatReport,
     pub(super) unavailable: usize,
@@ -99,6 +100,7 @@ struct Flight {
     shooter_identity: CombatObject,
     projectile: usize,
     pose: PlayerProjectile,
+    segment: Option<[[f32; 3]; 2]>,
 }
 
 impl AutoDemoCombat {
@@ -134,6 +136,7 @@ impl AutoDemoCombat {
             guard_clans,
             projectiles: Vec::new(),
             flights: Vec::new(),
+            finished_segments: Vec::new(),
             pose_failures: super::WeaponPoseReport::default(),
             report: CombatReport::default(),
             unavailable: 0,
@@ -259,6 +262,13 @@ impl AutoDemoCombat {
             .map(|flight| (flight.projectile, flight.pose))
     }
 
+    pub(super) fn segments(&self) -> impl Iterator<Item = (usize, [[f32; 3]; 2])> + '_ {
+        self.flights
+            .iter()
+            .filter_map(|flight| Some((flight.projectile, flight.segment?)))
+            .chain(self.finished_segments.iter().copied())
+    }
+
     pub(super) fn targets(
         &self,
         world: &fparkan_world::World,
@@ -345,8 +355,10 @@ impl AutoDemoCombat {
     ) -> (Vec<AutoDemoCombatEvent>, usize) {
         let mut events = Vec::new();
         let mut unavailable = 0;
+        self.finished_segments.clear();
         self.flights.retain_mut(|flight| {
             let mut contact = None;
+            let mut travelled = None;
             let Some(mission) = &engine.loaded else {
                 return false;
             };
@@ -354,6 +366,8 @@ impl AutoDemoCombat {
                 let ground = projectile_terrain_hit(&mission.terrain, segment)?;
                 contact = projectile_unit_hit(engine, flight.shooter, segment)
                     .filter(|hit| ground.is_none_or(|fraction| hit.fraction < fraction));
+                let fraction = contact.map(|hit| hit.fraction).or(ground).unwrap_or(1.0);
+                travelled = Some(clip_segment(segment, fraction));
                 Ok(ground.is_some() || contact.is_some())
             });
             if let Some(hit) = contact {
@@ -395,7 +409,16 @@ impl AutoDemoCombat {
                 }
             }
             match stays {
-                Ok(stays) => stays,
+                Ok(true) => {
+                    flight.segment = travelled;
+                    true
+                }
+                Ok(false) => {
+                    if let Some(segment) = travelled {
+                        self.finished_segments.push((flight.projectile, segment));
+                    }
+                    false
+                }
                 Err(_) => {
                     unavailable += 1;
                     self.report
@@ -524,6 +547,7 @@ impl AutoDemoCombat {
                         shooter_identity: shooter,
                         projectile,
                         pose,
+                        segment: None,
                     });
                     self.report
                         .shot(shooter, CombatObject::read(&engine.world, target), now);
@@ -564,9 +588,30 @@ impl AutoDemoCombat {
     }
 }
 
+fn clip_segment([start, end]: [[f32; 3]; 2], fraction: f32) -> [[f32; 3]; 2] {
+    if fraction == 1.0 {
+        [start, end]
+    } else {
+        [
+            start,
+            std::array::from_fn(|i| start[i] + (end[i] - start[i]) * fraction),
+        ]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visible_segment_ends_at_world_contact() {
+        let segment = [[10.0, 20.0, 8.0], [18.0, 24.0, 0.0]];
+        assert_eq!(
+            clip_segment(segment, 0.25),
+            [[10.0, 20.0, 8.0], [12.0, 21.0, 6.0]]
+        );
+        assert_eq!(clip_segment(segment, 1.0), segment);
+    }
     use crate::{
         apply_projectile_hit, control_node_provider_row, create, frame, load_gameplay_mission,
         loaded_mission_assets, loaded_mission_control_device_tables, loaded_mission_script_outcome,
@@ -616,6 +661,7 @@ mod tests {
         .unwrap();
         let mut observed_shots = 0;
         let mut observed_aimed_turret = false;
+        let mut observed_finished_segment = false;
         let mut observed_unavailable = engine.autodemo_combat.as_ref().unwrap().unavailable as u64;
         for now in (0..=120_000).step_by(50) {
             let frame = frame(&mut engine, now).unwrap();
@@ -627,6 +673,12 @@ mod tests {
                 .count();
             observed_shots += shots as u64;
             let combat = engine.autodemo_combat.as_ref().unwrap();
+            observed_finished_segment |= !combat.finished_segments.is_empty();
+            for flight in &combat.flights {
+                if let Some([_, end]) = flight.segment {
+                    assert_eq!(end, flight.pose.position);
+                }
+            }
             assert_eq!(
                 combat
                     .report
@@ -689,6 +741,10 @@ mod tests {
                 assert_eq!(total.count, 1);
                 assert!(observed_shots > 0);
                 assert!(observed_aimed_turret, "no stock turret tracked its target");
+                assert!(
+                    observed_finished_segment,
+                    "no segment survived its projectile's removal"
+                );
                 return;
             }
         }

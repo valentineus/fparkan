@@ -13,7 +13,9 @@ mod mission_hints;
 mod mission_notices;
 mod mission_pause;
 mod player_collision;
+mod projectile_render;
 mod projectile_trail;
+use projectile_render::{prepare_projectile_draw, ProjectileDraw};
 mod script_coverage;
 mod sun_visibility;
 mod terrain_lod;
@@ -97,15 +99,14 @@ use fparkan_runtime::{
     apply_projectile_contact, autodemo_camera, board_friendly_warbot, capture_building,
     capture_neutral_warbot, create, deploy_mine, disembark_warbot, frame as step_mission_frame,
     frame_with_player_motion, load_gameplay_mission, load_mission_static_preview,
-    load_mission_static_preview_roots, load_player_projectile, loaded_mission_assets,
-    loaded_mission_object_drafts, loaded_terrain, mission_object_handle, order_lab_research,
-    plan_player_motion_with_collision, player_vehicle, prepared_warbot_weapons,
-    projectile_terrain_hit, projectile_unit_hit, query_building_segment_world,
-    simulate_mission_report, starting_cockpit, starting_player_weapons, AutoDemoCamera,
-    AutoDemoView, BasementPlacementMode, BuildingMeshNode, Engine, EngineError, EngineServices,
-    FrameResult, LoadedMission, MissionAssets, MissionEventStop, MissionMode, MissionObjectDraft,
-    MissionRequest, MissionStartupInput, PlayerMotion, PlayerProjectile, PlayerWeapons,
-    StartingCockpit, SIMULATION_COVERAGE,
+    load_mission_static_preview_roots, loaded_mission_assets, loaded_mission_object_drafts,
+    loaded_terrain, mission_object_handle, order_lab_research, plan_player_motion_with_collision,
+    player_vehicle, prepared_warbot_weapons, projectile_terrain_hit, projectile_unit_hit,
+    query_building_segment_world, simulate_mission_report, starting_cockpit,
+    starting_player_weapons, AutoDemoCamera, AutoDemoView, BasementPlacementMode, BuildingMeshNode,
+    Engine, EngineError, EngineServices, FrameResult, LoadedMission, MissionAssets,
+    MissionEventStop, MissionMode, MissionObjectDraft, MissionRequest, MissionStartupInput,
+    PlayerMotion, PlayerProjectile, PlayerWeapons, StartingCockpit, SIMULATION_COVERAGE,
 };
 #[cfg(test)]
 use fparkan_runtime::{load_mission_with_init_stubs, plan_player_motion};
@@ -4786,23 +4787,6 @@ struct DynamicComponentGeometry {
     vertex_count: usize,
 }
 
-struct ProjectileDraw {
-    speed: f32,
-    lifetime_ms: u32,
-    volume: Option<f32>,
-    local_vertices: Vec<VulkanStaticVertex>,
-    instances: Vec<ProjectileDrawSlot>,
-}
-
-struct ProjectileDrawSlot {
-    flight: Option<PlayerProjectile>,
-    shooter: Option<ObjectHandle>,
-    vertex_start: usize,
-    draw_ranges: std::ops::Range<usize>,
-    trails: Vec<projectile_trail::ProjectileTrail>,
-    trail_segment: Option<[[f32; 3]; 2]>,
-}
-
 struct PlayerWeaponLayout {
     weapons: PlayerWeapons,
     slots: Vec<(usize, Option<Op2SoundCommand>)>,
@@ -9338,84 +9322,6 @@ fn append_static_preview_component(
     )
 }
 
-fn prepare_projectile_draw(
-    root: &Path,
-    engine: &Engine,
-    archive: &str,
-    name: &str,
-    capacity: impl FnOnce(u32) -> u32,
-    preview: &mut StaticPreviewScene,
-    trail_materials: Option<&mut HashMap<String, PreparedEffectMaterial>>,
-) -> Result<Option<ProjectileDraw>, String> {
-    let projectile = load_player_projectile(engine, archive, name)?;
-    let assets = &projectile.assets;
-    let [id] = assets.visuals_for_object(0) else {
-        return Err("projectile has no single visual".into());
-    };
-    let visual = assets
-        .visual_by_id(*id)
-        .ok_or("projectile visual unavailable")?;
-    let Some(model) = visual.model_id.and_then(|id| assets.model_by_id(id)) else {
-        // Some projectile prototypes use only FX for their visible body.
-        return Ok(None);
-    };
-    let geometry = project_msh_to_static_mesh_in_world_space_with_node_fallback_poses(
-        &model.validated,
-        LegacyIron3dEulerTransform {
-            translation: [0.0; 3],
-            orientation_radians: [0.0; 3],
-        },
-        [1.0; 3],
-    )
-    .map_err(|error| error.to_string())?;
-    if geometry.draw_ranges.is_empty() {
-        return Ok(None);
-    }
-    let selector_remap = static_preview_component_materials(
-        assets,
-        visual,
-        &geometry,
-        None,
-        &mut preview.materials,
-        &mut preview.material_animations,
-    )?;
-    let capacity = capacity(projectile.lifetime_ms).min(128);
-    let layers = trail_materials.map_or_else(Vec::new, |materials| {
-        projectile_trail::prepare(root, &projectile, name, preview, materials)
-    });
-    let mut instances = Vec::new();
-    for _ in 0..capacity {
-        let vertex_start = preview.mesh.vertices.len();
-        let range_start = preview.mesh.draw_ranges.len();
-        append_static_preview_component(
-            &mut preview.mesh,
-            geometry.clone(),
-            &selector_remap,
-            Some(&mut preview.material_animations),
-        )?;
-        let draw_ranges = range_start..preview.mesh.draw_ranges.len();
-        let trails = layers
-            .iter()
-            .map(|&layer| projectile_trail::ProjectileTrail::allocate(&mut preview.mesh, layer))
-            .collect::<Result<_, _>>()?;
-        instances.push(ProjectileDrawSlot {
-            flight: None,
-            shooter: None,
-            vertex_start,
-            draw_ranges,
-            trails,
-            trail_segment: None,
-        });
-    }
-    Ok(Some(ProjectileDraw {
-        speed: projectile.speed,
-        lifetime_ms: projectile.lifetime_ms,
-        volume: projectile.volume,
-        local_vertices: geometry.vertices,
-        instances,
-    }))
-}
-
 fn append_static_preview_component_with_lightmaps(
     target: &mut VulkanStaticMesh,
     component: VulkanStaticMesh,
@@ -9757,7 +9663,7 @@ fn run_static_vulkan_mode(
                 &name,
                 capacity,
                 &mut preview,
-                Some(&mut projectile_effect_materials),
+                &mut projectile_effect_materials,
             ) {
                 Ok(draw @ Some(_)) => draw,
                 Ok(None) => {
@@ -9774,7 +9680,7 @@ fn run_static_vulkan_mode(
     }
     let autodemo_draws = mission_engine.as_ref().map_or_else(Vec::new, |engine| {
         fparkan_runtime::autodemo_projectile_types(engine).iter().map(|kind| {
-            match prepare_projectile_draw(root, engine, &kind.archive, &kind.name, |_| kind.capacity, &mut preview, None) {
+            match prepare_projectile_draw(root, engine, &kind.archive, &kind.name, |_| kind.capacity, &mut preview, &mut projectile_effect_materials) {
                 Ok(Some(draw)) => Some(draw),
                 result => {
                     let reason = result.err().unwrap_or_else(|| "effect-only body".into());
@@ -10783,22 +10689,7 @@ impl StaticVulkanApp {
                 frame.autodemo_combat_unavailable
             );
         }
-        for draw in self.autodemo_draws.iter_mut().flatten() {
-            for instance in &mut draw.instances {
-                instance.flight = None;
-            }
-        }
-        for (slot, flight) in fparkan_runtime::autodemo_projectiles(engine) {
-            if let Some(draw) = self.autodemo_draws.get_mut(slot).and_then(Option::as_mut) {
-                if let Some(instance) = draw
-                    .instances
-                    .iter_mut()
-                    .find(|instance| instance.flight.is_none())
-                {
-                    instance.flight = Some(flight);
-                }
-            }
-        }
+        projectile_render::sample_autonomous(&mut self.autodemo_draws, engine);
     }
 
     fn building_segment_blocked(&self, world_segment: [[f32; 3]; 2]) -> Result<bool, String> {

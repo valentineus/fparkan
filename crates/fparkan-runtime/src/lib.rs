@@ -3364,6 +3364,16 @@ pub fn autodemo_projectiles(
         .flat_map(unit_combat::AutoDemoCombat::flights)
 }
 
+/// Travel during the latest combat step, including segments ending on impact.
+pub fn autonomous_projectile_segments(
+    engine: &Engine,
+) -> impl Iterator<Item = (usize, [[f32; 3]; 2])> + '_ {
+    engine
+        .autodemo_combat
+        .iter()
+        .flat_map(unit_combat::AutoDemoCombat::segments)
+}
+
 /// Counts autonomous weapons or projectile profiles that could not be prepared.
 #[must_use]
 pub fn autodemo_combat_unavailable(engine: &Engine) -> usize {
