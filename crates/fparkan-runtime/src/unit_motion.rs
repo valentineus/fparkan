@@ -9,9 +9,6 @@ pub struct UnitMotionSample {
     pub updates: u64,
     pub first_ms: u32,
     pub last_ms: u32,
-    pub discarded_waypoints: u64,
-    /// Sum of unused frame intervals, individually rounded to microseconds.
-    pub discarded_time_us: u64,
 }
 
 /// Counts persist after orders end or the object leaves the world.
@@ -32,19 +29,6 @@ impl UnitMotionReport {
         sample.updates += 1;
         sample.last_ms = now;
     }
-
-    pub(super) fn discard_waypoint_time(&mut self, object: CombatObject, seconds: f32) {
-        let time_us = (f64::from(seconds.max(0.0)) * 1_000_000.0).round() as u64;
-        if time_us == 0 {
-            return;
-        }
-        let sample = self
-            .objects
-            .get_mut(&object)
-            .expect("recorded motion update");
-        sample.discarded_waypoints += 1;
-        sample.discarded_time_us += time_us;
-    }
 }
 
 /// Reads observations shared by the interactive and headless mission paths.
@@ -58,7 +42,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn counts_updates_and_unused_time_separately_for_reused_slots() {
+    fn counts_updates_separately_for_reused_slots() {
         let object = CombatObject {
             slot: 4,
             generation: 1,
@@ -70,9 +54,7 @@ mod tests {
         };
         let mut report = UnitMotionReport::default();
         report.update(object, 0);
-        report.discard_waypoint_time(object, 0.125);
         report.update(object, 500);
-        report.discard_waypoint_time(object, 0.0);
         report.update(replacement, 1_000);
         assert_eq!(
             report.objects[&object],
@@ -80,17 +62,14 @@ mod tests {
                 updates: 2,
                 first_ms: 0,
                 last_ms: 500,
-                discarded_waypoints: 1,
-                discarded_time_us: 125_000,
             }
         );
         assert_eq!(report.objects[&replacement].updates, 1);
-        assert_eq!(report.objects[&replacement].discarded_time_us, 0);
     }
 
     #[test]
     #[ignore = "requires licensed corpus"]
-    fn licensed_stock_patrol_reports_controller_updates_and_lost_time() {
+    fn licensed_stock_patrol_reports_controller_updates() {
         use crate::{
             create, load_gameplay_mission, simulate_mission_report, EngineServices, MissionMode,
             MissionRequest, MissionStartupInput,
@@ -127,9 +106,6 @@ mod tests {
             .unit_motion
             .objects
             .values()
-            .any(|sample| sample.updates > 1
-                && sample.last_ms > sample.first_ms
-                && sample.discarded_waypoints > 0
-                && sample.discarded_time_us > 0));
+            .any(|sample| sample.updates > 1 && sample.last_ms > sample.first_ms));
     }
 }

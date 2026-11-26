@@ -3,13 +3,14 @@ use super::{
     boarding::WARBOT_CLASS,
     next_crt_rand,
     patrol_points::{PatrolPointReport, PatrolPoints},
+    route_motion::{follow_route, route_points, turn_toward},
     unit_combat::CombatTarget,
     unit_speed::{order_speed, UnitSpeedKind, UnitSpeedReport},
     EngineError, LoadedMissionState, MissionDocument, MissionObjectDraft, MissionScriptBundle,
     ObjectHandle, TerrainWorld, TransformState, World,
 };
 use fparkan_script::{Handler15TargetPayload, ScriptDispatchSelector, VarSet};
-use fparkan_terrain::{NavigationQuery, RouteRequest, SurfaceQuery};
+use fparkan_terrain::{NavigationQuery, SurfaceQuery};
 use fparkan_world::{identity_metadata, set_transform, transform_state};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 
@@ -543,7 +544,7 @@ impl UnitPatrol {
             if let Some(enemy) = enemy.filter(|enemy| enemy.in_range) {
                 let mut after = before;
                 let (yaw, _) = turn_toward(
-                    before,
+                    f32::from_bits(before.orientation[2]),
                     [enemy.center[0] - from[0], enemy.center[1] - from[1]],
                     seconds,
                 );
@@ -585,23 +586,9 @@ impl UnitPatrol {
                 };
                 unit.retry_ms = now_ms.saturating_add(1_000);
             }
-            let Some(&target) = unit.points.front() else {
-                continue;
-            };
-            let dx = target[0] - from[0];
-            let dy = target[1] - from[1];
-            let distance = dx.hypot(dy);
-            if distance <= 0.05 {
-                unit.points.pop_front();
-                state
-                    .motion_report
-                    .discard_waypoint_time(motion_object, seconds);
+            if unit.points.is_empty() {
                 continue;
             }
-            let mut after = before;
-            // shortcut: turn and non-place orders still use the temporary controller.
-            let (yaw, turn_seconds) = turn_toward(before, [dx, dy], seconds);
-            after.orientation[2] = yaw.to_bits();
             let speed = if (place_patrol && enemy.is_none()) || unit.destinations.is_some() {
                 let kind = if place_patrol {
                     UnitSpeedKind::PatrolPlace
@@ -624,27 +611,9 @@ impl UnitPatrol {
             } else {
                 9.0
             };
-            let travel = speed * (seconds - turn_seconds);
-            if travel > 0.0 {
-                let fraction = (travel / distance).min(1.0);
-                let xy = [from[0] + dx * fraction, from[1] + dy * fraction];
-                if let Some(ground) = terrain.height_at(xy).map_err(EngineError::Terrain)? {
-                    let old_ground = terrain
-                        .height_at([from[0], from[1]])
-                        .map_err(EngineError::Terrain)?;
-                    let z = ground + old_ground.map_or(0.0, |height| from[2] - height);
-                    after.position = [xy[0], xy[1], z].map(f32::to_bits);
-                    if fraction == 1.0 {
-                        unit.points.pop_front();
-                        state.motion_report.discard_waypoint_time(
-                            motion_object,
-                            seconds - turn_seconds - distance / speed,
-                        );
-                    }
-                } else {
-                    unit.points.clear();
-                }
-            }
+            let after = follow_route(before, &mut unit.points, speed, seconds, |xy| {
+                terrain.height_at(xy).map_err(EngineError::Terrain)
+            })?;
             if after != before {
                 poses.push((unit.handle, before, after));
             }
@@ -854,18 +823,6 @@ fn patrol_limits_new_targets_and_ends_pursuit_at_the_outer_boundary() {
     assert!(!patrol.allows_attack([650.0, 902.0, 0.0]));
 }
 
-fn turn_toward(pose: TransformState, [dx, dy]: [f32; 2], seconds: f32) -> (f32, f32) {
-    let yaw = f32::from_bits(pose.orientation[2]);
-    let goal_yaw = (-dx).atan2(dy);
-    let turn = (goal_yaw - yaw + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU)
-        - std::f32::consts::PI;
-    let turn_budget = 2.0 * seconds;
-    (
-        yaw + turn.clamp(-turn_budget, turn_budget),
-        seconds.min(turn.abs() * 0.5),
-    )
-}
-
 fn choose_route(
     terrain: &TerrainWorld,
     from: [f32; 3],
@@ -885,25 +842,6 @@ fn choose_route(
         }
     }
     Ok(VecDeque::new())
-}
-
-pub(super) fn route_points(
-    terrain: &TerrainWorld,
-    from: [f32; 3],
-    goal: [f32; 3],
-) -> Result<Option<VecDeque<[f32; 2]>>, EngineError> {
-    let route = terrain
-        .route(RouteRequest { start: from, goal })
-        .map_err(EngineError::Terrain)?;
-    Ok(route.and_then(|route| {
-        let mut points = route
-            .areas
-            .windows(2)
-            .map(|pair| terrain.route_crossing(pair[0], pair[1]))
-            .collect::<Option<VecDeque<_>>>()?;
-        points.push_back([goal[0], goal[1]]);
-        Some(points)
-    }))
 }
 
 impl PreparedPatrol {

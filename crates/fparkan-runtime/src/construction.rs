@@ -392,7 +392,7 @@ fn destination(
 ) -> Option<[f32; 3]> {
     let [x, y] = xy.map(|x| x as f32);
     let position = [x, y, terrain.height_at([x, y]).ok()??];
-    crate::unit_patrol::route_points(terrain, from, position).ok()??;
+    crate::route_motion::route_points(terrain, from, position).ok()??;
     Some(position)
 }
 

@@ -93,6 +93,7 @@ mod production;
 mod projectile;
 mod research;
 mod resource_distribution;
+mod route_motion;
 use resource_distribution::advance_behavior_distributor_tick;
 mod script_host;
 mod script_patrol;
