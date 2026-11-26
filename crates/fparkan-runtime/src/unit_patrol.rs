@@ -424,7 +424,7 @@ impl UnitPatrol {
         count_rng: &mut u32,
     ) -> Result<PreparedPatrol, EngineError> {
         let terrain = &mission.terrain;
-        let chassis = &mission.unit_can_fly;
+        let chassis = &mission.unit_chassis_flags;
         let mut state = self.clone();
         state.advance_script_orders(world, &mission.control_device_tables);
         state.units.retain(|unit| {
@@ -449,7 +449,7 @@ impl UnitPatrol {
             let from = before.position.map(f32::from_bits);
             let motion_object = crate::CombatObject::read(world, unit.handle);
             let original_id = motion_object.original_id.unwrap_or(unit.handle.slot);
-            let can_fly = chassis.get(&original_id).copied().flatten();
+            let can_fly = chassis.get(&original_id).and_then(|flags| flags.can_fly);
             if let Some(destinations) = &mut unit.destinations {
                 if destinations
                     .front()

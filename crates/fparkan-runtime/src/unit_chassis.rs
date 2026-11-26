@@ -1,12 +1,13 @@
 //! Chassis behavior flags shared by autonomous and player control.
-use crate::MissionObjectDraft;
+use crate::{Engine, MissionObjectDraft};
+use fparkan_assets::{decode_chassis_flags, ChassisFlags};
 use fparkan_resource::{resource_name, CachedResourceRepository, ResourceRepository};
 use std::collections::BTreeMap;
 
 pub(super) fn load_flags(
     resources: &CachedResourceRepository,
     drafts: &[MissionObjectDraft],
-) -> BTreeMap<u32, Option<bool>> {
+) -> BTreeMap<u32, ChassisFlags> {
     drafts
         .iter()
         .filter(|draft| {
@@ -17,7 +18,7 @@ pub(super) fn load_flags(
         .filter_map(|draft| {
             draft
                 .original_id
-                .map(|id| (id.0, can_fly(resources, draft)))
+                .map(|id| (id.0, load_profile(resources, draft).unwrap_or_default()))
         })
         .collect()
 }
@@ -26,6 +27,25 @@ pub(super) fn can_fly(
     resources: &CachedResourceRepository,
     draft: &MissionObjectDraft,
 ) -> Option<bool> {
+    load_profile(resources, draft)?.can_fly
+}
+
+/// Returns whether a loaded draft has an explicit walking chassis profile.
+pub fn loaded_walk_chassis(engine: &Engine, object_index: usize) -> bool {
+    engine.loaded.as_ref().is_some_and(|mission| {
+        mission
+            .object_drafts
+            .get(object_index)
+            .and_then(|draft| draft.original_id)
+            .and_then(|id| mission.unit_chassis_flags.get(&id.0))
+            .is_some_and(|flags| flags.walk_chassis == Some(true))
+    })
+}
+
+fn load_profile(
+    resources: &CachedResourceRepository,
+    draft: &MissionObjectDraft,
+) -> Option<ChassisFlags> {
     let chassis = draft.unit_components.first()?;
     let archive = crate::bounded_ascii_c_string(&chassis.archive_raw)?;
     let registry_path = crate::normalize_engine_path("chassis archive", &archive).ok()?;
@@ -45,5 +65,5 @@ pub(super) fn can_fly(
     let entry = resources
         .find(archive, &resource_name(name.as_bytes()))
         .ok()??;
-    fparkan_assets::decode_chassis_can_fly(resources.read(entry).ok()?.as_slice()).ok()?
+    decode_chassis_flags(resources.read(entry).ok()?.as_slice()).ok()
 }

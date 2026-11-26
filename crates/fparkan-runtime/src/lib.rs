@@ -103,12 +103,15 @@ mod script_host;
 mod script_patrol;
 mod script_time;
 mod unit_chassis;
+pub use unit_chassis::loaded_walk_chassis;
 mod unit_combat;
 mod unit_motion;
 pub use unit_motion::{loaded_mission_unit_motion_report, UnitMotionReport, UnitMotionSample};
 mod unit_patrol;
 mod unit_size_class;
 mod unit_spawn;
+mod walk_animation;
+pub use walk_animation::WalkAnimation;
 mod weapon_pose;
 mod wheel_animation;
 pub use weapon_pose::{initial_component_node_times, WeaponPoseReport};
@@ -1400,7 +1403,7 @@ struct LoadedMissionState {
     mission_assets: MissionAssets,
     asset_plan: MissionAssetPlan,
     object_drafts: Vec<MissionObjectDraft>,
-    unit_can_fly: std::collections::BTreeMap<u32, Option<bool>>,
+    unit_chassis_flags: std::collections::BTreeMap<u32, fparkan_assets::ChassisFlags>,
     behavior_distributors: Vec<BehaviorDistributorState>,
     behavior_ore_states: Vec<BehaviorOreState>,
     behavior_profiles: Vec<BehaviorProfileState>,
@@ -2726,7 +2729,7 @@ node_provider_distribution_suspended: false,
     engine.production = production;
     let free_research = research::FreeResearch::new(&object_drafts[..reserve_start]);
     let chassis_resources = CachedResourceRepository::new(vfs.clone());
-    let unit_can_fly = unit_chassis::load_flags(&chassis_resources, &object_drafts);
+    let unit_chassis_flags = unit_chassis::load_flags(&chassis_resources, &object_drafts);
     engine.loaded = Some(LoadedMissionState {
         summary: summary.clone(),
         mission,
@@ -2737,7 +2740,7 @@ node_provider_distribution_suspended: false,
         mission_assets,
         asset_plan: mission_asset_plan,
         object_drafts,
-        unit_can_fly,
+        unit_chassis_flags,
         behavior_distributors,
         behavior_ore_states,
         behavior_profiles,

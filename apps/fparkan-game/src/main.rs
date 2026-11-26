@@ -5,6 +5,7 @@
 use fparkan_runtime::initial_component_node_times as static_preview_node_times;
 
 mod camera_capture;
+mod chassis_animation;
 #[cfg(windows)]
 mod control_effects;
 use control_effects::{advance_control_effect_instances, owner_control_capacity};
@@ -279,7 +280,7 @@ fn run(args: &[String]) -> Result<String, String> {
         .and_then(|c| c.celestial_births.clone());
     let hold_schedule_phase = camera.is_some() && atmosphere_seconds.is_some();
     let terrain_materials_duration_started = Instant::now();
-    let preview = static_preview_mesh_and_materials(
+    let mut preview = static_preview_mesh_and_materials(
         mission_assets,
         terrain,
         roots,
@@ -292,6 +293,9 @@ fn run(args: &[String]) -> Result<String, String> {
         !args.viewer,
         (!args.viewer).then(|| starting_cockpit(&engine)).flatten(),
     )?;
+    if !args.viewer {
+        chassis_animation::connect_walkers(&engine, &mut preview);
+    }
     let terrain_materials_duration = terrain_materials_duration_started.elapsed();
     // Atmosphere files are mission-local assets.  Resolving them from the
     // entire install tree would silently attach the first unrelated mission's
@@ -4766,6 +4770,7 @@ struct ControlAnimationInstance {
     reported_unsupported_fallback: bool,
     door_blends: Vec<f32>,
     wheels: Option<fparkan_runtime::WheelAnimation>,
+    walk: Option<fparkan_runtime::WalkAnimation>,
 }
 
 #[derive(Clone)]
@@ -7378,13 +7383,14 @@ fn update_gameplay_animation_pose_buffers(
                     }
                 }
             }
-            if let (Some(wheels), Some((roots, snapshot))) = (&mut instance.wheels, motion) {
-                if let Some(root) = roots.get(object_index).and_then(Option::as_ref) {
-                    if let Some(pose) = live_root_pose(root.handle, snapshot) {
-                        wheels.sample(root.handle, pose, &mut node_times);
-                    }
-                }
-            }
+            let walking = motion.is_some_and(|(roots, snapshot)| {
+                roots
+                    .get(object_index)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|root| {
+                        chassis_animation::sample(instance, root, snapshot, &mut node_times)
+                    })
+            });
             instance.last_sampled_node_times.clone_from(&node_times);
             let times = node_times
                 .into_iter()
@@ -7392,7 +7398,10 @@ fn update_gameplay_animation_pose_buffers(
                 .collect::<Vec<_>>();
             let hierarchy = node38_sampled_hierarchy_at_times(&instance.model, &times)
                 .or_else(|| node38_fallback_hierarchy(&instance.model));
-            if let Some(hierarchy) = hierarchy {
+            if let Some(mut hierarchy) = hierarchy {
+                if let Some(walk) = instance.walk.as_ref().filter(|_| walking) {
+                    walk.remove_root_progress(&mut hierarchy);
+                }
                 if let Some(pose_buffer) = object_pose_buffers.get_mut(component_index) {
                     *pose_buffer = Some(hierarchy);
                 }
@@ -8377,6 +8386,7 @@ fn static_preview_mesh_and_materials(
                         last_sampled_node_times: Vec::new(),
                         reported_unsupported_fallback: false,
                         door_blends: Vec::new(),
+                        walk: None,
                         wheels: if component_index == 0
                             && mission_root
                                 .unit_dat_header_flags
@@ -13832,6 +13842,7 @@ mod tests {
             reported_unsupported_fallback: false,
             door_blends: Vec::new(),
             wheels: None,
+            walk: None,
         });
 
         let first = FrameClockSample {
@@ -13937,6 +13948,7 @@ mod tests {
             reported_unsupported_fallback: false,
             door_blends: Vec::new(),
             wheels: None,
+            walk: None,
         })]];
         let hierarchy =
             static_preview_component_pose_buffer(&model, &controls.bindings, None).unwrap();
@@ -14518,6 +14530,7 @@ mod tests {
                 reported_unsupported_fallback: false,
                 door_blends: Vec::new(),
                 wheels: None,
+                walk: None,
             }),
             None,
         ]];
@@ -14861,6 +14874,7 @@ mod tests {
                 reported_unsupported_fallback: false,
                 door_blends: Vec::new(),
                 wheels: None,
+                walk: None,
             }),
             None,
         ]];
@@ -15826,6 +15840,7 @@ mod tests {
             reported_unsupported_fallback: false,
             door_blends: Vec::new(),
             wheels: None,
+            walk: None,
         });
         let turret_pose = |app: &StaticVulkanApp, node| {
             let hierarchy = app.component_pose_buffers[cockpit.object_index]

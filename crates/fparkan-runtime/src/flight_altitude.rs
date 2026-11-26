@@ -75,8 +75,14 @@ mod tests {
         .unwrap();
         let id = OriginalObjectId(2);
         assert_eq!(
-            engine.loaded.as_ref().unwrap().unit_can_fly.get(&id.0),
-            Some(&Some(true))
+            engine
+                .loaded
+                .as_ref()
+                .unwrap()
+                .unit_chassis_flags
+                .get(&id.0)
+                .and_then(|flags| flags.can_fly),
+            Some(true)
         );
         let handle = handle_by_original_id(&engine.world, id).unwrap();
         let [a, b, initial_z] = transform_state(&engine.world, handle)
