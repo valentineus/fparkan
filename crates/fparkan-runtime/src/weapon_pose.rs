@@ -165,6 +165,49 @@ impl WeaponPoses {
         self.aims.get(component).copied().flatten()
     }
 
+    pub(super) fn initial_model_spheres(
+        &self,
+        assets: &MissionAssets,
+        index: usize,
+    ) -> Vec<([f32; 3], f32)> {
+        let models: Vec<_> = assets
+            .visuals_for_object(index)
+            .iter()
+            .map(|&id| assets.model_by_id(assets.visual_by_id(id)?.model_id?))
+            .collect();
+        let controls = assets.object_component_controls.get(index);
+        let hierarchies: Vec<_> = models
+            .iter()
+            .enumerate()
+            .map(|(component, model)| {
+                let model = &model.as_ref()?.validated;
+                let bindings = controls
+                    .and_then(|controls| controls.get(component)?.as_ref())
+                    .map_or(&[][..], |control| control.bindings.as_slice());
+                initial_component_node_times(model.node_count, bindings)
+                    .ok()
+                    .and_then(|times| node38_sampled_hierarchy_at_times(model, &times))
+                    .or_else(|| node38_fallback_hierarchy(model))
+            })
+            .collect();
+        models
+            .into_iter()
+            .zip(&self.mounts)
+            .filter_map(|(model, mount)| {
+                let model = &model?.validated;
+                let center = model.bounding_sphere_center;
+                let center = match *mount {
+                    Mount::Root => center,
+                    Mount::Socket(parent, socket) => {
+                        mounted_point(&hierarchies, &self.mounts, parent, socket, center)?
+                    }
+                    Mount::Unavailable => return None,
+                };
+                Some((center, model.bounding_sphere_radius))
+            })
+            .collect()
+    }
+
     #[cfg(test)]
     pub(super) fn has_aim(&self) -> bool {
         self.aims.iter().any(Option::is_some)

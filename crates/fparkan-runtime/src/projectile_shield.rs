@@ -2,7 +2,8 @@
 
 use crate::{
     control_device_budget_coefficient, control_device_selector_zero, fixed_words_ascii_c_string,
-    projectile::unit_sphere, Engine, MissionControlDeviceTableStatus, ProjectileContact,
+    projectile::unit_sphere, weapon_pose::WeaponPoses, Engine, MissionControlDeviceTableStatus,
+    ProjectileContact,
 };
 use fparkan_render::LegacyIron3dEulerTransform;
 use fparkan_world::transform_state;
@@ -17,9 +18,41 @@ pub struct ShieldImpact {
     pub world_from_effect: [[f32; 4]; 4],
 }
 
+pub(super) struct ShieldImpacts {
+    pulses: Vec<ShieldImpact>,
+    local_spheres: Vec<Option<([f32; 3], f32)>>,
+}
+
 /// Enables collection of transient shield pulses for the presentation layer.
 pub fn collect_shield_impacts(engine: &mut Engine) {
-    engine.shield_impacts = Some(Vec::new());
+    let local_spheres = engine.loaded.as_ref().map_or_else(Vec::new, |mission| {
+        let assets = &mission.mission_assets;
+        mission
+            .object_drafts
+            .iter()
+            .enumerate()
+            .map(|(index, draft)| {
+                if draft.unit_dat_header_flags != Some(crate::boarding::WARBOT_CLASS) {
+                    return None;
+                }
+                let controls = assets.object_component_controls.get(index)?;
+                if !controls
+                    .iter()
+                    .flatten()
+                    .flat_map(|control| &control.typed_records)
+                    .any(|record| record.tag == 9)
+                {
+                    return None;
+                }
+                let poses = WeaponPoses::new(draft, assets, index);
+                enclosing_sphere(&poses.initial_model_spheres(assets, index))
+            })
+            .collect()
+    });
+    engine.shield_impacts = Some(ShieldImpacts {
+        pulses: Vec::new(),
+        local_spheres,
+    });
 }
 
 /// Drains shield pulses accumulated since the last presentation update.
@@ -27,7 +60,7 @@ pub fn take_shield_impacts(engine: &mut Engine) -> Vec<ShieldImpact> {
     engine
         .shield_impacts
         .as_mut()
-        .map_or_else(Vec::new, std::mem::take)
+        .map_or_else(Vec::new, |impacts| std::mem::take(&mut impacts.pulses))
 }
 
 /// Finds authored shield effects for placed units and prepared spawn slots.
@@ -131,14 +164,55 @@ pub(super) fn absorb(engine: &mut Engine, hit: ProjectileContact, volume: f32) -
     deltas[sector] = (f32::from_bits(deltas[sector]) + (updated - fraction)).to_bits();
     if let Some(impacts) = engine.shield_impacts.as_mut() {
         if let Some(source) = shield_effect_source(&shield.descriptor.fixed_words) {
-            impacts.push(ShieldImpact {
+            let display_sphere = || {
+                let (center, radius) = *impacts.local_spheres.get(index)?.as_ref()?;
+                let scale = pose.scale.map(f32::from_bits);
+                let transform = LegacyIron3dEulerTransform {
+                    translation: pose.position.map(f32::from_bits),
+                    orientation_radians: pose.orientation.map(f32::from_bits),
+                };
+                Some((
+                    transform.try_transform_scaled_point(center, scale)?,
+                    radius * scale.into_iter().map(f32::abs).fold(0.0, f32::max),
+                ))
+            };
+            let (display_center, display_radius) = display_sphere().unwrap_or((center, radius));
+            // Keep the direction of the actual contact on the collision
+            // sphere until the field has its own collision surface.
+            impacts.pulses.push(ShieldImpact {
                 object_index: index,
                 source,
-                world_from_effect: effect_transform(center, offset, radius),
+                world_from_effect: effect_transform(display_center, offset, display_radius),
             });
         }
     }
     remaining
+}
+
+fn enclosing_sphere(parts: &[([f32; 3], f32)]) -> Option<([f32; 3], f32)> {
+    // AniMesh+0x9510 weights model centers by the authored radii. A second
+    // pass then puts even the most distant model sphere inside the result.
+    let weight: f32 = parts.iter().map(|(_, radius)| radius).sum();
+    if weight <= 0.0 {
+        return None;
+    }
+    let center = std::array::from_fn(|axis| {
+        parts
+            .iter()
+            .map(|(point, radius)| point[axis] * radius)
+            .sum::<f32>()
+            / weight
+    });
+    let radius = parts
+        .iter()
+        .map(|(point, radius)| {
+            let distance_sq: f32 = (0..3)
+                .map(|axis| (center[axis] - point[axis]).powi(2))
+                .sum();
+            distance_sq.sqrt() + radius
+        })
+        .fold(0.0, f32::max);
+    Some((center, radius))
 }
 
 fn effect_transform(center: [f32; 3], [x, y, z]: [f32; 3], radius: f32) -> [[f32; 4]; 4] {
@@ -180,6 +254,13 @@ fn intercept(volume: f32, capacity: f32) -> (f32, f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enclosing_sphere_uses_radii_to_weight_the_center() {
+        let parts = [([0.0; 3], 2.0), ([6.0, 0.0, 0.0], 1.0)];
+        assert_eq!(enclosing_sphere(&parts), Some(([2.0, 0.0, 0.0], 5.0)));
+        assert_eq!(enclosing_sphere(&[]), None);
+    }
 
     #[test]
     fn shield_spends_strength_before_dealing_hull_damage() {
@@ -253,6 +334,9 @@ mod tests {
             })
             .expect("stock shield with a charged front sector");
         collect_shield_impacts(&mut engine);
+        let (center, radius) = engine.shield_impacts.as_ref().unwrap().local_spheres[0]
+            .expect("stock AutoDemo warbot enclosure");
+        assert!(center[2] > 0.0 && radius > 6.0);
         assert!(
             apply_projectile_contact(&mut engine, contact, capacity * 0.5)
                 .unwrap()

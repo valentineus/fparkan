@@ -1417,7 +1417,7 @@ pub struct Engine {
     autodemo_reinforcements: Option<autodemo::LiveReinforcements>,
     production: Option<production::Production>,
     destruction_effects: Option<Vec<UnitDestructionEffect>>,
-    shield_impacts: Option<Vec<ShieldImpact>>,
+    shield_impacts: Option<projectile_shield::ShieldImpacts>,
 }
 
 struct LoadedMissionState {
