@@ -3,7 +3,9 @@ use super::{
     boarding::WARBOT_CLASS,
     next_crt_rand,
     patrol_points::{PatrolPointReport, PatrolPoints},
+    projectile::unit_sphere,
     route_motion::{follow_route, route_points, turn_toward},
+    route_obstacles::BuildingFootprints,
     unit_combat::CombatTarget,
     unit_speed::{order_speed, UnitSpeedKind, UnitSpeedReport},
     EngineError, LoadedMissionState, MissionDocument, MissionObjectDraft, MissionScriptBundle,
@@ -30,6 +32,7 @@ pub(super) struct UnitPatrol {
     pub(super) speed_report: UnitSpeedReport,
     pub(super) motion_report: crate::UnitMotionReport,
     pub(super) factory_raid_clans: usize,
+    buildings: BuildingFootprints,
 }
 
 #[derive(Clone)]
@@ -158,6 +161,7 @@ impl UnitPatrol {
             speed_report: UnitSpeedReport::default(),
             motion_report: crate::UnitMotionReport::default(),
             factory_raid_clans: 0,
+            buildings: BuildingFootprints::default(),
         }
     }
 
@@ -401,6 +405,7 @@ impl UnitPatrol {
             speed_report: UnitSpeedReport::default(),
             motion_report: crate::UnitMotionReport::default(),
             factory_raid_clans: 0,
+            buildings: BuildingFootprints::default(),
         })
     }
 
@@ -425,6 +430,9 @@ impl UnitPatrol {
         });
         let seconds = now_ms.saturating_sub(state.clock_ms) as f32 * 0.001;
         state.clock_ms = state.clock_ms.max(now_ms);
+        if seconds > 0.0 && !state.units.is_empty() {
+            state.buildings.refresh(world, mission);
+        }
         let mut poses = Vec::new();
         for unit in &mut state.units {
             let Ok(before) = transform_state(world, unit.handle) else {
@@ -611,7 +619,16 @@ impl UnitPatrol {
             } else {
                 9.0
             };
-            let after = follow_route(before, &mut unit.points, speed, seconds, |xy| {
+            let clearance = motion_object
+                .original_id
+                .and_then(|id| {
+                    let (center, radius) =
+                        unit_sphere(&mission.mission_assets, id as usize, before)?;
+                    Some(radius + (center[0] - from[0]).hypot(center[1] - from[1]))
+                })
+                .unwrap_or(0.0);
+            let obstacles = state.buildings.with_clearance(clearance);
+            let after = follow_route(before, &mut unit.points, speed, seconds, &obstacles, |xy| {
                 terrain.height_at(xy).map_err(EngineError::Terrain)
             })?;
             if after != before {

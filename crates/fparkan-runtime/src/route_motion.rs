@@ -1,6 +1,9 @@
 //! Follow a terrain route with a shared time budget for turning and travel.
 
-use crate::{EngineError, TerrainWorld, TransformState};
+use crate::{
+    route_obstacles::{open_leg, Footprint},
+    EngineError, TerrainWorld, TransformState,
+};
 use fparkan_terrain::{NavigationQuery, RouteRequest};
 use std::collections::VecDeque;
 
@@ -39,10 +42,17 @@ pub(super) fn follow_route(
     points: &mut VecDeque<[f32; 2]>,
     speed: f32,
     mut seconds: f32,
+    obstacles: &[Footprint],
     mut height_at: impl FnMut([f32; 2]) -> Result<Option<f32>, EngineError>,
 ) -> Result<TransformState, EngineError> {
     let [mut x, mut y, mut z] = pose.position.map(f32::from_bits);
-    while seconds > 0.0 {
+    while seconds > 0.0 && !points.is_empty() {
+        if !open_leg([x, y], points, obstacles, |point| {
+            height_at(point).map(|z| z.is_some())
+        })? {
+            points.clear();
+            break;
+        }
         let Some(&target) = points.front() else { break };
         let [dx, dy] = [target[0] - x, target[1] - y];
         let distance = dx.hypot(dy);
@@ -92,7 +102,7 @@ mod tests {
             ..Default::default()
         };
         let mut route = VecDeque::from([[0.0, 0.0], [0.0, 1.0], [4.0, 1.0]]);
-        let end = follow_route(start, &mut route, 2.0, 2.0, |[x, y]| Ok(Some(x + y))).unwrap();
+        let end = follow_route(start, &mut route, 2.0, 2.0, &[], |[x, y]| Ok(Some(x + y))).unwrap();
         let [x, y, z] = end.position.map(f32::from_bits);
         let expected_x = 3.0 - std::f32::consts::FRAC_PI_2;
         assert!((x - expected_x).abs() < 0.000_01);
