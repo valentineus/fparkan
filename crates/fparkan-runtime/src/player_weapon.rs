@@ -41,8 +41,10 @@ pub struct PlayerWeapon {
 #[derive(Clone)]
 struct Barrel {
     muzzle: PreparedControlPoint,
+    row: PreparedControlTimelineRow,
     rate: f64,
     blend: f64,
+    from_blend: f64,
 }
 
 #[derive(Clone, PartialEq)]
@@ -72,6 +74,40 @@ impl PlayerWeapons {
     /// Returns the prepared devices in selection order.
     pub fn weapons(&self) -> &[PlayerWeapon] {
         &self.weapons
+    }
+
+    /// Samples the barrel tracks after advancing the weapon bank on this frame.
+    pub fn apply_firing_pose(&self, component: usize, node_times: &mut [Option<f32>]) {
+        for weapon in self
+            .weapons
+            .iter()
+            .filter(|weapon| weapon.component_index == component)
+        {
+            for (index, barrel) in weapon.barrels.iter().enumerate() {
+                if barrel.row.flags & 4 != 0 {
+                    continue;
+                }
+                let Some(time) = node_times.get_mut(barrel.row.node_index) else {
+                    continue;
+                };
+                let mut blend = barrel.blend;
+                if index == weapon.barrel_index
+                    && matches!(weapon.phase, FirePhase::Shot | FirePhase::Finish)
+                {
+                    let duration = weapon.phase_end_ms - weapon.phase_start_ms;
+                    if duration > 0.0 {
+                        let progress =
+                            ((self.clock_ms - weapon.phase_start_ms) / duration).clamp(0.0, 1.0);
+                        blend = barrel.from_blend + progress * (blend - barrel.from_blend);
+                    }
+                }
+                let mut blend = blend as f32;
+                if barrel.row.flags & 2 != 0 {
+                    blend = 1.0 - blend;
+                }
+                *time = Some((1.0 - blend) * barrel.row.frame_a + blend * barrel.row.frame_b);
+            }
+        }
     }
 
     /// Selects all weapons with zero, or one weapon by its one-based slot.
@@ -197,6 +233,7 @@ impl PlayerWeapon {
 impl Barrel {
     fn travel_to(&mut self, blend: f64) -> f64 {
         let duration = (blend - self.blend).abs() * 1000.0 / self.rate;
+        self.from_blend = self.blend;
         self.blend = blend;
         duration
     }
@@ -282,8 +319,10 @@ fn prepare_weapons(
                     }
                     Some(Barrel {
                         muzzle: muzzle.clone(),
+                        row: *row,
                         rate: f64::from(rate),
                         blend: f64::from(row.initial_blend),
+                        from_blend: f64::from(row.initial_blend),
                     })
                 })
                 .collect::<Option<Vec<_>>>()?;
@@ -410,8 +449,18 @@ mod tests {
                         direction: [0.0, 1.0, 0.0],
                         name: [0; 32],
                     },
+                    row: PreparedControlTimelineRow {
+                        row_index: 0,
+                        node_index: 0,
+                        frame_a: 4.0,
+                        frame_b: 8.0,
+                        initial_blend: 0.0,
+                        raw_parameters: [0; 4],
+                        flags: 0,
+                    },
                     rate: 50.0,
                     blend: 0.0,
+                    from_blend: 0.0,
                 }],
                 barrel_index: 0,
                 rounds_remaining: Some(1),
@@ -428,12 +477,23 @@ mod tests {
             cost: 4.0,
             amount: 8.0,
         });
+        let mut node_times = [None];
         assert!(weapons.fire(true, 0).next().is_none());
+        assert!(weapons.fire(false, 5).next().is_none());
+        weapons.apply_firing_pose(0, &mut node_times);
+        assert_eq!(node_times, [Some(5.0)]);
         assert!(weapons.fire(false, 10).next().is_none());
+        weapons.apply_firing_pose(0, &mut node_times);
+        assert_eq!(node_times, [Some(6.0)]);
         assert_eq!(weapons.fire(false, 11).next().unwrap().0, 0);
+        assert!(weapons.fire(false, 16).next().is_none());
+        weapons.apply_firing_pose(0, &mut node_times);
+        assert_eq!(node_times, [Some(7.0)]);
         assert_eq!(weapons.weapons()[0].rounds_remaining(), Some(1));
         assert_eq!(weapons.weapons[0].charge.as_ref().unwrap().amount, 8.0);
         assert!(weapons.fire(false, 22).next().is_none());
+        weapons.apply_firing_pose(0, &mut node_times);
+        assert_eq!(node_times, [Some(4.0)]);
         assert_eq!(weapons.weapons()[0].rounds_remaining(), Some(0));
         assert_eq!(weapons.weapons[0].charge.as_ref().unwrap().amount, 4.0);
         assert!(weapons.fire(true, 100).next().is_none());

@@ -19,6 +19,7 @@ mod mission_hints;
 mod mission_notices;
 mod mission_pause;
 mod player_collision;
+mod player_fire;
 mod projectile_render;
 mod projectile_trail;
 mod shot_sound;
@@ -7307,6 +7308,7 @@ fn update_control_animation_pose_buffers(
         aim,
         None,
         None,
+        None,
     )
 }
 
@@ -7317,6 +7319,7 @@ fn update_gameplay_animation_pose_buffers(
     aim: Option<(StartingCockpit, f32)>,
     player_doors: Option<([f32; 3], f32, &[BuildingCollisionBinding])>,
     motion: Option<(&[Option<MissionRenderRoot>], &WorldSnapshot, &Engine)>,
+    firing: Option<(usize, &PlayerWeapons)>,
 ) -> Result<(), String> {
     for (object_index, components) in instances.iter_mut().enumerate() {
         let Some(object_pose_buffers) = pose_buffers.get_mut(object_index) else {
@@ -7420,6 +7423,9 @@ fn update_gameplay_animation_pose_buffers(
                         chassis_animation::sample(instance, root, snapshot, &mut node_times)
                     })
             });
+            if let Some((_, weapons)) = firing.filter(|(owner, _)| *owner == object_index) {
+                weapons.apply_firing_pose(component_index, &mut node_times);
+            }
             instance.last_sampled_node_times.clone_from(&node_times);
             let times = node_times
                 .into_iter()
@@ -7456,7 +7462,9 @@ fn control_tree_chain_animates(
                 .and_then(Option::as_ref)
                 .is_some_and(|control| {
                     fparkan_runtime::has_proximity_doors(control)
-                        || (autonomous && fparkan_runtime::has_turret_aim(control))
+                        || (autonomous
+                            && (fparkan_runtime::has_turret_aim(control)
+                                || control.typed_records.iter().any(|record| record.tag == 2)))
                         || control.typed_records.iter().any(|record| record.tag == 21)
                 })
         {
@@ -10488,121 +10496,6 @@ impl StaticVulkanApp {
         )
     }
 
-    fn update_player_fire(&mut self, clock_ms: u32) {
-        let trigger = self.player_fire_held || self.player_fire_pressed;
-        self.player_fire_pressed = false;
-        let (Some(cockpit), Some(frame)) = (self.cockpit, &self.mission_frame) else {
-            return;
-        };
-        let (Some(weapons), Some(layout)) = (
-            self.player_weapon_banks.get_mut(&cockpit.handle),
-            self.player_weapon_layouts.get(&cockpit.object_index),
-        ) else {
-            return;
-        };
-        let Some((_, state)) = frame
-            .snapshot
-            .transforms
-            .iter()
-            .find(|(handle, _)| *handle == cockpit.handle)
-        else {
-            return;
-        };
-        let transform = LegacyIron3dEulerTransform {
-            translation: state.position.map(f32::from_bits),
-            orientation_radians: state.orientation.map(f32::from_bits),
-        };
-        let scale = state.scale.map(f32::from_bits);
-        // shortcut: the camera supplies a shared aim direction until native
-        // per-weapon CPT direction and turret alignment agree in world space.
-        let direction = self.view_camera.forward;
-        if let Some(engine) = &self.mission_engine {
-            weapons.read_control_energy(engine, cockpit.handle);
-        }
-        for (slot, weapon, barrel) in weapons.fire(trigger, clock_ms) {
-            let hierarchy = self
-                .component_pose_buffers
-                .get(cockpit.object_index)
-                .and_then(|components| components.get(weapon.component_index))
-                .and_then(Option::as_ref);
-            let mount = self
-                .component_mount_poses
-                .get(cockpit.object_index)
-                .and_then(|components| components.get(weapon.component_index))
-                .copied()
-                .flatten();
-            let pose = control_effect_owner_node_pose(
-                hierarchy,
-                mount.is_some(),
-                barrel.raw_signed_field_04 as usize,
-            );
-            let muzzle = pose.and_then(|pose| {
-                let pose = mount.map_or(pose, |mount| compose_unit_pose(mount, pose));
-                let point = add3(
-                    pose.translation,
-                    rotate_unit_vector(barrel.position, pose.rotation),
-                );
-                transform.try_transform_scaled_point(point, scale)
-            });
-            let Some(muzzle) = muzzle else {
-                eprintln!("sim_coverage player_weapon_pose_stub=1 slot={}", slot + 1);
-                continue;
-            };
-            eprintln!(
-                "player_shot shooter={} slot={} projectile={}:{} queue_time_ms={clock_ms} muzzle={muzzle:?} rounds_remaining={:?}",
-                cockpit.handle.slot,
-                slot + 1,
-                weapon.projectile_archive,
-                weapon.projectile,
-                weapon.rounds_remaining(),
-            );
-            let (pool, sound) = &layout.slots[slot];
-            if let Some(draw) = self.projectile_draws[*pool].as_mut() {
-                if let Some(instance) = draw
-                    .instances
-                    .iter_mut()
-                    .find(|instance| instance.flight.is_none())
-                {
-                    instance.flight = PlayerProjectile::new(
-                        muzzle,
-                        direction,
-                        draw.speed,
-                        draw.lifetime_ms,
-                        clock_ms,
-                    );
-                    instance.shooter = Some(cockpit.handle);
-                    if let Some(flight) = &instance.flight {
-                        eprintln!("player_projectile_spawn slot={} queue_time_ms={clock_ms} speed={} lifetime_ms={} position={muzzle:?} direction={:?}", slot + 1, draw.speed, draw.lifetime_ms, flight.direction);
-                    }
-                } else {
-                    eprintln!(
-                        "sim_coverage player_projectile_pool_full=1 slot={}",
-                        slot + 1
-                    );
-                }
-            }
-            if let (Some(sound), Some(audio)) = (sound, self.audio.as_mut()) {
-                if let Some(event) = sound.one_shot_at(muzzle) {
-                    match audio.handle_sound_event(&event) {
-                        Ok(()) => eprintln!(
-                            "player_shot_sound slot={} resource={}:{} queue_time_ms={clock_ms}",
-                            slot + 1,
-                            event.archive,
-                            event.name
-                        ),
-                        Err(error) => eprintln!(
-                            "sim_coverage player_weapon_sound_stub=1 slot={} reason={error}",
-                            slot + 1
-                        ),
-                    }
-                }
-            }
-        }
-        if let Some(engine) = &mut self.mission_engine {
-            weapons.publish_control_energy(engine, cockpit.handle);
-        }
-    }
-
     fn advance_player_projectiles(&mut self, clock_ms: u32) -> Result<(), String> {
         let Some(engine) = self.mission_engine.as_mut() else {
             return Ok(());
@@ -11351,6 +11244,7 @@ impl StaticVulkanApp {
                 }
             }
         }
+        let player_shots = self.sample_player_fire(control_clock_ms);
         let effect_elapsed_seconds = control_clock_ms as f32 / 1000.0;
         // CTLD's validated NDP defaults seed the native query gate. This
         // preview does not process mission Action1 updates, so it retains that
@@ -11390,6 +11284,11 @@ impl StaticVulkanApp {
                         engine,
                     )
                 }),
+            self.cockpit.and_then(|cockpit| {
+                self.player_weapon_banks
+                    .get(&cockpit.handle)
+                    .map(|bank| (cockpit.object_index, bank))
+            }),
         )?;
         let placements = self
             .mission_frame
@@ -11430,7 +11329,7 @@ impl StaticVulkanApp {
             }
         }
         self.update_mission_camera(clock.delta_seconds, viewport)?;
-        self.update_player_fire(control_clock_ms);
+        self.emit_player_shots(control_clock_ms, player_shots);
         self.update_autodemo_projectiles(control_clock_ms);
         self.update_projectile_geometry();
         refresh_dynamic_shadow_casters(
@@ -14089,6 +13988,7 @@ mod tests {
                     now,
                     None,
                     Some(([hx, hy, hz], 0.292, &app.building_collision_bindings)),
+                    None,
                     None,
                 )
                 .unwrap();
