@@ -75,6 +75,11 @@ mod clan_script_init;
 mod clan_targeting;
 mod construction;
 mod construction_site;
+mod destruction;
+pub use destruction::{
+    collect_unit_destruction_effects, take_unit_destruction_effects,
+    unit_destruction_effect_sources, UnitDestructionEffect,
+};
 mod flight_altitude;
 mod ground_support;
 mod laboratory;
@@ -1397,6 +1402,7 @@ pub struct Engine {
     autodemo_combat: Option<unit_combat::AutoDemoCombat>,
     autodemo_reinforcements: Option<autodemo::LiveReinforcements>,
     production: Option<production::Production>,
+    destruction_effects: Option<Vec<UnitDestructionEffect>>,
 }
 
 struct LoadedMissionState {
@@ -1785,6 +1791,7 @@ pub fn create(services: EngineServices) -> Result<Engine, EngineError> {
         autodemo_combat: None,
         autodemo_reinforcements: None,
         production: None,
+        destruction_effects: None,
     })
 }
 
@@ -2733,6 +2740,9 @@ node_provider_distribution_suspended: false,
     engine.autodemo_combat = autodemo_combat;
     engine.autodemo_reinforcements = autodemo_reinforcements;
     engine.production = production;
+    if let Some(effects) = engine.destruction_effects.as_mut() {
+        effects.clear();
+    }
     let free_research = research::FreeResearch::new(&object_drafts[..reserve_start]);
     let chassis_resources = CachedResourceRepository::new(vfs.clone());
     let unit_chassis_flags = unit_chassis::load_flags(&chassis_resources, &object_drafts);

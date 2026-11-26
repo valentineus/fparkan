@@ -720,9 +720,12 @@ mod tests {
         let mut observed_aimed_turret = false;
         let mut observed_finished_segment = false;
         let mut observed_weapon_effect = false;
+        crate::collect_unit_destruction_effects(&mut engine);
         let mut observed_unavailable = engine.autodemo_combat.as_ref().unwrap().unavailable as u64;
         for now in (0..=120_000).step_by(50) {
             let frame = frame(&mut engine, now).unwrap();
+            let destruction_effects = crate::take_unit_destruction_effects(&mut engine);
+            assert!(crate::take_unit_destruction_effects(&mut engine).is_empty());
             observed_unavailable += frame.autodemo_combat_unavailable as u64;
             let shots = frame
                 .autodemo_combat_events
@@ -822,6 +825,14 @@ mod tests {
                 .iter()
                 .find(|event| matches!(event, AutoDemoCombatEvent::Destroyed { .. }))
             {
+                assert!(destruction_effects.iter().any(|event| {
+                    event.archive == "system.rlb"
+                        && event.name == "explode_rbr_b.exp"
+                        && event
+                            .position
+                            .iter()
+                            .all(|coordinate| coordinate.is_finite())
+                }));
                 assert!(identity_metadata(&engine.world, *target).is_err());
                 let ((_, retired), total) = combat
                     .report

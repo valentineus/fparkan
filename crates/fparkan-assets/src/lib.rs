@@ -32,10 +32,12 @@ pub use fparkan_texm::{PageRect, RgbaImage};
 use fparkan_vfs::DirectoryVfs;
 mod behavior_profile_values;
 mod chassis_profile;
+mod explosion_profile;
 pub use behavior_profile_values::{
     decode_behavior_go_speed_percent, decode_behavior_work_rates, BehaviorWorkRates,
 };
 pub use chassis_profile::{decode_chassis_can_fly, decode_chassis_flags, ChassisFlags};
+pub use explosion_profile::decode_explosion_effect;
 mod research;
 pub use research::{
     calc_full_research_cost, research_project_rows, ResearchCandidate, ResearchCandidateSet,

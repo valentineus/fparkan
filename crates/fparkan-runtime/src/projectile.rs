@@ -379,7 +379,11 @@ pub fn apply_projectile_hit(
     // shortcut: use the projectile provider volume directly, with immediate
     // removal on root depletion until native damage and death timing are wired.
     if volume >= remaining {
+        let effect = super::destruction::pending_effect(engine, handle);
         request_delete(&mut engine.world, handle).map_err(ControlResourceAccessError::World)?;
+        if let (Some(effect), Some(events)) = (effect, engine.destruction_effects.as_mut()) {
+            events.push(effect);
+        }
         return Ok(Some((0.0, true)));
     }
     apply_loaded_mission_control_node_delta(engine, handle, 0, -volume)?;

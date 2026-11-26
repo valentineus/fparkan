@@ -8,6 +8,7 @@ mod camera_capture;
 mod chassis_animation;
 #[cfg(windows)]
 mod control_effects;
+mod destruction_effects;
 use control_effects::{
     activate_firing_flashes, advance_control_effect_instances, owner_control_capacity,
 };
@@ -9694,6 +9695,10 @@ fn run_static_vulkan_mode(
             .map(|(archive, name)| shot_sound::load(root, archive, name))
             .collect()
     });
+    let destruction_effects = mission_engine
+        .as_ref()
+        .map(|engine| destruction_effects::DestructionEffects::prepare(root, engine, &mut preview))
+        .transpose()?;
     #[cfg(windows)]
     let mission_hints = if mission_engine.is_some() && demo_camera.is_none() {
         mission_hints::MissionHints::load(root, mission, &mut preview)
@@ -9725,6 +9730,10 @@ fn run_static_vulkan_mode(
         startup_timings,
     );
     app.mission_engine = mission_engine;
+    if let Some(engine) = app.mission_engine.as_mut() {
+        fparkan_runtime::collect_unit_destruction_effects(engine);
+    }
+    app.destruction_effects = destruction_effects;
     #[cfg(windows)]
     {
         if let Some(hints) = &mission_hints {
@@ -9929,6 +9938,7 @@ struct StaticVulkanApp {
     projectile_draws: Vec<Option<ProjectileDraw>>,
     autodemo_draws: Vec<Option<ProjectileDraw>>,
     autonomous_shot_sounds: Vec<Option<Op2SoundCommand>>,
+    destruction_effects: Option<destruction_effects::DestructionEffects>,
     player_fire_held: bool,
     player_fire_pressed: bool,
     player_capture_pressed: bool,
@@ -10075,6 +10085,7 @@ impl StaticVulkanApp {
             projectile_draws: Vec::new(),
             autodemo_draws: Vec::new(),
             autonomous_shot_sounds: Vec::new(),
+            destruction_effects: None,
             player_fire_held: false,
             player_fire_pressed: false,
             player_capture_pressed: false,
@@ -11459,7 +11470,23 @@ impl StaticVulkanApp {
                     .is_none_or(|target_ms| control_clock_ms >= target_ms),
             &self.removed_mission_roots,
         );
-        let control_vulkan_lights = active_control_point_lights(&control_point_lights);
+        let mut control_vulkan_lights = active_control_point_lights(&control_point_lights);
+        if let (Some(engine), Some(effects)) =
+            (&mut self.mission_engine, &mut self.destruction_effects)
+        {
+            effects.start(
+                fparkan_runtime::take_unit_destruction_effects(engine),
+                control_clock_ms,
+                self.audio.as_mut(),
+            );
+            effects.sample(
+                control_clock_ms,
+                &mut control_vulkan_lights,
+                &mut self.mesh,
+                &mut self.material_animations,
+                self.view_camera.position,
+            );
+        }
         let effect_updates = update_ambient_effect_geometry(
             &mut self.ambient_effect_slots,
             &self.component_pose_buffers,
@@ -11876,6 +11903,13 @@ impl StaticVulkanApp {
                             format!("hide inactive projectile range {range_index}: {error}")
                         })?;
                 }
+            }
+        }
+        if let Some(effects) = &self.destruction_effects {
+            for range in effects.inactive_ranges() {
+                renderer
+                    .set_draw_range_index_count(range, 0)
+                    .map_err(|error| format!("hide inactive destruction sprite: {error}"))?;
             }
         }
         if !self.removed_mission_roots.is_empty() || self.boarded_hero_index.is_some() {
