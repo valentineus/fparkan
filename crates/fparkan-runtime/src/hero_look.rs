@@ -1,11 +1,13 @@
 use fparkan_path::{normalize_relative, PathPolicy};
 use fparkan_vfs::Vfs;
+use std::f32::consts::TAU;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct HeroLook {
     turns: f32,
     sensitivity: f32,
-    pub(super) filtered_x: f32,
+    filtered_x: f32,
+    phase: f32,
 }
 
 impl HeroLook {
@@ -26,24 +28,52 @@ impl HeroLook {
                 .and_then(|bytes| mouse_sensitivity(&String::from_utf8_lossy(bytes)))
                 .unwrap_or(1.0),
             filtered_x: 0.0,
+            phase: 0.5,
         }
     }
 
-    /// Returns the filter state and the requested change in world yaw.
-    pub(super) fn sample(self, dx: f32, dy: f32) -> (f32, f32) {
-        let filtered = if dx == 0.0 && dy == 0.0 {
+    pub(super) fn reset(&mut self) {
+        self.filtered_x = 0.0;
+        self.phase = 0.5;
+    }
+
+    pub(super) fn has_state(self) -> bool {
+        self.filtered_x != 0.0 || self.phase != 0.5
+    }
+
+    /// Samples the input once and returns the yaw delivered by this tick.
+    pub(super) fn advance(&mut self, dx: f32, dy: f32, max_angle: f32) -> f32 {
+        self.filtered_x = if dx == 0.0 && dy == 0.0 {
             0.0
         } else {
             dx.clamp(i32::MIN as f32, i32::MAX as f32) * self.sensitivity * 0.95
                 + self.filtered_x * 0.05
         };
-        let scaled = filtered * 0.006;
+        let scaled = self.filtered_x * 0.006;
         let axis = if scaled.abs() > 0.999 {
             scaled.signum()
         } else {
             scaled
         };
-        (filtered, -(axis * self.turns) * std::f32::consts::TAU)
+        if axis != 0.0 {
+            let phase = self.phase + axis * self.turns;
+            self.phase = if phase >= 1.0 {
+                phase - 1.0
+            } else if phase <= 0.0 {
+                phase + 1.0
+            } else {
+                phase
+            };
+        }
+
+        let requested = -(self.phase - 0.5) * TAU;
+        let delivered = requested.clamp(-max_angle, max_angle);
+        self.phase = if requested == delivered {
+            0.5
+        } else {
+            (self.phase + delivered * (1.0 / TAU)).rem_euclid(1.0)
+        };
+        delivered
     }
 }
 
@@ -64,7 +94,7 @@ fn horizontal_binding(table: &str) -> Option<f32> {
             }
         }
         let turns = words.next()?.parse::<f32>().ok()?;
-        (turns.is_finite() && words.nth(1)?.eq_ignore_ascii_case("MAN_WRAP")).then_some(turns)
+        (turns.abs() <= 1.0 && words.nth(1)?.eq_ignore_ascii_case("MAN_WRAP")).then_some(turns)
     })
 }
 
@@ -106,15 +136,32 @@ MOUSE SCAN_NULL SCAN_MOUSE_X 1 CICLS_UNKNOWN MCMD_ANGLE_Z 0.20 0 MAN_WRAP 0.0 0 
             turns: 0.15,
             sensitivity: 1.0,
             filtered_x: 0.0,
+            phase: 0.5,
         };
         for (dx, expected) in [(100.0, 0.0855), (-100.0, -0.0855), (250.0, 0.15)] {
-            let (_, yaw) = look.sample(dx, 0.0);
-            assert!((yaw / -std::f32::consts::TAU - expected).abs() < 1e-6);
+            look.reset();
+            assert!((look.advance(dx, 0.0, TAU) / -TAU - expected).abs() < 1e-6);
         }
-        look.filtered_x = look.sample(100.0, 0.0).0;
-        let (tail, yaw) = look.sample(0.0, 1.0);
-        assert_eq!(tail, 4.75);
-        assert!((yaw / -std::f32::consts::TAU - 0.004275).abs() < 1e-6);
-        assert_eq!(look.sample(0.0, 0.0), (0.0, 0.0));
+        look.reset();
+        look.advance(100.0, 0.0, TAU);
+        assert!((look.advance(0.0, 1.0, TAU) / -TAU - 0.004275).abs() < 1e-6);
+        assert_eq!(look.filtered_x, 4.75);
+        assert_eq!(look.advance(0.0, 0.0, TAU), 0.0);
+        assert!(!look.has_state());
+    }
+
+    #[test]
+    fn hero_finishes_a_capped_turn_on_the_next_tick_without_mouse_input() {
+        let mut look = HeroLook {
+            turns: 0.15,
+            sensitivity: 1.0,
+            filtered_x: 0.0,
+            phase: 0.5,
+        };
+        let max_angle = 50.22849 * 0.01;
+        assert!((look.advance(250.0, 0.0, max_angle) + 0.5022847).abs() < 1e-6);
+        assert!((look.phase - 0.5700589).abs() < 1e-6);
+        assert!((look.advance(0.0, 0.0, max_angle) + 0.44019294).abs() < 1e-6);
+        assert!(!look.has_state());
     }
 }

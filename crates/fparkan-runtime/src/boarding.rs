@@ -143,7 +143,7 @@ pub fn board_friendly_warbot(
         });
         mission.player_pitch_bits = 0;
         mission.hero_walk_velocity = [0.0; 2];
-        mission.hero_look.filtered_x = 0.0;
+        mission.hero_look.reset();
     }
     Ok(Some(cockpit))
 }
@@ -225,7 +225,7 @@ pub fn disembark_warbot(engine: &mut Engine) -> Result<Option<StartingCockpit>, 
     mission.boarding = None;
     mission.player_pitch_bits = 0;
     mission.hero_walk_velocity = [0.0; 2];
-    mission.hero_look.filtered_x = 0.0;
+    mission.hero_look.reset();
     Ok(Some(hero))
 }
 

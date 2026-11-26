@@ -100,15 +100,12 @@ impl WalkRoute {
         } else {
             mouse_x * 0.95 + previous
         };
-        let can_walk = turn.abs() <= TAU * 0.15;
+        let walk_time = dx.hypot(dy).min(max_step) / 14.0;
+        let can_walk = turn.abs() <= (TAU * 0.15).min(50.0 * walk_time);
         fparkan_runtime::PlayerMotion {
             mouse_x,
             movement: [0.0, f32::from(can_walk)],
-            delta_seconds: if can_walk {
-                dx.hypot(dy).min(max_step) / 14.0
-            } else {
-                0.0
-            },
+            delta_seconds: if can_walk { walk_time } else { 0.03 },
             ..Default::default()
         }
     }

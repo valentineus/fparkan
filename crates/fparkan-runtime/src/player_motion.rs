@@ -1,4 +1,5 @@
 use super::{transform_state, Engine, EngineError, StartingCockpit, SurfaceQuery, TransformState};
+use crate::hero_look::HeroLook;
 use crate::manual_flight::{FlightDrive, FlightProfile};
 use crate::{hero_walk::WalkingDrive, TerrainWorld};
 use fparkan_resource::CachedResourceRepository;
@@ -66,7 +67,7 @@ pub struct PlayerMotionStep {
     pub(super) pitch_bits: u32,
     flight_velocity: Option<[f32; 3]>,
     hero_walk_velocity: Option<[f32; 2]>,
-    hero_filtered_x: Option<f32>,
+    hero_look: Option<HeroLook>,
     max_floor_clearance: f32,
     previous_terrain_height: Option<f32>,
     terrain_height: Option<f32>,
@@ -222,7 +223,7 @@ mod tests {
             pitch_bits: 0,
             flight_velocity: None,
             hero_walk_velocity: None,
-            hero_filtered_x: None,
+            hero_look: None,
             max_floor_clearance: FLOOR_CLEARANCE,
             previous_terrain_height: None,
             terrain_height: Some(11.5),
@@ -262,7 +263,7 @@ mod tests {
             pitch_bits: 0,
             flight_velocity: None,
             hero_walk_velocity: None,
-            hero_filtered_x: None,
+            hero_look: None,
             max_floor_clearance: 1.25,
             previous_terrain_height: Some(10.0),
             terrain_height: Some(10.0),
@@ -287,7 +288,7 @@ mod tests {
             pitch_bits: 0,
             flight_velocity: None,
             hero_walk_velocity: None,
-            hero_filtered_x: None,
+            hero_look: None,
             max_floor_clearance: FLOOR_CLEARANCE,
             previous_terrain_height: None,
             terrain_height: None,
@@ -458,7 +459,7 @@ fn plan_player_steps(
         && flight.is_none_or(|drive| input.climb == 0.0 && drive.velocity == [0.0; 3])
         && input.mouse_x == 0.0
         && input.mouse_y == 0.0
-        && (!hero_control || mission.hero_look.filtered_x == 0.0)
+        && (!hero_control || !mission.hero_look.has_state())
     {
         return Ok(None);
     }
@@ -470,12 +471,17 @@ fn plan_player_steps(
     {
         return Err(EngineError::Movement("invalid player step".into()));
     }
-    let hero_look = hero_control.then(|| mission.hero_look.sample(input.mouse_x, input.mouse_y));
-    // shortcut: mounted chassis still use a constant mouse gain.
-    let mut yaw_delta = hero_look.map_or_else(
-        || -input.mouse_x.clamp(-1_000.0, 1_000.0) * 0.003,
-        |(_, yaw)| yaw,
-    );
+    let mut hero_look = hero_control.then_some(mission.hero_look);
+    let mut yaw_delta = if let Some(look) = hero_look.as_mut() {
+        let max_angle = hero_profile
+            .map(|words| f32::from_bits(words[11]))
+            .filter(|speed| speed.is_finite() && *speed >= 0.0)
+            .map_or(f32::INFINITY, |speed| speed * input.delta_seconds);
+        look.advance(input.mouse_x, input.mouse_y, max_angle)
+    } else {
+        // shortcut: mounted chassis still use a constant mouse gain.
+        -input.mouse_x.clamp(-1_000.0, 1_000.0) * 0.003
+    };
     let speeds = if boarded.is_some() && !flying {
         crate::manual_chassis::speed_limits(mission, cockpit.handle)
             .unwrap_or([WALK_SPEED_FALLBACK; 2])
@@ -526,7 +532,7 @@ fn plan_player_steps(
             )?;
             step.max_floor_clearance = max_floor_clearance;
             step.hero_walk_velocity = walk.map(|(velocity, _)| velocity);
-            step.hero_filtered_x = hero_look.map(|(filtered_x, _)| filtered_x);
+            step.hero_look = hero_look;
             match resolve.as_mut() {
                 Some(resolve) => resolve(step),
                 None => Ok((step, false)),
@@ -555,7 +561,6 @@ fn plan_player_steps(
             return Ok(Some(step));
         }
         yaw_delta = 0.0;
-        input.mouse_x = 0.0;
         input.mouse_y = 0.0;
         pitch = f32::from_bits(step.pitch_bits);
         previous = step.pose;
@@ -578,8 +583,8 @@ pub(super) fn commit_motion_state(
             mission.hero_walk_velocity = if blocked { [0.0; 2] } else { velocity };
         }
         if mission.boarding.is_none() {
-            if let Some(filtered_x) = step.hero_filtered_x {
-                mission.hero_look.filtered_x = filtered_x;
+            if let Some(look) = step.hero_look {
+                mission.hero_look = look;
             }
         }
     }
@@ -614,7 +619,6 @@ fn plan_motion(
         .movement
         .into_iter()
         .chain([
-            input.mouse_x,
             input.mouse_y,
             input.climb,
             input.delta_seconds,
@@ -702,7 +706,7 @@ fn plan_motion(
         pitch_bits: pitch.to_bits(),
         flight_velocity,
         hero_walk_velocity: None,
-        hero_filtered_x: None,
+        hero_look: None,
         max_floor_clearance: FLOOR_CLEARANCE,
         previous_terrain_height,
         terrain_height,
