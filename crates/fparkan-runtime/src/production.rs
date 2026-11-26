@@ -21,7 +21,7 @@ use fparkan_world::{
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-// shortcut: GPU geometry is prepared for a bounded number of live builds.
+// shortcut: GPU geometry is prepared for a bounded number of live builds per scheme.
 // Lift the cap when the renderer can instantiate new roots during a mission.
 pub(super) const RESERVE_SLOTS: usize = 8;
 const PAID_MINIMUM_MS: u32 = 5_000;
@@ -509,15 +509,6 @@ fn order_owned_factory(
             .is_some_and(|id| handle_by_original_id(&engine.world, id).is_none())
             && !production.pending.iter().any(|order| order.slot == index)
     };
-    let live = (production.reserve_start..production.reserve_start + production.controls.len())
-        .filter(|&index| !free_slot(index))
-        .take(RESERVE_SLOTS)
-        .count();
-    if live >= RESERVE_SLOTS {
-        return Err(EngineError::Production(
-            "all prepared factory robot slots are occupied".into(),
-        ));
-    }
     let slot = (slot_start..slot_start + RESERVE_SLOTS)
         .find(|&index| free_slot(index))
         .ok_or_else(|| {
@@ -832,6 +823,47 @@ mod tests {
     use fparkan_vfs::DirectoryVfs;
     use fparkan_world::{set_transform, InputSnapshot, OriginalObjectId};
     use std::sync::Arc;
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_enemy_designs_leave_a_player_factory_slot_available() {
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed corpus");
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Single.01/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+
+        let production = engine.production.as_ref().unwrap();
+        assert!(production.player_scheme_count < production.schemes.len());
+        let enemy_start = production.reserve_start + production.player_scheme_count * RESERVE_SLOTS;
+        for index in enemy_start..enemy_start + RESERVE_SLOTS {
+            let id = engine.loaded.as_ref().unwrap().object_drafts[index].original_id;
+            let handle = fparkan_world::construct_replacement(
+                &mut engine.world,
+                fparkan_world::ObjectDraft { original_id: id },
+            )
+            .unwrap();
+            fparkan_world::set_owner(&mut engine.world, handle, Some(OwnerId(1))).unwrap();
+            fparkan_world::register_object(&mut engine.world, handle).unwrap();
+        }
+
+        let cockpit = starting_cockpit(&engine).unwrap();
+        let (factory, scheme, _) = clan_factory_schemes(&engine, cockpit).unwrap()[0];
+        assert!(order_clan_factory_scheme(&mut engine, cockpit, factory, scheme, 0).unwrap() > 0);
+        let production = engine.production.as_ref().unwrap();
+        let player_start = production.reserve_start + scheme * RESERVE_SLOTS;
+        assert!((player_start..player_start + RESERVE_SLOTS).contains(&production.pending[0].slot));
+    }
 
     #[test]
     #[ignore = "requires licensed corpus"]
