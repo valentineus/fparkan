@@ -3,7 +3,7 @@
 use super::{
     ambient_effect_pipeline_state, ambient_effect_vertex_rgb, append_effect_material_animation,
     append_environment_range, audio::GameAudio, debris::MeshFragment,
-    environment_vertex_with_alpha, native_command_phase, prepare_effect_material, quad_indices,
+    environment_vertex_with_alpha, native_command_phase, prepare_effect_material,
     EnvironmentGpuRange, MaterialAnimationBinding, PreparedEffectMaterial, StaticPreviewScene,
 };
 use fparkan_assets::{decode_explosion_effect, load_resource_entry_bytes_from_root, TerrainWorld};
@@ -206,7 +206,7 @@ impl DestructionEffects {
                                         );
                                         4
                                     ],
-                                    quad_indices(1)?,
+                                    vec![0, 1, 2, 2, 3, 0],
                                     pipeline,
                                 )?;
                                 let material = append_effect_material_animation(
