@@ -1,9 +1,9 @@
-//! Observations of the temporary unit controller, not a native motion solver.
+//! Coverage of the shared route follower and its approximations.
 
 use crate::{CombatObject, Engine};
 use std::collections::BTreeMap;
 
-/// Work performed by the temporary controller for one retained object identity.
+/// Route follower updates for one retained object identity.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UnitMotionSample {
     pub updates: u64,
@@ -20,7 +20,7 @@ pub struct UnitMotionReport {
 impl UnitMotionReport {
     pub(super) fn update(&mut self, object: CombatObject, now: u32) {
         let sample = self.objects.entry(object).or_insert_with(|| {
-            eprintln!("sim_coverage unit_motion_controller_stub=1 object={object} original_id={:?} first_ms={now}", object.original_id);
+            eprintln!("sim_coverage unit_route_motion_approx=1 object={object} original_id={:?} first_ms={now}", object.original_id);
             UnitMotionSample {
                 first_ms: now,
                 ..Default::default()

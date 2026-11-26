@@ -232,6 +232,6 @@ pub(super) fn log_clan_ai_stops(report: &SimulationReport) {
 
 pub(super) fn log_unit_motion(report: &UnitMotionReport) {
     for (object, sample) in &report.objects {
-        eprintln!("sim_coverage unit_motion_controller_stub={} object={object} original_id={:?} first_ms={} last_ms={}", sample.updates, object.original_id, sample.first_ms, sample.last_ms);
+        eprintln!("sim_coverage unit_route_motion_approx={} object={object} original_id={:?} first_ms={} last_ms={}", sample.updates, object.original_id, sample.first_ms, sample.last_ms);
     }
 }
