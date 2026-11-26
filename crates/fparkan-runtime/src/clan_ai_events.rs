@@ -88,10 +88,13 @@ pub(super) fn resolve_captures(
     Ok(captured)
 }
 
-pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) -> Vec<MissionNotice> {
+pub(super) fn tick(
+    engine: &mut crate::Engine,
+    now_ms: u32,
+) -> (Vec<MissionNotice>, Vec<crate::SpawnedUnit>) {
     let mut notices = Vec::new();
     let Some(loaded) = &mut engine.loaded else {
-        return notices;
+        return (notices, Vec::new());
     };
     crate::laboratory::tick(
         loaded,
@@ -99,7 +102,7 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) -> Vec<MissionNotice
         now_ms,
         &mut engine.behavior_rng_state,
     );
-    crate::construction::tick(
+    let constructed_buildings = crate::construction::tick(
         loaded,
         &mut engine.world,
         engine.production.as_mut(),
@@ -238,7 +241,7 @@ pub(super) fn tick(engine: &mut crate::Engine, now_ms: u32) -> Vec<MissionNotice
             }
         }
     }
-    notices
+    (notices, constructed_buildings)
 }
 
 #[derive(Default)]

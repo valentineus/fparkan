@@ -11201,6 +11201,12 @@ impl StaticVulkanApp {
                         .iter()
                         .map(|unit| (unit, "factory_robot_completed")),
                 )
+                .chain(
+                    frame
+                        .constructed_buildings
+                        .iter()
+                        .map(|building| (building, "building_constructed")),
+                )
                 .chain(deployed_mine.iter().map(|unit| (unit, "mine_deployed")))
             {
                 let index = reinforcement.object_index;

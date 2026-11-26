@@ -1,4 +1,4 @@
-use crate::unit_spawn::spawn_prepared_unit;
+use crate::unit_spawn::{spawn_prepared_unit, SpawnedUnit};
 use crate::{LoadedMissionState, MissionScriptBundle};
 use fparkan_path::ResourceName;
 use fparkan_script::ScriptDispatchSelector;
@@ -209,7 +209,8 @@ pub(super) fn tick(
     world: &mut World,
     mut production: Option<&mut crate::production::Production>,
     now_ms: u32,
-) {
+) -> Vec<SpawnedUnit> {
+    let mut constructed = Vec::new();
     let mut index = 0;
     while let Some(task) = mission.construction.tasks.get_mut(index) {
         let owned =
@@ -286,14 +287,16 @@ pub(super) fn tick(
             patrol.clear_move(task.builder);
         }
         if finish {
-            if let Err(error) = complete(mission, world, &task, production.as_deref_mut()) {
-                eprintln!(
+            match complete(mission, world, &task, production.as_deref_mut()) {
+                Ok(building) => constructed.push(building),
+                Err(error) => eprintln!(
                     "script_building_construction_failed clan={} builder={} reason={error}",
                     task.owner.0, task.builder.slot
-                );
+                ),
             }
         }
     }
+    constructed
 }
 
 fn complete(
@@ -301,7 +304,7 @@ fn complete(
     world: &mut World,
     task: &Task,
     production: Option<&mut crate::production::Production>,
-) -> Result<(), crate::EngineError> {
+) -> Result<SpawnedUnit, crate::EngineError> {
     let index = crate::behavior_ore_index_for_handle(&mission.behavior_ore_states, task.builder)
         .map_err(crate::EngineError::Production)?;
     let stock = f32::from_bits(mission.behavior_ore_states[index].current_ore_bits);
@@ -382,7 +385,11 @@ fn complete(
         "script_building_constructed clan={} builder={} building={} class={class:#010x}",
         task.owner.0, task.builder.slot, handle.slot
     );
-    Ok(())
+    Ok(SpawnedUnit {
+        object_index: task.slot,
+        handle,
+        clan: task.owner.0,
+    })
 }
 
 fn destination(
@@ -514,13 +521,18 @@ mod tests {
             }
         }
         for now in (0..=900_000).step_by(100) {
-            crate::frame(&mut engine, now).unwrap();
+            let frame = crate::frame(&mut engine, now).unwrap();
             let loaded = engine.loaded.as_ref().unwrap();
             if let Some(handle) = loaded.object_drafts[start..end].iter().find_map(|draft| {
                 (draft.unit_dat_header_flags == Some(0x8000_0010))
                     .then(|| handle_by_original_id(&engine.world, draft.original_id.unwrap()))
                     .flatten()
             }) {
+                assert!(frame
+                    .constructed_buildings
+                    .iter()
+                    .any(|building| building.handle == handle));
+                assert!(frame.snapshot.objects.contains(&handle));
                 assert_eq!(
                     identity_metadata(&engine.world, handle).unwrap().owner_id,
                     Some(OwnerId(1))

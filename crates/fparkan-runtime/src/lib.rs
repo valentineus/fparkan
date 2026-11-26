@@ -1411,6 +1411,8 @@ pub struct FrameResult {
     pub autodemo_reinforcement_unavailable: usize,
     /// Robot completed by a player factory order on this tick.
     pub produced_unit: Option<SpawnedUnit>,
+    /// Buildings completed by scripted construction on this tick.
+    pub constructed_buildings: Vec<SpawnedUnit>,
     /// Diagnostic for a production order whose unit could not be created.
     pub production_failure: Option<String>,
     /// Technology completed by a player laboratory order on this tick.
@@ -2949,7 +2951,10 @@ pub fn step_headless(
         .loaded
         .as_mut()
         .and_then(|state| state.tick_mission_event(&engine.world, queue_time_ms));
-    let clan_notices = clan_ai_events::tick(engine, queue_time_ms);
+    let (clan_notices, constructed_buildings) = clan_ai_events::tick(engine, queue_time_ms);
+    if !constructed_buildings.is_empty() {
+        snapshot = fparkan_world::world_snapshot(&engine.world, snapshot.events);
+    }
     let researched_component = engine
         .loaded
         .as_mut()
@@ -2963,6 +2968,7 @@ pub fn step_headless(
         autodemo_reinforcements,
         autodemo_reinforcement_unavailable,
         produced_unit,
+        constructed_buildings,
         production_failure,
         researched_component,
         player_footstep: None,
