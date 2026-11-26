@@ -1205,15 +1205,21 @@ mod tests {
         let cockpit = starting_cockpit(&engine).unwrap();
         let mut pose = transform_state(&engine.world, cockpit.handle).unwrap();
         let plant = handle_by_original_id(&engine.world, OriginalObjectId(7)).unwrap();
-        let plant_pose = transform_state(&engine.world, plant).unwrap();
-        let transform = fparkan_render::LegacyIron3dEulerTransform {
-            translation: plant_pose.position.map(f32::from_bits),
-            orientation_radians: plant_pose.orientation.map(f32::from_bits),
+        let communicator_floor = |engine: &Engine, index: u32| {
+            let mission = engine.loaded.as_ref().unwrap();
+            let draft = &mission.object_drafts[index as usize];
+            let handle = handle_by_original_id(&engine.world, OriginalObjectId(index)).unwrap();
+            let pose = transform_state(&engine.world, handle).unwrap();
+            let [a, b, c] = crate::mission_events::communicator_triangles(
+                &mission.mission_assets,
+                index as usize,
+                draft.unit_dat_header_flags.unwrap(),
+                pose,
+            )
+            .unwrap()[0];
+            std::array::from_fn(|axis| ((a[axis] + b[axis] + c[axis]) / 3.0).to_bits())
         };
-        pose.position = transform
-            .try_transform_scaled_point([0.08, -48.64, -6.63], plant_pose.scale.map(f32::from_bits))
-            .unwrap()
-            .map(f32::to_bits);
+        pose.position = communicator_floor(&engine, 7);
         set_transform(&mut engine.world, cockpit.handle, pose).unwrap();
         assert_eq!(
             order_factory_robot(&mut engine, cockpit, 100).unwrap(),
@@ -1256,7 +1262,7 @@ mod tests {
             "unpowered production device must lose its full work rate"
         );
         let factory_position = pose.position;
-        pose.position = [1288.99_f32, 807.4, 74.08].map(f32::to_bits);
+        pose.position = communicator_floor(&engine, 0);
         set_transform(&mut engine.world, cockpit.handle, pose).unwrap();
         assert_eq!(
             capture_neutral_building(&mut engine, cockpit).unwrap(),
