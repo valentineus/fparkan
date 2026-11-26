@@ -1,6 +1,7 @@
 use super::{
     autodemo::{reinforcement_position, MOBILE_UNIT, PLANT_CLASS},
     behavior_ore_index_for_handle,
+    factory_release::FactoryDeparture,
     mission_events::on_communicator,
     normalize_engine_path, query_behavior_profile_ore_rate,
     research::{load_clan_table, RESEARCHED},
@@ -294,8 +295,8 @@ impl Production {
             return Ok(None);
         }
         let pose = transform_state(world, order.plant)?;
-        // shortcut: prefer the old outdoor point until the factory's elevated
-        // release and protected exit order are simulated.
+        // shortcut: the outdoor direction selects an apron until the elevated
+        // assembly platform and its ramp are simulated.
         let preferred = reinforcement_position(
             pose.position.map(f32::from_bits),
             pose.orientation.map(f32::from_bits),
@@ -305,7 +306,7 @@ impl Production {
             &mission.terrain,
             &mut self.rng,
         )?;
-        let Some(position) = super::factory_release::clear_release_position(
+        let Some(site) = super::factory_release::clear_release_position(
             world,
             mission,
             &mut self.buildings,
@@ -321,7 +322,7 @@ impl Production {
             mission,
             order.slot,
             order.owner.0,
-            position,
+            site.position,
             self.controls[order.slot - self.reserve_start].clone(),
         )?;
         let draft = &mission.object_drafts[order.slot];
@@ -354,6 +355,13 @@ impl Production {
                 .find(|(index, _)| *index == order.plant_index)
                 .expect("free order belongs to a prepared factory");
             *count -= 1;
+        }
+        if let Some(exit) = site.exit {
+            let departure = FactoryDeparture::new(handle, order.slot, exit, mission);
+            mission
+                .unit_patrol
+                .get_or_insert_with(crate::unit_patrol::UnitPatrol::scripted)
+                .begin_factory_departure(departure, now_ms);
         }
         Ok(Some(SpawnedUnit {
             object_index: order.slot,
@@ -934,6 +942,7 @@ mod tests {
         let cargo_slots = production.reserve_start + transport_index * RESERVE_SLOTS;
         assert!((cargo_slots..cargo_slots + RESERVE_SLOTS).contains(&production.pending[0].slot));
         let mut completed = Vec::new();
+        let mut departures = Vec::new();
         for time in (40_016..=40_000 + duration + 2000).step_by(16) {
             if let Some(unit) = step_headless(&mut engine, InputSnapshot::default(), time)
                 .unwrap()
@@ -960,6 +969,13 @@ mod tests {
                     .unwrap()
                     .iter()
                     .all(|bounds| !bounds.contains([x, y])));
+                if mission
+                    .unit_patrol
+                    .as_ref()
+                    .is_some_and(|patrol| patrol.is_leaving_factory(unit.handle))
+                {
+                    departures.push((unit.handle, [x, y]));
+                }
                 completed.push((unit.clan, unit.object_index));
             }
         }
@@ -1008,6 +1024,15 @@ mod tests {
                     .clan_ai_events
                     .transport_orders()
                     .any(|(clan, unit, _)| clan == 1 && unit == handle.slot));
+                assert!(departures.into_iter().any(|(actor, start)| {
+                    let Some(patrol) = loaded.unit_patrol.as_ref() else {
+                        return false;
+                    };
+                    transform_state(&engine.world, actor).is_ok_and(|pose| {
+                        let [x, y, _] = pose.position.map(f32::from_bits);
+                        !patrol.is_leaving_factory(actor) && [x, y] != start
+                    })
+                }));
                 return;
             }
         }

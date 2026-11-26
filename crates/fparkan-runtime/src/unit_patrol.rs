@@ -1,6 +1,7 @@
 use super::{
     autodemo::{MOBILE_UNIT, PLANT_CLASS},
     boarding::WARBOT_CLASS,
+    factory_release::FactoryDeparture,
     flight_altitude::FlightClearance,
     ground_support::GroundSupport,
     next_crt_rand,
@@ -25,6 +26,7 @@ pub(super) use orders::supports_order;
 pub(super) struct UnitPatrol {
     center: Option<[f32; 2]>,
     units: Vec<PatrollingUnit>,
+    factory_departures: Vec<FactoryDeparture>,
     shut_down: HashSet<ObjectHandle>,
     script_orders: Vec<(ObjectHandle, VecDeque<orders::UnitOrder>)>,
     script_order_counts: BTreeMap<(u32, u32), u64>,
@@ -155,6 +157,7 @@ impl UnitPatrol {
         Self {
             center: None,
             units: Vec::new(),
+            factory_departures: Vec::new(),
             shut_down: HashSet::new(),
             script_orders: Vec::new(),
             script_order_counts: BTreeMap::new(),
@@ -303,6 +306,19 @@ impl UnitPatrol {
         self.shut_down.contains(&handle)
     }
 
+    pub(super) fn begin_factory_departure(&mut self, departure: FactoryDeparture, now_ms: u32) {
+        if self.units.is_empty() && self.factory_departures.is_empty() {
+            self.clock_ms = now_ms;
+        }
+        self.factory_departures.push(departure);
+    }
+
+    pub(super) fn is_leaving_factory(&self, unit: ObjectHandle) -> bool {
+        self.factory_departures
+            .iter()
+            .any(|departure| departure.handle == unit)
+    }
+
     pub(super) fn is_moving_to_destination(&self, handle: ObjectHandle) -> bool {
         self.units
             .iter()
@@ -401,6 +417,7 @@ impl UnitPatrol {
         Some(Self {
             center: Some(center),
             units,
+            factory_departures: Vec::new(),
             shut_down: HashSet::new(),
             script_orders: Vec::new(),
             script_order_counts: BTreeMap::new(),
@@ -435,14 +452,34 @@ impl UnitPatrol {
         });
         let seconds = now_ms.saturating_sub(state.clock_ms) as f32 * 0.001;
         state.clock_ms = state.clock_ms.max(now_ms);
-        let mut traffic = if seconds > 0.0 && !state.units.is_empty() {
-            state.buildings.refresh(world, mission);
-            FrameTraffic::read(world, mission)
-        } else {
-            FrameTraffic::default()
-        };
+        let mut traffic =
+            if seconds > 0.0 && (!state.units.is_empty() || !state.factory_departures.is_empty()) {
+                state.buildings.refresh(world, mission);
+                FrameTraffic::read(world, mission)
+            } else {
+                FrameTraffic::default()
+            };
         let mut poses = Vec::new();
+        if seconds > 0.0 {
+            for departure in std::mem::take(&mut state.factory_departures) {
+                let handle = departure.handle;
+                let Ok(before) = transform_state(world, handle) else {
+                    continue;
+                };
+                let after =
+                    departure.move_out(before, mission, &mut traffic, &state.buildings, seconds)?;
+                if after != before {
+                    poses.push((handle, before, after));
+                }
+                if !departure.finished(after) {
+                    state.factory_departures.push(departure);
+                }
+            }
+        }
         for unit in &mut state.units {
+            if self.is_leaving_factory(unit.handle) {
+                continue;
+            }
             let Ok(before) = transform_state(world, unit.handle) else {
                 continue;
             };

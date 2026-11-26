@@ -110,7 +110,9 @@ impl UnitPatrol {
                 order.opcode()
             );
         }
-        if append && (self.is_patrolling(actor) || self.is_shut_down(actor)) {
+        if self.is_leaving_factory(actor)
+            || (append && (self.is_patrolling(actor) || self.is_shut_down(actor)))
+        {
             if let Some((_, queue)) = self
                 .script_orders
                 .iter_mut()
@@ -186,7 +188,8 @@ impl UnitPatrol {
                 continue;
             };
             // shortcut: Go still uses the temporary arrival tolerance.
-            let complete = !self.is_shut_down(actor)
+            let complete = !self.is_leaving_factory(actor)
+                && !self.is_shut_down(actor)
                 && self
                     .units
                     .iter()
