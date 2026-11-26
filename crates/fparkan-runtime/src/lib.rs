@@ -101,6 +101,7 @@ mod player_status;
 mod player_weapon;
 mod production;
 mod projectile;
+mod repair_zone;
 mod research;
 mod resource_distribution;
 mod route_motion;

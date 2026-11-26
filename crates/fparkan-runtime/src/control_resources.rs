@@ -1,6 +1,6 @@
 use crate::{
-    control_profile, control_resource_budget_pass, ControlProfileReport, LoadedMissionState,
-    MissionControlDeviceTableStatus, MobileBudgetReport,
+    control_profile, control_resource_budget_pass, repair_zone, ControlProfileReport,
+    LoadedMissionState, MissionControlDeviceTableStatus, MobileBudgetReport,
 };
 use fparkan_world::{transform_state, ObjectHandle, World};
 use std::collections::BTreeMap;
@@ -14,6 +14,7 @@ pub(super) struct Resources {
     pub(super) profiles: ControlProfileReport,
     pub(super) mobile: MobileBudgetReport,
     blocked_budgets: Vec<ObjectHandle>,
+    repair_zones: repair_zone::RepairZones,
 }
 
 impl Default for Resources {
@@ -27,6 +28,7 @@ impl Default for Resources {
             profiles: ControlProfileReport::default(),
             mobile: MobileBudgetReport::default(),
             blocked_budgets: Vec::new(),
+            repair_zones: Default::default(),
         }
     }
 }
@@ -50,6 +52,10 @@ impl Resources {
 pub(super) fn tick(mission: &mut LoadedMissionState, world: &World, now_ms: u32) {
     let state = &mut mission.control_resources;
     state
+        .repair_zones
+        .prepare(&mission.mission_assets, &mission.object_drafts);
+    let facilities = state.repair_zones.active(world);
+    state
         .clocks
         .retain(|(handle, _)| transform_state(world, *handle).is_ok());
     state
@@ -65,9 +71,12 @@ pub(super) fn tick(mission: &mut LoadedMissionState, world: &World, now_ms: u32)
             Some(crate::autodemo::PLANT_CLASS | crate::laboratory::LAB_CLASS)
         );
         let mobile_owner = flags.is_some_and(|flags| flags & crate::autodemo::MOBILE_UNIT != 0);
-        if (!budget_owner && !mobile_owner) || transform_state(world, table.handle).is_err() {
+        if !budget_owner && !mobile_owner {
             continue;
         }
+        let Ok(pose) = transform_state(world, table.handle) else {
+            continue;
+        };
         let clock = if let Some(index) = state
             .clocks
             .iter()
@@ -93,6 +102,9 @@ pub(super) fn tick(mission: &mut LoadedMissionState, world: &World, now_ms: u32)
         let Some(seconds) = clock.step(now_ms as f32, true, 250.0, &mut state.rng) else {
             continue;
         };
+        if mobile_owner {
+            repair_zone::repair_hull(table, table.handle, world, pose, &facilities, seconds);
+        }
         let object = table.original_id.map_or(table.handle.slot, |id| id.0);
         let ticks = state.profiles.ticks.entry(object).or_default();
         *ticks += 1;
