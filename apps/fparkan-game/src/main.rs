@@ -113,16 +113,17 @@ use fparkan_runtime::{
     loaded_terrain, mission_object_handle, order_lab_research, plan_player_motion_with_collision,
     player_vehicle, prepared_warbot_weapons, projectile_terrain_hit, projectile_unit_hit,
     query_building_segment_world, simulate_mission_report, starting_cockpit,
-    starting_player_weapons, AutoDemoCamera, AutoDemoView, BasementPlacementMode, BuildingMeshNode,
-    Engine, EngineError, EngineServices, FrameResult, LoadedMission, MissionAssets,
-    MissionEventStop, MissionMode, MissionObjectDraft, MissionRequest, MissionStartupInput,
-    PlayerMotion, PlayerProjectile, PlayerWeapons, StartingCockpit, SIMULATION_COVERAGE,
+    starting_player_weapons, AutoDemoCamera, AutoDemoView, BuildingMeshNode, Engine, EngineError,
+    EngineServices, FrameResult, LoadedMission, MissionAssets, MissionEventStop, MissionMode,
+    MissionObjectDraft, MissionRequest, MissionStartupInput, PlayerMotion, PlayerProjectile,
+    PlayerWeapons, StartingCockpit, SIMULATION_COVERAGE,
 };
 #[cfg(test)]
 use fparkan_runtime::{load_mission_with_init_stubs, plan_player_motion};
+use fparkan_runtime::{mission_basement_footprints, MissionBasementFootprint};
 use fparkan_terrain::{
-    build_basement_foundations, BasementFootprint, BasementFoundation, BasementPlacement,
-    SurfaceQuery, TerrainLod, TerrainMaterialLayers, TerrainWorld,
+    build_basement_foundations, BasementFoundation, BasementPlacement, SurfaceQuery, TerrainLod,
+    TerrainMaterialLayers, TerrainWorld,
 };
 #[cfg(test)]
 use fparkan_terrain::{BasementFoundationFragment, FullSurfaceMask};
@@ -7653,13 +7654,6 @@ fn update_dynamic_component_geometry(
     Ok(())
 }
 
-struct MissionBasementFootprint {
-    object_index: usize,
-    outer: Vec<[f32; 2]>,
-    inner: Vec<[f32; 3]>,
-    flatten_inner_to_mean_outer_z: bool,
-}
-
 fn apply_basement_placement_deltas(
     roots: &[MissionObjectDraft],
     footprints: &[MissionBasementFootprint],
@@ -7676,88 +7670,6 @@ fn apply_basement_placement_deltas(
         root.position = root.root_position_with_basement_delta(placement.placement_delta);
     }
     Ok(adjusted_roots)
-}
-
-fn mission_basement_footprints(
-    assets: &MissionAssets,
-    roots: &[MissionObjectDraft],
-) -> Result<Vec<MissionBasementFootprint>, String> {
-    let mut footprints = Vec::new();
-    for (object_index, mission_root) in roots.iter().enumerate() {
-        let Some(mode) = mission_root.basement_placement_mode() else {
-            continue;
-        };
-        let Some(component_bas) = assets
-            .object_component_bas
-            .get(object_index)
-            .and_then(|components| components.first())
-            .and_then(Option::as_ref)
-        else {
-            continue;
-        };
-        let geometry = &component_bas.geometry;
-        let bas_label = format!(
-            "{}:{}",
-            component_bas.source.archive.as_str(),
-            String::from_utf8_lossy(&component_bas.source.name.0)
-        );
-        // shortcut: the installed Iron Strategy corpus has one inner and one
-        // outer ring per eligible DAT. Native iterates both arrays, so reject
-        // unsupported multiplicity until the multi-ring semantics are ported.
-        if geometry.first.len() != 1 || geometry.second.len() != 1 {
-            return Err(format!(
-                "eligible mission object {object_index} from {bas_label} has {} inner and {} outer BAS rings; one of each is supported",
-                geometry.first.len(),
-                geometry.second.len()
-            ));
-        }
-        let transform = LegacyIron3dEulerTransform {
-            translation: mission_root.position,
-            orientation_radians: mission_root.orientation_raw,
-        };
-        let transform_points = |points: &[[f32; 3]], ring_name: &str| {
-            let mut transformed_points = Vec::with_capacity(points.len());
-            for &point in points {
-                let transformed = transform
-                    .try_transform_scaled_point(point, mission_root.scale)
-                    .ok_or_else(|| {
-                        format!(
-                            "building BAS {ring_name} ring on mission object {object_index} from {bas_label} has a non-finite transformed point"
-                        )
-                    })?;
-                transformed_points.push(transformed);
-            }
-            Ok::<_, String>(transformed_points)
-        };
-        let inner_record = &geometry.first[0];
-        let outer_record = &geometry.second[0];
-        for (ring_name, declared_count, points) in [
-            ("inner", inner_record.declared_count, &inner_record.points),
-            ("outer", outer_record.declared_count, &outer_record.points),
-        ] {
-            let expected_point_count = usize::try_from(declared_count)
-                .ok()
-                .and_then(|count| count.checked_add(1))
-                .ok_or_else(|| format!("building BAS {ring_name} count overflows: {bas_label}"))?;
-            if usize::try_from(declared_count).unwrap_or(0) < 3
-                || points.len() != expected_point_count
-            {
-                return Err(format!(
-                    "building BAS {ring_name} ring on mission object {object_index} from {bas_label} has count {declared_count} and {} points",
-                    points.len()
-                ));
-            }
-        }
-        let inner = transform_points(&inner_record.points, "inner")?;
-        let outer_3d = transform_points(&outer_record.points, "outer")?;
-        footprints.push(MissionBasementFootprint {
-            object_index,
-            outer: outer_3d.iter().map(|point| [point[0], point[1]]).collect(),
-            inner,
-            flatten_inner_to_mean_outer_z: mode == BasementPlacementMode::FlattenInnerAndAdjustRoot,
-        });
-    }
-    Ok(footprints)
 }
 
 fn interpolate_static_terrain_vertex(
@@ -8296,11 +8208,7 @@ fn static_preview_mesh_and_materials(
     } else {
         let footprints = footprint_sources
             .iter()
-            .map(|footprint| BasementFootprint {
-                outer: &footprint.outer,
-                inner: &footprint.inner,
-                flatten_inner_to_mean_outer_z: footprint.flatten_inner_to_mean_outer_z,
-            })
+            .map(MissionBasementFootprint::contours)
             .collect::<Vec<_>>();
         Some(
             build_basement_foundations(terrain_mesh, &footprints)

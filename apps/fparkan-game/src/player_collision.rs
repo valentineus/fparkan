@@ -99,11 +99,7 @@ mod tests {
             terrain.source_mesh().unwrap(),
             &footprints
                 .iter()
-                .map(|footprint| BasementFootprint {
-                    outer: &footprint.outer,
-                    inner: &footprint.inner,
-                    flatten_inner_to_mean_outer_z: footprint.flatten_inner_to_mean_outer_z,
-                })
+                .map(MissionBasementFootprint::contours)
                 .collect::<Vec<_>>(),
         )
         .unwrap();

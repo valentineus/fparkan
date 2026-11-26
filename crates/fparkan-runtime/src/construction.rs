@@ -528,11 +528,47 @@ mod tests {
                     .then(|| handle_by_original_id(&engine.world, draft.original_id.unwrap()))
                     .flatten()
             }) {
-                assert!(frame
+                let building = frame
                     .constructed_buildings
                     .iter()
-                    .any(|building| building.handle == handle));
+                    .find(|building| building.handle == handle)
+                    .expect("first live factory must be published in the same frame");
                 assert!(frame.snapshot.objects.contains(&handle));
+                let pose = transform_state(&engine.world, handle).unwrap();
+                let mut draft = loaded.object_drafts[building.object_index].clone();
+                draft.position = pose.position.map(f32::from_bits);
+                draft.orientation_raw = pose.orientation.map(f32::from_bits);
+                draft.scale = pose.scale.map(f32::from_bits);
+                let footprint = crate::mission_basement_footprint(
+                    &loaded.mission_assets,
+                    building.object_index,
+                    &draft,
+                )
+                .unwrap()
+                .expect("the constructed factory has BAS rings at its live pose");
+                let mut footprints = crate::mission_basement_footprints(
+                    &loaded.mission_assets,
+                    &loaded.object_drafts[..loaded.summary.object_count],
+                )
+                .unwrap();
+                footprints.push(footprint);
+                let rings: Vec<_> = footprints
+                    .iter()
+                    .map(crate::MissionBasementFootprint::contours)
+                    .collect();
+                let foundation = fparkan_terrain::build_basement_foundations(
+                    loaded.terrain.source_mesh().unwrap(),
+                    &rings,
+                )
+                .expect("live factory footprint fits the stock terrain");
+                let cut_terrain = loaded
+                    .terrain
+                    .clone()
+                    .with_basement_foundation(foundation)
+                    .unwrap();
+                let [x, y, _] = draft.position;
+                assert!(loaded.terrain.support_at([x, y]).unwrap().is_some());
+                assert!(cut_terrain.support_at([x, y]).unwrap().is_none());
                 assert_eq!(
                     identity_metadata(&engine.world, handle).unwrap().owner_id,
                     Some(OwnerId(1))

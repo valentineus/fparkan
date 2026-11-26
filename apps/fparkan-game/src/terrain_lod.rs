@@ -179,11 +179,7 @@ mod tests {
         let footprints = super::super::mission_basement_footprints(assets, roots).unwrap();
         let borrowed = footprints
             .iter()
-            .map(|f| fparkan_terrain::BasementFootprint {
-                outer: &f.outer,
-                inner: &f.inner,
-                flatten_inner_to_mean_outer_z: f.flatten_inner_to_mean_outer_z,
-            })
+            .map(fparkan_runtime::MissionBasementFootprint::contours)
             .collect::<Vec<_>>();
         let mut foundation =
             fparkan_terrain::build_basement_foundations(terrain, &borrowed).unwrap();

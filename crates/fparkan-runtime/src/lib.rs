@@ -45,9 +45,13 @@ mod autodemo;
 mod behavior_clock;
 mod behavior_profile;
 use behavior_profile::prepare_behavior_profile_states;
+mod basement_geometry;
 mod boarding;
 mod builder_supply;
 mod building_door;
+pub use basement_geometry::{
+    mission_basement_footprint, mission_basement_footprints, MissionBasementFootprint,
+};
 mod building_passage;
 mod capture_barrier;
 mod clan_ai_events;
