@@ -1,6 +1,8 @@
 use crate::MissionDocument;
 use fparkan_assets::{ResearchCandidate, ResearchCandidateSet, ResearchTrfDocument};
 use fparkan_path::NormalizedPath;
+use fparkan_prototype::decode_unit_dat;
+use fparkan_resource::{ArchiveId, ResourceRepository};
 use fparkan_vfs::Vfs;
 use fparkan_world::OwnerId;
 
@@ -8,6 +10,7 @@ pub(super) struct ClanResearch {
     pub(super) candidates: ResearchCandidateSet,
     pub(super) table: ResearchTrfDocument,
     pub(super) refreshes: u64,
+    assault_excluded: Vec<bool>,
 }
 
 pub(super) fn scan_status(candidates: Option<&ResearchCandidateSet>) -> u32 {
@@ -17,6 +20,7 @@ pub(super) fn scan_status(candidates: Option<&ResearchCandidateSet>) -> u32 {
 impl ClanResearch {
     pub(super) fn load(
         vfs: &dyn Vfs,
+        repository: &impl ResourceRepository,
         mission: &MissionDocument,
         clan: usize,
     ) -> Result<Self, String> {
@@ -31,10 +35,21 @@ impl ClanResearch {
             loaded: true,
             ..Default::default()
         };
+        let registry_path = crate::normalize_engine_path("AI research", "objects.rlb")
+            .expect("static registry path");
+        let registry = repository.open_archive_unchanged(&registry_path).ok();
+        let assault_excluded = candidates
+            .entries
+            .iter()
+            .map(|entry| {
+                excluded_from_assault(vfs, repository, registry, &entry.path).unwrap_or(false)
+            })
+            .collect();
         let mut catalog = Self {
             candidates,
             table,
             refreshes: 0,
+            assault_excluded,
         };
         catalog.refresh(vfs)?;
         Ok(catalog)
@@ -46,17 +61,71 @@ impl ClanResearch {
             .refresh_selection(vfs, Some(&self.table))
             .map_err(|error| error.to_string())
     }
+
+    pub(super) fn assault_needs_weapon_metadata(&self) -> bool {
+        self.candidates.loaded
+            && self
+                .candidates
+                .entries
+                .iter()
+                .zip(&self.assault_excluded)
+                .any(|(candidate, &excluded)| candidate.status != 0 && !excluded)
+    }
+}
+
+fn excluded_from_assault(
+    vfs: &dyn Vfs,
+    repository: &impl ResourceRepository,
+    registry: Option<ArchiveId>,
+    path: &NormalizedPath,
+) -> Option<bool> {
+    let bytes = vfs.read(path).ok()?;
+    let unit = decode_unit_dat(&bytes).ok()?;
+    let flags = u32::from_le_bytes(unit.header_opaque[4..].try_into().ok()?);
+    if flags & crate::UNIT_DAT_CONTROL_CLASS_HIGH_BIT != 0 {
+        return Some(true);
+    }
+    if !matches!(
+        flags,
+        crate::boarding::WARBOT_CLASS
+            | crate::construction::BUILDER_CLASS
+            | crate::clan_factory_schemes::TRANSPORT_CLASS
+    ) {
+        return None;
+    }
+    let root = unit.records.first()?;
+    let archive = root.archive_raw.split(|&byte| byte == 0).next()?;
+    if !archive.eq_ignore_ascii_case(b"objects.rlb") {
+        return None;
+    }
+    let name = root.resource_raw.split(|&byte| byte == 0).next()?;
+    let entry = repository
+        .find(registry?, &crate::resource_name(name))
+        .ok()??;
+    let kind = repository.entry_info(entry).ok()?.key.type_id;
+    (kind == Some(crate::CONTROL_CLASS_SOURCE_BTLU)).then(|| chassis_size(name) < 3)
+}
+
+fn chassis_size(name: &[u8]) -> u32 {
+    match name.get(2).map(u8::to_ascii_lowercase) {
+        Some(b't') => 1,
+        Some(b'h' | b'l') => 2,
+        Some(b'm') => 3,
+        Some(b'b') => 4,
+        _ => 0,
+    }
 }
 
 pub(super) fn initialize(
     vfs: &dyn Vfs,
+    repository: &impl ResourceRepository,
     mission: &MissionDocument,
     ai: &mut crate::clan_ai_events::ClanAiEvents,
     bundles: &mut [crate::MissionScriptBundle],
     clan: usize,
     instruction_index: usize,
 ) {
-    match ClanResearch::load(vfs, mission, clan) {
+    match ClanResearch::load(vfs, repository, mission, clan) {
         Ok(catalog) => {
             eprintln!(
                 "sim_coverage script_research_catalog_approx=1 clan={clan} entries={} selected={}",
@@ -115,6 +184,21 @@ mod tests {
     };
     use fparkan_vfs::{DirectoryVfs, MemoryVfs};
     use std::sync::Arc;
+
+    #[test]
+    fn assault_size_comes_from_the_zero_based_third_byte_of_a_mobile_root() {
+        for (root, size) in [
+            (b"R_T_01".as_slice(), 1),
+            (b"r_h_02", 2),
+            (b"R_L_03", 2),
+            (b"R_M_04", 3),
+            (b"r_b_03", 4),
+            (b"R_E_42", 0),
+            (b"R_", 0),
+        ] {
+            assert_eq!(super::chassis_size(root), size);
+        }
+    }
 
     #[test]
     fn status_query_reads_the_cached_scan_without_reexamining_candidates() {
@@ -268,18 +352,27 @@ mod tests {
             .clan_ai_events
             .research_catalogs[&1];
         assert_eq!(catalog.candidates.entries.len(), native.len() / 0x124);
-        for (entry, row) in catalog
+        for (index, (entry, row)) in catalog
             .candidates
             .entries
             .iter()
             .zip(native.chunks_exact(0x124))
+            .enumerate()
         {
             let path = std::str::from_utf8(row[..260].split(|&b| b == 0).next().unwrap())
                 .unwrap()
                 .replace('\\', "/");
             assert_eq!(entry.path.as_str(), path);
             assert_eq!(entry.status, row[260], "{}", entry.path.as_str());
+            let flags = u32::from_le_bytes(row[0x108..0x10c].try_into().unwrap());
+            let size = u32::from_le_bytes(row[0x10c..0x110].try_into().unwrap());
+            assert_eq!(
+                catalog.assault_excluded[index],
+                flags & crate::UNIT_DAT_CONTROL_CLASS_HIGH_BIT != 0 || size < 3,
+                "{path} size {size}"
+            );
         }
+        assert!(!catalog.assault_needs_weapon_metadata());
         let index: u32 = std::fs::read_to_string(snapshot.with_extension("selection"))
             .unwrap()
             .trim()

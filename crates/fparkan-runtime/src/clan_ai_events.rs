@@ -1291,12 +1291,19 @@ impl LoadedMissionState {
                         ScriptDispatchSelector::Handler(handler @ 65)
                             if instruction.references.is_empty() =>
                         {
-                            // shortcut: large-warbot eligibility needs the native candidate power property.
-                            self.clan_ai_events.log_research_stub(
-                                clan,
-                                handler,
-                                &bundle.script_path,
-                            );
+                            if self
+                                .clan_ai_events
+                                .research_catalogs
+                                .get(&clan)
+                                .is_some_and(crate::clan_research::ClanResearch::assault_needs_weapon_metadata)
+                            {
+                                // shortcut: the rating and priority change for eligible chassis are unmodeled.
+                                self.clan_ai_events.log_research_stub(
+                                    clan,
+                                    handler,
+                                    &bundle.script_path,
+                                );
+                            }
                             Ok(Some(VarSetDefault::Dword(0)))
                         }
                         selector => Err(format!("{selector:?}")),

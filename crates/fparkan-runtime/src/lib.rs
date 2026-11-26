@@ -2648,6 +2648,7 @@ node_provider_distribution_suspended: false,
                 instruction_index,
             } => clan_research::initialize(
                 vfs.as_ref(),
+                repository,
                 &mission,
                 &mut clan_ai_events,
                 &mut loaded_scripts.bundles,
