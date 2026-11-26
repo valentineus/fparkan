@@ -319,6 +319,12 @@ impl UnitPatrol {
             .any(|departure| departure.handle == unit)
     }
 
+    pub(super) fn has_factory_departure(&self, plant: ObjectHandle) -> bool {
+        self.factory_departures
+            .iter()
+            .any(|departure| departure.plant == plant)
+    }
+
     pub(super) fn is_moving_to_destination(&self, handle: ObjectHandle) -> bool {
         self.units
             .iter()
@@ -461,7 +467,7 @@ impl UnitPatrol {
             };
         let mut poses = Vec::new();
         if seconds > 0.0 {
-            for departure in std::mem::take(&mut state.factory_departures) {
+            for mut departure in std::mem::take(&mut state.factory_departures) {
                 let handle = departure.handle;
                 let Ok(before) = transform_state(world, handle) else {
                     continue;

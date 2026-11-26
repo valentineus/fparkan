@@ -64,8 +64,17 @@ impl BuildingFootprints {
     }
 
     pub(super) fn with_clearance(&self, radius: f32) -> Vec<Footprint> {
+        self.with_clearance_except(radius, None)
+    }
+
+    pub(super) fn with_clearance_except(
+        &self,
+        radius: f32,
+        skip: Option<ObjectHandle>,
+    ) -> Vec<Footprint> {
         self.entries
             .values()
+            .filter(|(handle, _, _)| Some(*handle) != skip)
             .filter_map(|(_, _, footprint)| footprint.map(|bounds| bounds.expanded(radius)))
             .collect()
     }

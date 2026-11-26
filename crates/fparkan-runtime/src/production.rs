@@ -291,12 +291,16 @@ impl Production {
             }
             ready &= paid.ready();
         }
-        if !ready {
+        if !ready
+            || mission
+                .unit_patrol
+                .as_ref()
+                .is_some_and(|patrol| patrol.has_factory_departure(order.plant))
+        {
             return Ok(None);
         }
         let pose = transform_state(world, order.plant)?;
-        // shortcut: the outdoor direction selects an apron until the elevated
-        // assembly platform and its ramp are simulated.
+        // shortcut: use the outdoor direction to select the exit from the apron.
         let preferred = reinforcement_position(
             pose.position.map(f32::from_bits),
             pose.orientation.map(f32::from_bits),
@@ -311,6 +315,7 @@ impl Production {
             mission,
             &mut self.buildings,
             order.plant,
+            order.plant_index,
             order.slot,
             preferred,
         )?
@@ -356,8 +361,9 @@ impl Production {
                 .expect("free order belongs to a prepared factory");
             *count -= 1;
         }
-        if let Some(exit) = site.exit {
-            let departure = FactoryDeparture::new(handle, order.slot, exit, mission);
+        if let Some(departure) =
+            FactoryDeparture::from_site(handle, order.plant, order.slot, site, mission)
+        {
             mission
                 .unit_patrol
                 .get_or_insert_with(crate::unit_patrol::UnitPatrol::scripted)
@@ -907,6 +913,8 @@ mod tests {
             None,
         )
         .unwrap();
+        let enemy_factory = handle_by_original_id(&engine.world, OriginalObjectId(9)).unwrap();
+        let enemy_pose = transform_state(&engine.world, enemy_factory).unwrap();
         let report = super::super::simulate_mission_report(&mut engine, 40_000).unwrap();
         assert!(
             report.first_factory_completion_ms.contains_key(&1),
@@ -949,33 +957,22 @@ mod tests {
                 .produced_unit
             {
                 let pose = transform_state(&engine.world, unit.handle).unwrap();
-                let [x, y, _] = pose.position.map(f32::from_bits);
+                let [x, y, z] = pose.position.map(f32::from_bits);
                 let mission = engine.loaded.as_ref().unwrap();
-                let radius = crate::route_traffic::body_radius(
-                    &mission.mission_assets,
-                    unit.object_index,
-                    pose,
-                )
-                .unwrap();
-                let mut buildings = BuildingFootprints::default();
-                buildings.refresh(&engine.world, mission);
-                assert!(buildings
-                    .with_clearance(radius)
-                    .iter()
-                    .all(|bounds| !bounds.contains([x, y])));
-                let traffic = crate::route_traffic::FrameTraffic::read(&engine.world, mission);
-                assert!(traffic
-                    .blockers(unit.handle, [x, y], radius)
-                    .unwrap()
-                    .iter()
-                    .all(|bounds| !bounds.contains([x, y])));
-                if mission
+                let (plant, expected_z) = if unit.clan == 1 {
+                    (enemy_pose, 205.0637)
+                } else {
+                    (transform_state(&engine.world, factory).unwrap(), 196.756)
+                };
+                let [px, py, _] = plant.position.map(f32::from_bits);
+                assert_eq!([x, y], [px, py]);
+                assert!((z - expected_z).abs() < 0.001, "{z} vs {expected_z}");
+                assert!(mission
                     .unit_patrol
                     .as_ref()
-                    .is_some_and(|patrol| patrol.is_leaving_factory(unit.handle))
-                {
-                    departures.push((unit.handle, [x, y]));
-                }
+                    .unwrap()
+                    .is_leaving_factory(unit.handle));
+                departures.push((unit.handle, [x, y, z]));
                 completed.push((unit.clan, unit.object_index));
             }
         }
@@ -1029,8 +1026,8 @@ mod tests {
                         return false;
                     };
                     transform_state(&engine.world, actor).is_ok_and(|pose| {
-                        let [x, y, _] = pose.position.map(f32::from_bits);
-                        !patrol.is_leaving_factory(actor) && [x, y] != start
+                        let [x, y, z] = pose.position.map(f32::from_bits);
+                        !patrol.is_leaving_factory(actor) && [x, y] != start[..2] && z < start[2]
                     })
                 }));
                 return;
