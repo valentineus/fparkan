@@ -2025,9 +2025,19 @@ fn load_mission_with_options(
         }
     })?;
     let mut loaded_scripts = load_mission_scripts(&vfs, &mission, options.asset_scope)?;
+    let asset_manager = AssetManager::new(CachedResourceRepository::with_payload_cache_budget(
+        vfs.clone(),
+        MISSION_DECODED_PAYLOAD_CACHE_ENTRIES,
+    ));
+    let repository = asset_manager.repository();
     let player_scheme_count = build_schemes.len();
     let ai_schemes = if options.start_autodemo && request.mode == MissionMode::SingleMission {
-        clan_factory_schemes::available(vfs.as_ref(), &mission, &loaded_scripts.bundles)
+        clan_factory_schemes::available(
+            &asset_manager,
+            vfs.as_ref(),
+            &mission,
+            &loaded_scripts.bundles,
+        )
     } else {
         Vec::new()
     };
@@ -2043,10 +2053,6 @@ fn load_mission_with_options(
     } else {
         Vec::new()
     };
-    let repository = CachedResourceRepository::with_payload_cache_budget(
-        vfs.clone(),
-        MISSION_DECODED_PAYLOAD_CACHE_ENTRIES,
-    );
     let mut graph_roots: Vec<_> = mission
         .objects
         .iter()
@@ -2113,9 +2119,9 @@ fn load_mission_with_options(
             .unwrap_or_default(),
     };
     let (mut prototype_graph, resolved_prototypes, mut prototype_report) =
-        build_prototype_graph_report(&repository, vfs.as_ref(), scoped_graph_roots);
+        build_prototype_graph_report(repository, vfs.as_ref(), scoped_graph_roots);
     extend_graph_report_with_visual_dependencies(
-        &repository,
+        repository,
         &mut prototype_report,
         &mut prototype_graph,
         &resolved_prototypes,
@@ -2125,7 +2131,6 @@ fn load_mission_with_options(
             failures: prototype_report.failures.clone(),
         });
     }
-    let asset_manager = AssetManager::new(repository);
     let mission_assets = match options.asset_scope {
         MissionAssetScope::Full => asset_manager.prepare_mission_assets(
             &prototype_graph.root_prototype_request_spans,

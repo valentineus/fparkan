@@ -595,7 +595,10 @@ pub(super) fn order_script_factory(
         .find(|&(_, handle, _)| handle == plant)
         .ok_or_else(|| production_error("script factory is unavailable"))?;
     let auxiliary = crate::clan_factory_schemes::AUXILIARY_CLASSES.contains(&class);
-    let ai_scheme = if auxiliary && selection == crate::clan_factory_schemes::SELECT_FASTEST {
+    let use_catalog = (auxiliary && selection == crate::clan_factory_schemes::SELECT_FASTEST)
+        || (class == crate::boarding::WARBOT_CLASS
+            && selection == crate::clan_factory_schemes::SELECT_STRONGEST);
+    let ai_scheme = if use_catalog {
         production
             .ai_schemes
             .iter()
@@ -603,14 +606,22 @@ pub(super) fn order_script_factory(
     } else {
         None
     };
-    // shortcut: warbots use the first compatible prebuild until AI combat ranking is wired.
-    let scheme = schemes_for_plant(mission, production, index)
-        .find(|&(scheme, path)| {
+    let scheme = ai_scheme
+        .and_then(|selected| {
+            schemes_for_plant(mission, production, index)
+                .find(|&(_, path)| selected.as_str() == path)
+        })
+        .or_else(|| {
             if auxiliary {
-                return ai_scheme.is_some_and(|selected| selected.as_str() == path);
+                return None;
             }
-            let draft = &mission.object_drafts[production.reserve_start + scheme * RESERVE_SLOTS];
-            scheme < production.player_scheme_count && draft.unit_dat_header_flags == Some(class)
+            // shortcut: retain the compatible reserve for unsupported catalog requests.
+            schemes_for_plant(mission, production, index).find(|&(scheme, _)| {
+                let draft =
+                    &mission.object_drafts[production.reserve_start + scheme * RESERVE_SLOTS];
+                scheme < production.player_scheme_count
+                    && draft.unit_dat_header_flags == Some(class)
+            })
         })
         .map(|(scheme, _)| scheme)
         .ok_or_else(|| production_error("script factory has no compatible prepared scheme"))?;
@@ -802,6 +813,46 @@ mod tests {
     };
     use fparkan_vfs::DirectoryVfs;
     use fparkan_world::{set_transform, InputSnapshot, OriginalObjectId};
+    use std::sync::Arc;
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_stock_factory_releases_the_ranked_combat_design() {
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed corpus");
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/Single.01/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        let placed_count = engine.loaded.as_ref().unwrap().mission.objects.len();
+        for tick in 0..=60 * 12 {
+            let now = tick * 1000 / 60;
+            let frame = crate::frame(&mut engine, now).unwrap();
+            let first_build = frame.snapshot.transforms.iter().find_map(|(handle, _)| {
+                let identity = identity_metadata(&engine.world, *handle).ok()?;
+                let index = identity.original_id?.0 as usize;
+                (identity.owner_id == Some(OwnerId(1)) && index >= placed_count).then_some(index)
+            });
+            if let Some(index) = first_build {
+                let draft = &engine.loaded.as_ref().unwrap().object_drafts[index];
+                assert!(draft
+                    .resource_name_raw
+                    .eq_ignore_ascii_case(b"UNITS/UNITS/AI/12spd1.dat"));
+                assert!((10_000..=10_200).contains(&now), "release at {now} ms");
+                return;
+            }
+        }
+        panic!("stock AI did not release a combat design in the opening");
+    }
 
     #[test]
     fn mission_prebuilds_preserve_order_and_skip_duplicates() {

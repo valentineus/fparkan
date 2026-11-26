@@ -1,6 +1,7 @@
 use crate::{
-    control_device_provider_value_from_status, MissionControlDeviceTableState,
-    MissionControlDeviceTableStatus, ObjectHandle,
+    control_device_provider_value_from_status, EffectiveControlDevice,
+    MissionControlDeviceTableState, MissionControlDeviceTableStatus,
+    MissionControlNodeProviderTableStatus, ObjectHandle,
 };
 
 pub(super) fn unit_strength(
@@ -14,6 +15,15 @@ pub(super) fn unit_strength(
     let MissionControlDeviceTableStatus::Available(devices) = &table.status else {
         return rating(capacity, 0.0);
     };
+    // shortcut: assume full design ammunition and use the live Control amount
+    // until selector 0x36 scaling and live weapon counters are wired.
+    rating(capacity, weapon_power(devices, &table.node_provider_status))
+}
+
+pub(super) fn weapon_power(
+    devices: &[EffectiveControlDevice],
+    providers: &MissionControlNodeProviderTableStatus,
+) -> f32 {
     let mut grouped = false;
     let mut weapon_power = 0.0;
     for device in devices {
@@ -25,7 +35,7 @@ pub(super) fn unit_strength(
                 else {
                     continue;
                 };
-                if control_device_provider_value_from_status(&table.node_provider_status, device)
+                if control_device_provider_value_from_status(providers, device)
                     .is_ok_and(|health| health == 0.0)
                 {
                     continue;
@@ -39,12 +49,10 @@ pub(super) fn unit_strength(
             _ => {}
         }
     }
-    // shortcut: assume full design ammunition and use the live Control amount
-    // until selector 0x36 scaling and live weapon counters are wired.
-    rating(capacity, weapon_power)
+    weapon_power
 }
 
-fn rating(capacity: f32, weapon_power: f32) -> f32 {
+pub(super) fn rating(capacity: f32, weapon_power: f32) -> f32 {
     ((weapon_power + 0.8_f32) * capacity) * 0.00001_f32
 }
 

@@ -103,41 +103,30 @@ mod tests {
                     .reserved_minds(&engine.world, owner),
             )
         };
+        let reserved = |engine: &crate::Engine| {
+            engine
+                .production
+                .as_ref()
+                .unwrap()
+                .reserved_minds(&engine.world, OwnerId(1))
+        };
         assert_eq!(available(&engine, OwnerId(0)), 3);
         assert_eq!(available(&engine, OwnerId(1)), 4);
         frame(&mut engine, 0).unwrap();
-        assert_eq!(
-            engine
-                .production
-                .as_ref()
-                .unwrap()
-                .reserved_minds(&engine.world, OwnerId(1)),
-            1
-        );
+        assert_eq!(reserved(&engine), 1);
         assert_eq!(available(&engine, OwnerId(1)), 3);
-        for now_ms in (100..=20_000).step_by(100) {
-            frame(&mut engine, now_ms).unwrap();
-        }
-        assert_eq!(
-            engine
-                .production
-                .as_ref()
-                .unwrap()
-                .reserved_minds(&engine.world, OwnerId(1)),
-            0
-        );
+        let first_release = (100..=22_000)
+            .step_by(100)
+            .find(|&now_ms| {
+                frame(&mut engine, now_ms).unwrap();
+                reserved(&engine) == 0
+            })
+            .expect("the first build converted its reservation into a robot");
         assert_eq!(available(&engine, OwnerId(1)), 3);
-        for now_ms in (20_100..=28_000).step_by(100) {
+        assert!(((first_release + 100)..=32_000).step_by(100).any(|now_ms| {
             frame(&mut engine, now_ms).unwrap();
-        }
-        assert_eq!(
-            engine
-                .production
-                .as_ref()
-                .unwrap()
-                .reserved_minds(&engine.world, OwnerId(1)),
-            1
-        );
+            reserved(&engine) == 1
+        }));
         assert_eq!(available(&engine, OwnerId(1)), 2);
         let loaded = engine.loaded.as_ref().unwrap();
         let plant = loaded
