@@ -384,9 +384,11 @@ fn plan_player_steps(
     ) else {
         return Ok(None);
     };
-    let flying = mission
+    let boarded = mission
         .boarding
-        .is_some_and(|boarding| boarding.cockpit.handle == cockpit.handle && boarding.can_fly);
+        .filter(|boarding| boarding.cockpit.handle == cockpit.handle);
+    let flying = boarded.is_some_and(|boarding| boarding.can_fly);
+    let chassis_ground = boarded.and_then(|boarding| boarding.ground);
     if input.movement == [0.0; 2]
         && (!flying || input.climb == 0.0)
         && input.mouse_x == 0.0
@@ -400,6 +402,9 @@ fn plan_player_steps(
     }
     let speeds = if flying {
         [FLIGHT_SPEED_FALLBACK; 2]
+    } else if boarded.is_some() {
+        crate::manual_chassis::speed_limits(mission, cockpit.handle)
+            .unwrap_or([WALK_SPEED_FALLBACK; 2])
     } else if mission.local_hero == Some(cockpit.handle) {
         let forward = mission
             .control_device_tables
@@ -430,6 +435,7 @@ fn plan_player_steps(
     let Some(resolve) = resolve else {
         let mut step = plan_motion(&mission.terrain, pose, pitch, flying, speeds, input)?;
         step.max_floor_clearance = max_floor_clearance;
+        crate::manual_chassis::support_step(chassis_ground, &mission.terrain, pose, &mut step)?;
         return Ok(Some(step));
     };
     let count = if !flying && input.movement != [0.0; 2] {
@@ -467,6 +473,7 @@ fn plan_player_steps(
             step.surface = previous_surface;
             break;
         }
+        crate::manual_chassis::support_step(chassis_ground, &mission.terrain, previous, &mut step)?;
         if drowns(engine, cockpit, step) {
             break;
         }

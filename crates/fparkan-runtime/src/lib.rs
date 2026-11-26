@@ -91,6 +91,7 @@ use behavior_clock::next_crt_rand;
 mod mesh_collision;
 mod mining;
 pub use laboratory::LaboratoryReport;
+mod manual_chassis;
 mod mission_events;
 mod ore_transport;
 mod patrol_points;

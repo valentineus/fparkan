@@ -15,6 +15,7 @@ pub(super) struct Boarding {
     pub(super) cockpit: StartingCockpit,
     pub(super) hero: StartingCockpit,
     pub(super) can_fly: bool,
+    pub(super) ground: Option<crate::ground_support::GroundSupport>,
 }
 
 /// The vehicle cockpit while the player is aboard.
@@ -115,6 +116,14 @@ pub fn board_friendly_warbot(
         return Ok(None);
     };
     let can_fly = crate::player_motion::warbot_can_fly(engine, cockpit.object_index);
+    let ground = (!can_fly)
+        .then(|| {
+            crate::ground_support::GroundSupport::prepare(
+                &mission.mission_assets,
+                cockpit.object_index,
+            )
+        })
+        .flatten();
     set_transform(
         &mut engine.world,
         hero.handle,
@@ -128,6 +137,7 @@ pub fn board_friendly_warbot(
             cockpit,
             hero,
             can_fly,
+            ground,
         });
         mission.player_pitch_bits = 0;
     }
