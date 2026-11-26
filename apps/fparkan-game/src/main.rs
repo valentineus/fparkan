@@ -11404,9 +11404,9 @@ impl StaticVulkanApp {
                 fparkan_runtime::take_unit_destruction_effects(engine),
                 control_clock_ms,
                 self.audio.as_mut(),
-                |index, origin| {
+                |mesh, origin| {
                     debris::capture(
-                        index,
+                        mesh,
                         origin,
                         &self.dynamic_component_geometry,
                         &self.mesh,
@@ -11967,6 +11967,11 @@ impl StaticVulkanApp {
                 &self.component_pose_buffers,
                 &self.mesh,
                 renderer,
+                |range| {
+                    self.destruction_effects
+                        .as_ref()
+                        .is_some_and(|effects| effects.keeps_range(range))
+                },
             )?;
         }
         if !self.removed_mission_roots.is_empty() || self.boarded_hero_index.is_some() {

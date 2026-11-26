@@ -313,7 +313,7 @@ pub fn apply_projectile_contact(
     }
     // shortcut: feed the projectile NDP volume into the native reduction while impact falloff is open.
     let effect = (volume >= remaining && engine.destruction_effects.is_some())
-        .then(|| super::destruction::part_effect(row, contact.position))
+        .then(|| super::destruction::part_effect(engine, row, contact))
         .flatten();
     let updated = apply_loaded_mission_control_node_delta(engine, contact.handle, key, -volume)?;
     if updated.is_some() {
@@ -465,6 +465,9 @@ mod tests {
         let effects = take_unit_destruction_effects(&mut engine);
         assert_eq!(effects.len(), 1);
         assert_eq!(effects[0].position, contact.position);
+        assert!(
+            matches!(effects[0].mesh, Some(crate::DestroyedMesh::ChassisNode { object_index: 14, node: key, .. }) if key == node as usize)
+        );
     }
 
     #[test]
@@ -515,7 +518,7 @@ mod tests {
             panic!("expected one EXPL at the failed part");
         };
         assert_eq!(effect.position, contact.position);
-        assert_eq!(effect.object_index, None);
+        assert!(effect.mesh.is_none());
         assert_eq!(effect.name, "explode_frt_b.exp");
         assert!(unit_destruction_effect_sources(&engine)
             .any(|source| source == (effect.archive.clone(), effect.name.clone())));

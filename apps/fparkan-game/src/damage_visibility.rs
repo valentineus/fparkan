@@ -12,6 +12,7 @@ pub(super) fn apply(
     poses: &[Vec<Option<NodePoseBuffer>>],
     mesh: &VulkanStaticMesh,
     renderer: &mut VulkanSmokeRenderer,
+    fragment_is_visible: impl Fn(usize) -> bool,
 ) -> Result<(), String> {
     for (object, node) in depleted_chassis_nodes(engine) {
         let Some(component) = geometry
@@ -21,20 +22,20 @@ pub(super) fn apply(
         else {
             continue;
         };
-        let model = &component.model;
-        if model.node_stride != 38
-            || model.animation.is_none()
-            || !poses
-                .get(object)
-                .and_then(|v| v.first())
-                .is_some_and(Option::is_some)
+        if !poses
+            .get(object)
+            .and_then(|v| v.first())
+            .is_some_and(Option::is_some)
         {
             continue;
         }
         let Some(ranges) = node_draw_ranges(mesh, component, object, node) else {
             continue;
         };
-        for range in ranges {
+        for range in ranges
+            .into_iter()
+            .filter(|&range| !fragment_is_visible(range))
+        {
             renderer
                 .set_draw_range_index_count(range, 0)
                 .map_err(|error| format!("hide damaged chassis node {object}:{node}: {error}"))?;
@@ -43,12 +44,15 @@ pub(super) fn apply(
     Ok(())
 }
 
-fn node_draw_ranges(
+pub(super) fn node_draw_ranges(
     mesh: &VulkanStaticMesh,
     component: &DynamicComponentGeometry,
     object: usize,
     node: usize,
 ) -> Option<Vec<usize>> {
+    if component.model.node_stride != 38 || component.model.animation.is_none() {
+        return None;
+    }
     let owner = u32::try_from(object.checked_add(1)?).ok()?;
     let end = component.vertex_start.checked_add(component.vertex_count)?;
     let vertices = component.vertex_start..end;

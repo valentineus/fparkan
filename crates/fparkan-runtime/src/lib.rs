@@ -80,7 +80,7 @@ pub use debris_motion::DebrisMotion;
 mod destruction;
 pub use destruction::{
     collect_unit_destruction_effects, take_unit_destruction_effects,
-    unit_destruction_effect_sources, UnitDestructionEffect,
+    unit_destruction_effect_sources, DestroyedMesh, UnitDestructionEffect,
 };
 mod flight_altitude;
 mod ground_support;

@@ -6,10 +6,28 @@ use crate::{
 };
 use fparkan_world::{identity_metadata, transform_state};
 
+/// Geometry supplied by the destroyed object to its authored explosion.
+pub enum DestroyedMesh {
+    /// Mounted models after the loss of the whole chassis.
+    Mounted {
+        /// Prepared actor index.
+        object_index: usize,
+    },
+    /// One separated node of a still live chassis.
+    ChassisNode {
+        /// Prepared actor index.
+        object_index: usize,
+        /// Local node of the root model.
+        node: usize,
+        /// World position of the hull at impact.
+        hull_origin: [f32; 3],
+    },
+}
+
 /// Position and attached EXPL resource of a destroyed chassis or building part.
 pub struct UnitDestructionEffect {
-    /// Prepared draft index for the destroyed actor when it has an authored layout.
-    pub object_index: Option<usize>,
+    /// Prepared mesh to move when the effect requests built-in fragments.
+    pub mesh: Option<DestroyedMesh>,
     /// World-space origin of the effect.
     pub position: [f32; 3],
     /// Archive containing the explosion description.
@@ -67,13 +85,30 @@ pub fn unit_destruction_effect_sources(
 }
 
 pub(super) fn part_effect(
+    engine: &Engine,
     row: &MissionControlNodeProviderRow,
-    position: [f32; 3],
+    contact: super::ProjectileContact,
 ) -> Option<UnitDestructionEffect> {
     let (archive, name) = node_effect(row)?;
+    let mesh = match contact.node {
+        Some(super::ProjectileNode::Chassis(node))
+            if row.current_flags.is_some_and(|flags| flags & 2 == 0) =>
+        {
+            let id = identity_metadata(&engine.world, contact.handle)
+                .ok()?
+                .original_id?;
+            let hull = transform_state(&engine.world, contact.handle).ok()?;
+            Some(DestroyedMesh::ChassisNode {
+                object_index: id.0 as usize,
+                node: node as usize,
+                hull_origin: hull.position.map(f32::from_bits),
+            })
+        }
+        _ => None,
+    };
     Some(UnitDestructionEffect {
-        object_index: None,
-        position,
+        mesh,
+        position: contact.position,
         archive,
         name,
     })
@@ -104,7 +139,7 @@ pub(super) fn pending_effect(
         .position
         .map(f32::from_bits);
     Some(UnitDestructionEffect {
-        object_index,
+        mesh: object_index.map(|object_index| DestroyedMesh::Mounted { object_index }),
         position,
         archive,
         name,

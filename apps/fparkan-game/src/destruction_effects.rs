@@ -13,7 +13,9 @@ use fparkan_fx::{
     FxCommand, FxOpcode,
 };
 use fparkan_render_vulkan::{VulkanPointLight, VulkanStaticMesh};
-use fparkan_runtime::{unit_destruction_effect_sources, Engine, UnitDestructionEffect};
+use fparkan_runtime::{
+    unit_destruction_effect_sources, DestroyedMesh, Engine, UnitDestructionEffect,
+};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
@@ -44,7 +46,7 @@ mod tests {
         let position = [23.0, 45.0, 10.0];
         effects.start(
             vec![UnitDestructionEffect {
-                object_index: None,
+                mesh: None,
                 position,
                 archive: "system.rlb".into(),
                 name: "explode_rbr_b.exp".into(),
@@ -244,10 +246,10 @@ impl DestructionEffects {
         events: Vec<UnitDestructionEffect>,
         now: u32,
         mut audio: Option<&mut GameAudio>,
-        mut capture_fragments: impl FnMut(usize, [f32; 3]) -> Vec<MeshFragment>,
+        mut capture_fragments: impl FnMut(DestroyedMesh, [f32; 3]) -> Vec<MeshFragment>,
     ) {
         for UnitDestructionEffect {
-            object_index,
+            mesh,
             position,
             archive,
             name,
@@ -291,9 +293,9 @@ impl DestructionEffects {
                 effect: Arc::clone(effect),
                 clock,
                 position,
-                fragments: object_index
+                fragments: mesh
                     .filter(|_| effect.fragments)
-                    .map_or_else(Vec::new, |index| capture_fragments(index, position)),
+                    .map_or_else(Vec::new, |geometry| capture_fragments(geometry, position)),
             });
         }
     }

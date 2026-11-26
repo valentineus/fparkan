@@ -911,9 +911,8 @@ mod tests {
                 assert!(destruction_effects.iter().any(|event| {
                     event.archive == "system.rlb"
                         && event.name == "explode_rbr_b.exp"
-                        && event.object_index.is_some_and(|index| {
-                            drafts[index].original_id.map(|id| id.0) == retired.original_id
-                        })
+                        && matches!(event.mesh, Some(crate::DestroyedMesh::Mounted { object_index })
+                            if drafts[object_index].original_id.map(|id| id.0) == retired.original_id)
                         && event
                             .position
                             .iter()
