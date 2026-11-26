@@ -3253,7 +3253,9 @@ pub fn simulate_mission_report(
                 AutoDemoCombatEvent::Destroyed { .. } => {
                     report.autodemo_first_destroyed_ms.get_or_insert(clock_ms)
                 }
-                AutoDemoCombatEvent::BuildingHit { .. } => continue,
+                AutoDemoCombatEvent::BuildingHit { .. } | AutoDemoCombatEvent::WindupSound(_) => {
+                    continue
+                }
             };
         }
         report.mission_messages += frame
@@ -8827,6 +8829,7 @@ mod tests {
             effect_section: PreparedControlEffectSection::Parsed(rows),
             initial_effect_group,
             node_effect_links: Vec::new(),
+            effect_modes: Vec::new(),
             point_list: point_count.map(|count| PreparedControlPointList {
                 source: synthetic_resource_key(941),
                 points: (0..count)
@@ -9332,6 +9335,7 @@ mod tests {
             effect_section,
             initial_effect_group: None,
             node_effect_links: Vec::new(),
+            effect_modes: Vec::new(),
             point_list: None,
         }
     }
@@ -16678,7 +16682,8 @@ mod tests {
                             .any(|(handle, _)| *handle == target));
                         first_destroyed.get_or_insert(now);
                     }
-                    AutoDemoCombatEvent::BuildingHit { .. } => {}
+                    AutoDemoCombatEvent::BuildingHit { .. }
+                    | AutoDemoCombatEvent::WindupSound(_) => {}
                 }
             }
             for replacement in result.autodemo_reinforcements {

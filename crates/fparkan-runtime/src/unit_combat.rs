@@ -49,6 +49,8 @@ pub struct FiringEffectInstance {
 /// One autonomous combat event on the mission clock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AutoDemoCombatEvent {
+    /// The wind-up started a node-attached weapon sound.
+    WindupSound(FiringEffectInstance),
     /// A weapon released a projectile.
     Shot {
         /// Owner of the weapon.
@@ -685,6 +687,11 @@ impl AutoDemoCombat {
                         .unavailable(shooter, "projectile_launch", now, 1);
                 }
             }
+            events.extend(
+                unit.weapons
+                    .started_windup_sounds(unit.index)
+                    .map(AutoDemoCombatEvent::WindupSound),
+            );
             missing += due_missing;
             if missing > 0 {
                 let count = self
@@ -1174,6 +1181,44 @@ mod tests {
             }
         }
         panic!("the first capturer did not take the generator (moving={capturer_fired_while_moving}, defender={defender_fired})");
+    }
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_stock_helicopter_starts_both_laser_sound_rows() {
+        let mut engine = stock_two_fortresses();
+        let helicopter = mission_object_handle(&engine, OriginalObjectId(11)).unwrap();
+        let mut first_shot = None;
+        let mut first_windup_by_component = [None; 2];
+
+        for tick in 0..=60 * 28 {
+            let now = tick * 1000 / 60;
+            let result = frame(&mut engine, now).unwrap();
+            for event in result.autodemo_combat_events {
+                match event {
+                    AutoDemoCombatEvent::WindupSound(effect)
+                        if effect.object_index == 11
+                            && matches!(effect.component_index, 10 | 11) =>
+                    {
+                        assert_eq!((effect.table_index, effect.row_index), (0, 1));
+                        first_windup_by_component[effect.component_index - 10].get_or_insert(now);
+                    }
+                    AutoDemoCombatEvent::Shot { shooter, .. } if shooter == helicopter => {
+                        first_shot.get_or_insert(now);
+                    }
+                    _ => {}
+                }
+            }
+            if first_shot.is_some() && first_windup_by_component.iter().all(Option::is_some) {
+                break;
+            }
+        }
+
+        let first_shot = first_shot.expect("stock helicopter fires");
+        let [Some(left), Some(right)] = first_windup_by_component else {
+            panic!("both authored gun sounds need a wind-up, got {first_windup_by_component:?}");
+        };
+        assert!(left.min(right) <= first_shot);
     }
 
     #[test]

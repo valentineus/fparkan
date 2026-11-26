@@ -3,25 +3,30 @@ use super::{
     LegacyIron3dEulerTransform, PlayerProjectile, PreparedControlPoint, StaticVulkanApp,
 };
 
+use fparkan_runtime::FiringEffectInstance;
+
 impl StaticVulkanApp {
     pub(super) fn sample_player_fire(
         &mut self,
         clock_ms: u32,
-    ) -> Vec<(usize, PreparedControlPoint)> {
+    ) -> (
+        Vec<(usize, PreparedControlPoint)>,
+        Vec<FiringEffectInstance>,
+    ) {
         let trigger = self.player_fire_held || self.player_fire_pressed;
         self.player_fire_pressed = false;
         let Some(cockpit) = self.cockpit else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         if self.mission_frame.is_none()
             || !self
                 .player_weapon_layouts
                 .contains_key(&cockpit.object_index)
         {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let Some(weapons) = self.player_weapon_banks.get_mut(&cockpit.handle) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
         if let Some(engine) = &self.mission_engine {
             weapons.read_control_energy(engine, cockpit.handle);
@@ -33,7 +38,12 @@ impl StaticVulkanApp {
         if let Some(engine) = &mut self.mission_engine {
             weapons.publish_control_energy(engine, cockpit.handle);
         }
-        shots
+        (
+            shots,
+            weapons
+                .started_windup_sounds(cockpit.object_index)
+                .collect(),
+        )
     }
 
     pub(super) fn emit_player_shots(

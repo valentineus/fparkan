@@ -1055,8 +1055,44 @@ pub struct PreparedComponentControl {
     pub initial_effect_group: Option<usize>,
     /// Node-to-effect links from Control opcode 14, resolved within each group.
     pub node_effect_links: Vec<(usize, u32, u32)>,
+    /// Changes to the clocks of existing effect instances, from opcode 10.
+    pub effect_modes: Vec<PreparedControlEffectMode>,
     /// Component-local points selected for parsed effect rows, when present.
     pub point_list: Option<PreparedControlPointList>,
+}
+
+/// An opcode 10 command in a local Control effect group.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PreparedControlEffectMode {
+    pub table_index: usize,
+    pub raw_condition: [u32; 3],
+    pub selector: u32,
+    pub mode: u32,
+}
+
+impl PreparedComponentControl {
+    /// Node-attached sounds whose clocks enter mode 1 at weapon wind-up.
+    pub fn weapon_windup_sound_rows(
+        &self,
+        record: &PreparedControlTypedRecord,
+    ) -> impl Iterator<Item = &PreparedControlEffectRow> {
+        let group = (record.tag == 2).then_some(record.fixed_words[3]);
+        let rows = match &self.effect_section {
+            PreparedControlEffectSection::Parsed(rows) => rows.as_slice(),
+            _ => &[],
+        };
+        rows.iter().filter(move |row| {
+            row.opcode == 3
+                && self.initial_effect_group == Some(row.table_index)
+                && row.raw_condition[0] & 0xf000_0000 == 0
+                && self.effect_modes.iter().any(|change| {
+                    Some(change.table_index as u32) == group
+                        && change.raw_condition[0] & 0xf000_0000 == 0
+                        && change.selector == row.selector
+                        && change.mode == 1
+                })
+        })
+    }
 }
 
 /// Component-local BAS geometry loaded from an explicitly referenced BAS
@@ -3903,6 +3939,7 @@ struct DecodedComponentEffectSection {
     initial_group_opcodes: Option<Vec<u32>>,
     typed_records: Vec<PreparedControlTypedRecord>,
     node_effect_links: Vec<(usize, u32, u32)>,
+    effect_modes: Vec<PreparedControlEffectMode>,
 }
 
 fn decode_component_effect_section<F>(
@@ -3929,6 +3966,7 @@ where
             initial_group_opcodes: (cursor == payload.len()).then(Vec::new),
             typed_records: Vec::new(),
             node_effect_links: Vec::new(),
+            effect_modes: Vec::new(),
         });
     }
     if typed_record_count > CONTROL_TYPED_RECORD_LIMIT {
@@ -3952,6 +3990,7 @@ where
                 initial_group_opcodes: None,
                 typed_records,
                 node_effect_links: Vec::new(),
+                effect_modes: Vec::new(),
             });
         }
 
@@ -4054,6 +4093,7 @@ where
             initial_group_opcodes: complete.then(Vec::new),
             typed_records,
             node_effect_links: Vec::new(),
+            effect_modes: Vec::new(),
         });
     }
 
@@ -4074,6 +4114,7 @@ where
     let mut initial_group_opcodes = Some(Vec::new());
     let mut effect_rows = Vec::new();
     let mut node_effect_links = Vec::new();
+    let mut effect_modes = Vec::new();
     for table_index in 0..effect_group_count {
         let row_count = usize::try_from(
             control_u32_at(payload, cursor)
@@ -4111,7 +4152,7 @@ where
                     .expect("valid initial group has an opcode list")
                     .push(opcode);
             }
-            if !matches!(opcode, 3 | 4) {
+            if !matches!(opcode, 3 | 4 | 10) {
                 continue;
             }
             let raw_condition = [
@@ -4119,6 +4160,15 @@ where
                 control_u32_at(row, 4).expect("fixed effect row has condition word 1"),
                 control_u32_at(row, 8).expect("fixed effect row has condition word 2"),
             ];
+            if opcode == 10 {
+                effect_modes.push(PreparedControlEffectMode {
+                    table_index,
+                    raw_condition,
+                    selector: control_u32_at(row, 0x10).expect("fixed effect row has a selector"),
+                    mode: control_u32_at(row, 0x14).expect("fixed effect row has a time mode"),
+                });
+                continue;
+            }
             let point_offsets = [
                 control_u32_at(row, 0x10).expect("fixed effect row has point offset 0"),
                 control_u32_at(row, 0x14).expect("fixed effect row has point offset 1"),
@@ -4154,6 +4204,7 @@ where
             initial_group_opcodes: None,
             typed_records,
             node_effect_links: Vec::new(),
+            effect_modes: Vec::new(),
         });
     }
     Ok(DecodedComponentEffectSection {
@@ -4162,6 +4213,7 @@ where
         initial_group_opcodes,
         typed_records,
         node_effect_links,
+        effect_modes,
     })
 }
 
@@ -4342,6 +4394,7 @@ fn decode_component_control_payload_with_opcodes(
             effect_section: decoded_effect.section,
             initial_effect_group: decoded_effect.initial_effect_group,
             node_effect_links: decoded_effect.node_effect_links,
+            effect_modes: decoded_effect.effect_modes,
             point_list: None,
         },
         initial_group_opcodes,

@@ -1,10 +1,12 @@
 use super::{
     initial_native_effect_phase, AmbientEffectGpuSlot, ControlEffectFrameSample,
     ControlEffectInstanceKey, ControlEffectInstanceState, ControlEffectSlot, ControlSoundSlot,
-    MissionRenderRoot, SceneSampleId,
+    MissionRenderRoot, SceneSampleId, StaticVulkanApp,
 };
 use fparkan_fx::clock::{FxInstanceClock, FxPhaseProvider};
-use fparkan_runtime::{loaded_mission_control_device_tables, AutoDemoCombatEvent, Engine};
+use fparkan_runtime::{
+    loaded_mission_control_device_tables, AutoDemoCombatEvent, Engine, FiringEffectInstance,
+};
 use std::collections::{HashMap, HashSet};
 
 pub(super) fn owner_control_capacity(
@@ -20,6 +22,75 @@ pub(super) fn owner_control_capacity(
         f32::from_bits(table.node_provider_amount_bits?),
         f32::from_bits(table.node_provider_maximum_amount_bits?),
     ))
+}
+
+impl From<FiringEffectInstance> for ControlEffectInstanceKey {
+    fn from(effect: FiringEffectInstance) -> Self {
+        Self {
+            object_index: effect.object_index,
+            component_index: effect.component_index,
+            table_index: effect.table_index,
+            row_index: effect.row_index,
+        }
+    }
+}
+
+impl StaticVulkanApp {
+    pub(super) fn start_windup_sounds(
+        &mut self,
+        control_clock_ms: u32,
+        manual: Vec<FiringEffectInstance>,
+    ) {
+        if self.audio.is_none() {
+            return;
+        }
+        let autonomous = self.mission_frame.iter().flat_map(|frame| {
+            frame
+                .autodemo_combat_events
+                .iter()
+                .filter_map(|event| match event {
+                    AutoDemoCombatEvent::WindupSound(sound) => Some(*sound),
+                    _ => None,
+                })
+        });
+        let keys: HashSet<_> = manual
+            .into_iter()
+            .chain(autonomous)
+            .map(ControlEffectInstanceKey::from)
+            .collect();
+        if keys.is_empty() {
+            return;
+        }
+        for sound in &self.control_sound_slots {
+            let slot = &sound.effect;
+            if !sound.waits_for_windup || !keys.contains(&slot.random_instance_key) {
+                continue;
+            }
+            let state = self
+                .control_effect_instance_states
+                .entry(slot.random_instance_key)
+                .or_insert_with(|| {
+                    ControlEffectInstanceState::new(
+                        slot.random_seed,
+                        slot.header_flags,
+                        slot.phase_jitter,
+                        slot.random_shift,
+                    )
+                });
+            let now = control_clock_ms as f32;
+            // Opcode 10 immediately sets the origin and selects mode 1 on this instance.
+            let clock = state.clock.get_or_insert_with(|| {
+                FxInstanceClock::new(
+                    slot.time_mode,
+                    slot.header_flags,
+                    slot.duration_seconds,
+                    now,
+                )
+                .expect("prepared FX clock metadata")
+            });
+            clock.set_time(now, 1).expect("positive wind-up duration");
+        }
+    }
 }
 
 pub(super) fn advance_control_effect_instances(
@@ -46,7 +117,10 @@ pub(super) fn advance_control_effect_instances(
     }
     for slot in point_light_slots
         .iter()
-        .chain(sound_slots.iter().map(|slot| &slot.effect))
+        .chain(sound_slots.iter().filter_map(|slot| {
+            (!slot.waits_for_windup || states.contains_key(&slot.effect.random_instance_key))
+                .then_some(&slot.effect)
+        }))
     {
         specifications.entry(slot.random_instance_key).or_insert((
             slot.random_seed,
@@ -133,12 +207,7 @@ pub(super) fn activate_firing_flashes(
             else {
                 return None;
             };
-            let key = ControlEffectInstanceKey {
-                object_index: effect.object_index,
-                component_index: effect.component_index,
-                table_index: effect.table_index,
-                row_index: effect.row_index,
-            };
+            let key = ControlEffectInstanceKey::from(effect);
             let has_external_flash = ambient_slots
                 .iter()
                 .any(|slot| slot.random_instance_key == key && slot.time_mode == 4)

@@ -32,6 +32,7 @@ pub(super) fn projectile_launch<'a>(
 pub(super) fn report_missing_player_sounds(
     layouts: &std::collections::HashMap<usize, super::PlayerWeaponLayout>,
     projectiles: &[Option<super::ProjectileDraw>],
+    control_sounds: &[super::ControlSoundSlot],
 ) {
     for (&object, layout) in layouts {
         for (weapon, (pool, sound)) in layout.weapons.weapons().iter().zip(&layout.slots) {
@@ -39,7 +40,13 @@ pub(super) fn report_missing_player_sounds(
                 .get(*pool)
                 .and_then(Option::as_ref)
                 .is_some_and(|draw| !draw.launch_sounds.is_empty());
-            if sound.is_none() && !has_launch_sound {
+            let has_windup_sound = weapon.windup_sounds(object).any(|effect| {
+                let key = super::ControlEffectInstanceKey::from(effect);
+                control_sounds
+                    .iter()
+                    .any(|slot| slot.effect.random_instance_key == key)
+            });
+            if sound.is_none() && !has_launch_sound && !has_windup_sound {
                 eprintln!(
                     "sim_coverage player_weapon_sound_stub=1 object={object} projectile={}",
                     weapon.projectile

@@ -939,6 +939,7 @@ struct ControlEffectSlot {
 #[derive(Clone, Debug)]
 struct ControlSoundSlot {
     effect: ControlEffectSlot,
+    waits_for_windup: bool,
     command: Op2SoundCommand,
     state: Op2SoundState,
 }
@@ -5704,6 +5705,12 @@ fn append_initial_control_effect_slots(
         let group_index = row.table_index;
         let archive = fixed_effect_field(&row.resource.archive);
         let name = fixed_effect_field(&row.resource.name);
+        let windup = row.opcode == 3
+            && control.typed_records.iter().any(|record| {
+                control
+                    .weapon_windup_sound_rows(record)
+                    .any(|sound| sound.row_index == row.row_index)
+            });
         let points = if row.opcode == 4 {
             let Some(point_list) = point_list else {
                 continue;
@@ -5715,8 +5722,8 @@ fn append_initial_control_effect_slots(
                 )
             })?)
         } else {
-            // The root-node path covers the authored chassis engine loops.
-            if row.point_offsets[0] != 0 {
+            // Chassis engine loops use the root. Weapon sounds use their authored node.
+            if !windup && row.point_offsets[0] != 0 {
                 continue;
             }
             None
@@ -5746,7 +5753,7 @@ fn append_initial_control_effect_slots(
             .get(&key)
             .ok_or_else(|| format!("Control FX {key} was not cached"))?;
         let header = document.header();
-        if row.opcode == 3 && !matches!(header.time_mode, 5 | 15) {
+        if row.opcode == 3 && !windup && !matches!(header.time_mode, 5 | 15) {
             continue;
         }
         let sound_commands = document
@@ -5767,7 +5774,7 @@ fn append_initial_control_effect_slots(
             continue;
         }
         if !matches!(header.time_mode, 0..=17)
-            || (matches!(header.time_mode, 1..=3) && duration_seconds <= 0.0)
+            || ((windup || matches!(header.time_mode, 1..=3)) && duration_seconds <= 0.0)
         {
             *unsupported_sounds += sound_commands;
             record_skip(
@@ -5781,7 +5788,9 @@ fn append_initial_control_effect_slots(
         let owner_node_index = usize::try_from(
             points
                 .as_ref()
-                .map_or(0, |points| points[0].raw_signed_field_04),
+                .map_or(row.point_offsets[0] as i32, |points| {
+                    points[0].raw_signed_field_04
+                }),
         )
         .ok()
         .filter(|owner_node| {
@@ -5869,6 +5878,7 @@ fn append_initial_control_effect_slots(
                     if let Some(sound) = Op2SoundCommand::from_command(command) {
                         sound_slots.push(ControlSoundSlot {
                             effect: slot,
+                            waits_for_windup: windup,
                             command: sound,
                             state: Op2SoundState::default(),
                         });
@@ -9659,7 +9669,11 @@ fn run_static_vulkan_mode(
             };
             projectile_draws.push(draw);
         }
-        shot_sound::report_missing_player_sounds(&player_weapon_layouts, &projectile_draws);
+        shot_sound::report_missing_player_sounds(
+            &player_weapon_layouts,
+            &projectile_draws,
+            &preview.control_sound_slots,
+        );
     }
     let autodemo_draws = mission_engine.as_ref().map_or_else(Vec::new, |engine| {
         fparkan_runtime::autodemo_projectile_types(engine).iter().map(|kind| {
@@ -10611,8 +10625,9 @@ impl StaticVulkanApp {
             "mission_ai"
         };
         for event in &frame.autodemo_combat_events {
-            use fparkan_runtime::AutoDemoCombatEvent::{BuildingHit, Destroyed, Shot};
+            use fparkan_runtime::AutoDemoCombatEvent::{BuildingHit, Destroyed, Shot, WindupSound};
             match *event {
+                WindupSound(_) => {}
                 Shot { shooter, target, projectile, .. } => eprintln!(
                     "{combat}_shot shooter={} target={} projectile={projectile} queue_time_ms={clock_ms}", shooter.slot, target.slot
                 ),
@@ -11261,7 +11276,7 @@ impl StaticVulkanApp {
                 }
             }
         }
-        let player_shots = self.sample_player_fire(control_clock_ms);
+        let (player_shots, weapon_windup_sounds) = self.sample_player_fire(control_clock_ms);
         let effect_elapsed_seconds = control_clock_ms as f32 / 1000.0;
         // CTLD's validated NDP defaults seed the native query gate. This
         // preview does not process mission Action1 updates, so it retains that
@@ -11396,6 +11411,7 @@ impl StaticVulkanApp {
         } else {
             None
         };
+        self.start_windup_sounds(control_clock_ms, weapon_windup_sounds);
         let mut control_effect_random_samples = advance_control_effect_instances(
             &mut self.control_effect_instance_states,
             &self.ambient_effect_slots,
@@ -14404,6 +14420,7 @@ mod tests {
             effect_section: PreparedControlEffectSection::Absent,
             initial_effect_group: None,
             node_effect_links: Vec::new(),
+            effect_modes: Vec::new(),
             point_list: None,
         }
     }

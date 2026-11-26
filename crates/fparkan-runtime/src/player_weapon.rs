@@ -1,4 +1,4 @@
-use crate::{Engine, StartingCockpit};
+use crate::{Engine, FiringEffectInstance, StartingCockpit};
 use fparkan_assets::{
     PreparedComponentControl, PreparedControlEffectRow, PreparedControlEffectSection,
     PreparedControlPoint, PreparedControlTimelineRow,
@@ -29,6 +29,8 @@ pub struct PlayerWeapon {
     /// Optional type-4 effect started by this weapon.
     pub effect: Option<(String, String)>,
     pub(super) effect_row: Option<(usize, usize)>,
+    windup_sound_rows: Vec<(usize, usize)>,
+    windup_started: bool,
     barrels: Vec<Barrel>,
     barrel_index: usize,
     rounds_remaining: Option<u32>,
@@ -75,6 +77,17 @@ impl PlayerWeapons {
     /// Returns the prepared devices in selection order.
     pub fn weapons(&self) -> &[PlayerWeapon] {
         &self.weapons
+    }
+
+    /// Control sound instances whose wind-up began on this sample.
+    pub fn started_windup_sounds(
+        &self,
+        object_index: usize,
+    ) -> impl Iterator<Item = FiringEffectInstance> + '_ {
+        self.weapons
+            .iter()
+            .filter(|weapon| weapon.windup_started)
+            .flat_map(move |weapon| weapon.windup_sounds(object_index))
     }
 
     /// Samples the barrel tracks after advancing the weapon bank on this frame.
@@ -155,6 +168,7 @@ impl PlayerWeapons {
 impl PlayerWeapon {
     fn sample_fire(&mut self, trigger: bool, now: f64) -> Option<usize> {
         let mut shot = None;
+        self.windup_started = false;
         while now > self.phase_end_ms || self.phase == FirePhase::Idle {
             // shortcut: leave a second overdue shot pending until the next simulation sample.
             if self.phase == FirePhase::Shot && shot.is_some() {
@@ -186,6 +200,7 @@ impl PlayerWeapon {
                         break;
                     }
                     self.phase = FirePhase::Shot;
+                    self.windup_started = true;
                     barrel.travel_to(0.5)
                 }
                 FirePhase::Shot => {
@@ -213,6 +228,21 @@ impl PlayerWeapon {
             self.phase_end_ms = start + delay;
         }
         shot
+    }
+
+    /// Prepared node-attached sound rows belonging to this device.
+    pub fn windup_sounds(
+        &self,
+        object_index: usize,
+    ) -> impl Iterator<Item = FiringEffectInstance> + '_ {
+        self.windup_sound_rows
+            .iter()
+            .map(move |&(table_index, row_index)| FiringEffectInstance {
+                object_index,
+                component_index: self.component_index,
+                table_index,
+                row_index,
+            })
     }
 
     /// Remaining shots, or `None` for an unlimited weapon.
@@ -360,6 +390,11 @@ fn prepare_weapons(
                 projectile_archive,
                 effect,
                 effect_row: effect_row.map(|row| (row.table_index, row.row_index)),
+                windup_sound_rows: control
+                    .weapon_windup_sound_rows(record)
+                    .map(|row| (row.table_index, row.row_index))
+                    .collect(),
+                windup_started: false,
                 barrels,
                 barrel_index: 0,
                 rounds_remaining,
@@ -443,6 +478,8 @@ mod tests {
                 projectile_archive: String::from("test.rlb"),
                 effect: None,
                 effect_row: None,
+                windup_sound_rows: vec![(0, 1)],
+                windup_started: false,
                 barrels: vec![Barrel {
                     muzzle: PreparedControlPoint {
                         raw_flags: 0,
@@ -482,7 +519,17 @@ mod tests {
         });
         let mut node_times = [None];
         assert!(weapons.fire(true, 0).next().is_none());
+        assert_eq!(
+            weapons.started_windup_sounds(7).collect::<Vec<_>>(),
+            [FiringEffectInstance {
+                object_index: 7,
+                component_index: 0,
+                table_index: 0,
+                row_index: 1,
+            }]
+        );
         assert!(weapons.fire(false, 5).next().is_none());
+        assert!(weapons.started_windup_sounds(7).next().is_none());
         weapons.apply_firing_pose(0, &mut node_times);
         assert_eq!(node_times, [Some(5.0)]);
         assert!(weapons.fire(false, 10).next().is_none());
