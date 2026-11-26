@@ -249,6 +249,10 @@ mod tests {
                 let z = f32::from_bits(hero.position[2]);
                 assert!(z < factory.position[2] - 4.0, "factory cabin at {z}");
                 assert_eq!(app.terrain.height_at([x, y]).unwrap(), None);
+                assert_eq!(
+                    fparkan_runtime::capture_building(&mut engine, cockpit).unwrap(),
+                    Some(fparkan_world::OriginalObjectId(0))
+                );
             }
         }
         let [x, y, z] = hero.position.map(f32::from_bits);

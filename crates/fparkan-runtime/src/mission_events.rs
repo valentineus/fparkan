@@ -624,7 +624,6 @@ pub(super) fn communicator_triangles(
     pose: super::TransformState,
 ) -> Option<Vec<[[f32; 3]; 3]>> {
     let is_generator = class == 0x8000_0002;
-    let floor_only = is_generator || class == MAIN_TELEPORT_CLASS;
     let material = if is_generator {
         &b"B_MTP_07G"[..]
     } else {
@@ -679,15 +678,10 @@ pub(super) fn communicator_triangles(
                             transform.try_transform_scaled_point(pose.transform_point(local), scale)
                         });
                         let (a, b, c) = (a?, b?, c?);
-                        if floor_only {
-                            // These models use the platform material on both the floor and the surface above it.
-                            let winding =
-                                (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
-                            if winding <= 0.0 {
-                                return None;
-                            }
-                        }
-                        Some([a, b, c])
+                        // The floor and ceiling of the communicator share the same material.
+                        let normal_z =
+                            (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+                        (normal_z > 0.0).then_some([a, b, c])
                     })
             })
             .collect(),

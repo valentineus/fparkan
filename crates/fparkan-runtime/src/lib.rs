@@ -18214,7 +18214,7 @@ mod tests {
         );
         assert_eq!(capture_building(&mut engine, hero).unwrap(), None);
         let mut pose = transform_state(&engine.world, hero.handle).unwrap();
-        pose.position = [1871.4402_f32, 2020.2354, 61.34749].map(f32::to_bits);
+        pose.position = [1871.4402_f32, 2020.2354, 56.974].map(f32::to_bits);
         set_transform(&mut engine.world, hero.handle, pose).unwrap();
         assert_eq!(capture_neutral_building(&mut engine, hero).unwrap(), None);
         let count = |engine: &Engine| {
@@ -18567,8 +18567,8 @@ mod tests {
         );
         let mut player_pose = transform_state(&engine.world, cockpit.handle).unwrap();
         for (time, logic_id, objective_index, plate) in [
-            (2001, 0x8000_0001, 0, [391.3_f32, 740.1, 145.12]),
-            (4001, 0x8000_0003, 2, [1268.1, 790.6, 160.77]),
+            (2001, 0x8000_0001, 0, [391.3_f32, 740.1, 140.74]),
+            (4001, 0x8000_0003, 2, [1268.1, 790.6, 153.55]),
         ] {
             let slot = engine
                 .loaded
@@ -18584,7 +18584,7 @@ mod tests {
                 identity_metadata(&engine.world, handle).unwrap().owner_id,
                 Some(OwnerId(2))
             );
-            for z in [plate[2] + 12.0, plate[2] - 6.0] {
+            for z in [plate[2] + 5.0, plate[2] - 6.0] {
                 player_pose.position = [plate[0], plate[1], z].map(f32::to_bits);
                 set_transform(&mut engine.world, cockpit.handle, player_pose).unwrap();
                 assert_eq!(
@@ -18633,7 +18633,7 @@ mod tests {
             loaded_mission_script_outcome(&engine),
             Some(MissionScriptOutcome::Active)
         );
-        player_pose.position = [391.3_f32, 740.1, 145.12].map(f32::to_bits);
+        player_pose.position = [391.3_f32, 740.1, 140.74].map(f32::to_bits);
         set_transform(&mut engine.world, cockpit.handle, player_pose).unwrap();
         assert_eq!(
             order_factory_robot(&mut engine, cockpit, 4001).unwrap(),
@@ -18642,7 +18642,19 @@ mod tests {
         assert!(order_factory_robot(&mut engine, cockpit, 4002).is_err());
         let early = frame(&mut engine, 64_000).unwrap();
         assert!(early.produced_unit.is_none());
-        let complete = frame(&mut engine, 64_001).unwrap();
+        let wait_for_release = |engine: &mut Engine, now: &mut u32| {
+            let deadline = *now + 20_000;
+            while *now < deadline {
+                *now += 17;
+                let result = frame(engine, *now).unwrap();
+                if result.produced_unit.is_some() {
+                    return result;
+                }
+            }
+            panic!("factory did not release its order by {deadline} ms");
+        };
+        let mut now = 64_000;
+        let complete = wait_for_release(&mut engine, &mut now);
         let robot = complete.produced_unit.expect("finished robot");
         assert!(complete.snapshot.objects.contains(&robot.handle));
         assert_eq!(
@@ -18651,7 +18663,8 @@ mod tests {
                 .owner_id,
             Some(OwnerId(0))
         );
-        let next = frame(&mut engine, 66_001).unwrap();
+        now += 2_000;
+        let next = frame(&mut engine, now).unwrap();
         assert!(next.produced_unit.is_none());
         let event = next.mission_event.unwrap();
         assert!(event.stop.is_none(), "{:?}", event.stop);
@@ -18660,6 +18673,18 @@ mod tests {
             loaded_mission_script_outcome(&engine),
             Some(MissionScriptOutcome::Completed)
         );
+        let factory = mission_object_handle(&engine, OriginalObjectId(0)).unwrap();
+        let departure_deadline = now + 20_000;
+        while engine
+            .loaded
+            .as_ref()
+            .and_then(|mission| mission.unit_patrol.as_ref())
+            .is_some_and(|patrol| patrol.has_factory_departure(factory))
+        {
+            assert!(now < departure_deadline, "robot did not leave the factory");
+            now += 17;
+            frame(&mut engine, now).unwrap();
+        }
         assert_eq!(
             board_friendly_warbot(&mut engine, Some(robot.handle)).unwrap(),
             None
@@ -18702,7 +18727,8 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        frame_with_player_motion(&mut engine, 66_101, vehicle, motion, false).unwrap();
+        now += 100;
+        frame_with_player_motion(&mut engine, now, vehicle, motion, false).unwrap();
         let driven = transform_state(&engine.world, vehicle.handle).unwrap();
         assert_ne!(driven.position, robot_pose.position);
         assert_eq!(
@@ -18719,14 +18745,14 @@ mod tests {
                 .position,
             driven.position
         );
-        player_pose.position = [391.3_f32, 740.1, 145.12].map(f32::to_bits);
+        player_pose.position = [391.3_f32, 740.1, 140.74].map(f32::to_bits);
         set_transform(&mut engine.world, cockpit.handle, player_pose).unwrap();
         let mut live = vec![robot];
-        let mut now = 68_001;
         for _ in 1..production::RESERVE_SLOTS {
             let duration = order_factory_robot(&mut engine, cockpit, now).unwrap();
-            now += duration;
-            let result = frame(&mut engine, now).unwrap();
+            now += duration - 1;
+            frame(&mut engine, now).unwrap();
+            let result = wait_for_release(&mut engine, &mut now);
             let new = result.produced_unit.expect("another finished robot");
             assert!(live.iter().all(|unit| unit.object_index != new.object_index
                 && result.snapshot.objects.contains(&unit.handle)));
@@ -18735,7 +18761,9 @@ mod tests {
         assert!(order_factory_robot(&mut engine, cockpit, now).is_err());
         fparkan_world::request_delete(&mut engine.world, robot.handle).unwrap();
         let duration = order_factory_robot(&mut engine, cockpit, now).unwrap();
-        let replaced = frame(&mut engine, now + duration).unwrap();
+        now += duration - 1;
+        frame(&mut engine, now).unwrap();
+        let replaced = wait_for_release(&mut engine, &mut now);
         let replacement = replaced.produced_unit.expect("reused slot");
         assert_eq!(replacement.object_index, robot.object_index);
         assert_ne!(replacement.handle, robot.handle);
