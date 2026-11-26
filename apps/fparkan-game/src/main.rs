@@ -7411,15 +7411,23 @@ fn update_gameplay_animation_pose_buffers(
                     }
                 }
             }
-            if component_index == 0 && fparkan_runtime::has_proximity_doors(&instance.control) {
+            if component_index == 0 {
                 if let Some((root, engine)) = motion.and_then(|(roots, _, engine)| {
                     Some((roots.get(object_index)?.as_ref()?, engine))
                 }) {
-                    fparkan_runtime::sample_capture_doors(
+                    if fparkan_runtime::has_proximity_doors(&instance.control) {
+                        fparkan_runtime::sample_capture_doors(
+                            engine,
+                            root.handle,
+                            &instance.control,
+                            &mut instance.door_blends,
+                            &mut node_times,
+                        );
+                    }
+                    fparkan_runtime::sample_capture_barrier(
                         engine,
                         root.handle,
                         &instance.control,
-                        &mut instance.door_blends,
                         &mut node_times,
                     );
                 }
@@ -10568,7 +10576,11 @@ impl StaticVulkanApp {
                     })
                     .map_err(|error| format!("query projectile terrain: {error}"))?;
                 if !stays {
-                    let reason = if let Some(hit) = unit_contact {
+                    let reason = if unit_contact.is_some_and(|hit| {
+                        hit.node == Some(fparkan_runtime::ProjectileNode::CaptureBarrier)
+                    }) {
+                        "communicator-field"
+                    } else if let Some(hit) = unit_contact {
                         match draw.volume.map(|volume| apply_projectile_contact(engine, hit, volume)).transpose() {
                             Ok(Some(Some((remaining, removed)))) => eprintln!(
                                 "player_projectile_hit shooter={} pool={pool} target={} remaining={remaining} removed={removed} queue_time_ms={clock_ms}", shooter.slot, hit.handle.slot,

@@ -49,6 +49,7 @@ mod boarding;
 mod builder_supply;
 mod building_door;
 mod building_passage;
+mod capture_barrier;
 mod clan_ai_events;
 mod clan_area_strength;
 mod clan_build_limits;
@@ -144,6 +145,7 @@ pub use boarding::{
     board_friendly_warbot, disembark_warbot, player_vehicle, select_boarding_target,
 };
 pub use building_door::{has_proximity_doors, sample_capture_doors, sample_proximity_doors};
+pub use capture_barrier::sample_capture_barrier;
 pub use fparkan_assets::MissionAssets;
 pub use mesh_collision::{query_building_segment_world, BuildingMeshHit, BuildingMeshNode};
 pub use mining::deploy_mine;
@@ -1447,6 +1449,7 @@ struct LoadedMissionState {
     script_init_states: Vec<MissionScriptInitState>,
     script_varset_states: Vec<MissionScriptVarSetState>,
     mission_events: MissionEvents,
+    capture_barrier: Option<capture_barrier::CaptureBarrier>,
     clan_ai_events: clan_ai_events::ClanAiEvents,
     mine_sites: Vec<mining::MineSite>,
     construction: construction::Construction,
@@ -2802,6 +2805,7 @@ node_provider_distribution_suspended: false,
         script_init_states: loaded_scripts.init_states,
         script_varset_states: loaded_scripts.varset_states,
         mission_events,
+        capture_barrier: None,
         clan_ai_events,
         mine_sites,
         construction,
@@ -2904,6 +2908,7 @@ pub fn step_headless(
         engine.behavior_rng_state = crt;
     }
     if let Some(mission) = &mut engine.loaded {
+        capture_barrier::advance(mission, &engine.world, queue_time_ms);
         control_resources::tick(mission, &engine.world, queue_time_ms);
     }
     let (autodemo_combat_events, autodemo_combat_unavailable) =

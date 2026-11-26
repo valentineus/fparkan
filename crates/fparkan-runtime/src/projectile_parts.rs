@@ -5,9 +5,10 @@ use crate::{
     Engine, LoadedMissionState, MissionAssets, MissionControlNodeProviderTableStatus, ObjectHandle,
     TransformState,
 };
+use fparkan_animation::NodePoseBuffer;
 use fparkan_assets::PreparedModel;
 use fparkan_msh::{
-    node38_fallback_hierarchy, query_slot_segment, selected_slot, Group, Lod, NodeId,
+    node38_fallback_hierarchy, query_slot_segment, selected_slot, Group, Lod, ModelAsset, NodeId,
     SegmentQueryMasks,
 };
 use fparkan_render::LegacyIron3dEulerTransform;
@@ -105,6 +106,18 @@ pub(super) fn root_triangle_hit(
     accept_node: impl Fn(u32) -> bool,
 ) -> Option<(f32, u32)> {
     let model = &root_model(assets, index)?.validated;
+    // shortcut: use root MSH fallback poses until combat shares live component transforms.
+    let poses = node38_fallback_hierarchy(model)?;
+    model_triangle_hit(model, poses, state, segment, accept_node)
+}
+
+pub(super) fn model_triangle_hit(
+    model: &ModelAsset,
+    poses: NodePoseBuffer,
+    state: TransformState,
+    segment: [[f32; 3]; 2],
+    accept_node: impl Fn(u32) -> bool,
+) -> Option<(f32, u32)> {
     let root = LegacyIron3dEulerTransform {
         translation: state.position.map(f32::from_bits),
         orientation_radians: state.orientation.map(f32::from_bits),
@@ -118,8 +131,6 @@ pub(super) fn root_triangle_hit(
             local[i] = (root[i] * x + root[i + 4] * y + root[i + 8] * z) / scale[i];
         }
     }
-    // shortcut: use root MSH fallback poses until combat shares live component transforms.
-    let poses = node38_fallback_hierarchy(model)?;
     let squared_length: f32 = (0..3)
         .map(|i| (segment[1][i] - segment[0][i]).powi(2))
         .sum();

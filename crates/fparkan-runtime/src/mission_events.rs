@@ -566,6 +566,12 @@ fn capture_building_at_communicator(
             player_owner,
             class,
         )?;
+        mission.capture_barrier = crate::capture_barrier::CaptureBarrier::start(
+            &mission.mission_assets,
+            handle,
+            id.0 as usize,
+            cockpit.handle,
+        );
         Ok(Some((id, MissionNotice::BuildingCaptured { neutral })))
     } else {
         Ok(None)

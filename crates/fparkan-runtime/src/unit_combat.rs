@@ -460,7 +460,9 @@ impl AutoDemoCombat {
                 travelled = Some(clip_segment(segment, fraction));
                 Ok(ground.is_some() || contact.is_some())
             });
-            if let Some(hit) = contact {
+            if let Some(hit) =
+                contact.filter(|hit| hit.node != Some(crate::ProjectileNode::CaptureBarrier))
+            {
                 let data = &self.projectiles[flight.projectile];
                 // Capture the target before applying damage, which may remove it.
                 let target = CombatObject::read(&engine.world, hit.handle);

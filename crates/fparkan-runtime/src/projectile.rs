@@ -1,6 +1,6 @@
 use crate::{
     apply_loaded_mission_control_node_delta,
-    projectile_parts::{chassis_part_contact, root_model, root_triangle_hit},
+    projectile_parts::{chassis_part_contact, root_model},
     ControlResourceAccessError, Engine, MissionAssets, MissionControlNodeProviderTableStatus,
     TerrainWorld, CONTROL_CLASS_SOURCE_BULL, UNIT_DAT_CONTROL_CLASS_HIGH_BIT,
 };
@@ -189,6 +189,8 @@ pub enum ProjectileNode {
     Building(u32),
     /// A node of the warbot's chassis model.
     Chassis(u32),
+    /// An indestructible communicator field.
+    CaptureBarrier,
 }
 
 impl ProjectileContact {
@@ -229,9 +231,10 @@ pub fn projectile_unit_hit(
             let (center, radius) = unit_sphere(&mission.mission_assets, index, state)?;
             let sphere_fraction = segment_sphere_fraction(segment, center, radius)?;
             let (fraction, node) = if building {
-                let (fraction, node) =
-                    root_triangle_hit(&mission.mission_assets, index, state, segment, |_| true)?;
-                (fraction, Some(ProjectileNode::Building(node)))
+                let (fraction, node) = crate::capture_barrier::projectile_contact(
+                    mission, index, handle, state, segment,
+                )?;
+                (fraction, Some(node))
             } else if class == super::boarding::WARBOT_CLASS {
                 chassis_part_contact(
                     mission,
@@ -279,6 +282,11 @@ pub fn apply_projectile_contact(
     contact: ProjectileContact,
     volume: f32,
 ) -> Result<Option<(f32, bool)>, ControlResourceAccessError> {
+    let key = match contact.node {
+        Some(ProjectileNode::CaptureBarrier) => return Ok(None),
+        None | Some(ProjectileNode::Chassis(0)) => None,
+        Some(ProjectileNode::Chassis(key) | ProjectileNode::Building(key)) => Some(key),
+    };
     let volume = super::projectile_shield::absorb(engine, contact, volume);
     let table = engine.loaded.as_ref().and_then(|mission| {
         mission
@@ -290,11 +298,8 @@ pub fn apply_projectile_contact(
         volume,
         table.and_then(|table| table.projectile_resistance_bits),
     );
-    let key = match contact.node {
-        None | Some(ProjectileNode::Chassis(0)) => {
-            return apply_projectile_hit(engine, contact.handle, volume);
-        }
-        Some(ProjectileNode::Chassis(key) | ProjectileNode::Building(key)) => key,
+    let Some(key) = key else {
+        return apply_projectile_hit(engine, contact.handle, volume);
     };
     let row = table.and_then(|table| super::control_node_provider_row(table, key).ok());
     let Some(row) = row else {

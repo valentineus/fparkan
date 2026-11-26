@@ -208,6 +208,14 @@ mod tests {
                     &mut door_blends,
                     &mut node_times,
                 );
+                let factory_handle =
+                    mission_object_handle(&engine, fparkan_world::OriginalObjectId(0)).unwrap();
+                fparkan_runtime::sample_capture_barrier(
+                    &engine,
+                    factory_handle,
+                    &control,
+                    &mut node_times,
+                );
                 let times: Vec<_> = node_times
                     .into_iter()
                     .map(|time| time.map(AnimationTime))
@@ -256,6 +264,10 @@ mod tests {
                         fparkan_runtime::MissionNotice::BuildingCaptured { neutral: true }
                     ))
                 );
+                now += 17;
+                step_mission_frame(&mut engine, now).unwrap();
+                now += 500;
+                step_mission_frame(&mut engine, now).unwrap();
             }
         }
         let [x, y, z] = hero.position.map(f32::from_bits);
