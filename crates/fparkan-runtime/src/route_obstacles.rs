@@ -69,6 +69,12 @@ impl BuildingFootprints {
             .filter_map(|(_, _, footprint)| footprint.map(|bounds| bounds.expanded(radius)))
             .collect()
     }
+
+    pub(super) fn for_handle(&self, handle: ObjectHandle) -> Option<Footprint> {
+        self.entries
+            .values()
+            .find_map(|&(owner, _, bounds)| (owner == handle).then_some(bounds).flatten())
+    }
 }
 
 fn model_footprint(
@@ -161,7 +167,7 @@ impl Footprint {
         true
     }
 
-    fn corners(self) -> [[f32; 2]; 4] {
+    pub(super) fn corners(self) -> [[f32; 2]; 4] {
         let Self {
             min: [x0, y0],
             max: [x1, y1],
@@ -169,12 +175,16 @@ impl Footprint {
         [[x0, y0], [x0, y1], [x1, y0], [x1, y1]]
     }
 
-    fn exits(self, p: [f32; 2]) -> [[f32; 2]; 4] {
+    pub(super) fn exits(self, p: [f32; 2]) -> [[f32; 2]; 4] {
         let Self {
             min: [x0, y0],
             max: [x1, y1],
         } = self.expanded(CORNER_GAP);
         [[x0, p[1]], [x1, p[1]], [p[0], y0], [p[0], y1]]
+    }
+
+    pub(super) fn center(self) -> [f32; 2] {
+        std::array::from_fn(|axis| self.min[axis].midpoint(self.max[axis]))
     }
 }
 

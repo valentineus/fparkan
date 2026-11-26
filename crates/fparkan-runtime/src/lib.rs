@@ -96,6 +96,7 @@ mod player_motion;
 mod unit_speed;
 pub use patrol_points::PatrolPointReport;
 pub use unit_speed::{UnitSpeedKind, UnitSpeedReport};
+mod factory_release;
 mod player_status;
 mod player_weapon;
 mod production;

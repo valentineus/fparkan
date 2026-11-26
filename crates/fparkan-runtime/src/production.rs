@@ -4,6 +4,7 @@ use super::{
     mission_events::on_communicator,
     normalize_engine_path, query_behavior_profile_ore_rate,
     research::{load_clan_table, RESEARCHED},
+    route_obstacles::BuildingFootprints,
     set_control_device_table_selector,
     unit_spawn::{spawn_prepared_unit, SpawnedUnit},
     BehaviorOreState, Engine, EngineError, LoadedMissionState, MissionControlDeviceTableState,
@@ -72,6 +73,7 @@ pub(super) struct Production {
     plants: Vec<(usize, u32)>,
     pending: VecDeque<Order>,
     clock_ticks: std::collections::BTreeMap<(u16, u32), u64>,
+    buildings: BuildingFootprints,
     rng: u32,
 }
 
@@ -197,6 +199,7 @@ impl Production {
             plants: Vec::new(),
             pending: VecDeque::new(),
             clock_ticks: Default::default(),
+            buildings: BuildingFootprints::default(),
             rng: 1,
         };
         production.register_factories(0, &drafts[..reserve_start]);
@@ -291,9 +294,9 @@ impl Production {
             return Ok(None);
         }
         let pose = transform_state(world, order.plant)?;
-        // shortcut: reuse the outdoor spawn point until the factory exit
-        // device and its clear-space check are available.
-        let position = reinforcement_position(
+        // shortcut: prefer the old outdoor point until the factory's elevated
+        // release and protected exit order are simulated.
+        let preferred = reinforcement_position(
             pose.position.map(f32::from_bits),
             pose.orientation.map(f32::from_bits),
             pose.scale.map(f32::from_bits),
@@ -302,6 +305,17 @@ impl Production {
             &mission.terrain,
             &mut self.rng,
         )?;
+        let Some(position) = super::factory_release::clear_release_position(
+            world,
+            mission,
+            &mut self.buildings,
+            order.plant,
+            order.slot,
+            preferred,
+        )?
+        else {
+            return Ok(None);
+        };
         let handle = spawn_prepared_unit(
             world,
             mission,
@@ -925,6 +939,27 @@ mod tests {
                 .unwrap()
                 .produced_unit
             {
+                let pose = transform_state(&engine.world, unit.handle).unwrap();
+                let [x, y, _] = pose.position.map(f32::from_bits);
+                let mission = engine.loaded.as_ref().unwrap();
+                let radius = crate::route_traffic::body_radius(
+                    &mission.mission_assets,
+                    unit.object_index,
+                    pose,
+                )
+                .unwrap();
+                let mut buildings = BuildingFootprints::default();
+                buildings.refresh(&engine.world, mission);
+                assert!(buildings
+                    .with_clearance(radius)
+                    .iter()
+                    .all(|bounds| !bounds.contains([x, y])));
+                let traffic = crate::route_traffic::FrameTraffic::read(&engine.world, mission);
+                assert!(traffic
+                    .blockers(unit.handle, [x, y], radius)
+                    .unwrap()
+                    .iter()
+                    .all(|bounds| !bounds.contains([x, y])));
                 completed.push((unit.clan, unit.object_index));
             }
         }

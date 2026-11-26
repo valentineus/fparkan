@@ -18,7 +18,11 @@ pub(super) struct FrameTraffic {
     bodies: Vec<Body>,
 }
 
-fn body_radius(assets: &MissionAssets, index: usize, pose: TransformState) -> Option<f32> {
+pub(super) fn body_radius(
+    assets: &MissionAssets,
+    index: usize,
+    pose: TransformState,
+) -> Option<f32> {
     let (center, radius) = unit_sphere(assets, index, pose)?;
     let [x, y, _] = pose.position.map(f32::from_bits);
     let radius = radius + (center[0] - x).hypot(center[1] - y);
