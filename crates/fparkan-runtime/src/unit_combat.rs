@@ -2,6 +2,7 @@ use super::{
     apply_projectile_impact,
     autodemo::MOBILE_UNIT,
     combat_report::{CombatObject, CombatReport},
+    default_weapon_target::{self, DefaultWeaponTarget},
     player_weapon::prepare_unit_weapons,
     projectile::{load_projectile, segment_sphere_fraction, unit_sphere, ANIMAL_UNIT_CLASS},
     projectile_terrain_hit, projectile_unit_hit,
@@ -112,11 +113,20 @@ pub(super) struct CombatTarget {
 struct Unit {
     handle: ObjectHandle,
     index: usize,
+    class: u32,
     original_id: u32,
     weapons: PlayerWeapons,
     slots: Vec<Option<usize>>,
     effects: Vec<Option<usize>>,
     poses: WeaponPoses,
+    idle_target: DefaultWeaponTarget,
+}
+
+impl Unit {
+    fn uses_default_targeting(&self, patrol: Option<&UnitPatrol>) -> bool {
+        self.class == super::boarding::WARBOT_CLASS
+            && patrol.is_none_or(|patrol| !patrol.is_patrolling(self.handle))
+    }
 }
 
 struct Flight {
@@ -254,10 +264,12 @@ impl AutoDemoCombat {
             units.push(Unit {
                 handle,
                 index,
+                class,
                 weapons,
                 slots,
                 effects,
                 poses: WeaponPoses::new(draft, assets, index),
+                idle_target: DefaultWeaponTarget::default(),
                 original_id: draft.original_id.map_or(handle.slot, |id| id.0),
             });
         }
@@ -328,7 +340,7 @@ impl AutoDemoCombat {
         patrol: Option<&UnitPatrol>,
         controls: &[super::MissionControlDeviceTableState],
     ) -> Vec<(ObjectHandle, CombatTarget)> {
-        self.select_targets(world, assets, patrol, controls, false)
+        self.select_targets(world, assets, patrol, controls, None)
     }
 
     fn select_targets(
@@ -337,8 +349,9 @@ impl AutoDemoCombat {
         assets: &MissionAssets,
         patrol: Option<&UnitPatrol>,
         controls: &[super::MissionControlDeviceTableState],
-        use_weapon_range: bool,
+        fire_clock_ms: Option<u32>,
     ) -> Vec<(ObjectHandle, CombatTarget)> {
+        let use_weapon_range = fire_clock_ms.is_some();
         let live: Vec<_> = self
             .units
             .iter()
@@ -395,22 +408,34 @@ impl AutoDemoCombat {
                 if limit.is_some_and(|limit| !limit.allows_attack(position)) {
                     return None;
                 }
-                let search_distance = if use_weapon_range {
+                let idle_clock = fire_clock_ms.filter(|_| unit.uses_default_targeting(patrol));
+                let search_distance = if use_weapon_range && idle_clock.is_none() {
                     self.maximum_firing_distance(unit)
                 } else {
                     ATTACK_RANGE
                 };
-                let (enemy, center, radius, distance) = live
+                let (enemy, center, radius, _) = live
                     .iter()
                     .filter_map(|&(enemy, other, to, radius, target_position)| {
                         let enemy = enemy.handle;
-                        let distance = (to[0] - from[0]).hypot(to[1] - from[1]);
-                        (enemy != handle
-                            && distance <= search_distance
-                            && limit
-                                .is_none_or(|limit| limit.allows_target(enemy, target_position))
-                            && self.hostile.get(clan)?.get(other) == Some(&true))
-                        .then_some((enemy, to, radius, distance))
+                        if enemy == handle
+                            || limit
+                                .is_some_and(|limit| !limit.allows_target(enemy, target_position))
+                            || self.hostile.get(clan)?.get(other) != Some(&true)
+                        {
+                            return None;
+                        }
+                        let rank = if let Some(now) = idle_clock {
+                            if unit.idle_target.searches_at(now) {
+                                -default_weapon_target::score(position, target_position)?
+                            } else {
+                                (unit.idle_target.selected == Some(enemy)).then_some(0.0)?
+                            }
+                        } else {
+                            let distance = (to[0] - from[0]).hypot(to[1] - from[1]);
+                            (distance <= search_distance).then_some(distance)?
+                        };
+                        Some((enemy, to, radius, rank))
                     })
                     .min_by(|a, b| a.3.total_cmp(&b.3))?;
                 Some((
@@ -419,7 +444,8 @@ impl AutoDemoCombat {
                         handle: enemy,
                         center,
                         radius,
-                        in_range: distance <= ATTACK_STOP_RANGE,
+                        in_range: (center[0] - from[0]).hypot(center[1] - from[1])
+                            <= ATTACK_STOP_RANGE,
                     },
                 ))
             })
@@ -533,7 +559,7 @@ impl AutoDemoCombat {
             &mission.mission_assets,
             mission.unit_patrol.as_ref(),
             &mission.control_device_tables,
-            true,
+            Some(now),
         );
         for unit in &mut self.units {
             unit.weapons.read_control_energy(engine, unit.handle);
@@ -556,8 +582,8 @@ impl AutoDemoCombat {
             // shortcut: free warbots defend from their current position until the
             // default Behavior task and its pursuit rules are wired.
             let defends_from_position = matches!(
-                mission.object_drafts[unit.index].unit_dat_header_flags,
-                Some(super::boarding::WARBOT_CLASS | ANIMAL_UNIT_CLASS)
+                unit.class,
+                super::boarding::WARBOT_CLASS | ANIMAL_UNIT_CLASS
             );
             let eligible = !manually_controlled
                 && (mission.script_host_mode != super::MissionMode::SingleMission
@@ -567,12 +593,29 @@ impl AutoDemoCombat {
                         .unit_patrol
                         .as_ref()
                         .is_some_and(|patrol| patrol.is_patrolling(unit.handle)));
+            let selected = targets
+                .iter()
+                .find(|(handle, _)| *handle == unit.handle)
+                .map(|(_, target)| *target);
+            let patrol = mission.unit_patrol.as_ref();
+            if eligible
+                && unit.uses_default_targeting(patrol)
+                && !patrol.is_some_and(|patrol| {
+                    patrol.is_shut_down(unit.handle) || patrol.is_leaving_factory(unit.handle)
+                })
+            {
+                unit.idle_target.update(
+                    now,
+                    selected.map(|target| target.handle),
+                    &mut engine.behavior_rng_state,
+                );
+            } else {
+                unit.idle_target = DefaultWeaponTarget::default();
+            }
             let aim = eligible
                 .then(|| {
-                    targets
-                        .iter()
-                        .find(|(handle, _)| *handle == unit.handle)
-                        .map(|(_, target)| (target.handle, target.center, target.radius))
+                    selected
+                        .map(|target| (target.handle, target.center, target.radius))
                         .or_else(|| {
                             let (factory, index) =
                                 mission.unit_patrol.as_ref()?.raid_factory(unit.handle)?;

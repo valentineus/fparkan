@@ -84,6 +84,7 @@ mod clan_targeting;
 mod construction;
 mod construction_site;
 mod debris_motion;
+mod default_weapon_target;
 pub use debris_motion::DebrisMotion;
 mod destruction;
 pub use destruction::{
