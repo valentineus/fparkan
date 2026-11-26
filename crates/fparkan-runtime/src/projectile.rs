@@ -16,6 +16,8 @@ use fparkan_vfs::Vfs;
 use fparkan_world::{handle_by_original_id, request_delete, transform_state, ObjectHandle};
 use std::sync::Arc;
 
+const ANIMAL_UNIT_CLASS: u32 = 0x2000_0000;
+
 /// Prepared visuals and travel parameters for one projectile prototype.
 pub struct ProjectileAssets {
     /// Visual, materials and control profile for the single projectile mesh.
@@ -194,7 +196,8 @@ pub fn projectile_unit_hit(
         .filter_map(|(index, draft)| {
             let class = draft.unit_dat_header_flags?;
             let building = class & UNIT_DAT_CONTROL_CLASS_HIGH_BIT != 0;
-            if !building && class & super::autodemo::MOBILE_UNIT == 0 {
+            let animal = class == ANIMAL_UNIT_CLASS;
+            if !building && !animal && class & super::autodemo::MOBILE_UNIT == 0 {
                 return None;
             }
             let handle = handle_by_original_id(&engine.world, draft.original_id?)?;
@@ -393,6 +396,67 @@ pub fn apply_projectile_hit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires licensed corpus"]
+    fn licensed_constructor_animal_takes_projectile_damage() {
+        use crate::{
+            create, load_gameplay_mission, starting_cockpit, EngineServices, MissionMode,
+            MissionRequest, MissionStartupInput,
+        };
+        use fparkan_vfs::DirectoryVfs;
+
+        let root = std::env::var_os("FPARKAN_CORPUS_PART1_ROOT").expect("licensed corpus");
+        let mut engine = create(EngineServices::new(Arc::new(DirectoryVfs::new(root)))).unwrap();
+        load_gameplay_mission(
+            &mut engine,
+            MissionRequest {
+                key: "MISSIONS/CAMPAIGN/CAMPAIGN.00/Mission.02/data.tma".into(),
+                mode: MissionMode::SingleMission,
+            },
+            MissionStartupInput {
+                queue_time_ms: 0,
+                research_creation_gate: false,
+            },
+            None,
+        )
+        .unwrap();
+        let shooter = starting_cockpit(&engine).unwrap().handle;
+        let mission = engine.loaded.as_ref().unwrap();
+        let (index, draft) = mission
+            .object_drafts
+            .iter()
+            .enumerate()
+            .find(|(_, draft)| draft.unit_dat_header_flags == Some(ANIMAL_UNIT_CLASS))
+            .unwrap();
+        let creature = handle_by_original_id(&engine.world, draft.original_id.unwrap()).unwrap();
+        let pose = transform_state(&engine.world, creature).unwrap();
+        let ([x, y, z], radius) = unit_sphere(&mission.mission_assets, index, pose).unwrap();
+        let shot = [[x, y, z + 2.0 * radius], [x, y, z]];
+        let contact = projectile_unit_hit(&engine, shooter, shot).expect("animal contact");
+        assert_eq!(contact.handle, creature);
+        let table = mission
+            .control_device_tables
+            .iter()
+            .find(|table| table.handle == creature)
+            .unwrap();
+        let hp = f32::from_bits(
+            crate::control_node_provider_row(table, 0)
+                .unwrap()
+                .current_amount_bits,
+        );
+        assert!(hp.is_finite() && hp > 0.0);
+        let remaining = hp * 0.5;
+        assert_eq!(
+            apply_projectile_contact(&mut engine, contact, remaining).unwrap(),
+            Some((remaining, false))
+        );
+        assert_eq!(
+            apply_projectile_contact(&mut engine, contact, remaining).unwrap(),
+            Some((0.0, true))
+        );
+        assert!(transform_state(&engine.world, creature).is_err());
+    }
 
     #[test]
     fn projectile_uses_queue_age_and_tests_only_the_traveled_segment() {
