@@ -10523,9 +10523,13 @@ impl StaticVulkanApp {
         let pose = mount.map_or(pose, |mount| compose_unit_pose(mount, pose));
         let offset = rotate_unit_vector(cockpit.node_point, pose.rotation);
         let point = std::array::from_fn(|axis| pose.translation[axis] + offset[axis]);
+        let mut translation = state.position.map(f32::from_bits);
+        if let Some(engine) = &self.mission_engine {
+            translation[2] += fparkan_runtime::player_walk_camera_lift(engine, cockpit);
+        }
         let camera = fparkan_render::forward_cockpit_camera(
             LegacyIron3dEulerTransform {
-                translation: state.position.map(f32::from_bits),
+                translation,
                 orientation_radians: state.orientation.map(f32::from_bits),
             },
             state.scale.map(f32::from_bits),

@@ -94,6 +94,7 @@ pub use laboratory::LaboratoryReport;
 mod mission_events;
 mod ore_transport;
 mod patrol_points;
+mod player_gait;
 mod player_motion;
 mod unit_speed;
 pub use patrol_points::PatrolPointReport;
@@ -154,6 +155,7 @@ pub use mission_events::{
     capture_building, capture_building_with_notice, capture_neutral_building,
     capture_neutral_warbot, MissionEventStop, MissionEventTick, MissionNotice,
 };
+pub use player_gait::player_walk_camera_lift;
 pub use player_motion::{
     plan_player_motion, plan_player_motion_with_collision, PlayerMotion, PlayerMotionStep,
 };
@@ -1455,6 +1457,7 @@ struct LoadedMissionState {
     construction: construction::Construction,
     unit_patrol: Option<unit_patrol::UnitPatrol>,
     player_pitch_bits: u32,
+    player_gait: player_gait::PlayerGait,
     boarding: Option<boarding::Boarding>,
     local_hero: Option<ObjectHandle>,
     script_host_mode: MissionMode,
@@ -2811,6 +2814,7 @@ node_provider_distribution_suspended: false,
         construction,
         unit_patrol,
         player_pitch_bits: 0,
+        player_gait: Default::default(),
         boarding: None,
         local_hero,
         script_host_mode: request.mode,
@@ -2909,6 +2913,7 @@ pub fn step_headless(
     }
     if let Some(mission) = &mut engine.loaded {
         capture_barrier::advance(mission, &engine.world, queue_time_ms);
+        player_gait::advance(mission, &engine.world, queue_time_ms);
         control_resources::tick(mission, &engine.world, queue_time_ms);
     }
     let (autodemo_combat_events, autodemo_combat_unavailable) =
