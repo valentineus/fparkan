@@ -4,6 +4,7 @@ use fparkan_runtime::MissionNotice;
 impl StaticVulkanApp {
     pub(super) fn present_mission_notice(&mut self, notice: MissionNotice, clock_ms: u32) {
         match notice {
+            MissionNotice::BuildingCaptured { .. } => {}
             MissionNotice::ObjectiveComplete(index) => {
                 eprintln!(
                     "mission_objective index={index} status=complete queue_time_ms={clock_ms}"
@@ -39,6 +40,11 @@ impl StaticVulkanApp {
             let voice = match notice {
                 MissionNotice::Information(index) => audio.queue_mission_voice(index),
                 MissionNotice::ObjectiveComplete(_) => audio.queue_game_voice("VOICE_OBJ_COMPLETE"),
+                MissionNotice::BuildingCaptured { neutral } => audio.queue_game_voice(if neutral {
+                    "VOICE_NBUILD_CAPTURE"
+                } else {
+                    "VOICE_EBUILD_CAPTURE"
+                }),
                 MissionNotice::Completed => audio.queue_game_voice("VOICE_MISSION_COMPLETE"),
                 MissionNotice::Failed => audio.queue_game_voice("VOICE_MISSION_FAIL"),
             };

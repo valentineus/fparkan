@@ -105,7 +105,7 @@ use fparkan_render_vulkan::{
     VulkanStaticTexture, VulkanStaticTextureMip, VulkanStaticVertex,
 };
 use fparkan_runtime::{
-    apply_projectile_contact, autodemo_camera, board_friendly_warbot, capture_building,
+    apply_projectile_contact, autodemo_camera, board_friendly_warbot, capture_building_with_notice,
     capture_neutral_warbot, create, deploy_mine, disembark_warbot, frame as step_mission_frame,
     frame_with_player_motion, load_gameplay_mission, load_mission_static_preview,
     load_mission_static_preview_roots, loaded_mission_assets, loaded_mission_object_drafts,
@@ -11109,6 +11109,7 @@ impl StaticVulkanApp {
                     }
                 }
             }
+            let mut capture_notice = None;
             if let (true, Some(cockpit), false) = (
                 std::mem::take(&mut self.player_capture_pressed),
                 self.cockpit,
@@ -11148,9 +11149,10 @@ impl StaticVulkanApp {
                         "player_capture object={} queue_time_ms={control_clock_ms}",
                         target.0
                     );
-                } else if let Some(target) =
-                    capture_building(engine, cockpit).map_err(|error| error.to_string())?
+                } else if let Some((target, notice)) = capture_building_with_notice(engine, cockpit)
+                    .map_err(|error| error.to_string())?
                 {
+                    capture_notice = Some(notice);
                     eprintln!(
                         "player_building_capture object={} queue_time_ms={control_clock_ms}",
                         target.0
@@ -11250,10 +11252,9 @@ impl StaticVulkanApp {
                     eprintln!("mission_patrol_order unit={} target=[{x},{y}] queue_time_ms={control_clock_ms}", handle.slot);
                 }
             }
-            for &notice in frame
-                .mission_event
+            for &notice in capture_notice
                 .iter()
-                .flat_map(|tick| &tick.notices)
+                .chain(frame.mission_event.iter().flat_map(|tick| &tick.notices))
                 .chain(&frame.clan_notices)
             {
                 self.present_mission_notice(notice, control_clock_ms);

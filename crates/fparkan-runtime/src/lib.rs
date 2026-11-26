@@ -149,8 +149,8 @@ pub use mesh_collision::{query_building_segment_world, BuildingMeshHit, Building
 pub use mining::deploy_mine;
 use mission_events::MissionEvents;
 pub use mission_events::{
-    capture_building, capture_neutral_building, capture_neutral_warbot, MissionEventStop,
-    MissionEventTick, MissionNotice,
+    capture_building, capture_building_with_notice, capture_neutral_building,
+    capture_neutral_warbot, MissionEventStop, MissionEventTick, MissionNotice,
 };
 pub use player_motion::{
     plan_player_motion, plan_player_motion_with_collision, PlayerMotion, PlayerMotionStep,
@@ -18228,8 +18228,11 @@ mod tests {
         };
         let initial_count = count(&engine);
         assert_eq!(
-            capture_building(&mut engine, hero).unwrap(),
-            Some(factory_id)
+            capture_building_with_notice(&mut engine, hero).unwrap(),
+            Some((
+                factory_id,
+                MissionNotice::BuildingCaptured { neutral: false }
+            ))
         );
         assert_eq!(
             identity_metadata(&engine.world, factory).unwrap().owner_id,

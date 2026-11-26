@@ -51,6 +51,8 @@ pub enum MissionNotice {
     Information(u32),
     /// Objective changed from pending to complete.
     ObjectiveComplete(u32),
+    /// The player's capture took a building from a neutral or enemy clan.
+    BuildingCaptured { neutral: bool },
     /// Mission completed.
     Completed,
     /// Mission failed.
@@ -472,6 +474,7 @@ pub fn capture_neutral_building(
     cockpit: StartingCockpit,
 ) -> Result<Option<OriginalObjectId>, EngineError> {
     capture_building_at_communicator(engine, cockpit, false)
+        .map(|capture| capture.map(|(id, _)| id))
 }
 
 /// Transfers a neutral or hostile building at the player's communicator.
@@ -482,6 +485,18 @@ pub fn capture_building(
     engine: &mut Engine,
     cockpit: StartingCockpit,
 ) -> Result<Option<OriginalObjectId>, EngineError> {
+    capture_building_with_notice(engine, cockpit).map(|capture| capture.map(|(id, _)| id))
+}
+
+/// Transfers a building and reports which capture announcement to play.
+///
+/// # Errors
+///
+/// Returns an error if the player's world handle or the ownership update fails.
+pub fn capture_building_with_notice(
+    engine: &mut Engine,
+    cockpit: StartingCockpit,
+) -> Result<Option<(OriginalObjectId, MissionNotice)>, EngineError> {
     capture_building_at_communicator(engine, cockpit, true)
 }
 
@@ -489,7 +504,7 @@ fn capture_building_at_communicator(
     engine: &mut Engine,
     cockpit: StartingCockpit,
     allow_hostile: bool,
-) -> Result<Option<OriginalObjectId>, EngineError> {
+) -> Result<Option<(OriginalObjectId, MissionNotice)>, EngineError> {
     let Some(mission) = &mut engine.loaded else {
         return Ok(None);
     };
@@ -522,14 +537,16 @@ fn capture_building_at_communicator(
                 && player_clan.relations.iter().any(|relation| {
                     relation.relation_value == 0 && relation.other_clan_name.raw == clan.name.raw
                 });
-            (class & 0x8000_0000 != 0 && (clan.mode == 3 || hostile)).then_some((
+            let neutral = clan.mode == 3;
+            (class & 0x8000_0000 != 0 && (neutral || hostile)).then_some((
                 handle,
                 identity.original_id?,
                 owner,
                 class,
+                neutral,
             ))
         })
-        .find(|&(handle, id, _, class)| {
+        .find(|&(handle, id, _, class, _)| {
             transform_state(&engine.world, handle).is_ok_and(|pose| {
                 on_communicator(
                     &mission.mission_assets,
@@ -540,7 +557,7 @@ fn capture_building_at_communicator(
                 )
             })
         });
-    if let Some((handle, id, former_owner, class)) = candidate {
+    if let Some((handle, id, former_owner, class, neutral)) = candidate {
         mission.transfer_building(
             &mut engine.world,
             handle,
@@ -549,7 +566,7 @@ fn capture_building_at_communicator(
             player_owner,
             class,
         )?;
-        Ok(Some(id))
+        Ok(Some((id, MissionNotice::BuildingCaptured { neutral })))
     } else {
         Ok(None)
     }

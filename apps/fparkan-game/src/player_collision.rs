@@ -250,8 +250,11 @@ mod tests {
                 assert!(z < factory.position[2] - 4.0, "factory cabin at {z}");
                 assert_eq!(app.terrain.height_at([x, y]).unwrap(), None);
                 assert_eq!(
-                    fparkan_runtime::capture_building(&mut engine, cockpit).unwrap(),
-                    Some(fparkan_world::OriginalObjectId(0))
+                    fparkan_runtime::capture_building_with_notice(&mut engine, cockpit).unwrap(),
+                    Some((
+                        fparkan_world::OriginalObjectId(0),
+                        fparkan_runtime::MissionNotice::BuildingCaptured { neutral: true }
+                    ))
                 );
             }
         }
