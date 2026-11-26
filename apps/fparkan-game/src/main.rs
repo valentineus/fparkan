@@ -8,7 +8,9 @@ mod camera_capture;
 mod chassis_animation;
 #[cfg(windows)]
 mod control_effects;
-use control_effects::{advance_control_effect_instances, owner_control_capacity};
+use control_effects::{
+    activate_firing_flashes, advance_control_effect_instances, owner_control_capacity,
+};
 mod mission_hints;
 mod mission_notices;
 mod mission_pause;
@@ -11414,7 +11416,7 @@ impl StaticVulkanApp {
         } else {
             None
         };
-        let control_effect_random_samples = advance_control_effect_instances(
+        let mut control_effect_random_samples = advance_control_effect_instances(
             &mut self.control_effect_instance_states,
             &self.ambient_effect_slots,
             &self.control_point_light_slots,
@@ -11432,6 +11434,18 @@ impl StaticVulkanApp {
                 )
             },
         );
+        let firing_flashes = self
+            .mission_frame
+            .as_ref()
+            .map(|frame| {
+                activate_firing_flashes(
+                    &mut control_effect_random_samples,
+                    &self.ambient_effect_slots,
+                    &self.control_point_light_slots,
+                    &frame.autodemo_combat_events,
+                )
+            })
+            .unwrap_or_default();
         let control_point_lights = update_control_point_lights(
             &mut self.control_point_light_slots,
             &mut self.op1_jitter,
@@ -11626,6 +11640,10 @@ impl StaticVulkanApp {
                     .contains(&slot.owner_object_index)
                 {
                     audio.stop_control_sound(id);
+                    continue;
+                }
+                // The same firing event starts its one-shot directly.
+                if firing_flashes.contains(&slot.random_instance_key) {
                     continue;
                 }
                 if slot.owner_component_is_mounted {

@@ -1,7 +1,7 @@
 use crate::{Engine, StartingCockpit};
 use fparkan_assets::{
-    PreparedComponentControl, PreparedControlEffectSection, PreparedControlPoint,
-    PreparedControlTimelineRow,
+    PreparedComponentControl, PreparedControlEffectRow, PreparedControlEffectSection,
+    PreparedControlPoint, PreparedControlTimelineRow,
 };
 
 /// A unit's selectable weapon devices, in resource order.
@@ -27,6 +27,7 @@ pub struct PlayerWeapon {
     pub projectile_archive: String,
     /// Optional type-4 effect started by this weapon.
     pub effect: Option<(String, String)>,
+    pub(super) effect_row: Option<(usize, usize)>,
     barrels: Vec<Barrel>,
     barrel_index: usize,
     rounds_remaining: Option<u32>,
@@ -301,7 +302,13 @@ fn prepare_weapons(
             } else {
                 return None;
             };
-            let effect = firing_effect(control, row);
+            let effect_row = firing_effect_row(control, row);
+            let effect = effect_row.and_then(|row| {
+                Some((
+                    crate::bounded_ascii_c_string(&row.resource.archive)?,
+                    crate::bounded_ascii_c_string(&row.resource.name)?,
+                ))
+            });
             Some(PlayerWeapon {
                 component_index,
                 control_record_index,
@@ -310,6 +317,7 @@ fn prepare_weapons(
                 projectile,
                 projectile_archive,
                 effect,
+                effect_row: effect_row.map(|row| (row.table_index, row.row_index)),
                 barrels,
                 barrel_index: 0,
                 rounds_remaining,
@@ -323,21 +331,21 @@ fn prepare_weapons(
         .collect()
 }
 
-fn firing_effect(
-    control: &PreparedComponentControl,
+fn firing_effect_row<'a>(
+    control: &'a PreparedComponentControl,
     muzzle: &PreparedControlTimelineRow,
-) -> Option<(String, String)> {
+) -> Option<&'a PreparedControlEffectRow> {
     let PreparedControlEffectSection::Parsed(rows) = &control.effect_section else {
         return None;
     };
     let group = control.initial_effect_group?;
-    let row = if let Some(&(_, _, selector)) = control
+    if let Some(&(_, _, selector)) = control
         .node_effect_links
         .iter()
         .find(|&&(table, node, _)| table == group && node as usize == muzzle.node_index)
     {
         rows.iter()
-            .find(|row| row.table_index == group && row.selector == selector)?
+            .find(|row| row.table_index == group && row.selector == selector)
     } else {
         // Separate gun meshes can have one firing record and an effect whose
         // first control point is the same muzzle. Ambiguous rows stay unresolved.
@@ -359,12 +367,8 @@ fn firing_effect(
         if candidates.next().is_some() {
             return None;
         }
-        row
-    };
-    Some((
-        crate::bounded_ascii_c_string(&row.resource.archive)?,
-        crate::bounded_ascii_c_string(&row.resource.name)?,
-    ))
+        Some(row)
+    }
 }
 
 pub(super) fn prepare_unit_weapons(controls: &[Option<PreparedComponentControl>]) -> PlayerWeapons {
@@ -394,6 +398,7 @@ mod tests {
                 projectile: String::from("test"),
                 projectile_archive: String::from("test.rlb"),
                 effect: None,
+                effect_row: None,
                 barrels: vec![Barrel {
                     muzzle: PreparedControlPoint {
                         raw_flags: 0,

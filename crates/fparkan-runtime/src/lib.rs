@@ -150,7 +150,7 @@ pub use projectile::{
     projectile_unit_hit, PlayerProjectile, ProjectileAssets, ProjectileContact,
 };
 pub use research::order_lab_research;
-pub use unit_combat::{AutoDemoCombatEvent, AutoDemoProjectileType};
+pub use unit_combat::{AutoDemoCombatEvent, AutoDemoProjectileType, FiringEffectInstance};
 pub use unit_spawn::SpawnedUnit;
 
 const MISSION_DECODED_PAYLOAD_CACHE_ENTRIES: usize = 256;

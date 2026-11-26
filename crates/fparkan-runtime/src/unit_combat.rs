@@ -32,6 +32,19 @@ pub struct AutoDemoProjectileType {
     volume: Option<f32>,
 }
 
+/// The prepared scene instance associated with a weapon's firing effect.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FiringEffectInstance {
+    /// Index of the unit's prepared object draft.
+    pub object_index: usize,
+    /// Index of the component owning the effect.
+    pub component_index: usize,
+    /// Control effect table.
+    pub table_index: usize,
+    /// Effect row within that table.
+    pub row_index: usize,
+}
+
 /// One autonomous combat event on the mission clock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AutoDemoCombatEvent {
@@ -45,6 +58,8 @@ pub enum AutoDemoCombatEvent {
         projectile: usize,
         /// Optional weapon effect in shared resource order.
         effect: Option<usize>,
+        /// Prepared component effect activated by this release.
+        effect_instance: Option<FiringEffectInstance>,
         /// World-space muzzle position as raw IEEE-754 coordinates.
         muzzle_bits: [u32; 3],
     },
@@ -588,6 +603,14 @@ impl AutoDemoCombat {
                         target,
                         projectile,
                         effect: unit.effects[slot],
+                        effect_instance: weapon.effect_row.map(|(table_index, row_index)| {
+                            FiringEffectInstance {
+                                object_index: unit.index,
+                                component_index: weapon.component_index,
+                                table_index,
+                                row_index,
+                            }
+                        }),
                         muzzle_bits: from.map(f32::to_bits),
                     });
                 } else {
@@ -743,6 +766,7 @@ mod tests {
                 let AutoDemoCombatEvent::Shot {
                     shooter,
                     effect,
+                    effect_instance,
                     muzzle_bits,
                     ..
                 } = *event
@@ -753,6 +777,21 @@ mod tests {
                 assert_eq!(flight.pose.position.map(f32::to_bits), muzzle_bits);
                 if let Some(effect) = effect {
                     assert!(effect < combat.weapon_effects().len());
+                    let instance = effect_instance.expect("shot names its prepared effect row");
+                    let assets = &engine.loaded.as_ref().unwrap().mission_assets;
+                    let control = assets.object_component_controls[instance.object_index]
+                        [instance.component_index]
+                        .as_ref()
+                        .unwrap();
+                    let fparkan_assets::PreparedControlEffectSection::Parsed(rows) =
+                        &control.effect_section
+                    else {
+                        panic!("effect table is unprepared")
+                    };
+                    assert!(rows
+                        .iter()
+                        .any(|row| row.table_index == instance.table_index
+                            && row.row_index == instance.row_index));
                     observed_weapon_effect = true;
                 }
                 let shooter = combat

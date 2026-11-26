@@ -4,8 +4,8 @@ use super::{
     MissionRenderRoot, SceneSampleId,
 };
 use fparkan_fx::clock::{FxInstanceClock, FxPhaseProvider};
-use fparkan_runtime::{loaded_mission_control_device_tables, Engine};
-use std::collections::HashMap;
+use fparkan_runtime::{loaded_mission_control_device_tables, AutoDemoCombatEvent, Engine};
+use std::collections::{HashMap, HashSet};
 
 pub(super) fn owner_control_capacity(
     engine: &Engine,
@@ -106,5 +106,46 @@ pub(super) fn advance_control_effect_instances(
                 (key, state.sample)
             },
         )
+        .collect()
+}
+
+pub(super) fn activate_firing_flashes(
+    samples: &mut HashMap<ControlEffectInstanceKey, ControlEffectFrameSample>,
+    ambient_slots: &[AmbientEffectGpuSlot],
+    point_light_slots: &[ControlEffectSlot],
+    events: &[AutoDemoCombatEvent],
+) -> HashSet<ControlEffectInstanceKey> {
+    events
+        .iter()
+        .filter_map(|event| {
+            let AutoDemoCombatEvent::Shot {
+                effect_instance: Some(effect),
+                ..
+            } = *event
+            else {
+                return None;
+            };
+            let key = ControlEffectInstanceKey {
+                object_index: effect.object_index,
+                component_index: effect.component_index,
+                table_index: effect.table_index,
+                row_index: effect.row_index,
+            };
+            let has_external_flash = ambient_slots
+                .iter()
+                .any(|slot| slot.random_instance_key == key && slot.time_mode == 4)
+                || point_light_slots
+                    .iter()
+                    .any(|slot| slot.random_instance_key == key && slot.time_mode == 4);
+            if !has_external_flash {
+                return None;
+            }
+            let sample = samples.get_mut(&key)?;
+            // shortcut: the release occurs at the midpoint of the weapon cycle.
+            // Keep the flash to this snapshot until the full effect phase is wired.
+            sample.phase = Some(0.5);
+            sample.elapsed_seconds = 0.0;
+            Some(key)
+        })
         .collect()
 }
